@@ -1,0 +1,96 @@
+{
+  "records": 27495,
+  "bytes": 7898307,
+  "by_class": {
+    "catalog": {
+      "records": 23642,
+      "bytes": 5586840
+    },
+    "empty": {
+      "records": 93,
+      "bytes": 5580
+    },
+    "special": {
+      "records": 1559,
+      "bytes": 2136828
+    },
+    "user": {
+      "records": 2201,
+      "bytes": 169059
+    }
+  },
+  "by_rmgr": {
+    "btree": {
+      "records": 16545,
+      "bytes": 1665455,
+      "catalog": 15230,
+      "user": 1315,
+      "special": 0,
+      "empty": 0
+    },
+    "clog": {
+      "records": 1,
+      "bytes": 34,
+      "catalog": 0,
+      "user": 0,
+      "special": 1,
+      "empty": 0
+    },
+    "dbase": {
+      "records": 2,
+      "bytes": 84,
+      "catalog": 0,
+      "user": 0,
+      "special": 2,
+      "empty": 0
+    },
+    "heap": {
+      "records": 6541,
+      "bytes": 2036712,
+      "catalog": 5662,
+      "user": 879,
+      "special": 0,
+      "empty": 0
+    },
+    "heap2": {
+      "records": 2850,
+      "bytes": 2059312,
+      "catalog": 2750,
+      "user": 7,
+      "special": 0,
+      "empty": 93
+    },
+    "smgr": {
+      "records": 19,
+      "bytes": 798,
+      "catalog": 0,
+      "user": 0,
+      "special": 19,
+      "empty": 0
+    },
+    "standby": {
+      "records": 423,
+      "bytes": 24462,
+      "catalog": 0,
+      "user": 0,
+      "special": 423,
+      "empty": 0
+    },
+    "xact": {
+      "records": 779,
+      "bytes": 218333,
+      "catalog": 0,
+      "user": 0,
+      "special": 779,
+      "empty": 0
+    },
+    "xlog": {
+      "records": 335,
+      "bytes": 1893117,
+      "catalog": 0,
+      "user": 0,
+      "special": 335,
+      "empty": 0
+    }
+  }
+}

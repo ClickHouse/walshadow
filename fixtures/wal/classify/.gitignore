@@ -1,0 +1,3 @@
+# Captured WAL segments. Run capture.sh to regenerate; bytes aren't
+# committed because (a) they're large and (b) they vary by PG major.
+segments/
