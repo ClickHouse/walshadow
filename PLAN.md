@@ -6,13 +6,38 @@ plugin — but trades pgchcdc's *static catalog snapshot* for a co-located
 **shadow Postgres** that holds schema only, replays only catalog WAL,
 and doubles as a decoder oracle.
 
+## Supported PostgreSQL versions
+
+walshadow targets **PG 16+** as source-PG. Rationale:
+
+* PG 15 reshuffled `bimg_info` FPI bits (commit `a14354c`). PG 16 is
+  the first major where the new layout is the only layout we have to
+  carry in code; nothing in walshadow needs the PG-14 dual-branch
+  predicate.
+* PG 16 stabilised RelFileLocator as the on-disk-identifier name
+  (replacing RelFileNode). On-disk binary is unchanged but the source
+  references this naming.
+* PG 13 EOL Nov 2025; PG 14 EOL Nov 2026; PG 15 EOL Nov 2027. PG 16+
+  matches the supported-source window for any greenfield deployment.
+
+Shadow PG runs the same major as source — same constraint as before.
+Source/shadow minor mismatches are fine.
+
+The segment walker's technical floor is PG 15's page magic (0xD110),
+i.e. the FPI bit-shuffle boundary. PG 15 captures are tolerated because
+wal-rs's FPI dispatch keys off `magic >= 0xD110` and accepting PG 15
+costs no extra code paths; "PG 16+" is the *operationally supported*
+floor, not the technical one. PG ≤ 14 captures are rejected.
+
 ## Status
 
 - **Phase 0** — record-classification fixture. PHASE0.md.
+- **Phase 1** — WAL filter + CRC rewrite. PHASE1.md.
 
-Roadmap: Phase 1 — WAL filter + CRC rewrite (sequential, needs Phase 0).
-Phases 2–6 as listed below. Each phase closes with `PHASE<N>.md` at
-repo root; PLAN.md status list is the mutable index.
+Roadmap: Phase 2 — PG-16-minimum cleanup (small, can run in parallel
+with Phase 3). Phase 3 — shadow PG lifecycle (sequential, needs Phase
+1). Phases 4–7 as listed below. Each phase closes with `PHASE<N>.md`
+at repo root; PLAN.md status list is the mutable index.
 
 Reuses without modification:
 
@@ -261,8 +286,9 @@ requirement on source: `wal_level=logical`, same as pgchcdc.
 millions of user heap records in one xact. Shadow PG sees the catalog
 half; decoder sees the full xact. Ordering invariant (shadow replay
 LSN ≥ decoder read LSN) ensures decoder reads the post-DDL catalog
-shape for the heap records. PG ≥ 11 fast-path `ADD COLUMN` skips the
-rewrite entirely; no user heap records, only catalog — trivial case.
+shape for the heap records. Fast-path `ADD COLUMN` (always present
+since PG 11, baseline for PG 16+) skips the rewrite entirely; no
+user heap records, only catalog — trivial case.
 
 ### 6. Two-phase commit
 
@@ -273,8 +299,10 @@ records. Same handling as pgchcdc.
 
 ### 7. Shadow PG version skew
 
-Shadow PG must be the same major as source. Different minor is fine.
-Daemon refuses to start on major mismatch with a precise error.
+Shadow PG must be the same major as source, and source must be PG 16
+or newer (see "Supported PostgreSQL versions" above). Different
+minor is fine. Daemon refuses to start on major mismatch or on
+source-PG < 16 with a precise error.
 
 ### 8. Path A CRC at very high WAL rates
 
@@ -299,9 +327,10 @@ debug replay.
 
 ## Phasing
 
-Each phase produces an independent slice. Phase 1–4 are sequential;
-Phase 5 and 6 are parallel once Phase 4 closes. Phase docs follow the
-`PHASE<N>.md` convention from `~/s/wal-rs` and pgchcdc.
+Each phase produces an independent slice. Phase 1, 3, 4, 5 are
+sequential; Phase 2 runs in parallel with Phase 3; Phase 6 and 7 are
+parallel once Phase 5 closes. Phase docs follow the `PHASE<N>.md`
+convention from `~/s/wal-rs` and pgchcdc.
 
 ### Phase 0 — record-classification fixture
 
@@ -348,7 +377,44 @@ blocker.
 
 Size: ≈600 LOC. ~1 week.
 
-### Phase 2 — shadow PG lifecycle
+### Phase 2 — PG-16-minimum cleanup
+
+Codify the "Supported PostgreSQL versions" banner in code. Reject
+PG ≤ 14 captures at the segment walker; rename the `XLP_PAGE_MAGIC_PG15`
+constant to `XLP_PAGE_MAGIC_MIN` to surface its new role (FPI-layout
+floor, doubles as the minimum-accepted magic).
+
+PG 15 captures are tolerated, not rejected: wal-rs's FPI dispatch
+already keys off `magic >= 0xD110`, and there's no extra code to write
+to accept PG 15. "PG 16+" is the operationally supported floor; PG 15
+is the technical floor.
+
+Concrete changes:
+
+- `walshadow/src/wire.rs`: rename `XLP_PAGE_MAGIC_PG15` →
+  `XLP_PAGE_MAGIC_MIN` (value unchanged at 0xD110). No PG16 constant
+  introduced; the supported-version banner is policy, not a wire-level
+  predicate.
+- `walshadow/src/segment.rs`: add `WalkError::UnsupportedSourceVersion`;
+  reject pages whose magic is below `XLP_PAGE_MAGIC_MIN`.
+- `walshadow/fixtures/wal/{classify,filter}/capture.sh`: default
+  `WALSHADOW_PG_IMAGE` to `postgres:16`. Reject `WALSHADOW_USE_LOCAL=1`
+  when local `postgres -V` major < 15.
+- Upstream wal-rs (out-of-tree, tracked separately): drop
+  `BKP_IMAGE_IS_COMPRESSED_PG14`, collapse `is_compressed(page_magic)`
+  to a single `info & BKP_IMAGE_COMPRESS_MASK_PG15 != 0` predicate,
+  remove `WalParser::page_magic`'s PG-14 default. walshadow can vendor
+  the relevant constants in `wire.rs` until wal-rs lands the cleanup;
+  the version-aware predicate path becomes dead-code-eliminable.
+
+Risk: zero against shadow PG behavior — reader-side only. Existing
+round-trip + classifier fixtures re-capture cleanly against
+`postgres:16`.
+
+Size: ~30 LOC walshadow + ~20 LOC docs. ~1 day. Can run parallel
+with Phase 3.
+
+### Phase 3 — shadow PG lifecycle
 
 `initdb` once at bootstrap, restore schema-only dump from source.
 Write `recovery.signal` and a `restore_command` pointing at
@@ -359,7 +425,7 @@ Health probe: periodic `SELECT count(*) FROM pg_class` and a one-row
 
 Size: ≈400 LOC. ~3 days.
 
-### Phase 3 — catalog cache integration
+### Phase 4 — catalog cache integration
 
 Lift `pg/catalog.rs` from pgchcdc, replace its bootstrap-once mode
 with `ShadowCatalog` (libpq SQL conn to shadow, generation counter,
@@ -368,17 +434,16 @@ relfilenode→relation lookup goes through this cache.
 
 Size: ≈300 LOC. ~3 days.
 
-### Phase 4 — end-to-end DDL drill
+### Phase 5 — end-to-end DDL drill
 
 Source script: `CREATE TABLE t (...)`, `INSERT INTO t ...`,
-`ALTER TABLE t ADD COLUMN c int DEFAULT 7` (fast-path on PG ≥ 11),
-`UPDATE t SET c = c + 1`, `DROP TABLE t`. walshadow + decoder + CH
-emitter run the whole script unmodified. CH end-state matches source
-end-state.
+`ALTER TABLE t ADD COLUMN c int DEFAULT 7` (fast-path), `UPDATE t SET
+c = c + 1`, `DROP TABLE t`. walshadow + decoder + CH emitter run the
+whole script unmodified. CH end-state matches source end-state.
 
 Size: ≈200 LOC of test glue. ~3 days.
 
-### Phase 5 — differential decode oracle
+### Phase 6 — differential decode oracle
 
 For each Tier 3 fixture row, additionally probe shadow PG's
 typsend/typoutput, compare against decoder output. Add `--validate`
@@ -388,7 +453,7 @@ NULL bitmap layouts).
 
 Size: ≈400 LOC. ~1 week.
 
-### Phase 6 — operational
+### Phase 7 — operational
 
 Slot keepalive (walshadow's physical slot on source must advance with
 shadow's replay LSN, not the decoder's commit LSN — slot retention is

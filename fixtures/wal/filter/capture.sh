@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Capture a WAL segment for the Phase 0 classifier fixture.
+# Capture a WAL segment for the Phase 1 filter fixture.
 #
-# Default image: postgres:16. walshadow operationally supports PG 16+
-# (see PLAN.md "Supported PostgreSQL versions") and tolerates PG 15
-# captures because wal-rs's FPI parser dispatches off magic >= 0xD110.
-# PG ≤ 14 captures are rejected by the segment walker.
+# Steady-state OLTP workload (no DDL inside timed window). Goal: drive
+# catalog fraction well under 1% so the round-trip test can assert
+# acceptance §1's "kept fraction ≪ 1%" bound.
 #
-# Override with WALSHADOW_PG_IMAGE=postgres:17 / 18 / etc. Set
-# WALSHADOW_USE_LOCAL=1 to bypass docker; local `postgres` must be 15+.
+# WALSHADOW_PG_IMAGE / WALSHADOW_USE_LOCAL behave as in
+# `fixtures/wal/classify/capture.sh`. Default: postgres:16 in docker.
+# walshadow rejects PG ≤ 14 captures (FPI bit layout).
 #
-# Output: segments/000000010000000000000001.gz
+# Output: segments/000000010000000000000002.gz
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -31,7 +31,7 @@ if [[ "${WALSHADOW_USE_LOCAL:-0}" == "1" ]]; then
     PGDATA="$work/data"
     SOCKDIR="$work/sock"
     mkdir -p "$SOCKDIR"
-    PORT="${WALSHADOW_PG_PORT:-55432}"
+    PORT="${WALSHADOW_PG_PORT:-55433}"
     initdb -D "$PGDATA" -U postgres --no-instructions --auth=trust --encoding=UTF8 --locale=C >/dev/null
     cat >>"$PGDATA/postgresql.conf" <<EOF
 wal_level = logical
@@ -49,10 +49,9 @@ EOF
     pg_ctl -D "$PGDATA" -l "$work/log" -o "-c full_page_writes=off -c wal_compression=off" start -w >/dev/null
     psql -h "$SOCKDIR" -p "$PORT" -U postgres -d postgres -v ON_ERROR_STOP=1 -f "$here/workload.sql" >/dev/null
     pg_ctl -D "$PGDATA" stop -m fast -w >/dev/null
-    seg="$PGDATA/pg_wal/000000010000000000000001"
+    seg="$PGDATA/pg_wal/000000010000000000000002"
 else
     echo "using docker image $PG_IMAGE" >&2
-    # No --rm: postmaster shutdown races docker cp otherwise; trap does cleanup
     CID=$(docker run -d \
         -e POSTGRES_PASSWORD=pg \
         -e POSTGRES_DB=postgres \
@@ -63,7 +62,6 @@ else
         -c wal_compression=off \
         -c autovacuum=off \
         -c shared_buffers=32MB)
-    # Wait for readiness.
     for _ in $(seq 1 60); do
         if docker exec "$CID" pg_isready -U postgres -d postgres >/dev/null 2>&1; then
             break
@@ -72,21 +70,14 @@ else
     done
     docker cp "$here/workload.sql" "$CID:/tmp/workload.sql"
     docker exec -u postgres "$CID" psql -d postgres -v ON_ERROR_STOP=1 -f /tmp/workload.sql >/dev/null
-    # PG ≥ 18 image moved PGDATA from /var/lib/postgresql/data to a
-    # version-pathed dir; query SHOW data_directory and grab from there
     pgdata=$(docker exec -u postgres "$CID" psql -d postgres -tAX -c "SHOW data_directory")
-    # Grab the segment while the container is still alive. Workload
-    # ends in CHECKPOINT, so segment 0..1 is fully flushed
-    docker cp "$CID:$pgdata/pg_wal/000000010000000000000001" "$work/segment"
+    docker cp "$CID:$pgdata/pg_wal/000000010000000000000002" "$work/segment"
     seg="$work/segment"
 fi
 
 [[ -f "$seg" ]] || { echo "no segment at $seg" >&2; exit 1; }
 
-# Truncate trailing zero 8 KiB pages: find first run of >=2 zero pages
-# from EOF and snip there. Keeps a few zero pages of padding so the
-# parser sees a clean end-of-data marker without surprises.
-python3 - "$seg" "$out/000000010000000000000001" <<'PY'
+python3 - "$seg" "$out/000000010000000000000002" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 with open(src, 'rb') as f:
@@ -98,12 +89,12 @@ for i in range(n_pages):
     page = data[i*PAGE:(i+1)*PAGE]
     if any(page):
         last_nonzero = i
-keep = (last_nonzero + 2) * PAGE  # one trailing zero page as EOF marker
+keep = (last_nonzero + 2) * PAGE
 keep = min(keep, len(data))
 with open(dst, 'wb') as f:
     f.write(data[:keep])
 print(f"kept {keep // PAGE} pages ({keep} bytes) of {n_pages} ({len(data)} bytes)", file=sys.stderr)
 PY
 
-gzip -f -9 "$out/000000010000000000000001"
-echo "wrote $out/000000010000000000000001.gz"
+gzip -f -9 "$out/000000010000000000000002"
+echo "wrote $out/000000010000000000000002.gz"
