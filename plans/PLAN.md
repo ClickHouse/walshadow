@@ -43,9 +43,24 @@ floor, not the technical one. PG ≤ 14 captures are rejected.
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,
   `pg_class` heap-write decoder, `CatalogTracker::seed_from_source`
   bootstrap, `XLOG_SWITCH` pass-through test. [PRE5.md](PRE5.md).
+- **PRE5b** — close [PRE5](PRE5.md) silent-correctness gaps before
+  [Phase 5](#phase-5--heap-tuple-decoder--tier-12-type-matrix):
+  lift `Filter` to per-stream scope, wire `seed_from_source` into
+  `walshadow-stream`, handle `xl_heap_update` prefix/suffix in
+  `pg_class_decoder`, connect `CatalogTracker` to
+  `ShadowCatalog::invalidate`, widen `RecordEvent` → `Record`
+  carrying parsed `XLogRecord`, sink fan-out, `relreplident` +
+  `pg_index` on `RelDescriptor`. [PRE5b.md](PRE5b.md).
 - **clickhouse-c-rs** — vendored as workspace member. Provides the
   Native-wire emitter for Phase 7. Not gated by a `PHASE*.md`: the
   crate is upstream code, walshadow just consumes it.
+- **BASEBACKUP** — evaluation: use `BASE_BACKUP` to bootstrap
+  shadow's data dir (replacing `Shadow::apply_schema_dump`) and to
+  seed CH's initial heap load (via `COPY` from shadow at the
+  backup's `end_lsn`). Proposes insertion as Phase 6.5 between
+  [Phase 6](#phase-6--toast-reassembly--xact-buffer) and
+  [Phase 7](#phase-7--ch-native-emitter-via-clickhouse-c-rs). Not
+  committed work. [BASEBACKUP.md](BASEBACKUP.md).
 
 Roadmap: Phases 5–10 as listed below (heap decoder → TOAST/xact →
 CH emitter → DDL drill → Tier 3 + oracle → operational). Each phase
