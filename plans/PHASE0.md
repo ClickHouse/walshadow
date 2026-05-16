@@ -1,6 +1,6 @@
 # PHASE0 — record-classification fixture
 
-Closes Phase 0 of `PLAN.md`. Lands a per-record WAL classifier that
+Closes [Phase 0 of `PLAN.md`](PLAN.md#phase-0--record-classification-fixture). Lands a per-record WAL classifier that
 buckets every record into `Catalog` / `User` / `Special` / `Empty` and
 a CLI that walks WAL segment files & prints kept/dropped split per
 rmgr. Synthetic unit tests cover the classification rules; a fixture
@@ -64,8 +64,10 @@ Fix scoped to Phase 1: thread a `pg15_or_later: bool` derived from
 `XLogPageHeader.magic` through `WalParser` → `read_block_image_header`
 & branch the compressed-flag check. Phase 1 either contributes this
 upstream to wal-rs or ships an in-tree image-header reader in
-walshadow's own module. Tracking in PLAN.md "What … filters in" /
-"Filter implementation" section under Phase 1.
+walshadow's own module. Tracking in PLAN.md
+[What … filters in](PLAN.md#what-replay-only-catalog-filters-in) /
+[Filter implementation](PLAN.md#filter-implementation-rewrite-over-fork)
+section under [Phase 1](PLAN.md#phase-1--wal-filter--crc-rewrite).
 
 #### Orphan diff in `~/s/wal-rs`
 
@@ -122,19 +124,21 @@ across PG patch levels, so committing it would invite false test
 regressions on minor PG bumps. `capture.sh` is the reproducer; the
 test that depends on the segment skips silently when absent.
 
-## Deviations from PLAN.md Phase 0
+## Deviations from [PLAN.md Phase 0](PLAN.md#phase-0--record-classification-fixture)
 
-* PLAN.md says "Confirm catalog fraction is bounded (expect well
-  under 1% for realistic workloads)". The integration test asserts
-  `< 20%`, much looser, because the workload is intentionally
-  DDL-heavy in a short window (10 INSERTs into branches + 500 into
-  accounts + 3 ALTER TABLEs + 1 CHECKPOINT) so DDL records make up
-  a disproportionate share. A true steady-state OLTP capture would
-  re-tighten the bound; deferred to Phase 1 where the filter
-  consumes the fraction at runtime.
-* PLAN.md called for a "numbered fixture". Currently a single
-  workload at `fixtures/wal/classify/`. Numbering (per-PG-major) is
-  Phase 1 work once the PG 15+ parser issue is fixed.
+* [PLAN.md Phase 0](PLAN.md#phase-0--record-classification-fixture) says
+  "Confirm catalog fraction is bounded (expect well under 1% for
+  realistic workloads)". The integration test asserts `< 20%`, much
+  looser, because the workload is intentionally DDL-heavy in a short
+  window (10 INSERTs into branches + 500 into accounts + 3 ALTER
+  TABLEs + 1 CHECKPOINT) so DDL records make up a disproportionate
+  share. A true steady-state OLTP capture would re-tighten the
+  bound; deferred to [Phase 1](PLAN.md#phase-1--wal-filter--crc-rewrite)
+  where the filter consumes the fraction at runtime.
+* [PLAN.md Phase 0](PLAN.md#phase-0--record-classification-fixture)
+  called for a "numbered fixture". Currently a single workload at
+  `fixtures/wal/classify/`. Numbering (per-PG-major) is Phase 1 work
+  once the PG 15+ parser issue is fixed.
 
 ## What didn't get done
 

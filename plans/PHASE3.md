@@ -1,6 +1,6 @@
 # PHASE3 — shadow PG lifecycle
 
-Closes Phase 3 of `PLAN.md`. Lands `walshadow::shadow`: a small struct
+Closes [Phase 3 of `PLAN.md`](PLAN.md#phase-3--shadow-pg-lifecycle). Lands `walshadow::shadow`: a small struct
 that wraps PG's external binaries (`initdb`, `pg_ctl`, `psql`) plus
 the on-disk plumbing (`postgresql.conf`, `standby.signal`,
 `restore_command`) into one ergonomic Rust API. Higher layers (Phase
@@ -30,7 +30,7 @@ proper libpq client lands with Phase 4's `ShadowCatalog`.
 
 ### `standby.signal`, not `recovery.signal`
 
-PLAN.md Phase 3 says "Write `recovery.signal`". The architecture
+[PLAN.md Phase 3](PLAN.md#phase-3--shadow-pg-lifecycle) says "Write `recovery.signal`". The architecture
 diagram and §Architecture prose describe shadow as a *standby*. The
 two primitives behave differently:
 
@@ -44,8 +44,9 @@ two primitives behave differently:
   `primary_conninfo` empty). Matches walshadow's continuous-feed
   topology.
 
-Shadow ships `standby.signal`. PLAN.md text wasn't amended; treat it
-as a typo with this PHASE3 doc as the corrective record.
+Shadow ships `standby.signal`. [PLAN.md](PLAN.md#phase-3--shadow-pg-lifecycle)
+text wasn't amended; treat it as a typo with this PHASE3 doc as the
+corrective record.
 
 ### Probes via `psql`, not libpq
 
@@ -64,7 +65,7 @@ without touching callers.
 
 ### `apply_schema_dump` takes a `&str`, not a source connection
 
-PLAN.md Phase 3 says "restore schema-only dump from source". Two
+[PLAN.md Phase 3](PLAN.md#phase-3--shadow-pg-lifecycle) says "restore schema-only dump from source". Two
 shapes for the API:
 
 1. `Shadow::bootstrap_from_source(source_conn_str)` — opens an
@@ -121,14 +122,15 @@ inspect.
 
 ### `autovacuum = off`
 
-PLAN.md pitfall #3 flags catalog-index bloat on a busy DDL workload.
+[PLAN.md pitfall #3](PLAN.md#3-catalog-index-bloat) flags catalog-index bloat on a busy DDL workload.
 Phase 3's default is "accept bloat"; `autovacuum = off` avoids
 autovacuum interfering with recovery (vacuum on a standby is a no-op
 anyway, but the launcher running adds noise). When pitfall #3 needs
 addressing, the operator promotes shadow briefly, lets autovacuum
-run, then re-attaches — same posture as PLAN.md proposes.
+run, then re-attaches — same posture as
+[PLAN.md](PLAN.md#3-catalog-index-bloat) proposes.
 
-## Deviations from PLAN.md Phase 3
+## Deviations from [PLAN.md Phase 3](PLAN.md#phase-3--shadow-pg-lifecycle)
 
 * `standby.signal` instead of `recovery.signal` — see above.
 * No `--initial_target` boot gate in `Shadow::start`. The PLAN
@@ -148,7 +150,7 @@ run, then re-attaches — same posture as PLAN.md proposes.
   precedent, but Phase 3's lifecycle operations are stateful (start →
   query → stop) and don't compose well as one-shot CLI invocations.
   When Phase 7's `walshadow` daemon lands, it absorbs this surface.
-* No `pg_basebackup` integration. PLAN.md says "schema-only dump",
+* No `pg_basebackup` integration. [PLAN.md](PLAN.md#phase-3--shadow-pg-lifecycle) says "schema-only dump",
   not "full base backup"; we honour that. If shadow's `pg_control`
   starting LSN ever needs to be moved to match a source backup
   position (currently it's just initdb's own LSN, which is sufficient

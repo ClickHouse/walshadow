@@ -1,6 +1,6 @@
 # PHASE4 — shadow PG catalog cache
 
-Closes Phase 4 of `PLAN.md`. Lands `walshadow::shadow_catalog`: an
+Closes [Phase 4 of `PLAN.md`](PLAN.md#phase-4--catalog-cache-integration). Lands `walshadow::shadow_catalog`: an
 async libpq-style client (tokio-postgres) over shadow PG that turns
 a `RelFileNode` observed in source WAL into a fully-described
 `RelDescriptor`, with a generation-counter invalidation scheme and
@@ -31,7 +31,7 @@ New runtime dep: `tokio-postgres = "0.7"`. New runtime feature in
 
 ### Async over sync
 
-PLAN.md `relation_at` signature is `async fn`, the decoder
+[PLAN.md](PLAN.md#decoder-catalog-interface) `relation_at` signature is `async fn`, the decoder
 (walhouse, Phase 5+) is async, and a synchronous catalog client
 inside an async decoder forces either a `block_in_place` shim or a
 thread-pool detour every lookup. `tokio-postgres` is the canonical
@@ -59,7 +59,7 @@ that can't resolve them.
 
 ### Cache shape: HashMap by `(rfn, generation)` lazy eviction
 
-PLAN.md spec: "caches keyed by `(rfn, generation)`". Implementation
+[PLAN.md](PLAN.md#decoder-catalog-interface) spec: "caches keyed by `(rfn, generation)`". Implementation
 keeps a `HashMap<RelFileNode, CacheEntry>` where each entry carries
 its `generation`. On lookup: if `entry.generation == self.generation`,
 hit. If not, miss → re-fetch and overwrite. Stale entries are
@@ -80,7 +80,7 @@ trims.
 
 ### `Arc<RelDescriptor>`, not `&RelDescriptor`
 
-PLAN.md doc-block has `Result<&RelDescriptor, Error>`. Returning a
+[PLAN.md](PLAN.md#decoder-catalog-interface) doc-block has `Result<&RelDescriptor, Error>`. Returning a
 reference into a `HashMap` while allowing mutation of that map on
 the next call requires either splitting the cache out behind a
 `Mutex`/`RwLock` (and returning a guard, not a reference), or
@@ -142,7 +142,7 @@ A `ShadowCatalog` instance is bound to one PG database. Shadow PG
 is typically populated to mirror a single source-PG database, so
 this matches reality. Cross-database support would require either
 a `ShadowCatalog` per database (caller-managed) or a switching
-`SET search_path` / connection-per-db pool. PLAN.md doesn't
+`SET search_path` / connection-per-db pool. [PLAN.md](PLAN.md) doesn't
 require multi-db; if it ever does, the natural extension is a
 `ShadowCatalogSet` keyed by `db_node` holding one
 `ShadowCatalog` per dataset.
@@ -158,23 +158,25 @@ with explicit error on the empty-or-multi-char path. Tradeoff: one
 extra in-PG conversion per row, but each row produces one DDL-worth
 of catalog data — irrelevant against the actual catalog-fetch cost.
 
-## Deviations from PLAN.md Phase 4
+## Deviations from [PLAN.md Phase 4](PLAN.md#phase-4--catalog-cache-integration)
 
-* PLAN.md says "Lift `pg/catalog.rs` from pgchcdc". `~/s/walhouse/pgchcdc`
-  is empty (only a directory, no contents) on this checkout —
-  pgchcdc has either been removed or never lived in tree. Phase 4
-  was written from PLAN.md's interface spec only, with no
-  pgchcdc cross-reference. If pgchcdc's `catalog.rs` ever re-surfaces,
-  reconciling field names and lookup shapes is mechanical;
-  walhouse and walshadow will share the catalog interface from
-  here.
-* No "promote-once-and-pg_dump-from-shadow" fallback. PLAN.md
-  doesn't require it; `apply_schema_dump` (Phase 3) is the
+* [PLAN.md](PLAN.md#phase-4--catalog-cache-integration) says
+  "Lift `pg/catalog.rs` from pgchcdc". `~/s/walhouse/pgchcdc` is
+  empty (only a directory, no contents) on this checkout — pgchcdc
+  has either been removed or never lived in tree. Phase 4 was
+  written from [PLAN.md's interface spec](PLAN.md#decoder-catalog-interface)
+  only, with no pgchcdc cross-reference. If pgchcdc's `catalog.rs`
+  ever re-surfaces, reconciling field names and lookup shapes is
+  mechanical; walhouse and walshadow will share the catalog
+  interface from here.
+* No "promote-once-and-pg_dump-from-shadow" fallback.
+  [PLAN.md](PLAN.md) doesn't require it; `apply_schema_dump`
+  ([Phase 3](PLAN.md#phase-3--shadow-pg-lifecycle)) is the
   bootstrap-side primitive.
 * `RelDescriptor.attributes` includes dropped columns
-  (`attisdropped = true`). PLAN.md doesn't specify; dropped
-  columns are required for binary heap-tuple decoding to walk the
-  null bitmap correctly. Decoder filters at use-site.
+  (`attisdropped = true`). [PLAN.md](PLAN.md) doesn't specify;
+  dropped columns are required for binary heap-tuple decoding to
+  walk the null bitmap correctly. Decoder filters at use-site.
 
 ## What didn't get done
 
@@ -185,7 +187,7 @@ of catalog data — irrelevant against the actual catalog-fetch cost.
   prepares the SQL afresh. `tokio-postgres` does cache prepared
   statements implicitly, so this is more about the conceptual gap
   than a measured win; revisit when a workload measures it.
-* **Per-relation invalidation.** PLAN.md "Risks": "Bumping a
+* **Per-relation invalidation.** [PLAN.md "Risks"](PLAN.md#risks--open-questions): "Bumping a
   single generation counter on any catalog write over-invalidates.
   A finer scheme (per-relation invalidation keyed on which catalog
   row was touched) is possible but parses every catalog write —
@@ -198,7 +200,7 @@ of catalog data — irrelevant against the actual catalog-fetch cost.
   formally tested.
 * **Stats persistence.** `ShadowCatalogStats` is in-process only.
   Phase 7 metrics exporter scrapes it.
-* **`pg_index` join.** PLAN.md mentions
+* **`pg_index` join.** [PLAN.md](PLAN.md#decoder-catalog-interface) mentions
   "pg_class/pg_attribute/pg_type/pg_index for rfn". Phase 4 joins
   the first three; `pg_index` (key column ordering, AM-specific
   metadata) is only needed when the decoder reads catalog *indexes*

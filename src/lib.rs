@@ -8,6 +8,8 @@
 //! (`filter_segment`), output manifest (`manifest`).
 //! Phase 3: shadow PG lifecycle (`shadow`).
 //! Phase 4: shadow PG catalog cache (`shadow_catalog`).
+//! PRE5: pg_class heap-tuple decoder (`pg_class_decoder`), streaming
+//! filter event design (`wal_stream`).
 
 pub mod catalog_tracker;
 pub mod classify;
@@ -15,8 +17,11 @@ pub mod filter;
 pub mod filter_segment;
 pub mod main_data;
 pub mod manifest;
+pub mod pg_class_decoder;
 pub mod rewrite;
 pub mod segment;
 pub mod shadow;
 pub mod shadow_catalog;
+pub mod source_feed;
+pub mod wal_stream;
 pub mod wire;

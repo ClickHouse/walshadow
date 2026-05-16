@@ -2505,8 +2505,11 @@ name = "walshadow"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "crc32c",
+ "fallible-iterator",
+ "postgres-protocol",
  "serde",
  "serde_json",
  "tempfile",

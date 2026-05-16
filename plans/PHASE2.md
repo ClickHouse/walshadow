@@ -1,6 +1,6 @@
 # PHASE2 — PG-16-minimum cleanup
 
-Closes Phase 2 of `PLAN.md`. Codifies the "Supported PostgreSQL
+Closes [Phase 2 of `PLAN.md`](PLAN.md#phase-2--pg-16-minimum-cleanup). Codifies the "Supported PostgreSQL
 versions" banner in code: walshadow rejects PG ≤ 14 captures at the
 segment walker, defaults fixture capture to `postgres:16`, and
 renames the FPI-layout constant in `wire.rs` to reflect its new role
@@ -15,11 +15,11 @@ as the minimum accepted page magic.
 | Capture-script image default: `postgres:14` → `postgres:16` | `fixtures/wal/{classify,filter}/capture.sh` | bash -n parse |
 | Local PG version gate (`WALSHADOW_USE_LOCAL=1` requires PG ≥ 15) | `fixtures/wal/{classify,filter}/capture.sh` | bash -n parse |
 | FPI workaround comment removed from classify `capture.sh` | `fixtures/wal/classify/capture.sh` | n/a |
-| PLAN.md: Supported-versions banner footnote + Phase 2 rewrite | `PLAN.md` | n/a |
+| PLAN.md: [Supported-versions](PLAN.md#supported-postgresql-versions) banner footnote + [Phase 2](PLAN.md#phase-2--pg-16-minimum-cleanup) rewrite | [`PLAN.md`](PLAN.md) | n/a |
 
 ## Why PG 15 stays in the accept set
 
-PLAN.md's policy floor is PG 16 (EOL window, RelFileLocator naming
+[PLAN.md](PLAN.md#supported-postgresql-versions)'s policy floor is PG 16 (EOL window, RelFileLocator naming
 stabilisation). The *technical* floor is PG 15: that's where the FPI
 bit shuffle (`bimg_info` 0x02 = IS_COMPRESSED → APPLY,
 `a14354cac`) happened. wal-rs's parser dispatches FPI-bit semantics
@@ -33,7 +33,7 @@ split. Reject what we can't parse (PG ≤ 14), tolerate what we can.
 
 ### One constant, not two
 
-PLAN.md's earlier Phase 2 sketch proposed adding `XLP_PAGE_MAGIC_PG16
+[PLAN.md Phase 2](PLAN.md#phase-2--pg-16-minimum-cleanup)'s earlier sketch proposed adding `XLP_PAGE_MAGIC_PG16
 = 0xD113` alongside `XLP_PAGE_MAGIC_MIN = 0xD110`. Phase 2 ships only
 the latter: a single "minimum magic walshadow accepts" sentinel,
 doc-commented to explain both its FPI-layout meaning and its
@@ -43,7 +43,7 @@ predicate.
 
 ### Reject at the walker, not at the daemon
 
-PLAN.md pitfall #7 says "daemon refuses to start on … source-PG < 16".
+[PLAN.md pitfall #7](PLAN.md#7-shadow-pg-version-skew) says "daemon refuses to start on … source-PG < 16".
 That gate belongs in Phase 7 (operational) when the daemon binary
 exists; Phase 2 plants the same check one layer down, at the segment
 walker, where it covers fixture capture + CLI + integration tests
@@ -57,16 +57,18 @@ check on top (refuse PG 15 too, per banner). Either way no rework.
 so an operator can identify the source PG major from a single line of
 log output. Same posture as `BadPageMagic` for non-WAL data.
 
-## Deviations from PLAN.md Phase 2
+## Deviations from [PLAN.md Phase 2](PLAN.md#phase-2--pg-16-minimum-cleanup)
 
-* Phase 2 description in PLAN.md was rewritten to match what landed
-  (single `_MIN` constant, no `_PG16`, PG 15 tolerated). The earlier
-  "rename + add `_PG16`" sketch would have introduced a dead
-  constant.
-* Skipped editing PHASE0.md and PHASE1.md — keeping completed phase
-  retrospectives immutable (user direction during Phase 2).
+* Phase 2 description in [PLAN.md](PLAN.md#phase-2--pg-16-minimum-cleanup)
+  was rewritten to match what landed (single `_MIN` constant, no
+  `_PG16`, PG 15 tolerated). The earlier "rename + add `_PG16`"
+  sketch would have introduced a dead constant.
+* Skipped editing [PHASE0.md](PHASE0.md) and [PHASE1.md](PHASE1.md) —
+  keeping completed phase retrospectives immutable (user direction
+  during Phase 2).
 * No upstream wal-rs changes in this phase. The clean-up listed in
-  PLAN.md (drop `BKP_IMAGE_IS_COMPRESSED_PG14`, collapse
+  [PLAN.md](PLAN.md#phase-2--pg-16-minimum-cleanup) (drop
+  `BKP_IMAGE_IS_COMPRESSED_PG14`, collapse
   `is_compressed(page_magic)`) is tracked separately. walshadow
   works regardless of which side of that change wal-rs is on.
 

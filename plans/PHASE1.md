@@ -1,6 +1,6 @@
 # PHASE1 — WAL filter + CRC rewrite
 
-Closes Phase 1 of `PLAN.md`. Lands a byte-preserving WAL filter that
+Closes [Phase 1 of `PLAN.md`](PLAN.md#phase-1--wal-filter--crc-rewrite). Lands a byte-preserving WAL filter that
 drops user-relation records, replaces them with `XLOG_NOOP`
 placeholders of identical `xl_tot_len`, and recomputes CRC32C so the
 filtered segment re-parses cleanly through wal-rs's `WalParser`. Also
@@ -33,7 +33,7 @@ back-pointer remains valid for shadow PG's recovery state machine.
 
 ## Acceptance status
 
-PLAN.md §"Acceptance criteria" §1 calls for "well under 1%" kept
+[PLAN.md §"Acceptance criteria"](PLAN.md#acceptance-criteria) §1 calls for "well under 1%" kept
 fraction on a steady-state OLTP workload. Result on the new
 `fixtures/wal/filter/` capture (10k UPDATEs + 500 INSERTs + 200
 DELETEs against 1000-row table, no DDL inside the timed window):
@@ -81,7 +81,7 @@ trip; fixed by anchoring against `xlog.c:5169` directly.
 
 ### Byte-preserving rewrite over pack-and-shift
 
-PLAN.md mentions a "(filtered_lsn, source_lsn) manifest sidecar"
+[PLAN.md Phase 1](PLAN.md#phase-1--wal-filter--crc-rewrite) mentions a "(filtered_lsn, source_lsn) manifest sidecar"
 implying LSN translation. Two alternatives:
 
 1. **Byte-preserving** (chosen): drop records become same-length NOOPs.
@@ -145,7 +145,7 @@ dominated. Phase 1 fixture's workload checkpoints, calls
 capture grabs segment 2 instead of segment 1. Catalog fraction in
 segment 2 is effectively 0 (only special-rmgr records survive).
 
-## Deviations from PLAN.md Phase 1
+## Deviations from [PLAN.md Phase 1](PLAN.md#phase-1--wal-filter--crc-rewrite)
 
 * "≈600 LOC" estimate undershot. Phase 1 added ~1,500 LOC of
   functional code + ~600 LOC of tests. The byte-positioned segment
@@ -154,11 +154,11 @@ segment 2 is effectively 0 (only special-rmgr records survive).
   `WalParser` could not be reused directly because it discards record
   byte positions.
 * Manifest sidecar is byte-position indexed, not LSN-pair indexed.
-  See "Byte-preserving rewrite" above. PLAN.md was ambiguous about
+  See "Byte-preserving rewrite" above. [PLAN.md Phase 1](PLAN.md#phase-1--wal-filter--crc-rewrite) was ambiguous about
   whether `filtered_lsn` was a count-of-kept-records or a byte
   offset; byte offset chosen.
 * `RM_RELMAP_ID` tracker is implemented; `pg_class` heap-write
-  tracker is stubbed (counter only). PLAN.md grouped both as one
+  tracker is stubbed (counter only). [PLAN.md Phase 1](PLAN.md#phase-1--wal-filter--crc-rewrite) grouped both as one
   bullet; they split into "fully done" + "Phase 3 dependency".
 
 ## What didn't get done
@@ -223,5 +223,5 @@ LOC under `src/` (excluding tests inside source files): ~1,200. With
 in-file tests: 1,837. Tests-only: 205. Estimate was 600. The ~3x
 overshoot is concentrated in `segment.rs` (page-stitching) and the
 fact that PG's WAL on-disk format has more corner cases than
-PLAN.md anticipated (records spanning 3+ pages, headers straddling
+[PLAN.md](PLAN.md) anticipated (records spanning 3+ pages, headers straddling
 boundaries, mid-segment continuations).

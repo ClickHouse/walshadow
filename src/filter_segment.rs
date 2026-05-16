@@ -105,6 +105,10 @@ mod tests {
     const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
 
     fn build_record(rmid: u8, body_payload: &[u8]) -> Vec<u8> {
+        build_record_info(rmid, 0, body_payload)
+    }
+
+    fn build_record_info(rmid: u8, info: u8, body_payload: &[u8]) -> Vec<u8> {
         // body = block_id 0 (HAS_DATA, 4 bytes data), rel(12)+block(4), short marker, main_data
         // For simplicity, build a minimal record with only main_data SHORT
         let main_len = body_payload.len();
@@ -114,7 +118,7 @@ mod tests {
         v.extend_from_slice(&(total as u32).to_le_bytes());
         v.extend_from_slice(&0u32.to_le_bytes()); // xact
         v.extend_from_slice(&0u64.to_le_bytes()); // prev
-        v.push(0); // info
+        v.push(info);
         v.push(rmid);
         v.push(0);
         v.push(0);
@@ -181,5 +185,58 @@ mod tests {
         assert_eq!(mani.records[0].offset, 40); // long header + pad
         assert_eq!(mani.records[0].rmid, RmId::Xact as u8);
         assert_eq!(mani.records[0].kind, Kind::Kept);
+    }
+
+    /// PRE5 item 4: `XLOG_SWITCH` (rmgr RM_XLOG, info 0x40) must pass
+    /// through the filter unchanged and re-parse cleanly. PG emits one
+    /// at every `pg_switch_wal()` and at archive_timeout expirations;
+    /// shadow's recovery state machine needs the byte sequence intact.
+    ///
+    /// PG-wire convention is that XLOG_SWITCH marks the rest of the
+    /// segment as padding zeros (parser stops scanning after the
+    /// record). Test builds a page with one preceding xact record and
+    /// the switch; the filter must keep both byte-identically.
+    #[test]
+    fn xlog_switch_record_passes_through_filter() {
+        use wal_rs::pg::walparser::RmId;
+        const XLOG_SWITCH: u8 = 0x40;
+        let before = build_record(RmId::Xact as u8, &[0xDE, 0xAD]);
+        let switch_rec = build_record_info(RmId::Xlog as u8, XLOG_SWITCH, &[]);
+        let page = build_page_with_records(&[&before, &switch_rec]);
+
+        let (out, mani) = filter_segment(&page, "switch").expect("filter");
+
+        assert_eq!(out.len(), page.len(), "byte-preserving");
+        assert_eq!(mani.records.len(), 2);
+        let switch_entry = mani
+            .records
+            .iter()
+            .find(|e| e.rmid == RmId::Xlog as u8 && (e.info & 0xF0) == XLOG_SWITCH)
+            .expect("XLOG_SWITCH entry in manifest");
+        assert_eq!(
+            switch_entry.kind,
+            Kind::Kept,
+            "XLOG_SWITCH must be kept (special rmgr policy)",
+        );
+        // XLOG_SWITCH bytes are byte-identical between input + output.
+        let off = switch_entry.offset as usize;
+        let len = switch_entry.len as usize;
+        assert_eq!(
+            &page[off..off + len],
+            &out[off..off + len],
+            "XLOG_SWITCH bytes must be passed through unchanged",
+        );
+
+        // Filtered output re-parses through wal-rs's WalParser. The
+        // parser surfaces an `is_wal_switch()` record at the right
+        // place; subsequent bytes on the page are padding so the
+        // parser stops after the switch — matches PG WAL semantics.
+        let mut parser = WalParser::new();
+        let (_, parsed) = parser.parse_records_from_page(&out).expect("parse");
+        assert!(
+            parsed.iter().any(|r| r.is_wal_switch()),
+            "filtered output must still contain an XLOG_SWITCH; got {} records",
+            parsed.len(),
+        );
     }
 }

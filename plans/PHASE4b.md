@@ -1,6 +1,6 @@
 # PHASE4b — restart resilience
 
-Closes Phase 4b of `PLAN.md`. Extends `walshadow::shadow_catalog` so a
+Closes [Phase 4b of `PLAN.md`](PLAN.md#phase-4b--restart-resilience). Extends `walshadow::shadow_catalog` so a
 shadow PG bounce (operator-initiated `pg_ctl restart`, OOM kill that
 systemd recovers from, kernel signal) no longer wedges the daemon. The
 catalog's libpq client now transparently rebuilds on closed-connection
@@ -143,15 +143,16 @@ require teaching `psql` error-classification logic that is not worth
 having. Phase 7's daemon, which orchestrates probes at human cadence,
 owns retry at its own layer.
 
-## Deviations from PLAN.md Phase 4b
+## Deviations from [PLAN.md Phase 4b](PLAN.md#phase-4b--restart-resilience)
 
-* PLAN.md scope bullet says "Generation bump on every successful
-  reconnect"; the implementation also bumps `generation_bumps` in the
-  stats counter so the bump is observable through the same surface as
-  explicit `invalidate()` calls. PLAN.md is silent on which counter
-  reflects the bump; treating the implicit bump and the explicit bump
-  uniformly is simpler than splitting them.
-* PLAN.md mentioned exponential-backoff defaults capped at
+* [PLAN.md](PLAN.md#phase-4b--restart-resilience) scope bullet says
+  "Generation bump on every successful reconnect"; the implementation
+  also bumps `generation_bumps` in the stats counter so the bump is
+  observable through the same surface as explicit `invalidate()`
+  calls. [PLAN.md](PLAN.md#phase-4b--restart-resilience) is silent on
+  which counter reflects the bump; treating the implicit bump and
+  the explicit bump uniformly is simpler than splitting them.
+* [PLAN.md](PLAN.md#phase-4b--restart-resilience) mentioned exponential-backoff defaults capped at
   `replay_timeout` but didn't pin the values. Phase 4b picks 100 ms
   initial / 1 s ceiling — fast enough to catch a sub-second restart
   without spinning, slow enough not to hammer a fully-down PG. Both
@@ -160,7 +161,8 @@ owns retry at its own layer.
 
 ## What didn't get done
 
-* **Shadow PG process supervision.** Out of scope per PLAN.md Phase 4b:
+* **Shadow PG process supervision.** Out of scope per
+  [PLAN.md Phase 4b](PLAN.md#phase-4b--restart-resilience):
   production deploys run shadow PG under systemd, which owns crash
   recovery; walshadow does not babysit the postmaster.
 * **Fine-grained transient classification.** `is_transient` is a

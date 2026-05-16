@@ -32,20 +32,25 @@ floor, not the technical one. PG ≤ 14 captures are rejected.
 
 ## Status
 
-- **Phase 0** — record-classification fixture. PHASE0.md.
-- **Phase 1** — WAL filter + CRC rewrite. PHASE1.md.
-- **Phase 2** — PG-16-minimum cleanup. PHASE2.md.
-- **Phase 3** — shadow PG lifecycle. PHASE3.md.
-- **Phase 4** — catalog cache integration. PHASE4.md.
-- **Phase 4b** — restart resilience. PHASE4b.md.
+- **Phase 0** — record-classification fixture. [PHASE0.md](PHASE0.md).
+- **Phase 1** — WAL filter + CRC rewrite. [PHASE1.md](PHASE1.md).
+- **Phase 2** — PG-16-minimum cleanup. [PHASE2.md](PHASE2.md).
+- **Phase 3** — shadow PG lifecycle. [PHASE3.md](PHASE3.md).
+- **Phase 4** — catalog cache integration. [PHASE4.md](PHASE4.md).
+- **Phase 4b** — restart resilience. [PHASE4b.md](PHASE4b.md).
+- **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
+  (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
+  (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,
+  `pg_class` heap-write decoder, `CatalogTracker::seed_from_source`
+  bootstrap, `XLOG_SWITCH` pass-through test. [PRE5.md](PRE5.md).
 - **clickhouse-c-rs** — vendored as workspace member. Provides the
   Native-wire emitter for Phase 7. Not gated by a `PHASE*.md`: the
   crate is upstream code, walshadow just consumes it.
 
 Roadmap: Phases 5–10 as listed below (heap decoder → TOAST/xact →
 CH emitter → DDL drill → Tier 3 + oracle → operational). Each phase
-closes with `PHASE<N>.md` at repo root; PLAN.md status list is the
-mutable index.
+closes with `PHASE<N>.md` under `plans/`; the [status list](#status)
+is the mutable index.
 
 Reuses without modification:
 
@@ -450,7 +455,8 @@ Size: ≈400 LOC.
 Landed `walshadow::shadow_catalog`: async tokio-postgres client to
 shadow PG, generation counter, `relation_at(rfn, at_lsn)` gating on
 shadow's `pg_last_wal_replay_lsn`. Decoder relfilenode→relation lookup
-goes through this cache. See `src/shadow_catalog.rs` & PHASE4.md.
+goes through this cache. See `src/shadow_catalog.rs` &
+[PHASE4.md](PHASE4.md).
 
 Size: ≈300 LOC.
 
