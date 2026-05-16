@@ -127,17 +127,17 @@ impl CatalogTracker {
     /// oid falls in the catalog range.
     fn harvest_pg_class_blocks(&mut self, record: &XLogRecord) {
         for blk in &record.blocks {
-            let (db, rel) = (blk.header.location.rel.db_node, blk.header.location.rel.rel_node);
+            let (db, rel) = (
+                blk.header.location.rel.db_node,
+                blk.header.location.rel.rel_node,
+            );
             if !self.is_pg_class_relfilenode(db, rel) {
                 continue;
             }
             match decode_pg_class_tuple(&blk.data) {
                 Some(row) => {
                     self.pg_class_writes_decoded += 1;
-                    if row.oid != 0
-                        && row.oid < FIRST_NORMAL_OBJECT_ID
-                        && row.relfilenode != 0
-                    {
+                    if row.oid != 0 && row.oid < FIRST_NORMAL_OBJECT_ID && row.relfilenode != 0 {
                         self.nodes.insert((db, row.relfilenode));
                     }
                 }
@@ -295,7 +295,11 @@ mod tests {
             blocks: vec![XLogRecordBlock {
                 header: XLogRecordBlockHeader {
                     location: BlockLocation {
-                        rel: RelFileNode { spc_node: 1663, db_node: db, rel_node: rel },
+                        rel: RelFileNode {
+                            spc_node: 1663,
+                            db_node: db,
+                            rel_node: rel,
+                        },
                         block_no: 0,
                     },
                     ..Default::default()

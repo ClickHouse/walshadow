@@ -331,8 +331,9 @@ impl ShadowCatalog {
                 .await?;
             let raw: Option<String> = row.get(0);
             if let Some(s) = raw {
-                let lsn = parse_pg_lsn(&s)
-                    .map_err(|e| CatalogError::Parse(format!("pg_last_wal_replay_lsn {s:?}: {e}")))?;
+                let lsn = parse_pg_lsn(&s).map_err(|e| {
+                    CatalogError::Parse(format!("pg_last_wal_replay_lsn {s:?}: {e}"))
+                })?;
                 self.last_replay_lsn = Some(self.last_replay_lsn.map_or(lsn, |old| old.max(lsn)));
                 if lsn >= target {
                     return Ok(lsn);

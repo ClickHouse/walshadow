@@ -398,12 +398,7 @@ pub struct chc_codec {
 }
 
 unsafe extern "C" {
-    pub fn chc_cityhash128(
-        data: *const c_void,
-        len: usize,
-        out_lo: *mut u64,
-        out_hi: *mut u64,
-    );
+    pub fn chc_cityhash128(data: *const c_void, len: usize, out_lo: *mut u64, out_hi: *mut u64);
 }
 
 #[cfg(feature = "lz4")]

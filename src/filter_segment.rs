@@ -39,15 +39,16 @@ pub fn filter_segment(
 
     // First pass: collect records (we can't borrow `out` mutably while
     // walking it immutably). Materialise logical bytes + ranges.
-    let walked: Vec<_> = SegmentWalker::new(source_bytes)
-        .collect::<Result<Vec<_>, _>>()?;
+    let walked: Vec<_> = SegmentWalker::new(source_bytes).collect::<Result<Vec<_>, _>>()?;
 
     for record in walked {
         // Parse via wal-rs so the Filter sees a populated XLogRecord.
-        let parsed = parse_record_from_bytes(&record.logical_bytes, record.page_magic)
-            .map_err(|e| FilterSegmentError::Parse {
-                offset: record.start_offset,
-                source: e,
+        let parsed =
+            parse_record_from_bytes(&record.logical_bytes, record.page_magic).map_err(|e| {
+                FilterSegmentError::Parse {
+                    offset: record.start_offset,
+                    source: e,
+                }
             })?;
         let decision = filter.decide(&parsed);
         let kind = match decision {
@@ -97,8 +98,8 @@ pub fn filter_segment(
 mod tests {
     use super::*;
     use wal_rs::pg::walparser::{
-        WAL_PAGE_SIZE, WalParser, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_SHORT,
-        X_LOG_RECORD_HEADER_SIZE,
+        WAL_PAGE_SIZE, WalParser, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
+        XLR_BLOCK_ID_DATA_SHORT,
     };
 
     const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;

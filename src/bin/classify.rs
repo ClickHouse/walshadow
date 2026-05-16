@@ -10,11 +10,14 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use walshadow::classify::Summary;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walshadow::classify::Summary;
 
 #[derive(Parser, Debug)]
-#[command(name = "walshadow-classify", about = "Classify WAL records into catalog/user/special")]
+#[command(
+    name = "walshadow-classify",
+    about = "Classify WAL records into catalog/user/special"
+)]
 struct Args {
     /// WAL segment files to scan, in LSN order.
     #[arg(required = true)]
@@ -45,11 +48,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn walk_segment<R: Read>(
-    parser: &mut WalParser,
-    summary: &mut Summary,
-    mut r: R,
-) -> Result<()> {
+fn walk_segment<R: Read>(parser: &mut WalParser, summary: &mut Summary, mut r: R) -> Result<()> {
     let mut page = vec![0u8; WAL_PAGE_SIZE as usize];
     loop {
         let n = read_full(&mut r, &mut page)?;

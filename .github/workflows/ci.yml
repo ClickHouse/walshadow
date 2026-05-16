@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # wal-rs is a sibling path dep (../wal-rs); see walshadow's Cargo.toml.
+  # Accessed via a read-only deploy key on serprex/wal-rs whose private
+  # half lives in secrets.WAL_RS_DEPLOY_KEY.
+  WAL_RS_REPO: serprex/wal-rs
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build + e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout walshadow
+        uses: actions/checkout@v6
+        with:
+          path: walshadow
+
+      - name: Checkout wal-rs (private path dep)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.WAL_RS_REPO }}
+          path: wal-rs
+          ssh-key: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: walshadow
+
+      - name: Install C deps (lz4 + zstd for clickhouse-c-rs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential liblz4-dev libzstd-dev
+
+      # ubuntu-latest ships postgresql-16 preinstalled (server stopped) but
+      # initdb/pg_ctl/postgres aren't on PATH — they live under per-version
+      # libdirs. Pick the newest installed major and prepend its bin dir.
+      - name: PostgreSQL on PATH (for shadow + source PG e2e tests)
+        run: |
+          PG_BIN=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -z "$PG_BIN" ]; then
+            sudo apt-get install -y --no-install-recommends postgresql
+            PG_BIN=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
+          fi
+          echo "Using PG binaries at: $PG_BIN"
+          "$PG_BIN/initdb" --version
+          "$PG_BIN/pg_ctl" --version
+          echo "$PG_BIN" >> "$GITHUB_PATH"
+
+      # Official deb repo gives us both the `clickhouse` multitool (for
+      # `clickhouse local` tests) and `clickhouse-server` (for the
+      # readme_quickstart that connects to localhost:9000).
+      - name: Install ClickHouse (server + client)
+        run: |
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+          curl -fsSL https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update
+          DEBIAN_FRONTEND=noninteractive sudo -E apt-get install -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            clickhouse-server clickhouse-client clickhouse-common-static
+          clickhouse --version
+
+      - name: Start ClickHouse server
+        run: |
+          sudo service clickhouse-server start
+          # Wait for native protocol on :9000 (readme_quickstart probes it).
+          for i in $(seq 1 60); do
+            if clickhouse-client --query "SELECT 1" >/dev/null 2>&1; then
+              echo "clickhouse-server up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "clickhouse-server failed to come up" >&2
+          sudo tail -n 200 /var/log/clickhouse-server/clickhouse-server.err.log || true
+          exit 1
+
+      - name: Build (workspace + tests)
+        working-directory: walshadow
+        run: cargo build --workspace --all-targets --locked
+
+      # All e2e tests run: shadow_lifecycle, shadow_catalog, catalog_seed,
+      # wal_stream_e2e (need initdb), classify_fixture + filter_round_trip
+      # (use checked-in fixtures), clickhouse-c-rs clickhouse_local +
+      # readme_quickstarts (need clickhouse binary + server on :9000).
+      - name: Test (workspace, single-threaded — each test owns a PG cluster)
+        working-directory: walshadow
+        env:
+          # Tests pick non-overlapping ports but PG cluster startup is heavy;
+          # avoid thrashing the runner by serializing.
+          RUST_TEST_THREADS: "1"
+        run: cargo test --workspace --all-targets --locked -- --nocapture
+
+      - name: ClickHouse server logs on failure
+        if: failure()
+        run: sudo tail -n 500 /var/log/clickhouse-server/clickhouse-server.err.log || true
+
+  lint:
+    name: clippy + fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout walshadow
+        uses: actions/checkout@v6
+        with:
+          path: walshadow
+
+      - name: Checkout wal-rs (private path dep)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.WAL_RS_REPO }}
+          path: wal-rs
+          ssh-key: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: walshadow
+          key: lint
+
+      - name: Install C deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential liblz4-dev libzstd-dev
+
+      - name: cargo fmt
+        working-directory: walshadow
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: walshadow
+        run: cargo clippy --workspace --all-targets -- -D warnings

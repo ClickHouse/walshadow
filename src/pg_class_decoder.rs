@@ -105,8 +105,7 @@ pub fn decode_pg_class_tuple(block_data: &[u8]) -> Option<PgClassRow> {
         return None;
     }
     let oid = u32::from_le_bytes(block_data[oid_off..oid_off + 4].try_into().ok()?);
-    let relfilenode =
-        u32::from_le_bytes(block_data[rfn_off..rfn_off + 4].try_into().ok()?);
+    let relfilenode = u32::from_le_bytes(block_data[rfn_off..rfn_off + 4].try_into().ok()?);
     Some(PgClassRow { oid, relfilenode })
 }
 

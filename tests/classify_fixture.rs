@@ -13,8 +13,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use walshadow::classify::Summary;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walshadow::classify::Summary;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/wal/classify/segments")
@@ -30,7 +30,10 @@ fn decompress_gz(path: &PathBuf) -> std::io::Result<Vec<u8>> {
     child.stdout.as_mut().unwrap().read_to_end(&mut out)?;
     let status = child.wait()?;
     if !status.success() {
-        return Err(std::io::Error::other(format!("gunzip {:?} failed: {status}", path)));
+        return Err(std::io::Error::other(format!(
+            "gunzip {:?} failed: {status}",
+            path
+        )));
     }
     Ok(out)
 }
@@ -57,7 +60,10 @@ fn catalog_fraction_under_workload_is_bounded() {
     let dir = fixture_dir();
     let seg = dir.join("000000010000000000000001.gz");
     if !seg.exists() {
-        eprintln!("skip: no captured segment at {:?}. Run capture.sh to regenerate.", seg);
+        eprintln!(
+            "skip: no captured segment at {:?}. Run capture.sh to regenerate.",
+            seg
+        );
         return;
     }
     let bytes = decompress_gz(&seg).expect("gunzip fixture");
@@ -78,7 +84,11 @@ fn catalog_fraction_under_workload_is_bounded() {
     // The < 100% check just confirms the classifier isn't bucketing
     // every record as catalog. Phase 1 introduces a steady-state OLTP
     // workload that re-tightens this toward "well under 1%"
-    assert!(summary.records >= 100, "fixture too small: {} records", summary.records);
+    assert!(
+        summary.records >= 100,
+        "fixture too small: {} records",
+        summary.records
+    );
     assert!(
         summary.catalog_fraction() < 0.99,
         "catalog fraction {:.4} — classifier may be bucketing everything as catalog",
@@ -113,8 +123,16 @@ fn cli_produces_json_for_fixture() {
     drop(f);
 
     let exe = env!("CARGO_BIN_EXE_walshadow-classify");
-    let out = Command::new(exe).arg("--json").arg(tmp.path()).output().unwrap();
-    assert!(out.status.success(), "cli failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(exe)
+        .arg("--json")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json output");
     assert!(parsed["records"].as_u64().unwrap() > 0);
 }

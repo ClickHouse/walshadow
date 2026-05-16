@@ -70,8 +70,15 @@ fn current_db_oid(sh: &Shadow) -> u32 {
 
 async fn connect(sh: &Shadow) -> tokio_postgres::Client {
     let cfg = sh.config();
-    let conninfo = socket_conninfo(cfg.socket_dir.to_str().unwrap(), cfg.port, "postgres", "postgres");
-    let (client, conn) = tokio_postgres::connect(&conninfo, NoTls).await.expect("connect");
+    let conninfo = socket_conninfo(
+        cfg.socket_dir.to_str().unwrap(),
+        cfg.port,
+        "postgres",
+        "postgres",
+    );
+    let (client, conn) = tokio_postgres::connect(&conninfo, NoTls)
+        .await
+        .expect("connect");
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -150,7 +157,8 @@ async fn seed_closes_pre_attach_pg_class_rotation_hole() {
     // Rotate pg_class — `VACUUM FULL pg_class` cycles its mapped
     // filenode to a fresh value, usually above 16384 on a non-fresh
     // cluster but always different from the prior value.
-    sh.psql_one("VACUUM FULL pg_class").expect("vacuum full pg_class");
+    sh.psql_one("VACUUM FULL pg_class")
+        .expect("vacuum full pg_class");
     let pg_class_fn_after = pg_class_filenode_via_psql(&sh);
     assert_ne!(
         pg_class_fn_before, pg_class_fn_after,

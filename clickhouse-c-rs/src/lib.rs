@@ -13,6 +13,10 @@
 //!
 //! [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
 
+// FFI wrappers mirror C arities one-to-one; arg-count refactors would
+// only push parameters into ad-hoc structs without earning anything.
+#![allow(clippy::too_many_arguments)]
+
 pub mod sys;
 
 mod alloc;
@@ -30,7 +34,7 @@ pub use builder::BlockBuilder;
 pub use client::{
     Client, ClientOpts, DEFAULT_REVISION, Exception, ExceptionRef, Packet, PacketKind, ServerInfo,
 };
-pub use codec::{cityhash128, Codec, Compression};
+pub use codec::{Codec, Compression, cityhash128};
 pub use error::{Error, ErrorKind, Result};
 pub use io::PosixIo;
 pub use types::{Kind, TypeAst, TypeRef};

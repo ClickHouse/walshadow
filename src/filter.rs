@@ -100,11 +100,8 @@ impl Filter {
                 None => Decision::Keep, // safe default
             },
         };
-        self.stats.record(
-            class,
-            decision,
-            record.header.total_record_length as u64,
-        );
+        self.stats
+            .record(class, decision, record.header.total_record_length as u64);
         decision
     }
 

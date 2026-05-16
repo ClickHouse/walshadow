@@ -39,7 +39,10 @@ fn decompress_gz(path: &PathBuf) -> std::io::Result<Vec<u8>> {
     child.stdout.as_mut().unwrap().read_to_end(&mut out)?;
     let status = child.wait()?;
     if !status.success() {
-        return Err(std::io::Error::other(format!("gunzip {:?} failed: {status}", path)));
+        return Err(std::io::Error::other(format!(
+            "gunzip {:?} failed: {status}",
+            path
+        )));
     }
     Ok(out)
 }
@@ -80,11 +83,14 @@ fn filtered_segment_round_trips_through_wal_parser() {
     let (out, manifest) = filter_segment(&bytes, "fixture").expect("filter");
 
     // (1) Byte-preserving
-    assert_eq!(out.len(), bytes.len(), "filtered segment length must match source");
+    assert_eq!(
+        out.len(),
+        bytes.len(),
+        "filtered segment length must match source"
+    );
 
     // (2) Re-parses cleanly. (3) Record count matches manifest.
-    let (filtered_count, noops) =
-        parse_all_records(&out).expect("re-parse filtered segment");
+    let (filtered_count, noops) = parse_all_records(&out).expect("re-parse filtered segment");
 
     eprintln!(
         "fixture: source {} bytes, {} records (kept {}, dropped {}, undecoded-pg_class {})",
@@ -95,8 +101,7 @@ fn filtered_segment_round_trips_through_wal_parser() {
         manifest.stats.pg_class_writes_undecoded,
     );
     assert_eq!(
-        filtered_count as u64,
-        manifest.stats.records,
+        filtered_count as u64, manifest.stats.records,
         "WalParser record count != manifest record count"
     );
 
@@ -125,7 +130,10 @@ fn filtered_segment_round_trips_through_wal_parser() {
 fn oltp_workload_keeps_well_under_one_percent() {
     let seg = oltp_segment();
     if !seg.exists() {
-        eprintln!("skip: no OLTP fixture at {:?}. Run fixtures/wal/filter/capture.sh", seg);
+        eprintln!(
+            "skip: no OLTP fixture at {:?}. Run fixtures/wal/filter/capture.sh",
+            seg
+        );
         return;
     }
     let bytes = decompress_gz(&seg).expect("gunzip oltp fixture");
@@ -190,10 +198,9 @@ fn writes_filtered_segment_and_manifest_via_cli() {
 
     let in_name = tmp_in.path().file_name().unwrap();
     let seg_path = out_dir.path().join(in_name);
-    let manifest_path = out_dir.path().join(format!(
-        "{}.manifest.json",
-        in_name.to_string_lossy()
-    ));
+    let manifest_path = out_dir
+        .path()
+        .join(format!("{}.manifest.json", in_name.to_string_lossy()));
     assert!(seg_path.exists());
     assert!(manifest_path.exists());
 

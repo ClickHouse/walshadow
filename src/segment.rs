@@ -12,8 +12,8 @@
 
 use thiserror::Error;
 use wal_rs::pg::walparser::{
-    WAL_PAGE_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, X_LOG_RECORD_ALIGNMENT,
-    X_LOG_RECORD_HEADER_SIZE,
+    WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER,
+    XLP_PAGE_MAGIC_PG15,
 };
 
 const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
@@ -138,7 +138,11 @@ impl<'a> SegmentWalker<'a> {
             return Err(WalkError::BadPageInfo(self.page_start, info));
         }
         let is_long = (info & XLP_LONG_HEADER) != 0;
-        let header_size = if is_long { LONG_HEADER_SIZE } else { SHORT_HEADER_SIZE };
+        let header_size = if is_long {
+            LONG_HEADER_SIZE
+        } else {
+            SHORT_HEADER_SIZE
+        };
         if self.page_start + header_size > self.bytes.len() {
             return Err(WalkError::Truncated(self.page_start));
         }
@@ -175,11 +179,7 @@ impl<'a> SegmentWalker<'a> {
         Ok(Some(()))
     }
 
-    fn consume_continuation(
-        &mut self,
-        data_start: usize,
-        len: usize,
-    ) -> Result<(), WalkError> {
+    fn consume_continuation(&mut self, data_start: usize, len: usize) -> Result<(), WalkError> {
         let cont_end = data_start + len;
         if cont_end > self.bytes.len() {
             return Err(WalkError::Truncated(self.page_start));
@@ -229,16 +229,17 @@ impl<'a> SegmentWalker<'a> {
             self.cursor = page_end;
             return Ok(None);
         }
-        let xl_tot_len = u32::from_le_bytes(
-            self.bytes[self.cursor..self.cursor + 4].try_into().unwrap(),
-        );
+        let xl_tot_len =
+            u32::from_le_bytes(self.bytes[self.cursor..self.cursor + 4].try_into().unwrap());
         if xl_tot_len == 0 {
             // Zero header = post-WAL-switch padding / EOF
             if self.bytes[self.cursor..page_end].iter().all(|&b| b == 0) {
                 self.done = true;
                 return Ok(None);
             }
-            return Err(WalkError::ZeroRecord { offset: self.cursor });
+            return Err(WalkError::ZeroRecord {
+                offset: self.cursor,
+            });
         }
         let total = xl_tot_len as usize;
         if total < X_LOG_RECORD_HEADER_SIZE {

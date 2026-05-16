@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
-    socket_conninfo, with_transient_retry, CatalogError, ShadowCatalog, ShadowCatalogConfig,
+    CatalogError, ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
 };
 
 fn pg_available() -> bool {
@@ -21,10 +21,7 @@ fn pg_available() -> bool {
 }
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
-    let mut cfg = ShadowConfig::new(
-        tmp.path().join("data"),
-        tmp.path().join("filtered"),
-    );
+    let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
     cfg.port = port;
     cfg.socket_dir = tmp.path().join("sock");
     cfg.ctl_timeout = Duration::from_secs(30);
@@ -60,7 +57,9 @@ async fn open_catalog(shadow: &Shadow, replay_timeout: Duration) -> ShadowCatalo
         replay_poll: Duration::from_millis(20),
         ..Default::default()
     };
-    ShadowCatalog::connect(&conninfo, cat_cfg).await.expect("catalog connect")
+    ShadowCatalog::connect(&conninfo, cat_cfg)
+        .await
+        .expect("catalog connect")
 }
 
 fn pg_class_filenode_via_psql(shadow: &Shadow) -> u32 {
@@ -73,7 +72,9 @@ fn pg_class_filenode_via_psql(shadow: &Shadow) -> u32 {
 
 fn user_relation_filenode(shadow: &Shadow, qualified: &str) -> u32 {
     shadow
-        .psql_one(&format!("SELECT pg_relation_filenode('{qualified}'::regclass)::int8"))
+        .psql_one(&format!(
+            "SELECT pg_relation_filenode('{qualified}'::regclass)::int8"
+        ))
         .expect("psql user filenode")
         .parse()
         .expect("filenode is integer")
@@ -206,14 +207,21 @@ async fn user_relation_lookup_and_invalidation() {
     // Cache hit on repeat lookup.
     let first_misses = cat.stats().misses;
     let _ = cat.relation_at(rfn, 0).await.unwrap();
-    assert_eq!(cat.stats().misses, first_misses, "second lookup should not miss");
+    assert_eq!(
+        cat.stats().misses,
+        first_misses,
+        "second lookup should not miss"
+    );
 
     // Generation bump → forced refetch.
     let gen_before = cat.generation();
     cat.invalidate();
     assert_eq!(cat.generation(), gen_before + 1);
     let fetches_before = cat.stats().fetches;
-    let again = cat.relation_at(rfn, 0).await.expect("relation_at after invalidate");
+    let again = cat
+        .relation_at(rfn, 0)
+        .await
+        .expect("relation_at after invalidate");
     assert_eq!(again.name, "things");
     assert_eq!(
         cat.stats().fetches,
@@ -222,7 +230,10 @@ async fn user_relation_lookup_and_invalidation() {
     );
 
     // by-oid path round-trips back to the same descriptor.
-    let by_oid = cat.relation_by_oid(desc.oid).await.expect("relation_by_oid");
+    let by_oid = cat
+        .relation_by_oid(desc.oid)
+        .await
+        .expect("relation_by_oid");
     assert_eq!(by_oid.name, "things");
     assert_eq!(by_oid.rfn.rel_node, filenode);
 }

@@ -25,10 +25,7 @@ fn pg_available() -> bool {
 }
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
-    let mut cfg = ShadowConfig::new(
-        tmp.path().join("data"),
-        tmp.path().join("filtered"),
-    );
+    let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
     cfg.port = port;
     cfg.socket_dir = tmp.path().join("sock");
     cfg.ctl_timeout = Duration::from_secs(30);
@@ -119,7 +116,10 @@ fn standby_mode_lifecycle() {
     let walshadow_test_count = shadow
         .psql_one("SELECT count(*) FROM pg_class WHERE relname = 't' AND relnamespace = 'walshadow_test'::regnamespace")
         .expect("count walshadow_test.t");
-    assert_eq!(walshadow_test_count, "1", "schema dump must persist into standby");
+    assert_eq!(
+        walshadow_test_count, "1",
+        "schema dump must persist into standby"
+    );
     assert_eq!(h.pg_proc_relname, "pg_proc");
 
     drop(started);
@@ -139,8 +139,7 @@ fn restore_command_filename_is_segment_relative() {
     shadow.write_base_conf().expect("conf");
     shadow.enable_standby_recovery().expect("standby");
 
-    let conf =
-        std::fs::read_to_string(tmp.path().join("data/postgresql.conf")).expect("read conf");
+    let conf = std::fs::read_to_string(tmp.path().join("data/postgresql.conf")).expect("read conf");
     assert!(
         conf.contains("restore_command = 'cp "),
         "postgresql.conf missing restore_command line",

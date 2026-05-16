@@ -25,9 +25,7 @@ use wal_rs::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::SourceFeed;
-use walshadow::wal_stream::{
-    CollectingRecordSink, DirSegmentSink, WAL_SEG_SIZE, WalStream,
-};
+use walshadow::wal_stream::{CollectingRecordSink, DirSegmentSink, WAL_SEG_SIZE, WalStream};
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -161,11 +159,9 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
     let mut prev_dispatched = stream.dispatched_lsn();
     while segments_shipped < 1 && std::time::Instant::now() < deadline {
         let apply_lsn = stream.dispatched_lsn();
-        let next = tokio::time::timeout(
-            Duration::from_secs(2),
-            feed.next_chunk(apply_lsn, &mut buf),
-        )
-        .await;
+        let next =
+            tokio::time::timeout(Duration::from_secs(2), feed.next_chunk(apply_lsn, &mut buf))
+                .await;
         let chunk = match next {
             Ok(Ok(Some(c))) => c,
             Ok(Ok(None)) => break, // CopyDone
@@ -231,10 +227,9 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         "manifest sidecar at {}",
         mani_path.display(),
     );
-    let manifest: serde_json::Value = serde_json::from_reader(
-        std::fs::File::open(&mani_path).expect("open manifest"),
-    )
-    .expect("parse manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(&mani_path).expect("open manifest"))
+            .expect("parse manifest");
     assert_eq!(
         manifest["records"].as_array().unwrap().len(),
         count,

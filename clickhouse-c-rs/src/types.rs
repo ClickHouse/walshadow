@@ -165,7 +165,6 @@ impl TypeAst {
             _marker: core::marker::PhantomData,
         }
     }
-
 }
 
 impl Drop for TypeAst {
@@ -293,9 +292,8 @@ impl<'a> TypeRef<'a> {
             return String::new();
         }
         let mut buf = vec![0u8; needed + 1];
-        let _ = unsafe {
-            sys::chc_type_format(self.raw, buf.as_mut_ptr().cast::<c_char>(), buf.len())
-        };
+        let _ =
+            unsafe { sys::chc_type_format(self.raw, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
         buf.truncate(needed);
         String::from_utf8_lossy(&buf).into_owned()
     }

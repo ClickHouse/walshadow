@@ -93,10 +93,7 @@ pub struct RecordEvent {
 
 impl RecordEvent {
     /// Build from a [`Manifest`] entry plus the segment's start LSN.
-    pub fn from_manifest_entry(
-        seg_start_lsn: u64,
-        entry: &crate::manifest::Entry,
-    ) -> Self {
+    pub fn from_manifest_entry(seg_start_lsn: u64, entry: &crate::manifest::Entry) -> Self {
         let decision = match entry.kind {
             Kind::Kept => Decision::Keep,
             Kind::Dropped => Decision::Drop,
@@ -156,8 +153,7 @@ impl SegmentSink for CollectingSegmentSink {
         bytes: &[u8],
         manifest: &Manifest,
     ) -> Result<(), SinkError> {
-        self.segments
-            .push((seg, bytes.to_vec(), manifest.clone()));
+        self.segments.push((seg, bytes.to_vec(), manifest.clone()));
         Ok(())
     }
 }
@@ -293,8 +289,11 @@ impl WalStream {
         let pad = self.seg_size as usize - self.current_buf.len();
         self.current_buf.extend(std::iter::repeat_n(0u8, pad));
         let name = seg.format();
-        let (filtered, manifest) = filter_segment(&self.current_buf, &name)
-            .map_err(|source| WalStreamError::Filter { seg: name.clone(), source })?;
+        let (filtered, manifest) =
+            filter_segment(&self.current_buf, &name).map_err(|source| WalStreamError::Filter {
+                seg: name.clone(),
+                source,
+            })?;
         for entry in &manifest.records {
             let event = RecordEvent::from_manifest_entry(seg_start_lsn, entry);
             record_sink.on_record(&event)?;
@@ -314,8 +313,8 @@ impl WalStream {
         let seg = self.segment_for_lsn(self.current_lsn);
         let seg_start_lsn = self.current_lsn;
         let name = seg.format();
-        let (filtered, manifest) = filter_segment(&self.current_buf, &name)
-            .map_err(|source| WalStreamError::Filter {
+        let (filtered, manifest) =
+            filter_segment(&self.current_buf, &name).map_err(|source| WalStreamError::Filter {
                 seg: name.clone(),
                 source,
             })?;
@@ -422,6 +421,10 @@ mod tests {
         let on_disk = std::fs::read(&seg_path).unwrap();
         assert_eq!(on_disk, bytes);
         // No `.partial` leftovers — atomic rename cleaned up.
-        assert!(!tmp.path().join(format!("{}.partial", seg.format())).exists());
+        assert!(
+            !tmp.path()
+                .join(format!("{}.partial", seg.format()))
+                .exists()
+        );
     }
 }

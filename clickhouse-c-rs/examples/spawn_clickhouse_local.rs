@@ -11,7 +11,9 @@ use std::process::{Command, Stdio};
 use clickhouse_c::{Allocator, Block, BlockOpts, ColumnLayout, Kind, PosixIo};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let query = std::env::args().nth(1).ok_or("usage: spawn_clickhouse_local <SQL>")?;
+    let query = std::env::args()
+        .nth(1)
+        .ok_or("usage: spawn_clickhouse_local <SQL>")?;
 
     let child = Command::new("clickhouse")
         .args([
@@ -62,14 +64,13 @@ unsafe fn libc_close(fd: std::os::fd::RawFd) {
     let _ = unsafe { close(fd) };
 }
 
-fn print_value(
-    out: &mut impl Write,
-    block: &Block,
-    col: usize,
-    row: usize,
-) -> std::io::Result<()> {
-    let Some(c) = block.column(col) else { return Ok(()); };
-    let Some(t) = block.column_type(col) else { return Ok(()); };
+fn print_value(out: &mut impl Write, block: &Block, col: usize, row: usize) -> std::io::Result<()> {
+    let Some(c) = block.column(col) else {
+        return Ok(());
+    };
+    let Some(t) = block.column_type(col) else {
+        return Ok(());
+    };
 
     let (layout, t, c) = if matches!(c.layout(), Some(ColumnLayout::Nullable)) {
         if c.null_map().map(|m| m[row] != 0).unwrap_or(false) {
@@ -107,7 +108,11 @@ fn print_value(
         }
         Some(ColumnLayout::String) => {
             let (offsets, data) = c.string().expect("String column");
-            let start = if row == 0 { 0 } else { offsets[row - 1] as usize };
+            let start = if row == 0 {
+                0
+            } else {
+                offsets[row - 1] as usize
+            };
             let end = offsets[row] as usize;
             out.write_all(&data[start..end])
         }

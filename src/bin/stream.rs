@@ -32,12 +32,13 @@ use clap::Parser;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
 use walshadow::source_feed::SourceFeed;
-use walshadow::wal_stream::{
-    CollectingRecordSink, DirSegmentSink, WAL_SEG_SIZE, WalStream,
-};
+use walshadow::wal_stream::{CollectingRecordSink, DirSegmentSink, WAL_SEG_SIZE, WalStream};
 
 #[derive(Debug, Parser)]
-#[command(name = "walshadow-stream", about = "Stream + filter physical WAL from source PG.")]
+#[command(
+    name = "walshadow-stream",
+    about = "Stream + filter physical WAL from source PG."
+)]
 struct Args {
     /// Source PG host (TCP) or unix socket directory (leading `/`).
     #[arg(long, default_value = "localhost")]
@@ -148,8 +149,7 @@ async fn run(args: Args) -> Result<()> {
 
     let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned)?;
     let mut record_sink = CollectingRecordSink::default();
-    let mut segment_sink = DirSegmentSink::new(args.out_dir.clone())
-        .context("open out-dir")?;
+    let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     let mut segments_shipped = 0u64;

@@ -56,13 +56,13 @@ fn quickstart_decode_clickhouse_local() -> Result<(), Box<dyn std::error::Error>
     while let Some(block) = Block::read(io.as_mut(), alloc, BlockOpts::default())? {
         total_rows += block.n_rows();
         // README placeholder: block.n_rows(), block.column(i).fixed() / .string() / ...
-        if let Some(c) = block.column(0) {
-            if let Some((es, bytes)) = c.fixed() {
-                assert_eq!(es, 8, "numbers() is UInt64");
-                for row in 0..block.n_rows() {
-                    let p = &bytes[row * es..(row + 1) * es];
-                    saw_values.push(u64::from_le_bytes(p.try_into().unwrap()));
-                }
+        if let Some(c) = block.column(0)
+            && let Some((es, bytes)) = c.fixed()
+        {
+            assert_eq!(es, 8, "numbers() is UInt64");
+            for row in 0..block.n_rows() {
+                let p = &bytes[row * es..(row + 1) * es];
+                saw_values.push(u64::from_le_bytes(p.try_into().unwrap()));
             }
         }
     }

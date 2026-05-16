@@ -19,7 +19,10 @@ use clap::Parser;
 use walshadow::filter_segment::filter_segment;
 
 #[derive(Debug, Parser)]
-#[command(name = "walshadow-filter", about = "Filter WAL segment to catalog-only.")]
+#[command(
+    name = "walshadow-filter",
+    about = "Filter WAL segment to catalog-only."
+)]
 struct Args {
     /// Input segment file. Pass once per segment.
     #[arg(long = "in", value_name = "SEGMENT")]
@@ -47,8 +50,8 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> Result<()> {
-    let bytes = fs::read(&args.input)
-        .with_context(|| format!("read input {}", args.input.display()))?;
+    let bytes =
+        fs::read(&args.input).with_context(|| format!("read input {}", args.input.display()))?;
     let name = args
         .input
         .file_name()
@@ -64,9 +67,9 @@ fn run(args: Args) -> Result<()> {
     fs::write(&out_path, &filtered)
         .with_context(|| format!("write filtered segment {}", out_path.display()))?;
 
-    let manifest_path = args.manifest.unwrap_or_else(|| {
-        args.out_dir.join(format!("{name}.manifest.json"))
-    });
+    let manifest_path = args
+        .manifest
+        .unwrap_or_else(|| args.out_dir.join(format!("{name}.manifest.json")));
     let mf = fs::File::create(&manifest_path)
         .with_context(|| format!("create manifest {}", manifest_path.display()))?;
     serde_json::to_writer_pretty(mf, &manifest)

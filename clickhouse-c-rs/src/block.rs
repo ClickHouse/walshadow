@@ -305,4 +305,3 @@ pub struct LowCardinalityView<'b> {
     pub keys: &'b [u8],
     pub dict: Column<'b>,
 }
-

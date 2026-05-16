@@ -88,7 +88,13 @@ fn generate_constants(chc_dir: &Path, out_dir: &Path) {
     emit_enum(&mut out, &errors.1, "core::ffi::c_int");
 
     // Named enums.
-    emit_named(&mut out, &core_enums, "chc_kind", "chc_kind", "clickhouse.h");
+    emit_named(
+        &mut out,
+        &core_enums,
+        "chc_kind",
+        "chc_kind",
+        "clickhouse.h",
+    );
     emit_named(
         &mut out,
         &core_enums,
@@ -137,9 +143,12 @@ fn read(dir: &Path, name: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+// (Some(tag) | None for anonymous, variants as (name, value)).
+type EnumBlock = (Option<String>, Vec<(String, i64)>);
+
 fn emit_named(
     out: &mut String,
-    enums: &[(Option<String>, Vec<(String, i64)>)],
+    enums: &[EnumBlock],
     enum_name: &str,
     rust_type: &str,
     source_header: &str,
@@ -196,7 +205,7 @@ fn is_ident_byte(b: u8) -> bool {
 /// Returns `[(Some(name) | None, variants)]`. Variant value handles
 /// explicit `= INT_LITERAL` (decimal or hex, optional u/U/l/L suffix)
 /// and auto-increment from the previous variant.
-fn extract_enums(src: &str) -> Vec<(Option<String>, Vec<(String, i64)>)> {
+fn extract_enums(src: &str) -> Vec<EnumBlock> {
     let src = strip_comments(src);
     let bytes = src.as_bytes();
     let mut results = vec![];
@@ -281,7 +290,7 @@ fn parse_enum_body(body: &str) -> Vec<(String, i64)> {
 
 fn parse_c_integer(s: &str) -> Option<i64> {
     let s = s.trim();
-    let s = s.trim_end_matches(|c: char| matches!(c, 'u' | 'U' | 'l' | 'L'));
+    let s = s.trim_end_matches(['u', 'U', 'l', 'L']);
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         i64::from_str_radix(hex, 16).ok()
     } else {

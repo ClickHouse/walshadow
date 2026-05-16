@@ -431,10 +431,7 @@ mod tests {
         assert_eq!(parse_pg_lsn("0/1").unwrap(), 1);
         assert_eq!(parse_pg_lsn("0/16B3750").unwrap(), 0x016B3750);
         assert_eq!(parse_pg_lsn("1/0").unwrap(), 1u64 << 32);
-        assert_eq!(
-            parse_pg_lsn("FFFFFFFF/FFFFFFFF").unwrap(),
-            u64::MAX
-        );
+        assert_eq!(parse_pg_lsn("FFFFFFFF/FFFFFFFF").unwrap(), u64::MAX);
     }
 
     #[test]
@@ -451,6 +448,9 @@ mod tests {
             PathBuf::from("/tmp/walshadow-test/data"),
             PathBuf::from("/tmp/walshadow-test/filtered"),
         );
-        assert_eq!(cfg.socket_dir, PathBuf::from("/tmp/walshadow-test/shadow_sock"));
+        assert_eq!(
+            cfg.socket_dir,
+            PathBuf::from("/tmp/walshadow-test/shadow_sock")
+        );
     }
 }

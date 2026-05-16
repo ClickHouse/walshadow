@@ -13,7 +13,7 @@
 //! header (xl_tot_len through `xl_rmid` + 2 padding bytes).
 
 use wal_rs::pg::walparser::{
-    RmId, XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT, X_LOG_RECORD_HEADER_SIZE,
+    RmId, X_LOG_RECORD_HEADER_SIZE, XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT,
 };
 
 /// `XLogRecordHeader.info` value for an XLOG_NOOP record (high nibble
@@ -124,7 +124,10 @@ mod tests {
         let prev_orig = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         noop_replace(&mut bytes).unwrap();
         // xl_prev preserved
-        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), prev_orig);
+        assert_eq!(
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            prev_orig
+        );
         // info / rmid rewritten
         assert_eq!(bytes[16], XLOG_NOOP);
         assert_eq!(bytes[17], RmId::Xlog as u8);
@@ -159,13 +162,19 @@ mod tests {
     fn rejects_too_small_record() {
         let mut bytes = header_le(25, 0, 0, 0, RmId::Heap as u8);
         bytes.push(0); // body 1 byte
-        assert!(matches!(noop_replace(&mut bytes), Err(RewriteError::TooSmall(_))));
+        assert!(matches!(
+            noop_replace(&mut bytes),
+            Err(RewriteError::TooSmall(_))
+        ));
     }
 
     #[test]
     fn rejects_short_buffer() {
         let mut bytes = header_le(100, 0, 0, 0, RmId::Heap as u8); // claims 100 but only has 24
-        assert!(matches!(noop_replace(&mut bytes), Err(RewriteError::TooSmall(_))));
+        assert!(matches!(
+            noop_replace(&mut bytes),
+            Err(RewriteError::TooSmall(_))
+        ));
     }
 
     #[test]

@@ -222,10 +222,7 @@ impl Client {
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_client_recv_packet(self.raw.as_ptr(), &mut raw, &mut err) };
         check(rc, &err)?;
-        Ok(Packet {
-            raw,
-            client: self,
-        })
+        Ok(Packet { raw, client: self })
     }
 }
 
@@ -292,7 +289,10 @@ impl core::fmt::Debug for Exception {
         f.debug_struct("Exception")
             .field("code", &self.code())
             .field("name", &String::from_utf8_lossy(self.name()))
-            .field("display_text", &String::from_utf8_lossy(self.display_text()))
+            .field(
+                "display_text",
+                &String::from_utf8_lossy(self.display_text()),
+            )
             .field("stack_trace", &String::from_utf8_lossy(self.stack_trace()))
             .field("nested", &self.nested())
             .finish()
@@ -368,7 +368,10 @@ impl<'e> core::fmt::Debug for ExceptionRef<'e> {
         f.debug_struct("ExceptionRef")
             .field("code", &self.code())
             .field("name", &String::from_utf8_lossy(self.name()))
-            .field("display_text", &String::from_utf8_lossy(self.display_text()))
+            .field(
+                "display_text",
+                &String::from_utf8_lossy(self.display_text()),
+            )
             .field("stack_trace", &String::from_utf8_lossy(self.stack_trace()))
             .field("nested", &self.nested())
             .finish()
