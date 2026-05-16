@@ -1,10 +1,11 @@
 # walshadow — schema-only Postgres as live catalog mirror for CDC
 
-Companion architecture to `~/s/walhouse/pgchcdc/PLAN.md`. Same product
-shape — physical-WAL → ClickHouse read replica, no logical-decoding
-plugin — but trades pgchcdc's *static catalog snapshot* for a co-located
-**shadow Postgres** that holds schema only, replays only catalog WAL,
-and doubles as a decoder oracle.
+Physical-WAL → ClickHouse read replica with no logical-decoding plugin.
+Source PG's physical WAL stream feeds two consumers in the daemon: a
+co-located **shadow Postgres** that holds schema only and replays only
+catalog WAL, and an in-tree decoder that turns user-heap records into
+ClickHouse Native blocks. Shadow PG doubles as a live catalog oracle
+for the decoder.
 
 ## Supported PostgreSQL versions
 
@@ -37,33 +38,39 @@ floor, not the technical one. PG ≤ 14 captures are rejected.
 - **Phase 3** — shadow PG lifecycle. PHASE3.md.
 - **Phase 4** — catalog cache integration. PHASE4.md.
 - **Phase 4b** — restart resilience. PHASE4b.md.
+- **clickhouse-c-rs** — vendored as workspace member. Provides the
+  Native-wire emitter for Phase 7. Not gated by a `PHASE*.md`: the
+  crate is upstream code, walshadow just consumes it.
 
-Roadmap: Phases 5–7 as listed below. Each phase closes with
-`PHASE<N>.md` at repo root; PLAN.md status list is the mutable index.
+Roadmap: Phases 5–10 as listed below (heap decoder → TOAST/xact →
+CH emitter → DDL drill → Tier 3 + oracle → operational). Each phase
+closes with `PHASE<N>.md` at repo root; PLAN.md status list is the
+mutable index.
 
 Reuses without modification:
 
 - `~/s/wal-rs` Phase D `START_REPLICATION PHYSICAL` client, slot
   keepalive, TLS, SCRAM. walshadow consumes WAL bytes from this layer.
-- `~/s/walhouse/pgchcdc` everything below the catalog interface: WAL
-  record walker, heap tuple decoder, TOAST reassembly, xact buffer, CH
-  Native emitter, cursor file, type matrix, config TOML shape.
+- `clickhouse-c-rs` (workspace member under `clickhouse-c-rs/`). Rust
+  bindings to clickhouse-c's Native wire client: raw block
+  encode/decode plus the full TCP packet loop (Hello / Query / Data /
+  EOS / Exception / Progress) with LZ4 / ZSTD. walshadow's emitter
+  builds blocks via `BlockBuilder` & ships them over `Client`.
 - `~/s/walhouse/rust-hack` informally as a reference for off-disk
   parsing ergonomics. Not a runtime dependency.
 
-This doc covers only what walshadow adds: catalog mirror + replay
-filter + oracle integration.
-
 ## Why a shadow Postgres
 
-pgchcdc's static-catalog posture forces three concessions:
+A static-catalog snapshot (the simpler alternative — bootstrap pg_class
+/ pg_attribute / pg_type / pg_index once at start, never refresh)
+forces three concessions:
 
-1. Operator coordinates every DDL (pause walhouse, run DDL on both
-   sides, re-bootstrap, resume). pgchcdc PLAN.md Phase 10.
+1. Operator coordinates every DDL: pause the daemon, run DDL on both
+   sides, re-bootstrap, resume.
 2. Relfilenode rewrites (`VACUUM FULL`, `CLUSTER`, `REINDEX`,
    `ALTER TABLE ... SET TABLESPACE`) aren't observable without an
    external signal.
-3. No in-tree oracle when our decoder disagrees with PG on Tier 3
+3. No in-tree oracle when the decoder disagrees with PG on Tier 3
    values (numeric edge cases, jsonb canonicalisation, array layout).
 
 A second Postgres process sitting next to wal-rs, with schema only and
@@ -73,8 +80,7 @@ WAL-driven catalog, fixes all three at a bounded cost:
    `pg_class` / `pg_attribute` / `pg_type` / `pg_index` / `pg_depend`.
    Replay those records into shadow PG and `pg_catalog` stays current
    with zero operator coordination. Decoder queries catalog via libpq
-   SQL connection to shadow PG, same shape as pgchcdc's bootstrap query,
-   re-issued on cache invalidation.
+   SQL connection to shadow PG, re-issued on cache invalidation.
 2. **Relfilenode rewrites.** `pg_class.relfilenode` changes ride the
    same heap WAL into shadow PG. Decoder's `RelFileLocator → relation`
    index follows automatically.
@@ -166,7 +172,7 @@ and for those the keep/drop is uniform (catalog or not).
        |          | user-rel        +-----------+
        |          v                 | CRC       |
        |    +-----------+           | rewrite   |
-       |    | pgchcdc   |           +-----+-----+
+       |    | heap      |           +-----+-----+
        |    | decoder   |                 |      |
        |    +-----+-----+                 v      |
        |          |                +------------+|
@@ -174,10 +180,10 @@ and for those the keep/drop is uniform (catalog or not).
        |          |        SQL <---| postgres   ||
        |          |                | (recovery) ||
        |          v                +------------+|
-       |    +-----------+                        |
-       |    | CH Native |                        |
-       |    | emitter   |                        |
-       |    +-----+-----+                        |
+       |    +------------+                       |
+       |    | chc-rs     |                       |
+       |    | emitter    |                       |
+       |    +-----+------+                       |
        +----------|-----------------------------+
                   v
             +-----------+
@@ -194,7 +200,8 @@ on shadow before reading catalog for that xact's user records.
 
 ## Decoder catalog interface
 
-Replaces pgchcdc's bootstrap-once catalog cache.
+Async libpq client to shadow PG, generation counter, replay-LSN gate.
+Landed under `src/shadow_catalog.rs` (Phase 4 / 4b).
 
 ```rust
 pub struct ShadowCatalog {
@@ -246,10 +253,19 @@ round-trip per sampled row.
 
 ## ClickHouse side
 
-Verbatim from `~/s/walhouse/pgchcdc/PLAN.md` §"Type matrix" and
-§"ClickHouse Native emitter". `_lsn` synthetic column carries
-**source** LSN (not shadow LSN), so CH `ReplacingMergeTree` dedup works
-across walshadow restarts and across walshadow / pgchcdc cutovers.
+Emitter is built on `clickhouse-c-rs` (workspace member). Two paths
+exposed by that crate cover both the prod & test/CI ingestion modes:
+
+- **TCP `Client`**: `INSERT INTO t FORMAT Native` against a remote
+  server; LZ4 compression on by default. Used in production.
+- **Block frame over `PosixIo`**: pipe `BlockBuilder` output into
+  `clickhouse local --input-format Native`. Used in fixtures &
+  smoke tests where spinning a full server is overkill.
+
+Type matrix (PG OID → CH `TypeAst`) lives in-tree under `src/type_map.rs`
+(Phase 7). `_lsn` synthetic column carries **source** LSN (not shadow
+LSN), so CH `ReplacingMergeTree` dedup survives walshadow restarts &
+cursor rewinds.
 
 ## Pitfalls
 
@@ -279,7 +295,8 @@ measured to hurt.
 
 Catalog-only replay only needs `wal_level=replica`. Decoder for user
 tables still needs `logical` for old-tuple on UPDATE/DELETE. Net
-requirement on source: `wal_level=logical`, same as pgchcdc.
+requirement on source: `wal_level=logical` plus
+`REPLICA IDENTITY FULL` on every replicated table.
 
 ### 5. Source DDL that rewrites a user table
 
@@ -296,8 +313,8 @@ user heap records, only catalog — trivial case.
 
 `PREPARE TRANSACTION` then `COMMIT PREPARED` minutes later. Shadow PG
 holds the catalog xact in `pg_prepared_xacts`; decoder buffers user
-records. `COMMIT PREPARED` drops the shadow prepare and emits buffered
-records. Same handling as pgchcdc.
+records keyed by gxid. `COMMIT PREPARED` drops the shadow prepare &
+flushes the buffer to the CH emitter.
 
 ### 7. Shadow PG version skew
 
@@ -314,12 +331,12 @@ pool is trivial. Defer the thread pool until a measurement asks for it.
 
 ### 9. Source primary failover
 
-Replication slot doesn't follow a failover. Same posture as pgchcdc:
-operator either pre-creates a slot on the standby, or accepts a
-re-bootstrap from a new LSN with a snapshot bridge. walshadow bootstrap
-is faster than pgchcdc's because catalog is already mirrored on shadow
-PG and the decoder can keep running while we re-attach to the new
-primary's WAL stream.
+Replication slot doesn't follow a failover. Operator either pre-creates
+a slot on the standby, or accepts a re-bootstrap from a new LSN with a
+snapshot bridge. Catalog state is preserved on shadow PG across the
+re-attach, so only user-heap backfill is lost — the decoder can keep
+serving from cache while the new physical stream catches up to the old
+slot's LSN.
 
 ### 10. Shadow PG `pg_wal/` retention
 
@@ -329,11 +346,11 @@ debug replay.
 
 ## Phasing
 
-Each phase produces an independent slice. Phase 1, 3, 4, 5 are
-sequential; Phase 2 runs in parallel with Phase 3; Phase 4b runs in
-parallel with Phase 5; Phase 6 and 7 are parallel once Phase 5
-closes. Phase docs follow the `PHASE<N>.md` convention from
-`~/s/wal-rs` and pgchcdc.
+Each phase produces an independent slice. Phase 1, 3, 4, then the
+decoder chain (5→6→7) are sequential; Phase 2 ran in parallel with
+Phase 3; Phase 4b ran in parallel with Phase 5; Phase 9 & 10 are
+parallel once Phase 8 closes. Phase docs follow the `PHASE<N>.md`
+convention from `~/s/wal-rs`.
 
 ### Phase 0 — record-classification fixture
 
@@ -430,10 +447,10 @@ Size: ≈400 LOC.
 
 ### Phase 4 — catalog cache integration
 
-Lift `pg/catalog.rs` from pgchcdc, replace its bootstrap-once mode
-with `ShadowCatalog` (libpq SQL conn to shadow, generation counter,
-`relation_at(rfn, at_lsn)` gating on shadow's replay LSN). Decoder
-relfilenode→relation lookup goes through this cache.
+Landed `walshadow::shadow_catalog`: async tokio-postgres client to
+shadow PG, generation counter, `relation_at(rfn, at_lsn)` gating on
+shadow's `pg_last_wal_replay_lsn`. Decoder relfilenode→relation lookup
+goes through this cache. See `src/shadow_catalog.rs` & PHASE4.md.
 
 Size: ≈300 LOC.
 
@@ -471,7 +488,65 @@ Out of scope:
   fresh per call; existing error propagation on transient failures
   is correct.
 
-### Phase 5 — end-to-end DDL drill
+### Phase 5 — heap tuple decoder + Tier 1/2 type matrix
+
+Walk `RM_HEAP_ID` / `RM_HEAP2_ID` records the filter classifies as
+`User`, project `HeapTupleHeader` + payload through a per-relation
+descriptor from `ShadowCatalog`, emit a structured `Tuple { rfn, xid,
+op, new, old }` per record. UPDATE/DELETE carry the old tuple under
+`REPLICA IDENTITY FULL`; HOT updates collapse to the new image only
+when no logged columns moved.
+
+Type matrix covers Tier 1 (fixed-width: int2/4/8, float4/8, bool, date,
+time, timestamp, timestamptz, uuid, oid, char) & Tier 2
+(length-prefixed mechanical: bytea, text, varchar, name). Output Rust
+value type is a fixed-width-friendly enum that maps 1:1 onto
+`clickhouse-c-rs`'s `chc_col_kind` slots. Tier 3 (numeric, jsonb,
+arrays, inet, interval, tsvector) lands in Phase 9 alongside the
+oracle.
+
+Size: ≈700 LOC.
+
+### Phase 6 — TOAST reassembly + xact buffer
+
+`HeapTuple` columns flagged `VARATT_IS_EXTERNAL_ONDISK` reference a
+TOAST chunk relation; reassembly reads chunks from the same WAL stream
+the decoder sees (no source-PG round-trip), keyed by
+`(toast_relid, va_valueid)`. Chunks may arrive before or after the
+referring tuple; buffer until both halves are present, flush on xact
+commit.
+
+Xact buffer holds per-xid records until `XLOG_XACT_COMMIT` / abort is
+observed. Abort drops the buffer; commit flushes records in WAL order
+to the emitter, tagged with `(source_lsn, xid, commit_ts)`. Cursor
+file (`{data_dir}/cursor`) persists `(filter_lsn, decoder_lsn,
+emitter_lsn)` atomically (write tmp + rename) on each commit drain.
+
+Size: ≈600 LOC.
+
+### Phase 7 — CH Native emitter via clickhouse-c-rs
+
+Translate per-relation `Tuple` streams into `BlockBuilder` calls. One
+`Client` per CH replica, INSERT statement issued lazily on first row
+for a destination table; subsequent rows accumulate into a block until
+either the row-count budget or the byte budget trips, then
+`send_data(Some(&bb))` flushes & a fresh builder is started. End of
+xact closes the INSERT with `send_data(None)` so each xact lands as
+a single CH block group, matching the dedup model.
+
+Schema mapping: source `RelDescriptor` (from `ShadowCatalog`) →
+destination table name + per-column `TypeAst`. Mapping config lives in
+the TOML config (`[table."public.foo"] target = "default.foo"` etc.).
+`_lsn UInt64`, `_xid UInt32`, `_op Enum8('insert'=1,'update'=2,
+'delete'=3)`, `_commit_ts DateTime64(6)` are appended synthetically.
+
+LZ4 by default; ZSTD opt-in via feature flag passed through to
+`clickhouse-c-rs`. Exception packets from the server propagate as
+`Error::Exception` to walshadow's top-level retry loop.
+
+Size: ≈500 LOC.
+
+### Phase 8 — end-to-end DDL drill
 
 Source script: `CREATE TABLE t (...)`, `INSERT INTO t ...`,
 `ALTER TABLE t ADD COLUMN c int DEFAULT 7` (fast-path), `UPDATE t SET
@@ -480,17 +555,18 @@ whole script unmodified. CH end-state matches source end-state.
 
 Size: ≈200 LOC of test glue.
 
-### Phase 6 — differential decode oracle
+### Phase 9 — differential decode oracle + Tier 3 type matrix
 
-For each Tier 3 fixture row, additionally probe shadow PG's
-typsend/typoutput, compare against decoder output. Add `--validate`
-runtime mode (1-in-N sampling, configurable). Captures a regression
-suite for codec edge cases (numeric `NaN`, jsonb key ordering, array
-NULL bitmap layouts).
+Implement Tier 3 codecs (numeric, jsonb, arrays, inet, interval,
+tsvector) & lock them down with the oracle. For each Tier 3 fixture
+row, additionally probe shadow PG's typsend/typoutput & compare
+against decoder output. Add `--validate` runtime mode (1-in-N
+sampling, configurable). Captures a regression suite for codec edge
+cases (numeric `NaN`, jsonb key ordering, array NULL bitmap layouts).
 
-Size: ≈400 LOC.
+Size: ≈900 LOC.
 
-### Phase 7 — operational
+### Phase 10 — operational
 
 Slot keepalive (walshadow's physical slot on source must advance with
 shadow's replay LSN, not the decoder's commit LSN — slot retention is
@@ -515,8 +591,9 @@ Size: ≈400 LOC.
   workload makes it matter.
 * **Filter ↔ decoder ordering near boundaries.** Decoder reading at
   LSN X gates on shadow replay ≥ X. If shadow stalls (recovery loop,
-  I/O hiccup), decoder stalls. Same blast radius as a source-PG SQL
-  stall in pgchcdc's Phase 10 bootstrap. Surface in metrics.
+  I/O hiccup), decoder stalls. Blast radius is bounded by the WAL
+  retention window plus the cursor file's last commit LSN — surface
+  the gap (filter LSN − shadow replay LSN) in metrics.
 * **Shadow PG restart mid-flight.** `pg_ctl restart` or a
   systemd-driven restart drops `ShadowCatalog`'s libpq connection.
   Phase 4b handles via transparent reconnect plus generation bump;
@@ -528,26 +605,6 @@ Size: ≈400 LOC.
 * **Path A CRC at >1 GB/s WAL.** Measure before parallelising.
 * **PG fork temptation.** Path B keeps surfacing because Path A's
   rewrite "feels heavy". Resist until measured.
-
-## Relationship to pgchcdc
-
-walshadow is an alternate Phase 10 strategy, not a replacement. Decoder,
-type matrix, TOAST reassembly, xact buffer, CH emitter, cursor, and
-config TOML are shared verbatim. Picking between them:
-
-| dimension | pgchcdc | walshadow |
-|---|---|---|
-| extra PG process | none | one (schema-only) |
-| disk on daemon host | cursor file only | + schema PG data dir + filtered WAL window |
-| DDL handling | operator pause/resume | transparent via shadow replay |
-| relfilenode rewrite (VACUUM FULL etc.) | requires re-bootstrap | transparent |
-| Tier 3 decode oracle | offline fixtures only | live via shadow typoutput |
-| failure modes | static catalog drift | shadow replay stall |
-| good fit | low DDL rate, single-binary deploy | high DDL rate, codec correctness focus |
-
-A site that runs both (pgchcdc in prod, walshadow in a soak environment
-sampling 100% of decode output through the oracle) gets pgchcdc's
-operational simplicity in prod plus walshadow's confidence in CI.
 
 ## Acceptance criteria
 

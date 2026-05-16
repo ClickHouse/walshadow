@@ -1,3 +1,6 @@
+[workspace]
+members = ["clickhouse-c-rs"]
+
 [package]
 name = "walshadow"
 version = "0.1.0"
