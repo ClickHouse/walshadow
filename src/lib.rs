@@ -24,4 +24,3 @@ pub mod shadow;
 pub mod shadow_catalog;
 pub mod source_feed;
 pub mod wal_stream;
-pub mod wire;

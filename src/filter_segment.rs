@@ -96,10 +96,9 @@ pub fn filter_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
-
-    use crate::wire::{
-        XLP_LONG_HEADER, XLP_PAGE_MAGIC_MIN, XLR_BLOCK_ID_DATA_SHORT, X_LOG_RECORD_HEADER_SIZE,
+    use wal_rs::pg::walparser::{
+        WAL_PAGE_SIZE, WalParser, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_SHORT,
+        X_LOG_RECORD_HEADER_SIZE,
     };
 
     const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
@@ -134,7 +133,7 @@ mod tests {
 
     fn build_page_with_records(records: &[&[u8]]) -> Vec<u8> {
         let mut page = Vec::with_capacity(PAGE_SIZE);
-        page.extend_from_slice(&XLP_PAGE_MAGIC_MIN.to_le_bytes());
+        page.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
         page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
         page.extend_from_slice(&1u32.to_le_bytes()); // timeline
         page.extend_from_slice(&0u64.to_le_bytes()); // page_address

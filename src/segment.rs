@@ -11,10 +11,9 @@
 //! page-header interruptions), `byte_ranges` is where to write it back.
 
 use thiserror::Error;
-use wal_rs::pg::walparser::WAL_PAGE_SIZE;
-
-use crate::wire::{
-    XLP_LONG_HEADER, XLP_PAGE_MAGIC_MIN, X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE,
+use wal_rs::pg::walparser::{
+    WAL_PAGE_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, X_LOG_RECORD_ALIGNMENT,
+    X_LOG_RECORD_HEADER_SIZE,
 };
 
 const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
@@ -130,7 +129,7 @@ impl<'a> SegmentWalker<'a> {
         if magic & 0xFF00 != 0xD100 {
             return Err(WalkError::BadPageMagic(self.page_start, magic));
         }
-        if magic < XLP_PAGE_MAGIC_MIN {
+        if magic < XLP_PAGE_MAGIC_PG15 {
             return Err(WalkError::UnsupportedSourceVersion(self.page_start, magic));
         }
         // Validate flags
@@ -340,8 +339,6 @@ mod tests {
     use super::*;
     use wal_rs::pg::walparser::{RmId, WalParser};
 
-    use crate::wire::XLP_PAGE_MAGIC_MIN;
-
     /// Build a page with `body` starting after a long header (40 byte
     /// prefix). Zero-pads to PAGE_SIZE.
     fn build_single_page(body: &[u8], magic: u16, remaining_data_len: u32) -> Vec<u8> {
@@ -378,14 +375,14 @@ mod tests {
     fn walks_single_in_page_record() {
         let mut body = header_le(50);
         body.extend_from_slice(&[0u8; 26]);
-        let page = build_single_page(&body, XLP_PAGE_MAGIC_MIN, 0);
+        let page = build_single_page(&body, XLP_PAGE_MAGIC_PG15, 0);
 
         let mut walker = SegmentWalker::new(&page);
         let r = walker.next().unwrap().unwrap();
         assert_eq!(r.logical_bytes.len(), 50);
         assert_eq!(r.byte_ranges.len(), 1);
         assert_eq!(r.start_offset, 40); // long header + 4 pad
-        assert_eq!(r.page_magic, XLP_PAGE_MAGIC_MIN);
+        assert_eq!(r.page_magic, XLP_PAGE_MAGIC_PG15);
         // Walker terminates after zero-padded tail
         assert!(walker.next().is_none());
     }
@@ -399,7 +396,7 @@ mod tests {
         let mut h2 = header_le(60);
         h2.extend_from_slice(&[0u8; 36]);
         body.extend_from_slice(&h2);
-        let page = build_single_page(&body, XLP_PAGE_MAGIC_MIN, 0);
+        let page = build_single_page(&body, XLP_PAGE_MAGIC_PG15, 0);
 
         let mut walker = SegmentWalker::new(&page);
         let r1 = walker.next().unwrap().unwrap();
@@ -425,11 +422,11 @@ mod tests {
         let p1_data_area = PAGE_SIZE - 40;
         let p1_record_bytes = &record[..p1_data_area];
         let p1_remainder_bytes = &record[p1_data_area..]; // 48 bytes
-        let page1 = build_single_page(p1_record_bytes, XLP_PAGE_MAGIC_MIN, 0);
+        let page1 = build_single_page(p1_record_bytes, XLP_PAGE_MAGIC_PG15, 0);
 
         // page 2: short header + remaining_data_len = 48
         let mut page2 = Vec::with_capacity(PAGE_SIZE);
-        page2.extend_from_slice(&XLP_PAGE_MAGIC_MIN.to_le_bytes());
+        page2.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
         page2.extend_from_slice(&0u16.to_le_bytes()); // no flags
         page2.extend_from_slice(&1u32.to_le_bytes()); // timeline
         page2.extend_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // page_address
@@ -456,7 +453,7 @@ mod tests {
     #[test]
     fn walks_terminates_on_zero_padded_page() {
         // Empty body, expect immediate termination
-        let page = build_single_page(&[], XLP_PAGE_MAGIC_MIN, 0);
+        let page = build_single_page(&[], XLP_PAGE_MAGIC_PG15, 0);
         let mut walker = SegmentWalker::new(&page);
         assert!(walker.next().is_none());
     }
@@ -474,7 +471,7 @@ mod tests {
 
     /// PG ≤ 14 capture: magic 0xD10D (PG 14). Reject before the parser
     /// hits any FPI record, since wal-rs's FPI dispatch keys off
-    /// `magic >= XLP_PAGE_MAGIC_MIN`.
+    /// `magic >= XLP_PAGE_MAGIC_PG15`.
     #[test]
     fn rejects_pre_pg15_magic() {
         let body = header_le(40);
@@ -498,7 +495,7 @@ mod tests {
         let mut h2 = header_le(72);
         h2.extend_from_slice(&[0u8; 48]);
         body.extend_from_slice(&h2);
-        let page = build_single_page(&body, XLP_PAGE_MAGIC_MIN, 0);
+        let page = build_single_page(&body, XLP_PAGE_MAGIC_PG15, 0);
 
         let mut walker = SegmentWalker::new(&page);
         let r1 = walker.next().unwrap().unwrap();

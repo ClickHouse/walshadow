@@ -12,9 +12,9 @@
 //! i.e. body bytes first, then the first 20 bytes of the 24-byte
 //! header (xl_tot_len through `xl_rmid` + 2 padding bytes).
 
-use wal_rs::pg::walparser::RmId;
-
-use crate::wire::{XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT, X_LOG_RECORD_HEADER_SIZE};
+use wal_rs::pg::walparser::{
+    RmId, XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT, X_LOG_RECORD_HEADER_SIZE,
+};
 
 /// `XLogRecordHeader.info` value for an XLOG_NOOP record (high nibble
 /// 0x20 in xlog.c `XLOG_NOOP`).
@@ -96,8 +96,7 @@ pub fn compute_crc(record_bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::parse_record_from_bytes;
-    use crate::wire::XLP_PAGE_MAGIC_MIN;
+    use wal_rs::pg::walparser::{XLP_PAGE_MAGIC_PG15, parse_record_from_bytes};
 
     fn header_le(xl_tot_len: u32, xl_xid: u32, xl_prev: u64, info: u8, rmid: u8) -> Vec<u8> {
         let mut v = Vec::with_capacity(X_LOG_RECORD_HEADER_SIZE);
@@ -130,7 +129,7 @@ mod tests {
         assert_eq!(bytes[16], XLOG_NOOP);
         assert_eq!(bytes[17], RmId::Xlog as u8);
         // Re-parses as a clean record
-        let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_MIN).unwrap();
+        let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(parsed.header.info, XLOG_NOOP);
         assert_eq!(parsed.header.total_record_length, bytes.len() as u32);
         assert_eq!(parsed.blocks.len(), 0);
@@ -142,7 +141,7 @@ mod tests {
         // body_len > 257 forces LONG marker
         let mut bytes = build_record(1000, 0x42);
         noop_replace(&mut bytes).unwrap();
-        let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_MIN).unwrap();
+        let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(parsed.header.info, XLOG_NOOP);
         assert_eq!(parsed.main_data_len as usize, 1000 - MIN_LONG_BODY);
     }
@@ -182,7 +181,7 @@ mod tests {
         }
         let crc = compute_crc(&bytes);
         bytes[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
-        let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_MIN).unwrap();
+        let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(parsed.header.crc32_hash, crc);
     }
 }
