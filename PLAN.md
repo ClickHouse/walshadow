@@ -33,11 +33,13 @@ floor, not the technical one. PG ≤ 14 captures are rejected.
 
 - **Phase 0** — record-classification fixture. PHASE0.md.
 - **Phase 1** — WAL filter + CRC rewrite. PHASE1.md.
+- **Phase 2** — PG-16-minimum cleanup. PHASE2.md.
+- **Phase 3** — shadow PG lifecycle. PHASE3.md.
+- **Phase 4** — catalog cache integration. PHASE4.md.
 
-Roadmap: Phase 2 — PG-16-minimum cleanup (small, can run in parallel
-with Phase 3). Phase 3 — shadow PG lifecycle (sequential, needs Phase
-1). Phases 4–7 as listed below. Each phase closes with `PHASE<N>.md`
-at repo root; PLAN.md status list is the mutable index.
+Roadmap: Phase 4b plus Phases 5–7 as listed below. Each phase closes
+with `PHASE<N>.md` at repo root; PLAN.md status list is the mutable
+index.
 
 Reuses without modification:
 
@@ -328,9 +330,10 @@ debug replay.
 ## Phasing
 
 Each phase produces an independent slice. Phase 1, 3, 4, 5 are
-sequential; Phase 2 runs in parallel with Phase 3; Phase 6 and 7 are
-parallel once Phase 5 closes. Phase docs follow the `PHASE<N>.md`
-convention from `~/s/wal-rs` and pgchcdc.
+sequential; Phase 2 runs in parallel with Phase 3; Phase 4b runs in
+parallel with Phase 5; Phase 6 and 7 are parallel once Phase 5
+closes. Phase docs follow the `PHASE<N>.md` convention from
+`~/s/wal-rs` and pgchcdc.
 
 ### Phase 0 — record-classification fixture
 
@@ -434,6 +437,40 @@ relfilenode→relation lookup goes through this cache.
 
 Size: ≈300 LOC. ~3 days.
 
+### Phase 4b — restart resilience
+
+`ShadowCatalog` from Phase 4 holds a single `tokio_postgres::Client`;
+once the underlying connection drops, every subsequent call returns
+`connection closed` forever. Shadow PG bounces (operator-initiated
+`pg_ctl restart`, OOM kill recovered by systemd, kernel signal)
+become hard failures of the walshadow daemon, which is excessive
+given shadow PG's own crash recovery handles the WAL side cleanly.
+
+Scope:
+
+- Auto-reconnect inside `ShadowCatalog`. On a closed-connection
+  error from `client.query*`, transparently rebuild the client
+  (`tokio_postgres::connect` + driver `spawn`) and retry once.
+- Top-level retry policy for transient unavailability ("the database
+  system is starting up", "could not connect"): exponential backoff
+  capped at `replay_timeout`. Sits outside `ShadowCatalog` so the
+  cache machinery stays unaware of retries.
+- Generation bump on every successful reconnect. Catalog mutations
+  landing during the down window may not produce an `invalidate`
+  call from the upstream catalog tracker, so all cache entries are
+  treated as stale on reconnect.
+- `last_replay_lsn` reset on reconnect — previous high-water mark is
+  meaningless against a freshly-restarted PG instance.
+
+Out of scope:
+
+- Shadow PG process supervision. Production runs shadow PG under
+  systemd; walshadow does not own the postgres process lifetime past
+  Phase 3's bootstrap path.
+- Reconnect for the sync `Shadow` probe path. `psql_one` shells out
+  fresh per call; existing error propagation on transient failures
+  is correct.
+
 ### Phase 5 — end-to-end DDL drill
 
 Source script: `CREATE TABLE t (...)`, `INSERT INTO t ...`,
@@ -480,6 +517,10 @@ Size: ≈400 LOC. ~1 week.
   LSN X gates on shadow replay ≥ X. If shadow stalls (recovery loop,
   I/O hiccup), decoder stalls. Same blast radius as a source-PG SQL
   stall in pgchcdc's Phase 10 bootstrap. Surface in metrics.
+* **Shadow PG restart mid-flight.** `pg_ctl restart` or a
+  systemd-driven restart drops `ShadowCatalog`'s libpq connection.
+  Phase 4b handles via transparent reconnect plus generation bump;
+  without that layer the daemon needs an external restart.
 * **Differential oracle false positives.** PG's typoutput for some
   types is locale-dependent (`numeric` thousands separators aren't,
   but `to_char` formatting paths are). Pin shadow's `lc_numeric` and
@@ -528,5 +569,8 @@ FULL` on source:
    sampled row of the bad type.
 5. `kill -9` of walshadow during the workload, restart, end-state on
    CH matches a non-interrupted run (modulo merge transients).
+6. `pg_ctl restart` of shadow PG during the workload, walshadow
+   continues without operator intervention, CH end-state matches a
+   non-interrupted run.
 
-(1)–(3) gate v1.0; (4)–(5) gate v1.1.
+(1)–(3) gate v1.0; (4)–(6) gate v1.1.
