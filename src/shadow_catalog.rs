@@ -31,8 +31,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio_postgres::types::Oid;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::types::{Oid, ToSql};
+use tokio_postgres::{Client, NoTls, Row};
 use wal_rs::pg::walparser::RelFileNode;
 
 use crate::shadow::parse_pg_lsn;
@@ -104,10 +104,15 @@ pub struct ShadowCatalogConfig {
     /// `pg_last_wal_replay_lsn()` poll interval.
     pub replay_poll: Duration,
     /// [`ShadowCatalog::relation_at`] gives up after this long if shadow
-    /// has not advanced past `at_lsn`.
+    /// has not advanced past `at_lsn`. Also bounds the retry window in
+    /// [`with_transient_retry`] when callers pass it in.
     pub replay_timeout: Duration,
     /// Hard cap on cache entries. `None` = unbounded.
     pub max_entries: Option<usize>,
+    /// First sleep when [`with_transient_retry`] backs off.
+    pub reconnect_backoff_initial: Duration,
+    /// Backoff ceiling — exponential growth saturates here.
+    pub reconnect_backoff_max: Duration,
 }
 
 impl Default for ShadowCatalogConfig {
@@ -116,6 +121,8 @@ impl Default for ShadowCatalogConfig {
             replay_poll: Duration::from_millis(50),
             replay_timeout: Duration::from_secs(30),
             max_entries: Some(4096),
+            reconnect_backoff_initial: Duration::from_millis(100),
+            reconnect_backoff_max: Duration::from_secs(1),
         }
     }
 }
@@ -135,6 +142,9 @@ pub struct ShadowCatalogStats {
     pub generation_bumps: u64,
     pub replay_waits: u64,
     pub evictions: u64,
+    /// Successful `tokio_postgres::connect` calls past the first; each one
+    /// drives a generation bump and a `last_replay_lsn` reset.
+    pub reconnects: u64,
 }
 
 /// Build a tokio-postgres connection string for a unix-socket shadow.
@@ -144,6 +154,7 @@ pub fn socket_conninfo(socket_dir: &str, port: u16, user: &str, dbname: &str) ->
 
 pub struct ShadowCatalog {
     client: Client,
+    conninfo: String,
     config: ShadowCatalogConfig,
     generation: u64,
     by_filenode: HashMap<RelFileNode, CacheEntry>,
@@ -157,6 +168,11 @@ impl ShadowCatalog {
     /// Connect over an already-built connection string (key=value form,
     /// libpq style). Spawns the connection's I/O driver onto the current
     /// tokio runtime; the returned `ShadowCatalog` owns the client side.
+    /// One-shot — callers that need retry-on-PG-coming-up wrap this in
+    /// [`with_transient_retry`].
+    ///
+    /// `conninfo` is stashed so the client can be rebuilt transparently
+    /// when shadow PG bounces underneath a long-lived `ShadowCatalog`.
     pub async fn connect(conninfo: &str, config: ShadowCatalogConfig) -> Result<Self> {
         let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
         tokio::spawn(async move {
@@ -165,6 +181,7 @@ impl ShadowCatalog {
         });
         Ok(Self {
             client,
+            conninfo: conninfo.to_string(),
             config,
             generation: 0,
             by_filenode: HashMap::new(),
@@ -199,6 +216,97 @@ impl ShadowCatalog {
         self.generation
     }
 
+    /// Drop the current client and rebuild from stashed `conninfo`. One-shot;
+    /// retry-on-failure is the caller's job via [`with_transient_retry`].
+    ///
+    /// Catalog mutations may have landed during the down window without
+    /// producing an `invalidate` call from the upstream catalog tracker, so
+    /// generation is bumped to mark every cache entry stale on next access.
+    /// `last_replay_lsn` is reset because PG's replay LSN starts fresh
+    /// against a restarted instance.
+    async fn reconnect(&mut self) -> Result<()> {
+        let (client, conn) = tokio_postgres::connect(&self.conninfo, NoTls).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        self.client = client;
+        self.stats.reconnects += 1;
+        self.generation = self.generation.wrapping_add(1);
+        self.stats.generation_bumps += 1;
+        self.last_replay_lsn = None;
+        Ok(())
+    }
+
+    async fn ensure_open(&mut self) -> Result<()> {
+        if self.client.is_closed() {
+            self.reconnect().await?;
+        }
+        Ok(())
+    }
+
+    /// `query_one` with a single transparent reconnect-and-retry on
+    /// closed-connection errors. Other errors propagate as-is.
+    async fn query_one_retry(
+        &mut self,
+        statement: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Row> {
+        self.ensure_open().await?;
+        match self.client.query_one(statement, params).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                if self.client.is_closed() {
+                    self.reconnect().await?;
+                    Ok(self.client.query_one(statement, params).await?)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
+    /// `query_opt` with a single transparent reconnect-and-retry on
+    /// closed-connection errors.
+    async fn query_opt_retry(
+        &mut self,
+        statement: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<Row>> {
+        self.ensure_open().await?;
+        match self.client.query_opt(statement, params).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                if self.client.is_closed() {
+                    self.reconnect().await?;
+                    Ok(self.client.query_opt(statement, params).await?)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
+    /// `query` (multi-row) with a single transparent reconnect-and-retry on
+    /// closed-connection errors.
+    async fn query_retry(
+        &mut self,
+        statement: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>> {
+        self.ensure_open().await?;
+        match self.client.query(statement, params).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                if self.client.is_closed() {
+                    self.reconnect().await?;
+                    Ok(self.client.query(statement, params).await?)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
     /// Last observed `pg_last_wal_replay_lsn()` value (may be NULL when
     /// shadow has not replayed anything yet, e.g. fresh standby start).
     pub fn last_observed_replay(&self) -> Option<u64> {
@@ -219,8 +327,7 @@ impl ShadowCatalog {
         let start = Instant::now();
         loop {
             let row = self
-                .client
-                .query_one("SELECT pg_last_wal_replay_lsn()::text", &[])
+                .query_one_retry("SELECT pg_last_wal_replay_lsn()::text", &[])
                 .await?;
             let raw: Option<String> = row.get(0);
             if let Some(s) = raw {
@@ -335,8 +442,7 @@ impl ShadowCatalog {
         // mapped catalogs it reads pg_filenode.map, for regular tables
         // it reads pg_class.relfilenode.
         let row = self
-            .client
-            .query_opt(
+            .query_opt_retry(
                 "SELECT \
                     c.oid::oid, \
                     c.relnamespace::oid, \
@@ -374,8 +480,7 @@ impl ShadowCatalog {
     async fn fetch_by_oid(&mut self, oid: Oid) -> Result<Option<RelDescriptor>> {
         self.stats.fetches += 1;
         let row = self
-            .client
-            .query_opt(
+            .query_opt_retry(
                 "SELECT \
                     c.oid::oid, \
                     c.relnamespace::oid, \
@@ -420,10 +525,9 @@ impl ShadowCatalog {
         }))
     }
 
-    async fn fetch_attributes(&self, rel_oid: Oid) -> Result<Vec<RelAttr>> {
+    async fn fetch_attributes(&mut self, rel_oid: Oid) -> Result<Vec<RelAttr>> {
         let rows = self
-            .client
-            .query(
+            .query_retry(
                 "SELECT \
                     a.attnum::int2, \
                     a.attname::text, \
@@ -462,10 +566,9 @@ impl ShadowCatalog {
         Ok(out)
     }
 
-    async fn current_database_oid(&self) -> Result<Oid> {
+    async fn current_database_oid(&mut self) -> Result<Oid> {
         let row = self
-            .client
-            .query_one(
+            .query_one_retry(
                 "SELECT oid::oid FROM pg_database WHERE datname = current_database()",
                 &[],
             )
@@ -484,8 +587,56 @@ fn one_char(s: String, what: &str) -> Result<char> {
     }
 }
 
+/// Wrap an async operation that calls into [`ShadowCatalog`] with
+/// exponential-backoff retry on transient PG errors (closed connection,
+/// "the database system is starting up", connect-time refused). Non-PG
+/// errors (parse failures, not-found, replay timeouts) bypass retry and
+/// surface immediately.
+///
+/// Sits outside `ShadowCatalog` on purpose: cache invalidation and
+/// replay-LSN bookkeeping inside the catalog stay unaware of in-flight
+/// retries, observing only the final outcome.
+///
+/// `timeout` caps total wall time, `initial_backoff` is the first sleep,
+/// `max_backoff` caps the exponential growth.
+pub async fn with_transient_retry<R, F>(
+    timeout: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    mut op: F,
+) -> Result<R>
+where
+    F: AsyncFnMut() -> Result<R>,
+{
+    let start = Instant::now();
+    let mut delay = initial_backoff;
+    loop {
+        match op().await {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                if !is_transient(&e) || start.elapsed() >= timeout {
+                    return Err(e);
+                }
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(max_backoff);
+            }
+        }
+    }
+}
+
+/// True for errors that indicate "PG isn't reachable right now, try
+/// again". Currently any [`CatalogError::Pg`] qualifies — connect-refused
+/// and `CANNOT_CONNECT_NOW` both surface that way, and steady-state SQL
+/// errors against well-known queries are not expected.
+fn is_transient(err: &CatalogError) -> bool {
+    matches!(err, CatalogError::Pg(_))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -514,5 +665,57 @@ mod tests {
         let c = ShadowCatalogConfig::default();
         assert!(c.replay_poll < c.replay_timeout);
         assert!(c.max_entries.is_some());
+        assert!(c.reconnect_backoff_initial < c.reconnect_backoff_max);
+    }
+
+    #[test]
+    fn is_transient_classifies_known_variants() {
+        assert!(!is_transient(&CatalogError::Parse("x".into())));
+        assert!(!is_transient(&CatalogError::NotFoundByOid(42)));
+        assert!(!is_transient(&CatalogError::ReplayTimeout {
+            target: 0,
+            last: None,
+            elapsed: Duration::from_secs(0),
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_transient_retry_returns_immediately_on_success() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let r: Result<u32> = with_transient_retry(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+            async move || {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                Ok(7)
+            },
+        )
+        .await;
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_transient_retry_fails_fast_on_non_transient() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let r: Result<()> = with_transient_retry(
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+            async move || {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                Err(CatalogError::Parse("nope".into()))
+            },
+        )
+        .await;
+        assert!(matches!(r, Err(CatalogError::Parse(_))));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "non-transient must not retry",
+        );
     }
 }

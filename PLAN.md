@@ -36,10 +36,10 @@ floor, not the technical one. PG ≤ 14 captures are rejected.
 - **Phase 2** — PG-16-minimum cleanup. PHASE2.md.
 - **Phase 3** — shadow PG lifecycle. PHASE3.md.
 - **Phase 4** — catalog cache integration. PHASE4.md.
+- **Phase 4b** — restart resilience. PHASE4b.md.
 
-Roadmap: Phase 4b plus Phases 5–7 as listed below. Each phase closes
-with `PHASE<N>.md` at repo root; PLAN.md status list is the mutable
-index.
+Roadmap: Phases 5–7 as listed below. Each phase closes with
+`PHASE<N>.md` at repo root; PLAN.md status list is the mutable index.
 
 Reuses without modification:
 
@@ -346,7 +346,7 @@ for realistic workloads).
 Deliverable: numbered fixture under `fixtures/wal/classify/` plus a
 small CLI printing kept/dropped split per rmgr.
 
-Size: ~200 LOC. ~2 days.
+Size: ~200 LOC.
 
 ### Phase 1 — WAL filter + CRC rewrite
 
@@ -378,7 +378,7 @@ off `XLogPageHeader.magic` (PG ≤ 14 vs PG ≥ 15 bit shuffle from
 `a14354cac`). Captures from PG 15+ parse cleanly; no longer a Phase 1
 blocker.
 
-Size: ≈600 LOC. ~1 week.
+Size: ≈600 LOC.
 
 ### Phase 2 — PG-16-minimum cleanup
 
@@ -414,8 +414,8 @@ Risk: zero against shadow PG behavior — reader-side only. Existing
 round-trip + classifier fixtures re-capture cleanly against
 `postgres:16`.
 
-Size: ~30 LOC walshadow + ~20 LOC docs. ~1 day. Can run parallel
-with Phase 3.
+Size: ~30 LOC walshadow + ~20 LOC docs. Can run parallel with
+Phase 3.
 
 ### Phase 3 — shadow PG lifecycle
 
@@ -426,7 +426,7 @@ walshadow's filter output directory. `pg_ctl start`, wait for
 Health probe: periodic `SELECT count(*) FROM pg_class` and a one-row
 `SELECT relname FROM pg_class WHERE oid = 'pg_proc'::regclass`.
 
-Size: ≈400 LOC. ~3 days.
+Size: ≈400 LOC.
 
 ### Phase 4 — catalog cache integration
 
@@ -435,7 +435,7 @@ with `ShadowCatalog` (libpq SQL conn to shadow, generation counter,
 `relation_at(rfn, at_lsn)` gating on shadow's replay LSN). Decoder
 relfilenode→relation lookup goes through this cache.
 
-Size: ≈300 LOC. ~3 days.
+Size: ≈300 LOC.
 
 ### Phase 4b — restart resilience
 
@@ -478,7 +478,7 @@ Source script: `CREATE TABLE t (...)`, `INSERT INTO t ...`,
 c = c + 1`, `DROP TABLE t`. walshadow + decoder + CH emitter run the
 whole script unmodified. CH end-state matches source end-state.
 
-Size: ≈200 LOC of test glue. ~3 days.
+Size: ≈200 LOC of test glue.
 
 ### Phase 6 — differential decode oracle
 
@@ -488,7 +488,7 @@ runtime mode (1-in-N sampling, configurable). Captures a regression
 suite for codec edge cases (numeric `NaN`, jsonb key ordering, array
 NULL bitmap layouts).
 
-Size: ≈400 LOC. ~1 week.
+Size: ≈400 LOC.
 
 ### Phase 7 — operational
 
@@ -499,7 +499,7 @@ source LSN, filter LSN, shadow replay LSN, decoder commit LSN, CH ack
 LSN. SIGHUP reload of table mapping. Shadow PG restart on PG-major
 config change.
 
-Size: ≈400 LOC. ~1 week.
+Size: ≈400 LOC.
 
 ## Risks & open questions
 

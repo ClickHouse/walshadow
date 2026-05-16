@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
-    ShadowCatalog, ShadowCatalogConfig, socket_conninfo, CatalogError,
+    socket_conninfo, with_transient_retry, CatalogError, ShadowCatalog, ShadowCatalogConfig,
 };
 
 fn pg_available() -> bool {
@@ -254,6 +254,140 @@ async fn replay_lsn_gate_times_out_when_not_in_recovery() {
         }
         other => panic!("expected ReplayTimeout, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_reconnects_after_pg_restart() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, 55605);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    let mut cat = open_catalog(&shadow, Duration::from_secs(10)).await;
+
+    let pg_class_filenode = pg_class_filenode_via_psql(&shadow);
+    let pg_namespace_filenode = user_relation_filenode(&shadow, "pg_namespace");
+    let db = current_db_oid(&shadow);
+    let rfn_class = wal_rs::pg::walparser::RelFileNode {
+        spc_node: pg_global_tablespace_oid(),
+        db_node: db,
+        rel_node: pg_class_filenode,
+    };
+    let rfn_namespace = wal_rs::pg::walparser::RelFileNode {
+        spc_node: pg_global_tablespace_oid(),
+        db_node: db,
+        rel_node: pg_namespace_filenode,
+    };
+    let first = cat
+        .relation_at(rfn_class, 0)
+        .await
+        .expect("relation_at pre-restart");
+    assert_eq!(first.name, "pg_class");
+    let gen_before = cat.generation();
+    let reconnects_before = cat.stats().reconnects;
+    let bumps_before = cat.stats().generation_bumps;
+
+    // pg_ctl-style restart: stop, then start. Server-side close drops
+    // the libpq connection; the next SQL call has to reconnect. Use a
+    // different rfn post-restart so the cache miss forces a fetch
+    // (same rfn would hit cache and never touch the dead connection).
+    shadow.stop().expect("stop");
+    shadow.start().expect("restart");
+
+    let after = cat
+        .relation_at(rfn_namespace, 0)
+        .await
+        .expect("relation_at post-restart");
+    assert_eq!(after.name, "pg_namespace");
+    assert!(
+        cat.generation() > gen_before,
+        "reconnect must bump generation (was {gen_before}, now {})",
+        cat.generation(),
+    );
+    assert!(
+        cat.stats().reconnects > reconnects_before,
+        "reconnect counter must advance (was {reconnects_before}, now {})",
+        cat.stats().reconnects,
+    );
+    assert!(
+        cat.stats().generation_bumps > bumps_before,
+        "reconnect bumps cache generation alongside the reconnect counter",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_transient_retry_outlasts_a_pg_restart() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, 55606);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    let cfg = shadow.config();
+    let conninfo = socket_conninfo(
+        cfg.socket_dir.to_str().unwrap(),
+        cfg.port,
+        "postgres",
+        "postgres",
+    );
+
+    // Stop PG so the first connect attempts fail; restart in a background
+    // task after a short delay. with_transient_retry must keep retrying
+    // until PG is back.
+    shadow.stop().expect("stop");
+    let shadow_path = shadow.config().data_dir.clone();
+    let pg_bin = shadow.config().pg_bin_dir.clone();
+    let ctl_secs = shadow.config().ctl_timeout.as_secs().to_string();
+    let log_path = shadow_path.join("startup.log");
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let mut cmd = std::process::Command::new(match pg_bin {
+            Some(d) => d.join("pg_ctl"),
+            None => std::path::PathBuf::from("pg_ctl"),
+        });
+        cmd.args([
+            "-D",
+            shadow_path.to_str().unwrap(),
+            "-l",
+            log_path.to_str().unwrap(),
+            "-w",
+            "-t",
+            &ctl_secs,
+            "start",
+        ]);
+        let _ = cmd.output();
+    });
+
+    let cat = with_transient_retry(
+        Duration::from_secs(15),
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        async move || {
+            ShadowCatalog::connect(
+                &conninfo,
+                ShadowCatalogConfig {
+                    replay_timeout: Duration::from_secs(5),
+                    replay_poll: Duration::from_millis(20),
+                    ..Default::default()
+                },
+            )
+            .await
+        },
+    )
+    .await
+    .expect("eventually connects through with_transient_retry");
+    drop(cat);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
