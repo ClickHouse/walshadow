@@ -11,12 +11,16 @@
 //! Phase 4: shadow PG catalog cache (`shadow_catalog`).
 //! PRE5: pg_class heap-tuple decoder (`pg_class_decoder`), streaming
 //! filter event design (`wal_stream`).
+//! Phase 5: user-heap tuple decoder + Tier 1/2 type matrix
+//! (`heap_decoder`).
 
 pub mod catalog_tracker;
 pub mod classify;
+pub mod decoder_sink;
 pub mod filter;
 pub mod filter_segment;
 pub mod fpi;
+pub mod heap_decoder;
 pub mod main_data;
 pub mod manifest;
 pub mod pg_class_decoder;

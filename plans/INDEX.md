@@ -10,6 +10,7 @@ docs that are not yet committed work sit alongside as peers.
 - **Phase 3** — shadow PG lifecycle. [PHASE3.md](PHASE3.md).
 - **Phase 4** — catalog cache integration. [PHASE4.md](PHASE4.md).
 - **Phase 4b** — restart resilience. [PHASE4b.md](PHASE4b.md).
+- **Phase 5** — heap-tuple decoder + Tier 1/2 type matrix. [PHASE5.md](PHASE5.md).
 - **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,

@@ -39,12 +39,41 @@ use clap::Parser;
 use tokio::sync::Mutex;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
+use std::future::Future;
+use std::pin::Pin;
+use walshadow::decoder_sink::{DecoderSink, MetricsTupleObserver};
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
     with_transient_retry,
 };
 use walshadow::source_feed::SourceFeed;
-use walshadow::wal_stream::{DirSegmentSink, MetricsRecordSink, WAL_SEG_SIZE, WalStream};
+use walshadow::wal_stream::{
+    DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
+};
+
+/// Tiny inline `RecordSink` composite that retains direct ownership of
+/// both halves so the status-line code can read `MetricsRecordSink.
+/// summary()` and `DecoderSink.stats()` between segments without
+/// fishing them out of a `Vec<Box<dyn RecordSink>>`. Phase 5 owns this
+/// shape locally; Phase 7 will likely revisit when the CH-emitter
+/// observer joins the chain.
+struct DaemonSinks {
+    metrics: MetricsRecordSink,
+    decoder: DecoderSink<MetricsTupleObserver>,
+}
+
+impl RecordSink for DaemonSinks {
+    fn on_record<'a>(
+        &'a mut self,
+        record: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.metrics.on_record(record).await?;
+            self.decoder.on_record(record).await?;
+            Ok(())
+        })
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -237,7 +266,13 @@ async fn run(args: Args) -> Result<()> {
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;
-    let mut record_sink = MetricsRecordSink::default();
+    // Fan-out: metrics-by-rmgr first, Phase 5 heap-tuple decoder
+    // second. Ordering keeps per-rmgr counters intact when a decoder
+    // semantic error trips inside the dispatch chain.
+    let mut record_sink = DaemonSinks {
+        metrics: MetricsRecordSink::default(),
+        decoder: DecoderSink::new(catalog.clone(), MetricsTupleObserver::default()),
+    };
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
@@ -276,17 +311,18 @@ async fn run(args: Args) -> Result<()> {
             let filter = stream.filter();
             let ahead = server_end.saturating_sub(dispatched_before);
             eprintln!(
-                "shipped {} segments, last_lsn={:X}/{:X}, source_ahead={}B, {}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}",
+                "shipped {} segments, last_lsn={:X}/{:X}, source_ahead={}B, {}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}, {}",
                 segments_shipped,
                 now_dispatched >> 32,
                 now_dispatched as u32,
                 ahead,
-                record_sink.summary(),
+                record_sink.metrics.summary(),
                 filter.stats.kept,
                 filter.stats.dropped,
                 filter.tracker.relmap_updates,
                 filter.tracker.pg_class_writes_undecoded,
                 filter.tracker.pg_class_writes_oid_in_prefix,
+                record_sink.decoder.stats().summary(),
             );
             if args.max_segments != 0 && segments_shipped >= args.max_segments {
                 break "max-segments";
