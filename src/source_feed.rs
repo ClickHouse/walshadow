@@ -12,10 +12,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
+use tokio::net::{TcpStream, UnixStream};
+use tokio_postgres::config::SslMode as TpSslMode;
 use tokio_postgres::{Client, NoTls};
 use wal_rs::pg::backup::parse_pg_lsn;
 use wal_rs::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
 use wal_rs::pg::replication::stream::{Frame, build_status_update, decode_frame};
+use wal_rs::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 
 /// Default standby-status update cadence. Matches wal-rs / wal-g
 /// defaults; servers normally tolerate up to `wal_sender_timeout` of
@@ -222,33 +225,70 @@ impl SourceFeed {
     /// run arbitrary `SELECT`s cleanly (server only honours the small
     /// replication-protocol command set); the seed/sidecar path uses
     /// this fall-back connection.
+    ///
+    /// TLS reuses wal-rs's `maybe_upgrade` so sslmode (disable / allow /
+    /// prefer / require / verify-ca / verify-full) plus `PGSSLROOTCERT`
+    /// behave identically to the replication socket. The TLS-wrapped
+    /// stream is handed to `tokio_postgres::Config::connect_raw` with
+    /// `NoTls`; tokio-postgres's own `ssl_mode` is pinned to `Disable`
+    /// so it does not double-negotiate.
     pub async fn sql_client(&mut self) -> Result<&Client> {
         if self.sql_client.is_none() {
-            let conninfo = sql_conninfo(&self.cfg);
-            let (client, conn) = tokio_postgres::connect(&conninfo, NoTls)
-                .await
-                .with_context(|| format!("sidecar sql connect to {}", self.cfg.host))?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
+            let client = open_sql_client(&self.cfg).await.with_context(|| {
+                format!("sidecar sql connect to {}:{}", self.cfg.host, self.cfg.port)
+            })?;
             self.sql_client = Some(client);
         }
         Ok(self.sql_client.as_ref().unwrap())
     }
 }
 
-/// Build a libpq-style key=value conninfo for the sidecar SQL client.
-/// Mirrors `shadow_catalog::socket_conninfo` for unix sockets and adds
-/// `password=` when present.
-fn sql_conninfo(cfg: &PgConfig) -> String {
-    let mut s = format!(
-        "host={} port={} user={} dbname={} application_name={}-sql",
-        cfg.host, cfg.port, cfg.user, cfg.database, cfg.application_name,
-    );
+/// Open a non-replication libpq connection to the same source PG.
+/// Mirrors wal-rs's transport choice: unix socket when `host` starts
+/// with `/`, TLS-or-plain TCP otherwise. The startup handshake itself
+/// runs through tokio-postgres's `connect_raw`, so its `Client`
+/// surface is what callers receive.
+async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
+    let mut tp_cfg = tokio_postgres::Config::new();
+    tp_cfg
+        .user(cfg.user.as_str())
+        .dbname(cfg.database.as_str())
+        .application_name(format!("{}-sql", cfg.application_name))
+        // Stream is already TLS-wrapped (or intentionally plain) by the
+        // time it reaches connect_raw; tokio-postgres must not retry
+        // SSLRequest over the wrapped stream.
+        .ssl_mode(TpSslMode::Disable);
     if let Some(pw) = &cfg.password {
-        s.push_str(&format!(" password={pw}"));
+        tp_cfg.password(pw.as_str());
     }
-    s
+
+    let stream: Box<dyn SocketStream> = if cfg.host.starts_with('/') {
+        // PG refuses TLS on unix sockets server-side; skip negotiation.
+        let path = format!("{}/.s.PGSQL.{}", cfg.host.trim_end_matches('/'), cfg.port);
+        let sock = UnixStream::connect(&path)
+            .await
+            .with_context(|| format!("connect to unix:{path}"))?;
+        Box::new(sock)
+    } else {
+        let addr = format!("{}:{}", cfg.host, cfg.port);
+        let raw = TcpStream::connect(&addr)
+            .await
+            .with_context(|| format!("connect to {addr}"))?;
+        if cfg.sslmode == SslMode::Disable {
+            Box::new(raw)
+        } else {
+            let (sock, _used_tls) = maybe_upgrade(raw, &cfg.host, cfg.sslmode)
+                .await
+                .with_context(|| format!("tls negotiation against {addr}"))?;
+            sock
+        }
+    };
+
+    let (client, conn) = tp_cfg.connect_raw(stream, NoTls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(client)
 }
 
 #[inline]

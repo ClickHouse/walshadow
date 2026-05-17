@@ -89,14 +89,29 @@ those records User, drop them, and silently corrupt shadow's catalog.
   what to do with it. The seed is the only consumer today; if a future
   caller needs the same sidecar (eg replica-identity introspection) it
   reuses the existing client without a reconnect.
+* **TLS path reuses `wal-rs`.** Plan was silent on TLS; the initial
+  cut hard-coded `NoTls`. The shipped path runs `wal-rs`'s
+  `maybe_upgrade` on the raw TCP socket (rustls + aws-lc-rs, full
+  sslmode parity including `verify-ca` / `verify-full` and
+  `PGSSLROOTCERT`) and hands the upgraded `Box<dyn SocketStream>` to
+  `tokio_postgres::Config::connect_raw` with `NoTls`, pinning
+  `tokio_postgres::config::SslMode::Disable` so the postgres driver
+  does not double-negotiate. Unix sockets bypass TLS unconditionally
+  to match wal-rs's transport rule and PG's server-side refusal of
+  SSLRequest on unix. No new walshadow deps — rustls / aws-lc-rs /
+  webpki-roots / rustls-pemfile arrive transitively through wal-rs.
+  `bin/stream.rs` accepts the full six-mode `--sslmode` set via
+  `SslMode::parse` (was three-mode previously).
 
 ## Implementation notes for follow-on work
 
-`SourceFeed::sql_client()` does NOT propagate the source's TLS mode —
-`NoTls` is hard-coded. If walshadow ever needs to seed across a TLS-
-required source, plug a tokio-postgres tls connector. `shadow_catalog`
-hits the same wall and resolves it the same way (NoTls) — when one
-moves, both should.
+`SourceFeed::sql_client()` honours the source's full sslmode (six
+libpq modes); `shadow_catalog` still hard-codes `NoTls` against the
+unix-socket shadow PG. The walshadow→shadow connection lives on
+loopback unix and there's no in-tree path that runs shadow over TCP,
+so the gap is moot today. When/if shadow goes remote, factor the
+`open_sql_client` helper out of `source_feed.rs` and reuse it from
+`shadow_catalog::ShadowCatalog::connect`.
 
 Pre-rotation discovery uses `pg_relation_filenode(oid)` in a SQL
 predicate `WHERE c.oid < 16384 AND pg_relation_filenode(c.oid) IS NOT
@@ -122,9 +137,10 @@ the pumping side.
 ## Files actually changed
 
 ```
-src/source_feed.rs            sql_client(): lazy sidecar tokio-postgres
+src/source_feed.rs            sql_client(): lazy sidecar tokio-postgres + wal-rs TLS upgrade
 src/wal_stream.rs             filter_mut() accessor
-src/bin/stream.rs             seed_from_source between WalStream::new and START_REPLICATION
+src/bin/stream.rs             seed_from_source between WalStream::new and START_REPLICATION;
+                              --sslmode accepts the six libpq modes
 tests/catalog_seed.rs         loop VACUUM FULL pg_class until filenode >= 16384
 tests/wal_stream_e2e.rs       new pre_rotated_pg_class_seed_keeps_catalog_writes test
 plans/PRE5b2.md               this retrospective

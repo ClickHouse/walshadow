@@ -16,6 +16,8 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -428,4 +430,146 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
          kept_user={}, dropped={}",
         filter.stats.kept_user, filter.stats.dropped,
     );
+}
+
+fn openssl_available() -> bool {
+    Command::new("openssl")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// One-shot self-signed cert + key suitable for PG `ssl_cert_file` /
+/// `ssl_key_file`. `nodes` skips passphrase prompting; SAN covers
+/// `localhost` + `127.0.0.1` so a future verify-full test could reuse
+/// the same cert.
+fn generate_self_signed(out_dir: &Path) -> (PathBuf, PathBuf) {
+    let cert = out_dir.join("server.crt");
+    let key = out_dir.join("server.key");
+    let out = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key.to_str().unwrap(),
+            "-out",
+            cert.to_str().unwrap(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ])
+        .output()
+        .expect("openssl exec");
+    assert!(
+        out.status.success(),
+        "openssl req failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // PG refuses to start if the key file is group/world-readable.
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod key");
+    (cert, key)
+}
+
+fn append_ssl_conf(sh: &Shadow, cert: &Path, key: &Path) {
+    let path = sh.config().data_dir.join("postgresql.conf");
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(f, "\n# walshadow tls test overrides").unwrap();
+    writeln!(f, "ssl = on").unwrap();
+    writeln!(f, "ssl_cert_file = '{}'", cert.display()).unwrap();
+    writeln!(f, "ssl_key_file = '{}'", key.display()).unwrap();
+    // Override the base conf's empty `listen_addresses` so 127.0.0.1
+    // accepts TCP. Last setting wins in postgresql.conf.
+    writeln!(f, "listen_addresses = '127.0.0.1'").unwrap();
+}
+
+/// Force SSL on TCP. `hostnossl … reject` makes plain TCP a hard
+/// negative so the `pg_stat_ssl` assertion is not satisfied by an
+/// accidental fallback.
+fn require_ssl_on_tcp(sh: &Shadow) {
+    let path = sh.config().data_dir.join("pg_hba.conf");
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(f).unwrap();
+    writeln!(f, "hostssl all all 127.0.0.1/32 trust").unwrap();
+    writeln!(f, "hostnossl all all 127.0.0.1/32 reject").unwrap();
+    writeln!(f, "hostssl replication all 127.0.0.1/32 trust").unwrap();
+    writeln!(f, "hostnossl replication all 127.0.0.1/32 reject").unwrap();
+}
+
+/// Exercises `SourceFeed::sql_client()`'s TLS path explicitly: PG bound
+/// to 127.0.0.1 with `ssl=on` + `hostnossl … reject`, so a successful
+/// `SELECT 1` and a `pg_stat_ssl.ssl=true` reading prove the sidecar
+/// negotiated TLS (not a plain-TCP fallback). Replication-side TLS
+/// rides the same wal-rs `maybe_upgrade` and is covered by
+/// `wal-rs/src/pg/replication/tls.rs::tests`; this test pins the
+/// tokio-postgres-side wiring (`Config::connect_raw(stream, NoTls)`
+/// with the wal-rs-wrapped stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sidecar_sql_client_negotiates_tls_over_tcp() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    if !openssl_available() {
+        eprintln!("skip: no openssl on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = make_source(&tmp, 55803);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("base conf");
+    append_replication_conf(&source);
+
+    let (cert, key) = generate_self_signed(tmp.path());
+    append_ssl_conf(&source, &cert, &key);
+    require_ssl_on_tcp(&source);
+
+    source.start().expect("start source with ssl");
+    let _stop = StopOnDrop { sh: &source };
+
+    let cfg = source.config();
+    let pgcfg = PgConfig {
+        host: "127.0.0.1".into(),
+        port: cfg.port,
+        user: "postgres".into(),
+        password: None,
+        database: "postgres".into(),
+        application_name: "walshadow-tls-test".into(),
+        sslmode: SslMode::Require,
+    };
+    let mut feed = SourceFeed::connect(&pgcfg)
+        .await
+        .expect("source feed connect over tls");
+
+    let client = feed.sql_client().await.expect("sidecar sql_client over tls");
+
+    let rows = client
+        .query("SELECT 1::int8", &[])
+        .await
+        .expect("select 1 over tls");
+    let val: i64 = rows[0].get(0);
+    assert_eq!(val, 1);
+
+    let rows = client
+        .query(
+            "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await
+        .expect("pg_stat_ssl");
+    let ssl: bool = rows[0].get(0);
+    let version: Option<&str> = rows[0].get(1);
+    assert!(ssl, "expected SSL session for sidecar sql client");
+    let v = version.expect("pg_stat_ssl.version populated under SSL");
+    assert!(
+        v.starts_with("TLSv1"),
+        "expected TLSv1.x session, got {v:?}",
+    );
+    eprintln!("sidecar tls e2e: pg_stat_ssl reports version={v}");
 }

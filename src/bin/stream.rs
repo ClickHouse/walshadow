@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
@@ -53,8 +53,11 @@ struct Args {
     /// supports trust / cleartext / SCRAM-SHA-256.
     #[arg(long)]
     password: Option<String>,
-    /// SSL mode. `disable`, `prefer`, `require`. TLS is skipped on
-    /// unix sockets regardless.
+    /// SSL mode: `disable`, `allow`, `prefer`, `require`, `verify-ca`,
+    /// `verify-full`. TLS is skipped on unix sockets regardless. The
+    /// verify-ca / verify-full modes consult `PGSSLROOTCERT` (or the
+    /// webpki bundle if unset) for the trust anchor — same contract as
+    /// libpq.
     #[arg(long, default_value = "prefer")]
     sslmode: String,
     /// Where filtered segments + manifests land. Shadow PG's
@@ -101,12 +104,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<()> {
-    let sslmode = match args.sslmode.as_str() {
-        "disable" => SslMode::Disable,
-        "prefer" => SslMode::Prefer,
-        "require" => SslMode::Require,
-        other => bail!("invalid sslmode: {other}"),
-    };
+    let sslmode = SslMode::parse(&args.sslmode).context("--sslmode")?;
     let cfg = PgConfig {
         host: args.host,
         port: args.port,
