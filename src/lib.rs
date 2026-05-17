@@ -16,6 +16,7 @@ pub mod catalog_tracker;
 pub mod classify;
 pub mod filter;
 pub mod filter_segment;
+pub mod fpi;
 pub mod main_data;
 pub mod manifest;
 pub mod pg_class_decoder;

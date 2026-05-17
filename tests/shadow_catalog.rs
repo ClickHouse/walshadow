@@ -540,15 +540,22 @@ async fn replident_matrix_default_nothing_full_index() {
     shadow.start().expect("start");
     let _stop = stop_on_drop(&shadow);
 
-    // Four tables, one per relreplident variant. `def_t` has a PK so
-    // DEFAULT is meaningful; `nothing_t` explicitly switches to NOTHING;
-    // `full_t` to FULL; `idx_t` to USING INDEX on a two-column unique
-    // NOT NULL index — REPLICA IDENTITY USING INDEX rejects anything
-    // less.
+    // Six tables exercising relreplident matrix. `def_t` has a single-
+    // column PK; `no_pk_t` has no PK so Default carries None; `composite_pk_t`
+    // exercises multi-column PK indkey lift; `nothing_t` switches to NOTHING;
+    // `full_t` to FULL; `idx_t` to USING INDEX on a two-column unique NOT
+    // NULL index — REPLICA IDENTITY USING INDEX rejects anything less.
     shadow
         .apply_schema_dump(
             "CREATE SCHEMA wc;\n\
              CREATE TABLE wc.def_t (id bigint PRIMARY KEY, name text);\n\
+             CREATE TABLE wc.no_pk_t (a int, b int);\n\
+             CREATE TABLE wc.composite_pk_t (\n\
+                k1 int,\n\
+                k2 int,\n\
+                v text,\n\
+                PRIMARY KEY (k1, k2)\n\
+             );\n\
              CREATE TABLE wc.nothing_t (id bigint, name text);\n\
              ALTER TABLE wc.nothing_t REPLICA IDENTITY NOTHING;\n\
              CREATE TABLE wc.full_t (id bigint, name text);\n\
@@ -568,7 +575,22 @@ async fn replident_matrix_default_nothing_full_index() {
     let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
 
     let cases = [
-        ("wc.def_t", ReplIdent::Default),
+        (
+            "wc.def_t",
+            ReplIdent::Default {
+                pk_attnums: Some(vec![1]),
+            },
+        ),
+        (
+            "wc.no_pk_t",
+            ReplIdent::Default { pk_attnums: None },
+        ),
+        (
+            "wc.composite_pk_t",
+            ReplIdent::Default {
+                pk_attnums: Some(vec![1, 2]),
+            },
+        ),
         ("wc.nothing_t", ReplIdent::Nothing),
         ("wc.full_t", ReplIdent::Full),
     ];

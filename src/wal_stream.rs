@@ -35,6 +35,8 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use thiserror::Error;
 use wal_rs::pg::wal::segment::SegmentName;
@@ -121,6 +123,14 @@ impl Record {
 /// Sink that observes every record decided by the filter. Phase 5's
 /// heap-tuple decoder attaches here.
 ///
+/// **Async contract.** `on_record` is async so implementations may await
+/// `ShadowCatalog::relation_at` (Phase 5 decoder hot path) without
+/// blocking the WAL chunk feed. Signature uses the manual
+/// `Pin<Box<dyn Future>>` desugaring rather than `async fn` in trait so
+/// [`CompositeRecordSink`]'s `Vec<Box<dyn RecordSink + Send>>` stays
+/// dyn-compatible without an `async-trait` macro dependency. See
+/// PHASE5_prereq_async_sink for the trade-off rationale.
+///
 /// **Error contract.** Returning `Err` from any sink call poisons the
 /// owning [`WalStream`]: `next_lsn` and the partially-dispatched
 /// `current_buf` are left as-is, and every subsequent
@@ -130,19 +140,31 @@ impl Record {
 /// wants exactly-once semantics must commit its own state durably
 /// before returning `Ok`. See [PRE5b10.md](../plans/PRE5b10.md) item 4.
 pub trait RecordSink {
-    fn on_record(&mut self, record: &Record) -> Result<(), SinkError>;
+    fn on_record<'a>(
+        &'a mut self,
+        record: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 }
 
 /// Sink that receives one fully-filtered segment at a time. Shadow PG
 /// consumes filtered segments via `restore_command`; the production
 /// sink writes the bytes plus a manifest sidecar to that directory.
+///
+/// **Async contract.** Mirrors [`RecordSink`]: each 16 MiB segment
+/// write through [`DirSegmentSink`] is sync filesystem I/O that
+/// blocks the calling tokio worker until the write returns.
+/// `tokio::fs` (via internal `spawn_blocking`) keeps the chunk feed
+/// loop, ctrl_c handler, status timer & invalidation drain
+/// responsive on the typical `worker_threads = 2` runtime. Signature
+/// uses the same manual `Pin<Box<dyn Future>>` desugaring as
+/// `RecordSink` so trait-object usage stays dyn-compatible.
 pub trait SegmentSink {
-    fn on_segment(
-        &mut self,
+    fn on_segment<'a>(
+        &'a mut self,
         seg: SegmentName,
-        bytes: &[u8],
-        manifest: &Manifest,
-    ) -> Result<(), SinkError>;
+        bytes: &'a [u8],
+        manifest: &'a Manifest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
     /// Receives a partial segment flushed at shutdown by
     /// [`WalStream::close`]. Default forwards to [`on_segment`] for
@@ -150,12 +172,12 @@ pub trait SegmentSink {
     /// overrides to land bytes under `<name>.partial` per
     /// `pg_receivewal` convention so a follow-up daemon run does not
     /// confuse a partial for a complete segment.
-    fn on_partial_segment(
-        &mut self,
+    fn on_partial_segment<'a>(
+        &'a mut self,
         seg: SegmentName,
-        bytes: &[u8],
-        manifest: &Manifest,
-    ) -> Result<(), SinkError> {
+        bytes: &'a [u8],
+        manifest: &'a Manifest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         self.on_segment(seg, bytes, manifest)
     }
 }
@@ -167,9 +189,14 @@ pub struct CollectingRecordSink {
 }
 
 impl RecordSink for CollectingRecordSink {
-    fn on_record(&mut self, record: &Record) -> Result<(), SinkError> {
-        self.records.push(record.clone());
-        Ok(())
+    fn on_record<'a>(
+        &'a mut self,
+        record: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.records.push(record.clone());
+            Ok(())
+        })
     }
 }
 
@@ -182,9 +209,14 @@ pub struct CountingRecordSink {
 }
 
 impl RecordSink for CountingRecordSink {
-    fn on_record(&mut self, _record: &Record) -> Result<(), SinkError> {
-        self.count += 1;
-        Ok(())
+    fn on_record<'a>(
+        &'a mut self,
+        _record: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.count += 1;
+            Ok(())
+        })
     }
 }
 
@@ -222,14 +254,19 @@ impl MetricsRecordSink {
 }
 
 impl RecordSink for MetricsRecordSink {
-    fn on_record(&mut self, record: &Record) -> Result<(), SinkError> {
-        let rm = record.parsed.header.resource_manager_id;
-        *self
-            .by_rm_decision
-            .entry((rm, record.decision))
-            .or_insert(0) += 1;
-        self.total += 1;
-        Ok(())
+    fn on_record<'a>(
+        &'a mut self,
+        record: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            let rm = record.parsed.header.resource_manager_id;
+            *self
+                .by_rm_decision
+                .entry((rm, record.decision))
+                .or_insert(0) += 1;
+            self.total += 1;
+            Ok(())
+        })
     }
 }
 
@@ -257,11 +294,16 @@ impl CompositeRecordSink {
 }
 
 impl RecordSink for CompositeRecordSink {
-    fn on_record(&mut self, record: &Record) -> Result<(), SinkError> {
-        for s in &mut self.inner {
-            s.on_record(record)?;
-        }
-        Ok(())
+    fn on_record<'a>(
+        &'a mut self,
+        record: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            for s in &mut self.inner {
+                s.on_record(record).await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -273,14 +315,16 @@ pub struct CollectingSegmentSink {
 }
 
 impl SegmentSink for CollectingSegmentSink {
-    fn on_segment(
-        &mut self,
+    fn on_segment<'a>(
+        &'a mut self,
         seg: SegmentName,
-        bytes: &[u8],
-        manifest: &Manifest,
-    ) -> Result<(), SinkError> {
-        self.segments.push((seg, bytes.to_vec(), manifest.clone()));
-        Ok(())
+        bytes: &'a [u8],
+        manifest: &'a Manifest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.segments.push((seg, bytes.to_vec(), manifest.clone()));
+            Ok(())
+        })
     }
 }
 
@@ -292,6 +336,8 @@ pub struct DirSegmentSink {
 }
 
 impl DirSegmentSink {
+    /// Creates `out_dir` synchronously: called once at startup before any
+    /// tokio runtime work, so blocking is fine.
     pub fn new(out_dir: std::path::PathBuf) -> Result<Self, SinkError> {
         std::fs::create_dir_all(&out_dir)?;
         Ok(Self { out_dir })
@@ -299,23 +345,27 @@ impl DirSegmentSink {
 }
 
 impl SegmentSink for DirSegmentSink {
-    fn on_segment(
-        &mut self,
+    fn on_segment<'a>(
+        &'a mut self,
         seg: SegmentName,
-        bytes: &[u8],
-        manifest: &Manifest,
-    ) -> Result<(), SinkError> {
-        let name = seg.format();
-        let seg_path = self.out_dir.join(&name);
-        let tmp = seg_path.with_extension("partial");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &seg_path)?;
-        let mani_path = self.out_dir.join(format!("{name}.manifest.json"));
-        let mani_tmp = mani_path.with_extension("manifest.json.partial");
-        let f = std::fs::File::create(&mani_tmp)?;
-        serde_json::to_writer_pretty(f, manifest)?;
-        std::fs::rename(&mani_tmp, &mani_path)?;
-        Ok(())
+        bytes: &'a [u8],
+        manifest: &'a Manifest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            let name = seg.format();
+            let seg_path = self.out_dir.join(&name);
+            let tmp = seg_path.with_extension("partial");
+            tokio::fs::write(&tmp, bytes).await?;
+            tokio::fs::rename(&tmp, &seg_path).await?;
+            let mani_path = self.out_dir.join(format!("{name}.manifest.json"));
+            let mani_tmp = mani_path.with_extension("manifest.json.partial");
+            // Serde writes through a sync writer; manifest is tiny (KiB) so
+            // serialise to a Vec<u8> first, then write async.
+            let body = serde_json::to_vec_pretty(manifest)?;
+            tokio::fs::write(&mani_tmp, &body).await?;
+            tokio::fs::rename(&mani_tmp, &mani_path).await?;
+            Ok(())
+        })
     }
 
     /// Partial-on-shutdown lands at `<name>.partial` (with
@@ -324,25 +374,27 @@ impl SegmentSink for DirSegmentSink {
     /// not pick it up as a complete segment. Operator-facing artifact;
     /// resume on the next daemon run is via `--start-lsn` at the same
     /// segment boundary, not by reading the `.partial` bytes back.
-    fn on_partial_segment(
-        &mut self,
+    fn on_partial_segment<'a>(
+        &'a mut self,
         seg: SegmentName,
-        bytes: &[u8],
-        manifest: &Manifest,
-    ) -> Result<(), SinkError> {
-        let name = seg.format();
-        let partial_path = self.out_dir.join(format!("{name}.partial"));
-        let tmp = self.out_dir.join(format!("{name}.partial.tmp"));
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &partial_path)?;
-        let mani_path = self.out_dir.join(format!("{name}.partial.manifest.json"));
-        let mani_tmp = self
-            .out_dir
-            .join(format!("{name}.partial.manifest.json.tmp"));
-        let f = std::fs::File::create(&mani_tmp)?;
-        serde_json::to_writer_pretty(f, manifest)?;
-        std::fs::rename(&mani_tmp, &mani_path)?;
-        Ok(())
+        bytes: &'a [u8],
+        manifest: &'a Manifest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            let name = seg.format();
+            let partial_path = self.out_dir.join(format!("{name}.partial"));
+            let tmp = self.out_dir.join(format!("{name}.partial.tmp"));
+            tokio::fs::write(&tmp, bytes).await?;
+            tokio::fs::rename(&tmp, &partial_path).await?;
+            let mani_path = self.out_dir.join(format!("{name}.partial.manifest.json"));
+            let mani_tmp = self
+                .out_dir
+                .join(format!("{name}.partial.manifest.json.tmp"));
+            let body = serde_json::to_vec_pretty(manifest)?;
+            tokio::fs::write(&mani_tmp, &body).await?;
+            tokio::fs::rename(&mani_tmp, &mani_path).await?;
+            Ok(())
+        })
     }
 }
 
@@ -440,7 +492,7 @@ impl WalStream {
     /// caller's recovery is to drop this `WalStream` and construct a
     /// fresh one at the desired resume LSN. See [PRE5b10.md
     /// ](../plans/PRE5b10.md) item 4.
-    pub fn push(
+    pub async fn push(
         &mut self,
         lsn: u64,
         bytes: &[u8],
@@ -465,7 +517,7 @@ impl WalStream {
             cur_lsn += take as u64;
             data = &data[take..];
             if self.current_buf.len() == self.seg_size as usize
-                && let Err(e) = self.flush_current(record_sink, segment_sink)
+                && let Err(e) = self.flush_current(record_sink, segment_sink).await
             {
                 self.poisoned = true;
                 return Err(e);
@@ -480,7 +532,7 @@ impl WalStream {
     /// via [`SegmentSink::on_partial_segment`] so the file is
     /// distinguishable from a complete segment and shadow PG's
     /// `restore_command` does not pick it up.
-    pub fn close(
+    pub async fn close(
         mut self,
         partial_sink: Option<&mut dyn SegmentSink>,
         record_sink: &mut dyn RecordSink,
@@ -505,16 +557,16 @@ impl WalStream {
             })?;
         for (entry, parsed) in manifest.records.iter().zip(parsed) {
             let record = Record::from_parsed(seg_start_lsn, parsed, entry);
-            record_sink.on_record(&record)?;
+            record_sink.on_record(&record).await?;
         }
         if let Some(sink) = partial_sink {
-            sink.on_partial_segment(seg, &filtered, &manifest)?;
+            sink.on_partial_segment(seg, &filtered, &manifest).await?;
         }
         Ok(())
     }
 
     /// Internal: dispatch the just-filled `current_buf` and reset.
-    fn flush_current(
+    async fn flush_current(
         &mut self,
         record_sink: &mut dyn RecordSink,
         segment_sink: &mut dyn SegmentSink,
@@ -531,9 +583,9 @@ impl WalStream {
             })?;
         for (entry, parsed) in manifest.records.iter().zip(parsed) {
             let record = Record::from_parsed(seg_start_lsn, parsed, entry);
-            record_sink.on_record(&record)?;
+            record_sink.on_record(&record).await?;
         }
-        segment_sink.on_segment(seg, &filtered, &manifest)?;
+        segment_sink.on_segment(seg, &filtered, &manifest).await?;
         self.current_lsn += self.seg_size;
         self.current_buf.clear();
         Ok(())
@@ -614,13 +666,14 @@ mod tests {
         assert!(matches!(r, Err(WalStreamError::UnalignedBase(_))));
     }
 
-    #[test]
-    fn push_misaligned_errors() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_misaligned_errors() {
         let mut ws = WalStream::new(1, WAL_SEG_SIZE, 0).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         let err = ws
             .push(0x100, &[0u8; 1], &mut rec, &mut seg)
+            .await
             .expect_err("misaligned push must error");
         match err {
             WalStreamError::Misaligned { expected, got } => {
@@ -636,20 +689,22 @@ mod tests {
     /// failures, not just filter failures.
     struct ErrSegmentSink;
     impl SegmentSink for ErrSegmentSink {
-        fn on_segment(
-            &mut self,
+        fn on_segment<'a>(
+            &'a mut self,
             _seg: SegmentName,
-            _bytes: &[u8],
-            _manifest: &Manifest,
-        ) -> Result<(), SinkError> {
-            Err(SinkError::Other("synthetic segment-sink fail".into()))
+            _bytes: &'a [u8],
+            _manifest: &'a Manifest,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            Box::pin(async {
+                Err(SinkError::Other("synthetic segment-sink fail".into()))
+            })
         }
     }
 
     /// Zero-byte page → filter_segment yields no records but still
     /// dispatches the segment; `ErrSegmentSink` returns `Err` → poison.
-    #[test]
-    fn push_segment_sink_error_poisons_stream() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_segment_sink_error_poisons_stream() {
         const SEG: u64 = 8192;
         let mut ws = WalStream::new(1, SEG, 0).unwrap();
         let mut rec = CollectingRecordSink::default();
@@ -657,11 +712,13 @@ mod tests {
         let bytes = vec![0u8; SEG as usize];
         let err = ws
             .push(0, &bytes, &mut rec, &mut seg)
+            .await
             .expect_err("sink error must propagate");
         assert!(matches!(err, WalStreamError::Sink(_)), "{err:?}");
         let mut good_seg = CollectingSegmentSink::default();
         let err2 = ws
             .push(SEG, &[0u8; 1], &mut rec, &mut good_seg)
+            .await
             .expect_err("subsequent push must short-circuit");
         assert!(matches!(err2, WalStreamError::Poisoned));
     }
@@ -670,8 +727,8 @@ mod tests {
     /// `flush_current` calls `filter_segment` which surfaces a walker
     /// error. Stream is poisoned; the next push must short-circuit
     /// with `Poisoned` regardless of its own validity.
-    #[test]
-    fn push_filter_error_poisons_stream() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_filter_error_poisons_stream() {
         const SEG: u64 = 8192;
         let mut ws = WalStream::new(1, SEG, 0).unwrap();
         let mut rec = CollectingRecordSink::default();
@@ -682,10 +739,12 @@ mod tests {
         bytes[2] = 1;
         let err = ws
             .push(0, &bytes, &mut rec, &mut seg)
+            .await
             .expect_err("filter error must propagate");
         assert!(matches!(err, WalStreamError::Filter { .. }), "{err:?}");
         let err2 = ws
             .push(SEG, &[0u8; 1], &mut rec, &mut seg)
+            .await
             .expect_err("subsequent push must short-circuit");
         assert!(matches!(err2, WalStreamError::Poisoned));
     }
@@ -716,12 +775,17 @@ mod tests {
     struct SharedRmidLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl RecordSink for SharedRmidLog {
-        fn on_record(&mut self, r: &Record) -> Result<(), SinkError> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(r.parsed.header.resource_manager_id);
-            Ok(())
+        fn on_record<'a>(
+            &'a mut self,
+            r: &'a Record,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(r.parsed.header.resource_manager_id);
+                Ok(())
+            })
         }
     }
 
@@ -735,18 +799,23 @@ mod tests {
     }
 
     impl RecordSink for ErrAt {
-        fn on_record(&mut self, _record: &Record) -> Result<(), SinkError> {
-            let i = self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if i == self.fail_at {
-                Err(SinkError::Other(format!("synthetic fail at #{i}")))
-            } else {
-                Ok(())
-            }
+        fn on_record<'a>(
+            &'a mut self,
+            _record: &'a Record,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            Box::pin(async move {
+                let i = self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i == self.fail_at {
+                    Err(SinkError::Other(format!("synthetic fail at #{i}")))
+                } else {
+                    Ok(())
+                }
+            })
         }
     }
 
-    #[test]
-    fn composite_record_sink_fans_out_to_all_inner_sinks_in_order() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn composite_record_sink_fans_out_to_all_inner_sinks_in_order() {
         // Three records with distinct rmids so the order claim isn't
         // symmetric under permutation.
         let recs = [
@@ -761,15 +830,15 @@ mod tests {
             Box::new(SharedRmidLog(log_b.clone())),
         ]);
         for r in &recs {
-            comp.on_record(r).unwrap();
+            comp.on_record(r).await.unwrap();
         }
         let expected = vec![RmId::Heap as u8, RmId::Xact as u8, RmId::RelMap as u8];
         assert_eq!(*log_a.lock().unwrap(), expected);
         assert_eq!(*log_b.lock().unwrap(), expected);
     }
 
-    #[test]
-    fn composite_record_sink_short_circuits_on_first_err() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn composite_record_sink_short_circuits_on_first_err() {
         use std::sync::atomic::{AtomicU64, Ordering};
         let rec = synth_record(0, RmId::Heap as u8);
         let log_before = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -784,11 +853,12 @@ mod tests {
             Box::new(SharedRmidLog(log_after.clone())),
         ]);
         // First record: every sink runs, ErrAt's `seen` advances to 1.
-        comp.on_record(&rec).expect("first record succeeds");
+        comp.on_record(&rec).await.expect("first record succeeds");
         // Second record: ErrAt fails (i==fail_at==1). The sink after
         // ErrAt must not observe it — that's the short-circuit claim.
         let err = comp
             .on_record(&rec)
+            .await
             .expect_err("err propagates from inner sink");
         match err {
             SinkError::Other(msg) => assert!(msg.contains("synthetic fail")),
@@ -801,8 +871,8 @@ mod tests {
         assert_eq!(log_after.lock().unwrap().len(), 1);
     }
 
-    #[test]
-    fn metrics_sink_counts_per_rm_decision_and_discards() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_sink_counts_per_rm_decision_and_discards() {
         let mut sink = MetricsRecordSink::default();
         let mut heap_keep = synth_record(0, RmId::Heap as u8);
         heap_keep.decision = Decision::Keep;
@@ -811,7 +881,7 @@ mod tests {
         let mut xact_keep = synth_record(128, RmId::Xact as u8);
         xact_keep.decision = Decision::Keep;
         for r in [&heap_keep, &heap_keep, &heap_drop, &xact_keep] {
-            sink.on_record(r).unwrap();
+            sink.on_record(r).await.unwrap();
         }
         assert_eq!(sink.total, 4);
         assert_eq!(sink.by_rm_decision[&(RmId::Heap as u8, Decision::Keep)], 2,);
@@ -824,14 +894,14 @@ mod tests {
         assert!(summary.contains("xact/keep=1"), "got {summary:?}");
     }
 
-    #[test]
-    fn dir_sink_writes_segment_and_manifest_atomically() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dir_sink_writes_segment_and_manifest_atomically() {
         let tmp = tempfile::tempdir().unwrap();
         let mut sink = DirSegmentSink::new(tmp.path().to_path_buf()).unwrap();
         let seg = SegmentName::parse("000000010000000000000003").unwrap();
         let bytes = vec![0xAAu8; 64];
         let mani = dummy_manifest();
-        sink.on_segment(seg, &bytes, &mani).unwrap();
+        sink.on_segment(seg, &bytes, &mani).await.unwrap();
         let seg_path = tmp.path().join(seg.format());
         let mani_path = tmp.path().join(format!("{}.manifest.json", seg.format()));
         assert!(seg_path.exists(), "segment file written");
@@ -846,14 +916,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dir_sink_partial_segment_lands_with_partial_suffix() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dir_sink_partial_segment_lands_with_partial_suffix() {
         let tmp = tempfile::tempdir().unwrap();
         let mut sink = DirSegmentSink::new(tmp.path().to_path_buf()).unwrap();
         let seg = SegmentName::parse("000000010000000000000004").unwrap();
         let bytes = vec![0x77u8; 64];
         let mani = dummy_manifest();
-        sink.on_partial_segment(seg, &bytes, &mani).unwrap();
+        sink.on_partial_segment(seg, &bytes, &mani).await.unwrap();
         let name = seg.format();
         let partial_path = tmp.path().join(format!("{name}.partial"));
         let partial_mani_path = tmp.path().join(format!("{name}.partial.manifest.json"));

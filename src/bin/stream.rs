@@ -260,12 +260,14 @@ async fn run(args: Args) -> Result<()> {
         };
         let dispatched_before = stream.dispatched_lsn();
         let server_end = chunk.server_wal_end;
-        stream.push(
-            chunk.start_lsn,
-            chunk.data,
-            &mut record_sink,
-            &mut segment_sink,
-        )?;
+        stream
+            .push(
+                chunk.start_lsn,
+                chunk.data,
+                &mut record_sink,
+                &mut segment_sink,
+            )
+            .await?;
         let now_dispatched = stream.dispatched_lsn();
         if now_dispatched != prev_dispatched {
             let new_segs = (now_dispatched - prev_dispatched) / WAL_SEG_SIZE;
@@ -297,6 +299,7 @@ async fn run(args: Args) -> Result<()> {
     );
     stream
         .close(Some(&mut segment_sink), &mut record_sink)
+        .await
         .context("flush partial segment on shutdown")?;
     Ok(())
 }

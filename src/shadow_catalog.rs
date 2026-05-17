@@ -93,10 +93,11 @@ pub struct RelDescriptor {
     /// `'t'` temporary.
     pub persistence: char,
     /// `pg_class.relreplident` resolved to the form Phase 5's decoder
-    /// needs: `UsingIndex` carries the replica-identity index's oid and
-    /// the column-number list (`pg_index.indkey`), so old-tuple decode
-    /// under `XLH_UPDATE_CONTAINS_OLD_KEY` can be matched against the
-    /// indexed attnums without a second catalog round-trip.
+    /// needs: `UsingIndex` carries the replica-identity index's oid
+    /// and the column-number list (`pg_index.indkey`); `Default`
+    /// carries the primary key's `indkey` (or `None` when no PK), so
+    /// old-tuple decode under `XLH_UPDATE_CONTAINS_OLD_KEY` resolves
+    /// without a second catalog round-trip.
     pub replident: ReplIdent,
     pub attributes: Vec<RelAttr>,
 }
@@ -109,9 +110,14 @@ pub struct RelDescriptor {
 /// payloads.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplIdent {
-    /// `'d'`. Old-tuple payload contains the table's primary key
-    /// columns (or nothing if the table has no PK).
-    Default,
+    /// `'d'`. Old-tuple payload contains primary-key columns when
+    /// `XLH_UPDATE_CONTAINS_OLD_KEY` rides on UPDATE, or on every
+    /// DELETE. `pk_attnums` is `Some(pg_index.indkey)` for the
+    /// table's primary key (resolved at descriptor build via
+    /// `indisprimary = true`), or `None` when no PK exists — in
+    /// which case Phase 5 decodes `old = None` always. See Phase 5
+    /// relreplident behaviour table in PLAN.md.
+    Default { pk_attnums: Option<Vec<i16>> },
     /// `'n'`. Old-tuple payload is empty; UPDATE/DELETE rows lack a
     /// key. Phase 5's emitter drops these.
     Nothing,
@@ -614,7 +620,22 @@ impl ShadowCatalog {
 
     async fn fetch_replident(&mut self, c: char, rel_oid: Oid) -> Result<ReplIdent> {
         match c {
-            'd' => Ok(ReplIdent::Default),
+            'd' => {
+                // indkey is int2vector internally; cast to int2[] for
+                // tokio-postgres' standard Kind::Array(int2) decode.
+                // Missing row → table has no PK, decoder emits old = None.
+                let row = self
+                    .query_opt_retry(
+                        "SELECT indkey::int2[] \
+                         FROM pg_index \
+                         WHERE indrelid = $1 AND indisprimary = true \
+                         LIMIT 1",
+                        &[&rel_oid],
+                    )
+                    .await?;
+                let pk_attnums = row.map(|r| r.get::<_, Vec<i16>>(0));
+                Ok(ReplIdent::Default { pk_attnums })
+            }
             'n' => Ok(ReplIdent::Nothing),
             'f' => Ok(ReplIdent::Full),
             'i' => {

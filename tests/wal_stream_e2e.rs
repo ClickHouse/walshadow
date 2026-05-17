@@ -174,6 +174,7 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         };
         stream
             .push(chunk.start_lsn, chunk.data, &mut records, &mut segs)
+            .await
             .expect("push");
         let now_dispatched = stream.dispatched_lsn();
         if now_dispatched != prev_dispatched {
@@ -442,6 +443,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         };
         stream
             .push(chunk.start_lsn, chunk.data, &mut records, &mut segs)
+            .await
             .expect("push");
         let now = stream.dispatched_lsn();
         if now != prev {
@@ -711,6 +713,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         };
         stream
             .push(chunk.start_lsn, chunk.data, &mut metrics, &mut segs)
+            .await
             .expect("push");
         chunks_seen += 1;
         // Once next_lsn has caught up to (or past) ident.xlogpos, the
@@ -742,6 +745,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
     // calling stream.close(Some(&mut segs), &mut metrics).
     stream
         .close(Some(&mut segs), &mut metrics)
+        .await
         .expect("close writes partial");
 
     // The partial segment file must exist under <name>.partial, and the
@@ -849,6 +853,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
                 &mut resume_metrics,
                 &mut resume_segs,
             )
+            .await
             .expect("resume push");
         let now2 = stream2.dispatched_lsn();
         if now2 != prev2 {

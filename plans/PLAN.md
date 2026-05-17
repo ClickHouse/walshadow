@@ -491,19 +491,26 @@ Prerequisites, each landed as its own commit ahead of decoder work:
   Compressed-FPI sources (`wal_compression = pglz|lz4|zstd`) are
   common in production. Silent skip is not acceptable, so the
   primitive lands first.
-* Async `RecordSink`. `RecordSink::on_record` flips to `async fn`;
-  `WalStream::push` and `WalStream::close` flip to async too.
-  Reason: the decoder calls `ShadowCatalog::relation_at` (tokio-
-  postgres) on the hot path, and the alternatives — synchronous
-  libpq side-channel, or shunting records onto an mpsc with a
-  separate consumer task — either duplicate the catalog state or
-  decouple decoder cadence from segment cadence. Mechanical lift:
-  `Metrics`, `Collecting`, `Counting`, `Composite` sinks plus
-  `filter_segment`'s per-record dispatch loop. `SegmentSink` stays
-  sync (the production writer is `std::fs` and the test sinks are
-  in-memory; no value in async). Affects `bin/stream.rs`'s
-  `WalStream::push` call site and the eight existing integration
-  tests that drive sinks directly.
+* Async `RecordSink` + `SegmentSink`. Both trait methods flip to
+  `async fn` shape (`Pin<Box<dyn Future + Send + 'a>>` desugaring for
+  dyn-compat); `WalStream::push` / `WalStream::close` /
+  `flush_current` flip with them. Reason for `RecordSink`: decoder
+  calls `ShadowCatalog::relation_at` (tokio-postgres) on the hot
+  path, and the alternatives — synchronous libpq side-channel, or
+  shunting records onto an mpsc with a separate consumer task —
+  either duplicate the catalog state or decouple decoder cadence
+  from segment cadence. Reason for `SegmentSink`: 16 MiB segment
+  writes through `DirSegmentSink` are sync filesystem I/O that
+  blocks the calling tokio worker until the write returns;
+  `walshadow-stream` runs `worker_threads = 2`, so the block parks
+  half the pool. Flipped to `tokio::fs::write` (internally
+  `spawn_blocking`) so ctrl_c, status timer, invalidation drain
+  stay responsive while the write is in flight. Mechanical lift: `Metrics`, `Collecting`,
+  `Counting`, `Composite` record sinks, `Collecting` + `Dir`
+  segment sinks, plus the per-record + per-segment dispatch in
+  `WalStream`. Affects `bin/stream.rs`'s `WalStream::push` call
+  site and the eight existing integration tests that drive sinks
+  directly.
 * `ReplIdent::Default` carries resolved primary-key attnums.
   Today's `ReplIdent::Default` is a unit variant; the decoder
   needs `pg_index.indkey` where `indisprimary = true` to interpret

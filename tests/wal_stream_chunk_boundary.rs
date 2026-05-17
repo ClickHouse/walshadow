@@ -77,7 +77,7 @@ fn key(r: &Record) -> RecordKey {
     }
 }
 
-fn run_with_chunk_sizes(bytes: &[u8], seg_size: u64, chunks: &[usize]) -> Vec<RecordKey> {
+async fn run_with_chunk_sizes(bytes: &[u8], seg_size: u64, chunks: &[usize]) -> Vec<RecordKey> {
     let mut stream = WalStream::new(1, seg_size, 0).expect("stream new");
     let mut recs = CollectingRecordSink::default();
     let mut segs = CollectingSegmentSink::default();
@@ -88,6 +88,7 @@ fn run_with_chunk_sizes(bytes: &[u8], seg_size: u64, chunks: &[usize]) -> Vec<Re
         let take = (*chunk_iter.next().unwrap()).min(bytes.len() - off);
         stream
             .push(lsn, &bytes[off..off + take], &mut recs, &mut segs)
+            .await
             .expect("push");
         lsn += take as u64;
         off += take;
@@ -95,8 +96,8 @@ fn run_with_chunk_sizes(bytes: &[u8], seg_size: u64, chunks: &[usize]) -> Vec<Re
     recs.records.iter().map(key).collect()
 }
 
-#[test]
-fn bulk_and_byte_chunks_emit_identical_record_sequence() {
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_and_byte_chunks_emit_identical_record_sequence() {
     let path = fixture_path();
     if !path.exists() {
         eprintln!("skip: no captured segment at {path:?}");
@@ -110,11 +111,11 @@ fn bulk_and_byte_chunks_emit_identical_record_sequence() {
     let seg_size = bytes.len() as u64;
 
     // (a) one big push
-    let bulk = run_with_chunk_sizes(&bytes, seg_size, &[bytes.len()]);
+    let bulk = run_with_chunk_sizes(&bytes, seg_size, &[bytes.len()]).await;
     assert!(!bulk.is_empty(), "fixture had zero records");
 
     // (b) one byte at a time
-    let byte_at_a_time = run_with_chunk_sizes(&bytes, seg_size, &[1]);
+    let byte_at_a_time = run_with_chunk_sizes(&bytes, seg_size, &[1]).await;
     assert_eq!(
         bulk, byte_at_a_time,
         "byte-at-a-time record sequence diverged from bulk push",
@@ -123,7 +124,7 @@ fn bulk_and_byte_chunks_emit_identical_record_sequence() {
     // (c) varying chunk sizes that cross page (8192) and record-header
     // (24) boundaries non-trivially. Primes so the chunker doesn't
     // coincidentally land on the same offsets as the bulk path.
-    let prime_chunks = run_with_chunk_sizes(&bytes, seg_size, &[1, 7, 13, 257, 8193, 65537]);
+    let prime_chunks = run_with_chunk_sizes(&bytes, seg_size, &[1, 7, 13, 257, 8193, 65537]).await;
     assert_eq!(
         bulk, prime_chunks,
         "prime-chunked record sequence diverged from bulk push",
@@ -134,8 +135,8 @@ fn bulk_and_byte_chunks_emit_identical_record_sequence() {
 /// `current_buf` accumulates identically regardless of push cadence,
 /// so the rewritten segment delivered to the segment sink must be
 /// byte-equal across cadences.
-#[test]
-fn bulk_and_chunked_emit_identical_segment_bytes() {
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_and_chunked_emit_identical_segment_bytes() {
     let path = fixture_path();
     if !path.exists() {
         eprintln!("skip: no captured segment at {path:?}");
@@ -149,6 +150,7 @@ fn bulk_and_chunked_emit_identical_segment_bytes() {
     let mut seg_bulk = CollectingSegmentSink::default();
     stream_bulk
         .push(0, &bytes, &mut rec_bulk, &mut seg_bulk)
+        .await
         .expect("bulk push");
 
     let mut stream_chunked = WalStream::new(1, seg_size, 0).unwrap();
@@ -162,6 +164,7 @@ fn bulk_and_chunked_emit_identical_segment_bytes() {
                 &mut rec_chunked,
                 &mut seg_chunked,
             )
+            .await
             .expect("chunked push");
     }
 

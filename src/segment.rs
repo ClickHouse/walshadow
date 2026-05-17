@@ -10,11 +10,18 @@
 //! tuples — `logical_bytes` is the contiguous record (header + body, no
 //! page-header interruptions), `byte_ranges` is where to write it back.
 
+use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 use wal_rs::pg::walparser::{
     WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER,
     XLP_PAGE_MAGIC_PG15,
 };
+
+/// Inline-1 byte-range vector: records almost always live on one WAL
+/// page, multi-range only when a record straddles the page boundary.
+/// Allocated per walked record (millions per segment) so the inline
+/// case skips a `Vec` heap alloc on the hot path.
+pub type ByteRanges = SmallVec<[(usize, usize); 1]>;
 
 const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
 const SHORT_HEADER_SIZE: usize = 20;
@@ -45,7 +52,7 @@ pub struct WalkedRecord {
     pub logical_bytes: Vec<u8>,
     /// File-offset / length pairs the logical bytes occupy in the
     /// segment, in order. `byte_ranges.iter().map(|(_, l)| l).sum() == logical_bytes.len()`.
-    pub byte_ranges: Vec<(usize, usize)>,
+    pub byte_ranges: ByteRanges,
     /// First byte offset in the segment (= byte_ranges[0].0).
     pub start_offset: usize,
     /// Page magic from the page where the record header lives.
@@ -81,7 +88,7 @@ struct Pending {
     /// Bytes accumulated so far.
     accumulated: Vec<u8>,
     /// Byte ranges spanned so far.
-    byte_ranges: Vec<(usize, usize)>,
+    byte_ranges: ByteRanges,
     /// Magic of the page the record header was read on.
     page_magic: u16,
 }
@@ -223,7 +230,7 @@ impl<'a> SegmentWalker<'a> {
                 start_offset: self.cursor,
                 total_len: None,
                 accumulated: chunk.to_vec(),
-                byte_ranges: vec![(self.cursor, chunk.len())],
+                byte_ranges: smallvec![(self.cursor, chunk.len())],
                 page_magic: self.page_magic,
             });
             self.cursor = page_end;
@@ -259,7 +266,7 @@ impl<'a> SegmentWalker<'a> {
             self.cursor += take_this_page;
             return Ok(Some(WalkedRecord {
                 logical_bytes: accumulated,
-                byte_ranges: vec![range],
+                byte_ranges: smallvec![range],
                 start_offset: range.0,
                 page_magic: self.page_magic,
             }));
@@ -270,7 +277,7 @@ impl<'a> SegmentWalker<'a> {
             start_offset: self.cursor,
             total_len: Some(xl_tot_len),
             accumulated,
-            byte_ranges: vec![range],
+            byte_ranges: smallvec![range],
             page_magic: self.page_magic,
         });
         self.cursor = page_end; // force next iteration to read next page

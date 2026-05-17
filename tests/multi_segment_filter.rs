@@ -16,6 +16,8 @@
 //! way to force a relmap update on segment N and a dependent heap
 //! record on segment N+1 deterministically.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -160,8 +162,8 @@ const PG_CLASS_OID: u32 = 1259;
 const TEST_DB_NODE: u32 = 5;
 const REWRITTEN_PG_CLASS_FILENODE: u32 = 50000; // > 16384, would look user without relmap
 
-#[test]
-fn catalog_tracker_state_survives_segment_boundary() {
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_tracker_state_survives_segment_boundary() {
     // Segment 1: a single XLOG_RELMAP_UPDATE that maps pg_class to a
     // filenode in the user range. Class::Special, kept unconditionally;
     // its side effect is that tracker.nodes gains (TEST_DB_NODE,
@@ -196,9 +198,11 @@ fn catalog_tracker_state_survives_segment_boundary() {
 
     stream
         .push(0, &seg1, &mut records, &mut segs)
+        .await
         .expect("push seg1");
     stream
         .push(SEG_SIZE, &seg2, &mut records, &mut segs)
+        .await
         .expect("push seg2");
 
     assert_eq!(segs.segments.len(), 2, "two segments dispatched");
@@ -244,8 +248,8 @@ fn catalog_tracker_state_survives_segment_boundary() {
 /// the parsed `Record.parsed.header.xact_id` arrives at the sink
 /// untouched. Pre-PRE5b5 `RecordEvent` carried no xact_id at all, so
 /// this assertion is not satisfiable on the old shape.
-#[test]
-fn records_in_one_xact_share_xact_id_through_stream() {
+#[tokio::test(flavor = "current_thread")]
+async fn records_in_one_xact_share_xact_id_through_stream() {
     const XID: u32 = 42;
     const OTHER_XID: u32 = 99;
     // Three pg_class-targeted heap records — Class::Catalog by the
@@ -268,7 +272,10 @@ fn records_in_one_xact_share_xact_id_through_stream() {
     let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
     let mut records = CollectingRecordSink::default();
     let mut segs = CollectingSegmentSink::default();
-    stream.push(0, &seg, &mut records, &mut segs).expect("push");
+    stream
+        .push(0, &seg, &mut records, &mut segs)
+        .await
+        .expect("push");
 
     assert_eq!(records.records.len(), 4);
     let xid_42: Vec<_> = records
@@ -307,18 +314,28 @@ fn records_in_one_xact_share_xact_id_through_stream() {
 struct SharedCollectingSink(Arc<Mutex<Vec<Record>>>);
 
 impl RecordSink for SharedCollectingSink {
-    fn on_record(&mut self, r: &Record) -> Result<(), SinkError> {
-        self.0.lock().unwrap().push(r.clone());
-        Ok(())
+    fn on_record<'a>(
+        &'a mut self,
+        r: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.0.lock().unwrap().push(r.clone());
+            Ok(())
+        })
     }
 }
 
 struct SharedCountingSink(Arc<AtomicU64>);
 
 impl RecordSink for SharedCountingSink {
-    fn on_record(&mut self, _r: &Record) -> Result<(), SinkError> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+    fn on_record<'a>(
+        &'a mut self,
+        _r: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
     }
 }
 
@@ -332,13 +349,18 @@ struct FailOnNth {
 }
 
 impl RecordSink for FailOnNth {
-    fn on_record(&mut self, _r: &Record) -> Result<(), SinkError> {
-        let i = self.seen.fetch_add(1, Ordering::Relaxed);
-        if i == self.fail_at {
-            Err(SinkError::Other(format!("synthetic fail at #{i}")))
-        } else {
-            Ok(())
-        }
+    fn on_record<'a>(
+        &'a mut self,
+        _r: &'a Record,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            let i = self.seen.fetch_add(1, Ordering::Relaxed);
+            if i == self.fail_at {
+                Err(SinkError::Other(format!("synthetic fail at #{i}")))
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
@@ -350,8 +372,8 @@ impl RecordSink for FailOnNth {
 /// The `Send + 'static` bound on `CompositeRecordSink::inner` forces
 /// the shared-state idiom: the boxed sinks consume the trait objects,
 /// so observation handles live behind `Arc<Mutex<_>>`.
-#[test]
-fn composite_sink_fans_out_to_all_inner_sinks() {
+#[tokio::test(flavor = "current_thread")]
+async fn composite_sink_fans_out_to_all_inner_sinks() {
     // Four pg_class-targeted heap records — Class::Catalog by
     // bootstrap rule → all Kept, all reach the record sink.
     let recs: Vec<Vec<u8>> = (0..4)
@@ -378,7 +400,10 @@ fn composite_sink_fans_out_to_all_inner_sinks() {
     ]);
     let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
     let mut segs = CollectingSegmentSink::default();
-    stream.push(0, &seg, &mut comp, &mut segs).expect("push");
+    stream
+        .push(0, &seg, &mut comp, &mut segs)
+        .await
+        .expect("push");
 
     let collected = collected.lock().unwrap();
     assert_eq!(collected.len(), 4, "collecting sink saw all four records");
@@ -406,8 +431,8 @@ fn composite_sink_fans_out_to_all_inner_sinks() {
 /// sink *after* the failing one observed only the first record because
 /// `CompositeRecordSink` short-circuits on inner `Err`. Stream is
 /// considered poisoned post-error per PRE5b10 item 4.
-#[test]
-fn composite_sink_propagates_inner_error_and_short_circuits() {
+#[tokio::test(flavor = "current_thread")]
+async fn composite_sink_propagates_inner_error_and_short_circuits() {
     let recs: Vec<Vec<u8>> = (0..3)
         .map(|i| {
             build_record_with_block_ref_xid(
@@ -439,6 +464,7 @@ fn composite_sink_propagates_inner_error_and_short_circuits() {
     let mut segs = CollectingSegmentSink::default();
     let err = stream
         .push(0, &seg, &mut comp, &mut segs)
+        .await
         .expect_err("FailOnNth must propagate through WalStream::push");
     use walshadow::wal_stream::WalStreamError;
     match err {
