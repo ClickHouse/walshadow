@@ -555,12 +555,15 @@ impl WalStream {
                     source,
                 }
             })?;
+        // Match `flush_current`'s "segment first, then records" order
+        // so a partial close still gives shadow a chance to ingest the
+        // bytes before the decoder gates on its replay LSN.
+        if let Some(sink) = partial_sink {
+            sink.on_partial_segment(seg, &filtered, &manifest).await?;
+        }
         for (entry, parsed) in manifest.records.iter().zip(parsed) {
             let record = Record::from_parsed(seg_start_lsn, parsed, entry);
             record_sink.on_record(&record).await?;
-        }
-        if let Some(sink) = partial_sink {
-            sink.on_partial_segment(seg, &filtered, &manifest).await?;
         }
         Ok(())
     }
@@ -581,11 +584,17 @@ impl WalStream {
                     source,
                 }
             })?;
+        // Segment lands on disk before per-record dispatch fires. The
+        // decoder's `ShadowCatalog::relation_at` gates on shadow's
+        // `pg_last_wal_replay_lsn() >= record_lsn`; shadow can only
+        // advance once its `restore_command` finds the segment file —
+        // dispatching first would deadlock the per-record gate against
+        // the segment write its own caller is still holding back.
+        segment_sink.on_segment(seg, &filtered, &manifest).await?;
         for (entry, parsed) in manifest.records.iter().zip(parsed) {
             let record = Record::from_parsed(seg_start_lsn, parsed, entry);
             record_sink.on_record(&record).await?;
         }
-        segment_sink.on_segment(seg, &filtered, &manifest).await?;
         self.current_lsn += self.seg_size;
         self.current_buf.clear();
         Ok(())

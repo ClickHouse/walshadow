@@ -372,17 +372,21 @@ impl TablePlan {
         rel: &RelDescriptor,
         mapping: &TableMapping,
     ) -> Result<Self, EmitterError> {
-        let attmap: HashMap<i16, &crate::shadow_catalog::RelAttr> =
-            rel.attributes.iter().map(|a| (a.attnum, a)).collect();
         let mut columns = Vec::with_capacity(mapping.columns.len());
         let mut col_sql = Vec::with_capacity(mapping.columns.len() + 4);
+        // Mapping columns whose attnum isn't in the catalog descriptor
+        // are not a hard error: schema-evolution workloads pre-declare
+        // post-ALTER columns in the mapping, and pre-ALTER xacts will
+        // legitimately see fewer attnums than the mapping does.
+        // `TableEncoder::append_row` already emits NULL for any source
+        // attnum that `decoded.{new,old}.columns.get` returns None for,
+        // so the missing-column case lands as NULL on every row of the
+        // affected mapping column. Operators chasing a static-config
+        // typo see it as "this column is always NULL" — the CH dest
+        // table catches it if the column is non-nullable; otherwise
+        // surfaces in row-count / aggregate mismatches.
+        let _ = rel;
         for c in &mapping.columns {
-            if !attmap.contains_key(&c.src_attnum) {
-                return Err(EmitterError::Config(format!(
-                    "table {}: source attnum {} not in catalog descriptor",
-                    mapping.target, c.src_attnum
-                )));
-            }
             let ast = TypeAst::parse(&c.target_type, alloc)
                 .map_err(|e| EmitterError::Type(format!("{}: {e}", c.target_type)))?;
             columns.push(ColumnPlan {

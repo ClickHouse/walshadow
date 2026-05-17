@@ -16,6 +16,23 @@ docs that are not yet committed work sit alongside as peers.
 - **Phase 7** — CH Native emitter via clickhouse-c-rs. Feature-passdown
   shape + emitter scaffold + observer wiring; Tier 1/2 + live-CH drill
   iterate in followups. [PHASE7.md](PHASE7.md).
+- **Phase 8** — end-to-end DDL drill: source PG → walshadow filter →
+  shadow PG (recovery via `restore_command`, bootstrapped through
+  `pg_basebackup`) → heap decoder → xact buffer → CH-Native emitter →
+  spawned `clickhouse server`. Two integration tests in
+  `tests/phase8_e2e.rs` — INSERT/UPDATE/DELETE on a pre-created table,
+  and `ALTER TABLE ADD COLUMN` mid-stream with a mapping that
+  pre-declares the post-ALTER shape. Surfaces + fixes four bugs:
+  `WalStream::flush_current`'s dispatch order (segment-first so the
+  decoder's `relation_at` replay-LSN gate isn't deadlocked against
+  the segment write its own caller holds back),
+  `clickhouse-c-rs::Client` pins its `Allocator` in a `Box` so the
+  C-side `c->al` pointer stays valid after `Client::init` returns,
+  `TablePlan::build` no longer rejects mapping attnums absent from
+  the catalog descriptor (pre-ALTER xacts are valid), and `ChServer`
+  uses `SYSTEM SHUTDOWN` instead of `kill -TERM <pgid>` for clean
+  CH-server teardown. DROP TABLE + PG read-time-default replication
+  are followups. [PHASE8.md](PHASE8.md).
 - **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,
@@ -60,6 +77,12 @@ docs that are not yet committed work sit alongside as peers.
   `spill_backend = "local_disk" | "clickhouse"` knob reserved for the
   diskless case. Lands inside Phase 6's commit, not as a separate phase.
   [PHASE6disk.md](PHASE6disk.md).
+- **FUTURE** — evaluation: speculative roles for shadow PG beyond
+  CDC. Schema-only restore (ship shadow's catalog as DDL / hollow
+  data dir for third-party clusters) and synchronous-commit WAL
+  witness (walshadow as RPO=0 durability standby that relays the
+  surviving WAL tail to a lagging async standby on primary loss).
+  Not committed work. [FUTURE.md](FUTURE.md).
 - **FPI_COMPRESSION** — [Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix)
   prerequisite: decompress `wal_compression = pglz|lz4|zstd`
   full-page images via a new `src/fpi.rs` (`restore_block_image`)

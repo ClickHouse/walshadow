@@ -140,7 +140,13 @@ fn cstr_array_to_string(buf: &[c_char]) -> String {
 /// keep both pinned and drop in this order: client first, then I/O).
 pub struct Client {
     raw: NonNull<sys::chc_client>,
-    alloc: Allocator,
+    // `chc_client_init` stashes `c->al = al`, i.e. it stores a pointer
+    // back into the `chc_alloc` struct we pass in. Holding the
+    // allocator by value would let it move when `Self` is constructed
+    // and again on every Client move, invalidating the pointer the C
+    // side dereferences on every subsequent `alloc/realloc/free`. The
+    // Box keeps the address stable for the Client's lifetime.
+    alloc: Pin<Box<Allocator>>,
 }
 
 impl Client {
@@ -155,6 +161,7 @@ impl Client {
     ) -> Result<Self> {
         let codec_ptr = codec.map(|c| c.as_ptr());
         let raw_opts = opts.to_raw(codec_ptr);
+        let alloc = Box::pin(alloc);
         let mut out: *mut sys::chc_client = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
@@ -449,7 +456,7 @@ impl<'c> Packet<'c> {
         self.raw.block = core::ptr::null_mut();
         // SAFETY: ownership transfer; the same allocator was used by
         // chc_client_recv_packet (Client carries it).
-        unsafe { Block::from_raw(raw, self.client.alloc) }
+        unsafe { Block::from_raw(raw, *self.client.alloc) }
     }
 
     /// Take ownership of the exception chain on an Exception packet.
@@ -459,7 +466,7 @@ impl<'c> Packet<'c> {
         self.raw.exception = core::ptr::null_mut();
         // SAFETY: ownership transfer; allocator matches the one that
         // built the chain in chc_client_recv_packet.
-        Some(unsafe { Exception::from_raw(raw, self.client.alloc) })
+        Some(unsafe { Exception::from_raw(raw, *self.client.alloc) })
     }
 }
 
