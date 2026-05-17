@@ -34,10 +34,15 @@ floor, not the technical one. PG ≤ 14 captures are rejected.
 
 Plan-file index lives at [INDEX.md](INDEX.md).
 
-Roadmap: Phases 5–10 as listed below (heap decoder → TOAST/xact →
-CH emitter → DDL drill → Tier 3 + oracle → operational). Each phase
-closes with `PHASE<N>.md` under `plans/`; [INDEX.md](INDEX.md) is the
-mutable index.
+Roadmap: Phases 5–12 as listed below (heap decoder → TOAST/xact →
+CH emitter → DDL drill → Tier 3 + oracle → operational scaffolding →
+durability + resume → backfill bridge). Phase 10 was originally
+slated as the closing phase; the Phase 9 retro surfaced that v1.0
+acceptance §5 (`kill -9` + restart → matching CH end-state) cannot
+pass without a cursor file plus slot-advance gating on emitter-ack
+LSN — split out as Phase 11. The absence of an initial-snapshot
+path forces Phase 12. Each phase closes with `PHASE<N>.md` under
+`plans/`; [INDEX.md](INDEX.md) is the mutable index.
 
 Reuses without modification:
 
@@ -341,7 +346,10 @@ debug replay.
 Each phase produces an independent slice. Phase 1, 3, 4, then the
 decoder chain (5→6→7) are sequential; Phase 2 ran in parallel with
 Phase 3; Phase 4b ran in parallel with Phase 5; Phase 9 & 10 are
-parallel once Phase 8 closes. Phase docs follow the `PHASE<N>.md`
+parallel once Phase 8 closes. Phase 11 sequences after Phase 10
+(the cursor schema rides on the metrics + standby-status surfaces
+Phase 10 lands). Phase 12 is parallel with Phase 11 — different code
+paths, no shared state. Phase docs follow the `PHASE<N>.md`
 convention from `~/s/wal-rs`.
 
 ### Phase 0 — record-classification fixture
@@ -672,16 +680,229 @@ docs the rest). Followups: local codecs for jsonb / arrays if
 measurement shows the libpq round-trip is hot; sampler
 auto-tuning; mismatch ring buffer for debugging.
 
-### Phase 10 — operational
+### Phase 10 — operational scaffolding
 
-Slot keepalive (walshadow's physical slot on source must advance with
-shadow's replay LSN, not the decoder's commit LSN — slot retention is
-bounded by the slower of the two). Filtered `pg_wal/` trim. Metrics:
-source LSN, filter LSN, shadow replay LSN, decoder commit LSN, CH ack
-LSN. SIGHUP reload of table mapping. Shadow PG restart on PG-major
-config change.
+Renamed from "operational" (PLAN's original closing phase) to
+"operational scaffolding" once the Phase 9 retro made clear that the
+load-bearing slot-advance + cursor work belongs in its own phase
+([Phase 11](#phase-11--durability--resume)). Phase 10's scope is the
+surrounding plumbing the daemon needs to be observable + reloadable +
+safely connected; it lands the *shape* of standby-status reporting
+but doesn't change *what value* the daemon advances the slot to —
+that flip is Phase 11.
 
-Size: ≈400 LOC.
+Scope:
+
+- **Pre-flight validators at connect.** Daemon refuses to start on
+  source `server_version_num < 16` (PLAN §"Supported PostgreSQL
+  versions" + §"Pitfall #7"), shadow / source major mismatch,
+  source `wal_level != 'logical'`, any mapped relation without
+  `REPLICA IDENTITY FULL`, `--slot` set against a non-existent
+  slot. Precise error per failure mode, no silent-skip fall-throughs.
+- **HTTP / Prometheus metrics surface.** Source received LSN,
+  filter LSN, shadow replay LSN, decoder commit LSN, CH ack LSN
+  (the last two are Phase 11 outputs but the surface lands here so
+  Phase 11 only adds the values, not the endpoint). Per-rmgr
+  kept/dropped counters, xact-buffer occupancy, spill activity,
+  oracle sampler stats — everything the stderr status line already
+  carries.
+- **`tracing` subscriber pipeline.** `source_feed.rs`'s
+  `tracing_debug` stub today drops every `tracing::debug!` call site
+  wal-rs offers. Wire `tracing_subscriber::EnvFilter` so
+  `RUST_LOG=walshadow=debug` surfaces frame-level diagnostics.
+- **Filtered `pg_wal/` trim on shadow replay advance.** Segments
+  shipped to shadow's restore-command dir accumulate forever today.
+  Trim drops segments older than `pg_last_wal_replay_lsn() -
+  retention_window`. Retention defaults to 1 hour; configurable.
+- **Standby-status update shape.** `send_status` in
+  [`source_feed.rs`](../src/source_feed.rs) currently collapses
+  `(write_lsn, flush_lsn, apply_lsn)` to one value (filter
+  position). Phase 10 splits the three fields and parameterises
+  them; Phase 11 fills in the resume-safe values.
+- **SIGHUP reload of `--ch-config`.** Table mapping is boot-only
+  today. SIGHUP re-parses the TOML and swaps the live mapping
+  (atomic via `ArcSwap` or equivalent).
+- **Shadow PG major-version restart.** A `postgresql.conf` change
+  that requires a shadow restart (rare; mostly memory knobs) needs
+  the daemon to drive `pg_ctl restart` rather than die on connection
+  drop. Phase 4b's reconnect already handles the libpq side; this
+  is the supervisor side.
+- **CH emitter retry/reconnect.** Today one `Exception` packet from
+  the CH server kills the daemon. Bounded retry with exponential
+  backoff against a single replica; multi-replica fan-out remains
+  Phase 7-followup, not Phase 10.
+
+Out of scope:
+- Slot-advance value (Phase 11 territory; Phase 10 ships the
+  reporting shape but not the policy).
+- Cursor file (Phase 11).
+- Initial snapshot (Phase 12).
+
+Size: ≈600 LOC (revised up from PLAN's original 400 once the HTTP
+surface + pre-flight validators + tracing pipeline + CH-emitter
+retry are accounted).
+
+### Phase 11 — durability + resume
+
+Cursor file plus slot-advance gating on emitter-ack LSN. Today's
+daemon advances the source slot to `stream.dispatched_lsn()` (filter
+position) which is unsafe: a committed xact whose `XLOG_XACT_COMMIT`
+record has been filtered but not yet drained from the xact buffer
+into CH is lost on `kill -9` + restart, because source has been
+given permission to recycle that WAL and the spill dir is wiped on
+every startup ([`xact_buffer`](../src/xact_buffer.rs) +
+[`spill`](../src/spill.rs)'s "drained-or-replayable-from-cursor"
+invariant, where the cursor has never existed). Acceptance §5
+cannot pass under Phase 10's state.
+
+Scope:
+
+- **Cursor file** under `{spill_dir}/cursor.bin` (sibling to spill
+  files so a `mv` of the working dir keeps state coherent). Schema:
+  `version: u32`, `source_received_lsn: u64`,
+  `filter_durable_lsn: u64`, `shadow_replay_lsn: u64`,
+  `drain_lsn: u64`, `emitter_ack_lsn: u64`. Atomic-rename writer,
+  fsync, written on every emitter-acked xact drain.
+- **Slot advance** keyed on `emitter_ack_lsn`, not
+  `dispatched_lsn`. Phase 10's standby-status split is the
+  carrier: `write_lsn = source_received_lsn`,
+  `flush_lsn = filter_durable_lsn`,
+  `apply_lsn = min(shadow_replay_lsn, emitter_ack_lsn)`. wal-rs's
+  `build_status_update` already takes three LSNs; the daemon side
+  threads the right values through.
+- **Filter durability.** `tokio::fs::write` on segment seal is
+  rename-after-write but doesn't fsync the directory or the segment
+  file. Phase 11 adds explicit fsync so `filter_durable_lsn` is
+  honest — without it walshadow's "I flushed" ack to source is a
+  lie under a host power loss.
+- **Startup resume path.** Read cursor at boot; if present, resume
+  WAL stream from `cursor.emitter_ack_lsn` rounded down to a segment
+  boundary. Replay any spill files keyed on xids whose first-seen
+  LSN > `cursor.emitter_ack_lsn` (drained-but-not-acked xacts get
+  re-emitted; CH dedup on `_lsn` collapses them). If cursor missing
+  (greenfield boot), fall back to today's `--start-lsn` / source
+  `pg_current_wal_lsn` behaviour.
+- **Audit follow-up from [PHASE8 §"Bug 2"](PHASE8.md).** The
+  `BlockBuilder` `Allocator` is unpinned today — fine because the
+  builder doesn't outlive its construction frame. Phase 11's emitter
+  refactor for budget-triggered mid-xact flush (the followup
+  [PHASE7 §"Budget-triggered mid-xact flush"](PHASE7.md) defers)
+  may stretch the builder lifetime across awaits; pin it
+  `Pin<Box<Allocator>>` like `Client` if so.
+
+Out of scope:
+- Multi-replica fan-out cursor (single-CH-replica deployment; per-
+  replica acks are independent surface).
+- Per-source-shard cursor (single-source-daemon assumption holds).
+- Two-phase-commit cursor entries (`PREPARE` xacts can sit
+  arbitrarily long; cursor handling defers to the same followup
+  that builds proper 2PC support).
+
+Size: ≈500 LOC.
+
+### Phase 12 — backfill bridge
+
+Initial snapshot path for pre-existing source data. Today
+`START_REPLICATION PHYSICAL` only sees post-attach WAL — any row
+inserted on source before the daemon's first connect is invisible to
+CH forever. Greenfield CH deployments against a non-empty source
+need a backfill bridge.
+
+Two shapes, both leaning on the existing per-table emitter:
+
+- **Source-direct COPY** (default). `COPY (SELECT * FROM <rel>) TO
+  STDOUT BINARY` against source PG, per mapped relation, under a
+  `pg_export_snapshot()` shared with the replication slot's
+  start-LSN export. walshadow's emitter consumes the COPY stream
+  through the same `ColumnValue` → CH encoding the WAL hot path
+  uses, ships as one block group per relation under a synthetic
+  `_lsn = backfill_lsn` (sub-segment minimum across the export
+  snapshot's xmin). CH `ReplacingMergeTree(_lsn)` collapses
+  backfill rows with future WAL-driven updates.
+- **Shadow-as-source** (operator opt-in). Same shape but COPY
+  against shadow. Requires shadow to carry user-heap data files
+  ([BASEBACKUP](BASEBACKUP.md) Use Case 1B / 2A), not the MiB-
+  scale catalog-only shape Phase 3 ships. Trade-off: zero source
+  CPU + IO during backfill, at the cost of shadow data-dir size.
+
+Sequencing primitive: backfill completes at LSN `B` (the snapshot's
+`pg_export_snapshot()` LSN); daemon's `--start-lsn` for the WAL pump
+is `B` so the backfill's snapshot and the WAL tail meet seamlessly.
+Mirrors `pg_dump`'s parallel-dump co-ordination.
+
+Out of scope:
+- DDL during backfill — operator must quiesce DDL for the backfill
+  window. A mid-backfill DDL means re-snapshotting the affected
+  relation.
+- Backfill restart mid-flight. v1 is single-shot; on failure,
+  truncate CH dest + retry.
+- Per-relation back-pressure against active WAL. Backfill takes
+  whatever bandwidth the CH emitter is willing to accept;
+  the WAL pump's xact buffer holds back-pressure in parallel.
+
+Size: ≈700 LOC (one-shot COPY orchestrator + per-relation encoder
+reuse + snapshot co-ordination + retry semantics).
+
+## Known correctness gaps
+
+Surfaced during the Phase 9 retro / Phase 10 re-plan. Each is silent
+loss or quiet skew today, not visible to a metrics watcher. Listed
+separately from "Risks" because the decision to ship is "yes,
+deferred", not "open question".
+
+1. **`XLOG_HEAP2_MULTI_INSERT` silently dropped.**
+   [`heap_decoder.rs:370-373`](../src/heap_decoder.rs) returns
+   `Ok(None)` for every `RmId::Heap2` op (Phase 5 punt). `COPY` and
+   `INSERT INTO ... SELECT` paths emit `MULTI_INSERT`; their rows
+   never reach CH. Surfaces as row-count mismatch on any workload
+   that uses COPY-into. Defer to a Phase 7-followup once per-tuple
+   offset fan-out lands; until then, document as "COPY-into a
+   tracked table is unsupported, use multi-row INSERT".
+2. **Subxact lineage collapsed.** Phase 6 ships top-level-xact-only;
+   `XLOG_XACT_ASSIGNMENT` is ignored. `ROLLBACK TO SAVEPOINT`
+   mid-xact still lands every pre-savepoint write in CH at commit.
+   ORMs that wrap each statement in a savepoint (Django,
+   Hibernate, Rails) emit ghost rows under exception paths.
+   Phase-6-followup; non-blocking for §1 acceptance because pgbench
+   doesn't use savepoints.
+3. **`TRUNCATE` not replicated to CH.**
+   [`main_data.rs:15-19`](../src/main_data.rs) recognises
+   `XLOG_HEAP_TRUNCATE` for filter-keep purposes but the decoder
+   does not route it through to the emitter. CH dest accumulates
+   stale rows after a source `TRUNCATE`.
+4. **PG read-time defaults (`atthasmissing` + `attmissingval`).**
+   PHASE8 schema-evolution drill pins this: a pre-ALTER row, read on
+   source after `ALTER TABLE ADD COLUMN c int DEFAULT 7`, shows
+   `c = 7` because PG injects the missing default at read time.
+   walshadow's decoder reads the physical tuple bytes and emits
+   NULL. Acceptance §1 (`ALTER TABLE ... ADD COLUMN ... DEFAULT k`)
+   **fails today** when checksum compares the post-ALTER reader's
+   view against CH. Decoder needs to consult
+   `pg_attribute.atthasmissing` + `attmissingval` at decode time.
+5. **Sequence state not replicated.** Filter drops `RM_SEQ_ID`
+   (not in the catalog-keep table — PLAN's "What 'replay only
+   catalog' filters in"). CH never observes `nextval()` advances.
+   Tables with `serial` PKs replicate row values correctly, but a
+   downstream consumer cannot reconstruct source's sequence
+   `last_value`. Worth a CH-side synthetic `_sequence_value` per
+   tracked sequence if measurement demands.
+6. **Cross-table WAL ordering inside an xact** ([PHASE7 §"Cross-
+   table ordering inside an xact"](PHASE7.md)). Per-(destination
+   table, xact) batching collapses interleaved writes across T1 / T2
+   into "all T1, then all T2". Foreign-key invariants between T1
+   and T2 in CH readers can see partial state mid-drain. `_lsn`
+   dedup keys correctly so end-state is consistent.
+7. **Two-phase commit handling.** `XLOG_XACT_PREPARE` is ignored;
+   the xact stays buffered until `COMMIT_PREPARED` lands.
+   `PREPARE` followed by an arbitrarily long pause leaves the spill
+   file alive across multiple daemon restarts (where it gets wiped
+   per Phase 11's startup contract) — losing the prepared xact's
+   writes. PLAN §"Pitfall #6" names the design; no code today.
+8. **CH-server-bounce recovery.** Phase 10 lands bounded retry but
+   not a "re-emit the last drained xact's block from spill replay";
+   if the retry budget expires the daemon dies and Phase 11's
+   cursor resumes from `emitter_ack_lsn`. Operationally fine; named
+   for completeness.
 
 ## Risks & open questions
 
@@ -720,20 +941,35 @@ FULL` on source:
 1. A 30-second `pgbench -T 30 -c 8` workload intermixed with one
    `ALTER TABLE ... ADD COLUMN ... DEFAULT k` (fast-path) and one
    `CREATE INDEX CONCURRENTLY` produces matching row counts &
-   checksums on source and CH after walshadow drains.
+   checksums on source and CH after walshadow drains. *Gated on
+   [Phase 12](#phase-12--backfill-bridge) (pgbench's pre-workload
+   `pgbench -i` data lands via the backfill bridge, not WAL) plus
+   [Known correctness gaps §4](#known-correctness-gaps) (read-time
+   defaults must replicate before `ADD COLUMN ... DEFAULT k` passes
+   checksum).*
 2. A `VACUUM FULL` on a tracked table during the workload doesn't
    require operator intervention; CH state matches source within one
-   merge cycle.
+   merge cycle. *Live today through the Phase 4/4b catalog cache +
+   relfilenode-rewrite handling.*
 3. Shadow PG's `pg_last_wal_replay_lsn` lags source's
    `pg_current_wal_lsn` by less than 1 s of WAL bytes at steady state
-   on the workload above.
+   on the workload above. *Live today; depends on filter throughput
+   not on any unfinished phase.*
 4. `--validate` mode catches a planted decoder regression (e.g. a
    patched `numeric` codec that off-by-ones the dscale) on the first
-   sampled row of the bad type.
+   sampled row of the bad type. *Live through Phase 9's oracle.*
 5. `kill -9` of walshadow during the workload, restart, end-state on
    CH matches a non-interrupted run (modulo merge transients).
+   *Gated on [Phase 11](#phase-11--durability--resume) — fails today
+   because the source slot is advanced to filter-position, not
+   emitter-ack, so committed-but-not-acked xacts vanish after
+   restart.*
 6. `pg_ctl restart` of shadow PG during the workload, walshadow
    continues without operator intervention, CH end-state matches a
-   non-interrupted run.
+   non-interrupted run. *Live through Phase 4b's auto-reconnect.*
 
-(1)–(3) gate v1.0; (4)–(6) gate v1.1.
+(1)–(3) gate v1.0; (4)–(6) gate v1.1. v1.0 cannot ship until
+Phase 11 (for §5's `kill -9` resume) + Phase 12 (for §1's
+pgbench initial data) land. v1.0 also needs [Known correctness
+gaps §4](#known-correctness-gaps) (read-time defaults) closed
+before §1's `ADD COLUMN ... DEFAULT k` checksum compares cleanly.

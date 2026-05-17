@@ -64,6 +64,26 @@ docs that are not yet committed work sit alongside as peers.
   local codecs for `jsonb` / arrays if measurement says the
   per-row libpq round-trip is hot; sampler auto-tuning;
   mismatch ring buffer for debugging. [PHASE9.md](PHASE9.md).
+- **Phase 10** — operational scaffolding (renamed from
+  "operational"). Pre-flight validators, HTTP/Prom metrics, tracing
+  pipeline, filtered `pg_wal/` trim, standby-status triple-LSN
+  shape, SIGHUP `--ch-config` reload, CH-emitter retry. Scope-shrink
+  from the original Phase 10: slot-advance value + cursor file moved
+  to Phase 11. Not yet committed work; see
+  [PLAN.md §"Phase 10"](PLAN.md#phase-10--operational-scaffolding).
+- **Phase 11** — durability + resume. Cursor file under
+  `{spill_dir}/cursor.bin`, slot-advance gated on emitter-ack LSN,
+  filter-segment fsync, startup resume + spill replay. Unblocks
+  acceptance §5 (`kill -9` + restart matches uninterrupted CH
+  end-state). Not yet committed work; see
+  [PLAN.md §"Phase 11"](PLAN.md#phase-11--durability--resume).
+- **Phase 12** — backfill bridge. `COPY` from source (or shadow,
+  opt-in) under `pg_export_snapshot()`, ships pre-existing rows
+  through the same per-relation emitter the WAL hot path uses;
+  daemon's `--start-lsn` pins to the snapshot LSN so backfill +
+  WAL tail meet seamlessly. Unblocks greenfield deployments
+  against non-empty source. Not yet committed work; see
+  [PLAN.md §"Phase 12"](PLAN.md#phase-12--backfill-bridge).
 - **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,
