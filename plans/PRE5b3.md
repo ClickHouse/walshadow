@@ -117,7 +117,9 @@ the WAL record alone. Three cases:
 
 1. `cargo test --lib && cargo test --tests` clean, including unit
    cases for `prefixlen ∈ {0, 2, 4, 88}` and the live-fixture test.
-2. `cargo clippy --all-targets -- -D warnings` clean.
+2. `cargo fmt --all -- --check` and
+   `cargo clippy --all-targets -- -D warnings` clean. Run both at
+   the end of the implementing phase before commit.
 3. `tracker.pg_class_writes_undecoded` pinned at zero (or replaced by
    `pg_class_writes_oid_in_prefix`) on the
    `VACUUM FULL pg_depend` fixture.

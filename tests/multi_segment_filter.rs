@@ -17,7 +17,7 @@
 //! record on segment N+1 deterministically.
 
 use wal_rs::pg::walparser::{
-    RmId, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG, X_LOG_RECORD_HEADER_SIZE,
+    RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
 };
 use walshadow::filter::Decision;
 use walshadow::manifest::Kind;
@@ -143,10 +143,8 @@ fn catalog_tracker_state_survives_segment_boundary() {
     // filenode in the user range. Class::Special, kept unconditionally;
     // its side effect is that tracker.nodes gains (TEST_DB_NODE,
     // REWRITTEN_PG_CLASS_FILENODE).
-    let relmap_main = build_relmap_main_data(
-        TEST_DB_NODE,
-        &[(PG_CLASS_OID, REWRITTEN_PG_CLASS_FILENODE)],
-    );
+    let relmap_main =
+        build_relmap_main_data(TEST_DB_NODE, &[(PG_CLASS_OID, REWRITTEN_PG_CLASS_FILENODE)]);
     let relmap_rec = build_record_with_main_data(
         RmId::RelMap as u8,
         0x00, // XLOG_RELMAP_UPDATE

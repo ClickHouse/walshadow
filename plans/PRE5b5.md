@@ -63,7 +63,9 @@ field a downstream consumer needs.
 
 1. `cargo test --lib && cargo test --tests` clean, including the
    xact_id-cohesion assertion.
-2. `cargo clippy --all-targets -- -D warnings` clean.
+2. `cargo fmt --all -- --check` and
+   `cargo clippy --all-targets -- -D warnings` clean. Run both at
+   the end of the implementing phase before commit.
 3. `Record` carries `parsed: XLogRecord, source_lsn, page_magic,
    decision`; every existing `RecordEvent` field consumer reads
    through the new shape.

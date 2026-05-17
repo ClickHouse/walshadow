@@ -38,7 +38,9 @@ landed; the daemon's pipeline uses both.
 
 1. `cargo test --lib && cargo test --tests` clean, including the
    shutdown drill.
-2. `cargo clippy --all-targets -- -D warnings` clean.
+2. `cargo fmt --all -- --check` and
+   `cargo clippy --all-targets -- -D warnings` clean. Run both at
+   the end of the implementing phase before commit.
 3. `bin/stream.rs` no longer leaks `Record`s and writes a `.partial`
    segment on SIGINT, resumable via `--start-lsn`.
 

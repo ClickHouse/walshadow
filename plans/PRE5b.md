@@ -55,8 +55,10 @@ PRE5b closes when:
 
 1. PRE5b1 through PRE5b10 each pass their per-phase exit criteria.
 2. `cargo test --lib && cargo test --tests` clean on the merged state.
-3. `cargo clippy --all-targets -- -D warnings` clean on the merged
-   state.
+3. `cargo fmt --all -- --check` and
+   `cargo clippy --all-targets -- -D warnings` clean on the merged
+   state. Both lints run together at the end of every sub-phase
+   before the commit lands; CI runs the same two checks.
 4. `walshadow-stream` runs against a source that had
    `VACUUM FULL pg_class` pre-attach and produces filtered output
    indistinguishable (per manifest stats) from a daemon attached to

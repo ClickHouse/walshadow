@@ -547,7 +547,10 @@ async fn sidecar_sql_client_negotiates_tls_over_tcp() {
         .await
         .expect("source feed connect over tls");
 
-    let client = feed.sql_client().await.expect("sidecar sql_client over tls");
+    let client = feed
+        .sql_client()
+        .await
+        .expect("sidecar sql_client over tls");
 
     let rows = client
         .query("SELECT 1::int8", &[])

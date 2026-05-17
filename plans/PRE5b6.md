@@ -46,7 +46,9 @@ not required.
 
 1. `cargo test --lib && cargo test --tests` clean, including the
    two new fan-out cases.
-2. `cargo clippy --all-targets -- -D warnings` clean.
+2. `cargo fmt --all -- --check` and
+   `cargo clippy --all-targets -- -D warnings` clean. Run both at
+   the end of the implementing phase before commit.
 3. `CompositeRecordSink` covered by both happy-path and error-path
    tests; behaviour on inner-sink error documented in source.
 

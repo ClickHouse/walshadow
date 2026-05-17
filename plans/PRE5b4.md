@@ -45,7 +45,9 @@ shape for post-DDL records.
 
 1. `cargo test --lib && cargo test --tests` clean, including the new
    ALTER-driven re-fetch case.
-2. `cargo clippy --all-targets -- -D warnings` clean.
+2. `cargo fmt --all -- --check` and
+   `cargo clippy --all-targets -- -D warnings` clean. Run both at
+   the end of the implementing phase before commit.
 3. `CatalogTracker` mutations on the catalog set produce
    `ShadowCatalog::invalidate` calls in production paths
    (verified by a counter assertion or trace, not by behavioural

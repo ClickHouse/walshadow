@@ -39,7 +39,9 @@ enough that single-task serialisation dwarfs nothing measurable yet.
 
 1. `cargo test --lib && cargo test --tests` clean, including the
    mutex-sanity case.
-2. `cargo clippy --all-targets -- -D warnings` clean.
+2. `cargo fmt --all -- --check` and
+   `cargo clippy --all-targets -- -D warnings` clean. Run both at
+   the end of the implementing phase before commit.
 3. Daemon binary holds the catalog as `Arc<Mutex<_>>`; module doc
    reflects current `&mut self` API and the deferred refactor.
 

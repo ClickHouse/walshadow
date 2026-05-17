@@ -101,7 +101,9 @@ unchanged.
 
 1. `cargo test --lib && cargo test --tests` clean, including the
    chunk-boundary test and any item-specific cases added.
-2. `cargo clippy --all-targets -- -D warnings` clean.
+2. `cargo fmt --all -- --check` and
+   `cargo clippy --all-targets -- -D warnings` clean. Run both at
+   the end of the implementing phase before commit.
 3. Each item above either resolved with a code change or, where
    resolution is explicitly deferred, captured as a `// FIXME(PRE5b)`
    with a pointer to the relevant follow-up.
