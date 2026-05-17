@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walshadow::filter::Filter;
 use walshadow::filter_segment::filter_segment;
 
 fn fixture_segment() -> PathBuf {
@@ -80,7 +81,8 @@ fn filtered_segment_round_trips_through_wal_parser() {
         return;
     }
     let bytes = decompress_gz(&seg).expect("gunzip fixture");
-    let (out, manifest) = filter_segment(&bytes, "fixture").expect("filter");
+    let mut filter = Filter::new();
+    let (out, manifest) = filter_segment(&bytes, "fixture", &mut filter).expect("filter");
 
     // (1) Byte-preserving
     assert_eq!(
@@ -137,7 +139,8 @@ fn oltp_workload_keeps_well_under_one_percent() {
         return;
     }
     let bytes = decompress_gz(&seg).expect("gunzip oltp fixture");
-    let (out, manifest) = filter_segment(&bytes, "oltp").expect("filter oltp");
+    let mut filter = Filter::new();
+    let (out, manifest) = filter_segment(&bytes, "oltp", &mut filter).expect("filter oltp");
 
     let kept_frac = manifest.stats.kept as f64 / manifest.stats.records as f64;
     eprintln!(

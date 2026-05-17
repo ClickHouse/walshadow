@@ -25,7 +25,7 @@ pub enum Decision {
     Drop,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct FilterStats {
     pub kept: u64,
     pub dropped: u64,
@@ -38,6 +38,21 @@ pub struct FilterStats {
 }
 
 impl FilterStats {
+    /// Field-wise difference. Used by per-segment manifest emission
+    /// against a long-lived [`Filter`] whose `stats` are cumulative.
+    pub fn delta_from(&self, prev: &Self) -> Self {
+        Self {
+            kept: self.kept - prev.kept,
+            dropped: self.dropped - prev.dropped,
+            kept_bytes: self.kept_bytes - prev.kept_bytes,
+            dropped_bytes: self.dropped_bytes - prev.dropped_bytes,
+            kept_catalog: self.kept_catalog - prev.kept_catalog,
+            kept_user: self.kept_user - prev.kept_user,
+            kept_special: self.kept_special - prev.kept_special,
+            kept_empty: self.kept_empty - prev.kept_empty,
+        }
+    }
+
     pub fn record(&mut self, class: Class, decision: Decision, bytes: u64) {
         match decision {
             Decision::Keep => {

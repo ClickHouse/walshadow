@@ -39,3 +39,16 @@ docs that are not yet committed work sit alongside as peers.
   [Phase 6](PLAN.md#phase-6--toast-reassembly--xact-buffer) and
   [Phase 7](PLAN.md#phase-7--ch-native-emitter-via-clickhouse-c-rs).
   Not committed work. [BASEBACKUP.md](BASEBACKUP.md).
+- **SEGMENT_COMPRESSION** — evaluation: compressed WAL segment file
+  ingestion (`*.zst`, `*.lz4`, `*.gz`, `*.lzma`). Lift sits in
+  wal-rs (new sync `read_segment_file_sync` + `Method::Gz`);
+  walshadow flips `walshadow-filter` to it and drops the
+  test-local `decompress_gz` helpers. Sibling of FPI_COMPRESSION;
+  independent. [SEGMENT_COMPRESSION.md](SEGMENT_COMPRESSION.md).
+- **FPI_COMPRESSION** — evaluation: decompress `wal_compression
+  = pglz|lz4|zstd` full-page images via new walshadow modules
+  `src/pglz.rs` (port of PG's `pglz_decompress`) and `src/fpi.rs`
+  (`restore_block_image`). Unblocks [BASEBACKUP](BASEBACKUP.md)
+  1B+2A and `XLOG_FPI_FOR_HINT` handling in the future
+  heap-tuple decoder. Sibling of SEGMENT_COMPRESSION; independent.
+  [FPI_COMPRESSION.md](FPI_COMPRESSION.md).

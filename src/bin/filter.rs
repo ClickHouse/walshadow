@@ -16,6 +16,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use walshadow::filter::Filter;
 use walshadow::filter_segment::filter_segment;
 
 #[derive(Debug, Parser)]
@@ -58,7 +59,8 @@ fn run(args: Args) -> Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let (filtered, manifest) = filter_segment(&bytes, &name)
+    let mut filter = Filter::new();
+    let (filtered, manifest) = filter_segment(&bytes, &name, &mut filter)
         .with_context(|| format!("filter {}", args.input.display()))?;
 
     fs::create_dir_all(&args.out_dir)

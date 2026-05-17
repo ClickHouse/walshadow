@@ -28,14 +28,20 @@ pub enum FilterSegmentError {
 }
 
 /// Filter one segment's bytes and emit both rewritten bytes and a
-/// manifest sidecar. Pure function over `(source_bytes, source_name)`.
+/// manifest sidecar. `filter` is borrowed mutably so callers spanning
+/// multiple segments retain `CatalogTracker` state across calls; the
+/// emitted [`ManifestStats`] reflect only records processed *this* call.
 pub fn filter_segment(
     source_bytes: &[u8],
     source_name: &str,
+    filter: &mut Filter,
 ) -> Result<(Vec<u8>, Manifest), FilterSegmentError> {
+    let stats_before = filter.stats;
+    let relmap_before = filter.tracker.relmap_updates;
+    let pgc_undecoded_before = filter.tracker.pg_class_writes_undecoded;
+
     let mut out = source_bytes.to_vec();
     let mut entries = Vec::new();
-    let mut filter = Filter::new();
 
     // First pass: collect records (we can't borrow `out` mutably while
     // walking it immutably). Materialise logical bytes + ranges.
@@ -81,9 +87,9 @@ pub fn filter_segment(
     }
 
     let stats = ManifestStats::from_filter(
-        &filter.stats,
-        filter.tracker.relmap_updates,
-        filter.tracker.pg_class_writes_undecoded,
+        &filter.stats.delta_from(&stats_before),
+        filter.tracker.relmap_updates - relmap_before,
+        filter.tracker.pg_class_writes_undecoded - pgc_undecoded_before,
     );
     let manifest = Manifest {
         source_segment: source_name.to_string(),
@@ -165,7 +171,8 @@ mod tests {
         let r2 = build_record(RmId::Heap as u8, &[0xCC; 8]);
         let page = build_page_with_records(&[&r1, &r2]);
 
-        let (out, mani) = filter_segment(&page, "test").unwrap();
+        let mut filter = Filter::new();
+        let (out, mani) = filter_segment(&page, "test", &mut filter).unwrap();
         assert_eq!(out.len(), page.len());
         assert_eq!(mani.records.len(), 2);
         // Both records re-parse cleanly through WalParser
@@ -179,7 +186,8 @@ mod tests {
         use wal_rs::pg::walparser::RmId;
         let r = build_record(RmId::Xact as u8, &[0u8; 4]);
         let page = build_page_with_records(&[&r]);
-        let (_, mani) = filter_segment(&page, "seg-test").unwrap();
+        let mut filter = Filter::new();
+        let (_, mani) = filter_segment(&page, "seg-test", &mut filter).unwrap();
         assert_eq!(mani.source_segment, "seg-test");
         assert_eq!(mani.records.len(), 1);
         assert_eq!(mani.records[0].offset, 40); // long header + pad
@@ -204,7 +212,8 @@ mod tests {
         let switch_rec = build_record_info(RmId::Xlog as u8, XLOG_SWITCH, &[]);
         let page = build_page_with_records(&[&before, &switch_rec]);
 
-        let (out, mani) = filter_segment(&page, "switch").expect("filter");
+        let mut filter = Filter::new();
+        let (out, mani) = filter_segment(&page, "switch", &mut filter).expect("filter");
 
         assert_eq!(out.len(), page.len(), "byte-preserving");
         assert_eq!(mani.records.len(), 2);

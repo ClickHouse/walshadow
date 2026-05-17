@@ -37,7 +37,7 @@
 use thiserror::Error;
 use wal_rs::pg::wal::segment::SegmentName;
 
-use crate::filter::Decision;
+use crate::filter::{Decision, Filter};
 use crate::filter_segment::{FilterSegmentError, filter_segment};
 use crate::manifest::{Kind, Manifest};
 
@@ -195,6 +195,11 @@ impl SegmentSink for DirSegmentSink {
 
 /// Segment-aligned accumulator. Bytes pushed via [`push`](Self::push)
 /// must arrive in contiguous LSN order starting from [`base_lsn`](Self::base_lsn).
+///
+/// Owns the long-lived [`Filter`]: `CatalogTracker` state — every
+/// `XLOG_RELMAP_UPDATE`, every decoded pg_class write — must survive
+/// segment boundaries, otherwise a relmap in segment N gets forgotten
+/// before the heap write it authorised lands in segment N+1.
 pub struct WalStream {
     timeline: u32,
     seg_size: u64,
@@ -204,6 +209,7 @@ pub struct WalStream {
     /// LSN of the byte at `current_buf[0]`. Always segment-aligned.
     current_lsn: u64,
     current_buf: Vec<u8>,
+    filter: Filter,
 }
 
 impl WalStream {
@@ -219,7 +225,14 @@ impl WalStream {
             next_lsn: start_lsn,
             current_lsn: start_lsn,
             current_buf: Vec::with_capacity(seg_size as usize),
+            filter: Filter::new(),
         })
+    }
+
+    /// Borrow the long-lived filter. Stats here are cumulative across
+    /// every segment processed by this stream.
+    pub fn filter(&self) -> &Filter {
+        &self.filter
     }
 
     /// Round `lsn` down to the nearest segment boundary.
@@ -289,8 +302,8 @@ impl WalStream {
         let pad = self.seg_size as usize - self.current_buf.len();
         self.current_buf.extend(std::iter::repeat_n(0u8, pad));
         let name = seg.format();
-        let (filtered, manifest) =
-            filter_segment(&self.current_buf, &name).map_err(|source| WalStreamError::Filter {
+        let (filtered, manifest) = filter_segment(&self.current_buf, &name, &mut self.filter)
+            .map_err(|source| WalStreamError::Filter {
                 seg: name.clone(),
                 source,
             })?;
@@ -313,8 +326,8 @@ impl WalStream {
         let seg = self.segment_for_lsn(self.current_lsn);
         let seg_start_lsn = self.current_lsn;
         let name = seg.format();
-        let (filtered, manifest) =
-            filter_segment(&self.current_buf, &name).map_err(|source| WalStreamError::Filter {
+        let (filtered, manifest) = filter_segment(&self.current_buf, &name, &mut self.filter)
+            .map_err(|source| WalStreamError::Filter {
                 seg: name.clone(),
                 source,
             })?;
