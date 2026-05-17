@@ -1,0 +1,644 @@
+//! Phase 9 — Tier 3 codecs: small fixed-layout types decoded locally.
+//!
+//! Hybrid scope:
+//!
+//! - **Local**: `numeric`, `inet` / `cidr`, `interval`. Layout is
+//!   stable, decoders are mechanical, and per-row hot-path latency
+//!   would be the dominant cost if these went over libpq.
+//! - **Deferred to the shadow extension** (`walshadow_oracle`):
+//!   `jsonb`, arrays, `tsvector`, every other Tier 3 type. Decoder
+//!   surfaces these as [`crate::heap_decoder::ColumnValue::PgPending`]
+//!   carrying the raw on-disk bytes; resolution to text happens at
+//!   emit time via a `walshadow_decode_disk(oid, bytea) -> text` SQL
+//!   call against shadow PG. One source of truth for the long tail;
+//!   no codec drift to chase.
+//!
+//! Each local decoder takes the *body* of a varlena (or the raw bytes
+//! of a fixed-width datum, for `interval`) and produces a tagged value
+//! whose `text` form matches PG's `typoutput`. The differential oracle
+//! ([`crate::oracle`]) leans on that text-form equality to cross-check
+//! local decoders against shadow PG with 1-in-N sampling.
+
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CodecError {
+    #[error("truncated body at offset {offset}: need {need} bytes, have {have}")]
+    Truncated {
+        offset: usize,
+        need: usize,
+        have: usize,
+    },
+    #[error("malformed numeric: weight={weight} ndigits={ndigits} dscale={dscale}")]
+    BadNumeric {
+        weight: i32,
+        ndigits: usize,
+        dscale: i32,
+    },
+    #[error("malformed inet: family={family:#x} bits={bits} addr_len={addr_len}")]
+    BadInet {
+        family: u8,
+        bits: u8,
+        addr_len: usize,
+    },
+    #[error("malformed jsonb: version={version}")]
+    BadJsonbVersion { version: u8 },
+    #[error("malformed jsonb container: {0}")]
+    BadJsonbContainer(&'static str),
+    #[error("malformed array header: ndim={ndim} dataoffset={dataoffset}")]
+    BadArrayHeader { ndim: i32, dataoffset: i32 },
+    #[error("unsupported array element type oid {0}")]
+    UnsupportedArrayElement(u32),
+}
+
+// ---------------------------------------------------------------------
+// numeric — PG arbitrary-precision decimal (varlena, varies in length).
+// On-disk layout per `src/backend/utils/adt/numeric.c`:
+//
+// * Short form (top bit of n_header set):
+//     uint16  n_header   = NUMERIC_SHORT | (sign?0x2000:0)
+//                          | ((dscale & 0x3F) << 7)
+//                          | (weight & 0x7F sign-extended via 0x40)
+//     NumericDigit  digits[ndigits]   (int16, base-10000)
+//
+// * Long form (top bit clear, flag bits != NUMERIC_SPECIAL):
+//     uint16  n_sign_dscale = sign(POS/NEG) | (dscale & 0x3FFF)
+//     int16   weight
+//     NumericDigit  digits[ndigits]
+//
+// * Special form (flag bits == NUMERIC_SPECIAL):
+//     uint16  n_header   = NUMERIC_NAN | NUMERIC_PINF | NUMERIC_NINF
+//     no digits.
+// ---------------------------------------------------------------------
+
+const NUMERIC_SIGN_MASK: u16 = 0xC000;
+const NUMERIC_POS: u16 = 0x0000;
+const NUMERIC_NEG: u16 = 0x4000;
+const NUMERIC_SHORT: u16 = 0x8000;
+const NUMERIC_SPECIAL: u16 = 0xC000;
+
+const NUMERIC_NAN: u16 = 0xC000;
+const NUMERIC_PINF: u16 = 0xD000;
+const NUMERIC_NINF: u16 = 0xF000;
+
+const NUMERIC_SHORT_SIGN_MASK: u16 = 0x2000;
+const NUMERIC_SHORT_DSCALE_MASK: u16 = 0x1F80;
+const NUMERIC_SHORT_DSCALE_SHIFT: u16 = 7;
+const NUMERIC_SHORT_WEIGHT_SIGN_MASK: u16 = 0x0040;
+const NUMERIC_SHORT_WEIGHT_MASK: u16 = 0x003F;
+
+const NUMERIC_DSCALE_MASK: u16 = 0x3FFF;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NumericKind {
+    /// NaN.
+    NaN,
+    /// `+Infinity` (PG 14+).
+    PInf,
+    /// `-Infinity` (PG 14+).
+    NInf,
+    /// Finite value rendered to its PG-text form.
+    Finite(String),
+}
+
+/// Decode the body of a `numeric` varlena. Returns a [`NumericKind`]
+/// whose `Finite(s)` text matches PG's `numeric_out` exactly for finite
+/// inputs; specials carry their flag.
+pub fn decode_numeric(body: &[u8]) -> Result<NumericKind, CodecError> {
+    if body.len() < 2 {
+        return Err(CodecError::Truncated {
+            offset: 0,
+            need: 2,
+            have: body.len(),
+        });
+    }
+    let n_header = u16::from_le_bytes([body[0], body[1]]);
+    let flag = n_header & NUMERIC_SIGN_MASK;
+    let is_short = flag == NUMERIC_SHORT;
+    let is_special = flag == NUMERIC_SPECIAL;
+
+    if is_special {
+        return Ok(match n_header {
+            NUMERIC_NAN => NumericKind::NaN,
+            NUMERIC_PINF => NumericKind::PInf,
+            NUMERIC_NINF => NumericKind::NInf,
+            _ => NumericKind::NaN, // unknown special — treat as NaN to stay lossy-safe
+        });
+    }
+
+    let (sign, weight, dscale, digits_off) = if is_short {
+        let sign = if n_header & NUMERIC_SHORT_SIGN_MASK != 0 {
+            NUMERIC_NEG
+        } else {
+            NUMERIC_POS
+        };
+        let dscale = ((n_header & NUMERIC_SHORT_DSCALE_MASK) >> NUMERIC_SHORT_DSCALE_SHIFT) as i32;
+        let mut w = (n_header & NUMERIC_SHORT_WEIGHT_MASK) as i32;
+        if n_header & NUMERIC_SHORT_WEIGHT_SIGN_MASK != 0 {
+            // 7-bit signed extension
+            w |= !(NUMERIC_SHORT_WEIGHT_MASK as i32);
+        }
+        (sign, w, dscale, 2usize)
+    } else {
+        if body.len() < 4 {
+            return Err(CodecError::Truncated {
+                offset: 2,
+                need: 4,
+                have: body.len(),
+            });
+        }
+        let sign = n_header & NUMERIC_SIGN_MASK;
+        let dscale = (n_header & NUMERIC_DSCALE_MASK) as i32;
+        let weight = i16::from_le_bytes([body[2], body[3]]) as i32;
+        (sign, weight, dscale, 4usize)
+    };
+
+    let mut digits = Vec::new();
+    let mut cur = digits_off;
+    while cur + 2 <= body.len() {
+        digits.push(i16::from_le_bytes([body[cur], body[cur + 1]]));
+        cur += 2;
+    }
+    let ndigits = digits.len();
+
+    if dscale < 0 || ndigits > (NUMERIC_DSCALE_MASK as usize) + 4 {
+        return Err(CodecError::BadNumeric {
+            weight,
+            ndigits,
+            dscale,
+        });
+    }
+
+    Ok(NumericKind::Finite(render_numeric(
+        sign == NUMERIC_NEG,
+        weight,
+        dscale,
+        &digits,
+    )))
+}
+
+/// Render a finite numeric to its PG text form. Mirrors
+/// `get_str_from_var` in `numeric.c` (DEC_DIGITS == 4 branch).
+fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[i16]) -> String {
+    let ndigits = digits.len() as i32;
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+
+    // Pre-decimal digits.
+    if weight < 0 {
+        out.push('0');
+    } else {
+        let mut first_block = true;
+        for d in 0..=weight {
+            let dig = if d < ndigits { digits[d as usize] } else { 0 };
+            if first_block {
+                // Suppress leading zeros within the highest-order NBASE digit.
+                let s = format!("{dig}");
+                out.push_str(&s);
+                first_block = false;
+            } else {
+                // Subsequent NBASE digits always take DEC_DIGITS chars.
+                out.push_str(&format!("{:0>4}", dig.max(0)));
+            }
+        }
+    }
+
+    // Post-decimal digits.
+    if dscale > 0 {
+        out.push('.');
+        let mut written = 0i32;
+        let mut d = weight + 1;
+        while written < dscale {
+            let dig = if (0..ndigits).contains(&d) {
+                digits[d as usize]
+            } else {
+                0
+            };
+            // four decimal characters per NBASE digit (DEC_DIGITS == 4)
+            let s = format!("{:0>4}", dig.max(0));
+            for ch in s.chars() {
+                if written >= dscale {
+                    break;
+                }
+                out.push(ch);
+                written += 1;
+            }
+            d += 1;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// inet / cidr — on-disk `inet_struct` (utils/inet.h ≈ line 24):
+//   uint8 family   (2 = AF_INET, 3 = AF_INET6)
+//   uint8 bits     (netmask bits)
+//   uint8 ipaddr[nb]  (nb = 4 for AF_INET, 16 for AF_INET6)
+//
+// Note: PG's wire format (typsend, `inet_send`) adds two bytes here —
+// `is_cidr` flag + address byte count — but those are *not* on disk.
+// `is_cidr` is encoded by the column's type OID (INETOID vs CIDROID);
+// the body has no flag. Address-byte-count is implied by family.
+// ---------------------------------------------------------------------
+
+pub const PGSQL_AF_INET: u8 = 2;
+pub const PGSQL_AF_INET6: u8 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InetValue {
+    pub family: u8,
+    pub bits: u8,
+    pub is_cidr: bool,
+    pub addr: Vec<u8>,
+}
+
+/// Decode the body of an on-disk inet/cidr datum. `is_cidr` is **not**
+/// in the bytes — caller passes it from the column's type OID.
+pub fn decode_inet(body: &[u8], is_cidr: bool) -> Result<InetValue, CodecError> {
+    if body.len() < 2 {
+        return Err(CodecError::Truncated {
+            offset: 0,
+            need: 2,
+            have: body.len(),
+        });
+    }
+    let family = body[0];
+    let bits = body[1];
+    let nb = match family {
+        PGSQL_AF_INET => 4,
+        PGSQL_AF_INET6 => 16,
+        _ => {
+            return Err(CodecError::BadInet {
+                family,
+                bits,
+                addr_len: 0,
+            });
+        }
+    };
+    if body.len() < 2 + nb {
+        return Err(CodecError::Truncated {
+            offset: 2,
+            need: nb,
+            have: body.len() - 2,
+        });
+    }
+    Ok(InetValue {
+        family,
+        bits,
+        is_cidr,
+        addr: body[2..2 + nb].to_vec(),
+    })
+}
+
+impl InetValue {
+    /// PG `inet_out` / `cidr_out` text rendering: dotted-quad or
+    /// colon-hex, with an optional `/bits` netmask suffix. For `inet`
+    /// the suffix is omitted when bits == max-for-family; for `cidr`
+    /// the suffix is always present.
+    pub fn to_text(&self) -> String {
+        let addr_text = match self.family {
+            PGSQL_AF_INET => format!(
+                "{}.{}.{}.{}",
+                self.addr[0], self.addr[1], self.addr[2], self.addr[3]
+            ),
+            PGSQL_AF_INET6 => format_ipv6(&self.addr),
+            _ => String::from("?"),
+        };
+        let max_bits = if self.family == PGSQL_AF_INET {
+            32
+        } else {
+            128
+        };
+        if self.is_cidr || self.bits != max_bits {
+            format!("{addr_text}/{}", self.bits)
+        } else {
+            addr_text
+        }
+    }
+}
+
+/// IPv6 text rendering matching PG's `inet_net_ntop`: RFC 5952 canonical
+/// form (lower-case hex, no leading zeros per group, `::` collapses the
+/// longest run of two or more zero groups).
+fn format_ipv6(bytes: &[u8]) -> String {
+    let mut groups = [0u16; 8];
+    for (i, g) in groups.iter_mut().enumerate() {
+        *g = ((bytes[i * 2] as u16) << 8) | bytes[i * 2 + 1] as u16;
+    }
+    // Find longest run of consecutive zeros of length >= 2.
+    let mut best_start = None;
+    let mut best_len = 1usize;
+    let mut i = 0;
+    while i < 8 {
+        if groups[i] == 0 {
+            let mut j = i;
+            while j < 8 && groups[j] == 0 {
+                j += 1;
+            }
+            let run = j - i;
+            if run > best_len {
+                best_len = run;
+                best_start = Some(i);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = String::new();
+    let mut k = 0;
+    while k < 8 {
+        if Some(k) == best_start {
+            out.push_str("::");
+            k += best_len;
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(':') {
+            out.push(':');
+        }
+        out.push_str(&format!("{:x}", groups[k]));
+        k += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// interval — fixed 16 bytes: i64 micros + i32 days + i32 months.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntervalValue {
+    pub months: i32,
+    pub days: i32,
+    pub micros: i64,
+}
+
+pub fn decode_interval(body: &[u8]) -> Result<IntervalValue, CodecError> {
+    if body.len() < 16 {
+        return Err(CodecError::Truncated {
+            offset: 0,
+            need: 16,
+            have: body.len(),
+        });
+    }
+    let micros = i64::from_le_bytes(body[0..8].try_into().unwrap());
+    let days = i32::from_le_bytes(body[8..12].try_into().unwrap());
+    let months = i32::from_le_bytes(body[12..16].try_into().unwrap());
+    Ok(IntervalValue {
+        months,
+        days,
+        micros,
+    })
+}
+
+impl IntervalValue {
+    /// `interval_out` style: e.g. "1 year 2 mons 3 days 04:05:06.7".
+    /// Components with zero value are omitted; sub-second precision is
+    /// emitted as `.fffffff` (up to 6 digits) trimmed of trailing zeros.
+    pub fn to_text(&self) -> String {
+        if self.months == 0 && self.days == 0 && self.micros == 0 {
+            return "00:00:00".to_string();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let years = self.months / 12;
+        let mons = self.months % 12;
+        if years != 0 {
+            parts.push(format!(
+                "{years} {}",
+                if years.abs() == 1 { "year" } else { "years" }
+            ));
+        }
+        if mons != 0 {
+            parts.push(format!(
+                "{mons} {}",
+                if mons.abs() == 1 { "mon" } else { "mons" }
+            ));
+        }
+        if self.days != 0 {
+            parts.push(format!(
+                "{} {}",
+                self.days,
+                if self.days.abs() == 1 { "day" } else { "days" }
+            ));
+        }
+        if self.micros != 0 || parts.is_empty() {
+            parts.push(format_time_us(self.micros));
+        }
+        parts.join(" ")
+    }
+}
+
+fn format_time_us(mut us: i64) -> String {
+    let neg = us < 0;
+    if neg {
+        us = -us;
+    }
+    let hours = us / 3_600_000_000;
+    us %= 3_600_000_000;
+    let mins = us / 60_000_000;
+    us %= 60_000_000;
+    let secs = us / 1_000_000;
+    let frac = us % 1_000_000;
+    let prefix = if neg { "-" } else { "" };
+    if frac == 0 {
+        format!("{prefix}{hours:02}:{mins:02}:{secs:02}")
+    } else {
+        let mut frac_s = format!("{frac:06}");
+        while frac_s.ends_with('0') {
+            frac_s.pop();
+        }
+        format!("{prefix}{hours:02}:{mins:02}:{secs:02}.{frac_s}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn short_numeric(neg: bool, weight: i8, dscale: u8, digits: &[i16]) -> Vec<u8> {
+        let sign_bit = if neg { NUMERIC_SHORT_SIGN_MASK } else { 0 };
+        let dscale_bits =
+            ((dscale as u16) << NUMERIC_SHORT_DSCALE_SHIFT) & NUMERIC_SHORT_DSCALE_MASK;
+        let weight_bits = if weight < 0 {
+            NUMERIC_SHORT_WEIGHT_SIGN_MASK | ((weight as i32) as u16 & NUMERIC_SHORT_WEIGHT_MASK)
+        } else {
+            (weight as u16) & NUMERIC_SHORT_WEIGHT_MASK
+        };
+        let header = NUMERIC_SHORT | sign_bit | dscale_bits | weight_bits;
+        let mut out = header.to_le_bytes().to_vec();
+        for d in digits {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        out
+    }
+
+    fn long_numeric(neg: bool, weight: i16, dscale: u16, digits: &[i16]) -> Vec<u8> {
+        let sign = if neg { NUMERIC_NEG } else { NUMERIC_POS };
+        let n_sign_dscale = sign | (dscale & NUMERIC_DSCALE_MASK);
+        let mut out = n_sign_dscale.to_le_bytes().to_vec();
+        out.extend_from_slice(&weight.to_le_bytes());
+        for d in digits {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn numeric_short_one_digit() {
+        // 42 — weight 0, dscale 0, one digit value 42.
+        let body = short_numeric(false, 0, 0, &[42]);
+        assert_eq!(
+            decode_numeric(&body).unwrap(),
+            NumericKind::Finite("42".into())
+        );
+    }
+
+    #[test]
+    fn numeric_short_negative() {
+        // -7
+        let body = short_numeric(true, 0, 0, &[7]);
+        assert_eq!(
+            decode_numeric(&body).unwrap(),
+            NumericKind::Finite("-7".into())
+        );
+    }
+
+    #[test]
+    fn numeric_short_with_scale() {
+        // 1.5 — weight 0, dscale 1, digits [1, 5000]
+        let body = short_numeric(false, 0, 1, &[1, 5000]);
+        assert_eq!(
+            decode_numeric(&body).unwrap(),
+            NumericKind::Finite("1.5".into())
+        );
+    }
+
+    #[test]
+    fn numeric_zero() {
+        // 0 — weight 0, dscale 0, no digits
+        let body = short_numeric(false, 0, 0, &[]);
+        assert_eq!(
+            decode_numeric(&body).unwrap(),
+            NumericKind::Finite("0".into())
+        );
+    }
+
+    #[test]
+    fn numeric_long_form_large() {
+        // 12345 — three decimal-blocks: 1, 2345. weight 1, ndigits 2.
+        let body = long_numeric(false, 1, 0, &[1, 2345]);
+        assert_eq!(
+            decode_numeric(&body).unwrap(),
+            NumericKind::Finite("12345".into())
+        );
+    }
+
+    #[test]
+    fn numeric_specials() {
+        let nan = NUMERIC_NAN.to_le_bytes();
+        assert_eq!(decode_numeric(&nan).unwrap(), NumericKind::NaN);
+        let pinf = NUMERIC_PINF.to_le_bytes();
+        assert_eq!(decode_numeric(&pinf).unwrap(), NumericKind::PInf);
+        let ninf = NUMERIC_NINF.to_le_bytes();
+        assert_eq!(decode_numeric(&ninf).unwrap(), NumericKind::NInf);
+    }
+
+    #[test]
+    fn numeric_truncated_returns_error() {
+        let one_byte = vec![0u8];
+        assert!(matches!(
+            decode_numeric(&one_byte),
+            Err(CodecError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn inet_ipv4_simple() {
+        let body = vec![PGSQL_AF_INET, 32, 192, 168, 0, 1];
+        let v = decode_inet(&body, false).unwrap();
+        assert_eq!(v.family, PGSQL_AF_INET);
+        assert_eq!(v.bits, 32);
+        assert!(!v.is_cidr);
+        assert_eq!(v.addr, vec![192, 168, 0, 1]);
+        assert_eq!(v.to_text(), "192.168.0.1");
+    }
+
+    #[test]
+    fn inet_ipv4_cidr() {
+        let body = vec![PGSQL_AF_INET, 24, 10, 0, 0, 0];
+        let v = decode_inet(&body, true).unwrap();
+        assert!(v.is_cidr);
+        assert_eq!(v.to_text(), "10.0.0.0/24");
+    }
+
+    #[test]
+    fn inet_ipv4_with_short_mask() {
+        // 192.168.0.1/24 — non-cidr but bits != max; suffix should appear.
+        let body = vec![PGSQL_AF_INET, 24, 192, 168, 0, 1];
+        let v = decode_inet(&body, false).unwrap();
+        assert_eq!(v.to_text(), "192.168.0.1/24");
+    }
+
+    #[test]
+    fn inet_ipv6_loopback() {
+        let mut body = vec![PGSQL_AF_INET6, 128];
+        body.extend_from_slice(&[0u8; 15]);
+        body.push(1);
+        let v = decode_inet(&body, false).unwrap();
+        assert_eq!(v.to_text(), "::1");
+    }
+
+    #[test]
+    fn inet_ipv6_compressed_middle() {
+        // fe80::1
+        let mut body = vec![PGSQL_AF_INET6, 128];
+        body.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+        let v = decode_inet(&body, false).unwrap();
+        assert_eq!(v.to_text(), "fe80::1");
+    }
+
+    #[test]
+    fn inet_rejects_unknown_family() {
+        let body = vec![99u8, 32, 1, 2, 3, 4];
+        assert!(matches!(
+            decode_inet(&body, false),
+            Err(CodecError::BadInet { .. })
+        ));
+    }
+
+    #[test]
+    fn interval_decode_basic() {
+        // 1 month 2 days 3 microseconds: months=1 days=2 micros=3.
+        let mut body = Vec::new();
+        body.extend_from_slice(&3i64.to_le_bytes());
+        body.extend_from_slice(&2i32.to_le_bytes());
+        body.extend_from_slice(&1i32.to_le_bytes());
+        let v = decode_interval(&body).unwrap();
+        assert_eq!(v.months, 1);
+        assert_eq!(v.days, 2);
+        assert_eq!(v.micros, 3);
+        // Format checks: 1 mon 2 days 00:00:00.000003
+        assert!(v.to_text().contains("1 mon"));
+        assert!(v.to_text().contains("2 days"));
+        assert!(v.to_text().ends_with("00:00:00.000003"));
+    }
+
+    #[test]
+    fn interval_one_year_plus_one_hour() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3_600_000_000i64.to_le_bytes());
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&12i32.to_le_bytes());
+        let v = decode_interval(&body).unwrap();
+        assert_eq!(v.to_text(), "1 year 01:00:00");
+    }
+
+    #[test]
+    fn interval_zero() {
+        let body = vec![0u8; 16];
+        let v = decode_interval(&body).unwrap();
+        assert_eq!(v.to_text(), "00:00:00");
+    }
+}

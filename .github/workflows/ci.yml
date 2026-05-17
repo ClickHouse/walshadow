@@ -80,7 +80,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             postgresql-${{ matrix.pg-major }} \
-            postgresql-client-${{ matrix.pg-major }}
+            postgresql-client-${{ matrix.pg-major }} \
+            postgresql-server-dev-${{ matrix.pg-major }}
           sudo systemctl stop postgresql 2>/dev/null || true
           PG_BIN=/usr/lib/postgresql/${{ matrix.pg-major }}/bin
           "$PG_BIN/postgres" -V
@@ -150,6 +151,35 @@ jobs:
           # avoid thrashing the runner by serializing.
           RUST_TEST_THREADS: "1"
         run: cargo test --workspace --all-targets --locked -- --nocapture
+
+      # walshadow_oracle is a separate PGXS extension (shipped to shadow PG).
+      # Build it against the matrix PG, install into that major's $libdir /
+      # share/extension, then run pg_regress under a private --temp-instance
+      # so we don't need an external server. Covers the C bridge function's
+      # varlena, fixed-width by-val, by-ref, NULL, and ereport paths.
+      - name: walshadow_oracle extension (build + pg_regress)
+        working-directory: walshadow/walshadow_oracle
+        run: |
+          PG_BIN=/usr/lib/postgresql/${{ matrix.pg-major }}/bin
+          PG_CONFIG=$PG_BIN/pg_config
+          make PG_CONFIG=$PG_CONFIG
+          sudo make PG_CONFIG=$PG_CONFIG install
+          PG_REGRESS=/usr/lib/postgresql/${{ matrix.pg-major }}/lib/pgxs/src/test/regress/pg_regress
+          rm -rf /tmp/wsho_tmpinst
+          "$PG_REGRESS" \
+            --inputdir=./ --outputdir=./ \
+            --bindir="$PG_BIN" \
+            --temp-instance=/tmp/wsho_tmpinst \
+            --port=54329 \
+            walshadow_oracle
+
+      - name: walshadow_oracle regression diffs on failure
+        if: failure()
+        working-directory: walshadow/walshadow_oracle
+        run: |
+          test -f regression.diffs && cat regression.diffs || true
+          test -d /tmp/wsho_tmpinst/log && \
+            sudo tail -n 200 /tmp/wsho_tmpinst/log/postmaster.log || true
 
       - name: ClickHouse server logs on failure
         if: failure()

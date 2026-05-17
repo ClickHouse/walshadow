@@ -164,6 +164,15 @@ struct Args {
     /// Shape: see [`walshadow::ch_emitter::EmitterConfig::from_toml_str`].
     #[arg(long)]
     ch_config: Option<PathBuf>,
+    /// Phase 9 differential decode oracle: probe 1-in-`<N>` rows
+    /// through shadow PG's `walshadow_decode_disk(oid, bytea)`
+    /// extension function and assert the local decoder matches. `0`
+    /// (default) disables. Requires the `walshadow_oracle` extension
+    /// installed on shadow PG; absent extension surfaces as
+    /// `oracle fallback=N` in the status line and the daemon
+    /// silently ships raw on-disk bytes for `PgPending` types.
+    #[arg(long, default_value_t = 0)]
+    validate: u32,
 }
 
 fn main() -> ExitCode {
@@ -289,6 +298,34 @@ async fn run(args: Args) -> Result<()> {
         .set_invalidation_signal(invalidation_tx);
     let _invalidation_drain = spawn_invalidation_drain(catalog.clone(), invalidation_rx);
 
+    // Phase 9 oracle. Opens its own libpq connection to shadow PG so
+    // its queries don't pessimise the catalog's query-one path. Best-
+    // effort: a still-warming shadow or a connect timeout just
+    // disables the oracle; the daemon keeps running with the raw-
+    // bytes fallback.
+    let oracle = match walshadow::oracle::connect_with_budget(
+        &shadow_conninfo,
+        args.validate,
+        connect_budget,
+    )
+    .await
+    {
+        Ok(o) => {
+            let ext = o.has_extension().await;
+            eprintln!(
+                "oracle: connected (validate={} sample-rate=1/{} extension={})",
+                args.validate > 0,
+                args.validate.max(1),
+                if ext { "present" } else { "absent" },
+            );
+            Some(Arc::new(o))
+        }
+        Err(e) => {
+            eprintln!("oracle: disabled (connect failed: {e})");
+            None
+        }
+    };
+
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;
@@ -320,7 +357,7 @@ async fn run(args: Args) -> Result<()> {
     // clickhouse-c-rs wraps a raw fd through `chc_posix_io` (sync
     // read/write vtable), so we `into_std()` + `set_nonblocking(false)`
     // right before construction.
-    let observer: Box<dyn TupleObserver> = match args.ch_config.as_deref() {
+    let inner_observer: Box<dyn TupleObserver> = match args.ch_config.as_deref() {
         Some(path) => {
             let toml = tokio::fs::read_to_string(path)
                 .await
@@ -341,6 +378,16 @@ async fn run(args: Args) -> Result<()> {
             Box::new(EmitterObserver::new(emitter))
         }
         None => Box::new(MetricsTupleObserver::default()),
+    };
+    // Phase 9: wrap with OracleObserver when an oracle is up. The
+    // wrapper resolves PgPending columns via shadow PG's extension
+    // (no-op when extension is absent) and fires 1-in-N validator
+    // probes when `--validate > 0`. Skip the wrapper entirely if the
+    // oracle is disabled — keeps the dispatch chain tight for the
+    // metrics-only / no-shadow-extension case.
+    let observer: Box<dyn TupleObserver> = match oracle.clone() {
+        Some(o) => Box::new(walshadow::oracle::OracleObserver::new(o, inner_observer)),
+        None => inner_observer,
     };
     // Fan-out: metrics-by-rmgr first, then the buffering decoder
     // (heap → xact buffer), then the xact-record drain (commit/abort
@@ -394,8 +441,12 @@ async fn run(args: Args) -> Result<()> {
                 let b = xact_buffer.lock().await;
                 b.stats().summary()
             };
+            let oracle_stats = match &oracle {
+                Some(o) => o.stats.lock().await.summary(),
+                None => String::new(),
+            };
             eprintln!(
-                "shipped {} segments, last_lsn={:X}/{:X}, source_ahead={}B, {}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}, {}, {}",
+                "shipped {} segments, last_lsn={:X}/{:X}, source_ahead={}B, {}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}, {}, {}{}{}",
                 segments_shipped,
                 now_dispatched >> 32,
                 now_dispatched as u32,
@@ -408,6 +459,8 @@ async fn run(args: Args) -> Result<()> {
                 filter.tracker.pg_class_writes_oid_in_prefix,
                 record_sink.decoder.stats().summary(),
                 xact_stats,
+                if oracle_stats.is_empty() { "" } else { ", " },
+                oracle_stats,
             );
             if args.max_segments != 0 && segments_shipped >= args.max_segments {
                 break "max-segments";

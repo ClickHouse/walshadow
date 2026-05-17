@@ -650,16 +650,27 @@ whole script unmodified. CH end-state matches source end-state.
 
 Size: ≈200 LOC of test glue.
 
-### Phase 9 — differential decode oracle + Tier 3 type matrix
+### Phase 9 — differential decode oracle + Tier 3 hot types
 
-Implement Tier 3 codecs (numeric, jsonb, arrays, inet, interval,
-tsvector) & lock them down with the oracle. For each Tier 3 fixture
-row, additionally probe shadow PG's typsend/typoutput & compare
-against decoder output. Add `--validate` runtime mode (1-in-N
-sampling, configurable). Captures a regression suite for codec edge
-cases (numeric `NaN`, jsonb key ordering, array NULL bitmap layouts).
+Landed as a hybrid. `numeric` / `inet` / `cidr` / `interval` decoded
+locally in [`src/codecs.rs`](../src/codecs.rs); `jsonb`, arrays,
+`tsvector`, ranges, custom domains, every other long-tail Tier 3
+type surface as `ColumnValue::PgPending` and resolve at emit time
+via a `walshadow_oracle` shadow-PG extension exposing
+`walshadow_decode_disk(oid, bytea) -> text` (reconstructs a Datum
+from raw on-disk bytes and runs `typoutput`). Extension is optional
+— absent shadow extension makes the emitter fall back to writing
+raw on-disk bytes; no failure, no operator action required. The
+[`Oracle`](../src/oracle.rs) module hosts the libpq bridge, a
+lock-free 1-in-N sampler, and an `OracleObserver` wrapper that
+rewrites `PgPending` → `Text` before the inner observer sees the
+tuple. `walshadow-stream --validate <N>` switches on the sampler.
+Retro: [PHASE9.md](PHASE9.md).
 
-Size: ≈900 LOC.
+Size delivered: ~2050 LOC (Rust 1380, C 125, regress 249, CI 32,
+docs the rest). Followups: local codecs for jsonb / arrays if
+measurement shows the libpq round-trip is hot; sampler
+auto-tuning; mismatch ring buffer for debugging.
 
 ### Phase 10 — operational
 

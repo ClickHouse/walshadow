@@ -2,3 +2,13 @@
 /target
 coverage/
 preprocessed_configs/
+/results
+walshadow_oracle/out/
+walshadow_oracle/log/
+
+*.o
+*.bc
+*.so
+*.diffs
+
+regression.out

@@ -427,6 +427,41 @@ fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
             push_u32(out, *type_oid);
             push_bytes(out, raw);
         }
+        ColumnValue::Numeric(n) => {
+            use crate::codecs::NumericKind;
+            push_u8(out, 20);
+            match n {
+                NumericKind::Finite(s) => {
+                    push_u8(out, 0);
+                    push_str(out, s);
+                }
+                NumericKind::NaN => push_u8(out, 1),
+                NumericKind::PInf => push_u8(out, 2),
+                NumericKind::NInf => push_u8(out, 3),
+            }
+        }
+        ColumnValue::Inet(v) => {
+            push_u8(out, 21);
+            push_u8(out, v.family);
+            push_u8(out, v.bits);
+            push_u8(out, v.is_cidr as u8);
+            push_bytes(out, &v.addr);
+        }
+        ColumnValue::Interval(v) => {
+            push_u8(out, 22);
+            push_i32(out, v.months);
+            push_i32(out, v.days);
+            push_i64(out, v.micros);
+        }
+        ColumnValue::Json(s) => {
+            push_u8(out, 23);
+            push_str(out, s);
+        }
+        ColumnValue::PgPending { type_oid, raw } => {
+            push_u8(out, 24);
+            push_u32(out, *type_oid);
+            push_bytes(out, raw);
+        }
     }
 }
 
@@ -573,12 +608,7 @@ fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
             let tz_seconds = c.i32()?;
             ColumnValue::TimeTz { micros, tz_seconds }
         }
-        14 => {
-            let bs = c.need(16)?;
-            let mut a = [0u8; 16];
-            a.copy_from_slice(bs);
-            ColumnValue::Uuid(a)
-        }
+        14 => ColumnValue::Uuid(c.need(16)?.try_into().unwrap()),
         15 => ColumnValue::Name(c.string()?),
         16 => ColumnValue::Bytea(c.bytes()?),
         17 => ColumnValue::Text(c.string()?),
@@ -598,6 +628,50 @@ fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
             let type_oid = c.u32()?;
             let raw = c.bytes()?;
             ColumnValue::Unsupported { type_oid, raw }
+        }
+        20 => {
+            use crate::codecs::NumericKind;
+            let kind = c.u8()?;
+            ColumnValue::Numeric(match kind {
+                0 => NumericKind::Finite(c.string()?),
+                1 => NumericKind::NaN,
+                2 => NumericKind::PInf,
+                3 => NumericKind::NInf,
+                other => {
+                    return Err(SpillError::Format {
+                        offset: c.pos,
+                        detail: format!("unknown NumericKind tag {other}"),
+                    });
+                }
+            })
+        }
+        21 => {
+            let family = c.u8()?;
+            let bits = c.u8()?;
+            let is_cidr = c.u8()? != 0;
+            let addr = c.bytes()?;
+            ColumnValue::Inet(crate::codecs::InetValue {
+                family,
+                bits,
+                is_cidr,
+                addr,
+            })
+        }
+        22 => {
+            let months = c.i32()?;
+            let days = c.i32()?;
+            let micros = c.i64()?;
+            ColumnValue::Interval(crate::codecs::IntervalValue {
+                months,
+                days,
+                micros,
+            })
+        }
+        23 => ColumnValue::Json(c.string()?),
+        24 => {
+            let type_oid = c.u32()?;
+            let raw = c.bytes()?;
+            ColumnValue::PgPending { type_oid, raw }
         }
         other => {
             return Err(SpillError::Format {

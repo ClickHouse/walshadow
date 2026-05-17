@@ -33,6 +33,37 @@ docs that are not yet committed work sit alongside as peers.
   uses `SYSTEM SHUTDOWN` instead of `kill -TERM <pgid>` for clean
   CH-server teardown. DROP TABLE + PG read-time-default replication
   are followups. [PHASE8.md](PHASE8.md).
+- **Phase 9** — differential decode oracle + Tier 3 hot types.
+  Hybrid scope: `numeric` / `inet` / `cidr` / `interval` decoded
+  locally in `src/codecs.rs` (Tier 3 hot types — small, fixed
+  layout); `jsonb`, arrays, `tsvector`, ranges, custom domains, …
+  surface as `ColumnValue::PgPending` carrying raw on-disk bytes
+  and resolve at emit time via a new `walshadow_oracle` PG
+  extension exposing `walshadow_decode_disk(oid, bytea) -> text`.
+  Extension is optional — when absent the emitter falls back to
+  writing raw on-disk bytes verbatim. `Oracle` module
+  ([`src/oracle.rs`](../src/oracle.rs)) hosts the libpq bridge,
+  1-in-N validator sampler, and `OracleObserver` wrapper that
+  rewrites `PgPending` → `Text` before the inner observer sees
+  the tuple. `walshadow-stream --validate <N>` enables sampling.
+  Two integration tests pin the extension-present vs absent
+  paths, plus an `OracleObserver` round-trip. Extension ships
+  its own pg_regress suite under
+  [`walshadow_oracle/`](../walshadow_oracle) covering varlena,
+  fixed-width by-val 1/2/4/8, by-ref, cstring, STRICT NULL, and
+  the two `ereport` branches. CI matrix gains
+  `postgresql-server-dev-<major>` and runs the regress suite
+  under `--temp-instance`. Surfaces + fixes two bugs:
+  `decode_inet` was reading the wire-format `is_cidr | nb`
+  bytes that aren't actually present in the heap-tuple body
+  (PG's `inet_struct` is `family | bits | ipaddr[nb]`, with
+  `is_cidr` encoded at the type-OID level and `nb` implied by
+  `family`), and the oracle's `walshadow_decode_disk` SQL
+  binding tripped tokio-postgres' "error serializing
+  parameter 0" because `oid` is `u32`, not `i32`. Followups:
+  local codecs for `jsonb` / arrays if measurement says the
+  per-row libpq round-trip is hot; sampler auto-tuning;
+  mismatch ring buffer for debugging. [PHASE9.md](PHASE9.md).
 - **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,

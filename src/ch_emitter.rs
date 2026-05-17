@@ -861,12 +861,33 @@ fn encode_value(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError
         }
         ColumnValue::TimeTz { micros, .. } => buf.append_fixed_bytes(&micros.to_le_bytes()),
         ColumnValue::Uuid(b) => buf.append_fixed_bytes(b),
-        ColumnValue::Name(s) | ColumnValue::Text(s) => buf.append_string_bytes(s.as_bytes()),
+        ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => {
+            buf.append_string_bytes(s.as_bytes())
+        }
+        ColumnValue::Numeric(n) => {
+            use crate::codecs::NumericKind;
+            let txt: &str = match n {
+                NumericKind::Finite(s) => s.as_str(),
+                NumericKind::NaN => "NaN",
+                NumericKind::PInf => "Infinity",
+                NumericKind::NInf => "-Infinity",
+            };
+            buf.append_string_bytes(txt.as_bytes())
+        }
+        ColumnValue::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
+        ColumnValue::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
         ColumnValue::Bytea(b) => buf.append_string_bytes(b),
         ColumnValue::ExternalToast(_) => Err(EmitterError::UnsupportedValue {
             target_column: String::new(),
             kind: "unresolved TOAST pointer (xact buffer should have reassembled)",
         }),
+        // PgPending: resolution to text happens earlier in the pipeline
+        // (BufferingDecoderSink drain via the oracle extension). Reaching
+        // the emitter with PgPending still set means the extension is
+        // absent — fall back to the raw on-disk bytes so CH still
+        // receives the value (operators can post-process via PG-side
+        // tooling). No error; no stat bump.
+        ColumnValue::PgPending { raw, .. } => buf.append_string_bytes(raw),
         ColumnValue::Unsupported { .. } => Err(EmitterError::UnsupportedValue {
             target_column: String::new(),
             kind: "unsupported PG type oid",

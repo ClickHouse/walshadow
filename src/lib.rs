@@ -21,6 +21,7 @@
 pub mod catalog_tracker;
 pub mod ch_emitter;
 pub mod classify;
+pub mod codecs;
 pub mod decoder_sink;
 pub mod filter;
 pub mod filter_segment;
@@ -28,6 +29,7 @@ pub mod fpi;
 pub mod heap_decoder;
 pub mod main_data;
 pub mod manifest;
+pub mod oracle;
 pub mod pg_class_decoder;
 pub mod rewrite;
 mod segment;

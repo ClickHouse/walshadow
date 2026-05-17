@@ -147,7 +147,14 @@ pub const TIMEOID: u32 = 1083;
 pub const TIMESTAMPOID: u32 = 1114;
 pub const TIMESTAMPTZOID: u32 = 1184;
 pub const TIMETZOID: u32 = 1266;
+pub const INTERVALOID: u32 = 1186;
 pub const UUIDOID: u32 = 2950;
+// Tier 3 type OIDs — Phase 9 codecs dispatch off these.
+pub const NUMERICOID: u32 = 1700;
+pub const INETOID: u32 = 869;
+pub const CIDROID: u32 = 650;
+pub const JSONBOID: u32 = 3802;
+pub const JSONOID: u32 = 114;
 
 #[derive(Debug, Error)]
 pub enum DecodeError {
@@ -214,6 +221,32 @@ pub enum ColumnValue {
     /// `text` / `varchar` / `bpchar` — varlena unwrapped + UTF-8 decode.
     /// Invalid UTF-8 surfaces as [`ColumnValue::Bytea`] with a stats counter.
     Text(String),
+    /// `numeric` — Phase 9. Rendered as its PG-text form for finite
+    /// values; NaN / Infinity carry their flag directly. Emitter
+    /// downstream maps to CH `String` (precision is per-row in PG; no
+    /// fixed CH `Decimal` type fits without operator config).
+    Numeric(crate::codecs::NumericKind),
+    /// `inet` / `cidr` — Phase 9. Carries family/bits/cidr-flag/addr;
+    /// emit via [`crate::codecs::InetValue::to_text`].
+    Inet(crate::codecs::InetValue),
+    /// `interval` — Phase 9. 16-byte fixed-width tuple (months, days,
+    /// micros).
+    Interval(crate::codecs::IntervalValue),
+    /// `json` — Phase 9. Stored as varlena text directly on disk; we
+    /// pass it through unchanged.
+    Json(String),
+    /// Phase 9 deferred decode: the type isn't in walshadow's Tier 1/2
+    /// matrix and isn't one of the locally-implemented Tier 3 hot types
+    /// (numeric / inet / interval / json). Carries the raw on-disk
+    /// body; resolution to text happens at emit time via a
+    /// `walshadow_decode_disk(oid, bytea) -> text` SQL call against
+    /// shadow PG (the `walshadow_oracle` extension). When the extension
+    /// is unavailable, the emitter falls back to writing `<oid:N>` and
+    /// bumping `unsupported_values`.
+    PgPending {
+        type_oid: u32,
+        raw: Vec<u8>,
+    },
     /// On-disk TOAST pointer — Phase 6's TOAST reassembly will
     /// dereference. Until then, callers see opaque metadata and can
     /// either skip or emit a placeholder downstream.
@@ -812,13 +845,16 @@ fn decode_one_value(
             let tz_seconds = i32::from_le_bytes(body[8..12].try_into().unwrap());
             ColumnValue::TimeTz { micros, tz_seconds }
         }
-        UUIDOID => {
-            // PG's `uuid_send` emits raw 16 bytes, network byte order
-            // (no swap). On-disk is the same: just copy.
-            let mut bs = [0u8; 16];
-            bs.copy_from_slice(body);
-            ColumnValue::Uuid(bs)
-        }
+        // PG's `uuid_send` emits raw 16 bytes, network byte order (no
+        // swap). On-disk is the same.
+        UUIDOID => ColumnValue::Uuid(body.try_into().unwrap()),
+        INTERVALOID => match crate::codecs::decode_interval(body) {
+            Ok(v) => ColumnValue::Interval(v),
+            Err(_) => ColumnValue::Unsupported {
+                type_oid: att.type_oid,
+                raw: body.to_vec(),
+            },
+        },
         _ => ColumnValue::Unsupported {
             type_oid: att.type_oid,
             raw: body.to_vec(),
@@ -993,7 +1029,31 @@ fn varlena_to_value(att: &RelAttr, body: &[u8], _short: bool) -> ColumnValue {
             // happen on disk, but surface as bytea rather than crashing.
             Err(_) => ColumnValue::Bytea(body.to_vec()),
         },
-        _ => ColumnValue::Unsupported {
+        // Tier 3 hot types — local decoders (Phase 9).
+        NUMERICOID => match crate::codecs::decode_numeric(body) {
+            Ok(v) => ColumnValue::Numeric(v),
+            Err(_) => ColumnValue::Unsupported {
+                type_oid: att.type_oid,
+                raw: body.to_vec(),
+            },
+        },
+        INETOID | CIDROID => match crate::codecs::decode_inet(body, att.type_oid == CIDROID) {
+            Ok(v) => ColumnValue::Inet(v),
+            Err(_) => ColumnValue::Unsupported {
+                type_oid: att.type_oid,
+                raw: body.to_vec(),
+            },
+        },
+        JSONOID => match std::str::from_utf8(body) {
+            Ok(s) => ColumnValue::Json(s.to_owned()),
+            Err(_) => ColumnValue::Bytea(body.to_vec()),
+        },
+        // Tier 3 deferred — resolved by the walshadow_oracle extension
+        // on shadow PG at emit time. JSONBOID, range types, arrays
+        // (typcategory='A'), tsvector etc. all route here. Carries the
+        // full on-disk body so the SQL bridge can reconstruct the
+        // varlena Datum.
+        _ => ColumnValue::PgPending {
             type_oid: att.type_oid,
             raw: body.to_vec(),
         },
@@ -1385,11 +1445,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_unsupported_type_emits_opaque() {
-        // numeric (typ_oid 1700) is Tier 3 — should fall through to
-        // ColumnValue::Unsupported with raw bytes preserved.
-        let rel = descriptor(16397, vec![rel_attr(1, "n", 1700, -1, 'i')]);
-        let body = b"unparsed";
+    fn decode_unsupported_type_emits_pending() {
+        // Pick a varlena type OID that's outside walshadow's local
+        // matrix (jsonb = 3802). Post-Phase-9 the varlena fall-through
+        // produces a `PgPending` with raw bytes preserved — the
+        // walshadow_oracle shadow extension resolves the text form at
+        // emit time, falling back to `unsupported_values` when the
+        // extension is absent.
+        let rel = descriptor(16397, vec![rel_attr(1, "j", 3802, -1, 'i')]);
+        let body = b"\x01opaque";
         let total = 4 + body.len();
         let header_u32 = (total as u32) << 2;
         let mut col_data = Vec::new();
@@ -1401,11 +1465,11 @@ mod tests {
         let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
         let new = out.new.unwrap();
         match &new.columns[0] {
-            Some(ColumnValue::Unsupported { type_oid, raw }) => {
-                assert_eq!(*type_oid, 1700);
+            Some(ColumnValue::PgPending { type_oid, raw }) => {
+                assert_eq!(*type_oid, 3802);
                 assert_eq!(raw.as_slice(), body);
             }
-            other => panic!("expected Unsupported, got {other:?}"),
+            other => panic!("expected PgPending, got {other:?}"),
         }
     }
 
