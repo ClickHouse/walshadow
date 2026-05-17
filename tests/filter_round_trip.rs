@@ -30,6 +30,11 @@ fn oltp_segment() -> PathBuf {
         .join("fixtures/wal/filter/segments/000000010000000000000002.gz")
 }
 
+fn vacuum_full_pg_depend_segment() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/wal/vacuum_full_pg_depend/segments/000000010000000000000002.gz")
+}
+
 fn decompress_gz(path: &PathBuf) -> std::io::Result<Vec<u8>> {
     let mut child = Command::new("gunzip")
         .arg("-c")
@@ -167,6 +172,48 @@ fn oltp_workload_keeps_well_under_one_percent() {
     let (filtered_count, noops) = parse_all_records(&out).expect("re-parse filtered");
     assert_eq!(filtered_count as u64, manifest.stats.records);
     assert_eq!(noops as u64, manifest.stats.dropped);
+}
+
+/// PRE5b3 regression: pg_class UPDATE records from `VACUUM FULL` on a
+/// non-mapped catalog are prefix-compressed past the OID column. The
+/// decoder must signal `pg_class_writes_oid_in_prefix` and must NOT
+/// tick `pg_class_writes_undecoded` (which would mean the WAL was
+/// genuinely malformed, masking the prefix-compression hole).
+#[test]
+fn vacuum_full_pg_depend_ticks_oid_in_prefix_not_undecoded() {
+    let seg = vacuum_full_pg_depend_segment();
+    if !seg.exists() {
+        eprintln!(
+            "skip: no fixture at {:?}. Run fixtures/wal/vacuum_full_pg_depend/capture.sh",
+            seg
+        );
+        return;
+    }
+    let bytes = decompress_gz(&seg).expect("gunzip vacuum-full fixture");
+    let mut filter = Filter::new();
+    let (_out, manifest) = filter_segment(&bytes, "vac", &mut filter).expect("filter");
+
+    let tracker = &filter.tracker;
+    eprintln!(
+        "VACUUM FULL pg_depend fixture: {} records, oid_in_prefix={}, undecoded={}, decoded={}",
+        manifest.stats.records,
+        tracker.pg_class_writes_oid_in_prefix,
+        tracker.pg_class_writes_undecoded,
+        tracker.pg_class_writes_decoded,
+    );
+    assert!(
+        tracker.pg_class_writes_oid_in_prefix > 0,
+        "VACUUM FULL pg_<non-mapped> must produce ≥1 oid-in-prefix pg_class write; got 0",
+    );
+    assert_eq!(
+        tracker.pg_class_writes_undecoded, 0,
+        "VACUUM FULL pg_<non-mapped> must NOT tick pg_class_writes_undecoded — that signals \
+         genuinely malformed WAL, not prefix compression",
+    );
+    assert_eq!(
+        manifest.stats.pg_class_writes_oid_in_prefix, tracker.pg_class_writes_oid_in_prefix,
+        "manifest counter must mirror tracker counter",
+    );
 }
 
 #[test]

@@ -32,7 +32,7 @@ use wal_rs::pg::walparser::{RmId, XLogRecord};
 
 use crate::classify::FIRST_NORMAL_OBJECT_ID;
 use crate::pg_class_decoder::{
-    decode_pg_class_tuple, info_carries_new_tuple_heap, info_carries_new_tuple_heap2,
+    DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap, info_carries_new_tuple_heap2,
 };
 
 /// XLOG_RELMAP_UPDATE info byte (`xl_info & XLR_RMGR_INFO_MASK`).
@@ -58,14 +58,24 @@ pub struct CatalogTracker {
     /// Count of relmap updates observed (debug / metrics).
     pub relmap_updates: u64,
     /// pg_class heap writes whose payload failed `pg_class_decoder`
-    /// (truncated block data, missing column data). Successful decodes
-    /// do not increment this — see `pg_class_writes_decoded`.
+    /// (truncated block data, missing column data, malformed `t_hoff`).
+    /// Records that omit OID because PG prefix-compressed it land in
+    /// `pg_class_writes_oid_in_prefix` instead; this counter is
+    /// reserved for genuinely malformed input.
     pub pg_class_writes_undecoded: u64,
     /// pg_class heap writes successfully decoded. Catalog filenodes
     /// (oid < FirstNormalObjectId) extracted from these are added to
     /// `nodes`. User-table inserts decode fine but their oid trips the
     /// catalog filter and they are not added.
     pub pg_class_writes_decoded: u64,
+    /// pg_class UPDATE / HOT_UPDATE records that PG prefix-compressed
+    /// past the OID column — `XLH_UPDATE_PREFIX_FROM_OLD` set with
+    /// `prefixlen > 0`. The WAL record alone cannot reconstruct
+    /// `(oid, relfilenode)` for these; learning the rotated catalog
+    /// filenode requires the seed snapshot or a subsequent
+    /// `XLOG_RELMAP_UPDATE`. Typical pattern: `VACUUM FULL
+    /// pg_<non-mapped>` (pg_depend, pg_namespace, pg_constraint, …).
+    pub pg_class_writes_oid_in_prefix: u64,
     /// `(db_node, filenode)` pairs added at attach time via
     /// [`seed_from_source`](Self::seed_from_source).
     pub seeded_from_source: u64,
@@ -122,27 +132,32 @@ impl CatalogTracker {
         }
     }
 
-    /// For each block in `record` that targets pg_class, decode its
-    /// new-tuple payload and add `(db, relfilenode)` if the tuple's
-    /// oid falls in the catalog range.
+    /// Decode the new-tuple block (block 0) of `record` when it targets
+    /// pg_class. PG's `heap_insert` / `heap_update` /
+    /// `heap_hot_update` always register the new tuple via
+    /// `XLogRegisterBufData(0, ...)`; later block refs (e.g.,
+    /// `heap_update`'s block 1 "old page" reference) carry no tuple
+    /// data and must not be fed to the decoder.
     fn harvest_pg_class_blocks(&mut self, record: &XLogRecord) {
-        for blk in &record.blocks {
-            let (db, rel) = (
-                blk.header.location.rel.db_node,
-                blk.header.location.rel.rel_node,
-            );
-            if !self.is_pg_class_relfilenode(db, rel) {
-                continue;
-            }
-            match decode_pg_class_tuple(&blk.data) {
-                Some(row) => {
-                    self.pg_class_writes_decoded += 1;
-                    if row.oid != 0 && row.oid < FIRST_NORMAL_OBJECT_ID && row.relfilenode != 0 {
-                        self.nodes.insert((db, row.relfilenode));
-                    }
+        let Some(blk) = record.blocks.first() else {
+            return;
+        };
+        let (db, rel) = (
+            blk.header.location.rel.db_node,
+            blk.header.location.rel.rel_node,
+        );
+        if !self.is_pg_class_relfilenode(db, rel) {
+            return;
+        }
+        match decode_pg_class_tuple(record, 0) {
+            DecodeOutcome::Decoded(row) => {
+                self.pg_class_writes_decoded += 1;
+                if row.oid != 0 && row.oid < FIRST_NORMAL_OBJECT_ID && row.relfilenode != 0 {
+                    self.nodes.insert((db, row.relfilenode));
                 }
-                None => self.pg_class_writes_undecoded += 1,
             }
+            DecodeOutcome::OidInPrefix => self.pg_class_writes_oid_in_prefix += 1,
+            DecodeOutcome::Undecoded => self.pg_class_writes_undecoded += 1,
         }
     }
 
@@ -286,6 +301,17 @@ mod tests {
     }
 
     fn heap_block_record(rm: RmId, info: u8, db: u32, rel: u32, data: Vec<u8>) -> XLogRecord {
+        heap_block_record_with_main(rm, info, db, rel, data, Vec::new())
+    }
+
+    fn heap_block_record_with_main(
+        rm: RmId,
+        info: u8,
+        db: u32,
+        rel: u32,
+        data: Vec<u8>,
+        main_data: Vec<u8>,
+    ) -> XLogRecord {
         XLogRecord {
             header: XLogRecordHeader {
                 resource_manager_id: rm as u8,
@@ -307,8 +333,37 @@ mod tests {
                 data,
                 ..Default::default()
             }],
+            main_data,
             ..Default::default()
         }
+    }
+
+    /// xl_heap_update main_data with `flags=0`. Sufficient for UPDATE /
+    /// HOT_UPDATE block data that omits prefix/suffix compression.
+    fn xl_heap_update_no_compression() -> Vec<u8> {
+        // SizeOfHeapUpdate = 14 bytes; all-zero is fine because the
+        // decoder only reads byte 7 (flags).
+        vec![0u8; 14]
+    }
+
+    /// pg_class UPDATE block data with `XLH_UPDATE_PREFIX_FROM_OLD`
+    /// shape: leading uint16 prefixlen + xl_heap_header + bitmap pad +
+    /// only the column suffix that survived the prefix strip. Caller
+    /// passes the relfilenode bytes that land at the start of the
+    /// stripped column area. Pre-VACUUM FULL pg_class for non-mapped
+    /// catalogs prefix-compresses cols 1..7 (88 bytes), so the WAL
+    /// payload begins with relfilenode and trailing nullable columns.
+    fn pg_class_update_block_prefix_88(relfilenode: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&88u16.to_le_bytes()); // prefixlen
+        v.extend_from_slice(&33u16.to_le_bytes()); // t_infomask2
+        v.extend_from_slice(&0u16.to_le_bytes()); // t_infomask
+        v.push(24); // t_hoff
+        v.push(0); // 1-byte MAXALIGN pad (offset 23 -> 24)
+        // Column data starts at reconstructed offset 24 + 88 = 112, the
+        // first byte of relfilenode.
+        v.extend_from_slice(&relfilenode.to_le_bytes());
+        v
     }
 
     /// Build an xl_heap_header (t_infomask2, t_infomask, t_hoff) +
@@ -392,13 +447,45 @@ mod tests {
     fn pg_class_heap_update_adds_post_vacuum_full_filenode() {
         let mut t = CatalogTracker::new();
         // UPDATE on pg_class row for pg_depend (oid 2608) to a fresh
-        // relfilenode after VACUUM FULL pg_depend.
+        // relfilenode after VACUUM FULL pg_depend. Synthesised without
+        // prefix/suffix compression — the realistic VACUUM-FULL shape
+        // (prefixlen ≈ 88) is exercised by
+        // [`pg_class_heap_update_with_prefix_compression_increments_oid_in_prefix`].
         let data = pg_class_block_data(2608, 40000);
-        // info_high = 0x20 = XLOG_HEAP_UPDATE
-        let rec = heap_block_record(RmId::Heap, 0x20, 5, 1259, data);
+        let rec = heap_block_record_with_main(
+            RmId::Heap,
+            0x20,
+            5,
+            1259,
+            data,
+            xl_heap_update_no_compression(),
+        );
         t.observe(&rec);
         assert!(t.is_catalog(5, 40000));
         assert_eq!(t.pg_class_writes_decoded, 1);
+        assert_eq!(t.pg_class_writes_oid_in_prefix, 0);
+    }
+
+    #[test]
+    fn pg_class_heap_update_with_prefix_compression_increments_oid_in_prefix() {
+        // VACUUM FULL pg_<non-mapped> shape: pg_class cols 1..7 are
+        // unchanged so PG sets XLH_UPDATE_PREFIX_FROM_OLD with
+        // prefixlen ≈ 88. OID lives in the un-logged prefix; tracker
+        // must signal this via pg_class_writes_oid_in_prefix and must
+        // *not* tick pg_class_writes_undecoded. Catalog set stays
+        // unchanged because we can't identify which catalog this
+        // record's filenode belongs to.
+        let mut t = CatalogTracker::new();
+        let data = pg_class_update_block_prefix_88(40000);
+        // flags = XLH_UPDATE_PREFIX_FROM_OLD (0x20)
+        let mut md = xl_heap_update_no_compression();
+        md[7] = 0x20;
+        let rec = heap_block_record_with_main(RmId::Heap, 0x20, 5, 1259, data, md);
+        t.observe(&rec);
+        assert_eq!(t.pg_class_writes_oid_in_prefix, 1);
+        assert_eq!(t.pg_class_writes_undecoded, 0);
+        assert_eq!(t.pg_class_writes_decoded, 0);
+        assert!(!t.is_catalog(5, 40000));
     }
 
     #[test]
@@ -445,9 +532,18 @@ mod tests {
         let rm = relmap_record(5, &[(1259, 50000)]);
         t.observe(&rm);
         // Then VACUUM FULL on pg_depend; pg_class block now lives at
-        // filenode 50000, not 1259.
+        // filenode 50000, not 1259. No prefix/suffix compression in
+        // this synthetic — narrowly tests the relmap → pg_class
+        // filenode lookup, not the prefix path.
         let data = pg_class_block_data(2608, 70000);
-        let rec = heap_block_record(RmId::Heap, 0x20, 5, 50000, data);
+        let rec = heap_block_record_with_main(
+            RmId::Heap,
+            0x20,
+            5,
+            50000,
+            data,
+            xl_heap_update_no_compression(),
+        );
         t.observe(&rec);
         assert!(t.is_catalog(5, 70000));
         assert_eq!(t.pg_class_writes_decoded, 1);

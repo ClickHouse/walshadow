@@ -1,9 +1,11 @@
-# PRE5b3 — `pg_class_decoder` prefix/suffix compression
+# PRE5b3 — `pg_class_decoder` prefix/suffix compression (retrospective)
 
-[PRE5b](PRE5b.md) item B3. Fixes the `VACUUM FULL pg_<non-mapped>`
+[PRE5b](PRE5b.md) item B3. Third of the four B-item correctness fixes;
+independent of [PRE5b1](PRE5b1.md), [PRE5b2](PRE5b2.md),
+[PRE5b4](PRE5b4.md). Closes the `VACUUM FULL pg_<non-mapped>`
 silent-decode hole flagged by PRE5 exit criterion 5.
 
-## Why
+## Why (preserved)
 
 PG's `heap_update` (`~/s/postgresql/src/backend/access/heap/heapam.c:8984-9036`)
 writes UPDATE block-0 data as:
@@ -17,120 +19,170 @@ writes UPDATE block-0 data as:
 +- offset t_hoff + prefixlen                          -+
 ```
 
-Suffix is symmetric: trailing column bytes that match the old tuple
-are omitted. Recovery at `heap_xlog_update` reconstructs by copying
-prefix/suffix from the old page.
-
-`pg_class_decoder.rs:90-110` does
+`pg_class_decoder.rs` previously did
 
 ```rust
 let t_hoff = block_data[XL_HEAP_HEADER_SIZE - 1] as usize;
 ```
 
-i.e. reads `block_data[4]` as `t_hoff`. Wrong whenever any prefix or
+i.e. read `block_data[4]` as `t_hoff`. Wrong whenever any prefix or
 suffix flag is set on `xl_heap_update.flags`, which lives in
 `record.main_data`, not in block data.
 
 `VACUUM FULL` on a non-mapped catalog (`pg_depend`, `pg_namespace`,
 `pg_constraint`, `pg_index`) updates `pg_class.relfilenode` for that
 catalog's row. pg_class cols 1–7 occupy 88 bytes, all unchanged; PG's
-prefix-compute (`heapam.c:8904-8915`) yields `prefixlen ≈ 88` (modulo
-MAXALIGN). The OID column lands inside the prefix and never appears
-in the WAL record.
+prefix-compute yields `prefixlen ≈ 88`. The OID column lands inside the
+prefix and never appears in the WAL record.
 
-Consequence: every `VACUUM FULL pg_<non-mapped>` produces a pg_class
-WAL record whose `(oid, relfilenode)` the decoder cannot extract.
-`pg_class_writes_undecoded` ticks silently;
-`CatalogTracker::is_catalog(db, new_filenode)` stays `false`;
-subsequent WAL targeting the rotated catalog gets classified as User
-and dropped. PRE5 exit criterion 5 (counter pinned at zero) currently
-holds only because no fixture exercises the case. Unit test
-`pg_class_heap_update_adds_post_vacuum_full_filenode`
-(`catalog_tracker.rs:391`) passes with synthetic block data that omits
-prefix compression.
+Consequence: every `VACUUM FULL pg_<non-mapped>` produced a pg_class
+WAL record whose `(oid, relfilenode)` the decoder could not extract,
+ticking `pg_class_writes_undecoded` and silently leaving the catalog
+set unchanged for the rotated filenode. PRE5 exit criterion 5
+(counter pinned at zero) held only because no fixture exercised the
+case.
 
-## Implementation
+## What landed
 
-Two parts.
-
-**Part 1 — read `xl_heap_update.flags` from `main_data`.** Lift the
-decoder to take `record: &XLogRecord, block_idx: usize` instead of
-`block_data: &[u8]`. For `HEAP_UPDATE` / `HEAP_HOT_UPDATE` (info masks
-0x20 / 0x40), the `main_data` `xl_heap_update` layout
-(`SizeOfHeapUpdate = 13`) is `old_xmax(4) + old_offnum(2) +
-old_infobits_set(1) + flags(1) + new_xmax(4) + new_offnum(2)`. Read
-byte 7 as `flags`.
-
-* `XLH_UPDATE_PREFIX_FROM_OLD = 0x20`,
-  `XLH_UPDATE_SUFFIX_FROM_OLD = 0x40`.
-* `skip = (prefix ? 2 : 0) + (suffix ? 2 : 0)`.
-* Strip leading `skip` bytes from `block_data` before reading
-  `xl_heap_header`.
-* Capture `prefixlen` from the stripped uint16 for column-offset
-  arithmetic.
-
-HEAP_INSERT (info 0x00) carries no prefix/suffix; existing arithmetic
-stays.
-
-**Part 2 — column offset with prefix.** Column data starts at
-*reconstructed* tuple offset `t_hoff + prefixlen`, not `t_hoff`.
-pg_class col 1 (oid) sits at reconstructed offset `t_hoff`. If
-`prefixlen >= 4`, OID is entirely in the prefix and unrecoverable from
-the WAL record alone. Three cases:
-
-* `prefixlen == 0`: current arithmetic correct.
-* `0 < prefixlen < 4`: OID overlaps the boundary; reject as
-  unrecoverable.
-* `prefixlen >= 4`: OID in prefix. Path A would maintain a
-  `(pg_class_block, offset) → oid` index seeded from
-  `seed_from_source` and resolve via `xl_heap_update.new_offnum`. Path
-  B increments a new counter `pg_class_writes_oid_in_prefix` and
-  leaves the catalog set unchanged for that record. **Default to Path
-  B**: failure is bounded (next DDL touching the affected catalog
-  re-emits without prefix-on-OID), Path A duplicates state the source
-  PG already has, and the rotation can be observed via the
-  forthcoming `XLOG_RELMAP_UPDATE` for any subsequent index/relation
-  touch on shared catalogs.
+* **`pg_class_decoder` signature change.**
+  `decode_pg_class_tuple(record: &XLogRecord, block_idx: usize)
+  -> DecodeOutcome` replaced the old `(block_data: &[u8]) -> Option<…>`.
+  The decoder now reads `xl_heap_update.flags` from `record.main_data`
+  at byte offset 7 (`SizeOfHeapUpdate = 14` on the wire — PG's
+  `XLogRegisterData` strips the C-struct trailing pad that makes
+  in-memory `sizeof = 16`). HEAP_INSERT (info 0x00) skips the flags
+  read entirely.
+* **Three-way outcome enum.** `DecodeOutcome::{Decoded(PgClassRow),
+  OidInPrefix, Undecoded}` lets the tracker distinguish "PG omitted
+  the OID by design" from "WAL was malformed". Any `prefixlen > 0`
+  (overlap or fully-in-prefix) returns `OidInPrefix`; truncated /
+  invalid `t_hoff` returns `Undecoded`.
+* **New tracker counter.** `CatalogTracker.pg_class_writes_oid_in_prefix`
+  ticks on the prefix path; `pg_class_writes_undecoded` is now reserved
+  for genuinely malformed input. Both counters are surfaced through
+  `ManifestStats` and the `walshadow-stream` per-segment log line.
+* **`harvest_pg_class_blocks` narrowed to block 0.** PG's
+  `heap_insert` / `heap_update` / `heap_hot_update` always register
+  the new tuple via `XLogRegisterBufData(0, …)`. The previous loop
+  iterated every block reference and fed the empty "old page" block-1
+  back through the decoder, ticking spurious `pg_class_writes_undecoded`
+  counts. Constraining to `record.blocks.first()` matched PG's
+  contract and dropped the false-positive `undecoded` ticks to zero on
+  the new fixture (was 9 of 19 prefix-compressed records before the
+  narrowing).
+* **Live fixture.**
+  `fixtures/wal/vacuum_full_pg_depend/{capture.sh,workload.sql,segments/000000010000000000000002.gz}`.
+  Workload runs `VACUUM FULL` on `pg_depend`, `pg_namespace`,
+  `pg_constraint`. `capture.sh` follows the
+  `fixtures/wal/filter/capture.sh` shape — phase A primes catalog
+  state and `pg_switch_wal()`s into segment 2; phase B runs the target
+  operation. Captured under PG 18.4.
+* **Round-trip assertion.**
+  `tests/filter_round_trip.rs::vacuum_full_pg_depend_ticks_oid_in_prefix_not_undecoded`
+  drives the fixture through `filter_segment` and asserts
+  `tracker.pg_class_writes_oid_in_prefix > 0` and
+  `tracker.pg_class_writes_undecoded == 0`. Skips silently when the
+  fixture is absent (matches the existing `fixtures/wal/filter` test).
+* **New unit tests.** `pg_class_decoder` gained nine tests covering
+  `prefixlen ∈ {0, 2, 4, 88}`, `suffixlen ∈ {0, 4}`, both flags set,
+  HOT_UPDATE parity with UPDATE, and short-`main_data` rejection.
+  `catalog_tracker` gained
+  `pg_class_heap_update_with_prefix_compression_increments_oid_in_prefix`.
 
 ## Tests
 
-* Fixture: capture WAL from `VACUUM FULL pg_depend` on a live source.
-  Replay through `walshadow-filter`; assert
-  `tracker.pg_class_writes_oid_in_prefix` ticks and
-  `tracker.pg_class_writes_undecoded` does not.
-* Unit: synthesise `XLogRecord`s with `XLH_UPDATE_PREFIX_FROM_OLD` set
-  in `main_data` and prefixlen uint16 in `block_data`. Cover
-  `prefixlen ∈ {0, 2, 4, 88}` plus `suffixlen ∈ {0, 4}`. Assert decode
-  succeeds for small prefix, returns the "oid in prefix" sentinel for
-  `prefixlen >= 4`.
-* Positive: `prefixlen == 0 && suffixlen > 0`. Confirm decode succeeds
-  using stripped suffix bytes (suffix never overlaps the OID column).
+* `cargo test --lib`: 76 pass (was 66; +10 unit). Old
+  `pg_class_decoder` tests rewritten to use `record + block_idx`
+  inputs; old `catalog_tracker` UPDATE tests gained an explicit
+  `xl_heap_update` main_data (else the decoder correctly trips on the
+  empty main_data).
+* `cargo test --tests`: 21 integration tests pass (was 20; +1
+  fixture-backed test in `filter_round_trip.rs`). The new test only
+  fires when the fixture exists; on a clean clone with no docker /
+  local PG it skips.
+* `cargo fmt --all -- --check` clean.
+* `cargo clippy --all-targets -- -D warnings` clean.
 
-## Out of scope
+VACUUM FULL fixture stats: 874 records, 19 `oid_in_prefix`, 0
+`undecoded`, 16 `decoded` (mix of REINDEX-side INSERTs for new pg_class
+rows, and HOT_UPDATEs that fit in the prefix-free path).
 
-* General heap decoder with prefix/suffix handling.
-  [Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix)
-  inherits the same constraint for user heap; the pg_class-specific
-  path stays narrow.
+## Deviations from plan
 
-## Exit criteria
+* **`0 < prefixlen < 4` collapsed into `OidInPrefix`.** Plan called for
+  "reject as unrecoverable" — separate from `prefixlen >= 4`. In
+  practice both cases leave the OID irrecoverable from the record
+  alone; splitting them would mean two near-identical counters with no
+  consumer that cares. Single counter, single outcome. Documented in
+  the `DecodeOutcome::OidInPrefix` doc comment.
+* **Decoder no longer iterates blocks.** Plan kept the per-block
+  iteration shape from the original code. The live fixture showed
+  this was over-eager: PG's `heap_update` register a block-1 "old
+  page" reference with no data, and the loop fed it back into the
+  decoder for `Undecoded` ticks. The fix is to constrain to block 0,
+  not to teach the decoder to recognise "I am being called on the
+  wrong block." Encapsulates PG's convention at the harvester
+  boundary.
+* **Path A (synthesised oid index) explicitly skipped.** Plan offered
+  Path A / Path B; Path B (counter only) shipped. No state added
+  beyond the counter. PRE5b2's `seed_from_source` plus subsequent
+  `XLOG_RELMAP_UPDATE`s cover the "but how does the catalog set
+  actually learn the rotated filenode" question that Path A would
+  have addressed.
+* **`ManifestStats` widened.** Plan didn't call out manifest fields.
+  Added `pg_class_writes_oid_in_prefix` alongside the existing
+  `pg_class_writes_undecoded` so the per-segment view tracks both;
+  `from_filter` grew a parameter.
+* **`SizeOfHeapUpdate` is 14, not 13.** Plan said 13. Verified against
+  PG source plus a one-shot C program: in-memory `sizeof` is 16
+  (trailing pad), wire size via `XLogRegisterData(&xlrec,
+  SizeOfHeapUpdate)` is 14, `flags` at byte 7. Constants in the
+  module reflect the wire layout.
 
-1. `cargo test --lib && cargo test --tests` clean, including unit
-   cases for `prefixlen ∈ {0, 2, 4, 88}` and the live-fixture test.
-2. `cargo fmt --all -- --check` and
-   `cargo clippy --all-targets -- -D warnings` clean. Run both at
-   the end of the implementing phase before commit.
-3. `tracker.pg_class_writes_undecoded` pinned at zero (or replaced by
-   `pg_class_writes_oid_in_prefix`) on the
-   `VACUUM FULL pg_depend` fixture.
+## Implementation notes for follow-on work
 
-## Files expected to change
+`decode_pg_class_tuple`'s signature is now self-contained — it reads
+both `record.header.info` and `record.main_data`, so callers no
+longer need to pre-mask info high-nibble before calling. The
+`info_carries_new_tuple_heap` gate in `CatalogTracker::observe` stays
+because it short-circuits the harvester entirely (and keeps the
+"non-INSERT info ignored" unit test honest).
+
+The block-0-only contract in `harvest_pg_class_blocks` is the right
+shape for [Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix)'s
+general heap decoder too: PG's tuple data always rides block 0 for
+heap WAL ops that carry tuples. When `DecoderSink` lands, lift the
+same `record.blocks.first()` pattern.
+
+[PRE5b8](PRE5b8.md) will need to read `xl_heap_update.flags` for
+UPDATE / DELETE old-tuple decode. Reuse the
+`SIZE_OF_HEAP_UPDATE` / `XL_HEAP_UPDATE_FLAGS_OFFSET` constants —
+they're module-private today but the right place for them when Phase
+5 starts is a shared `heapam_xlog.rs` next to `main_data.rs`.
+
+`pg_class_writes_oid_in_prefix > 0` does *not* mean the catalog
+filenode rotation has been missed end-to-end. PRE5b2's
+`seed_from_source` populates `pg_class_filenode[db]` so subsequent
+`is_pg_class_relfilenode` checks land correctly; the next
+`XLOG_RELMAP_UPDATE` from any mapped-catalog touch refreshes the
+non-mapped catalog set too (shared `pg_database`, `pg_shdepend`
+churn is common in active workloads). If a long-running source goes
+extended periods with only `VACUUM FULL pg_<non-mapped>` activity
+and no relmap events, the oid_in_prefix records leave a gap until
+the next attach-time seed — out of scope for B3.
+
+## Files actually changed
 
 ```
-src/pg_class_decoder.rs            accept &XLogRecord; honour xl_heap_update.flags
-src/catalog_tracker.rs             pg_class_writes_oid_in_prefix counter; route
-                                   decoder through new signature
-tests/filter_round_trip.rs         add VACUUM FULL pg_depend assertion
-fixtures/wal/vacuum_full_pg_depend/  new — VACUUM FULL on a non-mapped catalog
-plans/PRE5b3.md                    this doc
+src/pg_class_decoder.rs                              accept &XLogRecord; honour xl_heap_update.flags;
+                                                     three-way DecodeOutcome
+src/catalog_tracker.rs                               pg_class_writes_oid_in_prefix counter;
+                                                     narrow harvest to block 0;
+                                                     route decoder through new signature
+src/filter_segment.rs                                thread new counter into ManifestStats
+src/manifest.rs                                      pg_class_writes_oid_in_prefix field
+src/bin/stream.rs                                    surface new counter in per-segment log
+tests/filter_round_trip.rs                           vacuum_full_pg_depend fixture assertion
+fixtures/wal/vacuum_full_pg_depend/                  new — capture.sh, workload.sql, segments/
+plans/PRE5b3.md                                      this retrospective
 ```

@@ -39,6 +39,7 @@ pub fn filter_segment(
     let stats_before = filter.stats;
     let relmap_before = filter.tracker.relmap_updates;
     let pgc_undecoded_before = filter.tracker.pg_class_writes_undecoded;
+    let pgc_oid_in_prefix_before = filter.tracker.pg_class_writes_oid_in_prefix;
 
     let mut out = source_bytes.to_vec();
     let mut entries = Vec::new();
@@ -90,6 +91,7 @@ pub fn filter_segment(
         &filter.stats.delta_from(&stats_before),
         filter.tracker.relmap_updates - relmap_before,
         filter.tracker.pg_class_writes_undecoded - pgc_undecoded_before,
+        filter.tracker.pg_class_writes_oid_in_prefix - pgc_oid_in_prefix_before,
     );
     let manifest = Manifest {
         source_segment: source_name.to_string(),

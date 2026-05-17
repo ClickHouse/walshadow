@@ -192,7 +192,7 @@ async fn run(args: Args) -> Result<()> {
             prev_dispatched = now_dispatched;
             let filter = stream.filter();
             eprintln!(
-                "shipped {} segments, last_lsn={:X}/{:X}, records={}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}",
+                "shipped {} segments, last_lsn={:X}/{:X}, records={}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}",
                 segments_shipped,
                 now_dispatched >> 32,
                 now_dispatched as u32,
@@ -201,6 +201,7 @@ async fn run(args: Args) -> Result<()> {
                 filter.stats.dropped,
                 filter.tracker.relmap_updates,
                 filter.tracker.pg_class_writes_undecoded,
+                filter.tracker.pg_class_writes_oid_in_prefix,
             );
             if args.max_segments != 0 && segments_shipped >= args.max_segments {
                 eprintln!("reached --max-segments={}, stopping", args.max_segments);
