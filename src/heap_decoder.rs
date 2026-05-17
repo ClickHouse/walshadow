@@ -309,6 +309,12 @@ pub struct CommittedTuple {
     /// lacked the field or hasn't arrived yet (Phase 5 unbuffered
     /// path).
     pub commit_ts: i64,
+    /// Phase 11. Source LSN of the matching `XLOG_XACT_COMMIT` record.
+    /// The CH emitter snapshots this onto its ack-LSN gauge once the
+    /// containing xact's `send_data(None)` finishes; the daemon's
+    /// status loop writes the value into the cursor file's
+    /// `emitter_ack_lsn` slot. `0` for the Phase 5 unbuffered path.
+    pub commit_lsn: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

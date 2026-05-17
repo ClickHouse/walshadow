@@ -33,6 +33,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -43,6 +44,7 @@ use tokio::sync::Mutex;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
 use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, MappingHandle};
+use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
 use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
@@ -192,6 +194,12 @@ struct Args {
     /// recovery drills; production should leave this off.
     #[arg(long, default_value_t = false)]
     skip_preflight: bool,
+    /// Phase 11. Ignore any `cursor.bin` under `--spill-dir` at boot
+    /// (greenfield resume even when a prior daemon left one). Useful
+    /// for "wipe + restart from a known LSN" drills. The cursor still
+    /// gets rewritten as the new daemon makes progress.
+    #[arg(long, default_value_t = false)]
+    ignore_cursor: bool,
 }
 
 fn main() -> ExitCode {
@@ -256,15 +264,40 @@ async fn run(args: Args) -> Result<()> {
         "source identified",
     );
 
-    let raw_start = match args.start_lsn {
-        Some(s) => parse_lsn(&s).context("--start-lsn")?,
-        None => ident.xlogpos,
+    // Phase 11 cursor-resume gate. `--start-lsn` (explicit operator
+    // override) wins; otherwise cursor.bin under spill_dir picks up the
+    // last emitter-acked LSN; otherwise greenfield (source's current
+    // write head). `--ignore-cursor` forces greenfield even when a
+    // valid cursor is on disk (recovery drills).
+    let cursor_at_boot: Option<cursor::Cursor> = if args.ignore_cursor {
+        None
+    } else {
+        match cursor::read(&args.spill_dir).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "walshadow::cursor",
+                    error = %e,
+                    spill_dir = %args.spill_dir.display(),
+                    "cursor file unreadable; falling back to greenfield",
+                );
+                None
+            }
+        }
+    };
+    let raw_start = match (&args.start_lsn, &cursor_at_boot) {
+        (Some(s), _) => parse_lsn(s).context("--start-lsn")?,
+        (None, Some(c)) if c.emitter_ack_lsn != 0 => c.emitter_ack_lsn,
+        (None, _) => ident.xlogpos,
     };
     let aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
     tracing::info!(
         target: "walshadow",
         raw = format!("{:X}/{:X}", raw_start >> 32, raw_start as u32),
         aligned = format!("{:X}/{:X}", aligned >> 32, aligned as u32),
+        from_cursor = cursor_at_boot.is_some()
+            && args.start_lsn.is_none()
+            && cursor_at_boot.as_ref().is_some_and(|c| c.emitter_ack_lsn != 0),
         "start LSN",
     );
 
@@ -504,14 +537,24 @@ async fn run(args: Args) -> Result<()> {
     let sighup_handle = mapping_handle.clone();
     let _sighup_task = spawn_sighup_handler(sighup_path, sighup_handle);
 
+    // Phase 11 — shared shadow_replay_lsn observed by the retention
+    // sweeper (the only thing polling shadow's `pg_last_wal_replay_lsn`
+    // today). Status loop reads the same atomic to feed the cursor
+    // file's `shadow_replay_lsn` slot + the standby-status `apply_lsn`
+    // ceiling. Atomic so the two tasks don't need a shared mutex.
+    let shadow_replay_lsn = Arc::new(AtomicU64::new(0));
+
     // Phase 10 retention sweeper. Polls shadow's replay LSN, drops
     // filtered segments more than `retention_bytes` behind. Disabled
-    // when `retention_bytes == 0`.
+    // when `retention_bytes == 0`. Phase 11 doubles up: the sweeper's
+    // poll feeds `shadow_replay_lsn` so the main loop doesn't open a
+    // second shadow connection.
     let _retention_task = if args.retention_bytes > 0 {
         Some(spawn_retention(
             args.out_dir.clone(),
             args.retention_bytes,
             shadow_conninfo.clone(),
+            shadow_replay_lsn.clone(),
         ))
     } else {
         None
@@ -520,20 +563,53 @@ async fn run(args: Args) -> Result<()> {
     let start_instant = Instant::now();
     let mut segments_shipped = 0u64;
     let mut prev_dispatched = stream.dispatched_lsn();
+    // Phase 11. Cursor write cadence matches the source standby-status
+    // cadence so the file's `emitter_ack_lsn` is ≥ the value we advertise
+    // to source as `apply_lsn` on every send. Without this ordering the
+    // slot could advance past a not-yet-durable resume point.
+    let cursor_write_interval = Duration::from_secs(args.status_interval);
+    let mut last_cursor_write: Option<Instant> = None;
     let shutdown_reason = loop {
-        // Build the standby-status triple from the most recent state we
-        // know. Phase 10 ships the *shape* — write/flush/apply all
-        // remain best-effort approximations of the same dispatched LSN
-        // until Phase 11 lands the durable-cursor + emitter-ack
-        // surfaces. `write_lsn` is the highest server_wal_end we have
-        // seen (what source last said is its own write head) so the
-        // protocol doesn't regress on a still-receiving connection.
+        // Snapshot every LSN the cursor + standby status depend on.
+        // dispatched_lsn is filter_durable now that DirSegmentSink
+        // fsyncs every segment + the parent dir. shadow_replay_lsn comes
+        // from the retention sweeper's poll (0 when retention is off).
+        // drain_lsn / emitter_ack_lsn come straight from the xact buffer
+        // — single source of truth per PHASE11.
         let dispatched = stream.dispatched_lsn();
         let received = feed.last_server_wal_end().max(dispatched);
+        let shadow_replay = shadow_replay_lsn.load(Ordering::Acquire);
+        let (drain_lsn, emitter_ack_lsn) = {
+            let b = xact_buffer.lock().await;
+            let s = b.stats();
+            (s.drain_lsn, s.emitter_ack_lsn)
+        };
+        // apply_lsn ceiling per PLAN §"Phase 11". Treat shadow_replay==0
+        // (sweeper disabled or hasn't reported yet) as "no constraint
+        // from shadow" rather than the literal min — otherwise a fresh
+        // boot with retention off would pin apply_lsn at 0 forever and
+        // source's slot would never recycle.
+        let apply_ceiling = match shadow_replay {
+            0 => emitter_ack_lsn,
+            s => s.min(emitter_ack_lsn),
+        };
+        let cur = cursor::Cursor {
+            source_received_lsn: received,
+            filter_durable_lsn: dispatched,
+            shadow_replay_lsn: shadow_replay,
+            drain_lsn,
+            emitter_ack_lsn,
+        };
+        if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
+            cursor::write(&args.spill_dir, &cur)
+                .await
+                .context("write resume cursor")?;
+            last_cursor_write = Some(Instant::now());
+        }
         let status = StandbyStatus {
             write_lsn: received,
             flush_lsn: dispatched,
-            apply_lsn: dispatched,
+            apply_lsn: apply_ceiling,
         };
         let chunk = tokio::select! {
             biased;
@@ -587,6 +663,9 @@ async fn run(args: Args) -> Result<()> {
                 &metrics,
                 received,
                 now_dispatched,
+                shadow_replay,
+                drain_lsn,
+                emitter_ack_lsn,
                 &record_sink.metrics,
                 &xact_stats,
                 &decoder_stats,
@@ -714,6 +793,7 @@ fn spawn_retention(
     out_dir: PathBuf,
     retention_bytes: u64,
     shadow_conninfo: String,
+    shadow_replay_lsn: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = match open_retention_client(&shadow_conninfo).await {
@@ -737,6 +817,7 @@ fn spawn_retention(
                     continue;
                 }
             };
+            shadow_replay_lsn.fetch_max(lsn, Ordering::Release);
             let cutoff = lsn.saturating_sub(retention_bytes);
             match trim_below_lsn(&out_dir, cutoff).await {
                 Ok(r) if r.segments_removed > 0 => {
@@ -781,6 +862,9 @@ async fn populate_metrics(
     registry: &MetricsRegistry,
     source_received_lsn: u64,
     filter_lsn: u64,
+    shadow_replay_lsn: u64,
+    decoder_commit_lsn: u64,
+    emitter_ack_lsn: u64,
     rec_metrics: &MetricsRecordSink,
     xact_stats: &walshadow::xact_buffer::XactBufferStats,
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
@@ -803,9 +887,9 @@ async fn populate_metrics(
     let snap = MetricsSnapshot {
         source_received_lsn,
         filter_lsn,
-        shadow_replay_lsn: 0, // Phase 10: retention task polls separately; expose later.
-        decoder_commit_lsn: 0, // Phase 11
-        emitter_ack_lsn: 0,   // Phase 11
+        shadow_replay_lsn,
+        decoder_commit_lsn,
+        emitter_ack_lsn,
         records_by_rm_decision: by_rm,
         xact_active: xact_stats.xacts_active,
         xact_bytes_in_memory: xact_stats.bytes_in_memory,

@@ -1125,7 +1125,11 @@ impl Emitter {
     }
 
     /// Drain every per-table encoder. Called by [`Self::on_xact_end`]
-    /// and pulled out so error-paths can `?` cleanly.
+    /// and pulled out so error-paths can `?` cleanly. Successful return
+    /// is the signal [`XactBuffer::commit`](crate::xact_buffer::XactBuffer::commit)
+    /// uses to advance [`XactBufferStats::emitter_ack_lsn`](crate::xact_buffer::XactBufferStats::emitter_ack_lsn);
+    /// no per-emitter ack gauge exists because the buffer's stats are
+    /// the single source of truth for Phase 11's slot-advance gate.
     fn drain_xact(&mut self) -> Result<(), EmitterError> {
         let keys: Vec<String> = self.tables.keys().cloned().collect();
         for k in &keys {
@@ -1430,6 +1434,7 @@ mod tests {
                 old: None,
             },
             commit_ts: 1_000_000,
+            commit_lsn: 0xD00D,
         }
     }
 

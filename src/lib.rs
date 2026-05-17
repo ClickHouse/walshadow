@@ -17,11 +17,14 @@
 //! by an append-only per-xid spill file (`spill`).
 //! Phase 7: ClickHouse-Native emitter (`ch_emitter`) — driven by the
 //! top crate's `lz4` / `zstd` features which forward to clickhouse-c-rs.
+//! Phase 11: durable resume cursor (`cursor`) sits next to the spill
+//! files; the boot path consults it before reverting to greenfield.
 
 pub mod catalog_tracker;
 pub mod ch_emitter;
 pub mod classify;
 pub mod codecs;
+pub mod cursor;
 pub mod decoder_sink;
 pub mod filter;
 pub mod filter_segment;

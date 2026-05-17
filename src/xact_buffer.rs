@@ -172,6 +172,14 @@ pub struct XactBufferStats {
     /// here than for `commits_unknown_xid` are expected since aborts
     /// often happen on xacts that never wrote anything.
     pub aborts_unknown_xid: u64,
+    /// Phase 11. Highest commit-record LSN drained out of the buffer
+    /// into the observer's `on_tuple` chain. Snapshot for the cursor
+    /// file's `drain_lsn`. Monotonic.
+    pub drain_lsn: u64,
+    /// Phase 11. Highest commit-record LSN where the observer's
+    /// `on_xact_end` returned `Ok` (CH emitter acknowledged the block
+    /// group). Snapshot for `cursor.emitter_ack_lsn`. Monotonic.
+    pub emitter_ack_lsn: u64,
 }
 
 impl XactBufferStats {
@@ -414,15 +422,28 @@ impl XactBuffer {
     /// by the caller. Heaps without TOAST columns never hit the
     /// catalog. No-op if `xid` is unknown (read-only xact, or one
     /// whose records the filter dropped before reaching the buffer).
+    ///
+    /// `commit_lsn` is the LSN of the `XLOG_XACT_COMMIT` record itself
+    /// (Phase 11). Stamped into [`CommittedTuple::commit_lsn`] for the
+    /// emitter's ack tracker, and bumped into
+    /// [`XactBufferStats::drain_lsn`] / `emitter_ack_lsn` on the
+    /// successful-drain path so the cursor file's resume gate has a
+    /// monotonic high-water mark.
     pub async fn commit<O: TupleObserver>(
         &mut self,
         xid: u32,
         commit_ts: i64,
+        commit_lsn: u64,
         catalog: &Arc<Mutex<ShadowCatalog>>,
         observer: &mut O,
     ) -> std::result::Result<(), XactBufferError> {
         let Some(mut st) = self.inflight.remove(&xid) else {
             self.stats.commits_unknown_xid += 1;
+            // Read-only / filter-dropped xacts still advance the
+            // emitter-ack ceiling — source's slot can recycle WAL up to
+            // their commit LSN without losing anything we'd have shipped.
+            self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
+            self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(commit_lsn);
             return Ok(());
         };
         self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
@@ -455,22 +476,37 @@ impl XactBuffer {
             let committed = CommittedTuple {
                 decoded: heap,
                 commit_ts,
+                commit_lsn,
             };
             observer
                 .on_tuple(&committed)
                 .await
                 .map_err(|e| XactBufferError::Observer(e.to_string()))?;
         }
+        // drain_lsn ticks before the on_xact_end ack so an observer
+        // failure leaves drain_lsn ahead of emitter_ack_lsn — exactly
+        // the gap the cursor file is designed to surface.
+        self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
         observer
             .on_xact_end()
             .await
             .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(commit_lsn);
         self.stats.committed_xacts_total += 1;
         Ok(())
     }
 
     /// Discard xact `xid`. No-op if unknown. Wipes any spill file.
-    pub async fn abort(&mut self, xid: u32) -> std::result::Result<(), XactBufferError> {
+    /// `abort_lsn` is the LSN of the `XLOG_XACT_ABORT` record itself;
+    /// advances `drain_lsn` / `emitter_ack_lsn` so the cursor file
+    /// records aborted xacts as fully consumed (nothing to ship).
+    pub async fn abort(
+        &mut self,
+        xid: u32,
+        abort_lsn: u64,
+    ) -> std::result::Result<(), XactBufferError> {
+        self.stats.drain_lsn = self.stats.drain_lsn.max(abort_lsn);
+        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(abort_lsn);
         let Some(mut st) = self.inflight.remove(&xid) else {
             self.stats.aborts_unknown_xid += 1;
             return Ok(());
@@ -681,13 +717,21 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                 XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
                     let commit_ts = parse_xact_time(&record.parsed.main_data);
                     let mut buf = self.buffer.lock().await;
-                    buf.commit(xid, commit_ts, &self.catalog, &mut self.observer)
-                        .await
-                        .map_err(SinkError::from)?;
+                    buf.commit(
+                        xid,
+                        commit_ts,
+                        record.source_lsn,
+                        &self.catalog,
+                        &mut self.observer,
+                    )
+                    .await
+                    .map_err(SinkError::from)?;
                 }
                 XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
                     let mut buf = self.buffer.lock().await;
-                    buf.abort(xid).await.map_err(SinkError::from)?;
+                    buf.abort(xid, record.source_lsn)
+                        .await
+                        .map_err(SinkError::from)?;
                 }
                 _ => {
                     // XLOG_XACT_PREPARE / ASSIGNMENT / INVALIDATIONS:
@@ -927,7 +971,7 @@ mod tests {
         let spill_dir = tmp.path().to_path_buf();
         let before: Vec<_> = std::fs::read_dir(&spill_dir).unwrap().collect();
         assert!(!before.is_empty(), "spill file present");
-        b.abort(11).await.unwrap();
+        b.abort(11, 200).await.unwrap();
         let after: Vec<_> = std::fs::read_dir(&spill_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -942,7 +986,7 @@ mod tests {
     async fn abort_unknown_xid_counts() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        b.abort(101).await.unwrap();
+        b.abort(101, 0).await.unwrap();
         assert_eq!(b.stats().aborts_unknown_xid, 1);
     }
 
@@ -973,8 +1017,8 @@ mod tests {
             !by_filename.iter().any(|n| n.contains("xid-0000000002-")),
             "xid=2 must remain in-memory, saw {by_filename:?}"
         );
-        b.abort(1).await.unwrap();
-        b.abort(2).await.unwrap();
+        b.abort(1, 300).await.unwrap();
+        b.abort(2, 300).await.unwrap();
     }
 
     #[test]
@@ -983,6 +1027,29 @@ mod tests {
         assert_eq!(parse_xact_time(&[1, 2, 3, 4]), 0);
         let ts = 0x0123_4567_89AB_CDEFi64;
         assert_eq!(parse_xact_time(&ts.to_le_bytes()), ts);
+    }
+
+    /// Phase 11. `abort()` must bump `drain_lsn` and `emitter_ack_lsn`
+    /// to the abort-record LSN so the cursor file (and the standby-
+    /// status apply ceiling) cover aborted xacts as "fully consumed".
+    /// Without this, an all-abort workload would never advance the slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_advances_ack_lsns_for_resume_cursor() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        b.on_heap(heap_with_value(7, 100, 16)).await.unwrap();
+        b.abort(7, 0x4000).await.unwrap();
+        assert_eq!(b.stats().drain_lsn, 0x4000);
+        assert_eq!(b.stats().emitter_ack_lsn, 0x4000);
+        // A second abort at a lower LSN must not regress the monotonic
+        // high-water marks.
+        b.abort(99, 0x100).await.unwrap();
+        assert_eq!(b.stats().drain_lsn, 0x4000);
+        assert_eq!(b.stats().emitter_ack_lsn, 0x4000);
+        // A later abort advances.
+        b.abort(101, 0x8000).await.unwrap();
+        assert_eq!(b.stats().drain_lsn, 0x8000);
+        assert_eq!(b.stats().emitter_ack_lsn, 0x8000);
     }
 
     #[test]

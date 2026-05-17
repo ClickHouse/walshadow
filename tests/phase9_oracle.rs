@@ -269,6 +269,7 @@ async fn oracle_observer_resolves_pg_pending_to_text() {
             old: None,
         },
         commit_ts: 0,
+        commit_lsn: 0,
     };
     wrapped.on_tuple(&committed).await.unwrap();
 

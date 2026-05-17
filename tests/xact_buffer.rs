@@ -217,13 +217,19 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, one_col(3)))
         .await
         .unwrap();
-    b.commit(7, 12345, &cat, &mut obs).await.unwrap();
+    b.commit(7, 12345, 300, &cat, &mut obs).await.unwrap();
     assert_eq!(obs.seen.len(), 2);
     assert_eq!(obs.seen[0].decoded.source_lsn, 100);
     assert_eq!(obs.seen[1].decoded.source_lsn, 200);
     assert_eq!(obs.seen[0].commit_ts, 12345);
     assert_eq!(obs.seen[1].commit_ts, 12345);
+    // Phase 11: every tuple carries the commit-record LSN so the
+    // emitter can stamp its ack ceiling without re-reading the buffer.
+    assert_eq!(obs.seen[0].commit_lsn, 300);
+    assert_eq!(obs.seen[1].commit_lsn, 300);
     assert_eq!(b.stats().committed_xacts_total, 1);
+    assert_eq!(b.stats().drain_lsn, 300);
+    assert_eq!(b.stats().emitter_ack_lsn, 300);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -236,9 +242,14 @@ async fn commit_unknown_xid_no_ops() {
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
     let mut obs = CollectObs::default();
-    b.commit(99, 0, &cat, &mut obs).await.unwrap();
+    // Phase 11: even with no buffered records, the commit's source LSN
+    // must advance both ack-LSN gauges so source's slot can recycle
+    // past read-only / filter-dropped xacts.
+    b.commit(99, 0, 0x9000, &cat, &mut obs).await.unwrap();
     assert_eq!(b.stats().commits_unknown_xid, 1);
     assert!(obs.seen.is_empty());
+    assert_eq!(b.stats().drain_lsn, 0x9000);
+    assert_eq!(b.stats().emitter_ack_lsn, 0x9000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -271,7 +282,7 @@ async fn commit_drains_spilled_then_in_memory_entries() {
             .await
             .unwrap();
     }
-    b.commit(5, 0, &cat, &mut obs).await.unwrap();
+    b.commit(5, 0, 250, &cat, &mut obs).await.unwrap();
     assert_eq!(obs.seen.len(), 5);
     for (i, c) in obs.seen.iter().enumerate() {
         let lsn = c.decoded.source_lsn;
@@ -327,7 +338,7 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
         .await
         .unwrap();
     }
-    b.commit(33, 12345, &cat, &mut obs).await.unwrap();
+    b.commit(33, 12345, 300, &cat, &mut obs).await.unwrap();
     assert_eq!(obs.seen.len(), 1);
     let body_col = &obs.seen[0].decoded.new.as_ref().unwrap().columns[1];
     match body_col {
@@ -375,7 +386,7 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         .unwrap();
     }
     let err = b
-        .commit(42, 0, &cat, &mut obs)
+        .commit(42, 0, 200, &cat, &mut obs)
         .await
         .expect_err("missing chunk surfaces");
     match err {
@@ -474,7 +485,7 @@ async fn abort_drops_xact_and_unlinks_spill_against_real_shadow() {
             .unwrap();
     }
     assert!(b.stats().spill_xacts_active >= 1);
-    b.abort(11).await.unwrap();
+    b.abort(11, 200).await.unwrap();
     let leftover: Vec<_> = std::fs::read_dir(&spill_dir)
         .unwrap()
         .filter_map(|e| e.ok())

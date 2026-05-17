@@ -83,12 +83,27 @@ docs that are not yet committed work sit alongside as peers.
   `Pin<Box<PosixIo>>` invariant so the C-side `client→io.state`
   back-pointer stays valid after field reassignment. [PHASE10.md
   ](PHASE10.md).
-- **Phase 11** — durability + resume. Cursor file under
-  `{spill_dir}/cursor.bin`, slot-advance gated on emitter-ack LSN,
-  filter-segment fsync, startup resume + spill replay. Unblocks
-  acceptance §5 (`kill -9` + restart matches uninterrupted CH
-  end-state). Not yet committed work; see
-  [PLAN.md §"Phase 11"](PLAN.md#phase-11--durability--resume).
+- **Phase 11** — durability + resume. Cursor file
+  ([`src/cursor.rs`](../src/cursor.rs)) at `{spill_dir}/cursor.bin`,
+  56-byte atomic-rename writer with magic + CRC32C; filter-segment
+  fsync via `OpenOptions+sync_all+rename+dir-fsync`; per-xact
+  `commit_lsn` carrier on [`CommittedTuple`](../src/heap_decoder.rs);
+  `XactBufferStats::{drain_lsn, emitter_ack_lsn}` monotonic gauges
+  set inside [`XactBuffer::commit`](../src/xact_buffer.rs) — the
+  single source of truth for "observer.on_xact_end returned Ok".
+  Daemon's status loop flips the standby-status triple to durable
+  values: `apply = min(shadow_replay, emitter_ack)`. Boot path reads
+  cursor before `START_REPLICATION`; `--ignore-cursor` forces
+  greenfield. Unblocks acceptance §5 (`kill -9` + restart matches
+  uninterrupted CH end-state). Surfaces + fixes three bugs:
+  unknown-xid commit/abort paths weren't advancing `emitter_ack_lsn`
+  (sustained read-only workload would freeze the slot), atomic-
+  rename writer must leave the `.tmp` sidecar tolerable across
+  crashes (boot reads `cursor.bin` only, ignores stale `.tmp`), and
+  `shadow_replay_lsn == 0` must be treated as "no constraint" not
+  literal-min (otherwise retention-disabled deployments pin
+  apply_lsn at 0). Per-xact cursor write + spill-replay on boot +
+  2PC cursor entries deferred. [PHASE11.md](PHASE11.md).
 - **Phase 12** — backfill bridge. `COPY` from source (or shadow,
   opt-in) under `pg_export_snapshot()`, ships pre-existing rows
   through the same per-relation emitter the WAL hot path uses;

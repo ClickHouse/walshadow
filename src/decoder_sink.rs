@@ -269,13 +269,14 @@ impl<O: TupleObserver> RecordSink for DecoderSink<O> {
                 self.stats.partial += 1;
             }
             // Phase 5 unbuffered path emits the moment the heap record
-            // lands — no commit record yet, so `commit_ts = 0`. Phase 6's
-            // [`BufferingDecoderSink`] takes over in the production
-            // dispatch chain; `DecoderSink` only survives for the
-            // Phase 5 ghost-row test fixtures.
+            // lands — no commit record yet, so `commit_ts = 0` and
+            // `commit_lsn = 0`. Phase 6's [`BufferingDecoderSink`] takes
+            // over in the production dispatch chain; `DecoderSink` only
+            // survives for the Phase 5 ghost-row test fixtures.
             let committed = CommittedTuple {
                 decoded,
                 commit_ts: 0,
+                commit_lsn: 0,
             };
             self.observer
                 .on_tuple(&committed)
@@ -324,6 +325,7 @@ mod tests {
         CommittedTuple {
             decoded,
             commit_ts: 0,
+            commit_lsn: 0,
         }
     }
 
@@ -380,6 +382,7 @@ mod tests {
         let c = CommittedTuple {
             decoded: d,
             commit_ts: 9_876,
+            commit_lsn: 0,
         };
         obs.on_tuple(&c).await.unwrap();
         assert_eq!(obs.tuples.len(), 1);

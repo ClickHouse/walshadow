@@ -355,15 +355,18 @@ impl SegmentSink for DirSegmentSink {
             let name = seg.format();
             let seg_path = self.out_dir.join(&name);
             let tmp = seg_path.with_extension("partial");
-            tokio::fs::write(&tmp, bytes).await?;
-            tokio::fs::rename(&tmp, &seg_path).await?;
+            // Phase 11 durability: fsync the segment file before rename
+            // so a power loss can't leave a renamed-but-empty entry on
+            // disk. Mirrors PG's own `pg_receivewal` flush model. fsync
+            // the dir afterwards so the rename itself is durable —
+            // without it, ext4 may persist file contents while losing
+            // the dir-entry rename.
+            write_sync_rename(&tmp, &seg_path, bytes).await?;
             let mani_path = self.out_dir.join(format!("{name}.manifest.json"));
             let mani_tmp = mani_path.with_extension("manifest.json.partial");
-            // Serde writes through a sync writer; manifest is tiny (KiB) so
-            // serialise to a Vec<u8> first, then write async.
             let body = serde_json::to_vec_pretty(manifest)?;
-            tokio::fs::write(&mani_tmp, &body).await?;
-            tokio::fs::rename(&mani_tmp, &mani_path).await?;
+            write_sync_rename(&mani_tmp, &mani_path, &body).await?;
+            crate::cursor::fsync_dir(&self.out_dir).await?;
             Ok(())
         })
     }
@@ -372,8 +375,9 @@ impl SegmentSink for DirSegmentSink {
     /// `<name>.partial.manifest.json` alongside) so shadow PG's
     /// `restore_command` — which matches by exact segment name — does
     /// not pick it up as a complete segment. Operator-facing artifact;
-    /// resume on the next daemon run is via `--start-lsn` at the same
-    /// segment boundary, not by reading the `.partial` bytes back.
+    /// resume on the next daemon run is via the Phase 11 cursor (which
+    /// resumes from `cursor.emitter_ack_lsn` segment-aligned down), not
+    /// by reading the `.partial` bytes back.
     fn on_partial_segment<'a>(
         &'a mut self,
         seg: SegmentName,
@@ -384,18 +388,39 @@ impl SegmentSink for DirSegmentSink {
             let name = seg.format();
             let partial_path = self.out_dir.join(format!("{name}.partial"));
             let tmp = self.out_dir.join(format!("{name}.partial.tmp"));
-            tokio::fs::write(&tmp, bytes).await?;
-            tokio::fs::rename(&tmp, &partial_path).await?;
+            write_sync_rename(&tmp, &partial_path, bytes).await?;
             let mani_path = self.out_dir.join(format!("{name}.partial.manifest.json"));
             let mani_tmp = self
                 .out_dir
                 .join(format!("{name}.partial.manifest.json.tmp"));
             let body = serde_json::to_vec_pretty(manifest)?;
-            tokio::fs::write(&mani_tmp, &body).await?;
-            tokio::fs::rename(&mani_tmp, &mani_path).await?;
+            write_sync_rename(&mani_tmp, &mani_path, &body).await?;
+            crate::cursor::fsync_dir(&self.out_dir).await?;
             Ok(())
         })
     }
+}
+
+/// Write `bytes` to `tmp`, fsync the file, then atomic-rename to
+/// `final_path`. Caller fsyncs the directory once per batch so a power
+/// loss can't leave the file contents on disk under a stale entry.
+async fn write_sync_rename(
+    tmp: &std::path::Path,
+    final_path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), SinkError> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tmp)
+        .await?;
+    f.write_all(bytes).await?;
+    f.sync_all().await?;
+    drop(f);
+    tokio::fs::rename(tmp, final_path).await?;
+    Ok(())
 }
 
 /// Segment-aligned accumulator. Bytes pushed via [`push`](Self::push)
