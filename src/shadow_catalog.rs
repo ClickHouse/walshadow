@@ -92,7 +92,37 @@ pub struct RelDescriptor {
     /// `pg_class.relpersistence`: `'p'` permanent, `'u'` unlogged,
     /// `'t'` temporary.
     pub persistence: char,
+    /// `pg_class.relreplident` resolved to the form Phase 5's decoder
+    /// needs: `UsingIndex` carries the replica-identity index's oid and
+    /// the column-number list (`pg_index.indkey`), so old-tuple decode
+    /// under `XLH_UPDATE_CONTAINS_OLD_KEY` can be matched against the
+    /// indexed attnums without a second catalog round-trip.
+    pub replident: ReplIdent,
     pub attributes: Vec<RelAttr>,
+}
+
+/// Resolved `pg_class.relreplident`. `pg_class` stores a single char
+/// (`'d'`, `'n'`, `'f'`, `'i'`); the `i` variant carries the
+/// replica-identity index's oid and the indexed-column attnum list
+/// (`pg_index.indkey`) because Phase 5's decoder needs both to
+/// interpret `XLH_UPDATE_CONTAINS_OLD_KEY` / `XLH_UPDATE_CONTAINS_OLD_TUPLE`
+/// payloads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplIdent {
+    /// `'d'`. Old-tuple payload contains the table's primary key
+    /// columns (or nothing if the table has no PK).
+    Default,
+    /// `'n'`. Old-tuple payload is empty; UPDATE/DELETE rows lack a
+    /// key. Phase 5's emitter drops these.
+    Nothing,
+    /// `'f'`. Old-tuple payload mirrors every non-dropped column.
+    Full,
+    /// `'i'`. Old-tuple payload contains the columns of
+    /// `indexrelid` indexed by `key_attnums` (`pg_index.indkey`).
+    UsingIndex {
+        index_oid: Oid,
+        key_attnums: Vec<i16>,
+    },
 }
 
 /// One column on a relation, fields chosen to match what walhouse's
@@ -468,7 +498,8 @@ impl ShadowCatalog {
                     n.nspname::text, \
                     c.relname::text, \
                     c.relkind::text, \
-                    c.relpersistence::text \
+                    c.relpersistence::text, \
+                    c.relreplident::text \
                  FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE pg_relation_filenode(c.oid) = $1 \
@@ -483,6 +514,8 @@ impl ShadowCatalog {
         let name: String = row.get(3);
         let kind = one_char(row.get::<_, String>(4), "relkind")?;
         let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
+        let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
+        let replident = self.fetch_replident(replident_char, oid).await?;
         let attributes = self.fetch_attributes(oid).await?;
         Ok(Some(RelDescriptor {
             rfn,
@@ -492,6 +525,7 @@ impl ShadowCatalog {
             name,
             kind,
             persistence,
+            replident,
             attributes,
         }))
     }
@@ -507,6 +541,7 @@ impl ShadowCatalog {
                     c.relname::text, \
                     c.relkind::text, \
                     c.relpersistence::text, \
+                    c.relreplident::text, \
                     c.reltablespace::oid, \
                     coalesce(pg_relation_filenode(c.oid), 0)::oid \
                  FROM pg_class c \
@@ -522,8 +557,9 @@ impl ShadowCatalog {
         let name: String = row.get(3);
         let kind = one_char(row.get::<_, String>(4), "relkind")?;
         let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
-        let spc_node: Oid = row.get(6);
-        let rel_node: Oid = row.get(7);
+        let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
+        let spc_node: Oid = row.get(7);
+        let rel_node: Oid = row.get(8);
         // db_node is the current database. Resolve via current_database()'s oid.
         let db_node = self.current_database_oid().await?;
         let rfn = RelFileNode {
@@ -531,6 +567,7 @@ impl ShadowCatalog {
             db_node,
             rel_node,
         };
+        let replident = self.fetch_replident(replident_char, oid).await?;
         let attributes = self.fetch_attributes(oid).await?;
         Ok(Some(RelDescriptor {
             rfn,
@@ -540,8 +577,45 @@ impl ShadowCatalog {
             name,
             kind,
             persistence,
+            replident,
             attributes,
         }))
+    }
+
+    async fn fetch_replident(&mut self, c: char, rel_oid: Oid) -> Result<ReplIdent> {
+        match c {
+            'd' => Ok(ReplIdent::Default),
+            'n' => Ok(ReplIdent::Nothing),
+            'f' => Ok(ReplIdent::Full),
+            'i' => {
+                // indkey is int2vector internally, cast to int2[] so the
+                // tokio-postgres array decode path lifts it into Vec<i16>
+                // through the standard Kind::Array(int2) branch.
+                let row = self
+                    .query_opt_retry(
+                        "SELECT indexrelid::oid, indkey::int2[] \
+                         FROM pg_index \
+                         WHERE indrelid = $1 AND indisreplident = true \
+                         LIMIT 1",
+                        &[&rel_oid],
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        CatalogError::Parse(format!(
+                            "relreplident='i' but no pg_index row with indisreplident=true for relation {rel_oid}",
+                        ))
+                    })?;
+                let index_oid: Oid = row.get(0);
+                let key_attnums: Vec<i16> = row.get(1);
+                Ok(ReplIdent::UsingIndex {
+                    index_oid,
+                    key_attnums,
+                })
+            }
+            other => Err(CatalogError::Parse(format!(
+                "unknown relreplident {other:?} (expected one of d/n/f/i)",
+            ))),
+        }
     }
 
     async fn fetch_attributes(&mut self, rel_oid: Oid) -> Result<Vec<RelAttr>> {

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
-    CatalogError, ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
-    with_transient_retry,
+    CatalogError, ReplIdent, ShadowCatalog, ShadowCatalogConfig, socket_conninfo,
+    spawn_invalidation_drain, with_transient_retry,
 };
 
 fn pg_available() -> bool {
@@ -521,6 +521,102 @@ async fn nonexistent_filenode_errors_not_found() {
     };
     let err = cat.relation_at(bogus, 0).await.expect_err("bogus filenode");
     matches!(err, CatalogError::NotFoundByFilenode(_));
+}
+
+/// PRE5b8: `RelDescriptor::replident` carries the resolved
+/// `pg_class.relreplident` and, for `USING INDEX`, the index oid plus
+/// `pg_index.indkey` attnum list. Phase 5's decoder reads both off the
+/// descriptor to interpret `XLH_UPDATE_CONTAINS_OLD_KEY` payloads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replident_matrix_default_nothing_full_index() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, 55609);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    // Four tables, one per relreplident variant. `def_t` has a PK so
+    // DEFAULT is meaningful; `nothing_t` explicitly switches to NOTHING;
+    // `full_t` to FULL; `idx_t` to USING INDEX on a two-column unique
+    // NOT NULL index — REPLICA IDENTITY USING INDEX rejects anything
+    // less.
+    shadow
+        .apply_schema_dump(
+            "CREATE SCHEMA wc;\n\
+             CREATE TABLE wc.def_t (id bigint PRIMARY KEY, name text);\n\
+             CREATE TABLE wc.nothing_t (id bigint, name text);\n\
+             ALTER TABLE wc.nothing_t REPLICA IDENTITY NOTHING;\n\
+             CREATE TABLE wc.full_t (id bigint, name text);\n\
+             ALTER TABLE wc.full_t REPLICA IDENTITY FULL;\n\
+             CREATE TABLE wc.idx_t (\n\
+                id bigint,\n\
+                k1 int NOT NULL,\n\
+                k2 int NOT NULL,\n\
+                name text\n\
+             );\n\
+             CREATE UNIQUE INDEX idx_t_keys ON wc.idx_t (k1, k2);\n\
+             ALTER TABLE wc.idx_t REPLICA IDENTITY USING INDEX idx_t_keys;\n",
+        )
+        .expect("schema dump");
+
+    let db = current_db_oid(&shadow);
+    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+
+    let cases = [
+        ("wc.def_t", ReplIdent::Default),
+        ("wc.nothing_t", ReplIdent::Nothing),
+        ("wc.full_t", ReplIdent::Full),
+    ];
+    for (qualified, expected) in cases {
+        let rfn = wal_rs::pg::walparser::RelFileNode {
+            spc_node: 1663,
+            db_node: db,
+            rel_node: user_relation_filenode(&shadow, qualified),
+        };
+        let desc = cat
+            .relation_at(rfn, 0)
+            .await
+            .unwrap_or_else(|e| panic!("relation_at {qualified}: {e}"));
+        assert_eq!(
+            desc.replident, expected,
+            "{qualified}: expected {expected:?}, got {:?}",
+            desc.replident,
+        );
+    }
+
+    let rfn_idx = wal_rs::pg::walparser::RelFileNode {
+        spc_node: 1663,
+        db_node: db,
+        rel_node: user_relation_filenode(&shadow, "wc.idx_t"),
+    };
+    let desc_idx = cat
+        .relation_at(rfn_idx, 0)
+        .await
+        .expect("relation_at idx_t");
+    let (index_oid, key_attnums) = match desc_idx.replident.clone() {
+        ReplIdent::UsingIndex {
+            index_oid,
+            key_attnums,
+        } => (index_oid, key_attnums),
+        other => panic!("idx_t: expected UsingIndex, got {other:?}"),
+    };
+    let expected_index_oid: u32 = shadow
+        .psql_one("SELECT 'wc.idx_t_keys'::regclass::oid::int8")
+        .expect("psql idx oid")
+        .parse()
+        .expect("idx oid integer");
+    assert_eq!(index_oid, expected_index_oid);
+    // k1, k2 are attnum 2 and 3 on idx_t (id=1, k1=2, k2=3, name=4).
+    assert_eq!(
+        key_attnums,
+        vec![2i16, 3],
+        "USING INDEX must surface pg_index.indkey verbatim",
+    );
 }
 
 /// PRE5b7 sanity check: with the catalog wrapped in
