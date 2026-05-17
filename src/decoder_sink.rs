@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use wal_rs::pg::walparser::RmId;
 
 use crate::filter::Decision;
-use crate::heap_decoder::{DecodeError, DecodedHeap, decode_heap_record};
+use crate::heap_decoder::{CommittedTuple, DecodeError, decode_heap_record};
 use crate::shadow_catalog::{CatalogError, ShadowCatalog};
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
@@ -44,15 +44,49 @@ impl From<DecoderSinkError> for SinkError {
     }
 }
 
-/// Trait wrapper for the destination of decoded heap events. Phase 5
-/// fans into `MetricsTupleObserver` (production counters) plus an
-/// in-memory collector for integration tests. Phase 7 lands the
-/// CH-emitter observer that turns these into Native blocks.
+/// Trait wrapper for the destination of decoded + committed heap
+/// events. Phase 5 fans into `MetricsTupleObserver` (production
+/// counters) plus an in-memory collector for integration tests. Phase
+/// 7 plugs the CH-emitter observer in here, which is why
+/// [`CommittedTuple`] (not [`DecodedHeap`]) is the wire type — the
+/// emitter wants `commit_ts` for its `_commit_ts` synthetic column.
+/// Phase 5's pre-buffer [`DecoderSink`] path passes `commit_ts = 0`
+/// since the commit record hasn't landed at that point.
+///
+/// `on_xact_end` fires after every tuple in a committed xact has been
+/// delivered. Phase 7's CH emitter uses it to close the open INSERT
+/// (`send_data(None)`) so each xact lands as a single CH block group.
+/// Default no-op; metrics & collector observers ignore the hook.
 pub trait TupleObserver: Send {
     fn on_tuple<'a>(
         &'a mut self,
-        decoded: &'a DecodedHeap,
+        committed: &'a CommittedTuple,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>>;
+
+    fn on_xact_end<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Forwarding impl so `Box<dyn TupleObserver>` itself implements
+/// [`TupleObserver`]. Lets the daemon pick an observer at runtime
+/// (e.g. metrics-only vs CH-emitter) without making
+/// [`crate::xact_buffer::XactRecordSink`] generic over a closed enum.
+impl<T: TupleObserver + ?Sized> TupleObserver for Box<T> {
+    fn on_tuple<'a>(
+        &'a mut self,
+        committed: &'a CommittedTuple,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        (**self).on_tuple(committed)
+    }
+
+    fn on_xact_end<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        (**self).on_xact_end()
+    }
 }
 
 /// Counter observer suitable for the production daemon. Discards the
@@ -95,10 +129,11 @@ pub struct MetricsTupleObserver {
 impl TupleObserver for MetricsTupleObserver {
     fn on_tuple<'a>(
         &'a mut self,
-        decoded: &'a DecodedHeap,
+        committed: &'a CommittedTuple,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
         Box::pin(async move {
             use crate::heap_decoder::HeapOp;
+            let decoded = &committed.decoded;
             self.stats.decoded += 1;
             match decoded.op {
                 HeapOp::Insert => self.stats.inserts += 1,
@@ -116,19 +151,21 @@ impl TupleObserver for MetricsTupleObserver {
     }
 }
 
-/// In-memory observer for tests. Owns the full tuple stream.
+/// In-memory observer for tests. Owns the full committed-tuple
+/// stream so tests can assert on `commit_ts` alongside the decoded
+/// payload.
 #[derive(Debug, Default)]
 pub struct CollectingTupleObserver {
-    pub tuples: Vec<DecodedHeap>,
+    pub tuples: Vec<CommittedTuple>,
 }
 
 impl TupleObserver for CollectingTupleObserver {
     fn on_tuple<'a>(
         &'a mut self,
-        decoded: &'a DecodedHeap,
+        committed: &'a CommittedTuple,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
         Box::pin(async move {
-            self.tuples.push(decoded.clone());
+            self.tuples.push(committed.clone());
             Ok(())
         })
     }
@@ -231,8 +268,17 @@ impl<O: TupleObserver> RecordSink for DecoderSink<O> {
             {
                 self.stats.partial += 1;
             }
+            // Phase 5 unbuffered path emits the moment the heap record
+            // lands — no commit record yet, so `commit_ts = 0`. Phase 6's
+            // [`BufferingDecoderSink`] takes over in the production
+            // dispatch chain; `DecoderSink` only survives for the
+            // Phase 5 ghost-row test fixtures.
+            let committed = CommittedTuple {
+                decoded,
+                commit_ts: 0,
+            };
             self.observer
-                .on_tuple(&decoded)
+                .on_tuple(&committed)
                 .await
                 .map_err(SinkError::from)?;
             Ok(())
@@ -271,8 +317,15 @@ impl DecoderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_decoder::{ColumnValue, HeapOp};
+    use crate::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
     use wal_rs::pg::walparser::RelFileNode;
+
+    fn wrap(decoded: DecodedHeap) -> CommittedTuple {
+        CommittedTuple {
+            decoded,
+            commit_ts: 0,
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn metrics_observer_buckets_by_op() {
@@ -295,9 +348,11 @@ mod tests {
             HeapOp::HotUpdate,
             HeapOp::Delete,
         ] {
-            obs.on_tuple(&mk(op, false)).await.unwrap();
+            obs.on_tuple(&wrap(mk(op, false))).await.unwrap();
         }
-        obs.on_tuple(&mk(HeapOp::Update, true)).await.unwrap();
+        obs.on_tuple(&wrap(mk(HeapOp::Update, true)))
+            .await
+            .unwrap();
         assert_eq!(obs.stats.decoded, 6);
         assert_eq!(obs.stats.inserts, 2);
         assert_eq!(obs.stats.updates, 2);
@@ -324,10 +379,15 @@ mod tests {
             }),
             old: None,
         };
-        obs.on_tuple(&d).await.unwrap();
+        let c = CommittedTuple {
+            decoded: d,
+            commit_ts: 9_876,
+        };
+        obs.on_tuple(&c).await.unwrap();
         assert_eq!(obs.tuples.len(), 1);
-        assert_eq!(obs.tuples[0].xid, 42);
-        assert_eq!(obs.tuples[0].source_lsn, 0x1234);
+        assert_eq!(obs.tuples[0].decoded.xid, 42);
+        assert_eq!(obs.tuples[0].decoded.source_lsn, 0x1234);
+        assert_eq!(obs.tuples[0].commit_ts, 9_876);
     }
 
     #[test]

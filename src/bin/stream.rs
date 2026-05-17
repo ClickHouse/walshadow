@@ -41,7 +41,8 @@ use std::pin::Pin;
 use tokio::sync::Mutex;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
-use walshadow::decoder_sink::MetricsTupleObserver;
+use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver};
+use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
     with_transient_retry,
@@ -54,14 +55,16 @@ use walshadow::xact_buffer::{BufferingDecoderSink, XactBuffer, XactBufferConfig,
 
 /// Tiny inline `RecordSink` composite. Phase 6 adds the xact buffer
 /// to the chain: heap-tuple records park in `xact` until the matching
-/// commit / abort lands, then drain to `xact_drain`'s observer (today
-/// the same metrics counter Phase 5 used; Phase 7 swaps in the CH
-/// emitter). Status-line code keeps direct ownership so per-section
-/// stats render without `dyn Any` round-trips.
+/// commit / abort lands, then drain to `xact_drain`'s observer. Phase
+/// 7 wires the observer end via `Box<dyn TupleObserver>` so the daemon
+/// can pick between metrics-only (no `--ch-config`) and the CH-Native
+/// emitter (config provided) at runtime without a closed enum.
+/// Status-line code keeps direct ownership so per-section stats render
+/// without `dyn Any` round-trips.
 struct DaemonSinks {
     metrics: MetricsRecordSink,
     decoder: BufferingDecoderSink,
-    xact_drain: XactRecordSink<MetricsTupleObserver>,
+    xact_drain: XactRecordSink<Box<dyn TupleObserver>>,
 }
 
 impl RecordSink for DaemonSinks {
@@ -155,6 +158,12 @@ struct Args {
     /// PG's `logical_decoding_work_mem` (64 MiB).
     #[arg(long, default_value_t = walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX)]
     xact_buffer_max: usize,
+    /// Optional path to the Phase 7 CH-Native emitter config (TOML).
+    /// When set, drained xact tuples ship to ClickHouse via
+    /// `clickhouse-c-rs`. When unset the daemon stays metrics-only.
+    /// Shape: see [`walshadow::ch_emitter::EmitterConfig::from_toml_str`].
+    #[arg(long)]
+    ch_config: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -301,6 +310,39 @@ async fn run(args: Args) -> Result<()> {
         args.spill_dir.display(),
         args.xact_buffer_max,
     );
+    // Pick the xact-drain observer: Phase 7 CH-Native emitter when
+    // `--ch-config` is supplied, else stay metrics-only. Wrapped in
+    // `Box<dyn TupleObserver>` so both arms share one drain-sink type.
+    //
+    // Config read + TCP connect ride tokio's async APIs so a slow DNS
+    // / stalled CH boot can't pin the runtime worker. Hand-off to the
+    // emitter requires a blocking-mode `std::net::TcpStream` because
+    // clickhouse-c-rs wraps a raw fd through `chc_posix_io` (sync
+    // read/write vtable), so we `into_std()` + `set_nonblocking(false)`
+    // right before construction.
+    let observer: Box<dyn TupleObserver> = match args.ch_config.as_deref() {
+        Some(path) => {
+            let toml = tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("read --ch-config {}", path.display()))?;
+            let emitter_cfg = EmitterConfig::from_toml_str(&toml)
+                .context("parse --ch-config")?;
+            let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+            let tcp = tokio::net::TcpStream::connect(&addr)
+                .await
+                .with_context(|| format!("connect CH at {addr}"))?;
+            tcp.set_nodelay(true).ok();
+            let std_tcp = tcp.into_std().context("tokio→std TcpStream handoff")?;
+            std_tcp
+                .set_nonblocking(false)
+                .context("set CH socket to blocking for chc_posix_io")?;
+            let emitter = Emitter::new(emitter_cfg, catalog.clone(), std_tcp)
+                .context("init CH emitter")?;
+            eprintln!("ch emitter: connected to {addr}");
+            Box::new(EmitterObserver::new(emitter))
+        }
+        None => Box::new(MetricsTupleObserver::default()),
+    };
     // Fan-out: metrics-by-rmgr first, then the buffering decoder
     // (heap → xact buffer), then the xact-record drain (commit/abort
     // → emit). Ordering keeps per-rmgr counters intact when a decoder
@@ -310,11 +352,7 @@ async fn run(args: Args) -> Result<()> {
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder: BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone()),
-        xact_drain: XactRecordSink::new(
-            xact_buffer.clone(),
-            catalog.clone(),
-            MetricsTupleObserver::default(),
-        ),
+        xact_drain: XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer),
     };
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);

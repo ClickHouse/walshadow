@@ -13,6 +13,9 @@ docs that are not yet committed work sit alongside as peers.
 - **Phase 5** — heap-tuple decoder + Tier 1/2 type matrix. [PHASE5.md](PHASE5.md).
 - **Phase 6** — TOAST reassembly + xact buffer + local-disk spill.
   [PHASE6.md](PHASE6.md). Design layer: [PHASE6disk.md](PHASE6disk.md).
+- **Phase 7** — CH Native emitter via clickhouse-c-rs. Feature-passdown
+  shape + emitter scaffold + observer wiring; Tier 1/2 + live-CH drill
+  iterate in followups. [PHASE7.md](PHASE7.md).
 - **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,

@@ -23,8 +23,20 @@ path = "src/bin/stream.rs"
 name = "walshadow"
 path = "src/lib.rs"
 
+[features]
+# Compression codecs walshadow's CH-Native emitter (Phase 7) advertises
+# in its Hello packet & negotiates onto the wire. Forwarded to
+# clickhouse-c-rs so its `chc_*_codec_init` symbols & C TU link only
+# what the top crate actually offers. `lz4` matches the ClickHouse
+# server default; flip `default-features = false` for an
+# uncompressed-only build with neither codec lib linked.
+default = ["lz4"]
+lz4 = ["clickhouse-c-rs/lz4"]
+zstd = ["clickhouse-c-rs/zstd"]
+
 [dependencies]
 wal-rs = { path = "../wal-rs" }
+clickhouse-c-rs = { path = "clickhouse-c-rs", default-features = false }
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -37,8 +49,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "fs", "sync"] }
 tokio-postgres = "0.7"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 zstd = "0.13"
 
 [dev-dependencies]

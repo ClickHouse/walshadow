@@ -15,8 +15,11 @@
 //! (`heap_decoder`).
 //! Phase 6: per-xact + TOAST reassembly buffer (`xact_buffer`) backed
 //! by an append-only per-xid spill file (`spill`).
+//! Phase 7: ClickHouse-Native emitter (`ch_emitter`) — driven by the
+//! top crate's `lz4` / `zstd` features which forward to clickhouse-c-rs.
 
 pub mod catalog_tracker;
+pub mod ch_emitter;
 pub mod classify;
 pub mod decoder_sink;
 pub mod filter;

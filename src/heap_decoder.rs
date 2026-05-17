@@ -262,6 +262,22 @@ pub enum HeapOp {
     Delete,
 }
 
+/// One drained tuple, fully reassembled. Phase 7's CH emitter consumes
+/// this as `(rfn, xid, source_lsn, commit_ts, op, new, old)`. The
+/// `commit_ts` half is the commit-record `xact_time`; Phase 5's
+/// pre-buffer [`DecoderSink`](crate::decoder_sink::DecoderSink) path
+/// wraps with `commit_ts = 0` since the commit record hasn't landed
+/// yet at that hop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommittedTuple {
+    pub decoded: DecodedHeap,
+    /// PG `TimestampTz` from the xact commit record (microseconds
+    /// since PG epoch 2000-01-01). 0 when the upstream commit record
+    /// lacked the field or hasn't arrived yet (Phase 5 unbuffered
+    /// path).
+    pub commit_ts: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedTuple {
     /// 0-based by attnum-1. `None` means "absent from WAL" — either

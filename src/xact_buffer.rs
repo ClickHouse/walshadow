@@ -73,7 +73,9 @@ use wal_rs::pg::walparser::RmId;
 
 use crate::decoder_sink::{DecoderSinkError, DecoderStats, TupleObserver};
 use crate::filter::Decision;
-use crate::heap_decoder::{ColumnValue, DecodedHeap, HeapOp, ToastPointer, decode_heap_record};
+use crate::heap_decoder::{
+    ColumnValue, CommittedTuple, DecodedHeap, HeapOp, ToastPointer, decode_heap_record,
+};
 use crate::shadow_catalog::{CatalogError, RelDescriptor, ShadowCatalog};
 use crate::spill::{SpillEntry, SpillError, SpillStore, SpillWriter, ToastChunk};
 use crate::wal_stream::{Record, RecordSink, SinkError};
@@ -195,19 +197,6 @@ impl XactBufferStats {
         }
         s
     }
-}
-
-/// One drained tuple, fully reassembled. Phase 7's CH emitter
-/// consumes this as `(rfn, xid, source_lsn, commit_ts, op, new, old)`.
-/// `commit_ts` carries the commit-record timestamp; today only the
-/// `XactRecordSink` drain path populates it.
-#[derive(Debug, Clone)]
-pub struct CommittedTuple {
-    pub decoded: DecodedHeap,
-    /// PG `TimestampTz` from the xact commit record (microseconds
-    /// since PG epoch 2000-01-01). 0 when the upstream commit record
-    /// lacked the field (eg. fixture-only synthetic xacts).
-    pub commit_ts: i64,
 }
 
 struct XactState {
@@ -468,10 +457,14 @@ impl XactBuffer {
                 commit_ts,
             };
             observer
-                .on_tuple(&committed.decoded)
+                .on_tuple(&committed)
                 .await
                 .map_err(|e| XactBufferError::Observer(e.to_string()))?;
         }
+        observer
+            .on_xact_end()
+            .await
+            .map_err(|e| XactBufferError::Observer(e.to_string()))?;
         self.stats.committed_xacts_total += 1;
         Ok(())
     }

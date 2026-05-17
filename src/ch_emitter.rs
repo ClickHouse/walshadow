@@ -1,0 +1,1427 @@
+//! Phase 7 — CH Native emitter via [`clickhouse-c-rs`].
+//!
+//! Translates committed-xact tuple streams into per-table INSERT
+//! statements over a single TCP `Client` per CH replica. Lifecycle per
+//! `(destination table, xact)`:
+//!
+//! 1. First row → buffer in [`TableEncoder`]; mark INSERT pending.
+//! 2. Either the `row_budget` or `byte_budget` trips → build a
+//!    [`BlockBuilder`], `send_query` (if not yet issued for this xact +
+//!    table), `send_data(Some(&bb))`, clear column buffers, keep INSERT
+//!    open. (Not implemented in v1: emitter holds the entire xact and
+//!    flushes a single block per table at xact end. Budget knobs exist
+//!    in [`EmitterConfig`] for a follow-up.)
+//! 3. `on_xact_end` (called by [`XactBuffer::commit`](crate::xact_buffer::XactBuffer))
+//!    flushes whatever buffered + closes each open INSERT with
+//!    `send_data(None)`, then drains response packets until
+//!    `EndOfStream` / `Exception`.
+//!
+//! Synthetic columns `_lsn UInt64`, `_xid UInt32`, `_op Enum8(...)`,
+//! `_commit_ts DateTime64(6, 'UTC')` are appended after every mapped
+//! column. PG's `TimestampTz` epoch is 2000-01-01; we shift to the Unix
+//! epoch (`DATETIME64_PG_EPOCH_US`) so `DateTime64(6)` semantics line up
+//! with ClickHouse.
+//!
+//! ## Compression
+//!
+//! Codec choice is feature-gated via walshadow's own `lz4` / `zstd`
+//! Cargo features, which forward to [`clickhouse-c-rs`]'s matching
+//! features (see top-level `Cargo.toml`). When a feature is off, the
+//! corresponding [`Compression`] variant fails to construct at
+//! `EmitterConfig::resolve_codec`. Default builds advertise LZ4 to
+//! match the CH server default.
+//!
+//! ## Cross-table ordering inside an xact
+//!
+//! `Client` is single-query-at-a-time, so an xact touching tables T1
+//! and T2 lands as: every T1 row first (one INSERT), then every T2
+//! (next INSERT). Original WAL interleaving across tables is not
+//! preserved. `_lsn` carries the source LSN so
+//! `ReplacingMergeTree`-style dedup still keys on the right value.
+//! WAL ordering within a single destination table is preserved.
+
+use std::collections::HashMap;
+use std::os::fd::IntoRawFd;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use clickhouse_c::{
+    Allocator, BlockBuilder, BlockOpts, Client, ClientOpts, Codec, Compression, Kind, PacketKind,
+    PosixIo, TypeAst,
+};
+use thiserror::Error;
+use tokio::sync::Mutex;
+
+use crate::decoder_sink::{DecoderSinkError, TupleObserver};
+use crate::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
+use crate::shadow_catalog::{CatalogError, RelDescriptor, ShadowCatalog};
+
+/// Microsecond offset between PG `TimestampTz` epoch (2000-01-01 UTC)
+/// and the Unix epoch. `DateTime64(6)` in ClickHouse is Unix
+/// microseconds; PG's commit-record `xact_time` and tuple
+/// `TimestampTz` columns are PG-epoch microseconds.
+pub const DATETIME64_PG_EPOCH_US: i64 = 946_684_800_000_000;
+
+/// `_op` Enum8 codes — keep in sync with the `Enum8('insert'=1, ...)`
+/// type advertised by [`TablePlan::synthetic_op_type`].
+pub const OP_INSERT: i8 = 1;
+pub const OP_UPDATE: i8 = 2;
+pub const OP_DELETE: i8 = 3;
+
+/// Default block accumulator budgets. Mirror common ClickHouse server
+/// defaults; tunable via [`EmitterConfig`].
+pub const DEFAULT_ROW_BUDGET: usize = 65_536;
+pub const DEFAULT_BYTE_BUDGET: usize = 1 << 20; // 1 MiB
+
+#[derive(Debug, Error)]
+pub enum EmitterError {
+    #[error("clickhouse-c: {0}")]
+    Client(#[from] clickhouse_c::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("config: {0}")]
+    Config(String),
+    #[error("type: {0}")]
+    Type(String),
+    #[error("catalog: {0}")]
+    Catalog(#[from] CatalogError),
+    #[error("compression `{0}` requested but feature disabled at compile time")]
+    CompressionUnsupported(&'static str),
+    #[error("no table mapping for source relation `{0}`")]
+    NoTableMapping(String),
+    #[error("unsupported column value for {target_column}: {kind}")]
+    UnsupportedValue {
+        target_column: String,
+        kind: &'static str,
+    },
+    #[error("CH server exception {code}: {message}")]
+    ServerException { code: i32, message: String },
+}
+
+impl From<EmitterError> for DecoderSinkError {
+    fn from(e: EmitterError) -> Self {
+        DecoderSinkError::Observer(e.to_string())
+    }
+}
+
+/// Per-replica connection + mapping config. Parse from TOML via
+/// [`EmitterConfig::from_toml_str`]; the `[ch]` table holds connection
+/// params, `[table."<src>"]` blocks declare per-relation mapping.
+#[derive(Debug, Clone)]
+pub struct EmitterConfig {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    pub compression: CompressionChoice,
+    pub row_budget: usize,
+    pub byte_budget: usize,
+    /// Keyed on `"<namespace>.<relname>"` source identifier.
+    pub tables: HashMap<String, TableMapping>,
+}
+
+impl Default for EmitterConfig {
+    fn default() -> Self {
+        Self {
+            host: "localhost".into(),
+            port: 9000,
+            database: "default".into(),
+            user: "default".into(),
+            password: String::new(),
+            compression: CompressionChoice::default(),
+            row_budget: DEFAULT_ROW_BUDGET,
+            byte_budget: DEFAULT_BYTE_BUDGET,
+            tables: HashMap::new(),
+        }
+    }
+}
+
+/// Wire-protocol compression choice. Variants are gated on Cargo
+/// features in the top crate; the `resolve` step refuses unsupported
+/// variants with [`EmitterError::CompressionUnsupported`] before the
+/// codec object is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressionChoice {
+    None,
+    #[default]
+    Lz4,
+    Zstd,
+}
+
+impl CompressionChoice {
+    pub fn parse(s: &str) -> Result<Self, EmitterError> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "none" | "off" | "" => Self::None,
+            "lz4" => Self::Lz4,
+            "zstd" => Self::Zstd,
+            other => {
+                return Err(EmitterError::Config(format!(
+                    "unknown compression `{other}` (expected none / lz4 / zstd)"
+                )));
+            }
+        })
+    }
+
+    fn to_wire(self) -> Compression {
+        match self {
+            Self::None => Compression::None,
+            Self::Lz4 => Compression::Lz4,
+            Self::Zstd => Compression::Zstd,
+        }
+    }
+
+    /// Build the [`Codec`] handle. Feature-gates flow up from
+    /// clickhouse-c-rs so the C TU only links a codec lib when its
+    /// matching feature is on in the top crate.
+    pub fn build_codec(self) -> Result<Option<Pin<Box<Codec>>>, EmitterError> {
+        match self {
+            Self::None => Ok(None),
+            Self::Lz4 => {
+                #[cfg(feature = "lz4")]
+                {
+                    Ok(Some(Codec::lz4()))
+                }
+                #[cfg(not(feature = "lz4"))]
+                {
+                    Err(EmitterError::CompressionUnsupported("lz4"))
+                }
+            }
+            Self::Zstd => {
+                #[cfg(feature = "zstd")]
+                {
+                    Ok(Some(Codec::zstd()))
+                }
+                #[cfg(not(feature = "zstd"))]
+                {
+                    Err(EmitterError::CompressionUnsupported("zstd"))
+                }
+            }
+        }
+    }
+}
+
+/// Per-source-relation destination metadata. Carries the destination
+/// table name & one entry per non-synthetic column. The mapping
+/// declares which source attnums to ship and what CH type to advertise.
+#[derive(Debug, Clone)]
+pub struct TableMapping {
+    pub target: String,
+    pub columns: Vec<ColumnMapping>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnMapping {
+    /// Source `pg_attribute.attnum` (1-based, matches PG convention).
+    pub src_attnum: i16,
+    pub target_name: String,
+    /// ClickHouse type expression — parsed via [`TypeAst::parse`]. The
+    /// emitter does not validate that the type matches the source
+    /// column's PG type; CH will reject on `INSERT` if they mismatch.
+    pub target_type: String,
+}
+
+impl EmitterConfig {
+    /// Parse a TOML config of the shape:
+    ///
+    /// ```toml
+    /// [ch]
+    /// host = "ch.example.com"
+    /// port = 9000
+    /// database = "default"
+    /// user = "default"
+    /// password = ""
+    /// compression = "lz4"   # one of none / lz4 / zstd
+    ///
+    /// [table."public.foo"]
+    /// target = "default.foo"
+    /// columns = [
+    ///   { attnum = 1, target = "id",   type = "UInt64" },
+    ///   { attnum = 2, target = "name", type = "Nullable(String)" },
+    /// ]
+    /// ```
+    pub fn from_toml_str(s: &str) -> Result<Self, EmitterError> {
+        use toml::Value;
+        let root: Value = s
+            .parse()
+            .map_err(|e: toml::de::Error| EmitterError::Config(format!("toml: {e}")))?;
+        let mut out = Self::default();
+        if let Some(ch) = root.get("ch").and_then(Value::as_table) {
+            if let Some(v) = ch.get("host").and_then(Value::as_str) {
+                out.host = v.into();
+            }
+            if let Some(v) = ch.get("port").and_then(Value::as_integer) {
+                out.port = u16::try_from(v).map_err(|_| {
+                    EmitterError::Config(format!("port {v} out of u16 range"))
+                })?;
+            }
+            if let Some(v) = ch.get("database").and_then(Value::as_str) {
+                out.database = v.into();
+            }
+            if let Some(v) = ch.get("user").and_then(Value::as_str) {
+                out.user = v.into();
+            }
+            if let Some(v) = ch.get("password").and_then(Value::as_str) {
+                out.password = v.into();
+            }
+            if let Some(v) = ch.get("compression").and_then(Value::as_str) {
+                out.compression = CompressionChoice::parse(v)?;
+            }
+            if let Some(v) = ch.get("row_budget").and_then(Value::as_integer) {
+                out.row_budget = usize::try_from(v).unwrap_or(DEFAULT_ROW_BUDGET);
+            }
+            if let Some(v) = ch.get("byte_budget").and_then(Value::as_integer) {
+                out.byte_budget = usize::try_from(v).unwrap_or(DEFAULT_BYTE_BUDGET);
+            }
+        }
+        if let Some(tbls) = root.get("table").and_then(Value::as_table) {
+            for (k, v) in tbls {
+                let t = v.as_table().ok_or_else(|| {
+                    EmitterError::Config(format!("table.{k}: expected a table"))
+                })?;
+                let target = t
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| EmitterError::Config(format!("table.{k}: missing target")))?
+                    .to_string();
+                let cols_v = t.get("columns").and_then(Value::as_array).ok_or_else(|| {
+                    EmitterError::Config(format!("table.{k}: missing columns array"))
+                })?;
+                let mut columns = Vec::with_capacity(cols_v.len());
+                for (i, c) in cols_v.iter().enumerate() {
+                    let ct = c.as_table().ok_or_else(|| {
+                        EmitterError::Config(format!("table.{k}.columns[{i}]: expected a table"))
+                    })?;
+                    let src_attnum = ct
+                        .get("attnum")
+                        .and_then(Value::as_integer)
+                        .ok_or_else(|| {
+                            EmitterError::Config(format!(
+                                "table.{k}.columns[{i}]: missing attnum"
+                            ))
+                        })?;
+                    let target_name = ct
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            EmitterError::Config(format!(
+                                "table.{k}.columns[{i}]: missing target"
+                            ))
+                        })?
+                        .to_string();
+                    let target_type = ct
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            EmitterError::Config(format!("table.{k}.columns[{i}]: missing type"))
+                        })?
+                        .to_string();
+                    columns.push(ColumnMapping {
+                        src_attnum: i16::try_from(src_attnum).map_err(|_| {
+                            EmitterError::Config(format!(
+                                "table.{k}.columns[{i}].attnum {src_attnum} out of i16 range"
+                            ))
+                        })?,
+                        target_name,
+                        target_type,
+                    });
+                }
+                out.tables.insert(k.clone(), TableMapping { target, columns });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Top-level construction: connect, build codec, return ready
+    /// [`Emitter`]. Requires a connected `TcpStream` from the caller
+    /// (Phase 7 plumbing); the caller hands the fd over to the emitter,
+    /// which owns it for the lifetime of the connection.
+    pub fn connect(
+        self,
+        catalog: Arc<Mutex<ShadowCatalog>>,
+        tcp: std::net::TcpStream,
+    ) -> Result<Emitter, EmitterError> {
+        Emitter::new(self, catalog, tcp)
+    }
+}
+
+/// Cached plan for one destination table. Built lazily the first time
+/// a tuple lands for the relation; stored in [`Emitter::tables`]
+/// keyed by source `(namespace.relname)`.
+pub struct TablePlan {
+    pub target: String,
+    pub columns: Vec<ColumnPlan>,
+    pub synth_lsn: ColumnPlan,
+    pub synth_xid: ColumnPlan,
+    pub synth_op: ColumnPlan,
+    pub synth_commit_ts: ColumnPlan,
+    /// `INSERT INTO ... (...) VALUES`. Pre-formatted so on-tuple paths
+    /// don't reassemble the string per row.
+    pub insert_sql: String,
+}
+
+pub struct ColumnPlan {
+    pub name: String,
+    /// CH type expression, eg. "Nullable(String)" / "UInt64".
+    pub type_repr: String,
+    pub ast: TypeAst,
+}
+
+impl TablePlan {
+    /// Build from a relation descriptor + mapping. Synthetic columns
+    /// are always non-nullable (the emitter always populates them).
+    fn build(
+        alloc: Allocator,
+        rel: &RelDescriptor,
+        mapping: &TableMapping,
+    ) -> Result<Self, EmitterError> {
+        let attmap: HashMap<i16, &crate::shadow_catalog::RelAttr> =
+            rel.attributes.iter().map(|a| (a.attnum, a)).collect();
+        let mut columns = Vec::with_capacity(mapping.columns.len());
+        let mut col_sql = Vec::with_capacity(mapping.columns.len() + 4);
+        for c in &mapping.columns {
+            if !attmap.contains_key(&c.src_attnum) {
+                return Err(EmitterError::Config(format!(
+                    "table {}: source attnum {} not in catalog descriptor",
+                    mapping.target, c.src_attnum
+                )));
+            }
+            let ast = TypeAst::parse(&c.target_type, alloc).map_err(|e| {
+                EmitterError::Type(format!("{}: {e}", c.target_type))
+            })?;
+            columns.push(ColumnPlan {
+                name: c.target_name.clone(),
+                type_repr: c.target_type.clone(),
+                ast,
+            });
+            col_sql.push(quote_ident(&c.target_name));
+        }
+        let mk = |name: &str, ty: &str| -> Result<ColumnPlan, EmitterError> {
+            Ok(ColumnPlan {
+                name: name.into(),
+                type_repr: ty.into(),
+                ast: TypeAst::parse(ty, alloc)
+                    .map_err(|e| EmitterError::Type(format!("{ty}: {e}")))?,
+            })
+        };
+        let synth_lsn = mk("_lsn", "UInt64")?;
+        let synth_xid = mk("_xid", "UInt32")?;
+        let synth_op = mk("_op", "Enum8('insert' = 1, 'update' = 2, 'delete' = 3)")?;
+        let synth_commit_ts = mk("_commit_ts", "DateTime64(6, 'UTC')")?;
+        col_sql.push(quote_ident(&synth_lsn.name));
+        col_sql.push(quote_ident(&synth_xid.name));
+        col_sql.push(quote_ident(&synth_op.name));
+        col_sql.push(quote_ident(&synth_commit_ts.name));
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) FORMAT Native",
+            mapping.target,
+            col_sql.join(", "),
+        );
+        Ok(Self {
+            target: mapping.target.clone(),
+            columns,
+            synth_lsn,
+            synth_xid,
+            synth_op,
+            synth_commit_ts,
+            insert_sql,
+        })
+    }
+}
+
+fn quote_ident(name: &str) -> String {
+    // CH backtick quoting (mirrors `quoteIdentIfNeed` in the upstream
+    // client). Backticks inside identifiers escape via doubling.
+    let mut s = String::with_capacity(name.len() + 2);
+    s.push('`');
+    for c in name.chars() {
+        if c == '`' {
+            s.push('`');
+        }
+        s.push(c);
+    }
+    s.push('`');
+    s
+}
+
+/// Per-table per-xact accumulator. One block buffer per CH column;
+/// flushed at xact end (or budget trip in a future pass). Buffers reset
+/// after `flush` so the encoder reuses allocations.
+pub struct TableEncoder {
+    pub plan: TablePlan,
+    pub rows: usize,
+    pub approx_bytes: usize,
+    /// Mirrors `plan.columns + 4 synth`.
+    pub buffers: Vec<ColumnBuf>,
+}
+
+/// On-the-wire-shape column buffer. Owned data lives here; the
+/// [`BlockBuilder`] borrows slices at flush time and the buffers are
+/// cleared after `send_data`.
+pub enum ColumnBuf {
+    /// `Type` like UInt32 — `width` bytes per row, packed little-endian.
+    Fixed { width: usize, bytes: Vec<u8> },
+    /// `String` / `Bytea`. `offsets[i]` is the cumulative exclusive end
+    /// of row `i` in `data`.
+    String { offsets: Vec<u64>, data: Vec<u8> },
+    /// `Nullable(Fixed)`. `null_map[i] = 1` means NULL; default value
+    /// (zero bytes) goes into `inner` for null rows so the slab stays
+    /// dense.
+    NullableFixed {
+        width: usize,
+        null_map: Vec<u8>,
+        inner: Vec<u8>,
+    },
+    /// `Nullable(String)`.
+    NullableString {
+        offsets: Vec<u64>,
+        data: Vec<u8>,
+        null_map: Vec<u8>,
+    },
+}
+
+impl ColumnBuf {
+    /// Build the right shape from a parsed [`TypeAst`]. Width comes
+    /// from clickhouse-c's `chc_type_elem_size` so FixedString(N),
+    /// DateTime64, Decimal*, Enum, etc. resolve correctly without
+    /// walshadow having to mirror the type-string surface. `elem_size
+    /// == 0` means a varlen on-wire shape (String / Bytea / Array / …);
+    /// the only varlen the emitter handles today is `String`, anything
+    /// else falls through to the [`String`] / [`NullableString`] arm
+    /// and dies cleanly on the first `append` mismatch.
+    fn new_for_ast(ast: &TypeAst) -> Result<Self, EmitterError> {
+        let view = ast.view();
+        let (nullable, inner) = if view.kind() == Some(Kind::Nullable) {
+            (
+                true,
+                view.child(0).ok_or_else(|| {
+                    EmitterError::Type("Nullable type with no child".into())
+                })?,
+            )
+        } else {
+            (false, view)
+        };
+        let elem = inner.elem_size();
+        Ok(match (nullable, elem) {
+            (false, 0) => Self::String {
+                offsets: Vec::new(),
+                data: Vec::new(),
+            },
+            (true, 0) => Self::NullableString {
+                offsets: Vec::new(),
+                data: Vec::new(),
+                null_map: Vec::new(),
+            },
+            (false, w) => Self::Fixed {
+                width: w,
+                bytes: Vec::new(),
+            },
+            (true, w) => Self::NullableFixed {
+                width: w,
+                null_map: Vec::new(),
+                inner: Vec::new(),
+            },
+        })
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Fixed { bytes, .. } => bytes.clear(),
+            Self::String { offsets, data } => {
+                offsets.clear();
+                data.clear();
+            }
+            Self::NullableFixed {
+                null_map, inner, ..
+            } => {
+                null_map.clear();
+                inner.clear();
+            }
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+            } => {
+                offsets.clear();
+                data.clear();
+                null_map.clear();
+            }
+        }
+    }
+
+    fn approx_size(&self) -> usize {
+        match self {
+            Self::Fixed { bytes, .. } => bytes.len(),
+            Self::String { offsets, data } => offsets.len() * 8 + data.len(),
+            Self::NullableFixed {
+                null_map, inner, ..
+            } => null_map.len() + inner.len(),
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+            } => offsets.len() * 8 + data.len() + null_map.len(),
+        }
+    }
+
+    /// Append one row. Caller decides whether the value is NULL.
+    fn append_null(&mut self) -> Result<(), EmitterError> {
+        match self {
+            Self::NullableFixed {
+                width,
+                null_map,
+                inner,
+            } => {
+                null_map.push(1);
+                inner.extend(std::iter::repeat_n(0u8, *width));
+                Ok(())
+            }
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+            } => {
+                null_map.push(1);
+                offsets.push(data.len() as u64);
+                Ok(())
+            }
+            _ => Err(EmitterError::UnsupportedValue {
+                target_column: String::new(),
+                kind: "NULL for non-Nullable column",
+            }),
+        }
+    }
+
+    fn append_fixed_bytes(&mut self, le: &[u8]) -> Result<(), EmitterError> {
+        match self {
+            Self::Fixed { width, bytes } => {
+                if le.len() != *width {
+                    return Err(EmitterError::Type(format!(
+                        "fixed-width mismatch: expected {} bytes, got {}",
+                        *width,
+                        le.len()
+                    )));
+                }
+                bytes.extend_from_slice(le);
+                Ok(())
+            }
+            Self::NullableFixed {
+                width,
+                null_map,
+                inner,
+            } => {
+                if le.len() != *width {
+                    return Err(EmitterError::Type(format!(
+                        "nullable-fixed-width mismatch: expected {} bytes, got {}",
+                        *width,
+                        le.len()
+                    )));
+                }
+                null_map.push(0);
+                inner.extend_from_slice(le);
+                Ok(())
+            }
+            _ => Err(EmitterError::UnsupportedValue {
+                target_column: String::new(),
+                kind: "fixed-width value into string-shaped buffer",
+            }),
+        }
+    }
+
+    fn append_string_bytes(&mut self, raw: &[u8]) -> Result<(), EmitterError> {
+        match self {
+            Self::String { offsets, data } => {
+                data.extend_from_slice(raw);
+                offsets.push(data.len() as u64);
+                Ok(())
+            }
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+            } => {
+                null_map.push(0);
+                data.extend_from_slice(raw);
+                offsets.push(data.len() as u64);
+                Ok(())
+            }
+            _ => Err(EmitterError::UnsupportedValue {
+                target_column: String::new(),
+                kind: "string value into fixed-shaped buffer",
+            }),
+        }
+    }
+}
+
+impl TableEncoder {
+    fn new(plan: TablePlan) -> Result<Self, EmitterError> {
+        let mut buffers = Vec::with_capacity(plan.columns.len() + 4);
+        for c in &plan.columns {
+            buffers.push(ColumnBuf::new_for_ast(&c.ast)?);
+        }
+        // Synthetic columns are non-nullable by construction.
+        buffers.push(ColumnBuf::Fixed {
+            width: 8,
+            bytes: Vec::new(),
+        }); // _lsn UInt64
+        buffers.push(ColumnBuf::Fixed {
+            width: 4,
+            bytes: Vec::new(),
+        }); // _xid UInt32
+        buffers.push(ColumnBuf::Fixed {
+            width: 1,
+            bytes: Vec::new(),
+        }); // _op Enum8
+        buffers.push(ColumnBuf::Fixed {
+            width: 8,
+            bytes: Vec::new(),
+        }); // _commit_ts DateTime64(6)
+        Ok(Self {
+            plan,
+            rows: 0,
+            approx_bytes: 0,
+            buffers,
+        })
+    }
+
+    fn clear(&mut self) {
+        for b in &mut self.buffers {
+            b.clear();
+        }
+        self.rows = 0;
+        self.approx_bytes = 0;
+    }
+
+    /// Append one committed tuple's `new` image (or `old` image for
+    /// DELETE / UPDATE old-key). Caller picks the source side and the
+    /// `_op` code.
+    pub fn append_row(
+        &mut self,
+        committed: &CommittedTuple,
+        mapping: &TableMapping,
+        op_code: i8,
+    ) -> Result<(), EmitterError> {
+        let decoded = &committed.decoded;
+        let side = match decoded.op {
+            HeapOp::Delete => decoded.old.as_ref(),
+            _ => decoded.new.as_ref(),
+        };
+        for (i, col) in mapping.columns.iter().enumerate() {
+            let buf = &mut self.buffers[i];
+            let raw_value = side
+                .and_then(|t| t.columns.get((col.src_attnum - 1) as usize))
+                .and_then(|opt| opt.as_ref());
+            match raw_value {
+                None | Some(ColumnValue::Null) => buf.append_null().map_err(|mut e| {
+                    if let EmitterError::UnsupportedValue {
+                        ref mut target_column,
+                        ..
+                    } = e
+                    {
+                        *target_column = col.target_name.clone();
+                    }
+                    e
+                })?,
+                Some(v) => encode_value(buf, v).map_err(|mut e| {
+                    if let EmitterError::UnsupportedValue {
+                        ref mut target_column,
+                        ..
+                    } = e
+                    {
+                        *target_column = col.target_name.clone();
+                    }
+                    e
+                })?,
+            }
+        }
+        // Synthetic columns: lsn (UInt64), xid (UInt32), op (Enum8),
+        // commit_ts (DateTime64(6, UTC) = unix microseconds).
+        let off = mapping.columns.len();
+        push_fixed(&mut self.buffers[off], &decoded.source_lsn.to_le_bytes())?;
+        push_fixed(&mut self.buffers[off + 1], &decoded.xid.to_le_bytes())?;
+        push_fixed(&mut self.buffers[off + 2], &op_code.to_le_bytes())?;
+        let unix_us = committed
+            .commit_ts
+            .saturating_add(DATETIME64_PG_EPOCH_US);
+        push_fixed(&mut self.buffers[off + 3], &unix_us.to_le_bytes())?;
+        self.rows += 1;
+        self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
+        Ok(())
+    }
+
+    /// Build a [`BlockBuilder`] over the accumulated buffers and send
+    /// it through `client.send_data`. Returns the row count just sent.
+    fn flush_block(
+        &mut self,
+        client: &mut Client,
+        alloc: Allocator,
+        opts: BlockOpts,
+    ) -> Result<usize, EmitterError> {
+        if self.rows == 0 {
+            return Ok(0);
+        }
+        let mut bb = BlockBuilder::new(alloc)?;
+        let n_rows = self.rows;
+        // Mapped columns
+        for (i, plan) in self.plan.columns.iter().enumerate() {
+            append_buf(&mut bb, &plan.name, &plan.ast, &self.buffers[i], n_rows)?;
+        }
+        let off = self.plan.columns.len();
+        append_buf(
+            &mut bb,
+            &self.plan.synth_lsn.name,
+            &self.plan.synth_lsn.ast,
+            &self.buffers[off],
+            n_rows,
+        )?;
+        append_buf(
+            &mut bb,
+            &self.plan.synth_xid.name,
+            &self.plan.synth_xid.ast,
+            &self.buffers[off + 1],
+            n_rows,
+        )?;
+        append_buf(
+            &mut bb,
+            &self.plan.synth_op.name,
+            &self.plan.synth_op.ast,
+            &self.buffers[off + 2],
+            n_rows,
+        )?;
+        append_buf(
+            &mut bb,
+            &self.plan.synth_commit_ts.name,
+            &self.plan.synth_commit_ts.ast,
+            &self.buffers[off + 3],
+            n_rows,
+        )?;
+        client.send_data(Some(&bb))?;
+        drop(bb);
+        // Caller is responsible for `opts`; `BlockBuilder::write` is
+        // not called because we go through the TCP packet loop.
+        let _ = opts;
+        self.clear();
+        Ok(n_rows)
+    }
+}
+
+fn append_buf<'a>(
+    bb: &mut BlockBuilder<'a>,
+    name: &str,
+    ast: &'a TypeAst,
+    buf: &'a ColumnBuf,
+    n_rows: usize,
+) -> Result<(), EmitterError> {
+    // SAFETY: the BlockBuilder retains pointers into the slabs we pass
+    // here until `send_data` returns. The buffers live in
+    // `TableEncoder.buffers` and are not mutated until `clear()` runs
+    // after this function returns.
+    match buf {
+        ColumnBuf::Fixed { bytes, .. } => {
+            bb.append_fixed(name, ast.view(), bytes, n_rows)?;
+        }
+        ColumnBuf::String { offsets, data } => {
+            bb.append_string(name, offsets, data, n_rows)?;
+        }
+        ColumnBuf::NullableFixed {
+            null_map, inner, ..
+        } => {
+            bb.append_nullable_fixed(name, ast.view(), null_map, inner, n_rows)?;
+        }
+        ColumnBuf::NullableString {
+            offsets,
+            data,
+            null_map,
+        } => {
+            bb.append_nullable_string(name, ast.view(), null_map, offsets, data, n_rows)?;
+        }
+    }
+    Ok(())
+}
+
+fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
+    buf.append_fixed_bytes(le)
+}
+
+fn encode_value(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> {
+    match v {
+        ColumnValue::Null => buf.append_null(),
+        ColumnValue::Bool(b) => buf.append_fixed_bytes(&[*b as u8]),
+        ColumnValue::Char(c) => buf.append_fixed_bytes(&c.to_le_bytes()),
+        ColumnValue::Int2(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ColumnValue::Int4(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ColumnValue::Int8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ColumnValue::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
+        ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
+        ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ColumnValue::Date(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ColumnValue::Time(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ColumnValue::Timestamp(n) | ColumnValue::TimestampTz(n) => {
+            // PG epoch → Unix epoch, microseconds. CH `DateTime64(6)` is
+            // unix-epoch microseconds.
+            let unix_us = n.saturating_add(DATETIME64_PG_EPOCH_US);
+            buf.append_fixed_bytes(&unix_us.to_le_bytes())
+        }
+        ColumnValue::TimeTz { micros, .. } => buf.append_fixed_bytes(&micros.to_le_bytes()),
+        ColumnValue::Uuid(b) => buf.append_fixed_bytes(b),
+        ColumnValue::Name(s) | ColumnValue::Text(s) => buf.append_string_bytes(s.as_bytes()),
+        ColumnValue::Bytea(b) => buf.append_string_bytes(b),
+        ColumnValue::ExternalToast(_) => Err(EmitterError::UnsupportedValue {
+            target_column: String::new(),
+            kind: "unresolved TOAST pointer (xact buffer should have reassembled)",
+        }),
+        ColumnValue::Unsupported { .. } => Err(EmitterError::UnsupportedValue {
+            target_column: String::new(),
+            kind: "unsupported PG type oid",
+        }),
+    }
+}
+
+/// Phase 7 CH-Native emitter. Holds one [`Client`] over a connected
+/// TCP socket per CH replica plus the per-table accumulator state.
+///
+/// Drop order: `client` first (final state-sync), then `codec`, then
+/// `io`. Rust drops fields in declaration order — keep the order below
+/// intact; reordering would invalidate the back-pointer C holds into
+/// `io.state` from inside `client`.
+pub struct Emitter {
+    client: Client,
+    #[allow(dead_code)]
+    codec: Option<Pin<Box<Codec>>>,
+    #[allow(dead_code)]
+    io: Pin<Box<PosixIo>>,
+    alloc: Allocator,
+    config: EmitterConfig,
+    catalog: Arc<Mutex<ShadowCatalog>>,
+    tables: HashMap<String, TableEncoder>,
+    /// xid currently held in `tables`. Reset on `on_xact_end`.
+    current_xid: Option<u32>,
+    pub stats: EmitterStats,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct EmitterStats {
+    pub rows_emitted: u64,
+    pub blocks_sent: u64,
+    pub xacts_committed: u64,
+    pub unsupported_relations: u64,
+    pub unsupported_values: u64,
+}
+
+impl Emitter {
+    pub fn new(
+        config: EmitterConfig,
+        catalog: Arc<Mutex<ShadowCatalog>>,
+        tcp: std::net::TcpStream,
+    ) -> Result<Self, EmitterError> {
+        let alloc = Allocator::stdlib();
+        let codec = config.compression.build_codec()?;
+        let fd = tcp.into_raw_fd();
+        let mut io = PosixIo::new(fd);
+        let mut opts = ClientOpts::new()
+            .database(&config.database)
+            .user(&config.user)
+            .password(&config.password);
+        opts.compression = config.compression.to_wire();
+        let codec_ref = codec.as_ref().map(|c| c.as_ref());
+        let client = Client::init(&opts, alloc, io.as_mut(), codec_ref)?;
+        Ok(Self {
+            client,
+            codec,
+            io,
+            alloc,
+            config,
+            catalog,
+            tables: HashMap::new(),
+            current_xid: None,
+            stats: EmitterStats::default(),
+        })
+    }
+
+    /// Route one committed tuple. INSERT/UPDATE land via the `new`
+    /// image; DELETE pulls from `old`. HOT_UPDATE is treated as UPDATE
+    /// downstream (op-code 2) — CH's `ReplacingMergeTree` cares about
+    /// `_lsn` ordering, not the PG-internal HOT distinction.
+    async fn route(&mut self, committed: &CommittedTuple) -> Result<(), EmitterError> {
+        if self.current_xid.is_none() {
+            self.current_xid = Some(committed.decoded.xid);
+        }
+        let rel = {
+            let mut cat = self.catalog.lock().await;
+            cat.relation_at(committed.decoded.rfn, committed.decoded.source_lsn)
+                .await?
+        };
+        let key = format!("{}.{}", rel.namespace_name, rel.name);
+        let Some(mapping) = self.config.tables.get(&key).cloned() else {
+            self.stats.unsupported_relations += 1;
+            return Ok(());
+        };
+        // Initialize per-table encoder lazily on first row.
+        let alloc = self.alloc;
+        let enc = if let Some(enc) = self.tables.get_mut(&key) {
+            enc
+        } else {
+            let plan = TablePlan::build(alloc, &rel, &mapping)?;
+            // First row for this (table, xact): issue the INSERT.
+            self.client.send_query(&plan.insert_sql, None)?;
+            let enc = TableEncoder::new(plan)?;
+            self.tables.insert(key.clone(), enc);
+            self.tables.get_mut(&key).expect("just inserted")
+        };
+        let op = match committed.decoded.op {
+            HeapOp::Insert => OP_INSERT,
+            HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
+            HeapOp::Delete => OP_DELETE,
+        };
+        if let Err(e) = enc.append_row(committed, &mapping, op) {
+            self.stats.unsupported_values += 1;
+            return Err(e);
+        }
+        // Budget check kept simple in v1: flush + close after xact end.
+        if enc.rows >= self.config.row_budget || enc.approx_bytes >= self.config.byte_budget {
+            self.flush_table(&key)?;
+        }
+        Ok(())
+    }
+
+    fn flush_table(&mut self, key: &str) -> Result<(), EmitterError> {
+        let alloc = self.alloc;
+        let enc = self
+            .tables
+            .get_mut(key)
+            .expect("flush_table called on unknown key");
+        let n = enc.flush_block(&mut self.client, alloc, BlockOpts::default())?;
+        if n > 0 {
+            self.stats.rows_emitted += n as u64;
+            self.stats.blocks_sent += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_table(&mut self, key: &str) -> Result<(), EmitterError> {
+        let alloc = self.alloc;
+        {
+            let enc = self
+                .tables
+                .get_mut(key)
+                .expect("finish_table called on unknown key");
+            let n = enc.flush_block(&mut self.client, alloc, BlockOpts::default())?;
+            if n > 0 {
+                self.stats.rows_emitted += n as u64;
+                self.stats.blocks_sent += 1;
+            }
+        }
+        // Close the INSERT for this table.
+        self.client.send_data(None)?;
+        loop {
+            let mut pkt = self.client.recv_packet()?;
+            match pkt.kind() {
+                Some(PacketKind::EndOfStream) => break,
+                Some(PacketKind::Exception) => {
+                    if let Some(exc) = pkt.take_exception() {
+                        return Err(EmitterError::ServerException {
+                            code: exc.code(),
+                            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
+                        });
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain every per-table encoder. Called by [`Self::on_xact_end`]
+    /// and pulled out so error-paths can `?` cleanly.
+    fn drain_xact(&mut self) -> Result<(), EmitterError> {
+        let keys: Vec<String> = self.tables.keys().cloned().collect();
+        for k in &keys {
+            self.finish_table(k)?;
+        }
+        self.tables.clear();
+        self.current_xid = None;
+        self.stats.xacts_committed += 1;
+        Ok(())
+    }
+}
+
+/// Plug Emitter into the [`TupleObserver`] dispatch path. Owned by
+/// `XactRecordSink<EmitterObserver>` in `bin/stream.rs`.
+pub struct EmitterObserver {
+    pub emitter: Emitter,
+}
+
+impl EmitterObserver {
+    pub fn new(emitter: Emitter) -> Self {
+        Self { emitter }
+    }
+}
+
+impl TupleObserver for EmitterObserver {
+    fn on_tuple<'a>(
+        &'a mut self,
+        committed: &'a CommittedTuple,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.emitter
+                .route(committed)
+                .await
+                .map_err(DecoderSinkError::from)
+        })
+    }
+
+    fn on_xact_end<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.emitter.drain_xact().map_err(DecoderSinkError::from)
+        })
+    }
+}
+
+// `ColumnBuf` Debug — used by error paths that want to surface what
+// shape the buffer is. Manual impl because deriving would render the
+// whole slab through `Vec<u8>` rather than reporting just lengths.
+impl std::fmt::Debug for ColumnBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed { width, bytes } => f
+                .debug_struct("Fixed")
+                .field("width", width)
+                .field("bytes_len", &bytes.len())
+                .finish(),
+            Self::String { offsets, data } => f
+                .debug_struct("String")
+                .field("rows", &offsets.len())
+                .field("data_len", &data.len())
+                .finish(),
+            Self::NullableFixed {
+                width,
+                null_map,
+                inner,
+            } => f
+                .debug_struct("NullableFixed")
+                .field("width", width)
+                .field("rows", &null_map.len())
+                .field("inner_len", &inner.len())
+                .finish(),
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+            } => f
+                .debug_struct("NullableString")
+                .field("rows", &null_map.len())
+                .field("offsets_len", &offsets.len())
+                .field("data_len", &data.len())
+                .finish(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heap_decoder::{DecodedHeap, DecodedTuple};
+    use wal_rs::pg::walparser::RelFileNode;
+
+    fn mk_mapping() -> TableMapping {
+        TableMapping {
+            target: "default.foo".into(),
+            columns: vec![
+                ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: "Int32".into(),
+                },
+                ColumnMapping {
+                    src_attnum: 2,
+                    target_name: "name".into(),
+                    target_type: "Nullable(String)".into(),
+                },
+            ],
+        }
+    }
+
+    fn mk_rel() -> RelDescriptor {
+        use crate::shadow_catalog::{RelAttr, ReplIdent};
+        use wal_rs::pg::walparser::RelFileNode;
+        RelDescriptor {
+            rfn: RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 16385,
+            },
+            oid: 16385,
+            namespace_oid: 2200,
+            namespace_name: "public".into(),
+            name: "foo".into(),
+            kind: 'r',
+            persistence: 'p',
+            replident: ReplIdent::Default { pk_attnums: None },
+            attributes: vec![
+                RelAttr {
+                    attnum: 1,
+                    name: "id".into(),
+                    type_oid: 23,
+                    typmod: -1,
+                    not_null: true,
+                    dropped: false,
+                    type_name: "int4".into(),
+                    type_byval: true,
+                    type_len: 4,
+                    type_align: 'i',
+                    type_storage: 'p',
+                },
+                RelAttr {
+                    attnum: 2,
+                    name: "name".into(),
+                    type_oid: 25,
+                    typmod: -1,
+                    not_null: false,
+                    dropped: false,
+                    type_name: "text".into(),
+                    type_byval: false,
+                    type_len: -1,
+                    type_align: 'i',
+                    type_storage: 'x',
+                },
+            ],
+        }
+    }
+
+    fn committed(id: i32, name: Option<&str>) -> CommittedTuple {
+        let name_col = match name {
+            None => Some(ColumnValue::Null),
+            Some(s) => Some(ColumnValue::Text(s.to_string())),
+        };
+        CommittedTuple {
+            decoded: DecodedHeap {
+                rfn: RelFileNode {
+                    spc_node: 1663,
+                    db_node: 5,
+                    rel_node: 16385,
+                },
+                xid: 42,
+                source_lsn: 0xCAFE,
+                op: HeapOp::Insert,
+                new: Some(DecodedTuple {
+                    columns: vec![Some(ColumnValue::Int4(id)), name_col],
+                    partial: false,
+                }),
+                old: None,
+            },
+            commit_ts: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn compression_choice_parses_case_insensitively() {
+        assert_eq!(CompressionChoice::parse("LZ4").unwrap(), CompressionChoice::Lz4);
+        assert_eq!(CompressionChoice::parse("Zstd").unwrap(), CompressionChoice::Zstd);
+        assert_eq!(CompressionChoice::parse("none").unwrap(), CompressionChoice::None);
+        assert_eq!(CompressionChoice::parse("").unwrap(), CompressionChoice::None);
+        CompressionChoice::parse("snappy").expect_err("unknown codec");
+    }
+
+    /// Each `CompressionChoice::build_codec` arm goes through the
+    /// matching feature gate. Build the variants on the current feature
+    /// matrix & confirm a successful codec emerges (or a clean error).
+    #[test]
+    fn compression_choice_build_codec_respects_features() {
+        let none = CompressionChoice::None.build_codec().unwrap();
+        assert!(none.is_none());
+        let lz4 = CompressionChoice::Lz4.build_codec();
+        #[cfg(feature = "lz4")]
+        {
+            assert!(lz4.unwrap().is_some());
+        }
+        #[cfg(not(feature = "lz4"))]
+        {
+            assert!(matches!(
+                lz4,
+                Err(EmitterError::CompressionUnsupported("lz4"))
+            ));
+        }
+        let zstd = CompressionChoice::Zstd.build_codec();
+        #[cfg(feature = "zstd")]
+        {
+            assert!(zstd.unwrap().is_some());
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            assert!(matches!(
+                zstd,
+                Err(EmitterError::CompressionUnsupported("zstd"))
+            ));
+        }
+    }
+
+    /// Reach into chc_type_elem_size for the Phase 7 width matrix
+    /// instead of mirroring it in walshadow. Confirms the upstream
+    /// elem_size return values match what the encoder needs for
+    /// fixed-shape ColumnBufs.
+    #[test]
+    fn elem_size_covers_phase7_tier1() {
+        let alloc = Allocator::stdlib();
+        let cases = [
+            ("UInt8", 1usize),
+            ("Int32", 4),
+            ("UInt64", 8),
+            ("Float64", 8),
+            ("DateTime64(6, 'UTC')", 8),
+            ("Decimal32(4)", 4),
+            ("FixedString(16)", 16),
+        ];
+        for (name, expected) in cases {
+            let ast = TypeAst::parse(name, alloc).expect("parses");
+            assert_eq!(ast.view().elem_size(), expected, "{name}");
+        }
+        // Varlen + composite types report 0; the encoder reads that
+        // as "varlen on-wire shape".
+        for name in ["String", "Array(UInt32)"] {
+            let ast = TypeAst::parse(name, alloc).expect("parses");
+            assert_eq!(ast.view().elem_size(), 0, "{name}");
+        }
+    }
+
+    /// Nullable wraps in CH wire types live at the type AST layer;
+    /// `new_for_ast` peels them via `Kind::Nullable` + `child(0)` and
+    /// picks the right buffer shape from the inner's `elem_size`.
+    #[test]
+    fn new_for_ast_picks_shape_from_chc_type_kind() {
+        let alloc = Allocator::stdlib();
+        let cases = [
+            ("Int32", "Fixed"),
+            ("String", "String"),
+            ("Nullable(Int64)", "NullableFixed"),
+            ("Nullable(String)", "NullableString"),
+            ("FixedString(7)", "Fixed"),
+            ("Nullable(FixedString(7))", "NullableFixed"),
+        ];
+        for (name, tag) in cases {
+            let ast = TypeAst::parse(name, alloc).expect("parses");
+            let buf = ColumnBuf::new_for_ast(&ast).expect("shape");
+            let actual = match buf {
+                ColumnBuf::Fixed { .. } => "Fixed",
+                ColumnBuf::String { .. } => "String",
+                ColumnBuf::NullableFixed { .. } => "NullableFixed",
+                ColumnBuf::NullableString { .. } => "NullableString",
+            };
+            assert_eq!(actual, tag, "{name}");
+        }
+    }
+
+    #[test]
+    fn quote_ident_escapes_backticks() {
+        assert_eq!(quote_ident("foo"), "`foo`");
+        assert_eq!(quote_ident("a`b"), "`a``b`");
+    }
+
+    #[test]
+    fn table_plan_builds_insert_with_synthetic_columns() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let m = mk_mapping();
+        let plan = TablePlan::build(alloc, &rel, &m).expect("plan builds");
+        assert!(plan.insert_sql.contains("INSERT INTO default.foo"));
+        assert!(plan.insert_sql.contains("`id`"));
+        assert!(plan.insert_sql.contains("`name`"));
+        assert!(plan.insert_sql.contains("`_lsn`"));
+        assert!(plan.insert_sql.contains("`_xid`"));
+        assert!(plan.insert_sql.contains("`_op`"));
+        assert!(plan.insert_sql.contains("`_commit_ts`"));
+        assert!(plan.insert_sql.ends_with(") FORMAT Native"));
+    }
+
+    #[test]
+    fn encoder_accumulates_into_typed_buffers() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let m = mk_mapping();
+        let plan = TablePlan::build(alloc, &rel, &m).unwrap();
+        let mut enc = TableEncoder::new(plan).unwrap();
+        enc.append_row(&committed(7, Some("seven")), &m, OP_INSERT).unwrap();
+        enc.append_row(&committed(8, None), &m, OP_INSERT).unwrap();
+        enc.append_row(&committed(9, Some("nine")), &m, OP_INSERT).unwrap();
+        assert_eq!(enc.rows, 3);
+        // Column 0 (Int32, non-null): 4 bytes * 3 rows = 12 bytes.
+        match &enc.buffers[0] {
+            ColumnBuf::Fixed { bytes, width } => {
+                assert_eq!(*width, 4);
+                assert_eq!(bytes.len(), 12);
+                assert_eq!(&bytes[0..4], &7i32.to_le_bytes());
+                assert_eq!(&bytes[4..8], &8i32.to_le_bytes());
+                assert_eq!(&bytes[8..12], &9i32.to_le_bytes());
+            }
+            other => panic!("col 0 expected Fixed, got {other:?} variant tag"),
+        }
+        // Column 1 (Nullable(String)): null_map [0,1,0], offsets [5, 5, 9].
+        match &enc.buffers[1] {
+            ColumnBuf::NullableString {
+                offsets,
+                data,
+                null_map,
+            } => {
+                assert_eq!(null_map, &vec![0u8, 1, 0]);
+                assert_eq!(offsets, &vec![5u64, 5, 9]);
+                assert_eq!(&data[..], b"sevennine");
+            }
+            other => panic!("col 1 expected NullableString, got {other:?} variant tag"),
+        }
+        // Synthetic _lsn at index 2 (after the 2 mapped columns).
+        let off = m.columns.len();
+        match &enc.buffers[off] {
+            ColumnBuf::Fixed { bytes, .. } => {
+                assert_eq!(bytes.len(), 24);
+                assert_eq!(&bytes[0..8], &0xCAFEu64.to_le_bytes());
+            }
+            other => panic!("_lsn expected Fixed, got {other:?} variant tag"),
+        }
+        // _op = INSERT = 1.
+        match &enc.buffers[off + 2] {
+            ColumnBuf::Fixed { bytes, .. } => assert_eq!(bytes, &vec![1u8, 1, 1]),
+            _ => panic!("_op expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn config_parses_full_toml_round_trip() {
+        let src = r#"
+            [ch]
+            host = "ch.example.com"
+            port = 9000
+            database = "default"
+            user = "ingest"
+            password = "secret"
+            compression = "lz4"
+            row_budget = 1024
+            byte_budget = 4096
+
+            [table."public.foo"]
+            target = "default.foo"
+            columns = [
+              { attnum = 1, target = "id",   type = "UInt64" },
+              { attnum = 2, target = "name", type = "Nullable(String)" },
+            ]
+        "#;
+        let c = EmitterConfig::from_toml_str(src).expect("parses");
+        assert_eq!(c.host, "ch.example.com");
+        assert_eq!(c.port, 9000);
+        assert_eq!(c.user, "ingest");
+        assert_eq!(c.compression, CompressionChoice::Lz4);
+        assert_eq!(c.row_budget, 1024);
+        assert_eq!(c.byte_budget, 4096);
+        let t = c.tables.get("public.foo").expect("mapping present");
+        assert_eq!(t.target, "default.foo");
+        assert_eq!(t.columns.len(), 2);
+        assert_eq!(t.columns[0].src_attnum, 1);
+        assert_eq!(t.columns[1].target_type, "Nullable(String)");
+    }
+}
+

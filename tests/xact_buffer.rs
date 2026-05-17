@@ -20,7 +20,9 @@ use tokio::sync::Mutex;
 use wal_rs::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
 use walshadow::decoder_sink::{DecoderSinkError, TupleObserver};
 use walshadow::filter::Decision;
-use walshadow::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer};
+use walshadow::heap_decoder::{
+    ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
+};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
 use walshadow::spill::ToastChunk;
@@ -145,20 +147,20 @@ fn cfg(spill_dir: std::path::PathBuf, budget: usize) -> XactBufferConfig {
 
 #[derive(Default)]
 struct CollectObs {
-    seen: Vec<DecodedHeap>,
+    seen: Vec<CommittedTuple>,
 }
 
 impl TupleObserver for CollectObs {
     fn on_tuple<'a>(
         &'a mut self,
-        d: &'a DecodedHeap,
+        c: &'a CommittedTuple,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = std::result::Result<(), DecoderSinkError>> + Send + 'a,
         >,
     > {
         Box::pin(async move {
-            self.seen.push(d.clone());
+            self.seen.push(c.clone());
             Ok(())
         })
     }
@@ -217,8 +219,10 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
         .unwrap();
     b.commit(7, 12345, &cat, &mut obs).await.unwrap();
     assert_eq!(obs.seen.len(), 2);
-    assert_eq!(obs.seen[0].source_lsn, 100);
-    assert_eq!(obs.seen[1].source_lsn, 200);
+    assert_eq!(obs.seen[0].decoded.source_lsn, 100);
+    assert_eq!(obs.seen[1].decoded.source_lsn, 200);
+    assert_eq!(obs.seen[0].commit_ts, 12345);
+    assert_eq!(obs.seen[1].commit_ts, 12345);
     assert_eq!(b.stats().committed_xacts_total, 1);
 }
 
@@ -269,19 +273,12 @@ async fn commit_drains_spilled_then_in_memory_entries() {
     }
     b.commit(5, 0, &cat, &mut obs).await.unwrap();
     assert_eq!(obs.seen.len(), 5);
-    for (i, h) in obs.seen.iter().enumerate() {
+    for (i, c) in obs.seen.iter().enumerate() {
+        let lsn = c.decoded.source_lsn;
         if i < 3 {
-            assert!(
-                h.source_lsn < 200,
-                "entry {i} expected spilled (lsn<200), got {}",
-                h.source_lsn
-            );
+            assert!(lsn < 200, "entry {i} expected spilled (lsn<200), got {lsn}");
         } else {
-            assert!(
-                h.source_lsn >= 200,
-                "entry {i} expected in-memory (lsn≥200), got {}",
-                h.source_lsn
-            );
+            assert!(lsn >= 200, "entry {i} expected in-memory (lsn≥200), got {lsn}");
         }
     }
 }
@@ -329,7 +326,7 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     }
     b.commit(33, 12345, &cat, &mut obs).await.unwrap();
     assert_eq!(obs.seen.len(), 1);
-    let body_col = &obs.seen[0].new.as_ref().unwrap().columns[1];
+    let body_col = &obs.seen[0].decoded.new.as_ref().unwrap().columns[1];
     match body_col {
         Some(ColumnValue::Text(s)) => assert_eq!(s, "Hello, wor"),
         other => panic!("expected Text after detoast, got {other:?}"),
@@ -446,7 +443,8 @@ async fn xact_record_sink_routes_commit_and_abort() {
     let prepare = xact_record(0x10, 9, 0);
     sink.on_record(&prepare).await.unwrap();
     assert_eq!(sink.observer_mut().seen.len(), 1);
-    assert_eq!(sink.observer_mut().seen[0].xid, 7);
+    assert_eq!(sink.observer_mut().seen[0].decoded.xid, 7);
+    assert_eq!(sink.observer_mut().seen[0].commit_ts, 0x1234);
     let b = buf.lock().await;
     assert_eq!(b.stats().committed_xacts_total, 1);
     assert_eq!(b.stats().aborted_xacts_total, 1);
