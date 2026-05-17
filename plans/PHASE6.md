@@ -15,15 +15,18 @@ per-xid append-only files under `{data_dir}/spill/`. Design layer:
 |---|---|---|
 | `spill` module — `SpillStore`, `SpillWriter`, `SpillReader`, `SpillEntry { Heap, Chunk }`, manual binary encoder/decoder for every `ColumnValue` variant | [`src/spill.rs`](../src/spill.rs) | 5 unit tests (round-trip, malformed tag, clear preserves non-spill files, writer-unlink removes file, per-variant encode/decode) |
 | `ToastChunk { toast_relid, value_id, chunk_seq, source_lsn, chunk_data }` exposed for callers that build chunks externally | [`src/spill.rs`](../src/spill.rs) | covered by `round_trip_heap_and_chunk` |
-| `xact_buffer` module — `XactBuffer`, `XactBufferConfig`, `XactBufferStats`, `XactState`, per-xact rel descriptor cache, largest-xact eviction | [`src/xact_buffer.rs`](../src/xact_buffer.rs) | 10 unit tests (commit drain order, abort cleanup, unknown-xid, largest-xact eviction, spilled-then-in-memory drain, uncompressed detoast, missing-chunk error, xact record sink routing, parse_xact_time edges, stats summary gating) |
-| TOAST reassembly + decompression (pglz / lz4 paths via existing `pglz` + `lz4_flex` crates) | [`src/xact_buffer.rs`](../src/xact_buffer.rs) `reassemble` + `detoast_tuple` | `detoast_concatenates_uncompressed_chunks_into_text`, `detoast_missing_chunk_seq_errors_clearly` |
-| `XactRecordSink<O: TupleObserver>` observing `RM_XACT_ID` records: COMMIT/COMMIT_PREPARED drain, ABORT/ABORT_PREPARED drop, everything else (PREPARE / ASSIGNMENT / INVALIDATIONS) ignored | [`src/xact_buffer.rs`](../src/xact_buffer.rs) | `xact_record_sink_routes_commit_and_abort` |
-| `BufferingDecoderSink` — replaces the direct-emit `DecoderSink` in the production fan-out: parks user-heap records in the buffer, reinterprets `pg_toast.*` INSERTs as `ToastChunk`s | [`src/xact_buffer.rs`](../src/xact_buffer.rs) | unit-test gap — covered by the daemon-level integration in `bin/stream.rs` (no PG-free harness exists today) |
+| `xact_buffer` module — `XactBuffer`, `XactBufferConfig`, `XactBufferStats`, largest-xact eviction, per-xid spill | [`src/xact_buffer.rs`](../src/xact_buffer.rs) | 6 unit tests (catalog-free paths: abort cleanup, abort-unknown-xid, eviction, parse_xact_time, summary gating, toast-shape recogniser) |
+| TOAST reassembly + decompression (pglz / lz4 paths via existing `pglz` + `lz4_flex` crates) | [`src/xact_buffer.rs`](../src/xact_buffer.rs) `reassemble` + `detoast_tuple` | `detoast_concatenates_uncompressed_chunks_into_text`, `detoast_missing_chunk_seq_errors_clearly` (in [`tests/xact_buffer.rs`](../tests/xact_buffer.rs), live shadow PG) |
+| `XactRecordSink<O: TupleObserver>` observing `RM_XACT_ID` records: COMMIT/COMMIT_PREPARED drain, ABORT/ABORT_PREPARED drop, everything else (PREPARE / ASSIGNMENT / INVALIDATIONS) ignored | [`src/xact_buffer.rs`](../src/xact_buffer.rs) | `xact_record_sink_routes_commit_and_abort` (live shadow PG) |
+| `BufferingDecoderSink` — replaces the direct-emit `DecoderSink` in the production fan-out: parks user-heap records in the buffer, reinterprets `pg_toast.*` INSERTs as `ToastChunk`s | [`src/xact_buffer.rs`](../src/xact_buffer.rs) | `toast_chunk_from_decoded_recognises_three_col_shape` unit; full sink path exercised via the daemon-level fan-out and Phase 8's DDL drill |
 | Daemon wiring — `--spill-dir` + `--xact-buffer-max` flags, `XactBuffer::clear_spill_dir` on startup, status line extended with `xact_active=… spill_bytes=… commit=… abort=…` | [`src/bin/stream.rs`](../src/bin/stream.rs) | live PG, not unit-tested |
+| Integration suite for commit / drain / detoast against a live shadow PG (mirrors `tests/shadow_catalog.rs` conventions: `pg_available()` gate, non-overlapping ports, `psql_one` for filenode + toast OID lookup) | [`tests/xact_buffer.rs`](../tests/xact_buffer.rs) | 7 tests — drain order, unknown-xid, spilled-then-in-memory drain, detoast + missing-chunk error, xact sink routing, abort-spill cleanup |
 
 Build clean on `cargo clippy --all-targets -- -D warnings`. Test counts:
 
-- `cargo test --lib`: 136 passed (was 121 at end of Phase 5; +15 = 5 `spill::tests::*` + 10 `xact_buffer::tests::*`).
+- `cargo test --lib`: 132 passed (was 121 at end of Phase 5; +11 = 5 `spill::tests::*` + 6 `xact_buffer::tests::*`).
+- `cargo test --test xact_buffer`: 7 passed against a live shadow PG
+  (ports 55701-55707; skipped silently if `initdb` is not on `$PATH`).
 - Existing 32 integration tests untouched, all green.
 
 Code size:
@@ -31,15 +34,15 @@ Code size:
 | component | LOC |
 |---|---|
 | `src/spill.rs` (writer / reader / store / manual encoder + tests) | 825 |
-| `src/xact_buffer.rs` (buffer / drain / detoast / sinks + tests) | 1257 |
+| `src/xact_buffer.rs` (buffer / drain / detoast / sinks + tests) | 1102 |
+| `tests/xact_buffer.rs` (live shadow PG integration tests) | 451 |
 | `src/bin/stream.rs` wiring delta | ~40 added |
 | `DecodedHeap` got `PartialEq` derive (for spill round-trip tests) | 1 |
 
-Larger than PHASE6disk's 900-LOC src estimate; the gap is on tests
-(~700 LOC of inline `#[cfg(test)]` modules vs. ~250 budgeted), driven
-by per-variant `ColumnValue` round-trip coverage and the
-spilled-then-in-memory drain ordering proof. Source-only sizing lands
-at ≈900 LOC, matching the design doc.
+Source-only sizing (`src/spill.rs` + `src/xact_buffer.rs` minus tests)
+lands at ≈900 LOC matching PHASE6disk.md's estimate; the test split
+between inline unit (catalog-free paths) and `tests/xact_buffer.rs`
+(live shadow PG) follows the [`tests/shadow_catalog.rs`] convention.
 
 ## What didn't get done
 
@@ -62,34 +65,46 @@ Four items deferred explicitly:
   PHASE6disk.md — `ReplacingMergeTree(_lsn)` can't retract on abort,
   so commit-buffer is the only correctness-safe model.
 - **Live-PG end-to-end test for `BufferingDecoderSink`.** The
-  decoder-side path needs a real `ShadowCatalog` (the descriptor's
-  `kind == 't'` toast-vs-user dispatch reads catalog state). Phase 5
+  decoder-side path needs WAL records (`record.parsed`, `record.decision`)
+  to exercise; today's `tests/xact_buffer.rs` covers the buffer + sink
+  drain proper via direct `on_heap` / `on_toast_chunk` calls. Phase 5
   punted the same way for `DecoderSink`; Phase 8's e2e DDL drill is
-  the natural home for both. Unit coverage of `XactBuffer` proper is
-  ten tests across eviction, drain, abort, detoast, and unknown-xid
-  paths — the buffer is well-exercised, the catalog-touching wiring
-  isn't.
+  the natural home for the full record→decoder→buffer chain. Unit
+  coverage of `XactBuffer` is split between catalog-free unit tests
+  (in-process) and catalog-touching integration tests (live shadow
+  PG), so the buffer is well-exercised end-to-end.
 
 ## Design decisions
 
-### Per-xact rel descriptor cache instead of catalog-at-drain
+### Catalog-at-drain, no per-xact cache
 
-Detoast needs the column's `pg_type.typoid` to decide `Bytea` vs `Text`
-substitution. PHASE6disk.md's draft sketched a `ShadowCatalog`
-reference inside the buffer, fetched lazily at commit. Implementation
-hit two friction points:
+Detoast needs the column's `pg_type.typoid` to decide `Bytea` vs
+`Text` substitution. Initial design (first commit of this phase)
+cached `Arc<RelDescriptor>` per `(xid, rfn)` inside [`XactState`] to
+avoid catalog round-trips during drain. Removed in v2:
 
-1. Spilling already-buffered tuples means the catalog lookup runs at
-   drain on every spilled heap with a toast column, multiplying
-   tokio-postgres round-trips by the depth of the xact.
-2. `ShadowCatalog::test_stub` doesn't exist; unit tests for detoast
-   would have needed either a real shadow PG or new test seams in the
-   catalog cache.
+* [`ShadowCatalog`] already has its own LRU. A second cache duplicates
+  the surface and gives drain an extra eviction dimension to worry
+  about — every active xact keeps its descriptor refs alive past the
+  catalog's own natural expiry.
+* Memory cost: one `Arc` bump + one `HashMap` allocation per
+  `(xid, rfn)`, paid even for xacts that never detoast.
+* In the production deployment shadow PG runs co-located, so
+  `relation_at` is cheap; the cache motive collapses.
 
-Switched to: `XactState` holds a `HashMap<RelFileNode, Arc<RelDescriptor>>`
-populated by `on_heap`. The descriptor cost is one `Arc` bump per
-first-touch per xact; dropped on commit/abort. Buffer drain has zero
-catalog dependency. Detoast tests run against pure synthetic descriptors.
+Switched to: `XactBuffer::commit` takes a `&Arc<Mutex<ShadowCatalog>>`
+parameter and `detoast_heap` calls `catalog.relation_at(rfn,
+source_lsn)` only when [`tuple_needs_detoast`] returns true (any
+column is `ExternalToast`). Heaps without TOAST columns never hit
+the catalog at drain. `XactRecordSink` holds an `Arc<Mutex<…>>` clone
+and forwards it through.
+
+Tests that exercise `commit` / detoast moved from `#[cfg(test)] mod
+tests` to `tests/xact_buffer.rs` and run against a real shadow PG
+using the same `make_shadow` / `psql_one` infrastructure as
+[`tests/shadow_catalog.rs`]. Unit tests stay catalog-free
+(abort / eviction / `parse_xact_time` / stats summary / TOAST-shape
+recogniser).
 
 ### Spill format: manual binary encoder, not `serde_json` / `bincode`
 

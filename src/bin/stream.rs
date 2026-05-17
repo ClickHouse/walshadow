@@ -312,7 +312,11 @@ async fn run(args: Args) -> Result<()> {
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder: BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone()),
-        xact_drain: XactRecordSink::new(xact_buffer.clone(), MetricsTupleObserver::default()),
+        xact_drain: XactRecordSink::new(
+            xact_buffer.clone(),
+            catalog.clone(),
+            MetricsTupleObserver::default(),
+        ),
     };
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);

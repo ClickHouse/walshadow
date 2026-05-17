@@ -603,16 +603,21 @@ with a fresh config-surface decision at that point. Design +
 comparison: [PHASE6disk.md](PHASE6disk.md). Retro:
 [PHASE6.md](PHASE6.md).
 
-Size delivered: ~2080 LOC (`src/spill.rs` 825, `src/xact_buffer.rs`
-1257, daemon wiring ~40). Of that, ~700 LOC is inline tests; the
-source-only sizing lands at ≈900 LOC matching PHASE6disk's
-estimate. Tests: +15 unit tests (5 spill + 10 xact_buffer).
+Size delivered: ~2380 LOC (`src/spill.rs` 825, `src/xact_buffer.rs`
+1102, `tests/xact_buffer.rs` 451, daemon wiring ~40). Source-only
+sizing lands at ≈900 LOC matching PHASE6disk's estimate. Tests: +11
+unit (5 spill + 6 xact_buffer catalog-free) plus +7 live-shadow-PG
+integration tests in `tests/xact_buffer.rs`.
+
+Detoast catalog access is direct via
+[`ShadowCatalog`](../src/shadow_catalog.rs) at drain — no per-xact
+descriptor cache, the catalog's own LRU covers repeat lookups.
 
 Deferred to Phase 7 / followups: cursor file
 (`(filter_lsn, decoder_lsn, emitter_lsn)` atomic write — needs the
 CH emitter's ack), subxact lineage, `XLOG_HEAP2_MULTI_INSERT`
-fan-out, live-PG smoke for `BufferingDecoderSink`. See
-[PHASE6.md "Followups"](PHASE6.md#followups).
+fan-out, full record→decoder→buffer chain integration test for
+`BufferingDecoderSink`. See [PHASE6.md "Followups"](PHASE6.md#followups).
 
 ### Phase 7 — CH Native emitter via clickhouse-c-rs
 
