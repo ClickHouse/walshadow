@@ -52,9 +52,7 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wal_rs::pg::walparser::RelFileNode;
 
-use crate::heap_decoder::{
-    ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
-};
+use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer};
 
 /// One unit the buffer wants to durably stash. Heap tuples and TOAST
 /// chunks share the file because both flush together at commit drain;
@@ -121,9 +119,7 @@ impl SpillStore {
     /// so two streams that picked up the same xid value after a slot
     /// rotation don't collide on disk.
     pub async fn writer(&self, xid: u32, first_lsn: u64) -> Result<SpillWriter> {
-        let path = self
-            .dir
-            .join(format!("xid-{xid:010}-{first_lsn:016X}.bin"));
+        let path = self.dir.join(format!("xid-{xid:010}-{first_lsn:016X}.bin"));
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -679,7 +675,9 @@ mod tests {
         let mut w = store.writer(42, 0x1000).await.unwrap();
         let h = sample_heap(42, 0x2000);
         let c = sample_chunk(99, 0, 0x2100, &[0xDE, 0xAD, 0xBE, 0xEF]);
-        w.write(&SpillEntry::Heap(Box::new(h.clone()))).await.unwrap();
+        w.write(&SpillEntry::Heap(Box::new(h.clone())))
+            .await
+            .unwrap();
         w.write(&SpillEntry::Chunk(c.clone())).await.unwrap();
         let bc = w.byte_count();
         assert!(bc > 0);
@@ -719,9 +717,13 @@ mod tests {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let mut w1 = store.writer(1, 0).await.unwrap();
-        w1.write(&SpillEntry::Heap(Box::new(sample_heap(1, 0)))).await.unwrap();
+        w1.write(&SpillEntry::Heap(Box::new(sample_heap(1, 0))))
+            .await
+            .unwrap();
         let mut w2 = store.writer(2, 0).await.unwrap();
-        w2.write(&SpillEntry::Heap(Box::new(sample_heap(2, 0)))).await.unwrap();
+        w2.write(&SpillEntry::Heap(Box::new(sample_heap(2, 0))))
+            .await
+            .unwrap();
         // Drop the writers without finish() so files stay on disk.
         drop(w1);
         drop(w2);
@@ -749,7 +751,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let mut w = store.writer(7, 0).await.unwrap();
-        w.write(&SpillEntry::Heap(Box::new(sample_heap(7, 0)))).await.unwrap();
+        w.write(&SpillEntry::Heap(Box::new(sample_heap(7, 0))))
+            .await
+            .unwrap();
         let path = w.path().to_path_buf();
         assert!(path.exists());
         w.unlink().await.unwrap();

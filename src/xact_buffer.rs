@@ -784,15 +784,14 @@ impl RecordSink for BufferingDecoderSink {
                     Err(e) => return Err(DecoderSinkError::from(e).into()),
                 }
             };
-            let decoded =
-                match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
-                    Ok(Some(d)) => d,
-                    Ok(None) => {
-                        self.stats.skipped_op += 1;
-                        return Ok(());
-                    }
-                    Err(e) => return Err(DecoderSinkError::from(e).into()),
-                };
+            let decoded = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    self.stats.skipped_op += 1;
+                    return Ok(());
+                }
+                Err(e) => return Err(DecoderSinkError::from(e).into()),
+            };
             self.stats.decoded += 1;
             match decoded.op {
                 HeapOp::Insert => self.stats.inserts += 1,

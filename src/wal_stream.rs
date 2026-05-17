@@ -695,9 +695,7 @@ mod tests {
             _bytes: &'a [u8],
             _manifest: &'a Manifest,
         ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-            Box::pin(async {
-                Err(SinkError::Other("synthetic segment-sink fail".into()))
-            })
+            Box::pin(async { Err(SinkError::Other("synthetic segment-sink fail".into())) })
         }
     }
 

@@ -101,8 +101,9 @@ pub fn restore_block_image(
         let mut page = [0u8; PAGE_BYTES];
         page[..hole_offset].copy_from_slice(&scratch[..hole_offset]);
         // hole region remains zero from page init
-        page[hole_offset + hole_length..]
-            .copy_from_slice(&scratch[hole_offset..hole_offset + (PAGE_BYTES - hole_offset - hole_length)]);
+        page[hole_offset + hole_length..].copy_from_slice(
+            &scratch[hole_offset..hole_offset + (PAGE_BYTES - hole_offset - hole_length)],
+        );
         Ok(page)
     } else {
         Ok(scratch)
@@ -114,8 +115,8 @@ mod tests {
     use super::*;
     use wal_rs::pg::walparser::{
         BKP_BLOCK_HAS_IMAGE, BKP_IMAGE_COMPRESS_LZ4, BKP_IMAGE_COMPRESS_PGLZ,
-        BKP_IMAGE_COMPRESS_ZSTD, BKP_IMAGE_HAS_HOLE, XLP_PAGE_MAGIC_PG15,
-        XLogRecordBlockHeader, XLogRecordBlockImageHeader,
+        BKP_IMAGE_COMPRESS_ZSTD, BKP_IMAGE_HAS_HOLE, XLP_PAGE_MAGIC_PG15, XLogRecordBlockHeader,
+        XLogRecordBlockImageHeader,
     };
 
     fn synth_page() -> [u8; PAGE_BYTES] {
@@ -126,7 +127,12 @@ mod tests {
         p
     }
 
-    fn build_block(image: Vec<u8>, info: u8, hole_offset: u16, hole_length: u16) -> XLogRecordBlock {
+    fn build_block(
+        image: Vec<u8>,
+        info: u8,
+        hole_offset: u16,
+        hole_length: u16,
+    ) -> XLogRecordBlock {
         let mut header = XLogRecordBlockHeader::new(0);
         header.fork_flags = BKP_BLOCK_HAS_IMAGE;
         header.image_header = XLogRecordBlockImageHeader {
@@ -170,7 +176,11 @@ mod tests {
         );
         let out = restore_block_image(&block, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(&out[..hole_offset], &page[..hole_offset]);
-        assert!(out[hole_offset..hole_offset + hole_length].iter().all(|&b| b == 0));
+        assert!(
+            out[hole_offset..hole_offset + hole_length]
+                .iter()
+                .all(|&b| b == 0)
+        );
         assert_eq!(
             &out[hole_offset + hole_length..],
             &page[hole_offset + hole_length..],
@@ -209,8 +219,7 @@ mod tests {
     #[test]
     fn pglz_round_trip() {
         let page = synth_page();
-        let compressed =
-            pglz::compress(&page, &pglz::Strategy::ALWAYS).expect("pglz compress");
+        let compressed = pglz::compress(&page, &pglz::Strategy::ALWAYS).expect("pglz compress");
         let block = build_block(compressed, BKP_IMAGE_COMPRESS_PGLZ, 0, 0);
         let out = restore_block_image(&block, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(out, page);
@@ -233,7 +242,11 @@ mod tests {
         );
         let out = restore_block_image(&block, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(&out[..hole_offset], &page[..hole_offset]);
-        assert!(out[hole_offset..hole_offset + hole_length].iter().all(|&b| b == 0));
+        assert!(
+            out[hole_offset..hole_offset + hole_length]
+                .iter()
+                .all(|&b| b == 0)
+        );
         assert_eq!(
             &out[hole_offset + hole_length..],
             &page[hole_offset + hole_length..],

@@ -157,7 +157,9 @@ pub enum DecodeError {
         need: usize,
         have: usize,
     },
-    #[error("xl_heap_header at offset {offset} declares t_hoff={t_hoff} < SIZE_OF_HEAP_TUPLE_HEADER")]
+    #[error(
+        "xl_heap_header at offset {offset} declares t_hoff={t_hoff} < SIZE_OF_HEAP_TUPLE_HEADER"
+    )]
     BadHoff { offset: usize, t_hoff: usize },
     #[error("nominal alignment char {0:?} not one of c/s/i/d")]
     BadAlign(char),
@@ -197,7 +199,10 @@ pub enum ColumnValue {
     TimestampTz(i64),
     /// `timetz` — `time` storage + 4-byte UTC offset (seconds; negative
     /// for east of UTC, per PG's sign convention).
-    TimeTz { micros: i64, tz_seconds: i32 },
+    TimeTz {
+        micros: i64,
+        tz_seconds: i32,
+    },
     /// `uuid` — 16 raw bytes, network byte order on disk per PG's
     /// `uuid_send` (no swap, just memcpy).
     Uuid([u8; 16]),
@@ -215,7 +220,10 @@ pub enum ColumnValue {
     ExternalToast(ToastPointer),
     /// Type OID outside the Phase 5 matrix. Carries the raw bytes so
     /// downstream stages can either treat as opaque or punt.
-    Unsupported { type_oid: u32, raw: Vec<u8> },
+    Unsupported {
+        type_oid: u32,
+        raw: Vec<u8>,
+    },
 }
 
 /// On-disk TOAST pointer (`struct varatt_external` in PG `varatt.h`).
@@ -399,7 +407,11 @@ fn decode_update(
         None
     };
 
-    let op = if hot { HeapOp::HotUpdate } else { HeapOp::Update };
+    let op = if hot {
+        HeapOp::HotUpdate
+    } else {
+        HeapOp::Update
+    };
     Ok(DecodedHeap {
         rfn,
         xid,
@@ -462,7 +474,9 @@ fn decode_old_tuple_from_main_data(
             have: main_data.len() - header_off,
         });
     }
-    Ok(Some(decode_tuple_payload(main_data, header_off, rel, 0, 0)?))
+    Ok(Some(decode_tuple_payload(
+        main_data, header_off, rel, 0, 0,
+    )?))
 }
 
 /// Walk a tuple payload that starts with `xl_heap_header` at `header_off`
@@ -557,8 +571,7 @@ fn decode_tuple_payload(
         // peek at, so we fall back to nominal alignment unconditionally
         // — matches PG's worst-case alignment when computing the
         // prefix-byte budget.
-        if col_size_hint == -1 && cur >= prefixlen && col_data_off + cur - prefixlen < buf.len()
-        {
+        if col_size_hint == -1 && cur >= prefixlen && col_data_off + cur - prefixlen < buf.len() {
             cur = att_align_nominal(
                 cur,
                 att.type_align,
@@ -699,11 +712,11 @@ fn att_align_nominal(
         return cur_offset;
     }
     match attalign {
-        'c' => cur_offset,                      // TYPALIGN_CHAR (1)
-        's' => align_up(cur_offset, 2),         // TYPALIGN_SHORT
-        'i' => align_up(cur_offset, 4),         // TYPALIGN_INT
-        'd' => align_up(cur_offset, 8),         // TYPALIGN_DOUBLE
-        _ => cur_offset,                        // unknown: fall back to no-align rather than panic
+        'c' => cur_offset,              // TYPALIGN_CHAR (1)
+        's' => align_up(cur_offset, 2), // TYPALIGN_SHORT
+        'i' => align_up(cur_offset, 4), // TYPALIGN_INT
+        'd' => align_up(cur_offset, 8), // TYPALIGN_DOUBLE
+        _ => cur_offset,                // unknown: fall back to no-align rather than panic
     }
 }
 
@@ -1020,7 +1033,13 @@ mod tests {
         BlockLocation, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 
-    fn rel_attr(attnum: i16, name: &str, type_oid: u32, type_len: i16, type_align: char) -> RelAttr {
+    fn rel_attr(
+        attnum: i16,
+        name: &str,
+        type_oid: u32,
+        type_len: i16,
+        type_align: char,
+    ) -> RelAttr {
         RelAttr {
             attnum,
             name: name.into(),
@@ -1155,10 +1174,7 @@ mod tests {
 
     #[test]
     fn decode_insert_short_varlena() {
-        let rel = descriptor(
-            16387,
-            vec![rel_attr(1, "msg", TEXTOID, -1, 'i')],
-        );
+        let rel = descriptor(16387, vec![rel_attr(1, "msg", TEXTOID, -1, 'i')]);
         // Short header: bit 0 set, len in upper 7 bits (total bytes incl. header).
         // Body = "hi" (2 bytes), total = 3.
         let header = (3u8 << 1) | 0x01;
@@ -1209,10 +1225,7 @@ mod tests {
 
     #[test]
     fn decode_delete_with_old_key_emits_old() {
-        let rel = descriptor(
-            16389,
-            vec![rel_attr(1, "id", INT4OID, 4, 'i')],
-        );
+        let rel = descriptor(16389, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
         // main_data: xl_heap_delete (8) + xl_heap_header (5) + bitmap_pad (1) + col data.
         let mut main_data = vec![0u8; SIZE_OF_HEAP_DELETE];
         main_data[7] = XLH_DELETE_CONTAINS_OLD_KEY;
@@ -1261,10 +1274,7 @@ mod tests {
 
     #[test]
     fn decode_hot_update_without_old_emits_no_old() {
-        let rel = descriptor(
-            16391,
-            vec![rel_attr(1, "id", INT4OID, 4, 'i')],
-        );
+        let rel = descriptor(16391, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
         let mut block_data = Vec::new();
         block_data.extend_from_slice(&1u16.to_le_bytes());
         block_data.extend_from_slice(&0u16.to_le_bytes());
@@ -1284,10 +1294,7 @@ mod tests {
     fn decode_dropped_column_emits_null_and_advances() {
         let mut dropped = rel_attr(1, "old", INT4OID, 4, 'i');
         dropped.dropped = true;
-        let rel = descriptor(
-            16392,
-            vec![dropped, rel_attr(2, "live", INT4OID, 4, 'i')],
-        );
+        let rel = descriptor(16392, vec![dropped, rel_attr(2, "live", INT4OID, 4, 'i')]);
         let mut col_data = Vec::new();
         col_data.extend_from_slice(&0i32.to_le_bytes()); // dropped col still in bytes
         col_data.extend_from_slice(&8888i32.to_le_bytes());
@@ -1320,12 +1327,11 @@ mod tests {
 
     #[test]
     fn decode_uuid_round_trip() {
-        let rel = descriptor(
-            16395,
-            vec![rel_attr(1, "u", UUIDOID, 16, 'c')],
-        );
-        let uuid_bytes = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-                          0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let rel = descriptor(16395, vec![rel_attr(1, "u", UUIDOID, 16, 'c')]);
+        let uuid_bytes = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
         let payload = build_tuple_payload(1, false, 24, &uuid_bytes);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
@@ -1336,10 +1342,7 @@ mod tests {
 
     #[test]
     fn decode_external_toast_pointer() {
-        let rel = descriptor(
-            16396,
-            vec![rel_attr(1, "blob", BYTEAOID, -1, 'i')],
-        );
+        let rel = descriptor(16396, vec![rel_attr(1, "blob", BYTEAOID, -1, 'i')]);
         // varattrib_1b_e: 0x01, va_tag=18, va_rawsize=12345, va_extinfo=678,
         // va_valueid=12, va_toastrelid=99.
         let mut col_data = Vec::new();
@@ -1369,10 +1372,7 @@ mod tests {
     fn decode_unsupported_type_emits_opaque() {
         // numeric (typ_oid 1700) is Tier 3 — should fall through to
         // ColumnValue::Unsupported with raw bytes preserved.
-        let rel = descriptor(
-            16397,
-            vec![rel_attr(1, "n", 1700, -1, 'i')],
-        );
+        let rel = descriptor(16397, vec![rel_attr(1, "n", 1700, -1, 'i')]);
         let body = b"unparsed";
         let total = 4 + body.len();
         let header_u32 = (total as u32) << 2;

@@ -36,11 +36,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::Mutex;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
-use std::future::Future;
-use std::pin::Pin;
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
@@ -50,9 +50,7 @@ use walshadow::source_feed::SourceFeed;
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
-use walshadow::xact_buffer::{
-    BufferingDecoderSink, XactBuffer, XactBufferConfig, XactRecordSink,
-};
+use walshadow::xact_buffer::{BufferingDecoderSink, XactBuffer, XactBufferConfig, XactRecordSink};
 
 /// Tiny inline `RecordSink` composite. Phase 6 adds the xact buffer
 /// to the chain: heap-tuple records park in `xact` until the matching

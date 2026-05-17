@@ -581,10 +581,7 @@ async fn replident_matrix_default_nothing_full_index() {
                 pk_attnums: Some(vec![1]),
             },
         ),
-        (
-            "wc.no_pk_t",
-            ReplIdent::Default { pk_attnums: None },
-        ),
+        ("wc.no_pk_t", ReplIdent::Default { pk_attnums: None }),
         (
             "wc.composite_pk_t",
             ReplIdent::Default {

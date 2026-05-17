@@ -22,9 +22,7 @@ use walshadow::decoder_sink::{DecoderSinkError, TupleObserver};
 use walshadow::filter::Decision;
 use walshadow::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer};
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{
-    ShadowCatalog, ShadowCatalogConfig, socket_conninfo,
-};
+use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
 use walshadow::spill::ToastChunk;
 use walshadow::wal_stream::Record;
 use walshadow::xact_buffer::{XactBuffer, XactBufferConfig, XactBufferError, XactRecordSink};
@@ -118,7 +116,13 @@ fn rfn(spc: u32, db: u32, rel: u32) -> RelFileNode {
     }
 }
 
-fn heap(rfn: RelFileNode, xid: u32, lsn: u64, op: HeapOp, cols: Vec<Option<ColumnValue>>) -> DecodedHeap {
+fn heap(
+    rfn: RelFileNode,
+    xid: u32,
+    lsn: u64,
+    op: HeapOp,
+    cols: Vec<Option<ColumnValue>>,
+) -> DecodedHeap {
     DecodedHeap {
         rfn,
         xid,
@@ -148,8 +152,11 @@ impl TupleObserver for CollectObs {
     fn on_tuple<'a>(
         &'a mut self,
         d: &'a DecodedHeap,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), DecoderSinkError>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<(), DecoderSinkError>> + Send + 'a,
+        >,
+    > {
         Box::pin(async move {
             self.seen.push(d.clone());
             Ok(())
@@ -193,10 +200,21 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
     let mut obs = CollectObs::default();
-    let one_col = |id: i32| vec![Some(ColumnValue::Int4(id)), Some(ColumnValue::Text("x".into()))];
-    b.on_heap(heap(rfn, 7, 100, HeapOp::Insert, one_col(1))).await.unwrap();
-    b.on_heap(heap(rfn, 7, 200, HeapOp::Update, one_col(2))).await.unwrap();
-    b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, one_col(3))).await.unwrap();
+    let one_col = |id: i32| {
+        vec![
+            Some(ColumnValue::Int4(id)),
+            Some(ColumnValue::Text("x".into())),
+        ]
+    };
+    b.on_heap(heap(rfn, 7, 100, HeapOp::Insert, one_col(1)))
+        .await
+        .unwrap();
+    b.on_heap(heap(rfn, 7, 200, HeapOp::Update, one_col(2)))
+        .await
+        .unwrap();
+    b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, one_col(3)))
+        .await
+        .unwrap();
     b.commit(7, 12345, &cat, &mut obs).await.unwrap();
     assert_eq!(obs.seen.len(), 2);
     assert_eq!(obs.seen[0].source_lsn, 100);
@@ -233,7 +251,10 @@ async fn commit_drains_spilled_then_in_memory_entries() {
         Some(ColumnValue::Int4(0)),
         Some(ColumnValue::Bytea(vec![0u8; 700])),
     ];
-    let small_col = vec![Some(ColumnValue::Int4(0)), Some(ColumnValue::Text("z".into()))];
+    let small_col = vec![
+        Some(ColumnValue::Int4(0)),
+        Some(ColumnValue::Text("z".into())),
+    ];
     // Three big tuples first — spill engages after the second.
     for i in 0..3 {
         b.on_heap(heap(rfn, 5, 100 + i, HeapOp::Insert, fat_col.clone()))
@@ -280,7 +301,7 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     let id_col = Some(ColumnValue::Int4(1));
     let body_ptr = Some(ColumnValue::ExternalToast(ToastPointer {
         va_rawsize: (4 + 3 + 3) + 4, // ext_size + VARHDRSZ
-        va_extinfo: 4 + 3 + 3,        // ext_size, no compression bits
+        va_extinfo: 4 + 3 + 3,       // ext_size, no compression bits
         va_valueid: 55,
         va_toastrelid: toast_oid,
     }));
@@ -400,10 +421,21 @@ async fn xact_record_sink_routes_commit_and_abort() {
     let buf = Arc::new(Mutex::new(XactBuffer::new(cfg(spill_dir, 1024)).unwrap()));
     {
         let mut b = buf.lock().await;
-        let col = |id: i32| vec![Some(ColumnValue::Int4(id)), Some(ColumnValue::Text("z".into()))];
-        b.on_heap(heap(rfn, 7, 100, HeapOp::Insert, col(1))).await.unwrap();
-        b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, col(2))).await.unwrap();
-        b.on_heap(heap(rfn, 9, 120, HeapOp::Insert, col(3))).await.unwrap();
+        let col = |id: i32| {
+            vec![
+                Some(ColumnValue::Int4(id)),
+                Some(ColumnValue::Text("z".into())),
+            ]
+        };
+        b.on_heap(heap(rfn, 7, 100, HeapOp::Insert, col(1)))
+            .await
+            .unwrap();
+        b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, col(2)))
+            .await
+            .unwrap();
+        b.on_heap(heap(rfn, 9, 120, HeapOp::Insert, col(3)))
+            .await
+            .unwrap();
     }
     let mut sink = XactRecordSink::new(buf.clone(), cat.clone(), CollectObs::default());
     let commit = xact_record(0x00, 7, 0x1234); // XLOG_XACT_COMMIT
