@@ -120,3 +120,69 @@ tests/wal_stream_chunk_boundary.rs new chunk-boundary stress
 fixtures/wal/xlog_switch/          captured fixture
 plans/PRE5b10.md                   this doc
 ```
+
+## Retro
+
+### Item 1 — `pub mod segment`
+
+`src/lib.rs:22` lost `pub`; `mod segment` is now reachable only through
+`filter_segment`. No external user existed.
+
+### Item 2 — push latency contract
+
+Comment landed on `WalStream::push` directly (in addition to the
+pre-existing module-level paragraph), so a reader auditing the
+per-call surface area sees the segment-cadence caveat without
+chasing module docs.
+
+### Item 3 — Empty-bucket audit
+
+Cross-checked `XLOG_HEAP2_VISIBLE`, `XLOG_HEAP2_PRUNE_*`,
+`XLOG_BTREE_VACUUM` against PG sources at
+`~/s/postgresql/src/backend/access/`: all three register a buffer
+with the record so `record.blocks` is non-empty and they classify
+out of `Empty`. The previously unnoted miss was
+`XLOG_BTREE_REUSE_PAGE` — a hot-standby conflict marker that
+explicitly does *not* register the buffer (PG nbtpage.c comment).
+Its `xl_btree_reuse_page` puts the locator at byte 0 of `main_data`,
+so the reclassifier was extended to cover it plus a positive unit
+test. `XLOG_HEAP_TRUNCATE` is logical-decoding-only and carries an
+oid array, not a relfilenode — left as the safe-default Keep path.
+Audit table is in `main_data.rs`'s module doc.
+
+### Item 4 — poisoned-on-error
+
+`WalStream` gained a `poisoned` bool. `push` short-circuits with
+`WalStreamError::Poisoned` after any prior sink/filter error.
+Documented on the `RecordSink` trait and on `push`. The deliberate
+non-rollback of `next_lsn` is now a stated contract: recovery is to
+construct a fresh `WalStream` at the desired LSN.
+
+### Item 5 — chunk-boundary stress
+
+`tests/wal_stream_chunk_boundary.rs` feeds the existing classify
+fixture through `WalStream` at three cadences: single bulk push,
+one byte at a time, and a rotating prime-sized chunk set
+`[1, 7, 13, 257, 8193, 65537]`. All three must produce identical
+`RecordKey` sequences and identical segment-sink bytes.
+
+### Item 6 — fixtures
+
+`fixtures/wal/xlog_switch/` captured locally via
+`WALSHADOW_USE_LOCAL=1` against PG 18; capture script mirrors the
+other fixtures. `fixtures/wal/vacuum_full_catalog/` is the realized
+form of `fixtures/wal/vacuum_full_pg_depend/` (landed under PRE5b3),
+no rename — the more specific name better describes the workload.
+PRE5.md's "Files expected to change" list (line 345) reads stale
+against the actual tree, but the doc is historical and not
+rewritten here.
+
+### Item 7 — FIFO eviction
+
+`min_by_key` linear scan replaced with `EvictionIndex` —
+`BTreeMap<u64, RelFileNode>` keyed by insert order, O(log n)
+per insert. Re-inserting an already-cached filenode rotates via
+`unregister` + `register` so the BTreeMap and `by_filenode` stay
+1:1. Extracted into a standalone struct so two unit tests cover
+the FIFO + rotation behavior without spinning up a tokio-postgres
+client.

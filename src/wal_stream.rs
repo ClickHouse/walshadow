@@ -65,6 +65,8 @@ pub enum WalStreamError {
     UnalignedBase(u64),
     #[error("sink: {0}")]
     Sink(#[from] SinkError),
+    #[error("stream poisoned by prior error; create a fresh WalStream to resume")]
+    Poisoned,
 }
 
 #[derive(Debug, Error)]
@@ -118,6 +120,15 @@ impl Record {
 
 /// Sink that observes every record decided by the filter. Phase 5's
 /// heap-tuple decoder attaches here.
+///
+/// **Error contract.** Returning `Err` from any sink call poisons the
+/// owning [`WalStream`]: `next_lsn` and the partially-dispatched
+/// `current_buf` are left as-is, and every subsequent
+/// [`WalStream::push`] returns [`WalStreamError::Poisoned`]. Recovery
+/// is to construct a fresh `WalStream` at the desired resume LSN —
+/// the protocol does not roll back per-record state, so a sink that
+/// wants exactly-once semantics must commit its own state durably
+/// before returning `Ok`. See [PRE5b10.md](../plans/PRE5b10.md) item 4.
 pub trait RecordSink {
     fn on_record(&mut self, record: &Record) -> Result<(), SinkError>;
 }
@@ -352,6 +363,12 @@ pub struct WalStream {
     current_lsn: u64,
     current_buf: Vec<u8>,
     filter: Filter,
+    /// Set by [`push`](Self::push) when filter or sink dispatch fails.
+    /// Subsequent calls short-circuit with [`WalStreamError::Poisoned`].
+    /// The plan does not roll `next_lsn` back on error (see [PRE5b10.md
+    /// ](../plans/PRE5b10.md) item 4); a fresh `WalStream` at the
+    /// caller's chosen resume LSN is the recovery path.
+    poisoned: bool,
 }
 
 impl WalStream {
@@ -368,6 +385,7 @@ impl WalStream {
             current_lsn: start_lsn,
             current_buf: Vec::with_capacity(seg_size as usize),
             filter: Filter::new(),
+            poisoned: false,
         })
     }
 
@@ -404,6 +422,24 @@ impl WalStream {
     /// Append bytes that start at LSN `lsn`. Calls `record_sink` /
     /// `segment_sink` synchronously once a segment fills. Returns the
     /// LSN of the next expected push.
+    ///
+    /// **Latency contract.** Per-segment, not per-record. A pushed
+    /// record sees no [`RecordSink`] call until enough subsequent
+    /// pushes accumulate `seg_size` bytes (16 MiB default), at which
+    /// point every record in that segment fires in one burst. Phase 5's
+    /// decoder tolerates segment-cadence latency. Phase 7's CH-native
+    /// emitter will not — see [PRE5b10.md](../plans/PRE5b10.md) item 2:
+    /// switching to a chunk-driven walker that yields records on the
+    /// fly is the deferred refactor, the sink trait shape is already
+    /// compatible.
+    ///
+    /// **Poisoned-on-error.** A sink (record or segment) returning
+    /// `Err`, or a filter/parse failure inside `flush_current`, marks
+    /// the stream as poisoned. Every subsequent call returns
+    /// [`WalStreamError::Poisoned`]. `next_lsn` is not rolled back: the
+    /// caller's recovery is to drop this `WalStream` and construct a
+    /// fresh one at the desired resume LSN. See [PRE5b10.md
+    /// ](../plans/PRE5b10.md) item 4.
     pub fn push(
         &mut self,
         lsn: u64,
@@ -411,6 +447,9 @@ impl WalStream {
         record_sink: &mut dyn RecordSink,
         segment_sink: &mut dyn SegmentSink,
     ) -> Result<u64, WalStreamError> {
+        if self.poisoned {
+            return Err(WalStreamError::Poisoned);
+        }
         if lsn != self.next_lsn {
             return Err(WalStreamError::Misaligned {
                 expected: self.next_lsn,
@@ -425,8 +464,11 @@ impl WalStream {
             self.current_buf.extend_from_slice(&data[..take]);
             cur_lsn += take as u64;
             data = &data[take..];
-            if self.current_buf.len() == self.seg_size as usize {
-                self.flush_current(record_sink, segment_sink)?;
+            if self.current_buf.len() == self.seg_size as usize
+                && let Err(e) = self.flush_current(record_sink, segment_sink)
+            {
+                self.poisoned = true;
+                return Err(e);
             }
         }
         self.next_lsn = cur_lsn;
@@ -587,6 +629,65 @@ mod tests {
             }
             _ => panic!("wrong error variant"),
         }
+    }
+
+    /// Adversarial segment sink that returns `Err` on every dispatch.
+    /// Used to prove the poison-on-error contract fires for sink
+    /// failures, not just filter failures.
+    struct ErrSegmentSink;
+    impl SegmentSink for ErrSegmentSink {
+        fn on_segment(
+            &mut self,
+            _seg: SegmentName,
+            _bytes: &[u8],
+            _manifest: &Manifest,
+        ) -> Result<(), SinkError> {
+            Err(SinkError::Other("synthetic segment-sink fail".into()))
+        }
+    }
+
+    /// Zero-byte page → filter_segment yields no records but still
+    /// dispatches the segment; `ErrSegmentSink` returns `Err` → poison.
+    #[test]
+    fn push_segment_sink_error_poisons_stream() {
+        const SEG: u64 = 8192;
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = ErrSegmentSink;
+        let bytes = vec![0u8; SEG as usize];
+        let err = ws
+            .push(0, &bytes, &mut rec, &mut seg)
+            .expect_err("sink error must propagate");
+        assert!(matches!(err, WalStreamError::Sink(_)), "{err:?}");
+        let mut good_seg = CollectingSegmentSink::default();
+        let err2 = ws
+            .push(SEG, &[0u8; 1], &mut rec, &mut good_seg)
+            .expect_err("subsequent push must short-circuit");
+        assert!(matches!(err2, WalStreamError::Poisoned));
+    }
+
+    /// Page-sized seg with bad magic → first push fills the segment,
+    /// `flush_current` calls `filter_segment` which surfaces a walker
+    /// error. Stream is poisoned; the next push must short-circuit
+    /// with `Poisoned` regardless of its own validity.
+    #[test]
+    fn push_filter_error_poisons_stream() {
+        const SEG: u64 = 8192;
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        let mut bytes = vec![0u8; SEG as usize];
+        bytes[0] = 0xFF;
+        bytes[1] = 0xFF;
+        bytes[2] = 1;
+        let err = ws
+            .push(0, &bytes, &mut rec, &mut seg)
+            .expect_err("filter error must propagate");
+        assert!(matches!(err, WalStreamError::Filter { .. }), "{err:?}");
+        let err2 = ws
+            .push(SEG, &[0u8; 1], &mut rec, &mut seg)
+            .expect_err("subsequent push must short-circuit");
+        assert!(matches!(err2, WalStreamError::Poisoned));
     }
 
     /// Synthesise a `Record` directly so the fan-out tests exercise

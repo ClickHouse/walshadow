@@ -35,6 +35,11 @@ fn vacuum_full_pg_depend_segment() -> PathBuf {
         .join("fixtures/wal/vacuum_full_pg_depend/segments/000000010000000000000002.gz")
 }
 
+fn xlog_switch_segment() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.gz")
+}
+
 fn decompress_gz(path: &PathBuf) -> std::io::Result<Vec<u8>> {
     let mut child = Command::new("gunzip")
         .arg("-c")
@@ -178,6 +183,47 @@ fn oltp_workload_keeps_well_under_one_percent() {
     let (filtered_count, noops) = parse_all_records(&out).expect("re-parse filtered");
     assert_eq!(filtered_count as u64, manifest.stats.records);
     assert_eq!(noops as u64, manifest.stats.dropped);
+}
+
+/// PRE5b10 item 6: captured-fixture cross-check for the synthetic
+/// `xlog_switch_record_passes_through_filter` unit test in
+/// `src/filter_segment.rs`. A real PG `pg_switch_wal()` lands an
+/// XLOG_SWITCH (rmgr 0, info 0x40) in the WAL segment; the filter
+/// must keep it byte-identically because shadow's recovery state
+/// machine relies on its presence at the segment tail.
+#[test]
+fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
+    use wal_rs::pg::walparser::RmId;
+    const XLOG_SWITCH: u8 = 0x40;
+    let seg = xlog_switch_segment();
+    if !seg.exists() {
+        eprintln!(
+            "skip: no fixture at {:?}. Run fixtures/wal/xlog_switch/capture.sh",
+            seg
+        );
+        return;
+    }
+    let bytes = decompress_gz(&seg).expect("gunzip xlog_switch fixture");
+    let mut filter = Filter::new();
+    let (out, manifest, _parsed) = filter_segment(&bytes, "xsw", &mut filter).expect("filter");
+
+    let switch_entry = manifest
+        .records
+        .iter()
+        .find(|e| e.rmid == RmId::Xlog as u8 && (e.info & 0xF0) == XLOG_SWITCH)
+        .expect("captured segment must contain ≥1 XLOG_SWITCH");
+    let off = switch_entry.offset as usize;
+    let len = switch_entry.len as usize;
+    assert_eq!(
+        &bytes[off..off + len],
+        &out[off..off + len],
+        "XLOG_SWITCH bytes must pass through unchanged",
+    );
+    assert_eq!(
+        switch_entry.kind,
+        walshadow::manifest::Kind::Kept,
+        "XLOG_SWITCH must be kept (special rmgr policy)",
+    );
 }
 
 /// PRE5b3 regression: pg_class UPDATE records from `VACUUM FULL` on a

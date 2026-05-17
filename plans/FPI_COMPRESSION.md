@@ -4,12 +4,12 @@ Evaluation. Sibling to [SEGMENT_COMPRESSION.md](SEGMENT_COMPRESSION.md);
 the two are independent and either may ship first. Status: **not
 committed work**.
 
-Walshadow-side per the project boundary: pglz has no usable
-upstream Rust crate, lz4 / zstd FPIs use raw-block / frame formats
-both already reachable via crates, and the consumer is a walshadow
-decoder (Phase 5/6 and [BASEBACKUP.md](BASEBACKUP.md)'s 1B+2A path)
-not a wal-rs primitive. Lift in wal-rs is bounded to extending the
-existing flag predicates; the new code is here.
+Walshadow-side per the project boundary: pglz, lz4, and zstd all
+have usable upstream Rust crates (`pglz` 0.1+, `lz4_flex`, `zstd`),
+and the consumer is a walshadow decoder (Phase 5/6 and
+[BASEBACKUP.md](BASEBACKUP.md)'s 1B+2A path) not a wal-rs primitive.
+Lift in wal-rs is bounded to extending existing flag predicates;
+new code is here.
 
 ## Why
 
@@ -115,14 +115,15 @@ Three things this plan needs to do per FPI:
 ## Module shape (walshadow side)
 
 ```
-src/pglz.rs          new — ~180 LOC  port of PG pglz_decompress.
-                                     Pure Rust, no_std-friendly,
-                                     thin tests + corpus crosscheck.
 src/fpi.rs           new — ~150 LOC  restore_block_image entry
                                      point; codec dispatch; hole
                                      splice; error type.
-src/lib.rs           +~2             pub mod pglz; pub mod fpi;
-Cargo.toml           +~3             lz4_flex = "0.11" (pure-Rust,
+src/lib.rs           +~1             pub mod fpi;
+Cargo.toml           +~3             pglz = "0.1" (sync
+                                     decompress_into mirrors PG's
+                                     pglz_decompress signature 1:1,
+                                     PostgreSQL-licensed),
+                                     lz4_flex = "0.11" (pure-Rust,
                                      no_std raw-block decoder),
                                      zstd-safe = "7" (single-pass
                                      bulk API, no streaming alloc)
@@ -131,42 +132,21 @@ Cargo.toml           +~3             lz4_flex = "0.11" (pure-Rust,
                                      covers ZSTD_decompress one-shot).
 ```
 
-### `src/pglz.rs`
+### pglz crate
 
-Port of `~/s/postgresql/src/common/pg_lzcompress.c::pglz_decompress`
-(PG BSD-style licence, attribution-only; vendor as own translation
-plus header pointer):
+`pglz` 0.1 (https://crates.io/crates/pglz) ports
+`src/common/pg_lzcompress.c` directly. Decompress entry walshadow
+uses:
 
 ```rust
-//! pglz raw-block decompressor. Translation of PG's
-//! `pg_lzcompress.c::pglz_decompress`; layout-preserving so a
-//! diff against PG's source is trivially auditable.
-
-#[derive(Debug, thiserror::Error)]
-pub enum PglzError {
-    #[error("corrupt pglz stream at src offset {0}")]
-    Corrupt(usize),
-    #[error("decoded {got} != requested {expected}")]
-    LengthMismatch { got: usize, expected: usize },
-}
-
-/// Decode `source` into `dest`. Returns the number of bytes written.
-///
-/// `check_complete=true` (recovery code path) errors if the decoded
-/// length doesn't exactly match `dest.len()` *and* the source isn't
-/// fully consumed. For FPI use, callers pass `true`.
-pub fn decompress(
-    source: &[u8],
-    dest: &mut [u8],
-    check_complete: bool,
-) -> Result<usize, PglzError>;
+pub fn decompress_into(source: &[u8], dest: &mut [u8], check_complete: bool) -> Option<usize>;
 ```
 
-Algorithm is a 9-bit control-stream literal/match-tag walker, ~150
-lines in C, no allocations, no dependencies. Tests cross-check
-against PG by feeding the known-good fixtures from
-`fixtures/wal/wal_compression_pglz/` (capture script added in this
-plan).
+Argument-for-argument equivalent of PG's
+`pglz_decompress(source, source_len, dest, rawsize, check_complete)`,
+returning bytes written or `None` on a corrupt stream (truncated
+tag, invalid back-reference). `fpi.rs` maps `None` to
+`FpiError::Pglz`.
 
 ### `src/fpi.rs`
 
@@ -194,8 +174,8 @@ pub enum FpiError {
     UnknownCodec(u8),
     #[error("hole offset {offset} + length {length} > BLCKSZ")]
     BadHole { offset: u16, length: u16 },
-    #[error("pglz: {0}")]
-    Pglz(#[from] crate::pglz::PglzError),
+    #[error("pglz: corrupt stream")]
+    Pglz,
     #[error("lz4: {0}")]
     Lz4(String),
     #[error("zstd: {0}")]
@@ -261,12 +241,15 @@ dispatches off this enum.
 
 ## Choice of codecs
 
-* **pglz**: port. No production-quality crate on crates.io
-  (`pg-lz` and `pglz` exist but quality is questionable; one has
-  hand-rolled `unsafe`, the other vendors a snapshot of PG's
-  source minus the bugfix history). Cleaner to vendor a direct
-  translation that mirrors PG's source line-for-line for ongoing
-  audit.
+* **pglz**: `pglz` crate (0.1, PostgreSQL-licensed, pure Rust,
+  ~380 LOC). Direct port of `src/common/pg_lzcompress.c`. Sync API
+  `decompress_into(src, dst, check_complete) -> Option<usize>`
+  mirrors PG's signature 1:1, no FFI, no unsafe. Older crates
+  (`pg-lz`, prior `pglz` snapshots) had quality issues; this 0.1
+  release is fresh and built specifically against PG's current
+  source for ongoing audit. Tokio feature exists for streaming use
+  but walshadow's call site is one-shot per page so the sync API
+  is the fit.
 * **lz4 raw block**: `lz4_flex` (pure Rust, no_std, raw-block API
   matches what PG calls). Alternative: `lz4-sys` (already in the
   transitive dep graph via async-compression). `lz4_flex`
@@ -277,19 +260,19 @@ dispatches off this enum.
   `zstd-safe` is the lower-level wrapper if `zstd` pulls in too
   much; either works.
 
-Direct deps walshadow adds: `lz4_flex`, `zstd`. Both have stable
-releases; both are commonly used in the Rust DB ecosystem.
+Direct deps walshadow adds: `pglz`, `lz4_flex`, `zstd`. All have
+stable releases; all are commonly used in the Rust DB ecosystem or
+purpose-built for it.
 
 ## Test strategy
 
 ### Unit
 
-* `pglz::decompress` round-trip vs PG: take the canonical pglz test
-  vectors from PG (`src/common/pg_lzcompress.c` has none in-tree;
-  use `pg_lzcompress` regression fixtures from
-  `src/test/regress/expected/`) or, more practically, capture WAL
-  with `wal_compression = pglz` from a live PG instance and assert
-  decoded pages match `pg_relpages` / `pg_buffercache` output.
+* `pglz` round-trip: covered upstream by the crate's `tests/regress.rs`.
+  Walshadow's coverage focuses on the FPI splice rather than the
+  codec — capture WAL with `wal_compression = pglz` from a live PG
+  instance and assert `restore_block_image` outputs match
+  `pg_relpages` / `pg_buffercache` page bytes.
 * Hole-splice with `hole_length = 0` (no hole, copy through).
 * Hole-splice with `hole_offset = N, hole_length = M` for several
   `(N, M)` pairs covering: hole at start, hole at end, hole in
@@ -313,11 +296,12 @@ releases; both are commonly used in the Rust DB ecosystem.
 
 ### Property
 
-* For randomly generated 8 KiB pages: pglz-compress (port the PG
-  compressor too, or use the C lib via FFI just for the test
-  side), feed through `pglz::decompress`, assert round-trip. Same
-  for lz4 / zstd via their encode counterparts. Confidence on the
-  decoder without needing PG running.
+* For randomly generated 8 KiB pages: `pglz::compress` →
+  `pglz::decompress_into`, assert round-trip. Same for lz4 / zstd
+  via their encode counterparts. Confidence on the FPI splice
+  layer without needing PG running. (Codec correctness is the
+  upstream crate's responsibility; this exercises the dispatch +
+  hole-splice glue.)
 
 ## Pitfalls
 
@@ -354,9 +338,9 @@ decoder layer wires it.
 Not actually possible in valid WAL — `image_length` is always >0
 when the flag is set. wal-rs's parser would return a `take(0)`
 slice without error, which `restore_block_image` then surfaces as
-`Pglz(Corrupt(0))` or similar codec-specific error. Tests should
-assert this case errors cleanly rather than panicking; no special
-handling needed.
+`Pglz` or a similar codec-specific error. Tests should assert this
+case errors cleanly rather than panicking; no special handling
+needed.
 
 ### 4. Codec disabled at compile time on source
 
@@ -379,24 +363,24 @@ malformed.
 
 PG WAL is little-endian on every platform PG runs on (it's a
 serialisation format that crosses architectures); walshadow runs
-on LE only anyway. No byte-swapping in the FPI path. Note this
-explicitly in `pglz.rs` so a future BE port has a single check
-point.
+on LE only anyway. No byte-swapping in the FPI path. Codec crates
+(`pglz`, `lz4_flex`, `zstd`) all operate on raw byte sequences and
+inherit the LE assumption from PG's on-disk format.
 
 ### 7. Crate-side wal-rs alternative
 
-`pglz`, `fpi`, and the per-codec dispatch arguably belong in wal-rs
-alongside `parse_record_from_bytes` — they operate on
+`fpi` and the per-codec dispatch arguably belong in wal-rs
+alongside `parse_record_from_bytes` — it operates on
 `XLogRecordBlock` fields the parser produces. Two reasons to keep
-them walshadow-side instead:
+it walshadow-side instead:
 
 * wal-rs deliberately exposes raw `b.image` rather than a
   reconstructed page; consumers other than walshadow may have
   reasons to inspect the compressed bytes directly. Adding
   `restore_block_image` to wal-rs is additive (doesn't change the
-  existing surface) but pulls the codec dep set (`lz4_flex`,
-  `zstd`) into every wal-rs user. wal-g (the other primary wal-rs
-  consumer) has no need for FPI decompression.
+  existing surface) but pulls the codec dep set (`pglz`,
+  `lz4_flex`, `zstd`) into every wal-rs user. wal-g (the other
+  primary wal-rs consumer) has no need for FPI decompression.
 * Codec selection — `lz4_flex` vs `lz4-sys`, `zstd` vs `zstd-safe`
   — is a project-level decision walshadow is making against its
   own constraints (pure-Rust preference for `lz4_flex`,
@@ -404,17 +388,15 @@ them walshadow-side instead:
   wal-rs would lock other consumers.
 
 If wal-g (or a future wal-rs consumer) acquires the same need,
-revisit: lift `fpi` and `pglz` upstream, keep walshadow's wrapper
-thin. The interface stays the same; the file just moves.
-Reversible.
+revisit: lift `fpi` upstream, keep walshadow's wrapper thin. The
+interface stays the same; the file just moves. Reversible.
 
 ## Estimate
 
 ```
-src/pglz.rs                       new — ~180 LOC  + ~80 LOC tests
 src/fpi.rs                        new — ~150 LOC  + ~120 LOC tests
-src/lib.rs                        +~2
-Cargo.toml                        +~3   lz4_flex, zstd
+src/lib.rs                        +~1
+Cargo.toml                        +~3   pglz, lz4_flex, zstd
 fixtures/wal/                     +~80  capture script extension
                                        to emit pglz/lz4/zstd cases
 tests/fpi_round_trip.rs           new — ~150 LOC
@@ -425,8 +407,9 @@ wal-rs (small lift):
   tests                           +~30
 ```
 
-Walshadow total: ~580 LOC src + ~350 LOC tests + ~80 LOC fixtures.
-wal-rs delta: ~60 LOC total.
+Walshadow total: ~400 LOC src + ~270 LOC tests + ~80 LOC fixtures.
+wal-rs delta: ~60 LOC total. The ~180 LOC pglz port shifts upstream
+to the `pglz` crate.
 
 ## Sequencing
 
@@ -443,10 +426,9 @@ wal-rs delta: ~60 LOC total.
 
 ## Recommendation
 
-1. Walshadow gets `src/pglz.rs` (port) and `src/fpi.rs`
-   (dispatch + hole splice). Public re-exports under
-   `walshadow::pglz` and `walshadow::fpi`. Codec deps: `lz4_flex`,
-   `zstd`.
+1. Walshadow gets `src/fpi.rs` (dispatch + hole splice). Public
+   re-export under `walshadow::fpi`. Codec deps: `pglz`,
+   `lz4_flex`, `zstd`.
 2. wal-rs gets `XLogRecordBlockImageHeader::compression_method`
    plus `FpiCompressionMethod` enum. Symmetric with the existing
    `is_compressed` predicate; small lift.

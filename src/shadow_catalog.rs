@@ -44,7 +44,7 @@
 //! Cross-user-database replay needs one cache per database; out of
 //! scope for Phase 4.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -200,6 +200,38 @@ pub fn socket_conninfo(socket_dir: &str, port: u16, user: &str, dbname: &str) ->
     format!("host={socket_dir} port={port} user={user} dbname={dbname}")
 }
 
+/// FIFO insert-order index for the `ShadowCatalog` cache. Replaces an
+/// O(n) `min_by_key` scan over the live entries with an O(log n)
+/// `BTreeMap::pop_first` (PRE5b10 item 7). Re-inserting an
+/// already-cached filenode rotates via `unregister` + `register` so
+/// the BTreeMap stays 1:1 with `by_filenode`.
+#[derive(Debug, Default)]
+struct EvictionIndex {
+    by_order: BTreeMap<u64, RelFileNode>,
+    next: u64,
+}
+
+impl EvictionIndex {
+    fn register(&mut self, rfn: RelFileNode) -> u64 {
+        self.next += 1;
+        self.by_order.insert(self.next, rfn);
+        self.next
+    }
+
+    fn unregister(&mut self, prev_order: u64) {
+        self.by_order.remove(&prev_order);
+    }
+
+    fn pop_oldest(&mut self) -> Option<RelFileNode> {
+        self.by_order.pop_first().map(|(_, r)| r)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_order.len()
+    }
+}
+
 pub struct ShadowCatalog {
     client: Client,
     conninfo: String,
@@ -207,7 +239,7 @@ pub struct ShadowCatalog {
     generation: u64,
     by_filenode: HashMap<RelFileNode, CacheEntry>,
     by_oid: HashMap<Oid, CacheEntry>,
-    insert_seq: u64,
+    eviction: EvictionIndex,
     last_replay_lsn: Option<u64>,
     stats: ShadowCatalogStats,
 }
@@ -234,7 +266,7 @@ impl ShadowCatalog {
             generation: 0,
             by_filenode: HashMap::new(),
             by_oid: HashMap::new(),
-            insert_seq: 0,
+            eviction: EvictionIndex::default(),
             last_replay_lsn: None,
             stats: ShadowCatalogStats::default(),
         })
@@ -446,10 +478,13 @@ impl ShadowCatalog {
 
     fn insert(&mut self, desc: RelDescriptor) -> Arc<RelDescriptor> {
         let arc = Arc::new(desc);
-        self.insert_seq += 1;
+        if let Some(prev) = self.by_filenode.get(&arc.rfn) {
+            self.eviction.unregister(prev.insert_order);
+        }
+        let order = self.eviction.register(arc.rfn);
         let entry = CacheEntry {
             generation: self.generation,
-            insert_order: self.insert_seq,
+            insert_order: order,
             desc: arc.clone(),
         };
         self.by_filenode.insert(
@@ -470,12 +505,7 @@ impl ShadowCatalog {
             return;
         };
         while self.by_filenode.len() > cap {
-            let Some(victim_rfn) = self
-                .by_filenode
-                .iter()
-                .min_by_key(|(_, e)| e.insert_order)
-                .map(|(k, _)| *k)
-            else {
+            let Some(victim_rfn) = self.eviction.pop_oldest() else {
                 break;
             };
             if let Some(e) = self.by_filenode.remove(&victim_rfn) {
@@ -793,6 +823,45 @@ mod tests {
             last: None,
             elapsed: Duration::from_secs(0),
         }));
+    }
+
+    fn rfn(rel: u32) -> RelFileNode {
+        RelFileNode {
+            spc_node: 1663,
+            db_node: 5,
+            rel_node: rel,
+        }
+    }
+
+    #[test]
+    fn eviction_index_pops_oldest_first() {
+        let mut ix = EvictionIndex::default();
+        let o1 = ix.register(rfn(10));
+        let o2 = ix.register(rfn(20));
+        let o3 = ix.register(rfn(30));
+        assert!(o1 < o2 && o2 < o3);
+        assert_eq!(ix.len(), 3);
+        assert_eq!(ix.pop_oldest(), Some(rfn(10)));
+        assert_eq!(ix.pop_oldest(), Some(rfn(20)));
+        assert_eq!(ix.pop_oldest(), Some(rfn(30)));
+        assert_eq!(ix.pop_oldest(), None);
+    }
+
+    #[test]
+    fn eviction_index_unregister_drops_stale_order() {
+        // Reinserting an already-cached filenode rotates it to the back:
+        // callers unregister the old order before registering a fresh one.
+        // Without this, the BTreeMap accumulates entries that no longer
+        // match the live cache and eviction picks ghost victims.
+        let mut ix = EvictionIndex::default();
+        let o1 = ix.register(rfn(10));
+        ix.register(rfn(20));
+        ix.unregister(o1);
+        let _ = ix.register(rfn(10));
+        assert_eq!(ix.len(), 2);
+        // Oldest is now rfn(20), not rfn(10).
+        assert_eq!(ix.pop_oldest(), Some(rfn(20)));
+        assert_eq!(ix.pop_oldest(), Some(rfn(10)));
     }
 
     #[tokio::test(flavor = "current_thread")]
