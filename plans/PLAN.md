@@ -32,40 +32,12 @@ floor, not the technical one. PG ≤ 14 captures are rejected.
 
 ## Status
 
-- **Phase 0** — record-classification fixture. [PHASE0.md](PHASE0.md).
-- **Phase 1** — WAL filter + CRC rewrite. [PHASE1.md](PHASE1.md).
-- **Phase 2** — PG-16-minimum cleanup. [PHASE2.md](PHASE2.md).
-- **Phase 3** — shadow PG lifecycle. [PHASE3.md](PHASE3.md).
-- **Phase 4** — catalog cache integration. [PHASE4.md](PHASE4.md).
-- **Phase 4b** — restart resilience. [PHASE4b.md](PHASE4b.md).
-- **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
-  (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
-  (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,
-  `pg_class` heap-write decoder, `CatalogTracker::seed_from_source`
-  bootstrap, `XLOG_SWITCH` pass-through test. [PRE5.md](PRE5.md).
-- **PRE5b** — close [PRE5](PRE5.md) silent-correctness gaps before
-  [Phase 5](#phase-5--heap-tuple-decoder--tier-12-type-matrix):
-  lift `Filter` to per-stream scope, wire `seed_from_source` into
-  `walshadow-stream`, handle `xl_heap_update` prefix/suffix in
-  `pg_class_decoder`, connect `CatalogTracker` to
-  `ShadowCatalog::invalidate`, widen `RecordEvent` → `Record`
-  carrying parsed `XLogRecord`, sink fan-out, `relreplident` +
-  `pg_index` on `RelDescriptor`. [PRE5b.md](PRE5b.md).
-- **clickhouse-c-rs** — vendored as workspace member. Provides the
-  Native-wire emitter for Phase 7. Not gated by a `PHASE*.md`: the
-  crate is upstream code, walshadow just consumes it.
-- **BASEBACKUP** — evaluation: use `BASE_BACKUP` to bootstrap
-  shadow's data dir (replacing `Shadow::apply_schema_dump`) and to
-  seed CH's initial heap load (via `COPY` from shadow at the
-  backup's `end_lsn`). Proposes insertion as Phase 6.5 between
-  [Phase 6](#phase-6--toast-reassembly--xact-buffer) and
-  [Phase 7](#phase-7--ch-native-emitter-via-clickhouse-c-rs). Not
-  committed work. [BASEBACKUP.md](BASEBACKUP.md).
+Plan-file index lives at [INDEX.md](INDEX.md).
 
 Roadmap: Phases 5–10 as listed below (heap decoder → TOAST/xact →
 CH emitter → DDL drill → Tier 3 + oracle → operational). Each phase
-closes with `PHASE<N>.md` under `plans/`; the [status list](#status)
-is the mutable index.
+closes with `PHASE<N>.md` under `plans/`; [INDEX.md](INDEX.md) is the
+mutable index.
 
 Reuses without modification:
 
