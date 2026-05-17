@@ -251,9 +251,8 @@ impl EmitterConfig {
                 out.host = v.into();
             }
             if let Some(v) = ch.get("port").and_then(Value::as_integer) {
-                out.port = u16::try_from(v).map_err(|_| {
-                    EmitterError::Config(format!("port {v} out of u16 range"))
-                })?;
+                out.port = u16::try_from(v)
+                    .map_err(|_| EmitterError::Config(format!("port {v} out of u16 range")))?;
             }
             if let Some(v) = ch.get("database").and_then(Value::as_str) {
                 out.database = v.into();
@@ -276,9 +275,9 @@ impl EmitterConfig {
         }
         if let Some(tbls) = root.get("table").and_then(Value::as_table) {
             for (k, v) in tbls {
-                let t = v.as_table().ok_or_else(|| {
-                    EmitterError::Config(format!("table.{k}: expected a table"))
-                })?;
+                let t = v
+                    .as_table()
+                    .ok_or_else(|| EmitterError::Config(format!("table.{k}: expected a table")))?;
                 let target = t
                     .get("target")
                     .and_then(Value::as_str)
@@ -292,21 +291,19 @@ impl EmitterConfig {
                     let ct = c.as_table().ok_or_else(|| {
                         EmitterError::Config(format!("table.{k}.columns[{i}]: expected a table"))
                     })?;
-                    let src_attnum = ct
-                        .get("attnum")
-                        .and_then(Value::as_integer)
-                        .ok_or_else(|| {
-                            EmitterError::Config(format!(
-                                "table.{k}.columns[{i}]: missing attnum"
-                            ))
-                        })?;
+                    let src_attnum =
+                        ct.get("attnum")
+                            .and_then(Value::as_integer)
+                            .ok_or_else(|| {
+                                EmitterError::Config(format!(
+                                    "table.{k}.columns[{i}]: missing attnum"
+                                ))
+                            })?;
                     let target_name = ct
                         .get("target")
                         .and_then(Value::as_str)
                         .ok_or_else(|| {
-                            EmitterError::Config(format!(
-                                "table.{k}.columns[{i}]: missing target"
-                            ))
+                            EmitterError::Config(format!("table.{k}.columns[{i}]: missing target"))
                         })?
                         .to_string();
                     let target_type = ct
@@ -326,7 +323,8 @@ impl EmitterConfig {
                         target_type,
                     });
                 }
-                out.tables.insert(k.clone(), TableMapping { target, columns });
+                out.tables
+                    .insert(k.clone(), TableMapping { target, columns });
             }
         }
         Ok(out)
@@ -386,9 +384,8 @@ impl TablePlan {
                     mapping.target, c.src_attnum
                 )));
             }
-            let ast = TypeAst::parse(&c.target_type, alloc).map_err(|e| {
-                EmitterError::Type(format!("{}: {e}", c.target_type))
-            })?;
+            let ast = TypeAst::parse(&c.target_type, alloc)
+                .map_err(|e| EmitterError::Type(format!("{}: {e}", c.target_type)))?;
             columns.push(ColumnPlan {
                 name: c.target_name.clone(),
                 type_repr: c.target_type.clone(),
@@ -494,9 +491,8 @@ impl ColumnBuf {
         let (nullable, inner) = if view.kind() == Some(Kind::Nullable) {
             (
                 true,
-                view.child(0).ok_or_else(|| {
-                    EmitterError::Type("Nullable type with no child".into())
-                })?,
+                view.child(0)
+                    .ok_or_else(|| EmitterError::Type("Nullable type with no child".into()))?,
             )
         } else {
             (false, view)
@@ -740,9 +736,7 @@ impl TableEncoder {
         push_fixed(&mut self.buffers[off], &decoded.source_lsn.to_le_bytes())?;
         push_fixed(&mut self.buffers[off + 1], &decoded.xid.to_le_bytes())?;
         push_fixed(&mut self.buffers[off + 2], &op_code.to_le_bytes())?;
-        let unix_us = committed
-            .commit_ts
-            .saturating_add(DATETIME64_PG_EPOCH_US);
+        let unix_us = committed.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
         push_fixed(&mut self.buffers[off + 3], &unix_us.to_le_bytes())?;
         self.rows += 1;
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
@@ -1078,9 +1072,7 @@ impl TupleObserver for EmitterObserver {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
-        Box::pin(async move {
-            self.emitter.drain_xact().map_err(DecoderSinkError::from)
-        })
+        Box::pin(async move { self.emitter.drain_xact().map_err(DecoderSinkError::from) })
     }
 }
 
@@ -1222,10 +1214,22 @@ mod tests {
 
     #[test]
     fn compression_choice_parses_case_insensitively() {
-        assert_eq!(CompressionChoice::parse("LZ4").unwrap(), CompressionChoice::Lz4);
-        assert_eq!(CompressionChoice::parse("Zstd").unwrap(), CompressionChoice::Zstd);
-        assert_eq!(CompressionChoice::parse("none").unwrap(), CompressionChoice::None);
-        assert_eq!(CompressionChoice::parse("").unwrap(), CompressionChoice::None);
+        assert_eq!(
+            CompressionChoice::parse("LZ4").unwrap(),
+            CompressionChoice::Lz4
+        );
+        assert_eq!(
+            CompressionChoice::parse("Zstd").unwrap(),
+            CompressionChoice::Zstd
+        );
+        assert_eq!(
+            CompressionChoice::parse("none").unwrap(),
+            CompressionChoice::None
+        );
+        assert_eq!(
+            CompressionChoice::parse("").unwrap(),
+            CompressionChoice::None
+        );
         CompressionChoice::parse("snappy").expect_err("unknown codec");
     }
 
@@ -1346,9 +1350,11 @@ mod tests {
         let m = mk_mapping();
         let plan = TablePlan::build(alloc, &rel, &m).unwrap();
         let mut enc = TableEncoder::new(plan).unwrap();
-        enc.append_row(&committed(7, Some("seven")), &m, OP_INSERT).unwrap();
+        enc.append_row(&committed(7, Some("seven")), &m, OP_INSERT)
+            .unwrap();
         enc.append_row(&committed(8, None), &m, OP_INSERT).unwrap();
-        enc.append_row(&committed(9, Some("nine")), &m, OP_INSERT).unwrap();
+        enc.append_row(&committed(9, Some("nine")), &m, OP_INSERT)
+            .unwrap();
         assert_eq!(enc.rows, 3);
         // Column 0 (Int32, non-null): 4 bytes * 3 rows = 12 bytes.
         match &enc.buffers[0] {
@@ -1424,4 +1430,3 @@ mod tests {
         assert_eq!(t.columns[1].target_type, "Nullable(String)");
     }
 }
-

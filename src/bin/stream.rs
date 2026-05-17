@@ -325,8 +325,7 @@ async fn run(args: Args) -> Result<()> {
             let toml = tokio::fs::read_to_string(path)
                 .await
                 .with_context(|| format!("read --ch-config {}", path.display()))?;
-            let emitter_cfg = EmitterConfig::from_toml_str(&toml)
-                .context("parse --ch-config")?;
+            let emitter_cfg = EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?;
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
             let tcp = tokio::net::TcpStream::connect(&addr)
                 .await
@@ -336,8 +335,8 @@ async fn run(args: Args) -> Result<()> {
             std_tcp
                 .set_nonblocking(false)
                 .context("set CH socket to blocking for chc_posix_io")?;
-            let emitter = Emitter::new(emitter_cfg, catalog.clone(), std_tcp)
-                .context("init CH emitter")?;
+            let emitter =
+                Emitter::new(emitter_cfg, catalog.clone(), std_tcp).context("init CH emitter")?;
             eprintln!("ch emitter: connected to {addr}");
             Box::new(EmitterObserver::new(emitter))
         }

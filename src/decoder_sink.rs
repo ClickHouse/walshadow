@@ -350,9 +350,7 @@ mod tests {
         ] {
             obs.on_tuple(&wrap(mk(op, false))).await.unwrap();
         }
-        obs.on_tuple(&wrap(mk(HeapOp::Update, true)))
-            .await
-            .unwrap();
+        obs.on_tuple(&wrap(mk(HeapOp::Update, true))).await.unwrap();
         assert_eq!(obs.stats.decoded, 6);
         assert_eq!(obs.stats.inserts, 2);
         assert_eq!(obs.stats.updates, 2);

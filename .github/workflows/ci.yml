@@ -20,9 +20,18 @@ concurrency:
 
 jobs:
   test:
-    name: build + e2e
+    name: build + e2e (pg${{ matrix.pg-major }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+
+    # walshadow operationally supports PG 16+ (see PLAN.md "Supported
+    # PostgreSQL versions"). Matrix pins the on-PATH PG binaries to one
+    # specific major; tests + fixture-capture scripts pick up whichever
+    # `initdb` / `pg_ctl` / `postgres` lands first.
+    strategy:
+      fail-fast: false
+      matrix:
+        pg-major: [16, 17, 18]
 
     steps:
       - name: Checkout walshadow
@@ -46,26 +55,36 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: walshadow
+          # Key on PG major so a feature/test-config change for one
+          # major doesn't poison the others' caches.
+          key: pg${{ matrix.pg-major }}
 
       - name: Install C deps (lz4 + zstd for clickhouse-c-rs)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential liblz4-dev libzstd-dev
+            build-essential liblz4-dev libzstd-dev curl gnupg lsb-release
 
-      # ubuntu-latest ships postgresql-16 preinstalled (server stopped) but
-      # initdb/pg_ctl/postgres aren't on PATH — they live under per-version
-      # libdirs. Pick the newest installed major and prepend its bin dir.
-      - name: PostgreSQL on PATH (for shadow + source PG e2e tests)
+      # The runner's preinstalled postgresql-common ships only one major
+      # at a time; pull the requested major straight from PGDG so the
+      # matrix can pin any of 16 / 17 / 18 independently of the runner
+      # image's choice. `systemctl stop postgresql` parks any auto-
+      # started instance so tests own the unix-socket dirs cleanly.
+      - name: Install PostgreSQL ${{ matrix.pg-major }} (PGDG)
         run: |
-          PG_BIN=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
-          if [ -z "$PG_BIN" ]; then
-            sudo apt-get install -y --no-install-recommends postgresql
-            PG_BIN=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
-          fi
-          echo "Using PG binaries at: $PG_BIN"
+          sudo systemctl stop postgresql 2>/dev/null || true
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgres-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgres-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg-major }} \
+            postgresql-client-${{ matrix.pg-major }}
+          sudo systemctl stop postgresql 2>/dev/null || true
+          PG_BIN=/usr/lib/postgresql/${{ matrix.pg-major }}/bin
+          "$PG_BIN/postgres" -V
           "$PG_BIN/initdb" --version
-          "$PG_BIN/pg_ctl" --version
           echo "$PG_BIN" >> "$GITHUB_PATH"
 
       # Official deb repo gives us both the `clickhouse` multitool (for
@@ -73,7 +92,7 @@ jobs:
       # readme_quickstart that connects to localhost:9000).
       - name: Install ClickHouse (server + client)
         run: |
-          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+          sudo apt-get install -y apt-transport-https ca-certificates
           curl -fsSL https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" \
@@ -100,14 +119,30 @@ jobs:
           sudo tail -n 200 /var/log/clickhouse-server/clickhouse-server.err.log || true
           exit 1
 
+      # classify / filter / xlog_switch / vacuum_full_pg_depend tests
+      # silently skip when no fixture bytes are present. Regenerate
+      # them against the matrix PG major so each job's
+      # filter_round_trip + classify_fixture + wal_stream_chunk_boundary
+      # actually runs against that major's WAL layout.
+      - name: Regenerate WAL fixtures (PG ${{ matrix.pg-major }})
+        working-directory: walshadow
+        env:
+          WALSHADOW_USE_LOCAL: "1"
+        run: |
+          fixtures/wal/classify/capture.sh
+          fixtures/wal/filter/capture.sh
+          fixtures/wal/xlog_switch/capture.sh
+          fixtures/wal/vacuum_full_pg_depend/capture.sh
+
       - name: Build (workspace + tests)
         working-directory: walshadow
         run: cargo build --workspace --all-targets --locked
 
       # All e2e tests run: shadow_lifecycle, shadow_catalog, catalog_seed,
       # wal_stream_e2e (need initdb), classify_fixture + filter_round_trip
-      # (use checked-in fixtures), clickhouse-c-rs clickhouse_local +
-      # readme_quickstarts (need clickhouse binary + server on :9000).
+      # + wal_stream_chunk_boundary (use the freshly regenerated fixtures),
+      # clickhouse-c-rs clickhouse_local + readme_quickstarts (need
+      # clickhouse binary + server on :9000).
       - name: Test (workspace, single-threaded — each test owns a PG cluster)
         working-directory: walshadow
         env:
@@ -115,6 +150,143 @@ jobs:
           # avoid thrashing the runner by serializing.
           RUST_TEST_THREADS: "1"
         run: cargo test --workspace --all-targets --locked -- --nocapture
+
+      - name: ClickHouse server logs on failure
+        if: failure()
+        run: sudo tail -n 500 /var/log/clickhouse-server/clickhouse-server.err.log || true
+
+  # Line-coverage baseline so future work can track movement. Runs the
+  # full e2e suite under `cargo llvm-cov` against the middle supported
+  # major (PG 17) — one major is enough for a coverage baseline; the
+  # matrix above proves cross-version behaviour separately. Uploads
+  # `lcov.info` + an HTML report as artifacts; summary lands in the
+  # job log.
+  coverage:
+    name: line coverage (pg17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout walshadow
+        uses: actions/checkout@v6
+        with:
+          path: walshadow
+
+      - name: Checkout wal-rs (private path dep)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.WAL_RS_REPO }}
+          path: wal-rs
+          ssh-key: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # cargo-llvm-cov needs `llvm-profdata` + `llvm-cov` shipped by
+          # this component.
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: walshadow
+          # Instrumented builds differ from the test job's; pin a
+          # separate cache key so they don't collide.
+          key: coverage
+
+      - name: Install C deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential liblz4-dev libzstd-dev curl gnupg lsb-release
+
+      - name: Install PostgreSQL 17 (PGDG)
+        run: |
+          sudo systemctl stop postgresql 2>/dev/null || true
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgres-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgres-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-17 postgresql-client-17
+          sudo systemctl stop postgresql 2>/dev/null || true
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Install ClickHouse (server + client)
+        run: |
+          sudo apt-get install -y apt-transport-https ca-certificates
+          curl -fsSL https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update
+          DEBIAN_FRONTEND=noninteractive sudo -E apt-get install -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            clickhouse-server clickhouse-client clickhouse-common-static
+
+      - name: Start ClickHouse server
+        run: |
+          sudo service clickhouse-server start
+          for i in $(seq 1 60); do
+            if clickhouse-client --query "SELECT 1" >/dev/null 2>&1; then
+              echo "clickhouse-server up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          sudo tail -n 200 /var/log/clickhouse-server/clickhouse-server.err.log || true
+          exit 1
+
+      - name: Regenerate WAL fixtures (PG 17)
+        working-directory: walshadow
+        env:
+          WALSHADOW_USE_LOCAL: "1"
+        run: |
+          fixtures/wal/classify/capture.sh
+          fixtures/wal/filter/capture.sh
+          fixtures/wal/xlog_switch/capture.sh
+          fixtures/wal/vacuum_full_pg_depend/capture.sh
+
+      # Single `--no-report` test pass so cargo only instruments &
+      # executes the suite once; subsequent `report` invocations re-read
+      # the cached profdata to emit lcov + html + summary.
+      - name: Run instrumented test suite (cargo llvm-cov)
+        working-directory: walshadow
+        env:
+          RUST_TEST_THREADS: "1"
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --all-targets --locked --no-report \
+            -- --nocapture
+
+      - name: Coverage summary (job log)
+        working-directory: walshadow
+        run: cargo llvm-cov report --summary-only
+
+      - name: Coverage lcov.info
+        working-directory: walshadow
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Coverage HTML
+        working-directory: walshadow
+        run: cargo llvm-cov report --html
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            walshadow/lcov.info
+            walshadow/target/llvm-cov/html
+          if-no-files-found: error
+          retention-days: 30
 
       - name: ClickHouse server logs on failure
         if: failure()

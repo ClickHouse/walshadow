@@ -278,7 +278,10 @@ async fn commit_drains_spilled_then_in_memory_entries() {
         if i < 3 {
             assert!(lsn < 200, "entry {i} expected spilled (lsn<200), got {lsn}");
         } else {
-            assert!(lsn >= 200, "entry {i} expected in-memory (lsn≥200), got {lsn}");
+            assert!(
+                lsn >= 200,
+                "entry {i} expected in-memory (lsn≥200), got {lsn}"
+            );
         }
     }
 }
