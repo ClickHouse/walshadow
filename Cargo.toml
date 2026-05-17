@@ -42,7 +42,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"
 fallible-iterator = "0.2"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 pglz = "0.1"
 postgres-protocol = "0.6"
 serde = { version = "1", features = ["derive"] }
@@ -51,7 +51,7 @@ smallvec = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "fs", "sync"] }
 tokio-postgres = "0.7"
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 zstd = "0.13"
 
 [dev-dependencies]

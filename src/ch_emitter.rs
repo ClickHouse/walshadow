@@ -242,8 +242,7 @@ impl EmitterConfig {
     /// ```
     pub fn from_toml_str(s: &str) -> Result<Self, EmitterError> {
         use toml::Value;
-        let root: Value = s
-            .parse()
+        let root: Value = toml::de::from_str(s)
             .map_err(|e: toml::de::Error| EmitterError::Config(format!("toml: {e}")))?;
         let mut out = Self::default();
         if let Some(ch) = root.get("ch").and_then(Value::as_table) {
