@@ -40,10 +40,12 @@ docs that are not yet committed work sit alongside as peers.
   [Phase 7](PLAN.md#phase-7--ch-native-emitter-via-clickhouse-c-rs).
   Not committed work. [BASEBACKUP.md](BASEBACKUP.md).
 - **SEGMENT_COMPRESSION** — evaluation: compressed WAL segment file
-  ingestion (`*.zst`, `*.lz4`, `*.gz`, `*.lzma`). Lift sits in
-  wal-rs (new sync `read_segment_file_sync` + `Method::Gz`);
-  walshadow flips `walshadow-filter` to it and drops the
-  test-local `decompress_gz` helpers. Sibling of FPI_COMPRESSION;
+  ingestion (`*.zst`, `*.lz4`, `*.gz`, `*.lzma`). wal-rs gets
+  `Method::Gz` + `classify_segment_path` + async
+  `open_segment_file`; `walshadow-filter` flips to
+  `#[tokio::main(flavor = "current_thread")]` and feeds the
+  decoder into the existing sync `filter_segment`. Test-local
+  `decompress_gz` helpers go away. Sibling of FPI_COMPRESSION;
   independent. [SEGMENT_COMPRESSION.md](SEGMENT_COMPRESSION.md).
 - **FPI_COMPRESSION** — evaluation: decompress `wal_compression
   = pglz|lz4|zstd` full-page images via new walshadow modules

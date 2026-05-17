@@ -241,3 +241,191 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         records.events.len(),
     );
 }
+
+fn pg_class_filenode(sh: &Shadow) -> u32 {
+    sh.psql_one("SELECT pg_relation_filenode('pg_class'::regclass)::int8")
+        .expect("filenode")
+        .parse()
+        .expect("integer")
+}
+
+/// PRE5b2 regression: walshadow-stream against a source whose pg_class
+/// was rotated above 16384 *before* attach. Without
+/// `seed_from_source`, heap writes targeting the rotated pg_class
+/// filenode classify as User and get dropped (the bootstrap rule
+/// `< FirstNormalObjectId` misses post-rotation filenodes, and the
+/// authoritative `XLOG_RELMAP_UPDATE` sits in pre-attach WAL the
+/// stream never sees).
+///
+/// With seed, the tracker knows pg_class's current filenode at
+/// attach; subsequent DDL writes on that filenode are kept and
+/// surfaced via `tracker.pg_class_writes_decoded`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = make_source(&tmp, 55802);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("base conf");
+    append_replication_conf(&source);
+    source.start().expect("start source");
+    let _stop = StopOnDrop { sh: &source };
+
+    // Rotate pg_class until its filenode crosses 16384 — otherwise the
+    // bootstrap rule already catches it and the seed has nothing to
+    // contribute.
+    let mut iters = 0;
+    loop {
+        source
+            .psql_one("VACUUM FULL pg_class")
+            .expect("vacuum full pg_class");
+        if pg_class_filenode(&source) >= 16384 {
+            break;
+        }
+        iters += 1;
+        assert!(
+            iters < 200,
+            "pg_class filenode stayed below 16384 after {iters} VACUUM FULL passes",
+        );
+    }
+    let pg_class_fn = pg_class_filenode(&source);
+    assert!(pg_class_fn >= 16384);
+    let db: u32 = source
+        .psql_one("SELECT oid::int8 FROM pg_database WHERE datname = current_database()")
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Force a segment switch so the rotation's WAL records sit in a
+    // closed segment behind us — the attach starts fresh and never
+    // sees the corresponding XLOG_RELMAP_UPDATE.
+    source.psql_one("SELECT pg_switch_wal()").expect("switch");
+
+    let cfg = source.config();
+    let pgcfg = PgConfig {
+        host: cfg.socket_dir.to_string_lossy().into_owned(),
+        port: cfg.port,
+        user: "postgres".into(),
+        password: None,
+        database: "postgres".into(),
+        application_name: "walshadow-pre-rotated".into(),
+        sslmode: SslMode::Disable,
+    };
+    let mut feed = SourceFeed::connect(&pgcfg)
+        .await
+        .expect("source feed connect")
+        .with_status_interval(Duration::from_millis(500));
+    let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
+    let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+
+    // Seed *before* START_REPLICATION. Without this line the test
+    // would catch the regression: tracker would never learn the
+    // rotated filenode and the pg_class writes below would be dropped.
+    {
+        let sql_client = feed.sql_client().await.expect("sidecar sql client");
+        let added = stream
+            .filter_mut()
+            .tracker
+            .seed_from_source(sql_client)
+            .await
+            .expect("seed_from_source");
+        assert!(added > 0, "seed must add ≥1 catalog filenode");
+    }
+    assert!(
+        stream.filter().tracker.is_catalog(db, pg_class_fn),
+        "after seed, rotated pg_class filenode {pg_class_fn} (db {db}) must be catalog",
+    );
+
+    feed.start_physical_replication(None, aligned, ident.timeline)
+        .await
+        .expect("START_REPLICATION");
+
+    // Generate DDL that updates pg_class on the rotated filenode, then
+    // switch to roll a segment.
+    let pump_sock = source.config().socket_dir.clone();
+    let pump_port = source.config().port;
+    let driver = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = Command::new("psql")
+            .args([
+                "-h",
+                pump_sock.to_str().unwrap(),
+                "-p",
+                &pump_port.to_string(),
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-c",
+                "CREATE SCHEMA s; \
+                 CREATE TABLE s.a (id int primary key); \
+                 CREATE TABLE s.b (id int primary key); \
+                 CREATE TABLE s.c (id int primary key); \
+                 ALTER TABLE s.a ADD COLUMN payload text; \
+                 SELECT pg_switch_wal();",
+            ])
+            .output();
+    });
+
+    let out_dir = tmp.path().join("filtered");
+    let mut records = CollectingRecordSink::default();
+    let mut segs = DirSegmentSink::new(out_dir.clone()).expect("out dir");
+    let mut buf = Vec::with_capacity(64 * 1024);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut segments_shipped = 0u64;
+    let mut prev = stream.dispatched_lsn();
+    while segments_shipped < 1 && std::time::Instant::now() < deadline {
+        let apply_lsn = stream.dispatched_lsn();
+        let next =
+            tokio::time::timeout(Duration::from_secs(2), feed.next_chunk(apply_lsn, &mut buf))
+                .await;
+        let chunk = match next {
+            Ok(Ok(Some(c))) => c,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => panic!("source feed error: {e:#}"),
+            Err(_) => continue,
+        };
+        stream
+            .push(chunk.start_lsn, chunk.data, &mut records, &mut segs)
+            .expect("push");
+        let now = stream.dispatched_lsn();
+        if now != prev {
+            segments_shipped += (now - prev) / WAL_SEG_SIZE;
+            prev = now;
+        }
+    }
+    let _ = driver.join();
+    assert!(segments_shipped >= 1, "no segments shipped in 15s");
+
+    let filter = stream.filter();
+    let tracker = &filter.tracker;
+    // CREATE TABLE / ALTER TABLE write to pg_class. With seed,
+    // `is_pg_class_relfilenode(db, pg_class_fn)` is true and the
+    // decoder runs on every such block — counters must move off zero.
+    let recognized = tracker.pg_class_writes_decoded + tracker.pg_class_writes_undecoded;
+    assert!(
+        recognized > 0,
+        "expected pg_class heap writes on rotated filenode {pg_class_fn} to be recognized; \
+         got decoded={} undecoded={}",
+        tracker.pg_class_writes_decoded,
+        tracker.pg_class_writes_undecoded,
+    );
+    // The same writes were classified User but promoted to Keep via
+    // the tracker's catalog set — kept_user counts them.
+    assert!(
+        filter.stats.kept_user > 0,
+        "expected pg_class writes on rotated filenode to be kept as user-classified \
+         catalog records; kept_user={}",
+        filter.stats.kept_user,
+    );
+    eprintln!(
+        "pre-rotated e2e: pg_class_fn={pg_class_fn}, recognized={recognized}, \
+         kept_user={}, dropped={}",
+        filter.stats.kept_user, filter.stats.dropped,
+    );
+}

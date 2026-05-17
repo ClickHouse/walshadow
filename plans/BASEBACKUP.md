@@ -25,15 +25,18 @@ filenodes.
   `pg_proc`, …) ride `pg_filenode.map`. Source's filenode for
   `pg_class` after a prior `VACUUM FULL pg_class` could be `>= 16384`;
   shadow's stays at its fresh initdb value. Heap-WAL records target
-  source's filenode and land on a file shadow's `pg_class` row
-  doesn't reference. [PRE5 item 3](PRE5.md#3-pg_filenode-map-attach-time-bootstrap)
-  patches this by rewriting shadow's `pg_filenode.map` from a SQL
-  query against source — works, but needs `pg_relation_filenode`
-  privileges and adds a bootstrap-time SQL fan-out.
+  source's filenode, recovery creates a fresh file at that path, and
+  shadow's own `pg_class` (still at its initdb filenode) never sees
+  the post-replay state — `ShadowCatalog` reads stale rows. The
+  schema-only path has no fix. [PRE5 item 3 / PRE5b2](PRE5b2.md)
+  seeds walshadow's runtime `CatalogTracker` from source so the WAL
+  filter classifies records on the rotated filenode correctly, but
+  does not touch shadow's on-disk `pg_filenode.map`; the
+  ShadowCatalog-side skew remains.
 * **Non-mapped catalogs** (`pg_depend`, `pg_index`, `pg_constraint`,
   …) have the same skew when source has rotated them via
   `VACUUM FULL` / `REINDEX` before walshadow attaches. The
-  schema-only path has *no* fix for this. [PRE5 item 2](PRE5.md#2-pg_class-heap-write-decoding)
+  schema-only path has *no* fix for this either. [PRE5 item 2](PRE5.md#2-pg_class-heap-write-decoding)
   catches future rotations from WAL, but the initial state is left
   to luck: shadow's fresh `pg_depend` filenode happens to match
   source's only if source has not rotated it.
@@ -212,10 +215,13 @@ data_dir" pass. Pseudo-flow:
 
 * `pg_dump` privileges not required on source; replication grant is
   enough.
-* Mapped catalog filenodes match source at start_lsn — [PRE5 item 3](PRE5.md#3-pg_filenode-map-attach-time-bootstrap)
-  becomes redundant.
-* Non-mapped catalog filenodes match source — closes a class of skew
-  the schema-only path has no fix for.
+* Mapped catalog filenodes on shadow match source at start_lsn —
+  closes the on-disk half of Gap 1 (the schema-only path leaves
+  shadow's `pg_filenode.map` skewed). [PRE5b2](PRE5b2.md)'s
+  `seed_from_source` stays load-bearing on the walshadow runtime
+  tracker side; BASE_BACKUP populates shadow, not walshadow.
+* Non-mapped catalog filenodes on shadow match source — closes a
+  class of skew the schema-only path has no fix for.
 * `clog/` and `pg_multixact/` are pre-populated; catalog tuple
   visibility resolves at start_lsn without a separate xact-status
   pre-load.
@@ -578,8 +584,7 @@ src/source_feed.rs         +~30         slot create before BASE_BACKUP (uses
                                             wal-rs's new create_physical_slot)
 tests/base_backup_e2e.rs   new — ~250 LOC  live source + shadow + CH
 fixtures/wal/base_backup/   new           capture script + sentinel fixture
-PLAN.md                    add Phase 6.5; mark PRE5 #3 redundant under
-                             base_backup bootstrap mode
+PLAN.md                    add Phase 6.5
 BASEBACKUP.md              this doc
 ```
 
@@ -608,9 +613,12 @@ the ~1300+ LOC of base-backup machinery already in wal-rs.
    default bootstrap, replacing `Shadow::apply_schema_dump` for any
    source reachable via REPLICATION. Keep `apply_schema_dump` as a
    fallback for environments without REPLICATION grants and for
-   test scaffolding. Eliminates [PRE5 item 3](PRE5.md#3-pg_filenode-map-attach-time-bootstrap)
-   from the critical path and closes the non-mapped-catalog skew
-   the schema-only path cannot reach.
+   test scaffolding. Closes shadow's on-disk filenode skew for
+   mapped *and* non-mapped catalogs in one step; the schema-only
+   path leaves both unaddressed. [PRE5b2](PRE5b2.md)'s
+   `seed_from_source` stays load-bearing on the daemon side
+   (walshadow's runtime `CatalogTracker` is distinct from shadow's
+   on-disk state — BASE_BACKUP does not seed it).
 2. Adopt **Use Case 2B (COPY from shadow once consistent)** for CH
    initial load. Pair with Use Case 1A transiently (keep user heap
    on shadow until CH has acked the snapshot), then run the prune
@@ -746,8 +754,9 @@ disk is unconstrained and decoder simplicity dominates.
 
 ### What this reorders in the doc
 
-* PRE5 #3 redundancy claim (line 215) still holds — Use Case 1
-  bootstrap is orthogonal to the 2A/2B/2C choice on the CH side.
+* [PRE5b2](PRE5b2.md)'s `seed_from_source` is independent of the
+  1x/2x choice and remains walshadow's source-of-truth for the
+  runtime `CatalogTracker` under every bootstrap mode.
 * Phase 6.5 acceptance criterion (`pgbench -i -s 10` round-trip)
   applies to whichever 2x path is configured; pick one for CI, gate
   the others as their own acceptance jobs.

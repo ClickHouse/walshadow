@@ -143,11 +143,29 @@ async fn run(args: Args) -> Result<()> {
         aligned as u32,
     );
 
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned)?;
+    // Seed the catalog tracker from source's *current* pg_class before
+    // START_REPLICATION. Closes the "long-running source rotated a
+    // mapped catalog above 16384 pre-attach" hole that the < 16384
+    // bootstrap rule misses on its own. Idempotent so `--start-lsn`
+    // resumes seed too.
+    {
+        let sql_client = feed
+            .sql_client()
+            .await
+            .context("open sidecar sql client for seed_from_source")?;
+        let added = stream
+            .filter_mut()
+            .tracker
+            .seed_from_source(sql_client)
+            .await
+            .context("seed_from_source")?;
+        eprintln!("seeded {added} catalog filenodes from source pg_class");
+    }
+
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;
-
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned)?;
     let mut record_sink = CollectingRecordSink::default();
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);

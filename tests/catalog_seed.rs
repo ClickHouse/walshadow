@@ -154,29 +154,49 @@ async fn seed_closes_pre_attach_pg_class_rotation_hole() {
     let _stop = StopOnDrop { sh: &sh };
 
     let pg_class_fn_before = pg_class_filenode_via_psql(&sh);
-    // Rotate pg_class — `VACUUM FULL pg_class` cycles its mapped
-    // filenode to a fresh value, usually above 16384 on a non-fresh
-    // cluster but always different from the prior value.
-    sh.psql_one("VACUUM FULL pg_class")
-        .expect("vacuum full pg_class");
+    // Rotate pg_class until its mapped filenode crosses FirstNormalObjectId
+    // (16384). A single `VACUUM FULL pg_class` on a fresh cluster can leave
+    // the new filenode below 16384, which silently neuters the assertions
+    // below (the bootstrap rule already catches < 16384, so seeding has
+    // nothing extra to prove). Loop until rotation exposes the hole the
+    // seed exists to close.
+    let mut iters = 0;
+    loop {
+        sh.psql_one("VACUUM FULL pg_class")
+            .expect("vacuum full pg_class");
+        let fn_now = pg_class_filenode_via_psql(&sh);
+        if fn_now >= 16384 {
+            break;
+        }
+        iters += 1;
+        assert!(
+            iters < 200,
+            "pg_class filenode stayed below 16384 after {iters} VACUUM FULL passes",
+        );
+    }
     let pg_class_fn_after = pg_class_filenode_via_psql(&sh);
     assert_ne!(
         pg_class_fn_before, pg_class_fn_after,
         "VACUUM FULL pg_class should rotate the filenode",
     );
+    assert!(
+        pg_class_fn_after >= 16384,
+        "test invariant: post-rotation filenode {} must be >= 16384 \
+         so the bootstrap rule actually misses it",
+        pg_class_fn_after,
+    );
 
     let db = current_db_oid(&sh);
 
-    // Tracker with no live WAL — only the bootstrap rule applies. If
-    // post-rotation filenode is >= 16384 the bootstrap rule misses it.
+    // Tracker with no live WAL — only the bootstrap rule (< 16384) applies.
+    // Now that we forced pg_class_fn_after >= 16384, the rule misses it
+    // unconditionally.
     let unseeded = CatalogTracker::new();
-    if pg_class_fn_after >= 16384 {
-        assert!(
-            !unseeded.is_catalog(db, pg_class_fn_after),
-            "without seed_from_source the rotated pg_class filenode {} must NOT be catalog",
-            pg_class_fn_after,
-        );
-    }
+    assert!(
+        !unseeded.is_catalog(db, pg_class_fn_after),
+        "without seed_from_source the rotated pg_class filenode {} must NOT be catalog",
+        pg_class_fn_after,
+    );
 
     // After seed, post-rotation filenode is in the catalog set.
     let client = connect(&sh).await;

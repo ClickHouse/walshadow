@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
+use tokio_postgres::{Client, NoTls};
 use wal_rs::pg::backup::parse_pg_lsn;
 use wal_rs::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
 use wal_rs::pg::replication::stream::{Frame, build_status_update, decode_frame};
@@ -40,8 +41,17 @@ pub struct SystemIdentity {
 
 /// One source connection in replication mode. Composes `ReplicationConn`
 /// (auth + framing) with walshadow's frame loop.
+///
+/// Lazily opens a sidecar non-replication `tokio_postgres::Client` for
+/// SQL queries that the replication-mode connection cannot serve (eg
+/// `CatalogTracker::seed_from_source`). Same `PgConfig`, NoTLS — TLS
+/// over the sidecar would need a separate connector pipeline.
 pub struct SourceFeed {
     conn: ReplicationConn,
+    cfg: PgConfig,
+    /// Sidecar libpq client for non-replication queries. Opened on
+    /// first `sql_client` call.
+    sql_client: Option<Client>,
     /// Wall-clock budget between standby status updates.
     status_interval: Duration,
     last_status: Instant,
@@ -54,6 +64,8 @@ impl SourceFeed {
         let conn = ReplicationConn::connect(cfg).await?;
         Ok(Self {
             conn,
+            cfg: cfg.clone(),
+            sql_client: None,
             status_interval: DEFAULT_STATUS_INTERVAL,
             last_status: Instant::now(),
             last_acked_lsn: 0,
@@ -204,6 +216,39 @@ impl SourceFeed {
     pub fn server_version_num(&self) -> i32 {
         self.conn.server_version_num
     }
+
+    /// Borrow a sidecar `tokio_postgres::Client` for the same source,
+    /// opened lazily on first call. Replication-mode connections cannot
+    /// run arbitrary `SELECT`s cleanly (server only honours the small
+    /// replication-protocol command set); the seed/sidecar path uses
+    /// this fall-back connection.
+    pub async fn sql_client(&mut self) -> Result<&Client> {
+        if self.sql_client.is_none() {
+            let conninfo = sql_conninfo(&self.cfg);
+            let (client, conn) = tokio_postgres::connect(&conninfo, NoTls)
+                .await
+                .with_context(|| format!("sidecar sql connect to {}", self.cfg.host))?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            self.sql_client = Some(client);
+        }
+        Ok(self.sql_client.as_ref().unwrap())
+    }
+}
+
+/// Build a libpq-style key=value conninfo for the sidecar SQL client.
+/// Mirrors `shadow_catalog::socket_conninfo` for unix sockets and adds
+/// `password=` when present.
+fn sql_conninfo(cfg: &PgConfig) -> String {
+    let mut s = format!(
+        "host={} port={} user={} dbname={} application_name={}-sql",
+        cfg.host, cfg.port, cfg.user, cfg.database, cfg.application_name,
+    );
+    if let Some(pw) = &cfg.password {
+        s.push_str(&format!(" password={pw}"));
+    }
+    s
 }
 
 #[inline]

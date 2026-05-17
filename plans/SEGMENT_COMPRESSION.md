@@ -6,8 +6,8 @@ committed work**.
 
 Lift sits on the wal-rs side per the project boundary
 ([BASEBACKUP.md §"Library surface to shape on wal-rs"](BASEBACKUP.md)
-sets the precedent). Walshadow keeps its sync, byte-slice consumer
-contract.
+sets the precedent). Walshadow consumes via the binaries' tokio
+runtimes; `filter_segment` itself stays sync.
 
 ## Why
 
@@ -47,15 +47,43 @@ Codec coverage target: `zstd`, `lz4`, `gzip`, `lzma` (wal-g), plus
 uncompressed. `brotli` is wal-rs's choice; walshadow inherits but
 doesn't push the matrix.
 
+## Async layering
+
+`filter_segment` is pure CPU with random-access rewrite
+(`filter_segment.rs:73` scatters NOOP bytes back into `out` at the
+walker-recorded ranges). Stays sync. Wrapping it in `async`
+would add poll boilerplate around a synchronous CPU walk with zero
+suspension points.
+
+The binaries drive the async pipeline:
+
+* `walshadow-stream` is already `#[tokio::main(flavor = "multi_thread")]`.
+* `walshadow-filter` flips from sync `fn main` to
+  `#[tokio::main(flavor = "current_thread")]`. Tokio is already a
+  walshadow direct dep (`Cargo.toml:37`), so binary-size and
+  build-graph cost is nil. Per-invocation runtime cost on a CLI
+  tool is sub-millisecond, irrelevant against 16 MiB of segment I/O.
+
+Bytes flow: file path → wal-rs async decoder → `read_to_end` into a
+`Vec<u8>` → `filter_segment(&bytes, &name, &mut filter)`.
+
+Materialising into a `Vec<u8>` (single 16 MiB allocation per segment)
+is the right call for now: `filter_segment` needs the whole segment
+in hand to walk records and scatter rewrites. A future
+chunk-driven walker (already noted in `wal_stream.rs:13-16`) could
+push back to a streaming `AsyncRead` consumer, but that's an
+orthogonal redesign — not gated on compression support.
+
 ## What wal-rs already gives us
 
 * `compression::Method` with `from_extension(".zst"|".lz4"|"…")`,
   `from_name("zstd"|"lz4"|"…")`, `extension(self) -> &'static str`.
   Covers `None | Zstd | Brotli | Lz4 | Lzma`. **Gap: no `Gz`** —
   wal-rs writes archive bytes but never gzip; the existing tests'
-  `decompress_gz` helper is doing this only because the fixtures were
-  captured via `gzip`. Adding `Gz` is a sympathetic ~20 LOC lift on
-  wal-rs (flate2 already transitive via reqwest).
+  `decompress_gz` helper exists only because the fixtures were
+  captured via `gzip`. Adding `Gz` is a sympathetic ~20 LOC lift
+  (async-compression's `GzipEncoder` / `GzipDecoder` already
+  reachable via feature flag).
 * `compression::decode(method, AsyncReader) -> AsyncReader` —
   reader-to-reader transform via async-compression. Memory cost is
   codec-window-sized, not segment-sized.
@@ -65,11 +93,12 @@ doesn't push the matrix.
 * `pg::wal::show.rs:109` strips one compression suffix from the
   filename to recover the segment name. Reusable.
 
-Missing on the wal-rs side: a **sync, file-path-keyed** helper that
-auto-detects from the suffix and returns uncompressed segment bytes.
-The async machinery is good for object-store streaming; walshadow's
-sync `filter_segment(&[u8], &str, &mut Filter)` contract wants bytes
-in hand.
+Missing on the wal-rs side:
+
+* Path-suffix classifier shared between `fetch.rs`, `show.rs`, and
+  walshadow's binary.
+* Thin async helper that opens a file, attaches the decoder based
+  on the classifier, returns an `AsyncReader`.
 
 ## Proposed wal-rs surface
 
@@ -80,59 +109,45 @@ in hand.
 pub enum SegmentFileError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("compression: {0}")]
-    Decompress(#[from] crate::compression::CompressionError),
     #[error("unsupported suffix {0:?}")]
     UnsupportedSuffix(String),
-    #[error("decoded size {got} != expected {expected}")]
-    SizeMismatch { got: usize, expected: usize },
+    #[error("not a segment name: {0:?}")]
+    BadSegmentName(String),
 }
 
-/// Detect compression from the trailing suffix (after stripping a
-/// single `.partial`), inflate to a `Vec<u8>`, optionally verify
-/// against `expected_size` (typically `DEFAULT_WAL_SEG_SIZE`).
-///
-/// `path` may name an uncompressed segment (no suffix), an archived
-/// segment (`*.zst`, `*.lz4`, `*.gz`, `*.lzma`, `*.br`), or a
-/// `pg_receivewal --compress` partial (`*.zst.partial`, etc).
-pub fn read_segment_file_sync(
-    path: &std::path::Path,
-    expected_size: Option<u64>,
-) -> Result<Vec<u8>, SegmentFileError>;
-
-/// Async counterpart for callers driving wal-rs's existing
-/// AsyncReader pipeline. Detects suffix, returns the streaming
-/// reader. Caller decides whether to materialise.
-pub fn read_segment_file_async(
-    path: &std::path::Path,
-) -> Result<crate::compression::AsyncReader, SegmentFileError>;
-
-/// Pure suffix → Method classifier with `.partial` peel-off. Public
-/// so the existing fetch path and walshadow's restore_command shim
-/// share one source of truth (currently fetch.rs has its own
-/// `CANDIDATE_EXTS` and `show.rs` has its own stripper).
+/// Pure suffix → (canonical segment name, codec) classifier with one
+/// `.partial` peel-off. Public so the existing fetch path and
+/// walshadow's binary share one source of truth.
 pub fn classify_segment_path(
     path: &std::path::Path,
 ) -> Result<(SegmentName, crate::compression::Method), SegmentFileError>;
+
+/// Open a segment file, attach the decoder selected by
+/// `classify_segment_path`. Caller drives the reader (typically
+/// `tokio::io::AsyncReadExt::read_to_end` into a `Vec<u8>`; future
+/// chunk-driven walker streams directly).
+pub async fn open_segment_file(
+    path: &std::path::Path,
+) -> Result<
+    (SegmentName, crate::compression::AsyncReader),
+    SegmentFileError,
+>;
 ```
 
 Implementation budget on wal-rs:
 
 ```
-src/compression/mod.rs            +~30   Method::Gz variant + flate2
-                                        (gated behind existing async-
-                                        compression feature flag)
-src/pg/wal/segment_file.rs        new — ~120 LOC  sync + async helpers,
-                                                  partial-suffix peel,
-                                                  size verification
+src/compression/mod.rs            +~30   Method::Gz variant
+src/pg/wal/segment_file.rs        new — ~80 LOC   classifier + async opener,
+                                                   partial-suffix peel
 src/pg/wal/mod.rs                 +~3    re-export
-tests                             +~150  per-codec round-trip on a
-                                        16 MiB zeroed segment plus
-                                        one real captured segment per
-                                        codec for fixture parity
+Cargo.toml                        +~1    async-compression["gzip"] feature
+tests                             +~120  per-codec round-trip on a
+                                         16 MiB zeroed segment plus
+                                         classifier unit tests
 ```
 
-Total wal-rs: ~150 LOC src + ~150 LOC tests. No breaking changes:
+Total wal-rs: ~110 LOC src + ~120 LOC tests. No breaking changes:
 `Method::Gz` is additive; existing call sites (`pg/wal/fetch.rs`'s
 `CANDIDATE_EXTS`) opt in by extending the slice when gzip enters
 their codec matrix. The classifier helper supersedes private logic
@@ -140,84 +155,85 @@ in `fetch.rs` and `show.rs` but those keep their current behaviour
 during migration — flip them in a follow-up commit so the surface
 change is observable in isolation.
 
-### Synchronous bridge
-
-`read_segment_file_sync` needs the same async-compression pipeline
-as the async path; running tokio for one file would be heavy. Two
-implementation choices:
-
-* **A.** Pull the codecs from the sync side directly: `lz4`,
-  `zstd::stream::read::Decoder`, `flate2::read::GzDecoder`,
-  `xz2::read::XzDecoder`, `brotli::Decompressor`. All sync, all in
-  the existing transitive dep graph or one-step adds. Replaces the
-  async pipeline for the sync helper only.
-* **B.** Drive the async pipeline via a `Runtime::new_current_thread()`
-  inside the helper. Adds tokio overhead per call; simpler code.
-
-**A** is preferred. Memory cost is bounded (single segment ≤ 16 MiB),
-and the sync codec crates are the same C libs the async ones wrap;
-no duplication.
-
 ## Walshadow consumers
 
 ### `walshadow-filter` binary
 
-`src/bin/filter.rs:54`:
+`src/bin/filter.rs:42` becomes:
 
 ```rust
-let bytes =
-    fs::read(&args.input).with_context(|| format!("read input {}", args.input.display()))?;
-let name = args.input.file_name()…;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    match run(Args::parse()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => { eprintln!("walshadow-filter: {e:#}"); ExitCode::FAILURE }
+    }
+}
+
+async fn run(args: Args) -> Result<()> {
+    let (seg_name, reader) = wal_rs::pg::wal::open_segment_file(&args.input)
+        .await
+        .with_context(|| format!("open {}", args.input.display()))?;
+    let mut bytes = Vec::with_capacity(WAL_SEG_SIZE as usize);
+    tokio::pin!(reader);
+    reader.read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("decode {}", args.input.display()))?;
+    let name = seg_name.format();
+
+    let mut filter = Filter::new();
+    let (filtered, manifest) = filter_segment(&bytes, &name, &mut filter)
+        .with_context(|| format!("filter {}", args.input.display()))?;
+    // …existing write logic, now async-friendly fs ops or tokio::fs.
+}
 ```
 
-Becomes:
+Side-effects:
 
-```rust
-let (seg_name, _method) = wal_rs::pg::wal::classify_segment_path(&args.input)
-    .with_context(|| format!("classify {}", args.input.display()))?;
-let bytes = wal_rs::pg::wal::read_segment_file_sync(&args.input, Some(WAL_SEG_SIZE))
-    .with_context(|| format!("read input {}", args.input.display()))?;
-let name = seg_name.format();
-```
-
-Side-effects: the manifest's `source_segment` now consistently uses
-the canonical 24-hex name, dropping any suffix the operator passed
-on the command line. Today the binary uses
-`args.input.file_name()` raw, so `00000001000000000000001A.zst` rides
-through into the manifest. The classifier-keyed lookup is the right
-fix — but flag this as an observable change to anyone parsing
-manifest sidecars.
+* Manifest `source_segment` now uses the canonical 24-hex name from
+  the classifier rather than `args.input.file_name()` raw. Today
+  `00000001000000000000001A.zst` rides through into the manifest;
+  the change normalises it. Flag in CHANGELOG; no `FILTER_VERSION`
+  bump (no schema change).
+* File-write side (`fs::write` of filtered segment + manifest)
+  stays `std::fs` — fast, sync, no contention worth tokio. Or flip
+  to `tokio::fs` for stylistic consistency; doesn't matter for
+  correctness.
 
 ### `walshadow-stream` binary
 
-Live wire stream is uncompressed. No change unless a future
-`--archive-source` flag lands (would pump segments out of an object
-store between live-stream and on-disk archive). Out of scope; the
-hook would be a new ingress, not a modification of the existing
-`SourceFeed` path.
+No change. Live wire is uncompressed. Future `--archive-source`
+flag (BASE_BACKUP catch-up replay) reuses `open_segment_file`
+naturally — same async surface as `SourceFeed`.
 
 ### Tests
 
 `tests/filter_round_trip.rs:33` + `tests/classify_fixture.rs:23`
-collapse to:
+collapse the local `decompress_gz` helpers. Three test shapes
+available:
 
-```rust
-let bytes = wal_rs::pg::wal::read_segment_file_sync(&seg, Some(WAL_SEG_SIZE))
-    .expect("read fixture");
-```
+* **`#[tokio::test]`** for tests that aren't doing much beyond
+  loading a fixture and calling `filter_segment`. Existing
+  `tests/wal_stream_e2e.rs` is already this shape.
+* **Sync test + `block_on` helper.** For tests that prefer to stay
+  sync, add a `walshadow::test_support::load_segment_blocking(path)
+  -> Vec<u8>` that builds a current-thread runtime and runs
+  `open_segment_file + read_to_end`. ~10 LOC of helper; lets
+  fixture loaders stay outside the async colour.
+* **Pre-baked `.bin` fixtures.** Keep one uncompressed fixture per
+  scenario as a sanity baseline; the compressed variants exercise
+  the new code path.
 
-The local `decompress_gz` helpers go away. Existing `.gz` fixtures
-work after wal-rs gains `Method::Gz`; nothing about the captured
-files changes.
+Recommendation: `#[tokio::test]` for fixture-heavy round-trip tests
+(`filter_round_trip`, `classify_fixture`); `block_on` helper if any
+existing sync test bodies bristle at conversion.
 
 ### Manifest
 
-`Manifest::source_segment` is a free-form string today
-(`filter_segment.rs:95`). Future readers may want to recover the
-original codec for diagnostic output. Out of scope for this plan —
-manifest stays segment-name-only. If a downstream consumer needs
-codec metadata, add a sidecar field with a major version bump on
-`FILTER_VERSION`.
+`Manifest::source_segment` stays a free-form string. Codec
+metadata is a non-goal for this plan. Future readers wanting the
+original codec can add a sidecar field with a `FILTER_VERSION`
+bump.
 
 ## Pitfalls
 
@@ -236,11 +252,9 @@ else is the segment name. Path with no compression suffix → `Method::None`.
 A `.partial` segment is well-formed up to its byte count: pages
 beyond the write are zero-padded by pg_receivewal. `filter_segment`
 already tolerates this via the zero-padded-page terminator in
-`SegmentWalker`. `expected_size = Some(WAL_SEG_SIZE)` size-check
-should treat `.partial` callers leniently — caller knows whether to
-require full size. Surface as `expected_size: Option<u64>` rather
-than mandatory; default `Some(WAL_SEG_SIZE)` in the binary, `None`
-in tests that hand-craft sub-segment fixtures.
+`SegmentWalker`. Size verification is opt-in by the caller: the
+binary checks `bytes.len() == WAL_SEG_SIZE` for `.zst` etc., skips
+the check for `.partial`.
 
 ### 3. Suffix vs magic-bytes detection
 
@@ -251,15 +265,7 @@ but adds I/O surface for no real benefit — operators never rename
 WAL files in archive. Skip magic-bytes; fail loudly on unrecognised
 suffix.
 
-### 4. Decoded-size verification
-
-Compressed-segment writers always produce exactly `WAL_SEG_SIZE`
-bytes when inflated (PG segment files are fixed-size). Verifying
-this catches corruption in transit and operator mistakes (truncated
-download, half-written archive). Cheap; `expected_size` knob makes
-it opt-in for fixture authors who genuinely need sub-segment files.
-
-### 5. Live wire path is genuinely uncompressed
+### 4. Live wire path is genuinely uncompressed
 
 `START_REPLICATION PHYSICAL` emits CopyData(`'w'`) frames carrying
 raw WAL bytes. No matter what `wal_compression` is set to on source,
@@ -270,26 +276,28 @@ inside a WAL record" (does exist, see
 [FPI_COMPRESSION.md](FPI_COMPRESSION.md)) is the most common
 mis-framing — call it out in the binary `--help` text.
 
-### 6. `Method::Gz` lift on wal-rs
+### 5. `Method::Gz` lift on wal-rs
 
-wal-rs doesn't write gzip anywhere today. Adding `Gz` only to the
-sync helper risks divergence (decoders that accept gzip, encoders
-that don't). Cleanest path: add `Gz` to both `encode` and `decode`
-in `compression::mod.rs` with `async-compression`'s `GzipEncoder` /
-`GzipDecoder`, plus the sync helper's `flate2` codec. Symmetric
-matrix.
+wal-rs doesn't write gzip anywhere today. Adding `Gz` only as a
+decoder risks asymmetry. Cleanest path: add to both `encode` and
+`decode` in `compression::mod.rs` via async-compression's
+`GzipEncoder` / `GzipDecoder`, gated behind the
+`async-compression["gzip"]` feature. Symmetric matrix.
 
-### 7. Path-keyed surface vs reader-keyed surface
+### 6. `current_thread` runtime in `walshadow-filter`
 
-`read_segment_file_sync(&Path, …)` is concrete; alternative shape
-is `decode_with_method_sync(Method, &mut dyn Read) -> Vec<u8>` and
-let the caller open the file. Path-keyed is the right default
-because suffix detection lives one step removed from the caller —
-otherwise every caller re-implements suffix parsing. Reader-keyed
-variant can land as a follow-up if the future restore_command shim
-wants in-memory inputs (e.g. blob fetched from object store
-already in a `Bytes` buffer); thin wrapper, doesn't change the
-plan's surface count.
+`flavor = "current_thread"` avoids the multi-thread runtime's
+worker-pool startup cost (microseconds, but appreciable on a
+short-lived CLI tool). The decoder is single-threaded anyway —
+async-compression doesn't fan out across cores. No reason to pay
+for multi-thread runtime here.
+
+### 7. Sync `filter_segment` stays sync
+
+Explicit non-goal: do not change `filter_segment` to `async`. CPU
+work, no I/O, random-access rewrite — async surface would be poll
+boilerplate around synchronous code. The binary materialises bytes
+then calls into sync code; this is the right layering.
 
 ### 8. Compression-suffix in `SegmentName::parse`
 
@@ -303,55 +311,58 @@ needed. Keep the parser strict.
 
 ```
 wal-rs tests:
-  segment_file_sync_per_codec     16 MiB zeroed bytes, encode via
-                                   compression::encode, write to
-                                   tmpfile with the codec's extension,
-                                   read_segment_file_sync, assert
-                                   round-trip equal — one case per
-                                   {None, Gz, Lz4, Zstd, Lzma, Br}.
+  classify_segment_path            (name.zst, name.zst.partial,
+                                    name.lz4, name, name.bogus) →
+                                    (SegmentName, Method) or Err.
+  open_segment_file_per_codec      16 MiB zeroed bytes, encode via
+                                    compression::encode, write to
+                                    tmpfile, open_segment_file +
+                                    read_to_end, assert round-trip
+                                    equal — one case per
+                                    {None, Gz, Lz4, Zstd, Lzma, Br}.
   partial_suffix_peel              fixture named `…0001A.zst.partial`
-                                   classifies as Zstd + the bare name.
-  size_mismatch_errors             feed 8 MiB of zeros via Zstd,
-                                   ask for Some(16 MiB), expect
-                                   SegmentFileError::SizeMismatch.
+                                    classifies as Zstd + the bare
+                                    name.
   unsupported_suffix_errors        file `foo.7z`; expect Err.
 
 walshadow tests (re-using new wal-rs helper):
   filter_round_trip                drop local decompress_gz, switch
-                                   fixture reader to read_segment_file_sync.
-                                   Tests pass byte-identically.
+                                    fixture reader to
+                                    open_segment_file via either
+                                    #[tokio::test] or load_segment_blocking.
+                                    Tests pass byte-identically.
   classify_fixture                 same drop-in.
-  walshadow-filter cli             new test: pass a Zstd-compressed
-                                   captured segment to the binary,
-                                   assert the resulting filtered
-                                   segment + manifest match the
-                                   uncompressed-fixture baseline.
+  walshadow-filter cli             new #[tokio::test]: pass a
+                                    Zstd-compressed captured segment
+                                    to the binary (via assert_cmd or
+                                    Command), assert the filtered
+                                    segment + manifest match the
+                                    uncompressed-fixture baseline.
 ```
 
 ## Estimate
 
 ```
 wal-rs:
-  src/compression/mod.rs            +~30  Gz variant + level mapping
-  src/pg/wal/segment_file.rs        new — ~120
-  src/pg/wal/mod.rs                 +~3   re-export
-  Cargo.toml                        +~5   flate2 (or feature-on
-                                          async-compression["gzip"])
-                                          plus sync codec deps for the
-                                          sync helper: zstd, lz4,
-                                          flate2, xz2, brotli
-  tests                             +~200 (replaces ~60 LOC of inline
-                                           gunzip in existing tests)
+  src/compression/mod.rs            +~30   Method::Gz variant + level
+  src/pg/wal/segment_file.rs        new — ~80   classifier + async open
+  src/pg/wal/mod.rs                 +~3    re-export
+  Cargo.toml                        +~1    async-compression["gzip"]
+  tests                             +~120
 
 walshadow:
-  src/bin/filter.rs                 ±~10  delegate to wal-rs helper
-  tests/filter_round_trip.rs        -~30  drop decompress_gz
-  tests/classify_fixture.rs         -~30  drop decompress_gz
+  src/bin/filter.rs                 ±~30  flip to #[tokio::main],
+                                          delegate to open_segment_file
+  src/lib.rs (or test_support.rs)   +~15  block_on helper for tests
+  tests/filter_round_trip.rs        -~25  drop decompress_gz, swap
+                                          fixture loader
+  tests/classify_fixture.rs         -~25  drop decompress_gz, swap
+                                          fixture loader
   fixtures/wal/README.md            +~10  document codec matrix
   plans/SEGMENT_COMPRESSION.md      this
 ```
 
-Combined: ~350 LOC src + ~200 LOC tests, of which walshadow accounts
+Combined: ~260 LOC src + ~120 LOC tests, of which walshadow accounts
 for ~50 LOC of *delta* (most movement is line-deletes).
 
 ## Sequencing
@@ -362,20 +373,24 @@ for ~50 LOC of *delta* (most movement is line-deletes).
   chosen for catch-up; otherwise sequence freely.
 * Sibling commits possible across repos. wal-rs side lands first
   (gates the walshadow-side `cargo update`); walshadow follow-up
-  flips ingress + drops the test gunzip helpers.
+  flips the binary + drops the test gunzip helpers.
 
 ## Recommendation
 
-1. Land `Method::Gz` + `read_segment_file_sync` +
-   `classify_segment_path` in wal-rs. Sync helper uses sync codec
-   crates (option A); async helper continues through async-compression.
-2. Walshadow flips `walshadow-filter` to the new entry point and
-   drops the two test-local `decompress_gz` helpers. Fixture files
-   stay `.gz` for repo size; classifier transparently inflates.
-3. Manifest `source_segment` field gets the canonical 24-hex name
+1. Land `Method::Gz` + `classify_segment_path` + `open_segment_file`
+   in wal-rs. All async; no sync bridge needed.
+2. Walshadow flips `walshadow-filter` to `#[tokio::main(flavor =
+   "current_thread")]` and feeds the decoder output into the
+   existing sync `filter_segment`. Drop the two test-local
+   `decompress_gz` helpers; fixture loaders pick one of
+   `#[tokio::test]` or a `block_on` helper.
+3. `filter_segment` itself stays sync. The async layer lives at
+   the binary boundary, not inside the rewrite hot path.
+4. Manifest `source_segment` field gets the canonical 24-hex name
    (drops any suffix the operator passed). Note in CHANGELOG; no
-   `FILTER_VERSION` bump (no schema change, just normalisation).
-4. Defer object-store ingress (`--archive-source` on
+   `FILTER_VERSION` bump.
+5. Defer object-store ingress (`--archive-source` on
    `walshadow-stream`) until [BASEBACKUP.md](BASEBACKUP.md) Phase
-   6.5's catch-up replay materialises. The helpers in this plan
-   support that future ingress without further wal-rs change.
+   6.5's catch-up replay materialises. `open_segment_file`'s async
+   shape composes naturally with that ingress without further
+   wal-rs change.

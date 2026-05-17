@@ -235,6 +235,13 @@ impl WalStream {
         &self.filter
     }
 
+    /// Mutable access for pre-stream setup: callers seed
+    /// `filter.tracker` (eg [`CatalogTracker::seed_from_source`]) before
+    /// any [`push`](Self::push). Not for hot-path use.
+    pub fn filter_mut(&mut self) -> &mut Filter {
+        &mut self.filter
+    }
+
     /// Round `lsn` down to the nearest segment boundary.
     pub fn align_down(lsn: u64, seg_size: u64) -> u64 {
         lsn - (lsn % seg_size)
