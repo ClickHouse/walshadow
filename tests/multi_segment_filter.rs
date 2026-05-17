@@ -16,13 +16,20 @@
 //! way to force a relmap update on segment N and a dependent heap
 //! record on segment N+1 deterministically.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
 use wal_rs::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
 };
+
 use walshadow::filter::Decision;
 use walshadow::manifest::Kind;
 use walshadow::rewrite::compute_crc;
-use walshadow::wal_stream::{CollectingRecordSink, CollectingSegmentSink, WalStream};
+use walshadow::wal_stream::{
+    CollectingRecordSink, CollectingSegmentSink, CompositeRecordSink, Record, RecordSink,
+    SinkError, WalStream,
+};
 
 /// Synthetic segment / page size: one 8 KiB page per segment. Math in
 /// `WalStream::segment_for_lsn` requires `seg_size` to divide `2^32`;
@@ -292,4 +299,166 @@ fn records_in_one_xact_share_xact_id_through_stream() {
         1,
         "stray record on a different xid must arrive distinguishable",
     );
+}
+
+/// `RecordSink` whose state lives in an `Arc<Mutex<_>>` so the test
+/// can keep an observation handle after the sink is boxed into
+/// [`CompositeRecordSink::inner`].
+struct SharedCollectingSink(Arc<Mutex<Vec<Record>>>);
+
+impl RecordSink for SharedCollectingSink {
+    fn on_record(&mut self, r: &Record) -> Result<(), SinkError> {
+        self.0.lock().unwrap().push(r.clone());
+        Ok(())
+    }
+}
+
+struct SharedCountingSink(Arc<AtomicU64>);
+
+impl RecordSink for SharedCountingSink {
+    fn on_record(&mut self, _r: &Record) -> Result<(), SinkError> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Errors deterministically on the `fail_at`-th `on_record`. The
+/// counter is the sink's only state, so the test can read how many
+/// records the sink processed (including the failing call) via the
+/// shared `Arc`.
+struct FailOnNth {
+    seen: Arc<AtomicU64>,
+    fail_at: u64,
+}
+
+impl RecordSink for FailOnNth {
+    fn on_record(&mut self, _r: &Record) -> Result<(), SinkError> {
+        let i = self.seen.fetch_add(1, Ordering::Relaxed);
+        if i == self.fail_at {
+            Err(SinkError::Other(format!("synthetic fail at #{i}")))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// PRE5b6: build a four-record segment, push it through `WalStream`
+/// with a `CompositeRecordSink` wrapping (a `CollectingRecordSink`
+/// equivalent + a `CountingRecordSink` equivalent), assert both
+/// observers see every record in source order.
+///
+/// The `Send + 'static` bound on `CompositeRecordSink::inner` forces
+/// the shared-state idiom: the boxed sinks consume the trait objects,
+/// so observation handles live behind `Arc<Mutex<_>>`.
+#[test]
+fn composite_sink_fans_out_to_all_inner_sinks() {
+    // Four pg_class-targeted heap records — Class::Catalog by
+    // bootstrap rule → all Kept, all reach the record sink.
+    let recs: Vec<Vec<u8>> = (0..4)
+        .map(|i| {
+            build_record_with_block_ref_xid(
+                RmId::Heap as u8,
+                0x00,
+                42,
+                1663,
+                TEST_DB_NODE,
+                PG_CLASS_OID,
+                i,
+            )
+        })
+        .collect();
+    let rec_refs: Vec<&[u8]> = recs.iter().map(|v| v.as_slice()).collect();
+    let seg = build_one_page_segment(&rec_refs);
+
+    let collected = Arc::new(Mutex::new(Vec::<Record>::new()));
+    let counted = Arc::new(AtomicU64::new(0));
+    let mut comp = CompositeRecordSink::new(vec![
+        Box::new(SharedCollectingSink(collected.clone())),
+        Box::new(SharedCountingSink(counted.clone())),
+    ]);
+    let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
+    let mut segs = CollectingSegmentSink::default();
+    stream.push(0, &seg, &mut comp, &mut segs).expect("push");
+
+    let collected = collected.lock().unwrap();
+    assert_eq!(collected.len(), 4, "collecting sink saw all four records");
+    assert_eq!(
+        counted.load(Ordering::Relaxed),
+        4,
+        "counting sink saw all four records",
+    );
+    // Source-order claim: block_no on the parsed record is the index
+    // we built the record with, so the iteration order is verifiable.
+    for (i, r) in collected.iter().enumerate() {
+        assert_eq!(r.parsed.blocks.len(), 1);
+        assert_eq!(
+            r.parsed.blocks[0].header.location.rel.rel_node,
+            PG_CLASS_OID
+        );
+        assert_eq!(r.parsed.blocks[0].header.location.block_no, i as u32);
+        assert_eq!(r.decision, Decision::Keep);
+    }
+}
+
+/// PRE5b6: a mid-chain inner sink errors on the second record.
+/// `WalStream::push` surfaces it as `WalStreamError::Sink`. The sink
+/// *before* the failing one observed both records (it ran first); the
+/// sink *after* the failing one observed only the first record because
+/// `CompositeRecordSink` short-circuits on inner `Err`. Stream is
+/// considered poisoned post-error per PRE5b10 item 4.
+#[test]
+fn composite_sink_propagates_inner_error_and_short_circuits() {
+    let recs: Vec<Vec<u8>> = (0..3)
+        .map(|i| {
+            build_record_with_block_ref_xid(
+                RmId::Heap as u8,
+                0x00,
+                42,
+                1663,
+                TEST_DB_NODE,
+                PG_CLASS_OID,
+                i,
+            )
+        })
+        .collect();
+    let rec_refs: Vec<&[u8]> = recs.iter().map(|v| v.as_slice()).collect();
+    let seg = build_one_page_segment(&rec_refs);
+
+    let before = Arc::new(AtomicU64::new(0));
+    let fail_seen = Arc::new(AtomicU64::new(0));
+    let after = Arc::new(AtomicU64::new(0));
+    let mut comp = CompositeRecordSink::new(vec![
+        Box::new(SharedCountingSink(before.clone())),
+        Box::new(FailOnNth {
+            seen: fail_seen.clone(),
+            fail_at: 1,
+        }),
+        Box::new(SharedCountingSink(after.clone())),
+    ]);
+    let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
+    let mut segs = CollectingSegmentSink::default();
+    let err = stream
+        .push(0, &seg, &mut comp, &mut segs)
+        .expect_err("FailOnNth must propagate through WalStream::push");
+    use walshadow::wal_stream::WalStreamError;
+    match err {
+        WalStreamError::Sink(SinkError::Other(msg)) => {
+            assert!(msg.contains("synthetic fail"));
+        }
+        other => panic!("expected WalStreamError::Sink(SinkError::Other), got {other:?}"),
+    }
+    // Post-error state — the contract documented on
+    // `CompositeRecordSink`:
+    //   * `before` observed records 0 and 1 (it ran before the fail).
+    //   * `fail_seen` observed records 0 (Ok) and 1 (Err); 2 was never
+    //     attempted because the fan-out aborted at record 1.
+    //   * `after` observed only record 0; record 1 was dispatched to
+    //     the failing sink but short-circuited before reaching `after`.
+    assert_eq!(before.load(Ordering::Relaxed), 2);
+    assert_eq!(fail_seen.load(Ordering::Relaxed), 2);
+    assert_eq!(after.load(Ordering::Relaxed), 1);
+    // `WalStream` does not roll back `next_lsn` on sink error; the
+    // segment sink also did not fire because the per-record dispatch
+    // runs before `segment_sink.on_segment` (see PRE5b10 item 4).
+    assert_eq!(segs.segments.len(), 0);
 }

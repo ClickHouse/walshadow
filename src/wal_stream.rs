@@ -144,6 +144,53 @@ impl RecordSink for CollectingRecordSink {
     }
 }
 
+/// Light-weight `RecordSink` that only counts. Pairs with
+/// [`CollectingRecordSink`] under [`CompositeRecordSink`] when a test
+/// needs to prove a second observer fired without holding clones.
+#[derive(Debug, Default)]
+pub struct CountingRecordSink {
+    pub count: u64,
+}
+
+impl RecordSink for CountingRecordSink {
+    fn on_record(&mut self, _record: &Record) -> Result<(), SinkError> {
+        self.count += 1;
+        Ok(())
+    }
+}
+
+/// Fan-out `RecordSink` that dispatches each record to a chain of inner
+/// sinks. Phase 5's heap-tuple `DecoderSink` rides alongside the
+/// segment writer through this surface; a metrics tap or oracle probe
+/// can join the same chain without changing [`WalStream::push`].
+///
+/// Dispatches in `inner` order and short-circuits on the first `Err`.
+/// **Post-error state**: inner sinks before the failing one have
+/// observed the record, the failing sink may have observed it
+/// partially, sinks after the failing one have not. The error
+/// propagates as [`WalStreamError::Sink`] and `WalStream` treats the
+/// stream as poisoned — do not call [`WalStream::push`] again on the
+/// same instance. See `plans/PRE5b10.md` item 4 for the broader
+/// `next_lsn` rollback policy.
+pub struct CompositeRecordSink {
+    pub inner: Vec<Box<dyn RecordSink + Send>>,
+}
+
+impl CompositeRecordSink {
+    pub fn new(inner: Vec<Box<dyn RecordSink + Send>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl RecordSink for CompositeRecordSink {
+    fn on_record(&mut self, record: &Record) -> Result<(), SinkError> {
+        for s in &mut self.inner {
+            s.on_record(record)?;
+        }
+        Ok(())
+    }
+}
+
 /// In-memory `SegmentSink` for tests + smoke fixtures. Concatenates
 /// every observed segment so callers can re-parse the output.
 #[derive(Debug, Default)]
@@ -447,6 +494,117 @@ mod tests {
             }
             _ => panic!("wrong error variant"),
         }
+    }
+
+    /// Synthesise a `Record` directly so the fan-out tests exercise
+    /// `CompositeRecordSink::on_record` without spinning up
+    /// `filter_segment`. Caller picks `offset` + `rmid` so a sequence
+    /// is ordered-distinguishable.
+    fn synth_record(offset: u64, rmid: u8) -> Record {
+        use wal_rs::pg::walparser::XLogRecordHeader;
+        let entry = dummy_manifest_entry(offset, rmid);
+        let parsed = ParsedRecord {
+            record: XLogRecord {
+                header: XLogRecordHeader {
+                    resource_manager_id: rmid,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            page_magic: 0xD110,
+        };
+        Record::from_parsed(0, parsed, &entry)
+    }
+
+    /// Inner sink that records each observed rmid into a shared vec
+    /// so the test can retain an observation handle while the boxed
+    /// trait object is moved into [`CompositeRecordSink`].
+    struct SharedRmidLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl RecordSink for SharedRmidLog {
+        fn on_record(&mut self, r: &Record) -> Result<(), SinkError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(r.parsed.header.resource_manager_id);
+            Ok(())
+        }
+    }
+
+    /// Adversarial inner sink that errors on the Nth `on_record` call.
+    /// Calls before `fail_at` succeed; the `fail_at` call returns
+    /// `Err(SinkError::Other(_))`. `seen` is shared so the test can
+    /// verify how many records the sink actually observed.
+    struct ErrAt {
+        seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        fail_at: u64,
+    }
+
+    impl RecordSink for ErrAt {
+        fn on_record(&mut self, _record: &Record) -> Result<(), SinkError> {
+            let i = self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i == self.fail_at {
+                Err(SinkError::Other(format!("synthetic fail at #{i}")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn composite_record_sink_fans_out_to_all_inner_sinks_in_order() {
+        // Three records with distinct rmids so the order claim isn't
+        // symmetric under permutation.
+        let recs = [
+            synth_record(0, RmId::Heap as u8),
+            synth_record(64, RmId::Xact as u8),
+            synth_record(128, RmId::RelMap as u8),
+        ];
+        let log_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_b = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut comp = CompositeRecordSink::new(vec![
+            Box::new(SharedRmidLog(log_a.clone())),
+            Box::new(SharedRmidLog(log_b.clone())),
+        ]);
+        for r in &recs {
+            comp.on_record(r).unwrap();
+        }
+        let expected = vec![RmId::Heap as u8, RmId::Xact as u8, RmId::RelMap as u8];
+        assert_eq!(*log_a.lock().unwrap(), expected);
+        assert_eq!(*log_b.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn composite_record_sink_short_circuits_on_first_err() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let rec = synth_record(0, RmId::Heap as u8);
+        let log_before = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let err_seen = std::sync::Arc::new(AtomicU64::new(0));
+        let log_after = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut comp = CompositeRecordSink::new(vec![
+            Box::new(SharedRmidLog(log_before.clone())),
+            Box::new(ErrAt {
+                seen: err_seen.clone(),
+                fail_at: 1,
+            }),
+            Box::new(SharedRmidLog(log_after.clone())),
+        ]);
+        // First record: every sink runs, ErrAt's `seen` advances to 1.
+        comp.on_record(&rec).expect("first record succeeds");
+        // Second record: ErrAt fails (i==fail_at==1). The sink after
+        // ErrAt must not observe it — that's the short-circuit claim.
+        let err = comp
+            .on_record(&rec)
+            .expect_err("err propagates from inner sink");
+        match err {
+            SinkError::Other(msg) => assert!(msg.contains("synthetic fail")),
+            _ => panic!("expected SinkError::Other, got {err:?}"),
+        }
+        // Post-error state: log_before saw both records, ErrAt saw two
+        // (one Ok + one Err), log_after saw only the first.
+        assert_eq!(log_before.lock().unwrap().len(), 2);
+        assert_eq!(err_seen.load(Ordering::Relaxed), 2);
+        assert_eq!(log_after.lock().unwrap().len(), 1);
     }
 
     #[test]
