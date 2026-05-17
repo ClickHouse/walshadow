@@ -34,10 +34,13 @@
 //!   (decoder)    (shadow PG pg_wal/, manifest sidecar)
 //! ```
 
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 use wal_rs::pg::wal::segment::SegmentName;
 use wal_rs::pg::walparser::XLogRecord;
 
+use crate::classify::rmgr_label;
 use crate::filter::{Decision, Filter};
 use crate::filter_segment::{FilterSegmentError, ParsedRecord, filter_segment};
 use crate::manifest::{Kind, Manifest};
@@ -129,6 +132,21 @@ pub trait SegmentSink {
         bytes: &[u8],
         manifest: &Manifest,
     ) -> Result<(), SinkError>;
+
+    /// Receives a partial segment flushed at shutdown by
+    /// [`WalStream::close`]. Default forwards to [`on_segment`] for
+    /// test sinks that don't care; production [`DirSegmentSink`]
+    /// overrides to land bytes under `<name>.partial` per
+    /// `pg_receivewal` convention so a follow-up daemon run does not
+    /// confuse a partial for a complete segment.
+    fn on_partial_segment(
+        &mut self,
+        seg: SegmentName,
+        bytes: &[u8],
+        manifest: &Manifest,
+    ) -> Result<(), SinkError> {
+        self.on_segment(seg, bytes, manifest)
+    }
 }
 
 /// In-memory `RecordSink` for tests. Stores every record.
@@ -155,6 +173,51 @@ pub struct CountingRecordSink {
 impl RecordSink for CountingRecordSink {
     fn on_record(&mut self, _record: &Record) -> Result<(), SinkError> {
         self.count += 1;
+        Ok(())
+    }
+}
+
+/// `RecordSink` that maintains a per-`(rmid, decision)` counter and
+/// discards the record. Production daemon binary uses this in place of
+/// [`CollectingRecordSink`] to avoid an unbounded `Vec<Record>` over a
+/// long-running stream. Cumulative; reset by replacing the sink.
+#[derive(Debug, Default)]
+pub struct MetricsRecordSink {
+    /// (rmid, decision) → count. `BTreeMap` so the on-emit formatted
+    /// line orders rmgrs deterministically.
+    pub by_rm_decision: BTreeMap<(u8, Decision), u64>,
+    pub total: u64,
+}
+
+impl MetricsRecordSink {
+    /// Stable single-line summary suitable for periodic logging on
+    /// segment emit. Empty buckets are skipped; rmgrs are reported by
+    /// human-readable label via [`rmgr_label`]. `total` mirrors the
+    /// `records=` counter the binary used to print from
+    /// `CollectingRecordSink.records.len()`.
+    pub fn summary(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        write!(&mut s, "total={}", self.total).unwrap();
+        for ((rm, decision), n) in &self.by_rm_decision {
+            let d = match decision {
+                Decision::Keep => "keep",
+                Decision::Drop => "drop",
+            };
+            write!(&mut s, " {}/{}={}", rmgr_label(*rm), d, n).unwrap();
+        }
+        s
+    }
+}
+
+impl RecordSink for MetricsRecordSink {
+    fn on_record(&mut self, record: &Record) -> Result<(), SinkError> {
+        let rm = record.parsed.header.resource_manager_id;
+        *self
+            .by_rm_decision
+            .entry((rm, record.decision))
+            .or_insert(0) += 1;
+        self.total += 1;
         Ok(())
     }
 }
@@ -238,6 +301,33 @@ impl SegmentSink for DirSegmentSink {
         std::fs::rename(&tmp, &seg_path)?;
         let mani_path = self.out_dir.join(format!("{name}.manifest.json"));
         let mani_tmp = mani_path.with_extension("manifest.json.partial");
+        let f = std::fs::File::create(&mani_tmp)?;
+        serde_json::to_writer_pretty(f, manifest)?;
+        std::fs::rename(&mani_tmp, &mani_path)?;
+        Ok(())
+    }
+
+    /// Partial-on-shutdown lands at `<name>.partial` (with
+    /// `<name>.partial.manifest.json` alongside) so shadow PG's
+    /// `restore_command` — which matches by exact segment name — does
+    /// not pick it up as a complete segment. Operator-facing artifact;
+    /// resume on the next daemon run is via `--start-lsn` at the same
+    /// segment boundary, not by reading the `.partial` bytes back.
+    fn on_partial_segment(
+        &mut self,
+        seg: SegmentName,
+        bytes: &[u8],
+        manifest: &Manifest,
+    ) -> Result<(), SinkError> {
+        let name = seg.format();
+        let partial_path = self.out_dir.join(format!("{name}.partial"));
+        let tmp = self.out_dir.join(format!("{name}.partial.tmp"));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &partial_path)?;
+        let mani_path = self.out_dir.join(format!("{name}.partial.manifest.json"));
+        let mani_tmp = self
+            .out_dir
+            .join(format!("{name}.partial.manifest.json.tmp"));
         let f = std::fs::File::create(&mani_tmp)?;
         serde_json::to_writer_pretty(f, manifest)?;
         std::fs::rename(&mani_tmp, &mani_path)?;
@@ -344,7 +434,10 @@ impl WalStream {
     }
 
     /// Force-flush the current partial segment (does nothing if empty).
-    /// Use on shutdown — leaves a `.partial` segment for the operator.
+    /// Use on shutdown — leaves a `.partial` segment for the operator
+    /// via [`SegmentSink::on_partial_segment`] so the file is
+    /// distinguishable from a complete segment and shadow PG's
+    /// `restore_command` does not pick it up.
     pub fn close(
         mut self,
         partial_sink: Option<&mut dyn SegmentSink>,
@@ -373,7 +466,7 @@ impl WalStream {
             record_sink.on_record(&record)?;
         }
         if let Some(sink) = partial_sink {
-            sink.on_segment(seg, &filtered, &manifest)?;
+            sink.on_partial_segment(seg, &filtered, &manifest)?;
         }
         Ok(())
     }
@@ -608,6 +701,29 @@ mod tests {
     }
 
     #[test]
+    fn metrics_sink_counts_per_rm_decision_and_discards() {
+        let mut sink = MetricsRecordSink::default();
+        let mut heap_keep = synth_record(0, RmId::Heap as u8);
+        heap_keep.decision = Decision::Keep;
+        let mut heap_drop = synth_record(64, RmId::Heap as u8);
+        heap_drop.decision = Decision::Drop;
+        let mut xact_keep = synth_record(128, RmId::Xact as u8);
+        xact_keep.decision = Decision::Keep;
+        for r in [&heap_keep, &heap_keep, &heap_drop, &xact_keep] {
+            sink.on_record(r).unwrap();
+        }
+        assert_eq!(sink.total, 4);
+        assert_eq!(sink.by_rm_decision[&(RmId::Heap as u8, Decision::Keep)], 2,);
+        assert_eq!(sink.by_rm_decision[&(RmId::Heap as u8, Decision::Drop)], 1,);
+        assert_eq!(sink.by_rm_decision[&(RmId::Xact as u8, Decision::Keep)], 1,);
+        let summary = sink.summary();
+        assert!(summary.starts_with("total=4"), "got {summary:?}");
+        assert!(summary.contains("heap/keep=2"), "got {summary:?}");
+        assert!(summary.contains("heap/drop=1"), "got {summary:?}");
+        assert!(summary.contains("xact/keep=1"), "got {summary:?}");
+    }
+
+    #[test]
     fn dir_sink_writes_segment_and_manifest_atomically() {
         let tmp = tempfile::tempdir().unwrap();
         let mut sink = DirSegmentSink::new(tmp.path().to_path_buf()).unwrap();
@@ -625,6 +741,36 @@ mod tests {
         assert!(
             !tmp.path()
                 .join(format!("{}.partial", seg.format()))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn dir_sink_partial_segment_lands_with_partial_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = DirSegmentSink::new(tmp.path().to_path_buf()).unwrap();
+        let seg = SegmentName::parse("000000010000000000000004").unwrap();
+        let bytes = vec![0x77u8; 64];
+        let mani = dummy_manifest();
+        sink.on_partial_segment(seg, &bytes, &mani).unwrap();
+        let name = seg.format();
+        let partial_path = tmp.path().join(format!("{name}.partial"));
+        let partial_mani_path = tmp.path().join(format!("{name}.partial.manifest.json"));
+        // Complete-segment name must NOT exist — otherwise shadow PG's
+        // restore_command would pick up a partial as a real segment.
+        assert!(
+            !tmp.path().join(&name).exists(),
+            "complete-segment path leaked: {name}",
+        );
+        assert!(partial_path.exists(), "partial path written");
+        assert!(partial_mani_path.exists(), "partial manifest written");
+        let on_disk = std::fs::read(&partial_path).unwrap();
+        assert_eq!(on_disk, bytes);
+        // Temp files cleaned up by atomic rename.
+        assert!(!tmp.path().join(format!("{name}.partial.tmp")).exists());
+        assert!(
+            !tmp.path()
+                .join(format!("{name}.partial.manifest.json.tmp"))
                 .exists()
         );
     }

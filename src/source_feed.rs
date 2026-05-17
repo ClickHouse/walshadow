@@ -59,6 +59,10 @@ pub struct SourceFeed {
     status_interval: Duration,
     last_status: Instant,
     last_acked_lsn: u64,
+    /// Most recent `server_wal_end` we have seen, from either a WAL
+    /// frame or a keepalive. Lets the daemon log "source ahead by N
+    /// bytes" without re-issuing IDENTIFY_SYSTEM.
+    last_server_wal_end: u64,
 }
 
 impl SourceFeed {
@@ -72,6 +76,7 @@ impl SourceFeed {
             status_interval: DEFAULT_STATUS_INTERVAL,
             last_status: Instant::now(),
             last_acked_lsn: 0,
+            last_server_wal_end: 0,
         })
     }
 
@@ -184,6 +189,7 @@ impl SourceFeed {
                     match decode_frame(&payload)? {
                         Frame::Wal(w) => {
                             buf.extend_from_slice(w.data);
+                            self.last_server_wal_end = w.server_wal_end;
                             return Ok(Some(WalChunk {
                                 start_lsn: w.start_lsn,
                                 server_wal_end: w.server_wal_end,
@@ -194,9 +200,11 @@ impl SourceFeed {
                             if k.reply_requested {
                                 self.send_status(apply_lsn).await?;
                             }
-                            // server_wal_end surfaces for diagnostics only;
-                            // current WalStream consumer ignores it
-                            let _ = k.server_wal_end;
+                            // remember the most recent server_wal_end so
+                            // the daemon can surface "source ahead by N
+                            // bytes" between WAL frames as well as during
+                            // them
+                            self.last_server_wal_end = k.server_wal_end;
                         }
                     }
                 }
@@ -205,6 +213,13 @@ impl SourceFeed {
                 m => tracing_debug(message_kind(&m)),
             }
         }
+    }
+
+    /// Most recent `server_wal_end` reported by source over either a WAL
+    /// frame or a keepalive. Zero before [`start_physical_replication`]
+    /// has produced any traffic.
+    pub fn last_server_wal_end(&self) -> u64 {
+        self.last_server_wal_end
     }
 
     async fn send_status(&mut self, apply_lsn: u64) -> Result<()> {

@@ -44,7 +44,7 @@ use walshadow::shadow_catalog::{
     with_transient_retry,
 };
 use walshadow::source_feed::SourceFeed;
-use walshadow::wal_stream::{CollectingRecordSink, DirSegmentSink, WAL_SEG_SIZE, WalStream};
+use walshadow::wal_stream::{DirSegmentSink, MetricsRecordSink, WAL_SEG_SIZE, WalStream};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -237,21 +237,29 @@ async fn run(args: Args) -> Result<()> {
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;
-    let mut record_sink = CollectingRecordSink::default();
+    let mut record_sink = MetricsRecordSink::default();
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     let mut segments_shipped = 0u64;
     let mut prev_dispatched = stream.dispatched_lsn();
-    loop {
+    let shutdown_reason = loop {
         let apply_lsn = stream.dispatched_lsn();
-        let chunk = match feed.next_chunk(apply_lsn, &mut chunk_buf).await? {
-            Some(c) => c,
-            None => {
-                eprintln!("source: CopyDone — stopping");
-                break;
+        let chunk = tokio::select! {
+            biased;
+            // Drain signals first so an in-flight ctrl_c doesn't lose to
+            // a chunk that's already at the head of the queue.
+            sig = tokio::signal::ctrl_c() => {
+                sig.context("install ctrl_c handler")?;
+                break "signal";
             }
+            res = feed.next_chunk(apply_lsn, &mut chunk_buf) => match res? {
+                Some(c) => c,
+                None => break "CopyDone",
+            },
         };
+        let dispatched_before = stream.dispatched_lsn();
+        let server_end = chunk.server_wal_end;
         stream.push(
             chunk.start_lsn,
             chunk.data,
@@ -264,12 +272,14 @@ async fn run(args: Args) -> Result<()> {
             segments_shipped += new_segs;
             prev_dispatched = now_dispatched;
             let filter = stream.filter();
+            let ahead = server_end.saturating_sub(dispatched_before);
             eprintln!(
-                "shipped {} segments, last_lsn={:X}/{:X}, records={}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}",
+                "shipped {} segments, last_lsn={:X}/{:X}, source_ahead={}B, {}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}",
                 segments_shipped,
                 now_dispatched >> 32,
                 now_dispatched as u32,
-                record_sink.records.len(),
+                ahead,
+                record_sink.summary(),
                 filter.stats.kept,
                 filter.stats.dropped,
                 filter.tracker.relmap_updates,
@@ -277,11 +287,17 @@ async fn run(args: Args) -> Result<()> {
                 filter.tracker.pg_class_writes_oid_in_prefix,
             );
             if args.max_segments != 0 && segments_shipped >= args.max_segments {
-                eprintln!("reached --max-segments={}, stopping", args.max_segments);
-                break;
+                break "max-segments";
             }
         }
-    }
+    };
+    eprintln!(
+        "stopping ({shutdown_reason}); flushing partial segment to {}",
+        args.out_dir.display(),
+    );
+    stream
+        .close(Some(&mut segment_sink), &mut record_sink)
+        .context("flush partial segment on shutdown")?;
     Ok(())
 }
 

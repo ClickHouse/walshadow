@@ -27,7 +27,9 @@ use wal_rs::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::SourceFeed;
-use walshadow::wal_stream::{CollectingRecordSink, DirSegmentSink, WAL_SEG_SIZE, WalStream};
+use walshadow::wal_stream::{
+    CollectingRecordSink, DirSegmentSink, MetricsRecordSink, WAL_SEG_SIZE, WalStream,
+};
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -621,4 +623,250 @@ async fn sidecar_sql_client_negotiates_tls_over_tcp() {
         "expected TLSv1.x session, got {v:?}",
     );
     eprintln!("sidecar tls e2e: pg_stat_ssl reports version={v}");
+}
+
+/// PRE5b9: `walshadow-stream` must call `WalStream::close()` on shutdown
+/// so the in-flight partial segment lands on disk rather than evaporating
+/// with the process. Exercises the `close()` path directly (signaling a
+/// subprocess is racy) plus the resume-from-segment-boundary contract
+/// the docstring promises: a fresh `WalStream` at the same aligned LSN
+/// must pump cleanly past the partial without tripping on misalignment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = make_source(&tmp, 55804);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("base conf");
+    append_replication_conf(&source);
+    source.start().expect("start source");
+    let _stop = StopOnDrop { sh: &source };
+
+    // Create schema only (skip pg_switch_wal so xlogpos stays mid-segment
+    // — otherwise START_REPLICATION at the segment boundary has nothing
+    // to ship and we never accumulate bytes into current_buf to write
+    // out as a partial).
+    source
+        .apply_schema_dump(
+            "CREATE SCHEMA sd;\n\
+             CREATE TABLE sd.t (id bigint primary key, payload text);\n\
+             INSERT INTO sd.t SELECT g, repeat('z', 80) FROM generate_series(1, 200) g;\n",
+        )
+        .expect("apply pre-shutdown workload");
+
+    let cfg = source.config();
+    let pgcfg = PgConfig {
+        host: cfg.socket_dir.to_string_lossy().into_owned(),
+        port: cfg.port,
+        user: "postgres".into(),
+        password: None,
+        database: "postgres".into(),
+        application_name: "walshadow-shutdown".into(),
+        sslmode: SslMode::Disable,
+    };
+    let mut feed = SourceFeed::connect(&pgcfg)
+        .await
+        .expect("source feed connect")
+        .with_status_interval(Duration::from_millis(500));
+    let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
+    let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
+    // Without WAL beyond aligned, there is nothing to flush. The
+    // pre-workload above is the source of those bytes.
+    assert!(
+        ident.xlogpos > aligned,
+        "xlogpos={:#X} aligned={:#X} — INSERT didn't push past segment boundary",
+        ident.xlogpos,
+        aligned,
+    );
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+
+    feed.start_physical_replication(None, aligned, ident.timeline)
+        .await
+        .expect("START_REPLICATION");
+
+    let out_dir = tmp.path().join("filtered_shutdown");
+    let mut metrics = MetricsRecordSink::default();
+    let mut segs = DirSegmentSink::new(out_dir.clone()).expect("open out dir");
+    let mut buf = Vec::with_capacity(64 * 1024);
+
+    // Pump until current_buf holds at least some bytes from the
+    // pre-workload, but stop well before the segment fills (the source
+    // is quiet — no concurrent writers — so we will not race past the
+    // segment boundary).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut chunks_seen = 0;
+    while std::time::Instant::now() < deadline {
+        let apply_lsn = stream.dispatched_lsn();
+        let next =
+            tokio::time::timeout(Duration::from_secs(1), feed.next_chunk(apply_lsn, &mut buf))
+                .await;
+        let chunk = match next {
+            Ok(Ok(Some(c))) => c,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => panic!("source feed error: {e:#}"),
+            Err(_) => continue,
+        };
+        stream
+            .push(chunk.start_lsn, chunk.data, &mut metrics, &mut segs)
+            .expect("push");
+        chunks_seen += 1;
+        // Once next_lsn has caught up to (or past) ident.xlogpos, the
+        // source has no more to send for now; bail out.
+        if stream.next_lsn() >= ident.xlogpos {
+            break;
+        }
+        // Defensive cap: we never expect this in a quiet-source test
+        // but if we somehow filled a segment, stop now to avoid a
+        // misleading "no partial" assertion later.
+        if chunks_seen >= 64 {
+            break;
+        }
+    }
+    assert!(
+        chunks_seen > 0,
+        "no WAL chunks received before shutdown drill",
+    );
+
+    let dispatched_at_close = stream.dispatched_lsn();
+    let next_at_close = stream.next_lsn();
+    assert!(
+        next_at_close > dispatched_at_close,
+        "current_buf must hold ≥1 byte for close() to produce a .partial \
+         (dispatched={dispatched_at_close:#X}, next={next_at_close:#X})",
+    );
+
+    // Drive the shutdown path. Equivalent to the daemon's ctrl_c branch
+    // calling stream.close(Some(&mut segs), &mut metrics).
+    stream
+        .close(Some(&mut segs), &mut metrics)
+        .expect("close writes partial");
+
+    // The partial segment file must exist under <name>.partial, and the
+    // matching complete-segment path must NOT — otherwise shadow PG's
+    // restore_command would treat it as a real segment.
+    let mut partials: Vec<PathBuf> = vec![];
+    for entry in std::fs::read_dir(&out_dir).unwrap() {
+        let e = entry.unwrap();
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.ends_with(".partial") && !n.ends_with(".manifest.json.partial") {
+            partials.push(e.path());
+        }
+    }
+    assert_eq!(
+        partials.len(),
+        1,
+        "expected exactly one .partial under {} after close(); got {:?}",
+        out_dir.display(),
+        partials,
+    );
+    let partial = &partials[0];
+    let partial_name = partial.file_name().unwrap().to_string_lossy().into_owned();
+    let segname_str = partial_name.strip_suffix(".partial").unwrap();
+    assert_eq!(segname_str.len(), 24, "partial name shape: {partial_name}");
+    assert!(
+        !out_dir.join(segname_str).exists(),
+        "complete-segment path leaked alongside partial: {segname_str}",
+    );
+    assert!(
+        out_dir
+            .join(format!("{segname_str}.partial.manifest.json"))
+            .exists(),
+        "partial manifest sidecar missing alongside {partial_name}",
+    );
+    // Partial is exactly one segment's worth, with the tail zero-padded
+    // per `close()`'s contract.
+    let on_disk = std::fs::read(partial).unwrap();
+    assert_eq!(
+        on_disk.len(),
+        WAL_SEG_SIZE as usize,
+        "partial must be padded to segment size",
+    );
+    drop(feed);
+
+    // Resume: fresh SourceFeed + WalStream at the same aligned start
+    // LSN. The contract is that --start-lsn at the segment boundary
+    // works; the .partial bytes themselves aren't replayed.
+    let mut feed2 = SourceFeed::connect(&pgcfg)
+        .await
+        .expect("resume feed connect")
+        .with_status_interval(Duration::from_millis(500));
+    let ident2 = feed2.identify_system().await.expect("IDENTIFY_SYSTEM #2");
+    let mut stream2 = WalStream::new(ident2.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    feed2
+        .start_physical_replication(None, aligned, ident2.timeline)
+        .await
+        .expect("START_REPLICATION resume");
+
+    // Drive more WAL after resume so the source has fresh bytes to ship.
+    let pump_sock = source.config().socket_dir.clone();
+    let pump_port = source.config().port;
+    let driver = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = Command::new("psql")
+            .args([
+                "-h",
+                pump_sock.to_str().unwrap(),
+                "-p",
+                &pump_port.to_string(),
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-c",
+                "INSERT INTO sd.t SELECT g+200, repeat('q', 80) FROM generate_series(1, 500) g; \
+                 SELECT pg_switch_wal();",
+            ])
+            .output();
+    });
+
+    let resume_out = tmp.path().join("filtered_resume");
+    let mut resume_metrics = CollectingRecordSink::default();
+    let mut resume_segs = DirSegmentSink::new(resume_out.clone()).expect("open resume out dir");
+    let mut resume_buf = Vec::with_capacity(64 * 1024);
+    let deadline2 = std::time::Instant::now() + Duration::from_secs(15);
+    let mut resume_segments = 0u64;
+    let mut prev2 = stream2.dispatched_lsn();
+    while resume_segments < 1 && std::time::Instant::now() < deadline2 {
+        let apply_lsn = stream2.dispatched_lsn();
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            feed2.next_chunk(apply_lsn, &mut resume_buf),
+        )
+        .await;
+        let chunk = match next {
+            Ok(Ok(Some(c))) => c,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => panic!("resume feed error: {e:#}"),
+            Err(_) => continue,
+        };
+        stream2
+            .push(
+                chunk.start_lsn,
+                chunk.data,
+                &mut resume_metrics,
+                &mut resume_segs,
+            )
+            .expect("resume push");
+        let now2 = stream2.dispatched_lsn();
+        if now2 != prev2 {
+            resume_segments += (now2 - prev2) / WAL_SEG_SIZE;
+            prev2 = now2;
+        }
+    }
+    let _ = driver.join();
+    assert!(
+        resume_segments >= 1,
+        "no segments shipped after resume in 15s",
+    );
+    assert!(
+        !resume_metrics.records.is_empty(),
+        "resume RecordSink saw zero records",
+    );
+    eprintln!(
+        "shutdown drill: partial={partial_name}, resume shipped {resume_segments} segment(s), {} records",
+        resume_metrics.records.len(),
+    );
 }
