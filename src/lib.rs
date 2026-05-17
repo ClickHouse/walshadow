@@ -13,6 +13,8 @@
 //! filter event design (`wal_stream`).
 //! Phase 5: user-heap tuple decoder + Tier 1/2 type matrix
 //! (`heap_decoder`).
+//! Phase 6: per-xact + TOAST reassembly buffer (`xact_buffer`) backed
+//! by an append-only per-xid spill file (`spill`).
 
 pub mod catalog_tracker;
 pub mod classify;
@@ -29,4 +31,6 @@ mod segment;
 pub mod shadow;
 pub mod shadow_catalog;
 pub mod source_feed;
+pub mod spill;
 pub mod wal_stream;
+pub mod xact_buffer;

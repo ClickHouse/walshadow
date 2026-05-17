@@ -11,6 +11,8 @@ docs that are not yet committed work sit alongside as peers.
 - **Phase 4** — catalog cache integration. [PHASE4.md](PHASE4.md).
 - **Phase 4b** — restart resilience. [PHASE4b.md](PHASE4b.md).
 - **Phase 5** — heap-tuple decoder + Tier 1/2 type matrix. [PHASE5.md](PHASE5.md).
+- **Phase 6** — TOAST reassembly + xact buffer + local-disk spill.
+  [PHASE6.md](PHASE6.md). Design layer: [PHASE6disk.md](PHASE6disk.md).
 - **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,
@@ -48,6 +50,13 @@ docs that are not yet committed work sit alongside as peers.
   decoder into the existing sync `filter_segment`. Test-local
   `decompress_gz` helpers go away. Sibling of FPI_COMPRESSION;
   independent. [SEGMENT_COMPRESSION.md](SEGMENT_COMPRESSION.md).
+- **PHASE6disk** — [Phase 6](PLAN.md#phase-6--toast-reassembly--xact-buffer)
+  design layer: xact buffer + TOAST reassembly spill backend. Compares
+  local-disk spill (mirrors PG `pg_replslot/<slot>/xid-*.snap`) against
+  CH-as-scratch and CH-as-primary; recommends local disk with a
+  `spill_backend = "local_disk" | "clickhouse"` knob reserved for the
+  diskless case. Lands inside Phase 6's commit, not as a separate phase.
+  [PHASE6disk.md](PHASE6disk.md).
 - **FPI_COMPRESSION** — [Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix)
   prerequisite: decompress `wal_compression = pglz|lz4|zstd`
   full-page images via a new `src/fpi.rs` (`restore_block_image`)

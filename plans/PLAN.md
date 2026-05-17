@@ -577,20 +577,42 @@ commit, separately accounted.
 
 ### Phase 6 — TOAST reassembly + xact buffer
 
-`HeapTuple` columns flagged `VARATT_IS_EXTERNAL_ONDISK` reference a
-TOAST chunk relation; reassembly reads chunks from the same WAL stream
-the decoder sees (no source-PG round-trip), keyed by
-`(toast_relid, va_valueid)`. Chunks may arrive before or after the
-referring tuple; buffer until both halves are present, flush on xact
-commit.
+Landed: per-xid buffer holds every [`DecodedHeap`] plus
+`(toast_relid, value_id, chunk_seq)` TOAST chunks from first heap
+touch until matching `XLOG_XACT_COMMIT` / `XLOG_XACT_ABORT`. Commit
+drains in WAL order with `ExternalToast` columns reassembled into
+`Bytea` / `Text` (pglz + lz4 decompression paths). Abort discards
+the buffer plus any spill file. Largest-xact-first eviction mirrors
+PG `ReorderBufferLargestTXN`. Local-disk spill primitive lands in
+the same commit; `{data_dir}/spill/xid-<xid>-<first_lsn>.bin` per
+xact, atomic-rename on writer finish, unlink on abort. Spill dir
+wiped at startup per "drained or replayable from cursor" contract.
 
-Xact buffer holds per-xid records until `XLOG_XACT_COMMIT` / abort is
-observed. Abort drops the buffer; commit flushes records in WAL order
-to the emitter, tagged with `(source_lsn, xid, commit_ts)`. Cursor
-file (`{data_dir}/cursor`) persists `(filter_lsn, decoder_lsn,
-emitter_lsn)` atomically (write tmp + rename) on each commit drain.
+`XactRecordSink` observes `RM_XACT_ID` records: COMMIT /
+COMMIT_PREPARED drain, ABORT / ABORT_PREPARED drop, PREPARE keeps
+the buffer alive for COMMIT_PREPARED. `BufferingDecoderSink`
+replaces Phase 5's direct-emit `DecoderSink` in the production
+dispatch chain: user-heap records park in the buffer, TOAST inserts
+(`rel.kind == 't'`) reinterpret as chunks keyed on the toast
+relation's pg_class OID.
 
-Size: ≈600 LOC.
+CH-as-scratch was considered and rejected on commit-drain latency +
+bandwidth doubling + MergeTree part hygiene; v1 has no
+`spill_backend` knob — the diskless walshadow path is future work
+with a fresh config-surface decision at that point. Design +
+comparison: [PHASE6disk.md](PHASE6disk.md). Retro:
+[PHASE6.md](PHASE6.md).
+
+Size delivered: ~2080 LOC (`src/spill.rs` 825, `src/xact_buffer.rs`
+1257, daemon wiring ~40). Of that, ~700 LOC is inline tests; the
+source-only sizing lands at ≈900 LOC matching PHASE6disk's
+estimate. Tests: +15 unit tests (5 spill + 10 xact_buffer).
+
+Deferred to Phase 7 / followups: cursor file
+(`(filter_lsn, decoder_lsn, emitter_lsn)` atomic write — needs the
+CH emitter's ack), subxact lineage, `XLOG_HEAP2_MULTI_INSERT`
+fan-out, live-PG smoke for `BufferingDecoderSink`. See
+[PHASE6.md "Followups"](PHASE6.md#followups).
 
 ### Phase 7 — CH Native emitter via clickhouse-c-rs
 

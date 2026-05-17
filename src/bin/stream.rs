@@ -41,7 +41,7 @@ use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
 use std::future::Future;
 use std::pin::Pin;
-use walshadow::decoder_sink::{DecoderSink, MetricsTupleObserver};
+use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
     with_transient_retry,
@@ -50,16 +50,20 @@ use walshadow::source_feed::SourceFeed;
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
+use walshadow::xact_buffer::{
+    BufferingDecoderSink, XactBuffer, XactBufferConfig, XactRecordSink,
+};
 
-/// Tiny inline `RecordSink` composite that retains direct ownership of
-/// both halves so the status-line code can read `MetricsRecordSink.
-/// summary()` and `DecoderSink.stats()` between segments without
-/// fishing them out of a `Vec<Box<dyn RecordSink>>`. Phase 5 owns this
-/// shape locally; Phase 7 will likely revisit when the CH-emitter
-/// observer joins the chain.
+/// Tiny inline `RecordSink` composite. Phase 6 adds the xact buffer
+/// to the chain: heap-tuple records park in `xact` until the matching
+/// commit / abort lands, then drain to `xact_drain`'s observer (today
+/// the same metrics counter Phase 5 used; Phase 7 swaps in the CH
+/// emitter). Status-line code keeps direct ownership so per-section
+/// stats render without `dyn Any` round-trips.
 struct DaemonSinks {
     metrics: MetricsRecordSink,
-    decoder: DecoderSink<MetricsTupleObserver>,
+    decoder: BufferingDecoderSink,
+    xact_drain: XactRecordSink<MetricsTupleObserver>,
 }
 
 impl RecordSink for DaemonSinks {
@@ -69,7 +73,13 @@ impl RecordSink for DaemonSinks {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.metrics.on_record(record).await?;
+            // Order matters: decoder must absorb the heap record into
+            // the buffer before the xact_drain sink (which may flush
+            // this same xact) runs. A multi-statement xact whose
+            // COMMIT record arrives in the same dispatch batch as
+            // its heap records would otherwise miss the latest writes.
             self.decoder.on_record(record).await?;
+            self.xact_drain.on_record(record).await?;
             Ok(())
         })
     }
@@ -138,6 +148,15 @@ struct Args {
     /// shadow doesn't fail the daemon on first boot.
     #[arg(long, default_value_t = 30)]
     shadow_connect_timeout: u64,
+    /// Phase 6 xact / TOAST buffer spill dir. Created on boot if
+    /// missing; wiped clean every startup per the
+    /// [PHASE6disk.md](../../plans/PHASE6disk.md) crash-recovery note.
+    #[arg(long)]
+    spill_dir: PathBuf,
+    /// In-memory budget for the xact buffer in bytes. Defaults match
+    /// PG's `logical_decoding_work_mem` (64 MiB).
+    #[arg(long, default_value_t = walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX)]
+    xact_buffer_max: usize,
 }
 
 fn main() -> ExitCode {
@@ -266,12 +285,34 @@ async fn run(args: Args) -> Result<()> {
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;
-    // Fan-out: metrics-by-rmgr first, Phase 5 heap-tuple decoder
-    // second. Ordering keeps per-rmgr counters intact when a decoder
-    // semantic error trips inside the dispatch chain.
+    // Phase 6 xact buffer + spill dir. Wiped on every startup —
+    // cursor file commits drains atomically so leftover spill files
+    // from a prior crash are always either redundant or stale.
+    let xact_buf_cfg = XactBufferConfig {
+        xact_buffer_max: args.xact_buffer_max,
+        spill_dir: args.spill_dir.clone(),
+    };
+    let xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
+    xact_buffer
+        .clear_spill_dir()
+        .await
+        .context("clear stale spill files")?;
+    let xact_buffer = Arc::new(Mutex::new(xact_buffer));
+    eprintln!(
+        "spill dir: {} (xact_buffer_max={} bytes)",
+        args.spill_dir.display(),
+        args.xact_buffer_max,
+    );
+    // Fan-out: metrics-by-rmgr first, then the buffering decoder
+    // (heap → xact buffer), then the xact-record drain (commit/abort
+    // → emit). Ordering keeps per-rmgr counters intact when a decoder
+    // semantic error trips inside the dispatch chain; xact_drain
+    // running after decoder absorbs any heap records in the same
+    // dispatch batch as the commit.
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
-        decoder: DecoderSink::new(catalog.clone(), MetricsTupleObserver::default()),
+        decoder: BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone()),
+        xact_drain: XactRecordSink::new(xact_buffer.clone(), MetricsTupleObserver::default()),
     };
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
@@ -310,8 +351,12 @@ async fn run(args: Args) -> Result<()> {
             prev_dispatched = now_dispatched;
             let filter = stream.filter();
             let ahead = server_end.saturating_sub(dispatched_before);
+            let xact_stats = {
+                let b = xact_buffer.lock().await;
+                b.stats().summary()
+            };
             eprintln!(
-                "shipped {} segments, last_lsn={:X}/{:X}, source_ahead={}B, {}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}, {}",
+                "shipped {} segments, last_lsn={:X}/{:X}, source_ahead={}B, {}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}, {}, {}",
                 segments_shipped,
                 now_dispatched >> 32,
                 now_dispatched as u32,
@@ -323,6 +368,7 @@ async fn run(args: Args) -> Result<()> {
                 filter.tracker.pg_class_writes_undecoded,
                 filter.tracker.pg_class_writes_oid_in_prefix,
                 record_sink.decoder.stats().summary(),
+                xact_stats,
             );
             if args.max_segments != 0 && segments_shipped >= args.max_segments {
                 break "max-segments";

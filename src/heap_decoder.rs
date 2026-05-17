@@ -231,7 +231,7 @@ pub struct ToastPointer {
 /// One decoded WAL heap record. Op + LSN + xid + new image + old image
 /// (per `relreplident`). Column count + ordering matches
 /// `RelDescriptor.attributes` — i.e. attnum-1 indexed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodedHeap {
     pub rfn: RelFileNode,
     pub xid: u32,
