@@ -32,6 +32,44 @@ pub struct WalChunk<'a> {
     pub data: &'a [u8],
 }
 
+/// Phase 10 standby-status carrier. Splits the single LSN that
+/// pre-Phase-10 status updates collapsed into one value into the three
+/// fields wal-rs's `build_status_update` already takes. Phase 11 fills
+/// in the resume-safe `flush` (filter-durable LSN) + `apply`
+/// (`min(shadow_replay, emitter_ack)`) values; Phase 10 ships the
+/// shape with conservative placeholders so the wire format is fixed
+/// before durability lands.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StandbyStatus {
+    /// `write_lsn` PG sees: how far the daemon's WAL pump has read +
+    /// is committed to durably storing locally. Today equal to
+    /// `source_received_lsn`.
+    pub write_lsn: u64,
+    /// `flush_lsn` PG sees: how far the filter has *durably* written
+    /// out to filtered segments. Phase 10 reports the last segment-
+    /// boundary `dispatched_lsn`; Phase 11 fsyncs first.
+    pub flush_lsn: u64,
+    /// `apply_lsn` PG sees: bounded above by shadow's replay LSN and
+    /// the CH emitter's ack LSN. Phase 10 reports `dispatched_lsn`
+    /// as a conservative ceiling; Phase 11 substitutes the real
+    /// ack-gated value so source's slot won't recycle WAL the
+    /// emitter hasn't durably consumed.
+    pub apply_lsn: u64,
+}
+
+impl StandbyStatus {
+    /// Build a status carrier where all three slots collapse to the
+    /// same value. Pre-Phase-10 callers used this shape; kept for
+    /// compatibility through Phase 10 wiring.
+    pub fn collapsed(lsn: u64) -> Self {
+        Self {
+            write_lsn: lsn,
+            flush_lsn: lsn,
+            apply_lsn: lsn,
+        }
+    }
+}
+
 /// Result of `IDENTIFY_SYSTEM`: server identity plus current WAL
 /// position.
 #[derive(Debug, Clone)]
@@ -162,18 +200,19 @@ impl SourceFeed {
     /// frame, `Ok(None)` on `CopyDone` (server shutdown), and `Err` on
     /// unexpected frames.
     ///
-    /// Caller drives this in a loop. `apply_lsn` is the highest LSN
-    /// the consumer has durably committed downstream; pass `last_acked`
-    /// + segment progress on each iteration.
+    /// Caller drives this in a loop. `status` carries the three LSNs
+    /// PG's standby-status protocol expects (write / flush / apply);
+    /// pass the consumer's current view on every iteration so a
+    /// keepalive's `reply_requested` flag echoes back fresh values.
     pub async fn next_chunk<'b>(
         &mut self,
-        apply_lsn: u64,
+        status: StandbyStatus,
         buf: &'b mut Vec<u8>,
     ) -> Result<Option<WalChunk<'b>>> {
         buf.clear();
         loop {
             if self.last_status.elapsed() >= self.status_interval {
-                self.send_status(apply_lsn).await?;
+                self.send_status(status).await?;
             }
             let timeout = self
                 .status_interval
@@ -198,7 +237,7 @@ impl SourceFeed {
                         }
                         Frame::Keepalive(k) => {
                             if k.reply_requested {
-                                self.send_status(apply_lsn).await?;
+                                self.send_status(status).await?;
                             }
                             // remember the most recent server_wal_end so
                             // the daemon can surface "source ahead by N
@@ -210,7 +249,13 @@ impl SourceFeed {
                 }
                 Message::CopyDone => return Ok(None),
                 Message::ErrorResponse(e) => bail!("source: {}", error_message(&e)),
-                m => tracing_debug(message_kind(&m)),
+                m => {
+                    tracing::debug!(
+                        target: "walshadow::source_feed",
+                        kind = message_kind(&m),
+                        "unexpected backend message",
+                    );
+                }
             }
         }
     }
@@ -222,11 +267,16 @@ impl SourceFeed {
         self.last_server_wal_end
     }
 
-    async fn send_status(&mut self, apply_lsn: u64) -> Result<()> {
-        let pos = apply_lsn.max(self.last_acked_lsn);
-        let payload = build_status_update(pos, pos, pos);
+    async fn send_status(&mut self, status: StandbyStatus) -> Result<()> {
+        // Never go backwards on any field — PG treats a regressing
+        // flush/apply as a protocol violation and may force-disconnect.
+        // `last_acked_lsn` tracks the high-water mark across all three.
+        let write = status.write_lsn.max(self.last_acked_lsn);
+        let flush = status.flush_lsn.max(self.last_acked_lsn);
+        let apply = status.apply_lsn.max(self.last_acked_lsn);
+        let payload = build_status_update(write, flush, apply);
         self.conn.send_copy_data(&payload).await?;
-        self.last_acked_lsn = pos;
+        self.last_acked_lsn = write.max(flush).max(apply);
         self.last_status = Instant::now();
         Ok(())
     }
@@ -304,12 +354,4 @@ async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
         let _ = conn.await;
     });
     Ok(client)
-}
-
-#[inline]
-fn tracing_debug(_kind: &'static str) {
-    // Stub for places where wal-rs uses `tracing::debug!`. walshadow
-    // doesn't yet plug the tracing pipeline; future work attaches a
-    // subscriber so these surfaces are observable. Drop the macro for
-    // now to keep build deps thin.
 }

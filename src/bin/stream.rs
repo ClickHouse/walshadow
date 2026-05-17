@@ -13,26 +13,27 @@
 //!     --shadow-socket-dir /tmp/shadow_sock --shadow-port 5433 \
 //!     --out-dir /var/lib/walshadow/filtered \
 //!     [--slot walshadow_phys] \
-//!     [--start-lsn 0/16B3750]
+//!     [--start-lsn 0/16B3750] \
+//!     [--metrics-bind 127.0.0.1:9484] \
+//!     [--retention-bytes 268435456]
 //! ```
 //!
-//! Without `--start-lsn`, the daemon starts at the segment boundary
-//! that contains the source's current `pg_current_wal_lsn`. With it,
-//! resumes from the supplied LSN rounded down to a segment boundary.
-//!
-//! Shutdown: Ctrl-C / SIGTERM stops the pump cleanly and writes the
-//! current partial segment (if any) so subsequent runs can pick up
-//! mid-segment via `--start-lsn`.
-//!
-//! Shadow catalog ownership: daemon holds the [`ShadowCatalog`] inside
-//! `Arc<tokio::sync::Mutex<_>>`. Clones go to the tracker→drain wire
-//! today and, post-Phase 5, to the `DecoderSink` that turns dropped
-//! heap records into tuple events. See [PRE5b7](../plans/PRE5b7.md).
+//! Phase 10 adds the operational scaffolding: pre-flight validators
+//! reject mis-configured boots, a Prometheus `/metrics` endpoint
+//! exposes the LSN triple + per-rmgr / xact-buffer / emitter / oracle
+//! counters, `tracing` is wired so `RUST_LOG=walshadow=debug` surfaces
+//! frame-level diagnostics, filtered segments under `--out-dir` are
+//! trimmed once shadow replays past them, the standby-status update
+//! sent back to source is split into the (write, flush, apply) triple
+//! the protocol expects, the CH emitter retries through a bounded
+//! reconnect loop, and `SIGHUP` re-reads `--ch-config` to swap the
+//! per-relation mapping atomically.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,13 +42,15 @@ use std::pin::Pin;
 use tokio::sync::Mutex;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
-use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver};
+use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, MappingHandle};
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
+use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
+use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
     with_transient_retry,
 };
-use walshadow::source_feed::SourceFeed;
+use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
@@ -162,6 +165,8 @@ struct Args {
     /// When set, drained xact tuples ship to ClickHouse via
     /// `clickhouse-c-rs`. When unset the daemon stays metrics-only.
     /// Shape: see [`walshadow::ch_emitter::EmitterConfig::from_toml_str`].
+    /// Phase 10 reloads this on SIGHUP (atomic mapping swap; connection
+    /// params stay boot-only).
     #[arg(long)]
     ch_config: Option<PathBuf>,
     /// Phase 9 differential decode oracle: probe 1-in-`<N>` rows
@@ -173,10 +178,25 @@ struct Args {
     /// silently ships raw on-disk bytes for `PgPending` types.
     #[arg(long, default_value_t = 0)]
     validate: u32,
+    /// Phase 10 HTTP/Prometheus metrics bind address. Disabled when
+    /// absent; pass `127.0.0.1:9484` for a localhost-only scrape.
+    #[arg(long)]
+    metrics_bind: Option<SocketAddr>,
+    /// Phase 10 retention horizon in bytes of WAL. Segments older than
+    /// `shadow_replay_lsn - retention_bytes` are deleted on every trim
+    /// cycle. Set to `0` to disable trim entirely.
+    #[arg(long, default_value_t = DEFAULT_RETENTION_BYTES)]
+    retention_bytes: u64,
+    /// Skip the Phase 10 pre-flight validators (server_version_num,
+    /// wal_level, REPLICA IDENTITY FULL, slot existence). Useful for
+    /// recovery drills; production should leave this off.
+    #[arg(long, default_value_t = false)]
+    skip_preflight: bool,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    init_tracing();
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -197,6 +217,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// Wire `tracing` once per process. `RUST_LOG` configures the filter;
+/// when unset, defaults to warn-level except for walshadow itself which
+/// stays at info so the daemon's startup banner still emits.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,walshadow=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 async fn run(args: Args) -> Result<()> {
     let sslmode = SslMode::parse(&args.sslmode).context("--sslmode")?;
     let cfg = PgConfig {
@@ -214,12 +248,12 @@ async fn run(args: Args) -> Result<()> {
         .with_status_interval(Duration::from_secs(args.status_interval));
 
     let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
-    eprintln!(
-        "source: sysid={} timeline={} xlogpos={:X}/{:X}",
-        ident.sysid,
-        ident.timeline,
-        ident.xlogpos >> 32,
-        ident.xlogpos as u32,
+    tracing::info!(
+        target: "walshadow",
+        sysid = %ident.sysid,
+        timeline = ident.timeline,
+        xlogpos = format!("{:X}/{:X}", ident.xlogpos >> 32, ident.xlogpos as u32),
+        "source identified",
     );
 
     let raw_start = match args.start_lsn {
@@ -227,12 +261,11 @@ async fn run(args: Args) -> Result<()> {
         None => ident.xlogpos,
     };
     let aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
-    eprintln!(
-        "start_lsn={:X}/{:X} (aligned={:X}/{:X})",
-        raw_start >> 32,
-        raw_start as u32,
-        aligned >> 32,
-        aligned as u32,
+    tracing::info!(
+        target: "walshadow",
+        raw = format!("{:X}/{:X}", raw_start >> 32, raw_start as u32),
+        aligned = format!("{:X}/{:X}", aligned >> 32, aligned as u32),
+        "start LSN",
     );
 
     let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned)?;
@@ -252,7 +285,11 @@ async fn run(args: Args) -> Result<()> {
             .seed_from_source(sql_client)
             .await
             .context("seed_from_source")?;
-        eprintln!("seeded {added} catalog filenodes from source pg_class");
+        tracing::info!(
+            target: "walshadow",
+            added,
+            "seeded catalog filenodes from source pg_class"
+        );
     }
 
     // Connect the shadow catalog before START_REPLICATION so the
@@ -279,12 +316,13 @@ async fn run(args: Args) -> Result<()> {
     .await
     .context("connect to shadow PG")?;
     let catalog = Arc::new(Mutex::new(catalog));
-    eprintln!(
-        "shadow: connected via {} (port={}, user={}, dbname={})",
-        args.shadow_socket_dir.display(),
-        args.shadow_port,
-        args.shadow_user,
-        args.shadow_dbname,
+    tracing::info!(
+        target: "walshadow",
+        socket = %args.shadow_socket_dir.display(),
+        port = args.shadow_port,
+        user = %args.shadow_user,
+        dbname = %args.shadow_dbname,
+        "shadow connected",
     );
 
     // Wire the descriptor-cache invalidation channel. Tracker → drain
@@ -297,6 +335,46 @@ async fn run(args: Args) -> Result<()> {
         .tracker
         .set_invalidation_signal(invalidation_tx);
     let _invalidation_drain = spawn_invalidation_drain(catalog.clone(), invalidation_rx);
+
+    // Phase 10 pre-flight validators. Run after both source + shadow
+    // SQL clients are up so every check has the connection it needs;
+    // abort the daemon on any finding unless `--skip-preflight` is set.
+    let initial_ch_config = match args.ch_config.as_deref() {
+        Some(path) => {
+            let toml = tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("read --ch-config {}", path.display()))?;
+            Some(EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?)
+        }
+        None => None,
+    };
+    if !args.skip_preflight {
+        let source_version_num = feed.server_version_num();
+        let source_sql = feed
+            .sql_client()
+            .await
+            .context("source sidecar sql for preflight")?;
+        let shadow_sql = open_shadow_sql_client(
+            &args.shadow_socket_dir,
+            args.shadow_port,
+            &args.shadow_user,
+            &args.shadow_dbname,
+        )
+        .await?;
+        let report = walshadow::preflight::run(walshadow::preflight::Inputs {
+            source_version_num,
+            source_sql,
+            shadow_sql: &shadow_sql,
+            slot: args.slot.as_deref(),
+            ch_config: initial_ch_config.as_ref(),
+        })
+        .await
+        .context("pre-flight probe")?;
+        report
+            .into_result()
+            .context("pre-flight rejected daemon start")?;
+        tracing::info!(target: "walshadow::preflight", "pre-flight passed");
+    }
 
     // Phase 9 oracle. Opens its own libpq connection to shadow PG so
     // its queries don't pessimise the catalog's query-one path. Best-
@@ -312,16 +390,17 @@ async fn run(args: Args) -> Result<()> {
     {
         Ok(o) => {
             let ext = o.has_extension().await;
-            eprintln!(
-                "oracle: connected (validate={} sample-rate=1/{} extension={})",
-                args.validate > 0,
-                args.validate.max(1),
-                if ext { "present" } else { "absent" },
+            tracing::info!(
+                target: "walshadow::oracle",
+                validate = args.validate > 0,
+                sample_rate = args.validate.max(1),
+                extension = if ext { "present" } else { "absent" },
+                "oracle connected",
             );
             Some(Arc::new(o))
         }
         Err(e) => {
-            eprintln!("oracle: disabled (connect failed: {e})");
+            tracing::warn!(target: "walshadow::oracle", error = %e, "oracle disabled");
             None
         }
     };
@@ -342,11 +421,13 @@ async fn run(args: Args) -> Result<()> {
         .await
         .context("clear stale spill files")?;
     let xact_buffer = Arc::new(Mutex::new(xact_buffer));
-    eprintln!(
-        "spill dir: {} (xact_buffer_max={} bytes)",
-        args.spill_dir.display(),
-        args.xact_buffer_max,
+    tracing::info!(
+        target: "walshadow",
+        spill_dir = %args.spill_dir.display(),
+        xact_buffer_max = args.xact_buffer_max,
+        "spill dir ready",
     );
+
     // Pick the xact-drain observer: Phase 7 CH-Native emitter when
     // `--ch-config` is supplied, else stay metrics-only. Wrapped in
     // `Box<dyn TupleObserver>` so both arms share one drain-sink type.
@@ -357,12 +438,9 @@ async fn run(args: Args) -> Result<()> {
     // clickhouse-c-rs wraps a raw fd through `chc_posix_io` (sync
     // read/write vtable), so we `into_std()` + `set_nonblocking(false)`
     // right before construction.
-    let inner_observer: Box<dyn TupleObserver> = match args.ch_config.as_deref() {
-        Some(path) => {
-            let toml = tokio::fs::read_to_string(path)
-                .await
-                .with_context(|| format!("read --ch-config {}", path.display()))?;
-            let emitter_cfg = EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?;
+    let mut mapping_handle: Option<MappingHandle> = None;
+    let inner_observer: Box<dyn TupleObserver> = match initial_ch_config {
+        Some(emitter_cfg) => {
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
             let tcp = tokio::net::TcpStream::connect(&addr)
                 .await
@@ -374,7 +452,8 @@ async fn run(args: Args) -> Result<()> {
                 .context("set CH socket to blocking for chc_posix_io")?;
             let emitter =
                 Emitter::new(emitter_cfg, catalog.clone(), std_tcp).context("init CH emitter")?;
-            eprintln!("ch emitter: connected to {addr}");
+            mapping_handle = Some(emitter.mapping_handle());
+            tracing::info!(target: "walshadow::ch_emitter", addr = %addr, "ch emitter connected");
             Box::new(EmitterObserver::new(emitter))
         }
         None => Box::new(MetricsTupleObserver::default()),
@@ -403,10 +482,59 @@ async fn run(args: Args) -> Result<()> {
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
+    // Phase 10 metrics endpoint. The registry handle threads through
+    // the status-line loop; the HTTP server task lives until the
+    // runtime tears down.
+    let metrics = MetricsRegistry::new();
+    let _metrics_server = match args.metrics_bind {
+        Some(addr) => {
+            let (bound, _handle) = walshadow::metrics::serve(addr, metrics.clone())
+                .await
+                .context("bind metrics endpoint")?;
+            tracing::info!(target: "walshadow::metrics", addr = %bound, "metrics endpoint serving");
+            Some(_handle)
+        }
+        None => None,
+    };
+
+    // Phase 10 SIGHUP handler. Re-reads `--ch-config` and swaps the
+    // live mapping in the emitter via the shared handle. Connection
+    // params stay boot-only; only the per-relation mapping reloads.
+    let sighup_path = args.ch_config.clone();
+    let sighup_handle = mapping_handle.clone();
+    let _sighup_task = spawn_sighup_handler(sighup_path, sighup_handle);
+
+    // Phase 10 retention sweeper. Polls shadow's replay LSN, drops
+    // filtered segments more than `retention_bytes` behind. Disabled
+    // when `retention_bytes == 0`.
+    let _retention_task = if args.retention_bytes > 0 {
+        Some(spawn_retention(
+            args.out_dir.clone(),
+            args.retention_bytes,
+            shadow_conninfo.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let start_instant = Instant::now();
     let mut segments_shipped = 0u64;
     let mut prev_dispatched = stream.dispatched_lsn();
     let shutdown_reason = loop {
-        let apply_lsn = stream.dispatched_lsn();
+        // Build the standby-status triple from the most recent state we
+        // know. Phase 10 ships the *shape* — write/flush/apply all
+        // remain best-effort approximations of the same dispatched LSN
+        // until Phase 11 lands the durable-cursor + emitter-ack
+        // surfaces. `write_lsn` is the highest server_wal_end we have
+        // seen (what source last said is its own write head) so the
+        // protocol doesn't regress on a still-receiving connection.
+        let dispatched = stream.dispatched_lsn();
+        let received = feed.last_server_wal_end().max(dispatched);
+        let status = StandbyStatus {
+            write_lsn: received,
+            flush_lsn: dispatched,
+            apply_lsn: dispatched,
+        };
         let chunk = tokio::select! {
             biased;
             // Drain signals first so an in-flight ctrl_c doesn't lose to
@@ -415,7 +543,7 @@ async fn run(args: Args) -> Result<()> {
                 sig.context("install ctrl_c handler")?;
                 break "signal";
             }
-            res = feed.next_chunk(apply_lsn, &mut chunk_buf) => match res? {
+            res = feed.next_chunk(status, &mut chunk_buf) => match res? {
                 Some(c) => c,
                 None => break "CopyDone",
             },
@@ -435,47 +563,271 @@ async fn run(args: Args) -> Result<()> {
             let new_segs = (now_dispatched - prev_dispatched) / WAL_SEG_SIZE;
             segments_shipped += new_segs;
             prev_dispatched = now_dispatched;
-            let filter = stream.filter();
             let ahead = server_end.saturating_sub(dispatched_before);
-            let xact_stats = {
+            // One status-tick = one metrics refresh + one stderr line.
+            let xact_summary = {
                 let b = xact_buffer.lock().await;
-                b.stats().summary()
+                let stats = b.stats().clone();
+                let line = stats.summary();
+                (stats, line)
             };
-            let oracle_stats = match &oracle {
-                Some(o) => o.stats.lock().await.summary(),
-                None => String::new(),
+            let (xact_stats, xact_line) = xact_summary;
+            let oracle_pair = match &oracle {
+                Some(o) => {
+                    let s = o.stats.lock().await.clone();
+                    let line = s.summary();
+                    (Some(s), line)
+                }
+                None => (None, String::new()),
             };
-            eprintln!(
-                "shipped {} segments, last_lsn={:X}/{:X}, source_ahead={}B, {}, kept={}, dropped={}, relmap_updates={}, pg_class_undecoded={}, pg_class_oid_in_prefix={}, {}, {}{}{}",
+            let (oracle_stats, oracle_line) = oracle_pair;
+            let filter = stream.filter();
+            let decoder_stats = record_sink.decoder.stats().clone();
+            populate_metrics(
+                &metrics,
+                received,
+                now_dispatched,
+                &record_sink.metrics,
+                &xact_stats,
+                &decoder_stats,
+                oracle_stats.as_ref(),
+                start_instant.elapsed().as_secs(),
+            )
+            .await;
+            tracing::info!(
+                target: "walshadow",
                 segments_shipped,
-                now_dispatched >> 32,
-                now_dispatched as u32,
-                ahead,
-                record_sink.metrics.summary(),
-                filter.stats.kept,
-                filter.stats.dropped,
-                filter.tracker.relmap_updates,
-                filter.tracker.pg_class_writes_undecoded,
-                filter.tracker.pg_class_writes_oid_in_prefix,
-                record_sink.decoder.stats().summary(),
-                xact_stats,
-                if oracle_stats.is_empty() { "" } else { ", " },
-                oracle_stats,
+                last_lsn = format!("{:X}/{:X}", now_dispatched >> 32, now_dispatched as u32),
+                source_ahead_bytes = ahead,
+                metrics = %record_sink.metrics.summary(),
+                kept = filter.stats.kept,
+                dropped = filter.stats.dropped,
+                relmap_updates = filter.tracker.relmap_updates,
+                pg_class_undecoded = filter.tracker.pg_class_writes_undecoded,
+                pg_class_oid_in_prefix = filter.tracker.pg_class_writes_oid_in_prefix,
+                decoder = %record_sink.decoder.stats().summary(),
+                xact_buffer = %xact_line,
+                oracle = %oracle_line,
+                "status",
             );
             if args.max_segments != 0 && segments_shipped >= args.max_segments {
                 break "max-segments";
             }
         }
     };
-    eprintln!(
-        "stopping ({shutdown_reason}); flushing partial segment to {}",
-        args.out_dir.display(),
+    tracing::info!(
+        target: "walshadow",
+        reason = shutdown_reason,
+        out_dir = %args.out_dir.display(),
+        "stopping — flushing partial segment",
     );
     stream
         .close(Some(&mut segment_sink), &mut record_sink)
         .await
         .context("flush partial segment on shutdown")?;
     Ok(())
+}
+
+/// Open a tokio_postgres client against shadow over its unix socket.
+/// Used by [`walshadow::preflight::run`] which needs SQL access
+/// independent of the [`ShadowCatalog`]'s replay-LSN-gated path.
+async fn open_shadow_sql_client(
+    socket_dir: &std::path::Path,
+    port: u16,
+    user: &str,
+    dbname: &str,
+) -> Result<tokio_postgres::Client> {
+    let socket = socket_dir
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("shadow-socket-dir not UTF-8"))?;
+    let conninfo = socket_conninfo(socket, port, user, dbname);
+    let (client, conn) = tokio_postgres::connect(&conninfo, tokio_postgres::NoTls)
+        .await
+        .with_context(|| format!("preflight: open shadow sql client ({conninfo})"))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(client)
+}
+
+/// Spawn the SIGHUP listener task. Each delivery re-parses
+/// `--ch-config`, validates the TOML, and atomically swaps the live
+/// mapping table. Parse errors keep the existing mapping in place +
+/// log; an absent `--ch-config` makes the handler a no-op tap.
+fn spawn_sighup_handler(
+    path: Option<PathBuf>,
+    handle: Option<MappingHandle>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "walshadow::sighup",
+                    error = %e,
+                    "SIGHUP install failed; reload disabled",
+                );
+                return;
+            }
+        };
+        loop {
+            if sig.recv().await.is_none() {
+                return;
+            }
+            let (Some(p), Some(h)) = (path.as_deref(), handle.as_ref()) else {
+                tracing::info!(target: "walshadow::sighup", "SIGHUP ignored (no --ch-config)");
+                continue;
+            };
+            match tokio::fs::read_to_string(p).await {
+                Ok(toml) => match EmitterConfig::from_toml_str(&toml) {
+                    Ok(cfg) => {
+                        *h.write().await = cfg.tables;
+                        tracing::info!(
+                            target: "walshadow::sighup",
+                            path = %p.display(),
+                            "ch-config reload applied",
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "walshadow::sighup",
+                        error = %e,
+                        path = %p.display(),
+                        "ch-config parse failed; existing mapping preserved",
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    target: "walshadow::sighup",
+                    error = %e,
+                    path = %p.display(),
+                    "ch-config read failed; existing mapping preserved",
+                ),
+            }
+        }
+    })
+}
+
+/// Spawn the retention sweeper task. Wakes every
+/// [`DEFAULT_TRIM_INTERVAL`], queries shadow's
+/// `pg_last_wal_replay_lsn()`, and trims segments older than
+/// `replay_lsn - retention_bytes`.
+fn spawn_retention(
+    out_dir: PathBuf,
+    retention_bytes: u64,
+    shadow_conninfo: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = match open_retention_client(&shadow_conninfo).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "walshadow::retention",
+                    error = %e,
+                    "shadow connect failed; retention disabled",
+                );
+                return;
+            }
+        };
+        loop {
+            tokio::time::sleep(DEFAULT_TRIM_INTERVAL).await;
+            let lsn = match query_replay_lsn(&client).await {
+                Ok(Some(l)) => l,
+                Ok(None) => continue, // shadow hasn't replayed anything yet
+                Err(e) => {
+                    tracing::warn!(target: "walshadow::retention", error = %e, "lsn query");
+                    continue;
+                }
+            };
+            let cutoff = lsn.saturating_sub(retention_bytes);
+            match trim_below_lsn(&out_dir, cutoff).await {
+                Ok(r) if r.segments_removed > 0 => {
+                    tracing::info!(
+                        target: "walshadow::retention",
+                        segments = r.segments_removed,
+                        manifests = r.manifests_removed,
+                        partials = r.partials_removed,
+                        bytes_freed = r.bytes_freed,
+                        cutoff_lsn = format!("{:X}/{:X}", cutoff >> 32, cutoff as u32),
+                        "trim cycle",
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(target: "walshadow::retention", error = %e, "trim"),
+            }
+        }
+    })
+}
+
+async fn open_retention_client(conninfo: &str) -> Result<tokio_postgres::Client> {
+    let (client, conn) = tokio_postgres::connect(conninfo, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(client)
+}
+
+async fn query_replay_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>> {
+    let row = client
+        .query_one("SELECT pg_last_wal_replay_lsn()::text", &[])
+        .await?;
+    let raw: Option<String> = row.get(0);
+    match raw {
+        Some(s) => Ok(Some(wal_rs::pg::backup::parse_pg_lsn(&s)?)),
+        None => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn populate_metrics(
+    registry: &MetricsRegistry,
+    source_received_lsn: u64,
+    filter_lsn: u64,
+    rec_metrics: &MetricsRecordSink,
+    xact_stats: &walshadow::xact_buffer::XactBufferStats,
+    decoder_stats: &walshadow::decoder_sink::DecoderStats,
+    oracle_stats: Option<&walshadow::oracle::OracleStats>,
+    uptime_secs: u64,
+) {
+    use std::collections::BTreeMap;
+    use walshadow::classify::rmgr_label;
+    let mut by_rm = BTreeMap::new();
+    for ((rm, decision), n) in &rec_metrics.by_rm_decision {
+        let key = (
+            rmgr_label(*rm).to_string(),
+            match decision {
+                walshadow::filter::Decision::Keep => "keep",
+                walshadow::filter::Decision::Drop => "drop",
+            },
+        );
+        by_rm.insert(key, *n);
+    }
+    let snap = MetricsSnapshot {
+        source_received_lsn,
+        filter_lsn,
+        shadow_replay_lsn: 0, // Phase 10: retention task polls separately; expose later.
+        decoder_commit_lsn: 0, // Phase 11
+        emitter_ack_lsn: 0,   // Phase 11
+        records_by_rm_decision: by_rm,
+        xact_active: xact_stats.xacts_active,
+        xact_bytes_in_memory: xact_stats.bytes_in_memory,
+        spill_xacts_active: xact_stats.spill_xacts_active,
+        spill_bytes_active: xact_stats.spill_bytes_active,
+        spill_evictions_total: xact_stats.spill_evictions_total,
+        xacts_committed_total: xact_stats.committed_xacts_total,
+        xacts_aborted_total: xact_stats.aborted_xacts_total,
+        decoder_decoded_total: decoder_stats.decoded,
+        decoder_partial_total: decoder_stats.partial,
+        emitter_rows_total: 0,
+        emitter_blocks_total: 0,
+        emitter_xacts_total: 0,
+        emitter_unsupported_relations: 0,
+        oracle_resolved_total: oracle_stats.map(|s| s.resolved).unwrap_or(0),
+        oracle_fallback_raw_total: oracle_stats.map(|s| s.fallback_raw).unwrap_or(0),
+        oracle_validate_sampled_total: oracle_stats.map(|s| s.probes).unwrap_or(0),
+        oracle_validate_mismatches_total: oracle_stats.map(|s| s.mismatches).unwrap_or(0),
+        oracle_errors_total: oracle_stats.map(|s| s.errors).unwrap_or(0),
+        uptime_secs,
+    };
+    registry.set(snap).await;
 }
 
 fn parse_lsn(s: &str) -> Result<u64> {

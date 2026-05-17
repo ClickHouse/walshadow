@@ -40,7 +40,7 @@ use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
 };
-use walshadow::source_feed::SourceFeed;
+use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
@@ -654,7 +654,7 @@ async fn phase8_insert_update_delete_replicates_to_clickhouse() {
         let apply_lsn = stream.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            feed.next_chunk(apply_lsn, &mut chunk_buf),
+            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut chunk_buf),
         )
         .await;
         let chunk = match next {
@@ -970,7 +970,7 @@ async fn phase8_add_column_replicates_pre_and_post_alter() {
         let apply_lsn = stream.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            feed.next_chunk(apply_lsn, &mut chunk_buf),
+            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut chunk_buf),
         )
         .await;
         let chunk = match next {

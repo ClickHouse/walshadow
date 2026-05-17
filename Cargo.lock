@@ -2582,6 +2582,8 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "toml",
+ "tracing",
+ "tracing-subscriber",
  "wal-rs",
  "zstd",
 ]

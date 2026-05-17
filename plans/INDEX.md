@@ -64,13 +64,25 @@ docs that are not yet committed work sit alongside as peers.
   local codecs for `jsonb` / arrays if measurement says the
   per-row libpq round-trip is hot; sampler auto-tuning;
   mismatch ring buffer for debugging. [PHASE9.md](PHASE9.md).
-- **Phase 10** — operational scaffolding (renamed from
-  "operational"). Pre-flight validators, HTTP/Prom metrics, tracing
-  pipeline, filtered `pg_wal/` trim, standby-status triple-LSN
-  shape, SIGHUP `--ch-config` reload, CH-emitter retry. Scope-shrink
-  from the original Phase 10: slot-advance value + cursor file moved
-  to Phase 11. Not yet committed work; see
-  [PLAN.md §"Phase 10"](PLAN.md#phase-10--operational-scaffolding).
+- **Phase 10** — operational scaffolding. Pre-flight validators
+  (`src/preflight.rs` — aggregated report across version / wal_level /
+  REPLICA IDENTITY FULL / slot existence), HTTP/Prom metrics endpoint
+  (`src/metrics.rs` — hand-rolled text format over tokio TCP, no new
+  observability dep), `tracing_subscriber` pipeline (`RUST_LOG=
+  walshadow=debug` surfaces wal-rs's frame-level diagnostics),
+  filtered segment retention (`src/retention.rs` — LSN-keyed trim
+  against shadow's `pg_last_wal_replay_lsn`), `(write, flush, apply)`
+  standby-status triple (`StandbyStatus` in `source_feed.rs`; Phase 11
+  fills resume-safe values), SIGHUP reload of `--ch-config` (atomic
+  swap of `MappingHandle` at xact boundary), CH-emitter bounded
+  reconnect+retry (`Emitter::route_with_retry` /
+  `drain_xact_with_retry` + `RetryConfig`). Surfaces + fixes two
+  bugs: tokio-postgres rejected `&str → regclass` binding, fix is
+  `to_regclass(text)` which also returns NULL on missing relations;
+  the Emitter's reconnect drop-order required keeping the existing
+  `Pin<Box<PosixIo>>` invariant so the C-side `client→io.state`
+  back-pointer stays valid after field reassignment. [PHASE10.md
+  ](PHASE10.md).
 - **Phase 11** — durability + resume. Cursor file under
   `{spill_dir}/cursor.bin`, slot-advance gated on emitter-ack LSN,
   filter-segment fsync, startup resume + spill replay. Unblocks

@@ -26,7 +26,7 @@ use wal_rs::pg::replication::tls::SslMode;
 use wal_rs::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::source_feed::SourceFeed;
+use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
     CollectingRecordSink, DirSegmentSink, MetricsRecordSink, WAL_SEG_SIZE, WalStream,
 };
@@ -163,9 +163,11 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
     let mut prev_dispatched = stream.dispatched_lsn();
     while segments_shipped < 1 && std::time::Instant::now() < deadline {
         let apply_lsn = stream.dispatched_lsn();
-        let next =
-            tokio::time::timeout(Duration::from_secs(2), feed.next_chunk(apply_lsn, &mut buf))
-                .await;
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut buf),
+        )
+        .await;
         let chunk = match next {
             Ok(Ok(Some(c))) => c,
             Ok(Ok(None)) => break, // CopyDone
@@ -432,9 +434,11 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
     let mut prev = stream.dispatched_lsn();
     while segments_shipped < 1 && std::time::Instant::now() < deadline {
         let apply_lsn = stream.dispatched_lsn();
-        let next =
-            tokio::time::timeout(Duration::from_secs(2), feed.next_chunk(apply_lsn, &mut buf))
-                .await;
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut buf),
+        )
+        .await;
         let chunk = match next {
             Ok(Ok(Some(c))) => c,
             Ok(Ok(None)) => break,
@@ -702,9 +706,11 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
     let mut chunks_seen = 0;
     while std::time::Instant::now() < deadline {
         let apply_lsn = stream.dispatched_lsn();
-        let next =
-            tokio::time::timeout(Duration::from_secs(1), feed.next_chunk(apply_lsn, &mut buf))
-                .await;
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut buf),
+        )
+        .await;
         let chunk = match next {
             Ok(Ok(Some(c))) => c,
             Ok(Ok(None)) => break,
@@ -837,7 +843,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         let apply_lsn = stream2.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            feed2.next_chunk(apply_lsn, &mut resume_buf),
+            feed2.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut resume_buf),
         )
         .await;
         let chunk = match next {

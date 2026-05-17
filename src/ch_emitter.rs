@@ -119,6 +119,30 @@ pub struct EmitterConfig {
     pub byte_budget: usize,
     /// Keyed on `"<namespace>.<relname>"` source identifier.
     pub tables: HashMap<String, TableMapping>,
+    /// Phase 10 bounded retry against a single CH replica. See
+    /// [`RetryConfig`] for semantics.
+    pub retry: RetryConfig,
+}
+
+/// Bounded-retry knobs for the CH emitter. A retryable error (IO,
+/// clickhouse-c protocol, ServerException) triggers reconnect + retry
+/// of the failing operation up to `max_attempts` times with
+/// exponential backoff capped at `max_backoff`.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub initial_backoff: std::time::Duration,
+    pub max_backoff: std::time::Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            initial_backoff: std::time::Duration::from_millis(250),
+            max_backoff: std::time::Duration::from_secs(10),
+        }
+    }
 }
 
 impl Default for EmitterConfig {
@@ -133,6 +157,7 @@ impl Default for EmitterConfig {
             row_budget: DEFAULT_ROW_BUDGET,
             byte_budget: DEFAULT_BYTE_BUDGET,
             tables: HashMap::new(),
+            retry: RetryConfig::default(),
         }
     }
 }
@@ -270,6 +295,21 @@ impl EmitterConfig {
             }
             if let Some(v) = ch.get("byte_budget").and_then(Value::as_integer) {
                 out.byte_budget = usize::try_from(v).unwrap_or(DEFAULT_BYTE_BUDGET);
+            }
+            if let Some(v) = ch.get("retry_max_attempts").and_then(Value::as_integer) {
+                out.retry.max_attempts = u32::try_from(v).unwrap_or(out.retry.max_attempts);
+            }
+            if let Some(v) = ch
+                .get("retry_initial_backoff_ms")
+                .and_then(Value::as_integer)
+                && let Ok(ms) = u64::try_from(v)
+            {
+                out.retry.initial_backoff = std::time::Duration::from_millis(ms);
+            }
+            if let Some(v) = ch.get("retry_max_backoff_ms").and_then(Value::as_integer)
+                && let Ok(ms) = u64::try_from(v)
+            {
+                out.retry.max_backoff = std::time::Duration::from_millis(ms);
             }
         }
         if let Some(tbls) = root.get("table").and_then(Value::as_table) {
@@ -895,6 +935,15 @@ fn encode_value(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError
     }
 }
 
+/// Shared per-relation mapping handle. Cloneable via the inner `Arc`;
+/// the daemon hands one clone to [`Emitter`] and keeps another to
+/// support SIGHUP reload (atomic swap of the entire `HashMap`).
+///
+/// Phase 10 sees the swap *between* xacts: tables already cached in
+/// [`Emitter::tables`] keep their old [`TablePlan`] until the xact
+/// drains and clears the cache. The next xact consults the new map.
+pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>;
+
 /// Phase 7 CH-Native emitter. Holds one [`Client`] over a connected
 /// TCP socket per CH replica plus the per-table accumulator state.
 ///
@@ -910,6 +959,11 @@ pub struct Emitter {
     io: Pin<Box<PosixIo>>,
     alloc: Allocator,
     config: EmitterConfig,
+    /// Phase 10 SIGHUP-reloadable mapping. Initial value is cloned from
+    /// `config.tables` at construction; later mutations come via
+    /// [`Emitter::mapping_handle`] reaching out from the daemon's
+    /// SIGHUP task.
+    mapping: MappingHandle,
     catalog: Arc<Mutex<ShadowCatalog>>,
     tables: HashMap<String, TableEncoder>,
     /// xid currently held in `tables`. Reset on `on_xact_end`.
@@ -924,6 +978,12 @@ pub struct EmitterStats {
     pub xacts_committed: u64,
     pub unsupported_relations: u64,
     pub unsupported_values: u64,
+    /// Phase 10 retry bookkeeping. `reconnects` ticks on every fresh
+    /// CH socket the daemon hot-replaces; `retries_attempted` ticks on
+    /// every reconnect-triggered retry (one per failing operation,
+    /// not per attempt — so a single op that needed 3 retries adds 3).
+    pub reconnects: u64,
+    pub retries_attempted: u64,
 }
 
 impl Emitter {
@@ -943,17 +1003,25 @@ impl Emitter {
         opts.compression = config.compression.to_wire();
         let codec_ref = codec.as_ref().map(|c| c.as_ref());
         let client = Client::init(&opts, alloc, io.as_mut(), codec_ref)?;
+        let mapping = Arc::new(tokio::sync::RwLock::new(config.tables.clone()));
         Ok(Self {
             client,
             codec,
             io,
             alloc,
             config,
+            mapping,
             catalog,
             tables: HashMap::new(),
             current_xid: None,
             stats: EmitterStats::default(),
         })
+    }
+
+    /// SIGHUP target. Daemon clones this handle at boot and feeds the
+    /// post-reload TOML mapping back through `*handle.write().await = new`.
+    pub fn mapping_handle(&self) -> MappingHandle {
+        self.mapping.clone()
     }
 
     /// Route one committed tuple. INSERT/UPDATE land via the `new`
@@ -970,9 +1038,15 @@ impl Emitter {
                 .await?
         };
         let key = format!("{}.{}", rel.namespace_name, rel.name);
-        let Some(mapping) = self.config.tables.get(&key).cloned() else {
-            self.stats.unsupported_relations += 1;
-            return Ok(());
+        let mapping = {
+            let m = self.mapping.read().await;
+            match m.get(&key).cloned() {
+                Some(v) => v,
+                None => {
+                    self.stats.unsupported_relations += 1;
+                    return Ok(());
+                }
+            }
         };
         // Initialize per-table encoder lazily on first row.
         let alloc = self.alloc;
@@ -1062,6 +1136,124 @@ impl Emitter {
         self.stats.xacts_committed += 1;
         Ok(())
     }
+
+    /// Phase 10 reconnect: open a fresh TCP socket against the same
+    /// `(host, port)`, build a new [`Client`], and hot-swap `client` /
+    /// `io` / `codec` while preserving the per-xact accumulator state
+    /// in `self.tables`. The caller is responsible for re-issuing
+    /// `send_query(insert_sql)` on the new connection for any table
+    /// whose buffered rows must still flush — see
+    /// [`Self::redo_open_inserts`].
+    ///
+    /// Drop order matters: `client` first (final state-sync against
+    /// the *old* io heap state), then `codec`, then `io`. Field
+    /// assignments below match struct declaration order; replacing
+    /// `self.client = new_client` drops the old client before old `io`
+    /// has been replaced, which is exactly the invariant the C-side
+    /// back-pointer needs.
+    pub async fn reconnect(&mut self) -> Result<(), EmitterError> {
+        let addr = format!("{}:{}", self.config.host, self.config.port);
+        let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
+            EmitterError::Io(std::io::Error::other(format!("reconnect to {addr}: {e}")))
+        })?;
+        tcp.set_nodelay(true).ok();
+        let std_tcp = tcp.into_std()?;
+        std_tcp.set_nonblocking(false)?;
+        let codec = self.config.compression.build_codec()?;
+        let fd = std_tcp.into_raw_fd();
+        let mut io = PosixIo::new(fd);
+        let mut opts = ClientOpts::new()
+            .database(&self.config.database)
+            .user(&self.config.user)
+            .password(&self.config.password);
+        opts.compression = self.config.compression.to_wire();
+        let codec_ref = codec.as_ref().map(|c| c.as_ref());
+        let client = Client::init(&opts, self.alloc, io.as_mut(), codec_ref)?;
+        self.client = client;
+        self.codec = codec;
+        self.io = io;
+        self.stats.reconnects += 1;
+        Ok(())
+    }
+
+    /// Re-issue `INSERT … FORMAT Native` for every per-table encoder
+    /// currently holding buffered rows. Called after [`Self::reconnect`]
+    /// so the buffers can flush through the new connection on the next
+    /// [`Self::drain_xact`].
+    fn redo_open_inserts(&mut self) -> Result<(), EmitterError> {
+        let sqls: Vec<String> = self
+            .tables
+            .values()
+            .map(|enc| enc.plan.insert_sql.clone())
+            .collect();
+        for sql in sqls {
+            self.client.send_query(&sql, None)?;
+        }
+        Ok(())
+    }
+
+    /// Wrap [`Self::route`] in bounded reconnect+retry per
+    /// [`EmitterConfig::retry`]. Used by [`EmitterObserver::on_tuple`].
+    /// Retry preserves the per-xact buffer state in `self.tables`, so
+    /// a CH bounce mid-xact still lets the surviving buffered rows
+    /// flush through the new connection.
+    pub async fn route_with_retry(
+        &mut self,
+        committed: &CommittedTuple,
+    ) -> Result<(), EmitterError> {
+        let retry = self.config.retry.clone();
+        let mut attempt = 0u32;
+        let mut backoff = retry.initial_backoff;
+        loop {
+            match self.route(committed).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
+                    self.stats.retries_attempted += 1;
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+                    self.reconnect().await?;
+                    self.redo_open_inserts()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Wrap [`Self::drain_xact`] in bounded reconnect+retry. Same shape
+    /// as [`Self::route_with_retry`] — see notes there.
+    pub async fn drain_xact_with_retry(&mut self) -> Result<(), EmitterError> {
+        let retry = self.config.retry.clone();
+        let mut attempt = 0u32;
+        let mut backoff = retry.initial_backoff;
+        loop {
+            match self.drain_xact() {
+                Ok(()) => return Ok(()),
+                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
+                    self.stats.retries_attempted += 1;
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+                    self.reconnect().await?;
+                    self.redo_open_inserts()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Classify a failure as transient (worth a reconnect+retry) or fatal.
+/// IO, clickhouse-c protocol, and ServerException are all transient at
+/// the network/server level — operators tune `retry.max_attempts` to
+/// bound the total wall-time. Config / Type / Catalog /
+/// UnsupportedValue stay fatal because they encode bugs in the daemon
+/// or mapping; retrying would loop forever.
+fn is_retryable(e: &EmitterError) -> bool {
+    matches!(
+        e,
+        EmitterError::Io(_) | EmitterError::Client(_) | EmitterError::ServerException { .. }
+    )
 }
 
 /// Plug Emitter into the [`TupleObserver`] dispatch path. Owned by
@@ -1085,7 +1277,7 @@ impl TupleObserver for EmitterObserver {
     > {
         Box::pin(async move {
             self.emitter
-                .route(committed)
+                .route_with_retry(committed)
                 .await
                 .map_err(DecoderSinkError::from)
         })
@@ -1096,7 +1288,12 @@ impl TupleObserver for EmitterObserver {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
-        Box::pin(async move { self.emitter.drain_xact().map_err(DecoderSinkError::from) })
+        Box::pin(async move {
+            self.emitter
+                .drain_xact_with_retry()
+                .await
+                .map_err(DecoderSinkError::from)
+        })
     }
 }
 
