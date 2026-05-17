@@ -36,9 +36,10 @@
 
 use thiserror::Error;
 use wal_rs::pg::wal::segment::SegmentName;
+use wal_rs::pg::walparser::XLogRecord;
 
 use crate::filter::{Decision, Filter};
-use crate::filter_segment::{FilterSegmentError, filter_segment};
+use crate::filter_segment::{FilterSegmentError, ParsedRecord, filter_segment};
 use crate::manifest::{Kind, Manifest};
 
 /// Default PG WAL segment size — 16 MiB. walshadow assumes the
@@ -73,36 +74,40 @@ pub enum SinkError {
     Other(String),
 }
 
-/// Per-record event emitted as the segment-level filter walks a
-/// completed segment. The downstream consumer (Phase 5 decoder, an
-/// observability tap) decides what to do based on `decision` and the
-/// record's parsed shape via [`Manifest`] entries.
+/// Per-record hand-off carrying the parsed `XLogRecord`, where it sits
+/// in the source LSN stream, and the keep/drop decision the filter
+/// computed. Phase 5's heap-tuple decoder reads `parsed.header.xact_id`,
+/// `parsed.blocks[i].header.location.rel`, and `parsed.main_data`;
+/// `page_magic` selects PG-15-vs-PG-14 FPI bit semantics.
 #[derive(Debug, Clone)]
-pub struct RecordEvent {
+pub struct Record {
+    pub parsed: XLogRecord,
     /// Absolute source LSN where the record begins.
     pub source_lsn: u64,
-    /// Total record length (`xl_tot_len`).
-    pub len: u32,
-    /// `XLogRecordHeader.resource_manager_id`.
-    pub rmid: u8,
-    /// `XLogRecordHeader.info` byte.
-    pub info: u8,
+    /// Magic of the page whose data area the record header sat on.
+    pub page_magic: u16,
     /// Keep/drop decision the filter computed.
     pub decision: Decision,
 }
 
-impl RecordEvent {
-    /// Build from a [`Manifest`] entry plus the segment's start LSN.
-    pub fn from_manifest_entry(seg_start_lsn: u64, entry: &crate::manifest::Entry) -> Self {
+impl Record {
+    /// Zip one parsed record with its matching [`Manifest`] entry
+    /// plus the segment's start LSN. Index alignment between
+    /// `parsed_records` and `manifest.records` is the
+    /// `filter_segment` contract.
+    pub fn from_parsed(
+        seg_start_lsn: u64,
+        parsed: ParsedRecord,
+        entry: &crate::manifest::Entry,
+    ) -> Self {
         let decision = match entry.kind {
             Kind::Kept => Decision::Keep,
             Kind::Dropped => Decision::Drop,
         };
         Self {
+            parsed: parsed.record,
             source_lsn: seg_start_lsn + entry.offset,
-            len: entry.len,
-            rmid: entry.rmid,
-            info: entry.info,
+            page_magic: parsed.page_magic,
             decision,
         }
     }
@@ -111,7 +116,7 @@ impl RecordEvent {
 /// Sink that observes every record decided by the filter. Phase 5's
 /// heap-tuple decoder attaches here.
 pub trait RecordSink {
-    fn on_record(&mut self, event: &RecordEvent) -> Result<(), SinkError>;
+    fn on_record(&mut self, record: &Record) -> Result<(), SinkError>;
 }
 
 /// Sink that receives one fully-filtered segment at a time. Shadow PG
@@ -126,15 +131,15 @@ pub trait SegmentSink {
     ) -> Result<(), SinkError>;
 }
 
-/// In-memory `RecordSink` for tests. Stores every event.
+/// In-memory `RecordSink` for tests. Stores every record.
 #[derive(Debug, Default)]
 pub struct CollectingRecordSink {
-    pub events: Vec<RecordEvent>,
+    pub records: Vec<Record>,
 }
 
 impl RecordSink for CollectingRecordSink {
-    fn on_record(&mut self, event: &RecordEvent) -> Result<(), SinkError> {
-        self.events.push(event.clone());
+    fn on_record(&mut self, record: &Record) -> Result<(), SinkError> {
+        self.records.push(record.clone());
         Ok(())
     }
 }
@@ -309,14 +314,16 @@ impl WalStream {
         let pad = self.seg_size as usize - self.current_buf.len();
         self.current_buf.extend(std::iter::repeat_n(0u8, pad));
         let name = seg.format();
-        let (filtered, manifest) = filter_segment(&self.current_buf, &name, &mut self.filter)
-            .map_err(|source| WalStreamError::Filter {
-                seg: name.clone(),
-                source,
+        let (filtered, manifest, parsed) =
+            filter_segment(&self.current_buf, &name, &mut self.filter).map_err(|source| {
+                WalStreamError::Filter {
+                    seg: name.clone(),
+                    source,
+                }
             })?;
-        for entry in &manifest.records {
-            let event = RecordEvent::from_manifest_entry(seg_start_lsn, entry);
-            record_sink.on_record(&event)?;
+        for (entry, parsed) in manifest.records.iter().zip(parsed) {
+            let record = Record::from_parsed(seg_start_lsn, parsed, entry);
+            record_sink.on_record(&record)?;
         }
         if let Some(sink) = partial_sink {
             sink.on_segment(seg, &filtered, &manifest)?;
@@ -333,14 +340,16 @@ impl WalStream {
         let seg = self.segment_for_lsn(self.current_lsn);
         let seg_start_lsn = self.current_lsn;
         let name = seg.format();
-        let (filtered, manifest) = filter_segment(&self.current_buf, &name, &mut self.filter)
-            .map_err(|source| WalStreamError::Filter {
-                seg: name.clone(),
-                source,
+        let (filtered, manifest, parsed) =
+            filter_segment(&self.current_buf, &name, &mut self.filter).map_err(|source| {
+                WalStreamError::Filter {
+                    seg: name.clone(),
+                    source,
+                }
             })?;
-        for entry in &manifest.records {
-            let event = RecordEvent::from_manifest_entry(seg_start_lsn, entry);
-            record_sink.on_record(&event)?;
+        for (entry, parsed) in manifest.records.iter().zip(parsed) {
+            let record = Record::from_parsed(seg_start_lsn, parsed, entry);
+            record_sink.on_record(&record)?;
         }
         segment_sink.on_segment(seg, &filtered, &manifest)?;
         self.current_lsn += self.seg_size;
@@ -385,12 +394,26 @@ mod tests {
     }
 
     #[test]
-    fn record_event_lsn_offset_is_seg_start_plus_entry_offset() {
+    fn record_lsn_offset_is_seg_start_plus_entry_offset() {
+        use wal_rs::pg::walparser::XLogRecordHeader;
         let entry = dummy_manifest_entry(40, RmId::Xact as u8);
-        let event = RecordEvent::from_manifest_entry(0x1000_0000, &entry);
-        assert_eq!(event.source_lsn, 0x1000_0000 + 40);
-        assert_eq!(event.rmid, RmId::Xact as u8);
-        assert_eq!(event.decision, Decision::Keep);
+        let parsed = ParsedRecord {
+            record: XLogRecord {
+                header: XLogRecordHeader {
+                    resource_manager_id: RmId::Xact as u8,
+                    xact_id: 42,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            page_magic: 0xD110,
+        };
+        let record = Record::from_parsed(0x1000_0000, parsed, &entry);
+        assert_eq!(record.source_lsn, 0x1000_0000 + 40);
+        assert_eq!(record.parsed.header.resource_manager_id, RmId::Xact as u8);
+        assert_eq!(record.parsed.header.xact_id, 42);
+        assert_eq!(record.page_magic, 0xD110);
+        assert_eq!(record.decision, Decision::Keep);
     }
 
     #[test]

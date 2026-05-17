@@ -53,9 +53,9 @@ fn build_relmap_main_data(dbid: u32, mappings: &[(u32, u32)]) -> Vec<u8> {
     data
 }
 
-fn write_header(v: &mut Vec<u8>, total: u32, info: u8, rmid: u8) {
+fn write_header(v: &mut Vec<u8>, total: u32, info: u8, rmid: u8, xid: u32) {
     v.extend_from_slice(&total.to_le_bytes()); // xl_tot_len
-    v.extend_from_slice(&0u32.to_le_bytes()); // xl_xid
+    v.extend_from_slice(&xid.to_le_bytes()); // xl_xid
     v.extend_from_slice(&0u64.to_le_bytes()); // xl_prev
     v.push(info);
     v.push(rmid);
@@ -72,10 +72,14 @@ fn finalise_crc(v: &mut [u8]) {
 /// Record carrying only main_data, encoded with `XLR_BLOCK_ID_DATA_LONG`
 /// for payloads > 255 bytes (relmap updates are ~536 bytes).
 fn build_record_with_main_data(rmid: u8, info: u8, main_data: &[u8]) -> Vec<u8> {
+    build_record_with_main_data_xid(rmid, info, 0, main_data)
+}
+
+fn build_record_with_main_data_xid(rmid: u8, info: u8, xid: u32, main_data: &[u8]) -> Vec<u8> {
     let body_len = 1 + 4 + main_data.len();
     let total = X_LOG_RECORD_HEADER_SIZE + body_len;
     let mut v = Vec::with_capacity(total);
-    write_header(&mut v, total as u32, info, rmid);
+    write_header(&mut v, total as u32, info, rmid, xid);
     v.push(XLR_BLOCK_ID_DATA_LONG);
     v.extend_from_slice(&(main_data.len() as u32).to_le_bytes());
     v.extend_from_slice(main_data);
@@ -93,10 +97,22 @@ fn build_record_with_block_ref(
     rel_node: u32,
     block_no: u32,
 ) -> Vec<u8> {
+    build_record_with_block_ref_xid(rmid, info, 0, spc_node, db_node, rel_node, block_no)
+}
+
+fn build_record_with_block_ref_xid(
+    rmid: u8,
+    info: u8,
+    xid: u32,
+    spc_node: u32,
+    db_node: u32,
+    rel_node: u32,
+    block_no: u32,
+) -> Vec<u8> {
     let body_len = 1 + 1 + 2 + 12 + 4; // block_id, fork_flags, data_length, rel, block_no
     let total = X_LOG_RECORD_HEADER_SIZE + body_len;
     let mut v = Vec::with_capacity(total);
-    write_header(&mut v, total as u32, info, rmid);
+    write_header(&mut v, total as u32, info, rmid, xid);
     v.push(0); // block_id = 0
     v.push(0); // fork_flags = 0 (no has_data, no has_image, no same_rel)
     v.extend_from_slice(&0u16.to_le_bytes()); // data_length = 0
@@ -179,7 +195,7 @@ fn catalog_tracker_state_survives_segment_boundary() {
         .expect("push seg2");
 
     assert_eq!(segs.segments.len(), 2, "two segments dispatched");
-    assert_eq!(records.events.len(), 2, "two record events surfaced");
+    assert_eq!(records.records.len(), 2, "two records surfaced");
 
     // Segment 1's relmap update — kept (special rmgr).
     let seg1_manifest = &segs.segments[0].2;
@@ -210,6 +226,70 @@ fn catalog_tracker_state_survives_segment_boundary() {
     assert_eq!(filter.tracker.relmap_updates, 1);
 
     // RecordSink decisions reflect the same outcome.
-    assert_eq!(records.events[0].decision, Decision::Keep);
-    assert_eq!(records.events[1].decision, Decision::Keep);
+    assert_eq!(records.records[0].decision, Decision::Keep);
+    assert_eq!(records.records[1].decision, Decision::Keep);
+}
+
+/// PRE5b5: every record bracketed by one BEGIN…COMMIT carries the
+/// same `xact_id` in its parsed header. Synthetic version: pack three
+/// records with `xid = 42` plus a stray xid=99 record (different
+/// transaction) into one segment, push through `WalStream`, assert
+/// the parsed `Record.parsed.header.xact_id` arrives at the sink
+/// untouched. Pre-PRE5b5 `RecordEvent` carried no xact_id at all, so
+/// this assertion is not satisfiable on the old shape.
+#[test]
+fn records_in_one_xact_share_xact_id_through_stream() {
+    const XID: u32 = 42;
+    const OTHER_XID: u32 = 99;
+    // Three pg_class-targeted heap records — Class::Catalog by the
+    // bootstrap rule (rel_node < 16384) → all Kept, all reaching the
+    // sink with their parsed shape.
+    let r1 = build_record_with_block_ref_xid(RmId::Heap as u8, 0x00, XID, 1663, 5, PG_CLASS_OID, 0);
+    let r2 = build_record_with_block_ref_xid(RmId::Heap as u8, 0x00, XID, 1663, 5, PG_CLASS_OID, 1);
+    let r3 = build_record_with_block_ref_xid(RmId::Heap as u8, 0x00, XID, 1663, 5, PG_CLASS_OID, 2);
+    let r_other = build_record_with_block_ref_xid(
+        RmId::Heap as u8,
+        0x00,
+        OTHER_XID,
+        1663,
+        5,
+        PG_CLASS_OID,
+        3,
+    );
+    let seg = build_one_page_segment(&[&r1, &r2, &r3, &r_other]);
+
+    let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
+    let mut records = CollectingRecordSink::default();
+    let mut segs = CollectingSegmentSink::default();
+    stream.push(0, &seg, &mut records, &mut segs).expect("push");
+
+    assert_eq!(records.records.len(), 4);
+    let xid_42: Vec<_> = records
+        .records
+        .iter()
+        .filter(|r| r.parsed.header.xact_id == XID)
+        .collect();
+    assert_eq!(
+        xid_42.len(),
+        3,
+        "all three records in the BEGIN…COMMIT cohort must carry xact_id={XID}",
+    );
+    for r in &xid_42 {
+        assert_eq!(r.parsed.header.resource_manager_id, RmId::Heap as u8);
+        assert_eq!(r.parsed.blocks.len(), 1);
+        assert_eq!(
+            r.parsed.blocks[0].header.location.rel.rel_node,
+            PG_CLASS_OID
+        );
+    }
+    let xid_99: Vec<_> = records
+        .records
+        .iter()
+        .filter(|r| r.parsed.header.xact_id == OTHER_XID)
+        .collect();
+    assert_eq!(
+        xid_99.len(),
+        1,
+        "stray record on a different xid must arrive distinguishable",
+    );
 }

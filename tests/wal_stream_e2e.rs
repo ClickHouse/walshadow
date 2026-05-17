@@ -237,10 +237,56 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         count,
         "manifest record count must match WalParser's count on filtered bytes",
     );
+    // PRE5b5 contract: parsed records arrive at the RecordSink with
+    // their full XLogRecord shape. Prove the wal-rs →
+    // filter_segment → WalStream chain forwards `parsed.header` and
+    // `parsed.blocks` rather than the old scalar-only RecordEvent.
+    assert!(!records.records.is_empty(), "RecordSink saw zero records");
+    // PG 17 baseline tops out at RmId::LogicalMsg = 21.
+    const MAX_KNOWN_RMID: u8 = 21;
+    for r in &records.records {
+        assert!(
+            r.parsed.header.resource_manager_id <= MAX_KNOWN_RMID,
+            "parsed resource_manager_id out of range: {}",
+            r.parsed.header.resource_manager_id,
+        );
+        assert!(r.source_lsn >= aligned);
+        assert!(r.parsed.header.total_record_length >= 24);
+    }
+    // At least one record carries a populated block locator so
+    // `blocks[0].header.location.rel` flows through with non-zero
+    // fields.
+    let with_block = records
+        .records
+        .iter()
+        .find(|r| {
+            r.parsed
+                .blocks
+                .iter()
+                .any(|b| b.header.location.rel.rel_node != 0)
+        })
+        .expect("at least one record with a populated block ref");
+    let rel = with_block
+        .parsed
+        .blocks
+        .iter()
+        .find(|b| b.header.location.rel.rel_node != 0)
+        .map(|b| b.header.location.rel)
+        .unwrap();
+    assert!(rel.rel_node > 0);
+    // At least one record carries a non-zero xact_id. A live INSERT +
+    // pg_switch_wal workload always emits ≥1 xact-bearing record
+    // (heap insert under the auto-commit xact).
+    let xid_bearing = records
+        .records
+        .iter()
+        .find(|r| r.parsed.header.xact_id != 0)
+        .expect("at least one record with a populated xact_id");
     eprintln!(
-        "e2e: shipped {} segment(s), {} record events surfaced via RecordSink",
+        "e2e: shipped {} segment(s), {} records surfaced via RecordSink (sample xid={})",
         segments_shipped,
-        records.events.len(),
+        records.records.len(),
+        xid_bearing.parsed.header.xact_id,
     );
 }
 

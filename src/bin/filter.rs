@@ -60,7 +60,7 @@ fn run(args: Args) -> Result<()> {
         .unwrap_or_default();
 
     let mut filter = Filter::new();
-    let (filtered, manifest) = filter_segment(&bytes, &name, &mut filter)
+    let (filtered, manifest, _parsed) = filter_segment(&bytes, &name, &mut filter)
         .with_context(|| format!("filter {}", args.input.display()))?;
 
     fs::create_dir_all(&args.out_dir)

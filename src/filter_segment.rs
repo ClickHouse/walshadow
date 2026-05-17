@@ -2,7 +2,7 @@
 //! dropped records in place, emit manifest sidecar.
 
 use thiserror::Error;
-use wal_rs::pg::walparser::{ParseError, parse_record_from_bytes};
+use wal_rs::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
 use crate::filter::{Decision, Filter};
 use crate::manifest::{Entry, FILTER_VERSION, Kind, Manifest, ManifestStats};
@@ -27,15 +27,28 @@ pub enum FilterSegmentError {
     },
 }
 
-/// Filter one segment's bytes and emit both rewritten bytes and a
-/// manifest sidecar. `filter` is borrowed mutably so callers spanning
-/// multiple segments retain `CatalogTracker` state across calls; the
-/// emitted [`ManifestStats`] reflect only records processed *this* call.
+/// In-memory hand-off paired with each [`Manifest`] entry: the parsed
+/// record plus the page magic of the page its header sat on. The
+/// magic is needed downstream to interpret PG-15-vs-PG-14 FPI bits via
+/// `XLogRecordBlockImageHeader::is_compressed`.
+#[derive(Debug, Clone)]
+pub struct ParsedRecord {
+    pub record: XLogRecord,
+    pub page_magic: u16,
+}
+
+/// Filter one segment's bytes and emit rewritten bytes, the manifest
+/// sidecar, and the parsed records in source order. `filter` is
+/// borrowed mutably so callers spanning multiple segments retain
+/// `CatalogTracker` state across calls; the emitted [`ManifestStats`]
+/// reflect only records processed *this* call. The returned
+/// `Vec<ParsedRecord>` is the parses-once hand-off for the streaming
+/// `RecordSink`; entries match `manifest.records` by index.
 pub fn filter_segment(
     source_bytes: &[u8],
     source_name: &str,
     filter: &mut Filter,
-) -> Result<(Vec<u8>, Manifest), FilterSegmentError> {
+) -> Result<(Vec<u8>, Manifest, Vec<ParsedRecord>), FilterSegmentError> {
     let stats_before = filter.stats;
     let relmap_before = filter.tracker.relmap_updates;
     let pgc_undecoded_before = filter.tracker.pg_class_writes_undecoded;
@@ -43,6 +56,7 @@ pub fn filter_segment(
 
     let mut out = source_bytes.to_vec();
     let mut entries = Vec::new();
+    let mut parsed_records = Vec::new();
 
     // First pass: collect records (we can't borrow `out` mutably while
     // walking it immutably). Materialise logical bytes + ranges.
@@ -85,6 +99,10 @@ pub fn filter_segment(
             info: parsed.header.info,
             kind,
         });
+        parsed_records.push(ParsedRecord {
+            record: parsed,
+            page_magic: record.page_magic,
+        });
     }
 
     let stats = ManifestStats::from_filter(
@@ -99,7 +117,7 @@ pub fn filter_segment(
         records: entries,
         stats,
     };
-    Ok((out, manifest))
+    Ok((out, manifest, parsed_records))
 }
 
 #[cfg(test)]
@@ -174,9 +192,15 @@ mod tests {
         let page = build_page_with_records(&[&r1, &r2]);
 
         let mut filter = Filter::new();
-        let (out, mani) = filter_segment(&page, "test", &mut filter).unwrap();
+        let (out, mani, parsed) = filter_segment(&page, "test", &mut filter).unwrap();
         assert_eq!(out.len(), page.len());
         assert_eq!(mani.records.len(), 2);
+        assert_eq!(parsed.len(), 2);
+        // Parsed records mirror manifest entries by index.
+        assert_eq!(
+            parsed[0].record.header.resource_manager_id,
+            mani.records[0].rmid,
+        );
         // Both records re-parse cleanly through WalParser
         let mut parser = WalParser::new();
         let (_, records) = parser.parse_records_from_page(&out).unwrap();
@@ -189,7 +213,7 @@ mod tests {
         let r = build_record(RmId::Xact as u8, &[0u8; 4]);
         let page = build_page_with_records(&[&r]);
         let mut filter = Filter::new();
-        let (_, mani) = filter_segment(&page, "seg-test", &mut filter).unwrap();
+        let (_, mani, _) = filter_segment(&page, "seg-test", &mut filter).unwrap();
         assert_eq!(mani.source_segment, "seg-test");
         assert_eq!(mani.records.len(), 1);
         assert_eq!(mani.records[0].offset, 40); // long header + pad
@@ -215,7 +239,7 @@ mod tests {
         let page = build_page_with_records(&[&before, &switch_rec]);
 
         let mut filter = Filter::new();
-        let (out, mani) = filter_segment(&page, "switch", &mut filter).expect("filter");
+        let (out, mani, _) = filter_segment(&page, "switch", &mut filter).expect("filter");
 
         assert_eq!(out.len(), page.len(), "byte-preserving");
         assert_eq!(mani.records.len(), 2);

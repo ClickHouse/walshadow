@@ -87,7 +87,12 @@ fn filtered_segment_round_trips_through_wal_parser() {
     }
     let bytes = decompress_gz(&seg).expect("gunzip fixture");
     let mut filter = Filter::new();
-    let (out, manifest) = filter_segment(&bytes, "fixture", &mut filter).expect("filter");
+    let (out, manifest, parsed) = filter_segment(&bytes, "fixture", &mut filter).expect("filter");
+    assert_eq!(
+        parsed.len(),
+        manifest.records.len(),
+        "parsed records must align 1:1 with manifest entries",
+    );
 
     // (1) Byte-preserving
     assert_eq!(
@@ -145,7 +150,8 @@ fn oltp_workload_keeps_well_under_one_percent() {
     }
     let bytes = decompress_gz(&seg).expect("gunzip oltp fixture");
     let mut filter = Filter::new();
-    let (out, manifest) = filter_segment(&bytes, "oltp", &mut filter).expect("filter oltp");
+    let (out, manifest, _parsed) =
+        filter_segment(&bytes, "oltp", &mut filter).expect("filter oltp");
 
     let kept_frac = manifest.stats.kept as f64 / manifest.stats.records as f64;
     eprintln!(
@@ -191,7 +197,7 @@ fn vacuum_full_pg_depend_ticks_oid_in_prefix_not_undecoded() {
     }
     let bytes = decompress_gz(&seg).expect("gunzip vacuum-full fixture");
     let mut filter = Filter::new();
-    let (_out, manifest) = filter_segment(&bytes, "vac", &mut filter).expect("filter");
+    let (_out, manifest, _parsed) = filter_segment(&bytes, "vac", &mut filter).expect("filter");
 
     let tracker = &filter.tracker;
     eprintln!(

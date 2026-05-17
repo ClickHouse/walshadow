@@ -212,7 +212,7 @@ async fn run(args: Args) -> Result<()> {
                 segments_shipped,
                 now_dispatched >> 32,
                 now_dispatched as u32,
-                record_sink.events.len(),
+                record_sink.records.len(),
                 filter.stats.kept,
                 filter.stats.dropped,
                 filter.tracker.relmap_updates,
