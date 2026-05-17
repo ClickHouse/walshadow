@@ -21,9 +21,22 @@
 //! [`spawn_invalidation_drain`] which coalesces ticks down to single
 //! [`ShadowCatalog::invalidate`] calls. The counter bumps; stale cache
 //! entries (whose stored generation no longer matches) are rejected on
-//! next access and re-fetched lazily. The catalog itself is `&mut
-//! self`; PRE5b4 callers wrap it in `Arc<tokio::sync::Mutex<_>>` for
-//! the drain task. PRE5b7 promotes the wrap to the daemon level.
+//! next access and re-fetched lazily.
+//!
+//! Concurrency: every mutating-looking method on `ShadowCatalog`
+//! ([`relation_at`](ShadowCatalog::relation_at),
+//! [`relation_by_oid`](ShadowCatalog::relation_by_oid),
+//! [`wait_for_replay`](ShadowCatalog::wait_for_replay),
+//! [`invalidate`](ShadowCatalog::invalidate)) takes `&mut self`. The
+//! cache state is technically interior-mutable (an `RwLock` over the
+//! two `HashMap`s + atomics for stats would suffice for the hit path)
+//! but [PLAN.md §Phase 5](../plans/PLAN.md)'s spec'd `&self` shape is
+//! deferred — see [PRE5b7](../plans/PRE5b7.md). Callers that need
+//! concurrent access (drain task, Phase 5 [`DecoderSink`], oracle)
+//! wrap the catalog in `Arc<tokio::sync::Mutex<_>>` at the daemon
+//! level and share clones. Single-task lookups today are cheap enough
+//! that mutex serialisation costs nothing measurable; the lock-free
+//! refactor lands when the lookup-rate hot path actually exists.
 //!
 //! Single-database model: a `ShadowCatalog` instance is bound to one
 //! database. Shared catalogs (`db_node == 0`) are visible from any

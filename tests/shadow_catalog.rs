@@ -522,3 +522,110 @@ async fn nonexistent_filenode_errors_not_found() {
     let err = cat.relation_at(bogus, 0).await.expect_err("bogus filenode");
     matches!(err, CatalogError::NotFoundByFilenode(_));
 }
+
+/// PRE5b7 sanity check: with the catalog wrapped in
+/// `Arc<tokio::sync::Mutex<_>>` at the daemon level, two tasks holding
+/// clones of the same `Arc` serialise cleanly across `relation_at`.
+/// Validates the wrap shape Phase 5's `DecoderSink` will rely on, not
+/// the lock-free hit path (that lands when the spec'd `&self`
+/// refactor follows up).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_mutex_catalog_serialises_relation_at_across_tasks() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, 55608);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    shadow
+        .apply_schema_dump(
+            "CREATE SCHEMA wc;\n\
+             CREATE TABLE wc.things (\n\
+                id   bigint PRIMARY KEY,\n\
+                name text NOT NULL\n\
+             );\n",
+        )
+        .expect("schema dump");
+
+    let pg_class_filenode = pg_class_filenode_via_psql(&shadow);
+    let things_filenode = user_relation_filenode(&shadow, "wc.things");
+    let db = current_db_oid(&shadow);
+    let rfn_class = wal_rs::pg::walparser::RelFileNode {
+        spc_node: pg_global_tablespace_oid(),
+        db_node: db,
+        rel_node: pg_class_filenode,
+    };
+    let rfn_things = wal_rs::pg::walparser::RelFileNode {
+        spc_node: 1663,
+        db_node: db,
+        rel_node: things_filenode,
+    };
+
+    let cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let cat = Arc::new(tokio::sync::Mutex::new(cat));
+
+    // Task A acquires the lock and holds it across an await on a small
+    // sleep, so task B starts its lookup against a held mutex. The
+    // tokio::sync::Mutex is fair-ish and async — task B must wait for
+    // A to drop the guard, then succeed. Anything else (panic, hang,
+    // "would deadlock") fails the test.
+    let cat_a = cat.clone();
+    let cat_b = cat.clone();
+    let task_a = tokio::spawn(async move {
+        let mut guard = cat_a.lock().await;
+        let desc = guard
+            .relation_at(rfn_class, 0)
+            .await
+            .expect("relation_at pg_class from task A");
+        // Hold the guard across an await so task B has to wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let again = guard
+            .relation_at(rfn_class, 0)
+            .await
+            .expect("relation_at pg_class second-call from task A");
+        assert_eq!(desc.name, "pg_class");
+        assert_eq!(again.name, "pg_class");
+        desc.oid
+    });
+    let task_b = tokio::spawn(async move {
+        // Yield once so task A wins the lock first.
+        tokio::task::yield_now().await;
+        let mut guard = cat_b.lock().await;
+        let desc = guard
+            .relation_at(rfn_things, 0)
+            .await
+            .expect("relation_at wc.things from task B");
+        assert_eq!(desc.name, "things");
+        desc.oid
+    });
+    let started = Instant::now();
+    let (oid_a, oid_b) = tokio::join!(task_a, task_b);
+    let elapsed = started.elapsed();
+    let oid_a = oid_a.expect("task A finished");
+    let oid_b = oid_b.expect("task B finished");
+    assert_ne!(oid_a, 0);
+    assert_ne!(oid_b, 0);
+    assert_ne!(
+        oid_a, oid_b,
+        "pg_class and wc.things must have different oids"
+    );
+    // Bound the wall clock to a generous ceiling so a hang surfaces.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cross-task relation_at took too long: {elapsed:?}",
+    );
+
+    // Final state: both descriptors cached, no surprise reconnects.
+    let guard = cat.lock().await;
+    assert!(guard.cached() >= 2, "cached={}", guard.cached());
+    assert_eq!(
+        guard.stats().reconnects,
+        0,
+        "no reconnect should fire on a steady-state shadow",
+    );
+}

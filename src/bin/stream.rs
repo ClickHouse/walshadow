@@ -10,6 +10,7 @@
 //! ```text
 //! walshadow-stream \
 //!     --host /tmp/source_sock --port 5432 --user postgres --dbname postgres \
+//!     --shadow-socket-dir /tmp/shadow_sock --shadow-port 5433 \
 //!     --out-dir /var/lib/walshadow/filtered \
 //!     [--slot walshadow_phys] \
 //!     [--start-lsn 0/16B3750]
@@ -22,15 +23,26 @@
 //! Shutdown: Ctrl-C / SIGTERM stops the pump cleanly and writes the
 //! current partial segment (if any) so subsequent runs can pick up
 //! mid-segment via `--start-lsn`.
+//!
+//! Shadow catalog ownership: daemon holds the [`ShadowCatalog`] inside
+//! `Arc<tokio::sync::Mutex<_>>`. Clones go to the tracker→drain wire
+//! today and, post-Phase 5, to the `DecoderSink` that turns dropped
+//! heap records into tuple events. See [PRE5b7](../plans/PRE5b7.md).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::sync::Mutex;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
+use walshadow::shadow_catalog::{
+    ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
+    with_transient_retry,
+};
 use walshadow::source_feed::SourceFeed;
 use walshadow::wal_stream::{CollectingRecordSink, DirSegmentSink, WAL_SEG_SIZE, WalStream};
 
@@ -79,6 +91,24 @@ struct Args {
     /// smoke tests). Zero = run forever.
     #[arg(long, default_value_t = 0)]
     max_segments: u64,
+    /// Shadow PG unix socket directory. Reused as libpq `host=` since
+    /// PG's libpq treats a leading `/` as a socket dir.
+    #[arg(long)]
+    shadow_socket_dir: PathBuf,
+    /// Shadow PG port.
+    #[arg(long, default_value_t = 5432)]
+    shadow_port: u16,
+    /// Shadow PG user.
+    #[arg(long, default_value = "postgres")]
+    shadow_user: String,
+    /// Shadow PG database.
+    #[arg(long, default_value = "postgres")]
+    shadow_dbname: String,
+    /// Wall-clock budget for the initial connect attempt against
+    /// shadow PG. Reused by [`with_transient_retry`] so a still-warming
+    /// shadow doesn't fail the daemon on first boot.
+    #[arg(long, default_value_t = 30)]
+    shadow_connect_timeout: u64,
 }
 
 fn main() -> ExitCode {
@@ -161,21 +191,48 @@ async fn run(args: Args) -> Result<()> {
         eprintln!("seeded {added} catalog filenodes from source pg_class");
     }
 
-    // Wire the descriptor-cache invalidation channel. Phase 5 will
-    // own the receiver once the daemon holds a `ShadowCatalog`; until
-    // then a stub drain consumes ticks so the unbounded buffer can't
-    // grow. Sender attached unconditionally so tracker counters reflect
-    // post-Phase-5 production behaviour.
-    let (invalidation_tx, mut invalidation_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // Connect the shadow catalog before START_REPLICATION so the
+    // tracker→drain wire is hot from the first record. Wrapped in
+    // with_transient_retry so a still-warming shadow doesn't kill the
+    // daemon on boot. PRE5b7: catalog lives in Arc<Mutex<_>>; clones
+    // fan out to the drain task today and to Phase 5's DecoderSink
+    // once it lands.
+    let shadow_conninfo = socket_conninfo(
+        args.shadow_socket_dir
+            .to_str()
+            .context("shadow-socket-dir not UTF-8")?,
+        args.shadow_port,
+        &args.shadow_user,
+        &args.shadow_dbname,
+    );
+    let connect_budget = Duration::from_secs(args.shadow_connect_timeout);
+    let cat_cfg = ShadowCatalogConfig::default();
+    let backoff_initial = cat_cfg.reconnect_backoff_initial;
+    let backoff_max = cat_cfg.reconnect_backoff_max;
+    let catalog = with_transient_retry(connect_budget, backoff_initial, backoff_max, async || {
+        ShadowCatalog::connect(&shadow_conninfo, cat_cfg.clone()).await
+    })
+    .await
+    .context("connect to shadow PG")?;
+    let catalog = Arc::new(Mutex::new(catalog));
+    eprintln!(
+        "shadow: connected via {} (port={}, user={}, dbname={})",
+        args.shadow_socket_dir.display(),
+        args.shadow_port,
+        args.shadow_user,
+        args.shadow_dbname,
+    );
+
+    // Wire the descriptor-cache invalidation channel. Tracker → drain
+    // task → ShadowCatalog::invalidate. Drain holds its own Arc clone
+    // of the catalog; future consumers (Phase 5 DecoderSink, oracle)
+    // clone again from `catalog`.
+    let (invalidation_tx, invalidation_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     stream
         .filter_mut()
         .tracker
         .set_invalidation_signal(invalidation_tx);
-    let _invalidation_drain = tokio::spawn(async move {
-        while invalidation_rx.recv().await.is_some() {
-            while invalidation_rx.try_recv().is_ok() {}
-        }
-    });
+    let _invalidation_drain = spawn_invalidation_drain(catalog.clone(), invalidation_rx);
 
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
