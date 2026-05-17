@@ -1,8 +1,16 @@
 # FPI_COMPRESSION — restore compressed full-page images
 
-Evaluation. Sibling to [SEGMENT_COMPRESSION.md](SEGMENT_COMPRESSION.md);
-the two are independent and either may ship first. Status: **not
-committed work**.
+Status: **Phase 5 prerequisite.** Lands as its own commit ahead of
+the [Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix)
+heap-tuple decoder; see [PLAN.md §Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix)
+prerequisites list. Reason for promotion from evaluation: user-heap
+records carry FPIs on first-modification-after-checkpoint, and the
+tuple bytes live inside the FPI when `XLOG_HEAP_INIT_PAGE` rides
+along. A Phase 5 decoder that cannot read those bytes is silently
+lossy on the post-checkpoint hot set, and `wal_compression = lz4` /
+`zstd` is common in production source clusters. Sibling to
+[SEGMENT_COMPRESSION.md](SEGMENT_COMPRESSION.md), which is still
+evaluation and independent.
 
 Walshadow-side per the project boundary: pglz, lz4, and zstd all
 have usable upstream Rust crates (`pglz` 0.1+, `lz4_flex`, `zstd`),
@@ -415,10 +423,18 @@ to the `pglz` crate.
 
 * Lands independently of [SEGMENT_COMPRESSION.md](SEGMENT_COMPRESSION.md).
   Either may go first.
+* **Blocks [Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix).**
+  User-heap records that ride alongside an FPI (first modification
+  of a page after checkpoint, with `XLOG_HEAP_INIT_PAGE`) deliver
+  tuple bytes through the page image. Phase 5's decoder calls
+  `restore_block_image` on those records and reads the new tuple
+  off the reconstructed page. Without this primitive, every
+  hot-page workload silently loses the first-after-checkpoint
+  write per page.
 * Blocks: [BASEBACKUP.md](BASEBACKUP.md) Path 1B+2A (page-walk
   bootstrap). Does not block Path 1A+2B or 1B+2C.
-* Blocks: future Phase-5 handling of `XLOG_FPI_FOR_HINT` for
-  pg_class. (Workaround until then: tolerate the silent miss via
+* Blocks: Phase 5 handling of `XLOG_FPI_FOR_HINT` for pg_class.
+  (Workaround until this lands: tolerate the silent miss via
   `pg_class_writes_undecoded` counter — already tracked.)
 * Out of scope: Phase 9 decode-oracle differential vs page bytes
   is a separate consumer; FPI primitive feeds it but the oracle

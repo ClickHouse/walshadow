@@ -483,12 +483,50 @@ Out of scope:
 
 ### Phase 5 — heap tuple decoder + Tier 1/2 type matrix
 
+Prerequisites, each landed as its own commit ahead of decoder work:
+
+* [FPI_COMPRESSION.md](FPI_COMPRESSION.md). User-heap records carry
+  full-page images on first-modification-after-checkpoint; tuple
+  bytes live inside the FPI when `XLOG_HEAP_INIT_PAGE` rides along.
+  Compressed-FPI sources (`wal_compression = pglz|lz4|zstd`) are
+  common in production. Silent skip is not acceptable, so the
+  primitive lands first.
+* Async `RecordSink`. `RecordSink::on_record` flips to `async fn`;
+  `WalStream::push` and `WalStream::close` flip to async too.
+  Reason: the decoder calls `ShadowCatalog::relation_at` (tokio-
+  postgres) on the hot path, and the alternatives — synchronous
+  libpq side-channel, or shunting records onto an mpsc with a
+  separate consumer task — either duplicate the catalog state or
+  decouple decoder cadence from segment cadence. Mechanical lift:
+  `Metrics`, `Collecting`, `Counting`, `Composite` sinks plus
+  `filter_segment`'s per-record dispatch loop. `SegmentSink` stays
+  sync (the production writer is `std::fs` and the test sinks are
+  in-memory; no value in async). Affects `bin/stream.rs`'s
+  `WalStream::push` call site and the eight existing integration
+  tests that drive sinks directly.
+* `ReplIdent::Default` carries resolved primary-key attnums.
+  Today's `ReplIdent::Default` is a unit variant; the decoder
+  needs `pg_index.indkey` where `indisprimary = true` to interpret
+  `XLH_UPDATE_CONTAINS_OLD_KEY` under `relreplident='d'`. Extend
+  the variant to `Default { pk_attnums: Option<Vec<i16>> }`
+  (`None` when the table has no PK), resolved at descriptor build
+  alongside the existing `UsingIndex` lookup. Single-query lift
+  inside `fetch_replident`.
+
 Walk `RM_HEAP_ID` / `RM_HEAP2_ID` records the filter classifies as
 `User`, project `HeapTupleHeader` + payload through a per-relation
 descriptor from `ShadowCatalog`, emit a structured `Tuple { rfn, xid,
-op, new, old }` per record. UPDATE/DELETE carry the old tuple under
-`REPLICA IDENTITY FULL`; HOT updates collapse to the new image only
-when no logged columns moved.
+op, new, old }` per record. HOT updates collapse to the new image
+only when no logged columns moved (`XLH_UPDATE_HOT` set, no
+`XLH_UPDATE_CONTAINS_OLD_*`). UPDATE/DELETE old-tuple decode honours
+every `relreplident` variant the catalog exposes:
+
+| `relreplident` | old payload | Phase 5 behaviour |
+|---|---|---|
+| `Full` (`'f'`) | every non-dropped column | decode full old tuple, every attnum populated |
+| `UsingIndex { key_attnums }` (`'i'`) | indexed columns only | decode subset; non-indexed attnums emit as `None` in `old` |
+| `Default { pk_attnums }` (`'d'`) | PK columns when a key column moved or DELETE | decode subset when `XLH_UPDATE_CONTAINS_OLD_KEY` is set; `old = None` when the bit is clear; `pk_attnums = None` (table without PK) → `old = None` always |
+| `Nothing` (`'n'`) | empty | `old = None`; emitter routes UPDATE/DELETE to the skip-on-update set with a stat counter so silent loss is visible |
 
 Type matrix covers Tier 1 (fixed-width: int2/4/8, float4/8, bool, date,
 time, timestamp, timestamptz, uuid, oid, char) & Tier 2
@@ -498,7 +536,37 @@ value type is a fixed-width-friendly enum that maps 1:1 onto
 arrays, inet, interval, tsvector) lands in Phase 9 alongside the
 oracle.
 
-Size: ≈700 LOC.
+**Rollback status, explicit.** Phase 5 has no xact buffer. The
+decoder emits `Tuple` eagerly the moment the heap record arrives,
+without waiting for the matching `XLOG_XACT_COMMIT` /
+`XLOG_XACT_ABORT`. Consequences:
+
+* Aborted xacts produce ghost rows downstream. PG writes user-heap
+  WAL ahead-of-write even when the xact subsequently aborts;
+  walshadow sees those records in WAL order, the decoder emits
+  tuples, the abort arrives later as `RM_XACT_ID` and Phase 5 has
+  no path to retract. Downstream CH ReplacingMergeTree dedups on
+  `_lsn` so a daemon restart won't double the ghosts, but they
+  persist as permanent rows in the target table until Phase 6
+  lands.
+* No commit ordering. Multi-statement xacts emit per-statement in
+  WAL order, not as one atomic batch at commit. A reader querying
+  CH mid-xact (impossible against PG without dirty reads) sees
+  partial state.
+* `_commit_ts` cannot be populated. The synthetic column
+  ([PLAN.md Phase 7](#phase-7--ch-native-emitter-via-clickhouse-c-rs))
+  is `NULL` for Phase 5 emissions; Phase 6 fills it from the
+  commit record at flush time.
+
+The `Tuple { xid }` field carries the bridge so Phase 6's xact
+buffer keys on `xid` and flushes / drops without an interface
+change. Phase 5 e2e tests pin themselves to auto-commit single-
+statement workloads to sidestep ghost emission; any test that
+exercises rollback must wait for Phase 6.
+
+Size: ≈700 LOC decoder + ~150 LOC async-sink refactor + Default-PK
+fetch ~30 LOC. FPI_COMPRESSION's ~400 LOC ships under its own
+commit, separately accounted.
 
 ### Phase 6 — TOAST reassembly + xact buffer
 

@@ -14,21 +14,21 @@ docs that are not yet committed work sit alongside as peers.
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,
   `pg_class` heap-write decoder, `CatalogTracker::seed_from_source`
-  bootstrap, `XLOG_SWITCH` pass-through test. [PRE5.md](PRE5.md).
-- **PRE5b** — close [PRE5](PRE5.md) silent-correctness gaps before
+  bootstrap, `XLOG_SWITCH` pass-through test. [PRE5.md](pre5/PRE5.md).
+- **PRE5b** — close [PRE5](pre5/PRE5.md) silent-correctness gaps before
   [Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix).
   Split into ten sub-phases, each shipped as its own commit; overview
-  at [PRE5b.md](PRE5b.md).
-  - **PRE5b1** lift `Filter` to per-stream scope. [PRE5b1.md](PRE5b1.md).
-  - **PRE5b2** wire `seed_from_source` into `walshadow-stream`. [PRE5b2.md](PRE5b2.md).
-  - **PRE5b3** handle `xl_heap_update` prefix/suffix in `pg_class_decoder`. [PRE5b3.md](PRE5b3.md).
-  - **PRE5b4** connect `CatalogTracker` to `ShadowCatalog::invalidate`. [PRE5b4.md](PRE5b4.md).
-  - **PRE5b5** widen `RecordEvent` → `Record` carrying parsed `XLogRecord`. [PRE5b5.md](PRE5b5.md).
-  - **PRE5b6** `CompositeRecordSink` fan-out. [PRE5b6.md](PRE5b6.md).
-  - **PRE5b7** `Arc<Mutex<ShadowCatalog>>` daemon wrap. [PRE5b7.md](PRE5b7.md).
-  - **PRE5b8** `relreplident` + `pg_index` on `RelDescriptor`. [PRE5b8.md](PRE5b8.md).
-  - **PRE5b9** `walshadow-stream` shutdown + memory hygiene. [PRE5b9.md](PRE5b9.md).
-  - **PRE5b10** smaller debts (Empty-bucket audit, FIFO eviction, etc.). [PRE5b10.md](PRE5b10.md).
+  at [PRE5b.md](pre5/PRE5b.md).
+  - **PRE5b1** lift `Filter` to per-stream scope. [PRE5b1.md](pre5/PRE5b1.md).
+  - **PRE5b2** wire `seed_from_source` into `walshadow-stream`. [PRE5b2.md](pre5/PRE5b2.md).
+  - **PRE5b3** handle `xl_heap_update` prefix/suffix in `pg_class_decoder`. [PRE5b3.md](pre5/PRE5b3.md).
+  - **PRE5b4** connect `CatalogTracker` to `ShadowCatalog::invalidate`. [PRE5b4.md](pre5/PRE5b4.md).
+  - **PRE5b5** widen `RecordEvent` → `Record` carrying parsed `XLogRecord`. [PRE5b5.md](pre5/PRE5b5.md).
+  - **PRE5b6** `CompositeRecordSink` fan-out. [PRE5b6.md](pre5/PRE5b6.md).
+  - **PRE5b7** `Arc<Mutex<ShadowCatalog>>` daemon wrap. [PRE5b7.md](pre5/PRE5b7.md).
+  - **PRE5b8** `relreplident` + `pg_index` on `RelDescriptor`. [PRE5b8.md](pre5/PRE5b8.md).
+  - **PRE5b9** `walshadow-stream` shutdown + memory hygiene. [PRE5b9.md](pre5/PRE5b9.md).
+  - **PRE5b10** smaller debts (Empty-bucket audit, FIFO eviction, etc.). [PRE5b10.md](pre5/PRE5b10.md).
 - **clickhouse-c-rs** — vendored as workspace member. Provides the
   Native-wire emitter for Phase 7. Not gated by a `PHASE*.md`: the
   crate is upstream code, walshadow just consumes it.
@@ -47,10 +47,12 @@ docs that are not yet committed work sit alongside as peers.
   decoder into the existing sync `filter_segment`. Test-local
   `decompress_gz` helpers go away. Sibling of FPI_COMPRESSION;
   independent. [SEGMENT_COMPRESSION.md](SEGMENT_COMPRESSION.md).
-- **FPI_COMPRESSION** — evaluation: decompress `wal_compression
-  = pglz|lz4|zstd` full-page images via a new `src/fpi.rs`
-  (`restore_block_image`) atop the `pglz` / `lz4_flex` / `zstd`
-  crates. Unblocks [BASEBACKUP](BASEBACKUP.md) 1B+2A and
-  `XLOG_FPI_FOR_HINT` handling in the future heap-tuple decoder.
-  Sibling of SEGMENT_COMPRESSION; independent.
-  [FPI_COMPRESSION.md](FPI_COMPRESSION.md).
+- **FPI_COMPRESSION** — [Phase 5](PLAN.md#phase-5--heap-tuple-decoder--tier-12-type-matrix)
+  prerequisite: decompress `wal_compression = pglz|lz4|zstd`
+  full-page images via a new `src/fpi.rs` (`restore_block_image`)
+  atop the `pglz` / `lz4_flex` / `zstd` crates. Required by Phase 5
+  for user-heap records that carry their tuple bytes inside an FPI
+  (post-checkpoint hot set). Also unblocks
+  [BASEBACKUP](BASEBACKUP.md) 1B+2A and `XLOG_FPI_FOR_HINT`
+  handling. Sibling of SEGMENT_COMPRESSION (still evaluation),
+  independent. [FPI_COMPRESSION.md](FPI_COMPRESSION.md).
