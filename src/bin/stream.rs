@@ -161,6 +161,22 @@ async fn run(args: Args) -> Result<()> {
         eprintln!("seeded {added} catalog filenodes from source pg_class");
     }
 
+    // Wire the descriptor-cache invalidation channel. Phase 5 will
+    // own the receiver once the daemon holds a `ShadowCatalog`; until
+    // then a stub drain consumes ticks so the unbounded buffer can't
+    // grow. Sender attached unconditionally so tracker counters reflect
+    // post-Phase-5 production behaviour.
+    let (invalidation_tx, mut invalidation_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    stream
+        .filter_mut()
+        .tracker
+        .set_invalidation_signal(invalidation_tx);
+    let _invalidation_drain = tokio::spawn(async move {
+        while invalidation_rx.recv().await.is_some() {
+            while invalidation_rx.try_recv().is_ok() {}
+        }
+    });
+
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;

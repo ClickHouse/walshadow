@@ -5,11 +5,13 @@
 //! ports so cargo's parallel runner doesn't collide them.
 
 use std::process::Command;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
-    CatalogError, ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
+    CatalogError, ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
+    with_transient_retry,
 };
 
 fn pg_available() -> bool {
@@ -399,6 +401,103 @@ async fn with_transient_retry_outlasts_a_pg_restart() {
     .await
     .expect("eventually connects through with_transient_retry");
     drop(cat);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tracker_signal_drives_invalidate_and_refetches_after_ddl() {
+    // Production-path verification of the CatalogTracker → mpsc →
+    // spawn_invalidation_drain → ShadowCatalog::invalidate wire. Closes
+    // the never-wired Phase 4b generation-bump path.
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, 55607);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    shadow
+        .apply_schema_dump(
+            "CREATE SCHEMA wc;\n\
+             CREATE TABLE wc.things (\n\
+                id   bigint PRIMARY KEY,\n\
+                name text NOT NULL\n\
+             );\n",
+        )
+        .expect("schema dump");
+
+    let filenode = user_relation_filenode(&shadow, "wc.things");
+    let db = current_db_oid(&shadow);
+    let rfn = wal_rs::pg::walparser::RelFileNode {
+        spc_node: 1663,
+        db_node: db,
+        rel_node: filenode,
+    };
+
+    let cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let cat = Arc::new(tokio::sync::Mutex::new(cat));
+
+    // Prime the cache so the post-DDL re-fetch is what surfaces the
+    // new column (the bug being fixed: without invalidate, the cached
+    // descriptor would keep masking ADD COLUMN).
+    {
+        let mut guard = cat.lock().await;
+        let desc = guard.relation_at(rfn, 0).await.expect("prime");
+        assert_eq!(desc.attributes.len(), 2);
+        assert!(desc.attributes.iter().all(|a| a.name != "extra"));
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let _drain = spawn_invalidation_drain(cat.clone(), rx);
+
+    // DDL through psql so the live shadow's catalog actually changes.
+    shadow
+        .apply_schema_dump("ALTER TABLE wc.things ADD COLUMN extra text;")
+        .expect("alter table");
+
+    let bumps_before = cat.lock().await.stats().generation_bumps;
+    // Production tracker sends the signal on observed pg_class writes.
+    // The test sends through the same channel so this case is honest
+    // about which segment of the wire it is exercising — the receiver
+    // side. The send-side wire is unit-tested in
+    // src/catalog_tracker.rs.
+    tx.send(()).expect("send signal");
+
+    // Wait for the drain task to bump generation. Poll with a sleep
+    // so it gets a chance to acquire the mutex.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut bumps_after = bumps_before;
+    while Instant::now() < deadline {
+        let snap = cat.lock().await.stats().generation_bumps;
+        if snap > bumps_before {
+            bumps_after = snap;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        bumps_after > bumps_before,
+        "drain must call invalidate; was {bumps_before}, observed {bumps_after}",
+    );
+
+    let mut guard = cat.lock().await;
+    let fresh = guard
+        .relation_at(rfn, 0)
+        .await
+        .expect("relation_at post-DDL");
+    assert_eq!(
+        fresh.attributes.len(),
+        3,
+        "post-DDL fetch must surface ADD COLUMN; got {:?}",
+        fresh.attributes.iter().map(|a| &a.name).collect::<Vec<_>>(),
+    );
+    assert!(
+        fresh.attributes.iter().any(|a| a.name == "extra"),
+        "added column must appear in attributes",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

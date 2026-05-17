@@ -22,10 +22,21 @@
 //!   cursor advances. Closes the "long-running source has already
 //!   rotated a mapped catalog above 16384 before walshadow attaches"
 //!   hole that the < 16384 bootstrap rule misses on its own.
+//!
+//! Invalidation signal: when [`set_invalidation_signal`](CatalogTracker
+//! ::set_invalidation_signal) attaches an mpsc sender, every `observe`
+//! that processes a relmap update or a pg_class heap write emits one
+//! signal. A drain task on the receiver side (see
+//! [`crate::shadow_catalog::spawn_invalidation_drain`]) collapses the
+//! signal stream into [`ShadowCatalog::invalidate`] calls so cached
+//! descriptors don't outlive the DDL that mutated their underlying
+//! catalog state. Senderless trackers (`walshadow-filter` CLI, batch
+//! filter tests) send nothing.
 
 use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::Client;
 use tokio_postgres::types::Oid;
 use wal_rs::pg::walparser::{RmId, XLogRecord};
@@ -55,6 +66,10 @@ pub struct CatalogTracker {
     /// Empty bootstrap falls through to the `rel == PG_CLASS_OID`
     /// initial-relfilenode check (mapped-catalog convention).
     pg_class_filenode: HashMap<u32, u32>,
+    /// Optional best-effort sender wired to a [`ShadowCatalog`] drain
+    /// task. Sends are non-blocking and ignore `SendError` so a closed
+    /// receiver doesn't poison the tracker.
+    invalidation_signal: Option<UnboundedSender<()>>,
     /// Count of relmap updates observed (debug / metrics).
     pub relmap_updates: u64,
     /// pg_class heap writes whose payload failed `pg_class_decoder`
@@ -79,6 +94,11 @@ pub struct CatalogTracker {
     /// `(db_node, filenode)` pairs added at attach time via
     /// [`seed_from_source`](Self::seed_from_source).
     pub seeded_from_source: u64,
+    /// Invalidation signals successfully enqueued. Sender-side counter
+    /// for tests + operator visibility; matches the drain task's
+    /// signal-count at steady state (the drain coalesces, so its
+    /// `generation_bumps` lags this by the coalesce factor).
+    pub invalidation_signals_sent: u64,
 }
 
 #[derive(Debug, Error)]
@@ -95,6 +115,23 @@ impl CatalogTracker {
     /// Add a `(db, rel)` pair to the catalog set explicitly.
     pub fn add(&mut self, db_node: u32, rel_node: u32) {
         self.nodes.insert((db_node, rel_node));
+    }
+
+    /// Attach a sender that fires once per observed catalog-touching
+    /// record. Idempotent on the senderless tracker shape; calling twice
+    /// replaces the previous sender (last-writer-wins).
+    pub fn set_invalidation_signal(&mut self, tx: UnboundedSender<()>) {
+        self.invalidation_signal = Some(tx);
+    }
+
+    /// Best-effort fire. `SendError` (closed receiver) is swallowed so
+    /// a torn-down drain task can't poison subsequent observes.
+    fn signal_invalidation(&mut self) {
+        if let Some(tx) = &self.invalidation_signal
+            && tx.send(()).is_ok()
+        {
+            self.invalidation_signals_sent += 1;
+        }
     }
 
     /// True if `(db, rel)` is currently catalog. `rel < FIRST_NORMAL_OBJECT_ID`
@@ -155,8 +192,16 @@ impl CatalogTracker {
                 if row.oid != 0 && row.oid < FIRST_NORMAL_OBJECT_ID && row.relfilenode != 0 {
                     self.nodes.insert((db, row.relfilenode));
                 }
+                self.signal_invalidation();
             }
-            DecodeOutcome::OidInPrefix => self.pg_class_writes_oid_in_prefix += 1,
+            DecodeOutcome::OidInPrefix => {
+                self.pg_class_writes_oid_in_prefix += 1;
+                // OID-in-prefix means pg_class was updated but we can't
+                // identify which row. Cached descriptors may still be
+                // stale (ALTER TABLE bumping relnatts lands here), so
+                // signal coarsely — over-invalidation per PLAN.md.
+                self.signal_invalidation();
+            }
             DecodeOutcome::Undecoded => self.pg_class_writes_undecoded += 1,
         }
     }
@@ -206,6 +251,7 @@ impl CatalogTracker {
                 }
             }
         }
+        self.signal_invalidation();
     }
 
     /// Populate the catalog set & pg_class-filenode map by querying the
@@ -557,5 +603,103 @@ mod tests {
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
         assert_eq!(t.relmap_updates, 1); // still counted, just no update applied
+    }
+
+    /// Best-effort mpsc sender hooked into a sync test: `try_recv`
+    /// returns Empty until `observe` fires a signal, then drains.
+    fn channel_pair() -> (
+        tokio::sync::mpsc::UnboundedSender<()>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        tokio::sync::mpsc::unbounded_channel::<()>()
+    }
+
+    #[test]
+    fn observe_relmap_update_fires_signal_when_attached() {
+        let (tx, mut rx) = channel_pair();
+        let mut t = CatalogTracker::new();
+        t.set_invalidation_signal(tx);
+        t.observe(&relmap_record(5, &[(1259, 50000)]));
+        assert!(rx.try_recv().is_ok(), "relmap update must signal");
+        assert_eq!(t.invalidation_signals_sent, 1);
+    }
+
+    #[test]
+    fn observe_pg_class_decoded_fires_signal_when_attached() {
+        let (tx, mut rx) = channel_pair();
+        let mut t = CatalogTracker::new();
+        t.set_invalidation_signal(tx);
+        let data = pg_class_block_data(2615, 30000);
+        t.observe(&heap_block_record(RmId::Heap, 0x00, 5, 1259, data));
+        assert!(rx.try_recv().is_ok(), "decoded pg_class write must signal");
+        assert_eq!(t.invalidation_signals_sent, 1);
+    }
+
+    #[test]
+    fn observe_pg_class_oid_in_prefix_fires_signal_when_attached() {
+        let (tx, mut rx) = channel_pair();
+        let mut t = CatalogTracker::new();
+        t.set_invalidation_signal(tx);
+        let data = pg_class_update_block_prefix_88(40000);
+        let mut md = xl_heap_update_no_compression();
+        md[7] = 0x20;
+        t.observe(&heap_block_record_with_main(
+            RmId::Heap,
+            0x20,
+            5,
+            1259,
+            data,
+            md,
+        ));
+        // pg_class was mutated — descriptor cache for user tables may
+        // be stale even when the WAL stripped the oid into the prefix.
+        assert!(
+            rx.try_recv().is_ok(),
+            "oid_in_prefix is still a catalog mutation — must signal",
+        );
+        assert_eq!(t.invalidation_signals_sent, 1);
+    }
+
+    #[test]
+    fn observe_pg_class_undecoded_does_not_fire_signal() {
+        let (tx, mut rx) = channel_pair();
+        let mut t = CatalogTracker::new();
+        t.set_invalidation_signal(tx);
+        // Truncated block data — decoder returns Undecoded.
+        t.observe(&heap_block_record(RmId::Heap, 0x00, 5, 1259, vec![]));
+        assert!(rx.try_recv().is_err(), "garbage must not signal");
+        assert_eq!(t.invalidation_signals_sent, 0);
+    }
+
+    #[test]
+    fn observe_without_sender_is_a_no_op() {
+        let mut t = CatalogTracker::new();
+        t.observe(&relmap_record(5, &[(1259, 50000)]));
+        assert_eq!(t.invalidation_signals_sent, 0);
+    }
+
+    #[test]
+    fn signal_swallows_closed_receiver() {
+        let (tx, rx) = channel_pair();
+        let mut t = CatalogTracker::new();
+        t.set_invalidation_signal(tx);
+        drop(rx);
+        // Send on a closed receiver returns SendError; observe must
+        // not panic and the counter must stay at zero.
+        t.observe(&relmap_record(5, &[(1259, 50000)]));
+        assert_eq!(t.invalidation_signals_sent, 0);
+    }
+
+    #[test]
+    fn observe_non_catalog_record_does_not_signal() {
+        let (tx, mut rx) = channel_pair();
+        let mut t = CatalogTracker::new();
+        t.set_invalidation_signal(tx);
+        // Heap insert against a user-table relfilenode — not pg_class
+        // (no relmap seen), tracker skips harvest.
+        let rec = heap_block_record(RmId::Heap, 0x00, 5, 50000, vec![0u8; 16]);
+        t.observe(&rec);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(t.invalidation_signals_sent, 0);
     }
 }

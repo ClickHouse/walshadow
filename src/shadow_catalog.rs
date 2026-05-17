@@ -14,11 +14,16 @@
 //!    regular tables uniformly), then fan-out to `pg_attribute` +
 //!    `pg_type` + `pg_namespace`.
 //!
-//! Generation invalidation: when an upstream observer (the filter's
-//! catalog-tracker, Phase 5/7 glue) sees a commit landing writes into
-//! `pg_catalog`, it calls [`ShadowCatalog::invalidate`]. The counter
-//! bumps; stale cache entries (whose stored generation no longer
-//! matches) are rejected on next access and re-fetched lazily.
+//! Generation invalidation: a [`CatalogTracker`](crate::catalog_tracker
+//! ::CatalogTracker) wired with [`set_invalidation_signal`](crate
+//! ::catalog_tracker::CatalogTracker::set_invalidation_signal) emits
+//! one mpsc tick per catalog-touching record. The receiver side runs
+//! [`spawn_invalidation_drain`] which coalesces ticks down to single
+//! [`ShadowCatalog::invalidate`] calls. The counter bumps; stale cache
+//! entries (whose stored generation no longer matches) are rejected on
+//! next access and re-fetched lazily. The catalog itself is `&mut
+//! self`; PRE5b4 callers wrap it in `Arc<tokio::sync::Mutex<_>>` for
+//! the drain task. PRE5b7 promotes the wrap to the daemon level.
 //!
 //! Single-database model: a `ShadowCatalog` instance is bound to one
 //! database. Shared catalogs (`db_node == 0`) are visible from any
@@ -631,6 +636,29 @@ where
 /// errors against well-known queries are not expected.
 fn is_transient(err: &CatalogError) -> bool {
     matches!(err, CatalogError::Pg(_))
+}
+
+/// Spawn the drain task that turns
+/// [`CatalogTracker`](crate::catalog_tracker::CatalogTracker) invalidation
+/// signals into [`ShadowCatalog::invalidate`] calls. Coalesces queued
+/// signals into one bump per wake — over-invalidation is cheap (lazy
+/// eviction) so adjacency-coalescing is the right trade.
+///
+/// The task ends when every [`UnboundedSender`](tokio::sync::mpsc
+/// ::UnboundedSender) tied to `rx` drops. Holding the returned
+/// [`JoinHandle`](tokio::task::JoinHandle) is optional; ignoring it
+/// detaches the task (preferred in long-running daemons).
+pub fn spawn_invalidation_drain(
+    catalog: std::sync::Arc<tokio::sync::Mutex<ShadowCatalog>>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            // Drain everything queued: one invalidate covers N signals.
+            while rx.try_recv().is_ok() {}
+            catalog.lock().await.invalidate();
+        }
+    })
 }
 
 #[cfg(test)]
