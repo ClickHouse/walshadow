@@ -224,30 +224,26 @@ impl<'a> TypeRef<'a> {
         unsafe { sys::chc_type_datetime64_scale(self.raw) }
     }
 
-    pub fn timezone(&self) -> Option<&'a str> {
+    /// Bytes the C library copied from the wire; not UTF-8-validated.
+    pub fn timezone(&self) -> Option<&'a [u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_type_timezone(self.raw, &mut len) };
         if p.is_null() {
             None
         } else {
             // SAFETY: pointer borrowed from C, valid for 'a.
-            unsafe {
-                let bytes = slice::from_raw_parts(p.cast::<u8>(), len);
-                Some(core::str::from_utf8_unchecked(bytes))
-            }
+            Some(unsafe { slice::from_raw_parts(p.cast::<u8>(), len) })
         }
     }
 
-    pub fn name(&self) -> Option<&'a str> {
+    /// Bytes the C library copied from the wire; not UTF-8-validated.
+    pub fn name(&self) -> Option<&'a [u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_type_name(self.raw, &mut len) };
         if p.is_null() {
             None
         } else {
-            unsafe {
-                let bytes = slice::from_raw_parts(p.cast::<u8>(), len);
-                Some(core::str::from_utf8_unchecked(bytes))
-            }
+            Some(unsafe { slice::from_raw_parts(p.cast::<u8>(), len) })
         }
     }
 
@@ -255,7 +251,9 @@ impl<'a> TypeRef<'a> {
         unsafe { sys::chc_type_enum_count(self.raw) }
     }
 
-    pub fn enum_at(&self, i: usize) -> Option<(&'a str, i64)> {
+    /// Returns `(name_bytes, value)` for the `i`'th enum entry. Name
+    /// bytes are not UTF-8-validated.
+    pub fn enum_at(&self, i: usize) -> Option<(&'a [u8], i64)> {
         if i >= self.enum_count() {
             return None;
         }
@@ -268,30 +266,35 @@ impl<'a> TypeRef<'a> {
         if name_ptr.is_null() {
             return None;
         }
-        let bytes = unsafe { slice::from_raw_parts(name_ptr.cast::<u8>(), name_len) };
-        Some((unsafe { core::str::from_utf8_unchecked(bytes) }, value))
+        Some((
+            unsafe { slice::from_raw_parts(name_ptr.cast::<u8>(), name_len) },
+            value,
+        ))
     }
 
-    pub fn tuple_field_name(&self, i: usize) -> Option<&'a str> {
+    /// Tuple field name bytes; not UTF-8-validated.
+    pub fn tuple_field_name(&self, i: usize) -> Option<&'a [u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_type_tuple_field_name(self.raw, i, &mut len) };
         if p.is_null() {
             None
         } else {
-            unsafe {
-                let bytes = slice::from_raw_parts(p.cast::<u8>(), len);
-                Some(core::str::from_utf8_unchecked(bytes))
-            }
+            Some(unsafe { slice::from_raw_parts(p.cast::<u8>(), len) })
         }
     }
 
-    /// Render the type name into a `String`.
+    /// Render the type name into a `String`. Returns an empty string if
+    /// the reported `needed` length would overflow `usize` on `+ 1` (the
+    /// C library should never publish a value that large).
     pub fn format(&self) -> String {
         let needed = unsafe { sys::chc_type_format(self.raw, core::ptr::null_mut(), 0) };
         if needed == 0 {
             return String::new();
         }
-        let mut buf = vec![0u8; needed + 1];
+        let Some(cap) = needed.checked_add(1) else {
+            return String::new();
+        };
+        let mut buf = vec![0u8; cap];
         let _ =
             unsafe { sys::chc_type_format(self.raw, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
         buf.truncate(needed);

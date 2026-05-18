@@ -3,7 +3,7 @@
 //! Skipped when `clickhouse` is not on PATH so CI without it stays green.
 
 use std::io::Read;
-use std::os::fd::IntoRawFd;
+use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
 use clickhouse_c::{Allocator, BlockBuilder, BlockOpts, PosixIo, TypeAst};
@@ -45,8 +45,7 @@ fn write_then_read_back_uint32() {
     let stdin = child.stdin.take().expect("stdin piped");
     let mut stdout = child.stdout.take().expect("stdout piped");
 
-    let in_fd = stdin.into_raw_fd();
-    let mut io = PosixIo::new(in_fd);
+    let mut io = PosixIo::new(stdin.as_fd());
 
     let ty = TypeAst::parse("UInt32", alloc).expect("UInt32");
     let data: [u32; 5] = [10, 20, 30, 40, 50];
@@ -59,13 +58,10 @@ fn write_then_read_back_uint32() {
         .expect("append");
     bb.write(io.as_mut(), BlockOpts::default()).expect("write");
 
-    // Close write end so clickhouse local sees EOF.
-    unsafe {
-        unsafe extern "C" {
-            fn close(fd: i32) -> i32;
-        }
-        close(in_fd);
-    }
+    // Drop the borrowing PosixIo first, then the stdin handle, which
+    // closes the pipe and lets clickhouse local see EOF.
+    drop(io);
+    drop(stdin);
 
     let mut buf = Vec::new();
     stdout.read_to_end(&mut buf).expect("read stdout");

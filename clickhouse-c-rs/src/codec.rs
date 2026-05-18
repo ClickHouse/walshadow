@@ -64,7 +64,23 @@ impl Codec {
 
     /// Borrow the underlying `chc_codec` for manual fills (e.g. wiring a
     /// custom allocator-bound compression implementation).
-    pub fn raw_mut(self: Pin<&mut Self>) -> &mut sys::chc_codec {
+    ///
+    /// # Safety
+    ///
+    /// Caller installs raw function pointers the C library will invoke
+    /// without further checks. To stay sound:
+    ///
+    /// * Each installed function pointer must match the exact signature
+    ///   of the corresponding `chc_codec` field.
+    /// * For any [`Compression`] the codec will be paired with at the
+    ///   [`Client`](crate::Client), the relevant fields must be set —
+    ///   e.g. `Compression::Lz4` needs `lz4_compress`, `lz4_decompress`,
+    ///   `lz4_bound`. Leaving a required slot `None` reaches a null
+    ///   call.
+    /// * Any `ud` pointer stored on the codec must outlive the
+    ///   [`Codec`] and remain dereferenceable from every thread the
+    ///   codec is used from.
+    pub unsafe fn raw_mut(self: Pin<&mut Self>) -> &mut sys::chc_codec {
         unsafe { &mut self.get_unchecked_mut().raw }
     }
 

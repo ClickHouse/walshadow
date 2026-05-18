@@ -247,7 +247,7 @@ impl<'a> BlockBuilder<'a> {
 
     /// Serialize through an `Io`. `opts` matches what [`Block::read`]
     /// uses; clickhouse-local accepts the default (all-zeros).
-    pub fn write(&self, io: Pin<&mut PosixIo>, opts: BlockOpts) -> Result<()> {
+    pub fn write(&self, io: Pin<&mut PosixIo<'_>>, opts: BlockOpts) -> Result<()> {
         let raw_opts = opts.to_raw();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {

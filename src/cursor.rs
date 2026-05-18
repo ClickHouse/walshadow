@@ -269,9 +269,7 @@ mod tests {
         write(tmp.path(), &c).await.unwrap();
         // No leftover .tmp from the atomic rename.
         assert!(
-            !tmp.path()
-                .join(format!("{CURSOR_FILENAME}.tmp"))
-                .exists(),
+            !tmp.path().join(format!("{CURSOR_FILENAME}.tmp")).exists(),
             "rename must clean up the .tmp sidecar",
         );
         let got = read(tmp.path()).await.unwrap().expect("cursor present");

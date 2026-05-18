@@ -135,42 +135,74 @@ fn cstr_array_to_string(buf: &[c_char]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Open ClickHouse client. Owns the underlying `chc_client *`; the
-/// [`PosixIo`] it was constructed with must outlive the client (callers
-/// keep both pinned and drop in this order: client first, then I/O).
-pub struct Client {
+/// Open ClickHouse client. Owns the underlying `chc_client *`, the
+/// [`PosixIo`] it talks through, and (when compressed) its [`Codec`];
+/// Rust drop order guarantees the C-side back-pointers stay valid
+/// through close.
+pub struct Client<'fd> {
     raw: NonNull<sys::chc_client>,
     // `chc_client_init` stashes `c->al = al`, i.e. it stores a pointer
-    // back into the `chc_alloc` struct we pass in. Holding the
-    // allocator by value would let it move when `Self` is constructed
-    // and again on every Client move, invalidating the pointer the C
-    // side dereferences on every subsequent `alloc/realloc/free`. The
-    // Box keeps the address stable for the Client's lifetime.
-    alloc: Pin<Box<Allocator>>,
+    // back into the `chc_alloc` struct we pass in; reads & writes go
+    // through `c->al->{alloc,realloc,free}` on every subsequent call
+    // and from `chc_client_close`. The `Box` heap-allocates the alloc
+    // so its address stays stable across moves of `Self`. No `Pin` —
+    // `Allocator: Unpin`, so a bare `Box` already gives all the
+    // guarantee the C side needs.
+    alloc: Box<Allocator>,
+    _codec: Option<Pin<Box<Codec>>>,
+    _io: Pin<Box<PosixIo<'fd>>>,
 }
 
-impl Client {
-    /// Performs Hello / HelloAck against the supplied I/O.
+impl<'fd> Client<'fd> {
+    /// Performs Hello / HelloAck against the supplied I/O. Takes
+    /// ownership of `io` and `codec` so the C-side back-pointers
+    /// `c->io` / `c->codec` stay valid for the client's lifetime.
     ///
     /// `codec` may be `None` only when `opts.compression` is `None`.
+    ///
+    /// The `'fd` lifetime is the borrow on the file descriptor backing
+    /// `io`. `Client<'fd>` cannot outlive that fd, so dropping the fd
+    /// owner while the [`Client`] is still alive is a compile error:
+    ///
+    /// ```compile_fail
+    /// use clickhouse_c::{Allocator, Client, ClientOpts, PosixIo};
+    /// use std::net::TcpStream;
+    /// use std::os::fd::AsFd;
+    ///
+    /// fn build() -> clickhouse_c::Result<Client<'static>> {
+    ///     let sock = TcpStream::connect("localhost:9000")?;
+    ///     let io = PosixIo::new(sock.as_fd());
+    ///     // Client<'_> borrows `sock` through `io`; can't promote to
+    ///     // 'static because `sock` dies at the end of this scope.
+    ///     Client::init(&ClientOpts::new(), Allocator::stdlib(), io, None)
+    /// }
+    /// ```
     pub fn init(
         opts: &ClientOpts,
         alloc: Allocator,
-        io: Pin<&mut PosixIo>,
-        codec: Option<Pin<&Codec>>,
+        mut io: Pin<Box<PosixIo<'fd>>>,
+        codec: Option<Pin<Box<Codec>>>,
     ) -> Result<Self> {
-        let codec_ptr = codec.map(|c| c.as_ptr());
+        let codec_ptr = codec.as_ref().map(|c| c.as_ref().as_ptr());
         let raw_opts = opts.to_raw(codec_ptr);
-        let alloc = Box::pin(alloc);
+        let alloc = Box::new(alloc);
         let mut out: *mut sys::chc_client = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
-            sys::chc_client_init(&mut out, &raw_opts, alloc.as_ptr(), io.io_ptr(), &mut err)
+            sys::chc_client_init(
+                &mut out,
+                &raw_opts,
+                alloc.as_ptr(),
+                io.as_mut().io_ptr(),
+                &mut err,
+            )
         };
         check(rc, &err)?;
         Ok(Self {
             raw: NonNull::new(out).expect("chc_client_init returned OK with NULL"),
             alloc,
+            _codec: codec,
+            _io: io,
         })
     }
 
@@ -224,7 +256,7 @@ impl Client {
 
     /// Read the next packet. Any block / exception payload is owned by
     /// the returned [`Packet`] and freed on drop unless taken out.
-    pub fn recv_packet(&mut self) -> Result<Packet<'_>> {
+    pub fn recv_packet(&mut self) -> Result<Packet<'_, 'fd>> {
         let mut raw = sys::chc_packet::zeroed();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_client_recv_packet(self.raw.as_ptr(), &mut raw, &mut err) };
@@ -233,13 +265,13 @@ impl Client {
     }
 }
 
-impl Drop for Client {
+impl<'fd> Drop for Client<'fd> {
     fn drop(&mut self) {
         unsafe { sys::chc_client_close(self.raw.as_ptr()) };
     }
 }
 
-unsafe impl Send for Client {}
+unsafe impl<'fd> Send for Client<'fd> {}
 
 /// Server-side exception. Owning wrapper around the C `chc_exception`
 /// chain head. [`Drop`] calls `chc_exception_free`, which walks `nested`
@@ -389,6 +421,10 @@ fn cstr_bytes<'a>(ptr: *mut c_char, len: usize) -> &'a [u8] {
     if ptr.is_null() || len == 0 {
         return &[];
     }
+    debug_assert!(
+        len <= isize::MAX as usize,
+        "clickhouse-c published exception field len = {len}",
+    );
     unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) }
 }
 
@@ -428,12 +464,12 @@ impl PacketKind {
 }
 
 /// Borrowed packet, owns its block/exception payloads until dropped.
-pub struct Packet<'c> {
+pub struct Packet<'c, 'fd: 'c> {
     raw: sys::chc_packet,
-    client: &'c mut Client,
+    client: &'c mut Client<'fd>,
 }
 
-impl<'c> Packet<'c> {
+impl<'c, 'fd: 'c> Packet<'c, 'fd> {
     pub fn kind(&self) -> Option<PacketKind> {
         PacketKind::from_raw(self.raw.kind)
     }
@@ -470,7 +506,7 @@ impl<'c> Packet<'c> {
     }
 }
 
-impl<'c> Drop for Packet<'c> {
+impl<'c, 'fd: 'c> Drop for Packet<'c, 'fd> {
     fn drop(&mut self) {
         // chc_packet_clear is safe to call with already-NULLed fields.
         unsafe { sys::chc_packet_clear(self.client.raw.as_ptr(), &mut self.raw) };

@@ -32,11 +32,22 @@ ClickHouse Native wire format. Two entry points:
 
 ## Safety model
 
+**Trusted base.** Soundness of every non-`unsafe` API in this crate is
+conditional on `clickhouse-c` (at the vendored revision) holding the
+invariants its headers document — chiefly that the `chc_column`-side
+length counters (`n_rows`, `offsets.last()`, `name_len`, etc.) match
+the buffer the same struct points at. Where the cross-check is
+expressible in a line, `debug_assert!`s trip in debug builds; release
+builds trust the C side. Bounds against the underlying allocation are
+not checked because `clickhouse-c` exposes no buffer-capacity API.
+
 **Allocators thread through every owning constructor.** `chc_alloc` is
 a vtable. `Allocator` wraps it `Copy + Send + Sync`. `TypeAst` /
 `Block` / `BlockBuilder` / `Client` each take an `Allocator` at
 construction & store it; `Drop` calls the matching destroy with the
-same allocator the C side used.
+same allocator the C side used. `Client` boxes its `Allocator` so the
+heap address the C side stashes in `c->al` stays valid through every
+later call & through `chc_client_close`.
 
 **No-copy column slabs.** `chc_block_builder_append_*` retains raw
 pointers to caller-owned bytes until `chc_block_write`. Mirrored as
@@ -47,7 +58,18 @@ each appended `TypeRef<'a>`. Caller keeps slabs alive for `'a`.
 back into the `chc_posix_io` state it was initialized from. `chc_codec`
 is similarly addressed by code that calls into its function-pointer
 table. `PosixIo` & `Codec` ship behind `Pin<Box<Self>>` & expose
-internals only through `Pin<&mut _>` / `Pin<&_>`.
+internals only through `Pin<&mut _>` / `Pin<&_>`. `Codec::raw_mut` is
+`unsafe`: caller must populate the function-pointer table to match the
+[`Compression`] the codec is paired with.
+
+**`Client` owns its I/O + codec.** `chc_client` stashes raw pointers
+to `chc_io` & `chc_codec` for the connection's lifetime; using
+borrowed references would let safe code drop them out from under the C
+side. `Client::init` takes `Pin<Box<PosixIo<'fd>>>` &
+`Option<Pin<Box<Codec>>>` by ownership so the back-pointers stay valid
+through `Drop`. `Client<'fd>` carries the fd lifetime; constructed via
+`PosixIo::new(fd.as_fd())` it ties the client to a borrowed fd, or via
+`PosixIo::new_owned(fd_owner)` it takes the fd and closes it on drop.
 
 **C-side strings.** `chc_err.msg` is a fixed-size char buffer;
 `Error::from_raw` copies it through `from_utf8_lossy` because the C
@@ -55,7 +77,11 @@ struct goes out of scope at the call boundary. `chc_exception` is a
 heap chain in the C allocator; [`Exception`] is a thin owning wrapper
 over the head pointer, accessors return `&[u8]` borrowed from C
 memory, and `Drop` calls `chc_exception_free` to walk & release the
-chain. Convert to `String` lossy at the consumer if needed.
+chain. Server-controlled text accessors on `Block` / `TypeRef`
+(`column_name`, `name`, `timezone`, `enum_at`, `tuple_field_name`)
+likewise return `&[u8]` so the UTF-8 question stays at the
+consumer; `TypeRef::format` is the one place a `String` is materialized
+& uses `from_utf8_lossy`.
 
 **Send / Sync.** Every owning handle is `Send`; none are `Sync`. Each
 `chc_client` is single-threaded upstream; block & builder objects
@@ -68,7 +94,7 @@ vtable).
 
 ```rust
 use clickhouse_c::{Allocator, Block, BlockOpts, PosixIo};
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
 let mut child = Command::new("clickhouse")
@@ -78,12 +104,13 @@ let mut child = Command::new("clickhouse")
     .stdout(Stdio::piped())
     .spawn()?;
 let stdout = child.stdout.take().unwrap();
-let mut io = PosixIo::new(stdout.as_raw_fd());
+let mut io = PosixIo::new(stdout.as_fd());
 
 let alloc = Allocator::stdlib();
 while let Some(block) = Block::read(io.as_mut(), alloc, BlockOpts::default())? {
     // block.n_rows(), block.column(i).fixed() / .string() / ...
 }
+drop(io);
 drop(stdout);     // close pipe
 child.wait()?;
 ```
@@ -96,7 +123,7 @@ needs both flags depending on negotiated server revision.
 
 ```rust
 use clickhouse_c::{Allocator, BlockBuilder, BlockOpts, PosixIo, TypeAst};
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
 let mut child = Command::new("clickhouse")
@@ -105,7 +132,7 @@ let mut child = Command::new("clickhouse")
     .stdin(Stdio::piped())
     .spawn()?;
 let stdin = child.stdin.take().unwrap();
-let mut io = PosixIo::new(stdin.as_raw_fd());
+let mut io = PosixIo::new(stdin.as_fd());
 
 let alloc = Allocator::stdlib();
 let ty = TypeAst::parse("UInt32", alloc)?;
@@ -117,6 +144,7 @@ let bytes: &[u8] = unsafe {
 let mut bb = BlockBuilder::new(alloc)?;
 bb.append_fixed("x", ty.view(), bytes, data.len())?;
 bb.write(io.as_mut(), BlockOpts::default())?;
+drop(io);
 drop(stdin);      // EOF for the child
 child.wait()?;
 ```
@@ -129,11 +157,12 @@ expects LE bytes. Big-endian hosts swap before append.
 ```rust
 use clickhouse_c::{Allocator, Client, ClientOpts, Codec, Compression, PacketKind, PosixIo};
 use std::net::TcpStream;
-use std::os::fd::IntoRawFd;
 
 let sock = TcpStream::connect("localhost:9000")?;
-let fd = sock.into_raw_fd();
-let mut io = PosixIo::new(fd);
+// `Client` will own the fd through `PosixIo::new_owned` and close it
+// on drop. For a borrowed-fd variant, keep `sock` in scope and pass
+// `PosixIo::new(sock.as_fd())` — `Client<'_>` then borrows from `sock`.
+let io = PosixIo::new_owned(sock);
 
 let codec = Codec::lz4();        // feature = "lz4" (default)
 let mut opts = ClientOpts::new()
@@ -142,8 +171,7 @@ let mut opts = ClientOpts::new()
     .password("");
 opts.compression = Compression::Lz4;
 
-let mut client = Client::init(&opts, Allocator::stdlib(),
-                              io.as_mut(), Some(codec.as_ref()))?;
+let mut client = Client::init(&opts, Allocator::stdlib(), io, Some(codec))?;
 
 client.send_query("INSERT INTO t FORMAT Native", None)?;
 // send one or more data blocks via client.send_data(Some(&bb)),

@@ -5,7 +5,7 @@
 //! ```
 
 use std::io::Write;
-use std::os::fd::IntoRawFd;
+use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
 use clickhouse_c::{Allocator, Block, BlockOpts, ColumnLayout, Kind, PosixIo};
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: spawn_clickhouse_local <SQL>")?;
 
-    let child = Command::new("clickhouse")
+    let mut child = Command::new("clickhouse")
         .args([
             "local",
             "--format",
@@ -27,20 +27,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .stdout(Stdio::piped())
         .spawn()?;
 
-    let stdout = child.stdout.expect("piped");
-    let fd = stdout.into_raw_fd();
+    let stdout = child.stdout.take().expect("piped");
 
     let alloc = Allocator::stdlib();
-    let mut io = PosixIo::new(fd);
+    let mut io = PosixIo::new(stdout.as_fd());
     let opts = BlockOpts::default();
 
     let stdout_lock = std::io::stdout();
     let mut out = stdout_lock.lock();
 
-    loop {
-        let Some(block) = Block::read(io.as_mut(), alloc, opts)? else {
-            break;
-        };
+    while let Some(block) = Block::read(io.as_mut(), alloc, opts)? {
         for row in 0..block.n_rows() {
             for col in 0..block.n_columns() {
                 if col > 0 {
@@ -52,16 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // SAFETY: we own the fd; close before dropping the PosixIo wrapper.
-    unsafe { libc_close(fd) };
+    drop(io);
+    drop(stdout);
+    child.wait()?;
     Ok(())
-}
-
-unsafe fn libc_close(fd: std::os::fd::RawFd) {
-    unsafe extern "C" {
-        fn close(fd: i32) -> i32;
-    }
-    let _ = unsafe { close(fd) };
 }
 
 fn print_value(out: &mut impl Write, block: &Block, col: usize, row: usize) -> std::io::Result<()> {

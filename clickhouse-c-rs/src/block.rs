@@ -74,7 +74,11 @@ pub struct Block {
 impl Block {
     /// Decode one block from an `Io`. Returns `Ok(None)` on a clean EOF at
     /// a block boundary.
-    pub fn read(io: Pin<&mut PosixIo>, alloc: Allocator, opts: BlockOpts) -> Result<Option<Self>> {
+    pub fn read(
+        io: Pin<&mut PosixIo<'_>>,
+        alloc: Allocator,
+        opts: BlockOpts,
+    ) -> Result<Option<Self>> {
         let raw_opts = opts.to_raw();
         let mut out: *mut sys::chc_block = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
@@ -102,16 +106,17 @@ impl Block {
         unsafe { sys::chc_block_n_columns(self.raw.as_ptr().cast_const()) }
     }
 
-    pub fn column_name(&self, i: usize) -> Option<&str> {
+    /// Column name as the raw bytes the C library copied from the wire.
+    /// UTF-8 is not validated; consumers that need a `&str` should run
+    /// the bytes through [`core::str::from_utf8`] or
+    /// `String::from_utf8_lossy`.
+    pub fn column_name(&self, i: usize) -> Option<&[u8]> {
         let mut len = 0;
         let p = unsafe { sys::chc_block_column_name(self.raw.as_ptr().cast_const(), i, &mut len) };
         if p.is_null() {
             None
         } else {
-            unsafe {
-                let bytes = slice::from_raw_parts(p.cast::<u8>(), len);
-                Some(core::str::from_utf8_unchecked(bytes))
-            }
+            Some(unsafe { slice::from_raw_parts(p.cast::<u8>(), len) })
         }
     }
 
@@ -182,7 +187,7 @@ impl<'b> Column<'b> {
         if ptr.is_null() {
             return None;
         }
-        let n = self.n_rows() * elem_size;
+        let n = self.n_rows().checked_mul(elem_size)?;
         let bytes = unsafe { slice::from_raw_parts(ptr.cast::<u8>(), n) };
         Some((elem_size, bytes))
     }
@@ -200,6 +205,10 @@ impl<'b> Column<'b> {
             return None;
         }
         let offsets = unsafe { slice::from_raw_parts(offsets_ptr, n) };
+        debug_assert!(
+            offsets.windows(2).all(|w| w[0] <= w[1]),
+            "clickhouse-c published non-monotone string offsets",
+        );
         let data_len = offsets.last().copied().unwrap_or(0) as usize;
         let data = if data_len == 0 || data_ptr.is_null() {
             &[][..]
@@ -282,12 +291,16 @@ impl<'b> Column<'b> {
         if key_size <= 0 {
             return None;
         }
+        debug_assert!(
+            matches!(key_size, 1 | 2 | 4 | 8),
+            "clickhouse-c published LowCardinality key_size = {key_size}",
+        );
         let keys_ptr = unsafe { sys::chc_column_lc_keys(self.raw) };
         let dict_ptr = unsafe { sys::chc_column_lc_dict(self.raw) };
         if keys_ptr.is_null() || dict_ptr.is_null() {
             return None;
         }
-        let keys_len = self.n_rows() * key_size as usize;
+        let keys_len = self.n_rows().checked_mul(key_size as usize)?;
         let keys = unsafe { slice::from_raw_parts(keys_ptr.cast::<u8>(), keys_len) };
         Some(LowCardinalityView {
             key_size: key_size as usize,

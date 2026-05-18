@@ -41,7 +41,6 @@
 //! WAL ordering within a single destination table is preserved.
 
 use std::collections::HashMap;
-use std::os::fd::IntoRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -946,17 +945,8 @@ pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>
 
 /// Phase 7 CH-Native emitter. Holds one [`Client`] over a connected
 /// TCP socket per CH replica plus the per-table accumulator state.
-///
-/// Drop order: `client` first (final state-sync), then `codec`, then
-/// `io`. Rust drops fields in declaration order — keep the order below
-/// intact; reordering would invalidate the back-pointer C holds into
-/// `io.state` from inside `client`.
 pub struct Emitter {
-    client: Client,
-    #[allow(dead_code)]
-    codec: Option<Pin<Box<Codec>>>,
-    #[allow(dead_code)]
-    io: Pin<Box<PosixIo>>,
+    client: Client<'static>,
     alloc: Allocator,
     config: EmitterConfig,
     /// Phase 10 SIGHUP-reloadable mapping. Initial value is cloned from
@@ -994,20 +984,16 @@ impl Emitter {
     ) -> Result<Self, EmitterError> {
         let alloc = Allocator::stdlib();
         let codec = config.compression.build_codec()?;
-        let fd = tcp.into_raw_fd();
-        let mut io = PosixIo::new(fd);
+        let io = PosixIo::new_owned(tcp);
         let mut opts = ClientOpts::new()
             .database(&config.database)
             .user(&config.user)
             .password(&config.password);
         opts.compression = config.compression.to_wire();
-        let codec_ref = codec.as_ref().map(|c| c.as_ref());
-        let client = Client::init(&opts, alloc, io.as_mut(), codec_ref)?;
+        let client = Client::init(&opts, alloc, io, codec)?;
         let mapping = Arc::new(tokio::sync::RwLock::new(config.tables.clone()));
         Ok(Self {
             client,
-            codec,
-            io,
             alloc,
             config,
             mapping,
@@ -1142,19 +1128,12 @@ impl Emitter {
     }
 
     /// Phase 10 reconnect: open a fresh TCP socket against the same
-    /// `(host, port)`, build a new [`Client`], and hot-swap `client` /
-    /// `io` / `codec` while preserving the per-xact accumulator state
-    /// in `self.tables`. The caller is responsible for re-issuing
-    /// `send_query(insert_sql)` on the new connection for any table
-    /// whose buffered rows must still flush — see
-    /// [`Self::redo_open_inserts`].
-    ///
-    /// Drop order matters: `client` first (final state-sync against
-    /// the *old* io heap state), then `codec`, then `io`. Field
-    /// assignments below match struct declaration order; replacing
-    /// `self.client = new_client` drops the old client before old `io`
-    /// has been replaced, which is exactly the invariant the C-side
-    /// back-pointer needs.
+    /// `(host, port)`, build a new [`Client`] (which owns its own
+    /// `PosixIo` + `Codec`), and hot-swap `self.client` while preserving
+    /// the per-xact accumulator state in `self.tables`. The caller is
+    /// responsible for re-issuing `send_query(insert_sql)` on the new
+    /// connection for any table whose buffered rows must still flush —
+    /// see [`Self::redo_open_inserts`].
     pub async fn reconnect(&mut self) -> Result<(), EmitterError> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
         let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
@@ -1164,18 +1143,14 @@ impl Emitter {
         let std_tcp = tcp.into_std()?;
         std_tcp.set_nonblocking(false)?;
         let codec = self.config.compression.build_codec()?;
-        let fd = std_tcp.into_raw_fd();
-        let mut io = PosixIo::new(fd);
+        let io = PosixIo::new_owned(std_tcp);
         let mut opts = ClientOpts::new()
             .database(&self.config.database)
             .user(&self.config.user)
             .password(&self.config.password);
         opts.compression = self.config.compression.to_wire();
-        let codec_ref = codec.as_ref().map(|c| c.as_ref());
-        let client = Client::init(&opts, self.alloc, io.as_mut(), codec_ref)?;
+        let client = Client::init(&opts, self.alloc, io, codec)?;
         self.client = client;
-        self.codec = codec;
-        self.io = io;
         self.stats.reconnects += 1;
         Ok(())
     }

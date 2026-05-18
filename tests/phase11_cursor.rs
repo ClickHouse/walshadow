@@ -31,7 +31,10 @@ async fn write_survives_simulated_crash_during_tmp_phase() {
     tokio::fs::write(&tmp_path, b"GARBAGE PARTIAL WRITE")
         .await
         .unwrap();
-    let got = cursor::read(dir).await.unwrap().expect("cursor still on disk");
+    let got = cursor::read(dir)
+        .await
+        .unwrap()
+        .expect("cursor still on disk");
     assert_eq!(got, good);
     // The next clean write recovers — and overwrites the bogus .tmp on
     // its way.
@@ -40,8 +43,14 @@ async fn write_survives_simulated_crash_during_tmp_phase() {
         ..good
     };
     cursor::write(dir, &better).await.unwrap();
-    assert!(!tmp_path.exists(), "successful write clears its .tmp sidecar");
-    let got = cursor::read(dir).await.unwrap().expect("post-recovery cursor");
+    assert!(
+        !tmp_path.exists(),
+        "successful write clears its .tmp sidecar"
+    );
+    let got = cursor::read(dir)
+        .await
+        .unwrap()
+        .expect("post-recovery cursor");
     assert_eq!(got, better);
 }
 

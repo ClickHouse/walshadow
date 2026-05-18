@@ -6,7 +6,7 @@
 
 use std::io::Read;
 use std::net::TcpStream;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
 use clickhouse_c::{
@@ -48,7 +48,7 @@ fn quickstart_decode_clickhouse_local() -> Result<(), Box<dyn std::error::Error>
         .stdout(Stdio::piped())
         .spawn()?;
     let stdout = child.stdout.take().unwrap();
-    let mut io = PosixIo::new(stdout.as_raw_fd());
+    let mut io = PosixIo::new(stdout.as_fd());
 
     let alloc = Allocator::stdlib();
     let mut total_rows = 0usize;
@@ -66,6 +66,7 @@ fn quickstart_decode_clickhouse_local() -> Result<(), Box<dyn std::error::Error>
             }
         }
     }
+    drop(io);
     drop(stdout);
     child.wait()?;
     // --- README snippet ends ---
@@ -107,7 +108,7 @@ fn quickstart_encode_block() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- README snippet begins ---
     let stdin = child.stdin.take().unwrap();
-    let mut io = PosixIo::new(stdin.as_raw_fd());
+    let mut io = PosixIo::new(stdin.as_fd());
 
     let alloc = Allocator::stdlib();
     let ty = TypeAst::parse("UInt32", alloc)?;
@@ -119,6 +120,7 @@ fn quickstart_encode_block() -> Result<(), Box<dyn std::error::Error>> {
     let mut bb = BlockBuilder::new(alloc)?;
     bb.append_fixed("x", ty.view(), bytes, data.len())?;
     bb.write(io.as_mut(), BlockOpts::default())?;
+    drop(io);
     drop(stdin); // EOF for the child
     child.wait()?;
     // --- README snippet ends ---
@@ -148,8 +150,7 @@ fn quickstart_tcp_client() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // --- README snippet begins ---
-    let fd = sock.into_raw_fd();
-    let mut io = PosixIo::new(fd);
+    let io = PosixIo::new_owned(sock);
 
     let codec = Codec::lz4(); // feature = "lz4" (default)
     let mut opts = ClientOpts::new()
@@ -158,12 +159,7 @@ fn quickstart_tcp_client() -> Result<(), Box<dyn std::error::Error>> {
         .password("");
     opts.compression = Compression::Lz4;
 
-    let mut client = Client::init(
-        &opts,
-        Allocator::stdlib(),
-        io.as_mut(),
-        Some(codec.as_ref()),
-    )?;
+    let mut client = Client::init(&opts, Allocator::stdlib(), io, Some(codec))?;
     // --- README snippet ends ---
 
     // Bring up a table for the INSERT FORMAT Native path the README shows.
@@ -204,11 +200,10 @@ fn quickstart_tcp_client() -> Result<(), Box<dyn std::error::Error>> {
     client.send_query("DROP TABLE readme_qs_tcp", None)?;
     drain(&mut client)?;
 
-    let _ = fd; // suppress unused warning; fd is now owned by `io`
     Ok(())
 }
 
-fn drain(client: &mut Client) -> Result<(), Box<dyn std::error::Error>> {
+fn drain(client: &mut Client<'_>) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut pkt = client.recv_packet()?;
         match pkt.kind() {
