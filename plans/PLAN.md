@@ -806,7 +806,9 @@ Initial snapshot path for pre-existing source data. Today
 `START_REPLICATION PHYSICAL` only sees post-attach WAL — any row
 inserted on source before the daemon's first connect is invisible to
 CH forever. Greenfield CH deployments against a non-empty source
-need a backfill bridge.
+need a backfill bridge. Shadow stays catalog-scale across every
+option below; making shadow user-heap-bearing would be equivalent
+to running a normal physical standby, which is anti-goal.
 
 Two shapes, both leaning on the existing per-table emitter:
 
@@ -819,18 +821,28 @@ Two shapes, both leaning on the existing per-table emitter:
   `_lsn = backfill_lsn` (sub-segment minimum across the export
   snapshot's xmin). CH `ReplacingMergeTree(_lsn)` collapses
   backfill rows with future WAL-driven updates.
-- **Shadow-as-source** (operator opt-in). Same shape but COPY
-  against shadow. Requires shadow to carry user-heap data files
-  ([BASEBACKUP](BASEBACKUP.md) Use Case 1B / 2A), not the MiB-
-  scale catalog-only shape Phase 3 ships. Trade-off: zero source
-  CPU + IO during backfill, at the cost of shadow data-dir size.
+- **Page-walk over a wal-g BASE_BACKUP** (operator opt-in, source
+  CPU constrained). When source already publishes wal-g backups to
+  S3, walshadow uses `wal_rs::pg::backup::fetch` to stream the
+  consistent point past the daemon. User-heap tar entries feed an
+  in-flight page-walk decoder ([BASEBACKUP](BASEBACKUP.md) Use Case
+  2A); catalog entries land on shadow under the same filtered
+  fetch Phase 6.5 uses. WAL catch-up between `start_lsn` and
+  `end_lsn` comes from the same S3 archive via
+  `wal_rs::pg::wal::fetch`. Zero source touches across the whole
+  backfill window; bytes flow S3 → daemon → CH without settling on
+  shadow.
 
-Sequencing primitive: backfill completes at LSN `B` (the snapshot's
-`pg_export_snapshot()` LSN); daemon's `--start-lsn` for the WAL pump
-is `B` so the backfill's snapshot and the WAL tail meet seamlessly.
-Mirrors `pg_dump`'s parallel-dump co-ordination.
+Sequencing primitive: backfill completes at LSN `B` (the source-direct
+path's `pg_export_snapshot()` LSN, or the BASE_BACKUP path's
+`end_lsn`); daemon's `--start-lsn` for the WAL pump is `B` so the
+backfill snapshot and the WAL tail meet seamlessly. Mirrors
+`pg_dump`'s parallel-dump co-ordination.
 
 Out of scope:
+- **Shadow-as-source.** Replicating user heap onto shadow to COPY
+  off shadow is the physical-standby shape walshadow exists to
+  avoid; rejected unconditionally.
 - DDL during backfill — operator must quiesce DDL for the backfill
   window. A mid-backfill DDL means re-snapshotting the affected
   relation.
@@ -840,8 +852,11 @@ Out of scope:
   whatever bandwidth the CH emitter is willing to accept;
   the WAL pump's xact buffer holds back-pressure in parallel.
 
-Size: ≈700 LOC (one-shot COPY orchestrator + per-relation encoder
-reuse + snapshot co-ordination + retry semantics).
+Size: ≈700 LOC for source-direct path (one-shot COPY orchestrator +
+per-relation encoder reuse + snapshot co-ordination + retry
+semantics). Page-walk path adds the ~650 LOC tracked under
+[BASEBACKUP](BASEBACKUP.md) §"Estimate" and shares it with Phase
+6.5 if both modes ship.
 
 ## Known correctness gaps
 

@@ -9,6 +9,20 @@ directory, and ClickHouse's initial user-heap state. Status:
 top of [Phase 7](PLAN.md#phase-7--ch-native-emitter-via-clickhouse-c-rs)
 or a dedicated new phase if BASE_BACKUP is the chosen bootstrap path.
 
+**Hard constraint, applies to every option below.** Shadow PG is
+catalog-only by design. Any path that lands source-scale user heap
+on shadow's data dir (transiently or otherwise) is out of scope —
+if walshadow wanted a full physical replica, the answer would be a
+normal standby, not a shadow. Bytes pass *through* the daemon during
+bootstrap; they do not settle on shadow.
+
+**Sourcing bias.** wal-rs already speaks the wal-g object-store
+layout (`pg/backup/fetch.rs`, `pg/wal/fetch.rs`). Production sources
+typically already run wal-g for DR; pulling the consistent point
+from S3 is preferred over a direct `BASE_BACKUP` against source, which
+costs source CPU/IO. Direct-from-source stays as a fallback for
+greenfield deployments without wal-g infra.
+
 ## Why ask the question now
 
 Two unrelated gaps converge on the same protocol.
@@ -123,8 +137,10 @@ of the Phase 6.5 work, not as separate prior phases.
   `unpack_manual<R>` extracts every entry. Walshadow needs to skip
   `pg_replslot/**`, `pg_stat_tmp/**`, `pg_logical/**`,
   `pg_dynshmem/**`, `pg_subtrans/**`, `pg_notify/**`, `temp_*`,
-  `pgsql_tmp/**`, `pg_serial/**`, `pg_snapshots/**`, and any
-  user-heap file when running Use Case 1B. Shape:
+  `pgsql_tmp/**`, `pg_serial/**`, `pg_snapshots/**`, **and every
+  user-heap file**. The last bullet is load-bearing, not optional:
+  it is what keeps shadow catalog-scale after a base-backup fetch.
+  Shape:
 
   ```rust
   pub trait EntryFilter: Send + Sync {
@@ -183,32 +199,39 @@ of the Phase 6.5 work, not as separate prior phases.
   expose. Only needed if `START_REPLICATION` from start_lsn turns
   out to be insufficient in practice.
 
-Aggregate wal-rs lift for the recommended 1A→1B + 2B path:
+Aggregate wal-rs lift for the recommended filtered-fetch + 2C path:
 EntryFilter trait + denylist constant + slot-create method. About
 150 LOC of upstream change, no churn on existing call sites.
 
 ## Use case 1 — shadow PG data-dir bootstrap
 
 Replaces the [Phase 3](PLAN.md#phase-3--shadow-pg-lifecycle) "initdb
-+ apply_schema_dump" pair with a single "fetch BASE_BACKUP into
-data_dir" pass. Pseudo-flow:
++ apply_schema_dump" pair with a single "fetch filtered BASE_BACKUP
+into data_dir" pass. The filter is what keeps the bootstrap inside
+the catalog-only constraint at the top of this doc. Pseudo-flow:
 
 ```
-1. ReplicationConn::connect(source)
-2. (slot already created or co-created in this session)
-3. run_base_backup(conn, opts, tx)
+1. Source = ReplicationConn::connect(source)            // direct
+       OR  FetchArgs::object_store(...)                  // S3 via wal-rs
+2. (slot already created or co-created on source PG)
+3. drive run_base_backup / fetch::handle_with_args with
+   entry_filter = CatalogOnly { whitelist: catalog_tracker_seed,
+                                denylist: SYSTEM_DIRS_DENYLIST }
 4. for event in rx:
      Start(info)          -> backup_start_lsn = info.start_lsn
-                             backup_end_lsn   = (filled by Finish)
-     Archive { meta, body } -> tar-extract body
-                               • data dir   -> shadow.data_dir
-                               • tablespace -> shadow.data_dir/pg_tblspc/<oid>/
-                                 (or skip, see "Disk budget")
-                               filter out pg_replslot/, pg_stat_tmp/, temp_*
+     Archive { meta, body } -> tar-extract body with filter
+                               • catalog file (oid < 16384 or in whitelist)
+                                   -> shadow.data_dir / pg_tblspc/<oid>/
+                               • user-heap file
+                                   -> drop
+                               • denylist dir (pg_replslot/, …)
+                                   -> drop
      Finish(info)         -> backup_end_lsn = info.end_lsn
 5. shadow.enable_standby_recovery()
 6. shadow.start()
 7. shadow.wait_for_replay(backup_end_lsn, …)
+       // WAL catch-up sourced from object-store archive when
+       // available, else from the live slot
 ```
 
 ### Wins over schema-only
@@ -228,37 +251,30 @@ data_dir" pass. Pseudo-flow:
 * `pg_control` carries source's start_lsn; shadow recovery anchors at
   the right LSN without a manual override.
 
-### Disk budget
+### Disk discipline
 
-A schema-only shadow is MiB-scale. A BASE_BACKUP'd shadow is
-source-scale. Two strategies:
+Shadow stays catalog-scale by construction. The `EntryFilter` lift
+above is applied during tar extraction: every `base/<dbid>/<filenode>`
+entry whose filenode is not in the catalog whitelist is dropped on
+the floor before it hits disk. User-heap bytes never settle on
+shadow.
 
-**A. Keep user heap on disk.** Disk grows from MiB to full source
-cluster size. Shadow's filter NOOPs all user-heap WAL, so user-heap
-files stay frozen at start_lsn forever — wasted space scaling with
-source's data footprint. Acceptable only as a transient state when
-Use Case 2B (below) needs the heap to drive CH initial load.
+Recovery between `start_lsn` and `end_lsn` references no user-heap
+files because walshadow's WAL filter already drops user-heap records
+in steady state — the same filter runs over the catch-up window,
+fed via `restore_command` from walshadow's filtered segment
+directory. Source-side `vacuum_defer_cleanup_age`-style hazards do
+not arise because shadow never reaches for those filenodes.
 
-**B. Strip user heap post-fetch.** After the fetch but before
-`enable_standby_recovery`:
+Whitelist input is the same `CatalogTracker` seed that PRE5b2 already
+needs (`oid < FirstNormalObjectId OR catalog-tracker hit`); the fetch
+side reuses it as `EntryFilter::keep(&path)`.
 
-* Spin shadow read-only in normal mode (no `standby.signal`).
-* Query `pg_class` over libpq: `SELECT oid, relfilenode, reltablespace,
-  relkind FROM pg_class`.
-* Cross-reference against the catalog whitelist
-  (`oid < FirstNormalObjectId OR catalog-tracker hit`).
-* Stop shadow; on the data dir, `unlink` each non-catalog
-  `base/<dbid>/<filenode>` plus `_fsm`, `_vm`, segno suffixes.
-* Touch sentinel `.walshadow-pruned` so re-runs detect prior state.
-
-Risk: deleting a file that recovery later wants to touch. Mitigated
-by walking only `oid < FirstNormalObjectId OR is-catalog-tracked` —
-non-tracked filenodes by definition don't appear in heap-WAL the
-filter keeps, so recovery never reaches for them.
-
-Default: **B**, unless Use Case 2B is chosen, in which case A
-persists for the duration of the CH initial-load pass and B runs
-once CH has acked the snapshot.
+No post-fetch prune. No transient source-scale window. If the
+extraction can't proceed without writing user heap (e.g. because
+`pg_filenode.map` recovery wants a heap page touched before catalog
+visibility resolves — currently no known case), the fetch fails
+loudly rather than degrading silently to a source-scale shadow.
 
 ### LSN alignment
 
@@ -284,64 +300,59 @@ in favour of the WAL-derived row.
 `Shadow::initdb` and `Shadow::apply_schema_dump` stay — useful for
 the test scaffolding under `tests/shadow_lifecycle.rs` and for
 environments without REPLICATION grant on source. New
-`Shadow::restore_from_base_backup(conn, opts) -> Result<EndInfo>`
-runs the pump and writes into `data_dir`. Roughly 200 LOC of
-shadow-side glue plus 150 LOC of prune pass.
+`Shadow::restore_from_base_backup(source, opts) -> Result<EndInfo>`
+runs the pump and writes the *filtered* contents into `data_dir`,
+where `source` is either a live `ReplicationConn` (direct) or an
+object-store `FetchArgs` (S3-via-wal-rs). Both feed
+`wal_rs::pg::backup::fetch::unpack_part` with the catalog-only
+`EntryFilter`. Roughly 200 LOC of shadow-side glue.
 
 ## Use case 2 — ClickHouse initial heap load
 
-Three plausible consumers of the BASE_BACKUP output for the CH side.
+Two consumers of the BASE_BACKUP output for the CH side. A third
+(COPY from a shadow that holds user heap) is incompatible with the
+catalog-only constraint above and is not listed.
 
 ### 2A. Page-walk decoder against the tar stream
 
-For each tracked user relation, open its tar entry, walk 8 KiB pages,
-iterate `ItemIdData` slots, decode `HeapTupleHeader` + payload
-through the Phase 5 decoder. Emit
+For each tracked user relation, open its tar entry as it flows past
+the daemon (S3 read or direct CopyData), walk 8 KiB pages, iterate
+`ItemIdData` slots, decode `HeapTupleHeader` + payload through the
+Phase 5 decoder. Emit
 `Tuple { rfn, xid: xmin, op: Insert, new, old: None }` per visible
-tuple. Visibility filter mirrors `HeapTupleSatisfiesMVCC` at
-start_lsn against the CLOG/multixact files shipped in the same
-BASE_BACKUP.
+tuple. Visibility folds into the WAL hot path: emit from
+`start_lsn`-state pages, then drive the Phase 5/6 WAL decoder
+across the `start → end` window. WAL commits/aborts in that window
+run through the standard decoder; ReplacingMergeTree dedups via
+`_lsn`. Bytes flow daemon → CH; nothing lands on shadow.
 
-Pros: zero source-PG round-trips beyond BASE_BACKUP itself,
-parallelisable across relations, the decoder code path reuses Phase
-5's heap-tuple projection logic.
+Pros: zero source-PG round-trips beyond BASE_BACKUP itself (and
+zero source round-trips at all if the backup is read from S3),
+parallelisable across relations, reuses the Phase 5 heap-tuple
+projection logic, no shadow-disk pressure.
 
 Cons:
 * TOAST chunks live in a separate relation. Need to follow
   `va_valueid` references into the corresponding TOAST table's
-  pages, also from the tar stream. Doable; adds a cross-archive
-  lookup that the WAL decoder's same-stream TOAST handling
-  ([Phase 6](PLAN.md#phase-6--toast-reassembly--xact-buffer))
+  pages, also from the tar stream. Buffer `pg_toast_<relid>` chunks
+  keyed by `(chunk_id, chunk_seq)`, drain on main-heap decode.
+  Bounded per-relation; spill-to-scratch covers TOAST that exceeds
+  RAM. Cross-archive lookup the WAL decoder's same-stream TOAST
+  handling ([Phase 6](PLAN.md#phase-6--toast-reassembly--xact-buffer))
   doesn't have.
-* On-disk heap holds *uncommitted* tuples too (xmin in-progress at
-  start_lsn). Backup's CLOG resolves them, but the post-backup WAL
-  stream that lands the commit must be drained before deciding
-  visibility — i.e. recovery must reach end_lsn first. Easier to
-  let shadow do that work than to re-implement on top of the tar.
-* Visibility code path diverges from the WAL decoder's "every kept
-  record is a committed insert/update/delete" model. Two code paths,
-  two regression surfaces.
-
-### 2B. COPY from shadow once consistent
-
-After shadow reaches end_lsn (and Use Case 1's prune step is
-postponed), for each tracked relation issue
-`COPY <rel> TO STDOUT WITH (FORMAT binary)` against shadow PG. Wire
-the COPY output through the [Phase 7](PLAN.md#phase-7--ch-native-emitter-via-clickhouse-c-rs)
-emitter to CH.
-
-Pros: PG handles visibility, TOAST de-toasting, type formatting.
-Shadow PG already speaks libpq via `ShadowCatalog`. One code path
-per type (the existing decoder for the WAL stream re-used as the
-CH-side projection).
-
-Cons:
-* Requires Use Case 1A (keep user heap on shadow) for the duration
-  of initial load. Disk-budget cost is transient but real.
-* COPY is sequential per relation; large relations bottleneck on
-  shadow's single-connection throughput. Parallelisable across
-  relations via N libpq sessions — `tokio_postgres` makes that
-  cheap.
+* Torn pages. BASE_BACKUP captures pages mid-write; PG recovery
+  normally applies WAL FPIs between `start_lsn` and `end_lsn` to
+  make them consistent. The page-walk decoder needs to buffer the
+  page subset that the WAL window touches (MiB out of GB/TB),
+  apply FPIs in-memory, walk the patched copy. Sliver of recovery
+  on the page subset that needs it, not a full re-implementation.
+* Catalog-before-heap ordering. Resolving `base/<dbid>/<filenode>`
+  to a relation kind requires `pg_class`. Tar order is not
+  catalogs-first by spec. Two-pass fetch: pass 1 lands catalogs
+  (filtered) to shadow data_dir, spin shadow read-only for
+  `pg_class` query, pass 2 streams user heap with the filenode map
+  in hand. Trivial when sourcing from S3; on direct-from-source
+  it costs one extra BASE_BACKUP duration.
 
 ### 2C. Parallel COPY against source at a `pg_export_snapshot()` boundary
 
@@ -350,77 +361,94 @@ can export a snapshot id around the same checkpoint via
 `pg_export_snapshot()`; walshadow opens N parallel libpq sessions
 against source, each `SET TRANSACTION SNAPSHOT '…'`, and COPYs
 disjoint relations in parallel. Independent of the BASE_BACKUP
-fetch path on the wire.
+fetch path on the wire. Shadow is untouched.
 
 Pros: maximum parallelism, source PG does visibility filtering, no
-on-shadow heap concerns.
+on-shadow heap concerns, zero new decoder code (existing Phase 7
+emitter consumes the COPY stream the same way it consumes WAL-
+derived tuples).
 
 Cons:
 * Source CPU/IO doubles during initial bootstrap (BASE_BACKUP + N
-  COPYs).
+  COPYs). Counter: the BASE_BACKUP half can come from S3 instead
+  of source, removing one of the two pressures — net source load
+  is just the N parallel COPYs.
 * Snapshot export is scoped to a single source xact; the session
   must stay open for the entire COPY duration. Cancellation /
   reconnect handling gets gnarly.
 * Two coordination points (BASE_BACKUP start + snapshot export
-  start) need to line up; not impossible, but adds protocol surface.
+  start) need to line up. Resolvable but adds protocol surface.
 
 ### Recommendation per case
 
-**2B for the first cut.** Pairs with Use Case 1A (keep user heap on
-shadow during initial load, prune after CH has acked the snapshot).
-Trades a transient large shadow-disk window for protocol simplicity
-and code reuse. Revisit 2B vs 2C once shadow's COPY throughput is
-measured on a real workload.
+Bootstrap pairs with the catalog-only Use Case 1 unconditionally.
+For the CH side:
 
-**2A** is the path that's mechanically cleanest but tangles the
-decoder with snapshot-visibility logic that doesn't appear in the
-WAL hot path. Defer indefinitely.
+* **2C default.** Zero new decoder code. With BASE_BACKUP sourced
+  from S3 the source-CPU concern collapses to "source runs the N
+  parallel COPYs", which is already the cost shape of any pg_dump-
+  parallel bootstrap. Pairs naturally with `pg_export_snapshot()`
+  semantics operators already understand.
+* **2A** when the source cluster cannot afford the N parallel COPYs
+  (locked under tight QoS, or replicas-only access). Pays ~400 LOC
+  of in-flight page-walk + FPI replay + cross-archive TOAST
+  bookkeeping on the walshadow side to spare source.
+* **Shadow-as-source path explicitly out.** Any framing that has
+  shadow holding user heap so a COPY can run off shadow violates
+  the catalog-only constraint at the top of this doc.
 
-Trade-off table:
+Trade-off table (only viable cells):
 
-| 1A keep heap | 1B prune heap |
-|---|---|
-| 2A page-walk | works (over-storing on shadow) | works (independent of shadow disk) |
-| 2B COPY from shadow | natural pairing | unavailable |
-| 2C COPY from source | wastes shadow heap | works |
+| Use Case 1 (filtered fetch, catalog-only on shadow) |
+|---|
+| 2A page-walk: works; ~400 LOC decoder lift; zero source COPY load |
+| 2C source-side COPY: works; zero decoder lift; N source connections |
 
-Recommended pairing: **1A + 2B → 1B (post-CH-ack prune)**.
+Recommended pairing: **filtered Use Case 1 + 2C**, fallback to **2A**
+when source CPU is constrained.
 
 ## Sourcing the backup
 
-Two paths, both already wired through wal-rs.
+Two paths, both already wired through wal-rs. Preference is
+**object-store first** — most production sources already run wal-g
+for DR, and walshadow inherits the existing backup pipeline for
+free.
 
-### Direct from source
-
-walshadow opens a replication-mode `ReplicationConn` and runs
-`BASE_BACKUP` against source itself. Trades source-cluster CPU/IO for
-the backup duration (minutes for small clusters, hours for TB-scale).
-Operator does not need any storage infrastructure beyond what source
-already runs.
-
-### From wal-g object store
+### From wal-g object store (preferred)
 
 When source is already backed up by wal-g (or any compatible tool
 writing the same on-disk layout), walshadow uses
 `wal_rs::pg::backup::fetch` to pull the latest backup from S3/GCS,
-restore into shadow's `data_dir`, then walks the WAL archive forward
-until end_lsn (or the live `START_REPLICATION` stream catches up).
-Source cluster isn't touched.
+runs filtered extraction (`EntryFilter` drops user heap + denylist
+dirs) into shadow's `data_dir`, then drives shadow's recovery using
+WAL pulled from the same archive via `wal_rs::pg::wal::fetch` until
+`end_lsn` is reached (or the live `START_REPLICATION` stream catches
+up). Source cluster isn't touched for either the backup payload or
+the WAL catch-up window.
 
-Both paths land at the same on-disk shape and the same `EndInfo`
-shape. One-call-site difference. Config:
+### Direct from source (fallback)
+
+For greenfield deployments without wal-g infra, walshadow opens a
+replication-mode `ReplicationConn` and runs `BASE_BACKUP` against
+source itself. Trades source-cluster CPU/IO for the backup duration
+(minutes for small clusters, hours for TB-scale). Same filtered
+extraction on the receiving side; user heap streams in over the
+wire and is dropped before disk.
+
+Both paths land at the same on-disk shape (catalog-only) and the
+same `EndInfo` LSN pair. One-call-site difference. Config:
 
 ```toml
 [bootstrap]
-mode = "base_backup"           # or "schema_only" (Phase 3 path)
-base_backup_source = "direct"  # or "object_store"
+mode = "base_backup"                # or "schema_only" (Phase 3 path)
+base_backup_source = "object_store" # or "direct"
 
-[bootstrap.object_store]       # only when base_backup_source = "object_store"
+[bootstrap.object_store]            # when base_backup_source = "object_store"
 storage_url = "s3://bucket/walg/"
 ```
 
-Default greenfield: `direct`. Default brownfield with wal-g infra:
-`object_store`.
+Default: `object_store` when storage credentials are configured,
+`direct` otherwise.
 
 ## What this doesn't help with
 
@@ -572,14 +600,16 @@ CDC against a populated source needs initial-load before v1.0.
 
 ## Estimate
 
-walshadow side:
+walshadow side (default: filtered fetch + 2C COPY):
 
 ```
-src/shadow_basebackup.rs   new — ~300 LOC  BASE_BACKUP-from-source wrapper,
-                                            tar → data_dir, denylist filter
-src/shadow.rs              +~80         Shadow::restore_from_base_backup,
-                                            prune pass, tablespace mapping
-src/ch_initial_load.rs     new — ~250 LOC  per-relation COPY pump → emitter
+src/shadow_basebackup.rs   new — ~300 LOC  BASE_BACKUP pump (direct +
+                                            object-store), filtered extraction,
+                                            denylist + heap-skip EntryFilter
+src/shadow.rs              +~60         Shadow::restore_from_base_backup,
+                                            tablespace mapping
+src/ch_initial_load.rs     new — ~250 LOC  snapshot-export coordinator +
+                                            per-relation COPY against source
 src/source_feed.rs         +~30         slot create before BASE_BACKUP (uses
                                             wal-rs's new create_physical_slot)
 tests/base_backup_e2e.rs   new — ~250 LOC  live source + shadow + CH
@@ -588,7 +618,19 @@ PLAN.md                    add Phase 6.5
 BASEBACKUP.md              this doc
 ```
 
-Total walshadow: ~660 LOC src + ~250 LOC tests.
+Total walshadow (2C default): ~640 LOC src + ~250 LOC tests.
+
+For 2A fallback (constrained source), add:
+
+```
++~400 LOC  in-memory FPI replay over buffered page subset
++~150 LOC  TOAST buffer + spill-to-scratch for cross-archive lookup
++~100 LOC  start→end WAL replay driver as visibility end-cap
++~150 LOC  tests
+```
+
+2A adds ~650 LOC behind a config knob; only paid by deployments that
+flip to `bootstrap.ch_initial_load = "tar_decode"`.
 
 wal-rs side (coupled upstream, lands first or co-lands):
 
@@ -604,162 +646,78 @@ tests                      +~80   filter denial behaviour, slot-create round-tri
 Total wal-rs: ~140 LOC src + ~80 LOC tests. Existing call sites
 untouched (filter defaults to `None`, slot-create is new method).
 
-Combined: ~800 LOC src + ~330 LOC tests across both repos, on top of
-the ~1300+ LOC of base-backup machinery already in wal-rs.
+Combined (2C default): ~780 LOC src + ~330 LOC tests across both
+repos, on top of the ~1300+ LOC of base-backup machinery already in
+wal-rs. 2A adds ~650 LOC src + ~150 LOC tests if/when enabled.
 
 ## Recommendation
 
-1. Adopt **Use Case 1 (BASE_BACKUP → shadow data dir)** as the
-   default bootstrap, replacing `Shadow::apply_schema_dump` for any
-   source reachable via REPLICATION. Keep `apply_schema_dump` as a
-   fallback for environments without REPLICATION grants and for
-   test scaffolding. Closes shadow's on-disk filenode skew for
-   mapped *and* non-mapped catalogs in one step; the schema-only
-   path leaves both unaddressed. [PRE5b2](pre5/PRE5b2.md)'s
-   `seed_from_source` stays load-bearing on the daemon side
-   (walshadow's runtime `CatalogTracker` is distinct from shadow's
-   on-disk state — BASE_BACKUP does not seed it).
-2. Adopt **Use Case 2B (COPY from shadow once consistent)** for CH
-   initial load. Pair with Use Case 1A transiently (keep user heap
-   on shadow until CH has acked the snapshot), then run the prune
-   pass to drop back to MiB-scale shadow disk.
-3. Defer **direct vs object-store** sourcing to a runtime config
-   knob; both land at the same `data_dir` shape and `EndInfo` LSN
-   pair.
-4. Insert as **Phase 6.5** between [Phase 6](PLAN.md#phase-6--toast-reassembly--xact-buffer)
+1. Adopt **Use Case 1 (filtered BASE_BACKUP → shadow data dir)** as
+   the default bootstrap, replacing `Shadow::apply_schema_dump` for
+   any source reachable via REPLICATION *or* via a wal-g object
+   store. Keep `apply_schema_dump` as a fallback for environments
+   with neither access path. The filtered extraction (heap-skip
+   `EntryFilter` plus the system-dirs denylist) closes shadow's
+   on-disk filenode skew for mapped *and* non-mapped catalogs in
+   one step without growing shadow past catalog-scale.
+   [PRE5b2](pre5/PRE5b2.md)'s `seed_from_source` stays load-bearing
+   on the daemon side (walshadow's runtime `CatalogTracker` is
+   distinct from shadow's on-disk state — BASE_BACKUP does not seed
+   it).
+2. Adopt **Use Case 2C (parallel source-side COPY at a
+   `pg_export_snapshot()` boundary)** for CH initial load by
+   default. Zero new decoder code; pairs naturally with the
+   `pg_export_snapshot()` LSN that bridges into the WAL pump's
+   `--start-lsn`. Holds shadow at catalog-scale.
+3. Provide **Use Case 2A (page-walk over the BASE_BACKUP tar
+   stream)** as an opt-in alternative for deployments where source
+   CPU is constrained and an extra ~650 LOC of in-flight decoder
+   work on the walshadow side is preferable. Especially attractive
+   when sourcing from S3, since the tar stream then incurs zero
+   source-side load.
+4. Prefer **object-store** sourcing whenever wal-g (or compatible)
+   infra exists; fall back to **direct** for greenfield clusters.
+   Same `data_dir` shape, same `EndInfo` LSN pair.
+5. Insert as **Phase 6.5** between [Phase 6](PLAN.md#phase-6--toast-reassembly--xact-buffer)
    and [Phase 7](PLAN.md#phase-7--ch-native-emitter-via-clickhouse-c-rs).
    Acceptance criterion (gates v1.0): a source pre-populated with
    `pgbench -i -s 10` is fully reflected in CH after a single
-   `walshadow bootstrap` followed by steady-state replication,
-   with row counts and checksums matching.
-5. **Use Case 2A** is reframed in the counter-proposal below as the
-   only path that keeps shadow at catalog-scale without source-side
-   double-load. Visibility folds into the Phase 5/6 WAL hot path
-   rather than diverging from it. Pick over 2C when source CPU is
-   tight; pick over 2B when shadow disk is.
+   `walshadow bootstrap` followed by steady-state replication, with
+   row counts and checksums matching, and shadow `data_dir` stays
+   under a configurable ceiling (catalog-scale, MiB-order) across
+   the whole bootstrap.
 
-## Counter-proposal: shadow disk budget as hard constraint
+Config knob:
 
-The recommendation above (1A+2B) assumes shadow can absorb full
-source disk transiently. That assumption holds only when source <
-shadow VM disk. The stated design target — dinky shadow VM (e.g.
-50 GB) against a TB-scale source — breaks it; 1A's prune pass cannot
-run if the fetch exhausts disk before completing. This section flips
-the default by shadow-disk budget.
-
-### What forces user heap onto shadow disk
-
-Only 2B. PG's `COPY ... TO STDOUT` reads from a running shadow's
-on-disk heap, so 2B inherently requires 1A. Every other CH-side
-option (2A page-walk, 2C source-side COPY) is indifferent to shadow
-heap state. The tar bytes themselves already stream —
-`BackupEvent::Archive.body` is an `AsyncRead` (see "What wal-rs
-already gives us"). Nothing in the protocol forces landing user heap
-to disk.
-
-### Three regimes
-
-| Path | Shadow heap on disk | Source CPU during bootstrap | Decoder LOC delta | When |
-|---|---|---|---|---|
-| 1A + 2B (doc default) | source-scale until pruned | 1× (BASE_BACKUP only) | baseline | source < shadow VM disk |
-| 1B + 2C | catalog-scale (MiB) | 2× (BASE_BACKUP + N COPY) | ~0 | dinky shadow, source has CPU headroom |
-| 1B + 2A | catalog-scale (MiB) | 1× (BASE_BACKUP only) | +~400 LOC | dinky shadow, tight source |
-
-### Path 1B + 2C — source-side parallel COPY
-
-Co-issue `pg_export_snapshot()` with BASE_BACKUP's start checkpoint.
-Open N libpq sessions against source, each `SET TRANSACTION SNAPSHOT
-'<id>'`, COPY disjoint relations directly into the Phase 7 emitter.
-Shadow stays catalog-scale; decoder is unchanged from the
-steady-state WAL path — source PG handles visibility, TOAST, type
-formatting.
-
-Cost: source CPU/IO doubles for the bootstrap window; snapshot
-session must stay open for full COPY duration; cancellation /
-reconnect handling on the snapshot session adds protocol surface.
-
-### Path 1B + 2A — streamed page-walk
-
-For each tracked user relation, the tar entry feeds a page-walk
-decoder inline: walk 8 KiB pages, iterate `ItemIdData` slots, decode
-`HeapTupleHeader` + payload through the Phase 5 decoder, emit
-`Tuple { rfn, xid: xmin, op: Insert, new, old: None }` per visible
-tuple, drop the bytes. Catalogs and recovery prereqs land on shadow
-as in 1B; user heap bypasses disk entirely.
-
-Engineering surface — re-examines the doc's original 2A cons:
-
-* **Torn pages.** BASE_BACKUP captures pages mid-write; PG recovery
-  applies WAL FPIs between `start_lsn` and `end_lsn` to make them
-  consistent. Decoder buffers the page subset that WAL window
-  touches (MiB out of GB/TB), applies FPIs in-memory, walks decoded.
-  Sliver of recovery on the page subset that needs it, not a full
-  re-implementation.
-
-* **Catalog-before-heap ordering.** Resolving
-  `base/<dbid>/<filenode>` to relation kind requires `pg_class`. Tar
-  order is not catalogs-first by spec. Two-pass fetch: pass 1 lands
-  catalogs to shadow data_dir, spin shadow read-only for `pg_class`
-  query, pass 2 streams user heap with the filenode map in hand.
-  Trivial on object-store; adds one BASE_BACKUP duration on
-  direct-from-source.
-
-* **TOAST cross-archive lookup.** Buffer `pg_toast_<relid>` chunks
-  keyed by `(chunk_id, chunk_seq)`, drain on main-heap decode.
-  Bounded per-relation; spill-to-scratch covers TOAST that exceeds
-  RAM. Scratch is bounded per-relation, not source-scale.
-
-* **Visibility folds into the WAL hot path.** Doc's original framing
-  called 2A's visibility code path divergent. It need not be: emit
-  tuples from start_lsn-state heap pages, then drive the Phase 5/6
-  WAL decoder across the start→end window. WAL commits/aborts in
-  that window run through the standard decoder; ReplacingMergeTree
-  dedups via `_lsn`. Same record stream, same code path —
-  BASE_BACKUP becomes "WAL prefix initialised from heap pages".
-
-Code-size delta vs 2B:
-
-```
-+~400 LOC  in-memory FPI replay over buffered page subset
-+~150 LOC  TOAST buffer + spill-to-scratch
-+~100 LOC  start→end WAL replay driver as visibility end-cap
--~250 LOC  ch_initial_load.rs (no shadow-COPY path)
-+~150 LOC  tests
+```toml
+[bootstrap]
+mode = "base_backup"                # or "schema_only" (Phase 3 path)
+base_backup_source = "object_store" # or "direct"
+ch_initial_load = "source_copy"     # or "tar_decode"
 ```
 
-Net: ~400 LOC src above the original 1A+2B estimate. Shadow stays
-dinky-feasible without source-side double-load.
+Defaults: `object_store` + `source_copy` when wal-g infra is
+configured; `direct` + `source_copy` for greenfield; flip
+`ch_initial_load = "tar_decode"` when source CPU during bootstrap
+is the binding cost.
 
-### Revised recommendation
+### What this leaves out
 
-Bootstrap path is conditional on shadow disk budget:
+* **Shadow as a COPY source.** Any framing where shadow holds user
+  heap so a `COPY ... TO STDOUT` can run off shadow violates the
+  catalog-only constraint at the top of the doc. Removed
+  unconditionally.
+* **Post-fetch prune passes.** Filtered extraction makes prune
+  obsolete; nothing to clean up.
+* **Replicating the full source cluster.** If a deployment ever
+  wants that shape, the right tool is a normal physical standby,
+  not walshadow.
 
-* **Source < shadow VM disk** (small source, beefy shadow, test
-  harness): **1A + 2B**. Simplest decoder.
-* **Source >> shadow VM disk, source has CPU headroom**
-  (dinky-shadow default when operator's source is overprovisioned):
-  **1B + 2C**. Catalog-scale shadow, zero new decoder code, pays
-  source-side double-load.
-* **Source >> shadow VM disk, source is tight on CPU**: **1B + 2A**.
-  Catalog-scale shadow, single BASE_BACKUP on source, ~400 LOC of
-  in-flight decoder work absorbs the cost on the walshadow side.
+### Notes carrying forward
 
-Ship `bootstrap.ch_initial_load = "shadow_copy" | "source_copy" |
-"tar_decode"` as a config knob, default `"source_copy"` (1B+2C):
-zero decoder cost, catalog-scale shadow, source-side load is
-operator infrastructure that's already provisioned for any
-production PG cluster. Operators flip to `"tar_decode"` (1B+2A) when
-source CPU is constrained, or to `"shadow_copy"` (1A+2B) when shadow
-disk is unconstrained and decoder simplicity dominates.
-
-### What this reorders in the doc
-
-* [PRE5b2](pre5/PRE5b2.md)'s `seed_from_source` is independent of the
-  1x/2x choice and remains walshadow's source-of-truth for the
+* [PRE5b2](pre5/PRE5b2.md)'s `seed_from_source` is independent of
+  the 2x choice and remains walshadow's source-of-truth for the
   runtime `CatalogTracker` under every bootstrap mode.
-* Phase 6.5 acceptance criterion (`pgbench -i -s 10` round-trip)
-  applies to whichever 2x path is configured; pick one for CI, gate
-  the others as their own acceptance jobs.
-* Estimate (line 568) is for 1A+2B. Add ~400 LOC src + ~150 LOC
-  tests for 1B+2A; subtract ~250 LOC (`ch_initial_load.rs`) and add
-  ~100 LOC (snapshot-session coordinator) for 1B+2C.
+* Phase 6.5 acceptance criterion applies to whichever 2x path is
+  configured; pick one for CI (default `source_copy`), gate the
+  other as its own acceptance job.
