@@ -5,7 +5,7 @@
 //! - **Local**: `numeric`, `inet` / `cidr`, `interval`. Layout is
 //!   stable, decoders are mechanical, and per-row hot-path latency
 //!   would be the dominant cost if these went over libpq.
-//! - **Deferred to the shadow extension** (`walshadow_oracle`):
+//! - **Deferred to the shadow extension** (`walshadow`):
 //!   `jsonb`, arrays, `tsvector`, every other Tier 3 type. Decoder
 //!   surfaces these as [`crate::heap_decoder::ColumnValue::PgPending`]
 //!   carrying the raw on-disk bytes; resolution to text happens at

@@ -3,8 +3,8 @@
 coverage/
 preprocessed_configs/
 /results
-walshadow_oracle/out/
-walshadow_oracle/log/
+pgext/out/
+pgext/log/
 
 *.o
 *.bc

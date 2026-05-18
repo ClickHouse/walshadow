@@ -3,12 +3,12 @@
 //! Three drills:
 //!
 //! 1. `oracle_without_extension_falls_back_to_raw_bytes` — spawn a
-//!    plain PG without loading the `walshadow_oracle` extension,
+//!    plain PG without loading the `walshadow` extension,
 //!    confirm `Oracle::resolve_pending` returns `Ok(None)` and the
 //!    `fallback_raw` stat increments. Skipped silently when `initdb`
 //!    isn't on PATH.
 //! 2. `oracle_with_extension_resolves_tier3_disk_bytes` — same setup
-//!    plus `CREATE EXTENSION walshadow_oracle`. For each of
+//!    plus `CREATE EXTENSION walshadow`. For each of
 //!    `numeric` / `inet` / `interval` / `jsonb` / `int4[]`, synthesize
 //!    on-disk bytes, call `walshadow_decode_disk(oid, bytea)`, assert
 //!    the returned text matches PG's `typoutput`. Skipped silently
@@ -159,8 +159,8 @@ async fn oracle_with_extension_resolves_tier3_disk_bytes() {
         Ok(true) => {}
         Ok(false) => {
             eprintln!(
-                "skip: walshadow_oracle extension not installed on this PG \
-                 (run `cd walshadow_oracle && sudo make install`)"
+                "skip: walshadow extension not installed on this PG \
+                 (run `cd pgext && sudo make install`)"
             );
             return;
         }
@@ -231,7 +231,7 @@ async fn oracle_observer_resolves_pg_pending_to_text() {
     sh.start().expect("start");
     let _stop = StopOnDrop { sh: &sh };
     if !matches!(sh.try_load_oracle_extension(), Ok(true)) {
-        eprintln!("skip: walshadow_oracle extension not installed on this PG");
+        eprintln!("skip: walshadow extension not installed on this PG");
         return;
     }
 

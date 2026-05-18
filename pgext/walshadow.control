@@ -1,0 +1,4 @@
+comment = 'walshadow Phase 9 decode bridge: on-disk Datum → typoutput text'
+default_version = '0.1'
+module_pathname = '$libdir/walshadow'
+relocatable = true

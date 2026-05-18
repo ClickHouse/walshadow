@@ -38,7 +38,7 @@ docs that are not yet committed work sit alongside as peers.
   locally in `src/codecs.rs` (Tier 3 hot types — small, fixed
   layout); `jsonb`, arrays, `tsvector`, ranges, custom domains, …
   surface as `ColumnValue::PgPending` carrying raw on-disk bytes
-  and resolve at emit time via a new `walshadow_oracle` PG
+  and resolve at emit time via a new `walshadow` PG
   extension exposing `walshadow_decode_disk(oid, bytea) -> text`.
   Extension is optional — when absent the emitter falls back to
   writing raw on-disk bytes verbatim. `Oracle` module
@@ -49,7 +49,7 @@ docs that are not yet committed work sit alongside as peers.
   Two integration tests pin the extension-present vs absent
   paths, plus an `OracleObserver` round-trip. Extension ships
   its own pg_regress suite under
-  [`walshadow_oracle/`](../walshadow_oracle) covering varlena,
+  [`pgext/`](../pgext) covering varlena,
   fixed-width by-val 1/2/4/8, by-ref, cstring, STRICT NULL, and
   the two `ereport` branches. CI matrix gains
   `postgresql-server-dev-<major>` and runs the regress suite

@@ -1,4 +1,0 @@
-comment = 'walshadow Phase 9 oracle: on-disk Datum → typoutput text bridge'
-default_version = '0.1'
-module_pathname = '$libdir/walshadow_oracle'
-relocatable = true

@@ -174,7 +174,7 @@ struct Args {
     /// Phase 9 differential decode oracle: probe 1-in-`<N>` rows
     /// through shadow PG's `walshadow_decode_disk(oid, bytea)`
     /// extension function and assert the local decoder matches. `0`
-    /// (default) disables. Requires the `walshadow_oracle` extension
+    /// (default) disables. Requires the `walshadow` extension
     /// installed on shadow PG; absent extension surfaces as
     /// `oracle fallback=N` in the status line and the daemon
     /// silently ships raw on-disk bytes for `PgPending` types.

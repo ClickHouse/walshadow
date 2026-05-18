@@ -10,7 +10,7 @@
 //!    `walshadow_decode_disk(oid, bytea) -> text` on shadow PG. Output
 //!    replaces the `PgPending` with a [`ColumnValue::Text`] so the
 //!    emitter can ship it as a CH `String`. When the
-//!    `walshadow_oracle` extension is **absent** the resolver returns
+//!    `walshadow` extension is **absent** the resolver returns
 //!    `Ok(None)` and the emitter falls back to writing the raw on-disk
 //!    bytes — i.e. the extension is optional.
 //!
@@ -101,7 +101,7 @@ pub struct Oracle {
 }
 
 impl Oracle {
-    /// Connect to shadow PG and probe for the `walshadow_oracle`
+    /// Connect to shadow PG and probe for the `walshadow`
     /// extension. Absence is not a failure: the resolver returns
     /// `Ok(None)` thereafter, which signals "fall back to raw bytes".
     pub async fn connect(conninfo: &str, sample_rate: u32) -> Result<Self, OracleError> {
@@ -121,7 +121,7 @@ impl Oracle {
         })
     }
 
-    /// `true` iff the `walshadow_oracle` extension was visible at connect
+    /// `true` iff the `walshadow` extension was visible at connect
     /// time. Read by the daemon's status line so operators can confirm
     /// the optional-extension contract on boot.
     pub async fn has_extension(&self) -> bool {

@@ -259,21 +259,21 @@ impl Shadow {
         Ok(out.status.code() == Some(0))
     }
 
-    /// Optional Phase 9 hook: load the `walshadow_oracle` extension if
+    /// Optional Phase 9 hook: load the `walshadow` extension if
     /// it's installed system-wide on shadow's PG. Tolerates the absent
     /// case — the daemon falls back to raw on-disk bytes for Tier 3
     /// types that aren't in the local matrix. Returns `true` iff the
     /// extension is now present.
     ///
-    /// Operators install once via `(cd walshadow_oracle && sudo make install)`;
+    /// Operators install once via `(cd pgext && sudo make install)`;
     /// this method is a thin wrapper around the idempotent
-    /// `CREATE EXTENSION IF NOT EXISTS walshadow_oracle`.
+    /// `CREATE EXTENSION IF NOT EXISTS walshadow`.
     pub fn try_load_oracle_extension(&self) -> Result<bool> {
         // `IF NOT EXISTS` keeps repeat calls a no-op; absence raises
-        // `extension "walshadow_oracle" is not available`, which we
+        // `extension "walshadow" is not available`, which we
         // catch and surface as a clean "false" rather than failing the
         // bootstrap.
-        match self.psql_one("CREATE EXTENSION IF NOT EXISTS walshadow_oracle") {
+        match self.psql_one("CREATE EXTENSION IF NOT EXISTS walshadow") {
             Ok(_) => Ok(true),
             Err(ShadowError::Process { stderr, .. }) if stderr.contains("not available") => {
                 Ok(false)

@@ -1,6 +1,6 @@
 /*
- * walshadow_oracle — shadow-PG extension used by walshadow's Phase 9
- * differential decode oracle.
+ * walshadow — shadow-PG extension used by walshadow's Phase 9
+ * differential on-disk decode bridge.
  *
  * Exposes one SQL function:
  *
@@ -9,9 +9,9 @@
  * Reconstructs a Datum from on-disk bytes (varlena types get a fresh
  * 4-byte header wrapped around the bytea body; fixed-width types are
  * copied verbatim into a Datum slot), then runs the type's typoutput
- * function. The caller — walshadow's decoder running outside shadow —
- * hands over the bytes it pulled from the source's WAL stream, and gets
- * back the same text PG would render via `relation::text` from inside.
+ * function. Caller — walshadow's decoder running outside shadow —
+ * hands over bytes it pulled from source's WAL stream, gets back the
+ * same text PG would render via `relation::text` from inside.
  *
  * Optional dependency: walshadow falls back to writing raw on-disk
  * bytes into CH when this extension isn't loaded on shadow PG.

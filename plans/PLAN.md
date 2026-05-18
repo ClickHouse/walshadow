@@ -664,7 +664,7 @@ Landed as a hybrid. `numeric` / `inet` / `cidr` / `interval` decoded
 locally in [`src/codecs.rs`](../src/codecs.rs); `jsonb`, arrays,
 `tsvector`, ranges, custom domains, every other long-tail Tier 3
 type surface as `ColumnValue::PgPending` and resolve at emit time
-via a `walshadow_oracle` shadow-PG extension exposing
+via a `walshadow` shadow-PG extension exposing
 `walshadow_decode_disk(oid, bytea) -> text` (reconstructs a Datum
 from raw on-disk bytes and runs `typoutput`). Extension is optional
 — absent shadow extension makes the emitter fall back to writing

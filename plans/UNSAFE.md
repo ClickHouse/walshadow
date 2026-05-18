@@ -106,7 +106,7 @@ Two fix shapes:
   invalid UTF-8 collapse to `None`.
 
 Pick `&[u8]`. The consumer in
-[`walshadow_oracle`](../walshadow_oracle/) currently converts to owned
+[`walshadow`](../src/) currently converts to owned
 `String` lossily at the boundary anyway; returning `&[u8]` is closer to
 truth and removes a hidden allocation in the hot path
 (`TypeRef::format` already uses `from_utf8_lossy`, which is the
@@ -114,7 +114,7 @@ explicit-cost equivalent — callers who want a `String` can do the same).
 
 Touch every consumer site:
 
-- [`walshadow_oracle/src/.../mod.rs`](../walshadow_oracle/) wherever
+- [`walshadow src/`](../src/) wherever
   `column_name` or `TypeRef::name` is currently consumed as `&str`.
 - [`clickhouse-c-rs/examples/spawn_clickhouse_local.rs`](../clickhouse-c-rs/examples/spawn_clickhouse_local.rs).
 - [`clickhouse-c-rs/tests/clickhouse_local.rs`](../clickhouse-c-rs/tests/clickhouse_local.rs)
@@ -221,7 +221,7 @@ impl<'fd> PosixIo<'fd> {
 ```
 
 This is the largest mechanical change: every `PosixIo::new(raw_fd)`
-caller in [`walshadow_oracle`](../walshadow_oracle/), the example, and
+caller in [`walshadow`](../src/), the example, and
 the tests becomes `PosixIo::new(socket.as_fd())`. The example's
 `into_raw_fd` + manual `close` dance disappears — the `ChildStdout`
 stays in scope and gets dropped naturally.
@@ -306,7 +306,7 @@ ever arrives, change `Allocator: !Copy` and keep the Box pin honest.
 - `cargo build --features lz4,zstd` clean.
 - `cargo test -p clickhouse-c-rs` plus a new `compile_fail` test
   demonstrating the (1) UAF no longer compiles.
-- `walshadow_oracle` compiles against the new API; existing integration
+- `walshadow` compiles against the new API; existing integration
   tests pass.
 - README "Safety model" section rewritten to reflect (a) Client now
   owns the IO+codec, (b) text accessors return `&[u8]`, (c) trust

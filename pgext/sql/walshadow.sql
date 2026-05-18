@@ -1,163 +1,86 @@
--- pg_regress suite for walshadow_oracle.
+-- pg_regress suite for walshadow.
 --
 -- Exercises every branch in walshadow_decode_disk: varlena, fixed
 -- pass-by-value (1/2/4/8 byte), fixed pass-by-reference, cstring, plus
 -- STRICT NULL handling and the two ereport paths. Fixed-width tests
 -- assume host-endian == little-endian, matching the on-disk Datum
 -- layout the function reconstructs.
-CREATE EXTENSION walshadow_oracle;
+
+CREATE EXTENSION walshadow;
+
 -- ---------- varlena -----------------------------------------------------
+
 -- text: bytea body == UTF-8 of the string.
 SELECT walshadow_decode_disk('text'::regtype, 'hello'::text::bytea) = 'hello' AS text_ascii;
- text_ascii 
-------------
- t
-(1 row)
-
 SELECT walshadow_decode_disk('text'::regtype, 'héllo wörld'::text::bytea) = 'héllo wörld' AS text_utf8;
- text_utf8 
------------
- t
-(1 row)
-
 SELECT walshadow_decode_disk('text'::regtype, ''::text::bytea) = '' AS text_empty;
- text_empty 
-------------
- t
-(1 row)
 
 -- varchar shares text's body shape.
 SELECT walshadow_decode_disk('varchar'::regtype, 'abc'::varchar::text::bytea) AS varchar_abc;
- varchar_abc 
--------------
- abc
-(1 row)
 
 -- bytea: identity (typoutput renders \x hex).
 SELECT walshadow_decode_disk('bytea'::regtype, '\xdeadbeef'::bytea) AS bytea_hex;
- bytea_hex  
-------------
- \xdeadbeef
-(1 row)
 
 -- json: free-form text body.
 SELECT walshadow_decode_disk('json'::regtype, '{"k":1}'::text::bytea) AS json_value;
- json_value 
-------------
- {"k":1}
-(1 row)
 
 -- Large varlena exercises the palloc + memcpy path past short-header
 -- territory; function always writes a 4-byte header regardless.
 SELECT walshadow_decode_disk('text'::regtype, repeat('a', 1024)::text::bytea) = repeat('a', 1024)
   AS text_1k;
- text_1k 
----------
- t
-(1 row)
 
 -- ---------- fixed pass-by-value ----------------------------------------
+
 -- int2: 2 bytes little-endian, value 42.
 SELECT walshadow_decode_disk('int2'::regtype, '\x2a00'::bytea) AS int2_42;
- int2_42 
----------
- 42
-(1 row)
 
 -- int4: 4 bytes little-endian, value 42.
 SELECT walshadow_decode_disk('int4'::regtype, '\x2a000000'::bytea) AS int4_42;
- int4_42 
----------
- 42
-(1 row)
 
 -- int4: negative value -1 → 0xffffffff.
 SELECT walshadow_decode_disk('int4'::regtype, '\xffffffff'::bytea) AS int4_neg1;
- int4_neg1 
------------
- -1
-(1 row)
 
 -- int8: 8 bytes little-endian, value 1234567890 = 0x499602d2.
 SELECT walshadow_decode_disk('int8'::regtype, '\xd202964900000000'::bytea) AS int8_val;
-  int8_val  
-------------
- 1234567890
-(1 row)
 
 -- bool: 1 byte.
 SELECT walshadow_decode_disk('bool'::regtype, '\x01'::bytea) AS bool_t;
- bool_t 
---------
- t
-(1 row)
-
 SELECT walshadow_decode_disk('bool'::regtype, '\x00'::bytea) AS bool_f;
- bool_f 
---------
- f
-(1 row)
 
 -- oid: 4 bytes little-endian, value 1234 = 0x4d2.
 SELECT walshadow_decode_disk('oid'::regtype, '\xd2040000'::bytea) AS oid_1234;
- oid_1234 
-----------
- 1234
-(1 row)
 
 -- float4: 4 bytes IEEE-754, value 1.0 = 0x3f800000.
 SELECT walshadow_decode_disk('float4'::regtype, '\x0000803f'::bytea) AS float4_one;
- float4_one 
-------------
- 1
-(1 row)
 
 -- float8: 8 bytes IEEE-754, value 1.0 = 0x3ff0000000000000.
 SELECT walshadow_decode_disk('float8'::regtype, '\x000000000000f03f'::bytea) AS float8_one;
- float8_one 
-------------
- 1
-(1 row)
 
 -- Extra raw bytes past typlen are ignored (memcpy honours typlen).
 SELECT walshadow_decode_disk('int4'::regtype, '\x2a000000ffffffff'::bytea) AS int4_42_trailing;
- int4_42_trailing 
-------------------
- 42
-(1 row)
 
 -- ---------- fixed pass-by-reference ------------------------------------
+
 -- uuid: 16 bytes verbatim.
 SELECT walshadow_decode_disk('uuid'::regtype,
     '\x00112233445566778899aabbccddeeff'::bytea) AS uuid_val;
-               uuid_val               
---------------------------------------
- 00112233-4455-6677-8899-aabbccddeeff
-(1 row)
 
 -- ---------- STRICT NULL handling ---------------------------------------
+
 -- Function is STRICT — either NULL arg short-circuits to NULL without
 -- entering the C body.
 SELECT walshadow_decode_disk(NULL::oid, '\x00'::bytea) IS NULL AS null_oid;
- null_oid 
-----------
- t
-(1 row)
-
 SELECT walshadow_decode_disk('int4'::regtype, NULL::bytea) IS NULL AS null_raw;
- null_raw 
-----------
- t
-(1 row)
 
 -- ---------- error paths ------------------------------------------------
+
 -- Unknown type oid (chosen well above any real catalog entry).
 SELECT walshadow_decode_disk(2147483647::oid, '\x00'::bytea);
-ERROR:  unknown type oid 2147483647
+
 -- Raw shorter than typlen for a fixed pass-by-value type.
 SELECT walshadow_decode_disk('int4'::regtype, ''::bytea);
-ERROR:  raw bytes 0 shorter than typlen 4 for oid 23
+
 -- Raw shorter than typlen for a fixed pass-by-reference type.
 SELECT walshadow_decode_disk('uuid'::regtype, '\x0011'::bytea);
-ERROR:  raw bytes 2 shorter than typlen 16 for oid 2950
-DROP EXTENSION walshadow_oracle;
+
+DROP EXTENSION walshadow;

@@ -51,7 +51,7 @@ exactly what the extension does, and Phase 9 ships it.
 | `Oracle` module: PgPending resolver + 1-in-N validator + reconnect-on-close + `OracleObserver` wrapper | [`src/oracle.rs`](../src/oracle.rs) | 3 lib unit tests (sampler on/off/1-in-N, stats summary) |
 | `walshadow-stream --validate <N>` CLI; oracle wires into the TupleObserver chain ahead of the inner emitter / metrics observer | [`src/bin/stream.rs`](../src/bin/stream.rs) | exercised by hand against the Phase 9 fixture cluster; CI doesn't currently spin the daemon |
 | `Shadow::try_load_oracle_extension` — `CREATE EXTENSION IF NOT EXISTS`, tolerant of "not available" | [`src/shadow.rs`](../src/shadow.rs) | Phase 9 integration tests gate on this returning `Ok(true)` |
-| `walshadow_oracle` PG extension — `walshadow_decode_disk(oid, bytea) -> text` reconstructs a Datum from on-disk bytes and runs `typoutput`. PGXS Makefile + .control + SQL + pg_regress suite. | [`walshadow_oracle/`](../walshadow_oracle) | 1 pg_regress test exercising varlena, by-val, by-ref, cstring, STRICT NULL, and the two `ereport` paths (`expected/walshadow_oracle.out`) — runs against every CI matrix PG under `--temp-instance` |
+| `walshadow` PG extension — `walshadow_decode_disk(oid, bytea) -> text` reconstructs a Datum from on-disk bytes and runs `typoutput`. PGXS Makefile + .control + SQL + pg_regress suite. | [`pgext/`](../pgext) | 1 pg_regress test exercising varlena, by-val, by-ref, cstring, STRICT NULL, and the two `ereport` paths (`expected/walshadow.out`) — runs against every CI matrix PG under `--temp-instance` |
 | CI: `postgresql-server-dev-<major>` added to install set; build + install + run pg_regress per matrix entry | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | the regress step itself is the test |
 | `plans/INDEX.md` updated with the Phase 9 entry | [`plans/INDEX.md`](INDEX.md) | doc-only |
 
@@ -62,7 +62,7 @@ Test counts (local, PG 18.4 + ClickHouse 25.8):
 - `cargo test --workspace --all-targets`: full suite green;
   159 lib tests (+19 from Phase 9), 3 phase9_oracle integration tests,
   no regressions in any earlier-phase suite.
-- `pg_regress walshadow_oracle`: 1 file, 86 statements, all pinned.
+- `pg_regress walshadow`: 1 file, 86 statements, all pinned.
 - Phase 8 e2e: still 1.5 s wall.
 
 Code size:
@@ -72,8 +72,8 @@ Code size:
 | `src/codecs.rs` | 644 |
 | `src/oracle.rs` | 452 |
 | `tests/phase9_oracle.rs` | 284 |
-| `walshadow_oracle/walshadow_oracle.c` | 125 |
-| `walshadow_oracle/sql/walshadow_oracle.sql` + `expected/…out` | 249 |
+| `pgext/walshadow.c` | 125 |
+| `pgext/sql/walshadow.sql` + `expected/…out` | 249 |
 | `src/heap_decoder.rs` / `ch_emitter.rs` / `spill.rs` / `shadow.rs` / `bin/stream.rs` net diff | ~270 |
 | CI yaml | ~32 |
 
@@ -122,7 +122,7 @@ class of typing bug doesn't hide.
 ### Extension is optional; fallback is raw on-disk bytes
 
 The user pushed back on a design that would make `CREATE EXTENSION
-walshadow_oracle` a mandatory deployment step ("extension should be
+walshadow` a mandatory deployment step ("extension should be
 optional, if not installed on pg just give back bytes"). The shape
 now: `Oracle::resolve_pending` probes for the extension at connect
 time and caches the result; absence makes every `PgPending` resolution
@@ -229,13 +229,13 @@ walshadow/src/spill.rs                        spill tags 20–24 for new variant
 walshadow/src/shadow.rs                       try_load_oracle_extension
 walshadow/src/bin/stream.rs                   --validate flag + Oracle wiring
 walshadow/tests/phase9_oracle.rs              new — integration tests (3)
-walshadow/walshadow_oracle/                   new — PGXS extension dir
-walshadow/walshadow_oracle/walshadow_oracle.c  C function
-walshadow/walshadow_oracle/walshadow_oracle.control  metadata
-walshadow/walshadow_oracle/walshadow_oracle--0.1.sql function DDL
-walshadow/walshadow_oracle/Makefile           PGXS + REGRESS target
-walshadow/walshadow_oracle/sql/                pg_regress test inputs
-walshadow/walshadow_oracle/expected/           pg_regress test fixtures
+walshadow/pgext/                              new — PGXS extension dir
+walshadow/pgext/walshadow.c                   C function
+walshadow/pgext/walshadow.control             metadata
+walshadow/pgext/walshadow--0.1.sql            function DDL
+walshadow/pgext/Makefile                      PGXS + REGRESS target
+walshadow/pgext/sql/                          pg_regress test inputs
+walshadow/pgext/expected/                     pg_regress test fixtures
 walshadow/.github/workflows/ci.yml            install dev headers, build + regress per PG
 walshadow/plans/INDEX.md                      Phase 9 entry
 walshadow/plans/PHASE9.md                     new (this doc)

@@ -240,7 +240,7 @@ pub enum ColumnValue {
     /// (numeric / inet / interval / json). Carries the raw on-disk
     /// body; resolution to text happens at emit time via a
     /// `walshadow_decode_disk(oid, bytea) -> text` SQL call against
-    /// shadow PG (the `walshadow_oracle` extension). When the extension
+    /// shadow PG (the `walshadow` extension). When the extension
     /// is unavailable, the emitter falls back to writing `<oid:N>` and
     /// bumping `unsupported_values`.
     PgPending {
@@ -1054,7 +1054,7 @@ fn varlena_to_value(att: &RelAttr, body: &[u8], _short: bool) -> ColumnValue {
             Ok(s) => ColumnValue::Json(s.to_owned()),
             Err(_) => ColumnValue::Bytea(body.to_vec()),
         },
-        // Tier 3 deferred — resolved by the walshadow_oracle extension
+        // Tier 3 deferred — resolved by the walshadow extension
         // on shadow PG at emit time. JSONBOID, range types, arrays
         // (typcategory='A'), tsvector etc. all route here. Carries the
         // full on-disk body so the SQL bridge can reconstruct the
@@ -1455,7 +1455,7 @@ mod tests {
         // Pick a varlena type OID that's outside walshadow's local
         // matrix (jsonb = 3802). Post-Phase-9 the varlena fall-through
         // produces a `PgPending` with raw bytes preserved — the
-        // walshadow_oracle shadow extension resolves the text form at
+        // walshadow shadow extension resolves the text form at
         // emit time, falling back to `unsupported_values` when the
         // extension is absent.
         let rel = descriptor(16397, vec![rel_attr(1, "j", 3802, -1, 'i')]);
