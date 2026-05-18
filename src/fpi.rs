@@ -270,4 +270,39 @@ mod tests {
         let out = restore_block_image(&block, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(out, page);
     }
+
+    #[test]
+    fn lz4_size_mismatch_short_payload() {
+        // Compressed payload represents fewer than BLCKSZ bytes; with hole_length=0
+        // body_len == BLCKSZ, decompress writes short, SizeMismatch fires.
+        let short = vec![0u8; 256];
+        let compressed = lz4_flex::block::compress(&short);
+        let block = build_block(compressed, BKP_IMAGE_COMPRESS_LZ4, 0, 0);
+        assert!(matches!(
+            restore_block_image(&block, XLP_PAGE_MAGIC_PG15),
+            Err(FpiError::SizeMismatch { .. }),
+        ));
+    }
+
+    #[test]
+    fn zstd_size_mismatch_short_payload() {
+        let short = vec![0u8; 256];
+        let compressed = zstd::bulk::compress(&short, 0).expect("zstd compress");
+        let block = build_block(compressed, BKP_IMAGE_COMPRESS_ZSTD, 0, 0);
+        assert!(matches!(
+            restore_block_image(&block, XLP_PAGE_MAGIC_PG15),
+            Err(FpiError::SizeMismatch { .. }),
+        ));
+    }
+
+    #[test]
+    fn pglz_corrupt_image_errors() {
+        // pglz::decompress_into runs with check_complete=true, so any size
+        // mismatch returns None and surfaces FpiError::Pglz. Cover that arm.
+        let block = build_block(vec![0u8; 16], BKP_IMAGE_COMPRESS_PGLZ, 0, 0);
+        assert!(matches!(
+            restore_block_image(&block, XLP_PAGE_MAGIC_PG15),
+            Err(FpiError::Pglz),
+        ));
+    }
 }

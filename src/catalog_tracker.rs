@@ -702,4 +702,74 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(t.invalidation_signals_sent, 0);
     }
+
+    #[test]
+    fn fresh_tracker_is_empty() {
+        let t = CatalogTracker::new();
+        assert!(t.is_empty(), "no learned nodes yet");
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn add_grows_len_idempotently() {
+        let mut t = CatalogTracker::new();
+        t.add(5, 50000);
+        t.add(5, 50000); // duplicate — set absorbs it
+        t.add(5, 50001);
+        assert!(!t.is_empty());
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn relmap_update_with_wrong_nbytes_is_ignored() {
+        let mut t = CatalogTracker::new();
+        let mut r = relmap_record(5, &[(1259, 50000)]);
+        // Patch nbytes (offset 8..12 in main_data) to something other than
+        // REL_MAP_FILE_SIZE. The decoder must short-circuit before reading.
+        r.main_data[8..12].copy_from_slice(&12345i32.to_le_bytes());
+        t.observe(&r);
+        assert!(!t.is_catalog(5, 50000));
+        assert_eq!(t.relmap_updates, 1);
+    }
+
+    #[test]
+    fn relmap_update_with_wrong_magic_is_ignored() {
+        let mut t = CatalogTracker::new();
+        let mut r = relmap_record(5, &[(1259, 50000)]);
+        // Magic is the first 4 bytes of the rel-map-file (offset 12..16 of
+        // main_data: 12 header + 0 magic offset).
+        r.main_data[12..16].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        t.observe(&r);
+        assert!(!t.is_catalog(5, 50000));
+    }
+
+    #[test]
+    fn relmap_update_rejects_oversized_num_mappings() {
+        let mut t = CatalogTracker::new();
+        let mut r = relmap_record(5, &[(1259, 50000)]);
+        // num_mappings sits at main_data[16..20] (12 header + 4 magic).
+        r.main_data[16..20].copy_from_slice(&((MAX_MAPPINGS + 1) as i32).to_le_bytes());
+        t.observe(&r);
+        assert!(!t.is_catalog(5, 50000));
+    }
+
+    #[test]
+    fn relmap_update_skips_zero_mapping_entries() {
+        let mut t = CatalogTracker::new();
+        // Entries with mapoid=0 or filenum=0 are absentees; they must
+        // not pollute the catalog set.
+        let r = relmap_record(5, &[(0, 50000), (1259, 0)]);
+        t.observe(&r);
+        assert!(t.is_empty(), "zero-tagged entries must be skipped");
+    }
+
+    #[test]
+    fn relmap_update_with_truncated_main_data_is_ignored() {
+        let mut t = CatalogTracker::new();
+        let mut r = relmap_record(5, &[(1259, 50000)]);
+        // Lop off the relmap body so len < 12 + REL_MAP_FILE_SIZE.
+        r.main_data.truncate(4);
+        t.observe(&r);
+        assert!(!t.is_catalog(5, 50000));
+    }
 }

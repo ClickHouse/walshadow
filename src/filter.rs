@@ -212,6 +212,52 @@ mod tests {
     }
 
     #[test]
+    fn empty_class_with_known_relation_is_classified_against_tracker() {
+        use crate::main_data::XLOG_HEAP2_NEW_CID;
+        // XLOG_HEAP2_NEW_CID carries a locator in main_data — Class::Empty
+        // with `relation_for_empty(Some(rel))`. Build one targeting a
+        // catalog filenode (oid < 16384) → Keep; one targeting a user
+        // filenode → Drop.
+        fn new_cid_main_data(db: u32, rel: u32) -> Vec<u8> {
+            let mut md = Vec::with_capacity(34);
+            md.extend_from_slice(&100u32.to_le_bytes()); // top_xid
+            md.extend_from_slice(&1u32.to_le_bytes()); // cmin
+            md.extend_from_slice(&2u32.to_le_bytes()); // cmax
+            md.extend_from_slice(&0u32.to_le_bytes()); // combocid
+            md.extend_from_slice(&1663u32.to_le_bytes()); // spc
+            md.extend_from_slice(&db.to_le_bytes());
+            md.extend_from_slice(&rel.to_le_bytes());
+            md.extend_from_slice(&[0u8; 6]); // target_tid
+            md
+        }
+        fn new_cid_record(db: u32, rel: u32) -> XLogRecord {
+            XLogRecord {
+                header: wal_rs::pg::walparser::XLogRecordHeader {
+                    resource_manager_id: RmId::Heap2 as u8,
+                    info: XLOG_HEAP2_NEW_CID,
+                    total_record_length: 64,
+                    ..Default::default()
+                },
+                main_data: new_cid_main_data(db, rel),
+                ..Default::default()
+            }
+        }
+        let mut f = Filter::new();
+        // catalog filenode (1259 = pg_class) → Keep
+        assert_eq!(f.decide(&new_cid_record(5, 1259)), Decision::Keep);
+        // user filenode → Drop
+        assert_eq!(f.decide(&new_cid_record(5, 20000)), Decision::Drop);
+    }
+
+    #[test]
+    fn default_matches_new_and_rmgr_label_round_trips() {
+        let _: Filter = Filter::default();
+        let r = rec(RmId::Heap, &[]);
+        let label = Filter::rmgr_label(&r);
+        assert!(!label.is_empty());
+    }
+
+    #[test]
     fn stats_track_kept_dropped() {
         let mut f = Filter::new();
         f.decide(&rec(RmId::Heap, &[(5, 1259)]));

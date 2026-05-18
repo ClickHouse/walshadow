@@ -1,0 +1,453 @@
+//! End-to-end drill against the `walshadow-stream` binary.
+//!
+//! Spawns the daemon as a subprocess pointed at a basebackup-bootstrapped
+//! source / shadow PG pair, drives an INSERT/UPDATE/DELETE workload, and
+//! asserts shadow replays the workload before the daemon exits via its
+//! `--max-segments` cap. Exercises [bin/stream.rs]'s argv parsing,
+//! `run()` setup (preflight + tracker seed + ShadowCatalog connect +
+//! cursor write + status loop), the metrics endpoint, retention sweeper
+//! poll path, and the partial-segment flush on shutdown — paths the
+//! phase8/phase12 fixtures don't reach because they re-implement the
+//! daemon's sink chain inline rather than driving the binary.
+//!
+//! Skipped silently when `initdb` or `pg_basebackup` aren't on `$PATH`.
+
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use walshadow::shadow::{Shadow, ShadowConfig};
+
+// Reserved port slot for this test binary — 56170-range, distinct
+// from phase8 (56100) / phase12 (56140) so concurrent `cargo test`
+// invocations don't trip over each other.
+const SOURCE_PORT: u16 = 56171;
+const SHADOW_PORT: u16 = 56172;
+const METRICS_PORT: u16 = 56173;
+
+fn pg_available() -> bool {
+    Command::new("initdb")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn pg_basebackup_available() -> bool {
+    Command::new("pg_basebackup")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn make_pg(tmp: &tempfile::TempDir, name: &str, port: u16) -> Shadow {
+    let mut cfg = ShadowConfig::new(
+        tmp.path().join(format!("{name}-data")),
+        tmp.path().join(format!("{name}-filtered")),
+    );
+    cfg.port = port;
+    cfg.socket_dir = tmp.path().join(format!("{name}-sock"));
+    cfg.ctl_timeout = Duration::from_secs(60);
+    fs::create_dir_all(&cfg.filter_out_dir).unwrap();
+    fs::create_dir_all(&cfg.socket_dir).unwrap();
+    Shadow::new(cfg)
+}
+
+// Source needs wal_level=logical for the preflight gate +
+// max_wal_senders so both pg_basebackup and the daemon's
+// START_REPLICATION can attach.
+fn append_source_conf(sh: &Shadow) {
+    let path = sh.config().data_dir.join("postgresql.conf");
+    let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(f, "\n# walshadow bin_stream_e2e source overrides").unwrap();
+    writeln!(f, "wal_level = logical").unwrap();
+    writeln!(f, "max_wal_senders = 4").unwrap();
+}
+
+struct StopOnDrop<'a> {
+    sh: &'a Shadow,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.sh.stop();
+    }
+}
+
+fn pg_basebackup(source: &Shadow, dest: &Path) -> Result<()> {
+    let cfg = source.config();
+    let out = Command::new("pg_basebackup")
+        .args([
+            "-h",
+            cfg.socket_dir.to_str().context("source sock not utf8")?,
+            "-p",
+            &cfg.port.to_string(),
+            "-U",
+            "postgres",
+            "-D",
+            dest.to_str().context("dest not utf8")?,
+            "-X",
+            "stream",
+            "-c",
+            "fast",
+            "-w",
+            "--no-sync",
+        ])
+        .output()
+        .context("spawn pg_basebackup")?;
+    if !out.status.success() {
+        bail!(
+            "pg_basebackup failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn rewrite_for_shadow(data_dir: &Path, port: u16, socket_dir: &Path) -> Result<()> {
+    let conf = data_dir.join("postgresql.conf");
+    let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
+    writeln!(f, "\n# walshadow bin_stream_e2e shadow overrides")?;
+    writeln!(f, "port = {port}")?;
+    writeln!(f, "unix_socket_directories = '{}'", socket_dir.display())?;
+    writeln!(f, "listen_addresses = ''")?;
+    writeln!(f, "hot_standby = on")?;
+    writeln!(f, "autovacuum = off")?;
+    writeln!(f, "fsync = off")?;
+    writeln!(f, "wal_retrieve_retry_interval = '100ms'")?;
+    Ok(())
+}
+
+fn enable_recovery(data_dir: &Path, restore_from: &Path) -> Result<()> {
+    fs::write(data_dir.join("standby.signal"), b"")?;
+    let conf = data_dir.join("postgresql.conf");
+    let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
+    writeln!(f, "\n# walshadow bin_stream_e2e recovery")?;
+    writeln!(f, "restore_command = 'cp {}/%f %p'", restore_from.display())?;
+    writeln!(f, "recovery_target_timeline = 'latest'")?;
+    Ok(())
+}
+
+/// Poll a TCP listener until accept succeeds or the deadline expires.
+/// Used as a coarse "daemon finished init" gate via its metrics bind.
+fn wait_for_listen(addr: SocketAddr, deadline: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    bail!("nothing listening on {addr} after {deadline:?}");
+}
+
+/// Issue a minimal HTTP/1.0 GET against the daemon's metrics endpoint
+/// and return the response body. Hand-rolled rather than pulling a
+/// reqwest-class dep into dev-deps — the endpoint is a 2xx-only
+/// localhost server.
+fn http_get(addr: SocketAddr, path: &str) -> Result<String> {
+    let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .with_context(|| format!("connect {addr}"))?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    write!(sock, "GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+    let mut buf = Vec::new();
+    sock.read_to_end(&mut buf)?;
+    let txt = String::from_utf8_lossy(&buf).into_owned();
+    let body_start = txt.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    Ok(txt[body_start..].to_string())
+}
+
+/// Wait for a child to exit, polling every 100 ms up to `deadline`.
+/// Returns the exit status on success; kills + reaps the child on
+/// timeout so a stuck daemon doesn't outlive the test.
+fn wait_with_timeout(child: &mut Child, deadline: Duration) -> Result<std::process::ExitStatus> {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match child.try_wait()? {
+            Some(s) => return Ok(s),
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    bail!("walshadow-stream did not exit within {deadline:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bin_stream_replicates_segments_and_serves_metrics() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    if !pg_basebackup_available() {
+        eprintln!("skip: no pg_basebackup on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // 1. Source PG, schema before basebackup so shadow inherits the
+    //    same oids/filenodes the daemon's tracker seeds against.
+    let source = make_pg(&tmp, "source", SOURCE_PORT);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("source base conf");
+    append_source_conf(&source);
+    source.start().expect("start source");
+    let _src_stop = StopOnDrop { sh: &source };
+
+    source
+        .apply_schema_dump(
+            "CREATE SCHEMA bs;\n\
+             CREATE TABLE bs.t (id bigint PRIMARY KEY, payload text);\n\
+             ALTER TABLE bs.t REPLICA IDENTITY FULL;\n",
+        )
+        .expect("apply source schema");
+
+    // 2. pg_basebackup -> shadow data dir. Retarget + standby.signal +
+    //    restore_command so shadow boots into recovery against the
+    //    daemon's --out-dir.
+    let shadow_data = tmp.path().join("shadow-data");
+    pg_basebackup(&source, &shadow_data).expect("pg_basebackup");
+    source.psql_one("SELECT pg_switch_wal()").expect("rotate");
+
+    let shadow_filter_dir = tmp.path().join("filtered");
+    fs::create_dir_all(&shadow_filter_dir).unwrap();
+    let shadow_sock = tmp.path().join("shadow-sock");
+    fs::create_dir_all(&shadow_sock).unwrap();
+    rewrite_for_shadow(&shadow_data, SHADOW_PORT, &shadow_sock).expect("retarget shadow conf");
+    enable_recovery(&shadow_data, &shadow_filter_dir).expect("enable shadow recovery");
+
+    let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
+    shadow_cfg.port = SHADOW_PORT;
+    shadow_cfg.socket_dir = shadow_sock.clone();
+    shadow_cfg.ctl_timeout = Duration::from_secs(60);
+    let shadow = Shadow::new(shadow_cfg);
+    if let Err(e) = shadow.start() {
+        let log = fs::read_to_string(shadow_data.join("startup.log"))
+            .unwrap_or_else(|_| "<no startup.log>".into());
+        panic!("start shadow standby failed: {e}\nstartup.log:\n{log}");
+    }
+    let _shd_stop = StopOnDrop { sh: &shadow };
+    assert!(
+        shadow.is_in_recovery().expect("probe in-recovery"),
+        "shadow must boot in recovery",
+    );
+
+    // 3. Spawn walshadow-stream. `--max-segments=1` makes the daemon
+    //    exit cleanly after the workload's pg_switch_wal seals a
+    //    segment; `--metrics-bind` doubles as a readiness probe.
+    let spill_dir = tmp.path().join("spill");
+    fs::create_dir_all(&spill_dir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_walshadow-stream");
+    let stderr_path = tmp.path().join("daemon.stderr.log");
+    let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{METRICS_PORT}").parse().unwrap();
+    let mut child = Command::new(bin)
+        .args([
+            "--host",
+            source.config().socket_dir.to_str().unwrap(),
+            "--port",
+            &SOURCE_PORT.to_string(),
+            "--user",
+            "postgres",
+            "--dbname",
+            "postgres",
+            "--sslmode",
+            "disable",
+            "--out-dir",
+            shadow_filter_dir.to_str().unwrap(),
+            "--shadow-socket-dir",
+            shadow_sock.to_str().unwrap(),
+            "--shadow-port",
+            &SHADOW_PORT.to_string(),
+            "--shadow-user",
+            "postgres",
+            "--shadow-dbname",
+            "postgres",
+            "--spill-dir",
+            spill_dir.to_str().unwrap(),
+            "--max-segments",
+            "1",
+            "--status-interval",
+            "1",
+            "--metrics-bind",
+            &metrics_addr.to_string(),
+            // Retention disabled — no shadow_replay sweeper churn
+            // racing the test's max-segments exit. Default would
+            // poll shadow on a 60s cadence; we'd never observe it.
+            "--retention-bytes",
+            "0",
+        ])
+        .env("RUST_LOG", "warn,walshadow=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .process_group(0)
+        .spawn()
+        .expect("spawn walshadow-stream");
+
+    let mut daemon_killed = false;
+    let result = (|| -> Result<()> {
+        // 4. Wait for the daemon's metrics endpoint — post-preflight,
+        //    post-shadow-connect, before the WAL pump's main loop.
+        wait_for_listen(metrics_addr, Duration::from_secs(30))
+            .context("daemon metrics endpoint never came up")?;
+
+        // 5. Scrape /metrics. Exercises metrics::serve + handle_client
+        //    end-to-end. Body should mention at least one of the
+        //    well-known walshadow_ counters.
+        let body = http_get(metrics_addr, "/metrics").context("metrics scrape")?;
+        assert!(
+            body.contains("walshadow_source_received_lsn") || body.contains("walshadow_uptime"),
+            "expected walshadow_* counter in /metrics body: {body}",
+        );
+
+        // 6. Drive workload. The daemon filters user-heap WAL records
+        //    (rmgr=HEAP, class=User → replaced with XLOG_NOOP) — only
+        //    catalog records ship to shadow. So the assertion target is
+        //    DDL: CREATE TABLE bs.t2 must materialise on shadow after
+        //    replay, while bs.t's INSERTs stay invisible there (their
+        //    destination is the CH emitter, exercised by phase8).
+        //    Autocommit per `-c` keeps each commit in the same segment
+        //    as its records; pg_switch_wal seals the work.
+        let driver_sock = source.config().socket_dir.clone();
+        let out = Command::new("psql")
+            .args([
+                "-h",
+                driver_sock.to_str().unwrap(),
+                "-p",
+                &SOURCE_PORT.to_string(),
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "CREATE TABLE bs.t2 (id int PRIMARY KEY, payload text)",
+                "-c",
+                "INSERT INTO bs.t SELECT g, repeat('x', g)::text FROM generate_series(1, 5) g",
+                "-c",
+                "SELECT pg_switch_wal()",
+            ])
+            .output()
+            .context("spawn workload psql")?;
+        if !out.status.success() {
+            bail!(
+                "workload psql failed: {}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+
+        // 7. Wait for the daemon to hit `--max-segments=1` and exit
+        //    cleanly. 60s budget covers basebackup retry + status-tick
+        //    cadence on slow CI.
+        let status =
+            wait_with_timeout(&mut child, Duration::from_secs(60)).context("daemon exit")?;
+        daemon_killed = true;
+        assert!(
+            status.success(),
+            "daemon exit status: {status:?}\nstderr:\n{}",
+            fs::read_to_string(&stderr_path).unwrap_or_default(),
+        );
+
+        // 8. Wait for shadow to replay past the source's final LSN.
+        //    The daemon flushed the partial segment + sealed one full
+        //    segment via pg_switch_wal; shadow's restore_command poll
+        //    catches up on the 100ms cadence we configured.
+        let target_text = source
+            .psql_one("SELECT pg_current_wal_lsn()::text")
+            .expect("source lsn");
+        let target = walshadow::shadow::parse_pg_lsn(&target_text).expect("parse target lsn");
+        let observed = shadow
+            .wait_for_replay(target, Duration::from_secs(30))
+            .expect("shadow replay catches up");
+        assert!(
+            observed >= target,
+            "shadow replay {observed:X} < target {target:X}",
+        );
+
+        // 9a. Catalog mirroring: bs.t2 was created during the
+        //     workload — DDL records pass through the filter, shadow
+        //     replays them, the table must exist on both sides with
+        //     matching column count.
+        let src_t2_cols = source
+            .psql_one(
+                "SELECT count(*)::text FROM information_schema.columns \
+                 WHERE table_schema='bs' AND table_name='t2'",
+            )
+            .expect("source t2 cols");
+        let shd_t2_cols = shadow
+            .psql_one(
+                "SELECT count(*)::text FROM information_schema.columns \
+                 WHERE table_schema='bs' AND table_name='t2'",
+            )
+            .expect("shadow t2 cols");
+        assert_eq!(src_t2_cols, "2", "source: bs.t2 should have 2 columns");
+        assert_eq!(
+            shd_t2_cols, src_t2_cols,
+            "shadow catalog did not mirror the CREATE TABLE",
+        );
+
+        // 9b. Heap filtering: bs.t's INSERTs do NOT replicate to shadow
+        //     (rmgr=HEAP, class=User → XLOG_NOOP). Source has 5 rows;
+        //     shadow has 0. Without this assertion we'd miss a
+        //     regression that accidentally widens the filter to keep
+        //     user-heap records.
+        let src_rows = source
+            .psql_one("SELECT count(*)::text FROM bs.t")
+            .expect("source bs.t count");
+        let shd_rows = shadow
+            .psql_one("SELECT count(*)::text FROM bs.t")
+            .expect("shadow bs.t count");
+        assert_eq!(src_rows, "5", "source: bs.t should have 5 inserted rows");
+        assert_eq!(
+            shd_rows, "0",
+            "shadow's bs.t must stay empty — daemon filter should drop user-heap WAL",
+        );
+
+        // 10. Daemon side-effects: cursor + at least one filtered
+        //     segment file landed under --out-dir.
+        assert!(
+            spill_dir.join("cursor.bin").exists(),
+            "cursor.bin should be written before clean exit",
+        );
+        let seg_files: Vec<_> = fs::read_dir(&shadow_filter_dir)
+            .expect("read filter dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            // 24-hex-char filenames are sealed WAL segments;
+            // `.partial` is the in-progress one flushed on shutdown.
+            .filter(|n| n.len() == 24 && n.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect();
+        assert!(
+            !seg_files.is_empty(),
+            "no sealed segments under {}: {:?}",
+            shadow_filter_dir.display(),
+            fs::read_dir(&shadow_filter_dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect::<Vec<_>>(),
+        );
+
+        Ok(())
+    })();
+
+    if !daemon_killed {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Err(e) = result {
+        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}

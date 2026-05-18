@@ -228,6 +228,19 @@ mod tests {
         assert_eq!(report.bytes_freed, 0);
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn skips_files_with_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let raw = std::ffi::OsStr::from_bytes(&[0xFF, 0xFE, b'.', b'b', b'i', b'n']);
+        std::fs::write(dir.join(raw), b"x").unwrap();
+        let report = trim_below_lsn(dir, u64::MAX).await.unwrap();
+        assert_eq!(report.segments_removed, 0);
+        assert!(dir.join(raw).exists());
+    }
+
     #[test]
     fn classify_picks_segment_manifest_partial() {
         let s = seg_name(1, 0, 9);

@@ -900,4 +900,174 @@ mod tests {
             assert_eq!(cur.pos, out.len(), "trailing bytes for {v:?}");
         }
     }
+
+    #[test]
+    fn encode_decode_remaining_value_variants_round_trip() {
+        use crate::codecs::{InetValue, IntervalValue, NumericKind, PGSQL_AF_INET6};
+        let cases = [
+            ColumnValue::Numeric(NumericKind::Finite("3.14".into())),
+            ColumnValue::Numeric(NumericKind::NaN),
+            ColumnValue::Numeric(NumericKind::PInf),
+            ColumnValue::Numeric(NumericKind::NInf),
+            ColumnValue::Inet(InetValue {
+                family: PGSQL_AF_INET6,
+                bits: 128,
+                is_cidr: false,
+                addr: vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
+            }),
+            ColumnValue::Interval(IntervalValue {
+                months: -3,
+                days: 14,
+                micros: 123_456,
+            }),
+            ColumnValue::Json("{\"a\":1}".into()),
+            ColumnValue::PgPending {
+                type_oid: 3802,
+                raw: vec![0xAA, 0xBB, 0xCC],
+            },
+        ];
+        for v in cases {
+            let mut out = Vec::new();
+            encode_value(&mut out, &v);
+            let mut cur = Cursor::new(&out);
+            let decoded = decode_value(&mut cur).unwrap();
+            assert_eq!(decoded, v, "round-trip mismatch for {v:?}");
+            assert_eq!(cur.pos, out.len(), "trailing bytes for {v:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn round_trip_all_heap_ops() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        // dir() accessor smoke
+        assert_eq!(store.dir(), tmp.path());
+        let mut w = store.writer(11, 0x500).await.unwrap();
+        // path() accessor smoke
+        assert!(w.path().exists());
+        for op in [
+            HeapOp::Insert,
+            HeapOp::Update,
+            HeapOp::HotUpdate,
+            HeapOp::Delete,
+        ] {
+            let mut h = sample_heap(11, 0x600);
+            h.op = op;
+            // For Update/HotUpdate/Delete an `old` tuple is expected; carry one.
+            h.old = Some(DecodedTuple {
+                columns: vec![Some(ColumnValue::Int4(42))],
+                partial: false,
+            });
+            w.write(&SpillEntry::Heap(Box::new(h))).await.unwrap();
+        }
+        let mut r = w.finish().await.unwrap();
+        assert!(r.path().to_str().unwrap().contains("xid-"));
+        let mut ops = Vec::new();
+        while let Some(e) = r.next().await.unwrap() {
+            if let SpillEntry::Heap(b) = e {
+                ops.push(b.op);
+            }
+        }
+        assert_eq!(
+            ops,
+            vec![
+                HeapOp::Insert,
+                HeapOp::Update,
+                HeapOp::HotUpdate,
+                HeapOp::Delete
+            ],
+        );
+        r.unlink().await.unwrap();
+    }
+
+    #[test]
+    fn cursor_short_read_surfaces_format_error() {
+        let mut cur = Cursor::new(&[1u8, 2]);
+        let err = cur.u32().unwrap_err();
+        assert!(matches!(err, SpillError::Format { offset: 0, .. }));
+    }
+
+    #[test]
+    fn cursor_string_rejects_invalid_utf8() {
+        // length 2, body is 0xFF 0xFE — invalid as UTF-8.
+        let buf = [2u8, 0, 0, 0, 0xFF, 0xFE];
+        let mut cur = Cursor::new(&buf);
+        let err = cur.string().unwrap_err();
+        assert!(matches!(err, SpillError::Format { .. }));
+    }
+
+    #[test]
+    fn decode_value_rejects_unknown_tag() {
+        let mut cur = Cursor::new(&[99u8]);
+        let err = decode_value(&mut cur).unwrap_err();
+        match err {
+            SpillError::Format { detail, .. } => {
+                assert!(detail.contains("unknown ColumnValue tag"), "{detail}");
+            }
+            other => panic!("expected Format, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_value_rejects_unknown_numeric_kind() {
+        // tag=20 (Numeric), then a bad NumericKind sub-tag.
+        let buf = [20u8, 99u8];
+        let mut cur = Cursor::new(&buf);
+        let err = decode_value(&mut cur).unwrap_err();
+        match err {
+            SpillError::Format { detail, .. } => {
+                assert!(detail.contains("unknown NumericKind tag"), "{detail}");
+            }
+            other => panic!("expected Format, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_heap_rejects_unknown_op_tag() {
+        // 4 u32 (spc/db/rel/xid) + u64 source_lsn = 24 bytes, then bad op 99.
+        let mut buf = vec![0u8; 24];
+        buf.push(99u8);
+        let mut cur = Cursor::new(&buf);
+        let err = decode_heap(&mut cur).unwrap_err();
+        match err {
+            SpillError::Format { detail, .. } => {
+                assert!(detail.contains("unknown HeapOp tag"), "{detail}");
+            }
+            other => panic!("expected Format, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_unlink_tolerates_already_gone() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let w = store.writer(13, 0).await.unwrap();
+        let path = w.path().to_path_buf();
+        // Remove the file out from under the writer.
+        tokio::fs::remove_file(&path).await.unwrap();
+        // unlink() must swallow NotFound.
+        w.unlink().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_unlink_tolerates_already_gone() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let mut w = store.writer(14, 0).await.unwrap();
+        w.write(&SpillEntry::Heap(Box::new(sample_heap(14, 0))))
+            .await
+            .unwrap();
+        let r = w.finish().await.unwrap();
+        tokio::fs::remove_file(r.path()).await.unwrap();
+        r.unlink().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_returns_ok_when_dir_vanished() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        // Rip the dir out — read_dir will return NotFound, which clear must absorb.
+        tokio::fs::remove_dir_all(tmp.path()).await.unwrap();
+        store.clear().await.unwrap();
+    }
 }

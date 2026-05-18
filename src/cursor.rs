@@ -277,6 +277,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn read_surfaces_non_not_found_io_error() {
+        // `cursor.bin` exists as a directory — tokio::fs::read returns
+        // IsADirectory (not NotFound), so the error must propagate.
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(CURSOR_FILENAME)).unwrap();
+        let err = read(tmp.path()).await.unwrap_err();
+        assert!(
+            matches!(err, CursorError::Io(_)),
+            "expected Io error, got {err:?}",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn second_write_overwrites_first() {
         let tmp = tempdir().unwrap();
         let mut c = sample();

@@ -73,9 +73,8 @@ pub fn noop_replace(record_bytes: &mut [u8]) -> Result<(), RewriteError> {
         body[0] = XLR_BLOCK_ID_DATA_SHORT;
         body[1] = (body_len - MIN_SHORT_BODY) as u8;
     } else {
-        if body_len < MIN_LONG_BODY {
-            return Err(RewriteError::TooSmall(xl_tot_len));
-        }
+        // body_len > MAX_SHORT_BODY (>= 258) > MIN_LONG_BODY (5), so the
+        // LONG-marker length always fits.
         body[0] = XLR_BLOCK_ID_DATA_LONG;
         body[1..5].copy_from_slice(&((body_len - MIN_LONG_BODY) as u32).to_le_bytes());
     }

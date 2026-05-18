@@ -641,4 +641,135 @@ mod tests {
         let v = decode_interval(&body).unwrap();
         assert_eq!(v.to_text(), "00:00:00");
     }
+
+    #[test]
+    fn numeric_short_negative_weight_renders_leading_zero() {
+        // 0.5 — weight=-1 (sign-extended via NUMERIC_SHORT_WEIGHT_SIGN_MASK),
+        // dscale=1, single digit 5000. Exercises both the short-form
+        // sign-extension branch & render_numeric's `weight < 0` arm.
+        let body = short_numeric(false, -1, 1, &[5000]);
+        assert_eq!(
+            decode_numeric(&body).unwrap(),
+            NumericKind::Finite("0.5".into())
+        );
+    }
+
+    #[test]
+    fn numeric_long_form_truncated_body() {
+        // Long form (top bit clear, sign bits not SPECIAL) with body < 4 bytes
+        // must fail with Truncated at offset 2.
+        let body = NUMERIC_POS.to_le_bytes().to_vec();
+        match decode_numeric(&body) {
+            Err(CodecError::Truncated { offset: 2, .. }) => (),
+            other => panic!("expected Truncated at offset 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_unknown_special_falls_back_to_nan() {
+        // Special flag bits set but tag != NaN/PInf/NInf → fallback NaN arm.
+        let header: u16 = NUMERIC_SPECIAL | 0x0001;
+        let body = header.to_le_bytes();
+        assert_eq!(decode_numeric(&body).unwrap(), NumericKind::NaN);
+    }
+
+    #[test]
+    fn numeric_dscale_trailing_zero_pad() {
+        // 5.0000 — short form weight=0 dscale=4 digits=[5]. Post-decimal
+        // loop runs past ndigits, hitting the `0` fallback arm.
+        let body = short_numeric(false, 0, 4, &[5]);
+        assert_eq!(
+            decode_numeric(&body).unwrap(),
+            NumericKind::Finite("5.0000".into())
+        );
+    }
+
+    #[test]
+    fn numeric_rejects_oversized_digit_array() {
+        // ndigits exceeds NUMERIC_DSCALE_MASK + 4 → BadNumeric.
+        let mut body = NUMERIC_POS.to_le_bytes().to_vec();
+        body.extend_from_slice(&0i16.to_le_bytes()); // weight
+        body.extend(std::iter::repeat_n(
+            0u8,
+            ((NUMERIC_DSCALE_MASK as usize) + 5) * 2,
+        ));
+        assert!(matches!(
+            decode_numeric(&body),
+            Err(CodecError::BadNumeric { .. })
+        ));
+    }
+
+    #[test]
+    fn inet_ipv4_truncated_addr() {
+        // family=AF_INET expects 4 addr bytes; only 2 supplied.
+        let body = vec![PGSQL_AF_INET, 32, 1, 2];
+        assert!(matches!(
+            decode_inet(&body, false),
+            Err(CodecError::Truncated { offset: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn inet_truncated_header() {
+        let body = vec![PGSQL_AF_INET];
+        assert!(matches!(
+            decode_inet(&body, false),
+            Err(CodecError::Truncated { offset: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn inet_unknown_family_text_renders_placeholder() {
+        // Direct InetValue construction bypasses decode_inet's family check
+        // to reach to_text's `_ => "?"` arm.
+        let v = InetValue {
+            family: 99,
+            bits: 0,
+            is_cidr: false,
+            addr: Vec::new(),
+        };
+        assert!(v.to_text().starts_with('?'));
+    }
+
+    #[test]
+    fn inet_ipv6_full_expansion_no_collapse() {
+        // No zero run >= 2, so every group is printed with a leading ':'
+        // separator after the first — exercises the explicit `:` push.
+        let mut body = vec![PGSQL_AF_INET6, 128];
+        for i in 1..=8u16 {
+            body.extend_from_slice(&i.to_be_bytes());
+        }
+        let v = decode_inet(&body, false).unwrap();
+        assert_eq!(v.to_text(), "1:2:3:4:5:6:7:8");
+    }
+
+    #[test]
+    fn interval_truncated_body() {
+        let body = vec![0u8; 10];
+        assert!(matches!(
+            decode_interval(&body),
+            Err(CodecError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn interval_negative_time_renders_with_sign() {
+        let v = IntervalValue {
+            months: 0,
+            days: 0,
+            micros: -3_600_000_000,
+        };
+        assert_eq!(v.to_text(), "-01:00:00");
+    }
+
+    #[test]
+    fn interval_trims_trailing_fraction_zeros() {
+        // 1000 us = 0.001 s — frac "001000" trims to "001".
+        let v = IntervalValue {
+            months: 0,
+            days: 0,
+            micros: 1_000,
+        };
+        assert_eq!(v.to_text(), "00:00:00.001");
+    }
 }

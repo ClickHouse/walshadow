@@ -159,6 +159,19 @@ mod tests {
         assert!(matches!(err, CatalogError::NotFoundByFilenode(_)));
     }
 
+    #[test]
+    fn catalog_map_resolver_exposes_map_and_into_inner() {
+        let mut map = CatalogMap::new();
+        map.insert(mk_rel(16402));
+        let resolver = CatalogMapResolver::new(map);
+        assert!(
+            resolver.map().get(5, 16402).is_some(),
+            "map() yields immutable view",
+        );
+        let recovered = resolver.into_inner();
+        assert!(recovered.get(5, 16402).is_some());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn catalog_map_resolver_ignores_at_lsn() {
         // Same filenode resolves identically regardless of at_lsn —
