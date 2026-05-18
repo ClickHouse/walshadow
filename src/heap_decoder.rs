@@ -537,6 +537,21 @@ fn decode_old_tuple_from_main_data(
 /// Walk a tuple payload that starts with `xl_heap_header` at `header_off`
 /// of `buf`, then bitmap, padding, and column data. `prefixlen` /
 /// `suffixlen` are PG's `XLH_UPDATE_*_FROM_OLD` byte counts: bytes
+/// Decode a tuple payload shaped like WAL `block.data` —
+/// `xl_heap_header (5)` followed by bitmap, padding, and column data
+/// starting at logical-tuple offset `t_hoff`. Used by Phase 12's
+/// page-walk sink which reshapes on-disk `HeapTupleHeaderData`-prefixed
+/// tuples into this form so the same Phase 5 decoder fields both.
+///
+/// `prefixlen=suffixlen=0` because the WAL prefix/suffix-from-old
+/// compression doesn't apply at backup time.
+pub(crate) fn decode_block_data(
+    block_data: &[u8],
+    rel: &RelDescriptor,
+) -> Result<DecodedTuple, DecodeError> {
+    decode_tuple_payload(block_data, 0, rel, 0, 0)
+}
+
 /// elided from the front (prefix) and back (suffix) of the logical
 /// column-data region. Columns whose byte ranges fall entirely inside
 /// those regions surface as `None` in the output and the caller flips

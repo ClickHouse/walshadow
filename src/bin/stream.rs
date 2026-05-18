@@ -30,24 +30,35 @@
 //! per-relation mapping atomically.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use std::fs;
 use std::future::Future;
+use std::io::Write as _;
 use std::pin::Pin;
 use tokio::sync::Mutex;
+use wal_rs::pg::backup::BACKUP_NAME_PREFIX;
+use wal_rs::pg::replication::base_backup::BaseBackupOpts;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
+use walshadow::backfill_bootstrap::{
+    BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
+};
+use walshadow::backup_source::BackupSource;
+use walshadow::backup_source_direct::DirectSource;
+use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, MappingHandle};
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
 use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
+use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
     with_transient_retry,
@@ -57,6 +68,27 @@ use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
 use walshadow::xact_buffer::{BufferingDecoderSink, XactBuffer, XactBufferConfig, XactRecordSink};
+
+/// Bootstrap source impl pick. Phase 12 hook in front of the WAL pump:
+/// landing catalog files + writing standby.signal so a fresh shadow PG
+/// can be brought up against this run's `out_dir`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum BootstrapMode {
+    /// Bootstrap disabled — caller supplied shadow data dir externally
+    /// (e.g. via `pg_basebackup`). Default behaviour preserves the
+    /// pre-Phase-12 daemon flow.
+    #[default]
+    Off,
+    /// Source-PG-driven BASE_BACKUP via the replication protocol.
+    /// Reuses the existing `--host` / `--port` / `--user` connection;
+    /// no extra credentials.
+    Direct,
+    /// wal-g-compatible BASE_BACKUP pulled from a `DynStorage` bucket.
+    /// Storage config is read from `WALG_*` env vars (same convention
+    /// as the wal-rs CLI); `--bootstrap-backup-name` selects which
+    /// backup (LATEST = newest sentinel).
+    ObjectStore,
+}
 
 /// Tiny inline `RecordSink` composite. Phase 6 adds the xact buffer
 /// to the chain: heap-tuple records park in `xact` until the matching
@@ -200,6 +232,53 @@ struct Args {
     /// gets rewritten as the new daemon makes progress.
     #[arg(long, default_value_t = false)]
     ignore_cursor: bool,
+    /// Phase 12 — bootstrap source pick. `off` (default) keeps the
+    /// pre-Phase-12 flow where shadow is bootstrapped externally.
+    /// `direct` issues BASE_BACKUP against source PG over the same
+    /// replication connection; `object_store` pulls a wal-g-format
+    /// backup from `DynStorage` (configured via `WALG_*` env vars).
+    /// In both bootstrap modes, the daemon lands catalog files +
+    /// writes standby.signal + restore_command to
+    /// `--bootstrap-shadow-data-dir`, then resumes the WAL pump at
+    /// the backup's `end_lsn` (overriding any cursor / `--start-lsn`).
+    #[arg(long, value_enum, default_value_t = BootstrapMode::Off)]
+    bootstrap_mode: BootstrapMode,
+    /// Shadow PG data dir that the bootstrap lands catalogs into. PG
+    /// recovery's `restore_command` will then consume
+    /// `out_dir/<seg>.partial` files to replay WAL beyond `end_lsn`.
+    /// Required when `--bootstrap-mode != off`. Must be empty (or
+    /// non-existent) at boot.
+    #[arg(long)]
+    bootstrap_shadow_data_dir: Option<PathBuf>,
+    /// Object-store backup name. `LATEST` resolves to the newest
+    /// sentinel; otherwise pass the literal `base_TTTTTTTTLLLLLLLLSSSSSSSS`
+    /// form. Required when `--bootstrap-mode=object_store`.
+    #[arg(long, default_value = "LATEST")]
+    bootstrap_backup_name: String,
+    /// Object-store fan-out parallelism. 4 is a safe default; raise
+    /// for high-bandwidth buckets, lower for narrow networks.
+    #[arg(long, default_value_t = 4)]
+    bootstrap_object_store_parallelism: usize,
+    /// BASE_BACKUP fast-checkpoint flag for `direct` mode. Defaults to
+    /// `true` so the bootstrap doesn't wait for the source's
+    /// checkpoint_timeout; flip off if checkpoint cost matters more
+    /// than bootstrap latency.
+    #[arg(long, default_value_t = true)]
+    bootstrap_fast_checkpoint: bool,
+    /// Auto-spawn shadow PG against `--bootstrap-shadow-data-dir`
+    /// immediately after the bootstrap pump returns. Daemon drives
+    /// `pg_ctl start` against the bootstrapped data dir, then waits
+    /// for `pg_last_wal_replay_lsn` to clear the backup's `end_lsn`
+    /// before continuing. Off by default — operators with an external
+    /// supervisor (systemd, k8s) own shadow lifecycle and don't want
+    /// double-management.
+    #[arg(long, default_value_t = false)]
+    bootstrap_autospawn_shadow: bool,
+    /// Wall-clock budget for `--bootstrap-autospawn-shadow`'s wait on
+    /// shadow's replay LSN. Seconds. Exceeded → daemon aborts; no
+    /// further WAL pumping.
+    #[arg(long, default_value_t = 300)]
+    bootstrap_shadow_replay_timeout: u64,
 }
 
 fn main() -> ExitCode {
@@ -242,11 +321,11 @@ fn init_tracing() {
 async fn run(args: Args) -> Result<()> {
     let sslmode = SslMode::parse(&args.sslmode).context("--sslmode")?;
     let cfg = PgConfig {
-        host: args.host,
+        host: args.host.clone(),
         port: args.port,
-        user: args.user,
-        password: args.password,
-        database: args.dbname,
+        user: args.user.clone(),
+        password: args.password.clone(),
+        database: args.dbname.clone(),
         application_name: "walshadow".into(),
         sslmode,
     };
@@ -263,6 +342,48 @@ async fn run(args: Args) -> Result<()> {
         xlogpos = format!("{:X}/{:X}", ident.xlogpos >> 32, ident.xlogpos as u32),
         "source identified",
     );
+
+    // Phase 12 — optional bootstrap step. On a non-off mode, this lands
+    // the catalog tree on `--bootstrap-shadow-data-dir`, writes a
+    // standby.signal + `restore_command` pointing at `--out-dir`, and
+    // returns the backup's `end_lsn` so the WAL pump (further down)
+    // resumes there. When `--ch-config` is also set, bootstrap rows
+    // route through a transitional emitter built against the seeded
+    // CatalogMap (no shadow PG needed); otherwise they drain to a
+    // metrics-only observer. The transitional emitter closes its
+    // INSERTs before this returns so the daemon's real emitter below
+    // opens fresh blocks for the WAL stream.
+    let bootstrap_ch_config = match args.ch_config.as_deref() {
+        Some(path) => {
+            let toml = tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("read --ch-config {}", path.display()))?;
+            Some(EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?)
+        }
+        None => None,
+    };
+    let bootstrap_end_lsn: Option<u64> = if matches!(args.bootstrap_mode, BootstrapMode::Off) {
+        None
+    } else {
+        Some(
+            run_bootstrap(&cfg, &mut feed, &args, bootstrap_ch_config)
+                .await
+                .context("phase 12 bootstrap")?,
+        )
+    };
+    // After run_bootstrap, optionally auto-spawn shadow PG against the
+    // bootstrapped data dir + wait for it to replay past `end_lsn`.
+    // Sync calls live in `block_in_place` because `Shadow::start` +
+    // `Shadow::wait_for_replay` shell out to `pg_ctl` / `psql`.
+    if let Some(end_lsn) = bootstrap_end_lsn
+        && args.bootstrap_autospawn_shadow
+    {
+        let shadow_data_dir = args
+            .bootstrap_shadow_data_dir
+            .clone()
+            .context("--bootstrap-shadow-data-dir required with --bootstrap-autospawn-shadow")?;
+        autospawn_shadow_and_wait(&args, shadow_data_dir, end_lsn).await?;
+    }
 
     // Phase 11 cursor-resume gate. `--start-lsn` (explicit operator
     // override) wins; otherwise cursor.bin under spill_dir picks up the
@@ -285,17 +406,24 @@ async fn run(args: Args) -> Result<()> {
             }
         }
     };
-    let raw_start = match (&args.start_lsn, &cursor_at_boot) {
-        (Some(s), _) => parse_lsn(s).context("--start-lsn")?,
-        (None, Some(c)) if c.emitter_ack_lsn != 0 => c.emitter_ack_lsn,
-        (None, _) => ident.xlogpos,
+    // Bootstrap-mode `end_lsn` outranks the cursor: a fresh bootstrap
+    // means catalog state on shadow is `end_lsn`, so consuming WAL
+    // before that double-counts. `--start-lsn` (explicit operator
+    // override) still wins so recovery drills can rewind further.
+    let raw_start = match (&args.start_lsn, bootstrap_end_lsn, &cursor_at_boot) {
+        (Some(s), _, _) => parse_lsn(s).context("--start-lsn")?,
+        (None, Some(l), _) => l,
+        (None, None, Some(c)) if c.emitter_ack_lsn != 0 => c.emitter_ack_lsn,
+        (None, None, _) => ident.xlogpos,
     };
     let aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
     tracing::info!(
         target: "walshadow",
         raw = format!("{:X}/{:X}", raw_start >> 32, raw_start as u32),
         aligned = format!("{:X}/{:X}", aligned >> 32, aligned as u32),
-        from_cursor = cursor_at_boot.is_some()
+        from_bootstrap = bootstrap_end_lsn.is_some() && args.start_lsn.is_none(),
+        from_cursor = bootstrap_end_lsn.is_none()
+            && cursor_at_boot.is_some()
             && args.start_lsn.is_none()
             && cursor_at_boot.as_ref().is_some_and(|c| c.emitter_ack_lsn != 0),
         "start LSN",
@@ -912,6 +1040,263 @@ async fn populate_metrics(
         uptime_secs,
     };
     registry.set(snap).await;
+}
+
+/// Phase 12 — orchestrate the BASE_BACKUP into a fresh shadow data dir.
+/// Returns the backup's `end_lsn` so the caller can rebind the WAL pump
+/// past it.
+///
+/// Operator contract after this returns:
+///
+/// 1. Bring up shadow PG with `standby.signal` + the `restore_command`
+///    pointing at `--out-dir` (both written here).
+/// 2. Shadow will consume filtered WAL segments the daemon produces
+///    against `--out-dir` and replay them.
+/// 3. There is no automatic shadow-process management; if a service
+///    manager (systemd, k8s) owns shadow, configure it to start once
+///    `bootstrap_shadow_data_dir` exists and is non-empty (this returns
+///    after that's true).
+///
+/// When `ch_config` is `Some`, bootstrap rows route through a
+/// transitional CH emitter built against a
+/// [`walshadow::relation_resolver::CatalogMapResolver`] wrapping the
+/// seeded `CatalogMap`. The emitter opens fresh INSERT blocks per
+/// destination table, ships synthetic INSERTs (`_op = 1`,
+/// `_lsn = start_lsn`, `_commit_ts = 0`), and `drain_backfill`'s
+/// trailing `on_xact_end` closes them before this function returns.
+/// The daemon's real `ShadowCatalog`-backed emitter starts fresh
+/// below; both share the same CH destination tables, so block
+/// alignment stays clean. When `ch_config` is `None`, rows drain to a
+/// metrics-only observer — matches operators running without
+/// `--ch-config`.
+async fn run_bootstrap(
+    src_cfg: &PgConfig,
+    feed: &mut SourceFeed,
+    args: &Args,
+    ch_config: Option<EmitterConfig>,
+) -> Result<u64> {
+    let shadow_data_dir = args
+        .bootstrap_shadow_data_dir
+        .clone()
+        .context("--bootstrap-shadow-data-dir required when --bootstrap-mode != off")?;
+
+    // Seed catalog map from source PG inside a REPEATABLE READ snapshot
+    // — DDL between the seed COMMIT and BASE_BACKUP's checkpoint window
+    // is operator-quiesced per PLAN.md §"Phase 12 — out of scope".
+    let sql_client = feed
+        .sql_client()
+        .await
+        .context("bootstrap: source sidecar sql client")?;
+    let catalog_map = seed_in_snapshot(sql_client)
+        .await
+        .context("bootstrap: seed_in_snapshot")?;
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        relations = catalog_map.len(),
+        mode = ?args.bootstrap_mode,
+        shadow_data_dir = %shadow_data_dir.display(),
+        "catalog map seeded",
+    );
+
+    let source: Box<dyn BackupSource> = match args.bootstrap_mode {
+        BootstrapMode::Direct => {
+            let opts = BaseBackupOpts {
+                label: format!(
+                    "walshadow-bootstrap-{}",
+                    chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+                ),
+                fast_checkpoint: args.bootstrap_fast_checkpoint,
+                no_verify_checksums: false,
+                max_rate_kib: None,
+            };
+            Box::new(DirectSource::new(src_cfg.clone(), opts))
+        }
+        BootstrapMode::ObjectStore => {
+            let settings = wal_rs::config::Settings::from_env()
+                .context("bootstrap: Settings::from_env (WALG_* env vars)")?;
+            let storage = settings
+                .build_storage()
+                .context("bootstrap: build storage from WALG_* env vars")?;
+            // `LATEST` resolves to the newest sentinel; ObjectStoreSource
+            // will canonicalise via `wal_rs::pg::backup::fetch::resolve_name`.
+            let name = args.bootstrap_backup_name.clone();
+            if name != "LATEST" && !name.starts_with(BACKUP_NAME_PREFIX) {
+                anyhow::bail!(
+                    "bootstrap: --bootstrap-backup-name {name:?} must be `LATEST` \
+                     or begin with `{BACKUP_NAME_PREFIX}`"
+                );
+            }
+            Box::new(
+                ObjectStoreSource::new(settings, storage, name)
+                    .with_parallelism(args.bootstrap_object_store_parallelism),
+            )
+        }
+        BootstrapMode::Off => unreachable!("dispatch happened in run()"),
+    };
+
+    let cfg = BootstrapConfig::new(shadow_data_dir.clone());
+    // PageWalkSink owns one CatalogMap; the transitional resolver gets
+    // a second clone. Both are immutable lookups, so duplicating is
+    // cheap — `Arc<RelDescriptor>` values stay shared across clones.
+    let resolver_map = catalog_map.clone();
+    let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map);
+
+    let (shipped, outcome) = match ch_config {
+        Some(emitter_cfg) => {
+            // Transitional emitter — `CatalogMapResolver` fronts the
+            // seeded snapshot (shadow PG isn't up yet). TCP open here
+            // mirrors the daemon path below; std-stream handoff keeps
+            // the chc_posix_io vtable on a blocking fd.
+            let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+            let tcp = tokio::net::TcpStream::connect(&addr)
+                .await
+                .with_context(|| format!("bootstrap: connect CH at {addr}"))?;
+            tcp.set_nodelay(true).ok();
+            let std_tcp = tcp
+                .into_std()
+                .context("bootstrap: tokio→std TcpStream handoff")?;
+            std_tcp
+                .set_nonblocking(false)
+                .context("bootstrap: set CH socket to blocking for chc_posix_io")?;
+            let resolver: Arc<dyn walshadow::relation_resolver::RelationResolver> = Arc::new(
+                walshadow::relation_resolver::CatalogMapResolver::new(resolver_map),
+            );
+            let emitter = Emitter::new(emitter_cfg, resolver, std_tcp)
+                .context("bootstrap: init transitional CH emitter")?;
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                addr = %addr,
+                "bootstrap ch emitter connected",
+            );
+            let mut observer = EmitterObserver::new(emitter);
+            let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
+            let shipped = drain_res.context("bootstrap drain")?;
+            let outcome: BootstrapOutcome = pump_res
+                .context("bootstrap pump join")?
+                .context("bootstrap pump")?;
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                rows_emitted = observer.emitter.stats.rows_emitted,
+                blocks_sent = observer.emitter.stats.blocks_sent,
+                "bootstrap emitter drained",
+            );
+            // Drop the transitional emitter so its CH TCP closes
+            // before the daemon path opens its own.
+            drop(observer);
+            (shipped, outcome)
+        }
+        None => {
+            // Metrics-only — bootstrap rows counted, not shipped.
+            // Matches operators running without `--ch-config`.
+            let mut observer = MetricsTupleObserver::default();
+            let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
+            let shipped = drain_res.context("bootstrap drain")?;
+            let outcome: BootstrapOutcome = pump_res
+                .context("bootstrap pump join")?
+                .context("bootstrap pump")?;
+            (shipped, outcome)
+        }
+    };
+
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        start_lsn = format!(
+            "{:X}/{:X}",
+            outcome.start.start_lsn >> 32,
+            outcome.start.start_lsn as u32
+        ),
+        end_lsn = format!(
+            "{:X}/{:X}",
+            outcome.end.end_lsn >> 32,
+            outcome.end.end_lsn as u32
+        ),
+        timeline = outcome.start.timeline,
+        kept_files = outcome.disk.kept_files,
+        skipped_denylist = outcome.disk.skipped_denylist,
+        files_walked = outcome.page_walk.files_walked,
+        tuples_emitted = outcome.page_walk.tuples_emitted,
+        drained = shipped,
+        "bootstrap landed",
+    );
+
+    // Lay down standby.signal + restore_command. Operator (or service
+    // manager) starts shadow PG against `shadow_data_dir` next; PG's
+    // recovery picks up filtered segments from `--out-dir` via the
+    // restore_command and applies them.
+    write_standby_config(&shadow_data_dir, &args.out_dir)
+        .context("bootstrap: write standby.signal + restore_command")?;
+
+    Ok(outcome.end.end_lsn)
+}
+
+/// Boot shadow PG against the bootstrapped data dir and wait until its
+/// replay LSN clears the backup's `end_lsn`. Drives sync `pg_ctl` +
+/// `psql` shells via `block_in_place` so the multi-threaded runtime
+/// keeps making forward progress on other tasks.
+///
+/// Reuses the existing `--shadow-socket-dir` / `--shadow-port` flags
+/// for the shadow listener config — they're the same socket the
+/// daemon will connect to for `ShadowCatalog` further down the
+/// pipeline.
+async fn autospawn_shadow_and_wait(
+    args: &Args,
+    shadow_data_dir: PathBuf,
+    end_lsn: u64,
+) -> Result<()> {
+    let mut cfg = ShadowConfig::new(shadow_data_dir.clone(), args.out_dir.clone());
+    cfg.port = args.shadow_port;
+    cfg.socket_dir = args.shadow_socket_dir.clone();
+    cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
+    let shadow = Shadow::new(cfg);
+    let timeout = Duration::from_secs(args.bootstrap_shadow_replay_timeout);
+
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        data_dir = %shadow_data_dir.display(),
+        end_lsn = format!("{:X}/{:X}", end_lsn >> 32, end_lsn as u32),
+        replay_timeout_secs = args.bootstrap_shadow_replay_timeout,
+        "auto-spawning shadow PG",
+    );
+    let replay_lsn = tokio::task::block_in_place(move || -> Result<u64> {
+        shadow.start().context("auto-spawn: shadow start")?;
+        shadow
+            .wait_for_replay(end_lsn, timeout)
+            .context("auto-spawn: wait_for_replay")
+    })?;
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        replay_lsn = format!("{:X}/{:X}", replay_lsn >> 32, replay_lsn as u32),
+        "shadow caught up to bootstrap end_lsn",
+    );
+    Ok(())
+}
+
+/// Write `standby.signal` + append a `restore_command` line so shadow
+/// PG starts in standby mode and feeds itself from the daemon's
+/// filtered-segment directory. Idempotent: `standby.signal` is a
+/// zero-byte marker file; `restore_command` is appended once.
+fn write_standby_config(shadow_data_dir: &Path, filter_out_dir: &Path) -> Result<()> {
+    fs::create_dir_all(shadow_data_dir)?;
+    fs::write(shadow_data_dir.join("standby.signal"), b"")?;
+    let conf = shadow_data_dir.join("postgresql.auto.conf");
+    let marker = "# walshadow Phase 12 bootstrap";
+    if conf.exists() {
+        let existing = fs::read_to_string(&conf).unwrap_or_default();
+        if existing.contains(marker) {
+            return Ok(());
+        }
+    }
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&conf)?;
+    writeln!(f, "\n{marker}")?;
+    writeln!(
+        f,
+        "restore_command = 'cp {}/%f %p'",
+        filter_out_dir.display()
+    )?;
+    Ok(())
 }
 
 fn parse_lsn(s: &str) -> Result<u64> {

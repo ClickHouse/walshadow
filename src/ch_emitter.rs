@@ -49,11 +49,11 @@ use clickhouse_c::{
     PosixIo, TypeAst,
 };
 use thiserror::Error;
-use tokio::sync::Mutex;
 
 use crate::decoder_sink::{DecoderSinkError, TupleObserver};
 use crate::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
-use crate::shadow_catalog::{CatalogError, RelDescriptor, ShadowCatalog};
+use crate::relation_resolver::RelationResolver;
+use crate::shadow_catalog::{CatalogError, RelDescriptor};
 
 /// Microsecond offset between PG `TimestampTz` epoch (2000-01-01 UTC)
 /// and the Unix epoch. `DateTime64(6)` in ClickHouse is Unix
@@ -374,10 +374,10 @@ impl EmitterConfig {
     /// which owns it for the lifetime of the connection.
     pub fn connect(
         self,
-        catalog: Arc<Mutex<ShadowCatalog>>,
+        resolver: Arc<dyn RelationResolver>,
         tcp: std::net::TcpStream,
     ) -> Result<Emitter, EmitterError> {
-        Emitter::new(self, catalog, tcp)
+        Emitter::new(self, resolver, tcp)
     }
 }
 
@@ -954,7 +954,7 @@ pub struct Emitter {
     /// [`Emitter::mapping_handle`] reaching out from the daemon's
     /// SIGHUP task.
     mapping: MappingHandle,
-    catalog: Arc<Mutex<ShadowCatalog>>,
+    resolver: Arc<dyn RelationResolver>,
     tables: HashMap<String, TableEncoder>,
     /// xid currently held in `tables`. Reset on `on_xact_end`.
     current_xid: Option<u32>,
@@ -979,7 +979,7 @@ pub struct EmitterStats {
 impl Emitter {
     pub fn new(
         config: EmitterConfig,
-        catalog: Arc<Mutex<ShadowCatalog>>,
+        resolver: Arc<dyn RelationResolver>,
         tcp: std::net::TcpStream,
     ) -> Result<Self, EmitterError> {
         let alloc = Allocator::stdlib();
@@ -997,7 +997,7 @@ impl Emitter {
             alloc,
             config,
             mapping,
-            catalog,
+            resolver,
             tables: HashMap::new(),
             current_xid: None,
             stats: EmitterStats::default(),
@@ -1018,11 +1018,10 @@ impl Emitter {
         if self.current_xid.is_none() {
             self.current_xid = Some(committed.decoded.xid);
         }
-        let rel = {
-            let mut cat = self.catalog.lock().await;
-            cat.relation_at(committed.decoded.rfn, committed.decoded.source_lsn)
-                .await?
-        };
+        let rel = self
+            .resolver
+            .relation_at(committed.decoded.rfn, committed.decoded.source_lsn)
+            .await?;
         let key = format!("{}.{}", rel.namespace_name, rel.name);
         let mapping = {
             let m = self.mapping.read().await;

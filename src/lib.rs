@@ -19,7 +19,16 @@
 //! top crate's `lz4` / `zstd` features which forward to clickhouse-c-rs.
 //! Phase 11: durable resume cursor (`cursor`) sits next to the spill
 //! files; the boot path consults it before reverting to greenfield.
+//! Phase 12: file-streaming backup source trait (`backup_source`) with
+//! Direct + ObjectStore impls, catalog-land + page-walk sinks, and the
+//! greenfield bootstrap orchestrator (`backfill_bootstrap`).
 
+pub mod backfill_bootstrap;
+pub mod backup_page_walk;
+pub mod backup_sink;
+pub mod backup_source;
+pub mod backup_source_direct;
+pub mod backup_source_object_store;
 pub mod catalog_tracker;
 pub mod ch_emitter;
 pub mod classify;
@@ -36,6 +45,7 @@ pub mod metrics;
 pub mod oracle;
 pub mod pg_class_decoder;
 pub mod preflight;
+pub mod relation_resolver;
 pub mod retention;
 pub mod rewrite;
 mod segment;
