@@ -1108,6 +1108,13 @@ async fn run_bootstrap(
                 fast_checkpoint: args.bootstrap_fast_checkpoint,
                 no_verify_checksums: false,
                 max_rate_kib: None,
+                // Ship pg_wal segments [start_lsn, end_lsn] inside base.tar
+                // so the auto-spawned shadow can hit `minRecoveryPoint` from
+                // local WAL alone. Without this, `pg_ctl -w start` polls
+                // `restore_command` against an `out/` directory that the
+                // streamer hasn't filled yet (queued behind autospawn) and
+                // times out
+                wal: true,
             };
             Box::new(DirectSource::new(src_cfg.clone(), opts))
         }

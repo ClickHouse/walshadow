@@ -1,5 +1,6 @@
 [workspace]
 members = ["clickhouse-c-rs"]
+exclude = ["wal-rs"]
 
 [package]
 name = "walshadow"
@@ -35,7 +36,7 @@ lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
 
 [dependencies]
-wal-rs = { path = "../wal-rs" }
+wal-rs = { path = "wal-rs" }
 clickhouse-c-rs = { path = "clickhouse-c-rs", default-features = false }
 anyhow = "1"
 astral-tokio-tar = { version = "0.6", default-features = false }

@@ -111,6 +111,15 @@ docs that are not yet committed work sit alongside as peers.
   WAL tail meet seamlessly. Unblocks greenfield deployments
   against non-empty source. Not yet committed work; see
   [PLAN.md §"Phase 12"](PLAN.md#phase-12--backfill-bridge).
+- **Phase 13** — sub-segment record latency. Lift the page-by-page
+  walker into `WalStream::push` so records reach the decoder on
+  page cadence instead of waiting for a 16 MiB segment to fill.
+  Catalog `relation_at` gate gets a "cached + no churn" fast path
+  so steady-state UPDATEs no longer wait on shadow's replay; cache
+  miss falls back to today's `wait_for_replay`. `DirSegmentSink`
+  cadence + manifest shape stay segment-aligned (shadow's
+  `restore_command` still needs whole segments).
+  [PHASE13.md](PHASE13.md).
 - **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,

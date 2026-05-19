@@ -1,0 +1,15 @@
+target
+oldcov
+coverage
+preprocessed_configs
+pgext/out
+pgext/log
+pgext/*.so
+pgext/*.o
+pgext/*.bc
+.git
+.claude
+**/.DS_Store
+*.diffs
+regression.out
+results

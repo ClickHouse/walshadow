@@ -153,6 +153,7 @@ async fn direct_source_self_hosted_via_replication_protocol() {
         fast_checkpoint: true,
         no_verify_checksums: false,
         max_rate_kib: None,
+        wal: false,
     };
     let direct = DirectSource::new(pgcfg, opts);
 

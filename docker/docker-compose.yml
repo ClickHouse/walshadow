@@ -1,0 +1,90 @@
+# walshadow demo. Three services:
+#   source     — postgres:17 with wal_level=logical, demo.users seeded
+#                via init script, REPLICA IDENTITY FULL set
+#   clickhouse — clickhouse-server with the demo.users destination
+#                table pre-created
+#   walshadow  — custom image carrying walshadow-stream + the
+#                walshadow PG extension. Boots an in-container shadow
+#                PG via --bootstrap-mode=direct + --bootstrap-autospawn
+#                then streams source's WAL into clickhouse
+#
+# Quick start (from repo root):
+#   git submodule update --init --recursive
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# Drive the pipeline:
+#   docker compose -f docker/docker-compose.yml exec source \
+#       psql -U postgres -c "UPDATE demo.users SET email='opifex@merces-digna' WHERE id=1"
+#   docker compose -f docker/docker-compose.yml exec clickhouse \
+#       clickhouse-client --query "SELECT * FROM demo.users FINAL"
+
+services:
+  source:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=8
+      - -c
+      - max_replication_slots=8
+      - -c
+      - wal_keep_size=128MB
+    volumes:
+      - ./init/source:/docker-entrypoint-initdb.d:ro
+      - source-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    volumes:
+      - ./init/clickhouse:/docker-entrypoint-initdb.d:ro
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+
+  walshadow:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      source:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      RUST_LOG: warn,walshadow=info
+      WALSHADOW_SOURCE_HOST: source
+      WALSHADOW_SOURCE_PORT: "5432"
+    volumes:
+      - ./ch-config.toml:/etc/walshadow/ch-config.toml:ro
+      - walshadow-data:/var/lib/walshadow
+    ports:
+      - "9484:9484"
+
+volumes:
+  source-data:
+  clickhouse-data:
+  walshadow-data:

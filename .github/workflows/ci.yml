@@ -8,10 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # wal-rs is a sibling path dep (../wal-rs); see walshadow's Cargo.toml.
-  # Accessed via a read-only deploy key on serprex/wal-rs whose private
-  # half lives in secrets.WAL_RS_DEPLOY_KEY.
-  WAL_RS_REPO: serprex/wal-rs
+  # wal-rs is a git submodule at walshadow/wal-rs (see .gitmodules);
+  # the path dep in Cargo.toml points there. Submodule URL is SSH; the
+  # `Init wal-rs submodule` step in each job feeds a read-only deploy
+  # key (secrets.WAL_RS_DEPLOY_KEY) via GIT_SSH_COMMAND so the clone
+  # auths without disturbing the primary checkout's GITHUB_TOKEN path.
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -39,12 +40,17 @@ jobs:
         with:
           path: walshadow
 
-      - name: Checkout wal-rs (private path dep)
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.WAL_RS_REPO }}
-          path: wal-rs
-          ssh-key: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+      - name: Init wal-rs submodule
+        working-directory: walshadow
+        env:
+          WAL_RS_DEPLOY_KEY: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$WAL_RS_DEPLOY_KEY" > ~/.ssh/wal_rs_deploy
+          chmod 600 ~/.ssh/wal_rs_deploy
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND='ssh -i ~/.ssh/wal_rs_deploy -o IdentitiesOnly=yes' \
+            git submodule update --init --recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -202,12 +208,17 @@ jobs:
         with:
           path: walshadow
 
-      - name: Checkout wal-rs (private path dep)
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.WAL_RS_REPO }}
-          path: wal-rs
-          ssh-key: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+      - name: Init wal-rs submodule
+        working-directory: walshadow
+        env:
+          WAL_RS_DEPLOY_KEY: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$WAL_RS_DEPLOY_KEY" > ~/.ssh/wal_rs_deploy
+          chmod 600 ~/.ssh/wal_rs_deploy
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND='ssh -i ~/.ssh/wal_rs_deploy -o IdentitiesOnly=yes' \
+            git submodule update --init --recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -333,12 +344,17 @@ jobs:
         with:
           path: walshadow
 
-      - name: Checkout wal-rs (private path dep)
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.WAL_RS_REPO }}
-          path: wal-rs
-          ssh-key: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+      - name: Init wal-rs submodule
+        working-directory: walshadow
+        env:
+          WAL_RS_DEPLOY_KEY: ${{ secrets.WAL_RS_DEPLOY_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$WAL_RS_DEPLOY_KEY" > ~/.ssh/wal_rs_deploy
+          chmod 600 ~/.ssh/wal_rs_deploy
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND='ssh -i ~/.ssh/wal_rs_deploy -o IdentitiesOnly=yes' \
+            git submodule update --init --recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -1,0 +1,19 @@
+# walshadow CH emitter mapping. attnum values match
+# pg_attribute.attnum (1-based) on demo.users; column types are the CH
+# destination types walshadow advertises in its INSERT block.
+
+[ch]
+host = "clickhouse"
+port = 9000
+database = "demo"
+user = "default"
+password = ""
+compression = "lz4"
+
+[table."demo.users"]
+target = "demo.users"
+columns = [
+    { attnum = 1, target = "id",    type = "UInt64" },
+    { attnum = 2, target = "name",  type = "String" },
+    { attnum = 3, target = "email", type = "String" },
+]

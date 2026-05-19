@@ -1,0 +1,3 @@
+[submodule "wal-rs"]
+	path = wal-rs
+	url = git@github.com:serprex/wal-rs.git
