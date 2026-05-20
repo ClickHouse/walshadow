@@ -30,10 +30,12 @@ pub enum FilterSegmentError {
 /// In-memory hand-off paired with each [`Manifest`] entry: the parsed
 /// record plus the page magic of the page its header sat on. The
 /// magic is needed downstream to interpret PG-15-vs-PG-14 FPI bits via
-/// `XLogRecordBlockImageHeader::is_compressed`.
+/// `XLogRecordBlockImageHeader::is_compressed`. Stored as `'static`
+/// (materialised via [`XLogRecord::into_owned`]) so `filter_segment`'s
+/// batch return outlives the source bytes the parser borrowed from.
 #[derive(Debug, Clone)]
 pub struct ParsedRecord {
-    pub record: XLogRecord,
+    pub record: XLogRecord<'static>,
     pub page_magic: u16,
 }
 
@@ -100,7 +102,7 @@ pub fn filter_segment(
             kind,
         });
         parsed_records.push(ParsedRecord {
-            record: parsed,
+            record: parsed.into_owned(),
             page_magic: record.page_magic,
         });
     }

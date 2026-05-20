@@ -317,7 +317,7 @@ mod tests {
     /// Wrap block data into an XLogRecord with the given rmgr + info.
     /// `main_data` is supplied verbatim (HEAP_UPDATE needs an
     /// xl_heap_update; HEAP_INSERT leaves it empty).
-    fn record(rm: RmId, info: u8, main_data: Vec<u8>, block_data: Vec<u8>) -> XLogRecord {
+    fn record(rm: RmId, info: u8, main_data: Vec<u8>, block_data: Vec<u8>) -> XLogRecord<'static> {
         XLogRecord {
             header: XLogRecordHeader {
                 resource_manager_id: rm as u8,
@@ -336,10 +336,10 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                data: block_data,
+                data: std::borrow::Cow::Owned(block_data),
                 ..Default::default()
             }],
-            main_data,
+            main_data: std::borrow::Cow::Owned(main_data),
             ..Default::default()
         }
     }

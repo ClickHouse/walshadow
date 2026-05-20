@@ -176,20 +176,23 @@ impl SpillWriter {
 
     pub async fn write(&mut self, entry: &SpillEntry) -> Result<()> {
         let mut body = Vec::with_capacity(128);
+        let tag: u8 = match entry {
+            SpillEntry::Heap(_) => 0,
+            SpillEntry::Chunk(_) => 1,
+        };
+        body.push(tag);
+        // u32 LE length placeholder; back-patched after the body
+        // appends in-place so encoding never goes through a scratch
+        // Vec.
+        let len_off = body.len();
+        body.extend_from_slice(&[0u8; 4]);
+        let inner_start = body.len();
         match entry {
-            SpillEntry::Heap(h) => {
-                body.push(0u8);
-                let inner = encode_heap(h);
-                push_u32(&mut body, inner.len() as u32);
-                body.extend_from_slice(&inner);
-            }
-            SpillEntry::Chunk(c) => {
-                body.push(1u8);
-                let inner = encode_chunk(c);
-                push_u32(&mut body, inner.len() as u32);
-                body.extend_from_slice(&inner);
-            }
+            SpillEntry::Heap(h) => encode_heap_into(&mut body, h),
+            SpillEntry::Chunk(c) => encode_chunk_into(&mut body, c),
         }
+        let inner_len = (body.len() - inner_start) as u32;
+        body[len_off..len_off + 4].copy_from_slice(&inner_len.to_le_bytes());
         self.file.write_all(&body).await?;
         self.byte_count += body.len() as u64;
         Ok(())
@@ -304,23 +307,21 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
     push_bytes(out, s.as_bytes());
 }
 
-fn encode_heap(h: &DecodedHeap) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
-    push_u32(&mut out, h.rfn.spc_node);
-    push_u32(&mut out, h.rfn.db_node);
-    push_u32(&mut out, h.rfn.rel_node);
-    push_u32(&mut out, h.xid);
-    push_u64(&mut out, h.source_lsn);
+fn encode_heap_into(out: &mut Vec<u8>, h: &DecodedHeap) {
+    push_u32(out, h.rfn.spc_node);
+    push_u32(out, h.rfn.db_node);
+    push_u32(out, h.rfn.rel_node);
+    push_u32(out, h.xid);
+    push_u64(out, h.source_lsn);
     let op_byte: u8 = match h.op {
         HeapOp::Insert => 0,
         HeapOp::Update => 1,
         HeapOp::HotUpdate => 2,
         HeapOp::Delete => 3,
     };
-    push_u8(&mut out, op_byte);
-    encode_opt_tuple(&mut out, h.new.as_ref());
-    encode_opt_tuple(&mut out, h.old.as_ref());
-    out
+    push_u8(out, op_byte);
+    encode_opt_tuple(out, h.new.as_ref());
+    encode_opt_tuple(out, h.old.as_ref());
 }
 
 fn encode_opt_tuple(out: &mut Vec<u8>, t: Option<&DecodedTuple>) {
@@ -465,14 +466,13 @@ fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
     }
 }
 
-fn encode_chunk(c: &ToastChunk) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + c.chunk_data.len());
-    push_u32(&mut out, c.toast_relid);
-    push_u32(&mut out, c.value_id);
-    push_u32(&mut out, c.chunk_seq);
-    push_u64(&mut out, c.source_lsn);
-    push_bytes(&mut out, &c.chunk_data);
-    out
+fn encode_chunk_into(out: &mut Vec<u8>, c: &ToastChunk) {
+    out.reserve(32 + c.chunk_data.len());
+    push_u32(out, c.toast_relid);
+    push_u32(out, c.value_id);
+    push_u32(out, c.chunk_seq);
+    push_u64(out, c.source_lsn);
+    push_bytes(out, &c.chunk_data);
 }
 
 // ── decoding ────────────────────────────────────────────────────────

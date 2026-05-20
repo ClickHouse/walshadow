@@ -589,8 +589,10 @@ fn detoast_tuple(
         let Some(ColumnValue::ExternalToast(p)) = col else {
             continue;
         };
-        let p_clone = p.clone();
-        let raw = reassemble(&p_clone, chunks)?;
+        // `ToastPointer: Copy` so the read-out frees the borrow on
+        // `col` before reassemble + assignment.
+        let p: ToastPointer = *p;
+        let raw = reassemble(&p, chunks)?;
         // Look up the original column's type to decide Bytea vs Text.
         let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
         let new_value = match type_oid {
@@ -627,7 +629,8 @@ fn reassemble(
         value_id: p.va_valueid,
         missing: 0,
     })?;
-    let mut concat: Vec<u8> = Vec::new();
+    let total: usize = map.values().map(Vec::len).sum();
+    let mut concat: Vec<u8> = Vec::with_capacity(total);
     for (expected, (seq, body)) in map.iter().enumerate() {
         let expected = expected as u32;
         if *seq != expected {
@@ -703,7 +706,7 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
 impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
     fn on_record<'a>(
         &'a mut self,
-        record: &'a Record,
+        record: &'a Record<'a>,
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -788,7 +791,7 @@ impl BufferingDecoderSink {
 impl RecordSink for BufferingDecoderSink {
     fn on_record<'a>(
         &'a mut self,
-        record: &'a Record,
+        record: &'a Record<'a>,
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -849,10 +852,11 @@ impl RecordSink for BufferingDecoderSink {
                 self.stats.partial += 1;
             }
             if rel.kind == 't' {
-                if let Some(chunk) = toast_chunk_from_decoded(&decoded, &rel) {
+                let xid = decoded.xid;
+                if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
                     self.toast_chunks_buffered += 1;
                     let mut buf = self.buffer.lock().await;
-                    buf.on_toast_chunk(chunk, decoded.xid)
+                    buf.on_toast_chunk(chunk, xid)
                         .await
                         .map_err(SinkError::from)?;
                 } else {
@@ -877,11 +881,11 @@ impl RecordSink for BufferingDecoderSink {
 /// because the referring tuple's `va_toastrelid` is the OID, not the
 /// relfilenode. The two diverge after `VACUUM FULL` / `CLUSTER` on
 /// the toast relation.
-fn toast_chunk_from_decoded(d: &DecodedHeap, rel: &RelDescriptor) -> Option<ToastChunk> {
+fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<ToastChunk> {
     if d.op != HeapOp::Insert {
         return None;
     }
-    let new = d.new.as_ref()?;
+    let new = d.new.as_mut()?;
     if new.columns.len() < 3 {
         return None;
     }
@@ -893,11 +897,11 @@ fn toast_chunk_from_decoded(d: &DecodedHeap, rel: &RelDescriptor) -> Option<Toas
         ColumnValue::Int4(v) => *v as u32,
         _ => return None,
     };
-    let chunk_data = match new.columns[2].as_ref()? {
-        ColumnValue::Bytea(b) => b.clone(),
+    let chunk_data = match new.columns[2].take()? {
+        ColumnValue::Bytea(b) => b,
         // Detoasted text-typed toast wouldn't be a normal flow but
         // tolerate by re-encoding back to bytes.
-        ColumnValue::Text(s) => s.as_bytes().to_vec(),
+        ColumnValue::Text(s) => s.into_bytes(),
         _ => return None,
     };
     Some(ToastChunk {
@@ -1091,6 +1095,7 @@ mod tests {
             namespace_oid: 99,
             namespace_name: "pg_toast".into(),
             name: "pg_toast_16385".into(),
+            qualified_name: RelDescriptor::build_qualified_name("pg_toast", "pg_toast_16385"),
             kind: 't',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -1151,7 +1156,7 @@ mod tests {
             }),
             old: None,
         };
-        let chunk = toast_chunk_from_decoded(&d, &rel).expect("recognised toast shape");
+        let chunk = toast_chunk_from_decoded(d.clone(), &rel).expect("recognised toast shape");
         assert_eq!(chunk.toast_relid, 99); // pg_class.oid, not rel_node
         assert_eq!(chunk.value_id, 55);
         assert_eq!(chunk.chunk_seq, 2);
@@ -1159,10 +1164,10 @@ mod tests {
         // Non-Insert ops fail the shape check.
         let mut d2 = d.clone();
         d2.op = HeapOp::Update;
-        assert!(toast_chunk_from_decoded(&d2, &rel).is_none());
+        assert!(toast_chunk_from_decoded(d2, &rel).is_none());
         // Two-column shape (truncated) fails.
         let mut d3 = d.clone();
         d3.new.as_mut().unwrap().columns.pop();
-        assert!(toast_chunk_from_decoded(&d3, &rel).is_none());
+        assert!(toast_chunk_from_decoded(d3, &rel).is_none());
     }
 }

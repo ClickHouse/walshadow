@@ -106,9 +106,16 @@ pub enum SinkError {
 /// computed. Phase 5's heap-tuple decoder reads `parsed.header.xact_id`,
 /// `parsed.blocks[i].header.location.rel`, and `parsed.main_data`;
 /// `page_magic` selects PG-15-vs-PG-14 FPI bit semantics.
+///
+/// The `'a` lifetime ties `parsed`'s borrows back to the walker's
+/// segment buffer — the streaming path constructs and dispatches a
+/// `Record<'a>` inside one `RecordSink::on_record` future without
+/// allocating per-record byte copies. Test sinks that store records
+/// across `try_next` iterations call `record.parsed.clone().into_owned()`
+/// to bump to `Record<'static>`.
 #[derive(Debug, Clone, Default)]
-pub struct Record {
-    pub parsed: XLogRecord,
+pub struct Record<'a> {
+    pub parsed: XLogRecord<'a>,
     /// Absolute source LSN where the record begins.
     pub source_lsn: u64,
     /// Magic of the page whose data area the record header sat on.
@@ -117,7 +124,7 @@ pub struct Record {
     pub decision: Decision,
 }
 
-impl Record {
+impl Record<'static> {
     /// Zip one parsed record with its matching [`Manifest`] entry
     /// plus the segment's start LSN. Index alignment between
     /// `parsed_records` and `manifest.records` is the
@@ -142,10 +149,16 @@ impl Record {
 
 /// Sink that observes every record decided by the filter. Phase 5's
 /// heap-tuple decoder attaches here.
+///
+/// `record` carries a `'b` borrow back into the streaming walker's
+/// segment buffer — sinks consume slices for the duration of the
+/// future and don't store the record. Sinks that must store records
+/// (eg test collectors) call `record.parsed.clone().into_owned()` to
+/// materialise an owned `XLogRecord<'static>` first.
 pub trait RecordSink {
     fn on_record<'a>(
         &'a mut self,
-        record: &'a Record,
+        record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 }
 
@@ -208,19 +221,27 @@ pub trait SegmentSink {
     }
 }
 
-/// In-memory `RecordSink` for tests. Stores every record.
+/// In-memory `RecordSink` for tests. Stores every record. Records
+/// are materialised to `'static` via [`XLogRecord::into_owned`] before
+/// storage so the borrow back into the walker buffer doesn't outlive
+/// the `on_record` future.
 #[derive(Debug, Default)]
 pub struct CollectingRecordSink {
-    pub records: Vec<Record>,
+    pub records: Vec<Record<'static>>,
 }
 
 impl RecordSink for CollectingRecordSink {
     fn on_record<'a>(
         &'a mut self,
-        record: &'a Record,
+        record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            self.records.push(record.clone());
+            self.records.push(Record {
+                parsed: record.parsed.clone().into_owned(),
+                source_lsn: record.source_lsn,
+                page_magic: record.page_magic,
+                decision: record.decision,
+            });
             Ok(())
         })
     }
@@ -235,7 +256,7 @@ pub struct CountingRecordSink {
 impl RecordSink for CountingRecordSink {
     fn on_record<'a>(
         &'a mut self,
-        _record: &'a Record,
+        _record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.count += 1;
@@ -271,7 +292,7 @@ impl MetricsRecordSink {
 impl RecordSink for MetricsRecordSink {
     fn on_record<'a>(
         &'a mut self,
-        record: &'a Record,
+        record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             let rm = record.parsed.header.resource_manager_id;
@@ -300,7 +321,7 @@ impl CompositeRecordSink {
 impl RecordSink for CompositeRecordSink {
     fn on_record<'a>(
         &'a mut self,
-        record: &'a Record,
+        record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             for s in &mut self.inner {
@@ -623,43 +644,67 @@ impl WalStream {
                 }
                 None => return Ok(()),
             };
-            let parsed = parse_record_from_bytes(&completed.logical_bytes, completed.page_magic)
+            let start_offset = completed.start_offset;
+            let page_magic = completed.page_magic;
+            let byte_ranges = completed.byte_ranges.clone();
+            let last_range = byte_ranges.last().copied().unwrap_or((0, 0));
+            let record_end = last_range.0 + last_range.1;
+
+            // Parse + decide inside an inner scope so any slice
+            // borrows back into the walker buffer (`parsed.main_data`,
+            // per-block `image`/`data`) live only across the filter
+            // call. For the `Drop` path we materialise the parse to
+            // `'static` so the subsequent `rewrite_record` can take
+            // `&mut self.walker` without conflicting; the `Keep` path
+            // keeps the borrow zero-copy through `record_sink`.
+            let decision;
+            let parsed_for_sink: XLogRecord<'static>;
+            {
+                let parsed = parse_record_from_bytes(
+                    completed.logical_bytes(self.walker.buffer()),
+                    completed.page_magic,
+                )
                 .map_err(|source| WalStreamError::Parse {
-                    offset: completed.start_offset,
+                    offset: start_offset,
                     source,
                 })?;
-            let decision = self.filter.decide(&parsed);
+                decision = self.filter.decide(&parsed);
+                // Materialise here: `rewrite_record` below mutates
+                // walker.buf which `parsed`'s slices view; the dispatch
+                // below needs the *original* parse, not post-rewrite.
+                parsed_for_sink = parsed.into_owned();
+            }
             let kind = match decision {
                 Decision::Keep => Kind::Kept,
                 Decision::Drop => Kind::Dropped,
             };
-            let final_bytes: Vec<u8> = if decision == Decision::Drop {
-                let mut buf = completed.logical_bytes.clone();
-                noop_replace(&mut buf).map_err(|source| WalStreamError::Rewrite {
-                    offset: completed.start_offset,
+            if decision == Decision::Drop {
+                let mut bytes = match completed.stitched_bytes {
+                    Some(v) => v,
+                    None => {
+                        let (off, len) = byte_ranges[0];
+                        self.walker.buffer()[off..off + len].to_vec()
+                    }
+                };
+                noop_replace(&mut bytes).map_err(|source| WalStreamError::Rewrite {
+                    offset: start_offset,
                     source,
                 })?;
-                self.walker.rewrite_record(&completed.byte_ranges, &buf);
-                buf
-            } else {
-                completed.logical_bytes.clone()
-            };
+                self.walker.rewrite_record(&byte_ranges, &bytes);
+            }
 
             self.pending_entries.push(Entry {
-                offset: completed.start_offset as u64,
-                len: parsed.header.total_record_length,
-                rmid: parsed.header.resource_manager_id,
-                info: parsed.header.info,
+                offset: start_offset as u64,
+                len: parsed_for_sink.header.total_record_length,
+                rmid: parsed_for_sink.header.resource_manager_id,
+                info: parsed_for_sink.header.info,
                 kind,
             });
-            let _ = final_bytes; // bytes scattered into walker via rewrite_record
 
             // Frame buffer[wire_offset..record_end] as one wire chunk
             // — covers page headers + inter-record padding so the
             // shadow walreceiver sees a byte-exact stream identical
             // to what `restore_command` would land on disk.
-            let last_range = completed.byte_ranges.last().copied().unwrap_or((0, 0));
-            let record_end = last_range.0 + last_range.1;
             if record_end > self.wire_offset {
                 let chunk = &self.walker.buffer()[self.wire_offset..record_end];
                 let start_lsn = self.current_lsn + self.wire_offset as u64;
@@ -667,11 +712,11 @@ impl WalStream {
                 self.wire_offset = record_end;
             }
 
-            let source_lsn = self.current_lsn + completed.start_offset as u64;
+            let source_lsn = self.current_lsn + start_offset as u64;
             let record = Record {
-                parsed,
+                parsed: parsed_for_sink,
                 source_lsn,
-                page_magic: completed.page_magic,
+                page_magic,
                 decision,
             };
             record_sink.on_record(&record).await?;
@@ -686,7 +731,6 @@ impl WalStream {
         segment_sink: &mut dyn SegmentSink,
     ) -> Result<(), WalStreamError> {
         let seg = self.segment_for_lsn(self.current_lsn);
-        let bytes = self.walker.take_segment();
         let relmap_delta = self.filter.tracker.relmap_updates - self.relmap_at_segment_start;
         let pgc_un_delta = self.filter.tracker.pg_class_writes_undecoded
             - self.pg_class_undecoded_at_segment_start;
@@ -709,11 +753,15 @@ impl WalStream {
         // the full segment byte-for-byte.
         let trailing_start_offset = self.wire_offset;
         let trailing_start_lsn = self.current_lsn + trailing_start_offset as u64;
+        let bytes = self.walker.buffer();
         let trailing = &bytes[trailing_start_offset..];
         self.bytes_sink
             .on_segment_boundary(trailing_start_lsn, trailing)
             .await?;
-        segment_sink.on_segment(seg, &bytes, &manifest).await?;
+        segment_sink
+            .on_segment(seg, self.walker.buffer(), &manifest)
+            .await?;
+        self.walker.reset_segment();
         self.current_lsn += self.seg_size;
         self.wire_offset = 0;
         // Snapshot for the next segment's manifest deltas.
@@ -747,9 +795,14 @@ impl WalStream {
         // through one more pass.
         let seg = self.segment_for_lsn(self.current_lsn);
         let seg_start_lsn = self.current_lsn;
-        let mut buf = self.walker.take_segment();
+        // `close` fires once per shutdown so the local copy is
+        // acceptable. Hot-path flushes go through `flush_segment` which
+        // hands the walker buffer to the sink directly.
+        let mut buf: Vec<u8> = Vec::with_capacity(self.seg_size as usize);
+        buf.extend_from_slice(self.walker.buffer());
         let pad = self.seg_size as usize - buf.len();
         buf.extend(std::iter::repeat_n(0u8, pad));
+        self.walker.reset_segment();
         let name = seg.format();
 
         // Re-run the batch filter over the padded buffer. Because we
@@ -930,7 +983,7 @@ mod tests {
         assert!(matches!(err2, WalStreamError::Poisoned));
     }
 
-    fn synth_record(offset: u64, rmid: u8) -> Record {
+    fn synth_record(offset: u64, rmid: u8) -> Record<'static> {
         use wal_rs::pg::walparser::XLogRecordHeader;
         let entry = dummy_manifest_entry(offset, rmid);
         let parsed = ParsedRecord {
@@ -951,7 +1004,7 @@ mod tests {
     impl RecordSink for SharedRmidLog {
         fn on_record<'a>(
             &'a mut self,
-            r: &'a Record,
+            r: &'a Record<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
             Box::pin(async move {
                 self.0
@@ -971,7 +1024,7 @@ mod tests {
     impl RecordSink for ErrAt {
         fn on_record<'a>(
             &'a mut self,
-            _record: &'a Record,
+            _record: &'a Record<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
             Box::pin(async move {
                 let i = self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

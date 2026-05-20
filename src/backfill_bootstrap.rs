@@ -324,12 +324,14 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         };
         let replident = fetch_replident(client, replident_char, oid).await?;
         let attributes = fetch_attributes(client, oid).await?;
+        let qualified_name = RelDescriptor::build_qualified_name(&namespace_name, &name);
         let desc = RelDescriptor {
             rfn,
             oid,
             namespace_oid,
             namespace_name,
             name,
+            qualified_name,
             kind,
             persistence,
             replident,
@@ -528,6 +530,7 @@ mod tests {
             namespace_oid: 2200,
             namespace_name: "public".into(),
             name: "t".into(),
+            qualified_name: RelDescriptor::build_qualified_name("public", "t"),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },

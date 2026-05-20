@@ -311,15 +311,20 @@ async fn records_in_one_xact_share_xact_id_through_stream() {
 /// `RecordSink` whose state lives in an `Arc<Mutex<_>>` so the test
 /// can keep an observation handle after the sink is boxed into
 /// [`CompositeRecordSink::inner`].
-struct SharedCollectingSink(Arc<Mutex<Vec<Record>>>);
+struct SharedCollectingSink(Arc<Mutex<Vec<Record<'static>>>>);
 
 impl RecordSink for SharedCollectingSink {
     fn on_record<'a>(
         &'a mut self,
-        r: &'a Record,
+        r: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            self.0.lock().unwrap().push(r.clone());
+            self.0.lock().unwrap().push(Record {
+                parsed: r.parsed.clone().into_owned(),
+                source_lsn: r.source_lsn,
+                page_magic: r.page_magic,
+                decision: r.decision,
+            });
             Ok(())
         })
     }
@@ -330,7 +335,7 @@ struct SharedCountingSink(Arc<AtomicU64>);
 impl RecordSink for SharedCountingSink {
     fn on_record<'a>(
         &'a mut self,
-        _r: &'a Record,
+        _r: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.0.fetch_add(1, Ordering::Relaxed);
@@ -351,7 +356,7 @@ struct FailOnNth {
 impl RecordSink for FailOnNth {
     fn on_record<'a>(
         &'a mut self,
-        _r: &'a Record,
+        _r: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             let i = self.seen.fetch_add(1, Ordering::Relaxed);

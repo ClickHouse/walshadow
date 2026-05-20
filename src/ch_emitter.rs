@@ -1022,10 +1022,9 @@ impl Emitter {
             .resolver
             .relation_at(committed.decoded.rfn, committed.decoded.source_lsn)
             .await?;
-        let key = format!("{}.{}", rel.namespace_name, rel.name);
         let mapping = {
             let m = self.mapping.read().await;
-            match m.get(&key).cloned() {
+            match m.get(rel.qualified_name.as_ref()).cloned() {
                 Some(v) => v,
                 None => {
                     self.stats.unsupported_relations += 1;
@@ -1035,15 +1034,20 @@ impl Emitter {
         };
         // Initialize per-table encoder lazily on first row.
         let alloc = self.alloc;
-        let enc = if let Some(enc) = self.tables.get_mut(&key) {
-            enc
+        let enc = if self.tables.contains_key(rel.qualified_name.as_ref()) {
+            self.tables
+                .get_mut(rel.qualified_name.as_ref())
+                .expect("just checked")
         } else {
             let plan = TablePlan::build(alloc, &rel, &mapping)?;
             // First row for this (table, xact): issue the INSERT.
             self.client.send_query(&plan.insert_sql, None)?;
             let enc = TableEncoder::new(plan)?;
-            self.tables.insert(key.clone(), enc);
-            self.tables.get_mut(&key).expect("just inserted")
+            let owned_key = rel.qualified_name.as_ref().to_owned();
+            self.tables.insert(owned_key, enc);
+            self.tables
+                .get_mut(rel.qualified_name.as_ref())
+                .expect("just inserted")
         };
         let op = match committed.decoded.op {
             HeapOp::Insert => OP_INSERT,
@@ -1056,7 +1060,8 @@ impl Emitter {
         }
         // Budget check kept simple in v1: flush + close after xact end.
         if enc.rows >= self.config.row_budget || enc.approx_bytes >= self.config.byte_budget {
-            self.flush_table(&key)?;
+            let key_owned = rel.qualified_name.as_ref().to_owned();
+            self.flush_table(&key_owned)?;
         }
         Ok(())
     }
@@ -1075,18 +1080,34 @@ impl Emitter {
         Ok(())
     }
 
-    fn finish_table(&mut self, key: &str) -> Result<(), EmitterError> {
+    /// Drain every per-table encoder. Called by [`Self::on_xact_end`]
+    /// and pulled out so error-paths can `?` cleanly. Successful return
+    /// is the signal [`XactBuffer::commit`](crate::xact_buffer::XactBuffer::commit)
+    /// uses to advance [`XactBufferStats::emitter_ack_lsn`](crate::xact_buffer::XactBufferStats::emitter_ack_lsn);
+    /// no per-emitter ack gauge exists because the buffer's stats are
+    /// the single source of truth for Phase 11's slot-advance gate.
+    fn drain_xact(&mut self) -> Result<(), EmitterError> {
+        // Drain by `mem::take`-ing the table map so the per-table
+        // teardown owns each encoder outright, no key-clones up front.
+        let tables = std::mem::take(&mut self.tables);
+        for (key, enc) in tables {
+            self.finish_table_owned(&key, enc)?;
+        }
+        self.current_xid = None;
+        self.stats.xacts_committed += 1;
+        Ok(())
+    }
+
+    fn finish_table_owned(
+        &mut self,
+        _key: &str,
+        mut enc: TableEncoder,
+    ) -> Result<(), EmitterError> {
         let alloc = self.alloc;
-        {
-            let enc = self
-                .tables
-                .get_mut(key)
-                .expect("finish_table called on unknown key");
-            let n = enc.flush_block(&mut self.client, alloc, BlockOpts::default())?;
-            if n > 0 {
-                self.stats.rows_emitted += n as u64;
-                self.stats.blocks_sent += 1;
-            }
+        let n = enc.flush_block(&mut self.client, alloc, BlockOpts::default())?;
+        if n > 0 {
+            self.stats.rows_emitted += n as u64;
+            self.stats.blocks_sent += 1;
         }
         // Close the INSERT for this table.
         self.client.send_data(None)?;
@@ -1106,23 +1127,6 @@ impl Emitter {
                 _ => {}
             }
         }
-        Ok(())
-    }
-
-    /// Drain every per-table encoder. Called by [`Self::on_xact_end`]
-    /// and pulled out so error-paths can `?` cleanly. Successful return
-    /// is the signal [`XactBuffer::commit`](crate::xact_buffer::XactBuffer::commit)
-    /// uses to advance [`XactBufferStats::emitter_ack_lsn`](crate::xact_buffer::XactBufferStats::emitter_ack_lsn);
-    /// no per-emitter ack gauge exists because the buffer's stats are
-    /// the single source of truth for Phase 11's slot-advance gate.
-    fn drain_xact(&mut self) -> Result<(), EmitterError> {
-        let keys: Vec<String> = self.tables.keys().cloned().collect();
-        for k in &keys {
-            self.finish_table(k)?;
-        }
-        self.tables.clear();
-        self.current_xid = None;
-        self.stats.xacts_committed += 1;
         Ok(())
     }
 
@@ -1352,6 +1356,7 @@ mod tests {
             namespace_oid: 2200,
             namespace_name: "public".into(),
             name: "foo".into(),
+            qualified_name: RelDescriptor::build_qualified_name("public", "foo"),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },

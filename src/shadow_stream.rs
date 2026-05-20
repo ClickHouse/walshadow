@@ -35,7 +35,7 @@ use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use wal_rs::pg::replication::server::{self, ServerError, WalSenderConn, decode_standby_status};
-use wal_rs::pg::replication::stream::{encode_keepalive_frame, encode_wal_data_frame};
+use wal_rs::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 
 use crate::wal_stream::{RecordBytesSink, SinkError};
 
@@ -203,6 +203,41 @@ impl ShadowStreamState {
         true
     }
 
+    /// Append a CopyData envelope wrapping a server-direction frame
+    /// (`'w'` or `'k'`) onto the connection's send queue, building the
+    /// envelope in-place to avoid the intermediate `Vec` allocations
+    /// `encode_*_frame` + `wrap_copy_data` + `enqueue` would otherwise
+    /// stack up per record × connection. `build_body` writes the frame
+    /// body — everything after the 5-byte CopyData header. Returns
+    /// `false` if the resulting envelope would breach `slow_threshold`;
+    /// the connection is then marked closing and the queue cleared
+    /// (consistent with the [`enqueue`] semantics).
+    fn enqueue_copy_data_with(&mut self, id: u64, build_body: impl FnOnce(&mut Vec<u8>)) -> bool {
+        let slow_threshold = self.slow_threshold;
+        let mark_closing = |connections: &mut HashMap<u64, ConnState>| {
+            if let Some(c) = connections.get_mut(&id) {
+                c.closing = true;
+            }
+        };
+        let q = self.send_queues.entry(id).or_default();
+        let envelope_start = q.len();
+        q.push(b'd');
+        // u32 BE length placeholder; back-patched once body bytes are appended.
+        q.extend_from_slice(&[0u8; 4]);
+        let body_start = q.len();
+        build_body(q);
+        let payload_len = 4 + (q.len() - body_start);
+        if envelope_start + 1 + payload_len > slow_threshold {
+            q.truncate(envelope_start);
+            mark_closing(&mut self.connections);
+            self.send_queues.remove(&id);
+            return false;
+        }
+        q[envelope_start + 1..envelope_start + 5]
+            .copy_from_slice(&(payload_len as u32).to_be_bytes());
+        true
+    }
+
     /// Advance the per-connection `dispatched_lsn` after a frame
     /// covering `[prev_lsn, new_lsn)` is enqueued.
     pub fn advance_dispatched(&mut self, id: u64, new_lsn: u64) {
@@ -237,6 +272,7 @@ impl RecordBytesSink for ShadowStreamSink {
             let mut state = self.state.lock().await;
             let end_lsn = start_lsn + bytes.len() as u64;
             state.server_wal_end = state.server_wal_end.max(end_lsn);
+            let server_wal_end = state.server_wal_end;
             let ids: Vec<u64> = state.connections.keys().copied().collect();
             for id in ids {
                 let conn_offset = state
@@ -253,12 +289,10 @@ impl RecordBytesSink for ShadowStreamSink {
                     continue;
                 }
                 let frame_lsn = start_lsn + skip as u64;
-                let frame = wrap_copy_data(&encode_wal_data_frame(
-                    frame_lsn,
-                    state.server_wal_end,
-                    to_send,
-                ));
-                if state.enqueue(id, frame) {
+                let enqueued = state.enqueue_copy_data_with(id, |out| {
+                    encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
+                });
+                if enqueued {
                     state.advance_dispatched(id, end_lsn);
                 }
             }
@@ -275,6 +309,7 @@ impl RecordBytesSink for ShadowStreamSink {
             let mut state = self.state.lock().await;
             let segment_end_lsn = start_lsn + trailing_bytes.len() as u64;
             state.server_wal_end = state.server_wal_end.max(segment_end_lsn);
+            let server_wal_end = state.server_wal_end;
             let ids: Vec<u64> = state.connections.keys().copied().collect();
             for id in ids {
                 let conn_offset = state
@@ -287,35 +322,21 @@ impl RecordBytesSink for ShadowStreamSink {
                     let to_send = &trailing_bytes[skip.min(trailing_bytes.len())..];
                     if !to_send.is_empty() {
                         let frame_lsn = start_lsn + skip as u64;
-                        let frame = wrap_copy_data(&encode_wal_data_frame(
-                            frame_lsn,
-                            state.server_wal_end,
-                            to_send,
-                        ));
-                        if state.enqueue(id, frame) {
+                        let enqueued = state.enqueue_copy_data_with(id, |out| {
+                            encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
+                        });
+                        if enqueued {
                             state.advance_dispatched(id, segment_end_lsn);
                         }
                     }
                 }
-                let frame = wrap_copy_data(&encode_keepalive_frame(state.server_wal_end, false));
-                let _ = state.enqueue(id, frame);
+                let _ = state.enqueue_copy_data_with(id, |out| {
+                    encode_keepalive_frame_into(out, server_wal_end, false);
+                });
             }
             Ok(())
         })
     }
-}
-
-/// Wrap a server-direction frame body (one `'w'` XLogData or `'k'`
-/// keepalive) into a CopyData envelope so the queue holds exactly
-/// what should appear on the wire. Listener task forwards the bytes
-/// verbatim — no further framing.
-fn wrap_copy_data(body: &[u8]) -> Vec<u8> {
-    let payload_len = 4 + body.len();
-    let mut out = Vec::with_capacity(1 + payload_len);
-    out.push(b'd');
-    out.extend_from_slice(&(payload_len as u32).to_be_bytes());
-    out.extend_from_slice(body);
-    out
 }
 
 /// Walsender listener address: prefers a unix socket path next to

@@ -30,7 +30,7 @@ pub enum FpiError {
 /// `page_magic` selects PG-14 vs PG-15 bimg_info bit layout; pass
 /// `XLogPageHeader.magic` of the page that started the record
 pub fn restore_block_image(
-    block: &XLogRecordBlock,
+    block: &XLogRecordBlock<'_>,
     page_magic: u16,
 ) -> Result<[u8; PAGE_BYTES], FpiError> {
     if !block.header.has_image() {
@@ -132,7 +132,7 @@ mod tests {
         info: u8,
         hole_offset: u16,
         hole_length: u16,
-    ) -> XLogRecordBlock {
+    ) -> XLogRecordBlock<'static> {
         let mut header = XLogRecordBlockHeader::new(0);
         header.fork_flags = BKP_BLOCK_HAS_IMAGE;
         header.image_header = XLogRecordBlockImageHeader {
@@ -143,8 +143,8 @@ mod tests {
         };
         XLogRecordBlock {
             header,
-            image,
-            data: Vec::new(),
+            image: std::borrow::Cow::Owned(image),
+            data: std::borrow::Cow::Borrowed(&[]),
         }
     }
 

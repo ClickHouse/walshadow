@@ -350,7 +350,7 @@ struct DaemonSinks {
 impl RecordSink for DaemonSinks {
     fn on_record<'a>(
         &'a mut self,
-        record: &'a Record,
+        record: &'a Record<'a>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>,
     > {

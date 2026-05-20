@@ -94,7 +94,7 @@ mod tests {
     use super::*;
     use wal_rs::pg::walparser::XLogRecordHeader;
 
-    fn new_cid_record(spc: u32, db: u32, rel: u32) -> XLogRecord {
+    fn new_cid_record(spc: u32, db: u32, rel: u32) -> XLogRecord<'static> {
         let mut md = Vec::with_capacity(NEW_CID_MIN_SIZE);
         md.extend_from_slice(&100u32.to_le_bytes()); // top_xid
         md.extend_from_slice(&1u32.to_le_bytes()); // cmin
@@ -110,7 +110,7 @@ mod tests {
                 info: XLOG_HEAP2_NEW_CID,
                 ..Default::default()
             },
-            main_data: md,
+            main_data: std::borrow::Cow::Owned(md),
             ..Default::default()
         }
     }
@@ -140,11 +140,11 @@ mod tests {
     #[test]
     fn truncated_main_data_returns_none() {
         let mut r = new_cid_record(1663, 5, 1259);
-        r.main_data.truncate(8);
+        r.main_data.to_mut().truncate(8);
         assert!(relation_for_empty(&r).is_none());
     }
 
-    fn btree_reuse_record(spc: u32, db: u32, rel: u32) -> XLogRecord {
+    fn btree_reuse_record(spc: u32, db: u32, rel: u32) -> XLogRecord<'static> {
         let mut md = Vec::with_capacity(BTREE_REUSE_PAGE_MIN_SIZE);
         md.extend_from_slice(&spc.to_le_bytes());
         md.extend_from_slice(&db.to_le_bytes());
@@ -158,7 +158,7 @@ mod tests {
                 info: XLOG_BTREE_REUSE_PAGE,
                 ..Default::default()
             },
-            main_data: md,
+            main_data: std::borrow::Cow::Owned(md),
             ..Default::default()
         }
     }
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn btree_reuse_truncated_returns_none() {
         let mut r = btree_reuse_record(1663, 5, 1259);
-        r.main_data.truncate(4);
+        r.main_data.to_mut().truncate(4);
         assert!(relation_for_empty(&r).is_none());
     }
 

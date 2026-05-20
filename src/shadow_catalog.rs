@@ -88,6 +88,12 @@ pub struct RelDescriptor {
     pub namespace_oid: Oid,
     pub namespace_name: String,
     pub name: String,
+    /// `format!("{namespace_name}.{name}")` cached at construction
+    /// time. Hot-path consumers (CH emitter routing, observers keyed
+    /// by qualified name) read this directly instead of re-formatting
+    /// per row. Wrap in `Arc<str>` so descriptor clones don't recopy
+    /// the bytes.
+    pub qualified_name: Arc<str>,
     /// `pg_class.relkind`: `'r'` table, `'i'` index, `'S'` sequence,
     /// `'t'` toast, `'v'` view, `'m'` matview, `'c'` composite,
     /// `'f'` foreign, `'p'` partitioned.
@@ -103,6 +109,18 @@ pub struct RelDescriptor {
     /// without a second catalog round-trip.
     pub replident: ReplIdent,
     pub attributes: Vec<RelAttr>,
+}
+
+impl RelDescriptor {
+    /// Build the cached qualified-name `Arc<str>` for callers
+    /// constructing a descriptor manually (tests + bootstrap paths).
+    pub fn build_qualified_name(namespace_name: &str, name: &str) -> Arc<str> {
+        let mut s = String::with_capacity(namespace_name.len() + 1 + name.len());
+        s.push_str(namespace_name);
+        s.push('.');
+        s.push_str(name);
+        Arc::<str>::from(s)
+    }
 }
 
 /// Resolved `pg_class.relreplident`. `pg_class` stores a single char
@@ -594,12 +612,14 @@ impl ShadowCatalog {
         let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
         let replident = self.fetch_replident(replident_char, oid).await?;
         let attributes = self.fetch_attributes(oid).await?;
+        let qualified_name = RelDescriptor::build_qualified_name(&namespace_name, &name);
         Ok(Some(RelDescriptor {
             rfn,
             oid,
             namespace_oid,
             namespace_name,
             name,
+            qualified_name,
             kind,
             persistence,
             replident,
@@ -646,12 +666,14 @@ impl ShadowCatalog {
         };
         let replident = self.fetch_replident(replident_char, oid).await?;
         let attributes = self.fetch_attributes(oid).await?;
+        let qualified_name = RelDescriptor::build_qualified_name(&namespace_name, &name);
         Ok(Some(RelDescriptor {
             rfn,
             oid,
             namespace_oid,
             namespace_name,
             name,
+            qualified_name,
             kind,
             persistence,
             replident,

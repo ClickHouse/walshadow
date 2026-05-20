@@ -50,13 +50,23 @@ pub enum StreamingWalkError {
 }
 
 /// One completed record's physical footprint within the current segment.
+///
+/// For the overwhelmingly common single-page case the walker carries
+/// no bytes at all — the caller reads them as a `&[u8]` slice of
+/// `walker.buffer()[byte_ranges[0]]`. Cross-page records have already
+/// been stitched (assembled across `byte_ranges` into one contiguous
+/// view) by the walker, so `stitched_bytes` is `Some(Vec<u8>)`. The
+/// [`logical_bytes`](CompletedRecord::logical_bytes) helper hides the
+/// distinction.
 #[derive(Debug, Clone)]
 pub struct CompletedRecord {
-    /// Logical record bytes (header + body), exactly `xl_tot_len` long.
-    pub logical_bytes: Vec<u8>,
+    /// `Some` if the record straddled a page boundary and the walker
+    /// had to materialise it into a contiguous Vec; `None` for the
+    /// common single-page case where the bytes still sit inside the
+    /// walker buffer at `byte_ranges[0]` and don't need copying.
+    pub stitched_bytes: Option<Vec<u8>>,
     /// `(offset, len)` pairs the logical bytes occupy in the segment
-    /// buffer, in order. `byte_ranges.iter().map(|(_, l)| l).sum() ==
-    /// logical_bytes.len()`.
+    /// buffer, in order. Sum equals the record's `xl_tot_len`.
     pub byte_ranges: ByteRanges,
     /// First byte offset in the segment (= `byte_ranges[0].0`).
     pub start_offset: usize,
@@ -65,28 +75,76 @@ pub struct CompletedRecord {
     pub page_magic: u16,
 }
 
+impl CompletedRecord {
+    /// Hand back the record's logical bytes. For cross-page records
+    /// this is a slice of the walker's stitched buffer; for
+    /// single-page it's a slice of `walker_buf` at the record's
+    /// `byte_ranges[0]`. Caller must pass `walker.buffer()`.
+    pub fn logical_bytes<'a>(&'a self, walker_buf: &'a [u8]) -> &'a [u8] {
+        if let Some(v) = &self.stitched_bytes {
+            return v.as_slice();
+        }
+        let (off, len) = self.byte_ranges[0];
+        &walker_buf[off..off + len]
+    }
+
+    /// Total record length (== `xl_tot_len`).
+    pub fn total_len(&self) -> usize {
+        self.byte_ranges.iter().map(|(_, l)| *l).sum()
+    }
+}
+
 #[derive(Debug)]
 struct Pending {
     start_offset: usize,
     total_len: Option<u32>,
-    accumulated: Vec<u8>,
+    /// `(offset, len)` slices in [`StreamingWalker::buf`] the record's
+    /// bytes occupy so far. Sole source of truth — the byte values
+    /// themselves live in the walker buffer, never duplicated. Field
+    /// `accumulated_len` mirrors `byte_ranges.iter().map(|(_, l)|
+    /// l).sum()` so hot-path completion checks dodge an iter walk.
     byte_ranges: ByteRanges,
+    accumulated_len: usize,
     page_magic: u16,
 }
 
 impl Pending {
-    fn try_resolve_total_len(&mut self) {
-        if self.total_len.is_none() && self.accumulated.len() >= X_LOG_RECORD_HEADER_SIZE {
-            let t = u32::from_le_bytes(self.accumulated[0..4].try_into().unwrap());
-            self.total_len = Some(t);
+    /// Read the record's `xl_tot_len` (first 4 bytes) once it's
+    /// landed across `byte_ranges`. Walks ranges into `buf` rather
+    /// than a duplicated `accumulated` Vec.
+    fn try_resolve_total_len(&mut self, buf: &[u8]) {
+        if self.total_len.is_some() || self.accumulated_len < X_LOG_RECORD_HEADER_SIZE {
+            return;
         }
+        let mut hdr = [0u8; 4];
+        let mut cursor = 0;
+        for &(off, len) in &self.byte_ranges {
+            if cursor >= 4 {
+                break;
+            }
+            let take = (4 - cursor).min(len);
+            hdr[cursor..cursor + take].copy_from_slice(&buf[off..off + take]);
+            cursor += take;
+        }
+        self.total_len = Some(u32::from_le_bytes(hdr));
     }
 
     fn fully_loaded(&self) -> bool {
         match self.total_len {
-            Some(t) => self.accumulated.len() == t as usize,
+            Some(t) => self.accumulated_len == t as usize,
             None => false,
         }
+    }
+
+    /// Materialise the logical bytes the record's `byte_ranges` cover
+    /// in `buf`. Called at completion to hand owned bytes to the
+    /// caller; never invoked mid-stitch.
+    fn materialise(&self, buf: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.accumulated_len);
+        for &(off, len) in &self.byte_ranges {
+            out.extend_from_slice(&buf[off..off + len]);
+        }
+        out
     }
 }
 
@@ -178,14 +236,15 @@ impl StreamingWalker {
         debug_assert_eq!(cursor, new_logical.len());
     }
 
-    /// Drop the current segment buffer + reset walker state. Returns
-    /// the completed segment bytes for downstream dispatch. Cross
-    /// segment `Pending` is dropped (matches per-segment-walker
-    /// semantics).
-    pub fn take_segment(&mut self) -> Vec<u8> {
-        let mut new_buf = Vec::new();
-        new_buf.reserve_exact(self.seg_size);
-        let out = std::mem::replace(&mut self.buf, new_buf);
+    /// Reset walker state for the next segment. Reuses the existing
+    /// 16 MiB buffer allocation (`Vec::clear` retains capacity) so
+    /// segment-cadence flushes don't churn the allocator — under
+    /// steady-state replication that's roughly `seg_size` per
+    /// `archive_timeout` of saved commit charge on no-overcommit
+    /// hosts. Cross-segment `Pending` is dropped (matches
+    /// per-segment-walker semantics).
+    pub fn reset_segment(&mut self) {
+        self.buf.clear();
         self.cursor = 0;
         self.page_start = 0;
         self.page_magic = 0;
@@ -194,13 +253,17 @@ impl StreamingWalker {
         self.page_header_consumed = false;
         self.pending = None;
         self.done_in_segment = false;
-        out
     }
 
     /// Yield the next completed record if available. Returns `None`
     /// when the walker needs more bytes; the caller's pattern is
     /// `while let Some(r) = walker.try_next()? { ... }` after every
     /// `extend`.
+    ///
+    /// Single-page records are returned with `stitched_bytes: None`
+    /// — the caller reads bytes via [`CompletedRecord::logical_bytes`]
+    /// straight off [`buffer`](Self::buffer), no per-record alloc.
+    /// Cross-page records carry an owned stitched Vec.
     pub fn try_next(&mut self) -> Option<Result<CompletedRecord, StreamingWalkError>> {
         if self.done_in_segment {
             return None;
@@ -223,22 +286,22 @@ impl StreamingWalker {
             if let Some(p) = self.pending.as_mut()
                 && let Some(total) = p.total_len
             {
-                let remaining = total as usize - p.accumulated.len();
+                let remaining = total as usize - p.accumulated_len;
                 let page_end = self.page_start + PAGE_SIZE;
                 let avail_on_page = page_end.saturating_sub(self.page_cursor);
                 let take_now = remaining
                     .min(avail_on_page)
                     .min(self.buf.len().saturating_sub(self.page_cursor));
                 if take_now > 0 {
-                    let chunk = &self.buf[self.page_cursor..self.page_cursor + take_now];
-                    p.accumulated.extend_from_slice(chunk);
                     p.byte_ranges.push((self.page_cursor, take_now));
+                    p.accumulated_len += take_now;
                     self.page_cursor += take_now;
                 }
                 if p.fully_loaded() {
                     let p = self.pending.take().unwrap();
+                    let stitched = p.materialise(&self.buf);
                     return Some(Ok(CompletedRecord {
-                        logical_bytes: p.accumulated,
+                        stitched_bytes: Some(stitched),
                         byte_ranges: p.byte_ranges,
                         start_offset: p.start_offset,
                         page_magic: p.page_magic,
@@ -258,25 +321,25 @@ impl StreamingWalker {
             // step 2 but without `remaining` cap until `total_len`
             // resolves.
             if let Some(p) = self.pending.as_mut() {
-                let needed = X_LOG_RECORD_HEADER_SIZE - p.accumulated.len();
+                let needed = X_LOG_RECORD_HEADER_SIZE - p.accumulated_len;
                 let page_end = self.page_start + PAGE_SIZE;
                 let avail_on_page = page_end.saturating_sub(self.page_cursor);
                 let take_now = needed
                     .min(avail_on_page)
                     .min(self.buf.len().saturating_sub(self.page_cursor));
                 if take_now > 0 {
-                    let chunk = &self.buf[self.page_cursor..self.page_cursor + take_now];
-                    p.accumulated.extend_from_slice(chunk);
                     p.byte_ranges.push((self.page_cursor, take_now));
+                    p.accumulated_len += take_now;
                     self.page_cursor += take_now;
-                    p.try_resolve_total_len();
+                    p.try_resolve_total_len(&self.buf);
                 }
                 // Loop back; resolved or still-resolving handled by
                 // step 2 / next iteration.
                 if p.fully_loaded() {
                     let p = self.pending.take().unwrap();
+                    let stitched = p.materialise(&self.buf);
                     return Some(Ok(CompletedRecord {
-                        logical_bytes: p.accumulated,
+                        stitched_bytes: Some(stitched),
                         byte_ranges: p.byte_ranges,
                         start_offset: p.start_offset,
                         page_magic: p.page_magic,
@@ -404,12 +467,12 @@ impl StreamingWalker {
                 self.done_in_segment = true;
                 return Ok(None);
             }
-            let chunk = &self.buf[self.page_cursor..chunk_end];
+            let chunk_len = chunk_end - self.page_cursor;
             self.pending = Some(Pending {
                 start_offset: self.page_cursor,
                 total_len: None,
-                accumulated: chunk.to_vec(),
-                byte_ranges: smallvec![(self.page_cursor, chunk.len())],
+                byte_ranges: smallvec![(self.page_cursor, chunk_len)],
+                accumulated_len: chunk_len,
                 page_magic: self.page_magic,
             });
             self.page_cursor = page_end;
@@ -455,27 +518,24 @@ impl StreamingWalker {
         }
         let range = (self.page_cursor, take_this_page);
         if take_this_page == total {
-            // Whole record sits on this page.
-            let mut accumulated = Vec::with_capacity(total);
-            accumulated
-                .extend_from_slice(&self.buf[self.page_cursor..self.page_cursor + take_this_page]);
+            // Whole record sits on this page — no per-record alloc.
+            // Caller reads bytes via `CompletedRecord::logical_bytes`
+            // straight off `walker.buffer()`.
             self.page_cursor += take_this_page;
             return Ok(Some(CompletedRecord {
-                logical_bytes: accumulated,
+                stitched_bytes: None,
                 byte_ranges: smallvec![range],
                 start_offset: range.0,
                 page_magic: self.page_magic,
             }));
         }
-        // Record will continue onto subsequent pages.
-        let mut accumulated = Vec::with_capacity(total);
-        accumulated
-            .extend_from_slice(&self.buf[self.page_cursor..self.page_cursor + take_this_page]);
+        // Record will continue onto subsequent pages. byte_ranges
+        // remains the sole source of truth; no duplicate Vec.
         self.pending = Some(Pending {
             start_offset: self.page_cursor,
             total_len: Some(xl_tot_len),
-            accumulated,
             byte_ranges: smallvec![range],
+            accumulated_len: take_this_page,
             page_magic: self.page_magic,
         });
         self.page_cursor = page_end;
@@ -546,10 +606,11 @@ mod tests {
         // Second push: enough to complete the record.
         walker.extend(&page[40 + 30..40 + 50]);
         let r = walker.try_next().unwrap().unwrap();
-        assert_eq!(r.logical_bytes.len(), 50);
+        assert_eq!(r.total_len(), 50);
         assert_eq!(r.byte_ranges.len(), 1);
         assert_eq!(r.start_offset, 40);
         assert_eq!(r.page_magic, XLP_PAGE_MAGIC_PG15);
+        assert!(r.stitched_bytes.is_none(), "single-page borrow path");
 
         // Third push: zero-padded tail. Walker terminates this segment.
         walker.extend(&page[40 + 50..]);
@@ -570,7 +631,7 @@ mod tests {
                 assert!(r.is_none(), "premature yield at byte {i}");
             } else {
                 let rec = r.unwrap().unwrap();
-                assert_eq!(rec.logical_bytes.len(), 80);
+                assert_eq!(rec.total_len(), 80);
             }
         }
     }
@@ -590,8 +651,8 @@ mod tests {
         let r1 = walker.try_next().unwrap().unwrap();
         let r2 = walker.try_next().unwrap().unwrap();
         assert!(walker.try_next().is_none());
-        assert_eq!(r1.logical_bytes.len(), 50);
-        assert_eq!(r2.logical_bytes.len(), 60);
+        assert_eq!(r1.total_len(), 50);
+        assert_eq!(r2.total_len(), 60);
         assert_eq!(r2.start_offset - r1.start_offset, 56);
     }
 
@@ -623,11 +684,25 @@ mod tests {
         assert!(walker.try_next().is_none());
         walker.extend(&page2);
         let r = walker.try_next().unwrap().unwrap();
-        assert!(walker.try_next().is_none());
-        assert_eq!(r.logical_bytes.len(), record_total as usize);
+        assert_eq!(r.total_len(), record_total as usize);
         assert_eq!(r.byte_ranges.len(), 2);
         assert_eq!(r.byte_ranges[0].1, p1_data_area);
         assert_eq!(r.byte_ranges[1].1, p1_remainder_bytes.len());
+        assert!(
+            r.stitched_bytes.is_some(),
+            "cross-page records stitched into owned Vec",
+        );
+        // Stitched bytes match the byte_ranges concatenation off the
+        // walker buffer, confirming `Pending.accumulated` was not
+        // re-introduced.
+        let stitched = r.stitched_bytes.unwrap();
+        let expected: Vec<u8> = r
+            .byte_ranges
+            .iter()
+            .flat_map(|(o, l)| walker.buffer()[*o..*o + *l].to_vec())
+            .collect();
+        assert_eq!(stitched, expected);
+        assert!(walker.try_next().is_none());
     }
 
     #[test]
@@ -639,8 +714,10 @@ mod tests {
         let mut walker = StreamingWalker::new(PAGE_SIZE);
         walker.extend(&page);
         let r = walker.try_next().unwrap().unwrap();
+        let byte_ranges = r.byte_ranges.clone();
+        drop(r);
         let new_logical = vec![0xCCu8; 40];
-        walker.rewrite_record(&r.byte_ranges, &new_logical);
+        walker.rewrite_record(&byte_ranges, &new_logical);
         assert!(walker.buffer()[40..80].iter().all(|&b| b == 0xCC));
         // Bytes outside the record's byte_ranges remain page-header.
         assert_eq!(&walker.buffer()[0..2], &XLP_PAGE_MAGIC_PG15.to_le_bytes(),);
@@ -682,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn take_segment_resets_state() {
+    fn reset_segment_clears_state_and_keeps_capacity() {
         let mut body = header_le(40);
         body.extend_from_slice(&[0u8; 16]);
         let page = build_single_page(&body, XLP_PAGE_MAGIC_PG15, 0);
@@ -690,10 +767,13 @@ mod tests {
         let mut walker = StreamingWalker::new(PAGE_SIZE);
         walker.extend(&page);
         let _r = walker.try_next().unwrap().unwrap();
-        let taken = walker.take_segment();
-        assert_eq!(taken.len(), PAGE_SIZE);
+        assert_eq!(walker.buffer().len(), PAGE_SIZE);
+        let cap_before = walker.buf.capacity();
+        walker.reset_segment();
         assert_eq!(walker.buffer_len(), 0);
         assert!(!walker.segment_full());
+        // Capacity reused across the segment boundary.
+        assert_eq!(walker.buf.capacity(), cap_before);
         // Cursor / page state reset so a fresh segment starts clean.
         walker.extend(&page);
         let r2 = walker.try_next().unwrap().unwrap();

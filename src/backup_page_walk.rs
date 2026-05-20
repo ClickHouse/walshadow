@@ -533,6 +533,7 @@ mod tests {
             namespace_oid: 2200,
             namespace_name: "public".into(),
             name: "t".into(),
+            qualified_name: RelDescriptor::build_qualified_name("public", "t"),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },

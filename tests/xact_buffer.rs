@@ -400,7 +400,7 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
     }
 }
 
-fn xact_record(info_op: u8, xid: u32, xact_time: i64) -> Record {
+fn xact_record(info_op: u8, xid: u32, xact_time: i64) -> Record<'static> {
     let mut main_data = Vec::with_capacity(8);
     main_data.extend_from_slice(&xact_time.to_le_bytes());
     Record {
@@ -411,7 +411,7 @@ fn xact_record(info_op: u8, xid: u32, xact_time: i64) -> Record {
                 xact_id: xid,
                 ..Default::default()
             },
-            main_data,
+            main_data: std::borrow::Cow::Owned(main_data),
             ..Default::default()
         },
         source_lsn: 0,

@@ -106,7 +106,7 @@ struct DaemonSinks {
 impl RecordSink for DaemonSinks {
     fn on_record<'a>(
         &'a mut self,
-        record: &'a Record,
+        record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.metrics.on_record(record).await?;

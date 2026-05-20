@@ -178,7 +178,7 @@ mod tests {
         BlockLocation, RelFileNode, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 
-    fn record_with(rm: RmId, rel_nodes: &[u32]) -> XLogRecord {
+    fn record_with(rm: RmId, rel_nodes: &[u32]) -> XLogRecord<'static> {
         let blocks = rel_nodes
             .iter()
             .map(|&rn| XLogRecordBlock {

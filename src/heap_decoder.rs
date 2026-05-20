@@ -261,7 +261,7 @@ pub enum ColumnValue {
 
 /// On-disk TOAST pointer (`struct varatt_external` in PG `varatt.h`).
 /// 16 bytes total, unaligned in the source tuple.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToastPointer {
     pub va_rawsize: i32,
     pub va_extinfo: u32,
@@ -1163,6 +1163,7 @@ mod tests {
             namespace_oid: 2200,
             namespace_name: "public".into(),
             name: "t".into(),
+            qualified_name: RelDescriptor::build_qualified_name("public", "t"),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -1185,7 +1186,12 @@ mod tests {
         v
     }
 
-    fn record_with(rm: RmId, info: u8, main_data: Vec<u8>, block_data: Vec<u8>) -> XLogRecord {
+    fn record_with(
+        rm: RmId,
+        info: u8,
+        main_data: Vec<u8>,
+        block_data: Vec<u8>,
+    ) -> XLogRecord<'static> {
         XLogRecord {
             header: XLogRecordHeader {
                 resource_manager_id: rm as u8,
@@ -1205,10 +1211,10 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                data: block_data,
+                data: std::borrow::Cow::Owned(block_data),
                 ..Default::default()
             }],
-            main_data,
+            main_data: std::borrow::Cow::Owned(main_data),
             ..Default::default()
         }
     }

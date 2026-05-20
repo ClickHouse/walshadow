@@ -149,7 +149,7 @@ mod tests {
         BlockLocation, RelFileNode, RmId, XLogRecordBlockHeader, XLogRecordHeader,
     };
 
-    fn rec(rm: RmId, rels: &[(u32, u32)]) -> XLogRecord {
+    fn rec(rm: RmId, rels: &[(u32, u32)]) -> XLogRecord<'static> {
         XLogRecord {
             header: XLogRecordHeader {
                 resource_manager_id: rm as u8,
@@ -233,7 +233,7 @@ mod tests {
             md.extend_from_slice(&[0u8; 6]); // target_tid
             md
         }
-        fn new_cid_record(db: u32, rel: u32) -> XLogRecord {
+        fn new_cid_record(db: u32, rel: u32) -> XLogRecord<'static> {
             XLogRecord {
                 header: wal_rs::pg::walparser::XLogRecordHeader {
                     resource_manager_id: RmId::Heap2 as u8,
@@ -241,7 +241,7 @@ mod tests {
                     total_record_length: 64,
                     ..Default::default()
                 },
-                main_data: new_cid_main_data(db, rel),
+                main_data: std::borrow::Cow::Owned(new_cid_main_data(db, rel)),
                 ..Default::default()
             }
         }

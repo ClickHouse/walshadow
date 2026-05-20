@@ -325,7 +325,7 @@ mod tests {
         BlockLocation, RelFileNode, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 
-    fn relmap_record(dbid: u32, mappings: &[(u32, u32)]) -> XLogRecord {
+    fn relmap_record(dbid: u32, mappings: &[(u32, u32)]) -> XLogRecord<'static> {
         let mut data = Vec::new();
         data.extend_from_slice(&dbid.to_le_bytes());
         data.extend_from_slice(&1664u32.to_le_bytes()); // tsid pg_global
@@ -351,12 +351,18 @@ mod tests {
                 ..Default::default()
             },
             main_data_len: data.len() as u32,
-            main_data: data,
+            main_data: std::borrow::Cow::Owned(data),
             ..Default::default()
         }
     }
 
-    fn heap_block_record(rm: RmId, info: u8, db: u32, rel: u32, data: Vec<u8>) -> XLogRecord {
+    fn heap_block_record(
+        rm: RmId,
+        info: u8,
+        db: u32,
+        rel: u32,
+        data: Vec<u8>,
+    ) -> XLogRecord<'static> {
         heap_block_record_with_main(rm, info, db, rel, data, Vec::new())
     }
 
@@ -367,7 +373,7 @@ mod tests {
         rel: u32,
         data: Vec<u8>,
         main_data: Vec<u8>,
-    ) -> XLogRecord {
+    ) -> XLogRecord<'static> {
         XLogRecord {
             header: XLogRecordHeader {
                 resource_manager_id: rm as u8,
@@ -386,10 +392,10 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                data,
+                data: std::borrow::Cow::Owned(data),
                 ..Default::default()
             }],
-            main_data,
+            main_data: std::borrow::Cow::Owned(main_data),
             ..Default::default()
         }
     }
@@ -609,7 +615,7 @@ mod tests {
     fn relmap_malformed_main_data_is_ignored() {
         let mut t = CatalogTracker::new();
         let mut r = relmap_record(5, &[(1259, 50000)]);
-        r.main_data.truncate(8); // chop off nbytes
+        r.main_data.to_mut().truncate(8); // chop off nbytes
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
         assert_eq!(t.relmap_updates, 1); // still counted, just no update applied
@@ -726,7 +732,7 @@ mod tests {
         let mut r = relmap_record(5, &[(1259, 50000)]);
         // Patch nbytes (offset 8..12 in main_data) to something other than
         // REL_MAP_FILE_SIZE. The decoder must short-circuit before reading.
-        r.main_data[8..12].copy_from_slice(&12345i32.to_le_bytes());
+        r.main_data.to_mut()[8..12].copy_from_slice(&12345i32.to_le_bytes());
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
         assert_eq!(t.relmap_updates, 1);
@@ -738,7 +744,7 @@ mod tests {
         let mut r = relmap_record(5, &[(1259, 50000)]);
         // Magic is the first 4 bytes of the rel-map-file (offset 12..16 of
         // main_data: 12 header + 0 magic offset).
-        r.main_data[12..16].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        r.main_data.to_mut()[12..16].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
     }
@@ -748,7 +754,7 @@ mod tests {
         let mut t = CatalogTracker::new();
         let mut r = relmap_record(5, &[(1259, 50000)]);
         // num_mappings sits at main_data[16..20] (12 header + 4 magic).
-        r.main_data[16..20].copy_from_slice(&((MAX_MAPPINGS + 1) as i32).to_le_bytes());
+        r.main_data.to_mut()[16..20].copy_from_slice(&((MAX_MAPPINGS + 1) as i32).to_le_bytes());
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
     }
@@ -768,7 +774,7 @@ mod tests {
         let mut t = CatalogTracker::new();
         let mut r = relmap_record(5, &[(1259, 50000)]);
         // Lop off the relmap body so len < 12 + REL_MAP_FILE_SIZE.
-        r.main_data.truncate(4);
+        r.main_data.to_mut().truncate(4);
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
     }

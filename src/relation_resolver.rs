@@ -91,6 +91,8 @@ mod tests {
     use crate::shadow_catalog::{RelAttr, ReplIdent};
 
     fn mk_rel(rel_node: u32) -> Arc<RelDescriptor> {
+        let name = format!("t{rel_node}");
+        let qualified_name = RelDescriptor::build_qualified_name("public", &name);
         Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -100,7 +102,8 @@ mod tests {
             oid: rel_node,
             namespace_oid: 2200,
             namespace_name: "public".into(),
-            name: format!("t{rel_node}"),
+            name,
+            qualified_name,
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
