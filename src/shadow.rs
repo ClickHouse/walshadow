@@ -194,10 +194,12 @@ impl Shadow {
         Ok(())
     }
 
-    /// Drop `standby.signal` + append `restore_command` to
-    /// `postgresql.conf`. Idempotent on `standby.signal`; appends a
-    /// fresh `restore_command` block on every call (later wins).
-    pub fn enable_standby_recovery(&self) -> Result<()> {
+    /// Drop `standby.signal` + append `primary_conninfo` (walsender
+    /// hot path) and `restore_command` (archive fallback) to
+    /// `postgresql.conf`. PG's walreceiver tries `primary_conninfo`
+    /// first and falls back to `restore_command` on connect error or
+    /// end-of-WAL.
+    pub fn enable_standby_recovery(&self, primary_conninfo: &str) -> Result<()> {
         let signal = self.config.data_dir.join("standby.signal");
         fs::write(&signal, b"")?;
         let conf_path = self.config.data_dir.join("postgresql.conf");
@@ -206,8 +208,12 @@ impl Shadow {
             .filter_out_dir
             .to_str()
             .expect("non-utf8 filter_out_dir");
+        // Escape any embedded single-quote per PG conf-string
+        // doubling convention.
+        let escaped = primary_conninfo.replace('\'', "''");
         let body = format!(
             "\n# walshadow recovery\n\
+             primary_conninfo = '{escaped}'\n\
              restore_command = 'cp {filter_dir}/%f %p'\n\
              recovery_target_timeline = 'latest'\n",
         );
@@ -475,5 +481,34 @@ mod tests {
             cfg.socket_dir,
             PathBuf::from("/tmp/walshadow-test/shadow_sock")
         );
+    }
+
+    #[test]
+    fn enable_standby_recovery_writes_signal_and_conf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let filter_dir = tmp.path().join("filtered");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&filter_dir).unwrap();
+        // Empty postgresql.conf — append() requires the file to exist.
+        fs::write(data_dir.join("postgresql.conf"), b"# base\n").unwrap();
+        let cfg = ShadowConfig::new(data_dir.clone(), filter_dir);
+        let shadow = Shadow::new(cfg);
+        shadow
+            .enable_standby_recovery(
+                "host=/tmp/sock port=55555 user=walshadow application_name=shadow",
+            )
+            .unwrap();
+        let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
+        assert!(
+            conf.contains("primary_conninfo"),
+            "no conninfo line: {conf}"
+        );
+        assert!(
+            conf.contains("restore_command"),
+            "no restore_command: {conf}"
+        );
+        assert!(conf.contains("recovery_target_timeline"));
+        assert!(data_dir.join("standby.signal").exists());
     }
 }

@@ -37,9 +37,7 @@ use walshadow::ch_emitter::{
 };
 use walshadow::decoder_sink::TupleObserver;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{
-    ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
-};
+use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
@@ -49,15 +47,19 @@ use walshadow::xact_buffer::{BufferingDecoderSink, XactBuffer, XactBufferConfig,
 // Non-overlapping ports — Phase 8 tests live in the 56100-range; pick
 // one slot per (cluster, ch-server) per test so a leftover from a
 // crashed prior run doesn't shadow the next one's port binding.
-const SOURCE_PORT: u16 = 56101;
-const SHADOW_PORT: u16 = 56102;
-const CH_TCP_PORT: u16 = 56109;
-const CH_HTTP_PORT: u16 = 56110;
+const SOURCE_PORT: u16 = 17101;
+const SHADOW_PORT: u16 = 17102;
+const CH_TCP_PORT: u16 = 17109;
+const CH_HTTP_PORT: u16 = 17110;
+// Far enough from CH ports that CH's auto-derived sidecar ports
+// (tcp_port_secure, interserver, etc.) don't accidentally bind it.
+const WALSENDER_PORT: u16 = 17150;
 // Schema-evolution drill ports.
-const SOURCE_PORT_S: u16 = 56121;
-const SHADOW_PORT_S: u16 = 56122;
-const CH_TCP_PORT_S: u16 = 56129;
-const CH_HTTP_PORT_S: u16 = 56130;
+const SOURCE_PORT_S: u16 = 17221;
+const SHADOW_PORT_S: u16 = 17222;
+const CH_TCP_PORT_S: u16 = 17229;
+const CH_HTTP_PORT_S: u16 = 17230;
+const WALSENDER_PORT_S: u16 = 17280;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -176,11 +178,15 @@ fn rewrite_for_shadow(data_dir: &Path, port: u16, socket_dir: &Path) -> Result<(
     Ok(())
 }
 
-fn enable_recovery(data_dir: &Path, restore_from: &Path) -> Result<()> {
+fn enable_recovery(data_dir: &Path, restore_from: &Path, walsender_port: u16) -> Result<()> {
     fs::write(data_dir.join("standby.signal"), b"")?;
     let conf = data_dir.join("postgresql.conf");
     let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
     writeln!(f, "\n# walshadow recovery")?;
+    writeln!(
+        f,
+        "primary_conninfo = 'host=127.0.0.1 port={walsender_port} user=walshadow application_name=shadow sslmode=disable'",
+    )?;
     writeln!(f, "restore_command = 'cp {}/%f %p'", restore_from.display())?;
     writeln!(f, "recovery_target_timeline = 'latest'")?;
     Ok(())
@@ -370,12 +376,16 @@ struct BootstrappedClusters {
     shadow_filter_dir: PathBuf,
 }
 
-fn bootstrap_clusters(
+async fn bootstrap_clusters(
     tmp: &tempfile::TempDir,
     schema_sql: &str,
     source_port: u16,
     shadow_port: u16,
-) -> BootstrappedClusters {
+    walsender_port: u16,
+) -> (
+    BootstrappedClusters,
+    Arc<Mutex<walshadow::shadow_stream::ShadowStreamState>>,
+) {
     // 1. Source PG — wal_level=logical so UPDATE/DELETE WAL records
     // carry the old-tuple bytes the heap decoder expects.
     let source = make_pg(tmp, "source", source_port);
@@ -413,9 +423,45 @@ fn bootstrap_clusters(
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
     rewrite_for_shadow(&shadow_data, shadow_port, &shadow_sock).expect("retarget conf");
-    enable_recovery(&shadow_data, &shadow_filter_dir).expect("standby.signal + restore_command");
+    enable_recovery(&shadow_data, &shadow_filter_dir, walsender_port)
+        .expect("standby.signal + restore_command");
 
-    // 6. Wrap the populated data dir in a Shadow for lifecycle control.
+    // 6. Spawn the walsender BEFORE shadow.start() so shadow's
+    // walreceiver hits an already-listening socket on its first
+    // connection attempt. PG's "invalid magic" check on pg_wal/seg3
+    // races the walreceiver bytes write — losing that race
+    // terminates the walreceiver and lets restore_command (which
+    // also has nothing yet) starve the recovery.
+    //
+    // Identity is read from source via psql so we can stamp the
+    // ShadowStreamState's `system_identifier` before any walreceiver
+    // connects — IDENTIFY_SYSTEM round-trip must match the source's
+    // basebackup-derived sysid or walreceiver bails immediately.
+    let sysid = source
+        .psql_one("SELECT system_identifier::text FROM pg_control_system()")
+        .expect("read source sysid");
+    let xlogpos_str = source
+        .psql_one("SELECT pg_current_wal_lsn()::text")
+        .expect("read source xlogpos");
+    let xlogpos = walshadow::shadow::parse_pg_lsn(&xlogpos_str).expect("parse xlogpos");
+    let aligned = WalStream::align_down(xlogpos, WAL_SEG_SIZE);
+    let shadow_stream_state = Arc::new(Mutex::new(
+        walshadow::shadow_stream::ShadowStreamState::new(1, sysid, aligned, 64 * 1024 * 1024),
+    ));
+    let _walsender_task = walshadow::shadow_stream::spawn_listener(
+        walshadow::shadow_stream::WalSenderAddr::Tcp(
+            format!("127.0.0.1:{walsender_port}").parse().unwrap(),
+        ),
+        shadow_stream_state.clone(),
+        Duration::from_millis(5),
+    )
+    .await
+    .expect("spawn walsender");
+    // Detach: caller test holds the state Arc; listener task lives
+    // for as long as the runtime.
+    std::mem::forget(_walsender_task);
+
+    // 7. Wrap the populated data dir in a Shadow for lifecycle control.
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
     shadow_cfg.port = shadow_port;
     shadow_cfg.socket_dir = shadow_sock;
@@ -431,11 +477,14 @@ fn bootstrap_clusters(
         "shadow must boot into recovery from the basebackup + standby.signal",
     );
 
-    BootstrappedClusters {
-        source,
-        shadow,
-        shadow_filter_dir,
-    }
+    (
+        BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -464,18 +513,23 @@ async fn phase8_insert_update_delete_replicates_to_clickhouse() {
     // inherits the same oids / filenodes — the decoder's
     // `pg_relation_filenode(oid)` probes on shadow then resolve every
     // WAL record's relation.
-    let BootstrappedClusters {
-        source,
-        shadow,
-        shadow_filter_dir,
-    } = bootstrap_clusters(
+    let (
+        BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = bootstrap_clusters(
         &tmp,
         "CREATE SCHEMA s8;\n\
          CREATE TABLE s8.t (id bigint PRIMARY KEY, payload text);\n\
          ALTER TABLE s8.t REPLICA IDENTITY FULL;\n",
         SOURCE_PORT,
         SHADOW_PORT,
-    );
+        WALSENDER_PORT,
+    )
+    .await;
     let _src_stop = StopOnDrop { sh: &source };
     let _shd_stop = StopOnDrop { sh: &shadow };
 
@@ -518,6 +572,11 @@ async fn phase8_insert_update_delete_replicates_to_clickhouse() {
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
     let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    // Walsender already bound by bootstrap_clusters before shadow.start();
+    // install the sink that bridges WalStream → that listener task.
+    stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
+        shadow_stream_state.clone(),
+    )));
 
     // 9. Seed catalog tracker from source pg_class so pre-attach filenode
     // rotations don't bite us.
@@ -541,7 +600,7 @@ async fn phase8_insert_update_delete_replicates_to_clickhouse() {
         "postgres",
     );
     let cat_cfg = ShadowCatalogConfig {
-        replay_timeout: Duration::from_secs(30),
+        replay_timeout: Duration::from_secs(60),
         replay_poll: Duration::from_millis(50),
         ..Default::default()
     };
@@ -550,9 +609,12 @@ async fn phase8_insert_update_delete_replicates_to_clickhouse() {
         .expect("connect shadow catalog");
     let catalog = Arc::new(Mutex::new(catalog));
 
-    let (inv_tx, inv_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    stream.filter_mut().tracker.set_invalidation_signal(inv_tx);
-    let _invalidation_drain = spawn_invalidation_drain(catalog.clone(), inv_rx);
+    let inv_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    stream
+        .filter_mut()
+        .tracker
+        .set_invalidation_epoch(inv_epoch.clone());
+    catalog.lock().await.set_invalidation_epoch(inv_epoch);
 
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await
@@ -781,18 +843,23 @@ async fn phase8_add_column_replicates_pre_and_post_alter() {
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let BootstrappedClusters {
-        source,
-        shadow,
-        shadow_filter_dir,
-    } = bootstrap_clusters(
+    let (
+        BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = bootstrap_clusters(
         &tmp,
         "CREATE SCHEMA s8;\n\
          CREATE TABLE s8.t (id bigint PRIMARY KEY, payload text);\n\
          ALTER TABLE s8.t REPLICA IDENTITY FULL;\n",
         SOURCE_PORT_S,
         SHADOW_PORT_S,
-    );
+        WALSENDER_PORT_S,
+    )
+    .await;
     let _src_stop = StopOnDrop { sh: &source };
     let _shd_stop = StopOnDrop { sh: &shadow };
 
@@ -833,6 +900,9 @@ async fn phase8_add_column_replicates_pre_and_post_alter() {
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
     let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
+        shadow_stream_state.clone(),
+    )));
 
     {
         let sql_client = feed.sql_client().await.expect("sidecar sql client");
@@ -851,7 +921,7 @@ async fn phase8_add_column_replicates_pre_and_post_alter() {
         "postgres",
     );
     let cat_cfg = ShadowCatalogConfig {
-        replay_timeout: Duration::from_secs(30),
+        replay_timeout: Duration::from_secs(60),
         replay_poll: Duration::from_millis(50),
         ..Default::default()
     };
@@ -860,9 +930,12 @@ async fn phase8_add_column_replicates_pre_and_post_alter() {
         .expect("connect shadow catalog");
     let catalog = Arc::new(Mutex::new(catalog));
 
-    let (inv_tx, inv_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    stream.filter_mut().tracker.set_invalidation_signal(inv_tx);
-    let _invalidation_drain = spawn_invalidation_drain(catalog.clone(), inv_rx);
+    let inv_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    stream
+        .filter_mut()
+        .tracker
+        .set_invalidation_epoch(inv_epoch.clone());
+    catalog.lock().await.set_invalidation_epoch(inv_epoch);
 
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await

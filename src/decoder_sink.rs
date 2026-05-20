@@ -12,8 +12,10 @@
 //! explicit" caveat: every successful decode increments `decoded`;
 //! `partial` counts prefix/suffix-compressed UPDATEs that Phase 6 must
 //! reassemble. `unsupported_rmgr_info`, `skipped_no_block`, and
-//! `replay_timeout` close the per-class accounting so operators can
-//! tell silent loss from real volume.
+//! close the per-class accounting so operators can tell silent loss
+//! from real volume. Catalog gate timeouts poison the stream — no
+//! `replay_timeout` counter, since silent loss is impossible by
+//! construction.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -113,9 +115,6 @@ pub struct DecoderStats {
     /// `seed_from_source`. Counted, not retried — Phase 6's xact
     /// buffer can reorder.
     pub catalog_not_found: u64,
-    /// `relation_at` returned `ReplayTimeout`. Stream proceeds; the
-    /// record is dropped from the decoded stream.
-    pub replay_timeout: u64,
     /// Record was on a `User` relation but the rmgr/info combo isn't
     /// in the Phase 5 matrix (MULTI_INSERT, HEAP2 PRUNE, etc).
     pub skipped_op: u64,
@@ -240,10 +239,9 @@ impl<O: TupleObserver> RecordSink for DecoderSink<O> {
                     self.stats.catalog_not_found += 1;
                     return Ok(());
                 }
-                Err(CatalogError::ReplayTimeout { .. }) => {
-                    self.stats.replay_timeout += 1;
-                    return Ok(());
-                }
+                // PHASE13 §6: ReplayTimeout poisons the stream so the
+                // daemon exits cleanly. Phase 11 cursor resumes from
+                // `dispatched_lsn` on the next boot.
                 Err(e) => return Err(DecoderSinkError::from(e).into()),
             };
             drop(cat);
@@ -293,7 +291,7 @@ impl DecoderStats {
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
         let mut s = format!("decoded={}", self.decoded);
-        let pairs: [(&str, u64); 8] = [
+        let pairs: [(&str, u64); 7] = [
             ("ins", self.inserts),
             ("upd", self.updates),
             ("hot", self.hot_updates),
@@ -301,7 +299,6 @@ impl DecoderStats {
             ("partial", self.partial),
             ("no_blk", self.skipped_no_block),
             ("not_found", self.catalog_not_found),
-            ("replay_to", self.replay_timeout),
         ];
         for (label, n) in pairs {
             if n > 0 {

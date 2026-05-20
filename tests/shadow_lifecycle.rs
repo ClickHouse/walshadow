@@ -93,8 +93,14 @@ fn standby_mode_lifecycle() {
     shadow.stop().expect("stop (normal)");
     assert!(!shadow.is_running().unwrap());
 
-    // Flip into standby.
-    shadow.enable_standby_recovery().expect("enable standby");
+    // Flip into standby. Empty primary_conninfo: the test cluster
+    // has no walsender to point at, so the walreceiver's connection
+    // attempt will fail and PG falls back to the archive
+    // restore_command path (which also has no files). Standby still
+    // boots cleanly into recovery.
+    shadow
+        .enable_standby_recovery("host=/dev/null port=1 user=walshadow application_name=test")
+        .expect("enable standby");
     shadow.start().expect("start (standby)");
     let started = scopeguard_stop(&shadow);
 
@@ -137,7 +143,11 @@ fn restore_command_filename_is_segment_relative() {
     let shadow = make_shadow(&tmp, 55503);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
-    shadow.enable_standby_recovery().expect("standby");
+    shadow
+        .enable_standby_recovery(
+            "host=/var/run/postgresql port=55501 user=walshadow application_name=shadow",
+        )
+        .expect("standby");
 
     let conf = std::fs::read_to_string(tmp.path().join("data/postgresql.conf")).expect("read conf");
     assert!(
@@ -145,6 +155,7 @@ fn restore_command_filename_is_segment_relative() {
         "postgresql.conf missing restore_command line",
     );
     assert!(conf.contains("/%f %p'"));
+    assert!(conf.contains("primary_conninfo"));
     assert!(tmp.path().join("data/standby.signal").exists());
 }
 

@@ -19,8 +19,11 @@ use crate::catalog_tracker::CatalogTracker;
 use crate::classify::{Class, classify, rmgr_label};
 use crate::main_data;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum Decision {
+    #[default]
     Keep,
     Drop,
 }

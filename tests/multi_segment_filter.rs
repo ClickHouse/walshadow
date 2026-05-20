@@ -483,13 +483,10 @@ async fn composite_sink_propagates_inner_error_and_short_circuits() {
     assert_eq!(before.load(Ordering::Relaxed), 2);
     assert_eq!(fail_seen.load(Ordering::Relaxed), 2);
     assert_eq!(after.load(Ordering::Relaxed), 1);
-    // `WalStream` does not roll back `next_lsn` on sink error. Phase 8
-    // flipped the dispatch order so the filtered segment lands on disk
-    // *before* per-record dispatch — shadow PG's `restore_command`
-    // needs the file present to advance `pg_last_wal_replay_lsn`,
-    // which the decoder's `relation_at` gate depends on. A record-sink
-    // error after the write leaves the segment on disk; the stream is
-    // already poisoned, so re-running with a fresh `WalStream` is the
-    // recovery path.
-    assert_eq!(segs.segments.len(), 1);
+    // PHASE13 dispatch ordering: per-record `record_sink` fires
+    // before segment_sink lands. A record-sink error poisons the
+    // stream mid-segment, so segment_sink never fires for this
+    // segment. The stream is poisoned; recovery is a fresh
+    // `WalStream` at the chosen resume LSN.
+    assert_eq!(segs.segments.len(), 0);
 }

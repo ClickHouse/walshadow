@@ -10,9 +10,10 @@
 //!
 //! `MAGIC (8B) | version u32 LE | source_received_lsn u64 LE |
 //!  filter_durable_lsn u64 LE | shadow_replay_lsn u64 LE |
-//!  drain_lsn u64 LE | emitter_ack_lsn u64 LE | crc32c u32 LE`
+//!  drain_lsn u64 LE | emitter_ack_lsn u64 LE |
+//!  shadow_flush_lsn u64 LE | crc32c u32 LE`
 //!
-//! Total 56 bytes. CRC32C covers every preceding byte; a corrupt or
+//! Total 64 bytes. CRC32C covers every preceding byte; a corrupt or
 //! truncated file surfaces as [`CursorError`] and the boot path falls
 //! back to greenfield resume (treat as missing). No partial-write
 //! window because every persist runs `create+write+sync+rename+
@@ -21,7 +22,7 @@
 //!
 //! ## Semantics
 //!
-//! Five LSNs, ordered roughly newest→oldest in WAL position:
+//! Six LSNs, ordered roughly newest→oldest in WAL position:
 //!
 //! * `source_received_lsn`: highest server_wal_end seen on the
 //!   replication socket. Bookkeeping only — never gates anything.
@@ -35,8 +36,13 @@
 //!   buffer (handed to the observer). Strictly higher than
 //!   `emitter_ack_lsn`.
 //! * `emitter_ack_lsn`: highest commit-record LSN where the CH
-//!   emitter's `on_xact_end` returned Ok (block group + `send_data
-//!   (None)` + `EndOfStream` packet). This is the slot-advance ceiling.
+//!   emitter's `on_xact_end` returned Ok. Slot-advance ceiling.
+//! * `shadow_flush_lsn` (PHASE13 §5): minimum `flush_lsn` reported via
+//!   inbound `'r'` standby status across active shadow streaming
+//!   connections. On daemon restart this is the resume position the
+//!   walsender hands shadow back through `START_REPLICATION PHYSICAL
+//!   <lsn>`. Bookkeeping-only when there are no active streaming
+//!   connections; the on-disk `restore_command` fallback takes over.
 //!
 //! The standby-status `apply_lsn` shipped to source equals
 //! `min(shadow_replay_lsn, emitter_ack_lsn)` — neither side may
@@ -53,20 +59,18 @@ use tokio::io::AsyncWriteExt;
 /// PLAN's "cursor file under `{spill_dir}/cursor.bin`".
 pub const CURSOR_FILENAME: &str = "cursor.bin";
 
-/// Schema version. Bump on any layout change; the boot path rejects
-/// older or newer versions explicitly.
-pub const CURSOR_VERSION: u32 = 1;
+/// Schema version. Bump on any layout change; boot path rejects
+/// mismatched versions explicitly.
+pub const CURSOR_VERSION: u32 = 2;
 
-/// Magic prefix. `WSCRSR` + version-byte + reserved-byte. Matches the
-/// MiB-scale file shape PG itself uses for `pg_control` etc — any
-/// scanner can recognise the file from the leading bytes alone.
+/// Magic prefix. `WSCRSR` + version-byte + reserved-byte.
 const MAGIC: &[u8; 8] = b"WSCRSR\x01\x00";
 
 const HEADER_LEN: usize = MAGIC.len() + 4 /*version*/;
-const LSN_COUNT: usize = 5;
+const LSN_COUNT: usize = 6;
 const PAYLOAD_LEN: usize = HEADER_LEN + LSN_COUNT * 8;
 const CRC_LEN: usize = 4;
-/// On-disk byte count of a valid cursor file. `8 + 4 + 5*8 + 4 = 56`.
+/// On-disk byte count of a cursor file. `8 + 4 + 6*8 + 4 = 64`.
 pub const CURSOR_FILE_LEN: usize = PAYLOAD_LEN + CRC_LEN;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -76,13 +80,17 @@ pub struct Cursor {
     pub shadow_replay_lsn: u64,
     pub drain_lsn: u64,
     pub emitter_ack_lsn: u64,
+    /// Minimum flush_lsn across active shadow streaming connections.
+    /// Resume position the walsender hands shadow back through
+    /// `START_REPLICATION PHYSICAL <lsn>` after a daemon restart.
+    pub shadow_flush_lsn: u64,
 }
 
 #[derive(Debug, Error)]
 pub enum CursorError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
-    #[error("cursor file size {got} != expected {CURSOR_FILE_LEN}")]
+    #[error("cursor file size {got} not a recognised cursor length")]
     Size { got: usize },
     #[error("bad magic header")]
     BadMagic,
@@ -97,8 +105,8 @@ pub fn cursor_path(spill_dir: &Path) -> PathBuf {
     spill_dir.join(CURSOR_FILENAME)
 }
 
-/// Encode `cur` into the on-disk byte form. Pure function — exposed
-/// so tests can pin the format.
+/// Encode `cur` into the on-disk byte form (v2). Pure function —
+/// exposed so tests can pin the format.
 pub fn encode(cur: &Cursor) -> Vec<u8> {
     let mut out = Vec::with_capacity(CURSOR_FILE_LEN);
     out.extend_from_slice(MAGIC);
@@ -108,6 +116,7 @@ pub fn encode(cur: &Cursor) -> Vec<u8> {
     out.extend_from_slice(&cur.shadow_replay_lsn.to_le_bytes());
     out.extend_from_slice(&cur.drain_lsn.to_le_bytes());
     out.extend_from_slice(&cur.emitter_ack_lsn.to_le_bytes());
+    out.extend_from_slice(&cur.shadow_flush_lsn.to_le_bytes());
     let crc = crc32c::crc32c(&out);
     out.extend_from_slice(&crc.to_le_bytes());
     debug_assert_eq!(out.len(), CURSOR_FILE_LEN);
@@ -143,12 +152,14 @@ pub fn decode(bytes: &[u8]) -> Result<Cursor, CursorError> {
     let shadow_replay_lsn = read();
     let drain_lsn = read();
     let emitter_ack_lsn = read();
+    let shadow_flush_lsn = read();
     Ok(Cursor {
         source_received_lsn,
         filter_durable_lsn,
         shadow_replay_lsn,
         drain_lsn,
         emitter_ack_lsn,
+        shadow_flush_lsn,
     })
 }
 
@@ -208,6 +219,7 @@ mod tests {
             shadow_replay_lsn: 0x0123_4566_0000_0000,
             drain_lsn: 0x0123_4565_0000_0000,
             emitter_ack_lsn: 0x0123_4564_0000_0000,
+            shadow_flush_lsn: 0x0123_4563_0000_0000,
         }
     }
 

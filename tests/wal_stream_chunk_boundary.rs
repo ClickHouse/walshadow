@@ -1,15 +1,9 @@
-//! PRE5b10 item 5: feed a captured WAL segment through `WalStream` at
-//! varying chunk sizes — one byte at a time, prime-sized chunks, single
-//! bulk push — and assert the per-record event sequence is identical
-//! across all paths.
-//!
-//! Backstop for the latency-contract refactor on [`WalStream::push`]
-//! (PRE5b10 item 2): a future chunk-driven walker that yields records
-//! before the segment fills must still emit the exact same record
-//! sequence as today's "accumulate, then `filter_segment`" path.
-//! Equivalence here means structural per-record fields, not byte
-//! identity of the buffered segment (filter is deterministic, so any
-//! drift would surface as differing record offsets or rmids).
+//! Feed a captured WAL segment through `WalStream` at varying chunk
+//! sizes — one byte at a time, prime-sized chunks, single bulk push —
+//! and assert the per-record event sequence is identical across all
+//! paths. With PHASE13's streaming walker, records yield as their last
+//! byte lands; this test pins the contract that record sequence and
+//! segment bytes are cadence-invariant.
 //!
 //! Skipped silently if the captured fixture is not present.
 
@@ -17,6 +11,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use walshadow::shadow_stream::{ShadowStreamSink, ShadowStreamState};
 use walshadow::wal_stream::{CollectingRecordSink, CollectingSegmentSink, Record, WalStream};
 
 fn fixture_path() -> PathBuf {
@@ -110,20 +105,15 @@ async fn bulk_and_byte_chunks_emit_identical_record_sequence() {
     );
     let seg_size = bytes.len() as u64;
 
-    // (a) one big push
     let bulk = run_with_chunk_sizes(&bytes, seg_size, &[bytes.len()]).await;
     assert!(!bulk.is_empty(), "fixture had zero records");
 
-    // (b) one byte at a time
     let byte_at_a_time = run_with_chunk_sizes(&bytes, seg_size, &[1]).await;
     assert_eq!(
         bulk, byte_at_a_time,
         "byte-at-a-time record sequence diverged from bulk push",
     );
 
-    // (c) varying chunk sizes that cross page (8192) and record-header
-    // (24) boundaries non-trivially. Primes so the chunker doesn't
-    // coincidentally land on the same offsets as the bulk path.
     let prime_chunks = run_with_chunk_sizes(&bytes, seg_size, &[1, 7, 13, 257, 8193, 65537]).await;
     assert_eq!(
         bulk, prime_chunks,
@@ -131,10 +121,6 @@ async fn bulk_and_byte_chunks_emit_identical_record_sequence() {
     );
 }
 
-/// Bulk vs chunked must also match on the segment-sink output bytes:
-/// `current_buf` accumulates identically regardless of push cadence,
-/// so the rewritten segment delivered to the segment sink must be
-/// byte-equal across cadences.
 #[tokio::test(flavor = "current_thread")]
 async fn bulk_and_chunked_emit_identical_segment_bytes() {
     let path = fixture_path();
@@ -178,4 +164,92 @@ async fn bulk_and_chunked_emit_identical_segment_bytes() {
         chunked_mani.records.len(),
         "manifest record counts diverged",
     );
+}
+
+/// PHASE13 §1+§3: a `ShadowStreamSink` installed on `WalStream`
+/// dispatches the full byte-exact wire stream. Aggregate dispatched
+/// bytes equal the segment's bytes.
+#[tokio::test(flavor = "current_thread")]
+async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let path = fixture_path();
+    if !path.exists() {
+        eprintln!("skip: no captured segment at {path:?}");
+        return;
+    }
+    let bytes = decompress_gz(&path).expect("gunzip fixture");
+    let seg_size = bytes.len() as u64;
+
+    let mut stream = WalStream::new(1, seg_size, 0).expect("stream new");
+    let mut rec_sink = CollectingRecordSink::default();
+    let mut seg_sink = CollectingSegmentSink::default();
+
+    let state = Arc::new(Mutex::new(ShadowStreamState::new(
+        1,
+        "1".into(),
+        0,
+        1024 * 1024 * 1024,
+    )));
+    let conn = state.lock().await.register_connection(0);
+    let sink = ShadowStreamSink::new(state.clone());
+    stream.set_bytes_sink(Box::new(sink));
+
+    for (i, b) in bytes.iter().enumerate() {
+        stream
+            .push(
+                i as u64,
+                std::slice::from_ref(b),
+                &mut rec_sink,
+                &mut seg_sink,
+            )
+            .await
+            .expect("push");
+    }
+
+    assert_eq!(seg_sink.segments.len(), 1, "one segment dispatched");
+    assert!(!rec_sink.records.is_empty(), "records dispatched");
+
+    // Each queued frame on the connection is a CopyData envelope
+    // wrapping a 'w' XLogData. Strip the framing and reconstruct
+    // the wire byte stream; it must match the segment buffer
+    // byte-for-byte.
+    let queued = state
+        .lock()
+        .await
+        .drain_send_queue(conn)
+        .unwrap_or_default();
+    let reconstructed = strip_wal_frames(&queued);
+    let (_, seg_bytes, _) = &seg_sink.segments[0];
+    assert_eq!(
+        reconstructed.len(),
+        seg_bytes.len(),
+        "wire stream length matches segment",
+    );
+    assert_eq!(&reconstructed, seg_bytes, "wire stream matches segment");
+}
+
+/// Strip CopyData ('d') envelopes from a concatenation of frames,
+/// returning the WAL payload bytes from every 'w' XLogData inside.
+fn strip_wal_frames(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 5 <= buf.len() {
+        if buf[i] != b'd' {
+            break;
+        }
+        let len = u32::from_be_bytes(buf[i + 1..i + 5].try_into().unwrap()) as usize;
+        let total = 1 + len;
+        if i + total > buf.len() {
+            break;
+        }
+        let body = &buf[i + 5..i + total];
+        if body.first().copied() == Some(b'w') && body.len() >= 1 + 8 + 8 + 8 {
+            let payload = &body[1 + 8 + 8 + 8..];
+            out.extend_from_slice(payload);
+        }
+        i += total;
+    }
+    out
 }

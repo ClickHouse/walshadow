@@ -1,38 +1,38 @@
-//! Streaming filter pipeline. Wraps the batch [`filter_segment`] in a
+//! Streaming filter pipeline. Wraps the per-record
+//! [`StreamingWalker`](crate::streaming_walker::StreamingWalker) in a
 //! segment-aligned accumulator that consumes arbitrary WAL byte chunks
 //! (from wal-rs's `START_REPLICATION` CopyData stream) and dispatches
-//! to per-record + per-segment sinks.
+//! to per-record + per-segment sinks at record cadence.
 //!
-//! Segment-level batching matches `pg_receivewal`'s storage cadence:
-//! shadow PG's `restore_command` needs full segment files, so writing
-//! sub-segment partials adds no headroom. Within a segment, records
-//! see no extra latency from this design — they reach the
-//! [`RecordSink`] as soon as the batch filter processes the segment.
-//!
-//! For per-record streaming (sub-segment latency for the decoder), a
-//! future revision can switch [`WalStream::push`] from "accumulate
-//! whole segment then call `filter_segment`" to a chunk-driven walker
-//! that yields records as soon as they complete. The sink protocol
-//! defined here is shape-compatible with both.
-//!
-//! ## Architecture
+//! ## Architecture (post PHASE13 §1)
 //!
 //! ```text
 //!   wal-rs CopyData('w') chunks
 //!              v
 //!     +-----------------+
 //!     |  WalStream::push|  base_lsn aligned to segment boundary
-//!     +--------+--------+  buffers bytes until segment full
-//!              | segment complete (WAL_SEG_SIZE bytes accumulated)
+//!     +--------+--------+  extends StreamingWalker buffer
+//!              | per record completing
 //!              v
-//!     filter_segment(bytes) -> (filtered_bytes, manifest)
+//!         Filter::decide
+//!         /     |        \
+//!        v      v         v
+//!   noop_replace (Drop)  rewrite_record  manifest
+//!              |          (in place)     entry
+//!              v
+//!         RecordBytesSink  (shadow wire — §3)
+//!              v
+//!         RecordSink       (BufferingDecoderSink, MetricsRecordSink, ...)
 //!              |
-//!         dispatch
-//!         /         \
-//!        v           v
-//!   RecordSink   SegmentSink
-//!   (decoder)    (shadow PG pg_wal/, manifest sidecar)
+//!              + segment fills (16 MiB accumulated)
+//!              v
+//!         SegmentSink       (DirSegmentSink — archive fallback + retention)
 //! ```
+//!
+//! Per-record dispatch happens the moment a record's last byte arrives.
+//! Segment-level dispatch fires on segment boundary with the
+//! already-filtered bytes + accumulated manifest. No re-parse, no
+//! second walk.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -40,12 +40,14 @@ use std::pin::Pin;
 
 use thiserror::Error;
 use wal_rs::pg::wal::segment::SegmentName;
-use wal_rs::pg::walparser::XLogRecord;
+use wal_rs::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
 use crate::classify::rmgr_label;
-use crate::filter::{Decision, Filter};
+use crate::filter::{Decision, Filter, FilterStats};
 use crate::filter_segment::{FilterSegmentError, ParsedRecord, filter_segment};
-use crate::manifest::{Kind, Manifest};
+use crate::manifest::{Entry, FILTER_VERSION, Kind, Manifest, ManifestStats};
+use crate::rewrite::{RewriteError, noop_replace};
+use crate::streaming_walker::{CompletedRecord, StreamingWalkError, StreamingWalker};
 
 /// Default PG WAL segment size — 16 MiB. walshadow assumes the
 /// upstream initdb default since every supported PG version starts
@@ -60,6 +62,24 @@ pub enum WalStreamError {
         seg: String,
         #[source]
         source: FilterSegmentError,
+    },
+    #[error("walk segment {seg}: {source}")]
+    Walk {
+        seg: String,
+        #[source]
+        source: StreamingWalkError,
+    },
+    #[error("parse record at offset {offset}: {source}")]
+    Parse {
+        offset: usize,
+        #[source]
+        source: ParseError,
+    },
+    #[error("rewrite record at offset {offset}: {source}")]
+    Rewrite {
+        offset: usize,
+        #[source]
+        source: RewriteError,
     },
     #[error("misaligned push: expected lsn {expected:#X}, got {got:#X}")]
     Misaligned { expected: u64, got: u64 },
@@ -86,7 +106,7 @@ pub enum SinkError {
 /// computed. Phase 5's heap-tuple decoder reads `parsed.header.xact_id`,
 /// `parsed.blocks[i].header.location.rel`, and `parsed.main_data`;
 /// `page_magic` selects PG-15-vs-PG-14 FPI bit semantics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Record {
     pub parsed: XLogRecord,
     /// Absolute source LSN where the record begins.
@@ -122,23 +142,6 @@ impl Record {
 
 /// Sink that observes every record decided by the filter. Phase 5's
 /// heap-tuple decoder attaches here.
-///
-/// **Async contract.** `on_record` is async so implementations may await
-/// `ShadowCatalog::relation_at` (Phase 5 decoder hot path) without
-/// blocking the WAL chunk feed. Signature uses the manual
-/// `Pin<Box<dyn Future>>` desugaring rather than `async fn` in trait so
-/// [`CompositeRecordSink`]'s `Vec<Box<dyn RecordSink + Send>>` stays
-/// dyn-compatible without an `async-trait` macro dependency. See
-/// PHASE5_prereq_async_sink for the trade-off rationale.
-///
-/// **Error contract.** Returning `Err` from any sink call poisons the
-/// owning [`WalStream`]: `next_lsn` and the partially-dispatched
-/// `current_buf` are left as-is, and every subsequent
-/// [`WalStream::push`] returns [`WalStreamError::Poisoned`]. Recovery
-/// is to construct a fresh `WalStream` at the desired resume LSN —
-/// the protocol does not roll back per-record state, so a sink that
-/// wants exactly-once semantics must commit its own state durably
-/// before returning `Ok`. See [PRE5b10.md](../plans/PRE5b10.md) item 4.
 pub trait RecordSink {
     fn on_record<'a>(
         &'a mut self,
@@ -146,18 +149,41 @@ pub trait RecordSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 }
 
+/// Streaming sink for the post-filter WAL byte stream.
+///
+/// PHASE13 §3 hooks [`crate::shadow_stream::ShadowStreamSink`] here:
+/// the wire framer pushes these bytes onto every active shadow
+/// connection's `'w'` send buffer at record cadence so shadow's
+/// walreceiver replays a byte-exact stream (record bytes plus the
+/// page headers that sit between them — both required for shadow's
+/// startup state machine to parse the WAL).
+///
+/// `on_wire_chunk` fires after every finalized record carrying the
+/// contiguous slice of the segment buffer from the last dispatched
+/// byte up to the record's end. Returning `Err` poisons the stream.
+pub trait RecordBytesSink: Send {
+    fn on_wire_chunk<'a>(
+        &'a mut self,
+        start_lsn: u64,
+        bytes: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
+
+    /// Called when a 16 MiB segment is finalized; carries any
+    /// trailing bytes (post-last-record padding / zero tail) along
+    /// with the segment-end LSN so the sink can advertise an
+    /// accurate `server_wal_end` in subsequent keepalives.
+    fn on_segment_boundary<'a>(
+        &'a mut self,
+        _start_lsn: u64,
+        _trailing_bytes: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// Sink that receives one fully-filtered segment at a time. Shadow PG
 /// consumes filtered segments via `restore_command`; the production
 /// sink writes the bytes plus a manifest sidecar to that directory.
-///
-/// **Async contract.** Mirrors [`RecordSink`]: each 16 MiB segment
-/// write through [`DirSegmentSink`] is sync filesystem I/O that
-/// blocks the calling tokio worker until the write returns.
-/// `tokio::fs` (via internal `spawn_blocking`) keeps the chunk feed
-/// loop, ctrl_c handler, status timer & invalidation drain
-/// responsive on the typical `worker_threads = 2` runtime. Signature
-/// uses the same manual `Pin<Box<dyn Future>>` desugaring as
-/// `RecordSink` so trait-object usage stays dyn-compatible.
 pub trait SegmentSink {
     fn on_segment<'a>(
         &'a mut self,
@@ -200,9 +226,7 @@ impl RecordSink for CollectingRecordSink {
     }
 }
 
-/// Light-weight `RecordSink` that only counts. Pairs with
-/// [`CollectingRecordSink`] under [`CompositeRecordSink`] when a test
-/// needs to prove a second observer fired without holding clones.
+/// Light-weight `RecordSink` that only counts.
 #[derive(Debug, Default)]
 pub struct CountingRecordSink {
     pub count: u64,
@@ -221,23 +245,14 @@ impl RecordSink for CountingRecordSink {
 }
 
 /// `RecordSink` that maintains a per-`(rmid, decision)` counter and
-/// discards the record. Production daemon binary uses this in place of
-/// [`CollectingRecordSink`] to avoid an unbounded `Vec<Record>` over a
-/// long-running stream. Cumulative; reset by replacing the sink.
+/// discards the record.
 #[derive(Debug, Default)]
 pub struct MetricsRecordSink {
-    /// (rmid, decision) → count. `BTreeMap` so the on-emit formatted
-    /// line orders rmgrs deterministically.
     pub by_rm_decision: BTreeMap<(u8, Decision), u64>,
     pub total: u64,
 }
 
 impl MetricsRecordSink {
-    /// Stable single-line summary suitable for periodic logging on
-    /// segment emit. Empty buckets are skipped; rmgrs are reported by
-    /// human-readable label via [`rmgr_label`]. `total` mirrors the
-    /// `records=` counter the binary used to print from
-    /// `CollectingRecordSink.records.len()`.
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
         let mut s = String::new();
@@ -271,18 +286,7 @@ impl RecordSink for MetricsRecordSink {
 }
 
 /// Fan-out `RecordSink` that dispatches each record to a chain of inner
-/// sinks. Phase 5's heap-tuple `DecoderSink` rides alongside the
-/// segment writer through this surface; a metrics tap or oracle probe
-/// can join the same chain without changing [`WalStream::push`].
-///
-/// Dispatches in `inner` order and short-circuits on the first `Err`.
-/// **Post-error state**: inner sinks before the failing one have
-/// observed the record, the failing sink may have observed it
-/// partially, sinks after the failing one have not. The error
-/// propagates as [`WalStreamError::Sink`] and `WalStream` treats the
-/// stream as poisoned — do not call [`WalStream::push`] again on the
-/// same instance. See `plans/PRE5b10.md` item 4 for the broader
-/// `next_lsn` rollback policy.
+/// sinks. Dispatches in `inner` order and short-circuits on first `Err`.
 pub struct CompositeRecordSink {
     pub inner: Vec<Box<dyn RecordSink + Send>>,
 }
@@ -307,8 +311,7 @@ impl RecordSink for CompositeRecordSink {
     }
 }
 
-/// In-memory `SegmentSink` for tests + smoke fixtures. Concatenates
-/// every observed segment so callers can re-parse the output.
+/// In-memory `SegmentSink` for tests + smoke fixtures.
 #[derive(Debug, Default)]
 pub struct CollectingSegmentSink {
     pub segments: Vec<(SegmentName, Vec<u8>, Manifest)>,
@@ -328,16 +331,62 @@ impl SegmentSink for CollectingSegmentSink {
     }
 }
 
+/// In-memory `RecordBytesSink` for tests. Captures each contiguous
+/// wire chunk + the segment boundary tails.
+#[derive(Debug, Default)]
+pub struct CollectingBytesSink {
+    pub chunks: Vec<(u64, Vec<u8>)>,
+    pub segment_boundaries: Vec<(u64, Vec<u8>)>,
+}
+
+impl RecordBytesSink for CollectingBytesSink {
+    fn on_wire_chunk<'a>(
+        &'a mut self,
+        start_lsn: u64,
+        bytes: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.chunks.push((start_lsn, bytes.to_vec()));
+            Ok(())
+        })
+    }
+
+    fn on_segment_boundary<'a>(
+        &'a mut self,
+        start_lsn: u64,
+        trailing_bytes: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.segment_boundaries
+                .push((start_lsn, trailing_bytes.to_vec()));
+            Ok(())
+        })
+    }
+}
+
+/// `RecordBytesSink` no-op default. Avoids each `WalStream::push`
+/// paying the cost of an `Option` branch on every record.
+#[derive(Debug, Default)]
+pub struct NoopBytesSink;
+
+impl RecordBytesSink for NoopBytesSink {
+    fn on_wire_chunk<'a>(
+        &'a mut self,
+        _start_lsn: u64,
+        _bytes: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// Production segment sink that writes filtered segments + manifests
-/// to a target directory. Shadow PG's `restore_command` reads from
-/// the same directory.
+/// to a target directory. Shadow PG's `restore_command` reads from the
+/// same directory.
 pub struct DirSegmentSink {
     out_dir: std::path::PathBuf,
 }
 
 impl DirSegmentSink {
-    /// Creates `out_dir` synchronously: called once at startup before any
-    /// tokio runtime work, so blocking is fine.
     pub fn new(out_dir: std::path::PathBuf) -> Result<Self, SinkError> {
         std::fs::create_dir_all(&out_dir)?;
         Ok(Self { out_dir })
@@ -355,12 +404,6 @@ impl SegmentSink for DirSegmentSink {
             let name = seg.format();
             let seg_path = self.out_dir.join(&name);
             let tmp = seg_path.with_extension("partial");
-            // Phase 11 durability: fsync the segment file before rename
-            // so a power loss can't leave a renamed-but-empty entry on
-            // disk. Mirrors PG's own `pg_receivewal` flush model. fsync
-            // the dir afterwards so the rename itself is durable —
-            // without it, ext4 may persist file contents while losing
-            // the dir-entry rename.
             write_sync_rename(&tmp, &seg_path, bytes).await?;
             let mani_path = self.out_dir.join(format!("{name}.manifest.json"));
             let mani_tmp = mani_path.with_extension("manifest.json.partial");
@@ -371,13 +414,6 @@ impl SegmentSink for DirSegmentSink {
         })
     }
 
-    /// Partial-on-shutdown lands at `<name>.partial` (with
-    /// `<name>.partial.manifest.json` alongside) so shadow PG's
-    /// `restore_command` — which matches by exact segment name — does
-    /// not pick it up as a complete segment. Operator-facing artifact;
-    /// resume on the next daemon run is via the Phase 11 cursor (which
-    /// resumes from `cursor.emitter_ack_lsn` segment-aligned down), not
-    /// by reading the `.partial` bytes back.
     fn on_partial_segment<'a>(
         &'a mut self,
         seg: SegmentName,
@@ -401,9 +437,6 @@ impl SegmentSink for DirSegmentSink {
     }
 }
 
-/// Write `bytes` to `tmp`, fsync the file, then atomic-rename to
-/// `final_path`. Caller fsyncs the directory once per batch so a power
-/// loss can't leave the file contents on disk under a stale entry.
 async fn write_sync_rename(
     tmp: &std::path::Path,
     final_path: &std::path::Path,
@@ -423,45 +456,68 @@ async fn write_sync_rename(
     Ok(())
 }
 
-/// Segment-aligned accumulator. Bytes pushed via [`push`](Self::push)
-/// must arrive in contiguous LSN order starting from [`base_lsn`](Self::base_lsn).
+/// Segment-aligned record-cadence WAL filter.
+///
+/// Bytes pushed via [`push`](Self::push) must arrive in contiguous LSN
+/// order starting from [`base_lsn`](Self::base_lsn).
 ///
 /// Owns the long-lived [`Filter`]: `CatalogTracker` state — every
 /// `XLOG_RELMAP_UPDATE`, every decoded pg_class write — must survive
-/// segment boundaries, otherwise a relmap in segment N gets forgotten
-/// before the heap write it authorised lands in segment N+1.
+/// segment boundaries.
+///
+/// Owns the [`StreamingWalker`] so the per-page parser carries pending
+/// state across `push` calls without resampling bytes from disk.
 pub struct WalStream {
     timeline: u32,
     seg_size: u64,
-    /// LSN of the next byte expected by [`push`](Self::push). Advances
-    /// by `bytes.len()` on every successful push.
+    /// LSN of the next byte expected by [`push`](Self::push).
     next_lsn: u64,
-    /// LSN of the byte at `current_buf[0]`. Always segment-aligned.
+    /// LSN of the byte at `walker.buffer()[0]`. Always segment-aligned.
     current_lsn: u64,
-    current_buf: Vec<u8>,
+    walker: StreamingWalker,
     filter: Filter,
+    /// Per-segment accumulating manifest entries. Reset on segment
+    /// boundary when `segment_sink.on_segment` lands.
+    pending_entries: Vec<Entry>,
+    /// `Filter::stats` snapshot at the start of the current segment.
+    /// Used to compute `ManifestStats` deltas at segment boundary.
+    stats_at_segment_start: FilterStats,
+    relmap_at_segment_start: u64,
+    pg_class_undecoded_at_segment_start: u64,
+    pg_class_oid_in_prefix_at_segment_start: u64,
+    /// PHASE13 §3: byte stream destination for the shadow wire.
+    /// Defaults to [`NoopBytesSink`]; production swaps in
+    /// [`crate::shadow_stream::ShadowStreamSink`] via
+    /// [`set_bytes_sink`](Self::set_bytes_sink).
+    bytes_sink: Box<dyn RecordBytesSink + Send>,
+    /// Segment-relative offset of the highest byte already framed
+    /// onto the bytes_sink. Advances as records complete; reset to
+    /// `0` at segment boundary.
+    wire_offset: usize,
     /// Set by [`push`](Self::push) when filter or sink dispatch fails.
-    /// Subsequent calls short-circuit with [`WalStreamError::Poisoned`].
-    /// The plan does not roll `next_lsn` back on error (see [PRE5b10.md
-    /// ](../plans/PRE5b10.md) item 4); a fresh `WalStream` at the
-    /// caller's chosen resume LSN is the recovery path.
     poisoned: bool,
 }
 
 impl WalStream {
-    /// `start_lsn` must be aligned to `seg_size`. Use [`align_down`] /
-    /// [`align_up`] if you have a non-aligned source LSN.
     pub fn new(timeline: u32, seg_size: u64, start_lsn: u64) -> Result<Self, WalStreamError> {
         if !start_lsn.is_multiple_of(seg_size) {
             return Err(WalStreamError::UnalignedBase(start_lsn));
         }
+        let filter = Filter::new();
         Ok(Self {
             timeline,
             seg_size,
             next_lsn: start_lsn,
             current_lsn: start_lsn,
-            current_buf: Vec::with_capacity(seg_size as usize),
-            filter: Filter::new(),
+            walker: StreamingWalker::new(seg_size as usize),
+            stats_at_segment_start: filter.stats,
+            relmap_at_segment_start: filter.tracker.relmap_updates,
+            pg_class_undecoded_at_segment_start: filter.tracker.pg_class_writes_undecoded,
+            pg_class_oid_in_prefix_at_segment_start: filter.tracker.pg_class_writes_oid_in_prefix,
+            filter,
+            pending_entries: Vec::new(),
+            bytes_sink: Box::new(NoopBytesSink),
+            wire_offset: 0,
             poisoned: false,
         })
     }
@@ -472,11 +528,18 @@ impl WalStream {
         &self.filter
     }
 
-    /// Mutable access for pre-stream setup: callers seed
-    /// `filter.tracker` (eg [`CatalogTracker::seed_from_source`]) before
-    /// any [`push`](Self::push). Not for hot-path use.
+    /// Mutable access for pre-stream setup.
     pub fn filter_mut(&mut self) -> &mut Filter {
         &mut self.filter
+    }
+
+    /// Install a `RecordBytesSink` (eg
+    /// [`crate::shadow_stream::ShadowStreamSink`]). Must be called
+    /// before the first [`push`](Self::push); swapping mid-stream
+    /// would leave bytes already dispatched to the previous sink
+    /// unreceived by the new one. Default is `NoopBytesSink`.
+    pub fn set_bytes_sink(&mut self, sink: Box<dyn RecordBytesSink + Send>) {
+        self.bytes_sink = sink;
     }
 
     /// Round `lsn` down to the nearest segment boundary.
@@ -490,33 +553,16 @@ impl WalStream {
     }
 
     /// LSN of the highest fully-dispatched byte (one past the end of
-    /// the last `on_segment` call). Stays at `start_lsn` until the
-    /// first segment fills.
+    /// the last `on_segment` call).
     pub fn dispatched_lsn(&self) -> u64 {
         self.current_lsn
     }
 
-    /// Append bytes that start at LSN `lsn`. Calls `record_sink` /
-    /// `segment_sink` synchronously once a segment fills. Returns the
-    /// LSN of the next expected push.
-    ///
-    /// **Latency contract.** Per-segment, not per-record. A pushed
-    /// record sees no [`RecordSink`] call until enough subsequent
-    /// pushes accumulate `seg_size` bytes (16 MiB default), at which
-    /// point every record in that segment fires in one burst. Phase 5's
-    /// decoder tolerates segment-cadence latency. Phase 7's CH-native
-    /// emitter will not — see [PRE5b10.md](../plans/PRE5b10.md) item 2:
-    /// switching to a chunk-driven walker that yields records on the
-    /// fly is the deferred refactor, the sink trait shape is already
-    /// compatible.
-    ///
-    /// **Poisoned-on-error.** A sink (record or segment) returning
-    /// `Err`, or a filter/parse failure inside `flush_current`, marks
-    /// the stream as poisoned. Every subsequent call returns
-    /// [`WalStreamError::Poisoned`]. `next_lsn` is not rolled back: the
-    /// caller's recovery is to drop this `WalStream` and construct a
-    /// fresh one at the desired resume LSN. See [PRE5b10.md
-    /// ](../plans/PRE5b10.md) item 4.
+    /// Append bytes that start at LSN `lsn`. Dispatches at record
+    /// cadence: per-record filter+rewrite → owned `bytes_sink` (shadow
+    /// wire) → `record_sink` (decoder + observers). Segment-level
+    /// `segment_sink` fires at the 16 MiB boundary as the archive
+    /// fallback artifact.
     pub async fn push(
         &mut self,
         lsn: u64,
@@ -536,13 +582,19 @@ impl WalStream {
         let mut data = bytes;
         let mut cur_lsn = lsn;
         while !data.is_empty() {
-            let space = self.seg_size as usize - self.current_buf.len();
+            let space = self.seg_size as usize - self.walker.buffer_len();
             let take = space.min(data.len());
-            self.current_buf.extend_from_slice(&data[..take]);
+            self.walker.extend(&data[..take]);
             cur_lsn += take as u64;
             data = &data[take..];
-            if self.current_buf.len() == self.seg_size as usize
-                && let Err(e) = self.flush_current(record_sink, segment_sink).await
+
+            if let Err(e) = self.drain_records(record_sink).await {
+                self.poisoned = true;
+                return Err(e);
+            }
+
+            if self.walker.segment_full()
+                && let Err(e) = self.flush_segment(segment_sink).await
             {
                 self.poisoned = true;
                 return Err(e);
@@ -550,6 +602,127 @@ impl WalStream {
         }
         self.next_lsn = cur_lsn;
         Ok(cur_lsn)
+    }
+
+    /// Drain every now-completable record from the walker. Per-record
+    /// dispatch fires the owned `bytes_sink.on_record_bytes` first
+    /// (the shadow wire) so the catalog gate `wait_for_replay
+    /// (record.lsn)` in `record_sink` clears against shadow's
+    /// wire-driven apply LSN rather than against `restore_command`
+    /// segment landing.
+    async fn drain_records(
+        &mut self,
+        record_sink: &mut dyn RecordSink,
+    ) -> Result<(), WalStreamError> {
+        loop {
+            let completed: CompletedRecord = match self.walker.try_next() {
+                Some(Ok(r)) => r,
+                Some(Err(source)) => {
+                    let seg = self.segment_for_lsn(self.current_lsn).format();
+                    return Err(WalStreamError::Walk { seg, source });
+                }
+                None => return Ok(()),
+            };
+            let parsed = parse_record_from_bytes(&completed.logical_bytes, completed.page_magic)
+                .map_err(|source| WalStreamError::Parse {
+                    offset: completed.start_offset,
+                    source,
+                })?;
+            let decision = self.filter.decide(&parsed);
+            let kind = match decision {
+                Decision::Keep => Kind::Kept,
+                Decision::Drop => Kind::Dropped,
+            };
+            let final_bytes: Vec<u8> = if decision == Decision::Drop {
+                let mut buf = completed.logical_bytes.clone();
+                noop_replace(&mut buf).map_err(|source| WalStreamError::Rewrite {
+                    offset: completed.start_offset,
+                    source,
+                })?;
+                self.walker.rewrite_record(&completed.byte_ranges, &buf);
+                buf
+            } else {
+                completed.logical_bytes.clone()
+            };
+
+            self.pending_entries.push(Entry {
+                offset: completed.start_offset as u64,
+                len: parsed.header.total_record_length,
+                rmid: parsed.header.resource_manager_id,
+                info: parsed.header.info,
+                kind,
+            });
+            let _ = final_bytes; // bytes scattered into walker via rewrite_record
+
+            // Frame buffer[wire_offset..record_end] as one wire chunk
+            // — covers page headers + inter-record padding so the
+            // shadow walreceiver sees a byte-exact stream identical
+            // to what `restore_command` would land on disk.
+            let last_range = completed.byte_ranges.last().copied().unwrap_or((0, 0));
+            let record_end = last_range.0 + last_range.1;
+            if record_end > self.wire_offset {
+                let chunk = &self.walker.buffer()[self.wire_offset..record_end];
+                let start_lsn = self.current_lsn + self.wire_offset as u64;
+                self.bytes_sink.on_wire_chunk(start_lsn, chunk).await?;
+                self.wire_offset = record_end;
+            }
+
+            let source_lsn = self.current_lsn + completed.start_offset as u64;
+            let record = Record {
+                parsed,
+                source_lsn,
+                page_magic: completed.page_magic,
+                decision,
+            };
+            record_sink.on_record(&record).await?;
+        }
+    }
+
+    /// Flush the just-completed 16 MiB segment to disk + reset the
+    /// walker for the next segment. Manifest stats reflect only the
+    /// records processed in this segment.
+    async fn flush_segment(
+        &mut self,
+        segment_sink: &mut dyn SegmentSink,
+    ) -> Result<(), WalStreamError> {
+        let seg = self.segment_for_lsn(self.current_lsn);
+        let bytes = self.walker.take_segment();
+        let relmap_delta = self.filter.tracker.relmap_updates - self.relmap_at_segment_start;
+        let pgc_un_delta = self.filter.tracker.pg_class_writes_undecoded
+            - self.pg_class_undecoded_at_segment_start;
+        let pgc_oip_delta = self.filter.tracker.pg_class_writes_oid_in_prefix
+            - self.pg_class_oid_in_prefix_at_segment_start;
+        let stats_delta = self.filter.stats.delta_from(&self.stats_at_segment_start);
+        let manifest = Manifest {
+            source_segment: seg.format(),
+            filter_version: FILTER_VERSION,
+            records: std::mem::take(&mut self.pending_entries),
+            stats: ManifestStats::from_filter(
+                &stats_delta,
+                relmap_delta,
+                pgc_un_delta,
+                pgc_oip_delta,
+            ),
+        };
+        // Drain any trailing bytes — zero-pad tail, post-last-record
+        // alignment — onto the shadow wire so the walreceiver sees
+        // the full segment byte-for-byte.
+        let trailing_start_offset = self.wire_offset;
+        let trailing_start_lsn = self.current_lsn + trailing_start_offset as u64;
+        let trailing = &bytes[trailing_start_offset..];
+        self.bytes_sink
+            .on_segment_boundary(trailing_start_lsn, trailing)
+            .await?;
+        segment_sink.on_segment(seg, &bytes, &manifest).await?;
+        self.current_lsn += self.seg_size;
+        self.wire_offset = 0;
+        // Snapshot for the next segment's manifest deltas.
+        self.stats_at_segment_start = self.filter.stats;
+        self.relmap_at_segment_start = self.filter.tracker.relmap_updates;
+        self.pg_class_undecoded_at_segment_start = self.filter.tracker.pg_class_writes_undecoded;
+        self.pg_class_oid_in_prefix_at_segment_start =
+            self.filter.tracker.pg_class_writes_oid_in_prefix;
+        Ok(())
     }
 
     /// Force-flush the current partial segment (does nothing if empty).
@@ -562,66 +735,51 @@ impl WalStream {
         partial_sink: Option<&mut dyn SegmentSink>,
         record_sink: &mut dyn RecordSink,
     ) -> Result<(), WalStreamError> {
-        if self.current_buf.is_empty() {
+        if self.walker.buffer_len() == 0 {
             return Ok(());
         }
+        // Records already drained at push cadence; the partial buffer
+        // may still contain a tail of unparsed bytes (record straddling
+        // the missing remainder). Zero-pad and run filter_segment over
+        // the padded buffer so the `.partial` file matches the
+        // shape `pg_receivewal` would write and so any records
+        // belonging entirely to this segment but yet undrained land
+        // through one more pass.
         let seg = self.segment_for_lsn(self.current_lsn);
         let seg_start_lsn = self.current_lsn;
-        // Pad to full size so filter_segment can walk it; pages past
-        // the actual write are zeroed (matching pg_receivewal partial
-        // segment semantics).
-        let pad = self.seg_size as usize - self.current_buf.len();
-        self.current_buf.extend(std::iter::repeat_n(0u8, pad));
+        let mut buf = self.walker.take_segment();
+        let pad = self.seg_size as usize - buf.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
         let name = seg.format();
+
+        // Re-run the batch filter over the padded buffer. Because we
+        // already drained records via the streaming path during
+        // [`push`](Self::push), this second pass picks up at most the
+        // records that needed a tail-page to complete (none on the
+        // graceful-shutdown path; bound by zero pad in worst case).
         let (filtered, manifest, parsed) =
-            filter_segment(&self.current_buf, &name, &mut self.filter).map_err(|source| {
+            filter_segment(&buf, &name, &mut self.filter).map_err(|source| {
                 WalStreamError::Filter {
                     seg: name.clone(),
                     source,
                 }
             })?;
-        // Match `flush_current`'s "segment first, then records" order
-        // so a partial close still gives shadow a chance to ingest the
-        // bytes before the decoder gates on its replay LSN.
+        // Streamed records already dispatched at push cadence;
+        // close()'s job is to land the partial bytes on disk so a
+        // follow-up daemon run can locate them. We do NOT re-dispatch
+        // the records through `record_sink` (would double-fire).
+        // Suppress the unused-parameter warning while keeping the
+        // signature symmetric with the historical contract that
+        // included a per-record path.
+        let _ = parsed;
+        let _ = seg_start_lsn;
         if let Some(sink) = partial_sink {
             sink.on_partial_segment(seg, &filtered, &manifest).await?;
         }
-        for (entry, parsed) in manifest.records.iter().zip(parsed) {
-            let record = Record::from_parsed(seg_start_lsn, parsed, entry);
-            record_sink.on_record(&record).await?;
-        }
-        Ok(())
-    }
-
-    /// Internal: dispatch the just-filled `current_buf` and reset.
-    async fn flush_current(
-        &mut self,
-        record_sink: &mut dyn RecordSink,
-        segment_sink: &mut dyn SegmentSink,
-    ) -> Result<(), WalStreamError> {
-        let seg = self.segment_for_lsn(self.current_lsn);
-        let seg_start_lsn = self.current_lsn;
-        let name = seg.format();
-        let (filtered, manifest, parsed) =
-            filter_segment(&self.current_buf, &name, &mut self.filter).map_err(|source| {
-                WalStreamError::Filter {
-                    seg: name.clone(),
-                    source,
-                }
-            })?;
-        // Segment lands on disk before per-record dispatch fires. The
-        // decoder's `ShadowCatalog::relation_at` gates on shadow's
-        // `pg_last_wal_replay_lsn() >= record_lsn`; shadow can only
-        // advance once its `restore_command` finds the segment file —
-        // dispatching first would deadlock the per-record gate against
-        // the segment write its own caller is still holding back.
-        segment_sink.on_segment(seg, &filtered, &manifest).await?;
-        for (entry, parsed) in manifest.records.iter().zip(parsed) {
-            let record = Record::from_parsed(seg_start_lsn, parsed, entry);
-            record_sink.on_record(&record).await?;
-        }
-        self.current_lsn += self.seg_size;
-        self.current_buf.clear();
+        // Records we did NOT redrive on close, since per-record
+        // dispatch fires at push cadence in PHASE13+. Suppress unused
+        // warning on record_sink to keep callers' shape unchanged.
+        let _ = record_sink;
         Ok(())
     }
 
@@ -718,9 +876,6 @@ mod tests {
         }
     }
 
-    /// Adversarial segment sink that returns `Err` on every dispatch.
-    /// Used to prove the poison-on-error contract fires for sink
-    /// failures, not just filter failures.
     struct ErrSegmentSink;
     impl SegmentSink for ErrSegmentSink {
         fn on_segment<'a>(
@@ -733,8 +888,6 @@ mod tests {
         }
     }
 
-    /// Zero-byte page → filter_segment yields no records but still
-    /// dispatches the segment; `ErrSegmentSink` returns `Err` → poison.
     #[tokio::test(flavor = "current_thread")]
     async fn push_segment_sink_error_poisons_stream() {
         const SEG: u64 = 8192;
@@ -755,12 +908,8 @@ mod tests {
         assert!(matches!(err2, WalStreamError::Poisoned));
     }
 
-    /// Page-sized seg with bad magic → first push fills the segment,
-    /// `flush_current` calls `filter_segment` which surfaces a walker
-    /// error. Stream is poisoned; the next push must short-circuit
-    /// with `Poisoned` regardless of its own validity.
     #[tokio::test(flavor = "current_thread")]
-    async fn push_filter_error_poisons_stream() {
+    async fn push_walk_error_poisons_stream() {
         const SEG: u64 = 8192;
         let mut ws = WalStream::new(1, SEG, 0).unwrap();
         let mut rec = CollectingRecordSink::default();
@@ -772,8 +921,8 @@ mod tests {
         let err = ws
             .push(0, &bytes, &mut rec, &mut seg)
             .await
-            .expect_err("filter error must propagate");
-        assert!(matches!(err, WalStreamError::Filter { .. }), "{err:?}");
+            .expect_err("walk error must propagate");
+        assert!(matches!(err, WalStreamError::Walk { .. }), "{err:?}");
         let err2 = ws
             .push(SEG, &[0u8; 1], &mut rec, &mut seg)
             .await
@@ -781,10 +930,6 @@ mod tests {
         assert!(matches!(err2, WalStreamError::Poisoned));
     }
 
-    /// Synthesise a `Record` directly so the fan-out tests exercise
-    /// `CompositeRecordSink::on_record` without spinning up
-    /// `filter_segment`. Caller picks `offset` + `rmid` so a sequence
-    /// is ordered-distinguishable.
     fn synth_record(offset: u64, rmid: u8) -> Record {
         use wal_rs::pg::walparser::XLogRecordHeader;
         let entry = dummy_manifest_entry(offset, rmid);
@@ -801,9 +946,6 @@ mod tests {
         Record::from_parsed(0, parsed, &entry)
     }
 
-    /// Inner sink that records each observed rmid into a shared vec
-    /// so the test can retain an observation handle while the boxed
-    /// trait object is moved into [`CompositeRecordSink`].
     struct SharedRmidLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl RecordSink for SharedRmidLog {
@@ -821,10 +963,6 @@ mod tests {
         }
     }
 
-    /// Adversarial inner sink that errors on the Nth `on_record` call.
-    /// Calls before `fail_at` succeed; the `fail_at` call returns
-    /// `Err(SinkError::Other(_))`. `seen` is shared so the test can
-    /// verify how many records the sink actually observed.
     struct ErrAt {
         seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
         fail_at: u64,
@@ -848,8 +986,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn composite_record_sink_fans_out_to_all_inner_sinks_in_order() {
-        // Three records with distinct rmids so the order claim isn't
-        // symmetric under permutation.
         let recs = [
             synth_record(0, RmId::Heap as u8),
             synth_record(64, RmId::Xact as u8),
@@ -884,10 +1020,7 @@ mod tests {
             }),
             Box::new(SharedRmidLog(log_after.clone())),
         ]);
-        // First record: every sink runs, ErrAt's `seen` advances to 1.
         comp.on_record(&rec).await.expect("first record succeeds");
-        // Second record: ErrAt fails (i==fail_at==1). The sink after
-        // ErrAt must not observe it — that's the short-circuit claim.
         let err = comp
             .on_record(&rec)
             .await
@@ -896,8 +1029,6 @@ mod tests {
             SinkError::Other(msg) => assert!(msg.contains("synthetic fail")),
             _ => panic!("expected SinkError::Other, got {err:?}"),
         }
-        // Post-error state: log_before saw both records, ErrAt saw two
-        // (one Ok + one Err), log_after saw only the first.
         assert_eq!(log_before.lock().unwrap().len(), 2);
         assert_eq!(err_seen.load(Ordering::Relaxed), 2);
         assert_eq!(log_after.lock().unwrap().len(), 1);
@@ -940,7 +1071,6 @@ mod tests {
         assert!(mani_path.exists(), "manifest sidecar written");
         let on_disk = std::fs::read(&seg_path).unwrap();
         assert_eq!(on_disk, bytes);
-        // No `.partial` leftovers — atomic rename cleaned up.
         assert!(
             !tmp.path()
                 .join(format!("{}.partial", seg.format()))
@@ -959,8 +1089,6 @@ mod tests {
         let name = seg.format();
         let partial_path = tmp.path().join(format!("{name}.partial"));
         let partial_mani_path = tmp.path().join(format!("{name}.partial.manifest.json"));
-        // Complete-segment name must NOT exist — otherwise shadow PG's
-        // restore_command would pick up a partial as a real segment.
         assert!(
             !tmp.path().join(&name).exists(),
             "complete-segment path leaked: {name}",
@@ -969,12 +1097,127 @@ mod tests {
         assert!(partial_mani_path.exists(), "partial manifest written");
         let on_disk = std::fs::read(&partial_path).unwrap();
         assert_eq!(on_disk, bytes);
-        // Temp files cleaned up by atomic rename.
         assert!(!tmp.path().join(format!("{name}.partial.tmp")).exists());
         assert!(
             !tmp.path()
                 .join(format!("{name}.partial.manifest.json.tmp"))
                 .exists()
         );
+    }
+
+    /// PHASE13 §1 contract: a `RecordBytesSink` sees the full wire
+    /// byte stream — every record byte image plus the page headers
+    /// and inter-record padding between them. Total bytes dispatched
+    /// (chunks + trailing) match seg_size exactly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bytes_sink_receives_full_wire_stream() {
+        const SEG: u64 = 8192;
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+
+        type WireLog = std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
+        let collector_chunks: WireLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collector_tails: WireLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct SharedCollector(WireLog, WireLog);
+        impl RecordBytesSink for SharedCollector {
+            fn on_wire_chunk<'a>(
+                &'a mut self,
+                start_lsn: u64,
+                bytes: &'a [u8],
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.lock().unwrap().push((start_lsn, bytes.to_vec()));
+                    Ok(())
+                })
+            }
+            fn on_segment_boundary<'a>(
+                &'a mut self,
+                start_lsn: u64,
+                trailing_bytes: &'a [u8],
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.1
+                        .lock()
+                        .unwrap()
+                        .push((start_lsn, trailing_bytes.to_vec()));
+                    Ok(())
+                })
+            }
+        }
+
+        let page = synth_xact_page();
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        ws.set_bytes_sink(Box::new(SharedCollector(
+            collector_chunks.clone(),
+            collector_tails.clone(),
+        )));
+        ws.push(0, &page, &mut rec, &mut seg).await.unwrap();
+        assert!(!rec.records.is_empty(), "record_sink fired");
+
+        // Wire chunks plus the trailing-tail chunk should sum to a
+        // contiguous byte stream from offset 0 to SEG, byte-identical
+        // to the segment_sink output.
+        let chunks = collector_chunks.lock().unwrap();
+        let tails = collector_tails.lock().unwrap();
+        let mut reconstructed = Vec::with_capacity(SEG as usize);
+        let mut expected_lsn = 0u64;
+        for (start, bytes) in chunks.iter() {
+            assert_eq!(*start, expected_lsn, "wire chunks must be contiguous");
+            reconstructed.extend_from_slice(bytes);
+            expected_lsn = start + bytes.len() as u64;
+        }
+        assert_eq!(tails.len(), 1);
+        let (tail_start, tail_bytes) = &tails[0];
+        assert_eq!(*tail_start, expected_lsn);
+        reconstructed.extend_from_slice(tail_bytes);
+        assert_eq!(reconstructed.len(), SEG as usize, "covers full segment");
+        let (_, seg_bytes, _) = &seg.segments[0];
+        assert_eq!(&reconstructed, seg_bytes, "wire bytes match segment bytes");
+    }
+
+    fn synth_xact_page() -> Vec<u8> {
+        use wal_rs::pg::walparser::{
+            WAL_PAGE_SIZE, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
+            XLR_BLOCK_ID_DATA_SHORT,
+        };
+        const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
+        fn rec(rmid: u8) -> Vec<u8> {
+            let body_len = 1 + 1 + 4; // short marker + len + 4-byte payload
+            let total = X_LOG_RECORD_HEADER_SIZE + body_len;
+            let mut v = Vec::with_capacity(total);
+            v.extend_from_slice(&(total as u32).to_le_bytes());
+            v.extend_from_slice(&0u32.to_le_bytes()); // xact
+            v.extend_from_slice(&0u64.to_le_bytes()); // prev
+            v.push(0); // info
+            v.push(rmid);
+            v.push(0);
+            v.push(0);
+            v.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+            v.push(XLR_BLOCK_ID_DATA_SHORT);
+            v.push(4u8);
+            v.extend_from_slice(&[0xDEu8; 4]);
+            let crc = crate::rewrite::compute_crc(&v);
+            v[20..24].copy_from_slice(&crc.to_le_bytes());
+            v
+        }
+        let r1 = rec(wal_rs::pg::walparser::RmId::Xact as u8);
+        let r2 = rec(wal_rs::pg::walparser::RmId::Xact as u8);
+        let mut page = Vec::with_capacity(PAGE_SIZE);
+        page.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        page.extend_from_slice(&1u32.to_le_bytes()); // timeline
+        page.extend_from_slice(&0u64.to_le_bytes()); // page_address
+        page.extend_from_slice(&0u32.to_le_bytes()); // remaining_data_len
+        page.extend_from_slice(&12345u64.to_le_bytes()); // sysid
+        page.extend_from_slice(&(8192u32 * 1024).to_le_bytes()); // seg_size
+        page.extend_from_slice(&8192u32.to_le_bytes()); // xlog_block_size
+        page.extend_from_slice(&[0u8; 4]); // pad to 40
+        for r in [&r1, &r2] {
+            page.extend_from_slice(r);
+            let pad = (8 - (page.len() % 8)) % 8;
+            page.extend(std::iter::repeat_n(0u8, pad));
+        }
+        page.resize(PAGE_SIZE, 0);
+        page
     }
 }

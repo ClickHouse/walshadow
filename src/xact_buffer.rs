@@ -814,11 +814,18 @@ impl RecordSink for BufferingDecoderSink {
                         self.stats.catalog_not_found += 1;
                         return Ok(());
                     }
-                    Err(CatalogError::ReplayTimeout { .. }) => {
-                        self.stats.replay_timeout += 1;
-                        return Ok(());
+                    Err(e) => {
+                        // PHASE13 §6: ReplayTimeout used to absorb
+                        // into stats.replay_timeout. Under streaming-
+                        // fed shadow the gate clears in ms — a timeout
+                        // means shadow stalled, the walsender wire
+                        // froze, or walshadow backed up against
+                        // socket buffers. Silent skip would shed
+                        // user-heap writes invisibly. Poison the
+                        // stream so the daemon exits and phase 11
+                        // cursor resumes on the next boot.
+                        return Err(DecoderSinkError::from(e).into());
                     }
-                    Err(e) => return Err(DecoderSinkError::from(e).into()),
                 }
             };
             let decoded = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {

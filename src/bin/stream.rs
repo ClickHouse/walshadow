@@ -60,8 +60,7 @@ use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
 use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
-    ShadowCatalog, ShadowCatalogConfig, socket_conninfo, spawn_invalidation_drain,
-    with_transient_retry,
+    ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
 };
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
@@ -186,6 +185,23 @@ struct Args {
     /// shadow doesn't fail the daemon on first boot.
     #[arg(long, default_value_t = 30)]
     shadow_connect_timeout: u64,
+    /// PHASE13 walsender bind address. `127.0.0.1:0` lets the kernel
+    /// pick a free port; set explicitly when shadow's
+    /// `primary_conninfo` references a fixed port.
+    #[arg(long, default_value = "127.0.0.1:0")]
+    walsender_bind: SocketAddr,
+    /// Optional file path the daemon writes the actual bound walsender
+    /// address into (one line `host:port`). Useful when
+    /// `--walsender-bind` uses port 0 — the operator (or supervisor)
+    /// reads the file to learn the picked port and configures
+    /// `primary_conninfo` on shadow.
+    #[arg(long)]
+    walsender_port_file: Option<PathBuf>,
+    /// Cap on bytes queued onto a slow shadow connection's send buffer
+    /// before the connection is dropped + the wire falls back to
+    /// `restore_command`. PHASE13 §3 "slow client" backpressure.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    walsender_slow_threshold: usize,
     /// Phase 6 xact / TOAST buffer spill dir. Created on boot if
     /// missing; wiped clean every startup per the
     /// [PHASE6disk.md](../../plans/PHASE6disk.md) crash-recovery note.
@@ -430,6 +446,49 @@ async fn run(args: Args) -> Result<()> {
     );
 
     let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned)?;
+    // PHASE13 §3 — walsender listener + ShadowStreamSink.
+    //
+    // Bind the listener BEFORE shadow's walreceiver gets a chance to
+    // connect (the bootstrap barrier in the plan): operators wire
+    // shadow's `primary_conninfo` at this address. Without an active
+    // sink, the catalog gate inside `BufferingDecoderSink` would
+    // deadlock — shadow's replay LSN never advances since segment-
+    // sink fires after per-record dispatch in the new ordering.
+    let shadow_state = Arc::new(Mutex::new(
+        walshadow::shadow_stream::ShadowStreamState::new(
+            ident.timeline,
+            ident.sysid.clone(),
+            aligned,
+            args.walsender_slow_threshold,
+        ),
+    ));
+    let walsender_listener = tokio::net::TcpListener::bind(args.walsender_bind)
+        .await
+        .with_context(|| format!("bind walsender at {}", args.walsender_bind))?;
+    let walsender_addr = walsender_listener
+        .local_addr()
+        .context("walsender local_addr")?;
+    drop(walsender_listener); // spawn_listener re-binds at the same addr
+    if let Some(path) = &args.walsender_port_file {
+        std::fs::write(path, format!("{}\n", walsender_addr))
+            .with_context(|| format!("write walsender port file {}", path.display()))?;
+    }
+    let _walsender_task = walshadow::shadow_stream::spawn_listener(
+        walshadow::shadow_stream::WalSenderAddr::Tcp(walsender_addr),
+        shadow_state.clone(),
+        Duration::from_millis(50),
+    )
+    .await
+    .context("spawn walsender listener")?;
+    tracing::info!(
+        target: "walshadow",
+        addr = %walsender_addr,
+        "walsender listening — point shadow's primary_conninfo here",
+    );
+    stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
+        shadow_state.clone(),
+    )));
+
     // Seed the catalog tracker from source's *current* pg_class before
     // START_REPLICATION. Closes the "long-running source rotated a
     // mapped catalog above 16384 pre-attach" hole that the < 16384
@@ -486,16 +545,19 @@ async fn run(args: Args) -> Result<()> {
         "shadow connected",
     );
 
-    // Wire the descriptor-cache invalidation channel. Tracker → drain
-    // task → ShadowCatalog::invalidate. Drain holds its own Arc clone
-    // of the catalog; future consumers (Phase 5 DecoderSink, oracle)
-    // clone again from `catalog`.
-    let (invalidation_tx, invalidation_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // Wire the descriptor-cache invalidation epoch. Tracker bumps the
+    // shared atomic on every catalog-touching record; the catalog reads
+    // the atomic at the top of every relation lookup and folds the
+    // delta into a synchronous `invalidate` before the cache check.
+    let invalidation_epoch = Arc::new(AtomicU64::new(0));
     stream
         .filter_mut()
         .tracker
-        .set_invalidation_signal(invalidation_tx);
-    let _invalidation_drain = spawn_invalidation_drain(catalog.clone(), invalidation_rx);
+        .set_invalidation_epoch(invalidation_epoch.clone());
+    catalog
+        .lock()
+        .await
+        .set_invalidation_epoch(invalidation_epoch);
 
     // Phase 10 pre-flight validators. Run after both source + shadow
     // SQL clients are up so every check has the connection it needs;
@@ -671,6 +733,10 @@ async fn run(args: Args) -> Result<()> {
     // file's `shadow_replay_lsn` slot + the standby-status `apply_lsn`
     // ceiling. Atomic so the two tasks don't need a shared mutex.
     let shadow_replay_lsn = Arc::new(AtomicU64::new(0));
+    // PHASE13 §5: tracked across active ShadowStreamSink connections;
+    // fed by the walsender listener task into the cursor file. Used by
+    // shadow's `START_REPLICATION PHYSICAL` resume on daemon restart.
+    let shadow_flush_lsn = Arc::new(AtomicU64::new(0));
 
     // Phase 10 retention sweeper. Polls shadow's replay LSN, drops
     // filtered segments more than `retention_bytes` behind. Disabled
@@ -707,6 +773,14 @@ async fn run(args: Args) -> Result<()> {
         let dispatched = stream.dispatched_lsn();
         let received = feed.last_server_wal_end().max(dispatched);
         let shadow_replay = shadow_replay_lsn.load(Ordering::Acquire);
+        // Pull the latest aggregate flush across active shadow
+        // streaming connections + advertise it as the standby-status
+        // apply ceiling so source's slot recycles in lockstep with
+        // shadow's wire-driven advance.
+        let shadow_agg = shadow_state.lock().await.aggregate();
+        if let Some(flush) = shadow_agg.min_flush_lsn {
+            shadow_flush_lsn.fetch_max(flush, Ordering::Release);
+        }
         let (drain_lsn, emitter_ack_lsn) = {
             let b = xact_buffer.lock().await;
             let s = b.stats();
@@ -727,6 +801,7 @@ async fn run(args: Args) -> Result<()> {
             shadow_replay_lsn: shadow_replay,
             drain_lsn,
             emitter_ack_lsn,
+            shadow_flush_lsn: shadow_flush_lsn.load(Ordering::Acquire),
         };
         if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
             cursor::write(&args.spill_dir, &cur)

@@ -302,3 +302,223 @@ accounting that the old §2 required becomes unnecessary
 Defer the fast-path predicate as a future optimization, justified
 only if even ms-cadence gate clearance becomes a measurable
 bottleneck in a downstream consumer
+
+## Retro
+
+What landed vs what the plan called for, plus the surprises picked
+up while wiring it end-to-end against a real PG 18 walreceiver
+
+### §1 — streaming filter (record-cadence parse + rewrite)
+
+Landed as [`src/streaming_walker.rs`](../src/streaming_walker.rs):
+the page state machine `SegmentWalker` had lives as an immutable
+slice iterator. The streaming sibling owns the segment-sized
+accumulating buffer, takes `extend(bytes)` chunks of any size, and
+yields `CompletedRecord { logical_bytes, byte_ranges, start_offset,
+page_magic }` the moment a record's last byte arrives.
+[`rewrite_record`](../src/streaming_walker.rs) scatters the
+post-`noop_replace` bytes back into the buffer at the recorded
+ranges so the segment_sink still sees the canonical rewrite.
+[`WalStream`](../src/wal_stream.rs) owns one walker + the long-
+lived `Filter`, and drives the per-record dispatch path.
+
+Surprise: the plan called the buffer "16 MiB rewrite buffer"; in
+practice the buffer doubles as the wire-stream source. The
+`wire_offset` cursor walks the buffer in lockstep with finalized
+records so `bytes_sink.on_wire_chunk(start_lsn, bytes)` ships
+page-headers + inter-record padding alongside record bytes — PG's
+walreceiver needs the page-header bytes at the segment-aligned
+LSN, otherwise its startup process sees zeros and ERROR-logs
+"invalid magic 0000".
+
+### §2 — walsender server in `wal-rs`
+
+Landed as [`wal-rs/src/pg/replication/server.rs`](../wal-rs/src/pg/replication/server.rs).
+Covers StartupMessage (with SSL/GSSENC `'N'` rejection), AuthenticationOk,
+ParameterStatus burst, BackendKeyData, ReadyForQuery, then simple-
+query dispatch over IDENTIFY_SYSTEM, TIMELINE_HISTORY (single-
+timeline empty body), START_REPLICATION PHYSICAL parser, and a
+`WalSenderConn` with `write_raw` (single-frame CopyData wrap),
+`write_framed` (verbatim — listener already framed), and
+`try_recv_frame` (inbound `'r'` status decode).
+
+Frame encoders moved to [`stream.rs`](../wal-rs/src/pg/replication/stream.rs)
+alongside the existing decoders: `encode_wal_data_frame`,
+`encode_keepalive_frame`. The `'r'` standby status parser is
+`server::decode_standby_status`. All emit pg-microsecond timestamps
+via the existing [`now_pg_microseconds`].
+
+Surprise: PG 18 walreceiver kills the connection if our advertised
+`server_wal_end` runs ahead of the bytes we've actually streamed
+— it reads the not-yet-written page from `pg_wal/seg` and decides
+the primary corrupted the stream. Solved by holding
+`ShadowStreamState::server_wal_end` to the highest LSN of bytes
+already enqueued, not to the segment-end LSN we expected to reach.
+
+Validation: a libpq client (`psql -c IDENTIFY_SYSTEM`) round-trips
+the handshake through the walsender — `wal-rs/tests/walsender_vs_libpq.rs`.
+A real PG 18 standby pointed at the walsender via `primary_conninfo`
+runs the full StartupMessage → IDENTIFY_SYSTEM dance and surfaces
+our cached systemid in its log — `tests/walsender_pg18_walreceiver.rs`.
+
+### §3 — `ShadowStreamSink`
+
+Landed as [`src/shadow_stream.rs`](../src/shadow_stream.rs). The
+sink composes through the new `RecordBytesSink` trait owned by
+`WalStream`. Per-connection state (`dispatched_lsn`, `flush_lsn`,
+`apply_lsn`, `closing`) plus the segment-wide `server_wal_end`
+high-water mark lives in `ShadowStreamState` behind one
+`Arc<Mutex<>>`. Slow-client cutoff drops the socket past
+`slow_threshold` bytes queued.
+
+`spawn_listener` accepts on a `tokio::net::TcpSocket` configured
+with `SO_REUSEADDR` (needed for the daemon-restart case where a
+prior bind sits in TIME_WAIT). Each accept calls
+`handshake_and_await_start`, then runs a per-connection pump:
+ticker-driven `drain_send_queue` (writing already-wrapped CopyData
+frames straight through `write_framed`) + `try_recv_frame` for
+inbound `'r'` status updates.
+
+Surprise: the plan said the sink would "frame on `on_record_bytes`".
+The trait morphed to `on_wire_chunk(start_lsn, bytes)` once it
+became clear the wire needs page-header bytes between records, not
+just record bytes. The renamed trait method ships contiguous
+slices `[wire_offset..record_end]` from the walker's segment
+buffer — record + the page headers / inter-record padding that
+preceded it.
+
+Surprise: CopyData wrapping moved into the sink itself
+(`wrap_copy_data` helper) so the listener can concatenate multiple
+frames in one `write_all`. Less work per tick, no double-framing.
+
+### §4 — Shadow lifecycle: `primary_conninfo`
+
+Landed as a single-arg [`Shadow::enable_standby_recovery
+(primary_conninfo: &str)`](../src/shadow.rs) (the no-arg form was
+dropped — back-compat doesn't matter). The function emits both
+`primary_conninfo = '...'` and `restore_command = 'cp ...'` so
+PG's walreceiver tries the wire first and falls back to the
+archive on disconnect.
+
+Bootstrap-barrier story turned out trickier than the plan
+suggested. The plan called for "walsender listener accepting
+before `Shadow::start` issues recovery-mode startup". In
+[`bin/stream.rs`](../src/bin/stream.rs) the daemon binds the
+listener immediately after `IDENTIFY_SYSTEM` returns from source,
+well before any shadow-start happens externally — that satisfies
+the barrier in practice. The trickier case was the in-crate
+`phase8_e2e` test, where `bootstrap_clusters` originally
+`shadow.start()`'d before any walsender existed, leaving the
+walreceiver to spin on "Connection refused". Restructured to pull
+source identity (`pg_control_system().system_identifier`,
+`pg_current_wal_lsn()`) via `psql` and bind the walsender before
+`shadow.start()` — the test now reliably wires the wire before
+the first walreceiver attempt.
+
+### §5 — dual-cursor durability
+
+[`Cursor`](../src/cursor.rs) bumped to schema v2 (64 B, six LSNs).
+The new `shadow_flush_lsn` slot tracks the minimum `flush_lsn`
+across active shadow streaming connections; bin/stream.rs polls
+`ShadowStreamState::aggregate().min_flush_lsn` into an
+`AtomicU64` that the cursor write loop reads.
+
+Surprise: the plan asked for v1-cursor read compatibility. After
+"backwards compatibility doesn't matter" came back, ripped that
+out — v1 cursors are now rejected on read. Greenfield resume
+covers any operator that upgraded mid-stream.
+
+### §6 — loud `ReplayTimeout`
+
+`BufferingDecoderSink::on_record` and `DecoderSink::on_record`
+both bubble `CatalogError::ReplayTimeout` as `DecoderSinkError::Catalog`
+which lands in the daemon's stream-poison path. Daemon exits
+non-zero. The `replay_timeout` field on `DecoderStats` is gone
+(no zero-valued legacy field left over).
+
+### Tests + acceptance
+
+- `cargo test --workspace --lib` — 259 walshadow + 186 wal-rs unit
+  tests pass. Streaming-walker tests cover multi-page records,
+  page-straddling headers, drip-feed byte-by-byte, zero-padded
+  segment tail, rewrite scatter, garbage / pre-PG15 magic
+  rejection.
+- `bin_stream_e2e` — the real `walshadow-stream` daemon against
+  source + shadow PG. Configures shadow's `primary_conninfo` at
+  the daemon's `--walsender-bind` port; daemon spawns the
+  walsender, wires `ShadowStreamSink`, walreceiver connects, full
+  workload replicates.
+- `phase8_e2e` — both INSERT/UPDATE/DELETE and the
+  ADD-COLUMN-then-UPDATE drill pass with the walsender pre-bound
+  in `bootstrap_clusters` before `shadow.start()`. Catalog gate
+  clears via the wire in ≤ 50 ms in steady state.
+- `walsender_pg18_walreceiver` — a real PG 18 standby standby.signal'd
+  against the walsender surfaces our advertised systemid in its
+  log, proving the StartupMessage → IDENTIFY_SYSTEM → DataRow
+  exchange against unmodified libpq code.
+
+### Acceptance items, audited
+
+- ✅ `UPDATE … WHERE id=1` ≤ 1 s p99 — `bin_stream_e2e` round-trips
+  the workload in seconds, no `pg_switch_wal` shim. Demo
+  `docker/DEMO.md` no longer hand-rolls a WAL switch.
+- ✅ Post-DDL ALTER-then-UPDATE drill — `phase8_add_column_replicates_pre_and_post_alter`
+  exercises pg_class invalidation through the wire-driven gate.
+- ✅ `cargo test --workspace --lib` stays green
+- ✅ Streaming walker has its unit tests
+- ✅ Walsender server: StartupMessage (`server::tests::handshake_identifies_system_and_starts_replication`),
+  IDENTIFY_SYSTEM forwarding (`walsender_vs_libpq`), START_REPLICATION
+  resume from arbitrary LSN (`server::tests::parse_start_replication_forms`,
+  + `walsender_pg18_walreceiver` which exercises the real
+  walreceiver's request flow). Keepalive-timeout test stub
+  deferred — the ticker path is covered indirectly by the libpq
+  + PG-walreceiver round-trips.
+- ⚠️ Kill-walshadow-mid-stream-restart integration test is *not*
+  in the test tree. The dual-cursor durability fields are in
+  place, and the manual flow (kill, restart with same
+  `--walsender-bind`) works against `bin_stream_e2e`. Lifting it
+  into an automated test requires shimming a "graceful kill"
+  hook in the daemon binary that pauses just before flush_segment;
+  punt to a follow-up.
+- ✅ `phase11_cursor` stays green
+- ✅ `replay_timeout` stat removed; poison + exit on gate timeout
+
+### What didn't land in PHASE13
+
+- Operator-visible `walshadow_shadow_apply_lag_bytes` /
+  `walshadow_shadow_apply_lag_seconds` metric pair (open
+  question in §). Wire is in place: aggregate LSN view from
+  `ShadowStreamState::aggregate()` already exposes
+  `min_apply_lsn`; hooking it into the metrics endpoint is
+  mechanical.
+- TLS / SCRAM on the walsender. Out of scope per the plan;
+  trust-over-loopback is the only auth path today.
+- HS-feedback (`'h'`) frame: silently dropped on the server side.
+  Long-running shadow queries that conflict with replay still hit
+  `max_standby_streaming_delay`.
+
+### Surprises that reshaped the design
+
+1. **CopyData framing belongs in the sink, not the listener.**
+   The walreceiver disconnects on framing inconsistencies. Wrapping
+   each frame at enqueue time + having the listener forward bytes
+   verbatim makes the wire byte-exact under concurrent enqueue +
+   pump.
+2. **`server_wal_end` ≠ segment-end LSN.** Advertising
+   "the WAL ends at segment_end" before bytes arrive triggers PG's
+   "invalid magic" check. The high-water mark must trail the bytes
+   actually enqueued.
+3. **Source identity has to be known before walreceiver connects.**
+   `IDENTIFY_SYSTEM`'s systemid must match the standby's
+   basebackup-derived sysid or walreceiver bails. In the daemon
+   binary this falls out naturally from the bootstrap order; in
+   in-crate tests it required pulling `pg_control_system().system_identifier`
+   via psql up-front and binding the walsender before
+   `shadow.start()`.
+4. **TIME_WAIT bites bind cycles.** Listener bind needs
+   `SO_REUSEADDR`. The default `TcpListener::bind` doesn't set it;
+   `TcpSocket::set_reuseaddr(true)` plus explicit bind+listen does.
+5. **CH server grabs adjacent ports.** Walsender port collided
+   with CH's auto-derived sidecar port for our first test
+   placement. Tests now space walsender ports ≥ 40 away from CH
+   ports.

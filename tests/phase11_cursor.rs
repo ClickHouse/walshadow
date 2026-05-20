@@ -21,6 +21,7 @@ async fn write_survives_simulated_crash_during_tmp_phase() {
         shadow_replay_lsn: 0x08,
         drain_lsn: 0x07,
         emitter_ack_lsn: 0x06,
+        shadow_flush_lsn: 0x05,
     };
     cursor::write(dir, &good).await.unwrap();
     // Now simulate a crash during the *next* write: the .tmp gets

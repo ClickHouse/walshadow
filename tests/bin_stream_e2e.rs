@@ -26,9 +26,10 @@ use walshadow::shadow::{Shadow, ShadowConfig};
 // Reserved port slot for this test binary — 56170-range, distinct
 // from phase8 (56100) / phase12 (56140) so concurrent `cargo test`
 // invocations don't trip over each other.
-const SOURCE_PORT: u16 = 56171;
-const SHADOW_PORT: u16 = 56172;
-const METRICS_PORT: u16 = 56173;
+const SOURCE_PORT: u16 = 26171;
+const SHADOW_PORT: u16 = 26172;
+const METRICS_PORT: u16 = 26173;
+const WALSENDER_PORT: u16 = 26174;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -128,11 +129,15 @@ fn rewrite_for_shadow(data_dir: &Path, port: u16, socket_dir: &Path) -> Result<(
     Ok(())
 }
 
-fn enable_recovery(data_dir: &Path, restore_from: &Path) -> Result<()> {
+fn enable_recovery(data_dir: &Path, restore_from: &Path, walsender_port: u16) -> Result<()> {
     fs::write(data_dir.join("standby.signal"), b"")?;
     let conf = data_dir.join("postgresql.conf");
     let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
     writeln!(f, "\n# walshadow bin_stream_e2e recovery")?;
+    writeln!(
+        f,
+        "primary_conninfo = 'host=127.0.0.1 port={walsender_port} user=walshadow application_name=shadow sslmode=disable'",
+    )?;
     writeln!(f, "restore_command = 'cp {}/%f %p'", restore_from.display())?;
     writeln!(f, "recovery_target_timeline = 'latest'")?;
     Ok(())
@@ -225,7 +230,8 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
     rewrite_for_shadow(&shadow_data, SHADOW_PORT, &shadow_sock).expect("retarget shadow conf");
-    enable_recovery(&shadow_data, &shadow_filter_dir).expect("enable shadow recovery");
+    enable_recovery(&shadow_data, &shadow_filter_dir, WALSENDER_PORT)
+        .expect("enable shadow recovery");
 
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
     shadow_cfg.port = SHADOW_PORT;
@@ -282,6 +288,8 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             "1",
             "--metrics-bind",
             &metrics_addr.to_string(),
+            "--walsender-bind",
+            &format!("127.0.0.1:{WALSENDER_PORT}"),
             // Retention disabled — no shadow_replay sweeper churn
             // racing the test's max-segments exit. Default would
             // poll shadow on a 60s cadence; we'd never observe it.
@@ -356,8 +364,9 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         daemon_killed = true;
         assert!(
             status.success(),
-            "daemon exit status: {status:?}\nstderr:\n{}",
+            "daemon exit status: {status:?}\nstderr:\n{}\nshadow startup.log:\n{}",
             fs::read_to_string(&stderr_path).unwrap_or_default(),
+            fs::read_to_string(shadow_data.join("startup.log")).unwrap_or_default(),
         );
 
         // 8. Wait for shadow to replay past the source's final LSN.

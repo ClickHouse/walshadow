@@ -15,13 +15,15 @@
 //!    `pg_type` + `pg_namespace`.
 //!
 //! Generation invalidation: a [`CatalogTracker`](crate::catalog_tracker
-//! ::CatalogTracker) wired with [`set_invalidation_signal`](crate
-//! ::catalog_tracker::CatalogTracker::set_invalidation_signal) emits
-//! one mpsc tick per catalog-touching record. The receiver side runs
-//! [`spawn_invalidation_drain`] which coalesces ticks down to single
-//! [`ShadowCatalog::invalidate`] calls. The counter bumps; stale cache
-//! entries (whose stored generation no longer matches) are rejected on
-//! next access and re-fetched lazily.
+//! ::CatalogTracker) wired with [`set_invalidation_epoch`](crate
+//! ::catalog_tracker::CatalogTracker::set_invalidation_epoch) bumps a
+//! shared `AtomicU64` on every catalog-touching record. The catalog
+//! reads the atomic at the top of every relation lookup
+//! ([`ShadowCatalog::set_invalidation_epoch`] installs the matching
+//! `Arc` clone). An advance triggers an in-line
+//! [`ShadowCatalog::invalidate`] before the cache check — synchronous
+//! so a DDL observed in the same batch as the dependent heap INSERT
+//! can't race past the cache.
 //!
 //! Concurrency: every mutating-looking method on `ShadowCatalog`
 //! ([`relation_at`](ShadowCatalog::relation_at),
@@ -46,6 +48,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -247,6 +250,15 @@ pub struct ShadowCatalog {
     by_oid: HashMap<Oid, CacheEntry>,
     eviction: EvictionIndex,
     last_replay_lsn: Option<u64>,
+    /// Shared with the upstream [`CatalogTracker`](crate
+    /// ::catalog_tracker::CatalogTracker). Acquire-load on every
+    /// relation lookup; an advance triggers `invalidate`. `None` when
+    /// the catalog is used standalone (tests, batch tools).
+    invalidation_epoch: Option<Arc<AtomicU64>>,
+    /// Latest epoch already folded into `generation`. Compared against
+    /// `invalidation_epoch` on each lookup; updated to the loaded
+    /// value after invalidation runs.
+    last_seen_epoch: u64,
     stats: ShadowCatalogStats,
 }
 
@@ -274,8 +286,32 @@ impl ShadowCatalog {
             by_oid: HashMap::new(),
             eviction: EvictionIndex::default(),
             last_replay_lsn: None,
+            invalidation_epoch: None,
+            last_seen_epoch: 0,
             stats: ShadowCatalogStats::default(),
         })
+    }
+
+    /// Install the shared epoch counter. Pass the same `Arc` clone as
+    /// the upstream [`CatalogTracker::set_invalidation_epoch`](crate
+    /// ::catalog_tracker::CatalogTracker::set_invalidation_epoch) call.
+    pub fn set_invalidation_epoch(&mut self, epoch: Arc<AtomicU64>) {
+        // Adopt the current value as already-seen so a non-zero epoch
+        // (e.g., catalog opened mid-stream) doesn't trigger a spurious
+        // initial invalidate on the first lookup.
+        self.last_seen_epoch = epoch.load(Ordering::Acquire);
+        self.invalidation_epoch = Some(epoch);
+    }
+
+    fn drain_invalidations(&mut self) {
+        let Some(e) = &self.invalidation_epoch else {
+            return;
+        };
+        let cur = e.load(Ordering::Acquire);
+        if cur != self.last_seen_epoch {
+            self.last_seen_epoch = cur;
+            self.invalidate();
+        }
     }
 
     /// Current generation. Bumps every [`invalidate`] call.
@@ -448,8 +484,12 @@ impl ShadowCatalog {
         rfn: RelFileNode,
         at_lsn: u64,
     ) -> Result<Arc<RelDescriptor>> {
+        self.drain_invalidations();
         if at_lsn > 0 {
             self.wait_for_replay(at_lsn).await?;
+            // Re-check after the await: a DDL observed concurrently can
+            // have bumped the epoch while wait_for_replay yielded.
+            self.drain_invalidations();
         }
         if let Some(entry) = self.by_filenode.get(&rfn)
             && entry.generation == self.generation
@@ -468,6 +508,7 @@ impl ShadowCatalog {
     /// Look up a relation by oid (no replay-LSN gate; intended for
     /// oid-only references like xact records or shared-catalog probes).
     pub async fn relation_by_oid(&mut self, oid: Oid) -> Result<Arc<RelDescriptor>> {
+        self.drain_invalidations();
         if let Some(entry) = self.by_oid.get(&oid)
             && entry.generation == self.generation
         {
@@ -774,29 +815,6 @@ where
 /// errors against well-known queries are not expected.
 fn is_transient(err: &CatalogError) -> bool {
     matches!(err, CatalogError::Pg(_))
-}
-
-/// Spawn the drain task that turns
-/// [`CatalogTracker`](crate::catalog_tracker::CatalogTracker) invalidation
-/// signals into [`ShadowCatalog::invalidate`] calls. Coalesces queued
-/// signals into one bump per wake — over-invalidation is cheap (lazy
-/// eviction) so adjacency-coalescing is the right trade.
-///
-/// The task ends when every [`UnboundedSender`](tokio::sync::mpsc
-/// ::UnboundedSender) tied to `rx` drops. Holding the returned
-/// [`JoinHandle`](tokio::task::JoinHandle) is optional; ignoring it
-/// detaches the task (preferred in long-running daemons).
-pub fn spawn_invalidation_drain(
-    catalog: std::sync::Arc<tokio::sync::Mutex<ShadowCatalog>>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            // Drain everything queued: one invalidate covers N signals.
-            while rx.try_recv().is_ok() {}
-            catalog.lock().await.invalidate();
-        }
-    })
 }
 
 #[cfg(test)]
