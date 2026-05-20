@@ -48,30 +48,11 @@ Expect three rows, all sharing the same `_lsn` (`start_lsn` from the
 
 ## 4. Drive a change & verify streaming
 
-`walshadow-stream` parses WAL one 16 MiB segment at a time
-(`WalStream::push` → `filter_segment`), so a small UPDATE on a quiet
-source sits in the in-flight segment until either the segment fills
-or source rolls it. Two ways to force the roll:
-
-- **Demo / low-volume:** `SELECT pg_switch_wal()` after each change.
-- **Production / steady throughput:** set `archive_timeout=30s` (or
-  similar) on source so PG auto-rotates segments under any
-  back-pressure. Documented in `docker-compose.yml` would expose this
-  per-source.
-
-Each statement runs in its own psql autocommit txn — `psql -c
-"UPDATE…; SELECT pg_switch_wal()"` would wrap **both** in one txn
-whose COMMIT would land *after* the SWITCH (in a half-empty next
-segment that can't reach the 16 MiB flush threshold), breaking the
-recipe. Run them as separate `-c` calls, or pipe via heredoc:
-
 ```
-docker compose -f docker/docker-compose.yml exec -T source psql -U postgres <<'SQL'
-UPDATE demo.users SET email='opifex@merces-digna' WHERE id=1;
-SELECT pg_switch_wal();
-SQL
+docker compose -f docker/docker-compose.yml exec -T source psql -U postgres -c \
+    "UPDATE demo.users SET email='opifex@merces-digna' WHERE id=1"
 
-sleep 3
+sleep 1
 
 docker compose -f docker/docker-compose.yml exec clickhouse \
     clickhouse-client --query "SELECT id,email,_op,_lsn FROM demo.users FINAL ORDER BY id"

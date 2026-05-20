@@ -1301,12 +1301,13 @@ async fn run_bootstrap(
         "bootstrap landed",
     );
 
-    // Lay down standby.signal + restore_command. Operator (or service
-    // manager) starts shadow PG against `shadow_data_dir` next; PG's
-    // recovery picks up filtered segments from `--out-dir` via the
-    // restore_command and applies them.
-    write_standby_config(&shadow_data_dir, &args.out_dir)
-        .context("bootstrap: write standby.signal + restore_command")?;
+    // Lay down standby.signal + primary_conninfo + restore_command.
+    // primary_conninfo points at the daemon's PHASE13 walsender (bound
+    // further down in `run`); restore_command remains the archive
+    // fallback. PG's walreceiver tries the wire first and falls back on
+    // disconnect or end-of-WAL.
+    write_standby_config(&shadow_data_dir, &args.out_dir, args.walsender_bind)
+        .context("bootstrap: write standby.signal + primary_conninfo + restore_command")?;
 
     Ok(outcome.end.end_lsn)
 }
@@ -1357,7 +1358,11 @@ async fn autospawn_shadow_and_wait(
 /// PG starts in standby mode and feeds itself from the daemon's
 /// filtered-segment directory. Idempotent: `standby.signal` is a
 /// zero-byte marker file; `restore_command` is appended once.
-fn write_standby_config(shadow_data_dir: &Path, filter_out_dir: &Path) -> Result<()> {
+fn write_standby_config(
+    shadow_data_dir: &Path,
+    filter_out_dir: &Path,
+    walsender_bind: SocketAddr,
+) -> Result<()> {
     fs::create_dir_all(shadow_data_dir)?;
     fs::write(shadow_data_dir.join("standby.signal"), b"")?;
     let conf = shadow_data_dir.join("postgresql.auto.conf");
@@ -1373,6 +1378,17 @@ fn write_standby_config(shadow_data_dir: &Path, filter_out_dir: &Path) -> Result
         .create(true)
         .open(&conf)?;
     writeln!(f, "\n{marker}")?;
+    // primary_conninfo wires shadow's walreceiver to walshadow's
+    // PHASE13 walsender. Skip when port=0 — kernel-picked addresses
+    // are unstable across daemon restarts, fall back to archive-only.
+    if walsender_bind.port() != 0 {
+        writeln!(
+            f,
+            "primary_conninfo = 'host={} port={} user=walshadow application_name=shadow sslmode=disable'",
+            walsender_bind.ip(),
+            walsender_bind.port(),
+        )?;
+    }
     writeln!(
         f,
         "restore_command = 'cp {}/%f %p'",
