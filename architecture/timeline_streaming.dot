@@ -1,0 +1,133 @@
+// walshadow — steady-state streaming: one record's journey
+// rankdir=LR — pipeline reads left → right with parallel branches
+digraph timeline_streaming {
+  rankdir=LR;
+  compound=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow steady-state streaming — one record's journey through hot path", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.6, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ═════ ① ingress ═════
+  subgraph cluster_p1 {
+    label="① ingress";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    commit [label="COMMIT on demo.users\nUPDATE → WAL @ LSN=X", fillcolor="#3D3D54"];
+    wsend  [label="source walsender\nCopyData 'w' frame", fillcolor="#3D3D54"];
+    feed   [label="SourceFeed::pump\nWalChunk(start_lsn=X)", fillcolor="#4D3A28"];
+    commit -> wsend -> feed [color="#A1A9CC"];
+  }
+
+  // ═════ ② filter + rewrite ═════
+  subgraph cluster_p2 {
+    label="② filter + rewrite";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    push   [label="WalStream::push\nStreamingWalker\nextend / try_next", fillcolor="#4D3A28"];
+    rec    [label="CompletedRecord\n(parsed, byte_ranges)", fillcolor="#4D3A28", shape=parallelogram];
+    decide [label="Filter::decide\n→ Decision::Drop\n(user heap)", fillcolor="#4D3A28"];
+    rewr   [label="rewrite::noop_replace\nin-place + CRC32C", fillcolor="#4D3A28"];
+    push -> rec -> decide -> rewr;
+  }
+  feed -> push [lhead=cluster_p2];
+
+  // ═════ ③ fan-out (record-cadence dispatch in order) ═════
+  subgraph cluster_p3 {
+    label="③ fan-out (sync dispatch — ordering matters)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    fbytes [label="❶ RecordBytesSink\n→ ShadowStreamSink", fillcolor="#4D3340"];
+    frec   [label="❷ RecordSink\n→ DecoderSink", fillcolor="#4D4128"];
+    fseg   [label="❸ SegmentSink defers\nuntil 16 MiB boundary", fillcolor="#4D3340"];
+  }
+  rewr -> fbytes [lhead=cluster_p3];
+  rewr -> frec;
+  rewr -> fseg [style=dashed];
+
+  // ═════ ④ shadow apply (hot wire) ═════
+  subgraph cluster_p4 {
+    label="④ shadow apply  (record cadence, ms)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    frame4 [label="frame 'w' XLogData\nenqueue to send buffer", fillcolor="#4D3340"];
+    recv4  [label="walreceiver applies redo\npg_last_wal_replay_lsn ↑", fillcolor="#3D4128"];
+    frame4 -> recv4 [label="hot wire", color="#BD8183", penwidth=2];
+  }
+  fbytes -> frame4 [lhead=cluster_p4, color="#BD8183", penwidth=2];
+
+  // ═════ ⑤ decoder gate + buffer ═════
+  subgraph cluster_p5 {
+    label="⑤ decoder gate clears + xact buffer  (gated on ④)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    gate5 [label="DecoderSink:\nrelation_at(rfn, X)\nwait_for_replay(X)", fillcolor="#4D4128"];
+    dec5  [label="heap_decoder\n→ DecodedHeap", fillcolor="#4D4128"];
+    buf5  [label="XactBuffer::insert(xid)\n(per-xid mem + spill)", fillcolor="#4D4128"];
+    gate5 -> dec5 -> buf5;
+  }
+  frec -> gate5 [lhead=cluster_p5];
+  recv4 -> gate5 [label="apply_lsn ≥ X\n(unblocks gate)", style=dashed, color="#BD8183"];
+
+  // ═════ ⑥ commit drain → CH ═════
+  subgraph cluster_p6 {
+    label="⑥ XLOG_XACT_COMMIT  → drain → CH";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    cmt6   [label="XLOG_XACT_COMMIT\nLSN = X'", fillcolor="#3D3D54"];
+    drain6 [label="XactBuffer::commit(xid, X')\ndrain spill + memory\nin WAL order", fillcolor="#4D4128"];
+    enc6   [label="TableEncoder\nBlockBuilder\n_lsn / _xid / _op / _commit_ts", fillcolor="#4D4128"];
+    sndp6  [label="send_query INSERT…\nsend_data(Some(block))", fillcolor="#4D4128"];
+    sndn6  [label="send_data(None)\ndrain responses\nemitter_ack_lsn := X'", fillcolor="#4D4128"];
+    ch6    [label="ReplacingMergeTree(_lsn)\nmerged in CH", fillcolor="#4D4128"];
+
+    cmt6 -> drain6;
+    drain6 -> enc6 -> sndp6 -> sndn6;
+    sndp6 -> ch6 [label="Native block", color="#BF8C5F"];
+    sndn6 -> ch6 [style=dashed];
+  }
+  buf6_anchor [shape=point, width=0, style=invis];  // anchor for cross-cluster from buf5
+  buf5 -> cmt6 [label="next record", style=dashed];
+
+  // ═════ ⑦ async durability (off hot path) ═════
+  subgraph cluster_p7 {
+    label="⑦ async durability  (off hot path, segment / cursor cadence)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    seg7  [label="DirSegmentSink::on_segment\nfsync segment + manifest\nfsync parent dir", fillcolor="#4D3340"];
+    out7  [label="out/<seg>\n+ manifest.json", fillcolor="#4D3850", shape=note];
+    cur7  [label="status loop (10 s)\ncursor::write\nSourceFeed::send_status", fillcolor="#4D3A28"];
+    curd7 [label="cursor.bin\natomic rename", fillcolor="#4D3850", shape=note];
+    slot7 [label="source slot advance\napply = min(\n shadow_replay,\n emitter_ack)", fillcolor="#3D3D54"];
+
+    seg7 -> out7;
+    cur7 -> curd7;
+    cur7 -> slot7 [color="#B58B86", style=dashed];
+  }
+  fseg -> seg7 [label="16 MiB boundary", style=dashed, lhead=cluster_p7];
+  sndn6 -> cur7 [style=dotted, color="#b380b0", label="emitter_ack_lsn"];
+
+  // ═════ Legend + budget table ═════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — actor</B></TD></TR>
+      <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>source Postgres</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>walshadow ingress / orchestrator</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>walshadow decoder + xact + emitter / CH</TD></TR>
+      <TR><TD BGCOLOR="#4D3340"></TD><TD>walshadow output sinks (walsender, segment)</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>source → walshadow replication</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>━━</B></FONT></TD><TD>walsender wire → shadow (hot path)</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>ClickHouse Native block</TD></TR>
+      <TR><TD><FONT COLOR="#B58B86"><B>┄┄</B></FONT></TD><TD>standby status to source slot</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability write</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>hot-path budget (PHASE13: ≤ 1 s p99)</B></TD></TR>
+      <TR><TD>④ shadow apply</TD><TD>ms — walsender wire</TD></TR>
+      <TR><TD>⑤ gate clear</TD><TD>ms — driven by ④</TD></TR>
+      <TR><TD>⑥ CH block send</TD><TD>ms — single Native block / xact</TD></TR>
+      <TR><TD>⑦ segment + cursor</TD><TD>seconds — async, off hot path</TD></TR>
+    </TABLE>
+  >];
+  ch6 -> legend [style=invis];
+}

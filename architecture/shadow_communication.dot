@@ -1,0 +1,81 @@
+// walshadow ↔ shadow PG — three communication channels
+// 1. libpq queries (catalog cache fill)
+// 2. walsender wire (record-cadence WAL push, Phase 13)
+// 3. restore_command (archive fallback, segment cadence)
+digraph shadow_comm {
+  rankdir=LR;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow ↔ shadow PG — three communication channels", fontsize=14, splines=spline, nodesep=0.6, ranksep=1.0, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=10, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ──────── walshadow side ────────
+  subgraph cluster_w {
+    label="walshadow-stream daemon"; style="solid"; color="#A1A9CC";
+    bgcolor="#34302c";
+
+    catalog [label="ShadowCatalog\nRelDescriptor LRU\n+ tokio_postgres client", fillcolor="#3D3D54"];
+    inval   [label="invalidation_drain task\ngeneration counter", fillcolor="#3D3D54"];
+
+    sender  [label="ShadowStreamSink + walsender\nlistener (unix / TCP)\nframe encoder", fillcolor="#4D3340"];
+    segwrt  [label="DirSegmentSink\nfiltered segments + manifest", fillcolor="#4D3850"];
+
+    bootstrap [label="Bootstrap orchestrator\nspawn_greenfield_bootstrap\n(catalog seed + BASE_BACKUP)", fillcolor="#4D4128"];
+  }
+
+  // ──────── on-disk archive ────────
+  outdir [label="out/<seg>\n16 MiB filtered\nsegments + manifests", fillcolor="#5A3D5A", shape=note];
+  dataok [label="shadow data dir\npopulated by bootstrap\n(catalog files landed)", fillcolor="#5A3D5A", shape=note];
+
+  // ──────── shadow side ────────
+  subgraph cluster_s {
+    label="shadow PG (continuous recovery)"; style="solid"; color="#869461";
+    bgcolor="#34302c";
+
+    walrecv [label="walreceiver\nprimary_conninfo=walshadow\nflush/apply LSN", fillcolor="#3D4128"];
+    restorer[label="restore_command\ncp out/%f %p", fillcolor="#3D4128"];
+    shadcat [label="pg_class /\npg_attribute /\npg_type / pg_namespace", fillcolor="#3D4128"];
+    pglog   [label="redo apply\npg_last_wal_replay_lsn()", fillcolor="#3D4128"];
+  }
+
+  // ──────── Channel 1: libpq (catalog reads) ────────
+  catalog -> shadcat [label="① libpq SELECT\n(cache fill on miss)\nport=55434", color="#CBA85E", dir=both, arrowtail=open, penwidth=2];
+
+  // ──────── Channel 2: walsender wire (Phase 13 — hot path) ────────
+  sender  -> walrecv [label="② 'w' XLogData frames\nrecord cadence (ms)\nstreaming-replication protocol", color="#BD8183", penwidth=3];
+  walrecv -> sender  [label="② 'r' standby status\nflush_lsn / apply_lsn", color="#BD8183", style=dashed];
+
+  // ──────── Channel 3: restore_command (archive fallback) ────────
+  segwrt  -> outdir  [label="fsync segment + manifest", color="#6E6963"];
+  outdir  -> restorer[label="③ filesystem read\non walreceiver disconnect\nor end-of-WAL", color="#6E6963", penwidth=2];
+  restorer-> pglog   [label="apply segment", color="#6E6963"];
+  walrecv -> pglog   [label="apply 'w' frames", color="#BD8183"];
+
+  // ──────── Bootstrap channel (one-shot) ────────
+  bootstrap -> dataok [label="④ catalog files\n(BASE_BACKUP landed)", color="#BF8C5F", style=dashed, penwidth=2];
+  dataok    -> pglog  [label="initial state", color="#BF8C5F", style=dashed];
+
+  // ──────── Catalog invalidation feedback ────────
+  pglog   -> walrecv [label="advance\npg_last_wal_replay_lsn", style=dashed];
+  inval   -> catalog [label="bump generation\n(force cache miss)", style=dashed, color="#CBA85E"];
+
+  // ──────── Catalog gate dependency ────────
+  walrecv -> catalog [label="apply_lsn drives\nrelation_at gate\n(unblocks decoder)", style=dotted, color="#A1A9CC", constraint=false];
+
+  // ──────── Legend ────────
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>channels (edge color)</B></TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>① ━━</B></FONT></TD><TD>libpq queries (catalog cache fill, on miss)</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>② ━━</B></FONT></TD><TD>walsender wire — 'w' XLogData @ record cadence (ms)</TD></TR>
+      <TR><TD><FONT COLOR="#6E6963"><B>③ ━━</B></FONT></TD><TD>restore_command — archive fallback (segment cadence)</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>④ ┄┄</B></FONT></TD><TD>BASE_BACKUP land (one-shot, greenfield)</TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>···</B></FONT></TD><TD>catalog gate dependency (apply_lsn → relation_at)</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill</B></TD></TR>
+      <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>walshadow — ShadowCatalog (libpq client)</TD></TR>
+      <TR><TD BGCOLOR="#4D3340"></TD><TD>walshadow — walsender / sender side</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>walshadow — on-disk segments / shadow data dir</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>walshadow — bootstrap orchestrator</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres receivers / catalog</TD></TR>
+    </TABLE>
+  >];
+}

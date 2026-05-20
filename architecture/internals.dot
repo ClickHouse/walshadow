@@ -1,0 +1,134 @@
+// walshadow — internal pipeline detail
+// Deeper than overview.dot: filter stages, fan-out ordering, catalog cache
+// internals, walsender server internals, decoder type matrix, xact spill, …
+digraph internals {
+  rankdir=TB;
+  compound=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow internals — pipeline stages, taps & caches", fontsize=14, splines=spline, nodesep=0.45, ranksep=0.55, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ════════ External actors ════════
+  src [label="source PG", fillcolor="#3D3D54", shape=cylinder];
+  shd [label="shadow PG\nwalreceiver + catalog\n(pg_last_wal_replay_lsn)", fillcolor="#3D4128", shape=cylinder];
+  ch  [label="ClickHouse", fillcolor="#4D4128", shape=cylinder];
+
+  // ════════ ① ingress ════════
+  subgraph cluster_ingress {
+    label="① ingress (main loop, tokio)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    feed   [label="SourceFeed::pump\nwal-rs ReplicationConn\nIDENTIFY_SYSTEM +\nSTART_REPLICATION PHYSICAL", fillcolor="#3D3D54"];
+    chunks [label="WalChunk stream\n(start_lsn, server_wal_end,\n bytes)", fillcolor="#3D3D54", shape=parallelogram];
+    feed -> chunks;
+  }
+
+  // ════════ ② filter pipeline ════════
+  subgraph cluster_filter {
+    label="② filter pipeline (sync, record cadence)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    walker  [label="StreamingWalker\npage-state machine\nrecord stitch across pages", fillcolor="#4D3A28"];
+    track   [label="CatalogTracker\nrelfilenode set\n(relmap + pg_class writes)", fillcolor="#4D3A28"];
+    decide  [label="Filter::decide\nKeep catalog\nDrop user-heap\nEmpty → reclass", fillcolor="#4D3A28"];
+    rewrite [label="rewrite::noop_replace\nin-place at byte_ranges\n+ CRC32C recompute", fillcolor="#4D3A28"];
+    segbuf  [label="16 MiB segment buffer\n(rewritten image)", fillcolor="#4D3A28", shape=cylinder];
+    walker -> decide -> rewrite -> segbuf;
+    decide -> track [dir=both, arrowtail=open, style=dashed];
+  }
+  chunks -> walker [color="#A1A9CC", penwidth=2];
+
+  // ════════ ③ fan-out ════════
+  subgraph cluster_fanout {
+    label="③ CompositeRecordSink fan-out (record cadence — ordering matters)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    bytesink [label="❶ ShadowStreamSink\non_record_bytes", fillcolor="#4D3340"];
+    recsink  [label="❷ DecoderSink\non_record\n(if Drop && Heap)", fillcolor="#4D4128"];
+    segsink  [label="❸ DirSegmentSink\non_segment\n(at 16 MiB boundary)", fillcolor="#4D3340"];
+  }
+  segbuf -> bytesink [color="#BD8183", penwidth=2];
+  segbuf -> recsink;
+  segbuf -> segsink  [style=dashed];
+
+  // ════════ ④ decode + xact buffer ════════
+  subgraph cluster_decode {
+    label="④ decode + xact buffer (gated on shadow apply)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    catgate [label="ShadowCatalog::relation_at\nwait_for_replay(at_lsn)", fillcolor="#4D4128"];
+    decoder [label="heap_decoder\nINSERT / DELETE / UPDATE / HOT\nTier 1 fixed-width\nTier 2 length-prefixed\nReplica identity matrix", fillcolor="#4D4128"];
+    xactbuf [label="XactBuffer\nper-xid hashmap +\nTOAST reassembly\nbudget = work_mem", fillcolor="#4D4128"];
+    drain   [label="commit drain\n(spilled first, mem second,\n WAL-order replay)", fillcolor="#4D4128"];
+    catgate -> decoder -> xactbuf -> drain;
+  }
+  recsink -> catgate;
+
+  // ════════ ⑤ CH emitter ════════
+  subgraph cluster_ch {
+    label="⑤ CH emitter (single query per replica)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    tableenc [label="TableEncoder\nper (table, xact)\nrow/byte budget", fillcolor="#5D4628"];
+    block    [label="BlockBuilder\nNative columns +\n_lsn / _xid / _op / _commit_ts", fillcolor="#5D4628"];
+    chwire   [label="clickhouse-c-rs\nsend_query →\nsend_data(Some|None) →\ndrain responses", fillcolor="#5D4628"];
+    tableenc -> block -> chwire;
+  }
+  drain -> tableenc [color="#BF8C5F", penwidth=2];
+
+  // ════════ ⑥ ShadowCatalog cache (Arc<Mutex<>>) ════════
+  subgraph cluster_catalog {
+    label="⑥ ShadowCatalog cache  (Arc<Mutex<>>)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    lru    [label="LRU 4096\nby_filenode / by_oid\n+ generation counter", fillcolor="#4D4D28"];
+    libpq  [label="tokio_postgres::Client\nSELECT pg_class /\npg_attribute / pg_type", fillcolor="#4D4D28"];
+    inval  [label="invalidation_drain\n(tokio task)\nbump generation\non catalog write", fillcolor="#4D4D28"];
+    lru -> libpq [style=dashed, label="miss"];
+    inval -> lru [style=dashed, color="#CBA85E"];
+  }
+  catgate -> lru   [style=dashed, color="#CBA85E", constraint=false, label="lookup"];
+  track   -> inval [style=dashed, color="#CBA85E", constraint=false];
+
+  // ════════ ⑦ walsender server (tokio task) ════════
+  subgraph cluster_walsender {
+    label="⑦ walsender server  (tokio task)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    listener [label="accept(unix / TCP)\nIDENTIFY_SYSTEM +\nSTART_REPLICATION", fillcolor="#5D3F40"];
+    sendq    [label="per-conn send queue\n'w' XLogData @ record\n'k' keepalive on idle", fillcolor="#5D3F40"];
+    stat     [label="rx 'r' standby status\nflush_lsn / apply_lsn\n(min across conns)", fillcolor="#5D3F40"];
+    listener -> sendq [style=dashed];
+  }
+  bytesink -> sendq [color="#BD8183", penwidth=2];
+  stat -> catgate [style=dashed, color="#BD8183", constraint=false, label="apply_lsn → unblock gate"];
+
+  // ════════ ⑧ on-disk caches ════════
+  subgraph cluster_disk {
+    label="⑧ on-disk caches"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    outdir [label="out/<seg>\n16 MiB filtered\n+ manifest.json", fillcolor="#4D3850", shape=note];
+    spill  [label="{spill}/xid-<xid>-<lsn>.bin\nappend-only\n[tag u8 | len u32 | body]", fillcolor="#4D3850", shape=note];
+    cursor [label="{spill}/cursor.bin\n56B atomic rename\n5 LSN fields + CRC32C", fillcolor="#4D3850", shape=note];
+  }
+
+  // ════════ External edges ════════
+  src     -> feed   [color="#A1A9CC", penwidth=2];
+  sendq   -> shd    [color="#BD8183", penwidth=2, label="hot wire (ms)"];
+  shd     -> stat   [style=dashed, color="#BD8183", constraint=false];
+  libpq   -> shd    [color="#CBA85E", dir=both, arrowtail=open, constraint=false, label="libpq SELECT"];
+  segsink -> outdir;
+  outdir  -> shd    [style=dashed, color="#6E6963", constraint=false, label="restore_command"];
+  xactbuf -> spill  [style=dashed, label="evict largest xact"];
+  drain   -> cursor [style=dotted, color="#b380b0", label="LSN bundle"];
+  chwire  -> ch     [color="#BF8C5F", penwidth=2];
+
+  // ════════ Legend ════════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
+      <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>source PG / ingress</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>walshadow filter pipeline</TD></TR>
+      <TR><TD BGCOLOR="#4D3340"></TD><TD>walshadow output sinks (walsender, segment)</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>walshadow decoder + xact buffer</TD></TR>
+      <TR><TD BGCOLOR="#4D4D28"></TD><TD>walshadow ShadowCatalog cache</TD></TR>
+      <TR><TD BGCOLOR="#5D3F40"></TD><TD>walshadow walsender server</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>walshadow CH emitter</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>source replication frame</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>━━</B></FONT></TD><TD>walsender wire (hot path)</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq catalog query</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>CH Native</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability</TD></TR>
+      <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>filesystem (restore_command)</TD></TR>
+    </TABLE>
+  >];
+  ch -> legend [style=invis];
+}

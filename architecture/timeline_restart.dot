@@ -1,0 +1,102 @@
+// walshadow — restart recovery: 3 scenarios as side-by-side phase columns
+digraph timeline_restart {
+  rankdir=TB;
+  compound=true;
+  newrank=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow restart timelines — 3 scenarios, time flows top → bottom within each column", fontsize=14, splines=spline, nodesep=0.3, ranksep=0.45, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7", width=2.4];
+  edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ═════ A. clean restart (SIGTERM) ═════
+  subgraph cluster_a {
+    label="A. clean restart  (SIGTERM, cursor flushed, slot inside wal_keep_size)";
+    style="rounded,filled"; color="#A1A9CC"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    a0 [label="① SIGTERM", fillcolor="#403a36"];
+    a1 [label="② drain in-flight xact\non_xact_end → ack", fillcolor="#4D3A28"];
+    a2 [label="③ DirSegmentSink::on_partial_segment\n<seg>.partial", fillcolor="#4D3340"];
+    a3 [label="④ cursor::write final state\n(emitter_ack_lsn, drain_lsn, …)", fillcolor="#4D3A28"];
+    a4 [label="⑤ process exit", fillcolor="#403a36"];
+    a5 [label="⑥ restart:\ncursor::read → Cursor{…}\nresume_lsn = segment-aligned\ndown to emitter_ack_lsn", fillcolor="#4D3A28"];
+    a6 [label="⑦ Shadow::start in recovery mode\n(if not already running)", fillcolor="#3D4128"];
+    a7 [label="⑧ walsender listener up\nbefore walreceiver connects", fillcolor="#4D3340"];
+    a8 [label="⑨ SourceFeed open\nSTART_REPLICATION PHYSICAL <resume_lsn>", fillcolor="#4D3A28"];
+    a9 [label="⑩ records re-flow\nCH ReplacingMergeTree(_lsn) dedups", fillcolor="#4D4128"];
+
+    a0 -> a1 -> a2 -> a3 -> a4 -> a5 -> a6 -> a7 -> a8 -> a9;
+  }
+
+  // ═════ B. kill -9 mid-stream ═════
+  subgraph cluster_b {
+    label="B. kill -9 mid-stream  (last fsynced cursor authoritative)";
+    style="rounded,filled"; color="#CBA85E"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    b0 [label="① kill -9 (no drain)", fillcolor="#403a36"];
+    b1 [label="② OS reaps process\nbuffers lost; cursor.bin = last fsync\nspill files on disk\npartial segment write rolled back", fillcolor="#4D3A28"];
+    b2 [label="③ restart:\nspill::clear() wipes xid-*.bin\n(PHASE6disk policy)", fillcolor="#4D3A28"];
+    b3 [label="④ cursor::read\nresume_lsn = emitter_ack_lsn\n(slot-safe)", fillcolor="#4D3A28"];
+    b4 [label="⑤ shadow PG recovers on its own\nwalreceiver retry timer", fillcolor="#3D4128"];
+    b5 [label="⑥ shadow asks START_REPLICATION\nPHYSICAL <its flush_lsn>", fillcolor="#3D4128"];
+    b6 [label="⑦ walshadow honours both:\n• upstream feed at resume_lsn\n• shadow feed at shadow's flush_lsn", fillcolor="#4D3A28"];
+    b7 [label="⑧ overlap records replayed\nCH dedups on _lsn\nshadow apply monotonic", fillcolor="#4D4128"];
+    b8 [label="⑨ steady-state reached", fillcolor="#4D3A28"];
+
+    b0 -> b1 -> b2 -> b3 -> b4 -> b5 -> b6 -> b7 -> b8;
+  }
+
+  // ═════ C. WAL overflow → re-bootstrap ═════
+  subgraph cluster_c {
+    label="C. extended outage  (slot LSN beyond source wal_keep_size)";
+    style="rounded,filled"; color="#BD8183"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    c0 [label="① extended downtime", fillcolor="#403a36"];
+    c1 [label="② restart:\nSourceFeed::START_REPLICATION →\nERROR requested WAL segment removed", fillcolor="#4D3A28"];
+    c2 [label="③ daemon poisons\nlog ReplayTimeout / WAL gap\nexit non-zero", fillcolor="#4D3A28"];
+    c3 [label="④ operator re-invokes\n--bootstrap-mode=direct\n(or object_store)", fillcolor="#403a36"];
+    c4 [label="⑤ greenfield bootstrap path\n(→ timeline_bootstrap)", fillcolor="#4D3A28"];
+    c5 [label="⑥ shadow data dir wiped\nor diverted to fresh dir", fillcolor="#3D4128"];
+    c6 [label="⑦ new cursor.bin written\nat end_lsn", fillcolor="#4D3A28"];
+    c7 [label="⑧ steady-state reached", fillcolor="#4D4128"];
+
+    c0 -> c1 -> c2 -> c3 -> c4 -> c5 -> c6 -> c7;
+  }
+
+  // Force A | B | C side by side via invisible head-to-head ordering
+  a0 -> b0 [style=invis, weight=100];
+  b0 -> c0 [style=invis, weight=100];
+
+  // ═════ cursor.bin reference table ═════
+  cursor_table [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">
+      <TR><TD COLSPAN="4" BGCOLOR="#4D3850"><B>cursor.bin — 5 LSN fields</B></TD></TR>
+      <TR BGCOLOR="#34302c">
+        <TD><B>field</B></TD><TD><B>writer</B></TD><TD><B>role on restart</B></TD><TD><B>role in slot advance</B></TD>
+      </TR>
+      <TR><TD>source_received_lsn</TD><TD>SourceFeed::pump</TD><TD>observational</TD><TD>write LSN</TD></TR>
+      <TR><TD>filter_durable_lsn</TD><TD>DirSegmentSink::on_segment</TD><TD>archive coverage</TD><TD>flush LSN</TD></TR>
+      <TR><TD>shadow_replay_lsn</TD><TD>retention_sweeper</TD><TD>bounds segment trim</TD><TD>caps apply LSN</TD></TR>
+      <TR><TD>drain_lsn</TD><TD>XactBuffer::commit</TD><TD>observational</TD><TD>—</TD></TR>
+      <TR><TD><B>emitter_ack_lsn</B></TD><TD>XactBuffer::commit (post-Ok)</TD><TD><B>resume_lsn source</B></TD><TD><B>caps apply LSN</B></TD></TR>
+    </TABLE>
+  >];
+  a9 -> cursor_table [style=invis];
+  b8 -> cursor_table [style=invis];
+  c7 -> cursor_table [style=invis];
+
+  // ═════ Legend ═════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill</B></TD></TR>
+      <TR><TD BGCOLOR="#403a36" WIDTH="28"></TD><TD>operator / OS event</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>walshadow-stream</TD></TR>
+      <TR><TD BGCOLOR="#4D3340"></TD><TD>walshadow — segment / walsender side</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>ClickHouse (dedup endpoint)</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>scenario cluster border</B></TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━</B></FONT></TD><TD>A. clean restart (SIGTERM)</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>━</B></FONT></TD><TD>B. kill -9 mid-stream</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>━</B></FONT></TD><TD>C. WAL overflow → re-bootstrap</TD></TR>
+    </TABLE>
+  >];
+  cursor_table -> legend [style=invis];
+}

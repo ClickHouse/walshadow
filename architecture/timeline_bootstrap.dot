@@ -1,0 +1,115 @@
+// walshadow — greenfield bootstrap timeline
+// 5 phase clusters top→bottom; node fill colour-codes the actor
+digraph timeline_bootstrap {
+  rankdir=TB;
+  compound=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow greenfield bootstrap — 5 phases", fontsize=14, splines=spline, nodesep=0.35, ranksep=0.5, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ═════ ① catalog seed ═════
+  subgraph cluster_p1 {
+    label="① catalog seed";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    op1  [label="walshadow-stream\n--bootstrap-mode=direct\n--ch-config=…", fillcolor="#403a36"];
+    sql1 [label="sidecar SQL on source\nSELECT oid, relfilenode\nFROM pg_class WHERE oid≥16384", fillcolor="#3D3D54"];
+    map1 [label="CatalogTracker::seed_from_source\nbuilds CatalogMap", fillcolor="#4D3A28"];
+
+    op1 -> map1 [label="spawn"];
+    map1 -> sql1 [label="libpq", color="#CBA85E", dir=both, arrowtail=open];
+  }
+
+  // ═════ ② BASE_BACKUP pump ═════
+  subgraph cluster_p2 {
+    label="② BASE_BACKUP pump — MultiplexSink fan-out";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    bs2   [label="BackupSource\n(Direct | ObjectStore)\nbegin pump", fillcolor="#4D3A28"];
+    src2  [label="BASE_BACKUP open\npg_export_snapshot()\nstart_lsn = X", fillcolor="#3D3D54"];
+    lan2  [label="DiskLanderSink\ncatalog → shadow data dir\nuser-heap filenode Skip", fillcolor="#4D3A28"];
+    walk2 [label="PageWalkSink\ndecode 8 KiB heap pages\n→ BackfillTuple (mpsc)", fillcolor="#4D3A28"];
+    dsk2  [label="shadow data dir\ncatalog files landed", fillcolor="#4D3850", shape=note];
+
+    bs2 -> src2 [label="replication protocol", color="#A1A9CC", dir=both, arrowtail=open];
+    bs2 -> lan2  [label="MultiplexSink"];
+    bs2 -> walk2 [label="MultiplexSink"];
+    lan2 -> dsk2 [label="land file"];
+  }
+  map1 -> bs2 [label="open BASE_BACKUP", lhead=cluster_p2, color="#A1A9CC"];
+
+  // ═════ ③ drain → CH (concurrent with ②) ═════
+  subgraph cluster_p3 {
+    label="③ drain → ClickHouse  (concurrent with ②)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    drain3 [label="drain_backfill task\nsynthesize CommittedTuple\n{op=Insert, _lsn=start_lsn}", fillcolor="#4D3A28"];
+    ch3    [label="Emitter against\nCatalogMapResolver\nINSERT FORMAT Native", fillcolor="#4D4128"];
+
+    drain3 -> ch3 [label="per-relation block", color="#BF8C5F"];
+  }
+  walk2 -> drain3 [label="BackfillTuple\n(unbounded mpsc)", lhead=cluster_p3];
+
+  // ═════ ④ shadow handoff ═════
+  subgraph cluster_p4 {
+    label="④ shadow handoff";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    end4    [label="BASE_BACKUP end\nend_lsn = Y", fillcolor="#3D3D54"];
+    out4    [label="BootstrapOutcome\n{start_lsn, end_lsn}", fillcolor="#4D3A28"];
+    ctrl4   [label="pg_control landed last\n(barrier)", fillcolor="#4D3850", shape=note];
+    conf4   [label="Shadow::enable_standby_recovery\nappend standby.signal +\nrestore_command +\nprimary_conninfo", fillcolor="#4D3A28"];
+    files4  [label="postgresql.conf +\nstandby.signal", fillcolor="#4D3850", shape=note];
+    listen4 [label="walsender listener up\n(barrier before shadow start)", fillcolor="#4D3A28"];
+    start4  [label="Shadow::start (recovery mode)\nblock_in_place pg_ctl", fillcolor="#4D3A28"];
+    shd4    [label="postmaster + walreceiver\nbegin replay", fillcolor="#3D4128"];
+
+    end4 -> out4 [label="end_lsn", dir=back, color="#A1A9CC"];
+    out4 -> ctrl4 [style=invis];
+    out4 -> conf4;
+    conf4 -> files4 [label="write"];
+    conf4 -> listen4;
+    listen4 -> start4 [label="barrier"];
+    start4 -> shd4 [label="pg_ctl start"];
+  }
+  bs2 -> end4 [label="finish", lhead=cluster_p4, color="#A1A9CC"];
+
+  // ═════ ⑤ cursor + WAL pump start ═════
+  subgraph cluster_p5 {
+    label="⑤ cursor + WAL pump start  (→ steady-state)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    cur5   [label="cursor::write\nemitter_ack_lsn = end_lsn", fillcolor="#4D3A28"];
+    curd5  [label="cursor.bin\natomic rename + fsync", fillcolor="#4D3850", shape=note];
+    feed5  [label="SourceFeed open\nSTART_REPLICATION\nPHYSICAL <end_lsn>", fillcolor="#4D3A28"];
+    repl5  [label="streaming protocol\nopens at end_lsn", fillcolor="#3D3D54"];
+    apply5 [label="pg_last_wal_replay_lsn ≥ end_lsn\nready for relation_at gate", fillcolor="#3D4128"];
+    hot5   [label="hot streaming\n→ timeline_streaming", fillcolor="#4D3A28", shape=cds];
+
+    cur5  -> curd5 [label="fsync"];
+    cur5  -> feed5;
+    feed5 -> repl5 [label="START_REPLICATION", color="#A1A9CC", dir=both, arrowtail=open];
+    feed5 -> hot5;
+  }
+  out4 -> cur5  [label="next phase",  lhead=cluster_p5];
+  shd4 -> apply5 [label="replay catches up", style=dashed, color="#869461"];
+
+  // ═════ Legend ═════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — actor</B></TD></TR>
+      <TR><TD BGCOLOR="#403a36" WIDTH="28"></TD><TD>operator / CLI</TD></TR>
+      <TR><TD BGCOLOR="#3D3D54"></TD><TD>source Postgres</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>walshadow-stream</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>ClickHouse</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>physical replication protocol</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq catalog query</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>ClickHouse Native blocks</TD></TR>
+      <TR><TD><FONT COLOR="#869461"><B>┄┄</B></FONT></TD><TD>shadow replay progress</TD></TR>
+    </TABLE>
+  >];
+  hot5 -> legend [style=invis];
+}
