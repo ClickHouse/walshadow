@@ -57,7 +57,13 @@ fn build_heap_insert(rel_node: u32, block_no: u32, xid: u32, main_data: &[u8]) -
         + 1 + 4 + main_data.len(); // XLR_BLOCK_ID_DATA_LONG + u32 len + data
     let total = X_LOG_RECORD_HEADER_SIZE + body_len;
     let mut v = Vec::with_capacity(total);
-    write_header(&mut v, total as u32, 0x00 /* XLOG_HEAP_INSERT */, RmId::Heap as u8, xid);
+    write_header(
+        &mut v,
+        total as u32,
+        0x00, /* XLOG_HEAP_INSERT */
+        RmId::Heap as u8,
+        xid,
+    );
     // block ref
     v.push(0); // block_id = 0
     v.push(0); // fork_flags = 0
@@ -165,7 +171,10 @@ async fn run_case(
     let start = Instant::now();
     for i in 0..iterations {
         let lsn = (i as u64) * SEG_SIZE;
-        stream.push(lsn, seg, record_sink, &mut seg_sink).await.unwrap();
+        stream
+            .push(lsn, seg, record_sink, &mut seg_sink)
+            .await
+            .unwrap();
     }
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64();

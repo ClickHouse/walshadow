@@ -185,7 +185,7 @@ async fn direct_bootstrap_ch_end_to_end() {
         .process_group(0)
         .spawn()
         .expect("spawn walshadow-stream");
-    let mut guard = fx::ChildGuard::new(child);
+    let guard = fx::ChildGuard::new(child);
     // Drop guard for the shadow PG the daemon's autospawn brings up —
     // stops it after the test so leftover postmasters don't linger.
     // SAFETY: only set up paths; we'll attach the Shadow handle after

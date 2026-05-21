@@ -725,9 +725,8 @@ mod tests {
             commit_lsn: u64,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<u64, crate::decoder_sink::DecoderSinkError>,
-                    > + Send
+                dyn std::future::Future<Output = Result<u64, crate::decoder_sink::DecoderSinkError>>
+                    + Send
                     + 'a,
             >,
         > {

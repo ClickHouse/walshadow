@@ -57,15 +57,15 @@ use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, MappingHand
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
+use walshadow::queueing_record_sink::{
+    DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
+};
 use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
 };
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
-use walshadow::queueing_record_sink::{
-    DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
-};
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
@@ -132,6 +132,13 @@ impl RecordSink for DecoderXactPair {
         // Same plumbing as on_idle: decoder has no close work,
         // xact_drain forwards to the emitter for the final flush.
         self.xact_drain.on_close()
+    }
+
+    fn on_idle_advance<'a>(
+        &'a mut self,
+        lsn: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        self.xact_drain.on_idle_advance(lsn)
     }
 }
 
@@ -953,6 +960,7 @@ async fn run(args: Args) -> Result<()> {
             flush_lsn: dispatched,
             apply_lsn: apply_ceiling,
         };
+        let dispatched_before = stream.dispatched_lsn();
         let chunk = tokio::select! {
             biased;
             // Drain signals first so an in-flight ctrl_c doesn't lose to
@@ -961,76 +969,97 @@ async fn run(args: Args) -> Result<()> {
                 sig.context("install ctrl_c handler")?;
                 break "signal";
             }
-            res = feed.next_chunk(status, &mut chunk_buf) => match res? {
+            // Idle tick: with decoder + xact_drain now running behind
+            // QueueingRecordSink, `emitter_ack_lsn` advances in the
+            // worker after the pump has finished pushing. Without a
+            // periodic wakeup, an idle source (kill-restart's
+            // post-catchup quiescence) would freeze metrics + cursor at
+            // whatever values the last chunk landed on.
+            _ = tokio::time::sleep(cursor_write_interval) => None,
+            res = feed.next_chunk(status, &mut chunk_buf) => Some(match res? {
                 Some(c) => c,
                 None => break "CopyDone",
-            },
+            }),
         };
-        let dispatched_before = stream.dispatched_lsn();
-        let server_end = chunk.server_wal_end;
-        stream
-            .push(
-                chunk.start_lsn,
-                chunk.data,
-                &mut record_sink,
-                &mut segment_sink,
-            )
-            .await?;
+        let server_end = chunk.as_ref().map(|c| c.server_wal_end).unwrap_or(received);
+        if let Some(chunk) = chunk {
+            stream
+                .push(
+                    chunk.start_lsn,
+                    chunk.data,
+                    &mut record_sink,
+                    &mut segment_sink,
+                )
+                .await?;
+        }
+        // Flush the pump-side accumulator so partial batches don't strand
+        // commits in `decoder_xact.buf` when source goes idle (the
+        // kill-restart drill's post-catchup quiescence). Per-iteration
+        // flush still amortises the worker's wakeup cost across whatever
+        // records the chunk produced.
+        record_sink
+            .decoder_xact
+            .flush()
+            .await
+            .context("flush queueing decoder sink")?;
         let now_dispatched = stream.dispatched_lsn();
-        if now_dispatched != prev_dispatched {
+        let advanced = now_dispatched != prev_dispatched;
+        // Always refresh metrics + log on advance; on idle ticks just
+        // refresh metrics so emitter_ack_lsn / cursor stay current.
+        let (xact_stats, xact_line) = {
+            let b = xact_buffer.lock().await;
+            let stats = b.stats().clone();
+            let line = stats.summary();
+            (stats, line)
+        };
+        let (oracle_stats, oracle_line) = match &oracle {
+            Some(o) => {
+                let s = o.stats.lock().await.clone();
+                let line = s.summary();
+                (Some(s), line)
+            }
+            None => (None, String::new()),
+        };
+        let decoder_stats = record_sink
+            .decoder_stats
+            .lock()
+            .expect("decoder stats mutex poisoned")
+            .clone();
+        let shadow_apply_lsn = shadow_agg.min_apply_lsn.unwrap_or(0);
+        let lag_bytes = received.saturating_sub(shadow_apply_lsn);
+        rate_estimator.observe(Instant::now(), received);
+        let lag_seconds = rate_estimator.seconds_for(lag_bytes);
+        // Re-read the post-worker xact buffer stats for the metric so
+        // emitter_ack_lsn reflects what the queueing worker has actually
+        // drained, not the snapshot taken at the top of this iteration.
+        let emitter_ack_for_metric = xact_stats.emitter_ack_lsn;
+        let drain_for_metric = xact_stats.drain_lsn;
+        populate_metrics(
+            &metrics,
+            received,
+            now_dispatched,
+            shadow_replay,
+            drain_for_metric,
+            emitter_ack_for_metric,
+            &record_sink.metrics,
+            &xact_stats,
+            &decoder_stats,
+            oracle_stats.as_ref(),
+            start_instant.elapsed().as_secs(),
+            ShadowMetricsView {
+                apply_lag_bytes: lag_bytes,
+                apply_lag_seconds: lag_seconds,
+                active_connections: shadow_agg.active_connections as u64,
+                dropped_total: shadow_agg.dropped_total,
+            },
+        )
+        .await;
+        if advanced {
             let new_segs = (now_dispatched - prev_dispatched) / WAL_SEG_SIZE;
             segments_shipped += new_segs;
             prev_dispatched = now_dispatched;
             let ahead = server_end.saturating_sub(dispatched_before);
-            // One status-tick = one metrics refresh + one stderr line.
-            let xact_summary = {
-                let b = xact_buffer.lock().await;
-                let stats = b.stats().clone();
-                let line = stats.summary();
-                (stats, line)
-            };
-            let (xact_stats, xact_line) = xact_summary;
-            let oracle_pair = match &oracle {
-                Some(o) => {
-                    let s = o.stats.lock().await.clone();
-                    let line = s.summary();
-                    (Some(s), line)
-                }
-                None => (None, String::new()),
-            };
-            let (oracle_stats, oracle_line) = oracle_pair;
             let filter = stream.filter();
-            let decoder_stats = record_sink
-                .decoder_stats
-                .lock()
-                .expect("decoder stats mutex poisoned")
-                .clone();
-            // PHASE14 §6 — `min_apply_lsn=None` (no shadow attached) is
-            // treated as 0 so the gauge surfaces disconnect as max-lag.
-            let shadow_apply_lsn = shadow_agg.min_apply_lsn.unwrap_or(0);
-            let lag_bytes = received.saturating_sub(shadow_apply_lsn);
-            rate_estimator.observe(Instant::now(), received);
-            let lag_seconds = rate_estimator.seconds_for(lag_bytes);
-            populate_metrics(
-                &metrics,
-                received,
-                now_dispatched,
-                shadow_replay,
-                drain_lsn,
-                emitter_ack_lsn,
-                &record_sink.metrics,
-                &xact_stats,
-                &decoder_stats,
-                oracle_stats.as_ref(),
-                start_instant.elapsed().as_secs(),
-                ShadowMetricsView {
-                    apply_lag_bytes: lag_bytes,
-                    apply_lag_seconds: lag_seconds,
-                    active_connections: shadow_agg.active_connections as u64,
-                    dropped_total: shadow_agg.dropped_total,
-                },
-            )
-            .await;
             tracing::info!(
                 target: "walshadow",
                 segments_shipped,
@@ -1352,48 +1381,54 @@ async fn run_bootstrap(
         "catalog map seeded",
     );
 
-    let source: Box<dyn BackupSource> = match args.bootstrap_mode {
-        BootstrapMode::Direct => {
-            let opts = BaseBackupOpts {
-                label: format!(
-                    "walshadow-bootstrap-{}",
-                    chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-                ),
-                fast_checkpoint: args.bootstrap_fast_checkpoint,
-                no_verify_checksums: false,
-                max_rate_kib: None,
-                // Ship pg_wal segments [start_lsn, end_lsn] inside base.tar
-                // so the auto-spawned shadow can hit `minRecoveryPoint` from
-                // local WAL alone. Without this, `pg_ctl -w start` polls
-                // `restore_command` against an `out/` directory that the
-                // streamer hasn't filled yet (queued behind autospawn) and
-                // times out
-                wal: true,
-            };
-            Box::new(DirectSource::new(src_cfg.clone(), opts))
-        }
-        BootstrapMode::ObjectStore => {
-            let settings = wal_rs::config::Settings::from_env()
-                .context("bootstrap: Settings::from_env (WALG_* env vars)")?;
-            let storage = settings
-                .build_storage()
-                .context("bootstrap: build storage from WALG_* env vars")?;
-            // `LATEST` resolves to the newest sentinel; ObjectStoreSource
-            // will canonicalise via `wal_rs::pg::backup::fetch::resolve_name`.
-            let name = args.bootstrap_backup_name.clone();
-            if name != "LATEST" && !name.starts_with(BACKUP_NAME_PREFIX) {
-                anyhow::bail!(
-                    "bootstrap: --bootstrap-backup-name {name:?} must be `LATEST` \
-                     or begin with `{BACKUP_NAME_PREFIX}`"
-                );
+    // Object-store bootstrap retains `(settings, storage)` past source
+    // construction so the post-pump hydrate step can pull WAL segments
+    // covering `[start_lsn, end_lsn]` from `wal_005/` into shadow's
+    // `pg_wal/`. Direct mode ships WAL inside `base.tar` via
+    // `BaseBackupOpts { wal: true }`, so no follow-up fetch needed
+    type ObjectStoreHandles = (wal_rs::config::Settings, wal_rs::storage::DynStorage);
+    let (source, object_store_handles): (Box<dyn BackupSource>, Option<ObjectStoreHandles>) =
+        match args.bootstrap_mode {
+            BootstrapMode::Direct => {
+                let opts = BaseBackupOpts {
+                    label: format!(
+                        "walshadow-bootstrap-{}",
+                        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+                    ),
+                    fast_checkpoint: args.bootstrap_fast_checkpoint,
+                    no_verify_checksums: false,
+                    max_rate_kib: None,
+                    // Ship pg_wal segments [start_lsn, end_lsn] inside base.tar
+                    // so the auto-spawned shadow can hit `minRecoveryPoint` from
+                    // local WAL alone. Without this, `pg_ctl -w start` polls
+                    // `restore_command` against an `out/` directory that the
+                    // streamer hasn't filled yet (queued behind autospawn) and
+                    // times out
+                    wal: true,
+                };
+                (Box::new(DirectSource::new(src_cfg.clone(), opts)), None)
             }
-            Box::new(
-                ObjectStoreSource::new(settings, storage, name)
-                    .with_parallelism(args.bootstrap_object_store_parallelism),
-            )
-        }
-        BootstrapMode::Off => unreachable!("dispatch happened in run()"),
-    };
+            BootstrapMode::ObjectStore => {
+                let settings = wal_rs::config::Settings::from_env()
+                    .context("bootstrap: Settings::from_env (WALG_* env vars)")?;
+                let storage = settings
+                    .build_storage()
+                    .context("bootstrap: build storage from WALG_* env vars")?;
+                // `LATEST` resolves to the newest sentinel; ObjectStoreSource
+                // will canonicalise via `wal_rs::pg::backup::fetch::resolve_name`.
+                let name = args.bootstrap_backup_name.clone();
+                if name != "LATEST" && !name.starts_with(BACKUP_NAME_PREFIX) {
+                    anyhow::bail!(
+                        "bootstrap: --bootstrap-backup-name {name:?} must be `LATEST` \
+                         or begin with `{BACKUP_NAME_PREFIX}`"
+                    );
+                }
+                let src = ObjectStoreSource::new(settings.clone(), storage.clone(), name)
+                    .with_parallelism(args.bootstrap_object_store_parallelism);
+                (Box::new(src), Some((settings, storage)))
+            }
+            BootstrapMode::Off => unreachable!("dispatch happened in run()"),
+        };
 
     let cfg = BootstrapConfig::new(shadow_data_dir.clone());
     // PageWalkSink owns one CatalogMap; the transitional resolver gets
@@ -1485,6 +1520,26 @@ async fn run_bootstrap(
         drained = shipped,
         "bootstrap landed",
     );
+
+    // Object-store mode: hydrate shadow's pg_wal/ with the WAL covering
+    // [start_lsn, end_lsn] before pg_ctl. Direct mode already shipped
+    // these segments inside base.tar via BaseBackupOpts { wal: true };
+    // object-store backups keep WAL in wal_005/ separately, so the
+    // daemon pulls it here. Skipping this hydrate would deadlock
+    // autospawn_shadow_and_wait — restore_command points at an empty
+    // out/ dir and primary_conninfo's walsender hasn't bound yet
+    if let Some((settings, storage)) = object_store_handles {
+        fetch_wal_into_pg_wal(
+            &settings,
+            storage,
+            &shadow_data_dir,
+            outcome.start.start_lsn,
+            outcome.end.end_lsn,
+            outcome.start.timeline,
+        )
+        .await
+        .context("bootstrap: hydrate shadow pg_wal from object store")?;
+    }
 
     // Lay down standby.signal + primary_conninfo + restore_command.
     // primary_conninfo points at the daemon's PHASE13 walsender (bound
@@ -1634,6 +1689,68 @@ fn write_shadow_listener_overrides(
     writeln!(f, "port = {port}")?;
     writeln!(f, "unix_socket_directories = '{}'", socket_dir.display())?;
     writeln!(f, "listen_addresses = ''")?;
+    Ok(())
+}
+
+/// Pull WAL segments covering `[start_lsn, end_lsn]` on `timeline` out
+/// of wal-rs storage and land them in `<shadow_data_dir>/pg_wal/`. The
+/// auto-spawned shadow's standby recovery then hits `minRecoveryPoint`
+/// from local WAL without depending on either `restore_command` (the
+/// streamer's filtered out-dir is empty until the WAL pump starts,
+/// which is after autospawn) or `primary_conninfo` (walsender binds
+/// later in `run`)
+///
+/// Mirrors the direct-bootstrap path where `BaseBackupOpts { wal: true }`
+/// inlines the same segments inside `base.tar`.
+/// `wal_rs::pg::backup::push::handle` sets `wal: false`, so the
+/// object-store backup tar doesn't carry them — they live in
+/// `wal_005/` separately, populated by `wal-push` / archive_command
+///
+/// Missing segments surface as `WAL <name> not found in storage` from
+/// wal-rs's `fetch::handle` — actionable upstream signal that the
+/// operator's archiving pipeline left a gap
+async fn fetch_wal_into_pg_wal(
+    settings: &wal_rs::config::Settings,
+    storage: wal_rs::storage::DynStorage,
+    shadow_data_dir: &Path,
+    start_lsn: u64,
+    end_lsn: u64,
+    timeline: u32,
+) -> Result<()> {
+    use wal_rs::pg::wal::segment::SegmentName;
+
+    let seg_size = WAL_SEG_SIZE;
+    let pg_wal_dir = shadow_data_dir.join("pg_wal");
+    tokio::fs::create_dir_all(&pg_wal_dir)
+        .await
+        .with_context(|| format!("create {}", pg_wal_dir.display()))?;
+    let mut cur = SegmentName {
+        timeline,
+        log_id: (start_lsn >> 32) as u32,
+        seg_no: ((start_lsn & 0xFFFF_FFFF) / seg_size) as u32,
+    };
+    let mut fetched: u32 = 0;
+    loop {
+        let name = cur.format();
+        let dst = pg_wal_dir.join(&name);
+        wal_rs::pg::wal::fetch::handle(settings, storage.clone(), &name, &dst)
+            .await
+            .with_context(|| format!("fetch WAL {name} -> {}", dst.display()))?;
+        fetched += 1;
+        let seg_end = cur.start_lsn(seg_size).saturating_add(seg_size);
+        if end_lsn < seg_end {
+            break;
+        }
+        cur = cur.next(seg_size);
+    }
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        fetched,
+        start_lsn = format!("{:X}/{:X}", start_lsn >> 32, start_lsn as u32),
+        end_lsn = format!("{:X}/{:X}", end_lsn >> 32, end_lsn as u32),
+        timeline,
+        "hydrated shadow pg_wal from object store",
+    );
     Ok(())
 }
 

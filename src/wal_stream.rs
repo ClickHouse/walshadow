@@ -185,6 +185,20 @@ pub trait RecordSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Post-batch nudge from the queueing worker: every record with
+    /// `source_lsn <= lsn` has been dispatched through `on_record`.
+    /// The xact buffer uses it to advance `emitter_ack_lsn` past
+    /// trailing non-commit WAL (checkpoint, RUNNING_XACTS, post-COMMIT
+    /// page-padding) when no xact is in flight. Without it source's
+    /// slot pins WAL at the last COMMIT — the kill-restart drill's
+    /// post-catchup idle never resolves. Default: no-op.
+    fn on_idle_advance<'a>(
+        &'a mut self,
+        _lsn: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Streaming sink for the post-filter WAL byte stream.

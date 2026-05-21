@@ -122,7 +122,9 @@ impl QueueingRecordSink {
                 match tokio::time::timeout(idle_interval, rx.recv()).await {
                     Ok(Some(batch)) => {
                         let n = batch.len() as u64;
+                        let mut max_lsn: u64 = 0;
                         for record in &batch {
+                            max_lsn = max_lsn.max(record.source_lsn);
                             if let Err(e) = inner.on_record(record).await {
                                 *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
                                 in_flight_w.fetch_sub(n, Ordering::Relaxed);
@@ -132,6 +134,20 @@ impl QueueingRecordSink {
                                 }
                                 break 'outer;
                             }
+                        }
+                        // Post-batch nudge: lets the inner sink advance
+                        // its idle ack past trailing non-commit WAL.
+                        // Pump emits records in LSN order, so `max_lsn`
+                        // is a high-water mark for "everything ≤ this
+                        // is dispatched."
+                        if let Err(e) = inner.on_idle_advance(max_lsn).await {
+                            *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
+                            in_flight_w.fetch_sub(n, Ordering::Relaxed);
+                            rx.close();
+                            while let Some(rest) = rx.recv().await {
+                                in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
+                            }
+                            break 'outer;
                         }
                         in_flight_w.fetch_sub(n, Ordering::Relaxed);
                     }
@@ -171,6 +187,17 @@ impl QueueingRecordSink {
             soft_cap: soft_cap.max(1) as u64,
             worker: Some(worker),
         }
+    }
+
+    /// Public flush. Ships whatever the pump has accumulated to the
+    /// worker without waiting for `batch_size`. Pump loop calls this
+    /// after each chunk so a quiescent source can't strand commits in
+    /// the pump-side buffer.
+    pub async fn flush(&mut self) -> Result<(), SinkError> {
+        if let Some(e) = self.take_pending_error() {
+            return Err(e);
+        }
+        self.flush_buf()
     }
 
     /// Ship the pump-side buffer to the worker. Called from

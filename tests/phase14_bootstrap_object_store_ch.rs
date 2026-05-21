@@ -45,6 +45,7 @@ use wal_rs::compression;
 use wal_rs::config::{DeltaSettings, Settings, StorageSettings};
 use wal_rs::pg::backup::list;
 use wal_rs::pg::backup::push::{self, PushArgs};
+use wal_rs::pg::wal;
 use wal_rs::retry::RetryPolicy;
 use wal_rs::storage::DynStorage;
 use wal_rs::storage::fs::FsStorage;
@@ -62,6 +63,34 @@ const METRICS_PORT: u16 = 17335;
 const WALSENDER_PORT: u16 = 17336;
 
 const N_ROWS: i32 = 64;
+
+/// Walk source's `pg_wal/` and push every completed 24-hex-digit WAL
+/// segment into wal-rs storage. Skips `.partial`, `.history`,
+/// `archive_status/`, and any subdirectory entry. Caller forces a
+/// `pg_switch_wal` first so the segment containing the basebackup's
+/// `end_lsn` is on disk in final form. In production this happens
+/// asynchronously via `archive_command` wired to `wal-push`; tests
+/// invoke it inline
+async fn push_completed_wal_segments(
+    source: &Shadow,
+    settings: &wal_rs::config::Settings,
+    storage: DynStorage,
+) -> anyhow::Result<()> {
+    let pg_wal = source.config().data_dir.join("pg_wal");
+    for entry in fs::read_dir(&pg_wal).with_context(|| format!("read_dir {}", pg_wal.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.len() != 24 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let path = entry.path();
+        wal::push::handle(settings, storage.clone(), &path)
+            .await
+            .with_context(|| format!("wal::push::handle {}", path.display()))?;
+    }
+    Ok(())
+}
 
 fn make_source(tmp: &tempfile::TempDir) -> Shadow {
     let mut cfg = ShadowConfig::new(
@@ -98,11 +127,6 @@ fn test_settings(storage_root: PathBuf) -> Settings {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "daemon bug: object_store bootstrap doesn't seed shadow's pg_wal, \
-            autospawn deadlocks waiting for WAL since walsender binds after \
-            wait_for_replay. Fix needs daemon refactor to either fetch WAL \
-            from wal-rs storage into shadow's pg_wal/ before pg_ctl start, \
-            or reorder bind-walsender ahead of autospawn"]
 async fn object_store_bootstrap_ch_end_to_end() {
     if !fx::pg_available() {
         eprintln!("skip: no initdb on PATH");
@@ -148,6 +172,19 @@ async fn object_store_bootstrap_ch_end_to_end() {
     push::handle(&settings, storage.clone(), PushArgs::default())
         .await
         .expect("wal-rs push::handle against source PG");
+
+    // push::handle archives the basebackup files but leaves WAL to
+    // archive_command (`wal: false` in its BaseBackupOpts), so the
+    // segment containing the backup's `end_lsn` sits unrotated in
+    // source's pg_wal/. Force a rotation, then push every completed
+    // segment via wal-rs's wal::push so the daemon's object-store
+    // hydrate path finds WAL covering [start_lsn, end_lsn] in storage.
+    source
+        .psql_one("SELECT pg_switch_wal()")
+        .expect("force WAL rotation post-basebackup");
+    push_completed_wal_segments(&source, &settings, storage.clone())
+        .await
+        .expect("push WAL segments to storage");
 
     let backup_summaries = list::collect(storage.clone())
         .await
@@ -255,7 +292,7 @@ async fn object_store_bootstrap_ch_end_to_end() {
         .process_group(0)
         .spawn()
         .expect("spawn walshadow-stream");
-    let mut guard = fx::ChildGuard::new(child);
+    let guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
         // 8. Wait for the daemon's metrics endpoint — bootstrap done,

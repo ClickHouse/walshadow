@@ -824,6 +824,21 @@ impl XactBuffer {
         Ok(())
     }
 
+    /// Idle-tick ack: advance `emitter_ack_lsn` / `drain_lsn` to `lsn`
+    /// when no xact is in flight. Pump loop drives this after the
+    /// queueing worker drains a batch so source's slot can recycle
+    /// past the trailing post-COMMIT WAL (page padding, RUNNING_XACTS,
+    /// CHECKPOINT) when the workload is quiescent. Without it the
+    /// emitter ack would pin at the last COMMIT and source's WAL
+    /// retention would grow unbounded.
+    pub fn advance_idle(&mut self, lsn: u64) {
+        if self.stats.xacts_active != 0 {
+            return;
+        }
+        self.stats.drain_lsn = self.stats.drain_lsn.max(lsn);
+        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(lsn);
+    }
+
     /// Discard xact `xid`. No-op if unknown. Wipes any spill file.
     /// `abort_lsn` is the LSN of the `XLOG_XACT_ABORT` record itself;
     /// advances `drain_lsn` / `emitter_ack_lsn` so the cursor file
@@ -1166,6 +1181,18 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                 .map_err(|e| SinkError::Other(e.to_string()))
         })
     }
+
+    fn on_idle_advance<'a>(
+        &'a mut self,
+        lsn: u64,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut buf = self.buffer.lock().await;
+            buf.advance_idle(lsn);
+            Ok(())
+        })
+    }
 }
 
 /// `RecordSink` that decodes user-heap records and routes them into
@@ -1209,7 +1236,10 @@ impl BufferingDecoderSink {
     /// Snapshot of the live counters. Cheap clone of the `DecoderStats`
     /// struct (all `u64` fields).
     pub fn stats(&self) -> DecoderStats {
-        self.stats.lock().expect("decoder stats mutex poisoned").clone()
+        self.stats
+            .lock()
+            .expect("decoder stats mutex poisoned")
+            .clone()
     }
 
     /// Shared handle a wrapping `QueueingRecordSink` can hand back to
