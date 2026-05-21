@@ -313,6 +313,33 @@ unsafe extern "C" {
         err: *mut chc_err,
     ) -> c_int;
 
+    pub fn chc_block_builder_append_array_nested_fixed(
+        bb: *mut chc_block_builder,
+        name: *const c_char,
+        name_len: usize,
+        t: *const chc_type,
+        ndim: c_int,
+        level_offsets: *const *const u64,
+        level_offsets_len: *const usize,
+        values: *const c_void,
+        n_rows: usize,
+        err: *mut chc_err,
+    ) -> c_int;
+
+    pub fn chc_block_builder_append_array_nested_string(
+        bb: *mut chc_block_builder,
+        name: *const c_char,
+        name_len: usize,
+        t: *const chc_type,
+        ndim: c_int,
+        level_offsets: *const *const u64,
+        level_offsets_len: *const usize,
+        values_offsets: *const u64,
+        values_data: *const u8,
+        n_rows: usize,
+        err: *mut chc_err,
+    ) -> c_int;
+
     pub fn chc_block_builder_append_json_string(
         bb: *mut chc_block_builder,
         name: *const c_char,

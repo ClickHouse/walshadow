@@ -54,8 +54,6 @@ fn main() {
         "clickhouse-posix-io.h",
         "clickhouse-compression.h",
         "clickhouse-client.h",
-        "clickhouse-lz4.h",
-        "clickhouse-zstd.h",
     ] {
         let p = chc_dir.join(h);
         if p.exists() {

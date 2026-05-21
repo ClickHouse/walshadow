@@ -54,19 +54,51 @@ post-DDL CH shape inside one xact boundary of the source ALTER's
 commit. TOML stops being the mapping source-of-truth for tracked
 namespaces; remains an override + per-column rename channel
 
-## Coordination with PHASE14
+## Coordination with PHASE14 + post-PHASE14 topology shift
 
-PHASE14 lands in parallel and overlaps in one place: PHASE14 item 1
-(read-time defaults) extends `RelAttr` with `missing_value`. PHASE15
-§3's type bridge reads it for `DEFAULT` rendering. Rebase order:
+PHASE14 closed (commit `142681a`). The relevant artefacts §1–§6
+consume:
 
-1. PHASE14 item 1 lands first — its `RelAttr.missing_value` field is
-   a strict prerequisite for §3
-2. PHASE15 §1+ land against the PHASE14-extended `RelAttr` shape
+- **`RelAttr.missing_text: Option<String>`** (not `missing_value` as
+  this plan originally said). PG `attmissingval` is `anyarray`, so
+  shadow fetch casts to `text` & the field carries the typoutput form.
+  `heap_decoder::missing_value_for(att) → ColumnValue` is the
+  text → typed resolver. §3 needs a further `ColumnValue → CH SQL
+  literal` writer (the emitter today encodes via codecs, not SQL; no
+  existing function renders a `ColumnValue` as a `DEFAULT` clause)
+- **`HeapOp::Truncate`** + the pre-decode intercept in
+  [`BufferingDecoderSink::on_record`](../src/decoder_sink.rs) — §6's
+  pg_class heap_delete intercept lives at the same fan-out point
+- **Subxact lineage** ([phase14/05](phase14/05-subxact-rollback.md))
+  — `XactBuffer::commit/abort` k-way merges per-subxid buffers in
+  source_lsn ASC order. §6's `DrainEntry::Catalog` events must thread
+  the same merge so catalog events nested under an aborting sub roll
+  back too. Catalog events buffered under a subxid that aborts must
+  drop; catalog events under a sub that commits drain in WAL position
+  alongside the sub's heap writes
 
-The remaining PHASE14 items (item 2 MULTI_INSERT, item 3 TRUNCATE,
-items 5+ subxact / metrics / integration tests) are orthogonal to
-PHASE15. DROP TABLE moved from PHASE14 into PHASE15 §6 because the
+Post-PHASE14 the pump → emitter chain restructured behind
+[`QueueingRecordSink`](../src/queueing_record_sink.rs) (commits
+`b6cf510` + `a546be5`). Today's topology:
+
+```
+pump task                              worker task
+─────────                              ───────────
+RecordBytesSink (shadow wire bytes)    BufferingDecoderSink → XactBuffer → Emitter
+   ↓                                       ↑
+   └─── mpsc<Vec<Record<'static>>> ───────┘
+```
+
+The pump task only stamps wire bytes through the shadow `RecordBytesSink`;
+decoder, xact buffer, & emitter run in a sibling worker task draining
+the mpsc. PHASE15 §1's event channel + §2's applicator gate must live
+**inside the worker task** — blocking the pump on a CH ALTER ack
+deadlocks the shadow-wire feed that the catalog refetch in §1 depends
+on. `advance_idle(lsn)` (the post-`a546be5` quiescent-stream ack)
+means catalog events on a low-traffic source need an idle path too
+— see §6 below
+
+DROP TABLE moved from PHASE14 into PHASE15 §6 because the
 event-channel + xact-buffer-drain plumbing it needs is the same
 plumbing §1 + §2 + §6 already ship together
 
@@ -143,8 +175,11 @@ Wire-up:
   (e.g. a drop that landed during a reconnect window) emits
   `Dropped` with `qualified_name` resolved off the last-cached
   descriptor
-- Channel is `mpsc::channel(64)` per subscriber; slow applicator
-  only stalls itself, decoder hot path is unaffected
+- Channel is `mpsc::channel(64)` per subscriber. Subscriber runs
+  inside the worker task that owns the `BufferingDecoderSink`; the
+  decoder fan-out is local to that task, so a slow applicator only
+  stalls the worker (back-pressuring the queueing channel), never
+  the pump's wire-bytes path
 - Rename detection is `position-match + name diff` on `RelAttr`:
   the dropped + added attnums correlate when the attnum order is
   preserved and one column's name changed. Heuristic; reverts to
@@ -158,10 +193,14 @@ is. Resolution requires the libpq round-trip through shadow that
 
 ### 2. CH-side DDL applicator
 
-New module `src/ch_ddl.rs`. Subscribes to `ShadowCatalog`'s
-`SchemaEvent` channel, opens its own `clickhouse_c_rs::Client`
+New module `src/ch_ddl.rs`. Owned by the worker task (same task as
+`BufferingDecoderSink` + `XactBuffer` + `Emitter`); a separate
+applicator task is rejected because the post-DDL `await_ready` gate
+would otherwise cross a task boundary the worker already snapshots
+synchronously. Applicator subscribes to `ShadowCatalog`'s
+`SchemaEvent` channel & opens its own `clickhouse_c_rs::Client`
 (separate from the emitter's per-replica connection so DDL doesn't
-ride the INSERT pump's backpressure path), and converts each event
+ride the INSERT pump's backpressure path), converting each event
 into the corresponding CH SQL:
 
 | event | CH SQL | notes |
@@ -188,25 +227,41 @@ encodes against R's new shape lands on CH. Implementation:
 - Emitter's `route_with_retry`
   ([`src/ch_emitter.rs`](../src/ch_emitter.rs)) calls
   `applicator.await_ready(rfn, generation).await` before the first
-  `send_data` of any block under that descriptor generation
+  `send_data` of any block under that descriptor generation. Both
+  emitter & applicator are worker-task-local — the await is a same-task
+  notify wait, not a cross-task channel hop
 - A descriptor that hasn't moved (no `Changed` event since the
   applicator booted) is "ready" trivially — the gate only blocks
   when an unacked DDL is in flight for that exact rfn+generation
 - Worst-case latency = CH ALTER round-trip (~ms on MergeTree). Bumps
   p99 on the post-ALTER xact, not a correctness break
 
+**`TupleObserver` widening for catalog events.** `XactBuffer::commit`
+takes `observer: &mut O: TupleObserver` & calls `observer.on_tuple` per
+`CommittedTuple`, `observer.on_xact_end` per commit
+([`src/xact_buffer.rs:708`](../src/xact_buffer.rs)). Catalog events
+buffered alongside user-data writes (see §6) need a parallel callback;
+extend the trait with `on_schema_event(&SchemaEvent) -> Result<()>`.
+The k-way merge in `commit` iterates `DrainEntry` in `source_lsn`
+order (§6), dispatching `Tuple` → `on_tuple`, `Catalog` →
+`on_schema_event`. Observer impl in `Emitter` calls the
+worker-local applicator from `on_schema_event`, then the gate fires
+for the next `on_tuple` to await
+
 ### 3. Type-system bridge
 
 `TableMapping.ColumnMapping.target_type` is a raw CH type string the
 operator writes
-([`src/ch_emitter.rs:245`](../src/ch_emitter.rs)). For automated DDL
+([`src/ch_emitter.rs:267`](../src/ch_emitter.rs)). For automated DDL
 the daemon needs the inverse: given a `RelAttr` (PG type_oid +
-typmod + nullable + PHASE14 §1's `missing_value`), produce a CH type
-AST + a default expression
+typmod + nullable + PHASE14 §1's `missing_text`), produce a CH type
+string + a default-expression literal
 
-New `src/type_bridge.rs`. Builds on
-[`src/type_map.rs`](../src/type_map.rs) (existing PG → CH type
-classifier from PHASE7) but extends it with the typmod-aware shape:
+New `src/type_bridge.rs`. Greenfield — no existing PG → CH classifier
+to extend (the plan's earlier reference to a `src/type_map.rs` was
+incorrect; today's type knowledge sits ad-hoc inside `ch_emitter.rs`'s
+`TypeAst::parse` & `heap_decoder::missing_value_for`'s match arms).
+The bridge is the canonical mapping table:
 
 | PG type | typmod meaning | CH type |
 |---|---|---|
@@ -226,8 +281,23 @@ classifier from PHASE7) but extends it with the typmod-aware shape:
 Nullable mapping: `RelAttr.not_null = false → Nullable(T)`. Primary
 key + replident-default columns stay non-nullable per CH MergeTree
 ordering-key rules. Default expressions: if PHASE14 §1's
-`missing_value` is `Some`, render as `DEFAULT <literal>`; otherwise
-let CH apply its type-default
+`missing_text` is `Some`, route through
+`heap_decoder::missing_value_for(att) → ColumnValue`, then through a
+new `type_bridge::column_value_to_sql_literal(&ColumnValue, &CHType)
+-> String` writer that renders the literal in CH SQL form (`'…'` for
+strings, numeric forms for ints/decimals, `toDateTime64('…', 6,
+'UTC')` for timestamps, etc.). Emitted as
+`DEFAULT <literal>` in the CH `ADD COLUMN` clause. PG's
+`PgPending` fallback (Tier 3) renders as a `DEFAULT` against the
+text form via CH `parseDateTime…` / `toNumeric…` casts where the
+target type has a string-input form; types lacking one fall through
+to `UnsupportedType` & operator-side TOML override. Otherwise let
+CH apply its type-default
+
+The literal writer is the load-bearing new surface — the existing
+emitter encodes values via the Tier 1/2 codec stack into the CH
+native wire format, never as SQL text — so it lives in
+`type_bridge` alongside the type matrix, not in the emitter
 
 Failure mode: a PG type with no bridge entry surfaces an
 `UnsupportedType { oid, type_name }` error from §1's
@@ -266,7 +336,8 @@ Flow:
 
 Pre-existing rows on CH read NULL for `ship_at` (CH `Nullable`
 default). When the source ALTER carries `DEFAULT k`, PHASE14 §1's
-`missing_value` carries k through `RelAttr`; §3's bridge emits
+`missing_text` carries k's typoutput form through `RelAttr`; §3's
+bridge resolves it via `missing_value_for` + the literal writer & emits
 `DEFAULT k` in the CH `ADD COLUMN` so pre-existing CH rows resolve to
 k matching source's read-time-default behaviour
 
@@ -303,6 +374,31 @@ engine_default = "ReplacingMergeTree(_lsn)"
 `auto_create = true` enables the §2 applicator's `Added` path for
 that namespace. Per-table TOML (`[table."public.foo"]`) still
 overrides — explicit column-list wins over auto-derivation
+
+**Resolver shape for PHASE16 reuse.** Today the emitter's
+`MappingHandle` is `Arc<RwLock<HashMap<String, TableMapping>>>`
+([`src/ch_emitter.rs:971`](../src/ch_emitter.rs)) swapped wholesale on
+SIGHUP. PHASE16 §3 wants `watch::Receiver<Arc<ResolvedConfig>>`
+fed by a precedence merge of CLI > WAL-config > TOML. PHASE15
+lands `auto_create` / `type_overrides` / `order_by_default` /
+`engine_default` consumable through the watch shape from day one:
+
+```rust
+pub struct ResolvedConfig {
+    pub tables:     HashMap<String, TableMapping>,
+    pub namespaces: HashMap<String, NamespaceMapping>, // §5
+    pub global:     GlobalMapping,                     // §6's drop_strategy + future PHASE16 keys
+}
+```
+
+Today's only producer is the TOML loader; PHASE16 plugs the
+WAL-config decoder + CLI override at the same merge point without
+changing emitter/applicator consumers. Emitter
+snapshots `*watch_rx.borrow()` at xact-start (post-PHASE16 §4
+ordering — config flips inside an xact apply to the next xact);
+applicator does the same at `Added`/`Changed` dispatch. SIGHUP
+republishes the merged snapshot; the `RwLock` swap path goes
+away
 
 CREATE-TABLE SQL the applicator renders:
 
@@ -374,7 +470,9 @@ walshadow's xact buffer
 ([`src/xact_buffer.rs`](../src/xact_buffer.rs)) drains writes in
 WAL order; the catalog DELETE arrives at the same xact's commit.
 The emitter must process writes-then-drop within the drain. Lift
-the drain entry from `CommittedTuple` to:
+the per-xid buffer entry (today `SpillEntry` carrying tuple bytes
++ chunk fragments) so it also carries catalog events keyed on
+`source_lsn`:
 
 ```rust
 enum DrainEntry {
@@ -383,10 +481,30 @@ enum DrainEntry {
 }
 ```
 
-`XactBuffer::commit`'s drain loop iterates `DrainEntry` in WAL
-order; per-row writes process through the emitter normally,
-catalog events route through the §2 applicator. Pre-DROP writes
-land on the still-extant CH dest, then the DROP runs
+`XactBuffer::commit`'s k-way merge across per-subxid buffers
+([`src/xact_buffer.rs:776`](../src/xact_buffer.rs)) iterates
+`DrainEntry` in `source_lsn` ASC order; tuples route through
+`observer.on_tuple`, catalog events through
+`observer.on_schema_event` (§2's `TupleObserver` widening). Pre-DROP
+writes land on the still-extant CH dest, then the DROP runs
+
+**Subxact abort interaction.** PHASE14 §5 lets a sub-xact buffer
+its own writes keyed on `subxid`; `XactBuffer::abort` discards the
+sub's buffer entirely. Catalog events stamped under that subxid
+must drop with the heap writes — the `pg_class_decoder` heap_delete
+intercept inserts the `Dropped` event into the **subxid's**
+per-xid buffer, not a global side-channel, so abort cleanup is
+automatic. CREATE-then-rollback-savepoint sequence: an `Added`
+event followed by a sub-rollback discards both, no CH-side effect
+
+**Quiescent-stream path.** `XactBuffer::advance_idle(lsn)`
+(post-`a546be5`) advances `emitter_ack_lsn` when no xact is
+active. Catalog events on truly idle streams (DROP TABLE in a
+single-stmt autocommit on an otherwise-quiet source) still arrive
+through a one-tuple xact's commit path; no separate idle dispatch
+needed. If a future workload demonstrates DROP-only xacts being
+held up by the queueing worker's batch threshold (64 records),
+revisit with a per-event flush hint on the queueing sink
 
 Risks + edge cases:
 
@@ -413,14 +531,11 @@ Risks + edge cases:
 
 ## What stays (anti-goals)
 
-- **TOML stays valid**. Existing `[table."ns.foo"]` configs keep
-  working as overrides. Operators with hand-curated mappings see
-  no regression on upgrade — the namespace block is purely
-  additive
-- **Static-mapping deployment shape**. Daemon doesn't *require*
-  `auto_create`; an operator who wants every DDL to flow through
-  human review keeps `auto_create = false` (the default) and the
-  current "edit TOML + SIGHUP" loop works unchanged
+Pre-1.0: backwards compat with existing TOML / `MappingHandle` /
+emitter signatures isn't a goal. Existing tests rewrite as the
+shape changes; the namespace + resolver edits land as one cut,
+not an additive layer
+
 - **No CH `Replicated` engine assumption**. DDL applicator runs
   one ALTER per replica via the emitter's existing per-replica
   client. CH-cluster fan-out (`ON CLUSTER`) is a config flag, not
@@ -430,9 +545,11 @@ Risks + edge cases:
   in particular touches multiple subsystems (decoder ATTACH/DETACH
   PARTITION handling, applicator routing) and lands as its own
   phase
-- **Decoder catalog API**. `ShadowCatalog::relation_at` signature
-  unchanged. The event channel is additive — consumers that don't
-  care (the decoder's hot path) ignore it
+- **Decoder catalog API** stays at one round-trip per refetch.
+  The event channel is additive on the producer side
+  (`ShadowCatalog::fetch_by_*` emits a `SchemaEvent` after the
+  fetch); the existing `relation_at` consumer path stays
+  unchanged
 - **No retroactive schema migration**. A `Changed` event reshapes
   the CH dest forward only. Old rows in CH already encoded under
   `old`'s shape keep their column values; new rows encode under
@@ -440,10 +557,10 @@ Risks + edge cases:
   cover the read side. Backfilling pre-ALTER rows with the new
   column's value is out of scope (mutation, slow, operator-driven)
 - **TRUNCATE + read-time defaults**. PHASE14's territory. PHASE15
-  consumes PHASE14 item 1's `RelAttr.missing_value` through §3's
-  type bridge but doesn't reshape TRUNCATE plumbing — TRUNCATE
-  rides the `RmId::Heap` op `0x30` path PHASE14 item 3 lights up,
-  not the catalog channel §1 introduces
+  consumes PHASE14 §1's `RelAttr.missing_text` through §3's type
+  bridge but doesn't reshape TRUNCATE plumbing — TRUNCATE rides the
+  `HeapOp::Truncate` path PHASE14 §3 lit up, not the catalog
+  channel §1 introduces
 
 ## Open questions
 
@@ -497,12 +614,18 @@ Risks + edge cases:
   with a different name is indistinguishable from RENAME at the
   catalog level. PG's WAL distinguishes (rename writes one
   pg_attribute heap_update; drop+add writes a heap_delete + a
-  heap_insert), but `ShadowCatalog::fetch_by_oid` sees only the
-  post-state. Acceptable: operators relying on
-  drop-and-re-add-at-same-position to clear column data should
-  prefer the explicit two-step DDL with a SIGHUP between them, or
-  pin the column with `[table.…]` override to disable the
-  heuristic
+  heap_insert) but `ShadowCatalog::fetch_by_oid` sees only the
+  post-state. With PHASE14 §5's subxact lineage now collapsing
+  same-xact drop+add into a single descriptor refetch, the false-
+  positive surface widened. Mitigation: per-table opt-out
+  `[table."ns.foo"] schema_diff = "no_rename"` forces every
+  attnum delta to render as drop+add. Default stays heuristic-on
+  because pure-rename DDL is the common case
+- **Spill format version bump.** `HeapOp::Truncate` (PHASE14 §3)
+  + `DrainEntry::Catalog` (this phase) both add tags without a
+  spill schema rev. Resume contract is "wipe on startup" so it's
+  academic, but bump the format version to v2 with the §6 work
+  for honesty — PHASE14 retro already flagged this as cleanup
 
 ## Acceptance
 
@@ -512,7 +635,7 @@ Risks + edge cases:
   values. No TOML edit, no CH DDL run by the operator
 - **§4 default drill**: `ALTER TABLE x ADD COLUMN c int DEFAULT 7`
   against a non-empty source table. CH `c` reads 7 for every
-  pre-ALTER row (via PHASE14 §1's `missing_value` carried through
+  pre-ALTER row (via PHASE14 §1's `missing_text` carried through
   §3's bridge) **and** the CH column ddl is auto-applied via §2.
   End-to-end this is PLAN §1's gating drill, with PHASE14
   responsible for the read-time-default decode and PHASE15
@@ -555,27 +678,35 @@ Risks + edge cases:
 
 ## Sequencing
 
-§1 (event channel) and §3 (type bridge) are independent and land in
-parallel; §3 depends on PHASE14 item 1's `RelAttr.missing_value`.
-§2 (applicator) depends on §1 + §3. The per-DDL drills land against
-§2:
+PHASE14 has landed (commit `142681a`), so §3 already has its
+prerequisite (`RelAttr.missing_text`). §1 (event channel) & §3
+(type bridge) are independent & land in parallel. §2 (applicator)
+depends on §1 + §3 + the `TupleObserver` widening for catalog
+events. The per-DDL drills land against §2:
 
 1. §4 (ALTER COLUMN) first — smallest test loop, the post-ALTER
-   default drill carries the PLAN §1 v1.0 acceptance weight
+   default drill carries PLAN §1's acceptance weight & exercises
+   the literal-writer end-to-end
 2. §6 (DROP TABLE) second — small mechanical add on top of §1's
-   channel + §2's applicator, closes the PHASE8 followup
-3. §5 (CREATE TABLE + namespace) third — adds the CREATE-TABLE SQL
-   renderer + namespace config surface; benefits from §4 + §6
-   being exercised first because the failure modes overlap
+   channel + §2's applicator + the `DrainEntry::Catalog` lift
+   inside `XactBuffer::commit`'s k-way merge. Closes the PHASE8
+   followup. Spill format bump to v2 lands here
+3. §5 (CREATE TABLE + namespace + resolver shape) third — adds
+   the CREATE-TABLE SQL renderer + lifts `MappingHandle` into
+   `watch::Receiver<Arc<ResolvedConfig>>`. Lifts the namespace
+   config alongside; PHASE16 plugs the WAL-config + CLI sources
+   into the same merge point
 
 Phase closes when the §4 default drill passes end-to-end against a
-daemon configured with one `[namespace.…]` block and no per-table
+daemon configured with one `[namespace.…]` block & no per-table
 overrides — that's the operator-flow demonstration that walshadow
 owns CH-side schema as well as data
 
-Size estimate: ~1050 LOC product (event channel + applicator +
-type bridge + CREATE-TABLE renderer + namespace config +
-DROP-TABLE drain wiring) + ~720 LOC tests. Mostly mechanical
-against landed PHASE5/7/13 + PHASE14 surfaces; the load-bearing
-decision work is the type-bridge matrix + the rename heuristic +
-the `DrainEntry::Catalog` ordering against in-flight writes
+Size estimate: ~1300 LOC product (event channel ~150 + applicator
+~220 + type bridge ~280 incl. literal writer + CREATE-TABLE renderer
+~120 + namespace config + resolver shape ~200 + DROP-TABLE drain
+wiring + spill-bump ~130 + `TupleObserver` widening ~80 + worker-task
+plumbing ~120) + ~720 LOC tests. The literal writer & the resolver
+shape are the new load-bearing surfaces; the rename heuristic +
+`DrainEntry::Catalog` ordering against in-flight writes carry over
+from the original sizing

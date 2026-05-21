@@ -307,6 +307,32 @@ int  chc_block_builder_append_array_string(
         const uint8_t  *values_data,
         size_t          n_rows, chc_err *err);
 
+/* Nested Array(Array(...(<fixed/string>))) variants. `t` is top-level
+ * Array type, `ndim` is nesting depth (must match `t`). level_offsets
+ * is ndim cumulative-end arrays ordered outer-to-inner, level_offsets_len
+ * gives count at each level. n_rows is top-level row count, must equal
+ * level_offsets_len[0] */
+int  chc_block_builder_append_array_nested_fixed(
+        chc_block_builder *bb,
+        const char *name, size_t name_len,
+        const chc_type *t,
+        int                       ndim,
+        const uint64_t * const   *level_offsets,
+        const size_t             *level_offsets_len,
+        const void               *values,
+        size_t                    n_rows, chc_err *err);
+
+int  chc_block_builder_append_array_nested_string(
+        chc_block_builder *bb,
+        const char *name, size_t name_len,
+        const chc_type *t,
+        int                       ndim,
+        const uint64_t * const   *level_offsets,
+        const size_t             *level_offsets_len,
+        const uint64_t           *values_offsets,
+        const uint8_t            *values_data,
+        size_t                    n_rows, chc_err *err);
+
 /* LowCardinality(String) or LowCardinality(Nullable(String)). For the
  * Nullable variant the caller must place a null-sentinel entry at dict
  * index 0 (CH convention) and use key 0 for null rows. */
@@ -2329,14 +2355,16 @@ chc_block_read(chc_io *io, const chc_alloc *al,
 /* -------- block writer ---------- */
 
 typedef enum {
-    CHC__BLD_FIXED         = 1,
-    CHC__BLD_STRING        = 2,
-    CHC__BLD_NULL_FIXED    = 3,
-    CHC__BLD_NULL_STRING   = 4,
-    CHC__BLD_ARRAY_FIXED   = 5,
-    CHC__BLD_ARRAY_STRING  = 6,
-    CHC__BLD_LC_STRING     = 7,
-    CHC__BLD_JSON_STRING   = 8,
+    CHC__BLD_FIXED               = 1,
+    CHC__BLD_STRING              = 2,
+    CHC__BLD_NULL_FIXED          = 3,
+    CHC__BLD_NULL_STRING         = 4,
+    CHC__BLD_ARRAY_FIXED         = 5,
+    CHC__BLD_ARRAY_STRING        = 6,
+    CHC__BLD_LC_STRING           = 7,
+    CHC__BLD_JSON_STRING         = 8,
+    CHC__BLD_ARRAY_NESTED_FIXED  = 9,
+    CHC__BLD_ARRAY_NESTED_STRING = 10,
 } chc__bld_kind;
 
 typedef struct {
@@ -2353,6 +2381,9 @@ typedef struct {
     size_t          str_n;            /* row count of the inner-string body */
     const uint8_t  *null_map;         /* NULL_FIXED / NULL_STRING */
     const uint64_t *arr_offsets;      /* ARRAY_FIXED / ARRAY_STRING (cumulative ends) */
+    int                       arr_ndim;            /* ARRAY_NESTED_* nesting depth, >= 2 */
+    const uint64_t * const   *arr_level_offsets;   /* ARRAY_NESTED_* ndim cumulative-end arrays */
+    const size_t             *arr_level_offsets_len; /* ARRAY_NESTED_* count per level */
     int             lc_key_size;      /* LC_STRING */
     const void     *lc_keys;
 } chc__col_entry;
@@ -2600,6 +2631,108 @@ chc_block_builder_append_array_string(chc_block_builder *bb,
     return CHC_OK;
 }
 
+/* Walk past ndim Array(...) layers, return leaf type or NULL on
+ * shape mismatch */
+static const chc_type *
+chc__bld_array_leaf(const chc_type *t, int ndim)
+{
+    while (ndim-- > 0) {
+        if (!t || t->kind != CHC_ARRAY || t->n_children != 1) return NULL;
+        t = t->children[0];
+    }
+    return t;
+}
+
+int
+chc_block_builder_append_array_nested_fixed(chc_block_builder *bb,
+                                            const char *name, size_t name_len,
+                                            const chc_type *t,
+                                            int ndim,
+                                            const uint64_t * const *level_offsets,
+                                            const size_t *level_offsets_len,
+                                            const void *values,
+                                            size_t n_rows, chc_err *err)
+{
+    if (ndim < 2)
+        return chc__err_set(err, CHC_ERR_USAGE,
+            "append_array_nested_fixed: ndim must be >= 2");
+    const chc_type *leaf = chc__bld_array_leaf(t, ndim);
+    if (!leaf)
+        return chc__err_set(err, CHC_ERR_TYPE,
+            "append_array_nested_fixed: type does not match ndim");
+    size_t es = chc_type_elem_size(leaf);
+    if (!es)
+        return chc__err_set(err, CHC_ERR_TYPE,
+            "append_array_nested_fixed: leaf is not fixed-size");
+    if (n_rows != level_offsets_len[0])
+        return chc__err_set(err, CHC_ERR_USAGE,
+            "append_array_nested_fixed: n_rows != level_offsets_len[0]");
+    int rc = chc__bld_check_rows(bb, n_rows, err);
+    if (rc != CHC_OK) return rc;
+    rc = chc__bld_grow(bb, err);
+    if (rc != CHC_OK) return rc;
+    chc__col_entry *e = &bb->cols[bb->n_cols++];
+    memset(e, 0, sizeof *e);
+    e->name = name; e->name_len = name_len;
+    e->type = t;
+    e->kind = CHC__BLD_ARRAY_NESTED_FIXED;
+    e->n_rows = n_rows;
+    e->arr_ndim = ndim;
+    e->arr_level_offsets = level_offsets;
+    e->arr_level_offsets_len = level_offsets_len;
+    e->fixed_data = values;
+    e->fixed_elem_size = es;
+    /* str_n holds leaf element count: last cumulative end of innermost level */
+    {
+        size_t      ilen = level_offsets_len[ndim - 1];
+        e->str_n = ilen ? (size_t) level_offsets[ndim - 1][ilen - 1] : 0;
+    }
+    return CHC_OK;
+}
+
+int
+chc_block_builder_append_array_nested_string(chc_block_builder *bb,
+                                             const char *name, size_t name_len,
+                                             const chc_type *t,
+                                             int ndim,
+                                             const uint64_t * const *level_offsets,
+                                             const size_t *level_offsets_len,
+                                             const uint64_t *values_offsets,
+                                             const uint8_t *values_data,
+                                             size_t n_rows, chc_err *err)
+{
+    if (ndim < 2)
+        return chc__err_set(err, CHC_ERR_USAGE,
+            "append_array_nested_string: ndim must be >= 2");
+    const chc_type *leaf = chc__bld_array_leaf(t, ndim);
+    if (!leaf || leaf->kind != CHC_STRING)
+        return chc__err_set(err, CHC_ERR_TYPE,
+            "append_array_nested_string: leaf is not String");
+    if (n_rows != level_offsets_len[0])
+        return chc__err_set(err, CHC_ERR_USAGE,
+            "append_array_nested_string: n_rows != level_offsets_len[0]");
+    int rc = chc__bld_check_rows(bb, n_rows, err);
+    if (rc != CHC_OK) return rc;
+    rc = chc__bld_grow(bb, err);
+    if (rc != CHC_OK) return rc;
+    chc__col_entry *e = &bb->cols[bb->n_cols++];
+    memset(e, 0, sizeof *e);
+    e->name = name; e->name_len = name_len;
+    e->type = t;
+    e->kind = CHC__BLD_ARRAY_NESTED_STRING;
+    e->n_rows = n_rows;
+    e->arr_ndim = ndim;
+    e->arr_level_offsets = level_offsets;
+    e->arr_level_offsets_len = level_offsets_len;
+    e->str_offsets = values_offsets;
+    e->str_data = values_data;
+    {
+        size_t      ilen = level_offsets_len[ndim - 1];
+        e->str_n = ilen ? (size_t) level_offsets[ndim - 1][ilen - 1] : 0;
+    }
+    return CHC_OK;
+}
+
 int
 chc_block_builder_append_json_string(chc_block_builder *bb,
                                      const char *name, size_t name_len,
@@ -2820,6 +2953,26 @@ chc__bld_write_body(chc_io *io, const chc__col_entry *e, chc_err *err)
     case CHC__BLD_ARRAY_STRING:
         if ((rc = chc__write_u64_le_array(io, e->arr_offsets, e->n_rows, err)))
             return rc;
+        return chc__write_string_body(io, e->str_offsets, e->str_data,
+                                      e->str_n, err);
+
+    case CHC__BLD_ARRAY_NESTED_FIXED:
+        for (int lvl = 0; lvl < e->arr_ndim; lvl++) {
+            if ((rc = chc__write_u64_le_array(io, e->arr_level_offsets[lvl],
+                                              e->arr_level_offsets_len[lvl], err)))
+                return rc;
+        }
+        if (e->str_n && e->fixed_elem_size)
+            return chc__write_bytes(io, e->fixed_data,
+                                    e->str_n * e->fixed_elem_size, err);
+        return CHC_OK;
+
+    case CHC__BLD_ARRAY_NESTED_STRING:
+        for (int lvl = 0; lvl < e->arr_ndim; lvl++) {
+            if ((rc = chc__write_u64_le_array(io, e->arr_level_offsets[lvl],
+                                              e->arr_level_offsets_len[lvl], err)))
+                return rc;
+        }
         return chc__write_string_body(io, e->str_offsets, e->str_data,
                                       e->str_n, err);
 

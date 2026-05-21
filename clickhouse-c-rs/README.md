@@ -194,8 +194,8 @@ loop {
 
 | Feature | Default | Effect |
 |---|---|---|
-| `lz4`   | on      | include `clickhouse-lz4.h`, link `-llz4`, expose `Codec::lz4()` |
-| `zstd`  | off     | include `clickhouse-zstd.h`, link `-lzstd`, expose `Codec::zstd()` |
+| `lz4`   | on      | compile clickhouse-compression.h's LZ4 wrapper, link `-llz4`, expose `Codec::lz4()` |
+| `zstd`  | off     | compile clickhouse-compression.h's ZSTD wrapper, link `-lzstd`, expose `Codec::zstd()` |
 
 `default-features = false` for an uncompressed-only build with no
 compression libs linked.

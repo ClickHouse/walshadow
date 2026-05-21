@@ -1,11 +1,16 @@
 /*
  * clickhouse-compression.h -- compressed-frame layout, CityHash128, codec
- * vtable. No external dependencies; the actual compressor is plugged in
- * by including clickhouse-lz4.h (or -zstd.h) or by filling chc_codec
- * manually.
+ * vtable, and ready-made LZ4 / ZSTD chc_codec wrappers.
  *
  * Exactly one TU must `#define CHC_IMPLEMENTATION` before including;
  * the implementation uses static helpers from clickhouse.h.
+ *
+ * LZ4 wrapper (chc_lz4_codec_init) is compiled in by default & pulls
+ * <lz4.h>; link -llz4. Define CHC_NO_LZ4 before including to opt out
+ * (drops the include & the wrapper).
+ *
+ * ZSTD wrapper (chc_zstd_codec_init) is compiled in by default & pulls
+ * <zstd.h>; link -lzstd. Define CHC_NO_ZSTD before including to opt out.
  *
  * Frame layout (matches ClickHouse server / clickhouse-cpp
  * base/compressed.cpp):
@@ -81,6 +86,19 @@ struct chc_codec {
  * matching CH server / clickhouse-cpp. */
 void chc_cityhash128(const void *data, size_t len,
                      uint64_t *out_lo, uint64_t *out_hi);
+
+#ifndef CHC_NO_LZ4
+/* Fill lz4_* slots of `out` with wrappers around <lz4.h>. Leaves zstd_*
+ * untouched, so callers wanting both codecs can call both init helpers
+ * on the same struct in either order. Caller links -llz4. */
+void chc_lz4_codec_init(chc_codec *out);
+#endif
+
+#ifndef CHC_NO_ZSTD
+/* Fill zstd_* slots of `out` with wrappers around <zstd.h>. Leaves lz4_*
+ * untouched. Caller links -lzstd. */
+void chc_zstd_codec_init(chc_codec *out);
+#endif
 
 #ifdef CHC_IMPLEMENTATION
 
@@ -513,6 +531,108 @@ chc__decomp_src_free(chc__decomp_src *s)
     s->frame_buf = s->comp_buf = NULL;
     s->frame_cap = s->comp_cap = 0;
 }
+
+/* ============================================================
+ * LZ4 adapter (opt out with CHC_NO_LZ4 before including).
+ * ============================================================ */
+
+#ifndef CHC_NO_LZ4
+
+#include <lz4.h>
+
+static int
+chc__lz4_compress(void *ud, const void *src, size_t src_len,
+                  void *dst, size_t dst_cap, size_t *dst_n, chc_err *err)
+{
+    (void) ud;
+    if (src_len > (size_t) LZ4_MAX_INPUT_SIZE)
+        return chc__err_set(err, CHC_ERR_USAGE,
+                            "LZ4 input too big: %zu", src_len);
+    int n = LZ4_compress_default((const char *) src, (char *) dst,
+                                 (int) src_len, (int) dst_cap);
+    if (n <= 0)
+        return chc__err_set(err, CHC_ERR_OOM,
+                            "LZ4_compress_default failed (rc=%d)", n);
+    *dst_n = (size_t) n;
+    return CHC_OK;
+}
+
+static int
+chc__lz4_decompress(void *ud, const void *src, size_t src_len,
+                    void *dst, size_t original, chc_err *err)
+{
+    (void) ud;
+    int n = LZ4_decompress_safe((const char *) src, (char *) dst,
+                                (int) src_len, (int) original);
+    if (n < 0 || (size_t) n != original)
+        return chc__err_set(err, CHC_ERR_PROTOCOL,
+                            "LZ4_decompress_safe rc=%d, expected %zu",
+                            n, original);
+    return CHC_OK;
+}
+
+static size_t chc__lz4_bound(size_t n) { return (size_t) LZ4_compressBound((int) n); }
+
+void
+chc_lz4_codec_init(chc_codec *out)
+{
+    out->ud             = NULL;
+    out->lz4_compress   = chc__lz4_compress;
+    out->lz4_decompress = chc__lz4_decompress;
+    out->lz4_bound      = chc__lz4_bound;
+}
+
+#endif /* !CHC_NO_LZ4 */
+
+/* ============================================================
+ * ZSTD adapter (opt out with CHC_NO_ZSTD before including).
+ * ============================================================ */
+
+#ifndef CHC_NO_ZSTD
+
+#include <zstd.h>
+
+static int
+chc__zstd_compress(void *ud, const void *src, size_t src_len,
+                   void *dst, size_t dst_cap, size_t *dst_n, chc_err *err)
+{
+    (void) ud;
+    size_t n = ZSTD_compress(dst, dst_cap, src, src_len, ZSTD_CLEVEL_DEFAULT);
+    if (ZSTD_isError(n))
+        return chc__err_set(err, CHC_ERR_OOM,
+                            "ZSTD_compress failed: %s", ZSTD_getErrorName(n));
+    *dst_n = n;
+    return CHC_OK;
+}
+
+static int
+chc__zstd_decompress(void *ud, const void *src, size_t src_len,
+                     void *dst, size_t original, chc_err *err)
+{
+    (void) ud;
+    size_t n = ZSTD_decompress(dst, original, src, src_len);
+    if (ZSTD_isError(n))
+        return chc__err_set(err, CHC_ERR_PROTOCOL,
+                            "ZSTD_decompress failed: %s", ZSTD_getErrorName(n));
+    if (n != original)
+        return chc__err_set(err, CHC_ERR_PROTOCOL,
+                            "ZSTD_decompress produced %zu bytes, expected %zu",
+                            n, original);
+    return CHC_OK;
+}
+
+static size_t chc__zstd_bound(size_t n) { return ZSTD_compressBound(n); }
+
+void
+chc_zstd_codec_init(chc_codec *out)
+{
+    out->ud              = NULL;
+    out->zstd_compress   = chc__zstd_compress;
+    out->zstd_decompress = chc__zstd_decompress;
+    out->zstd_bound      = chc__zstd_bound;
+}
+
+#endif /* !CHC_NO_ZSTD */
 
 #endif /* CHC_IMPLEMENTATION */
 
