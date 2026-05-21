@@ -318,6 +318,7 @@ fn encode_heap_into(out: &mut Vec<u8>, h: &DecodedHeap) {
         HeapOp::Update => 1,
         HeapOp::HotUpdate => 2,
         HeapOp::Delete => 3,
+        HeapOp::Truncate => 4,
     };
     push_u8(out, op_byte);
     encode_opt_tuple(out, h.new.as_ref());
@@ -547,6 +548,7 @@ fn decode_heap(c: &mut Cursor) -> Result<DecodedHeap> {
         1 => HeapOp::Update,
         2 => HeapOp::HotUpdate,
         3 => HeapOp::Delete,
+        4 => HeapOp::Truncate,
         other => {
             return Err(SpillError::Format {
                 offset: c.pos,
@@ -950,14 +952,21 @@ mod tests {
             HeapOp::Update,
             HeapOp::HotUpdate,
             HeapOp::Delete,
+            HeapOp::Truncate,
         ] {
             let mut h = sample_heap(11, 0x600);
             h.op = op;
-            // For Update/HotUpdate/Delete an `old` tuple is expected; carry one.
-            h.old = Some(DecodedTuple {
-                columns: vec![Some(ColumnValue::Int4(42))],
-                partial: false,
-            });
+            if matches!(op, HeapOp::Truncate) {
+                // Truncate carries no tuple payload.
+                h.new = None;
+                h.old = None;
+            } else {
+                // For Update/HotUpdate/Delete an `old` tuple is expected.
+                h.old = Some(DecodedTuple {
+                    columns: vec![Some(ColumnValue::Int4(42))],
+                    partial: false,
+                });
+            }
             w.write(&SpillEntry::Heap(Box::new(h))).await.unwrap();
         }
         let mut r = w.finish().await.unwrap();
@@ -974,7 +983,8 @@ mod tests {
                 HeapOp::Insert,
                 HeapOp::Update,
                 HeapOp::HotUpdate,
-                HeapOp::Delete
+                HeapOp::Delete,
+                HeapOp::Truncate,
             ],
         );
         r.unlink().await.unwrap();

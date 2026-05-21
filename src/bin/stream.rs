@@ -56,7 +56,7 @@ use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, MappingHandle};
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
-use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
+use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
 use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
@@ -757,6 +757,9 @@ async fn run(args: Args) -> Result<()> {
     let start_instant = Instant::now();
     let mut segments_shipped = 0u64;
     let mut prev_dispatched = stream.dispatched_lsn();
+    // PHASE14 §6 — rolling 30 s WAL byte-rate estimate. Status loop
+    // pushes a `(now, source_received_lsn)` sample per tick.
+    let mut rate_estimator = RateEstimator::default();
     // Phase 11. Cursor write cadence matches the source standby-status
     // cadence so the file's `emitter_ack_lsn` is ≥ the value we advertise
     // to source as `apply_lsn` on every send. Without this ordering the
@@ -862,6 +865,12 @@ async fn run(args: Args) -> Result<()> {
             let (oracle_stats, oracle_line) = oracle_pair;
             let filter = stream.filter();
             let decoder_stats = record_sink.decoder.stats().clone();
+            // PHASE14 §6 — `min_apply_lsn=None` (no shadow attached) is
+            // treated as 0 so the gauge surfaces disconnect as max-lag.
+            let shadow_apply_lsn = shadow_agg.min_apply_lsn.unwrap_or(0);
+            let lag_bytes = received.saturating_sub(shadow_apply_lsn);
+            rate_estimator.observe(Instant::now(), received);
+            let lag_seconds = rate_estimator.seconds_for(lag_bytes);
             populate_metrics(
                 &metrics,
                 received,
@@ -874,12 +883,19 @@ async fn run(args: Args) -> Result<()> {
                 &decoder_stats,
                 oracle_stats.as_ref(),
                 start_instant.elapsed().as_secs(),
+                ShadowMetricsView {
+                    apply_lag_bytes: lag_bytes,
+                    apply_lag_seconds: lag_seconds,
+                    active_connections: shadow_agg.active_connections as u64,
+                    dropped_total: shadow_agg.dropped_total,
+                },
             )
             .await;
             tracing::info!(
                 target: "walshadow",
                 segments_shipped,
                 last_lsn = format!("{:X}/{:X}", now_dispatched >> 32, now_dispatched as u32),
+                shadow_apply = format!("{:X}/{:X}", shadow_apply_lsn >> 32, shadow_apply_lsn as u32),
                 source_ahead_bytes = ahead,
                 metrics = %record_sink.metrics.summary(),
                 kept = filter.stats.kept,
@@ -1060,6 +1076,16 @@ async fn query_replay_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>
     }
 }
 
+/// PHASE14 §6 shadow-stream view passed into the metrics publish step.
+/// Bundles the four shadow-side numbers that come from
+/// [`ShadowStreamState::aggregate`] + the daemon's [`RateEstimator`].
+struct ShadowMetricsView {
+    apply_lag_bytes: u64,
+    apply_lag_seconds: f64,
+    active_connections: u64,
+    dropped_total: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn populate_metrics(
     registry: &MetricsRegistry,
@@ -1073,6 +1099,7 @@ async fn populate_metrics(
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
     uptime_secs: u64,
+    shadow_view: ShadowMetricsView,
 ) {
     use std::collections::BTreeMap;
     use walshadow::classify::rmgr_label;
@@ -1113,6 +1140,10 @@ async fn populate_metrics(
         oracle_validate_mismatches_total: oracle_stats.map(|s| s.mismatches).unwrap_or(0),
         oracle_errors_total: oracle_stats.map(|s| s.errors).unwrap_or(0),
         uptime_secs,
+        shadow_apply_lag_bytes: shadow_view.apply_lag_bytes,
+        shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
+        shadow_stream_active_connections: shadow_view.active_connections,
+        shadow_stream_dropped_connections_total: shadow_view.dropped_total,
     };
     registry.set(snap).await;
 }
@@ -1309,6 +1340,18 @@ async fn run_bootstrap(
     write_standby_config(&shadow_data_dir, &args.out_dir, args.walsender_bind)
         .context("bootstrap: write standby.signal + primary_conninfo + restore_command")?;
 
+    // Shadow PG refuses to start on a data dir whose mode isn't 0700 or
+    // 0750. BASE_BACKUP extraction creates the directory at the process
+    // umask (typically 0755) since tar headers carry no entry for the
+    // root, so reassert restrictive perms before pg_ctl runs against it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o700);
+        fs::set_permissions(&shadow_data_dir, perms)
+            .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
+    }
+
     Ok(outcome.end.end_lsn)
 }
 
@@ -1326,6 +1369,14 @@ async fn autospawn_shadow_and_wait(
     shadow_data_dir: PathBuf,
     end_lsn: u64,
 ) -> Result<()> {
+    // BASE_BACKUP ships source's postgresql.conf verbatim, so shadow
+    // would inherit source's port + listen_addresses + socket dir and
+    // collide with the still-running source. Write last-wins overrides
+    // into postgresql.auto.conf so the cloned cluster comes up on the
+    // operator's `--shadow-*` values.
+    write_shadow_listener_overrides(&shadow_data_dir, args.shadow_port, &args.shadow_socket_dir)
+        .context("bootstrap: write shadow listener overrides")?;
+
     let mut cfg = ShadowConfig::new(shadow_data_dir.clone(), args.out_dir.clone());
     cfg.port = args.shadow_port;
     cfg.socket_dir = args.shadow_socket_dir.clone();
@@ -1394,6 +1445,41 @@ fn write_standby_config(
         "restore_command = 'cp {}/%f %p'",
         filter_out_dir.display()
     )?;
+    Ok(())
+}
+
+/// Append shadow-side `port` / `unix_socket_directories` /
+/// `listen_addresses` keys to the cloned data dir's
+/// `postgresql.auto.conf`. PG honours last-wins-per-key across the conf
+/// chain, so these override whatever source's conf carried into the
+/// BASE_BACKUP. Idempotent via a `walshadow shadow-listener overrides`
+/// marker — subsequent daemon restarts skip the append.
+///
+/// `listen_addresses = ''` disables TCP entirely: shadow is local-only
+/// over the socket dir the daemon connects to, never visible on a
+/// network. Operators wanting a TCP shadow override this via their own
+/// `ALTER SYSTEM SET listen_addresses = ...` after first boot.
+fn write_shadow_listener_overrides(
+    shadow_data_dir: &Path,
+    port: u16,
+    socket_dir: &Path,
+) -> Result<()> {
+    let conf = shadow_data_dir.join("postgresql.auto.conf");
+    let marker = "# walshadow shadow-listener overrides";
+    if conf.exists() {
+        let existing = fs::read_to_string(&conf).unwrap_or_default();
+        if existing.contains(marker) {
+            return Ok(());
+        }
+    }
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&conf)?;
+    writeln!(f, "\n{marker}")?;
+    writeln!(f, "port = {port}")?;
+    writeln!(f, "unix_socket_directories = '{}'", socket_dir.display())?;
+    writeln!(f, "listen_addresses = ''")?;
     Ok(())
 }
 

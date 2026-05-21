@@ -64,6 +64,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -94,6 +95,279 @@ const XLOG_XACT_COMMIT: u8 = 0x00;
 const XLOG_XACT_ABORT: u8 = 0x20;
 const XLOG_XACT_COMMIT_PREPARED: u8 = 0x30;
 const XLOG_XACT_ABORT_PREPARED: u8 = 0x40;
+const XLOG_XACT_ASSIGNMENT: u8 = 0x50;
+/// `xinfo` field follows the leading `xact_time` when this bit is set
+/// in the record header's `info`. `access/xact.h` L182.
+const XLOG_XACT_HAS_INFO: u8 = 0x80;
+
+/// `xinfo` bits driving xl_xact_commit / xl_xact_abort tail layout.
+/// `access/xact.h` L188-196. PHASE14 item 5 only consumes
+/// `HAS_SUBXACTS`; remaining flags drive skip-walk.
+const XACT_XINFO_HAS_DBINFO: u32 = 1 << 0;
+const XACT_XINFO_HAS_SUBXACTS: u32 = 1 << 1;
+const XACT_XINFO_HAS_RELFILELOCATORS: u32 = 1 << 2;
+const XACT_XINFO_HAS_INVALS: u32 = 1 << 3;
+const XACT_XINFO_HAS_TWOPHASE: u32 = 1 << 4;
+const XACT_XINFO_HAS_ORIGIN: u32 = 1 << 5;
+const XACT_XINFO_HAS_GID: u32 = 1 << 7;
+const XACT_XINFO_HAS_DROPPED_STATS: u32 = 1 << 8;
+
+/// Maps PG subxact xids to their top-level xid. Built from
+/// `XLOG_XACT_ASSIGNMENT` (info `0x50`) records arriving on the xact
+/// resource manager. PHASE14 item 5 keeps both directions so
+/// `forget_tree` runs O(k) over actual children rather than scanning
+/// every entry in `parent`.
+///
+/// Tracker is a hint, not a correctness gate: PG batches the first 64
+/// subxacts under `PGPROC_MAX_CACHED_SUBXIDS` and emits no assignment
+/// for that window. The authoritative list arrives inline with
+/// commit / abort records; tracker drives early eviction policy only.
+#[derive(Debug, Default)]
+pub struct SubxactTracker {
+    parent: HashMap<u32, u32>,
+    children: HashMap<u32, Vec<u32>>,
+}
+
+impl SubxactTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that every `subxid` belongs to `top_xid`. Repeated
+    /// assignments for the same subxid keep the most recent top.
+    pub fn assign(&mut self, top_xid: u32, subxids: &[u32]) {
+        if subxids.is_empty() {
+            return;
+        }
+        // Two-phase to avoid holding a `&mut Vec` from `children[top]`
+        // while also walking `children[prev_top]` on retargets.
+        for &s in subxids {
+            if let Some(prev_top) = self.parent.insert(s, top_xid)
+                && prev_top != top_xid
+                && let Some(prev_bucket) = self.children.get_mut(&prev_top)
+            {
+                prev_bucket.retain(|&x| x != s);
+            }
+        }
+        let bucket = self.children.entry(top_xid).or_default();
+        for &s in subxids {
+            if !bucket.contains(&s) {
+                bucket.push(s);
+            }
+        }
+    }
+
+    /// Resolve `xid` to its top. Unmapped xids return themselves —
+    /// matches PG's "subxact's top is itself when no ASSIGNMENT
+    /// landed yet" semantics so callers can treat top + sub uniformly.
+    pub fn top_for(&self, xid: u32) -> u32 {
+        self.parent.get(&xid).copied().unwrap_or(xid)
+    }
+
+    /// Drop every mapping rooted at `top_xid`. Called once the top
+    /// commits or aborts and the tracker's hint is no longer useful.
+    pub fn forget_tree(&mut self, top_xid: u32) {
+        if let Some(subs) = self.children.remove(&top_xid) {
+            for s in subs {
+                self.parent.remove(&s);
+            }
+        }
+        // top_xid might itself be a subxact in another tree (shouldn't
+        // happen on the commit / abort path but cheap to scrub).
+        self.parent.remove(&top_xid);
+    }
+
+    /// Return the recorded subxids for `top_xid`. Caller's slice for
+    /// drain ordering; tracker keeps its own buckets intact.
+    pub fn subxids_of(&self, top_xid: u32) -> Vec<u32> {
+        self.children.get(&top_xid).cloned().unwrap_or_default()
+    }
+}
+
+/// Parsed body of `xl_xact_commit` / `xl_xact_abort`. Today's consumer
+/// only needs the timestamp + subxact list; remaining xinfo tails are
+/// skip-walked through but unread.
+#[derive(Debug, Default)]
+struct XactCommitPayload {
+    xact_time: i64,
+    subxacts: Vec<u32>,
+}
+
+/// `xl_xact_assignment` payload (`access/xact.h` L218-225). Returns
+/// `(xtop, subxids)` from `main_data`. `xtop` is canonical — the
+/// record header's `xact_id` is the same value in steady state, but
+/// the payload is the documented source of truth.
+fn parse_xact_assignment(main_data: &[u8]) -> Option<(u32, Vec<u32>)> {
+    if main_data.len() < 8 {
+        return None;
+    }
+    let xtop = u32::from_le_bytes(main_data[0..4].try_into().unwrap());
+    let nsub = i32::from_le_bytes(main_data[4..8].try_into().unwrap());
+    if nsub < 0 {
+        return None;
+    }
+    let nsub = nsub as usize;
+    let need = 8 + nsub * 4;
+    if main_data.len() < need {
+        return None;
+    }
+    let mut subs = Vec::with_capacity(nsub);
+    for i in 0..nsub {
+        let off = 8 + i * 4;
+        subs.push(u32::from_le_bytes(
+            main_data[off..off + 4].try_into().unwrap(),
+        ));
+    }
+    Some((xtop, subs))
+}
+
+/// Walk `xl_xact_commit` / `xl_xact_abort` main_data following the
+/// `xinfo` tail order from `xactdesc.c::ParseCommitRecord` /
+/// `ParseAbortRecord`. Returns `XactCommitPayload::default()` on any
+/// short read so the decoder degrades to "commit_ts unknown, no
+/// subxact list" rather than poisoning the stream.
+///
+/// `info` is the record header's `info` byte. `XLOG_XACT_HAS_INFO`
+/// (`0x80`) gates the `xinfo` u32 immediately after `xact_time`. The
+/// commit-prepared / abort-prepared codepaths set the same flag.
+fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayload {
+    let mut out = XactCommitPayload::default();
+    if main_data.len() < 8 {
+        return out;
+    }
+    out.xact_time = i64::from_le_bytes(main_data[0..8].try_into().unwrap());
+    let mut p = 8usize;
+    let xinfo: u32 = if info & XLOG_XACT_HAS_INFO != 0 {
+        if main_data.len() < p + 4 {
+            return out;
+        }
+        let v = u32::from_le_bytes(main_data[p..p + 4].try_into().unwrap());
+        p += 4;
+        v
+    } else {
+        0
+    };
+    if xinfo & XACT_XINFO_HAS_DBINFO != 0 {
+        // dbId + tsId, 2x Oid (4 bytes each).
+        if main_data.len() < p + 8 {
+            return out;
+        }
+        p += 8;
+    }
+    if xinfo & XACT_XINFO_HAS_SUBXACTS != 0 {
+        if main_data.len() < p + 4 {
+            return out;
+        }
+        let n = i32::from_le_bytes(main_data[p..p + 4].try_into().unwrap());
+        p += 4;
+        if n < 0 {
+            return out;
+        }
+        let n = n as usize;
+        if main_data.len() < p + n * 4 {
+            return out;
+        }
+        let mut subs = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = p + i * 4;
+            subs.push(u32::from_le_bytes(
+                main_data[off..off + 4].try_into().unwrap(),
+            ));
+        }
+        p += n * 4;
+        out.subxacts = subs;
+    }
+    // Remaining tails are skip-walked. None of them feed the buffer
+    // today; the loop exists so the caller's `p` would stay sane if a
+    // future change reads beyond subxacts.
+    if xinfo & XACT_XINFO_HAS_RELFILELOCATORS != 0 {
+        // int32 nrels + RelFileLocator (spc Oid, db Oid, rel Oid) =
+        // 4 bytes + 12 per entry.
+        if main_data.len() < p + 4 {
+            return out;
+        }
+        let n = i32::from_le_bytes(main_data[p..p + 4].try_into().unwrap());
+        p += 4;
+        if n < 0 {
+            return out;
+        }
+        let skip = (n as usize).saturating_mul(12);
+        if main_data.len() < p + skip {
+            return out;
+        }
+        p += skip;
+    }
+    if xinfo & XACT_XINFO_HAS_DROPPED_STATS != 0 {
+        // int32 nitems + xl_xact_stats_item (int kind + Oid dboid +
+        // 2x uint32 objid) = 4 + 16 per entry.
+        if main_data.len() < p + 4 {
+            return out;
+        }
+        let n = i32::from_le_bytes(main_data[p..p + 4].try_into().unwrap());
+        p += 4;
+        if n < 0 {
+            return out;
+        }
+        let skip = (n as usize).saturating_mul(16);
+        if main_data.len() < p + skip {
+            return out;
+        }
+        p += skip;
+    }
+    if xinfo & XACT_XINFO_HAS_INVALS != 0 {
+        // commit-only tail; abort never sets this bit per xactdesc.c.
+        // int32 nmsgs + SharedInvalidationMessage (16 bytes each).
+        if main_data.len() < p + 4 {
+            return out;
+        }
+        let n = i32::from_le_bytes(main_data[p..p + 4].try_into().unwrap());
+        p += 4;
+        if n < 0 {
+            return out;
+        }
+        let skip = (n as usize).saturating_mul(16);
+        if main_data.len() < p + skip {
+            return out;
+        }
+        p += skip;
+    }
+    if xinfo & XACT_XINFO_HAS_TWOPHASE != 0 {
+        // xl_xact_twophase: TransactionId (4 bytes).
+        if main_data.len() < p + 4 {
+            return out;
+        }
+        p += 4;
+        if xinfo & XACT_XINFO_HAS_GID != 0 {
+            // null-terminated GID; walk to the terminator.
+            let rest = &main_data[p..];
+            let nul = rest.iter().position(|&b| b == 0);
+            match nul {
+                Some(n) => p += n + 1,
+                None => return out,
+            }
+        }
+    }
+    if xinfo & XACT_XINFO_HAS_ORIGIN != 0 {
+        // xl_xact_origin: XLogRecPtr (8) + TimestampTz (8). Unaligned
+        // per the comment in xactdesc.c.
+        if main_data.len() < p + 16 {
+            return out;
+        }
+        // not read, just consume.
+        let _ = p;
+    }
+    out
+}
+
+/// Pull the `source_lsn` off a `SpillEntry`. Heaps and chunks both
+/// stamp the WAL LSN at decode time; the buffer's merge-drain across
+/// `top + subxids` orders entries by this field.
+fn entry_lsn(e: &SpillEntry) -> u64 {
+    match e {
+        SpillEntry::Heap(h) => h.source_lsn,
+        SpillEntry::Chunk(c) => c.source_lsn,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct XactBufferConfig {
@@ -431,13 +705,28 @@ impl XactBuffer {
     /// monotonic high-water mark.
     pub async fn commit<O: TupleObserver>(
         &mut self,
-        xid: u32,
+        top_xid: u32,
         commit_ts: i64,
         commit_lsn: u64,
+        subxids: &[u32],
         catalog: &Arc<Mutex<ShadowCatalog>>,
         observer: &mut O,
     ) -> std::result::Result<(), XactBufferError> {
-        let Some(mut st) = self.inflight.remove(&xid) else {
+        // Pull every xid in the commit tree out of `inflight`. Subxids
+        // we never buffered (catalog-only writes, filter-dropped) skip
+        // silently — only the top counts for `commits_unknown_xid` so
+        // the metric stays a per-xact rate, not per-subxid.
+        let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
+        xids.push(top_xid);
+        xids.extend_from_slice(subxids);
+        let mut states: Vec<XactState> = Vec::with_capacity(xids.len());
+        for x in &xids {
+            if let Some(st) = self.inflight.remove(x) {
+                states.push(st);
+            }
+        }
+
+        if states.is_empty() {
             self.stats.commits_unknown_xid += 1;
             // Read-only / filter-dropped xacts still advance the
             // emitter-ack ceiling — source's slot can recycle WAL up to
@@ -445,29 +734,53 @@ impl XactBuffer {
             self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
             self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(commit_lsn);
             return Ok(());
-        };
-        self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
-        self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
+        }
+        // Active counter ticks down once per drained xact (top + subs).
+        for st in &states {
+            self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
+            self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
+        }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
 
-        // Collect heaps + chunks. Spilled half drained first to keep
-        // WAL-order intact (eviction always flushes from the front of
-        // in_mem, so spilled is older than anything still in memory).
-        let mut heaps: Vec<DecodedHeap> = Vec::with_capacity(st.in_mem.len());
-        let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
-
-        let in_mem = std::mem::take(&mut st.in_mem);
-        if let Some(writer) = st.spill.take() {
-            let bc = writer.byte_count();
-            self.stats.spill_bytes_active = self.stats.spill_bytes_active.saturating_sub(bc);
-            self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
-            let mut reader = writer.finish().await?;
-            while let Some(entry) = reader.next().await? {
-                accumulate(entry, &mut heaps, &mut chunks);
+        // Drain spill files first (older in WAL order) per xid, then
+        // tack on in-mem entries. Result: one `VecDeque<SpillEntry>` per
+        // xid already sorted by `source_lsn` ASC.
+        let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
+        for mut st in states.drain(..) {
+            let in_mem = std::mem::take(&mut st.in_mem);
+            let mut entries: VecDeque<SpillEntry> = VecDeque::with_capacity(in_mem.len());
+            if let Some(writer) = st.spill.take() {
+                let bc = writer.byte_count();
+                self.stats.spill_bytes_active = self.stats.spill_bytes_active.saturating_sub(bc);
+                self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
+                let mut reader = writer.finish().await?;
+                while let Some(entry) = reader.next().await? {
+                    entries.push_back(entry);
+                }
+                reader.unlink().await?;
             }
-            reader.unlink().await?;
+            entries.extend(in_mem);
+            per_xid.push(entries);
         }
-        for entry in in_mem {
+
+        // k-way merge over per_xid heads by `source_lsn` ASC. k = 1 +
+        // nsubxacts, typically <= 4; linear-scan head pick beats a
+        // tournament heap at this size.
+        let mut heaps: Vec<DecodedHeap> = Vec::new();
+        let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
+        loop {
+            let mut pick: Option<(usize, u64)> = None;
+            for (i, q) in per_xid.iter().enumerate() {
+                let Some(head) = q.front() else { continue };
+                let lsn = entry_lsn(head);
+                if pick.is_none_or(|(_, best)| lsn < best) {
+                    pick = Some((i, lsn));
+                }
+            }
+            let Some((i, _)) = pick else {
+                break;
+            };
+            let entry = per_xid[i].pop_front().expect("just peeked head");
             accumulate(entry, &mut heaps, &mut chunks);
         }
 
@@ -492,6 +805,8 @@ impl XactBuffer {
             .await
             .map_err(|e| XactBufferError::Observer(e.to_string()))?;
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(commit_lsn);
+        // One bump per top, not per subxid: a top with N subs is a
+        // single user-facing transaction at COMMIT time.
         self.stats.committed_xacts_total += 1;
         Ok(())
     }
@@ -504,22 +819,42 @@ impl XactBuffer {
         &mut self,
         xid: u32,
         abort_lsn: u64,
+        subxids: &[u32],
     ) -> std::result::Result<(), XactBufferError> {
         self.stats.drain_lsn = self.stats.drain_lsn.max(abort_lsn);
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(abort_lsn);
-        let Some(mut st) = self.inflight.remove(&xid) else {
+        // `xid` is the header xact_id — top-xact abort, or subxact
+        // standalone-rollback. Either way, drop `xid` itself and every
+        // sub in `subxids`. For mid-xact subxact rollback (PG
+        // `RecordSubTransactionAbort` writes a separate `XLOG_XACT_ABORT`
+        // keyed on the sub xid), top's pre-savepoint entries stay
+        // keyed on top_xid in `inflight` and flush at the top's COMMIT.
+        let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
+        xids.push(xid);
+        xids.extend_from_slice(subxids);
+
+        let mut any = false;
+        for x in xids {
+            let Some(mut st) = self.inflight.remove(&x) else {
+                continue;
+            };
+            any = true;
+            self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
+            self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
+            if let Some(writer) = st.spill.take() {
+                let bc = writer.byte_count();
+                self.stats.spill_bytes_active = self.stats.spill_bytes_active.saturating_sub(bc);
+                self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
+                writer.unlink().await?;
+            }
+        }
+        self.stats.bytes_in_memory = self.bytes_in_memory as u64;
+        if !any {
             self.stats.aborts_unknown_xid += 1;
             return Ok(());
-        };
-        self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
-        self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
-        self.stats.bytes_in_memory = self.bytes_in_memory as u64;
-        if let Some(writer) = st.spill.take() {
-            let bc = writer.byte_count();
-            self.stats.spill_bytes_active = self.stats.spill_bytes_active.saturating_sub(bc);
-            self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
-            writer.unlink().await?;
         }
+        // One bump per abort record, not per subxid — matches `commit`'s
+        // per-top accounting.
         self.stats.aborted_xacts_total += 1;
         Ok(())
     }
@@ -678,6 +1013,12 @@ pub struct XactRecordSink<O: TupleObserver + Send> {
     /// `relation_at` only for heaps with TOAST columns; everything
     /// else doesn't touch the catalog.
     catalog: Arc<Mutex<ShadowCatalog>>,
+    /// PHASE14 item 5. Maps subxids to their top via
+    /// `XLOG_XACT_ASSIGNMENT`. Hint surface only — the canonical
+    /// subxact list arrives inline on commit / abort records and
+    /// drives the drain merge directly. Tracker covers eviction-
+    /// policy decisions that need to know the family before COMMIT.
+    subxact_tracker: Arc<Mutex<SubxactTracker>>,
     /// Where committed tuples land. `XactBuffer::commit` calls
     /// `observer.on_tuple` per drained tuple; production wires this
     /// to the same `MetricsTupleObserver` Phase 5 uses and Phase 7
@@ -694,12 +1035,24 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
         Self {
             buffer,
             catalog,
+            subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             observer,
         }
     }
 
+    /// Wire a shared `SubxactTracker` (e.g. one owned by the daemon's
+    /// eviction policy). When unset the sink owns a private tracker.
+    pub fn with_subxact_tracker(mut self, tracker: Arc<Mutex<SubxactTracker>>) -> Self {
+        self.subxact_tracker = tracker;
+        self
+    }
+
     pub fn observer_mut(&mut self) -> &mut O {
         &mut self.observer
+    }
+
+    pub fn subxact_tracker(&self) -> &Arc<Mutex<SubxactTracker>> {
+        &self.subxact_tracker
     }
 }
 
@@ -718,30 +1071,52 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
             let xid = record.parsed.header.xact_id;
             match op {
                 XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
-                    let commit_ts = parse_xact_time(&record.parsed.main_data);
+                    let payload = parse_xact_payload(info, &record.parsed.main_data);
                     let mut buf = self.buffer.lock().await;
                     buf.commit(
                         xid,
-                        commit_ts,
+                        payload.xact_time,
                         record.source_lsn,
+                        &payload.subxacts,
                         &self.catalog,
                         &mut self.observer,
                     )
                     .await
                     .map_err(SinkError::from)?;
+                    drop(buf);
+                    // Drop the tracker's hint for this family —
+                    // commit terminates the top. Cheap O(k) cleanup.
+                    self.subxact_tracker.lock().await.forget_tree(xid);
                 }
                 XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
+                    let payload = parse_xact_payload(info, &record.parsed.main_data);
                     let mut buf = self.buffer.lock().await;
-                    buf.abort(xid, record.source_lsn)
+                    buf.abort(xid, record.source_lsn, &payload.subxacts)
                         .await
                         .map_err(SinkError::from)?;
+                    drop(buf);
+                    // forget_tree is harmless for standalone subxact
+                    // abort (xid is the sub itself, tracker drops the
+                    // single edge); for top abort it clears the whole
+                    // family.
+                    self.subxact_tracker.lock().await.forget_tree(xid);
+                }
+                XLOG_XACT_ASSIGNMENT => {
+                    // PHASE14 item 5. Record subxact → top edges so
+                    // eviction policy can fold sibling buffers under
+                    // memory pressure. Correctness rides on the commit
+                    // / abort record's authoritative subxact list, not
+                    // on this hint.
+                    if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data) {
+                        self.subxact_tracker.lock().await.assign(xtop, &subs);
+                    }
                 }
                 _ => {
-                    // XLOG_XACT_PREPARE / ASSIGNMENT / INVALIDATIONS:
-                    // not Phase 6 territory. PREPARE without COMMIT
-                    // PREPARED would leave the xact stuck — defer 2PC
-                    // proper handling to a follow-up, today the xact
-                    // stays buffered until COMMIT_PREPARED lands.
+                    // XLOG_XACT_PREPARE / INVALIDATIONS: not Phase 6
+                    // territory. PREPARE without COMMIT PREPARED would
+                    // leave the xact stuck — defer 2PC proper handling
+                    // to a follow-up, today the xact stays buffered
+                    // until COMMIT_PREPARED lands.
                 }
             }
             Ok(())
@@ -786,6 +1161,61 @@ impl BufferingDecoderSink {
     pub fn stats(&self) -> &DecoderStats {
         &self.stats
     }
+
+    /// Parse `xl_heap_truncate` main_data, resolve each relid through
+    /// `ShadowCatalog`, and push one `HeapOp::Truncate` per relation
+    /// into the xact buffer. TRUNCATE is unique in carrying pg_class
+    /// OIDs (not relfilenodes) and no block ref, so the standard
+    /// `relation_at(rfn)` path doesn't fit.
+    async fn handle_truncate(&mut self, record: &Record<'_>) -> std::result::Result<(), SinkError> {
+        let Some(parsed) = crate::main_data::parse_xl_heap_truncate(&record.parsed.main_data)
+        else {
+            self.stats.skipped_op += 1;
+            return Ok(());
+        };
+        let xid = record.parsed.header.xact_id;
+        let source_lsn = record.source_lsn;
+        // Gate on shadow having replayed past source_lsn so the
+        // catalog's pg_class entry for each relid is fresh.
+        if source_lsn > 0 {
+            let mut cat = self.catalog.lock().await;
+            cat.wait_for_replay(source_lsn)
+                .await
+                .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
+        }
+        for relid in parsed.relids {
+            let rel = {
+                let mut cat = self.catalog.lock().await;
+                match cat.relation_by_oid(relid).await {
+                    Ok(r) => r,
+                    Err(CatalogError::NotFoundByOid(_)) => {
+                        self.stats.catalog_not_found += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(DecoderSinkError::from(e).into()),
+                }
+            };
+            // Toast / index / sequence: TRUNCATE doesn't propagate
+            // (CH side has no per-table-internal toast). Filter to
+            // user heap relations.
+            if rel.kind != 'r' && rel.kind != 'p' {
+                continue;
+            }
+            let decoded = DecodedHeap {
+                rfn: rel.rfn,
+                xid,
+                source_lsn,
+                op: HeapOp::Truncate,
+                new: None,
+                old: None,
+            };
+            self.stats.decoded += 1;
+            self.stats.truncates += 1;
+            let mut buf = self.buffer.lock().await;
+            buf.on_heap(decoded).await.map_err(SinkError::from)?;
+        }
+        Ok(())
+    }
 }
 
 impl RecordSink for BufferingDecoderSink {
@@ -795,10 +1225,22 @@ impl RecordSink for BufferingDecoderSink {
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
+            let rm = record.parsed.header.resource_manager_id;
+            // TRUNCATE rides Decision::Keep (filter leaves it intact so
+            // shadow can replay the truncate against its own copy), but
+            // the decoder still needs to fan out per-relid HeapOp::Truncate
+            // for CH emission. Handle before the Drop gate so the
+            // SchemaEvent path fires regardless of how the filter scored
+            // the record.
+            if rm == RmId::Heap as u8 {
+                let info_op = record.parsed.header.info & crate::heap_decoder::XLOG_HEAP_OPMASK;
+                if info_op == crate::heap_decoder::XLOG_HEAP_TRUNCATE {
+                    return self.handle_truncate(record).await;
+                }
+            }
             if record.decision != Decision::Drop {
                 return Ok(());
             }
-            let rm = record.parsed.header.resource_manager_id;
             if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
                 return Ok(());
             }
@@ -831,40 +1273,47 @@ impl RecordSink for BufferingDecoderSink {
                     }
                 }
             };
-            let decoded = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
-                Ok(Some(d)) => d,
-                Ok(None) => {
-                    self.stats.skipped_op += 1;
-                    return Ok(());
-                }
+            let decoded_set = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
+                Ok(set) => set,
                 Err(e) => return Err(DecoderSinkError::from(e).into()),
             };
-            self.stats.decoded += 1;
-            match decoded.op {
-                HeapOp::Insert => self.stats.inserts += 1,
-                HeapOp::Update => self.stats.updates += 1,
-                HeapOp::HotUpdate => self.stats.hot_updates += 1,
-                HeapOp::Delete => self.stats.deletes += 1,
+            if decoded_set.is_empty() {
+                self.stats.skipped_op += 1;
+                return Ok(());
             }
-            if decoded.new.as_ref().is_some_and(|t| t.partial)
-                || decoded.old.as_ref().is_some_and(|t| t.partial)
-            {
-                self.stats.partial += 1;
-            }
-            if rel.kind == 't' {
-                let xid = decoded.xid;
-                if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
-                    self.toast_chunks_buffered += 1;
-                    let mut buf = self.buffer.lock().await;
-                    buf.on_toast_chunk(chunk, xid)
-                        .await
-                        .map_err(SinkError::from)?;
-                } else {
-                    self.toast_chunks_malformed += 1;
+            for decoded in decoded_set {
+                self.stats.decoded += 1;
+                match decoded.op {
+                    HeapOp::Insert => self.stats.inserts += 1,
+                    HeapOp::Update => self.stats.updates += 1,
+                    HeapOp::HotUpdate => self.stats.hot_updates += 1,
+                    HeapOp::Delete => self.stats.deletes += 1,
+                    // Truncate is routed via handle_truncate before
+                    // decode_heap_record runs, so this arm is
+                    // unreachable in steady state. Bumping the counter
+                    // is harmless defensively.
+                    HeapOp::Truncate => self.stats.truncates += 1,
                 }
-            } else {
-                let mut buf = self.buffer.lock().await;
-                buf.on_heap(decoded).await.map_err(SinkError::from)?;
+                if decoded.new.as_ref().is_some_and(|t| t.partial)
+                    || decoded.old.as_ref().is_some_and(|t| t.partial)
+                {
+                    self.stats.partial += 1;
+                }
+                if rel.kind == 't' {
+                    let xid = decoded.xid;
+                    if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
+                        self.toast_chunks_buffered += 1;
+                        let mut buf = self.buffer.lock().await;
+                        buf.on_toast_chunk(chunk, xid)
+                            .await
+                            .map_err(SinkError::from)?;
+                    } else {
+                        self.toast_chunks_malformed += 1;
+                    }
+                } else {
+                    let mut buf = self.buffer.lock().await;
+                    buf.on_heap(decoded).await.map_err(SinkError::from)?;
+                }
             }
             Ok(())
         })
@@ -913,24 +1362,14 @@ fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<T
     })
 }
 
-/// Pull `xact_time: TimestampTz` off the leading 8 bytes of an
-/// `xl_xact_commit` / `xl_xact_abort` record. Returns 0 when
-/// `main_data` is shorter — surfaces as "commit_ts unknown"
-/// downstream rather than failing the stream.
-fn parse_xact_time(main_data: &[u8]) -> i64 {
-    if main_data.len() < 8 {
-        return 0;
-    }
-    i64::from_le_bytes(main_data[0..8].try_into().unwrap())
-}
-
 #[cfg(test)]
 mod tests {
     //! Phase 6 unit tests cover the catalog-free paths:
     //! * On-heap / on-chunk absorption.
     //! * Abort cleanup (no detoast).
     //! * Largest-xact eviction (no detoast).
-    //! * `parse_xact_time` shape coverage.
+    //! * `parse_xact_payload` shape coverage (PHASE14 item 5).
+    //! * `SubxactTracker` round-trip (PHASE14 item 5).
     //! * `XactBufferStats::summary` conditional rendering.
     //!
     //! Commit-drain + detoast + `XactRecordSink::commit` paths live in
@@ -982,7 +1421,7 @@ mod tests {
         let spill_dir = tmp.path().to_path_buf();
         let before: Vec<_> = std::fs::read_dir(&spill_dir).unwrap().collect();
         assert!(!before.is_empty(), "spill file present");
-        b.abort(11, 200).await.unwrap();
+        b.abort(11, 200, &[]).await.unwrap();
         let after: Vec<_> = std::fs::read_dir(&spill_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -997,7 +1436,7 @@ mod tests {
     async fn abort_unknown_xid_counts() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        b.abort(101, 0).await.unwrap();
+        b.abort(101, 0, &[]).await.unwrap();
         assert_eq!(b.stats().aborts_unknown_xid, 1);
     }
 
@@ -1028,16 +1467,8 @@ mod tests {
             !by_filename.iter().any(|n| n.contains("xid-0000000002-")),
             "xid=2 must remain in-memory, saw {by_filename:?}"
         );
-        b.abort(1, 300).await.unwrap();
-        b.abort(2, 300).await.unwrap();
-    }
-
-    #[test]
-    fn parse_xact_time_short_main_data_returns_zero() {
-        assert_eq!(parse_xact_time(&[]), 0);
-        assert_eq!(parse_xact_time(&[1, 2, 3, 4]), 0);
-        let ts = 0x0123_4567_89AB_CDEFi64;
-        assert_eq!(parse_xact_time(&ts.to_le_bytes()), ts);
+        b.abort(1, 300, &[]).await.unwrap();
+        b.abort(2, 300, &[]).await.unwrap();
     }
 
     /// Phase 11. `abort()` must bump `drain_lsn` and `emitter_ack_lsn`
@@ -1049,16 +1480,16 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         b.on_heap(heap_with_value(7, 100, 16)).await.unwrap();
-        b.abort(7, 0x4000).await.unwrap();
+        b.abort(7, 0x4000, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x4000);
         assert_eq!(b.stats().emitter_ack_lsn, 0x4000);
         // A second abort at a lower LSN must not regress the monotonic
         // high-water marks.
-        b.abort(99, 0x100).await.unwrap();
+        b.abort(99, 0x100, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x4000);
         assert_eq!(b.stats().emitter_ack_lsn, 0x4000);
         // A later abort advances.
-        b.abort(101, 0x8000).await.unwrap();
+        b.abort(101, 0x8000, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x8000);
         assert_eq!(b.stats().emitter_ack_lsn, 0x8000);
     }
@@ -1112,6 +1543,7 @@ mod tests {
                     type_len: 4,
                     type_align: 'i',
                     type_storage: 'p',
+                    missing_text: None,
                 },
                 RelAttr {
                     attnum: 2,
@@ -1125,6 +1557,7 @@ mod tests {
                     type_len: 4,
                     type_align: 'i',
                     type_storage: 'p',
+                    missing_text: None,
                 },
                 RelAttr {
                     attnum: 3,
@@ -1138,6 +1571,7 @@ mod tests {
                     type_len: -1,
                     type_align: 'i',
                     type_storage: 'x',
+                    missing_text: None,
                 },
             ],
         };
@@ -1169,5 +1603,122 @@ mod tests {
         let mut d3 = d.clone();
         d3.new.as_mut().unwrap().columns.pop();
         assert!(toast_chunk_from_decoded(d3, &rel).is_none());
+    }
+
+    // ── PHASE14 item 5 ────────────────────────────────────────────────
+
+    #[test]
+    fn subxact_tracker_round_trip() {
+        let mut t = SubxactTracker::new();
+        t.assign(100, &[101, 102]);
+        assert_eq!(t.top_for(101), 100);
+        assert_eq!(t.top_for(102), 100);
+        // Unknown xid returns itself per PG's "sub's top is itself
+        // when no ASSIGNMENT record landed yet" semantics.
+        assert_eq!(t.top_for(100), 100);
+        assert_eq!(t.top_for(999), 999);
+        // subxids_of mirrors assign's input ordering.
+        let subs = t.subxids_of(100);
+        assert!(subs.contains(&101) && subs.contains(&102) && subs.len() == 2);
+        // Repeated assignment is idempotent — no duplicate edges.
+        t.assign(100, &[101]);
+        assert_eq!(t.subxids_of(100).len(), 2);
+        t.forget_tree(100);
+        assert_eq!(t.top_for(101), 101);
+        assert_eq!(t.top_for(102), 102);
+        assert!(t.subxids_of(100).is_empty());
+    }
+
+    #[test]
+    fn subxact_tracker_retargets_subxid_to_new_top() {
+        // Defensive case: a subxid that was previously assigned to one
+        // top gets reassigned to another. Old children edge must drop.
+        let mut t = SubxactTracker::new();
+        t.assign(10, &[20]);
+        t.assign(30, &[20]);
+        assert_eq!(t.top_for(20), 30);
+        assert!(t.subxids_of(10).is_empty());
+        assert_eq!(t.subxids_of(30), vec![20]);
+    }
+
+    #[test]
+    fn parse_xact_assignment_decodes_xtop_and_subs() {
+        // xtop=0x11223344, nsub=2, subs=[0x55, 0x66].
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x11223344u32.to_le_bytes());
+        buf.extend_from_slice(&2i32.to_le_bytes());
+        buf.extend_from_slice(&0x55u32.to_le_bytes());
+        buf.extend_from_slice(&0x66u32.to_le_bytes());
+        let (xtop, subs) = parse_xact_assignment(&buf).expect("parses");
+        assert_eq!(xtop, 0x11223344);
+        assert_eq!(subs, vec![0x55, 0x66]);
+        // Short main_data → None, doesn't panic.
+        assert!(parse_xact_assignment(&buf[..6]).is_none());
+        // Negative nsub → reject.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(&(-1i32).to_le_bytes());
+        assert!(parse_xact_assignment(&bad).is_none());
+    }
+
+    #[test]
+    fn parse_xact_payload_extracts_xact_time_without_xinfo() {
+        // No HAS_INFO bit → only the 8-byte timestamp lives in the body.
+        let ts = 0x0123_4567_89AB_CDEFi64;
+        let body = ts.to_le_bytes();
+        let p = parse_xact_payload(0x00, &body);
+        assert_eq!(p.xact_time, ts);
+        assert!(p.subxacts.is_empty());
+    }
+
+    #[test]
+    fn parse_xact_payload_reads_subxacts_with_dbinfo_skip() {
+        // HAS_INFO bit set, xinfo = DBINFO | SUBXACTS. Skip-walks
+        // through the dbInfo (8 bytes: dbOid + tsOid) to land on the
+        // subxacts header.
+        let mut body = Vec::new();
+        body.extend_from_slice(&42i64.to_le_bytes()); // xact_time
+        body.extend_from_slice(&(XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS).to_le_bytes());
+        body.extend_from_slice(&5u32.to_le_bytes()); // dbId
+        body.extend_from_slice(&1663u32.to_le_bytes()); // tsId
+        body.extend_from_slice(&3i32.to_le_bytes()); // nsubxacts
+        body.extend_from_slice(&0xAAu32.to_le_bytes());
+        body.extend_from_slice(&0xBBu32.to_le_bytes());
+        body.extend_from_slice(&0xCCu32.to_le_bytes());
+        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &body);
+        assert_eq!(p.xact_time, 42);
+        assert_eq!(p.subxacts, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn parse_xact_payload_handles_no_has_info() {
+        // HAS_INFO unset → xinfo defaults to 0 (no tails). Even when
+        // bytes follow the timestamp, parser must not consume them.
+        let mut body = 7i64.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0xFF; 16]);
+        let p = parse_xact_payload(0x00, &body);
+        assert_eq!(p.xact_time, 7);
+        assert!(p.subxacts.is_empty());
+    }
+
+    #[test]
+    fn parse_xact_payload_short_main_data_returns_default() {
+        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &[1, 2, 3, 4]);
+        assert_eq!(p.xact_time, 0);
+        assert!(p.subxacts.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_with_subxids_drops_each_buffer() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        b.on_heap(heap_with_value(300, 100, 16)).await.unwrap();
+        b.on_heap(heap_with_value(301, 200, 16)).await.unwrap();
+        b.on_heap(heap_with_value(302, 300, 16)).await.unwrap();
+        b.abort(300, 0x500, &[301, 302]).await.unwrap();
+        assert!(b.active_xids().is_empty());
+        // One aborted_xacts_total bump per terminator record, not per
+        // subxid in the list.
+        assert_eq!(b.stats().aborted_xacts_total, 1);
     }
 }

@@ -41,7 +41,7 @@ use crate::backup_sink::{CatalogFilenodes, DiskLanderSink, DiskLanderStats, Mult
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::decoder_sink::TupleObserver;
 use crate::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
-use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
+use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent, parse_array_one_element};
 
 /// Operator-tunable knobs.
 #[derive(Debug, Clone)]
@@ -218,17 +218,33 @@ pub async fn run_greenfield_bootstrap(
 /// the bottom of the wire, synthesising committed rows directly from
 /// on-disk pages.
 ///
-/// Channel-close (pump task dropped its sender) ends the loop;
-/// `on_xact_end` then closes every open INSERT block so the
+/// `PageWalkSink` emits all rows for one rfn contiguously before
+/// moving on, so we drive an `on_xact_end` whenever the rfn flips.
+/// CH's Native protocol forbids issuing a new `Query` (`INSERT INTO
+/// table_B`) while a prior `INSERT INTO table_A` still has an open
+/// data stream; without per-table flushes the second `send_query`
+/// races the first INSERT's body bytes and CH silently drops everything
+/// emitted on the connection.
+///
+/// Channel-close (pump task dropped its sender) ends the loop; the
+/// final `on_xact_end` closes the last table's INSERT block so the
 /// transitional emitter releases its CH state cleanly before the
-/// daemon swaps to the shadow-catalog-backed emitter. Errors from
-/// `on_tuple` / `on_xact_end` propagate after the receiver closes.
+/// daemon swaps to the shadow-catalog-backed emitter.
 pub async fn drain_backfill<O: TupleObserver + ?Sized>(
     mut rx: mpsc::UnboundedReceiver<BackfillTuple>,
     observer: &mut O,
 ) -> Result<u64> {
     let mut shipped: u64 = 0;
+    let mut last_rfn: Option<RelFileNode> = None;
     while let Some(tuple) = rx.recv().await {
+        if let Some(prev) = last_rfn
+            && prev != tuple.rfn
+        {
+            observer.on_xact_end().await.map_err(|e| {
+                anyhow::anyhow!("bootstrap drain: emitter rejected mid-table xact end: {e}")
+            })?;
+        }
+        last_rfn = Some(tuple.rfn);
         let committed = backfill_to_committed(tuple);
         observer
             .on_tuple(&committed)
@@ -413,7 +429,8 @@ async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>>
                 t.typbyval::bool, \
                 t.typlen::int2, \
                 t.typalign::text, \
-                t.typstorage::text \
+                t.typstorage::text, \
+                CASE WHEN a.atthasmissing THEN a.attmissingval::text END \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
              WHERE a.attrelid = $1 AND a.attnum >= 1 \
@@ -423,6 +440,7 @@ async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>>
         .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
+        let raw_missing: Option<String> = row.get(11);
         out.push(RelAttr {
             attnum: row.get(0),
             name: row.get(1),
@@ -435,6 +453,7 @@ async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>>
             type_len: row.get(8),
             type_align: one_char(row.get::<_, String>(9), "typalign")?,
             type_storage: one_char(row.get::<_, String>(10), "typstorage")?,
+            missing_text: raw_missing.as_deref().and_then(parse_array_one_element),
         });
     }
     Ok(out)
@@ -546,6 +565,7 @@ mod tests {
                 type_len: 4,
                 type_align: 'i',
                 type_storage: 'p',
+                missing_text: None,
             }],
         }
     }

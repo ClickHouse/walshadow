@@ -111,6 +111,41 @@ docs that are not yet committed work sit alongside as peers.
   WAL tail meet seamlessly. Unblocks greenfield deployments
   against non-empty source. Not yet committed work; see
   [PLAN.md §"Phase 12"](PLAN.md#phase-12--backfill-bridge).
+- **Phase 14** — close v1.0 product gaps + lift integration coverage.
+  Read-time defaults (`atthasmissing` / `attmissingval`),
+  `XLOG_HEAP2_MULTI_INSERT` per-tuple fan-out (`SmallVec<[_; 1]>`
+  on `decode_heap_record`), `TRUNCATE` propagation (single
+  `TRUNCATE TABLE <dest>` per relid, no tombstone shape), subxact
+  lineage + `ROLLBACK TO SAVEPOINT` via `XLOG_XACT_ASSIGNMENT`
+  tracking + commit/abort-payload subxids list,
+  `walshadow_shadow_apply_lag_*` metrics on the Prom endpoint,
+  plus three integration tests covering v1.0 acceptance §1
+  (pgbench + ALTER + CIC), acceptance §5 (kill -9 + restart), and
+  the Phase 12 direct + CH-backed bootstrap drill. `DROP TABLE`
+  propagation moved into [Phase 15 §6](PHASE15.md) because it
+  rides the same `SchemaEvent` channel + xact-buffer drain wiring
+  that PHASE15's shape-mutating DDLs need. 2PC / sequence state /
+  cross-table ordering / TLS-SCRAM defer to v1.1+ with rationale.
+  Split into eight sub-plans; overview at
+  [phase14/PLAN.md](phase14/PLAN.md).
+- **Phase 15** — propagate source schema changes through to CH.
+  `ShadowCatalog` gains a per-relation `SchemaEvent` channel
+  (`Added` / `Changed{diff}` / `Dropped`), sourced both from
+  descriptor-diff at fetch time and from `pg_class_decoder`'s
+  heap_delete branch. New `src/ch_ddl.rs` applicator translates
+  events into CH `CREATE TABLE` / `ALTER ... ADD|DROP|RENAME
+  COLUMN` / `DROP TABLE` against a PG → CH `type_bridge`, gated
+  against the emitter's INSERT path via a per-(rfn, generation)
+  ready notify so post-ALTER xacts land on the new CH shape.
+  `XactBuffer::commit`'s drain queue lifts to `DrainEntry::{Tuple,
+  Catalog}` so DROP TABLE orders correctly against pre-DROP
+  writes, gated on `--drop-table-strategy = retain|drop|warn`
+  (default `retain`).
+  Namespace block (`[namespace."public"] auto_create = true`)
+  flips the daemon from operator-pre-declared TOML mapping to
+  auto-discovery; per-table TOML stays as override. Type widening
+  (`ALTER COLUMN TYPE`), partitioned-table DDL, FK constraints
+  defer. [PHASE15.md](PHASE15.md).
 - **Phase 13** — sub-segment record latency. Lift the page-by-page
   walker into `WalStream::push` so records reach the decoder on
   page cadence instead of waiting for a 16 MiB segment to fill.

@@ -170,6 +170,14 @@ pub struct RelAttr {
     /// `pg_type.typstorage`: `'p'` plain, `'e'` external (toast),
     /// `'m'` main (in-line, never compressed), `'x'` extended.
     pub type_storage: char,
+    /// `pg_attribute.atthasmissing` + text form of `attmissingval[1]`
+    /// when set. PG's fast-path `ALTER TABLE ADD COLUMN ... DEFAULT k`
+    /// (heaptuple.c `getmissingattr`) emits this for pre-ALTER rows
+    /// whose physical tuple has fewer columns than the catalog. The
+    /// text form is the type's `typoutput` rendering; heap_decoder
+    /// converts back to `ColumnValue` via the Tier 1/2 type matrix,
+    /// with `PgPending` fallback through the oracle for Tier 3.
+    pub missing_text: Option<String>,
 }
 
 /// Tunables for the cache; defaults match the Phase 4 daemon's
@@ -733,6 +741,11 @@ impl ShadowCatalog {
     }
 
     async fn fetch_attributes(&mut self, rel_oid: Oid) -> Result<Vec<RelAttr>> {
+        // `attmissingval` is `anyarray`, which doesn't support
+        // subscript or `unnest`. Cast through `::text` surfaces PG's
+        // array_out literal (`{val}` for a single-element array);
+        // strip braces + dequote in `parse_array_one_element` to
+        // recover the typoutput text form for `getmissingattr`.
         let rows = self
             .query_retry(
                 "SELECT \
@@ -746,7 +759,8 @@ impl ShadowCatalog {
                     t.typbyval::bool, \
                     t.typlen::int2, \
                     t.typalign::text, \
-                    t.typstorage::text \
+                    t.typstorage::text, \
+                    CASE WHEN a.atthasmissing THEN a.attmissingval::text END \
                  FROM pg_attribute a \
                  JOIN pg_type t ON t.oid = a.atttypid \
                  WHERE a.attrelid = $1 AND a.attnum >= 1 \
@@ -756,6 +770,7 @@ impl ShadowCatalog {
             .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            let raw_missing: Option<String> = row.get(11);
             out.push(RelAttr {
                 attnum: row.get(0),
                 name: row.get(1),
@@ -768,6 +783,7 @@ impl ShadowCatalog {
                 type_len: row.get(8),
                 type_align: one_char(row.get::<_, String>(9), "typalign")?,
                 type_storage: one_char(row.get::<_, String>(10), "typstorage")?,
+                missing_text: raw_missing.as_deref().and_then(parse_array_one_element),
             });
         }
         Ok(out)
@@ -781,6 +797,46 @@ impl ShadowCatalog {
             )
             .await?;
         Ok(row.get(0))
+    }
+}
+
+/// Strip the single element from a PG array text literal `{val}` and
+/// dequote it. Used to recover `attmissingval[1]`'s typoutput form
+/// after `array_out` rendering of `anyarray`.
+///
+/// PG array_out quoting rules (from `~/s/postgresql/src/backend/utils/adt/arrayfuncs.c`
+/// `array_out`): elements containing braces, commas, double-quotes,
+/// backslashes, or whitespace get wrapped in `"`; internal `"` and
+/// `\` are escaped with `\`. NULL elements render as the literal
+/// `NULL` (no quotes). Returns `None` on `NULL`, empty array `{}`,
+/// or any shape outside single-element 1-D.
+pub(crate) fn parse_array_one_element(raw: &str) -> Option<String> {
+    let inner = raw.strip_prefix('{')?.strip_suffix('}')?;
+    if inner.is_empty() {
+        return None;
+    }
+    if inner == "NULL" {
+        return None;
+    }
+    if let Some(rest) = inner.strip_prefix('"') {
+        // Quoted form: walk and unescape; ensure trailing `"`.
+        let mut out = String::with_capacity(rest.len());
+        let mut chars = rest.chars().peekable();
+        loop {
+            match chars.next() {
+                Some('"') => return (chars.next().is_none()).then_some(out),
+                Some('\\') => match chars.next() {
+                    Some(c) => out.push(c),
+                    None => return None,
+                },
+                Some(c) => out.push(c),
+                None => return None,
+            }
+        }
+    } else {
+        // Unquoted scalar; no internal special chars by PG's array_out
+        // guarantee.
+        Some(inner.to_owned())
     }
 }
 
@@ -845,6 +901,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn parse_array_one_element_scalars() {
+        assert_eq!(parse_array_one_element("{7}").as_deref(), Some("7"));
+        assert_eq!(parse_array_one_element("{t}").as_deref(), Some("t"));
+        assert_eq!(parse_array_one_element("{3.14}").as_deref(), Some("3.14"),);
+        assert_eq!(
+            parse_array_one_element("{-9223372036854775808}").as_deref(),
+            Some("-9223372036854775808"),
+        );
+    }
+
+    #[test]
+    fn parse_array_one_element_quoted_text() {
+        assert_eq!(
+            parse_array_one_element("{\"hello\"}").as_deref(),
+            Some("hello"),
+        );
+        assert_eq!(
+            parse_array_one_element("{\"hello, world\"}").as_deref(),
+            Some("hello, world"),
+        );
+        assert_eq!(
+            parse_array_one_element("{\"a\\\"b\"}").as_deref(),
+            Some("a\"b"),
+        );
+    }
+
+    #[test]
+    fn parse_array_one_element_empty_and_null() {
+        assert!(parse_array_one_element("{}").is_none());
+        assert!(parse_array_one_element("{NULL}").is_none());
+        assert!(parse_array_one_element("nope").is_none());
+    }
 
     #[test]
     fn one_char_accepts_single() {

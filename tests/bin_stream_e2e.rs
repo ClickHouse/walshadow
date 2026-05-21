@@ -318,6 +318,19 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             body.contains("walshadow_source_received_lsn") || body.contains("walshadow_uptime"),
             "expected walshadow_* counter in /metrics body: {body}",
         );
+        // PHASE14 §6 — shadow apply-lag surface is part of the static
+        // render shape (zero-valued before any shadow attaches).
+        for name in [
+            "walshadow_shadow_apply_lag_bytes",
+            "walshadow_shadow_apply_lag_seconds",
+            "walshadow_shadow_stream_active_connections",
+            "walshadow_shadow_stream_dropped_connections_total",
+        ] {
+            assert!(
+                body.contains(name),
+                "expected {name} in /metrics body: {body}",
+            );
+        }
 
         // 6. Drive workload. The daemon filters user-heap WAL records
         //    (rmgr=HEAP, class=User → replaced with XLOG_NOOP) — only

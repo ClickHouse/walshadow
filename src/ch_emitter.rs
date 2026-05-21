@@ -974,6 +974,8 @@ pub struct EmitterStats {
     /// not per attempt — so a single op that needed 3 retries adds 3).
     pub reconnects: u64,
     pub retries_attempted: u64,
+    /// `HeapOp::Truncate` events shipped to CH as `TRUNCATE TABLE`.
+    pub truncates_emitted: u64,
 }
 
 impl Emitter {
@@ -1032,6 +1034,36 @@ impl Emitter {
                 }
             }
         };
+        // Truncate executes in WAL order against the destination.
+        // Drain any pending per-table buffer for this relation first
+        // (so prior INSERTs in the same xact land before the truncate),
+        // then issue `TRUNCATE TABLE <dest>` synchronously.
+        if let HeapOp::Truncate = committed.decoded.op {
+            let key = rel.qualified_name.as_ref().to_owned();
+            if let Some(enc) = self.tables.remove(&key) {
+                self.finish_table_owned(&key, enc)?;
+            }
+            let sql = format!("TRUNCATE TABLE {}", mapping.target);
+            self.client.send_query(&sql, None)?;
+            loop {
+                let mut pkt = self.client.recv_packet()?;
+                match pkt.kind() {
+                    Some(PacketKind::EndOfStream) => break,
+                    Some(PacketKind::Exception) => {
+                        if let Some(exc) = pkt.take_exception() {
+                            return Err(EmitterError::ServerException {
+                                code: exc.code(),
+                                message: String::from_utf8_lossy(exc.display_text()).into_owned(),
+                            });
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            self.stats.truncates_emitted += 1;
+            return Ok(());
+        }
         // Initialize per-table encoder lazily on first row.
         let alloc = self.alloc;
         let enc = if self.tables.contains_key(rel.qualified_name.as_ref()) {
@@ -1053,6 +1085,8 @@ impl Emitter {
             HeapOp::Insert => OP_INSERT,
             HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
             HeapOp::Delete => OP_DELETE,
+            // Routed above; unreachable here.
+            HeapOp::Truncate => return Ok(()),
         };
         if let Err(e) = enc.append_row(committed, &mapping, op) {
             self.stats.unsupported_values += 1;
@@ -1373,6 +1407,7 @@ mod tests {
                     type_len: 4,
                     type_align: 'i',
                     type_storage: 'p',
+                    missing_text: None,
                 },
                 RelAttr {
                     attnum: 2,
@@ -1386,6 +1421,7 @@ mod tests {
                     type_len: -1,
                     type_align: 'i',
                     type_storage: 'x',
+                    missing_text: None,
                 },
             ],
         }

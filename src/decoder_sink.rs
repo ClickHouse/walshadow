@@ -118,6 +118,10 @@ pub struct DecoderStats {
     /// Record was on a `User` relation but the rmgr/info combo isn't
     /// in the Phase 5 matrix (MULTI_INSERT, HEAP2 PRUNE, etc).
     pub skipped_op: u64,
+    /// `XLOG_HEAP_TRUNCATE` records fanned out to per-relid
+    /// `HeapOp::Truncate` events. Counted by
+    /// [`BufferingDecoderSink::on_record`]'s pre-decode intercept.
+    pub truncates: u64,
 }
 
 #[derive(Debug, Default)]
@@ -139,6 +143,7 @@ impl TupleObserver for MetricsTupleObserver {
                 HeapOp::Update => self.stats.updates += 1,
                 HeapOp::HotUpdate => self.stats.hot_updates += 1,
                 HeapOp::Delete => self.stats.deletes += 1,
+                HeapOp::Truncate => self.stats.truncates += 1,
             }
             if decoded.new.as_ref().map(|t| t.partial).unwrap_or(false)
                 || decoded.old.as_ref().map(|t| t.partial).unwrap_or(false)
@@ -245,41 +250,43 @@ impl<O: TupleObserver> RecordSink for DecoderSink<O> {
                 Err(e) => return Err(DecoderSinkError::from(e).into()),
             };
             drop(cat);
-            let decoded = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
-                Ok(Some(d)) => d,
-                Ok(None) => {
-                    self.stats.skipped_op += 1;
-                    return Ok(());
-                }
+            let decoded_set = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
+                Ok(set) => set,
                 Err(e) => return Err(DecoderSinkError::from(e).into()),
             };
-            self.stats.decoded += 1;
+            if decoded_set.is_empty() {
+                self.stats.skipped_op += 1;
+                return Ok(());
+            }
             use crate::heap_decoder::HeapOp;
-            match decoded.op {
-                HeapOp::Insert => self.stats.inserts += 1,
-                HeapOp::Update => self.stats.updates += 1,
-                HeapOp::HotUpdate => self.stats.hot_updates += 1,
-                HeapOp::Delete => self.stats.deletes += 1,
+            for decoded in decoded_set {
+                self.stats.decoded += 1;
+                match decoded.op {
+                    HeapOp::Insert => self.stats.inserts += 1,
+                    HeapOp::Update => self.stats.updates += 1,
+                    HeapOp::HotUpdate => self.stats.hot_updates += 1,
+                    HeapOp::Delete => self.stats.deletes += 1,
+                    HeapOp::Truncate => self.stats.truncates += 1,
+                }
+                if decoded.new.as_ref().map(|t| t.partial).unwrap_or(false)
+                    || decoded.old.as_ref().map(|t| t.partial).unwrap_or(false)
+                {
+                    self.stats.partial += 1;
+                }
+                // Phase 5 unbuffered path emits the moment the heap
+                // record lands — no commit record yet, so commit_ts=0
+                // and commit_lsn=0. Phase 6's BufferingDecoderSink
+                // takes over in the production dispatch chain.
+                let committed = CommittedTuple {
+                    decoded,
+                    commit_ts: 0,
+                    commit_lsn: 0,
+                };
+                self.observer
+                    .on_tuple(&committed)
+                    .await
+                    .map_err(SinkError::from)?;
             }
-            if decoded.new.as_ref().map(|t| t.partial).unwrap_or(false)
-                || decoded.old.as_ref().map(|t| t.partial).unwrap_or(false)
-            {
-                self.stats.partial += 1;
-            }
-            // Phase 5 unbuffered path emits the moment the heap record
-            // lands — no commit record yet, so `commit_ts = 0` and
-            // `commit_lsn = 0`. Phase 6's [`BufferingDecoderSink`] takes
-            // over in the production dispatch chain; `DecoderSink` only
-            // survives for the Phase 5 ghost-row test fixtures.
-            let committed = CommittedTuple {
-                decoded,
-                commit_ts: 0,
-                commit_lsn: 0,
-            };
-            self.observer
-                .on_tuple(&committed)
-                .await
-                .map_err(SinkError::from)?;
             Ok(())
         })
     }
@@ -291,11 +298,12 @@ impl DecoderStats {
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
         let mut s = format!("decoded={}", self.decoded);
-        let pairs: [(&str, u64); 7] = [
+        let pairs: [(&str, u64); 8] = [
             ("ins", self.inserts),
             ("upd", self.updates),
             ("hot", self.hot_updates),
             ("del", self.deletes),
+            ("trunc", self.truncates),
             ("partial", self.partial),
             ("no_blk", self.skipped_no_block),
             ("not_found", self.catalog_not_found),

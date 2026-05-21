@@ -17,10 +17,11 @@
 //! intentionally read-only (no `/quit`, no admin verbs); operator
 //! actions stay on the CLI side.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -79,6 +80,19 @@ pub struct MetricsSnapshot {
     pub oracle_validate_mismatches_total: u64,
     pub oracle_errors_total: u64,
     pub uptime_secs: u64,
+    /// PHASE14 §6 — `source_received_lsn - min_apply_lsn` across active
+    /// shadow walreceiver connections. Caller saturates to 0 when shadow
+    /// is ahead; when no shadow is connected, caller passes
+    /// `source_received_lsn` (treat disconnect as max lag).
+    pub shadow_apply_lag_bytes: u64,
+    /// PHASE14 §6 — `shadow_apply_lag_bytes` divided by a rolling 30 s
+    /// estimate of source WAL byte rate. `f64::INFINITY` when rate is 0
+    /// (renders as `+Inf`).
+    pub shadow_apply_lag_seconds: f64,
+    /// Count of currently-attached walreceiver connections.
+    pub shadow_stream_active_connections: u64,
+    /// Cumulative connections dropped by `slow_threshold` overflow.
+    pub shadow_stream_dropped_connections_total: u64,
 }
 
 /// Shared handle the daemon clones to write + the HTTP server clones
@@ -104,6 +118,73 @@ impl MetricsRegistry {
     /// the duration of the clone (microseconds).
     pub async fn snapshot(&self) -> MetricsSnapshot {
         self.inner.read().await.clone()
+    }
+}
+
+/// Rolling 30 s ring of `(timestamp, source_received_lsn)` samples used
+/// to derive a coarse WAL byte-rate for `shadow_apply_lag_seconds`.
+/// Status-loop ticks push fresh samples + prune older than `window`.
+#[derive(Debug)]
+pub struct RateEstimator {
+    window: Duration,
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl RateEstimator {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            samples: VecDeque::new(),
+        }
+    }
+
+    /// Push a fresh sample, prune entries older than `window`.
+    pub fn observe(&mut self, now: Instant, received_lsn: u64) {
+        self.samples.push_back((now, received_lsn));
+        let cutoff = now.checked_sub(self.window);
+        if let Some(cutoff) = cutoff {
+            while let Some(&(t, _)) = self.samples.front()
+                && t < cutoff
+                && self.samples.len() > 1
+            {
+                self.samples.pop_front();
+            }
+        }
+    }
+
+    /// Bytes-per-second across the ring. `None` when fewer than two
+    /// samples or zero elapsed time.
+    pub fn rate(&self) -> Option<f64> {
+        let (front_t, front_lsn) = *self.samples.front()?;
+        let (back_t, back_lsn) = *self.samples.back()?;
+        let elapsed = back_t.saturating_duration_since(front_t).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        let delta = back_lsn.saturating_sub(front_lsn);
+        if delta == 0 {
+            return None;
+        }
+        Some(delta as f64 / elapsed)
+    }
+
+    /// Convert a lag in bytes to lag in seconds against the current
+    /// rate estimate. Returns `0.0` when lag is 0, `INFINITY` when rate
+    /// is unknown.
+    pub fn seconds_for(&self, lag_bytes: u64) -> f64 {
+        if lag_bytes == 0 {
+            return 0.0;
+        }
+        match self.rate() {
+            Some(r) if r > 0.0 => lag_bytes as f64 / r,
+            _ => f64::INFINITY,
+        }
+    }
+}
+
+impl Default for RateEstimator {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(30))
     }
 }
 
@@ -278,11 +359,43 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "counter",
             snap.uptime_secs,
         ),
+        (
+            "walshadow_shadow_apply_lag_bytes",
+            "Bytes between source_received_lsn and the min apply LSN reported by active shadow walreceivers.",
+            "gauge",
+            snap.shadow_apply_lag_bytes,
+        ),
+        (
+            "walshadow_shadow_stream_active_connections",
+            "Currently-attached walreceiver connections to walshadow's walsender.",
+            "gauge",
+            snap.shadow_stream_active_connections,
+        ),
+        (
+            "walshadow_shadow_stream_dropped_connections_total",
+            "Connections dropped by slow-client cutoff since daemon start.",
+            "counter",
+            snap.shadow_stream_dropped_connections_total,
+        ),
     ];
     for (name, help, kind, value) in pairs {
         writeln!(s, "# HELP {name} {help}").unwrap();
         writeln!(s, "# TYPE {name} {kind}").unwrap();
         writeln!(s, "{name} {value}").unwrap();
+    }
+
+    // Float-valued gauge — Prom format accepts `+Inf` for unknown rate.
+    let name = "walshadow_shadow_apply_lag_seconds";
+    writeln!(
+        s,
+        "# HELP {name} Estimated seconds shadow trails source, by source byte rate over last 30s.",
+    )
+    .unwrap();
+    writeln!(s, "# TYPE {name} gauge").unwrap();
+    if snap.shadow_apply_lag_seconds.is_infinite() {
+        writeln!(s, "{name} +Inf").unwrap();
+    } else {
+        writeln!(s, "{name} {:.3}", snap.shadow_apply_lag_seconds).unwrap();
     }
     s
 }
@@ -397,6 +510,87 @@ mod tests {
         let got = reg.snapshot().await;
         assert_eq!(got.filter_lsn, 7);
         assert_eq!(got.xacts_committed_total, 11);
+    }
+
+    #[test]
+    fn render_emits_shadow_apply_lag_lines() {
+        let snap = MetricsSnapshot {
+            shadow_apply_lag_bytes: 12345,
+            shadow_apply_lag_seconds: 1.23456,
+            shadow_stream_active_connections: 2,
+            shadow_stream_dropped_connections_total: 5,
+            ..MetricsSnapshot::default()
+        };
+        let body = render(&snap);
+        assert!(body.contains("# HELP walshadow_shadow_apply_lag_bytes"));
+        assert!(body.contains("# TYPE walshadow_shadow_apply_lag_bytes gauge"));
+        assert!(body.contains("walshadow_shadow_apply_lag_bytes 12345"));
+        assert!(body.contains("# HELP walshadow_shadow_apply_lag_seconds"));
+        assert!(body.contains("# TYPE walshadow_shadow_apply_lag_seconds gauge"));
+        // {:.3} precision per spec
+        assert!(body.contains("walshadow_shadow_apply_lag_seconds 1.235"));
+        assert!(body.contains("# HELP walshadow_shadow_stream_active_connections"));
+        assert!(body.contains("# TYPE walshadow_shadow_stream_active_connections gauge"));
+        assert!(body.contains("walshadow_shadow_stream_active_connections 2"));
+        assert!(body.contains("# HELP walshadow_shadow_stream_dropped_connections_total"));
+        assert!(body.contains("# TYPE walshadow_shadow_stream_dropped_connections_total counter"));
+        assert!(body.contains("walshadow_shadow_stream_dropped_connections_total 5"));
+    }
+
+    #[test]
+    fn render_emits_infinity_as_plus_inf() {
+        let snap = MetricsSnapshot {
+            shadow_apply_lag_seconds: f64::INFINITY,
+            ..MetricsSnapshot::default()
+        };
+        let body = render(&snap);
+        assert!(body.contains("walshadow_shadow_apply_lag_seconds +Inf"));
+    }
+
+    #[test]
+    fn rate_estimator_rate_across_window() {
+        let mut e = RateEstimator::new(Duration::from_secs(30));
+        let t0 = Instant::now();
+        e.observe(t0, 0);
+        e.observe(t0 + Duration::from_secs(10), 10_000);
+        let r = e.rate().expect("rate");
+        assert!((r - 1000.0).abs() < 1e-6, "expected ~1000 B/s got {r}");
+    }
+
+    #[test]
+    fn rate_estimator_prunes_outside_window() {
+        let mut e = RateEstimator::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+        e.observe(t0, 0);
+        e.observe(t0 + Duration::from_secs(1), 1_000);
+        e.observe(t0 + Duration::from_secs(10), 10_000);
+        // First entry is now older than `window` from latest; pruned.
+        let (front_t, _) = *e.samples.front().unwrap();
+        assert!(front_t >= t0 + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rate_estimator_seconds_for_zero_lag() {
+        let mut e = RateEstimator::new(Duration::from_secs(30));
+        e.observe(Instant::now(), 0);
+        assert_eq!(e.seconds_for(0), 0.0);
+    }
+
+    #[test]
+    fn rate_estimator_seconds_for_unknown_rate_is_infinity() {
+        let e = RateEstimator::new(Duration::from_secs(30));
+        assert!(e.seconds_for(1024).is_infinite());
+    }
+
+    #[test]
+    fn rate_estimator_seconds_for_known_rate() {
+        let mut e = RateEstimator::new(Duration::from_secs(30));
+        let t0 = Instant::now();
+        e.observe(t0, 0);
+        e.observe(t0 + Duration::from_secs(10), 10_000);
+        // rate = 1000 B/s, lag 5000 B → 5 s
+        let s = e.seconds_for(5_000);
+        assert!((s - 5.0).abs() < 1e-6, "expected 5.0 got {s}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

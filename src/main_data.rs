@@ -60,6 +60,52 @@ const NEW_CID_LOCATOR_OFFSET: usize = 16;
 const NEW_CID_MIN_SIZE: usize = 34;
 const BTREE_REUSE_PAGE_MIN_SIZE: usize = 25;
 
+/// `xl_heap_truncate` header size before the relids array. PG
+/// `SizeOfHeapTruncate = offsetof(xl_heap_truncate, relids) = 12` — 9
+/// bytes of dbId+nrelids+flags plus 3 bytes of trailing padding so
+/// the relids array (4-byte aligned `Oid`) starts on a u32 boundary.
+const HEAP_TRUNCATE_HEADER_SIZE: usize = 12;
+
+/// PG `xl_heap_truncate.flags` bits (heapam_xlog.h).
+pub const XLH_TRUNCATE_CASCADE: u8 = 1 << 0;
+pub const XLH_TRUNCATE_RESTART_SEQS: u8 = 1 << 1;
+
+/// Parsed body of an `XLOG_HEAP_TRUNCATE` main_data record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapTruncate {
+    pub db_oid: u32,
+    pub flags: u8,
+    /// pg_class OIDs of the relations being truncated. Note these are
+    /// **OIDs**, not relfilenodes — TRUNCATE may rewrite the relation
+    /// on commit (new filenode), so the WAL carries the stable id.
+    pub relids: Vec<u32>,
+}
+
+/// Parse `xl_heap_truncate` main_data. Layout (PG `heapam_xlog.h`):
+/// `Oid dbId; uint32 nrelids; uint8 flags; Oid relids[nrelids]`.
+pub fn parse_xl_heap_truncate(md: &[u8]) -> Option<HeapTruncate> {
+    if md.len() < HEAP_TRUNCATE_HEADER_SIZE {
+        return None;
+    }
+    let db_oid = u32::from_le_bytes(md[0..4].try_into().unwrap());
+    let nrelids = u32::from_le_bytes(md[4..8].try_into().unwrap()) as usize;
+    let flags = md[8];
+    let expected = HEAP_TRUNCATE_HEADER_SIZE + nrelids * 4;
+    if md.len() < expected {
+        return None;
+    }
+    let mut relids = Vec::with_capacity(nrelids);
+    for i in 0..nrelids {
+        let off = HEAP_TRUNCATE_HEADER_SIZE + i * 4;
+        relids.push(u32::from_le_bytes(md[off..off + 4].try_into().unwrap()));
+    }
+    Some(HeapTruncate {
+        db_oid,
+        flags,
+        relids,
+    })
+}
+
 fn read_locator(md: &[u8], off: usize) -> RelFileNode {
     RelFileNode {
         spc_node: u32::from_le_bytes(md[off..off + 4].try_into().unwrap()),
@@ -184,5 +230,46 @@ mod tests {
         let mut r = btree_reuse_record(1663, 5, 1259);
         r.header.info = 0xC0; // XLOG_BTREE_VACUUM — block-ref bearing, not Empty
         assert!(relation_for_empty(&r).is_none());
+    }
+
+    /// PG `XLogRegisterData(&xlrec, SizeOfHeapTruncate)` writes the C
+    /// struct including its trailing 3-byte padding so the following
+    /// relids array lands on a 4-byte boundary. Tests mirror the same
+    /// layout.
+    fn write_truncate_header(md: &mut Vec<u8>, db_oid: u32, nrelids: u32, flags: u8) {
+        md.extend_from_slice(&db_oid.to_le_bytes());
+        md.extend_from_slice(&nrelids.to_le_bytes());
+        md.push(flags);
+        md.extend_from_slice(&[0u8; 3]); // alignment padding
+    }
+
+    #[test]
+    fn parse_xl_heap_truncate_extracts_relids() {
+        let mut md = Vec::new();
+        write_truncate_header(&mut md, 5, 3, XLH_TRUNCATE_CASCADE);
+        for oid in [16400u32, 16401, 16402] {
+            md.extend_from_slice(&oid.to_le_bytes());
+        }
+        let r = parse_xl_heap_truncate(&md).expect("parse");
+        assert_eq!(r.db_oid, 5);
+        assert_eq!(r.flags, XLH_TRUNCATE_CASCADE);
+        assert_eq!(r.relids, vec![16400, 16401, 16402]);
+    }
+
+    #[test]
+    fn parse_xl_heap_truncate_truncated_returns_none() {
+        let mut md = Vec::new();
+        write_truncate_header(&mut md, 5, 2, 0); // claims 2 relids
+        md.extend_from_slice(&16400u32.to_le_bytes()); // only one
+        assert!(parse_xl_heap_truncate(&md).is_none());
+    }
+
+    #[test]
+    fn parse_xl_heap_truncate_zero_relids_ok() {
+        let mut md = Vec::new();
+        write_truncate_header(&mut md, 7, 0, 0);
+        let r = parse_xl_heap_truncate(&md).expect("parse");
+        assert_eq!(r.db_oid, 7);
+        assert!(r.relids.is_empty());
     }
 }

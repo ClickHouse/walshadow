@@ -74,6 +74,9 @@ pub struct AggregateLsn {
     pub min_flush_lsn: Option<u64>,
     pub min_apply_lsn: Option<u64>,
     pub active_connections: usize,
+    /// Cumulative count of connections dropped by `slow_threshold`
+    /// overflow since process start. Counter-shaped — never decreases.
+    pub dropped_total: u64,
 }
 
 #[derive(Debug, Error)]
@@ -118,6 +121,10 @@ pub struct ShadowStreamState {
     /// Most-recent server_wal_end value the sink has observed. Used
     /// to populate `'w'`/`'k'` frame headers.
     pub server_wal_end: u64,
+    /// Counter — connections cut due to `slow_threshold` overflow.
+    /// Surfaced via [`AggregateLsn::dropped_total`] for the
+    /// `walshadow_shadow_stream_dropped_connections_total` gauge.
+    dropped_total: u64,
 }
 
 impl ShadowStreamState {
@@ -138,6 +145,7 @@ impl ShadowStreamState {
             send_queues: HashMap::new(),
             slow_threshold,
             server_wal_end: current_lsn,
+            dropped_total: 0,
         }
     }
 
@@ -145,12 +153,16 @@ impl ShadowStreamState {
     pub fn aggregate(&self) -> AggregateLsn {
         let active: Vec<&ConnState> = self.connections.values().filter(|c| !c.closing).collect();
         if active.is_empty() {
-            return AggregateLsn::default();
+            return AggregateLsn {
+                dropped_total: self.dropped_total,
+                ..AggregateLsn::default()
+            };
         }
         AggregateLsn {
             min_flush_lsn: active.iter().map(|c| c.flush_lsn).min(),
             min_apply_lsn: active.iter().map(|c| c.apply_lsn).min(),
             active_connections: active.len(),
+            dropped_total: self.dropped_total,
         }
     }
 
@@ -193,8 +205,11 @@ impl ShadowStreamState {
     pub fn enqueue(&mut self, id: u64, framed: Vec<u8>) -> bool {
         let q = self.send_queues.entry(id).or_default();
         if q.len() + framed.len() > self.slow_threshold {
-            if let Some(c) = self.connections.get_mut(&id) {
+            if let Some(c) = self.connections.get_mut(&id)
+                && !c.closing
+            {
                 c.closing = true;
+                self.dropped_total += 1;
             }
             self.send_queues.remove(&id);
             return false;
@@ -214,11 +229,6 @@ impl ShadowStreamState {
     /// (consistent with the [`enqueue`] semantics).
     fn enqueue_copy_data_with(&mut self, id: u64, build_body: impl FnOnce(&mut Vec<u8>)) -> bool {
         let slow_threshold = self.slow_threshold;
-        let mark_closing = |connections: &mut HashMap<u64, ConnState>| {
-            if let Some(c) = connections.get_mut(&id) {
-                c.closing = true;
-            }
-        };
         let q = self.send_queues.entry(id).or_default();
         let envelope_start = q.len();
         q.push(b'd');
@@ -229,7 +239,12 @@ impl ShadowStreamState {
         let payload_len = 4 + (q.len() - body_start);
         if envelope_start + 1 + payload_len > slow_threshold {
             q.truncate(envelope_start);
-            mark_closing(&mut self.connections);
+            if let Some(c) = self.connections.get_mut(&id)
+                && !c.closing
+            {
+                c.closing = true;
+                self.dropped_total += 1;
+            }
             self.send_queues.remove(&id);
             return false;
         }
@@ -593,6 +608,17 @@ mod tests {
         assert!(!s.enqueue(id, vec![0u8; 64]));
         assert!(s.connections.get(&id).unwrap().closing);
         assert!(!s.send_queues.contains_key(&id));
+        assert_eq!(s.aggregate().dropped_total, 1);
+    }
+
+    #[test]
+    fn dropped_total_increments_once_per_connection() {
+        let mut s = ShadowStreamState::new(1, "x".into(), 0, 64);
+        let id = s.register_connection(0);
+        assert!(!s.enqueue(id, vec![0u8; 128]));
+        // Second overflow on the now-closing slot must not double-count.
+        assert!(!s.enqueue(id, vec![0u8; 128]));
+        assert_eq!(s.aggregate().dropped_total, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

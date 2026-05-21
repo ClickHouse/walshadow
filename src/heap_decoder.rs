@@ -80,10 +80,16 @@
 //! xact state; it stamps every output with `xid` so Phase 6's buffer
 //! can key on it.
 
+use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 use wal_rs::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
+
+/// Per-record decode output. SmallVec sized at 1 keeps the
+/// INSERT/UPDATE/DELETE single-row path stack-allocated; only
+/// MULTI_INSERT with ntuples > 1 spills to heap.
+pub type DecodedHeaps = SmallVec<[DecodedHeap; 1]>;
 
 /// `SizeOfHeapHeader` from PG `heapam_xlog.h`.
 pub const SIZE_OF_HEAP_HEADER: usize = 5;
@@ -104,6 +110,7 @@ pub const XLOG_HEAP_OPMASK: u8 = 0x70;
 pub const XLOG_HEAP_INSERT: u8 = 0x00;
 pub const XLOG_HEAP_DELETE: u8 = 0x10;
 pub const XLOG_HEAP_UPDATE: u8 = 0x20;
+pub const XLOG_HEAP_TRUNCATE: u8 = 0x30;
 pub const XLOG_HEAP_HOT_UPDATE: u8 = 0x40;
 pub const XLOG_HEAP_LOCK: u8 = 0x60;
 pub const XLOG_HEAP_INPLACE: u8 = 0x70;
@@ -293,6 +300,12 @@ pub enum HeapOp {
     /// drill but not for CH emission today.
     HotUpdate,
     Delete,
+    /// `XLOG_HEAP_TRUNCATE` — relation-wide deletion. Carries no
+    /// tuple payload (`new = None`, `old = None`); the rfn + xid +
+    /// source_lsn locate the affected relation. PG emits one record
+    /// per relid in the truncated set; walshadow fans out one
+    /// `DecodedHeap` per relid before this op reaches the buffer.
+    Truncate,
 }
 
 /// One drained tuple, fully reassembled. Phase 7's CH emitter consumes
@@ -332,14 +345,17 @@ pub struct DecodedTuple {
 
 /// Top-level decode entry point. Returns:
 ///
-/// - `Ok(Some(DecodedHeap))` for INSERT / UPDATE / HOT_UPDATE / DELETE
-///   on this `RelDescriptor`.
-/// - `Ok(None)` for ops with no tuple payload to emit
-///   (LOCK, INPLACE, TRUNCATE, MULTI_INSERT, every `RM_HEAP2_ID`
-///   except MULTI_INSERT, every record on a non-User relation).
-///   Callers count these for metrics but don't ship them.
-/// - `Err` only on malformed bytes — Phase 5 contract is silent skip
-///   beats noisy failure for unrecognised op codes, but malformed
+/// - One-element [`DecodedHeaps`] for INSERT / UPDATE / HOT_UPDATE /
+///   DELETE on this `RelDescriptor`.
+/// - N-element [`DecodedHeaps`] for `XLOG_HEAP2_MULTI_INSERT`, one
+///   per tuple.
+/// - Empty [`DecodedHeaps`] for ops with no tuple payload to emit
+///   (LOCK, INPLACE, TRUNCATE, every other `RM_HEAP2_ID` op,
+///   every record on a non-User relation, MULTI_INSERT lacking
+///   `XLH_INSERT_CONTAINS_NEW_TUPLE`). Callers count these for
+///   metrics but don't ship them.
+/// - `Err` only on malformed bytes — contract is silent skip beats
+///   noisy failure for unrecognised op codes, but malformed
 ///   `xl_heap_header` / block data short reads still surface.
 ///
 /// `rel` must describe the relation that `record.blocks[0].header.location.rel`
@@ -349,10 +365,10 @@ pub fn decode_heap_record(
     record: &XLogRecord,
     source_lsn: u64,
     rel: &RelDescriptor,
-) -> Result<Option<DecodedHeap>, DecodeError> {
+) -> Result<DecodedHeaps, DecodeError> {
     let rm = record.header.resource_manager_id;
     if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
-        return Ok(None);
+        return Ok(SmallVec::new());
     }
     let info_op = record.header.info & XLOG_HEAP_OPMASK;
     let rfn = record
@@ -364,20 +380,150 @@ pub fn decode_heap_record(
 
     if rm == RmId::Heap as u8 {
         match info_op {
-            XLOG_HEAP_INSERT => decode_insert(record, source_lsn, rfn, xid, rel).map(Some),
-            XLOG_HEAP_UPDATE => decode_update(record, source_lsn, rfn, xid, rel, false).map(Some),
-            XLOG_HEAP_HOT_UPDATE => {
-                decode_update(record, source_lsn, rfn, xid, rel, true).map(Some)
-            }
-            XLOG_HEAP_DELETE => decode_delete(record, source_lsn, rfn, xid, rel).map(Some),
+            XLOG_HEAP_INSERT => Ok(smallvec![decode_insert(record, source_lsn, rfn, xid, rel)?]),
+            XLOG_HEAP_UPDATE => Ok(smallvec![decode_update(
+                record, source_lsn, rfn, xid, rel, false,
+            )?]),
+            XLOG_HEAP_HOT_UPDATE => Ok(smallvec![decode_update(
+                record, source_lsn, rfn, xid, rel, true,
+            )?]),
+            XLOG_HEAP_DELETE => Ok(smallvec![
+                decode_delete(record, source_lsn, rfn, xid, rel,)?
+            ]),
             // LOCK / INPLACE / CONFIRM / TRUNCATE / out-of-band: skip silently.
-            _ => Ok(None),
+            _ => Ok(SmallVec::new()),
         }
     } else {
-        // RmId::Heap2 — multi-insert covered by Phase 6 (xact buffer
-        // needs to fan out per-tuple offsets). Phase 5 skips silently.
-        Ok(None)
+        match info_op {
+            XLOG_HEAP2_MULTI_INSERT => decode_multi_insert(record, source_lsn, rfn, xid, rel),
+            _ => Ok(SmallVec::new()),
+        }
     }
+}
+
+/// `xl_heap_multi_insert` per-record header size.
+/// PG `SizeOfHeapMultiInsert = offsetof(xl_heap_multi_insert, offsets) = 4`:
+/// `flags:u8 + pad:u8 + ntuples:u16`. The 1-byte pad sits between flags
+/// and ntuples so the u16 lands on a 2-byte boundary.
+pub const SIZE_OF_HEAP_MULTI_INSERT: usize = 4;
+/// `xl_multi_insert_tuple` on-wire size (`datalen:u16 + t_infomask2:u16 +
+/// t_infomask:u16 + t_hoff:u8`). PG `SizeOfMultiInsertTuple` from
+/// `heapam_xlog.h`.
+pub const SIZE_OF_MULTI_INSERT_TUPLE: usize = 7;
+
+/// `XLOG_HEAP_INIT_PAGE` is layered on top of the op nibble. When set,
+/// the writer omits the offset array (tuples land at sequential
+/// `FirstOffsetNumber + i`). See PG `heapam.c::heap_multi_insert` line
+/// ≈ 2607.
+pub const XLOG_HEAP_INIT_PAGE: u8 = 0x80;
+
+fn decode_multi_insert(
+    record: &XLogRecord,
+    source_lsn: u64,
+    rfn: RelFileNode,
+    xid: u32,
+    rel: &RelDescriptor,
+) -> Result<DecodedHeaps, DecodeError> {
+    let md = &record.main_data;
+    if md.len() < SIZE_OF_HEAP_MULTI_INSERT {
+        return Err(DecodeError::Truncated {
+            offset: 0,
+            need: SIZE_OF_HEAP_MULTI_INSERT,
+            have: md.len(),
+        });
+    }
+    let flags = md[0];
+    // md[1] is the pad byte (PG inserts it to 2-byte-align ntuples).
+    let ntuples = u16::from_le_bytes([md[2], md[3]]) as usize;
+    if ntuples == 0 {
+        // Empty MULTI_INSERT is malformed per PG's assert path; bail
+        // loudly so a corrupt stream surfaces.
+        return Err(DecodeError::Truncated {
+            offset: 0,
+            need: 1,
+            have: 0,
+        });
+    }
+    // No CONTAINS_NEW_TUPLE: writer ran without wal_level=logical (or
+    // a similar gate stripped the tuple bytes from block 0). Without
+    // tuple data we'd synthesize empty rows; skip the whole record.
+    // PG sets this flag whenever logical decoding needs the payload —
+    // walshadow's hard floor is `wal_level=logical`, so the gate is
+    // a paranoia check rather than the common path.
+    if flags & XLH_INSERT_CONTAINS_NEW_TUPLE == 0 {
+        return Ok(SmallVec::new());
+    }
+    let init_page = record.header.info & XLOG_HEAP_INIT_PAGE != 0;
+    // When not init_page, main_data continues with offsets[ntuples] of
+    // u16 each. We don't need the offset values themselves — block 0's
+    // data carries tuples in order — but the length check ensures the
+    // record is well-formed.
+    let expected_md_min = if init_page {
+        SIZE_OF_HEAP_MULTI_INSERT
+    } else {
+        SIZE_OF_HEAP_MULTI_INSERT + ntuples * 2
+    };
+    if md.len() < expected_md_min {
+        return Err(DecodeError::Truncated {
+            offset: SIZE_OF_HEAP_MULTI_INSERT,
+            need: expected_md_min,
+            have: md.len(),
+        });
+    }
+
+    let block = match record.blocks.first() {
+        Some(b) => b,
+        None => return Ok(SmallVec::new()),
+    };
+    let data = &block.data;
+    let mut cursor = 0usize;
+    let mut out: DecodedHeaps = SmallVec::with_capacity(ntuples);
+    for _ in 0..ntuples {
+        // Each xl_multi_insert_tuple is SHORTALIGN'd (2-byte) at write
+        // time. PG `heap_xlog_multi_insert` line ≈ 621.
+        cursor = align_up(cursor, 2);
+        if data.len() < cursor + SIZE_OF_MULTI_INSERT_TUPLE {
+            return Err(DecodeError::Truncated {
+                offset: cursor,
+                need: SIZE_OF_MULTI_INSERT_TUPLE,
+                have: data.len().saturating_sub(cursor),
+            });
+        }
+        let datalen = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
+        let t_infomask2 = u16::from_le_bytes([data[cursor + 2], data[cursor + 3]]);
+        let t_infomask = u16::from_le_bytes([data[cursor + 4], data[cursor + 5]]);
+        let t_hoff = data[cursor + 6];
+        cursor += SIZE_OF_MULTI_INSERT_TUPLE;
+        if data.len() < cursor + datalen {
+            return Err(DecodeError::Truncated {
+                offset: cursor,
+                need: datalen,
+                have: data.len().saturating_sub(cursor),
+            });
+        }
+        // Reshape into the `xl_heap_header + bitmap + col data` layout
+        // `decode_tuple_payload` expects: PG strips the 5-byte
+        // xl_heap_header at write time for multi-insert and stores
+        // (t_infomask2, t_infomask, t_hoff) on the per-tuple
+        // xl_multi_insert_tuple instead. Re-synthesize the 5 bytes,
+        // then append the tuple body (bitmap+pad+col data).
+        let mut synth = Vec::with_capacity(SIZE_OF_HEAP_HEADER + datalen);
+        synth.extend_from_slice(&t_infomask2.to_le_bytes());
+        synth.extend_from_slice(&t_infomask.to_le_bytes());
+        synth.push(t_hoff);
+        synth.extend_from_slice(&data[cursor..cursor + datalen]);
+        cursor += datalen;
+        let tup = decode_tuple_payload(&synth, 0, rel, 0, 0)?;
+        out.push(DecodedHeap {
+            rfn,
+            xid,
+            source_lsn,
+            op: HeapOp::Insert,
+            new: Some(tup),
+            old: None,
+        });
+    }
+    Ok(out)
 }
 
 fn decode_insert(
@@ -623,9 +769,11 @@ fn decode_tuple_payload(
         if idx >= natts {
             // Writer's natts is smaller than catalog natts: trailing
             // columns added via `ALTER TABLE ADD COLUMN` since the WAL
-            // record was written. Per PG "missing column" rules they
-            // surface as default/NULL on read.
-            columns.push(Some(ColumnValue::Null));
+            // record was written. PG's `getmissingattr` (heaptuple.c)
+            // substitutes `attmissingval[1]` for fast-path defaults;
+            // mirror by surfacing the catalog's pre-decoded missing
+            // value when present, NULL otherwise.
+            columns.push(Some(missing_value_for(att)));
             continue;
         }
         if has_null && !bitmap_is_set(bitmap, idx) {
@@ -725,6 +873,61 @@ fn decode_tuple_payload(
         columns,
         partial: false,
     })
+}
+
+/// Resolve `RelAttr::missing_text` (PG `attmissingval[1]::text`) to a
+/// `ColumnValue` via the Tier 1/2 type matrix. Falls back to
+/// `PgPending` for Tier 3, which the oracle resolves at emit time.
+/// Returns `ColumnValue::Null` when the attribute has no missing
+/// default (the common case).
+pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
+    let Some(text) = att.missing_text.as_deref() else {
+        return ColumnValue::Null;
+    };
+    match att.type_oid {
+        BOOLOID => match text {
+            "t" | "true" | "yes" | "on" | "1" => ColumnValue::Bool(true),
+            _ => ColumnValue::Bool(false),
+        },
+        CHAROID => text
+            .as_bytes()
+            .first()
+            .map(|b| ColumnValue::Char(*b as i8))
+            .unwrap_or(ColumnValue::Null),
+        INT2OID => text
+            .parse::<i16>()
+            .map(ColumnValue::Int2)
+            .unwrap_or(ColumnValue::Null),
+        INT4OID => text
+            .parse::<i32>()
+            .map(ColumnValue::Int4)
+            .unwrap_or(ColumnValue::Null),
+        INT8OID => text
+            .parse::<i64>()
+            .map(ColumnValue::Int8)
+            .unwrap_or(ColumnValue::Null),
+        FLOAT4OID => text
+            .parse::<f32>()
+            .map(ColumnValue::Float4)
+            .unwrap_or(ColumnValue::Null),
+        FLOAT8OID => text
+            .parse::<f64>()
+            .map(ColumnValue::Float8)
+            .unwrap_or(ColumnValue::Null),
+        OIDOID => text
+            .parse::<u32>()
+            .map(ColumnValue::Oid)
+            .unwrap_or(ColumnValue::Null),
+        TEXTOID | VARCHAROID | BPCHAROID | NAMEOID => ColumnValue::Text(text.to_owned()),
+        JSONOID => ColumnValue::Json(text.to_owned()),
+        // Tier 3 / everything else: round-trip through oracle.
+        // typoutput text form is the input PG's typinput expects, so
+        // shadow can recover bytea via `text -> oid -> typinput -> typsend`.
+        _ => ColumnValue::PgPending {
+            type_oid: att.type_oid,
+            raw: text.as_bytes().to_vec(),
+        },
+    }
 }
 
 /// Byte width to attribute to a column for cursor accounting when we
@@ -1149,6 +1352,7 @@ mod tests {
             type_len,
             type_align,
             type_storage: 'p',
+            missing_text: None,
         }
     }
 
@@ -1237,7 +1441,7 @@ mod tests {
         let payload = build_tuple_payload(2, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
-        let out = decode_heap_record(&rec, 0x1000, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0x1000, &rel).unwrap().remove(0);
         assert_eq!(out.op, HeapOp::Insert);
         assert_eq!(out.xid, 42);
         let new = out.new.unwrap();
@@ -1269,7 +1473,7 @@ mod tests {
         let payload = build_tuple_payload(2, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         assert_eq!(new.columns[0], Some(ColumnValue::Bool(true)));
         assert_eq!(new.columns[1], Some(ColumnValue::Text("hi".into())));
@@ -1290,7 +1494,7 @@ mod tests {
         let payload = build_tuple_payload(1, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         assert_eq!(new.columns[0], Some(ColumnValue::Text("hi".into())));
     }
@@ -1318,7 +1522,7 @@ mod tests {
         payload.extend_from_slice(&300i32.to_le_bytes());
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         assert_eq!(new.columns.len(), 3);
         assert_eq!(new.columns[0], Some(ColumnValue::Int4(100)));
@@ -1338,7 +1542,7 @@ mod tests {
         main_data.push(0); // bitmap pad
         main_data.extend_from_slice(&7777i32.to_le_bytes());
         let rec = record_with(RmId::Heap, XLOG_HEAP_DELETE, main_data, Vec::new());
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         assert_eq!(out.op, HeapOp::Delete);
         let old = out.old.unwrap();
         assert_eq!(old.columns[0], Some(ColumnValue::Int4(7777)));
@@ -1365,7 +1569,7 @@ mod tests {
         let mut main_data = vec![0u8; SIZE_OF_HEAP_UPDATE];
         main_data[7] = XLH_UPDATE_PREFIX_FROM_OLD; // flags
         let rec = record_with(RmId::Heap, XLOG_HEAP_UPDATE, main_data, block_data);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         assert_eq!(out.op, HeapOp::Update);
         let new = out.new.unwrap();
         assert!(new.partial, "prefix-compressed UPDATE flagged partial");
@@ -1386,7 +1590,7 @@ mod tests {
         block_data.extend_from_slice(&55i32.to_le_bytes());
         let main_data = vec![0u8; SIZE_OF_HEAP_UPDATE]; // flags=0
         let rec = record_with(RmId::Heap, XLOG_HEAP_HOT_UPDATE, main_data, block_data);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         assert_eq!(out.op, HeapOp::HotUpdate);
         assert!(out.old.is_none());
         let new = out.new.unwrap();
@@ -1404,7 +1608,7 @@ mod tests {
         let payload = build_tuple_payload(2, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         assert_eq!(new.columns[0], Some(ColumnValue::Null));
         assert_eq!(new.columns[1], Some(ColumnValue::Int4(8888)));
@@ -1416,16 +1620,18 @@ mod tests {
         for op in [XLOG_HEAP_LOCK, XLOG_HEAP_INPLACE, 0x30] {
             let rec = record_with(RmId::Heap, op, Vec::new(), Vec::new());
             let out = decode_heap_record(&rec, 0, &rel).unwrap();
-            assert!(out.is_none(), "op {op:#x} should skip");
+            assert!(out.is_empty(), "op {op:#x} should skip");
         }
     }
 
     #[test]
-    fn decode_skips_heap2_silently() {
+    fn decode_skips_heap2_lock_updated_silently() {
+        // LOCK_UPDATED (0x60) is the canonical "skip" path on Heap2;
+        // MULTI_INSERT (0x50) now decodes — covered in its own test.
         let rel = descriptor(16394, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
-        let rec = record_with(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, Vec::new(), Vec::new());
+        let rec = record_with(RmId::Heap2, 0x60, Vec::new(), Vec::new());
         let out = decode_heap_record(&rec, 0, &rel).unwrap();
-        assert!(out.is_none(), "multi-insert is Phase 6 territory");
+        assert!(out.is_empty(), "non-multi-insert heap2 ops skip");
     }
 
     #[test]
@@ -1438,7 +1644,7 @@ mod tests {
         let payload = build_tuple_payload(1, false, 24, &uuid_bytes);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         assert_eq!(new.columns[0], Some(ColumnValue::Uuid(uuid_bytes)));
     }
@@ -1458,7 +1664,7 @@ mod tests {
         let payload = build_tuple_payload(1, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         match &new.columns[0] {
             Some(ColumnValue::ExternalToast(p)) => {
@@ -1489,7 +1695,7 @@ mod tests {
         let payload = build_tuple_payload(1, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
-        let out = decode_heap_record(&rec, 0, &rel).unwrap().unwrap();
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         match &new.columns[0] {
             Some(ColumnValue::PgPending { type_oid, raw }) => {
@@ -1498,6 +1704,185 @@ mod tests {
             }
             other => panic!("expected PgPending, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn missing_value_substitutes_when_natts_below_catalog() {
+        // Catalog has 3 columns; WAL writer's natts=2 (pre-ALTER row).
+        // Column 3 carries missing_text="7"; decode must surface 7,
+        // not NULL.
+        let mut a3 = rel_attr(3, "c", INT4OID, 4, 'i');
+        a3.missing_text = Some("7".into());
+        let rel = descriptor(
+            16500,
+            vec![
+                rel_attr(1, "id", INT4OID, 4, 'i'),
+                rel_attr(2, "payload", INT4OID, 4, 'i'),
+                a3,
+            ],
+        );
+        let mut col_data = Vec::new();
+        col_data.extend_from_slice(&100i32.to_le_bytes());
+        col_data.extend_from_slice(&200i32.to_le_bytes());
+        // natts=2: writer logged only the first two columns.
+        let payload = build_tuple_payload(2, false, 24, &col_data);
+        let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
+        let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
+        let new = out.new.unwrap();
+        assert_eq!(new.columns.len(), 3);
+        assert_eq!(new.columns[0], Some(ColumnValue::Int4(100)));
+        assert_eq!(new.columns[1], Some(ColumnValue::Int4(200)));
+        assert_eq!(new.columns[2], Some(ColumnValue::Int4(7)));
+    }
+
+    #[test]
+    fn missing_value_absent_falls_back_to_null() {
+        // Catalog natts=3, writer natts=2, column 3 has no
+        // missing_text — expect explicit NULL.
+        let rel = descriptor(
+            16501,
+            vec![
+                rel_attr(1, "id", INT4OID, 4, 'i'),
+                rel_attr(2, "payload", INT4OID, 4, 'i'),
+                rel_attr(3, "c", INT4OID, 4, 'i'),
+            ],
+        );
+        let mut col_data = Vec::new();
+        col_data.extend_from_slice(&1i32.to_le_bytes());
+        col_data.extend_from_slice(&2i32.to_le_bytes());
+        let payload = build_tuple_payload(2, false, 24, &col_data);
+        let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
+        let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
+        let new = out.new.unwrap();
+        assert_eq!(new.columns[2], Some(ColumnValue::Null));
+    }
+
+    #[test]
+    fn missing_value_physical_null_unaffected_by_default() {
+        // Physical NULL (bitmap clear) on a column that has
+        // missing_text must still surface as NULL — the missing-value
+        // substitution only applies when natts is below the catalog
+        // count, never to a column the WAL explicitly NULLed.
+        let mut a2 = rel_attr(2, "b", INT4OID, 4, 'i');
+        a2.missing_text = Some("99".into());
+        let rel = descriptor(16502, vec![rel_attr(1, "a", INT4OID, 4, 'i'), a2]);
+        let bitmap = 0b00000001u8; // bit 0 set, bit 1 clear (NULL)
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(&HEAP_HASNULL.to_le_bytes());
+        payload.push(24);
+        payload.push(bitmap);
+        payload.extend_from_slice(&55i32.to_le_bytes());
+        let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
+        let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
+        let new = out.new.unwrap();
+        assert_eq!(new.columns[0], Some(ColumnValue::Int4(55)));
+        assert_eq!(new.columns[1], Some(ColumnValue::Null));
+    }
+
+    #[test]
+    fn decode_multi_insert_three_rows() {
+        let rel = descriptor(16410, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        // main_data: flags=CONTAINS_NEW_TUPLE (0x08), pad, ntuples=3,
+        // offsets[3] = [1,2,3] (info != INIT_PAGE).
+        let mut main_data = Vec::new();
+        main_data.push(XLH_INSERT_CONTAINS_NEW_TUPLE);
+        main_data.push(0); // alignment pad before ntuples
+        main_data.extend_from_slice(&3u16.to_le_bytes());
+        for off in 1u16..=3 {
+            main_data.extend_from_slice(&off.to_le_bytes());
+        }
+        // block 0 data: 3 x (xl_multi_insert_tuple(7) + bitmap_pad(1) +
+        // int4(4)) = 12 bytes per row, no inter-tuple padding because
+        // 12 is already a multiple of 2.
+        let mut block_data = Vec::new();
+        for v in [100i32, 200, 300] {
+            // datalen = 1 bitmap_pad + 4 int4 = 5 bytes (matches
+            // tuple body after stripping the 23-byte fixed header on
+            // the writer side).
+            block_data.extend_from_slice(&5u16.to_le_bytes()); // datalen
+            block_data.extend_from_slice(&1u16.to_le_bytes()); // t_infomask2 = natts=1
+            block_data.extend_from_slice(&0u16.to_le_bytes()); // t_infomask
+            block_data.push(24); // t_hoff
+            block_data.push(0); // bitmap pad (single byte; col offset 1..5)
+            block_data.extend_from_slice(&v.to_le_bytes());
+        }
+        let rec = record_with(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, main_data, block_data);
+        let out = decode_heap_record(&rec, 0x2000, &rel).unwrap();
+        assert_eq!(out.len(), 3);
+        for (i, expected) in [100i32, 200, 300].iter().enumerate() {
+            assert_eq!(out[i].op, HeapOp::Insert);
+            assert_eq!(out[i].xid, 42);
+            assert_eq!(out[i].source_lsn, 0x2000);
+            let new = out[i].new.as_ref().unwrap();
+            assert_eq!(new.columns.len(), 1);
+            assert_eq!(new.columns[0], Some(ColumnValue::Int4(*expected)));
+        }
+    }
+
+    #[test]
+    fn decode_multi_insert_zero_ntuples_errors() {
+        let rel = descriptor(16411, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let mut main_data = Vec::new();
+        main_data.push(XLH_INSERT_CONTAINS_NEW_TUPLE);
+        main_data.push(0); // pad
+        main_data.extend_from_slice(&0u16.to_le_bytes());
+        let rec = record_with(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, main_data, Vec::new());
+        let r = decode_heap_record(&rec, 0, &rel);
+        assert!(r.is_err(), "ntuples=0 must surface as DecodeError");
+    }
+
+    #[test]
+    fn decode_multi_insert_skips_without_new_tuple_flag() {
+        let rel = descriptor(16412, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        // flags=0 (no CONTAINS_NEW_TUPLE), pad, ntuples=2 — record
+        // carries no tuple bytes; decoder must surface an empty smallvec.
+        let mut main_data = Vec::new();
+        main_data.push(0);
+        main_data.push(0); // pad
+        main_data.extend_from_slice(&2u16.to_le_bytes());
+        main_data.extend_from_slice(&1u16.to_le_bytes()); // offset[0]
+        main_data.extend_from_slice(&2u16.to_le_bytes()); // offset[1]
+        let rec = record_with(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, main_data, Vec::new());
+        let out = decode_heap_record(&rec, 0, &rel).unwrap();
+        assert!(out.is_empty(), "missing CONTAINS_NEW_TUPLE => skip");
+    }
+
+    #[test]
+    fn missing_value_for_type_matrix() {
+        let mut bool_att = rel_attr(1, "b", BOOLOID, 1, 'c');
+        bool_att.missing_text = Some("t".into());
+        assert_eq!(missing_value_for(&bool_att), ColumnValue::Bool(true));
+        bool_att.missing_text = Some("false".into());
+        assert_eq!(missing_value_for(&bool_att), ColumnValue::Bool(false));
+
+        let mut i4 = rel_attr(1, "x", INT4OID, 4, 'i');
+        i4.missing_text = Some("42".into());
+        assert_eq!(missing_value_for(&i4), ColumnValue::Int4(42));
+
+        let mut i8 = rel_attr(1, "x", INT8OID, 8, 'd');
+        i8.missing_text = Some("-9223372036854775808".into());
+        assert_eq!(missing_value_for(&i8), ColumnValue::Int8(i64::MIN));
+
+        let mut txt = rel_attr(1, "n", TEXTOID, -1, 'i');
+        txt.missing_text = Some("hello".into());
+        assert_eq!(missing_value_for(&txt), ColumnValue::Text("hello".into()));
+
+        let mut num = rel_attr(1, "n", NUMERICOID, -1, 'i');
+        num.missing_text = Some("3.14".into());
+        match missing_value_for(&num) {
+            ColumnValue::PgPending { type_oid, raw } => {
+                assert_eq!(type_oid, NUMERICOID);
+                assert_eq!(raw, b"3.14");
+            }
+            other => panic!("expected PgPending for numeric, got {other:?}"),
+        }
+
+        let none = rel_attr(1, "x", INT4OID, 4, 'i');
+        assert_eq!(missing_value_for(&none), ColumnValue::Null);
     }
 
     #[test]
