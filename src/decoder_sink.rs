@@ -14,7 +14,7 @@ use std::pin::Pin;
 use thiserror::Error;
 
 use crate::heap_decoder::{CommittedTuple, DecodeError};
-use crate::shadow_catalog::CatalogError;
+use crate::shadow_catalog::{CatalogError, SchemaEvent};
 use crate::wal_stream::SinkError;
 
 #[derive(Debug, Error)]
@@ -62,6 +62,20 @@ pub trait TupleObserver: Send {
         Box::pin(async move { Ok(commit_lsn) })
     }
 
+    /// PHASE15 §2 — schema-event dispatch. Called from
+    /// [`crate::xact_buffer::XactBuffer::commit`]'s k-way merge in
+    /// `source_lsn` order alongside `on_tuple`, so the CH DDL applicator
+    /// runs ALTER / CREATE / DROP against the dest before the next
+    /// `on_tuple` encodes a row against the post-DDL shape. Default:
+    /// no-op — observers that don't own CH (metrics, collecting test
+    /// observer) ignore schema events.
+    fn on_schema_event<'a>(
+        &'a mut self,
+        _event: &'a SchemaEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Driver-initiated tick. Mirror of [`crate::wal_stream::RecordSink::on_idle`]
     /// at the observer layer — lets the CH emitter close its
     /// hold-open INSERTs once `flush_timeout` has elapsed without any
@@ -100,6 +114,13 @@ impl<T: TupleObserver + ?Sized> TupleObserver for Box<T> {
         commit_lsn: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
         (**self).on_xact_end(commit_lsn)
+    }
+
+    fn on_schema_event<'a>(
+        &'a mut self,
+        event: &'a SchemaEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        (**self).on_schema_event(event)
     }
 
     fn on_idle<'a>(

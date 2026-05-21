@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio_postgres::types::{Oid, ToSql};
 use tokio_postgres::{Client, NoTls, Row};
 use wal_rs::pg::walparser::RelFileNode;
@@ -180,6 +181,99 @@ pub struct RelAttr {
     pub missing_text: Option<String>,
 }
 
+/// PHASE15 §1 — schema mutation surface published by [`ShadowCatalog`]
+/// to downstream consumers (the CH DDL applicator + integration tests).
+///
+/// One event per resolved descriptor change. `Added` fires the first
+/// time the catalog learns about an oid; `Changed` fires when a refetch
+/// returns a non-trivially-different shape; `Dropped` fires for
+/// relations the decoder saw heap_delete on a pg_class row for. Events
+/// flow in `ShadowCatalog` internal order (the order the fetches /
+/// drops happened); callers stamp them onto an xact-buffer position by
+/// pairing each event with the WAL record that triggered the fetch.
+#[derive(Debug, Clone)]
+pub enum SchemaEvent {
+    Added {
+        desc: Arc<RelDescriptor>,
+    },
+    Changed {
+        old: Arc<RelDescriptor>,
+        new: Arc<RelDescriptor>,
+        diff: SchemaDiff,
+    },
+    Dropped {
+        oid: Oid,
+        qualified_name: Arc<str>,
+    },
+}
+
+/// Resolved diff between two [`RelDescriptor`] snapshots for the same
+/// relation oid. Built by [`compute_schema_diff`]; emitter consumers
+/// run one CH `ALTER` per entry without re-walking attributes.
+///
+/// `type_changes` lists `(attnum, new_attr)` — old type is recoverable
+/// from `Changed.old.attributes`. PHASE15 rejects type changes via
+/// [`crate::type_bridge::BridgeError::UnsupportedType`] when emitted to
+/// CH; widening lands in a follow-up phase.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SchemaDiff {
+    pub added_columns: Vec<RelAttr>,
+    pub dropped_columns: Vec<i16>,
+    /// `(attnum, old_name, new_name)`. Renames are detected by attnum
+    /// match + name diff; PG's `RENAME COLUMN` keeps attnum intact, so
+    /// the natural case lands here without a heuristic.
+    pub renamed_columns: Vec<(i16, String, String)>,
+    pub type_changes: Vec<(i16, RelAttr)>,
+}
+
+impl SchemaDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added_columns.is_empty()
+            && self.dropped_columns.is_empty()
+            && self.renamed_columns.is_empty()
+            && self.type_changes.is_empty()
+    }
+}
+
+/// Compute the diff `old → new` for the same relation. Caller's
+/// responsibility to pass descriptors that share `oid`. Dropped
+/// attributes on either side (`attisdropped = true`) are filtered out
+/// before diffing because PG retains them in `pg_attribute` for
+/// physical-layout reasons; CH sees only live columns.
+pub fn compute_schema_diff(old: &RelDescriptor, new: &RelDescriptor) -> SchemaDiff {
+    let mut diff = SchemaDiff::default();
+    let mut old_by_num: HashMap<i16, &RelAttr> = old
+        .attributes
+        .iter()
+        .filter(|a| !a.dropped)
+        .map(|a| (a.attnum, a))
+        .collect();
+    for n_att in new.attributes.iter().filter(|a| !a.dropped) {
+        match old_by_num.remove(&n_att.attnum) {
+            None => diff.added_columns.push(n_att.clone()),
+            Some(o_att) => {
+                if o_att.name != n_att.name {
+                    diff.renamed_columns.push((
+                        n_att.attnum,
+                        o_att.name.clone(),
+                        n_att.name.clone(),
+                    ));
+                }
+                if o_att.type_oid != n_att.type_oid
+                    || o_att.typmod != n_att.typmod
+                    || o_att.not_null != n_att.not_null
+                {
+                    diff.type_changes.push((n_att.attnum, n_att.clone()));
+                }
+            }
+        }
+    }
+    let mut dropped: Vec<i16> = old_by_num.into_keys().collect();
+    dropped.sort_unstable();
+    diff.dropped_columns = dropped;
+    diff
+}
+
 /// Tunables for the cache; defaults match the Phase 4 daemon's
 /// human-cadence access pattern.
 #[derive(Debug, Clone)]
@@ -281,6 +375,13 @@ pub struct ShadowCatalog {
     generation: u64,
     by_filenode: HashMap<RelFileNode, CacheEntry>,
     by_oid: HashMap<Oid, CacheEntry>,
+    /// PHASE15 §1 — last-seen descriptor per oid, retained across
+    /// generation bumps. `by_filenode` / `by_oid` get logically
+    /// invalidated by generation but the entries stay; `prev_known`
+    /// is the source of truth for "what shape did the consumer last
+    /// know about this oid?" which `compute_schema_diff` consults.
+    /// Holds an `Arc` so descriptor clones stay cheap.
+    prev_known: HashMap<Oid, Arc<RelDescriptor>>,
     eviction: EvictionIndex,
     last_replay_lsn: Option<u64>,
     /// Shared with the upstream [`CatalogTracker`](crate
@@ -292,6 +393,26 @@ pub struct ShadowCatalog {
     /// `invalidation_epoch` on each lookup; updated to the loaded
     /// value after invalidation runs.
     last_seen_epoch: u64,
+    /// PHASE15 §1 schema-event sink. Set by [`Self::subscribe`]; every
+    /// descriptor fetch that resolves to a new oid or a diff against
+    /// the previously-known shape pushes one [`SchemaEvent`] here.
+    /// `None` keeps the producer side a no-op (standalone catalog,
+    /// pre-DDL-applicator tests).
+    event_tx: Option<mpsc::UnboundedSender<SchemaEvent>>,
+    /// PHASE15 §6 — last `generation` value [`Self::sweep_dropped`]
+    /// processed. Throttle marker so high-frequency commit-boundary
+    /// callers (pgbench-rate workloads) skip the sweep's SQL round-
+    /// trip when no DDL has fired since the prior sweep.
+    last_swept_generation: u64,
+    /// PHASE15 §6 — narrower than [`Self::invalidation_epoch`]: bumps
+    /// only on pg_class `heap_delete` records. Catalog tracker
+    /// publishes via `set_pg_class_delete_epoch`; [`Self::sweep_dropped`]
+    /// gates off this counter so ADD COLUMN / CREATE INDEX etc. don't
+    /// drive per-commit shadow PG sweeps in pgbench-rate workloads.
+    pg_class_delete_epoch: Option<Arc<AtomicU64>>,
+    /// Last `pg_class_delete_epoch` value already swept. Same shape as
+    /// `last_seen_epoch` but for the narrower counter.
+    last_seen_delete_epoch: u64,
     stats: ShadowCatalogStats,
 }
 
@@ -317,12 +438,187 @@ impl ShadowCatalog {
             generation: 0,
             by_filenode: HashMap::new(),
             by_oid: HashMap::new(),
+            prev_known: HashMap::new(),
             eviction: EvictionIndex::default(),
             last_replay_lsn: None,
             invalidation_epoch: None,
             last_seen_epoch: 0,
+            event_tx: None,
+            last_swept_generation: 0,
+            pg_class_delete_epoch: None,
+            last_seen_delete_epoch: 0,
             stats: ShadowCatalogStats::default(),
         })
+    }
+
+    /// PHASE15 §6 — install the DROP-only epoch counter. Pair with
+    /// [`crate::catalog_tracker::CatalogTracker::set_pg_class_delete_epoch`].
+    pub fn set_pg_class_delete_epoch(&mut self, epoch: Arc<AtomicU64>) {
+        self.last_seen_delete_epoch = epoch.load(Ordering::Acquire);
+        self.pg_class_delete_epoch = Some(epoch);
+    }
+
+    /// PHASE15 §1 — install the schema-event sink. Returns the matching
+    /// `Receiver` so the caller (typically the worker task owning
+    /// [`crate::xact_buffer::BufferingDecoderSink`]) can drain events
+    /// as the catalog discovers descriptor shapes. Subsequent
+    /// `subscribe` calls overwrite the prior sink — only one
+    /// subscriber is supported by design.
+    pub fn subscribe(&mut self) -> mpsc::UnboundedReceiver<SchemaEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.event_tx = Some(tx);
+        rx
+    }
+
+    /// PHASE15 §5 — bootstrap-time fan-out. Resolves every relation
+    /// in the named source namespaces and emits one `Added` event per
+    /// relation that the catalog hadn't seen before. Idempotent across
+    /// daemon restarts because the applicator's `CREATE TABLE IF NOT
+    /// EXISTS` ack-skips a second run.
+    ///
+    /// Caller passes the list of namespace names that have
+    /// `auto_create = true`; relations in other namespaces stay
+    /// undisclosed until the decoder fetches them on first WAL touch.
+    pub async fn seed_from_source(&mut self, namespaces: &[String]) -> Result<usize> {
+        if namespaces.is_empty() {
+            return Ok(0);
+        }
+        let rows = self
+            .query_retry(
+                "SELECT c.oid::oid \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = ANY($1::text[]) \
+                   AND c.relkind IN ('r', 'p')",
+                &[&namespaces],
+            )
+            .await?;
+        let mut added = 0usize;
+        for row in rows {
+            let oid: Oid = row.get(0);
+            if self.prev_known.contains_key(&oid) {
+                continue;
+            }
+            // Fetch the descriptor through the regular path so the
+            // resulting `Added` event flows through `record_descriptor`
+            // and lands in the subscriber's mpsc queue.
+            match self.relation_by_oid(oid).await {
+                Ok(_) => added += 1,
+                Err(CatalogError::NotFoundByOid(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(added)
+    }
+
+    /// Emit a `Dropped` event for an oid the decoder observed a
+    /// pg_class `heap_delete` for. `qualified_name` is resolved from the
+    /// last-known descriptor in [`Self::prev_known`]; returns `false`
+    /// when the catalog has never seen the oid (the relation was never
+    /// queried via shadow, so CH never learned about it either —
+    /// nothing for the applicator to do).
+    pub fn emit_dropped(&mut self, oid: Oid) -> bool {
+        let Some(prev) = self.prev_known.remove(&oid) else {
+            return false;
+        };
+        self.by_oid.remove(&oid);
+        // Filenode entry can stay until the next access; cheap eviction.
+        self.send_event(SchemaEvent::Dropped {
+            oid,
+            qualified_name: prev.qualified_name.clone(),
+        });
+        true
+    }
+
+    /// PHASE15 §6 — poll-based DROP TABLE discovery.
+    ///
+    /// Polls shadow's `pg_class` for every oid currently in
+    /// [`Self::prev_known`]; any oid that no longer exists in shadow
+    /// gets a `Dropped` event emitted (via [`Self::emit_dropped`]) and
+    /// is removed from `prev_known`. Returns the count of dropped oids
+    /// surfaced.
+    ///
+    /// The natural detection path (decoder observes pg_class
+    /// `heap_delete` for the dropped relation) doesn't fire for system
+    /// catalogs with `relreplident = 'n'` — PG doesn't include the old
+    /// tuple in WAL, so the decoder can't extract the dropped oid.
+    /// Poll-based discovery sidesteps that limitation at the cost of
+    /// one SQL round-trip per sweep.
+    ///
+    /// Throttled by `last_swept_generation`: a sweep that finds no
+    /// drops bumps the marker so subsequent calls within the same
+    /// generation no-op without hitting the SQL layer. High-frequency
+    /// commit-boundary callers (pgbench-rate workloads) thus avoid
+    /// pessimising shadow PG with one query per commit; the per-commit
+    /// cost reduces to an atomic load on the invalidation epoch.
+    pub async fn sweep_dropped(&mut self) -> Result<usize> {
+        // Fold any pending invalidations FIRST so a DDL between this
+        // sweep and the prior one bumps `generation` to a value past
+        // `last_swept_generation`.
+        self.drain_invalidations();
+        // Snapshot the DROP-only epoch BEFORE the query so any
+        // concurrent advance doesn't get swept-under by the
+        // post-query update; the next sweep would re-fire.
+        let snapshot_delete_epoch = self
+            .pg_class_delete_epoch
+            .as_ref()
+            .map(|e| e.load(Ordering::Acquire))
+            .unwrap_or(self.last_seen_delete_epoch);
+        if self.prev_known.is_empty()
+            || (self.last_swept_generation == self.generation
+                && snapshot_delete_epoch == self.last_seen_delete_epoch)
+        {
+            return Ok(0);
+        }
+        let known: Vec<Oid> = self.prev_known.keys().copied().collect();
+        let rows = self
+            .query_retry(
+                "SELECT oid::oid FROM pg_class WHERE oid = ANY($1::oid[])",
+                &[&known],
+            )
+            .await?;
+        let alive: std::collections::HashSet<Oid> = rows.iter().map(|r| r.get(0)).collect();
+        let mut emitted = 0usize;
+        for oid in known {
+            if !alive.contains(&oid) && self.emit_dropped(oid) {
+                emitted += 1;
+            }
+        }
+        self.last_swept_generation = self.generation;
+        self.last_seen_delete_epoch = snapshot_delete_epoch;
+        Ok(emitted)
+    }
+
+    fn send_event(&self, ev: SchemaEvent) {
+        if let Some(tx) = &self.event_tx {
+            // Unbounded channel: send only fails if the receiver was
+            // dropped — at daemon shutdown. Silently drop in that case.
+            let _ = tx.send(ev);
+        }
+    }
+
+    fn record_descriptor(&mut self, new: &Arc<RelDescriptor>) {
+        let oid = new.oid;
+        match self.prev_known.get(&oid).cloned() {
+            None => {
+                self.send_event(SchemaEvent::Added { desc: new.clone() });
+            }
+            Some(old) => {
+                if Arc::ptr_eq(&old, new) {
+                    // Re-insert of the exact same Arc — no shape change.
+                    return;
+                }
+                let diff = compute_schema_diff(&old, new);
+                if !diff.is_empty() {
+                    self.send_event(SchemaEvent::Changed {
+                        old,
+                        new: new.clone(),
+                        diff,
+                    });
+                }
+            }
+        }
+        self.prev_known.insert(oid, new.clone());
     }
 
     /// Install the shared epoch counter. Pass the same `Arc` clone as
@@ -350,6 +646,36 @@ impl ShadowCatalog {
     /// Current generation. Bumps every [`invalidate`] call.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// PHASE15 §6 — true when [`Self::sweep_dropped`] would do real
+    /// work (catalog tracker observed a pg_class `heap_delete` since
+    /// the last sweep AND there's something to sweep). Read-only +
+    /// cheap (one atomic load + integer compare); callers gate the
+    /// per-commit sweep on this to keep pgbench-rate workloads off
+    /// the catalog's SQL path when nothing's been dropped.
+    pub fn has_pending_sweep(&self) -> bool {
+        if self.prev_known.is_empty() {
+            return false;
+        }
+        // When the daemon hasn't wired the DROP-only counter, fall
+        // back to the conservative path (any catalog invalidation
+        // triggers a sweep). Costs an extra SQL/commit but
+        // correctness over throughput when wiring is partial.
+        let current = match &self.pg_class_delete_epoch {
+            Some(e) => e.load(Ordering::Acquire),
+            None => {
+                // Conservative fallback path.
+                let inv = self
+                    .invalidation_epoch
+                    .as_ref()
+                    .map(|e| e.load(Ordering::Acquire))
+                    .unwrap_or(self.last_seen_epoch);
+                return inv != self.last_seen_epoch
+                    || self.last_swept_generation != self.generation;
+            }
+        };
+        current != self.last_seen_delete_epoch
     }
 
     pub fn stats(&self) -> &ShadowCatalogStats {
@@ -576,6 +902,9 @@ impl ShadowCatalog {
             },
         );
         self.by_oid.insert(arc.oid, entry);
+        // PHASE15 §1: emit Added/Changed against the previously-known
+        // descriptor (kept in `prev_known` across generation bumps).
+        self.record_descriptor(&arc);
         self.evict_if_over_cap();
         arc
     }
@@ -1038,6 +1367,127 @@ mod tests {
         .await;
         assert_eq!(r.unwrap(), 7);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn mk_attr(attnum: i16, name: &str, oid: Oid, not_null: bool) -> RelAttr {
+        RelAttr {
+            attnum,
+            name: name.into(),
+            type_oid: oid,
+            typmod: -1,
+            not_null,
+            dropped: false,
+            type_name: "test".into(),
+            type_byval: true,
+            type_len: 4,
+            type_align: 'i',
+            type_storage: 'p',
+            missing_text: None,
+        }
+    }
+
+    fn mk_desc(oid: Oid, attrs: Vec<RelAttr>) -> RelDescriptor {
+        RelDescriptor {
+            rfn: rfn(oid),
+            oid,
+            namespace_oid: 2200,
+            namespace_name: "public".into(),
+            name: format!("t{oid}"),
+            qualified_name: RelDescriptor::build_qualified_name("public", &format!("t{oid}")),
+            kind: 'r',
+            persistence: 'p',
+            replident: ReplIdent::Default { pk_attnums: None },
+            attributes: attrs,
+        }
+    }
+
+    #[test]
+    fn schema_diff_detects_added_columns() {
+        let old = mk_desc(16400, vec![mk_attr(1, "id", 23, true)]);
+        let new = mk_desc(
+            16400,
+            vec![mk_attr(1, "id", 23, true), mk_attr(2, "name", 25, false)],
+        );
+        let d = compute_schema_diff(&old, &new);
+        assert_eq!(d.added_columns.len(), 1);
+        assert_eq!(d.added_columns[0].attnum, 2);
+        assert!(d.dropped_columns.is_empty());
+        assert!(d.renamed_columns.is_empty());
+        assert!(d.type_changes.is_empty());
+    }
+
+    #[test]
+    fn schema_diff_detects_dropped_columns() {
+        let old = mk_desc(
+            16400,
+            vec![mk_attr(1, "id", 23, true), mk_attr(2, "name", 25, false)],
+        );
+        let new = mk_desc(16400, vec![mk_attr(1, "id", 23, true)]);
+        let d = compute_schema_diff(&old, &new);
+        assert_eq!(d.dropped_columns, vec![2]);
+        assert!(d.added_columns.is_empty());
+    }
+
+    #[test]
+    fn schema_diff_detects_rename_at_same_attnum() {
+        let old = mk_desc(
+            16400,
+            vec![
+                mk_attr(1, "id", 23, true),
+                mk_attr(2, "old_name", 25, false),
+            ],
+        );
+        let new = mk_desc(
+            16400,
+            vec![
+                mk_attr(1, "id", 23, true),
+                mk_attr(2, "new_name", 25, false),
+            ],
+        );
+        let d = compute_schema_diff(&old, &new);
+        assert_eq!(
+            d.renamed_columns,
+            vec![(2, "old_name".into(), "new_name".into())]
+        );
+        assert!(d.added_columns.is_empty());
+        assert!(d.dropped_columns.is_empty());
+        assert!(d.type_changes.is_empty());
+    }
+
+    #[test]
+    fn schema_diff_detects_type_change_at_same_attnum() {
+        let old = mk_desc(16400, vec![mk_attr(1, "c", 23, true)]); // int4
+        let new = mk_desc(16400, vec![mk_attr(1, "c", 20, true)]); // int8
+        let d = compute_schema_diff(&old, &new);
+        assert_eq!(d.type_changes.len(), 1);
+        assert_eq!(d.type_changes[0].0, 1);
+        assert_eq!(d.type_changes[0].1.type_oid, 20);
+    }
+
+    #[test]
+    fn schema_diff_skips_pg_dropped_columns_in_old() {
+        // PG retains dropped columns in pg_attribute with attisdropped=true.
+        // Diff must ignore them so DROP COLUMN doesn't re-surface as
+        // pseudo-still-present on the new side.
+        let mut a = mk_attr(2, "x", 25, false);
+        a.dropped = true;
+        let old = mk_desc(16400, vec![mk_attr(1, "id", 23, true), a]);
+        let new = mk_desc(16400, vec![mk_attr(1, "id", 23, true)]);
+        let d = compute_schema_diff(&old, &new);
+        // Already dropped on old side; nothing to fire.
+        assert!(d.dropped_columns.is_empty());
+        assert!(d.added_columns.is_empty());
+    }
+
+    #[test]
+    fn schema_diff_is_empty_when_shapes_match() {
+        let a = mk_desc(
+            16400,
+            vec![mk_attr(1, "id", 23, true), mk_attr(2, "name", 25, false)],
+        );
+        let b = a.clone();
+        let d = compute_schema_diff(&a, &b);
+        assert!(d.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -381,6 +381,13 @@ impl<O: TupleObserver + Send> TupleObserver for OracleObserver<O> {
         self.inner.on_xact_end(commit_lsn)
     }
 
+    fn on_schema_event<'a>(
+        &'a mut self,
+        event: &'a crate::shadow_catalog::SchemaEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        self.inner.on_schema_event(event)
+    }
+
     fn on_idle<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {

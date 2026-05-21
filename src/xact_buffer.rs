@@ -77,7 +77,7 @@ use crate::filter::Decision;
 use crate::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, HeapOp, ToastPointer, decode_heap_record,
 };
-use crate::shadow_catalog::{CatalogError, RelDescriptor, ShadowCatalog};
+use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent, ShadowCatalog};
 use crate::spill::{SpillEntry, SpillError, SpillStore, SpillWriter, ToastChunk};
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
@@ -496,6 +496,14 @@ struct XactState {
     /// Bytes written to spill so far. Mirrors `spill.as_ref().byte_count()`
     /// to keep the stat updater branch-free.
     spill_bytes: u64,
+    /// PHASE15 §6 — catalog events buffered with the xact, ordered
+    /// by source_lsn ASC. Not spilled (the data inside an `Added`
+    /// / `Changed` event is rich enough that a spill format would
+    /// duplicate `RelDescriptor` decoding; the practical case has at
+    /// most a handful of DDL events per xact). If memory pressure
+    /// becomes a concern, a later phase can encode the events as
+    /// SpillEntry variants and reuse the eviction path.
+    catalog_events: Vec<(u64, SchemaEvent)>,
 }
 
 impl XactState {
@@ -506,6 +514,7 @@ impl XactState {
             in_mem_bytes: 0,
             spill: None,
             spill_bytes: 0,
+            catalog_events: Vec::new(),
         }
     }
 }
@@ -612,6 +621,25 @@ impl XactBuffer {
         let first_lsn = chunk.source_lsn;
         let entry = SpillEntry::Chunk(chunk);
         self.absorb(xid, first_lsn, entry).await
+    }
+
+    /// PHASE15 §6 — buffer a [`SchemaEvent`] keyed on `xid`. Drains
+    /// alongside heap tuples + chunks at `commit` time in `source_lsn`
+    /// order, so an `Added`/`Changed` event triggered by a DDL within
+    /// the same xact lands BEFORE the heap writes that follow it.
+    /// Aborted xacts drop their events automatically with the rest of
+    /// the per-xid buffer.
+    pub fn on_schema_event(&mut self, xid: u32, source_lsn: u64, event: SchemaEvent) {
+        let is_new = !self.inflight.contains_key(&xid);
+        let st = self
+            .inflight
+            .entry(xid)
+            .or_insert_with(|| XactState::new(source_lsn));
+        st.catalog_events.push((source_lsn, event));
+        if is_new {
+            self.stats.xacts_active += 1;
+            self.stats.xacts_total += 1;
+        }
     }
 
     async fn absorb(
@@ -754,8 +782,12 @@ impl XactBuffer {
 
         // Drain spill files first (older in WAL order) per xid, then
         // tack on in-mem entries. Result: one `VecDeque<SpillEntry>` per
-        // xid already sorted by `source_lsn` ASC.
+        // xid already sorted by `source_lsn` ASC. Catalog events ride a
+        // sibling `VecDeque<(u64, SchemaEvent)>` per xid for the k-way
+        // merge below — they don't spill.
         let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
+        let mut per_xid_catalog: Vec<VecDeque<(u64, SchemaEvent)>> =
+            Vec::with_capacity(states.len());
         for mut st in states.drain(..) {
             let in_mem = std::mem::take(&mut st.in_mem);
             let mut entries: VecDeque<SpillEntry> = VecDeque::with_capacity(in_mem.len());
@@ -771,30 +803,91 @@ impl XactBuffer {
             }
             entries.extend(in_mem);
             per_xid.push(entries);
+            // Catalog events accumulate in arrival order; arrival order
+            // matches WAL order because the decoder sink pushes
+            // immediately on observe, so we can treat the Vec as already
+            // sorted ASC by source_lsn.
+            let cat: VecDeque<(u64, SchemaEvent)> = std::mem::take(&mut st.catalog_events).into();
+            per_xid_catalog.push(cat);
         }
 
         // k-way merge over per_xid heads by `source_lsn` ASC. k = 1 +
         // nsubxacts, typically <= 4; linear-scan head pick beats a
-        // tournament heap at this size.
+        // tournament heap at this size. Each item routes into one of
+        // three sinks:
+        //   * Heap entries collect into `heaps` for post-pass detoast +
+        //     dispatch.
+        //   * Chunks fold into `chunks`, keyed by (toast_relid, value_id).
+        //   * Catalog events accumulate into `ordered_events` with the
+        //     heap-index they sort BEFORE, so dispatch interleaves
+        //     catalog events with tuples in source_lsn order.
         let mut heaps: Vec<DecodedHeap> = Vec::new();
         let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
+        let mut ordered_events: Vec<(usize, SchemaEvent)> = Vec::new();
         loop {
-            let mut pick: Option<(usize, u64)> = None;
+            #[derive(Clone, Copy)]
+            enum Pick {
+                Spill(usize, u64),
+                Catalog(usize, u64),
+            }
+            let mut best: Option<Pick> = None;
+            let best_lsn = |p: Pick| match p {
+                Pick::Spill(_, l) | Pick::Catalog(_, l) => l,
+            };
+            // Pick catalog events FIRST at any tie: PG always writes
+            // the DDL's catalog mutation BEFORE the heap write that
+            // depends on it. When [`BufferingDecoderSink`] stamps a
+            // schema event with the triggering heap's source_lsn (the
+            // catalog refetch is lazy), the two share an LSN; tie-
+            // break catalog first so the applicator's `ALTER` lands
+            // on CH before the dependent INSERT encodes against the
+            // post-DDL shape.
+            for (i, q) in per_xid_catalog.iter().enumerate() {
+                let Some(&(lsn, _)) = q.front() else {
+                    continue;
+                };
+                if best.is_none_or(|b| lsn <= best_lsn(b)) {
+                    best = Some(Pick::Catalog(i, lsn));
+                }
+            }
             for (i, q) in per_xid.iter().enumerate() {
                 let Some(head) = q.front() else { continue };
                 let lsn = entry_lsn(head);
-                if pick.is_none_or(|(_, best)| lsn < best) {
-                    pick = Some((i, lsn));
+                if best.is_none_or(|b| lsn < best_lsn(b)) {
+                    best = Some(Pick::Spill(i, lsn));
                 }
             }
-            let Some((i, _)) = pick else {
+            let Some(pick) = best else {
                 break;
             };
-            let entry = per_xid[i].pop_front().expect("just peeked head");
-            accumulate(entry, &mut heaps, &mut chunks);
+            match pick {
+                Pick::Spill(i, _) => {
+                    let entry = per_xid[i].pop_front().expect("just peeked head");
+                    accumulate(entry, &mut heaps, &mut chunks);
+                }
+                Pick::Catalog(i, _) => {
+                    let (_lsn, ev) = per_xid_catalog[i].pop_front().expect("just peeked head");
+                    // The catalog event sorts BEFORE the heap that
+                    // follows in source_lsn order. Record the heap
+                    // index that this event sorts in front of so the
+                    // dispatch loop flushes the event first.
+                    ordered_events.push((heaps.len(), ev));
+                }
+            }
         }
 
-        for mut heap in heaps {
+        let mut event_cursor = 0usize;
+        for (heap_idx, mut heap) in heaps.into_iter().enumerate() {
+            // Flush any catalog events that sort BEFORE this heap.
+            while event_cursor < ordered_events.len() && ordered_events[event_cursor].0 <= heap_idx
+            {
+                let ev = &ordered_events[event_cursor].1;
+                observer
+                    .on_schema_event(ev)
+                    .await
+                    .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+                event_cursor += 1;
+            }
             detoast_heap(&mut heap, &chunks, catalog).await?;
             let committed = CommittedTuple {
                 decoded: heap,
@@ -805,6 +898,16 @@ impl XactBuffer {
                 .on_tuple(&committed)
                 .await
                 .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+        }
+        // Flush trailing catalog events (events with no heap after them
+        // in the merge).
+        while event_cursor < ordered_events.len() {
+            let ev = &ordered_events[event_cursor].1;
+            observer
+                .on_schema_event(ev)
+                .await
+                .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+            event_cursor += 1;
         }
         // drain_lsn ticks before the on_xact_end ack so an observer
         // failure leaves drain_lsn ahead of emitter_ack_lsn — exactly
@@ -1051,6 +1154,24 @@ pub struct XactRecordSink<O: TupleObserver + Send> {
     /// to the same `MetricsTupleObserver` Phase 5 uses and Phase 7
     /// will swap for the CH emitter observer.
     observer: O,
+    /// PHASE15 §6 schema-event consumer. Same `Arc<Mutex<…>>` as the
+    /// one [`BufferingDecoderSink`] holds; this sink only drains it
+    /// post-`sweep_dropped` to route `Dropped` events into the xact
+    /// buffer.
+    schema_events: Option<SchemaEventRx>,
+    /// PHASE15 §6 — DROP-only epoch counter (shared with
+    /// `ShadowCatalog::set_pg_class_delete_epoch` +
+    /// `CatalogTracker::set_pg_class_delete_epoch`). Atomic-load on
+    /// every commit boundary so the per-commit catalog-lock acquire
+    /// is skipped when no DROP TABLE has fired. The lock is contended
+    /// with `BufferingDecoderSink::on_record`'s long-running
+    /// `wait_for_replay` calls; holding it per commit serialised the
+    /// drain pipeline behind heap-record fetches in pgbench-rate
+    /// workloads.
+    pg_class_delete_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Last `pg_class_delete_epoch` value already processed by the
+    /// sink. Bumped after a successful sweep.
+    last_seen_delete_epoch: u64,
 }
 
 impl<O: TupleObserver + Send> XactRecordSink<O> {
@@ -1064,6 +1185,9 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
             catalog,
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             observer,
+            schema_events: None,
+            pg_class_delete_epoch: None,
+            last_seen_delete_epoch: 0,
         }
     }
 
@@ -1074,12 +1198,56 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
         self
     }
 
+    /// PHASE15 §6 — share the catalog's schema-event receiver. The
+    /// sink runs [`ShadowCatalog::sweep_dropped`] at every commit
+    /// boundary; the resulting `Dropped` events land in the channel
+    /// and need to flow into the xact buffer keyed on the commit's
+    /// xid + LSN. Pass the same [`SchemaEventRx`] also handed to
+    /// [`BufferingDecoderSink::with_schema_events`].
+    pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
+        self.schema_events = Some(rx);
+        self
+    }
+
+    /// PHASE15 §6 — install the DROP-only epoch counter. Pair with
+    /// [`crate::catalog_tracker::CatalogTracker::set_pg_class_delete_epoch`]
+    /// and [`ShadowCatalog::set_pg_class_delete_epoch`]; the sink uses
+    /// this counter to decide whether [`ShadowCatalog::sweep_dropped`]
+    /// has any work without acquiring the (contended) catalog lock.
+    pub fn with_pg_class_delete_epoch(mut self, epoch: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.last_seen_delete_epoch = epoch.load(std::sync::atomic::Ordering::Acquire);
+        self.pg_class_delete_epoch = Some(epoch);
+        self
+    }
+
     pub fn observer_mut(&mut self) -> &mut O {
         &mut self.observer
     }
 
     pub fn subxact_tracker(&self) -> &Arc<Mutex<SubxactTracker>> {
         &self.subxact_tracker
+    }
+
+    /// Drain any [`SchemaEvent`]s queued by a recent
+    /// `ShadowCatalog::sweep_dropped` call (or other producer) and
+    /// route them into the xact buffer keyed on `(xid, source_lsn)`.
+    async fn route_pending_schema_events(
+        &mut self,
+        xid: u32,
+        source_lsn: u64,
+    ) -> std::result::Result<(), SinkError> {
+        let Some(rx) = self.schema_events.as_ref() else {
+            return Ok(());
+        };
+        let pending = drain_pending_schema_events(rx);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut buf = self.buffer.lock().await;
+        for ev in pending {
+            buf.on_schema_event(xid, source_lsn, ev);
+        }
+        Ok(())
     }
 }
 
@@ -1099,6 +1267,48 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
             match op {
                 XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
                     let payload = parse_xact_payload(info, &record.parsed.main_data);
+                    // PHASE15 §6 — poll-based DROP TABLE discovery at
+                    // the commit boundary. PG's system catalogs default
+                    // to `relreplident = 'n'` so heap_delete WAL records
+                    // don't carry the dying tuple's oid; the only safe
+                    // way to detect a drop is to ask shadow whether the
+                    // previously-known oids still exist. `has_pending_sweep`
+                    // gates on the narrower `pg_class_delete_epoch` so
+                    // ADD COLUMN / CREATE INDEX / VACUUM (catalog
+                    // INSERT / UPDATE flood) don't trigger the sweep —
+                    // only heap_delete on pg_class (the WAL signature
+                    // of DROP TABLE) tips this branch.
+                    if self.schema_events.is_some() {
+                        // Atomic-load gate: skip the catalog lock when
+                        // no DROP TABLE has fired since the last sweep.
+                        // The lock contends with `BufferingDecoderSink`'s
+                        // long-running `wait_for_replay` calls; holding
+                        // it per commit serialised pgbench-rate workloads
+                        // behind heap-record fetches.
+                        let current_delete_epoch = self
+                            .pg_class_delete_epoch
+                            .as_ref()
+                            .map(|e| e.load(std::sync::atomic::Ordering::Acquire))
+                            .unwrap_or(self.last_seen_delete_epoch);
+                        if current_delete_epoch != self.last_seen_delete_epoch {
+                            let mut cat = self.catalog.lock().await;
+                            if record.source_lsn > 0 {
+                                cat.wait_for_replay(record.source_lsn)
+                                    .await
+                                    .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
+                            }
+                            let dropped_count = cat
+                                .sweep_dropped()
+                                .await
+                                .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
+                            drop(cat);
+                            self.last_seen_delete_epoch = current_delete_epoch;
+                            if dropped_count > 0 {
+                                self.route_pending_schema_events(xid, record.source_lsn)
+                                    .await?;
+                            }
+                        }
+                    }
                     let mut buf = self.buffer.lock().await;
                     buf.commit(
                         xid,
@@ -1202,6 +1412,13 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
 /// `Decision::Drop` records reach this sink (catalog-keep stays on
 /// the shadow-replay path); semantic errors absorb into
 /// [`DecoderStats`] rather than poisoning the stream.
+/// Shared schema-event receiver — wraps the catalog's
+/// [`tokio::sync::mpsc::UnboundedReceiver`] behind a `std::sync::Mutex`
+/// so both [`BufferingDecoderSink`] (drain after every `relation_at`)
+/// and [`XactRecordSink`] (drain after every `sweep_dropped` at commit
+/// boundaries) can pull events out of the same queue.
+pub type SchemaEventRx = Arc<std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SchemaEvent>>>;
+
 pub struct BufferingDecoderSink {
     catalog: Arc<Mutex<ShadowCatalog>>,
     buffer: Arc<Mutex<XactBuffer>>,
@@ -1210,6 +1427,12 @@ pub struct BufferingDecoderSink {
     /// without contending on `self`. Mutations stay short — the lock
     /// is never held across `.await`.
     stats: Arc<std::sync::Mutex<DecoderStats>>,
+    /// PHASE15 §1 — schema events the catalog emits at descriptor
+    /// fetch time. Drained inline after every `relation_at` so events
+    /// land in the same xact buffer keyed on the current record's
+    /// xid + source_lsn. `None` keeps the sink schema-unaware
+    /// (greenfield bootstrap, tests).
+    schema_events: Option<SchemaEventRx>,
 }
 
 impl BufferingDecoderSink {
@@ -1218,7 +1441,20 @@ impl BufferingDecoderSink {
             catalog,
             buffer,
             stats: Arc::new(std::sync::Mutex::new(DecoderStats::default())),
+            schema_events: None,
         }
+    }
+
+    /// Attach a [`SchemaEvent`] receiver. Wrap a freshly-subscribed
+    /// [`tokio::sync::mpsc::UnboundedReceiver`] in a [`SchemaEventRx`]
+    /// (`Arc<std::sync::Mutex<…>>`) so the same handle can also be
+    /// shared with [`XactRecordSink::with_schema_events`] — PHASE15 §6
+    /// drains the channel from both sides (decoder for Added/Changed
+    /// events at fetch time, xact-record sink for Dropped events at
+    /// commit time via [`ShadowCatalog::sweep_dropped`]).
+    pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
+        self.schema_events = Some(rx);
+        self
     }
 
     /// Snapshot of the live counters. Cheap clone of the `DecoderStats`
@@ -1239,6 +1475,30 @@ impl BufferingDecoderSink {
 
     fn bump<F: FnOnce(&mut DecoderStats)>(&self, f: F) {
         f(&mut self.stats.lock().expect("decoder stats mutex poisoned"))
+    }
+
+    /// PHASE15 §1 — drain any [`SchemaEvent`]s the catalog accumulated
+    /// during the most recent fetch. Routes each into the xact buffer
+    /// stamped with the current record's `(xid, source_lsn)` so the
+    /// k-way drain in [`XactBuffer::commit`] sorts them with the heap
+    /// writes that triggered the refetch.
+    async fn drain_schema_events(
+        &mut self,
+        xid: u32,
+        source_lsn: u64,
+    ) -> std::result::Result<(), SinkError> {
+        let Some(rx) = self.schema_events.as_ref() else {
+            return Ok(());
+        };
+        let pending = drain_pending_schema_events(rx);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut buf = self.buffer.lock().await;
+        for ev in pending {
+            buf.on_schema_event(xid, source_lsn, ev);
+        }
+        Ok(())
     }
 
     /// Parse `xl_heap_truncate` main_data, resolve each relid through
@@ -1274,6 +1534,10 @@ impl BufferingDecoderSink {
                     Err(e) => return Err(DecoderSinkError::from(e).into()),
                 }
             };
+            // PHASE15 §1 — TRUNCATE may trigger an Added/Changed event
+            // if the relation was rotated since last fetch. Drain the
+            // channel inline so events land in the xact buffer.
+            self.drain_schema_events(xid, source_lsn).await?;
             // Toast / index / sequence: TRUNCATE doesn't propagate
             // (CH side has no per-table-internal toast). Filter to
             // user heap relations.
@@ -1351,6 +1615,13 @@ impl RecordSink for BufferingDecoderSink {
                     }
                 }
             };
+            // PHASE15 §1 — drain any schema events the catalog pushed
+            // during the refetch (Added on first sight, Changed on
+            // diff). Route into the xact buffer keyed on the current
+            // record's xid so they drain in WAL order with the heap
+            // writes the refetch resolves. Empty in steady state.
+            self.drain_schema_events(record.parsed.header.xact_id, record.source_lsn)
+                .await?;
             let decoded_set = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
                 Ok(set) => set,
                 Err(e) => return Err(DecoderSinkError::from(e).into()),
@@ -1380,6 +1651,19 @@ impl RecordSink for BufferingDecoderSink {
             Ok(())
         })
     }
+}
+
+/// Drain every queued [`SchemaEvent`] into a `Vec`. Caller decides
+/// where to route them (xact buffer, applicator, etc). Uses
+/// `try_recv` in a tight loop — the channel is unbounded + same-task,
+/// so no contention.
+fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent> {
+    let mut out = Vec::new();
+    let mut guard = rx.lock().expect("schema event rx mutex poisoned");
+    while let Ok(ev) = guard.try_recv() {
+        out.push(ev);
+    }
+    out
 }
 
 /// Repack a TOAST table INSERT (op=Insert, exactly 3 columns:

@@ -51,10 +51,11 @@ use clickhouse_c::{
 };
 use thiserror::Error;
 
+use crate::ch_ddl::DdlApplicator;
 use crate::decoder_sink::{DecoderSinkError, TupleObserver};
 use crate::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::relation_resolver::RelationResolver;
-use crate::shadow_catalog::{CatalogError, RelDescriptor};
+use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent};
 
 /// Microsecond offset between PG `TimestampTz` epoch (2000-01-01 UTC)
 /// and the Unix epoch. `DateTime64(6)` in ClickHouse is Unix
@@ -139,6 +140,13 @@ pub struct EmitterConfig {
     pub flush_timeout: Duration,
     /// Keyed on `"<namespace>.<relname>"` source identifier.
     pub tables: HashMap<String, TableMapping>,
+    /// PHASE15 §5 — per-source-namespace defaults. Auto-DDL flow.
+    /// Keyed on PG schema name (`"public"`, etc.); per-table entries
+    /// in `tables` still win for the relation they name.
+    pub namespaces: HashMap<String, NamespaceMapping>,
+    /// PHASE15 §6 — global `--drop-table-strategy` default. Per-namespace
+    /// override via `[namespace.<ns>] drop_table_strategy = ...`.
+    pub drop_table_strategy: String,
     /// Phase 10 bounded retry against a single CH replica. See
     /// [`RetryConfig`] for semantics.
     pub retry: RetryConfig,
@@ -178,6 +186,8 @@ impl Default for EmitterConfig {
             byte_budget: DEFAULT_BYTE_BUDGET,
             flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
             tables: HashMap::new(),
+            namespaces: HashMap::new(),
+            drop_table_strategy: "retain".into(),
             retry: RetryConfig::default(),
         }
     }
@@ -209,7 +219,7 @@ impl CompressionChoice {
         })
     }
 
-    fn to_wire(self) -> Compression {
+    pub(crate) fn to_wire(self) -> Compression {
         match self {
             Self::None => Compression::None,
             Self::Lz4 => Compression::Lz4,
@@ -254,6 +264,27 @@ impl CompressionChoice {
 pub struct TableMapping {
     pub target: String,
     pub columns: Vec<ColumnMapping>,
+}
+
+/// PHASE15 §5 — per-namespace defaults. Operator-pinned blocks shaped
+/// like:
+///
+/// ```toml
+/// [namespace."public"]
+/// target_database = "default"
+/// auto_create = true
+/// drop_table_strategy = "retain"   # one of retain / drop / warn
+/// ```
+///
+/// `auto_create = true` lets [`crate::ch_ddl::DdlApplicator`] run
+/// `CREATE TABLE IF NOT EXISTS` for relations in this namespace the
+/// first time their descriptor is observed. `target_database`
+/// overrides the global `[ch] database` for tables in this namespace.
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceMapping {
+    pub target_database: Option<String>,
+    pub auto_create: bool,
+    pub drop_table_strategy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +367,36 @@ impl EmitterConfig {
                 && let Ok(ms) = u64::try_from(v)
             {
                 out.retry.max_backoff = std::time::Duration::from_millis(ms);
+            }
+            if let Some(v) = ch.get("drop_table_strategy").and_then(Value::as_str) {
+                out.drop_table_strategy = v.into();
+            }
+        }
+        if let Some(nss) = root.get("namespace").and_then(Value::as_table) {
+            for (k, v) in nss {
+                let t = v.as_table().ok_or_else(|| {
+                    EmitterError::Config(format!("namespace.{k}: expected a table"))
+                })?;
+                let target_database = t
+                    .get("target_database")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let auto_create = t
+                    .get("auto_create")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let drop_table_strategy = t
+                    .get("drop_table_strategy")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                out.namespaces.insert(
+                    k.clone(),
+                    NamespaceMapping {
+                        target_database,
+                        auto_create,
+                        drop_table_strategy,
+                    },
+                );
             }
         }
         if let Some(tbls) = root.get("table").and_then(Value::as_table) {
@@ -1002,6 +1063,11 @@ pub struct Emitter {
     /// Monotonic; only bumped inside [`Self::close_all_open_inserts`]
     /// or when an empty/untracked xact arrives with no rows pending.
     last_durable_commit_lsn: u64,
+    /// PHASE15 §2 — CH-side DDL writer. Owns its own clickhouse-c
+    /// `Client` (separate from `self.client` so DDL doesn't interleave
+    /// with INSERT data). `None` when the emitter is wired without a
+    /// DDL applicator (tests, transitional bootstrap emitter).
+    applicator: Option<DdlApplicator>,
     pub stats: EmitterStats,
 }
 
@@ -1056,8 +1122,24 @@ impl Emitter {
             flush_deadline: None,
             pending_max_commit_lsn: 0,
             last_durable_commit_lsn: 0,
+            applicator: None,
             stats: EmitterStats::default(),
         })
+    }
+
+    /// PHASE15 §2 — attach a DDL applicator. Caller opens the
+    /// applicator's own TCP connection and passes it through
+    /// [`DdlApplicator::new`] before handing it off here. Once
+    /// attached, schema events drained from the xact buffer route
+    /// through the applicator before the next `on_tuple` encodes
+    /// rows against the post-DDL shape.
+    pub fn with_applicator(mut self, applicator: DdlApplicator) -> Self {
+        self.applicator = Some(applicator);
+        self
+    }
+
+    pub fn applicator_mut(&mut self) -> Option<&mut DdlApplicator> {
+        self.applicator.as_mut()
     }
 
     /// SIGHUP target. Daemon clones this handle at boot and feeds the
@@ -1433,6 +1515,55 @@ impl Emitter {
         }
     }
 
+    /// PHASE15 §2 — dispatch a [`SchemaEvent`] to the in-process
+    /// applicator. Closes the open INSERT for the AFFECTED relation
+    /// first (`send_data(None)` + drain → durable on CH) so the CH
+    /// ALTER doesn't race against a still-buffered INSERT against the
+    /// pre-DDL shape. Re-encoding for the post-DDL shape happens
+    /// lazily on the next `route` call — the per-relation
+    /// [`TablePlan`] is dropped from `tables` so the next row rebuilds
+    /// it off the fresh descriptor.
+    ///
+    /// Surgical close (this table only) keeps other tables' open
+    /// INSERTs intact — important for the multi-table-per-xact path
+    /// (pgbench's TPC-B writes 4 tables per xact) where closing-all
+    /// would break the cross-INSERT pipeline.
+    ///
+    /// Schema events on unmapped relations still route through the
+    /// applicator (CREATE TABLE auto-discovery for namespace-pattern
+    /// matched relations); the applicator handles the no-mapping case
+    /// internally.
+    pub async fn dispatch_schema_event(&mut self, event: &SchemaEvent) -> Result<(), EmitterError> {
+        let affected: Option<String> = match event {
+            SchemaEvent::Added { desc } => Some(desc.qualified_name.as_ref().to_owned()),
+            SchemaEvent::Changed { new, .. } => Some(new.qualified_name.as_ref().to_owned()),
+            SchemaEvent::Dropped { qualified_name, .. } => Some(qualified_name.as_ref().to_owned()),
+        };
+        if let Some(key) = affected.as_deref()
+            && let Some(enc) = self.tables.remove(key)
+        {
+            self.finish_table_owned(key, enc)?;
+        }
+        if let Some(app) = self.applicator.as_mut() {
+            app.apply(event).await?;
+        }
+        Ok(())
+    }
+
+    /// Bounded-retry wrapper around [`Self::dispatch_schema_event`].
+    /// DDL failures retry through `reconnect_applicator` (today: just
+    /// surface the error — the applicator's CH connection lives on a
+    /// separate TCP and reconnect is operator-quiesced).
+    pub async fn dispatch_schema_event_with_retry(
+        &mut self,
+        event: &SchemaEvent,
+    ) -> Result<(), EmitterError> {
+        // Currently no retry — DDL errors poison the stream so the
+        // operator sees them. PHASE16 may add bounded reconnect for the
+        // DDL connection.
+        self.dispatch_schema_event(event).await
+    }
+
     /// Wrap [`Self::on_xact_end_with_lsn`] in bounded reconnect+retry.
     /// Same shape as [`Self::route_with_retry`] — see notes there.
     pub async fn on_xact_end_with_retry(&mut self, commit_lsn: u64) -> Result<u64, EmitterError> {
@@ -1505,6 +1636,20 @@ impl TupleObserver for EmitterObserver {
         Box::pin(async move {
             self.emitter
                 .on_xact_end_with_retry(commit_lsn)
+                .await
+                .map_err(DecoderSinkError::from)
+        })
+    }
+
+    fn on_schema_event<'a>(
+        &'a mut self,
+        event: &'a SchemaEvent,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.emitter
+                .dispatch_schema_event_with_retry(event)
                 .await
                 .map_err(DecoderSinkError::from)
         })

@@ -75,6 +75,13 @@ pub struct CatalogTracker {
     /// invalidates its cache before the cache check. Senderless
     /// trackers leave this `None`.
     invalidation_epoch: Option<Arc<AtomicU64>>,
+    /// PHASE15 §6 — narrower signal: bumps ONLY on pg_class
+    /// heap_delete records (the WAL shape that DROP TABLE writes).
+    /// Lets [`ShadowCatalog::sweep_dropped`] throttle off this
+    /// counter so non-drop DDL (ADD COLUMN, CREATE INDEX, ...) doesn't
+    /// trigger a per-commit shadow PG round-trip. Senderless trackers
+    /// leave this `None`.
+    pg_class_delete_epoch: Option<Arc<AtomicU64>>,
     /// Count of relmap updates observed (debug / metrics).
     pub relmap_updates: u64,
     /// pg_class heap writes whose payload failed `pg_class_decoder`
@@ -131,10 +138,25 @@ impl CatalogTracker {
         self.invalidation_epoch = Some(epoch);
     }
 
+    /// PHASE15 §6 — attach the DROP-only counter. Bumped only on
+    /// pg_class `heap_delete` records (the DDL shape that flags an
+    /// oid as gone). [`ShadowCatalog::sweep_dropped`] gates off this
+    /// counter to skip per-commit shadow round-trips for non-drop
+    /// DDL.
+    pub fn set_pg_class_delete_epoch(&mut self, epoch: Arc<AtomicU64>) {
+        self.pg_class_delete_epoch = Some(epoch);
+    }
+
     fn signal_invalidation(&mut self) {
         if let Some(e) = &self.invalidation_epoch {
             e.fetch_add(1, Ordering::Release);
             self.invalidation_signals_sent += 1;
+        }
+    }
+
+    fn signal_pg_class_delete(&mut self) {
+        if let Some(e) = &self.pg_class_delete_epoch {
+            e.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -170,7 +192,42 @@ impl CatalogTracker {
         let heap2_new_tuple = rm == RmId::Heap2 as u8 && info_carries_new_tuple_heap2(info_high);
         if heap_new_tuple || heap2_new_tuple {
             self.harvest_pg_class_blocks(record);
+            return;
         }
+        // PHASE15 §6 — DROP TABLE writes `heap_delete` against
+        // pg_class, which the (insert/update-only) harvest path
+        // skips. Bump the invalidation epoch anyway so the catalog
+        // cache invalidates + downstream `sweep_dropped` runs on the
+        // next commit boundary. We don't try to decode the dying
+        // tuple's OID — system catalogs default to
+        // `relreplident = 'n'` so the WAL doesn't carry it.
+        if rm == RmId::Heap as u8 {
+            let info_op = info_high & 0x70;
+            if info_op == 0x10 {
+                // HEAP_DELETE
+                self.signal_pg_class_touch(record);
+            }
+        }
+    }
+
+    /// Bump the invalidation epoch when a record targets the current
+    /// pg_class filenode. Used for ops the harvest path skips
+    /// (DELETE / etc.) — coarse-fire only, no row-level decode. Also
+    /// bumps the narrower `pg_class_delete_epoch` so the catalog's
+    /// DROP-TABLE sweep can throttle off the delete-specific signal.
+    fn signal_pg_class_touch(&mut self, record: &XLogRecord) {
+        let Some(blk) = record.blocks.first() else {
+            return;
+        };
+        let (db, rel) = (
+            blk.header.location.rel.db_node,
+            blk.header.location.rel.rel_node,
+        );
+        if !self.is_pg_class_relfilenode(db, rel) {
+            return;
+        }
+        self.signal_invalidation();
+        self.signal_pg_class_delete();
     }
 
     /// Decode the new-tuple block (block 0) of `record` when it targets

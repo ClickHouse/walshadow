@@ -640,10 +640,20 @@ async fn run(args: Args) -> Result<()> {
         .filter_mut()
         .tracker
         .set_invalidation_epoch(invalidation_epoch.clone());
-    catalog
-        .lock()
-        .await
-        .set_invalidation_epoch(invalidation_epoch);
+    // PHASE15 §6 — narrower drop-only counter so sweep_dropped
+    // throttles off pg_class heap_delete instead of every catalog
+    // touch (ADD COLUMN / CREATE INDEX flood pgbench-rate workloads
+    // otherwise).
+    let pg_class_delete_epoch = Arc::new(AtomicU64::new(0));
+    stream
+        .filter_mut()
+        .tracker
+        .set_pg_class_delete_epoch(pg_class_delete_epoch.clone());
+    {
+        let mut cat = catalog.lock().await;
+        cat.set_invalidation_epoch(invalidation_epoch);
+        cat.set_pg_class_delete_epoch(pg_class_delete_epoch.clone());
+    }
 
     // Phase 10 pre-flight validators. Run after both source + shadow
     // SQL clients are up so every check has the connection it needs;
@@ -763,10 +773,34 @@ async fn run(args: Args) -> Result<()> {
             std_tcp
                 .set_nonblocking(false)
                 .context("set CH socket to blocking for chc_posix_io")?;
-            let emitter =
-                Emitter::new(emitter_cfg, catalog.clone(), std_tcp).context("init CH emitter")?;
+            let emitter = Emitter::new(emitter_cfg.clone(), catalog.clone(), std_tcp)
+                .context("init CH emitter")?;
             mapping_handle = Some(emitter.mapping_handle());
-            tracing::info!(target: "walshadow::ch_emitter", addr = %addr, "ch emitter connected");
+            // PHASE15 §2 — second CH connection for the DDL applicator.
+            // Separate TCP so ALTER / CREATE / DROP don't ride the
+            // INSERT pump's backpressure path. Build only when the
+            // emitter is wired (no point in a DDL connection without
+            // an upstream observer).
+            let ddl_tcp = tokio::net::TcpStream::connect(&addr)
+                .await
+                .with_context(|| format!("connect CH DDL at {addr}"))?;
+            ddl_tcp.set_nodelay(true).ok();
+            let ddl_std = ddl_tcp
+                .into_std()
+                .context("tokio→std TcpStream handoff for DDL")?;
+            ddl_std
+                .set_nonblocking(false)
+                .context("set CH DDL socket to blocking for chc_posix_io")?;
+            let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_emitter(&emitter_cfg);
+            let applicator = walshadow::ch_ddl::DdlApplicator::new(
+                &emitter_cfg,
+                ddl_cfg,
+                emitter.mapping_handle(),
+                ddl_std,
+            )
+            .context("init DDL applicator")?;
+            let emitter = emitter.with_applicator(applicator);
+            tracing::info!(target: "walshadow::ch_emitter", addr = %addr, "ch emitter + DDL applicator connected");
             Box::new(EmitterObserver::new(emitter))
         }
         None => Box::new(MetricsTupleObserver::default()),
@@ -788,9 +822,17 @@ async fn run(args: Args) -> Result<()> {
     // inside the worker keeps per-rmgr counters intact: xact_drain
     // runs after decoder absorbs any heap records in the same dispatch
     // batch as the commit.
-    let decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone());
+    // PHASE15 §1 — subscribe BufferingDecoderSink + XactRecordSink to
+    // schema events the catalog publishes at descriptor-fetch time
+    // and at commit-boundary `sweep_dropped` sweeps. Shared
+    // `Arc<Mutex<…>>` so both sinks pull from the same queue.
+    let schema_events = Arc::new(std::sync::Mutex::new(catalog.lock().await.subscribe()));
+    let decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
+        .with_schema_events(schema_events.clone());
     let decoder_stats_handle = decoder.stats_handle();
-    let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer);
+    let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer)
+        .with_schema_events(schema_events)
+        .with_pg_class_delete_epoch(pg_class_delete_epoch);
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,

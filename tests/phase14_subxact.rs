@@ -175,6 +175,7 @@ async fn run_drill<F: FnOnce(&Shadow) -> std::thread::JoinHandle<()>>(
         ch_tcp_port: slot.ch_tcp,
         mappings: mapping(),
         app_name,
+        ddl: None,
     })
     .await;
 

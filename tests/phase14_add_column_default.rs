@@ -117,6 +117,7 @@ async fn phase14_add_column_default_replicates_pre_alter_default() {
         ch_tcp_port: CH_TCP_PORT,
         mappings,
         app_name: "walshadow-phase14-add-col-default",
+        ddl: None,
     })
     .await;
 

@@ -109,6 +109,7 @@ async fn phase14_truncate_removes_ch_rows() {
         ch_tcp_port: CH_TCP_PORT,
         mappings,
         app_name: "walshadow-phase14-truncate",
+        ddl: None,
     })
     .await;
 

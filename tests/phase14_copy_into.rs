@@ -108,6 +108,7 @@ async fn phase14_copy_into_multi_insert_replicates() {
         ch_tcp_port: CH_TCP_PORT,
         mappings,
         app_name: "walshadow-phase14-copy",
+        ddl: None,
     })
     .await;
 

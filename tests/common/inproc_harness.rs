@@ -30,8 +30,10 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
+use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, EmitterObserver, TableMapping,
+    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, EmitterObserver, NamespaceMapping,
+    TableMapping,
 };
 use walshadow::decoder_sink::TupleObserver;
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -443,6 +445,18 @@ pub struct BuildPipelineArgs<'a> {
     pub ch_tcp_port: u16,
     pub mappings: Vec<TableMappingSpec>,
     pub app_name: &'a str,
+    /// PHASE15 — when set, the pipeline wires a CH DDL applicator on a
+    /// second TCP connection + subscribes the decoder to the catalog's
+    /// schema-event channel. Auto-create namespaces flagged in
+    /// `namespaces` get `CREATE TABLE` on first sight; per-table
+    /// mappings still win as overrides.
+    pub ddl: Option<DdlPipelineArgs>,
+}
+
+#[derive(Default)]
+pub struct DdlPipelineArgs {
+    pub namespaces: std::collections::HashMap<String, NamespaceMapping>,
+    pub drop_table_strategy: Option<String>,
 }
 
 pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
@@ -456,6 +470,7 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
         ch_tcp_port,
         mappings,
         app_name,
+        ddl,
     } = args;
     let scfg = source.config();
     let pgcfg = PgConfig {
@@ -505,11 +520,20 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
     let catalog = Arc::new(Mutex::new(catalog));
 
     let inv_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let del_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     stream
         .filter_mut()
         .tracker
         .set_invalidation_epoch(inv_epoch.clone());
-    catalog.lock().await.set_invalidation_epoch(inv_epoch);
+    stream
+        .filter_mut()
+        .tracker
+        .set_pg_class_delete_epoch(del_epoch.clone());
+    {
+        let mut cat = catalog.lock().await;
+        cat.set_invalidation_epoch(inv_epoch);
+        cat.set_pg_class_delete_epoch(del_epoch.clone());
+    }
 
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await
@@ -540,18 +564,51 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
             },
         );
     }
+    if let Some(d) = ddl.as_ref() {
+        emitter_cfg.namespaces = d.namespaces.clone();
+        if let Some(s) = &d.drop_table_strategy {
+            emitter_cfg.drop_table_strategy = s.clone();
+        }
+    }
 
     let tcp = TcpStream::connect(("127.0.0.1", ch_tcp_port)).expect("tcp connect ch");
     tcp.set_nodelay(true).ok();
     tcp.set_nonblocking(false)
         .expect("blocking socket for chc_posix_io");
-    let emitter = Emitter::new(emitter_cfg, catalog.clone(), tcp).expect("init emitter");
+    let mut emitter =
+        Emitter::new(emitter_cfg.clone(), catalog.clone(), tcp).expect("init emitter");
+    let mapping_handle = emitter.mapping_handle();
+
+    // PHASE15 wiring — second CH TCP for the DDL applicator + decoder
+    // subscription to the catalog's schema-event channel.
+    let mut schema_rx_opt = None;
+    if ddl.is_some() {
+        let ddl_tcp = TcpStream::connect(("127.0.0.1", ch_tcp_port)).expect("tcp connect ch ddl");
+        ddl_tcp.set_nodelay(true).ok();
+        ddl_tcp
+            .set_nonblocking(false)
+            .expect("blocking socket for chc_posix_io (ddl)");
+        let ddl_cfg = DdlConfig::from_emitter(&emitter_cfg);
+        let applicator =
+            DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping_handle, ddl_tcp).expect("ddl init");
+        emitter = emitter.with_applicator(applicator);
+        let rx = catalog.lock().await.subscribe();
+        schema_rx_opt = Some(std::sync::Arc::new(std::sync::Mutex::new(rx)));
+    }
     let observer: Box<dyn TupleObserver> = Box::new(EmitterObserver::new(emitter));
 
+    let mut decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone());
+    let mut xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer);
+    if let Some(rx) = schema_rx_opt {
+        decoder = decoder.with_schema_events(rx.clone());
+        xact_drain = xact_drain
+            .with_schema_events(rx)
+            .with_pg_class_delete_epoch(del_epoch);
+    }
     let record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
-        decoder: BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone()),
-        xact_drain: XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer),
+        decoder,
+        xact_drain,
     };
     let segment_sink =
         DirSegmentSink::new(shadow_filter_dir.to_path_buf()).expect("open shadow filter dir");
