@@ -254,7 +254,7 @@ async fn small_insert_loop(
         let id = next_id.fetch_add(10, Ordering::Relaxed);
         let sock = source_sock.clone();
         let sql = format!(
-            "INSERT INTO kr.t SELECT g, 'row-'||g::text FROM generate_series({}, {}) g",
+            "INSERT INTO kr.t SELECT g::int4, 'row-'||g::text FROM generate_series({}, {}) g",
             id,
             id + 9,
         );
@@ -289,7 +289,7 @@ async fn small_insert_loop(
 async fn large_xact(source_sock: PathBuf, start_id: i64) {
     let sql = format!(
         "BEGIN; \
-         INSERT INTO kr.t SELECT g, repeat('x', 200) FROM generate_series({}, {}) g; \
+         INSERT INTO kr.t SELECT g::int4, repeat('x', 200) FROM generate_series({}, {}) g; \
          COMMIT",
         start_id,
         start_id + 9999,
@@ -386,12 +386,6 @@ fn write_ch_config(ch_config_path: &Path) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked on the same daemon shadow-catalog deadlock the pgbench_acceptance \
-            test surfaces: streaming-workload decoder waits for shadow PG to apply \
-            past each record's LSN, shadow needs walsender bytes the daemon pumps, \
-            and the catalog wait_for_replay (30s hard timeout) trips before shadow \
-            catches up. 15 cycles × ~5-15 min apiece even when working — keep under \
-            `--ignored` until the underlying daemon path is fixed"]
 async fn kill_restart_preserves_end_state() {
     if !fx::pg_available() {
         eprintln!("skip: no initdb on PATH");
@@ -433,7 +427,7 @@ async fn run_drill() -> Result<()> {
     source
         .apply_schema_dump(
             "CREATE SCHEMA kr;\n\
-             CREATE TABLE kr.t (id bigint PRIMARY KEY, name text NOT NULL);\n\
+             CREATE TABLE kr.t (id int4 PRIMARY KEY, name text NOT NULL);\n\
              ALTER TABLE kr.t REPLICA IDENTITY FULL;\n",
         )
         .context("apply source schema")?;

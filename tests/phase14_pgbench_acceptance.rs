@@ -252,13 +252,6 @@ fn pgbench_init(source: &Shadow, scale: u32) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "daemon bug: under sustained WAL workload the streaming pump's \
-            decoder blocks in shadow-catalog `wait_for_replay`, which hits \
-            its 30s timeout before shadow's walreceiver applies the WAL the \
-            daemon's bytes_sink pushed. Surfaces as `sink: catalog: timeout \
-            waiting for replay`. Needs daemon-side investigation: either \
-            decouple decoder catalog-wait from the pump loop, lift the \
-            catalog timeout cap, or instrument why shadow's apply stalls."]
 async fn pgbench_acceptance_ddl_intermix() {
     if !fx::pg_available() {
         tracing::warn!("skip: no initdb on PATH");

@@ -63,6 +63,9 @@ use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
 };
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
+use walshadow::queueing_record_sink::{
+    DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
+};
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
@@ -89,18 +92,49 @@ enum BootstrapMode {
     ObjectStore,
 }
 
-/// Tiny inline `RecordSink` composite. Phase 6 adds the xact buffer
-/// to the chain: heap-tuple records park in `xact` until the matching
-/// commit / abort lands, then drain to `xact_drain`'s observer. Phase
-/// 7 wires the observer end via `Box<dyn TupleObserver>` so the daemon
-/// can pick between metrics-only (no `--ch-config`) and the CH-Native
-/// emitter (config provided) at runtime without a closed enum.
-/// Status-line code keeps direct ownership so per-section stats render
-/// without `dyn Any` round-trips.
-struct DaemonSinks {
-    metrics: MetricsRecordSink,
+/// `decoder + xact_drain` pair that runs on the queueing worker.
+/// Lifted out of [`DaemonSinks`] so the pair (which dispatches inside
+/// a single worker task) is one `RecordSink` value `QueueingRecordSink`
+/// can own.
+///
+/// Order: decoder absorbs the heap record into the xact buffer before
+/// xact_drain flushes the matching commit/abort. A multi-statement xact
+/// whose COMMIT lands in the same dispatch batch as its heap records
+/// would otherwise miss the latest writes.
+struct DecoderXactPair {
     decoder: BufferingDecoderSink,
     xact_drain: XactRecordSink<Box<dyn TupleObserver>>,
+}
+
+impl RecordSink for DecoderXactPair {
+    fn on_record<'a>(
+        &'a mut self,
+        record: &'a Record<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.decoder.on_record(record).await?;
+            self.xact_drain.on_record(record).await?;
+            Ok(())
+        })
+    }
+}
+
+/// Daemon-side `RecordSink` composite.
+///
+/// `metrics` stays synchronous on the pump task — its mutations are
+/// counter bumps, never await — so the status line reads them
+/// directly. The decoder/xact-drain pair runs behind a
+/// [`QueueingRecordSink`] so its `wait_for_replay` waits don't park
+/// the pump task, which would freeze the `RecordBytesSink` wire shadow
+/// PG depends on for apply-LSN progress (the deadlock the phase14
+/// streaming tests surface).
+struct DaemonSinks {
+    metrics: MetricsRecordSink,
+    decoder_xact: QueueingRecordSink,
+    /// Shared with the `BufferingDecoderSink` running on the queueing
+    /// worker; the status loop polls counters here without contending
+    /// on the worker.
+    decoder_stats: Arc<std::sync::Mutex<walshadow::decoder_sink::DecoderStats>>,
 }
 
 impl RecordSink for DaemonSinks {
@@ -110,13 +144,7 @@ impl RecordSink for DaemonSinks {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.metrics.on_record(record).await?;
-            // Order matters: decoder must absorb the heap record into
-            // the buffer before the xact_drain sink (which may flush
-            // this same xact) runs. A multi-statement xact whose
-            // COMMIT record arrives in the same dispatch batch as
-            // its heap records would otherwise miss the latest writes.
-            self.decoder.on_record(record).await?;
-            self.xact_drain.on_record(record).await?;
+            self.decoder_xact.on_record(record).await?;
             Ok(())
         })
     }
@@ -202,6 +230,22 @@ struct Args {
     /// `restore_command`. PHASE13 §3 "slow client" backpressure.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     walsender_slow_threshold: usize,
+    /// Seconds the pump waits for shadow's walreceiver to attach
+    /// before processing records. `0` disables the barrier (degraded
+    /// operators driving shadow purely via `restore_command`).
+    /// `ShadowStreamSink` drops bytes pushed before a connection
+    /// registers; without the barrier the pump can race past
+    /// shadow's `START_REPLICATION` LSN and leave the catalog gate
+    /// timed out against an apply LSN that never advances.
+    #[arg(long, default_value_t = 60)]
+    walsender_connect_timeout: u64,
+    /// Capacity of the `QueueingRecordSink` channel feeding the
+    /// decoder/xact-drain worker. Bigger absorbs longer
+    /// `wait_for_replay` stalls before pump-side `tx.send` blocks;
+    /// smaller bounds memory at the cost of more frequent blocks.
+    /// Sets the soft limit on pump-ahead during shadow apply lag.
+    #[arg(long, default_value_t = DEFAULT_QUEUEING_RECORD_SINK_CAPACITY)]
+    decoder_queue_capacity: usize,
     /// Phase 6 xact / TOAST buffer spill dir. Created on boot if
     /// missing; wiped clean every startup per the
     /// [PHASE6disk.md](../../plans/PHASE6disk.md) crash-recovery note.
@@ -301,7 +345,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
     init_tracing();
     let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .build()
     {
@@ -691,16 +735,27 @@ async fn run(args: Args) -> Result<()> {
         Some(o) => Box::new(walshadow::oracle::OracleObserver::new(o, inner_observer)),
         None => inner_observer,
     };
-    // Fan-out: metrics-by-rmgr first, then the buffering decoder
-    // (heap → xact buffer), then the xact-record drain (commit/abort
-    // → emit). Ordering keeps per-rmgr counters intact when a decoder
-    // semantic error trips inside the dispatch chain; xact_drain
-    // running after decoder absorbs any heap records in the same
-    // dispatch batch as the commit.
+    // Fan-out: metrics-by-rmgr first (sync, on pump task), then the
+    // buffering decoder (heap → xact buffer) + xact-record drain
+    // (commit/abort → emit) pair queued behind a worker task so their
+    // `wait_for_replay` calls don't park the pump task. Ordering
+    // inside the worker keeps per-rmgr counters intact: xact_drain
+    // runs after decoder absorbs any heap records in the same dispatch
+    // batch as the commit.
+    let decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone());
+    let decoder_stats_handle = decoder.stats_handle();
+    let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer);
+    let decoder_xact = QueueingRecordSink::spawn(
+        DecoderXactPair {
+            decoder,
+            xact_drain,
+        },
+        args.decoder_queue_capacity,
+    );
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
-        decoder: BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone()),
-        xact_drain: XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer),
+        decoder_xact,
+        decoder_stats: decoder_stats_handle,
     };
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
@@ -753,6 +808,46 @@ async fn run(args: Args) -> Result<()> {
     } else {
         None
     };
+
+    // Block before the pump loop until shadow's walreceiver has
+    // attached. `ShadowStreamSink::on_wire_chunk` drops bytes when no
+    // connection is registered, so if the pump races past
+    // `START_REPLICATION`'s LSN before walreceiver arrives the gap
+    // is unrecoverable: post-conn frames carry LSNs past walreceiver's
+    // expected continuity, shadow's apply stalls, and the catalog
+    // gate inside `BufferingDecoderSink` times out (the failure mode
+    // `phase14_pgbench_acceptance` and `phase14_kill_restart`
+    // surfaced). Cap the wait so operators running without a streaming
+    // shadow still boot cleanly — they take the `restore_command`
+    // archive path instead.
+    if args.walsender_connect_timeout > 0 {
+        let timeout = Duration::from_secs(args.walsender_connect_timeout);
+        let start = Instant::now();
+        let mut attached = false;
+        loop {
+            if shadow_state.lock().await.aggregate().active_connections > 0 {
+                attached = true;
+                break;
+            }
+            if start.elapsed() >= timeout {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if attached {
+            tracing::info!(
+                target: "walshadow",
+                wait = ?start.elapsed(),
+                "walsender connected — starting pump",
+            );
+        } else {
+            tracing::warn!(
+                target: "walshadow",
+                timeout_secs = args.walsender_connect_timeout,
+                "no walsender connection within boot barrier — proceeding (shadow on restore_command path)",
+            );
+        }
+    }
 
     let start_instant = Instant::now();
     let mut segments_shipped = 0u64;
@@ -864,7 +959,11 @@ async fn run(args: Args) -> Result<()> {
             };
             let (oracle_stats, oracle_line) = oracle_pair;
             let filter = stream.filter();
-            let decoder_stats = record_sink.decoder.stats().clone();
+            let decoder_stats = record_sink
+                .decoder_stats
+                .lock()
+                .expect("decoder stats mutex poisoned")
+                .clone();
             // PHASE14 §6 — `min_apply_lsn=None` (no shadow attached) is
             // treated as 0 so the gauge surfaces disconnect as max-lag.
             let shadow_apply_lsn = shadow_agg.min_apply_lsn.unwrap_or(0);
@@ -903,7 +1002,7 @@ async fn run(args: Args) -> Result<()> {
                 relmap_updates = filter.tracker.relmap_updates,
                 pg_class_undecoded = filter.tracker.pg_class_writes_undecoded,
                 pg_class_oid_in_prefix = filter.tracker.pg_class_writes_oid_in_prefix,
-                decoder = %record_sink.decoder.stats().summary(),
+                decoder = %decoder_stats.summary(),
                 xact_buffer = %xact_line,
                 oracle = %oracle_line,
                 "status",
@@ -923,6 +1022,14 @@ async fn run(args: Args) -> Result<()> {
         .close(Some(&mut segment_sink), &mut record_sink)
         .await
         .context("flush partial segment on shutdown")?;
+    // Drain the queueing worker so any records pump-side enqueued but
+    // not yet dispatched run through the decoder + xact_drain chain
+    // before the daemon exits. Surfaces any worker-parked error.
+    let DaemonSinks { decoder_xact, .. } = record_sink;
+    decoder_xact
+        .close()
+        .await
+        .context("drain queueing decoder sink on shutdown")?;
     Ok(())
 }
 

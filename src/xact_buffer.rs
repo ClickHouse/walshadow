@@ -1136,7 +1136,11 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
 pub struct BufferingDecoderSink {
     catalog: Arc<Mutex<ShadowCatalog>>,
     buffer: Arc<Mutex<XactBuffer>>,
-    pub stats: DecoderStats,
+    /// Shared so the daemon's status loop (or a `QueueingRecordSink`
+    /// wrapper running this sink on a worker task) can read counters
+    /// without contending on `self`. Mutations stay short — the lock
+    /// is never held across `.await`.
+    stats: Arc<std::sync::Mutex<DecoderStats>>,
     /// Counts of TOAST chunks routed to the buffer. Distinct from
     /// `stats.inserts`, which only counts non-toast user-table writes.
     pub toast_chunks_buffered: u64,
@@ -1152,14 +1156,27 @@ impl BufferingDecoderSink {
         Self {
             catalog,
             buffer,
-            stats: DecoderStats::default(),
+            stats: Arc::new(std::sync::Mutex::new(DecoderStats::default())),
             toast_chunks_buffered: 0,
             toast_chunks_malformed: 0,
         }
     }
 
-    pub fn stats(&self) -> &DecoderStats {
-        &self.stats
+    /// Snapshot of the live counters. Cheap clone of the `DecoderStats`
+    /// struct (all `u64` fields).
+    pub fn stats(&self) -> DecoderStats {
+        self.stats.lock().expect("decoder stats mutex poisoned").clone()
+    }
+
+    /// Shared handle a wrapping `QueueingRecordSink` can hand back to
+    /// the daemon's status loop so it polls live counters while the
+    /// sink itself runs on a separate worker task.
+    pub fn stats_handle(&self) -> Arc<std::sync::Mutex<DecoderStats>> {
+        self.stats.clone()
+    }
+
+    fn bump<F: FnOnce(&mut DecoderStats)>(&self, f: F) {
+        f(&mut self.stats.lock().expect("decoder stats mutex poisoned"))
     }
 
     /// Parse `xl_heap_truncate` main_data, resolve each relid through
@@ -1170,7 +1187,7 @@ impl BufferingDecoderSink {
     async fn handle_truncate(&mut self, record: &Record<'_>) -> std::result::Result<(), SinkError> {
         let Some(parsed) = crate::main_data::parse_xl_heap_truncate(&record.parsed.main_data)
         else {
-            self.stats.skipped_op += 1;
+            self.bump(|s| s.skipped_op += 1);
             return Ok(());
         };
         let xid = record.parsed.header.xact_id;
@@ -1189,7 +1206,7 @@ impl BufferingDecoderSink {
                 match cat.relation_by_oid(relid).await {
                     Ok(r) => r,
                     Err(CatalogError::NotFoundByOid(_)) => {
-                        self.stats.catalog_not_found += 1;
+                        self.bump(|s| s.catalog_not_found += 1);
                         continue;
                     }
                     Err(e) => return Err(DecoderSinkError::from(e).into()),
@@ -1209,8 +1226,10 @@ impl BufferingDecoderSink {
                 new: None,
                 old: None,
             };
-            self.stats.decoded += 1;
-            self.stats.truncates += 1;
+            self.bump(|s| {
+                s.decoded += 1;
+                s.truncates += 1;
+            });
             let mut buf = self.buffer.lock().await;
             buf.on_heap(decoded).await.map_err(SinkError::from)?;
         }
@@ -1247,7 +1266,7 @@ impl RecordSink for BufferingDecoderSink {
             let rfn = match record.parsed.blocks.first() {
                 Some(b) => b.header.location.rel,
                 None => {
-                    self.stats.skipped_no_block += 1;
+                    self.bump(|s| s.skipped_no_block += 1);
                     return Ok(());
                 }
             };
@@ -1256,7 +1275,7 @@ impl RecordSink for BufferingDecoderSink {
                 match cat.relation_at(rfn, record.source_lsn).await {
                     Ok(r) => r,
                     Err(CatalogError::NotFoundByFilenode(_)) => {
-                        self.stats.catalog_not_found += 1;
+                        self.bump(|s| s.catalog_not_found += 1);
                         return Ok(());
                     }
                     Err(e) => {
@@ -1278,27 +1297,28 @@ impl RecordSink for BufferingDecoderSink {
                 Err(e) => return Err(DecoderSinkError::from(e).into()),
             };
             if decoded_set.is_empty() {
-                self.stats.skipped_op += 1;
+                self.bump(|s| s.skipped_op += 1);
                 return Ok(());
             }
             for decoded in decoded_set {
-                self.stats.decoded += 1;
-                match decoded.op {
-                    HeapOp::Insert => self.stats.inserts += 1,
-                    HeapOp::Update => self.stats.updates += 1,
-                    HeapOp::HotUpdate => self.stats.hot_updates += 1,
-                    HeapOp::Delete => self.stats.deletes += 1,
-                    // Truncate is routed via handle_truncate before
-                    // decode_heap_record runs, so this arm is
-                    // unreachable in steady state. Bumping the counter
-                    // is harmless defensively.
-                    HeapOp::Truncate => self.stats.truncates += 1,
-                }
-                if decoded.new.as_ref().is_some_and(|t| t.partial)
-                    || decoded.old.as_ref().is_some_and(|t| t.partial)
-                {
-                    self.stats.partial += 1;
-                }
+                let partial = decoded.new.as_ref().is_some_and(|t| t.partial)
+                    || decoded.old.as_ref().is_some_and(|t| t.partial);
+                self.bump(|s| {
+                    s.decoded += 1;
+                    match decoded.op {
+                        HeapOp::Insert => s.inserts += 1,
+                        HeapOp::Update => s.updates += 1,
+                        HeapOp::HotUpdate => s.hot_updates += 1,
+                        HeapOp::Delete => s.deletes += 1,
+                        // Truncate routes via handle_truncate above, so
+                        // this arm is unreachable in steady state.
+                        // Counting it is harmless defensively.
+                        HeapOp::Truncate => s.truncates += 1,
+                    }
+                    if partial {
+                        s.partial += 1;
+                    }
+                });
                 if rel.kind == 't' {
                     let xid = decoded.xid;
                     if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
