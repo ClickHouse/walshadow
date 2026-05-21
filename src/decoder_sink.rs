@@ -56,9 +56,14 @@ impl From<DecoderSinkError> for SinkError {
 /// since the commit record hasn't landed at that point.
 ///
 /// `on_xact_end` fires after every tuple in a committed xact has been
-/// delivered. Phase 7's CH emitter uses it to close the open INSERT
-/// (`send_data(None)`) so each xact lands as a single CH block group.
-/// Default no-op; metrics & collector observers ignore the hook.
+/// delivered. Phase 7's CH emitter uses it as the per-xact landmark
+/// for closing or extending its open INSERT blocks. Returns the
+/// highest commit_lsn now known durable on the observer (CH server
+/// acked, MergeTree part finalized). Callers advance their ack
+/// ceiling from the returned value, not from `commit_lsn`, so an
+/// observer that holds INSERTs open across xacts can report ack lag
+/// without breaking the slot-advance gate. Default impl returns
+/// `commit_lsn` — no async work, instant ack.
 pub trait TupleObserver: Send {
     fn on_tuple<'a>(
         &'a mut self,
@@ -66,6 +71,27 @@ pub trait TupleObserver: Send {
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>>;
 
     fn on_xact_end<'a>(
+        &'a mut self,
+        commit_lsn: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
+        Box::pin(async move { Ok(commit_lsn) })
+    }
+
+    /// Driver-initiated tick. Mirror of [`crate::wal_stream::RecordSink::on_idle`]
+    /// at the observer layer — lets the CH emitter close its
+    /// hold-open INSERTs once `flush_timeout` has elapsed without any
+    /// fresh xact_end calls to piggyback the deadline check on.
+    /// Default: no-op.
+    fn on_idle<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Final hook before drop. Mirror of [`crate::wal_stream::RecordSink::on_close`]
+    /// at the observer layer — used by the CH emitter to force-flush
+    /// any held-open INSERT on daemon shutdown. Default: no-op.
+    fn on_close<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
@@ -86,8 +112,21 @@ impl<T: TupleObserver + ?Sized> TupleObserver for Box<T> {
 
     fn on_xact_end<'a>(
         &'a mut self,
+        commit_lsn: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
+        (**self).on_xact_end(commit_lsn)
+    }
+
+    fn on_idle<'a>(
+        &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        (**self).on_xact_end()
+        (**self).on_idle()
+    }
+
+    fn on_close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        (**self).on_close()
     }
 }
 

@@ -160,6 +160,31 @@ pub trait RecordSink {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
+
+    /// Driver-initiated tick for time-based work that can't wait on
+    /// the next record. Today's only consumer is the CH emitter's
+    /// hold-INSERT-open path, where the close-and-ack handshake is
+    /// gated on `flush_timeout` elapsing — an idle stream would
+    /// otherwise sit on rows indefinitely. Fired by
+    /// [`crate::queueing_record_sink::QueueingRecordSink`]'s worker
+    /// when its receive loop times out. Default: no-op.
+    fn on_idle<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Final hook before the sink drops. Fired by the queueing worker
+    /// after its channel closes (i.e. the daemon called `close()` on
+    /// the wrapper). Lets the CH emitter force-close any
+    /// hold-INSERT-open buffers regardless of deadline — without
+    /// this, the last burst of rows in a flush window stays
+    /// non-durable on graceful shutdown. Default: no-op.
+    fn on_close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Streaming sink for the post-filter WAL byte stream.

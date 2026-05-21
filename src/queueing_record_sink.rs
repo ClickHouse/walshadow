@@ -34,66 +34,178 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
-/// Default channel capacity. Sized to absorb the worker's worst-case
-/// `wait_for_replay` (30 s catalog timeout) at typical record cadence
-/// — at ~120 byte records and 10 MiB/s WAL rate that's 2.5 M records.
-/// Picked a budget of ~256 k records (~30 MiB at the small-record
-/// extreme, more for fat records). The pump blocks on send past this
-/// point, which is the right escalation: the worker has stalled long
-/// enough that surfacing the error is preferable to unbounded memory.
-pub const DEFAULT_QUEUEING_RECORD_SINK_CAPACITY: usize = 262_144;
+/// Pump-side buffer size: records collected before a batch is sent
+/// onto the worker channel. Picked to amortise the per-send overhead
+/// (atomic + alloc + wakeup) which dominates the queueing path at
+/// small per-record sizes. 64 lands the channel cost near 8 ns per
+/// record on top of the clone-into-owned baseline.
+pub const DEFAULT_QUEUEING_BATCH_SIZE: usize = 64;
+
+/// Soft cap on the in-flight queue (records, summed across batches in
+/// the channel + the pump-side buffer). Past this the pump yields to
+/// the runtime so the worker drains. The hard cap is open-ended — if
+/// the worker permanently stalls, the catalog `wait_for_replay`
+/// timeout surfaces an error on the shared err slot and the pump
+/// bails on the next `on_record`.
+pub const DEFAULT_QUEUEING_RECORD_SINK_CAPACITY: usize = 16_384;
+
+/// Default idle-wakeup cadence for the worker's `on_idle` tick. Picked
+/// to give the CH emitter's hold-INSERT-open deadline a chance to
+/// fire shortly after `flush_timeout` elapses without piling on
+/// wakeups during steady-state traffic. Concrete deployments should
+/// match this to roughly `flush_timeout / 2`.
+pub const DEFAULT_QUEUEING_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Wraps any `RecordSink` so per-record dispatch runs on a separate
 /// task. Construct via [`QueueingRecordSink::spawn`].
 pub struct QueueingRecordSink {
-    tx: Option<mpsc::Sender<Record<'static>>>,
+    tx: Option<mpsc::UnboundedSender<Vec<Record<'static>>>>,
+    /// Pump-side accumulator. `on_record` clones the record here;
+    /// when `buf.len() >= batch_size` the buffer is shipped onto the
+    /// channel as one message. Final-flush happens in `close()`.
+    buf: Vec<Record<'static>>,
+    batch_size: usize,
     err: Arc<StdMutex<Option<SinkError>>>,
+    in_flight: Arc<AtomicU64>,
+    soft_cap: u64,
     worker: Option<JoinHandle<()>>,
 }
 
 impl QueueingRecordSink {
-    /// Spawn a worker task that owns `inner`. Records arriving via
-    /// [`RecordSink::on_record`] are cloned into `'static` form and
-    /// shipped through a bounded channel of `capacity` records.
-    pub fn spawn<S>(mut inner: S, capacity: usize) -> Self
+    /// Spawn a worker task with the default idle cadence — see
+    /// [`Self::spawn_with_idle`] for the full-control entry.
+    pub fn spawn<S>(inner: S, batch_size: usize, soft_cap: usize) -> Self
     where
         S: RecordSink + Send + 'static,
     {
-        let (tx, mut rx) = mpsc::channel::<Record<'static>>(capacity.max(1));
+        Self::spawn_with_idle(inner, batch_size, soft_cap, DEFAULT_QUEUEING_IDLE_INTERVAL)
+    }
+
+    /// Spawn a worker task that owns `inner`. Pump-side `on_record`
+    /// clones records into a local buffer; once `batch_size` records
+    /// accumulate, the whole batch is shipped onto an unbounded
+    /// channel. The worker drains batches and dispatches each record
+    /// through `inner`. `soft_cap` triggers a `yield_now` once the
+    /// in-flight count (channel + pump buffer) exceeds it.
+    ///
+    /// `idle_interval` controls how often the worker calls
+    /// `inner.on_idle()` when the channel is quiescent. Lets time-based
+    /// observer work (CH emitter's hold-INSERT-open deadline) fire
+    /// without requiring fresh records to arrive.
+    pub fn spawn_with_idle<S>(
+        mut inner: S,
+        batch_size: usize,
+        soft_cap: usize,
+        idle_interval: Duration,
+    ) -> Self
+    where
+        S: RecordSink + Send + 'static,
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<Record<'static>>>();
         let err = Arc::new(StdMutex::new(None));
+        let in_flight = Arc::new(AtomicU64::new(0));
         let err_w = err.clone();
+        let in_flight_w = in_flight.clone();
+        let batch_size = batch_size.max(1);
+        let idle_interval = idle_interval.max(Duration::from_millis(1));
         let worker = tokio::spawn(async move {
-            while let Some(record) = rx.recv().await {
-                if let Err(e) = inner.on_record(&record).await {
-                    *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
-                    // Drain remaining items so the pump's `send` calls
-                    // wake up promptly instead of stalling against a
-                    // dead receiver. The first slot-stored error
-                    // surfaces on the next pump-side `on_record`.
-                    rx.close();
-                    while rx.recv().await.is_some() {}
-                    return;
+            'outer: loop {
+                match tokio::time::timeout(idle_interval, rx.recv()).await {
+                    Ok(Some(batch)) => {
+                        let n = batch.len() as u64;
+                        for record in &batch {
+                            if let Err(e) = inner.on_record(record).await {
+                                *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
+                                in_flight_w.fetch_sub(n, Ordering::Relaxed);
+                                rx.close();
+                                while let Some(rest) = rx.recv().await {
+                                    in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
+                                }
+                                break 'outer;
+                            }
+                        }
+                        in_flight_w.fetch_sub(n, Ordering::Relaxed);
+                    }
+                    Ok(None) => {
+                        // Channel closed by `QueueingRecordSink::close`.
+                        // Give the inner sink one last shutdown tick
+                        // (CH emitter force-flushes hold-open
+                        // INSERTs here so the final flush window's
+                        // rows reach CH durably before the worker
+                        // exits).
+                        if let Err(e) = inner.on_close().await {
+                            *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
+                        }
+                        break 'outer;
+                    }
+                    Err(_) => {
+                        // Idle wakeup: drive any time-based work the
+                        // inner sink wants (CH emitter flush deadline).
+                        if let Err(e) = inner.on_idle().await {
+                            *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
+                            rx.close();
+                            while let Some(rest) = rx.recv().await {
+                                in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
+                            }
+                            break 'outer;
+                        }
+                    }
                 }
             }
         });
         Self {
             tx: Some(tx),
+            buf: Vec::with_capacity(batch_size),
+            batch_size,
             err,
+            in_flight,
+            soft_cap: soft_cap.max(1) as u64,
             worker: Some(worker),
         }
+    }
+
+    /// Ship the pump-side buffer to the worker. Called from
+    /// `on_record` when the batch fills, and from `close()` to flush
+    /// any tail.
+    fn flush_buf(&mut self) -> Result<(), SinkError> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::replace(&mut self.buf, Vec::with_capacity(self.batch_size));
+        let n = batch.len() as u64;
+        self.in_flight.fetch_add(n, Ordering::Relaxed);
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| SinkError::Other("queueing record sink already closed".into()))?;
+        if tx.send(batch).is_err() {
+            self.in_flight.fetch_sub(n, Ordering::Relaxed);
+            if let Some(e) = self.take_pending_error() {
+                return Err(e);
+            }
+            return Err(SinkError::Other(
+                "queueing record sink worker stopped".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Drop the channel sender + join the worker. Any error the worker
     /// has parked surfaces here. Call after the pump has stopped
     /// feeding records.
     pub async fn close(mut self) -> Result<(), SinkError> {
+        // Flush any pump-side tail before dropping the sender so the
+        // worker sees the final batch.
+        self.flush_buf()?;
         self.tx.take(); // drop sender so worker observes channel close
         if let Some(handle) = self.worker.take() {
             // Worker exits on `rx.recv() == None` (channel closed).
@@ -147,24 +259,22 @@ impl RecordSink for QueueingRecordSink {
             if let Some(e) = self.take_pending_error() {
                 return Err(e);
             }
-            let owned = Record {
+            self.buf.push(Record {
                 parsed: record.parsed.clone().into_owned(),
                 source_lsn: record.source_lsn,
                 page_magic: record.page_magic,
                 decision: record.decision,
-            };
-            let tx = self.tx.as_ref().ok_or_else(|| {
-                SinkError::Other("queueing record sink already closed".into())
-            })?;
-            if tx.send(owned).await.is_err() {
-                // Worker exited. Prefer surfacing the stored error
-                // over a generic "worker dead" message.
-                if let Some(e) = self.take_pending_error() {
-                    return Err(e);
+            });
+            if self.buf.len() >= self.batch_size {
+                self.flush_buf()?;
+                // Soft backpressure: yield once the worker is N
+                // records behind so the runtime schedules it. Atomic
+                // load on the hot path; only yields when actually
+                // behind. Check only at flush time so the per-record
+                // cost stays minimal.
+                if self.in_flight.load(Ordering::Relaxed) > self.soft_cap {
+                    tokio::task::yield_now().await;
                 }
-                return Err(SinkError::Other(
-                    "queueing record sink worker stopped".into(),
-                ));
             }
             Ok(())
         })
@@ -204,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn forwards_records_in_order() {
         let collected = Arc::new(StdMutex::new(Vec::<u64>::new()));
-        let mut q = QueueingRecordSink::spawn(CaptureLsn(collected.clone()), 8);
+        let mut q = QueueingRecordSink::spawn(CaptureLsn(collected.clone()), 2, 8);
         for lsn in [10, 20, 30, 40, 50] {
             q.on_record(&synth(lsn)).await.expect("send");
         }
@@ -223,7 +333,7 @@ mod tests {
                 Box::pin(async move { Err(SinkError::Other("boom".into())) })
             }
         }
-        let mut q = QueueingRecordSink::spawn(Fail, 4);
+        let mut q = QueueingRecordSink::spawn(Fail, 1, 4);
         // First send completes before the worker has consumed; the
         // error parks in the slot. Spin until it lands so the next
         // send hits the slot rather than racing the worker.
@@ -257,7 +367,7 @@ mod tests {
                 })
             }
         }
-        let mut q = QueueingRecordSink::spawn(Counter(count.clone()), 4);
+        let mut q = QueueingRecordSink::spawn(Counter(count.clone()), 4, 4);
         for lsn in 0..32 {
             q.on_record(&synth(lsn)).await.expect("send");
         }

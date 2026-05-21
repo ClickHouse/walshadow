@@ -451,8 +451,10 @@ pub struct XactBufferStats {
     /// file's `drain_lsn`. Monotonic.
     pub drain_lsn: u64,
     /// Phase 11. Highest commit-record LSN where the observer's
-    /// `on_xact_end` returned `Ok` (CH emitter acknowledged the block
-    /// group). Snapshot for `cursor.emitter_ack_lsn`. Monotonic.
+    /// `on_xact_end` reported durable on the downstream sink. Snapshot
+    /// for `cursor.emitter_ack_lsn`. Monotonic. Lags `drain_lsn`
+    /// whenever the observer (CH emitter with `flush_timeout > 0`)
+    /// holds rows in still-open INSERTs.
     pub emitter_ack_lsn: u64,
 }
 
@@ -731,8 +733,16 @@ impl XactBuffer {
             // Read-only / filter-dropped xacts still advance the
             // emitter-ack ceiling — source's slot can recycle WAL up to
             // their commit LSN without losing anything we'd have shipped.
+            // Route through `on_xact_end` anyway so an observer that
+            // holds prior xacts' rows in still-open inserts can clamp
+            // the ack at its own durable horizon (otherwise we'd claim
+            // durability for rows still buffered client-side).
             self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
-            self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(commit_lsn);
+            let ack_lsn = observer
+                .on_xact_end(commit_lsn)
+                .await
+                .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+            self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
             return Ok(());
         }
         // Active counter ticks down once per drained xact (top + subs).
@@ -798,13 +808,16 @@ impl XactBuffer {
         }
         // drain_lsn ticks before the on_xact_end ack so an observer
         // failure leaves drain_lsn ahead of emitter_ack_lsn — exactly
-        // the gap the cursor file is designed to surface.
+        // the gap the cursor file is designed to surface. With CH
+        // emitter's flush_timeout > 0, on_xact_end returns the last
+        // durable commit_lsn (possibly < commit_lsn for held-open
+        // inserts), so emitter_ack_lsn lags drain_lsn deliberately.
         self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
-        observer
-            .on_xact_end()
+        let ack_lsn = observer
+            .on_xact_end(commit_lsn)
             .await
             .map_err(|e| XactBufferError::Observer(e.to_string()))?;
-        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(commit_lsn);
+        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
         // One bump per top, not per subxid: a top with N subs is a
         // single user-facing transaction at COMMIT time.
         self.stats.committed_xacts_total += 1;
@@ -1120,6 +1133,37 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                 }
             }
             Ok(())
+        })
+    }
+
+    /// Forward idle ticks straight to the observer. The xact buffer
+    /// itself has no time-based work; the hook exists so the CH
+    /// emitter's hold-INSERT-open deadline can fire without waiting
+    /// on the next commit record.
+    fn on_idle<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.observer
+                .on_idle()
+                .await
+                .map_err(|e| SinkError::Other(e.to_string()))
+        })
+    }
+
+    /// Forward close to the observer. Final force-flush hook for the
+    /// CH emitter's hold-INSERT-open path; without it, any rows
+    /// buffered when the daemon shuts down would stay non-durable.
+    fn on_close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.observer
+                .on_close()
+                .await
+                .map_err(|e| SinkError::Other(e.to_string()))
         })
     }
 }

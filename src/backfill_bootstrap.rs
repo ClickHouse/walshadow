@@ -236,15 +236,17 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
 ) -> Result<u64> {
     let mut shipped: u64 = 0;
     let mut last_rfn: Option<RelFileNode> = None;
+    let mut last_lsn: u64 = 0;
     while let Some(tuple) = rx.recv().await {
         if let Some(prev) = last_rfn
             && prev != tuple.rfn
         {
-            observer.on_xact_end().await.map_err(|e| {
+            observer.on_xact_end(last_lsn).await.map_err(|e| {
                 anyhow::anyhow!("bootstrap drain: emitter rejected mid-table xact end: {e}")
             })?;
         }
         last_rfn = Some(tuple.rfn);
+        last_lsn = tuple.source_lsn;
         let committed = backfill_to_committed(tuple);
         observer
             .on_tuple(&committed)
@@ -253,7 +255,7 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
         shipped += 1;
     }
     observer
-        .on_xact_end()
+        .on_xact_end(last_lsn)
         .await
         .map_err(|e| anyhow::anyhow!("bootstrap drain: emitter rejected xact end: {e}"))?;
     Ok(shipped)
@@ -720,15 +722,17 @@ mod tests {
         }
         fn on_xact_end<'a>(
             &'a mut self,
+            commit_lsn: u64,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<(), crate::decoder_sink::DecoderSinkError>>
-                    + Send
+                dyn std::future::Future<
+                        Output = Result<u64, crate::decoder_sink::DecoderSinkError>,
+                    > + Send
                     + 'a,
             >,
         > {
             self.on_xact_end_calls += 1;
-            Box::pin(async { Ok(()) })
+            Box::pin(async move { Ok(commit_lsn) })
         }
     }
 

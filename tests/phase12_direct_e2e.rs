@@ -270,14 +270,15 @@ impl walshadow::decoder_sink::TupleObserver for RecordingObserver {
     }
     fn on_xact_end<'a>(
         &'a mut self,
+        commit_lsn: u64,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<(), walshadow::decoder_sink::DecoderSinkError>>
+            dyn std::future::Future<Output = Result<u64, walshadow::decoder_sink::DecoderSinkError>>
                 + Send
                 + 'a,
         >,
     > {
         self.xact_end_calls += 1;
-        Box::pin(async { Ok(()) })
+        Box::pin(async move { Ok(commit_lsn) })
     }
 }

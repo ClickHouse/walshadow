@@ -201,7 +201,14 @@ pub struct ShadowCatalogConfig {
 impl Default for ShadowCatalogConfig {
     fn default() -> Self {
         Self {
-            replay_poll: Duration::from_millis(50),
+            // 1 ms keeps the worker's per-record floor in line with
+            // the catalog's SQL round-trip cost rather than the prior
+            // 50 ms sleep. Under sustained workload where shadow's
+            // apply lags pump's dispatch by O(records), each
+            // `wait_for_replay` cache miss costs one round-trip
+            // instead of a fixed 50 ms tick, which dominated the
+            // worker's throughput in `phase14_pgbench_acceptance`.
+            replay_poll: Duration::from_millis(1),
             replay_timeout: Duration::from_secs(30),
             max_entries: Some(4096),
             reconnect_backoff_initial: Duration::from_millis(100),

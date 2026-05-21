@@ -376,8 +376,21 @@ impl<O: TupleObserver + Send> TupleObserver for OracleObserver<O> {
 
     fn on_xact_end<'a>(
         &'a mut self,
+        commit_lsn: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
+        self.inner.on_xact_end(commit_lsn)
+    }
+
+    fn on_idle<'a>(
+        &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        self.inner.on_xact_end()
+        self.inner.on_idle()
+    }
+
+    fn on_close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        self.inner.on_close()
     }
 }
 

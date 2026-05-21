@@ -64,7 +64,7 @@ use walshadow::shadow_catalog::{
 };
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::queueing_record_sink::{
-    DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
+    DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
@@ -116,6 +116,22 @@ impl RecordSink for DecoderXactPair {
             self.xact_drain.on_record(record).await?;
             Ok(())
         })
+    }
+
+    fn on_idle<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        // Decoder has no time-based work; xact_drain forwards to the
+        // observer where the CH emitter's deadline check runs.
+        self.xact_drain.on_idle()
+    }
+
+    fn on_close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        // Same plumbing as on_idle: decoder has no close work,
+        // xact_drain forwards to the emitter for the final flush.
+        self.xact_drain.on_close()
     }
 }
 
@@ -239,13 +255,20 @@ struct Args {
     /// timed out against an apply LSN that never advances.
     #[arg(long, default_value_t = 60)]
     walsender_connect_timeout: u64,
-    /// Capacity of the `QueueingRecordSink` channel feeding the
-    /// decoder/xact-drain worker. Bigger absorbs longer
-    /// `wait_for_replay` stalls before pump-side `tx.send` blocks;
-    /// smaller bounds memory at the cost of more frequent blocks.
-    /// Sets the soft limit on pump-ahead during shadow apply lag.
+    /// Soft cap on in-flight records (pump-side buffer + worker
+    /// channel) for the `QueueingRecordSink` feeding the decoder /
+    /// xact-drain worker. Past this watermark the pump yields to let
+    /// the worker drain; a permanently stuck worker still surfaces
+    /// via the catalog `wait_for_replay` timeout on the err slot.
     #[arg(long, default_value_t = DEFAULT_QUEUEING_RECORD_SINK_CAPACITY)]
     decoder_queue_capacity: usize,
+    /// Pump-side batch size for the `QueueingRecordSink`. Records
+    /// collect into a local `Vec` before shipping onto the worker
+    /// channel; bigger amortises the per-send overhead but adds
+    /// latency between pump and worker (the worker's
+    /// `wait_for_replay` lags one batch behind the pump).
+    #[arg(long, default_value_t = DEFAULT_QUEUEING_BATCH_SIZE)]
+    decoder_batch_size: usize,
     /// Phase 6 xact / TOAST buffer spill dir. Created on boot if
     /// missing; wiped clean every startup per the
     /// [PHASE6disk.md](../../plans/PHASE6disk.md) crash-recovery note.
@@ -263,6 +286,15 @@ struct Args {
     /// params stay boot-only).
     #[arg(long)]
     ch_config: Option<PathBuf>,
+    /// Override the TOML's `[ch] flush_timeout_ms` knob from the CLI.
+    /// `0` (default) keeps the legacy close-INSERT-per-xact path;
+    /// positive values switch on the hold-INSERT-open-across-xacts
+    /// flow, capping per-row latency to `flush_timeout_ms` between
+    /// first append and CH durability. SIGHUP reads `--ch-config`
+    /// only, so use the flag for the boot value when you don't want
+    /// to maintain the knob in TOML.
+    #[arg(long)]
+    ch_flush_timeout_ms: Option<u64>,
     /// Phase 9 differential decode oracle: probe 1-in-`<N>` rows
     /// through shadow PG's `walshadow_decode_disk(oid, bytea)`
     /// extension function and assert the local decoder matches. `0`
@@ -418,7 +450,11 @@ async fn run(args: Args) -> Result<()> {
             let toml = tokio::fs::read_to_string(path)
                 .await
                 .with_context(|| format!("read --ch-config {}", path.display()))?;
-            Some(EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?)
+            let mut cfg = EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?;
+            if let Some(ms) = args.ch_flush_timeout_ms {
+                cfg.flush_timeout = std::time::Duration::from_millis(ms);
+            }
+            Some(cfg)
         }
         None => None,
     };
@@ -611,7 +647,11 @@ async fn run(args: Args) -> Result<()> {
             let toml = tokio::fs::read_to_string(path)
                 .await
                 .with_context(|| format!("read --ch-config {}", path.display()))?;
-            Some(EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?)
+            let mut cfg = EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?;
+            if let Some(ms) = args.ch_flush_timeout_ms {
+                cfg.flush_timeout = std::time::Duration::from_millis(ms);
+            }
+            Some(cfg)
         }
         None => None,
     };
@@ -750,6 +790,7 @@ async fn run(args: Args) -> Result<()> {
             decoder,
             xact_drain,
         },
+        args.decoder_batch_size,
         args.decoder_queue_capacity,
     );
     let mut record_sink = DaemonSinks {
@@ -1394,6 +1435,12 @@ async fn run_bootstrap(
             let outcome: BootstrapOutcome = pump_res
                 .context("bootstrap pump join")?
                 .context("bootstrap pump")?;
+            // Force-close held-open INSERTs before tearing down the
+            // transitional emitter. With `flush_timeout > 0` the
+            // last synthetic xact_end won't have closed them.
+            walshadow::decoder_sink::TupleObserver::on_close(&mut observer)
+                .await
+                .context("bootstrap emitter shutdown flush")?;
             tracing::info!(
                 target: "walshadow::bootstrap",
                 rows_emitted = observer.emitter.stats.rows_emitted,

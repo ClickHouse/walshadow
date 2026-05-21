@@ -43,6 +43,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clickhouse_c::{
     Allocator, BlockBuilder, BlockOpts, Client, ClientOpts, Codec, Compression, Kind, PacketKind,
@@ -71,6 +72,13 @@ pub const OP_DELETE: i8 = 3;
 /// defaults; tunable via [`EmitterConfig`].
 pub const DEFAULT_ROW_BUDGET: usize = 65_536;
 pub const DEFAULT_BYTE_BUDGET: usize = 1 << 20; // 1 MiB
+
+/// Default flush timeout (ms) — `0` keeps the legacy
+/// close-INSERT-on-every-xact-end behaviour. Set this to a positive
+/// value via TOML (`flush_timeout_ms`) or `--ch-flush-timeout-ms` to
+/// let the emitter hold INSERTs open across xacts and close them on a
+/// deadline that starts when the first row of a fresh INSERT lands.
+pub const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 0;
 
 #[derive(Debug, Error)]
 pub enum EmitterError {
@@ -116,6 +124,19 @@ pub struct EmitterConfig {
     pub compression: CompressionChoice,
     pub row_budget: usize,
     pub byte_budget: usize,
+    /// Hold INSERTs open across xacts. Timer starts when the first row
+    /// of a fresh INSERT lands and trips at `now + flush_timeout`; on
+    /// trip the emitter closes every still-open INSERT (one
+    /// `send_data(None)` + drain to `EndOfStream` per table) and
+    /// advances its durable-LSN horizon. `Duration::ZERO` (default)
+    /// keeps the pre-fix behaviour: every xact closes its own
+    /// INSERTs, ack tracks `drain_lsn` exactly.
+    ///
+    /// Latency cap: a row buffered the moment the deadline starts is
+    /// at most `flush_timeout` away from durable on CH. Throughput
+    /// win: small commits (the pgbench TPC-B shape) coalesce into one
+    /// MergeTree part per flush window instead of one per xact.
+    pub flush_timeout: Duration,
     /// Keyed on `"<namespace>.<relname>"` source identifier.
     pub tables: HashMap<String, TableMapping>,
     /// Phase 10 bounded retry against a single CH replica. See
@@ -155,6 +176,7 @@ impl Default for EmitterConfig {
             compression: CompressionChoice::default(),
             row_budget: DEFAULT_ROW_BUDGET,
             byte_budget: DEFAULT_BYTE_BUDGET,
+            flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
             tables: HashMap::new(),
             retry: RetryConfig::default(),
         }
@@ -294,6 +316,11 @@ impl EmitterConfig {
             }
             if let Some(v) = ch.get("byte_budget").and_then(Value::as_integer) {
                 out.byte_budget = usize::try_from(v).unwrap_or(DEFAULT_BYTE_BUDGET);
+            }
+            if let Some(v) = ch.get("flush_timeout_ms").and_then(Value::as_integer)
+                && let Ok(ms) = u64::try_from(v)
+            {
+                out.flush_timeout = Duration::from_millis(ms);
             }
             if let Some(v) = ch.get("retry_max_attempts").and_then(Value::as_integer) {
                 out.retry.max_attempts = u32::try_from(v).unwrap_or(out.retry.max_attempts);
@@ -958,6 +985,23 @@ pub struct Emitter {
     tables: HashMap<String, TableEncoder>,
     /// xid currently held in `tables`. Reset on `on_xact_end`.
     current_xid: Option<u32>,
+    /// Set when any INSERT opens (first row after the previous close)
+    /// and `flush_timeout > 0`. Cleared on close. Drives the
+    /// hold-INSERT-open path's deadline check inside
+    /// [`Self::on_xact_end_with_lsn`].
+    flush_deadline: Option<Instant>,
+    /// Highest `commit_lsn` of any row currently buffered in an open
+    /// INSERT (either in [`TableEncoder`] memory or already shipped
+    /// via [`TableEncoder::flush_block`] but not yet sealed by
+    /// `send_data(None)`). Bumped per tuple in [`Self::route`], reset
+    /// to `0` on close, then `last_durable_commit_lsn` adopts it.
+    pending_max_commit_lsn: u64,
+    /// Highest `commit_lsn` known durable on CH (i.e. covered by a
+    /// closed INSERT's `EndOfStream`). xact_buffer pulls this through
+    /// [`EmitterObserver::on_xact_end`] to advance `emitter_ack_lsn`.
+    /// Monotonic; only bumped inside [`Self::close_all_open_inserts`]
+    /// or when an empty/untracked xact arrives with no rows pending.
+    last_durable_commit_lsn: u64,
     pub stats: EmitterStats,
 }
 
@@ -976,6 +1020,13 @@ pub struct EmitterStats {
     pub retries_attempted: u64,
     /// `HeapOp::Truncate` events shipped to CH as `TRUNCATE TABLE`.
     pub truncates_emitted: u64,
+    /// Number of times the hold-INSERT-open deadline tripped (i.e.
+    /// `flush_timeout` elapsed since the first row of a fresh INSERT
+    /// landed) and forced a multi-xact close. Stays at `0` when
+    /// `flush_timeout == 0` because the legacy close-per-xact path
+    /// fires through [`Self::close_all_open_inserts`] without setting
+    /// a deadline.
+    pub flush_deadline_trips: u64,
 }
 
 impl Emitter {
@@ -1002,6 +1053,9 @@ impl Emitter {
             resolver,
             tables: HashMap::new(),
             current_xid: None,
+            flush_deadline: None,
+            pending_max_commit_lsn: 0,
+            last_durable_commit_lsn: 0,
             stats: EmitterStats::default(),
         })
     }
@@ -1074,6 +1128,14 @@ impl Emitter {
             let plan = TablePlan::build(alloc, &rel, &mapping)?;
             // First row for this (table, xact): issue the INSERT.
             self.client.send_query(&plan.insert_sql, None)?;
+            // Start the latency-cap timer for the hold-INSERT-open
+            // path on the *first* INSERT of a fresh flush window.
+            // Subsequent tables opening within the same window share
+            // the deadline so close-all-on-trip preserves the
+            // ack-monotonicity invariant.
+            if !self.config.flush_timeout.is_zero() && self.flush_deadline.is_none() {
+                self.flush_deadline = Some(Instant::now() + self.config.flush_timeout);
+            }
             let enc = TableEncoder::new(plan)?;
             let owned_key = rel.qualified_name.as_ref().to_owned();
             self.tables.insert(owned_key, enc);
@@ -1092,7 +1154,10 @@ impl Emitter {
             self.stats.unsupported_values += 1;
             return Err(e);
         }
-        // Budget check kept simple in v1: flush + close after xact end.
+        self.pending_max_commit_lsn = self.pending_max_commit_lsn.max(committed.commit_lsn);
+        // Budget trip flushes the per-table data block but keeps the
+        // INSERT open — close happens on deadline / next xact_end
+        // when `flush_timeout == 0`.
         if enc.rows >= self.config.row_budget || enc.approx_bytes >= self.config.byte_budget {
             let key_owned = rel.qualified_name.as_ref().to_owned();
             self.flush_table(&key_owned)?;
@@ -1114,22 +1179,154 @@ impl Emitter {
         Ok(())
     }
 
-    /// Drain every per-table encoder. Called by [`Self::on_xact_end`]
-    /// and pulled out so error-paths can `?` cleanly. Successful return
-    /// is the signal [`XactBuffer::commit`](crate::xact_buffer::XactBuffer::commit)
-    /// uses to advance [`XactBufferStats::emitter_ack_lsn`](crate::xact_buffer::XactBufferStats::emitter_ack_lsn);
-    /// no per-emitter ack gauge exists because the buffer's stats are
-    /// the single source of truth for Phase 11's slot-advance gate.
-    fn drain_xact(&mut self) -> Result<(), EmitterError> {
-        // Drain by `mem::take`-ing the table map so the per-table
-        // teardown owns each encoder outright, no key-clones up front.
+    /// Per-xact landmark. In hold-open mode flushes accumulated rows
+    /// into Data blocks on each still-open INSERT (no
+    /// `send_data(None)`, no `EndOfStream` wait — cheap, no
+    /// roundtrip). In legacy mode (or when the deadline has tripped)
+    /// closes every open INSERT and drains to `EndOfStream`. Either
+    /// way, returns the highest `commit_lsn` now known durable on CH.
+    ///
+    /// `xact_buffer`'s `emitter_ack_lsn` tracks the returned value,
+    /// not the input `commit_lsn`, so hold-open shows up as
+    /// `emitter_ack_lsn` lagging `drain_lsn` until the next close.
+    fn on_xact_end_with_lsn(&mut self, commit_lsn: u64) -> Result<u64, EmitterError> {
+        let now = Instant::now();
+        let deadline_tripped = self.flush_deadline.is_some_and(|d| now >= d);
+        if deadline_tripped {
+            self.stats.flush_deadline_trips += 1;
+        }
+        let must_close = self.config.flush_timeout.is_zero() || deadline_tripped;
+        if must_close {
+            // close_all_open_inserts re-flushes any held block before
+            // the close-and-drain handshake, so we skip the cheap
+            // pre-flush below.
+            self.close_all_open_inserts()?;
+        } else {
+            // Hold-open: ship per-table data blocks on the still-open
+            // INSERTs so the server can squash them into the next
+            // part, but skip the `send_data(None)` that would finalize
+            // a part. The next close (deadline / shutdown) will
+            // finalize one part covering every block since reopen.
+            let keys: Vec<String> = self
+                .tables
+                .iter()
+                .filter(|(_, enc)| enc.rows > 0)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in keys {
+                self.flush_table(&key)?;
+            }
+        }
+        // No INSERTs open and nothing pending → an empty / untracked
+        // xact at `commit_lsn` adds no in-flight work, so the durable
+        // horizon can move to its commit. (When inserts are still
+        // open we leave `last_durable_commit_lsn` alone — bumping it
+        // here would claim durability for rows still buffered
+        // client-side.)
+        if self.tables.is_empty() && self.pending_max_commit_lsn == 0 {
+            self.last_durable_commit_lsn = self.last_durable_commit_lsn.max(commit_lsn);
+        }
+        self.current_xid = None;
+        self.stats.xacts_committed += 1;
+        Ok(self.last_durable_commit_lsn)
+    }
+
+    /// Close every still-open INSERT (`send_data(None)` + drain to
+    /// `EndOfStream` per table), then promote `pending_max_commit_lsn`
+    /// to `last_durable_commit_lsn` and reset the flush window. Called
+    /// from [`Self::on_xact_end_with_lsn`] on deadline trip or legacy
+    /// per-xact close, and from [`Self::flush_open_inserts`] for
+    /// explicit shutdown flush.
+    fn close_all_open_inserts(&mut self) -> Result<(), EmitterError> {
+        if self.tables.is_empty() {
+            // Nothing buffered, but clear the deadline so the next
+            // INSERT opening can set a fresh window.
+            self.flush_deadline = None;
+            return Ok(());
+        }
         let tables = std::mem::take(&mut self.tables);
         for (key, enc) in tables {
             self.finish_table_owned(&key, enc)?;
         }
-        self.current_xid = None;
-        self.stats.xacts_committed += 1;
+        self.last_durable_commit_lsn = self
+            .last_durable_commit_lsn
+            .max(self.pending_max_commit_lsn);
+        self.pending_max_commit_lsn = 0;
+        self.flush_deadline = None;
         Ok(())
+    }
+
+    /// Explicit flush of every open INSERT — for shutdown paths.
+    /// Equivalent to a deadline trip but doesn't require routing a
+    /// synthetic xact. Returns the post-flush durable horizon.
+    pub fn flush_open_inserts(&mut self) -> Result<u64, EmitterError> {
+        self.close_all_open_inserts()?;
+        Ok(self.last_durable_commit_lsn)
+    }
+
+    /// Idle-tick variant: closes only when [`Self::flush_deadline`]
+    /// has elapsed. Cheap to call on every wakeup since the common
+    /// case is "deadline not yet set" (no rows held) or "deadline
+    /// still in the future" (recently opened). Counted under
+    /// `flush_deadline_trips` on close.
+    pub fn flush_if_deadline_tripped(&mut self) -> Result<u64, EmitterError> {
+        if self.flush_deadline.is_some_and(|d| Instant::now() >= d) {
+            self.stats.flush_deadline_trips += 1;
+            self.close_all_open_inserts()?;
+        }
+        Ok(self.last_durable_commit_lsn)
+    }
+
+    /// Bounded-retry wrapper around [`Self::flush_if_deadline_tripped`].
+    /// Mirrors [`Self::on_xact_end_with_retry`].
+    pub async fn flush_if_deadline_tripped_with_retry(&mut self) -> Result<u64, EmitterError> {
+        let retry = self.config.retry.clone();
+        let mut attempt = 0u32;
+        let mut backoff = retry.initial_backoff;
+        loop {
+            match self.flush_if_deadline_tripped() {
+                Ok(ack) => return Ok(ack),
+                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
+                    self.stats.retries_attempted += 1;
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+                    self.reconnect().await?;
+                    self.redo_open_inserts()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Bounded-retry wrapper around [`Self::flush_open_inserts`].
+    /// Called from the daemon shutdown path.
+    pub async fn flush_open_inserts_with_retry(&mut self) -> Result<u64, EmitterError> {
+        let retry = self.config.retry.clone();
+        let mut attempt = 0u32;
+        let mut backoff = retry.initial_backoff;
+        loop {
+            match self.flush_open_inserts() {
+                Ok(ack) => return Ok(ack),
+                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
+                    self.stats.retries_attempted += 1;
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+                    self.reconnect().await?;
+                    self.redo_open_inserts()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Read-only snapshot of the durable horizon. Cheap; the
+    /// xact_buffer doesn't poll this (it threads ack through
+    /// [`TupleObserver::on_xact_end`]), but external probes (status
+    /// line, metrics) can use it.
+    pub fn last_durable_commit_lsn(&self) -> u64 {
+        self.last_durable_commit_lsn
     }
 
     fn finish_table_owned(
@@ -1195,7 +1392,7 @@ impl Emitter {
     /// Re-issue `INSERT … FORMAT Native` for every per-table encoder
     /// currently holding buffered rows. Called after [`Self::reconnect`]
     /// so the buffers can flush through the new connection on the next
-    /// [`Self::drain_xact`].
+    /// [`Self::on_xact_end_with_lsn`].
     fn redo_open_inserts(&mut self) -> Result<(), EmitterError> {
         let sqls: Vec<String> = self
             .tables
@@ -1236,15 +1433,15 @@ impl Emitter {
         }
     }
 
-    /// Wrap [`Self::drain_xact`] in bounded reconnect+retry. Same shape
-    /// as [`Self::route_with_retry`] — see notes there.
-    pub async fn drain_xact_with_retry(&mut self) -> Result<(), EmitterError> {
+    /// Wrap [`Self::on_xact_end_with_lsn`] in bounded reconnect+retry.
+    /// Same shape as [`Self::route_with_retry`] — see notes there.
+    pub async fn on_xact_end_with_retry(&mut self, commit_lsn: u64) -> Result<u64, EmitterError> {
         let retry = self.config.retry.clone();
         let mut attempt = 0u32;
         let mut backoff = retry.initial_backoff;
         loop {
-            match self.drain_xact() {
-                Ok(()) => return Ok(()),
+            match self.on_xact_end_with_lsn(commit_lsn) {
+                Ok(ack) => return Ok(ack),
                 Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
                     self.stats.retries_attempted += 1;
                     attempt += 1;
@@ -1301,14 +1498,52 @@ impl TupleObserver for EmitterObserver {
 
     fn on_xact_end<'a>(
         &'a mut self,
+        commit_lsn: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.emitter
+                .on_xact_end_with_retry(commit_lsn)
+                .await
+                .map_err(DecoderSinkError::from)
+        })
+    }
+
+    /// Idle wakeup: close any held-open INSERT whose deadline has
+    /// elapsed. Hot path when `flush_timeout > 0` and traffic stops —
+    /// without this the last burst of rows would stay buffered
+    /// client-side past the deadline, since `on_xact_end` only fires
+    /// per committed xact.
+    fn on_idle<'a>(
+        &'a mut self,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
             self.emitter
-                .drain_xact_with_retry()
+                .flush_if_deadline_tripped_with_retry()
                 .await
-                .map_err(DecoderSinkError::from)
+                .map_err(DecoderSinkError::from)?;
+            Ok(())
+        })
+    }
+
+    /// Daemon shutdown hook: force-close every held-open INSERT
+    /// regardless of deadline. Any rows still in flight when the
+    /// daemon stops would otherwise stay buffered client-side and
+    /// disappear when the process exits.
+    fn on_close<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.emitter
+                .flush_open_inserts_with_retry()
+                .await
+                .map_err(DecoderSinkError::from)?;
+            Ok(())
         })
     }
 }
