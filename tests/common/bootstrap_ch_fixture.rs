@@ -2,11 +2,12 @@
 //! drills (`phase14_bootstrap_direct_ch.rs`,
 //! `phase14_bootstrap_object_store_ch.rs`).
 //!
-//! Owns: the `ChServer` subprocess wrapper (copied from
-//! `phase8_e2e.rs` since that struct stays private to its test
-//! binary), TOML CH-config rendering for the table mapping the daemon
-//! consumes via `--ch-config`, and the `assert_ch_matches_source`
-//! count/sum/md5 oracle the two drills share.
+//! Owns: the `ChServer` subprocess wrapper (lifted from
+//! `phase8_e2e.rs` during PRE15 so the phase 8, phase 14 bootstrap, and
+//! phase 14 kill-restart drills share one driver), TOML CH-config
+//! rendering for the table mapping the daemon consumes via
+//! `--ch-config`, and the `assert_ch_matches_source` count/sum/md5
+//! oracle the two drills share.
 //!
 //! Included from the test files via `#[path = "common/..."]` rather
 //! than wired through `tests/common/mod.rs` because Cargo would
@@ -25,9 +26,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use walshadow::shadow::Shadow;
 
-/// ClickHouse server subprocess wrapper. Mirrors the inline harness
-/// in `tests/phase8_e2e.rs` — re-exposed here so both bootstrap drills
-/// share one driver.
+/// ClickHouse server subprocess wrapper shared by the phase 8 DDL
+/// drill, both phase 14 bootstrap drills, and the phase 14
+/// kill-restart drill.
 pub struct ChServer {
     child: Child,
     pub port: u16,

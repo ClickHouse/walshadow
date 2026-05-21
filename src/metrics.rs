@@ -70,6 +70,8 @@ pub struct MetricsSnapshot {
     pub xacts_aborted_total: u64,
     pub decoder_decoded_total: u64,
     pub decoder_partial_total: u64,
+    pub decoder_toast_chunks_total: u64,
+    pub decoder_toast_malformed_total: u64,
     pub emitter_rows_total: u64,
     pub emitter_blocks_total: u64,
     pub emitter_xacts_total: u64,
@@ -298,6 +300,18 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "Decoded tuples with prefix/suffix-from-old elided columns.",
             "counter",
             snap.decoder_partial_total,
+        ),
+        (
+            "walshadow_decoder_toast_chunks_total",
+            "TOAST chunks routed into the xact buffer's chunk slot.",
+            "counter",
+            snap.decoder_toast_chunks_total,
+        ),
+        (
+            "walshadow_decoder_toast_malformed_total",
+            "TOAST inserts the decoder couldn't reinterpret as a chunk.",
+            "counter",
+            snap.decoder_toast_malformed_total,
         ),
         (
             "walshadow_emitter_rows_total",

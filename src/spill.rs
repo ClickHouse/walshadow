@@ -19,10 +19,17 @@
 //! ## On-disk layout
 //!
 //! ```text
+//! [2 bytes "WS" magic] [u16 LE version] then repeating:
 //! [u8 tag] [u32 len LE] [body of `len` bytes]
 //!   tag = 0 → SpillEntry::Heap   (body = encoded DecodedHeap)
 //!   tag = 1 → SpillEntry::Chunk  (body = encoded ToastChunk)
 //! ```
+//!
+//! Version bumps on any change to the body encoding. Spill files do
+//! not survive a daemon restart (resume contract wipes the dir on
+//! boot), so the magic + version exists for self-check honesty: a
+//! mid-restart format mismatch surfaces as [`SpillError::Format`]
+//! rather than as a silent body misparse.
 //!
 //! The outer length lets [`SpillReader::next`] skip a malformed body
 //! without forcing the whole file. v1 propagates any malformation as
@@ -97,6 +104,14 @@ pub enum SpillError {
 
 pub type Result<T> = std::result::Result<T, SpillError>;
 
+/// File-leading magic. Picked to be ASCII for `xxd`-friendly debug.
+pub const SPILL_MAGIC: [u8; 2] = *b"WS";
+/// Current on-disk format. v2 covers `HeapOp::Truncate`'s tag-4
+/// (PHASE14 §3) and `DrainEntry::Catalog` lift (PHASE15 §6 will reuse).
+/// v1 was the pre-PRE15 unversioned shape; we never wrote a v1 header,
+/// so older files are simply rejected as "no magic".
+pub const SPILL_VERSION: u16 = 2;
+
 /// Filesystem layout owner. Creates the dir if missing; offers a
 /// `writer(xid, first_lsn)` factory and a startup `clear`.
 pub struct SpillStore {
@@ -120,16 +135,20 @@ impl SpillStore {
     /// rotation don't collide on disk.
     pub async fn writer(&self, xid: u32, first_lsn: u64) -> Result<SpillWriter> {
         let path = self.dir.join(format!("xid-{xid:010}-{first_lsn:016X}.bin"));
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .read(true)
             .open(&path)
             .await?;
+        let mut header = [0u8; 4];
+        header[..2].copy_from_slice(&SPILL_MAGIC);
+        header[2..].copy_from_slice(&SPILL_VERSION.to_le_bytes());
+        file.write_all(&header).await?;
         Ok(SpillWriter {
             file,
             path,
-            byte_count: 0,
+            byte_count: header.len() as u64,
         })
     }
 
@@ -209,6 +228,7 @@ impl SpillWriter {
         Ok(SpillReader {
             file,
             path: self.path,
+            header_checked: false,
         })
     }
 
@@ -228,6 +248,12 @@ impl SpillWriter {
 pub struct SpillReader {
     file: File,
     path: PathBuf,
+    /// `false` until `next()` reads + verifies the leading
+    /// [`SPILL_MAGIC`] + version. Header read is lazy so tests
+    /// constructing a [`SpillReader`] over synthetic bytes can fail
+    /// cleanly with [`SpillError::Format`] when the magic doesn't
+    /// match, mirroring the production "stale spill on disk" path.
+    header_checked: bool,
 }
 
 impl SpillReader {
@@ -235,8 +261,39 @@ impl SpillReader {
         &self.path
     }
 
+    async fn check_header(&mut self) -> Result<()> {
+        let mut buf = [0u8; 4];
+        if let Err(e) = self.file.read_exact(&mut buf).await {
+            return Err(match e.kind() {
+                io::ErrorKind::UnexpectedEof => SpillError::Format {
+                    offset: 0,
+                    detail: "spill file shorter than 4-byte header".into(),
+                },
+                _ => e.into(),
+            });
+        }
+        if buf[..2] != SPILL_MAGIC {
+            return Err(SpillError::Format {
+                offset: 0,
+                detail: format!("bad magic {:02x?}, expected WS", &buf[..2]),
+            });
+        }
+        let version = u16::from_le_bytes([buf[2], buf[3]]);
+        if version != SPILL_VERSION {
+            return Err(SpillError::Format {
+                offset: 2,
+                detail: format!("unsupported spill version {version}, expected {SPILL_VERSION}"),
+            });
+        }
+        self.header_checked = true;
+        Ok(())
+    }
+
     /// One entry per call. Returns `Ok(None)` at clean EOF.
     pub async fn next(&mut self) -> Result<Option<SpillEntry>> {
+        if !self.header_checked {
+            self.check_header().await?;
+        }
         let mut tag_buf = [0u8; 1];
         match self.file.read_exact(&mut tag_buf).await {
             Ok(_) => {}
@@ -840,19 +897,44 @@ mod tests {
     async fn malformed_tag_surfaces_format_error() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("xid-0000000000-0000000000000000.bin");
-        // tag=255 + len=0 + no body
-        tokio::fs::write(&path, &[255u8, 0u8, 0u8, 0u8, 0u8])
-            .await
-            .unwrap();
+        // Valid header + tag=255 + len=0 + no body. Header lets the
+        // reader past `check_header`; tag=255 then trips the entry
+        // dispatch.
+        let mut bytes = Vec::with_capacity(6 + 5);
+        bytes.extend_from_slice(&SPILL_MAGIC);
+        bytes.extend_from_slice(&SPILL_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&[255u8, 0u8, 0u8, 0u8, 0u8]);
+        tokio::fs::write(&path, &bytes).await.unwrap();
         let mut r = SpillReader {
             file: OpenOptions::new().read(true).open(&path).await.unwrap(),
             path,
+            header_checked: false,
         };
         let err = r.next().await.expect_err("must error on bad tag");
         match err {
             SpillError::Format { detail, .. } => {
                 assert!(detail.contains("unknown entry tag"), "{detail}");
             }
+            other => panic!("expected Format, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_magic_surfaces_format_error() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("xid-0000000000-0000000000000000.bin");
+        // No header bytes — first read should fail on the magic check.
+        tokio::fs::write(&path, &[0u8, 0u8, 0u8, 0u8])
+            .await
+            .unwrap();
+        let mut r = SpillReader {
+            file: OpenOptions::new().read(true).open(&path).await.unwrap(),
+            path,
+            header_checked: false,
+        };
+        let err = r.next().await.expect_err("must error on missing magic");
+        match err {
+            SpillError::Format { detail, .. } => assert!(detail.contains("bad magic"), "{detail}"),
             other => panic!("expected Format, got {other:?}"),
         }
     }

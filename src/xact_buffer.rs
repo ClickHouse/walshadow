@@ -1,7 +1,7 @@
 //! Phase 6 — per-xid xact buffer + TOAST reassembly.
 //!
-//! Sits between [`DecoderSink`](crate::decoder_sink::DecoderSink)'s
-//! per-record output and the downstream emitter. Holds every
+//! Sits between [`BufferingDecoderSink`]'s per-record output and the
+//! downstream emitter. Holds every
 //! [`DecodedHeap`] for a given xid plus every TOAST chunk
 //! `(toast_relid, value_id, chunk_seq)` until the matching
 //! `XLOG_XACT_COMMIT` / `XLOG_XACT_ABORT` lands. Commit drains in WAL
@@ -1031,10 +1031,9 @@ fn reassemble(
 }
 
 /// `RecordSink` that observes `RM_XACT_ID` records and drives the
-/// buffer's commit/abort path. Separate from
-/// [`DecoderSink`](crate::decoder_sink::DecoderSink) because xact
-/// records are `Decision::Keep` (shadow PG needs them for CLOG) so
-/// the decoder sink skips them by contract.
+/// buffer's commit/abort path. Separate from [`BufferingDecoderSink`]
+/// because xact records are `Decision::Keep` (shadow PG needs them
+/// for CLOG) so the decoder sink skips them by contract.
 pub struct XactRecordSink<O: TupleObserver + Send> {
     buffer: Arc<Mutex<XactBuffer>>,
     /// Shared with `BufferingDecoderSink`. Drain calls
@@ -1199,8 +1198,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
 /// the xact buffer keyed by `xid`. Toast-relation INSERTs
 /// (`rel.kind == 't'`) are reinterpreted as
 /// [`ToastChunk`](crate::spill::ToastChunk)s and parked under their
-/// `(toast_relid, value_id)` slot for drain-time reassembly. Mirrors
-/// [`DecoderSink`](crate::decoder_sink::DecoderSink)'s contract: only
+/// `(toast_relid, value_id)` slot for drain-time reassembly. Only
 /// `Decision::Drop` records reach this sink (catalog-keep stays on
 /// the shadow-replay path); semantic errors absorb into
 /// [`DecoderStats`] rather than poisoning the stream.
@@ -1212,14 +1210,6 @@ pub struct BufferingDecoderSink {
     /// without contending on `self`. Mutations stay short — the lock
     /// is never held across `.await`.
     stats: Arc<std::sync::Mutex<DecoderStats>>,
-    /// Counts of TOAST chunks routed to the buffer. Distinct from
-    /// `stats.inserts`, which only counts non-toast user-table writes.
-    pub toast_chunks_buffered: u64,
-    /// Toast inserts the decoder couldn't reinterpret as a chunk
-    /// (missing chunk_id/seq/data columns, type mismatch). Surfaces
-    /// so a corrupt catalog or a future TOAST layout shows up as a
-    /// counter, not silent loss.
-    pub toast_chunks_malformed: u64,
 }
 
 impl BufferingDecoderSink {
@@ -1228,8 +1218,6 @@ impl BufferingDecoderSink {
             catalog,
             buffer,
             stats: Arc::new(std::sync::Mutex::new(DecoderStats::default())),
-            toast_chunks_buffered: 0,
-            toast_chunks_malformed: 0,
         }
     }
 
@@ -1300,10 +1288,7 @@ impl BufferingDecoderSink {
                 new: None,
                 old: None,
             };
-            self.bump(|s| {
-                s.decoded += 1;
-                s.truncates += 1;
-            });
+            self.bump(|s| s.record(&decoded));
             let mut buf = self.buffer.lock().await;
             buf.on_heap(decoded).await.map_err(SinkError::from)?;
         }
@@ -1375,34 +1360,17 @@ impl RecordSink for BufferingDecoderSink {
                 return Ok(());
             }
             for decoded in decoded_set {
-                let partial = decoded.new.as_ref().is_some_and(|t| t.partial)
-                    || decoded.old.as_ref().is_some_and(|t| t.partial);
-                self.bump(|s| {
-                    s.decoded += 1;
-                    match decoded.op {
-                        HeapOp::Insert => s.inserts += 1,
-                        HeapOp::Update => s.updates += 1,
-                        HeapOp::HotUpdate => s.hot_updates += 1,
-                        HeapOp::Delete => s.deletes += 1,
-                        // Truncate routes via handle_truncate above, so
-                        // this arm is unreachable in steady state.
-                        // Counting it is harmless defensively.
-                        HeapOp::Truncate => s.truncates += 1,
-                    }
-                    if partial {
-                        s.partial += 1;
-                    }
-                });
+                self.bump(|s| s.record(&decoded));
                 if rel.kind == 't' {
                     let xid = decoded.xid;
                     if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
-                        self.toast_chunks_buffered += 1;
+                        self.bump(|s| s.toast_chunks_buffered += 1);
                         let mut buf = self.buffer.lock().await;
                         buf.on_toast_chunk(chunk, xid)
                             .await
                             .map_err(SinkError::from)?;
                     } else {
-                        self.toast_chunks_malformed += 1;
+                        self.bump(|s| s.toast_chunks_malformed += 1);
                     }
                 } else {
                     let mut buf = self.buffer.lock().await;

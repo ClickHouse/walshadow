@@ -1,34 +1,21 @@
-//! Phase 5 — `RecordSink` adapter wiring the heap-tuple decoder to
-//! [`WalStream`](crate::wal_stream::WalStream).
+//! Phase 5 — shared types for the heap-tuple decoder fan-out:
+//! [`TupleObserver`] (downstream of [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink)
+//! 's commit drain), [`DecoderStats`] counters, [`DecoderSinkError`].
 //!
-//! Routes records whose filter decision is [`Decision::Drop`] (user
-//! relations) through [`decode_heap_record`], fans the output to a
-//! pluggable observer. Decoder hot path needs the relation descriptor
-//! ([`ShadowCatalog::relation_at`] gated on shadow's replay LSN), so
-//! the sink owns an `Arc<Mutex<ShadowCatalog>>` clone — see
-//! `bin/stream.rs` for the daemon-side wiring.
-//!
-//! Stats coverage matches the PHASE 5 plan's "Rollback status,
-//! explicit" caveat: every successful decode increments `decoded`;
-//! `partial` counts prefix/suffix-compressed UPDATEs that Phase 6 must
-//! reassemble. `unsupported_rmgr_info`, `skipped_no_block`, and
-//! close the per-class accounting so operators can tell silent loss
-//! from real volume. Catalog gate timeouts poison the stream — no
-//! `replay_timeout` counter, since silent loss is impossible by
-//! construction.
+//! Per-record dispatch lives in
+//! [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink);
+//! the production observer is [`crate::ch_emitter::EmitterObserver`].
+//! Catalog gate timeouts poison the stream — no `replay_timeout`
+//! counter, since silent loss is impossible by construction.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::Mutex;
-use wal_rs::pg::walparser::RmId;
 
-use crate::filter::Decision;
-use crate::heap_decoder::{CommittedTuple, DecodeError, decode_heap_record};
-use crate::shadow_catalog::{CatalogError, ShadowCatalog};
-use crate::wal_stream::{Record, RecordSink, SinkError};
+use crate::heap_decoder::{CommittedTuple, DecodeError};
+use crate::shadow_catalog::CatalogError;
+use crate::wal_stream::SinkError;
 
 #[derive(Debug, Error)]
 pub enum DecoderSinkError {
@@ -47,13 +34,11 @@ impl From<DecoderSinkError> for SinkError {
 }
 
 /// Trait wrapper for the destination of decoded + committed heap
-/// events. Phase 5 fans into `MetricsTupleObserver` (production
-/// counters) plus an in-memory collector for integration tests. Phase
-/// 7 plugs the CH-emitter observer in here, which is why
-/// [`CommittedTuple`] (not [`DecodedHeap`]) is the wire type — the
-/// emitter wants `commit_ts` for its `_commit_ts` synthetic column.
-/// Phase 5's pre-buffer [`DecoderSink`] path passes `commit_ts = 0`
-/// since the commit record hasn't landed at that point.
+/// events. Production fans into `MetricsTupleObserver` (counters) or
+/// the CH-emitter observer; tests use the in-memory collector. The
+/// CH emitter wants `commit_ts` for its `_commit_ts` synthetic
+/// column, so [`CommittedTuple`] (not [`DecodedHeap`]) is the wire
+/// type.
 ///
 /// `on_xact_end` fires after every tuple in a committed xact has been
 /// delivered. Phase 7's CH emitter uses it as the per-xact landmark
@@ -161,6 +146,14 @@ pub struct DecoderStats {
     /// `HeapOp::Truncate` events. Counted by
     /// [`BufferingDecoderSink::on_record`]'s pre-decode intercept.
     pub truncates: u64,
+    /// TOAST chunks routed into the xact buffer's chunk slot. Distinct
+    /// from `inserts`, which only counts user-table writes.
+    pub toast_chunks_buffered: u64,
+    /// TOAST inserts the decoder couldn't reinterpret as a chunk
+    /// (missing chunk_id/seq/data columns, type mismatch). Surfaces
+    /// so a corrupt catalog or a future TOAST layout shows up as a
+    /// counter, not silent loss.
+    pub toast_chunks_malformed: u64,
 }
 
 #[derive(Debug, Default)]
@@ -174,21 +167,7 @@ impl TupleObserver for MetricsTupleObserver {
         committed: &'a CommittedTuple,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
         Box::pin(async move {
-            use crate::heap_decoder::HeapOp;
-            let decoded = &committed.decoded;
-            self.stats.decoded += 1;
-            match decoded.op {
-                HeapOp::Insert => self.stats.inserts += 1,
-                HeapOp::Update => self.stats.updates += 1,
-                HeapOp::HotUpdate => self.stats.hot_updates += 1,
-                HeapOp::Delete => self.stats.deletes += 1,
-                HeapOp::Truncate => self.stats.truncates += 1,
-            }
-            if decoded.new.as_ref().map(|t| t.partial).unwrap_or(false)
-                || decoded.old.as_ref().map(|t| t.partial).unwrap_or(false)
-            {
-                self.stats.partial += 1;
-            }
+            self.stats.record(&committed.decoded);
             Ok(())
         })
     }
@@ -214,130 +193,34 @@ impl TupleObserver for CollectingTupleObserver {
     }
 }
 
-/// `RecordSink` wiring. Each [`Record`] crosses two gates:
-///
-/// 1. Decision gate: only `Decision::Drop` records reach the decoder.
-///    `Keep` records ride the existing catalog-replay path (shadow PG
-///    consumes them); decoding them would double-count or misclassify.
-/// 2. rmgr gate: only `RmId::Heap` / `RmId::Heap2` are decoded today.
-///    Future expansion (`RmId::Btree` for unique-index rows?) lives
-///    behind the same gate.
-///
-/// On `Decode` / `Catalog` errors the sink **does not poison** the
-/// stream: errors are absorbed into `DecoderStats` so a single bad
-/// tuple won't take down the rest of the segment. The poison contract
-/// of [`WalStream`](crate::wal_stream::WalStream) is reserved for
-/// errors that compromise byte-level integrity (filter parse failure,
-/// IO loss); decoder semantic errors don't qualify.
-pub struct DecoderSink<O: TupleObserver> {
-    catalog: Arc<Mutex<ShadowCatalog>>,
-    observer: O,
-    pub stats: DecoderStats,
-}
-
-impl<O: TupleObserver> DecoderSink<O> {
-    pub fn new(catalog: Arc<Mutex<ShadowCatalog>>, observer: O) -> Self {
-        Self {
-            catalog,
-            observer,
-            stats: DecoderStats::default(),
+impl DecoderStats {
+    /// Bump per-op counters off one decoded heap event. Single source
+    /// of truth for the `HeapOp → counter` mapping; every decoder
+    /// dispatch site routes through here so new ops only add code in
+    /// one place.
+    pub fn record(&mut self, decoded: &crate::heap_decoder::DecodedHeap) {
+        use crate::heap_decoder::HeapOp;
+        self.decoded += 1;
+        match decoded.op {
+            HeapOp::Insert => self.inserts += 1,
+            HeapOp::Update => self.updates += 1,
+            HeapOp::HotUpdate => self.hot_updates += 1,
+            HeapOp::Delete => self.deletes += 1,
+            HeapOp::Truncate => self.truncates += 1,
+        }
+        let partial = decoded.new.as_ref().is_some_and(|t| t.partial)
+            || decoded.old.as_ref().is_some_and(|t| t.partial);
+        if partial {
+            self.partial += 1;
         }
     }
 
-    /// Borrow the observer mutably — test convenience to inspect
-    /// downstream state without re-extracting the sink.
-    pub fn observer_mut(&mut self) -> &mut O {
-        &mut self.observer
-    }
-
-    /// Stats snapshot; the production daemon logs this in the status line.
-    pub fn stats(&self) -> &DecoderStats {
-        &self.stats
-    }
-}
-
-impl<O: TupleObserver> RecordSink for DecoderSink<O> {
-    fn on_record<'a>(
-        &'a mut self,
-        record: &'a Record<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            if record.decision != Decision::Drop {
-                return Ok(());
-            }
-            let rm = record.parsed.header.resource_manager_id;
-            if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
-                return Ok(());
-            }
-            let rfn = match record.parsed.blocks.first() {
-                Some(b) => b.header.location.rel,
-                None => {
-                    self.stats.skipped_no_block += 1;
-                    return Ok(());
-                }
-            };
-            let mut cat = self.catalog.lock().await;
-            let rel = match cat.relation_at(rfn, record.source_lsn).await {
-                Ok(r) => r,
-                Err(CatalogError::NotFoundByFilenode(_)) => {
-                    self.stats.catalog_not_found += 1;
-                    return Ok(());
-                }
-                // PHASE13 §6: ReplayTimeout poisons the stream so the
-                // daemon exits cleanly. Phase 11 cursor resumes from
-                // `dispatched_lsn` on the next boot.
-                Err(e) => return Err(DecoderSinkError::from(e).into()),
-            };
-            drop(cat);
-            let decoded_set = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
-                Ok(set) => set,
-                Err(e) => return Err(DecoderSinkError::from(e).into()),
-            };
-            if decoded_set.is_empty() {
-                self.stats.skipped_op += 1;
-                return Ok(());
-            }
-            use crate::heap_decoder::HeapOp;
-            for decoded in decoded_set {
-                self.stats.decoded += 1;
-                match decoded.op {
-                    HeapOp::Insert => self.stats.inserts += 1,
-                    HeapOp::Update => self.stats.updates += 1,
-                    HeapOp::HotUpdate => self.stats.hot_updates += 1,
-                    HeapOp::Delete => self.stats.deletes += 1,
-                    HeapOp::Truncate => self.stats.truncates += 1,
-                }
-                if decoded.new.as_ref().map(|t| t.partial).unwrap_or(false)
-                    || decoded.old.as_ref().map(|t| t.partial).unwrap_or(false)
-                {
-                    self.stats.partial += 1;
-                }
-                // Phase 5 unbuffered path emits the moment the heap
-                // record lands — no commit record yet, so commit_ts=0
-                // and commit_lsn=0. Phase 6's BufferingDecoderSink
-                // takes over in the production dispatch chain.
-                let committed = CommittedTuple {
-                    decoded,
-                    commit_ts: 0,
-                    commit_lsn: 0,
-                };
-                self.observer
-                    .on_tuple(&committed)
-                    .await
-                    .map_err(SinkError::from)?;
-            }
-            Ok(())
-        })
-    }
-}
-
-impl DecoderStats {
     /// Single-line summary suitable for the daemon's status line. Skips
     /// zero buckets so a quiet workload shows a tight format.
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
         let mut s = format!("decoded={}", self.decoded);
-        let pairs: [(&str, u64); 8] = [
+        let pairs: [(&str, u64); 10] = [
             ("ins", self.inserts),
             ("upd", self.updates),
             ("hot", self.hot_updates),
@@ -346,6 +229,8 @@ impl DecoderStats {
             ("partial", self.partial),
             ("no_blk", self.skipped_no_block),
             ("not_found", self.catalog_not_found),
+            ("toast", self.toast_chunks_buffered),
+            ("toast_bad", self.toast_chunks_malformed),
         ];
         for (label, n) in pairs {
             if n > 0 {

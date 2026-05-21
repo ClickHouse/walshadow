@@ -155,6 +155,11 @@ docs that are not yet committed work sit alongside as peers.
   cadence + manifest shape stay segment-aligned (shadow's
   `restore_command` still needs whole segments).
   [PHASE13.md](PHASE13.md).
+- **PRE15** — pre-PHASE15 cleanup: delete unbuffered `DecoderSink`,
+  single `DecoderStats::record` helper, lift `toast_chunks_*` into
+  `DecoderStats` + metrics, lift `ChServer` test fixture into
+  `tests/common/`, add `WS` magic + u16 version header to spill
+  files. Audits PHASE14 retro items. [PRE15.md](PRE15.md).
 - **PRE5** — pre-Phase-5 cleanup: streaming filter pipeline
   (`WalStream`, `RecordSink`, `DirSegmentSink`), `SourceFeed`
   (`START_REPLICATION PHYSICAL` pump), `walshadow-stream` binary,

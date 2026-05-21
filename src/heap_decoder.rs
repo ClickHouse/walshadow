@@ -310,10 +310,8 @@ pub enum HeapOp {
 
 /// One drained tuple, fully reassembled. Phase 7's CH emitter consumes
 /// this as `(rfn, xid, source_lsn, commit_ts, op, new, old)`. The
-/// `commit_ts` half is the commit-record `xact_time`; Phase 5's
-/// pre-buffer [`DecoderSink`](crate::decoder_sink::DecoderSink) path
-/// wraps with `commit_ts = 0` since the commit record hasn't landed
-/// yet at that hop.
+/// `commit_ts` half is the commit-record `xact_time` carried through
+/// [`crate::xact_buffer::XactBuffer::commit`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTuple {
     pub decoded: DecodedHeap,

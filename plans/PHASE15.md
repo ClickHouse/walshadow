@@ -385,11 +385,18 @@ lands `auto_create` / `type_overrides` / `order_by_default` /
 
 ```rust
 pub struct ResolvedConfig {
-    pub tables:     HashMap<String, TableMapping>,
-    pub namespaces: HashMap<String, NamespaceMapping>, // §5
     pub global:     GlobalMapping,                     // §6's drop_strategy + future PHASE16 keys
+    pub namespaces: HashMap<String, NamespaceMapping>, // §5
+    pub tables:     HashMap<String, TableMapping>,
+    pub columns:    HashMap<(String, String), ColumnMapping>, // (qualified_name, src_attname) — sink for type_overrides
 }
 ```
+
+`columns` is the per-(table, column) overlay sink. PHASE15 fills
+it from `[namespace.<ns>] type_overrides`; PHASE16 adds
+`walshadow.config_column` as a higher-precedence source feeding
+the same map. Emitter resolves a column's effective `ColumnMapping`
+by overlay-first then `TableMapping.columns` fallback
 
 Today's only producer is the TOML loader; PHASE16 plugs the
 WAL-config decoder + CLI override at the same merge point without

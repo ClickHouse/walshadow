@@ -603,8 +603,7 @@ async fn run(args: Args) -> Result<()> {
     // tracker→drain wire is hot from the first record. Wrapped in
     // with_transient_retry so a still-warming shadow doesn't kill the
     // daemon on boot. PRE5b7: catalog lives in Arc<Mutex<_>>; clones
-    // fan out to the drain task today and to Phase 5's DecoderSink
-    // once it lands.
+    // fan out to the drain task, BufferingDecoderSink, and oracle.
     let shadow_conninfo = socket_conninfo(
         args.shadow_socket_dir
             .to_str()
@@ -1307,6 +1306,8 @@ async fn populate_metrics(
         xacts_aborted_total: xact_stats.aborted_xacts_total,
         decoder_decoded_total: decoder_stats.decoded,
         decoder_partial_total: decoder_stats.partial,
+        decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered,
+        decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed,
         emitter_rows_total: 0,
         emitter_blocks_total: 0,
         emitter_xacts_total: 0,

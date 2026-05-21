@@ -621,9 +621,9 @@ async fn replident_matrix_default_nothing_full_index() {
 /// PRE5b7 sanity check: with the catalog wrapped in
 /// `Arc<tokio::sync::Mutex<_>>` at the daemon level, two tasks holding
 /// clones of the same `Arc` serialise cleanly across `relation_at`.
-/// Validates the wrap shape Phase 5's `DecoderSink` will rely on, not
-/// the lock-free hit path (that lands when the spec'd `&self`
-/// refactor follows up).
+/// Validates the wrap shape `BufferingDecoderSink` relies on, not the
+/// lock-free hit path (that lands when the spec'd `&self` refactor
+/// follows up).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arc_mutex_catalog_serialises_relation_at_across_tasks() {
     if !pg_available() {

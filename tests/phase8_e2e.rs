@@ -19,12 +19,14 @@
 //! fresh oids on shadow; only a `pg_basebackup` (or the BASE_BACKUP
 //! primitive wal-rs already vendors) preserves cluster identity.
 
+#[path = "common/bootstrap_ch_fixture.rs"]
+mod fx;
+
 use std::fs;
 use std::io::Write;
 use std::net::TcpStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,8 @@ use walshadow::wal_stream::{
 };
 use walshadow::xact_buffer::{BufferingDecoderSink, XactBuffer, XactBufferConfig, XactRecordSink};
 
+use fx::ChServer;
+
 // Non-overlapping ports — Phase 8 tests live in the 56100-range; pick
 // one slot per (cluster, ch-server) per test so a leftover from a
 // crashed prior run doesn't shadow the next one's port binding.
@@ -61,35 +65,7 @@ const CH_TCP_PORT_S: u16 = 17229;
 const CH_HTTP_PORT_S: u16 = 17230;
 const WALSENDER_PORT_S: u16 = 17280;
 
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn pg_basebackup_available() -> bool {
-    Command::new("pg_basebackup")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn clickhouse_available() -> bool {
-    Command::new("clickhouse")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+use fx::{clickhouse_available, pg_available, pg_basebackup_available};
 
 fn make_pg(tmp: &tempfile::TempDir, name: &str, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(
@@ -192,148 +168,8 @@ fn enable_recovery(data_dir: &Path, restore_from: &Path, walsender_port: u16) ->
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ClickHouse server harness
-// ---------------------------------------------------------------------------
-
-struct ChServer {
-    child: Child,
-    port: u16,
-    #[allow(dead_code)]
-    tmp: tempfile::TempDir,
-}
-
-impl ChServer {
-    fn spawn(tmp: tempfile::TempDir, tcp_port: u16, http_port: u16) -> Result<Self> {
-        let data_dir = tmp.path().join("ch");
-        fs::create_dir_all(&data_dir)?;
-        let log_dir = tmp.path().join("ch-logs");
-        fs::create_dir_all(&log_dir)?;
-        // CH server's embedded config defaults to listening on
-        // mysql_port (9004), postgresql_port (9005), grpc_port (9100),
-        // prometheus.port (9363), interserver_http_port (9009) — all
-        // unrelated to the Native TCP path the test uses. Two test
-        // runs sharing a host can collide on those defaults; override
-        // the listeners we DON'T use to fresh ports (or to remove
-        // them — CH accepts `--<port>=` empty-string as "don't bind").
-        let child = Command::new("clickhouse")
-            .args([
-                "server",
-                "--",
-                &format!("--tcp_port={tcp_port}"),
-                &format!("--http_port={http_port}"),
-                &format!("--interserver_http_port={}", http_port + 1),
-                "--mysql_port=",
-                "--postgresql_port=",
-                "--grpc_port=",
-                "--prometheus.port=",
-                "--listen_host=127.0.0.1",
-                &format!("--path={}/", data_dir.display()),
-                &format!("--logger.log={}/server.log", log_dir.display()),
-                &format!("--logger.errorlog={}/error.log", log_dir.display()),
-                "--logger.level=warning",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            // CH server forks a watchdog parent + a worker child. Put
-            // both in a fresh process group so Drop can SIGTERM the
-            // whole tree — `child.kill()` only signals the immediate
-            // pid and would orphan the worker.
-            .process_group(0)
-            .spawn()
-            .context("spawn clickhouse server")?;
-        let s = Self {
-            child,
-            port: tcp_port,
-            tmp,
-        };
-        s.wait_for_listen(Duration::from_secs(60))?;
-        Ok(s)
-    }
-
-    fn wait_for_listen(&self, deadline: Duration) -> Result<()> {
-        let start = Instant::now();
-        let addr = format!("127.0.0.1:{}", self.port);
-        while start.elapsed() < deadline {
-            if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
-                .is_ok()
-                && self.query("SELECT 1").is_ok()
-            {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        bail!("clickhouse server failed to accept queries within {deadline:?}");
-    }
-
-    fn query(&self, sql: &str) -> Result<String> {
-        let out = Command::new("clickhouse")
-            .args([
-                "client",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &self.port.to_string(),
-                "--query",
-                sql,
-            ])
-            .output()
-            .context("spawn clickhouse client")?;
-        if !out.status.success() {
-            bail!(
-                "clickhouse query failed: {} (stderr={})",
-                sql,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-}
-
-impl Drop for ChServer {
-    fn drop(&mut self) {
-        // `SYSTEM SHUTDOWN` is CH's documented graceful-exit path
-        // (https://clickhouse.com/docs/sql-reference/statements/system#shutdown).
-        // The watchdog + worker pair both wind down on receipt, and
-        // the immediate child reaped via `try_wait` reflects the
-        // whole-tree exit. Avoids the process-group SIGTERM dance,
-        // which is fragile when the watchdog has already exited
-        // (defunct) and `kill -TERM -<pgid>` can't reliably find a
-        // live recipient.
-        let _ = Command::new("clickhouse")
-            .args([
-                "client",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &self.port.to_string(),
-                "--query",
-                "SYSTEM SHUTDOWN",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        // Wait up to ~5 s for the watchdog + worker to wind down.
-        for _ in 0..50 {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(_) => break,
-            }
-        }
-        // Fallback: hard kill the process group if `SYSTEM SHUTDOWN`
-        // did not take effect. `process_group(0)` at spawn time put
-        // both watchdog + worker in the same group; signal -<pgid>
-        // hits the whole tree.
-        let pgid = self.child.id() as i32;
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{pgid}")])
-            .stderr(Stdio::null())
-            .status();
-        let _ = self.child.wait();
-    }
-}
+// ChServer + skip-gate probes (`clickhouse_available`, `pg_available`,
+// `pg_basebackup_available`) come from `fx` (`tests/common/bootstrap_ch_fixture.rs`).
 
 // ---------------------------------------------------------------------------
 // Daemon sink chain (clone of bin/stream.rs::DaemonSinks, kept inline so
