@@ -575,6 +575,11 @@ async fn pgbench_acceptance_ddl_intermix() {
 
     if let Err(e) = result {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        // Snapshot the whole tempdir (shadow PG log, daemon stderr,
+        // spill, filtered manifests) before TempDir::drop wipes it. CI
+        // uploads $WALSHADOW_ARTIFACT_DIR as a job artifact; local runs
+        // leave the env var unset and dump_artifacts no-ops.
+        fx::dump_artifacts(tmp.path(), "phase14_pgbench_acceptance_ddl_intermix");
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }
 }
@@ -606,14 +611,26 @@ fn wait_child_with_timeout(
 /// segment seals).
 fn wait_for_ack_catchup(metrics_addr: SocketAddr, target: u64, deadline: Duration) -> Result<u64> {
     let start = std::time::Instant::now();
+    let mut last_body = String::new();
     while start.elapsed() < deadline {
-        if let Ok(body) = fx::http_get(metrics_addr, "/metrics")
-            && let Some(ack) = fx::parse_metric(&body, "walshadow_emitter_ack_lsn")
-            && ack >= target
-        {
-            return Ok(ack);
+        if let Ok(body) = fx::http_get(metrics_addr, "/metrics") {
+            last_body = body;
+            if let Some(ack) = fx::parse_metric(&last_body, "walshadow_emitter_ack_lsn")
+                && ack >= target
+            {
+                return Ok(ack);
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+    if let Ok(root) = std::env::var("WALSHADOW_ARTIFACT_DIR")
+        && !last_body.is_empty()
+    {
+        let path = std::path::PathBuf::from(root).join("metrics.txt");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, &last_body);
     }
     anyhow::bail!("emitter_ack_lsn never reached {target:X} in {deadline:?}");
 }

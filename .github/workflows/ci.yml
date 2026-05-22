@@ -156,7 +156,20 @@ jobs:
           # Tests pick non-overlapping ports but PG cluster startup is heavy;
           # avoid thrashing the runner by serializing.
           RUST_TEST_THREADS: "1"
+          # Opts tests with `fx::dump_artifacts` into copying their tempdir
+          # here on failure. Empty on success; uploaded as a job artifact
+          # by the next step when present.
+          WALSHADOW_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
         run: cargo test --workspace --all-targets --locked -- --nocapture
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-pg${{ matrix.pg-major }}
+          path: ${{ github.workspace }}/test-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
 
       # walshadow extension is a separate PGXS module (shipped to shadow PG).
       # Build it against the matrix PG, install into that major's $libdir /
@@ -302,10 +315,20 @@ jobs:
         working-directory: walshadow
         env:
           RUST_TEST_THREADS: "1"
+          WALSHADOW_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
         run: |
           cargo llvm-cov clean --workspace
           cargo llvm-cov --workspace --all-targets --locked --no-report \
             -- --nocapture
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-coverage
+          path: ${{ github.workspace }}/test-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Coverage summary (job log)
         working-directory: walshadow
@@ -320,7 +343,7 @@ jobs:
         run: cargo llvm-cov report --html
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: |

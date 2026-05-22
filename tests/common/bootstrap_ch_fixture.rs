@@ -355,6 +355,97 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Copy a test's tempdir into `$WALSHADOW_ARTIFACT_DIR/<label>/` so CI
+/// can upload it on failure. No-op when the env var is unset (local
+/// runs). Skips PG data-dir bulk (`pg_wal`, `base`, etc.) and the raw
+/// filtered WAL segments — keeps `log/postmaster.log`, `core.*`, `*.conf`,
+/// `*.opts`, signals, daemon stderr, spill files, segment manifests.
+/// Per-file cap of 64 MiB as a safety net. Errors only log — artifact
+/// dump must not mask the original failure.
+pub fn dump_artifacts(src: &std::path::Path, label: &str) {
+    let Ok(root) = std::env::var("WALSHADOW_ARTIFACT_DIR") else {
+        return;
+    };
+    let dest = std::path::PathBuf::from(root).join(label);
+    if let Err(e) = copy_dir_filtered(src, &dest, 64 * 1024 * 1024) {
+        eprintln!("dump_artifacts({label}): {e}");
+    } else {
+        eprintln!("dump_artifacts({label}): wrote {}", dest.display());
+    }
+}
+
+/// Directory names skipped wholesale inside a PG cluster data dir or
+/// next to it. Mostly heap pages + xact state — useless for diagnosing
+/// daemon / shadow behaviour, and big enough to blow the runner's
+/// artifact quota (pgbench-scale source-data alone is ~150 MB).
+const SKIP_DIR_NAMES: &[&str] = &[
+    "base",
+    "global",
+    "pg_wal",
+    "pg_xact",
+    "pg_subtrans",
+    "pg_multixact",
+    "pg_commit_ts",
+    "pg_dynshmem",
+    "pg_notify",
+    "pg_replslot",
+    "pg_serial",
+    "pg_snapshots",
+    "pg_stat",
+    "pg_stat_tmp",
+    "pg_tblspc",
+    "pg_twophase",
+    "pg_logical",
+];
+
+fn copy_dir_filtered(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    per_file_cap: u64,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let name = entry.file_name();
+        let src_p = entry.path();
+        let dst_p = dst.join(&name);
+        if ty.is_symlink() {
+            continue;
+        }
+        if ty.is_dir() {
+            if SKIP_DIR_NAMES
+                .iter()
+                .any(|s| std::ffi::OsStr::new(s) == name)
+            {
+                continue;
+            }
+            copy_dir_filtered(&src_p, &dst_p, per_file_cap)?;
+            continue;
+        }
+        // `filtered/` carries 16 MiB WAL segments alongside their
+        // `*.manifest.json` companions. Manifests describe per-record
+        // filter decisions — keep them; segments are recoverable from
+        // source on demand and just inflate the artifact.
+        let nstr = name.to_string_lossy();
+        if (nstr.starts_with("00000001") || nstr.starts_with("0000000"))
+            && !nstr.contains("manifest")
+        {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        if meta.len() > per_file_cap {
+            std::fs::write(
+                dst_p.with_extension("skipped"),
+                format!("skipped: size {} > cap {}\n", meta.len(), per_file_cap),
+            )?;
+            continue;
+        }
+        std::fs::copy(&src_p, &dst_p)?;
+    }
+    Ok(())
+}
+
 /// Drop guard that calls `Shadow::stop` on the wrapped fixture. Lets
 /// each test own a single owner of the PG lifecycle even when the
 /// fixture leaks via panic.
