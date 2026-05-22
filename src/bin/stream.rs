@@ -950,6 +950,13 @@ async fn run(args: Args) -> Result<()> {
     // slot could advance past a not-yet-durable resume point.
     let cursor_write_interval = Duration::from_secs(args.status_interval);
     let mut last_cursor_write: Option<Instant> = None;
+    // Inflight-stall watchdog. When xacts_active stays > 0 across two
+    // status intervals without `emitter_ack_lsn` moving, dump the
+    // parked xids' identifiers so the artifact captures who's holding
+    // the slot. One-shot per stall — re-arms when ack advances.
+    let mut last_emitter_ack_observed: u64 = 0;
+    let mut inflight_stall_since: Option<Instant> = None;
+    let mut inflight_stall_logged = false;
     let shutdown_reason = loop {
         // Snapshot every LSN the cursor + standby status depend on.
         // dispatched_lsn is filter_durable now that DirSegmentSink
@@ -1121,6 +1128,71 @@ async fn run(args: Args) -> Result<()> {
             if args.max_segments != 0 && segments_shipped >= args.max_segments {
                 break "max-segments";
             }
+        }
+        // Inflight-stall watchdog. Re-arm when ack moves; otherwise
+        // after 5s of stall with parked xacts, dump the parked xids
+        // once. Independent of `advanced` so a fully-quiescent pump
+        // still surfaces who's holding the slot.
+        if xact_stats.emitter_ack_lsn != last_emitter_ack_observed {
+            last_emitter_ack_observed = xact_stats.emitter_ack_lsn;
+            inflight_stall_since = None;
+            inflight_stall_logged = false;
+        }
+        if xact_stats.xacts_active > 0 {
+            let since = inflight_stall_since.get_or_insert(Instant::now());
+            if !inflight_stall_logged && since.elapsed() >= Duration::from_secs(5) {
+                let snap = xact_buffer.lock().await.inflight_snapshot();
+                let summary: String = snap
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "xid={} lsn={:X}/{:X}..{:X}/{:X} heap={} chunk={} bytes={} spill={} cat={} rels=[{}]",
+                            e.xid,
+                            e.first_lsn >> 32,
+                            e.first_lsn as u32,
+                            e.last_lsn >> 32,
+                            e.last_lsn as u32,
+                            e.heap_count,
+                            e.chunk_count,
+                            e.in_mem_bytes,
+                            if e.spilled { "y" } else { "n" },
+                            e.catalog_events,
+                            e.rels,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                tracing::warn!(
+                    target: "walshadow",
+                    xacts_active = xact_stats.xacts_active,
+                    emitter_ack_lsn = format!(
+                        "{:X}/{:X}",
+                        xact_stats.emitter_ack_lsn >> 32,
+                        xact_stats.emitter_ack_lsn as u32,
+                    ),
+                    drain_lsn = format!(
+                        "{:X}/{:X}",
+                        xact_stats.drain_lsn >> 32,
+                        xact_stats.drain_lsn as u32,
+                    ),
+                    source_received = format!(
+                        "{:X}/{:X}",
+                        received >> 32,
+                        received as u32,
+                    ),
+                    filter_dispatched = format!(
+                        "{:X}/{:X}",
+                        now_dispatched >> 32,
+                        now_dispatched as u32,
+                    ),
+                    inflight = %summary,
+                    "xact inflight parked — emitter ack pinned by these xids",
+                );
+                inflight_stall_logged = true;
+            }
+        } else {
+            inflight_stall_since = None;
+            inflight_stall_logged = false;
         }
     };
     tracing::info!(

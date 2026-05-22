@@ -1299,14 +1299,21 @@ impl Emitter {
                 self.flush_table(&key)?;
             }
         }
-        // No INSERTs open and nothing pending → an empty / untracked
-        // xact at `commit_lsn` adds no in-flight work, so the durable
-        // horizon can move to its commit. (When inserts are still
-        // open we leave `last_durable_commit_lsn` alone — bumping it
-        // here would claim durability for rows still buffered
-        // client-side.)
-        if self.tables.is_empty() && self.pending_max_commit_lsn == 0 {
-            self.last_durable_commit_lsn = self.last_durable_commit_lsn.max(commit_lsn);
+        // No INSERTs open → no in-flight work, durable horizon can move
+        // to `commit_lsn`. Also promote any `pending_max_commit_lsn` left
+        // over from rows finished mid-drain via `dispatch_schema_event`
+        // or the `Truncate` path (must_close mode already drained these
+        // through `close_all_open_inserts`; hold-open mode reaches here
+        // with tables still empty if every routed table got finished
+        // before xact_end). When inserts are still open we leave
+        // `last_durable_commit_lsn` alone — bumping would claim
+        // durability for rows still buffered client-side.
+        if self.tables.is_empty() {
+            self.last_durable_commit_lsn = self
+                .last_durable_commit_lsn
+                .max(self.pending_max_commit_lsn)
+                .max(commit_lsn);
+            self.pending_max_commit_lsn = 0;
         }
         self.current_xid = None;
         self.stats.xacts_committed += 1;
@@ -1320,16 +1327,20 @@ impl Emitter {
     /// per-xact close, and from [`Self::flush_open_inserts`] for
     /// explicit shutdown flush.
     fn close_all_open_inserts(&mut self) -> Result<(), EmitterError> {
-        if self.tables.is_empty() {
-            // Nothing buffered, but clear the deadline so the next
-            // INSERT opening can set a fresh window.
-            self.flush_deadline = None;
-            return Ok(());
+        if !self.tables.is_empty() {
+            let tables = std::mem::take(&mut self.tables);
+            for (key, enc) in tables {
+                self.finish_table_owned(&key, enc)?;
+            }
         }
-        let tables = std::mem::take(&mut self.tables);
-        for (key, enc) in tables {
-            self.finish_table_owned(&key, enc)?;
-        }
+        // Promote `pending_max_commit_lsn` even when `tables` is already
+        // empty: rows whose commit_lsn contributed to it could only have
+        // left `tables` via `finish_table_owned` (mid-xact close from
+        // `dispatch_schema_event` or the `Truncate` path), which drains
+        // EndOfStream — durable on CH. Without this, an xact whose only
+        // routed rows landed in tables that were finished mid-drain
+        // leaves `last_durable_commit_lsn` pinned at its prior value and
+        // `emitter_ack_lsn` never moves.
         self.last_durable_commit_lsn = self
             .last_durable_commit_lsn
             .max(self.pending_max_commit_lsn);

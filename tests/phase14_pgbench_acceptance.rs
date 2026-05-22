@@ -366,7 +366,18 @@ async fn pgbench_acceptance_ddl_intermix() {
             "--bootstrap-shadow-replay-timeout",
             "180",
         ])
-        .env("RUST_LOG", "warn,walshadow=info")
+        // CI sets `WALSHADOW_ARTIFACT_DIR`; bump the daemon to trace
+        // for `xact_buffer` so a stalled commit pipeline can be read
+        // straight off the artifact's `daemon.stderr.log`. Local runs
+        // leave the env var unset and keep the quieter default.
+        .env(
+            "RUST_LOG",
+            if std::env::var_os("WALSHADOW_ARTIFACT_DIR").is_some() {
+                "warn,walshadow=info,walshadow::xact_buffer=trace"
+            } else {
+                "warn,walshadow=info"
+            },
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .process_group(0)

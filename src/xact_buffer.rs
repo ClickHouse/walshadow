@@ -558,6 +558,29 @@ fn value_size(v: &ColumnValue) -> usize {
     }
 }
 
+/// One entry per inflight xid produced by
+/// [`XactBuffer::inflight_snapshot`]. Diagnostic surface for "a commit
+/// for this xid never arrived" investigations — fields cover the four
+/// pre-commit absorption paths (heap, chunk, schema event, spill).
+#[derive(Debug, Clone)]
+pub struct InflightSnapshotEntry {
+    pub xid: u32,
+    pub first_lsn: u64,
+    /// Max source_lsn across heaps + chunks + catalog events for this
+    /// xid. Distance from `first_lsn` shows how long the xact has been
+    /// open in WAL terms.
+    pub last_lsn: u64,
+    pub heap_count: u64,
+    pub chunk_count: u64,
+    pub in_mem_bytes: u64,
+    pub spilled: bool,
+    pub catalog_events: u64,
+    /// `(db_node, rel_node)` pairs touched by this xact, comma-joined.
+    /// Cross-reference against shadow's `pg_class.relfilenode` to name
+    /// the table without paying for a catalog lookup on every snapshot.
+    pub rels: String,
+}
+
 /// Per-xact + TOAST buffer with spill-to-disk overflow. Holds
 /// everything keyed by `xid`; chunk lookups inside an xact happen via
 /// a `(toast_relid, value_id)` walk at drain.
@@ -592,6 +615,61 @@ impl XactBuffer {
 
     pub fn stats(&self) -> &XactBufferStats {
         &self.stats
+    }
+
+    /// Snapshot every xid currently parked in `inflight`, with its
+    /// first-seen `source_lsn` and the (heap, chunk, catalog) sizes the
+    /// drain would process. Sorted by xid for deterministic dumps.
+    /// Diagnostic only — pump-side `populate_metrics` uses it for the
+    /// `walshadow_xact_inflight` text exposition when xacts pile up
+    /// past a quiescent source.
+    pub fn inflight_snapshot(&self) -> Vec<InflightSnapshotEntry> {
+        let mut out: Vec<InflightSnapshotEntry> = self
+            .inflight
+            .iter()
+            .map(|(xid, st)| {
+                let mut last_lsn = st.first_lsn;
+                let mut rels: std::collections::BTreeSet<(u32, u32)> =
+                    std::collections::BTreeSet::new();
+                let mut heap_count = 0u64;
+                let mut chunk_count = 0u64;
+                for e in &st.in_mem {
+                    match e {
+                        SpillEntry::Heap(h) => {
+                            heap_count += 1;
+                            last_lsn = last_lsn.max(h.source_lsn);
+                            rels.insert((h.rfn.db_node, h.rfn.rel_node));
+                        }
+                        SpillEntry::Chunk(c) => {
+                            chunk_count += 1;
+                            last_lsn = last_lsn.max(c.source_lsn);
+                            rels.insert((0, c.toast_relid));
+                        }
+                    }
+                }
+                for (lsn, _) in &st.catalog_events {
+                    last_lsn = last_lsn.max(*lsn);
+                }
+                let rels_str = rels
+                    .into_iter()
+                    .map(|(db, rel)| format!("{db}/{rel}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                InflightSnapshotEntry {
+                    xid: *xid,
+                    first_lsn: st.first_lsn,
+                    last_lsn,
+                    heap_count,
+                    chunk_count,
+                    in_mem_bytes: st.in_mem_bytes as u64,
+                    spilled: st.spill.is_some(),
+                    catalog_events: st.catalog_events.len() as u64,
+                    rels: rels_str,
+                }
+            })
+            .collect();
+        out.sort_by_key(|e| e.xid);
+        out
     }
 
     /// Buffer a decoded heap tuple. The descriptor needed to detoast
@@ -920,7 +998,19 @@ impl XactBuffer {
             .on_xact_end(commit_lsn)
             .await
             .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+        let prev_ack = self.stats.emitter_ack_lsn;
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
+        // Trace ack progression — if observer keeps returning a stale
+        // value while commit_lsn marches forward, the ack pin shows up
+        // here.
+        tracing::trace!(
+            target: "walshadow::xact_buffer",
+            top_xid,
+            commit_lsn = format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn as u32),
+            ack_lsn = format!("{:X}/{:X}", ack_lsn >> 32, ack_lsn as u32),
+            prev_ack = format!("{:X}/{:X}", prev_ack >> 32, prev_ack as u32),
+            "drain complete",
+        );
         // One bump per top, not per subxid: a top with N subs is a
         // single user-facing transaction at COMMIT time.
         self.stats.committed_xacts_total += 1;
@@ -1310,6 +1400,22 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                         }
                     }
                     let mut buf = self.buffer.lock().await;
+                    // Trace every commit so daemon stderr can correlate
+                    // a stuck `xact_active` against the commits that
+                    // ARE arriving; in particular surfaces subxact-id
+                    // mismatches between heap-record xact_id and the
+                    // top's commit-record subxact list.
+                    tracing::trace!(
+                        target: "walshadow::xact_buffer",
+                        xid,
+                        commit_lsn = format!(
+                            "{:X}/{:X}",
+                            record.source_lsn >> 32,
+                            record.source_lsn as u32,
+                        ),
+                        nsubxacts = payload.subxacts.len(),
+                        "xact commit",
+                    );
                     buf.commit(
                         xid,
                         payload.xact_time,
@@ -1327,6 +1433,17 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                 }
                 XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
                     let payload = parse_xact_payload(info, &record.parsed.main_data);
+                    tracing::trace!(
+                        target: "walshadow::xact_buffer",
+                        xid,
+                        abort_lsn = format!(
+                            "{:X}/{:X}",
+                            record.source_lsn >> 32,
+                            record.source_lsn as u32,
+                        ),
+                        nsubxacts = payload.subxacts.len(),
+                        "xact abort",
+                    );
                     let mut buf = self.buffer.lock().await;
                     buf.abort(xid, record.source_lsn, &payload.subxacts)
                         .await
