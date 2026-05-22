@@ -10,5 +10,6 @@ pgext/log/
 *.bc
 *.so
 *.diffs
+architecture/*.png
 
 regression.out

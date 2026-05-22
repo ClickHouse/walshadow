@@ -44,7 +44,7 @@ digraph timeline_bootstrap {
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     drain3 [label="drain_backfill task\nsynthesize CommittedTuple\n{op=Insert, _lsn=start_lsn}", fillcolor="#4D3A28"];
-    ch3    [label="Emitter against\nCatalogMapResolver\nINSERT FORMAT Native", fillcolor="#4D4128"];
+    ch3    [label="transitional Emitter\nvs CatalogMapResolver\nheld-open INSERT,\nforce-closed at bootstrap end\n(no DdlApplicator)", fillcolor="#4D4128"];
 
     drain3 -> ch3 [label="per-relation block", color="#BF8C5F"];
   }
@@ -84,7 +84,7 @@ digraph timeline_bootstrap {
     feed5  [label="SourceFeed open\nSTART_REPLICATION\nPHYSICAL <end_lsn>", fillcolor="#4D3A28"];
     repl5  [label="streaming protocol\nopens at end_lsn", fillcolor="#3D3D54"];
     apply5 [label="pg_last_wal_replay_lsn ≥ end_lsn\nready for relation_at gate", fillcolor="#3D4128"];
-    hot5   [label="hot streaming\n→ timeline_streaming", fillcolor="#4D3A28", shape=cds];
+    hot5   [label="hot streaming\n(steady-state emitter\n+ DdlApplicator)\n→ timeline_streaming", fillcolor="#4D3A28", shape=cds];
 
     cur5  -> curd5 [label="fsync"];
     cur5  -> feed5;

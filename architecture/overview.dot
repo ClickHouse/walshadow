@@ -8,7 +8,7 @@ digraph overview {
 
   // ─── 5 actors ───
   src [label="source\nPostgres\n(primary,\nwal_level=replica)",                                                          fillcolor="#3D3D54", shape=cylinder];
-  wal [label="walshadow-stream\n\nfilters WAL (drop user-heap,\nkeep catalog) → rewrites CRC,\ndecodes heap → emits to CH",
+  wal [label="walshadow-stream\n\nfilters WAL (drop user-heap,\nkeep catalog) → rewrites CRC,\ndecodes heap → emits to CH,\nDDL events → CH ALTER/CREATE",
        fillcolor="#4D3A28", width=2.6];
   arc [label="out/<seg>\nfiltered 16 MiB\nWAL + manifest",                                                                fillcolor="#4D3850", shape=note];
   shd [label="shadow\nPostgres\n(continuous recovery,\nschema/catalog mirror)",                                            fillcolor="#3D4128", shape=cylinder];
@@ -20,7 +20,7 @@ digraph overview {
   wal -> shd [label="③ libpq SELECT\ncatalog cache fill",                         color="#CBA85E", dir=both, arrowtail=open, constraint=false];
   wal -> arc [label="④ fsync segment\n+ manifest",                                color="#6E6963"];
   arc -> shd [label="⑤ restore_command\n(archive fallback)",                      style=dashed, color="#6E6963", constraint=false];
-  wal -> ch  [label="⑥ CH Native blocks\n(per-xact INSERT)",                      color="#BF8C5F", penwidth=2];
+  wal -> ch  [label="⑥ CH Native blocks\nheld-open INSERT\n(multi-xact, deadline-flushed)", color="#BF8C5F", penwidth=2];
 
   // ─── Legend ───
   legend [shape=plaintext, label=<
@@ -31,7 +31,7 @@ digraph overview {
       <TR><TD><FONT COLOR="#CBA85E"><B>③</B></FONT></TD><TD>walshadow ↔ shadow: libpq SELECT on cache miss (pg_class / pg_attribute)</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>④</B></FONT></TD><TD>walshadow → on-disk: fsynced filtered WAL segments + manifests</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>⑤</B></FONT></TD><TD>on-disk → shadow: restore_command archive fallback when walsender stalls</TD></TR>
-      <TR><TD><FONT COLOR="#BF8C5F"><B>⑥</B></FONT></TD><TD>walshadow → ClickHouse: Native protocol, per-xact INSERT FORMAT Native</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>⑥</B></FONT></TD><TD>walshadow → ClickHouse: Native protocol, INSERT held open across xacts, deadline-flushed (PHASE14)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>where to go next</B></TD></TR>
       <TR><TD COLSPAN="2"><FONT FACE="monospace">internals.svg</FONT> — pipeline stages, taps, caches</TD></TR>
       <TR><TD COLSPAN="2"><FONT FACE="monospace">shadow_communication.svg</FONT> — channels ②③⑤ in detail</TD></TR>
