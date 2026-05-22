@@ -410,9 +410,6 @@ fn copy_dir_filtered(
         let name = entry.file_name();
         let src_p = entry.path();
         let dst_p = dst.join(&name);
-        if ty.is_symlink() {
-            continue;
-        }
         if ty.is_dir() {
             if SKIP_DIR_NAMES
                 .iter()
@@ -421,6 +418,12 @@ fn copy_dir_filtered(
                 continue;
             }
             copy_dir_filtered(&src_p, &dst_p, per_file_cap)?;
+            continue;
+        }
+        // PG's `source-sock/.s.PGSQL.*` and shadow's lock files would
+        // surface as unix sockets / fifos — `fs::copy` returns ENXIO on
+        // those. Only regular files have content worth uploading.
+        if !ty.is_file() {
             continue;
         }
         // `filtered/` carries 16 MiB WAL segments alongside their
@@ -441,7 +444,12 @@ fn copy_dir_filtered(
             )?;
             continue;
         }
-        std::fs::copy(&src_p, &dst_p)?;
+        // Best-effort per-file: log and continue on copy failure so a
+        // single weird file (permissions, race against PG shutdown)
+        // doesn't truncate the whole dump.
+        if let Err(e) = std::fs::copy(&src_p, &dst_p) {
+            eprintln!("dump_artifacts: skip {}: {e}", src_p.display());
+        }
     }
     Ok(())
 }
