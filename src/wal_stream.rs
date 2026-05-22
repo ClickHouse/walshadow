@@ -641,9 +641,14 @@ impl WalStream {
         }
         let mut data = bytes;
         let mut cur_lsn = lsn;
+        let chunk_cap = self.seg_size as usize;
         while !data.is_empty() {
-            let space = self.seg_size as usize - self.walker.buffer_len();
-            let take = space.min(data.len());
+            // Bound per-iteration extend by one seg so buf growth on
+            // a multi-seg `push` call stays predictable; spanning
+            // records may push buf temporarily past seg_size, but
+            // each iter drains + flushes back down once the record
+            // completes.
+            let take = chunk_cap.min(data.len());
             self.walker.extend(&data[..take]);
             cur_lsn += take as u64;
             data = &data[take..];
@@ -653,11 +658,15 @@ impl WalStream {
                 return Err(e);
             }
 
-            if self.walker.segment_full()
-                && let Err(e) = self.flush_segment(segment_sink).await
-            {
-                self.poisoned = true;
-                return Err(e);
+            loop {
+                match self.try_flush_first_segment(segment_sink).await {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        self.poisoned = true;
+                        return Err(e);
+                    }
+                }
             }
         }
         self.next_lsn = cur_lsn;
@@ -762,13 +771,29 @@ impl WalStream {
         }
     }
 
-    /// Flush the just-completed 16 MiB segment to disk + reset the
-    /// walker for the next segment. Manifest stats reflect only the
-    /// records processed in this segment.
-    async fn flush_segment(
+    /// Flush the first `seg_size` bytes of the walker buffer if a
+    /// segment's worth has accumulated AND no in-flight `pending`
+    /// record still straddles seg-0. Returns `true` if a seg was
+    /// flushed, `false` if the precondition wasn't met.
+    ///
+    /// Spanning case (pending seg-0 → seg-1): we wait. Once the record
+    /// completes through `drain_records`, [`rewrite_record`](StreamingWalker::rewrite_record)
+    /// applies the NOOP rewrite uniformly across both segs of the
+    /// walker buf, and the next `try_flush_first_segment` call ships
+    /// seg-0 with rewritten partial bytes.
+    async fn try_flush_first_segment(
         &mut self,
         segment_sink: &mut dyn SegmentSink,
-    ) -> Result<(), WalStreamError> {
+    ) -> Result<bool, WalStreamError> {
+        let seg_size = self.seg_size as usize;
+        if self.walker.buffer_len() < seg_size {
+            return Ok(false);
+        }
+        if let Some(pend_off) = self.walker.pending_start_offset()
+            && pend_off < seg_size
+        {
+            return Ok(false);
+        }
         let seg = self.segment_for_lsn(self.current_lsn);
         let relmap_delta = self.filter.tracker.relmap_updates - self.relmap_at_segment_start;
         let pgc_un_delta = self.filter.tracker.pg_class_writes_undecoded
@@ -776,10 +801,27 @@ impl WalStream {
         let pgc_oip_delta = self.filter.tracker.pg_class_writes_oid_in_prefix
             - self.pg_class_oid_in_prefix_at_segment_start;
         let stats_delta = self.filter.stats.delta_from(&self.stats_at_segment_start);
+        // Split manifest entries: those with offset < seg_size belong
+        // to seg-0. Remaining stay in pending_entries for seg-1's
+        // future flush. Rebase remainder offsets so they're correct
+        // post-truncate.
+        let mut seg_entries = Vec::with_capacity(self.pending_entries.len());
+        let mut future_entries = Vec::new();
+        for entry in std::mem::take(&mut self.pending_entries) {
+            if (entry.offset as usize) < seg_size {
+                seg_entries.push(entry);
+            } else {
+                future_entries.push(Entry {
+                    offset: entry.offset - self.seg_size,
+                    ..entry
+                });
+            }
+        }
+        self.pending_entries = future_entries;
         let manifest = Manifest {
             source_segment: seg.format(),
             filter_version: FILTER_VERSION,
-            records: std::mem::take(&mut self.pending_entries),
+            records: seg_entries,
             stats: ManifestStats::from_filter(
                 &stats_delta,
                 relmap_delta,
@@ -787,29 +829,31 @@ impl WalStream {
                 pgc_oip_delta,
             ),
         };
-        // Drain any trailing bytes — zero-pad tail, post-last-record
-        // alignment — onto the shadow wire so the walreceiver sees
-        // the full segment byte-for-byte.
-        let trailing_start_offset = self.wire_offset;
-        let trailing_start_lsn = self.current_lsn + trailing_start_offset as u64;
-        let bytes = self.walker.buffer();
-        let trailing = &bytes[trailing_start_offset..];
-        self.bytes_sink
-            .on_segment_boundary(trailing_start_lsn, trailing)
-            .await?;
+        // Wire tail: bytes_sink saw on_wire_chunk per-record up to
+        // wire_offset. If wire_offset < seg_size, the residual span
+        // (alignment pad + page header + spanning-record bytes that
+        // were rewritten in-place) still needs to ship before seg-0
+        // closes.
+        if self.wire_offset < seg_size {
+            let trailing_start_lsn = self.current_lsn + self.wire_offset as u64;
+            let trailing = &self.walker.buffer()[self.wire_offset..seg_size];
+            self.bytes_sink
+                .on_segment_boundary(trailing_start_lsn, trailing)
+                .await?;
+        }
         segment_sink
-            .on_segment(seg, self.walker.buffer(), &manifest)
+            .on_segment(seg, &self.walker.buffer()[..seg_size], &manifest)
             .await?;
-        self.walker.reset_segment();
+        self.walker.truncate_first_segment();
         self.current_lsn += self.seg_size;
-        self.wire_offset = 0;
+        self.wire_offset = self.wire_offset.saturating_sub(seg_size);
         // Snapshot for the next segment's manifest deltas.
         self.stats_at_segment_start = self.filter.stats;
         self.relmap_at_segment_start = self.filter.tracker.relmap_updates;
         self.pg_class_undecoded_at_segment_start = self.filter.tracker.pg_class_writes_undecoded;
         self.pg_class_oid_in_prefix_at_segment_start =
             self.filter.tracker.pg_class_writes_oid_in_prefix;
-        Ok(())
+        Ok(true)
     }
 
     /// Force-flush the current partial segment (does nothing if empty).
@@ -819,9 +863,20 @@ impl WalStream {
     /// `restore_command` does not pick it up.
     pub async fn close(
         mut self,
-        partial_sink: Option<&mut dyn SegmentSink>,
+        mut partial_sink: Option<&mut dyn SegmentSink>,
         record_sink: &mut dyn RecordSink,
     ) -> Result<(), WalStreamError> {
+        // Drain any fully-buffered segments first — buf may exceed
+        // seg_size when a record was straddling the boundary at the
+        // moment shutdown fired. Each completed seg ships as a normal
+        // segment file (not `.partial`).
+        if let Some(sink) = partial_sink.as_deref_mut() {
+            while self.walker.buffer_len() >= self.seg_size as usize {
+                if !self.try_flush_first_segment(sink).await? {
+                    break;
+                }
+            }
+        }
         if self.walker.buffer_len() == 0 {
             return Ok(());
         }
@@ -835,12 +890,13 @@ impl WalStream {
         let seg = self.segment_for_lsn(self.current_lsn);
         let seg_start_lsn = self.current_lsn;
         // `close` fires once per shutdown so the local copy is
-        // acceptable. Hot-path flushes go through `flush_segment` which
-        // hands the walker buffer to the sink directly.
+        // acceptable. Hot-path flushes hand the walker buffer to the
+        // sink directly.
         let mut buf: Vec<u8> = Vec::with_capacity(self.seg_size as usize);
         buf.extend_from_slice(self.walker.buffer());
-        let pad = self.seg_size as usize - buf.len();
-        buf.extend(std::iter::repeat_n(0u8, pad));
+        if buf.len() < self.seg_size as usize {
+            buf.resize(self.seg_size as usize, 0);
+        }
         self.walker.reset_segment();
         let name = seg.format();
 

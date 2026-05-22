@@ -216,12 +216,64 @@ impl StreamingWalker {
         self.buf.len() == self.seg_size
     }
 
-    /// Append source bytes onto the buffer. Caller must not exceed
-    /// `seg_size`; [`WalStream::push`](crate::wal_stream::WalStream::push)
-    /// splits chunks at segment boundary before forwarding.
+    /// Append source bytes onto the buffer. May grow past `seg_size`
+    /// while a record straddles the boundary; cross-seg `pending`
+    /// (`xl_tot_len` exceeds bytes left in the active seg) needs the
+    /// next seg's continuation bytes to complete + rewrite uniformly.
+    /// [`WalStream`](crate::wal_stream::WalStream) calls
+    /// [`truncate_first_segment`](Self::truncate_first_segment) once
+    /// the spanning record completes & no pending remains in seg 0.
     pub fn extend(&mut self, bytes: &[u8]) {
-        debug_assert!(self.buf.len() + bytes.len() <= self.seg_size);
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// Buf-offset of the in-flight partial record, or `None` if no
+    /// record straddles the parse frontier. Used to gate first-segment
+    /// flush: pending whose `start_offset < seg_size` must complete
+    /// before the seg can ship, so [`rewrite_record`](Self::rewrite_record)
+    /// can apply the NOOP rewrite to bytes in both segs uniformly.
+    pub fn pending_start_offset(&self) -> Option<usize> {
+        self.pending.as_ref().map(|p| p.start_offset)
+    }
+
+    /// Drop the first `seg_size` bytes off the buffer, rebasing every
+    /// walker offset (page cursor, pending byte ranges) by `-seg_size`.
+    /// Pre: `buf.len() >= seg_size`, and any in-flight `pending` lives
+    /// in `[seg_size, buf.len())`.
+    pub fn truncate_first_segment(&mut self) {
+        let n = self.seg_size;
+        debug_assert!(self.buf.len() >= n);
+        if let Some(p) = &self.pending {
+            debug_assert!(p.start_offset >= n);
+        }
+        self.buf.drain(0..n);
+        if let Some(p) = self.pending.as_mut() {
+            p.start_offset -= n;
+            for r in p.byte_ranges.iter_mut() {
+                r.0 -= n;
+            }
+        }
+        if self.page_start >= n {
+            // Walker advanced into seg 1 already (typical spanning
+            // case: spanning record completed + more seg-1 records
+            // emitted before flush). Rebase page state.
+            self.page_start -= n;
+            self.page_data_start = self.page_data_start.saturating_sub(n);
+            self.page_cursor = self.page_cursor.saturating_sub(n);
+            // page_magic + page_header_consumed describe the page at
+            // page_start, stay valid post-shift.
+        } else {
+            // Walker still parking on seg 0 (zero-pad tail or hadn't
+            // seen seg-1 bytes yet). Restart parse from new buf[0] so
+            // seg 1's first-page header gets read fresh.
+            self.page_start = 0;
+            self.page_magic = 0;
+            self.page_data_start = 0;
+            self.page_cursor = 0;
+            self.page_header_consumed = false;
+        }
+        self.cursor = self.cursor.saturating_sub(n);
+        self.done_in_segment = false;
     }
 
     /// Apply a per-record rewrite (eg [`crate::rewrite::noop_replace`])
@@ -756,6 +808,102 @@ mod tests {
         let mut walker = StreamingWalker::new(PAGE_SIZE);
         walker.extend(&page);
         assert!(walker.try_next().is_none());
+    }
+
+    fn build_long_header_page(
+        body: &[u8],
+        magic: u16,
+        remaining_data_len: u32,
+        page_address: u64,
+    ) -> Vec<u8> {
+        let mut page = Vec::with_capacity(PAGE_SIZE);
+        page.extend_from_slice(&magic.to_le_bytes());
+        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        page.extend_from_slice(&1u32.to_le_bytes());
+        page.extend_from_slice(&page_address.to_le_bytes());
+        page.extend_from_slice(&remaining_data_len.to_le_bytes());
+        page.extend_from_slice(&12345u64.to_le_bytes());
+        page.extend_from_slice(&(PG_SEG as u32).to_le_bytes());
+        page.extend_from_slice(&8192u32.to_le_bytes());
+        page.extend_from_slice(&[0u8; 4]);
+        page.extend_from_slice(body);
+        page.resize(PAGE_SIZE, 0);
+        page
+    }
+
+    /// Spanning-record regression. Walker buf grows past `seg_size`
+    /// so `pending` can complete across the boundary;
+    /// `rewrite_record` scatters NOOP bytes back into both seg
+    /// portions; `truncate_first_segment` drops seg-0 and rebases
+    /// indices so subsequent records emit at seg-1-relative offsets.
+    #[test]
+    fn handles_record_spanning_segment_boundary() {
+        // seg_size = one page; spanning record occupies seg-0's full
+        // data area + 16 bytes of seg-1's data area.
+        let overflow: usize = 16;
+        let in_seg0 = PAGE_SIZE - 40;
+        let record_total = in_seg0 + overflow;
+        let body_after_header = record_total - X_LOG_RECORD_HEADER_SIZE;
+        let mut record = header_le(record_total as u32);
+        record.extend_from_slice(&vec![0xAAu8; body_after_header]);
+
+        let seg0 = build_long_header_page(&record[..in_seg0], XLP_PAGE_MAGIC_PG15, 0, 0);
+        // Seg-1's first page: long header with remaining_data_len =
+        // overflow; body starts with continuation of the spanning
+        // record + a trailing zero pad.
+        let seg1_body = record[in_seg0..].to_vec();
+        let seg1 = build_long_header_page(
+            &seg1_body,
+            XLP_PAGE_MAGIC_PG15,
+            overflow as u32,
+            PAGE_SIZE as u64,
+        );
+
+        let mut walker = StreamingWalker::new(PAGE_SIZE);
+        walker.extend(&seg0);
+        // Walker should be pending — record header read, body
+        // overflowed seg-0's page. No completion yet.
+        assert!(walker.try_next().is_none());
+        assert!(walker.pending_start_offset().is_some());
+        let pend_off = walker.pending_start_offset().unwrap();
+        assert!(pend_off < PAGE_SIZE, "pending lives in seg-0");
+
+        // Now extend seg-1. Walker should yield the spanning record
+        // with byte_ranges across the boundary.
+        walker.extend(&seg1);
+        let r = walker.try_next().unwrap().unwrap();
+        assert_eq!(r.total_len(), record_total);
+        assert_eq!(r.byte_ranges.len(), 2);
+        assert_eq!(r.byte_ranges[0].1, in_seg0);
+        assert_eq!(r.byte_ranges[1].1, overflow);
+        assert!(r.byte_ranges[0].0 < PAGE_SIZE, "first range in seg-0");
+        assert!(
+            r.byte_ranges[1].0 >= PAGE_SIZE,
+            "second range in seg-1 past page header"
+        );
+
+        // Rewrite must scatter back into the walker buf at the
+        // record's byte_ranges, covering both seg portions. Mimic
+        // noop_replace by writing a sentinel.
+        let new_logical = vec![0xCCu8; record_total];
+        let byte_ranges = r.byte_ranges.clone();
+        walker.rewrite_record(&byte_ranges, &new_logical);
+        for (off, len) in byte_ranges.iter().copied() {
+            assert!(
+                walker.buffer()[off..off + len].iter().all(|&b| b == 0xCC),
+                "rewrite landed at off={off} len={len}",
+            );
+        }
+
+        // Truncate seg-0; walker.buf shrinks; subsequent parsing
+        // continues in what was seg-1.
+        assert!(walker.buffer_len() >= PAGE_SIZE);
+        walker.truncate_first_segment();
+        assert_eq!(walker.buffer_len(), PAGE_SIZE);
+        assert!(walker.pending_start_offset().is_none());
+        // Remaining bytes are seg-1 bytes (page header + continuation
+        // + zero pad). Sentinel bytes survive at the continuation.
+        assert!(walker.buffer()[40..40 + overflow].iter().all(|&b| b == 0xCC));
     }
 
     #[test]

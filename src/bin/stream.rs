@@ -1557,7 +1557,14 @@ async fn run_bootstrap(
             // Transitional emitter — `CatalogMapResolver` fronts the
             // seeded snapshot (shadow PG isn't up yet). TCP open here
             // mirrors the daemon path below; std-stream handoff keeps
-            // the chc_posix_io vtable on a blocking fd.
+            // the chc_posix_io vtable on a blocking fd. Force
+            // `flush_timeout = 0` so the rfn-flip in `drain_backfill`
+            // closes the prior INSERT before the next `send_query` —
+            // hold-open mode would violate CH's "no overlapping
+            // INSERTs on one connection" rule + silently drop the
+            // first table's bytes.
+            let mut emitter_cfg = emitter_cfg;
+            emitter_cfg.flush_timeout = std::time::Duration::ZERO;
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
             let tcp = tokio::net::TcpStream::connect(&addr)
                 .await

@@ -1207,6 +1207,19 @@ impl Emitter {
                 .get_mut(rel.qualified_name.as_ref())
                 .expect("just checked")
         } else {
+            // CH's Native protocol allows at most one open INSERT per
+            // connection: sending a fresh `Query` while another
+            // INSERT's data stream is still open trips
+            // `Unexpected packet Query received from client` (code
+            // 101). Every prior table's INSERT must close before we
+            // can `send_query` for a new one. Pgbench TPC-B writes
+            // four tables per xact, so this fires on every commit.
+            if !self.tables.is_empty() {
+                let prior = std::mem::take(&mut self.tables);
+                for (key, enc) in prior {
+                    self.finish_table_owned(&key, enc)?;
+                }
+            }
             let plan = TablePlan::build(alloc, &rel, &mapping)?;
             // First row for this (table, xact): issue the INSERT.
             self.client.send_query(&plan.insert_sql, None)?;
