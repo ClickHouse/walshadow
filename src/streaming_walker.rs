@@ -903,7 +903,11 @@ mod tests {
         assert!(walker.pending_start_offset().is_none());
         // Remaining bytes are seg-1 bytes (page header + continuation
         // + zero pad). Sentinel bytes survive at the continuation.
-        assert!(walker.buffer()[40..40 + overflow].iter().all(|&b| b == 0xCC));
+        assert!(
+            walker.buffer()[40..40 + overflow]
+                .iter()
+                .all(|&b| b == 0xCC)
+        );
     }
 
     #[test]

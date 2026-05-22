@@ -358,6 +358,14 @@ async fn pgbench_acceptance_ddl_intermix() {
             "0",
             "--ch-config",
             ch_config_path.to_str().unwrap(),
+            // Hold INSERTs open across xacts; pgbench TPC-B writes 4
+            // tables/xact and each per-table close is one CH
+            // EndOfStream round-trip, so flush_timeout=0 caps throughput
+            // at ~one xact per (4 × RTT) = ~5 xact/s on a local CH.
+            // 200 ms coalesces inserts into one MergeTree part per
+            // window and lets the daemon track pgbench's ~700 xact/s.
+            "--ch-flush-timeout-ms",
+            "200",
             "--bootstrap-mode",
             "direct",
             "--bootstrap-shadow-data-dir",

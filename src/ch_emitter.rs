@@ -1068,6 +1068,13 @@ pub struct Emitter {
     /// with INSERT data). `None` when the emitter is wired without a
     /// DDL applicator (tests, transitional bootstrap emitter).
     applicator: Option<DdlApplicator>,
+    /// Key of the table whose `INSERT INTO ... FORMAT Native` is
+    /// currently open on `client`. `None` between `send_data(None)` +
+    /// EndOfStream drain and the next `send_query`. CH's Native protocol
+    /// rejects a fresh `Query` while another INSERT data stream is open
+    /// (code 101 "Unexpected packet Query"), so any wire activity for
+    /// table B must call `close_current_wire` first if A is open.
+    wire_open_key: Option<String>,
     pub stats: EmitterStats,
 }
 
@@ -1123,6 +1130,7 @@ impl Emitter {
             pending_max_commit_lsn: 0,
             last_durable_commit_lsn: 0,
             applicator: None,
+            wire_open_key: None,
             stats: EmitterStats::default(),
         })
     }
@@ -1173,12 +1181,17 @@ impl Emitter {
         // Truncate executes in WAL order against the destination.
         // Drain any pending per-table buffer for this relation first
         // (so prior INSERTs in the same xact land before the truncate),
-        // then issue `TRUNCATE TABLE <dest>` synchronously.
+        // then issue `TRUNCATE TABLE <dest>` synchronously. Closing
+        // the current wire (if any) lets `send_query(TRUNCATE)` ride
+        // the same connection without tripping CH's "one Query at a
+        // time" invariant.
         if let HeapOp::Truncate = committed.decoded.op {
             let key = rel.qualified_name.as_ref().to_owned();
-            if let Some(enc) = self.tables.remove(&key) {
-                self.finish_table_owned(&key, enc)?;
+            if self.tables.get(&key).is_some_and(|e| e.rows > 0) {
+                self.flush_table(&key)?;
             }
+            self.close_current_wire()?;
+            self.tables.remove(&key);
             let sql = format!("TRUNCATE TABLE {}", mapping.target);
             self.client.send_query(&sql, None)?;
             loop {
@@ -1200,44 +1213,22 @@ impl Emitter {
             self.stats.truncates_emitted += 1;
             return Ok(());
         }
-        // Initialize per-table encoder lazily on first row.
-        let alloc = self.alloc;
-        let enc = if self.tables.contains_key(rel.qualified_name.as_ref()) {
-            self.tables
-                .get_mut(rel.qualified_name.as_ref())
-                .expect("just checked")
-        } else {
-            // CH's Native protocol allows at most one open INSERT per
-            // connection: sending a fresh `Query` while another
-            // INSERT's data stream is still open trips
-            // `Unexpected packet Query received from client` (code
-            // 101). Every prior table's INSERT must close before we
-            // can `send_query` for a new one. Pgbench TPC-B writes
-            // four tables per xact, so this fires on every commit.
-            if !self.tables.is_empty() {
-                let prior = std::mem::take(&mut self.tables);
-                for (key, enc) in prior {
-                    self.finish_table_owned(&key, enc)?;
-                }
-            }
-            let plan = TablePlan::build(alloc, &rel, &mapping)?;
-            // First row for this (table, xact): issue the INSERT.
-            self.client.send_query(&plan.insert_sql, None)?;
-            // Start the latency-cap timer for the hold-INSERT-open
-            // path on the *first* INSERT of a fresh flush window.
-            // Subsequent tables opening within the same window share
-            // the deadline so close-all-on-trip preserves the
-            // ack-monotonicity invariant.
-            if !self.config.flush_timeout.is_zero() && self.flush_deadline.is_none() {
-                self.flush_deadline = Some(Instant::now() + self.config.flush_timeout);
-            }
+        // Lazily build the per-table encoder on first row. NO wire
+        // activity here: pgbench's TPC-B xact touches 4 tables per
+        // commit, so eagerly closing prior wires on each table-switch
+        // would cost one CH round-trip per row. Wire opens happen at
+        // flush time (budget trip in this fn, or close_all at deadline /
+        // legacy per-xact close).
+        if !self.tables.contains_key(rel.qualified_name.as_ref()) {
+            let plan = TablePlan::build(self.alloc, &rel, &mapping)?;
             let enc = TableEncoder::new(plan)?;
             let owned_key = rel.qualified_name.as_ref().to_owned();
             self.tables.insert(owned_key, enc);
-            self.tables
-                .get_mut(rel.qualified_name.as_ref())
-                .expect("just inserted")
-        };
+        }
+        let enc = self
+            .tables
+            .get_mut(rel.qualified_name.as_ref())
+            .expect("just inserted");
         let op = match committed.decoded.op {
             HeapOp::Insert => OP_INSERT,
             HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
@@ -1250,17 +1241,82 @@ impl Emitter {
             return Err(e);
         }
         self.pending_max_commit_lsn = self.pending_max_commit_lsn.max(committed.commit_lsn);
-        // Budget trip flushes the per-table data block but keeps the
-        // INSERT open — close happens on deadline / next xact_end
-        // when `flush_timeout == 0`.
-        if enc.rows >= self.config.row_budget || enc.approx_bytes >= self.config.byte_budget {
+        let tripped =
+            enc.rows >= self.config.row_budget || enc.approx_bytes >= self.config.byte_budget;
+        // Budget trip flushes the per-table data block to wire (opens
+        // INSERT for this table if not already, switching off any other
+        // table's open wire first). INSERT stays open across xacts in
+        // hold-open mode; legacy mode closes on the next xact_end.
+        if tripped {
             let key_owned = rel.qualified_name.as_ref().to_owned();
             self.flush_table(&key_owned)?;
         }
         Ok(())
     }
 
+    /// Ensure `key`'s INSERT is open on `client`, switching off any
+    /// other table's open wire first (CH allows only one INSERT data
+    /// stream per connection — see [`Self::wire_open_key`]). Issues
+    /// `send_query(INSERT … FORMAT Native)` against `client` on first
+    /// open for the table; subsequent calls are no-ops while the wire
+    /// stays on `key`. Sets [`Self::flush_deadline`] when opening a
+    /// fresh window under `flush_timeout > 0`.
+    fn open_wire(&mut self, key: &str) -> Result<(), EmitterError> {
+        if self.wire_open_key.as_deref() == Some(key) {
+            return Ok(());
+        }
+        self.close_current_wire()?;
+        let enc = self
+            .tables
+            .get(key)
+            .expect("open_wire called on unknown table");
+        self.client.send_query(&enc.plan.insert_sql, None)?;
+        self.wire_open_key = Some(key.to_owned());
+        if !self.config.flush_timeout.is_zero() && self.flush_deadline.is_none() {
+            self.flush_deadline = Some(Instant::now() + self.config.flush_timeout);
+        }
+        Ok(())
+    }
+
+    /// Close the currently-open INSERT (if any): ship any remaining
+    /// rows in that table's encoder, then `send_data(None)` and drain
+    /// to `EndOfStream`. Idempotent — no-op when no wire is open.
+    /// Called between table-switches, on xact_end (legacy / deadline),
+    /// before TRUNCATE / DDL, and on shutdown.
+    fn close_current_wire(&mut self) -> Result<(), EmitterError> {
+        let Some(key) = self.wire_open_key.take() else {
+            return Ok(());
+        };
+        let alloc = self.alloc;
+        if let Some(enc) = self.tables.get_mut(&key) {
+            let n = enc.flush_block(&mut self.client, alloc, BlockOpts::default())?;
+            if n > 0 {
+                self.stats.rows_emitted += n as u64;
+                self.stats.blocks_sent += 1;
+            }
+        }
+        self.client.send_data(None)?;
+        loop {
+            let mut pkt = self.client.recv_packet()?;
+            match pkt.kind() {
+                Some(PacketKind::EndOfStream) => break,
+                Some(PacketKind::Exception) => {
+                    if let Some(exc) = pkt.take_exception() {
+                        return Err(EmitterError::ServerException {
+                            code: exc.code(),
+                            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
+                        });
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn flush_table(&mut self, key: &str) -> Result<(), EmitterError> {
+        self.open_wire(key)?;
         let alloc = self.alloc;
         let enc = self
             .tables
@@ -1292,36 +1348,21 @@ impl Emitter {
         }
         let must_close = self.config.flush_timeout.is_zero() || deadline_tripped;
         if must_close {
-            // close_all_open_inserts re-flushes any held block before
-            // the close-and-drain handshake, so we skip the cheap
-            // pre-flush below.
             self.close_all_open_inserts()?;
-        } else {
-            // Hold-open: ship per-table data blocks on the still-open
-            // INSERTs so the server can squash them into the next
-            // part, but skip the `send_data(None)` that would finalize
-            // a part. The next close (deadline / shutdown) will
-            // finalize one part covering every block since reopen.
-            let keys: Vec<String> = self
-                .tables
-                .iter()
-                .filter(|(_, enc)| enc.rows > 0)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in keys {
-                self.flush_table(&key)?;
-            }
+        } else if self.flush_deadline.is_none() && self.tables.values().any(|e| e.rows > 0) {
+            // Hold-open: rows queued from this xact share the next
+            // flush window with subsequent xacts. Pure-NOOP commit
+            // (route never reached append_row because every relation
+            // was unmapped) leaves the deadline unset so an idle slot
+            // doesn't tick on phantom traffic.
+            self.flush_deadline = Some(Instant::now() + self.config.flush_timeout);
         }
-        // No INSERTs open → no in-flight work, durable horizon can move
-        // to `commit_lsn`. Also promote any `pending_max_commit_lsn` left
-        // over from rows finished mid-drain via `dispatch_schema_event`
-        // or the `Truncate` path (must_close mode already drained these
-        // through `close_all_open_inserts`; hold-open mode reaches here
-        // with tables still empty if every routed table got finished
-        // before xact_end). When inserts are still open we leave
-        // `last_durable_commit_lsn` alone — bumping would claim
-        // durability for rows still buffered client-side.
-        if self.tables.is_empty() {
+        // Durable horizon can move only when nothing is buffered client-
+        // side. In hold-open mode this falls through until the deadline
+        // trips and `close_all_open_inserts` promotes; legacy mode
+        // closes inside `must_close` above so this catches the empty-xact
+        // case (heap touched only unmapped relations or pure DDL).
+        if self.wire_open_key.is_none() && self.tables.values().all(|e| e.rows == 0) {
             self.last_durable_commit_lsn = self
                 .last_durable_commit_lsn
                 .max(self.pending_max_commit_lsn)
@@ -1333,27 +1374,28 @@ impl Emitter {
         Ok(self.last_durable_commit_lsn)
     }
 
-    /// Close every still-open INSERT (`send_data(None)` + drain to
-    /// `EndOfStream` per table), then promote `pending_max_commit_lsn`
-    /// to `last_durable_commit_lsn` and reset the flush window. Called
+    /// Flush every table with buffered rows through the single open
+    /// wire (serial: each table's `flush_table` closes the prior
+    /// table's INSERT before opening its own), then close the trailing
+    /// wire. Promotes `pending_max_commit_lsn` to
+    /// `last_durable_commit_lsn` and resets the flush window. Called
     /// from [`Self::on_xact_end_with_lsn`] on deadline trip or legacy
     /// per-xact close, and from [`Self::flush_open_inserts`] for
     /// explicit shutdown flush.
     fn close_all_open_inserts(&mut self) -> Result<(), EmitterError> {
-        if !self.tables.is_empty() {
-            let tables = std::mem::take(&mut self.tables);
-            for (key, enc) in tables {
-                self.finish_table_owned(&key, enc)?;
-            }
+        let keys: Vec<String> = self
+            .tables
+            .iter()
+            .filter(|(_, enc)| enc.rows > 0)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys {
+            self.flush_table(&key)?;
         }
-        // Promote `pending_max_commit_lsn` even when `tables` is already
-        // empty: rows whose commit_lsn contributed to it could only have
-        // left `tables` via `finish_table_owned` (mid-xact close from
-        // `dispatch_schema_event` or the `Truncate` path), which drains
-        // EndOfStream — durable on CH. Without this, an xact whose only
-        // routed rows landed in tables that were finished mid-drain
-        // leaves `last_durable_commit_lsn` pinned at its prior value and
-        // `emitter_ack_lsn` never moves.
+        self.close_current_wire()?;
+        // Empty encoders stay around so the next flush window reuses
+        // the ColumnBuf allocations + cached TablePlan. DDL drops them
+        // through `dispatch_schema_event` if the shape changed.
         self.last_durable_commit_lsn = self
             .last_durable_commit_lsn
             .max(self.pending_max_commit_lsn);
@@ -1398,7 +1440,6 @@ impl Emitter {
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(retry.max_backoff);
                     self.reconnect().await?;
-                    self.redo_open_inserts()?;
                 }
                 Err(e) => return Err(e),
             }
@@ -1420,7 +1461,6 @@ impl Emitter {
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(retry.max_backoff);
                     self.reconnect().await?;
-                    self.redo_open_inserts()?;
                 }
                 Err(e) => return Err(e),
             }
@@ -1435,45 +1475,12 @@ impl Emitter {
         self.last_durable_commit_lsn
     }
 
-    fn finish_table_owned(
-        &mut self,
-        _key: &str,
-        mut enc: TableEncoder,
-    ) -> Result<(), EmitterError> {
-        let alloc = self.alloc;
-        let n = enc.flush_block(&mut self.client, alloc, BlockOpts::default())?;
-        if n > 0 {
-            self.stats.rows_emitted += n as u64;
-            self.stats.blocks_sent += 1;
-        }
-        // Close the INSERT for this table.
-        self.client.send_data(None)?;
-        loop {
-            let mut pkt = self.client.recv_packet()?;
-            match pkt.kind() {
-                Some(PacketKind::EndOfStream) => break,
-                Some(PacketKind::Exception) => {
-                    if let Some(exc) = pkt.take_exception() {
-                        return Err(EmitterError::ServerException {
-                            code: exc.code(),
-                            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                        });
-                    }
-                    break;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
     /// Phase 10 reconnect: open a fresh TCP socket against the same
     /// `(host, port)`, build a new [`Client`] (which owns its own
     /// `PosixIo` + `Codec`), and hot-swap `self.client` while preserving
-    /// the per-xact accumulator state in `self.tables`. The caller is
-    /// responsible for re-issuing `send_query(insert_sql)` on the new
-    /// connection for any table whose buffered rows must still flush —
-    /// see [`Self::redo_open_inserts`].
+    /// the per-table accumulator state in `self.tables`. The fresh
+    /// connection has nothing open, so [`Self::wire_open_key`] clears
+    /// and the next [`Self::flush_table`] re-`send_query`s on demand.
     pub async fn reconnect(&mut self) -> Result<(), EmitterError> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
         let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
@@ -1491,23 +1498,8 @@ impl Emitter {
         opts.compression = self.config.compression.to_wire();
         let client = Client::init(&opts, self.alloc, io, codec)?;
         self.client = client;
+        self.wire_open_key = None;
         self.stats.reconnects += 1;
-        Ok(())
-    }
-
-    /// Re-issue `INSERT … FORMAT Native` for every per-table encoder
-    /// currently holding buffered rows. Called after [`Self::reconnect`]
-    /// so the buffers can flush through the new connection on the next
-    /// [`Self::on_xact_end_with_lsn`].
-    fn redo_open_inserts(&mut self) -> Result<(), EmitterError> {
-        let sqls: Vec<String> = self
-            .tables
-            .values()
-            .map(|enc| enc.plan.insert_sql.clone())
-            .collect();
-        for sql in sqls {
-            self.client.send_query(&sql, None)?;
-        }
         Ok(())
     }
 
@@ -1532,7 +1524,6 @@ impl Emitter {
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(retry.max_backoff);
                     self.reconnect().await?;
-                    self.redo_open_inserts()?;
                 }
                 Err(e) => return Err(e),
             }
@@ -1563,10 +1554,14 @@ impl Emitter {
             SchemaEvent::Changed { new, .. } => Some(new.qualified_name.as_ref().to_owned()),
             SchemaEvent::Dropped { qualified_name, .. } => Some(qualified_name.as_ref().to_owned()),
         };
-        if let Some(key) = affected.as_deref()
-            && let Some(enc) = self.tables.remove(key)
-        {
-            self.finish_table_owned(key, enc)?;
+        if let Some(key) = affected.as_deref() {
+            if self.tables.get(key).is_some_and(|e| e.rows > 0) {
+                self.flush_table(key)?;
+            }
+            if self.wire_open_key.as_deref() == Some(key) {
+                self.close_current_wire()?;
+            }
+            self.tables.remove(key);
         }
         if let Some(app) = self.applicator.as_mut() {
             app.apply(event).await?;
@@ -1603,7 +1598,6 @@ impl Emitter {
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(retry.max_backoff);
                     self.reconnect().await?;
-                    self.redo_open_inserts()?;
                 }
                 Err(e) => return Err(e),
             }

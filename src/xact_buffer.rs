@@ -1607,6 +1607,16 @@ impl BufferingDecoderSink {
         let Some(rx) = self.schema_events.as_ref() else {
             return Ok(());
         };
+        // Heap2 VACUUM / FREEZE records carry xact_id=0 (non-
+        // transactional) but still drive `relation_at` lookups that
+        // can push Added/Changed events. Buffering them under xid=0
+        // creates an inflight entry that never commits, pinning
+        // `emitter_ack_lsn` behind a phantom xact. Leave the events
+        // in the channel — the next real-xid heap record or commit
+        // will drain them in-order.
+        if xid == 0 {
+            return Ok(());
+        }
         let pending = drain_pending_schema_events(rx);
         if pending.is_empty() {
             return Ok(());
