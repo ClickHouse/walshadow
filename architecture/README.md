@@ -52,10 +52,31 @@ wait on shadow without parking the wire. CH ⑥ is held-open INSERT:
 ### 6. Restart timelines — three scenarios
 
 Side-by-side columns: A. clean SIGTERM, B. kill -9 mid-stream
-(validated by `phase14_kill_restart` drill), C. WAL overflow →
+(validated by `tests/kill_restart.rs` drill), C. WAL overflow →
 re-bootstrap. Includes cursor.bin six-field reference table.
 
 ![restart timelines](timeline_restart.svg)
+
+## Component diagrams
+
+One per file under [`../plans/`](../plans/INDEX.md). Embedded inline in
+the matching plan doc. Render alongside the six above.
+
+| component | source | embedded in |
+|---|---|---|
+| filter | [`filter.dot`](filter.dot) | [`plans/filter.md`](../plans/filter.md) |
+| source | [`source.dot`](source.dot) | [`plans/source.md`](../plans/source.md) |
+| shadow | [`shadow.dot`](shadow.dot) | [`plans/shadow.md`](../plans/shadow.md) |
+| decoder | [`decoder.dot`](decoder.dot) | [`plans/decoder.md`](../plans/decoder.md) |
+| xact | [`xact.dot`](xact.dot) | [`plans/xact.md`](../plans/xact.md) |
+| emitter | [`emitter.dot`](emitter.dot) | [`plans/emitter.md`](../plans/emitter.md) |
+| bootstrap | [`bootstrap.dot`](bootstrap.dot) | [`plans/bootstrap.md`](../plans/bootstrap.md) |
+| ops | [`ops.dot`](ops.dot) | [`plans/ops.md`](../plans/ops.md) |
+| oracle | [`oracle.dot`](oracle.dot) | [`plans/oracle.md`](../plans/oracle.md) |
+| safety | [`safety.dot`](safety.dot) | [`plans/safety.md`](../plans/safety.md) |
+
+Machine-readable regeneration specs live under
+[`../plans/robot/`](../plans/robot/INDEX.md) — not for human reading
 
 ## Render
 

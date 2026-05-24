@@ -33,7 +33,7 @@ digraph timeline_restart {
 
     b0 [label="① kill -9 (no drain)", fillcolor="#403a36"];
     b1 [label="② OS reaps process\nbuffers lost; cursor.bin = last fsync\nspill files on disk\npartial segment write rolled back", fillcolor="#4D3A28"];
-    b2 [label="③ restart:\nspill::clear() wipes xid-*.bin\n(PHASE6disk policy)", fillcolor="#4D3A28"];
+    b2 [label="③ restart:\nspill::clear() wipes xid-*.bin\n(resume contract)", fillcolor="#4D3A28"];
     b3 [label="④ cursor::read\nresume_lsn = emitter_ack_lsn\n(slot-safe)", fillcolor="#4D3A28"];
     b4 [label="⑤ shadow PG recovers on its own\nwalreceiver retry timer", fillcolor="#3D4128"];
     b5 [label="⑥ shadow asks START_REPLICATION\nPHYSICAL <its flush_lsn>", fillcolor="#3D4128"];

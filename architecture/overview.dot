@@ -1,7 +1,7 @@
 // walshadow — 30-second system view
 // 5 boxes, 6 wires. For deeper pipeline detail, see internals.dot.
 digraph overview {
-  rankdir=LR;
+  rankdir=TB;
   graph [fontname="Helvetica", labelloc="t", label="walshadow — source Postgres → ClickHouse, with shadow Postgres as catalog-replay sidecar", fontsize=14, splines=spline, nodesep=0.6, ranksep=1.1, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=12, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=10, color="#c1a78e", fontcolor="#ECE1D7"];
@@ -27,11 +27,11 @@ digraph overview {
     <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>wire</B></TD></TR>
       <TR><TD><FONT COLOR="#A1A9CC"><B>①</B></FONT></TD><TD>source → walshadow: physical replication (START_REPLICATION PHYSICAL)</TD></TR>
-      <TR><TD><FONT COLOR="#BD8183"><B>②</B></FONT></TD><TD>walshadow → shadow: walsender wire, record cadence (Phase 13 hot path)</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>②</B></FONT></TD><TD>walshadow → shadow: walsender wire, record cadence (hot path)</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>③</B></FONT></TD><TD>walshadow ↔ shadow: libpq SELECT on cache miss (pg_class / pg_attribute)</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>④</B></FONT></TD><TD>walshadow → on-disk: fsynced filtered WAL segments + manifests</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>⑤</B></FONT></TD><TD>on-disk → shadow: restore_command archive fallback when walsender stalls</TD></TR>
-      <TR><TD><FONT COLOR="#BF8C5F"><B>⑥</B></FONT></TD><TD>walshadow → ClickHouse: Native protocol, INSERT held open across xacts, deadline-flushed (PHASE14)</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>⑥</B></FONT></TD><TD>walshadow → ClickHouse: Native protocol, INSERT held open across xacts, deadline-flushed</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>where to go next</B></TD></TR>
       <TR><TD COLSPAN="2"><FONT FACE="monospace">internals.svg</FONT> — pipeline stages, taps, caches</TD></TR>
       <TR><TD COLSPAN="2"><FONT FACE="monospace">shadow_communication.svg</FONT> — channels ②③⑤ in detail</TD></TR>

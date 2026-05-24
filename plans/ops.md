@@ -2,8 +2,8 @@
 
 Operational scaffolding for production deployment. Four sibling
 surfaces: preflight validators, HTTP/Prom metrics, filtered-segment
-retention, durable cursor file. None of them touches decoder fidelity; their job is to
-make a long-running daemon survivable, observable, and resumable.
+retention, durable cursor file. None touches decoder fidelity; job is
+to make long-running daemon survivable, observable, resumable
 
 ## Purpose
 
@@ -11,12 +11,12 @@ make a long-running daemon survivable, observable, and resumable.
   aggregated report instead of "fix one issue, restart, hit next"
 - Expose every load-bearing LSN + per-rmgr filter counter + xact buffer
   occupancy as Prom text so operators see lag before CH does
-- Retain filtered segments below shadow's replay head for a
-  configurable debug window, drop older ones to bound disk
+- Retain filtered segments below shadow's replay head for configurable
+  debug window, drop older ones to bound disk
 - Persist resume state (six LSNs + CRC) across `kill -9` so daemon
-  restart hands source's slot a byte-identical write/flush/apply
-  triple, and `cargo test --test kill_restart` proves end-state
-  parity over 15 seeded kill/restart cycles
+  restart hands source's slot byte-identical write/flush/apply triple,
+  and `cargo test --test kill_restart` proves end-state parity over 15
+  seeded kill/restart cycles
 
 ## Preflight validators
 
@@ -27,42 +27,41 @@ hitting 3-4 setup issues see them all at once. Checks driven from
 
 - `server_version_num >= MIN_SERVER_VERSION_NUM` (160_000). Catalog
   accessors assume PG-16 column layouts
-- `source_major == shadow_major`. Same-physical-WAL standby cannot
-  span major versions, PG's catalog layout diverges across them
+- `source_major == shadow_major`. Same-physical-WAL standby cannot span
+  major versions, PG's catalog layout diverges across them
 - `wal_level = 'logical'`. Physical-only WAL omits old-tuple bytes
   UPDATE / DELETE need
 - `--slot` resolves in `pg_replication_slots` when set
 - Every `--ch-config` mapped relation has `relreplident = 'f'`. Uses
   `to_regclass(text)` so missing relations land as `MappedRelMissing`
-  (NULL row), not a `SqlState::UNDEFINED_TABLE` SQL error. `quote_ident`
+  (NULL row), not `SqlState::UNDEFINED_TABLE` SQL error. `quote_ident`
   alternative rejected, doesn't handle `"namespace.relname"` form
 
-Each finding renders to a precise variant with operator-actionable
-text (`ALTER TABLE foo REPLICA IDENTITY FULL on the source`). No
+Each finding renders to a precise variant with operator-actionable text
+(`ALTER TABLE foo REPLICA IDENTITY FULL on the source`). No
 silent-skip fall-throughs. `--skip-preflight` exists for development
-work, not production. Daemon prints the report and exits non-zero on
-any finding.
+work, not production. Daemon prints report and exits non-zero on any
+finding
 
 ## Metrics endpoint
 
 [`src/metrics.rs`](../src/metrics.rs). Hand-rolled Prometheus text
-format over a tokio TCP loop. No `prometheus` crate dep, ~80 LOC of
-`writeln!` against an `MetricsSnapshot`. `--metrics-bind 127.0.0.1:PORT`
-opens the listener; `:0` picks an ephemeral port. The HTTP server
-returns the same body for any path so `curl http://host:port/` works
-alongside `/metrics`.
+format over tokio TCP loop. No `prometheus` crate dep, ~80 LOC of
+`writeln!` against `MetricsSnapshot`. `--metrics-bind 127.0.0.1:PORT`
+opens listener; `:0` picks ephemeral port. HTTP server returns same
+body for any path so `curl http://host:port/` works alongside `/metrics`
 
-Endpoint doubles as a bootstrap-readiness gate: integration tests
-poll `fx::wait_for_listen(metrics_addr)` to detect that preflight +
-bootstrap finished before driving workload.
+Endpoint doubles as bootstrap-readiness gate: integration tests poll
+`fx::wait_for_listen(metrics_addr)` to detect that preflight +
+bootstrap finished before driving workload
 
 Inventory by category:
 
 ### LSN gauges
 
-- `walshadow_source_received_lsn` — highest `server_wal_end` on the
+- `walshadow_source_received_lsn` — highest `server_wal_end` on
   replication socket
-- `walshadow_filter_lsn` — last segment-boundary the filter dispatched
+- `walshadow_filter_lsn` — last segment-boundary filter dispatched
 - `walshadow_shadow_replay_lsn` — `pg_last_wal_replay_lsn()`, polled
   shared with retention sweeper via one `Arc<AtomicU64>`
 - `walshadow_decoder_commit_lsn` — wired to `XactBufferStats.drain_lsn`
@@ -93,8 +92,8 @@ Inventory by category:
   shadow is connected, caller passes `source_received_lsn` so
   disconnect surfaces as max lag, not silently absent
 - `walshadow_shadow_apply_lag_seconds` (gauge): bytes divided by
-  rolling 30 s rate estimate. `+Inf` when denominator is unknown (Prom
-  convention for "no data point"); zero when lag is zero
+  rolling 30 s rate estimate. `+Inf` when denominator is unknown
+  (Prom convention for "no data point"); zero when lag is zero
 - `walshadow_shadow_stream_active_connections` (gauge): count of
   attached walreceivers
 - `walshadow_shadow_stream_dropped_connections_total` (counter):
@@ -104,124 +103,132 @@ Inventory by category:
 
 Render emits `# HELP` + `# TYPE` per metric. Counters use `_total`
 suffix per Prom naming. `f64::INFINITY` → `+Inf`; finite floats use
-`{:.3}` precision.
+`{:.3}` precision
 
 ## RateEstimator
 
 [`RateEstimator`](../src/metrics.rs) in `src/metrics.rs`, driven from
-the status-loop tick in `src/bin/stream.rs`. 30-second rolling
+status-loop tick in `src/bin/stream.rs`. 30-second rolling
 `VecDeque<(Instant, source_received_lsn)>`; `observe` pushes + prunes
 entries older than `window`; `rate()` returns
 `(back_lsn - front_lsn) / elapsed_secs` or `None` when fewer than two
-samples, zero elapsed, or zero delta.
+samples, zero elapsed, or zero delta
 
-`seconds_for(lag_bytes)` is the gauge feeder:
+`seconds_for(lag_bytes)` is gauge feeder:
 
 - `lag_bytes == 0` → `0.0`
 - `rate().is_some()` → `lag_bytes / rate`
 - otherwise → `f64::INFINITY` (renders as `+Inf`)
 
-Rate window pinned at 30 s. A 5 s window swings wildly under bursty
-write traffic; 60 s lags too far behind step changes. No history
-persisted, restart resets.
+Rate window pinned at 30 s. 5 s window swings wildly under bursty write
+traffic; 60 s lags too far behind step changes. No history persisted,
+restart resets
 
 ## Tracing
 
 `tracing_subscriber::fmt().with_env_filter(...)` initialised once at
 [`bin/stream.rs`](../src/bin/stream.rs) entry. `RUST_LOG` honoured;
 default `warn` + per-crate overrides. Surfaces wal-rs's frame-level
-debug calls alongside walshadow's own status-line events.
+debug calls alongside walshadow's own status-line events
 
 Status line per tick includes `shadow_apply=<lsn>` alongside
 `dispatched=<lsn>` + `drain_lsn=<lsn>`. Diverging pair is the
-at-a-glance signal that shadow has fallen behind. CI runs set
+at-a-glance signal shadow has fallen behind. CI runs set
 `RUST_LOG=warn,walshadow=info`; artifact-emitting CI flips to
-`walshadow::xact_buffer=trace` so stalled commits surface in the
-captured stderr log without re-runs.
+`walshadow::xact_buffer=trace` so stalled commits surface in captured
+stderr log without re-runs
 
 OpenTelemetry / Jaeger export deferred; single-daemon +
-stderr-to-journal deployments don't need it.
+stderr-to-journal deployments don't need it
 
 ## SIGHUP reload
 
 [`bin/stream.rs::install_sighup`](../src/bin/stream.rs). Re-reads
 `--ch-config` TOML, parses through `EmitterConfig::from_toml_str`,
-atomically swaps the emitter's `Arc<RwLock<HashMap<String, TableMapping>>>`
+atomically swaps emitter's
+`Arc<RwLock<HashMap<String, TableMapping>>>`
 ([`MappingHandle`](../src/ch_emitter.rs)) via
 `*handle.write().await = new`. New mapping picks up at next xact
 boundary; `Emitter::tables` per-table encoder cache clears at end of
-`drain_xact` so the next `route()` call consults the live handle and
-rebuilds.
+`drain_xact` so next `route()` call consults live handle and rebuilds
 
 Mid-xact application rejected: would change CH dest of
-already-buffered rows mid-flush, requiring a CH-server-side
-"redirect" semantic that doesn't exist.
+already-buffered rows mid-flush, requiring CH-server-side "redirect"
+semantic that doesn't exist
 
-SIGHUP without `--ch-config` is a no-op tap. The runtime-config-from-PG
-work narrows TOML scope but doesn't remove it; cross-link
+SIGHUP without `--ch-config` is no-op tap. Runtime-config-from-PG work
+narrows TOML scope but doesn't remove it; cross-link
 [emitter.md](emitter.md),
-[future/runtime_config_from_pg.md](future/runtime_config_from_pg.md).
+[future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
 
 ## Filtered segment retention
 
 [`src/retention.rs`](../src/retention.rs). Shadow's `restore_command`
-copies (not moves) every segment out of the filter's output dir; the
-originals accumulate forever without intervention.
+copies (not moves) every segment out of filter's output dir; originals
+accumulate forever without intervention
 
-`trim_below_lsn(dir, cutoff_lsn)` walks the dir, parses each filename
-through `SegmentName::parse`, and removes any segment whose end LSN
+`trim_below_lsn(dir, cutoff_lsn)` walks dir, parses each filename
+through `SegmentName::parse`, removes any segment whose end LSN
 (`start_lsn + WAL_SEG_SIZE`) sits at or below `cutoff_lsn`. Segment
 containing `cutoff_lsn` is preserved (shadow may still be reading it).
-`.partial` files (crash residue) and `.manifest.json` sidecars
-(plus `.partial.manifest.json`) are removed alongside their segment.
-Unknown files are left alone — trimmer is conservative on purpose so
-a sibling system writing into the same dir doesn't lose unrelated
-files.
+`.partial` files (crash residue) and `.manifest.json` sidecars (plus
+`.partial.manifest.json`) are removed alongside their segment. Unknown
+files left alone — trimmer is conservative on purpose so sibling
+system writing into same dir doesn't lose unrelated files
 
 Sweeper task in `bin/stream.rs` ticks every
 `DEFAULT_TRIM_INTERVAL = 30s`, polls
 `SELECT pg_last_wal_replay_lsn()::text` from shadow, computes
 `cutoff_lsn = replay_lsn.saturating_sub(retention_bytes)`. Single
-`Arc<AtomicU64>` shared with the status loop so the metrics gauge +
-the sweeper see the same value with one round-trip.
+`Arc<AtomicU64>` shared with status loop so metrics gauge + sweeper
+see the same value with one round-trip
 
-`--retention-bytes` default `DEFAULT_RETENTION_BYTES = 256 MiB`
-(~16 × 16 MiB segments). `--retention-bytes 0` disables the sweeper
-outright. Bytes (not seconds) because daemon lives in LSN space:
-"how far behind can shadow lag" is exactly LSN delta. Operator
-tuning "1h at 2 MB/s" maps to bytes once.
+`--retention-bytes` default `DEFAULT_RETENTION_BYTES = 256 MiB` (~16 ×
+16 MiB segments). `--retention-bytes 0` disables sweeper outright.
+Bytes (not seconds) because daemon lives in LSN space: "how far behind
+can shadow lag" is exactly LSN delta. Operator tuning "1h at 2 MB/s"
+maps to bytes once
 
 `TrimReport { segments_removed, manifests_removed, partials_removed,
-bytes_freed }` surfaces at the status line.
+bytes_freed }` surfaces at status line
+
+## Cursor durability + slot advance
+
+![ops](../architecture/ops.svg)
+
+`status_loop` in [`bin/stream.rs`](../src/bin/stream.rs) is single
+choke point: snapshots all six LSNs at `--status-interval` cadence
+(default 10 s), writes `cursor.bin` via atomic rename, emits
+standby-status triple on replication socket. Diagram covers
+producer-of-each-field wiring; sections below pin load-bearing
+semantics
 
 ## Standby-status triple
 
 [`StandbyStatus { write, flush, apply }`](../src/source_feed.rs)
 threads through `SourceFeed::next_chunk`/`send_status`:
 
-- `write_lsn = source_received_lsn` — last `server_wal_end` seen
-- `flush_lsn = filter_durable_lsn` — last segment fsynced via
-  `DirSegmentSink::on_segment`'s `OpenOptions+write_all+sync_all+
-  rename+dir_sync` chain. Equal to `dispatched_lsn` once segment fsync
-  made equivalence honest
-- `apply_lsn = min(shadow_replay_lsn, emitter_ack_lsn)`. Neither side
-  may advance past either replica. Carve-out: treat
-  `shadow_replay_lsn == 0` as "no constraint from shadow" (sweeper
-  hasn't reported, or `--retention-bytes 0`) and use
-  `emitter_ack_lsn` alone — otherwise source's slot freezes at 0
+- `write_lsn = source_received_lsn`
+- `flush_lsn = filter_durable_lsn` (segment fsync via
+  `DirSegmentSink::on_segment`'s
+  `OpenOptions+write_all+sync_all+rename+dir_sync` chain)
+- `apply_lsn = min(shadow_replay_lsn, emitter_ack_lsn)` with carve-out:
+  treat `shadow_replay_lsn == 0` as "no constraint from shadow"
+  (sweeper hasn't reported, or `--retention-bytes 0`) and use
+  `emitter_ack_lsn` alone, otherwise source's slot freezes at 0
 
 Source's `pg_replication_slots.confirmed_flush_lsn` advances against
-this triple; slot recycle keys on `apply_lsn`. See
-[filter.md](filter.md) for `filter_durable_lsn` producer,
-[shadow.md](shadow.md) for `shadow_replay_lsn` + `shadow_flush_lsn`
-producers, [xact.md](xact.md) for `drain_lsn` + `emitter_ack_lsn`,
-[emitter.md](emitter.md) for `on_xact_end` returning Ok being the
-signal the buffer interprets to advance `emitter_ack_lsn`.
+this triple; slot recycle keys on `apply_lsn`. Per-field producer
+cross-links: [filter.md](filter.md) (`filter_durable_lsn`),
+[shadow.md](shadow.md) (`shadow_replay_lsn`, `shadow_flush_lsn`),
+[xact.md](xact.md) (`drain_lsn`, `emitter_ack_lsn`),
+[emitter.md](emitter.md) (`on_xact_end → Ok` signal advancing
+`emitter_ack_lsn`)
 
 ## Cursor file
 
 [`src/cursor.rs`](../src/cursor.rs). `{spill_dir}/cursor.bin`, 64 bytes
-on disk, schema version 2 (v2 added `shadow_flush_lsn` to v1 layout).
+on disk, schema version 2 (v2 added `shadow_flush_lsn` to v1 layout)
 
 ```
 MAGIC "WSCRSR\x01\x00"        (8 B)
@@ -235,42 +242,43 @@ shadow_flush_lsn    u64 LE    (8 B)
 crc32c              u32 LE    (4 B)
 ```
 
-Constants: `CURSOR_FILENAME = "cursor.bin"`,
-`CURSOR_VERSION = 2`, `CURSOR_FILE_LEN = 64`, `LSN_COUNT = 6`. CRC32C
-matches PG's own checksum algorithm so future "log on every checksum
-failure" taps share code paths. Magic prefix doubles as
-`file`/`binwalk`-friendly identifier.
+Constants: `CURSOR_FILENAME = "cursor.bin"`, `CURSOR_VERSION = 2`,
+`CURSOR_FILE_LEN = 64`, `LSN_COUNT = 6`. CRC32C matches PG's own
+checksum algorithm so future "log on every checksum failure" taps
+share code paths. Magic prefix doubles as `file`/`binwalk`-friendly
+identifier
 
 Writer is `create+write_all+sync_all+rename+fsync_dir` against
 `cursor.bin.tmp` → `cursor.bin`. `kill -9` between `OpenOptions::open`
-+ `rename` leaves a valid-magic, valid-CRC stale `.tmp` on disk; boot
-path only reads `cursor.bin` so the stale `.tmp` is ignored. Code
-comment in `cursor::write` pins the invariant.
++ `rename` leaves valid-magic, valid-CRC stale `.tmp` on disk; boot
+path only reads `cursor.bin` so stale `.tmp` is ignored. Code comment
+in `cursor::write` pins invariant
 
 Reader (`cursor::read`) returns `Ok(None)` for greenfield (file
-absent), `Ok(Some)` for a valid file, `Err(CursorError::{Size,
-BadMagic, Version, Crc, Io})` for corrupt. Boot path logs the error
-and falls back to greenfield resume.
+absent), `Ok(Some)` for valid file, `Err(CursorError::{Size, BadMagic,
+Version, Crc, Io})` for corrupt. Boot path logs error and falls back
+to greenfield resume
 
-`--ignore-cursor` forces greenfield boot even with a valid file on
-disk. Picked over `rm cursor.bin` because `rm` between cursor write +
-daemon launch races a still-running daemon; flag is atomic with the
-boot sequence and leaves the prior cursor on disk for forensics.
+`--ignore-cursor` forces greenfield boot even with valid file on disk.
+Picked over `rm cursor.bin` because `rm` between cursor write + daemon
+launch races a still-running daemon; flag is atomic with boot sequence
+and leaves prior cursor on disk for forensics
 
 Write cadence equals `--status-interval` (default 10 s). Per-xact
 cursor write rejected on cost grounds — 1k cursors/sec worth of
-disk+fsync+dir-fsync on a busy OLTP workload; PLAN §5 acceptance
-doesn't require per-xact granularity.
+disk+fsync+dir-fsync on busy OLTP workload; PLAN §5 acceptance doesn't
+require per-xact granularity
 
 Cursor lives at `{spill_dir}/cursor.bin` not `--cursor-path` so `mv`
-of the working dir keeps spill files + cursor coherent. `cursor::cursor_path`
-is the single choke point for any future `--cursor-dir` HA knob.
+of working dir keeps spill files + cursor coherent.
+`cursor::cursor_path` is single choke point for any future
+`--cursor-dir` HA knob
 
 ## Resume semantics
 
 Boot order ([`bin/stream.rs`](../src/bin/stream.rs)):
 `IDENTIFY_SYSTEM` → cursor read → resolve start LSN → preflight →
-`START_REPLICATION`.
+`START_REPLICATION`
 
 Start-LSN precedence:
 
@@ -279,86 +287,65 @@ Start-LSN precedence:
    and `--ignore-cursor` unset
 3. Source's current write head — greenfield
 
-Each LSN's restart role:
-
-- `source_received_lsn`: bookkeeping only, gates nothing on restart
-- `filter_durable_lsn`: highest segment fsynced on disk. Equals
-  `flush_lsn` advertised to source
-- `shadow_replay_lsn`: shadow PG's `pg_last_wal_replay_lsn()`,
-  apply-LSN floor (when nonzero)
-- `drain_lsn`: highest commit-record LSN handed to observer's
-  `on_xact_end`. Strictly ≥ `emitter_ack_lsn`. Surfaces as
-  `walshadow_decoder_commit_lsn`
-- `emitter_ack_lsn`: highest commit-record LSN where `on_xact_end`
-  returned Ok. Load-bearing resume LSN — daemon restarts here.
-  Apply-LSN ceiling
-- `shadow_flush_lsn`: minimum `flush_lsn` reported via inbound `'r'`
-  standby status across active shadow streaming connections. On
-  restart, walsender hands shadow back through
-  `START_REPLICATION PHYSICAL <lsn>`. Bookkeeping-only when no
-  streaming shadows are attached; on-disk `restore_command` fallback
-  takes over
-
-Apply LSN formula (`min(shadow_replay_lsn, emitter_ack_lsn)`) with
-carve-out: treat `shadow_replay_lsn == 0` as no shadow constraint,
-fall back to `emitter_ack_lsn` alone. Ack-only
-correctness is the right trade when shadow's replay isn't on the
-resume path anyway.
+Per-field restart role is on cursor.bin layout table in diagram above.
+`emitter_ack_lsn` is load-bearing resume LSN (daemon restarts here);
+`shadow_flush_lsn` lets streaming-fed shadow's resume position survive
+daemon bounce without re-archiving from `out/`. Bookkeeping-only
+fields (`source_received_lsn`, `drain_lsn`) gate nothing on restart
+but surface as metrics
 
 Dual-cursor contract for `kill -9` + restart: spill dir + cursor file
-persist between kill and restart. `shadow_flush_lsn` lets the
-streaming-fed shadow's resume position survive daemon bounce without
-re-archiving from `out/`.
+persist between kill and restart
 
 ## Kill-restart drill
 
-[`tests/kill_restart.rs`](../tests/kill_restart.rs).
-Three cutoff strategies × five seeded windows = 15 daemon
-spawn/kill/restart cycles per CI invocation. Source PG + CH server +
-basebackup-cloned shadow stand up once, daemon cycles inside.
+[`tests/kill_restart.rs`](../tests/kill_restart.rs). Three cutoff
+strategies × five seeded windows = 15 daemon spawn/kill/restart cycles
+per CI invocation. Source PG + CH server + basebackup-cloned shadow
+stand up once, daemon cycles inside
 
 Strategies:
 
-1. **mid-segment** — kill before in-flight segment reaches 16 MiB
-   seal. Walshadow's cursor resumes from sub-segment LSN; streaming-
-   fed shadow re-streams unsealed bytes via the wire, archive path
-   catches up via partial-segment re-fetch
-2. **mid-xact** — kill while at least one large xact is open (sized
-   to spill via `XactBuffer` largest-first eviction; `BEGIN; INSERT
-   × 10000; COMMIT` of ~250 B/row alongside the small-write loop)
+1. **mid-segment** — kill before in-flight segment reaches 16 MiB seal.
+   Walshadow's cursor resumes from sub-segment LSN; streaming-fed
+   shadow re-streams unsealed bytes via wire, archive path catches up
+   via partial-segment re-fetch
+2. **mid-xact** — kill while at least one large xact is open (sized to
+   spill via `XactBuffer` largest-first eviction; `BEGIN; INSERT ×
+   10000; COMMIT` of ~250 B/row alongside small-write loop)
 3. **post-commit / pre-CH-ack** — kill the moment
    `walshadow_xacts_committed_total > 0`. Fallback shape in place of
-   the originally-planned CH-side artificial-delay shim; same intent,
+   originally-planned CH-side artificial-delay shim; same intent,
    simpler harness
 
 Per-cycle: spawn daemon, wait for metrics endpoint (post-preflight
 readiness gate), drive small_insert_loop, fire strategy trigger,
 SIGKILL via `std::process::Child::kill()`, snapshot source's
 `pg_current_wal_lsn`, restart with identical flags (same `--spill-dir`,
-same `--walsender-bind`, SO_REUSEADDR on the listener), no
+same `--walsender-bind`, SO_REUSEADDR on listener), no
 `--ignore-cursor`, poll `walshadow_emitter_ack_lsn` until catchup,
 assert CH `count + sum(id) + md5(string_agg(name, ',' ORDER BY id))`
-matches source.
+matches source
 
-`WALSHADOW_KILL_SEED` env (default `0xC11AC11A`) seeds an inline
+`WALSHADOW_KILL_SEED` env (default `0xC11AC11A`) seeds inline
 splitmix-style LCG so CI is reproducible. Per-(strategy, run) seed
-derivative shifts the 250-750 ms kill window within each strategy.
-Nightly rotation across seeds surfaces rare-window bugs.
+derivative shifts 250-750 ms kill window within each strategy. Nightly
+rotation across seeds surfaces rare-window bugs
 
 Test is NOT `#[ignore]`. Uses runtime skip-gates checking
 `fx::pg_available()` / `fx::pg_basebackup_available()` /
 `fx::clickhouse_available()` — silently `return` when binaries are
 absent, panics on actual failure when present (switched away from
-`#[ignore]` so default `cargo test` exercises the drill on any dev box
-with PG + CH on PATH).
+`#[ignore]` so default `cargo test` exercises drill on any dev box with
+PG + CH on PATH)
 
 Source pins `wal_keep_size = '128MB'` so 250-750 ms of WAL stays
-inside the slot-less retention window (no `--slot` set in this drill).
+inside slot-less retention window (no `--slot` set in this drill)
 
 ## pgbench acceptance drill
 
 [`tests/pgbench_acceptance.rs`](../tests/pgbench_acceptance.rs).
-v1.0 acceptance §1 end-to-end.
+v1.0 acceptance §1 end-to-end
 
 Pipeline: `initdb` source PG `wal_level=logical` → `pgbench -i -s 1`
 (100k `pgbench_accounts`, 1 branch, 10 tellers, 0 history) →
@@ -367,64 +354,64 @@ otherwise) → spawn CH + dest tables ReplacingMergeTree(_lsn) → spawn
 `walshadow-stream --bootstrap-mode=direct
 --bootstrap-autospawn-shadow` → wait for metrics endpoint
 (bootstrap-finished gate, ~100k rows land via transitional emitter's
-synchronous INSERTs) → `pgbench -T 6 -c 4 -j 2` background (CI uses
-6 s, plan called for 30 s) → +2 s `ALTER TABLE pgbench_accounts ADD
+synchronous INSERTs) → `pgbench -T 6 -c 4 -j 2` background (CI uses 6
+s, plan called for 30 s) → +2 s `ALTER TABLE pgbench_accounts ADD
 COLUMN c int DEFAULT 7` (exercises read-time defaults via
 `attmissingval`) → +4 s `CREATE INDEX CONCURRENTLY ON pgbench_history
 (bid)` (catalog-cache + non-blocking-DDL exercise) → drain via
 `pg_switch_wal` + `--max-segments=1`, or poll
 `walshadow_emitter_ack_lsn` to source's post-switch
-`pg_current_wal_lsn` → `OPTIMIZE TABLE <dest> FINAL` per table,
-parity oracle on count + sum.
+`pg_current_wal_lsn` → `OPTIMIZE TABLE <dest> FINAL` per table, parity
+oracle on count + sum
 
 `c` column on CH is **`Nullable(Int32)`** not `Int32`. Bootstrap walks
-heap pages where `attnum=5` doesn't yet exist (ALTER fires post-
-bootstrap), and the emitter writes NULL for missing-attnum mapping
+heap pages where `attnum=5` doesn't yet exist (ALTER fires
+post-bootstrap), emitter writes NULL for missing-attnum mapping
 columns. Non-nullable rejects bootstrap inserts. Assertion adjusted to
-(a) ≥ 1 row reaches CH with `c=7` via the read-time-default path,
-(b) no row has c set to anything other than 7 or NULL. Pre-ALTER
-bootstrap rows never touched by pgbench stay at `c=NULL`. See
-[bootstrap.md](bootstrap.md) for the bootstrap-then-DDL column-shape
-interaction.
+(a) ≥ 1 row reaches CH with `c=7` via read-time-default path, (b) no
+row has c set to anything other than 7 or NULL. Pre-ALTER bootstrap
+rows never touched by pgbench stay at `c=NULL`. See
+[bootstrap.md](bootstrap.md) for bootstrap-then-DDL column-shape
+interaction
 
 Test NOT `#[ignore]`. Same runtime skip-gate pattern as kill-restart:
 `fx::pg_available`, `fx::pg_basebackup_available`,
-`fx::clickhouse_available`, plus a local `pgbench_available()`.
+`fx::clickhouse_available`, plus local `pgbench_available()`
 
 `--ch-flush-timeout-ms 200` holds INSERTs open across xacts; pgbench
 TPC-B writes four tables/xact + per-table close is one CH EndOfStream
-round-trip, so `flush_timeout=0` caps throughput at ~5 xact/s on a
-local CH. 200 ms coalesces inserts into one MergeTree part per window
-and lets the daemon track pgbench's ~700 xact/s.
+round-trip, so `flush_timeout=0` caps throughput at ~5 xact/s on local
+CH. 200 ms coalesces inserts into one MergeTree part per window, lets
+daemon track pgbench's ~700 xact/s
 
 CI matrix slot for PG 16 / 17 / 18 across same fixture — different
-`postgres` binary — exists, drift surfaces as parity-check diff.
+`postgres` binary — exists, drift surfaces as parity-check diff
 
 ## Bounded CH-emitter retry
 
-[`Emitter::reconnect`](../src/ch_emitter.rs) opens
-a fresh TCP + builds a new `Client`, hot-swaps `client` / `codec` /
-`io` while preserving per-xact accumulator buffers in `self.tables`.
-[`Emitter::route_with_retry`] + [`Emitter::drain_xact_with_retry`]
-wrap inner ops with bounded exponential backoff per [`RetryConfig`].
+[`Emitter::reconnect`](../src/ch_emitter.rs) opens fresh TCP + builds
+new `Client`, hot-swaps `client` / `codec` / `io` while preserving
+per-xact accumulator buffers in `self.tables`.
+[`Emitter::route_with_retry`] + [`Emitter::drain_xact_with_retry`] wrap
+inner ops with bounded exponential backoff per [`RetryConfig`].
 `EmitterError::{Io, Client, ServerException}` is now survived instead
-of killing the daemon.
+of killing daemon
 
-Residual hazard: rows that landed in CH on the old connection +
-committed by CH server before disconnect are duplicated on retry.
+Residual hazard: rows that landed in CH on old connection + committed
+by CH server before disconnect are duplicated on retry.
 `ReplacingMergeTree(_lsn)` collapses dupes on `FINAL`; eager-read
-consumers see the dup window. Acceptable for v1.0.
+consumers see dup window. Acceptable for v1.0
 
-Dual-cursor narrows the dup window, slot-advance via
-`emitter_ack_lsn` means retry replays from a per-xact ack point, not
-from the segment boundary. Deeper re-emit-from-spill story (replay
-spill files keyed on xids whose first-seen LSN > cursor's ack) is
-deferred to [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md).
+Dual-cursor narrows dup window, slot-advance via `emitter_ack_lsn`
+means retry replays from per-xact ack point, not from segment boundary.
+Deeper re-emit-from-spill story (replay spill files keyed on xids
+whose first-seen LSN > cursor's ack) is deferred to
+[future/ch_bounce_recovery.md](future/ch_bounce_recovery.md)
 
 ## Cross-links
 
-- [filter.md](filter.md) — `filter_durable_lsn` producer
-  (DirSegmentSink fsync chain)
+- [filter.md](filter.md) — `filter_durable_lsn` producer (DirSegmentSink
+  fsync chain)
 - [shadow.md](shadow.md) — `shadow_replay_lsn` (sweeper poll) +
   `shadow_flush_lsn` (streaming) producers
 - [xact.md](xact.md) — `drain_lsn` + `emitter_ack_lsn` producers
@@ -438,9 +425,7 @@ deferred to [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md).
 - [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md) —
   deeper re-emit-from-spill story past current retry surface
 - [future/parked.md](future/parked.md) —
-  `--bootstrap-autospawn-shadow` port override + the seven
+  `--bootstrap-autospawn-shadow` port override + seven
   originally-`#[ignore]` tests' un-ignore drive items
 - [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
   — narrows TOML scope but doesn't remove `--ch-config` SIGHUP reload
-
-File written.

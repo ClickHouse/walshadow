@@ -241,7 +241,7 @@
 <path fill="#4d3a28" stroke="#6e6963" d="M785.4,-988.75C785.4,-988.75 636.6,-988.75 636.6,-988.75 630.6,-988.75 624.6,-982.75 624.6,-976.75 624.6,-976.75 624.6,-954.5 624.6,-954.5 624.6,-948.5 630.6,-942.5 636.6,-942.5 636.6,-942.5 785.4,-942.5 785.4,-942.5 791.4,-942.5 797.4,-948.5 797.4,-954.5 797.4,-954.5 797.4,-976.75 797.4,-976.75 797.4,-982.75 791.4,-988.75 785.4,-988.75"/>
 <text xml:space="preserve" text-anchor="middle" x="711" y="-975.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">③ restart:</text>
 <text xml:space="preserve" text-anchor="middle" x="711" y="-962.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">spill::clear() wipes xid&#45;*.bin</text>
-<text xml:space="preserve" text-anchor="middle" x="711" y="-949.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">(PHASE6disk policy)</text>
+<text xml:space="preserve" text-anchor="middle" x="711" y="-949.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">(resume contract)</text>
 </g>
 <!-- b1&#45;&gt;b2 -->
 <g id="edge11" class="edge">

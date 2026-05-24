@@ -1,9 +1,9 @@
 # walshadow overview
 
-walshadow turns a source Postgres's physical-WAL stream into ClickHouse
+walshadow turns source Postgres's physical-WAL stream into ClickHouse
 Native blocks without a logical-decoding plugin. Two consumers share
-one wire: a per-record WAL filter feeds a co-located shadow Postgres
-running schema-only catalog replay, and an in-tree heap-tuple decoder
+one wire: per-record WAL filter feeds co-located shadow Postgres
+running schema-only catalog replay, and in-tree heap-tuple decoder
 emits user rows to ClickHouse, using shadow as live catalog oracle for
 every relation lookup
 
@@ -61,7 +61,7 @@ identical `xl_tot_len` so subsequent `xl_prev` chain stays valid.
 Shadow PG runs as standby pointed at filter output via walsender wire
 plus `restore_command` archive fallback; unmodified upstream PG binary
 
-Alternative — patch recovery dispatcher with a relfilenode whitelist —
+Alternative — patch recovery dispatcher with relfilenode whitelist —
 rejected: maintaining PG fork is permanent spend, CRC rewrite is
 one-time, CRC32C on SSE4.2 is ~1 ns/byte. Reconsider only if
 measurement says otherwise
@@ -71,8 +71,8 @@ measurement says otherwise
 Component docs live alongside this overview:
 
 - [filter.md](filter.md) — per-record keep/drop, CRC32C rewrite,
-  `CatalogTracker` whitelist maintenance via `RM_RELMAP_ID` +
-  `pg_class` heap writes, `main_data` reclassifier
+  `CatalogTracker` whitelist via `RM_RELMAP_ID` + `pg_class` heap
+  writes, `main_data` reclassifier
 - [source.md](source.md) — WAL ingestion: wal-rs replication client,
   `SourceFeed`, walsender server feeding shadow at record cadence,
   `WalStream` page walker, `streaming_walker`, `QueueingRecordSink`
@@ -80,14 +80,14 @@ Component docs live alongside this overview:
 - [shadow.md](shadow.md) — shadow PG lifecycle (`initdb`,
   `recovery.signal`, supervision), `ShadowCatalog` libpq cache with
   generation counter + `relation_at` replay-LSN gate, per-relation
-  `SchemaEvent` channel feeding the CH DDL applicator
+  `SchemaEvent` channel feeding CH DDL applicator
 - [decoder.md](decoder.md) — `heap_decoder` Tier 1/2 type matrix,
   `MULTI_INSERT` fan-out, FPI decompression, `main_data` parsing,
   `pg_class_decoder` driving `CatalogTracker`, `relation_resolver`
 - [xact.md](xact.md) — `XactBuffer` per-xid hold-and-flush, append-only
   per-xid spill at `{spill_dir}/xid-<xid>-<first_lsn>.bin`,
   `SubxactTracker` + commit-record subxact list authority, TOAST chunk
-  reassembly inside the buffer
+  reassembly inside buffer
 - [emitter.md](emitter.md) — `ch_emitter` held-open INSERT (one query
   per table, blocks until deadline / row / byte budget),
   `clickhouse-c-rs` `BlockBuilder` + `Client`, `ch_ddl` applicator on a
@@ -119,28 +119,29 @@ Component docs live alongside this overview:
    records. Tiny volume, no per-record filtering
 3. **Catalog index bloat.** Shadow autovacuum suspended in recovery.
    Mitigations: periodic restart, accept while catalog stays MiB-scale,
-   or briefly promote to vacuum. Default: accept
+   briefly promote to vacuum. Default: accept
 4. **wal_level.** Catalog needs `replica`; user-table decoder needs
    `logical` for old-tuple. Net: `wal_level=logical` plus
    `REPLICA IDENTITY FULL` on every replicated table, both preflighted
 5. **Source DDL that rewrites a user table.** Ordering invariant:
    shadow replay LSN ≥ decoder read LSN. `ShadowCatalog::relation_at`
    blocks until `pg_last_wal_replay_lsn() >= commit_lsn` so decoder
-   reads post-DDL catalog for the heap records. Fast-path `ADD COLUMN`
-   skips rewrite; read-time defaults via `attmissingval` cover the
+   reads post-DDL catalog for heap records. Fast-path `ADD COLUMN`
+   skips rewrite; read-time defaults via `attmissingval` cover
    bootstrap-then-ALTER skew
 6. **Shadow PG version skew.** Same major as source. Daemon refuses to
    start on mismatch or PG < 16
 7. **Catalog cache invalidation granularity.** Single generation bumps
-   on any `pg_class` write — over-invalidates. Decoder fidelity unaffected;
-   cache freshness coarse. Defer finer scheme until measured
+   on any `pg_class` write — over-invalidates. Decoder fidelity
+   unaffected; cache freshness coarse. Defer finer scheme until
+   measured
 8. **Bootstrap-then-ADD-COLUMN column nullability.** Bootstrap walks
    heap pages where post-ALTER attnums don't yet exist; emitter writes
    NULL for missing-attnum mapping columns. CH-side schema must use
    `Nullable(T)` for any column likely added post-attach
 9. **Source primary failover.** Slot doesn't follow. Operator
    pre-creates slot on standby (PG 17+ failover-aware slots) or accepts
-   re-bootstrap from a new LSN. Catalog preserved on shadow across
+   re-bootstrap from new LSN. Catalog preserved on shadow across
    re-attach via `rebind` disposition; diverged clusters need `rebuild`
 
 ## Acceptance criteria
@@ -154,8 +155,8 @@ replicated table
    `ALTER TABLE ADD COLUMN ... DEFAULT k` and one
    `CREATE INDEX CONCURRENTLY` produces matching row counts and
    checksums on source and CH after drain. **Code-complete.**
-   `tests/pgbench_acceptance.rs` covers it end-to-end with
-   runtime skip-gate (no `initdb` / `pgbench` / `clickhouse` on PATH →
+   `tests/pgbench_acceptance.rs` covers it end-to-end with runtime
+   skip-gate (no `initdb` / `pgbench` / `clickhouse` on PATH →
    `eprintln!("skip"); return`). Asserts adjusted to
    `c Nullable(Int32)` because bootstrap walks pre-ALTER pages
 2. `VACUUM FULL` on a tracked table mid-workload, no operator
@@ -164,12 +165,12 @@ replicated table
 3. Shadow's `pg_last_wal_replay_lsn` lags source's
    `pg_current_wal_lsn` by < 1 s of WAL at steady state. **Live**;
    surfaced as `walshadow_shadow_apply_lag_bytes` +
-   `walshadow_shadow_apply_lag_seconds` on the metrics endpoint
+   `walshadow_shadow_apply_lag_seconds` on metrics endpoint
 
 ### v1.1
 
 4. `--validate` catches a planted decoder regression on the first
-   sampled row of the bad type. **Live** via the differential oracle +
+   sampled row of the bad type. **Live** via differential oracle +
    `pgext/`; absent extension surfaces as `oracle fallback=N` and
    raw-bytes pass-through for `PgPending`
 5. `kill -9` of walshadow mid-workload, restart, CH end-state matches
@@ -177,10 +178,10 @@ replicated table
    `tests/kill_restart.rs` exercises three kill strategies × five
    seeded LCG windows = 15 cycles, runtime skip-gated on PG / CH
    availability. `WALSHADOW_KILL_SEED` (default `0xC11AC11A`) seeds
-   the LCG for reproducibility
-6. `pg_ctl restart` of shadow mid-workload, walshadow continues
-   without operator intervention. **Live** via `ShadowCatalog`
-   auto-reconnect + generation bump on reconnect
+   LCG for reproducibility
+6. `pg_ctl restart` of shadow mid-workload, walshadow continues without
+   operator intervention. **Live** via `ShadowCatalog` auto-reconnect
+   + generation bump on reconnect
 
 Acceptance tests (`tests/kill_restart.rs`, `pgbench_acceptance.rs`,
 `bootstrap_direct_ch.rs`, `bootstrap_object_store_ch.rs`, `copy_into.rs`,
@@ -204,11 +205,11 @@ Tracked in [`plans/future/`](future/INDEX.md):
 - **Two-phase commit.** `XLOG_XACT_PREPARE` ignored; `PREPARE` ↔
   `COMMIT PREPARED` across daemon restarts can lose prepared writes
 - **CH-server-bounce recovery.** Bounded retry; expired budget kills
-  the daemon, cursor file resumes on restart
+  daemon, cursor file resumes on restart
 
 Speculative, not committed:
-[future/shadow_schema_export.md](future/shadow_schema_export.md)
-(ship shadow's catalog as DDL or hollow data dir) and
+[future/shadow_schema_export.md](future/shadow_schema_export.md) (ship
+shadow's catalog as DDL or hollow data dir) and
 [future/sync_commit_witness.md](future/sync_commit_witness.md)
 (walshadow as RPO=0 quorum acker under
 `ANY 1 (walshadow, fullpg)`)

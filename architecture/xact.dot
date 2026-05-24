@@ -1,0 +1,110 @@
+// walshadow — XactBuffer lifecycle (insert → maybe-evict → commit drain)
+// Strict layered DAG: producers above their consumers, single cluster
+// for the drain pipeline, all other nodes bare. No constraint=false
+// except the abort→spill backwards unlink.
+digraph xact {
+  rankdir=TB;
+  compound=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow — XactBuffer + spill + commit drain", fontsize=14, splines=spline, nodesep=0.35, ranksep=0.55, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ════════ Rank 0: producers ════════
+  // catevt+decoder on the left (both feed buf); xaclog on the right
+  // (feeds subt + abort + merge, all aligned beneath it)
+  { rank=same;
+    catevt  [label="ShadowCatalog\nschema_event_tx\nAdded / Changed / Dropped", fillcolor="#4D4D28"];
+    decoder [label="BufferingDecoderSink\nheap_decoder + TOAST reshape\nstamps source_lsn, xid", fillcolor="#4D4128"];
+    xaclog  [label="XLOG_XACT_*\nASSIGNMENT 0x50 (hint)\nCOMMIT 0x00 / _PREPARED 0x30\nABORT  0x20 / _PREPARED  0x40", fillcolor="#3D3D54"];
+  }
+
+  // ════════ Rank 1: state — buf | subt | abort | idle, in producer-aligned order ════════
+  { rank=same;
+    buf [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2">
+        <TR><TD ALIGN="LEFT"><B>XactBuffer</B></TD></TR>
+        <TR><TD ALIGN="LEFT">inflight: HashMap&lt;xid, XactState&gt;</TD></TR>
+        <TR><TD ALIGN="LEFT">bytes_in_memory · stats · store: SpillStore</TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9"><I>XactState (per xid):</I></FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">first_lsn · in_mem: Vec&lt;SpillEntry&gt; · in_mem_bytes</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">spill: Option&lt;SpillWriter&gt; · spill_bytes</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">catalog_events: Vec&lt;(lsn, SchemaEvent)&gt;</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">SpillEntry = Heap(DecodedHeap) | Chunk(ToastChunk)</FONT></TD></TR>
+      </TABLE>
+    >, fillcolor="#4D4128", shape=box];
+
+    subt  [label="SubxactTracker\nparent: HashMap<xid, top>\nchildren: HashMap<top, Vec<xid>>", fillcolor="#4D4128"];
+
+    abort [label="abort(xid, abort_lsn, subxids)\ndrop XactState (top + subs)\nSpillWriter::unlink per xid\ndrain_lsn / emitter_ack_lsn ↑\nforget_tree(top)", fillcolor="#4D4128"];
+
+    idle  [label="advance_idle(lsn)\nfires when xacts_active == 0\nlifts drain_lsn / ack_lsn", fillcolor="#4D4128"];
+  }
+
+  // producer → state (vertical drops, no cross-traffic)
+  catevt  -> buf   [label="on_schema_event\n(xid, source_lsn, ev)", color="#CBA85E", style=dashed];
+  decoder -> buf   [label="absorb Heap / Chunk"];
+  xaclog  -> subt  [label="ASSIGNMENT 0x50\nadd_subxact(top, subs)"];
+  xaclog  -> abort [label="ABORT / _PREPARED"];
+  buf     -> idle  [style=dashed, label="xacts_active == 0"];
+
+  // ════════ Rank 2: evict + spill (sidecar pair under buf) ════════
+  { rank=same;
+    evict [label="maybe_evict\nbytes_in_memory > xact_buffer_max (64 MiB)\npick largest in-mem xact\n(mirrors PG ReorderBufferLargestTXN)\n→ evict_xact: lazy-open SpillWriter,\ndrain in_mem → write(entry), zero bytes\n(catalog_events stay in memory)", fillcolor="#4D3A28"];
+    spill [label="{spill}/xid-{xid:010}-{first_lsn:016X}.bin\n[\"WS\" magic | u16 ver=2]\n[tag u8 | u32 LE inner_len | body]*\n  tag=0 → Heap   tag=1 → Chunk\nappend-only, fsync on finish", fillcolor="#4D3850", shape=note];
+  }
+  buf   -> evict [label="after every absorb\nwhile over budget"];
+  evict -> spill [color="#6E6963", style=dashed, label="SpillWriter::write"];
+  abort -> spill [color="#6E6963", style=dashed, label="unlink"];
+
+  // ════════ Rank 3+: commit drain (linear pipeline, the only remaining cluster) ════════
+  subgraph cluster_drain {
+    label="commit(top_xid, ts, commit_lsn, subxids) — k-way merge"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    merge [label="pull (top + subxids) from inflight\n  unknown xid → commits_unknown_xid;\n  on_xact_end fires anyway (ack ceiling)\nper xid: SpillReader → unlink + append in_mem\n  → VecDeque ASC by source_lsn\nk-way merge (k = 1+nsub, typically ≤ 4)\n  linear-scan head pick\n  TIE: catalog event BEFORE tuple", fillcolor="#4D4128"];
+
+    detoast [label="detoast_heap\nreassemble (toast_relid, value_id)\n  → BTreeMap<chunk_seq, bytes>\npglz / lz4 inline\nlazy ShadowCatalog::relation_at", fillcolor="#4D4128"];
+
+    dispatch [label="dispatch loop\non_schema_event(ev)  // pre-dependent heap\non_tuple(CommittedTuple{decoded, ts, lsn})\non_xact_end(commit_lsn) → ack_lsn\nsubxact_tracker.forget_tree(top)", fillcolor="#4D4128"];
+
+    merge -> detoast -> dispatch;
+  }
+  xaclog -> merge [label="COMMIT / _PREPARED\nparse_xact_payload"];
+  subt   -> merge [label="(top + subxids)\nauthoritative on COMMIT", style=dashed];
+  spill  -> merge [color="#6E6963", style=dashed, label="SpillReader::next\nthen unlink"];
+
+  // ════════ Rank below drain: observer (CH emitter) ════════
+  observer [label="TupleObserver (CH emitter)\non_tuple → BlockBuilder\non_xact_end → durable ack_lsn", fillcolor="#5D4628"];
+  dispatch -> observer [color="#BF8C5F", penwidth=2, label="on_schema_event /\non_tuple / on_xact_end"];
+
+  // ════════ Bottom: cursor (durability fan-in) ════════
+  cursor [label="cursor.bin\ndrain_lsn      = max commit_lsn  (advances FIRST)\nemitter_ack_lsn = max ack_lsn   (lags drain_lsn)", fillcolor="#4D3850", shape=note];
+  dispatch -> cursor [color="#b380b0", style=dotted, label="drain_lsn ↑\n(pre-ack)"];
+  observer -> cursor [color="#b380b0", style=dotted, label="emitter_ack_lsn ↑"];
+  abort    -> cursor [color="#b380b0", style=dotted, label="abort_lsn ↑"];
+  idle     -> cursor [color="#b380b0", style=dotted, label="idle ↑"];
+
+  // ════════ Legend ════════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
+      <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>source PG / XLOG_XACT records</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>eviction policy (sync, after absorb)</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>XactBuffer / decoder / drain</TD></TR>
+      <TR><TD BGCOLOR="#4D4D28"></TD><TD>ShadowCatalog schema_event_tx</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>downstream CH emitter (observer)</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact (spill / cursor)</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
+      <TR><TD><FONT COLOR="#c1a78e"><B>━━</B></FONT></TD><TD>buffer-internal control / data</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>┄┄</B></FONT></TD><TD>schema event (lsn-stamped)</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>CH Native rows + DDL via observer</TD></TR>
+      <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>spill file IO (write / read / unlink)</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability (drain_lsn / emitter_ack_lsn)</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>k-way merge — ordering rules</B></TD></TR>
+      <TR><TD COLSPAN="2">heads sorted ASC by source_lsn</TD></TR>
+      <TR><TD COLSPAN="2">tie: catalog event BEFORE tuple (PG writes pg_class first)</TD></TR>
+      <TR><TD COLSPAN="2">heaps run through detoast post-merge; chunks fold into (relid, value_id)</TD></TR>
+      <TR><TD COLSPAN="2">drain_lsn advances BEFORE on_xact_end ack — cursor surfaces the gap</TD></TR>
+    </TABLE>
+  >];
+  cursor -> legend [style=invis];
+}

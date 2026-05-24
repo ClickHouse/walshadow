@@ -1,0 +1,129 @@
+// walshadow — heap-tuple decoder dispatch + type matrix
+// One record → DecodedHeap path. Entry through BufferingDecoderSink,
+// TRUNCATE intercept, decode_heap_record op nibble dispatch, per-column
+// walk, Tier 1/2/3 + PgPending type fan-out. Side branches: replica
+// identity old-tuple shape, read-time missing-value substitution.
+digraph decoder {
+  rankdir=TB;
+  compound=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow heap decoder — record → DecodedHeap dispatch + type matrix", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.5, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ════════ ingress ════════
+  record [label="WAL Record\nRM_HEAP / RM_HEAP2\nrfn = blocks[0].location.rel\nxid, source_lsn, info", fillcolor="#3D3D54", shape=parallelogram];
+
+  // ════════ sink + truncate intercept ════════
+  subgraph cluster_sink {
+    label="BufferingDecoderSink::on_record (xact_buffer.rs)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    sink     [label="on_record\nrm == Heap && info == TRUNCATE?", fillcolor="#4D4128"];
+    trunc    [label="handle_truncate\nparse_xl_heap_truncate\nwait_for_replay(source_lsn)\nfor relid in relids:\n  relation_by_oid → fan out\n  HeapOp::Truncate\n(kind in {'r','p'} only)", fillcolor="#4D4128"];
+    relat    [label="ShadowCatalog::relation_at(rfn, lsn)\nLRU + libpq fetch", fillcolor="#4D4D28"];
+    sink -> trunc [label="0x30 TRUNCATE", style=dashed];
+    sink -> relat [label="other ops"];
+  }
+  record -> sink;
+
+  // ════════ entry point ════════
+  entry [label="decode_heap_record\n(heap_decoder.rs)\ndispatch on rm + info & 0x70", fillcolor="#4D4128"];
+  relat -> entry [label="RelDescriptor"];
+
+  // ════════ op dispatch ════════
+  subgraph cluster_ops {
+    label="op dispatch — info & XLOG_HEAP_OPMASK"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    ins   [label="INSERT 0x00\ndecode_insert\nblock.data:\n  xl_heap_header (5)\n  + bitmap + col data", fillcolor="#4D4128"];
+    upd   [label="UPDATE 0x20 / HOT 0x40\ndecode_update\nprefix/suffix u16 from\nblock.data per\nXLH_UPDATE_*_FROM_OLD", fillcolor="#4D4128"];
+    del   [label="DELETE 0x10\ndecode_delete\nold tuple in main_data\nwhen XLH_DELETE_CONTAINS_*", fillcolor="#4D4128"];
+    multi [label="MULTI_INSERT 0x50 (Heap2)\ndecode_multi_insert\nntuples loop —\nper-tuple xl_multi_insert_tuple\nsynthesises stripped 5B header", fillcolor="#4D4128"];
+    skip  [label="LOCK / INPLACE / CONFIRM /\nother RM_HEAP2 ops\n→ empty SmallVec (silent skip)", fillcolor="#4D3A28", shape=note];
+    entry -> ins;
+    entry -> upd;
+    entry -> del;
+    entry -> multi;
+    entry -> skip [style=dashed];
+  }
+
+  // ════════ payload walker ════════
+  payload [label="decode_tuple_payload\nparse xl_heap_header\nt_infomask2 / t_infomask / t_hoff\nnatts = t_infomask2 & 0x07FF\nbitmap[+MAXALIGN pad]\ncol_data_off = 5 + (t_hoff − 23)", fillcolor="#4D4128"];
+  ins   -> payload;
+  upd   -> payload [label="cursor +=\nprefix/suffix"];
+  del   -> payload;
+  multi -> payload [label="synth header\n+ tuple body"];
+
+  // ════════ per-column walk ════════
+  colwalk [label="per-column walk over rel.attributes\natt_align_nominal (peek byte for varlena)\nbitmap-clear → Some(Null)\nin-prefix / past-EOF → None, partial = true\nidx ≥ natts → missing_value_for(att)", fillcolor="#4D4128"];
+  payload -> colwalk;
+
+  // ════════ type dispatch (cluster) ════════
+  subgraph cluster_types {
+    label="decode_one_value — per-OID dispatch"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    tier1 [label="Tier 1 — fixed-width\nbool / char / int2/4/8 / oid\nfloat4/8 / date / time / timestamp[tz]\ntimetz (12) / uuid (16) / name (64)\ninterval (16, via codecs)", fillcolor="#4D4128"];
+    tier2 [label="Tier 2 — varlena (typlen = −1)\ndecode_varlena: 1B short / 4B (un)compressed / on-disk TOAST\nbytea / text / bpchar / varchar / json\ninvalid UTF-8 → Bytea fallback", fillcolor="#4D4128"];
+    tier3 [label="Tier 3 — in-tree codecs (codecs.rs)\nnumeric (decode_numeric)\ninet / cidr (decode_inet)\ninterval (decode_interval)\njson (passthrough)", fillcolor="#4D4128"];
+    pending [label="PgPending { type_oid, raw }\njsonb / range / arrays /\ntsvector / vendor types →\noracle: walshadow_decode_disk(oid, bytea)", fillcolor="#5D3F40"];
+    toast [label="ExternalToast(ToastPointer)\nvarattrib_1b_e (tag 18)\nva_rawsize / va_extinfo /\nva_valueid / va_toastrelid", fillcolor="#5D3F40", shape=note];
+    tier2 -> toast [style=dashed, label="on-disk ptr"];
+  }
+  colwalk -> tier1 [color="#CBA85E"];
+  colwalk -> tier2 [color="#BD8183"];
+  colwalk -> tier3 [color="#BF8C5F"];
+  colwalk -> pending [color="#A1A9CC", style=dashed];
+
+  // ════════ output ════════
+  decoded [label="DecodedHeap {\n  rfn, xid, source_lsn,\n  op, new, old\n}\nSmallVec<[_; 1]> stack\n(spills only on multi)", fillcolor="#4D4128", shape=parallelogram];
+  tier1   -> decoded;
+  tier2   -> decoded;
+  tier3   -> decoded;
+  pending -> decoded;
+  trunc   -> decoded [label="Truncate\n(per relid)", style=dashed];
+
+  xactbuf [label="XactBuffer::on_heap\nper-xid bucket\n+ TOAST reassembly\n+ subxact tracker", fillcolor="#4D4128", shape=cylinder];
+  decoded -> xactbuf [color="#BF8C5F", penwidth=2];
+
+  // ════════ side cluster: replica identity ════════
+  subgraph cluster_replident {
+    label="old-tuple shape — relreplident × flags"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    rid [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+        <TR><TD BGCOLOR="#34302c"><B>relreplident</B></TD><TD BGCOLOR="#34302c"><B>old payload</B></TD></TR>
+        <TR><TD>Default + PK</TD><TD>PK cols on OLD_KEY, non-PK = Some(Null) via bitmap</TD></TR>
+        <TR><TD>Default no-PK</TD><TD>old = None</TD></TR>
+        <TR><TD>Nothing</TD><TD>old = None</TD></TR>
+        <TR><TD>Full</TD><TD>every non-dropped column</TD></TR>
+        <TR><TD>UsingIndex</TD><TD>indexed cols, others = Some(Null)</TD></TR>
+      </TABLE>
+    >, shape=plaintext];
+  }
+  payload -> rid [style=dashed, color="#b380b0", constraint=false, label="UPDATE/DELETE\nold-tuple shape"];
+
+  // ════════ side cluster: read-time defaults ════════
+  subgraph cluster_missing {
+    label="missing_value_for(att) — fast-path ADD COLUMN ... DEFAULT k"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    miss [label="RelAttr.missing_text = Some(t)\nTier 1 numeric → parse iN / fN\nBOOLOID → PG truth set\nCHAROID → first byte i8\nTEXT/VARCHAR/BPCHAR/NAME/JSON → passthrough\nelse → PgPending { oid, t.as_bytes() }", fillcolor="#5D3F40"];
+  }
+  colwalk -> miss [style=dashed, color="#b380b0", constraint=false, label="idx ≥ natts\n(post-ALTER\ntrailing attrs)"];
+
+  // ════════ Legend ════════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
+      <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>WAL record ingress</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>decoder + xact buffer (heap_decoder.rs, xact_buffer.rs)</TD></TR>
+      <TR><TD BGCOLOR="#4D4D28"></TD><TD>ShadowCatalog (RelDescriptor resolution)</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>silent-skip op (no DecodedHeap emitted)</TD></TR>
+      <TR><TD BGCOLOR="#5D3F40"></TD><TD>oracle / missing-value bridge</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour — type tier</B></TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>Tier 1 fixed-width (typlen &gt; 0)</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>━━</B></FONT></TD><TD>Tier 2 varlena (typlen = −1) — varatt headers</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>Tier 3 in-tree codecs (numeric / inet / interval / json)</TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>┄┄</B></FONT></TD><TD>PgPending → oracle (jsonb / range / array / vendor)</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>┄┄</B></FONT></TD><TD>side branch (replica identity, read-time defaults)</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>tier matrix — handling</B></TD></TR>
+      <TR><TD><B>Tier 1</B></TD><TD>inline byte read from buf[abs..abs+typlen]</TD></TR>
+      <TR><TD><B>Tier 2</B></TD><TD>decode_varlena (short / 4B / TOAST ptr) + per-OID body</TD></TR>
+      <TR><TD><B>Tier 3</B></TD><TD>codecs.rs (numeric base-10000, inet family+bits, interval 16B)</TD></TR>
+      <TR><TD><B>PgPending</B></TD><TD>carry raw bytes, resolve at emit via shadow PG extension</TD></TR>
+    </TABLE>
+  >];
+  xactbuf -> legend [style=invis];
+}

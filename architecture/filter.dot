@@ -1,0 +1,117 @@
+// walshadow — per-record filter decision pipeline
+// StreamingWalker → Filter::decide → keep verbatim or NOOP-rewrite +
+// CRC32C → segment buffer. CatalogTracker side cluster feeds the
+// decision (relmap + pg_class harvest + seed). rmgr keep policy is a
+// decision sub-table off to the side.
+digraph filter {
+  rankdir=TB;
+  compound=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow filter — per-record keep/drop + byte-preserving NOOP rewrite", fontsize=14, splines=spline, nodesep=0.45, ranksep=0.65, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ════════ ingress ════════
+  subgraph cluster_in {
+    label="① ingress"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    chunk  [label="WalChunk\n(source-order bytes,\npage-framed)", fillcolor="#3D3D54", shape=parallelogram];
+    walker [label="StreamingWalker\nstitch records across pages,\nyield (logical_bytes,\n byte_ranges, page_magic)", fillcolor="#3D3D54"];
+    parse  [label="parse_record_from_bytes\nwal-rs XLogRecord\nblocks + main_data", fillcolor="#3D3D54"];
+    chunk -> walker -> parse;
+  }
+
+  // ════════ filter::decide (main column) ════════
+  subgraph cluster_decide {
+    label="② Filter::decide  (per record, post-update tracker)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    observe  [label="tracker.observe(rec)\nupdate catalog set\nbefore classify", fillcolor="#4D3A28"];
+    classify [label="classify::classify\nSpecial / Catalog /\nUser / Empty", fillcolor="#4D3A28"];
+    empty    [label="main_data::relation_for_empty\nXLOG_HEAP2_NEW_CID (0x70)\nXLOG_BTREE_REUSE_PAGE (0xD0)\nextract RelFileLocator", fillcolor="#4D3A28"];
+    iscat    [label="tracker.is_catalog\n(db_node, rel_node)\n+ shared (0, rel_node)", fillcolor="#4D3A28", shape=diamond];
+
+    keep [label="Decision::Keep\n(Special, Catalog,\n promoted User,\n Empty rel ∈ cat,\n safe-default Empty)", fillcolor="#4D3A28"];
+    drop [label="Decision::Drop\n(User no-cat-ref,\n Empty rel ∉ catalog)", fillcolor="#4D3A28"];
+
+    observe  -> classify;
+    classify -> iscat   [label="User /\nCatalog"];
+    classify -> empty   [label="Empty\n(no blocks)"];
+    empty    -> iscat   [label="rel from\nmain_data"];
+    iscat -> keep [label="yes"];
+    iscat -> drop [label="no"];
+    {rank=same; keep; drop}
+  }
+  parse -> observe [color="#A1A9CC", penwidth=2, lhead=cluster_decide];
+
+  // ════════ rmgr keep policy — sub-table inside decide cluster, pinned right ════════
+  policy [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="#3a3530">
+      <TR><TD COLSPAN="2" BGCOLOR="#4c4641"><FONT COLOR="#ECE1D7"><B>rmgr keep policy</B></FONT></TD></TR>
+      <TR><TD><FONT COLOR="#ECE1D7">HEAP / HEAP2</FONT></TD><TD><FONT COLOR="#ECE1D7">keep iff block ref ∈ catalog set</FONT></TD></TR>
+      <TR><TD><FONT COLOR="#ECE1D7">BTREE</FONT></TD><TD><FONT COLOR="#ECE1D7">keep iff block ref ∈ catalog set</FONT></TD></TR>
+      <TR><TD><FONT COLOR="#ECE1D7">HASH / GIN / GIST / SPGIST / BRIN</FONT></TD><TD><FONT COLOR="#ECE1D7">drop on user index</FONT></TD></TR>
+      <TR><TD><FONT COLOR="#ECE1D7">SEQ / GENERIC / LOGICALMSG</FONT></TD><TD><FONT COLOR="#ECE1D7">drop when no catalog ref</FONT></TD></TR>
+      <TR><TD><FONT COLOR="#ECE1D7">RELMAP / XACT / CLOG / MULTIXACT / STANDBY</FONT></TD><TD><FONT COLOR="#ECE1D7">always keep</FONT></TD></TR>
+      <TR><TD><FONT COLOR="#ECE1D7">COMMIT_TS / REPL_ORIGIN / DBASE / TBLSPC / SMGR</FONT></TD><TD><FONT COLOR="#ECE1D7">always keep</FONT></TD></TR>
+      <TR><TD><FONT COLOR="#ECE1D7">XLOG</FONT></TD><TD><FONT COLOR="#ECE1D7">CHECKPOINT / NEXTOID / PARAMETER_CHANGE keep</FONT></TD></TR>
+    </TABLE>
+  >];
+  classify -> policy [style=dashed, color="#6E6963", constraint=false, label="rmgr →\nclass", arrowhead=none];
+
+  // ════════ CatalogTracker side cluster ════════
+  subgraph cluster_track {
+    label="③ CatalogTracker  (live catalog filenode set)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    nodes [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2">
+        <TR><TD ALIGN="LEFT"><B>nodes</B>: HashSet&lt;(db, rel)&gt;</TD></TR>
+        <TR><TD ALIGN="LEFT">bootstrap: rel &lt; 16384 ∨ shared (db=0)</TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9"><I>tracker.observe(rec) dispatches:</I></FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">• RM_RELMAP_ID → mapoid → filenum (magic 0x592717)</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">• pg_class HEAP insert/update → (oid, relfilenode)</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">• pg_class heap_delete → coarse epoch++ (DROP signal)</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">• seed_from_source → libpq SELECT pg_class at attach</FONT></TD></TR>
+      </TABLE>
+    >, fillcolor="#4D4D28", shape=box];
+  }
+  observe -> nodes [style=dashed, color="#CBA85E", label="tracker.observe(rec)"];
+  nodes   -> iscat [style=dashed, color="#CBA85E", label="is_catalog(db, rel)"];
+
+  // ════════ rewrite + emit ════════
+  subgraph cluster_rw {
+    label="④ rewrite + emit"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    verbatim [label="copy logical_bytes\ninto segment buffer\nat byte_ranges", fillcolor="#4D3A28"];
+    noop     [label="rewrite::noop_replace\nheader: keep xl_tot_len, xl_prev;\n info=XLOG_NOOP, rmid=RM_XLOG\nbody: zero-fill + main_data marker\n SHORT (≤257) | LONG", fillcolor="#4D3A28"];
+    crc      [label="CRC32C recompute\nINIT → body → header[0..20]\nmatches xlog.c:5169", fillcolor="#4D3A28"];
+    scatter  [label="scatter rewritten bytes\ninto segment buffer\nat each byte_range\n(cross-seg: rewrite both)", fillcolor="#4D3A28"];
+    {rank=same; verbatim; noop}
+    noop -> crc -> scatter;
+  }
+  keep -> verbatim [color="#BD8183"];
+  drop -> noop     [color="#BD8183"];
+
+  // ════════ output ════════
+  segbuf   [label="16 MiB segment buffer\nfiltered image\nfiltered_lsn == source_lsn", fillcolor="#4D3850", shape=note];
+  manifest [label="Manifest\nrecords: [{offset, len,\n rmid, info, kind}]\n+ FilterStats delta", fillcolor="#4D3850", shape=note];
+  verbatim -> segbuf;
+  scatter  -> segbuf;
+  segbuf   -> manifest [style=dashed];
+
+  // ════════ Legend ════════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
+      <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>ingress (walker, parser)</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>walshadow filter / rewrite (sync)</TD></TR>
+      <TR><TD BGCOLOR="#4D4D28"></TD><TD>CatalogTracker state + inputs</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk / output artifact</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>source replication frame</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>━━</B></FONT></TD><TD>decision → rewrite (hot path)</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>┄┄</B></FONT></TD><TD>tracker update + catalog lookup</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>source</B></TD></TR>
+      <TR><TD COLSPAN="2"><FONT FACE="monospace">src/filter.rs</FONT> — Filter::decide</TD></TR>
+      <TR><TD COLSPAN="2"><FONT FACE="monospace">src/catalog_tracker.rs</FONT> — CatalogTracker</TD></TR>
+      <TR><TD COLSPAN="2"><FONT FACE="monospace">src/rewrite.rs</FONT> — noop_replace + CRC32C</TD></TR>
+      <TR><TD COLSPAN="2"><FONT FACE="monospace">src/main_data.rs</FONT> — empty reclassifier</TD></TR>
+    </TABLE>
+  >];
+  manifest -> legend [style=invis];
+}

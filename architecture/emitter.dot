@@ -1,0 +1,111 @@
+// walshadow — CH emitter component view
+// Held-open INSERT state machine (single CH TCP) + DdlApplicator (second
+// CH TCP). Zoomed-in view of cluster_ch + cluster_ddl from internals.dot.
+digraph emitter {
+  rankdir=TB;
+  compound=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow CH emitter — held-open INSERT pump + DdlApplicator (dual CH TCP)", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.5, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ═════ producers (upstream, top-left) ═════
+  subgraph cluster_src {
+    label="upstream  (xact buffer drain)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    drain [label="XactRecordSink\ncommit drain\n(k-way merge:\n CommittedTuple ⨝ SchemaEvent\n in source-LSN order)", fillcolor="#4D4128"];
+    cat   [label="ShadowCatalog::subscribe\nSchemaEvent\nAdded / Changed / Dropped\n(unbounded mpsc)", fillcolor="#4D4D28", shape=parallelogram];
+  }
+
+  // ═════ row path: held-open INSERT (single CH TCP) ═════
+  subgraph cluster_rows {
+    label="row path — Emitter::route → held-open INSERT  (CH TCP #1)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    route   [label="Emitter::route\nresolve rel + mapping\nHeapOp dispatch", fillcolor="#5D4628"];
+    enc     [label="TableEncoder::append_row\nper (src qualified_name)\nrow_budget 65536\nbyte_budget 1 MiB", fillcolor="#5D4628"];
+    cols    [label="ColumnBuf slabs\nFixed / String /\nNullableFixed /\nNullableString\ncolumn-major +\nsynthetic _lsn/_xid/_op/_commit_ts", fillcolor="#5D4628"];
+    block   [label="BlockBuilder\nborrow into slabs\nat flush", fillcolor="#5D4628"];
+    openw   [label="open_wire(key)\nkey matches → no-op\nelse close prior +\n send_query(INSERT…)\n flush_deadline := now + T", fillcolor="#5D4628"];
+    sendd   [label="send_data(Some(block))\nper budget trip", fillcolor="#5D4628"];
+    hold    [label="hold across xacts\nwire_open_key = Some(key)\nflush_timeout cap", fillcolor="#5D4628", shape=note];
+    closew  [label="close_current_wire\nsend_data(None) + drain\nto EndOfStream\nlast_durable ← pending_max", fillcolor="#5D4628"];
+    trunc   [label="HeapOp::Truncate\nflush + close +\n send_query(TRUNCATE TABLE)", fillcolor="#5D4628"];
+
+    route -> enc -> cols -> block -> openw -> sendd;
+    sendd -> hold [style=dashed];
+    hold -> closew [style=dashed, label="deadline / table switch\n/ schema event / on_close"];
+    route -> trunc [style=dashed, label="HeapOp::Truncate", constraint=false];
+  }
+
+  // ═════ DDL path: separate CH TCP ═════
+  subgraph cluster_ddl {
+    label="DDL path — DdlApplicator (CH TCP #2, separate connection)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    dispatch [label="Emitter::dispatch_schema_event\n1. flush_table(key)\n2. close_current_wire if key open\n3. drop tables[key]\n4. applicator.apply(event)", fillcolor="#5D4628"];
+    bridge   [label="type_bridge::map\nRelAttr → ResolvedColumn\n(reject widen,\n pk strips Nullable)", fillcolor="#5D4628"];
+    apply    [label="DdlApplicator::apply\nAdded  → CREATE TABLE IF NOT EXISTS\nChanged → RENAME / ADD / DROP COLUMN\nDropped → DropTableStrategy", fillcolor="#5D4628"];
+    ddlsql   [label="send_query(DDL SQL)\n+ drain to EndOfStream\n(per-statement,\n no held-open)", fillcolor="#5D4628"];
+
+    dispatch -> apply -> ddlsql;
+    bridge   -> apply [style=dashed, label="resolve types"];
+  }
+
+  // ═════ CH endpoint (two distinct sockets) ═════
+  subgraph cluster_ch {
+    label="ClickHouse";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    chrows [label="CH TCP #1\nclickhouse-c-rs Client\nReplacingMergeTree(_lsn)\nNative rows", fillcolor="#4D4128", shape=cylinder];
+    chddl  [label="CH TCP #2\nclickhouse-c-rs Client\nALTER / CREATE /\n DROP / TRUNCATE", fillcolor="#4D4128", shape=cylinder];
+  }
+
+  // ═════ ack-LSN side-channel ═════
+  ack [label="EmitterObserver::on_xact_end\nreturns last_durable_commit_lsn\n→ cursor::emitter_ack_lsn", fillcolor="#4D3A28", shape=note];
+
+  // ═════ upstream → emitter ═════
+  drain -> route    [color="#BF8C5F", penwidth=2, lhead=cluster_rows, label="CommittedTuple"];
+  cat   -> dispatch [color="#CBA85E", style=dashed, lhead=cluster_ddl, label="SchemaEvent\ndrain at commit"];
+
+  // ═════ emitter → CH ═════
+  sendd  -> chrows [color="#BF8C5F", penwidth=2, label="Native block"];
+  closew -> chrows [color="#BF8C5F", style=dashed, label="EndOfStream"];
+  trunc  -> chrows [color="#BF8C5F", style=dashed, label="TRUNCATE"];
+  ddlsql -> chddl  [color="#BF8C5F", style=dashed, penwidth=2, label="DDL SQL\n(second TCP)"];
+
+  // ═════ await_ready gate: DDL completion precedes next row INSERT for same key ═════
+  ddlsql -> route [style=dotted, color="#b380b0", constraint=false, label="await_ready\nnext route rebuilds\nTablePlan off post-DDL desc"];
+
+  // ═════ ack out ═════
+  closew -> ack [style=dotted, color="#b380b0", label="advance ack"];
+
+  // ═════ Legend ═════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
+      <TR><TD BGCOLOR="#4D4128" WIDTH="28"></TD><TD>xact-buffer drain / ClickHouse</TD></TR>
+      <TR><TD BGCOLOR="#4D4D28"></TD><TD>ShadowCatalog schema-event tx</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>walshadow CH emitter + DdlApplicator</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>cursor / ack side-channel</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge style</B></TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>CH Native rows (TCP #1, solid)</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>┄┄</B></FONT></TD><TD>CH DDL SQL (TCP #2, dashed)</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>┄┄</B></FONT></TD><TD>SchemaEvent off ShadowCatalog</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>await_ready gate / ack-LSN</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>synthetic columns (every dest table)</B></TD></TR>
+      <TR><TD><FONT FACE="monospace">_lsn</FONT></TD><TD>UInt64 — commit_lsn; ReplacingMergeTree dedup key</TD></TR>
+      <TR><TD><FONT FACE="monospace">_xid</FONT></TD><TD>UInt32 — source xid; recovers xact boundary</TD></TR>
+      <TR><TD><FONT FACE="monospace">_op</FONT></TD><TD>Enum8(insert=1, update=2, delete=3); HOT_UPDATE → 2</TD></TR>
+      <TR><TD><FONT FACE="monospace">_commit_ts</FONT></TD><TD>DateTime64(6, 'UTC'); xl_xact_commit shifted from PG epoch</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>flush triggers</B></TD></TR>
+      <TR><TD>row_budget</TD><TD>enc.rows ≥ 65536</TD></TR>
+      <TR><TD>byte_budget</TD><TD>enc.approx_bytes ≥ 1 MiB</TD></TR>
+      <TR><TD>deadline</TD><TD>flush_timeout elapsed since first row</TD></TR>
+      <TR><TD>schema event</TD><TD>surgical close on affected key only</TD></TR>
+      <TR><TD>TRUNCATE / on_close</TD><TD>full close + drain</TD></TR>
+    </TABLE>
+  >];
+  chrows -> legend [style=invis];
+  chddl  -> legend [style=invis];
+}

@@ -1,9 +1,8 @@
 # walshadow plan index
 
-Component-by-component docs for walshadow's current implementation
-state. Start at [overview.md](overview.md) for the system shape, then
-drop into individual components. Future-work proposals live under
-[future/](future/INDEX.md)
+Component docs for walshadow's current implementation state. Start at
+[overview.md](overview.md) for system shape, then drop into individual
+components. Future-work proposals live under [future/](future/INDEX.md)
 
 ## Components
 
@@ -37,15 +36,25 @@ drop into individual components. Future-work proposals live under
 
 ## Future work
 
-[future/INDEX.md](future/INDEX.md) collects planning for work not yet
-shipped: runtime config overlay from source PG, segment compression,
-two-phase commit, sequence-state replication, cross-table ordering,
-CH-bounce recovery, and the parked operational polish list. Promote
-into `plans/` when an item lands
+[future/INDEX.md](future/INDEX.md) collects work not yet shipped:
+runtime config overlay from source PG, segment compression, two-phase
+commit, sequence-state replication, cross-table ordering, CH-bounce
+recovery, parked operational polish. Promote into `plans/` when an item
+lands
 
 ## Architecture diagrams
 
-Live under [architecture/](../architecture/README.md). Six SVGs cover
-overview, internals, shadow communication, bootstrap timeline,
-streaming timeline, restart timelines. Updated on architecturally
-load-bearing changes
+Live under [architecture/](../architecture/README.md). System-level
+SVGs cover overview, internals, shadow communication, bootstrap
+timeline, streaming timeline, restart timelines. Per-component SVGs
+(one per file in this index, embedded inline) cover filter, source,
+shadow, decoder, xact, emitter, bootstrap, ops, oracle, safety. Updated
+on architecturally load-bearing changes
+
+## Regenerating diagrams
+
+[robot/](robot/INDEX.md) — machine-readable diagram specs for agent
+consumption (NOT for humans). Each `robot/<comp>.md` carries concept,
+cluster structure, key nodes/edges, style invariants, quality bar for
+`architecture/<comp>.dot`. Pair with `_palette.md` for shared style.
+Use when regenerating a component diagram after material code change

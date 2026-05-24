@@ -1,0 +1,149 @@
+// walshadow — BASE_BACKUP fan-out (component view)
+// Differentiated from timeline_bootstrap.dot: that one walks the
+// 5 phases top→bottom in time; this one freezes phases 1-4 and
+// exposes the MultiplexSink fan-out structure — BackupSource trait
+// + two impls, per-file routing, parallel ShadowDataDir + PageWalkSink
+// rails, transitional held-open INSERT.
+digraph bootstrap {
+  rankdir=TB;
+  compound=true;
+  newrank=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow greenfield bootstrap — BASE_BACKUP fan-out (MultiplexSink, parallel rails)", fontsize=14, splines=spline, nodesep=0.45, ranksep=0.6, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ════════ External actors (top) ════════
+  src [label="source PG\nreplication slot", fillcolor="#3D3D54", shape=cylinder];
+  s3  [label="object store\nwal-g layout\n(DynStorage)", fillcolor="#3D3D54", shape=cylinder];
+  { rank=same; src; s3; }
+
+  // ════════ Catalog seed sidecar (off-pump) ════════
+  subgraph cluster_seed {
+    label="catalog seed — REPEATABLE READ sidecar, runs once before BASE_BACKUP";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    seedq  [label="seed_in_snapshot\nSELECT pg_class / pg_attribute /\npg_type / pg_index WHERE oid≥16384", fillcolor="#4D4D28"];
+    catmap [label="CatalogMap\nrelfilenode → RelDescriptor", fillcolor="#4D4D28", shape=parallelogram];
+    resolv [label="CatalogMapResolver\nimpl RelationResolver\n(at_lsn ignored)", fillcolor="#4D4D28"];
+    seedq -> catmap -> resolv;
+  }
+
+  // ════════ BackupSource trait + two impls ════════
+  subgraph cluster_source {
+    label="BackupSource — async fn run(data_dir, Arc<Mutex<dyn BackupSink>>) → (StartInfo, EndInfo)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    direct [label="BackupSourceDirect\nwal-rs run_base_backup\ntokio_tar over ChannelReader", fillcolor="#4D3A28"];
+    obj    [label="BackupSourceObjectStore\nfetch_sentinel + list_tar_parts\nbuffer_unordered, pg_control barrier", fillcolor="#4D3A28"];
+    ev     [label="per-file events into sink\nstart → begin → chunk* → end → finish\nFileMeta {path, size, mode, kind}", fillcolor="#4D3A28", shape=parallelogram];
+    { rank=same; direct; obj; }
+    direct -> ev;
+    obj    -> ev;
+  }
+  src -> direct [label="BASE_BACKUP\n+ pg_export_snapshot()", color="#A1A9CC", dir=both, arrowtail=open, penwidth=2];
+  s3  -> obj    [label="GET tar parts", color="#A1A9CC", penwidth=2];
+  src -> seedq  [label="libpq sidecar", color="#CBA85E", dir=both, arrowtail=open];
+
+  // ════════ Orchestrator + MultiplexSink dispatcher ════════
+  orch [label="backfill_bootstrap orchestrator\nspawn_greenfield_bootstrap\nholds Arc<Mutex<MultiplexSink<PageWalkSink>>>", fillcolor="#4D3A28"];
+  mux  [label="MultiplexSink (impl BackupSink, sync)\nbegin(meta) → DiskLanderSink.classify():\n  Keep         → lander only\n  SkipDenylist → lander Skip (dir entry kept as empty dir)\n  SkipUserHeap → tap.begin (Tap | Skip)\nchunk / end route to chosen sink; finish observed by both",
+        fillcolor="#4D3340", width=4.6];
+  ev    -> orch [label="drives via run(sink)", color="#A1A9CC"];
+  orch  -> mux  [label="install sink"];
+
+  // ════════ Left rail — shadow data dir landing ════════
+  subgraph cluster_land {
+    label="rail A — catalog + system files (Keep)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    lander [label="DiskLanderSink\nKeep: global/, pg_xact/, pg_multixact/,\n  pg_filenode.map, tablespace_map,\n  pg_control, backup_label,\n  pg_tblspc/<oid> symlinks,\n  base/<db>/<fn<16384> + CatalogFilenodes\nSkipUserHeap: fn ≥ 16384 (rerouted by mux)", fillcolor="#4D3340"];
+    write  [label="write_kept\nFile / Dir / Symlink\nsync_data on close\npg_control lands last (barrier)", fillcolor="#4D3340"];
+    ddir   [label="shadow data_dir\n+ postgresql.auto.conf\n+ standby.signal\n+ restore_command", fillcolor="#4D3850", shape=note];
+    lander -> write [color="#6E6963"];
+    write  -> ddir  [color="#6E6963", style=dashed, label="fsync"];
+  }
+
+  // ════════ Right rail — page-walk → CH ════════
+  subgraph cluster_walk {
+    label="rail B — user heap (Tap, 2A page-walk decoder)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    pwsink [label="PageWalkSink\nparse_base_path → rfn ≥ 16384\naccumulate 8 KiB at a time", fillcolor="#4D4128"];
+    walker [label="PageWalker::walk_page\npd_lower/pd_upper bounds-check\nfor each LP_NORMAL ItemIdData slot\n  decode_on_page_tuple\nreshape HeapTupleHeaderData →\n  xl_heap_header + bitmap + cols", fillcolor="#4D4128"];
+    dec    [label="heap_decoder::decode_block_data\nshared with WAL hot path\n(no FPI replay on backup pages;\n external TOAST → ColumnValue::PgPending)", fillcolor="#4D4128"];
+    bft    [label="BackfillTuple\n{rfn, xid, source_lsn = start_lsn,\n columns}", fillcolor="#4D4128", shape=parallelogram];
+    queue  [label="unbounded mpsc\n(blocking_send forbidden\nfrom tokio context)", fillcolor="#4D4128", shape=parallelogram];
+    drain  [label="drain_backfill task\nsynthesize CommittedTuple\n{op=Insert, commit_lsn=start_lsn}\non_xact_end on every rfn flip", fillcolor="#4D4128"];
+
+    pwsink -> walker -> dec -> bft -> queue -> drain;
+  }
+
+  // MultiplexSink → rails (lander left, walker right) — same rank pulls them side-by-side
+  mux -> lander [label="Keep /\nSkipDenylist"];
+  mux -> pwsink [label="SkipUserHeap →\ntap.begin (Tap)"];
+  { rank=same; lander; pwsink; }
+
+  // ════════ Transitional CH emitter (bootstrap-only) ════════
+  subgraph cluster_emit {
+    label="transitional emitter — bootstrap one-shot, force-closed at end (no DdlApplicator wired)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    tobs  [label="TupleObserver\nholds Arc<dyn RelationResolver>", fillcolor="#5D4628"];
+    bb    [label="BlockBuilder per relation\nNative columns +\n_lsn=start_lsn / _xid / _op=Insert", fillcolor="#5D4628"];
+    wire  [label="clickhouse-c-rs\nheld-open INSERT,\nsend_query once per (table, INSERT)\nsend_data(None) at rfn flip /\n bootstrap end", fillcolor="#5D4628"];
+    tobs -> bb -> wire;
+  }
+  drain  -> tobs [color="#BF8C5F", penwidth=2, style=dashed, label="per-rfn block"];
+  resolv -> tobs [color="#CBA85E", style=dashed, label="relation_at(rfn, _)"];
+
+  ch [label="ClickHouse\nReplacingMergeTree(_lsn)", fillcolor="#4D4128", shape=cylinder];
+  wire -> ch [color="#BF8C5F", style=dashed, penwidth=2, label="Native\n(bootstrap)"];
+
+  // ════════ Handoff at end_lsn ════════
+  subgraph cluster_handoff {
+    label="handoff at end_lsn — orchestrator drops emitter, hands cursor to streaming pump";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    out  [label="BootstrapOutcome\n{start_lsn, end_lsn,\n DiskLanderStats, PageWalkStats}", fillcolor="#4D3A28"];
+    cur  [label="cursor::write\nemitter_ack_lsn = end_lsn\natomic rename + fsync", fillcolor="#4D3A28"];
+    curd [label="cursor.bin", fillcolor="#4D3850", shape=note];
+    feed [label="SourceFeed open\nSTART_REPLICATION\nPHYSICAL <end_lsn>", fillcolor="#4D3A28"];
+    shd  [label="shadow PG\npostmaster + walreceiver\nbegin replay at end_lsn", fillcolor="#3D4128", shape=cylinder];
+
+    out -> cur;
+    cur -> curd [color="#b380b0", style=dotted, label="atomic rename"];
+    cur -> feed;
+    feed -> shd [color="#BD8183", style=dashed, label="walsender wire\n(steady-state)"];
+  }
+  orch -> out  [label="finish()\nend_lsn", color="#A1A9CC", constraint=false];
+  ddir -> shd  [color="#6E6963", style=dashed, label="shadow boots\nfrom data_dir"];
+
+  // ════════ Legend — anchored off ch, rank=sink so it floats to the right ════════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
+      <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>source PG / object store ingress</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>orchestrator / BackupSource impls</TD></TR>
+      <TR><TD BGCOLOR="#4D3340"></TD><TD>MultiplexSink + DiskLanderSink (rail A)</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>PageWalkSink + heap decoder (rail B)</TD></TR>
+      <TR><TD BGCOLOR="#4D4D28"></TD><TD>CatalogMap seed + RelationResolver</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>transitional CH emitter (bootstrap-only)</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres (post-handoff)</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>replication protocol (BASE_BACKUP, START_REPLICATION)</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>┄┄</B></FONT></TD><TD>walsender wire (post-handoff)</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq catalog query / RelationResolver lookup</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>┄┄</B></FONT></TD><TD>CH Native (bootstrap one-shot, force-closed at end)</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability</TD></TR>
+      <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>filesystem (data_dir land, shadow boot)</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>file routing (MultiplexSink)</B></TD></TR>
+      <TR><TD>catalog filenode<BR/>(fn &lt; 16384 ∪ whitelist)</TD><TD>rail A only</TD></TR>
+      <TR><TD>global/, pg_xact/, pg_control,<BR/>tablespace_map, conf files</TD><TD>rail A only</TD></TR>
+      <TR><TD>pg_replslot/, pg_stat_tmp/,<BR/>pg_logical/, pgsql_tmp/, temp_*</TD><TD>Skip (denylist;<BR/>dir entry kept as empty dir)</TD></TR>
+      <TR><TD>user heap<BR/>base/&lt;db&gt;/&lt;fn ≥ 16384&gt;</TD><TD>rail B only<BR/>(never lands on shadow)</TD></TR>
+      <TR><TD>pg_toast_&lt;relid&gt;</TD><TD>rail B observed,<BR/>chunks not reassembled (V1)</TD></TR>
+    </TABLE>
+  >];
+  ch -> legend [style=invis];
+}

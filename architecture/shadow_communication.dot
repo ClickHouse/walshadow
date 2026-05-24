@@ -1,9 +1,9 @@
 // walshadow ↔ shadow PG — three communication channels
 // 1. libpq queries (catalog cache fill)
-// 2. walsender wire (record-cadence WAL push, Phase 13)
+// 2. walsender wire (record-cadence WAL push)
 // 3. restore_command (archive fallback, segment cadence)
 digraph shadow_comm {
-  rankdir=LR;
+  rankdir=TB;
   graph [fontname="Helvetica", labelloc="t", label="walshadow ↔ shadow PG — three communication channels", fontsize=14, splines=spline, nodesep=0.6, ranksep=1.0, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=10, color="#c1a78e", fontcolor="#ECE1D7"];
@@ -13,7 +13,7 @@ digraph shadow_comm {
     label="walshadow-stream daemon"; style="solid"; color="#A1A9CC";
     bgcolor="#34302c";
 
-    catalog [label="ShadowCatalog\nRelDescriptor LRU\n+ tokio_postgres client\n+ schema_event_tx (PHASE15)", fillcolor="#3D3D54"];
+    catalog [label="ShadowCatalog\nRelDescriptor LRU\n+ tokio_postgres client\n+ schema_event_tx", fillcolor="#3D3D54"];
     inval   [label="invalidation_drain task\ngeneration counter", fillcolor="#3D3D54"];
 
     sender  [label="ShadowStreamSink + walsender\nlistener (unix / TCP)\nframe encoder", fillcolor="#4D3340"];
@@ -40,7 +40,7 @@ digraph shadow_comm {
   // ──────── Channel 1: libpq (catalog reads) ────────
   catalog -> shadcat [label="① libpq SELECT\n(cache fill on miss)\nport=55434", color="#CBA85E", dir=both, arrowtail=open, penwidth=2];
 
-  // ──────── Channel 2: walsender wire (Phase 13 — hot path) ────────
+  // ──────── Channel 2: walsender wire (hot path) ────────
   sender  -> walrecv [label="② 'w' XLogData frames\nrecord cadence (ms)\nstreaming-replication protocol", color="#BD8183", penwidth=3];
   walrecv -> sender  [label="② 'r' standby status\nflush_lsn / apply_lsn", color="#BD8183", style=dashed];
 
@@ -71,7 +71,7 @@ digraph shadow_comm {
       <TR><TD><FONT COLOR="#BF8C5F"><B>④ ┄┄</B></FONT></TD><TD>BASE_BACKUP land (one-shot, greenfield)</TD></TR>
       <TR><TD><FONT COLOR="#A1A9CC"><B>···</B></FONT></TD><TD>catalog gate dependency (apply_lsn → relation_at)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>derived flow (off ①)</B></TD></TR>
-      <TR><TD COLSPAN="2">PHASE15: cache miss → schema diff → SchemaEvent → DdlApplicator → CH ALTER/CREATE/DROP. Stays inside walshadow; CH wire not drawn.</TD></TR>
+      <TR><TD COLSPAN="2">Schema event flow: cache miss → schema diff → SchemaEvent → DdlApplicator → CH ALTER/CREATE/DROP. Stays inside walshadow; CH wire not drawn.</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill</B></TD></TR>
       <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>walshadow — ShadowCatalog (libpq client)</TD></TR>
       <TR><TD BGCOLOR="#4D3340"></TD><TD>walshadow — walsender / sender side</TD></TR>
@@ -80,4 +80,5 @@ digraph shadow_comm {
       <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres receivers / catalog</TD></TR>
     </TABLE>
   >];
+  pglog -> legend [style=invis];
 }

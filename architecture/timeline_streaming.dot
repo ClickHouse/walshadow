@@ -1,9 +1,9 @@
 // walshadow — steady-state streaming: one record's journey
-// rankdir=LR — pipeline reads left → right with parallel branches
+// rankdir=TB — pipeline reads top→bottom; was LR but ran 6× wider than tall
 digraph timeline_streaming {
-  rankdir=LR;
+  rankdir=TB;
   compound=true;
-  graph [fontname="Helvetica", labelloc="t", label="walshadow steady-state streaming — one record's journey through hot path (post-PHASE15)", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.6, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="walshadow steady-state streaming — one record's journey through hot path", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.6, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
 
@@ -82,7 +82,7 @@ digraph timeline_streaming {
 
   // ═════ ⑥ commit drain → CH (held-open INSERT) ═════
   subgraph cluster_p6 {
-    label="⑥ XLOG_XACT_COMMIT  → drain → CH (held-open INSERT, PHASE14 §02)";
+    label="⑥ XLOG_XACT_COMMIT  → drain → CH (held-open INSERT)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     cmt6   [label="XLOG_XACT_COMMIT\nLSN = X'", fillcolor="#3D3D54"];

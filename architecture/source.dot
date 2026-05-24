@@ -1,0 +1,110 @@
+// walshadow — source pipeline detail (per plans/source.md)
+// SourceFeed → StreamingWalker → CompositeRecordSink fan-out:
+//   ❶ ShadowStreamSink (bytes, walsender wire)
+//   ❷ QueueingRecordSink (worker, decoder)
+//   ❸ DirSegmentSink (16 MiB segment artifact)
+// Emphasizes the pump-task / worker-task boundary at QueueingRecordSink.
+digraph source {
+  rankdir=TB;
+  compound=true;
+  graph [fontname="Helvetica", labelloc="t", label="source pipeline — SourceFeed → StreamingWalker → CompositeRecordSink fan-out", fontsize=14, splines=spline, nodesep=0.5, ranksep=0.7, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  // ════════ External actors ════════
+  src [label="source PG\nwal_level=replica", fillcolor="#3D3D54", shape=cylinder];
+  shd [label="shadow PG\nwalreceiver\npg_last_wal_replay_lsn", fillcolor="#3D4128", shape=cylinder];
+  dec [label="downstream\nBufferingDecoderSink\n+ XactRecordSink\n→ CH emitter", fillcolor="#4D4128", shape=cylinder];
+
+  // ════════ ① ingress (pump task) ════════
+  subgraph cluster_ingress {
+    label="① ingress (pump task, tokio)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    repconn [label="ReplicationConn (wal-rs)\nIDENTIFY_SYSTEM +\nSTART_REPLICATION PHYSICAL\n+ TLS / SCRAM-SHA-256", fillcolor="#3D3D54"];
+    feed    [label="SourceFeed::pump\nnext_chunk frame loop,\n'k' keepalive absorb,\n'r' standby status @ 10s", fillcolor="#3D3D54"];
+    chunks  [label="WalChunk\n{ start_lsn, server_wal_end,\n  data: &[u8] }", fillcolor="#3D3D54", shape=parallelogram];
+    repconn -> feed -> chunks;
+  }
+
+  // ════════ ② walker (pump task, sync, record cadence) ════════
+  subgraph cluster_walker {
+    label="② WalStream::push (pump task, sync — record cadence)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    walker [label="StreamingWalker\npage-state machine,\nrecord stitch across pages,\n16 MiB buffer (one alloc)", fillcolor="#4D3A28"];
+    drain  [label="WalStream::drain_records\nFilter::decide (keep / drop) +\nnoop_replace + CRC32C +\nparsed.into_owned()", fillcolor="#4D3A28"];
+    walker -> drain;
+  }
+  chunks -> walker [color="#A1A9CC", penwidth=2];
+
+  // ════════ ③ CompositeRecordSink fan-out (pump task, order matters) ════════
+  subgraph cluster_fanout {
+    label="③ CompositeRecordSink fan-out (pump task — bytes before record before segment)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    bytesink [label="❶ ShadowStreamSink\non_wire_chunk\n(stays on pump task)", fillcolor="#4D3340"];
+    metric   [label="MetricsRecordSink\nsync counters", fillcolor="#4D3340"];
+    qsink    [label="❷ QueueingRecordSink\non_record\n(clones to 'static,\n enqueues, returns)", fillcolor="#4D3340"];
+    segsink  [label="❸ DirSegmentSink\non_segment\n@ 16 MiB boundary", fillcolor="#4D3340"];
+  }
+  drain -> bytesink [color="#BD8183", penwidth=2, label="❶"];
+  drain -> metric   [style=dashed];
+  drain -> qsink    [label="❷"];
+  drain -> segsink  [style=dashed, label="❸"];
+
+  // ════════ ④ Queue boundary (pump → worker) ════════
+  subgraph cluster_queue {
+    label="④ QueueingRecordSink — pump-task ↔ worker-task boundary"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    qbuf  [label="pump-side batch\nVec<Record<'static>>\nbatch_size = 64", fillcolor="#4D3A28", shape=parallelogram];
+    qchan [label="unbounded mpsc\nin_flight AtomicU64,\nsoft_cap → yield_now", fillcolor="#4D3A28", shape=parallelogram];
+    qwrk  [label="worker task\ndrain, on_idle ticks,\non_idle_advance(lsn)", fillcolor="#4D3A28"];
+    qerr  [label="shared err slot\n(wait_for_replay timeout\n surfaces back to pump)", fillcolor="#4D3A28", shape=note];
+    qbuf -> qchan -> qwrk;
+    qwrk -> qerr [style=dashed, color="#B58B86"];
+  }
+  qsink -> qbuf [lhead=cluster_queue];
+  qerr  -> qsink [style=dashed, color="#B58B86", constraint=false, label="next on_record →\nErr (real root cause,\n daemon exits clean)"];
+
+  // ════════ ⑤ walsender server (own tokio task) ════════
+  subgraph cluster_walsender {
+    label="⑤ walsender server (wal-rs server.rs — own tokio task)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    listener [label="accept loop\n127.0.0.1 TCP +\nSO_REUSEADDR / unix\nStartupMessage replication=true\nIDENTIFY_SYSTEM cached", fillcolor="#5D3F40"];
+    sendq    [label="WalSenderConn send queue\nper-conn Vec<u8>\n'w' XLogData + 'k' keepalive\nslow-client cutoff", fillcolor="#5D3F40"];
+    stat     [label="decode_standby_status\nrx 'r' write/flush/apply\nShadowStreamState aggregate", fillcolor="#5D3F40"];
+    listener -> sendq [style=dashed];
+  }
+  bytesink -> sendq [color="#BD8183", penwidth=2, label="enqueue_framed\n(record cadence, ms)"];
+
+  // ════════ ⑥ on-disk artifact ════════
+  outdir [label="out/<seg>\nfsynced 16 MiB +\nmanifest.json", fillcolor="#4D3850", shape=note];
+  segsink -> outdir;
+
+  // ════════ External edges ════════
+  src   -> repconn [color="#A1A9CC", penwidth=2, label="CopyData 'w'\nstreaming replication"];
+  sendq -> shd    [color="#BD8183", penwidth=2, label="'w' XLogData\nrecord cadence"];
+  shd   -> stat   [style=dashed, color="#BD8183", constraint=false, label="'r' standby status"];
+  outdir -> shd   [style=dashed, color="#6E6963", constraint=false, label="restore_command\n(archive fallback)"];
+  qwrk  -> dec    [color="#BF8C5F", penwidth=2, label="DecoderXactPair\n(batched records)"];
+
+  // ════════ Cross-cutting secondary edges ════════
+  stat -> qwrk [style=dotted, color="#A1A9CC", constraint=false, label="apply_lsn →\nunblock wait_for_replay\n(catalog gate)"];
+
+  // ════════ Legend ════════
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
+      <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>source PG / ingress (SourceFeed, ReplicationConn)</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>walshadow filter / walker / queue (pump-side sync)</TD></TR>
+      <TR><TD BGCOLOR="#4D3340"></TD><TD>CompositeRecordSink fan-out sinks</TD></TR>
+      <TR><TD BGCOLOR="#5D3F40"></TD><TD>walsender server (accept, send queue, status rx)</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact (filtered segment + manifest)</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres (walreceiver)</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>downstream decoder + CH emitter</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour — channel</B></TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>source replication frame (CopyData 'w')</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>━━</B></FONT></TD><TD>walsender wire (hot path, record cadence)</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>batched records → decoder / CH emitter</TD></TR>
+      <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>filesystem (restore_command archive fallback)</TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>···</B></FONT></TD><TD>apply_lsn feedback (catalog gate unblock)</TD></TR>
+      <TR><TD><FONT COLOR="#B58B86"><B>┄┄</B></FONT></TD><TD>worker error surfaced back to pump task</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>fan-out order (③, mandatory)</B></TD></TR>
+      <TR><TD COLSPAN="2">❶ bytes → walsender (advances shadow apply_lsn)<BR/>❷ record → queue → decoder (waits on apply_lsn at catalog gate)<BR/>❸ segment fires only at 16 MiB boundary</TD></TR>
+    </TABLE>
+  >];
+  dec -> legend [style=invis];
+}

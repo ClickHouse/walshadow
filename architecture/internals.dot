@@ -1,11 +1,11 @@
 // walshadow — internal pipeline detail
 // Deeper than overview.dot: filter stages, fan-out ordering, queueing
 // stage, catalog cache internals, walsender server internals, decoder
-// type matrix, xact spill, schema-event channel (PHASE15), …
+// type matrix, xact spill, schema-event channel, …
 digraph internals {
   rankdir=TB;
   compound=true;
-  graph [fontname="Helvetica", labelloc="t", label="walshadow internals — pipeline stages, taps & caches (post-PHASE15)", fontsize=14, splines=spline, nodesep=0.45, ranksep=0.55, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="walshadow internals — pipeline stages, taps & caches", fontsize=14, splines=spline, nodesep=0.45, ranksep=0.55, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
 
@@ -71,7 +71,7 @@ digraph internals {
 
   // ════════ ⑥ CH emitter — row path ════════
   subgraph cluster_ch {
-    label="⑥ CH emitter — held-open INSERT, deadline-flushed (PHASE14 §02)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    label="⑥ CH emitter — held-open INSERT, deadline-flushed"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     tableenc [label="TableEncoder\nper (table, INSERT)\nrow/byte budget", fillcolor="#5D4628"];
     block    [label="BlockBuilder\nNative columns +\n_lsn / _xid / _op / _commit_ts", fillcolor="#5D4628"];
     chwire   [label="clickhouse-c-rs\nsend_query (once per table)\nsend_data(Some) per block\nsend_data(None) on deadline\nflush_timeout cap", fillcolor="#5D4628"];
@@ -81,7 +81,7 @@ digraph internals {
 
   // ════════ ⑦ ShadowCatalog cache + schema-event channel ════════
   subgraph cluster_catalog {
-    label="⑦ ShadowCatalog cache + SchemaEvent channel (PHASE15 §1)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    label="⑦ ShadowCatalog cache + SchemaEvent channel"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     lru    [label="LRU 4096\nby_filenode / by_oid\n+ generation counter", fillcolor="#4D4D28"];
     libpq  [label="tokio_postgres::Client\nSELECT pg_class /\npg_attribute / pg_type", fillcolor="#4D4D28"];
     inval  [label="invalidation_drain\n(tokio task)\nbump generation\non catalog write", fillcolor="#4D4D28"];
@@ -91,9 +91,9 @@ digraph internals {
     lru -> evtx [style=dashed, color="#CBA85E", label="diff vs prior"];
   }
 
-  // ════════ ⑦b DDL applicator + type bridge (PHASE15 §2) ════════
+  // ════════ ⑦b DDL applicator + type bridge ════════
   subgraph cluster_ddl {
-    label="⑦b DDL applicator (PHASE15 §2 — separate CH TCP)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    label="⑦b DDL applicator (separate CH TCP)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     bridge [label="type_bridge\nRelAttr → CH type\n(reject widen for now)", fillcolor="#5D4628"];
     ddlapp [label="DdlApplicator\n(ch_ddl.rs)\nCREATE / ADD COL /\nRENAME / DROP TABLE", fillcolor="#5D4628"];
     bridge -> ddlapp [style=dashed];
@@ -102,7 +102,7 @@ digraph internals {
   ddlapp -> chwire [style=dashed, color="#BF8C5F", constraint=false, label="DDL SQL\n(off hot path,\n own CH TCP)"];
 
   catgate -> lru   [style=dashed, color="#CBA85E", constraint=false, label="lookup"];
-  track   -> inval [style=dashed, color="#CBA85E", constraint=false];
+  track   -> inval [style=dashed, color="#CBA85E"];
   evtx    -> xactbuf [style=dashed, color="#CBA85E", constraint=false, label="stamp on xid"];
 
   // ════════ ⑧ walsender server (tokio task) ════════
@@ -128,12 +128,15 @@ digraph internals {
   src     -> feed   [color="#A1A9CC", penwidth=2];
   sendq   -> shd    [color="#BD8183", penwidth=2, label="hot wire (ms)"];
   shd     -> stat   [style=dashed, color="#BD8183", constraint=false];
-  libpq   -> shd    [color="#CBA85E", dir=both, arrowtail=open, constraint=false, label="libpq SELECT"];
+  libpq   -> shd    [color="#CBA85E", dir=both, arrowtail=open, label="libpq SELECT"];
   segsink -> outdir;
-  outdir  -> shd    [style=dashed, color="#6E6963", constraint=false, label="restore_command"];
+  outdir  -> shd    [style=dashed, color="#6E6963", label="restore_command"];
   xactbuf -> spill  [style=dashed, label="evict largest xact"];
   drain   -> cursor [style=dotted, color="#b380b0", label="LSN bundle"];
   chwire  -> ch     [color="#BF8C5F", penwidth=2];
+
+  // ════════ Anchor sinks at the bottom rank ════════
+  { rank=sink; shd; ch; }
 
   // ════════ Legend ════════
   legend [shape=plaintext, label=<
