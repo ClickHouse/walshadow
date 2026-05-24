@@ -1,18 +1,14 @@
-//! Phase 12 — page-walk Tap sink + supporting walker types.
+//! Page-walk Tap sink + supporting walker types.
 //!
 //! Sinks user-heap tar entries (`base/<dbid>/<filenode>` with
 //! filenode >= 16384) via [`FileAction::Tap`]. As bytes arrive in
 //! `chunk()` callbacks, the sink accumulates them 8 KiB at a time
 //! (PG's heap page size), walks each full page's `ItemIdData` slots,
-//! and decodes live tuples through the **same Phase 5 heap decoder
-//! the WAL hot path uses** ([`crate::heap_decoder::decode_block_data`]).
+//! and decodes live tuples through the **same heap decoder the WAL
+//! hot path uses** ([`crate::heap_decoder::decode_block_data`]).
 //! Output is one [`BackfillTuple`] per `LP_NORMAL` slot; the sink
 //! hands them off through an mpsc to an async drain task that pumps
-//! the CH emitter.
-//!
-//! Reused largely as-is from PHASE12experiments worktree D's
-//! `backfill_tar.rs`; the file-level trait shape replaces the
-//! tar-coupled `TapSink` it used previously.
+//! the CH emitter. See [plans/bootstrap.md](../plans/bootstrap.md).
 //!
 //! ## V1 limits
 //!
@@ -20,8 +16,8 @@
 //!   captured mid-write get walked as-shipped. WAL records in
 //!   `[start_lsn, end_lsn]` that update the same tuples re-emit at
 //!   higher `_lsn` and `ReplacingMergeTree(_lsn)` collapses the
-//!   duplicate. Documented as accepted brief-duplicate window in
-//!   [PHASE12plan.md](../plans/PHASE12plan.md).
+//!   duplicate. Accepted brief-duplicate window, see
+//!   [plans/bootstrap.md](../plans/bootstrap.md).
 //! - **TOAST-spilled columns surface as `ColumnValue::PgPending`.**
 //!   Inline-stored varlena columns decode through the Phase 5 type
 //!   matrix; external TOAST chunks aren't reassembled here. The

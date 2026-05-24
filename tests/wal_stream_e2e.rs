@@ -1,4 +1,4 @@
-//! PRE5 item 1: full WAL capture pipeline.
+//! Full WAL capture pipeline against a live source PG.
 //!
 //! Source PG → `SourceFeed` (`START_REPLICATION PHYSICAL`) →
 //! `WalStream` (segment-aligned filter) → `DirSegmentSink` →
@@ -242,7 +242,7 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         count,
         "manifest record count must match WalParser's count on filtered bytes",
     );
-    // PRE5b5 contract: parsed records arrive at the RecordSink with
+    // RecordSink contract: parsed records arrive at the RecordSink with
     // their full XLogRecord shape. Prove the wal-rs →
     // filter_segment → WalStream chain forwards `parsed.header` and
     // `parsed.blocks` rather than the old scalar-only RecordEvent.
@@ -302,7 +302,7 @@ fn pg_class_filenode(sh: &Shadow) -> u32 {
         .expect("integer")
 }
 
-/// PRE5b2 regression: walshadow-stream against a source whose pg_class
+/// Catalog-seed regression: walshadow-stream against a source whose pg_class
 /// was rotated above 16384 *before* attach. Without
 /// `seed_from_source`, heap writes targeting the rotated pg_class
 /// filenode classify as User and get dropped (the bootstrap rule
@@ -631,7 +631,7 @@ async fn sidecar_sql_client_negotiates_tls_over_tcp() {
     eprintln!("sidecar tls e2e: pg_stat_ssl reports version={v}");
 }
 
-/// PRE5b9: `walshadow-stream` must call `WalStream::close()` on shutdown
+/// Shutdown contract: `walshadow-stream` must call `WalStream::close()` on shutdown
 /// so the in-flight partial segment lands on disk rather than evaporating
 /// with the process. Exercises the `close()` path directly (signaling a
 /// subprocess is racy) plus the resume-from-segment-boundary contract

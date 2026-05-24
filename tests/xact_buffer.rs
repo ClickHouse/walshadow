@@ -1,4 +1,4 @@
-//! Phase 6 — `XactBuffer` commit/drain + detoast against a live
+//! `XactBuffer` commit/drain + detoast against a live
 //! shadow PG. Skipped silently if `initdb` is not on `$PATH`.
 //!
 //! The buffer's commit path needs
@@ -223,7 +223,7 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     assert_eq!(obs.seen[1].decoded.source_lsn, 200);
     assert_eq!(obs.seen[0].commit_ts, 12345);
     assert_eq!(obs.seen[1].commit_ts, 12345);
-    // Phase 11: every tuple carries the commit-record LSN so the
+    // Commit-LSN carriage: every tuple carries the commit-record LSN so the
     // emitter can stamp its ack ceiling without re-reading the buffer.
     assert_eq!(obs.seen[0].commit_lsn, 300);
     assert_eq!(obs.seen[1].commit_lsn, 300);
@@ -242,7 +242,7 @@ async fn commit_unknown_xid_no_ops() {
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
     let mut obs = CollectObs::default();
-    // Phase 11: even with no buffered records, the commit's source LSN
+    // Ack-LSN coverage: even with no buffered records, the commit's source LSN
     // must advance both ack-LSN gauges so source's slot can recycle
     // past read-only / filter-dropped xacts.
     b.commit(99, 0, 0x9000, &[], &cat, &mut obs).await.unwrap();
@@ -297,7 +297,7 @@ async fn commit_drains_spilled_then_in_memory_entries() {
     }
 }
 
-/// PHASE14 item 5. Two per-xid buffers (top xid=7 + sub xid=8) drain
+/// Subxact merge: two per-xid buffers (top xid=7 + sub xid=8) drain
 /// as a single merged stream ordered by `source_lsn`. The top's first
 /// entry (LSN 100) precedes the sub's entry (LSN 150) which precedes
 /// the top's second entry (LSN 200). Wrong-order emit would surface a

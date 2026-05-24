@@ -11,7 +11,7 @@
 //! resolves in milliseconds.
 //!
 //! Under sustained workload mixed with DDL (the
-//! `phase14_pgbench_acceptance` and `phase14_kill_restart` drills),
+//! `pgbench_acceptance` and `kill_restart` drills),
 //! `wait_for_replay` can take longer than one record latency. Because
 //! the pump task is parked inside that await, the bytes_sink stops
 //! firing on subsequent records → walsender's per-connection queues

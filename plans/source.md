@@ -1,0 +1,419 @@
+# source — physical WAL ingestion
+
+Pump bytes off source PG, walk pages into records at page cadence,
+dispatch each record through a fan-out sink chain. One ingress site
+([`SourceFeed`](../src/source_feed.rs)), one walker
+([`StreamingWalker`](../src/streaming_walker.rs)), one record-cadence
+dispatch point ([`WalStream::push`](../src/wal_stream.rs)). Filter
+rewrite into shadow's `pg_wal/`, heap decode into CH Native blocks,
+xact buffering, oracle all hang off the
+[`RecordSink`](../src/wal_stream.rs) +
+[`RecordBytesSink`](../src/wal_stream.rs) traits with no second walk
+of the bytes. Every downstream subsystem composes through this surface
+
+## Purpose
+
+Source PG's `pg_wal/` is the only external source of truth for
+committed data. The source component turns it into two streams:
+(1) byte stream identical to source's WAL minus user-data records,
+shipped to shadow PG via walshadow's homemade walsender so shadow
+stays a valid hot standby of source's catalog state; (2) parsed-
+record stream the heap decoder + xact buffer consume to build CH
+Native blocks
+
+Same parse, same walk, same byte ranges. Filter decision (Keep /
+Drop) computed once per record, broadcast to both consumers via
+[`CompositeRecordSink`](../src/wal_stream.rs). Drop path
+NOOP-rewrites bytes in place inside walker buffer so segment-cadence
+disk output ([`DirSegmentSink`](../src/wal_stream.rs)) and
+record-cadence shadow wire
+([`ShadowStreamSink`](../src/shadow_stream.rs)) ship the same rewrite
+
+## SourceFeed
+
+[`src/source_feed.rs`](../src/source_feed.rs). Wraps wal-rs's
+[`ReplicationConn`](../wal-rs/src/pg/replication/conn.rs):
+`IDENTIFY_SYSTEM` → `START_REPLICATION PHYSICAL <slot>? <lsn>
+TIMELINE <tli>` → `next_chunk` loop returning
+[`WalChunk { start_lsn, server_wal_end, data }`](../src/source_feed.rs)
+per `CopyData('w')` frame. `next_chunk` blocks on one server
+message; WAL data returns to caller, keepalives absorbed
+transparently, `reply_requested` echoes a `'r'` status update inline.
+[`StandbyStatus { write_lsn, flush_lsn, apply_lsn }`](../src/source_feed.rs)
+passes in per call; `send_status` clamps each slot through
+`last_acked_lsn` — PG treats flush/apply regression as a protocol
+violation and force-disconnects. Cadence
+[`DEFAULT_STATUS_INTERVAL = 10s`](../src/source_feed.rs); source's
+`wal_sender_timeout` default 60s gives 6× headroom
+
+`slot: Option<&str>` on `start_physical_replication`: Some = bind to
+permanent physical slot, pins source's `pg_wal/` until our
+`apply_lsn` advances; None = slotless, source recycles on
+`wal_keep_size` schedule. Slot caps catch-up, slotless caps source
+disk burn
+
+TLS / SCRAM via wal-rs's
+[`tls.rs`](../wal-rs/src/pg/replication/tls.rs): modes `disable /
+allow / prefer / require / verify-ca / verify-full`, verify-*
+consults `PGSSLROOTCERT` or webpki. TLS skipped on unix sockets (PG
+refuses, matching libpq). Auth: trust / cleartext / SCRAM-SHA-256.
+Sidecar `tokio_postgres::Client` for non-replication queries opens
+lazily via `sql_client()`; same `PgConfig`, same TLS wrap, runs
+through `connect_raw` with `SslMode::Disable` so it never
+double-negotiates
+
+Walshadow's walsender server (other side, feeding shadow) is
+trust-over-loopback only, no TLS, no SCRAM. Listener binds
+`127.0.0.1` or colocated unix socket; cross-host shadow needs TLS +
+SCRAM-SHA-256, see [future/parked.md](future/parked.md).
+Throttle: wal-rs ships [`pg::throttle`](../wal-rs/src/throttle.rs)
+as a token-bucket `AsyncRead` adapter, not wired today (queueing
+sink's backpressure paces the daemon), but the hook exists
+
+## WalStream::push
+
+[`src/wal_stream.rs`](../src/wal_stream.rs). Page-cadence record
+entry point. Owns the
+[`StreamingWalker`](../src/streaming_walker.rs), long-lived
+[`Filter`](../src/filter.rs), per-segment manifest accumulator,
+optional `RecordBytesSink` for shadow wire
+
+```rust
+pub async fn push(
+    &mut self,
+    lsn: u64,
+    bytes: &[u8],
+    record_sink: &mut dyn RecordSink,
+    segment_sink: &mut dyn SegmentSink,
+) -> Result<u64, WalStreamError>
+```
+
+`lsn` must equal `self.next_lsn()` (misalignment errors); `start_lsn`
+at `WalStream::new(timeline, seg_size, start_lsn)` must be
+segment-aligned (`UnalignedBase` otherwise); `bytes` may span any
+chunking. Per-record dispatch fires the moment a record's last byte
+lands: `bytes_sink.on_wire_chunk(start_lsn,
+buf[wire_offset..record_end])` → `record_sink.on_record(&Record)`.
+Order matters: bytes ship first so shadow's apply LSN advances
+before the catalog gate inside `BufferingDecoderSink::on_record`
+checks it. Segment dispatch fires when walker buffer crosses 16 MiB;
+records straddling the boundary hold the flush until the spanning
+record completes, rewrite then lands uniformly across both segs
+
+Poisoned flag: any error returned to `push` (sink Err, walker
+BadPageMagic, parse failure, rewrite failure) sets `self.poisoned =
+true`; subsequent `push` calls short-circuit with
+`WalStreamError::Poisoned`. Mid-segment sink failure leaves byte /
+manifest / shadow-wire / decoder state out of sync; recovery
+requires fresh `WalStream` + fresh upstream connection at the
+durable `dispatched_lsn`
+
+## StreamingWalker
+
+[`src/streaming_walker.rs`](../src/streaming_walker.rs). Stateful
+page walker driven by `WalStream::push` as bytes arrive. Carries
+page-cursor + `Pending` cross-page stitcher + 16 MiB
+segment-accumulating buffer across calls
+
+[`StreamingWalker::buffer() -> &[u8]`](../src/streaming_walker.rs)
+returns the live segment buffer; `WalStream::flush_segment` hands it
+to `SegmentSink::on_segment` without a `Vec` allocation,
+`reset_segment()` then `buf.clear()`s in place. One 16 MiB
+allocation across the whole pump, not one per segment
+
+`try_next() -> Option<Result<CompletedRecord, _>>` yields the next
+finalised record. [`CompletedRecord`](../src/streaming_walker.rs)
+carries `byte_ranges`, `start_offset`, `page_magic`, and
+`stitched_bytes: Option<Vec<u8>>`: `None` for single-page records
+(overwhelmingly common, caller reads via
+`completed.logical_bytes(walker.buffer())` borrowing into segment
+buffer); `Some(Vec)` for cross-page records where
+`Pending::materialise` assembled bytes across `byte_ranges` at
+completion. `Pending` dropped its old `accumulated: Vec<u8>` for
+`byte_ranges` + `accumulated_len: usize` — bytes live only in walker
+buf during stitch. Owned-struct + `logical_bytes(walker_buf)` helper
+sidesteps the NLL trap that bit `CompletedRecord<'a>` borrowing into
+`self.buf` while `try_next`'s loop reborrows `&mut self.buf`
+
+`rewrite_record(byte_ranges, bytes)` scatters post-`noop_replace`
+bytes into the walker buffer. Mutates `&mut self.buf`, so parsed
+record's borrows into the same buffer must release first —
+[`WalStream::drain_records`](../src/wal_stream.rs) materialises
+`parsed.into_owned()` between filter decide and rewrite for that
+reason
+
+Walker rejects pre-PG-15 magic
+([`XLP_PAGE_MAGIC_PG15`](../wal-rs/src/pg/walparser/types.rs)),
+emits `BadPageMagic` / `UnsupportedSourceVersion`. Zero `xl_tot_len`
+or `xl_tot_len < X_LOG_RECORD_HEADER_SIZE` fail at the page state
+machine, not the parser
+
+## CompositeRecordSink fan-out
+
+[`src/wal_stream.rs`](../src/wal_stream.rs). Single dispatch site
+in `WalStream::push`, fan-out via
+[`CompositeRecordSink`](../src/wal_stream.rs) — `inner: Vec<Box<dyn
+RecordSink + Send>>`, push sees a single `&mut dyn RecordSink`
+
+`MetricsRecordSink` runs on the pump task — counter bumps only, no
+await, status line reads the same struct directly.
+`QueueingRecordSink` (next section) wraps the decoder/xact pair so
+its `wait_for_replay` waits don't park the pump
+
+Byte path lives separately on `RecordBytesSink::on_wire_chunk`, not
+on a `RecordSink`. Filter's NOOP rewrite for dropped records fires
+inside `drain_records` before either sink sees the bytes, so both
+shadow's wire and shadow's archive
+([`DirSegmentSink`](../src/wal_stream.rs)) ship the rewritten
+sequence. See [filter.md](filter.md) for filter rules + NOOP
+rewrite contract
+
+[`BufferingDecoderSink`](../src/xact_buffer.rs) sits as the second
+sink in the queued chain. Sees every `Decision::Drop` record on
+`RM_HEAP_ID` / `RM_HEAP2_ID` (user-data records the filter has
+already byte-rewritten to NOOP for shadow's benefit). Pre-rewrite
+parse carried on `Record.parsed`, so decoder sees the canonical
+pre-NOOP tuple bytes. See [decoder.md](decoder.md)
+
+## QueueingRecordSink
+
+[`src/queueing_record_sink.rs`](../src/queueing_record_sink.rs).
+Decouples decoder's `ShadowCatalog::wait_for_replay` from pump task
+
+Wire ordering fires `RecordBytesSink::on_wire_chunk` before
+`RecordSink::on_record` per record, both awaited inline. Steady
+workload: catalog gate resolves in ms because shadow's apply LSN
+advances on the wire. Sustained DDL: gate can take seconds — pump
+task parks inside the await, `bytes_sink` stops firing → walsender
+per-connection queues drain → shadow's walreceiver stalls → apply
+LSN sticks below `record.source_lsn` → `wait_for_replay` trips its
+30 s timeout. Pump and shadow deadlocked
+(`pgbench_acceptance` + `kill_restart` failure mode)
+
+`QueueingRecordSink::spawn` takes inner `RecordSink + Send +
+'static`, `batch_size`, `soft_cap`. Pump-side `on_record` clones
+record to `'static` via `record.parsed.clone().into_owned()`, pushes
+onto local `Vec`, ships when `len >= batch_size` onto unbounded
+`mpsc::UnboundedSender<Vec<Record<'static>>>`. Worker drains at its
+own pace through the inner sink
+
+Backpressure soft only. `in_flight: AtomicU64` tracks records in
+channel + pump buffer; crossing `soft_cap` triggers
+`tokio::task::yield_now()`. Hard cap open-ended — permanently
+stalled worker surfaces catalog `wait_for_replay` timeout on shared
+err slot, pump's next `on_record` returns the parked error, daemon
+exits cleanly with the real root cause rather than hanging
+
+Worker uses `tokio::time::timeout(idle_interval, rx.recv())`. On
+timeout calls `inner.on_idle()` — CH emitter's hold-INSERT-open
+deadline fires there without fresh records. Channel close fires
+`inner.on_close()` for one last flush. `on_idle_advance(lsn)` runs
+after every batch carrying max `source_lsn`; xact buffer uses it to
+advance `emitter_ack_lsn` past trailing non-commit WAL (checkpoint,
+RUNNING_XACTS) when no xact is in flight — without it source's slot
+pins WAL at the last COMMIT and kill-restart idle catchup never
+resolves
+
+## DecoderSink
+
+Per-record decoder dispatch lives in
+[`BufferingDecoderSink`](../src/xact_buffer.rs). The `decoder_sink`
+module ([`src/decoder_sink.rs`](../src/decoder_sink.rs)) carries
+shared types: [`TupleObserver`](../src/decoder_sink.rs),
+[`DecoderStats`](../src/decoder_sink.rs),
+[`DecoderSinkError`](../src/decoder_sink.rs).
+[`MetricsTupleObserver`](../src/decoder_sink.rs) hosts the
+[`DecoderStats`](../src/decoder_sink.rs) counter struct;
+[`CollectingTupleObserver`](../src/decoder_sink.rs) is the test
+collector; production wires
+[`EmitterObserver`](../src/ch_emitter.rs) attached via
+SIGHUP-reloadable `MappingHandle`
+
+Record stats on `DecoderStats`: `toast_chunks_buffered` (TOAST
+chunks routed into xact buffer's chunk slot, distinct from
+`inserts` for user-table writes); `toast_chunks_malformed` (TOAST
+inserts the decoder couldn't reinterpret as a chunk — missing
+`chunk_id`/`seq`/`data`, type mismatch — surfaces corrupt catalog
+as a counter, not silent loss); `catalog_not_found` (heap record on
+a relation `relation_at` couldn't resolve, counted not retried —
+xact buffer reordering handles legitimate races); `skipped_no_block`
+(`record.parsed.blocks` empty: LOCK, INPLACE, TRUNCATE)
+
+`on_xact_end` signature:
+
+```rust
+fn on_xact_end<'a>(
+    &'a mut self,
+    commit_lsn: u64,
+) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>>
+```
+
+Returns highest commit_lsn now known durable on the observer (CH
+server acked, MergeTree part finalized). Callers advance ack
+ceiling from the returned value, not from `commit_lsn` — an
+observer holding INSERTs open across xacts can report ack lag
+without breaking slot-advance gate. Default impl returns
+`commit_lsn` (instant ack); CH emitter overrides to thread
+flush_timeout deadline. See [xact.md](xact.md) for where committed
+tuples land
+
+## Zero-copy framing
+
+Zero-copy audit. Hot-path allocation profile shaped so a
+single-page record (overwhelmingly common) travels from socket to
+sink without a heap allocation for its bytes
+
+`XLogRecord<'a>` and `XLogRecordBlock<'a>` carry `main_data`,
+per-block `image`, per-block `data` as `Cow<'a, [u8]>` in
+[`wal-rs/src/pg/walparser/types.rs`](../wal-rs/src/pg/walparser/types.rs).
+Parser populates `Cow::Borrowed(slice)` straight off input — every
+`head.to_vec()` is gone. Defaults to `Cow::Borrowed(&[])` so
+`XLogRecord::default()` stays allocation-free. Test sinks call
+`record.parsed.clone().into_owned()` for `Record<'static>`;
+production sinks consume inside one `on_record` future, never store
+
+`StreamingWalker::buffer() -> &[u8]` returns the segment buffer
+directly; `WalStream::flush_segment` hands the slice to
+`SegmentSink::on_segment` and calls `reset_segment()` after. No
+16 MiB-per-segment churn. `CompletedRecord.stitched_bytes:
+Option<Vec<u8>>` materialises only on cross-page record completion
+via `Pending::materialise(buf)`; `logical_bytes(walker_buf)` hides
+the borrowed-vs-owned distinction
+
+[`stream.rs`](../wal-rs/src/pg/replication/stream.rs) exposes
+`encode_wal_data_frame_into(&mut Vec<u8>, ...)` and
+`encode_keepalive_frame_into(&mut Vec<u8>, ...)`.
+[`ShadowStreamSink`](../src/shadow_stream.rs) writes the CopyData
+envelope (`'d'` tag + u32 BE length placeholder + body + back-patch)
+straight into each connection's send queue Vec. One Vec per
+(record × connection), not three
+
+Drop-path materialisation: `WalStream::drain_records` calls
+`parsed.into_owned()` between filter decide and
+`walker.rewrite_record` — rewrite mutates the walker buffer at the
+same ranges `parsed`'s slices view. Cost lands once per dispatched
+record at the trait boundary; parser-internal `to_vec`s the audit
+eliminated never fire. Keep-path records on a non-storing sink stay
+zero-copy through
+
+Future zero-copy: `XLogRecord.blocks` smallvec migration,
+single-pass header-walk merge in `parse.rs`. See `future/parked.md`
+
+## Walshadow walsender server
+
+[`wal-rs/src/pg/replication/server.rs`](../wal-rs/src/pg/replication/server.rs).
+Server side of the physical-replication protocol, pairs with
+[`conn.rs`](../wal-rs/src/pg/replication/conn.rs)'s client so
+wal-rs plays either role
+
+Why a homemade walsender: naive approach is "shadow
+`restore_command` from walshadow's filtered segment dir". That's the
+archive-only design, sits on segment cadence — shadow's
+`pg_last_wal_replay_lsn` advances only when shadow finds a new
+segment file. Catalog gate `wait_for_replay(at_lsn)` inside
+[`BufferingDecoderSink::on_record`](../src/xact_buffer.rs) therefore
+stalls for an entire segment (up to 16 MiB / source's write rate,
+plus `archive_timeout`) on every cache miss. Source UPDATE → CH
+FINAL latency bottoms out at segment cadence
+
+Streaming-fed shadow flips it: walshadow becomes shadow's primary,
+`primary_conninfo` points at the walsender, filtered WAL flows
+record-by-record over the streaming-replication protocol. Shadow's
+replay LSN advances at network + apply cadence (ms), catalog gate
+clears in ms
+
+Surface: `StartupMessage` with `replication=true` →
+`AuthenticationOk` + ParameterStatus burst + `BackendKeyData` +
+`ReadyForQuery`. `IDENTIFY_SYSTEM` returns `(systemid, timeline,
+xlogpos, dbname)` row cached from source's reply at startup.
+`TIMELINE_HISTORY <tli>` returns single-timeline empty body.
+`START_REPLICATION [SLOT _] PHYSICAL <lsn> [TIMELINE <n>]` returns
+`CopyBothResponse` then `'w'` XLogData frames. `BASE_BACKUP`
+unsupported (shadow basebackup'd from source at bootstrap)
+
+`'w'` + `'k'` encoders sit in
+[`stream.rs`](../wal-rs/src/pg/replication/stream.rs) alongside the
+existing decoders. Inbound `'r'` standby status via
+`server::decode_standby_status`. `'h'` hot-standby-feedback ignored
+— walshadow holds no source-side slot, no horizon to propagate
+
+Transport: 127.0.0.1 TCP with `SO_REUSEADDR` via
+`TcpSocket::set_reuseaddr` (`TcpListener::bind` doesn't set it,
+TIME_WAIT bites the daemon-restart bind cycle), or unix socket for
+colocated containers. `--walsender-bind` picks address; port-0 +
+`--walsender-port-file` lets supervisors learn the picked port.
+Boot barrier on `--walsender-connect-timeout` waits for shadow's
+walreceiver to attach before pump starts —
+`ShadowStreamSink::on_wire_chunk` drops bytes pushed before any
+connection registers, missed gap is unrecoverable
+
+Sink: `ShadowStreamSink` composes via
+[`WalStream::set_bytes_sink`](../src/wal_stream.rs). Per-connection
+`dispatched_lsn` / `flush_lsn` / `apply_lsn` tracked in
+[`ShadowStreamState`](../src/shadow_stream.rs) behind one
+`Arc<Mutex>`. Slow-client cutoff drops the socket past
+`walsender_slow_threshold` queued bytes; shadow catches up via
+`restore_command` from `out/`. See [shadow.md](shadow.md)
+
+## Binary
+
+[`src/bin/stream.rs`](../src/bin/stream.rs). `walshadow-stream`
+daemon entry point. Boots in order: args + pre-flight validators
+([`preflight.rs`](../src/preflight.rs)); optional bootstrap
+(direct `BASE_BACKUP` from source, or wal-g-compatible from object
+store); `SourceFeed` connect + `IDENTIFY_SYSTEM` + derive
+`start_lsn` from cursor / `--start-lsn` / source's `xlogpos` aligned
+down; `ShadowCatalog` + `XactBuffer` + `schema_events` subscription;
+bind walsender listener before shadow's walreceiver attaches;
+construct [`DaemonSinks`](../src/bin/stream.rs) (`MetricsRecordSink`
++ `QueueingRecordSink::spawn(DecoderXactPair { decoder, xact_drain
+}, batch_size, capacity)`); open `WalStream` + `DirSegmentSink`,
+attach `ShadowStreamSink` via `set_bytes_sink`; spawn metrics
+endpoint, SIGHUP handler, retention sweeper, cursor write loop;
+wait for walsender connect barrier; pump loop: `feed.next_chunk()`
+→ `stream.push(lsn, bytes, &mut record_sink, &mut segment_sink)` →
+cursor advance → status update → repeat
+
+```text
+WalStream::push
+  |
+  +--> RecordBytesSink (ShadowStreamSink)
+  |       wire bytes -> shadow's walreceiver
+  |
+  +--> SegmentSink (DirSegmentSink)
+  |       16 MiB segments -> out/ -> shadow's restore_command (fallback)
+  |
+  +--> RecordSink (DaemonSinks)
+        |- MetricsRecordSink             (sync, counters)
+        +- QueueingRecordSink             (worker task)
+             |- DecoderXactPair
+                  |- BufferingDecoderSink   (user-heap -> xact buffer)
+                  +- XactRecordSink         (commit/abort -> observer)
+                        |- EmitterObserver  (CH Native emit)
+                        +- (MetricsTupleObserver)
+```
+
+`DecoderXactPair` order is fixed: decoder absorbs the heap record
+into xact buffer *before* xact_drain flushes the matching
+commit/abort. A multi-statement xact whose COMMIT lands in the same
+dispatch batch as its heap writes would otherwise miss the latest
+writes. See [ops.md](ops.md) for cursor advance, metrics endpoint,
+SIGHUP semantics, retention sweeper
+
+## Cross-links
+
+[filter.md](filter.md) — record-filter sink (catalog whitelist,
+classify, rewrite). [decoder.md](decoder.md) — heap-decoder sink +
+FPI decompress + TOAST chunk routing. [shadow.md](shadow.md) —
+walsender-fed shadow lifecycle, `primary_conninfo` +
+`restore_command` dual-source pattern. [xact.md](xact.md) — xact
+buffer, TOAST reassembly, where committed tuples land.
+[ops.md](ops.md) — cursor advance, metrics endpoint, SIGHUP,
+retention sweeper
+
+## Out of scope
+
+Future zero-copy work, `XLogRecord.blocks` smallvec migration and
+single-pass header walk merge in `wal-rs/src/pg/walparser/parse.rs`,
+parked in [future/parked.md](future/parked.md). TLS / SCRAM on the
+walsender server also parked there

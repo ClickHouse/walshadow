@@ -7,8 +7,8 @@
 //! `run()` setup (preflight + tracker seed + ShadowCatalog connect +
 //! cursor write + status loop), the metrics endpoint, retention sweeper
 //! poll path, and the partial-segment flush on shutdown — paths the
-//! phase8/phase12 fixtures don't reach because they re-implement the
-//! daemon's sink chain inline rather than driving the binary.
+//! pipeline_e2e / bootstrap_*_e2e fixtures don't reach because they
+//! re-implement the daemon's sink chain inline rather than driving the binary.
 //!
 //! Skipped silently when `initdb` or `pg_basebackup` aren't on `$PATH`.
 
@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail};
 use walshadow::shadow::{Shadow, ShadowConfig};
 
 // Reserved port slot for this test binary — 56170-range, distinct
-// from phase8 (56100) / phase12 (56140) so concurrent `cargo test`
+// from pipeline_e2e (56100) / bootstrap_*_e2e (56140) so concurrent `cargo test`
 // invocations don't trip over each other.
 const SOURCE_PORT: u16 = 26171;
 const SHADOW_PORT: u16 = 26172;
@@ -318,7 +318,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             body.contains("walshadow_source_received_lsn") || body.contains("walshadow_uptime"),
             "expected walshadow_* counter in /metrics body: {body}",
         );
-        // PHASE14 §6 — shadow apply-lag surface is part of the static
+        // Shadow apply-lag surface is part of the static
         // render shape (zero-valued before any shadow attaches).
         for name in [
             "walshadow_shadow_apply_lag_bytes",
@@ -337,7 +337,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         //    catalog records ship to shadow. So the assertion target is
         //    DDL: CREATE TABLE bs.t2 must materialise on shadow after
         //    replay, while bs.t's INSERTs stay invisible there (their
-        //    destination is the CH emitter, exercised by phase8).
+        //    destination is the CH emitter, exercised by pipeline_e2e).
         //    Autocommit per `-c` keeps each commit in the same segment
         //    as its records; pg_switch_wal seals the work.
         let driver_sock = source.config().socket_dir.clone();

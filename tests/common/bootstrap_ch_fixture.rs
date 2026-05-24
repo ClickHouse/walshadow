@@ -1,10 +1,10 @@
-//! Shared scaffolding for the Phase 14 bootstrap → CH end-to-end
-//! drills (`phase14_bootstrap_direct_ch.rs`,
-//! `phase14_bootstrap_object_store_ch.rs`).
+//! Shared scaffolding for the bootstrap → CH end-to-end
+//! drills (`bootstrap_direct_ch.rs`,
+//! `bootstrap_object_store_ch.rs`).
 //!
 //! Owns: the `ChServer` subprocess wrapper (lifted from
-//! `phase8_e2e.rs` during PRE15 so the phase 8, phase 14 bootstrap, and
-//! phase 14 kill-restart drills share one driver), TOML CH-config
+//! `pipeline_e2e.rs` so the pipeline DDL drill, both bootstrap drills,
+//! and the kill-restart drill share one driver), TOML CH-config
 //! rendering for the table mapping the daemon consumes via
 //! `--ch-config`, and the `assert_ch_matches_source` count/sum/md5
 //! oracle the two drills share.
@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use walshadow::shadow::Shadow;
 
-/// ClickHouse server subprocess wrapper shared by the phase 8 DDL
-/// drill, both phase 14 bootstrap drills, and the phase 14
+/// ClickHouse server subprocess wrapper shared by the pipeline DDL
+/// drill, both bootstrap-to-CH drills, and the
 /// kill-restart drill.
 pub struct ChServer {
     child: Child,
@@ -146,7 +146,7 @@ impl Drop for ChServer {
     }
 }
 
-/// Skip-gate probe — same shape as `phase8_e2e.rs::clickhouse_available`.
+/// Skip-gate probe — same shape as `pipeline_e2e.rs::clickhouse_available`.
 pub fn clickhouse_available() -> bool {
     Command::new("clickhouse")
         .arg("--version")
@@ -229,11 +229,11 @@ pub fn create_ch_dest_table(ch: &ChServer, database: &str, table: &str) -> Resul
 /// Append `wal_level=logical` + `max_wal_senders` to the source PG's
 /// postgresql.conf so the daemon's preflight (which insists on
 /// `logical`) clears and BASE_BACKUP can attach. Mirrors the
-/// `append_source_conf` helpers in the existing phase tests.
+/// `append_source_conf` helpers in the bootstrap drill tests.
 pub fn append_source_conf(sh: &Shadow) -> Result<()> {
     let path = sh.config().data_dir.join("postgresql.conf");
     let mut f = fs::OpenOptions::new().append(true).open(&path)?;
-    writeln!(f, "\n# walshadow Phase 14 source overrides")?;
+    writeln!(f, "\n# walshadow bootstrap-CH source overrides")?;
     writeln!(f, "wal_level = logical")?;
     writeln!(f, "max_wal_senders = 4")?;
     Ok(())

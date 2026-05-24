@@ -1,4 +1,4 @@
-//! PRE5 item 3: `CatalogTracker::seed_from_source` against a live PG.
+//! `CatalogTracker::seed_from_source` against a live PG.
 //!
 //! Drives a temp cluster through a `VACUUM FULL pg_class` (rotates the
 //! mapped catalog's filenode above 16384) and confirms that
@@ -8,8 +8,8 @@
 //! Skipped silently when `initdb` is not on `$PATH`.
 //!
 //! Uses the `Shadow` lifecycle helpers as a generic PG cluster wrapper
-//! — this is "source PG" in the PRE5 sense, not shadow PG. The same
-//! binary serves both roles.
+//! — this stands in for the upstream "source PG", not shadow PG. The
+//! same binary serves both roles.
 
 use std::process::Command;
 use std::time::Duration;

@@ -1,4 +1,4 @@
-//! Phase 3: shadow PG lifecycle end-to-end.
+//! Shadow PG lifecycle end-to-end.
 //!
 //! Skipped silently if `initdb` is not on `$PATH` (CI sandboxes
 //! without PG, etc.). Run locally against any installed PG ≥ 12.

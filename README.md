@@ -5,13 +5,15 @@ into CDC for ClickHouse. Shadow PG runs as a recovery-mode standby fed
 by walshadow's walsender, exposing source's catalog state for the decoder
 without ever hosting user-heap data
 
-For design, see `plans/PLAN.md`; for diagrams, `architecture/README.md`;
-for the phased roadmap, `plans/INDEX.md`
+For design, see [plans/overview.md](plans/overview.md) and component
+docs indexed at [plans/INDEX.md](plans/INDEX.md); for diagrams,
+[architecture/README.md](architecture/README.md); for future work,
+[plans/future/INDEX.md](plans/future/INDEX.md)
 
 ## Quick start (docker)
 
 End-to-end demo wiring source PG → walshadow → ClickHouse. Step-by-step
-in `docker/DEMO.md`. Short form:
+in [docker/DEMO.md](docker/DEMO.md). Short form:
 
 ```
 git submodule update --init --recursive
@@ -21,7 +23,7 @@ docker compose -f docker/docker-compose.yml logs -f walshadow
 
 Wait for the `shadow caught up to bootstrap end_lsn` line, then drive
 changes on source and read them back from CH (full sequence in
-`docker/DEMO.md`)
+[docker/DEMO.md](docker/DEMO.md))
 
 ## Source PG requirements
 
@@ -85,7 +87,8 @@ walsender tuning, retention, etc.)
 
 ### CH emitter config
 
-TOML, see `docker/ch-config.toml` for a minimal example. Shape:
+TOML, see [docker/ch-config.toml](docker/ch-config.toml) for a minimal
+example. Shape:
 
 ```toml
 [ch]
@@ -130,7 +133,7 @@ wal-rs/             physical-WAL parser, separate submodule
 clickhouse-c-rs/    CH-Native client, separate submodule
 pgext/              walshadow Phase 9 decode-bridge extension (PGXS)
 architecture/       overview + internals diagrams
-plans/              phased design docs (PLAN.md is the baseline)
+plans/              component design docs (overview.md is the baseline)
 docker/             docker-compose demo + Dockerfile
 tests/              integration suite
 fixtures/wal/       golden WAL fixtures for offline tests

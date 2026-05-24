@@ -1,0 +1,329 @@
+# shadow
+
+## Purpose
+
+walshadow runs a co-located Postgres as schema-only catalog mirror &
+decode oracle. Shadow replays catalog WAL via streaming replication
+plus an archive fallback; decoder queries its catalog over libpq.
+Shadow never serves user-heap data, never gets DDL'd by walshadow,
+& never accepts writes from anywhere but the source WAL feed
+
+Two distinct surfaces this doc covers:
+
+- **lifecycle** — process management (`initdb`, conf, `pg_ctl`),
+  bootstrap restore, recovery-mode startup. Owned by `Shadow` in
+  `src/shadow.rs`. Production daemon defers supervision to systemd
+- **catalog API** — async libpq client + LRU + replay-LSN gate +
+  schema-event channel. Owned by `ShadowCatalog` in
+  `src/shadow_catalog.rs`. Consumed by the heap decoder & the CH
+  DDL applicator
+
+Lifecycle code is sync, shells out to PG binaries; catalog code is
+async, drives `tokio-postgres`. They share the data dir & port but
+otherwise compose at the daemon level
+
+## Lifecycle
+
+`Shadow` ([src/shadow.rs](../src/shadow.rs)) wraps `initdb`, `pg_ctl`,
+`psql` plus the on-disk plumbing (`postgresql.conf`,
+`standby.signal`, `restore_command`, `primary_conninfo`) behind one
+small struct. Bootstrap order:
+
+1. `initdb` — fresh empty cluster (~50 MiB, ~400 `pg_class` rows)
+2. `write_base_conf` — append walshadow knobs (port, unix socket,
+   `autovacuum = off`, `fsync = off`, `hot_standby = on`,
+   `wal_level = replica`, `max_wal_senders = 0`,
+   `listen_addresses = ''`)
+3. schema-only restore — see [bootstrap.md](bootstrap.md). Two paths:
+   `apply_schema_dump(sql)` pipes `pg_dump --schema-only` output
+   through `psql -f -`; `BASE_BACKUP` greenfield variant copies
+   source's catalog files directly. `apply_schema_dump` takes a
+   `&str` payload, not a source connection — outbound source
+   connection management lives in the daemon, not in this module
+4. `enable_standby_recovery(primary_conninfo)` — drops
+   `standby.signal`, appends `primary_conninfo = '<walsender>'` +
+   `restore_command = 'cp <filter_dir>/%f %p'` +
+   `recovery_target_timeline = 'latest'`. Standby (not recovery)
+   signal: continuous-feed topology requires staying in recovery
+   indefinitely
+5. `start` — `pg_ctl -w start`, blocks until postmaster accepts
+   connections (~600 ms on PG 18, standby mode)
+6. `wait_for_replay(target, timeout)` — polls
+   `pg_last_wal_replay_lsn() ≥ target`. `target = 0` waits for any
+   non-NULL observation (post-startup catch-up)
+7. `health` — recovery state + replay LSN + `pg_class` count +
+   `pg_proc` lookup. Single-probe corruption canary
+
+Probes route through `psql -tAXq -c` via the `psql_one` helper. The
+real libpq client lives in `ShadowCatalog`; mixing the two at
+this layer would duplicate connection state for no measurable win.
+Production deploys run shadow under systemd — walshadow does not
+babysit the postmaster
+
+## Three channels to shadow
+
+See [architecture/shadow_communication.dot](../architecture/shadow_communication.dot)
+for the rendered diagram. Three independent paths walshadow uses to
+talk to shadow:
+
+1. **libpq catalog queries** — `ShadowCatalog`'s tokio-postgres
+   client. One long-lived connection over unix socket, used for
+   `relation_at` / `relation_by_oid` / `wait_for_replay` /
+   `sweep_dropped`. Hot path for the decoder
+2. **walsender wire** — `ShadowStreamSink` framing
+   filtered-record bytes as `'w'` `XLogData` CopyData frames,
+   listener accepts shadow's walreceiver (`primary_conninfo` in
+   shadow's conf). Record-cadence WAL push, ms-scale. See
+   [source.md](source.md) for the source-side walsender walshadow
+   itself consumes
+3. **restore_command archive fallback** — `cp out/%f %p` pulls
+   completed 16 MiB segments from the filter output directory.
+   Segment-cadence, used by shadow's walreceiver when the wire
+   disconnects or shadow restarts past walshadow's segment-retention
+   window
+
+Channels (2) & (3) coexist by PG design: walreceiver tries
+`primary_conninfo` first, falls back to `restore_command` on connect
+error or end-of-WAL. Both feed shadow's startup recovery process
+which advances `pg_last_wal_replay_lsn()`; channel (1) reads that
+LSN as the gate input
+
+## ShadowCatalog
+
+Async libpq client over shadow's unix socket. Key surfaces:
+
+```rust
+pub async fn relation_at(&mut self, rfn: RelFileNode, at_lsn: u64)
+    -> Result<Arc<RelDescriptor>>;
+pub async fn relation_by_oid(&mut self, oid: Oid)
+    -> Result<Arc<RelDescriptor>>;
+pub async fn wait_for_replay(&mut self, target: u64) -> Result<u64>;
+pub fn invalidate(&mut self) -> u64;       // bump generation
+pub fn subscribe(&mut self) -> mpsc::UnboundedReceiver<SchemaEvent>;
+```
+
+Cache shape: `HashMap<RelFileNode, CacheEntry>` + mirror
+`HashMap<Oid, CacheEntry>`, each entry tagged with the generation
+at insertion. Lookup hits when `entry.generation ==
+self.generation`; mismatch falls through to a fresh fetch.
+Bounded by `ShadowCatalogConfig.max_entries` (default 4096),
+FIFO-evicted via an `EvictionIndex` BTreeMap (O(log n) victim
+select via `BTreeMap::pop_first`)
+
+`relation_at(rfn, at_lsn)` semantics:
+
+1. `drain_invalidations()` folds any pending epoch advance from the
+   shared `Arc<AtomicU64>` set by `set_invalidation_epoch`
+2. If `at_lsn > 0`, await `wait_for_replay(at_lsn)`: poll
+   `pg_last_wal_replay_lsn()` (with monotone last-observation cache
+   to skip re-polls when `seen >= target`) until shadow has replayed
+   past `at_lsn` or the timeout fires
+3. Re-`drain_invalidations()` post-await — a DDL observed during
+   the yield can have bumped the epoch
+4. Cache check; on miss, one SQL fan-out (`pg_class` + `pg_namespace`
+   + `pg_index` for replident + `pg_attribute` + `pg_type`) builds a
+   `RelDescriptor`, `insert`s it, returns the `Arc`
+
+`at_lsn = 0` skips the replay gate — used when the caller already
+proved freshness or the cache is being driven from a non-WAL source
+(bootstrap seed, tests). Single SQL round-trip per cache miss; a
+`RelFileNode` hits at most once per generation because hits short-
+circuit before any I/O, and a generation bump invalidates every
+entry uniformly. Filenode resolution goes through
+`pg_relation_filenode(oid)` so mapped catalogs (`pg_class`,
+`pg_attribute`, shared catalogs in `global/`) & regular tables
+resolve uniformly
+
+## Catalog invalidation
+
+Single `u64` generation counter, bumped on:
+
+- explicit `invalidate()` call by upstream `CatalogTracker` after
+  any catalog-touching WAL record (`pg_class`, `pg_attribute`,
+  `pg_type`, `pg_index`, relmap update, …)
+- transparent `reconnect()` (see below)
+- any DROP TABLE observed via the `pg_class_delete_epoch` sweep
+  path
+
+Coarse-fire by design: one DDL → one bump → every cache entry
+stale. Lazy eviction keeps `invalidate()` O(1) regardless of cache
+size. See the project memory note on PG version WAL skew
+for the deeper point: any `pg_class` write triggers invalidation,
+including hint-bit writes & autovacuum noise that don't change
+schema. Decoder fidelity does not imply cache freshness — the
+coarse predicate over-invalidates but cannot under-invalidate.
+Fast-path `rfn-may-be-stale` predicate deferred because streaming-fed
+shadow makes the post-bump refetch ms-cadence (see
+[future/risks.md](future/risks.md) for the open optimisation)
+
+`pg_class_delete_epoch` is a narrower DROP-TABLE counter so
+`sweep_dropped` can skip its SQL probe when no heap_delete fired
+since the prior sweep. ADD COLUMN / CREATE INDEX no longer drive
+per-commit shadow PG sweeps at pgbench rate
+
+## Reconnect resilience
+
+`ShadowCatalog` stashes `conninfo` at construct time; if the
+underlying tokio-postgres client closes (shadow bounce, OOM kill,
+systemd restart) the catalog rebuilds transparently:
+
+- `reconnect()` & `ensure_open()` are **private** async fns on
+  `ShadowCatalog`. Earlier design notes presented them as `pub` for
+  illustration; the implementation kept them internal because every
+  external call already routes through `query_*_retry` helpers which
+  bracket SQL with `ensure_open` + one-shot retry on
+  `client.is_closed()`
+- each successful reconnect bumps `generation` (every cached entry
+  treated stale) & resets `last_replay_lsn = None` (avoid stale
+  monotone-tracking shortcut against a freshly-restarted standby)
+- `with_transient_retry(timeout, async-closure)` free function wraps
+  any catalog op in exponential backoff (default 100 ms initial /
+  1 s ceiling, capped by `replay_timeout`). `is_transient` matches
+  every `CatalogError::Pg(_)` variant — fine-grained classification
+  is a follow-up if a workload measures spurious retries
+
+Single retry inside the query helpers, multi-attempt budgeted retry
+outside: keeps cache bookkeeping unaware of in-flight retries, &
+keeps the backoff policy varyable per call site
+
+## RelDescriptor
+
+What the catalog produces per relation:
+
+- `rfn: RelFileNode`, `oid: Oid`, `namespace_oid`, `namespace_name`,
+  `name`, `qualified_name: Arc<str>` (pre-formatted for hot-path
+  routing)
+- `kind` (`pg_class.relkind`: `'r'` table / `'p'` partitioned / etc),
+  `persistence` (`'p'` / `'u'` / `'t'`)
+- `replident: ReplIdent` — resolved from `pg_class.relreplident`
+  through `pg_index`: `Default { pk_attnums }`, `Nothing`, `Full`,
+  `UsingIndex { index_oid, key_attnums }`. Carries the indexed-
+  attnum list inline so old-tuple decode under
+  `XLH_UPDATE_CONTAINS_OLD_KEY` resolves without a second round-trip
+- `attributes: Vec<RelAttr>` — per column: `attnum`, `name`,
+  `type_oid`, `typmod`, `not_null`, `dropped`, `type_name`,
+  `type_byval`, `type_len`, `type_align`, `type_storage`,
+  `missing_text` (PG 11+ fast-path `ADD COLUMN ... DEFAULT k`,
+  carried as the typoutput rendering)
+
+Dropped columns stay in `attributes` (`dropped = true`) because the
+heap-tuple decoder needs them to walk the null bitmap correctly;
+consumers filter at use-site. See [decoder.md](decoder.md) for the
+consumer side
+
+## ShadowStreamSink
+
+Shadow-stream sink composing alongside `DirSegmentSink` &
+`BufferingDecoderSink` on `WalStream`. Per-record dispatch:
+`on_wire_chunk(start_lsn, bytes)` ships rewritten record bytes plus
+the page-header & inter-record padding bytes that precede them
+(walreceiver rejects records that arrive at non-page-aligned LSNs
+without their page headers — "invalid magic 0000"). CopyData
+wrapping done at enqueue via `wrap_copy_data` so the listener
+concatenates multiple frames in one `write_all`
+
+Per-connection state:
+- `dispatched_lsn` (mirrors source's `write_lsn`)
+- `flush_lsn`, `apply_lsn` (from inbound `'r'` standby status frames)
+- `closing` (set on write error, drops slot on next sweep)
+
+Aggregate view (`ShadowStreamState::aggregate() → AggregateLsn`)
+exposes `min_flush_lsn`, `min_apply_lsn`, `active_connections`,
+`dropped_total` for the cursor write loop + metrics
+
+Backpressure: per-connection send queue caps at `slow_threshold`
+bytes; overflow drops the socket & lets shadow reconnect via the
+archive (`restore_command`) path. `server_wal_end` advanced only to
+bytes already enqueued — advertising a higher value crashes PG 18's
+walreceiver on the still-zero page it tries to read
+
+Segment cadence preserved on top of record cadence:
+`DirSegmentSink` still writes one 16 MiB segment + manifest per
+boundary. The wire is the hot path, segments are the archive
+fallback + durable artifact
+
+## SchemaEvent channel
+
+`ShadowCatalog::subscribe() ->
+mpsc::UnboundedReceiver<SchemaEvent>`. Three event shapes:
+
+- `Added { desc }` — first time the catalog learns an oid (CREATE
+  TABLE, post-DROP re-CREATE, `seed_from_source` bootstrap)
+- `Changed { old, new, diff: SchemaDiff }` — refetch returned a
+  non-trivial diff against the previously-known shape. `SchemaDiff`
+  carries `added_columns`, `dropped_columns`, `renamed_columns`,
+  `type_changes` (renames detected by attnum-match + name-diff
+  heuristic)
+- `Dropped { oid, qualified_name }` — emitted by `emit_dropped(oid)`
+  (called from `pg_class_decoder` heap_delete branch) or by
+  `sweep_dropped` poll path
+
+`prev_known: HashMap<Oid, Arc<RelDescriptor>>` retains last-seen
+descriptors across generation bumps so the diff source-of-truth
+survives invalidation. Channel is consumed by the CH DDL
+applicator inside the worker task — see [emitter.md](emitter.md)
+
+## What's NOT shipped yet from namespace mapping
+
+Channel is **unbounded** (`mpsc::unbounded_channel`); earlier plan
+text spoke of `mpsc::channel(64)` for back-pressure but the
+implementation uses unbounded send because the applicator runs in
+the same worker task as the decoder, so back-pressure surfaces
+naturally as task-local await depth rather than channel saturation
+
+`NamespaceMapping` ([src/ch_emitter.rs](../src/ch_emitter.rs)) ships
+`auto_create: bool` only. Plan additionally lists `type_overrides`,
+`order_by_default`, `engine_default` — none of those fields landed.
+Accompanying `watch::Receiver<Arc<ResolvedConfig>>` resolver refactor
+also did not land — emitter still consumes `Arc<RwLock<HashMap>>`
+on SIGHUP. Closing those gaps is prerequisite for
+runtime-config-from-PG. See
+[future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
+— CLI > WAL-config > TOML precedence merge depends on the resolver
+substrate landing first
+
+## Pitfalls
+
+- **autovacuum suspended in recovery.** Shadow runs continuously in
+  recovery, so autovacuum cannot reclaim catalog-index bloat from
+  busy-DDL workloads. Default is `autovacuum = off`. Bloat
+  resolution: operator promotes shadow briefly, lets autovacuum
+  run, re-attaches. Not automated
+- **wal_level = logical required on source.** Shadow needs full old-
+  tuple bytes on user-heap UPDATE/DELETE to drive
+  `XLH_UPDATE_CONTAINS_OLD_KEY` decode; `wal_level = replica` is
+  insufficient. Shadow itself runs at `wal_level = replica` because
+  it never emits logical decoding
+- **process supervision is out of scope.** Production deploys run
+  shadow under systemd, which owns crash recovery & restart
+  policy. `Shadow::start` / `stop` are bootstrap & test helpers;
+  the daemon does not babysit the postmaster. `ShadowCatalog`'s
+  reconnect path absorbs supervisor-driven bounces transparently
+- **PG version skew on cross-WAL replay.** Shadow's PG version must
+  match (or exceed in compatible ways) the source's. See
+  the PG 17 repro docker memory note
+  for the PG-17-specific repro layout
+- **WAL struct alignment in body walker.** Body block-id sentinels
+  255/254/253/252 must all be handled; missing 252 manifests as
+  `BadBlockId` after SAVEPOINT writes. See
+  the wal-rs block-id sentinels memory note
+- **cross-segment user-heap records.** Spanning records must
+  NOOP-rewrite in both segments; otherwise shadow PG PANICs on
+  missing pages. See the cross-segment record memory note
+
+## Cross-links
+
+- [bootstrap.md](bootstrap.md) — initdb path vs `BASE_BACKUP` path,
+  `apply_schema_dump` consumer, `seed_from_source` bootstrap fan-out
+- [decoder.md](decoder.md) — `relation_at` consumer, heap-tuple
+  decode against `RelDescriptor`
+- [emitter.md](emitter.md) — `SchemaEvent` channel downstream
+  consumer (`ch_ddl::DdlApplicator`), `await_ready` ordering gate
+- [source.md](source.md) — walsender walshadow consumes from
+  source; symmetry with the walsender walshadow exposes to shadow
+- [future/risks.md](future/risks.md) — coarse-fire generation
+  invalidation, deferred `rfn-may-be-stale` fast-path predicate
+- [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
+  — `ResolvedConfig` + `watch` refactor sequencing
+
+File written: [plans/shadow.md](shadow.md)

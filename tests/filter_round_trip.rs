@@ -185,7 +185,7 @@ fn oltp_workload_keeps_well_under_one_percent() {
     assert_eq!(noops as u64, manifest.stats.dropped);
 }
 
-/// PRE5b10 item 6: captured-fixture cross-check for the synthetic
+/// Captured-fixture cross-check for the synthetic
 /// `xlog_switch_record_passes_through_filter` unit test in
 /// `src/filter_segment.rs`. A real PG `pg_switch_wal()` lands an
 /// XLOG_SWITCH (rmgr 0, info 0x40) in the WAL segment; the filter
@@ -226,7 +226,7 @@ fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
     );
 }
 
-/// PRE5b3 regression: pg_class UPDATE records from `VACUUM FULL` on a
+/// Prefix-compression regression: pg_class UPDATE records from `VACUUM FULL` on a
 /// non-mapped catalog are prefix-compressed past the OID column. The
 /// decoder must signal `pg_class_writes_oid_in_prefix` and must NOT
 /// tick `pg_class_writes_undecoded` (which would mean the WAL was

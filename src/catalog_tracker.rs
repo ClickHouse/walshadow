@@ -262,7 +262,7 @@ impl CatalogTracker {
                 // by PG version + record shape (PG 17 ALTER ADD COLUMN
                 // emits an HOT_UPDATE on pg_class whose new tuple omits
                 // the relnatts-bearing prefix). Catalog cache must
-                // still drop: silent skip caused phase8_add_column to
+                // still drop: silent skip caused add-column drills to
                 // ship c=NULL for post-ALTER rows decoded against the
                 // stale 2-column descriptor.
                 self.pg_class_writes_undecoded += 1;

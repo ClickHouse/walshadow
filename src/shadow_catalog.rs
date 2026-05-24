@@ -32,9 +32,8 @@
 //! [`invalidate`](ShadowCatalog::invalidate)) takes `&mut self`. The
 //! cache state is technically interior-mutable (an `RwLock` over the
 //! two `HashMap`s + atomics for stats would suffice for the hit path)
-//! but [PLAN.md §Phase 5](../plans/PLAN.md)'s spec'd `&self` shape is
-//! deferred — see [PRE5b7](../plans/PRE5b7.md). Callers that need
-//! concurrent access (drain task, [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink),
+//! but the `&self` shape is deferred. Callers that need concurrent
+//! access (drain task, [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink),
 //! oracle) wrap the catalog in `Arc<tokio::sync::Mutex<_>>` at the daemon
 //! level and share clones. Single-task lookups today are cheap enough
 //! that mutex serialisation costs nothing measurable; the lock-free
@@ -301,7 +300,7 @@ impl Default for ShadowCatalogConfig {
             // apply lags pump's dispatch by O(records), each
             // `wait_for_replay` cache miss costs one round-trip
             // instead of a fixed 50 ms tick, which dominated the
-            // worker's throughput in `phase14_pgbench_acceptance`.
+            // worker's throughput in `pgbench_acceptance`.
             replay_poll: Duration::from_millis(1),
             replay_timeout: Duration::from_secs(30),
             max_entries: Some(4096),

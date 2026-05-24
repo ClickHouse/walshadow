@@ -1,6 +1,7 @@
-//! Phase 12 — file-streaming backup-source trait.
+//! File-streaming backup-source trait.
 //!
-//! See [PHASE12plan.md](../plans/PHASE12plan.md) for design rationale.
+//! See [plans/bootstrap.md](../plans/bootstrap.md) for the BackupSource
+//! trait surface and orchestrator wiring.
 //!
 //! The trait lifts above tar: a base backup is a stream of files with
 //! cluster-relative paths, regardless of wire encoding. Two production

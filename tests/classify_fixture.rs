@@ -1,12 +1,12 @@
 //! Integration test against captured WAL fixture.
 //!
-//! Phase 0 fixture is captured by `fixtures/wal/classify/capture.sh`
+//! Classifier fixture is captured by `fixtures/wal/classify/capture.sh`
 //! into `fixtures/wal/classify/segments/`. The bytes are not checked
 //! in (see .gitignore there); regenerate locally to run this test.
 //!
 //! Skipped silently if no captured segment is present. Local runs
-//! after `capture.sh` get the catalog-fraction-bound assertion that
-//! Phase 0 of PLAN.md targets.
+//! after `capture.sh` get the catalog-fraction-bound assertion the
+//! classifier targets.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -78,12 +78,12 @@ fn catalog_fraction_under_workload_is_bounded() {
         100.0 * summary.catalog_fraction()
     );
 
-    // Sanity bound. Phase 0 workload is intentionally DDL-heavy in a
+    // Sanity bound. Capture workload is intentionally DDL-heavy in a
     // small window so catalog fraction sits around 85–95% on a real
     // capture (validated against docker:14, docker:18, and local PG 18).
     // The < 100% check just confirms the classifier isn't bucketing
-    // every record as catalog. Phase 1 introduces a steady-state OLTP
-    // workload that re-tightens this toward "well under 1%"
+    // every record as catalog. A steady-state OLTP capture re-tightens
+    // this toward "well under 1%"
     assert!(
         summary.records >= 100,
         "fixture too small: {} records",

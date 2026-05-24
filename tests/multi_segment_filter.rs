@@ -1,4 +1,4 @@
-//! PRE5b1 regression: `CatalogTracker` state must survive a segment
+//! Cross-segment regression: `CatalogTracker` state must survive a segment
 //! boundary so that an `XLOG_RELMAP_UPDATE` (or a decoded pg_class
 //! heap-tuple) in segment N can authorise a heap record in segment
 //! N+1 against the rewritten filenode.
@@ -241,13 +241,13 @@ async fn catalog_tracker_state_survives_segment_boundary() {
     assert_eq!(records.records[1].decision, Decision::Keep);
 }
 
-/// PRE5b5: every record bracketed by one BEGIN…COMMIT carries the
+/// Every record bracketed by one BEGIN…COMMIT carries the
 /// same `xact_id` in its parsed header. Synthetic version: pack three
 /// records with `xid = 42` plus a stray xid=99 record (different
 /// transaction) into one segment, push through `WalStream`, assert
 /// the parsed `Record.parsed.header.xact_id` arrives at the sink
-/// untouched. Pre-PRE5b5 `RecordEvent` carried no xact_id at all, so
-/// this assertion is not satisfiable on the old shape.
+/// untouched. Earlier `RecordEvent` carried no xact_id at all, so
+/// this assertion was not satisfiable on the old shape.
 #[tokio::test(flavor = "current_thread")]
 async fn records_in_one_xact_share_xact_id_through_stream() {
     const XID: u32 = 42;
@@ -369,7 +369,7 @@ impl RecordSink for FailOnNth {
     }
 }
 
-/// PRE5b6: build a four-record segment, push it through `WalStream`
+/// Composite-sink fan-out: build a four-record segment, push it through `WalStream`
 /// with a `CompositeRecordSink` wrapping (a `CollectingRecordSink`
 /// equivalent + a `CountingRecordSink` equivalent), assert both
 /// observers see every record in source order.
@@ -430,12 +430,12 @@ async fn composite_sink_fans_out_to_all_inner_sinks() {
     }
 }
 
-/// PRE5b6: a mid-chain inner sink errors on the second record.
+/// Composite short-circuit: a mid-chain inner sink errors on the second record.
 /// `WalStream::push` surfaces it as `WalStreamError::Sink`. The sink
 /// *before* the failing one observed both records (it ran first); the
 /// sink *after* the failing one observed only the first record because
 /// `CompositeRecordSink` short-circuits on inner `Err`. Stream is
-/// considered poisoned post-error per PRE5b10 item 4.
+/// considered poisoned post-error.
 #[tokio::test(flavor = "current_thread")]
 async fn composite_sink_propagates_inner_error_and_short_circuits() {
     let recs: Vec<Vec<u8>> = (0..3)
@@ -488,7 +488,7 @@ async fn composite_sink_propagates_inner_error_and_short_circuits() {
     assert_eq!(before.load(Ordering::Relaxed), 2);
     assert_eq!(fail_seen.load(Ordering::Relaxed), 2);
     assert_eq!(after.load(Ordering::Relaxed), 1);
-    // PHASE13 dispatch ordering: per-record `record_sink` fires
+    // Dispatch ordering: per-record `record_sink` fires
     // before segment_sink lands. A record-sink error poisons the
     // stream mid-segment, so segment_sink never fires for this
     // segment. The stream is poisoned; recovery is a fresh

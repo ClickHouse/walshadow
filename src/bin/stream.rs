@@ -276,9 +276,9 @@ struct Args {
     /// `wait_for_replay` lags one batch behind the pump).
     #[arg(long, default_value_t = DEFAULT_QUEUEING_BATCH_SIZE)]
     decoder_batch_size: usize,
-    /// Phase 6 xact / TOAST buffer spill dir. Created on boot if
-    /// missing; wiped clean every startup per the
-    /// [PHASE6disk.md](../../plans/PHASE6disk.md) crash-recovery note.
+    /// Xact / TOAST buffer spill dir. Created on boot if missing;
+    /// wiped clean every startup per the crash-recovery contract in
+    /// [plans/xact.md](../../plans/xact.md).
     #[arg(long)]
     spill_dir: PathBuf,
     /// In-memory budget for the xact buffer in bytes. Defaults match
@@ -905,7 +905,7 @@ async fn run(args: Args) -> Result<()> {
     // is unrecoverable: post-conn frames carry LSNs past walreceiver's
     // expected continuity, shadow's apply stalls, and the catalog
     // gate inside `BufferingDecoderSink` times out (the failure mode
-    // `phase14_pgbench_acceptance` and `phase14_kill_restart`
+    // `pgbench_acceptance` and `kill_restart`
     // surfaced). Cap the wait so operators running without a streaming
     // shadow still boot cleanly — they take the `restore_command`
     // archive path instead.

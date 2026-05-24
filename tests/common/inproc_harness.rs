@@ -1,9 +1,9 @@
-//! Shared in-process scaffolding for phase 14 placeholder tests.
+//! Shared in-process scaffolding for inline DML/DDL drill tests.
 //!
-//! Mirrors the harness phase8_e2e.rs builds inline: source PG +
+//! Mirrors the harness `pipeline_e2e.rs` builds inline: source PG +
 //! basebackup-cloned shadow PG in standby mode, a CH server, the
 //! walshadow WAL pipeline driven from the source's replication
-//! protocol, and a workload driver. Phase14 test bodies wire schema +
+//! protocol, and a workload driver. Test bodies wire schema +
 //! mapping + workload + assertions; this module owns the bootstrap +
 //! pump loop.
 //!
@@ -12,7 +12,7 @@
 //! test binary.
 //!
 //! Scope: in-process pipeline only. The daemon-binary-spawn drills
-//! (phase14_bootstrap_*, kill_restart, pgbench_acceptance) keep their
+//! (bootstrap_*_ch, kill_restart, pgbench_acceptance) keep their
 //! own `bootstrap_ch_fixture.rs`.
 
 #![allow(dead_code)]
@@ -100,7 +100,7 @@ pub fn make_pg(tmp: &tempfile::TempDir, name: &str, port: u16) -> Shadow {
 pub fn append_source_conf(sh: &Shadow) {
     let path = sh.config().data_dir.join("postgresql.conf");
     let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-    writeln!(f, "\n# walshadow phase14 inproc source overrides").unwrap();
+    writeln!(f, "\n# walshadow inproc source overrides").unwrap();
     writeln!(f, "wal_level = logical").unwrap();
     writeln!(f, "max_wal_senders = 4").unwrap();
 }
@@ -150,7 +150,7 @@ pub fn pg_basebackup(source: &Shadow, dest: &Path) -> Result<()> {
 pub fn rewrite_for_shadow(data_dir: &Path, port: u16, socket_dir: &Path) -> Result<()> {
     let conf = data_dir.join("postgresql.conf");
     let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
-    writeln!(f, "\n# walshadow phase14 inproc shadow overrides")?;
+    writeln!(f, "\n# walshadow inproc shadow overrides")?;
     writeln!(f, "port = {port}")?;
     writeln!(f, "unix_socket_directories = '{}'", socket_dir.display())?;
     writeln!(f, "listen_addresses = ''")?;
@@ -165,7 +165,7 @@ pub fn enable_recovery(data_dir: &Path, restore_from: &Path, walsender_port: u16
     fs::write(data_dir.join("standby.signal"), b"")?;
     let conf = data_dir.join("postgresql.conf");
     let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
-    writeln!(f, "\n# walshadow phase14 inproc recovery")?;
+    writeln!(f, "\n# walshadow inproc recovery")?;
     writeln!(
         f,
         "primary_conninfo = 'host=127.0.0.1 port={walsender_port} user=walshadow application_name=shadow sslmode=disable'",
@@ -296,7 +296,7 @@ impl Drop for ChServer {
 
 // ---------------------------------------------------------------------------
 // Daemon sink chain (clone of bin/stream.rs::DaemonSinks). Kept here so
-// each phase14 test owns dispatch order without re-exporting
+// each inproc test owns dispatch order without re-exporting
 // daemon-private types.
 // ---------------------------------------------------------------------------
 
@@ -445,7 +445,7 @@ pub struct BuildPipelineArgs<'a> {
     pub ch_tcp_port: u16,
     pub mappings: Vec<TableMappingSpec>,
     pub app_name: &'a str,
-    /// PHASE15 — when set, the pipeline wires a CH DDL applicator on a
+    /// DDL replication — when set, the pipeline wires a CH DDL applicator on a
     /// second TCP connection + subscribes the decoder to the catalog's
     /// schema-event channel. Auto-create namespaces flagged in
     /// `namespaces` get `CREATE TABLE` on first sight; per-table
@@ -579,7 +579,7 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
         Emitter::new(emitter_cfg.clone(), catalog.clone(), tcp).expect("init emitter");
     let mapping_handle = emitter.mapping_handle();
 
-    // PHASE15 wiring — second CH TCP for the DDL applicator + decoder
+    // DDL wiring — second CH TCP for the DDL applicator + decoder
     // subscription to the catalog's schema-event channel.
     let mut schema_rx_opt = None;
     if ddl.is_some() {

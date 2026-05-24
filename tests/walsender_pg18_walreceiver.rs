@@ -1,4 +1,4 @@
-//! PHASE13 §2 protocol validation against a real PG18 walreceiver.
+//! Shadow-stream protocol validation against a real PG18 walreceiver.
 //!
 //! Spins up:
 //! 1. A fresh PG18 cluster via `initdb` in a tempdir (primary source).
@@ -78,8 +78,8 @@ async fn pg_walreceiver_connects_and_runs_identify_system() {
         return;
     }
 
-    // Spin up the walsender server first (bootstrap barrier per
-    // PHASE13 §4) so PG's walreceiver doesn't hit
+    // Spin up the walsender server first (bootstrap-barrier
+    // ordering) so PG's walreceiver doesn't hit
     // wal_retrieve_retry_interval on first start.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let walsender_port = listener.local_addr().unwrap().port();
@@ -124,7 +124,7 @@ async fn pg_walreceiver_connects_and_runs_identify_system() {
         return;
     }
     let conninfo = format!(
-        "host=127.0.0.1 port={walsender_port} user=walshadow application_name=phase13test sslmode=disable"
+        "host=127.0.0.1 port={walsender_port} user=walshadow application_name=walreceiver_check sslmode=disable"
     );
     let socket_str = standby_socket_dir.to_str().unwrap();
     // Pick a free TCP port for the standby's listener so it doesn't
@@ -136,7 +136,7 @@ async fn pg_walreceiver_connects_and_runs_identify_system() {
         p
     };
     let conf = format!(
-        "\n# phase13 walreceiver validation\n\
+        "\n# walreceiver validation\n\
          primary_conninfo = '{conninfo}'\n\
          hot_standby = on\n\
          wal_level = replica\n\

@@ -3,8 +3,8 @@
 //! Generates a synthetic 16 MiB segment full of heap-insert records,
 //! pumps it through `WalStream::push` with progressively heavier sink
 //! combinations, and prints records-per-second + MB/s for each. Lets
-//! us isolate which sink dominates the per-record cost the phase14
-//! streaming tests trip over.
+//! us isolate which sink dominates the per-record cost the bootstrap
+//! and kill-restart streaming tests trip over.
 //!
 //! Not a CI assertion (results are hardware-dependent). Run with
 //! `cargo test --release --test wal_stream_throughput -- --nocapture`.

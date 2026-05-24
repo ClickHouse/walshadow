@@ -1,7 +1,7 @@
 //! Feed a captured WAL segment through `WalStream` at varying chunk
 //! sizes — one byte at a time, prime-sized chunks, single bulk push —
 //! and assert the per-record event sequence is identical across all
-//! paths. With PHASE13's streaming walker, records yield as their last
+//! paths. With the streaming walker, records yield as their last
 //! byte lands; this test pins the contract that record sequence and
 //! segment bytes are cadence-invariant.
 //!
@@ -166,7 +166,7 @@ async fn bulk_and_chunked_emit_identical_segment_bytes() {
     );
 }
 
-/// PHASE13 §1+§3: a `ShadowStreamSink` installed on `WalStream`
+/// Shadow-stream sink: a `ShadowStreamSink` installed on `WalStream`
 /// dispatches the full byte-exact wire stream. Aggregate dispatched
 /// bytes equal the segment's bytes.
 #[tokio::test(flavor = "current_thread")]

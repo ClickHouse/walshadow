@@ -1,4 +1,4 @@
-//! Phase 4: `ShadowCatalog` end-to-end against a live shadow PG.
+//! `ShadowCatalog` end-to-end against a live shadow PG.
 //!
 //! Skipped silently if `initdb` is not on `$PATH`. Each test spins up a
 //! fresh data directory under a tempdir; tests pick non-overlapping
@@ -503,9 +503,9 @@ async fn nonexistent_filenode_errors_not_found() {
     matches!(err, CatalogError::NotFoundByFilenode(_));
 }
 
-/// PRE5b8: `RelDescriptor::replident` carries the resolved
+/// Replica-identity carriage: `RelDescriptor::replident` carries the resolved
 /// `pg_class.relreplident` and, for `USING INDEX`, the index oid plus
-/// `pg_index.indkey` attnum list. Phase 5's decoder reads both off the
+/// `pg_index.indkey` attnum list. Heap decoder reads both off the
 /// descriptor to interpret `XLH_UPDATE_CONTAINS_OLD_KEY` payloads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replident_matrix_default_nothing_full_index() {
@@ -618,7 +618,7 @@ async fn replident_matrix_default_nothing_full_index() {
     );
 }
 
-/// PRE5b7 sanity check: with the catalog wrapped in
+/// Arc-mutex sanity check: with the catalog wrapped in
 /// `Arc<tokio::sync::Mutex<_>>` at the daemon level, two tasks holding
 /// clones of the same `Arc` serialise cleanly across `relation_at`.
 /// Validates the wrap shape `BufferingDecoderSink` relies on, not the

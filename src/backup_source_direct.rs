@@ -1,4 +1,4 @@
-//! Phase 12 — Direct base-backup source.
+//! Direct base-backup source.
 //!
 //! Wraps wal-rs's `pg::replication::base_backup::run_base_backup` to
 //! drive walshadow's file-streaming [`BackupSource`] trait. Issues
@@ -9,11 +9,11 @@
 //! protocol order; they appear naturally as `FileKind::Symlink`
 //! entries.
 //!
-//! Single-pass design: the [PHASE12plan.md](../plans/PHASE12plan.md)
-//! design seeds the page-walk
+//! Single-pass design: seed the page-walk
 //! [`CatalogMap`](crate::backup_page_walk::CatalogMap) from source PG
 //! via a sidecar SQL query *before* this runs, so all routing
-//! decisions are known by the time bytes land.
+//! decisions are known by the time bytes land. See
+//! [plans/bootstrap.md](../plans/bootstrap.md).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
