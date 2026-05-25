@@ -252,8 +252,7 @@ closing-all would break cross-INSERT pipeline
 5. Drain to `EndOfStream` / `Exception`
 6. Bump `stats.truncates_emitted`
 
-`RESTART_SEQS` flag is ignored — sequence-state replication is
-deferred, see [future/sequence_state.md](future/sequence_state.md).
+`RESTART_SEQS` flag is ignored — sequence state isn't replicated.
 PG's `TRUNCATE … RESTART IDENTITY` arrives as same `HeapOp::Truncate`
 with no flag distinction at emitter layer; bit lives on PG xlog record
 but doesn't propagate through `DecodedHeap`
@@ -360,7 +359,5 @@ reconnect for DDL connection
 - [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
   — runtime-config substrate; `ResolvedConfig` + `watch::Receiver`
   shape partial namespace-mapping work needs to land first
-- [future/sequence_state.md](future/sequence_state.md) — TRUNCATE
-  RESTART_SEQS + nextval replication, deferred
 - [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md) —
   spill-buffered re-emit for extended CH outages

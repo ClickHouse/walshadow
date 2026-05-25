@@ -8,8 +8,6 @@ here as they surface; promote into `plans/` when they land
 * [shadow_schema_export.md](shadow_schema_export.md) — shadow PG as schema-only catalog donor to third-party clusters
 * [sync_commit_witness.md](sync_commit_witness.md) — walshadow as RPO=0 durability standby
 * [two_phase_commit.md](two_phase_commit.md) — `XLOG_XACT_PREPARE` handling and gxid-keyed buffer
-* [sequence_state.md](sequence_state.md) — CH-side `last_value` reconstruction
-* [cross_table_ordering.md](cross_table_ordering.md) — cross-table WAL ordering inside an xact
 * [ch_bounce_recovery.md](ch_bounce_recovery.md) — deeper re-emit-from-spill on retry-budget exhaustion
 * [risks.md](risks.md) — measurement-deferred risks and open questions
 * [parked.md](parked.md) — small operational polish + cross-major fixtures + skipped-test drive
