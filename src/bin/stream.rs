@@ -31,7 +31,6 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -380,27 +379,11 @@ struct Args {
     bootstrap_shadow_replay_timeout: u64,
 }
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<()> {
     let args = Args::parse();
     init_tracing();
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("walshadow-stream: tokio runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match rt.block_on(run(args)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("walshadow-stream: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
+    run(args).await
 }
 
 /// Wire `tracing` once per process. `RUST_LOG` configures the filter;
@@ -557,7 +540,8 @@ async fn run(args: Args) -> Result<()> {
         .context("walsender local_addr")?;
     drop(walsender_listener); // spawn_listener re-binds at the same addr
     if let Some(path) = &args.walsender_port_file {
-        std::fs::write(path, format!("{}\n", walsender_addr))
+        tokio::fs::write(path, format!("{}\n", walsender_addr))
+            .await
             .with_context(|| format!("write walsender port file {}", path.display()))?;
     }
     let _walsender_task = walshadow::shadow_stream::spawn_listener(
@@ -1679,7 +1663,8 @@ async fn run_bootstrap(
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o700);
-        fs::set_permissions(&shadow_data_dir, perms)
+        tokio::fs::set_permissions(&shadow_data_dir, perms)
+            .await
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 

@@ -11,11 +11,11 @@
 //! 5. All `Decision::Drop` records show as `XLOG_NOOP` (rmid=0, info=0x20)
 //!    in the filtered output.
 
-use std::fs::File;
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
+use tokio::io::AsyncReadExt;
+use wal_rs::pg::wal::segment_file::open_segment_file;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::filter::Filter;
 use walshadow::filter_segment::filter_segment;
@@ -40,21 +40,10 @@ fn xlog_switch_segment() -> PathBuf {
         .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.gz")
 }
 
-fn decompress_gz(path: &PathBuf) -> std::io::Result<Vec<u8>> {
-    let mut child = Command::new("gunzip")
-        .arg("-c")
-        .arg(path)
-        .stdout(Stdio::piped())
-        .spawn()?;
+async fn load_segment(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
+    let (_seg, mut r) = open_segment_file(path).await?;
     let mut out = Vec::new();
-    child.stdout.as_mut().unwrap().read_to_end(&mut out)?;
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(std::io::Error::other(format!(
-            "gunzip {:?} failed: {status}",
-            path
-        )));
-    }
+    r.read_to_end(&mut out).await?;
     Ok(out)
 }
 
@@ -83,14 +72,14 @@ fn parse_all_records(bytes: &[u8]) -> anyhow::Result<(usize, usize)> {
     Ok((total, noops))
 }
 
-#[test]
-fn filtered_segment_round_trips_through_wal_parser() {
+#[tokio::test]
+async fn filtered_segment_round_trips_through_wal_parser() {
     let seg = fixture_segment();
     if !seg.exists() {
         eprintln!("skip: no captured segment at {:?}", seg);
         return;
     }
-    let bytes = decompress_gz(&seg).expect("gunzip fixture");
+    let bytes = load_segment(&seg).await.expect("load fixture");
     let mut filter = Filter::new();
     let (out, manifest, parsed) = filter_segment(&bytes, "fixture", &mut filter).expect("filter");
     assert_eq!(
@@ -143,8 +132,8 @@ fn filtered_segment_round_trips_through_wal_parser() {
 /// of records. `fixtures/wal/filter/capture.sh` runs CREATE TABLE +
 /// INSERT in segment 1, then `pg_switch_wal()`, then heavy DML —
 /// segment 2 is the OLTP-only slice this test exercises.
-#[test]
-fn oltp_workload_keeps_well_under_one_percent() {
+#[tokio::test]
+async fn oltp_workload_keeps_well_under_one_percent() {
     let seg = oltp_segment();
     if !seg.exists() {
         eprintln!(
@@ -153,7 +142,7 @@ fn oltp_workload_keeps_well_under_one_percent() {
         );
         return;
     }
-    let bytes = decompress_gz(&seg).expect("gunzip oltp fixture");
+    let bytes = load_segment(&seg).await.expect("load oltp fixture");
     let mut filter = Filter::new();
     let (out, manifest, _parsed) =
         filter_segment(&bytes, "oltp", &mut filter).expect("filter oltp");
@@ -191,8 +180,8 @@ fn oltp_workload_keeps_well_under_one_percent() {
 /// XLOG_SWITCH (rmgr 0, info 0x40) in the WAL segment; the filter
 /// must keep it byte-identically because shadow's recovery state
 /// machine relies on its presence at the segment tail.
-#[test]
-fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
+#[tokio::test]
+async fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
     use wal_rs::pg::walparser::RmId;
     const XLOG_SWITCH: u8 = 0x40;
     let seg = xlog_switch_segment();
@@ -203,7 +192,7 @@ fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
         );
         return;
     }
-    let bytes = decompress_gz(&seg).expect("gunzip xlog_switch fixture");
+    let bytes = load_segment(&seg).await.expect("load xlog_switch fixture");
     let mut filter = Filter::new();
     let (out, manifest, _parsed) = filter_segment(&bytes, "xsw", &mut filter).expect("filter");
 
@@ -231,8 +220,8 @@ fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
 /// decoder must signal `pg_class_writes_oid_in_prefix` and must NOT
 /// tick `pg_class_writes_undecoded` (which would mean the WAL was
 /// genuinely malformed, masking the prefix-compression hole).
-#[test]
-fn vacuum_full_pg_depend_ticks_oid_in_prefix_not_undecoded() {
+#[tokio::test]
+async fn vacuum_full_pg_depend_ticks_oid_in_prefix_not_undecoded() {
     let seg = vacuum_full_pg_depend_segment();
     if !seg.exists() {
         eprintln!(
@@ -241,7 +230,7 @@ fn vacuum_full_pg_depend_ticks_oid_in_prefix_not_undecoded() {
         );
         return;
     }
-    let bytes = decompress_gz(&seg).expect("gunzip vacuum-full fixture");
+    let bytes = load_segment(&seg).await.expect("load vacuum-full fixture");
     let mut filter = Filter::new();
     let (_out, manifest, _parsed) = filter_segment(&bytes, "vac", &mut filter).expect("filter");
 
@@ -268,25 +257,22 @@ fn vacuum_full_pg_depend_ticks_oid_in_prefix_not_undecoded() {
     );
 }
 
-#[test]
-fn writes_filtered_segment_and_manifest_via_cli() {
+#[tokio::test]
+async fn writes_filtered_segment_and_manifest_via_cli() {
     let seg = fixture_segment();
     if !seg.exists() {
         eprintln!("skip: no captured segment at {:?}", seg);
         return;
     }
-    let bytes = decompress_gz(&seg).expect("gunzip fixture");
-    let tmp_in = tempfile::NamedTempFile::new().unwrap();
-    let mut f = File::create(tmp_in.path()).unwrap();
-    use std::io::Write;
-    f.write_all(&bytes).unwrap();
-    drop(f);
+    // Pass the compressed fixture directly: the CLI now classifies +
+    // decompresses on the input side via wal_rs::pg::wal::segment_file
+    let bytes = load_segment(&seg).await.expect("load fixture");
 
     let out_dir = tempfile::tempdir().unwrap();
     let exe = env!("CARGO_BIN_EXE_walshadow-filter");
     let out = Command::new(exe)
         .arg("--in")
-        .arg(tmp_in.path())
+        .arg(&seg)
         .arg("--out-dir")
         .arg(out_dir.path())
         .arg("--quiet")
@@ -298,17 +284,21 @@ fn writes_filtered_segment_and_manifest_via_cli() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let in_name = tmp_in.path().file_name().unwrap();
-    let seg_path = out_dir.path().join(in_name);
-    let manifest_path = out_dir
-        .path()
-        .join(format!("{}.manifest.json", in_name.to_string_lossy()));
-    assert!(seg_path.exists());
-    assert!(manifest_path.exists());
+    // Canonical 24-hex name lands in out_dir + manifest filename
+    let canonical = seg
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.split('.').next())
+        .expect("fixture name");
+    let seg_path = out_dir.path().join(canonical);
+    let manifest_path = out_dir.path().join(format!("{canonical}.manifest.json"));
+    assert!(seg_path.exists(), "missing filtered segment {seg_path:?}");
+    assert!(manifest_path.exists(), "missing manifest {manifest_path:?}");
 
     let filtered = std::fs::read(&seg_path).expect("read filtered");
     assert_eq!(filtered.len(), bytes.len());
     let manifest: serde_json::Value =
-        serde_json::from_reader(File::open(&manifest_path).unwrap()).expect("read manifest");
+        serde_json::from_reader(std::fs::File::open(&manifest_path).unwrap())
+            .expect("read manifest");
     assert!(!manifest["records"].as_array().unwrap().is_empty());
 }

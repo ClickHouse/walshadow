@@ -3,12 +3,20 @@
 //!
 //! Usage:
 //! ```text
-//! walshadow-filter --in seg.wal --out-dir filtered/ [--manifest filtered/seg.json]
+//! walshadow-filter --in seg.wal[.zst|.gz|.lz4|.lzma|.br][.partial] \
+//!     --out-dir filtered/ [--manifest filtered/seg.json]
 //! ```
-//! Reads `seg.wal`, walks every record, drops user-relation records by
-//! NOOP-replacing them in place (xl_prev chain preserved), writes the
-//! result to `filtered/<basename(seg.wal)>` and a JSON sidecar next to
-//! it (or to `--manifest` if given).
+//! Reads `seg.wal` (decompressed transparently by wal-rs if the path
+//! carries a recognised codec suffix), walks every record, drops
+//! user-relation records by NOOP-replacing them in place (xl_prev chain
+//! preserved), writes the result to `filtered/<24-hex-name>` and a JSON
+//! sidecar next to it (or to `--manifest` if given).
+//!
+//! Note on naming layers: this binary handles *segment-file* compression
+//! (whole-segment codec envelope produced by pg_receivewal / archive_command).
+//! It does NOT handle the orthogonal `wal_compression` GUC, which
+//! compresses FPIs *inside* WAL records — that's the
+//! `filter_segment` walker's concern and is already supported.
 
 use std::fs;
 use std::path::PathBuf;
@@ -16,6 +24,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::io::AsyncReadExt;
+use wal_rs::pg::wal::segment_file::open_segment_file;
 use walshadow::filter::Filter;
 use walshadow::filter_segment::filter_segment;
 
@@ -25,7 +35,8 @@ use walshadow::filter_segment::filter_segment;
     about = "Filter WAL segment to catalog-only."
 )]
 struct Args {
-    /// Input segment file. Pass once per segment.
+    /// Input segment file. Compression suffix (.zst .gz .lz4 .lzma .br)
+    /// is auto-detected; `.partial` peer accepted.
     #[arg(long = "in", value_name = "SEGMENT")]
     input: PathBuf,
     /// Output directory for the filtered segment.
@@ -39,9 +50,10 @@ struct Args {
     quiet: bool,
 }
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
     let args = Args::parse();
-    match run(args) {
+    match run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("walshadow-filter: {e:#}");
@@ -50,14 +62,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: Args) -> Result<()> {
-    let bytes =
-        fs::read(&args.input).with_context(|| format!("read input {}", args.input.display()))?;
-    let name = args
-        .input
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+async fn run(args: Args) -> Result<()> {
+    let (seg_name, mut reader) = open_segment_file(&args.input)
+        .await
+        .with_context(|| format!("open input {}", args.input.display()))?;
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("read input {}", args.input.display()))?;
+    let name = seg_name.format();
 
     let mut filter = Filter::new();
     let (filtered, manifest, _parsed) = filter_segment(&bytes, &name, &mut filter)

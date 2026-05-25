@@ -2,14 +2,17 @@
 //!
 //! Phase 0 deliverable. Consumes raw pg_wal segment files (16 MiB each by
 //! default, the on-disk format pg_receivewal & a running primary write to
-//! pg_wal/). Output is either a JSON [`Summary`] or a human-readable table.
+//! pg_wal/). Compressed segment archives (`.zst` / `.gz` / `.lz4` / `.lzma`
+//! / `.br`, with optional `.partial` peer) are auto-detected by suffix and
+//! transparently decoded via wal-rs's `open_segment_file`. Output is either
+//! a JSON [`Summary`] or a human-readable table.
 
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use wal_rs::pg::wal::segment_file::open_segment_file;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::classify::Summary;
 
@@ -19,7 +22,8 @@ use walshadow::classify::Summary;
     about = "Classify WAL records into catalog/user/special"
 )]
 struct Args {
-    /// WAL segment files to scan, in LSN order.
+    /// WAL segment files to scan, in LSN order. Compression suffix
+    /// (.zst .gz .lz4 .lzma .br) auto-detected; `.partial` peer accepted.
     #[arg(required = true)]
     files: Vec<PathBuf>,
 
@@ -28,14 +32,18 @@ struct Args {
     json: bool,
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let args = Args::parse();
     let mut summary = Summary::default();
     let mut parser = WalParser::new();
 
     for path in &args.files {
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        walk_segment(&mut parser, &mut summary, BufReader::new(f))
+        let (_seg, reader) = open_segment_file(path)
+            .await
+            .with_context(|| format!("open {}", path.display()))?;
+        walk_segment(&mut parser, &mut summary, reader)
+            .await
             .with_context(|| format!("walk {}", path.display()))?;
     }
 
@@ -48,10 +56,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn walk_segment<R: Read>(parser: &mut WalParser, summary: &mut Summary, mut r: R) -> Result<()> {
+async fn walk_segment<R: AsyncRead + Unpin>(
+    parser: &mut WalParser,
+    summary: &mut Summary,
+    mut r: R,
+) -> Result<()> {
     let mut page = vec![0u8; WAL_PAGE_SIZE as usize];
     loop {
-        let n = read_full(&mut r, &mut page)?;
+        let n = read_full(&mut r, &mut page).await?;
         if n == 0 {
             return Ok(());
         }
@@ -68,10 +80,10 @@ fn walk_segment<R: Read>(parser: &mut WalParser, summary: &mut Summary, mut r: R
     }
 }
 
-fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+async fn read_full<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
-        let n = r.read(&mut buf[filled..])?;
+        let n = r.read(&mut buf[filled..]).await?;
         if n == 0 {
             break;
         }

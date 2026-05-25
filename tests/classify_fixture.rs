@@ -9,10 +9,11 @@
 //! classifier targets.
 
 use std::fs::File;
-use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
+use tokio::io::AsyncReadExt;
+use wal_rs::pg::wal::segment_file::open_segment_file;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::classify::Summary;
 
@@ -20,21 +21,10 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/wal/classify/segments")
 }
 
-fn decompress_gz(path: &PathBuf) -> std::io::Result<Vec<u8>> {
-    let mut child = Command::new("gunzip")
-        .arg("-c")
-        .arg(path)
-        .stdout(Stdio::piped())
-        .spawn()?;
+async fn load_segment(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
+    let (_seg, mut r) = open_segment_file(path).await?;
     let mut out = Vec::new();
-    child.stdout.as_mut().unwrap().read_to_end(&mut out)?;
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(std::io::Error::other(format!(
-            "gunzip {:?} failed: {status}",
-            path
-        )));
-    }
+    r.read_to_end(&mut out).await?;
     Ok(out)
 }
 
@@ -55,8 +45,8 @@ fn walk(bytes: &[u8]) -> anyhow::Result<Summary> {
     Ok(summary)
 }
 
-#[test]
-fn catalog_fraction_under_workload_is_bounded() {
+#[tokio::test]
+async fn catalog_fraction_under_workload_is_bounded() {
     let dir = fixture_dir();
     let seg = dir.join("000000010000000000000001.gz");
     if !seg.exists() {
@@ -66,7 +56,7 @@ fn catalog_fraction_under_workload_is_bounded() {
         );
         return;
     }
-    let bytes = decompress_gz(&seg).expect("gunzip fixture");
+    let bytes = load_segment(&seg).await.expect("load fixture");
     let summary = walk(&bytes).expect("walk fixture");
 
     let writer = File::create(dir.parent().unwrap().join("last_run.json")).unwrap();
@@ -116,18 +106,9 @@ fn cli_produces_json_for_fixture() {
         eprintln!("skip: no captured segment at {:?}", seg);
         return;
     }
-    let bytes = decompress_gz(&seg).expect("gunzip fixture");
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut f = std::fs::File::create(tmp.path()).unwrap();
-    f.write_all(&bytes).unwrap();
-    drop(f);
 
     let exe = env!("CARGO_BIN_EXE_walshadow-classify");
-    let out = Command::new(exe)
-        .arg("--json")
-        .arg(tmp.path())
-        .output()
-        .unwrap();
+    let out = Command::new(exe).arg("--json").arg(&seg).output().unwrap();
     assert!(
         out.status.success(),
         "cli failed: {}",

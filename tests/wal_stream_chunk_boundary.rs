@@ -7,10 +7,10 @@
 //!
 //! Skipped silently if the captured fixture is not present.
 
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
+use tokio::io::AsyncReadExt;
+use wal_rs::pg::wal::segment_file::open_segment_file;
 use walshadow::shadow_stream::{ShadowStreamSink, ShadowStreamState};
 use walshadow::wal_stream::{CollectingRecordSink, CollectingSegmentSink, Record, WalStream};
 
@@ -19,21 +19,10 @@ fn fixture_path() -> PathBuf {
         .join("fixtures/wal/classify/segments/000000010000000000000001.gz")
 }
 
-fn decompress_gz(path: &PathBuf) -> std::io::Result<Vec<u8>> {
-    let mut child = Command::new("gunzip")
-        .arg("-c")
-        .arg(path)
-        .stdout(Stdio::piped())
-        .spawn()?;
+async fn load_segment(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
+    let (_seg, mut r) = open_segment_file(path).await?;
     let mut out = Vec::new();
-    child.stdout.as_mut().unwrap().read_to_end(&mut out)?;
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(std::io::Error::other(format!(
-            "gunzip {:?} failed: {status}",
-            path
-        )));
-    }
+    r.read_to_end(&mut out).await?;
     Ok(out)
 }
 
@@ -98,7 +87,7 @@ async fn bulk_and_byte_chunks_emit_identical_record_sequence() {
         eprintln!("skip: no captured segment at {path:?}");
         return;
     }
-    let bytes = decompress_gz(&path).expect("gunzip fixture");
+    let bytes = load_segment(&path).await.expect("load fixture");
     assert!(
         bytes.len().is_multiple_of(8192),
         "fixture must be page-aligned"
@@ -128,7 +117,7 @@ async fn bulk_and_chunked_emit_identical_segment_bytes() {
         eprintln!("skip: no captured segment at {path:?}");
         return;
     }
-    let bytes = decompress_gz(&path).expect("gunzip fixture");
+    let bytes = load_segment(&path).await.expect("load fixture");
     let seg_size = bytes.len() as u64;
 
     let mut stream_bulk = WalStream::new(1, seg_size, 0).unwrap();
@@ -179,7 +168,7 @@ async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
         eprintln!("skip: no captured segment at {path:?}");
         return;
     }
-    let bytes = decompress_gz(&path).expect("gunzip fixture");
+    let bytes = load_segment(&path).await.expect("load fixture");
     let seg_size = bytes.len() as u64;
 
     let mut stream = WalStream::new(1, seg_size, 0).expect("stream new");

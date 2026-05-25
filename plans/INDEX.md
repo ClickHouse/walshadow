@@ -37,10 +37,9 @@ components. Future-work proposals live under [future/](future/INDEX.md)
 ## Future work
 
 [future/INDEX.md](future/INDEX.md) collects work not yet shipped:
-runtime config overlay from source PG, segment compression, two-phase
-commit, sequence-state replication, cross-table ordering, CH-bounce
-recovery, parked operational polish. Promote into `plans/` when an item
-lands
+runtime config overlay from source PG, two-phase commit, sequence-state
+replication, cross-table ordering, CH-bounce recovery, parked operational
+polish. Promote into `plans/` when an item lands
 
 ## Architecture diagrams
 
