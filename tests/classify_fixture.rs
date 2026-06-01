@@ -12,20 +12,15 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::process::Command;
 
-use tokio::io::AsyncReadExt;
-use wal_rs::pg::wal::segment_file::open_segment_file;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::classify::Summary;
 
+#[path = "common/segment.rs"]
+mod segment;
+use segment::load_segment;
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/wal/classify/segments")
-}
-
-async fn load_segment(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
-    let (_seg, mut r) = open_segment_file(path).await?;
-    let mut out = Vec::new();
-    r.read_to_end(&mut out).await?;
-    Ok(out)
 }
 
 fn walk(bytes: &[u8]) -> anyhow::Result<Summary> {

@@ -14,11 +14,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use tokio::io::AsyncReadExt;
-use wal_rs::pg::wal::segment_file::open_segment_file;
 use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::filter::Filter;
 use walshadow::filter_segment::filter_segment;
+
+#[path = "common/segment.rs"]
+mod segment;
+use segment::load_segment;
 
 fn fixture_segment() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -38,13 +40,6 @@ fn vacuum_full_pg_depend_segment() -> PathBuf {
 fn xlog_switch_segment() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.gz")
-}
-
-async fn load_segment(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
-    let (_seg, mut r) = open_segment_file(path).await?;
-    let mut out = Vec::new();
-    r.read_to_end(&mut out).await?;
-    Ok(out)
 }
 
 /// (total_record_count, noop_count) by walking through `WalParser`.

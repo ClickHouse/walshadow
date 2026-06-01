@@ -9,21 +9,16 @@
 
 use std::path::PathBuf;
 
-use tokio::io::AsyncReadExt;
-use wal_rs::pg::wal::segment_file::open_segment_file;
 use walshadow::shadow_stream::{ShadowStreamSink, ShadowStreamState};
 use walshadow::wal_stream::{CollectingRecordSink, CollectingSegmentSink, Record, WalStream};
+
+#[path = "common/segment.rs"]
+mod segment;
+use segment::load_segment;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures/wal/classify/segments/000000010000000000000001.gz")
-}
-
-async fn load_segment(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
-    let (_seg, mut r) = open_segment_file(path).await?;
-    let mut out = Vec::new();
-    r.read_to_end(&mut out).await?;
-    Ok(out)
 }
 
 /// Stable fingerprint of a `Record`. Filter is deterministic so any
