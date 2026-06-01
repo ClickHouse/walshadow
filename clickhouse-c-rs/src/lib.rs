@@ -31,9 +31,7 @@ mod types;
 pub use alloc::Allocator;
 pub use block::{Block, BlockOpts, Column, ColumnLayout, LowCardinalityView};
 pub use builder::BlockBuilder;
-pub use client::{
-    Client, ClientOpts, DEFAULT_REVISION, Exception, ExceptionRef, Packet, PacketKind, ServerInfo,
-};
+pub use client::{Client, ClientOpts, DEFAULT_REVISION, Exception, Packet, PacketKind, ServerInfo};
 pub use codec::{Codec, Compression, cityhash128};
 pub use error::{Error, ErrorKind, Result};
 pub use io::PosixIo;

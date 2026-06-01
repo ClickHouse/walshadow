@@ -144,6 +144,18 @@ impl Block {
         }
     }
 
+    /// Validate every column with [`Column::validate`]. `chc_block_read`
+    /// does not check cross-field invariants, so call this on blocks
+    /// decoded from an untrusted peer before traversing them.
+    pub fn validate(&self) -> Result<()> {
+        for i in 0..self.n_columns() {
+            if let Some(col) = self.column(i) {
+                col.validate()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_overflows(&self) -> bool {
         unsafe { sys::chc_block_is_overflows(self.raw.as_ptr().cast_const()) }
     }
@@ -177,11 +189,23 @@ impl<'b> Column<'b> {
         unsafe { sys::chc_column_n_rows(self.raw) }
     }
 
+    /// Enforce the cross-field invariants ClickHouse checks on its own
+    /// native deserialization path, recursing through nested columns:
+    /// array offsets non-decreasing, LowCardinality keys within dict
+    /// range. A forged column can otherwise drive reads past inner-column
+    /// bounds. Returns [`ErrorKind::Protocol`](crate::ErrorKind::Protocol)
+    /// on the first violation.
+    pub fn validate(&self) -> Result<()> {
+        let mut err = sys::chc_err::zeroed();
+        let rc = unsafe { sys::chc_column_validate(self.raw, &mut err) };
+        check(rc, &err)
+    }
+
     /// Returns `(elem_size, bytes)`. Bytes are little-endian on the wire.
     pub fn fixed(&self) -> Option<(usize, &'b [u8])> {
-        if !matches!(self.layout(), Some(ColumnLayout::Fixed)) {
+        let Some(ColumnLayout::Fixed) = self.layout() else {
             return None;
-        }
+        };
         let mut elem_size = 0usize;
         let ptr = unsafe { sys::chc_column_fixed_data(self.raw, &mut elem_size) };
         if ptr.is_null() {
@@ -195,9 +219,9 @@ impl<'b> Column<'b> {
     /// String column: `(offsets, data)`. `offsets[i]` is the cumulative
     /// end of row `i` in `data` (exclusive ends, host byte order).
     pub fn string(&self) -> Option<(&'b [u64], &'b [u8])> {
-        if !matches!(self.layout(), Some(ColumnLayout::String)) {
+        let Some(ColumnLayout::String) = self.layout() else {
             return None;
-        }
+        };
         let n = self.n_rows();
         let offsets_ptr = unsafe { sys::chc_column_string_offsets(self.raw) };
         let data_ptr = unsafe { sys::chc_column_string_data(self.raw) };
@@ -219,9 +243,9 @@ impl<'b> Column<'b> {
     }
 
     pub fn null_map(&self) -> Option<&'b [u8]> {
-        if !matches!(self.layout(), Some(ColumnLayout::Nullable)) {
+        let Some(ColumnLayout::Nullable) = self.layout() else {
             return None;
-        }
+        };
         let p = unsafe { sys::chc_column_null_map(self.raw) };
         if p.is_null() {
             return None;
@@ -242,9 +266,9 @@ impl<'b> Column<'b> {
     }
 
     pub fn array_offsets(&self) -> Option<&'b [u64]> {
-        if !matches!(self.layout(), Some(ColumnLayout::Array)) {
+        let Some(ColumnLayout::Array) = self.layout() else {
             return None;
-        }
+        };
         let p = unsafe { sys::chc_column_array_offsets(self.raw) };
         if p.is_null() {
             None
@@ -284,9 +308,9 @@ impl<'b> Column<'b> {
     /// LowCardinality keys: returns `(key_size_bytes, raw_key_bytes)` and
     /// the dictionary column.
     pub fn low_cardinality(&self) -> Option<LowCardinalityView<'b>> {
-        if !matches!(self.layout(), Some(ColumnLayout::LowCardinality)) {
+        let Some(ColumnLayout::LowCardinality) = self.layout() else {
             return None;
-        }
+        };
         let key_size = unsafe { sys::chc_column_lc_key_size(self.raw) };
         if key_size <= 0 {
             return None;

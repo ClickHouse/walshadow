@@ -273,17 +273,16 @@ impl<'fd> Drop for Client<'fd> {
 
 unsafe impl<'fd> Send for Client<'fd> {}
 
-/// Server-side exception. Owning wrapper around the C `chc_exception`
-/// chain head. [`Drop`] calls `chc_exception_free`, which walks `nested`
-/// & frees every link.
+/// Server-side exception. Owning wrapper around the C `chc_exception`.
+/// [`Drop`] calls `chc_exception_free`.
 pub struct Exception {
     raw: NonNull<sys::chc_exception>,
     alloc: Allocator,
 }
 
 impl Exception {
-    /// SAFETY: `raw` must point at a `chc_exception` chain owned by the
-    /// caller; `alloc` must be the allocator it was created with.
+    /// SAFETY: `raw` must point at a `chc_exception` owned by the caller;
+    /// `alloc` must be the allocator it was created with.
     unsafe fn from_raw(raw: NonNull<sys::chc_exception>, alloc: Allocator) -> Self {
         Self { raw, alloc }
     }
@@ -306,15 +305,6 @@ impl Exception {
         let r = unsafe { self.raw.as_ref() };
         cstr_bytes(r.stack_trace, r.stack_trace_len)
     }
-
-    /// Next link in the chain, borrowed from this owner.
-    pub fn nested(&self) -> Option<ExceptionRef<'_>> {
-        let p = unsafe { (*self.raw.as_ptr()).nested };
-        NonNull::new(p).map(|raw| ExceptionRef {
-            raw: raw.as_ptr().cast_const(),
-            _marker: core::marker::PhantomData,
-        })
-    }
 }
 
 impl Drop for Exception {
@@ -333,7 +323,6 @@ impl core::fmt::Debug for Exception {
                 &String::from_utf8_lossy(self.display_text()),
             )
             .field("stack_trace", &String::from_utf8_lossy(self.stack_trace()))
-            .field("nested", &self.nested())
             .finish()
     }
 }
@@ -362,58 +351,6 @@ impl From<Exception> for Error {
             message: String::from_utf8_lossy(exc.display_text()).into_owned(),
             server_name: String::from_utf8_lossy(exc.name()).into_owned(),
         }
-    }
-}
-
-/// Borrowed view of a chain link. Lifetime ties to the owning
-/// [`Exception`] head.
-#[derive(Clone, Copy)]
-pub struct ExceptionRef<'e> {
-    raw: *const sys::chc_exception,
-    _marker: core::marker::PhantomData<&'e sys::chc_exception>,
-}
-
-impl<'e> ExceptionRef<'e> {
-    pub fn code(self) -> i32 {
-        unsafe { (*self.raw).code }
-    }
-
-    pub fn name(self) -> &'e [u8] {
-        let r = unsafe { &*self.raw };
-        cstr_bytes(r.name, r.name_len)
-    }
-
-    pub fn display_text(self) -> &'e [u8] {
-        let r = unsafe { &*self.raw };
-        cstr_bytes(r.display_text, r.display_text_len)
-    }
-
-    pub fn stack_trace(self) -> &'e [u8] {
-        let r = unsafe { &*self.raw };
-        cstr_bytes(r.stack_trace, r.stack_trace_len)
-    }
-
-    pub fn nested(self) -> Option<ExceptionRef<'e>> {
-        let p = unsafe { (*self.raw).nested };
-        NonNull::new(p).map(|raw| ExceptionRef {
-            raw: raw.as_ptr().cast_const(),
-            _marker: core::marker::PhantomData,
-        })
-    }
-}
-
-impl<'e> core::fmt::Debug for ExceptionRef<'e> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ExceptionRef")
-            .field("code", &self.code())
-            .field("name", &String::from_utf8_lossy(self.name()))
-            .field(
-                "display_text",
-                &String::from_utf8_lossy(self.display_text()),
-            )
-            .field("stack_trace", &String::from_utf8_lossy(self.stack_trace()))
-            .field("nested", &self.nested())
-            .finish()
     }
 }
 

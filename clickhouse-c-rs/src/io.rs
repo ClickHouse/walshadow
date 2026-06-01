@@ -10,6 +10,7 @@
 
 use core::marker::{PhantomData, PhantomPinned};
 use core::pin::Pin;
+use core::time::Duration;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use crate::sys;
@@ -43,6 +44,7 @@ impl<'fd> PosixIo<'fd> {
                 fd: 0,
                 check_cancel: None,
                 cancel_ud: core::ptr::null_mut(),
+                deadline_us: 0,
             },
             io: sys::chc_io {
                 ud: core::ptr::null_mut(),
@@ -74,6 +76,32 @@ impl<'fd> PosixIo<'fd> {
         // SAFETY: structural pin; hand out a raw pointer to the
         // pinned-in-place `io` field.
         unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
+    }
+
+    /// Bound subsequent blocking reads by an absolute `now + timeout`
+    /// deadline; `None` clears it so reads block indefinitely (default).
+    ///
+    /// The deadline is absolute and shared by every later read, not a
+    /// rolling per-read budget: refresh it before each operation that
+    /// needs a fresh window. Once elapsed, reads fail with
+    /// [`ErrorKind::Io`](crate::ErrorKind::Io) ("read timeout"); a
+    /// `Some(ZERO)` timeout makes the next read time out immediately.
+    pub fn set_read_timeout(self: Pin<&mut Self>, timeout: Option<Duration>) {
+        let deadline_us = match timeout {
+            None => 0,
+            Some(d) => {
+                let now = unsafe { sys::chc_rs_monotonic_us() };
+                let add = i64::try_from(d.as_micros()).unwrap_or(i64::MAX);
+                // Keep nonzero so a near-zero deadline never reads as "disabled".
+                now.saturating_add(add).max(1)
+            }
+        };
+        // SAFETY: structural pin; only mutates the deadline field of the
+        // pinned-in-place `state`.
+        unsafe {
+            let this = self.get_unchecked_mut();
+            sys::chc_posix_io_set_deadline(&mut this.state, deadline_us);
+        }
     }
 }
 

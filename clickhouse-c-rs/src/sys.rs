@@ -70,6 +70,14 @@ unsafe extern "C" {
     pub fn chc_alloc_stdlib() -> chc_alloc;
 }
 
+/* ---- crate-local C helpers (src/wrapper.c) ---- */
+
+unsafe extern "C" {
+    // CLOCK_MONOTONIC microseconds in clickhouse-c's own clock domain, so
+    // Rust-computed read deadlines line up with the posix-io poll loop.
+    pub fn chc_rs_monotonic_us() -> i64;
+}
+
 /* ---- io ---- */
 
 #[repr(C)]
@@ -100,6 +108,9 @@ pub struct chc_posix_io {
     pub fd: c_int,
     pub check_cancel: Option<unsafe extern "C" fn(ud: *mut c_void) -> bool>,
     pub cancel_ud: *mut c_void,
+    // Absolute CLOCK_MONOTONIC-us read deadline; 0 disables. chc_posix_io_init
+    // zeroes it, so the Rust state struct must carry it or that write lands OOB.
+    pub deadline_us: i64,
 }
 
 unsafe extern "C" {
@@ -110,6 +121,7 @@ unsafe extern "C" {
         check_cancel: Option<unsafe extern "C" fn(ud: *mut c_void) -> bool>,
         cancel_ud: *mut c_void,
     );
+    pub fn chc_posix_io_set_deadline(state: *mut chc_posix_io, deadline_us: i64);
 }
 
 /* ---- type AST ---- */
@@ -181,6 +193,7 @@ unsafe extern "C" {
     pub fn chc_column_lc_key_size(c: *const chc_column) -> c_int;
     pub fn chc_column_lc_keys(c: *const chc_column) -> *const c_void;
     pub fn chc_column_lc_dict(c: *const chc_column) -> *const chc_column;
+    pub fn chc_column_validate(c: *const chc_column, err: *mut chc_err) -> c_int;
 }
 
 /* ---- block reader ---- */
@@ -498,7 +511,6 @@ pub struct chc_exception {
     pub display_text_len: usize,
     pub stack_trace: *mut c_char,
     pub stack_trace_len: usize,
-    pub nested: *mut chc_exception,
 }
 
 #[repr(C)]
