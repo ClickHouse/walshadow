@@ -44,7 +44,7 @@ digraph timeline_bootstrap {
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     drain3 [label="drain_backfill task\nsynthesize CommittedTuple\n{op=Insert, _lsn=start_lsn}", fillcolor="#4D3A28"];
-    ch3    [label="transitional Emitter\nvs CatalogMapResolver\nheld-open INSERT,\nforce-closed at bootstrap end\n(no DdlApplicator)", fillcolor="#4D4128"];
+    ch3    [label="transitional Emitter\nvs CatalogMapResolver\nflush_timeout=0: seal per table (rfn flip)\nforce-closed at bootstrap end\n(no DdlApplicator)", fillcolor="#4D4128"];
 
     drain3 -> ch3 [label="per-relation block", color="#BF8C5F"];
   }

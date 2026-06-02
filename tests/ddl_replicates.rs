@@ -380,3 +380,109 @@ async fn drop_table_strategy_drop_removes_dest() {
         "CH dest must be dropped under drop_table_strategy = drop"
     );
 }
+
+/// F6: a namespace's `target_database` override must route both the
+/// auto-created CH table and its rows to that database, not the global
+/// `[ch] database`. Before the fix, `DdlConfig::from_emitter` discarded
+/// the override and everything landed in the global DB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_create_honors_per_namespace_target_database() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source_port = SOURCE_PORT + 30;
+    let shadow_port = SHADOW_PORT + 30;
+    let ch_tcp_port = CH_TCP_PORT + 30;
+    let ch_http_port = CH_HTTP_PORT + 30;
+    let walsender_port = WALSENDER_PORT + 30;
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(
+        &tmp,
+        "CREATE SCHEMA s15warehouse;\n",
+        source_port,
+        shadow_port,
+        walsender_port,
+    )
+    .await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    // Global DB and the namespace's override DB both exist; the table
+    // must land in the override, "warehouse".
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create global db");
+    ch.query("CREATE DATABASE IF NOT EXISTS warehouse")
+        .expect("create warehouse db");
+
+    let mut ddl_args = fx::DdlPipelineArgs::default();
+    ddl_args.namespaces.insert(
+        "s15warehouse".into(),
+        NamespaceMapping {
+            target_database: Some("warehouse".into()),
+            auto_create: true,
+            drop_table_strategy: None,
+        },
+    );
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test", // global differs from the override
+        ch_tcp_port,
+        mappings: vec![],
+        app_name: "walshadow-ddl-ns-target",
+        ddl: Some(ddl_args),
+    })
+    .await;
+
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "CREATE TABLE s15warehouse.w (id bigint PRIMARY KEY, body text)".into(),
+            "INSERT INTO s15warehouse.w (id, body) VALUES (1, 'ns')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(60)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 60s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+
+    // Table + row land in the override DB.
+    let in_warehouse = ch
+        .query("SELECT count() FROM warehouse.w FINAL WHERE _op != 'delete'")
+        .expect("warehouse count");
+    assert_eq!(
+        in_warehouse, "1",
+        "row must land in the namespace's database"
+    );
+
+    // And NOT in the global DB.
+    let in_global = ch
+        .query("SELECT count() FROM system.tables WHERE database = 'walshadow_test' AND name = 'w'")
+        .expect("global table existence");
+    assert_eq!(
+        in_global, "0",
+        "table must not be created in the global database",
+    );
+}

@@ -3,6 +3,15 @@
 // CRC32C → segment buffer. CatalogTracker side cluster feeds the
 // decision (relmap + pg_class harvest + seed). rmgr keep policy is a
 // decision sub-table off to the side.
+//
+// regeneration spec:
+// sources of truth: plans/filter.md · src/filter.rs · src/catalog_tracker.rs · src/rewrite.rs
+// subsumes: plans/filter.md § "Filter contract" + "Rewrite over fork"
+// quality bar:
+//   - track cluster doesn't push decide off main column
+//   - noop / rewrite siblings rank-aligned so segbuf joins cleanly
+//   - rmgr keep-policy table in legend fits within graph width
+// shared style: palette.md
 digraph filter {
   rankdir=TB;
   compound=true;

@@ -171,7 +171,8 @@ buf[abs..abs+len]`:
 | 26 | oid | 4 | `Oid(u32)` |
 | 700 / 701 | float4 / float8 | 4 / 8 | `Float4` / `Float8` |
 | 1082 | date | 4 | `Date(i32)` days since 2000-01-01 |
-| 1083 / 1114 / 1184 | time / timestamp / timestamptz | 8 | microseconds since PG epoch |
+| 1083 | time | 8 | `Time(i64)` microseconds since midnight (no epoch shift) |
+| 1114 / 1184 | timestamp / timestamptz | 8 | microseconds since PG epoch |
 | 1266 | timetz | 12 | `TimeTz { micros: i64, tz_seconds: i32 }` |
 | 2950 | uuid | 16 | `Uuid([u8; 16])` raw, no swap |
 | 19 | name | 64 | `Name(String)` via fixed-width path (NUL-padded NAMEDATALEN) |

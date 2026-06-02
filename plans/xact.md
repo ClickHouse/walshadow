@@ -186,9 +186,17 @@ operator wanting this gets a fresh config-surface decision
 
 `drain_lsn` advances BEFORE `on_xact_end` ack so an observer failure
 leaves `drain_lsn > emitter_ack_lsn`, exactly the gap cursor file
-surfaces. `emitter_ack_lsn` lags whenever CH emitter holds rows in open
-INSERTs under `flush_timeout > 0`. Both snapshot back into cursor file
+surfaces. `emitter_ack_lsn` lags whenever the CH emitter holds rows
+buffered under `flush_timeout > 0`. Both snapshot back into cursor file
 maintained by [ops.md](ops.md)
+
+Idle ticks keep the ack moving without a commit: `advance_idle(lsn,
+ack_ceiling)` lifts `drain_lsn` to the dispatched `lsn` but
+`emitter_ack_lsn` only to `min(lsn, ack_ceiling)` — the observer's
+durable horizon (`idle_ack_ceiling`), so a quiescent nudge can't promote
+the ack past rows still buffered in the emitter. `note_idle_durable(lsn)`
+folds a deadline-triggered close's durable LSN into `emitter_ack_lsn`
+alone. Both no-op while a xact is in flight
 
 `XactBufferStats::summary` renders `xact_active`, `bytes_in_mem`,
 `spill_active`, `spill_bytes`, `commit`, `abort` always; appends

@@ -2,8 +2,8 @@
 
 High-level pipeline. Shadow PG runs as catalog-replay sidecar fed by
 walshadow's walsender; filtered segments under `out/` serve as archive
-fallback. CH wire is a held-open INSERT (multi-xact, deadline-flushed);
-walshadow pushes DDL through a second CH connection.
+fallback. CH rows buffer across xacts and seal as complete INSERTs
+(budget / deadline); walshadow pushes DDL through a second CH connection.
 
 ![overview](overview.svg)
 
@@ -33,9 +33,10 @@ derives off channel ① (cache miss → diff → `SchemaEvent` →
 
 Catalog seed → BASE_BACKUP pump (MultiplexSink fan-out) → drain to CH →
 shadow handoff → cursor + WAL pump start. Bootstrap-time emitter is
-transitional: held-open INSERT for throughput, force-closed at end, no
-`DdlApplicator` wired. Each phase is a labelled cluster; node fill
-colour-codes the actor.
+transitional: `flush_timeout = 0` seals one INSERT per table (at each
+rfn flip) plus budget trips, force-closed at end, no `DdlApplicator`
+wired. Each phase is a labelled cluster; node fill colour-codes the
+actor.
 
 ![bootstrap timeline](timeline_bootstrap.svg)
 
@@ -43,9 +44,10 @@ colour-codes the actor.
 
 Steady-state hot path, left→right. Bytes path (③→④) stays on the pump
 task; decoder path (③→④'→⑤→⑥) crosses `QueueingRecordSink` so it can
-wait on shadow without parking the wire. CH ⑥ is held-open INSERT:
-`send_query` once per table, `send_data(Some)` per block,
-`send_data(None)` only when `flush_timeout` deadline trips or on close.
+wait on shadow without parking the wire. CH ⑥ buffers rows across xacts
+with no open wire; a budget or `flush_timeout` trigger seals one complete
+INSERT (`open_wire` → `send_data(Some)` → `send_data(None)` →
+`EndOfStream` → clear buffer).
 
 ![streaming timeline](timeline_streaming.svg)
 
@@ -75,13 +77,28 @@ the matching plan doc. Render alongside the six above.
 | oracle | [`oracle.dot`](oracle.dot) | [`plans/oracle.md`](../plans/oracle.md) |
 | safety | [`safety.dot`](safety.dot) | [`plans/safety.md`](../plans/safety.md) |
 
-Machine-readable regeneration specs live under
-[`../plans/robot/`](../plans/robot/INDEX.md) — not for human reading
+## Regenerating a diagram
+
+Each `<comp>.dot` carries its own regeneration spec as a header comment
+(sources of truth, `plans/` section subsumed, quality bar). Shared style
+— palette, edge channels, legend conventions — lives in
+[`palette.md`](palette.md).
+
+To regenerate `architecture/<comp>.svg`:
+1. read [`palette.md`](palette.md) for shared style invariants
+2. read the regen-spec header in `<comp>.dot` (sources of truth, subsumes, quality bar)
+3. read `plans/<comp>.md` for current implementation truth, plus the cited `src/` files as accuracy anchor
+4. edit `<comp>.dot`, render (below), read the png, iterate until the header quality bar passes
+5. if the `.svg` path changed, update the `plans/<comp>.md` embed
+
+System-level diagrams (overview, internals, shadow_communication,
+timeline_*) carry no per-comp spec — stable and visually saturated. Add
+one only on the next material rewrite.
 
 ## Render
 
 ```sh
-for f in *.dot; do dot -Tsvg "$f" -o "${f%.dot}.svg"; done
+for f in *.dot; do dot -Tsvg "$f" -o "${f%.dot}.svg"; dot -Tpng "$f" -o "${f%.dot}.png"; done
 ```
 
 ## Key references
@@ -89,7 +106,7 @@ for f in *.dot; do dot -Tsvg "$f" -o "${f%.dot}.svg"; done
 | diagram detail | source |
 |---|---|
 | catalog-event channel + CH DDL applicator | [`plans/shadow.md`](../plans/shadow.md), [`plans/emitter.md`](../plans/emitter.md) |
-| held-open INSERT, TRUNCATE, subxact rollback, apply-lag | [`plans/emitter.md`](../plans/emitter.md), [`plans/xact.md`](../plans/xact.md), [`plans/ops.md`](../plans/ops.md) |
+| atomic-seal INSERT, TRUNCATE, subxact rollback, apply-lag | [`plans/emitter.md`](../plans/emitter.md), [`plans/xact.md`](../plans/xact.md), [`plans/ops.md`](../plans/ops.md) |
 | `QueueingRecordSink`, pump ↔ decoder decoupling | [`plans/source.md`](../plans/source.md) |
 | streaming-fed shadow | [`plans/shadow.md`](../plans/shadow.md), [`plans/source.md`](../plans/source.md) |
 | greenfield bootstrap | [`plans/bootstrap.md`](../plans/bootstrap.md) |

@@ -1,14 +1,16 @@
 # emitter
 
-CH-side ingest: per-relation held-open INSERT pump, DDL applicator, PG
-→ CH type bridge. Three modules — `src/ch_emitter.rs`, `src/ch_ddl.rs`,
+CH-side ingest: per-relation buffer-then-seal INSERT pump, DDL
+applicator, PG → CH type bridge. Three modules — `src/ch_emitter.rs`,
+`src/ch_ddl.rs`,
 `src/type_bridge.rs`. Consumed through `TupleObserver` so xact-buffer
 drain feeds it verbatim
 
 ## Purpose
 
 Translate committed-xact tuple streams from xact-buffer's k-way-merge
-into ClickHouse Native blocks landing on per-table held-open INSERTs.
+into ClickHouse Native blocks buffered per table and sealed as complete
+INSERTs.
 DDL applicator runs in lockstep on sibling CH connection, consuming
 `SchemaEvent`s off `ShadowCatalog::subscribe` and reshaping CH tables
 to track source PG catalog deltas. Emitter ack-LSN feeds cursor file so
@@ -29,28 +31,39 @@ Per-replica wiring is two TCP sockets, both built off same
   `SchemaEvent` arrives
 
 Two connections, not one, because CH's `Client` is
-single-query-at-a-time. Holding an INSERT open across xacts (hot path)
-would block any ALTER that needed to ride same wire. Surgical close on
-affected relation gates DDL behind any buffered rows for that table;
-other tables' open INSERTs stay live across the DDL
+single-query-at-a-time. An in-flight INSERT flush (hot path) would
+block any ALTER that needed to ride same wire. Surgical flush on the
+affected relation lands its buffered rows before the DDL; other tables'
+buffered rows stay untouched across the DDL
 
-## Held-open INSERT shape
+## Hold-open buffer shape
 
-Wire shape pivoted from `one-INSERT-per-table-per-xact` to
-`one-INSERT-per-table held across xacts`. State machine + flush
-triggers are in diagram above; `Emitter::wire_open_key` carries
-currently-open table and `open_wire(key)` no-ops when key matches
+Wire shape pivoted from `one-INSERT-per-table-per-xact` to rows held in
+per-table `TableEncoder` buffers across xacts, each flush sealing one
+*complete* INSERT. No INSERT is held open on the wire between flushes:
+`open_wire` issues `send_query`, `close_current_wire` ships the block +
+`send_data(None)` + drains `EndOfStream`, and `flush_table` runs the two
+back-to-back. `Emitter::wire_open_key` carries the transiently-open
+table; `open_wire(key)` no-ops only within one flush's open→close window
 
-`flush_timeout = 0` keeps legacy close-per-xact behaviour
+The buffer is cleared only after `EndOfStream` (in
+`close_current_wire`). A mid-flush disconnect rolls the whole
+in-progress INSERT back on CH, so the rows stay buffered and the retry
+replays them — `ReplacingMergeTree(_lsn)` collapses any replay dupes.
+The earlier shape left rows shipped-but-unsealed on an open wire, which
+a disconnect would have lost
+
+`flush_timeout = 0` keeps legacy seal-per-xact behaviour
 (`emitter_ack_lsn` tracks `drain_lsn` exactly). Non-zero `flush_timeout`
 lets pgbench-shaped 4-table xacts coalesce into one MergeTree part per
 window instead of one per xact. Latency cap is configured timeout from
-first-row-of-window
+first-buffered-row-of-window
 
-Deadline timer starts when first row of fresh INSERT lands (`open_wire`
-sets `flush_deadline = now + flush_timeout`). Idle ticks call
-`flush_if_deadline_tripped` via `TupleObserver::on_idle` so last burst
-before traffic stops doesn't sit past deadline
+Deadline timer arms when the first row of a fresh window buffers
+(`on_xact_end_with_lsn` sets `flush_deadline = now + flush_timeout`;
+`open_wire` re-arms defensively). Idle ticks call
+`flush_if_deadline_tripped` via `TupleObserver::on_idle` so the last
+burst before traffic stops doesn't sit past the deadline
 
 ## BlockBuilder per relation
 
@@ -77,9 +90,11 @@ walshadow-side type table, so `FixedString(N)`, `DateTime64(p)`,
 upstream surface. `elem_size == 0` means varlen; only varlen shape
 today is `String`, anything else dies cleanly at `append`
 
-Flush triggers (`tripped` branch in `Emitter::route`):
+Flush triggers (each seals a *complete* INSERT — open → block →
+`EndOfStream` → clear):
 
-- `enc.rows >= config.row_budget` (default 65536)
+- `enc.rows >= config.row_budget` (default 65536) — `tripped` branch in
+  `Emitter::route`
 - `enc.approx_bytes >= config.byte_budget` (default 1 MiB)
 - xact end (legacy mode), deadline trip, schema event, TRUNCATE,
   shutdown
@@ -103,14 +118,30 @@ matches CH's own posture
 | "char" / int2/4/8 | Int8/16/32/64 |
 | oid | UInt32 |
 | float4/8 | Float32/64 |
-| numeric(p,s), p ≤ 76 | Decimal(p,s); else String |
+| numeric(p,s), 1 ≤ p ≤ 76 | Decimal(p,s); else String |
 | text / varchar(n) / bpchar(n) / name / bytea | String |
 | date | Date32 |
-| time / timetz / interval | String (text form) |
+| time | Time64(6) |
+| timetz / interval | String (text form) |
 | timestamp(p) / timestamptz(p) | DateTime64(p, 'UTC'), p ≤ 6 |
 | uuid | UUID |
 | inet / cidr / json / jsonb | String |
 | array / unknown | String fallback |
+
+`numeric` needs `1 ≤ p ≤ 76` for `Decimal`; `p = 0`, scale outside
+`0 ≤ s ≤ p`, or unconstrained `numeric` (which can carry NaN/±Inf) fall
+back to `String`. Into a `Decimal` column `encode_value` ships the value
+as a scaled little-endian two's-complement integer (`value * 10^scale`,
+U256 arithmetic spanning Decimal128/256 widths); NaN/±Inf into a
+`Decimal` column is unrepresentable and errors with `UnsupportedValue`
+(map that column to `String` to keep them). A `String`-mapped `numeric`
+still ships lossless text including NaN/Inf
+
+`time` → `Time64(6)` ships raw microseconds-since-midnight LE. CH 25.x
+gates `Time64` behind `enable_time_time64_type=1`; the dest server's
+profile must enable it or auto-create / insert on `time` columns fails.
+`timetz` → `String` renders via `codecs::timetz_to_text`, preserving the
+UTC offset the old fixed encoding silently dropped
 
 Default expressions reconstruct from `RelAttr.missing_text` (fast-path
 `attmissingval[1]` PG plants on `ALTER TABLE ADD COLUMN ... DEFAULT k`).
@@ -161,8 +192,8 @@ next route call rebuilds off fresh mapping
 
 ### NamespaceMapping (partial)
 
-Per-source-namespace defaults block, `[namespace."public"]`. Today's
-shipped surface is one field only:
+Per-source-namespace defaults block, `[namespace."public"]`. Three
+fields wired today:
 
 ```rust
 pub struct NamespaceMapping {
@@ -178,10 +209,18 @@ namespace and auto-derive a `TableMapping` via
 `derive_columns_for_mapping`. Per-table TOML still wins when both are
 configured for the same relation
 
+`target_database` and `drop_table_strategy` resolve per-namespace
+through `DdlConfig::{target_database_for, drop_strategy_for}`: the
+applicator carries the namespace map and falls back to the global
+`target_database` / `drop_table_strategy` when a namespace has no
+override. The per-namespace `target_database` drives both the CREATE
+and the derived row-routing mapping, so rows and DDL land in the same
+database
+
 ## NOT yet landed for namespace mapping
 
-Plan called for richer namespace surface; only auto_create sliver
-shipped. Missing:
+`auto_create`, `target_database`, and `drop_table_strategy` ship; the
+richer namespace surface the plan called for is still missing:
 
 - `ResolvedConfig` struct: design called for one pre-materialised value
   carrying `tables`, `namespaces`, and a
@@ -214,10 +253,10 @@ never back-pressures catalog producer). Apply table:
 
 | `SchemaEvent` | CH SQL |
 |---|---|
-| `Added { desc }` | `CREATE TABLE IF NOT EXISTS` when namespace `auto_create = true` and no pre-pinned mapping. Auto-derives `TableMapping` post-success so next `route` call ships rows against new table |
+| `Added { desc }` | `CREATE TABLE IF NOT EXISTS` (in the namespace's `target_database`, else global default) when namespace `auto_create = true` and no pre-pinned mapping. Auto-derives `TableMapping` against that same database post-success so next `route` call ships rows against the new table |
 | `Changed { diff }` | `ALTER TABLE … RENAME COLUMN` first (so position-match diffs don't trip into drop+add), then `ALTER TABLE … ADD COLUMN IF NOT EXISTS` per added attnum, then `ALTER TABLE … DROP COLUMN IF EXISTS` per dropped attnum |
 | `Changed.type_changes` | rejected, logged, `stats.type_changes_rejected += n`. Operator handles via manual CH migration |
-| `Dropped { qualified_name }` | gated on `DropTableStrategy`: `Retain` (default) skips silently, `Warn` skips at WARN, `Drop` runs `DROP TABLE IF EXISTS` |
+| `Dropped { qualified_name }` | gated on the namespace's `DropTableStrategy` (`drop_strategy_for`, else global): `Retain` (default) skips silently, `Warn` skips at WARN, `Drop` runs `DROP TABLE IF EXISTS` |
 
 `render_create_table` builds CREATE off descriptor: attributes through
 `type_bridge::map`, PK columns first in `ORDER BY` (else `_lsn`
@@ -257,6 +296,16 @@ PG's `TRUNCATE … RESTART IDENTITY` arrives as same `HeapOp::Truncate`
 with no flag distinction at emitter layer; bit lives on PG xlog record
 but doesn't propagate through `DecodedHeap`
 
+## Foreign-DB row skip
+
+Physical replication ships the whole cluster's WAL, so `route` sees
+heap records for relations in other databases. `relation_at` rejects
+those with `CatalogError::ForeignDatabase` (filenode resolved to a
+`db_node` that's neither the shadow DB nor a shared catalog — see
+[shadow.md](shadow.md)). Emitter treats it like an unmapped relation:
+no append, no poison, bump `stats.foreign_db_rows_skipped`, return
+`Ok(())` so the ack advances past it
+
 ## Read-time defaults integration
 
 PG's fast-path `ALTER TABLE ADD COLUMN … DEFAULT k` plants
@@ -284,19 +333,30 @@ PG-side tooling. See [decoder.md](decoder.md) for tier classification +
 returns highest LSN known durable on CH. Two values move through
 emitter:
 
-- `pending_max_commit_lsn`: highest `commit_lsn` of any row currently
-  buffered (in `TableEncoder` memory OR shipped via `send_data(Some)`
-  but not yet sealed by `send_data(None)`). Bumped per tuple in
-  `route`, reset to 0 on close
+- `pending_max_commit_lsn`: highest `commit_lsn` of any row buffered in
+  a `TableEncoder` but not yet sealed by a completed INSERT
+  (`EndOfStream`). Bumped per tuple in `route`, reset to 0 once every
+  buffer has drained. Nothing is ever shipped-but-unsealed, so this
+  tracks buffered rows alone
 - `last_durable_commit_lsn`: monotonic horizon. Promoted from
   `pending_max_commit_lsn` only inside `close_all_open_inserts`
-  (deadline trip or legacy per-xact close) or when empty xact arrives
-  with no rows pending
+  (deadline trip or legacy per-xact close) or when an empty xact
+  arrives with no rows pending. Promotion is safe precisely because
+  every buffer is drained first — the horizon never passes a
+  still-buffered row
 
 Hold-open mode means `last_durable_commit_lsn` lags `drain_lsn` until
-deadline trips — `emitter_ack_lsn` in cursor file reflects that lag.
-See [ops.md](ops.md) for cursor + recovery contract; `cursor.rs` writes
-value to disk on every observer ack and replay starts from
+the deadline trips — `emitter_ack_lsn` in cursor file reflects that lag
+
+`idle_ack_ceiling(lsn)` exposes that horizon to the idle path: when
+nothing is buffered (no open wire, every encoder empty) it returns
+`lsn` (trailing non-commit WAL is shippable-free, safe to ack fully),
+else it caps at `last_durable_commit_lsn` so a quiescent-tick nudge
+can't ack rows still buffered. `on_idle` separately returns the LSN a
+deadline-triggered close just made durable, which the xact buffer folds
+into `emitter_ack_lsn` via `note_idle_durable`. See [ops.md](ops.md)
+for cursor + recovery contract; `cursor.rs` writes value to disk on
+every observer ack and replay starts from
 `min(shadow_replay_lsn, emitter_ack_lsn)`
 
 ## Bootstrap-time emitter

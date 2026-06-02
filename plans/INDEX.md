@@ -21,9 +21,9 @@ components. Future-work proposals live under [future/](future/INDEX.md)
   read-time defaults
 - [xact.md](xact.md) — `XactBuffer`, `SubxactTracker`, TOAST
   reassembly, local-disk spill, `DrainEntry` ordering
-- [emitter.md](emitter.md) — CH Native held-open INSERT, `BlockBuilder`
-  per relation, `type_bridge`, synthetic columns, `DdlApplicator`,
-  `await_ready` gate
+- [emitter.md](emitter.md) — CH Native atomic-seal INSERT,
+  `BlockBuilder` per relation, `type_bridge`, synthetic columns,
+  `DdlApplicator`, `await_ready` gate
 - [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
   / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
   `RelationResolver`
@@ -52,8 +52,8 @@ on architecturally load-bearing changes
 
 ## Regenerating diagrams
 
-[robot/](robot/INDEX.md) — machine-readable diagram specs for agent
-consumption (NOT for humans). Each `robot/<comp>.md` carries concept,
-cluster structure, key nodes/edges, style invariants, quality bar for
-`architecture/<comp>.dot`. Pair with `_palette.md` for shared style.
+Each `architecture/<comp>.dot` carries its own regeneration spec as a
+header comment (sources of truth, subsumed plan section, quality bar);
+shared style invariants live in [`architecture/palette.md`](../architecture/palette.md).
+Workflow in [`architecture/README.md`](../architecture/README.md#regenerating-a-diagram).
 Use when regenerating a component diagram after material code change

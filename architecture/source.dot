@@ -4,6 +4,15 @@
 //   ❷ QueueingRecordSink (worker, decoder)
 //   ❸ DirSegmentSink (16 MiB segment artifact)
 // Emphasizes the pump-task / worker-task boundary at QueueingRecordSink.
+//
+// regeneration spec:
+// sources of truth: plans/source.md · src/source_feed.rs · src/wal_stream.rs · src/queueing_record_sink.rs · src/walsender_server*.rs
+// subsumes: plans/source.md § sink composition / fan-out / QueueingRecordSink
+// quality bar:
+//   - "stays on pump" vs "worker task" labels visually distinct
+//   - ❶❷❸ ordering glyphs visible in fan-out nodes
+//   - listener / sendq / statrx triangle reads as one walsender entity
+// shared style: palette.md
 digraph source {
   rankdir=TB;
   compound=true;

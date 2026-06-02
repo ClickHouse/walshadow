@@ -3,6 +3,16 @@
 // the boundary, what we trust on the C side. Six unsafe holes from the
 // UNSAFE landing (audited 2026-05-17 at commit b5af579) marked beside
 // the component they constrain; full prose lives in the legend below.
+//
+// regeneration spec:
+// sources of truth: plans/safety.md · clickhouse-c-rs/ (Client<'fd>, PosixIo<'fd>, Codec) · audit b5af579 @ 2026-05-17
+// subsumes: plans/safety.md § unsafe surface enumeration + lifetime relationships
+// quality bar:
+//   - six unsafe holes visible without overlapping their owners
+//   - ownership tree (Client → PosixIo → BorrowedFd) reads cleanly
+//   - FFI crossings clearly bidirectional (call + return)
+//   - "TRUST BOUNDARY" divider unambiguous
+// shared style: palette.md
 digraph safety {
   rankdir=TB;
   compound=true;

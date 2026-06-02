@@ -430,7 +430,7 @@ impl IntervalValue {
     }
 }
 
-fn format_time_us(mut us: i64) -> String {
+pub(crate) fn format_time_us(mut us: i64) -> String {
     let neg = us < 0;
     if neg {
         us = -us;
@@ -451,6 +451,29 @@ fn format_time_us(mut us: i64) -> String {
         }
         format!("{prefix}{hours:02}:{mins:02}:{secs:02}.{frac_s}")
     }
+}
+
+/// PG `timetz_out`: time-of-day text plus the zone offset. PG stores the
+/// zone as seconds *west* of UTC (negative east), so the displayed
+/// offset is `-tz_seconds`. Renders `±HH`, appending `:MM` then `:SS`
+/// only when nonzero, matching PG's output.
+pub(crate) fn timetz_to_text(micros: i64, tz_seconds: i32) -> String {
+    let mut s = format_time_us(micros);
+    let off = -tz_seconds;
+    let sign = if off < 0 { '-' } else { '+' };
+    let abs = off.unsigned_abs();
+    let hh = abs / 3600;
+    let mm = (abs % 3600) / 60;
+    let ss = abs % 60;
+    s.push(sign);
+    s.push_str(&format!("{hh:02}"));
+    if mm != 0 || ss != 0 {
+        s.push_str(&format!(":{mm:02}"));
+        if ss != 0 {
+            s.push_str(&format!(":{ss:02}"));
+        }
+    }
+    s
 }
 
 #[cfg(test)]
@@ -606,6 +629,20 @@ mod tests {
             decode_inet(&body, false),
             Err(CodecError::BadInet { .. })
         ));
+    }
+
+    #[test]
+    fn timetz_text_renders_zone() {
+        // 12:34:56 at UTC+2 → PG stores tz_seconds = -7200 (west-positive
+        // convention), displayed offset +02.
+        let micros = ((12 * 3600 + 34 * 60 + 56) as i64) * 1_000_000;
+        assert_eq!(timetz_to_text(micros, -7200), "12:34:56+02");
+        // UTC.
+        assert_eq!(timetz_to_text(micros, 0), "12:34:56+00");
+        // West of UTC with a half-hour offset: UTC-5:30 → tz_seconds=19800.
+        assert_eq!(timetz_to_text(micros, 19800), "12:34:56-05:30");
+        // Sub-second precision is preserved.
+        assert_eq!(timetz_to_text(micros + 500_000, -7200), "12:34:56.5+02");
     }
 
     #[test]

@@ -1017,18 +1017,27 @@ impl XactBuffer {
         Ok(())
     }
 
-    /// Idle-tick ack: advance `emitter_ack_lsn` / `drain_lsn` to `lsn`
-    /// when no xact is in flight. Pump loop drives this after the
-    /// queueing worker drains a batch so source's slot can recycle
-    /// past the trailing post-COMMIT WAL (page padding, RUNNING_XACTS,
-    /// CHECKPOINT) when the workload is quiescent. Without it the
-    /// emitter ack would pin at the last COMMIT and source's WAL
-    /// retention would grow unbounded.
-    pub fn advance_idle(&mut self, lsn: u64) {
+    /// Idle-tick ack: advance `drain_lsn` to `lsn` (dispatched marker)
+    /// when no xact is in flight, and `emitter_ack_lsn` to
+    /// `min(lsn, ack_ceiling)`. Pump loop drives this after the queueing
+    /// worker drains a batch so source's slot can recycle past trailing
+    /// post-COMMIT WAL (page padding, RUNNING_XACTS, CHECKPOINT) when
+    /// quiescent. `ack_ceiling` is the observer's durable horizon: in
+    /// hold-open mode rows can sit in open INSERTs between commits, so
+    /// the ack must not jump past what the observer has made durable —
+    /// otherwise source recycles WAL the emitter hasn't written.
+    pub fn advance_idle(&mut self, lsn: u64, ack_ceiling: u64) {
         if self.stats.xacts_active != 0 {
             return;
         }
         self.stats.drain_lsn = self.stats.drain_lsn.max(lsn);
+        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(lsn.min(ack_ceiling));
+    }
+
+    /// Fold an observer-reported durable LSN (e.g. from a deadline-
+    /// triggered idle close) into `emitter_ack_lsn`. Only advances the
+    /// ack; `drain_lsn` already covers commit boundaries.
+    pub fn note_idle_durable(&mut self, lsn: u64) {
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(lsn);
     }
 
@@ -1486,10 +1495,18 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
-            self.observer
+            let durable = self
+                .observer
                 .on_idle()
                 .await
-                .map_err(|e| SinkError::Other(e.to_string()))
+                .map_err(|e| SinkError::Other(e.to_string()))?;
+            // A deadline-triggered close promotes the emitter's durable
+            // horizon; fold it into the ack so retention advances even
+            // when no further commit follows.
+            if durable != 0 {
+                self.buffer.lock().await.note_idle_durable(durable);
+            }
+            Ok(())
         })
     }
 
@@ -1514,8 +1531,12 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
+            // Cap the ack at the observer's durable horizon before
+            // locking the buffer (the nudge must not promote past rows
+            // still held in open INSERTs).
+            let ceiling = self.observer.idle_ack_ceiling(lsn);
             let mut buf = self.buffer.lock().await;
-            buf.advance_idle(lsn);
+            buf.advance_idle(lsn, ceiling);
             Ok(())
         })
     }
@@ -1903,6 +1924,29 @@ mod tests {
         assert!(after.is_empty(), "abort must remove spill file");
         assert_eq!(b.stats().aborted_xacts_total, 1);
         assert_eq!(b.stats().spill_xacts_active, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn advance_idle_caps_ack_at_ceiling() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        // Hold-open: ceiling (durable horizon) below the dispatched lsn.
+        // drain_lsn tracks dispatch, emitter_ack capped at the ceiling.
+        b.advance_idle(100, 50);
+        assert_eq!(b.stats().drain_lsn, 100);
+        assert_eq!(b.stats().emitter_ack_lsn, 50);
+        // Nothing buffered: ceiling == lsn, ack advances fully.
+        b.advance_idle(200, 200);
+        assert_eq!(b.stats().drain_lsn, 200);
+        assert_eq!(b.stats().emitter_ack_lsn, 200);
+        // Stale/regressing inputs never lower either field.
+        b.advance_idle(150, 100);
+        assert_eq!(b.stats().drain_lsn, 200);
+        assert_eq!(b.stats().emitter_ack_lsn, 200);
+        // Deadline-close durable feedback advances only the ack.
+        b.note_idle_durable(260);
+        assert_eq!(b.stats().drain_lsn, 200);
+        assert_eq!(b.stats().emitter_ack_lsn, 260);
     }
 
     #[tokio::test(flavor = "current_thread")]

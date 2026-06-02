@@ -76,15 +76,28 @@ pub trait TupleObserver: Send {
         Box::pin(async { Ok(()) })
     }
 
+    /// Ceiling for an idle-advance ack at LSN `lsn`. Returns `lsn` when
+    /// the observer holds nothing client-side (caller may advance fully
+    /// past trailing non-commit WAL); otherwise the observer's durable
+    /// horizon, so a quiescent-tick nudge can't promote the emitter ack
+    /// past rows still buffered in open INSERTs. Default: `lsn` —
+    /// observers that don't buffer (metrics, collectors) impose no
+    /// constraint.
+    fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
+        lsn
+    }
+
     /// Driver-initiated tick. Mirror of [`crate::wal_stream::RecordSink::on_idle`]
     /// at the observer layer — lets the CH emitter close its
     /// hold-open INSERTs once `flush_timeout` has elapsed without any
-    /// fresh xact_end calls to piggyback the deadline check on.
-    /// Default: no-op.
+    /// fresh xact_end calls to piggyback the deadline check on. Returns
+    /// the commit LSN made durable by any deadline-triggered close
+    /// (`0` = nothing promoted), which the xact buffer folds into
+    /// `emitter_ack_lsn`. Default: no-op, `Ok(0)`.
     fn on_idle<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(0) })
     }
 
     /// Final hook before drop. Mirror of [`crate::wal_stream::RecordSink::on_close`]
@@ -123,9 +136,13 @@ impl<T: TupleObserver + ?Sized> TupleObserver for Box<T> {
         (**self).on_schema_event(event)
     }
 
+    fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
+        (**self).idle_ack_ceiling(lsn)
+    }
+
     fn on_idle<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
         (**self).on_idle()
     }
 

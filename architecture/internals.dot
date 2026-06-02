@@ -71,10 +71,10 @@ digraph internals {
 
   // ════════ ⑥ CH emitter — row path ════════
   subgraph cluster_ch {
-    label="⑥ CH emitter — held-open INSERT, deadline-flushed"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    tableenc [label="TableEncoder\nper (table, INSERT)\nrow/byte budget", fillcolor="#5D4628"];
+    label="⑥ CH emitter — buffer across xacts, atomic-seal INSERT"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    tableenc [label="TableEncoder\nper table; buffer across xacts\nrow/byte budget", fillcolor="#5D4628"];
     block    [label="BlockBuilder\nNative columns +\n_lsn / _xid / _op / _commit_ts", fillcolor="#5D4628"];
-    chwire   [label="clickhouse-c-rs\nsend_query (once per table)\nsend_data(Some) per block\nsend_data(None) on deadline\nflush_timeout cap", fillcolor="#5D4628"];
+    chwire   [label="clickhouse-c-rs\nflush_table: open_wire send_query\nsend_data(Some) → send_data(None)\nEndOfStream → clear buffer\nbudget / deadline seal", fillcolor="#5D4628"];
     tableenc -> block -> chwire;
   }
   drain -> tableenc [color="#BF8C5F", penwidth=2];

@@ -3,6 +3,8 @@
 Planning-only docs for work that has not shipped. Drop new proposals
 here as they surface; promote into `plans/` when they land
 
+* [TABLESPACES.md](TABLESPACES.md) — source-tablespace correctness: bootstrap page-walk + shadow directory materialization
+* [DESTINATIONS.md](DESTINATIONS.md) — N:M ClickHouse destination routing: fan-out/fan-in, per-dest ack accounting, slot-advance tension
 * [runtime_config_from_pg.md](runtime_config_from_pg.md) — WAL-driven runtime config overlay from source PG
 * [shadow_schema_export.md](shadow_schema_export.md) — shadow PG as schema-only catalog donor to third-party clusters
 * [sync_commit_witness.md](sync_commit_witness.md) — walshadow as RPO=0 durability standby

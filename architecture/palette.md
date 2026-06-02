@@ -1,5 +1,3 @@
-# robot:_palette
-
 Shared style for all architecture/*.dot. Not for humans
 
 ## graph defaults

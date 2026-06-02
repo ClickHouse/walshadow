@@ -3,7 +3,17 @@
 // 5 phases top→bottom in time; this one freezes phases 1-4 and
 // exposes the MultiplexSink fan-out structure — BackupSource trait
 // + two impls, per-file routing, parallel ShadowDataDir + PageWalkSink
-// rails, transitional held-open INSERT.
+// rails, transitional seal-per-table INSERT (flush_timeout = 0).
+//
+// regeneration spec:
+// sources of truth: plans/bootstrap.md · src/backup_source_direct.rs · src/backup_source_object_store.rs · src/backup_page_walk.rs · src/backup_source.rs
+// subsumes: plans/bootstrap.md § "MultiplexSink" / fan-out
+// differentiates: timeline_bootstrap.dot walks the 5-phase TIMELINE; this freezes phases 1-4 and exposes the FAN-OUT structure (BackupSource impls, MultiplexSink, simultaneous shadow-dir + CH writes)
+// quality bar:
+//   - "both" fan-out from classify visible (two edges, not one merged)
+//   - RelationResolver feedback edge clearly secondary (dashed, constraint=false)
+//   - bootstrap CH path distinct from steady-state emitter (annotated "no DdlApplicator")
+// shared style: palette.md
 digraph bootstrap {
   rankdir=TB;
   compound=true;
@@ -90,7 +100,7 @@ digraph bootstrap {
 
     tobs  [label="TupleObserver\nholds Arc<dyn RelationResolver>", fillcolor="#5D4628"];
     bb    [label="BlockBuilder per relation\nNative columns +\n_lsn=start_lsn / _xid / _op=Insert", fillcolor="#5D4628"];
-    wire  [label="clickhouse-c-rs\nheld-open INSERT,\nsend_query once per (table, INSERT)\nsend_data(None) at rfn flip /\n bootstrap end", fillcolor="#5D4628"];
+    wire  [label="clickhouse-c-rs\nflush_timeout = 0 → seal per table\nopen_wire send_query per table\nsend_data(None) → EndOfStream\nat rfn flip / budget / bootstrap end", fillcolor="#5D4628"];
     tobs -> bb -> wire;
   }
   drain  -> tobs [color="#BF8C5F", penwidth=2, style=dashed, label="per-rfn block"];

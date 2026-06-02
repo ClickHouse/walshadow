@@ -19,11 +19,12 @@
 //! | `int2/4/8` | `Int16/32/64` | |
 //! | `oid` | `UInt32` | |
 //! | `float4/8` | `Float32/64` | |
-//! | `numeric(p,s)` | `Decimal(p,s)` (p ≤ 76 — CH cap), else `String` | |
+//! | `numeric(p,s)` | `Decimal(p,s)` (p ≤ 76), else `String` | |
 //! | `varchar(n)`, `bpchar(n)`, `text`, `name` | `String` | CH has no length cap |
 //! | `bytea` | `String` | CH binary lands in String columns |
 //! | `date` | `Date32` | covers PG's -infinity / +infinity edges |
-//! | `time` / `timetz` | `String` | rendered via `ColumnValue` text form |
+//! | `time` | `Time64(6)` | microseconds since midnight |
+//! | `timetz` | `String` | preserves UTC offset text |
 //! | `timestamp` / `timestamptz` | `DateTime64(p, 'UTC')` p ≤ 6 | |
 //! | `interval` | `String` | |
 //! | `uuid` | `UUID` | |
@@ -59,7 +60,7 @@ pub const CIDR_OID: u32 = heap_decoder::CIDROID;
 
 /// PG `VARHDRSZ` — 4-byte varlena header used by `typmod` packing.
 const VARHDRSZ: i32 = 4;
-/// CH `Decimal` maximum precision (driven by Decimal256 wire shape).
+/// CH `Decimal` max precision, the `Decimal256` ceiling.
 const CH_DECIMAL_MAX_PRECISION: i32 = 76;
 /// CH `DateTime64` maximum fractional precision.
 const CH_DATETIME64_MAX_PRECISION: i32 = 6;
@@ -121,7 +122,15 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         NUMERICOID => numeric_ch_type(att.typmod),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID | BYTEAOID => "String".into(),
         DATEOID => "Date32".into(),
-        TIMEOID | TIMETZOID | INTERVALOID => "String".into(),
+        // `time` → microseconds since midnight, which is exactly CH
+        // `Time64(6)`'s tick. CH 25.x gates `Time64` behind
+        // `enable_time_time64_type=1`; the dest server must enable it
+        // (default profile) or auto-create/insert on time columns fail.
+        // `timetz` carries a UTC offset CH's time types can't store, so
+        // it stays text (lossless); `interval` has no CH analog and
+        // renders to text too.
+        TIMEOID => "Time64(6)".into(),
+        TIMETZOID | INTERVALOID => "String".into(),
         TIMESTAMPOID | TIMESTAMPTZOID => datetime64_ch_type(att.typmod),
         UUIDOID => "UUID".into(),
         INETOID | CIDR_OID => "String".into(),
@@ -146,8 +155,9 @@ fn render_default(att: &RelAttr, ch_inner: &str) -> Option<String> {
 
 /// Decode `pg_attribute.atttypmod` for `numeric(p, s)` and produce the
 /// matching CH type. Falls back to `String` when precision exceeds CH's
-/// `Decimal256` cap, or when typmod is unset (`-1` ≡ unconstrained
-/// numeric).
+/// Decimal cap (76), when scale is out of `0 ≤ s ≤ p`, or when typmod is
+/// unset (`-1` ≡ unconstrained numeric, which may also hold NaN/±Inf
+/// that `Decimal` cannot represent).
 fn numeric_ch_type(typmod: i32) -> String {
     if typmod < VARHDRSZ {
         return "String".into();
@@ -164,7 +174,7 @@ fn numeric_ch_type(typmod: i32) -> String {
     } else {
         scale_raw
     };
-    if !(0..=CH_DECIMAL_MAX_PRECISION).contains(&precision) || scale < 0 || scale > precision {
+    if !(1..=CH_DECIMAL_MAX_PRECISION).contains(&precision) || scale < 0 || scale > precision {
         return "String".into();
     }
     format!("Decimal({precision}, {scale})")
@@ -434,10 +444,62 @@ mod tests {
             base_type_for(&attr(NUMERICOID, -1, true, None)).unwrap(),
             "String"
         );
-        // numeric(100, 2) → String (CH cap)
-        let tm = ((100i32 << 16) | 2) + VARHDRSZ;
+        // numeric(38, 4) → Decimal128 boundary.
+        let tm = ((38i32 << 16) | 4) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            "Decimal(38, 4)"
+        );
+        // numeric(39, 4) → Decimal256.
+        let tm = ((39i32 << 16) | 4) + VARHDRSZ;
+        assert_eq!(
+            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            "Decimal(39, 4)"
+        );
+        // numeric(76, 10) → Decimal256 boundary.
+        let tm = ((76i32 << 16) | 10) + VARHDRSZ;
+        assert_eq!(
+            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            "Decimal(76, 10)"
+        );
+        // numeric(77, 10) → String: beyond CH Decimal256 precision.
+        let tm = ((77i32 << 16) | 10) + VARHDRSZ;
+        assert_eq!(
+            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            "String"
+        );
+        // numeric(10, -1) → String: CH Decimal scale must be nonnegative.
+        let tm = ((10i32 << 16) | 0xFFFF) + VARHDRSZ;
+        assert_eq!(
+            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            "String"
+        );
+        // numeric(50, 2) → Decimal256.
+        let tm = ((50i32 << 16) | 2) + VARHDRSZ;
+        assert_eq!(
+            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            "Decimal(50, 2)"
+        );
+        // numeric(50, 60) → String: CH Decimal scale can't exceed precision.
+        let tm = ((50i32 << 16) | 60) + VARHDRSZ;
+        assert_eq!(
+            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            "String"
+        );
+    }
+
+    #[test]
+    fn time_maps_native_timetz_and_interval_text() {
+        assert_eq!(
+            base_type_for(&attr(TIMEOID, -1, true, None)).unwrap(),
+            "Time64(6)"
+        );
+        assert_eq!(
+            base_type_for(&attr(TIMETZOID, -1, true, None)).unwrap(),
+            "String"
+        );
+        assert_eq!(
+            base_type_for(&attr(INTERVALOID, -1, true, None)).unwrap(),
             "String"
         );
     }

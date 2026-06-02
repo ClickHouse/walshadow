@@ -5,16 +5,16 @@
 //! `(destination table, xact)`:
 //!
 //! 1. First row → buffer in [`TableEncoder`]; mark INSERT pending.
-//! 2. Either the `row_budget` or `byte_budget` trips → build a
-//!    [`BlockBuilder`], `send_query` (if not yet issued for this xact +
-//!    table), `send_data(Some(&bb))`, clear column buffers, keep INSERT
-//!    open. (Not implemented in v1: emitter holds the entire xact and
-//!    flushes a single block per table at xact end. Budget knobs exist
-//!    in [`EmitterConfig`] for a follow-up.)
+//! 2. Either the `row_budget` or `byte_budget` trips → seal one complete
+//!    INSERT: `send_query` + `send_data(Some(&bb))` + `send_data(None)`,
+//!    drain to `EndOfStream`, then clear the buffer. The buffer is never
+//!    cleared before `EndOfStream`, so a mid-flush disconnect replays
+//!    rather than loses rows (CH dedups any replay by `_lsn`).
 //! 3. `on_xact_end` (called by [`XactBuffer::commit`](crate::xact_buffer::XactBuffer))
-//!    flushes whatever buffered + closes each open INSERT with
-//!    `send_data(None)`, then drains response packets until
-//!    `EndOfStream` / `Exception`.
+//!    seals every still-buffered table the same way (legacy mode, or
+//!    when the hold-open `flush_timeout` deadline has tripped). In
+//!    hold-open mode rows accumulate across xacts until a budget trip or
+//!    the deadline seals them, batching small xacts into fewer parts.
 //!
 //! Synthetic columns `_lsn UInt64`, `_xid UInt32`, `_op Enum8(...)`,
 //! `_commit_ts DateTime64(6, 'UTC')` are appended after every mapped
@@ -489,6 +489,41 @@ pub struct ColumnPlan {
     /// CH type expression, eg. "Nullable(String)" / "UInt64".
     pub type_repr: String,
     pub ast: TypeAst,
+    /// Wire metadata for a (possibly Nullable) `Decimal(p,s)` column.
+    pub decimal: Option<DecimalWire>,
+}
+
+/// Physical wire width of a CH `Decimal`: exactly one of four
+/// signed-integer backings. Discriminants are the byte widths, so
+/// `as usize` recovers the size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecimalWidth {
+    D32 = 4,
+    D64 = 8,
+    D128 = 16,
+    D256 = 32,
+}
+
+impl DecimalWidth {
+    fn from_elem_size(size: usize) -> Option<Self> {
+        Some(match size {
+            4 => Self::D32,
+            8 => Self::D64,
+            16 => Self::D128,
+            32 => Self::D256,
+            _ => return None,
+        })
+    }
+
+    fn bytes(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecimalWire {
+    pub scale: u8,
+    pub width: DecimalWidth,
 }
 
 impl TablePlan {
@@ -516,10 +551,12 @@ impl TablePlan {
         for c in &mapping.columns {
             let ast = TypeAst::parse(&c.target_type, alloc)
                 .map_err(|e| EmitterError::Type(format!("{}: {e}", c.target_type)))?;
+            let decimal = decimal_wire_of(&ast);
             columns.push(ColumnPlan {
                 name: c.target_name.clone(),
                 type_repr: c.target_type.clone(),
                 ast,
+                decimal,
             });
             col_sql.push(quote_ident(&c.target_name));
         }
@@ -529,6 +566,7 @@ impl TablePlan {
                 type_repr: ty.into(),
                 ast: TypeAst::parse(ty, alloc)
                     .map_err(|e| EmitterError::Type(format!("{ty}: {e}")))?,
+                decimal: None,
             })
         };
         let synth_lsn = mk("_lsn", "UInt64")?;
@@ -833,6 +871,7 @@ impl TableEncoder {
             _ => decoded.new.as_ref(),
         };
         for (i, col) in mapping.columns.iter().enumerate() {
+            let decimal = self.plan.columns[i].decimal;
             let buf = &mut self.buffers[i];
             let raw_value = side
                 .and_then(|t| t.columns.get((col.src_attnum - 1) as usize))
@@ -848,7 +887,7 @@ impl TableEncoder {
                     }
                     e
                 })?,
-                Some(v) => encode_value(buf, v).map_err(|mut e| {
+                Some(v) => encode_value(buf, v, decimal).map_err(|mut e| {
                     if let EmitterError::UnsupportedValue {
                         ref mut target_column,
                         ..
@@ -924,7 +963,11 @@ impl TableEncoder {
         // Caller is responsible for `opts`; `BlockBuilder::write` is
         // not called because we go through the TCP packet loop.
         let _ = opts;
-        self.clear();
+        // Buffer is NOT cleared here. Durability lands only at the
+        // wire's `EndOfStream`; if the connection drops between this
+        // send and that ack, CH rolls back the whole in-progress
+        // INSERT, so the rows must stay buffered for the retry to
+        // replay. `close_current_wire` clears post-`EndOfStream`.
         Ok(n_rows)
     }
 }
@@ -967,7 +1010,209 @@ fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
     buf.append_fixed_bytes(le)
 }
 
-fn encode_value(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> {
+/// Wire metadata for a (possibly `Nullable`) CH `Decimal` type, or
+/// `None` when the type isn't Decimal. Peels one `Nullable` layer the
+/// same way [`ColumnBuf::new_for_ast`] does.
+fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
+    let view = ast.view();
+    let inner = if view.kind() == Some(Kind::Nullable) {
+        view.child(0)?
+    } else {
+        view
+    };
+    if !matches!(
+        inner.kind(),
+        Some(Kind::Decimal32 | Kind::Decimal64 | Kind::Decimal128 | Kind::Decimal256)
+    ) {
+        return None;
+    }
+    Some(DecimalWire {
+        scale: u8::try_from(inner.decimal_scale()).ok()?,
+        width: DecimalWidth::from_elem_size(inner.elem_size())?,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct U256([u64; 4]);
+
+impl U256 {
+    fn is_zero(self) -> bool {
+        self.0 == [0; 4]
+    }
+
+    fn one_shl(bit: usize) -> Self {
+        let mut limbs = [0; 4];
+        limbs[bit / 64] = 1u64 << (bit % 64);
+        Self(limbs)
+    }
+
+    fn checked_mul_small(&mut self, rhs: u32) -> bool {
+        let mut carry = 0u128;
+        for limb in &mut self.0 {
+            let v = (*limb as u128) * (rhs as u128) + carry;
+            *limb = v as u64;
+            carry = v >> 64;
+        }
+        carry == 0
+    }
+
+    fn checked_add_small(&mut self, rhs: u32) -> bool {
+        let mut carry = rhs as u128;
+        for limb in &mut self.0 {
+            let v = (*limb as u128) + carry;
+            *limb = v as u64;
+            carry = v >> 64;
+            if carry == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn div_small(&mut self, rhs: u32) -> u32 {
+        let mut rem = 0u128;
+        let rhs = rhs as u128;
+        for limb in self.0.iter_mut().rev() {
+            let v = (rem << 64) | (*limb as u128);
+            *limb = (v / rhs) as u64;
+            rem = v % rhs;
+        }
+        rem as u32
+    }
+
+    fn to_le_bytes(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, limb) in self.0.iter().enumerate() {
+            out[i * 8..][..8].copy_from_slice(&limb.to_le_bytes());
+        }
+        out
+    }
+}
+
+impl Ord for U256 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (a, b) in self.0.iter().rev().zip(other.0.iter().rev()) {
+            match a.cmp(b) {
+                std::cmp::Ordering::Equal => {}
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl PartialOrd for U256 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn decimal_oob() -> EmitterError {
+    EmitterError::UnsupportedValue {
+        target_column: String::new(),
+        kind: "numeric out of range for Decimal column",
+    }
+}
+
+fn decimal_type_error(msg: &str) -> EmitterError {
+    EmitterError::Type(msg.into())
+}
+
+/// Convert a PG `numeric` text rendering (`numeric_out` form, eg
+/// `-12.340`) to the scaled integer a CH `Decimal(_, scale)` stores:
+/// `value * 10^scale`, encoded as two's-complement little-endian bytes
+/// at the Decimal wire width. PG stores values conforming to column
+/// typmod, so text dscale normally equals `scale`; rescale handles
+/// integer-valued numerics and defensive target-scale overrides.
+fn decimal_text_to_scaled_le(
+    text: &str,
+    scale: i32,
+    width: DecimalWidth,
+) -> Result<[u8; 32], EmitterError> {
+    let width = width.bytes();
+    if scale < 0 {
+        return Err(decimal_type_error("Decimal column has negative scale"));
+    }
+
+    let neg = text.starts_with('-');
+    // Strip at most one leading sign; numeric_out emits a single optional
+    // '-', so a residual sign char in `body` is malformed and the parse
+    // loop below rejects it as a non-digit.
+    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let mut mag = U256::default();
+    let mut frac_digits = 0i32;
+    let mut seen_dot = false;
+    let mut saw_digit = false;
+
+    for b in body.bytes() {
+        match b {
+            b'.' if !seen_dot => seen_dot = true,
+            b'0'..=b'9' => {
+                saw_digit = true;
+                if !mag.checked_mul_small(10) || !mag.checked_add_small((b - b'0') as u32) {
+                    return Err(decimal_oob());
+                }
+                if seen_dot {
+                    frac_digits += 1;
+                }
+            }
+            _ => return Err(decimal_oob()),
+        }
+    }
+    if !saw_digit {
+        return Err(decimal_oob());
+    }
+
+    let diff = scale - frac_digits;
+    if diff > 0 {
+        for _ in 0..diff {
+            if !mag.checked_mul_small(10) {
+                return Err(decimal_oob());
+            }
+        }
+    } else if diff < 0 {
+        // Text carries more fractional digits than the column scale.
+        // PG would have rounded on store, so this is a defensive
+        // truncation that should not occur for conforming values.
+        for _ in 0..-diff {
+            mag.div_small(10);
+        }
+    }
+
+    // Bound the magnitude by the physical wire width (signed Int{32,64,
+    // 128,256} range), not the logical Decimal(p,s) precision of 10^p.
+    // The bridge maps numeric(p,s) → Decimal(p,s) with matching p, so
+    // conforming values satisfy both; this check is the backstop that
+    // turns a too-wide value (eg an operator override onto a narrower
+    // Decimal) into a clean error instead of a silently truncated store.
+    let limit = U256::one_shl(width * 8 - 1);
+    if (!neg && mag >= limit) || (neg && mag > limit) {
+        return Err(decimal_oob());
+    }
+
+    let mut out = mag.to_le_bytes();
+    if neg && !mag.is_zero() {
+        for b in &mut out[..width] {
+            *b = !*b;
+        }
+        let mut carry = 1u16;
+        for b in &mut out[..width] {
+            let v = (*b as u16) + carry;
+            *b = v as u8;
+            carry = v >> 8;
+            if carry == 0 {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn encode_value(
+    buf: &mut ColumnBuf,
+    v: &ColumnValue,
+    decimal: Option<DecimalWire>,
+) -> Result<(), EmitterError> {
     match v {
         ColumnValue::Null => buf.append_null(),
         ColumnValue::Bool(b) => buf.append_fixed_bytes(&[*b as u8]),
@@ -979,6 +1224,8 @@ fn encode_value(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError
         ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
         ColumnValue::Date(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        // `time` → `Time64(6)`: microseconds since midnight, no epoch
+        // offset (matches the bridge's `Time64(6)` mapping).
         ColumnValue::Time(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
         ColumnValue::Timestamp(n) | ColumnValue::TimestampTz(n) => {
             // PG epoch → Unix epoch, microseconds. CH `DateTime64(6)` is
@@ -986,20 +1233,48 @@ fn encode_value(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError
             let unix_us = n.saturating_add(DATETIME64_PG_EPOCH_US);
             buf.append_fixed_bytes(&unix_us.to_le_bytes())
         }
-        ColumnValue::TimeTz { micros, .. } => buf.append_fixed_bytes(&micros.to_le_bytes()),
+        // `timetz` → text (CH has no zone-aware time type); preserves
+        // the offset the fixed encoding used to drop.
+        ColumnValue::TimeTz { micros, tz_seconds } => {
+            buf.append_string_bytes(crate::codecs::timetz_to_text(*micros, *tz_seconds).as_bytes())
+        }
         ColumnValue::Uuid(b) => buf.append_fixed_bytes(b),
         ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => {
             buf.append_string_bytes(s.as_bytes())
         }
         ColumnValue::Numeric(n) => {
             use crate::codecs::NumericKind;
-            let txt: &str = match n {
-                NumericKind::Finite(s) => s.as_str(),
-                NumericKind::NaN => "NaN",
-                NumericKind::PInf => "Infinity",
-                NumericKind::NInf => "-Infinity",
-            };
-            buf.append_string_bytes(txt.as_bytes())
+            match decimal {
+                // Decimal column: encode the finite value as a scaled
+                // little-endian integer. Non-finite (NaN/±Inf) can't be
+                // represented — surface as an error so nothing is
+                // silently corrupted (operator maps that column to
+                // String to recover).
+                Some(decimal) => match n {
+                    NumericKind::Finite(s) => {
+                        let scaled =
+                            decimal_text_to_scaled_le(s, i32::from(decimal.scale), decimal.width)?;
+                        buf.append_fixed_bytes(&scaled[..decimal.width.bytes()])
+                    }
+                    NumericKind::NaN | NumericKind::PInf | NumericKind::NInf => {
+                        Err(EmitterError::UnsupportedValue {
+                            target_column: String::new(),
+                            kind: "non-finite numeric (NaN/Inf) into Decimal column",
+                        })
+                    }
+                },
+                // String column (unconstrained numeric or operator
+                // mapping): lossless text, including NaN/±Inf.
+                None => {
+                    let txt: &str = match n {
+                        NumericKind::Finite(s) => s.as_str(),
+                        NumericKind::NaN => "NaN",
+                        NumericKind::PInf => "Infinity",
+                        NumericKind::NInf => "-Infinity",
+                    };
+                    buf.append_string_bytes(txt.as_bytes())
+                }
+            }
         }
         ColumnValue::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
         ColumnValue::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
@@ -1051,11 +1326,10 @@ pub struct Emitter {
     /// hold-INSERT-open path's deadline check inside
     /// [`Self::on_xact_end_with_lsn`].
     flush_deadline: Option<Instant>,
-    /// Highest `commit_lsn` of any row currently buffered in an open
-    /// INSERT (either in [`TableEncoder`] memory or already shipped
-    /// via [`TableEncoder::flush_block`] but not yet sealed by
-    /// `send_data(None)`). Bumped per tuple in [`Self::route`], reset
-    /// to `0` on close, then `last_durable_commit_lsn` adopts it.
+    /// Highest `commit_lsn` of any row buffered in a [`TableEncoder`]
+    /// but not yet sealed by a completed INSERT (`EndOfStream`). Bumped
+    /// per tuple in [`Self::route`], reset to `0` once every buffer has
+    /// drained, then `last_durable_commit_lsn` adopts it.
     pending_max_commit_lsn: u64,
     /// Highest `commit_lsn` known durable on CH (i.e. covered by a
     /// closed INSERT's `EndOfStream`). xact_buffer pulls this through
@@ -1084,6 +1358,9 @@ pub struct EmitterStats {
     pub blocks_sent: u64,
     pub xacts_committed: u64,
     pub unsupported_relations: u64,
+    /// Rows whose filenode resolved to a foreign database (physical WAL
+    /// carries the whole cluster). Skipped, not an error.
+    pub foreign_db_rows_skipped: u64,
     pub unsupported_values: u64,
     /// Phase 10 retry bookkeeping. `reconnects` ticks on every fresh
     /// CH socket the daemon hot-replaces; `retries_attempted` ticks on
@@ -1164,10 +1441,20 @@ impl Emitter {
         if self.current_xid.is_none() {
             self.current_xid = Some(committed.decoded.xid);
         }
-        let rel = self
+        let rel = match self
             .resolver
             .relation_at(committed.decoded.rfn, committed.decoded.source_lsn)
-            .await?;
+            .await
+        {
+            Ok(rel) => rel,
+            // Foreign-DB WAL: skip like an unmapped relation (no append,
+            // no poison), let the ack advance past it.
+            Err(CatalogError::ForeignDatabase(_)) => {
+                self.stats.foreign_db_rows_skipped += 1;
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mapping = {
             let m = self.mapping.read().await;
             match m.get(rel.qualified_name.as_ref()).cloned() {
@@ -1243,10 +1530,10 @@ impl Emitter {
         self.pending_max_commit_lsn = self.pending_max_commit_lsn.max(committed.commit_lsn);
         let tripped =
             enc.rows >= self.config.row_budget || enc.approx_bytes >= self.config.byte_budget;
-        // Budget trip flushes the per-table data block to wire (opens
-        // INSERT for this table if not already, switching off any other
-        // table's open wire first). INSERT stays open across xacts in
-        // hold-open mode; legacy mode closes on the next xact_end.
+        // Budget trip seals this table's buffered rows as one complete
+        // INSERT (open → block → EndOfStream → clear). Bounds client
+        // memory; an over-budget xact lands as several sealed parts
+        // rather than one streamed-but-unconfirmed part.
         if tripped {
             let key_owned = rel.qualified_name.as_ref().to_owned();
             self.flush_table(&key_owned)?;
@@ -1312,34 +1599,37 @@ impl Emitter {
                 _ => {}
             }
         }
-        Ok(())
-    }
-
-    fn flush_table(&mut self, key: &str) -> Result<(), EmitterError> {
-        self.open_wire(key)?;
-        let alloc = self.alloc;
-        let enc = self
-            .tables
-            .get_mut(key)
-            .expect("flush_table called on unknown key");
-        let n = enc.flush_block(&mut self.client, alloc, BlockOpts::default())?;
-        if n > 0 {
-            self.stats.rows_emitted += n as u64;
-            self.stats.blocks_sent += 1;
+        // EndOfStream confirmed: the INSERT is durable on CH, so the
+        // rows just sealed are now safe to drop. Until this point the
+        // buffer is the only replay source if the connection bounced.
+        if let Some(enc) = self.tables.get_mut(&key) {
+            enc.clear();
         }
         Ok(())
     }
 
-    /// Per-xact landmark. In hold-open mode flushes accumulated rows
-    /// into Data blocks on each still-open INSERT (no
-    /// `send_data(None)`, no `EndOfStream` wait — cheap, no
-    /// roundtrip). In legacy mode (or when the deadline has tripped)
-    /// closes every open INSERT and drains to `EndOfStream`. Either
-    /// way, returns the highest `commit_lsn` now known durable on CH.
+    /// Seal `key`'s buffered rows as one complete, independently-durable
+    /// INSERT: open the wire, ship the block, terminate, drain to
+    /// `EndOfStream`, then clear the buffer. A budget trip lands here,
+    /// so an over-budget xact produces several sealed parts rather than
+    /// one streamed-but-unconfirmed part — the buffer never holds
+    /// shipped-but-unacked rows that a disconnect would lose.
+    fn flush_table(&mut self, key: &str) -> Result<(), EmitterError> {
+        self.open_wire(key)?;
+        self.close_current_wire()
+    }
+
+    /// Per-xact landmark. In hold-open mode rows from this xact stay
+    /// buffered in their [`TableEncoder`]s, sharing the next flush
+    /// window with later xacts — nothing ships until a budget trip or
+    /// the deadline seals a complete INSERT. In legacy mode (or when
+    /// the deadline has tripped) seals every buffered table now and
+    /// drains each to `EndOfStream`. Either way, returns the highest
+    /// `commit_lsn` now known durable on CH.
     ///
     /// `xact_buffer`'s `emitter_ack_lsn` tracks the returned value,
     /// not the input `commit_lsn`, so hold-open shows up as
-    /// `emitter_ack_lsn` lagging `drain_lsn` until the next close.
+    /// `emitter_ack_lsn` lagging `drain_lsn` until the next seal.
     fn on_xact_end_with_lsn(&mut self, commit_lsn: u64) -> Result<u64, EmitterError> {
         let now = Instant::now();
         let deadline_tripped = self.flush_deadline.is_some_and(|d| now >= d);
@@ -1374,11 +1664,12 @@ impl Emitter {
         Ok(self.last_durable_commit_lsn)
     }
 
-    /// Flush every table with buffered rows through the single open
-    /// wire (serial: each table's `flush_table` closes the prior
-    /// table's INSERT before opening its own), then close the trailing
-    /// wire. Promotes `pending_max_commit_lsn` to
-    /// `last_durable_commit_lsn` and resets the flush window. Called
+    /// Seal every table with buffered rows as its own complete INSERT
+    /// (each `flush_table` opens, ships, and drains to `EndOfStream`),
+    /// then promote `pending_max_commit_lsn` to
+    /// `last_durable_commit_lsn` and reset the flush window. The
+    /// promotion is safe only because every buffer is now drained — the
+    /// durable horizon never moves past a still-buffered row. Called
     /// from [`Self::on_xact_end_with_lsn`] on deadline trip or legacy
     /// per-xact close, and from [`Self::flush_open_inserts`] for
     /// explicit shutdown flush.
@@ -1392,10 +1683,11 @@ impl Emitter {
         for key in keys {
             self.flush_table(&key)?;
         }
+        // Each flush_table already closed its wire; this is a defensive
+        // no-op for a wire left open by a non-flush path (e.g. TRUNCATE
+        // ordering). Empty encoders stay around so the next flush window
+        // reuses the ColumnBuf allocations + cached TablePlan.
         self.close_current_wire()?;
-        // Empty encoders stay around so the next flush window reuses
-        // the ColumnBuf allocations + cached TablePlan. DDL drops them
-        // through `dispatch_schema_event` if the shape changed.
         self.last_durable_commit_lsn = self
             .last_durable_commit_lsn
             .max(self.pending_max_commit_lsn);
@@ -1473,6 +1765,18 @@ impl Emitter {
     /// line, metrics) can use it.
     pub fn last_durable_commit_lsn(&self) -> u64 {
         self.last_durable_commit_lsn
+    }
+
+    /// Ceiling for an idle-advance ack at `lsn`. When nothing is
+    /// buffered client-side (no open wire, every encoder empty), `lsn`
+    /// is fully durable-safe — trailing WAL past the last commit carries
+    /// no rows to ship. Otherwise cap at `last_durable_commit_lsn` so a
+    /// quiescent-tick nudge can't promote the ack past rows still held
+    /// in open INSERTs. Mirrors the guard in `on_xact_end_with_lsn`.
+    pub fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
+        let fully_drained =
+            self.wire_open_key.is_none() && self.tables.values().all(|e| e.rows == 0);
+        idle_ceiling(fully_drained, lsn, self.last_durable_commit_lsn)
     }
 
     /// Phase 10 reconnect: open a fresh TCP socket against the same
@@ -1611,6 +1915,14 @@ impl Emitter {
 /// bound the total wall-time. Config / Type / Catalog /
 /// UnsupportedValue stay fatal because they encode bugs in the daemon
 /// or mapping; retrying would loop forever.
+/// Pure core of [`Emitter::idle_ack_ceiling`]: when the emitter is
+/// fully drained (no open wire, every encoder empty) trailing WAL is
+/// shippable-free so `lsn` is safe; otherwise cap at the durable
+/// horizon so an idle nudge can't ack rows still buffered client-side.
+fn idle_ceiling(fully_drained: bool, lsn: u64, durable: u64) -> u64 {
+    if fully_drained { lsn } else { durable }
+}
+
 fn is_retryable(e: &EmitterError) -> bool {
     matches!(
         e,
@@ -1673,22 +1985,26 @@ impl TupleObserver for EmitterObserver {
         })
     }
 
+    fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
+        self.emitter.idle_ack_ceiling(lsn)
+    }
+
     /// Idle wakeup: close any held-open INSERT whose deadline has
     /// elapsed. Hot path when `flush_timeout > 0` and traffic stops —
     /// without this the last burst of rows would stay buffered
     /// client-side past the deadline, since `on_xact_end` only fires
-    /// per committed xact.
+    /// per committed xact. Returns the post-close durable horizon so
+    /// the xact buffer advances `emitter_ack_lsn` to it.
     fn on_idle<'a>(
         &'a mut self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
             self.emitter
                 .flush_if_deadline_tripped_with_retry()
                 .await
-                .map_err(DecoderSinkError::from)?;
-            Ok(())
+                .map_err(DecoderSinkError::from)
         })
     }
 
@@ -1756,6 +2072,14 @@ mod tests {
     use super::*;
     use crate::heap_decoder::{DecodedHeap, DecodedTuple};
     use wal_rs::pg::walparser::RelFileNode;
+
+    #[test]
+    fn idle_ceiling_caps_when_buffered() {
+        // Fully drained: trailing WAL past the durable horizon is safe.
+        assert_eq!(idle_ceiling(true, 500, 300), 500);
+        // Rows held (open wire or non-empty encoder): cap at durable.
+        assert_eq!(idle_ceiling(false, 500, 300), 300);
+    }
 
     fn mk_mapping() -> TableMapping {
         TableMapping {
@@ -1957,6 +2281,163 @@ mod tests {
                 ColumnBuf::NullableString { .. } => "NullableString",
             };
             assert_eq!(actual, tag, "{name}");
+        }
+    }
+
+    #[test]
+    fn decimal_text_scales_to_integer() {
+        fn le_i64(text: &str, scale: i32) -> [u8; 8] {
+            let le = decimal_text_to_scaled_le(text, scale, DecimalWidth::D64).unwrap();
+            le[..8].try_into().unwrap()
+        }
+
+        assert_eq!(le_i64("0", 2), 0i64.to_le_bytes());
+        assert_eq!(le_i64("12", 2), 1200i64.to_le_bytes());
+        assert_eq!(le_i64("1.50", 2), 150i64.to_le_bytes());
+        assert_eq!(le_i64("-12.34", 2), (-1234i64).to_le_bytes());
+        assert_eq!(le_i64("0.001", 3), 1i64.to_le_bytes());
+        // More fractional digits than the column scale: defensive trunc.
+        assert_eq!(le_i64("123.456", 2), 12345i64.to_le_bytes());
+        // Malformed input rejected: doubled sign, empty, stray chars.
+        assert!(decimal_text_to_scaled_le("--5", 0, DecimalWidth::D64).is_err());
+        assert!(decimal_text_to_scaled_le("", 0, DecimalWidth::D64).is_err());
+        assert!(decimal_text_to_scaled_le("1.2.3", 0, DecimalWidth::D64).is_err());
+    }
+
+    #[test]
+    fn decimal_text_rejects_signed_width_overflow() {
+        let max = i128::MAX.to_string();
+        let le = decimal_text_to_scaled_le(&max, 0, DecimalWidth::D128).unwrap();
+        assert_eq!(&le[..16], &i128::MAX.to_le_bytes());
+
+        let min_mag = "170141183460469231731687303715884105728";
+        assert!(decimal_text_to_scaled_le(min_mag, 0, DecimalWidth::D128).is_err());
+
+        let le = decimal_text_to_scaled_le(&format!("-{min_mag}"), 0, DecimalWidth::D128).unwrap();
+        assert_eq!(&le[..16], &i128::MIN.to_le_bytes());
+    }
+
+    #[test]
+    fn decimal_text_encodes_decimal256_width() {
+        let le = decimal_text_to_scaled_le("-1", 0, DecimalWidth::D256).unwrap();
+        assert_eq!(&le[..32], &[0xff; 32]);
+
+        let wide39 = "9".repeat(39);
+        assert!(decimal_text_to_scaled_le(&wide39, 0, DecimalWidth::D128).is_err());
+        let le = decimal_text_to_scaled_le(&wide39, 0, DecimalWidth::D256).unwrap();
+        assert!(le[16..32].iter().any(|b| *b != 0));
+
+        let wide76 = "9".repeat(76);
+        assert!(decimal_text_to_scaled_le(&wide76, 0, DecimalWidth::D256).is_ok());
+    }
+
+    #[test]
+    fn encode_numeric_into_decimal_and_string() {
+        use crate::codecs::NumericKind;
+        let alloc = Allocator::stdlib();
+        // Decimal(10,2) → Decimal64 (8 bytes); "1.50" scaled by 100 = 150.
+        let ast = TypeAst::parse("Decimal(10, 2)", alloc).unwrap();
+        let decimal = decimal_wire_of(&ast);
+        assert_eq!(
+            decimal,
+            Some(DecimalWire {
+                scale: 2,
+                width: DecimalWidth::D64
+            })
+        );
+        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
+        encode_value(
+            &mut buf,
+            &ColumnValue::Numeric(NumericKind::Finite("1.50".into())),
+            decimal,
+        )
+        .unwrap();
+        match &buf {
+            ColumnBuf::Fixed { width, bytes } => {
+                assert_eq!(*width, 8);
+                assert_eq!(bytes.as_slice(), &150i64.to_le_bytes());
+            }
+            _ => panic!("expected fixed-shape buffer"),
+        }
+        // NaN into a Decimal column is unrepresentable → error.
+        let mut buf_nan = ColumnBuf::new_for_ast(&ast).unwrap();
+        assert!(
+            encode_value(
+                &mut buf_nan,
+                &ColumnValue::Numeric(NumericKind::NaN),
+                decimal,
+            )
+            .is_err()
+        );
+
+        let wide_ast = TypeAst::parse("Decimal(50, 2)", alloc).unwrap();
+        let wide_decimal = decimal_wire_of(&wide_ast);
+        assert_eq!(
+            wide_decimal,
+            Some(DecimalWire {
+                scale: 2,
+                width: DecimalWidth::D256
+            })
+        );
+        let mut wide_buf = ColumnBuf::new_for_ast(&wide_ast).unwrap();
+        encode_value(
+            &mut wide_buf,
+            &ColumnValue::Numeric(NumericKind::Finite(
+                "123456789012345678901234567890123456789012345678.12".into(),
+            )),
+            wide_decimal,
+        )
+        .unwrap();
+        match &wide_buf {
+            ColumnBuf::Fixed { width, bytes } => {
+                assert_eq!(*width, 32);
+                assert_eq!(bytes.len(), 32);
+                assert!(bytes[16..32].iter().any(|b| *b != 0));
+            }
+            _ => panic!("expected fixed-shape buffer"),
+        }
+
+        // String-mapped numeric (unconstrained) renders text.
+        let sast = TypeAst::parse("String", alloc).unwrap();
+        let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
+        encode_value(&mut sbuf, &ColumnValue::Numeric(NumericKind::NaN), None).unwrap();
+        match &sbuf {
+            ColumnBuf::String { data, .. } => assert_eq!(data.as_slice(), b"NaN"),
+            _ => panic!("expected string-shape buffer"),
+        }
+    }
+
+    #[test]
+    fn encode_time_native_and_timetz_text() {
+        let alloc = Allocator::stdlib();
+        let micros = 45_296_000_000i64; // 12:34:56
+        // time → Time64(6): raw microseconds LE, 8 bytes.
+        let ast = TypeAst::parse("Time64(6)", alloc).unwrap();
+        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
+        encode_value(&mut buf, &ColumnValue::Time(micros), None).unwrap();
+        match &buf {
+            ColumnBuf::Fixed { width, bytes } => {
+                assert_eq!(*width, 8);
+                assert_eq!(bytes.as_slice(), &micros.to_le_bytes());
+            }
+            _ => panic!("expected fixed-shape buffer"),
+        }
+        // timetz → String text carrying the zone (which the old fixed
+        // encoding silently dropped).
+        let sast = TypeAst::parse("String", alloc).unwrap();
+        let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
+        encode_value(
+            &mut sbuf,
+            &ColumnValue::TimeTz {
+                micros,
+                tz_seconds: -7200,
+            },
+            None,
+        )
+        .unwrap();
+        match &sbuf {
+            ColumnBuf::String { data, .. } => assert_eq!(data.as_slice(), b"12:34:56+02"),
+            _ => panic!("expected string-shape buffer"),
         }
     }
 

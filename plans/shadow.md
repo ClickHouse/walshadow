@@ -110,6 +110,17 @@ caller proved freshness or cache is driven from non-WAL source
 load-bearing: DDL observed concurrently during the yield can have
 bumped the epoch
 
+Foreign-DB filenodes are rejected before the SQL fan-out:
+`fetch_by_filenode` returns `CatalogError::ForeignDatabase` when
+`rfn.db_node` is neither the connected shadow DB nor `0` (shared
+catalog). Physical replication ships the whole cluster's WAL, and
+relfilenodes are unique only within a database — a foreign `db_node`'s
+`rel_node` can collide with a real local relation and resolve to the
+wrong descriptor (`spc_node` need not match). The connected DB OID is
+memoized in `current_db_oid` (fixed by `conninfo`, survives reconnect);
+`foreign_db_skips` counts the rejections. Emitter folds the error into
+a row skip (see [emitter.md](emitter.md))
+
 ## Catalog invalidation
 
 Single `u64` generation counter; lazy eviction keeps `invalidate()`
@@ -233,8 +244,10 @@ back-pressure surfaces naturally as task-local await depth rather than
 channel saturation
 
 `NamespaceMapping` ([src/ch_emitter.rs](../src/ch_emitter.rs)) ships
-`auto_create: bool` only. Plan additionally listed `type_overrides`,
-`order_by_default`, `engine_default` — none landed. Accompanying
+`auto_create`, `target_database`, and `drop_table_strategy` (the latter
+two resolved per-namespace in `DdlApplicator`). Plan additionally listed
+`type_overrides`, `order_by_default`, `engine_default` — none landed.
+Accompanying
 `watch::Receiver<Arc<ResolvedConfig>>` resolver refactor also did not
 land — emitter still consumes `Arc<RwLock<HashMap>>` on SIGHUP. Closing
 those gaps is prerequisite for runtime-config-from-PG. See

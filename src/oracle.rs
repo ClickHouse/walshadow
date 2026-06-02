@@ -388,9 +388,13 @@ impl<O: TupleObserver + Send> TupleObserver for OracleObserver<O> {
         self.inner.on_schema_event(event)
     }
 
+    fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
+        self.inner.idle_ack_ceiling(lsn)
+    }
+
     fn on_idle<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
         self.inner.on_idle()
     }
 

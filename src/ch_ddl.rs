@@ -31,11 +31,13 @@
 //! must be closed first; that's the emitter's responsibility (see
 //! `Emitter::flush_for_schema_change`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use clickhouse_c::{Allocator, Client, ClientOpts, PacketKind, PosixIo};
 
-use crate::ch_emitter::{ColumnMapping, EmitterConfig, EmitterError, MappingHandle, TableMapping};
+use crate::ch_emitter::{
+    ColumnMapping, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, TableMapping,
+};
 use crate::shadow_catalog::{RelDescriptor, SchemaDiff, SchemaEvent};
 use crate::type_bridge::{self, ResolvedColumn};
 
@@ -83,10 +85,15 @@ pub struct DdlConfig {
     /// applicator consults `mapping_handle` for the per-table override
     /// path and treats namespace-implicit creates as best-effort.
     pub auto_create_namespaces: HashSet<String>,
-    /// CH database name DDL targets when the per-table mapping doesn't
-    /// override the destination explicitly. Matches the emitter's
-    /// `EmitterConfig::database`.
+    /// CH database name DDL targets when neither the per-table mapping
+    /// nor the source namespace overrides the destination. Matches the
+    /// emitter's `EmitterConfig::database`.
     pub target_database: String,
+    /// Per-namespace overrides (`target_database`, `drop_table_strategy`)
+    /// keyed by source namespace, resolved in [`Self::target_database_for`]
+    /// and [`Self::drop_strategy_for`]. The global fields above are the
+    /// fallback when a namespace has no override.
+    pub namespaces: HashMap<String, NamespaceMapping>,
 }
 
 impl DdlConfig {
@@ -97,16 +104,33 @@ impl DdlConfig {
             .filter(|(_, v)| v.auto_create)
             .map(|(k, _)| k.clone())
             .collect();
-        // Global drop strategy wins; per-namespace overrides land via a
-        // post-construction patch (the applicator doesn't see the
-        // namespace map directly).
         let drop_table_strategy =
             DropTableStrategy::parse(&cfg.drop_table_strategy).unwrap_or_default();
         Self {
             drop_table_strategy,
             auto_create_namespaces,
             target_database: cfg.database.clone(),
+            namespaces: cfg.namespaces.clone(),
         }
+    }
+
+    /// Destination CH database for a source namespace: its
+    /// `target_database` override if set, else the global default.
+    fn target_database_for(&self, namespace: &str) -> &str {
+        self.namespaces
+            .get(namespace)
+            .and_then(|n| n.target_database.as_deref())
+            .unwrap_or(&self.target_database)
+    }
+
+    /// Drop strategy for a source namespace: its `drop_table_strategy`
+    /// override (parsed) if set, else the global default.
+    fn drop_strategy_for(&self, namespace: &str) -> DropTableStrategy {
+        self.namespaces
+            .get(namespace)
+            .and_then(|n| n.drop_table_strategy.as_deref())
+            .and_then(|s| DropTableStrategy::parse(s).ok())
+            .unwrap_or(self.drop_table_strategy)
     }
 
     pub fn with_drop_strategy(mut self, s: DropTableStrategy) -> Self {
@@ -207,7 +231,14 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         }
-        let sql = match render_create_table(desc, &self.config.target_database)? {
+        // Per-namespace target_database override (else global). Drives
+        // both the CREATE TABLE and the row-routing mapping below, so
+        // rows and DDL land in the same database.
+        let target_db = self
+            .config
+            .target_database_for(&desc.namespace_name)
+            .to_owned();
+        let sql = match render_create_table(desc, &target_db)? {
             Some(s) => s,
             None => {
                 self.stats.skipped += 1;
@@ -218,11 +249,7 @@ impl DdlApplicator {
         self.stats.creates_applied += 1;
         // Auto-derive a TableMapping so the emitter can ship rows
         // against the freshly-created CH table without TOML edits.
-        let target = format!(
-            "{}.{}",
-            sql_ident(&self.config.target_database),
-            sql_ident(&desc.name)
-        );
+        let target = format!("{}.{}", sql_ident(&target_db), sql_ident(&desc.name));
         let columns = derive_columns_for_mapping(desc);
         let mapping = TableMapping { target, columns };
         let mut m = self.mapping.write().await;
@@ -408,7 +435,11 @@ impl DdlApplicator {
                 return Ok(());
             }
         };
-        match self.config.drop_table_strategy {
+        // Namespace is the prefix of `namespace.name` (see
+        // `RelDescriptor::build_qualified_name`); resolve its per-
+        // namespace drop strategy, else the global default.
+        let namespace = qualified_name.split('.').next().unwrap_or_default();
+        match self.config.drop_strategy_for(namespace) {
             DropTableStrategy::Retain => {
                 self.stats.skipped += 1;
                 tracing::info!(
@@ -627,6 +658,46 @@ mod tests {
     use crate::heap_decoder::{INT4OID, TEXTOID, TIMESTAMPTZOID};
     use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent, SchemaDiff};
     use std::sync::Arc;
+
+    #[test]
+    fn per_namespace_target_and_drop_override_global() {
+        use crate::ch_emitter::NamespaceMapping;
+        use std::collections::HashMap;
+        let mut namespaces = HashMap::new();
+        namespaces.insert(
+            "analytics".to_string(),
+            NamespaceMapping {
+                target_database: Some("warehouse".into()),
+                auto_create: true,
+                drop_table_strategy: Some("drop".into()),
+            },
+        );
+        namespaces.insert(
+            "logs".to_string(),
+            NamespaceMapping {
+                target_database: None,
+                auto_create: true,
+                drop_table_strategy: None,
+            },
+        );
+        let cfg = DdlConfig {
+            drop_table_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            target_database: "default".into(),
+            namespaces,
+        };
+        // target_database: namespace override, else global fallback.
+        assert_eq!(cfg.target_database_for("analytics"), "warehouse");
+        assert_eq!(cfg.target_database_for("logs"), "default");
+        assert_eq!(cfg.target_database_for("unconfigured"), "default");
+        // drop strategy: namespace override, else global fallback.
+        assert_eq!(cfg.drop_strategy_for("analytics"), DropTableStrategy::Drop);
+        assert_eq!(cfg.drop_strategy_for("logs"), DropTableStrategy::Retain);
+        assert_eq!(
+            cfg.drop_strategy_for("unconfigured"),
+            DropTableStrategy::Retain
+        );
+    }
 
     fn att(attnum: i16, name: &str, oid: u32, not_null: bool, missing: Option<&str>) -> RelAttr {
         RelAttr {

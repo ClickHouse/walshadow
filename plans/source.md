@@ -41,9 +41,12 @@ per `CopyData('w')` frame. `next_chunk` blocks on one server message;
 WAL data returns to caller, keepalives absorbed transparently,
 `reply_requested` echoes `'r'` status update inline.
 [`StandbyStatus { write_lsn, flush_lsn, apply_lsn }`](../src/source_feed.rs)
-passes in per call; `send_status` clamps each slot through
-`last_acked_lsn` — PG treats flush/apply regression as protocol violation
-and force-disconnects. Cadence
+passes in per call; `send_status` clamps each field to its own monotonic
+high-water (`StatusFloors` via `clamp_status`) — PG treats flush/apply
+regression as a protocol violation and force-disconnects. Per-field
+floors, not one shared high-water: a leading `write` must not lift
+`flush`/`apply`, which would claim durability the filter and CH emitter
+have not reached and let source recycle un-filtered WAL. Cadence
 [`DEFAULT_STATUS_INTERVAL = 10s`](../src/source_feed.rs); source's
 `wal_sender_timeout` default 60s gives 6× headroom
 
@@ -200,13 +203,16 @@ returns parked error, daemon exits cleanly with real root cause rather
 than hanging
 
 Worker uses `tokio::time::timeout(idle_interval, rx.recv())`. On timeout
-calls `inner.on_idle()` — CH emitter's hold-INSERT-open deadline fires
-there without fresh records. Channel close fires `inner.on_close()`
-for one last flush. `on_idle_advance(lsn)` runs after every batch
-carrying max `source_lsn`; xact buffer uses it to advance
-`emitter_ack_lsn` past trailing non-commit WAL (checkpoint,
-RUNNING_XACTS) when no xact is in flight — without it source's slot
-pins WAL at last COMMIT, kill-restart idle catchup never resolves
+calls `inner.on_idle()` — CH emitter's deadline seal fires there without
+fresh records; the returned durable LSN folds into `emitter_ack_lsn` via
+`note_idle_durable`. Channel close fires `inner.on_close()` for one last
+flush. `on_idle_advance(lsn)` runs after every batch carrying max
+`source_lsn`; xact buffer uses it to advance `emitter_ack_lsn` past
+trailing non-commit WAL (checkpoint, RUNNING_XACTS) when no xact is in
+flight — but capped at the observer's `idle_ack_ceiling(lsn)` so the
+nudge can't promote past rows still buffered in the emitter. Without it
+source's slot pins WAL at last COMMIT, kill-restart idle catchup never
+resolves
 
 ## DecoderSink
 
@@ -248,6 +254,13 @@ across xacts can report ack lag without breaking slot-advance gate.
 Default impl returns `commit_lsn` (instant ack); CH emitter overrides
 to thread `flush_timeout` deadline. See [xact.md](xact.md) for where
 committed tuples land
+
+Two idle-path hooks pair with it: `on_idle() -> Result<u64>` returns the
+commit LSN a deadline-triggered close just made durable (`0` when
+nothing promoted), and `idle_ack_ceiling(lsn) -> u64` caps an idle
+advance at the observer's durable horizon. Defaults are `Ok(0)` and
+`lsn` — non-buffering observers (metrics, collectors) impose no
+constraint; the CH emitter overrides both to surface its hold-open lag
 
 ## Zero-copy framing
 

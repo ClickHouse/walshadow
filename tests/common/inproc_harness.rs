@@ -192,6 +192,28 @@ impl ChServer {
         fs::create_dir_all(&data_dir)?;
         let log_dir = tmp.path().join("ch-logs");
         fs::create_dir_all(&log_dir)?;
+        // Default-profile users config that also enables CH `Time64`
+        // (the bridge maps PG `time` to it; gated behind this
+        // experimental setting in CH 25.x — production must enable it
+        // server-side too). Replaces the built-in users config, so the
+        // passwordless default user is restated here.
+        let users_xml = tmp.path().join("users.xml");
+        fs::write(
+            &users_xml,
+            "<clickhouse>\
+                <profiles><default>\
+                    <enable_time_time64_type>1</enable_time_time64_type>\
+                </default></profiles>\
+                <users><default>\
+                    <password></password>\
+                    <networks><ip>::/0</ip></networks>\
+                    <profile>default</profile>\
+                    <quota>default</quota>\
+                    <access_management>1</access_management>\
+                </default></users>\
+                <quotas><default/></quotas>\
+            </clickhouse>",
+        )?;
         let child = Command::new("clickhouse")
             .args([
                 "server",
@@ -208,6 +230,7 @@ impl ChServer {
                 &format!("--logger.log={}/server.log", log_dir.display()),
                 &format!("--logger.errorlog={}/error.log", log_dir.display()),
                 "--logger.level=warning",
+                &format!("--users_config={}", users_xml.display()),
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -64,6 +64,8 @@ pub enum CatalogError {
     Pg(#[from] tokio_postgres::Error),
     #[error("relation not found by filenode {0:?}")]
     NotFoundByFilenode(RelFileNode),
+    #[error("relation in foreign database {0:?} (not the shadow DB)")]
+    ForeignDatabase(RelFileNode),
     #[error("relation not found by oid {0}")]
     NotFoundByOid(Oid),
     #[error("timeout after {elapsed:?} waiting for replay ≥ {target:#X} (last observed: {last:?})")]
@@ -325,6 +327,10 @@ pub struct ShadowCatalogStats {
     pub generation_bumps: u64,
     pub replay_waits: u64,
     pub evictions: u64,
+    /// Records whose `db_node` is neither the shadow DB nor a shared
+    /// catalog (db_node 0). Physical replication ships the whole
+    /// cluster's WAL; these are rejected before the filenode query.
+    pub foreign_db_skips: u64,
     /// Successful `tokio_postgres::connect` calls past the first; each one
     /// drives a generation bump and a `last_replay_lsn` reset.
     pub reconnects: u64,
@@ -412,6 +418,11 @@ pub struct ShadowCatalog {
     /// Last `pg_class_delete_epoch` value already swept. Same shape as
     /// `last_seen_epoch` but for the narrower counter.
     last_seen_delete_epoch: u64,
+    /// OID of the database this catalog's client is connected to. Lazily
+    /// fetched once; used to reject foreign-DB filenodes before the
+    /// relfilenode query (relfilenodes are unique only within a DB).
+    /// Survives `reconnect` — `conninfo` (hence the DB) is fixed.
+    current_db_oid: Option<Oid>,
     stats: ShadowCatalogStats,
 }
 
@@ -446,6 +457,7 @@ impl ShadowCatalog {
             last_swept_generation: 0,
             pg_class_delete_epoch: None,
             last_seen_delete_epoch: 0,
+            current_db_oid: None,
             stats: ShadowCatalogStats::default(),
         })
     }
@@ -924,6 +936,16 @@ impl ShadowCatalog {
     }
 
     async fn fetch_by_filenode(&mut self, rfn: RelFileNode) -> Result<Option<RelDescriptor>> {
+        // Reject foreign-DB filenodes before querying: relfilenodes are
+        // unique only within a (database, tablespace), so a foreign
+        // db_node's rel_node can collide with a real local relation and
+        // resolve to the wrong descriptor. spc_node need not match —
+        // relfilenode is unique per database regardless of tablespace.
+        // db_node 0 = shared catalog (visible from any DB), left through.
+        if is_foreign_db(rfn.db_node, self.current_db_oid().await?) {
+            self.stats.foreign_db_skips += 1;
+            return Err(CatalogError::ForeignDatabase(rfn));
+        }
         self.stats.fetches += 1;
         // pg_relation_filenode(oid) abstracts mapped vs unmapped: for
         // mapped catalogs it reads pg_filenode.map, for regular tables
@@ -1133,6 +1155,17 @@ impl ShadowCatalog {
             .await?;
         Ok(row.get(0))
     }
+
+    /// Memoized [`Self::current_database_oid`]. Cached across `reconnect`
+    /// since `conninfo` pins the database.
+    async fn current_db_oid(&mut self) -> Result<Oid> {
+        if let Some(oid) = self.current_db_oid {
+            return Ok(oid);
+        }
+        let oid = self.current_database_oid().await?;
+        self.current_db_oid = Some(oid);
+        Ok(oid)
+    }
 }
 
 /// Strip the single element from a PG array text literal `{val}` and
@@ -1230,12 +1263,29 @@ fn is_transient(err: &CatalogError) -> bool {
     matches!(err, CatalogError::Pg(_))
 }
 
+/// True when `db_node` belongs to neither the connected shadow DB nor a
+/// shared catalog (db_node 0). Such filenodes come from other databases
+/// in the cluster's physical WAL and must not resolve locally.
+fn is_foreign_db(db_node: Oid, current_db_oid: Oid) -> bool {
+    db_node != 0 && db_node != current_db_oid
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn foreign_db_predicate() {
+        // Shared catalog (db_node 0) is never foreign.
+        assert!(!is_foreign_db(0, 16384));
+        // Same DB resolves locally.
+        assert!(!is_foreign_db(16384, 16384));
+        // Different DB in the cluster's WAL is rejected.
+        assert!(is_foreign_db(16385, 16384));
+    }
 
     #[test]
     fn parse_array_one_element_scalars() {

@@ -3,6 +3,16 @@
 // segment sink, shadow-replay sweeper, walsender-rx standby frames →
 // writes cursor.bin (atomic rename, CRC32C) → emits standby-status
 // triple to source slot → feeds retention sweeper & Prom metrics.
+//
+// regeneration spec:
+// sources of truth: plans/ops.md · src/cursor.rs · src/preflight.rs · src/retention.rs · src/metrics.rs
+// subsumes: plans/ops.md § "Cursor file" + "Slot advance" + apply-lag metric
+// known discrepancy: cursor field count — defer to src/cursor.rs (plans/INDEX.md says "five-field", plans/ops.md says "6 LSNs")
+// quality bar:
+//   - cursor write edge (magenta dotted) reads as durability path
+//   - slot-advance edge clearly back to source PG, not confused with metrics export
+//   - preflight noted as boot-only (not in tick loop)
+// shared style: palette.md
 digraph ops {
   rankdir=TB;
   compound=true;

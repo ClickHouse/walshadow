@@ -70,6 +70,27 @@ impl StandbyStatus {
     }
 }
 
+/// Per-field monotonic high-water for advertised standby LSNs. Each
+/// field carries its own floor so a leading `write` never lifts
+/// `flush`/`apply` — that would claim durability the filter and CH
+/// emitter have not reached, letting source recycle un-filtered WAL.
+#[derive(Debug, Clone, Copy, Default)]
+struct StatusFloors {
+    write: u64,
+    flush: u64,
+    apply: u64,
+}
+
+/// Clamp each advertised LSN to its own floor and advance that floor.
+/// PG rejects a regressing flush/apply, so each field is held at its
+/// own high-water — independent of the others.
+fn clamp_status(status: StandbyStatus, floors: &mut StatusFloors) -> (u64, u64, u64) {
+    floors.write = status.write_lsn.max(floors.write);
+    floors.flush = status.flush_lsn.max(floors.flush);
+    floors.apply = status.apply_lsn.max(floors.apply);
+    (floors.write, floors.flush, floors.apply)
+}
+
 /// Result of `IDENTIFY_SYSTEM`: server identity plus current WAL
 /// position.
 #[derive(Debug, Clone)]
@@ -96,7 +117,8 @@ pub struct SourceFeed {
     /// Wall-clock budget between standby status updates.
     status_interval: Duration,
     last_status: Instant,
-    last_acked_lsn: u64,
+    /// Per-field monotonic high-water for advertised write/flush/apply.
+    floors: StatusFloors,
     /// Most recent `server_wal_end` we have seen, from either a WAL
     /// frame or a keepalive. Lets the daemon log "source ahead by N
     /// bytes" without re-issuing IDENTIFY_SYSTEM.
@@ -113,7 +135,7 @@ impl SourceFeed {
             sql_client: None,
             status_interval: DEFAULT_STATUS_INTERVAL,
             last_status: Instant::now(),
-            last_acked_lsn: 0,
+            floors: StatusFloors::default(),
             last_server_wal_end: 0,
         })
     }
@@ -190,7 +212,11 @@ impl SourceFeed {
         };
         self.conn.send_query(&cmd).await?;
         self.conn.expect_copy_both_open().await?;
-        self.last_acked_lsn = start_lsn;
+        self.floors = StatusFloors {
+            write: start_lsn,
+            flush: start_lsn,
+            apply: start_lsn,
+        };
         self.last_status = Instant::now();
         Ok(())
     }
@@ -268,15 +294,12 @@ impl SourceFeed {
     }
 
     async fn send_status(&mut self, status: StandbyStatus) -> Result<()> {
-        // Never go backwards on any field — PG treats a regressing
-        // flush/apply as a protocol violation and may force-disconnect.
-        // `last_acked_lsn` tracks the high-water mark across all three.
-        let write = status.write_lsn.max(self.last_acked_lsn);
-        let flush = status.flush_lsn.max(self.last_acked_lsn);
-        let apply = status.apply_lsn.max(self.last_acked_lsn);
+        // Never regress any field — PG treats a regressing flush/apply
+        // as a protocol violation and may force-disconnect. Each field
+        // tracks its own high-water (see `clamp_status`).
+        let (write, flush, apply) = clamp_status(status, &mut self.floors);
         let payload = build_status_update(write, flush, apply);
         self.conn.send_copy_data(&payload).await?;
-        self.last_acked_lsn = write.max(flush).max(apply);
         self.last_status = Instant::now();
         Ok(())
     }
@@ -354,4 +377,58 @@ async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
         let _ = conn.await;
     });
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_keeps_each_field_independent() {
+        let mut floors = StatusFloors::default();
+        // write leads flush/apply — must NOT lift flush/apply.
+        let (w, f, a) = clamp_status(
+            StandbyStatus {
+                write_lsn: 3000,
+                flush_lsn: 1000,
+                apply_lsn: 800,
+            },
+            &mut floors,
+        );
+        assert_eq!((w, f, a), (3000, 1000, 800));
+        // Next status with a higher flush/apply but same write: each
+        // field rises from its own floor, flush/apply not pinned at 3000.
+        let (w, f, a) = clamp_status(
+            StandbyStatus {
+                write_lsn: 3000,
+                flush_lsn: 1500,
+                apply_lsn: 1200,
+            },
+            &mut floors,
+        );
+        assert_eq!((w, f, a), (3000, 1500, 1200));
+    }
+
+    #[test]
+    fn clamp_never_regresses_a_field() {
+        let mut floors = StatusFloors::default();
+        clamp_status(
+            StandbyStatus {
+                write_lsn: 5000,
+                flush_lsn: 4000,
+                apply_lsn: 4000,
+            },
+            &mut floors,
+        );
+        // A stale status with lower values holds at the prior floor.
+        let (w, f, a) = clamp_status(
+            StandbyStatus {
+                write_lsn: 4500,
+                flush_lsn: 3000,
+                apply_lsn: 3500,
+            },
+            &mut floors,
+        );
+        assert_eq!((w, f, a), (5000, 4000, 4000));
+    }
 }

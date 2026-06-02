@@ -80,24 +80,26 @@ digraph timeline_streaming {
   qwrk -> gate5 [lhead=cluster_p5];
   recv4 -> gate5 [label="apply_lsn ≥ X\n(unblocks gate)", style=dashed, color="#BD8183"];
 
-  // ═════ ⑥ commit drain → CH (held-open INSERT) ═════
+  // ═════ ⑥ commit drain → CH (atomic-seal INSERT) ═════
   subgraph cluster_p6 {
-    label="⑥ XLOG_XACT_COMMIT  → drain → CH (held-open INSERT)";
+    label="⑥ XLOG_XACT_COMMIT  → drain → CH (atomic-seal INSERT)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     cmt6   [label="XLOG_XACT_COMMIT\nLSN = X'", fillcolor="#3D3D54"];
     drain6 [label="XactRecordSink::on_record\ndrain spill + memory\nin WAL order", fillcolor="#4D4128"];
     enc6   [label="TableEncoder::append_row\n_lsn / _xid / _op / _commit_ts", fillcolor="#4D4128"];
-    sndp6  [label="if INSERT not open:\n send_query INSERT…\nsend_data(Some(block))\n(deadline starts on 1st row)", fillcolor="#4D4128"];
-    hold6  [label="hold INSERT open\nacross xacts\n(flush_timeout)", fillcolor="#4D4128", shape=note];
-    sndn6  [label="on deadline or close:\n send_data(None)\n drain → EndOfStream\n emitter_ack_lsn := X'", fillcolor="#4D4128"];
+    buf6   [label="buffer across xacts\nin TableEncoder\nNO open wire\npending_max ← X'", fillcolor="#4D4128", shape=note];
+    seal6  [label="seal trigger → flush_table\nopen_wire: send_query INSERT…\nsend_data(Some(block))", fillcolor="#4D4128"];
+    close6 [label="send_data(None) → EndOfStream\nclear buffer (post-ack)\nemitter_ack_lsn := X'", fillcolor="#4D4128"];
     ch6    [label="ReplacingMergeTree(_lsn)\nmerged in CH", fillcolor="#4D4128"];
 
     cmt6 -> drain6;
-    drain6 -> enc6 -> sndp6 -> hold6 [style=dashed];
-    hold6 -> sndn6 [style=dashed, label="deadline trips"];
-    sndp6 -> ch6 [label="Native block", color="#BF8C5F"];
-    sndn6 -> ch6 [style=dashed];
+    drain6 -> enc6;
+    enc6 -> buf6;
+    buf6 -> seal6 [style=dashed, label="budget / deadline"];
+    seal6 -> close6;
+    seal6 -> ch6 [label="Native block", color="#BF8C5F"];
+    close6 -> ch6 [style=dashed];
   }
   buf5 -> cmt6 [label="next record", style=dashed];
 
@@ -139,7 +141,7 @@ digraph timeline_streaming {
       <TR><TD>④ shadow apply</TD><TD>ms — walsender wire (independent of ⑤)</TD></TR>
       <TR><TD>④' queue hand-off</TD><TD>~ns enqueue, batch_size=64</TD></TR>
       <TR><TD>⑤ gate clear</TD><TD>ms — driven by ④ apply_lsn</TD></TR>
-      <TR><TD>⑥ CH block send</TD><TD>per block; INSERT held open, deadline-flushed</TD></TR>
+      <TR><TD>⑥ CH block send</TD><TD>rows buffered across xacts; seal complete INSERT on budget/deadline</TD></TR>
       <TR><TD>⑦ segment + cursor</TD><TD>seconds — async, off hot path</TD></TR>
     </TABLE>
   >];

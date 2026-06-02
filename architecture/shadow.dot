@@ -3,6 +3,16 @@
 // LRU shape + generation counter + invalidation-epoch fold + reconnect
 // resilience (folded into libpq node) + DROP sweep + SchemaEvent
 // fan-out to DdlApplicator / XactBuffer.
+//
+// regeneration spec:
+// sources of truth: plans/shadow.md · src/shadow_catalog.rs
+// subsumes: plans/shadow.md § ShadowCatalog cache + invalidation + SchemaEvent emission
+// differentiates: shadow_communication.dot draws the three CHANNELS (libpq, walsender, restore_command); this draws ShadowCatalog INTERNAL state — don't duplicate
+// quality bar:
+//   - gen → LRU invalidation edge clearly dashed, doesn't fight populate edges
+//   - reconnect cluster off to the side, doesn't deform main flow
+//   - shadow PG cylinder appears once (libpq + apply_lsn gate both touch it)
+// shared style: palette.md
 digraph shadow_catalog {
   rankdir=TB;
   compound=true;

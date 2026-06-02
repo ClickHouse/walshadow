@@ -88,10 +88,11 @@ Component docs live alongside this overview:
   per-xid spill at `{spill_dir}/xid-<xid>-<first_lsn>.bin`,
   `SubxactTracker` + commit-record subxact list authority, TOAST chunk
   reassembly inside buffer
-- [emitter.md](emitter.md) — `ch_emitter` held-open INSERT (one query
-  per table, blocks until deadline / row / byte budget),
-  `clickhouse-c-rs` `BlockBuilder` + `Client`, `ch_ddl` applicator on a
-  separate CH connection, `type_bridge` PG-OID → CH `TypeAst`
+- [emitter.md](emitter.md) — `ch_emitter` atomic-seal INSERT (rows
+  buffer per table across xacts, seal a complete INSERT on deadline /
+  row / byte budget), `clickhouse-c-rs` `BlockBuilder` + `Client`,
+  `ch_ddl` applicator on a separate CH connection, `type_bridge` PG-OID
+  → CH `TypeAst`
 - [bootstrap.md](bootstrap.md) — greenfield path:
   `backup_source_direct` + `backup_source_object_store`,
   `backup_page_walk`, `MultiplexSink` fanning to shadow's data dir and

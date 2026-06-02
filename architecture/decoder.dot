@@ -3,6 +3,15 @@
 // TRUNCATE intercept, decode_heap_record op nibble dispatch, per-column
 // walk, Tier 1/2/3 + PgPending type fan-out. Side branches: replica
 // identity old-tuple shape, read-time missing-value substitution.
+//
+// regeneration spec:
+// sources of truth: plans/decoder.md · src/heap_decoder.rs · src/codecs.rs · src/main_data.rs
+// subsumes: plans/decoder.md § "Entry point" + "HeapOp variants" + tier overview (detailed tier matrix kept in prose)
+// quality bar:
+//   - 5+ tier outputs all reach `out` without crossing
+//   - truncate intercept clearly distinct (pre-dispatch)
+//   - replid annotation hangs off payload without deforming dispatch column
+// shared style: palette.md
 digraph decoder {
   rankdir=TB;
   compound=true;

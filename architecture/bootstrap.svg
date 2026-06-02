@@ -32,8 +32,8 @@
 </g>
 <g id="clust8" class="cluster">
 <title>cluster_emit</title>
-<path fill="#34302c" stroke="#4c4641" d="M190,-721.81C190,-721.81 784,-721.81 784,-721.81 790,-721.81 796,-727.81 796,-733.81 796,-733.81 796,-995.06 796,-995.06 796,-1001.06 790,-1007.06 784,-1007.06 784,-1007.06 190,-1007.06 190,-1007.06 184,-1007.06 178,-1001.06 178,-995.06 178,-995.06 178,-733.81 178,-733.81 178,-727.81 184,-721.81 190,-721.81"/>
-<text xml:space="preserve" text-anchor="middle" x="487" y="-989.76" font-family="Helvetica,sans-Serif" font-size="14.00" fill="#ece1d7">transitional emitter — bootstrap one&#45;shot, force&#45;closed at end (no DdlApplicator wired)</text>
+<path fill="#34302c" stroke="#4c4641" d="M192,-721.81C192,-721.81 786,-721.81 786,-721.81 792,-721.81 798,-727.81 798,-733.81 798,-733.81 798,-995.06 798,-995.06 798,-1001.06 792,-1007.06 786,-1007.06 786,-1007.06 192,-1007.06 192,-1007.06 186,-1007.06 180,-1001.06 180,-995.06 180,-995.06 180,-733.81 180,-733.81 180,-727.81 186,-721.81 192,-721.81"/>
+<text xml:space="preserve" text-anchor="middle" x="489" y="-989.76" font-family="Helvetica,sans-Serif" font-size="14.00" fill="#ece1d7">transitional emitter — bootstrap one&#45;shot, force&#45;closed at end (no DdlApplicator wired)</text>
 </g>
 <g id="clust9" class="cluster">
 <title>cluster_handoff</title>
@@ -400,12 +400,12 @@
 <!-- wire -->
 <g id="node22" class="node">
 <title>wire</title>
-<path fill="#5d4628" stroke="#6e6963" d="M536.5,-801.56C536.5,-801.56 367.5,-801.56 367.5,-801.56 361.5,-801.56 355.5,-795.56 355.5,-789.56 355.5,-789.56 355.5,-741.81 355.5,-741.81 355.5,-735.81 361.5,-729.81 367.5,-729.81 367.5,-729.81 536.5,-729.81 536.5,-729.81 542.5,-729.81 548.5,-735.81 548.5,-741.81 548.5,-741.81 548.5,-789.56 548.5,-789.56 548.5,-795.56 542.5,-801.56 536.5,-801.56"/>
+<path fill="#5d4628" stroke="#6e6963" d="M532,-801.56C532,-801.56 372,-801.56 372,-801.56 366,-801.56 360,-795.56 360,-789.56 360,-789.56 360,-741.81 360,-741.81 360,-735.81 366,-729.81 372,-729.81 372,-729.81 532,-729.81 532,-729.81 538,-729.81 544,-735.81 544,-741.81 544,-741.81 544,-789.56 544,-789.56 544,-795.56 538,-801.56 532,-801.56"/>
 <text xml:space="preserve" text-anchor="middle" x="452" y="-788.06" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">clickhouse&#45;c&#45;rs</text>
-<text xml:space="preserve" text-anchor="middle" x="452" y="-775.31" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">held&#45;open INSERT,</text>
-<text xml:space="preserve" text-anchor="middle" x="452" y="-762.56" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">send_query once per (table, INSERT)</text>
-<text xml:space="preserve" text-anchor="middle" x="452" y="-749.81" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">send_data(None) at rfn flip /</text>
-<text xml:space="preserve" text-anchor="middle" x="452" y="-737.06" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> bootstrap end</text>
+<text xml:space="preserve" text-anchor="middle" x="452" y="-775.31" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">flush_timeout = 0 → seal per table</text>
+<text xml:space="preserve" text-anchor="middle" x="452" y="-762.56" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">open_wire send_query per table</text>
+<text xml:space="preserve" text-anchor="middle" x="452" y="-749.81" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">send_data(None) → EndOfStream</text>
+<text xml:space="preserve" text-anchor="middle" x="452" y="-737.06" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">at rfn flip / budget / bootstrap end</text>
 </g>
 <!-- bb&#45;&gt;wire -->
 <g id="edge20" class="edge">

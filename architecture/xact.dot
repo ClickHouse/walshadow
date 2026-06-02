@@ -2,6 +2,15 @@
 // Strict layered DAG: producers above their consumers, single cluster
 // for the drain pipeline, all other nodes bare. No constraint=false
 // except the abort→spill backwards unlink.
+//
+// regeneration spec:
+// sources of truth: plans/xact.md · src/xact_buffer.rs · src/spill.rs
+// subsumes: plans/xact.md § "Buffer shape" + "Eviction policy" + "Spill backend" + "Drain shape"
+// quality bar:
+//   - spill round-trip (write → file → read) visually traceable
+//   - subx tracker feeds drain without overlapping spill IO
+//   - evbus → kmerge edge doesn't entangle with main merge edges
+// shared style: palette.md
 digraph xact {
   rankdir=TB;
   compound=true;

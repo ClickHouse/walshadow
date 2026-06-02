@@ -2,6 +2,15 @@
 // PgPending resolver path + Tier 3 sampling validator path,
 // both fronted by libpq into shadow PG. Extension surface (pgext/)
 // shown as a side branch with absence-fallback semantics.
+//
+// regeneration spec:
+// sources of truth: plans/oracle.md · pgext/ · src/ oracle-path module (grep src/ for oracle|valid|pending)
+// subsumes: plans/oracle.md § differential decode flow + extension surface + --validate sampling
+// quality bar:
+//   - two-way branch on extension availability legible (not a tangle)
+//   - libpq round-trip reads as one canonical orange edge in/out of shadow
+//   - fallback path visually distinct from main path
+// shared style: palette.md
 digraph oracle {
   rankdir=TB;
   compound=true;

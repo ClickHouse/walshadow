@@ -167,35 +167,35 @@
 <!-- drain3 -->
 <g id="node9" class="node">
 <title>drain3</title>
-<path fill="#4d3a28" stroke="#6e6963" d="M298.88,-1039.25C298.88,-1039.25 171.12,-1039.25 171.12,-1039.25 165.12,-1039.25 159.12,-1033.25 159.12,-1027.25 159.12,-1027.25 159.12,-1005 159.12,-1005 159.12,-999 165.12,-993 171.12,-993 171.12,-993 298.88,-993 298.88,-993 304.88,-993 310.88,-999 310.88,-1005 310.88,-1005 310.88,-1027.25 310.88,-1027.25 310.88,-1033.25 304.88,-1039.25 298.88,-1039.25"/>
-<text xml:space="preserve" text-anchor="middle" x="235" y="-1025.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">drain_backfill task</text>
-<text xml:space="preserve" text-anchor="middle" x="235" y="-1013" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">synthesize CommittedTuple</text>
-<text xml:space="preserve" text-anchor="middle" x="235" y="-1000.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">{op=Insert, _lsn=start_lsn}</text>
+<path fill="#4d3a28" stroke="#6e6963" d="M291.88,-1039.25C291.88,-1039.25 164.12,-1039.25 164.12,-1039.25 158.12,-1039.25 152.12,-1033.25 152.12,-1027.25 152.12,-1027.25 152.12,-1005 152.12,-1005 152.12,-999 158.12,-993 164.12,-993 164.12,-993 291.88,-993 291.88,-993 297.88,-993 303.88,-999 303.88,-1005 303.88,-1005 303.88,-1027.25 303.88,-1027.25 303.88,-1033.25 297.88,-1039.25 291.88,-1039.25"/>
+<text xml:space="preserve" text-anchor="middle" x="228" y="-1025.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">drain_backfill task</text>
+<text xml:space="preserve" text-anchor="middle" x="228" y="-1013" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">synthesize CommittedTuple</text>
+<text xml:space="preserve" text-anchor="middle" x="228" y="-1000.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">{op=Insert, _lsn=start_lsn}</text>
 </g>
 <!-- walk2&#45;&gt;drain3 -->
 <g id="edge9" class="edge">
 <title>walk2&#45;&gt;drain3</title>
-<path fill="none" stroke="#c1a78e" d="M482.11,-1123.9C430.15,-1109.22 362.8,-1089.31 328.4,-1075.2"/>
-<polygon fill="#c1a78e" stroke="#c1a78e" points="329.84,-1072.78 321.39,-1072.17 327.61,-1077.91 329.84,-1072.78"/>
-<text xml:space="preserve" text-anchor="middle" x="449.13" y="-1094.45" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ece1d7">BackfillTuple</text>
-<text xml:space="preserve" text-anchor="middle" x="449.13" y="-1083.2" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ece1d7">(unbounded mpsc)</text>
+<path fill="none" stroke="#c1a78e" d="M482.23,-1123.65C430.33,-1108.83 363.01,-1088.83 328.45,-1075.13"/>
+<polygon fill="#c1a78e" stroke="#c1a78e" points="329.86,-1072.68 321.4,-1072.19 327.71,-1077.85 329.86,-1072.68"/>
+<text xml:space="preserve" text-anchor="middle" x="455.48" y="-1094.45" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ece1d7">BackfillTuple</text>
+<text xml:space="preserve" text-anchor="middle" x="455.48" y="-1083.2" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ece1d7">(unbounded mpsc)</text>
 </g>
 <!-- ch3 -->
 <g id="node10" class="node">
 <title>ch3</title>
-<path fill="#4d4128" stroke="#6e6963" d="M299.62,-945.75C299.62,-945.75 164.38,-945.75 164.38,-945.75 158.38,-945.75 152.38,-939.75 152.38,-933.75 152.38,-933.75 152.38,-886 152.38,-886 152.38,-880 158.38,-874 164.38,-874 164.38,-874 299.62,-874 299.62,-874 305.62,-874 311.62,-880 311.62,-886 311.62,-886 311.62,-933.75 311.62,-933.75 311.62,-939.75 305.62,-945.75 299.62,-945.75"/>
-<text xml:space="preserve" text-anchor="middle" x="232" y="-932.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">transitional Emitter</text>
-<text xml:space="preserve" text-anchor="middle" x="232" y="-919.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">vs CatalogMapResolver</text>
-<text xml:space="preserve" text-anchor="middle" x="232" y="-906.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">held&#45;open INSERT,</text>
-<text xml:space="preserve" text-anchor="middle" x="232" y="-894" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">force&#45;closed at bootstrap end</text>
-<text xml:space="preserve" text-anchor="middle" x="232" y="-881.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">(no DdlApplicator)</text>
+<path fill="#4d4128" stroke="#6e6963" d="M299.88,-945.75C299.88,-945.75 112.12,-945.75 112.12,-945.75 106.12,-945.75 100.12,-939.75 100.12,-933.75 100.12,-933.75 100.12,-886 100.12,-886 100.12,-880 106.12,-874 112.12,-874 112.12,-874 299.88,-874 299.88,-874 305.88,-874 311.88,-880 311.88,-886 311.88,-886 311.88,-933.75 311.88,-933.75 311.88,-939.75 305.88,-945.75 299.88,-945.75"/>
+<text xml:space="preserve" text-anchor="middle" x="206" y="-932.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">transitional Emitter</text>
+<text xml:space="preserve" text-anchor="middle" x="206" y="-919.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">vs CatalogMapResolver</text>
+<text xml:space="preserve" text-anchor="middle" x="206" y="-906.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">flush_timeout=0: seal per table (rfn flip)</text>
+<text xml:space="preserve" text-anchor="middle" x="206" y="-894" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">force&#45;closed at bootstrap end</text>
+<text xml:space="preserve" text-anchor="middle" x="206" y="-881.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">(no DdlApplicator)</text>
 </g>
 <!-- drain3&#45;&gt;ch3 -->
 <g id="edge8" class="edge">
 <title>drain3&#45;&gt;ch3</title>
-<path fill="none" stroke="#bf8c5f" d="M234.35,-992.5C234.04,-981.61 233.65,-968.16 233.28,-955.34"/>
-<polygon fill="#bf8c5f" stroke="#bf8c5f" points="236.09,-955.59 233.06,-947.68 230.49,-955.75 236.09,-955.59"/>
-<text xml:space="preserve" text-anchor="middle" x="272.77" y="-966.45" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ece1d7">per&#45;relation block</text>
+<path fill="none" stroke="#bf8c5f" d="M223.23,-992.5C220.93,-981.61 218.09,-968.16 215.38,-955.34"/>
+<polygon fill="#bf8c5f" stroke="#bf8c5f" points="218.15,-954.89 213.76,-947.64 212.67,-956.05 218.15,-954.89"/>
+<text xml:space="preserve" text-anchor="middle" x="257.97" y="-966.45" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ece1d7">per&#45;relation block</text>
 </g>
 <!-- out4 -->
 <g id="node12" class="node">
