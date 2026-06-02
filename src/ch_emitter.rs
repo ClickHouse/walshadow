@@ -1575,13 +1575,11 @@ impl Emitter {
             return Ok(());
         };
         let alloc = self.alloc;
-        if let Some(enc) = self.tables.get_mut(&key) {
-            let n = enc.flush_block(&mut self.client, alloc, BlockOpts::default())?;
-            if n > 0 {
-                self.stats.rows_emitted += n as u64;
-                self.stats.blocks_sent += 1;
-            }
-        }
+        let n = if let Some(enc) = self.tables.get_mut(&key) {
+            enc.flush_block(&mut self.client, alloc, BlockOpts::default())?
+        } else {
+            0
+        };
         self.client.send_data(None)?;
         loop {
             let mut pkt = self.client.recv_packet()?;
@@ -1600,8 +1598,13 @@ impl Emitter {
             }
         }
         // EndOfStream confirmed: the INSERT is durable on CH, so the
-        // rows just sealed are now safe to drop. Until this point the
-        // buffer is the only replay source if the connection bounced.
+        // rows just sealed are now safe to count and drop. Until this
+        // point the buffer is the only replay source if the connection
+        // bounced.
+        if n > 0 {
+            self.stats.rows_emitted += n as u64;
+            self.stats.blocks_sent += 1;
+        }
         if let Some(enc) = self.tables.get_mut(&key) {
             enc.clear();
         }
