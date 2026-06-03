@@ -1,0 +1,105 @@
+# walshadow dashboard demo overlay. Layer ON TOP of docker-compose.yml:
+#
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.demo.yml up --build -d
+#
+# Adds the observability + load-generation tier on top of the lean
+# source→walshadow→clickhouse base:
+#   pgbench           — hammers source with the TPC-B workload
+#   postgres-exporter — source PG stats (TPS, tuple write rates) → Prom
+#   prometheus        — scrapes walshadow:9484 + postgres-exporter:9187
+#   grafana           — http://localhost:3000, anonymous-admin, lands on
+#                       the "walshadow — live CDC pipeline" dashboard
+#
+# The base services are extended (not replaced): the env toggles below
+# arm the demo-only init steps (init/source/02-pgbench.sh,
+# init/clickhouse/02-pgbench.sh — no-ops without WALSHADOW_DEMO_PGBENCH)
+# and repoint walshadow at the pgbench-aware ch-config + a 1s status
+# cadence so the graphs move in near-real-time.
+
+services:
+  source:
+    environment:
+      WALSHADOW_DEMO_PGBENCH: "1"
+      PGBENCH_SCALE: "${PGBENCH_SCALE:-1}"
+
+  clickhouse:
+    environment:
+      WALSHADOW_DEMO_PGBENCH: "1"
+
+  walshadow:
+    environment:
+      RUST_LOG: warn,walshadow=info
+      WALSHADOW_STATUS_INTERVAL: "1"
+      WALSHADOW_CH_CONFIG: /etc/walshadow/ch-config.demo.toml
+    volumes:
+      - ./ch-config.demo.toml:/etc/walshadow/ch-config.demo.toml:ro
+
+  pgbench:
+    image: postgres:17-bookworm
+    depends_on:
+      source:
+        condition: service_healthy
+      walshadow:
+        condition: service_started
+    environment:
+      PGBENCH_CLIENTS: "${PGBENCH_CLIENTS:-4}"
+      PGBENCH_THREADS: "${PGBENCH_THREADS:-2}"
+      PGBENCH_DURATION: "${PGBENCH_DURATION:-86400}"
+    entrypoint: ["/bin/bash", "-c"]
+    # `$$` escapes the compose-interpolation pass so these expand from
+    # the container's env at runtime, not from the host shell at config
+    # time (which would blank them).
+    command:
+      - |
+        set -euo pipefail
+        echo "pgbench: waiting for source PG ..."
+        until pg_isready -h source -U postgres -d postgres >/dev/null 2>&1; do sleep 1; done
+        echo "pgbench: waiting for walshadow bootstrap (metrics port 9484) ..."
+        until (echo > /dev/tcp/walshadow/9484) 2>/dev/null; do sleep 1; done
+        sleep 2
+        echo "pgbench: hammering source (-c $${PGBENCH_CLIENTS} -j $${PGBENCH_THREADS} for $${PGBENCH_DURATION}s)"
+        exec pgbench -h source -U postgres -d postgres -n \
+            -c "$${PGBENCH_CLIENTS}" -j "$${PGBENCH_THREADS}" \
+            -T "$${PGBENCH_DURATION}" -P 5
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    depends_on:
+      source:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres@source:5432/postgres?sslmode=disable"
+    ports:
+      - "9187:9187"
+
+  prometheus:
+    image: prom/prometheus:v2.53.2
+    depends_on:
+      - postgres-exporter
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1h
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    depends_on:
+      - prometheus
+      - clickhouse
+    environment:
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: dark
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: "1s"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/walshadow.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"

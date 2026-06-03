@@ -21,8 +21,9 @@ use std::time::Duration;
 use wal_rs::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::CatalogMap;
 use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, TableMapping,
+    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, EmitterObserver, TableMapping,
 };
+use walshadow::decoder_sink::TupleObserver;
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::relation_resolver::CatalogMapResolver;
 use walshadow::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
@@ -101,6 +102,39 @@ fn tuple(id: i32, source_lsn: u64, commit_lsn: u64) -> CommittedTuple {
     }
 }
 
+/// Emitter config mapping `public.foo` → `walshadow_test.foo` with the
+/// legacy seal-per-xact path (`flush_timeout = 0`).
+fn emitter_cfg(tcp_port: u16, row_budget: usize) -> EmitterConfig {
+    let mut cfg = EmitterConfig {
+        host: "127.0.0.1".into(),
+        port: tcp_port,
+        database: "walshadow_test".into(),
+        compression: CompressionChoice::Lz4,
+        row_budget,
+        flush_timeout: Duration::ZERO,
+        ..Default::default()
+    };
+    cfg.tables.insert(
+        "public.foo".into(),
+        TableMapping {
+            target: "walshadow_test.foo".into(),
+            columns: vec![
+                ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: "Int32".into(),
+                },
+                ColumnMapping {
+                    src_attnum: 2,
+                    target_name: "val".into(),
+                    target_type: "Nullable(String)".into(),
+                },
+            ],
+        },
+    );
+    cfg
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn budget_trips_seal_complete_inserts() {
     if !fx::clickhouse_available() {
@@ -124,35 +158,8 @@ async fn budget_trips_seal_complete_inserts() {
     )
     .expect("create dest table");
 
-    let mut cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: CH_TCP_PORT,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::Lz4,
-        // Trip after every 2 rows so one 5-row xact seals 3 INSERTs.
-        row_budget: 2,
-        // Legacy mode: on_xact_end seals immediately (deterministic).
-        flush_timeout: Duration::ZERO,
-        ..Default::default()
-    };
-    cfg.tables.insert(
-        "public.foo".into(),
-        TableMapping {
-            target: "walshadow_test.foo".into(),
-            columns: vec![
-                ColumnMapping {
-                    src_attnum: 1,
-                    target_name: "id".into(),
-                    target_type: "Int32".into(),
-                },
-                ColumnMapping {
-                    src_attnum: 2,
-                    target_name: "val".into(),
-                    target_type: "Nullable(String)".into(),
-                },
-            ],
-        },
-    );
+    // Trip after every 2 rows so one 5-row xact seals 3 INSERTs.
+    let cfg = emitter_cfg(CH_TCP_PORT, 2);
 
     let mut map = CatalogMap::new();
     map.insert(Arc::new(rel_descriptor()));
@@ -191,4 +198,70 @@ async fn budget_trips_seal_complete_inserts() {
         .query("SELECT uniqExact(id) FROM walshadow_test.foo")
         .expect("ch distinct");
     assert_eq!(distinct, N.to_string());
+}
+
+const OBS_TCP_PORT: u16 = 17623;
+const OBS_HTTP_PORT: u16 = 17624;
+
+/// Regression: `EmitterObserver::stats_handle` must mirror live emitter
+/// counters across the worker-task boundary. The daemon's status loop
+/// reads only this handle (the emitter is buried inside the
+/// `QueueingRecordSink` worker); before the fix `populate_metrics`
+/// hardcoded `walshadow_emitter_{rows,blocks,xacts}_total` to 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observer_handle_mirrors_emitter_counters() {
+    if !fx::clickhouse_available() {
+        eprintln!("skip: no clickhouse binary on PATH");
+        return;
+    }
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, OBS_TCP_PORT, OBS_HTTP_PORT).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+    ch.query(
+        "CREATE OR REPLACE TABLE walshadow_test.foo (\
+            id Int32,\
+            val Nullable(String),\
+            _lsn UInt64,\
+            _xid UInt32,\
+            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
+            _commit_ts DateTime64(6, 'UTC')\
+         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+    )
+    .expect("create dest table");
+
+    // High budget so all rows land in one block sealed at xact end.
+    let cfg = emitter_cfg(OBS_TCP_PORT, 1024);
+
+    let mut map = CatalogMap::new();
+    map.insert(Arc::new(rel_descriptor()));
+    let resolver = Arc::new(CatalogMapResolver::new(map));
+
+    let tcp = TcpStream::connect(("127.0.0.1", OBS_TCP_PORT)).expect("tcp connect ch");
+    tcp.set_nodelay(true).ok();
+    tcp.set_nonblocking(false).expect("blocking socket");
+    let emitter = Emitter::new(cfg, resolver, tcp).expect("init emitter");
+
+    let mut observer = EmitterObserver::new(emitter);
+    let handle = observer.stats_handle();
+    assert_eq!(
+        handle.lock().unwrap().rows_emitted,
+        0,
+        "fresh handle starts at zero",
+    );
+
+    const N: i32 = 3;
+    for i in 0..N {
+        observer
+            .on_tuple(&tuple(i, 0x2000 + i as u64, 0xBEEF))
+            .await
+            .expect("on_tuple");
+    }
+    observer.on_xact_end(0xBEEF).await.expect("on_xact_end");
+
+    let snap = handle.lock().unwrap().clone();
+    assert_eq!(snap.rows_emitted, N as u64, "rows reach the polled handle");
+    assert_eq!(snap.xacts_committed, 1, "xact commit reaches the handle");
+    assert!(snap.blocks_sent >= 1, "block seal reaches the handle");
 }

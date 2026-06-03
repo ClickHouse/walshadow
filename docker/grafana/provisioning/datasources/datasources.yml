@@ -1,0 +1,30 @@
+# Grafana datasources for the walshadow demo. UIDs are pinned so the
+# provisioned dashboard (dashboards/walshadow.json) can reference them
+# without a UI hookup step.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: walshadow-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 2s
+
+  # Reads the destination tables directly over CH's native protocol
+  # (port 9000) so panels can show actual rows landed, not just
+  # pipeline counters. Provided by GF_INSTALL_PLUGINS on first boot.
+  - name: ClickHouse
+    uid: walshadow-ch
+    type: grafana-clickhouse-datasource
+    access: proxy
+    jsonData:
+      host: clickhouse
+      port: 9000
+      protocol: native
+      username: default
+      defaultDatabase: demo
+    secureJsonData:
+      password: ""

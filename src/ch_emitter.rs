@@ -1937,11 +1937,33 @@ fn is_retryable(e: &EmitterError) -> bool {
 /// `XactRecordSink<EmitterObserver>` in `bin/stream.rs`.
 pub struct EmitterObserver {
     pub emitter: Emitter,
+    /// Shared mirror of `emitter.stats` the daemon status loop polls
+    /// while this observer runs on the `QueueingRecordSink` worker
+    /// task. Refreshed after every dispatch callback; lock never held
+    /// across `.await`.
+    stats: Arc<std::sync::Mutex<EmitterStats>>,
 }
 
 impl EmitterObserver {
     pub fn new(emitter: Emitter) -> Self {
-        Self { emitter }
+        Self {
+            emitter,
+            stats: Arc::new(std::sync::Mutex::new(EmitterStats::default())),
+        }
+    }
+
+    /// Handle the daemon hands to its status loop so it reads live
+    /// emitter counters across the worker-task boundary (the emitter
+    /// itself is buried inside the worker).
+    pub fn stats_handle(&self) -> Arc<std::sync::Mutex<EmitterStats>> {
+        self.stats.clone()
+    }
+
+    /// Mirror the emitter's local counters into the shared handle.
+    /// Called at the tail of each callback so a poll never lags more
+    /// than one dispatch behind.
+    fn publish_stats(&self) {
+        *self.stats.lock().expect("emitter stats mutex poisoned") = self.emitter.stats.clone();
     }
 }
 
@@ -1953,10 +1975,13 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            self.emitter
+            let r = self
+                .emitter
                 .route_with_retry(committed)
                 .await
-                .map_err(DecoderSinkError::from)
+                .map_err(DecoderSinkError::from);
+            self.publish_stats();
+            r
         })
     }
 
@@ -1967,10 +1992,13 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            self.emitter
+            let r = self
+                .emitter
                 .on_xact_end_with_retry(commit_lsn)
                 .await
-                .map_err(DecoderSinkError::from)
+                .map_err(DecoderSinkError::from);
+            self.publish_stats();
+            r
         })
     }
 
@@ -1981,10 +2009,13 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            self.emitter
+            let r = self
+                .emitter
                 .dispatch_schema_event_with_retry(event)
                 .await
-                .map_err(DecoderSinkError::from)
+                .map_err(DecoderSinkError::from);
+            self.publish_stats();
+            r
         })
     }
 
@@ -2004,10 +2035,13 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            self.emitter
+            let r = self
+                .emitter
                 .flush_if_deadline_tripped_with_retry()
                 .await
-                .map_err(DecoderSinkError::from)
+                .map_err(DecoderSinkError::from);
+            self.publish_stats();
+            r
         })
     }
 
@@ -2021,10 +2055,13 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            self.emitter
+            let r = self
+                .emitter
                 .flush_open_inserts_with_retry()
                 .await
-                .map_err(DecoderSinkError::from)?;
+                .map_err(DecoderSinkError::from);
+            self.publish_stats();
+            r?;
             Ok(())
         })
     }

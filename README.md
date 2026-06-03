@@ -25,6 +25,15 @@ Wait for the `shadow caught up to bootstrap end_lsn` line, then drive
 changes on source and read them back from CH (full sequence in
 [docker/DEMO.md](docker/DEMO.md))
 
+For pgbench with Grafana dashboards plus live schema-change propagation:
+
+```
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.demo.yml up --build -d
+```
+
+then open http://localhost:3000. Walkthrough in
+[docker/DEMO.md](docker/DEMO.md)
+
 ## Source PG requirements
 
 Enforced at daemon boot by `src/preflight.rs`. Daemon refuses to start

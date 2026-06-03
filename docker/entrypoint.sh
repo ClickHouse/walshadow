@@ -39,7 +39,7 @@ exec walshadow-stream \
     --bootstrap-shadow-data-dir "$SHADOW_DATA" \
     --bootstrap-autospawn-shadow \
     --walsender-bind 127.0.0.1:5433 \
-    --ch-config /etc/walshadow/ch-config.toml \
+    --ch-config "${WALSHADOW_CH_CONFIG:-/etc/walshadow/ch-config.toml}" \
     --metrics-bind 0.0.0.0:9484 \
-    --status-interval 5 \
+    --status-interval "${WALSHADOW_STATUS_INTERVAL:-5}" \
     "$@"

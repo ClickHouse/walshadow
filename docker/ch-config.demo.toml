@@ -1,0 +1,72 @@
+# walshadow demo CH emitter mapping — observability variant.
+# Superset of ch-config.toml: keeps demo.users (the schema-change
+# narrative table) and adds the four pgbench TPC-B tables the hammer
+# service pounds. attnum values match pg_attribute.attnum (1-based);
+# `type` is the CH destination type walshadow advertises in its INSERT
+# block (must match the pre-created dest table from
+# init/clickhouse/02-pgbench.sh).
+#
+# demo.users is pinned to exactly id/name/email — no `signup_ts`. The
+# DEMO walks an operator adding that column live; walshadow's DDL
+# applicator runs ALTER TABLE ... ADD COLUMN on CH and auto-extends this
+# mapping at runtime, so the new column appears in ClickHouse without a
+# config edit.
+
+[ch]
+host = "clickhouse"
+port = 9000
+database = "demo"
+user = "default"
+password = ""
+compression = "lz4"
+# Hold INSERTs open across xacts and close them on a 200ms timer.
+# pgbench's TPC-B xact writes four tables; closing every INSERT per
+# xact is one CH round-trip each and caps throughput at a few xact/s.
+# Coalescing into one MergeTree part per window lets the daemon track
+# pgbench's hundreds of xact/s.
+flush_timeout_ms = 200
+
+[table."demo.users"]
+target = "demo.users"
+columns = [
+    { attnum = 1, target = "id",    type = "UInt64" },
+    { attnum = 2, target = "name",  type = "String" },
+    { attnum = 3, target = "email", type = "String" },
+]
+
+[table."public.pgbench_accounts"]
+target = "demo.pgbench_accounts"
+columns = [
+    { attnum = 1, target = "aid",      type = "Int32"  },
+    { attnum = 2, target = "bid",      type = "Int32"  },
+    { attnum = 3, target = "abalance", type = "Int32"  },
+    { attnum = 4, target = "filler",   type = "String" },
+]
+
+[table."public.pgbench_branches"]
+target = "demo.pgbench_branches"
+columns = [
+    { attnum = 1, target = "bid",      type = "Int32" },
+    { attnum = 2, target = "bbalance", type = "Int32" },
+    { attnum = 3, target = "filler",   type = "Nullable(String)" },
+]
+
+[table."public.pgbench_tellers"]
+target = "demo.pgbench_tellers"
+columns = [
+    { attnum = 1, target = "tid",      type = "Int32" },
+    { attnum = 2, target = "bid",      type = "Int32" },
+    { attnum = 3, target = "tbalance", type = "Int32" },
+    { attnum = 4, target = "filler",   type = "Nullable(String)" },
+]
+
+[table."public.pgbench_history"]
+target = "demo.pgbench_history"
+columns = [
+    { attnum = 1, target = "tid",    type = "Int32" },
+    { attnum = 2, target = "bid",    type = "Int32" },
+    { attnum = 3, target = "aid",    type = "Int32" },
+    { attnum = 4, target = "delta",  type = "Int32" },
+    { attnum = 5, target = "mtime",  type = "DateTime64(6)" },
+    { attnum = 6, target = "filler", type = "Nullable(String)" },
+]

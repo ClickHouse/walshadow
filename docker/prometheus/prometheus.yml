@@ -1,0 +1,20 @@
+# Prometheus scrape config for the walshadow demo. Two targets:
+#   walshadow         — the daemon's hand-rolled /metrics surface
+#                       (src/metrics.rs), updated every status tick
+#                       (WALSHADOW_STATUS_INTERVAL=1s in the demo).
+#   postgres-exporter — source PG's pg_stat_* (TPS, tuple write rates).
+# ClickHouse is read directly by Grafana via the native datasource, not
+# scraped here.
+
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: walshadow
+    static_configs:
+      - targets: ["walshadow:9484"]
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
