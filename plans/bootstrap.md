@@ -42,7 +42,7 @@ for rendered diagram. Five clusters top→bottom:
    - user heap → `PageWalkSink` (Tap) → decoded 8 KiB at a time
    - denylist contents → Skip; denylist dir entries themselves → Keep
      as empty dirs
-3. **Drain → CH** (concurrent with phase 2) — `PageWalkSink` ships
+3. **Drain → CH** (concurrent with step 2) — `PageWalkSink` ships
    `BackfillTuple`s through unbounded mpsc to `drain_backfill`, which
    synthesizes `CommittedTuple { op=Insert, commit_lsn=start_lsn }` and
    feeds transitional `Emitter` against `CatalogMapResolver`. Per-table
@@ -349,7 +349,7 @@ one-line summary at INFO; metrics integration is open work
 
 Error handling: source pump errors propagate through JoinHandle; drain
 task errors return through `drain_backfill` future. Both must be
-`await`ed before daemon transitions to phase 4. Typical failure mode
+`await`ed before daemon transitions to step 4. Typical failure mode
 is emitter rejection — `bootstrap drain: emitter rejected tuple`
 wraps inner `DecoderSinkError` with context
 

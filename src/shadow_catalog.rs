@@ -1,4 +1,4 @@
-//! Phase 4: shadow PG catalog cache.
+//! Shadow PG catalog cache.
 //!
 //! Decoder calls [`ShadowCatalog::relation_at`] with a [`RelFileNode`]
 //! observed in a source-WAL record plus the record's source LSN.
@@ -43,7 +43,7 @@
 //! database. Shared catalogs (`db_node == 0`) are visible from any
 //! connection and resolve correctly via `pg_relation_filenode`.
 //! Cross-user-database replay needs one cache per database; out of
-//! scope for Phase 4.
+//! scope here.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -103,7 +103,7 @@ pub struct RelDescriptor {
     /// `pg_class.relpersistence`: `'p'` permanent, `'u'` unlogged,
     /// `'t'` temporary.
     pub persistence: char,
-    /// `pg_class.relreplident` resolved to the form Phase 5's decoder
+    /// `pg_class.relreplident` resolved to the form the decoder
     /// needs: `UsingIndex` carries the replica-identity index's oid
     /// and the column-number list (`pg_index.indkey`); `Default`
     /// carries the primary key's `indkey` (or `None` when no PK), so
@@ -128,7 +128,7 @@ impl RelDescriptor {
 /// Resolved `pg_class.relreplident`. `pg_class` stores a single char
 /// (`'d'`, `'n'`, `'f'`, `'i'`); the `i` variant carries the
 /// replica-identity index's oid and the indexed-column attnum list
-/// (`pg_index.indkey`) because Phase 5's decoder needs both to
+/// (`pg_index.indkey`) because the decoder needs both to
 /// interpret `XLH_UPDATE_CONTAINS_OLD_KEY` / `XLH_UPDATE_CONTAINS_OLD_TUPLE`
 /// payloads.
 #[derive(Debug, Clone, PartialEq)]
@@ -138,11 +138,11 @@ pub enum ReplIdent {
     /// DELETE. `pk_attnums` is `Some(pg_index.indkey)` for the
     /// table's primary key (resolved at descriptor build via
     /// `indisprimary = true`), or `None` when no PK exists — in
-    /// which case Phase 5 decodes `old = None` always. See Phase 5
-    /// relreplident behaviour table in PLAN.md.
+    /// which case the decoder yields `old = None` always. See the
+    /// relreplident behaviour notes alongside the heap decoder.
     Default { pk_attnums: Option<Vec<i16>> },
     /// `'n'`. Old-tuple payload is empty; UPDATE/DELETE rows lack a
-    /// key. Phase 5's emitter drops these.
+    /// key. The emitter drops these.
     Nothing,
     /// `'f'`. Old-tuple payload mirrors every non-dropped column.
     Full,
@@ -182,7 +182,7 @@ pub struct RelAttr {
     pub missing_text: Option<String>,
 }
 
-/// PHASE15 §1 — schema mutation surface published by [`ShadowCatalog`]
+/// Schema mutation surface published by [`ShadowCatalog`]
 /// to downstream consumers (the CH DDL applicator + integration tests).
 ///
 /// One event per resolved descriptor change. `Added` fires the first
@@ -213,9 +213,9 @@ pub enum SchemaEvent {
 /// run one CH `ALTER` per entry without re-walking attributes.
 ///
 /// `type_changes` lists `(attnum, new_attr)` — old type is recoverable
-/// from `Changed.old.attributes`. PHASE15 rejects type changes via
+/// from `Changed.old.attributes`. Type changes are rejected via
 /// [`crate::type_bridge::BridgeError::UnsupportedType`] when emitted to
-/// CH; widening lands in a follow-up phase.
+/// CH; widening lands in a follow-up.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SchemaDiff {
     pub added_columns: Vec<RelAttr>,
@@ -275,7 +275,7 @@ pub fn compute_schema_diff(old: &RelDescriptor, new: &RelDescriptor) -> SchemaDi
     diff
 }
 
-/// Tunables for the cache; defaults match the Phase 4 daemon's
+/// Tunables for the cache; defaults match the daemon's
 /// human-cadence access pattern.
 #[derive(Debug, Clone)]
 pub struct ShadowCatalogConfig {
@@ -343,7 +343,7 @@ pub fn socket_conninfo(socket_dir: &str, port: u16, user: &str, dbname: &str) ->
 
 /// FIFO insert-order index for the `ShadowCatalog` cache. Replaces an
 /// O(n) `min_by_key` scan over the live entries with an O(log n)
-/// `BTreeMap::pop_first` (PRE5b10 item 7). Re-inserting an
+/// `BTreeMap::pop_first`. Re-inserting an
 /// already-cached filenode rotates via `unregister` + `register` so
 /// the BTreeMap stays 1:1 with `by_filenode`.
 #[derive(Debug, Default)]
@@ -380,7 +380,7 @@ pub struct ShadowCatalog {
     generation: u64,
     by_filenode: HashMap<RelFileNode, CacheEntry>,
     by_oid: HashMap<Oid, CacheEntry>,
-    /// PHASE15 §1 — last-seen descriptor per oid, retained across
+    /// Last-seen descriptor per oid, retained across
     /// generation bumps. `by_filenode` / `by_oid` get logically
     /// invalidated by generation but the entries stay; `prev_known`
     /// is the source of truth for "what shape did the consumer last
@@ -398,18 +398,18 @@ pub struct ShadowCatalog {
     /// `invalidation_epoch` on each lookup; updated to the loaded
     /// value after invalidation runs.
     last_seen_epoch: u64,
-    /// PHASE15 §1 schema-event sink. Set by [`Self::subscribe`]; every
+    /// Schema-event sink. Set by [`Self::subscribe`]; every
     /// descriptor fetch that resolves to a new oid or a diff against
     /// the previously-known shape pushes one [`SchemaEvent`] here.
     /// `None` keeps the producer side a no-op (standalone catalog,
     /// pre-DDL-applicator tests).
     event_tx: Option<mpsc::UnboundedSender<SchemaEvent>>,
-    /// PHASE15 §6 — last `generation` value [`Self::sweep_dropped`]
+    /// Last `generation` value [`Self::sweep_dropped`]
     /// processed. Throttle marker so high-frequency commit-boundary
     /// callers (pgbench-rate workloads) skip the sweep's SQL round-
     /// trip when no DDL has fired since the prior sweep.
     last_swept_generation: u64,
-    /// PHASE15 §6 — narrower than [`Self::invalidation_epoch`]: bumps
+    /// Narrower than [`Self::invalidation_epoch`]: bumps
     /// only on pg_class `heap_delete` records. Catalog tracker
     /// publishes via `set_pg_class_delete_epoch`; [`Self::sweep_dropped`]
     /// gates off this counter so ADD COLUMN / CREATE INDEX etc. don't
@@ -424,6 +424,27 @@ pub struct ShadowCatalog {
     /// Survives `reconnect` — `conninfo` (hence the DB) is fixed.
     current_db_oid: Option<Oid>,
     stats: ShadowCatalogStats,
+}
+
+/// `query`/`query_one`/`query_opt` with a single transparent
+/// reconnect-and-retry on closed-connection errors. Other errors
+/// propagate. A macro parametrizes the client `$method` so the three
+/// arities share one body without boxing the future.
+macro_rules! query_with_reconnect {
+    ($self:ident, $method:ident, $statement:expr, $params:expr) => {{
+        $self.ensure_open().await?;
+        match $self.client.$method($statement, $params).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                if $self.client.is_closed() {
+                    $self.reconnect().await?;
+                    Ok($self.client.$method($statement, $params).await?)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }};
 }
 
 impl ShadowCatalog {
@@ -462,14 +483,14 @@ impl ShadowCatalog {
         })
     }
 
-    /// PHASE15 §6 — install the DROP-only epoch counter. Pair with
+    /// Install the DROP-only epoch counter. Pair with
     /// [`crate::catalog_tracker::CatalogTracker::set_pg_class_delete_epoch`].
     pub fn set_pg_class_delete_epoch(&mut self, epoch: Arc<AtomicU64>) {
         self.last_seen_delete_epoch = epoch.load(Ordering::Acquire);
         self.pg_class_delete_epoch = Some(epoch);
     }
 
-    /// PHASE15 §1 — install the schema-event sink. Returns the matching
+    /// Install the schema-event sink. Returns the matching
     /// `Receiver` so the caller (typically the worker task owning
     /// [`crate::xact_buffer::BufferingDecoderSink`]) can drain events
     /// as the catalog discovers descriptor shapes. Subsequent
@@ -481,7 +502,7 @@ impl ShadowCatalog {
         rx
     }
 
-    /// PHASE15 §5 — bootstrap-time fan-out. Resolves every relation
+    /// Bootstrap-time fan-out. Resolves every relation
     /// in the named source namespaces and emits one `Added` event per
     /// relation that the catalog hadn't seen before. Idempotent across
     /// daemon restarts because the applicator's `CREATE TABLE IF NOT
@@ -522,6 +543,54 @@ impl ShadowCatalog {
         Ok(added)
     }
 
+    /// Seed the schema-diff baseline (`prev_known`) for the
+    /// operator-pinned relations before [`Self::subscribe`]. Warms
+    /// `prev_known` with each relation's boot-time shape so its first
+    /// post-start `ALTER ADD COLUMN` (or RENAME / DROP) diffs against
+    /// that shape and surfaces as `Changed` (→ CH `ALTER`) rather than
+    /// cold-`prev_known` `Added` — which the applicator skips for
+    /// operator-pinned dests, leaving CH a column behind.
+    ///
+    /// `qualified_names` are `"namespace.relname"` source identifiers
+    /// (the pinned mapping keys). Each resolves to a shadow oid via
+    /// `to_regclass($1)`; a NULL resolution is skipped (preflight already
+    /// guarantees mapped rels exist, so a miss here is purely defensive).
+    /// Oids already in `prev_known` are skipped, keeping the seed
+    /// idempotent across `--start-lsn` resume.
+    ///
+    /// Fetches each descriptor through [`Self::relation_by_oid`], which
+    /// flows through `insert` → `record_descriptor` and warms
+    /// `prev_known` (plus `by_oid` / `by_filenode`). Must run before
+    /// `subscribe()`: `send_event` is a no-op while `event_tx` is `None`,
+    /// so seeding emits no `Added` to the applicator and does zero CH
+    /// work at boot. Returns the count of relations seeded.
+    ///
+    /// Records the *full* source descriptor, not the pinned mapping, so a
+    /// later `ALTER` diffs against the whole source shape: columns the
+    /// operator deliberately left unmapped sit in the baseline and read
+    /// as "excluded", never "added since". See the pinned-subset reasoning
+    /// in `plans/future/pinned_ddl_baseline.md`.
+    pub async fn seed_baseline(&mut self, qualified_names: &[String]) -> Result<usize> {
+        let mut seeded = 0usize;
+        for name in qualified_names {
+            let row = self
+                .query_one_retry("SELECT to_regclass($1)::oid", &[&name.as_str()])
+                .await?;
+            let Some(oid) = row.get::<_, Option<Oid>>(0) else {
+                continue;
+            };
+            if self.prev_known.contains_key(&oid) {
+                continue;
+            }
+            match self.relation_by_oid(oid).await {
+                Ok(_) => seeded += 1,
+                Err(CatalogError::NotFoundByOid(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(seeded)
+    }
+
     /// Emit a `Dropped` event for an oid the decoder observed a
     /// pg_class `heap_delete` for. `qualified_name` is resolved from the
     /// last-known descriptor in [`Self::prev_known`]; returns `false`
@@ -541,7 +610,7 @@ impl ShadowCatalog {
         true
     }
 
-    /// PHASE15 §6 — poll-based DROP TABLE discovery.
+    /// Poll-based DROP TABLE discovery.
     ///
     /// Polls shadow's `pg_class` for every oid currently in
     /// [`Self::prev_known`]; any oid that no longer exists in shadow
@@ -659,7 +728,7 @@ impl ShadowCatalog {
         self.generation
     }
 
-    /// PHASE15 §6 — true when [`Self::sweep_dropped`] would do real
+    /// True when [`Self::sweep_dropped`] would do real
     /// work (catalog tracker observed a pg_class `heap_delete` since
     /// the last sweep AND there's something to sweep). Read-only +
     /// cheap (one atomic load + integer compare); callers gate the
@@ -743,18 +812,7 @@ impl ShadowCatalog {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Row> {
-        self.ensure_open().await?;
-        match self.client.query_one(statement, params).await {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                if self.client.is_closed() {
-                    self.reconnect().await?;
-                    Ok(self.client.query_one(statement, params).await?)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        query_with_reconnect!(self, query_one, statement, params)
     }
 
     /// `query_opt` with a single transparent reconnect-and-retry on
@@ -764,18 +822,7 @@ impl ShadowCatalog {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Option<Row>> {
-        self.ensure_open().await?;
-        match self.client.query_opt(statement, params).await {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                if self.client.is_closed() {
-                    self.reconnect().await?;
-                    Ok(self.client.query_opt(statement, params).await?)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        query_with_reconnect!(self, query_opt, statement, params)
     }
 
     /// `query` (multi-row) with a single transparent reconnect-and-retry on
@@ -785,18 +832,7 @@ impl ShadowCatalog {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>> {
-        self.ensure_open().await?;
-        match self.client.query(statement, params).await {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                if self.client.is_closed() {
-                    self.reconnect().await?;
-                    Ok(self.client.query(statement, params).await?)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        query_with_reconnect!(self, query, statement, params)
     }
 
     /// Last observed `pg_last_wal_replay_lsn()` value (may be NULL when
@@ -913,7 +949,7 @@ impl ShadowCatalog {
             },
         );
         self.by_oid.insert(arc.oid, entry);
-        // PHASE15 §1: emit Added/Changed against the previously-known
+        // Emit Added/Changed against the previously-known
         // descriptor (kept in `prev_known` across generation bumps).
         self.record_descriptor(&arc);
         self.evict_if_over_cap();
@@ -968,28 +1004,7 @@ impl ShadowCatalog {
             )
             .await?;
         let Some(row) = row else { return Ok(None) };
-        let oid: Oid = row.get(0);
-        let namespace_oid: Oid = row.get(1);
-        let namespace_name: String = row.get(2);
-        let name: String = row.get(3);
-        let kind = one_char(row.get::<_, String>(4), "relkind")?;
-        let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
-        let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
-        let replident = self.fetch_replident(replident_char, oid).await?;
-        let attributes = self.fetch_attributes(oid).await?;
-        let qualified_name = RelDescriptor::build_qualified_name(&namespace_name, &name);
-        Ok(Some(RelDescriptor {
-            rfn,
-            oid,
-            namespace_oid,
-            namespace_name,
-            name,
-            qualified_name,
-            kind,
-            persistence,
-            replident,
-            attributes,
-        }))
+        Ok(Some(self.descriptor_from_row(&row, rfn).await?))
     }
 
     async fn fetch_by_oid(&mut self, oid: Oid) -> Result<Option<RelDescriptor>> {
@@ -1013,13 +1028,6 @@ impl ShadowCatalog {
             )
             .await?;
         let Some(row) = row else { return Ok(None) };
-        let oid: Oid = row.get(0);
-        let namespace_oid: Oid = row.get(1);
-        let namespace_name: String = row.get(2);
-        let name: String = row.get(3);
-        let kind = one_char(row.get::<_, String>(4), "relkind")?;
-        let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
-        let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
         let spc_node: Oid = row.get(7);
         let rel_node: Oid = row.get(8);
         // db_node is the current database. Resolve via current_database()'s oid.
@@ -1029,10 +1037,25 @@ impl ShadowCatalog {
             db_node,
             rel_node,
         };
+        Ok(Some(self.descriptor_from_row(&row, rfn).await?))
+    }
+
+    /// Build a [`RelDescriptor`] from a pg_class⋈pg_namespace row whose
+    /// first 7 columns are (oid, relnamespace, nspname, relname, relkind,
+    /// relpersistence, relreplident), pairing it with an already-resolved
+    /// `rfn`. Fans out to `fetch_replident` + `fetch_attributes`.
+    async fn descriptor_from_row(&mut self, row: &Row, rfn: RelFileNode) -> Result<RelDescriptor> {
+        let oid: Oid = row.get(0);
+        let namespace_oid: Oid = row.get(1);
+        let namespace_name: String = row.get(2);
+        let name: String = row.get(3);
+        let kind = one_char(row.get::<_, String>(4), "relkind")?;
+        let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
+        let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
         let replident = self.fetch_replident(replident_char, oid).await?;
         let attributes = self.fetch_attributes(oid).await?;
         let qualified_name = RelDescriptor::build_qualified_name(&namespace_name, &name);
-        Ok(Some(RelDescriptor {
+        Ok(RelDescriptor {
             rfn,
             oid,
             namespace_oid,
@@ -1043,7 +1066,7 @@ impl ShadowCatalog {
             persistence,
             replident,
             attributes,
-        }))
+        })
     }
 
     async fn fetch_replident(&mut self, c: char, rel_oid: Oid) -> Result<ReplIdent> {

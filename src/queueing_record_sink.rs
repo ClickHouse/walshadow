@@ -3,7 +3,7 @@
 //!
 //! ## Why
 //!
-//! The PHASE13 §3 design fires `RecordBytesSink::on_wire_chunk`
+//! The streaming-shadow design fires `RecordBytesSink::on_wire_chunk`
 //! (shadow-wire bytes) before `RecordSink::on_record` (decoder, xact
 //! buffer, emitter) per record, with both calls awaited in the pump
 //! task. The decoder's `ShadowCatalog::wait_for_replay` gate clears
@@ -118,6 +118,18 @@ impl QueueingRecordSink {
         let batch_size = batch_size.max(1);
         let idle_interval = idle_interval.max(Duration::from_millis(1));
         let worker = tokio::spawn(async move {
+            // Park the first error, drop the in-flight batch (`n`, or 0 on
+            // the idle path), then close+drain the channel so `in_flight`
+            // settles. Caller `break 'outer`s after.
+            let park_err_and_drain =
+                async |e, n: u64, rx: &mut mpsc::UnboundedReceiver<Vec<Record<'static>>>| {
+                    *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
+                    in_flight_w.fetch_sub(n, Ordering::Relaxed);
+                    rx.close();
+                    while let Some(rest) = rx.recv().await {
+                        in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
+                    }
+                };
             'outer: loop {
                 match tokio::time::timeout(idle_interval, rx.recv()).await {
                     Ok(Some(batch)) => {
@@ -126,12 +138,7 @@ impl QueueingRecordSink {
                         for record in &batch {
                             max_lsn = max_lsn.max(record.source_lsn);
                             if let Err(e) = inner.on_record(record).await {
-                                *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
-                                in_flight_w.fetch_sub(n, Ordering::Relaxed);
-                                rx.close();
-                                while let Some(rest) = rx.recv().await {
-                                    in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
-                                }
+                                park_err_and_drain(e, n, &mut rx).await;
                                 break 'outer;
                             }
                         }
@@ -141,12 +148,7 @@ impl QueueingRecordSink {
                         // is a high-water mark for "everything ≤ this
                         // is dispatched."
                         if let Err(e) = inner.on_idle_advance(max_lsn).await {
-                            *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
-                            in_flight_w.fetch_sub(n, Ordering::Relaxed);
-                            rx.close();
-                            while let Some(rest) = rx.recv().await {
-                                in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
-                            }
+                            park_err_and_drain(e, n, &mut rx).await;
                             break 'outer;
                         }
                         in_flight_w.fetch_sub(n, Ordering::Relaxed);
@@ -167,11 +169,7 @@ impl QueueingRecordSink {
                         // Idle wakeup: drive any time-based work the
                         // inner sink wants (CH emitter flush deadline).
                         if let Err(e) = inner.on_idle().await {
-                            *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
-                            rx.close();
-                            while let Some(rest) = rx.recv().await {
-                                in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
-                            }
+                            park_err_and_drain(e, 0, &mut rx).await;
                             break 'outer;
                         }
                     }

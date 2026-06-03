@@ -1,7 +1,7 @@
 //! Reclassifier for records that carry the target relation in
 //! `main_data` rather than a block reference.
 //!
-//! Phase 0 buckets these as `Class::Empty`. Known reachable cases on
+//! The per-record classifier buckets these as `Class::Empty`. Known reachable cases on
 //! PG 15+ captures, cross-checked against
 //! `~/s/postgresql/src/backend/access/`:
 //!

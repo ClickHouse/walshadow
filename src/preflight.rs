@@ -1,8 +1,8 @@
-//! Phase 10 — pre-flight validators run at daemon connect.
+//! Pre-flight validators run at daemon connect.
 //!
 //! Refuses to start when any of the following holds:
 //!
-//! - source `server_version_num` < 160_000 ([PLAN.md Phase 2] minimum).
+//! - source `server_version_num` < 160_000 (minimum supported major).
 //! - shadow / source major mismatch (a same-physical-WAL standby cannot
 //!   span major versions; PG's own catalog layout changes across them).
 //! - source `wal_level` not `logical` ([PLAN.md §4]; physical-only WAL
@@ -22,7 +22,7 @@ use tokio_postgres::Client;
 
 use crate::ch_emitter::EmitterConfig;
 
-/// Minimum supported source major. Phase 2 closed PG <16 cleanup; the
+/// Minimum supported source major. PG <16 is unsupported; the
 /// catalog accessors assume PG-16 column layouts.
 pub const MIN_SERVER_VERSION_NUM: i32 = 160_000;
 

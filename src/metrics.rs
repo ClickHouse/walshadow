@@ -1,4 +1,4 @@
-//! Phase 10 — HTTP/Prometheus metrics surface.
+//! HTTP/Prometheus metrics surface.
 //!
 //! Exposes a `/metrics` endpoint over plain TCP that scrapers like
 //! Prometheus already speak. Output is the Prometheus
@@ -11,7 +11,7 @@
 //! request. Lock contention is invisible at scrape rates (≤ once/sec
 //! per Prom replica).
 //!
-//! Scope is the LSN triple ([Phase 11 fills the resume-safe values]),
+//! Scope is the LSN triple (resume-safe values land with the durable cursor),
 //! per-rmgr filter counters, xact buffer occupancy, spill stats, oracle
 //! sampler stats, and a daemon-uptime counter. The endpoint is
 //! intentionally read-only (no `/quit`, no admin verbs); operator
@@ -43,19 +43,19 @@ pub enum MetricsError {
 #[derive(Debug, Default, Clone)]
 pub struct MetricsSnapshot {
     /// Source PG's most recent `server_wal_end` (write LSN as PG sees
-    /// it). Walshadow's "source_received_lsn" in [Phase 11] parlance.
+    /// it). Walshadow's "source_received_lsn".
     pub source_received_lsn: u64,
     /// Last segment-boundary LSN the filter has dispatched downstream.
-    /// Becomes filter_durable_lsn in Phase 11 once segment fsync lands.
+    /// Becomes filter_durable_lsn once segment fsync lands.
     pub filter_lsn: u64,
     /// Shadow PG's `pg_last_wal_replay_lsn()`, polled at status-line
     /// cadence. `0` until first poll.
     pub shadow_replay_lsn: u64,
-    /// Latest LSN the decoder has committed downstream (Phase 11).
-    /// Stays `0` in Phase 10 — surface lands here so the endpoint shape
+    /// Latest LSN the decoder has committed downstream.
+    /// Currently stays `0` — surface lands here so the endpoint shape
     /// is fixed before durability work.
     pub decoder_commit_lsn: u64,
-    /// CH emitter ack-LSN (Phase 11). Same placeholder treatment as
+    /// CH emitter ack-LSN. Same placeholder treatment as
     /// `decoder_commit_lsn`.
     pub emitter_ack_lsn: u64,
     /// Per-(rmgr name, decision) record counters. `decision` is one of
@@ -82,12 +82,12 @@ pub struct MetricsSnapshot {
     pub oracle_validate_mismatches_total: u64,
     pub oracle_errors_total: u64,
     pub uptime_secs: u64,
-    /// PHASE14 §6 — `source_received_lsn - min_apply_lsn` across active
+    /// `source_received_lsn - min_apply_lsn` across active
     /// shadow walreceiver connections. Caller saturates to 0 when shadow
     /// is ahead; when no shadow is connected, caller passes
     /// `source_received_lsn` (treat disconnect as max lag).
     pub shadow_apply_lag_bytes: u64,
-    /// PHASE14 §6 — `shadow_apply_lag_bytes` divided by a rolling 30 s
+    /// `shadow_apply_lag_bytes` divided by a rolling 30 s
     /// estimate of source WAL byte rate. `f64::INFINITY` when rate is 0
     /// (renders as `+Inf`).
     pub shadow_apply_lag_seconds: f64,
@@ -216,12 +216,12 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         ),
         (
             "walshadow_decoder_commit_lsn",
-            "Highest LSN the decoder has committed downstream (Phase 11; 0 in Phase 10).",
+            "Highest LSN the decoder has committed downstream (currently 0).",
             snap.decoder_commit_lsn,
         ),
         (
             "walshadow_emitter_ack_lsn",
-            "Highest LSN the CH emitter has acked (Phase 11; 0 in Phase 10).",
+            "Highest LSN the CH emitter has acked (currently 0).",
             snap.emitter_ack_lsn,
         ),
     ] {

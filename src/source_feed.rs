@@ -4,8 +4,8 @@
 //! issue `IDENTIFY_SYSTEM`, then `START_REPLICATION PHYSICAL`, then run
 //! a frame loop that surfaces `CopyData('w')` WAL bytes to a caller
 //! callback while transparently handling `CopyData('k')` keepalives and
-//! periodic standby-status replies. Used by the daemon binary (PRE5
-//! item 1) and by the live-source integration tests.
+//! periodic standby-status replies. Used by the daemon binary
+//! and by the live-source integration tests.
 
 use std::time::{Duration, Instant};
 
@@ -32,11 +32,11 @@ pub struct WalChunk<'a> {
     pub data: &'a [u8],
 }
 
-/// Phase 10 standby-status carrier. Splits the single LSN that
-/// pre-Phase-10 status updates collapsed into one value into the three
-/// fields wal-rs's `build_status_update` already takes. Phase 11 fills
-/// in the resume-safe `flush` (filter-durable LSN) + `apply`
-/// (`min(shadow_replay, emitter_ack)`) values; Phase 10 ships the
+/// Standby-status carrier. Splits the single LSN that earlier
+/// status updates collapsed into one value into the three
+/// fields wal-rs's `build_status_update` already takes. The durable
+/// path fills in the resume-safe `flush` (filter-durable LSN) + `apply`
+/// (`min(shadow_replay, emitter_ack)`) values; today ships the
 /// shape with conservative placeholders so the wire format is fixed
 /// before durability lands.
 #[derive(Debug, Clone, Copy, Default)]
@@ -46,12 +46,12 @@ pub struct StandbyStatus {
     /// `source_received_lsn`.
     pub write_lsn: u64,
     /// `flush_lsn` PG sees: how far the filter has *durably* written
-    /// out to filtered segments. Phase 10 reports the last segment-
-    /// boundary `dispatched_lsn`; Phase 11 fsyncs first.
+    /// out to filtered segments. Today reports the last segment-
+    /// boundary `dispatched_lsn`; the durable path fsyncs first.
     pub flush_lsn: u64,
     /// `apply_lsn` PG sees: bounded above by shadow's replay LSN and
-    /// the CH emitter's ack LSN. Phase 10 reports `dispatched_lsn`
-    /// as a conservative ceiling; Phase 11 substitutes the real
+    /// the CH emitter's ack LSN. Today reports `dispatched_lsn`
+    /// as a conservative ceiling; the durable path substitutes the real
     /// ack-gated value so source's slot won't recycle WAL the
     /// emitter hasn't durably consumed.
     pub apply_lsn: u64,
@@ -59,8 +59,8 @@ pub struct StandbyStatus {
 
 impl StandbyStatus {
     /// Build a status carrier where all three slots collapse to the
-    /// same value. Pre-Phase-10 callers used this shape; kept for
-    /// compatibility through Phase 10 wiring.
+    /// same value. Earlier callers used this shape; kept for
+    /// compatibility through the current wiring.
     pub fn collapsed(lsn: u64) -> Self {
         Self {
             write_lsn: lsn,

@@ -1,4 +1,4 @@
-//! Phase 6 — per-xact append-only spill backend.
+//! Per-xact append-only spill backend.
 //!
 //! Mirrors PG's `pg_replslot/<slot>/xid-*.snap` shape: one file per
 //! buffered xid under `{data_dir}/spill/`. The xact buffer flushes its
@@ -107,8 +107,8 @@ pub type Result<T> = std::result::Result<T, SpillError>;
 /// File-leading magic. Picked to be ASCII for `xxd`-friendly debug.
 pub const SPILL_MAGIC: [u8; 2] = *b"WS";
 /// Current on-disk format. v2 covers `HeapOp::Truncate`'s tag-4
-/// (PHASE14 §3) and `DrainEntry::Catalog` lift (PHASE15 §6 will reuse).
-/// v1 was the pre-PRE15 unversioned shape; we never wrote a v1 header,
+/// and the `DrainEntry::Catalog` lift.
+/// v1 was the earlier unversioned shape; we never wrote a v1 header,
 /// so older files are simply rejected as "no magic".
 pub const SPILL_VERSION: u16 = 2;
 
@@ -153,7 +153,7 @@ impl SpillStore {
     }
 
     /// Wipe every file under the spill dir. Called at daemon startup
-    /// per [PHASE6disk.md]("Crash recovery"): on-disk state is always
+    /// per the crash-recovery contract: on-disk state is always
     /// either drained-into-CH or replayable from the cursor's
     /// `decoder_lsn`, so leftover spill files from a prior crash are
     /// safe to discard.
@@ -235,12 +235,19 @@ impl SpillWriter {
     /// Abort path: drop the file unread. Renamed from `discard` so the
     /// intent is obvious at call sites.
     pub async fn unlink(self) -> Result<()> {
-        drop(self.file);
-        match tokio::fs::remove_file(&self.path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        unlink_file(self.file, &self.path).await
+    }
+}
+
+/// Drop `file` and remove `path`, tolerating an already-gone file
+/// (abort races, crash-cleanup re-runs). Shared by both spill handles'
+/// `unlink`.
+async fn unlink_file(file: File, path: &Path) -> Result<()> {
+    drop(file);
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -327,12 +334,7 @@ impl SpillReader {
     }
 
     pub async fn unlink(self) -> Result<()> {
-        drop(self.file);
-        match tokio::fs::remove_file(&self.path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        unlink_file(self.file, &self.path).await
     }
 }
 

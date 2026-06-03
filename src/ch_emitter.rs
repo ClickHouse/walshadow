@@ -1,4 +1,4 @@
-//! Phase 7 — CH Native emitter via [`clickhouse-c-rs`].
+//! CH Native emitter via [`clickhouse-c-rs`].
 //!
 //! Translates committed-xact tuple streams into per-table INSERT
 //! statements over a single TCP `Client` per CH replica. Lifecycle per
@@ -141,14 +141,14 @@ pub struct EmitterConfig {
     pub flush_timeout: Duration,
     /// Keyed on `"<namespace>.<relname>"` source identifier.
     pub tables: HashMap<String, TableMapping>,
-    /// PHASE15 §5 — per-source-namespace defaults. Auto-DDL flow.
+    /// Per-source-namespace defaults. Auto-DDL flow.
     /// Keyed on PG schema name (`"public"`, etc.); per-table entries
     /// in `tables` still win for the relation they name.
     pub namespaces: HashMap<String, NamespaceMapping>,
-    /// PHASE15 §6 — global `--drop-table-strategy` default. Per-namespace
+    /// Global `--drop-table-strategy` default. Per-namespace
     /// override via `[namespace.<ns>] drop_table_strategy = ...`.
     pub drop_table_strategy: String,
-    /// Phase 10 bounded retry against a single CH replica. See
+    /// Bounded retry against a single CH replica. See
     /// [`RetryConfig`] for semantics.
     pub retry: RetryConfig,
 }
@@ -267,7 +267,7 @@ pub struct TableMapping {
     pub columns: Vec<ColumnMapping>,
 }
 
-/// PHASE15 §5 — per-namespace defaults. Operator-pinned blocks shaped
+/// Per-namespace defaults. Operator-pinned blocks shaped
 /// like:
 ///
 /// ```toml
@@ -459,7 +459,7 @@ impl EmitterConfig {
 
     /// Top-level construction: connect, build codec, return ready
     /// [`Emitter`]. Requires a connected `TcpStream` from the caller
-    /// (Phase 7 plumbing); the caller hands the fd over to the emitter,
+    /// (daemon plumbing); the caller hands the fd over to the emitter,
     /// which owns it for the lifetime of the connection.
     pub fn connect(
         self,
@@ -595,7 +595,7 @@ impl TablePlan {
     }
 }
 
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     // CH backtick quoting (mirrors `quoteIdentIfNeed` in the upstream
     // client). Backticks inside identifiers escape via doubling.
     let mut s = String::with_capacity(name.len() + 2);
@@ -608,6 +608,78 @@ fn quote_ident(name: &str) -> String {
     }
     s.push('`');
     s
+}
+
+/// Open a CH [`Client`] from `config` over an already-connected blocking
+/// `tcp`. Shared by [`Emitter::new`], [`Emitter::reconnect`], and
+/// [`DdlApplicator::new`] so connection options stay in one place.
+pub(crate) fn connect_client(
+    config: &EmitterConfig,
+    alloc: Allocator,
+    tcp: std::net::TcpStream,
+) -> Result<Client<'static>, EmitterError> {
+    let codec = config.compression.build_codec()?;
+    let io = PosixIo::new_owned(tcp);
+    let mut opts = ClientOpts::new()
+        .database(&config.database)
+        .user(&config.user)
+        .password(&config.password);
+    opts.compression = config.compression.to_wire();
+    Ok(Client::init(&opts, alloc, io, codec)?)
+}
+
+/// Drain a CH response stream to `EndOfStream`, surfacing any
+/// `Exception` packet as [`EmitterError::ServerException`]. Used after
+/// every `send_query`/`send_data(None)` that expects no result rows
+/// (INSERT seal, TRUNCATE, DDL).
+pub(crate) fn drain_to_end_of_stream(client: &mut Client<'_>) -> Result<(), EmitterError> {
+    loop {
+        let mut pkt = client.recv_packet()?;
+        match pkt.kind() {
+            Some(PacketKind::EndOfStream) => break,
+            Some(PacketKind::Exception) => {
+                if let Some(exc) = pkt.take_exception() {
+                    return Err(EmitterError::ServerException {
+                        code: exc.code(),
+                        message: String::from_utf8_lossy(exc.display_text()).into_owned(),
+                    });
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Bounded reconnect+retry around a CH op returning `Result<_,
+/// EmitterError>`. A macro, not a fn: it threads `&mut self` through
+/// both `$op` and the in-loop `reconnect().await` without a borrow
+/// conflict. `$op` may be sync or `.await`-ed. Retryable failures bounce
+/// the connection per [`EmitterConfig::retry`]; the per-table buffer in
+/// `self.tables` survives so buffered rows reflush on the new socket.
+macro_rules! with_reconnect_retry {
+    ($self:ident, $op:expr) => {{
+        let retry = $self.config.retry.clone();
+        let mut attempt = 0u32;
+        let mut backoff = retry.initial_backoff;
+        loop {
+            match $op {
+                Ok(ack) => break Ok(ack),
+                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
+                    $self
+                        .stats
+                        .retries_attempted
+                        .fetch_add(1, Ordering::Relaxed);
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+                    $self.reconnect().await?;
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    }};
 }
 
 /// Per-table per-xact accumulator. One block buffer per CH column;
@@ -1302,18 +1374,18 @@ fn encode_value(
 /// the daemon hands one clone to [`Emitter`] and keeps another to
 /// support SIGHUP reload (atomic swap of the entire `HashMap`).
 ///
-/// Phase 10 sees the swap *between* xacts: tables already cached in
+/// The reload sees the swap *between* xacts: tables already cached in
 /// [`Emitter::tables`] keep their old [`TablePlan`] until the xact
 /// drains and clears the cache. The next xact consults the new map.
 pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>;
 
-/// Phase 7 CH-Native emitter. Holds one [`Client`] over a connected
+/// CH-Native emitter. Holds one [`Client`] over a connected
 /// TCP socket per CH replica plus the per-table accumulator state.
 pub struct Emitter {
     client: Client<'static>,
     alloc: Allocator,
     config: EmitterConfig,
-    /// Phase 10 SIGHUP-reloadable mapping. Initial value is cloned from
+    /// SIGHUP-reloadable mapping. Initial value is cloned from
     /// `config.tables` at construction; later mutations come via
     /// [`Emitter::mapping_handle`] reaching out from the daemon's
     /// SIGHUP task.
@@ -1338,7 +1410,7 @@ pub struct Emitter {
     /// Monotonic; only bumped inside [`Self::close_all_open_inserts`]
     /// or when an empty/untracked xact arrives with no rows pending.
     last_durable_commit_lsn: u64,
-    /// PHASE15 §2 — CH-side DDL writer. Owns its own clickhouse-c
+    /// CH-side DDL writer. Owns its own clickhouse-c
     /// `Client` (separate from `self.client` so DDL doesn't interleave
     /// with INSERT data). `None` when the emitter is wired without a
     /// DDL applicator (tests, transitional bootstrap emitter).
@@ -1365,7 +1437,7 @@ crate::atomic_stats! {
         /// carries the whole cluster). Skipped, not an error.
         pub foreign_db_rows_skipped,
         pub unsupported_values,
-        /// Phase 10 retry bookkeeping. `reconnects` ticks on every fresh
+        /// Retry bookkeeping. `reconnects` ticks on every fresh
         /// CH socket the daemon hot-replaces; `retries_attempted` ticks on
         /// every reconnect-triggered retry (one per failing operation,
         /// not per attempt — so a single op that needed 3 retries adds 3).
@@ -1390,14 +1462,7 @@ impl Emitter {
         tcp: std::net::TcpStream,
     ) -> Result<Self, EmitterError> {
         let alloc = Allocator::stdlib();
-        let codec = config.compression.build_codec()?;
-        let io = PosixIo::new_owned(tcp);
-        let mut opts = ClientOpts::new()
-            .database(&config.database)
-            .user(&config.user)
-            .password(&config.password);
-        opts.compression = config.compression.to_wire();
-        let client = Client::init(&opts, alloc, io, codec)?;
+        let client = connect_client(&config, alloc, tcp)?;
         let mapping = Arc::new(tokio::sync::RwLock::new(config.tables.clone()));
         Ok(Self {
             client,
@@ -1416,7 +1481,7 @@ impl Emitter {
         })
     }
 
-    /// PHASE15 §2 — attach a DDL applicator. Caller opens the
+    /// Attach a DDL applicator. Caller opens the
     /// applicator's own TCP connection and passes it through
     /// [`DdlApplicator::new`] before handing it off here. Once
     /// attached, schema events drained from the xact buffer route
@@ -1496,22 +1561,7 @@ impl Emitter {
             self.tables.remove(&key);
             let sql = format!("TRUNCATE TABLE {}", mapping.target);
             self.client.send_query(&sql, None)?;
-            loop {
-                let mut pkt = self.client.recv_packet()?;
-                match pkt.kind() {
-                    Some(PacketKind::EndOfStream) => break,
-                    Some(PacketKind::Exception) => {
-                        if let Some(exc) = pkt.take_exception() {
-                            return Err(EmitterError::ServerException {
-                                code: exc.code(),
-                                message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                            });
-                        }
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            drain_to_end_of_stream(&mut self.client)?;
             self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -1598,22 +1648,7 @@ impl Emitter {
             0
         };
         self.client.send_data(None)?;
-        loop {
-            let mut pkt = self.client.recv_packet()?;
-            match pkt.kind() {
-                Some(PacketKind::EndOfStream) => break,
-                Some(PacketKind::Exception) => {
-                    if let Some(exc) = pkt.take_exception() {
-                        return Err(EmitterError::ServerException {
-                            code: exc.code(),
-                            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                        });
-                    }
-                    break;
-                }
-                _ => {}
-            }
-        }
+        drain_to_end_of_stream(&mut self.client)?;
         // EndOfStream confirmed: the INSERT is durable on CH, so the
         // rows just sealed are now safe to count and drop. Until this
         // point the buffer is the only replay source if the connection
@@ -1746,43 +1781,13 @@ impl Emitter {
     /// Bounded-retry wrapper around [`Self::flush_if_deadline_tripped`].
     /// Mirrors [`Self::on_xact_end_with_retry`].
     pub async fn flush_if_deadline_tripped_with_retry(&mut self) -> Result<u64, EmitterError> {
-        let retry = self.config.retry.clone();
-        let mut attempt = 0u32;
-        let mut backoff = retry.initial_backoff;
-        loop {
-            match self.flush_if_deadline_tripped() {
-                Ok(ack) => return Ok(ack),
-                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
-                    attempt += 1;
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
-                    self.reconnect().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        with_reconnect_retry!(self, self.flush_if_deadline_tripped())
     }
 
     /// Bounded-retry wrapper around [`Self::flush_open_inserts`].
     /// Called from the daemon shutdown path.
     pub async fn flush_open_inserts_with_retry(&mut self) -> Result<u64, EmitterError> {
-        let retry = self.config.retry.clone();
-        let mut attempt = 0u32;
-        let mut backoff = retry.initial_backoff;
-        loop {
-            match self.flush_open_inserts() {
-                Ok(ack) => return Ok(ack),
-                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
-                    attempt += 1;
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
-                    self.reconnect().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        with_reconnect_retry!(self, self.flush_open_inserts())
     }
 
     /// Read-only snapshot of the durable horizon. Cheap; the
@@ -1805,7 +1810,7 @@ impl Emitter {
         idle_ceiling(fully_drained, lsn, self.last_durable_commit_lsn)
     }
 
-    /// Phase 10 reconnect: open a fresh TCP socket against the same
+    /// Reconnect: open a fresh TCP socket against the same
     /// `(host, port)`, build a new [`Client`] (which owns its own
     /// `PosixIo` + `Codec`), and hot-swap `self.client` while preserving
     /// the per-table accumulator state in `self.tables`. The fresh
@@ -1819,15 +1824,7 @@ impl Emitter {
         tcp.set_nodelay(true).ok();
         let std_tcp = tcp.into_std()?;
         std_tcp.set_nonblocking(false)?;
-        let codec = self.config.compression.build_codec()?;
-        let io = PosixIo::new_owned(std_tcp);
-        let mut opts = ClientOpts::new()
-            .database(&self.config.database)
-            .user(&self.config.user)
-            .password(&self.config.password);
-        opts.compression = self.config.compression.to_wire();
-        let client = Client::init(&opts, self.alloc, io, codec)?;
-        self.client = client;
+        self.client = connect_client(&self.config, self.alloc, std_tcp)?;
         self.wire_open_key = None;
         self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1842,25 +1839,10 @@ impl Emitter {
         &mut self,
         committed: &CommittedTuple,
     ) -> Result<(), EmitterError> {
-        let retry = self.config.retry.clone();
-        let mut attempt = 0u32;
-        let mut backoff = retry.initial_backoff;
-        loop {
-            match self.route(committed).await {
-                Ok(()) => return Ok(()),
-                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
-                    attempt += 1;
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
-                    self.reconnect().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        with_reconnect_retry!(self, self.route(committed).await)
     }
 
-    /// PHASE15 §2 — dispatch a [`SchemaEvent`] to the in-process
+    /// Dispatch a [`SchemaEvent`] to the in-process
     /// applicator. Closes the open INSERT for the AFFECTED relation
     /// first (`send_data(None)` + drain → durable on CH) so the CH
     /// ALTER doesn't race against a still-buffered INSERT against the
@@ -1908,30 +1890,15 @@ impl Emitter {
         event: &SchemaEvent,
     ) -> Result<(), EmitterError> {
         // Currently no retry — DDL errors poison the stream so the
-        // operator sees them. PHASE16 may add bounded reconnect for the
-        // DDL connection.
+        // operator sees them. Bounded reconnect for the DDL connection
+        // may come later.
         self.dispatch_schema_event(event).await
     }
 
     /// Wrap [`Self::on_xact_end_with_lsn`] in bounded reconnect+retry.
     /// Same shape as [`Self::route_with_retry`] — see notes there.
     pub async fn on_xact_end_with_retry(&mut self, commit_lsn: u64) -> Result<u64, EmitterError> {
-        let retry = self.config.retry.clone();
-        let mut attempt = 0u32;
-        let mut backoff = retry.initial_backoff;
-        loop {
-            match self.on_xact_end_with_lsn(commit_lsn) {
-                Ok(ack) => return Ok(ack),
-                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
-                    attempt += 1;
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
-                    self.reconnect().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        with_reconnect_retry!(self, self.on_xact_end_with_lsn(commit_lsn))
     }
 }
 
@@ -2259,12 +2226,12 @@ mod tests {
         }
     }
 
-    /// Reach into chc_type_elem_size for the Phase 7 width matrix
+    /// Reach into chc_type_elem_size for the emitter width matrix
     /// instead of mirroring it in walshadow. Confirms the upstream
     /// elem_size return values match what the encoder needs for
     /// fixed-shape ColumnBufs.
     #[test]
-    fn elem_size_covers_phase7_tier1() {
+    fn elem_size_covers_tier1() {
         let alloc = Allocator::stdlib();
         let cases = [
             ("UInt8", 1usize),

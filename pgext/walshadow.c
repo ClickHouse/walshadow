@@ -1,5 +1,5 @@
 /*
- * walshadow — shadow-PG extension used by walshadow's Phase 9
+ * walshadow — shadow-PG extension used by walshadow's
  * differential on-disk decode bridge.
  *
  * Exposes one SQL function:

@@ -1,4 +1,4 @@
-//! Phase 12 — greenfield bootstrap orchestrator.
+//! Greenfield bootstrap orchestrator.
 //!
 //! Wires a [`BackupSource`] (Direct or ObjectStore) through a
 //! [`MultiplexSink`] composed of [`DiskLanderSink`] +
@@ -21,8 +21,8 @@
 //! ```
 //!
 //! Catalog-seed snapshot binding: the seed query runs against source PG
-//! immediately before `source.run` issues `BASE_BACKUP`. Per
-//! [PLAN.md §Phase 12 out-of-scope](PLAN.md#phase-12--backfill-bridge),
+//! immediately before `source.run` issues `BASE_BACKUP`. Per the
+//! bootstrap contract,
 //! DDL during backfill is operator-quiesced; the sub-second seed/issue
 //! gap is operationally indistinguishable from BASE_BACKUP's own
 //! checkpoint window.
@@ -370,8 +370,8 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
 /// is independent of this snapshot, but binding the catalog read to a
 /// stable snapshot prevents a torn read against concurrent DDL while
 /// the seed runs. The sub-second window between this COMMIT and the
-/// caller's `source.run` is the operator-quiesce window mentioned in
-/// PHASE12plan.md §"Catalog-seed snapshot binding".
+/// caller's `source.run` is the operator-quiesce window of the
+/// catalog-seed snapshot binding.
 pub async fn seed_in_snapshot(client: &Client) -> Result<CatalogMap> {
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -483,7 +483,7 @@ fn one_char(s: String, what: &str) -> Result<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backup_page_walk::PAGE_BYTES;
+    use crate::backup_page_walk::{PAGE_BYTES, make_rel, synth_single_tuple_page};
     use crate::backup_source::{BackupSink, BackupSource, FileKind, FileMeta};
     use async_trait::async_trait;
 
@@ -515,60 +515,6 @@ mod tests {
                 g.finish(&self.end)?;
             }
             Ok((self.start.clone(), self.end.clone()))
-        }
-    }
-
-    /// Build an 8 KiB heap page with one int4 tuple. Salvaged inline
-    /// to avoid a public surface for the test helper.
-    fn synth_single_tuple_page(value: i32) -> [u8; PAGE_BYTES] {
-        use crate::backup_page_walk::{LP_NORMAL, SIZE_OF_ITEM_ID, SIZE_OF_PAGE_HEADER};
-        let mut page = [0u8; PAGE_BYTES];
-        let tuple_off = PAGE_BYTES - 32;
-        page[tuple_off..tuple_off + 4].copy_from_slice(&99u32.to_le_bytes());
-        page[tuple_off + 18..tuple_off + 20].copy_from_slice(&1u16.to_le_bytes());
-        page[tuple_off + 20..tuple_off + 22].copy_from_slice(&0u16.to_le_bytes());
-        page[tuple_off + 22] = 24;
-        page[tuple_off + 24..tuple_off + 28].copy_from_slice(&value.to_le_bytes());
-        let tuple_len = 28u16;
-        page[12..14].copy_from_slice(&((SIZE_OF_PAGE_HEADER + 4) as u16).to_le_bytes());
-        page[14..16].copy_from_slice(&(tuple_off as u16).to_le_bytes());
-        let raw = ((tuple_off as u32) & 0x7FFF)
-            | (((LP_NORMAL as u32) & 0x3) << 15)
-            | (((tuple_len as u32) & 0x7FFF) << 17);
-        page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + SIZE_OF_ITEM_ID]
-            .copy_from_slice(&raw.to_le_bytes());
-        page
-    }
-
-    fn make_rel() -> RelDescriptor {
-        RelDescriptor {
-            rfn: RelFileNode {
-                spc_node: 1663,
-                db_node: 5,
-                rel_node: 16400,
-            },
-            oid: 16400,
-            namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name: "t".into(),
-            qualified_name: RelDescriptor::build_qualified_name("public", "t"),
-            kind: 'r',
-            persistence: 'p',
-            replident: ReplIdent::Default { pk_attnums: None },
-            attributes: vec![RelAttr {
-                attnum: 1,
-                name: "id".into(),
-                type_oid: crate::heap_decoder::INT4OID,
-                typmod: -1,
-                not_null: false,
-                dropped: false,
-                type_name: "int4".into(),
-                type_byval: true,
-                type_len: 4,
-                type_align: 'i',
-                type_storage: 'p',
-                missing_text: None,
-            }],
         }
     }
 

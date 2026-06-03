@@ -1,13 +1,13 @@
-//! PHASE15 §3 — PG → CH type bridge.
+//! PG → CH type bridge.
 //!
 //! Given a [`RelAttr`] resolved from shadow PG's `pg_attribute`, produce
 //! the matching CH type string plus an optional `DEFAULT <expr>` clause
-//! reconstructed from PG's `attmissingval[1]` (see PHASE14 §1).
+//! reconstructed from PG's `attmissingval[1]`.
 //!
 //! `EmitterConfig.tables` (TOML mapping) is still the operator-pinned
-//! override path; PHASE15 §5 wires the bridge as the fallback for
-//! relations matched by namespace pattern only. PHASE15 §4 + §6 consume
-//! the bridge through `ch_ddl::DdlApplicator` when reshaping CH tables
+//! override path; the bridge is the fallback for
+//! relations matched by namespace pattern only. The DDL applicator
+//! consumes the bridge through `ch_ddl::DdlApplicator` when reshaping CH tables
 //! to track source DDL.
 //!
 //! ## Type matrix
@@ -558,7 +558,7 @@ mod tests {
         // 1/2 arm for it). The literal writer renders the raw typoutput
         // bytes through `unhex(...)` rather than `toDateTime64(...)`,
         // because reconstructing a typed CH literal from the bytes alone
-        // would require oracle help. PHASE15 §4's drill exercises the
+        // would require oracle help. The DDL-replication drill exercises the
         // typed path end-to-end through the oracle's round-trip.
         let r = map(
             &attr(TIMESTAMPTZOID, 6, true, Some("2024-01-02 03:04:05+00")),

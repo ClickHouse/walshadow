@@ -22,10 +22,10 @@
 //! 9. [`Shadow::health`] — periodic catalog probe
 //!
 //! Step 4 stays a primitive: walshadow does not reach out to source PG
-//! here (daemon orchestration is Phase 7). Callers feed in the dump
+//! here (daemon orchestration owns that). Callers feed in the dump
 //! string they obtained however they prefer.
 //!
-//! Standby signal vs recovery signal: PLAN.md Phase 3 says
+//! Standby signal vs recovery signal: a naive setup says
 //! `recovery.signal`, but §Architecture describes shadow as a
 //! *standby* — `recovery.signal` exits recovery when archive WAL runs
 //! out, which is the wrong primitive. `standby.signal` keeps the
@@ -265,7 +265,7 @@ impl Shadow {
         Ok(out.status.code() == Some(0))
     }
 
-    /// Optional Phase 9 hook: load the `walshadow` extension if
+    /// Optional oracle hook: load the `walshadow` extension if
     /// it's installed system-wide on shadow's PG. Tolerates the absent
     /// case — the daemon falls back to raw on-disk bytes for Tier 3
     /// types that aren't in the local matrix. Returns `true` iff the

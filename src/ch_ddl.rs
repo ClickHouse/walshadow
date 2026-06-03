@@ -1,4 +1,4 @@
-//! PHASE15 §2 — CH-side DDL applicator.
+//! CH-side DDL applicator.
 //!
 //! Consumes [`SchemaEvent`] dispatch from
 //! [`crate::xact_buffer::XactBuffer::commit`]'s k-way merge (via the
@@ -11,7 +11,7 @@
 //! | `Changed.added_columns` | `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` per column in attnum order |
 //! | `Changed.renamed_columns` | `ALTER TABLE … RENAME COLUMN … TO …` first |
 //! | `Changed.dropped_columns` | `ALTER TABLE … DROP COLUMN IF EXISTS …` |
-//! | `Changed.type_changes` | rejected — logged, not applied (PHASE15 open question) |
+//! | `Changed.type_changes` | rejected — logged, not applied (open question) |
 //! | `Dropped` | `DROP TABLE IF EXISTS …` gated on [`DropTableStrategy`] |
 //!
 //! ## Connection lifecycle
@@ -33,15 +33,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use clickhouse_c::{Allocator, Client, ClientOpts, PacketKind, PosixIo};
+use clickhouse_c::{Allocator, Client};
 
 use crate::ch_emitter::{
     ColumnMapping, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, TableMapping,
+    connect_client, drain_to_end_of_stream, quote_ident,
 };
 use crate::shadow_catalog::{RelDescriptor, SchemaDiff, SchemaEvent};
 use crate::type_bridge::{self, ResolvedColumn};
 
-/// Per-relation DROP TABLE behaviour. Matches PHASE15 §6's
+/// Per-relation DROP TABLE behaviour. Matches the
 /// `--drop-table-strategy` flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DropTableStrategy {
@@ -78,7 +79,7 @@ impl DropTableStrategy {
 #[derive(Debug, Clone)]
 pub struct DdlConfig {
     pub drop_table_strategy: DropTableStrategy,
-    /// PHASE15 §5 hook — when a namespace mapping with
+    /// Auto-create hook — when a namespace mapping with
     /// `auto_create = true` is configured for the source namespace,
     /// `Added` events run `CREATE TABLE IF NOT EXISTS` automatically.
     /// Today's config only carries the namespace allow-list; the
@@ -173,15 +174,7 @@ impl DdlApplicator {
         mapping: MappingHandle,
         tcp: std::net::TcpStream,
     ) -> Result<Self, EmitterError> {
-        let alloc = Allocator::stdlib();
-        let codec = emitter_cfg.compression.build_codec()?;
-        let io = PosixIo::new_owned(tcp);
-        let mut opts = ClientOpts::new()
-            .database(&emitter_cfg.database)
-            .user(&emitter_cfg.user)
-            .password(&emitter_cfg.password);
-        opts.compression = emitter_cfg.compression.to_wire();
-        let client = Client::init(&opts, alloc, io, codec)?;
+        let client = connect_client(emitter_cfg, Allocator::stdlib(), tcp)?;
         Ok(Self {
             client,
             config: ddl_cfg,
@@ -268,7 +261,7 @@ impl DdlApplicator {
             Some(t) => t,
             None => {
                 // Without a target we can't ALTER. Skip silently —
-                // PHASE15 §5's auto_create reduces this case to the
+                // auto_create reduces this case to the
                 // "namespace configured but table not yet learned" path
                 // which `Added` handles.
                 self.stats.skipped += 1;
@@ -350,7 +343,7 @@ impl DdlApplicator {
             self.stats.alters_applied += 1;
         }
         if !diff.type_changes.is_empty() {
-            // Rejected per PHASE15 §3 open question — log + skip.
+            // Rejected per type-change open question — log + skip.
             self.stats.type_changes_rejected += diff.type_changes.len() as u64;
             tracing::warn!(
                 target: "walshadow::ch_ddl",
@@ -399,7 +392,7 @@ impl DdlApplicator {
         }
         // Adds: auto-derive a column mapping using type_bridge. Skip
         // when the operator already pre-declared the column (e.g.,
-        // PHASE8 add-column drill mapping).
+        // a pre-declared add-column mapping).
         for att in &diff.added_columns {
             if target_mapping
                 .columns
@@ -484,39 +477,8 @@ impl DdlApplicator {
     async fn execute(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
         self.client.send_query(sql, None)?;
-        loop {
-            let mut pkt = self.client.recv_packet()?;
-            match pkt.kind() {
-                Some(PacketKind::EndOfStream) => return Ok(()),
-                Some(PacketKind::Exception) => {
-                    if let Some(exc) = pkt.take_exception() {
-                        return Err(EmitterError::ServerException {
-                            code: exc.code(),
-                            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                        });
-                    }
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
+        drain_to_end_of_stream(&mut self.client)
     }
-}
-
-/// CH backtick identifier quoting — mirrors `clickhouse-client`'s
-/// `quoteIdentIfNeed`. Inline copy avoids exposing the emitter's
-/// private helper.
-fn quote_ident(name: &str) -> String {
-    let mut s = String::with_capacity(name.len() + 2);
-    s.push('`');
-    for c in name.chars() {
-        if c == '`' {
-            s.push('`');
-        }
-        s.push(c);
-    }
-    s.push('`');
-    s
 }
 
 /// Render `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <n> <ty> [DEFAULT
@@ -544,7 +506,7 @@ pub fn render_create_table(
 ) -> Result<Option<String>, EmitterError> {
     let target = format!(
         "{}.{}",
-        quote_database(target_database),
+        quote_ident(target_database),
         quote_ident(&desc.name)
     );
     let pk_attnums: Vec<i16> = match &desc.replident {
@@ -607,10 +569,6 @@ pub fn render_create_table(
         col_defs.join(",\n  ")
     );
     Ok(Some(sql))
-}
-
-fn quote_database(name: &str) -> String {
-    quote_ident(name)
 }
 
 /// CH identifier — same shape as [`quote_ident`]. Re-exported as a

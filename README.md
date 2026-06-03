@@ -65,7 +65,7 @@ Binaries land under `target/release/`:
 - `walshadow-classify`, record-level classifier for diagnostics
 
 The PG extension under `pgext/` is built separately via PGXS, only
-needed for the Phase 9 decode oracle:
+needed for the decode oracle:
 
 ```
 make -C pgext install
@@ -140,7 +140,7 @@ src/                walshadow daemon + library
 src/bin/            CLI entry points (stream, filter, classify)
 wal-rs/             physical-WAL parser, separate submodule
 clickhouse-c-rs/    CH-Native client, separate submodule
-pgext/              walshadow Phase 9 decode-bridge extension (PGXS)
+pgext/              walshadow decode-bridge extension (PGXS)
 architecture/       overview + internals diagrams
 plans/              component design docs (overview.md is the baseline)
 docker/             docker-compose demo + Dockerfile

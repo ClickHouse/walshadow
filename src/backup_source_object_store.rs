@@ -1,4 +1,4 @@
-//! Phase 12 — Object-store base-backup source.
+//! Object-store base-backup source.
 //!
 //! Fetches a wal-g compatible BASE_BACKUP from a `DynStorage` bucket,
 //! decompresses each tar part, and pumps file events through the

@@ -18,7 +18,7 @@
 //!     [--retention-bytes 268435456]
 //! ```
 //!
-//! Phase 10 adds the operational scaffolding: pre-flight validators
+//! Operational scaffolding: pre-flight validators
 //! reject mis-configured boots, a Prometheus `/metrics` endpoint
 //! exposes the LSN triple + per-rmgr / xact-buffer / emitter / oracle
 //! counters, `tracing` is wired so `RUST_LOG=walshadow=debug` surfaces
@@ -70,14 +70,14 @@ use walshadow::wal_stream::{
 };
 use walshadow::xact_buffer::{BufferingDecoderSink, XactBuffer, XactBufferConfig, XactRecordSink};
 
-/// Bootstrap source impl pick. Phase 12 hook in front of the WAL pump:
+/// Bootstrap source impl pick. Hook in front of the WAL pump:
 /// landing catalog files + writing standby.signal so a fresh shadow PG
 /// can be brought up against this run's `out_dir`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 enum BootstrapMode {
     /// Bootstrap disabled — caller supplied shadow data dir externally
     /// (e.g. via `pg_basebackup`). Default behaviour preserves the
-    /// pre-Phase-12 daemon flow.
+    /// external-bootstrap daemon flow.
     #[default]
     Off,
     /// Source-PG-driven BASE_BACKUP via the replication protocol.
@@ -148,7 +148,7 @@ impl RecordSink for DecoderXactPair {
 /// directly. The decoder/xact-drain pair runs behind a
 /// [`QueueingRecordSink`] so its `wait_for_replay` waits don't park
 /// the pump task, which would freeze the `RecordBytesSink` wire shadow
-/// PG depends on for apply-LSN progress (the deadlock the phase14
+/// PG depends on for apply-LSN progress (the deadlock the
 /// streaming tests surface).
 struct DaemonSinks {
     metrics: MetricsRecordSink,
@@ -238,7 +238,7 @@ struct Args {
     /// shadow doesn't fail the daemon on first boot.
     #[arg(long, default_value_t = 30)]
     shadow_connect_timeout: u64,
-    /// PHASE13 walsender bind address. `127.0.0.1:0` lets the kernel
+    /// Walsender bind address. `127.0.0.1:0` lets the kernel
     /// pick a free port; set explicitly when shadow's
     /// `primary_conninfo` references a fixed port.
     #[arg(long, default_value = "127.0.0.1:0")]
@@ -252,7 +252,7 @@ struct Args {
     walsender_port_file: Option<PathBuf>,
     /// Cap on bytes queued onto a slow shadow connection's send buffer
     /// before the connection is dropped + the wire falls back to
-    /// `restore_command`. PHASE13 §3 "slow client" backpressure.
+    /// `restore_command`. "Slow client" backpressure.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     walsender_slow_threshold: usize,
     /// Seconds the pump waits for shadow's walreceiver to attach
@@ -287,11 +287,11 @@ struct Args {
     /// PG's `logical_decoding_work_mem` (64 MiB).
     #[arg(long, default_value_t = walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX)]
     xact_buffer_max: usize,
-    /// Optional path to the Phase 7 CH-Native emitter config (TOML).
+    /// Optional path to the CH-Native emitter config (TOML).
     /// When set, drained xact tuples ship to ClickHouse via
     /// `clickhouse-c-rs`. When unset the daemon stays metrics-only.
     /// Shape: see [`walshadow::ch_emitter::EmitterConfig::from_toml_str`].
-    /// Phase 10 reloads this on SIGHUP (atomic mapping swap; connection
+    /// Reloaded on SIGHUP (atomic mapping swap; connection
     /// params stay boot-only).
     #[arg(long)]
     ch_config: Option<PathBuf>,
@@ -304,7 +304,7 @@ struct Args {
     /// to maintain the knob in TOML.
     #[arg(long)]
     ch_flush_timeout_ms: Option<u64>,
-    /// Phase 9 differential decode oracle: probe 1-in-`<N>` rows
+    /// Differential decode oracle: probe 1-in-`<N>` rows
     /// through shadow PG's `walshadow_decode_disk(oid, bytea)`
     /// extension function and assert the local decoder matches. `0`
     /// (default) disables. Requires the `walshadow` extension
@@ -313,28 +313,28 @@ struct Args {
     /// silently ships raw on-disk bytes for `PgPending` types.
     #[arg(long, default_value_t = 0)]
     validate: u32,
-    /// Phase 10 HTTP/Prometheus metrics bind address. Disabled when
+    /// HTTP/Prometheus metrics bind address. Disabled when
     /// absent; pass `127.0.0.1:9484` for a localhost-only scrape.
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
-    /// Phase 10 retention horizon in bytes of WAL. Segments older than
+    /// Retention horizon in bytes of WAL. Segments older than
     /// `shadow_replay_lsn - retention_bytes` are deleted on every trim
     /// cycle. Set to `0` to disable trim entirely.
     #[arg(long, default_value_t = DEFAULT_RETENTION_BYTES)]
     retention_bytes: u64,
-    /// Skip the Phase 10 pre-flight validators (server_version_num,
+    /// Skip the pre-flight validators (server_version_num,
     /// wal_level, REPLICA IDENTITY FULL, slot existence). Useful for
     /// recovery drills; production should leave this off.
     #[arg(long, default_value_t = false)]
     skip_preflight: bool,
-    /// Phase 11. Ignore any `cursor.bin` under `--spill-dir` at boot
+    /// Ignore any `cursor.bin` under `--spill-dir` at boot
     /// (greenfield resume even when a prior daemon left one). Useful
     /// for "wipe + restart from a known LSN" drills. The cursor still
     /// gets rewritten as the new daemon makes progress.
     #[arg(long, default_value_t = false)]
     ignore_cursor: bool,
-    /// Phase 12 — bootstrap source pick. `off` (default) keeps the
-    /// pre-Phase-12 flow where shadow is bootstrapped externally.
+    /// Bootstrap source pick. `off` (default) keeps the
+    /// flow where shadow is bootstrapped externally.
     /// `direct` issues BASE_BACKUP against source PG over the same
     /// replication connection; `object_store` pulls a wal-g-format
     /// backup from `DynStorage` (configured via `WALG_*` env vars).
@@ -428,7 +428,7 @@ async fn run(args: Args) -> Result<()> {
         "source identified",
     );
 
-    // Phase 12 — optional bootstrap step. On a non-off mode, this lands
+    // Optional bootstrap step. On a non-off mode, this lands
     // the catalog tree on `--bootstrap-shadow-data-dir`, writes a
     // standby.signal + `restore_command` pointing at `--out-dir`, and
     // returns the backup's `end_lsn` so the WAL pump (further down)
@@ -457,7 +457,7 @@ async fn run(args: Args) -> Result<()> {
         Some(
             run_bootstrap(&cfg, &mut feed, &args, bootstrap_ch_config)
                 .await
-                .context("phase 12 bootstrap")?,
+                .context("bootstrap")?,
         )
     };
     // After run_bootstrap, optionally auto-spawn shadow PG against the
@@ -474,7 +474,7 @@ async fn run(args: Args) -> Result<()> {
         autospawn_shadow_and_wait(&args, shadow_data_dir, end_lsn).await?;
     }
 
-    // Phase 11 cursor-resume gate. `--start-lsn` (explicit operator
+    // Cursor-resume gate. `--start-lsn` (explicit operator
     // override) wins; otherwise cursor.bin under spill_dir picks up the
     // last emitter-acked LSN; otherwise greenfield (source's current
     // write head). `--ignore-cursor` forces greenfield even when a
@@ -519,7 +519,7 @@ async fn run(args: Args) -> Result<()> {
     );
 
     let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned)?;
-    // PHASE13 §3 — walsender listener + ShadowStreamSink.
+    // Walsender listener + ShadowStreamSink.
     //
     // Bind the listener BEFORE shadow's walreceiver gets a chance to
     // connect (the bootstrap barrier in the plan): operators wire
@@ -589,7 +589,7 @@ async fn run(args: Args) -> Result<()> {
     // Connect the shadow catalog before START_REPLICATION so the
     // tracker→drain wire is hot from the first record. Wrapped in
     // with_transient_retry so a still-warming shadow doesn't kill the
-    // daemon on boot. PRE5b7: catalog lives in Arc<Mutex<_>>; clones
+    // daemon on boot. Catalog lives in Arc<Mutex<_>>; clones
     // fan out to the drain task, BufferingDecoderSink, and oracle.
     let shadow_conninfo = socket_conninfo(
         args.shadow_socket_dir
@@ -627,7 +627,7 @@ async fn run(args: Args) -> Result<()> {
         .filter_mut()
         .tracker
         .set_invalidation_epoch(invalidation_epoch.clone());
-    // PHASE15 §6 — narrower drop-only counter so sweep_dropped
+    // Narrower drop-only counter so sweep_dropped
     // throttles off pg_class heap_delete instead of every catalog
     // touch (ADD COLUMN / CREATE INDEX flood pgbench-rate workloads
     // otherwise).
@@ -642,7 +642,7 @@ async fn run(args: Args) -> Result<()> {
         cat.set_pg_class_delete_epoch(pg_class_delete_epoch.clone());
     }
 
-    // Phase 10 pre-flight validators. Run after both source + shadow
+    // Pre-flight validators. Run after both source + shadow
     // SQL clients are up so every check has the connection it needs;
     // abort the daemon on any finding unless `--skip-preflight` is set.
     let initial_ch_config = match args.ch_config.as_deref() {
@@ -686,7 +686,30 @@ async fn run(args: Args) -> Result<()> {
         tracing::info!(target: "walshadow::preflight", "pre-flight passed");
     }
 
-    // Phase 9 oracle. Opens its own libpq connection to shadow PG so
+    // Seed the schema-diff baseline for operator-pinned
+    // relations before subscribe(), so a pinned table's first post-start
+    // ALTER diffs against boot shape (→ Changed → CH ALTER) rather than
+    // cold-prev_known Added (apply_added skips pinned dests). Runs before
+    // START_REPLICATION so the baseline is in place before any WAL record
+    // is decoded. cfg.tables.keys() is exactly the pinned set; auto-create
+    // tables record their baseline on the first-touch CREATE path so they
+    // need no seeding.
+    if let Some(cfg) = initial_ch_config.as_ref() {
+        let names: Vec<String> = cfg.tables.keys().cloned().collect();
+        let seeded = catalog
+            .lock()
+            .await
+            .seed_baseline(&names)
+            .await
+            .context("seed schema-diff baseline for mapped relations")?;
+        tracing::info!(
+            target: "walshadow",
+            seeded,
+            "seeded schema-diff baseline for mapped relations",
+        );
+    }
+
+    // Oracle. Opens its own libpq connection to shadow PG so
     // its queries don't pessimise the catalog's query-one path. Best-
     // effort: a still-warming shadow or a connect timeout just
     // disables the oracle; the daemon keeps running with the raw-
@@ -718,7 +741,7 @@ async fn run(args: Args) -> Result<()> {
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;
-    // Phase 6 xact buffer + spill dir. Wiped on every startup —
+    // Xact buffer + spill dir. Wiped on every startup —
     // cursor file commits drains atomically so leftover spill files
     // from a prior crash are always either redundant or stale.
     let xact_buf_cfg = XactBufferConfig {
@@ -738,7 +761,7 @@ async fn run(args: Args) -> Result<()> {
         "spill dir ready",
     );
 
-    // Pick the xact-drain observer: Phase 7 CH-Native emitter when
+    // Pick the xact-drain observer: CH-Native emitter when
     // `--ch-config` is supplied, else stay metrics-only. Wrapped in
     // `Box<dyn TupleObserver>` so both arms share one drain-sink type.
     //
@@ -764,7 +787,7 @@ async fn run(args: Args) -> Result<()> {
             let emitter = Emitter::new(emitter_cfg.clone(), catalog.clone(), std_tcp)
                 .context("init CH emitter")?;
             mapping_handle = Some(emitter.mapping_handle());
-            // PHASE15 §2 — second CH connection for the DDL applicator.
+            // Second CH connection for the DDL applicator.
             // Separate TCP so ALTER / CREATE / DROP don't ride the
             // INSERT pump's backpressure path. Build only when the
             // emitter is wired (no point in a DDL connection without
@@ -795,7 +818,7 @@ async fn run(args: Args) -> Result<()> {
         }
         None => Box::new(MetricsTupleObserver::default()),
     };
-    // Phase 9: wrap with OracleObserver when an oracle is up. The
+    // Wrap with OracleObserver when an oracle is up. The
     // wrapper resolves PgPending columns via shadow PG's extension
     // (no-op when extension is absent) and fires 1-in-N validator
     // probes when `--validate > 0`. Skip the wrapper entirely if the
@@ -812,7 +835,7 @@ async fn run(args: Args) -> Result<()> {
     // inside the worker keeps per-rmgr counters intact: xact_drain
     // runs after decoder absorbs any heap records in the same dispatch
     // batch as the commit.
-    // PHASE15 §1 — subscribe BufferingDecoderSink + XactRecordSink to
+    // Subscribe BufferingDecoderSink + XactRecordSink to
     // schema events the catalog publishes at descriptor-fetch time
     // and at commit-boundary `sweep_dropped` sweeps. Shared
     // `Arc<Mutex<…>>` so both sinks pull from the same queue.
@@ -840,7 +863,7 @@ async fn run(args: Args) -> Result<()> {
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
-    // Phase 10 metrics endpoint. The registry handle threads through
+    // Metrics endpoint. The registry handle threads through
     // the status-line loop; the HTTP server task lives until the
     // runtime tears down.
     let metrics = MetricsRegistry::new();
@@ -855,27 +878,27 @@ async fn run(args: Args) -> Result<()> {
         None => None,
     };
 
-    // Phase 10 SIGHUP handler. Re-reads `--ch-config` and swaps the
+    // SIGHUP handler. Re-reads `--ch-config` and swaps the
     // live mapping in the emitter via the shared handle. Connection
     // params stay boot-only; only the per-relation mapping reloads.
     let sighup_path = args.ch_config.clone();
     let sighup_handle = mapping_handle.clone();
     let _sighup_task = spawn_sighup_handler(sighup_path, sighup_handle);
 
-    // Phase 11 — shared shadow_replay_lsn observed by the retention
+    // Shared shadow_replay_lsn observed by the retention
     // sweeper (the only thing polling shadow's `pg_last_wal_replay_lsn`
     // today). Status loop reads the same atomic to feed the cursor
     // file's `shadow_replay_lsn` slot + the standby-status `apply_lsn`
     // ceiling. Atomic so the two tasks don't need a shared mutex.
     let shadow_replay_lsn = Arc::new(AtomicU64::new(0));
-    // PHASE13 §5: tracked across active ShadowStreamSink connections;
+    // Tracked across active ShadowStreamSink connections;
     // fed by the walsender listener task into the cursor file. Used by
     // shadow's `START_REPLICATION PHYSICAL` resume on daemon restart.
     let shadow_flush_lsn = Arc::new(AtomicU64::new(0));
 
-    // Phase 10 retention sweeper. Polls shadow's replay LSN, drops
+    // Retention sweeper. Polls shadow's replay LSN, drops
     // filtered segments more than `retention_bytes` behind. Disabled
-    // when `retention_bytes == 0`. Phase 11 doubles up: the sweeper's
+    // when `retention_bytes == 0`. The sweeper doubles up: its
     // poll feeds `shadow_replay_lsn` so the main loop doesn't open a
     // second shadow connection.
     let _retention_task = if args.retention_bytes > 0 {
@@ -932,10 +955,10 @@ async fn run(args: Args) -> Result<()> {
     let start_instant = Instant::now();
     let mut segments_shipped = 0u64;
     let mut prev_dispatched = stream.dispatched_lsn();
-    // PHASE14 §6 — rolling 30 s WAL byte-rate estimate. Status loop
+    // Rolling 30 s WAL byte-rate estimate. Status loop
     // pushes a `(now, source_received_lsn)` sample per tick.
     let mut rate_estimator = RateEstimator::default();
-    // Phase 11. Cursor write cadence matches the source standby-status
+    // Cursor write cadence matches the source standby-status
     // cadence so the file's `emitter_ack_lsn` is ≥ the value we advertise
     // to source as `apply_lsn` on every send. Without this ordering the
     // slot could advance past a not-yet-durable resume point.
@@ -954,7 +977,7 @@ async fn run(args: Args) -> Result<()> {
         // fsyncs every segment + the parent dir. shadow_replay_lsn comes
         // from the retention sweeper's poll (0 when retention is off).
         // drain_lsn / emitter_ack_lsn come straight from the xact buffer
-        // — single source of truth per PHASE11.
+        // — single source of truth.
         let dispatched = stream.dispatched_lsn();
         let received = feed.last_server_wal_end().max(dispatched);
         let shadow_replay = shadow_replay_lsn.load(Ordering::Acquire);
@@ -971,7 +994,7 @@ async fn run(args: Args) -> Result<()> {
             let s = b.stats();
             (s.drain_lsn, s.emitter_ack_lsn)
         };
-        // apply_lsn ceiling per PLAN §"Phase 11". Treat shadow_replay==0
+        // apply_lsn ceiling. Treat shadow_replay==0
         // (sweeper disabled or hasn't reported yet) as "no constraint
         // from shadow" rather than the literal min — otherwise a fresh
         // boot with retention off would pin apply_lsn at 0 forever and
@@ -1353,7 +1376,7 @@ async fn query_replay_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>
     }
 }
 
-/// PHASE14 §6 shadow-stream view passed into the metrics publish step.
+/// Shadow-stream view passed into the metrics publish step.
 /// Bundles the four shadow-side numbers that come from
 /// [`ShadowStreamState::aggregate`] + the daemon's [`RateEstimator`].
 struct ShadowMetricsView {
@@ -1446,7 +1469,7 @@ async fn populate_metrics(
     registry.set(snap).await;
 }
 
-/// Phase 12 — orchestrate the BASE_BACKUP into a fresh shadow data dir.
+/// Orchestrate the BASE_BACKUP into a fresh shadow data dir.
 /// Returns the backup's `end_lsn` so the caller can rebind the WAL pump
 /// past it.
 ///
@@ -1486,7 +1509,7 @@ async fn run_bootstrap(
 
     // Seed catalog map from source PG inside a REPEATABLE READ snapshot
     // — DDL between the seed COMMIT and BASE_BACKUP's checkpoint window
-    // is operator-quiesced per PLAN.md §"Phase 12 — out of scope".
+    // is operator-quiesced per the bootstrap out-of-scope contract.
     let sql_client = feed
         .sql_client()
         .await
@@ -1671,7 +1694,7 @@ async fn run_bootstrap(
     }
 
     // Lay down standby.signal + primary_conninfo + restore_command.
-    // primary_conninfo points at the daemon's PHASE13 walsender (bound
+    // primary_conninfo points at the daemon's walsender (bound
     // further down in `run`); restore_command remains the archive
     // fallback. PG's walreceiver tries the wire first and falls back on
     // disconnect or end-of-WAL.
@@ -1756,7 +1779,7 @@ fn write_standby_config(
     fs::create_dir_all(shadow_data_dir)?;
     fs::write(shadow_data_dir.join("standby.signal"), b"")?;
     let conf = shadow_data_dir.join("postgresql.auto.conf");
-    let marker = "# walshadow Phase 12 bootstrap";
+    let marker = "# walshadow bootstrap";
     if conf.exists() {
         let existing = fs::read_to_string(&conf).unwrap_or_default();
         if existing.contains(marker) {
@@ -1769,7 +1792,7 @@ fn write_standby_config(
         .open(&conf)?;
     writeln!(f, "\n{marker}")?;
     // primary_conninfo wires shadow's walreceiver to walshadow's
-    // PHASE13 walsender. Skip when port=0 — kernel-picked addresses
+    // walsender. Skip when port=0 — kernel-picked addresses
     // are unstable across daemon restarts, fall back to archive-only.
     if walsender_bind.port() != 0 {
         writeln!(

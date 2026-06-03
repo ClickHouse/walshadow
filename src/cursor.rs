@@ -1,4 +1,4 @@
-//! Phase 11 — durable resume cursor.
+//! Durable resume cursor.
 //!
 //! Persists the daemon's resume position so a `kill -9` plus restart
 //! lands a consistent CH end-state. Lives next to the spill dir
@@ -37,7 +37,7 @@
 //!   `emitter_ack_lsn`.
 //! * `emitter_ack_lsn`: highest commit-record LSN where the CH
 //!   emitter's `on_xact_end` returned Ok. Slot-advance ceiling.
-//! * `shadow_flush_lsn` (PHASE13 §5): minimum `flush_lsn` reported via
+//! * `shadow_flush_lsn`: minimum `flush_lsn` reported via
 //!   inbound `'r'` standby status across active shadow streaming
 //!   connections. On daemon restart this is the resume position the
 //!   walsender hands shadow back through `START_REPLICATION PHYSICAL

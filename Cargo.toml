@@ -29,7 +29,7 @@ name = "walshadow"
 path = "src/lib.rs"
 
 [features]
-# Compression codecs walshadow's CH-Native emitter (Phase 7) advertises
+# Compression codecs walshadow's CH-Native emitter advertises
 # in its Hello packet & negotiates onto the wire. Forwarded to
 # clickhouse-c-rs so its `chc_*_codec_init` symbols & C TU link only
 # what the top crate actually offers. `lz4` matches the ClickHouse

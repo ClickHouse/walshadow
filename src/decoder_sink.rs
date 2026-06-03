@@ -1,4 +1,4 @@
-//! Phase 5 — shared types for the heap-tuple decoder fan-out:
+//! Shared types for the heap-tuple decoder fan-out:
 //! [`TupleObserver`] (downstream of [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink)
 //! 's commit drain), [`DecoderStats`] counters, [`DecoderSinkError`].
 //!
@@ -42,7 +42,7 @@ impl From<DecoderSinkError> for SinkError {
 /// type.
 ///
 /// `on_xact_end` fires after every tuple in a committed xact has been
-/// delivered. Phase 7's CH emitter uses it as the per-xact landmark
+/// delivered. The CH emitter uses it as the per-xact landmark
 /// for closing or extending its open INSERT blocks. Returns the
 /// highest commit_lsn now known durable on the observer (CH server
 /// acked, MergeTree part finalized). Callers advance their ack
@@ -63,7 +63,7 @@ pub trait TupleObserver: Send {
         Box::pin(async move { Ok(commit_lsn) })
     }
 
-    /// PHASE15 §2 — schema-event dispatch. Called from
+    /// Schema-event dispatch. Called from
     /// [`crate::xact_buffer::XactBuffer::commit`]'s k-way merge in
     /// `source_lsn` order alongside `on_tuple`, so the CH DDL applicator
     /// runs ALTER / CREATE / DROP against the dest before the next
@@ -167,8 +167,8 @@ crate::atomic_stats! {
         pub hot_updates,
         pub deletes,
         /// Decoded but the WAL elided some columns via
-        /// `XLH_UPDATE_PREFIX_FROM_OLD` / `..._SUFFIX_FROM_OLD`. Phase 6
-        /// reassembles from previous tuple image; Phase 5 emits as-is.
+        /// `XLH_UPDATE_PREFIX_FROM_OLD` / `..._SUFFIX_FROM_OLD`. The xact
+        /// buffer reassembles from previous tuple image; the decoder emits as-is.
         pub partial,
         /// `record.parsed.blocks` was empty — record references no
         /// relation. Heap LOCK / INPLACE / TRUNCATE land here under the
@@ -177,11 +177,11 @@ crate::atomic_stats! {
         /// Heap record on a relation [`ShadowCatalog`] returned
         /// `NotFoundByFilenode` for. Possible causes: replay-LSN gate
         /// ahead of catalog mutation, mapping rotation, race with
-        /// `seed_from_source`. Counted, not retried — Phase 6's xact
+        /// `seed_from_source`. Counted, not retried — the xact
         /// buffer can reorder.
         pub catalog_not_found,
         /// Record was on a `User` relation but the rmgr/info combo isn't
-        /// in the Phase 5 matrix (MULTI_INSERT, HEAP2 PRUNE, etc).
+        /// in the decoder's type matrix (MULTI_INSERT, HEAP2 PRUNE, etc).
         pub skipped_op,
         /// `XLOG_HEAP_TRUNCATE` records fanned out to per-relid
         /// `HeapOp::Truncate` events. Counted by

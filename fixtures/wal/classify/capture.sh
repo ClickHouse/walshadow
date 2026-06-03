@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture a WAL segment for the Phase 0 classifier fixture.
+# Capture a WAL segment for the classifier fixture.
 #
 # Default image: postgres:16. walshadow operationally supports PG 16+
 # (see PLAN.md "Supported PostgreSQL versions") and tolerates PG 15

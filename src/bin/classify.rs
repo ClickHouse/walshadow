@@ -1,6 +1,6 @@
 //! walshadow-classify — walk WAL segment files & print catalog/user/special split.
 //!
-//! Phase 0 deliverable. Consumes raw pg_wal segment files (16 MiB each by
+//! Consumes raw pg_wal segment files (16 MiB each by
 //! default, the on-disk format pg_receivewal & a running primary write to
 //! pg_wal/). Compressed segment archives (`.zst` / `.gz` / `.lz4` / `.lzma`
 //! / `.br`, with optional `.partial` peer) are auto-detected by suffix and
