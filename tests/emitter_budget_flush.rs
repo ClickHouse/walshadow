@@ -184,10 +184,13 @@ async fn budget_trips_seal_complete_inserts() {
     assert_eq!(ack, 0xC0FFEE, "durable horizon must reach the commit lsn");
 
     // Two budget trips + the xact-end seal = 3 sealed INSERTs.
+    let blocks_sent = emitter
+        .stats
+        .blocks_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert!(
-        emitter.stats.blocks_sent >= 3,
-        "expected ≥3 sealed blocks, got {}",
-        emitter.stats.blocks_sent,
+        blocks_sent >= 3,
+        "expected ≥3 sealed blocks, got {blocks_sent}",
     );
 
     let count = ch
@@ -245,8 +248,9 @@ async fn observer_handle_mirrors_emitter_counters() {
 
     let mut observer = EmitterObserver::new(emitter);
     let handle = observer.stats_handle();
+    use std::sync::atomic::Ordering::Relaxed;
     assert_eq!(
-        handle.lock().unwrap().rows_emitted,
+        handle.rows_emitted.load(Relaxed),
         0,
         "fresh handle starts at zero",
     );
@@ -260,8 +264,18 @@ async fn observer_handle_mirrors_emitter_counters() {
     }
     observer.on_xact_end(0xBEEF).await.expect("on_xact_end");
 
-    let snap = handle.lock().unwrap().clone();
-    assert_eq!(snap.rows_emitted, N as u64, "rows reach the polled handle");
-    assert_eq!(snap.xacts_committed, 1, "xact commit reaches the handle");
-    assert!(snap.blocks_sent >= 1, "block seal reaches the handle");
+    assert_eq!(
+        handle.rows_emitted.load(Relaxed),
+        N as u64,
+        "rows reach the polled handle",
+    );
+    assert_eq!(
+        handle.xacts_committed.load(Relaxed),
+        1,
+        "xact commit reaches the handle",
+    );
+    assert!(
+        handle.blocks_sent.load(Relaxed) >= 1,
+        "block seal reaches the handle",
+    );
 }

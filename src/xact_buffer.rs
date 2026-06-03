@@ -1562,9 +1562,9 @@ pub struct BufferingDecoderSink {
     buffer: Arc<Mutex<XactBuffer>>,
     /// Shared so the daemon's status loop (or a `QueueingRecordSink`
     /// wrapper running this sink on a worker task) can read counters
-    /// without contending on `self`. Mutations stay short — the lock
-    /// is never held across `.await`.
-    stats: Arc<std::sync::Mutex<DecoderStats>>,
+    /// without locking. Mutations are `fetch_add(_, Relaxed)`; readers
+    /// `.load(Relaxed)` at the use site.
+    stats: Arc<DecoderStats>,
     /// PHASE15 §1 — schema events the catalog emits at descriptor
     /// fetch time. Drained inline after every `relation_at` so events
     /// land in the same xact buffer keyed on the current record's
@@ -1578,7 +1578,7 @@ impl BufferingDecoderSink {
         Self {
             catalog,
             buffer,
-            stats: Arc::new(std::sync::Mutex::new(DecoderStats::default())),
+            stats: Arc::new(DecoderStats::default()),
             schema_events: None,
         }
     }
@@ -1595,24 +1595,18 @@ impl BufferingDecoderSink {
         self
     }
 
-    /// Snapshot of the live counters. Cheap clone of the `DecoderStats`
-    /// struct (all `u64` fields).
-    pub fn stats(&self) -> DecoderStats {
-        self.stats
-            .lock()
-            .expect("decoder stats mutex poisoned")
-            .clone()
+    /// Borrow the live counters (for `.summary()` and ad-hoc field
+    /// `.load(Relaxed)` reads).
+    pub fn stats(&self) -> &DecoderStats {
+        &self.stats
     }
 
     /// Shared handle a wrapping `QueueingRecordSink` can hand back to
     /// the daemon's status loop so it polls live counters while the
-    /// sink itself runs on a separate worker task.
-    pub fn stats_handle(&self) -> Arc<std::sync::Mutex<DecoderStats>> {
+    /// sink itself runs on a separate worker task. Reads via
+    /// `.load(Relaxed)` on the returned struct's fields.
+    pub fn stats_handle(&self) -> Arc<DecoderStats> {
         self.stats.clone()
-    }
-
-    fn bump<F: FnOnce(&mut DecoderStats)>(&self, f: F) {
-        f(&mut self.stats.lock().expect("decoder stats mutex poisoned"))
     }
 
     /// PHASE15 §1 — drain any [`SchemaEvent`]s the catalog accumulated
@@ -1657,7 +1651,9 @@ impl BufferingDecoderSink {
     async fn handle_truncate(&mut self, record: &Record<'_>) -> std::result::Result<(), SinkError> {
         let Some(parsed) = crate::main_data::parse_xl_heap_truncate(&record.parsed.main_data)
         else {
-            self.bump(|s| s.skipped_op += 1);
+            self.stats
+                .skipped_op
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         };
         let xid = record.parsed.header.xact_id;
@@ -1676,7 +1672,9 @@ impl BufferingDecoderSink {
                 match cat.relation_by_oid(relid).await {
                     Ok(r) => r,
                     Err(CatalogError::NotFoundByOid(_)) => {
-                        self.bump(|s| s.catalog_not_found += 1);
+                        self.stats
+                            .catalog_not_found
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
                     Err(e) => return Err(DecoderSinkError::from(e).into()),
@@ -1700,7 +1698,7 @@ impl BufferingDecoderSink {
                 new: None,
                 old: None,
             };
-            self.bump(|s| s.record(&decoded));
+            self.stats.record(&decoded);
             let mut buf = self.buffer.lock().await;
             buf.on_heap(decoded).await.map_err(SinkError::from)?;
         }
@@ -1737,7 +1735,9 @@ impl RecordSink for BufferingDecoderSink {
             let rfn = match record.parsed.blocks.first() {
                 Some(b) => b.header.location.rel,
                 None => {
-                    self.bump(|s| s.skipped_no_block += 1);
+                    self.stats
+                        .skipped_no_block
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
             };
@@ -1746,7 +1746,9 @@ impl RecordSink for BufferingDecoderSink {
                 match cat.relation_at(rfn, record.source_lsn).await {
                     Ok(r) => r,
                     Err(CatalogError::NotFoundByFilenode(_)) => {
-                        self.bump(|s| s.catalog_not_found += 1);
+                        self.stats
+                            .catalog_not_found
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Ok(());
                     }
                     Err(e) => {
@@ -1775,21 +1777,27 @@ impl RecordSink for BufferingDecoderSink {
                 Err(e) => return Err(DecoderSinkError::from(e).into()),
             };
             if decoded_set.is_empty() {
-                self.bump(|s| s.skipped_op += 1);
+                self.stats
+                    .skipped_op
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(());
             }
             for decoded in decoded_set {
-                self.bump(|s| s.record(&decoded));
+                self.stats.record(&decoded);
                 if rel.kind == 't' {
                     let xid = decoded.xid;
                     if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
-                        self.bump(|s| s.toast_chunks_buffered += 1);
+                        self.stats
+                            .toast_chunks_buffered
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let mut buf = self.buffer.lock().await;
                         buf.on_toast_chunk(chunk, xid)
                             .await
                             .map_err(SinkError::from)?;
                     } else {
-                        self.bump(|s| s.toast_chunks_malformed += 1);
+                        self.stats
+                            .toast_chunks_malformed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 } else {
                     let mut buf = self.buffer.lock().await;

@@ -156,7 +156,10 @@ struct DaemonSinks {
     /// Shared with the `BufferingDecoderSink` running on the queueing
     /// worker; the status loop polls counters here without contending
     /// on the worker.
-    decoder_stats: Arc<std::sync::Mutex<walshadow::decoder_sink::DecoderStats>>,
+    decoder_stats: Arc<walshadow::decoder_sink::DecoderStats>,
+    /// Shared with the [`Emitter`] running inside the queueing-worker's
+    /// observer. `None` when the daemon runs without a CH emitter wired.
+    emitter_stats: Option<Arc<walshadow::ch_emitter::EmitterStats>>,
 }
 
 impl RecordSink for DaemonSinks {
@@ -746,9 +749,7 @@ async fn run(args: Args) -> Result<()> {
     // read/write vtable), so we `into_std()` + `set_nonblocking(false)`
     // right before construction.
     let mut mapping_handle: Option<MappingHandle> = None;
-    let mut emitter_stats_handle: Option<
-        Arc<std::sync::Mutex<walshadow::ch_emitter::EmitterStats>>,
-    > = None;
+    let mut emitter_stats_handle: Option<Arc<walshadow::ch_emitter::EmitterStats>> = None;
     let inner_observer: Box<dyn TupleObserver> = match initial_ch_config {
         Some(emitter_cfg) => {
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
@@ -788,9 +789,9 @@ async fn run(args: Args) -> Result<()> {
             .context("init DDL applicator")?;
             let emitter = emitter.with_applicator(applicator);
             tracing::info!(target: "walshadow::ch_emitter", addr = %addr, "ch emitter + DDL applicator connected");
-            let emitter_observer = EmitterObserver::new(emitter);
-            emitter_stats_handle = Some(emitter_observer.stats_handle());
-            Box::new(emitter_observer)
+            let observer = EmitterObserver::new(emitter);
+            emitter_stats_handle = Some(observer.stats_handle());
+            Box::new(observer)
         }
         None => Box::new(MetricsTupleObserver::default()),
     };
@@ -834,6 +835,7 @@ async fn run(args: Args) -> Result<()> {
         metrics: MetricsRecordSink::default(),
         decoder_xact,
         decoder_stats: decoder_stats_handle,
+        emitter_stats: emitter_stats_handle,
     };
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
@@ -1049,19 +1051,14 @@ async fn run(args: Args) -> Result<()> {
             let line = stats.summary();
             (stats, line)
         };
-        let (oracle_stats, oracle_line) = match &oracle {
-            Some(o) => {
-                let s = o.stats.lock().await.clone();
-                let line = s.summary();
-                (Some(s), line)
-            }
-            None => (None, String::new()),
+        let oracle_line = match &oracle {
+            Some(o) => o.stats.summary(),
+            None => String::new(),
         };
-        let decoder_stats = record_sink
-            .decoder_stats
-            .lock()
-            .expect("decoder stats mutex poisoned")
-            .clone();
+        let oracle_stats = oracle.as_ref().map(|o| o.stats.as_ref());
+        let decoder_stats: &walshadow::decoder_sink::DecoderStats = &record_sink.decoder_stats;
+        let emitter_stats: Option<&walshadow::ch_emitter::EmitterStats> =
+            record_sink.emitter_stats.as_deref();
         let shadow_apply_lsn = shadow_agg.min_apply_lsn.unwrap_or(0);
         let lag_bytes = received.saturating_sub(shadow_apply_lsn);
         rate_estimator.observe(Instant::now(), received);
@@ -1071,14 +1068,6 @@ async fn run(args: Args) -> Result<()> {
         // drained, not the snapshot taken at the top of this iteration.
         let emitter_ack_for_metric = xact_stats.emitter_ack_lsn;
         let drain_for_metric = xact_stats.drain_lsn;
-        // Emitter counters live inside the QueueingRecordSink worker; the
-        // observer mirrors them into this shared handle after each
-        // dispatch. `None` when running without `--ch-config` (metrics-
-        // only observer never bumps emitter counters).
-        let emitter_stats = emitter_stats_handle
-            .as_ref()
-            .map(|h| h.lock().expect("emitter stats mutex poisoned").clone())
-            .unwrap_or_default();
         populate_metrics(
             &metrics,
             received,
@@ -1088,9 +1077,9 @@ async fn run(args: Args) -> Result<()> {
             emitter_ack_for_metric,
             &record_sink.metrics,
             &xact_stats,
-            &decoder_stats,
-            &emitter_stats,
-            oracle_stats.as_ref(),
+            decoder_stats,
+            emitter_stats,
+            oracle_stats,
             start_instant.elapsed().as_secs(),
             ShadowMetricsView {
                 apply_lag_bytes: lag_bytes,
@@ -1385,7 +1374,7 @@ async fn populate_metrics(
     rec_metrics: &MetricsRecordSink,
     xact_stats: &walshadow::xact_buffer::XactBufferStats,
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
-    emitter_stats: &walshadow::ch_emitter::EmitterStats,
+    emitter_stats: Option<&walshadow::ch_emitter::EmitterStats>,
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
     uptime_secs: u64,
     shadow_view: ShadowMetricsView,
@@ -1417,19 +1406,37 @@ async fn populate_metrics(
         spill_evictions_total: xact_stats.spill_evictions_total,
         xacts_committed_total: xact_stats.committed_xacts_total,
         xacts_aborted_total: xact_stats.aborted_xacts_total,
-        decoder_decoded_total: decoder_stats.decoded,
-        decoder_partial_total: decoder_stats.partial,
-        decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered,
-        decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed,
-        emitter_rows_total: emitter_stats.rows_emitted,
-        emitter_blocks_total: emitter_stats.blocks_sent,
-        emitter_xacts_total: emitter_stats.xacts_committed,
-        emitter_unsupported_relations: emitter_stats.unsupported_relations,
-        oracle_resolved_total: oracle_stats.map(|s| s.resolved).unwrap_or(0),
-        oracle_fallback_raw_total: oracle_stats.map(|s| s.fallback_raw).unwrap_or(0),
-        oracle_validate_sampled_total: oracle_stats.map(|s| s.probes).unwrap_or(0),
-        oracle_validate_mismatches_total: oracle_stats.map(|s| s.mismatches).unwrap_or(0),
-        oracle_errors_total: oracle_stats.map(|s| s.errors).unwrap_or(0),
+        decoder_decoded_total: decoder_stats.decoded.load(Ordering::Relaxed),
+        decoder_partial_total: decoder_stats.partial.load(Ordering::Relaxed),
+        decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
+        decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
+        emitter_rows_total: emitter_stats
+            .map(|s| s.rows_emitted.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        emitter_blocks_total: emitter_stats
+            .map(|s| s.blocks_sent.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        emitter_xacts_total: emitter_stats
+            .map(|s| s.xacts_committed.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        emitter_unsupported_relations: emitter_stats
+            .map(|s| s.unsupported_relations.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_resolved_total: oracle_stats
+            .map(|s| s.resolved.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_fallback_raw_total: oracle_stats
+            .map(|s| s.fallback_raw.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_validate_sampled_total: oracle_stats
+            .map(|s| s.probes.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_validate_mismatches_total: oracle_stats
+            .map(|s| s.mismatches.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_errors_total: oracle_stats
+            .map(|s| s.errors.load(Ordering::Relaxed))
+            .unwrap_or(0),
         uptime_secs,
         shadow_apply_lag_bytes: shadow_view.apply_lag_bytes,
         shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
@@ -1597,10 +1604,11 @@ async fn run_bootstrap(
             walshadow::decoder_sink::TupleObserver::on_close(&mut observer)
                 .await
                 .context("bootstrap emitter shutdown flush")?;
+            use std::sync::atomic::Ordering;
             tracing::info!(
                 target: "walshadow::bootstrap",
-                rows_emitted = observer.emitter.stats.rows_emitted,
-                blocks_sent = observer.emitter.stats.blocks_sent,
+                rows_emitted = observer.emitter.stats.rows_emitted.load(Ordering::Relaxed),
+                blocks_sent = observer.emitter.stats.blocks_sent.load(Ordering::Relaxed),
                 "bootstrap emitter drained",
             );
             // Drop the transitional emitter so its CH TCP closes

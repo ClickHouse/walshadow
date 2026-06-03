@@ -49,20 +49,23 @@ pub enum OracleError {
     Query(tokio_postgres::Error),
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct OracleStats {
-    /// `walshadow_decode_disk` calls that returned a text payload.
-    pub resolved: u64,
-    /// `walshadow_decode_disk` calls returning NULL or absent-extension.
-    pub fallback_raw: u64,
-    /// 1-in-N samples taken (Tier 3 hot types only).
-    pub probes: u64,
-    /// Probe outcomes that matched the local decoder.
-    pub matches: u64,
-    /// Probe outcomes where local decoder text != shadow PG text.
-    pub mismatches: u64,
-    /// SQL / connection errors collapsed into a single bucket.
-    pub errors: u64,
+crate::atomic_stats! {
+    /// Oracle resolver/validator counters. Mutations via
+    /// `fetch_add(_, Relaxed)`; reads via `.load(Relaxed)` at the use site.
+    pub struct OracleStats {
+        /// `walshadow_decode_disk` calls that returned a text payload.
+        pub resolved,
+        /// `walshadow_decode_disk` calls returning NULL or absent-extension.
+        pub fallback_raw,
+        /// 1-in-N samples taken (Tier 3 hot types only).
+        pub probes,
+        /// Probe outcomes that matched the local decoder.
+        pub matches,
+        /// Probe outcomes where local decoder text != shadow PG text.
+        pub mismatches,
+        /// SQL / connection errors collapsed into a single bucket.
+        pub errors,
+    }
 }
 
 /// Sampler tracks 1-in-N selection across calls. Lock-free counter so
@@ -96,7 +99,7 @@ pub struct Oracle {
     client: Mutex<Option<Client>>,
     conninfo: String,
     has_extension: Mutex<Option<bool>>,
-    pub stats: Mutex<OracleStats>,
+    pub stats: Arc<OracleStats>,
     pub sampler: Sampler,
 }
 
@@ -116,7 +119,7 @@ impl Oracle {
             client: Mutex::new(Some(client)),
             conninfo: conninfo.to_owned(),
             has_extension: Mutex::new(Some(has_ext)),
-            stats: Mutex::new(OracleStats::default()),
+            stats: Arc::new(OracleStats::default()),
             sampler: Sampler::new(sample_rate),
         })
     }
@@ -155,7 +158,7 @@ impl Oracle {
         raw: &[u8],
     ) -> Result<Option<String>, OracleError> {
         if !self.has_extension().await {
-            self.stats.lock().await.fallback_raw += 1;
+            self.stats.fallback_raw.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
         let sql = "SELECT walshadow_decode_disk($1::oid, $2::bytea)";
@@ -172,11 +175,10 @@ impl Oracle {
             match row {
                 Ok(r) => {
                     let txt: Option<String> = r.try_get(0).ok();
-                    let mut stats = self.stats.lock().await;
                     if txt.is_some() {
-                        stats.resolved += 1;
+                        self.stats.resolved.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        stats.fallback_raw += 1;
+                        self.stats.fallback_raw.fetch_add(1, Ordering::Relaxed);
                     }
                     return Ok(txt);
                 }
@@ -185,7 +187,7 @@ impl Oracle {
                     let _ = self.reconnect().await;
                 }
                 Err(_) => {
-                    self.stats.lock().await.errors += 1;
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
                 }
             }
@@ -232,18 +234,17 @@ impl Oracle {
                 Err(_) => break None,
             }
         };
-        let mut stats = self.stats.lock().await;
-        stats.probes += 1;
+        self.stats.probes.fetch_add(1, Ordering::Relaxed);
         let Some(r) = res else {
-            stats.errors += 1;
+            self.stats.errors.fetch_add(1, Ordering::Relaxed);
             return true;
         };
         let pg_text: Option<String> = r.try_get(0).ok();
         let matched = pg_text.as_deref() == Some(local_text);
         if matched {
-            stats.matches += 1;
+            self.stats.matches.fetch_add(1, Ordering::Relaxed);
         } else {
-            stats.mismatches += 1;
+            self.stats.mismatches.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
@@ -312,13 +313,14 @@ pub async fn maybe_validate_tuple(oracle: &Oracle, columns: &[Option<ColumnValue
 impl OracleStats {
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
-        let mut s = format!("oracle resolved={}", self.resolved);
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let mut s = format!("oracle resolved={}", ld(&self.resolved));
         let pairs: [(&str, u64); 5] = [
-            ("fallback", self.fallback_raw),
-            ("probes", self.probes),
-            ("match", self.matches),
-            ("mismatch", self.mismatches),
-            ("err", self.errors),
+            ("fallback", ld(&self.fallback_raw)),
+            ("probes", ld(&self.probes)),
+            ("match", ld(&self.matches)),
+            ("mismatch", ld(&self.mismatches)),
+            ("err", ld(&self.errors)),
         ];
         for (label, n) in pairs {
             if n > 0 {
@@ -455,14 +457,10 @@ mod tests {
 
     #[test]
     fn stats_summary_skips_zero_buckets() {
-        let s = OracleStats {
-            resolved: 4,
-            fallback_raw: 0,
-            probes: 2,
-            matches: 2,
-            mismatches: 0,
-            errors: 0,
-        };
+        let s = OracleStats::default();
+        s.resolved.store(4, Ordering::Relaxed);
+        s.probes.store(2, Ordering::Relaxed);
+        s.matches.store(2, Ordering::Relaxed);
         let out = s.summary();
         assert!(out.contains("resolved=4"));
         assert!(out.contains("probes=2"));
