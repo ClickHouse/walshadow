@@ -20,6 +20,10 @@ path = "src/bin/filter.rs"
 name = "walshadow-stream"
 path = "src/bin/stream.rs"
 
+[[bin]]
+name = "walshadow-latency-bench"
+path = "src/bin/latency_bench.rs"
+
 [lib]
 name = "walshadow"
 path = "src/lib.rs"
