@@ -24,7 +24,7 @@ fn main() {
     build
         .file("src/wrapper.c")
         .include(&chc_dir)
-        .std("c11")
+        .std("c2x")
         .warnings(true)
         .extra_warnings(true)
         .flag_if_supported("-Wno-unused-parameter")
