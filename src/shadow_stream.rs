@@ -345,9 +345,6 @@ impl RecordBytesSink for ShadowStreamSink {
                         }
                     }
                 }
-                let _ = state.enqueue_copy_data_with(id, |out| {
-                    encode_keepalive_frame_into(out, server_wal_end, false);
-                });
             }
             Ok(())
         })
@@ -526,6 +523,13 @@ async fn run_connection_loop<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
+    // Shadow's `wal_receiver_timeout` (default 60s) tears down the
+    // connection if no message arrives in that window. `'w'` XLogData
+    // frames cover the timer while WAL flows; on idle nothing leaves,
+    // so inject a fresh `'k'` once we've been quiet for KEEPALIVE_IDLE
+    // (10s matches PG's wal_receiver_status_interval convention).
+    const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+    let mut last_write = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(flush_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -533,6 +537,12 @@ where
             _ = ticker.tick() => {
                 let pending = {
                     let mut s = state.lock().await;
+                    if last_write.elapsed() >= KEEPALIVE_IDLE {
+                        let server_wal_end = s.server_wal_end;
+                        let _ = s.enqueue_copy_data_with(id, |out| {
+                            encode_keepalive_frame_into(out, server_wal_end, false);
+                        });
+                    }
                     s.drain_send_queue(id)
                 };
                 if let Some(bytes) = pending
@@ -540,6 +550,7 @@ where
                 {
                     // Queue holds fully-framed CopyData envelopes; ship verbatim.
                     conn.write_framed(&bytes).await?;
+                    last_write = tokio::time::Instant::now();
                 }
             }
             frame = conn.try_recv_frame() => {
