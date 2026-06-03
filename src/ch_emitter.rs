@@ -43,6 +43,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use clickhouse_c::{
@@ -1349,34 +1350,37 @@ pub struct Emitter {
     /// (code 101 "Unexpected packet Query"), so any wire activity for
     /// table B must call `close_current_wire` first if A is open.
     wire_open_key: Option<String>,
-    pub stats: EmitterStats,
+    pub stats: Arc<EmitterStats>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct EmitterStats {
-    pub rows_emitted: u64,
-    pub blocks_sent: u64,
-    pub xacts_committed: u64,
-    pub unsupported_relations: u64,
-    /// Rows whose filenode resolved to a foreign database (physical WAL
-    /// carries the whole cluster). Skipped, not an error.
-    pub foreign_db_rows_skipped: u64,
-    pub unsupported_values: u64,
-    /// Phase 10 retry bookkeeping. `reconnects` ticks on every fresh
-    /// CH socket the daemon hot-replaces; `retries_attempted` ticks on
-    /// every reconnect-triggered retry (one per failing operation,
-    /// not per attempt — so a single op that needed 3 retries adds 3).
-    pub reconnects: u64,
-    pub retries_attempted: u64,
-    /// `HeapOp::Truncate` events shipped to CH as `TRUNCATE TABLE`.
-    pub truncates_emitted: u64,
-    /// Number of times the hold-INSERT-open deadline tripped (i.e.
-    /// `flush_timeout` elapsed since the first row of a fresh INSERT
-    /// landed) and forced a multi-xact close. Stays at `0` when
-    /// `flush_timeout == 0` because the legacy close-per-xact path
-    /// fires through [`Self::close_all_open_inserts`] without setting
-    /// a deadline.
-    pub flush_deadline_trips: u64,
+crate::atomic_stats! {
+    /// CH emitter counters. Mutations via `fetch_add(_, Relaxed)`; the
+    /// daemon's status loop reads via `.load(Relaxed)` at the use site.
+    pub struct EmitterStats {
+        pub rows_emitted,
+        pub blocks_sent,
+        pub xacts_committed,
+        pub unsupported_relations,
+        /// Rows whose filenode resolved to a foreign database (physical WAL
+        /// carries the whole cluster). Skipped, not an error.
+        pub foreign_db_rows_skipped,
+        pub unsupported_values,
+        /// Phase 10 retry bookkeeping. `reconnects` ticks on every fresh
+        /// CH socket the daemon hot-replaces; `retries_attempted` ticks on
+        /// every reconnect-triggered retry (one per failing operation,
+        /// not per attempt — so a single op that needed 3 retries adds 3).
+        pub reconnects,
+        pub retries_attempted,
+        /// `HeapOp::Truncate` events shipped to CH as `TRUNCATE TABLE`.
+        pub truncates_emitted,
+        /// Number of times the hold-INSERT-open deadline tripped (i.e.
+        /// `flush_timeout` elapsed since the first row of a fresh INSERT
+        /// landed) and forced a multi-xact close. Stays at `0` when
+        /// `flush_timeout == 0` because the legacy close-per-xact path
+        /// fires through [`Emitter::close_all_open_inserts`] without setting
+        /// a deadline.
+        pub flush_deadline_trips,
+    }
 }
 
 impl Emitter {
@@ -1408,7 +1412,7 @@ impl Emitter {
             last_durable_commit_lsn: 0,
             applicator: None,
             wire_open_key: None,
-            stats: EmitterStats::default(),
+            stats: Arc::new(EmitterStats::default()),
         })
     }
 
@@ -1433,6 +1437,13 @@ impl Emitter {
         self.mapping.clone()
     }
 
+    /// Shared handle so the daemon's status loop (running on a different
+    /// task once the emitter is boxed into an observer) can snapshot
+    /// counters without coordinating with the emitter task.
+    pub fn stats_handle(&self) -> Arc<EmitterStats> {
+        self.stats.clone()
+    }
+
     /// Route one committed tuple. INSERT/UPDATE land via the `new`
     /// image; DELETE pulls from `old`. HOT_UPDATE is treated as UPDATE
     /// downstream (op-code 2) — CH's `ReplacingMergeTree` cares about
@@ -1450,7 +1461,9 @@ impl Emitter {
             // Foreign-DB WAL: skip like an unmapped relation (no append,
             // no poison), let the ack advance past it.
             Err(CatalogError::ForeignDatabase(_)) => {
-                self.stats.foreign_db_rows_skipped += 1;
+                self.stats
+                    .foreign_db_rows_skipped
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
@@ -1460,7 +1473,9 @@ impl Emitter {
             match m.get(rel.qualified_name.as_ref()).cloned() {
                 Some(v) => v,
                 None => {
-                    self.stats.unsupported_relations += 1;
+                    self.stats
+                        .unsupported_relations
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
             }
@@ -1497,7 +1512,7 @@ impl Emitter {
                     _ => {}
                 }
             }
-            self.stats.truncates_emitted += 1;
+            self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         // Lazily build the per-table encoder on first row. NO wire
@@ -1524,7 +1539,9 @@ impl Emitter {
             HeapOp::Truncate => return Ok(()),
         };
         if let Err(e) = enc.append_row(committed, &mapping, op) {
-            self.stats.unsupported_values += 1;
+            self.stats
+                .unsupported_values
+                .fetch_add(1, Ordering::Relaxed);
             return Err(e);
         }
         self.pending_max_commit_lsn = self.pending_max_commit_lsn.max(committed.commit_lsn);
@@ -1602,8 +1619,10 @@ impl Emitter {
         // point the buffer is the only replay source if the connection
         // bounced.
         if n > 0 {
-            self.stats.rows_emitted += n as u64;
-            self.stats.blocks_sent += 1;
+            self.stats
+                .rows_emitted
+                .fetch_add(n as u64, Ordering::Relaxed);
+            self.stats.blocks_sent.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(enc) = self.tables.get_mut(&key) {
             enc.clear();
@@ -1637,7 +1656,9 @@ impl Emitter {
         let now = Instant::now();
         let deadline_tripped = self.flush_deadline.is_some_and(|d| now >= d);
         if deadline_tripped {
-            self.stats.flush_deadline_trips += 1;
+            self.stats
+                .flush_deadline_trips
+                .fetch_add(1, Ordering::Relaxed);
         }
         let must_close = self.config.flush_timeout.is_zero() || deadline_tripped;
         if must_close {
@@ -1663,7 +1684,7 @@ impl Emitter {
             self.pending_max_commit_lsn = 0;
         }
         self.current_xid = None;
-        self.stats.xacts_committed += 1;
+        self.stats.xacts_committed.fetch_add(1, Ordering::Relaxed);
         Ok(self.last_durable_commit_lsn)
     }
 
@@ -1714,7 +1735,9 @@ impl Emitter {
     /// `flush_deadline_trips` on close.
     pub fn flush_if_deadline_tripped(&mut self) -> Result<u64, EmitterError> {
         if self.flush_deadline.is_some_and(|d| Instant::now() >= d) {
-            self.stats.flush_deadline_trips += 1;
+            self.stats
+                .flush_deadline_trips
+                .fetch_add(1, Ordering::Relaxed);
             self.close_all_open_inserts()?;
         }
         Ok(self.last_durable_commit_lsn)
@@ -1730,7 +1753,7 @@ impl Emitter {
             match self.flush_if_deadline_tripped() {
                 Ok(ack) => return Ok(ack),
                 Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    self.stats.retries_attempted += 1;
+                    self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
                     attempt += 1;
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(retry.max_backoff);
@@ -1751,7 +1774,7 @@ impl Emitter {
             match self.flush_open_inserts() {
                 Ok(ack) => return Ok(ack),
                 Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    self.stats.retries_attempted += 1;
+                    self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
                     attempt += 1;
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(retry.max_backoff);
@@ -1806,7 +1829,7 @@ impl Emitter {
         let client = Client::init(&opts, self.alloc, io, codec)?;
         self.client = client;
         self.wire_open_key = None;
-        self.stats.reconnects += 1;
+        self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1826,7 +1849,7 @@ impl Emitter {
             match self.route(committed).await {
                 Ok(()) => return Ok(()),
                 Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    self.stats.retries_attempted += 1;
+                    self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
                     attempt += 1;
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(retry.max_backoff);
@@ -1900,7 +1923,7 @@ impl Emitter {
             match self.on_xact_end_with_lsn(commit_lsn) {
                 Ok(ack) => return Ok(ack),
                 Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    self.stats.retries_attempted += 1;
+                    self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
                     attempt += 1;
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(retry.max_backoff);
@@ -1937,33 +1960,15 @@ fn is_retryable(e: &EmitterError) -> bool {
 /// `XactRecordSink<EmitterObserver>` in `bin/stream.rs`.
 pub struct EmitterObserver {
     pub emitter: Emitter,
-    /// Shared mirror of `emitter.stats` the daemon status loop polls
-    /// while this observer runs on the `QueueingRecordSink` worker
-    /// task. Refreshed after every dispatch callback; lock never held
-    /// across `.await`.
-    stats: Arc<std::sync::Mutex<EmitterStats>>,
 }
 
 impl EmitterObserver {
     pub fn new(emitter: Emitter) -> Self {
-        Self {
-            emitter,
-            stats: Arc::new(std::sync::Mutex::new(EmitterStats::default())),
-        }
+        Self { emitter }
     }
 
-    /// Handle the daemon hands to its status loop so it reads live
-    /// emitter counters across the worker-task boundary (the emitter
-    /// itself is buried inside the worker).
-    pub fn stats_handle(&self) -> Arc<std::sync::Mutex<EmitterStats>> {
-        self.stats.clone()
-    }
-
-    /// Mirror the emitter's local counters into the shared handle.
-    /// Called at the tail of each callback so a poll never lags more
-    /// than one dispatch behind.
-    fn publish_stats(&self) {
-        *self.stats.lock().expect("emitter stats mutex poisoned") = self.emitter.stats.clone();
+    pub fn stats_handle(&self) -> Arc<EmitterStats> {
+        self.emitter.stats_handle()
     }
 }
 
@@ -1975,13 +1980,10 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let r = self
-                .emitter
+            self.emitter
                 .route_with_retry(committed)
                 .await
-                .map_err(DecoderSinkError::from);
-            self.publish_stats();
-            r
+                .map_err(DecoderSinkError::from)
         })
     }
 
@@ -1992,13 +1994,10 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let r = self
-                .emitter
+            self.emitter
                 .on_xact_end_with_retry(commit_lsn)
                 .await
-                .map_err(DecoderSinkError::from);
-            self.publish_stats();
-            r
+                .map_err(DecoderSinkError::from)
         })
     }
 
@@ -2009,13 +2008,10 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let r = self
-                .emitter
+            self.emitter
                 .dispatch_schema_event_with_retry(event)
                 .await
-                .map_err(DecoderSinkError::from);
-            self.publish_stats();
-            r
+                .map_err(DecoderSinkError::from)
         })
     }
 
@@ -2035,13 +2031,10 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let r = self
-                .emitter
+            self.emitter
                 .flush_if_deadline_tripped_with_retry()
                 .await
-                .map_err(DecoderSinkError::from);
-            self.publish_stats();
-            r
+                .map_err(DecoderSinkError::from)
         })
     }
 
@@ -2055,13 +2048,10 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let r = self
-                .emitter
+            self.emitter
                 .flush_open_inserts_with_retry()
                 .await
-                .map_err(DecoderSinkError::from);
-            self.publish_stats();
-            r?;
+                .map_err(DecoderSinkError::from)?;
             Ok(())
         })
     }

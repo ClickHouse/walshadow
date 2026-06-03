@@ -23,6 +23,8 @@
 //! Direct + ObjectStore impls, catalog-land + page-walk sinks, and the
 //! greenfield bootstrap orchestrator (`backfill_bootstrap`).
 
+#[macro_use]
+pub mod atomic_stats;
 pub mod backfill_bootstrap;
 pub mod backup_page_walk;
 pub mod backup_sink;

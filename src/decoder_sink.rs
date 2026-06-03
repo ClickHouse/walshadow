@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
@@ -153,45 +154,48 @@ impl<T: TupleObserver + ?Sized> TupleObserver for Box<T> {
     }
 }
 
-/// Counter observer suitable for the production daemon. Discards the
-/// tuple payload; tracks counts by op kind so the daemon's status line
-/// surfaces decoded-tuple cadence.
-#[derive(Debug, Default, Clone)]
-pub struct DecoderStats {
-    pub decoded: u64,
-    pub inserts: u64,
-    pub updates: u64,
-    pub hot_updates: u64,
-    pub deletes: u64,
-    /// Decoded but the WAL elided some columns via
-    /// `XLH_UPDATE_PREFIX_FROM_OLD` / `..._SUFFIX_FROM_OLD`. Phase 6
-    /// reassembles from previous tuple image; Phase 5 emits as-is.
-    pub partial: u64,
-    /// `record.parsed.blocks` was empty — record references no
-    /// relation. Heap LOCK / INPLACE / TRUNCATE land here under the
-    /// decoder's silent-skip policy.
-    pub skipped_no_block: u64,
-    /// Heap record on a relation [`ShadowCatalog`] returned
-    /// `NotFoundByFilenode` for. Possible causes: replay-LSN gate
-    /// ahead of catalog mutation, mapping rotation, race with
-    /// `seed_from_source`. Counted, not retried — Phase 6's xact
-    /// buffer can reorder.
-    pub catalog_not_found: u64,
-    /// Record was on a `User` relation but the rmgr/info combo isn't
-    /// in the Phase 5 matrix (MULTI_INSERT, HEAP2 PRUNE, etc).
-    pub skipped_op: u64,
-    /// `XLOG_HEAP_TRUNCATE` records fanned out to per-relid
-    /// `HeapOp::Truncate` events. Counted by
-    /// [`BufferingDecoderSink::on_record`]'s pre-decode intercept.
-    pub truncates: u64,
-    /// TOAST chunks routed into the xact buffer's chunk slot. Distinct
-    /// from `inserts`, which only counts user-table writes.
-    pub toast_chunks_buffered: u64,
-    /// TOAST inserts the decoder couldn't reinterpret as a chunk
-    /// (missing chunk_id/seq/data columns, type mismatch). Surfaces
-    /// so a corrupt catalog or a future TOAST layout shows up as a
-    /// counter, not silent loss.
-    pub toast_chunks_malformed: u64,
+crate::atomic_stats! {
+    /// Counter observer suitable for the production daemon. Discards the
+    /// tuple payload; tracks counts by op kind so the daemon's status line
+    /// surfaces decoded-tuple cadence. Mutations use
+    /// `fetch_add(_, Relaxed)`; the daemon's status loop reads via
+    /// `.load(Relaxed)` at the use site.
+    pub struct DecoderStats {
+        pub decoded,
+        pub inserts,
+        pub updates,
+        pub hot_updates,
+        pub deletes,
+        /// Decoded but the WAL elided some columns via
+        /// `XLH_UPDATE_PREFIX_FROM_OLD` / `..._SUFFIX_FROM_OLD`. Phase 6
+        /// reassembles from previous tuple image; Phase 5 emits as-is.
+        pub partial,
+        /// `record.parsed.blocks` was empty — record references no
+        /// relation. Heap LOCK / INPLACE / TRUNCATE land here under the
+        /// decoder's silent-skip policy.
+        pub skipped_no_block,
+        /// Heap record on a relation [`ShadowCatalog`] returned
+        /// `NotFoundByFilenode` for. Possible causes: replay-LSN gate
+        /// ahead of catalog mutation, mapping rotation, race with
+        /// `seed_from_source`. Counted, not retried — Phase 6's xact
+        /// buffer can reorder.
+        pub catalog_not_found,
+        /// Record was on a `User` relation but the rmgr/info combo isn't
+        /// in the Phase 5 matrix (MULTI_INSERT, HEAP2 PRUNE, etc).
+        pub skipped_op,
+        /// `XLOG_HEAP_TRUNCATE` records fanned out to per-relid
+        /// `HeapOp::Truncate` events. Counted by
+        /// [`BufferingDecoderSink::on_record`]'s pre-decode intercept.
+        pub truncates,
+        /// TOAST chunks routed into the xact buffer's chunk slot. Distinct
+        /// from `inserts`, which only counts user-table writes.
+        pub toast_chunks_buffered,
+        /// TOAST inserts the decoder couldn't reinterpret as a chunk
+        /// (missing chunk_id/seq/data columns, type mismatch). Surfaces
+        /// so a corrupt catalog or a future TOAST layout shows up as a
+        /// counter, not silent loss.
+        pub toast_chunks_malformed,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -236,20 +240,20 @@ impl DecoderStats {
     /// of truth for the `HeapOp → counter` mapping; every decoder
     /// dispatch site routes through here so new ops only add code in
     /// one place.
-    pub fn record(&mut self, decoded: &crate::heap_decoder::DecodedHeap) {
+    pub fn record(&self, decoded: &crate::heap_decoder::DecodedHeap) {
         use crate::heap_decoder::HeapOp;
-        self.decoded += 1;
+        self.decoded.fetch_add(1, Ordering::Relaxed);
         match decoded.op {
-            HeapOp::Insert => self.inserts += 1,
-            HeapOp::Update => self.updates += 1,
-            HeapOp::HotUpdate => self.hot_updates += 1,
-            HeapOp::Delete => self.deletes += 1,
-            HeapOp::Truncate => self.truncates += 1,
-        }
+            HeapOp::Insert => self.inserts.fetch_add(1, Ordering::Relaxed),
+            HeapOp::Update => self.updates.fetch_add(1, Ordering::Relaxed),
+            HeapOp::HotUpdate => self.hot_updates.fetch_add(1, Ordering::Relaxed),
+            HeapOp::Delete => self.deletes.fetch_add(1, Ordering::Relaxed),
+            HeapOp::Truncate => self.truncates.fetch_add(1, Ordering::Relaxed),
+        };
         let partial = decoded.new.as_ref().is_some_and(|t| t.partial)
             || decoded.old.as_ref().is_some_and(|t| t.partial);
         if partial {
-            self.partial += 1;
+            self.partial.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -257,26 +261,28 @@ impl DecoderStats {
     /// zero buckets so a quiet workload shows a tight format.
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
-        let mut s = format!("decoded={}", self.decoded);
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let mut s = format!("decoded={}", ld(&self.decoded));
         let pairs: [(&str, u64); 10] = [
-            ("ins", self.inserts),
-            ("upd", self.updates),
-            ("hot", self.hot_updates),
-            ("del", self.deletes),
-            ("trunc", self.truncates),
-            ("partial", self.partial),
-            ("no_blk", self.skipped_no_block),
-            ("not_found", self.catalog_not_found),
-            ("toast", self.toast_chunks_buffered),
-            ("toast_bad", self.toast_chunks_malformed),
+            ("ins", ld(&self.inserts)),
+            ("upd", ld(&self.updates)),
+            ("hot", ld(&self.hot_updates)),
+            ("del", ld(&self.deletes)),
+            ("trunc", ld(&self.truncates)),
+            ("partial", ld(&self.partial)),
+            ("no_blk", ld(&self.skipped_no_block)),
+            ("not_found", ld(&self.catalog_not_found)),
+            ("toast", ld(&self.toast_chunks_buffered)),
+            ("toast_bad", ld(&self.toast_chunks_malformed)),
         ];
         for (label, n) in pairs {
             if n > 0 {
                 write!(&mut s, " {label}={n}").unwrap();
             }
         }
-        if self.skipped_op > 0 {
-            write!(&mut s, " skip_op={}", self.skipped_op).unwrap();
+        let skip_op = ld(&self.skipped_op);
+        if skip_op > 0 {
+            write!(&mut s, " skip_op={skip_op}").unwrap();
         }
         s
     }
@@ -320,12 +326,14 @@ mod tests {
             obs.on_tuple(&wrap(mk(op, false))).await.unwrap();
         }
         obs.on_tuple(&wrap(mk(HeapOp::Update, true))).await.unwrap();
-        assert_eq!(obs.stats.decoded, 6);
-        assert_eq!(obs.stats.inserts, 2);
-        assert_eq!(obs.stats.updates, 2);
-        assert_eq!(obs.stats.hot_updates, 1);
-        assert_eq!(obs.stats.deletes, 1);
-        assert_eq!(obs.stats.partial, 1);
+        let s = &obs.stats;
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        assert_eq!(ld(&s.decoded), 6);
+        assert_eq!(ld(&s.inserts), 2);
+        assert_eq!(ld(&s.updates), 2);
+        assert_eq!(ld(&s.hot_updates), 1);
+        assert_eq!(ld(&s.deletes), 1);
+        assert_eq!(ld(&s.partial), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -360,15 +368,11 @@ mod tests {
 
     #[test]
     fn stats_summary_skips_zero_buckets() {
-        let s = DecoderStats {
-            decoded: 5,
-            inserts: 3,
-            updates: 0,
-            hot_updates: 0,
-            deletes: 2,
-            partial: 1,
-            ..Default::default()
-        };
+        let s = DecoderStats::default();
+        s.decoded.store(5, Ordering::Relaxed);
+        s.inserts.store(3, Ordering::Relaxed);
+        s.deletes.store(2, Ordering::Relaxed);
+        s.partial.store(1, Ordering::Relaxed);
         let out = s.summary();
         assert!(out.starts_with("decoded=5"), "{out}");
         assert!(out.contains("ins=3"), "{out}");

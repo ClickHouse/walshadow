@@ -135,9 +135,9 @@ async fn oracle_without_extension_falls_back_to_raw_bytes() {
         .await
         .expect("resolve_pending");
     assert!(out.is_none(), "expected fallback, got {out:?}");
-    let stats = oracle.stats.lock().await.clone();
-    assert_eq!(stats.fallback_raw, 1);
-    assert_eq!(stats.resolved, 0);
+    use std::sync::atomic::Ordering;
+    assert_eq!(oracle.stats.fallback_raw.load(Ordering::Relaxed), 1);
+    assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 0);
     assert!(!oracle.has_extension().await);
 }
 
@@ -212,10 +212,10 @@ async fn oracle_with_extension_resolves_tier3_disk_bytes() {
         .expect("resolved Some");
     assert_eq!(txt, "{1,2,3}");
 
-    let stats = oracle.stats.lock().await.clone();
-    assert_eq!(stats.resolved, 4);
-    assert_eq!(stats.fallback_raw, 0);
-    assert_eq!(stats.errors, 0);
+    use std::sync::atomic::Ordering;
+    assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 4);
+    assert_eq!(oracle.stats.fallback_raw.load(Ordering::Relaxed), 0);
+    assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -280,6 +280,6 @@ async fn oracle_observer_resolves_pg_pending_to_text() {
         Some(ColumnValue::Text(s)) => assert_eq!(s, "42"),
         other => panic!("expected Text(\"42\"), got {other:?}"),
     }
-    let stats = oracle.stats.lock().await.clone();
-    assert_eq!(stats.resolved, 1);
+    use std::sync::atomic::Ordering;
+    assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 1);
 }
