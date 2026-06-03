@@ -52,7 +52,7 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
-use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, MappingHandle};
+use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, EmitterStats, MappingHandle};
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
@@ -157,6 +157,10 @@ struct DaemonSinks {
     /// worker; the status loop polls counters here without contending
     /// on the worker.
     decoder_stats: Arc<std::sync::Mutex<walshadow::decoder_sink::DecoderStats>>,
+    /// Shared snapshot of the CH emitter's counters, published by
+    /// `EmitterObserver` at commit boundaries. Stays at the default
+    /// (all-zero) when no emitter is wired (metrics-only / no `--ch-config`).
+    emitter_stats: Arc<std::sync::Mutex<EmitterStats>>,
 }
 
 impl RecordSink for DaemonSinks {
@@ -746,6 +750,9 @@ async fn run(args: Args) -> Result<()> {
     // read/write vtable), so we `into_std()` + `set_nonblocking(false)`
     // right before construction.
     let mut mapping_handle: Option<MappingHandle> = None;
+    // Published by the EmitterObserver (when wired) and read by the
+    // status/metrics loop. Default-zero when no emitter exists.
+    let emitter_stats_handle = Arc::new(std::sync::Mutex::new(EmitterStats::default()));
     let inner_observer: Box<dyn TupleObserver> = match initial_ch_config {
         Some(emitter_cfg) => {
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
@@ -785,7 +792,10 @@ async fn run(args: Args) -> Result<()> {
             .context("init DDL applicator")?;
             let emitter = emitter.with_applicator(applicator);
             tracing::info!(target: "walshadow::ch_emitter", addr = %addr, "ch emitter + DDL applicator connected");
-            Box::new(EmitterObserver::new(emitter))
+            Box::new(EmitterObserver::with_stats_handle(
+                emitter,
+                emitter_stats_handle.clone(),
+            ))
         }
         None => Box::new(MetricsTupleObserver::default()),
     };
@@ -829,6 +839,7 @@ async fn run(args: Args) -> Result<()> {
         metrics: MetricsRecordSink::default(),
         decoder_xact,
         decoder_stats: decoder_stats_handle,
+        emitter_stats: emitter_stats_handle,
     };
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
@@ -1057,6 +1068,11 @@ async fn run(args: Args) -> Result<()> {
             .lock()
             .expect("decoder stats mutex poisoned")
             .clone();
+        let emitter_stats = record_sink
+            .emitter_stats
+            .lock()
+            .expect("emitter stats mutex poisoned")
+            .clone();
         let shadow_apply_lsn = shadow_agg.min_apply_lsn.unwrap_or(0);
         let lag_bytes = received.saturating_sub(shadow_apply_lsn);
         rate_estimator.observe(Instant::now(), received);
@@ -1076,6 +1092,7 @@ async fn run(args: Args) -> Result<()> {
             &record_sink.metrics,
             &xact_stats,
             &decoder_stats,
+            &emitter_stats,
             oracle_stats.as_ref(),
             start_instant.elapsed().as_secs(),
             ShadowMetricsView {
@@ -1371,6 +1388,7 @@ async fn populate_metrics(
     rec_metrics: &MetricsRecordSink,
     xact_stats: &walshadow::xact_buffer::XactBufferStats,
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
+    emitter_stats: &walshadow::ch_emitter::EmitterStats,
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
     uptime_secs: u64,
     shadow_view: ShadowMetricsView,
@@ -1406,10 +1424,10 @@ async fn populate_metrics(
         decoder_partial_total: decoder_stats.partial,
         decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered,
         decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed,
-        emitter_rows_total: 0,
-        emitter_blocks_total: 0,
-        emitter_xacts_total: 0,
-        emitter_unsupported_relations: 0,
+        emitter_rows_total: emitter_stats.rows_emitted,
+        emitter_blocks_total: emitter_stats.blocks_sent,
+        emitter_xacts_total: emitter_stats.xacts_committed,
+        emitter_unsupported_relations: emitter_stats.unsupported_relations,
         oracle_resolved_total: oracle_stats.map(|s| s.resolved).unwrap_or(0),
         oracle_fallback_raw_total: oracle_stats.map(|s| s.fallback_raw).unwrap_or(0),
         oracle_validate_sampled_total: oracle_stats.map(|s| s.probes).unwrap_or(0),

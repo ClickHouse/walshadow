@@ -528,6 +528,16 @@ where
 {
     let mut ticker = tokio::time::interval(flush_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A caught-up or idle source produces no WAL chunks, and keepalives
+    // are otherwise only enqueued on segment boundaries — so the wire
+    // goes silent. PG's walreceiver then hits `wal_receiver_timeout`
+    // (default 60s), drops the connection (`client sent Terminate`) and
+    // reconnects at the same LSN, churning forever. Emit a standalone
+    // keepalive whenever the wire has been idle for `KEEPALIVE_IDLE`
+    // (mirrors a real walsender's `wal_sender_timeout/2` cadence, kept
+    // well under any sane `wal_receiver_timeout`).
+    const KEEPALIVE_IDLE: Duration = Duration::from_secs(5);
+    let mut last_send = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -540,6 +550,25 @@ where
                 {
                     // Queue holds fully-framed CopyData envelopes; ship verbatim.
                     conn.write_framed(&bytes).await?;
+                    last_send = tokio::time::Instant::now();
+                } else if last_send.elapsed() >= KEEPALIVE_IDLE {
+                    // Reuse the CopyData framing path so the idle
+                    // keepalive envelope is byte-identical to the
+                    // segment-boundary one.
+                    let keepalive = {
+                        let mut s = state.lock().await;
+                        let server_wal_end = s.server_wal_end;
+                        s.enqueue_copy_data_with(id, |out| {
+                            encode_keepalive_frame_into(out, server_wal_end, false);
+                        });
+                        s.drain_send_queue(id)
+                    };
+                    if let Some(bytes) = keepalive
+                        && !bytes.is_empty()
+                    {
+                        conn.write_framed(&bytes).await?;
+                        last_send = tokio::time::Instant::now();
+                    }
                 }
             }
             frame = conn.try_recv_frame() => {

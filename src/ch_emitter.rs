@@ -1937,11 +1937,36 @@ fn is_retryable(e: &EmitterError) -> bool {
 /// `XactRecordSink<EmitterObserver>` in `bin/stream.rs`.
 pub struct EmitterObserver {
     pub emitter: Emitter,
+    /// Optional shared snapshot of [`Emitter::stats`], refreshed at each
+    /// commit/idle/close boundary so the daemon's metrics loop can read
+    /// emitter counters (rows/blocks/xacts/unsupported) without touching
+    /// the drain worker. `None` in tests / bootstrap where nothing
+    /// observes it.
+    stats_pub: Option<Arc<std::sync::Mutex<EmitterStats>>>,
 }
 
 impl EmitterObserver {
     pub fn new(emitter: Emitter) -> Self {
-        Self { emitter }
+        Self { emitter, stats_pub: None }
+    }
+
+    /// Like [`Self::new`] but publishes [`Emitter::stats`] snapshots into
+    /// `handle` at every commit/idle/close boundary.
+    pub fn with_stats_handle(
+        emitter: Emitter,
+        handle: Arc<std::sync::Mutex<EmitterStats>>,
+    ) -> Self {
+        Self { emitter, stats_pub: Some(handle) }
+    }
+
+    /// Copy the emitter's current counters into the shared handle, if one
+    /// is wired. Cheap — `EmitterStats` is a handful of `u64`s.
+    fn publish_stats(&self) {
+        if let Some(h) = &self.stats_pub
+            && let Ok(mut g) = h.lock()
+        {
+            *g = self.emitter.stats.clone();
+        }
     }
 }
 
@@ -1967,10 +1992,13 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            self.emitter
+            let r = self
+                .emitter
                 .on_xact_end_with_retry(commit_lsn)
                 .await
-                .map_err(DecoderSinkError::from)
+                .map_err(DecoderSinkError::from);
+            self.publish_stats();
+            r
         })
     }
 
@@ -2004,10 +2032,13 @@ impl TupleObserver for EmitterObserver {
         Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            self.emitter
+            let r = self
+                .emitter
                 .flush_if_deadline_tripped_with_retry()
                 .await
-                .map_err(DecoderSinkError::from)
+                .map_err(DecoderSinkError::from);
+            self.publish_stats();
+            r
         })
     }
 
@@ -2025,6 +2056,7 @@ impl TupleObserver for EmitterObserver {
                 .flush_open_inserts_with_retry()
                 .await
                 .map_err(DecoderSinkError::from)?;
+            self.publish_stats();
             Ok(())
         })
     }
