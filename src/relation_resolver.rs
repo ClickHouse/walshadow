@@ -1,4 +1,4 @@
-//! Phase 12 — catalog adapter trait fronting `relation_at`.
+//! Catalog adapter trait fronting `relation_at`.
 //!
 //! Emitter only needs one catalog operation: resolve
 //! `(RelFileNode, source_lsn) → Arc<RelDescriptor>`. Decoupling Emitter

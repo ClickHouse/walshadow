@@ -1,4 +1,4 @@
-//! Phase 6 — per-xid xact buffer + TOAST reassembly.
+//! Per-xid xact buffer + TOAST reassembly.
 //!
 //! Sits between [`BufferingDecoderSink`]'s per-record output and the
 //! downstream emitter. Holds every
@@ -23,8 +23,8 @@
 //!   for every value in the xact is already buffered.
 //!
 //! Cross-xact chunks would matter only for PG's `streaming=on` mode,
-//! which walshadow does not implement (see [PHASE6disk.md "What this
-//! defers — Streaming mid-xact"]).
+//! which walshadow does not implement (streaming mid-xact is
+//! deferred).
 //!
 //! ## Catalog access at drain
 //!
@@ -33,7 +33,7 @@
 //! [`ShadowCatalog::relation_at`](crate::shadow_catalog::ShadowCatalog::relation_at)
 //! on each heap whose `tuple_needs_detoast` returns true; the
 //! catalog's own LRU caches the descriptor across repeat lookups,
-//! so a Phase 6-internal cache would just duplicate that surface.
+//! so a buffer-internal cache would just duplicate that surface.
 //! Heaps without TOAST columns never hit the catalog at drain.
 //!
 //! ## Spill policy
@@ -49,9 +49,9 @@
 //! in-memory entries (newer). Eviction always flushes from the front
 //! of `in_mem`, so the invariant "spilled is older than in-mem" holds.
 //!
-//! Spill-to-ClickHouse is reserved as design space ([PHASE6disk.md]
-//! Option B) — config knob, schema, and code path are left for a
-//! follow-up phase when a diskless walshadow operator asks. v1 is
+//! Spill-to-ClickHouse is reserved as design space (Option B) —
+//! config knob, schema, and code path are left for a
+//! follow-up when a diskless walshadow operator asks. v1 is
 //! local-disk-only.
 //!
 //! ## Status counters
@@ -101,7 +101,7 @@ const XLOG_XACT_ASSIGNMENT: u8 = 0x50;
 const XLOG_XACT_HAS_INFO: u8 = 0x80;
 
 /// `xinfo` bits driving xl_xact_commit / xl_xact_abort tail layout.
-/// `access/xact.h` L188-196. PHASE14 item 5 only consumes
+/// `access/xact.h` L188-196. The commit/abort parser only consumes
 /// `HAS_SUBXACTS`; remaining flags drive skip-walk.
 const XACT_XINFO_HAS_DBINFO: u32 = 1 << 0;
 const XACT_XINFO_HAS_SUBXACTS: u32 = 1 << 1;
@@ -114,7 +114,7 @@ const XACT_XINFO_HAS_DROPPED_STATS: u32 = 1 << 8;
 
 /// Maps PG subxact xids to their top-level xid. Built from
 /// `XLOG_XACT_ASSIGNMENT` (info `0x50`) records arriving on the xact
-/// resource manager. PHASE14 item 5 keeps both directions so
+/// resource manager. The tracker keeps both directions so
 /// `forget_tree` runs O(k) over actual children rather than scanning
 /// every entry in `parent`.
 ///
@@ -446,11 +446,11 @@ pub struct XactBufferStats {
     /// here than for `commits_unknown_xid` are expected since aborts
     /// often happen on xacts that never wrote anything.
     pub aborts_unknown_xid: u64,
-    /// Phase 11. Highest commit-record LSN drained out of the buffer
+    /// Highest commit-record LSN drained out of the buffer
     /// into the observer's `on_tuple` chain. Snapshot for the cursor
     /// file's `drain_lsn`. Monotonic.
     pub drain_lsn: u64,
-    /// Phase 11. Highest commit-record LSN where the observer's
+    /// Highest commit-record LSN where the observer's
     /// `on_xact_end` reported durable on the downstream sink. Snapshot
     /// for `cursor.emitter_ack_lsn`. Monotonic. Lags `drain_lsn`
     /// whenever the observer (CH emitter with `flush_timeout > 0`)
@@ -496,7 +496,7 @@ struct XactState {
     /// Bytes written to spill so far. Mirrors `spill.as_ref().byte_count()`
     /// to keep the stat updater branch-free.
     spill_bytes: u64,
-    /// PHASE15 §6 — catalog events buffered with the xact, ordered
+    /// Catalog events buffered with the xact, ordered
     /// by source_lsn ASC. Not spilled (the data inside an `Added`
     /// / `Changed` event is rich enough that a spill format would
     /// duplicate `RelDescriptor` decoding; the practical case has at
@@ -675,7 +675,7 @@ impl XactBuffer {
     /// Buffer a decoded heap tuple. The descriptor needed to detoast
     /// `ExternalToast` columns at drain is fetched from
     /// [`ShadowCatalog`] on demand inside
-    /// [`XactBuffer::commit`] — Phase 6 deliberately does not keep
+    /// [`XactBuffer::commit`] — the buffer deliberately does not keep
     /// its own per-xact rel cache, the catalog's own LRU already
     /// covers the repeat-lookup path.
     pub async fn on_heap(
@@ -701,7 +701,7 @@ impl XactBuffer {
         self.absorb(xid, first_lsn, entry).await
     }
 
-    /// PHASE15 §6 — buffer a [`SchemaEvent`] keyed on `xid`. Drains
+    /// Buffer a [`SchemaEvent`] keyed on `xid`. Drains
     /// alongside heap tuples + chunks at `commit` time in `source_lsn`
     /// order, so an `Added`/`Changed` event triggered by a DDL within
     /// the same xact lands BEFORE the heap writes that follow it.
@@ -805,8 +805,8 @@ impl XactBuffer {
     /// catalog. No-op if `xid` is unknown (read-only xact, or one
     /// whose records the filter dropped before reaching the buffer).
     ///
-    /// `commit_lsn` is the LSN of the `XLOG_XACT_COMMIT` record itself
-    /// (Phase 11). Stamped into [`CommittedTuple::commit_lsn`] for the
+    /// `commit_lsn` is the LSN of the `XLOG_XACT_COMMIT` record itself.
+    /// Stamped into [`CommittedTuple::commit_lsn`] for the
     /// emitter's ack tracker, and bumped into
     /// [`XactBufferStats::drain_lsn`] / `emitter_ack_lsn` on the
     /// successful-drain path so the cursor file's resume gate has a
@@ -1242,7 +1242,7 @@ pub struct XactRecordSink<O: TupleObserver + Send> {
     /// `relation_at` only for heaps with TOAST columns; everything
     /// else doesn't touch the catalog.
     catalog: Arc<Mutex<ShadowCatalog>>,
-    /// PHASE14 item 5. Maps subxids to their top via
+    /// Maps subxids to their top via
     /// `XLOG_XACT_ASSIGNMENT`. Hint surface only — the canonical
     /// subxact list arrives inline on commit / abort records and
     /// drives the drain merge directly. Tracker covers eviction-
@@ -1250,15 +1250,15 @@ pub struct XactRecordSink<O: TupleObserver + Send> {
     subxact_tracker: Arc<Mutex<SubxactTracker>>,
     /// Where committed tuples land. `XactBuffer::commit` calls
     /// `observer.on_tuple` per drained tuple; production wires this
-    /// to the same `MetricsTupleObserver` Phase 5 uses and Phase 7
-    /// will swap for the CH emitter observer.
+    /// to the same `MetricsTupleObserver` the metrics path uses and the
+    /// CH emitter observer in production.
     observer: O,
-    /// PHASE15 §6 schema-event consumer. Same `Arc<Mutex<…>>` as the
+    /// Schema-event consumer. Same `Arc<Mutex<…>>` as the
     /// one [`BufferingDecoderSink`] holds; this sink only drains it
     /// post-`sweep_dropped` to route `Dropped` events into the xact
     /// buffer.
     schema_events: Option<SchemaEventRx>,
-    /// PHASE15 §6 — DROP-only epoch counter (shared with
+    /// DROP-only epoch counter (shared with
     /// `ShadowCatalog::set_pg_class_delete_epoch` +
     /// `CatalogTracker::set_pg_class_delete_epoch`). Atomic-load on
     /// every commit boundary so the per-commit catalog-lock acquire
@@ -1297,7 +1297,7 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
         self
     }
 
-    /// PHASE15 §6 — share the catalog's schema-event receiver. The
+    /// Share the catalog's schema-event receiver. The
     /// sink runs [`ShadowCatalog::sweep_dropped`] at every commit
     /// boundary; the resulting `Dropped` events land in the channel
     /// and need to flow into the xact buffer keyed on the commit's
@@ -1308,7 +1308,7 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
         self
     }
 
-    /// PHASE15 §6 — install the DROP-only epoch counter. Pair with
+    /// Install the DROP-only epoch counter. Pair with
     /// [`crate::catalog_tracker::CatalogTracker::set_pg_class_delete_epoch`]
     /// and [`ShadowCatalog::set_pg_class_delete_epoch`]; the sink uses
     /// this counter to decide whether [`ShadowCatalog::sweep_dropped`]
@@ -1366,7 +1366,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
             match op {
                 XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
                     let payload = parse_xact_payload(info, &record.parsed.main_data);
-                    // PHASE15 §6 — poll-based DROP TABLE discovery at
+                    // Poll-based DROP TABLE discovery at
                     // the commit boundary. PG's system catalogs default
                     // to `relreplident = 'n'` so heap_delete WAL records
                     // don't carry the dying tuple's oid; the only safe
@@ -1465,7 +1465,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                     self.subxact_tracker.lock().await.forget_tree(xid);
                 }
                 XLOG_XACT_ASSIGNMENT => {
-                    // PHASE14 item 5. Record subxact → top edges so
+                    // Record subxact → top edges so
                     // eviction policy can fold sibling buffers under
                     // memory pressure. Correctness rides on the commit
                     // / abort record's authoritative subxact list, not
@@ -1475,8 +1475,8 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                     }
                 }
                 _ => {
-                    // XLOG_XACT_PREPARE / INVALIDATIONS: not Phase 6
-                    // territory. PREPARE without COMMIT PREPARED would
+                    // XLOG_XACT_PREPARE / INVALIDATIONS: not this
+                    // buffer's territory. PREPARE without COMMIT PREPARED would
                     // leave the xact stuck — defer 2PC proper handling
                     // to a follow-up, today the xact stays buffered
                     // until COMMIT_PREPARED lands.
@@ -1565,7 +1565,7 @@ pub struct BufferingDecoderSink {
     /// without locking. Mutations are `fetch_add(_, Relaxed)`; readers
     /// `.load(Relaxed)` at the use site.
     stats: Arc<DecoderStats>,
-    /// PHASE15 §1 — schema events the catalog emits at descriptor
+    /// Schema events the catalog emits at descriptor
     /// fetch time. Drained inline after every `relation_at` so events
     /// land in the same xact buffer keyed on the current record's
     /// xid + source_lsn. `None` keeps the sink schema-unaware
@@ -1586,8 +1586,8 @@ impl BufferingDecoderSink {
     /// Attach a [`SchemaEvent`] receiver. Wrap a freshly-subscribed
     /// [`tokio::sync::mpsc::UnboundedReceiver`] in a [`SchemaEventRx`]
     /// (`Arc<std::sync::Mutex<…>>`) so the same handle can also be
-    /// shared with [`XactRecordSink::with_schema_events`] — PHASE15 §6
-    /// drains the channel from both sides (decoder for Added/Changed
+    /// shared with [`XactRecordSink::with_schema_events`]: the channel
+    /// drains from both sides (decoder for Added/Changed
     /// events at fetch time, xact-record sink for Dropped events at
     /// commit time via [`ShadowCatalog::sweep_dropped`]).
     pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
@@ -1609,7 +1609,7 @@ impl BufferingDecoderSink {
         self.stats.clone()
     }
 
-    /// PHASE15 §1 — drain any [`SchemaEvent`]s the catalog accumulated
+    /// Drain any [`SchemaEvent`]s the catalog accumulated
     /// during the most recent fetch. Routes each into the xact buffer
     /// stamped with the current record's `(xid, source_lsn)` so the
     /// k-way drain in [`XactBuffer::commit`] sorts them with the heap
@@ -1680,7 +1680,7 @@ impl BufferingDecoderSink {
                     Err(e) => return Err(DecoderSinkError::from(e).into()),
                 }
             };
-            // PHASE15 §1 — TRUNCATE may trigger an Added/Changed event
+            // TRUNCATE may trigger an Added/Changed event
             // if the relation was rotated since last fetch. Drain the
             // channel inline so events land in the xact buffer.
             self.drain_schema_events(xid, source_lsn).await?;
@@ -1752,20 +1752,20 @@ impl RecordSink for BufferingDecoderSink {
                         return Ok(());
                     }
                     Err(e) => {
-                        // PHASE13 §6: ReplayTimeout used to absorb
+                        // ReplayTimeout used to absorb
                         // into stats.replay_timeout. Under streaming-
                         // fed shadow the gate clears in ms — a timeout
                         // means shadow stalled, the walsender wire
                         // froze, or walshadow backed up against
                         // socket buffers. Silent skip would shed
                         // user-heap writes invisibly. Poison the
-                        // stream so the daemon exits and phase 11
+                        // stream so the daemon exits and the
                         // cursor resumes on the next boot.
                         return Err(DecoderSinkError::from(e).into());
                     }
                 }
             };
-            // PHASE15 §1 — drain any schema events the catalog pushed
+            // Drain any schema events the catalog pushed
             // during the refetch (Added on first sight, Changed on
             // diff). Route into the xact buffer keyed on the current
             // record's xid so they drain in WAL order with the heap
@@ -1866,12 +1866,12 @@ fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<T
 
 #[cfg(test)]
 mod tests {
-    //! Phase 6 unit tests cover the catalog-free paths:
+    //! Unit tests cover the catalog-free paths:
     //! * On-heap / on-chunk absorption.
     //! * Abort cleanup (no detoast).
     //! * Largest-xact eviction (no detoast).
-    //! * `parse_xact_payload` shape coverage (PHASE14 item 5).
-    //! * `SubxactTracker` round-trip (PHASE14 item 5).
+    //! * `parse_xact_payload` shape coverage.
+    //! * `SubxactTracker` round-trip.
     //! * `XactBufferStats::summary` conditional rendering.
     //!
     //! Commit-drain + detoast + `XactRecordSink::commit` paths live in
@@ -1996,7 +1996,7 @@ mod tests {
         b.abort(2, 300, &[]).await.unwrap();
     }
 
-    /// Phase 11. `abort()` must bump `drain_lsn` and `emitter_ack_lsn`
+    /// `abort()` must bump `drain_lsn` and `emitter_ack_lsn`
     /// to the abort-record LSN so the cursor file (and the standby-
     /// status apply ceiling) cover aborted xacts as "fully consumed".
     /// Without this, an all-abort workload would never advance the slot.
@@ -2130,7 +2130,7 @@ mod tests {
         assert!(toast_chunk_from_decoded(d3, &rel).is_none());
     }
 
-    // ── PHASE14 item 5 ────────────────────────────────────────────────
+    // ── subxact tracking ──────────────────────────────────────────────
 
     #[test]
     fn subxact_tracker_round_trip() {

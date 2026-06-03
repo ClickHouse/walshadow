@@ -1,4 +1,4 @@
-//! Phase 5 — user-heap tuple decoder + Tier 1/2 type matrix.
+//! User-heap tuple decoder + Tier 1/2 type matrix.
 //!
 //! Walks `RM_HEAP_ID` / `RM_HEAP2_ID` records the filter classified as
 //! `User`, projects the WAL payload through a per-relation
@@ -6,7 +6,7 @@
 //! [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog), and emits a
 //! structured [`DecodedHeap`] per record. Tier 1 (fixed-width) + Tier 2
 //! (length-prefixed mechanical) types are decoded inline; Tier 3
-//! (`numeric`, `jsonb`, arrays, ...) is deferred to Phase 9.
+//! (`numeric`, `jsonb`, arrays, ...) is deferred to the Tier 3 codecs.
 //!
 //! ## WAL layout (PG `src/include/access/heapam_xlog.h`,
 //! `src/backend/access/heap/heapam.c::heap_xlog_*`)
@@ -41,9 +41,9 @@
 //!   the new tuple shares contiguous head/tail bytes with the old
 //!   tuple — see `heap_update` in heapam.c lines ≈ 8985 (prefix), 8997
 //!   (suffix). The "compressed away" bytes are *not* in WAL; reconstruction
-//!   needs the old tuple. Phase 5 marks those columns as
+//!   needs the old tuple. The decoder marks those columns as
 //!   [`None`] in [`DecodedTuple::columns`] and flips
-//!   [`DecodedTuple::partial`] = true; Phase 6's xact buffer can fill
+//!   [`DecodedTuple::partial`] = true; the xact buffer can fill
 //!   them from the previous tuple image.
 //!
 //! ## Replica-identity matrix
@@ -67,17 +67,17 @@
 //! are always present in `block.data`, even when an FPI replaces the
 //! page at recovery (`heap_xlog_insert` line ≈ 1130:
 //! `XLogReadBufferForRedoExtended` then `XLogRecGetBlockData`). So
-//! Phase 5 reads tuple bytes off `block.data` exclusively; the
-//! FPI-restore path lives in [`crate::fpi`] for the Phase-6 / BASEBACKUP
+//! The decoder reads tuple bytes off `block.data` exclusively; the
+//! FPI-restore path lives in [`crate::fpi`] for the xact-buffer / BASEBACKUP
 //! use cases.
 //!
 //! ## Roll-back ghost rows
 //!
-//! Phase 5 emits eagerly the moment the heap record arrives — no
+//! The decoder emits eagerly the moment the heap record arrives — no
 //! per-xact buffer, no `XLOG_XACT_ABORT` retraction. Aborted xacts
-//! produce ghost rows downstream; PLAN.md §Phase 5 "Rollback status,
-//! explicit" documents the limitation. The decoder is unaware of
-//! xact state; it stamps every output with `xid` so Phase 6's buffer
+//! produce ghost rows downstream; that rollback-status limitation is
+//! explicit and by design. The decoder is unaware of
+//! xact state; it stamps every output with `xid` so the xact buffer
 //! can key on it.
 
 use smallvec::{SmallVec, smallvec};
@@ -156,7 +156,7 @@ pub const TIMESTAMPTZOID: u32 = 1184;
 pub const TIMETZOID: u32 = 1266;
 pub const INTERVALOID: u32 = 1186;
 pub const UUIDOID: u32 = 2950;
-// Tier 3 type OIDs — Phase 9 codecs dispatch off these.
+// Tier 3 type OIDs — codecs dispatch off these.
 pub const NUMERICOID: u32 = 1700;
 pub const INETOID: u32 = 869;
 pub const CIDROID: u32 = 650;
@@ -181,10 +181,10 @@ pub enum DecodeError {
     BadPrefixSuffix { need: usize, have: usize },
 }
 
-/// Tier 1/2 decoded value space. One variant per type in PHASE5.md's
+/// Tier 1/2 decoded value space. One variant per type in the
 /// type matrix; everything else surfaces as
-/// [`ColumnValue::Unsupported`] (covers Tier 3 codecs PHASE 9 will
-/// ship) or [`ColumnValue::ExternalToast`] (Phase 6 will detoast).
+/// [`ColumnValue::Unsupported`] (covers Tier 3 codecs still to
+/// ship) or [`ColumnValue::ExternalToast`] (the xact buffer will detoast).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnValue {
     /// Explicit SQL NULL — bitmap bit clear.
@@ -228,21 +228,21 @@ pub enum ColumnValue {
     /// `text` / `varchar` / `bpchar` — varlena unwrapped + UTF-8 decode.
     /// Invalid UTF-8 surfaces as [`ColumnValue::Bytea`] with a stats counter.
     Text(String),
-    /// `numeric` — Phase 9. Rendered as its PG-text form for finite
+    /// `numeric` — Tier 3. Rendered as its PG-text form for finite
     /// values; NaN / Infinity carry their flag directly. Emitter
     /// downstream maps to CH `String` (precision is per-row in PG; no
     /// fixed CH `Decimal` type fits without operator config).
     Numeric(crate::codecs::NumericKind),
-    /// `inet` / `cidr` — Phase 9. Carries family/bits/cidr-flag/addr;
+    /// `inet` / `cidr` — Tier 3. Carries family/bits/cidr-flag/addr;
     /// emit via [`crate::codecs::InetValue::to_text`].
     Inet(crate::codecs::InetValue),
-    /// `interval` — Phase 9. 16-byte fixed-width tuple (months, days,
+    /// `interval` — Tier 3. 16-byte fixed-width tuple (months, days,
     /// micros).
     Interval(crate::codecs::IntervalValue),
-    /// `json` — Phase 9. Stored as varlena text directly on disk; we
+    /// `json` — Tier 3. Stored as varlena text directly on disk; we
     /// pass it through unchanged.
     Json(String),
-    /// Phase 9 deferred decode: the type isn't in walshadow's Tier 1/2
+    /// Deferred decode: the type isn't in walshadow's Tier 1/2
     /// matrix and isn't one of the locally-implemented Tier 3 hot types
     /// (numeric / inet / interval / json). Carries the raw on-disk
     /// body; resolution to text happens at emit time via a
@@ -254,11 +254,11 @@ pub enum ColumnValue {
         type_oid: u32,
         raw: Vec<u8>,
     },
-    /// On-disk TOAST pointer — Phase 6's TOAST reassembly will
+    /// On-disk TOAST pointer — the xact buffer's TOAST reassembly will
     /// dereference. Until then, callers see opaque metadata and can
     /// either skip or emit a placeholder downstream.
     ExternalToast(ToastPointer),
-    /// Type OID outside the Phase 5 matrix. Carries the raw bytes so
+    /// Type OID outside the decoder's matrix. Carries the raw bytes so
     /// downstream stages can either treat as opaque or punt.
     Unsupported {
         type_oid: u32,
@@ -296,7 +296,7 @@ pub enum HeapOp {
     /// `XLOG_HEAP_HOT_UPDATE` — emitted as a separate op because
     /// downstream may want to skip them entirely (HOT updates by
     /// definition touch no logged index; the visible row identity
-    /// is unchanged). PG distinction matters for Phase 9's index
+    /// is unchanged). PG distinction matters for the index
     /// drill but not for CH emission today.
     HotUpdate,
     Delete,
@@ -308,7 +308,7 @@ pub enum HeapOp {
     Truncate,
 }
 
-/// One drained tuple, fully reassembled. Phase 7's CH emitter consumes
+/// One drained tuple, fully reassembled. The CH emitter consumes
 /// this as `(rfn, xid, source_lsn, commit_ts, op, new, old)`. The
 /// `commit_ts` half is the commit-record `xact_time` carried through
 /// [`crate::xact_buffer::XactBuffer::commit`].
@@ -317,14 +317,14 @@ pub struct CommittedTuple {
     pub decoded: DecodedHeap,
     /// PG `TimestampTz` from the xact commit record (microseconds
     /// since PG epoch 2000-01-01). 0 when the upstream commit record
-    /// lacked the field or hasn't arrived yet (Phase 5 unbuffered
+    /// lacked the field or hasn't arrived yet (decoder unbuffered
     /// path).
     pub commit_ts: i64,
-    /// Phase 11. Source LSN of the matching `XLOG_XACT_COMMIT` record.
+    /// Source LSN of the matching `XLOG_XACT_COMMIT` record.
     /// The CH emitter snapshots this onto its ack-LSN gauge once the
     /// containing xact's `send_data(None)` finishes; the daemon's
     /// status loop writes the value into the cursor file's
-    /// `emitter_ack_lsn` slot. `0` for the Phase 5 unbuffered path.
+    /// `emitter_ack_lsn` slot. `0` for the decoder's unbuffered path.
     pub commit_lsn: u64,
 }
 
@@ -336,7 +336,7 @@ pub struct DecodedTuple {
     /// is explicit NULL (bitmap bit clear).
     pub columns: Vec<Option<ColumnValue>>,
     /// True iff at least one [`Some`] in `columns` was elided due to
-    /// PG's prefix/suffix compression. Downstream (Phase 6 xact
+    /// PG's prefix/suffix compression. Downstream (the xact
     /// buffer) can backfill from the previous tuple image.
     pub partial: bool,
 }
@@ -683,9 +683,9 @@ fn decode_old_tuple_from_main_data(
 /// `suffixlen` are PG's `XLH_UPDATE_*_FROM_OLD` byte counts: bytes
 /// Decode a tuple payload shaped like WAL `block.data` —
 /// `xl_heap_header (5)` followed by bitmap, padding, and column data
-/// starting at logical-tuple offset `t_hoff`. Used by Phase 12's
+/// starting at logical-tuple offset `t_hoff`. Used by the bootstrap
 /// page-walk sink which reshapes on-disk `HeapTupleHeaderData`-prefixed
-/// tuples into this form so the same Phase 5 decoder fields both.
+/// tuples into this form so the same heap decoder fields both.
 ///
 /// `prefixlen=suffixlen=0` because the WAL prefix/suffix-from-old
 /// compression doesn't apply at backup time.
@@ -813,7 +813,7 @@ fn decode_tuple_payload(
                 None => {
                     // Varlena in prefix: no way to advance cur without the
                     // bytes. Mark this and every subsequent column as
-                    // absent and bail out; Phase 6's buffer reconstructs.
+                    // absent and bail out; the xact buffer reconstructs.
                     columns.push(None);
                     for _ in (idx + 1)..attrs.len() {
                         columns.push(None);
@@ -1113,7 +1113,7 @@ fn consume_dropped(att: &RelAttr, buf: &[u8], abs: usize) -> Result<usize, Decod
 ///
 /// - `0bxxxxxx00` 4-byte length, uncompressed.
 /// - `0bxxxxxx10` 4-byte length, compressed in-line (we hand back as
-///   `Unsupported` for now — Phase 9 will detoast the in-line
+///   `Unsupported` for now — a later codec will detoast the in-line
 ///   compression with `pglz`/`lz4` once Tier-3 arrays need it; PG
 ///   `wal_compression` already covers FPI compression).
 /// - `0b00000001` TOAST pointer (`varattrib_1b_e`, 18 bytes on disk).
@@ -1228,8 +1228,8 @@ fn decode_varlena(
     }
     if compressed {
         // In-line compressed: 4-byte header + 4-byte va_tcinfo (extsize +
-        // method) + compressed body. Phase 5 surfaces opaque; Phase 9
-        // ships the pglz / lz4 unwrap.
+        // method) + compressed body. The decoder surfaces opaque; a
+        // later codec ships the pglz / lz4 unwrap.
         return Ok((
             ColumnValue::Unsupported {
                 type_oid: att.type_oid,
@@ -1251,7 +1251,7 @@ fn varlena_to_value(att: &RelAttr, body: &[u8], _short: bool) -> ColumnValue {
             // happen on disk, but surface as bytea rather than crashing.
             Err(_) => ColumnValue::Bytea(body.to_vec()),
         },
-        // Tier 3 hot types — local decoders (Phase 9).
+        // Tier 3 hot types — local decoders.
         NUMERICOID => match crate::codecs::decode_numeric(body) {
             Ok(v) => ColumnValue::Numeric(v),
             Err(_) => ColumnValue::Unsupported {
@@ -1286,7 +1286,7 @@ fn varlena_to_value(att: &RelAttr, body: &[u8], _short: bool) -> ColumnValue {
 /// (typlen=NAMEDATALEN=64, typbyval=false, typalign='c'). Decoded by
 /// the fixed-width path above; this helper handles the `typlen=-2`
 /// cstring variant (regtype, regclass typoutput intermediates) which
-/// is `\0`-terminated. None of the Phase 5 type matrix uses typlen=-2,
+/// is `\0`-terminated. None of the decoder's type matrix uses typlen=-2,
 /// but tracking it lets dropped cstring columns walk correctly.
 fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), DecodeError> {
     let mut end = abs;
@@ -1309,8 +1309,8 @@ fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Decode
 }
 
 /// True iff this column is part of the relation's replica identity
-/// (used by Phase 7 emitter to gate `_op=delete/update` propagation).
-/// Phase 5 ships the predicate here so downstream stages stay agnostic
+/// (used by the emitter to gate `_op=delete/update` propagation).
+/// The decoder ships the predicate here so downstream stages stay agnostic
 /// to the [`ReplIdent`] variants.
 pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
     match replident {
@@ -1678,7 +1678,7 @@ mod tests {
     #[test]
     fn decode_unsupported_type_emits_pending() {
         // Pick a varlena type OID that's outside walshadow's local
-        // matrix (jsonb = 3802). Post-Phase-9 the varlena fall-through
+        // matrix (jsonb = 3802). The varlena fall-through
         // produces a `PgPending` with raw bytes preserved — the
         // walshadow shadow extension resolves the text form at
         // emit time, falling back to `unsupported_values` when the

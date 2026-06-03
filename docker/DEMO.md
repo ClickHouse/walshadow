@@ -118,11 +118,12 @@ $dc exec clickhouse clickhouse-client --query \
     "SELECT id, email, _op, _lsn FROM demo.users FINAL ORDER BY id"
 ```
 
-Row 1's email updates; `_op` reads `update`. This is also what registers
-`demo.users`' current column layout with walshadow — it learns each
-table's shape from the change stream, so a baseline change must flow
-before a schema change reads as *column added* rather than *new table*
-(operator-pinned tables are assumed CH-managed on first sight).
+Row 1's email updates; `_op` reads `update` — CDC in flight. Pure
+demonstration now: walshadow seeds each pinned relation's column baseline
+at startup, so Beat 2's schema change replicates even if you skip this
+beat. (Pre-seed this row change was load-bearing — a pinned table needed
+one DML before an `ALTER` read as *column added* rather than *new table*,
+since operator-pinned tables are assumed CH-managed on first sight.)
 
 **Beat 2 — the schema evolves.** Add a column on the source and watch
 walshadow replicate the DDL to ClickHouse — no config edit, no restart:

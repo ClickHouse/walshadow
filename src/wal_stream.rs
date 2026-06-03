@@ -4,7 +4,7 @@
 //! (from wal-rs's `START_REPLICATION` CopyData stream) and dispatches
 //! to per-record + per-segment sinks at record cadence.
 //!
-//! ## Architecture (post PHASE13 §1)
+//! ## Architecture
 //!
 //! ```text
 //!   wal-rs CopyData('w') chunks
@@ -103,7 +103,7 @@ pub enum SinkError {
 
 /// Per-record hand-off carrying the parsed `XLogRecord`, where it sits
 /// in the source LSN stream, and the keep/drop decision the filter
-/// computed. Phase 5's heap-tuple decoder reads `parsed.header.xact_id`,
+/// computed. The heap-tuple decoder reads `parsed.header.xact_id`,
 /// `parsed.blocks[i].header.location.rel`, and `parsed.main_data`;
 /// `page_magic` selects PG-15-vs-PG-14 FPI bit semantics.
 ///
@@ -147,7 +147,7 @@ impl Record<'static> {
     }
 }
 
-/// Sink that observes every record decided by the filter. Phase 5's
+/// Sink that observes every record decided by the filter. The
 /// heap-tuple decoder attaches here.
 ///
 /// `record` carries a `'b` borrow back into the streaming walker's
@@ -203,7 +203,7 @@ pub trait RecordSink {
 
 /// Streaming sink for the post-filter WAL byte stream.
 ///
-/// PHASE13 §3 hooks [`crate::shadow_stream::ShadowStreamSink`] here:
+/// [`crate::shadow_stream::ShadowStreamSink`] hooks in here:
 /// the wire framer pushes these bytes onto every active shadow
 /// connection's `'w'` send buffer at record cadence so shadow's
 /// walreceiver replays a byte-exact stream (record bytes plus the
@@ -545,7 +545,7 @@ pub struct WalStream {
     relmap_at_segment_start: u64,
     pg_class_undecoded_at_segment_start: u64,
     pg_class_oid_in_prefix_at_segment_start: u64,
-    /// PHASE13 §3: byte stream destination for the shadow wire.
+    /// Byte stream destination for the shadow wire.
     /// Defaults to [`NoopBytesSink`]; production swaps in
     /// [`crate::shadow_stream::ShadowStreamSink`] via
     /// [`set_bytes_sink`](Self::set_bytes_sink).
@@ -925,7 +925,7 @@ impl WalStream {
             sink.on_partial_segment(seg, &filtered, &manifest).await?;
         }
         // Records we did NOT redrive on close, since per-record
-        // dispatch fires at push cadence in PHASE13+. Suppress unused
+        // dispatch fires at push cadence in the streaming path. Suppress unused
         // warning on record_sink to keep callers' shape unchanged.
         let _ = record_sink;
         Ok(())
@@ -1253,7 +1253,7 @@ mod tests {
         );
     }
 
-    /// PHASE13 §1 contract: a `RecordBytesSink` sees the full wire
+    /// Contract: a `RecordBytesSink` sees the full wire
     /// byte stream — every record byte image plus the page headers
     /// and inter-record padding between them. Total bytes dispatched
     /// (chunks + trailing) match seg_size exactly.

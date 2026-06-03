@@ -1,4 +1,4 @@
-//! PHASE13 §3 — streaming-fed shadow.
+//! Streaming-fed shadow.
 //!
 //! `ShadowStreamSink` composes alongside
 //! [`DirSegmentSink`](crate::wal_stream::DirSegmentSink) and

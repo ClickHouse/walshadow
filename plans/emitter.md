@@ -270,6 +270,34 @@ adds push new entry derived through `type_bridge::map`. Operator-pinned
 overrides survive: only `src_attnum`-matching entries the applicator
 could have produced get touched
 
+### Baseline seeding (the `Added`-vs-`Changed` discriminator)
+
+Whether a relation's first post-start descriptor fetch surfaces as
+`Added` or `Changed` keys on whether `ShadowCatalog::prev_known` already
+holds its oid. `prev_known` is the *baseline ledger* (last source shape
+CH and source agreed on), not the descriptor cache — cold at every boot,
+never reconstructed on a miss. Left cold, a pinned table that sees no DML
+before its first `ALTER` records the post-ALTER shape as `Added`, which
+`apply_added` skips for pinned dests (operator-managed CH) → CH stays a
+column behind.
+
+`ShadowCatalog::seed_baseline(qualified_names)` warms `prev_known` for
+every pinned relation before `subscribe()` so the cache never decides the
+branch: `bin/stream.rs` calls it after preflight / before
+`START_REPLICATION` over `cfg.tables.keys()` (the inproc harness mirrors
+it before its own `subscribe`). Pre-subscribe, `send_event` is a no-op,
+so seeding emits nothing and does zero CH work. The first post-boot
+`ALTER` then diffs the evolved descriptor against the seeded boot shape →
+`Changed` → the `apply_changed` path above runs the CH ALTER.
+
+Seeds the *full source* descriptor, never the mapping: a pinned subset's
+unmapped columns sit in the baseline and read as "operator-excluded", so
+a later `ALTER` adds only genuinely-new columns, never re-adds an
+excluded one. Auto-create tables need no seeding — their first-touch
+`Added` → `CREATE TABLE` already records a baseline. Open: boot-time
+drift (column added while the daemon is down folds silently into the
+seeded baseline) — see `plans/future/pinned_ddl_baseline.md` "Deferred".
+
 ### await_ready gate
 
 Coordination with INSERT pump is synchronous, not channel-based.

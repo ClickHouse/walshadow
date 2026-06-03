@@ -2,7 +2,7 @@
 //!
 //! Bootstrap rule: every rel_node < FirstNormalObjectId (16384) starts
 //! in the catalog set. Matches `classify::is_catalog_relnode` for parity
-//! with Phase 0.
+//! with the per-record classifier.
 //!
 //! Updates:
 //! * `RM_RELMAP_ID / XLOG_RELMAP_UPDATE` — authoritative for mapped
@@ -12,8 +12,8 @@
 //!   `src/backend/utils/cache/relmapper.c`). Each non-zero mapping
 //!   `(mapoid, mapfilenumber)` adds `mapfilenumber` to the catalog
 //!   set for that database (or the shared set if `dbid == 0`).
-//! * Heap writes to `pg_class` — decoded via [`pg_class_decoder`]
-//!   (PRE5 item 2). Carries new relfilenodes for non-mapped catalogs
+//! * Heap writes to `pg_class` — decoded via [`pg_class_decoder`].
+//!   Carries new relfilenodes for non-mapped catalogs
 //!   after `VACUUM FULL` / `REINDEX` / `CLUSTER`. Filters on
 //!   `oid < FirstNormalObjectId` so user-table inserts into pg_class
 //!   never pollute the catalog set.
@@ -75,7 +75,7 @@ pub struct CatalogTracker {
     /// invalidates its cache before the cache check. Senderless
     /// trackers leave this `None`.
     invalidation_epoch: Option<Arc<AtomicU64>>,
-    /// PHASE15 §6 — narrower signal: bumps ONLY on pg_class
+    /// Narrower signal: bumps ONLY on pg_class
     /// heap_delete records (the WAL shape that DROP TABLE writes).
     /// Lets [`ShadowCatalog::sweep_dropped`] throttle off this
     /// counter so non-drop DDL (ADD COLUMN, CREATE INDEX, ...) doesn't
@@ -138,7 +138,7 @@ impl CatalogTracker {
         self.invalidation_epoch = Some(epoch);
     }
 
-    /// PHASE15 §6 — attach the DROP-only counter. Bumped only on
+    /// Attach the DROP-only counter. Bumped only on
     /// pg_class `heap_delete` records (the DDL shape that flags an
     /// oid as gone). [`ShadowCatalog::sweep_dropped`] gates off this
     /// counter to skip per-commit shadow round-trips for non-drop
@@ -194,7 +194,7 @@ impl CatalogTracker {
             self.harvest_pg_class_blocks(record);
             return;
         }
-        // PHASE15 §6 — DROP TABLE writes `heap_delete` against
+        // DROP TABLE writes `heap_delete` against
         // pg_class, which the (insert/update-only) harvest path
         // skips. Bump the invalidation epoch anyway so the catalog
         // cache invalidates + downstream `sweep_dropped` runs on the
@@ -216,18 +216,23 @@ impl CatalogTracker {
     /// bumps the narrower `pg_class_delete_epoch` so the catalog's
     /// DROP-TABLE sweep can throttle off the delete-specific signal.
     fn signal_pg_class_touch(&mut self, record: &XLogRecord) {
-        let Some(blk) = record.blocks.first() else {
-            return;
-        };
-        let (db, rel) = (
-            blk.header.location.rel.db_node,
-            blk.header.location.rel.rel_node,
-        );
-        if !self.is_pg_class_relfilenode(db, rel) {
+        if self.pg_class_block(record).is_none() {
             return;
         }
         self.signal_invalidation();
         self.signal_pg_class_delete();
+    }
+
+    /// First block's `(db_node, rel_node)` when `record` targets the
+    /// current pg_class filenode; `None` for no-block records or writes
+    /// to other relations.
+    fn pg_class_block(&self, record: &XLogRecord) -> Option<(u32, u32)> {
+        let blk = record.blocks.first()?;
+        let (db, rel) = (
+            blk.header.location.rel.db_node,
+            blk.header.location.rel.rel_node,
+        );
+        self.is_pg_class_relfilenode(db, rel).then_some((db, rel))
     }
 
     /// Decode the new-tuple block (block 0) of `record` when it targets
@@ -237,16 +242,9 @@ impl CatalogTracker {
     /// `heap_update`'s block 1 "old page" reference) carry no tuple
     /// data and must not be fed to the decoder.
     fn harvest_pg_class_blocks(&mut self, record: &XLogRecord) {
-        let Some(blk) = record.blocks.first() else {
+        let Some((db, _rel)) = self.pg_class_block(record) else {
             return;
         };
-        let (db, rel) = (
-            blk.header.location.rel.db_node,
-            blk.header.location.rel.rel_node,
-        );
-        if !self.is_pg_class_relfilenode(db, rel) {
-            return;
-        }
         match decode_pg_class_tuple(record, 0) {
             DecodeOutcome::Decoded(row) => {
                 self.pg_class_writes_decoded += 1;

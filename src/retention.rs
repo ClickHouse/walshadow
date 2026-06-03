@@ -1,4 +1,4 @@
-//! Phase 10 — filtered segment retention.
+//! Filtered segment retention.
 //!
 //! Shadow PG's `restore_command` copies (not moves) every segment out
 //! of the filter's output directory; the originals accumulate forever.
@@ -13,7 +13,7 @@
 //! tuning the value can map "1h of WAL at 2 MB/s" → bytes once. Keeps
 //! the trimmer pure-LSN with no clock dependency.
 //!
-//! Auxiliary `.partial` files (Phase 4b crash residue) and
+//! Auxiliary `.partial` files (crash residue) and
 //! `*.manifest.json` sidecars are removed alongside their segment.
 //! Unknown files in the directory are left alone — the trimmer is
 //! conservative on purpose so a sibling system writing into the same

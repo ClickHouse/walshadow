@@ -19,7 +19,7 @@
 //!   duplicate. Accepted brief-duplicate window, see
 //!   [plans/bootstrap.md](../plans/bootstrap.md).
 //! - **TOAST-spilled columns surface as `ColumnValue::PgPending`.**
-//!   Inline-stored varlena columns decode through the Phase 5 type
+//!   Inline-stored varlena columns decode through the heap decoder's type
 //!   matrix; external TOAST chunks aren't reassembled here. The
 //!   chunk-and-assemble logic is WAL-shared work, not 2A-specific.
 //! - **`pg_toast_<relid>` tar entries are observed but not decoded.**
@@ -72,7 +72,7 @@ pub enum PageWalkError {
     },
 }
 
-/// One decoded tuple from a backup page. Mirrors the shape Phase 7's
+/// One decoded tuple from a backup page. Mirrors the shape the
 /// CH emitter consumes (a synthetic INSERT at `_lsn = start_lsn`).
 #[derive(Debug, Clone)]
 pub struct BackfillTuple {
@@ -242,7 +242,7 @@ impl<'a> PageWalker<'a> {
 }
 
 /// Decode one on-page tuple. The on-disk tuple shape carries a full
-/// `HeapTupleHeaderData` (23 bytes); the Phase 5 decoder consumes the
+/// `HeapTupleHeaderData` (23 bytes); the heap decoder consumes the
 /// `xl_heap_header` (5 bytes) shape PG strips into WAL via
 /// `XLogRegisterBufData(0, tup->t_data + SizeofHeapTupleHeader, ...)`.
 /// Reshape `HeapTupleHeaderData` → `xl_heap_header`-prefixed buffer,
@@ -512,73 +512,77 @@ impl BackupSink for PageWalkSink {
     }
 }
 
+/// Test fixture: a `public.t(id int4)` descriptor (rfn 1663/5/16400,
+/// oid 16400). Shared with `backfill_bootstrap`'s tests.
+#[cfg(test)]
+pub(crate) fn make_rel() -> RelDescriptor {
+    use crate::shadow_catalog::{RelAttr, ReplIdent};
+    RelDescriptor {
+        rfn: RelFileNode {
+            spc_node: 1663,
+            db_node: 5,
+            rel_node: 16400,
+        },
+        oid: 16400,
+        namespace_oid: 2200,
+        namespace_name: "public".into(),
+        name: "t".into(),
+        qualified_name: RelDescriptor::build_qualified_name("public", "t"),
+        kind: 'r',
+        persistence: 'p',
+        replident: ReplIdent::Default { pk_attnums: None },
+        attributes: vec![RelAttr {
+            attnum: 1,
+            name: "id".into(),
+            type_oid: crate::heap_decoder::INT4OID,
+            typmod: -1,
+            not_null: false,
+            dropped: false,
+            type_name: "int4".into(),
+            type_byval: true,
+            type_len: 4,
+            type_align: 'i',
+            type_storage: 'p',
+            missing_text: None,
+        }],
+    }
+}
+
+/// Test fixture: synthesise an 8 KiB heap page with one int4 tuple, laid
+/// out as PG would (PageHeaderData at 0, one ItemIdData slot at 24,
+/// tuple body at the upper end). Shared with `backfill_bootstrap`.
+#[cfg(test)]
+pub(crate) fn synth_single_tuple_page(value: i32) -> [u8; PAGE_BYTES] {
+    let mut page = [0u8; PAGE_BYTES];
+    // Tuple body: HeapTupleHeaderData (23) + 1 byte pad + 4-byte int
+    let tuple_off = PAGE_BYTES - 32;
+    // t_xmin = 99
+    page[tuple_off..tuple_off + 4].copy_from_slice(&99u32.to_le_bytes());
+    // t_infomask2 = 1 (natts = 1)
+    page[tuple_off + 18..tuple_off + 20].copy_from_slice(&1u16.to_le_bytes());
+    // t_infomask = 0
+    page[tuple_off + 20..tuple_off + 22].copy_from_slice(&0u16.to_le_bytes());
+    // t_hoff = 24 (MAXALIGN(8) past 23-byte header)
+    page[tuple_off + 22] = 24;
+    // column 1 (int4) at offset 24
+    page[tuple_off + 24..tuple_off + 28].copy_from_slice(&value.to_le_bytes());
+    let tuple_len = 28u16;
+    // Page header: pd_lower = 24 + 4 (one slot), pd_upper = tuple_off
+    page[12..14].copy_from_slice(&((SIZE_OF_PAGE_HEADER + 4) as u16).to_le_bytes());
+    page[14..16].copy_from_slice(&(tuple_off as u16).to_le_bytes());
+    // ItemIdData slot 0: lp_off (15) | lp_flags (2) | lp_len (15)
+    let raw = ((tuple_off as u32) & 0x7FFF)
+        | (((LP_NORMAL as u32) & 0x3) << 15)
+        | (((tuple_len as u32) & 0x7FFF) << 17);
+    page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + SIZE_OF_ITEM_ID]
+        .copy_from_slice(&raw.to_le_bytes());
+    page
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shadow_catalog::{RelAttr, ReplIdent};
     use std::path::PathBuf;
-
-    fn make_rel() -> RelDescriptor {
-        RelDescriptor {
-            rfn: RelFileNode {
-                spc_node: 1663,
-                db_node: 5,
-                rel_node: 16400,
-            },
-            oid: 16400,
-            namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name: "t".into(),
-            qualified_name: RelDescriptor::build_qualified_name("public", "t"),
-            kind: 'r',
-            persistence: 'p',
-            replident: ReplIdent::Default { pk_attnums: None },
-            attributes: vec![RelAttr {
-                attnum: 1,
-                name: "id".into(),
-                type_oid: crate::heap_decoder::INT4OID,
-                typmod: -1,
-                not_null: false,
-                dropped: false,
-                type_name: "int4".into(),
-                type_byval: true,
-                type_len: 4,
-                type_align: 'i',
-                type_storage: 'p',
-                missing_text: None,
-            }],
-        }
-    }
-
-    /// Synthesise an 8 KiB heap page with one int4 tuple. The page is
-    /// laid out as PG would lay it out: PageHeaderData at offset 0,
-    /// one ItemIdData slot at offset 24, tuple body at the upper end
-    /// of the page.
-    fn synth_single_tuple_page(value: i32) -> [u8; PAGE_BYTES] {
-        let mut page = [0u8; PAGE_BYTES];
-        // Tuple body: HeapTupleHeaderData (23) + 1 byte pad + 4-byte int
-        let tuple_off = PAGE_BYTES - 32;
-        // t_xmin = 99
-        page[tuple_off..tuple_off + 4].copy_from_slice(&99u32.to_le_bytes());
-        // t_infomask2 = 1 (natts = 1)
-        page[tuple_off + 18..tuple_off + 20].copy_from_slice(&1u16.to_le_bytes());
-        // t_infomask = 0
-        page[tuple_off + 20..tuple_off + 22].copy_from_slice(&0u16.to_le_bytes());
-        // t_hoff = 24 (MAXALIGN(8) past 23-byte header)
-        page[tuple_off + 22] = 24;
-        // column 1 (int4) at offset 24
-        page[tuple_off + 24..tuple_off + 28].copy_from_slice(&value.to_le_bytes());
-        let tuple_len = 28u16;
-        // Page header: pd_lower = 24 + 4 (one slot), pd_upper = tuple_off
-        page[12..14].copy_from_slice(&((SIZE_OF_PAGE_HEADER + 4) as u16).to_le_bytes());
-        page[14..16].copy_from_slice(&(tuple_off as u16).to_le_bytes());
-        // ItemIdData slot 0: lp_off (15) | lp_flags (2) | lp_len (15)
-        let raw = ((tuple_off as u32) & 0x7FFF)
-            | (((LP_NORMAL as u32) & 0x3) << 15)
-            | (((tuple_len as u32) & 0x7FFF) << 17);
-        page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + 4].copy_from_slice(&raw.to_le_bytes());
-        page
-    }
 
     #[test]
     fn page_walker_emits_single_tuple() {

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
-    CatalogError, ReplIdent, ShadowCatalog, ShadowCatalogConfig, socket_conninfo,
+    CatalogError, ReplIdent, SchemaEvent, ShadowCatalog, ShadowCatalogConfig, socket_conninfo,
     with_transient_retry,
 };
 
@@ -81,6 +81,14 @@ fn user_relation_filenode(shadow: &Shadow, qualified: &str) -> u32 {
         .expect("psql user filenode")
         .parse()
         .expect("filenode is integer")
+}
+
+fn relation_oid(shadow: &Shadow, qualified: &str) -> u32 {
+    shadow
+        .psql_one(&format!("SELECT '{qualified}'::regclass::oid::int8"))
+        .expect("psql relation oid")
+        .parse()
+        .expect("oid is integer")
 }
 
 fn current_db_oid(shadow: &Shadow) -> u32 {
@@ -478,6 +486,101 @@ async fn tracker_signal_drives_invalidate_and_refetches_after_ddl() {
         fresh.attributes.iter().any(|a| a.name == "extra"),
         "added column must appear in attributes",
     );
+}
+
+/// Baseline seed makes a pinned relation's first post-start ALTER emit
+/// `Changed`, not `Added`. The executable form of the invariant in
+/// `plans/future/pinned_ddl_baseline.md`: cache warmth must not decide
+/// the schema event. `seeded` is warmed by `seed_baseline` before
+/// `subscribe()`; `cold` is not. Both get the same ADD COLUMN; the
+/// seeded table surfaces a `Changed` (→ CH ALTER), the cold table a
+/// stale `Added` (→ apply_added skips a pinned dest — the bug).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seed_baseline_makes_first_alter_emit_changed_not_added() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, 55610);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    shadow
+        .apply_schema_dump(
+            "CREATE SCHEMA wc;\n\
+             CREATE TABLE wc.seeded (id bigint PRIMARY KEY, name text);\n\
+             CREATE TABLE wc.cold   (id bigint PRIMARY KEY, name text);\n",
+        )
+        .expect("schema dump");
+
+    let seeded_oid = relation_oid(&shadow, "wc.seeded");
+    let cold_oid = relation_oid(&shadow, "wc.cold");
+
+    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let epoch = Arc::new(AtomicU64::new(0));
+    cat.set_invalidation_epoch(epoch.clone());
+
+    // Warm prev_known for `wc.seeded` only. Pre-subscribe, so no event
+    // leaks; `wc.cold` stays cold.
+    let seeded = cat
+        .seed_baseline(&["wc.seeded".to_string()])
+        .await
+        .expect("seed_baseline");
+    assert_eq!(seeded, 1, "exactly one mapped relation seeded");
+
+    let mut rx = cat.subscribe();
+    assert!(
+        rx.try_recv().is_err(),
+        "seed ran before subscribe — no event must have leaked",
+    );
+
+    // Same DDL on both tables.
+    shadow
+        .apply_schema_dump(
+            "ALTER TABLE wc.seeded ADD COLUMN extra text;\n\
+             ALTER TABLE wc.cold   ADD COLUMN extra text;\n",
+        )
+        .expect("alter both");
+    // Production tracker bumps the epoch on observed pg_class writes;
+    // simulate one so the next lookup invalidates and refetches.
+    epoch.fetch_add(1, Ordering::Release);
+
+    // Seeded relation: refetch diffs the evolved shape against the warm
+    // baseline → Changed carrying the added column.
+    let _ = cat
+        .relation_by_oid(seeded_oid)
+        .await
+        .expect("refetch seeded");
+    match rx.try_recv().expect("seeded must emit one event") {
+        SchemaEvent::Changed { diff, .. } => {
+            assert!(
+                diff.added_columns.iter().any(|a| a.name == "extra"),
+                "Changed diff must carry the added column; got {diff:?}",
+            );
+        }
+        other => panic!("seeded: expected Changed, got {other:?}"),
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "seeded relation must emit exactly one event",
+    );
+
+    // Cold relation: first-ever fetch carries the post-ALTER shape and
+    // prev_known is empty → Added. This is the pre-fix behaviour the
+    // seed eliminates for pinned tables.
+    let _ = cat.relation_by_oid(cold_oid).await.expect("fetch cold");
+    match rx.try_recv().expect("cold must emit one event") {
+        SchemaEvent::Added { desc } => {
+            assert!(
+                desc.attributes.iter().any(|a| a.name == "extra"),
+                "cold Added carries the already-evolved shape",
+            );
+        }
+        other => panic!("cold: expected Added, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

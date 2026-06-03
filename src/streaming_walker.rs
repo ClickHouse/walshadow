@@ -628,19 +628,7 @@ mod tests {
     }
 
     fn build_single_page(body: &[u8], magic: u16, remaining_data_len: u32) -> Vec<u8> {
-        let mut page = Vec::with_capacity(PAGE_SIZE);
-        page.extend_from_slice(&magic.to_le_bytes());
-        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
-        page.extend_from_slice(&1u32.to_le_bytes());
-        page.extend_from_slice(&0u64.to_le_bytes());
-        page.extend_from_slice(&remaining_data_len.to_le_bytes());
-        page.extend_from_slice(&12345u64.to_le_bytes());
-        page.extend_from_slice(&(PG_SEG as u32).to_le_bytes());
-        page.extend_from_slice(&8192u32.to_le_bytes());
-        page.extend_from_slice(&[0u8; 4]);
-        page.extend_from_slice(body);
-        page.resize(PAGE_SIZE, 0);
-        page
+        build_long_header_page(body, magic, remaining_data_len, 0)
     }
 
     #[test]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Capture a WAL segment containing an XLOG_SWITCH record for the PRE5b10
-# item 6 fixture.
+# Capture a WAL segment containing an XLOG_SWITCH record for the
+# XLOG_SWITCH fixture.
 #
 # WALSHADOW_PG_IMAGE / WALSHADOW_USE_LOCAL behave as in
 # fixtures/wal/filter/capture.sh. Default: postgres:16 in docker.

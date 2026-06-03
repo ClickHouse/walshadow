@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(mani.records[0].kind, Kind::Kept);
     }
 
-    /// PRE5 item 4: `XLOG_SWITCH` (rmgr RM_XLOG, info 0x40) must pass
+    /// `XLOG_SWITCH` (rmgr RM_XLOG, info 0x40) must pass
     /// through the filter unchanged and re-parse cleanly. PG emits one
     /// at every `pg_switch_wal()` and at archive_timeout expirations;
     /// shadow's recovery state machine needs the byte sequence intact.

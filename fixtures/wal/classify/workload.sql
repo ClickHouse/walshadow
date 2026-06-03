@@ -1,4 +1,4 @@
--- Mixed DDL + DML workload for Phase 0 classifier fixture.
+-- Mixed DDL + DML workload for the classifier fixture.
 -- Goal: produce WAL with a representative spread across rmgrs & both
 -- catalog and user relfilenodes. Reproducible: deterministic SQL, no
 -- random clocks beyond the LSN/CRC churn already in WAL.

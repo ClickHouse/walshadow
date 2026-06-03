@@ -1,4 +1,4 @@
-//! Phase 9 — Tier 3 codecs: small fixed-layout types decoded locally.
+//! Tier 3 codecs: small fixed-layout types decoded locally.
 //!
 //! Hybrid scope:
 //!

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture a WAL segment for the Phase 1 filter fixture.
+# Capture a WAL segment for the filter fixture.
 #
 # Steady-state OLTP workload (no DDL inside timed window). Goal: drive
 # catalog fraction well under 1% so the round-trip test can assert

@@ -5,9 +5,9 @@
 //! catalogs unconditionally + mapped catalogs (pg_class, pg_attribute,
 //! pg_type, pg_proc, ...) only at their initial relfilenode. A subsequent
 //! VACUUM FULL on a mapped catalog rewrites it to a relfilenode >= 16384;
-//! Phase 1 will track RM_RELMAP_ID + heap writes to pg_class to keep the
+//! tracking RM_RELMAP_ID + heap writes to pg_class keeps the
 //! mapped-catalog set current. Until then the heuristic stays good enough
-//! for the Phase-0 goal: confirm catalog fraction is small.
+//! for the initial goal: confirm catalog fraction is small.
 //!
 //! Special rmgrs (XLOG / XACT / CLOG / MULTIXACT / STANDBY / RELMAP /
 //! COMMIT_TS / REPL_ORIGIN / DBASE / TBLSPC / SMGR) are always kept —
@@ -31,7 +31,7 @@ pub enum Class {
     /// Recovery plumbing rmgr (xlog control, xact status, etc.). Keep.
     Special,
     /// No block refs, non-special rmgr (e.g. some btree meta records).
-    /// Phase 1 will inspect main_data to bucket these; for now they
+    /// A later pass inspects main_data to bucket these; for now they
     /// neither keep nor drop, just count.
     Empty,
 }

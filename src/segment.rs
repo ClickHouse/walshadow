@@ -1,7 +1,7 @@
 //! Byte-positioned WAL segment walker.
 //!
 //! `WalParser` from wal-rs surfaces parsed `XLogRecord`s but discards
-//! where each record physically sat in the segment. The Phase 1 rewriter
+//! where each record physically sat in the segment. The rewriter
 //! needs that mapping so it can replace dropped records in place,
 //! preserving every other record's `xl_prev` chain.
 //!

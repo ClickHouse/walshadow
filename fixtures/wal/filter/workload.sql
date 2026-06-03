@@ -1,4 +1,4 @@
--- Steady-state OLTP workload for Phase 1 filter fixture.
+-- Steady-state OLTP workload for the filter fixture.
 -- Two phases separated by `pg_switch_wal()` so the captured segment
 -- contains only DML traffic (bootstrap DDL ends up in segment 1; the
 -- target capture is segment 2). Acceptance §1: catalog fraction well

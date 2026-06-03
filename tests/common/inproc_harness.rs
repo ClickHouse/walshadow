@@ -594,6 +594,20 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
         }
     }
 
+    // Seed the schema-diff baseline for mapped relations before any
+    // subscribe(), mirroring bin/stream.rs: warms prev_known so a pinned
+    // table's first post-start ALTER surfaces as Changed instead of the
+    // cold-prev_known Added that apply_added skips for pinned dests.
+    {
+        let names: Vec<String> = emitter_cfg.tables.keys().cloned().collect();
+        catalog
+            .lock()
+            .await
+            .seed_baseline(&names)
+            .await
+            .expect("seed schema-diff baseline");
+    }
+
     let tcp = TcpStream::connect(("127.0.0.1", ch_tcp_port)).expect("tcp connect ch");
     tcp.set_nodelay(true).ok();
     tcp.set_nonblocking(false)

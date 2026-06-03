@@ -1,4 +1,4 @@
-//! Phase 9 — differential decode oracle backed by shadow PG.
+//! Differential decode oracle backed by shadow PG.
 //!
 //! Two roles:
 //!

@@ -7,4 +7,4 @@ AS 'MODULE_PATHNAME', 'walshadow_decode_disk'
 LANGUAGE C STRICT IMMUTABLE;
 
 COMMENT ON FUNCTION walshadow_decode_disk(oid, bytea) IS
-  'Decode an on-disk Datum body via typoutput; used by walshadow''s Phase 9 decode bridge.';
+  'Decode an on-disk Datum body via typoutput; used by walshadow''s decode bridge.';

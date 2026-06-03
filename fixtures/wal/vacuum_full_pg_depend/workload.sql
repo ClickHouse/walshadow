@@ -1,4 +1,4 @@
--- VACUUM FULL pg_depend (non-mapped catalog) for PRE5b3 fixture.
+-- VACUUM FULL pg_depend (non-mapped catalog) fixture.
 --
 -- Goal: produce a WAL segment containing pg_class UPDATE records that
 -- PG prefix-compresses past the OID column. Decoder must signal

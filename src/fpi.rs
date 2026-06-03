@@ -1,7 +1,7 @@
 //! Reconstruct a full 8 KiB page from `XLogRecordBlock.image`. PG's
 //! recovery calls this `RestoreBlockImage`
 //! (src/backend/access/transam/xlogreader.c). walshadow mirrors that
-//! surface so Phase 5 / 6 decoders + BASEBACKUP.md path 1B+2A can
+//! surface so heap + xact-buffer decoders + BASEBACKUP.md path 1B+2A can
 //! consume FPIs produced under `wal_compression = pglz|lz4|zstd`
 
 use wal_rs::pg::walparser::{BLOCK_SIZE, FpiCompressionMethod, XLogRecordBlock};

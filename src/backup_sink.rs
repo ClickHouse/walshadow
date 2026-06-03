@@ -1,4 +1,4 @@
-//! Phase 12 — DiskLanderSink + MultiplexSink.
+//! DiskLanderSink + MultiplexSink.
 //!
 //! The two production-shape sinks composed by the bootstrap
 //! orchestrator. Page-walking sink lives in
