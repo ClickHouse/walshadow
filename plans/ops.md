@@ -70,8 +70,8 @@ Inventory by category:
 
 ### Counters
 
-- `walshadow_filter_records_total{rmgr,decision}` — labelled per
-  (rmgr name, "keep"|"drop")
+- `walshadow_filter_records_total{rmgr,route}` — labelled per
+  (rmgr name, "to_shadow"|"to_decoder")
 - `walshadow_xacts_{committed,aborted}_total`
 - `walshadow_decoder_{decoded,partial,toast_chunks,toast_malformed}_total`
 - `walshadow_emitter_{rows,blocks,xacts,unsupported_relations}_total`

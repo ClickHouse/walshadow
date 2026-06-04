@@ -1,7 +1,7 @@
 //! walshadow — schema-only Postgres + WAL replay catalog mirror for CDC.
 //!
 //! Per-record classifier (`classify`).
-//! WAL filter + CRC rewrite. Per-record keep/drop decision
+//! WAL filter + CRC rewrite. Per-record routing decision
 //! (`filter`), byte-positioned walker (private `segment` reachable only
 //! via `filter_segment`), in-place rewrite + CRC32C (`rewrite`), live
 //! catalog tracking (`catalog_tracker`), `main_data` reclassifier

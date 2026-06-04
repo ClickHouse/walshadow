@@ -30,7 +30,7 @@ struct RecordKey {
     info: u8,
     xact_id: u32,
     total_len: u32,
-    decision: walshadow::filter::Decision,
+    route: walshadow::filter::Route,
     page_magic: u16,
     block_locators: Vec<(u32, u32, u32)>,
 }
@@ -42,7 +42,7 @@ fn key(r: &Record) -> RecordKey {
         info: r.parsed.header.info,
         xact_id: r.parsed.header.xact_id,
         total_len: r.parsed.header.total_record_length,
-        decision: r.decision,
+        route: r.route,
         page_magic: r.page_magic,
         block_locators: r
             .parsed

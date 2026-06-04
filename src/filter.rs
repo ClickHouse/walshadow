@@ -1,16 +1,19 @@
-//! Per-record keep/drop decision used by the WAL rewriter.
+//! Per-record routing decision used by the WAL rewriter: where each
+//! record goes, not whether it survives.
 //!
 //! Wraps `classify` + `CatalogTracker` + `main_data` reclassifier into
 //! a stateful `Filter` that callers feed each record in source order.
 //!
-//! Decision policy:
-//! * `Special` rmgr → Keep (recovery plumbing shadow needs verbatim)
-//! * `Catalog` class → Keep
-//! * `User` class → Drop (XLOG_NOOP placeholder of same length)
+//! Route policy:
+//! * `Special` rmgr → ToShadow (recovery plumbing shadow needs verbatim)
+//! * `Catalog` class → ToShadow
+//! * `User` class → ToDecoder (XLOG_NOOP placeholder of same length on
+//!   the shadow stream; original bytes feed the heap decoder)
 //! * `Empty` class → reclassify via `main_data::relation_for_empty`,
 //!   re-checking against `CatalogTracker`. Unrecognised Empty records
-//!   default to Keep (correctness over efficiency: false-keeping a
-//!   non-catalog record is wasted bytes; false-dropping breaks shadow).
+//!   default to ToShadow (correctness over efficiency: false-routing a
+//!   non-catalog record to shadow is wasted bytes; wrongly suppressing
+//!   a catalog record breaks shadow).
 
 use serde::{Deserialize, Serialize};
 use wal_rs::pg::walparser::{XLogRecord, XLogRecordBlock};
@@ -22,10 +25,16 @@ use crate::main_data;
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
-pub enum Decision {
+pub enum Route {
+    /// Replay on shadow verbatim — catalog + recovery-plumbing records
+    /// shadow PG needs in its redo stream.
     #[default]
-    Keep,
-    Drop,
+    ToShadow,
+    /// Suppress on the shadow stream as an `XLOG_NOOP` of identical
+    /// length; the original bytes route to the heap decoder for CH
+    /// emission (heap rmgrs) or to nowhere (other user rmgrs, e.g.
+    /// user-index records, which are simply not replayed).
+    ToDecoder,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -56,9 +65,9 @@ impl FilterStats {
         }
     }
 
-    pub fn record(&mut self, class: Class, decision: Decision, bytes: u64) {
-        match decision {
-            Decision::Keep => {
+    pub fn record(&mut self, class: Class, route: Route, bytes: u64) {
+        match route {
+            Route::ToShadow => {
                 self.kept += 1;
                 self.kept_bytes += bytes;
                 match class {
@@ -68,7 +77,7 @@ impl FilterStats {
                     Class::Empty => self.kept_empty += 1,
                 }
             }
-            Decision::Drop => {
+            Route::ToDecoder => {
                 self.dropped += 1;
                 self.dropped_bytes += bytes;
             }
@@ -77,9 +86,9 @@ impl FilterStats {
 }
 
 /// Stateful filter. Updates the catalog tracker on every record then
-/// returns Keep/Drop based on the *post-update* catalog set so an
+/// returns the `Route` based on the *post-update* catalog set so an
 /// XLOG_RELMAP_UPDATE that introduces a new mapped-catalog filenumber
-/// can immediately keep subsequent records on that filenumber.
+/// can immediately route subsequent records on that filenumber to shadow.
 pub struct Filter {
     pub tracker: CatalogTracker,
     pub stats: FilterStats,
@@ -93,34 +102,34 @@ impl Filter {
         }
     }
 
-    pub fn decide(&mut self, record: &XLogRecord) -> Decision {
+    pub fn decide(&mut self, record: &XLogRecord) -> Route {
         self.tracker.observe(record);
         let class = classify(record);
-        let decision = match class {
-            Class::Special | Class::Catalog => Decision::Keep,
+        let route = match class {
+            Class::Special | Class::Catalog => Route::ToShadow,
             Class::User => {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
                     // classify under-counted because tracker has newer
                     // filenodes than the bootstrap rule knew about
-                    Decision::Keep
+                    Route::ToShadow
                 } else {
-                    Decision::Drop
+                    Route::ToDecoder
                 }
             }
             Class::Empty => match main_data::relation_for_empty(record) {
                 Some(rel) => {
                     if self.tracker.is_catalog(rel.db_node, rel.rel_node) {
-                        Decision::Keep
+                        Route::ToShadow
                     } else {
-                        Decision::Drop
+                        Route::ToDecoder
                     }
                 }
-                None => Decision::Keep, // safe default
+                None => Route::ToShadow, // safe default
             },
         };
         self.stats
-            .record(class, decision, record.header.total_record_length as u64);
-        decision
+            .record(class, route, record.header.total_record_length as u64);
+        route
     }
 
     /// Per-rmgr label string for diagnostics.
@@ -181,28 +190,28 @@ mod tests {
     fn catalog_record_is_kept() {
         let mut f = Filter::new();
         let r = rec(RmId::Heap, &[(5, 1259)]);
-        assert_eq!(f.decide(&r), Decision::Keep);
+        assert_eq!(f.decide(&r), Route::ToShadow);
     }
 
     #[test]
     fn user_record_is_dropped() {
         let mut f = Filter::new();
         let r = rec(RmId::Heap, &[(5, 20000)]);
-        assert_eq!(f.decide(&r), Decision::Drop);
+        assert_eq!(f.decide(&r), Route::ToDecoder);
     }
 
     #[test]
     fn special_rmgr_is_kept() {
         let mut f = Filter::new();
         let r = rec(RmId::Xact, &[]);
-        assert_eq!(f.decide(&r), Decision::Keep);
+        assert_eq!(f.decide(&r), Route::ToShadow);
     }
 
     #[test]
     fn empty_unknown_is_kept_safe_default() {
         let mut f = Filter::new();
         let r = rec(RmId::Heap, &[]);
-        assert_eq!(f.decide(&r), Decision::Keep);
+        assert_eq!(f.decide(&r), Route::ToShadow);
     }
 
     #[test]
@@ -211,7 +220,7 @@ mod tests {
         // Manually inject a learned mapping (pg_class on db 5 rewritten to 50000)
         f.tracker.add(5, 50000);
         let r = rec(RmId::Heap, &[(5, 50000)]);
-        assert_eq!(f.decide(&r), Decision::Keep);
+        assert_eq!(f.decide(&r), Route::ToShadow);
     }
 
     #[test]
@@ -247,9 +256,9 @@ mod tests {
         }
         let mut f = Filter::new();
         // catalog filenode (1259 = pg_class) → Keep
-        assert_eq!(f.decide(&new_cid_record(5, 1259)), Decision::Keep);
+        assert_eq!(f.decide(&new_cid_record(5, 1259)), Route::ToShadow);
         // user filenode → Drop
-        assert_eq!(f.decide(&new_cid_record(5, 20000)), Decision::Drop);
+        assert_eq!(f.decide(&new_cid_record(5, 20000)), Route::ToDecoder);
     }
 
     #[test]

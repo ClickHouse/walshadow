@@ -73,7 +73,7 @@ use tokio::sync::Mutex;
 use wal_rs::pg::walparser::RmId;
 
 use crate::decoder_sink::{DecoderSinkError, DecoderStats, TupleObserver};
-use crate::filter::Decision;
+use crate::filter::Route;
 use crate::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, HeapOp, ToastPointer, decode_heap_record,
 };
@@ -1234,7 +1234,7 @@ fn reassemble(
 
 /// `RecordSink` that observes `RM_XACT_ID` records and drives the
 /// buffer's commit/abort path. Separate from [`BufferingDecoderSink`]
-/// because xact records are `Decision::Keep` (shadow PG needs them
+/// because xact records are `Route::ToShadow` (shadow PG needs them
 /// for CLOG) so the decoder sink skips them by contract.
 pub struct XactRecordSink<O: TupleObserver + Send> {
     buffer: Arc<Mutex<XactBuffer>>,
@@ -1547,7 +1547,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
 /// (`rel.kind == 't'`) are reinterpreted as
 /// [`ToastChunk`](crate::spill::ToastChunk)s and parked under their
 /// `(toast_relid, value_id)` slot for drain-time reassembly. Only
-/// `Decision::Drop` records reach this sink (catalog-keep stays on
+/// `Route::ToDecoder` records reach this sink (catalog-keep stays on
 /// the shadow-replay path); semantic errors absorb into
 /// [`DecoderStats`] rather than poisoning the stream.
 /// Shared schema-event receiver — wraps the catalog's
@@ -1714,7 +1714,7 @@ impl RecordSink for BufferingDecoderSink {
     {
         Box::pin(async move {
             let rm = record.parsed.header.resource_manager_id;
-            // TRUNCATE rides Decision::Keep (filter leaves it intact so
+            // TRUNCATE rides Route::ToShadow (filter leaves it intact so
             // shadow can replay the truncate against its own copy), but
             // the decoder still needs to fan out per-relid HeapOp::Truncate
             // for CH emission. Handle before the Drop gate so the
@@ -1726,7 +1726,7 @@ impl RecordSink for BufferingDecoderSink {
                     return self.handle_truncate(record).await;
                 }
             }
-            if record.decision != Decision::Drop {
+            if record.route != Route::ToDecoder {
                 return Ok(());
             }
             if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
