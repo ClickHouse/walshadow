@@ -10,7 +10,8 @@
 //! Shadow PG lifecycle (`shadow`).
 //! Shadow PG catalog cache (`shadow_catalog`).
 //! pg_class heap-tuple decoder (`pg_class_decoder`), streaming
-//! filter event design (`wal_stream`).
+//! filter event design (`wal_stream`). Shared PG-15+ WAL page-header
+//! parse for both segment walkers (`wal_page`).
 //! User-heap tuple decoder + Tier 1/2 type matrix
 //! (`heap_decoder`).
 //! Per-xact + TOAST reassembly buffer (`xact_buffer`) backed
@@ -60,5 +61,6 @@ pub mod source_feed;
 pub mod spill;
 pub mod streaming_walker;
 pub mod type_bridge;
+pub mod wal_page;
 pub mod wal_stream;
 pub mod xact_buffer;

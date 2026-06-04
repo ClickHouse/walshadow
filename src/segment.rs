@@ -11,39 +11,16 @@
 //! page-header interruptions), `byte_ranges` is where to write it back.
 
 use smallvec::{SmallVec, smallvec};
-use thiserror::Error;
-use wal_rs::pg::walparser::{
-    WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER,
-    XLP_PAGE_MAGIC_PG15,
-};
+use wal_rs::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
+
+pub use crate::wal_page::WalkError;
+use crate::wal_page::{PAGE_SIZE, PageHeaderParse, align_up, parse_page_header};
 
 /// Inline-1 byte-range vector: records almost always live on one WAL
 /// page, multi-range only when a record straddles the page boundary.
 /// Allocated per walked record (millions per segment) so the inline
 /// case skips a `Vec` heap alloc on the hot path.
 pub type ByteRanges = SmallVec<[(usize, usize); 1]>;
-
-const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
-const SHORT_HEADER_SIZE: usize = 20;
-const LONG_HEADER_SIZE: usize = SHORT_HEADER_SIZE + 16;
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum WalkError {
-    #[error("page header at offset {0} has bad magic 0x{1:04x}")]
-    BadPageMagic(usize, u16),
-    #[error(
-        "page header at offset {0} has magic 0x{1:04x} (PG ≤ 14); walshadow requires PG 15+ (FPI bit layout)"
-    )]
-    UnsupportedSourceVersion(usize, u16),
-    #[error("page header at offset {0} declares invalid info flags 0x{1:04x}")]
-    BadPageInfo(usize, u16),
-    #[error("record at offset {offset} has zero xl_tot_len")]
-    ZeroRecord { offset: usize },
-    #[error("record at offset {offset} has xl_tot_len < {min}")]
-    ShortRecord { offset: usize, min: usize },
-    #[error("page at offset {0} ends mid-record but next page header missing")]
-    Truncated(usize),
-}
 
 /// One walked record's physical footprint in the segment.
 #[derive(Debug, Clone)]
@@ -121,42 +98,25 @@ impl<'a> SegmentWalker<'a> {
     }
 
     fn read_page_header(&mut self) -> Result<Option<()>, WalkError> {
-        if self.page_start + SHORT_HEADER_SIZE > self.bytes.len() {
-            self.done = true;
-            return Ok(None);
-        }
-        let buf = &self.bytes[self.page_start..];
-        let magic = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-        let info = u16::from_le_bytes(buf[2..4].try_into().unwrap());
-        if magic == 0 && info == 0 {
-            // Zero page = end of valid data
-            self.done = true;
-            return Ok(None);
-        }
-        if magic & 0xFF00 != 0xD100 {
-            return Err(WalkError::BadPageMagic(self.page_start, magic));
-        }
-        if magic < XLP_PAGE_MAGIC_PG15 {
-            return Err(WalkError::UnsupportedSourceVersion(self.page_start, magic));
-        }
-        // Validate flags
-        const XLP_ALL_FLAGS: u16 = 0x0007;
-        if info & !XLP_ALL_FLAGS != 0 {
-            return Err(WalkError::BadPageInfo(self.page_start, info));
-        }
-        let is_long = (info & XLP_LONG_HEADER) != 0;
-        let header_size = if is_long {
-            LONG_HEADER_SIZE
-        } else {
-            SHORT_HEADER_SIZE
-        };
-        if self.page_start + header_size > self.bytes.len() {
-            return Err(WalkError::Truncated(self.page_start));
-        }
-        let remaining_data_len = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+        let (magic, data_start, remaining_data_len) =
+            match parse_page_header(self.bytes, self.page_start)? {
+                // Short tail or zero page: clean end of valid data.
+                PageHeaderParse::ShortHeaderIncomplete | PageHeaderParse::ZeroPage => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                // Long header announced but bytes missing: corrupt segment.
+                PageHeaderParse::LongHeaderIncomplete => {
+                    return Err(WalkError::Truncated(self.page_start));
+                }
+                PageHeaderParse::Valid {
+                    magic,
+                    data_start,
+                    remaining_data_len,
+                } => (magic, data_start, remaining_data_len),
+            };
         self.page_magic = magic;
 
-        let data_start = self.page_start + align_up(header_size, X_LOG_RECORD_ALIGNMENT);
         let page_end = self.page_start + PAGE_SIZE;
         if data_start > self.bytes.len() {
             return Err(WalkError::Truncated(self.page_start));
@@ -338,14 +298,10 @@ impl<'a> Iterator for SegmentWalker<'a> {
     }
 }
 
-fn align_up(n: usize, align: usize) -> usize {
-    (n + align - 1) & !(align - 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::{RmId, WalParser};
+    use wal_rs::pg::walparser::{RmId, WalParser, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
 
     /// Build a page with `body` starting after a long header (40 byte
     /// prefix). Zero-pads to PAGE_SIZE.

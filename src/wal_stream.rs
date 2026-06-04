@@ -47,7 +47,7 @@ use crate::filter::{Decision, Filter, FilterStats};
 use crate::filter_segment::{FilterSegmentError, ParsedRecord, filter_segment};
 use crate::manifest::{Entry, FILTER_VERSION, Kind, Manifest, ManifestStats};
 use crate::rewrite::{RewriteError, noop_replace};
-use crate::streaming_walker::{CompletedRecord, StreamingWalkError, StreamingWalker};
+use crate::streaming_walker::{CompletedRecord, StreamingWalker, WalkError};
 
 /// Default PG WAL segment size — 16 MiB. walshadow assumes the
 /// upstream initdb default since every supported PG version starts
@@ -67,7 +67,7 @@ pub enum WalStreamError {
     Walk {
         seg: String,
         #[source]
-        source: StreamingWalkError,
+        source: WalkError,
     },
     #[error("parse record at offset {offset}: {source}")]
     Parse {

@@ -23,31 +23,11 @@
 //! aligned by construction.
 
 use smallvec::smallvec;
-use thiserror::Error;
-use wal_rs::pg::walparser::{
-    WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER,
-    XLP_PAGE_MAGIC_PG15,
-};
+use wal_rs::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 
 use crate::segment::ByteRanges;
-
-const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
-const SHORT_HEADER_SIZE: usize = 20;
-const LONG_HEADER_SIZE: usize = SHORT_HEADER_SIZE + 16;
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum StreamingWalkError {
-    #[error("page header at offset {0} has bad magic 0x{1:04x}")]
-    BadPageMagic(usize, u16),
-    #[error("page header at offset {0} has magic 0x{1:04x} (PG ≤ 14); walshadow requires PG 15+")]
-    UnsupportedSourceVersion(usize, u16),
-    #[error("page header at offset {0} declares invalid info flags 0x{1:04x}")]
-    BadPageInfo(usize, u16),
-    #[error("record at offset {offset} has zero xl_tot_len")]
-    ZeroRecord { offset: usize },
-    #[error("record at offset {offset} has xl_tot_len < {min}")]
-    ShortRecord { offset: usize, min: usize },
-}
+pub use crate::wal_page::WalkError;
+use crate::wal_page::{PAGE_SIZE, PageHeaderParse, align_up, parse_page_header};
 
 /// One completed record's physical footprint within the current segment.
 ///
@@ -169,10 +149,6 @@ pub struct StreamingWalker {
     /// Cursor within the page once continuation bytes have been
     /// consumed; tracks where the next record header can begin.
     page_cursor: usize,
-    /// Did we already attempt to consume continuation from the current
-    /// page? Drives idempotency across [`try_next`] calls when bytes
-    /// arrive in mid-page chunks.
-    page_header_consumed: bool,
     pending: Option<Pending>,
     /// Set when a zero-padded page or zero-tail record marks
     /// end-of-valid-data in the current segment.
@@ -191,7 +167,6 @@ impl StreamingWalker {
             page_magic: 0,
             page_data_start: 0,
             page_cursor: 0,
-            page_header_consumed: false,
             pending: None,
             done_in_segment: false,
         }
@@ -260,8 +235,8 @@ impl StreamingWalker {
             self.page_start -= n;
             self.page_data_start = self.page_data_start.saturating_sub(n);
             self.page_cursor = self.page_cursor.saturating_sub(n);
-            // page_magic + page_header_consumed describe the page at
-            // page_start, stay valid post-shift.
+            // page_magic describes the page at page_start, stays valid
+            // post-shift.
         } else {
             // Walker still parking on seg 0 (zero-pad tail or hadn't
             // seen seg-1 bytes yet). Restart parse from new buf[0] so
@@ -270,7 +245,6 @@ impl StreamingWalker {
             self.page_magic = 0;
             self.page_data_start = 0;
             self.page_cursor = 0;
-            self.page_header_consumed = false;
         }
         self.cursor = self.cursor.saturating_sub(n);
         self.done_in_segment = false;
@@ -302,7 +276,6 @@ impl StreamingWalker {
         self.page_magic = 0;
         self.page_data_start = 0;
         self.page_cursor = 0;
-        self.page_header_consumed = false;
         self.pending = None;
         self.done_in_segment = false;
     }
@@ -316,7 +289,7 @@ impl StreamingWalker {
     /// — the caller reads bytes via [`CompletedRecord::logical_bytes`]
     /// straight off [`buffer`](Self::buffer), no per-record alloc.
     /// Cross-page records carry an owned stitched Vec.
-    pub fn try_next(&mut self) -> Option<Result<CompletedRecord, StreamingWalkError>> {
+    pub fn try_next(&mut self) -> Option<Result<CompletedRecord, WalkError>> {
         if self.done_in_segment {
             return None;
         }
@@ -433,45 +406,26 @@ impl StreamingWalker {
     /// Parse the page header at `self.page_start`. Returns
     /// `Ok(true)` on success, `Ok(false)` when the buffer lacks the
     /// header bytes yet, `Err` on a malformed header.
-    fn try_read_page_header(&mut self) -> Result<bool, StreamingWalkError> {
-        if self.buf.len() < self.page_start + SHORT_HEADER_SIZE {
-            return Ok(false);
-        }
-        let buf = &self.buf[self.page_start..];
-        let magic = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-        let info = u16::from_le_bytes(buf[2..4].try_into().unwrap());
-        if magic == 0 && info == 0 {
-            self.done_in_segment = true;
-            return Ok(true);
-        }
-        if magic & 0xFF00 != 0xD100 {
-            return Err(StreamingWalkError::BadPageMagic(self.page_start, magic));
-        }
-        if magic < XLP_PAGE_MAGIC_PG15 {
-            return Err(StreamingWalkError::UnsupportedSourceVersion(
-                self.page_start,
-                magic,
-            ));
-        }
-        const XLP_ALL_FLAGS: u16 = 0x0007;
-        if info & !XLP_ALL_FLAGS != 0 {
-            return Err(StreamingWalkError::BadPageInfo(self.page_start, info));
-        }
-        let is_long = (info & XLP_LONG_HEADER) != 0;
-        let header_size = if is_long {
-            LONG_HEADER_SIZE
-        } else {
-            SHORT_HEADER_SIZE
-        };
-        if self.buf.len() < self.page_start + header_size {
-            return Ok(false);
-        }
-        let remaining_data_len = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+    fn try_read_page_header(&mut self) -> Result<bool, WalkError> {
+        let (magic, data_start, remaining_data_len) =
+            match parse_page_header(&self.buf, self.page_start)? {
+                // Header bytes haven't all arrived yet: wait for more.
+                PageHeaderParse::ShortHeaderIncomplete | PageHeaderParse::LongHeaderIncomplete => {
+                    return Ok(false);
+                }
+                PageHeaderParse::ZeroPage => {
+                    self.done_in_segment = true;
+                    return Ok(true);
+                }
+                PageHeaderParse::Valid {
+                    magic,
+                    data_start,
+                    remaining_data_len,
+                } => (magic, data_start, remaining_data_len),
+            };
         self.page_magic = magic;
-        let data_start = self.page_start + align_up(header_size, X_LOG_RECORD_ALIGNMENT);
         self.page_data_start = data_start;
         self.page_cursor = data_start;
-        self.page_header_consumed = false;
 
         // If no pending record is being stitched, a non-zero
         // remaining_data_len means continuation from a record we
@@ -490,7 +444,7 @@ impl StreamingWalker {
     /// Read one record at `self.page_cursor` if enough bytes are in
     /// the buffer. Returns `Ok(None)` if more bytes are needed or the
     /// page boundary was hit before a record landed.
-    fn try_read_record(&mut self) -> Result<Option<CompletedRecord>, StreamingWalkError> {
+    fn try_read_record(&mut self) -> Result<Option<CompletedRecord>, WalkError> {
         let page_end = self.page_start + PAGE_SIZE;
         // Skip record-alignment pad.
         self.page_cursor = align_up(self.page_cursor, X_LOG_RECORD_ALIGNMENT);
@@ -551,13 +505,13 @@ impl StreamingWalker {
                 self.done_in_segment = true;
                 return Ok(None);
             }
-            return Err(StreamingWalkError::ZeroRecord {
+            return Err(WalkError::ZeroRecord {
                 offset: self.page_cursor,
             });
         }
         let total = xl_tot_len as usize;
         if total < X_LOG_RECORD_HEADER_SIZE {
-            return Err(StreamingWalkError::ShortRecord {
+            return Err(WalkError::ShortRecord {
                 offset: self.page_cursor,
                 min: X_LOG_RECORD_HEADER_SIZE,
             });
@@ -599,18 +553,13 @@ impl StreamingWalker {
         self.page_magic = 0;
         self.page_data_start = 0;
         self.page_cursor = self.page_start;
-        self.page_header_consumed = false;
     }
-}
-
-fn align_up(n: usize, align: usize) -> usize {
-    (n + align - 1) & !(align - 1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::RmId;
+    use wal_rs::pg::walparser::{RmId, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
 
     const PG_SEG: usize = 16 * 1024 * 1024;
 
@@ -772,7 +721,7 @@ mod tests {
         page[2] = 1;
         walker.extend(&page);
         let e = walker.try_next().unwrap().unwrap_err();
-        assert!(matches!(e, StreamingWalkError::BadPageMagic(_, _)));
+        assert!(matches!(e, WalkError::BadPageMagic(_, _)));
         // After error walker stays done.
         assert!(walker.try_next().is_none());
     }
@@ -784,10 +733,7 @@ mod tests {
         let mut walker = StreamingWalker::new(PAGE_SIZE);
         walker.extend(&page);
         let e = walker.try_next().unwrap().unwrap_err();
-        assert!(matches!(
-            e,
-            StreamingWalkError::UnsupportedSourceVersion(_, 0xD10D)
-        ));
+        assert!(matches!(e, WalkError::UnsupportedSourceVersion(_, 0xD10D)));
     }
 
     #[test]
