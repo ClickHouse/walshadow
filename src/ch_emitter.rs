@@ -2078,6 +2078,42 @@ mod tests {
         assert_eq!(idle_ceiling(false, 500, 300), 300);
     }
 
+    #[test]
+    fn decimal_type_error_wraps_message_in_type_variant() {
+        match decimal_type_error("scale out of range") {
+            EmitterError::Type(msg) => assert_eq!(msg, "scale out of range"),
+            other => panic!("expected Type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_retryable_only_for_transport_and_server_faults() {
+        // Transport / server faults: the stream loop should reconnect+retry.
+        assert!(is_retryable(&EmitterError::Io(std::io::Error::other(
+            "reset"
+        ))));
+        assert!(is_retryable(&EmitterError::ServerException {
+            code: 241,
+            message: "MEMORY_LIMIT_EXCEEDED".into(),
+        }));
+        // Semantic / config faults are terminal — retrying repeats them.
+        assert!(!is_retryable(&EmitterError::Type("bad decimal".into())));
+        assert!(!is_retryable(&EmitterError::Config("missing host".into())));
+        assert!(!is_retryable(&EmitterError::NoTableMapping(
+            "public.t".into()
+        )));
+        assert!(!is_retryable(&EmitterError::CompressionUnsupported("zstd")));
+    }
+
+    #[test]
+    fn emitter_error_converts_into_decoder_observer_error() {
+        let d: DecoderSinkError = EmitterError::Type("nope".into()).into();
+        match d {
+            DecoderSinkError::Observer(msg) => assert!(msg.contains("nope"), "{msg}"),
+            other => panic!("expected Observer, got {other:?}"),
+        }
+    }
+
     fn mk_mapping() -> TableMapping {
         TableMapping {
             target: "default.foo".into(),

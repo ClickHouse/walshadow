@@ -595,6 +595,12 @@ mod tests {
     }
 
     #[test]
+    fn seg_size_reports_construction_value() {
+        let w = StreamingWalker::new(PG_SEG);
+        assert_eq!(w.seg_size(), PG_SEG);
+    }
+
+    #[test]
     fn yields_single_in_page_record_as_bytes_arrive() {
         let mut body = header_le(50);
         body.extend_from_slice(&[0u8; 26]);

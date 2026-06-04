@@ -352,6 +352,28 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Fail on any 0%-coverage file
+        working-directory: walshadow
+        run: |
+          zero=$(awk '
+            /^SF:/ { f = substr($0, 4) }
+            /^LF:/ { lf = substr($0, 4) + 0 }
+            /^LH:/ {
+              if (substr($0, 4) + 0 == 0 && lf > 0) {
+                i = index(f, "/src/"); if (i) f = substr(f, i + 1)
+                print f
+              }
+            }
+          ' lcov.info)
+          if [ -n "$zero" ]; then
+            count=$(printf '%s\n' "$zero" | grep -c .)
+            echo "Files with 0% line coverage (every source file must be exercised by a test):"
+            printf '%s\n' "$zero" | sed 's/^/  /'
+            echo "::error::${count} file(s) have 0% line coverage"
+            exit 1
+          fi
+          echo "OK: all instrumented files have >0% line coverage."
+
       - name: ClickHouse server logs on failure
         if: failure()
         run: sudo tail -n 500 /var/log/clickhouse-server/clickhouse-server.err.log || true

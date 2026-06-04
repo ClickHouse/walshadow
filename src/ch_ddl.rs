@@ -657,6 +657,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn with_drop_strategy_overrides_global_default() {
+        use std::collections::HashMap;
+        let cfg = DdlConfig {
+            drop_table_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            target_database: "default".into(),
+            namespaces: HashMap::new(),
+        };
+        assert_eq!(cfg.drop_table_strategy, DropTableStrategy::Retain);
+        let cfg = cfg.with_drop_strategy(DropTableStrategy::Drop);
+        assert_eq!(cfg.drop_table_strategy, DropTableStrategy::Drop);
+        // Global override now drives the per-namespace fallback.
+        assert_eq!(
+            cfg.drop_strategy_for("unconfigured"),
+            DropTableStrategy::Drop
+        );
+    }
+
     fn att(attnum: i16, name: &str, oid: u32, not_null: bool, missing: Option<&str>) -> RelAttr {
         RelAttr {
             attnum,
