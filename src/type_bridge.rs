@@ -402,6 +402,47 @@ mod tests {
     }
 
     #[test]
+    fn render_pg_time_matches_typoutput() {
+        let cases = [
+            (0i64, "00:00:00"),
+            (3_661_000_000, "01:01:01"),
+            (3_661_000_001, "01:01:01.000001"),
+            (86_399_999_999, "23:59:59.999999"),
+            // Negative micros wrap into the day via rem_euclid.
+            (-1, "23:59:59.999999"),
+        ];
+        for (micros, expected) in cases {
+            assert_eq!(render_pg_time(micros), expected, "micros={micros}");
+        }
+    }
+
+    #[test]
+    fn render_pg_timetz_applies_pg_sign_convention() {
+        // tz_seconds is west-positive; the displayed offset is its negation.
+        let cases = [
+            (0i64, 0i32, "00:00:00+00"),
+            (0, -3_600, "00:00:00+01"),    // UTC+1
+            (0, 19_800, "00:00:00-05:30"), // UTC-5:30
+            (3_661_500_000, -19_800, "01:01:01.500000+05:30"),
+        ];
+        for (micros, tz, expected) in cases {
+            assert_eq!(
+                render_pg_timetz(micros, tz),
+                expected,
+                "micros={micros} tz={tz}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_pg_timestamp_normal_and_out_of_range_fallback() {
+        // pg_micros=0 is the PG epoch (2000-01-01).
+        assert_eq!(render_pg_timestamp(0), "2000-01-01 00:00:00");
+        // i64::MAX overflows chrono's representable range → epoch fallback.
+        assert_eq!(render_pg_timestamp(i64::MAX), "1970-01-01 00:00:00");
+    }
+
+    #[test]
     fn int_types_map_to_signed_ch() {
         assert_eq!(
             base_type_for(&attr(INT2OID, -1, true, None)).unwrap(),

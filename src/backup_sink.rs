@@ -516,4 +516,46 @@ mod tests {
         assert_eq!(lander.stats.skipped_user_heap, 0);
         assert_eq!(lander.stats.skipped_denylist, 1);
     }
+
+    #[test]
+    fn catalog_filenodes_len_and_is_empty() {
+        let mut c = CatalogFilenodes::new();
+        assert!(c.is_empty());
+        assert_eq!(c.len(), 0);
+        c.insert(5, 50000);
+        c.insert(0, 99999);
+        assert!(!c.is_empty());
+        assert_eq!(c.len(), 2);
+        // HashSet semantics: re-inserting an existing pair is a no-op.
+        c.insert(5, 50000);
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn multiplex_lander_stats_exposes_disk_counters() {
+        let lander = DiskLanderSink::new(CatalogFilenodes::new());
+        let mut mux = MultiplexSink::new(lander, CountingTap::default());
+        // catalog file → Keep → kept_files
+        let m = FileMeta {
+            path: PathBuf::from("base/5/1259"),
+            size: 0,
+            mode: 0,
+            kind: FileKind::File,
+        };
+        assert_eq!(mux.begin(&m).unwrap(), FileAction::Keep);
+        mux.end().unwrap();
+        // denylist file → Skip → skipped_denylist
+        let m = FileMeta {
+            path: PathBuf::from("pg_replslot/0/state"),
+            size: 0,
+            mode: 0,
+            kind: FileKind::File,
+        };
+        assert_eq!(mux.begin(&m).unwrap(), FileAction::Skip);
+        mux.end().unwrap();
+
+        let stats = mux.lander_stats();
+        assert_eq!(stats.kept_files, 1);
+        assert_eq!(stats.skipped_denylist, 1);
+    }
 }

@@ -1912,6 +1912,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inflight_snapshot_empty_when_nothing_buffered() {
+        let tmp = tempdir().unwrap();
+        let b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        assert!(b.inflight_snapshot().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inflight_snapshot_reports_single_parked_xid() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        b.on_heap(heap_with_value(7, 100, 16)).await.unwrap();
+        let snap = b.inflight_snapshot();
+        assert_eq!(snap.len(), 1);
+        let e = &snap[0];
+        assert_eq!(e.xid, 7);
+        assert_eq!(e.first_lsn, 100);
+        assert_eq!(e.last_lsn, 100);
+        assert_eq!(e.heap_count, 1);
+        assert_eq!(e.chunk_count, 0);
+        assert!(e.in_mem_bytes > 0);
+        assert!(
+            !e.spilled,
+            "16-byte tuple stays in memory under the 1 KiB cap"
+        );
+        // db_node/rel_node from heap_with_value's RelFileNode.
+        assert_eq!(e.rels, "5/16385");
+    }
+
+    #[test]
+    fn xact_buffer_error_converts_to_sink_and_decoder_errors() {
+        let s: SinkError = XactBufferError::Observer("boom".into()).into();
+        match s {
+            SinkError::Other(msg) => assert!(msg.contains("boom"), "{msg}"),
+            other => panic!("expected SinkError::Other, got {other:?}"),
+        }
+        let d: DecoderSinkError = XactBufferError::Observer("boom".into()).into();
+        match d {
+            DecoderSinkError::Observer(msg) => assert!(msg.contains("boom"), "{msg}"),
+            other => panic!("expected DecoderSinkError::Observer, got {other:?}"),
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn abort_drops_xact_and_unlinks_spill() {
         let tmp = tempdir().unwrap();

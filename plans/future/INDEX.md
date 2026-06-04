@@ -11,5 +11,6 @@ here as they surface; promote into `plans/` when they land
 * [two_phase_commit.md](two_phase_commit.md) — `XLOG_XACT_PREPARE` handling and gxid-keyed buffer
 * [ch_bounce_recovery.md](ch_bounce_recovery.md) — deeper re-emit-from-spill on retry-budget exhaustion
 * [pinned_ddl_baseline.md](pinned_ddl_baseline.md) — schema-event outcome must be a function of config + baseline, not cache warmth; seed baseline at start, plus CH-existence / persisted-baseline options for cross-restart consistency
+* [coverage100.md](coverage100.md) — drive `cargo llvm-cov` line coverage toward 100%: tiered work list (pure units → fixtures → live e2e → hard tail)
 * [risks.md](risks.md) — measurement-deferred risks and open questions
 * [parked.md](parked.md) — small operational polish + cross-major fixtures + skipped-test drive

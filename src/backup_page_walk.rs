@@ -585,6 +585,19 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn source_lsn_reflects_start_info() {
+        let mut sink = PageWalkSink::new_capturing(CatalogMap::new());
+        assert_eq!(sink.source_lsn(), 0);
+        sink.start(&StartInfo {
+            start_lsn: 0xABCD_1234,
+            timeline: 1,
+            tablespaces: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(sink.source_lsn(), 0xABCD_1234);
+    }
+
+    #[test]
     fn page_walker_emits_single_tuple() {
         let rel = make_rel();
         let walker = PageWalker::new(&rel, 0xABCD);

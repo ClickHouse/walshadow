@@ -1422,6 +1422,40 @@ mod tests {
     }
 
     #[test]
+    fn decode_cstring_text_bytea_and_truncated() {
+        // Valid UTF-8 → Text, consumes through the trailing NUL.
+        let (v, n) = decode_cstring(b"hello\0", 0).unwrap();
+        assert_eq!(v, ColumnValue::Text("hello".into()));
+        assert_eq!(n, 6);
+        // Non-UTF-8 body → Bytea.
+        let (v, n) = decode_cstring(&[0xFF, 0xFE, 0x00], 0).unwrap();
+        assert_eq!(v, ColumnValue::Bytea(vec![0xFF, 0xFE]));
+        assert_eq!(n, 3);
+        // Decode from a non-zero offset within a multi-string buffer.
+        let (v, n) = decode_cstring(b"ab\0cd\0", 3).unwrap();
+        assert_eq!(v, ColumnValue::Text("cd".into()));
+        assert_eq!(n, 3);
+        // No terminator before buffer end → Truncated.
+        match decode_cstring(b"hello", 0) {
+            Err(DecodeError::Truncated { offset, need, have }) => {
+                assert_eq!((offset, need, have), (0, 1, 0));
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_one_value_maps_char_to_signed_i8() {
+        let att = rel_attr(1, "c", CHAROID, 1, 'c');
+        let (v, n) = decode_one_value(&att, &[65u8], 0).unwrap();
+        assert_eq!(v, ColumnValue::Char(65));
+        assert_eq!(n, 1);
+        // 0xFF round-trips through i8 as -1.
+        let (v, _) = decode_one_value(&att, &[0xFFu8], 0).unwrap();
+        assert_eq!(v, ColumnValue::Char(-1));
+    }
+
+    #[test]
     fn decode_insert_int4_int8() {
         let rel = descriptor(
             16385,

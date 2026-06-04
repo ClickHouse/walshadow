@@ -469,4 +469,34 @@ mod tests {
         assert!(!out.contains("mismatch"));
         assert!(!out.contains("err"));
     }
+
+    /// Minimal inner observer with an observable field so `inner_mut`'s
+    /// returned reference can be proven to alias the wrapped value.
+    struct ProbeObserver {
+        tuples: u32,
+    }
+    impl TupleObserver for ProbeObserver {
+        fn on_tuple<'a>(
+            &'a mut self,
+            _committed: &'a CommittedTuple,
+        ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn inner_mut_aliases_wrapped_observer() {
+        // No live PG: client=None is enough to build the wrapper; the
+        // accessor under test never touches the connection.
+        let oracle = Arc::new(Oracle {
+            client: Mutex::new(None),
+            conninfo: String::new(),
+            has_extension: Mutex::new(None),
+            stats: Arc::new(OracleStats::default()),
+            sampler: Sampler::new(0),
+        });
+        let mut obs = OracleObserver::new(oracle, ProbeObserver { tuples: 0 });
+        obs.inner_mut().tuples += 5;
+        assert_eq!(obs.inner_mut().tuples, 5);
+    }
 }

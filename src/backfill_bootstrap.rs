@@ -487,6 +487,16 @@ mod tests {
     use crate::backup_source::{BackupSink, BackupSource, FileKind, FileMeta};
     use async_trait::async_trait;
 
+    #[test]
+    fn with_catalog_filenodes_seeds_whitelist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = BootstrapConfig::new(tmp.path().to_path_buf());
+        assert!(cfg.catalog_filenodes.is_empty());
+        let cfg = cfg.with_catalog_filenodes(CatalogFilenodes::from_iter([(5, 50000), (0, 99999)]));
+        assert_eq!(cfg.catalog_filenodes.len(), 2);
+        assert!(cfg.catalog_filenodes.is_catalog(5, 50000));
+    }
+
     /// Mock source that emits a curated sequence of file events. Used
     /// to test the orchestrator without a live PG.
     struct MockSource {
