@@ -148,6 +148,9 @@ impl Inserter {
                         .rows_emitted
                         .fetch_add(batch.n_rows as u64, Ordering::Relaxed);
                     self.stats.blocks_sent.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .inserter_batches_in
+                        .fetch_add(1, Ordering::Relaxed);
                     self.ack.acked(batch.per_seq);
                 }
                 Err(e) => {

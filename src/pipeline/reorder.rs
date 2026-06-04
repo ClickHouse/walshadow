@@ -28,10 +28,13 @@ use crate::decoder_sink::DecoderSinkError;
 use crate::heap_decoder::{DecodedHeap, HeapOp};
 use crate::shadow_catalog::{CatalogError, SchemaEvent, ShadowCatalog};
 use crate::wal_stream::{Record, RecordSink, SinkError};
+use tracing::Instrument;
+
 use crate::xact_buffer::{
-    DrainedXact, SchemaEventRx, SubxactTracker, XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED,
-    XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK,
-    XactBuffer, drain_pending_schema_events, parse_xact_assignment, parse_xact_payload,
+    DrainedXact, SchemaEventRx, SubxactTracker, TxnSpanRegistry, XLOG_XACT_ABORT,
+    XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
+    XLOG_XACT_OPMASK, XactBuffer, drain_pending_schema_events, parse_xact_assignment,
+    parse_xact_payload,
 };
 
 use crate::pipeline::ack::AckHandle;
@@ -63,6 +66,10 @@ pub struct ReorderSink {
     resolver: ToastResolver,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
+    /// Per-txn span map (shared with the pump + buffer). `Some` only when
+    /// OTLP tracing is on; reorder parents `commit.drain`/`dispatch` under
+    /// the `txn` and prunes the entry at commit (the buffer prunes at abort).
+    span_registry: Option<TxnSpanRegistry>,
 }
 
 impl ReorderSink {
@@ -80,6 +87,7 @@ impl ReorderSink {
         stats: Arc<EmitterStats>,
         resolver: ToastResolver,
         fatal: Fatal,
+        span_registry: Option<TxnSpanRegistry>,
     ) -> Self {
         let last_seen_delete_epoch = pg_class_delete_epoch
             .as_ref()
@@ -100,6 +108,7 @@ impl ReorderSink {
             resolver,
             fatal,
             next_seq: 0,
+            span_registry,
         }
     }
 
@@ -176,6 +185,7 @@ impl ReorderSink {
     // (Send): owned `DdlApplicator`/`AsyncClient` is Send but not Sync, so a
     // shared `&Self` across an await wouldn't be Send.
     async fn dispatch_job(&mut self, job: DecodeJob) -> Result<(), SinkError> {
+        self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
         tokio::select! {
             r = self.jobs_tx.send(job) => r.map_err(|_| SinkError::Other("decode job queue closed".into())),
             _ = self.fatal.wait() => Err(self.fatal_err()),
@@ -325,16 +335,50 @@ impl ReorderSink {
         record: &Record<'_>,
     ) -> Result<(), SinkError> {
         let payload = parse_xact_payload(info, &record.parsed.main_data);
+        // Parent for this commit's spans; held until on_commit returns so it
+        // outlives the prune below. No-op span when tracing off/unsampled.
+        let txn = self
+            .span_registry
+            .as_ref()
+            .and_then(|r| r.txn_span(xid))
+            .unwrap_or_else(tracing::Span::none);
         self.maybe_sweep_dropped(xid, record.source_lsn).await?;
+        let drain_span = trace_span!(
+            !txn.is_none(),
+            parent: &txn,
+            "commit.drain",
+            xid = xid,
+            commit_lsn = record.source_lsn,
+        );
+        // Same drain, parented contextually so it shows under `record` in the
+        // batch view (`commit.drain` shows only in the per-txn trace).
+        let reorder_span = trace_span!(
+            !txn.is_none(),
+            "reorder",
+            xid = xid,
+            commit_lsn = record.source_lsn,
+        );
         let drained = {
             let mut buf = self.buffer.lock().await;
             buf.drain_committed(xid, payload.xact_time, record.source_lsn, &payload.subxacts)
+                .instrument(drain_span)
+                .instrument(reorder_span)
                 .await
                 .map_err(SinkError::from)?
         };
         self.subxact_tracker.lock().await.forget_tree(xid);
         // One per drained commit, incl. empty / unmapped-only
         self.stats.xacts_committed.fetch_add(1, Ordering::Relaxed);
+        txn.record("rows", drained.heaps.len() as u64);
+        txn.record("outcome", "committed");
+        // Prune the committed tree's span handles (else the map grows
+        // unbounded); the local `txn` clone keeps the span alive for dispatch.
+        if let Some(r) = &self.span_registry {
+            let mut xids: Vec<u32> = Vec::with_capacity(1 + payload.subxacts.len());
+            xids.push(xid);
+            xids.extend_from_slice(&payload.subxacts);
+            r.prune(&xids);
+        }
 
         // Persist this xact's chunks (disk / CH) before they're consumed by
         // the decode pool, so a later re-emit of a pre-window referrer finds
@@ -353,7 +397,13 @@ impl ReorderSink {
                 .iter()
                 .any(|h| matches!(h.op, HeapOp::Truncate));
         if is_barrier {
-            self.run_barrier(drained).await
+            self.run_barrier(drained)
+                .instrument(trace_span!(
+                    !txn.is_none(),
+                    parent: &txn,
+                    "commit.barrier",
+                ))
+                .await
         } else if drained.heaps.is_empty() {
             // Empty commit: rows=0 seq keeps the contiguous watermark unbroken
             let seq = self.alloc_seq();
@@ -370,7 +420,14 @@ impl ReorderSink {
                 heaps: drained.heaps,
                 chunks: Arc::new(drained.chunks),
             };
-            self.dispatch_job(job).await
+            self.dispatch_job(job)
+                .instrument(trace_span!(
+                    !txn.is_none(),
+                    parent: &txn,
+                    "dispatch",
+                    seq = seq,
+                ))
+                .await
         }
     }
 

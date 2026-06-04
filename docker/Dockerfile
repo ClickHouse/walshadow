@@ -24,7 +24,15 @@ COPY Cargo.toml Cargo.lock ./
 COPY clickhouse-c-rs ./clickhouse-c-rs
 COPY bench ./bench
 COPY src ./src
-RUN cargo build --release --bin walshadow-stream
+# Cache mounts persist cargo's registry/git and the target dir across builds,
+# so a source change recompiles only the changed crates, not all deps. The
+# target dir lives in the cache mount (not the image layer), so the binary is
+# copied out to a normal path in the same RUN for the runtime stage to pick up.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --bin walshadow-stream \
+    && cp /src/target/release/walshadow-stream /usr/local/bin/walshadow-stream
 
 FROM postgres:${PG_MAJOR}-alpine AS ext-builder
 RUN apk add --no-cache build-base
@@ -41,7 +49,7 @@ FROM postgres:${PG_MAJOR}-alpine AS runtime
 # liblz4/libzstd already present as PG deps.
 RUN apk add --no-cache bash ca-certificates
 
-COPY --from=rust-builder /src/target/release/walshadow-stream /usr/local/bin/walshadow-stream
+COPY --from=rust-builder /usr/local/bin/walshadow-stream /usr/local/bin/walshadow-stream
 COPY --from=ext-builder /src/pgext/walshadow.so \
         /usr/local/lib/postgresql/walshadow.so
 COPY --from=ext-builder /src/pgext/walshadow.control \

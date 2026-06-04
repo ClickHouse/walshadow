@@ -139,6 +139,9 @@ struct DaemonSinks {
     /// Shared with parallel pipeline's inserter pool (bumps counters
     /// post-`EndOfStream`). `None` when no CH pipeline is wired.
     emitter_stats: Option<Arc<walshadow::ch_emitter::EmitterStats>>,
+    /// Per-txn span map; `Some` only with OTLP on. Registering at WAL read
+    /// (here) makes the `txn` span cover the pump→worker channel wait.
+    span_registry: Option<walshadow::xact_buffer::TxnSpanRegistry>,
 }
 
 impl RecordSink for DaemonSinks {
@@ -147,6 +150,10 @@ impl RecordSink for DaemonSinks {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
+            // Register at WAL read (pre-channel) so the span covers the queue wait.
+            if let Some(reg) = &self.span_registry {
+                reg.open(record.parsed.header.xact_id, record.source_lsn);
+            }
             self.metrics.on_record(record).await?;
             self.decoder_xact.on_record(record).await?;
             Ok(())
@@ -290,6 +297,16 @@ struct Args {
     /// HTTP/Prometheus metrics bind address. Disabled when absent.
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
+    /// OTLP/gRPC endpoint for traces, e.g. `http://localhost:4317`. Absent
+    /// disables tracing (zero overhead); falls back to
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT`. Spans emit at the `walshadow::trace`
+    /// target.
+    #[arg(long)]
+    otlp_endpoint: Option<String>,
+    /// Fraction of transactions to trace, `[0.0, 1.0]`. Head-sampled per txn
+    /// (see `trace::should_sample`), so per-record span cost scales with it.
+    #[arg(long, default_value_t = 0.01)]
+    trace_sample_ratio: f64,
     /// WAL retention horizon in bytes. Segments older than
     /// `shadow_replay_lsn - retention_bytes` deleted every trim cycle.
     /// `0` disables trim.
@@ -348,21 +365,103 @@ struct Args {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    init_tracing();
-    run(args).await
+    walshadow::trace::set_sample_ratio(args.trace_sample_ratio);
+    // `--otlp-endpoint` wins; otherwise honor the conventional env var.
+    let otlp_endpoint = args
+        .otlp_endpoint
+        .clone()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok());
+    let tracer_provider = init_tracing(otlp_endpoint.as_deref());
+    let result = run(args).await;
+    // The batch span processor lives on a background thread, so a bare
+    // process exit drops whatever it hasn't flushed. Drain it before we
+    // return (best-effort — a failed flush must not mask `run`'s result).
+    if let Some(provider) = tracer_provider
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::warn!(target: "walshadow", error = %e, "otlp tracer shutdown");
+    }
+    result
 }
 
-/// `RUST_LOG` configures the filter; unset defaults to warn except
-/// walshadow=info so the startup banner still emits.
-fn init_tracing() {
+/// OTLP/gRPC batch tracer provider for `endpoint`. Must run inside the tokio
+/// runtime (tonic exporter + batch worker need it).
+fn build_otlp_provider(
+    endpoint: &str,
+) -> anyhow::Result<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()?;
+    // Head sampling happens at span creation (per txn, see TxnSpanRegistry),
+    // so the SDK exports everything it's handed.
+    Ok(SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .with_batch_exporter(exporter)
+        .with_resource(Resource::builder().with_service_name("walshadow").build())
+        .build())
+}
+
+/// Wire `tracing` once per process (`RUST_LOG` filter, default
+/// `warn,walshadow=info`). With `otlp_endpoint` set, stacks an OTel layer on
+/// the stderr `fmt` layer; the returned provider must be `.shutdown()` at exit.
+fn init_tracing(
+    otlp_endpoint: Option<&str>,
+) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::prelude::*;
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_writer(std::io::stderr);
+
+    // Best-effort: a bad endpoint logs and degrades to no-traces rather
+    // than refusing to boot — observability never blocks the pipeline.
+    let provider = match otlp_endpoint {
+        Some(endpoint) => match build_otlp_provider(endpoint) {
+            Ok(p) => {
+                opentelemetry::global::set_tracer_provider(p.clone());
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("walshadow: OTLP exporter init failed for {endpoint}: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    // `walshadow::trace` spans only feed the OTLP exporter; with none attached
+    // they are pure per-record overhead, so disable that target — unless the
+    // user explicitly set it in RUST_LOG.
+    let user_set_trace = std::env::var("RUST_LOG")
+        .map(|v| v.contains("walshadow::trace"))
+        .unwrap_or(false);
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,walshadow=info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_writer(std::io::stderr)
+    let filter = if provider.is_some() || user_set_trace {
+        filter
+    } else {
+        filter.add_directive(
+            "walshadow::trace=off"
+                .parse()
+                .expect("static trace-off directive parses"),
+        )
+    };
+    let otel_layer = provider
+        .as_ref()
+        .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("walshadow")));
+
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(otel_layer)
         .try_init();
+    provider
 }
 
 async fn run(args: Args) -> Result<()> {
@@ -682,8 +781,18 @@ async fn run(args: Args) -> Result<()> {
     // Shared schema-events queue (descriptor-fetch + commit-boundary
     // `sweep_dropped`); both decoder and drain stage pull from it.
     let schema_events = Arc::new(std::sync::Mutex::new(catalog.lock().await.subscribe()));
-    let decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
+    // Txn-span registry, shared by pump + decoder; `Some` only with OTLP on.
+    let span_registry =
+        if args.otlp_endpoint.is_some() || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+            Some(xact_buffer.lock().await.span_registry())
+        } else {
+            None
+        };
+    let mut decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
         .with_schema_events(schema_events.clone());
+    if let Some(reg) = &span_registry {
+        decoder = decoder.with_span_registry(reg.clone());
+    }
     let decoder_stats_handle = decoder.stats_handle();
 
     let mut mapping_handle: Option<MappingHandle> = None;
@@ -735,6 +844,7 @@ async fn run(args: Args) -> Result<()> {
                 schema_events: Some(schema_events.clone()),
                 pg_class_delete_epoch: Some(pg_class_delete_epoch.clone()),
                 stats,
+                span_registry: span_registry.clone(),
             };
             let (reorder_sink, handle) = pcfg
                 .spawn(emitter_ack)
@@ -755,6 +865,7 @@ async fn run(args: Args) -> Result<()> {
                 },
                 args.decoder_batch_size,
                 args.decoder_queue_capacity,
+                span_registry.clone(),
             )
         }
         None => {
@@ -777,6 +888,7 @@ async fn run(args: Args) -> Result<()> {
                 },
                 args.decoder_batch_size,
                 args.decoder_queue_capacity,
+                span_registry.clone(),
             )
         }
     };
@@ -785,6 +897,7 @@ async fn run(args: Args) -> Result<()> {
         decoder_xact,
         decoder_stats: decoder_stats_handle,
         emitter_stats: emitter_stats_handle,
+        span_registry,
     };
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
@@ -874,6 +987,9 @@ async fn run(args: Args) -> Result<()> {
     // send; else the slot could advance past a not-yet-durable resume point.
     let cursor_write_interval = Duration::from_secs(args.status_interval);
     let mut last_cursor_write: Option<Instant> = None;
+    // Fast metrics-refresh tick (decoupled from cursor/status): an idle source
+    // would otherwise freeze the /metrics snapshot while the pipeline drains.
+    let metrics_tick = Duration::from_millis(250);
     // Inflight-stall watchdog: xacts_active > 0 with stalled
     // `emitter_ack_lsn` dumps the parked xids holding the slot. One-shot
     // per stall, re-arms when ack advances.
@@ -935,11 +1051,9 @@ async fn run(args: Args) -> Result<()> {
                 sig.context("install ctrl_c handler")?;
                 break "signal";
             }
-            // Idle tick: `emitter_ack_lsn` advances in the queueing worker
-            // after the pump pushes, so without a periodic wakeup an idle
-            // source (kill-restart post-catchup quiescence) freezes metrics
-            // + cursor at the last chunk's values.
-            _ = tokio::time::sleep(cursor_write_interval) => None,
+            // Idle tick so metrics/cursor keep tracking the draining pipeline
+            // when no new WAL arrives.
+            _ = tokio::time::sleep(metrics_tick) => None,
             res = feed.next_chunk(status, &mut chunk_buf) => Some(match res? {
                 Some(c) => c,
                 None => break "CopyDone",
@@ -1008,6 +1122,8 @@ async fn run(args: Args) -> Result<()> {
             drain_for_metric,
             emitter_ack_for_metric,
             &record_sink.metrics,
+            record_sink.decoder_xact.in_flight(),
+            record_sink.decoder_xact.processed(),
             &xact_stats,
             decoder_stats,
             emitter_stats,
@@ -1283,6 +1399,39 @@ struct ShadowMetricsView {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// CPU seconds + RSS bytes from `/proc/self`. Linux-only; `(0.0, 0)` if
+/// unreadable. Assumes `CLK_TCK` 100 (USER_HZ) and `VmRSS` in kB.
+fn read_process_stats() -> (f64, u64) {
+    const CLK_TCK: f64 = 100.0;
+    let cpu = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            // Split after the last ')' (comm may hold spaces/parens): utime
+            // (field 14) and stime (15) are then indices 11 and 12.
+            let rest = s.rsplit_once(')')?.1;
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            let utime: u64 = f.get(11)?.parse().ok()?;
+            let stime: u64 = f.get(12)?.parse().ok()?;
+            Some((utime + stime) as f64 / CLK_TCK)
+        })
+        .unwrap_or(0.0);
+    let rss = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            let kb: u64 = s
+                .lines()
+                .find(|l| l.starts_with("VmRSS:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            Some(kb * 1024)
+        })
+        .unwrap_or(0);
+    (cpu, rss)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn populate_metrics(
     registry: &MetricsRegistry,
     source_received_lsn: u64,
@@ -1291,6 +1440,8 @@ async fn populate_metrics(
     decoder_commit_lsn: u64,
     emitter_ack_lsn: u64,
     rec_metrics: &MetricsRecordSink,
+    pump_queue_depth: u64,
+    queue_records_out_total: u64,
     xact_stats: &walshadow::xact_buffer::XactBufferStats,
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
     emitter_stats: Option<&walshadow::ch_emitter::EmitterStats>,
@@ -1300,6 +1451,7 @@ async fn populate_metrics(
 ) {
     use std::collections::BTreeMap;
     use walshadow::classify::rmgr_label;
+    let (proc_cpu, proc_rss) = read_process_stats();
     let mut by_rm = BTreeMap::new();
     for ((rm, route), n) in &rec_metrics.by_rm_route {
         let key = (
@@ -1335,6 +1487,28 @@ async fn populate_metrics(
         emitter_blocks_total: emitter_stats
             .map(|s| s.blocks_sent.load(Ordering::Relaxed))
             .unwrap_or(0),
+        pump_queue_depth,
+        queue_records_out_total,
+        queue_jobs_out_total: emitter_stats
+            .map(|s| s.queue_jobs_out.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        decode_jobs_in_total: emitter_stats
+            .map(|s| s.decode_jobs_in.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        decode_rows_out_total: emitter_stats
+            .map(|s| s.decode_rows_out.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        insertbatch_rows_in_total: emitter_stats
+            .map(|s| s.insertbatch_rows_in.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        insertbatch_batches_out_total: emitter_stats
+            .map(|s| s.insertbatch_batches_out.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        inserter_batches_in_total: emitter_stats
+            .map(|s| s.inserter_batches_in.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        process_cpu_seconds_total: proc_cpu,
+        process_resident_memory_bytes: proc_rss,
         emitter_xacts_total: emitter_stats
             .map(|s| s.xacts_committed.load(Ordering::Relaxed))
             .unwrap_or(0),

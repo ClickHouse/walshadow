@@ -243,7 +243,7 @@ async fn pump_throughput_breakdown() {
         let inner = OwnedCounterSink {
             counter: counter.clone(),
         };
-        let mut queueing = QueueingRecordSink::spawn(inner, 256, 16_384);
+        let mut queueing = QueueingRecordSink::spawn(inner, 256, 16_384, None);
         run_case(
             "queueing(counter) + noop",
             &seg,
@@ -272,7 +272,7 @@ async fn pump_throughput_breakdown() {
         let inner = OwnedCounterSink {
             counter: counter.clone(),
         };
-        let mut queueing = QueueingRecordSink::spawn(inner, 256, 16_384);
+        let mut queueing = QueueingRecordSink::spawn(inner, 256, 16_384, None);
         let bs: Box<dyn walshadow::wal_stream::RecordBytesSink + Send> =
             Box::new(ShadowStreamSink::new(state.clone()));
         run_case(

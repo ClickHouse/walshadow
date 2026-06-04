@@ -70,6 +70,17 @@ services:
       - "8123:8123"
       - "9000:9000"
 
+  # End-to-end trace sink. Jaeger all-in-one ingests OTLP/gRPC on 4317
+  # (COLLECTOR_OTLP_ENABLED) and serves the trace UI on 16686. Open a
+  # slow `txn` there to see its commit.drain → emit.insert waterfall.
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+
   walshadow:
     build:
       context: ..
@@ -79,10 +90,15 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     environment:
       RUST_LOG: warn,walshadow=info
       WALSHADOW_SOURCE_HOST: source
       WALSHADOW_SOURCE_PORT: "5432"
+      # Ship spans to the Jaeger sidecar. Unset this (or remove jaeger)
+      # to run with zero tracing overhead — no exporter is installed.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     volumes:
       - ./ch-config.toml:/etc/walshadow/ch-config.toml:ro
       - walshadow-data:/var/lib/walshadow

@@ -60,6 +60,17 @@ pub struct MetricsSnapshot {
     pub emitter_blocks_total: u64,
     pub emitter_xacts_total: u64,
     pub emitter_unsupported_relations: u64,
+    // Pipeline flow + process gauges; see `render` for descriptions.
+    pub pump_queue_depth: u64,
+    pub queue_records_out_total: u64,
+    pub queue_jobs_out_total: u64,
+    pub decode_jobs_in_total: u64,
+    pub decode_rows_out_total: u64,
+    pub insertbatch_rows_in_total: u64,
+    pub insertbatch_batches_out_total: u64,
+    pub inserter_batches_in_total: u64,
+    pub process_cpu_seconds_total: f64,
+    pub process_resident_memory_bytes: u64,
     pub oracle_resolved_total: u64,
     pub oracle_fallback_raw_total: u64,
     pub oracle_validate_sampled_total: u64,
@@ -306,6 +317,60 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             snap.emitter_unsupported_relations,
         ),
         (
+            "walshadow_pump_queue_depth",
+            "Records buffered between the WAL pump and the queueing worker.",
+            "gauge",
+            snap.pump_queue_depth,
+        ),
+        (
+            "walshadow_queue_records_out_total",
+            "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
+            "counter",
+            snap.queue_records_out_total,
+        ),
+        (
+            "walshadow_queue_jobs_out_total",
+            "DecodeJobs the queueing worker shipped to the decode pool. queue_jobs_out - decode_jobs_in is the worker->pool channel depth.",
+            "counter",
+            snap.queue_jobs_out_total,
+        ),
+        (
+            "walshadow_decode_jobs_in_total",
+            "DecodeJobs the decode pool has pulled. Pinned at queue_jobs_out ⇒ pool idle; the gap at the channel cap ⇒ the pool is the limiter.",
+            "counter",
+            snap.decode_jobs_in_total,
+        ),
+        (
+            "walshadow_decode_rows_out_total",
+            "Rows the decode pool routed to the insertbatch builder. decode_rows_out - insertbatch_rows_in is the pool->builder channel depth.",
+            "counter",
+            snap.decode_rows_out_total,
+        ),
+        (
+            "walshadow_insertbatch_rows_in_total",
+            "Rows the insertbatch builder accepted before sealing into InsertBatches.",
+            "counter",
+            snap.insertbatch_rows_in_total,
+        ),
+        (
+            "walshadow_insertbatch_batches_out_total",
+            "InsertBatches the builder sealed and pushed to the inserter pool.",
+            "counter",
+            snap.insertbatch_batches_out_total,
+        ),
+        (
+            "walshadow_inserter_batches_in_total",
+            "InsertBatches an inserter finished draining to ClickHouse. insertbatch_batches_out - inserter_batches_in is the live backlog; their rates show inserter-pool saturation.",
+            "counter",
+            snap.inserter_batches_in_total,
+        ),
+        (
+            "walshadow_process_resident_memory_bytes",
+            "Resident set size of the walshadow process (VmRSS).",
+            "gauge",
+            snap.process_resident_memory_bytes,
+        ),
+        (
             "walshadow_decode_resolved_total",
             "PgPending columns resolved via the walshadow extension.",
             "counter",
@@ -379,6 +444,16 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     } else {
         writeln!(s, "{name} {:.3}", snap.shadow_apply_lag_seconds).unwrap();
     }
+
+    // Process CPU as a float counter (seconds); rate() ≈ cores in use.
+    let name = "walshadow_process_cpu_seconds_total";
+    writeln!(
+        s,
+        "# HELP {name} Total user+system CPU seconds consumed by the walshadow process.",
+    )
+    .unwrap();
+    writeln!(s, "# TYPE {name} counter").unwrap();
+    writeln!(s, "{name} {:.3}", snap.process_cpu_seconds_total).unwrap();
     s
 }
 

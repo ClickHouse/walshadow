@@ -684,6 +684,7 @@ pub async fn build_pipeline_with(
         schema_events: schema_events.clone(),
         pg_class_delete_epoch: ddl.as_ref().map(|_| del_epoch.clone()),
         stats: stats.clone(),
+        span_registry: None,
     };
     let (reorder, handle) = pcfg
         .spawn(emitter_ack.clone())

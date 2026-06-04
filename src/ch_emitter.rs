@@ -1271,6 +1271,14 @@ crate::atomic_stats! {
         /// Toasted values whose chunks were absent from an active store
         /// (disk / CH gap) — a real data gap, not a fill
         pub toast_fetch_miss,
+        // Pipeline-flow counters; `_out`/`_in` pairs give channel depth. See
+        // `metrics::render`.
+        pub queue_jobs_out,
+        pub decode_jobs_in,
+        pub decode_rows_out,
+        pub insertbatch_rows_in,
+        pub insertbatch_batches_out,
+        pub inserter_batches_in,
     }
 }
 

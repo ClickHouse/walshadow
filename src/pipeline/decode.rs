@@ -157,6 +157,9 @@ pub async fn decode_and_route(
     if !buf.is_empty() {
         route_chunk(&ctx.msg_tx, buf).await?;
     }
+    ctx.stats
+        .decode_rows_out
+        .fetch_add(routed, Ordering::Relaxed);
     Ok(routed)
 }
 
@@ -177,6 +180,7 @@ pub fn spawn_pool(
         let fatal = fatal.clone();
         handles.push(tokio::spawn(async move {
             while let Some(job) = jobs.recv().await {
+                ctx.stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
                 let seq = job.seq;
                 match decode_and_route(
                     &ctx,

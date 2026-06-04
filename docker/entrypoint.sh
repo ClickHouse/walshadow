@@ -23,6 +23,19 @@ fi
 chmod 700 "$SHADOW_DATA"
 mkdir -p "$OUT_DIR" "$SPILL_DIR" "$SOCKET_DIR"
 
+# Pool sizes default here for the local stack, but the EC2 deploy.sh forwards
+# explicit --decoder-pool-size/--inserter-pool-size via "$@"; clap rejects a
+# flag passed twice, so only inject our defaults when the caller didn't.
+POOL_ARGS=()
+case " $* " in
+    *" --decoder-pool-size "*) ;;
+    *) POOL_ARGS+=(--decoder-pool-size "${WALSHADOW_DECODER_POOL:-1}") ;;
+esac
+case " $* " in
+    *" --inserter-pool-size "*) ;;
+    *) POOL_ARGS+=(--inserter-pool-size "${WALSHADOW_INSERTER_POOL:-4}") ;;
+esac
+
 exec walshadow-stream \
     --host "${WALSHADOW_SOURCE_HOST:-source}" \
     --port "${WALSHADOW_SOURCE_PORT:-5432}" \
@@ -42,4 +55,5 @@ exec walshadow-stream \
     --ch-config "${WALSHADOW_CH_CONFIG:-/etc/walshadow/ch-config.toml}" \
     --metrics-bind 0.0.0.0:9484 \
     --status-interval "${WALSHADOW_STATUS_INTERVAL:-5}" \
+    "${POOL_ARGS[@]}" \
     "$@"
