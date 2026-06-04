@@ -58,9 +58,9 @@ pub struct MetricsSnapshot {
     /// CH emitter ack-LSN. Same placeholder treatment as
     /// `decoder_commit_lsn`.
     pub emitter_ack_lsn: u64,
-    /// Per-(rmgr name, decision) record counters. `decision` is one of
-    /// `"keep"` / `"drop"`.
-    pub records_by_rm_decision: BTreeMap<(String, &'static str), u64>,
+    /// Per-(rmgr name, route) record counters. `route` is one of
+    /// `"to_shadow"` / `"to_decoder"`.
+    pub records_by_rm_route: BTreeMap<(String, &'static str), u64>,
     pub xact_active: u64,
     pub xact_bytes_in_memory: u64,
     pub spill_xacts_active: u64,
@@ -233,14 +233,14 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     // Per-rmgr counters -------------------------------------------------
     writeln!(
         s,
-        "# HELP walshadow_filter_records_total Records observed by the filter, labeled by rmgr + decision."
+        "# HELP walshadow_filter_records_total Records observed by the filter, labeled by rmgr + route."
     )
     .unwrap();
     writeln!(s, "# TYPE walshadow_filter_records_total counter").unwrap();
-    for ((rm, decision), n) in &snap.records_by_rm_decision {
+    for ((rm, route), n) in &snap.records_by_rm_route {
         writeln!(
             s,
-            "walshadow_filter_records_total{{rmgr={rm:?},decision={decision:?}}} {n}"
+            "walshadow_filter_records_total{{rmgr={rm:?},route={route:?}}} {n}"
         )
         .unwrap();
     }
@@ -497,8 +497,8 @@ mod tests {
             uptime_secs: 42,
             ..MetricsSnapshot::default()
         };
-        snap.records_by_rm_decision
-            .insert(("Heap".into(), "drop"), 17);
+        snap.records_by_rm_route
+            .insert(("Heap".into(), "to_decoder"), 17);
 
         let body = render(&snap);
         assert!(body.contains("# HELP walshadow_source_received_lsn"));
@@ -506,7 +506,7 @@ mod tests {
         assert!(body.contains("walshadow_source_received_lsn 3405691582"));
         assert!(body.contains("walshadow_filter_lsn 12648430"));
         assert!(
-            body.contains("walshadow_filter_records_total{rmgr=\"Heap\",decision=\"drop\"} 17")
+            body.contains("walshadow_filter_records_total{rmgr=\"Heap\",route=\"to_decoder\"} 17")
         );
         assert!(body.contains("walshadow_xact_active 3"));
         assert!(body.contains("walshadow_uptime_seconds 42"));

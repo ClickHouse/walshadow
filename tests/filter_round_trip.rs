@@ -8,7 +8,7 @@
 //! 2. Every record re-parses through wal-rs's `WalParser` without error.
 //! 3. Manifest record count equals source record count.
 //! 4. Filter dropped >0 user records on a non-DDL-heavy workload.
-//! 5. All `Decision::Drop` records show as `XLOG_NOOP` (rmid=0, info=0x20)
+//! 5. All `Route::ToDecoder` records show as `XLOG_NOOP` (rmid=0, info=0x20)
 //!    in the filtered output.
 
 use std::path::PathBuf;

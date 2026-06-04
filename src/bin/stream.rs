@@ -1405,12 +1405,12 @@ async fn populate_metrics(
     use std::collections::BTreeMap;
     use walshadow::classify::rmgr_label;
     let mut by_rm = BTreeMap::new();
-    for ((rm, decision), n) in &rec_metrics.by_rm_decision {
+    for ((rm, route), n) in &rec_metrics.by_rm_route {
         let key = (
             rmgr_label(*rm).to_string(),
-            match decision {
-                walshadow::filter::Decision::Keep => "keep",
-                walshadow::filter::Decision::Drop => "drop",
+            match route {
+                walshadow::filter::Route::ToShadow => "to_shadow",
+                walshadow::filter::Route::ToDecoder => "to_decoder",
             },
         );
         by_rm.insert(key, *n);
@@ -1421,7 +1421,7 @@ async fn populate_metrics(
         shadow_replay_lsn,
         decoder_commit_lsn,
         emitter_ack_lsn,
-        records_by_rm_decision: by_rm,
+        records_by_rm_route: by_rm,
         xact_active: xact_stats.xacts_active,
         xact_bytes_in_memory: xact_stats.bytes_in_memory,
         spill_xacts_active: xact_stats.spill_xacts_active,

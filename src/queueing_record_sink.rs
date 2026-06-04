@@ -288,7 +288,7 @@ impl RecordSink for QueueingRecordSink {
                 parsed: record.parsed.clone().into_owned(),
                 source_lsn: record.source_lsn,
                 page_magic: record.page_magic,
-                decision: record.decision,
+                route: record.route,
             });
             if self.buf.len() >= self.batch_size {
                 self.flush_buf()?;
@@ -317,7 +317,7 @@ mod tests {
             parsed: XLogRecord::default(),
             source_lsn,
             page_magic: 0,
-            decision: crate::filter::Decision::Keep,
+            route: crate::filter::Route::ToShadow,
         }
     }
 

@@ -25,7 +25,7 @@ use wal_rs::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
 };
 
-use walshadow::filter::Decision;
+use walshadow::filter::Route;
 use walshadow::manifest::Kind;
 use walshadow::rewrite::compute_crc;
 use walshadow::wal_stream::{
@@ -236,9 +236,9 @@ async fn catalog_tracker_state_survives_segment_boundary() {
     assert_eq!(filter.stats.dropped, 0);
     assert_eq!(filter.tracker.relmap_updates, 1);
 
-    // RecordSink decisions reflect the same outcome.
-    assert_eq!(records.records[0].decision, Decision::Keep);
-    assert_eq!(records.records[1].decision, Decision::Keep);
+    // RecordSink routes reflect the same outcome.
+    assert_eq!(records.records[0].route, Route::ToShadow);
+    assert_eq!(records.records[1].route, Route::ToShadow);
 }
 
 /// Every record bracketed by one BEGIN…COMMIT carries the
@@ -323,7 +323,7 @@ impl RecordSink for SharedCollectingSink {
                 parsed: r.parsed.clone().into_owned(),
                 source_lsn: r.source_lsn,
                 page_magic: r.page_magic,
-                decision: r.decision,
+                route: r.route,
             });
             Ok(())
         })
@@ -426,7 +426,7 @@ async fn composite_sink_fans_out_to_all_inner_sinks() {
             PG_CLASS_OID
         );
         assert_eq!(r.parsed.blocks[0].header.location.block_no, i as u32);
-        assert_eq!(r.decision, Decision::Keep);
+        assert_eq!(r.route, Route::ToShadow);
     }
 }
 

@@ -17,8 +17,8 @@
 //!         Filter::decide
 //!         /     |        \
 //!        v      v         v
-//!   noop_replace (Drop)  rewrite_record  manifest
-//!              |          (in place)     entry
+//!   noop_replace (ToDecoder)  rewrite_record  manifest
+//!              |              (in place)      entry
 //!              v
 //!         RecordBytesSink  (shadow wire — §3)
 //!              v
@@ -43,7 +43,7 @@ use wal_rs::pg::wal::segment::SegmentName;
 use wal_rs::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
 use crate::classify::rmgr_label;
-use crate::filter::{Decision, Filter, FilterStats};
+use crate::filter::{Filter, FilterStats, Route};
 use crate::filter_segment::{FilterSegmentError, ParsedRecord, filter_segment};
 use crate::manifest::{Entry, FILTER_VERSION, Kind, Manifest, ManifestStats};
 use crate::rewrite::{RewriteError, noop_replace};
@@ -102,8 +102,8 @@ pub enum SinkError {
 }
 
 /// Per-record hand-off carrying the parsed `XLogRecord`, where it sits
-/// in the source LSN stream, and the keep/drop decision the filter
-/// computed. The heap-tuple decoder reads `parsed.header.xact_id`,
+/// in the source LSN stream, and the `Route` the filter computed. The
+/// heap-tuple decoder reads `parsed.header.xact_id`,
 /// `parsed.blocks[i].header.location.rel`, and `parsed.main_data`;
 /// `page_magic` selects PG-15-vs-PG-14 FPI bit semantics.
 ///
@@ -120,8 +120,8 @@ pub struct Record<'a> {
     pub source_lsn: u64,
     /// Magic of the page whose data area the record header sat on.
     pub page_magic: u16,
-    /// Keep/drop decision the filter computed.
-    pub decision: Decision,
+    /// Routing decision the filter computed.
+    pub route: Route,
 }
 
 impl Record<'static> {
@@ -134,15 +134,15 @@ impl Record<'static> {
         parsed: ParsedRecord,
         entry: &crate::manifest::Entry,
     ) -> Self {
-        let decision = match entry.kind {
-            Kind::Kept => Decision::Keep,
-            Kind::Dropped => Decision::Drop,
+        let route = match entry.kind {
+            Kind::Kept => Route::ToShadow,
+            Kind::Dropped => Route::ToDecoder,
         };
         Self {
             parsed: parsed.record,
             source_lsn: seg_start_lsn + entry.offset,
             page_magic: parsed.page_magic,
-            decision,
+            route,
         }
     }
 }
@@ -279,7 +279,7 @@ impl RecordSink for CollectingRecordSink {
                 parsed: record.parsed.clone().into_owned(),
                 source_lsn: record.source_lsn,
                 page_magic: record.page_magic,
-                decision: record.decision,
+                route: record.route,
             });
             Ok(())
         })
@@ -304,11 +304,11 @@ impl RecordSink for CountingRecordSink {
     }
 }
 
-/// `RecordSink` that maintains a per-`(rmid, decision)` counter and
+/// `RecordSink` that maintains a per-`(rmid, route)` counter and
 /// discards the record.
 #[derive(Debug, Default)]
 pub struct MetricsRecordSink {
-    pub by_rm_decision: BTreeMap<(u8, Decision), u64>,
+    pub by_rm_route: BTreeMap<(u8, Route), u64>,
     pub total: u64,
 }
 
@@ -317,12 +317,12 @@ impl MetricsRecordSink {
         use std::fmt::Write as _;
         let mut s = String::new();
         write!(&mut s, "total={}", self.total).unwrap();
-        for ((rm, decision), n) in &self.by_rm_decision {
-            let d = match decision {
-                Decision::Keep => "keep",
-                Decision::Drop => "drop",
+        for ((rm, route), n) in &self.by_rm_route {
+            let r = match route {
+                Route::ToShadow => "to_shadow",
+                Route::ToDecoder => "to_decoder",
             };
-            write!(&mut s, " {}/{}={}", rmgr_label(*rm), d, n).unwrap();
+            write!(&mut s, " {}/{}={}", rmgr_label(*rm), r, n).unwrap();
         }
         s
     }
@@ -335,10 +335,7 @@ impl RecordSink for MetricsRecordSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             let rm = record.parsed.header.resource_manager_id;
-            *self
-                .by_rm_decision
-                .entry((rm, record.decision))
-                .or_insert(0) += 1;
+            *self.by_rm_route.entry((rm, record.route)).or_insert(0) += 1;
             self.total += 1;
             Ok(())
         })
@@ -701,11 +698,11 @@ impl WalStream {
             // Parse + decide inside an inner scope so any slice
             // borrows back into the walker buffer (`parsed.main_data`,
             // per-block `image`/`data`) live only across the filter
-            // call. For the `Drop` path we materialise the parse to
-            // `'static` so the subsequent `rewrite_record` can take
-            // `&mut self.walker` without conflicting; the `Keep` path
-            // keeps the borrow zero-copy through `record_sink`.
-            let decision;
+            // call. We materialise the parse to `'static` so the
+            // `ToDecoder` in-place NOOP below can take `&mut self.walker`
+            // without conflicting, and so the decoder still reads the
+            // original bytes after the shadow stream is clobbered.
+            let route;
             let parsed_for_sink: XLogRecord<'static>;
             {
                 let parsed = parse_record_from_bytes(
@@ -716,29 +713,43 @@ impl WalStream {
                     offset: start_offset,
                     source,
                 })?;
-                decision = self.filter.decide(&parsed);
+                route = self.filter.decide(&parsed);
                 // Materialise here: `rewrite_record` below mutates
                 // walker.buf which `parsed`'s slices view; the dispatch
                 // below needs the *original* parse, not post-rewrite.
                 parsed_for_sink = parsed.into_owned();
             }
-            let kind = match decision {
-                Decision::Keep => Kind::Kept,
-                Decision::Drop => Kind::Dropped,
+            let kind = match route {
+                Route::ToShadow => Kind::Kept,
+                Route::ToDecoder => Kind::Dropped,
             };
-            if decision == Decision::Drop {
-                let mut bytes = match completed.stitched_bytes {
-                    Some(v) => v,
+            if route == Route::ToDecoder {
+                // `parsed_for_sink` already owns the original bytes the
+                // decoder reads, so clobbering the buffer with the NOOP
+                // here is safe.
+                match completed.stitched_bytes {
+                    // Cross-page: bytes are page-fragmented in the
+                    // buffer, so stitch → NOOP → scatter back across
+                    // `byte_ranges`.
+                    Some(mut bytes) => {
+                        noop_replace(&mut bytes).map_err(|source| WalStreamError::Rewrite {
+                            offset: start_offset,
+                            source,
+                        })?;
+                        self.walker.rewrite_record(&byte_ranges, &bytes);
+                    }
+                    // Single-page: record is contiguous in the buffer;
+                    // NOOP in place, no copy-out + scatter-back.
                     None => {
                         let (off, len) = byte_ranges[0];
-                        self.walker.buffer()[off..off + len].to_vec()
+                        self.walker
+                            .rewrite_record_in_place(off, len, noop_replace)
+                            .map_err(|source| WalStreamError::Rewrite {
+                                offset: start_offset,
+                                source,
+                            })?;
                     }
-                };
-                noop_replace(&mut bytes).map_err(|source| WalStreamError::Rewrite {
-                    offset: start_offset,
-                    source,
-                })?;
-                self.walker.rewrite_record(&byte_ranges, &bytes);
+                }
             }
 
             self.pending_entries.push(Entry {
@@ -765,7 +776,7 @@ impl WalStream {
                 parsed: parsed_for_sink,
                 source_lsn,
                 page_magic,
-                decision,
+                route,
             };
             record_sink.on_record(&record).await?;
         }
@@ -987,7 +998,7 @@ mod tests {
         assert_eq!(record.parsed.header.resource_manager_id, RmId::Xact as u8);
         assert_eq!(record.parsed.header.xact_id, 42);
         assert_eq!(record.page_magic, 0xD110);
-        assert_eq!(record.decision, Decision::Keep);
+        assert_eq!(record.route, Route::ToShadow);
     }
 
     #[test]
@@ -1183,26 +1194,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn metrics_sink_counts_per_rm_decision_and_discards() {
+    async fn metrics_sink_counts_per_rm_route_and_discards() {
         let mut sink = MetricsRecordSink::default();
         let mut heap_keep = synth_record(0, RmId::Heap as u8);
-        heap_keep.decision = Decision::Keep;
+        heap_keep.route = Route::ToShadow;
         let mut heap_drop = synth_record(64, RmId::Heap as u8);
-        heap_drop.decision = Decision::Drop;
+        heap_drop.route = Route::ToDecoder;
         let mut xact_keep = synth_record(128, RmId::Xact as u8);
-        xact_keep.decision = Decision::Keep;
+        xact_keep.route = Route::ToShadow;
         for r in [&heap_keep, &heap_keep, &heap_drop, &xact_keep] {
             sink.on_record(r).await.unwrap();
         }
         assert_eq!(sink.total, 4);
-        assert_eq!(sink.by_rm_decision[&(RmId::Heap as u8, Decision::Keep)], 2,);
-        assert_eq!(sink.by_rm_decision[&(RmId::Heap as u8, Decision::Drop)], 1,);
-        assert_eq!(sink.by_rm_decision[&(RmId::Xact as u8, Decision::Keep)], 1,);
+        assert_eq!(sink.by_rm_route[&(RmId::Heap as u8, Route::ToShadow)], 2,);
+        assert_eq!(sink.by_rm_route[&(RmId::Heap as u8, Route::ToDecoder)], 1,);
+        assert_eq!(sink.by_rm_route[&(RmId::Xact as u8, Route::ToShadow)], 1,);
         let summary = sink.summary();
         assert!(summary.starts_with("total=4"), "got {summary:?}");
-        assert!(summary.contains("heap/keep=2"), "got {summary:?}");
-        assert!(summary.contains("heap/drop=1"), "got {summary:?}");
-        assert!(summary.contains("xact/keep=1"), "got {summary:?}");
+        assert!(summary.contains("heap/to_shadow=2"), "got {summary:?}");
+        assert!(summary.contains("heap/to_decoder=1"), "got {summary:?}");
+        assert!(summary.contains("xact/to_shadow=1"), "got {summary:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

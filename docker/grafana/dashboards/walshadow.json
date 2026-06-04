@@ -233,7 +233,7 @@
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "walshadow-prom" },
           "expr": "rate(walshadow_filter_records_total[$__rate_interval])",
-          "legendFormat": "{{rmgr}} · {{decision}}"
+          "legendFormat": "{{rmgr}} · {{route}}"
         }
       ]
     },

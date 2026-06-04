@@ -1,10 +1,10 @@
-//! Drive a full segment: walk records, decide keep/drop, NOOP-rewrite
-//! dropped records in place, emit manifest sidecar.
+//! Drive a full segment: walk records, decide each record's `Route`,
+//! NOOP-rewrite ToDecoder records in place, emit manifest sidecar.
 
 use thiserror::Error;
 use wal_rs::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
-use crate::filter::{Decision, Filter};
+use crate::filter::{Filter, Route};
 use crate::manifest::{Entry, FILTER_VERSION, Kind, Manifest, ManifestStats};
 use crate::rewrite::{RewriteError, noop_replace};
 use crate::segment::{SegmentWalker, WalkError};
@@ -73,24 +73,36 @@ pub fn filter_segment(
                     source: e,
                 }
             })?;
-        let decision = filter.decide(&parsed);
-        let kind = match decision {
-            Decision::Keep => Kind::Kept,
-            Decision::Drop => Kind::Dropped,
+        let route = filter.decide(&parsed);
+        let kind = match route {
+            Route::ToShadow => Kind::Kept,
+            Route::ToDecoder => Kind::Dropped,
         };
 
-        if decision == Decision::Drop {
-            let mut buf = record.logical_bytes.clone();
-            // Preserve xl_prev from the original record (already in buf).
-            noop_replace(&mut buf).map_err(|e| FilterSegmentError::Rewrite {
-                offset: record.start_offset,
-                source: e,
-            })?;
-            // Scatter rewritten bytes back into `out` at the same ranges.
-            let mut cursor = 0;
-            for &(off, len) in &record.byte_ranges {
-                out[off..off + len].copy_from_slice(&buf[cursor..cursor + len]);
-                cursor += len;
+        if route == Route::ToDecoder {
+            if let [(off, len)] = record.byte_ranges.as_slice() {
+                // Single-page: record is contiguous in `out` (a copy of
+                // source) with its original xl_tot_len + xl_prev intact;
+                // NOOP in place, no clone + scatter-back.
+                noop_replace(&mut out[*off..*off + *len]).map_err(|e| {
+                    FilterSegmentError::Rewrite {
+                        offset: record.start_offset,
+                        source: e,
+                    }
+                })?;
+            } else {
+                // Cross-page: bytes are page-fragmented in `out`, so
+                // NOOP the contiguous logical copy then scatter back.
+                let mut buf = record.logical_bytes.clone();
+                noop_replace(&mut buf).map_err(|e| FilterSegmentError::Rewrite {
+                    offset: record.start_offset,
+                    source: e,
+                })?;
+                let mut cursor = 0;
+                for &(off, len) in &record.byte_ranges {
+                    out[off..off + len].copy_from_slice(&buf[cursor..cursor + len]);
+                    cursor += len;
+                }
             }
         }
 

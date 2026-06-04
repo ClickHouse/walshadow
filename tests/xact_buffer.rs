@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use wal_rs::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
 use walshadow::decoder_sink::{DecoderSinkError, TupleObserver};
-use walshadow::filter::Decision;
+use walshadow::filter::Route;
 use walshadow::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
 };
@@ -453,7 +453,7 @@ fn xact_record(info_op: u8, xid: u32, xact_time: i64) -> Record<'static> {
         },
         source_lsn: 0,
         page_magic: 0xD110,
-        decision: Decision::Keep,
+        route: Route::ToShadow,
     }
 }
 

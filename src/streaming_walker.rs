@@ -262,6 +262,20 @@ impl StreamingWalker {
         debug_assert_eq!(cursor, new_logical.len());
     }
 
+    /// In-place variant of [`rewrite_record`](Self::rewrite_record) for a
+    /// single-page record whose `len` bytes are contiguous in the buffer
+    /// at `off` (`stitched_bytes: None`). Runs `rewrite` directly over
+    /// the segment buffer, skipping the copy-out + scatter-back the
+    /// fragmented (cross-page) path needs.
+    pub fn rewrite_record_in_place<E>(
+        &mut self,
+        off: usize,
+        len: usize,
+        rewrite: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        rewrite(&mut self.buf[off..off + len])
+    }
+
     /// Reset walker state for the next segment. Reuses the existing
     /// 16 MiB buffer allocation (`Vec::clear` retains capacity) so
     /// segment-cadence flushes don't churn the allocator — under

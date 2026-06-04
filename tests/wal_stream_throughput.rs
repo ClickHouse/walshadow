@@ -322,7 +322,7 @@ async fn pump_throughput_breakdown() {
                         parsed: r.parsed.clone().into_owned(),
                         source_lsn: r.source_lsn,
                         page_magic: r.page_magic,
-                        decision: r.decision,
+                        route: r.route,
                     };
                     // Push then immediately pop to drop, so we measure
                     // clone+drop without growing memory unboundedly.
