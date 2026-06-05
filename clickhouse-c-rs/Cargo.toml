@@ -12,10 +12,18 @@ path = "src/lib.rs"
 [features]
 default = ["lz4"]
 lz4 = []
+tokio = ["dep:tokio"]
+# rustls TLS for the blocking Client (tls::TlsIo) and, when `tokio` is also
+# on, AsyncClient::connect_tls.
+tls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
 zstd = []
 
 [dependencies]
 thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "time"], optional = true }
+rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "1", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -29,3 +37,18 @@ all-features = true
 [[example]]
 name = "spawn_clickhouse_local"
 path = "examples/spawn_clickhouse_local.rs"
+
+[[test]]
+name = "async_client"
+path = "tests/async_client.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "tls"
+path = "tests/tls.rs"
+required-features = ["tls", "tokio"]
+
+[[test]]
+name = "tls_live"
+path = "tests/tls_live.rs"
+required-features = ["tls", "tokio"]

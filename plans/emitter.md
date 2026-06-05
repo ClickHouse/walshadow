@@ -437,9 +437,9 @@ reconnect for DDL connection
 - [ops.md](ops.md) — `cursor.rs` writes `emitter_ack_lsn` to on-disk
   cursor file; restart resumes from
   `min(shadow_replay_lsn, emitter_ack_lsn)`
-- [safety.md](safety.md) — `clickhouse-c-rs` unsafe surface
-  (`BlockBuilder` borrows into `ColumnBuf` slabs, `PosixIo` owns fd,
-  `Client` lifetime invariants)
+- [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
+  — `clickhouse-c-rs` unsafe surface (`BlockBuilder` borrows into
+  `ColumnBuf` slabs, `PosixIo` owns fd, `Client` lifetime invariants)
 - [bootstrap.md](bootstrap.md) — transitional bootstrap emitter wiring,
   force-close handshake
 - [oracle.md](oracle.md) — Tier 3 default resolution via PG-side

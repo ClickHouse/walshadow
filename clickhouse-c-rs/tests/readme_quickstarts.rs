@@ -5,14 +5,14 @@
 //! available so CI without them stays green.
 
 use std::io::Read;
+#[cfg(feature = "lz4")]
 use std::net::TcpStream;
 use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
-use clickhouse_c::{
-    Allocator, Block, BlockBuilder, BlockOpts, Client, ClientOpts, Codec, Compression, PacketKind,
-    PosixIo, TypeAst,
-};
+use clickhouse_c::{Allocator, Block, BlockBuilder, BlockOpts, PosixIo, TypeAst};
+#[cfg(feature = "lz4")]
+use clickhouse_c::{Client, ClientOpts, Codec, Compression, Event};
 
 fn clickhouse_on_path() -> bool {
     Command::new("clickhouse")
@@ -139,6 +139,7 @@ fn quickstart_encode_block() -> Result<(), Box<dyn std::error::Error>> {
 // Requires a ClickHouse server reachable at localhost:9000. Skips when not.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "lz4")]
 #[test]
 fn quickstart_tcp_client() -> Result<(), Box<dyn std::error::Error>> {
     let sock = match TcpStream::connect("localhost:9000") {
@@ -186,12 +187,9 @@ fn quickstart_tcp_client() -> Result<(), Box<dyn std::error::Error>> {
     client.send_data(None)?;
 
     loop {
-        let mut pkt = client.recv_packet()?;
-        match pkt.kind() {
-            Some(PacketKind::EndOfStream) => break,
-            Some(PacketKind::Exception) => {
-                return Err(pkt.take_exception().unwrap().into());
-            }
+        match client.recv_event()? {
+            Event::EndOfStream => break,
+            Event::Exception(exc) => return Err(exc.into()),
             _ => {}
         }
     }
@@ -203,12 +201,12 @@ fn quickstart_tcp_client() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(feature = "lz4")]
 fn drain(client: &mut Client<'_>) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let mut pkt = client.recv_packet()?;
-        match pkt.kind() {
-            Some(PacketKind::EndOfStream) => return Ok(()),
-            Some(PacketKind::Exception) => return Err(pkt.take_exception().unwrap().into()),
+        match client.recv_event()? {
+            Event::EndOfStream => return Ok(()),
+            Event::Exception(exc) => return Err(exc.into()),
             _ => {}
         }
     }

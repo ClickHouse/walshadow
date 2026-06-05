@@ -1,5 +1,5 @@
 # walshadow demo. Three services:
-#   source     — postgres:17 with wal_level=logical, demo.users seeded
+#   source     — postgres:18 with wal_level=logical, demo.users seeded
 #                via init script, REPLICA IDENTITY FULL set
 #   clickhouse — clickhouse-server with the demo.users destination
 #                table pre-created
@@ -20,7 +20,7 @@
 
 services:
   source:
-    image: postgres:17-bookworm
+    image: postgres:18-bookworm
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_HOST_AUTH_METHOD: trust
@@ -36,7 +36,10 @@ services:
       - wal_keep_size=128MB
     volumes:
       - ./init/source:/docker-entrypoint-initdb.d:ro
-      - source-data:/var/lib/postgresql/data
+      # PG 18+ official image stores data in a major-version subdir
+      # (/var/lib/postgresql/18/docker); mount the parent, not /data.
+      # See https://github.com/docker-library/postgres/pull/1259
+      - source-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
       interval: 2s
@@ -46,7 +49,7 @@ services:
       - "5432:5432"
 
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.3
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
     volumes:

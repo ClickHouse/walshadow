@@ -12,7 +12,6 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,10 +126,7 @@ async fn native_numeric_time_timetz_round_trip() {
     map.insert(Arc::new(rel_descriptor()));
     let resolver = Arc::new(CatalogMapResolver::new(map));
 
-    let tcp = TcpStream::connect(("127.0.0.1", CH_TCP_PORT)).expect("tcp connect ch");
-    tcp.set_nodelay(true).ok();
-    tcp.set_nonblocking(false).expect("blocking socket");
-    let mut emitter = Emitter::new(cfg, resolver, tcp).expect("init emitter");
+    let mut emitter = Emitter::new(cfg, resolver).await.expect("init emitter");
 
     let tuple = CommittedTuple {
         decoded: DecodedHeap {

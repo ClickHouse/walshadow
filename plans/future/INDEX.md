@@ -12,5 +12,8 @@ here as they surface; promote into `plans/` when they land
 * [ch_bounce_recovery.md](ch_bounce_recovery.md) — deeper re-emit-from-spill on retry-budget exhaustion
 * [pinned_ddl_baseline.md](pinned_ddl_baseline.md) — schema-event outcome must be a function of config + baseline, not cache warmth; seed baseline at start, plus CH-existence / persisted-baseline options for cross-restart consistency
 * [coverage100.md](coverage100.md) — drive `cargo llvm-cov` line coverage toward 100%: tiered work list (pure units → fixtures → live e2e → hard tail)
+* [FUZZ.md](FUZZ.md) — continuous coverage-guided fuzzing (cargo-fuzz/libFuzzer) across wal-rs + walshadow + clickhouse-c-rs: tiered targets, round-trip/differential oracles, C-boundary ASan, unattended-VM supervisor
+* [parallel_decode_and_insert.md](parallel_decode_and_insert.md) — M decoders feeding N inserters against CH Cloud SMT; coalescing seam, cumulative-ack watermark, substrate-agnostic inserter for `clickhouse-c-rs-async`
+* [clickhouse_async/INDEX.md](clickhouse_async/INDEX.md) — native sans-io async in clickhouse-c (additive `clickhouse-async.h` + would-block/rewind core + thread-free Rust client); phased, with column-resumption design open
 * [risks.md](risks.md) — measurement-deferred risks and open questions
 * [parked.md](parked.md) — small operational polish + cross-major fixtures + skipped-test drive

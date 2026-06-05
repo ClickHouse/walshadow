@@ -8,7 +8,7 @@
 #      this same container by --bootstrap-autospawn-shadow) can
 #      `CREATE EXTENSION walshadow` against its own $libdir.
 
-ARG PG_MAJOR=17
+ARG PG_MAJOR=18
 
 FROM rust:1-alpine AS rust-builder
 # build-base: gcc 15 + musl-dev + make. lz4/zstd dev+headers for the

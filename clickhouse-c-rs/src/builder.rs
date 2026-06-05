@@ -19,17 +19,20 @@ use crate::types::TypeRef;
 /// without copying.
 pub struct BlockBuilder<'a> {
     raw: NonNull<sys::chc_block_builder>,
+    _alloc: Box<Allocator>,
     _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> BlockBuilder<'a> {
     pub fn new(alloc: Allocator) -> Result<Self> {
+        let alloc = Box::new(alloc);
         let mut out: *mut sys::chc_block_builder = core::ptr::null_mut();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_block_builder_init(&mut out, alloc.as_ptr(), &mut err) };
         check(rc, &err)?;
         Ok(Self {
             raw: NonNull::new(out).expect("chc_block_builder_init returned OK with NULL"),
+            _alloc: alloc,
             _marker: PhantomData,
         })
     }
@@ -274,3 +277,8 @@ impl<'a> Drop for BlockBuilder<'a> {
 }
 
 unsafe impl<'a> Send for BlockBuilder<'a> {}
+// Sync: a shared `&BlockBuilder` only exposes read-only operations
+// (`as_ptr`, `write`); mutation requires `&mut self`. The async client
+// holds `&BlockBuilder` across the `send_data` await, so the borrow
+// must be `Send`, which needs the builder `Sync`.
+unsafe impl<'a> Sync for BlockBuilder<'a> {}

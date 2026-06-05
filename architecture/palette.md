@@ -33,7 +33,6 @@ fontcolor #ECE1D7
 | on-disk artifact | #4D3850 (shape=note) |
 | shadow Postgres | #3D4128 |
 | ClickHouse | #4D4128 |
-| unsafe annotation (safety only) | #6D2D2D (dashed border) |
 
 ## edge colors (channel)
 
@@ -46,7 +45,7 @@ fontcolor #ECE1D7
 | CH DDL SQL (separate TCP) | #BF8C5F | dashed |
 | cursor durability | #b380b0 | dotted |
 | filesystem / restore_command | #6E6963 | dashed |
-| unsafe annotation (safety only) | #B58B86 | dashed, constraint=false |
+| error / sidecar feedback | #B58B86 | dashed, constraint=false |
 
 ## sidecar edges
 

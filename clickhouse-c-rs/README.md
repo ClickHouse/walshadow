@@ -6,6 +6,8 @@ ClickHouse Native wire format. Two entry points:
 - raw block frames over any fd (TCP socket, pipe to `clickhouse local`)
 - TCP packet loop (Hello / Query / Data / EOS / Exception / Progress)
   with optional LZ4 / ZSTD compression
+- Tokio async TCP packet loop with feature `tokio`
+- TLS (rustls) for both the blocking and async clients with feature `tls`
 
 [clickhouse-c]: https://github.com/ClickHouse/clickhouse-c
 
@@ -54,13 +56,18 @@ pointers to caller-owned bytes until `chc_block_write`. Mirrored as
 `BlockBuilder<'a>`; each `append_*` takes `&'a [u8]` / `&'a [u64]` &
 each appended `TypeRef<'a>`. Caller keeps slabs alive for `'a`.
 
-**Self-referential C structs are pinned.** `chc_io` carries a pointer
-back into the `chc_posix_io` state it was initialized from. `chc_codec`
-is similarly addressed by code that calls into its function-pointer
-table. `PosixIo` & `Codec` ship behind `Pin<Box<Self>>` & expose
-internals only through `Pin<&mut _>` / `Pin<&_>`. `Codec::raw_mut` is
-`unsafe`: caller must populate the function-pointer table to match the
-[`Compression`] the codec is paired with.
+**Self-referential C structs.** `chc_io` carries a pointer back into the
+`chc_posix_io` state it was initialized from; `PosixIo` holds both inline
+& lets `chc_posix_io_init` wire the back-pointer, so it is genuinely
+pinned (`PhantomPinned`) — mirroring how `TlsIo` embeds a `chc_io` whose
+`ud` points at its own rustls stream. `chc_codec` is addressed by
+compression code calling into its function-pointer table, so `Codec` is
+likewise pinned. All ship behind `Pin<Box<Self>>` & expose internals
+through `Pin<&mut _>` / `Pin<&_>`: `PosixIo` for ownership-passing into
+[`Client`] / [`Block`] / [`BlockBuilder`], `Codec` because it must not
+move. `Codec::raw_mut` is `unsafe`: caller must
+populate the function-pointer table to match the [`Compression`] the
+codec is paired with.
 
 **`Client` owns its I/O + codec.** `chc_client` stashes raw pointers
 to `chc_io` & `chc_codec` for the connection's lifetime; using
@@ -83,10 +90,24 @@ likewise return `&[u8]` so the UTF-8 question stays at the
 consumer; `TypeRef::format` is the one place a `String` is materialized
 & uses `from_utf8_lossy`.
 
+**Packet payloads alias a union.** `chc_packet` is a `kind` tag plus a
+`payload` union — `block`, `exception`, `progress` and `profile` share
+one slot, mirroring the C header. Exactly one arm is live, selected by
+`kind`; reading any other is UB. `chc_packet_payload` therefore makes
+every read `unsafe`, and a single reader — `Event::from_raw`, shared by
+the blocking `Client` and the async client — converts a recv'd packet
+into an owned `Event`, reading each arm only inside its `kind` match. A
+new `chc_packet` member must be a union arm, never a parallel struct
+field: a field laid out past the union's offset reads zero for every
+packet, silently turning exception payloads into NULL.
+
 **Send / Sync.** Every owning handle is `Send`; none are `Sync`. Each
 `chc_client` is single-threaded upstream; block & builder objects
 follow. `Allocator` is the only `Sync` type (stateless function-pointer
-vtable).
+vtable). `AsyncClient` (feature `tokio`) is `Send` too, and its method
+futures stay `Send` because no raw FFI pointer is held across an
+`.await` — each `chc_async_*` call resolves the C-owned slice or pointer
+in a tight scope and awaits only on the copied `&[u8]`.
 
 ## Quickstart
 
@@ -155,7 +176,7 @@ expects LE bytes. Big-endian hosts swap before append.
 ### TCP client
 
 ```rust
-use clickhouse_c::{Allocator, Client, ClientOpts, Codec, Compression, PacketKind, PosixIo};
+use clickhouse_c::{Allocator, Client, ClientOpts, Codec, Compression, Event, PosixIo};
 use std::net::TcpStream;
 
 let sock = TcpStream::connect("localhost:9000")?;
@@ -179,15 +200,52 @@ client.send_query("INSERT INTO t FORMAT Native", None)?;
 client.send_data(None)?;
 
 loop {
-    let mut pkt = client.recv_packet()?;
-    match pkt.kind() {
-        Some(PacketKind::EndOfStream) => break,
-        Some(PacketKind::Exception) => {
-            return Err(pkt.take_exception().unwrap().into());
-        }
+    match client.recv_event()? {
+        Event::EndOfStream => break,
+        Event::Exception(exc) => return Err(exc.into()),
         _ => {}
     }
 }
+```
+
+### TLS (feature `tls`)
+
+rustls verifies the peer against `tls::default_config()` (Mozilla webpki
+roots, no client auth). `rustls` is re-exported as `clickhouse_c::tls::rustls`
+so callers can build a bespoke `ClientConfig` (private CA, mTLS) and pass it
+in. The native secure port is `9440`.
+
+Async — wraps the `tokio::net::TcpStream` in a TLS stream (also needs
+feature `tokio`):
+
+```rust,ignore
+use clickhouse_c::{AsyncClient, ClientOpts};
+
+let mut client = AsyncClient::connect_tls(
+    ("myhost.clickhouse.cloud", 9440),
+    "myhost.clickhouse.cloud",          // SNI + cert hostname
+    ClientOpts::new().user("default").password("…"),
+    None,                               // or Some(Codec::lz4())
+    clickhouse_c::tls::default_config(),
+).await?;
+```
+
+Blocking — `tls::TlsIo` is a `ClientIo` backend over an owned `TcpStream`;
+hand it to the same `Client::init` the plaintext path uses:
+
+```rust,ignore
+use clickhouse_c::{Allocator, Client, ClientOpts, tls};
+use std::net::TcpStream;
+
+let tcp = TcpStream::connect(("myhost.clickhouse.cloud", 9440))?;
+tcp.set_nodelay(true).ok();
+let io = tls::TlsIo::connect(tcp, "myhost.clickhouse.cloud", tls::default_config())?;
+let mut client = Client::init(
+    &ClientOpts::new().user("default").password("…"),
+    Allocator::stdlib(),
+    io,
+    None,
+)?;
 ```
 
 ## Feature flags
@@ -195,7 +253,12 @@ loop {
 | Feature | Default | Effect |
 |---|---|---|
 | `lz4`   | on      | compile clickhouse-compression.h's LZ4 wrapper, link `-llz4`, expose `Codec::lz4()` |
+| `tls`   | off     | rustls TLS: `tls::TlsIo` backend for the blocking `Client`, `AsyncClient::connect_tls`, `tls::default_config()` (webpki roots) |
+| `tokio` | off     | expose `AsyncClient` over `tokio::net::TcpStream` |
 | `zstd`  | off     | compile clickhouse-compression.h's ZSTD wrapper, link `-lzstd`, expose `Codec::zstd()` |
+
+`tls` pulls in `rustls` + `webpki-roots` (+ `tokio-rustls` for the async
+path). Async TLS needs both `tls` and `tokio`.
 
 `default-features = false` for an uncompressed-only build with no
 compression libs linked.
@@ -219,11 +282,14 @@ Mirrors upstream's list plus Rust-specific items:
 - HTTP — wrap libcurl or a Rust HTTP client
 - DNS, endpoint round-robin, pooling, retry / backoff — caller-driven;
   `PosixIo` only wraps a connected fd
-- TLS — caller drives OpenSSL / rustls & feeds bytes through a custom
-  `chc_io`. `clickhouse-openssl.h` not wired into the Rust layer yet
+- TLS beyond rustls — the `tls` feature ships a rustls backend
+  (`tls::TlsIo` / `AsyncClient::connect_tls`); for a different stack the
+  caller can still drive OpenSSL through a custom `chc_io`
+  (`clickhouse-openssl.h`) or hand `connect_tls` a bespoke
+  `rustls::ClientConfig`
 - Threading — each `Client` is single-threaded, matching upstream
-- Async I/O — `chc_io.read` / `.write` are called synchronously; wrap
-  the fd in a blocking transport
+- Runtime-neutral Rust async — `AsyncClient` is Tokio-native; custom
+  event loops can drive `chc_async_*` through `sys`
 - `Variant` / `Dynamic` / `JSON` / `AggregateFunction` decoding —
   upstream excludes from v1 (25.x / 26.x wire format still shifting).
   `BlockBuilder::append_json_string` covers the STRING-serialization

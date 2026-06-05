@@ -90,15 +90,15 @@ use std::pin::Pin;
 pub const DEFAULT_XACT_BUFFER_MAX: usize = 64 * 1024 * 1024;
 
 /// XLOG_XACT info-op constants. Mirror PG `access/xact.h` L169-179.
-const XLOG_XACT_OPMASK: u8 = 0x70;
-const XLOG_XACT_COMMIT: u8 = 0x00;
-const XLOG_XACT_ABORT: u8 = 0x20;
-const XLOG_XACT_COMMIT_PREPARED: u8 = 0x30;
-const XLOG_XACT_ABORT_PREPARED: u8 = 0x40;
-const XLOG_XACT_ASSIGNMENT: u8 = 0x50;
+pub(crate) const XLOG_XACT_OPMASK: u8 = 0x70;
+pub(crate) const XLOG_XACT_COMMIT: u8 = 0x00;
+pub(crate) const XLOG_XACT_ABORT: u8 = 0x20;
+pub(crate) const XLOG_XACT_COMMIT_PREPARED: u8 = 0x30;
+pub(crate) const XLOG_XACT_ABORT_PREPARED: u8 = 0x40;
+pub(crate) const XLOG_XACT_ASSIGNMENT: u8 = 0x50;
 /// `xinfo` field follows the leading `xact_time` when this bit is set
 /// in the record header's `info`. `access/xact.h` L182.
-const XLOG_XACT_HAS_INFO: u8 = 0x80;
+pub(crate) const XLOG_XACT_HAS_INFO: u8 = 0x80;
 
 /// `xinfo` bits driving xl_xact_commit / xl_xact_abort tail layout.
 /// `access/xact.h` L188-196. The commit/abort parser only consumes
@@ -188,16 +188,16 @@ impl SubxactTracker {
 /// only needs the timestamp + subxact list; remaining xinfo tails are
 /// skip-walked through but unread.
 #[derive(Debug, Default)]
-struct XactCommitPayload {
-    xact_time: i64,
-    subxacts: Vec<u32>,
+pub(crate) struct XactCommitPayload {
+    pub(crate) xact_time: i64,
+    pub(crate) subxacts: Vec<u32>,
 }
 
 /// `xl_xact_assignment` payload (`access/xact.h` L218-225). Returns
 /// `(xtop, subxids)` from `main_data`. `xtop` is canonical — the
 /// record header's `xact_id` is the same value in steady state, but
 /// the payload is the documented source of truth.
-fn parse_xact_assignment(main_data: &[u8]) -> Option<(u32, Vec<u32>)> {
+pub(crate) fn parse_xact_assignment(main_data: &[u8]) -> Option<(u32, Vec<u32>)> {
     if main_data.len() < 8 {
         return None;
     }
@@ -230,7 +230,7 @@ fn parse_xact_assignment(main_data: &[u8]) -> Option<(u32, Vec<u32>)> {
 /// `info` is the record header's `info` byte. `XLOG_XACT_HAS_INFO`
 /// (`0x80`) gates the `xinfo` u32 immediately after `xact_time`. The
 /// commit-prepared / abort-prepared codepaths set the same flag.
-fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayload {
+pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayload {
     let mut out = XactCommitPayload::default();
     if main_data.len() < 8 {
         return out;
@@ -1017,6 +1017,132 @@ impl XactBuffer {
         Ok(())
     }
 
+    /// Drain a committed xact for the parallel pipeline: pull its
+    /// buffered entries, k-way merge by `source_lsn`, and return the
+    /// ordered (still-toasted) heaps + TOAST chunk map + interleaved
+    /// schema events — *without* detoast or downstream dispatch (those move
+    /// to the decode pool / barrier coordinator). Updates buffer stats
+    /// (`xacts_active`, spill, `drain_lsn`, `committed_xacts_total`) exactly
+    /// like [`Self::commit`] does, but the durability watermark is the
+    /// pipeline ack collector's job, so `emitter_ack_lsn` is not touched.
+    pub async fn drain_committed(
+        &mut self,
+        top_xid: u32,
+        commit_ts: i64,
+        commit_lsn: u64,
+        subxids: &[u32],
+    ) -> std::result::Result<DrainedXact, XactBufferError> {
+        let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
+        xids.push(top_xid);
+        xids.extend_from_slice(subxids);
+        let mut states: Vec<XactState> = Vec::with_capacity(xids.len());
+        for x in &xids {
+            if let Some(st) = self.inflight.remove(x) {
+                states.push(st);
+            }
+        }
+        // drain_lsn marks the dispatch boundary regardless of contents.
+        self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
+        if states.is_empty() {
+            // Read-only / filter-dropped xact: no rows, but the reorder
+            // coordinator still registers a seq so the contiguous watermark
+            // can advance past `commit_lsn`.
+            self.stats.commits_unknown_xid += 1;
+            return Ok(DrainedXact {
+                commit_ts,
+                commit_lsn,
+                heaps: Vec::new(),
+                chunks: HashMap::new(),
+                ordered_events: Vec::new(),
+                had_states: false,
+            });
+        }
+        for st in &states {
+            self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
+            self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
+        }
+        self.stats.bytes_in_memory = self.bytes_in_memory as u64;
+
+        // Spill files first (older), then in-mem entries, per xid; result is
+        // one `source_lsn`-ASC deque per xid for the k-way merge. Mirrors
+        // the drain in [`Self::commit`].
+        let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
+        let mut per_xid_catalog: Vec<VecDeque<(u64, SchemaEvent)>> =
+            Vec::with_capacity(states.len());
+        for mut st in states.drain(..) {
+            let in_mem = std::mem::take(&mut st.in_mem);
+            let mut entries: VecDeque<SpillEntry> = VecDeque::with_capacity(in_mem.len());
+            if let Some(writer) = st.spill.take() {
+                let bc = writer.byte_count();
+                self.stats.spill_bytes_active = self.stats.spill_bytes_active.saturating_sub(bc);
+                self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
+                let mut reader = writer.finish().await?;
+                while let Some(entry) = reader.next().await? {
+                    entries.push_back(entry);
+                }
+                reader.unlink().await?;
+            }
+            entries.extend(in_mem);
+            per_xid.push(entries);
+            let cat: VecDeque<(u64, SchemaEvent)> = std::mem::take(&mut st.catalog_events).into();
+            per_xid_catalog.push(cat);
+        }
+
+        let mut heaps: Vec<DecodedHeap> = Vec::new();
+        let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
+        let mut ordered_events: Vec<(usize, SchemaEvent)> = Vec::new();
+        loop {
+            #[derive(Clone, Copy)]
+            enum Pick {
+                Spill(usize, u64),
+                Catalog(usize, u64),
+            }
+            let mut best: Option<Pick> = None;
+            let best_lsn = |p: Pick| match p {
+                Pick::Spill(_, l) | Pick::Catalog(_, l) => l,
+            };
+            // Catalog events tie-break first: PG writes the DDL's catalog
+            // mutation before the dependent heap, and they can share an LSN.
+            for (i, q) in per_xid_catalog.iter().enumerate() {
+                let Some(&(lsn, _)) = q.front() else {
+                    continue;
+                };
+                if best.is_none_or(|b| lsn <= best_lsn(b)) {
+                    best = Some(Pick::Catalog(i, lsn));
+                }
+            }
+            for (i, q) in per_xid.iter().enumerate() {
+                let Some(head) = q.front() else { continue };
+                let lsn = entry_lsn(head);
+                if best.is_none_or(|b| lsn < best_lsn(b)) {
+                    best = Some(Pick::Spill(i, lsn));
+                }
+            }
+            let Some(pick) = best else {
+                break;
+            };
+            match pick {
+                Pick::Spill(i, _) => {
+                    let entry = per_xid[i].pop_front().expect("just peeked head");
+                    accumulate(entry, &mut heaps, &mut chunks);
+                }
+                Pick::Catalog(i, _) => {
+                    let (_lsn, ev) = per_xid_catalog[i].pop_front().expect("just peeked head");
+                    ordered_events.push((heaps.len(), ev));
+                }
+            }
+        }
+        self.stats.committed_xacts_total += 1;
+        Ok(DrainedXact {
+            commit_ts,
+            commit_lsn,
+            heaps,
+            chunks,
+            ordered_events,
+            had_states: true,
+        })
+    }
+
     /// Idle-tick ack: advance `drain_lsn` to `lsn` (dispatched marker)
     /// when no xact is in flight, and `emitter_ack_lsn` to
     /// `min(lsn, ack_ceiling)`. Pump loop drives this after the queueing
@@ -1098,6 +1224,22 @@ impl XactBuffer {
     }
 }
 
+/// A committed xact drained for the parallel pipeline by
+/// [`XactBuffer::drain_committed`]. Heaps are still TOAST-toasted; the decode
+/// pool handles detoast, type resolution, and routing. A non-empty
+/// `ordered_events` (or a `HeapOp::Truncate` heap) makes this a barrier the
+/// reorder coordinator serializes against ClickHouse.
+pub struct DrainedXact {
+    pub commit_ts: i64,
+    pub commit_lsn: u64,
+    pub heaps: Vec<DecodedHeap>,
+    pub chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
+    /// `(heap_index, event)` — the event sorts before `heaps[heap_index]`.
+    pub ordered_events: Vec<(usize, SchemaEvent)>,
+    /// False for a read-only / filter-dropped / unknown xid (no rows).
+    pub had_states: bool,
+}
+
 fn accumulate(
     entry: SpillEntry,
     heaps: &mut Vec<DecodedHeap>,
@@ -1114,7 +1256,7 @@ fn accumulate(
     }
 }
 
-async fn detoast_heap(
+pub(crate) async fn detoast_heap(
     heap: &mut DecodedHeap,
     chunks: &HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
     catalog: &Arc<Mutex<ShadowCatalog>>,
@@ -1813,7 +1955,7 @@ impl RecordSink for BufferingDecoderSink {
 /// where to route them (xact buffer, applicator, etc). Uses
 /// `try_recv` in a tight loop — the channel is unbounded + same-task,
 /// so no contention.
-fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent> {
+pub(crate) fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent> {
     let mut out = Vec::new();
     let mut guard = rx.lock().expect("schema event rx mutex poisoned");
     while let Ok(ev) = guard.try_recv() {

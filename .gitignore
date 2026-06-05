@@ -3,6 +3,7 @@
 coverage/
 preprocessed_configs/
 /results
+/access
 pgext/out/
 pgext/log/
 

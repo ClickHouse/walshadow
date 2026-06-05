@@ -23,6 +23,9 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .file("src/wrapper.c")
+        // Layout probes (sizeof/_Alignof/offsetof) consumed by tests/layout.rs
+        // to catch silent struct drift on a header bump.
+        .file("src/layout_probe.c")
         .include(&chc_dir)
         .std("c2x")
         .warnings(true)
@@ -47,6 +50,7 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=src/wrapper.c");
+    println!("cargo:rerun-if-changed=src/layout_probe.c");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CHC_INCLUDE_DIR");
     for h in [
@@ -54,6 +58,7 @@ fn main() {
         "clickhouse-posix-io.h",
         "clickhouse-compression.h",
         "clickhouse-client.h",
+        "clickhouse-async.h",
     ] {
         let p = chc_dir.join(h);
         if p.exists() {

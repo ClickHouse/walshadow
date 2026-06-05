@@ -16,8 +16,8 @@
 //!
 //! ## Connection lifecycle
 //!
-//! The applicator opens its own `clickhouse_c::Client` (separate from
-//! the emitter's INSERT pump) so DDL doesn't ride the INSERT
+//! The applicator opens its own `clickhouse_c::AsyncClient` (separate
+//! from the emitter's INSERT pump) so DDL doesn't ride the INSERT
 //! backpressure path. Same `(host, port, user, password, database)` as
 //! the emitter; built from the same `EmitterConfig`.
 //!
@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use clickhouse_c::{Allocator, Client};
+use clickhouse_c::AsyncClient;
 
 use crate::ch_emitter::{
     ColumnMapping, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, TableMapping,
@@ -140,9 +140,9 @@ impl DdlConfig {
     }
 }
 
-/// CH-side DDL writer. Owns one clickhouse-c Client over its own TCP.
+/// CH-side DDL writer. Owns one clickhouse-c AsyncClient over its own TCP.
 pub struct DdlApplicator {
-    client: Client<'static>,
+    client: AsyncClient,
     config: DdlConfig,
     mapping: MappingHandle,
     pub stats: DdlStats,
@@ -165,16 +165,15 @@ pub struct DdlStats {
 }
 
 impl DdlApplicator {
-    /// Build an applicator backed by `tcp`. Caller supplies a blocking-
-    /// mode `std::net::TcpStream` already connected to CH — same shape
-    /// as [`crate::ch_emitter::Emitter::new`].
-    pub fn new(
+    /// Build an applicator with its own CH connection. Opens a fresh
+    /// `tokio` TCP socket to `(host, port)` via [`AsyncClient`] — same
+    /// shape as [`crate::ch_emitter::Emitter::new`].
+    pub async fn new(
         emitter_cfg: &EmitterConfig,
         ddl_cfg: DdlConfig,
         mapping: MappingHandle,
-        tcp: std::net::TcpStream,
     ) -> Result<Self, EmitterError> {
-        let client = connect_client(emitter_cfg, Allocator::stdlib(), tcp)?;
+        let client = connect_client(emitter_cfg).await?;
         Ok(Self {
             client,
             config: ddl_cfg,
@@ -466,6 +465,18 @@ impl DdlApplicator {
         }
     }
 
+    /// Execute `TRUNCATE TABLE <target>` for a mapped source relation.
+    /// No-op for unmapped relations (mirrors the emitter's row-skip).
+    /// The pipeline's reorder coordinator calls this inside a barrier
+    /// (after all earlier data is durable) so the truncate orders correctly
+    /// against inserts despite the otherwise out-of-order pipeline.
+    pub async fn truncate(&mut self, qualified_name: &str) -> Result<(), EmitterError> {
+        let Some(target) = self.mapping_target(qualified_name).await else {
+            return Ok(());
+        };
+        self.execute(&format!("TRUNCATE TABLE {target}")).await
+    }
+
     async fn mapping_target(&mut self, qualified_name: &str) -> Option<String> {
         let m = self.mapping.read().await;
         m.get(qualified_name).map(|t| t.target.clone())
@@ -476,8 +487,8 @@ impl DdlApplicator {
     /// to be sent.
     async fn execute(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
-        self.client.send_query(sql, None)?;
-        drain_to_end_of_stream(&mut self.client)
+        self.client.send_query(sql, None).await?;
+        drain_to_end_of_stream(&mut self.client).await
     }
 }
 
