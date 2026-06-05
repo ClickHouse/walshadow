@@ -52,10 +52,11 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
-use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, MappingHandle};
+use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, EmitterStats, MappingHandle};
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
+use walshadow::pipeline::{PipelineConfig, PipelineHandle};
 use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
@@ -68,7 +69,9 @@ use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
-use walshadow::xact_buffer::{BufferingDecoderSink, XactBuffer, XactBufferConfig, XactRecordSink};
+use walshadow::xact_buffer::{
+    BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig, XactRecordSink,
+};
 
 /// Bootstrap source impl pick. Hook in front of the WAL pump:
 /// landing catalog files + writing standby.signal so a fresh shadow PG
@@ -100,12 +103,12 @@ enum BootstrapMode {
 /// xact_drain flushes the matching commit/abort. A multi-statement xact
 /// whose COMMIT lands in the same dispatch batch as its heap records
 /// would otherwise miss the latest writes.
-struct DecoderXactPair {
+struct DecoderXactPair<D: RecordSink + Send> {
     decoder: BufferingDecoderSink,
-    xact_drain: XactRecordSink<Box<dyn TupleObserver>>,
+    xact_drain: D,
 }
 
-impl RecordSink for DecoderXactPair {
+impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
@@ -278,6 +281,18 @@ struct Args {
     /// `wait_for_replay` lags one batch behind the pump).
     #[arg(long, default_value_t = DEFAULT_QUEUEING_BATCH_SIZE)]
     decoder_batch_size: usize,
+    /// Decode-pool size (M): parallel workers doing CPU/IO decode work
+    /// (detoast, type coercion, oracle resolution) feeding the insert
+    /// batcher. Only meaningful with `--ch-config`. `1` (default) keeps
+    /// decode serial so per-table WAL order is preserved; M>1 relaxes
+    /// per-table order, relying on `_lsn` ReplacingMergeTree dedup.
+    #[arg(long, default_value_t = 1)]
+    decoder_pool_size: usize,
+    /// Insert-pool size (N): concurrent ClickHouse connections sending
+    /// INSERTs. Cloud throughput is RTT/part-commit bound, so N>1 is the
+    /// main throughput lever. Only meaningful with `--ch-config`.
+    #[arg(long, default_value_t = 1)]
+    inserter_pool_size: usize,
     /// Xact / TOAST buffer spill dir. Created on boot if missing;
     /// wiped clean every startup per the crash-recovery contract in
     /// [plans/xact.md](../../plans/xact.md).
@@ -761,99 +776,106 @@ async fn run(args: Args) -> Result<()> {
         "spill dir ready",
     );
 
-    // Pick the xact-drain observer: CH-Native emitter when
-    // `--ch-config` is supplied, else stay metrics-only. Wrapped in
-    // `Box<dyn TupleObserver>` so both arms share one drain-sink type.
+    // The buffering decoder (heap → xact buffer) runs behind a
+    // `QueueingRecordSink` worker so its `wait_for_replay` calls don't
+    // park the pump task (which would freeze the shadow-PG wire). Its
+    // drain half differs by mode: with `--ch-config` the parallel
+    // decode+insert pipeline (M decoders, N inserters); without, a
+    // serial metrics-only drain.
     //
-    // Config read + TCP connect ride tokio's async APIs so a slow DNS
-    // / stalled CH boot can't pin the runtime worker. Hand-off to the
-    // emitter requires a blocking-mode `std::net::TcpStream` because
-    // clickhouse-c-rs wraps a raw fd through `chc_posix_io` (sync
-    // read/write vtable), so we `into_std()` + `set_nonblocking(false)`
-    // right before construction.
-    let mut mapping_handle: Option<MappingHandle> = None;
-    let mut emitter_stats_handle: Option<Arc<walshadow::ch_emitter::EmitterStats>> = None;
-    let inner_observer: Box<dyn TupleObserver> = match initial_ch_config {
-        Some(emitter_cfg) => {
-            let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-            let tcp = tokio::net::TcpStream::connect(&addr)
-                .await
-                .with_context(|| format!("connect CH at {addr}"))?;
-            tcp.set_nodelay(true).ok();
-            let std_tcp = tcp.into_std().context("tokio→std TcpStream handoff")?;
-            std_tcp
-                .set_nonblocking(false)
-                .context("set CH socket to blocking for chc_posix_io")?;
-            let emitter = Emitter::new(emitter_cfg.clone(), catalog.clone(), std_tcp)
-                .context("init CH emitter")?;
-            mapping_handle = Some(emitter.mapping_handle());
-            // Second CH connection for the DDL applicator.
-            // Separate TCP so ALTER / CREATE / DROP don't ride the
-            // INSERT pump's backpressure path. Build only when the
-            // emitter is wired (no point in a DDL connection without
-            // an upstream observer).
-            let ddl_tcp = tokio::net::TcpStream::connect(&addr)
-                .await
-                .with_context(|| format!("connect CH DDL at {addr}"))?;
-            ddl_tcp.set_nodelay(true).ok();
-            let ddl_std = ddl_tcp
-                .into_std()
-                .context("tokio→std TcpStream handoff for DDL")?;
-            ddl_std
-                .set_nonblocking(false)
-                .context("set CH DDL socket to blocking for chc_posix_io")?;
-            let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_emitter(&emitter_cfg);
-            let applicator = walshadow::ch_ddl::DdlApplicator::new(
-                &emitter_cfg,
-                ddl_cfg,
-                emitter.mapping_handle(),
-                ddl_std,
-            )
-            .context("init DDL applicator")?;
-            let emitter = emitter.with_applicator(applicator);
-            tracing::info!(target: "walshadow::ch_emitter", addr = %addr, "ch emitter + DDL applicator connected");
-            let observer = EmitterObserver::new(emitter);
-            emitter_stats_handle = Some(observer.stats_handle());
-            Box::new(observer)
-        }
-        None => Box::new(MetricsTupleObserver::default()),
-    };
-    // Wrap with OracleObserver when an oracle is up. The
-    // wrapper resolves PgPending columns via shadow PG's extension
-    // (no-op when extension is absent) and fires 1-in-N validator
-    // probes when `--validate > 0`. Skip the wrapper entirely if the
-    // oracle is disabled — keeps the dispatch chain tight for the
-    // metrics-only / no-shadow-extension case.
-    let observer: Box<dyn TupleObserver> = match oracle.clone() {
-        Some(o) => Box::new(walshadow::oracle::OracleObserver::new(o, inner_observer)),
-        None => inner_observer,
-    };
-    // Fan-out: metrics-by-rmgr first (sync, on pump task), then the
-    // buffering decoder (heap → xact buffer) + xact-record drain
-    // (commit/abort → emit) pair queued behind a worker task so their
-    // `wait_for_replay` calls don't park the pump task. Ordering
-    // inside the worker keeps per-rmgr counters intact: xact_drain
-    // runs after decoder absorbs any heap records in the same dispatch
-    // batch as the commit.
-    // Subscribe BufferingDecoderSink + XactRecordSink to
-    // schema events the catalog publishes at descriptor-fetch time
-    // and at commit-boundary `sweep_dropped` sweeps. Shared
-    // `Arc<Mutex<…>>` so both sinks pull from the same queue.
+    // Subscribe to the catalog's schema events (descriptor-fetch +
+    // commit-boundary `sweep_dropped`); shared `Arc<Mutex<…>>` so both the
+    // decoder and the drain stage pull from the same queue.
     let schema_events = Arc::new(std::sync::Mutex::new(catalog.lock().await.subscribe()));
     let decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
         .with_schema_events(schema_events.clone());
     let decoder_stats_handle = decoder.stats_handle();
-    let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer)
-        .with_schema_events(schema_events)
-        .with_pg_class_delete_epoch(pg_class_delete_epoch);
-    let decoder_xact = QueueingRecordSink::spawn(
-        DecoderXactPair {
-            decoder,
-            xact_drain,
-        },
-        args.decoder_batch_size,
-        args.decoder_queue_capacity,
-    );
+
+    let mut mapping_handle: Option<MappingHandle> = None;
+    let mut emitter_stats_handle: Option<Arc<EmitterStats>> = None;
+    let mut pipeline_handle: Option<PipelineHandle> = None;
+    // When the pipeline is wired, the durable watermark comes from its ack
+    // collector atomic instead of the xact buffer's synchronous field.
+    let mut pipeline_ack: Option<Arc<AtomicU64>> = None;
+
+    let decoder_xact = match initial_ch_config {
+        Some(emitter_cfg) => {
+            let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+            // SIGHUP-reloadable mapping shared by the DDL applicator + the
+            // decode pool (was previously owned by the serial Emitter).
+            let mapping: MappingHandle =
+                Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+            mapping_handle = Some(mapping.clone());
+            // DDL applicator on its own CH connection; owned by the reorder
+            // coordinator so ALTER / CREATE / DROP / TRUNCATE apply inside
+            // the barrier (after earlier data is durable).
+            let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_emitter(&emitter_cfg);
+            let applicator =
+                walshadow::ch_ddl::DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone())
+                    .await
+                    .context("init DDL applicator")?;
+            let stats = Arc::new(EmitterStats::default());
+            emitter_stats_handle = Some(stats.clone());
+            let emitter_ack = Arc::new(AtomicU64::new(0));
+            pipeline_ack = Some(emitter_ack.clone());
+            let pcfg = PipelineConfig {
+                emitter: emitter_cfg,
+                decoder_pool_size: args.decoder_pool_size,
+                inserter_pool_size: args.inserter_pool_size,
+                catalog: catalog.clone(),
+                mapping,
+                oracle: oracle.clone(),
+                applicator,
+                buffer: xact_buffer.clone(),
+                subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
+                schema_events: Some(schema_events.clone()),
+                pg_class_delete_epoch: Some(pg_class_delete_epoch.clone()),
+                stats,
+            };
+            let (reorder_sink, handle) = pcfg
+                .spawn(emitter_ack)
+                .await
+                .context("spawn decode+insert pipeline")?;
+            pipeline_handle = Some(handle);
+            tracing::info!(
+                target: "walshadow::pipeline",
+                addr = %addr,
+                decoders = args.decoder_pool_size.max(1),
+                inserters = args.inserter_pool_size.max(1),
+                "parallel decode+insert pipeline started",
+            );
+            QueueingRecordSink::spawn(
+                DecoderXactPair {
+                    decoder,
+                    xact_drain: reorder_sink,
+                },
+                args.decoder_batch_size,
+                args.decoder_queue_capacity,
+            )
+        }
+        None => {
+            // Metrics-only (no CH): serial drain to counters. Oracle
+            // wrapper resolves PgPending + fires validator probes when up.
+            let observer: Box<dyn TupleObserver> = match oracle.clone() {
+                Some(o) => Box::new(walshadow::oracle::OracleObserver::new(
+                    o,
+                    Box::new(MetricsTupleObserver::default()) as Box<dyn TupleObserver>,
+                )),
+                None => Box::new(MetricsTupleObserver::default()),
+            };
+            let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer)
+                .with_schema_events(schema_events)
+                .with_pg_class_delete_epoch(pg_class_delete_epoch.clone());
+            QueueingRecordSink::spawn(
+                DecoderXactPair {
+                    decoder,
+                    xact_drain,
+                },
+                args.decoder_batch_size,
+                args.decoder_queue_capacity,
+            )
+        }
+    };
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder_xact,
@@ -992,7 +1014,13 @@ async fn run(args: Args) -> Result<()> {
         let (drain_lsn, emitter_ack_lsn) = {
             let b = xact_buffer.lock().await;
             let s = b.stats();
-            (s.drain_lsn, s.emitter_ack_lsn)
+            // Pipeline path: durable watermark comes from the ack
+            // collector atomic; serial/metrics path: xact buffer field.
+            let ea = match &pipeline_ack {
+                Some(a) => a.load(Ordering::Acquire),
+                None => s.emitter_ack_lsn,
+            };
+            (s.drain_lsn, ea)
         };
         // apply_lsn ceiling. Treat shadow_replay==0
         // (sweeper disabled or hasn't reported yet) as "no constraint
@@ -1064,13 +1092,27 @@ async fn run(args: Args) -> Result<()> {
             .flush()
             .await
             .context("flush queueing decoder sink")?;
+        // Surface a pipeline-stage failure (encode reject, retry-exhausted
+        // inserter, decode/catalog error) as a clean daemon exit with the
+        // root cause rather than a silently pinned watermark.
+        if let Some(h) = &pipeline_handle
+            && let Some(msg) = h.fatal.message()
+        {
+            anyhow::bail!("decode+insert pipeline failed: {msg}");
+        }
         let now_dispatched = stream.dispatched_lsn();
         let advanced = now_dispatched != prev_dispatched;
         // Always refresh metrics + log on advance; on idle ticks just
         // refresh metrics so emitter_ack_lsn / cursor stay current.
         let (xact_stats, xact_line) = {
             let b = xact_buffer.lock().await;
-            let stats = b.stats().clone();
+            let mut stats = b.stats().clone();
+            // Reflect the pipeline ack collector's watermark so the metric +
+            // inflight-stall watchdog track real CH durability, not the
+            // unused xact-buffer field.
+            if let Some(a) = &pipeline_ack {
+                stats.emitter_ack_lsn = a.load(Ordering::Acquire);
+            }
             let line = stats.summary();
             (stats, line)
         };
@@ -1223,6 +1265,16 @@ async fn run(args: Args) -> Result<()> {
         .close()
         .await
         .context("drain queueing decoder sink on shutdown")?;
+    // Closing the worker drops the reorder sink, which closes the decode
+    // job queue. Drain the rest of the pipeline in order (decoders →
+    // batcher force-flush → inserters to EndOfStream → ack collector) so no
+    // buffered rows are lost and the final watermark is durable.
+    if let Some(handle) = pipeline_handle {
+        handle
+            .join()
+            .await
+            .map_err(|m| anyhow::anyhow!("decode+insert pipeline drain failed: {m}"))?;
+    }
     Ok(())
 }
 
@@ -1584,9 +1636,8 @@ async fn run_bootstrap(
     let (shipped, outcome) = match ch_config {
         Some(emitter_cfg) => {
             // Transitional emitter — `CatalogMapResolver` fronts the
-            // seeded snapshot (shadow PG isn't up yet). TCP open here
-            // mirrors the daemon path below; std-stream handoff keeps
-            // the chc_posix_io vtable on a blocking fd. Force
+            // seeded snapshot (shadow PG isn't up yet). `AsyncClient`
+            // opens its own socket inside `Emitter::new`. Force
             // `flush_timeout = 0` so the rfn-flip in `drain_backfill`
             // closes the prior INSERT before the next `send_query` —
             // hold-open mode would violate CH's "no overlapping
@@ -1595,20 +1646,11 @@ async fn run_bootstrap(
             let mut emitter_cfg = emitter_cfg;
             emitter_cfg.flush_timeout = std::time::Duration::ZERO;
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-            let tcp = tokio::net::TcpStream::connect(&addr)
-                .await
-                .with_context(|| format!("bootstrap: connect CH at {addr}"))?;
-            tcp.set_nodelay(true).ok();
-            let std_tcp = tcp
-                .into_std()
-                .context("bootstrap: tokio→std TcpStream handoff")?;
-            std_tcp
-                .set_nonblocking(false)
-                .context("bootstrap: set CH socket to blocking for chc_posix_io")?;
             let resolver: Arc<dyn walshadow::relation_resolver::RelationResolver> = Arc::new(
                 walshadow::relation_resolver::CatalogMapResolver::new(resolver_map),
             );
-            let emitter = Emitter::new(emitter_cfg, resolver, std_tcp)
+            let emitter = Emitter::new(emitter_cfg, resolver)
+                .await
                 .context("bootstrap: init transitional CH emitter")?;
             tracing::info!(
                 target: "walshadow::bootstrap",

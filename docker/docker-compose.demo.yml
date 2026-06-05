@@ -36,7 +36,7 @@ services:
       - ./ch-config.demo.toml:/etc/walshadow/ch-config.demo.toml:ro
 
   pgbench:
-    image: postgres:17-bookworm
+    image: postgres:18-bookworm
     depends_on:
       source:
         condition: service_healthy
@@ -64,7 +64,7 @@ services:
             -T "$${PGBENCH_DURATION}" -P 5
 
   postgres-exporter:
-    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.19.1
     depends_on:
       source:
         condition: service_healthy
@@ -74,7 +74,7 @@ services:
       - "9187:9187"
 
   prometheus:
-    image: prom/prometheus:v2.53.2
+    image: prom/prometheus:v3.12.0
     depends_on:
       - postgres-exporter
     volumes:
@@ -86,7 +86,7 @@ services:
       - "9090:9090"
 
   grafana:
-    image: grafana/grafana:11.3.1
+    image: grafana/grafana:13.0.2
     depends_on:
       - prometheus
       - clickhouse

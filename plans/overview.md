@@ -106,10 +106,11 @@ Component docs live alongside this overview:
   `SELECT $1::bytea::<typ>::text` round-trip against shadow,
   `--validate <N>` sampling, walshadow PG extension (`pgext/`) exposing
   `walshadow_decode_disk(oid, bytea) -> text` for Tier 3 types
-- [safety.md](safety.md) — clickhouse-c-rs unsafe surface (six holes
-  audited 2026-05-17 at commit `b5af579`: `Client` ownership of
-  `PosixIo`/`Codec`, `&[u8]` over `from_utf8_unchecked`, `Codec::raw_mut`
-  unsafe, C-side trust boundary, `checked_mul`, `BorrowedFd`)
+- [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
+  — clickhouse-c-rs unsafe surface (audited 2026-05-17 at `b5af579`):
+  `Client` ownership of `PosixIo`/`Codec`, `&[u8]` over
+  `from_utf8_unchecked`, `Codec::raw_mut` unsafe, C-side trust boundary,
+  `checked_mul`, `BorrowedFd`, packet-payload union
 
 ## Pitfalls and ordering invariants
 

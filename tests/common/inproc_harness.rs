@@ -27,22 +27,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
 use wal_rs::pg::replication::conn::PgConfig;
 use wal_rs::pg::replication::tls::SslMode;
+
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, EmitterObserver, NamespaceMapping,
-    TableMapping,
+    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, EmitterObserver, EmitterStats,
+    MappingHandle, NamespaceMapping, TableMapping,
 };
 use walshadow::decoder_sink::TupleObserver;
+use walshadow::pipeline::reorder::ReorderSink;
+use walshadow::pipeline::{PipelineConfig, PipelineHandle};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
-use walshadow::xact_buffer::{BufferingDecoderSink, XactBuffer, XactBufferConfig, XactRecordSink};
+use walshadow::xact_buffer::{
+    BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig, XactRecordSink,
+};
 
 // ---------------------------------------------------------------------------
 // Skip-gate probes
@@ -608,26 +614,19 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
             .expect("seed schema-diff baseline");
     }
 
-    let tcp = TcpStream::connect(("127.0.0.1", ch_tcp_port)).expect("tcp connect ch");
-    tcp.set_nodelay(true).ok();
-    tcp.set_nonblocking(false)
-        .expect("blocking socket for chc_posix_io");
-    let mut emitter =
-        Emitter::new(emitter_cfg.clone(), catalog.clone(), tcp).expect("init emitter");
+    let mut emitter = Emitter::new(emitter_cfg.clone(), catalog.clone())
+        .await
+        .expect("init emitter");
     let mapping_handle = emitter.mapping_handle();
 
     // DDL wiring — second CH TCP for the DDL applicator + decoder
     // subscription to the catalog's schema-event channel.
     let mut schema_rx_opt = None;
     if ddl.is_some() {
-        let ddl_tcp = TcpStream::connect(("127.0.0.1", ch_tcp_port)).expect("tcp connect ch ddl");
-        ddl_tcp.set_nodelay(true).ok();
-        ddl_tcp
-            .set_nonblocking(false)
-            .expect("blocking socket for chc_posix_io (ddl)");
         let ddl_cfg = DdlConfig::from_emitter(&emitter_cfg);
-        let applicator =
-            DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping_handle, ddl_tcp).expect("ddl init");
+        let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping_handle)
+            .await
+            .expect("ddl init");
         emitter = emitter.with_applicator(applicator);
         let rx = catalog.lock().await.subscribe();
         schema_rx_opt = Some(std::sync::Arc::new(std::sync::Mutex::new(rx)));
@@ -661,23 +660,232 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
     }
 }
 
-/// Drive the WAL pump until `segments_needed` segments have shipped or
-/// `deadline` elapses. Returns the count shipped.
-pub async fn pump_segments(
-    pipeline: &mut Pipeline,
+// ---------------------------------------------------------------------------
+// Parallel decode+insert pipeline builder. Mirrors `build_pipeline`'s
+// feed/catalog bootstrap but swaps the serial `Emitter` drain for the
+// `src/pipeline` fan-out (M decoders, N inserters, reorder coordinator) —
+// the same wiring `bin/stream.rs` stands up behind `--ch-config`. Scoped
+// to the data path: no DDL applicator subscription, so `BuildPipelineArgs::ddl`
+// is ignored here (pass `None`).
+// ---------------------------------------------------------------------------
+
+/// Record-sink chain feeding the parallel pipeline: `metrics → decoder
+/// (heaps → xact buffer) → reorder (commit → dispatch to decode pool)`.
+/// Clone of `bin/stream.rs`'s `DaemonSinks` with the reorder coordinator
+/// as the drain half.
+pub struct PipelineSinks {
+    pub metrics: MetricsRecordSink,
+    pub decoder: BufferingDecoderSink,
+    pub reorder: ReorderSink,
+}
+
+impl RecordSink for PipelineSinks {
+    fn on_record<'a>(
+        &'a mut self,
+        record: &'a Record<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.metrics.on_record(record).await?;
+            self.decoder.on_record(record).await?;
+            self.reorder.on_record(record).await?;
+            Ok(())
+        })
+    }
+}
+
+pub struct ParallelPipeline {
+    pub feed: SourceFeed,
+    pub stream: WalStream,
+    pub sinks: PipelineSinks,
+    pub segment_sink: DirSegmentSink,
+    pub xact_buffer: Arc<Mutex<XactBuffer>>,
+    pub chunk_buf: Vec<u8>,
+    pub handle: PipelineHandle,
+    pub ack: Arc<AtomicU64>,
+}
+
+impl ParallelPipeline {
+    /// Drop the sink chain (closing the reorder coordinator's job + row
+    /// channels) and await the drain cascade: decoders finish → batcher
+    /// final-flushes → inserters drain to `EndOfStream` → ack collector
+    /// exits. Surfaces any pipeline-fatal error.
+    pub async fn shutdown(self) -> std::result::Result<(), String> {
+        let ParallelPipeline { sinks, handle, .. } = self;
+        drop(sinks);
+        handle.join().await
+    }
+}
+
+pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPipeline {
+    let BuildPipelineArgs {
+        tmp,
+        source,
+        shadow,
+        shadow_filter_dir,
+        shadow_stream_state,
+        ch_database,
+        ch_tcp_port,
+        mappings,
+        app_name,
+        ddl: _,
+    } = args;
+    let scfg = source.config();
+    let pgcfg = PgConfig {
+        host: scfg.socket_dir.to_string_lossy().into_owned(),
+        port: scfg.port,
+        user: "postgres".into(),
+        password: None,
+        database: "postgres".into(),
+        application_name: app_name.into(),
+        sslmode: SslMode::Disable,
+    };
+    let mut feed = SourceFeed::connect(&pgcfg)
+        .await
+        .expect("source feed connect")
+        .with_status_interval(Duration::from_millis(500));
+    let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
+    let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
+        shadow_stream_state,
+    )));
+
+    {
+        let sql_client = feed.sql_client().await.expect("sidecar sql client");
+        stream
+            .filter_mut()
+            .tracker
+            .seed_from_source(sql_client)
+            .await
+            .expect("seed_from_source");
+    }
+
+    let shadow_conninfo = socket_conninfo(
+        shadow.config().socket_dir.to_str().unwrap(),
+        shadow.config().port,
+        "postgres",
+        "postgres",
+    );
+    let cat_cfg = ShadowCatalogConfig {
+        replay_timeout: Duration::from_secs(60),
+        replay_poll: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let catalog = ShadowCatalog::connect(&shadow_conninfo, cat_cfg)
+        .await
+        .expect("connect shadow catalog");
+    let catalog = Arc::new(Mutex::new(catalog));
+
+    let inv_epoch = Arc::new(AtomicU64::new(0));
+    stream
+        .filter_mut()
+        .tracker
+        .set_invalidation_epoch(inv_epoch.clone());
+    catalog.lock().await.set_invalidation_epoch(inv_epoch);
+
+    feed.start_physical_replication(None, aligned, ident.timeline)
+        .await
+        .expect("START_REPLICATION");
+
+    let spill_dir = tmp.path().join("spill");
+    fs::create_dir_all(&spill_dir).unwrap();
+    let xact_buf_cfg = XactBufferConfig {
+        xact_buffer_max: walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX,
+        spill_dir,
+    };
+    let xact_buffer = XactBuffer::new(xact_buf_cfg).expect("xact buffer");
+    let xact_buffer = Arc::new(Mutex::new(xact_buffer));
+
+    let mut emitter_cfg = EmitterConfig {
+        host: "127.0.0.1".into(),
+        port: ch_tcp_port,
+        database: ch_database.into(),
+        compression: CompressionChoice::Lz4,
+        ..Default::default()
+    };
+    for spec in mappings {
+        emitter_cfg.tables.insert(
+            spec.source_table,
+            TableMapping {
+                target: spec.target_table,
+                columns: spec.columns,
+            },
+        );
+    }
+
+    // SIGHUP-reloadable mapping shared by the DDL applicator + decode pool.
+    let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+    let ddl_cfg = DdlConfig::from_emitter(&emitter_cfg);
+    let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone())
+        .await
+        .expect("ddl applicator init");
+    let stats = Arc::new(EmitterStats::default());
+    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let pcfg = PipelineConfig {
+        emitter: emitter_cfg,
+        decoder_pool_size: 2,
+        inserter_pool_size: 2,
+        catalog: catalog.clone(),
+        mapping,
+        oracle: None,
+        applicator,
+        buffer: xact_buffer.clone(),
+        subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
+        schema_events: None,
+        pg_class_delete_epoch: None,
+        stats,
+    };
+    let (reorder, handle) = pcfg
+        .spawn(emitter_ack.clone())
+        .await
+        .expect("spawn decode+insert pipeline");
+
+    let decoder = BufferingDecoderSink::new(catalog, xact_buffer.clone());
+    let sinks = PipelineSinks {
+        metrics: MetricsRecordSink::default(),
+        decoder,
+        reorder,
+    };
+    let segment_sink =
+        DirSegmentSink::new(shadow_filter_dir.to_path_buf()).expect("open shadow filter dir");
+    let chunk_buf = Vec::with_capacity(64 * 1024);
+
+    ParallelPipeline {
+        feed,
+        stream,
+        sinks,
+        segment_sink,
+        xact_buffer,
+        chunk_buf,
+        handle,
+        ack: emitter_ack,
+    }
+}
+
+/// Drive the WAL pump against the raw feed/stream/sink trio until
+/// `segments_needed` segments have shipped or `deadline` elapses.
+/// Returns the count shipped. Generic over the record sink so both the
+/// serial-emitter [`Pipeline`] and the parallel [`ParallelPipeline`]
+/// reuse one loop.
+pub async fn pump_until<S: RecordSink>(
+    feed: &mut SourceFeed,
+    stream: &mut WalStream,
+    record_sink: &mut S,
+    segment_sink: &mut DirSegmentSink,
+    chunk_buf: &mut Vec<u8>,
     segments_needed: u64,
     deadline: Duration,
 ) -> u64 {
     let end = Instant::now() + deadline;
     let mut segments_shipped = 0u64;
-    let mut prev = pipeline.stream.dispatched_lsn();
+    let mut prev = stream.dispatched_lsn();
     while segments_shipped < segments_needed && Instant::now() < end {
-        let apply_lsn = pipeline.stream.dispatched_lsn();
+        let apply_lsn = stream.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            pipeline
-                .feed
-                .next_chunk(StandbyStatus::collapsed(apply_lsn), &mut pipeline.chunk_buf),
+            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), chunk_buf),
         )
         .await;
         let chunk = match next {
@@ -686,23 +894,36 @@ pub async fn pump_segments(
             Ok(Err(e)) => panic!("source feed: {e:#}"),
             Err(_) => continue,
         };
-        pipeline
-            .stream
-            .push(
-                chunk.start_lsn,
-                chunk.data,
-                &mut pipeline.record_sink,
-                &mut pipeline.segment_sink,
-            )
+        stream
+            .push(chunk.start_lsn, chunk.data, record_sink, segment_sink)
             .await
             .expect("push");
-        let now = pipeline.stream.dispatched_lsn();
+        let now = stream.dispatched_lsn();
         if now != prev {
             segments_shipped += (now - prev) / WAL_SEG_SIZE;
             prev = now;
         }
     }
     segments_shipped
+}
+
+/// Drive the WAL pump until `segments_needed` segments have shipped or
+/// `deadline` elapses. Returns the count shipped.
+pub async fn pump_segments(
+    pipeline: &mut Pipeline,
+    segments_needed: u64,
+    deadline: Duration,
+) -> u64 {
+    pump_until(
+        &mut pipeline.feed,
+        &mut pipeline.stream,
+        &mut pipeline.record_sink,
+        &mut pipeline.segment_sink,
+        &mut pipeline.chunk_buf,
+        segments_needed,
+        deadline,
+    )
+    .await
 }
 
 /// Driver thread that fires a sequence of `-c` statements at the source

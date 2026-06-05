@@ -31,7 +31,6 @@ include!(concat!(env!("OUT_DIR"), "/sys_constants.rs"));
 
 #[repr(C)]
 pub struct chc_err {
-    pub code: c_int,
     pub server_code: c_int,
     pub msg: [c_char; CHC_ERR_MSG_LEN],
     pub server_name: [c_char; CHC_ERR_NAME_LEN],
@@ -40,7 +39,6 @@ pub struct chc_err {
 impl chc_err {
     pub const fn zeroed() -> Self {
         Self {
-            code: 0,
             server_code: 0,
             msg: [0; CHC_ERR_MSG_LEN],
             server_name: [0; CHC_ERR_NAME_LEN],
@@ -80,6 +78,11 @@ unsafe extern "C" {
 
 /* ---- io ---- */
 
+// Read/write/cancel vtable the C library drives. POD, declared in the
+// public section of clickhouse.h (not behind CHC_IMPLEMENTATION), so the
+// layout is stable to mirror. The posix path (src/io.rs) lets
+// chc_posix_io_init populate one over a raw fd; the rustls path
+// (src/tls.rs) constructs one directly with Rust extern "C" callbacks.
 #[repr(C)]
 pub struct chc_io {
     pub ud: *mut c_void,
@@ -104,12 +107,21 @@ pub struct chc_io {
 }
 
 #[repr(C)]
+pub struct chc_in {
+    _opaque: [u8; 0],
+}
+
+// Blocking POSIX-fd backend state for chc_io, declared in
+// clickhouse-posix-io.h (struct body is public; the implementation lives in
+// the wrapper.c TU). chc_posix_io_init populates this and the chc_io vtable
+// it feeds, pointing the vtable's `ud` back at this state; src/io.rs holds
+// both inline in a pinned PosixIo so the pair keeps a fixed address.
+#[repr(C)]
 pub struct chc_posix_io {
     pub fd: c_int,
     pub check_cancel: Option<unsafe extern "C" fn(ud: *mut c_void) -> bool>,
     pub cancel_ud: *mut c_void,
-    // Absolute CLOCK_MONOTONIC-us read deadline; 0 disables. chc_posix_io_init
-    // zeroes it, so the Rust state struct must carry it or that write lands OOB.
+    // Monotonic-us deadline applied to each blocking read; 0 disables.
     pub deadline_us: i64,
 }
 
@@ -514,6 +526,7 @@ pub struct chc_exception {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct chc_packet_progress {
     pub rows: u64,
     pub bytes: u64,
@@ -523,6 +536,7 @@ pub struct chc_packet_progress {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct chc_packet_profile {
     pub rows: u64,
     pub blocks: u64,
@@ -532,35 +546,28 @@ pub struct chc_packet_profile {
     pub calculated_rows_before_limit: u8,
 }
 
+// Payload aliases one storage selected by `kind`; mirrors the C union.
+// Reading the wrong arm is UB, so callers gate access on `kind`.
 #[repr(C)]
-pub struct chc_packet {
-    pub kind: chc_packet_kind,
+pub union chc_packet_payload {
     pub block: *mut chc_block,
     pub exception: *mut chc_exception,
     pub progress: chc_packet_progress,
     pub profile: chc_packet_profile,
 }
 
+#[repr(C)]
+pub struct chc_packet {
+    pub kind: chc_packet_kind,
+    pub payload: chc_packet_payload,
+}
+
 impl chc_packet {
     pub const fn zeroed() -> Self {
         Self {
             kind: 0,
-            block: core::ptr::null_mut(),
-            exception: core::ptr::null_mut(),
-            progress: chc_packet_progress {
-                rows: 0,
-                bytes: 0,
-                total_rows: 0,
-                written_rows: 0,
-                written_bytes: 0,
-            },
-            profile: chc_packet_profile {
-                rows: 0,
-                blocks: 0,
-                bytes: 0,
-                rows_before_limit: 0,
-                applied_limit: 0,
-                calculated_rows_before_limit: 0,
+            payload: chc_packet_payload {
+                block: core::ptr::null_mut(),
             },
         }
     }
@@ -629,4 +636,53 @@ unsafe extern "C" {
     pub fn chc_client_send_cancel(c: *mut chc_client, err: *mut chc_err) -> c_int;
     pub fn chc_client_send_ping(c: *mut chc_client, err: *mut chc_err) -> c_int;
     pub fn chc_exception_free(e: *mut chc_exception, al: *const chc_alloc);
+}
+
+/* ---- async client ---- */
+
+#[repr(C)]
+pub struct chc_async_client {
+    _opaque: [u8; 0],
+}
+
+unsafe extern "C" {
+    pub fn chc_async_client_init(
+        out: *mut *mut chc_async_client,
+        opts: *const chc_client_opts,
+        al: *const chc_alloc,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_async_client_free(c: *mut chc_async_client);
+
+    pub fn chc_async_submit(
+        c: *mut chc_async_client,
+        buf: *const c_void,
+        len: usize,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_async_pending_out(c: *mut chc_async_client, buf: *mut *const u8, len: *mut usize);
+    pub fn chc_async_consume_out(c: *mut chc_async_client, n: usize);
+
+    pub fn chc_async_handshake(c: *mut chc_async_client, err: *mut chc_err) -> c_int;
+    pub fn chc_async_send_query(
+        c: *mut chc_async_client,
+        sql: *const c_char,
+        sql_len: usize,
+        query_id: *const c_char,
+        query_id_len: usize,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_async_send_data(
+        c: *mut chc_async_client,
+        bb: *const chc_block_builder,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_async_send_data_end(c: *mut chc_async_client, err: *mut chc_err) -> c_int;
+    pub fn chc_async_recv_packet(
+        c: *mut chc_async_client,
+        out: *mut chc_packet,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_async_server_info(c: *const chc_async_client) -> *const chc_server_info;
+    pub fn chc_async_packet_clear(c: *mut chc_async_client, p: *mut chc_packet);
 }

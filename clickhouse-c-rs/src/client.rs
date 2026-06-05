@@ -13,7 +13,7 @@ use crate::block::Block;
 use crate::builder::BlockBuilder;
 use crate::codec::{Codec, Compression};
 use crate::error::{Error, ErrorKind, Result, check};
-use crate::io::PosixIo;
+use crate::io::ClientIo;
 use crate::sys;
 
 pub const DEFAULT_REVISION: u64 = sys::CHC_CLIENT_DEFAULT_REVISION;
@@ -73,7 +73,7 @@ impl ClientOpts {
         self
     }
 
-    fn to_raw(&self, codec: Option<*const sys::chc_codec>) -> sys::chc_client_opts {
+    pub(crate) fn to_raw(&self, codec: Option<*const sys::chc_codec>) -> sys::chc_client_opts {
         let mut raw = sys::chc_client_opts::zeroed();
         raw.client_name = ptr_or_null(&self.client_name);
         raw.database = ptr_or_null(&self.database);
@@ -116,7 +116,7 @@ pub struct ServerInfo {
 }
 
 impl ServerInfo {
-    fn from_raw(raw: &sys::chc_server_info) -> Self {
+    pub(crate) fn from_raw(raw: &sys::chc_server_info) -> Self {
         Self {
             name: cstr_array_to_string(&raw.name),
             timezone: cstr_array_to_string(&raw.timezone),
@@ -150,13 +150,21 @@ pub struct Client<'fd> {
     // guarantee the C side needs.
     alloc: Box<Allocator>,
     _codec: Option<Pin<Box<Codec>>>,
-    _io: Pin<Box<PosixIo<'fd>>>,
+    // Type-erased so the same `Client` carries either a plaintext
+    // [`PosixIo`](crate::PosixIo) or a `tls::TlsIo`. `chc_client` retains
+    // the `chc_io` pointer minted from this backend, so it must outlive
+    // the client; the box keeps it pinned through `Drop`.
+    _io: Pin<Box<dyn ClientIo + Send + 'fd>>,
 }
 
 impl<'fd> Client<'fd> {
     /// Performs Hello / HelloAck against the supplied I/O. Takes
     /// ownership of `io` and `codec` so the C-side back-pointers
     /// `c->io` / `c->codec` stay valid for the client's lifetime.
+    ///
+    /// `io` is any [`ClientIo`] backend: [`PosixIo`](crate::PosixIo) for a
+    /// plaintext fd, or `tls::TlsIo` (feature `tls`) for rustls over a
+    /// `TcpStream`.
     ///
     /// `codec` may be `None` only when `opts.compression` is `None`.
     ///
@@ -177,10 +185,10 @@ impl<'fd> Client<'fd> {
     ///     Client::init(&ClientOpts::new(), Allocator::stdlib(), io, None)
     /// }
     /// ```
-    pub fn init(
+    pub fn init<I: ClientIo + Send + 'fd>(
         opts: &ClientOpts,
         alloc: Allocator,
-        mut io: Pin<Box<PosixIo<'fd>>>,
+        mut io: Pin<Box<I>>,
         codec: Option<Pin<Box<Codec>>>,
     ) -> Result<Self> {
         let codec_ptr = codec.as_ref().map(|c| c.as_ref().as_ptr());
@@ -254,14 +262,20 @@ impl<'fd> Client<'fd> {
         check(rc, &err)
     }
 
-    /// Read the next packet. Any block / exception payload is owned by
-    /// the returned [`Packet`] and freed on drop unless taken out.
-    pub fn recv_packet(&mut self) -> Result<Packet<'_, 'fd>> {
+    /// Read the next server event, blocking until a full packet arrives.
+    /// Any block / exception payload is owned by the returned [`Event`]
+    /// and freed on drop.
+    pub fn recv_event(&mut self) -> Result<Event> {
         let mut raw = sys::chc_packet::zeroed();
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe { sys::chc_client_recv_packet(self.raw.as_ptr(), &mut raw, &mut err) };
-        check(rc, &err)?;
-        Ok(Packet { raw, client: self })
+        if let Err(e) = check(rc, &err) {
+            unsafe { sys::chc_packet_clear(self.raw.as_ptr(), &mut raw) };
+            return Err(e);
+        }
+        let event = Event::from_raw(&mut raw, *self.alloc);
+        unsafe { sys::chc_packet_clear(self.raw.as_ptr(), &mut raw) };
+        event
     }
 }
 
@@ -283,7 +297,7 @@ pub struct Exception {
 impl Exception {
     /// SAFETY: `raw` must point at a `chc_exception` owned by the caller;
     /// `alloc` must be the allocator it was created with.
-    unsafe fn from_raw(raw: NonNull<sys::chc_exception>, alloc: Allocator) -> Self {
+    pub(crate) unsafe fn from_raw(raw: NonNull<sys::chc_exception>, alloc: Allocator) -> Self {
         Self { raw, alloc }
     }
 
@@ -382,7 +396,7 @@ pub enum PacketKind {
 }
 
 impl PacketKind {
-    fn from_raw(k: sys::chc_packet_kind) -> Option<Self> {
+    pub(crate) fn from_raw(k: sys::chc_packet_kind) -> Option<Self> {
         Some(match k {
             sys::CHC_PKT_DATA => Self::Data,
             sys::CHC_PKT_EXCEPTION => Self::Exception,
@@ -400,52 +414,115 @@ impl PacketKind {
     }
 }
 
-/// Borrowed packet, owns its block/exception payloads until dropped.
-pub struct Packet<'c, 'fd: 'c> {
-    raw: sys::chc_packet,
-    client: &'c mut Client<'fd>,
+/// Owned server event from the packet loop, shared by [`Client`] and the
+/// async client. Any block / exception payload is owned here and freed on
+/// drop. Reading the `kind`-selected union arm happens once, in
+/// [`Event::from_raw`], so consumers never touch the raw union.
+pub enum Event {
+    Data(Block),
+    Totals(Block),
+    Extremes(Block),
+    Log(Block),
+    ProfileEvents(Block),
+    Exception(Exception),
+    Progress(Progress),
+    ProfileInfo(ProfileInfo),
+    Pong,
+    EndOfStream,
+    TableColumns,
 }
 
-impl<'c, 'fd: 'c> Packet<'c, 'fd> {
-    pub fn kind(&self) -> Option<PacketKind> {
-        PacketKind::from_raw(self.raw.kind)
+impl Event {
+    /// Consume a recv'd packet, taking ownership of its payload. `raw`
+    /// must come straight from `chc_*_recv_packet`; arms are read only
+    /// after `kind` selects them, so no union read is unsound.
+    pub(crate) fn from_raw(raw: &mut sys::chc_packet, alloc: Allocator) -> Result<Self> {
+        let Some(kind) = PacketKind::from_raw(raw.kind) else {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                format!("unknown server packet {}", raw.kind),
+            ));
+        };
+        Ok(match kind {
+            PacketKind::Data => Self::Data(take_block(raw, alloc)?),
+            PacketKind::Totals => Self::Totals(take_block(raw, alloc)?),
+            PacketKind::Extremes => Self::Extremes(take_block(raw, alloc)?),
+            PacketKind::Log => Self::Log(take_block(raw, alloc)?),
+            PacketKind::ProfileEvents => Self::ProfileEvents(take_block(raw, alloc)?),
+            PacketKind::Exception => Self::Exception(take_exception(raw, alloc)?),
+            PacketKind::Progress => {
+                // SAFETY: kind selects the `progress` arm.
+                Self::Progress(Progress::from_raw(unsafe { &raw.payload.progress }))
+            }
+            PacketKind::ProfileInfo => {
+                // SAFETY: kind selects the `profile` arm.
+                Self::ProfileInfo(ProfileInfo::from_raw(unsafe { &raw.payload.profile }))
+            }
+            PacketKind::Pong => Self::Pong,
+            PacketKind::EndOfStream => Self::EndOfStream,
+            PacketKind::TableColumns => Self::TableColumns,
+        })
     }
+}
 
-    pub fn progress(&self) -> &sys::chc_packet_progress {
-        &self.raw.progress
-    }
+fn take_block(raw: &mut sys::chc_packet, alloc: Allocator) -> Result<Block> {
+    // SAFETY: caller's kind match selected the `block` arm.
+    let p = unsafe { raw.payload.block };
+    raw.payload.block = core::ptr::null_mut();
+    // SAFETY: ownership transfer; alloc matches the recv'ing client.
+    unsafe { Block::from_raw(p, alloc) }
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "block packet missing block"))
+}
 
-    pub fn profile(&self) -> &sys::chc_packet_profile {
-        &self.raw.profile
-    }
+fn take_exception(raw: &mut sys::chc_packet, alloc: Allocator) -> Result<Exception> {
+    // SAFETY: caller's kind match selected the `exception` arm.
+    let p = NonNull::new(unsafe { raw.payload.exception })
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "exception packet missing exception"))?;
+    raw.payload.exception = core::ptr::null_mut();
+    // SAFETY: ownership transfer; alloc matches the recv'ing client.
+    Ok(unsafe { Exception::from_raw(p, alloc) })
+}
 
-    /// Take ownership of the block payload (Data / Totals / Extremes /
-    /// Log / ProfileEvents packets). Subsequent calls return `None`.
-    pub fn take_block(&mut self) -> Option<Block> {
-        if self.raw.block.is_null() {
-            return None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub rows: u64,
+    pub bytes: u64,
+    pub total_rows: u64,
+    pub written_rows: u64,
+    pub written_bytes: u64,
+}
+
+impl Progress {
+    fn from_raw(raw: &sys::chc_packet_progress) -> Self {
+        Self {
+            rows: raw.rows,
+            bytes: raw.bytes,
+            total_rows: raw.total_rows,
+            written_rows: raw.written_rows,
+            written_bytes: raw.written_bytes,
         }
-        let raw = self.raw.block;
-        self.raw.block = core::ptr::null_mut();
-        // SAFETY: ownership transfer; the same allocator was used by
-        // chc_client_recv_packet (Client carries it).
-        unsafe { Block::from_raw(raw, *self.client.alloc) }
-    }
-
-    /// Take ownership of the exception chain on an Exception packet.
-    /// Subsequent calls return `None`.
-    pub fn take_exception(&mut self) -> Option<Exception> {
-        let raw = NonNull::new(self.raw.exception)?;
-        self.raw.exception = core::ptr::null_mut();
-        // SAFETY: ownership transfer; allocator matches the one that
-        // built the chain in chc_client_recv_packet.
-        Some(unsafe { Exception::from_raw(raw, *self.client.alloc) })
     }
 }
 
-impl<'c, 'fd: 'c> Drop for Packet<'c, 'fd> {
-    fn drop(&mut self) {
-        // chc_packet_clear is safe to call with already-NULLed fields.
-        unsafe { sys::chc_packet_clear(self.client.raw.as_ptr(), &mut self.raw) };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileInfo {
+    pub rows: u64,
+    pub blocks: u64,
+    pub bytes: u64,
+    pub rows_before_limit: u64,
+    pub applied_limit: bool,
+    pub calculated_rows_before_limit: bool,
+}
+
+impl ProfileInfo {
+    fn from_raw(raw: &sys::chc_packet_profile) -> Self {
+        Self {
+            rows: raw.rows,
+            blocks: raw.blocks,
+            bytes: raw.bytes,
+            rows_before_limit: raw.rows_before_limit,
+            applied_limit: raw.applied_limit != 0,
+            calculated_rows_before_limit: raw.calculated_rows_before_limit != 0,
+        }
     }
 }

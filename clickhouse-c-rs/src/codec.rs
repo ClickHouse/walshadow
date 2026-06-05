@@ -27,6 +27,7 @@ pub struct Codec {
 }
 
 impl Codec {
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
     fn zeroed() -> Self {
         Self {
             raw: sys::chc_codec {

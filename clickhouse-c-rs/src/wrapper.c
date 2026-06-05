@@ -5,8 +5,9 @@
  */
 
 /* posix-io read timeouts use clock_gettime/CLOCK_MONOTONIC + poll, hidden
- * under -std=c11 without a POSIX feature-test macro. Match upstream TUs. */
+ * under -std=c23 without a POSIX feature-test macro. Match upstream TUs. */
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE 200809L
 
 #define CHC_PROVIDE_STDLIB_ALLOC
 #define CHC_IMPLEMENTATION
@@ -23,11 +24,14 @@
 #include "clickhouse-posix-io.h"
 #include "clickhouse-compression.h"
 #include "clickhouse-client.h"
+#include "clickhouse-async.h"
 
 #include <time.h>
 
 /* Monotonic-us clock in clickhouse-c's CLOCK_MONOTONIC domain, letting Rust
- * compute absolute read deadlines comparable to the posix-io poll loop. */
+ * compute absolute read deadlines comparable to the posix-io poll loop.
+ * src/io.rs builds & drives the chc_posix_io / chc_io pair itself via the
+ * chc_posix_io_init / chc_posix_io_set_deadline symbols this TU emits. */
 int64_t
 chc_rs_monotonic_us(void)
 {

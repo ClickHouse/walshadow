@@ -48,6 +48,7 @@ pub mod manifest;
 pub mod metrics;
 pub mod oracle;
 pub mod pg_class_decoder;
+pub mod pipeline;
 pub mod preflight;
 pub mod queueing_record_sink;
 pub mod relation_resolver;

@@ -9,7 +9,7 @@ Five services from the base stack plus a demo tier:
 
 | service | role |
 |---|---|
-| `source` | postgres:17, `wal_level=logical`, seeds `demo.users` + pgbench TPC-B schema (`REPLICA IDENTITY FULL`) |
+| `source` | postgres:18, `wal_level=logical`, seeds `demo.users` + pgbench TPC-B schema (`REPLICA IDENTITY FULL`) |
 | `walshadow` | the daemon: in-container shadow PG (auto-spawned) + WAL→CH stream, `/metrics` on :9484 |
 | `clickhouse` | destination, `demo.*` tables pre-created |
 | `pgbench` | hammers `source` with the TPC-B workload |

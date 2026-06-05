@@ -75,7 +75,6 @@ the matching plan doc. Render alongside the six above.
 | bootstrap | [`bootstrap.dot`](bootstrap.dot) | [`plans/bootstrap.md`](../plans/bootstrap.md) |
 | ops | [`ops.dot`](ops.dot) | [`plans/ops.md`](../plans/ops.md) |
 | oracle | [`oracle.dot`](oracle.dot) | [`plans/oracle.md`](../plans/oracle.md) |
-| safety | [`safety.dot`](safety.dot) | [`plans/safety.md`](../plans/safety.md) |
 
 ## Regenerating a diagram
 

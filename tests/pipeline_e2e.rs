@@ -24,7 +24,6 @@ mod fx;
 
 use std::fs;
 use std::io::Write;
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -492,11 +491,9 @@ async fn insert_update_delete_replicates_to_clickhouse() {
         },
     );
 
-    let tcp = TcpStream::connect(("127.0.0.1", CH_TCP_PORT)).expect("tcp connect ch");
-    tcp.set_nodelay(true).ok();
-    tcp.set_nonblocking(false)
-        .expect("blocking socket for chc_posix_io");
-    let emitter = Emitter::new(emitter_cfg, catalog.clone(), tcp).expect("init emitter");
+    let emitter = Emitter::new(emitter_cfg, catalog.clone())
+        .await
+        .expect("init emitter");
     let observer: Box<dyn TupleObserver> = Box::new(EmitterObserver::new(emitter));
 
     let mut record_sink = DaemonSinks {
@@ -822,11 +819,9 @@ async fn add_column_replicates_pre_and_post_alter() {
         },
     );
 
-    let tcp = TcpStream::connect(("127.0.0.1", CH_TCP_PORT_S)).expect("tcp connect ch");
-    tcp.set_nodelay(true).ok();
-    tcp.set_nonblocking(false)
-        .expect("blocking socket for chc_posix_io");
-    let emitter = Emitter::new(emitter_cfg, catalog.clone(), tcp).expect("init emitter");
+    let emitter = Emitter::new(emitter_cfg, catalog.clone())
+        .await
+        .expect("init emitter");
     let observer: Box<dyn TupleObserver> = Box::new(EmitterObserver::new(emitter));
 
     let mut record_sink = DaemonSinks {

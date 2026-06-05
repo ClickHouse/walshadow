@@ -31,8 +31,9 @@ components. Future-work proposals live under [future/](future/INDEX.md)
   6 LSNs), standby-status triple, kill-restart drill
 - [oracle.md](oracle.md) — differential decode oracle, walshadow PG
   extension, `--validate` sampling
-- [safety.md](safety.md) — clickhouse-c-rs FFI trust boundary,
-  `Client<'fd>` lifetime shape, `PosixIo` `BorrowedFd` discipline
+- [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
+  — FFI trust boundary, `Client<'fd>` lifetime shape, `PosixIo`
+  `BorrowedFd` discipline, packet-payload union
 
 ## Future work
 
@@ -47,7 +48,7 @@ Live under [architecture/](../architecture/README.md). System-level
 SVGs cover overview, internals, shadow communication, bootstrap
 timeline, streaming timeline, restart timelines. Per-component SVGs
 (one per file in this index, embedded inline) cover filter, source,
-shadow, decoder, xact, emitter, bootstrap, ops, oracle, safety. Updated
+shadow, decoder, xact, emitter, bootstrap, ops, oracle. Updated
 on architecturally load-bearing changes
 
 ## Regenerating diagrams
