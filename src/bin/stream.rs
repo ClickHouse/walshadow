@@ -311,12 +311,14 @@ struct Args {
     #[arg(long)]
     ch_config: Option<PathBuf>,
     /// Override the TOML's `[ch] flush_timeout_ms` knob from the CLI.
-    /// `0` (default) keeps the legacy close-INSERT-per-xact path;
-    /// positive values switch on the hold-INSERT-open-across-xacts
-    /// flow, capping per-row latency to `flush_timeout_ms` between
-    /// first append and CH durability. SIGHUP reads `--ch-config`
-    /// only, so use the flag for the boot value when you don't want
-    /// to maintain the knob in TOML.
+    /// On the live pipeline (`--ch-config`) `0` (default) selects a
+    /// 100ms partial-batch deadline so cold tables can't pin the
+    /// watermark; positive values set that deadline explicitly,
+    /// capping per-row latency between first append and CH durability.
+    /// No per-xact-close path runs on the live drain (that survives
+    /// only in bootstrap backfill, where it's forced internally).
+    /// SIGHUP reads `--ch-config` only, so use the flag for the boot
+    /// value when you don't want to maintain the knob in TOML.
     #[arg(long)]
     ch_flush_timeout_ms: Option<u64>,
     /// Differential decode oracle: probe 1-in-`<N>` rows

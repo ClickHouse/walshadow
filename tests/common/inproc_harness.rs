@@ -664,9 +664,15 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
 // Parallel decode+insert pipeline builder. Mirrors `build_pipeline`'s
 // feed/catalog bootstrap but swaps the serial `Emitter` drain for the
 // `src/pipeline` fan-out (M decoders, N inserters, reorder coordinator) —
-// the same wiring `bin/stream.rs` stands up behind `--ch-config`. Scoped
-// to the data path: no DDL applicator subscription, so `BuildPipelineArgs::ddl`
-// is ignored here (pass `None`).
+// the same wiring `bin/stream.rs` stands up behind `--ch-config`.
+//
+// `TRUNCATE` rides the reorder barrier as a `HeapOp::Truncate` heap and so
+// needs no extra wiring (the applicator is always built below). Schema-
+// evolution DDL (ALTER/CREATE/DROP) flows as reorder `ordered_events`, which
+// only surface when the decoder is subscribed to the catalog's schema-event
+// channel — so `ddl: Some(..)` wires that subscription + the pg_class delete
+// epoch + baseline seeding, exactly like `build_pipeline`. `ddl: None` leaves
+// the DML-only path untouched.
 // ---------------------------------------------------------------------------
 
 /// Record-sink chain feeding the parallel pipeline: `metrics → decoder
@@ -704,6 +710,9 @@ pub struct ParallelPipeline {
     pub chunk_buf: Vec<u8>,
     pub handle: PipelineHandle,
     pub ack: Arc<AtomicU64>,
+    /// Same `EmitterStats` Arc the daemon exports to Prometheus; lets tests
+    /// assert the parallel path keeps the emitter counters live.
+    pub stats: Arc<EmitterStats>,
 }
 
 impl ParallelPipeline {
@@ -729,7 +738,7 @@ pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPip
         ch_tcp_port,
         mappings,
         app_name,
-        ddl: _,
+        ddl,
     } = args;
     let scfg = source.config();
     let pgcfg = PgConfig {
@@ -785,6 +794,20 @@ pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPip
         .set_invalidation_epoch(inv_epoch.clone());
     catalog.lock().await.set_invalidation_epoch(inv_epoch);
 
+    // pg_class delete epoch gates the reorder coordinator's commit-boundary
+    // DROP sweep. Only the DDL path needs it (mirrors bin/stream.rs).
+    let del_epoch = Arc::new(AtomicU64::new(0));
+    if ddl.is_some() {
+        stream
+            .filter_mut()
+            .tracker
+            .set_pg_class_delete_epoch(del_epoch.clone());
+        catalog
+            .lock()
+            .await
+            .set_pg_class_delete_epoch(del_epoch.clone());
+    }
+
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await
         .expect("START_REPLICATION");
@@ -815,6 +838,29 @@ pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPip
         );
     }
 
+    // DDL wiring (mirrors bin/stream.rs --ch-config). Fold namespace /
+    // drop-strategy overrides into the emitter config *before* the
+    // applicator reads it, seed the schema-diff baseline for mapped
+    // relations so a pinned table's first ALTER surfaces as Changed, and
+    // subscribe the decoder to the catalog's schema-event channel so
+    // ALTER/CREATE/DROP reach the reorder coordinator as `ordered_events`.
+    let mut schema_events: Option<walshadow::xact_buffer::SchemaEventRx> = None;
+    if let Some(d) = ddl.as_ref() {
+        emitter_cfg.namespaces = d.namespaces.clone();
+        if let Some(s) = &d.drop_table_strategy {
+            emitter_cfg.drop_table_strategy = s.clone();
+        }
+        let names: Vec<String> = emitter_cfg.tables.keys().cloned().collect();
+        catalog
+            .lock()
+            .await
+            .seed_baseline(&names)
+            .await
+            .expect("seed schema-diff baseline");
+        let rx = catalog.lock().await.subscribe();
+        schema_events = Some(Arc::new(std::sync::Mutex::new(rx)));
+    }
+
     // SIGHUP-reloadable mapping shared by the DDL applicator + decode pool.
     let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
     let ddl_cfg = DdlConfig::from_emitter(&emitter_cfg);
@@ -833,16 +879,19 @@ pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPip
         applicator,
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-        schema_events: None,
-        pg_class_delete_epoch: None,
-        stats,
+        schema_events: schema_events.clone(),
+        pg_class_delete_epoch: ddl.as_ref().map(|_| del_epoch.clone()),
+        stats: stats.clone(),
     };
     let (reorder, handle) = pcfg
         .spawn(emitter_ack.clone())
         .await
         .expect("spawn decode+insert pipeline");
 
-    let decoder = BufferingDecoderSink::new(catalog, xact_buffer.clone());
+    let mut decoder = BufferingDecoderSink::new(catalog, xact_buffer.clone());
+    if let Some(rx) = &schema_events {
+        decoder = decoder.with_schema_events(rx.clone());
+    }
     let sinks = PipelineSinks {
         metrics: MetricsRecordSink::default(),
         decoder,
@@ -861,6 +910,7 @@ pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPip
         chunk_buf,
         handle,
         ack: emitter_ack,
+        stats,
     }
 }
 

@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use wal_rs::pg::walparser::RmId;
 
 use crate::ch_ddl::DdlApplicator;
+use crate::ch_emitter::EmitterStats;
 use crate::decoder_sink::DecoderSinkError;
 use crate::heap_decoder::{DecodedHeap, HeapOp};
 use crate::relation_resolver::RelationResolver;
@@ -55,6 +56,10 @@ pub struct ReorderSink {
     /// used to send `FlushAll` so it orders after enqueued rows.
     msg_tx: mpsc::Sender<BatcherMsg>,
     fatal: Fatal,
+    /// Shared emitter counters. Reorder owns the commit-order boundary, so
+    /// it bumps `xacts_committed` (once per commit) and `truncates_emitted`,
+    /// matching the serial emitter's `on_xact_end_with_lsn` / `route`.
+    stats: Arc<EmitterStats>,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
 }
@@ -71,6 +76,7 @@ impl ReorderSink {
         ack: AckHandle,
         jobs_tx: mpmc::Sender<DecodeJob>,
         msg_tx: mpsc::Sender<BatcherMsg>,
+        stats: Arc<EmitterStats>,
         fatal: Fatal,
     ) -> Self {
         let last_seen_delete_epoch = pg_class_delete_epoch
@@ -88,6 +94,7 @@ impl ReorderSink {
             ack,
             jobs_tx,
             msg_tx,
+            stats,
             fatal,
             next_seq: 0,
         }
@@ -259,7 +266,9 @@ impl ReorderSink {
         self.applicator
             .truncate(rel.qualified_name.as_ref())
             .await
-            .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))
+            .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
+        self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Process a barrier xact in source_lsn order: data rows accumulate
@@ -324,6 +333,9 @@ impl ReorderSink {
                 .map_err(SinkError::from)?
         };
         self.subxact_tracker.lock().await.forget_tree(xid);
+        // One per drained commit (incl. empty / unmapped-only), matching the
+        // serial emitter's bump in `on_xact_end_with_lsn`.
+        self.stats.xacts_committed.fetch_add(1, Ordering::Relaxed);
 
         let is_barrier = !drained.ordered_events.is_empty()
             || drained

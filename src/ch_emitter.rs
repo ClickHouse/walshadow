@@ -1,5 +1,11 @@
 //! CH Native emitter via [`clickhouse-c-rs`].
 //!
+//! Fronts bootstrap backfill only; the live streaming drain uses the
+//! parallel pipeline in [`crate::pipeline`]. Per-xact close
+//! (`flush_timeout == 0`, "legacy mode" below) is forced on for
+//! backfill and unreachable from the live `flush_timeout` knob, which
+//! maps `0` to a 100ms partial-batch deadline instead.
+//!
 //! Translates committed-xact tuple streams into per-table INSERT
 //! statements over a single TCP `AsyncClient` per CH replica. Lifecycle per
 //! `(destination table, xact)`:
@@ -75,11 +81,13 @@ pub const OP_DELETE: i8 = 3;
 pub const DEFAULT_ROW_BUDGET: usize = 65_536;
 pub const DEFAULT_BYTE_BUDGET: usize = 1 << 20; // 1 MiB
 
-/// Default flush timeout (ms) — `0` keeps the legacy
-/// close-INSERT-on-every-xact-end behaviour. Set this to a positive
-/// value via TOML (`flush_timeout_ms`) or `--ch-flush-timeout-ms` to
-/// let the emitter hold INSERTs open across xacts and close them on a
-/// deadline that starts when the first row of a fresh INSERT lands.
+/// Default flush timeout (ms). `0` keeps this serial emitter's
+/// close-INSERT-on-every-xact-end behaviour (bootstrap backfill only);
+/// the live pipeline substitutes a 100ms partial-batch deadline for
+/// `0` so cold tables can't pin the watermark. A positive value, via
+/// TOML (`flush_timeout_ms`) or `--ch-flush-timeout-ms`, holds INSERTs
+/// open across xacts and seals on a deadline armed at the first row of
+/// a fresh INSERT.
 pub const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 0;
 
 #[derive(Debug, Error)]
