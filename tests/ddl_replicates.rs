@@ -145,6 +145,7 @@ async fn alter_add_column_replicates_without_toml_edit() {
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay");
     assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
 
     // Verify CH gained the `c` column (Nullable(String) by default).
     let cols = ch
@@ -264,6 +265,7 @@ async fn create_table_auto_replicates_in_namespace() {
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay");
     assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
 
     // CH dest should exist and contain the row.
     let tbls = ch
@@ -369,6 +371,7 @@ async fn drop_table_strategy_drop_removes_dest() {
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay");
     assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
 
     let exists = ch
         .query(
@@ -467,6 +470,7 @@ async fn auto_create_honors_per_namespace_target_database() {
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay");
     assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
 
     // Table + row land in the override DB.
     let in_warehouse = ch

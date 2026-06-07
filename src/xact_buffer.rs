@@ -12,7 +12,7 @@
 //! ## Why bundle TOAST chunks into the same buffer as heap tuples
 //!
 //! PG's `toast_save_datum` writes chunk INSERTs in the same xact as
-//! the referring tuple. Keeping both inside one [`XactState`] gives:
+//! the referring tuple. Keeping both inside one `XactState` gives:
 //!
 //! * Single key (`xid`) for spill, eviction, drain, abort cleanup.
 //! * WAL-order natural — heap and chunk records interleave on disk;
@@ -40,7 +40,7 @@
 //!
 //! Once `memory_used > config.xact_buffer_max`, [`XactBuffer`] picks
 //! the largest in-memory xact and flushes its entries to a
-//! [`SpillWriter`](crate::spill::SpillWriter) under `spill_dir`. The
+//! [`SpillWriter`] under `spill_dir`. The
 //! xact stays "open" — subsequent records keep appending to the spill
 //! file. Mirrors PG `ReorderBufferLargestTXN` (logical-decoding's same
 //! problem in `~/s/postgresql/src/backend/replication/logical/reorderbuffer.c`).
@@ -372,7 +372,7 @@ fn entry_lsn(e: &SpillEntry) -> u64 {
 #[derive(Debug, Clone)]
 pub struct XactBufferConfig {
     /// In-memory budget across every active xact before eviction
-    /// kicks in. Sum of [`XactState::in_mem_bytes`] over [`XactBuffer`].
+    /// kicks in. Sum of `XactState::in_mem_bytes` over [`XactBuffer`].
     pub xact_buffer_max: usize,
     /// Per-xid spill files land here. Created on [`XactBuffer::new`]
     /// if missing; cleared by [`XactBuffer::clear_spill_dir`] at
@@ -966,7 +966,7 @@ impl XactBuffer {
                     .map_err(|e| XactBufferError::Observer(e.to_string()))?;
                 event_cursor += 1;
             }
-            detoast_heap(&mut heap, &chunks, catalog).await?;
+            detoast_heap(&mut heap, &chunks, catalog, false).await?;
             let committed = CommittedTuple {
                 decoded: heap,
                 commit_ts,
@@ -1260,6 +1260,12 @@ pub(crate) async fn detoast_heap(
     heap: &mut DecodedHeap,
     chunks: &HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
     catalog: &Arc<Mutex<ShadowCatalog>>,
+    // The async decode pool can lag past a DDL and re-resolve an older heap,
+    // so it reuses the inline path's cached descriptor without mutating the
+    // cache or emitting schema events (see
+    // `ShadowCatalog::relation_at_pooled`). The WAL-ordered observer drain
+    // passes `false` to keep the normal cache-populating path.
+    pooled: bool,
 ) -> std::result::Result<(), XactBufferError> {
     let needs = tuple_needs_detoast(heap.new.as_ref()) || tuple_needs_detoast(heap.old.as_ref());
     if !needs {
@@ -1267,7 +1273,11 @@ pub(crate) async fn detoast_heap(
     }
     let rel: Arc<RelDescriptor> = {
         let mut cat = catalog.lock().await;
-        cat.relation_at(heap.rfn, heap.source_lsn).await?
+        if pooled {
+            cat.relation_at_pooled(heap.rfn, heap.source_lsn).await?
+        } else {
+            cat.relation_at(heap.rfn, heap.source_lsn).await?
+        }
     };
     if let Some(t) = heap.new.as_mut() {
         detoast_tuple(t, &rel, chunks)?;
@@ -1687,7 +1697,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
 /// `RecordSink` that decodes user-heap records and routes them into
 /// the xact buffer keyed by `xid`. Toast-relation INSERTs
 /// (`rel.kind == 't'`) are reinterpreted as
-/// [`ToastChunk`](crate::spill::ToastChunk)s and parked under their
+/// [`ToastChunk`]s and parked under their
 /// `(toast_relid, value_id)` slot for drain-time reassembly. Only
 /// `Route::ToDecoder` records reach this sink (catalog-keep stays on
 /// the shadow-replay path); semantic errors absorb into

@@ -287,7 +287,7 @@ impl SourceFeed {
     }
 
     /// Most recent `server_wal_end` reported by source over either a WAL
-    /// frame or a keepalive. Zero before [`start_physical_replication`]
+    /// frame or a keepalive. Zero before `start_physical_replication`
     /// has produced any traffic.
     pub fn last_server_wal_end(&self) -> u64 {
         self.last_server_wal_end

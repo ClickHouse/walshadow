@@ -16,7 +16,8 @@
 //!   → schema + INSERT s14.t (64 rows) + CHECKPOINT + pg_switch_wal
 //!   → walshadow-stream (subprocess)
 //!         → run_bootstrap (DirectSource BASE_BACKUP → MultiplexSink)
-//!         → drain_backfill → transitional Emitter → CH default.t
+//!         → pipeline::bootstrap::drain → shared tail (batcher + inserter
+//!           pool + ack) → CH default.t
 //!         → autospawn shadow PG against bootstrap_shadow_data_dir
 //!         → ShadowCatalog connect + preflight + WAL pump
 //!   → assert_ch_matches_source(ch, source, "s14.t", "default.t")
@@ -195,9 +196,9 @@ async fn direct_bootstrap_ch_end_to_end() {
         // 7. Wait for the daemon's metrics endpoint. Crossing this
         //    barrier means: bootstrap finished, autospawn'd shadow is
         //    serving, preflight passed, WAL pump is in its main loop.
-        //    Bootstrap-emitter INSERTs flush to CH synchronously before
-        //    the daemon hands off to the streaming pump, so the 64-row
-        //    fixture is fully on CH by the time we reach this barrier.
+        //    The bootstrap tail's `wait_through(K)` makes every backfill
+        //    row durable on CH before the daemon hands off to the streaming
+        //    pump, so the 64-row fixture is fully on CH at this barrier.
         fx::wait_for_listen(metrics_addr, Duration::from_secs(30))
             .context("daemon metrics endpoint never came up")?;
 

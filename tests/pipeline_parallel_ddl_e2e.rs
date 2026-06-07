@@ -102,7 +102,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
         ],
     }];
 
-    let mut pipeline = fx::build_parallel_pipeline(fx::BuildPipelineArgs {
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
         tmp: &tmp,
         source: &source,
         shadow: &shadow,
@@ -271,7 +271,7 @@ async fn parallel_pipeline_truncate_orders_after_data() {
 
     // TRUNCATE rides the barrier as a heap op — no schema-event subscription
     // needed, so the DML-only wiring (`ddl: None`) suffices.
-    let mut pipeline = fx::build_parallel_pipeline(fx::BuildPipelineArgs {
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
         tmp: &tmp,
         source: &source,
         shadow: &shadow,

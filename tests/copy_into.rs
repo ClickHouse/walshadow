@@ -128,6 +128,7 @@ async fn copy_into_multi_insert_replicates() {
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay catches up");
     assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
 
     let src_count = source
         .psql_one("SELECT count(*) FROM s14.copy_t")

@@ -23,13 +23,12 @@
 //!
 //! ## Coordination with the INSERT pump
 //!
-//! The xact-buffer drain calls `on_schema_event` BEFORE the next
-//! `on_tuple` that references the post-DDL shape (k-way merge in
-//! source_lsn order). The applicator runs the CH DDL synchronously
-//! inside `on_schema_event` — by the time `on_tuple` is called, the
-//! CH table is reshaped. Open INSERTs against the affected relation
-//! must be closed first; that's the emitter's responsibility (see
-//! `Emitter::flush_for_schema_change`).
+//! The reorder coordinator ([`crate::pipeline::reorder`]) drives DDL
+//! ordering: within a barrier xact it dispatches pending data segments,
+//! fences (seals the batcher and waits until every earlier row is durable
+//! on CH), then applies the schema change here, then resumes. The CH table
+//! is reshaped only after all earlier-LSN rows have landed; post-DDL rows
+//! then encode against the new shape.
 
 use std::collections::{HashMap, HashSet};
 
@@ -75,7 +74,7 @@ impl DropTableStrategy {
 
 /// Knobs that don't ride the emitter's INSERT pump but still need to
 /// flow through the same TOML reload path. Owned by the applicator;
-/// SIGHUP reload swaps the inner via [`DdlApplicator::reload_config`].
+/// SIGHUP reload swaps the inner via [`DdlApplicator::config_mut`].
 #[derive(Debug, Clone)]
 pub struct DdlConfig {
     pub drop_table_strategy: DropTableStrategy,
@@ -91,8 +90,8 @@ pub struct DdlConfig {
     /// emitter's `EmitterConfig::database`.
     pub target_database: String,
     /// Per-namespace overrides (`target_database`, `drop_table_strategy`)
-    /// keyed by source namespace, resolved in [`Self::target_database_for`]
-    /// and [`Self::drop_strategy_for`]. The global fields above are the
+    /// keyed by source namespace, resolved in `Self::target_database_for`
+    /// and `Self::drop_strategy_for`. The global fields above are the
     /// fallback when a namespace has no override.
     pub namespaces: HashMap<String, NamespaceMapping>,
 }
@@ -167,7 +166,7 @@ pub struct DdlStats {
 impl DdlApplicator {
     /// Build an applicator with its own CH connection. Opens a fresh
     /// `tokio` TCP socket to `(host, port)` via [`AsyncClient`] — same
-    /// shape as [`crate::ch_emitter::Emitter::new`].
+    /// shape as the shared `connect_client` helper.
     pub async fn new(
         emitter_cfg: &EmitterConfig,
         ddl_cfg: DdlConfig,
@@ -582,7 +581,7 @@ pub fn render_create_table(
     Ok(Some(sql))
 }
 
-/// CH identifier — same shape as [`quote_ident`]. Re-exported as a
+/// CH identifier — same shape as `quote_ident`. Re-exported as a
 /// helper for callers building qualified destination names from
 /// (database, table) parts without re-walking the surface.
 pub fn sql_ident(name: &str) -> String {
@@ -590,7 +589,7 @@ pub fn sql_ident(name: &str) -> String {
 }
 
 /// Derive a default `Vec<ColumnMapping>` from a relation's descriptor.
-/// Used by [`DdlApplicator::apply_added`] when auto-discovering tables
+/// Used by `DdlApplicator::apply_added` when auto-discovering tables
 /// in an `auto_create`-flagged namespace; operator overrides via TOML
 /// still win the next SIGHUP.
 pub fn derive_columns_for_mapping(desc: &RelDescriptor) -> Vec<ColumnMapping> {

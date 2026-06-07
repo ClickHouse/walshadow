@@ -15,22 +15,22 @@
 
 pub mod ack;
 pub mod batcher;
+pub mod bootstrap;
 pub mod decode;
 pub mod inserter;
 pub mod mpmc;
 pub mod reorder;
+pub mod tail;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use clickhouse_c::Allocator;
-
 use crate::ch_ddl::DdlApplicator;
-use crate::ch_emitter::{EmitterConfig, EmitterError, EmitterStats, MappingHandle};
+use crate::ch_emitter::{EmitterConfig, EmitterError, EmitterStats, MappingHandle, TableMapping};
 use crate::oracle::Oracle;
 use crate::shadow_catalog::ShadowCatalog;
 use crate::xact_buffer::{SchemaEventRx, SubxactTracker, XactBuffer};
@@ -94,6 +94,24 @@ impl Fatal {
 /// otherwise pin the watermark indefinitely, so 0 means "use this".
 const DEFAULT_PIPELINE_FLUSH: Duration = Duration::from_millis(100);
 
+/// Resolve a relation's destination mapping. Bumps `unsupported_relations`
+/// and returns None when the relation maps to no destination, so callers skip
+pub(crate) async fn lookup_mapping(
+    mapping: &MappingHandle,
+    qualified_name: &str,
+    stats: &EmitterStats,
+) -> Option<Arc<TableMapping>> {
+    match mapping.read().await.get(qualified_name) {
+        Some(v) => Some(Arc::new(v.clone())),
+        None => {
+            stats
+                .unsupported_relations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 /// Inputs the daemon supplies to stand up the pipeline. Mirrors what the
 /// serial emitter path consumed, plus the two pool sizes.
 pub struct PipelineConfig {
@@ -120,10 +138,8 @@ pub struct PipelineHandle {
     /// as the standby `apply_lsn` and writes it to the resume cursor.
     pub emitter_ack: Arc<AtomicU64>,
     pub fatal: Fatal,
-    collector: JoinHandle<()>,
-    batcher: JoinHandle<()>,
     decoders: Vec<JoinHandle<()>>,
-    inserters: Vec<JoinHandle<()>>,
+    tail: tail::TailParts,
 }
 
 impl PipelineHandle {
@@ -134,11 +150,7 @@ impl PipelineHandle {
         for h in self.decoders {
             let _ = h.await;
         }
-        let _ = self.batcher.await;
-        for h in self.inserters {
-            let _ = h.await;
-        }
-        let _ = self.collector.await;
+        self.tail.join().await;
         match self.fatal.message() {
             Some(msg) => Err(msg),
             None => Ok(()),
@@ -171,46 +183,22 @@ impl PipelineConfig {
             stats,
         } = self;
         let m = decoder_pool_size.max(1);
-        let n = inserter_pool_size.max(1);
         let fatal = Fatal::new();
 
-        let (ack, collector) = ack::spawn(emitter_ack.clone());
-
-        // Channel bounds scale with pool sizes for bounded overlap. Rows
-        // (decode pool) and FlushAll (barrier) share one FIFO channel so the
-        // barrier flush can't overtake enqueued rows.
-        let (jobs_tx, jobs_rx) = mpmc::channel::<decode::DecodeJob>((m * 4).max(8));
-        let (msg_tx, msg_rx) = mpsc::channel::<batcher::BatcherMsg>(8192);
-        let (batches_tx, batches_rx) = mpmc::channel::<batcher::InsertBatch>((n * 2).max(4));
-
-        // Inserters first (they only consume): a connect failure aborts
-        // before any other stage spins up.
-        let inserters = inserter::spawn_pool(
-            n,
+        // Shared tail (ack collector + inserter pool + batcher); the same
+        // unit bootstrap feeds via the page walk. `msg_tx` and `ack` clone
+        // into the decode pool + reorder below.
+        let (msg_tx, ack, tail) = tail::spawn(
             &emitter,
-            batches_rx,
-            ack.clone(),
+            inserter_pool_size,
             stats.clone(),
+            emitter_ack.clone(),
             fatal.clone(),
         )
         .await?;
 
-        let flush_timeout = if emitter.flush_timeout.is_zero() {
-            DEFAULT_PIPELINE_FLUSH
-        } else {
-            emitter.flush_timeout
-        };
-        let batcher = batcher::spawn(
-            msg_rx,
-            batches_tx,
-            batcher::BatcherConfig {
-                row_budget: emitter.row_budget,
-                byte_budget: emitter.byte_budget,
-                flush_timeout,
-            },
-            Allocator::stdlib(),
-            fatal.clone(),
-        );
+        // Job-queue bound scales with the decode pool for bounded overlap.
+        let (jobs_tx, jobs_rx) = mpmc::channel::<decode::DecodeJob>((m * 4).max(8));
 
         let ctx = decode::DecodeCtx {
             catalog: catalog.clone(),
@@ -240,10 +228,8 @@ impl PipelineConfig {
             PipelineHandle {
                 emitter_ack,
                 fatal,
-                collector,
-                batcher,
                 decoders,
-                inserters,
+                tail,
             },
         ))
     }

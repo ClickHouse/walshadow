@@ -51,7 +51,6 @@ pub mod pg_class_decoder;
 pub mod pipeline;
 pub mod preflight;
 pub mod queueing_record_sink;
-pub mod relation_resolver;
 pub mod retention;
 pub mod rewrite;
 pub mod segment;

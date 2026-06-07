@@ -34,10 +34,9 @@ use wal_rs::pg::replication::tls::SslMode;
 
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, EmitterObserver, EmitterStats,
-    MappingHandle, NamespaceMapping, TableMapping,
+    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, MappingHandle, NamespaceMapping,
+    TableMapping,
 };
-use walshadow::decoder_sink::TupleObserver;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle};
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -46,9 +45,7 @@ use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
-use walshadow::xact_buffer::{
-    BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig, XactRecordSink,
-};
+use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
 // ---------------------------------------------------------------------------
 // Skip-gate probes
@@ -324,34 +321,6 @@ impl Drop for ChServer {
 }
 
 // ---------------------------------------------------------------------------
-// Daemon sink chain (clone of bin/stream.rs::DaemonSinks). Kept here so
-// each inproc test owns dispatch order without re-exporting
-// daemon-private types.
-// ---------------------------------------------------------------------------
-
-pub struct DaemonSinks {
-    pub metrics: MetricsRecordSink,
-    pub decoder: BufferingDecoderSink,
-    pub xact_drain: XactRecordSink<Box<dyn TupleObserver>>,
-}
-
-impl RecordSink for DaemonSinks {
-    fn on_record<'a>(
-        &'a mut self,
-        record: &'a Record<'a>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.metrics.on_record(record).await?;
-            self.decoder.on_record(record).await?;
-            self.xact_drain.on_record(record).await?;
-            Ok(())
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Bootstrap orchestrator. Returns the source + shadow pair + the
 // `ShadowStreamState` the walsender listener is hosting.
 // ---------------------------------------------------------------------------
@@ -444,19 +413,14 @@ pub async fn bootstrap_clusters(
 
 // ---------------------------------------------------------------------------
 // Pipeline builder + pump loop. `build_pipeline` wires SourceFeed →
-// WalStream → DaemonSinks → DirSegmentSink against a pre-bootstrapped
-// PG pair + CH server. `pump_segments` runs the inner loop until
-// `segments_needed` segments have shipped or `deadline` elapses.
+// WalStream → the parallel decode+insert pipeline (`src/pipeline`:
+// reorder → decode pool → batcher → inserter pool, the same wiring
+// `bin/stream.rs` stands up behind `--ch-config`) → DirSegmentSink against
+// a pre-bootstrapped PG pair + CH server. `pump_segments` runs the inner
+// loop until `segments_needed` segments ship or `deadline` elapses; tests
+// then `pipeline.shutdown().await` to drain the tail before asserting CH
+// state (the tail batches, so rows aren't durable until the drain).
 // ---------------------------------------------------------------------------
-
-pub struct Pipeline {
-    pub feed: SourceFeed,
-    pub stream: WalStream,
-    pub record_sink: DaemonSinks,
-    pub segment_sink: DirSegmentSink,
-    pub xact_buffer: Arc<Mutex<XactBuffer>>,
-    pub chunk_buf: Vec<u8>,
-}
 
 pub struct TableMappingSpec {
     pub source_table: String,
@@ -488,191 +452,17 @@ pub struct DdlPipelineArgs {
     pub drop_table_strategy: Option<String>,
 }
 
-pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
-    let BuildPipelineArgs {
-        tmp,
-        source,
-        shadow,
-        shadow_filter_dir,
-        shadow_stream_state,
-        ch_database,
-        ch_tcp_port,
-        mappings,
-        app_name,
-        ddl,
-    } = args;
-    let scfg = source.config();
-    let pgcfg = PgConfig {
-        host: scfg.socket_dir.to_string_lossy().into_owned(),
-        port: scfg.port,
-        user: "postgres".into(),
-        password: None,
-        database: "postgres".into(),
-        application_name: app_name.into(),
-        sslmode: SslMode::Disable,
-    };
-    let mut feed = SourceFeed::connect(&pgcfg)
-        .await
-        .expect("source feed connect")
-        .with_status_interval(Duration::from_millis(500));
-    let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
-    let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
-    stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
-        shadow_stream_state,
-    )));
-
-    {
-        let sql_client = feed.sql_client().await.expect("sidecar sql client");
-        stream
-            .filter_mut()
-            .tracker
-            .seed_from_source(sql_client)
-            .await
-            .expect("seed_from_source");
-    }
-
-    let shadow_conninfo = socket_conninfo(
-        shadow.config().socket_dir.to_str().unwrap(),
-        shadow.config().port,
-        "postgres",
-        "postgres",
-    );
-    let cat_cfg = ShadowCatalogConfig {
-        replay_timeout: Duration::from_secs(60),
-        replay_poll: Duration::from_millis(50),
-        ..Default::default()
-    };
-    let catalog = ShadowCatalog::connect(&shadow_conninfo, cat_cfg)
-        .await
-        .expect("connect shadow catalog");
-    let catalog = Arc::new(Mutex::new(catalog));
-
-    let inv_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let del_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    stream
-        .filter_mut()
-        .tracker
-        .set_invalidation_epoch(inv_epoch.clone());
-    stream
-        .filter_mut()
-        .tracker
-        .set_pg_class_delete_epoch(del_epoch.clone());
-    {
-        let mut cat = catalog.lock().await;
-        cat.set_invalidation_epoch(inv_epoch);
-        cat.set_pg_class_delete_epoch(del_epoch.clone());
-    }
-
-    feed.start_physical_replication(None, aligned, ident.timeline)
-        .await
-        .expect("START_REPLICATION");
-
-    let spill_dir = tmp.path().join("spill");
-    fs::create_dir_all(&spill_dir).unwrap();
-    let xact_buf_cfg = XactBufferConfig {
-        xact_buffer_max: walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX,
-        spill_dir,
-    };
-    let xact_buffer = XactBuffer::new(xact_buf_cfg).expect("xact buffer");
-    let xact_buffer = Arc::new(Mutex::new(xact_buffer));
-
-    let mut emitter_cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: ch_tcp_port,
-        database: ch_database.into(),
-        compression: CompressionChoice::Lz4,
-        ..Default::default()
-    };
-    for spec in mappings {
-        emitter_cfg.tables.insert(
-            spec.source_table,
-            TableMapping {
-                target: spec.target_table,
-                columns: spec.columns,
-            },
-        );
-    }
-    if let Some(d) = ddl.as_ref() {
-        emitter_cfg.namespaces = d.namespaces.clone();
-        if let Some(s) = &d.drop_table_strategy {
-            emitter_cfg.drop_table_strategy = s.clone();
-        }
-    }
-
-    // Seed the schema-diff baseline for mapped relations before any
-    // subscribe(), mirroring bin/stream.rs: warms prev_known so a pinned
-    // table's first post-start ALTER surfaces as Changed instead of the
-    // cold-prev_known Added that apply_added skips for pinned dests.
-    {
-        let names: Vec<String> = emitter_cfg.tables.keys().cloned().collect();
-        catalog
-            .lock()
-            .await
-            .seed_baseline(&names)
-            .await
-            .expect("seed schema-diff baseline");
-    }
-
-    let mut emitter = Emitter::new(emitter_cfg.clone(), catalog.clone())
-        .await
-        .expect("init emitter");
-    let mapping_handle = emitter.mapping_handle();
-
-    // DDL wiring — second CH TCP for the DDL applicator + decoder
-    // subscription to the catalog's schema-event channel.
-    let mut schema_rx_opt = None;
-    if ddl.is_some() {
-        let ddl_cfg = DdlConfig::from_emitter(&emitter_cfg);
-        let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping_handle)
-            .await
-            .expect("ddl init");
-        emitter = emitter.with_applicator(applicator);
-        let rx = catalog.lock().await.subscribe();
-        schema_rx_opt = Some(std::sync::Arc::new(std::sync::Mutex::new(rx)));
-    }
-    let observer: Box<dyn TupleObserver> = Box::new(EmitterObserver::new(emitter));
-
-    let mut decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone());
-    let mut xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer);
-    if let Some(rx) = schema_rx_opt {
-        decoder = decoder.with_schema_events(rx.clone());
-        xact_drain = xact_drain
-            .with_schema_events(rx)
-            .with_pg_class_delete_epoch(del_epoch);
-    }
-    let record_sink = DaemonSinks {
-        metrics: MetricsRecordSink::default(),
-        decoder,
-        xact_drain,
-    };
-    let segment_sink =
-        DirSegmentSink::new(shadow_filter_dir.to_path_buf()).expect("open shadow filter dir");
-    let chunk_buf = Vec::with_capacity(64 * 1024);
-
-    Pipeline {
-        feed,
-        stream,
-        record_sink,
-        segment_sink,
-        xact_buffer,
-        chunk_buf,
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Parallel decode+insert pipeline builder. Mirrors `build_pipeline`'s
-// feed/catalog bootstrap but swaps the serial `Emitter` drain for the
-// `src/pipeline` fan-out (M decoders, N inserters, reorder coordinator) —
-// the same wiring `bin/stream.rs` stands up behind `--ch-config`.
+// `build_pipeline` wires the feed/catalog bootstrap and the `src/pipeline`
+// fan-out (decode pool → batcher → inserter pool, reorder coordinator) — the
+// same wiring `bin/stream.rs` stands up behind `--ch-config`.
 //
 // `TRUNCATE` rides the reorder barrier as a `HeapOp::Truncate` heap and so
 // needs no extra wiring (the applicator is always built below). Schema-
 // evolution DDL (ALTER/CREATE/DROP) flows as reorder `ordered_events`, which
 // only surface when the decoder is subscribed to the catalog's schema-event
 // channel — so `ddl: Some(..)` wires that subscription + the pg_class delete
-// epoch + baseline seeding, exactly like `build_pipeline`. `ddl: None` leaves
-// the DML-only path untouched.
+// epoch + baseline seeding. `ddl: None` leaves the DML-only path untouched.
 // ---------------------------------------------------------------------------
 
 /// Record-sink chain feeding the parallel pipeline: `metrics → decoder
@@ -701,7 +491,7 @@ impl RecordSink for PipelineSinks {
     }
 }
 
-pub struct ParallelPipeline {
+pub struct Pipeline {
     pub feed: SourceFeed,
     pub stream: WalStream,
     pub sinks: PipelineSinks,
@@ -715,19 +505,19 @@ pub struct ParallelPipeline {
     pub stats: Arc<EmitterStats>,
 }
 
-impl ParallelPipeline {
+impl Pipeline {
     /// Drop the sink chain (closing the reorder coordinator's job + row
     /// channels) and await the drain cascade: decoders finish → batcher
     /// final-flushes → inserters drain to `EndOfStream` → ack collector
     /// exits. Surfaces any pipeline-fatal error.
     pub async fn shutdown(self) -> std::result::Result<(), String> {
-        let ParallelPipeline { sinks, handle, .. } = self;
+        let Pipeline { sinks, handle, .. } = self;
         drop(sinks);
         handle.join().await
     }
 }
 
-pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPipeline {
+pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
     let BuildPipelineArgs {
         tmp,
         source,
@@ -901,7 +691,7 @@ pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPip
         DirSegmentSink::new(shadow_filter_dir.to_path_buf()).expect("open shadow filter dir");
     let chunk_buf = Vec::with_capacity(64 * 1024);
 
-    ParallelPipeline {
+    Pipeline {
         feed,
         stream,
         sinks,
@@ -916,9 +706,8 @@ pub async fn build_parallel_pipeline(args: BuildPipelineArgs<'_>) -> ParallelPip
 
 /// Drive the WAL pump against the raw feed/stream/sink trio until
 /// `segments_needed` segments have shipped or `deadline` elapses.
-/// Returns the count shipped. Generic over the record sink so both the
-/// serial-emitter [`Pipeline`] and the parallel [`ParallelPipeline`]
-/// reuse one loop.
+/// Returns the count shipped. Generic over the record sink so the
+/// [`Pipeline`] drive and the bootstrap drills reuse one loop.
 pub async fn pump_until<S: RecordSink>(
     feed: &mut SourceFeed,
     stream: &mut WalStream,
@@ -967,7 +756,7 @@ pub async fn pump_segments(
     pump_until(
         &mut pipeline.feed,
         &mut pipeline.stream,
-        &mut pipeline.record_sink,
+        &mut pipeline.sinks,
         &mut pipeline.segment_sink,
         &mut pipeline.chunk_buf,
         segments_needed,

@@ -12,7 +12,7 @@
 //!   `src/backend/utils/cache/relmapper.c`). Each non-zero mapping
 //!   `(mapoid, mapfilenumber)` adds `mapfilenumber` to the catalog
 //!   set for that database (or the shared set if `dbid == 0`).
-//! * Heap writes to `pg_class` — decoded via [`pg_class_decoder`].
+//! * Heap writes to `pg_class` — decoded via `pg_class_decoder`.
 //!   Carries new relfilenodes for non-mapped catalogs
 //!   after `VACUUM FULL` / `REINDEX` / `CLUSTER`. Filters on
 //!   `oid < FirstNormalObjectId` so user-table inserts into pg_class
@@ -23,12 +23,13 @@
 //!   rotated a mapped catalog above 16384 before walshadow attaches"
 //!   hole that the < 16384 bootstrap rule misses on its own.
 //!
-//! Invalidation signal: when [`set_invalidation_epoch`](CatalogTracker
-//! ::set_invalidation_epoch) attaches an `AtomicU64`, every `observe`
+//! Invalidation signal: when
+//! [`set_invalidation_epoch`](CatalogTracker::set_invalidation_epoch)
+//! attaches an `AtomicU64`, every `observe`
 //! that processes a relmap update or a pg_class heap write bumps the
 //! counter. [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog)
 //! shares the same atomic and consults it at the top of every relation
-//! lookup; an advance triggers an in-line [`ShadowCatalog::invalidate`]
+//! lookup; an advance triggers an in-line `ShadowCatalog::invalidate`
 //! call before the cache check. Synchronous so a catalog write
 //! observed in the same `WalStream::push` batch as the dependent heap
 //! INSERT can't lose the race against an async drain task.
@@ -77,7 +78,7 @@ pub struct CatalogTracker {
     invalidation_epoch: Option<Arc<AtomicU64>>,
     /// Narrower signal: bumps ONLY on pg_class
     /// heap_delete records (the WAL shape that DROP TABLE writes).
-    /// Lets [`ShadowCatalog::sweep_dropped`] throttle off this
+    /// Lets `ShadowCatalog::sweep_dropped` throttle off this
     /// counter so non-drop DDL (ADD COLUMN, CREATE INDEX, ...) doesn't
     /// trigger a per-commit shadow PG round-trip. Senderless trackers
     /// leave this `None`.
@@ -140,7 +141,7 @@ impl CatalogTracker {
 
     /// Attach the DROP-only counter. Bumped only on
     /// pg_class `heap_delete` records (the DDL shape that flags an
-    /// oid as gone). [`ShadowCatalog::sweep_dropped`] gates off this
+    /// oid as gone). `ShadowCatalog::sweep_dropped` gates off this
     /// counter to skip per-commit shadow round-trips for non-drop
     /// DDL.
     pub fn set_pg_class_delete_epoch(&mut self, epoch: Arc<AtomicU64>) {

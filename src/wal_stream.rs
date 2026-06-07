@@ -1,5 +1,5 @@
 //! Streaming filter pipeline. Wraps the per-record
-//! [`StreamingWalker`](crate::streaming_walker::StreamingWalker) in a
+//! [`StreamingWalker`] in a
 //! segment-aligned accumulator that consumes arbitrary WAL byte chunks
 //! (from wal-rs's `START_REPLICATION` CopyData stream) and dispatches
 //! to per-record + per-segment sinks at record cadence.
@@ -245,7 +245,7 @@ pub trait SegmentSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
     /// Receives a partial segment flushed at shutdown by
-    /// [`WalStream::close`]. Default forwards to [`on_segment`] for
+    /// [`WalStream::close`]. Default forwards to `on_segment` for
     /// test sinks that don't care; production [`DirSegmentSink`]
     /// overrides to land bytes under `<name>.partial` per
     /// `pg_receivewal` convention so a follow-up daemon run does not
@@ -516,7 +516,7 @@ async fn write_sync_rename(
 /// Segment-aligned record-cadence WAL filter.
 ///
 /// Bytes pushed via [`push`](Self::push) must arrive in contiguous LSN
-/// order starting from [`base_lsn`](Self::base_lsn).
+/// order starting from `base_lsn`.
 ///
 /// Owns the long-lived [`Filter`]: `CatalogTracker` state — every
 /// `XLOG_RELMAP_UPDATE`, every decoded pg_class write — must survive

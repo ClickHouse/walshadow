@@ -30,7 +30,7 @@ pub struct WalkedRecord {
     /// File-offset / length pairs the logical bytes occupy in the
     /// segment, in order. `byte_ranges.iter().map(|(_, l)| l).sum() == logical_bytes.len()`.
     pub byte_ranges: ByteRanges,
-    /// First byte offset in the segment (= byte_ranges[0].0).
+    /// First byte offset in the segment (= `byte_ranges[0].0`).
     pub start_offset: usize,
     /// Page magic from the page where the record header lives.
     pub page_magic: u16,

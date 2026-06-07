@@ -9,7 +9,7 @@
 //!
 //! Out-of-order completion across workers is fine: rows carry `source_lsn`
 //! as `_lsn`, so `ReplacingMergeTree(_lsn)` converges per PK
-//! ([[project_walshadow_eventual_consistency]]). At M=1 dispatch order (so
+//! (`project_walshadow_eventual_consistency`). At M=1 dispatch order (so
 //! per-table WAL order) is preserved.
 
 use std::collections::{BTreeMap, HashMap};
@@ -25,7 +25,6 @@ use crate::oracle::{Oracle, maybe_validate_tuple, resolve_pending_tuple};
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::pipeline::{Fatal, mpmc};
-use crate::relation_resolver::RelationResolver;
 use crate::shadow_catalog::{CatalogError, ShadowCatalog};
 use crate::xact_buffer::detoast_heap;
 
@@ -77,32 +76,28 @@ pub async fn decode_and_route(
 ) -> Result<u64, String> {
     let mut routed = 0u64;
     for mut heap in heaps {
-        detoast_heap(&mut heap, &chunks, &ctx.catalog)
+        detoast_heap(&mut heap, &chunks, &ctx.catalog, true)
             .await
             .map_err(|e| e.to_string())?;
-        let rel = match ctx.catalog.relation_at(heap.rfn, heap.source_lsn).await {
-            Ok(r) => r,
-            // Foreign-DB WAL (physical WAL carries the whole cluster): skip.
-            Err(CatalogError::ForeignDatabase(_)) => {
-                ctx.stats
-                    .foreign_db_rows_skipped
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            Err(e) => return Err(e.to_string()),
-        };
-        let mapping = {
-            let m = ctx.mapping.read().await;
-            match m.get(rel.qualified_name.as_ref()) {
-                Some(v) => Arc::new(v.clone()),
-                // Unmapped relation: skip (not part of any destination).
-                None => {
+        let rel =
+            match crate::shadow_catalog::resolve_at_pooled(&ctx.catalog, heap.rfn, heap.source_lsn)
+                .await
+            {
+                Ok(r) => r,
+                // Foreign-DB WAL (physical WAL carries the whole cluster): skip.
+                Err(CatalogError::ForeignDatabase(_)) => {
                     ctx.stats
-                        .unsupported_relations
+                        .foreign_db_rows_skipped
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-            }
+                Err(e) => return Err(e.to_string()),
+            };
+        let Some(mapping) =
+            crate::pipeline::lookup_mapping(&ctx.mapping, rel.qualified_name.as_ref(), &ctx.stats)
+                .await
+        else {
+            continue;
         };
         let mut committed = CommittedTuple {
             decoded: heap,
