@@ -16,6 +16,7 @@
 //! [plans/bootstrap.md](../plans/bootstrap.md).
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -64,6 +65,10 @@ impl BackupSource for DirectSource {
 
         let mut start: Option<StartInfo> = None;
         let mut end: Option<EndInfo> = None;
+        // One id space across all archives this run; archives drain
+        // sequentially here, but keep the shared counter for symmetry
+        // with object_store's concurrent parts.
+        let next_entry = AtomicU64::new(0);
 
         while let Some(ev) = rx.recv().await {
             let ev = ev.context("DirectSource: BASE_BACKUP event channel")?;
@@ -89,7 +94,7 @@ impl BackupSource for DirectSource {
                         oid = meta.oid,
                         "archive open",
                     );
-                    drive_archive(body, &data_dir, sink.clone()).await?;
+                    drive_archive(body, &data_dir, sink.clone(), &next_entry).await?;
                 }
                 BackupEvent::Finish(e) => {
                     let e = EndInfo {
@@ -126,10 +131,11 @@ async fn drive_archive(
     body: mpsc::Receiver<std::io::Result<bytes::Bytes>>,
     data_dir: &std::path::Path,
     sink: Arc<Mutex<dyn BackupSink>>,
+    next_entry: &AtomicU64,
 ) -> Result<()> {
     let reader = ChannelReader::new(body);
     let mut archive = tokio_tar::Archive::new(reader);
-    pump_tar_to_sink(&mut archive, data_dir, &sink)
+    pump_tar_to_sink(&mut archive, data_dir, &sink, next_entry)
         .await
         .context("DirectSource: tar unpack")?;
     Ok(())

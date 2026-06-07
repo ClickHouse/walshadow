@@ -31,6 +31,7 @@
 //!   produce.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -132,16 +133,27 @@ impl BackupSource for ObjectStoreSource {
             "draining tar partitions"
         );
 
+        // Shared entry-id counter across all concurrent parts. Each
+        // tar entry gets a unique `EntryId` so the sink keys per-entry
+        // state on it; concurrent parts interleave begin/chunk on the
+        // shared sink mutex (released across body reads) without
+        // clobbering each other's page-walk slot.
+        let next_entry = Arc::new(AtomicU64::new(0));
+
         // Phase A — fan-out data parts. `for_each_concurrent`-style
         // bounded fan-out via `buffer_unordered`. Each worker shares
-        // the sink Arc<Mutex<>>; contention is at file boundaries
+        // the sink Arc<Mutex<>> + the entry-id counter; per-entry sink
+        // state is keyed by EntryId, so interleaving is safe
         let data_results = futures::stream::iter(data_parts)
             .map(|key| {
                 let storage = storage.clone();
                 let settings = settings.clone();
                 let data_dir = data_dir.clone();
                 let sink = sink.clone();
-                async move { unpack_one_part(&settings, &storage, &key, &data_dir, sink).await }
+                let next_entry = next_entry.clone();
+                async move {
+                    unpack_one_part(&settings, &storage, &key, &data_dir, sink, next_entry).await
+                }
             })
             .buffer_unordered(parallelism)
             .collect::<Vec<_>>()
@@ -154,7 +166,15 @@ impl BackupSource for ObjectStoreSource {
         // control parts is unusual (wal-g emits exactly one) but we
         // walk them in sorted order if it ever happens
         for key in &control_parts {
-            unpack_one_part(&settings, &storage, key, &data_dir, sink.clone()).await?;
+            unpack_one_part(
+                &settings,
+                &storage,
+                key,
+                &data_dir,
+                sink.clone(),
+                next_entry.clone(),
+            )
+            .await?;
         }
 
         {
@@ -225,6 +245,7 @@ async fn unpack_one_part(
     key: &str,
     data_dir: &std::path::Path,
     sink: Arc<Mutex<dyn BackupSink>>,
+    next_entry: Arc<AtomicU64>,
 ) -> Result<()> {
     let method = method_from_key(key);
     let body = storage
@@ -236,7 +257,7 @@ async fn unpack_one_part(
     let decoded = compression::decode(method, decrypted);
 
     let mut archive = tokio_tar::Archive::new(decoded);
-    pump_tar_to_sink(&mut archive, data_dir, &sink)
+    pump_tar_to_sink(&mut archive, data_dir, &sink, &next_entry)
         .await
         .with_context(|| format!("ObjectStoreSource: tar unpack {key}"))?;
     tracing::info!(
