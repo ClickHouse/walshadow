@@ -22,13 +22,13 @@ final state order-independent (`ch_ddl.rs`,
 [[project_walshadow_eventual_consistency]]). Slot feedback still needs a
 strict contiguous durable watermark.
 
-## Status (2026-06-05) — implemented, not yet shippable
+## Status (2026-06-07) — pooled WAL path green at M=1/N=1
 
 Pipeline built in `src/pipeline/` (`mpmc`, `ack`, `batcher`, `inserter`,
 `decode`, `reorder`), wired into `bin/stream.rs` behind
-`--decoder-pool-size` / `--inserter-pool-size` (default 1/1), active only with
-`--ch-config`. Serial `Emitter`/`EmitterObserver` kept for bootstrap. Detail in
-`RETRO.md` and `codex.md`.
+`--decoder-pool-size` / `--inserter-pool-size` (default 1/1). With `--ch-config`
+set the WAL path always runs the pooled pipeline (`PipelineConfig::spawn`);
+bootstrap still routes through the serial `Emitter`.
 
 Done:
 
@@ -42,40 +42,52 @@ Done:
   `flush_timeout=3600s` (caught by codex, not the design review)
 * Clean build + clippy, serial/bootstrap path untouched, 376 lib tests plus
   hermetic integration tests green
+* `pgbench_acceptance_ddl_intermix` (live PG+CH, pooled WAL path at M=1/N=1,
+  ADD COLUMN + CREATE INDEX CONCURRENTLY mid-workload) green 5/5, ~22s.
+  Resolves the 2026-06-05 watermark-pin failure. Root cause was per-INSERT RTT
+  cost at `flush_timeout=0`: each pgbench xact's four per-table INSERT closes
+  cost 4×RTT (~5 xact/s on local CH), so `emitter_ack` could never track the
+  ~700 xact/s source. `--ch-flush-timeout-ms 200` coalesces rows into one part
+  per window and lets N=1 hold the source rate. Barrier +
+  `wait_for_ack_catchup` both pass, so the coarse barrier is not regressing at
+  this scale
 
-Broken, blocks ship:
+Ship-blockers remaining:
 
-* `pgbench_acceptance_ddl_intermix` (live PG+CH) fails reproducibly.
-  `emitter_ack` watermark pins near bootstrap `end_lsn` while the dispatch
-  frontier races MBs ahead and never catches up. Pooled inserter path makes
-  rows durable far slower than the serial emitter it replaced; the coarse
-  barrier compounds it by blocking the single reorder task on
-  `wait_all_durable` for the entire pre-DDL backlog. Lag shows up before the
-  ALTER too, so it is not only a barrier problem. Root cause not isolated;
-  suspects: batch seal cadence under sustained load, per-INSERT cost at N=1,
-  barrier freezing forward progress
-
-Known gaps (codex review):
-
+* Pool sizes >1 have in-process e2e coverage but no live daemon coverage.
+  `tests/pipeline_parallel_e2e.rs` (DML) and `tests/pipeline_parallel_ddl_e2e.rs`
+  (ALTER ADD COLUMN + TRUNCATE through `run_barrier`) drive the real
+  `PipelineConfig` fan-out at M=2/N=2. `pgbench_acceptance_ddl_intermix`, the
+  daemon-spawn live test, still hardcodes default 1/1 with no knob. Validate N
+  concurrent `AsyncClient`s under the DDL barrier in the spawned daemon too,
+  confirming out-of-order INSERTs across connections stay `_lsn`-correct
 * Bootstrap/base-backup still routes through serial `Emitter`, bypassing pool,
   retry, ack, backpressure. Target shape in "Base backup through the same
   pipeline" below
-* Live CH e2e (`tests/pipeline_e2e.rs`, `tests/bootstrap_direct_ch.rs`) still
-  exercises the serial emitter, not `PipelineConfig`; pooled path uncovered e2e
+
+Known gaps:
+
+* `tests/pipeline_e2e.rs`, `tests/bootstrap_direct_ch.rs` still exercise the
+  serial emitter, not `PipelineConfig`. The pooled path has live daemon-spawn
+  coverage via `pgbench_acceptance_ddl_intermix` (M=1/N=1) and in-process
+  coverage via `tests/pipeline_parallel_{e2e,ddl_e2e}.rs` (M=2/N=2, including
+  the DDL + TRUNCATE barrier)
 * Backpressure goal unmet: pump-to-worker still `mpsc::UnboundedSender`
   (`queueing_record_sink.rs`), ack events still `mpsc::unbounded_channel`
   (`ack.rs`)
 
 Next:
 
-1. Reproduce the lag with no DDL to separate inserter throughput from barrier
-   cost; instrument batch count/size and per-INSERT latency
-2. If the barrier dominates: make it DDL-type-aware. ADD COLUMN needs only seal
-   plus epoch bump before post-ALTER rows decode, no global `wait_all_durable`.
-   Reserve the full drain for destructive DDL (DROP/RENAME column, TRUNCATE)
-3. If the inserter dominates: confirm batches coalesce to the serial emitter's
-   per-flush size; check the deadline ticker is not starved under load
-4. Daemon-level e2e with pool sizes > 1; move bootstrap onto the shared tail
+1. Daemon e2e with pool sizes >1; confirm out-of-order INSERTs across N
+   connections stay `_lsn`-correct through the DDL barrier
+2. Move bootstrap onto the shared batcher/inserter/ack tail (see "Base backup
+   through the same pipeline")
+3. Replace unbounded pump-to-worker + ack channels with bounded ones to close
+   the backpressure chain
+4. DDL barrier optimization, deferred now that N=1 tracks the source: make it
+   DDL-type-aware. ADD COLUMN needs only seal plus epoch bump before post-ALTER
+   rows decode, no global `wait_all_durable`. Reserve the full drain for
+   destructive DDL (DROP/RENAME column, TRUNCATE)
 
 ## Current serial path
 
@@ -189,10 +201,11 @@ Keep barrier coarse. DDL is rare. Do not optimize away ordering. See
 [pinned_ddl_baseline.md](pinned_ddl_baseline.md),
 [[reference_pinned_table_ddl_baseline]].
 
-Caveat from the live run: coarse cost scales with in-flight backlog, not DDL
-frequency. `run_barrier` freezes the single reorder task on `wait_all_durable`
-for the whole pre-DDL backlog while the source advances, regressing the serial
-path's surgical per-table wire close. See Status next-step 2 (DDL-type-aware
+Caveat: coarse cost scales with in-flight backlog, not DDL frequency.
+`run_barrier` freezes the single reorder task on `wait_all_durable` for the
+whole pre-DDL backlog while the source advances, against the serial path's
+surgical per-table wire close. Not a blocker at M=1/N=1 (the live test passes),
+but it grows with N and backlog. See Status next-step 4 (DDL-type-aware
 barrier).
 
 ## Inserter actor

@@ -52,8 +52,11 @@ async fn parallel_pipeline_replicates_dml() {
         shadow_stream_state,
     ) = fx::bootstrap_clusters(
         &tmp,
+        // `bar` is intentionally left out of the CH mappings below so its
+        // rows exercise the decode pool's unmapped-relation skip counter.
         "CREATE TABLE public.foo (id int PRIMARY KEY, val text);\n\
-         ALTER TABLE public.foo REPLICA IDENTITY FULL;\n",
+         ALTER TABLE public.foo REPLICA IDENTITY FULL;\n\
+         CREATE TABLE public.bar (id int);\n",
         SOURCE_PORT,
         SHADOW_PORT,
         WALSENDER_PORT,
@@ -117,6 +120,8 @@ async fn parallel_pipeline_replicates_dml() {
             "INSERT INTO public.foo VALUES (1, 'a'), (2, 'b'), (3, 'c')".into(),
             "UPDATE public.foo SET val = 'B' WHERE id = 2".into(),
             "DELETE FROM public.foo WHERE id = 3".into(),
+            // Unmapped relation: decoded, then skipped (bumps the counter).
+            "INSERT INTO public.bar VALUES (7)".into(),
             "SELECT pg_switch_wal()".into(),
         ],
     );
@@ -144,8 +149,10 @@ async fn parallel_pipeline_replicates_dml() {
     assert!(observed >= target);
 
     // The pipeline's durable watermark lives in the ack-collector atomic;
-    // capture it before `shutdown` consumes the pipeline.
+    // capture it (and the emitter counters) before `shutdown` consumes the
+    // pipeline.
     let ack = pipeline.ack.clone();
+    let stats = pipeline.stats.clone();
 
     // Drain the fan-out: decoders finish, batcher final-flushes, inserters
     // drain to EndOfStream, ack collector exits. A clean join proves no
@@ -178,5 +185,30 @@ async fn parallel_pipeline_replicates_dml() {
     assert!(
         ack.load(std::sync::atomic::Ordering::Acquire) > 0,
         "durable watermark advanced",
+    );
+
+    // Emitter Prometheus counters stay live on the parallel path (reorder
+    // bumps xacts per commit; inserters bump rows/blocks post-EndOfStream).
+    // INSERT + UPDATE + DELETE are three mapped commits, so the previously
+    // stuck-at-0 xacts counter must clear.
+    use std::sync::atomic::Ordering;
+    assert!(
+        stats.xacts_committed.load(Ordering::Relaxed) >= 3,
+        "emitter_xacts_total live on pipeline (got {})",
+        stats.xacts_committed.load(Ordering::Relaxed),
+    );
+    assert!(
+        stats.rows_emitted.load(Ordering::Relaxed) > 0,
+        "emitter_rows_total live on pipeline",
+    );
+    assert!(
+        stats.blocks_sent.load(Ordering::Relaxed) > 0,
+        "emitter_blocks_total live on pipeline",
+    );
+    // public.bar has no CH mapping, so its row lands on the decode pool's
+    // unmapped skip — previously invisible on the parallel path.
+    assert!(
+        stats.unsupported_relations.load(Ordering::Relaxed) > 0,
+        "emitter_unsupported_relations_total live on pipeline",
     );
 }

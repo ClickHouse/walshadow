@@ -217,6 +217,7 @@ impl PipelineConfig {
             mapping,
             oracle,
             msg_tx: msg_tx.clone(),
+            stats: stats.clone(),
         };
         let decoders = decode::spawn_pool(m, ctx, jobs_rx, ack.clone(), fatal.clone());
 
@@ -230,6 +231,7 @@ impl PipelineConfig {
             ack,
             jobs_tx,
             msg_tx,
+            stats,
             fatal.clone(),
         );
 

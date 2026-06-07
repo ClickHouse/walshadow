@@ -14,11 +14,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::ch_emitter::MappingHandle;
+use crate::ch_emitter::{EmitterStats, MappingHandle};
 use crate::heap_decoder::{CommittedTuple, DecodedHeap};
 use crate::oracle::{Oracle, maybe_validate_tuple, resolve_pending_tuple};
 use crate::pipeline::ack::AckHandle;
@@ -52,6 +53,10 @@ pub struct DecodeCtx {
     /// Rows go to the batcher on the shared FIFO `BatcherMsg` channel (so a
     /// barrier `FlushAll` can't overtake them).
     pub msg_tx: mpsc::Sender<BatcherMsg>,
+    /// Shared emitter counters. Decode bumps `foreign_db_rows_skipped` and
+    /// `unsupported_relations` on the skip arms so the parallel path keeps
+    /// those metrics live (the serial emitter bumps them in `route`).
+    pub stats: Arc<EmitterStats>,
 }
 
 /// Detoast, resolve, and route every heap of one xact to the batcher.
@@ -59,8 +64,9 @@ pub struct DecodeCtx {
 /// inserters will ack — the `R` the collector compares against). Used by
 /// both the decode workers and the barrier's data segments.
 ///
-/// Foreign-database and unmapped relations are skipped (not counted), as
-/// in the serial emitter; any other catalog error poisons the stream.
+/// Foreign-database and unmapped relations are skipped (bumping
+/// `foreign_db_rows_skipped` / `unsupported_relations`, as in the serial
+/// emitter); any other catalog error poisons the stream.
 pub async fn decode_and_route(
     ctx: &DecodeCtx,
     seq: u64,
@@ -77,7 +83,12 @@ pub async fn decode_and_route(
         let rel = match ctx.catalog.relation_at(heap.rfn, heap.source_lsn).await {
             Ok(r) => r,
             // Foreign-DB WAL (physical WAL carries the whole cluster): skip.
-            Err(CatalogError::ForeignDatabase(_)) => continue,
+            Err(CatalogError::ForeignDatabase(_)) => {
+                ctx.stats
+                    .foreign_db_rows_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             Err(e) => return Err(e.to_string()),
         };
         let mapping = {
@@ -85,7 +96,12 @@ pub async fn decode_and_route(
             match m.get(rel.qualified_name.as_ref()) {
                 Some(v) => Arc::new(v.clone()),
                 // Unmapped relation: skip (not part of any destination).
-                None => continue,
+                None => {
+                    ctx.stats
+                        .unsupported_relations
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
         };
         let mut committed = CommittedTuple {
