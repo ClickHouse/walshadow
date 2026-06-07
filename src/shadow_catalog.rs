@@ -14,10 +14,10 @@
 //!    regular tables uniformly), then fan-out to `pg_attribute` +
 //!    `pg_type` + `pg_namespace`.
 //!
-//! Generation invalidation: a [`CatalogTracker`](crate::catalog_tracker
-//! ::CatalogTracker) wired with [`set_invalidation_epoch`](crate
-//! ::catalog_tracker::CatalogTracker::set_invalidation_epoch) bumps a
-//! shared `AtomicU64` on every catalog-touching record. The catalog
+//! Generation invalidation: a
+//! [`CatalogTracker`](crate::catalog_tracker::CatalogTracker) wired with
+//! [`set_invalidation_epoch`](crate::catalog_tracker::CatalogTracker::set_invalidation_epoch)
+//! bumps a shared `AtomicU64` on every catalog-touching record. The catalog
 //! reads the atomic at the top of every relation lookup
 //! ([`ShadowCatalog::set_invalidation_epoch`] installs the matching
 //! `Arc` clone). An advance triggers an in-line
@@ -29,7 +29,7 @@
 //! ([`relation_at`](ShadowCatalog::relation_at),
 //! [`relation_by_oid`](ShadowCatalog::relation_by_oid),
 //! [`wait_for_replay`](ShadowCatalog::wait_for_replay),
-//! [`invalidate`](ShadowCatalog::invalidate)) takes `&mut self`. The
+//! `invalidate`) takes `&mut self`. The
 //! cache state is technically interior-mutable (an `RwLock` over the
 //! two `HashMap`s + atomics for stats would suffice for the hit path)
 //! but the `&self` shape is deferred. Callers that need concurrent
@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::types::{Oid, ToSql};
 use tokio_postgres::{Client, NoTls, Row};
 use wal_rs::pg::walparser::RelFileNode;
@@ -593,7 +593,7 @@ impl ShadowCatalog {
 
     /// Emit a `Dropped` event for an oid the decoder observed a
     /// pg_class `heap_delete` for. `qualified_name` is resolved from the
-    /// last-known descriptor in [`Self::prev_known`]; returns `false`
+    /// last-known descriptor in `prev_known`; returns `false`
     /// when the catalog has never seen the oid (the relation was never
     /// queried via shadow, so CH never learned about it either —
     /// nothing for the applicator to do).
@@ -613,7 +613,7 @@ impl ShadowCatalog {
     /// Poll-based DROP TABLE discovery.
     ///
     /// Polls shadow's `pg_class` for every oid currently in
-    /// [`Self::prev_known`]; any oid that no longer exists in shadow
+    /// `prev_known`; any oid that no longer exists in shadow
     /// gets a `Dropped` event emitted (via [`Self::emit_dropped`]) and
     /// is removed from `prev_known`. Returns the count of dropped oids
     /// surfaced.
@@ -702,8 +702,9 @@ impl ShadowCatalog {
     }
 
     /// Install the shared epoch counter. Pass the same `Arc` clone as
-    /// the upstream [`CatalogTracker::set_invalidation_epoch`](crate
-    /// ::catalog_tracker::CatalogTracker::set_invalidation_epoch) call.
+    /// the upstream
+    /// [`CatalogTracker::set_invalidation_epoch`](crate::catalog_tracker::CatalogTracker::set_invalidation_epoch)
+    /// call.
     pub fn set_invalidation_epoch(&mut self, epoch: Arc<AtomicU64>) {
         // Adopt the current value as already-seen so a non-zero epoch
         // (e.g., catalog opened mid-stream) doesn't trigger a spurious
@@ -723,7 +724,7 @@ impl ShadowCatalog {
         }
     }
 
-    /// Current generation. Bumps every [`invalidate`] call.
+    /// Current generation. Bumps every `invalidate` call.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -909,6 +910,54 @@ impl ShadowCatalog {
             .await?
             .ok_or(CatalogError::NotFoundByFilenode(rfn))?;
         Ok(self.insert(desc))
+    }
+
+    /// Filenode resolution for the async decode pool. Reuses the descriptor
+    /// the WAL-ordered inline path
+    /// ([`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink))
+    /// already resolved + cached for `rfn` — serving the cached entry at ANY
+    /// generation — and only fetches (transiently, never writing the cache or
+    /// emitting events) when the filenode is absent entirely.
+    ///
+    /// The pool routes heaps that the inline path already decoded against a
+    /// specific descriptor, but does so asynchronously: a worker can lag past
+    /// a later DDL that bumped the generation. Re-resolving through
+    /// [`Self::relation_at`] there is doubly wrong, as two drills show:
+    ///
+    /// * ADD COLUMN keeps the filenode. A lagging fetch at an older heap's
+    ///   `at_lsn` (replay gate already satisfied) reads shadow's pre-DDL shape
+    ///   but `insert`s it at the post-DDL generation — poisoning the
+    ///   entry so the inline path's own later resolution of the post-DDL rows
+    ///   gets a hit and never fires `Changed` (barrier never reaches CH).
+    /// * TRUNCATE rotates the filenode. Once shadow replays it, the old
+    ///   filenode no longer resolves from `pg_class`, so a fetch returns
+    ///   `None` and the pre-TRUNCATE rows fail outright — the cached entry is
+    ///   the only surviving descriptor for them.
+    ///
+    /// Reusing the cached shape sidesteps both: schema-change detection and
+    /// cache maintenance stay solely on the inline path.
+    pub async fn relation_at_pooled(
+        &mut self,
+        rfn: RelFileNode,
+        at_lsn: u64,
+    ) -> Result<Arc<RelDescriptor>> {
+        self.drain_invalidations();
+        if at_lsn > 0 {
+            self.wait_for_replay(at_lsn).await?;
+            self.drain_invalidations();
+        }
+        if let Some(entry) = self.by_filenode.get(&rfn) {
+            self.stats.hits += 1;
+            return Ok(entry.desc.clone());
+        }
+        // Absent (never inline-resolved, or evicted under cache pressure):
+        // fetch transiently. No insert — keep the pool out of cache state.
+        self.stats.misses += 1;
+        let desc = self
+            .fetch_by_filenode(rfn)
+            .await?
+            .ok_or(CatalogError::NotFoundByFilenode(rfn))?;
+        Ok(Arc::new(desc))
     }
 
     /// Look up a relation by oid (no replay-LSN gate; intended for
@@ -1189,6 +1238,29 @@ impl ShadowCatalog {
         self.current_db_oid = Some(oid);
         Ok(oid)
     }
+}
+
+/// Resolve a WAL-observed filenode under the shared mutex. `at_lsn` gates on
+/// shadow replay (pg_last_wal_replay_lsn); lock releases before return
+pub async fn resolve_at(
+    catalog: &Mutex<ShadowCatalog>,
+    rfn: RelFileNode,
+    at_lsn: u64,
+) -> Result<Arc<RelDescriptor>> {
+    let mut cat = catalog.lock().await;
+    cat.relation_at(rfn, at_lsn).await
+}
+
+/// [`resolve_at`] for the async decode pool — reuses the inline path's cached
+/// descriptor and never mutates the cache or emits schema events. See
+/// [`ShadowCatalog::relation_at_pooled`].
+pub async fn resolve_at_pooled(
+    catalog: &Mutex<ShadowCatalog>,
+    rfn: RelFileNode,
+    at_lsn: u64,
+) -> Result<Arc<RelDescriptor>> {
+    let mut cat = catalog.lock().await;
+    cat.relation_at_pooled(rfn, at_lsn).await
 }
 
 /// Strip the single element from a PG array text literal `{val}` and

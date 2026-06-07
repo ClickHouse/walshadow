@@ -165,6 +165,7 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay");
     assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
 
     // CH grew the column off the first ALTER, with no priming DML.
     let col = ch
@@ -290,6 +291,7 @@ async fn pinned_subset_alter_adds_only_new_column() {
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay");
     assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
 
     // signup_ts added…
     let added = ch

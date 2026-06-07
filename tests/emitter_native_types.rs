@@ -1,8 +1,11 @@
-//! F4 — native CH type encoding, driven at the emitter layer against a
-//! real ClickHouse: `numeric(p≤76,s)` → `Decimal(p,s)` (scaled integer),
-//! `time` → `Time64(6)` (microseconds since midnight), `timetz` →
-//! `String` (lossless text with zone). Confirms the wire encoding the
-//! bridge advertises matches what the server stores.
+//! F4 — native CH type encoding, driven through the insert tail
+//! (batcher → inserter) against a real ClickHouse: `numeric(p≤76,s)` →
+//! `Decimal(p,s)` (scaled integer), `time` → `Time64(6)` (microseconds
+//! since midnight), `timetz` → `String` (lossless text with zone).
+//! Confirms the wire encoding the bridge advertises matches what the
+//! server stores. The encoding path (`TableEncoder::append_row` →
+//! `append_buf`) is shared with the WAL/bootstrap producers, so this
+//! pins it through the same tail those use.
 //!
 //! `Time64` is gated behind `enable_time_time64_type=1`; the harness's
 //! `ChServer::spawn` enables it in the default profile.
@@ -13,16 +16,16 @@
 mod fx;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::AtomicU64;
 
 use wal_rs::pg::walparser::RelFileNode;
-use walshadow::backup_page_walk::CatalogMap;
 use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, TableMapping,
+    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping,
 };
 use walshadow::codecs::NumericKind;
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
-use walshadow::relation_resolver::CatalogMapResolver;
+use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
+use walshadow::pipeline::{Fatal, tail};
 use walshadow::shadow_catalog::{RelDescriptor, ReplIdent};
 
 const CH_TCP_PORT: u16 = 17629;
@@ -80,53 +83,54 @@ async fn native_numeric_time_timetz_round_trip() {
     )
     .expect("create dest table");
 
-    let mut cfg = EmitterConfig {
+    let cfg = EmitterConfig {
         host: "127.0.0.1".into(),
         port: CH_TCP_PORT,
         database: "walshadow_test".into(),
         compression: CompressionChoice::Lz4,
-        flush_timeout: Duration::ZERO,
         ..Default::default()
     };
-    cfg.tables.insert(
-        "public.things".into(),
-        TableMapping {
-            target: "walshadow_test.things".into(),
-            columns: vec![
-                ColumnMapping {
-                    src_attnum: 1,
-                    target_name: "id".into(),
-                    target_type: "Int32".into(),
-                },
-                ColumnMapping {
-                    src_attnum: 2,
-                    target_name: "n".into(),
-                    target_type: "Decimal(10, 2)".into(),
-                },
-                ColumnMapping {
-                    src_attnum: 3,
-                    target_name: "nw".into(),
-                    target_type: "Decimal(50, 2)".into(),
-                },
-                ColumnMapping {
-                    src_attnum: 4,
-                    target_name: "t".into(),
-                    target_type: "Time64(6)".into(),
-                },
-                ColumnMapping {
-                    src_attnum: 5,
-                    target_name: "tz".into(),
-                    target_type: "String".into(),
-                },
-            ],
-        },
-    );
 
-    let mut map = CatalogMap::new();
-    map.insert(Arc::new(rel_descriptor()));
-    let resolver = Arc::new(CatalogMapResolver::new(map));
+    // The batcher builds its plan from the `RoutedRow`'s mapping (not
+    // `cfg.tables`), so the destination shape lives here.
+    let rel = Arc::new(rel_descriptor());
+    let mapping = Arc::new(TableMapping {
+        target: "walshadow_test.things".into(),
+        columns: vec![
+            ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Int32".into(),
+            },
+            ColumnMapping {
+                src_attnum: 2,
+                target_name: "n".into(),
+                target_type: "Decimal(10, 2)".into(),
+            },
+            ColumnMapping {
+                src_attnum: 3,
+                target_name: "nw".into(),
+                target_type: "Decimal(50, 2)".into(),
+            },
+            ColumnMapping {
+                src_attnum: 4,
+                target_name: "t".into(),
+                target_type: "Time64(6)".into(),
+            },
+            ColumnMapping {
+                src_attnum: 5,
+                target_name: "tz".into(),
+                target_type: "String".into(),
+            },
+        ],
+    });
 
-    let mut emitter = Emitter::new(cfg, resolver).await.expect("init emitter");
+    let stats = Arc::new(EmitterStats::default());
+    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let fatal = Fatal::new();
+    let (msg_tx, ack, tail_parts) = tail::spawn(&cfg, 1, stats, emitter_ack, fatal.clone())
+        .await
+        .expect("spawn tail");
 
     let tuple = CommittedTuple {
         decoded: DecodedHeap {
@@ -155,11 +159,31 @@ async fn native_numeric_time_timetz_round_trip() {
         commit_ts: 1_000_000,
         commit_lsn: 0xABCD,
     };
-    emitter.route_with_retry(&tuple).await.expect("route");
-    emitter
-        .on_xact_end_with_retry(0xABCD)
+
+    // Drive the single row through the tail: register the seq, route the
+    // row, seal with FlushAll, wait for it durable, then drain.
+    ack.register(0, tuple.commit_lsn);
+    msg_tx
+        .send(BatcherMsg::Row(RoutedRow {
+            seq: 0,
+            rel,
+            mapping,
+            committed: tuple,
+        }))
         .await
-        .expect("xact end");
+        .expect("route row");
+    ack.placed(0, 1);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    msg_tx
+        .send(BatcherMsg::FlushAll(reply_tx))
+        .await
+        .expect("send flush");
+    reply_rx.await.expect("flush ack");
+    ack.wait_through(1).await;
+    drop(msg_tx);
+    drop(ack);
+    tail_parts.join().await;
+    assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
 
     let row = ch
         .query(

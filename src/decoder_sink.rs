@@ -3,8 +3,9 @@
 //! 's commit drain), [`DecoderStats`] counters, [`DecoderSinkError`].
 //!
 //! Per-record dispatch lives in
-//! [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink);
-//! the production observer is [`crate::ch_emitter::EmitterObserver`].
+//! [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink). The
+//! CH path drains through the parallel [`pipeline`](crate::pipeline); the
+//! metrics-only path (no `--ch-config`) drains to [`MetricsTupleObserver`].
 //! Catalog gate timeouts poison the stream — no `replay_timeout`
 //! counter, since silent loss is impossible by construction.
 
@@ -38,7 +39,8 @@ impl From<DecoderSinkError> for SinkError {
 /// events. Production fans into `MetricsTupleObserver` (counters) or
 /// the CH-emitter observer; tests use the in-memory collector. The
 /// CH emitter wants `commit_ts` for its `_commit_ts` synthetic
-/// column, so [`CommittedTuple`] (not [`DecodedHeap`]) is the wire
+/// column, so [`CommittedTuple`] (not
+/// [`DecodedHeap`](crate::heap_decoder::DecodedHeap)) is the wire
 /// type.
 ///
 /// `on_xact_end` fires after every tuple in a committed xact has been
@@ -174,7 +176,8 @@ crate::atomic_stats! {
         /// relation. Heap LOCK / INPLACE / TRUNCATE land here under the
         /// decoder's silent-skip policy.
         pub skipped_no_block,
-        /// Heap record on a relation [`ShadowCatalog`] returned
+        /// Heap record on a relation
+        /// [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog) returned
         /// `NotFoundByFilenode` for. Possible causes: replay-LSN gate
         /// ahead of catalog mutation, mapping rotation, race with
         /// `seed_from_source`. Counted, not retried — the xact
@@ -185,7 +188,7 @@ crate::atomic_stats! {
         pub skipped_op,
         /// `XLOG_HEAP_TRUNCATE` records fanned out to per-relid
         /// `HeapOp::Truncate` events. Counted by
-        /// [`BufferingDecoderSink::on_record`]'s pre-decode intercept.
+        /// `BufferingDecoderSink::on_record`'s pre-decode intercept.
         pub truncates,
         /// TOAST chunks routed into the xact buffer's chunk slot. Distinct
         /// from `inserts`, which only counts user-table writes.

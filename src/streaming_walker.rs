@@ -17,7 +17,7 @@
 //!
 //! Cross-segment record straddling matches the per-segment walker:
 //! `Pending` is dropped at segment reset
-//! ([`take_segment`](StreamingWalker::take_segment)). Records whose
+//! (`take_segment`). Records whose
 //! last byte sits in segment N+1 are lost; PG's WAL emits an
 //! `XLOG_SWITCH` on operator-driven boundaries so the demo case is
 //! aligned by construction.

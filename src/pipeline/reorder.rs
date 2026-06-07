@@ -28,7 +28,6 @@ use crate::ch_ddl::DdlApplicator;
 use crate::ch_emitter::EmitterStats;
 use crate::decoder_sink::DecoderSinkError;
 use crate::heap_decoder::{DecodedHeap, HeapOp};
-use crate::relation_resolver::RelationResolver;
 use crate::shadow_catalog::{CatalogError, SchemaEvent, ShadowCatalog};
 use crate::wal_stream::{Record, RecordSink, SinkError};
 use crate::xact_buffer::{
@@ -258,7 +257,9 @@ impl ReorderSink {
     }
 
     async fn apply_truncate(&mut self, heap: &DecodedHeap) -> Result<(), SinkError> {
-        let rel = match self.catalog.relation_at(heap.rfn, heap.source_lsn).await {
+        let rel = match crate::shadow_catalog::resolve_at(&self.catalog, heap.rfn, heap.source_lsn)
+            .await
+        {
             Ok(r) => r,
             Err(CatalogError::ForeignDatabase(_)) => return Ok(()),
             Err(e) => return Err(SinkError::from(DecoderSinkError::from(e))),

@@ -425,3 +425,9 @@ jobs:
       - name: cargo clippy
         working-directory: walshadow
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo doc
+        working-directory: walshadow
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --lib --bins

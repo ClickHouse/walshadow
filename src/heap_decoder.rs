@@ -2,7 +2,7 @@
 //!
 //! Walks `RM_HEAP_ID` / `RM_HEAP2_ID` records the filter classified as
 //! `User`, projects the WAL payload through a per-relation
-//! [`RelDescriptor`](crate::shadow_catalog::RelDescriptor) fetched from
+//! [`RelDescriptor`] fetched from
 //! [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog), and emits a
 //! structured [`DecodedHeap`] per record. Tier 1 (fixed-width) + Tier 2
 //! (length-prefixed mechanical) types are decoded inline; Tier 3

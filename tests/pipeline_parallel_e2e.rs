@@ -98,7 +98,7 @@ async fn parallel_pipeline_replicates_dml() {
         ],
     }];
 
-    let mut pipeline = fx::build_parallel_pipeline(fx::BuildPipelineArgs {
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
         tmp: &tmp,
         source: &source,
         shadow: &shadow,

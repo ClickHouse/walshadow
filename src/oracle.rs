@@ -3,7 +3,7 @@
 //! Two roles:
 //!
 //! 1. **PgPending resolver.** When the decoder emits
-//!    [`ColumnValue::PgPending`](crate::heap_decoder::ColumnValue::PgPending)
+//!    [`ColumnValue::PgPending`]
 //!    for a varlena type outside walshadow's local matrix
 //!    (`jsonb`, arrays, `tsvector`, ranges, custom domains, ...),
 //!    [`Oracle::resolve_pending`] runs

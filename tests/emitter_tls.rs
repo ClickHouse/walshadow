@@ -1,9 +1,10 @@
-//! walshadow CH-Native emitter over TLS, end to end against a locally
+//! walshadow CH-Native insert tail over TLS, end to end against a locally
 //! spawned `clickhouse server` listening on a secure native port with a
 //! self-signed cert.
 //!
-//! Exercises the production `EmitterConfig { secure: true, .. }` path:
-//! `Emitter::new` → `connect_client` → `AsyncClient::connect_tls`. The
+//! Exercises the production `EmitterConfig { secure: true, .. }` path
+//! through the inserter pool: `tail::spawn` → `inserter::spawn_pool` →
+//! `connect_client` → `AsyncClient::connect_tls`. The
 //! self-signed CA is pinned into the rustls root store via
 //! `EmitterConfig::tls_config`, so chain + SNI hostname (`localhost`)
 //! verification runs for real rather than being disabled — `default_config`
@@ -23,16 +24,17 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use clickhouse_c::tls::{self, rustls};
 use wal_rs::pg::walparser::RelFileNode;
-use walshadow::backup_page_walk::CatalogMap;
 use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, Emitter, EmitterConfig, TableMapping,
+    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping,
 };
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
-use walshadow::relation_resolver::CatalogMapResolver;
+use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
+use walshadow::pipeline::{Fatal, tail};
 use walshadow::shadow_catalog::{RelDescriptor, ReplIdent};
 
 const RFN: RelFileNode = RelFileNode {
@@ -331,42 +333,42 @@ async fn emitter_tls_round_trip() {
     // 127.0.0.1) and SNI/cert verification (cert SAN includes localhost).
     // tls_config pins the self-signed CA; default_config (public roots)
     // would reject it.
-    let mut cfg = EmitterConfig {
+    let cfg = EmitterConfig {
         host: "localhost".into(),
         port: ch.secure_port,
         database: "walshadow_test".into(),
         secure: true,
         tls_config: Some(ch.pinned_config()),
         compression: CompressionChoice::Lz4,
-        flush_timeout: Duration::ZERO,
         ..Default::default()
     };
-    cfg.tables.insert(
-        "public.things".into(),
-        TableMapping {
-            target: "walshadow_test.things".into(),
-            columns: vec![
-                ColumnMapping {
-                    src_attnum: 1,
-                    target_name: "id".into(),
-                    target_type: "Int32".into(),
-                },
-                ColumnMapping {
-                    src_attnum: 2,
-                    target_name: "name".into(),
-                    target_type: "Nullable(String)".into(),
-                },
-            ],
-        },
-    );
+    // The batcher builds its plan from the `RoutedRow`'s mapping.
+    let rel = Arc::new(rel_descriptor());
+    let mapping = Arc::new(TableMapping {
+        target: "walshadow_test.things".into(),
+        columns: vec![
+            ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Int32".into(),
+            },
+            ColumnMapping {
+                src_attnum: 2,
+                target_name: "name".into(),
+                target_type: "Nullable(String)".into(),
+            },
+        ],
+    });
 
-    let mut map = CatalogMap::new();
-    map.insert(Arc::new(rel_descriptor()));
-    let resolver = Arc::new(CatalogMapResolver::new(map));
-
-    let mut emitter = Emitter::new(cfg, resolver)
+    // Every inserter in the pool connects via `connect_client` →
+    // `AsyncClient::connect_tls`, so spawning the tail exercises the secure
+    // path the same way the WAL/bootstrap producers do.
+    let stats = Arc::new(EmitterStats::default());
+    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let fatal = Fatal::new();
+    let (msg_tx, ack, tail_parts) = tail::spawn(&cfg, 1, stats, emitter_ack, fatal.clone())
         .await
-        .expect("init emitter over TLS");
+        .expect("spawn tail over TLS");
 
     let tuple = CommittedTuple {
         decoded: DecodedHeap {
@@ -386,11 +388,28 @@ async fn emitter_tls_round_trip() {
         commit_ts: 1_000_000,
         commit_lsn: 0xABCD,
     };
-    emitter.route_with_retry(&tuple).await.expect("route");
-    emitter
-        .on_xact_end_with_retry(0xABCD)
+    ack.register(0, tuple.commit_lsn);
+    msg_tx
+        .send(BatcherMsg::Row(RoutedRow {
+            seq: 0,
+            rel,
+            mapping,
+            committed: tuple,
+        }))
         .await
-        .expect("xact end");
+        .expect("route row");
+    ack.placed(0, 1);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    msg_tx
+        .send(BatcherMsg::FlushAll(reply_tx))
+        .await
+        .expect("send flush");
+    reply_rx.await.expect("flush ack");
+    ack.wait_through(1).await;
+    drop(msg_tx);
+    drop(ack);
+    tail_parts.join().await;
+    assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
 
     let row = ch
         .query("SELECT id, name FROM walshadow_test.things FINAL WHERE id = 1")

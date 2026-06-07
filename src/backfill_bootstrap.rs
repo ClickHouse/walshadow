@@ -40,7 +40,6 @@ use crate::backup_page_walk::{BackfillTuple, CatalogMap, PageWalkSink, PageWalkS
 use crate::backup_sink::{CatalogFilenodes, DiskLanderSink, DiskLanderStats, MultiplexSink};
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::decoder_sink::TupleObserver;
-use crate::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent, parse_array_one_element};
 
 /// Operator-tunable knobs.
@@ -212,7 +211,8 @@ pub async fn run_greenfield_bootstrap(
 
 /// Drain backfill tuples from the orchestrator's channel into a
 /// [`TupleObserver`]. Each `BackfillTuple` becomes a synthetic
-/// [`CommittedTuple`] with `op = Insert`, `commit_ts = 0`, and
+/// [`CommittedTuple`](crate::heap_decoder::CommittedTuple) with
+/// `op = Insert`, `commit_ts = 0`, and
 /// `commit_lsn = source_lsn` (the BASE_BACKUP's `start_lsn`). The
 /// daemon's xact-buffer + decoder chain isn't on this path — we are
 /// the bottom of the wire, synthesising committed rows directly from
@@ -247,7 +247,7 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
         }
         last_rfn = Some(tuple.rfn);
         last_lsn = tuple.source_lsn;
-        let committed = backfill_to_committed(tuple);
+        let committed = tuple.into_committed_insert();
         observer
             .on_tuple(&committed)
             .await
@@ -259,30 +259,6 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
         .await
         .map_err(|e| anyhow::anyhow!("bootstrap drain: emitter rejected xact end: {e}"))?;
     Ok(shipped)
-}
-
-/// Translate a page-walk tuple into the
-/// [`CommittedTuple`](crate::heap_decoder::CommittedTuple) shape the
-/// CH-emitter consumes. The synthetic insert carries the BASE_BACKUP's
-/// `start_lsn` as both `source_lsn` and `commit_lsn`; `ReplacingMergeTree(_lsn)`
-/// in ClickHouse collapses any duplicates the WAL-side decoder
-/// re-emits for records in `[start_lsn, end_lsn]`.
-fn backfill_to_committed(t: BackfillTuple) -> CommittedTuple {
-    CommittedTuple {
-        decoded: DecodedHeap {
-            rfn: t.rfn,
-            xid: t.xid,
-            source_lsn: t.source_lsn,
-            op: HeapOp::Insert,
-            new: Some(DecodedTuple {
-                columns: t.columns,
-                partial: false,
-            }),
-            old: None,
-        },
-        commit_ts: 0,
-        commit_lsn: t.source_lsn,
-    }
 }
 
 /// Build a [`CatalogMap`] by querying source PG for every user
@@ -485,6 +461,7 @@ mod tests {
     use super::*;
     use crate::backup_page_walk::{PAGE_BYTES, make_rel, synth_single_tuple_page};
     use crate::backup_source::{BackupSink, BackupSource, FileKind, FileMeta};
+    use crate::heap_decoder::HeapOp;
     use async_trait::async_trait;
 
     #[test]

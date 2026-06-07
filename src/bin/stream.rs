@@ -52,11 +52,11 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
-use walshadow::ch_emitter::{Emitter, EmitterConfig, EmitterObserver, EmitterStats, MappingHandle};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, MappingHandle};
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
-use walshadow::pipeline::{PipelineConfig, PipelineHandle};
+use walshadow::pipeline::{Fatal, PipelineConfig, PipelineHandle, bootstrap, tail};
 use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
@@ -160,8 +160,10 @@ struct DaemonSinks {
     /// worker; the status loop polls counters here without contending
     /// on the worker.
     decoder_stats: Arc<walshadow::decoder_sink::DecoderStats>,
-    /// Shared with the [`Emitter`] running inside the queueing-worker's
-    /// observer. `None` when the daemon runs without a CH emitter wired.
+    /// Shared with the parallel pipeline's inserter pool (which bumps the
+    /// counters post-`EndOfStream`); the status loop polls them here
+    /// without contending on the workers. `None` when the daemon runs
+    /// without a CH pipeline wired.
     emitter_stats: Option<Arc<walshadow::ch_emitter::EmitterStats>>,
 }
 
@@ -450,12 +452,11 @@ async fn run(args: Args) -> Result<()> {
     // standby.signal + `restore_command` pointing at `--out-dir`, and
     // returns the backup's `end_lsn` so the WAL pump (further down)
     // resumes there. When `--ch-config` is also set, bootstrap rows
-    // route through a transitional emitter built against the seeded
-    // CatalogMap (no shadow PG needed); otherwise they drain to a
-    // metrics-only observer. The transitional emitter closes its
-    // INSERTs before this returns so the daemon's real emitter below
-    // opens fresh blocks for the WAL stream.
-    let bootstrap_ch_config = match args.ch_config.as_deref() {
+    // route through the shared insert tail (no shadow PG needed);
+    // otherwise they drain to a metrics-only observer. The tail makes
+    // every bootstrap row durable on CH before this returns, so the WAL
+    // pump below resumes against a fully-shipped baseline.
+    let ch_config = match args.ch_config.as_deref() {
         Some(path) => {
             let toml = tokio::fs::read_to_string(path)
                 .await
@@ -472,7 +473,7 @@ async fn run(args: Args) -> Result<()> {
         None
     } else {
         Some(
-            run_bootstrap(&cfg, &mut feed, &args, bootstrap_ch_config)
+            run_bootstrap(&cfg, &mut feed, &args, ch_config.clone())
                 .await
                 .context("bootstrap")?,
         )
@@ -662,19 +663,6 @@ async fn run(args: Args) -> Result<()> {
     // Pre-flight validators. Run after both source + shadow
     // SQL clients are up so every check has the connection it needs;
     // abort the daemon on any finding unless `--skip-preflight` is set.
-    let initial_ch_config = match args.ch_config.as_deref() {
-        Some(path) => {
-            let toml = tokio::fs::read_to_string(path)
-                .await
-                .with_context(|| format!("read --ch-config {}", path.display()))?;
-            let mut cfg = EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?;
-            if let Some(ms) = args.ch_flush_timeout_ms {
-                cfg.flush_timeout = std::time::Duration::from_millis(ms);
-            }
-            Some(cfg)
-        }
-        None => None,
-    };
     if !args.skip_preflight {
         let source_version_num = feed.server_version_num();
         let source_sql = feed
@@ -693,7 +681,7 @@ async fn run(args: Args) -> Result<()> {
             source_sql,
             shadow_sql: &shadow_sql,
             slot: args.slot.as_deref(),
-            ch_config: initial_ch_config.as_ref(),
+            ch_config: ch_config.as_ref(),
         })
         .await
         .context("pre-flight probe")?;
@@ -711,7 +699,7 @@ async fn run(args: Args) -> Result<()> {
     // is decoded. cfg.tables.keys() is exactly the pinned set; auto-create
     // tables record their baseline on the first-touch CREATE path so they
     // need no seeding.
-    if let Some(cfg) = initial_ch_config.as_ref() {
+    if let Some(cfg) = ch_config.as_ref() {
         let names: Vec<String> = cfg.tables.keys().cloned().collect();
         let seeded = catalog
             .lock()
@@ -800,7 +788,7 @@ async fn run(args: Args) -> Result<()> {
     // collector atomic instead of the xact buffer's synchronous field.
     let mut pipeline_ack: Option<Arc<AtomicU64>> = None;
 
-    let decoder_xact = match initial_ch_config {
+    let decoder_xact = match ch_config {
         Some(emitter_cfg) => {
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
             // SIGHUP-reloadable mapping shared by the DDL applicator + the
@@ -818,7 +806,17 @@ async fn run(args: Args) -> Result<()> {
                     .context("init DDL applicator")?;
             let stats = Arc::new(EmitterStats::default());
             emitter_stats_handle = Some(stats.clone());
-            let emitter_ack = Arc::new(AtomicU64::new(0));
+            // Seed the durable watermark at the bootstrap end_lsn so the
+            // resume cursor persists `end_lsn` (not start_lsn) until the
+            // first WAL xact advances it. Without this, a crash between
+            // bootstrap completion and the first post-end_lsn xact going
+            // durable — restarted with --bootstrap-mode=off — would resume
+            // the cursor at start_lsn and re-decode [start_lsn, end_lsn]
+            // against the end_lsn shadow catalog (WAL-version skew). The
+            // tail's `fetch_max` keeps it monotonic as WAL re-reads
+            // [aligned, end_lsn]. See plans/future/parallel_decode_and_insert.md
+            // (Handoff step 3).
+            let emitter_ack = Arc::new(AtomicU64::new(bootstrap_end_lsn.unwrap_or(0)));
             pipeline_ack = Some(emitter_ack.clone());
             let pcfg = PipelineConfig {
                 emitter: emitter_cfg,
@@ -1432,7 +1430,8 @@ async fn query_replay_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>
 
 /// Shadow-stream view passed into the metrics publish step.
 /// Bundles the four shadow-side numbers that come from
-/// [`ShadowStreamState::aggregate`] + the daemon's [`RateEstimator`].
+/// [`ShadowStreamState::aggregate`](walshadow::shadow_stream::ShadowStreamState::aggregate)
+/// + the daemon's [`RateEstimator`].
 struct ShadowMetricsView {
     apply_lag_bytes: u64,
     apply_lag_seconds: f64,
@@ -1538,18 +1537,17 @@ async fn populate_metrics(
 ///    `bootstrap_shadow_data_dir` exists and is non-empty (this returns
 ///    after that's true).
 ///
-/// When `ch_config` is `Some`, bootstrap rows route through a
-/// transitional CH emitter built against a
-/// [`walshadow::relation_resolver::CatalogMapResolver`] wrapping the
-/// seeded `CatalogMap`. The emitter opens fresh INSERT blocks per
-/// destination table, ships synthetic INSERTs (`_op = 1`,
-/// `_lsn = start_lsn`, `_commit_ts = 0`), and `drain_backfill`'s
-/// trailing `on_xact_end` closes them before this function returns.
-/// The daemon's real `ShadowCatalog`-backed emitter starts fresh
-/// below; both share the same CH destination tables, so block
-/// alignment stays clean. When `ch_config` is `None`, rows drain to a
-/// metrics-only observer — matches operators running without
-/// `--ch-config`.
+/// When `ch_config` is `Some`, bootstrap rows route through the shared
+/// insert tail (batcher + N inserters + ack collector) — the same
+/// machinery the WAL pipeline uses. [`walshadow::pipeline::bootstrap::drain`]
+/// resolves each page-walk tuple against the seeded `CatalogMap`, maps
+/// it, and ships a synthetic INSERT (`_op = 1`, `_lsn = start_lsn`,
+/// `_commit_ts = 0`). On completion it seals the open batches
+/// (`FlushAll`) and waits for every bootstrap seq durable on CH
+/// (`wait_through(K)`) before tearing the tail down, so the WAL pump
+/// below resumes against a fully-shipped baseline on the same CH tables.
+/// When `ch_config` is `None`, rows drain to a metrics-only observer via
+/// `drain_backfill` — matches operators running without `--ch-config`.
 async fn run_bootstrap(
     src_cfg: &PgConfig,
     feed: &mut SourceFeed,
@@ -1629,59 +1627,82 @@ async fn run_bootstrap(
         };
 
     let cfg = BootstrapConfig::new(shadow_data_dir.clone());
-    // PageWalkSink owns one CatalogMap; the transitional resolver gets
-    // a second clone. Both are immutable lookups, so duplicating is
-    // cheap — `Arc<RelDescriptor>` values stay shared across clones.
-    let resolver_map = catalog_map.clone();
+    // PageWalkSink owns one CatalogMap; the tail drain gets a second
+    // clone to resolve rfns → descriptors. Both are immutable lookups, so
+    // duplicating is cheap — `Arc<RelDescriptor>` values stay shared.
+    let drain_catalog = catalog_map.clone();
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map);
 
     let (shipped, outcome) = match ch_config {
         Some(emitter_cfg) => {
-            // Transitional emitter — `CatalogMapResolver` fronts the
-            // seeded snapshot (shadow PG isn't up yet). `AsyncClient`
-            // opens its own socket inside `Emitter::new`. Force
-            // `flush_timeout = 0` so the rfn-flip in `drain_backfill`
-            // closes the prior INSERT before the next `send_query` —
-            // hold-open mode would violate CH's "no overlapping
-            // INSERTs on one connection" rule + silently drop the
-            // first table's bytes.
-            let mut emitter_cfg = emitter_cfg;
-            emitter_cfg.flush_timeout = std::time::Duration::ZERO;
+            // Route bootstrap rows through the shared insert tail (batcher
+            // + N inserters + ack collector) — the same machinery the WAL
+            // pipeline uses, not a separate serial emitter. Bootstrap is
+            // the easy case: every row is op=Insert at _lsn = start_lsn,
+            // no aborts / TRUNCATE / DDL. The per-rfn force-flush dance the
+            // old transitional emitter needed is gone (the batcher owns
+            // INSERT lifecycle), so we keep the operator's flush_timeout;
+            // the tail defaults 0 to its own partial-flush deadline.
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-            let resolver: Arc<dyn walshadow::relation_resolver::RelationResolver> = Arc::new(
-                walshadow::relation_resolver::CatalogMapResolver::new(resolver_map),
-            );
-            let emitter = Emitter::new(emitter_cfg, resolver)
-                .await
-                .context("bootstrap: init transitional CH emitter")?;
+            let stats = Arc::new(EmitterStats::default());
+            // Bootstrap's own watermark atomic — discarded after teardown.
+            // The durability proof is `wait_through(K)`; the resume LSN is
+            // carried to `end_lsn` by seeding the WAL pipeline's emitter_ack
+            // (see `run`), so a uniform `commit_lsn = start_lsn` here is fine.
+            let emitter_ack = Arc::new(AtomicU64::new(0));
+            let fatal = Fatal::new();
+            let inserter_pool_size = args.inserter_pool_size;
+            let (msg_tx, ack, tail) = tail::spawn(
+                &emitter_cfg,
+                inserter_pool_size,
+                stats.clone(),
+                emitter_ack,
+                fatal.clone(),
+            )
+            .await
+            .context("bootstrap: spawn insert tail")?;
+            // PageWalkSink rfns resolve against the seeded snapshot; the
+            // mapping is the static [table.*] config (no SIGHUP and no
+            // shadow PG during bootstrap).
+            let mapping: MappingHandle =
+                Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
             tracing::info!(
                 target: "walshadow::bootstrap",
                 addr = %addr,
-                "bootstrap ch emitter connected",
+                inserters = inserter_pool_size.max(1),
+                "bootstrap insert tail started",
             );
-            let mut observer = EmitterObserver::new(emitter);
-            let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
-            let shipped = drain_res.context("bootstrap drain")?;
+
+            // Drain the page walk into the tail concurrently with the pump.
+            let drain = tokio::spawn(bootstrap::drain(
+                rx,
+                drain_catalog,
+                mapping,
+                msg_tx.clone(),
+                ack.clone(),
+                stats.clone(),
+            ));
+            let (drain_res, pump_res) = tokio::join!(drain, pump);
+            let drain_outcome = drain_res
+                .context("bootstrap drain join")?
+                .map_err(|e| anyhow::anyhow!("bootstrap drain: {e}"))?;
             let outcome: BootstrapOutcome = pump_res
                 .context("bootstrap pump join")?
                 .context("bootstrap pump")?;
-            // Force-close held-open INSERTs before tearing down the
-            // transitional emitter. With `flush_timeout > 0` the
-            // last synthetic xact_end won't have closed them.
-            walshadow::decoder_sink::TupleObserver::on_close(&mut observer)
+            let k = drain_outcome.next_seq;
+
+            tail.finish(msg_tx, ack, k, &fatal)
                 .await
-                .context("bootstrap emitter shutdown flush")?;
-            use std::sync::atomic::Ordering;
+                .map_err(|m| anyhow::anyhow!("bootstrap: {m}"))?;
             tracing::info!(
                 target: "walshadow::bootstrap",
-                rows_emitted = observer.emitter.stats.rows_emitted.load(Ordering::Relaxed),
-                blocks_sent = observer.emitter.stats.blocks_sent.load(Ordering::Relaxed),
-                "bootstrap emitter drained",
+                rows_routed = drain_outcome.rows_routed,
+                rows_emitted = stats.rows_emitted.load(Ordering::Relaxed),
+                blocks_sent = stats.blocks_sent.load(Ordering::Relaxed),
+                seqs = k,
+                "bootstrap insert tail drained",
             );
-            // Drop the transitional emitter so its CH TCP closes
-            // before the daemon path opens its own.
-            drop(observer);
-            (shipped, outcome)
+            (drain_outcome.rows_routed, outcome)
         }
         None => {
             // Metrics-only — bootstrap rows counted, not shipped.

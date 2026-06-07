@@ -5,7 +5,7 @@
 //! `chunk()` callbacks, the sink accumulates them 8 KiB at a time
 //! (PG's heap page size), walks each full page's `ItemIdData` slots,
 //! and decodes live tuples through the **same heap decoder the WAL
-//! hot path uses** ([`crate::heap_decoder::decode_block_data`]).
+//! hot path uses** (`decode_block_data`).
 //! Output is one [`BackfillTuple`] per `LP_NORMAL` slot; the sink
 //! hands them off through an mpsc to an async drain task that pumps
 //! the CH emitter. See [plans/bootstrap.md](../plans/bootstrap.md).
@@ -38,7 +38,9 @@ use crate::backup_sink::parse_base_path;
 use crate::backup_source::{
     BackupSink, EndInfo, EntryId, FileAction, FileKind, FileMeta, StartInfo,
 };
-use crate::heap_decoder::{ColumnValue, DecodeError, decode_block_data};
+use crate::heap_decoder::{
+    ColumnValue, CommittedTuple, DecodeError, DecodedHeap, DecodedTuple, HeapOp, decode_block_data,
+};
 use crate::shadow_catalog::RelDescriptor;
 
 /// Heap page size — PG compile-time, identical to wal-rs `BLOCK_SIZE`.
@@ -86,6 +88,29 @@ pub struct BackfillTuple {
     pub source_lsn: u64,
     /// Attnum-1 indexed columns, matching `RelDescriptor.attributes`.
     pub columns: Vec<Option<ColumnValue>>,
+}
+
+impl BackfillTuple {
+    /// Synthetic base-backup insert: start_lsn rides as both source_lsn and
+    /// commit_lsn so ReplacingMergeTree(_lsn) collapses duplicates the WAL
+    /// decoder re-emits for records in [start_lsn, end_lsn]
+    pub fn into_committed_insert(self) -> CommittedTuple {
+        CommittedTuple {
+            decoded: DecodedHeap {
+                rfn: self.rfn,
+                xid: self.xid,
+                source_lsn: self.source_lsn,
+                op: HeapOp::Insert,
+                new: Some(DecodedTuple {
+                    columns: self.columns,
+                    partial: false,
+                }),
+                old: None,
+            },
+            commit_ts: 0,
+            commit_lsn: self.source_lsn,
+        }
+    }
 }
 
 /// Resolved `(db_node, rel_node) → RelDescriptor` map. Populated

@@ -61,14 +61,11 @@ Ship-blockers remaining:
   daemon-spawn live test, still hardcodes default 1/1 with no knob. Validate N
   concurrent `AsyncClient`s under the DDL barrier in the spawned daemon too,
   confirming out-of-order INSERTs across connections stay `_lsn`-correct
-* Bootstrap/base-backup still routes through serial `Emitter`, bypassing pool,
-  retry, ack, backpressure. Target shape in "Base backup through the same
-  pipeline" below. Two correctness items surfaced while scoping that move,
-  both pre-existing and independent of the pool: object_store concurrent-part
-  fan-out corrupting the shared page-walk sink state (fixed via per-entry
-  `EntryId` keying, Blockers, refined #5), and externally-toasted columns
-  erroring rather than shipping (Blockers, refined #2, design in
-  [TOAST.md](TOAST.md))
+* DONE (2026-06-07). Bootstrap/base-backup now routes through the shared tail
+  (Option A), not the serial `Emitter`. See "Status (2026-06-07) — bootstrap
+  through the shared tail" below. Externally-toasted columns still error rather
+  than ship (Blockers, refined #2, design in [TOAST.md](TOAST.md)) — fail-fast
+  preserved, now surfaced through the tail's `fatal` instead of the emitter.
 
 Known gaps:
 
@@ -85,25 +82,65 @@ Next:
 
 1. Daemon e2e with pool sizes >1; confirm out-of-order INSERTs across N
    connections stay `_lsn`-correct through the DDL barrier
-2. Move bootstrap onto the shared batcher/inserter/ack tail (see "Base backup
-   through the same pipeline"): extract `tail::spawn` from
-   `PipelineConfig::spawn`, route the page-walk drain through it (Option A,
-   decode stays in the sink), synthesize per-rfn seqs, then run the Handoff
-   completion sequence at end-of-bootstrap — `BatcherMsg::FlushAll`,
-   `wait_through(K)` for bootstrap durability, then advance the persisted resume
-   LSN to `end_lsn` (`ack.trailing(end_lsn)` or a final zero-row `end_lsn`
-   marker seq). The explicit `end_lsn` bump is correctness, not cosmetics:
-   `wait_through(K)` proves durability but leaves published `emitter_ack` at
-   `start_lsn` (every bootstrap `commit_lsn` is `start_lsn`). Direct mode applies
-   as-is; `object_store` (S3) first needs serialized Tap sink events
-   (Blockers, refined #5) before per-rfn seqs are correct. Decode pool for
-   bootstrap (Option B) only if page-walk decode can't feed N inserters
+2. DONE (2026-06-07). Bootstrap routes through the shared tail (Option A). See
+   "Status (2026-06-07) — bootstrap through the shared tail" below. The
+   serialized Tap sink events that gated `object_store` (Blockers, refined #5)
+   landed earlier, so both Direct and ObjectStore route through the tail. Decode
+   pool for bootstrap (parallel-decode Option B) remains gated on measurement
 3. Replace unbounded pump-to-worker + ack channels with bounded ones to close
    the backpressure chain
 4. DDL barrier optimization, deferred now that N=1 tracks the source: make it
    DDL-type-aware. ADD COLUMN needs only seal plus epoch bump before post-ALTER
    rows decode, no global `wait_all_durable`. Reserve the full drain for
    destructive DDL (DROP/RENAME column, TRUNCATE)
+
+## Status (2026-06-07) — bootstrap through the shared tail
+
+Bootstrap (greenfield base backup) now feeds the same batcher → inserter →
+ack tail as WAL, replacing the transitional serial `Emitter`. Direct and
+ObjectStore sources both route through it.
+
+Shape (Option A — decode stays in the page-walk sink):
+
+* `tail::spawn` (`src/pipeline/tail.rs`) factored out of `PipelineConfig::spawn`:
+  ack collector + N inserters + batcher, fed by a `mpsc::Sender<BatcherMsg>` +
+  `AckHandle`. WAL composes it with reorder + decode pool; behaviour unchanged
+  (`pipeline_parallel_{e2e,ddl_e2e}` green).
+* `pipeline::bootstrap::drain` (`src/pipeline/bootstrap.rs`) is the bootstrap
+  producer: pulls `BackfillTuple`s off the `PageWalkSink` channel, resolves +
+  maps (no detoast, no oracle — Option A), builds `CommittedTuple{op=Insert,
+  commit_lsn=start_lsn}`, sends `RoutedRow` to the tail. One synthetic seq per
+  rfn (register at rfn start, `placed` at rfn flip / channel close).
+* `run_bootstrap` (`bin/stream.rs`, `--ch-config` arm) spawns the tail at
+  `--inserter-pool-size`, runs the page walk + drain concurrently, then the
+  completion sequence: `BatcherMsg::FlushAll` → `ack.wait_through(K)` →
+  teardown. The metrics-only (no `--ch-config`) arm still uses `drain_backfill`.
+
+Handoff (resume-LSN correctness): implemented as a **separate** tail instance
+torn down at end-of-bootstrap, *not* the shared-instance handoff sketched under
+"Handoff: shared tail" below. `run()` stands bootstrap up before shadow-PG spawn
+/ `START_REPLICATION`, so holding one tail (and its CH sockets) idle across the
+multi-second autospawn was not worth the coupling. This is the plan's own
+sanctioned "run steps 1–3 before opening `START_REPLICATION`" conservative
+alternative (no overlap, identical durability guarantee). The explicit `end_lsn`
+bump (step 3) is realized by **seeding the WAL pipeline's `emitter_ack` atomic to
+`bootstrap_end_lsn`** at creation, so the resume cursor persists `end_lsn` (not
+`start_lsn`) until the first WAL xact; the tail's `fetch_max` keeps it monotonic
+as WAL re-reads `[aligned, end_lsn]`. Because the WAL collector is a fresh
+instance starting at seq 0, Blocker #3 (seq continuity at `K`) does not apply.
+
+Coverage:
+
+* `tests/bootstrap_pipeline_ch.rs` — bootstrap drain → tail at N=2 → live CH,
+  `row_budget=4` so each rfn's seq spans many batches that fan across both
+  connections and ack out of order; `wait_through(K)` reconciles, all rows land.
+* `bootstrap_direct_ch.rs` / `bootstrap_object_store_ch.rs` — full daemon-spawn
+  bootstrap through the tail (N=1), green.
+* `pipeline::bootstrap` unit tests — per-rfn seq counts, unmapped-skip,
+  reappearing-rfn (object_store interleave) yields fresh dense seqs.
+
+Still open: TOAST fail-fast (Blockers, refined #2); parallel-decode Option B
+gated on measurement; backpressure (unbounded pump→drain channel, Next step 3).
 
 ## Current serial path
 

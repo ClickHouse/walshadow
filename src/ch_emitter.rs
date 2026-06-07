@@ -1,68 +1,56 @@
-//! CH Native emitter via [`clickhouse-c-rs`].
+//! CH-native emitter primitives via `clickhouse-c-rs`.
 //!
-//! Fronts bootstrap backfill only; the live streaming drain uses the
-//! parallel pipeline in [`crate::pipeline`]. Per-xact close
-//! (`flush_timeout == 0`, "legacy mode" below) is forced on for
-//! backfill and unreachable from the live `flush_timeout` knob, which
-//! maps `0` to a 100ms partial-batch deadline instead.
-//!
-//! Translates committed-xact tuple streams into per-table INSERT
-//! statements over a single TCP `AsyncClient` per CH replica. Lifecycle per
-//! `(destination table, xact)`:
-//!
-//! 1. First row → buffer in [`TableEncoder`]; mark INSERT pending.
-//! 2. Either the `row_budget` or `byte_budget` trips → seal one complete
-//!    INSERT: `send_query` + `send_data(Some(&bb))` + `send_data_end()`,
-//!    drain to `EndOfStream`, then clear the buffer. The buffer is never
-//!    cleared before `EndOfStream`, so a mid-flush disconnect replays
-//!    rather than loses rows (CH dedups any replay by `_lsn`).
-//! 3. `on_xact_end` (called by [`XactBuffer::commit`](crate::xact_buffer::XactBuffer))
-//!    seals every still-buffered table the same way (legacy mode, or
-//!    when the hold-open `flush_timeout` deadline has tripped). In
-//!    hold-open mode rows accumulate across xacts until a budget trip or
-//!    the deadline seals them, batching small xacts into fewer parts.
+//! Defines building blocks shared by bootstrap backfill and live
+//! streaming, with no emitter object or xact lifecycle of its own:
+//! [`EmitterConfig`] (TOML parse + retry classification via
+//! [`RetryConfig`]), [`CompressionChoice`], the config-side
+//! [`TableMapping`]/[`NamespaceMapping`]/[`ColumnMapping`],
+//! [`TablePlan`]/[`ColumnPlan`] (relation schema -> native wire plan),
+//! [`TableEncoder`]/[`ColumnBuf`] (row -> native block + per-value
+//! encoding), and [`EmitterStats`]. Consumed by
+//! [`crate::pipeline`]'s `batcher` and `inserter`, and by
+//! [`crate::ch_ddl`]; batching, seal triggers, and xact close all live
+//! in the pipeline, not here.
 //!
 //! Synthetic columns `_lsn UInt64`, `_xid UInt32`, `_op Enum8(...)`,
-//! `_commit_ts DateTime64(6, 'UTC')` are appended after every mapped
-//! column. PG's `TimestampTz` epoch is 2000-01-01; we shift to the Unix
-//! epoch (`DATETIME64_PG_EPOCH_US`) so `DateTime64(6)` semantics line up
-//! with ClickHouse.
+//! `_commit_ts DateTime64(6, 'UTC')` are appended by [`TablePlan`] after
+//! every mapped column and filled by [`TableEncoder`]. PG's
+//! `TimestampTz` epoch is 2000-01-01; we shift to the Unix epoch
+//! (`DATETIME64_PG_EPOCH_US`) so `DateTime64(6)` semantics line up with
+//! ClickHouse.
 //!
 //! ## Compression
 //!
 //! Codec choice is feature-gated via walshadow's own `lz4` / `zstd`
-//! Cargo features, which forward to [`clickhouse-c-rs`]'s matching
+//! Cargo features, which forward to `clickhouse-c-rs`'s matching
 //! features (see top-level `Cargo.toml`). When a feature is off, the
-//! corresponding [`Compression`] variant fails to construct at
-//! `EmitterConfig::resolve_codec`. Default builds advertise LZ4 to
-//! match the CH server default.
+//! corresponding [`CompressionChoice`] variant fails to construct at
+//! [`CompressionChoice::build_codec`] with
+//! [`EmitterError::CompressionUnsupported`]. Default builds advertise
+//! LZ4 to match the CH server default.
 //!
 //! ## Cross-table ordering inside an xact
 //!
-//! `AsyncClient` is single-query-at-a-time, so an xact touching tables T1
-//! and T2 lands as: every T1 row first (one INSERT), then every T2
-//! (next INSERT). Original WAL interleaving across tables is not
-//! preserved. `_lsn` carries the source LSN so
-//! `ReplacingMergeTree`-style dedup still keys on the right value.
-//! WAL ordering within a single destination table is preserved.
+//! `AsyncClient` is single-query-at-a-time, so an xact touching tables
+//! T1 and T2 lands as every T1 row first (one INSERT), then every T2
+//! (next INSERT); original WAL interleaving across tables is not
+//! preserved. `_lsn` carries the source LSN so `ReplacingMergeTree`-style
+//! dedup still keys on the right value, and WAL ordering within a single
+//! destination table is preserved
 
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clickhouse_c::{
-    Allocator, AsyncClient, BlockBuilder, BlockOpts, ClientOpts, Codec, Compression, Event, Kind,
-    TypeAst,
+    Allocator, AsyncClient, BlockBuilder, ClientOpts, Codec, Compression, Event, Kind, TypeAst,
 };
 use thiserror::Error;
 
-use crate::ch_ddl::DdlApplicator;
-use crate::decoder_sink::{DecoderSinkError, TupleObserver};
+use crate::decoder_sink::DecoderSinkError;
 use crate::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
-use crate::relation_resolver::RelationResolver;
-use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent};
+use crate::shadow_catalog::{CatalogError, RelDescriptor};
 
 /// Microsecond offset between PG `TimestampTz` epoch (2000-01-01 UTC)
 /// and the Unix epoch. `DateTime64(6)` in ClickHouse is Unix
@@ -71,7 +59,7 @@ use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent};
 pub const DATETIME64_PG_EPOCH_US: i64 = 946_684_800_000_000;
 
 /// `_op` Enum8 codes — keep in sync with the `Enum8('insert'=1, ...)`
-/// type advertised by [`TablePlan::synthetic_op_type`].
+/// type advertised by [`TablePlan::synth_op`].
 pub const OP_INSERT: i8 = 1;
 pub const OP_UPDATE: i8 = 2;
 pub const OP_DELETE: i8 = 3;
@@ -492,20 +480,10 @@ impl EmitterConfig {
         }
         Ok(out)
     }
-
-    /// Top-level construction: connect, build codec, return ready
-    /// [`Emitter`]. Opens its own `tokio` TCP connection to
-    /// `(host, port)` via [`AsyncClient`]; no caller-supplied socket.
-    pub async fn connect(
-        self,
-        resolver: Arc<dyn RelationResolver>,
-    ) -> Result<Emitter, EmitterError> {
-        Emitter::new(self, resolver).await
-    }
 }
 
-/// Cached plan for one destination table. Built lazily the first time
-/// a tuple lands for the relation; stored in [`Emitter::tables`]
+/// Cached plan for one destination table. Built lazily the first time a
+/// row lands for the relation; held by the batcher's [`TableEncoder`]
 /// keyed by source `(namespace.relname)`.
 pub struct TablePlan {
     pub target: String,
@@ -646,8 +624,9 @@ pub(crate) fn quote_ident(name: &str) -> String {
 
 /// Open a CH [`AsyncClient`] from `config`, connecting a fresh `tokio`
 /// TCP socket to `(host, port)` and running the Hello handshake. Shared
-/// by [`Emitter::new`], [`Emitter::reconnect`], and [`DdlApplicator::new`]
-/// so connection options stay in one place.
+/// by the inserter pool ([`crate::pipeline::inserter`]) and
+/// [`crate::ch_ddl::DdlApplicator::new`] so connection options stay in one
+/// place.
 pub(crate) async fn connect_client(config: &EmitterConfig) -> Result<AsyncClient, EmitterError> {
     let codec = config.compression.build_codec()?;
     let mut opts = ClientOpts::new()
@@ -689,36 +668,6 @@ pub(crate) async fn drain_to_end_of_stream(client: &mut AsyncClient) -> Result<(
         }
     }
     Ok(())
-}
-
-/// Bounded reconnect+retry around a CH op returning `Result<_,
-/// EmitterError>`. A macro, not a fn: it threads `&mut self` through
-/// both `$op` and the in-loop `reconnect().await` without a borrow
-/// conflict. `$op` may be sync or `.await`-ed. Retryable failures bounce
-/// the connection per [`EmitterConfig::retry`]; the per-table buffer in
-/// `self.tables` survives so buffered rows reflush on the new socket.
-macro_rules! with_reconnect_retry {
-    ($self:ident, $op:expr) => {{
-        let retry = $self.config.retry.clone();
-        let mut attempt = 0u32;
-        let mut backoff = retry.initial_backoff;
-        loop {
-            match $op {
-                Ok(ack) => break Ok(ack),
-                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
-                    $self
-                        .stats
-                        .retries_attempted
-                        .fetch_add(1, Ordering::Relaxed);
-                    attempt += 1;
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2).min(retry.max_backoff);
-                    $self.reconnect().await?;
-                }
-                Err(e) => break Err(e),
-            }
-        }
-    }};
 }
 
 /// Per-table per-xact accumulator. One block buffer per CH column;
@@ -798,31 +747,6 @@ impl ColumnBuf {
                 inner: Vec::new(),
             },
         })
-    }
-
-    fn clear(&mut self) {
-        match self {
-            Self::Fixed { bytes, .. } => bytes.clear(),
-            Self::String { offsets, data } => {
-                offsets.clear();
-                data.clear();
-            }
-            Self::NullableFixed {
-                null_map, inner, ..
-            } => {
-                null_map.clear();
-                inner.clear();
-            }
-            Self::NullableString {
-                offsets,
-                data,
-                null_map,
-            } => {
-                offsets.clear();
-                data.clear();
-                null_map.clear();
-            }
-        }
     }
 
     fn approx_size(&self) -> usize {
@@ -984,14 +908,6 @@ impl TableEncoder {
         Ok((old, rows))
     }
 
-    fn clear(&mut self) {
-        for b in &mut self.buffers {
-            b.clear();
-        }
-        self.rows = 0;
-        self.approx_bytes = 0;
-    }
-
     /// Append one committed tuple's `new` image (or `old` image for
     /// DELETE / UPDATE old-key). Caller picks the source side and the
     /// `_op` code.
@@ -1046,65 +962,6 @@ impl TableEncoder {
         self.rows += 1;
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
         Ok(())
-    }
-
-    /// Build a [`BlockBuilder`] over the accumulated buffers and send
-    /// it through `client.send_data`. Returns the row count just sent.
-    async fn flush_block(
-        &mut self,
-        client: &mut AsyncClient,
-        alloc: Allocator,
-        opts: BlockOpts,
-    ) -> Result<usize, EmitterError> {
-        if self.rows == 0 {
-            return Ok(0);
-        }
-        let mut bb = BlockBuilder::new(alloc)?;
-        let n_rows = self.rows;
-        // Mapped columns
-        for (i, plan) in self.plan.columns.iter().enumerate() {
-            append_buf(&mut bb, &plan.name, &plan.ast, &self.buffers[i], n_rows)?;
-        }
-        let off = self.plan.columns.len();
-        append_buf(
-            &mut bb,
-            &self.plan.synth_lsn.name,
-            &self.plan.synth_lsn.ast,
-            &self.buffers[off],
-            n_rows,
-        )?;
-        append_buf(
-            &mut bb,
-            &self.plan.synth_xid.name,
-            &self.plan.synth_xid.ast,
-            &self.buffers[off + 1],
-            n_rows,
-        )?;
-        append_buf(
-            &mut bb,
-            &self.plan.synth_op.name,
-            &self.plan.synth_op.ast,
-            &self.buffers[off + 2],
-            n_rows,
-        )?;
-        append_buf(
-            &mut bb,
-            &self.plan.synth_commit_ts.name,
-            &self.plan.synth_commit_ts.ast,
-            &self.buffers[off + 3],
-            n_rows,
-        )?;
-        client.send_data(Some(&bb)).await?;
-        drop(bb);
-        // Caller is responsible for `opts`; `BlockBuilder::write` is
-        // not called because we go through the TCP packet loop.
-        let _ = opts;
-        // Buffer is NOT cleared here. Durability lands only at the
-        // wire's `EndOfStream`; if the connection drops between this
-        // send and that ack, CH rolls back the whole in-progress
-        // INSERT, so the rows must stay buffered for the retry to
-        // replay. `close_current_wire` clears post-`EndOfStream`.
-        Ok(n_rows)
     }
 }
 
@@ -1433,60 +1290,14 @@ fn encode_value(
     }
 }
 
-/// Shared per-relation mapping handle. Cloneable via the inner `Arc`;
-/// the daemon hands one clone to [`Emitter`] and keeps another to
-/// support SIGHUP reload (atomic swap of the entire `HashMap`).
+/// Shared per-relation mapping handle. Cloneable via the inner `Arc`; the
+/// decode pool and the DDL applicator read it, and the daemon swaps the
+/// whole `HashMap` atomically on SIGHUP reload.
 ///
-/// The reload sees the swap *between* xacts: tables already cached in
-/// [`Emitter::tables`] keep their old [`TablePlan`] until the xact
-/// drains and clears the cache. The next xact consults the new map.
+/// Readers see the swap *between* rows; a table's cached [`TablePlan`] in
+/// the batcher rebuilds on the next epoch (after a barrier), so subsequent
+/// batches encode against the new map.
 pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>;
-
-/// CH-Native emitter. Holds one [`AsyncClient`] over a connected
-/// TCP socket per CH replica plus the per-table accumulator state.
-pub struct Emitter {
-    client: AsyncClient,
-    alloc: Allocator,
-    config: EmitterConfig,
-    /// SIGHUP-reloadable mapping. Initial value is cloned from
-    /// `config.tables` at construction; later mutations come via
-    /// [`Emitter::mapping_handle`] reaching out from the daemon's
-    /// SIGHUP task.
-    mapping: MappingHandle,
-    resolver: Arc<dyn RelationResolver>,
-    tables: HashMap<String, TableEncoder>,
-    /// xid currently held in `tables`. Reset on `on_xact_end`.
-    current_xid: Option<u32>,
-    /// Set when any INSERT opens (first row after the previous close)
-    /// and `flush_timeout > 0`. Cleared on close. Drives the
-    /// hold-INSERT-open path's deadline check inside
-    /// [`Self::on_xact_end_with_lsn`].
-    flush_deadline: Option<Instant>,
-    /// Highest `commit_lsn` of any row buffered in a [`TableEncoder`]
-    /// but not yet sealed by a completed INSERT (`EndOfStream`). Bumped
-    /// per tuple in [`Self::route`], reset to `0` once every buffer has
-    /// drained, then `last_durable_commit_lsn` adopts it.
-    pending_max_commit_lsn: u64,
-    /// Highest `commit_lsn` known durable on CH (i.e. covered by a
-    /// closed INSERT's `EndOfStream`). xact_buffer pulls this through
-    /// [`EmitterObserver::on_xact_end`] to advance `emitter_ack_lsn`.
-    /// Monotonic; only bumped inside [`Self::close_all_open_inserts`]
-    /// or when an empty/untracked xact arrives with no rows pending.
-    last_durable_commit_lsn: u64,
-    /// CH-side DDL writer. Owns its own clickhouse-c
-    /// `AsyncClient` (separate from `self.client` so DDL doesn't interleave
-    /// with INSERT data). `None` when the emitter is wired without a
-    /// DDL applicator (tests, transitional bootstrap emitter).
-    applicator: Option<DdlApplicator>,
-    /// Key of the table whose `INSERT INTO ... FORMAT Native` is
-    /// currently open on `client`. `None` between `send_data_end()` +
-    /// EndOfStream drain and the next `send_query`. CH's Native protocol
-    /// rejects a fresh `Query` while another INSERT data stream is open
-    /// (code 101 "Unexpected packet Query"), so any wire activity for
-    /// table B must call `close_current_wire` first if A is open.
-    wire_open_key: Option<String>,
-    pub stats: Arc<EmitterStats>,
-}
 
 crate::atomic_stats! {
     /// CH emitter counters. Mutations via `fetch_add(_, Relaxed)`; the
@@ -1508,468 +1319,12 @@ crate::atomic_stats! {
         pub retries_attempted,
         /// `HeapOp::Truncate` events shipped to CH as `TRUNCATE TABLE`.
         pub truncates_emitted,
-        /// Number of times the hold-INSERT-open deadline tripped (i.e.
-        /// `flush_timeout` elapsed since the first row of a fresh INSERT
-        /// landed) and forced a multi-xact close. Stays at `0` when
-        /// `flush_timeout == 0` because the legacy close-per-xact path
-        /// fires through [`Emitter::close_all_open_inserts`] without setting
-        /// a deadline.
+        /// Legacy serial-emitter counter for hold-INSERT-open deadline
+        /// trips. The pooled pipeline seals partial batches via the
+        /// batcher's own `flush_timeout` deadline and does not bump this,
+        /// so it now stays 0.
         pub flush_deadline_trips,
     }
-}
-
-impl Emitter {
-    pub async fn new(
-        config: EmitterConfig,
-        resolver: Arc<dyn RelationResolver>,
-    ) -> Result<Self, EmitterError> {
-        let alloc = Allocator::stdlib();
-        let client = connect_client(&config).await?;
-        let mapping = Arc::new(tokio::sync::RwLock::new(config.tables.clone()));
-        Ok(Self {
-            client,
-            alloc,
-            config,
-            mapping,
-            resolver,
-            tables: HashMap::new(),
-            current_xid: None,
-            flush_deadline: None,
-            pending_max_commit_lsn: 0,
-            last_durable_commit_lsn: 0,
-            applicator: None,
-            wire_open_key: None,
-            stats: Arc::new(EmitterStats::default()),
-        })
-    }
-
-    /// Attach a DDL applicator. Caller opens the
-    /// applicator's own TCP connection and passes it through
-    /// [`DdlApplicator::new`] before handing it off here. Once
-    /// attached, schema events drained from the xact buffer route
-    /// through the applicator before the next `on_tuple` encodes
-    /// rows against the post-DDL shape.
-    pub fn with_applicator(mut self, applicator: DdlApplicator) -> Self {
-        self.applicator = Some(applicator);
-        self
-    }
-
-    pub fn applicator_mut(&mut self) -> Option<&mut DdlApplicator> {
-        self.applicator.as_mut()
-    }
-
-    /// SIGHUP target. Daemon clones this handle at boot and feeds the
-    /// post-reload TOML mapping back through `*handle.write().await = new`.
-    pub fn mapping_handle(&self) -> MappingHandle {
-        self.mapping.clone()
-    }
-
-    /// Shared handle so the daemon's status loop (running on a different
-    /// task once the emitter is boxed into an observer) can snapshot
-    /// counters without coordinating with the emitter task.
-    pub fn stats_handle(&self) -> Arc<EmitterStats> {
-        self.stats.clone()
-    }
-
-    /// Route one committed tuple. INSERT/UPDATE land via the `new`
-    /// image; DELETE pulls from `old`. HOT_UPDATE is treated as UPDATE
-    /// downstream (op-code 2) — CH's `ReplacingMergeTree` cares about
-    /// `_lsn` ordering, not the PG-internal HOT distinction.
-    async fn route(&mut self, committed: &CommittedTuple) -> Result<(), EmitterError> {
-        if self.current_xid.is_none() {
-            self.current_xid = Some(committed.decoded.xid);
-        }
-        let rel = match self
-            .resolver
-            .relation_at(committed.decoded.rfn, committed.decoded.source_lsn)
-            .await
-        {
-            Ok(rel) => rel,
-            // Foreign-DB WAL: skip like an unmapped relation (no append,
-            // no poison), let the ack advance past it.
-            Err(CatalogError::ForeignDatabase(_)) => {
-                self.stats
-                    .foreign_db_rows_skipped
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let mapping = {
-            let m = self.mapping.read().await;
-            match m.get(rel.qualified_name.as_ref()).cloned() {
-                Some(v) => v,
-                None => {
-                    self.stats
-                        .unsupported_relations
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
-                }
-            }
-        };
-        // Truncate executes in WAL order against the destination.
-        // Drain any pending per-table buffer for this relation first
-        // (so prior INSERTs in the same xact land before the truncate),
-        // then issue `TRUNCATE TABLE <dest>` synchronously. Closing
-        // the current wire (if any) lets `send_query(TRUNCATE)` ride
-        // the same connection without tripping CH's "one Query at a
-        // time" invariant.
-        if let HeapOp::Truncate = committed.decoded.op {
-            let key = rel.qualified_name.as_ref().to_owned();
-            if self.tables.get(&key).is_some_and(|e| e.rows > 0) {
-                self.flush_table(&key).await?;
-            }
-            self.close_current_wire().await?;
-            self.tables.remove(&key);
-            let sql = format!("TRUNCATE TABLE {}", mapping.target);
-            self.client.send_query(&sql, None).await?;
-            drain_to_end_of_stream(&mut self.client).await?;
-            self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        // Lazily build the per-table encoder on first row. NO wire
-        // activity here: pgbench's TPC-B xact touches 4 tables per
-        // commit, so eagerly closing prior wires on each table-switch
-        // would cost one CH round-trip per row. Wire opens happen at
-        // flush time (budget trip in this fn, or close_all at deadline /
-        // legacy per-xact close).
-        if !self.tables.contains_key(rel.qualified_name.as_ref()) {
-            let plan = TablePlan::build(self.alloc, &rel, &mapping)?;
-            let enc = TableEncoder::new(plan)?;
-            let owned_key = rel.qualified_name.as_ref().to_owned();
-            self.tables.insert(owned_key, enc);
-        }
-        let enc = self
-            .tables
-            .get_mut(rel.qualified_name.as_ref())
-            .expect("just inserted");
-        let op = match committed.decoded.op {
-            HeapOp::Insert => OP_INSERT,
-            HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
-            HeapOp::Delete => OP_DELETE,
-            // Routed above; unreachable here.
-            HeapOp::Truncate => return Ok(()),
-        };
-        if let Err(e) = enc.append_row(committed, &mapping, op) {
-            self.stats
-                .unsupported_values
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(e);
-        }
-        self.pending_max_commit_lsn = self.pending_max_commit_lsn.max(committed.commit_lsn);
-        let tripped =
-            enc.rows >= self.config.row_budget || enc.approx_bytes >= self.config.byte_budget;
-        // Budget trip seals this table's buffered rows as one complete
-        // INSERT (open → block → EndOfStream → clear). Bounds client
-        // memory; an over-budget xact lands as several sealed parts
-        // rather than one streamed-but-unconfirmed part.
-        if tripped {
-            let key_owned = rel.qualified_name.as_ref().to_owned();
-            self.flush_table(&key_owned).await?;
-        }
-        Ok(())
-    }
-
-    /// Ensure `key`'s INSERT is open on `client`, switching off any
-    /// other table's open wire first (CH allows only one INSERT data
-    /// stream per connection — see [`Self::wire_open_key`]). Issues
-    /// `send_query(INSERT … FORMAT Native)` against `client` on first
-    /// open for the table; subsequent calls are no-ops while the wire
-    /// stays on `key`. Sets [`Self::flush_deadline`] when opening a
-    /// fresh window under `flush_timeout > 0`.
-    async fn open_wire(&mut self, key: &str) -> Result<(), EmitterError> {
-        if self.wire_open_key.as_deref() == Some(key) {
-            return Ok(());
-        }
-        self.close_current_wire().await?;
-        let enc = self
-            .tables
-            .get(key)
-            .expect("open_wire called on unknown table");
-        self.client.send_query(&enc.plan.insert_sql, None).await?;
-        self.wire_open_key = Some(key.to_owned());
-        if !self.config.flush_timeout.is_zero() && self.flush_deadline.is_none() {
-            self.flush_deadline = Some(Instant::now() + self.config.flush_timeout);
-        }
-        Ok(())
-    }
-
-    /// Close the currently-open INSERT (if any): ship any remaining
-    /// rows in that table's encoder, then `send_data_end()` and drain
-    /// to `EndOfStream`. Idempotent — no-op when no wire is open.
-    /// Called between table-switches, on xact_end (legacy / deadline),
-    /// before TRUNCATE / DDL, and on shutdown.
-    async fn close_current_wire(&mut self) -> Result<(), EmitterError> {
-        let Some(key) = self.wire_open_key.take() else {
-            return Ok(());
-        };
-        let alloc = self.alloc;
-        let n = if let Some(enc) = self.tables.get_mut(&key) {
-            enc.flush_block(&mut self.client, alloc, BlockOpts::default())
-                .await?
-        } else {
-            0
-        };
-        self.client.send_data_end().await?;
-        drain_to_end_of_stream(&mut self.client).await?;
-        // EndOfStream confirmed: the INSERT is durable on CH, so the
-        // rows just sealed are now safe to count and drop. Until this
-        // point the buffer is the only replay source if the connection
-        // bounced.
-        if n > 0 {
-            self.stats
-                .rows_emitted
-                .fetch_add(n as u64, Ordering::Relaxed);
-            self.stats.blocks_sent.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(enc) = self.tables.get_mut(&key) {
-            enc.clear();
-        }
-        Ok(())
-    }
-
-    /// Seal `key`'s buffered rows as one complete, independently-durable
-    /// INSERT: open the wire, ship the block, terminate, drain to
-    /// `EndOfStream`, then clear the buffer. A budget trip lands here,
-    /// so an over-budget xact produces several sealed parts rather than
-    /// one streamed-but-unconfirmed part — the buffer never holds
-    /// shipped-but-unacked rows that a disconnect would lose.
-    async fn flush_table(&mut self, key: &str) -> Result<(), EmitterError> {
-        self.open_wire(key).await?;
-        self.close_current_wire().await
-    }
-
-    /// Per-xact landmark. In hold-open mode rows from this xact stay
-    /// buffered in their [`TableEncoder`]s, sharing the next flush
-    /// window with later xacts — nothing ships until a budget trip or
-    /// the deadline seals a complete INSERT. In legacy mode (or when
-    /// the deadline has tripped) seals every buffered table now and
-    /// drains each to `EndOfStream`. Either way, returns the highest
-    /// `commit_lsn` now known durable on CH.
-    ///
-    /// `xact_buffer`'s `emitter_ack_lsn` tracks the returned value,
-    /// not the input `commit_lsn`, so hold-open shows up as
-    /// `emitter_ack_lsn` lagging `drain_lsn` until the next seal.
-    async fn on_xact_end_with_lsn(&mut self, commit_lsn: u64) -> Result<u64, EmitterError> {
-        let now = Instant::now();
-        let deadline_tripped = self.flush_deadline.is_some_and(|d| now >= d);
-        if deadline_tripped {
-            self.stats
-                .flush_deadline_trips
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let must_close = self.config.flush_timeout.is_zero() || deadline_tripped;
-        if must_close {
-            self.close_all_open_inserts().await?;
-        } else if self.flush_deadline.is_none() && self.tables.values().any(|e| e.rows > 0) {
-            // Hold-open: rows queued from this xact share the next
-            // flush window with subsequent xacts. Pure-NOOP commit
-            // (route never reached append_row because every relation
-            // was unmapped) leaves the deadline unset so an idle slot
-            // doesn't tick on phantom traffic.
-            self.flush_deadline = Some(Instant::now() + self.config.flush_timeout);
-        }
-        // Durable horizon can move only when nothing is buffered client-
-        // side. In hold-open mode this falls through until the deadline
-        // trips and `close_all_open_inserts` promotes; legacy mode
-        // closes inside `must_close` above so this catches the empty-xact
-        // case (heap touched only unmapped relations or pure DDL).
-        if self.wire_open_key.is_none() && self.tables.values().all(|e| e.rows == 0) {
-            self.last_durable_commit_lsn = self
-                .last_durable_commit_lsn
-                .max(self.pending_max_commit_lsn)
-                .max(commit_lsn);
-            self.pending_max_commit_lsn = 0;
-        }
-        self.current_xid = None;
-        self.stats.xacts_committed.fetch_add(1, Ordering::Relaxed);
-        Ok(self.last_durable_commit_lsn)
-    }
-
-    /// Seal every table with buffered rows as its own complete INSERT
-    /// (each `flush_table` opens, ships, and drains to `EndOfStream`),
-    /// then promote `pending_max_commit_lsn` to
-    /// `last_durable_commit_lsn` and reset the flush window. The
-    /// promotion is safe only because every buffer is now drained — the
-    /// durable horizon never moves past a still-buffered row. Called
-    /// from [`Self::on_xact_end_with_lsn`] on deadline trip or legacy
-    /// per-xact close, and from [`Self::flush_open_inserts`] for
-    /// explicit shutdown flush.
-    async fn close_all_open_inserts(&mut self) -> Result<(), EmitterError> {
-        let keys: Vec<String> = self
-            .tables
-            .iter()
-            .filter(|(_, enc)| enc.rows > 0)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in keys {
-            self.flush_table(&key).await?;
-        }
-        // Each flush_table already closed its wire; this is a defensive
-        // no-op for a wire left open by a non-flush path (e.g. TRUNCATE
-        // ordering). Empty encoders stay around so the next flush window
-        // reuses the ColumnBuf allocations + cached TablePlan.
-        self.close_current_wire().await?;
-        self.last_durable_commit_lsn = self
-            .last_durable_commit_lsn
-            .max(self.pending_max_commit_lsn);
-        self.pending_max_commit_lsn = 0;
-        self.flush_deadline = None;
-        Ok(())
-    }
-
-    /// Explicit flush of every open INSERT — for shutdown paths.
-    /// Equivalent to a deadline trip but doesn't require routing a
-    /// synthetic xact. Returns the post-flush durable horizon.
-    pub async fn flush_open_inserts(&mut self) -> Result<u64, EmitterError> {
-        self.close_all_open_inserts().await?;
-        Ok(self.last_durable_commit_lsn)
-    }
-
-    /// Idle-tick variant: closes only when [`Self::flush_deadline`]
-    /// has elapsed. Cheap to call on every wakeup since the common
-    /// case is "deadline not yet set" (no rows held) or "deadline
-    /// still in the future" (recently opened). Counted under
-    /// `flush_deadline_trips` on close.
-    pub async fn flush_if_deadline_tripped(&mut self) -> Result<u64, EmitterError> {
-        if self.flush_deadline.is_some_and(|d| Instant::now() >= d) {
-            self.stats
-                .flush_deadline_trips
-                .fetch_add(1, Ordering::Relaxed);
-            self.close_all_open_inserts().await?;
-        }
-        Ok(self.last_durable_commit_lsn)
-    }
-
-    /// Bounded-retry wrapper around [`Self::flush_if_deadline_tripped`].
-    /// Mirrors [`Self::on_xact_end_with_retry`].
-    pub async fn flush_if_deadline_tripped_with_retry(&mut self) -> Result<u64, EmitterError> {
-        with_reconnect_retry!(self, self.flush_if_deadline_tripped().await)
-    }
-
-    /// Bounded-retry wrapper around [`Self::flush_open_inserts`].
-    /// Called from the daemon shutdown path.
-    pub async fn flush_open_inserts_with_retry(&mut self) -> Result<u64, EmitterError> {
-        with_reconnect_retry!(self, self.flush_open_inserts().await)
-    }
-
-    /// Read-only snapshot of the durable horizon. Cheap; the
-    /// xact_buffer doesn't poll this (it threads ack through
-    /// [`TupleObserver::on_xact_end`]), but external probes (status
-    /// line, metrics) can use it.
-    pub fn last_durable_commit_lsn(&self) -> u64 {
-        self.last_durable_commit_lsn
-    }
-
-    /// Ceiling for an idle-advance ack at `lsn`. When nothing is
-    /// buffered client-side (no open wire, every encoder empty), `lsn`
-    /// is fully durable-safe — trailing WAL past the last commit carries
-    /// no rows to ship. Otherwise cap at `last_durable_commit_lsn` so a
-    /// quiescent-tick nudge can't promote the ack past rows still held
-    /// in open INSERTs. Mirrors the guard in `on_xact_end_with_lsn`.
-    pub fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
-        let fully_drained =
-            self.wire_open_key.is_none() && self.tables.values().all(|e| e.rows == 0);
-        idle_ceiling(fully_drained, lsn, self.last_durable_commit_lsn)
-    }
-
-    /// Reconnect: open a fresh [`AsyncClient`] against the same
-    /// `(host, port)` (which owns its own `tokio` socket + `Codec`) and
-    /// hot-swap `self.client` while preserving the per-table accumulator
-    /// state in `self.tables`. The fresh connection has nothing open, so
-    /// [`Self::wire_open_key`] clears and the next [`Self::flush_table`]
-    /// re-`send_query`s on demand.
-    pub async fn reconnect(&mut self) -> Result<(), EmitterError> {
-        self.client = connect_client(&self.config).await?;
-        self.wire_open_key = None;
-        self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Wrap [`Self::route`] in bounded reconnect+retry per
-    /// [`EmitterConfig::retry`]. Used by [`EmitterObserver::on_tuple`].
-    /// Retry preserves the per-xact buffer state in `self.tables`, so
-    /// a CH bounce mid-xact still lets the surviving buffered rows
-    /// flush through the new connection.
-    pub async fn route_with_retry(
-        &mut self,
-        committed: &CommittedTuple,
-    ) -> Result<(), EmitterError> {
-        with_reconnect_retry!(self, self.route(committed).await)
-    }
-
-    /// Dispatch a [`SchemaEvent`] to the in-process
-    /// applicator. Closes the open INSERT for the AFFECTED relation
-    /// first (`send_data_end()` + drain → durable on CH) so the CH
-    /// ALTER doesn't race against a still-buffered INSERT against the
-    /// pre-DDL shape. Re-encoding for the post-DDL shape happens
-    /// lazily on the next `route` call — the per-relation
-    /// [`TablePlan`] is dropped from `tables` so the next row rebuilds
-    /// it off the fresh descriptor.
-    ///
-    /// Surgical close (this table only) keeps other tables' open
-    /// INSERTs intact — important for the multi-table-per-xact path
-    /// (pgbench's TPC-B writes 4 tables per xact) where closing-all
-    /// would break the cross-INSERT pipeline.
-    ///
-    /// Schema events on unmapped relations still route through the
-    /// applicator (CREATE TABLE auto-discovery for namespace-pattern
-    /// matched relations); the applicator handles the no-mapping case
-    /// internally.
-    pub async fn dispatch_schema_event(&mut self, event: &SchemaEvent) -> Result<(), EmitterError> {
-        let affected: Option<String> = match event {
-            SchemaEvent::Added { desc } => Some(desc.qualified_name.as_ref().to_owned()),
-            SchemaEvent::Changed { new, .. } => Some(new.qualified_name.as_ref().to_owned()),
-            SchemaEvent::Dropped { qualified_name, .. } => Some(qualified_name.as_ref().to_owned()),
-        };
-        if let Some(key) = affected.as_deref() {
-            if self.tables.get(key).is_some_and(|e| e.rows > 0) {
-                self.flush_table(key).await?;
-            }
-            if self.wire_open_key.as_deref() == Some(key) {
-                self.close_current_wire().await?;
-            }
-            self.tables.remove(key);
-        }
-        if let Some(app) = self.applicator.as_mut() {
-            app.apply(event).await?;
-        }
-        Ok(())
-    }
-
-    /// Bounded-retry wrapper around [`Self::dispatch_schema_event`].
-    /// DDL failures retry through `reconnect_applicator` (today: just
-    /// surface the error — the applicator's CH connection lives on a
-    /// separate TCP and reconnect is operator-quiesced).
-    pub async fn dispatch_schema_event_with_retry(
-        &mut self,
-        event: &SchemaEvent,
-    ) -> Result<(), EmitterError> {
-        // Currently no retry — DDL errors poison the stream so the
-        // operator sees them. Bounded reconnect for the DDL connection
-        // may come later.
-        self.dispatch_schema_event(event).await
-    }
-
-    /// Wrap [`Self::on_xact_end_with_lsn`] in bounded reconnect+retry.
-    /// Same shape as [`Self::route_with_retry`] — see notes there.
-    pub async fn on_xact_end_with_retry(&mut self, commit_lsn: u64) -> Result<u64, EmitterError> {
-        with_reconnect_retry!(self, self.on_xact_end_with_lsn(commit_lsn).await)
-    }
-}
-
-/// Classify a failure as transient (worth a reconnect+retry) or fatal.
-/// IO, clickhouse-c protocol, and ServerException are all transient at
-/// the network/server level — operators tune `retry.max_attempts` to
-/// bound the total wall-time. Config / Type / Catalog /
-/// UnsupportedValue stay fatal because they encode bugs in the daemon
-/// or mapping; retrying would loop forever.
-/// Pure core of [`Emitter::idle_ack_ceiling`]: when the emitter is
-/// fully drained (no open wire, every encoder empty) trailing WAL is
-/// shippable-free so `lsn` is safe; otherwise cap at the durable
-/// horizon so an idle nudge can't ack rows still buffered client-side.
-fn idle_ceiling(fully_drained: bool, lsn: u64, durable: u64) -> u64 {
-    if fully_drained { lsn } else { durable }
 }
 
 pub(crate) fn is_retryable(e: &EmitterError) -> bool {
@@ -1980,107 +1335,6 @@ pub(crate) fn is_retryable(e: &EmitterError) -> bool {
             | EmitterError::ServerException { .. }
             | EmitterError::Timeout { .. }
     )
-}
-
-/// Plug Emitter into the [`TupleObserver`] dispatch path. Owned by
-/// `XactRecordSink<EmitterObserver>` in `bin/stream.rs`.
-pub struct EmitterObserver {
-    pub emitter: Emitter,
-}
-
-impl EmitterObserver {
-    pub fn new(emitter: Emitter) -> Self {
-        Self { emitter }
-    }
-
-    pub fn stats_handle(&self) -> Arc<EmitterStats> {
-        self.emitter.stats_handle()
-    }
-}
-
-impl TupleObserver for EmitterObserver {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a CommittedTuple,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.emitter
-                .route_with_retry(committed)
-                .await
-                .map_err(DecoderSinkError::from)
-        })
-    }
-
-    fn on_xact_end<'a>(
-        &'a mut self,
-        commit_lsn: u64,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.emitter
-                .on_xact_end_with_retry(commit_lsn)
-                .await
-                .map_err(DecoderSinkError::from)
-        })
-    }
-
-    fn on_schema_event<'a>(
-        &'a mut self,
-        event: &'a SchemaEvent,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.emitter
-                .dispatch_schema_event_with_retry(event)
-                .await
-                .map_err(DecoderSinkError::from)
-        })
-    }
-
-    fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
-        self.emitter.idle_ack_ceiling(lsn)
-    }
-
-    /// Idle wakeup: close any held-open INSERT whose deadline has
-    /// elapsed. Hot path when `flush_timeout > 0` and traffic stops —
-    /// without this the last burst of rows would stay buffered
-    /// client-side past the deadline, since `on_xact_end` only fires
-    /// per committed xact. Returns the post-close durable horizon so
-    /// the xact buffer advances `emitter_ack_lsn` to it.
-    fn on_idle<'a>(
-        &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.emitter
-                .flush_if_deadline_tripped_with_retry()
-                .await
-                .map_err(DecoderSinkError::from)
-        })
-    }
-
-    /// Daemon shutdown hook: force-close every held-open INSERT
-    /// regardless of deadline. Any rows still in flight when the
-    /// daemon stops would otherwise stay buffered client-side and
-    /// disappear when the process exits.
-    fn on_close<'a>(
-        &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), DecoderSinkError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.emitter
-                .flush_open_inserts_with_retry()
-                .await
-                .map_err(DecoderSinkError::from)?;
-            Ok(())
-        })
-    }
 }
 
 // `ColumnBuf` Debug — used by error paths that want to surface what
@@ -2128,14 +1382,6 @@ mod tests {
     use super::*;
     use crate::heap_decoder::{DecodedHeap, DecodedTuple};
     use wal_rs::pg::walparser::RelFileNode;
-
-    #[test]
-    fn idle_ceiling_caps_when_buffered() {
-        // Fully drained: trailing WAL past the durable horizon is safe.
-        assert_eq!(idle_ceiling(true, 500, 300), 500);
-        // Rows held (open wire or non-empty encoder): cap at durable.
-        assert_eq!(idle_ceiling(false, 500, 300), 300);
-    }
 
     #[test]
     fn decimal_type_error_wraps_message_in_type_variant() {

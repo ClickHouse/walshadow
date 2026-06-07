@@ -17,8 +17,8 @@
 //!         --bootstrap-mode=object_store
 //!         --bootstrap-object-store-prefix=file://<tmpdir>/wal-g (env)
 //!         --bootstrap-backup-name=<resolved>
-//!     → ObjectStoreSource → MultiplexSink → drain_backfill
-//!     → transitional CH Emitter → default.t
+//!     → ObjectStoreSource → MultiplexSink → pipeline::bootstrap::drain
+//!     → shared tail (batcher + inserter pool + ack) → default.t
 //!     → autospawn shadow PG against bootstrap_shadow_data_dir
 //!     → WAL pump main loop
 //!   → assert_ch_matches_source(ch, source, "s14.t", "default.t")

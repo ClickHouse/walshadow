@@ -192,6 +192,7 @@ async fn run_drill<F: FnOnce(&Shadow) -> std::thread::JoinHandle<()>>(
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay catches up");
     assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
 
     // Stop shadow now so its leftover postmaster doesn't outlive tempdir.
     let _ = shadow.stop();
