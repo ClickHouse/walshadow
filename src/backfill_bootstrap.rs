@@ -516,9 +516,16 @@ mod tests {
                 let mut g = sink.lock().unwrap();
                 g.start(&self.start)?;
             }
-            for (meta, body) in &self.files {
+            for (i, (meta, body)) in self.files.iter().enumerate() {
                 let mut cur: &[u8] = body;
-                crate::backup_source::pump_entry(&mut cur, meta, &data_dir, &sink).await?;
+                crate::backup_source::pump_entry(
+                    &mut cur,
+                    meta,
+                    &data_dir,
+                    &sink,
+                    crate::backup_source::EntryId(i as u64),
+                )
+                .await?;
             }
             {
                 let mut g = sink.lock().unwrap();

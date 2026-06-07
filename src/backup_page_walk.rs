@@ -35,7 +35,9 @@ use tokio::sync::mpsc;
 use wal_rs::pg::walparser::{Oid, RelFileNode};
 
 use crate::backup_sink::parse_base_path;
-use crate::backup_source::{BackupSink, EndInfo, FileAction, FileKind, FileMeta, StartInfo};
+use crate::backup_source::{
+    BackupSink, EndInfo, EntryId, FileAction, FileKind, FileMeta, StartInfo,
+};
 use crate::heap_decoder::{ColumnValue, DecodeError, decode_block_data};
 use crate::shadow_catalog::RelDescriptor;
 
@@ -329,8 +331,12 @@ pub struct PageWalkSink {
     out_tx: Option<mpsc::UnboundedSender<BackfillTuple>>,
     /// Test-only capture, populated when `out_tx` is None.
     pub captured: Vec<BackfillTuple>,
-    /// State carried between begin / chunk / end for the current entry.
-    cur: Option<TapEntry>,
+    /// Per-entry state carried between begin / chunk / end, keyed by the
+    /// source-allocated `EntryId`. A map, not one slot, because
+    /// object_store fan-out interleaves `begin`/`chunk` across concurrent
+    /// parts; one slot would let part B's `begin` clobber the entry part
+    /// A is mid-stream on, mis-framing pages and misattributing rfns.
+    cur: HashMap<EntryId, TapEntry>,
 }
 
 struct TapEntry {
@@ -359,7 +365,7 @@ impl PageWalkSink {
             stats: PageWalkStats::default(),
             out_tx: Some(out_tx),
             captured: Vec::new(),
-            cur: None,
+            cur: HashMap::new(),
         }
     }
 
@@ -373,7 +379,7 @@ impl PageWalkSink {
             stats: PageWalkStats::default(),
             out_tx: None,
             captured: Vec::new(),
-            cur: None,
+            cur: HashMap::new(),
         }
     }
 
@@ -389,22 +395,23 @@ impl PageWalkSink {
         parse_base_path(&meta.path)
     }
 
-    fn flush_full_pages(&mut self) -> io::Result<()> {
+    fn flush_full_pages(&mut self, id: EntryId) -> io::Result<()> {
         loop {
-            let entry = match self.cur.as_mut() {
-                Some(e) => e,
-                None => return Ok(()),
-            };
-            if entry.page_buf.len() < PAGE_BYTES {
-                return Ok(());
-            }
             // Steal the page out so we can drop the entry borrow before
-            // calling out_tx.send
-            let block_no = entry.block_no;
-            entry.block_no = entry.block_no.saturating_add(1);
-            let is_toast = entry.is_toast;
-            let desc_opt = entry.desc.clone();
-            let page: Vec<u8> = entry.page_buf.drain(..PAGE_BYTES).collect();
+            // touching self.stats / out_tx.send
+            let (block_no, is_toast, desc_opt, page) = {
+                let entry = match self.cur.get_mut(&id) {
+                    Some(e) => e,
+                    None => return Ok(()),
+                };
+                if entry.page_buf.len() < PAGE_BYTES {
+                    return Ok(());
+                }
+                let block_no = entry.block_no;
+                entry.block_no = entry.block_no.saturating_add(1);
+                let page: Vec<u8> = entry.page_buf.drain(..PAGE_BYTES).collect();
+                (block_no, entry.is_toast, entry.desc.clone(), page)
+            };
 
             if is_toast {
                 // V1: count the page, skip decode. WAL-side TOAST work
@@ -454,7 +461,7 @@ impl BackupSink for PageWalkSink {
         Ok(())
     }
 
-    fn begin(&mut self, meta: &FileMeta) -> io::Result<FileAction> {
+    fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
         let Some((db, rel)) = self.classify(meta) else {
             // Path doesn't parse as base/<db>/<filenode> — refuse Tap;
             // multiplex sink will fall back to lander.
@@ -470,30 +477,30 @@ impl BackupSink for PageWalkSink {
         } else {
             self.stats.files_skipped_unknown_filenode += 1;
         }
-        self.cur = Some(TapEntry {
-            block_no: 0,
-            page_buf: Vec::with_capacity(PAGE_BYTES * 2),
-            is_toast,
-            desc,
-        });
+        self.cur.insert(
+            entry,
+            TapEntry {
+                block_no: 0,
+                page_buf: Vec::with_capacity(PAGE_BYTES * 2),
+                is_toast,
+                desc,
+            },
+        );
         Ok(FileAction::Tap)
     }
 
-    fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        {
-            let entry = self
-                .cur
-                .as_mut()
-                .ok_or_else(|| io::Error::other("PageWalkSink: chunk before begin"))?;
-            entry.page_buf.extend_from_slice(bytes);
+    fn chunk(&mut self, entry: EntryId, bytes: &[u8]) -> io::Result<()> {
+        match self.cur.get_mut(&entry) {
+            Some(e) => e.page_buf.extend_from_slice(bytes),
+            None => return Err(io::Error::other("PageWalkSink: chunk before begin")),
         }
-        self.flush_full_pages()?;
+        self.flush_full_pages(entry)?;
         Ok(())
     }
 
-    fn end(&mut self) -> io::Result<()> {
-        if let Some(entry) = self.cur.take() {
-            let trailing = entry.page_buf.len() as u64;
+    fn end(&mut self, entry: EntryId) -> io::Result<()> {
+        if let Some(e) = self.cur.remove(&entry) {
+            let trailing = e.page_buf.len() as u64;
             if trailing > 0 {
                 // PG heap files are always page-aligned; trailing
                 // partial-page bytes are zero-padding or anomalous.
@@ -702,13 +709,14 @@ mod tests {
             mode: 0o600,
             kind: FileKind::File,
         };
-        let action = sink.begin(&meta).unwrap();
+        let id = EntryId(0);
+        let action = sink.begin(id, &meta).unwrap();
         assert_eq!(action, FileAction::Tap);
         let page = synth_single_tuple_page(99);
         // Feed in two chunks to exercise the buffer-across-chunk path
-        sink.chunk(&page[..4096]).unwrap();
-        sink.chunk(&page[4096..]).unwrap();
-        sink.end().unwrap();
+        sink.chunk(id, &page[..4096]).unwrap();
+        sink.chunk(id, &page[4096..]).unwrap();
+        sink.end(id).unwrap();
         sink.finish(&EndInfo {
             end_lsn: 0,
             timeline: 1,
@@ -752,10 +760,11 @@ mod tests {
             mode: 0o600,
             kind: FileKind::File,
         };
-        let action = sink.begin(&meta).unwrap();
+        let id = EntryId(0);
+        let action = sink.begin(id, &meta).unwrap();
         assert_eq!(action, FileAction::Tap);
-        sink.chunk(&synth_single_tuple_page(7)).unwrap();
-        sink.end().unwrap();
+        sink.chunk(id, &synth_single_tuple_page(7)).unwrap();
+        sink.end(id).unwrap();
         // Tuple decoding skipped because no RelDescriptor; stat
         // reflects unknown filenode
         assert!(sink.captured.is_empty());
@@ -781,6 +790,66 @@ mod tests {
             mode: 0,
             kind: FileKind::File,
         };
-        assert_eq!(sink.begin(&meta).unwrap(), FileAction::Skip);
+        assert_eq!(sink.begin(EntryId(0), &meta).unwrap(), FileAction::Skip);
+    }
+
+    /// object_store fan-out interleaves begin/chunk across concurrent
+    /// parts on the one shared sink (the mutex is released across each
+    /// body read). Per-entry keying must keep each file's page-walk
+    /// state separate; a single `cur` slot let a later `begin` clobber
+    /// the entry an earlier file was mid-stream on, misframing pages and
+    /// decoding them against the wrong relation. Drives two entries with
+    /// out-of-order, interleaved begin/chunk/end.
+    #[test]
+    fn interleaved_entries_keep_independent_state() {
+        let mut catalog = CatalogMap::new();
+        let rel_a = make_rel(); // rfn 1663/5/16400
+        let mut rel_b = make_rel();
+        rel_b.rfn.rel_node = 16401;
+        rel_b.oid = 16401;
+        catalog.insert(Arc::new(rel_a));
+        catalog.insert(Arc::new(rel_b));
+        let mut sink = PageWalkSink::new_capturing(catalog);
+        sink.start(&StartInfo {
+            start_lsn: 0x1000,
+            timeline: 1,
+            tablespaces: Vec::new(),
+        })
+        .unwrap();
+
+        let meta_a = FileMeta {
+            path: PathBuf::from("base/5/16400"),
+            size: PAGE_BYTES as u64,
+            mode: 0o600,
+            kind: FileKind::File,
+        };
+        let meta_b = FileMeta {
+            path: PathBuf::from("base/5/16401"),
+            size: PAGE_BYTES as u64,
+            mode: 0o600,
+            kind: FileKind::File,
+        };
+        let (a, b) = (EntryId(0), EntryId(1));
+
+        // Both open before either streams; chunks arrive in the opposite
+        // order; ends interleave too — the worst case for a shared slot.
+        assert_eq!(sink.begin(a, &meta_a).unwrap(), FileAction::Tap);
+        assert_eq!(sink.begin(b, &meta_b).unwrap(), FileAction::Tap);
+        sink.chunk(b, &synth_single_tuple_page(200)).unwrap();
+        sink.chunk(a, &synth_single_tuple_page(100)).unwrap();
+        sink.end(a).unwrap();
+        sink.end(b).unwrap();
+
+        // Each tuple must carry its own file's rfn + value, not the
+        // other's. A shared slot would attribute both to rel B.
+        let mut by_rel: HashMap<Oid, i32> = HashMap::new();
+        for t in &sink.captured {
+            if let Some(Some(ColumnValue::Int4(v))) = t.columns.first() {
+                by_rel.insert(t.rfn.rel_node, *v);
+            }
+        }
+        assert_eq!(sink.captured.len(), 2);
+        assert_eq!(by_rel.get(&16400), Some(&100), "entry A decoded vs rel A");
+        assert_eq!(by_rel.get(&16401), Some(&200), "entry B decoded vs rel B");
     }
 }

@@ -31,7 +31,9 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
-use crate::backup_source::{BackupSink, EndInfo, FileAction, FileKind, FileMeta, StartInfo};
+use crate::backup_source::{
+    BackupSink, EndInfo, EntryId, FileAction, FileKind, FileMeta, StartInfo,
+};
 use crate::classify::FIRST_NORMAL_OBJECT_ID;
 
 /// System-dir denylist mirroring `wal_rs::pg::backup::SYSTEM_DIRS_DENYLIST`.
@@ -194,7 +196,7 @@ pub enum DiskAction {
 }
 
 impl BackupSink for DiskLanderSink {
-    fn begin(&mut self, meta: &FileMeta) -> io::Result<FileAction> {
+    fn begin(&mut self, _entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
         let action = match self.classify(meta) {
             DiskAction::Keep => FileAction::Keep,
             DiskAction::SkipDenylist | DiskAction::SkipUserHeap => FileAction::Skip,
@@ -214,14 +216,14 @@ impl BackupSink for DiskLanderSink {
         }
         Ok(action)
     }
-    fn chunk(&mut self, _bytes: &[u8]) -> io::Result<()> {
+    fn chunk(&mut self, _entry: EntryId, _bytes: &[u8]) -> io::Result<()> {
         // DiskLanderSink never returns Tap, so chunk() should never
         // fire. Surface a programming-error path here loudly.
         Err(io::Error::other(
             "DiskLanderSink::chunk called — sink only ever Keeps or Skips",
         ))
     }
-    fn end(&mut self) -> io::Result<()> {
+    fn end(&mut self, _entry: EntryId) -> io::Result<()> {
         Ok(())
     }
 }
@@ -235,7 +237,10 @@ impl BackupSink for DiskLanderSink {
 pub struct MultiplexSink<T> {
     lander: DiskLanderSink,
     tap: T,
-    routed_to_tap: bool,
+    /// Entries currently routed to the tap. A set, not one flag, so
+    /// concurrent entries (object_store fan-out) dispatch `chunk`/`end`
+    /// to the right inner sink instead of racing one shared bool.
+    tap_entries: HashSet<EntryId>,
 }
 
 impl<T: BackupSink> MultiplexSink<T> {
@@ -243,7 +248,7 @@ impl<T: BackupSink> MultiplexSink<T> {
         Self {
             lander,
             tap,
-            routed_to_tap: false,
+            tap_entries: HashSet::new(),
         }
     }
 
@@ -262,42 +267,42 @@ impl<T: BackupSink> BackupSink for MultiplexSink<T> {
         self.tap.start(info)?;
         Ok(())
     }
-    fn begin(&mut self, meta: &FileMeta) -> io::Result<FileAction> {
-        self.routed_to_tap = false;
+    fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
         let action = match self.lander.classify(meta) {
             DiskAction::Keep => {
-                self.lander.begin(meta)?;
+                self.lander.begin(entry, meta)?;
                 FileAction::Keep
             }
             DiskAction::SkipDenylist => {
-                self.lander.begin(meta)?;
+                self.lander.begin(entry, meta)?;
                 FileAction::Skip
             }
             DiskAction::SkipUserHeap => {
                 // User heap — flip to Tap if the inner sink accepts.
                 // Inner sink's begin() can decline by returning Skip /
                 // Keep, in which case we honour that.
-                let inner_action = self.tap.begin(meta)?;
-                self.routed_to_tap = inner_action == FileAction::Tap;
+                let inner_action = self.tap.begin(entry, meta)?;
+                if inner_action == FileAction::Tap {
+                    self.tap_entries.insert(entry);
+                }
                 inner_action
             }
         };
         Ok(action)
     }
-    fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if self.routed_to_tap {
-            self.tap.chunk(bytes)
+    fn chunk(&mut self, entry: EntryId, bytes: &[u8]) -> io::Result<()> {
+        if self.tap_entries.contains(&entry) {
+            self.tap.chunk(entry, bytes)
         } else {
             // Lander never asks for chunk; defensive
             Err(io::Error::other("MultiplexSink: chunk without active tap"))
         }
     }
-    fn end(&mut self) -> io::Result<()> {
-        if self.routed_to_tap {
-            self.tap.end()?;
-            self.routed_to_tap = false;
+    fn end(&mut self, entry: EntryId) -> io::Result<()> {
+        if self.tap_entries.remove(&entry) {
+            self.tap.end(entry)?;
         } else {
-            self.lander.end()?;
+            self.lander.end(entry)?;
         }
         Ok(())
     }
@@ -450,16 +455,16 @@ mod tests {
         bytes: u64,
     }
     impl BackupSink for CountingTap {
-        fn begin(&mut self, _meta: &FileMeta) -> io::Result<FileAction> {
+        fn begin(&mut self, _entry: EntryId, _meta: &FileMeta) -> io::Result<FileAction> {
             self.begins += 1;
             Ok(FileAction::Tap)
         }
-        fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+        fn chunk(&mut self, _entry: EntryId, bytes: &[u8]) -> io::Result<()> {
             self.chunks += 1;
             self.bytes += bytes.len() as u64;
             Ok(())
         }
-        fn end(&mut self) -> io::Result<()> {
+        fn end(&mut self, _entry: EntryId) -> io::Result<()> {
             self.ends += 1;
             Ok(())
         }
@@ -478,8 +483,8 @@ mod tests {
             mode: 0,
             kind: FileKind::File,
         };
-        assert_eq!(mux.begin(&m).unwrap(), FileAction::Keep);
-        mux.end().unwrap();
+        assert_eq!(mux.begin(EntryId(0), &m).unwrap(), FileAction::Keep);
+        mux.end(EntryId(0)).unwrap();
 
         // user heap → Tap
         let m = FileMeta {
@@ -488,10 +493,10 @@ mod tests {
             mode: 0,
             kind: FileKind::File,
         };
-        assert_eq!(mux.begin(&m).unwrap(), FileAction::Tap);
-        mux.chunk(&[0u8; 1024]).unwrap();
-        mux.chunk(&[1u8; 512]).unwrap();
-        mux.end().unwrap();
+        assert_eq!(mux.begin(EntryId(1), &m).unwrap(), FileAction::Tap);
+        mux.chunk(EntryId(1), &[0u8; 1024]).unwrap();
+        mux.chunk(EntryId(1), &[1u8; 512]).unwrap();
+        mux.end(EntryId(1)).unwrap();
 
         // denylist file → Skip, no tap
         let m = FileMeta {
@@ -500,8 +505,8 @@ mod tests {
             mode: 0,
             kind: FileKind::File,
         };
-        assert_eq!(mux.begin(&m).unwrap(), FileAction::Skip);
-        mux.end().unwrap();
+        assert_eq!(mux.begin(EntryId(2), &m).unwrap(), FileAction::Skip);
+        mux.end(EntryId(2)).unwrap();
 
         let (lander, tap) = mux.into_inner();
         assert_eq!(tap.begins, 1);
@@ -542,8 +547,8 @@ mod tests {
             mode: 0,
             kind: FileKind::File,
         };
-        assert_eq!(mux.begin(&m).unwrap(), FileAction::Keep);
-        mux.end().unwrap();
+        assert_eq!(mux.begin(EntryId(0), &m).unwrap(), FileAction::Keep);
+        mux.end(EntryId(0)).unwrap();
         // denylist file → Skip → skipped_denylist
         let m = FileMeta {
             path: PathBuf::from("pg_replslot/0/state"),
@@ -551,8 +556,8 @@ mod tests {
             mode: 0,
             kind: FileKind::File,
         };
-        assert_eq!(mux.begin(&m).unwrap(), FileAction::Skip);
-        mux.end().unwrap();
+        assert_eq!(mux.begin(EntryId(1), &m).unwrap(), FileAction::Skip);
+        mux.end(EntryId(1)).unwrap();
 
         let stats = mux.lander_stats();
         assert_eq!(stats.kept_files, 1);

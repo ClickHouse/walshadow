@@ -34,6 +34,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -90,6 +91,15 @@ pub enum FileAction {
     Tap,
 }
 
+/// Per-entry token the source allocates fresh per file and threads
+/// through `begin`/`chunk`/`end`. Sinks key per-entry state on it, so
+/// concurrent entries (object_store fan-out drains parts under
+/// `buffer_unordered`, releasing the sink mutex across each body read)
+/// keep independent state instead of clobbering one shared slot.
+/// Monotonic from a single counter per source run, so globally unique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EntryId(pub u64);
+
 /// Source-side invariants known before the first file event. Mirrors
 /// wal-rs `pg::replication::base_backup::StartInfo` so callers wired to
 /// wal-rs types don't translate. Cloned by value.
@@ -131,18 +141,20 @@ pub trait BackupSink: Send {
     }
 
     /// Routing decision. Implementations are expected to be cheap;
-    /// per-file dispatch is the hot path.
-    fn begin(&mut self, meta: &FileMeta) -> io::Result<FileAction>;
+    /// per-file dispatch is the hot path. `entry` keys any per-file
+    /// state the sink carries to `chunk`/`end`.
+    fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction>;
 
     /// Body bytes for a `Tap` entry. Called zero or more times in
-    /// arbitrary chunk sizes between `begin()` and `end()`. Sources
-    /// guarantee bytes are presented in file order; sink owns any
-    /// per-page / per-chunk framing.
-    fn chunk(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// arbitrary chunk sizes between `begin()` and `end()` for the same
+    /// `entry`. Sources guarantee bytes are presented in file order per
+    /// entry; sink owns any per-page / per-chunk framing. Calls for
+    /// distinct entries may interleave (object_store fan-out).
+    fn chunk(&mut self, entry: EntryId, bytes: &[u8]) -> io::Result<()>;
 
-    /// Closes the current file. Fires once per `begin()`, regardless of
-    /// the action returned.
-    fn end(&mut self) -> io::Result<()>;
+    /// Closes `entry`. Fires once per `begin()`, regardless of the
+    /// action returned.
+    fn end(&mut self, entry: EntryId) -> io::Result<()>;
 
     /// Fired once after the last file event.
     fn finish(&mut self, _info: &EndInfo) -> io::Result<()> {
@@ -225,6 +237,7 @@ pub(crate) async fn pump_tar_to_sink<R>(
     archive: &mut tokio_tar::Archive<R>,
     data_dir: &Path,
     sink: &Arc<Mutex<dyn BackupSink>>,
+    next_entry: &AtomicU64,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + Send,
@@ -237,7 +250,8 @@ where
         let Some(meta) = tar_entry_meta(&entry)? else {
             continue;
         };
-        pump_entry(&mut entry, &meta, data_dir, sink).await?;
+        let id = EntryId(next_entry.fetch_add(1, Ordering::Relaxed));
+        pump_entry(&mut entry, &meta, data_dir, sink, id).await?;
     }
     Ok(())
 }
@@ -250,6 +264,7 @@ pub(crate) async fn pump_entry<R>(
     meta: &FileMeta,
     data_dir: &Path,
     sink: &Arc<Mutex<dyn BackupSink>>,
+    entry: EntryId,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + ?Sized,
@@ -258,17 +273,17 @@ where
         let mut s = sink
             .lock()
             .map_err(|_| io::Error::other("sink mutex poisoned"))?;
-        s.begin(meta)?
+        s.begin(entry, meta)?
     };
     match action {
         FileAction::Keep => write_kept(body, meta, data_dir).await?,
         FileAction::Skip => drain_to_void(body).await?,
-        FileAction::Tap => stream_to_sink(body, meta, sink).await?,
+        FileAction::Tap => stream_to_sink(body, meta, sink, entry).await?,
     }
     let mut s = sink
         .lock()
         .map_err(|_| io::Error::other("sink mutex poisoned"))?;
-    s.end()
+    s.end(entry)
 }
 
 async fn drain_to_void<R>(body: &mut R) -> io::Result<()>
@@ -289,6 +304,7 @@ async fn stream_to_sink<R>(
     body: &mut R,
     meta: &FileMeta,
     sink: &Arc<Mutex<dyn BackupSink>>,
+    entry: EntryId,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + ?Sized,
@@ -306,7 +322,7 @@ where
         let mut s = sink
             .lock()
             .map_err(|_| io::Error::other("sink mutex poisoned"))?;
-        s.chunk(&buf[..n])?;
+        s.chunk(entry, &buf[..n])?;
     }
     Ok(())
 }
@@ -376,6 +392,7 @@ pub(crate) async fn emit_tablespace_symlink(
     tablespace: &Tablespace,
     data_dir: &Path,
     sink: &Arc<Mutex<dyn BackupSink>>,
+    entry: EntryId,
 ) -> io::Result<()> {
     if tablespace.is_default() {
         return Ok(());
@@ -389,7 +406,7 @@ pub(crate) async fn emit_tablespace_symlink(
         },
     };
     let mut body = tokio::io::empty();
-    pump_entry(&mut body, &meta, data_dir, sink).await
+    pump_entry(&mut body, &meta, data_dir, sink, entry).await
 }
 
 #[cfg(test)]
@@ -480,7 +497,7 @@ mod tests {
             });
             Ok(())
         }
-        fn begin(&mut self, meta: &FileMeta) -> io::Result<FileAction> {
+        fn begin(&mut self, _entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
             // Route catalogs Keep, denylist Skip, user heap Tap, rest Keep
             let s = meta.path.to_string_lossy();
             let action = if s.starts_with("pg_replslot/") {
@@ -502,14 +519,14 @@ mod tests {
             self.cur_tap = (action == FileAction::Tap).then(Vec::new);
             Ok(action)
         }
-        fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+        fn chunk(&mut self, _entry: EntryId, bytes: &[u8]) -> io::Result<()> {
             self.events.push(Event::Chunk { len: bytes.len() });
             if let Some(buf) = self.cur_tap.as_mut() {
                 buf.extend_from_slice(bytes);
             }
             Ok(())
         }
-        fn end(&mut self) -> io::Result<()> {
+        fn end(&mut self, _entry: EntryId) -> io::Result<()> {
             let path = self.cur_path.take().unwrap_or_default();
             if let Some(buf) = self.cur_tap.take() {
                 self.tapped.push((path.clone(), buf));
@@ -614,7 +631,8 @@ mod tests {
         let recording = Arc::new(Mutex::new(RecordingSink::default()));
         let sink: Arc<Mutex<dyn BackupSink>> = recording.clone();
         let mut archive = tokio_tar::Archive::new(std::io::Cursor::new(tar_bytes));
-        pump_tar_to_sink(&mut archive, data_dir, &sink)
+        let next_entry = AtomicU64::new(0);
+        pump_tar_to_sink(&mut archive, data_dir, &sink, &next_entry)
             .await
             .unwrap();
 
