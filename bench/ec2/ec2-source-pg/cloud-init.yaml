@@ -1,0 +1,69 @@
+#cloud-config
+# Provisions the walshadow "source" Postgres on a fresh Ubuntu host:
+# installs Docker, then runs postgres:17-bookworm with wal_level=logical
+# and the init/source scripts (demo.users seed + replication HBA),
+# mirroring the `source` service in docker/docker-compose.yml.
+write_files:
+  - path: /opt/walshadow/init/source/00-hba.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      echo "host replication all all trust" >> "$PGDATA/pg_hba.conf"
+  - path: /opt/walshadow/init/source/01-schema.sql
+    permissions: '0644'
+    content: |
+      CREATE SCHEMA IF NOT EXISTS demo;
+      CREATE TABLE demo.users (
+          id    bigint PRIMARY KEY,
+          name  text NOT NULL,
+          email text NOT NULL
+      );
+      ALTER TABLE demo.users REPLICA IDENTITY FULL;
+      INSERT INTO demo.users (id, name, email) VALUES
+          (1, 'Opifex',     'opifex@rerum.novarum'),
+          (2, 'Dominus',    'dominus@rerum.novarum'),
+          (3, 'Respublica', 'respublica@rerum.novarum');
+  - path: /opt/walshadow/init/source/02-pgbench.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      [ -n "${WALSHADOW_DEMO_PGBENCH:-}" ] || exit 0
+      SCALE="${PGBENCH_SCALE:-1}"
+      pgbench -i -s "$SCALE" -q -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+      psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
+      ALTER TABLE pgbench_accounts REPLICA IDENTITY FULL;
+      ALTER TABLE pgbench_branches REPLICA IDENTITY FULL;
+      ALTER TABLE pgbench_tellers  REPLICA IDENTITY FULL;
+      ALTER TABLE pgbench_history  REPLICA IDENTITY FULL;
+      SQL
+      echo "walshadow-demo: pgbench schema seeded (scale=$SCALE)"
+runcmd:
+  - export DEBIAN_FRONTEND=noninteractive
+  - apt-get update
+  - apt-get install -y ca-certificates curl
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu
+  - docker volume create source-data
+  - >
+    docker run -d --name source --restart unless-stopped
+    -p 5432:5432
+    -e POSTGRES_PASSWORD=postgres
+    -e POSTGRES_HOST_AUTH_METHOD=trust
+    -v /opt/walshadow/init/source:/docker-entrypoint-initdb.d:ro
+    -v source-data:/var/lib/postgresql/data
+    postgres:17-bookworm
+    postgres
+    -c wal_level=logical
+    -c max_wal_senders=8
+    -c max_replication_slots=8
+    -c wal_keep_size=128MB
+    -c wal_compression=lz4
+    -c listen_addresses='*'

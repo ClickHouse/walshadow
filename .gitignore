@@ -4,6 +4,7 @@ coverage/
 preprocessed_configs/
 /results
 /access
+/bench/results/
 pgext/out/
 pgext/log/
 

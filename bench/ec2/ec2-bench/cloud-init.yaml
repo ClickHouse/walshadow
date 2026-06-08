@@ -1,0 +1,21 @@
+#cloud-config
+# Provisions the in-VPC benchmark-runner host: installs Docker only. deploy.sh
+# ships the walshadow-bench image + the instances' state.env files and installs
+# a `walshadow-ec2-bench` wrapper that runs the bench in a host-network container
+# (so it reaches the source/ClickHouse/standby over the VPC at low RTT).
+runcmd:
+  - export DEBIAN_FRONTEND=noninteractive
+  - apt-get update
+  - apt-get install -y ca-certificates curl
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu
+  # Keep interactive SSH sessions alive through idle NAT/firewall timeouts
+  # (server sends a probe every 30s; tolerates long idle before dropping).
+  - printf 'ClientAliveInterval 30\nClientAliveCountMax 1000\n' > /etc/ssh/sshd_config.d/99-keepalive.conf
+  - systemctl reload ssh 2>/dev/null || systemctl reload sshd || true
