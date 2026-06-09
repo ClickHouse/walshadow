@@ -1,31 +1,18 @@
 //! Differential decode oracle backed by shadow PG.
 //!
-//! Two roles:
-//!
-//! 1. **PgPending resolver.** When the decoder emits
-//!    [`ColumnValue::PgPending`]
-//!    for a varlena type outside walshadow's local matrix
+//! 1. PgPending resolver: for varlena types outside walshadow's local matrix
 //!    (`jsonb`, arrays, `tsvector`, ranges, custom domains, ...),
-//!    [`Oracle::resolve_pending`] runs
-//!    `walshadow_decode_disk(oid, bytea) -> text` on shadow PG. Output
-//!    replaces the `PgPending` with a [`ColumnValue::Text`] so the
-//!    emitter can ship it as a CH `String`. When the
-//!    `walshadow` extension is **absent** the resolver returns
-//!    `Ok(None)` and the emitter falls back to writing the raw on-disk
-//!    bytes — i.e. the extension is optional.
+//!    [`Oracle::resolve_pending`] runs `walshadow_decode_disk(oid, bytea) -> text`
+//!    on shadow PG, replacing PgPending with [`ColumnValue::Text`]. Extension is
+//!    optional: when absent resolver returns `Ok(None)` and emitter ships raw
+//!    on-disk bytes.
+//! 2. 1-in-N validator: sampled Tier 3 codec values (`numeric`/`inet`/`interval`)
+//!    cross-checked against shadow PG's typoutput. Mismatches counted + logged,
+//!    row still ships (watchdog, not gate). Off by default, `--validate <N>`.
 //!
-//! 2. **1-in-N validator.** Sampled rows from the local Tier 3 codecs
-//!    (`numeric` / `inet` / `interval`) round-trip through shadow PG
-//!    via `SELECT $1::bytea::<typname>::text`. Mismatches bump
-//!    `mismatches` and log; the row still goes out to CH (validator is
-//!    a watchdog, not a gate). Off by default; enabled with
-//!    `walshadow-stream --validate <N>`.
-//!
-//! Sits next to [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog)
-//! — it reuses the same tokio-postgres connection model but doesn't
-//! share the catalog's `Client` (the oracle's queries don't need to
-//! observe replay-LSN gating and shouldn't pessimise the catalog's
-//! query-one path).
+//! Separate `Client` from [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog):
+//! oracle queries don't observe replay-LSN gating and mustn't pessimise the
+//! catalog's query-one path.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -50,26 +37,22 @@ pub enum OracleError {
 }
 
 crate::atomic_stats! {
-    /// Oracle resolver/validator counters. Mutations via
-    /// `fetch_add(_, Relaxed)`; reads via `.load(Relaxed)` at the use site.
     pub struct OracleStats {
-        /// `walshadow_decode_disk` calls that returned a text payload.
+        /// `walshadow_decode_disk` calls returning a text payload
         pub resolved,
-        /// `walshadow_decode_disk` calls returning NULL or absent-extension.
+        /// `walshadow_decode_disk` calls returning NULL or absent-extension
         pub fallback_raw,
-        /// 1-in-N samples taken (Tier 3 hot types only).
         pub probes,
-        /// Probe outcomes that matched the local decoder.
         pub matches,
-        /// Probe outcomes where local decoder text != shadow PG text.
+        /// local decoder text != shadow PG text
         pub mismatches,
-        /// SQL / connection errors collapsed into a single bucket.
+        /// SQL / connection errors, single bucket
         pub errors,
     }
 }
 
-/// Sampler tracks 1-in-N selection across calls. Lock-free counter so
-/// multiple decoder workers can share one `Oracle` without serialising.
+/// 1-in-N selection. Lock-free counter so decoder workers share one `Oracle`
+/// without serialising.
 #[derive(Debug)]
 pub struct Sampler {
     rate: u32,
@@ -84,8 +67,7 @@ impl Sampler {
         }
     }
 
-    /// `true` iff this call counts as the next 1-in-N hit. `rate == 0`
-    /// means sampling disabled.
+    /// `rate == 0` disables sampling
     pub fn pick(&self) -> bool {
         if self.rate == 0 {
             return false;
@@ -104,9 +86,8 @@ pub struct Oracle {
 }
 
 impl Oracle {
-    /// Connect to shadow PG and probe for the `walshadow`
-    /// extension. Absence is not a failure: the resolver returns
-    /// `Ok(None)` thereafter, which signals "fall back to raw bytes".
+    /// Connect to shadow PG, probe for `walshadow` extension. Absence not a
+    /// failure: resolver returns `Ok(None)` thereafter (fall back to raw bytes).
     pub async fn connect(conninfo: &str, sample_rate: u32) -> Result<Self, OracleError> {
         let (client, connection) = tokio_postgres::connect(conninfo, NoTls)
             .await
@@ -124,17 +105,14 @@ impl Oracle {
         })
     }
 
-    /// `true` iff the `walshadow` extension was visible at connect
-    /// time. Read by the daemon's status line so operators can confirm
-    /// the optional-extension contract on boot.
+    /// Extension visible at connect time. Daemon status line surfaces this so
+    /// operators confirm the optional-extension contract on boot.
     pub async fn has_extension(&self) -> bool {
         self.has_extension.lock().await.unwrap_or(false)
     }
 
-    /// Reconnect once on a closed connection. Mirrors
-    /// [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog)'s
-    /// `query_one_retry` pattern; sits in this module to keep the
-    /// oracle's pool independent of the catalog's.
+    /// Mirrors [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog)'s
+    /// `query_one_retry`; duplicated here to keep oracle's pool independent.
     async fn reconnect(&self) -> Result<(), OracleError> {
         let (client, connection) = tokio_postgres::connect(&self.conninfo, NoTls)
             .await
@@ -148,10 +126,8 @@ impl Oracle {
         Ok(())
     }
 
-    /// Run `walshadow_decode_disk(type_oid, raw)` and return the
-    /// resolved text. Returns `Ok(None)` when the extension is absent
-    /// (the emitter then falls back to raw bytes) or on a transient
-    /// error (logged via `stats.errors`).
+    /// `Ok(None)` when extension absent (emitter falls back to raw bytes) or on
+    /// transient error (counted via `stats.errors`).
     pub async fn resolve_pending(
         &self,
         type_oid: u32,
@@ -195,8 +171,7 @@ impl Oracle {
     }
 
     /// Cross-check a locally-decoded Tier 3 value against shadow PG's
-    /// own `typoutput`. Only fires on a sampler hit. Returns whether
-    /// the probe ran (informational; not used for control flow).
+    /// `typoutput`. Fires only on a sampler hit. Return value informational.
     pub async fn validate(&self, type_oid: u32, raw: &[u8], local_text: &str) -> bool {
         if !self.sampler.pick() {
             return false;
@@ -208,9 +183,8 @@ impl Oracle {
             | crate::heap_decoder::INTERVALOID
                 if self.has_extension().await =>
             {
-                // For local Tier 3 hot types we already have the same
-                // path the oracle uses: walshadow_decode_disk reconstructs
-                // the Datum then calls typoutput. Reuse it when present.
+                // walshadow_decode_disk reconstructs the Datum then calls
+                // typoutput, same path the resolver uses
                 "SELECT walshadow_decode_disk($1::oid, $2::bytea)"
             }
             _ => return false,
@@ -251,7 +225,6 @@ impl Oracle {
 }
 
 async fn probe_extension(client: &Client) -> Result<bool, OracleError> {
-    // `pg_proc` is in every PG; this query is cheap.
     let row = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'walshadow_decode_disk')",
@@ -262,9 +235,8 @@ async fn probe_extension(client: &Client) -> Result<bool, OracleError> {
     Ok(row.try_get::<_, bool>(0).unwrap_or(false))
 }
 
-/// Apply [`Oracle::resolve_pending`] across every column of a tuple
-/// in place. PgPending → Text on success; PgPending stays put on
-/// fall-back (raw bytes then surface through `encode_value`).
+/// PgPending → Text on success; on fall-back PgPending stays put and emitter
+/// writes raw bytes via `encode_value`.
 pub async fn resolve_pending_tuple(oracle: &Oracle, columns: &mut [Option<ColumnValue>]) {
     for col in columns.iter_mut() {
         if let Some(ColumnValue::PgPending { type_oid, raw }) = col {
@@ -273,16 +245,13 @@ pub async fn resolve_pending_tuple(oracle: &Oracle, columns: &mut [Option<Column
                     *col = Some(ColumnValue::Text(s));
                 }
                 _ => {
-                    // Leave PgPending in place; emitter writes raw bytes.
+                    // fall back: leave PgPending, emitter writes raw bytes
                 }
             }
         }
     }
 }
 
-/// Cross-check sampler entry point: walks a tuple, picks an entry for
-/// the local hot types, fires the probe. Does not consume bytes; safe
-/// to invoke concurrently across rows.
 pub async fn maybe_validate_tuple(oracle: &Oracle, columns: &[Option<ColumnValue>]) {
     for col in columns.iter().flatten() {
         match col {
@@ -293,10 +262,8 @@ pub async fn maybe_validate_tuple(oracle: &Oracle, columns: &[Option<ColumnValue
                     NumericKind::PInf => "Infinity".into(),
                     NumericKind::NInf => "-Infinity".into(),
                 };
-                // For numerics we don't have the raw bytes here; the
-                // validator path requires raw bytes. Without them we
-                // skip — the validator's primary value is jsonb/array
-                // (PgPending) where raw bytes are present.
+                // No raw bytes here, validator needs them; skip. Its primary
+                // value is jsonb/array (PgPending), where raw bytes are present
                 let _ = local;
             }
             ColumnValue::PgPending { type_oid, raw } => {
@@ -307,9 +274,6 @@ pub async fn maybe_validate_tuple(oracle: &Oracle, columns: &[Option<ColumnValue
     }
 }
 
-/// Helper for `walshadow-stream` to format a one-line oracle status
-/// summary, suitable for the status line emitted alongside decoder /
-/// xact-buffer stats.
 impl OracleStats {
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
@@ -331,16 +295,9 @@ impl OracleStats {
     }
 }
 
-/// [`TupleObserver`] wrapper. On each tuple: resolve every
-/// `PgPending` column through the oracle (replaces with `Text`) and
-/// optionally fire 1-in-N validator probes against shadow PG, then
-/// forward the mutated clone to the inner observer.
-///
-/// One clone per tuple. Mid-volume workloads (Tier 3 columns are
-/// typically a small minority of any schema) shouldn't notice; very
-/// hot workloads can disable the wrapper by passing
-/// `--validate 0 --without-oracle` and live with raw bytes for
-/// `PgPending` types.
+/// [`TupleObserver`] wrapper: resolve PgPending columns, optionally validate,
+/// forward mutated clone to inner. One clone per tuple; hot workloads can
+/// bypass via `--validate 0 --without-oracle` (raw bytes for PgPending).
 pub struct OracleObserver<O: TupleObserver + Send> {
     oracle: Arc<Oracle>,
     inner: O,
@@ -407,10 +364,9 @@ impl<O: TupleObserver + Send> TupleObserver for OracleObserver<O> {
     }
 }
 
-/// Convenience wrapper: connect with a timeout budget so a still-warming
-/// shadow doesn't pin the daemon at boot. Matches the catalog's
-/// [`with_transient_retry`](crate::shadow_catalog::with_transient_retry)
-/// shape.
+/// Connect with a timeout budget so a still-warming shadow doesn't pin the
+/// daemon at boot. Matches the catalog's
+/// [`with_transient_retry`](crate::shadow_catalog::with_transient_retry) shape.
 pub async fn connect_with_budget(
     conninfo: &str,
     sample_rate: u32,
@@ -451,7 +407,6 @@ mod tests {
                 hits += 1;
             }
         }
-        // 100 / 5 = 20 hits.
         assert_eq!(hits, 20);
     }
 
@@ -470,8 +425,6 @@ mod tests {
         assert!(!out.contains("err"));
     }
 
-    /// Minimal inner observer with an observable field so `inner_mut`'s
-    /// returned reference can be proven to alias the wrapped value.
     struct ProbeObserver {
         tuples: u32,
     }
@@ -486,8 +439,7 @@ mod tests {
 
     #[test]
     fn inner_mut_aliases_wrapped_observer() {
-        // No live PG: client=None is enough to build the wrapper; the
-        // accessor under test never touches the connection.
+        // client=None: accessor under test never touches the connection
         let oracle = Arc::new(Oracle {
             client: Mutex::new(None),
             conninfo: String::new(),

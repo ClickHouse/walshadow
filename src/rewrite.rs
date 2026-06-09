@@ -1,35 +1,30 @@
-//! Per-record byte rewrite: replace a dropped record's body with an
-//! `XLOG_NOOP` of identical `xl_tot_len` so `xl_prev` chain stays valid,
-//! then recompute CRC32C. Kept records pass through unmodified.
+//! Replace a dropped record's body with an `XLOG_NOOP` of identical
+//! `xl_tot_len` so the `xl_prev` chain stays valid, then recompute CRC32C.
 //!
-//! CRC32C scheme matches `src/backend/access/transam/xlog.c:5169`:
+//! CRC32C scheme matches PG `src/backend/access/transam/xlog.c`:
 //! ```c
 //! INIT_CRC32C(crc);
 //! COMP_CRC32C(crc, ((char *) record) + SizeOfXLogRecord, xl_tot_len - SizeOfXLogRecord);
 //! COMP_CRC32C(crc, (char *) record, offsetof(XLogRecord, xl_crc));
 //! FIN_CRC32C(crc);
 //! ```
-//! i.e. body bytes first, then the first 20 bytes of the 24-byte
-//! header (xl_tot_len through `xl_rmid` + 2 padding bytes).
+//! body bytes first, then header[0..20] (xl_tot_len through xl_rmid + 2 pad).
 
 use wal_rs::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT,
 };
 
-/// `XLogRecordHeader.info` value for an XLOG_NOOP record (high nibble
-/// 0x20 in xlog.c `XLOG_NOOP`).
+/// `XLogRecordHeader.info` for XLOG_NOOP (high nibble 0x20 in xlog.c).
 pub const XLOG_NOOP: u8 = 0x20;
 
-/// Offset of `xl_crc` inside the 24-byte header.
+/// Offset of `xl_crc` in the 24-byte header.
 pub const CRC_OFFSET: usize = 20;
 
-/// Smallest body that can encode a SHORT-marked main_data: 1-byte marker
-/// + 1-byte length = 2 bytes minimum.
+/// SHORT main_data marker: 1-byte marker + 1-byte length.
 const MIN_SHORT_BODY: usize = 2;
-/// Smallest body that can encode a LONG-marked main_data: 1-byte marker
-/// + 4-byte length = 5 bytes minimum.
+/// LONG main_data marker: 1-byte marker + 4-byte length.
 const MIN_LONG_BODY: usize = 5;
-/// SHORT marker carries an 8-bit length, so body must fit `2 + 255`.
+/// SHORT length is 8-bit, so body must fit `2 + 255`.
 const MAX_SHORT_BODY: usize = MIN_SHORT_BODY + u8::MAX as usize;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -38,18 +33,16 @@ pub enum RewriteError {
     TooSmall(u32),
 }
 
-/// Rewrite `record_bytes` in place so it parses as an XLOG_NOOP of the
-/// same `xl_tot_len`. Preserves the original `xl_prev` so subsequent
-/// records' chain integrity is intact. Recomputes CRC32C.
+/// Rewrite in place to an XLOG_NOOP of the same `xl_tot_len`, preserving
+/// `xl_prev` so the chain stays intact. Recomputes CRC32C.
 ///
-/// `record_bytes` is the logical record (header + body, no page
-/// boundaries). Caller is responsible for scattering this back into the
-/// segment if the record spans pages.
+/// `record_bytes` is the logical record (no page boundaries); caller
+/// scatters it back into the segment if the record spans pages.
 pub fn noop_replace(record_bytes: &mut [u8]) -> Result<(), RewriteError> {
     let xl_tot_len = u32::from_le_bytes(record_bytes[0..4].try_into().unwrap());
     let total = xl_tot_len as usize;
     if total != record_bytes.len() {
-        // Caller didn't pass a complete record. Treat as malformed.
+        // Incomplete record, treat as malformed.
         return Err(RewriteError::TooSmall(xl_tot_len));
     }
     let body_len = total.saturating_sub(X_LOG_RECORD_HEADER_SIZE);
@@ -57,24 +50,21 @@ pub fn noop_replace(record_bytes: &mut [u8]) -> Result<(), RewriteError> {
         return Err(RewriteError::TooSmall(xl_tot_len));
     }
 
-    // Header rewrite: keep xl_tot_len (offset 0..4) and xl_prev (8..16);
-    // zero xl_xid, set info=XLOG_NOOP, rmid=RM_XLOG, zero pad+crc.
+    // Keep xl_tot_len (0..4) and xl_prev (8..16); rewrite the rest.
     record_bytes[4..8].fill(0); // xl_xid
     record_bytes[16] = XLOG_NOOP; // info
     record_bytes[17] = RmId::Xlog as u8; // rmid
     record_bytes[18] = 0; // pad
     record_bytes[19] = 0; // pad
-    record_bytes[20..24].fill(0); // crc (will be overwritten below)
+    record_bytes[20..24].fill(0); // crc
 
-    // Body rewrite: short or long main_data marker + zero fill.
     let body = &mut record_bytes[X_LOG_RECORD_HEADER_SIZE..];
     body.fill(0);
     if body_len <= MAX_SHORT_BODY {
         body[0] = XLR_BLOCK_ID_DATA_SHORT;
         body[1] = (body_len - MIN_SHORT_BODY) as u8;
     } else {
-        // body_len > MAX_SHORT_BODY (>= 258) > MIN_LONG_BODY (5), so the
-        // LONG-marker length always fits.
+        // body_len >= 258 > MIN_LONG_BODY, so the LONG length always fits.
         body[0] = XLR_BLOCK_ID_DATA_LONG;
         body[1..5].copy_from_slice(&((body_len - MIN_LONG_BODY) as u32).to_le_bytes());
     }
@@ -122,15 +112,12 @@ mod tests {
         let mut bytes = build_record(50, 0xdeadbeefcafebabe);
         let prev_orig = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         noop_replace(&mut bytes).unwrap();
-        // xl_prev preserved
         assert_eq!(
             u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
             prev_orig
         );
-        // info / rmid rewritten
         assert_eq!(bytes[16], XLOG_NOOP);
         assert_eq!(bytes[17], RmId::Xlog as u8);
-        // Re-parses as a clean record
         let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(parsed.header.info, XLOG_NOOP);
         assert_eq!(parsed.header.total_record_length, bytes.len() as u32);
@@ -140,7 +127,7 @@ mod tests {
 
     #[test]
     fn noop_replaces_user_record_long_body() {
-        // body_len > 257 forces LONG marker
+        // body_len > 257 forces the LONG marker
         let mut bytes = build_record(1000, 0x42);
         noop_replace(&mut bytes).unwrap();
         let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
@@ -178,10 +165,9 @@ mod tests {
 
     #[test]
     fn crc_matches_pg_when_record_is_unchanged() {
-        // Build a valid record, write its own CRC, parse it: round-trips
         let body_len = 16;
         let mut bytes = build_record(body_len, 0);
-        // Use SHORT marker so the record is parseable
+        // SHORT marker so the record is parseable
         bytes[X_LOG_RECORD_HEADER_SIZE] = XLR_BLOCK_ID_DATA_SHORT;
         bytes[X_LOG_RECORD_HEADER_SIZE + 1] = (body_len - MIN_SHORT_BODY) as u8;
         for b in bytes[X_LOG_RECORD_HEADER_SIZE + 2..].iter_mut() {

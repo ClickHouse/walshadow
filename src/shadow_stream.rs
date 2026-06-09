@@ -1,26 +1,15 @@
 //! Streaming-fed shadow.
 //!
-//! `ShadowStreamSink` composes alongside
-//! [`DirSegmentSink`](crate::wal_stream::DirSegmentSink) and
-//! [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink)
-//! on a [`WalStream`](crate::wal_stream::WalStream). On each filtered
-//! record it appends the rewritten bytes onto every active shadow
-//! connection's send buffer, framed as `'w'` `XLogData` per the
-//! physical replication protocol. On each segment boundary it
-//! advances the per-connection `server_wal_end` for keepalive
-//! framing.
+//! `ShadowStreamSink` frames each filtered record as `'w'` `XLogData`
+//! (physical replication protocol) onto every active shadow
+//! connection's send buffer. Inbound `'r'` standby-status frames carry
+//! shadow's flush/apply LSNs back; the min across connections gates the
+//! catalog.
 //!
-//! Tracking state per connection:
-//! - `dispatched_to_shadow_lsn` — high water of bytes pushed onto the
-//!   wire (mirrors source's `write_lsn`)
-//! - `shadow_flush_lsn`, `shadow_apply_lsn` — from `'r'` standby status
-//!   frames the connection sends back. The min across active
-//!   connections is the catalog-gate input.
-//!
-//! Backpressure: a socket whose send buffer fills past
-//! `slow_connection_threshold` is dropped, letting shadow reconnect
-//! via the archive (`restore_command`) path. The catalog gate then
-//! polls shadow's apply LSN until streaming resumes.
+//! Backpressure: a send buffer past `slow_connection_threshold` is
+//! dropped, letting shadow reconnect via the archive (`restore_command`)
+//! path; the catalog gate then polls shadow's apply LSN until streaming
+//! resumes.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -39,19 +28,19 @@ use wal_rs::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_da
 
 use crate::wal_stream::{RecordBytesSink, SinkError};
 
-/// One client (typically shadow PG) currently consuming WAL bytes.
-/// State the sink needs per connection.
+/// Per-connection state for one WAL-consuming client (typically
+/// shadow PG).
 #[derive(Debug)]
 struct ConnState {
-    /// High water of bytes the sink has pushed onto this connection's
-    /// send buffer. Equivalent to source's `write_lsn`.
+    /// High water of bytes pushed onto the send buffer; source's
+    /// `write_lsn` equivalent.
     dispatched_lsn: u64,
-    /// Last `flush_lsn` reported by the client's `'r'` standby status.
+    /// Last `flush_lsn` from the client's `'r'` standby status.
     flush_lsn: u64,
-    /// Last `apply_lsn` reported by the client's `'r'` standby status.
+    /// Last `apply_lsn` from the client's `'r'` standby status.
     apply_lsn: u64,
-    /// Closing? Marked once a write error fires; the listener loop
-    /// drops the slot on the next status sweep.
+    /// Marked on a write error/overflow; listener drops the slot on
+    /// the next status sweep.
     closing: bool,
 }
 
@@ -66,16 +55,16 @@ impl ConnState {
     }
 }
 
-/// Aggregate flush/apply LSN view across every shadow-streaming
-/// connection. `None` if there are no active connections (the catalog
-/// gate falls back to disk-driven polling).
+/// Aggregate flush/apply LSN across shadow-streaming connections.
+/// `None` with no active connections (catalog gate falls back to
+/// disk-driven polling).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AggregateLsn {
     pub min_flush_lsn: Option<u64>,
     pub min_apply_lsn: Option<u64>,
     pub active_connections: usize,
-    /// Cumulative count of connections dropped by `slow_threshold`
-    /// overflow since process start. Counter-shaped — never decreases.
+    /// Monotonic count of connections dropped by `slow_threshold`
+    /// overflow since process start.
     pub dropped_total: u64,
 }
 
@@ -87,41 +76,30 @@ pub enum ShadowStreamError {
     Server(#[from] ServerError),
 }
 
-/// Shared state ShadowStreamSink + the listener task contend over.
-/// `RwLock` would be tempting on the hot path, but write traffic
-/// (sink dispatch + listener accept) is symmetric to read traffic
-/// (status sweep), so a `Mutex` keeps the protocol simple.
+/// Shared between ShadowStreamSink + listener task. `Mutex` not
+/// `RwLock`: write traffic (sink dispatch + accept) is symmetric to
+/// read traffic (status sweep).
 #[derive(Debug)]
 pub struct ShadowStreamState {
-    /// LSN of the first byte every newly-accepted connection should
-    /// receive. Mirrors source's view of "current WAL position" at
-    /// the time the connection landed.
+    /// First-byte LSN every newly-accepted connection receives.
     pub current_lsn: u64,
     pub timeline: u32,
     pub system_identifier: String,
-    /// `IDENTIFY_SYSTEM`'s `dbname` column (always empty for physical
-    /// replication).
+    /// `IDENTIFY_SYSTEM` `dbname` (always empty for physical replication).
     pub dbname: Option<String>,
-    /// `IDENTIFY_SYSTEM`'s `xlogpos` column — the source's
-    /// `pg_current_wal_lsn()`. Walshadow advertises its
-    /// `current_lsn` here so shadow's walreceiver knows where to
-    /// resume.
+    /// `IDENTIFY_SYSTEM` `xlogpos`, source's `pg_current_wal_lsn()`.
+    /// Advertise `current_lsn` here so shadow's walreceiver knows where
+    /// to resume.
     pub xlogpos: u64,
-    /// Per-connection state (keyed by connection id).
     connections: HashMap<u64, ConnState>,
-    /// Next connection id to hand out on `register_connection`.
     next_conn_id: u64,
-    /// Pending record bytes per connection: bytes queued behind a
-    /// slow shadow client. Kept bounded by `slow_threshold`; past it
-    /// the connection is dropped.
+    /// Bytes queued behind a slow shadow client, bounded by
+    /// `slow_threshold`.
     send_queues: HashMap<u64, Vec<u8>>,
-    /// Slow-connection cutoff in bytes; past this the listener kills
-    /// the socket.
+    /// Slow-connection byte cutoff; past it the listener kills the socket.
     pub slow_threshold: usize,
-    /// Most-recent server_wal_end value the sink has observed. Used
-    /// to populate `'w'`/`'k'` frame headers.
+    /// Populates `'w'`/`'k'` frame headers.
     pub server_wal_end: u64,
-    /// Counter — connections cut due to `slow_threshold` overflow.
     /// Surfaced via [`AggregateLsn::dropped_total`] for the
     /// `walshadow_shadow_stream_dropped_connections_total` gauge.
     dropped_total: u64,
@@ -149,7 +127,6 @@ impl ShadowStreamState {
         }
     }
 
-    /// Aggregate LSN view across active connections.
     pub fn aggregate(&self) -> AggregateLsn {
         let active: Vec<&ConnState> = self.connections.values().filter(|c| !c.closing).collect();
         if active.is_empty() {
@@ -166,7 +143,6 @@ impl ShadowStreamState {
         }
     }
 
-    /// Track a new connection. Returns its id.
     pub fn register_connection(&mut self, start_lsn: u64) -> u64 {
         let id = self.next_conn_id;
         self.next_conn_id += 1;
@@ -174,14 +150,12 @@ impl ShadowStreamState {
         id
     }
 
-    /// Drop a connection (closed gracefully or killed by slow-client
-    /// cutoff). Removes both connection state and any queued bytes.
     pub fn drop_connection(&mut self, id: u64) {
         self.connections.remove(&id);
         self.send_queues.remove(&id);
     }
 
-    /// Record an inbound `'r'` standby status from the wire.
+    /// Record an inbound `'r'` standby status.
     pub fn observe_status(&mut self, id: u64, write_lsn: u64, flush_lsn: u64, apply_lsn: u64) {
         let _ = write_lsn;
         if let Some(c) = self.connections.get_mut(&id) {
@@ -190,18 +164,13 @@ impl ShadowStreamState {
         }
     }
 
-    /// Drain the pending send queue for connection `id` — listener
-    /// task pulls bytes out of here, framed and ready to go on the
-    /// socket. Internally also tracks `dispatched_lsn` advance for
-    /// keepalive carriage.
+    /// Listener pulls framed bytes out of here.
     pub fn drain_send_queue(&mut self, id: u64) -> Option<Vec<u8>> {
         self.send_queues.remove(&id)
     }
 
-    /// Append framed bytes to a connection's send queue. If the queue
-    /// would overflow `slow_threshold`, the connection is marked
-    /// `closing` and the framed bytes are discarded (the listener
-    /// task tears down the socket on its next pass).
+    /// Overflowing `slow_threshold` marks the connection `closing` and
+    /// discards the bytes; listener tears down on its next pass.
     pub fn enqueue(&mut self, id: u64, framed: Vec<u8>) -> bool {
         let q = self.send_queues.entry(id).or_default();
         if q.len() + framed.len() > self.slow_threshold {
@@ -218,21 +187,17 @@ impl ShadowStreamState {
         true
     }
 
-    /// Append a CopyData envelope wrapping a server-direction frame
-    /// (`'w'` or `'k'`) onto the connection's send queue, building the
-    /// envelope in-place to avoid the intermediate `Vec` allocations
-    /// `encode_*_frame` + `wrap_copy_data` + `enqueue` would otherwise
-    /// stack up per record × connection. `build_body` writes the frame
-    /// body — everything after the 5-byte CopyData header. Returns
-    /// `false` if the resulting envelope would breach `slow_threshold`;
-    /// the connection is then marked closing and the queue cleared
-    /// (consistent with the [`enqueue`] semantics).
+    /// Append a CopyData envelope wrapping a `'w'`/`'k'` frame, built
+    /// in-place to skip the intermediate `Vec`s per record × connection.
+    /// `build_body` writes everything after the 5-byte CopyData header.
+    /// `false` on `slow_threshold` breach (marks closing, clears queue,
+    /// matching [`enqueue`]).
     fn enqueue_copy_data_with(&mut self, id: u64, build_body: impl FnOnce(&mut Vec<u8>)) -> bool {
         let slow_threshold = self.slow_threshold;
         let q = self.send_queues.entry(id).or_default();
         let envelope_start = q.len();
         q.push(b'd');
-        // u32 BE length placeholder; back-patched once body bytes are appended.
+        // u32 BE length placeholder, back-patched after body appended
         q.extend_from_slice(&[0u8; 4]);
         let body_start = q.len();
         build_body(q);
@@ -253,8 +218,6 @@ impl ShadowStreamState {
         true
     }
 
-    /// Advance the per-connection `dispatched_lsn` after a frame
-    /// covering `[prev_lsn, new_lsn)` is enqueued.
     pub fn advance_dispatched(&mut self, id: u64, new_lsn: u64) {
         if let Some(c) = self.connections.get_mut(&id) {
             c.dispatched_lsn = c.dispatched_lsn.max(new_lsn);
@@ -262,8 +225,6 @@ impl ShadowStreamState {
     }
 }
 
-/// `RecordBytesSink` impl: frames each record + segment boundary onto
-/// every active shadow connection's send queue.
 pub struct ShadowStreamSink {
     state: Arc<Mutex<ShadowStreamState>>,
 }
@@ -351,22 +312,15 @@ impl RecordBytesSink for ShadowStreamSink {
     }
 }
 
-/// Walsender listener address: prefers a unix socket path next to
-/// shadow PG's socket dir; falls back to TCP.
 #[derive(Debug, Clone)]
 pub enum WalSenderAddr {
     Unix(PathBuf),
     Tcp(SocketAddr),
 }
 
-/// Spawn a listener that accepts walreceiver clients, runs the
-/// startup + IDENTIFY_SYSTEM + START_REPLICATION handshake, then
-/// pumps queued bytes from `ShadowStreamState::send_queues` onto the
-/// socket while decoding inbound `'r'` standby status frames.
-///
-/// Returns a `JoinHandle` so callers can keep the listener task
-/// alive across the daemon lifecycle (bootstrap → main pump →
-/// shutdown).
+/// Accept walreceiver clients, run startup + IDENTIFY_SYSTEM +
+/// START_REPLICATION handshake, pump queued bytes onto the socket
+/// while decoding inbound `'r'` standby status.
 pub async fn spawn_listener(
     addr: WalSenderAddr,
     state: Arc<Mutex<ShadowStreamState>>,
@@ -374,7 +328,6 @@ pub async fn spawn_listener(
 ) -> Result<tokio::task::JoinHandle<()>, ShadowStreamError> {
     match addr {
         WalSenderAddr::Unix(path) => {
-            // Best-effort cleanup of a stale socket file.
             let _ = tokio::fs::remove_file(&path).await;
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -387,9 +340,8 @@ pub async fn spawn_listener(
             )))
         }
         WalSenderAddr::Tcp(addr) => {
-            // SO_REUSEADDR so a recent prior bind in TIME_WAIT
-            // doesn't block startup. Important for test cycles + for
-            // the "daemon restart with same `--walsender-bind`" case.
+            // SO_REUSEADDR: a prior bind in TIME_WAIT must not block
+            // restart with the same `--walsender-bind`.
             let sock = match addr {
                 std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4().map_err(|e| {
                     io::Error::new(e.kind(), format!("TcpSocket::new_v4 {addr}: {e}"))
@@ -474,8 +426,7 @@ async fn handle_tcp_connection(
     }
 }
 
-/// Walsender per-connection driver. Generic over the socket transport
-/// so unix + TCP share the same protocol logic.
+/// Generic over the socket transport so unix + TCP share the logic.
 async fn drive_connection<S>(
     mut sock: S,
     state: Arc<Mutex<ShadowStreamState>>,
@@ -524,10 +475,9 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     // Shadow's `wal_receiver_timeout` (default 60s) tears down the
-    // connection if no message arrives in that window. `'w'` XLogData
-    // frames cover the timer while WAL flows; on idle nothing leaves,
-    // so inject a fresh `'k'` once we've been quiet for KEEPALIVE_IDLE
-    // (10s matches PG's wal_receiver_status_interval convention).
+    // connection on silence. `'w'` frames cover the timer while WAL
+    // flows; on idle inject a `'k'` after KEEPALIVE_IDLE (10s, PG's
+    // wal_receiver_status_interval convention).
     const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
     let mut last_write = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(flush_interval);
@@ -548,7 +498,7 @@ where
                 if let Some(bytes) = pending
                     && !bytes.is_empty()
                 {
-                    // Queue holds fully-framed CopyData envelopes; ship verbatim.
+                    // Queue holds fully-framed CopyData envelopes
                     conn.write_framed(&bytes).await?;
                     last_write = tokio::time::Instant::now();
                 }
@@ -615,7 +565,6 @@ mod tests {
         let id = s.register_connection(0);
         assert!(s.enqueue(id, vec![0u8; 32]));
         assert!(s.enqueue(id, vec![0u8; 16]));
-        // Past threshold:
         assert!(!s.enqueue(id, vec![0u8; 64]));
         assert!(s.connections.get(&id).unwrap().closing);
         assert!(!s.send_queues.contains_key(&id));
@@ -627,7 +576,7 @@ mod tests {
         let mut s = ShadowStreamState::new(1, "x".into(), 0, 64);
         let id = s.register_connection(0);
         assert!(!s.enqueue(id, vec![0u8; 128]));
-        // Second overflow on the now-closing slot must not double-count.
+        // second overflow on the closing slot must not double-count
         assert!(!s.enqueue(id, vec![0u8; 128]));
         assert_eq!(s.aggregate().dropped_total, 1);
     }
@@ -644,9 +593,8 @@ mod tests {
         let qa = s.drain_send_queue(a).unwrap();
         let qb = s.drain_send_queue(b).unwrap();
         assert!(!qa.is_empty());
-        // Queue holds CopyData envelopes wrapping 'w' XLogData.
-        // 'd' (1) + length (4) + 'w' (1) + start_lsn (8) +
-        // server_wal_end (8) + send_time (8) = 30 bytes before payload.
+        // CopyData envelope over 'w' XLogData: 'd'(1) + len(4) + 'w'(1)
+        // + start_lsn(8) + server_wal_end(8) + send_time(8) = 30 bytes
         assert_eq!(&qa[30..], bytes);
         assert_eq!(&qb[30..], bytes);
     }

@@ -1,25 +1,13 @@
 //! Replication-latency benchmarks for the walshadow demo stack.
 //!
-//! Writes rows to the `source` Postgres and measures how long until they
-//! become visible in ClickHouse — end-to-end replication latency. Runs
-//! against the docker/docker-compose.yml stack over host-exposed ports;
-//! all timing uses one host-side monotonic clock (`Instant`), so there's
-//! no cross-container clock skew (both the "committed" and the "visible"
-//! instants are taken here).
-//!
-//! Two benchmarks, selected with `--bench`:
-//!   * `single-row` — insert one row at a time, time commit→visible,
-//!     repeat, report a percentile distribution.
-//!   * `sustained`  — drive a continuous insert rate across N connections,
-//!     sample latency under load, report achieved rate + drain time.
+//! Runs against docker/docker-compose.yml over host-exposed ports. All
+//! timing uses one host-side monotonic clock (`Instant`), so no
+//! cross-container clock skew: both commit and visible instants taken here.
 //!
 //! Example:
 //!   cargo run --release --bin walshadow-latency-bench -- --bench single-row
 //!   cargo run --release --bin walshadow-latency-bench -- \
 //!       --bench sustained --rate 500 --concurrency 4
-//!
-//! ClickHouse is queried via a tiny hand-rolled HTTP client (one short
-//! connection per query) so no reqwest-class dependency is pulled in.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,11 +30,9 @@ enum Bench {
     about = "Measure source-Postgres → ClickHouse replication latency"
 )]
 struct Args {
-    /// Which benchmark to run.
     #[arg(long, value_enum)]
     bench: Bench,
 
-    // ---- source Postgres ------------------------------------------------
     #[arg(long, default_value = "127.0.0.1")]
     pg_host: String,
     #[arg(long, default_value_t = 5432)]
@@ -57,20 +43,16 @@ struct Args {
     pg_dbname: String,
     #[arg(long)]
     pg_password: Option<String>,
-    /// Source table to insert into.
     #[arg(long, default_value = "demo.users")]
     table: String,
 
-    // ---- ClickHouse -----------------------------------------------------
     #[arg(long, default_value = "127.0.0.1")]
     ch_host: String,
     #[arg(long, default_value_t = 8123)]
     ch_http_port: u16,
-    /// Destination table to poll.
     #[arg(long, default_value = "demo.users")]
     ch_table: String,
 
-    // ---- single-row bench -----------------------------------------------
     #[arg(long, default_value_t = 100)]
     iterations: u64,
     #[arg(long, default_value_t = 10)]
@@ -80,8 +62,6 @@ struct Args {
     #[arg(long, default_value_t = 30_000)]
     row_timeout_ms: u64,
 
-    // ---- sustained bench ------------------------------------------------
-    /// Target insert rate (rows/sec).
     #[arg(long, default_value_t = 200)]
     rate: u64,
     #[arg(long, default_value_t = 20)]
@@ -89,13 +69,13 @@ struct Args {
     /// Tag every Nth row as a latency probe.
     #[arg(long, default_value_t = 25)]
     probe_every: u64,
-    /// Parallel insert connections. >1 fans the target rate across N
-    /// Postgres connections — a single connection serialises on the wire.
+    /// Parallel insert connections. >1 fans target rate across N conns;
+    /// a single connection serialises on the wire.
     #[arg(long, default_value_t = 1)]
     concurrency: u64,
 
-    /// Bench rows live at `id >= id_base`; cleared at startup so each run
-    /// starts clean. Keep clear of the demo's seeded ids (1..=3).
+    /// Bench rows live at `id >= id_base`; cleared at startup. Keep clear
+    /// of demo's seeded ids (1..=3).
     #[arg(long, default_value_t = 1_000_000)]
     id_base: i64,
 }
@@ -115,8 +95,7 @@ async fn main() -> Result<()> {
         args.ch_table.clone(),
     );
 
-    // Preflight so a misconfigured endpoint fails fast instead of looking
-    // like every row "timed out".
+    // Fail fast on misconfigured endpoint instead of every row "timing out".
     let one = ch
         .query("SELECT 1")
         .await
@@ -125,8 +104,7 @@ async fn main() -> Result<()> {
         bail!("ClickHouse preflight returned {one:?}, expected \"1\"");
     }
 
-    // Clean slate for our id range so every timed write is a true INSERT
-    // and re-runs are idempotent.
+    // Clean id range so every timed write is a true INSERT, re-runs idempotent.
     pg.delete_bench_rows(args.id_base)
         .await
         .context("clear prior bench rows")?;
@@ -146,10 +124,6 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Benchmark: single-row latency distribution
-// ---------------------------------------------------------------------------
 
 async fn run_single_row(args: &Args, pg: &PgClient, ch: &ChHttp) -> Result<()> {
     let total = args.warmup + args.iterations;
@@ -193,10 +167,6 @@ async fn run_single_row(args: &Args, pg: &PgClient, ch: &ChHttp) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark: sustained-load latency
-// ---------------------------------------------------------------------------
-
 async fn run_sustained(args: &Args, pg: Arc<PgClient>, ch: &ChHttp) -> Result<()> {
     let base = args.id_base + 1_000_000;
     let concurrency: i64 = args.concurrency.max(1) as i64;
@@ -205,9 +175,8 @@ async fn run_sustained(args: &Args, pg: Arc<PgClient>, ch: &ChHttp) -> Result<()
         args.rate, args.duration_secs, concurrency, args.probe_every
     );
 
-    // One Postgres connection per inserter worker so inserts run in
-    // parallel — a single connection serialises on the wire. Reuse the
-    // caller's client as worker 0; open the rest.
+    // One connection per worker so inserts run in parallel; a single
+    // connection serialises on the wire. Reuse caller's client as worker 0.
     let mut conns: Vec<Arc<PgClient>> = Vec::with_capacity(concurrency as usize);
     conns.push(pg);
     for w in 1..concurrency {
@@ -218,16 +187,14 @@ async fn run_sustained(args: &Args, pg: Arc<PgClient>, ch: &ChHttp) -> Result<()
         ));
     }
 
-    // Probe channel: inserters → poller. Each probe is (id, commit instant).
+    // Probe is (id, commit instant).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(i64, Instant)>();
     let wall_start = Instant::now();
 
-    // Spawn `concurrency` inserter workers. Each targets rate/concurrency
-    // rows/s; combined they aim for `rate`. Worker w owns the id lattice
-    // `base + k*concurrency + w` so ids never collide and stay monotonic
-    // within a worker. Each returns its row count and the actual
-    // insert-window duration (achieved rate is measured over the window,
-    // NOT the drain that follows it).
+    // Worker w owns id lattice `base + k*concurrency + w` so ids never
+    // collide, stay monotonic within a worker. Returns row count + actual
+    // insert-window duration: achieved rate measured over the window, NOT
+    // the drain that follows it.
     let duration = Duration::from_secs(args.duration_secs);
     let probe_every: i64 = args.probe_every.max(1) as i64;
     let per_worker_rate = (args.rate.max(1) as f64 / concurrency as f64).max(f64::MIN_POSITIVE);
@@ -252,7 +219,7 @@ async fn run_sustained(args: &Args, pg: Arc<PgClient>, ch: &ChHttp) -> Result<()
                 last_id = Some(id);
                 k += 1;
             }
-            // Always probe this worker's final row so the drain tail shows.
+            // Probe final row so drain tail shows.
             if let Some(id) = last_id
                 && (k - 1) % probe_every != 0
             {
@@ -264,7 +231,6 @@ async fn run_sustained(args: &Args, pg: Arc<PgClient>, ch: &ChHttp) -> Result<()
     }
     drop(tx); // workers hold their own clones; poller exits when all close
 
-    // Poller: pull each probe, wait until visible, record latency.
     let poll = Duration::from_millis(args.poll_interval_ms);
     let timeout = Duration::from_millis(args.row_timeout_ms);
     let mut samples_ms: Vec<f64> = Vec::new();
@@ -280,9 +246,8 @@ async fn run_sustained(args: &Args, pg: Arc<PgClient>, ch: &ChHttp) -> Result<()
             None => timeouts += 1,
         }
         processed += 1;
-        // When load exceeds pipeline capacity the drain runs far past the
-        // insert window — print progress so a long (but live) drain isn't
-        // mistaken for a hang.
+        // Under overload the drain runs far past the insert window; print
+        // progress so a long but live drain isn't mistaken for a hang.
         if processed.is_multiple_of(500) {
             println!(
                 "  … drained {processed} probes (last latency {:.0}ms)",
@@ -318,10 +283,8 @@ async fn run_sustained(args: &Args, pg: Arc<PgClient>, ch: &ChHttp) -> Result<()
     Ok(())
 }
 
-/// Poll ClickHouse for `id` until present or `timeout` elapses. Returns the
-/// `Instant` it was first observed, or `None` on timeout. A transient query
-/// error is treated as "not yet visible" so a momentary CH hiccup doesn't
-/// abort the whole run.
+/// Poll CH for `id` until present or `timeout`. Transient query error
+/// treated as "not yet visible" so a momentary CH hiccup doesn't abort the run.
 async fn wait_visible(
     ch: &ChHttp,
     id: i64,
@@ -342,10 +305,6 @@ async fn wait_visible(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Postgres client
-// ---------------------------------------------------------------------------
-
 struct PgClient {
     client: tokio_postgres::Client,
     insert_sql: String,
@@ -364,7 +323,7 @@ impl PgClient {
         let (client, connection) = tokio_postgres::connect(&conninfo, NoTls)
             .await
             .with_context(|| format!("tokio_postgres::connect ({conninfo})"))?;
-        // The connection object drives the protocol and must be polled.
+        // tokio-postgres connection drives the protocol, must be polled.
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 eprintln!("postgres connection error: {e}");
@@ -391,17 +350,15 @@ impl PgClient {
     }
 
     async fn delete_bench_rows(&self, id_base: i64) -> Result<()> {
-        // Table name is interpolated (can't be a bind param); id_base bound.
+        // Table name can't be a bind param; id_base bound.
         let sql = format!("DELETE FROM {} WHERE id >= $1", self.table);
         self.client.execute(&sql, &[&id_base]).await?;
         Ok(())
     }
 }
 
-// ---------------------------------------------------------------------------
-// ClickHouse HTTP client — one short connection per query, no extra deps.
-// ---------------------------------------------------------------------------
-
+// Hand-rolled CH HTTP client: one short connection per query, avoids a
+// reqwest-class dependency.
 struct ChHttp {
     host: String,
     port: u16,
@@ -413,10 +370,9 @@ impl ChHttp {
         Self { host, port, table }
     }
 
-    /// POST `sql` to the CH HTTP endpoint and return the trimmed body.
-    /// Opens a fresh connection per call (HTTP/1.0, `Connection: close`).
-    /// Simple; under very long sustained-overload drains raise
-    /// `--poll-interval-ms` so polling doesn't churn through sockets.
+    /// POST `sql`, return trimmed body. Fresh connection per call (HTTP/1.0,
+    /// `Connection: close`); under long overload drains raise
+    /// `--poll-interval-ms` so polling doesn't churn sockets.
     async fn query(&self, sql: &str) -> Result<String> {
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
             .await
@@ -440,8 +396,7 @@ impl ChHttp {
         Ok(body.trim().to_string())
     }
 
-    /// `SELECT count() FROM <table> WHERE id = <id>` — no FINAL needed, a
-    /// single freshly-inserted row appears exactly once.
+    /// No FINAL needed: a single freshly-inserted row appears exactly once.
     async fn count_id(&self, id: i64) -> Result<u64> {
         let sql = format!("SELECT count() FROM {} WHERE id = {}", self.table, id);
         let body = self.query(&sql).await?;
@@ -450,10 +405,6 @@ impl ChHttp {
             .with_context(|| format!("parse count() response {body:?}"))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Stats
-// ---------------------------------------------------------------------------
 
 struct Summary {
     n: usize,
@@ -466,7 +417,7 @@ struct Summary {
 }
 
 impl Summary {
-    /// Sorts `samples` in place and computes nearest-rank percentiles.
+    /// Sorts `samples` in place, computes nearest-rank percentiles.
     fn from(samples: &mut [f64]) -> Self {
         if samples.is_empty() {
             return Self {
@@ -482,7 +433,7 @@ impl Summary {
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = samples.len();
         let pct = |p: f64| -> f64 {
-            // nearest-rank: ceil(p/100 * n), 1-based, clamped.
+            // nearest-rank: ceil(p/100 * n), 1-based, clamped
             let rank = ((p / 100.0) * n as f64).ceil() as usize;
             samples[rank.clamp(1, n) - 1]
         };

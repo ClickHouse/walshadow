@@ -1,11 +1,10 @@
-//! walshadow-classify — walk WAL segment files & print catalog/user/special split.
+//! walshadow-classify — walk WAL segment files, print catalog/user/special split.
 //!
-//! Consumes raw pg_wal segment files (16 MiB each by
-//! default, the on-disk format pg_receivewal & a running primary write to
-//! pg_wal/). Compressed segment archives (`.zst` / `.gz` / `.lz4` / `.lzma`
-//! / `.br`, with optional `.partial` peer) are auto-detected by suffix and
-//! transparently decoded via wal-rs's `open_segment_file`. Output is either
-//! a JSON [`Summary`] or a human-readable table.
+//! Consumes raw pg_wal segment files (16 MiB each by default, the on-disk
+//! format pg_receivewal and a running primary write to pg_wal/).
+//! Compressed archives (`.zst`/`.gz`/`.lz4`/`.lzma`/`.br`, optional
+//! `.partial` peer) are auto-detected by suffix and decoded via wal-rs's
+//! `open_segment_file`.
 
 use std::path::PathBuf;
 

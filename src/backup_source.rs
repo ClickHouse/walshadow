@@ -1,36 +1,26 @@
-//! File-streaming backup-source trait.
+//! File-streaming backup-source trait. A base backup is a stream of
+//! files with cluster-relative paths, regardless of wire encoding.
+//! See [plans/bootstrap.md](../plans/bootstrap.md).
 //!
-//! See [plans/bootstrap.md](../plans/bootstrap.md) for the BackupSource
-//! trait surface and orchestrator wiring.
-//!
-//! The trait lifts above tar: a base backup is a stream of files with
-//! cluster-relative paths, regardless of wire encoding. Two production
-//! impls today, [`crate::backup_source_direct::DirectSource`]
+//! Production impls: [`crate::backup_source_direct::DirectSource`]
 //! (replication protocol) and
 //! [`crate::backup_source_object_store::ObjectStoreSource`] (wal-g
-//! layout via `DynStorage`). LocalDir is a future third impl.
+//! layout via `DynStorage`).
 //!
-//! Sinks consume per-file events and route through `Keep` (source
-//! writes body to `data_dir`), `Skip` (drop body), or `Tap` (sink
-//! receives `chunk()` callbacks). The shape is structurally close to
-//! wal-rs's `EntryAction` but at a higher layer that knows about
-//! FileKind / Symlink / cluster-relative paths instead of tar entries.
-//!
-//! All I/O is async on top of `tokio_tar` (the astral-sh fork of the
-//! sync `tar` crate). Source impls never need `spawn_blocking`; sinks
-//! see entries as the bytes land.
+//! All I/O is async on `tokio_tar` (astral-sh fork of sync `tar`); no
+//! `spawn_blocking`.
 //!
 //! ## Contracts every source guarantees
 //!
-//! 1. `start()` fires before any `begin()`, carrying `start_lsn`,
-//!    timeline, and the user tablespace list.
+//! 1. `start()` fires before any `begin()`, carrying start_lsn,
+//!    timeline, user tablespace list.
 //! 2. Tablespace symlinks (`pg_tblspc/<oid>`) emit as `FileKind::Symlink`
 //!    before any file under their subtree.
-//! 3. `pg_control` emits last — both PG's BASE_BACKUP protocol and
-//!    wal-rs's `list_tar_parts` honour this; future impls must too.
-//! 4. `finish()` fires after the last `end()`, carrying `end_lsn`.
-//! 5. Paths are cluster-relative, sanitised against `..` /
-//!    absolute-root traversal at the source impl boundary.
+//! 3. `pg_control` emits last; PG's BASE_BACKUP protocol and wal-rs's
+//!    `list_tar_parts` both honour this, future impls must too.
+//! 4. `finish()` fires after the last `end()`, carrying end_lsn.
+//! 5. Paths are cluster-relative, sanitised against `..` / absolute-root
+//!    traversal at the source impl boundary.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,30 +32,27 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use wal_rs::pg::replication::base_backup::Tablespace;
 
-/// Filesystem-object kind of a file event. Tar-driven sources translate
-/// tar entry types here; the trait does not expose tar at all.
+/// Filesystem-object kind. Tar-driven sources translate tar entry types
+/// here; the trait does not expose tar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileKind {
-    /// Regular file. Body bytes flow through `chunk()` (Tap) or get
-    /// written to `data_dir/path` (Keep).
     File,
-    /// Directory. No body. `Keep` creates it, `Skip` drops it, `Tap`
-    /// fires `chunk()` with zero bytes.
     Dir,
-    /// Symbolic link. No body. `target` is the cluster-relative or
-    /// absolute path the link resolves to (PG tablespace symlinks
-    /// carry absolute filesystem paths).
-    Symlink { target: PathBuf },
+    /// `target` is the resolved path; PG tablespace symlinks carry
+    /// absolute filesystem paths
+    Symlink {
+        target: PathBuf,
+    },
 }
 
-/// Cluster-relative path + size + mode + kind. Path examples:
+/// Cluster-relative path examples:
 ///
-/// - `base/5/16400` — user heap file
-/// - `base/5/1259` — `pg_class` heap (catalog, OID 1259)
-/// - `global/1213` — shared catalog
-/// - `pg_control` — controlfile
-/// - `pg_tblspc/16384` — tablespace symlink (FileKind::Symlink)
-/// - `pg_xact/0000` — clog file
+/// - `base/5/16400` user heap file
+/// - `base/5/1259` `pg_class` heap (catalog, OID 1259)
+/// - `global/1213` shared catalog
+/// - `pg_control` controlfile
+/// - `pg_tblspc/16384` tablespace symlink
+/// - `pg_xact/0000` clog file
 #[derive(Debug, Clone)]
 pub struct FileMeta {
     pub path: PathBuf,
@@ -74,35 +61,28 @@ pub struct FileMeta {
     pub kind: FileKind,
 }
 
-/// Sink decision per file at `begin()` time. Source acts on the
-/// returned action; sink owns whatever bookkeeping the action implies.
+/// Sink routing decision per file at `begin()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileAction {
-    /// Source writes the body (regular files) or materializes the dir
-    /// / symlink under caller-supplied `data_dir`. `chunk()` is not
-    /// called for `Keep`.
+    /// Source writes body / materializes dir or symlink under
+    /// `data_dir`; no `chunk()`
     Keep,
-    /// Source drains the body unread; no on-disk land, no `chunk()`
-    /// callbacks.
+    /// Source drains body unread; no land, no `chunk()`
     Skip,
-    /// Source streams body bytes through `chunk()` to the sink; no
-    /// on-disk land. Dir / Symlink entries fire `chunk()` zero times
-    /// regardless.
+    /// Source streams body through `chunk()`, no land. Dir / Symlink
+    /// fire `chunk()` zero times
     Tap,
 }
 
-/// Per-entry token the source allocates fresh per file and threads
-/// through `begin`/`chunk`/`end`. Sinks key per-entry state on it, so
-/// concurrent entries (object_store fan-out drains parts under
-/// `buffer_unordered`, releasing the sink mutex across each body read)
-/// keep independent state instead of clobbering one shared slot.
-/// Monotonic from a single counter per source run, so globally unique.
+/// Per-file token threaded through `begin`/`chunk`/`end`. Sinks key
+/// per-entry state on it so concurrent entries (object_store fan-out
+/// under `buffer_unordered`, sink mutex released across body reads)
+/// keep independent state. Monotonic per source run, globally unique.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntryId(pub u64);
 
-/// Source-side invariants known before the first file event. Mirrors
-/// wal-rs `pg::replication::base_backup::StartInfo` so callers wired to
-/// wal-rs types don't translate. Cloned by value.
+/// Mirrors wal-rs `pg::replication::base_backup::StartInfo` so callers
+/// wired to wal-rs types don't translate.
 #[derive(Debug, Clone)]
 pub struct StartInfo {
     pub start_lsn: u64,
@@ -110,7 +90,6 @@ pub struct StartInfo {
     pub tablespaces: Vec<Tablespace>,
 }
 
-/// Recovery-target LSN + timeline known after the last file event.
 /// Mirrors wal-rs's `EndInfo`.
 #[derive(Debug, Clone)]
 pub struct EndInfo {
@@ -118,54 +97,35 @@ pub struct EndInfo {
     pub timeline: u32,
 }
 
-/// Per-file consumer.
+/// Per-file consumer, driven by [`BackupSource::run`]: `start` once,
+/// then per file `begin` / (if `Tap`) zero-or-more `chunk` / `end`,
+/// then `finish` once.
 ///
-/// Lifecycle, fired by [`BackupSource::run`]:
-///
-/// 1. `start(&StartInfo)` once.
-/// 2. For each file in source order:
-///    - `begin(&FileMeta) -> FileAction`,
-///    - if `Tap`: zero-or-more `chunk(bytes)`,
-///    - `end()` always.
-/// 3. `finish(&EndInfo)` once.
-///
-/// `Send` is required because parallel source impls (object_store
-/// fan-out) drive the sink from worker tasks. The trait methods are
-/// sync — sinks that need async I/O (e.g. database catalog seeding)
-/// must complete that work in `start()`/`finish()` via a runtime
-/// handle, or buffer events for an async drain task.
+/// `Send` because parallel source impls drive the sink from worker
+/// tasks. Methods are sync; sinks needing async I/O must do it in
+/// `start`/`finish` via a runtime handle, or buffer for an async drain.
 pub trait BackupSink: Send {
-    /// Fired once before any file event.
     fn start(&mut self, _info: &StartInfo) -> io::Result<()> {
         Ok(())
     }
 
-    /// Routing decision. Implementations are expected to be cheap;
-    /// per-file dispatch is the hot path. `entry` keys any per-file
-    /// state the sink carries to `chunk`/`end`.
+    /// Must be cheap; per-file dispatch is the hot path
     fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction>;
 
-    /// Body bytes for a `Tap` entry. Called zero or more times in
-    /// arbitrary chunk sizes between `begin()` and `end()` for the same
-    /// `entry`. Sources guarantee bytes are presented in file order per
-    /// entry; sink owns any per-page / per-chunk framing. Calls for
-    /// distinct entries may interleave (object_store fan-out).
+    /// Body bytes for a `Tap` entry, in file order per entry, arbitrary
+    /// chunk sizes. Calls for distinct entries may interleave.
     fn chunk(&mut self, entry: EntryId, bytes: &[u8]) -> io::Result<()>;
 
-    /// Closes `entry`. Fires once per `begin()`, regardless of the
-    /// action returned.
+    /// Fires once per `begin()`, regardless of action returned
     fn end(&mut self, entry: EntryId) -> io::Result<()>;
 
-    /// Fired once after the last file event.
     fn finish(&mut self, _info: &EndInfo) -> io::Result<()> {
         Ok(())
     }
 }
 
-/// One base backup as a stream of file events.
-///
-/// `data_dir` receives `Keep`d bodies. The sink lives behind `Arc<Mutex<_>>`
-/// so parallel source impls share it without per-worker copies.
+/// `data_dir` receives `Keep`d bodies. Sink behind `Arc<Mutex<_>>` so
+/// parallel source impls share it without per-worker copies.
 #[async_trait]
 pub trait BackupSource: Send {
     async fn run(
@@ -175,15 +135,12 @@ pub trait BackupSource: Send {
     ) -> anyhow::Result<(StartInfo, EndInfo)>;
 }
 
-// ---------------------------------------------------------------------
-// Shared helpers — tar→file translation, async disk-land writer
+// Shared helpers: tar->file translation, async disk-land writer
 
-/// Translate one tokio_tar entry into a `FileMeta`. Returns `None` for
-/// entries the source should ignore (absolute paths, parent-dir
-/// traversal, hard links — PG basebackup emits none of these).
-///
-/// Cluster-relative path is rebuilt component-by-component skipping
-/// any `..` / `/` so callers can't escape `data_dir` on write.
+/// Translate one tokio_tar entry into a `FileMeta`. `None` for entries
+/// the source ignores (absolute paths, `..` traversal, hard links; PG
+/// basebackup emits none). Path rebuilt component-by-component skipping
+/// `..` / `/` so callers can't escape `data_dir` on write.
 pub(crate) fn tar_entry_meta<R: AsyncRead + Unpin>(
     entry: &tokio_tar::Entry<R>,
 ) -> io::Result<Option<FileMeta>> {
@@ -226,13 +183,9 @@ pub(crate) fn tar_entry_meta<R: AsyncRead + Unpin>(
     }))
 }
 
-/// Drive one tokio_tar archive against a sink. Drains `archive` to
-/// end, emitting per-entry `begin()`/`chunk()`/`end()` callbacks.
-/// `Keep` entries land under `data_dir`; `Tap` entries stream through
-/// `chunk()`; `Skip` entries drop the body unread.
-///
-/// Called by both `DirectSource` (per `BackupEvent::Archive.body`) and
-/// `ObjectStoreSource` (per fetched tar part).
+/// Drain one tokio_tar archive against a sink, emitting per-entry
+/// callbacks. Called by `DirectSource` (per `BackupEvent::Archive.body`)
+/// and `ObjectStoreSource` (per fetched tar part).
 pub(crate) async fn pump_tar_to_sink<R>(
     archive: &mut tokio_tar::Archive<R>,
     data_dir: &Path,
@@ -257,8 +210,7 @@ where
 }
 
 /// One tar entry through the sink. Factored so callers can drive
-/// non-tar-shaped FileMeta sequences (e.g. inline symlink emission
-/// before the data archive opens, or a future LocalDir source).
+/// non-tar-shaped FileMeta sequences (e.g. inline symlink emission).
 pub(crate) async fn pump_entry<R>(
     body: &mut R,
     meta: &FileMeta,
@@ -380,13 +332,9 @@ where
     Ok(())
 }
 
-/// Materialize a tablespace symlink as a `FileMeta` and pump it
-/// through the sink. Source impls call this for any
-/// `Tablespace::is_default() == false` entry that didn't already ride
-/// inside the tar stream as a `pg_tblspc/<oid>` Symlink. Both
-/// production impls today get the symlinks from inside the data-dir
-/// archive, so this helper is currently used only by future LocalDir
-/// shapes — exposed for API symmetry.
+/// Materialize a non-default tablespace symlink and pump it through the
+/// sink. Both production impls get symlinks from inside the data-dir
+/// archive, so this is unused today, exposed for future LocalDir shapes.
 #[allow(dead_code)]
 pub(crate) async fn emit_tablespace_symlink(
     tablespace: &Tablespace,
@@ -415,11 +363,9 @@ pub(crate) mod testing {
 
     use tokio::io::AsyncWriteExt;
 
-    /// Build a one-archive tar in memory containing the curated set of
-    /// entries every routing test asserts on. Mirrors PG's BASE_BACKUP
-    /// layout roughly: an empty pg_replslot dir + denylist file inside,
-    /// a global/ catalog, a base/<db>/<catalog>, a base/<db>/<heap>,
-    /// pg_control last.
+    /// In-memory tar roughly mirroring PG's BASE_BACKUP layout: empty
+    /// pg_replslot dir + denylist file inside, global/ catalog,
+    /// base/<db>/<catalog>, base/<db>/<heap>, pg_control last.
     pub async fn build_synthetic_tar() -> Vec<u8> {
         let buf: Vec<u8> = Vec::new();
         let mut b = tokio_tar::Builder::new(buf);
@@ -469,9 +415,8 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
 
-    /// Recording sink — collects every callback into a `Vec<Event>` so
-    /// tests assert on the exact sequence the source produced. Owns
-    /// captured `Tap` chunks per file.
+    /// Collects every callback into `events` so tests assert on the
+    /// exact sequence; `tapped` holds captured Tap chunks per file.
     #[derive(Debug, Default)]
     pub(crate) struct RecordingSink {
         pub events: Vec<Event>,
@@ -498,7 +443,6 @@ mod tests {
             Ok(())
         }
         fn begin(&mut self, _entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
-            // Route catalogs Keep, denylist Skip, user heap Tap, rest Keep
             let s = meta.path.to_string_lossy();
             let action = if s.starts_with("pg_replslot/") {
                 if matches!(meta.kind, FileKind::Dir) {
@@ -603,10 +547,9 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut h = tokio_tar::Header::new_gnu();
-            // tokio_tar::Builder::set_path refuses `..`, so synthesise
-            // a header with the path bytes directly. PG's BASE_BACKUP
-            // never emits `..` paths but a hostile / corrupt tar must
-            // not escape data_dir.
+            // set_path refuses `..`, so write header bytes directly. PG
+            // never emits `..` but a hostile / corrupt tar must not
+            // escape data_dir.
             let name = b"../../etc/passwd";
             h.as_old_mut().name[..name.len()].copy_from_slice(name);
             h.set_size(0);
@@ -636,18 +579,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Catalogs landed
         assert!(data_dir.join("base/5/1259").exists(), "catalog must land");
         assert!(data_dir.join("global/1213").exists(), "global must land");
         assert!(data_dir.join("pg_control").exists(), "pg_control must land");
-        // Denylist dir landed (empty), file inside did not
+        // Denylist dir lands empty, file inside does not
         assert!(data_dir.join("pg_replslot").is_dir());
         assert!(!data_dir.join("pg_replslot/0/state").exists());
-        // User heap tapped, did not land on disk
+        // User heap tapped, not landed
         assert!(!data_dir.join("base/5/16400").exists());
 
         let r = recording.lock().unwrap();
-        // Last file event must be pg_control end
+        // Last file event must be pg_control end (contract 3)
         let last_end = r
             .events
             .iter()
@@ -658,8 +600,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(last_end, PathBuf::from("pg_control"));
-        // Tap fired for user heap exactly once worth of chunks summing to
-        // the file body length
+        // Tapped chunks sum to the file body length
         let tapped_bytes: usize = r
             .events
             .iter()

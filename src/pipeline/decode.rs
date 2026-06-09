@@ -1,15 +1,14 @@
 //! Decode pool — the CPU/IO-parallel stage.
 //!
-//! Each worker pulls a [`DecodeJob`] (one committed xact's ordered,
-//! still-toasted heaps + chunk map) off the shared job queue and, per heap:
-//! detoasts (catalog), resolves the relation → mapping → destination table,
-//! runs oracle `PgPending` resolution + sampled validation, and routes the
-//! row to the [`InsertBatcher`](crate::pipeline::batcher). After the xact's
-//! last row it reports `Placed{seq, rows}` to the ack collector.
+//! Each worker pulls a [`DecodeJob`] and per heap detoasts, resolves
+//! relation → mapping → table, runs oracle `PgPending` resolution + sampled
+//! validation, and routes to the
+//! [`InsertBatcher`](crate::pipeline::batcher). After the xact's last row it
+//! reports `Placed{seq, rows}`.
 //!
 //! Out-of-order completion across workers is fine: rows carry `source_lsn`
 //! as `_lsn`, so `ReplacingMergeTree(_lsn)` converges per PK
-//! (`project_walshadow_eventual_consistency`). At M=1 dispatch order (so
+//! (`project_walshadow_eventual_consistency`). At M=1 dispatch order (hence
 //! per-table WAL order) is preserved.
 
 use std::collections::{BTreeMap, HashMap};
@@ -31,9 +30,8 @@ use crate::xact_buffer::detoast_heap;
 /// Reassembled-TOAST chunk map: `(toast_relid, value_id) -> seq -> bytes`.
 pub type ToastChunks = HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>;
 
-/// One committed xact handed to the decode pool. `chunks` is `Arc` so the
-/// barrier coordinator can dispatch several data segments of one xact
-/// sharing the same TOAST chunk map without cloning it.
+/// `chunks` is `Arc` so the barrier coordinator can dispatch several data
+/// segments of one xact sharing the same TOAST chunk map without cloning.
 pub struct DecodeJob {
     pub seq: u64,
     pub commit_ts: i64,
@@ -49,30 +47,24 @@ pub struct DecodeCtx {
     pub catalog: Arc<Mutex<ShadowCatalog>>,
     pub mapping: MappingHandle,
     pub oracle: Option<Arc<Oracle>>,
-    /// Rows go to the batcher in chunks (capped by [`DECODE_CHUNK_ROWS`] /
-    /// [`DECODE_CHUNK_BYTES`]) on the shared FIFO `BatcherMsg` channel (so a
-    /// barrier `FlushAll` can't overtake them; a whole chunk enqueues as one
-    /// ordered item).
+    /// Shared FIFO `BatcherMsg` channel: a chunk enqueues as one ordered item
+    /// so a barrier `FlushAll` can't overtake it.
     pub msg_tx: mpsc::Sender<BatcherMsg>,
-    /// Shared emitter counters. Decode bumps `foreign_db_rows_skipped` and
-    /// `unsupported_relations` on the skip arms so the parallel path keeps
-    /// those metrics live (the serial emitter bumps them in `route`).
+    /// Decode bumps `foreign_db_rows_skipped` / `unsupported_relations` on the
+    /// skip arms so the parallel path keeps those metrics live.
     pub stats: Arc<EmitterStats>,
 }
 
-/// Rows a decode worker coalesces before one [`BatcherMsg::Rows`] send.
+/// Rows coalesced before one [`BatcherMsg::Rows`] send.
 pub const DECODE_CHUNK_ROWS: usize = 1024;
 
-/// Decoded payload bytes a worker coalesces before one [`BatcherMsg::Rows`]
-/// send — the second half of the dual trigger with [`DECODE_CHUNK_ROWS`].
-/// Bounds the buffer (and the channel item) for fat detoasted rows that
-/// would otherwise pin many MiB before the row cap fires; comfortably above
-/// the ~100 KiB a full row-cap chunk of ordinary rows reaches, so
+/// Byte half of the dual trigger with [`DECODE_CHUNK_ROWS`]. Bounds the
+/// channel item for fat detoasted rows that would pin many MiB before the row
+/// cap fires; above the ~100 KiB an ordinary row-cap chunk reaches, so
 /// steady-state coalescing is unchanged.
 pub const DECODE_CHUNK_BYTES: usize = 4 << 20;
 
-/// Send one coalesced chunk to the batcher. `Err` means the batcher channel
-/// closed (the tail tripped fatal); the caller surfaces it.
+/// `Err` means the batcher channel closed (tail tripped fatal).
 async fn route_chunk(
     msg_tx: &mpsc::Sender<BatcherMsg>,
     rows: Vec<RoutedRow>,
@@ -83,17 +75,14 @@ async fn route_chunk(
         .map_err(|_| "batcher channel closed".to_string())
 }
 
-/// Detoast, resolve, and route every heap of one xact to the batcher.
-/// Returns the number of rows routed (= rows the batcher will encode and
-/// inserters will ack — the `R` the collector compares against). Used by
-/// both the decode workers and the barrier's data segments.
+/// Detoast, resolve, and route every heap of one xact. Returns rows routed
+/// (the `R` the collector compares against). Used by decode workers and the
+/// barrier's data segments.
 ///
-/// Rows are sent in chunks capped by [`DECODE_CHUNK_ROWS`] or
-/// [`DECODE_CHUNK_BYTES`] (whichever trips first); the buffer is flushed
-/// before returning so every routed row is on the channel by the time the
-/// caller reports `Placed` (the watermark invariant). Foreign-database and
-/// unmapped relations are skipped (bumping `foreign_db_rows_skipped` /
-/// `unsupported_relations`, as in the serial emitter); any other catalog
+/// The buffer is flushed before returning so every routed row is on the
+/// channel by the time the caller reports `Placed` (watermark invariant).
+/// Foreign-database and unmapped relations are skipped (bumping
+/// `foreign_db_rows_skipped` / `unsupported_relations`); any other catalog
 /// error poisons the stream.
 pub async fn decode_and_route(
     ctx: &DecodeCtx,
@@ -115,7 +104,7 @@ pub async fn decode_and_route(
                 .await
             {
                 Ok(r) => r,
-                // Foreign-DB WAL (physical WAL carries the whole cluster): skip.
+                // Physical WAL carries the whole cluster; skip foreign-DB rows
                 Err(CatalogError::ForeignDatabase(_)) => {
                     ctx.stats
                         .foreign_db_rows_skipped
@@ -136,8 +125,8 @@ pub async fn decode_and_route(
             commit_lsn,
         };
         if let Some(oracle) = &ctx.oracle {
-            // Mirror OracleObserver::on_tuple — resolve PgPending columns via
-            // shadow PG's extension, then fire the 1-in-N validator probe.
+            // Mirror OracleObserver::on_tuple: resolve PgPending via shadow PG
+            // extension, then fire the 1-in-N validator probe
             if let Some(t) = committed.decoded.new.as_mut() {
                 resolve_pending_tuple(oracle, &mut t.columns).await;
             }
@@ -167,9 +156,8 @@ pub async fn decode_and_route(
     Ok(routed)
 }
 
-/// Spawn `m` decode workers draining `jobs`. Each reports `Placed{seq, R}`
-/// on success; a decode error is fatal (a never-placed seq would pin the
-/// watermark forever).
+/// Spawn `m` decode workers draining `jobs`. A decode error is fatal: a
+/// never-placed seq would pin the watermark forever.
 pub fn spawn_pool(
     m: usize,
     ctx: DecodeCtx,

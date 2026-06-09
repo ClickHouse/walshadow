@@ -1,40 +1,30 @@
 //! Live catalog relfilenode set.
 //!
-//! Bootstrap rule: every rel_node < FirstNormalObjectId (16384) starts
-//! in the catalog set. Matches `classify::is_catalog_relnode` for parity
-//! with the per-record classifier.
+//! Bootstrap rule: rel_node < FirstNormalObjectId (16384) is catalog.
 //!
-//! Updates:
+//! Update sources:
 //! * `RM_RELMAP_ID / XLOG_RELMAP_UPDATE` — authoritative for mapped
-//!   catalogs (pg_class, pg_attribute, pg_type, pg_proc, pg_database,
-//!   pg_authid, pg_shdepend, …). Body is `xl_relmap_update` + a
-//!   `RelMapFile` blob (magic + mappings + crc, see PG
-//!   `src/backend/utils/cache/relmapper.c`). Each non-zero mapping
-//!   `(mapoid, mapfilenumber)` adds `mapfilenumber` to the catalog
-//!   set for that database (or the shared set if `dbid == 0`).
-//! * Heap writes to `pg_class` — decoded via `pg_class_decoder`.
-//!   Carries new relfilenodes for non-mapped catalogs
-//!   after `VACUUM FULL` / `REINDEX` / `CLUSTER`. Filters on
-//!   `oid < FirstNormalObjectId` so user-table inserts into pg_class
-//!   never pollute the catalog set.
-//! * [`seed_from_source`](CatalogTracker::seed_from_source) — bootstrap
-//!   from a libpq connection to the source PG before the replication
-//!   cursor advances. Closes the "long-running source has already
-//!   rotated a mapped catalog above 16384 before walshadow attaches"
-//!   hole that the < 16384 bootstrap rule misses on its own.
+//!   catalogs (pg_class, pg_attribute, pg_type, pg_proc, pg_database, …).
+//!   Body is `xl_relmap_update` + `RelMapFile` blob (magic + mappings +
+//!   crc, see PG `src/backend/utils/cache/relmapper.c`). Each non-zero
+//!   `(mapoid, mapfilenumber)` adds `mapfilenumber` for that database
+//!   (shared set if `dbid == 0`).
+//! * Heap writes to `pg_class` (`pg_class_decoder`). Carry new
+//!   relfilenodes for non-mapped catalogs after VACUUM FULL / REINDEX /
+//!   CLUSTER. `oid < FirstNormalObjectId` filter keeps user-table
+//!   inserts into pg_class out of the catalog set.
+//! * [`seed_from_source`](CatalogTracker::seed_from_source) — closes the
+//!   hole where a long-running source rotated a mapped catalog above
+//!   16384 before walshadow attached, so its `XLOG_RELMAP_UPDATE` sits
+//!   in pre-attach WAL the bootstrap rule never sees.
 //!
-//! Invalidation signal: when
-//! [`set_invalidation_epoch`](CatalogTracker::set_invalidation_epoch)
-//! attaches an `AtomicU64`, every `observe`
-//! that processes a relmap update or a pg_class heap write bumps the
-//! counter. [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog)
-//! shares the same atomic and consults it at the top of every relation
-//! lookup; an advance triggers an in-line `ShadowCatalog::invalidate`
-//! call before the cache check. Synchronous so a catalog write
-//! observed in the same `WalStream::push` batch as the dependent heap
-//! INSERT can't lose the race against an async drain task.
-//! Senderless trackers (`walshadow-filter` CLI, batch filter tests)
-//! bump nothing.
+//! Invalidation signal: when [`set_invalidation_epoch`] attaches an
+//! `AtomicU64`, every relmap-update / pg_class-heap-write observe bumps
+//! it. [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog) shares the
+//! atomic, acquire-loads at every relation lookup, and invalidates before
+//! the cache check. Synchronous so a catalog write in the same
+//! `WalStream::push` batch as the dependent heap INSERT can't lose the
+//! race against an async drain task. Senderless trackers bump nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -57,60 +47,40 @@ const RELMAPPER_FILEMAGIC: i32 = 0x592717;
 const MAX_MAPPINGS: usize = 64;
 const REL_MAP_FILE_SIZE: usize = 4 + 4 + MAX_MAPPINGS * 8 + 4; // magic + n + mappings + crc
 
-/// `pg_class.oid` — fixed PG catalog OID since forever.
+/// `pg_class.oid`, fixed PG catalog OID
 pub const PG_CLASS_OID: u32 = 1259;
 
 #[derive(Debug, Default)]
 pub struct CatalogTracker {
-    /// `(db_node, rel_node)` for per-database catalogs. `db_node == 0`
-    /// is the shared catalog set; queries on any db must consult it.
+    /// `(db_node, rel_node)`; `db_node == 0` is the shared catalog set,
+    /// consulted by queries on any db
     nodes: HashSet<(u32, u32)>,
-    /// Current pg_class filenode per database. Seeded by relmap update
-    /// for oid=1259 and by [`seed_from_source`](Self::seed_from_source).
-    /// Empty bootstrap falls through to the `rel == PG_CLASS_OID`
-    /// initial-relfilenode check (mapped-catalog convention).
+    /// Current pg_class filenode per db. Empty bootstrap falls through to
+    /// `rel == PG_CLASS_OID` (mapped-catalog relfilenode == oid until
+    /// first rewrite).
     pg_class_filenode: HashMap<u32, u32>,
-    /// Shared atomic counter consulted by [`ShadowCatalog`]'s lookup
-    /// path. Every catalog-touching observe bumps it; the catalog sees
-    /// the bump on the next relation lookup (acquire-load) and
-    /// invalidates its cache before the cache check. Senderless
-    /// trackers leave this `None`.
+    /// Bumped on every catalog-touching observe; ShadowCatalog acquire-
+    /// loads and invalidates before its cache check. Senderless: `None`.
     invalidation_epoch: Option<Arc<AtomicU64>>,
-    /// Narrower signal: bumps ONLY on pg_class
-    /// heap_delete records (the WAL shape that DROP TABLE writes).
-    /// Lets `ShadowCatalog::sweep_dropped` throttle off this
-    /// counter so non-drop DDL (ADD COLUMN, CREATE INDEX, ...) doesn't
-    /// trigger a per-commit shadow PG round-trip. Senderless trackers
-    /// leave this `None`.
+    /// Bumped only on pg_class heap_delete (the shape DROP TABLE writes),
+    /// so `ShadowCatalog::sweep_dropped` throttles off drops and skips a
+    /// per-commit shadow round-trip for non-drop DDL. Senderless: `None`.
     pg_class_delete_epoch: Option<Arc<AtomicU64>>,
-    /// Count of relmap updates observed (debug / metrics).
     pub relmap_updates: u64,
-    /// pg_class heap writes whose payload failed `pg_class_decoder`
-    /// (truncated block data, missing column data, malformed `t_hoff`).
-    /// Records that omit OID because PG prefix-compressed it land in
-    /// `pg_class_writes_oid_in_prefix` instead; this counter is
-    /// reserved for genuinely malformed input.
+    /// pg_class heap writes the decoder couldn't reconstruct (truncated /
+    /// malformed `t_hoff`). OID-prefix-compressed records count in
+    /// `pg_class_writes_oid_in_prefix` instead.
     pub pg_class_writes_undecoded: u64,
-    /// pg_class heap writes successfully decoded. Catalog filenodes
-    /// (oid < FirstNormalObjectId) extracted from these are added to
-    /// `nodes`. User-table inserts decode fine but their oid trips the
-    /// catalog filter and they are not added.
     pub pg_class_writes_decoded: u64,
-    /// pg_class UPDATE / HOT_UPDATE records that PG prefix-compressed
-    /// past the OID column — `XLH_UPDATE_PREFIX_FROM_OLD` set with
-    /// `prefixlen > 0`. The WAL record alone cannot reconstruct
-    /// `(oid, relfilenode)` for these; learning the rotated catalog
-    /// filenode requires the seed snapshot or a subsequent
-    /// `XLOG_RELMAP_UPDATE`. Typical pattern: `VACUUM FULL
-    /// pg_<non-mapped>` (pg_depend, pg_namespace, pg_constraint, …).
+    /// pg_class UPDATE / HOT_UPDATE that prefix-compressed past the OID
+    /// (`XLH_UPDATE_PREFIX_FROM_OLD`, `prefixlen > 0`). WAL alone can't
+    /// reconstruct `(oid, relfilenode)`; rotated filenode learned via seed
+    /// snapshot or later `XLOG_RELMAP_UPDATE`. Typical: VACUUM FULL on a
+    /// non-mapped catalog (pg_depend, pg_namespace, …).
     pub pg_class_writes_oid_in_prefix: u64,
-    /// `(db_node, filenode)` pairs added at attach time via
-    /// [`seed_from_source`](Self::seed_from_source).
     pub seeded_from_source: u64,
-    /// Cumulative count of epoch bumps emitted from this tracker. The
-    /// catalog's `generation_bumps` may lag because the catalog
-    /// collapses multiple bumps observed between two lookups into one
-    /// `invalidate` call.
+    /// Epoch bumps emitted here; catalog's `generation_bumps` may lag as
+    /// it collapses bumps between lookups into one `invalidate`.
     pub invalidation_signals_sent: u64,
 }
 
@@ -125,25 +95,14 @@ impl CatalogTracker {
         Self::default()
     }
 
-    /// Add a `(db, rel)` pair to the catalog set explicitly.
     pub fn add(&mut self, db_node: u32, rel_node: u32) {
         self.nodes.insert((db_node, rel_node));
     }
 
-    /// Attach a shared epoch counter. Bumped on every catalog-touching
-    /// observe. The [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog)
-    /// holding the matching `Arc` clone collapses observed bumps into
-    /// `invalidate` calls on the next relation lookup. Last-writer-wins
-    /// if called twice.
     pub fn set_invalidation_epoch(&mut self, epoch: Arc<AtomicU64>) {
         self.invalidation_epoch = Some(epoch);
     }
 
-    /// Attach the DROP-only counter. Bumped only on
-    /// pg_class `heap_delete` records (the DDL shape that flags an
-    /// oid as gone). `ShadowCatalog::sweep_dropped` gates off this
-    /// counter to skip per-commit shadow round-trips for non-drop
-    /// DDL.
     pub fn set_pg_class_delete_epoch(&mut self, epoch: Arc<AtomicU64>) {
         self.pg_class_delete_epoch = Some(epoch);
     }
@@ -161,10 +120,9 @@ impl CatalogTracker {
         }
     }
 
-    /// True if `(db, rel)` is currently catalog. `rel < FIRST_NORMAL_OBJECT_ID`
-    /// is the bootstrap rule; tracked relmap updates add post-rewrite
-    /// filenumbers. Shared catalogs (`db_node == 0`) always treated as
-    /// catalog (pg_database, pg_authid, pg_tablespace, etc.).
+    /// `rel < FIRST_NORMAL_OBJECT_ID` is the bootstrap rule; relmap
+    /// updates add post-rewrite filenumbers. `db_node == 0` (shared:
+    /// pg_database, pg_authid, …) consulted for any db.
     pub fn is_catalog(&self, db_node: u32, rel_node: u32) -> bool {
         if rel_node == 0 {
             return false;
@@ -178,8 +136,7 @@ impl CatalogTracker {
         self.nodes.contains(&(db_node, rel_node)) || self.nodes.contains(&(0, rel_node))
     }
 
-    /// Feed every record through here. Filters internally on rmgr
-    /// + info so callers can call unconditionally.
+    /// Filters internally on rmgr + info; safe to call unconditionally.
     pub fn observe(&mut self, record: &XLogRecord) {
         let rm = record.header.resource_manager_id;
         let info_high = record.header.info & 0xF0;
@@ -195,13 +152,10 @@ impl CatalogTracker {
             self.harvest_pg_class_blocks(record);
             return;
         }
-        // DROP TABLE writes `heap_delete` against
-        // pg_class, which the (insert/update-only) harvest path
-        // skips. Bump the invalidation epoch anyway so the catalog
-        // cache invalidates + downstream `sweep_dropped` runs on the
-        // next commit boundary. We don't try to decode the dying
-        // tuple's OID — system catalogs default to
-        // `relreplident = 'n'` so the WAL doesn't carry it.
+        // DROP TABLE writes pg_class heap_delete, skipped by the
+        // insert/update-only harvest path. Bump epoch anyway so cache
+        // invalidates + sweep_dropped runs next commit. Dying tuple OID
+        // not decoded: catalogs default relreplident='n', WAL omits it.
         if rm == RmId::Heap as u8 {
             let info_op = info_high & 0x70;
             if info_op == 0x10 {
@@ -211,11 +165,9 @@ impl CatalogTracker {
         }
     }
 
-    /// Bump the invalidation epoch when a record targets the current
-    /// pg_class filenode. Used for ops the harvest path skips
-    /// (DELETE / etc.) — coarse-fire only, no row-level decode. Also
-    /// bumps the narrower `pg_class_delete_epoch` so the catalog's
-    /// DROP-TABLE sweep can throttle off the delete-specific signal.
+    /// Coarse-fire (no row decode) when a record hits the current
+    /// pg_class filenode, for ops the harvest path skips (DELETE). Also
+    /// bumps `pg_class_delete_epoch` for the DROP-TABLE sweep.
     fn signal_pg_class_touch(&mut self, record: &XLogRecord) {
         if self.pg_class_block(record).is_none() {
             return;
@@ -224,9 +176,8 @@ impl CatalogTracker {
         self.signal_pg_class_delete();
     }
 
-    /// First block's `(db_node, rel_node)` when `record` targets the
-    /// current pg_class filenode; `None` for no-block records or writes
-    /// to other relations.
+    /// First block's `(db_node, rel_node)` iff it targets the current
+    /// pg_class filenode; `None` otherwise.
     fn pg_class_block(&self, record: &XLogRecord) -> Option<(u32, u32)> {
         let blk = record.blocks.first()?;
         let (db, rel) = (
@@ -236,12 +187,9 @@ impl CatalogTracker {
         self.is_pg_class_relfilenode(db, rel).then_some((db, rel))
     }
 
-    /// Decode the new-tuple block (block 0) of `record` when it targets
-    /// pg_class. PG's `heap_insert` / `heap_update` /
-    /// `heap_hot_update` always register the new tuple via
-    /// `XLogRegisterBufData(0, ...)`; later block refs (e.g.,
-    /// `heap_update`'s block 1 "old page" reference) carry no tuple
-    /// data and must not be fed to the decoder.
+    /// Decode block 0 when `record` targets pg_class. PG registers the
+    /// new tuple via `XLogRegisterBufData(0, ...)`; later block refs
+    /// (heap_update's block 1 old page) carry no tuple, must not decode.
     fn harvest_pg_class_blocks(&mut self, record: &XLogRecord) {
         let Some((db, _rel)) = self.pg_class_block(record) else {
             return;
@@ -257,25 +205,20 @@ impl CatalogTracker {
                 self.pg_class_writes_oid_in_prefix += 1;
             }
             DecodeOutcome::Undecoded => {
-                // Decoder couldn't reconstruct (oid, relfilenode) — varies
-                // by PG version + record shape (PG 17 ALTER ADD COLUMN
-                // emits an HOT_UPDATE on pg_class whose new tuple omits
-                // the relnatts-bearing prefix). Catalog cache must
-                // still drop: silent skip caused add-column drills to
-                // ship c=NULL for post-ALTER rows decoded against the
-                // stale 2-column descriptor.
+                // Cache must still drop: PG 17 ALTER ADD COLUMN emits a
+                // pg_class HOT_UPDATE whose new tuple omits the relnatts
+                // prefix; silent skip shipped c=NULL for post-ALTER rows
+                // decoded against the stale 2-column descriptor.
                 self.pg_class_writes_undecoded += 1;
             }
         }
-        // Coarse-fire regardless of decoder outcome. Over-invalidation is
-        // cheap (lazy refetch); under-invalidation silently masks DDL.
+        // Coarse-fire regardless: over-invalidation is cheap (lazy
+        // refetch), under-invalidation silently masks DDL.
         self.signal_invalidation();
     }
 
-    /// True iff `(db, rel)` is the current pg_class filenode for `db`.
-    /// Falls back to `rel == PG_CLASS_OID` when nothing has been observed
-    /// for `db` yet (initial mapped-catalog convention: relfilenode
-    /// equals oid until the first RELMAP rewrite).
+    /// Falls back to `rel == PG_CLASS_OID` until a filenode is observed
+    /// for `db` (mapped-catalog relfilenode == oid until first rewrite).
     fn is_pg_class_relfilenode(&self, db: u32, rel: u32) -> bool {
         match self.pg_class_filenode.get(&db) {
             Some(&fnum) => fnum == rel,
@@ -286,7 +229,7 @@ impl CatalogTracker {
     fn handle_relmap_update(&mut self, record: &XLogRecord) {
         self.relmap_updates += 1;
         let md = &record.main_data;
-        // xl_relmap_update: dbid(4) + tsid(4) + nbytes(4) = 12 bytes
+        // xl_relmap_update header: dbid(4) + tsid(4) + nbytes(4) = 12
         if md.len() < 12 + REL_MAP_FILE_SIZE {
             return;
         }
@@ -320,14 +263,10 @@ impl CatalogTracker {
         self.signal_invalidation();
     }
 
-    /// Populate the catalog set & pg_class-filenode map by querying the
-    /// source PG's `pg_class` for every catalog relation (oid < 16384).
-    /// Closes the "rotated mapped catalog before walshadow attached"
-    /// hole — the bootstrap rule otherwise misses post-rewrite filenodes
-    /// because the corresponding `XLOG_RELMAP_UPDATE` sits in pre-attach
-    /// WAL walshadow never sees.
-    ///
-    /// Shared catalogs are seeded under `db_node = 0`; per-db under the
+    /// Query source `pg_class` for every catalog relation (oid < 16384).
+    /// Closes the rotated-mapped-catalog-before-attach hole: post-rewrite
+    /// filenodes whose `XLOG_RELMAP_UPDATE` sits in pre-attach WAL.
+    /// Shared catalogs seeded under `db_node = 0`, per-db under the
     /// source's current-database oid.
     pub async fn seed_from_source(&mut self, client: &Client) -> Result<usize, SeedError> {
         let rows = client
@@ -364,7 +303,6 @@ impl CatalogTracker {
         Ok(added)
     }
 
-    /// Size of the tracked set, for metrics.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -386,14 +324,12 @@ mod tests {
         data.extend_from_slice(&dbid.to_le_bytes());
         data.extend_from_slice(&1664u32.to_le_bytes()); // tsid pg_global
         data.extend_from_slice(&(REL_MAP_FILE_SIZE as i32).to_le_bytes());
-        // RelMapFile
         data.extend_from_slice(&RELMAPPER_FILEMAGIC.to_le_bytes());
         data.extend_from_slice(&(mappings.len() as i32).to_le_bytes());
         for &(oid, fnum) in mappings {
             data.extend_from_slice(&oid.to_le_bytes());
             data.extend_from_slice(&fnum.to_le_bytes());
         }
-        // Pad rest of mappings array
         for _ in mappings.len()..MAX_MAPPINGS {
             data.extend_from_slice(&[0u8; 8]);
         }
@@ -456,49 +392,33 @@ mod tests {
         }
     }
 
-    /// xl_heap_update main_data with `flags=0`. Sufficient for UPDATE /
-    /// HOT_UPDATE block data that omits prefix/suffix compression.
+    /// Decoder reads only byte 7 (flags), so all-zero suffices.
     fn xl_heap_update_no_compression() -> Vec<u8> {
-        // SizeOfHeapUpdate = 14 bytes; all-zero is fine because the
-        // decoder only reads byte 7 (flags).
-        vec![0u8; 14]
+        vec![0u8; 14] // SizeOfHeapUpdate
     }
 
-    /// pg_class UPDATE block data with `XLH_UPDATE_PREFIX_FROM_OLD`
-    /// shape: leading uint16 prefixlen + xl_heap_header + bitmap pad +
-    /// only the column suffix that survived the prefix strip. Caller
-    /// passes the relfilenode bytes that land at the start of the
-    /// stripped column area. Pre-VACUUM FULL pg_class for non-mapped
-    /// catalogs prefix-compresses cols 1..7 (88 bytes), so the WAL
-    /// payload begins with relfilenode and trailing nullable columns.
+    /// `XLH_UPDATE_PREFIX_FROM_OLD` shape: VACUUM FULL on a non-mapped
+    /// catalog compresses cols 1..7 (88 bytes), so WAL payload begins at
+    /// relfilenode.
     fn pg_class_update_block_prefix_88(relfilenode: u32) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&88u16.to_le_bytes()); // prefixlen
         v.extend_from_slice(&33u16.to_le_bytes()); // t_infomask2
         v.extend_from_slice(&0u16.to_le_bytes()); // t_infomask
         v.push(24); // t_hoff
-        v.push(0); // 1-byte MAXALIGN pad (offset 23 -> 24)
-        // Column data starts at reconstructed offset 24 + 88 = 112, the
-        // first byte of relfilenode.
+        v.push(0); // MAXALIGN pad, offset 23 -> 24
         v.extend_from_slice(&relfilenode.to_le_bytes());
         v
     }
 
-    /// Build an xl_heap_header (t_infomask2, t_infomask, t_hoff) +
-    /// payload that decodes to a pg_class tuple with the given oid and
-    /// relfilenode. No nulls, t_hoff = 24 (no bitmap).
+    /// xl_heap_header + payload decoding to a pg_class tuple. No nulls,
+    /// t_hoff = 24.
     fn pg_class_block_data(oid: u32, relfilenode: u32) -> Vec<u8> {
-        // xl_heap_header: t_infomask2 (col count + flags), t_infomask
-        // (HEAP_HASOID and HASNULL bits — we use 0 for no nulls,
-        // no system oid), t_hoff.
         let mut v = Vec::new();
-        v.extend_from_slice(&33u16.to_le_bytes()); // t_infomask2 (PG 18 pg_class natts)
-        v.extend_from_slice(&0u16.to_le_bytes()); // t_infomask (no nulls)
-        v.push(24); // t_hoff = MAXALIGN(SizeOfHeapTupleHeader) when no nulls
-        // 1 byte of MAXALIGN padding to bring offset from 23 → 24 in the
-        // reconstructed tuple.
-        v.push(0);
-        // Column data
+        v.extend_from_slice(&33u16.to_le_bytes()); // t_infomask2 (pg_class natts)
+        v.extend_from_slice(&0u16.to_le_bytes()); // t_infomask
+        v.push(24); // t_hoff = MAXALIGN(SizeOfHeapTupleHeader)
+        v.push(0); // MAXALIGN pad, offset 23 -> 24
         v.extend_from_slice(&oid.to_le_bytes()); // col 1: oid
         v.extend_from_slice(&[0u8; 64]); // col 2: relname (NAMEDATALEN)
         v.extend_from_slice(&0u32.to_le_bytes()); // col 3: relnamespace
@@ -522,7 +442,6 @@ mod tests {
     #[test]
     fn relmap_update_adds_post_rewrite_filenodes() {
         let mut t = CatalogTracker::new();
-        // pg_class (oid 1259) rewritten to filenode 50000 in db 5
         let r = relmap_record(5, &[(1259, 50000)]);
         t.observe(&r);
         assert!(t.is_catalog(5, 50000));
@@ -532,7 +451,7 @@ mod tests {
     #[test]
     fn shared_relmap_visible_across_dbs() {
         let mut t = CatalogTracker::new();
-        // pg_database (oid 1262) rewritten in shared/global (dbid 0)
+        // pg_database (oid 1262) in shared/global (dbid 0)
         let r = relmap_record(0, &[(1262, 60000)]);
         t.observe(&r);
         assert!(t.is_catalog(0, 60000));
@@ -550,11 +469,9 @@ mod tests {
     #[test]
     fn pg_class_heap_insert_adds_non_mapped_catalog_filenode() {
         let mut t = CatalogTracker::new();
-        // INSERT into pg_class for pg_namespace (oid 2615) carrying
-        // a fresh relfilenode 30000 (e.g., VACUUM FULL pg_namespace).
+        // VACUUM FULL pg_namespace (oid 2615) -> fresh relfilenode
         let data = pg_class_block_data(2615, 30000);
-        // info_high = 0x00 = XLOG_HEAP_INSERT
-        let rec = heap_block_record(RmId::Heap, 0x00, 5, 1259, data);
+        let rec = heap_block_record(RmId::Heap, 0x00, 5, 1259, data); // XLOG_HEAP_INSERT
         t.observe(&rec);
         assert!(t.is_catalog(5, 30000));
         assert_eq!(t.pg_class_writes_decoded, 1);
@@ -564,11 +481,9 @@ mod tests {
     #[test]
     fn pg_class_heap_update_adds_post_vacuum_full_filenode() {
         let mut t = CatalogTracker::new();
-        // UPDATE on pg_class row for pg_depend (oid 2608) to a fresh
-        // relfilenode after VACUUM FULL pg_depend. Synthesised without
-        // prefix/suffix compression — the realistic VACUUM-FULL shape
-        // (prefixlen ≈ 88) is exercised by
-        // [`pg_class_heap_update_with_prefix_compression_increments_oid_in_prefix`].
+        // VACUUM FULL pg_depend (oid 2608) without prefix/suffix
+        // compression; realistic prefixlen ≈ 88 shape covered by
+        // pg_class_heap_update_with_prefix_compression_increments_oid_in_prefix
         let data = pg_class_block_data(2608, 40000);
         let rec = heap_block_record_with_main(
             RmId::Heap,
@@ -586,18 +501,13 @@ mod tests {
 
     #[test]
     fn pg_class_heap_update_with_prefix_compression_increments_oid_in_prefix() {
-        // VACUUM FULL pg_<non-mapped> shape: pg_class cols 1..7 are
-        // unchanged so PG sets XLH_UPDATE_PREFIX_FROM_OLD with
-        // prefixlen ≈ 88. OID lives in the un-logged prefix; tracker
-        // must signal this via pg_class_writes_oid_in_prefix and must
-        // *not* tick pg_class_writes_undecoded. Catalog set stays
-        // unchanged because we can't identify which catalog this
-        // record's filenode belongs to.
+        // VACUUM FULL non-mapped catalog: cols 1..7 unchanged so PG sets
+        // XLH_UPDATE_PREFIX_FROM_OLD, prefixlen ≈ 88, OID in un-logged
+        // prefix. Catalog set unchanged: can't tell which catalog owns it.
         let mut t = CatalogTracker::new();
         let data = pg_class_update_block_prefix_88(40000);
-        // flags = XLH_UPDATE_PREFIX_FROM_OLD (0x20)
         let mut md = xl_heap_update_no_compression();
-        md[7] = 0x20;
+        md[7] = 0x20; // XLH_UPDATE_PREFIX_FROM_OLD
         let rec = heap_block_record_with_main(RmId::Heap, 0x20, 5, 1259, data, md);
         t.observe(&rec);
         assert_eq!(t.pg_class_writes_oid_in_prefix, 1);
@@ -609,21 +519,17 @@ mod tests {
     #[test]
     fn pg_class_heap_insert_for_user_table_does_not_add() {
         let mut t = CatalogTracker::new();
-        // CREATE TABLE user_t generates an INSERT into pg_class with
-        // oid >= 16384. Tracker must NOT add the new filenode.
+        // CREATE TABLE: pg_class INSERT with oid >= 16384, must not add
         let data = pg_class_block_data(50000, 50001);
         let rec = heap_block_record(RmId::Heap, 0x00, 5, 1259, data);
         t.observe(&rec);
         assert!(!t.is_catalog(5, 50001));
-        // Decoded successfully, just filtered by oid range.
-        assert_eq!(t.pg_class_writes_decoded, 1);
+        assert_eq!(t.pg_class_writes_decoded, 1); // decoded, filtered by oid range
     }
 
     #[test]
     fn pg_class_truncated_block_data_increments_undecoded() {
         let mut t = CatalogTracker::new();
-        // Block targeting pg_class with no payload — too short to
-        // decode anything.
         let rec = heap_block_record(RmId::Heap, 0x00, 5, 1259, vec![]);
         t.observe(&rec);
         assert_eq!(t.pg_class_writes_undecoded, 1);
@@ -633,9 +539,8 @@ mod tests {
     #[test]
     fn pg_class_heap_record_with_non_insert_info_ignored() {
         let mut t = CatalogTracker::new();
-        // info_high = 0x30 in RM_HEAP is HEAP_INPLACE — no new tuple.
-        // We must skip these so we don't try to decode block data
-        // that isn't shaped like xl_heap_header + tuple.
+        // 0x30 = HEAP_INPLACE: no new tuple, block data not
+        // xl_heap_header + tuple, must skip
         let data = pg_class_block_data(2608, 40000);
         let rec = heap_block_record(RmId::Heap, 0x30, 5, 1259, data);
         t.observe(&rec);
@@ -646,13 +551,11 @@ mod tests {
     #[test]
     fn pg_class_heap_record_after_relmap_uses_new_filenode() {
         let mut t = CatalogTracker::new();
-        // Source rotated pg_class to filenode 50000 first.
+        // Source rotated pg_class to filenode 50000 first
         let rm = relmap_record(5, &[(1259, 50000)]);
         t.observe(&rm);
-        // Then VACUUM FULL on pg_depend; pg_class block now lives at
-        // filenode 50000, not 1259. No prefix/suffix compression in
-        // this synthetic — narrowly tests the relmap → pg_class
-        // filenode lookup, not the prefix path.
+        // VACUUM FULL pg_depend; pg_class block now at 50000, not 1259.
+        // Tests relmap -> pg_class filenode lookup, not the prefix path.
         let data = pg_class_block_data(2608, 70000);
         let rec = heap_block_record_with_main(
             RmId::Heap,
@@ -674,7 +577,7 @@ mod tests {
         r.main_data.to_mut().truncate(8); // chop off nbytes
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
-        assert_eq!(t.relmap_updates, 1); // still counted, just no update applied
+        assert_eq!(t.relmap_updates, 1); // counted, no update applied
     }
 
     fn fresh_epoch() -> Arc<AtomicU64> {
@@ -722,8 +625,6 @@ mod tests {
             data,
             md,
         ));
-        // pg_class was mutated — descriptor cache for user tables may
-        // be stale even when the WAL stripped the oid into the prefix.
         assert_eq!(
             epoch.load(Ordering::Acquire),
             1,
@@ -737,8 +638,7 @@ mod tests {
         let epoch = fresh_epoch();
         let mut t = CatalogTracker::new();
         t.set_invalidation_epoch(epoch.clone());
-        // Truncated block data — decoder returns Undecoded, but the
-        // record still touched pg_class. Coarse signal so cache drops.
+        // Undecoded but still touched pg_class: coarse signal, cache drops
         t.observe(&heap_block_record(RmId::Heap, 0x00, 5, 1259, vec![]));
         assert_eq!(epoch.load(Ordering::Acquire), 1);
         assert_eq!(t.invalidation_signals_sent, 1);
@@ -757,8 +657,7 @@ mod tests {
         let epoch = fresh_epoch();
         let mut t = CatalogTracker::new();
         t.set_invalidation_epoch(epoch.clone());
-        // Heap insert against a user-table relfilenode — not pg_class
-        // (no relmap seen), tracker skips harvest.
+        // User-table relfilenode (no relmap seen), harvest skipped
         let rec = heap_block_record(RmId::Heap, 0x00, 5, 50000, vec![0u8; 16]);
         t.observe(&rec);
         assert_eq!(epoch.load(Ordering::Acquire), 0);
@@ -776,7 +675,7 @@ mod tests {
     fn add_grows_len_idempotently() {
         let mut t = CatalogTracker::new();
         t.add(5, 50000);
-        t.add(5, 50000); // duplicate — set absorbs it
+        t.add(5, 50000); // duplicate
         t.add(5, 50001);
         assert!(!t.is_empty());
         assert_eq!(t.len(), 2);
@@ -786,8 +685,7 @@ mod tests {
     fn relmap_update_with_wrong_nbytes_is_ignored() {
         let mut t = CatalogTracker::new();
         let mut r = relmap_record(5, &[(1259, 50000)]);
-        // Patch nbytes (offset 8..12 in main_data) to something other than
-        // REL_MAP_FILE_SIZE. The decoder must short-circuit before reading.
+        // nbytes at main_data[8..12]; mismatch must short-circuit
         r.main_data.to_mut()[8..12].copy_from_slice(&12345i32.to_le_bytes());
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
@@ -798,8 +696,7 @@ mod tests {
     fn relmap_update_with_wrong_magic_is_ignored() {
         let mut t = CatalogTracker::new();
         let mut r = relmap_record(5, &[(1259, 50000)]);
-        // Magic is the first 4 bytes of the rel-map-file (offset 12..16 of
-        // main_data: 12 header + 0 magic offset).
+        // magic at main_data[12..16] (12 header + magic offset 0)
         r.main_data.to_mut()[12..16].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
@@ -809,7 +706,7 @@ mod tests {
     fn relmap_update_rejects_oversized_num_mappings() {
         let mut t = CatalogTracker::new();
         let mut r = relmap_record(5, &[(1259, 50000)]);
-        // num_mappings sits at main_data[16..20] (12 header + 4 magic).
+        // num_mappings at main_data[16..20] (12 header + 4 magic)
         r.main_data.to_mut()[16..20].copy_from_slice(&((MAX_MAPPINGS + 1) as i32).to_le_bytes());
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
@@ -818,8 +715,7 @@ mod tests {
     #[test]
     fn relmap_update_skips_zero_mapping_entries() {
         let mut t = CatalogTracker::new();
-        // Entries with mapoid=0 or filenum=0 are absentees; they must
-        // not pollute the catalog set.
+        // mapoid=0 or filenum=0 entries are absentees, must not pollute
         let r = relmap_record(5, &[(0, 50000), (1259, 0)]);
         t.observe(&r);
         assert!(t.is_empty(), "zero-tagged entries must be skipped");
@@ -829,8 +725,7 @@ mod tests {
     fn relmap_update_with_truncated_main_data_is_ignored() {
         let mut t = CatalogTracker::new();
         let mut r = relmap_record(5, &[(1259, 50000)]);
-        // Lop off the relmap body so len < 12 + REL_MAP_FILE_SIZE.
-        r.main_data.to_mut().truncate(4);
+        r.main_data.to_mut().truncate(4); // len < 12 + REL_MAP_FILE_SIZE
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
     }

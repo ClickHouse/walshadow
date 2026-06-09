@@ -1,59 +1,47 @@
-//! CH-side DDL applicator.
-//!
-//! Consumes [`SchemaEvent`] dispatch from
-//! [`crate::xact_buffer::XactBuffer::commit`]'s k-way merge (via the
-//! [`crate::decoder_sink::TupleObserver::on_schema_event`] callback)
-//! and translates each event into the matching CH SQL:
+//! CH-side DDL applicator. Translates each [`SchemaEvent`] into CH SQL:
 //!
 //! | event | CH SQL |
 //! |---|---|
 //! | `Added` | `CREATE TABLE IF NOT EXISTS …` (only when namespace `auto_create = true`) |
 //! | `Changed.added_columns` | `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` per column in attnum order |
-//! | `Changed.renamed_columns` | `ALTER TABLE … RENAME COLUMN … TO …` first |
+//! | `Changed.renamed_columns` | `ALTER TABLE … RENAME COLUMN IF EXISTS … TO …` first |
 //! | `Changed.dropped_columns` | `ALTER TABLE … DROP COLUMN IF EXISTS …` |
 //! | `Changed.type_changes` | rejected — logged, not applied (open question) |
 //! | `Dropped` | `DROP TABLE IF EXISTS …` gated on [`DropTableStrategy`] |
 //!
-//! ## Connection lifecycle
-//!
-//! The applicator opens its own `clickhouse_c::AsyncClient` (separate
-//! from the emitter's INSERT pump) so DDL doesn't ride the INSERT
-//! backpressure path. Same `(host, port, user, password, database)` as
-//! the emitter; built from the same `EmitterConfig`.
+//! Opens its own `AsyncClient` (separate from the INSERT pump) so DDL
+//! doesn't ride the INSERT backpressure path.
 //!
 //! ## Coordination with the INSERT pump
 //!
 //! The reorder coordinator ([`crate::pipeline::reorder`]) drives DDL
-//! ordering: within a barrier xact it dispatches pending data segments,
-//! fences (seals the batcher and waits until every earlier row is durable
-//! on CH), then applies the schema change here, then resumes. The CH table
-//! is reshaped only after all earlier-LSN rows have landed; post-DDL rows
-//! then encode against the new shape.
+//! ordering: within a barrier xact it dispatches pending data, fences
+//! (seals the batcher, waits until every earlier row is durable on CH),
+//! then applies the schema change, then resumes. Post-DDL rows encode
+//! against the new shape.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use clickhouse_c::AsyncClient;
 
 use crate::ch_emitter::{
-    ColumnMapping, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, TableMapping,
-    connect_client, drain_to_end_of_stream, quote_ident,
+    ColumnMapping, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, RetryConfig,
+    TableMapping, connect_client, drain_to_end_of_stream, is_retryable, quote_ident,
 };
 use crate::shadow_catalog::{RelDescriptor, SchemaDiff, SchemaEvent};
 use crate::type_bridge::{self, ResolvedColumn};
 
-/// Per-relation DROP TABLE behaviour. Matches the
-/// `--drop-table-strategy` flag.
+/// Per-relation DROP TABLE behaviour, matches `--drop-table-strategy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DropTableStrategy {
-    /// Source `DROP TABLE` drops the in-memory encoder for the
-    /// relation; CH dest stays. Default — surprising silent CH drops
-    /// are operationally hazardous.
+    /// Drop only the in-memory encoder; CH dest stays. Default, since
+    /// silent CH drops are operationally hazardous.
     #[default]
     Retain,
-    /// Source `DROP TABLE` runs `DROP TABLE IF EXISTS <dest>` on CH.
+    /// Run `DROP TABLE IF EXISTS <dest>` on CH
     Drop,
-    /// Same as Retain, but logs at WARN. Useful for operators staging
-    /// the move to `Drop`.
+    /// Like Retain but logs at WARN; for staging the move to `Drop`
     Warn,
 }
 
@@ -72,27 +60,20 @@ impl DropTableStrategy {
     }
 }
 
-/// Knobs that don't ride the emitter's INSERT pump but still need to
-/// flow through the same TOML reload path. Owned by the applicator;
-/// SIGHUP reload swaps the inner via [`DdlApplicator::config_mut`].
+/// Knobs that don't ride the INSERT pump but flow through the same TOML
+/// reload path. SIGHUP reload swaps the inner via
+/// [`DdlApplicator::config_mut`].
 #[derive(Debug, Clone)]
 pub struct DdlConfig {
     pub drop_table_strategy: DropTableStrategy,
-    /// Auto-create hook — when a namespace mapping with
-    /// `auto_create = true` is configured for the source namespace,
-    /// `Added` events run `CREATE TABLE IF NOT EXISTS` automatically.
-    /// Today's config only carries the namespace allow-list; the
-    /// applicator consults `mapping_handle` for the per-table override
-    /// path and treats namespace-implicit creates as best-effort.
+    /// Namespaces whose `Added` events run `CREATE TABLE IF NOT EXISTS`
+    /// automatically (`auto_create = true`)
     pub auto_create_namespaces: HashSet<String>,
-    /// CH database name DDL targets when neither the per-table mapping
-    /// nor the source namespace overrides the destination. Matches the
-    /// emitter's `EmitterConfig::database`.
+    /// CH database DDL targets when neither per-table mapping nor source
+    /// namespace overrides the destination
     pub target_database: String,
-    /// Per-namespace overrides (`target_database`, `drop_table_strategy`)
-    /// keyed by source namespace, resolved in `Self::target_database_for`
-    /// and `Self::drop_strategy_for`. The global fields above are the
-    /// fallback when a namespace has no override.
+    /// Per-namespace overrides, fallback to the global fields above when
+    /// a namespace has none
     pub namespaces: HashMap<String, NamespaceMapping>,
 }
 
@@ -114,8 +95,6 @@ impl DdlConfig {
         }
     }
 
-    /// Destination CH database for a source namespace: its
-    /// `target_database` override if set, else the global default.
     fn target_database_for(&self, namespace: &str) -> &str {
         self.namespaces
             .get(namespace)
@@ -123,8 +102,6 @@ impl DdlConfig {
             .unwrap_or(&self.target_database)
     }
 
-    /// Drop strategy for a source namespace: its `drop_table_strategy`
-    /// override (parsed) if set, else the global default.
     fn drop_strategy_for(&self, namespace: &str) -> DropTableStrategy {
         self.namespaces
             .get(namespace)
@@ -139,34 +116,33 @@ impl DdlConfig {
     }
 }
 
-/// CH-side DDL writer. Owns one clickhouse-c AsyncClient over its own TCP.
+/// CH-side DDL writer. Owns one AsyncClient over its own TCP.
 pub struct DdlApplicator {
     client: AsyncClient,
     config: DdlConfig,
     mapping: MappingHandle,
+    /// Reconnect params, cloned at boot. SIGHUP reloads DDL knobs not
+    /// connection params, so a reconnect re-dials the boot endpoint.
+    conn_cfg: EmitterConfig,
+    retry: RetryConfig,
+    /// Per-attempt cap (shares `EmitterConfig::insert_timeout`); a
+    /// half-open CH socket can't park the reorder barrier past this
+    query_timeout: Duration,
     pub stats: DdlStats,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct DdlStats {
-    /// `ALTER TABLE` statements successfully acked by CH.
     pub alters_applied: u64,
-    /// `CREATE TABLE IF NOT EXISTS` statements run (regardless of
-    /// whether the table already existed).
     pub creates_applied: u64,
-    /// `DROP TABLE IF EXISTS` statements run.
     pub drops_applied: u64,
-    /// Schema events the applicator received but skipped (no mapping,
-    /// no auto_create, type change rejected, drop strategy = Retain).
+    /// Events received but skipped (no mapping, no auto_create, type
+    /// change rejected, drop strategy = Retain)
     pub skipped: u64,
-    /// Type changes the applicator refused.
     pub type_changes_rejected: u64,
 }
 
 impl DdlApplicator {
-    /// Build an applicator with its own CH connection. Opens a fresh
-    /// `tokio` TCP socket to `(host, port)` via [`AsyncClient`] — same
-    /// shape as the shared `connect_client` helper.
     pub async fn new(
         emitter_cfg: &EmitterConfig,
         ddl_cfg: DdlConfig,
@@ -177,6 +153,9 @@ impl DdlApplicator {
             client,
             config: ddl_cfg,
             mapping,
+            conn_cfg: emitter_cfg.clone(),
+            retry: emitter_cfg.retry.clone(),
+            query_timeout: emitter_cfg.insert_timeout,
             stats: DdlStats::default(),
         })
     }
@@ -189,9 +168,8 @@ impl DdlApplicator {
         &mut self.config
     }
 
-    /// Apply one schema event. Errors propagate; the worker task
-    /// turns them into a `DecoderSinkError` so the daemon poisons the
-    /// stream cleanly per the worker-task contract.
+    /// Errors propagate; the worker task turns them into
+    /// `DecoderSinkError` so the daemon poisons the stream cleanly.
     pub async fn apply(&mut self, event: &SchemaEvent) -> Result<(), EmitterError> {
         match event {
             SchemaEvent::Added { desc } => self.apply_added(desc).await,
@@ -204,8 +182,7 @@ impl DdlApplicator {
     }
 
     async fn apply_added(&mut self, desc: &RelDescriptor) -> Result<(), EmitterError> {
-        // Pre-declared mapping wins — operator already pinned the dest
-        // and the CH side is operator-managed. Skip auto-create.
+        // Pre-declared mapping wins: dest is operator-managed, skip auto-create
         if self
             .mapping_target(desc.qualified_name.as_ref())
             .await
@@ -222,9 +199,8 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         }
-        // Per-namespace target_database override (else global). Drives
-        // both the CREATE TABLE and the row-routing mapping below, so
-        // rows and DDL land in the same database.
+        // Drives both CREATE TABLE and the row-routing mapping below so
+        // rows and DDL land in the same database
         let target_db = self
             .config
             .target_database_for(&desc.namespace_name)
@@ -238,8 +214,8 @@ impl DdlApplicator {
         };
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
-        // Auto-derive a TableMapping so the emitter can ship rows
-        // against the freshly-created CH table without TOML edits.
+        // Auto-derive a TableMapping so the emitter ships rows against
+        // the new CH table without TOML edits
         let target = format!("{}.{}", sql_ident(&target_db), sql_ident(&desc.name));
         let columns = derive_columns_for_mapping(desc);
         let mapping = TableMapping { target, columns };
@@ -258,22 +234,18 @@ impl DdlApplicator {
         let target = match self.mapping_target(&key).await {
             Some(t) => t,
             None => {
-                // Without a target we can't ALTER. Skip silently —
-                // auto_create reduces this case to the
-                // "namespace configured but table not yet learned" path
-                // which `Added` handles.
+                // No target, can't ALTER; `Added` handles the
+                // not-yet-learned case
                 self.stats.skipped += 1;
                 return Ok(());
             }
         };
         // RENAME before ADD/DROP so position-matched renames don't trip
-        // a subsequent diff into a drop+add pair.
+        // a later diff into a drop+add pair
         for (_attnum, old_name, new_name) in &diff.renamed_columns {
-            // The mapping's column targets are operator-pinned; if the
-            // operator has a TOML rename, the source rename here is a
-            // no-op from CH's POV (TOML still maps src_attnum to the
-            // same CH column name). Detect this by checking whether the
-            // CH column name has changed.
+            // Operator TOML rename makes the source rename a no-op from
+            // CH's POV (TOML still maps src_attnum to the same CH name);
+            // detect via whether the CH column name changed
             let mapping_lookup = self.mapping.read().await;
             let m = mapping_lookup
                 .get(&key)
@@ -283,12 +255,13 @@ impl DdlApplicator {
                 || !m.columns.iter().any(|c| &c.target_name == old_name);
             drop(mapping_lookup);
             if needs_rename {
-                // Pre-declared TOML mapping already encodes the rename;
-                // skip the CH ALTER.
+                // Pre-declared TOML mapping already encodes the rename
                 continue;
             }
+            // IF EXISTS keeps rename idempotent: reconnect+resend or
+            // daemon-restart re-fire no-ops once CH has the renamed column
             let sql = format!(
-                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                "ALTER TABLE {} RENAME COLUMN IF EXISTS {} TO {}",
                 target,
                 quote_ident(old_name),
                 quote_ident(new_name)
@@ -306,8 +279,7 @@ impl DdlApplicator {
             let resolved = match type_bridge::map(att, pk_member) {
                 Ok(r) => r,
                 Err(type_bridge::BridgeError::UnsupportedType { .. }) => {
-                    // Unbridged type — log + skip the ADD. Operator-side
-                    // TOML override is the recovery path.
+                    // Unbridged type; operator TOML override is the recovery path
                     self.stats.skipped += 1;
                     continue;
                 }
@@ -317,8 +289,7 @@ impl DdlApplicator {
             self.stats.alters_applied += 1;
         }
         for attnum in &diff.dropped_columns {
-            // Resolve the CH column name from the old descriptor — the
-            // diff lists attnums only.
+            // diff lists attnums only; resolve CH column name from old descriptor
             let name = _old
                 .attributes
                 .iter()
@@ -328,10 +299,8 @@ impl DdlApplicator {
                 self.stats.skipped += 1;
                 continue;
             };
-            // Pre-declared TOML mapping might still reference the
-            // dropped column; surface the drop on CH regardless. The
-            // emitter encodes NULL into mapping columns whose attnum
-            // disappeared from the descriptor.
+            // Surface the drop on CH even if TOML still references the
+            // column; emitter then encodes NULL for the vanished attnum
             let sql = format!(
                 "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
                 target,
@@ -341,7 +310,6 @@ impl DdlApplicator {
             self.stats.alters_applied += 1;
         }
         if !diff.type_changes.is_empty() {
-            // Rejected per type-change open question — log + skip.
             self.stats.type_changes_rejected += diff.type_changes.len() as u64;
             tracing::warn!(
                 target: "walshadow::ch_ddl",
@@ -351,11 +319,10 @@ impl DdlApplicator {
                  (manual operator migration required)"
             );
         }
-        // Auto-extend the operator's TableMapping so the emitter ships
-        // post-DDL rows against the new shape without TOML edits.
-        // Operator-pinned `target_name` overrides survive: we only
-        // touch ColumnMapping entries the applicator could have
-        // produced (src_attnum match).
+        // Auto-extend the TableMapping so the emitter ships post-DDL
+        // rows against the new shape without TOML edits; operator-pinned
+        // `target_name` overrides survive (only touch entries the
+        // applicator could have produced, by src_attnum match)
         self.mutate_mapping_for_diff(_old, new, diff).await;
         Ok(())
     }
@@ -371,11 +338,9 @@ impl DdlApplicator {
         let Some(target_mapping) = m.get_mut(&key) else {
             return;
         };
-        // Renames: if the operator's TOML used the OLD source name
-        // (and thus matches the old descriptor's column name), rename
-        // the CH column. If the operator already pinned a different
-        // name, leave it; CH side already runs no ALTER (see
-        // `apply_changed`).
+        // Rename the CH column only when TOML used the OLD source name;
+        // an operator-pinned different name is left alone (CH runs no
+        // ALTER for it either, see `apply_changed`)
         for (attnum, old_name, new_name) in &diff.renamed_columns {
             for c in &mut target_mapping.columns {
                 if c.src_attnum == *attnum && &c.target_name == old_name {
@@ -383,14 +348,10 @@ impl DdlApplicator {
                 }
             }
         }
-        // Drops: if a ColumnMapping references the dropped attnum,
-        // strip it so the emitter stops looking the column up.
         for attnum in &diff.dropped_columns {
             target_mapping.columns.retain(|c| c.src_attnum != *attnum);
         }
-        // Adds: auto-derive a column mapping using type_bridge. Skip
-        // when the operator already pre-declared the column (e.g.,
-        // a pre-declared add-column mapping).
+        // Skip adds the operator already pre-declared
         for att in &diff.added_columns {
             if target_mapping
                 .columns
@@ -426,9 +387,8 @@ impl DdlApplicator {
                 return Ok(());
             }
         };
-        // Namespace is the prefix of `namespace.name` (see
-        // `RelDescriptor::build_qualified_name`); resolve its per-
-        // namespace drop strategy, else the global default.
+        // Namespace is prefix of `namespace.name` (see
+        // `RelDescriptor::build_qualified_name`)
         let namespace = qualified_name.split('.').next().unwrap_or_default();
         match self.config.drop_strategy_for(namespace) {
             DropTableStrategy::Retain => {
@@ -455,8 +415,7 @@ impl DdlApplicator {
                 let sql = format!("DROP TABLE IF EXISTS {target}");
                 self.execute(&sql).await?;
                 self.stats.drops_applied += 1;
-                // Forget the auto-mapped entry so future Added events
-                // for the same qualified_name re-derive fresh columns.
+                // Forget the auto-mapped entry so a future Added re-derives columns
                 let mut m = self.mapping.write().await;
                 m.remove(qualified_name);
                 Ok(())
@@ -464,11 +423,10 @@ impl DdlApplicator {
         }
     }
 
-    /// Execute `TRUNCATE TABLE <target>` for a mapped source relation.
-    /// No-op for unmapped relations (mirrors the emitter's row-skip).
-    /// The pipeline's reorder coordinator calls this inside a barrier
-    /// (after all earlier data is durable) so the truncate orders correctly
-    /// against inserts despite the otherwise out-of-order pipeline.
+    /// `TRUNCATE TABLE <target>`, no-op for unmapped relations. Reorder
+    /// coordinator calls this inside a barrier (after earlier data is
+    /// durable) so the truncate orders correctly against inserts despite
+    /// the otherwise out-of-order pipeline.
     pub async fn truncate(&mut self, qualified_name: &str) -> Result<(), EmitterError> {
         let Some(target) = self.mapping_target(qualified_name).await else {
             return Ok(());
@@ -481,19 +439,51 @@ impl DdlApplicator {
         m.get(qualified_name).map(|t| t.target.clone())
     }
 
-    /// Run one DDL statement: `send_query` + drain to `EndOfStream` /
-    /// `Exception`. CH DDL is single-statement so no Data blocks need
-    /// to be sent.
+    /// Run one DDL statement with the same bounded timeout +
+    /// reconnect/retry as the INSERT pump. DDL applies inside the
+    /// reorder barrier, so a half-open socket would otherwise park the
+    /// barrier and ack frontier indefinitely. Every emitted statement is
+    /// idempotent (`IF [NOT] EXISTS`, `RENAME COLUMN IF EXISTS`,
+    /// `TRUNCATE`), so a reconnect resends and CH no-ops the second apply.
     async fn execute(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
-        self.client.send_query(sql, None).await?;
-        drain_to_end_of_stream(&mut self.client).await
+        let mut attempt = 0u32;
+        let mut backoff = self.retry.initial_backoff;
+        loop {
+            let attempt_result = match tokio::time::timeout(self.query_timeout, async {
+                self.client.send_query(sql, None).await?;
+                drain_to_end_of_stream(&mut self.client).await
+            })
+            .await
+            {
+                Ok(r) => r,
+                // Park past the cap (half-open socket) must not pin the
+                // barrier forever; surface a retryable timeout
+                Err(_elapsed) => Err(EmitterError::Timeout {
+                    secs: self.query_timeout.as_secs(),
+                }),
+            };
+            match attempt_result {
+                Ok(()) => return Ok(()),
+                Err(e) if is_retryable(&e) && attempt < self.retry.max_attempts => {
+                    tracing::warn!(
+                        target: "walshadow::ch_ddl",
+                        error = %e, attempt, sql = %sql,
+                        "DDL attempt failed; reconnecting + retrying",
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(self.retry.max_backoff);
+                    self.client = connect_client(&self.conn_cfg).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
-/// Render `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <n> <ty> [DEFAULT
-/// <expr>]`. The `IF NOT EXISTS` keeps the statement idempotent so a
-/// daemon restart that re-fires the event acks on the second run.
+/// `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <n> <ty> [DEFAULT <expr>]`.
+/// IF NOT EXISTS keeps it idempotent across a daemon-restart re-fire.
 pub fn render_add_column(target: &str, name: &str, resolved: &ResolvedColumn) -> String {
     let mut s = format!(
         "ALTER TABLE {target} ADD COLUMN IF NOT EXISTS {} {}",
@@ -507,9 +497,8 @@ pub fn render_add_column(target: &str, name: &str, resolved: &ResolvedColumn) ->
     s
 }
 
-/// Render a `CREATE TABLE IF NOT EXISTS` for an autodiscovered
-/// relation. Returns `None` when the relation lacks a usable
-/// `ORDER BY` (no PK + no namespace default); caller logs + skips.
+/// `CREATE TABLE IF NOT EXISTS` for an autodiscovered relation. `None`
+/// when a column's type can't be bridged; caller logs + skips.
 pub fn render_create_table(
     desc: &RelDescriptor,
     target_database: &str,
@@ -535,9 +524,8 @@ pub fn render_create_table(
         let resolved = match type_bridge::map(att, pk_member) {
             Ok(r) => r,
             Err(type_bridge::BridgeError::UnsupportedType { .. }) => {
-                // Bail out: the table is half-renderable, skip the
-                // CREATE so the operator can install a TOML override
-                // and re-trigger via Added on the next refetch.
+                // Skip the half-renderable CREATE; operator installs a
+                // TOML override and re-triggers via Added on next refetch
                 return Ok(None);
             }
         };
@@ -548,13 +536,13 @@ pub fn render_create_table(
         }
         col_defs.push(def);
     }
-    // Synthetic columns mirror `TablePlan::build`'s shape.
+    // Synthetic columns mirror `TablePlan::build`
     col_defs.push("`_lsn` UInt64".into());
     col_defs.push("`_xid` UInt32".into());
     col_defs.push("`_op` Enum8('insert' = 1, 'update' = 2, 'delete' = 3)".into());
     col_defs.push("`_commit_ts` DateTime64(6, 'UTC')".into());
 
-    // ORDER BY: prefer PK columns; else fall back to `_lsn`.
+    // ORDER BY: prefer PK columns, else `_lsn`
     let order_by = if pk_attnums.is_empty() {
         "(`_lsn`)".to_string()
     } else {
@@ -581,17 +569,14 @@ pub fn render_create_table(
     Ok(Some(sql))
 }
 
-/// CH identifier — same shape as `quote_ident`. Re-exported as a
-/// helper for callers building qualified destination names from
-/// (database, table) parts without re-walking the surface.
+/// CH identifier; alias of `quote_ident` for callers building qualified
+/// (database, table) names.
 pub fn sql_ident(name: &str) -> String {
     quote_ident(name)
 }
 
-/// Derive a default `Vec<ColumnMapping>` from a relation's descriptor.
-/// Used by `DdlApplicator::apply_added` when auto-discovering tables
-/// in an `auto_create`-flagged namespace; operator overrides via TOML
-/// still win the next SIGHUP.
+/// Default `Vec<ColumnMapping>` for an auto-discovered table; operator
+/// TOML overrides win the next SIGHUP.
 pub fn derive_columns_for_mapping(desc: &RelDescriptor) -> Vec<ColumnMapping> {
     let pk_attnums: Vec<i16> = match &desc.replident {
         crate::shadow_catalog::ReplIdent::Default {
@@ -654,11 +639,9 @@ mod tests {
             target_database: "default".into(),
             namespaces,
         };
-        // target_database: namespace override, else global fallback.
         assert_eq!(cfg.target_database_for("analytics"), "warehouse");
         assert_eq!(cfg.target_database_for("logs"), "default");
         assert_eq!(cfg.target_database_for("unconfigured"), "default");
-        // drop strategy: namespace override, else global fallback.
         assert_eq!(cfg.drop_strategy_for("analytics"), DropTableStrategy::Drop);
         assert_eq!(cfg.drop_strategy_for("logs"), DropTableStrategy::Retain);
         assert_eq!(
@@ -679,7 +662,7 @@ mod tests {
         assert_eq!(cfg.drop_table_strategy, DropTableStrategy::Retain);
         let cfg = cfg.with_drop_strategy(DropTableStrategy::Drop);
         assert_eq!(cfg.drop_table_strategy, DropTableStrategy::Drop);
-        // Global override now drives the per-namespace fallback.
+        // Global override drives the per-namespace fallback
         assert_eq!(
             cfg.drop_strategy_for("unconfigured"),
             DropTableStrategy::Drop
@@ -806,11 +789,8 @@ mod tests {
 
     #[test]
     fn render_create_table_skips_when_type_unbridged() {
-        // Force a type-bridge failure by using a synthetic OID below the
-        // safe range — type_bridge falls back to String for unknown
-        // type OIDs today, so this never hits None. Update if the bridge
-        // grows strictness; the API contract (`Option<String>`) is what
-        // matters here.
+        // type_bridge falls back to String for unknown OIDs today, so
+        // this never hits None; revisit if the bridge grows strictness
         let d = desc("t", vec![att(1, "id", 99999, true, None)], None);
         let sql = render_create_table(&d, "db").unwrap();
         assert!(sql.is_some(), "fallback path keeps the CREATE renderable");
@@ -818,11 +798,8 @@ mod tests {
 
     #[test]
     fn diff_renamed_then_added_then_dropped_in_correct_order() {
-        // The plan calls out: RENAME before ADD/DROP so position-match
-        // diffs don't trip into a drop+add pair. This test asserts on
-        // the order the applicator iterates `SchemaDiff` (RENAME first,
-        // ADD second, DROP third). Functional verification of the
-        // ordering itself lives in the integration test.
+        // RENAME before ADD/DROP so position-match diffs don't trip into
+        // a drop+add pair; functional verification in the integration test
         let diff = SchemaDiff {
             added_columns: vec![att(3, "c3", INT4OID, false, None)],
             dropped_columns: vec![2],
@@ -850,8 +827,6 @@ mod tests {
         .into_iter()
         .collect();
         let handle: MappingHandle = Arc::new(tokio::sync::RwLock::new(map));
-        // Smoke test: ensure the handle resolves what we expect. The
-        // applicator's mapping_target uses the same shape.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

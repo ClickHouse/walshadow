@@ -1,17 +1,16 @@
 //! Inserter pool — N `AsyncClient` connections sending sealed batches.
 //!
-//! ClickHouse Cloud INSERT cost is mostly RTT + object-store part commit,
-//! so throughput comes from keeping many INSERTs in flight. Each inserter
-//! owns one connection, pulls [`InsertBatch`]es off the shared spmc queue
-//! (any idle inserter takes any batch, so a hot table can use more than one
-//! connection), rebuilds the Native block over the batch's owned slabs, and
-//! runs one complete `send_query` + `send_data` + `send_data_end` +
-//! drain-to-`EndOfStream` INSERT.
+//! ClickHouse Cloud INSERT cost is mostly RTT + object-store part commit, so
+//! throughput comes from keeping many INSERTs in flight. Each inserter pulls
+//! [`InsertBatch`]es off the shared spmc queue (any idle inserter takes any
+//! batch, so a hot table can use more than one connection), rebuilds the
+//! Native block over the batch's owned slabs, and runs one `send_query` +
+//! `send_data` + `send_data_end` + drain-to-`EndOfStream` INSERT.
 //!
-//! Durability invariant: [`AckHandle::acked`] fires **only after** the
-//! drain returns. Until then a connection drop replays the still-owned
-//! batch (CH dedups by `_lsn`). Retry-exhaustion is fatal — the watermark
-//! can't advance without this batch, so the daemon must stop.
+//! Durability invariant: [`AckHandle::acked`] fires **only after** the drain
+//! returns. Until then a connection drop replays the still-owned batch (CH
+//! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
+//! without this batch.
 
 use std::collections::HashMap;
 
@@ -32,9 +31,9 @@ struct Inserter {
     client: AsyncClient,
     alloc: Allocator,
     config: EmitterConfig,
-    /// Parsed column types per table, refreshed when a batch's
-    /// `schema_epoch` changes (a barrier rebuilt the table). `TypeAst` is
-    /// `Send` but not `Sync`, so each inserter parses its own.
+    /// Parsed column types per table, refreshed when a batch's `schema_epoch`
+    /// changes. `TypeAst` is `Send` but not `Sync`, so each inserter parses
+    /// its own.
     asts: HashMap<String, (u64, Vec<TypeAst>)>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
@@ -64,9 +63,9 @@ impl Inserter {
     }
 
     /// Bounded reconnect+retry around one prepared INSERT. Only `bb`
-    /// (which is `Send + Sync`) and `self` cross the awaits — never a bare
-    /// `&TypeAst` (`TypeAst` is `!Sync`), so the task future stays `Send`.
-    /// The block is unchanged across retries, so a reconnect just resends.
+    /// (`Send + Sync`) and `self` cross the awaits, never a bare `&TypeAst`
+    /// (`!Sync`), so the task future stays `Send`. The block is unchanged
+    /// across retries, so a reconnect just resends.
     async fn send_with_retry(
         &mut self,
         sql: &str,
@@ -80,18 +79,15 @@ impl Inserter {
                 self.client.send_query(sql, None).await?;
                 self.client.send_data(Some(bb)).await?;
                 self.client.send_data_end().await?;
-                // EndOfStream confirmed: rows are durable on CH. Only after
-                // this returns may the caller ack the batch's seqs.
+                // Only after EndOfStream returns are rows durable and ackable
                 drain_to_end_of_stream(&mut self.client).await
             })
             .await
             {
                 Ok(r) => r,
-                // A send/recv that parks past the cap (e.g. a connection that
-                // wedges mid-INSERT) must not pin the watermark forever:
+                // A connection wedged mid-INSERT must not pin the watermark:
                 // surface a retryable timeout so the retry arm reconnects and
-                // resends on a fresh socket. CH dedups the re-sent block by
-                // `_lsn`, so the resend is idempotent.
+                // resends on a fresh socket. CH dedups the resend by `_lsn`.
                 Err(_elapsed) => Err(EmitterError::Timeout {
                     secs: self.config.insert_timeout.as_secs(),
                 }),
@@ -116,8 +112,8 @@ impl Inserter {
                 fatal.set(format!("inserter type parse: {e}"));
                 break;
             }
-            // Own the asts (`Vec<TypeAst>` is `Send`) for the build; index
-            // inline so no `&[TypeAst]` binding lives across the send await.
+            // Own the asts (`Vec<TypeAst>` is `Send`); index inline so no
+            // `&[TypeAst]` binding lives across the send await
             let (epoch, asts) = self
                 .asts
                 .remove(&batch.meta.table_key)
@@ -163,8 +159,8 @@ impl Inserter {
     }
 }
 
-/// Connect `n` inserters and spawn their drain loops. Each opens its own
-/// TCP `AsyncClient`; a connect failure aborts pool startup.
+/// Connect `n` inserters and spawn their drain loops; a connect failure
+/// aborts pool startup.
 pub async fn spawn_pool(
     n: usize,
     config: &EmitterConfig,

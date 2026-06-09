@@ -1,13 +1,10 @@
-//! Shared types for the heap-tuple decoder fan-out:
-//! [`TupleObserver`] (downstream of [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink)
-//! 's commit drain), [`DecoderStats`] counters, [`DecoderSinkError`].
+//! Shared types for the heap-tuple decoder fan-out: [`TupleObserver`],
+//! [`DecoderStats`], [`DecoderSinkError`].
 //!
-//! Per-record dispatch lives in
-//! [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink). The
-//! CH path drains through the parallel [`pipeline`](crate::pipeline); the
+//! CH path drains through the parallel [`pipeline`](crate::pipeline);
 //! metrics-only path (no `--ch-config`) drains to [`MetricsTupleObserver`].
-//! Catalog gate timeouts poison the stream — no `replay_timeout`
-//! counter, since silent loss is impossible by construction.
+//! Catalog gate timeouts poison the stream, so no `replay_timeout` counter:
+//! silent loss is impossible by construction.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -35,23 +32,16 @@ impl From<DecoderSinkError> for SinkError {
     }
 }
 
-/// Trait wrapper for the destination of decoded + committed heap
-/// events. Production fans into `MetricsTupleObserver` (counters) or
-/// the CH-emitter observer; tests use the in-memory collector. The
-/// CH emitter wants `commit_ts` for its `_commit_ts` synthetic
-/// column, so [`CommittedTuple`] (not
-/// [`DecodedHeap`](crate::heap_decoder::DecodedHeap)) is the wire
-/// type.
+/// Destination of decoded + committed heap events. Wire type is
+/// [`CommittedTuple`] not [`DecodedHeap`](crate::heap_decoder::DecodedHeap):
+/// CH emitter needs `commit_ts` for its `_commit_ts` synthetic column.
 ///
-/// `on_xact_end` fires after every tuple in a committed xact has been
-/// delivered. The CH emitter uses it as the per-xact landmark
-/// for closing or extending its open INSERT blocks. Returns the
-/// highest commit_lsn now known durable on the observer (CH server
-/// acked, MergeTree part finalized). Callers advance their ack
-/// ceiling from the returned value, not from `commit_lsn`, so an
-/// observer that holds INSERTs open across xacts can report ack lag
-/// without breaking the slot-advance gate. Default impl returns
-/// `commit_lsn` — no async work, instant ack.
+/// `on_xact_end` fires after every tuple in a committed xact is delivered.
+/// Returns highest commit_lsn now durable on the observer (CH server acked,
+/// MergeTree part finalized). Callers advance their ack ceiling from the
+/// return value, NOT `commit_lsn`, so an observer holding INSERTs open across
+/// xacts reports ack lag without breaking the slot-advance gate. Default
+/// returns `commit_lsn` (instant ack).
 pub trait TupleObserver: Send {
     fn on_tuple<'a>(
         &'a mut self,
@@ -65,13 +55,10 @@ pub trait TupleObserver: Send {
         Box::pin(async move { Ok(commit_lsn) })
     }
 
-    /// Schema-event dispatch. Called from
-    /// [`crate::xact_buffer::XactBuffer::commit`]'s k-way merge in
-    /// `source_lsn` order alongside `on_tuple`, so the CH DDL applicator
-    /// runs ALTER / CREATE / DROP against the dest before the next
-    /// `on_tuple` encodes a row against the post-DDL shape. Default:
-    /// no-op — observers that don't own CH (metrics, collecting test
-    /// observer) ignore schema events.
+    /// Dispatched from [`crate::xact_buffer::XactBuffer::commit`]'s k-way merge
+    /// in `source_lsn` order alongside `on_tuple`, so DDL (ALTER/CREATE/DROP)
+    /// lands on dest before the next `on_tuple` encodes against post-DDL shape.
+    /// Default no-op: non-CH observers ignore schema events.
     fn on_schema_event<'a>(
         &'a mut self,
         _event: &'a SchemaEvent,
@@ -79,33 +66,27 @@ pub trait TupleObserver: Send {
         Box::pin(async { Ok(()) })
     }
 
-    /// Ceiling for an idle-advance ack at LSN `lsn`. Returns `lsn` when
-    /// the observer holds nothing client-side (caller may advance fully
-    /// past trailing non-commit WAL); otherwise the observer's durable
-    /// horizon, so a quiescent-tick nudge can't promote the emitter ack
-    /// past rows still buffered in open INSERTs. Default: `lsn` —
-    /// observers that don't buffer (metrics, collectors) impose no
-    /// constraint.
+    /// Ceiling for an idle-advance ack at `lsn`. Returns `lsn` when observer
+    /// holds nothing client-side; otherwise its durable horizon, so a
+    /// quiescent-tick nudge can't promote the emitter ack past rows still
+    /// buffered in open INSERTs. Default `lsn`: non-buffering observers.
     fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
         lsn
     }
 
-    /// Driver-initiated tick. Mirror of [`crate::wal_stream::RecordSink::on_idle`]
-    /// at the observer layer — lets the CH emitter close its
-    /// hold-open INSERTs once `flush_timeout` has elapsed without any
-    /// fresh xact_end calls to piggyback the deadline check on. Returns
-    /// the commit LSN made durable by any deadline-triggered close
-    /// (`0` = nothing promoted), which the xact buffer folds into
-    /// `emitter_ack_lsn`. Default: no-op, `Ok(0)`.
+    /// Observer-layer mirror of [`crate::wal_stream::RecordSink::on_idle`]:
+    /// CH emitter closes hold-open INSERTs once `flush_timeout` elapses with no
+    /// fresh xact_end to piggyback the deadline check on. Returns commit LSN
+    /// made durable by any deadline-triggered close (`0` = nothing promoted),
+    /// folded into `emitter_ack_lsn`. Default no-op `Ok(0)`.
     fn on_idle<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
         Box::pin(async { Ok(0) })
     }
 
-    /// Final hook before drop. Mirror of [`crate::wal_stream::RecordSink::on_close`]
-    /// at the observer layer — used by the CH emitter to force-flush
-    /// any held-open INSERT on daemon shutdown. Default: no-op.
+    /// Observer-layer mirror of [`crate::wal_stream::RecordSink::on_close`]:
+    /// CH emitter force-flushes any held-open INSERT on daemon shutdown.
     fn on_close<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
@@ -113,9 +94,7 @@ pub trait TupleObserver: Send {
     }
 }
 
-/// Forwarding impl so `Box<dyn TupleObserver>` itself implements
-/// [`TupleObserver`]. Lets the daemon pick an observer at runtime
-/// (e.g. metrics-only vs CH-emitter) without making
+/// Forwarding impl so the daemon picks an observer at runtime without making
 /// [`crate::xact_buffer::XactRecordSink`] generic over a closed enum.
 impl<T: TupleObserver + ?Sized> TupleObserver for Box<T> {
     fn on_tuple<'a>(
@@ -157,46 +136,34 @@ impl<T: TupleObserver + ?Sized> TupleObserver for Box<T> {
 }
 
 crate::atomic_stats! {
-    /// Counter observer suitable for the production daemon. Discards the
-    /// tuple payload; tracks counts by op kind so the daemon's status line
-    /// surfaces decoded-tuple cadence. Mutations use
-    /// `fetch_add(_, Relaxed)`; the daemon's status loop reads via
-    /// `.load(Relaxed)` at the use site.
     pub struct DecoderStats {
         pub decoded,
         pub inserts,
         pub updates,
         pub hot_updates,
         pub deletes,
-        /// Decoded but the WAL elided some columns via
-        /// `XLH_UPDATE_PREFIX_FROM_OLD` / `..._SUFFIX_FROM_OLD`. The xact
-        /// buffer reassembles from previous tuple image; the decoder emits as-is.
+        /// WAL elided columns via `XLH_UPDATE_PREFIX_FROM_OLD` /
+        /// `..._SUFFIX_FROM_OLD`; xact buffer reassembles from prev tuple image
         pub partial,
-        /// `record.parsed.blocks` was empty — record references no
-        /// relation. Heap LOCK / INPLACE / TRUNCATE land here under the
-        /// decoder's silent-skip policy.
+        /// `record.parsed.blocks` empty: no relation. Heap LOCK / INPLACE /
+        /// TRUNCATE land here under the silent-skip policy
         pub skipped_no_block,
-        /// Heap record on a relation
         /// [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog) returned
-        /// `NotFoundByFilenode` for. Possible causes: replay-LSN gate
-        /// ahead of catalog mutation, mapping rotation, race with
-        /// `seed_from_source`. Counted, not retried — the xact
-        /// buffer can reorder.
+        /// `NotFoundByFilenode`. Causes: replay-LSN gate ahead of catalog
+        /// mutation, mapping rotation, race with `seed_from_source`. Not
+        /// retried, xact buffer can reorder
         pub catalog_not_found,
-        /// Record was on a `User` relation but the rmgr/info combo isn't
-        /// in the decoder's type matrix (MULTI_INSERT, HEAP2 PRUNE, etc).
+        /// `User` relation but rmgr/info combo outside the type matrix
+        /// (MULTI_INSERT, HEAP2 PRUNE, etc)
         pub skipped_op,
-        /// `XLOG_HEAP_TRUNCATE` records fanned out to per-relid
-        /// `HeapOp::Truncate` events. Counted by
-        /// `BufferingDecoderSink::on_record`'s pre-decode intercept.
+        /// `XLOG_HEAP_TRUNCATE` fanned out to per-relid `HeapOp::Truncate`
         pub truncates,
-        /// TOAST chunks routed into the xact buffer's chunk slot. Distinct
-        /// from `inserts`, which only counts user-table writes.
+        /// TOAST chunks routed into the xact buffer's chunk slot, distinct
+        /// from `inserts` (user-table writes only)
         pub toast_chunks_buffered,
-        /// TOAST inserts the decoder couldn't reinterpret as a chunk
-        /// (missing chunk_id/seq/data columns, type mismatch). Surfaces
-        /// so a corrupt catalog or a future TOAST layout shows up as a
-        /// counter, not silent loss.
+        /// TOAST inserts not reinterpretable as a chunk (missing
+        /// chunk_id/seq/data, type mismatch). Surfaces a corrupt catalog or
+        /// future TOAST layout as a counter, not silent loss
         pub toast_chunks_malformed,
     }
 }
@@ -218,9 +185,7 @@ impl TupleObserver for MetricsTupleObserver {
     }
 }
 
-/// In-memory observer for tests. Owns the full committed-tuple
-/// stream so tests can assert on `commit_ts` alongside the decoded
-/// payload.
+/// In-memory test observer; retains full committed tuples for assertions.
 #[derive(Debug, Default)]
 pub struct CollectingTupleObserver {
     pub tuples: Vec<CommittedTuple>,
@@ -239,10 +204,8 @@ impl TupleObserver for CollectingTupleObserver {
 }
 
 impl DecoderStats {
-    /// Bump per-op counters off one decoded heap event. Single source
-    /// of truth for the `HeapOp → counter` mapping; every decoder
-    /// dispatch site routes through here so new ops only add code in
-    /// one place.
+    /// Single source of truth for the `HeapOp → counter` mapping; all decoder
+    /// dispatch sites route through here.
     pub fn record(&self, decoded: &crate::heap_decoder::DecodedHeap) {
         use crate::heap_decoder::HeapOp;
         self.decoded.fetch_add(1, Ordering::Relaxed);
@@ -260,8 +223,7 @@ impl DecoderStats {
         }
     }
 
-    /// Single-line summary suitable for the daemon's status line. Skips
-    /// zero buckets so a quiet workload shows a tight format.
+    /// Single-line status summary, zero buckets elided.
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -381,7 +343,6 @@ mod tests {
         assert!(out.contains("ins=3"), "{out}");
         assert!(out.contains("del=2"), "{out}");
         assert!(out.contains("partial=1"), "{out}");
-        // updates / hot_updates / no_blk are zero and must be elided
         assert!(!out.contains("upd="), "{out}");
         assert!(!out.contains("hot="), "{out}");
         assert!(!out.contains("no_blk="), "{out}");

@@ -1,23 +1,17 @@
 //! Tier 3 codecs: small fixed-layout types decoded locally.
 //!
-//! Hybrid scope:
+//! - **Local**: `numeric`, `inet` / `cidr`, `interval`. Stable layout,
+//!   mechanical decoders, per-row hot-path latency would dominate over libpq.
+//! - **Deferred to the shadow extension** (`walshadow`): `jsonb`, arrays,
+//!   `tsvector`, every other Tier 3 type. Surfaced as
+//!   [`crate::heap_decoder::ColumnValue::PgPending`] carrying raw on-disk
+//!   bytes; resolved at emit time via `walshadow_decode_disk(oid, bytea) ->
+//!   text` against shadow PG. One source of truth, no codec drift.
 //!
-//! - **Local**: `numeric`, `inet` / `cidr`, `interval`. Layout is
-//!   stable, decoders are mechanical, and per-row hot-path latency
-//!   would be the dominant cost if these went over libpq.
-//! - **Deferred to the shadow extension** (`walshadow`):
-//!   `jsonb`, arrays, `tsvector`, every other Tier 3 type. Decoder
-//!   surfaces these as [`crate::heap_decoder::ColumnValue::PgPending`]
-//!   carrying the raw on-disk bytes; resolution to text happens at
-//!   emit time via a `walshadow_decode_disk(oid, bytea) -> text` SQL
-//!   call against shadow PG. One source of truth for the long tail;
-//!   no codec drift to chase.
-//!
-//! Each local decoder takes the *body* of a varlena (or the raw bytes
-//! of a fixed-width datum, for `interval`) and produces a tagged value
-//! whose `text` form matches PG's `typoutput`. The differential oracle
-//! ([`crate::oracle`]) leans on that text-form equality to cross-check
-//! local decoders against shadow PG with 1-in-N sampling.
+//! Each decoder takes the varlena *body* (or raw fixed-width bytes for
+//! `interval`) and produces a tagged value whose `text` matches PG
+//! `typoutput`. Differential oracle ([`crate::oracle`]) cross-checks that
+//! text equality against shadow PG with 1-in-N sampling.
 
 use thiserror::Error;
 
@@ -51,9 +45,8 @@ pub enum CodecError {
     UnsupportedArrayElement(u32),
 }
 
-// ---------------------------------------------------------------------
-// numeric — PG arbitrary-precision decimal (varlena, varies in length).
-// On-disk layout per `src/backend/utils/adt/numeric.c`:
+// numeric — varlena arbitrary-precision decimal. On-disk layout per
+// `src/backend/utils/adt/numeric.c`:
 //
 // * Short form (top bit of n_header set):
 //     uint16  n_header   = NUMERIC_SHORT | (sign?0x2000:0)
@@ -69,7 +62,6 @@ pub enum CodecError {
 // * Special form (flag bits == NUMERIC_SPECIAL):
 //     uint16  n_header   = NUMERIC_NAN | NUMERIC_PINF | NUMERIC_NINF
 //     no digits.
-// ---------------------------------------------------------------------
 
 const NUMERIC_SIGN_MASK: u16 = 0xC000;
 const NUMERIC_POS: u16 = 0x0000;
@@ -91,19 +83,17 @@ const NUMERIC_DSCALE_MASK: u16 = 0x3FFF;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NumericKind {
-    /// NaN.
     NaN,
-    /// `+Infinity` (PG 14+).
+    /// `+Infinity` (PG 14+)
     PInf,
-    /// `-Infinity` (PG 14+).
+    /// `-Infinity` (PG 14+)
     NInf,
-    /// Finite value rendered to its PG-text form.
+    /// PG-text form
     Finite(String),
 }
 
-/// Decode the body of a `numeric` varlena. Returns a [`NumericKind`]
-/// whose `Finite(s)` text matches PG's `numeric_out` exactly for finite
-/// inputs; specials carry their flag.
+/// Decode `numeric` varlena body; `Finite(s)` matches PG `numeric_out`
+/// exactly for finite inputs, specials carry their flag
 pub fn decode_numeric(body: &[u8]) -> Result<NumericKind, CodecError> {
     if body.len() < 2 {
         return Err(CodecError::Truncated {
@@ -122,7 +112,7 @@ pub fn decode_numeric(body: &[u8]) -> Result<NumericKind, CodecError> {
             NUMERIC_NAN => NumericKind::NaN,
             NUMERIC_PINF => NumericKind::PInf,
             NUMERIC_NINF => NumericKind::NInf,
-            _ => NumericKind::NaN, // unknown special — treat as NaN to stay lossy-safe
+            _ => NumericKind::NaN, // unknown special, treat as NaN (lossy-safe)
         });
     }
 
@@ -135,7 +125,7 @@ pub fn decode_numeric(body: &[u8]) -> Result<NumericKind, CodecError> {
         let dscale = ((n_header & NUMERIC_SHORT_DSCALE_MASK) >> NUMERIC_SHORT_DSCALE_SHIFT) as i32;
         let mut w = (n_header & NUMERIC_SHORT_WEIGHT_MASK) as i32;
         if n_header & NUMERIC_SHORT_WEIGHT_SIGN_MASK != 0 {
-            // 7-bit signed extension
+            // 7-bit sign extension
             w |= !(NUMERIC_SHORT_WEIGHT_MASK as i32);
         }
         (sign, w, dscale, 2usize)
@@ -177,8 +167,7 @@ pub fn decode_numeric(body: &[u8]) -> Result<NumericKind, CodecError> {
     )))
 }
 
-/// Render a finite numeric to its PG text form. Mirrors
-/// `get_str_from_var` in `numeric.c` (DEC_DIGITS == 4 branch).
+/// Mirrors `get_str_from_var` in `numeric.c` (DEC_DIGITS == 4 branch)
 fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[i16]) -> String {
     let ndigits = digits.len() as i32;
     let mut out = String::new();
@@ -186,7 +175,6 @@ fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[i16]) -> String
         out.push('-');
     }
 
-    // Pre-decimal digits.
     if weight < 0 {
         out.push('0');
     } else {
@@ -194,18 +182,17 @@ fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[i16]) -> String
         for d in 0..=weight {
             let dig = if d < ndigits { digits[d as usize] } else { 0 };
             if first_block {
-                // Suppress leading zeros within the highest-order NBASE digit.
+                // Suppress leading zeros in highest-order NBASE digit
                 let s = format!("{dig}");
                 out.push_str(&s);
                 first_block = false;
             } else {
-                // Subsequent NBASE digits always take DEC_DIGITS chars.
+                // Subsequent NBASE digits take DEC_DIGITS chars
                 out.push_str(&format!("{:0>4}", dig.max(0)));
             }
         }
     }
 
-    // Post-decimal digits.
     if dscale > 0 {
         out.push('.');
         let mut written = 0i32;
@@ -216,7 +203,7 @@ fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[i16]) -> String
             } else {
                 0
             };
-            // four decimal characters per NBASE digit (DEC_DIGITS == 4)
+            // 4 decimal chars per NBASE digit (DEC_DIGITS == 4)
             let s = format!("{:0>4}", dig.max(0));
             for ch in s.chars() {
                 if written >= dscale {
@@ -231,17 +218,14 @@ fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[i16]) -> String
     out
 }
 
-// ---------------------------------------------------------------------
-// inet / cidr — on-disk `inet_struct` (utils/inet.h ≈ line 24):
+// inet / cidr — on-disk `inet_struct` (utils/inet.h):
 //   uint8 family   (2 = AF_INET, 3 = AF_INET6)
 //   uint8 bits     (netmask bits)
 //   uint8 ipaddr[nb]  (nb = 4 for AF_INET, 16 for AF_INET6)
 //
-// Note: PG's wire format (typsend, `inet_send`) adds two bytes here —
-// `is_cidr` flag + address byte count — but those are *not* on disk.
-// `is_cidr` is encoded by the column's type OID (INETOID vs CIDROID);
-// the body has no flag. Address-byte-count is implied by family.
-// ---------------------------------------------------------------------
+// PG wire format (`inet_send`) adds is_cidr flag + addr byte count, but those
+// are NOT on disk: is_cidr comes from the column type OID (INETOID vs
+// CIDROID), addr count is implied by family.
 
 pub const PGSQL_AF_INET: u8 = 2;
 pub const PGSQL_AF_INET6: u8 = 3;
@@ -254,8 +238,7 @@ pub struct InetValue {
     pub addr: Vec<u8>,
 }
 
-/// Decode the body of an on-disk inet/cidr datum. `is_cidr` is **not**
-/// in the bytes — caller passes it from the column's type OID.
+/// `is_cidr` is **not** in the bytes; caller passes it from the column type OID
 pub fn decode_inet(body: &[u8], is_cidr: bool) -> Result<InetValue, CodecError> {
     if body.len() < 2 {
         return Err(CodecError::Truncated {
@@ -293,10 +276,9 @@ pub fn decode_inet(body: &[u8], is_cidr: bool) -> Result<InetValue, CodecError> 
 }
 
 impl InetValue {
-    /// PG `inet_out` / `cidr_out` text rendering: dotted-quad or
-    /// colon-hex, with an optional `/bits` netmask suffix. For `inet`
-    /// the suffix is omitted when bits == max-for-family; for `cidr`
-    /// the suffix is always present.
+    /// PG `inet_out` / `cidr_out`: dotted-quad or colon-hex with optional
+    /// `/bits` suffix. `inet` omits suffix when bits == family max; `cidr`
+    /// always emits it
     pub fn to_text(&self) -> String {
         let addr_text = match self.family {
             PGSQL_AF_INET => format!(
@@ -319,15 +301,13 @@ impl InetValue {
     }
 }
 
-/// IPv6 text rendering matching PG's `inet_net_ntop`: RFC 5952 canonical
-/// form (lower-case hex, no leading zeros per group, `::` collapses the
-/// longest run of two or more zero groups).
+/// IPv6 matching PG `inet_net_ntop`: RFC 5952 canonical form (lower-case hex,
+/// no per-group leading zeros, `::` collapses longest run of ≥2 zero groups)
 fn format_ipv6(bytes: &[u8]) -> String {
     let mut groups = [0u16; 8];
     for (i, g) in groups.iter_mut().enumerate() {
         *g = ((bytes[i * 2] as u16) << 8) | bytes[i * 2 + 1] as u16;
     }
-    // Find longest run of consecutive zeros of length >= 2.
     let mut best_start = None;
     let mut best_len = 1usize;
     let mut i = 0;
@@ -364,9 +344,7 @@ fn format_ipv6(bytes: &[u8]) -> String {
     out
 }
 
-// ---------------------------------------------------------------------
-// interval — fixed 16 bytes: i64 micros + i32 days + i32 months.
-// ---------------------------------------------------------------------
+// interval — fixed 16 bytes: i64 micros + i32 days + i32 months
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntervalValue {
@@ -394,9 +372,9 @@ pub fn decode_interval(body: &[u8]) -> Result<IntervalValue, CodecError> {
 }
 
 impl IntervalValue {
-    /// `interval_out` style: e.g. "1 year 2 mons 3 days 04:05:06.7".
-    /// Components with zero value are omitted; sub-second precision is
-    /// emitted as `.fffffff` (up to 6 digits) trimmed of trailing zeros.
+    /// PG `interval_out`: e.g. "1 year 2 mons 3 days 04:05:06.7". Zero
+    /// components omitted; sub-second as `.ffffff` (≤6 digits) trailing-zero
+    /// trimmed
     pub fn to_text(&self) -> String {
         if self.months == 0 && self.days == 0 && self.micros == 0 {
             return "00:00:00".to_string();
@@ -453,10 +431,9 @@ pub(crate) fn format_time_us(mut us: i64) -> String {
     }
 }
 
-/// PG `timetz_out`: time-of-day text plus the zone offset. PG stores the
-/// zone as seconds *west* of UTC (negative east), so the displayed
-/// offset is `-tz_seconds`. Renders `±HH`, appending `:MM` then `:SS`
-/// only when nonzero, matching PG's output.
+/// PG `timetz_out`: time-of-day plus zone offset. PG stores zone as seconds
+/// *west* of UTC (negative east), so displayed offset is `-tz_seconds`. `±HH`,
+/// appends `:MM` then `:SS` only when nonzero
 pub(crate) fn timetz_to_text(micros: i64, tz_seconds: i32) -> String {
     let mut s = format_time_us(micros);
     let off = -tz_seconds;
@@ -510,7 +487,7 @@ mod tests {
 
     #[test]
     fn numeric_short_one_digit() {
-        // 42 — weight 0, dscale 0, one digit value 42.
+        // 42
         let body = short_numeric(false, 0, 0, &[42]);
         assert_eq!(
             decode_numeric(&body).unwrap(),
@@ -520,7 +497,6 @@ mod tests {
 
     #[test]
     fn numeric_short_negative() {
-        // -7
         let body = short_numeric(true, 0, 0, &[7]);
         assert_eq!(
             decode_numeric(&body).unwrap(),
@@ -530,7 +506,7 @@ mod tests {
 
     #[test]
     fn numeric_short_with_scale() {
-        // 1.5 — weight 0, dscale 1, digits [1, 5000]
+        // 1.5: digits base-10000 → [1, 5000]
         let body = short_numeric(false, 0, 1, &[1, 5000]);
         assert_eq!(
             decode_numeric(&body).unwrap(),
@@ -540,7 +516,7 @@ mod tests {
 
     #[test]
     fn numeric_zero() {
-        // 0 — weight 0, dscale 0, no digits
+        // 0: no digits
         let body = short_numeric(false, 0, 0, &[]);
         assert_eq!(
             decode_numeric(&body).unwrap(),
@@ -550,7 +526,7 @@ mod tests {
 
     #[test]
     fn numeric_long_form_large() {
-        // 12345 — three decimal-blocks: 1, 2345. weight 1, ndigits 2.
+        // 12345: base-10000 blocks [1, 2345], weight 1
         let body = long_numeric(false, 1, 0, &[1, 2345]);
         assert_eq!(
             decode_numeric(&body).unwrap(),
@@ -598,7 +574,7 @@ mod tests {
 
     #[test]
     fn inet_ipv4_with_short_mask() {
-        // 192.168.0.1/24 — non-cidr but bits != max; suffix should appear.
+        // non-cidr but bits != max, suffix appears
         let body = vec![PGSQL_AF_INET, 24, 192, 168, 0, 1];
         let v = decode_inet(&body, false).unwrap();
         assert_eq!(v.to_text(), "192.168.0.1/24");
@@ -615,7 +591,6 @@ mod tests {
 
     #[test]
     fn inet_ipv6_compressed_middle() {
-        // fe80::1
         let mut body = vec![PGSQL_AF_INET6, 128];
         body.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
         let v = decode_inet(&body, false).unwrap();
@@ -633,21 +608,18 @@ mod tests {
 
     #[test]
     fn timetz_text_renders_zone() {
-        // 12:34:56 at UTC+2 → PG stores tz_seconds = -7200 (west-positive
-        // convention), displayed offset +02.
+        // UTC+2 stored west-positive as tz_seconds=-7200, displayed +02
         let micros = ((12 * 3600 + 34 * 60 + 56) as i64) * 1_000_000;
         assert_eq!(timetz_to_text(micros, -7200), "12:34:56+02");
-        // UTC.
         assert_eq!(timetz_to_text(micros, 0), "12:34:56+00");
-        // West of UTC with a half-hour offset: UTC-5:30 → tz_seconds=19800.
+        // UTC-5:30 → tz_seconds=19800
         assert_eq!(timetz_to_text(micros, 19800), "12:34:56-05:30");
-        // Sub-second precision is preserved.
         assert_eq!(timetz_to_text(micros + 500_000, -7200), "12:34:56.5+02");
     }
 
     #[test]
     fn interval_decode_basic() {
-        // 1 month 2 days 3 microseconds: months=1 days=2 micros=3.
+        // on-disk order: micros, days, months
         let mut body = Vec::new();
         body.extend_from_slice(&3i64.to_le_bytes());
         body.extend_from_slice(&2i32.to_le_bytes());
@@ -656,7 +628,6 @@ mod tests {
         assert_eq!(v.months, 1);
         assert_eq!(v.days, 2);
         assert_eq!(v.micros, 3);
-        // Format checks: 1 mon 2 days 00:00:00.000003
         assert!(v.to_text().contains("1 mon"));
         assert!(v.to_text().contains("2 days"));
         assert!(v.to_text().ends_with("00:00:00.000003"));
@@ -681,9 +652,7 @@ mod tests {
 
     #[test]
     fn numeric_short_negative_weight_renders_leading_zero() {
-        // 0.5 — weight=-1 (sign-extended via NUMERIC_SHORT_WEIGHT_SIGN_MASK),
-        // dscale=1, single digit 5000. Exercises both the short-form
-        // sign-extension branch & render_numeric's `weight < 0` arm.
+        // 0.5: weight=-1 exercises short-form sign extension + `weight < 0` arm
         let body = short_numeric(false, -1, 1, &[5000]);
         assert_eq!(
             decode_numeric(&body).unwrap(),
@@ -693,8 +662,7 @@ mod tests {
 
     #[test]
     fn numeric_long_form_truncated_body() {
-        // Long form (top bit clear, sign bits not SPECIAL) with body < 4 bytes
-        // must fail with Truncated at offset 2.
+        // Long form, body < 4 bytes → Truncated at offset 2
         let body = NUMERIC_POS.to_le_bytes().to_vec();
         match decode_numeric(&body) {
             Err(CodecError::Truncated { offset: 2, .. }) => (),
@@ -704,7 +672,7 @@ mod tests {
 
     #[test]
     fn numeric_unknown_special_falls_back_to_nan() {
-        // Special flag bits set but tag != NaN/PInf/NInf → fallback NaN arm.
+        // Special flag set, tag != NaN/PInf/NInf → NaN fallback
         let header: u16 = NUMERIC_SPECIAL | 0x0001;
         let body = header.to_le_bytes();
         assert_eq!(decode_numeric(&body).unwrap(), NumericKind::NaN);
@@ -712,8 +680,7 @@ mod tests {
 
     #[test]
     fn numeric_dscale_trailing_zero_pad() {
-        // 5.0000 — short form weight=0 dscale=4 digits=[5]. Post-decimal
-        // loop runs past ndigits, hitting the `0` fallback arm.
+        // 5.0000: post-decimal loop runs past ndigits, hits `0` fallback
         let body = short_numeric(false, 0, 4, &[5]);
         assert_eq!(
             decode_numeric(&body).unwrap(),
@@ -723,7 +690,7 @@ mod tests {
 
     #[test]
     fn numeric_rejects_oversized_digit_array() {
-        // ndigits exceeds NUMERIC_DSCALE_MASK + 4 → BadNumeric.
+        // ndigits > NUMERIC_DSCALE_MASK + 4 → BadNumeric
         let mut body = NUMERIC_POS.to_le_bytes().to_vec();
         body.extend_from_slice(&0i16.to_le_bytes()); // weight
         body.extend(std::iter::repeat_n(
@@ -738,7 +705,7 @@ mod tests {
 
     #[test]
     fn inet_ipv4_truncated_addr() {
-        // family=AF_INET expects 4 addr bytes; only 2 supplied.
+        // AF_INET expects 4 addr bytes, only 2 supplied
         let body = vec![PGSQL_AF_INET, 32, 1, 2];
         assert!(matches!(
             decode_inet(&body, false),
@@ -757,8 +724,7 @@ mod tests {
 
     #[test]
     fn inet_unknown_family_text_renders_placeholder() {
-        // Direct InetValue construction bypasses decode_inet's family check
-        // to reach to_text's `_ => "?"` arm.
+        // Direct construction bypasses decode_inet's family check → `_ => "?"`
         let v = InetValue {
             family: 99,
             bits: 0,
@@ -770,8 +736,7 @@ mod tests {
 
     #[test]
     fn inet_ipv6_full_expansion_no_collapse() {
-        // No zero run >= 2, so every group is printed with a leading ':'
-        // separator after the first — exercises the explicit `:` push.
+        // No zero run ≥2, exercises explicit `:` push between every group
         let mut body = vec![PGSQL_AF_INET6, 128];
         for i in 1..=8u16 {
             body.extend_from_slice(&i.to_be_bytes());
@@ -801,7 +766,7 @@ mod tests {
 
     #[test]
     fn interval_trims_trailing_fraction_zeros() {
-        // 1000 us = 0.001 s — frac "001000" trims to "001".
+        // 1000 us: frac "001000" trims to "001"
         let v = IntervalValue {
             months: 0,
             days: 0,

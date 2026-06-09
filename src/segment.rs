@@ -1,14 +1,10 @@
 //! Byte-positioned WAL segment walker.
 //!
-//! `WalParser` from wal-rs surfaces parsed `XLogRecord`s but discards
-//! where each record physically sat in the segment. The rewriter
-//! needs that mapping so it can replace dropped records in place,
-//! preserving every other record's `xl_prev` chain.
-//!
-//! Walks pages sequentially, accumulating continuations across page
-//! boundaries. Yields `WalkedRecord { logical_bytes, byte_ranges }`
-//! tuples — `logical_bytes` is the contiguous record (header + body, no
-//! page-header interruptions), `byte_ranges` is where to write it back.
+//! wal-rs `WalParser` discards where each record physically sat in the segment.
+//! Rewriter needs that mapping to replace dropped records in place, preserving
+//! every other record's `xl_prev` chain. `logical_bytes` is the contiguous
+//! record (header + body, no page-header interruptions); `byte_ranges` is where
+//! to write it back.
 
 use smallvec::{SmallVec, smallvec};
 use wal_rs::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
@@ -16,57 +12,45 @@ use wal_rs::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 pub use crate::wal_page::WalkError;
 use crate::wal_page::{PAGE_SIZE, PageHeaderParse, align_up, parse_page_header};
 
-/// Inline-1 byte-range vector: records almost always live on one WAL
-/// page, multi-range only when a record straddles the page boundary.
-/// Allocated per walked record (millions per segment) so the inline
-/// case skips a `Vec` heap alloc on the hot path.
+/// Inline-1: a record almost always lives on one page, multi-range only when
+/// it straddles a page boundary. Millions per segment, so inline case skips a
+/// heap alloc on the hot path.
 pub type ByteRanges = SmallVec<[(usize, usize); 1]>;
 
-/// One walked record's physical footprint in the segment.
 #[derive(Debug, Clone)]
 pub struct WalkedRecord {
-    /// Logical record bytes (header + body), exactly `xl_tot_len` long.
+    /// Header + body, exactly `xl_tot_len` long
     pub logical_bytes: Vec<u8>,
-    /// File-offset / length pairs the logical bytes occupy in the
-    /// segment, in order. `byte_ranges.iter().map(|(_, l)| l).sum() == logical_bytes.len()`.
+    /// In-order file offset/length pairs the logical bytes occupy.
+    /// `byte_ranges.iter().map(|(_, l)| l).sum() == logical_bytes.len()`
     pub byte_ranges: ByteRanges,
-    /// First byte offset in the segment (= `byte_ranges[0].0`).
     pub start_offset: usize,
-    /// Page magic from the page where the record header lives.
+    /// Magic of the page where the record header lives (FPI bit layout)
     pub page_magic: u16,
 }
 
-/// Iterate every complete record on a segment, in source order.
-///
-/// `bytes` is the raw segment file. Trailing zero pages (post-CHECKPOINT
-/// padding) terminate iteration silently.
+/// Iterate every complete record in source order. Trailing zero pages
+/// (post-CHECKPOINT padding) terminate iteration silently.
 pub struct SegmentWalker<'a> {
     bytes: &'a [u8],
-    /// Cursor within the current page's data area.
     cursor: usize,
-    /// File offset of the current page's start.
     page_start: usize,
-    /// Magic from the current page's header (for FPI bit interpretation
-    /// of records starting on this page).
+    /// Magic of current page header (FPI bit interpretation for records
+    /// starting on this page)
     page_magic: u16,
-    /// Partial record currently being stitched.
     pending: Option<Pending>,
-    /// Set once we've returned an Err or hit clean EOF.
+    /// Set once an Err returned or clean EOF hit
     done: bool,
 }
 
 #[derive(Debug)]
 struct Pending {
-    /// File offset where the record header begins.
     start_offset: usize,
-    /// `xl_tot_len` once we have all 24 header bytes; `None` until then
-    /// (a record's header can itself straddle the page boundary).
+    /// `xl_tot_len` once all header bytes present; `None` until then (header
+    /// can itself straddle the page boundary)
     total_len: Option<u32>,
-    /// Bytes accumulated so far.
     accumulated: Vec<u8>,
-    /// Byte ranges spanned so far.
     byte_ranges: ByteRanges,
-    /// Magic of the page the record header was read on.
     page_magic: u16,
 }
 
@@ -100,12 +84,12 @@ impl<'a> SegmentWalker<'a> {
     fn read_page_header(&mut self) -> Result<Option<()>, WalkError> {
         let (magic, data_start, remaining_data_len) =
             match parse_page_header(self.bytes, self.page_start)? {
-                // Short tail or zero page: clean end of valid data.
+                // Short tail or zero page: clean end of valid data
                 PageHeaderParse::ShortHeaderIncomplete | PageHeaderParse::ZeroPage => {
                     self.done = true;
                     return Ok(None);
                 }
-                // Long header announced but bytes missing: corrupt segment.
+                // Long header announced but bytes missing: corrupt segment
                 PageHeaderParse::LongHeaderIncomplete => {
                     return Err(WalkError::Truncated(self.page_start));
                 }
@@ -123,23 +107,20 @@ impl<'a> SegmentWalker<'a> {
         }
         let page_data_area = page_end - data_start;
 
-        // Handle continuation of a record from previous page. The
-        // `remaining_data_len` is bytes still owed; if it exceeds this
-        // page's data area, the record spans yet another page.
+        // Continuation from previous page. `remaining_data_len` bytes still
+        // owed; if it exceeds this page's data area, record spans yet another
         if remaining_data_len > 0 {
             let contributes = remaining_data_len.min(page_data_area);
             self.consume_continuation(data_start, contributes)?;
-            // Cursor: after the continuation bytes, aligned. If the
-            // record didn't complete on this page, no more records on
-            // this page either — jump cursor to page_end.
+            // Record incomplete on this page => no more records here either
             if remaining_data_len > page_data_area {
                 self.cursor = page_end;
             } else {
                 self.cursor = align_up(data_start + remaining_data_len, X_LOG_RECORD_ALIGNMENT);
             }
         } else {
-            // No continuation. If we still have pending state, drop it
-            // (segment corrupt at boundary; be lenient at EOF).
+            // No continuation; drop stale pending (segment corrupt at boundary,
+            // lenient at EOF)
             self.pending = None;
             self.cursor = data_start;
         }
@@ -151,9 +132,8 @@ impl<'a> SegmentWalker<'a> {
         if cont_end > self.bytes.len() {
             return Err(WalkError::Truncated(self.page_start));
         }
-        // If no pending, the segment started mid-record (continuation
-        // from a previous segment). Skip those bytes silently — they
-        // belong to a record we never saw the header of.
+        // No pending => segment started mid-record (continuation from a prior
+        // segment); skip silently, header never seen
         let p = match self.pending.as_mut() {
             Some(p) => p,
             None => return Ok(()),
@@ -165,22 +145,17 @@ impl<'a> SegmentWalker<'a> {
         Ok(())
     }
 
-    /// Read one record starting at `self.cursor`. Returns `None` if the
-    /// remainder of the page is zeros (end-of-valid-data marker).
+    /// `None` when the page remainder is zeros (end-of-valid-data marker).
     fn try_read_record_on_page(&mut self) -> Result<Option<WalkedRecord>, WalkError> {
         let page_end = self.page_start + PAGE_SIZE;
-        // Skip alignment pad
         self.cursor = align_up(self.cursor, X_LOG_RECORD_ALIGNMENT);
         if self.cursor >= page_end {
             return Ok(None);
         }
         let avail = page_end - self.cursor;
         if avail < X_LOG_RECORD_HEADER_SIZE {
-            // Header doesn't fit on this page. Either:
-            //  * trailing zeros → end of valid data, done.
-            //  * non-zero partial header → record continues on next
-            //    page; buffer what we have and let `consume_continuation`
-            //    finish stitching.
+            // Header doesn't fit: trailing zeros => EOF; else partial header,
+            // record continues next page, buffer for `consume_continuation`
             if self.bytes[self.cursor..page_end].iter().all(|&b| b == 0) {
                 self.done = true;
                 return Ok(None);
@@ -199,7 +174,7 @@ impl<'a> SegmentWalker<'a> {
         let xl_tot_len =
             u32::from_le_bytes(self.bytes[self.cursor..self.cursor + 4].try_into().unwrap());
         if xl_tot_len == 0 {
-            // Zero header = post-WAL-switch padding / EOF
+            // Zero header: post-WAL-switch padding / EOF
             if self.bytes[self.cursor..page_end].iter().all(|&b| b == 0) {
                 self.done = true;
                 return Ok(None);
@@ -222,7 +197,6 @@ impl<'a> SegmentWalker<'a> {
         accumulated.extend_from_slice(&self.bytes[self.cursor..self.cursor + take_this_page]);
 
         if take_this_page == total {
-            // Whole record on this page
             self.cursor += take_this_page;
             return Ok(Some(WalkedRecord {
                 logical_bytes: accumulated,
@@ -240,7 +214,7 @@ impl<'a> SegmentWalker<'a> {
             byte_ranges: smallvec![range],
             page_magic: self.page_magic,
         });
-        self.cursor = page_end; // force next iteration to read next page
+        self.cursor = page_end;
         Ok(None)
     }
 }
@@ -255,8 +229,8 @@ impl<'a> Iterator for SegmentWalker<'a> {
 
         loop {
             let page_end = self.page_start + PAGE_SIZE;
-            // Need to read a new page if cursor is at/past page boundary
-            // or this is the very first call (cursor == 0 and page_magic == 0).
+            // New page when cursor at/past boundary, or first call
+            // (cursor == 0 && page_magic == 0)
             if self.cursor >= page_end || self.page_magic == 0 {
                 self.page_start = self.cursor.max(self.page_start);
                 if self.cursor >= page_end {
@@ -270,8 +244,7 @@ impl<'a> Iterator for SegmentWalker<'a> {
                         return Some(Err(e));
                     }
                 }
-                // After processing continuation, the pending may have
-                // completed; if so, emit it now.
+                // Continuation may have completed the pending record; emit it
                 if let Some(p) = self.pending.as_ref()
                     && p.fully_loaded()
                 {
@@ -303,8 +276,7 @@ mod tests {
     use super::*;
     use wal_rs::pg::walparser::{RmId, WalParser, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
 
-    /// Build a page with `body` starting after a long header (40 byte
-    /// prefix). Zero-pads to PAGE_SIZE.
+    /// `body` starts after a long header (40-byte prefix), zero-padded to PAGE_SIZE
     fn build_single_page(body: &[u8], magic: u16, remaining_data_len: u32) -> Vec<u8> {
         let mut page = Vec::with_capacity(PAGE_SIZE);
         page.extend_from_slice(&magic.to_le_bytes());
@@ -347,7 +319,6 @@ mod tests {
         assert_eq!(r.byte_ranges.len(), 1);
         assert_eq!(r.start_offset, 40); // long header + 4 pad
         assert_eq!(r.page_magic, XLP_PAGE_MAGIC_PG15);
-        // Walker terminates after zero-padded tail
         assert!(walker.next().is_none());
     }
 
@@ -373,19 +344,16 @@ mod tests {
 
     #[test]
     fn walks_record_spanning_two_pages() {
-        // Record header on page 1, body finishes on page 2.
-        // Layout: long header (40) + record header (24) + body 60 bytes
-        // page data area = 8192 - 40 = 8152 bytes
-        // Make record = 8200 bytes so it overflows the page by 48 bytes.
+        // page data area = 8192 - 40 long header = 8152; record 8200 overflows
+        // by 48 bytes, so body finishes on page 2
         let record_total = 8200u32;
         let body_after_header = record_total as usize - X_LOG_RECORD_HEADER_SIZE;
         let mut record = header_le(record_total);
         record.extend_from_slice(&vec![0xAAu8; body_after_header]);
 
-        // page 1: long header + the part of record that fits (8152 bytes)
         let p1_data_area = PAGE_SIZE - 40;
         let p1_record_bytes = &record[..p1_data_area];
-        let p1_remainder_bytes = &record[p1_data_area..]; // 48 bytes
+        let p1_remainder_bytes = &record[p1_data_area..];
         let page1 = build_single_page(p1_record_bytes, XLP_PAGE_MAGIC_PG15, 0);
 
         // page 2: short header + remaining_data_len = 48
@@ -395,7 +363,7 @@ mod tests {
         page2.extend_from_slice(&1u32.to_le_bytes()); // timeline
         page2.extend_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // page_address
         page2.extend_from_slice(&(p1_remainder_bytes.len() as u32).to_le_bytes());
-        // short header = 20 bytes, then pad to 24
+        // short header = 20 bytes, pad to 24
         page2.extend_from_slice(&[0u8; 4]);
         page2.extend_from_slice(p1_remainder_bytes);
         page2.resize(PAGE_SIZE, 0);
@@ -416,7 +384,6 @@ mod tests {
 
     #[test]
     fn walks_terminates_on_zero_padded_page() {
-        // Empty body, expect immediate termination
         let page = build_single_page(&[], XLP_PAGE_MAGIC_PG15, 0);
         let mut walker = SegmentWalker::new(&page);
         assert!(walker.next().is_none());
@@ -433,9 +400,8 @@ mod tests {
         assert!(matches!(e, WalkError::BadPageMagic(_, _)));
     }
 
-    /// PG ≤ 14 capture: magic 0xD10D (PG 14). Reject before the parser
-    /// hits any FPI record, since wal-rs's FPI dispatch keys off
-    /// `magic >= XLP_PAGE_MAGIC_PG15`.
+    /// Magic 0xD10D (PG 14): reject before any FPI record, since wal-rs FPI
+    /// dispatch keys off `magic >= XLP_PAGE_MAGIC_PG15`
     #[test]
     fn rejects_pre_pg15_magic() {
         let body = header_le(40);
@@ -448,10 +414,9 @@ mod tests {
         );
     }
 
-    /// Boundaries the walker reports must match wal-rs `WalParser`'s
-    /// boundaries on the same bytes. Cross-validated against real
-    /// captured segments in `tests/filter_round_trip.rs`; this
-    /// synthetic test just keeps the two structures linked.
+    /// Walker boundaries must match wal-rs `WalParser` on the same bytes.
+    /// Real cross-validation lives in `tests/filter_round_trip.rs`; this is the
+    /// synthetic link between the two structures.
     #[test]
     fn walker_record_boundary_matches_xl_tot_len() {
         let mut body = header_le(40);

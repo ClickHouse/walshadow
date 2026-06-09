@@ -1,30 +1,19 @@
-//! Page-walk Tap sink + supporting walker types.
-//!
-//! Sinks user-heap tar entries (`base/<dbid>/<filenode>` with
-//! filenode >= 16384) via [`FileAction::Tap`]. As bytes arrive in
-//! `chunk()` callbacks, the sink accumulates them 8 KiB at a time
-//! (PG's heap page size), walks each full page's `ItemIdData` slots,
-//! and decodes live tuples through the **same heap decoder the WAL
-//! hot path uses** (`decode_block_data`).
-//! Output is one [`BackfillTuple`] per `LP_NORMAL` slot; the sink
-//! hands them off through an mpsc to an async drain task that pumps
-//! the CH emitter. See [plans/bootstrap.md](../plans/bootstrap.md).
+//! Page-walk Tap sink. Decodes user-heap tar entries through the same
+//! heap decoder the WAL hot path uses (`decode_block_data`).
+//! See [plans/bootstrap.md](../plans/bootstrap.md).
 //!
 //! ## V1 limits
 //!
-//! - **No FPI replay on backup pages.** Pages with `pd_lsn < start_lsn`
+//! - No FPI replay on backup pages. Pages with `pd_lsn < start_lsn`
 //!   captured mid-write get walked as-shipped. WAL records in
-//!   `[start_lsn, end_lsn]` that update the same tuples re-emit at
-//!   higher `_lsn` and `ReplacingMergeTree(_lsn)` collapses the
-//!   duplicate. Accepted brief-duplicate window, see
-//!   [plans/bootstrap.md](../plans/bootstrap.md).
-//! - **TOAST-spilled columns surface as `ColumnValue::PgPending`.**
-//!   Inline-stored varlena columns decode through the heap decoder's type
-//!   matrix; external TOAST chunks aren't reassembled here. The
-//!   chunk-and-assemble logic is WAL-shared work, not 2A-specific.
-//! - **`pg_toast_<relid>` tar entries are observed but not decoded.**
-//!   The page count surfaces via stats; the chunk projection is
-//!   deferred to the WAL-side TOAST decoder.
+//!   `[start_lsn, end_lsn]` re-emit at higher `_lsn` and
+//!   `ReplacingMergeTree(_lsn)` collapses the duplicate. Accepted
+//!   brief-duplicate window, see [plans/bootstrap.md](../plans/bootstrap.md).
+//! - TOAST-spilled columns surface as `ColumnValue::PgPending`. Inline
+//!   varlena decodes; external TOAST chunk reassembly is WAL-shared work,
+//!   not done here.
+//! - `pg_toast_<relid>` tar entries observed but not decoded; chunk
+//!   projection deferred to WAL-side TOAST decoder.
 
 use std::collections::HashMap;
 use std::io;
@@ -43,19 +32,15 @@ use crate::heap_decoder::{
 };
 use crate::shadow_catalog::RelDescriptor;
 
-/// Heap page size — PG compile-time, identical to wal-rs `BLOCK_SIZE`.
+/// Heap page size, PG compile-time, identical to wal-rs `BLOCK_SIZE`
 pub const PAGE_BYTES: usize = 8192;
-/// `PageHeaderData` size — 24 bytes since PG 8.x.
+/// `PageHeaderData` size, 24 bytes since PG 8.x
 pub const SIZE_OF_PAGE_HEADER: usize = 24;
-/// `ItemIdData` size — 4 bytes, packed.
 pub const SIZE_OF_ITEM_ID: usize = 4;
-/// `lp_flags` LP_NORMAL — slot carries a live tuple.
+/// `lp_flags` value for a live tuple slot
 pub const LP_NORMAL: u8 = 1;
 
-/// `pg_toast` regnamespace name. TOAST tables ship under this
-/// namespace with `pg_toast_<relid>` names; pages from them are
-/// recognised but their `(chunk_id, chunk_seq, chunk_data)` shape
-/// isn't decoded in V1.
+/// `pg_toast` regnamespace; TOAST tables ship as `pg_toast_<relid>`
 pub const PG_TOAST_NS: &str = "pg_toast";
 
 #[derive(Debug, Error)]
@@ -76,24 +61,23 @@ pub enum PageWalkError {
     },
 }
 
-/// One decoded tuple from a backup page. Mirrors the shape the
-/// CH emitter consumes (a synthetic INSERT at `_lsn = start_lsn`).
+/// One decoded tuple from a backup page; a synthetic INSERT at
+/// `_lsn = start_lsn`.
 #[derive(Debug, Clone)]
 pub struct BackfillTuple {
     pub rfn: RelFileNode,
-    /// `t_xmin` of the on-page tuple. Sequencing isn't load-bearing
-    /// since `_lsn = start_lsn` is the same for every backfill row.
+    /// `t_xmin`; sequencing not load-bearing, every backfill row shares
+    /// the same `_lsn = start_lsn`
     pub xid: u32,
-    /// `start_lsn` from `StartInfo`. Every backfill row uses this.
     pub source_lsn: u64,
-    /// Attnum-1 indexed columns, matching `RelDescriptor.attributes`.
+    /// Attnum-1 indexed, matching `RelDescriptor.attributes`
     pub columns: Vec<Option<ColumnValue>>,
 }
 
 impl BackfillTuple {
-    /// Synthetic base-backup insert: start_lsn rides as both source_lsn and
-    /// commit_lsn so ReplacingMergeTree(_lsn) collapses duplicates the WAL
-    /// decoder re-emits for records in [start_lsn, end_lsn]
+    /// start_lsn rides as both source_lsn and commit_lsn so
+    /// ReplacingMergeTree(_lsn) collapses duplicates the WAL decoder
+    /// re-emits for records in [start_lsn, end_lsn]
     pub fn into_committed_insert(self) -> CommittedTuple {
         CommittedTuple {
             decoded: DecodedHeap {
@@ -113,16 +97,12 @@ impl BackfillTuple {
     }
 }
 
-/// Resolved `(db_node, rel_node) → RelDescriptor` map. Populated
-/// before [`PageWalkSink`] runs, typically by querying source PG's
-/// `pg_class`/`pg_attribute`/`pg_type` for relations with
-/// `oid >= 16384`. The bootstrap orchestrator owns the seed; the
-/// sink consumes immutable lookups.
+/// Resolved `(db_node, rel_node) → RelDescriptor` map. Seeded before
+/// [`PageWalkSink`] runs from source PG's
+/// `pg_class`/`pg_attribute`/`pg_type` for relations `oid >= 16384`.
 #[derive(Debug, Default, Clone)]
 pub struct CatalogMap {
     by_filenode: HashMap<(Oid, Oid), Arc<RelDescriptor>>,
-    /// `pg_toast_<relid>` tables — pages observed but not decoded
-    /// in V1.
     toast_filenodes: HashMap<(Oid, Oid), Oid>,
 }
 
@@ -156,33 +136,27 @@ impl CatalogMap {
     }
 }
 
-/// Per-pump counters. Operator-visible; not load-bearing.
+/// Per-pump counters, operator-visible
 #[derive(Debug, Default, Clone)]
 pub struct PageWalkStats {
-    /// User-heap files observed (begin'd) regardless of decode.
     pub files_seen: u64,
-    /// User-heap files whose pages were walked (filenode resolved to
-    /// a `RelDescriptor`).
     pub files_walked: u64,
-    /// User-heap files skipped because the catalog map didn't carry
-    /// their filenode — typically a race against the catalog seed.
+    /// Filenode absent from catalog map, typically a race against the seed
     pub files_skipped_unknown_filenode: u64,
-    /// TOAST relation files observed; pages noted, contents deferred.
     pub toast_files_observed: u64,
     pub pages_walked: u64,
     pub slots_seen: u64,
     pub tuples_emitted: u64,
     pub tuples_skipped_lp_flag: u64,
     pub tuples_skipped_truncated: u64,
-    /// Page-buffer bytes dropped because chunk arrived between pages
-    /// (PG never emits non-page-aligned data — anomalous).
+    /// Trailing partial-page bytes; PG heap files are page-aligned so
+    /// nonzero is anomalous
     pub tail_bytes_dropped: u64,
 }
 
-/// Walk one 8 KiB page slice, emit `BackfillTuple`s for `LP_NORMAL`
-/// slots. Returns errors only on framing corruption (bad page header
-/// bounds); per-tuple decode failures bump skip stats so a single
-/// torn page can't abort the whole bootstrap.
+/// Walks one 8 KiB page, emitting `BackfillTuple`s for `LP_NORMAL`
+/// slots. Errors only on framing corruption; per-tuple decode failures
+/// bump skip stats so a torn page can't abort the bootstrap.
 pub struct PageWalker<'a> {
     pub rel: &'a RelDescriptor,
     pub source_lsn: u64,
@@ -207,18 +181,13 @@ impl<'a> PageWalker<'a> {
             });
         }
         // PageHeaderData (PG src/include/storage/bufpage.h):
-        //   pd_lsn       0..8  (XLogRecPtr)
-        //   pd_checksum  8..10
-        //   pd_flags    10..12
-        //   pd_lower    12..14
-        //   pd_upper    14..16
-        //   pd_special  16..18
-        //   pd_pagesize 18..20
-        //   pd_prune    20..24
+        //   pd_lsn 0..8  pd_checksum 8..10  pd_flags 10..12
+        //   pd_lower 12..14  pd_upper 14..16  pd_special 16..18
+        //   pd_pagesize 18..20  pd_prune 20..24
         let pd_lower = u16::from_le_bytes(page[12..14].try_into().unwrap());
         let pd_upper = u16::from_le_bytes(page[14..16].try_into().unwrap());
         if pd_lower as usize == SIZE_OF_PAGE_HEADER && pd_upper as usize == PAGE_BYTES {
-            // Fresh / empty page — no slots
+            // Fresh / empty page
             stats.pages_walked += 1;
             return Ok(());
         }
@@ -268,15 +237,11 @@ impl<'a> PageWalker<'a> {
     }
 }
 
-/// Decode one on-page tuple. The on-disk tuple shape carries a full
-/// `HeapTupleHeaderData` (23 bytes); the heap decoder consumes the
-/// `xl_heap_header` (5 bytes) shape PG strips into WAL via
-/// `XLogRegisterBufData(0, tup->t_data + SizeofHeapTupleHeader, ...)`.
-/// Reshape `HeapTupleHeaderData` → `xl_heap_header`-prefixed buffer,
-/// then call the shared decoder.
-///
-/// Returns `(xmin, columns)` or `None` on a truncated / malformed
-/// header — a single bad tuple shouldn't abort page-walk.
+/// Decode one on-page tuple. On-disk shape carries a full
+/// `HeapTupleHeaderData` (23 bytes); the shared heap decoder consumes
+/// the `xl_heap_header` (5 bytes) shape PG strips into WAL via
+/// `XLogRegisterBufData(0, tup->t_data + SizeofHeapTupleHeader, ...)`,
+/// so reshape before calling it. `None` on truncated / malformed header.
 fn decode_on_page_tuple(
     tuple: &[u8],
     rel: &RelDescriptor,
@@ -286,15 +251,11 @@ fn decode_on_page_tuple(
     if tuple.len() < SIZE_OF_HEAP_TUPLE_HEADER {
         return None;
     }
-    // HeapTupleHeaderData layout (htup_details.h):
-    //   t_xmin       0..4   (TransactionId)
-    //   t_xmax       4..8
-    //   t_field3     8..12  (cid | xvac union)
-    //   t_ctid       12..18 (BlockIdData + OffsetNumber)
-    //   t_infomask2  18..20
-    //   t_infomask   20..22
-    //   t_hoff       22     (offset to user data, 8-byte aligned)
-    //   t_bits[]     23..   (NULL bitmap, only if HEAP_HASNULL)
+    // HeapTupleHeaderData (htup_details.h):
+    //   t_xmin 0..4  t_xmax 4..8  t_field3 8..12  t_ctid 12..18
+    //   t_infomask2 18..20  t_infomask 20..22
+    //   t_hoff 22 (offset to user data, 8-byte aligned)
+    //   t_bits[] 23.. (NULL bitmap, only if HEAP_HASNULL)
     let xmin = u32::from_le_bytes(tuple[0..4].try_into().unwrap());
     let t_infomask2 = u16::from_le_bytes(tuple[18..20].try_into().unwrap());
     let t_infomask = u16::from_le_bytes(tuple[20..22].try_into().unwrap());
@@ -309,11 +270,9 @@ fn decode_on_page_tuple(
         return None;
     }
 
-    // Build a synthetic xl_heap_header-prefixed buffer:
-    //   xl_heap_header (5): t_infomask2 (2), t_infomask (2), t_hoff (1)
-    //   bitmap (bitmap_bytes)
-    //   padding (HeapTupleHeader's t_bits..t_hoff gap)
-    //   column data (tuple[t_hoff..])
+    // Synthetic xl_heap_header-prefixed buffer:
+    //   xl_heap_header (5): t_infomask2, t_infomask, t_hoff
+    //   bitmap, then t_bits..t_hoff padding gap, then column data
     let mut wal_shaped = Vec::with_capacity(5 + (tuple.len() - SIZE_OF_HEAP_TUPLE_HEADER));
     wal_shaped.extend_from_slice(&t_infomask2.to_le_bytes());
     wal_shaped.extend_from_slice(&t_infomask.to_le_bytes());
@@ -336,49 +295,33 @@ fn decode_on_page_tuple(
 }
 
 /// Tap sink that buffers tar entry bytes and walks them 8 KiB at a
-/// time. Tuples ship over `out_tx` to an async drain task that pumps
-/// the CH emitter.
+/// time, shipping tuples over `out_tx` to an async drain task.
 pub struct PageWalkSink {
     catalog: CatalogMap,
-    /// `_lsn` value stamped onto every emitted tuple. Set by
-    /// `start()` from the source's `StartInfo`.
     source_lsn: u64,
-    /// Per-pump stats.
     pub stats: PageWalkStats,
-    /// Output channel. Unbounded for V1 — the `BackupSink::chunk`
-    /// callback is sync, and `tokio::sync::mpsc::Sender::blocking_send`
-    /// panics inside the tokio runtime context the source drives.
-    /// Memory exposure: bounded by user-heap row count emitted between
-    /// drain ticks; in practice the emitter task ahead of this drains
-    /// fast enough that unbounded queue is bounded by IO jitter alone.
-    /// Switch to `try_send` + capacity if measurement shows
-    /// pathological build-up.
+    /// Unbounded because `chunk()` is sync and `blocking_send` panics
+    /// inside the tokio runtime the source drives. Queue depth bounded
+    /// by IO jitter since the emitter task drains ahead; switch to
+    /// `try_send` + capacity if measurement shows build-up.
     out_tx: Option<mpsc::UnboundedSender<BackfillTuple>>,
-    /// Test-only capture, populated when `out_tx` is None.
+    /// Test-only capture, populated when `out_tx` is None
     pub captured: Vec<BackfillTuple>,
-    /// Per-entry state carried between begin / chunk / end, keyed by the
-    /// source-allocated `EntryId`. A map, not one slot, because
-    /// object_store fan-out interleaves `begin`/`chunk` across concurrent
-    /// parts; one slot would let part B's `begin` clobber the entry part
-    /// A is mid-stream on, mis-framing pages and misattributing rfns.
+    /// Per-entry state keyed by `EntryId`. A map, not one slot, because
+    /// object_store fan-out interleaves begin/chunk across concurrent
+    /// parts; one slot would let part B's begin clobber part A's
+    /// in-flight entry, mis-framing pages and misattributing rfns.
     cur: HashMap<EntryId, TapEntry>,
 }
 
 struct TapEntry {
-    /// Block number within the relation, starting at 0 for each new
-    /// tar entry. PG segments past 1 GiB carry `.1`, `.2` suffixes;
-    /// in-segment block numbering is local. Cross-segment continuation
-    /// (e.g. a 2 GiB relation as `<filenode>` + `<filenode>.1`) needs
-    /// the caller to track segment offset — V1 walks each segment as
-    /// if it were block 0 onward, which is correct for the LSN-stamp
-    /// case (every row gets `source_lsn` regardless).
+    /// Block number within the relation, 0-based per tar entry. V1 walks
+    /// each >1 GiB segment (`.1`, `.2` suffixes) as block 0 onward;
+    /// correct for the LSN-stamp case since every row gets `source_lsn`
     block_no: u32,
-    /// Carry-over bytes when chunk() reads straddled a page boundary.
+    /// Carry-over bytes when a chunk read straddled a page boundary
     page_buf: Vec<u8>,
-    /// `is_toast` cached at begin() so we can short-circuit page-walk
-    /// inside chunk() without re-locking the catalog map.
     is_toast: bool,
-    /// Resolved descriptor, cached at begin().
     desc: Option<Arc<RelDescriptor>>,
 }
 
@@ -394,8 +337,7 @@ impl PageWalkSink {
         }
     }
 
-    /// Test-mode constructor — emitted tuples land in `captured`
-    /// instead of being shipped through an mpsc.
+    /// Test-mode: emitted tuples land in `captured` instead of the mpsc
     #[cfg(test)]
     pub fn new_capturing(catalog: CatalogMap) -> Self {
         Self {
@@ -408,7 +350,6 @@ impl PageWalkSink {
         }
     }
 
-    /// Currently-active source_lsn. Set by `start()`.
     pub fn source_lsn(&self) -> u64 {
         self.source_lsn
     }
@@ -422,8 +363,8 @@ impl PageWalkSink {
 
     fn flush_full_pages(&mut self, id: EntryId) -> io::Result<()> {
         loop {
-            // Steal the page out so we can drop the entry borrow before
-            // touching self.stats / out_tx.send
+            // Take the page so the entry borrow drops before touching
+            // self.stats / out_tx.send
             let (block_no, is_toast, desc_opt, page) = {
                 let entry = match self.cur.get_mut(&id) {
                     Some(e) => e,
@@ -439,14 +380,12 @@ impl PageWalkSink {
             };
 
             if is_toast {
-                // V1: count the page, skip decode. WAL-side TOAST work
-                // will pick this up when it lands.
+                // V1: count, skip decode; deferred to WAL-side TOAST
                 self.stats.pages_walked += 1;
                 continue;
             }
             let Some(desc) = desc_opt else {
-                // Catalog seed didn't carry this filenode — skip the
-                // page entirely. Stats bookkeeping happened at begin().
+                // Filenode absent from seed; stats counted at begin()
                 continue;
             };
 
@@ -488,8 +427,7 @@ impl BackupSink for PageWalkSink {
 
     fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
         let Some((db, rel)) = self.classify(meta) else {
-            // Path doesn't parse as base/<db>/<filenode> — refuse Tap;
-            // multiplex sink will fall back to lander.
+            // Not base/<db>/<filenode>; multiplex sink falls back to lander
             return Ok(FileAction::Skip);
         };
         self.stats.files_seen += 1;
@@ -527,9 +465,8 @@ impl BackupSink for PageWalkSink {
         if let Some(e) = self.cur.remove(&entry) {
             let trailing = e.page_buf.len() as u64;
             if trailing > 0 {
-                // PG heap files are always page-aligned; trailing
-                // partial-page bytes are zero-padding or anomalous.
-                // Count them but don't try to decode.
+                // PG heap files are page-aligned; trailing bytes are
+                // zero-padding or anomalous, so count without decoding
                 self.stats.tail_bytes_dropped += trailing;
             }
         }
@@ -537,15 +474,12 @@ impl BackupSink for PageWalkSink {
     }
 
     fn finish(&mut self, _info: &EndInfo) -> io::Result<()> {
-        // Drop the sender clone so the emitter drain task observes
-        // channel close after this BackupSink is dropped (caller
-        // controls the Arc lifetime; nothing to do here).
+        // Channel close happens when caller drops this sink's Arc
         Ok(())
     }
 }
 
-/// Test fixture: a `public.t(id int4)` descriptor (rfn 1663/5/16400,
-/// oid 16400). Shared with `backfill_bootstrap`'s tests.
+/// Test fixture `public.t(id int4)`, shared with `backfill_bootstrap`
 #[cfg(test)]
 pub(crate) fn make_rel() -> RelDescriptor {
     use crate::shadow_catalog::{RelAttr, ReplIdent};
@@ -580,26 +514,20 @@ pub(crate) fn make_rel() -> RelDescriptor {
     }
 }
 
-/// Test fixture: synthesise an 8 KiB heap page with one int4 tuple, laid
-/// out as PG would (PageHeaderData at 0, one ItemIdData slot at 24,
-/// tuple body at the upper end). Shared with `backfill_bootstrap`.
+/// Test fixture: synthesise an 8 KiB heap page with one int4 tuple in
+/// PG on-disk layout. Shared with `backfill_bootstrap`.
 #[cfg(test)]
 pub(crate) fn synth_single_tuple_page(value: i32) -> [u8; PAGE_BYTES] {
     let mut page = [0u8; PAGE_BYTES];
     // Tuple body: HeapTupleHeaderData (23) + 1 byte pad + 4-byte int
     let tuple_off = PAGE_BYTES - 32;
-    // t_xmin = 99
-    page[tuple_off..tuple_off + 4].copy_from_slice(&99u32.to_le_bytes());
-    // t_infomask2 = 1 (natts = 1)
-    page[tuple_off + 18..tuple_off + 20].copy_from_slice(&1u16.to_le_bytes());
-    // t_infomask = 0
-    page[tuple_off + 20..tuple_off + 22].copy_from_slice(&0u16.to_le_bytes());
-    // t_hoff = 24 (MAXALIGN(8) past 23-byte header)
-    page[tuple_off + 22] = 24;
-    // column 1 (int4) at offset 24
+    page[tuple_off..tuple_off + 4].copy_from_slice(&99u32.to_le_bytes()); // t_xmin
+    page[tuple_off + 18..tuple_off + 20].copy_from_slice(&1u16.to_le_bytes()); // t_infomask2, natts=1
+    page[tuple_off + 20..tuple_off + 22].copy_from_slice(&0u16.to_le_bytes()); // t_infomask
+    page[tuple_off + 22] = 24; // t_hoff = MAXALIGN(8) past 23-byte header
     page[tuple_off + 24..tuple_off + 28].copy_from_slice(&value.to_le_bytes());
     let tuple_len = 28u16;
-    // Page header: pd_lower = 24 + 4 (one slot), pd_upper = tuple_off
+    // pd_lower = header + one slot, pd_upper = tuple_off
     page[12..14].copy_from_slice(&((SIZE_OF_PAGE_HEADER + 4) as u16).to_le_bytes());
     page[14..16].copy_from_slice(&(tuple_off as u16).to_le_bytes());
     // ItemIdData slot 0: lp_off (15) | lp_flags (2) | lp_len (15)
@@ -651,7 +579,7 @@ mod tests {
         let rel = make_rel();
         let walker = PageWalker::new(&rel, 0);
         let mut page = [0u8; PAGE_BYTES];
-        // Fresh-init page: pd_lower at header end, pd_upper at page end
+        // Fresh-init: pd_lower at header end, pd_upper at page end
         page[12..14].copy_from_slice(&(SIZE_OF_PAGE_HEADER as u16).to_le_bytes());
         page[14..16].copy_from_slice(&(PAGE_BYTES as u16).to_le_bytes());
         let mut out = Vec::new();
@@ -667,7 +595,7 @@ mod tests {
         let rel = make_rel();
         let walker = PageWalker::new(&rel, 0);
         let mut page = synth_single_tuple_page(7);
-        // Flip the slot's lp_flags from LP_NORMAL (1) to LP_DEAD (3)
+        // Flip lp_flags LP_NORMAL (1) -> LP_DEAD (3)
         let raw = u32::from_le_bytes(
             page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + 4]
                 .try_into()
@@ -690,7 +618,7 @@ mod tests {
         let rel = make_rel();
         let walker = PageWalker::new(&rel, 0);
         let mut page = [0u8; PAGE_BYTES];
-        // pd_lower past pd_upper
+        // pd_lower > pd_upper
         page[12..14].copy_from_slice(&(PAGE_BYTES as u16).to_le_bytes());
         page[14..16].copy_from_slice(&(SIZE_OF_PAGE_HEADER as u16).to_le_bytes());
         let mut out = Vec::new();
@@ -738,7 +666,7 @@ mod tests {
         let action = sink.begin(id, &meta).unwrap();
         assert_eq!(action, FileAction::Tap);
         let page = synth_single_tuple_page(99);
-        // Feed in two chunks to exercise the buffer-across-chunk path
+        // Two chunks exercise the buffer-across-chunk path
         sink.chunk(id, &page[..4096]).unwrap();
         sink.chunk(id, &page[4096..]).unwrap();
         sink.end(id).unwrap();
@@ -790,13 +718,10 @@ mod tests {
         assert_eq!(action, FileAction::Tap);
         sink.chunk(id, &synth_single_tuple_page(7)).unwrap();
         sink.end(id).unwrap();
-        // Tuple decoding skipped because no RelDescriptor; stat
-        // reflects unknown filenode
         assert!(sink.captured.is_empty());
         assert_eq!(sink.stats.files_skipped_unknown_filenode, 1);
         assert_eq!(sink.stats.tuples_emitted, 0);
-        // Page bookkeeping is silent on the "no descriptor" path —
-        // we don't claim to have walked it
+        // No-descriptor path doesn't count the page as walked
         assert_eq!(sink.stats.pages_walked, 0);
     }
 
@@ -819,16 +744,14 @@ mod tests {
     }
 
     /// object_store fan-out interleaves begin/chunk across concurrent
-    /// parts on the one shared sink (the mutex is released across each
-    /// body read). Per-entry keying must keep each file's page-walk
-    /// state separate; a single `cur` slot let a later `begin` clobber
-    /// the entry an earlier file was mid-stream on, misframing pages and
-    /// decoding them against the wrong relation. Drives two entries with
-    /// out-of-order, interleaved begin/chunk/end.
+    /// parts on the shared sink (mutex released across each body read).
+    /// Per-entry keying keeps each file's page-walk state separate; a
+    /// single `cur` slot would let a later begin clobber an in-flight
+    /// entry, misframing pages against the wrong relation.
     #[test]
     fn interleaved_entries_keep_independent_state() {
         let mut catalog = CatalogMap::new();
-        let rel_a = make_rel(); // rfn 1663/5/16400
+        let rel_a = make_rel();
         let mut rel_b = make_rel();
         rel_b.rfn.rel_node = 16401;
         rel_b.oid = 16401;
@@ -856,8 +779,8 @@ mod tests {
         };
         let (a, b) = (EntryId(0), EntryId(1));
 
-        // Both open before either streams; chunks arrive in the opposite
-        // order; ends interleave too — the worst case for a shared slot.
+        // Both open before either streams, chunks arrive reversed, ends
+        // interleave: worst case for a shared slot
         assert_eq!(sink.begin(a, &meta_a).unwrap(), FileAction::Tap);
         assert_eq!(sink.begin(b, &meta_b).unwrap(), FileAction::Tap);
         sink.chunk(b, &synth_single_tuple_page(200)).unwrap();
@@ -865,8 +788,8 @@ mod tests {
         sink.end(a).unwrap();
         sink.end(b).unwrap();
 
-        // Each tuple must carry its own file's rfn + value, not the
-        // other's. A shared slot would attribute both to rel B.
+        // Each tuple carries its own file's rfn + value; a shared slot
+        // would attribute both to rel B
         let mut by_rel: HashMap<Oid, i32> = HashMap::new();
         for t in &sink.captured {
             if let Some(Some(ColumnValue::Int4(v))) = t.columns.first() {

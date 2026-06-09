@@ -1,14 +1,9 @@
 //! PG → CH type bridge.
 //!
-//! Given a [`RelAttr`] resolved from shadow PG's `pg_attribute`, produce
-//! the matching CH type string plus an optional `DEFAULT <expr>` clause
-//! reconstructed from PG's `attmissingval[1]`.
-//!
-//! `EmitterConfig.tables` (TOML mapping) is still the operator-pinned
-//! override path; the bridge is the fallback for
-//! relations matched by namespace pattern only. The DDL applicator
-//! consumes the bridge through `ch_ddl::DdlApplicator` when reshaping CH tables
-//! to track source DDL.
+//! `EmitterConfig.tables` (TOML) is operator-pinned override; bridge is
+//! fallback for relations matched by namespace pattern only. DDL applicator
+//! consumes bridge via `ch_ddl::DdlApplicator`. Default reconstructed from
+//! PG `attmissingval[1]`.
 //!
 //! ## Type matrix
 //!
@@ -32,20 +27,17 @@
 //! | `json` / `jsonb` | `String` | CH `JSON` opt-in via namespace config |
 //! | array / unknown | `String` | falls through to PGPending bytes |
 //!
-//! Nullability: `not_null = false` wraps the inner type in `Nullable(_)`
-//! unless the column is part of CH's `ORDER BY` (primary-key columns
-//! must stay non-nullable; caller enforces).
+//! Nullability: `not_null = false` wraps inner in `Nullable(_)` unless
+//! column is in CH `ORDER BY` (PK columns must stay non-nullable; caller
+//! enforces).
 //!
 //! ## Default expression
 //!
-//! `attmissingval` arrives as PG's `typoutput` text form (see
-//! `parse_array_one_element` in `shadow_catalog.rs`). `default_expr`
-//! routes it through `heap_decoder::missing_value_for(att) →
-//! ColumnValue`, then renders via [`column_value_to_sql_literal`].
-//!
-//! Booleans → `true` / `false`; ints → numeric literal; strings →
-//! single-quoted with `'` escaping; timestamps → `toDateTime64('…', 6,
-//! 'UTC')`. Falls through to `String`-typed default for tier-3 / unknown.
+//! `attmissingval` arrives as PG `typoutput` text form (see
+//! `parse_array_one_element` in `shadow_catalog.rs`); routed through
+//! `heap_decoder::missing_value_for(att) → ColumnValue`, rendered via
+//! [`column_value_to_sql_literal`]. Tier-3 / unknown fall through to
+//! `String`-typed default.
 
 use crate::heap_decoder::{
     self, BOOLOID, BPCHAROID, BYTEAOID, CHAROID, ColumnValue, DATEOID, FLOAT4OID, FLOAT8OID,
@@ -54,44 +46,31 @@ use crate::heap_decoder::{
 };
 use crate::shadow_catalog::RelAttr;
 
-/// PG `cidr` OID — wal_rs constants list it but the heap_decoder
-/// module already exports `INETOID`. cidr shares decode with inet.
+/// PG `cidr` OID; shares decode with inet
 pub const CIDR_OID: u32 = heap_decoder::CIDROID;
 
-/// PG `VARHDRSZ` — 4-byte varlena header used by `typmod` packing.
+/// PG `VARHDRSZ`, 4-byte varlena header, used by `typmod` packing
 const VARHDRSZ: i32 = 4;
-/// CH `Decimal` max precision, the `Decimal256` ceiling.
+/// CH `Decimal256` precision ceiling
 const CH_DECIMAL_MAX_PRECISION: i32 = 76;
-/// CH `DateTime64` maximum fractional precision.
+/// CH `DateTime64` max fractional precision
 const CH_DATETIME64_MAX_PRECISION: i32 = 6;
 
-/// Outcome of resolving a [`RelAttr`] to its CH-side type + optional
-/// default. `default_sql` is the SQL fragment after `DEFAULT ` (no
-/// leading `DEFAULT` keyword); callers wrap as needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedColumn {
-    /// CH type expression as it would appear in a `CREATE TABLE` or
-    /// `ALTER TABLE ADD COLUMN` clause. Includes `Nullable(...)` wrap
-    /// when applicable.
     pub ch_type: String,
-    /// `Some(literal)` when PG's `attmissingval` carried a fast-path
-    /// default the bridge could render in CH SQL. `None` when no
-    /// missing-default exists or when rendering wasn't possible.
+    /// SQL fragment after `DEFAULT ` (no keyword); `None` when no
+    /// missing-default or rendering not possible
     pub default_sql: Option<String>,
 }
 
-/// Error path for `map`. Surfaces a non-fatal hint to the caller; the
-/// applicator typically logs and skips the DDL while leaving already-
-/// bridged relations intact.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BridgeError {
     #[error("unsupported PG type oid {type_oid} (name {type_name:?})")]
     UnsupportedType { type_oid: u32, type_name: String },
 }
 
-/// Map one column. `pk_member = true` forces non-nullable (CH refuses
-/// `Nullable` columns in `ORDER BY`); pass `false` for non-key
-/// columns where `Nullable(_)` is acceptable.
+/// `pk_member = true` forces non-nullable: CH refuses `Nullable` in `ORDER BY`
 pub fn map(att: &RelAttr, pk_member: bool) -> Result<ResolvedColumn, BridgeError> {
     let inner = base_type_for(att)?;
     let ch_type = if pk_member || att.not_null {
@@ -106,9 +85,7 @@ pub fn map(att: &RelAttr, pk_member: bool) -> Result<ResolvedColumn, BridgeError
     })
 }
 
-/// Base (non-nullable) CH type for one PG attribute. Returns the inner
-/// type without `Nullable(_)` wrapping; [`map`] adds the wrap when
-/// appropriate.
+/// Inner CH type without `Nullable(_)`; [`map`] adds wrap
 pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
     Ok(match att.type_oid {
         BOOLOID => "Bool".into(),
@@ -122,13 +99,11 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         NUMERICOID => numeric_ch_type(att.typmod),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID | BYTEAOID => "String".into(),
         DATEOID => "Date32".into(),
-        // `time` → microseconds since midnight, which is exactly CH
-        // `Time64(6)`'s tick. CH 25.x gates `Time64` behind
-        // `enable_time_time64_type=1`; the dest server must enable it
-        // (default profile) or auto-create/insert on time columns fail.
-        // `timetz` carries a UTC offset CH's time types can't store, so
-        // it stays text (lossless); `interval` has no CH analog and
-        // renders to text too.
+        // `time` microseconds-since-midnight == CH `Time64(6)` tick. CH 25.x
+        // gates Time64 behind `enable_time_time64_type=1`; dest server must
+        // enable or time-column create/insert fails. `timetz` carries a UTC
+        // offset CH time types can't store, so stays text; `interval` has no
+        // CH analog
         TIMEOID => "Time64(6)".into(),
         TIMETZOID | INTERVALOID => "String".into(),
         TIMESTAMPOID | TIMESTAMPTZOID => datetime64_ch_type(att.typmod),
@@ -139,11 +114,9 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
     })
 }
 
-/// Render the SQL fragment for the post-`DEFAULT ` keyword when the
-/// attribute carries a `missing_text` (PG fast-path
-/// `ALTER TABLE ... ADD COLUMN ... DEFAULT k`). Returns `None` when no
-/// fast-path default exists or when the value can't be expressed as a
-/// CH literal cleanly.
+/// Render post-`DEFAULT ` fragment from `missing_text` (PG fast-path
+/// `ALTER TABLE ... ADD COLUMN ... DEFAULT k`). `None` when no fast-path
+/// default or value not cleanly expressible as CH literal
 fn render_default(att: &RelAttr, ch_inner: &str) -> Option<String> {
     let _ = att.missing_text.as_ref()?;
     let value = heap_decoder::missing_value_for(att);
@@ -153,11 +126,9 @@ fn render_default(att: &RelAttr, ch_inner: &str) -> Option<String> {
     column_value_to_sql_literal(&value, ch_inner)
 }
 
-/// Decode `pg_attribute.atttypmod` for `numeric(p, s)` and produce the
-/// matching CH type. Falls back to `String` when precision exceeds CH's
-/// Decimal cap (76), when scale is out of `0 ≤ s ≤ p`, or when typmod is
-/// unset (`-1` ≡ unconstrained numeric, which may also hold NaN/±Inf
-/// that `Decimal` cannot represent).
+/// Decode `pg_attribute.atttypmod` for `numeric(p, s)`. Falls back to
+/// `String` when precision > 76, scale outside `0 ≤ s ≤ p`, or typmod unset
+/// (`-1` unconstrained numeric may hold NaN/±Inf that `Decimal` can't hold)
 fn numeric_ch_type(typmod: i32) -> String {
     if typmod < VARHDRSZ {
         return "String".into();
@@ -165,11 +136,9 @@ fn numeric_ch_type(typmod: i32) -> String {
     let packed = typmod - VARHDRSZ;
     let precision = (packed >> 16) & 0xFFFF;
     let scale_raw = packed & 0xFFFF;
-    // PG packs scale as a signed 16-bit value (PG 15+ allows negative
-    // scale). CH `Decimal(p,s)` requires `0 ≤ s ≤ p`; fall back to
-    // String when the packed scale is outside that range.
+    // PG packs scale as signed 16-bit (PG 15+ allows negative). CH
+    // `Decimal(p,s)` requires `0 ≤ s ≤ p`
     let scale = if scale_raw & 0x8000 != 0 {
-        // Sign-extend.
         scale_raw | !0xFFFF
     } else {
         scale_raw
@@ -180,10 +149,9 @@ fn numeric_ch_type(typmod: i32) -> String {
     format!("Decimal({precision}, {scale})")
 }
 
-/// `timestamp(p)` / `timestamptz(p)` → `DateTime64(p, 'UTC')`. PG's
-/// typmod packs the fractional precision (0..=6); the bridge always
-/// pins the timezone to UTC because PG's `timestamptz` storage is
-/// epoch microseconds, not zoned.
+/// `timestamp(p)` / `timestamptz(p)` → `DateTime64(p, 'UTC')`. typmod packs
+/// fractional precision 0..=6. Pinned UTC: PG `timestamptz` storage is epoch
+/// microseconds, not zoned
 fn datetime64_ch_type(typmod: i32) -> String {
     let precision = if (0..=CH_DATETIME64_MAX_PRECISION).contains(&typmod) {
         typmod
@@ -193,12 +161,10 @@ fn datetime64_ch_type(typmod: i32) -> String {
     format!("DateTime64({precision}, 'UTC')")
 }
 
-/// Render a single PG-decoded value as a CH SQL literal suitable for
-/// pasting after `DEFAULT `. Falls back to `None` for shapes the bridge
-/// can't express cleanly (e.g. unsupported types whose `Unsupported.raw`
-/// would need typmod-aware reconstruction). `ch_inner` is the
-/// non-nullable CH type from [`base_type_for`]; used to drive
-/// timestamp formatting + cast shape.
+/// Render PG-decoded value as CH SQL literal for after `DEFAULT `. `None`
+/// for shapes not cleanly expressible (e.g. `Unsupported.raw` needing
+/// typmod-aware reconstruction). `ch_inner` (non-nullable, from
+/// [`base_type_for`]) drives timestamp formatting + cast shape
 pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<String> {
     match v {
         ColumnValue::Null => Some("NULL".into()),
@@ -250,10 +216,8 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         ColumnValue::Inet(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Uuid(b) => Some(format!("toUUID({})", sql_string_literal(&format_uuid(b)))),
         ColumnValue::PgPending { raw, .. } => {
-            // typoutput text form is operator-meaningful; render as a
-            // String default. Caller chose a non-String CH inner means
-            // the literal lands as a CH cast, which is what PG would do
-            // for `DEFAULT typeinput('…')` semantically.
+            // Render raw typoutput bytes as String default; non-String CH inner
+            // lands as a cast, matching PG `DEFAULT typeinput('…')` semantics
             Some(sql_bytes_literal(raw))
         }
         ColumnValue::ExternalToast(_) | ColumnValue::Unsupported { .. } => None,
@@ -266,7 +230,7 @@ fn format_float(f: f64) -> String {
     } else if f.is_infinite() {
         if f > 0.0 { "inf".into() } else { "-inf".into() }
     } else {
-        // Always include a decimal so CH parses as Float, not Int.
+        // Force a decimal so CH parses Float not Int
         let s = format!("{f}");
         if s.contains('.') || s.contains('e') || s.contains('E') {
             s
@@ -276,8 +240,7 @@ fn format_float(f: f64) -> String {
     }
 }
 
-/// Render PG `time` (microseconds since midnight) as the typoutput
-/// shape: `HH:MM:SS[.ffffff]`.
+/// PG `time` (microseconds since midnight) → typoutput `HH:MM:SS[.ffffff]`
 fn render_pg_time(micros: i64) -> String {
     let m = micros.rem_euclid(86_400_000_000);
     let total_secs = m / 1_000_000;
@@ -297,8 +260,7 @@ fn render_pg_timetz(micros: i64, tz_seconds: i32) -> String {
     if tz_seconds == 0 {
         format!("{time}+00")
     } else {
-        // PG sign convention: positive tz_seconds means west of UTC, so
-        // the displayed offset is the negation.
+        // PG tz_seconds is west-positive; displayed offset is negation
         let total = -tz_seconds;
         let sign = if total >= 0 { '+' } else { '-' };
         let total = total.abs();
@@ -312,15 +274,15 @@ fn render_pg_timetz(micros: i64, tz_seconds: i32) -> String {
     }
 }
 
-/// Render PG `timestamp` / `timestamptz` (PG-epoch microseconds) as a
-/// CH-parseable ISO string with up to 6 fractional digits.
+/// PG `timestamp` / `timestamptz` (PG-epoch microseconds) → CH-parseable ISO
+/// string, up to 6 fractional digits
 fn render_pg_timestamp(pg_micros: i64) -> String {
     use chrono::{DateTime, TimeZone, Utc};
     let unix_micros = pg_micros.saturating_add(crate::ch_emitter::DATETIME64_PG_EPOCH_US);
     let secs = unix_micros.div_euclid(1_000_000);
     let nanos = (unix_micros.rem_euclid(1_000_000) * 1_000) as u32;
     let dt: DateTime<Utc> = Utc.timestamp_opt(secs, nanos).single().unwrap_or_else(|| {
-        // Fallback: huge value clamped to chrono's representable range.
+        // Value out of chrono's range; clamp to epoch
         DateTime::<Utc>::from_timestamp(0, 0).unwrap()
     });
     if dt.timestamp_subsec_micros() == 0 {
@@ -330,15 +292,12 @@ fn render_pg_timestamp(pg_micros: i64) -> String {
     }
 }
 
-/// Pull the precision out of `DateTime64(P, 'UTC')`. Returns `None` if
-/// `inner` doesn't match.
 fn parse_datetime64_precision(inner: &str) -> Option<i32> {
     let body = inner.strip_prefix("DateTime64(")?;
     let comma = body.find(',')?;
     body[..comma].trim().parse::<i32>().ok()
 }
 
-/// Render a 16-byte UUID in canonical hyphenated form.
 fn format_uuid(b: &[u8; 16]) -> String {
     let mut s = String::with_capacity(36);
     for (i, byte) in b.iter().enumerate() {
@@ -350,9 +309,8 @@ fn format_uuid(b: &[u8; 16]) -> String {
     s
 }
 
-/// CH SQL string-literal escaping. Backslash + single-quote double,
-/// other control chars stay literal — CH's parser accepts UTF-8 bytes
-/// inside `'…'` directly.
+/// CH SQL string-literal escaping. Double backslash + single-quote; other
+/// control chars stay literal, CH parser accepts raw UTF-8 inside `'…'`
 fn sql_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -367,9 +325,8 @@ fn sql_string_literal(s: &str) -> String {
     out
 }
 
-/// Render raw bytes as a CH binary literal. Hex form via
-/// `unhex('…')` keeps binary defaults round-trip safe for non-UTF-8
-/// payloads; CH `String` columns accept the resulting bytes verbatim.
+/// Raw bytes as CH binary literal via `unhex('…')`; round-trip safe for
+/// non-UTF-8 payloads into CH `String` columns
 fn sql_bytes_literal(b: &[u8]) -> String {
     let mut hex = String::with_capacity(b.len() * 2);
     for byte in b {
@@ -408,7 +365,7 @@ mod tests {
             (3_661_000_000, "01:01:01"),
             (3_661_000_001, "01:01:01.000001"),
             (86_399_999_999, "23:59:59.999999"),
-            // Negative micros wrap into the day via rem_euclid.
+            // Negative micros wrap via rem_euclid
             (-1, "23:59:59.999999"),
         ];
         for (micros, expected) in cases {
@@ -418,7 +375,6 @@ mod tests {
 
     #[test]
     fn render_pg_timetz_applies_pg_sign_convention() {
-        // tz_seconds is west-positive; the displayed offset is its negation.
         let cases = [
             (0i64, 0i32, "00:00:00+00"),
             (0, -3_600, "00:00:00+01"),    // UTC+1
@@ -436,9 +392,9 @@ mod tests {
 
     #[test]
     fn render_pg_timestamp_normal_and_out_of_range_fallback() {
-        // pg_micros=0 is the PG epoch (2000-01-01).
+        // pg_micros=0 is PG epoch (2000-01-01)
         assert_eq!(render_pg_timestamp(0), "2000-01-01 00:00:00");
-        // i64::MAX overflows chrono's representable range → epoch fallback.
+        // i64::MAX overflows chrono range → epoch fallback
         assert_eq!(render_pg_timestamp(i64::MAX), "1970-01-01 00:00:00");
     }
 
@@ -474,7 +430,7 @@ mod tests {
 
     #[test]
     fn numeric_typmod_decodes_precision_and_scale() {
-        // numeric(10, 2) → typmod = ((10 << 16) | 2) + 4 = 655370
+        // typmod = ((precision << 16) | scale) + VARHDRSZ
         let tm = ((10i32 << 16) | 2) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
@@ -485,43 +441,41 @@ mod tests {
             base_type_for(&attr(NUMERICOID, -1, true, None)).unwrap(),
             "String"
         );
-        // numeric(38, 4) → Decimal128 boundary.
+        // p=38 Decimal128 boundary
         let tm = ((38i32 << 16) | 4) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
             "Decimal(38, 4)"
         );
-        // numeric(39, 4) → Decimal256.
         let tm = ((39i32 << 16) | 4) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
             "Decimal(39, 4)"
         );
-        // numeric(76, 10) → Decimal256 boundary.
+        // p=76 Decimal256 ceiling
         let tm = ((76i32 << 16) | 10) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
             "Decimal(76, 10)"
         );
-        // numeric(77, 10) → String: beyond CH Decimal256 precision.
+        // p=77 beyond Decimal256 → String
         let tm = ((77i32 << 16) | 10) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
             "String"
         );
-        // numeric(10, -1) → String: CH Decimal scale must be nonnegative.
+        // negative scale → String
         let tm = ((10i32 << 16) | 0xFFFF) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
             "String"
         );
-        // numeric(50, 2) → Decimal256.
         let tm = ((50i32 << 16) | 2) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
             "Decimal(50, 2)"
         );
-        // numeric(50, 60) → String: CH Decimal scale can't exceed precision.
+        // scale > precision → String
         let tm = ((50i32 << 16) | 60) + VARHDRSZ;
         assert_eq!(
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
@@ -595,12 +549,9 @@ mod tests {
 
     #[test]
     fn default_for_timestamp_renders_pgpending_bytes() {
-        // missing_value_for routes TIMESTAMPTZ through PgPending (no Tier
-        // 1/2 arm for it). The literal writer renders the raw typoutput
-        // bytes through `unhex(...)` rather than `toDateTime64(...)`,
-        // because reconstructing a typed CH literal from the bytes alone
-        // would require oracle help. The DDL-replication drill exercises the
-        // typed path end-to-end through the oracle's round-trip.
+        // missing_value_for routes TIMESTAMPTZ through PgPending; literal
+        // writer emits raw typoutput bytes via `unhex(...)` not
+        // `toDateTime64(...)`, typed path needs oracle round-trip
         let r = map(
             &attr(TIMESTAMPTZOID, 6, true, Some("2024-01-02 03:04:05+00")),
             false,
@@ -630,7 +581,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lit, "3.14");
-        // Same value into a String column gets quoted.
         let lit = column_value_to_sql_literal(
             &ColumnValue::Numeric(NumericKind::Finite("3.14".into())),
             "String",
@@ -666,9 +616,6 @@ mod tests {
 
     #[test]
     fn column_value_timestamp_routes_through_to_datetime64() {
-        // PG epoch microseconds: 2024-01-02 03:04:05 UTC =
-        // (24y * 365.25d + …) — exact value not asserted, just the
-        // surrounding cast shape.
         let lit = column_value_to_sql_literal(&ColumnValue::TimestampTz(0), "DateTime64(6, 'UTC')")
             .unwrap();
         assert!(

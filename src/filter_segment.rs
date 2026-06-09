@@ -1,5 +1,5 @@
-//! Drive a full segment: walk records, decide each record's `Route`,
-//! NOOP-rewrite ToDecoder records in place, emit manifest sidecar.
+//! Drive a full segment: walk records, decide `Route`, NOOP-rewrite
+//! ToDecoder records in place, emit manifest sidecar.
 
 use thiserror::Error;
 use wal_rs::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
@@ -27,25 +27,22 @@ pub enum FilterSegmentError {
     },
 }
 
-/// In-memory hand-off paired with each [`Manifest`] entry: the parsed
-/// record plus the page magic of the page its header sat on. The
-/// magic is needed downstream to interpret PG-15-vs-PG-14 FPI bits via
-/// `XLogRecordBlockImageHeader::is_compressed`. Stored as `'static`
-/// (materialised via [`XLogRecord::into_owned`]) so `filter_segment`'s
-/// batch return outlives the source bytes the parser borrowed from.
+/// Parsed record + page magic of the page its header sat on. Magic is
+/// needed downstream to interpret PG-15-vs-PG-14 FPI bits via
+/// `XLogRecordBlockImageHeader::is_compressed`. `'static` (via
+/// [`XLogRecord::into_owned`]) so the batch return outlives source bytes
+/// the parser borrowed.
 #[derive(Debug, Clone)]
 pub struct ParsedRecord {
     pub record: XLogRecord<'static>,
     pub page_magic: u16,
 }
 
-/// Filter one segment's bytes and emit rewritten bytes, the manifest
-/// sidecar, and the parsed records in source order. `filter` is
-/// borrowed mutably so callers spanning multiple segments retain
-/// `CatalogTracker` state across calls; the emitted [`ManifestStats`]
-/// reflect only records processed *this* call. The returned
-/// `Vec<ParsedRecord>` is the parses-once hand-off for the streaming
-/// `RecordSink`; entries match `manifest.records` by index.
+/// Emit rewritten bytes, manifest sidecar, parsed records in source order.
+/// `filter` borrowed mutably so callers spanning multiple segments retain
+/// `CatalogTracker` state across calls; emitted [`ManifestStats`] reflect
+/// only records processed *this* call. Returned `Vec<ParsedRecord>` is the
+/// parses-once hand-off; entries match `manifest.records` by index.
 pub fn filter_segment(
     source_bytes: &[u8],
     source_name: &str,
@@ -60,12 +57,10 @@ pub fn filter_segment(
     let mut entries = Vec::new();
     let mut parsed_records = Vec::new();
 
-    // First pass: collect records (we can't borrow `out` mutably while
-    // walking it immutably). Materialise logical bytes + ranges.
+    // Collect first: can't borrow `out` mutably while walking it immutably.
     let walked: Vec<_> = SegmentWalker::new(source_bytes).collect::<Result<Vec<_>, _>>()?;
 
     for record in walked {
-        // Parse via wal-rs so the Filter sees a populated XLogRecord.
         let parsed =
             parse_record_from_bytes(&record.logical_bytes, record.page_magic).map_err(|e| {
                 FilterSegmentError::Parse {
@@ -81,9 +76,7 @@ pub fn filter_segment(
 
         if route == Route::ToDecoder {
             if let [(off, len)] = record.byte_ranges.as_slice() {
-                // Single-page: record is contiguous in `out` (a copy of
-                // source) with its original xl_tot_len + xl_prev intact;
-                // NOOP in place, no clone + scatter-back.
+                // Single-page: contiguous in `out`, NOOP in place.
                 noop_replace(&mut out[*off..*off + *len]).map_err(|e| {
                     FilterSegmentError::Rewrite {
                         offset: record.start_offset,
@@ -91,8 +84,8 @@ pub fn filter_segment(
                     }
                 })?;
             } else {
-                // Cross-page: bytes are page-fragmented in `out`, so
-                // NOOP the contiguous logical copy then scatter back.
+                // Cross-page: page-fragmented in `out`; NOOP contiguous
+                // logical copy then scatter back.
                 let mut buf = record.logical_bytes.clone();
                 noop_replace(&mut buf).map_err(|e| FilterSegmentError::Rewrite {
                     offset: record.start_offset,
@@ -149,8 +142,7 @@ mod tests {
     }
 
     fn build_record_info(rmid: u8, info: u8, body_payload: &[u8]) -> Vec<u8> {
-        // body = block_id 0 (HAS_DATA, 4 bytes data), rel(12)+block(4), short marker, main_data
-        // For simplicity, build a minimal record with only main_data SHORT
+        // Minimal record: only a SHORT-marked main_data, no block refs.
         let main_len = body_payload.len();
         let body_len = 2 + main_len; // SHORT marker + len + payload
         let total = X_LOG_RECORD_HEADER_SIZE + body_len;
@@ -166,7 +158,6 @@ mod tests {
         v.push(XLR_BLOCK_ID_DATA_SHORT);
         v.push(main_len as u8);
         v.extend_from_slice(body_payload);
-        // Compute CRC and patch
         let crc = crate::rewrite::compute_crc(&v);
         v[20..24].copy_from_slice(&crc.to_le_bytes());
         v
@@ -196,11 +187,8 @@ mod tests {
     #[test]
     fn drops_user_keeps_special_round_trips() {
         use wal_rs::pg::walparser::RmId;
-        // One special (xact) record and one user-heap-style record. Heap
-        // record has no block refs in this minimal build → classifies as
-        // Empty → kept by safe default. To exercise drop, build a record
-        // with a fake "user" block ref instead. Simpler: only verify that
-        // the xact record is kept and re-parses cleanly after filter.
+        // Heap record has no block refs in this minimal build → Empty →
+        // kept by safe default; verify xact record kept + re-parses clean.
         let r1 = build_record(RmId::Xact as u8, &[0xAA, 0xBB]);
         let r2 = build_record(RmId::Heap as u8, &[0xCC; 8]);
         let page = build_page_with_records(&[&r1, &r2]);
@@ -210,12 +198,10 @@ mod tests {
         assert_eq!(out.len(), page.len());
         assert_eq!(mani.records.len(), 2);
         assert_eq!(parsed.len(), 2);
-        // Parsed records mirror manifest entries by index.
         assert_eq!(
             parsed[0].record.header.resource_manager_id,
             mani.records[0].rmid,
         );
-        // Both records re-parse cleanly through WalParser
         let mut parser = WalParser::new();
         let (_, records) = parser.parse_records_from_page(&out).unwrap();
         assert_eq!(records.len(), 2);
@@ -230,20 +216,16 @@ mod tests {
         let (_, mani, _) = filter_segment(&page, "seg-test", &mut filter).unwrap();
         assert_eq!(mani.source_segment, "seg-test");
         assert_eq!(mani.records.len(), 1);
-        assert_eq!(mani.records[0].offset, 40); // long header + pad
+        assert_eq!(mani.records[0].offset, 40); // 40-byte long page header
         assert_eq!(mani.records[0].rmid, RmId::Xact as u8);
         assert_eq!(mani.records[0].kind, Kind::Kept);
     }
 
-    /// `XLOG_SWITCH` (rmgr RM_XLOG, info 0x40) must pass
-    /// through the filter unchanged and re-parse cleanly. PG emits one
-    /// at every `pg_switch_wal()` and at archive_timeout expirations;
-    /// shadow's recovery state machine needs the byte sequence intact.
-    ///
-    /// PG-wire convention is that XLOG_SWITCH marks the rest of the
-    /// segment as padding zeros (parser stops scanning after the
-    /// record). Test builds a page with one preceding xact record and
-    /// the switch; the filter must keep both byte-identically.
+    /// `XLOG_SWITCH` (rmgr RM_XLOG, info 0x40) must pass through unchanged.
+    /// PG emits one at every `pg_switch_wal()` and archive_timeout expiry;
+    /// shadow's recovery state machine needs the bytes intact. PG marks the
+    /// rest of the segment as padding zeros after it, so the parser stops
+    /// scanning past the record.
     #[test]
     fn xlog_switch_record_passes_through_filter() {
         use wal_rs::pg::walparser::RmId;
@@ -267,7 +249,6 @@ mod tests {
             Kind::Kept,
             "XLOG_SWITCH must be kept (special rmgr policy)",
         );
-        // XLOG_SWITCH bytes are byte-identical between input + output.
         let off = switch_entry.offset as usize;
         let len = switch_entry.len as usize;
         assert_eq!(
@@ -276,10 +257,6 @@ mod tests {
             "XLOG_SWITCH bytes must be passed through unchanged",
         );
 
-        // Filtered output re-parses through wal-rs's WalParser. The
-        // parser surfaces an `is_wal_switch()` record at the right
-        // place; subsequent bytes on the page are padding so the
-        // parser stops after the switch — matches PG WAL semantics.
         let mut parser = WalParser::new();
         let (_, parsed) = parser.parse_records_from_page(&out).expect("parse");
         assert!(

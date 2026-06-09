@@ -1,38 +1,33 @@
 //! Per-record classification of WAL into catalog / user / special buckets.
 //!
 //! Catalog detection uses `rel_node < FirstNormalObjectId` (16384, see
-//! `~/s/postgresql/src/include/access/transam.h`). This catches non-mapped
-//! catalogs unconditionally + mapped catalogs (pg_class, pg_attribute,
-//! pg_type, pg_proc, ...) only at their initial relfilenode. A subsequent
-//! VACUUM FULL on a mapped catalog rewrites it to a relfilenode >= 16384;
-//! tracking RM_RELMAP_ID + heap writes to pg_class keeps the
-//! mapped-catalog set current. Until then the heuristic stays good enough
-//! for the initial goal: confirm catalog fraction is small.
+//! `~/s/postgresql/src/include/access/transam.h`). Catches non-mapped
+//! catalogs unconditionally + mapped catalogs (pg_class, pg_attribute, …)
+//! only at their initial relfilenode; VACUUM FULL rewrites a mapped
+//! catalog above 16384, so RM_RELMAP_ID + pg_class heap tracking keeps the
+//! mapped set current.
 //!
-//! Special rmgrs (XLOG / XACT / CLOG / MULTIXACT / STANDBY / RELMAP /
-//! COMMIT_TS / REPL_ORIGIN / DBASE / TBLSPC / SMGR) are always kept —
-//! they are recovery plumbing shadow Postgres needs regardless of which
-//! relations get replayed.
+//! Special rmgrs are recovery plumbing shadow Postgres needs regardless of
+//! which relations replay.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use wal_rs::pg::walparser::{RmId, XLogRecord};
 
-/// pg src/include/access/transam.h FirstNormalObjectId.
+/// `FirstNormalObjectId`, pg src/include/access/transam.h
 pub const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Class {
-    /// Touches a catalog relfilenode. Replay on shadow.
+    /// Touches a catalog relfilenode; replay on shadow
     Catalog,
-    /// Touches only user relfilenodes. Drop for shadow replay.
+    /// User relfilenodes only; drop for shadow replay
     User,
-    /// Recovery plumbing rmgr (xlog control, xact status, etc.). Keep.
+    /// Recovery plumbing rmgr; keep
     Special,
-    /// No block refs, non-special rmgr (e.g. some btree meta records).
-    /// A later pass inspects main_data to bucket these; for now they
-    /// neither keep nor drop, just count.
+    /// No block refs, non-special rmgr (e.g. some btree meta). A later
+    /// pass inspects main_data; for now neither keep nor drop, just count.
     Empty,
 }
 
@@ -77,8 +72,7 @@ pub fn classify(record: &XLogRecord) -> Class {
     if saw_user { Class::User } else { Class::Empty }
 }
 
-/// Human-readable rmgr label for reports. Falls back to numeric id for
-/// out-of-range values (forward compat with future PG majors).
+/// Numeric id fallback for unknown rmgrs (forward compat, future PG majors).
 pub fn rmgr_label(rm: u8) -> String {
     let named = match rm {
         x if x == RmId::Xlog as u8 => "xlog",
@@ -161,7 +155,7 @@ impl Summary {
         }
     }
 
-    /// Catalog fraction by record count. Zero on empty summary.
+    /// Catalog fraction by record count; zero on empty summary
     pub fn catalog_fraction(&self) -> f64 {
         if self.records == 0 {
             return 0.0;
@@ -212,7 +206,7 @@ mod tests {
         assert!(is_catalog_relnode(1259)); // pg_class oid
         assert!(is_catalog_relnode(16383));
         assert!(!is_catalog_relnode(16384));
-        assert!(!is_catalog_relnode(0)); // skip InvalidOid sentinel
+        assert!(!is_catalog_relnode(0)); // InvalidOid sentinel
     }
 
     #[test]

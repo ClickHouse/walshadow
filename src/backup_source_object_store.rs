@@ -1,8 +1,6 @@
-//! Object-store base-backup source.
-//!
-//! Fetches a wal-g compatible BASE_BACKUP from a `DynStorage` bucket,
-//! decompresses each tar part, and pumps file events through the
-//! caller-supplied [`BackupSink`].
+//! Object-store base-backup source. Fetches a wal-g compatible
+//! BASE_BACKUP from a `DynStorage` bucket, decompresses each tar part,
+//! pumps file events through [`BackupSink`].
 //!
 //! Layout (mirrors wal-g, owned by [`wal_rs::pg::backup`]):
 //!
@@ -18,17 +16,15 @@
 //!       pg_control.tar.zst             ← *always* drains last, single task
 //! ```
 //!
-//! Parallelism is internal: workers share `Arc<Mutex<dyn BackupSink>>`.
-//! `pg_control` is a hard barrier — every other part drains before it
+//! `pg_control` is a hard barrier: every other part drains before it
 //! opens, matching PG recovery's expectation that pg_control reflects
 //! state after every other file landed.
 //!
 //! ## V1 constraints
 //!
-//! - **Full backups only.** A delta chain (`increment_from` set in the
-//!   sentinel) errors out hard: incremented files need a disk-resident
-//!   base to overlay onto, which the streaming page-walk path doesn't
-//!   produce.
+//! - Full backups only. A delta chain (`increment_from` set in the
+//!   sentinel) errors hard: incremented files need a disk-resident base
+//!   to overlay onto, which the streaming page-walk path doesn't produce.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -46,9 +42,8 @@ use wal_rs::storage::DynStorage;
 
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo, pump_tar_to_sink};
 
-/// Object-store source. `parallelism` bounds the number of in-flight
-/// data parts fetched + decompressed + tar-parsed; `pg_control` always
-/// runs single-task after the data parts drain.
+/// `parallelism` bounds in-flight data parts; `pg_control` always runs
+/// single-task after they drain.
 pub struct ObjectStoreSource {
     pub settings: Settings,
     pub storage: DynStorage,
@@ -119,10 +114,8 @@ impl BackupSource for ObjectStoreSource {
             );
         }
 
-        // Split data parts vs pg_control. Both lists are already in the
-        // sorted order list_tar_parts returned (data first, control
-        // last); we partition rather than re-sort so any future part
-        // type slots cleanly between them
+        // Partition rather than re-sort to preserve list_tar_parts order
+        // (data first, control last) and let future part types slot between
         let (data_parts, control_parts): (Vec<_>, Vec<_>) =
             parts.into_iter().partition(|k| !k.contains("pg_control"));
         tracing::info!(
@@ -133,17 +126,12 @@ impl BackupSource for ObjectStoreSource {
             "draining tar partitions"
         );
 
-        // Shared entry-id counter across all concurrent parts. Each
-        // tar entry gets a unique `EntryId` so the sink keys per-entry
-        // state on it; concurrent parts interleave begin/chunk on the
-        // shared sink mutex (released across body reads) without
-        // clobbering each other's page-walk slot.
+        // Shared counter across concurrent parts; unique EntryId per
+        // entry keeps interleaved begin/chunk on the shared sink mutex
+        // from clobbering each other's page-walk slot.
         let next_entry = Arc::new(AtomicU64::new(0));
 
-        // Phase A — fan-out data parts. `for_each_concurrent`-style
-        // bounded fan-out via `buffer_unordered`. Each worker shares
-        // the sink Arc<Mutex<>> + the entry-id counter; per-entry sink
-        // state is keyed by EntryId, so interleaving is safe
+        // Phase A: bounded fan-out of data parts via buffer_unordered
         let data_results = futures::stream::iter(data_parts)
             .map(|key| {
                 let storage = storage.clone();
@@ -162,9 +150,8 @@ impl BackupSource for ObjectStoreSource {
             r?;
         }
 
-        // Phase B — pg_control parts, single-task barrier. Multiple
-        // control parts is unusual (wal-g emits exactly one) but we
-        // walk them in sorted order if it ever happens
+        // Phase B: pg_control barrier, single-task. wal-g emits one
+        // control part; walk in sorted order if ever more
         for key in &control_parts {
             unpack_one_part(
                 &settings,
@@ -185,9 +172,8 @@ impl BackupSource for ObjectStoreSource {
     }
 }
 
-/// Build (start, end) from sentinel fields. Timeline parses out of the
-/// backup name's first 8 hex chars (matches `format_backup_name` in
-/// `wal_rs::pg::backup::mod.rs:152`).
+/// Build (start, end) from sentinel fields. Timeline is the backup
+/// name's first 8 hex chars, per wal-rs `format_backup_name`.
 fn build_lsn_pair(resolved_name: &str, s: &BackupSentinelDtoV2) -> Result<(StartInfo, EndInfo)> {
     let start_lsn = s
         .sentinel
@@ -208,16 +194,15 @@ fn build_lsn_pair(resolved_name: &str, s: &BackupSentinelDtoV2) -> Result<(Start
     ))
 }
 
-/// Wraps `wal_rs::pg::backup::parse_timeline_from_backup_name` with the
-/// ObjectStoreSource error context. Returns Result to slot into the
-/// surrounding `?`-chain
+/// Wraps `wal_rs::pg::backup::parse_timeline_from_backup_name` with
+/// error context
 fn parse_timeline_from_name(name: &str) -> Result<u32> {
     wal_rs::pg::backup::parse_timeline_from_backup_name(name)
         .ok_or_else(|| anyhow!("ObjectStoreSource: cannot parse timeline from backup name: {name}"))
 }
 
-/// `TablespaceSpec` → `Vec<Tablespace>` so the trait's StartInfo speaks
-/// wal-rs's protocol shape regardless of which source produced it.
+/// `TablespaceSpec` → `Vec<Tablespace>` so StartInfo speaks wal-rs's
+/// protocol shape regardless of source
 fn tablespaces_from_spec(spec: Option<&TablespaceSpec>) -> Vec<Tablespace> {
     let Some(spec) = spec else {
         return Vec::new();
@@ -236,9 +221,9 @@ fn tablespaces_from_spec(spec: Option<&TablespaceSpec>) -> Vec<Tablespace> {
         .collect()
 }
 
-/// Fetch one tar part, decompress, decrypt, throttle, then pump
-/// through `pump_tar_to_sink`. The decompressed reader is `AsyncRead`,
-/// so tokio_tar drives it directly — no spawn_blocking dance.
+/// Fetch one tar part, throttle, decrypt, decompress, pump through
+/// `pump_tar_to_sink`. Decompressed reader is `AsyncRead`, tokio_tar
+/// drives it directly, no spawn_blocking.
 async fn unpack_one_part(
     settings: &Settings,
     storage: &DynStorage,
@@ -273,7 +258,7 @@ fn method_from_key(key: &str) -> compression::Method {
     compression::Method::from_extension(ext).unwrap_or(compression::Method::None)
 }
 
-/// Saturating fallback so the source builds without pulling `num_cpus`.
+/// Fallback so the source builds without pulling `num_cpus`
 fn num_cpus_or(fallback: usize) -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())

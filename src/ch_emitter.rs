@@ -1,42 +1,24 @@
-//! CH-native emitter primitives via `clickhouse-c-rs`.
-//!
-//! Defines building blocks shared by bootstrap backfill and live
-//! streaming, with no emitter object or xact lifecycle of its own:
-//! [`EmitterConfig`] (TOML parse + retry classification via
-//! [`RetryConfig`]), [`CompressionChoice`], the config-side
-//! [`TableMapping`]/[`NamespaceMapping`]/[`ColumnMapping`],
-//! [`TablePlan`]/[`ColumnPlan`] (relation schema -> native wire plan),
-//! [`TableEncoder`]/[`ColumnBuf`] (row -> native block + per-value
-//! encoding), and [`EmitterStats`]. Consumed by
-//! [`crate::pipeline`]'s `batcher` and `inserter`, and by
-//! [`crate::ch_ddl`]; batching, seal triggers, and xact close all live
-//! in the pipeline, not here.
+//! CH-native emitter primitives via `clickhouse-c-rs`. Batching, seal
+//! triggers, and xact close live in [`crate::pipeline`], not here.
 //!
 //! Synthetic columns `_lsn UInt64`, `_xid UInt32`, `_op Enum8(...)`,
-//! `_commit_ts DateTime64(6, 'UTC')` are appended by [`TablePlan`] after
-//! every mapped column and filled by [`TableEncoder`]. PG's
-//! `TimestampTz` epoch is 2000-01-01; we shift to the Unix epoch
-//! (`DATETIME64_PG_EPOCH_US`) so `DateTime64(6)` semantics line up with
-//! ClickHouse.
+//! `_commit_ts DateTime64(6, 'UTC')` append after every mapped column.
+//! PG `TimestampTz` epoch is 2000-01-01; shift to Unix epoch
+//! (`DATETIME64_PG_EPOCH_US`) to match CH `DateTime64(6)`.
 //!
 //! ## Compression
 //!
-//! Codec choice is feature-gated via walshadow's own `lz4` / `zstd`
-//! Cargo features, which forward to `clickhouse-c-rs`'s matching
-//! features (see top-level `Cargo.toml`). When a feature is off, the
-//! corresponding [`CompressionChoice`] variant fails to construct at
-//! [`CompressionChoice::build_codec`] with
-//! [`EmitterError::CompressionUnsupported`]. Default builds advertise
-//! LZ4 to match the CH server default.
+//! Feature-gated via walshadow's `lz4` / `zstd` Cargo features, which
+//! forward to clickhouse-c-rs (see top-level `Cargo.toml`). Default
+//! builds advertise LZ4 to match the CH server default.
 //!
 //! ## Cross-table ordering inside an xact
 //!
-//! `AsyncClient` is single-query-at-a-time, so an xact touching tables
-//! T1 and T2 lands as every T1 row first (one INSERT), then every T2
-//! (next INSERT); original WAL interleaving across tables is not
-//! preserved. `_lsn` carries the source LSN so `ReplacingMergeTree`-style
-//! dedup still keys on the right value, and WAL ordering within a single
-//! destination table is preserved
+//! `AsyncClient` is single-query-at-a-time, so an xact touching T1 and
+//! T2 lands all T1 rows (one INSERT) then all T2 (next INSERT); WAL
+//! interleaving across tables is not preserved. `_lsn` carries the
+//! source LSN so `ReplacingMergeTree` dedup keys on the right value;
+//! WAL ordering within a single dest table is preserved
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -52,30 +34,26 @@ use crate::decoder_sink::DecoderSinkError;
 use crate::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::shadow_catalog::{CatalogError, RelDescriptor};
 
-/// Microsecond offset between PG `TimestampTz` epoch (2000-01-01 UTC)
-/// and the Unix epoch. `DateTime64(6)` in ClickHouse is Unix
-/// microseconds; PG's commit-record `xact_time` and tuple
-/// `TimestampTz` columns are PG-epoch microseconds.
+/// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
+/// epoch. CH `DateTime64(6)` is Unix microseconds; PG commit-record
+/// `xact_time` and tuple `TimestampTz` are PG-epoch microseconds.
 pub const DATETIME64_PG_EPOCH_US: i64 = 946_684_800_000_000;
 
-/// `_op` Enum8 codes — keep in sync with the `Enum8('insert'=1, ...)`
-/// type advertised by [`TablePlan::synth_op`].
+/// `_op` Enum8 codes; keep in sync with [`TablePlan::synth_op`]
 pub const OP_INSERT: i8 = 1;
 pub const OP_UPDATE: i8 = 2;
 pub const OP_DELETE: i8 = 3;
 
-/// Default block accumulator budgets. Mirror common ClickHouse server
-/// defaults; tunable via [`EmitterConfig`].
+/// Default block accumulator budgets. Mirror common CH server defaults
 pub const DEFAULT_ROW_BUDGET: usize = 65_536;
 pub const DEFAULT_BYTE_BUDGET: usize = 1 << 20; // 1 MiB
 
-/// Default flush timeout (ms). `0` keeps this serial emitter's
+/// Default flush timeout (ms). `0` keeps serial emitter's
 /// close-INSERT-on-every-xact-end behaviour (bootstrap backfill only);
-/// the live pipeline substitutes a 100ms partial-batch deadline for
-/// `0` so cold tables can't pin the watermark. A positive value, via
-/// TOML (`flush_timeout_ms`) or `--ch-flush-timeout-ms`, holds INSERTs
-/// open across xacts and seals on a deadline armed at the first row of
-/// a fresh INSERT.
+/// live pipeline substitutes a 100ms partial-batch deadline for `0` so
+/// cold tables can't pin the watermark. Positive value holds INSERTs
+/// open across xacts, seals on a deadline armed at first row of a fresh
+/// INSERT.
 pub const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 0;
 
 #[derive(Debug, Error)]
@@ -111,9 +89,9 @@ impl From<EmitterError> for DecoderSinkError {
     }
 }
 
-/// Per-replica connection + mapping config. Parse from TOML via
-/// [`EmitterConfig::from_toml_str`]; the `[ch]` table holds connection
-/// params, `[table."<src>"]` blocks declare per-relation mapping.
+/// Per-replica connection + mapping config. TOML `[ch]` table holds
+/// connection params, `[table."<src>"]` blocks declare per-relation
+/// mapping; parse via [`EmitterConfig::from_toml_str`].
 #[derive(Debug, Clone)]
 pub struct EmitterConfig {
     pub host: String,
@@ -121,60 +99,48 @@ pub struct EmitterConfig {
     pub database: String,
     pub user: String,
     pub password: String,
-    /// Wrap the native protocol in TLS (rustls, public webpki roots).
-    /// Set for ClickHouse Cloud, whose secure native port (9440) speaks
+    /// Wrap native protocol in TLS (rustls, public webpki roots). Set
+    /// for ClickHouse Cloud, whose secure native port (9440) speaks
     /// native-over-TLS. SNI + cert verification key off `host`.
     pub secure: bool,
-    /// Custom rustls roots/config for the `secure` path: private CA,
-    /// pinned self-signed cert, or mTLS. `None` (default) uses public
-    /// webpki roots via [`clickhouse_c::tls::default_config`]. Build from
-    /// a `RootCertStore` via [`clickhouse_c::tls::config_with_roots`].
-    /// Not parsed from TOML; carried through reconnect + the DDL
-    /// applicator so every CH socket pins the same roots.
+    /// Custom rustls roots/config for `secure` path: private CA, pinned
+    /// self-signed cert, or mTLS. `None` uses public webpki roots via
+    /// [`clickhouse_c::tls::default_config`]. Not parsed from TOML;
+    /// carried through reconnect + DDL applicator so every CH socket
+    /// pins the same roots.
     pub tls_config: Option<Arc<clickhouse_c::tls::rustls::ClientConfig>>,
     pub compression: CompressionChoice,
     pub row_budget: usize,
     pub byte_budget: usize,
-    /// Hold INSERTs open across xacts. Timer starts when the first row
-    /// of a fresh INSERT lands and trips at `now + flush_timeout`; on
-    /// trip the emitter closes every still-open INSERT (one
-    /// `send_data_end()` + drain to `EndOfStream` per table) and
-    /// advances its durable-LSN horizon. `Duration::ZERO` (default)
-    /// keeps the pre-fix behaviour: every xact closes its own
-    /// INSERTs, ack tracks `drain_lsn` exactly.
-    ///
-    /// Latency cap: a row buffered the moment the deadline starts is
-    /// at most `flush_timeout` away from durable on CH. Throughput
-    /// win: small commits (the pgbench TPC-B shape) coalesce into one
-    /// MergeTree part per flush window instead of one per xact.
+    /// Hold INSERTs open across xacts. Timer starts at first row of a
+    /// fresh INSERT, trips at `now + flush_timeout`; on trip emitter
+    /// closes every still-open INSERT and advances its durable-LSN
+    /// horizon. `Duration::ZERO` (default): every xact closes its own
+    /// INSERTs, ack tracks `drain_lsn` exactly. Latency cap: a buffered
+    /// row is at most `flush_timeout` from durable. Throughput: small
+    /// commits coalesce into one MergeTree part per flush window.
     pub flush_timeout: Duration,
-    /// Keyed on `"<namespace>.<relname>"` source identifier.
+    /// Keyed on `"<namespace>.<relname>"`
     pub tables: HashMap<String, TableMapping>,
-    /// Per-source-namespace defaults. Auto-DDL flow.
-    /// Keyed on PG schema name (`"public"`, etc.); per-table entries
-    /// in `tables` still win for the relation they name.
+    /// Per-namespace defaults keyed on PG schema name; per-table
+    /// entries in `tables` win for the relation they name
     pub namespaces: HashMap<String, NamespaceMapping>,
-    /// Global `--drop-table-strategy` default. Per-namespace
-    /// override via `[namespace.<ns>] drop_table_strategy = ...`.
+    /// Global `--drop-table-strategy` default; per-namespace override
+    /// via `[namespace.<ns>] drop_table_strategy = ...`
     pub drop_table_strategy: String,
-    /// Bounded retry against a single CH replica. See
-    /// [`RetryConfig`] for semantics.
     pub retry: RetryConfig,
-    /// Wall-clock cap on a single INSERT attempt (send + drain to
-    /// `EndOfStream`). A connection that wedges mid-INSERT surfaces as a
-    /// retryable [`EmitterError::Timeout`] so the inserter reconnects and
-    /// resends rather than pinning the durable watermark forever. Sized far
-    /// above a healthy round-trip (single-digit ms local, RTT-bound cloud).
+    /// Wall-clock cap on a single INSERT attempt. A connection that
+    /// wedges mid-INSERT surfaces as retryable [`EmitterError::Timeout`]
+    /// so the inserter reconnects + resends rather than pinning the
+    /// durable watermark forever. Sized far above a healthy round-trip.
     pub insert_timeout: Duration,
 }
 
-/// Default per-INSERT wall-clock cap; see [`EmitterConfig::insert_timeout`].
 pub const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
 
-/// Bounded-retry knobs for the CH emitter. A retryable error (IO,
-/// clickhouse-c protocol, ServerException) triggers reconnect + retry
-/// of the failing operation up to `max_attempts` times with
-/// exponential backoff capped at `max_backoff`.
+/// Bounded-retry knobs. Retryable error (IO, clickhouse-c protocol,
+/// ServerException) triggers reconnect + retry up to `max_attempts`
+/// with exponential backoff capped at `max_backoff`.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max_attempts: u32,
@@ -215,10 +181,10 @@ impl Default for EmitterConfig {
     }
 }
 
-/// Wire-protocol compression choice. Variants are gated on Cargo
-/// features in the top crate; the `resolve` step refuses unsupported
-/// variants with [`EmitterError::CompressionUnsupported`] before the
-/// codec object is built.
+/// Wire-protocol compression choice. Variants gated on Cargo features
+/// in the top crate; unsupported variants fail at
+/// [`CompressionChoice::build_codec`] with
+/// [`EmitterError::CompressionUnsupported`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionChoice {
     None,
@@ -249,9 +215,8 @@ impl CompressionChoice {
         }
     }
 
-    /// Build the [`Codec`] handle. Feature-gates flow up from
-    /// clickhouse-c-rs so the C TU only links a codec lib when its
-    /// matching feature is on in the top crate.
+    /// Feature-gates flow up from clickhouse-c-rs so the C TU only links
+    /// a codec lib when its matching feature is on in the top crate.
     pub fn build_codec(self) -> Result<Option<Pin<Box<Codec>>>, EmitterError> {
         match self {
             Self::None => Ok(None),
@@ -279,17 +244,16 @@ impl CompressionChoice {
     }
 }
 
-/// Per-source-relation destination metadata. Carries the destination
-/// table name & one entry per non-synthetic column. The mapping
-/// declares which source attnums to ship and what CH type to advertise.
+/// Per-source-relation destination metadata: which source attnums to
+/// ship and what CH type to advertise, one entry per non-synthetic
+/// column.
 #[derive(Debug, Clone)]
 pub struct TableMapping {
     pub target: String,
     pub columns: Vec<ColumnMapping>,
 }
 
-/// Per-namespace defaults. Operator-pinned blocks shaped
-/// like:
+/// Per-namespace defaults. Operator-pinned blocks shaped like:
 ///
 /// ```toml
 /// [namespace."public"]
@@ -299,9 +263,8 @@ pub struct TableMapping {
 /// ```
 ///
 /// `auto_create = true` lets [`crate::ch_ddl::DdlApplicator`] run
-/// `CREATE TABLE IF NOT EXISTS` for relations in this namespace the
-/// first time their descriptor is observed. `target_database`
-/// overrides the global `[ch] database` for tables in this namespace.
+/// `CREATE TABLE IF NOT EXISTS` on first descriptor sighting.
+/// `target_database` overrides global `[ch] database` for this namespace.
 #[derive(Debug, Clone, Default)]
 pub struct NamespaceMapping {
     pub target_database: Option<String>,
@@ -311,12 +274,12 @@ pub struct NamespaceMapping {
 
 #[derive(Debug, Clone)]
 pub struct ColumnMapping {
-    /// Source `pg_attribute.attnum` (1-based, matches PG convention).
+    /// Source `pg_attribute.attnum` (1-based)
     pub src_attnum: i16,
     pub target_name: String,
-    /// ClickHouse type expression — parsed via [`TypeAst::parse`]. The
-    /// emitter does not validate that the type matches the source
-    /// column's PG type; CH will reject on `INSERT` if they mismatch.
+    /// CH type expression, parsed via [`TypeAst::parse`]. Emitter does
+    /// not validate against the source PG type; CH rejects on `INSERT`
+    /// if they mismatch.
     pub target_type: String,
 }
 
@@ -482,9 +445,7 @@ impl EmitterConfig {
     }
 }
 
-/// Cached plan for one destination table. Built lazily the first time a
-/// row lands for the relation; held by the batcher's [`TableEncoder`]
-/// keyed by source `(namespace.relname)`.
+/// Cached plan for one destination table, built lazily on first row.
 pub struct TablePlan {
     pub target: String,
     pub columns: Vec<ColumnPlan>,
@@ -492,23 +453,20 @@ pub struct TablePlan {
     pub synth_xid: ColumnPlan,
     pub synth_op: ColumnPlan,
     pub synth_commit_ts: ColumnPlan,
-    /// `INSERT INTO ... (...) VALUES`. Pre-formatted so on-tuple paths
-    /// don't reassemble the string per row.
+    /// Pre-formatted so on-tuple paths don't reassemble per row
     pub insert_sql: String,
 }
 
 pub struct ColumnPlan {
     pub name: String,
-    /// CH type expression, eg. "Nullable(String)" / "UInt64".
     pub type_repr: String,
     pub ast: TypeAst,
-    /// Wire metadata for a (possibly Nullable) `Decimal(p,s)` column.
     pub decimal: Option<DecimalWire>,
 }
 
-/// Physical wire width of a CH `Decimal`: exactly one of four
-/// signed-integer backings. Discriminants are the byte widths, so
-/// `as usize` recovers the size.
+/// Physical wire width of a CH `Decimal`: one of four signed-integer
+/// backings. Discriminants are the byte widths, so `as usize` recovers
+/// the size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecimalWidth {
     D32 = 4,
@@ -540,8 +498,7 @@ pub struct DecimalWire {
 }
 
 impl TablePlan {
-    /// Build from a relation descriptor + mapping. Synthetic columns
-    /// are always non-nullable (the emitter always populates them).
+    /// Synthetic columns always non-nullable (emitter always populates).
     pub(crate) fn build(
         alloc: Allocator,
         rel: &RelDescriptor,
@@ -549,17 +506,11 @@ impl TablePlan {
     ) -> Result<Self, EmitterError> {
         let mut columns = Vec::with_capacity(mapping.columns.len());
         let mut col_sql = Vec::with_capacity(mapping.columns.len() + 4);
-        // Mapping columns whose attnum isn't in the catalog descriptor
-        // are not a hard error: schema-evolution workloads pre-declare
-        // post-ALTER columns in the mapping, and pre-ALTER xacts will
-        // legitimately see fewer attnums than the mapping does.
-        // `TableEncoder::append_row` already emits NULL for any source
-        // attnum that `decoded.{new,old}.columns.get` returns None for,
-        // so the missing-column case lands as NULL on every row of the
-        // affected mapping column. Operators chasing a static-config
-        // typo see it as "this column is always NULL" — the CH dest
-        // table catches it if the column is non-nullable; otherwise
-        // surfaces in row-count / aggregate mismatches.
+        // Mapping attnums absent from the catalog descriptor are not a
+        // hard error: schema-evolution pre-declares post-ALTER columns,
+        // pre-ALTER xacts legitimately see fewer attnums. append_row
+        // emits NULL for any missing attnum, so a static-config typo
+        // surfaces as an always-NULL column (or CH reject if non-nullable)
         let _ = rel;
         for c in &mapping.columns {
             let ast = TypeAst::parse(&c.target_type, alloc)
@@ -608,8 +559,8 @@ impl TablePlan {
 }
 
 pub(crate) fn quote_ident(name: &str) -> String {
-    // CH backtick quoting (mirrors `quoteIdentIfNeed` in the upstream
-    // client). Backticks inside identifiers escape via doubling.
+    // CH backtick quoting (mirrors upstream `quoteIdentIfNeed`):
+    // backticks inside identifiers escape via doubling
     let mut s = String::with_capacity(name.len() + 2);
     s.push('`');
     for c in name.chars() {
@@ -622,11 +573,9 @@ pub(crate) fn quote_ident(name: &str) -> String {
     s
 }
 
-/// Open a CH [`AsyncClient`] from `config`, connecting a fresh `tokio`
-/// TCP socket to `(host, port)` and running the Hello handshake. Shared
-/// by the inserter pool ([`crate::pipeline::inserter`]) and
-/// [`crate::ch_ddl::DdlApplicator::new`] so connection options stay in one
-/// place.
+/// Open a CH [`AsyncClient`]. Shared by inserter pool and
+/// [`crate::ch_ddl::DdlApplicator::new`] so connection options stay in
+/// one place.
 pub(crate) async fn connect_client(config: &EmitterConfig) -> Result<AsyncClient, EmitterError> {
     let codec = config.compression.build_codec()?;
     let mut opts = ClientOpts::new()
@@ -636,9 +585,8 @@ pub(crate) async fn connect_client(config: &EmitterConfig) -> Result<AsyncClient
     opts.compression = config.compression.to_wire();
     let addr = (config.host.as_str(), config.port);
     let client = if config.secure {
-        // SNI + cert verification key off the configured host. Caller's
-        // pinned config wins (private CA / self-signed / mTLS); else
-        // public webpki roots cover ClickHouse Cloud's CA.
+        // Caller's pinned config wins (private CA / self-signed / mTLS);
+        // else public webpki roots cover ClickHouse Cloud's CA
         let tls = config
             .tls_config
             .clone()
@@ -651,9 +599,9 @@ pub(crate) async fn connect_client(config: &EmitterConfig) -> Result<AsyncClient
 }
 
 /// Drain a CH response stream to `EndOfStream`, surfacing any
-/// `Exception` packet as [`EmitterError::ServerException`]. Used after
-/// every `send_query`/`send_data_end()` that expects no result rows
-/// (INSERT seal, TRUNCATE, DDL).
+/// `Exception` packet as [`EmitterError::ServerException`]. Used after a
+/// `send_query`/`send_data_end()` expecting no result rows (INSERT seal,
+/// TRUNCATE, DDL).
 pub(crate) async fn drain_to_end_of_stream(client: &mut AsyncClient) -> Result<(), EmitterError> {
     loop {
         match client.recv_event().await? {
@@ -670,35 +618,29 @@ pub(crate) async fn drain_to_end_of_stream(client: &mut AsyncClient) -> Result<(
     Ok(())
 }
 
-/// Per-table per-xact accumulator. One block buffer per CH column;
-/// flushed at xact end (or budget trip in a future pass). Buffers reset
-/// after `flush` so the encoder reuses allocations.
+/// Per-table per-xact accumulator, one block buffer per CH column.
 pub struct TableEncoder {
     pub plan: TablePlan,
     pub rows: usize,
     pub approx_bytes: usize,
-    /// Mirrors `plan.columns + 4 synth`.
+    /// Mirrors `plan.columns + 4 synth`
     pub buffers: Vec<ColumnBuf>,
 }
 
-/// On-the-wire-shape column buffer. Owned data lives here; the
-/// [`BlockBuilder`] borrows slices at flush time and the buffers are
-/// cleared after `send_data`.
+/// On-the-wire-shape column buffer. [`BlockBuilder`] borrows these
+/// slices at flush time; cleared after `send_data`.
 pub enum ColumnBuf {
-    /// `Type` like UInt32 — `width` bytes per row, packed little-endian.
+    /// `width` bytes per row, packed little-endian
     Fixed { width: usize, bytes: Vec<u8> },
-    /// `String` / `Bytea`. `offsets[i]` is the cumulative exclusive end
-    /// of row `i` in `data`.
+    /// `offsets[i]` is the cumulative exclusive end of row `i` in `data`
     String { offsets: Vec<u64>, data: Vec<u8> },
-    /// `Nullable(Fixed)`. `null_map[i] = 1` means NULL; default value
-    /// (zero bytes) goes into `inner` for null rows so the slab stays
-    /// dense.
+    /// `null_map[i] = 1` means NULL; zero bytes go into `inner` for null
+    /// rows so the slab stays dense
     NullableFixed {
         width: usize,
         null_map: Vec<u8>,
         inner: Vec<u8>,
     },
-    /// `Nullable(String)`.
     NullableString {
         offsets: Vec<u64>,
         data: Vec<u8>,
@@ -707,14 +649,11 @@ pub enum ColumnBuf {
 }
 
 impl ColumnBuf {
-    /// Build the right shape from a parsed [`TypeAst`]. Width comes
-    /// from clickhouse-c's `chc_type_elem_size` so FixedString(N),
-    /// DateTime64, Decimal*, Enum, etc. resolve correctly without
-    /// walshadow having to mirror the type-string surface. `elem_size
-    /// == 0` means a varlen on-wire shape (String / Bytea / Array / …);
-    /// the only varlen the emitter handles today is `String`, anything
-    /// else falls through to the [`String`] / [`NullableString`] arm
-    /// and dies cleanly on the first `append` mismatch.
+    /// Width comes from clickhouse-c `chc_type_elem_size` so
+    /// FixedString(N), DateTime64, Decimal*, Enum resolve without
+    /// walshadow mirroring the type-string surface. `elem_size == 0`
+    /// means varlen on-wire shape; only `String` is handled, other
+    /// varlens fall through to the String arms and die on first `append`.
     fn new_for_ast(ast: &TypeAst) -> Result<Self, EmitterError> {
         let view = ast.view();
         let (nullable, inner) = if view.kind() == Some(Kind::Nullable) {
@@ -764,7 +703,6 @@ impl ColumnBuf {
         }
     }
 
-    /// Append one row. Caller decides whether the value is NULL.
     fn append_null(&mut self) -> Result<(), EmitterError> {
         match self {
             Self::NullableFixed {
@@ -853,16 +791,14 @@ impl ColumnBuf {
     }
 }
 
-/// Fresh per-column buffers matching `plan` (mapped columns + the four
-/// synthetic ones). Shared by [`TableEncoder::new`] and
-/// [`TableEncoder::take_block`] so the synthetic-column widths live in one
-/// place.
+/// Fresh per-column buffers matching `plan` (mapped + four synthetic).
+/// Shared by [`TableEncoder::new`] and [`TableEncoder::take_block`] so
+/// synthetic-column widths live in one place.
 pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterError> {
     let mut buffers = Vec::with_capacity(plan.columns.len() + 4);
     for c in &plan.columns {
         buffers.push(ColumnBuf::new_for_ast(&c.ast)?);
     }
-    // Synthetic columns are non-nullable by construction.
     buffers.push(ColumnBuf::Fixed {
         width: 8,
         bytes: Vec::new(),
@@ -893,12 +829,8 @@ impl TableEncoder {
         })
     }
 
-    /// Swap the accumulated column slabs out for fresh empties, returning
-    /// the old slabs + their row count. The pipeline's batcher hands the
-    /// returned slabs to an inserter task (which rebuilds the
-    /// [`BlockBuilder`] over them with its own parsed types) and keeps
-    /// appending into the fresh ones. Unlike [`Self::clear`] this transfers
-    /// ownership rather than reusing the allocations.
+    /// Swap accumulated slabs out for fresh empties, returning old slabs
+    /// + row count. Transfers ownership rather than reusing allocations.
     pub(crate) fn take_block(&mut self) -> Result<(Vec<ColumnBuf>, usize), EmitterError> {
         let fresh = fresh_buffers(&self.plan)?;
         let old = std::mem::replace(&mut self.buffers, fresh);
@@ -908,9 +840,7 @@ impl TableEncoder {
         Ok((old, rows))
     }
 
-    /// Append one committed tuple's `new` image (or `old` image for
-    /// DELETE / UPDATE old-key). Caller picks the source side and the
-    /// `_op` code.
+    /// Caller picks the source side (DELETE uses `old`) and the `_op` code.
     pub fn append_row(
         &mut self,
         committed: &CommittedTuple,
@@ -951,8 +881,7 @@ impl TableEncoder {
                 })?,
             }
         }
-        // Synthetic columns: lsn (UInt64), xid (UInt32), op (Enum8),
-        // commit_ts (DateTime64(6, UTC) = unix microseconds).
+        // Synthetic columns: _lsn, _xid, _op, _commit_ts (unix micros)
         let off = mapping.columns.len();
         push_fixed(&mut self.buffers[off], &decoded.source_lsn.to_le_bytes())?;
         push_fixed(&mut self.buffers[off + 1], &decoded.xid.to_le_bytes())?;
@@ -972,10 +901,9 @@ pub(crate) fn append_buf<'a>(
     buf: &'a ColumnBuf,
     n_rows: usize,
 ) -> Result<(), EmitterError> {
-    // SAFETY: the BlockBuilder retains pointers into the slabs we pass
-    // here until `send_data` returns. The buffers live in
-    // `TableEncoder.buffers` and are not mutated until `clear()` runs
-    // after this function returns.
+    // SAFETY: BlockBuilder retains pointers into these slabs until
+    // `send_data` returns; buffers in `TableEncoder.buffers` are not
+    // mutated until `clear()` runs after this returns
     match buf {
         ColumnBuf::Fixed { bytes, .. } => {
             bb.append_fixed(name, ast.view(), bytes, n_rows)?;
@@ -1003,9 +931,8 @@ fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
     buf.append_fixed_bytes(le)
 }
 
-/// Wire metadata for a (possibly `Nullable`) CH `Decimal` type, or
-/// `None` when the type isn't Decimal. Peels one `Nullable` layer the
-/// same way [`ColumnBuf::new_for_ast`] does.
+/// Wire metadata for a (possibly `Nullable`) CH `Decimal`, else `None`.
+/// Peels one `Nullable` layer like [`ColumnBuf::new_for_ast`].
 fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
     let view = ast.view();
     let inner = if view.kind() == Some(Kind::Nullable) {
@@ -1111,11 +1038,10 @@ fn decimal_type_error(msg: &str) -> EmitterError {
     EmitterError::Type(msg.into())
 }
 
-/// Convert a PG `numeric` text rendering (`numeric_out` form, eg
-/// `-12.340`) to the scaled integer a CH `Decimal(_, scale)` stores:
-/// `value * 10^scale`, encoded as two's-complement little-endian bytes
-/// at the Decimal wire width. PG stores values conforming to column
-/// typmod, so text dscale normally equals `scale`; rescale handles
+/// PG `numeric_out` text (eg `-12.340`) to the scaled integer a CH
+/// `Decimal(_, scale)` stores: `value * 10^scale`, two's-complement
+/// little-endian at the Decimal wire width. PG values conform to column
+/// typmod so text dscale normally equals `scale`; rescale handles
 /// integer-valued numerics and defensive target-scale overrides.
 fn decimal_text_to_scaled_le(
     text: &str,
@@ -1128,9 +1054,8 @@ fn decimal_text_to_scaled_le(
     }
 
     let neg = text.starts_with('-');
-    // Strip at most one leading sign; numeric_out emits a single optional
-    // '-', so a residual sign char in `body` is malformed and the parse
-    // loop below rejects it as a non-digit.
+    // numeric_out emits a single optional '-'; a residual sign in `body`
+    // is malformed and the parse loop rejects it as a non-digit
     let body = text.strip_prefix(['-', '+']).unwrap_or(text);
     let mut mag = U256::default();
     let mut frac_digits = 0i32;
@@ -1164,20 +1089,18 @@ fn decimal_text_to_scaled_le(
             }
         }
     } else if diff < 0 {
-        // Text carries more fractional digits than the column scale.
-        // PG would have rounded on store, so this is a defensive
-        // truncation that should not occur for conforming values.
+        // More fractional digits than column scale: PG would have
+        // rounded on store, so defensive trunc, shouldn't occur for
+        // conforming values
         for _ in 0..-diff {
             mag.div_small(10);
         }
     }
 
-    // Bound the magnitude by the physical wire width (signed Int{32,64,
-    // 128,256} range), not the logical Decimal(p,s) precision of 10^p.
-    // The bridge maps numeric(p,s) → Decimal(p,s) with matching p, so
-    // conforming values satisfy both; this check is the backstop that
-    // turns a too-wide value (eg an operator override onto a narrower
-    // Decimal) into a clean error instead of a silently truncated store.
+    // Bound by physical wire width (signed Int{32,64,128,256} range),
+    // not logical Decimal(p,s) precision 10^p. Backstop turning a
+    // too-wide value (eg operator override onto a narrower Decimal) into
+    // a clean error instead of a silently truncated store.
     let limit = U256::one_shl(width * 8 - 1);
     if (!neg && mag >= limit) || (neg && mag > limit) {
         return Err(decimal_oob());
@@ -1217,17 +1140,14 @@ fn encode_value(
         ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
         ColumnValue::Date(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        // `time` → `Time64(6)`: microseconds since midnight, no epoch
-        // offset (matches the bridge's `Time64(6)` mapping).
+        // `time` → `Time64(6)`: microseconds since midnight, no epoch offset
         ColumnValue::Time(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
         ColumnValue::Timestamp(n) | ColumnValue::TimestampTz(n) => {
-            // PG epoch → Unix epoch, microseconds. CH `DateTime64(6)` is
-            // unix-epoch microseconds.
             let unix_us = n.saturating_add(DATETIME64_PG_EPOCH_US);
             buf.append_fixed_bytes(&unix_us.to_le_bytes())
         }
-        // `timetz` → text (CH has no zone-aware time type); preserves
-        // the offset the fixed encoding used to drop.
+        // `timetz` → text: CH has no zone-aware time type, text keeps
+        // the offset the old fixed encoding dropped
         ColumnValue::TimeTz { micros, tz_seconds } => {
             buf.append_string_bytes(crate::codecs::timetz_to_text(*micros, *tz_seconds).as_bytes())
         }
@@ -1238,11 +1158,9 @@ fn encode_value(
         ColumnValue::Numeric(n) => {
             use crate::codecs::NumericKind;
             match decimal {
-                // Decimal column: encode the finite value as a scaled
-                // little-endian integer. Non-finite (NaN/±Inf) can't be
-                // represented — surface as an error so nothing is
-                // silently corrupted (operator maps that column to
-                // String to recover).
+                // Decimal column: non-finite (NaN/±Inf) is unrepresentable,
+                // error rather than silently corrupt (operator maps the
+                // column to String to recover)
                 Some(decimal) => match n {
                     NumericKind::Finite(s) => {
                         let scaled =
@@ -1256,8 +1174,7 @@ fn encode_value(
                         })
                     }
                 },
-                // String column (unconstrained numeric or operator
-                // mapping): lossless text, including NaN/±Inf.
+                // String column: lossless text, including NaN/±Inf
                 None => {
                     let txt: &str = match n {
                         NumericKind::Finite(s) => s.as_str(),
@@ -1276,12 +1193,9 @@ fn encode_value(
             target_column: String::new(),
             kind: "unresolved TOAST pointer (xact buffer should have reassembled)",
         }),
-        // PgPending: resolution to text happens earlier in the pipeline
-        // (BufferingDecoderSink drain via the oracle extension). Reaching
-        // the emitter with PgPending still set means the extension is
-        // absent — fall back to the raw on-disk bytes so CH still
-        // receives the value (operators can post-process via PG-side
-        // tooling). No error; no stat bump.
+        // PgPending normally resolves to text earlier (BufferingDecoderSink
+        // via the oracle extension). Still set here means extension absent;
+        // fall back to raw on-disk bytes so CH still gets the value
         ColumnValue::PgPending { raw, .. } => buf.append_string_bytes(raw),
         ColumnValue::Unsupported { .. } => Err(EmitterError::UnsupportedValue {
             target_column: String::new(),
@@ -1290,39 +1204,31 @@ fn encode_value(
     }
 }
 
-/// Shared per-relation mapping handle. Cloneable via the inner `Arc`; the
-/// decode pool and the DDL applicator read it, and the daemon swaps the
-/// whole `HashMap` atomically on SIGHUP reload.
-///
-/// Readers see the swap *between* rows; a table's cached [`TablePlan`] in
-/// the batcher rebuilds on the next epoch (after a barrier), so subsequent
-/// batches encode against the new map.
+/// Shared per-relation mapping handle. Daemon swaps the whole `HashMap`
+/// atomically on SIGHUP reload; readers see the swap between rows, and a
+/// table's cached [`TablePlan`] rebuilds on the next epoch (after a
+/// barrier) so subsequent batches encode against the new map.
 pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>;
 
 crate::atomic_stats! {
-    /// CH emitter counters. Mutations via `fetch_add(_, Relaxed)`; the
-    /// daemon's status loop reads via `.load(Relaxed)` at the use site.
+    /// CH emitter counters. `fetch_add(_, Relaxed)`; status loop reads
+    /// via `.load(Relaxed)`.
     pub struct EmitterStats {
         pub rows_emitted,
         pub blocks_sent,
         pub xacts_committed,
         pub unsupported_relations,
-        /// Rows whose filenode resolved to a foreign database (physical WAL
-        /// carries the whole cluster). Skipped, not an error.
+        /// Rows whose filenode resolved to a foreign database (physical
+        /// WAL carries the whole cluster). Skipped, not an error.
         pub foreign_db_rows_skipped,
         pub unsupported_values,
-        /// Retry bookkeeping. `reconnects` ticks on every fresh
-        /// CH socket the daemon hot-replaces; `retries_attempted` ticks on
-        /// every reconnect-triggered retry (one per failing operation,
-        /// not per attempt — so a single op that needed 3 retries adds 3).
+        /// `retries_attempted` counts one per failing operation, not per
+        /// attempt (one op needing 3 retries adds 3)
         pub reconnects,
         pub retries_attempted,
-        /// `HeapOp::Truncate` events shipped to CH as `TRUNCATE TABLE`.
         pub truncates_emitted,
-        /// Legacy serial-emitter counter for hold-INSERT-open deadline
-        /// trips. The pooled pipeline seals partial batches via the
-        /// batcher's own `flush_timeout` deadline and does not bump this,
-        /// so it now stays 0.
+        /// Legacy serial-emitter counter; pooled pipeline seals via the
+        /// batcher's own `flush_timeout` deadline and never bumps this
         pub flush_deadline_trips,
     }
 }
@@ -1337,9 +1243,7 @@ pub(crate) fn is_retryable(e: &EmitterError) -> bool {
     )
 }
 
-// `ColumnBuf` Debug — used by error paths that want to surface what
-// shape the buffer is. Manual impl because deriving would render the
-// whole slab through `Vec<u8>` rather than reporting just lengths.
+// Manual Debug: deriving would dump the whole slab; report just lengths
 impl std::fmt::Debug for ColumnBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1393,7 +1297,6 @@ mod tests {
 
     #[test]
     fn is_retryable_only_for_transport_and_server_faults() {
-        // Transport / server faults: the stream loop should reconnect+retry.
         assert!(is_retryable(&EmitterError::Io(std::io::Error::other(
             "reset"
         ))));
@@ -1401,7 +1304,7 @@ mod tests {
             code: 241,
             message: "MEMORY_LIMIT_EXCEEDED".into(),
         }));
-        // Semantic / config faults are terminal — retrying repeats them.
+        // Semantic / config faults are terminal
         assert!(!is_retryable(&EmitterError::Type("bad decimal".into())));
         assert!(!is_retryable(&EmitterError::Config("missing host".into())));
         assert!(!is_retryable(&EmitterError::NoTableMapping(
@@ -1534,9 +1437,6 @@ mod tests {
         CompressionChoice::parse("snappy").expect_err("unknown codec");
     }
 
-    /// Each `CompressionChoice::build_codec` arm goes through the
-    /// matching feature gate. Build the variants on the current feature
-    /// matrix & confirm a successful codec emerges (or a clean error).
     #[test]
     fn compression_choice_build_codec_respects_features() {
         let none = CompressionChoice::None.build_codec().unwrap();
@@ -1567,10 +1467,8 @@ mod tests {
         }
     }
 
-    /// Reach into chc_type_elem_size for the emitter width matrix
-    /// instead of mirroring it in walshadow. Confirms the upstream
-    /// elem_size return values match what the encoder needs for
-    /// fixed-shape ColumnBufs.
+    /// Confirm upstream `chc_type_elem_size` returns match what the
+    /// encoder needs for fixed-shape ColumnBufs.
     #[test]
     fn elem_size_covers_tier1() {
         let alloc = Allocator::stdlib();
@@ -1587,17 +1485,13 @@ mod tests {
             let ast = TypeAst::parse(name, alloc).expect("parses");
             assert_eq!(ast.view().elem_size(), expected, "{name}");
         }
-        // Varlen + composite types report 0; the encoder reads that
-        // as "varlen on-wire shape".
+        // Varlen + composite types report 0 (varlen on-wire shape)
         for name in ["String", "Array(UInt32)"] {
             let ast = TypeAst::parse(name, alloc).expect("parses");
             assert_eq!(ast.view().elem_size(), 0, "{name}");
         }
     }
 
-    /// Nullable wraps in CH wire types live at the type AST layer;
-    /// `new_for_ast` peels them via `Kind::Nullable` + `child(0)` and
-    /// picks the right buffer shape from the inner's `elem_size`.
     #[test]
     fn new_for_ast_picks_shape_from_chc_type_kind() {
         let alloc = Allocator::stdlib();
@@ -1634,9 +1528,7 @@ mod tests {
         assert_eq!(le_i64("1.50", 2), 150i64.to_le_bytes());
         assert_eq!(le_i64("-12.34", 2), (-1234i64).to_le_bytes());
         assert_eq!(le_i64("0.001", 3), 1i64.to_le_bytes());
-        // More fractional digits than the column scale: defensive trunc.
         assert_eq!(le_i64("123.456", 2), 12345i64.to_le_bytes());
-        // Malformed input rejected: doubled sign, empty, stray chars.
         assert!(decimal_text_to_scaled_le("--5", 0, DecimalWidth::D64).is_err());
         assert!(decimal_text_to_scaled_le("", 0, DecimalWidth::D64).is_err());
         assert!(decimal_text_to_scaled_le("1.2.3", 0, DecimalWidth::D64).is_err());
@@ -1673,7 +1565,6 @@ mod tests {
     fn encode_numeric_into_decimal_and_string() {
         use crate::codecs::NumericKind;
         let alloc = Allocator::stdlib();
-        // Decimal(10,2) → Decimal64 (8 bytes); "1.50" scaled by 100 = 150.
         let ast = TypeAst::parse("Decimal(10, 2)", alloc).unwrap();
         let decimal = decimal_wire_of(&ast);
         assert_eq!(
@@ -1697,7 +1588,6 @@ mod tests {
             }
             _ => panic!("expected fixed-shape buffer"),
         }
-        // NaN into a Decimal column is unrepresentable → error.
         let mut buf_nan = ColumnBuf::new_for_ast(&ast).unwrap();
         assert!(
             encode_value(
@@ -1735,7 +1625,6 @@ mod tests {
             _ => panic!("expected fixed-shape buffer"),
         }
 
-        // String-mapped numeric (unconstrained) renders text.
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
         encode_value(&mut sbuf, &ColumnValue::Numeric(NumericKind::NaN), None).unwrap();
@@ -1749,7 +1638,6 @@ mod tests {
     fn encode_time_native_and_timetz_text() {
         let alloc = Allocator::stdlib();
         let micros = 45_296_000_000i64; // 12:34:56
-        // time → Time64(6): raw microseconds LE, 8 bytes.
         let ast = TypeAst::parse("Time64(6)", alloc).unwrap();
         let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
         encode_value(&mut buf, &ColumnValue::Time(micros), None).unwrap();
@@ -1760,8 +1648,6 @@ mod tests {
             }
             _ => panic!("expected fixed-shape buffer"),
         }
-        // timetz → String text carrying the zone (which the old fixed
-        // encoding silently dropped).
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
         encode_value(
@@ -1814,7 +1700,6 @@ mod tests {
         enc.append_row(&committed(9, Some("nine")), &m, OP_INSERT)
             .unwrap();
         assert_eq!(enc.rows, 3);
-        // Column 0 (Int32, non-null): 4 bytes * 3 rows = 12 bytes.
         match &enc.buffers[0] {
             ColumnBuf::Fixed { bytes, width } => {
                 assert_eq!(*width, 4);
@@ -1825,7 +1710,6 @@ mod tests {
             }
             other => panic!("col 0 expected Fixed, got {other:?} variant tag"),
         }
-        // Column 1 (Nullable(String)): null_map [0,1,0], offsets [5, 5, 9].
         match &enc.buffers[1] {
             ColumnBuf::NullableString {
                 offsets,
@@ -1838,7 +1722,6 @@ mod tests {
             }
             other => panic!("col 1 expected NullableString, got {other:?} variant tag"),
         }
-        // Synthetic _lsn at index 2 (after the 2 mapped columns).
         let off = m.columns.len();
         match &enc.buffers[off] {
             ColumnBuf::Fixed { bytes, .. } => {
@@ -1847,7 +1730,6 @@ mod tests {
             }
             other => panic!("_lsn expected Fixed, got {other:?} variant tag"),
         }
-        // _op = INSERT = 1.
         match &enc.buffers[off + 2] {
             ColumnBuf::Fixed { bytes, .. } => assert_eq!(bytes, &vec![1u8, 1, 1]),
             _ => panic!("_op expected Fixed"),
@@ -1881,7 +1763,7 @@ mod tests {
         assert_eq!(c.user, "ingest");
         assert!(c.secure);
         assert_eq!(c.compression, CompressionChoice::Lz4);
-        // Omitting `secure` defaults to plaintext.
+        // Omitting `secure` defaults to plaintext
         assert!(
             !EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n")
                 .unwrap()

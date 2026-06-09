@@ -1,10 +1,9 @@
 //! Greenfield bootstrap orchestrator.
 //!
-//! Wires a [`BackupSource`] (Direct or ObjectStore) through a
-//! [`MultiplexSink`] composed of [`DiskLanderSink`] +
-//! [`PageWalkSink`]. Catalog files land on `shadow_data_dir`;
-//! user-heap pages page-walk and ship `BackfillTuple`s through an
-//! mpsc into a caller-owned emitter drain task.
+//! Wires [`BackupSource`] through [`MultiplexSink`]([`DiskLanderSink`],
+//! [`PageWalkSink`]). Catalog files land on `shadow_data_dir`; user-heap
+//! pages page-walk and ship `BackfillTuple`s over an mpsc to a caller-owned
+//! emitter drain task.
 //!
 //! Sequencing:
 //!
@@ -20,12 +19,9 @@
 //!    then rebinds WAL pump at end_lsn.
 //! ```
 //!
-//! Catalog-seed snapshot binding: the seed query runs against source PG
-//! immediately before `source.run` issues `BASE_BACKUP`. Per the
-//! bootstrap contract,
-//! DDL during backfill is operator-quiesced; the sub-second seed/issue
-//! gap is operationally indistinguishable from BASE_BACKUP's own
-//! checkpoint window.
+//! Catalog seed runs against source PG immediately before `source.run`
+//! issues `BASE_BACKUP`. DDL during backfill is operator-quiesced; sub-second
+//! seed/issue gap is indistinguishable from BASE_BACKUP's checkpoint window.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -42,19 +38,14 @@ use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::decoder_sink::TupleObserver;
 use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent, parse_array_one_element};
 
-/// Operator-tunable knobs.
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
-    /// Shadow PG's data directory. The orchestrator pre-creates if
-    /// missing; the source writes catalog files into it during the
-    /// pump. The daemon's startup hook (`Shadow::start`) needs the
-    /// directory to be empty at boot time except for what the
-    /// orchestrator landed.
+    /// Orchestrator pre-creates if missing. `Shadow::start` requires it
+    /// empty at boot except for what the orchestrator landed
     pub shadow_data_dir: PathBuf,
-    /// Catalog-tracker filenode whitelist — rotated catalogs from
-    /// `CatalogTracker::seed_from_source` that the bootstrap rule
-    /// (`rel_node < 16384`) misses. Empty in greenfield deployments
-    /// where the seed runs after bootstrap.
+    /// Rotated catalogs from `CatalogTracker::seed_from_source` that the
+    /// `rel_node < 16384` bootstrap rule misses. Empty in greenfield where
+    /// seed runs after bootstrap
     pub catalog_filenodes: CatalogFilenodes,
 }
 
@@ -72,7 +63,6 @@ impl BootstrapConfig {
     }
 }
 
-/// Result of one successful bootstrap pump.
 #[derive(Debug, Clone)]
 pub struct BootstrapOutcome {
     pub start: StartInfo,
@@ -81,13 +71,9 @@ pub struct BootstrapOutcome {
     pub page_walk: PageWalkStats,
 }
 
-/// Spawn the greenfield bootstrap pump on a tokio task and yield the
-/// caller a `(rx, handle)` pair so it can drain `BackfillTuple`s
-/// concurrently with the source pump. The pump task drops its sender
-/// half on return; `rx.recv() == None` is the channel-close signal the
-/// drain task watches for.
-///
-/// Caller orchestration:
+/// Spawn pump on a tokio task, yield `(rx, handle)` so caller drains
+/// `BackfillTuple`s concurrently. Pump drops its sender on return;
+/// `rx.recv() == None` signals channel close.
 ///
 /// ```ignore
 /// let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map);
@@ -96,16 +82,15 @@ pub struct BootstrapOutcome {
 /// let shipped = drained.await?;
 /// ```
 ///
-/// Streaming the drain is load-bearing for large backups: the channel
-/// is unbounded by necessity (PageWalkSink::chunk is sync and would
-/// `blocking_send`-panic inside the tokio runtime), so without a
-/// concurrent drain the producer queues every tuple in memory until
-/// the source completes.
+/// Channel is unbounded because PageWalkSink::chunk is sync and would
+/// `blocking_send`-panic inside the runtime; a concurrent drain keeps the
+/// queue bounded in practice, else the producer holds every tuple in memory
+/// until source completes.
 ///
-/// The orchestrator does **not** touch [`crate::shadow::Shadow`] —
-/// the daemon owns shadow lifecycle. After the pump returns the
-/// caller writes `standby.signal` with `recovery_target_lsn = end_lsn`,
-/// starts shadow, and waits for replay before rebinding the WAL pump.
+/// Does not touch [`crate::shadow::Shadow`]; daemon owns shadow lifecycle.
+/// After pump returns, caller writes `standby.signal` with
+/// `recovery_target_lsn = end_lsn`, starts shadow, waits replay, then rebinds
+/// WAL pump.
 pub fn spawn_greenfield_bootstrap(
     cfg: BootstrapConfig,
     source: Box<dyn BackupSource>,
@@ -114,11 +99,8 @@ pub fn spawn_greenfield_bootstrap(
     mpsc::UnboundedReceiver<BackfillTuple>,
     JoinHandle<Result<BootstrapOutcome>>,
 ) {
-    // Unbounded so PageWalkSink::chunk (sync) can send from inside the
-    // tokio runtime context without blocking_send-panic. See module
-    // docs at backup_page_walk.rs::PageWalkSink::out_tx for the
-    // trade-off; the drain task ahead of `rx` is what keeps the queue
-    // bounded in practice.
+    // Unbounded so sync PageWalkSink::chunk avoids blocking_send-panic; see
+    // backup_page_walk.rs::PageWalkSink::out_tx
     let (tx, rx) = mpsc::unbounded_channel::<BackfillTuple>();
     let pump = tokio::spawn(async move {
         tokio::fs::create_dir_all(&cfg.shadow_data_dir)
@@ -134,10 +116,8 @@ pub fn spawn_greenfield_bootstrap(
         let page_walk = PageWalkSink::new(catalog_map, tx);
         let mux = MultiplexSink::new(lander, page_walk);
 
-        // Hold the typed Arc alongside the trait-object Arc so we can
-        // recover stats after the source completes. Both Arc clones
-        // point at the same Mutex; the source sees only the erased
-        // view.
+        // Keep typed Arc beside erased trait-object Arc to recover stats
+        // after source completes; both point at the same Mutex
         let typed: Arc<Mutex<MultiplexSink<PageWalkSink>>> = Arc::new(Mutex::new(mux));
         let erased: Arc<Mutex<dyn BackupSink>> = typed.clone();
 
@@ -147,19 +127,16 @@ pub fn spawn_greenfield_bootstrap(
             .await
             .context("bootstrap: source.run")?;
 
-        // Recover stats. With the source done, only `typed` should
-        // still hold a strong reference (the source's `erased` clone
-        // has been dropped on return). `try_unwrap` succeeds if no
-        // other clone leaked; otherwise read through the Mutex.
+        // Source dropped its `erased` clone on return, so `try_unwrap`
+        // succeeds unless a clone leaked; else read through the Mutex
         let outcome = match Arc::try_unwrap(typed) {
             Ok(mtx) => {
                 let mux = mtx
                     .into_inner()
                     .map_err(|_| anyhow::anyhow!("bootstrap: mux mutex poisoned at teardown"))?;
                 let (lander, page_walk) = mux.into_inner();
-                // Dropping `page_walk` here closes the unbounded
-                // channel sender held in `out_tx`, so any concurrent
-                // drain task observes channel-close on its next recv.
+                // Dropping `page_walk` closes the channel sender in `out_tx`,
+                // so a concurrent drain observes channel-close on next recv
                 BootstrapOutcome {
                     start,
                     end,
@@ -184,13 +161,10 @@ pub fn spawn_greenfield_bootstrap(
     (rx, pump)
 }
 
-/// Convenience wrapper around [`spawn_greenfield_bootstrap`] for
-/// tests + small fixtures: runs the pump to completion, collects every
-/// emitted `BackfillTuple` into a `Vec`, returns the outcome alongside.
-/// Production callers should use [`spawn_greenfield_bootstrap`] +
-/// [`drain_backfill`] instead so memory exposure is bounded by the
-/// downstream emitter's drain rate, not by the source's full tuple
-/// count.
+/// Test/fixture wrapper: run pump to completion, collect every
+/// `BackfillTuple` into a `Vec`. Production callers use
+/// [`spawn_greenfield_bootstrap`] + [`drain_backfill`] to bound memory by
+/// the emitter's drain rate, not the source's full tuple count
 pub async fn run_greenfield_bootstrap(
     cfg: BootstrapConfig,
     source: Box<dyn BackupSource>,
@@ -209,27 +183,21 @@ pub async fn run_greenfield_bootstrap(
     Ok((outcome, tuples))
 }
 
-/// Drain backfill tuples from the orchestrator's channel into a
-/// [`TupleObserver`]. Each `BackfillTuple` becomes a synthetic
-/// [`CommittedTuple`](crate::heap_decoder::CommittedTuple) with
-/// `op = Insert`, `commit_ts = 0`, and
-/// `commit_lsn = source_lsn` (the BASE_BACKUP's `start_lsn`). The
-/// daemon's xact-buffer + decoder chain isn't on this path — we are
-/// the bottom of the wire, synthesising committed rows directly from
-/// on-disk pages.
+/// Drain backfill tuples into a [`TupleObserver`]. Each `BackfillTuple`
+/// becomes a synthetic
+/// [`CommittedTuple`](crate::heap_decoder::CommittedTuple) with `op = Insert`,
+/// `commit_ts = 0`, `commit_lsn = source_lsn` (BASE_BACKUP `start_lsn`).
+/// Synthesises committed rows from on-disk pages, bypassing the daemon's
+/// xact-buffer + decoder chain.
 ///
-/// `PageWalkSink` emits all rows for one rfn contiguously before
-/// moving on, so we drive an `on_xact_end` whenever the rfn flips.
-/// CH's Native protocol forbids issuing a new `Query` (`INSERT INTO
-/// table_B`) while a prior `INSERT INTO table_A` still has an open
-/// data stream; without per-table flushes the second `send_query`
-/// races the first INSERT's body bytes and CH silently drops everything
-/// emitted on the connection.
+/// `PageWalkSink` emits all rows for one rfn contiguously, so drive
+/// `on_xact_end` on every rfn flip: CH Native protocol forbids a new `Query`
+/// while a prior INSERT's data stream is open; without per-table flushes the
+/// second `send_query` races the first INSERT's body bytes and CH silently
+/// drops everything on the connection.
 ///
-/// Channel-close (pump task dropped its sender) ends the loop; the
-/// final `on_xact_end` closes the last table's INSERT block so the
-/// transitional emitter releases its CH state cleanly before the
-/// daemon swaps to the shadow-catalog-backed emitter.
+/// Final `on_xact_end` after channel-close lets the transitional emitter
+/// release CH state before the daemon swaps to the shadow-catalog emitter.
 pub async fn drain_backfill<O: TupleObserver + ?Sized>(
     mut rx: mpsc::UnboundedReceiver<BackfillTuple>,
     observer: &mut O,
@@ -261,18 +229,11 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
     Ok(shipped)
 }
 
-/// Build a [`CatalogMap`] by querying source PG for every user
-/// relation. Run inside a snapshot xact (`REPEATABLE READ`) when DDL
-/// quiescence isn't enforced externally — see [`seed_in_snapshot`]
-/// for the wrapped form.
-///
-/// Mirrors `ShadowCatalog::fetch_by_rfn` /
-/// `ShadowCatalog::fetch_attributes` / `ShadowCatalog::fetch_replident`
-/// (all in `shadow_catalog.rs`) but enumerates all user relations
-/// upfront instead of resolving lazily by filenode.
-///
-/// Filenodes of 0 (partitioned parents, views, etc.) are skipped —
-/// they have no heap to page-walk.
+/// Build a [`CatalogMap`] by enumerating every source PG user relation
+/// upfront. Mirrors `ShadowCatalog::{fetch_by_rfn,fetch_attributes,
+/// fetch_replident}` (shadow_catalog.rs) but eager rather than lazy by
+/// filenode. Wrap in [`seed_in_snapshot`] when DDL quiescence isn't external.
+/// Filenode 0 (partitioned parents, views) has no heap to page-walk; skipped.
 pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
     let db_oid = current_database_oid(client).await?;
     let rows = client
@@ -307,8 +268,7 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         let spc_node: Oid = row.get(7);
         let rel_node: Oid = row.get(8);
         if rel_node == 0 {
-            // Partitioned parent / view / sequence without a heap; nothing
-            // to page-walk for this relation
+            // No heap to page-walk (partitioned parent / view / sequence)
             continue;
         }
         let rfn = RelFileNode {
@@ -341,21 +301,16 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
     Ok(map)
 }
 
-/// Snapshot-bound wrapper: open a REPEATABLE READ xact, seed the
-/// CatalogMap inside it, COMMIT. Source PG's `BASE_BACKUP` checkpoint
-/// is independent of this snapshot, but binding the catalog read to a
-/// stable snapshot prevents a torn read against concurrent DDL while
-/// the seed runs. The sub-second window between this COMMIT and the
-/// caller's `source.run` is the operator-quiesce window of the
-/// catalog-seed snapshot binding.
+/// Open REPEATABLE READ xact, seed CatalogMap, COMMIT. Stable snapshot
+/// prevents a torn read against concurrent DDL during the seed. The
+/// sub-second window before `source.run` relies on operator quiesce.
 pub async fn seed_in_snapshot(client: &Client) -> Result<CatalogMap> {
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .context("bootstrap: open seed snapshot xact")?;
     let result = seed_catalog_from_source(client).await;
-    // Always commit, even on seed failure — the xact is read-only so
-    // commit-vs-rollback is purely about releasing the snapshot.
+    // Read-only xact: commit even on failure, only releases the snapshot
     let _ = client.batch_execute("COMMIT").await;
     result
 }
@@ -474,8 +429,7 @@ mod tests {
         assert!(cfg.catalog_filenodes.is_catalog(5, 50000));
     }
 
-    /// Mock source that emits a curated sequence of file events. Used
-    /// to test the orchestrator without a live PG.
+    /// Emits a curated file-event sequence; tests orchestrator without live PG
     struct MockSource {
         files: Vec<(FileMeta, Vec<u8>)>,
         start: StartInfo,
@@ -576,17 +530,15 @@ mod tests {
             .await
             .unwrap();
 
-        // LSN handoff intact
         assert_eq!(outcome.start.start_lsn, 0xDEAD_BEEF);
         assert_eq!(outcome.end.end_lsn, 0xFFFF_FFFF);
 
-        // Catalog landed, user heap did not, denylist did not, pg_control landed
+        // Catalog + pg_control landed; user heap + denylist did not
         assert!(data_dir.join("base/5/1259").exists());
         assert!(!data_dir.join("base/5/16400").exists());
         assert!(!data_dir.join("pg_replslot/0/state").exists());
         assert!(data_dir.join("pg_control").exists());
 
-        // Page-walked tuple captured by the drain wrapper
         assert_eq!(tuples.len(), 1, "exactly one synthetic tuple expected");
         let tuple = &tuples[0];
         assert_eq!(tuple.source_lsn, 0xDEAD_BEEF);
@@ -637,9 +589,6 @@ mod tests {
         }
     }
 
-    /// Recording observer that counts tuples + xact-end calls so tests
-    /// can assert `drain_backfill` closes the transitional emitter's
-    /// INSERT blocks exactly once after the channel drains.
     #[derive(Default)]
     struct CountingObserver {
         on_tuple_calls: u32,
@@ -698,17 +647,14 @@ mod tests {
         let shipped = drain_backfill(rx, &mut obs).await.unwrap();
         assert_eq!(shipped, 4);
         assert_eq!(obs.on_tuple_calls, 4);
-        // Exactly one synthetic xact closes the backfill — drain calls
-        // on_xact_end once after the receiver is drained.
+        // One synthetic xact closes the backfill
         assert_eq!(obs.on_xact_end_calls, 1);
     }
 
     #[tokio::test]
     async fn drain_backfill_calls_on_xact_end_even_on_empty_channel() {
-        // Producer drops the sender without ever pushing a tuple. The
-        // synthetic xact still closes — `on_xact_end` always fires
-        // after channel close so a Solution 2 transitional emitter's
-        // INSERT cleanup runs unconditionally.
+        // Sender dropped without a tuple; `on_xact_end` still fires so the
+        // transitional emitter's INSERT cleanup runs unconditionally
         let (tx, rx) = mpsc::unbounded_channel::<BackfillTuple>();
         drop(tx);
         let mut obs = CountingObserver::default();

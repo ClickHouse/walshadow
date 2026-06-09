@@ -1,66 +1,39 @@
 //! Per-xid xact buffer + TOAST reassembly.
 //!
-//! Sits between [`BufferingDecoderSink`]'s per-record output and the
-//! downstream emitter. Holds every
-//! [`DecodedHeap`] for a given xid plus every TOAST chunk
-//! `(toast_relid, value_id, chunk_seq)` until the matching
-//! `XLOG_XACT_COMMIT` / `XLOG_XACT_ABORT` lands. Commit drains in WAL
-//! order with each `ColumnValue::ExternalToast` substituted by its
-//! reassembled `Bytea` / `Text` payload; abort drops the buffer plus
-//! any spill file.
+//! Holds every [`DecodedHeap`] + TOAST chunk for an xid until the
+//! matching `XLOG_XACT_COMMIT` / `XLOG_XACT_ABORT` lands. Commit drains
+//! in WAL order substituting each `ColumnValue::ExternalToast` with its
+//! reassembled `Bytea` / `Text`; abort drops buffer + spill file.
 //!
-//! ## Why bundle TOAST chunks into the same buffer as heap tuples
+//! ## Why bundle TOAST chunks with heap tuples
 //!
-//! PG's `toast_save_datum` writes chunk INSERTs in the same xact as
-//! the referring tuple. Keeping both inside one `XactState` gives:
+//! PG `toast_save_datum` writes chunk INSERTs in the same xact as the
+//! referring tuple, so one `XactState` keyed by `xid` covers both. WAL
+//! order is natural since heap + chunk records interleave on disk, and
+//! detoast at drain means chunk-vs-tuple arrival order is moot.
 //!
-//! * Single key (`xid`) for spill, eviction, drain, abort cleanup.
-//! * WAL-order natural — heap and chunk records interleave on disk;
-//!   sequential drain matches what downstream `ReplacingMergeTree`
-//!   expects.
-//! * Chunks arriving before / after the referring tuple are a
-//!   non-issue: detoast happens at drain, by which point every chunk
-//!   for every value in the xact is already buffered.
-//!
-//! Cross-xact chunks would matter only for PG's `streaming=on` mode,
-//! which walshadow does not implement (streaming mid-xact is
-//! deferred).
+//! Cross-xact chunks would matter only for PG `streaming=on`, which
+//! walshadow does not implement.
 //!
 //! ## Catalog access at drain
 //!
-//! Detoasting needs the original column's type OID to decide
-//! `Bytea` vs `Text`. Drain calls
+//! Detoast needs the column's type OID to pick `Bytea` vs `Text`. Drain
+//! calls
 //! [`ShadowCatalog::relation_at`](crate::shadow_catalog::ShadowCatalog::relation_at)
-//! on each heap whose `tuple_needs_detoast` returns true; the
-//! catalog's own LRU caches the descriptor across repeat lookups,
-//! so a buffer-internal cache would just duplicate that surface.
-//! Heaps without TOAST columns never hit the catalog at drain.
+//! per heap needing detoast; the catalog's LRU covers repeat lookups so
+//! a buffer-internal cache would duplicate it.
 //!
 //! ## Spill policy
 //!
-//! Once `memory_used > config.xact_buffer_max`, [`XactBuffer`] picks
-//! the largest in-memory xact and flushes its entries to a
-//! [`SpillWriter`] under `spill_dir`. The
-//! xact stays "open" — subsequent records keep appending to the spill
-//! file. Mirrors PG `ReorderBufferLargestTXN` (logical-decoding's same
-//! problem in `~/s/postgresql/src/backend/replication/logical/reorderbuffer.c`).
+//! Once `memory_used > config.xact_buffer_max`, flush the largest
+//! in-memory xact to a [`SpillWriter`]; the xact stays open and later
+//! records append to the file. Mirrors PG `ReorderBufferLargestTXN`
+//! (`~/s/postgresql/src/backend/replication/logical/reorderbuffer.c`).
 //!
-//! Drain pass: spilled entries first (older in WAL order), then
-//! in-memory entries (newer). Eviction always flushes from the front
-//! of `in_mem`, so the invariant "spilled is older than in-mem" holds.
+//! Drain: spilled entries first (older), then in-mem. Eviction always
+//! flushes from front of `in_mem`, holding "spilled older than in-mem".
 //!
-//! Spill-to-ClickHouse is reserved as design space (Option B) —
-//! config knob, schema, and code path are left for a
-//! follow-up when a diskless walshadow operator asks. v1 is
-//! local-disk-only.
-//!
-//! ## Status counters
-//!
-//! `xact_buffer_active`, `xacts_buffered_total`, `spill_bytes_active`,
-//! `spill_xacts_active`, `spill_evictions_total`,
-//! `aborted_xacts_total`, `committed_xacts_total`. Surfaced via
-//! [`XactBufferStats`] and rendered in the daemon's status line by
-//! [`XactBufferStats::summary`].
+//! Spill-to-ClickHouse (Option B) is deferred; v1 is local-disk-only.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -83,26 +56,23 @@ use crate::wal_stream::{Record, RecordSink, SinkError};
 
 use std::pin::Pin;
 
-/// Default in-memory budget: matches PG's `logical_decoding_work_mem`
-/// default (64 MiB, `~/s/postgresql/src/backend/utils/misc/guc_tables.c`
-/// L2611). Large enough that small xacts never spill, small enough
-/// that one runaway xact doesn't OOM the daemon.
+/// Matches PG `logical_decoding_work_mem` default 64 MiB
+/// (`~/s/postgresql/src/backend/utils/misc/guc_tables.c`)
 pub const DEFAULT_XACT_BUFFER_MAX: usize = 64 * 1024 * 1024;
 
-/// XLOG_XACT info-op constants. Mirror PG `access/xact.h` L169-179.
+/// XLOG_XACT info-op constants, PG `access/xact.h`
 pub(crate) const XLOG_XACT_OPMASK: u8 = 0x70;
 pub(crate) const XLOG_XACT_COMMIT: u8 = 0x00;
 pub(crate) const XLOG_XACT_ABORT: u8 = 0x20;
 pub(crate) const XLOG_XACT_COMMIT_PREPARED: u8 = 0x30;
 pub(crate) const XLOG_XACT_ABORT_PREPARED: u8 = 0x40;
 pub(crate) const XLOG_XACT_ASSIGNMENT: u8 = 0x50;
-/// `xinfo` field follows the leading `xact_time` when this bit is set
-/// in the record header's `info`. `access/xact.h` L182.
+/// When set in record header `info`, `xinfo` u32 follows `xact_time`.
+/// PG `access/xact.h`
 pub(crate) const XLOG_XACT_HAS_INFO: u8 = 0x80;
 
-/// `xinfo` bits driving xl_xact_commit / xl_xact_abort tail layout.
-/// `access/xact.h` L188-196. The commit/abort parser only consumes
-/// `HAS_SUBXACTS`; remaining flags drive skip-walk.
+/// `xinfo` bits driving xl_xact_commit / xl_xact_abort tail layout, PG
+/// `access/xact.h`. Parser consumes `HAS_SUBXACTS`; rest drive skip-walk
 const XACT_XINFO_HAS_DBINFO: u32 = 1 << 0;
 const XACT_XINFO_HAS_SUBXACTS: u32 = 1 << 1;
 const XACT_XINFO_HAS_RELFILELOCATORS: u32 = 1 << 2;
@@ -112,16 +82,13 @@ const XACT_XINFO_HAS_ORIGIN: u32 = 1 << 5;
 const XACT_XINFO_HAS_GID: u32 = 1 << 7;
 const XACT_XINFO_HAS_DROPPED_STATS: u32 = 1 << 8;
 
-/// Maps PG subxact xids to their top-level xid. Built from
-/// `XLOG_XACT_ASSIGNMENT` (info `0x50`) records arriving on the xact
-/// resource manager. The tracker keeps both directions so
-/// `forget_tree` runs O(k) over actual children rather than scanning
-/// every entry in `parent`.
+/// Maps PG subxact xids to top-level xid, built from
+/// `XLOG_XACT_ASSIGNMENT` (info `0x50`) records.
 ///
-/// Tracker is a hint, not a correctness gate: PG batches the first 64
-/// subxacts under `PGPROC_MAX_CACHED_SUBXIDS` and emits no assignment
-/// for that window. The authoritative list arrives inline with
-/// commit / abort records; tracker drives early eviction policy only.
+/// Hint, not correctness gate: PG batches first 64 subxacts under
+/// `PGPROC_MAX_CACHED_SUBXIDS` and emits no assignment for that window.
+/// Authoritative list arrives inline on commit / abort; tracker drives
+/// early eviction policy only.
 #[derive(Debug, Default)]
 pub struct SubxactTracker {
     parent: HashMap<u32, u32>,
@@ -133,14 +100,13 @@ impl SubxactTracker {
         Self::default()
     }
 
-    /// Record that every `subxid` belongs to `top_xid`. Repeated
-    /// assignments for the same subxid keep the most recent top.
+    /// Repeated assignments for a subxid keep most recent top
     pub fn assign(&mut self, top_xid: u32, subxids: &[u32]) {
         if subxids.is_empty() {
             return;
         }
-        // Two-phase to avoid holding a `&mut Vec` from `children[top]`
-        // while also walking `children[prev_top]` on retargets.
+        // Two-phase: avoid holding `&mut children[top]` while walking
+        // `children[prev_top]` on retargets
         for &s in subxids {
             if let Some(prev_top) = self.parent.insert(s, top_xid)
                 && prev_top != top_xid
@@ -157,46 +123,39 @@ impl SubxactTracker {
         }
     }
 
-    /// Resolve `xid` to its top. Unmapped xids return themselves —
-    /// matches PG's "subxact's top is itself when no ASSIGNMENT
-    /// landed yet" semantics so callers can treat top + sub uniformly.
+    /// Unmapped xids return themselves, matching PG "subxact's top is
+    /// itself when no ASSIGNMENT landed yet"
     pub fn top_for(&self, xid: u32) -> u32 {
         self.parent.get(&xid).copied().unwrap_or(xid)
     }
 
-    /// Drop every mapping rooted at `top_xid`. Called once the top
-    /// commits or aborts and the tracker's hint is no longer useful.
     pub fn forget_tree(&mut self, top_xid: u32) {
         if let Some(subs) = self.children.remove(&top_xid) {
             for s in subs {
                 self.parent.remove(&s);
             }
         }
-        // top_xid might itself be a subxact in another tree (shouldn't
-        // happen on the commit / abort path but cheap to scrub).
+        // top_xid might be a subxact in another tree (shouldn't happen on
+        // commit / abort path, cheap to scrub)
         self.parent.remove(&top_xid);
     }
 
-    /// Return the recorded subxids for `top_xid`. Caller's slice for
-    /// drain ordering; tracker keeps its own buckets intact.
     pub fn subxids_of(&self, top_xid: u32) -> Vec<u32> {
         self.children.get(&top_xid).cloned().unwrap_or_default()
     }
 }
 
-/// Parsed body of `xl_xact_commit` / `xl_xact_abort`. Today's consumer
-/// only needs the timestamp + subxact list; remaining xinfo tails are
-/// skip-walked through but unread.
+/// Parsed body of `xl_xact_commit` / `xl_xact_abort`. Consumer needs
+/// only timestamp + subxact list; remaining xinfo tails are skip-walked
 #[derive(Debug, Default)]
 pub(crate) struct XactCommitPayload {
     pub(crate) xact_time: i64,
     pub(crate) subxacts: Vec<u32>,
 }
 
-/// `xl_xact_assignment` payload (`access/xact.h` L218-225). Returns
-/// `(xtop, subxids)` from `main_data`. `xtop` is canonical — the
-/// record header's `xact_id` is the same value in steady state, but
-/// the payload is the documented source of truth.
+/// Parse `xl_xact_assignment` (PG `access/xact.h`) into `(xtop,
+/// subxids)`. `xtop` is canonical: header `xact_id` matches in steady
+/// state but payload is documented source of truth.
 pub(crate) fn parse_xact_assignment(main_data: &[u8]) -> Option<(u32, Vec<u32>)> {
     if main_data.len() < 8 {
         return None;
@@ -221,15 +180,13 @@ pub(crate) fn parse_xact_assignment(main_data: &[u8]) -> Option<(u32, Vec<u32>)>
     Some((xtop, subs))
 }
 
-/// Walk `xl_xact_commit` / `xl_xact_abort` main_data following the
-/// `xinfo` tail order from `xactdesc.c::ParseCommitRecord` /
-/// `ParseAbortRecord`. Returns `XactCommitPayload::default()` on any
-/// short read so the decoder degrades to "commit_ts unknown, no
-/// subxact list" rather than poisoning the stream.
+/// Walk `xl_xact_commit` / `xl_xact_abort` main_data per the `xinfo`
+/// tail order in PG `xactdesc.c::ParseCommitRecord` / `ParseAbortRecord`.
+/// Short read returns default so decoder degrades to "commit_ts unknown,
+/// no subxacts" rather than poisoning the stream.
 ///
-/// `info` is the record header's `info` byte. `XLOG_XACT_HAS_INFO`
-/// (`0x80`) gates the `xinfo` u32 immediately after `xact_time`. The
-/// commit-prepared / abort-prepared codepaths set the same flag.
+/// `info` is record header `info`; `XLOG_XACT_HAS_INFO` (`0x80`) gates
+/// the `xinfo` u32 after `xact_time`. Commit/abort-prepared set it too.
 pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayload {
     let mut out = XactCommitPayload::default();
     if main_data.len() < 8 {
@@ -248,7 +205,7 @@ pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayloa
         0
     };
     if xinfo & XACT_XINFO_HAS_DBINFO != 0 {
-        // dbId + tsId, 2x Oid (4 bytes each).
+        // dbId + tsId, 2x Oid
         if main_data.len() < p + 8 {
             return out;
         }
@@ -277,12 +234,10 @@ pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayloa
         p += n * 4;
         out.subxacts = subs;
     }
-    // Remaining tails are skip-walked. None of them feed the buffer
-    // today; the loop exists so the caller's `p` would stay sane if a
-    // future change reads beyond subxacts.
+    // Remaining tails skip-walked only to keep `p` valid for a future
+    // reader; none feed the buffer today
     if xinfo & XACT_XINFO_HAS_RELFILELOCATORS != 0 {
-        // int32 nrels + RelFileLocator (spc Oid, db Oid, rel Oid) =
-        // 4 bytes + 12 per entry.
+        // int32 nrels + RelFileLocator (spc/db/rel Oid): 4 + 12 per entry
         if main_data.len() < p + 4 {
             return out;
         }
@@ -298,8 +253,8 @@ pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayloa
         p += skip;
     }
     if xinfo & XACT_XINFO_HAS_DROPPED_STATS != 0 {
-        // int32 nitems + xl_xact_stats_item (int kind + Oid dboid +
-        // 2x uint32 objid) = 4 + 16 per entry.
+        // int32 nitems + xl_xact_stats_item (kind + dboid + 2x objid):
+        // 4 + 16 per entry
         if main_data.len() < p + 4 {
             return out;
         }
@@ -315,8 +270,8 @@ pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayloa
         p += skip;
     }
     if xinfo & XACT_XINFO_HAS_INVALS != 0 {
-        // commit-only tail; abort never sets this bit per xactdesc.c.
-        // int32 nmsgs + SharedInvalidationMessage (16 bytes each).
+        // commit-only per xactdesc.c; int32 nmsgs +
+        // SharedInvalidationMessage (16 bytes each)
         if main_data.len() < p + 4 {
             return out;
         }
@@ -332,13 +287,13 @@ pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayloa
         p += skip;
     }
     if xinfo & XACT_XINFO_HAS_TWOPHASE != 0 {
-        // xl_xact_twophase: TransactionId (4 bytes).
+        // xl_xact_twophase: TransactionId (4 bytes)
         if main_data.len() < p + 4 {
             return out;
         }
         p += 4;
         if xinfo & XACT_XINFO_HAS_GID != 0 {
-            // null-terminated GID; walk to the terminator.
+            // null-terminated GID
             let rest = &main_data[p..];
             let nul = rest.iter().position(|&b| b == 0);
             match nul {
@@ -348,20 +303,17 @@ pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayloa
         }
     }
     if xinfo & XACT_XINFO_HAS_ORIGIN != 0 {
-        // xl_xact_origin: XLogRecPtr (8) + TimestampTz (8). Unaligned
-        // per the comment in xactdesc.c.
+        // xl_xact_origin: XLogRecPtr (8) + TimestampTz (8), unaligned per
+        // xactdesc.c
         if main_data.len() < p + 16 {
             return out;
         }
-        // not read, just consume.
         let _ = p;
     }
     out
 }
 
-/// Pull the `source_lsn` off a `SpillEntry`. Heaps and chunks both
-/// stamp the WAL LSN at decode time; the buffer's merge-drain across
-/// `top + subxids` orders entries by this field.
+/// `source_lsn` is the WAL LSN stamped at decode; merge-drain orders by it
 fn entry_lsn(e: &SpillEntry) -> u64 {
     match e {
         SpillEntry::Heap(h) => h.source_lsn,
@@ -371,12 +323,9 @@ fn entry_lsn(e: &SpillEntry) -> u64 {
 
 #[derive(Debug, Clone)]
 pub struct XactBufferConfig {
-    /// In-memory budget across every active xact before eviction
-    /// kicks in. Sum of `XactState::in_mem_bytes` over [`XactBuffer`].
+    /// In-memory budget across all active xacts before eviction
     pub xact_buffer_max: usize,
-    /// Per-xid spill files land here. Created on [`XactBuffer::new`]
-    /// if missing; cleared by [`XactBuffer::clear_spill_dir`] at
-    /// startup.
+    /// Per-xid spill files land here
     pub spill_dir: PathBuf,
 }
 
@@ -421,40 +370,27 @@ impl From<XactBufferError> for DecoderSinkError {
 
 #[derive(Debug, Default, Clone)]
 pub struct XactBufferStats {
-    /// Xacts currently buffered (in-memory or partly spilled).
     pub xacts_active: u64,
-    /// Bytes of [`DecodedHeap`] / [`ToastChunk`] held in memory.
-    /// Bookkeeping-only — actual heap allocation may differ.
+    /// Bookkeeping estimate; actual heap allocation may differ
     pub bytes_in_memory: u64,
-    /// Total xacts buffered since startup.
     pub xacts_total: u64,
-    /// Xacts with a non-empty spill file right now.
     pub spill_xacts_active: u64,
-    /// Bytes written to spill files for active xacts. Drops as
-    /// commits/aborts drain the files.
     pub spill_bytes_active: u64,
-    /// Total spill evictions since startup.
     pub spill_evictions_total: u64,
-    /// Total xacts committed (drained successfully).
     pub committed_xacts_total: u64,
-    /// Total xacts aborted (buffer dropped).
     pub aborted_xacts_total: u64,
-    /// Counts of `COMMIT` records observed for xids the buffer
-    /// never saw — i.e. read-only or filtered-out xacts.
+    /// `COMMIT` records for xids never buffered (read-only/filtered)
     pub commits_unknown_xid: u64,
-    /// Same shape for aborts: xids we never buffered. Higher counts
-    /// here than for `commits_unknown_xid` are expected since aborts
-    /// often happen on xacts that never wrote anything.
+    /// Aborts for xids never buffered. Runs higher than
+    /// `commits_unknown_xid`: aborts often hit xacts that wrote nothing
     pub aborts_unknown_xid: u64,
-    /// Highest commit-record LSN drained out of the buffer
-    /// into the observer's `on_tuple` chain. Snapshot for the cursor
-    /// file's `drain_lsn`. Monotonic.
+    /// Highest commit-record LSN drained into observer `on_tuple`.
+    /// Snapshot for cursor `drain_lsn`, monotonic
     pub drain_lsn: u64,
-    /// Highest commit-record LSN where the observer's
-    /// `on_xact_end` reported durable on the downstream sink. Snapshot
-    /// for `cursor.emitter_ack_lsn`. Monotonic. Lags `drain_lsn`
-    /// whenever the observer (CH emitter with `flush_timeout > 0`)
-    /// holds rows in still-open INSERTs.
+    /// Highest commit-record LSN observer `on_xact_end` reported durable.
+    /// Snapshot for `cursor.emitter_ack_lsn`, monotonic. Lags `drain_lsn`
+    /// when observer (CH emitter `flush_timeout > 0`) holds rows in open
+    /// INSERTs
     pub emitter_ack_lsn: u64,
 }
 
@@ -484,25 +420,17 @@ impl XactBufferStats {
 }
 
 struct XactState {
-    /// First WAL LSN of the xact — sticky across spill rotations,
-    /// distinguishes two xids that collide post slot rebuild.
+    /// Sticky across spill rotations; distinguishes two xids that collide
+    /// after a slot rebuild
     first_lsn: u64,
-    /// Entries pending memory→spill. WAL-order by arrival.
+    /// WAL-order by arrival
     in_mem: Vec<SpillEntry>,
-    /// Approximate bytes held by `in_mem`.
     in_mem_bytes: usize,
-    /// Spill file. `None` until first eviction.
+    /// `None` until first eviction
     spill: Option<SpillWriter>,
-    /// Bytes written to spill so far. Mirrors `spill.as_ref().byte_count()`
-    /// to keep the stat updater branch-free.
     spill_bytes: u64,
-    /// Catalog events buffered with the xact, ordered
-    /// by source_lsn ASC. Not spilled (the data inside an `Added`
-    /// / `Changed` event is rich enough that a spill format would
-    /// duplicate `RelDescriptor` decoding; the practical case has at
-    /// most a handful of DDL events per xact). If memory pressure
-    /// becomes a concern, a later phase can encode the events as
-    /// SpillEntry variants and reuse the eviction path.
+    /// source_lsn ASC. Not spilled: events carry rich `RelDescriptor`
+    /// data a spill format would duplicate, and DDL per xact is rare
     catalog_events: Vec<(u64, SchemaEvent)>,
 }
 
@@ -519,11 +447,8 @@ impl XactState {
     }
 }
 
-/// Approximate byte cost of one [`DecodedHeap`] / [`ToastChunk`] for
-/// the in-memory accounting. Exact heap allocation is hard to count
-/// without re-walking every `Vec` / `String`; this estimate is good
-/// enough for the threshold decision and lets eviction kick in before
-/// process RSS blows up.
+/// Approximate byte cost for in-memory accounting; estimate, not exact
+/// heap allocation. Good enough for the eviction threshold
 fn approximate_size(entry: &SpillEntry) -> usize {
     match entry {
         SpillEntry::Heap(h) => {
@@ -558,32 +483,26 @@ fn value_size(v: &ColumnValue) -> usize {
     }
 }
 
-/// One entry per inflight xid produced by
-/// [`XactBuffer::inflight_snapshot`]. Diagnostic surface for "a commit
-/// for this xid never arrived" investigations — fields cover the four
-/// pre-commit absorption paths (heap, chunk, schema event, spill).
+/// Diagnostic surface for "a commit for this xid never arrived";
+/// fields cover the four pre-commit absorption paths
 #[derive(Debug, Clone)]
 pub struct InflightSnapshotEntry {
     pub xid: u32,
     pub first_lsn: u64,
-    /// Max source_lsn across heaps + chunks + catalog events for this
-    /// xid. Distance from `first_lsn` shows how long the xact has been
-    /// open in WAL terms.
+    /// Max source_lsn over heaps + chunks + catalog events; distance from
+    /// `first_lsn` shows how long the xact has been open in WAL terms
     pub last_lsn: u64,
     pub heap_count: u64,
     pub chunk_count: u64,
     pub in_mem_bytes: u64,
     pub spilled: bool,
     pub catalog_events: u64,
-    /// `(db_node, rel_node)` pairs touched by this xact, comma-joined.
-    /// Cross-reference against shadow's `pg_class.relfilenode` to name
-    /// the table without paying for a catalog lookup on every snapshot.
+    /// `(db_node, rel_node)` comma-joined; cross-reference shadow's
+    /// `pg_class.relfilenode` to name the table without a catalog lookup
     pub rels: String,
 }
 
-/// Per-xact + TOAST buffer with spill-to-disk overflow. Holds
-/// everything keyed by `xid`; chunk lookups inside an xact happen via
-/// a `(toast_relid, value_id)` walk at drain.
+/// Per-xact + TOAST buffer with spill-to-disk overflow, keyed by `xid`
 pub struct XactBuffer {
     config: XactBufferConfig,
     store: SpillStore,
@@ -604,10 +523,9 @@ impl XactBuffer {
         })
     }
 
-    /// Clear leftover spill files from a prior crash. Cursor file
-    /// guarantees on-disk state was either drained-to-CH or
-    /// replayable from `decoder_lsn`, so the spill dir is always
-    /// safe to wipe at startup. Caller invokes once before any `on_*`.
+    /// Clear leftover spill files from a prior crash. Safe to wipe: cursor
+    /// file guarantees state was drained-to-CH or replayable from
+    /// `decoder_lsn`. Call once before any `on_*`
     pub async fn clear_spill_dir(&self) -> std::result::Result<(), XactBufferError> {
         self.store.clear().await?;
         Ok(())
@@ -617,12 +535,8 @@ impl XactBuffer {
         &self.stats
     }
 
-    /// Snapshot every xid currently parked in `inflight`, with its
-    /// first-seen `source_lsn` and the (heap, chunk, catalog) sizes the
-    /// drain would process. Sorted by xid for deterministic dumps.
-    /// Diagnostic only — pump-side `populate_metrics` uses it for the
-    /// `walshadow_xact_inflight` text exposition when xacts pile up
-    /// past a quiescent source.
+    /// Sorted by xid. Diagnostic only: pump-side `populate_metrics` feeds
+    /// it into `walshadow_xact_inflight` when xacts pile up
     pub fn inflight_snapshot(&self) -> Vec<InflightSnapshotEntry> {
         let mut out: Vec<InflightSnapshotEntry> = self
             .inflight
@@ -672,12 +586,8 @@ impl XactBuffer {
         out
     }
 
-    /// Buffer a decoded heap tuple. The descriptor needed to detoast
-    /// `ExternalToast` columns at drain is fetched from
-    /// [`ShadowCatalog`] on demand inside
-    /// [`XactBuffer::commit`] — the buffer deliberately does not keep
-    /// its own per-xact rel cache, the catalog's own LRU already
-    /// covers the repeat-lookup path.
+    /// Detoast descriptor is fetched in [`XactBuffer::commit`] on demand:
+    /// no per-xact rel cache here, catalog's LRU covers repeat lookups
     pub async fn on_heap(
         &mut self,
         decoded: DecodedHeap,
@@ -688,9 +598,7 @@ impl XactBuffer {
         self.absorb(xid, first_lsn, entry).await
     }
 
-    /// Buffer one TOAST chunk. Decoder sink builds these from
-    /// `pg_toast.pg_toast_<rel>` INSERTs that the filter classified
-    /// as `User`.
+    /// Built from `pg_toast.pg_toast_<rel>` INSERTs by the decoder sink
     pub async fn on_toast_chunk(
         &mut self,
         chunk: ToastChunk,
@@ -701,12 +609,8 @@ impl XactBuffer {
         self.absorb(xid, first_lsn, entry).await
     }
 
-    /// Buffer a [`SchemaEvent`] keyed on `xid`. Drains
-    /// alongside heap tuples + chunks at `commit` time in `source_lsn`
-    /// order, so an `Added`/`Changed` event triggered by a DDL within
-    /// the same xact lands BEFORE the heap writes that follow it.
-    /// Aborted xacts drop their events automatically with the rest of
-    /// the per-xid buffer.
+    /// Drains in `source_lsn` order at commit, so a DDL's `Added`/`Changed`
+    /// event lands BEFORE the heap writes that follow it
     pub fn on_schema_event(&mut self, xid: u32, source_lsn: u64, event: SchemaEvent) {
         let is_new = !self.inflight.contains_key(&xid);
         let st = self
@@ -733,8 +637,7 @@ impl XactBuffer {
             .entry(xid)
             .or_insert_with(|| XactState::new(first_lsn));
         if let Some(spill) = st.spill.as_mut() {
-            // Xact already spilling — append straight to disk to keep
-            // memory pressure flat.
+            // Already spilling: append straight to disk
             spill.write(&entry).await?;
             let bc = spill.byte_count();
             self.stats.spill_bytes_active += bc - st.spill_bytes;
@@ -755,7 +658,6 @@ impl XactBuffer {
 
     async fn maybe_evict(&mut self) -> std::result::Result<(), XactBufferError> {
         while self.bytes_in_memory > self.config.xact_buffer_max {
-            // Pick the largest live in-memory xact.
             let largest = self
                 .inflight
                 .iter()
@@ -763,9 +665,8 @@ impl XactBuffer {
                 .max_by_key(|(_, s)| s.in_mem_bytes)
                 .map(|(xid, _)| *xid);
             let Some(xid) = largest else {
-                // Nothing left to evict — every active xact already on
-                // disk. Caller pushing into spilled xacts faster than
-                // the budget allows; in-memory part stays at floor.
+                // All active xacts already on disk; caller pushing into
+                // spilled xacts faster than budget allows
                 break;
             };
             self.evict_xact(xid).await?;
@@ -798,19 +699,14 @@ impl XactBuffer {
         Ok(())
     }
 
-    /// Drain xact `xid` to `observer` in WAL order. Substitutes every
-    /// `ExternalToast` column with its reassembled `Bytea` / `Text`
-    /// value via [`ShadowCatalog::relation_at`] on the catalog passed
-    /// by the caller. Heaps without TOAST columns never hit the
-    /// catalog. No-op if `xid` is unknown (read-only xact, or one
-    /// whose records the filter dropped before reaching the buffer).
+    /// Drain xact `xid` to `observer` in WAL order, substituting each
+    /// `ExternalToast` with its reassembled `Bytea` / `Text` via
+    /// [`ShadowCatalog::relation_at`]. No-op for unknown `xid`
+    /// (read-only or filter-dropped).
     ///
-    /// `commit_lsn` is the LSN of the `XLOG_XACT_COMMIT` record itself.
-    /// Stamped into [`CommittedTuple::commit_lsn`] for the
-    /// emitter's ack tracker, and bumped into
-    /// [`XactBufferStats::drain_lsn`] / `emitter_ack_lsn` on the
-    /// successful-drain path so the cursor file's resume gate has a
-    /// monotonic high-water mark.
+    /// `commit_lsn` is the `XLOG_XACT_COMMIT` record LSN, stamped into
+    /// [`CommittedTuple::commit_lsn`] and bumped into `drain_lsn` /
+    /// `emitter_ack_lsn` as the cursor resume gate's monotonic mark.
     pub async fn commit<O: TupleObserver>(
         &mut self,
         top_xid: u32,
@@ -820,10 +716,8 @@ impl XactBuffer {
         catalog: &Arc<Mutex<ShadowCatalog>>,
         observer: &mut O,
     ) -> std::result::Result<(), XactBufferError> {
-        // Pull every xid in the commit tree out of `inflight`. Subxids
-        // we never buffered (catalog-only writes, filter-dropped) skip
-        // silently — only the top counts for `commits_unknown_xid` so
-        // the metric stays a per-xact rate, not per-subxid.
+        // Only the top counts for `commits_unknown_xid` so the metric
+        // stays per-xact, not per-subxid
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
         xids.push(top_xid);
         xids.extend_from_slice(subxids);
@@ -836,13 +730,11 @@ impl XactBuffer {
 
         if states.is_empty() {
             self.stats.commits_unknown_xid += 1;
-            // Read-only / filter-dropped xacts still advance the
-            // emitter-ack ceiling — source's slot can recycle WAL up to
-            // their commit LSN without losing anything we'd have shipped.
-            // Route through `on_xact_end` anyway so an observer that
-            // holds prior xacts' rows in still-open inserts can clamp
-            // the ack at its own durable horizon (otherwise we'd claim
-            // durability for rows still buffered client-side).
+            // Read-only / filter-dropped still advances the ack ceiling so
+            // the slot can recycle WAL up to commit_lsn. Route through
+            // `on_xact_end` anyway so an observer holding prior rows in
+            // open inserts clamps the ack at its own durable horizon,
+            // else we'd claim durability for client-buffered rows
             self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
             let ack_lsn = observer
                 .on_xact_end(commit_lsn)
@@ -851,18 +743,14 @@ impl XactBuffer {
             self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
             return Ok(());
         }
-        // Active counter ticks down once per drained xact (top + subs).
         for st in &states {
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
 
-        // Drain spill files first (older in WAL order) per xid, then
-        // tack on in-mem entries. Result: one `VecDeque<SpillEntry>` per
-        // xid already sorted by `source_lsn` ASC. Catalog events ride a
-        // sibling `VecDeque<(u64, SchemaEvent)>` per xid for the k-way
-        // merge below — they don't spill.
+        // Spill (older) first, then in-mem: one `source_lsn`-ASC deque
+        // per xid. Catalog events ride a sibling deque (never spilled)
         let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
         let mut per_xid_catalog: Vec<VecDeque<(u64, SchemaEvent)>> =
             Vec::with_capacity(states.len());
@@ -881,24 +769,14 @@ impl XactBuffer {
             }
             entries.extend(in_mem);
             per_xid.push(entries);
-            // Catalog events accumulate in arrival order; arrival order
-            // matches WAL order because the decoder sink pushes
-            // immediately on observe, so we can treat the Vec as already
-            // sorted ASC by source_lsn.
+            // Arrival order == WAL order: decoder sink pushes on observe,
+            // so the Vec is already source_lsn ASC
             let cat: VecDeque<(u64, SchemaEvent)> = std::mem::take(&mut st.catalog_events).into();
             per_xid_catalog.push(cat);
         }
 
-        // k-way merge over per_xid heads by `source_lsn` ASC. k = 1 +
-        // nsubxacts, typically <= 4; linear-scan head pick beats a
-        // tournament heap at this size. Each item routes into one of
-        // three sinks:
-        //   * Heap entries collect into `heaps` for post-pass detoast +
-        //     dispatch.
-        //   * Chunks fold into `chunks`, keyed by (toast_relid, value_id).
-        //   * Catalog events accumulate into `ordered_events` with the
-        //     heap-index they sort BEFORE, so dispatch interleaves
-        //     catalog events with tuples in source_lsn order.
+        // k-way merge of per_xid heads by `source_lsn` ASC. k = 1 +
+        // nsubxacts, typically <= 4, so linear head-pick beats a heap
         let mut heaps: Vec<DecodedHeap> = Vec::new();
         let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
         let mut ordered_events: Vec<(usize, SchemaEvent)> = Vec::new();
@@ -912,14 +790,11 @@ impl XactBuffer {
             let best_lsn = |p: Pick| match p {
                 Pick::Spill(_, l) | Pick::Catalog(_, l) => l,
             };
-            // Pick catalog events FIRST at any tie: PG always writes
-            // the DDL's catalog mutation BEFORE the heap write that
-            // depends on it. When [`BufferingDecoderSink`] stamps a
-            // schema event with the triggering heap's source_lsn (the
-            // catalog refetch is lazy), the two share an LSN; tie-
-            // break catalog first so the applicator's `ALTER` lands
-            // on CH before the dependent INSERT encodes against the
-            // post-DDL shape.
+            // Catalog wins ties: PG writes the DDL catalog mutation before
+            // the dependent heap, and the lazy refetch stamps the schema
+            // event with the triggering heap's source_lsn, so they share
+            // an LSN. Catalog-first lands the `ALTER` on CH before the
+            // dependent INSERT encodes against the post-DDL shape
             for (i, q) in per_xid_catalog.iter().enumerate() {
                 let Some(&(lsn, _)) = q.front() else {
                     continue;
@@ -945,10 +820,7 @@ impl XactBuffer {
                 }
                 Pick::Catalog(i, _) => {
                     let (_lsn, ev) = per_xid_catalog[i].pop_front().expect("just peeked head");
-                    // The catalog event sorts BEFORE the heap that
-                    // follows in source_lsn order. Record the heap
-                    // index that this event sorts in front of so the
-                    // dispatch loop flushes the event first.
+                    // Event sorts before heaps[heaps.len()]
                     ordered_events.push((heaps.len(), ev));
                 }
             }
@@ -956,7 +828,6 @@ impl XactBuffer {
 
         let mut event_cursor = 0usize;
         for (heap_idx, mut heap) in heaps.into_iter().enumerate() {
-            // Flush any catalog events that sort BEFORE this heap.
             while event_cursor < ordered_events.len() && ordered_events[event_cursor].0 <= heap_idx
             {
                 let ev = &ordered_events[event_cursor].1;
@@ -977,8 +848,7 @@ impl XactBuffer {
                 .await
                 .map_err(|e| XactBufferError::Observer(e.to_string()))?;
         }
-        // Flush trailing catalog events (events with no heap after them
-        // in the merge).
+        // Trailing events with no heap after them
         while event_cursor < ordered_events.len() {
             let ev = &ordered_events[event_cursor].1;
             observer
@@ -987,12 +857,10 @@ impl XactBuffer {
                 .map_err(|e| XactBufferError::Observer(e.to_string()))?;
             event_cursor += 1;
         }
-        // drain_lsn ticks before the on_xact_end ack so an observer
-        // failure leaves drain_lsn ahead of emitter_ack_lsn — exactly
-        // the gap the cursor file is designed to surface. With CH
-        // emitter's flush_timeout > 0, on_xact_end returns the last
-        // durable commit_lsn (possibly < commit_lsn for held-open
-        // inserts), so emitter_ack_lsn lags drain_lsn deliberately.
+        // drain_lsn ticks before the ack so an observer failure leaves
+        // drain_lsn ahead of emitter_ack_lsn, the gap the cursor surfaces.
+        // With CH flush_timeout > 0, on_xact_end returns last durable
+        // commit_lsn (<= commit_lsn), so emitter_ack_lsn lags by design
         self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
         let ack_lsn = observer
             .on_xact_end(commit_lsn)
@@ -1000,9 +868,6 @@ impl XactBuffer {
             .map_err(|e| XactBufferError::Observer(e.to_string()))?;
         let prev_ack = self.stats.emitter_ack_lsn;
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
-        // Trace ack progression — if observer keeps returning a stale
-        // value while commit_lsn marches forward, the ack pin shows up
-        // here.
         tracing::trace!(
             target: "walshadow::xact_buffer",
             top_xid,
@@ -1011,20 +876,16 @@ impl XactBuffer {
             prev_ack = format!("{:X}/{:X}", prev_ack >> 32, prev_ack as u32),
             "drain complete",
         );
-        // One bump per top, not per subxid: a top with N subs is a
-        // single user-facing transaction at COMMIT time.
+        // One bump per top, not per subxid
         self.stats.committed_xacts_total += 1;
         Ok(())
     }
 
-    /// Drain a committed xact for the parallel pipeline: pull its
-    /// buffered entries, k-way merge by `source_lsn`, and return the
-    /// ordered (still-toasted) heaps + TOAST chunk map + interleaved
-    /// schema events — *without* detoast or downstream dispatch (those move
-    /// to the decode pool / barrier coordinator). Updates buffer stats
-    /// (`xacts_active`, spill, `drain_lsn`, `committed_xacts_total`) exactly
-    /// like [`Self::commit`] does, but the durability watermark is the
-    /// pipeline ack collector's job, so `emitter_ack_lsn` is not touched.
+    /// Parallel-pipeline drain: k-way merge by `source_lsn`, return
+    /// still-toasted heaps + chunk map + interleaved events *without*
+    /// detoast or dispatch (those move to the decode pool / barrier
+    /// coordinator). Unlike [`Self::commit`], leaves `emitter_ack_lsn`
+    /// to the pipeline ack collector.
     pub async fn drain_committed(
         &mut self,
         top_xid: u32,
@@ -1041,12 +902,10 @@ impl XactBuffer {
                 states.push(st);
             }
         }
-        // drain_lsn marks the dispatch boundary regardless of contents.
         self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
         if states.is_empty() {
-            // Read-only / filter-dropped xact: no rows, but the reorder
-            // coordinator still registers a seq so the contiguous watermark
-            // can advance past `commit_lsn`.
+            // Read-only / filter-dropped: reorder coordinator still
+            // registers a seq so the contiguous watermark passes commit_lsn
             self.stats.commits_unknown_xid += 1;
             return Ok(DrainedXact {
                 commit_ts,
@@ -1063,9 +922,7 @@ impl XactBuffer {
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
 
-        // Spill files first (older), then in-mem entries, per xid; result is
-        // one `source_lsn`-ASC deque per xid for the k-way merge. Mirrors
-        // the drain in [`Self::commit`].
+        // Spill (older) then in-mem per xid, source_lsn-ASC; see [`Self::commit`]
         let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
         let mut per_xid_catalog: Vec<VecDeque<(u64, SchemaEvent)>> =
             Vec::with_capacity(states.len());
@@ -1143,15 +1000,12 @@ impl XactBuffer {
         })
     }
 
-    /// Idle-tick ack: advance `drain_lsn` to `lsn` (dispatched marker)
-    /// when no xact is in flight, and `emitter_ack_lsn` to
-    /// `min(lsn, ack_ceiling)`. Pump loop drives this after the queueing
-    /// worker drains a batch so source's slot can recycle past trailing
-    /// post-COMMIT WAL (page padding, RUNNING_XACTS, CHECKPOINT) when
-    /// quiescent. `ack_ceiling` is the observer's durable horizon: in
-    /// hold-open mode rows can sit in open INSERTs between commits, so
-    /// the ack must not jump past what the observer has made durable —
-    /// otherwise source recycles WAL the emitter hasn't written.
+    /// When no xact in flight, advance `drain_lsn` to `lsn` and
+    /// `emitter_ack_lsn` to `min(lsn, ack_ceiling)`. Lets the slot recycle
+    /// trailing post-COMMIT WAL (page padding, RUNNING_XACTS, CHECKPOINT)
+    /// when quiescent. `ack_ceiling` is the observer's durable horizon: in
+    /// hold-open mode rows sit in open INSERTs, so the ack must not pass
+    /// what's durable else source recycles unwritten WAL.
     pub fn advance_idle(&mut self, lsn: u64, ack_ceiling: u64) {
         if self.stats.xacts_active != 0 {
             return;
@@ -1160,17 +1014,15 @@ impl XactBuffer {
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(lsn.min(ack_ceiling));
     }
 
-    /// Fold an observer-reported durable LSN (e.g. from a deadline-
-    /// triggered idle close) into `emitter_ack_lsn`. Only advances the
-    /// ack; `drain_lsn` already covers commit boundaries.
+    /// Fold an observer-reported durable LSN into `emitter_ack_lsn` only;
+    /// `drain_lsn` already covers commit boundaries
     pub fn note_idle_durable(&mut self, lsn: u64) {
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(lsn);
     }
 
-    /// Discard xact `xid`. No-op if unknown. Wipes any spill file.
-    /// `abort_lsn` is the LSN of the `XLOG_XACT_ABORT` record itself;
-    /// advances `drain_lsn` / `emitter_ack_lsn` so the cursor file
-    /// records aborted xacts as fully consumed (nothing to ship).
+    /// Discard xact `xid` + spill file. No-op if unknown. `abort_lsn` is
+    /// the `XLOG_XACT_ABORT` record LSN; advances `drain_lsn` /
+    /// `emitter_ack_lsn` so the cursor counts aborts as fully consumed
     pub async fn abort(
         &mut self,
         xid: u32,
@@ -1179,12 +1031,11 @@ impl XactBuffer {
     ) -> std::result::Result<(), XactBufferError> {
         self.stats.drain_lsn = self.stats.drain_lsn.max(abort_lsn);
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(abort_lsn);
-        // `xid` is the header xact_id — top-xact abort, or subxact
-        // standalone-rollback. Either way, drop `xid` itself and every
-        // sub in `subxids`. For mid-xact subxact rollback (PG
-        // `RecordSubTransactionAbort` writes a separate `XLOG_XACT_ABORT`
-        // keyed on the sub xid), top's pre-savepoint entries stay
-        // keyed on top_xid in `inflight` and flush at the top's COMMIT.
+        // `xid` is header xact_id: top abort or subxact standalone
+        // rollback. Drop `xid` + every sub. For mid-xact subxact rollback
+        // (PG `RecordSubTransactionAbort` writes a separate
+        // `XLOG_XACT_ABORT` keyed on the sub), the top's pre-savepoint
+        // entries stay keyed on top_xid and flush at the top's COMMIT.
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
         xids.push(xid);
         xids.extend_from_slice(subxids);
@@ -1209,13 +1060,11 @@ impl XactBuffer {
             self.stats.aborts_unknown_xid += 1;
             return Ok(());
         }
-        // One bump per abort record, not per subxid — matches `commit`'s
-        // per-top accounting.
+        // One bump per abort record, not per subxid
         self.stats.aborted_xacts_total += 1;
         Ok(())
     }
 
-    /// xact ids currently held — test helper.
     #[cfg(test)]
     pub fn active_xids(&self) -> Vec<u32> {
         let mut v: Vec<u32> = self.inflight.keys().copied().collect();
@@ -1224,19 +1073,18 @@ impl XactBuffer {
     }
 }
 
-/// A committed xact drained for the parallel pipeline by
-/// [`XactBuffer::drain_committed`]. Heaps are still TOAST-toasted; the decode
-/// pool handles detoast, type resolution, and routing. A non-empty
-/// `ordered_events` (or a `HeapOp::Truncate` heap) makes this a barrier the
-/// reorder coordinator serializes against ClickHouse.
+/// Committed xact for the parallel pipeline. Heaps still TOAST-toasted;
+/// decode pool handles detoast + routing. Non-empty `ordered_events` (or
+/// a `HeapOp::Truncate` heap) makes this a barrier the reorder
+/// coordinator serializes against ClickHouse.
 pub struct DrainedXact {
     pub commit_ts: i64,
     pub commit_lsn: u64,
     pub heaps: Vec<DecodedHeap>,
     pub chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
-    /// `(heap_index, event)` — the event sorts before `heaps[heap_index]`.
+    /// Event sorts before `heaps[heap_index]`
     pub ordered_events: Vec<(usize, SchemaEvent)>,
-    /// False for a read-only / filter-dropped / unknown xid (no rows).
+    /// False for read-only / filter-dropped / unknown xid
     pub had_states: bool,
 }
 
@@ -1260,11 +1108,10 @@ pub(crate) async fn detoast_heap(
     heap: &mut DecodedHeap,
     chunks: &HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
     catalog: &Arc<Mutex<ShadowCatalog>>,
-    // The async decode pool can lag past a DDL and re-resolve an older heap,
-    // so it reuses the inline path's cached descriptor without mutating the
-    // cache or emitting schema events (see
-    // `ShadowCatalog::relation_at_pooled`). The WAL-ordered observer drain
-    // passes `false` to keep the normal cache-populating path.
+    // Async decode pool can lag past a DDL and re-resolve an older heap,
+    // so it reuses the inline cached descriptor without mutating cache or
+    // emitting events (`ShadowCatalog::relation_at_pooled`). WAL-ordered
+    // observer drain passes `false` for the normal cache-populating path.
     pooled: bool,
 ) -> std::result::Result<(), XactBufferError> {
     let needs = tuple_needs_detoast(heap.new.as_ref()) || tuple_needs_detoast(heap.old.as_ref());
@@ -1306,11 +1153,9 @@ fn detoast_tuple(
         let Some(ColumnValue::ExternalToast(p)) = col else {
             continue;
         };
-        // `ToastPointer: Copy` so the read-out frees the borrow on
-        // `col` before reassemble + assignment.
+        // `ToastPointer: Copy` frees the borrow on `col` before reassign
         let p: ToastPointer = *p;
         let raw = reassemble(&p, chunks)?;
-        // Look up the original column's type to decide Bytea vs Text.
         let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
         let new_value = match type_oid {
             crate::heap_decoder::BYTEAOID => ColumnValue::Bytea(raw),
@@ -1327,10 +1172,10 @@ fn detoast_tuple(
     Ok(())
 }
 
-/// PG `VARLENA_EXTSIZE_BITS` from `~/s/postgresql/src/include/varatt.h`.
+/// PG `VARLENA_EXTSIZE_BITS`, `~/s/postgresql/src/include/varatt.h`
 const VARLENA_EXTSIZE_BITS: u32 = 30;
 const VARLENA_EXTSIZE_MASK: u32 = (1u32 << VARLENA_EXTSIZE_BITS) - 1;
-/// PG `VARHDRSZ` — 4-byte varlena header.
+/// PG `VARHDRSZ`, 4-byte varlena header
 const VARHDRSZ: i32 = 4;
 
 const TOAST_COMPRESSION_PGLZ: u8 = 0;
@@ -1384,44 +1229,24 @@ fn reassemble(
     }
 }
 
-/// `RecordSink` that observes `RM_XACT_ID` records and drives the
-/// buffer's commit/abort path. Separate from [`BufferingDecoderSink`]
-/// because xact records are `Route::ToShadow` (shadow PG needs them
-/// for CLOG) so the decoder sink skips them by contract.
+/// `RecordSink` for `RM_XACT_ID` records. Separate from
+/// [`BufferingDecoderSink`] because xact records are `Route::ToShadow`
+/// (shadow PG needs them for CLOG) so the decoder sink skips them.
 pub struct XactRecordSink<O: TupleObserver + Send> {
     buffer: Arc<Mutex<XactBuffer>>,
-    /// Shared with `BufferingDecoderSink`. Drain calls
-    /// `relation_at` only for heaps with TOAST columns; everything
-    /// else doesn't touch the catalog.
     catalog: Arc<Mutex<ShadowCatalog>>,
-    /// Maps subxids to their top via
-    /// `XLOG_XACT_ASSIGNMENT`. Hint surface only — the canonical
-    /// subxact list arrives inline on commit / abort records and
-    /// drives the drain merge directly. Tracker covers eviction-
-    /// policy decisions that need to know the family before COMMIT.
+    /// Hint only: canonical subxact list arrives inline on commit / abort.
+    /// Tracker covers eviction policy needing the family before COMMIT
     subxact_tracker: Arc<Mutex<SubxactTracker>>,
-    /// Where committed tuples land. `XactBuffer::commit` calls
-    /// `observer.on_tuple` per drained tuple; production wires this
-    /// to the same `MetricsTupleObserver` the metrics path uses and the
-    /// CH emitter observer in production.
     observer: O,
-    /// Schema-event consumer. Same `Arc<Mutex<…>>` as the
-    /// one [`BufferingDecoderSink`] holds; this sink only drains it
-    /// post-`sweep_dropped` to route `Dropped` events into the xact
-    /// buffer.
+    /// Same handle [`BufferingDecoderSink`] holds; this sink drains it
+    /// post-`sweep_dropped` to route `Dropped` events into the buffer
     schema_events: Option<SchemaEventRx>,
-    /// DROP-only epoch counter (shared with
-    /// `ShadowCatalog::set_pg_class_delete_epoch` +
-    /// `CatalogTracker::set_pg_class_delete_epoch`). Atomic-load on
-    /// every commit boundary so the per-commit catalog-lock acquire
-    /// is skipped when no DROP TABLE has fired. The lock is contended
-    /// with `BufferingDecoderSink::on_record`'s long-running
-    /// `wait_for_replay` calls; holding it per commit serialised the
-    /// drain pipeline behind heap-record fetches in pgbench-rate
-    /// workloads.
+    /// Shared with `ShadowCatalog`/`CatalogTracker`
+    /// `set_pg_class_delete_epoch`. Atomic-load skips the per-commit
+    /// catalog-lock acquire when no DROP TABLE fired; that lock contends
+    /// with `wait_for_replay` and serialised the drain at pgbench rates
     pg_class_delete_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// Last `pg_class_delete_epoch` value already processed by the
-    /// sink. Bumped after a successful sweep.
     last_seen_delete_epoch: u64,
 }
 
@@ -1442,29 +1267,25 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
         }
     }
 
-    /// Wire a shared `SubxactTracker` (e.g. one owned by the daemon's
-    /// eviction policy). When unset the sink owns a private tracker.
+    /// Unset: sink owns a private tracker
     pub fn with_subxact_tracker(mut self, tracker: Arc<Mutex<SubxactTracker>>) -> Self {
         self.subxact_tracker = tracker;
         self
     }
 
-    /// Share the catalog's schema-event receiver. The
-    /// sink runs [`ShadowCatalog::sweep_dropped`] at every commit
-    /// boundary; the resulting `Dropped` events land in the channel
-    /// and need to flow into the xact buffer keyed on the commit's
-    /// xid + LSN. Pass the same [`SchemaEventRx`] also handed to
+    /// Sink runs [`ShadowCatalog::sweep_dropped`] per commit; resulting
+    /// `Dropped` events flow into the buffer keyed on the commit's
+    /// xid + LSN. Pass the same `rx` as
     /// [`BufferingDecoderSink::with_schema_events`].
     pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
         self.schema_events = Some(rx);
         self
     }
 
-    /// Install the DROP-only epoch counter. Pair with
+    /// Pair with
     /// [`crate::catalog_tracker::CatalogTracker::set_pg_class_delete_epoch`]
-    /// and [`ShadowCatalog::set_pg_class_delete_epoch`]; the sink uses
-    /// this counter to decide whether [`ShadowCatalog::sweep_dropped`]
-    /// has any work without acquiring the (contended) catalog lock.
+    /// and [`ShadowCatalog::set_pg_class_delete_epoch`]; gates
+    /// [`ShadowCatalog::sweep_dropped`] without the contended catalog lock.
     pub fn with_pg_class_delete_epoch(mut self, epoch: Arc<std::sync::atomic::AtomicU64>) -> Self {
         self.last_seen_delete_epoch = epoch.load(std::sync::atomic::Ordering::Acquire);
         self.pg_class_delete_epoch = Some(epoch);
@@ -1479,9 +1300,7 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
         &self.subxact_tracker
     }
 
-    /// Drain any [`SchemaEvent`]s queued by a recent
-    /// `ShadowCatalog::sweep_dropped` call (or other producer) and
-    /// route them into the xact buffer keyed on `(xid, source_lsn)`.
+    /// Route queued [`SchemaEvent`]s into the buffer keyed on `(xid, source_lsn)`
     async fn route_pending_schema_events(
         &mut self,
         xid: u32,
@@ -1518,24 +1337,14 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
             match op {
                 XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
                     let payload = parse_xact_payload(info, &record.parsed.main_data);
-                    // Poll-based DROP TABLE discovery at
-                    // the commit boundary. PG's system catalogs default
-                    // to `relreplident = 'n'` so heap_delete WAL records
-                    // don't carry the dying tuple's oid; the only safe
-                    // way to detect a drop is to ask shadow whether the
-                    // previously-known oids still exist. `has_pending_sweep`
-                    // gates on the narrower `pg_class_delete_epoch` so
-                    // ADD COLUMN / CREATE INDEX / VACUUM (catalog
-                    // INSERT / UPDATE flood) don't trigger the sweep —
-                    // only heap_delete on pg_class (the WAL signature
-                    // of DROP TABLE) tips this branch.
+                    // Poll-based DROP TABLE discovery at commit. PG system
+                    // catalogs default to `relreplident = 'n'`, so
+                    // heap_delete WAL omits the dying oid; only way to
+                    // detect a drop is asking shadow if known oids still
+                    // exist. Epoch gate fires only on heap_delete against
+                    // pg_class (DROP TABLE's WAL signature), not on the
+                    // ADD COLUMN / CREATE INDEX / VACUUM catalog flood.
                     if self.schema_events.is_some() {
-                        // Atomic-load gate: skip the catalog lock when
-                        // no DROP TABLE has fired since the last sweep.
-                        // The lock contends with `BufferingDecoderSink`'s
-                        // long-running `wait_for_replay` calls; holding
-                        // it per commit serialised pgbench-rate workloads
-                        // behind heap-record fetches.
                         let current_delete_epoch = self
                             .pg_class_delete_epoch
                             .as_ref()
@@ -1561,11 +1370,8 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                         }
                     }
                     let mut buf = self.buffer.lock().await;
-                    // Trace every commit so daemon stderr can correlate
-                    // a stuck `xact_active` against the commits that
-                    // ARE arriving; in particular surfaces subxact-id
-                    // mismatches between heap-record xact_id and the
-                    // top's commit-record subxact list.
+                    // Surfaces subxact-id mismatches between heap-record
+                    // xact_id and the top's commit-record subxact list
                     tracing::trace!(
                         target: "walshadow::xact_buffer",
                         xid,
@@ -1588,8 +1394,6 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                     .await
                     .map_err(SinkError::from)?;
                     drop(buf);
-                    // Drop the tracker's hint for this family —
-                    // commit terminates the top. Cheap O(k) cleanup.
                     self.subxact_tracker.lock().await.forget_tree(xid);
                 }
                 XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
@@ -1610,38 +1414,28 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                         .await
                         .map_err(SinkError::from)?;
                     drop(buf);
-                    // forget_tree is harmless for standalone subxact
-                    // abort (xid is the sub itself, tracker drops the
-                    // single edge); for top abort it clears the whole
-                    // family.
+                    // Harmless for standalone subxact abort (drops the
+                    // single edge); top abort clears the family
                     self.subxact_tracker.lock().await.forget_tree(xid);
                 }
                 XLOG_XACT_ASSIGNMENT => {
-                    // Record subxact → top edges so
-                    // eviction policy can fold sibling buffers under
-                    // memory pressure. Correctness rides on the commit
-                    // / abort record's authoritative subxact list, not
-                    // on this hint.
+                    // Hint for eviction policy; correctness rides on the
+                    // commit / abort record's authoritative subxact list
                     if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data) {
                         self.subxact_tracker.lock().await.assign(xtop, &subs);
                     }
                 }
                 _ => {
-                    // XLOG_XACT_PREPARE / INVALIDATIONS: not this
-                    // buffer's territory. PREPARE without COMMIT PREPARED would
-                    // leave the xact stuck — defer 2PC proper handling
-                    // to a follow-up, today the xact stays buffered
-                    // until COMMIT_PREPARED lands.
+                    // XLOG_XACT_PREPARE / INVALIDATIONS unhandled. 2PC
+                    // deferred: xact stays buffered until COMMIT_PREPARED
                 }
             }
             Ok(())
         })
     }
 
-    /// Forward idle ticks straight to the observer. The xact buffer
-    /// itself has no time-based work; the hook exists so the CH
-    /// emitter's hold-INSERT-open deadline can fire without waiting
-    /// on the next commit record.
+    /// Buffer has no time-based work; hook exists so the CH emitter's
+    /// hold-INSERT-open deadline fires without waiting on next commit
     fn on_idle<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
@@ -1652,9 +1446,8 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                 .on_idle()
                 .await
                 .map_err(|e| SinkError::Other(e.to_string()))?;
-            // A deadline-triggered close promotes the emitter's durable
-            // horizon; fold it into the ack so retention advances even
-            // when no further commit follows.
+            // Deadline close promotes the durable horizon; fold into ack
+            // so retention advances with no further commit
             if durable != 0 {
                 self.buffer.lock().await.note_idle_durable(durable);
             }
@@ -1662,9 +1455,8 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
         })
     }
 
-    /// Forward close to the observer. Final force-flush hook for the
-    /// CH emitter's hold-INSERT-open path; without it, any rows
-    /// buffered when the daemon shuts down would stay non-durable.
+    /// Final force-flush for the CH emitter's hold-INSERT-open path;
+    /// without it, rows buffered at shutdown stay non-durable
     fn on_close<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
@@ -1683,9 +1475,8 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
-            // Cap the ack at the observer's durable horizon before
-            // locking the buffer (the nudge must not promote past rows
-            // still held in open INSERTs).
+            // Cap ack at the durable horizon: nudge must not promote past
+            // rows held in open INSERTs
             let ceiling = self.observer.idle_ack_ceiling(lsn);
             let mut buf = self.buffer.lock().await;
             buf.advance_idle(lsn, ceiling);
@@ -1694,34 +1485,21 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
     }
 }
 
-/// `RecordSink` that decodes user-heap records and routes them into
-/// the xact buffer keyed by `xid`. Toast-relation INSERTs
-/// (`rel.kind == 't'`) are reinterpreted as
-/// [`ToastChunk`]s and parked under their
-/// `(toast_relid, value_id)` slot for drain-time reassembly. Only
-/// `Route::ToDecoder` records reach this sink (catalog-keep stays on
-/// the shadow-replay path); semantic errors absorb into
-/// [`DecoderStats`] rather than poisoning the stream.
-/// Shared schema-event receiver — wraps the catalog's
-/// [`tokio::sync::mpsc::UnboundedReceiver`] behind a `std::sync::Mutex`
-/// so both [`BufferingDecoderSink`] (drain after every `relation_at`)
-/// and [`XactRecordSink`] (drain after every `sweep_dropped` at commit
-/// boundaries) can pull events out of the same queue.
+/// Shared schema-event receiver. `std::sync::Mutex` wrapper lets both
+/// [`BufferingDecoderSink`] (drain after every `relation_at`) and
+/// [`XactRecordSink`] (drain after every `sweep_dropped`) pull from the
+/// same queue.
 pub type SchemaEventRx = Arc<std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SchemaEvent>>>;
 
+/// Decodes `Route::ToDecoder` user-heap records into the xact buffer.
+/// Toast-relation INSERTs (`rel.kind == 't'`) reinterpret as
+/// [`ToastChunk`]; semantic errors absorb into [`DecoderStats`] rather
+/// than poison the stream.
 pub struct BufferingDecoderSink {
     catalog: Arc<Mutex<ShadowCatalog>>,
     buffer: Arc<Mutex<XactBuffer>>,
-    /// Shared so the daemon's status loop (or a `QueueingRecordSink`
-    /// wrapper running this sink on a worker task) can read counters
-    /// without locking. Mutations are `fetch_add(_, Relaxed)`; readers
-    /// `.load(Relaxed)` at the use site.
     stats: Arc<DecoderStats>,
-    /// Schema events the catalog emits at descriptor
-    /// fetch time. Drained inline after every `relation_at` so events
-    /// land in the same xact buffer keyed on the current record's
-    /// xid + source_lsn. `None` keeps the sink schema-unaware
-    /// (greenfield bootstrap, tests).
+    /// `None` keeps the sink schema-unaware (greenfield bootstrap, tests)
     schema_events: Option<SchemaEventRx>,
 }
 
@@ -1735,36 +1513,24 @@ impl BufferingDecoderSink {
         }
     }
 
-    /// Attach a [`SchemaEvent`] receiver. Wrap a freshly-subscribed
-    /// [`tokio::sync::mpsc::UnboundedReceiver`] in a [`SchemaEventRx`]
-    /// (`Arc<std::sync::Mutex<…>>`) so the same handle can also be
-    /// shared with [`XactRecordSink::with_schema_events`]: the channel
-    /// drains from both sides (decoder for Added/Changed
-    /// events at fetch time, xact-record sink for Dropped events at
-    /// commit time via [`ShadowCatalog::sweep_dropped`]).
+    /// Share the same `rx` with [`XactRecordSink::with_schema_events`]:
+    /// channel drains from both sides (decoder for Added/Changed at fetch
+    /// time, xact-record sink for Dropped at commit via `sweep_dropped`).
     pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
         self.schema_events = Some(rx);
         self
     }
 
-    /// Borrow the live counters (for `.summary()` and ad-hoc field
-    /// `.load(Relaxed)` reads).
     pub fn stats(&self) -> &DecoderStats {
         &self.stats
     }
 
-    /// Shared handle a wrapping `QueueingRecordSink` can hand back to
-    /// the daemon's status loop so it polls live counters while the
-    /// sink itself runs on a separate worker task. Reads via
-    /// `.load(Relaxed)` on the returned struct's fields.
     pub fn stats_handle(&self) -> Arc<DecoderStats> {
         self.stats.clone()
     }
 
-    /// Drain any [`SchemaEvent`]s the catalog accumulated
-    /// during the most recent fetch. Routes each into the xact buffer
-    /// stamped with the current record's `(xid, source_lsn)` so the
-    /// k-way drain in [`XactBuffer::commit`] sorts them with the heap
+    /// Route catalog-fetch [`SchemaEvent`]s into the buffer stamped
+    /// `(xid, source_lsn)` so the commit drain sorts them with the heap
     /// writes that triggered the refetch.
     async fn drain_schema_events(
         &mut self,
@@ -1774,13 +1540,10 @@ impl BufferingDecoderSink {
         let Some(rx) = self.schema_events.as_ref() else {
             return Ok(());
         };
-        // Heap2 VACUUM / FREEZE records carry xact_id=0 (non-
-        // transactional) but still drive `relation_at` lookups that
-        // can push Added/Changed events. Buffering them under xid=0
-        // creates an inflight entry that never commits, pinning
-        // `emitter_ack_lsn` behind a phantom xact. Leave the events
-        // in the channel — the next real-xid heap record or commit
-        // will drain them in-order.
+        // Heap2 VACUUM / FREEZE carry xact_id=0 (non-transactional) but
+        // still drive `relation_at`. Buffering under xid=0 creates an
+        // inflight entry that never commits, pinning `emitter_ack_lsn`
+        // behind a phantom xact; leave events for the next real-xid drain.
         if xid == 0 {
             return Ok(());
         }
@@ -1795,11 +1558,9 @@ impl BufferingDecoderSink {
         Ok(())
     }
 
-    /// Parse `xl_heap_truncate` main_data, resolve each relid through
-    /// `ShadowCatalog`, and push one `HeapOp::Truncate` per relation
-    /// into the xact buffer. TRUNCATE is unique in carrying pg_class
-    /// OIDs (not relfilenodes) and no block ref, so the standard
-    /// `relation_at(rfn)` path doesn't fit.
+    /// Push one `HeapOp::Truncate` per relation. TRUNCATE uniquely
+    /// carries pg_class OIDs (not relfilenodes) and no block ref, so the
+    /// standard `relation_at(rfn)` path doesn't fit.
     async fn handle_truncate(&mut self, record: &Record<'_>) -> std::result::Result<(), SinkError> {
         let Some(parsed) = crate::main_data::parse_xl_heap_truncate(&record.parsed.main_data)
         else {
@@ -1810,8 +1571,8 @@ impl BufferingDecoderSink {
         };
         let xid = record.parsed.header.xact_id;
         let source_lsn = record.source_lsn;
-        // Gate on shadow having replayed past source_lsn so the
-        // catalog's pg_class entry for each relid is fresh.
+        // Gate on shadow replaying past source_lsn so each relid's
+        // pg_class entry is fresh
         if source_lsn > 0 {
             let mut cat = self.catalog.lock().await;
             cat.wait_for_replay(source_lsn)
@@ -1832,13 +1593,10 @@ impl BufferingDecoderSink {
                     Err(e) => return Err(DecoderSinkError::from(e).into()),
                 }
             };
-            // TRUNCATE may trigger an Added/Changed event
-            // if the relation was rotated since last fetch. Drain the
-            // channel inline so events land in the xact buffer.
+            // relation_by_oid may emit Added/Changed if the rel rotated
             self.drain_schema_events(xid, source_lsn).await?;
-            // Toast / index / sequence: TRUNCATE doesn't propagate
-            // (CH side has no per-table-internal toast). Filter to
-            // user heap relations.
+            // CH has no per-table internal toast; only user heap
+            // ('r'/'p') TRUNCATE propagates
             if rel.kind != 'r' && rel.kind != 'p' {
                 continue;
             }
@@ -1866,12 +1624,9 @@ impl RecordSink for BufferingDecoderSink {
     {
         Box::pin(async move {
             let rm = record.parsed.header.resource_manager_id;
-            // TRUNCATE rides Route::ToShadow (filter leaves it intact so
-            // shadow can replay the truncate against its own copy), but
-            // the decoder still needs to fan out per-relid HeapOp::Truncate
-            // for CH emission. Handle before the Drop gate so the
-            // SchemaEvent path fires regardless of how the filter scored
-            // the record.
+            // TRUNCATE rides Route::ToShadow (shadow replays it) but the
+            // decoder still fans out per-relid HeapOp::Truncate for CH.
+            // Handle before the Drop gate, regardless of filter score.
             if rm == RmId::Heap as u8 {
                 let info_op = record.parsed.header.info & crate::heap_decoder::XLOG_HEAP_OPMASK;
                 if info_op == crate::heap_decoder::XLOG_HEAP_TRUNCATE {
@@ -1904,24 +1659,15 @@ impl RecordSink for BufferingDecoderSink {
                         return Ok(());
                     }
                     Err(e) => {
-                        // ReplayTimeout used to absorb
-                        // into stats.replay_timeout. Under streaming-
-                        // fed shadow the gate clears in ms — a timeout
-                        // means shadow stalled, the walsender wire
-                        // froze, or walshadow backed up against
-                        // socket buffers. Silent skip would shed
-                        // user-heap writes invisibly. Poison the
-                        // stream so the daemon exits and the
-                        // cursor resumes on the next boot.
+                        // ReplayTimeout means shadow stalled or the wire
+                        // froze; silent skip would shed user-heap writes
+                        // invisibly. Poison the stream so the daemon exits
+                        // and the cursor resumes on next boot.
                         return Err(DecoderSinkError::from(e).into());
                     }
                 }
             };
-            // Drain any schema events the catalog pushed
-            // during the refetch (Added on first sight, Changed on
-            // diff). Route into the xact buffer keyed on the current
-            // record's xid so they drain in WAL order with the heap
-            // writes the refetch resolves. Empty in steady state.
+            // Empty in steady state
             self.drain_schema_events(record.parsed.header.xact_id, record.source_lsn)
                 .await?;
             let decoded_set = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
@@ -1961,10 +1707,7 @@ impl RecordSink for BufferingDecoderSink {
     }
 }
 
-/// Drain every queued [`SchemaEvent`] into a `Vec`. Caller decides
-/// where to route them (xact buffer, applicator, etc). Uses
-/// `try_recv` in a tight loop — the channel is unbounded + same-task,
-/// so no contention.
+/// Drain queued [`SchemaEvent`]s; channel is unbounded + same-task
 pub(crate) fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent> {
     let mut out = Vec::new();
     let mut guard = rx.lock().expect("schema event rx mutex poisoned");
@@ -1974,16 +1717,13 @@ pub(crate) fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent
     out
 }
 
-/// Repack a TOAST table INSERT (op=Insert, exactly 3 columns:
-/// `chunk_id oid`, `chunk_seq int4`, `chunk_data bytea`) into a
-/// [`ToastChunk`]. Returns `None` for shapes that don't fit — caller
-/// counts the malformed event so silent loss is visible.
+/// Repack a TOAST table INSERT (Insert, 3 columns: `chunk_id oid`,
+/// `chunk_seq int4`, `chunk_data bytea`) into a [`ToastChunk`]; `None`
+/// for shapes that don't fit.
 ///
-/// Keyed on the toast relation's pg_class OID
-/// ([`RelDescriptor::oid`]) rather than its on-disk `rel_node`
-/// because the referring tuple's `va_toastrelid` is the OID, not the
-/// relfilenode. The two diverge after `VACUUM FULL` / `CLUSTER` on
-/// the toast relation.
+/// Keyed on the toast rel's pg_class OID ([`RelDescriptor::oid`]), not
+/// `rel_node`: the referring tuple's `va_toastrelid` is the OID. They
+/// diverge after `VACUUM FULL` / `CLUSTER` on the toast rel.
 fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<ToastChunk> {
     if d.op != HeapOp::Insert {
         return None;
@@ -2002,8 +1742,7 @@ fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<T
     };
     let chunk_data = match new.columns[2].take()? {
         ColumnValue::Bytea(b) => b,
-        // Detoasted text-typed toast wouldn't be a normal flow but
-        // tolerate by re-encoding back to bytes.
+        // Text-typed toast chunk: re-encode to bytes (not a normal flow)
         ColumnValue::Text(s) => s.into_bytes(),
         _ => return None,
     };
@@ -2018,21 +1757,10 @@ fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<T
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests cover the catalog-free paths:
-    //! * On-heap / on-chunk absorption.
-    //! * Abort cleanup (no detoast).
-    //! * Largest-xact eviction (no detoast).
-    //! * `parse_xact_payload` shape coverage.
-    //! * `SubxactTracker` round-trip.
-    //! * `XactBufferStats::summary` conditional rendering.
-    //!
-    //! Commit-drain + detoast + `XactRecordSink::commit` paths live in
-    //! `tests/xact_buffer.rs` against a real shadow PG — they need
-    //! `ShadowCatalog::relation_at` to resolve `rfn` → `RelDescriptor`,
-    //! and a stub-catalog seam in unit-test land would just duplicate
-    //! the production cache surface (the user instruction: the
-    //! per-xact relfilenode cache was misguided, drain reuses
-    //! ShadowCatalog's own LRU).
+    //! Catalog-free paths only. Commit-drain + detoast +
+    //! `XactRecordSink::commit` live in `tests/xact_buffer.rs` against a
+    //! real shadow PG: they need `ShadowCatalog::relation_at`, and a
+    //! unit-test stub catalog would duplicate the production cache.
 
     use super::*;
     use crate::heap_decoder::{DecodedTuple, HeapOp};
@@ -2089,7 +1817,6 @@ mod tests {
             !e.spilled,
             "16-byte tuple stays in memory under the 1 KiB cap"
         );
-        // db_node/rel_node from heap_with_value's RelFileNode.
         assert_eq!(e.rels, "5/16385");
     }
 
@@ -2133,20 +1860,17 @@ mod tests {
     async fn advance_idle_caps_ack_at_ceiling() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        // Hold-open: ceiling (durable horizon) below the dispatched lsn.
-        // drain_lsn tracks dispatch, emitter_ack capped at the ceiling.
+        // Hold-open: ceiling below dispatched lsn caps emitter_ack
         b.advance_idle(100, 50);
         assert_eq!(b.stats().drain_lsn, 100);
         assert_eq!(b.stats().emitter_ack_lsn, 50);
-        // Nothing buffered: ceiling == lsn, ack advances fully.
         b.advance_idle(200, 200);
         assert_eq!(b.stats().drain_lsn, 200);
         assert_eq!(b.stats().emitter_ack_lsn, 200);
-        // Stale/regressing inputs never lower either field.
+        // Regressing inputs never lower either field
         b.advance_idle(150, 100);
         assert_eq!(b.stats().drain_lsn, 200);
         assert_eq!(b.stats().emitter_ack_lsn, 200);
-        // Deadline-close durable feedback advances only the ack.
         b.note_idle_durable(260);
         assert_eq!(b.stats().drain_lsn, 200);
         assert_eq!(b.stats().emitter_ack_lsn, 260);
@@ -2168,7 +1892,6 @@ mod tests {
             spill_dir: tmp.path().to_path_buf(),
         };
         let mut b = XactBuffer::new(cfg).unwrap();
-        // Two xacts: xid=1 with one fat tuple, xid=2 with three small.
         b.on_heap(heap_with_value(1, 100, 8192)).await.unwrap();
         for i in 0..3 {
             b.on_heap(heap_with_value(2, 200 + i, 128)).await.unwrap();
@@ -2191,10 +1914,8 @@ mod tests {
         b.abort(2, 300, &[]).await.unwrap();
     }
 
-    /// `abort()` must bump `drain_lsn` and `emitter_ack_lsn`
-    /// to the abort-record LSN so the cursor file (and the standby-
-    /// status apply ceiling) cover aborted xacts as "fully consumed".
-    /// Without this, an all-abort workload would never advance the slot.
+    /// Aborts must advance the LSNs, else an all-abort workload never
+    /// advances the slot
     #[tokio::test(flavor = "current_thread")]
     async fn abort_advances_ack_lsns_for_resume_cursor() {
         let tmp = tempdir().unwrap();
@@ -2203,12 +1924,10 @@ mod tests {
         b.abort(7, 0x4000, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x4000);
         assert_eq!(b.stats().emitter_ack_lsn, 0x4000);
-        // A second abort at a lower LSN must not regress the monotonic
-        // high-water marks.
+        // Lower-LSN abort must not regress the monotonic marks
         b.abort(99, 0x100, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x4000);
         assert_eq!(b.stats().emitter_ack_lsn, 0x4000);
-        // A later abort advances.
         b.abort(101, 0x8000, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x8000);
         assert_eq!(b.stats().emitter_ack_lsn, 0x8000);
@@ -2315,11 +2034,9 @@ mod tests {
         assert_eq!(chunk.value_id, 55);
         assert_eq!(chunk.chunk_seq, 2);
         assert_eq!(chunk.chunk_data, b"hello");
-        // Non-Insert ops fail the shape check.
         let mut d2 = d.clone();
         d2.op = HeapOp::Update;
         assert!(toast_chunk_from_decoded(d2, &rel).is_none());
-        // Two-column shape (truncated) fails.
         let mut d3 = d.clone();
         d3.new.as_mut().unwrap().columns.pop();
         assert!(toast_chunk_from_decoded(d3, &rel).is_none());
@@ -2333,14 +2050,12 @@ mod tests {
         t.assign(100, &[101, 102]);
         assert_eq!(t.top_for(101), 100);
         assert_eq!(t.top_for(102), 100);
-        // Unknown xid returns itself per PG's "sub's top is itself
-        // when no ASSIGNMENT record landed yet" semantics.
+        // Unknown xid returns itself, PG "sub's top is itself pre-ASSIGNMENT"
         assert_eq!(t.top_for(100), 100);
         assert_eq!(t.top_for(999), 999);
-        // subxids_of mirrors assign's input ordering.
         let subs = t.subxids_of(100);
         assert!(subs.contains(&101) && subs.contains(&102) && subs.len() == 2);
-        // Repeated assignment is idempotent — no duplicate edges.
+        // Idempotent: no duplicate edges
         t.assign(100, &[101]);
         assert_eq!(t.subxids_of(100).len(), 2);
         t.forget_tree(100);
@@ -2351,8 +2066,7 @@ mod tests {
 
     #[test]
     fn subxact_tracker_retargets_subxid_to_new_top() {
-        // Defensive case: a subxid that was previously assigned to one
-        // top gets reassigned to another. Old children edge must drop.
+        // Reassign a subxid to a new top; old children edge must drop
         let mut t = SubxactTracker::new();
         t.assign(10, &[20]);
         t.assign(30, &[20]);
@@ -2372,9 +2086,9 @@ mod tests {
         let (xtop, subs) = parse_xact_assignment(&buf).expect("parses");
         assert_eq!(xtop, 0x11223344);
         assert_eq!(subs, vec![0x55, 0x66]);
-        // Short main_data → None, doesn't panic.
+        // Short main_data → None
         assert!(parse_xact_assignment(&buf[..6]).is_none());
-        // Negative nsub → reject.
+        // Negative nsub → reject
         let mut bad = Vec::new();
         bad.extend_from_slice(&1u32.to_le_bytes());
         bad.extend_from_slice(&(-1i32).to_le_bytes());
@@ -2383,7 +2097,7 @@ mod tests {
 
     #[test]
     fn parse_xact_payload_extracts_xact_time_without_xinfo() {
-        // No HAS_INFO bit → only the 8-byte timestamp lives in the body.
+        // No HAS_INFO: body is just the 8-byte timestamp
         let ts = 0x0123_4567_89AB_CDEFi64;
         let body = ts.to_le_bytes();
         let p = parse_xact_payload(0x00, &body);
@@ -2393,9 +2107,8 @@ mod tests {
 
     #[test]
     fn parse_xact_payload_reads_subxacts_with_dbinfo_skip() {
-        // HAS_INFO bit set, xinfo = DBINFO | SUBXACTS. Skip-walks
-        // through the dbInfo (8 bytes: dbOid + tsOid) to land on the
-        // subxacts header.
+        // xinfo = DBINFO | SUBXACTS: skip-walk 8-byte dbInfo (dbOid+tsOid)
+        // to reach the subxacts header
         let mut body = Vec::new();
         body.extend_from_slice(&42i64.to_le_bytes()); // xact_time
         body.extend_from_slice(&(XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS).to_le_bytes());
@@ -2412,8 +2125,7 @@ mod tests {
 
     #[test]
     fn parse_xact_payload_handles_no_has_info() {
-        // HAS_INFO unset → xinfo defaults to 0 (no tails). Even when
-        // bytes follow the timestamp, parser must not consume them.
+        // HAS_INFO unset: parser must not consume bytes past the timestamp
         let mut body = 7i64.to_le_bytes().to_vec();
         body.extend_from_slice(&[0xFF; 16]);
         let p = parse_xact_payload(0x00, &body);
@@ -2437,8 +2149,7 @@ mod tests {
         b.on_heap(heap_with_value(302, 300, 16)).await.unwrap();
         b.abort(300, 0x500, &[301, 302]).await.unwrap();
         assert!(b.active_xids().is_empty());
-        // One aborted_xacts_total bump per terminator record, not per
-        // subxid in the list.
+        // One bump per terminator record, not per subxid
         assert_eq!(b.stats().aborted_xacts_total, 1);
     }
 }

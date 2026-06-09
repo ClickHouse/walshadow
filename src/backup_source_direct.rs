@@ -1,19 +1,12 @@
-//! Direct base-backup source.
+//! Direct base-backup source. Wraps wal-rs's
+//! `pg::replication::base_backup::run_base_backup` to drive walshadow's
+//! [`BackupSource`] trait. Tablespace symlinks ride inside the data-dir
+//! archive in PG protocol order, surfacing as `FileKind::Symlink`.
 //!
-//! Wraps wal-rs's `pg::replication::base_backup::run_base_backup` to
-//! drive walshadow's file-streaming [`BackupSource`] trait. Issues
-//! `BASE_BACKUP` against source PG; for each `BackupEvent::Archive`
-//! body received over the events channel, async-tar-parses the stream
-//! and pumps entries through the caller-supplied [`BackupSink`].
-//! Tablespace symlinks ride inside the data-dir archive in the PG
-//! protocol order; they appear naturally as `FileKind::Symlink`
-//! entries.
-//!
-//! Single-pass design: seed the page-walk
+//! Single-pass: seed the page-walk
 //! [`CatalogMap`](crate::backup_page_walk::CatalogMap) from source PG
-//! via a sidecar SQL query *before* this runs, so all routing
-//! decisions are known by the time bytes land. See
-//! [plans/bootstrap.md](../plans/bootstrap.md).
+//! before this runs so all routing decisions are known when bytes land.
+//! See [plans/bootstrap.md](../plans/bootstrap.md).
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -29,8 +22,7 @@ use wal_rs::pg::replication::conn::{PgConfig, ReplicationConn};
 
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo, pump_tar_to_sink};
 
-/// Replication-protocol BASE_BACKUP issuer. Holds the connection
-/// config + options; one-shot construction per bootstrap.
+/// Replication-protocol BASE_BACKUP issuer
 pub struct DirectSource {
     pub source: PgConfig,
     pub opts: BaseBackupOpts,
@@ -55,9 +47,8 @@ impl BackupSource for DirectSource {
             .await
             .context("DirectSource: connect to source PG for BASE_BACKUP")?;
 
-        // wal-rs's events channel is bounded; depth=8 matches its own
-        // internal sizing. Producer back-pressures naturally on slow
-        // archive drain
+        // depth=8 matches wal-rs internal sizing; producer back-pressures
+        // on slow archive drain
         let (tx, mut rx) = mpsc::channel::<Result<BackupEvent>>(8);
         let pump = tokio::spawn(async move {
             run_base_backup(conn, opts, tx).await;
@@ -65,9 +56,8 @@ impl BackupSource for DirectSource {
 
         let mut start: Option<StartInfo> = None;
         let mut end: Option<EndInfo> = None;
-        // One id space across all archives this run; archives drain
-        // sequentially here, but keep the shared counter for symmetry
-        // with object_store's concurrent parts.
+        // Archives drain sequentially here; shared counter kept for
+        // symmetry with object_store's concurrent parts
         let next_entry = AtomicU64::new(0);
 
         while let Some(ev) = rx.recv().await {
@@ -112,8 +102,6 @@ impl BackupSource for DirectSource {
             }
         }
 
-        // Reap the pump task — error here surfaces a join panic or a
-        // late-arriving send failure
         if let Err(e) = pump.await {
             bail!("DirectSource: BASE_BACKUP pump task panicked: {e:#}");
         }
@@ -124,9 +112,9 @@ impl BackupSource for DirectSource {
     }
 }
 
-/// Drain one archive body through `pump_tar_to_sink`. The wal-rs
-/// `ChannelReader` is `AsyncRead`, so tokio_tar's async pipeline takes
-/// it directly — no SyncIoBridge / spawn_blocking dance.
+/// Drain one archive body through `pump_tar_to_sink`. wal-rs's
+/// `ChannelReader` is `AsyncRead`, so tokio_tar takes it directly, no
+/// SyncIoBridge / spawn_blocking.
 async fn drive_archive(
     body: mpsc::Receiver<std::io::Result<bytes::Bytes>>,
     data_dir: &std::path::Path,
