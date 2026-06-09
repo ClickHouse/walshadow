@@ -266,6 +266,42 @@ pub enum ColumnValue {
     },
 }
 
+impl ColumnValue {
+    /// Approximate in-memory payload bytes of the decoded value — varlena
+    /// lengths plus fixed-width scalar widths. Used to bound the decode
+    /// pool's coalescing buffer; varlena (detoasted) payloads dominate, but
+    /// scalars are counted so a wide row still accrues. Detoast has already
+    /// run by route time, so `ExternalToast` pointers are resolved into
+    /// `Text`/`Bytea` here. Exhaustive so a new variant forces a width.
+    pub fn approx_bytes(&self) -> usize {
+        use crate::codecs::NumericKind;
+        match self {
+            ColumnValue::Null => 0,
+            ColumnValue::Bool(_) | ColumnValue::Char(_) => 1,
+            ColumnValue::Int2(_) => 2,
+            ColumnValue::Int4(_)
+            | ColumnValue::Float4(_)
+            | ColumnValue::Oid(_)
+            | ColumnValue::Date(_) => 4,
+            ColumnValue::Int8(_)
+            | ColumnValue::Float8(_)
+            | ColumnValue::Time(_)
+            | ColumnValue::Timestamp(_)
+            | ColumnValue::TimestampTz(_) => 8,
+            ColumnValue::TimeTz { .. } => 12,
+            ColumnValue::Uuid(_) => 16,
+            ColumnValue::Interval(_) => 16,
+            ColumnValue::Inet(v) => 3 + v.addr.len(),
+            ColumnValue::Numeric(NumericKind::Finite(s)) => s.len(),
+            ColumnValue::Numeric(_) => 0,
+            ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => s.len(),
+            ColumnValue::Bytea(b) => b.len(),
+            ColumnValue::PgPending { raw, .. } | ColumnValue::Unsupported { raw, .. } => raw.len(),
+            ColumnValue::ExternalToast(_) => 16,
+        }
+    }
+}
+
 /// On-disk TOAST pointer (`struct varatt_external` in PG `varatt.h`).
 /// 16 bytes total, unaligned in the source tuple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +323,23 @@ pub struct DecodedHeap {
     pub op: HeapOp,
     pub new: Option<DecodedTuple>,
     pub old: Option<DecodedTuple>,
+}
+
+impl DecodedHeap {
+    /// Sum of [`ColumnValue::approx_bytes`] across both tuple images
+    /// (REPLICA IDENTITY FULL keeps a fat `old` image alive too).
+    pub fn approx_bytes(&self) -> usize {
+        let image = |t: &Option<DecodedTuple>| {
+            t.as_ref().map_or(0, |t| {
+                t.columns
+                    .iter()
+                    .flatten()
+                    .map(ColumnValue::approx_bytes)
+                    .sum::<usize>()
+            })
+        };
+        image(&self.new) + image(&self.old)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1371,6 +1424,50 @@ mod tests {
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }
+    }
+
+    #[test]
+    fn approx_bytes_counts_scalars_and_varlena() {
+        assert_eq!(ColumnValue::Null.approx_bytes(), 0);
+        assert_eq!(ColumnValue::Int2(0).approx_bytes(), 2);
+        assert_eq!(ColumnValue::Int4(0).approx_bytes(), 4);
+        assert_eq!(ColumnValue::Int8(0).approx_bytes(), 8);
+        assert_eq!(ColumnValue::Uuid([0; 16]).approx_bytes(), 16);
+        assert_eq!(ColumnValue::Text("héllo".into()).approx_bytes(), 6);
+        assert_eq!(ColumnValue::Bytea(vec![0u8; 100]).approx_bytes(), 100);
+        assert_eq!(
+            ColumnValue::PgPending {
+                type_oid: 1,
+                raw: vec![0u8; 7],
+            }
+            .approx_bytes(),
+            7
+        );
+
+        // Both images sum; absent (`None`) columns contribute nothing.
+        let heap = DecodedHeap {
+            rfn: RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 16385,
+            },
+            xid: 1,
+            source_lsn: 0,
+            op: HeapOp::Update,
+            new: Some(DecodedTuple {
+                columns: vec![
+                    Some(ColumnValue::Int4(1)),
+                    Some(ColumnValue::Bytea(vec![0u8; 10])),
+                ],
+                partial: false,
+            }),
+            old: Some(DecodedTuple {
+                columns: vec![None, Some(ColumnValue::Text("abc".into()))],
+                partial: false,
+            }),
+        };
+        // new: Int4(4) + Bytea(10); old: None(0) + Text(3).
+        assert_eq!(heap.approx_bytes(), 17);
     }
 
     /// Build a heap-tuple-shaped byte buffer: `xl_heap_header (5) +

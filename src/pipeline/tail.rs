@@ -108,7 +108,7 @@ pub async fn spawn(
     // Rows (decode pool / bootstrap drain) and FlushAll (barrier /
     // bootstrap completion) share one FIFO channel so a flush can't
     // overtake rows enqueued before it.
-    let (msg_tx, msg_rx) = mpsc::channel::<BatcherMsg>(8192);
+    let (msg_tx, msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let (batches_tx, batches_rx) = mpmc::channel::<InsertBatch>((n * 2).max(4));
 
     let inserters = inserter::spawn_pool(
