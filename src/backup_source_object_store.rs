@@ -27,8 +27,10 @@
 //!   to overlay onto, which the streaming page-walk path doesn't produce.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+
+use tokio::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -102,8 +104,8 @@ impl BackupSource for ObjectStoreSource {
 
         let (start, end) = build_lsn_pair(&resolved, &sentinel)?;
         {
-            let mut g = sink.lock().map_err(|_| anyhow!("sink mutex poisoned"))?;
-            g.start(&start)?;
+            let mut g = sink.lock().await;
+            g.start(&start).await?;
         }
 
         let parts = list_tar_parts(&storage, &resolved).await?;
@@ -165,8 +167,8 @@ impl BackupSource for ObjectStoreSource {
         }
 
         {
-            let mut g = sink.lock().map_err(|_| anyhow!("sink mutex poisoned"))?;
-            g.finish(&end)?;
+            let mut g = sink.lock().await;
+            g.finish(&end).await?;
         }
         Ok((start, end))
     }

@@ -379,7 +379,7 @@ jobs:
         run: sudo tail -n 500 /var/log/clickhouse-server/clickhouse-server.err.log || true
 
   lint:
-    name: clippy + fmt
+    name: lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

@@ -24,11 +24,12 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::Mutex;
 
 use wal_rs::pg::replication::base_backup::Tablespace;
 
@@ -102,24 +103,27 @@ pub struct EndInfo {
 /// then `finish` once.
 ///
 /// `Send` because parallel source impls drive the sink from worker
-/// tasks. Methods are sync; sinks needing async I/O must do it in
-/// `start`/`finish` via a runtime handle, or buffer for an async drain.
+/// tasks. All methods async so a sink can backpressure its driver
+/// directly: `chunk` awaiting a full downstream channel parks the body
+/// read, which parks the source fetch. No intermediate buffer.
+#[async_trait]
 pub trait BackupSink: Send {
-    fn start(&mut self, _info: &StartInfo) -> io::Result<()> {
+    async fn start(&mut self, _info: &StartInfo) -> io::Result<()> {
         Ok(())
     }
 
     /// Must be cheap; per-file dispatch is the hot path
-    fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction>;
+    async fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction>;
 
     /// Body bytes for a `Tap` entry, in file order per entry, arbitrary
-    /// chunk sizes. Calls for distinct entries may interleave.
-    fn chunk(&mut self, entry: EntryId, bytes: &[u8]) -> io::Result<()>;
+    /// chunk sizes. Calls for distinct entries may interleave. Awaiting
+    /// here backpressures the source.
+    async fn chunk(&mut self, entry: EntryId, bytes: &[u8]) -> io::Result<()>;
 
     /// Fires once per `begin()`, regardless of action returned
-    fn end(&mut self, entry: EntryId) -> io::Result<()>;
+    async fn end(&mut self, entry: EntryId) -> io::Result<()>;
 
-    fn finish(&mut self, _info: &EndInfo) -> io::Result<()> {
+    async fn finish(&mut self, _info: &EndInfo) -> io::Result<()> {
         Ok(())
     }
 }
@@ -222,20 +226,16 @@ where
     R: AsyncRead + Unpin + ?Sized,
 {
     let action = {
-        let mut s = sink
-            .lock()
-            .map_err(|_| io::Error::other("sink mutex poisoned"))?;
-        s.begin(entry, meta)?
+        let mut s = sink.lock().await;
+        s.begin(entry, meta).await?
     };
     match action {
         FileAction::Keep => write_kept(body, meta, data_dir).await?,
         FileAction::Skip => drain_to_void(body).await?,
         FileAction::Tap => stream_to_sink(body, meta, sink, entry).await?,
     }
-    let mut s = sink
-        .lock()
-        .map_err(|_| io::Error::other("sink mutex poisoned"))?;
-    s.end(entry)
+    let mut s = sink.lock().await;
+    s.end(entry).await
 }
 
 async fn drain_to_void<R>(body: &mut R) -> io::Result<()>
@@ -271,10 +271,11 @@ where
         if n == 0 {
             break;
         }
-        let mut s = sink
-            .lock()
-            .map_err(|_| io::Error::other("sink mutex poisoned"))?;
-        s.chunk(entry, &buf[..n])?;
+        // Guard held across the chunk await: a full downstream channel
+        // parks this read (and any concurrent part contending the lock),
+        // propagating backpressure to the source fetch
+        let mut s = sink.lock().await;
+        s.chunk(entry, &buf[..n]).await?;
     }
     Ok(())
 }
@@ -434,15 +435,16 @@ mod tests {
         Finish { end_lsn: u64 },
     }
 
+    #[async_trait]
     impl BackupSink for RecordingSink {
-        fn start(&mut self, info: &StartInfo) -> io::Result<()> {
+        async fn start(&mut self, info: &StartInfo) -> io::Result<()> {
             self.events.push(Event::Start {
                 start_lsn: info.start_lsn,
                 timeline: info.timeline,
             });
             Ok(())
         }
-        fn begin(&mut self, _entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
+        async fn begin(&mut self, _entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
             let s = meta.path.to_string_lossy();
             let action = if s.starts_with("pg_replslot/") {
                 if matches!(meta.kind, FileKind::Dir) {
@@ -463,14 +465,14 @@ mod tests {
             self.cur_tap = (action == FileAction::Tap).then(Vec::new);
             Ok(action)
         }
-        fn chunk(&mut self, _entry: EntryId, bytes: &[u8]) -> io::Result<()> {
+        async fn chunk(&mut self, _entry: EntryId, bytes: &[u8]) -> io::Result<()> {
             self.events.push(Event::Chunk { len: bytes.len() });
             if let Some(buf) = self.cur_tap.as_mut() {
                 buf.extend_from_slice(bytes);
             }
             Ok(())
         }
-        fn end(&mut self, _entry: EntryId) -> io::Result<()> {
+        async fn end(&mut self, _entry: EntryId) -> io::Result<()> {
             let path = self.cur_path.take().unwrap_or_default();
             if let Some(buf) = self.cur_tap.take() {
                 self.tapped.push((path.clone(), buf));
@@ -478,7 +480,7 @@ mod tests {
             self.events.push(Event::End { path });
             Ok(())
         }
-        fn finish(&mut self, info: &EndInfo) -> io::Result<()> {
+        async fn finish(&mut self, info: &EndInfo) -> io::Result<()> {
             self.events.push(Event::Finish {
                 end_lsn: info.end_lsn,
             });
@@ -588,7 +590,7 @@ mod tests {
         // User heap tapped, not landed
         assert!(!data_dir.join("base/5/16400").exists());
 
-        let r = recording.lock().unwrap();
+        let r = recording.lock().await;
         // Last file event must be pg_control end (contract 3)
         let last_end = r
             .events

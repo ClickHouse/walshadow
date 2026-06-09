@@ -640,7 +640,7 @@ async fn run(args: Args) -> Result<()> {
     .await
     {
         Ok(o) => {
-            let ext = o.has_extension().await;
+            let ext = o.has_extension();
             tracing::info!(
                 target: "walshadow::oracle",
                 validate = args.validate > 0,
@@ -718,7 +718,7 @@ async fn run(args: Args) -> Result<()> {
             // zero cursor ack), silently dropping [raw_start, head] WAL that
             // never reached CH. tail's `fetch_max` keeps it monotonic as WAL
             // re-reads [aligned, raw_start]. See
-            // plans/future/parallel_decode_and_insert.md (Handoff step 3).
+            // plans/future/pipeline_backpressure_and_scaling.md (Handoff step 3).
             let emitter_ack = Arc::new(AtomicU64::new(raw_start));
             pipeline_ack = Some(emitter_ack.clone());
             let pcfg = PipelineConfig {
