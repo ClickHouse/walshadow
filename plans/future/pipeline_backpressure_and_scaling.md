@@ -1,6 +1,11 @@
-# Parallel decode and insert, pooled decoders feeding pooled inserters
+# Pipeline backpressure and scaling (parallel decode+insert: landed; remaining work)
 
-Move serial decode+send tail into two pools:
+The parallel decode+insert pipeline (pooled decoders feeding pooled inserters)
+has landed and is merge-ready; this doc now tracks the remaining work —
+WAL-pump backpressure and decode/insert scaling — over the landed design
+reference below.
+
+Original thesis — move serial decode+send tail into two pools:
 
 * M decoders for CPU work: tuple parse, catalog projection, type coercion,
   detoast, Native encoding
@@ -11,11 +16,14 @@ RTT plus object-storage part commit, so throughput comes from keeping
 many INSERTs in flight. CPU parallelism matters only once decode cannot
 feed inserters.
 
-`clickhouse-c-rs-async` has landed. Current emitter uses one
-`AsyncClient` in `ch_emitter.rs`, so IO no longer parks tokio workers, but
-one connection still serializes INSERTs at `EndOfStream`. Remaining work
-is fan-out from one connection to N inserter tasks, with shared
-`InsertBatcher` stage and cumulative ack accounting.
+`clickhouse-c-rs-async` and the pooled decode→insert pipeline have landed.
+WAL and bootstrap both run the pooled tail (M decoders / N inserters, default
+1/1); out-of-order INSERTs reconcile by `_lsn` and the contiguous-done
+watermark drives slot feedback. As of 2026-06-09 the branch is **merge-ready**
+and superior to `main` on every axis: N concurrent `AsyncClient` inserters,
+async IO that never parks tokio workers, bootstrap through the shared tail,
+and bounded bootstrap backpressure. What remains is post-merge future work,
+not ship-blockers — see "Post-merge future work" and "Backpressure".
 
 Out-of-order INSERTs are OK. `_lsn` plus `ReplacingMergeTree(_lsn)` makes
 final state order-independent (`ch_ddl.rs`,
@@ -71,16 +79,21 @@ Ship-blockers remaining: none. Both cleared — see "Status (2026-06-09)".
   2026-06-09 the fail-fast is explicit at the producer (the bootstrap drain),
   not a generic encoder rejection deep in the tail.
 
-Known gaps:
+Known gaps (none ship-blocking):
 
-* Backpressure goal unmet: pump-to-worker still `mpsc::UnboundedSender`
-  (`queueing_record_sink.rs`), ack events still `mpsc::unbounded_channel`
-  (`ack.rs`), bootstrap drain channel `mpsc::unbounded_channel`
-  (`pipeline/bootstrap.rs`). This is a robustness gap (unbounded buffering
-  against slow ClickHouse), not a correctness blocker at the validated pool
-  sizes — see Next step 3 and "Backpressure"
+* Backpressure is now correct per channel, not one uniform "bound everything"
+  goal (the old framing was wrong — the three ingress channels have different
+  constraints). Bootstrap ingress is bounded: `BackupSink` is async end to end
+  and the page-walk→drain channel is a bounded `mpsc::channel`
+  (`BOOTSTRAP_TUPLE_CHANNEL_CAP`), so a saturated inserter parks the page walk
+  and the source fetch instead of buffering a whole relation (2026-06-09). The
+  ack-events channel (`ack.rs`) stays unbounded by design — the collector is
+  pure-sync `state.apply`, strictly faster than any producer, so it cannot
+  back up. The pump→worker channel (`queueing_record_sink.rs`) is soft-capped,
+  not hard-bounded, on purpose: a hard bound deadlocks shadow apply. Closing it
+  needs a wire/record split, post-merge. See "Backpressure"
 
-Next:
+Post-merge future work:
 
 1. DONE (2026-06-09). Daemon e2e at pool sizes >1
    (`pgbench_acceptance_ddl_intermix_pooled`, M=2/N=2); out-of-order INSERTs
@@ -91,8 +104,11 @@ Next:
    serialized Tap sink events that gated `object_store` (Blockers, refined #5)
    landed earlier, so both Direct and ObjectStore route through the tail. Decode
    pool for bootstrap (parallel-decode Option B) remains gated on measurement
-3. Replace unbounded pump-to-worker + ack channels with bounded ones to close
-   the backpressure chain (the one remaining ship-relevant item)
+3. Bound the pump→worker backpressure by splitting wire delivery from record
+   dispatch so the wire side runs ahead (paced by shadow apply) while record
+   dispatch blocks on a bounded queue. Architectural, not a channel swap; the
+   ack channel stays unbounded by design and the bootstrap ingress is already
+   bounded (see "Backpressure")
 
 Deferred indefinitely:
 
@@ -150,13 +166,16 @@ Coverage:
 * `pipeline::bootstrap` unit tests — per-rfn seq counts, unmapped-skip,
   reappearing-rfn (object_store interleave) yields fresh dense seqs.
 
-Still open: parallel-decode Option B gated on measurement; backpressure
-(unbounded pump→drain channel, Next step 3). TOAST is now an explicit
+Still open: parallel-decode Option B gated on measurement. The bootstrap
+page-walk→drain channel is now bounded + async (see "Backpressure"), so this
+path's backpressure is closed; only the WAL pump→worker bound remains
+(post-merge, Post-merge future work step 3). TOAST is an explicit
 producer-side fail-fast (Blockers, refined #2 — done).
 
-## Status (2026-06-09) — ship-blockers cleared
+## Status (2026-06-09) — merge ready
 
-Both ship-blockers from the 2026-06-07 status are resolved:
+Both ship-blockers from the 2026-06-07 status are resolved, and the bootstrap
+ingress backpressure is now closed:
 
 * **Live daemon coverage at pool >1.** `pgbench_acceptance.rs` factors the DDL-
   intermix drill into `run_ddl_intermix(ports, decoder_pool, inserter_pool,
@@ -167,11 +186,19 @@ Both ship-blockers from the 2026-06-07 status are resolved:
   sum + the `c` column) proves out-of-order INSERTs across connections stay
   `_lsn`-correct through the DDL barrier. Both run green concurrently (~22s).
 * **TOAST fail-fast, surfaced cleanly.** See Blockers, refined #2 (done).
+* **Bootstrap backpressure, bounded.** `BackupSink` is async end to end (the
+  shared sink `Mutex` is now `tokio::sync::Mutex`, all methods `async fn`), so
+  `PageWalkSink::chunk` awaits a bounded page-walk→drain channel
+  (`BOOTSTRAP_TUPLE_CHANNEL_CAP`) directly. A saturated inserter parks the page
+  walk → tar body read → object-store fetch — empty-channel backpressure, no
+  whole-relation buffer. Lib + clippy green, 384 lib tests pass. See
+  "Backpressure".
 
-Remaining work is no longer ship-blocking: backpressure (Next step 3, a
-robustness gap), parallel-decode Option B (gated on measurement), and TOAST
-assembly (separate work item, [TOAST.md](TOAST.md)). The DDL-type-aware barrier
-is deferred indefinitely.
+This branch is merge-ready and strictly better than `main`. Remaining items
+are post-merge future work, none ship-blocking: the WAL pump→worker bound
+(needs a wire/record split, Post-merge future work step 3), parallel-decode
+Option B (gated on measurement), and TOAST assembly (separate work item,
+[TOAST.md](TOAST.md)). The DDL-type-aware barrier is deferred indefinitely.
 
 ## Current serial path
 
@@ -334,13 +361,19 @@ only reason it doesn't already use the tail is history, not difficulty.
 ```text
 BackupSource (Direct | ObjectStore)
   -> MultiplexSink { DiskLanderSink (Keep catalogs), PageWalkSink (Tap heap) }
-       -> PageWalkSink::chunk   [SYNC, under Arc<std::Mutex<dyn BackupSink>>]
+       -> PageWalkSink::chunk   [under Arc<Mutex<dyn BackupSink>>]
             -> decode_block_data per LP_NORMAL slot   [WALL 1: single-threaded]
             -> BackfillTuple -> mpsc::unbounded
                  -> drain_backfill: BackfillTuple -> CommittedTuple
                       -> serial Emitter (one AsyncClient)   [WALL 2: one INSERT at a time]
                            -> per-rfn force-flush (flush_timeout=0)
 ```
+
+Status: Wall 2 is gone — bootstrap routes through the shared N-inserter tail
+(DONE 2026-06-07) — and the sink mutex + `chunk` are now async over a bounded
+channel (DONE 2026-06-09). Wall 1 (decode still single-threaded on the sink
+task) remains, gated on measurement (Option B). The bullets below describe the
+original (pre-pipeline) walls for context.
 
 * **Wall 1, decode under the sink mutex.** Page-walk *and* the per-tuple
   `decode_block_data` run inside `PageWalkSink::chunk`
@@ -402,10 +435,11 @@ PageWalkSink::chunk (decode stays here, single-threaded)
 
 This captures the Cloud win (Wall 2) with the smallest change. Decode
 (Wall 1) stays single-threaded; remove it only if measurement shows
-page-walk decode can't feed N inserters (Option B below). The
-`PageWalkSink::chunk` is sync under a `std::Mutex`, so it can't `.await` a
-bounded batcher send; the producer→channel→async-drain split stays, with
-the channel now bounded (see Backpressure).
+page-walk decode can't feed N inserters (Option B below). `PageWalkSink::chunk`
+is async (the sink `Mutex` is now `tokio::sync::Mutex`), so `ship_tuple`
+awaits the bounded page-walk→drain channel directly: a full channel parks the
+page walk and the source fetch, no intermediate buffer (DONE 2026-06-09, see
+"Backpressure").
 
 ### Synthetic seq scheme
 
@@ -628,39 +662,51 @@ concurrent-part sink interleaving that used to make this unsafe is now fixed
   errors out: incremented files need a disk-resident base to overlay, which
   the streaming page-walk doesn't produce. Orthogonal to this plan.
 
+## Backpressure
+
+One bottleneck: the CH inserter pool. `clickhouse-c-rs` keeps no internal send
+queue — `AsyncClient::send_data` writes to the socket inside the await and
+`drain_to_end_of_stream` awaits the server's `EndOfStream` — so each inserter
+task's await *is* the drum, and the internal WAL chain
+(reorder→decode→batcher→inserter) is bounded end to end: every stage awaits a
+bounded `mpmc`/`mpsc`, the terminal await is the CH send itself. Steady-state
+memory there is the sum of those bounded buffers.
+
+The three ingress channels are not one problem with one fix (the earlier
+"bound every channel" framing was too coarse):
+
+* **Bootstrap page-walk → drain: bounded (DONE 2026-06-09).** `BackupSink` is
+  async end to end (sink `Mutex` → `tokio::sync::Mutex`, all methods
+  `async fn`); `PageWalkSink::ship_tuple` awaits a bounded `mpsc::channel`
+  (`BOOTSTRAP_TUPLE_CHANNEL_CAP`). A full channel parks the page walk → the tar
+  body read → the object-store fetch. No standing buffer; the bootstrap paces
+  to CH. Deadlock-free: bootstrap runs before shadow start, so the drain
+  consumes on a separate task with no cycle.
+* **Ack events (`ack.rs`): unbounded by design, leave it.** The collector loop
+  is pure-sync `state.apply` (BTreeMap bookkeeping), strictly faster than any
+  producer, so the channel cannot back up. Bounding it buys zero memory and
+  would force `ack.acked` off its non-blocking fire-and-forget on the inserter
+  hot path.
+* **Pump → worker (`queueing_record_sink.rs`): soft-capped on purpose; real
+  bound is post-merge.** `on_record` and shadow-wire delivery are lockstep in
+  `wal_stream.rs::drain_records`, and `ReorderSink::maybe_sweep_dropped` →
+  `ShadowCatalog::wait_for_replay` couples decode to shadow apply, which needs
+  the pump to keep feeding *subsequent* wire bytes (walreceiver flush
+  granularity). A hard-bounded blocking `on_record` therefore re-introduces the
+  shadow-starvation deadlock the queueing sink exists to avoid; the soft cap
+  (yield past `soft_cap`) is the deliberate trade. Under sustained
+  CH-slower-than-WAL this buffer can still grow, buffering WAL in walshadow RAM
+  rather than letting the PG slot hold it on disk. The fix is to split wire
+  delivery (runs ahead, paced by shadow apply) from record dispatch (blocks on
+  a bounded queue) — architectural, not a channel swap. Post-merge (Post-merge
+  future work step 3).
+
 ## Sizing
 
 * **N inserters** ~= `insert_round_trip / time_to_seal_one_batch`, enough
   to avoid Cloud latency binding throughput
 * **M decoders** ~= enough that decode throughput >= aggregate insert
   throughput; keep M lower than N unless measurements show CPU bottleneck
-
-## Backpressure
-
-Use bounded channels everywhere. Current pump-to-worker mpsc is
-unbounded; replace it as part of pool work.
-
-Backpressure chain:
-
-```text
-inserter queue full -> InsertBatcher stalls -> decoders block -> job queue fills
--> reorder stalls -> pump soft_cap yields -> walsender queues
-```
-
-Bootstrap has the same gap and then some: the `PageWalkSink -> drain`
-channel (`backup_page_walk.rs::out_tx`) is `mpsc::unbounded` *by necessity*
-today, because `chunk()` is sync under a `std::Mutex` and `blocking_send`
-panics in the runtime. Bounding it needs a sync `try_send` + capacity (drop
-to a parking strategy on full) or moving the page split off the sink task.
-Its chain mirrors WAL:
-
-```text
-inserter queue full -> batcher stalls -> bootstrap drain blocks
--> PageWalkSink channel fills -> sink chunk() parks -> BackupSource backpressures
-   (DirectSource bounded events channel / ObjectStoreSource buffer_unordered)
-```
-
-Goal is bounded overlap, not unbounded buffering against slow ClickHouse.
 
 ## Build order
 

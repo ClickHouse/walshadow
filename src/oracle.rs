@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -80,7 +80,7 @@ impl Sampler {
 pub struct Oracle {
     client: Mutex<Option<Client>>,
     conninfo: String,
-    has_extension: Mutex<Option<bool>>,
+    has_extension: AtomicBool,
     pub stats: Arc<OracleStats>,
     pub sampler: Sampler,
 }
@@ -99,7 +99,7 @@ impl Oracle {
         Ok(Self {
             client: Mutex::new(Some(client)),
             conninfo: conninfo.to_owned(),
-            has_extension: Mutex::new(Some(has_ext)),
+            has_extension: AtomicBool::new(has_ext),
             stats: Arc::new(OracleStats::default()),
             sampler: Sampler::new(sample_rate),
         })
@@ -107,8 +107,8 @@ impl Oracle {
 
     /// Extension visible at connect time. Daemon status line surfaces this so
     /// operators confirm the optional-extension contract on boot.
-    pub async fn has_extension(&self) -> bool {
-        self.has_extension.lock().await.unwrap_or(false)
+    pub fn has_extension(&self) -> bool {
+        self.has_extension.load(Ordering::Relaxed)
     }
 
     /// Mirrors [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog)'s
@@ -122,7 +122,7 @@ impl Oracle {
         });
         let has_ext = probe_extension(&client).await.unwrap_or(false);
         *self.client.lock().await = Some(client);
-        *self.has_extension.lock().await = Some(has_ext);
+        self.has_extension.store(has_ext, Ordering::Relaxed);
         Ok(())
     }
 
@@ -133,7 +133,7 @@ impl Oracle {
         type_oid: u32,
         raw: &[u8],
     ) -> Result<Option<String>, OracleError> {
-        if !self.has_extension().await {
+        if !self.has_extension() {
             self.stats.fallback_raw.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
@@ -181,7 +181,7 @@ impl Oracle {
             | crate::heap_decoder::INETOID
             | crate::heap_decoder::CIDROID
             | crate::heap_decoder::INTERVALOID
-                if self.has_extension().await =>
+                if self.has_extension() =>
             {
                 // walshadow_decode_disk reconstructs the Datum then calls
                 // typoutput, same path the resolver uses
@@ -443,7 +443,7 @@ mod tests {
         let oracle = Arc::new(Oracle {
             client: Mutex::new(None),
             conninfo: String::new(),
-            has_extension: Mutex::new(None),
+            has_extension: AtomicBool::new(false),
             stats: Arc::new(OracleStats::default()),
             sampler: Sampler::new(0),
         });

@@ -9,12 +9,12 @@
 //! See [plans/bootstrap.md](../plans/bootstrap.md).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use wal_rs::pg::replication::base_backup::{
     BackupEvent, BaseBackupOpts, ChannelReader, run_base_backup,
 };
@@ -70,10 +70,8 @@ impl BackupSource for DirectSource {
                         tablespaces: s.tablespaces,
                     };
                     {
-                        let mut g = sink
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("sink mutex poisoned"))?;
-                        g.start(&s)?;
+                        let mut g = sink.lock().await;
+                        g.start(&s).await?;
                     }
                     start = Some(s);
                 }
@@ -92,10 +90,8 @@ impl BackupSource for DirectSource {
                         timeline: e.timeline,
                     };
                     {
-                        let mut g = sink
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("sink mutex poisoned"))?;
-                        g.finish(&e)?;
+                        let mut g = sink.lock().await;
+                        g.finish(&e).await?;
                     }
                     end = Some(e);
                 }

@@ -24,15 +24,17 @@
 //! seed/issue gap is indistinguishable from BASE_BACKUP's checkpoint window.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_postgres::Client;
 use wal_rs::pg::walparser::{Oid, RelFileNode};
 
-use crate::backup_page_walk::{BackfillTuple, CatalogMap, PageWalkSink, PageWalkStats};
+use crate::backup_page_walk::{
+    BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink, PageWalkStats,
+};
 use crate::backup_sink::{CatalogFilenodes, DiskLanderSink, DiskLanderStats, MultiplexSink};
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::decoder_sink::TupleObserver;
@@ -82,10 +84,9 @@ pub struct BootstrapOutcome {
 /// let shipped = drained.await?;
 /// ```
 ///
-/// Channel is unbounded because PageWalkSink::chunk is sync and would
-/// `blocking_send`-panic inside the runtime; a concurrent drain keeps the
-/// queue bounded in practice, else the producer holds every tuple in memory
-/// until source completes.
+/// Channel is bounded ([`BOOTSTRAP_TUPLE_CHANNEL_CAP`]): PageWalkSink::chunk
+/// awaits a free slot, so a slow drain backpressures the source rather than
+/// letting the producer hold every tuple in memory until source completes.
 ///
 /// Does not touch [`crate::shadow::Shadow`]; daemon owns shadow lifecycle.
 /// After pump returns, caller writes `standby.signal` with
@@ -96,12 +97,12 @@ pub fn spawn_greenfield_bootstrap(
     source: Box<dyn BackupSource>,
     catalog_map: CatalogMap,
 ) -> (
-    mpsc::UnboundedReceiver<BackfillTuple>,
+    mpsc::Receiver<BackfillTuple>,
     JoinHandle<Result<BootstrapOutcome>>,
 ) {
-    // Unbounded so sync PageWalkSink::chunk avoids blocking_send-panic; see
-    // backup_page_walk.rs::PageWalkSink::out_tx
-    let (tx, rx) = mpsc::unbounded_channel::<BackfillTuple>();
+    // Bounded: PageWalkSink::chunk awaits a free slot, so a slow drain
+    // backpressures the source instead of buffering the whole relation
+    let (tx, rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
     let pump = tokio::spawn(async move {
         tokio::fs::create_dir_all(&cfg.shadow_data_dir)
             .await
@@ -131,9 +132,7 @@ pub fn spawn_greenfield_bootstrap(
         // succeeds unless a clone leaked; else read through the Mutex
         let outcome = match Arc::try_unwrap(typed) {
             Ok(mtx) => {
-                let mux = mtx
-                    .into_inner()
-                    .map_err(|_| anyhow::anyhow!("bootstrap: mux mutex poisoned at teardown"))?;
+                let mux = mtx.into_inner();
                 let (lander, page_walk) = mux.into_inner();
                 // Dropping `page_walk` closes the channel sender in `out_tx`,
                 // so a concurrent drain observes channel-close on next recv
@@ -145,9 +144,7 @@ pub fn spawn_greenfield_bootstrap(
                 }
             }
             Err(arc) => {
-                let g = arc
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("bootstrap: mux mutex poisoned at teardown"))?;
+                let g = arc.lock().await;
                 BootstrapOutcome {
                     start,
                     end,
@@ -199,7 +196,7 @@ pub async fn run_greenfield_bootstrap(
 /// Final `on_xact_end` after channel-close lets the transitional emitter
 /// release CH state before the daemon swaps to the shadow-catalog emitter.
 pub async fn drain_backfill<O: TupleObserver + ?Sized>(
-    mut rx: mpsc::UnboundedReceiver<BackfillTuple>,
+    mut rx: mpsc::Receiver<BackfillTuple>,
     observer: &mut O,
 ) -> Result<u64> {
     let mut shipped: u64 = 0;
@@ -444,8 +441,8 @@ mod tests {
             sink: Arc<Mutex<dyn BackupSink>>,
         ) -> Result<(StartInfo, EndInfo)> {
             {
-                let mut g = sink.lock().unwrap();
-                g.start(&self.start)?;
+                let mut g = sink.lock().await;
+                g.start(&self.start).await?;
             }
             for (i, (meta, body)) in self.files.iter().enumerate() {
                 let mut cur: &[u8] = body;
@@ -459,8 +456,8 @@ mod tests {
                 .await?;
             }
             {
-                let mut g = sink.lock().unwrap();
-                g.finish(&self.end)?;
+                let mut g = sink.lock().await;
+                g.finish(&self.end).await?;
             }
             Ok((self.start.clone(), self.end.clone()))
         }
@@ -554,7 +551,7 @@ mod tests {
     async fn drain_backfill_synthesises_inserts_into_observer() {
         use crate::decoder_sink::CollectingTupleObserver;
 
-        let (tx, rx) = mpsc::unbounded_channel::<BackfillTuple>();
+        let (tx, rx) = mpsc::channel::<BackfillTuple>(64);
         let rfn = RelFileNode {
             spc_node: 1663,
             db_node: 5,
@@ -567,6 +564,7 @@ mod tests {
                 source_lsn: 0xCAFE,
                 columns: vec![Some(crate::heap_decoder::ColumnValue::Int4(v as i32))],
             })
+            .await
             .unwrap();
         }
         drop(tx);
@@ -631,7 +629,7 @@ mod tests {
             db_node: 5,
             rel_node: 16400,
         };
-        let (tx, rx) = mpsc::unbounded_channel::<BackfillTuple>();
+        let (tx, rx) = mpsc::channel::<BackfillTuple>(64);
         for v in 0..4u32 {
             tx.send(BackfillTuple {
                 rfn,
@@ -639,6 +637,7 @@ mod tests {
                 source_lsn: 1,
                 columns: vec![Some(crate::heap_decoder::ColumnValue::Int4(v as i32))],
             })
+            .await
             .unwrap();
         }
         drop(tx);
@@ -655,7 +654,7 @@ mod tests {
     async fn drain_backfill_calls_on_xact_end_even_on_empty_channel() {
         // Sender dropped without a tuple; `on_xact_end` still fires so the
         // transitional emitter's INSERT cleanup runs unconditionally
-        let (tx, rx) = mpsc::unbounded_channel::<BackfillTuple>();
+        let (tx, rx) = mpsc::channel::<BackfillTuple>(64);
         drop(tx);
         let mut obs = CountingObserver::default();
         let shipped = drain_backfill(rx, &mut obs).await.unwrap();

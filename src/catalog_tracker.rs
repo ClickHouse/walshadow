@@ -18,7 +18,8 @@
 //!   16384 before walshadow attached, so its `XLOG_RELMAP_UPDATE` sits
 //!   in pre-attach WAL the bootstrap rule never sees.
 //!
-//! Invalidation signal: when [`set_invalidation_epoch`] attaches an
+//! Invalidation signal: when
+//! [`set_invalidation_epoch`](CatalogTracker::set_invalidation_epoch) attaches an
 //! `AtomicU64`, every relmap-update / pg_class-heap-write observe bumps
 //! it. [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog) shares the
 //! atomic, acquire-loads at every relation lookup, and invalidates before

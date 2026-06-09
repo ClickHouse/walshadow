@@ -43,7 +43,7 @@ Two gaps fall out:
   `encode_value` (`src/ch_emitter.rs`) returns
   `EmitterError::UnsupportedValue { kind: "unresolved TOAST pointer (xact
   buffer should have reassembled)" }`. This is the
-  [[parallel_decode_and_insert]] "Blockers, refined" item 2 — bootstrap
+  [[pipeline_backpressure_and_scaling]] "Blockers, refined" item 2 — bootstrap
   *fails*, it does not ship. Latent only because test fixtures keep values
   inline (< ~2 KiB, below `TOAST_TUPLE_THRESHOLD`).
 * **Pre-window values can't be rebuilt from WAL alone.** A row whose value
@@ -166,7 +166,7 @@ the short-circuit with a real walk:
   to the mirrored CH toast table (a `TableMapping` for `pg_toast_<relid>`),
   same as any other table. Reuse `toast_chunk_from_decoded`'s shape check to
   validate the 3-column layout before shipping.
-* wire this through the shared tail per [[parallel_decode_and_insert]]
+* wire this through the shared tail per [[pipeline_backpressure_and_scaling]]
   "Base backup through the same pipeline": chunks are just more rows, one
   `op=Insert` at `_lsn = start_lsn`, no aborts, no barriers. Per-rfn seqs
   cover toast filenodes for free.
@@ -302,7 +302,7 @@ dedup is purely a dedup, never a value change.
 ## Incremental delivery
 
 Smallest-first, each step independently shippable, tied to the
-[[parallel_decode_and_insert]] TOAST blocker.
+[[pipeline_backpressure_and_scaling]] TOAST blocker.
 
 1. **Fail-fast cleanly.** Make the bootstrap `ExternalToast` path surface a
    documented, counted error instead of a bare `UnsupportedValue` deep in
@@ -319,7 +319,7 @@ Smallest-first, each step independently shippable, tied to the
    fallback in the R2 reassembler (hydrate the `chunks` map from the CH
    toast table, then call `reassemble` unchanged). Bootstrap and pre-window
    WAL values now resolve. This resolves the
-   [[parallel_decode_and_insert]] blocker fully.
+   [[pipeline_backpressure_and_scaling]] blocker fully.
 4. **WAL chunk durability.** Route same-xact `ToastChunk`s to the CH toast
    table too (second sink), so a future re-emit of a pre-window referrer
    finds its chunks. Without this, step 3's fallback only covers

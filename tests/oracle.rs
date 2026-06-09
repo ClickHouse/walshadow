@@ -138,7 +138,7 @@ async fn oracle_without_extension_falls_back_to_raw_bytes() {
     use std::sync::atomic::Ordering;
     assert_eq!(oracle.stats.fallback_raw.load(Ordering::Relaxed), 1);
     assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 0);
-    assert!(!oracle.has_extension().await);
+    assert!(!oracle.has_extension());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -174,7 +174,7 @@ async fn oracle_with_extension_resolves_tier3_disk_bytes() {
         "postgres",
     );
     let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
-    assert!(oracle.has_extension().await);
+    assert!(oracle.has_extension());
 
     // numeric — 42
     let txt = oracle

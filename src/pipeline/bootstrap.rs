@@ -3,7 +3,7 @@
 //!
 //! Greenfield base backup: every row `op=Insert` at one `_lsn = start_lsn`,
 //! no aborts/TRUNCATE/DDL barriers. Resolve + map only, no detoast or oracle
-//! resolution (Option A in `plans/future/parallel_decode_and_insert.md`);
+//! resolution (Option A in `plans/future/pipeline_backpressure_and_scaling.md`);
 //! page-walk decode stays single-threaded in
 //! [`PageWalkSink`](crate::backup_page_walk::PageWalkSink).
 //!
@@ -61,7 +61,7 @@ pub struct BootstrapDrainOutcome {
 /// skipped (bumping `unsupported_relations`, matching WAL decode pool).
 /// Errors only when batcher channel closes early (tail tripped `fatal`).
 pub async fn drain(
-    mut rx: mpsc::UnboundedReceiver<BackfillTuple>,
+    mut rx: mpsc::Receiver<BackfillTuple>,
     catalog: CatalogMap,
     mapping_handle: MappingHandle,
     msg_tx: mpsc::Sender<BatcherMsg>,
@@ -268,13 +268,13 @@ mod tests {
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-        let (tup_tx, tup_rx) = mpsc::unbounded_channel::<BackfillTuple>();
+        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
 
         for id in 0..3 {
-            tup_tx.send(tuple(16400, id)).unwrap();
+            tup_tx.send(tuple(16400, id)).await.unwrap();
         }
         for id in 0..2 {
-            tup_tx.send(tuple(16401, id)).unwrap();
+            tup_tx.send(tuple(16401, id)).await.unwrap();
         }
         drop(tup_tx);
 
@@ -318,12 +318,12 @@ mod tests {
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-        let (tup_tx, tup_rx) = mpsc::unbounded_channel::<BackfillTuple>();
+        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
 
         // 16400, 16401(unmapped), 16400 → seqs 0,1,2; only 0 and 2 route
-        tup_tx.send(tuple(16400, 1)).unwrap();
-        tup_tx.send(tuple(16401, 9)).unwrap();
-        tup_tx.send(tuple(16400, 2)).unwrap();
+        tup_tx.send(tuple(16400, 1)).await.unwrap();
+        tup_tx.send(tuple(16401, 9)).await.unwrap();
+        tup_tx.send(tuple(16400, 2)).await.unwrap();
         drop(tup_tx);
 
         let stats = Arc::new(EmitterStats::default());
@@ -362,9 +362,9 @@ mod tests {
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-        let (tup_tx, tup_rx) = mpsc::unbounded_channel::<BackfillTuple>();
+        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
 
-        tup_tx.send(toast_tuple(16400)).unwrap();
+        tup_tx.send(toast_tuple(16400)).await.unwrap();
         drop(tup_tx);
 
         let stats = Arc::new(EmitterStats::default());
