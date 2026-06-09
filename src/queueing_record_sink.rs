@@ -1,36 +1,24 @@
-//! `RecordSink` wrapper that decouples per-record dispatch from the
-//! WAL pump task.
+//! `RecordSink` wrapper decoupling per-record dispatch from the WAL
+//! pump task.
 //!
 //! ## Why
 //!
-//! The streaming-shadow design fires `RecordBytesSink::on_wire_chunk`
-//! (shadow-wire bytes) before `RecordSink::on_record` (decoder, xact
-//! buffer, emitter) per record, with both calls awaited in the pump
-//! task. The decoder's `ShadowCatalog::wait_for_replay` gate clears
-//! against bytes the wire already pushed, so under steady workload it
-//! resolves in milliseconds.
+//! Pump awaits `on_wire_chunk` (shadow-wire bytes) then `on_record`
+//! (decoder/xact buffer/emitter) per record. Decoder's
+//! `ShadowCatalog::wait_for_replay` clears against bytes the wire
+//! already pushed. Under DDL-mixed workload (`pgbench_acceptance`,
+//! `kill_restart` drills) it can exceed one record latency, parking
+//! the pump inside the await: bytes_sink stops firing, walsender
+//! queues drain, shadow's walreceiver starves, apply LSN stalls below
+//! `record.source_lsn`, wait trips its 30s catalog timeout. Deadlock.
 //!
-//! Under sustained workload mixed with DDL (the
-//! `pgbench_acceptance` and `kill_restart` drills),
-//! `wait_for_replay` can take longer than one record latency. Because
-//! the pump task is parked inside that await, the bytes_sink stops
-//! firing on subsequent records → walsender's per-connection queues
-//! drain → shadow's walreceiver stops getting WAL → shadow's apply
-//! LSN stalls below `record.source_lsn` → the wait trips its 30 s
-//! catalog timeout. Both sides deadlocked on each other.
+//! Break the lockstep: `on_record` owns the record `'static`, pushes
+//! onto an mpsc channel, returns. Worker drains through the inner sink
+//! at its own pace while pump keeps streaming bytes so shadow applies.
 //!
-//! `QueueingRecordSink` breaks the lockstep: pump-side `on_record`
-//! converts the record to a `'static` owned form, pushes it onto a
-//! bounded `mpsc` channel, and returns immediately. A worker task
-//! drains the channel through the real inner sink at its own pace.
-//! The pump task keeps streaming bytes to `RecordBytesSink` (so
-//! shadow keeps applying), and the decoder waits on shadow inside the
-//! worker without blocking the wire.
-//!
-//! Errors from the worker (catalog timeout, decoder semantic error,
-//! emitter I/O) surface back to the pump on the next `on_record` call
-//! by way of a shared error slot — the daemon exits cleanly with the
-//! actual root cause rather than hanging.
+//! Worker errors surface back to the pump on the next `on_record` via
+//! a shared error slot, so the daemon exits with the root cause rather
+//! than hanging.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -43,35 +31,27 @@ use tokio::task::JoinHandle;
 
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
-/// Pump-side buffer size: records collected before a batch is sent
-/// onto the worker channel. Picked to amortise the per-send overhead
-/// (atomic + alloc + wakeup) which dominates the queueing path at
-/// small per-record sizes. 64 lands the channel cost near 8 ns per
-/// record on top of the clone-into-owned baseline.
+/// Records batched before a channel send. Amortises per-send overhead
+/// (atomic + alloc + wakeup); 64 lands channel cost near 8ns/record
+/// over the clone-into-owned baseline.
 pub const DEFAULT_QUEUEING_BATCH_SIZE: usize = 64;
 
-/// Soft cap on the in-flight queue (records, summed across batches in
-/// the channel + the pump-side buffer). Past this the pump yields to
-/// the runtime so the worker drains. The hard cap is open-ended — if
-/// the worker permanently stalls, the catalog `wait_for_replay`
-/// timeout surfaces an error on the shared err slot and the pump
-/// bails on the next `on_record`.
+/// Soft in-flight cap (channel batches + pump buffer). Past it the
+/// pump yields so the worker drains. No hard cap: a permanently
+/// stalled worker surfaces via the `wait_for_replay` timeout on the
+/// shared err slot.
 pub const DEFAULT_QUEUEING_RECORD_SINK_CAPACITY: usize = 16_384;
 
-/// Default idle-wakeup cadence for the worker's `on_idle` tick. Picked
-/// to give the CH emitter's hold-INSERT-open deadline a chance to
-/// fire shortly after `flush_timeout` elapses without piling on
-/// wakeups during steady-state traffic. Concrete deployments should
-/// match this to roughly `flush_timeout / 2`.
+/// Worker `on_idle` cadence. Lets CH emitter's hold-INSERT-open
+/// deadline fire shortly after `flush_timeout` without piling on
+/// wakeups; deployments should match ~`flush_timeout / 2`.
 pub const DEFAULT_QUEUEING_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Wraps any `RecordSink` so per-record dispatch runs on a separate
-/// task. Construct via [`QueueingRecordSink::spawn`].
+/// Construct via [`QueueingRecordSink::spawn`].
 pub struct QueueingRecordSink {
     tx: Option<mpsc::UnboundedSender<Vec<Record<'static>>>>,
-    /// Pump-side accumulator. `on_record` clones the record here;
-    /// when `buf.len() >= batch_size` the buffer is shipped onto the
-    /// channel as one message. Final-flush happens in `close()`.
+    /// `on_record` clones here; shipped as one message at `batch_size`,
+    /// final flush in `close()`.
     buf: Vec<Record<'static>>,
     batch_size: usize,
     err: Arc<StdMutex<Option<SinkError>>>,
@@ -81,8 +61,7 @@ pub struct QueueingRecordSink {
 }
 
 impl QueueingRecordSink {
-    /// Spawn a worker task with the default idle cadence — see
-    /// [`Self::spawn_with_idle`] for the full-control entry.
+    /// Default idle cadence; see [`Self::spawn_with_idle`].
     pub fn spawn<S>(inner: S, batch_size: usize, soft_cap: usize) -> Self
     where
         S: RecordSink + Send + 'static,
@@ -90,17 +69,11 @@ impl QueueingRecordSink {
         Self::spawn_with_idle(inner, batch_size, soft_cap, DEFAULT_QUEUEING_IDLE_INTERVAL)
     }
 
-    /// Spawn a worker task that owns `inner`. Pump-side `on_record`
-    /// clones records into a local buffer; once `batch_size` records
-    /// accumulate, the whole batch is shipped onto an unbounded
-    /// channel. The worker drains batches and dispatches each record
-    /// through `inner`. `soft_cap` triggers a `yield_now` once the
-    /// in-flight count (channel + pump buffer) exceeds it.
-    ///
-    /// `idle_interval` controls how often the worker calls
-    /// `inner.on_idle()` when the channel is quiescent. Lets time-based
-    /// observer work (CH emitter's hold-INSERT-open deadline) fire
-    /// without requiring fresh records to arrive.
+    /// Worker owns `inner`, drains batches, dispatches each record.
+    /// `soft_cap` triggers `yield_now` once in-flight (channel + pump
+    /// buffer) exceeds it. `idle_interval` paces `inner.on_idle()` on a
+    /// quiescent channel so time-based observer work (CH emitter's
+    /// hold-INSERT-open deadline) fires without fresh records.
     pub fn spawn_with_idle<S>(
         mut inner: S,
         batch_size: usize,
@@ -118,9 +91,8 @@ impl QueueingRecordSink {
         let batch_size = batch_size.max(1);
         let idle_interval = idle_interval.max(Duration::from_millis(1));
         let worker = tokio::spawn(async move {
-            // Park the first error, drop the in-flight batch (`n`, or 0 on
-            // the idle path), then close+drain the channel so `in_flight`
-            // settles. Caller `break 'outer`s after.
+            // Park error, drop in-flight (`n`, or 0 on idle path),
+            // close+drain so `in_flight` settles. Caller breaks after.
             let park_err_and_drain =
                 async |e, n: u64, rx: &mut mpsc::UnboundedReceiver<Vec<Record<'static>>>| {
                     *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
@@ -142,11 +114,9 @@ impl QueueingRecordSink {
                                 break 'outer;
                             }
                         }
-                        // Post-batch nudge: lets the inner sink advance
-                        // its idle ack past trailing non-commit WAL.
-                        // Pump emits records in LSN order, so `max_lsn`
-                        // is a high-water mark for "everything ≤ this
-                        // is dispatched."
+                        // Advance inner sink's idle ack past trailing
+                        // non-commit WAL. Pump emits in LSN order, so
+                        // `max_lsn` is the dispatched high-water.
                         if let Err(e) = inner.on_idle_advance(max_lsn).await {
                             park_err_and_drain(e, n, &mut rx).await;
                             break 'outer;
@@ -154,20 +124,18 @@ impl QueueingRecordSink {
                         in_flight_w.fetch_sub(n, Ordering::Relaxed);
                     }
                     Ok(None) => {
-                        // Channel closed by `QueueingRecordSink::close`.
-                        // Give the inner sink one last shutdown tick
-                        // (CH emitter force-flushes hold-open
-                        // INSERTs here so the final flush window's
-                        // rows reach CH durably before the worker
-                        // exits).
+                        // Channel closed by `close`. Final shutdown
+                        // tick: CH emitter force-flushes hold-open
+                        // INSERTs so the last window's rows reach CH
+                        // durably before the worker exits.
                         if let Err(e) = inner.on_close().await {
                             *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
                         }
                         break 'outer;
                     }
                     Err(_) => {
-                        // Idle wakeup: drive any time-based work the
-                        // inner sink wants (CH emitter flush deadline).
+                        // Idle wakeup: drive time-based inner work
+                        // (CH emitter flush deadline).
                         if let Err(e) = inner.on_idle().await {
                             park_err_and_drain(e, 0, &mut rx).await;
                             break 'outer;
@@ -187,10 +155,9 @@ impl QueueingRecordSink {
         }
     }
 
-    /// Public flush. Ships whatever the pump has accumulated to the
-    /// worker without waiting for `batch_size`. Pump loop calls this
-    /// after each chunk so a quiescent source can't strand commits in
-    /// the pump-side buffer.
+    /// Ship the accumulated buffer without waiting for `batch_size`.
+    /// Pump calls this after each chunk so a quiescent source can't
+    /// strand commits in the pump-side buffer.
     pub async fn flush(&mut self) -> Result<(), SinkError> {
         if let Some(e) = self.take_pending_error() {
             return Err(e);
@@ -198,9 +165,6 @@ impl QueueingRecordSink {
         self.flush_buf()
     }
 
-    /// Ship the pump-side buffer to the worker. Called from
-    /// `on_record` when the batch fills, and from `close()` to flush
-    /// any tail.
     fn flush_buf(&mut self) -> Result<(), SinkError> {
         if self.buf.is_empty() {
             return Ok(());
@@ -224,18 +188,15 @@ impl QueueingRecordSink {
         Ok(())
     }
 
-    /// Drop the channel sender + join the worker. Any error the worker
-    /// has parked surfaces here. Call after the pump has stopped
-    /// feeding records.
+    /// Drop the sender + join the worker, surfacing any parked error.
+    /// Call after the pump stops feeding records.
     pub async fn close(mut self) -> Result<(), SinkError> {
-        // Flush any pump-side tail before dropping the sender so the
-        // worker sees the final batch.
+        // Flush tail before dropping sender so worker sees final batch.
         self.flush_buf()?;
-        self.tx.take(); // drop sender so worker observes channel close
+        self.tx.take();
         if let Some(handle) = self.worker.take() {
-            // Worker exits on `rx.recv() == None` (channel closed).
-            // Join propagates panics; treat as a sink error so the
-            // daemon's shutdown path surfaces them.
+            // Treat a worker panic as a sink error so daemon shutdown
+            // surfaces it.
             if let Err(e) = handle.await {
                 let msg = if e.is_panic() {
                     format!("queueing sink worker panicked: {e}")
@@ -267,9 +228,8 @@ impl QueueingRecordSink {
 impl Drop for QueueingRecordSink {
     fn drop(&mut self) {
         if let Some(handle) = self.worker.take() {
-            // Caller didn't `close()` — best-effort abort so the
-            // runtime doesn't leak the task. Errors get dropped here;
-            // a graceful shutdown should call `close().await` first.
+            // No `close()`: best-effort abort so the task doesn't leak.
+            // Graceful shutdown should `close().await` first.
             handle.abort();
         }
     }
@@ -292,11 +252,8 @@ impl RecordSink for QueueingRecordSink {
             });
             if self.buf.len() >= self.batch_size {
                 self.flush_buf()?;
-                // Soft backpressure: yield once the worker is N
-                // records behind so the runtime schedules it. Atomic
-                // load on the hot path; only yields when actually
-                // behind. Check only at flush time so the per-record
-                // cost stays minimal.
+                // Soft backpressure: yield only when actually behind,
+                // checked at flush time to keep per-record cost low.
                 if self.in_flight.load(Ordering::Relaxed) > self.soft_cap {
                     tokio::task::yield_now().await;
                 }
@@ -359,9 +316,8 @@ mod tests {
             }
         }
         let mut q = QueueingRecordSink::spawn(Fail, 1, 4);
-        // First send completes before the worker has consumed; the
-        // error parks in the slot. Spin until it lands so the next
-        // send hits the slot rather than racing the worker.
+        // First send returns before the worker consumes; spin until
+        // the error parks so the next send hits the slot, not a race.
         let _ = q.on_record(&synth(1)).await;
         for _ in 0..50 {
             if q.err.lock().unwrap().is_some() {

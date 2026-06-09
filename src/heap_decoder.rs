@@ -1,27 +1,20 @@
 //! User-heap tuple decoder + Tier 1/2 type matrix.
 //!
-//! Walks `RM_HEAP_ID` / `RM_HEAP2_ID` records the filter classified as
-//! `User`, projects the WAL payload through a per-relation
-//! [`RelDescriptor`] fetched from
-//! [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog), and emits a
-//! structured [`DecodedHeap`] per record. Tier 1 (fixed-width) + Tier 2
-//! (length-prefixed mechanical) types are decoded inline; Tier 3
-//! (`numeric`, `jsonb`, arrays, ...) is deferred to the Tier 3 codecs.
+//! Tier 1 (fixed-width) + Tier 2 (length-prefixed mechanical) types decode
+//! inline; Tier 3 (`numeric`, `jsonb`, arrays) defers to the codecs.
 //!
-//! ## WAL layout (PG `src/include/access/heapam_xlog.h`,
-//! `src/backend/access/heap/heapam.c::heap_xlog_*`)
+//! ## WAL layout (PG `access/heapam_xlog.h`, `heapam.c::heap_xlog_*`)
 //!
 //! ### INSERT (`info & 0x70 == 0x00`)
 //!
-//! - `main_data`: `xl_heap_insert` (3 bytes — `offnum:u16`, `flags:u8`)
+//! - `main_data`: `xl_heap_insert` (3 bytes: `offnum:u16`, `flags:u8`)
 //! - block 0 data: `xl_heap_header (5)` + bitmap[+pad] + col data
 //!
-//! `t_hoff` (5th byte of `xl_heap_header`) names the offset of column
-//! data **within the reconstructed `HeapTupleHeaderData`**, so the
-//! column-data offset inside `block.data` is `5 + (t_hoff - 23)`. The
-//! `5` is `SizeOfHeapHeader`; `23` is `SizeofHeapTupleHeader` (the
-//! fixed-header bytes PG strips per `XLogRegisterBufData(0,
-//! tup->t_data + SizeofHeapTupleHeader, ...)`).
+//! `t_hoff` (5th byte of `xl_heap_header`) is col-data offset within the
+//! reconstructed `HeapTupleHeaderData`, so col-data offset inside
+//! `block.data` is `5 + (t_hoff - 23)`. `5` = `SizeOfHeapHeader`; `23` =
+//! `SizeofHeapTupleHeader`, the fixed-header bytes PG strips per
+//! `XLogRegisterBufData(0, tup->t_data + SizeofHeapTupleHeader, ...)`
 //!
 //! ### DELETE (`0x10`)
 //!
@@ -35,20 +28,14 @@
 //!   old tuple bytes when `flags & XLH_UPDATE_CONTAINS_OLD`]
 //! - block 0 data: `[prefixlen:u16 if XLH_UPDATE_PREFIX_FROM_OLD]
 //!   [suffixlen:u16 if XLH_UPDATE_SUFFIX_FROM_OLD] + xl_heap_header
-//!   (5) + bitmap[+pad] + col data starting at reconstructed offset
-//!   t_hoff + prefixlen, ending at reconstructed offset
-//!   t_len - suffixlen`. PG emits prefix/suffix-compressed WAL when
-//!   the new tuple shares contiguous head/tail bytes with the old
-//!   tuple — see `heap_update` in heapam.c lines ≈ 8985 (prefix), 8997
-//!   (suffix). The "compressed away" bytes are *not* in WAL; reconstruction
-//!   needs the old tuple. The decoder marks those columns as
-//!   [`None`] in [`DecodedTuple::columns`] and flips
-//!   [`DecodedTuple::partial`] = true; the xact buffer can fill
-//!   them from the previous tuple image.
+//!   (5) + bitmap[+pad] + col data` spanning reconstructed offsets
+//!   `t_hoff + prefixlen` .. `t_len - suffixlen`. PG prefix/suffix-
+//!   compresses WAL when new shares contiguous head/tail bytes with old
+//!   (`heap_update` in heapam.c). Compressed-away bytes aren't in WAL;
+//!   reconstruction needs old tuple. Decoder marks those columns `None`
+//!   + sets [`DecodedTuple::partial`]; xact buffer backfills from prev image.
 //!
-//! ## Replica-identity matrix
-//!
-//! Per PG `ExtractReplicaIdentity` (heapam.c ≈ line 9150):
+//! ## Replica-identity matrix (PG `ExtractReplicaIdentity`, heapam.c)
 //!
 //! | `relreplident` | old payload | this module's behaviour |
 //! |---|---|---|
@@ -60,24 +47,19 @@
 //!
 //! ## What lives in `block.data` vs the FPI
 //!
-//! PG's `heap_insert` / `heap_update` set `bufflags |= REGBUF_KEEP_DATA`
-//! when `RelationIsLogicallyLogged(rel)` (which holds under
-//! `wal_level=logical`, walshadow's hard floor — see PLAN.md
-//! "Pitfalls/wal_level on source"). With `KEEP_DATA`, the tuple bytes
-//! are always present in `block.data`, even when an FPI replaces the
-//! page at recovery (`heap_xlog_insert` line ≈ 1130:
-//! `XLogReadBufferForRedoExtended` then `XLogRecGetBlockData`). So
-//! The decoder reads tuple bytes off `block.data` exclusively; the
-//! FPI-restore path lives in [`crate::fpi`] for the xact-buffer / BASEBACKUP
-//! use cases.
+//! PG `heap_insert`/`heap_update` set `REGBUF_KEEP_DATA` under
+//! `RelationIsLogicallyLogged(rel)` (holds at `wal_level=logical`,
+//! walshadow's hard floor, PLAN.md "Pitfalls/wal_level on source"). With
+//! `KEEP_DATA` tuple bytes are always in `block.data`, even when an FPI
+//! replaces the page at recovery (`heap_xlog_insert`). Decoder reads tuple
+//! bytes off `block.data` exclusively; FPI-restore lives in [`crate::fpi`]
+//! for xact-buffer / BASEBACKUP use.
 //!
 //! ## Roll-back ghost rows
 //!
-//! The decoder emits eagerly the moment the heap record arrives — no
-//! per-xact buffer, no `XLOG_XACT_ABORT` retraction. Aborted xacts
-//! produce ghost rows downstream; that rollback-status limitation is
-//! explicit and by design. The decoder is unaware of
-//! xact state; it stamps every output with `xid` so the xact buffer
+//! Decoder emits eagerly per heap record: no per-xact buffer, no
+//! `XLOG_XACT_ABORT` retraction. Aborted xacts produce ghost rows
+//! downstream by design. Every output stamped with `xid` so xact buffer
 //! can key on it.
 
 use smallvec::{SmallVec, smallvec};
@@ -86,25 +68,24 @@ use wal_rs::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
 
-/// Per-record decode output. SmallVec sized at 1 keeps the
-/// INSERT/UPDATE/DELETE single-row path stack-allocated; only
-/// MULTI_INSERT with ntuples > 1 spills to heap.
+/// SmallVec sized at 1: single-row INSERT/UPDATE/DELETE stays stack-allocated,
+/// only MULTI_INSERT with ntuples > 1 spills.
 pub type DecodedHeaps = SmallVec<[DecodedHeap; 1]>;
 
-/// `SizeOfHeapHeader` from PG `heapam_xlog.h`.
+/// PG `SizeOfHeapHeader`.
 pub const SIZE_OF_HEAP_HEADER: usize = 5;
-/// `SizeofHeapTupleHeader` — stable at 23 bytes since PG 7.x.
+/// PG `SizeofHeapTupleHeader`, stable at 23 since PG 7.x.
 pub const SIZE_OF_HEAP_TUPLE_HEADER: usize = 23;
-/// `SizeOfHeapInsert` from PG `heapam_xlog.h` (offnum:u16 + flags:u8).
+/// PG `SizeOfHeapInsert` (offnum:u16 + flags:u8).
 pub const SIZE_OF_HEAP_INSERT: usize = 3;
-/// `SizeOfHeapDelete` (xmax:u32 + offnum:u16 + infobits_set:u8 + flags:u8).
+/// PG `SizeOfHeapDelete` (xmax:u32 + offnum:u16 + infobits_set:u8 + flags:u8).
 pub const SIZE_OF_HEAP_DELETE: usize = 8;
-/// `SizeOfHeapUpdate` (old_xmax:u32 + old_offnum:u16 + old_infobits:u8 +
-/// flags:u8 + new_xmax:u32 + new_offnum:u16). Note the C-struct
-/// `sizeof` is 16 with trailing pad; PG's `XLogRegisterData` strips it.
+/// PG `SizeOfHeapUpdate` (old_xmax:u32 + old_offnum:u16 + old_infobits:u8 +
+/// flags:u8 + new_xmax:u32 + new_offnum:u16). C-struct `sizeof` is 16 with
+/// trailing pad; PG `XLogRegisterData` strips it.
 pub const SIZE_OF_HEAP_UPDATE: usize = 14;
 
-/// Mask for the op portion of `info` (strips off `XLOG_HEAP_INIT_PAGE`).
+/// Op portion of `info`, strips `XLOG_HEAP_INIT_PAGE`.
 pub const XLOG_HEAP_OPMASK: u8 = 0x70;
 
 pub const XLOG_HEAP_INSERT: u8 = 0x00;
@@ -181,85 +162,68 @@ pub enum DecodeError {
     BadPrefixSuffix { need: usize, have: usize },
 }
 
-/// Tier 1/2 decoded value space. One variant per type in the
-/// type matrix; everything else surfaces as
-/// [`ColumnValue::Unsupported`] (covers Tier 3 codecs still to
-/// ship) or [`ColumnValue::ExternalToast`] (the xact buffer will detoast).
+/// Tier 1/2 decoded value space. Out-of-matrix types surface as
+/// [`ColumnValue::Unsupported`] or [`ColumnValue::ExternalToast`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnValue {
-    /// Explicit SQL NULL — bitmap bit clear.
     Null,
     Bool(bool),
-    /// `char` (typname='char'), 1 byte. PG stores as `int8` but
-    /// surface as `i8` so callers can distinguish from `int2`.
+    /// `char` (typname='char'). PG stores as `int8`; surface `i8` to
+    /// distinguish from `int2`.
     Char(i8),
     Int2(i16),
     Int4(i32),
     Int8(i64),
     Float4(f32),
     Float8(f64),
-    /// `oid`, `regproc`, etc. — 4-byte unsigned.
     Oid(u32),
-    /// `date` — days since PG epoch (2000-01-01). Negative for pre-epoch.
+    /// `date`, days since PG epoch 2000-01-01, negative for pre-epoch.
     Date(i32),
-    /// `time` — microseconds since midnight. PG built with
-    /// `--disable-integer-datetimes` (legacy float8 storage) was
-    /// removed in PG 10; everything we target is integer microseconds.
+    /// `time`, microseconds since midnight. Legacy float8 storage
+    /// (`--disable-integer-datetimes`) removed in PG 10.
     Time(i64),
-    /// `timestamp` — microseconds since PG epoch (2000-01-01 00:00:00 UTC).
+    /// `timestamp`, microseconds since PG epoch 2000-01-01 00:00:00 UTC.
     Timestamp(i64),
-    /// `timestamptz` — same storage as `timestamp`; the suffix is a
-    /// presentation-only flag in PG, the bytes are identical.
+    /// `timestamptz`, same storage as `timestamp`; tz is presentation-only
+    /// in PG, bytes identical.
     TimestampTz(i64),
-    /// `timetz` — `time` storage + 4-byte UTC offset (seconds; negative
-    /// for east of UTC, per PG's sign convention).
+    /// `timetz`, `time` storage + 4-byte UTC offset (seconds, negative for
+    /// east of UTC per PG sign convention).
     TimeTz {
         micros: i64,
         tz_seconds: i32,
     },
-    /// `uuid` — 16 raw bytes, network byte order on disk per PG's
-    /// `uuid_send` (no swap, just memcpy).
+    /// `uuid`, 16 raw bytes network byte order on disk (PG `uuid_send`, memcpy).
     Uuid([u8; 16]),
-    /// `name` — NAMEDATALEN-bounded (64) C string, no varlena header.
-    /// Stored as fixed-size 64 bytes with NUL padding; surface trimmed.
+    /// `name`, NUL-padded NAMEDATALEN(64) C string, no varlena header;
+    /// surface trimmed.
     Name(String),
-    /// `bytea` — raw bytes, varlena unwrapped.
     Bytea(Vec<u8>),
-    /// `text` / `varchar` / `bpchar` — varlena unwrapped + UTF-8 decode.
-    /// Invalid UTF-8 surfaces as [`ColumnValue::Bytea`] with a stats counter.
+    /// `text`/`varchar`/`bpchar`, varlena + UTF-8 decode. Invalid UTF-8
+    /// surfaces as [`ColumnValue::Bytea`].
     Text(String),
-    /// `numeric` — Tier 3. Rendered as its PG-text form for finite
-    /// values; NaN / Infinity carry their flag directly. Emitter
-    /// downstream maps to CH `String` (precision is per-row in PG; no
-    /// fixed CH `Decimal` type fits without operator config).
+    /// `numeric` Tier 3. PG-text form for finite; NaN/Infinity carry their
+    /// flag. Emitter maps to CH `String` (PG precision is per-row, no fixed
+    /// CH `Decimal` fits without operator config).
     Numeric(crate::codecs::NumericKind),
-    /// `inet` / `cidr` — Tier 3. Carries family/bits/cidr-flag/addr;
-    /// emit via [`crate::codecs::InetValue::to_text`].
+    /// `inet`/`cidr` Tier 3. Emit via [`crate::codecs::InetValue::to_text`].
     Inet(crate::codecs::InetValue),
-    /// `interval` — Tier 3. 16-byte fixed-width tuple (months, days,
-    /// micros).
+    /// `interval` Tier 3, 16-byte fixed-width (months, days, micros).
     Interval(crate::codecs::IntervalValue),
-    /// `json` — Tier 3. Stored as varlena text directly on disk; we
-    /// pass it through unchanged.
+    /// `json` Tier 3, varlena text on disk, passed through unchanged.
     Json(String),
-    /// Deferred decode: the type isn't in walshadow's Tier 1/2
-    /// matrix and isn't one of the locally-implemented Tier 3 hot types
-    /// (numeric / inet / interval / json). Carries the raw on-disk
-    /// body; resolution to text happens at emit time via a
-    /// `walshadow_decode_disk(oid, bytea) -> text` SQL call against
-    /// shadow PG (the `walshadow` extension). When the extension
-    /// is unavailable, the emitter falls back to writing `<oid:N>` and
-    /// bumping `unsupported_values`.
+    /// Tier 3 deferred (not numeric/inet/interval/json). Carries raw
+    /// on-disk body; resolved to text at emit via
+    /// `walshadow_decode_disk(oid, bytea) -> text` against shadow PG
+    /// (`walshadow` extension). Absent extension: emitter writes `<oid:N>`,
+    /// bumps `unsupported_values`.
     PgPending {
         type_oid: u32,
         raw: Vec<u8>,
     },
-    /// On-disk TOAST pointer — the xact buffer's TOAST reassembly will
-    /// dereference. Until then, callers see opaque metadata and can
-    /// either skip or emit a placeholder downstream.
+    /// On-disk TOAST pointer; xact buffer's TOAST reassembly dereferences.
     ExternalToast(ToastPointer),
-    /// Type OID outside the decoder's matrix. Carries the raw bytes so
-    /// downstream stages can either treat as opaque or punt.
+    /// Type OID outside decoder matrix, carries raw bytes.
     Unsupported {
         type_oid: u32,
         raw: Vec<u8>,
@@ -267,12 +231,10 @@ pub enum ColumnValue {
 }
 
 impl ColumnValue {
-    /// Approximate in-memory payload bytes of the decoded value — varlena
-    /// lengths plus fixed-width scalar widths. Used to bound the decode
-    /// pool's coalescing buffer; varlena (detoasted) payloads dominate, but
-    /// scalars are counted so a wide row still accrues. Detoast has already
-    /// run by route time, so `ExternalToast` pointers are resolved into
-    /// `Text`/`Bytea` here. Exhaustive so a new variant forces a width.
+    /// Approximate in-memory payload bytes, to bound the decode pool's
+    /// coalescing buffer. Detoast has already run by route time so
+    /// `ExternalToast` pointers are resolved into `Text`/`Bytea`. Exhaustive
+    /// so a new variant forces a width.
     pub fn approx_bytes(&self) -> usize {
         use crate::codecs::NumericKind;
         match self {
@@ -302,8 +264,8 @@ impl ColumnValue {
     }
 }
 
-/// On-disk TOAST pointer (`struct varatt_external` in PG `varatt.h`).
-/// 16 bytes total, unaligned in the source tuple.
+/// On-disk TOAST pointer (PG `varatt.h` `struct varatt_external`), 16 bytes,
+/// unaligned in source tuple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToastPointer {
     pub va_rawsize: i32,
@@ -312,9 +274,8 @@ pub struct ToastPointer {
     pub va_toastrelid: u32,
 }
 
-/// One decoded WAL heap record. Op + LSN + xid + new image + old image
-/// (per `relreplident`). Column count + ordering matches
-/// `RelDescriptor.attributes` — i.e. attnum-1 indexed.
+/// One decoded WAL heap record. Column count + ordering matches
+/// `RelDescriptor.attributes`, i.e. attnum-1 indexed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedHeap {
     pub rfn: RelFileNode,
@@ -326,8 +287,7 @@ pub struct DecodedHeap {
 }
 
 impl DecodedHeap {
-    /// Sum of [`ColumnValue::approx_bytes`] across both tuple images
-    /// (REPLICA IDENTITY FULL keeps a fat `old` image alive too).
+    /// Sum across both images (REPLICA IDENTITY FULL keeps a fat `old` too).
     pub fn approx_bytes(&self) -> usize {
         let image = |t: &Option<DecodedTuple>| {
             t.as_ref().map_or(0, |t| {
@@ -346,71 +306,50 @@ impl DecodedHeap {
 pub enum HeapOp {
     Insert,
     Update,
-    /// `XLOG_HEAP_HOT_UPDATE` — emitted as a separate op because
-    /// downstream may want to skip them entirely (HOT updates by
-    /// definition touch no logged index; the visible row identity
-    /// is unchanged). PG distinction matters for the index
-    /// drill but not for CH emission today.
+    /// `XLOG_HEAP_HOT_UPDATE`, separate op so downstream may skip: HOT
+    /// updates touch no logged index, visible row identity unchanged.
     HotUpdate,
     Delete,
-    /// `XLOG_HEAP_TRUNCATE` — relation-wide deletion. Carries no
-    /// tuple payload (`new = None`, `old = None`); the rfn + xid +
-    /// source_lsn locate the affected relation. PG emits one record
-    /// per relid in the truncated set; walshadow fans out one
-    /// `DecodedHeap` per relid before this op reaches the buffer.
+    /// `XLOG_HEAP_TRUNCATE`, relation-wide, no tuple payload. PG emits one
+    /// record per relid in the truncated set; walshadow fans out one
+    /// `DecodedHeap` per relid before reaching the buffer.
     Truncate,
 }
 
-/// One drained tuple, fully reassembled. The CH emitter consumes
-/// this as `(rfn, xid, source_lsn, commit_ts, op, new, old)`. The
-/// `commit_ts` half is the commit-record `xact_time` carried through
-/// [`crate::xact_buffer::XactBuffer::commit`].
+/// One drained tuple, fully reassembled. `commit_ts` is the commit-record
+/// `xact_time` carried through [`crate::xact_buffer::XactBuffer::commit`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTuple {
     pub decoded: DecodedHeap,
-    /// PG `TimestampTz` from the xact commit record (microseconds
-    /// since PG epoch 2000-01-01). 0 when the upstream commit record
-    /// lacked the field or hasn't arrived yet (decoder unbuffered
-    /// path).
+    /// PG `TimestampTz` from xact commit record (micros since PG epoch
+    /// 2000-01-01). 0 when commit record lacked field or hasn't arrived
+    /// (decoder unbuffered path).
     pub commit_ts: i64,
-    /// Source LSN of the matching `XLOG_XACT_COMMIT` record.
-    /// The CH emitter snapshots this onto its ack-LSN gauge once the
-    /// containing xact's `send_data(None)` finishes; the daemon's
-    /// status loop writes the value into the cursor file's
-    /// `emitter_ack_lsn` slot. `0` for the decoder's unbuffered path.
+    /// Source LSN of matching `XLOG_XACT_COMMIT`. CH emitter snapshots onto
+    /// its ack-LSN gauge once the xact's `send_data(None)` finishes; daemon
+    /// status loop writes it to cursor file `emitter_ack_lsn`. 0 for
+    /// decoder unbuffered path.
     pub commit_lsn: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedTuple {
-    /// 0-based by attnum-1. `None` means "absent from WAL" — either
-    /// PG's UPDATE prefix/suffix compression skipped it, or this
-    /// `relreplident` shape never carries it. `Some(ColumnValue::Null)`
-    /// is explicit NULL (bitmap bit clear).
+    /// Indexed by attnum-1. `None` = absent from WAL (PG UPDATE prefix/suffix
+    /// compression skipped it, or this `relreplident` shape never carries it).
+    /// `Some(ColumnValue::Null)` is explicit NULL (bitmap bit clear).
     pub columns: Vec<Option<ColumnValue>>,
-    /// True iff at least one [`Some`] in `columns` was elided due to
-    /// PG's prefix/suffix compression. Downstream (the xact
-    /// buffer) can backfill from the previous tuple image.
+    /// True iff a column was elided by PG prefix/suffix compression; xact
+    /// buffer backfills from previous tuple image.
     pub partial: bool,
 }
 
-/// Top-level decode entry point. Returns:
+/// Top-level decode entry point. One-element [`DecodedHeaps`] for
+/// INSERT/UPDATE/HOT_UPDATE/DELETE, N-element for `XLOG_HEAP2_MULTI_INSERT`,
+/// empty for ops with no tuple payload (LOCK, INPLACE, TRUNCATE, other
+/// `RM_HEAP2_ID` ops, MULTI_INSERT lacking `XLH_INSERT_CONTAINS_NEW_TUPLE`).
+/// Unrecognised op codes skip silently; only malformed bytes return `Err`.
 ///
-/// - One-element [`DecodedHeaps`] for INSERT / UPDATE / HOT_UPDATE /
-///   DELETE on this `RelDescriptor`.
-/// - N-element [`DecodedHeaps`] for `XLOG_HEAP2_MULTI_INSERT`, one
-///   per tuple.
-/// - Empty [`DecodedHeaps`] for ops with no tuple payload to emit
-///   (LOCK, INPLACE, TRUNCATE, every other `RM_HEAP2_ID` op,
-///   every record on a non-User relation, MULTI_INSERT lacking
-///   `XLH_INSERT_CONTAINS_NEW_TUPLE`). Callers count these for
-///   metrics but don't ship them.
-/// - `Err` only on malformed bytes — contract is silent skip beats
-///   noisy failure for unrecognised op codes, but malformed
-///   `xl_heap_header` / block data short reads still surface.
-///
-/// `rel` must describe the relation that `record.blocks[0].header.location.rel`
-/// names — caller's responsibility to fetch via
+/// `rel` must describe `record.blocks[0].header.location.rel`, fetched via
 /// [`ShadowCatalog::relation_at`](crate::shadow_catalog::ShadowCatalog::relation_at).
 pub fn decode_heap_record(
     record: &XLogRecord,
@@ -441,7 +380,6 @@ pub fn decode_heap_record(
             XLOG_HEAP_DELETE => Ok(smallvec![
                 decode_delete(record, source_lsn, rfn, xid, rel,)?
             ]),
-            // LOCK / INPLACE / CONFIRM / TRUNCATE / out-of-band: skip silently.
             _ => Ok(SmallVec::new()),
         }
     } else {
@@ -452,20 +390,15 @@ pub fn decode_heap_record(
     }
 }
 
-/// `xl_heap_multi_insert` per-record header size.
-/// PG `SizeOfHeapMultiInsert = offsetof(xl_heap_multi_insert, offsets) = 4`:
-/// `flags:u8 + pad:u8 + ntuples:u16`. The 1-byte pad sits between flags
-/// and ntuples so the u16 lands on a 2-byte boundary.
+/// PG `SizeOfHeapMultiInsert = offsetof(xl_heap_multi_insert, offsets)`:
+/// `flags:u8 + pad:u8 + ntuples:u16`. 1-byte pad 2-byte-aligns ntuples.
 pub const SIZE_OF_HEAP_MULTI_INSERT: usize = 4;
-/// `xl_multi_insert_tuple` on-wire size (`datalen:u16 + t_infomask2:u16 +
-/// t_infomask:u16 + t_hoff:u8`). PG `SizeOfMultiInsertTuple` from
-/// `heapam_xlog.h`.
+/// PG `SizeOfMultiInsertTuple`, `xl_multi_insert_tuple` on-wire:
+/// `datalen:u16 + t_infomask2:u16 + t_infomask:u16 + t_hoff:u8`.
 pub const SIZE_OF_MULTI_INSERT_TUPLE: usize = 7;
 
-/// `XLOG_HEAP_INIT_PAGE` is layered on top of the op nibble. When set,
-/// the writer omits the offset array (tuples land at sequential
-/// `FirstOffsetNumber + i`). See PG `heapam.c::heap_multi_insert` line
-/// ≈ 2607.
+/// Layered on the op nibble. Set => writer omits offset array (tuples land at
+/// sequential `FirstOffsetNumber + i`), PG `heapam.c::heap_multi_insert`.
 pub const XLOG_HEAP_INIT_PAGE: u8 = 0x80;
 
 fn decode_multi_insert(
@@ -484,31 +417,24 @@ fn decode_multi_insert(
         });
     }
     let flags = md[0];
-    // md[1] is the pad byte (PG inserts it to 2-byte-align ntuples).
+    // md[1] is pad
     let ntuples = u16::from_le_bytes([md[2], md[3]]) as usize;
     if ntuples == 0 {
-        // Empty MULTI_INSERT is malformed per PG's assert path; bail
-        // loudly so a corrupt stream surfaces.
+        // Malformed per PG assert path; bail so corrupt stream surfaces
         return Err(DecodeError::Truncated {
             offset: 0,
             need: 1,
             have: 0,
         });
     }
-    // No CONTAINS_NEW_TUPLE: writer ran without wal_level=logical (or
-    // a similar gate stripped the tuple bytes from block 0). Without
-    // tuple data we'd synthesize empty rows; skip the whole record.
-    // PG sets this flag whenever logical decoding needs the payload —
-    // walshadow's hard floor is `wal_level=logical`, so the gate is
-    // a paranoia check rather than the common path.
+    // No CONTAINS_NEW_TUPLE => tuple bytes stripped (writer not at
+    // wal_level=logical). Skip; walshadow floor is logical so paranoia check
     if flags & XLH_INSERT_CONTAINS_NEW_TUPLE == 0 {
         return Ok(SmallVec::new());
     }
     let init_page = record.header.info & XLOG_HEAP_INIT_PAGE != 0;
-    // When not init_page, main_data continues with offsets[ntuples] of
-    // u16 each. We don't need the offset values themselves — block 0's
-    // data carries tuples in order — but the length check ensures the
-    // record is well-formed.
+    // Non-init_page: main_data continues with offsets[ntuples] of u16.
+    // Values unneeded (block 0 carries tuples in order); length-check only
     let expected_md_min = if init_page {
         SIZE_OF_HEAP_MULTI_INSERT
     } else {
@@ -530,8 +456,8 @@ fn decode_multi_insert(
     let mut cursor = 0usize;
     let mut out: DecodedHeaps = SmallVec::with_capacity(ntuples);
     for _ in 0..ntuples {
-        // Each xl_multi_insert_tuple is SHORTALIGN'd (2-byte) at write
-        // time. PG `heap_xlog_multi_insert` line ≈ 621.
+        // Each xl_multi_insert_tuple SHORTALIGN'd (2-byte) at write time,
+        // PG `heap_xlog_multi_insert`
         cursor = align_up(cursor, 2);
         if data.len() < cursor + SIZE_OF_MULTI_INSERT_TUPLE {
             return Err(DecodeError::Truncated {
@@ -552,12 +478,9 @@ fn decode_multi_insert(
                 have: data.len().saturating_sub(cursor),
             });
         }
-        // Reshape into the `xl_heap_header + bitmap + col data` layout
-        // `decode_tuple_payload` expects: PG strips the 5-byte
-        // xl_heap_header at write time for multi-insert and stores
-        // (t_infomask2, t_infomask, t_hoff) on the per-tuple
-        // xl_multi_insert_tuple instead. Re-synthesize the 5 bytes,
-        // then append the tuple body (bitmap+pad+col data).
+        // Multi-insert strips the 5-byte xl_heap_header at write time and
+        // stores (t_infomask2, t_infomask, t_hoff) on xl_multi_insert_tuple.
+        // Re-synthesize those 5 bytes + tuple body for decode_tuple_payload
         let mut synth = Vec::with_capacity(SIZE_OF_HEAP_HEADER + datalen);
         synth.extend_from_slice(&t_infomask2.to_le_bytes());
         synth.extend_from_slice(&t_infomask.to_le_bytes());
@@ -587,8 +510,8 @@ fn decode_insert(
     let block = match record.blocks.first() {
         Some(b) => b,
         None => {
-            // INSERT with no block ref is malformed; PG always references the
-            // target page. Emit empty new tuple rather than failing the stream.
+            // PG always references target page; emit empty new rather than
+            // fail the stream
             return Ok(DecodedHeap {
                 rfn,
                 xid,
@@ -625,7 +548,7 @@ fn decode_update(
             have: record.main_data.len(),
         });
     }
-    let flags = record.main_data[7]; // xl_heap_update.flags offset, see file header
+    let flags = record.main_data[7]; // xl_heap_update.flags offset
     let has_prefix = flags & XLH_UPDATE_PREFIX_FROM_OLD != 0;
     let has_suffix = flags & XLH_UPDATE_SUFFIX_FROM_OLD != 0;
     let has_old_tuple = flags & XLH_UPDATE_CONTAINS_OLD_TUPLE != 0;
@@ -688,7 +611,7 @@ fn decode_delete(
             have: record.main_data.len(),
         });
     }
-    let flags = record.main_data[7]; // xl_heap_delete.flags offset (after xmax:4 + offnum:2 + infobits_set:1)
+    let flags = record.main_data[7]; // xl_heap_delete.flags (after xmax:4 + offnum:2 + infobits:1)
     let has_old = flags & (XLH_DELETE_CONTAINS_OLD_TUPLE | XLH_DELETE_CONTAINS_OLD_KEY) != 0;
     let old = if has_old {
         decode_old_tuple_from_main_data(&record.main_data, SIZE_OF_HEAP_DELETE, rel)?
@@ -731,17 +654,10 @@ fn decode_old_tuple_from_main_data(
     )?))
 }
 
-/// Walk a tuple payload that starts with `xl_heap_header` at `header_off`
-/// of `buf`, then bitmap, padding, and column data. `prefixlen` /
-/// `suffixlen` are PG's `XLH_UPDATE_*_FROM_OLD` byte counts: bytes
-/// Decode a tuple payload shaped like WAL `block.data` —
-/// `xl_heap_header (5)` followed by bitmap, padding, and column data
-/// starting at logical-tuple offset `t_hoff`. Used by the bootstrap
-/// page-walk sink which reshapes on-disk `HeapTupleHeaderData`-prefixed
-/// tuples into this form so the same heap decoder fields both.
-///
-/// `prefixlen=suffixlen=0` because the WAL prefix/suffix-from-old
-/// compression doesn't apply at backup time.
+/// Decode a `block.data`-shaped tuple for the bootstrap page-walk sink,
+/// which reshapes on-disk `HeapTupleHeaderData`-prefixed tuples into this
+/// form. `prefixlen=suffixlen=0`: WAL prefix/suffix-from-old compression
+/// doesn't apply at backup time.
 pub(crate) fn decode_block_data(
     block_data: &[u8],
     rel: &RelDescriptor,
@@ -749,12 +665,12 @@ pub(crate) fn decode_block_data(
     decode_tuple_payload(block_data, 0, rel, 0, 0)
 }
 
-/// elided from the front (prefix) and back (suffix) of the logical
-/// column-data region. Columns whose byte ranges fall entirely inside
-/// those regions surface as `None` in the output and the caller flips
-/// `partial=true`. Bitmap + xl_heap_header are written *before* prefix
-/// elision so they're always present at `header_off` regardless of
-/// prefix/suffix.
+/// Walk a tuple payload (`xl_heap_header` at `header_off`, then bitmap,
+/// padding, col data). `prefixlen`/`suffixlen` are PG `XLH_UPDATE_*_FROM_OLD`
+/// byte counts elided from front/back of the logical col-data region; columns
+/// wholly inside those regions surface `None` and caller flips `partial`.
+/// Bitmap + xl_heap_header precede prefix elision so are always present at
+/// `header_off`.
 fn decode_tuple_payload(
     buf: &[u8],
     header_off: usize,
@@ -782,9 +698,8 @@ fn decode_tuple_payload(
     let has_null = t_infomask & HEAP_HASNULL != 0;
 
     let bitmap_bytes = if has_null { natts.div_ceil(8) } else { 0 };
-    // Tuple header offset 23 → bitmap → MAXALIGN(8) padding → col data at
-    // logical tuple offset t_hoff. The WAL block-data slice elides the
-    // 23-byte fixed header. Bitmap starts at buf[header_off + 5].
+    // PG tuple: header(23) -> bitmap -> MAXALIGN(8) pad -> col data at t_hoff.
+    // WAL slice elides the 23-byte fixed header, so bitmap is at header_off + 5
     let bitmap_off = header_off + SIZE_OF_HEAP_HEADER;
     if buf.len() < bitmap_off + bitmap_bytes {
         return Err(DecodeError::Truncated {
@@ -795,35 +710,27 @@ fn decode_tuple_payload(
     }
     let bitmap = &buf[bitmap_off..bitmap_off + bitmap_bytes];
 
-    // Column data in WAL block: starts after `xl_heap_header + (t_hoff - 23)`
-    // bytes (the bytes between SizeofHeapTupleHeader and t_hoff are bitmap +
-    // alignment pad, all carried verbatim in WAL).
+    // Bytes between SizeofHeapTupleHeader and t_hoff (bitmap + align pad) are
+    // carried verbatim in WAL
     let col_data_off = header_off + SIZE_OF_HEAP_HEADER + (t_hoff - SIZE_OF_HEAP_TUPLE_HEADER);
 
     let mut columns = Vec::with_capacity(rel.attributes.len());
-    // `cur` is the byte offset within the *logical* column-data region
-    // (i.e. relative to logical-tuple offset t_hoff). Alignment matches
-    // PG's `att_align_nominal` against this logical offset. t_hoff is
-    // MAXALIGN'd (8) so column 1 starts cleanly. WAL block-data offset
-    // for the bytes of column at logical offset `cur` is
-    // `col_data_off + (cur - prefixlen)` when `cur >= prefixlen`.
+    // `cur` is offset within the *logical* col-data region (relative to
+    // t_hoff); align matches PG `att_align_nominal` against this offset. t_hoff
+    // is MAXALIGN'd(8) so col 1 starts clean. WAL offset of logical `cur` is
+    // `col_data_off + (cur - prefixlen)` when `cur >= prefixlen`
     let mut cur: usize = 0;
     let attrs = effective_attrs(rel, natts);
     let wal_col_data_avail = buf.len().saturating_sub(col_data_off);
-    // Logical end-of-column-data: bytes available in WAL plus prefix
-    // (suffix bytes are past the WAL slice). suffixlen is accepted
-    // explicitly so callers can independently bound the walk; for now
-    // we just consult buffer length, which already accounts for it.
+    // suffix bytes are past the WAL slice; buf len already accounts for them so
+    // suffixlen goes unconsulted
     let _ = suffixlen;
     let logical_end = wal_col_data_avail + prefixlen;
     for (idx, att) in attrs.iter().enumerate() {
         if idx >= natts {
-            // Writer's natts is smaller than catalog natts: trailing
-            // columns added via `ALTER TABLE ADD COLUMN` since the WAL
-            // record was written. PG's `getmissingattr` (heaptuple.c)
-            // substitutes `attmissingval[1]` for fast-path defaults;
-            // mirror by surfacing the catalog's pre-decoded missing
-            // value when present, NULL otherwise.
+            // wal natts < catalog natts: trailing cols added via ALTER ADD
+            // COLUMN after the record. Mirror PG `getmissingattr`
+            // (heaptuple.c) `attmissingval[1]` fast-path default
             columns.push(Some(missing_value_for(att)));
             continue;
         }
@@ -831,15 +738,9 @@ fn decode_tuple_payload(
             columns.push(Some(ColumnValue::Null));
             continue;
         }
-        // Compute the WAL byte position this column would land at if
-        // present in WAL. We need it before we can decide "in prefix"
-        // for varlena (whose peek-byte depends on the WAL bytes).
         let col_size_hint = att.type_len;
-        // Apply nominal alignment. For varlena (typlen=-1), if the
-        // column falls inside the prefix we don't have its byte to
-        // peek at, so we fall back to nominal alignment unconditionally
-        // — matches PG's worst-case alignment when computing the
-        // prefix-byte budget.
+        // Varlena align needs a peek at the WAL byte; in-prefix varlena has no
+        // byte to peek so fall back to nominal align (PG worst-case budget)
         if col_size_hint == -1 && cur >= prefixlen && col_data_off + cur - prefixlen < buf.len() {
             cur = att_align_nominal(
                 cur,
@@ -849,13 +750,11 @@ fn decode_tuple_payload(
                 col_data_off + cur - prefixlen,
             );
         } else {
-            // Force nominal alignment when we can't peek (in prefix /
-            // past EOF). PG's behaviour matches because prefix bytes
-            // are themselves aligned in the source tuple.
+            // Can't peek (in prefix / past EOF); prefix bytes are themselves
+            // aligned in the source tuple so nominal align matches PG
             cur = align_for(cur, att.type_align);
         }
 
-        // Column is in prefix?
         if cur < prefixlen {
             let len = decoded_size_or_skip(att);
             match len {
@@ -864,9 +763,9 @@ fn decode_tuple_payload(
                     cur += n;
                 }
                 None => {
-                    // Varlena in prefix: no way to advance cur without the
-                    // bytes. Mark this and every subsequent column as
-                    // absent and bail out; the xact buffer reconstructs.
+                    // Varlena in prefix: can't advance cur without the bytes.
+                    // Mark this + every later col absent, bail; xact buffer
+                    // reconstructs
                     columns.push(None);
                     for _ in (idx + 1)..attrs.len() {
                         columns.push(None);
@@ -880,17 +779,14 @@ fn decode_tuple_payload(
             continue;
         }
 
-        // Column is in WAL slice?
         if cur >= logical_end {
-            // Entirely in suffix / past EOF.
+            // In suffix / past EOF
             columns.push(None);
-            // Advance cur by an attlen guess so subsequent fixed-width
-            // columns in suffix still get accounted for (purely
-            // accounting; we emit None for all).
+            // Advance cur for fixed-width accounting only; all emit None
             if let Some(n) = decoded_size_or_skip(att) {
                 cur += n;
             } else {
-                // Varlena tail; remaining columns stay absent.
+                // Varlena tail; remaining cols stay absent
                 for _ in (idx + 1)..attrs.len() {
                     columns.push(None);
                 }
@@ -926,11 +822,9 @@ fn decode_tuple_payload(
     })
 }
 
-/// Resolve `RelAttr::missing_text` (PG `attmissingval[1]::text`) to a
-/// `ColumnValue` via the Tier 1/2 type matrix. Falls back to
-/// `PgPending` for Tier 3, which the oracle resolves at emit time.
-/// Returns `ColumnValue::Null` when the attribute has no missing
-/// default (the common case).
+/// Resolve `RelAttr::missing_text` (PG `attmissingval[1]::text`) via the
+/// Tier 1/2 matrix; Tier 3 falls to `PgPending` (oracle resolves at emit).
+/// `Null` when attribute has no missing default.
 pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
     let Some(text) = att.missing_text.as_deref() else {
         return ColumnValue::Null;
@@ -971,9 +865,8 @@ pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
             .unwrap_or(ColumnValue::Null),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID => ColumnValue::Text(text.to_owned()),
         JSONOID => ColumnValue::Json(text.to_owned()),
-        // Tier 3 / everything else: round-trip through oracle.
-        // typoutput text form is the input PG's typinput expects, so
-        // shadow can recover bytea via `text -> oid -> typinput -> typsend`.
+        // typoutput text is what typinput expects, so shadow recovers bytea
+        // via text -> oid -> typinput -> typsend
         _ => ColumnValue::PgPending {
             type_oid: att.type_oid,
             raw: text.as_bytes().to_vec(),
@@ -981,9 +874,8 @@ pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
     }
 }
 
-/// Byte width to attribute to a column for cursor accounting when we
-/// can't read its bytes (in prefix or past EOF). `None` for varlena —
-/// caller must stop walking, since varlena width depends on content.
+/// Byte width for cursor accounting when bytes are unreadable (in prefix /
+/// past EOF). `None` for varlena (width is content-dependent), caller stops.
 fn decoded_size_or_skip(att: &RelAttr) -> Option<usize> {
     if att.type_len > 0 {
         Some(att.type_len as usize)
@@ -992,9 +884,8 @@ fn decoded_size_or_skip(att: &RelAttr) -> Option<usize> {
     }
 }
 
-/// Plain MAXALIGN dispatch over `pg_type.typalign`. Used in the
-/// in-prefix / past-EOF branches where we can't peek at bytes to
-/// detect a short varlena header (`att_align_pointer`'s optimisation).
+/// MAXALIGN dispatch over `pg_type.typalign`, for in-prefix / past-EOF where
+/// we can't peek to detect a short varlena header (`att_align_pointer`).
 fn align_for(cur: usize, attalign: char) -> usize {
     match attalign {
         'c' => cur,
@@ -1005,24 +896,17 @@ fn align_for(cur: usize, attalign: char) -> usize {
     }
 }
 
-/// PG's natts (`t_infomask2 & HEAP_NATTS_MASK`) reflects the writer's
-/// view. For replica-identity-only writes (UsingIndex / Default), the
-/// writer constructs a `heap_form_tuple` with NULL placeholders in
-/// non-indexed columns — those still occupy bitmap slots, so natts on
-/// the wire equals the relation's natts. Returned attribute list is
-/// just `rel.attributes` (every attnum). If the relation has been
-/// extended with `ALTER TABLE ADD COLUMN ... DEFAULT NULL` since the
-/// WAL was written (`natts_in_wal < rel.attributes.len()`), the extra
-/// trailing attrs come through as `Some(Null)` per PG's
-/// "missing-column" handling.
+/// Always `rel.attributes`. Replica-identity-only writes (UsingIndex/Default)
+/// carry NULL placeholders for non-indexed cols, so wire natts equals rel
+/// natts. Post-ALTER-ADD-COLUMN trailing attrs (`natts_in_wal < natts`)
+/// surface via PG missing-column handling.
 fn effective_attrs(rel: &RelDescriptor, _natts: usize) -> &[RelAttr] {
     &rel.attributes
 }
 
-/// PG `att_align_nominal` (tupmacs.h ≈ line 150). For varlena (typlen=-1),
-/// PG's `att_align_pointer` skips alignment when the next byte is a
-/// 1-byte short-header datum (`!VARATT_NOT_PAD_BYTE`); we mirror that
-/// by peeking at `buf[abs]` before aligning.
+/// PG `att_align_nominal` (tupmacs.h). For varlena, PG `att_align_pointer`
+/// skips alignment when next byte is a 1-byte short-header datum
+/// (`!VARATT_NOT_PAD_BYTE`); mirror by peeking `buf[abs]` before aligning.
 fn att_align_nominal(
     cur_offset: usize,
     attalign: char,
@@ -1031,16 +915,16 @@ fn att_align_nominal(
     abs_offset: usize,
 ) -> usize {
     if attlen == -1 && abs_offset < buf.len() && buf[abs_offset] != 0 {
-        // varlena, peek: non-zero first byte = short-header or aligned 4B
-        // header, both safe to read unaligned. Zero byte must be padding.
+        // Non-zero first byte = short-header or aligned 4B header, both safe
+        // unaligned; zero byte must be padding
         return cur_offset;
     }
     match attalign {
-        'c' => cur_offset,              // TYPALIGN_CHAR (1)
+        'c' => cur_offset,              // TYPALIGN_CHAR
         's' => align_up(cur_offset, 2), // TYPALIGN_SHORT
         'i' => align_up(cur_offset, 4), // TYPALIGN_INT
         'd' => align_up(cur_offset, 8), // TYPALIGN_DOUBLE
-        _ => cur_offset,                // unknown: fall back to no-align rather than panic
+        _ => cur_offset,                // unknown: no-align rather than panic
     }
 }
 
@@ -1068,19 +952,16 @@ fn read_u16(buf: &[u8], cur: &mut usize) -> Result<u16, DecodeError> {
     Ok(v)
 }
 
-/// Decode one column. Returns `(value, bytes_consumed)` so the caller
-/// can advance its cursor. Varlena types report total on-disk length
-/// (varlena header + body, including TOAST pointer's full 18 bytes).
+/// Returns `(value, bytes_consumed)`. Varlena reports total on-disk length
+/// (header + body, including TOAST pointer's full 18 bytes).
 fn decode_one_value(
     att: &RelAttr,
     buf: &[u8],
     abs: usize,
 ) -> Result<(ColumnValue, usize), DecodeError> {
     if att.dropped {
-        // Dropped columns retain attlen/attalign/typbyval per
-        // catalog convention (so heap scans still walk correctly).
-        // For Tier 1/2 fixed types this is well-defined; for varlena
-        // we still need to read the header to advance the cursor.
+        // Dropped cols retain attlen/attalign/typbyval per catalog
+        // convention; still read varlena header to advance cursor
         let consumed = consume_dropped(att, buf, abs)?;
         return Ok((ColumnValue::Null, consumed));
     }
@@ -1115,13 +996,11 @@ fn decode_one_value(
         TIMESTAMPOID => ColumnValue::Timestamp(i64::from_le_bytes(body.try_into().unwrap())),
         TIMESTAMPTZOID => ColumnValue::TimestampTz(i64::from_le_bytes(body.try_into().unwrap())),
         TIMETZOID => {
-            // `timetz` is 12 bytes: 8-byte time + 4-byte tz offset.
+            // 12 bytes: 8-byte time + 4-byte tz offset
             let micros = i64::from_le_bytes(body[..8].try_into().unwrap());
             let tz_seconds = i32::from_le_bytes(body[8..12].try_into().unwrap());
             ColumnValue::TimeTz { micros, tz_seconds }
         }
-        // PG's `uuid_send` emits raw 16 bytes, network byte order (no
-        // swap). On-disk is the same.
         UUIDOID => ColumnValue::Uuid(body.try_into().unwrap()),
         INTERVALOID => match crate::codecs::decode_interval(body) {
             Ok(v) => ColumnValue::Interval(v),
@@ -1138,9 +1017,7 @@ fn decode_one_value(
     Ok((v, len))
 }
 
-/// Skip a dropped column. Same shape as a live column but no value
-/// emitted (caller maps to ColumnValue::Null). For varlena we still
-/// must read the header to advance correctly.
+/// Skip a dropped column; still read varlena header to advance correctly.
 fn consume_dropped(att: &RelAttr, buf: &[u8], abs: usize) -> Result<usize, DecodeError> {
     if att.type_len == -1 {
         let (_, consumed) = decode_varlena(att, buf, abs)?;
@@ -1161,19 +1038,15 @@ fn consume_dropped(att: &RelAttr, buf: &[u8], abs: usize) -> Result<usize, Decod
     }
 }
 
-/// Decode a varlena attribute (`typlen == -1`). PG varlena formats
-/// (`varatt.h` ≈ line 142):
+/// Decode a varlena attribute (`typlen == -1`). PG varlena formats (`varatt.h`):
 ///
 /// - `0bxxxxxx00` 4-byte length, uncompressed.
-/// - `0bxxxxxx10` 4-byte length, compressed in-line (we hand back as
-///   `Unsupported` for now — a later codec will detoast the in-line
-///   compression with `pglz`/`lz4` once Tier-3 arrays need it; PG
-///   `wal_compression` already covers FPI compression).
+/// - `0bxxxxxx10` 4-byte length, in-line compressed (surfaced `Unsupported`;
+///   later codec detoasts pglz/lz4).
 /// - `0b00000001` TOAST pointer (`varattrib_1b_e`, 18 bytes on disk).
 /// - `0bxxxxxxx1` 1-byte length, uncompressed short header.
 ///
-/// We're little-endian only (every supported arch + PG's
-/// `WORDS_BIGENDIAN` is dead on x86/aarch64 — see PG's `pg_config.h`).
+/// Little-endian only (`WORDS_BIGENDIAN` dead on x86/aarch64).
 fn decode_varlena(
     att: &RelAttr,
     buf: &[u8],
@@ -1188,7 +1061,7 @@ fn decode_varlena(
     }
     let first = buf[abs];
     if first == 0x01 {
-        // TOAST pointer: varattrib_1b_e with va_tag = 18 (VARTAG_ONDISK).
+        // varattrib_1b_e: va_tag follows the 0x01 byte
         if buf.len() < abs + 2 {
             return Err(DecodeError::Truncated {
                 offset: abs,
@@ -1197,7 +1070,7 @@ fn decode_varlena(
             });
         }
         let tag = buf[abs + 1];
-        // On-disk TOAST pointer is tag 18 + 16 bytes of struct varatt_external.
+        // VARTAG_ONDISK = 18: tag byte + 16-byte struct varatt_external
         if tag == 18 {
             if buf.len() < abs + 2 + 16 {
                 return Err(DecodeError::Truncated {
@@ -1221,9 +1094,8 @@ fn decode_varlena(
                 18,
             ));
         }
-        // Other tags (INDIRECT/EXPANDED) are in-memory only — they
-        // never appear on disk per varatt.h docs. Forward as
-        // unsupported so a corrupt stream surfaces visibly.
+        // INDIRECT/EXPANDED tags are in-memory only, never on disk (varatt.h);
+        // forward Unsupported so a corrupt stream surfaces
         return Ok((
             ColumnValue::Unsupported {
                 type_oid: att.type_oid,
@@ -1233,8 +1105,7 @@ fn decode_varlena(
         ));
     }
     if first & 0x01 != 0 {
-        // 1-byte length short header: low bit set, length in upper 7
-        // bits including the header byte. Body starts at abs+1.
+        // Short header: low bit set, total length (incl header byte) in upper 7
         let total = (first >> 1) as usize;
         if total < 1 {
             return Err(DecodeError::Truncated {
@@ -1254,7 +1125,7 @@ fn decode_varlena(
         let v = varlena_to_value(att, body, false);
         return Ok((v, total));
     }
-    // 4-byte length: bits [1:0] = 00 (uncompressed) or 10 (compressed).
+    // 4-byte length: bits [1:0] = 00 uncompressed, 10 compressed
     if buf.len() < abs + 4 {
         return Err(DecodeError::Truncated {
             offset: abs,
@@ -1281,8 +1152,7 @@ fn decode_varlena(
     }
     if compressed {
         // In-line compressed: 4-byte header + 4-byte va_tcinfo (extsize +
-        // method) + compressed body. The decoder surfaces opaque; a
-        // later codec ships the pglz / lz4 unwrap.
+        // method) + body; surfaced opaque until a pglz/lz4 codec lands
         return Ok((
             ColumnValue::Unsupported {
                 type_oid: att.type_oid,
@@ -1300,11 +1170,9 @@ fn varlena_to_value(att: &RelAttr, body: &[u8], _short: bool) -> ColumnValue {
         BYTEAOID => ColumnValue::Bytea(body.to_vec()),
         TEXTOID | VARCHAROID | BPCHAROID => match std::str::from_utf8(body) {
             Ok(s) => ColumnValue::Text(s.to_owned()),
-            // Invalid UTF-8 — PG validates on input so this should never
-            // happen on disk, but surface as bytea rather than crashing.
+            // PG validates UTF-8 on input; surface bytea not crash if ever invalid
             Err(_) => ColumnValue::Bytea(body.to_vec()),
         },
-        // Tier 3 hot types — local decoders.
         NUMERICOID => match crate::codecs::decode_numeric(body) {
             Ok(v) => ColumnValue::Numeric(v),
             Err(_) => ColumnValue::Unsupported {
@@ -1323,11 +1191,9 @@ fn varlena_to_value(att: &RelAttr, body: &[u8], _short: bool) -> ColumnValue {
             Ok(s) => ColumnValue::Json(s.to_owned()),
             Err(_) => ColumnValue::Bytea(body.to_vec()),
         },
-        // Tier 3 deferred — resolved by the walshadow extension
-        // on shadow PG at emit time. JSONBOID, range types, arrays
-        // (typcategory='A'), tsvector etc. all route here. Carries the
-        // full on-disk body so the SQL bridge can reconstruct the
-        // varlena Datum.
+        // Tier 3 deferred: jsonb, range types, arrays (typcategory='A'),
+        // tsvector etc. Carries full on-disk body so the SQL bridge
+        // reconstructs the varlena Datum; walshadow extension resolves at emit
         _ => ColumnValue::PgPending {
             type_oid: att.type_oid,
             raw: body.to_vec(),
@@ -1335,12 +1201,9 @@ fn varlena_to_value(att: &RelAttr, body: &[u8], _short: bool) -> ColumnValue {
     }
 }
 
-/// `name` columns store as NUL-padded `NAMEDATALEN`-bound C strings
-/// (typlen=NAMEDATALEN=64, typbyval=false, typalign='c'). Decoded by
-/// the fixed-width path above; this helper handles the `typlen=-2`
-/// cstring variant (regtype, regclass typoutput intermediates) which
-/// is `\0`-terminated. None of the decoder's type matrix uses typlen=-2,
-/// but tracking it lets dropped cstring columns walk correctly.
+/// Handle `typlen=-2` `\0`-terminated cstring (regtype/regclass typoutput
+/// intermediates). Not in the type matrix, but tracking it lets dropped
+/// cstring columns walk correctly. (`name`, typlen=64, goes the fixed path.)
 fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), DecodeError> {
     let mut end = abs;
     while end < buf.len() && buf[end] != 0 {
@@ -1358,13 +1221,11 @@ fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Decode
         Ok(s) => ColumnValue::Text(s.to_owned()),
         Err(_) => ColumnValue::Bytea(body.to_vec()),
     };
-    Ok((value, (end - abs) + 1)) // include the trailing NUL
+    Ok((value, (end - abs) + 1)) // include trailing NUL
 }
 
-/// True iff this column is part of the relation's replica identity
-/// (used by the emitter to gate `_op=delete/update` propagation).
-/// The decoder ships the predicate here so downstream stages stay agnostic
-/// to the [`ReplIdent`] variants.
+/// True iff `attnum` is part of the relation's replica identity. Emitter gates
+/// `_op=delete/update` propagation on this, staying agnostic to [`ReplIdent`].
 pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
     match replident {
         ReplIdent::Full => true,
@@ -1444,7 +1305,6 @@ mod tests {
             7
         );
 
-        // Both images sum; absent (`None`) columns contribute nothing.
         let heap = DecodedHeap {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -1466,13 +1326,10 @@ mod tests {
                 partial: false,
             }),
         };
-        // new: Int4(4) + Bytea(10); old: None(0) + Text(3).
         assert_eq!(heap.approx_bytes(), 17);
     }
 
-    /// Build a heap-tuple-shaped byte buffer: `xl_heap_header (5) +
-    /// bitmap[+pad] + column data`. Caller supplies the column-data
-    /// payload; helper computes natts, bitmap, and t_hoff to fit.
+    /// Build `xl_heap_header (5) + bitmap[+pad] + col data`.
     fn build_tuple_payload(natts: u16, has_null: bool, t_hoff: u8, col_data: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&natts.to_le_bytes()); // t_infomask2
@@ -1480,7 +1337,7 @@ mod tests {
         v.extend_from_slice(&infomask.to_le_bytes()); // t_infomask
         v.push(t_hoff);
         let bitmap_pad = (t_hoff as usize) - SIZE_OF_HEAP_TUPLE_HEADER;
-        v.extend_from_slice(&vec![0xFFu8; bitmap_pad]); // bitmap_bits + padding (all-set bitmap for no-null)
+        v.extend_from_slice(&vec![0xFFu8; bitmap_pad]); // all-set bitmap + pad
         v.extend_from_slice(col_data);
         v
     }
@@ -1520,19 +1377,17 @@ mod tests {
 
     #[test]
     fn decode_cstring_text_bytea_and_truncated() {
-        // Valid UTF-8 → Text, consumes through the trailing NUL.
         let (v, n) = decode_cstring(b"hello\0", 0).unwrap();
         assert_eq!(v, ColumnValue::Text("hello".into()));
         assert_eq!(n, 6);
-        // Non-UTF-8 body → Bytea.
         let (v, n) = decode_cstring(&[0xFF, 0xFE, 0x00], 0).unwrap();
         assert_eq!(v, ColumnValue::Bytea(vec![0xFF, 0xFE]));
         assert_eq!(n, 3);
-        // Decode from a non-zero offset within a multi-string buffer.
+        // non-zero offset within multi-string buffer
         let (v, n) = decode_cstring(b"ab\0cd\0", 3).unwrap();
         assert_eq!(v, ColumnValue::Text("cd".into()));
         assert_eq!(n, 3);
-        // No terminator before buffer end → Truncated.
+        // no terminator before buffer end
         match decode_cstring(b"hello", 0) {
             Err(DecodeError::Truncated { offset, need, have }) => {
                 assert_eq!((offset, need, have), (0, 1, 0));
@@ -1547,7 +1402,7 @@ mod tests {
         let (v, n) = decode_one_value(&att, &[65u8], 0).unwrap();
         assert_eq!(v, ColumnValue::Char(65));
         assert_eq!(n, 1);
-        // 0xFF round-trips through i8 as -1.
+        // 0xFF -> i8 -1
         let (v, _) = decode_one_value(&att, &[0xFFu8], 0).unwrap();
         assert_eq!(v, ColumnValue::Char(-1));
     }
@@ -1561,11 +1416,10 @@ mod tests {
                 rel_attr(2, "b", INT8OID, 8, 'd'),
             ],
         );
-        // col_data: int4 at logical offset 0..4, then 4 bytes pad to 8-align
-        // for int8 at logical offset 8..16. Matches `att_align_nominal`.
+        // int4 at 0..4, 4-byte pad, int8 8-aligned at 8..16
         let mut col_data = Vec::new();
         col_data.extend_from_slice(&12345i32.to_le_bytes());
-        col_data.extend_from_slice(&[0u8; 4]); // 8-align pad before int8
+        col_data.extend_from_slice(&[0u8; 4]); // 8-align pad
         col_data.extend_from_slice(&999_999i64.to_le_bytes());
         let payload = build_tuple_payload(2, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
@@ -1591,9 +1445,8 @@ mod tests {
         );
         let mut col_data = Vec::new();
         col_data.push(1u8); // bool true
-        // Align varlena to 'i' (4). offset = 1, need next multiple of 4 = 4
-        col_data.extend_from_slice(&[0u8; 3]); // pad
-        // 4-byte uncompressed varlena: header = len << 2, body = "hi"
+        col_data.extend_from_slice(&[0u8; 3]); // pad to 'i'-align(4)
+        // 4-byte uncompressed varlena: header = total << 2
         let body = b"hi";
         let total = 4 + body.len();
         let header_u32 = (total as u32) << 2;
@@ -1611,15 +1464,13 @@ mod tests {
     #[test]
     fn decode_insert_short_varlena() {
         let rel = descriptor(16387, vec![rel_attr(1, "msg", TEXTOID, -1, 'i')]);
-        // Short header: bit 0 set, len in upper 7 bits (total bytes incl. header).
-        // Body = "hi" (2 bytes), total = 3.
+        // Short header: bit 0 set, total (incl header) in upper 7 bits
         let header = (3u8 << 1) | 0x01;
         let mut col_data = Vec::new();
         col_data.push(header);
         col_data.extend_from_slice(b"hi");
-        // For varlena typlen=-1 alignment, PG's att_align_pointer SKIPS
-        // alignment when the next byte is a non-zero short-header byte.
-        // So no padding before col_data; t_hoff = 24 (just bitmap_pad=1).
+        // att_align_pointer skips alignment before a non-zero short-header byte,
+        // so no pad; t_hoff=24 is just bitmap_pad=1
         let payload = build_tuple_payload(1, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
@@ -1638,15 +1489,15 @@ mod tests {
                 rel_attr(3, "c", INT4OID, 4, 'i'),
             ],
         );
-        // Bitmap: 3 bits, 1 byte. Set bits 0 and 2; clear bit 1 (NULL).
+        // bits 0,2 set; bit 1 clear (NULL)
         let bitmap = 0b00000101u8;
-        // t_hoff = MAXALIGN(23 + 1 byte bitmap) = 24
+        // t_hoff = MAXALIGN(23 + 1 bitmap byte) = 24
         let mut payload = Vec::new();
         payload.extend_from_slice(&3u16.to_le_bytes());
         payload.extend_from_slice(&HEAP_HASNULL.to_le_bytes());
         payload.push(24);
         payload.push(bitmap);
-        // Column data: int4 then int4 (col 2 skipped because NULL).
+        // col 2 absent from data (NULL)
         payload.extend_from_slice(&100i32.to_le_bytes());
         payload.extend_from_slice(&300i32.to_le_bytes());
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
@@ -1662,7 +1513,7 @@ mod tests {
     #[test]
     fn decode_delete_with_old_key_emits_old() {
         let rel = descriptor(16389, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
-        // main_data: xl_heap_delete (8) + xl_heap_header (5) + bitmap_pad (1) + col data.
+        // main_data: xl_heap_delete(8) + xl_heap_header(5) + bitmap_pad(1) + col data
         let mut main_data = vec![0u8; SIZE_OF_HEAP_DELETE];
         main_data[7] = XLH_DELETE_CONTAINS_OLD_KEY;
         main_data.extend_from_slice(&1u16.to_le_bytes()); // natts
@@ -1686,8 +1537,8 @@ mod tests {
                 rel_attr(2, "b", INT4OID, 4, 'i'),
             ],
         );
-        // UPDATE with PREFIX_FROM_OLD, prefixlen=4 (col 1 elided from WAL).
-        // Block 0 data: [prefixlen:u16=4][xl_heap_header(5)][bitmap_pad(1)][col 2 = int4]
+        // PREFIX_FROM_OLD, prefixlen=4 (col 1 elided). block 0:
+        // [prefixlen:u16=4][xl_heap_header(5)][bitmap_pad(1)][col 2 int4]
         let mut block_data = Vec::new();
         block_data.extend_from_slice(&4u16.to_le_bytes());
         block_data.extend_from_slice(&2u16.to_le_bytes()); // natts
@@ -1702,9 +1553,7 @@ mod tests {
         assert_eq!(out.op, HeapOp::Update);
         let new = out.new.unwrap();
         assert!(new.partial, "prefix-compressed UPDATE flagged partial");
-        // col 1 elided into the un-logged prefix → None
         assert_eq!(new.columns[0], None);
-        // col 2 present at offset 0 of the WAL col-data
         assert_eq!(new.columns[1], Some(ColumnValue::Int4(999)));
     }
 
@@ -1732,7 +1581,7 @@ mod tests {
         dropped.dropped = true;
         let rel = descriptor(16392, vec![dropped, rel_attr(2, "live", INT4OID, 4, 'i')]);
         let mut col_data = Vec::new();
-        col_data.extend_from_slice(&0i32.to_le_bytes()); // dropped col still in bytes
+        col_data.extend_from_slice(&0i32.to_le_bytes()); // dropped col still present
         col_data.extend_from_slice(&8888i32.to_le_bytes());
         let payload = build_tuple_payload(2, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
@@ -1755,8 +1604,7 @@ mod tests {
 
     #[test]
     fn decode_skips_heap2_lock_updated_silently() {
-        // LOCK_UPDATED (0x60) is the canonical "skip" path on Heap2;
-        // MULTI_INSERT (0x50) now decodes — covered in its own test.
+        // 0x60 = Heap2 LOCK_UPDATED, skip path (MULTI_INSERT 0x50 tested apart)
         let rel = descriptor(16394, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
         let rec = record_with(RmId::Heap2, 0x60, Vec::new(), Vec::new());
         let out = decode_heap_record(&rec, 0, &rel).unwrap();
@@ -1781,8 +1629,7 @@ mod tests {
     #[test]
     fn decode_external_toast_pointer() {
         let rel = descriptor(16396, vec![rel_attr(1, "blob", BYTEAOID, -1, 'i')]);
-        // varattrib_1b_e: 0x01, va_tag=18, va_rawsize=12345, va_extinfo=678,
-        // va_valueid=12, va_toastrelid=99.
+        // varattrib_1b_e: 0x01, va_tag=18, then va_rawsize/extinfo/valueid/toastrelid
         let mut col_data = Vec::new();
         col_data.push(0x01);
         col_data.push(18);
@@ -1808,12 +1655,8 @@ mod tests {
 
     #[test]
     fn decode_unsupported_type_emits_pending() {
-        // Pick a varlena type OID that's outside walshadow's local
-        // matrix (jsonb = 3802). The varlena fall-through
-        // produces a `PgPending` with raw bytes preserved — the
-        // walshadow shadow extension resolves the text form at
-        // emit time, falling back to `unsupported_values` when the
-        // extension is absent.
+        // jsonb=3802 is outside the local matrix; varlena fall-through yields
+        // PgPending preserving raw bytes (shadow extension resolves at emit)
         let rel = descriptor(16397, vec![rel_attr(1, "j", 3802, -1, 'i')]);
         let body = b"\x01opaque";
         let total = 4 + body.len();
@@ -1837,9 +1680,8 @@ mod tests {
 
     #[test]
     fn missing_value_substitutes_when_natts_below_catalog() {
-        // Catalog has 3 columns; WAL writer's natts=2 (pre-ALTER row).
-        // Column 3 carries missing_text="7"; decode must surface 7,
-        // not NULL.
+        // Catalog natts=3, wal natts=2 (pre-ALTER row); col 3 missing_text="7"
+        // must surface 7 not NULL
         let mut a3 = rel_attr(3, "c", INT4OID, 4, 'i');
         a3.missing_text = Some("7".into());
         let rel = descriptor(
@@ -1853,7 +1695,6 @@ mod tests {
         let mut col_data = Vec::new();
         col_data.extend_from_slice(&100i32.to_le_bytes());
         col_data.extend_from_slice(&200i32.to_le_bytes());
-        // natts=2: writer logged only the first two columns.
         let payload = build_tuple_payload(2, false, 24, &col_data);
         let main_data = vec![0u8; SIZE_OF_HEAP_INSERT];
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
@@ -1867,8 +1708,7 @@ mod tests {
 
     #[test]
     fn missing_value_absent_falls_back_to_null() {
-        // Catalog natts=3, writer natts=2, column 3 has no
-        // missing_text — expect explicit NULL.
+        // Catalog natts=3, wal natts=2, col 3 no missing_text => NULL
         let rel = descriptor(
             16501,
             vec![
@@ -1890,14 +1730,12 @@ mod tests {
 
     #[test]
     fn missing_value_physical_null_unaffected_by_default() {
-        // Physical NULL (bitmap clear) on a column that has
-        // missing_text must still surface as NULL — the missing-value
-        // substitution only applies when natts is below the catalog
-        // count, never to a column the WAL explicitly NULLed.
+        // Bitmap-clear NULL on a missing_text col stays NULL: substitution
+        // applies only for natts below catalog, never to an explicit WAL NULL
         let mut a2 = rel_attr(2, "b", INT4OID, 4, 'i');
         a2.missing_text = Some("99".into());
         let rel = descriptor(16502, vec![rel_attr(1, "a", INT4OID, 4, 'i'), a2]);
-        let bitmap = 0b00000001u8; // bit 0 set, bit 1 clear (NULL)
+        let bitmap = 0b00000001u8; // bit 1 clear = NULL
         let mut payload = Vec::new();
         payload.extend_from_slice(&2u16.to_le_bytes());
         payload.extend_from_slice(&HEAP_HASNULL.to_le_bytes());
@@ -1915,28 +1753,26 @@ mod tests {
     #[test]
     fn decode_multi_insert_three_rows() {
         let rel = descriptor(16410, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
-        // main_data: flags=CONTAINS_NEW_TUPLE (0x08), pad, ntuples=3,
-        // offsets[3] = [1,2,3] (info != INIT_PAGE).
+        // main_data: flags=CONTAINS_NEW_TUPLE, pad, ntuples=3,
+        // offsets[3]=[1,2,3] (info != INIT_PAGE)
         let mut main_data = Vec::new();
         main_data.push(XLH_INSERT_CONTAINS_NEW_TUPLE);
-        main_data.push(0); // alignment pad before ntuples
+        main_data.push(0); // pad
         main_data.extend_from_slice(&3u16.to_le_bytes());
         for off in 1u16..=3 {
             main_data.extend_from_slice(&off.to_le_bytes());
         }
-        // block 0 data: 3 x (xl_multi_insert_tuple(7) + bitmap_pad(1) +
-        // int4(4)) = 12 bytes per row, no inter-tuple padding because
-        // 12 is already a multiple of 2.
+        // 3 x (xl_multi_insert_tuple(7) + bitmap_pad(1) + int4(4)) = 12B/row,
+        // no inter-tuple pad (12 even)
         let mut block_data = Vec::new();
         for v in [100i32, 200, 300] {
-            // datalen = 1 bitmap_pad + 4 int4 = 5 bytes (matches
-            // tuple body after stripping the 23-byte fixed header on
-            // the writer side).
+            // datalen=5: bitmap_pad(1) + int4(4), tuple body after stripping
+            // the 23-byte fixed header writer-side
             block_data.extend_from_slice(&5u16.to_le_bytes()); // datalen
-            block_data.extend_from_slice(&1u16.to_le_bytes()); // t_infomask2 = natts=1
+            block_data.extend_from_slice(&1u16.to_le_bytes()); // t_infomask2 = natts
             block_data.extend_from_slice(&0u16.to_le_bytes()); // t_infomask
             block_data.push(24); // t_hoff
-            block_data.push(0); // bitmap pad (single byte; col offset 1..5)
+            block_data.push(0); // bitmap pad
             block_data.extend_from_slice(&v.to_le_bytes());
         }
         let rec = record_with(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, main_data, block_data);
@@ -1967,8 +1803,7 @@ mod tests {
     #[test]
     fn decode_multi_insert_skips_without_new_tuple_flag() {
         let rel = descriptor(16412, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
-        // flags=0 (no CONTAINS_NEW_TUPLE), pad, ntuples=2 — record
-        // carries no tuple bytes; decoder must surface an empty smallvec.
+        // flags=0 (no CONTAINS_NEW_TUPLE): no tuple bytes => empty smallvec
         let mut main_data = Vec::new();
         main_data.push(0);
         main_data.push(0); // pad

@@ -1,13 +1,11 @@
 //! Bounded multi-producer multi-consumer channel on tokio primitives.
 //!
-//! tokio's `mpsc` is single-consumer; the pipeline fans one queue out to
-//! N inserters and M decoders. Rather than pull in `async-channel`, wrap a
-//! `Mutex<VecDeque>` between two `Semaphore`s: `items` counts queued
-//! elements (recv waits on it), `space` counts free slots (send waits on
-//! it). Both semaphores are multi-waiter and FIFO-fair, so this is true
-//! mpmc with bounded backpressure. `close` makes pending + future
-//! `acquire`s fail, draining whatever is still queued before recv yields
-//! `None`.
+//! tokio's `mpsc` is single-consumer; the pipeline fans one queue to N
+//! inserters and M decoders. Rather than pull in `async-channel`, wrap a
+//! `Mutex<VecDeque>` between two `Semaphore`s: `items` counts queued elements
+//! (recv waits), `space` counts free slots (send waits). Both semaphores are
+//! multi-waiter and FIFO-fair. `close` makes pending + future `acquire`s
+//! fail, draining whatever is queued before recv yields `None`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,9 +39,8 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        // Last sender gone: close the item side so blocked/future `recv`s
-        // drain whatever is queued and then yield `None` (graceful
-        // shutdown by dropping senders, like tokio's mpsc).
+        // Last sender gone: close item side so `recv`s drain then yield `None`
+        // (graceful shutdown by dropping senders, like tokio's mpsc)
         if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.shared.items.close();
         }
@@ -75,8 +72,8 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 }
 
 impl<T> Sender<T> {
-    /// Await a free slot, then enqueue. `Err(item)` means the channel was
-    /// closed (returns the item so the caller can decide what to do).
+    /// Await a free slot, then enqueue. `Err(item)` returns the item when the
+    /// channel was closed.
     pub async fn send(&self, item: T) -> Result<(), T> {
         match self.shared.space.acquire().await {
             Ok(p) => p.forget(),
@@ -91,8 +88,7 @@ impl<T> Sender<T> {
         Ok(())
     }
 
-    /// Close both ends. Outstanding + future `send`/`recv` acquires fail;
-    /// queued items still drain via `recv`.
+    /// Close both ends; queued items still drain via `recv`.
     pub fn close(&self) {
         self.shared.items.close();
         self.shared.space.close();
@@ -114,7 +110,6 @@ impl<T> Receiver<T> {
                 self.shared.space.add_permits(1);
                 item
             }
-            // Closed: drain whatever is still queued, then `None`.
             Err(_) => self
                 .shared
                 .q
@@ -181,7 +176,6 @@ mod tests {
         for p in producers {
             p.await.unwrap();
         }
-        // Producers done; close so consumers see `None` after draining.
         tx.close();
         for c in consumers {
             c.await.unwrap();

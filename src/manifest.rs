@@ -1,10 +1,6 @@
-//! `(filtered_lsn, source_lsn, kind)` sidecar for a filtered segment.
-//!
-//! Filter is byte-preserving, so `filtered_lsn == source_lsn` for every
-//! record. The sidecar is therefore a record-boundary index, used by
-//! the replay-driver tool to point at specific records and by the
-//! round-trip test to assert "every record at this offset in the
-//! source has a corresponding record at the same offset in the output".
+//! Record-boundary sidecar for a filtered segment. Filter is
+//! byte-preserving so `filtered_lsn == source_lsn` for every record;
+//! the replay-driver tool and round-trip test index records by offset.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,13 +16,12 @@ pub struct Manifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
-    /// Byte offset within the segment.
+    /// Byte offset within the segment
     pub offset: u64,
-    /// xl_tot_len of the record.
+    /// xl_tot_len
     pub len: u32,
-    /// Resource-manager id (numeric).
     pub rmid: u8,
-    /// `XLogRecordHeader.info` byte.
+    /// `XLogRecordHeader.info` byte
     pub info: u8,
     pub kind: Kind,
 }
@@ -50,14 +45,13 @@ pub struct ManifestStats {
     pub special_keeps: u64,
     pub empty_keeps: u64,
     pub relmap_updates: u64,
-    /// Genuinely malformed pg_class heap-write payloads (truncated /
-    /// invalid `t_hoff`). Expected at zero on healthy captures.
+    /// Malformed pg_class heap-write payloads (truncated / invalid
+    /// `t_hoff`); zero on healthy captures
     pub pg_class_writes_undecoded: u64,
-    /// pg_class UPDATE / HOT_UPDATE records where PG prefix-compressed
-    /// past the OID column (typically `VACUUM FULL` on a non-mapped
-    /// catalog). Catalog filenode rotation for these is recoverable
-    /// only via `seed_from_source` or a subsequent
-    /// `XLOG_RELMAP_UPDATE`.
+    /// pg_class UPDATE / HOT_UPDATE where PG prefix-compressed past the
+    /// OID column (typically `VACUUM FULL` on a non-mapped catalog);
+    /// filenode rotation recoverable only via `seed_from_source` or a
+    /// later `XLOG_RELMAP_UPDATE`
     pub pg_class_writes_oid_in_prefix: u64,
 }
 

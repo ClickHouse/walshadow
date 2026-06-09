@@ -1,23 +1,17 @@
 //! Filtered segment retention.
 //!
-//! Shadow PG's `restore_command` copies (not moves) every segment out
-//! of the filter's output directory; the originals accumulate forever.
-//! This module drops segments + manifests once shadow has replayed
-//! past them — bounded below by `retention_bytes` worth of WAL so a
-//! restart with `--start-lsn` slightly behind the current head still
-//! finds segments to replay through.
+//! Shadow PG's `restore_command` copies (not moves) segments out of the
+//! filter's output dir, so originals accumulate forever. Drop segments +
+//! manifests once shadow has replayed past them, bounded below by
+//! `retention_bytes` of WAL so a restart with `--start-lsn` slightly
+//! behind head still finds segments to replay through.
 //!
-//! Trim windows in LSN bytes rather than wall-clock seconds: the
-//! daemon already lives in LSN space, retention is a function of "how
-//! far behind can shadow be" which is exactly LSN, and a power user
-//! tuning the value can map "1h of WAL at 2 MB/s" → bytes once. Keeps
-//! the trimmer pure-LSN with no clock dependency.
+//! Trim in LSN bytes not wall-clock: retention is "how far behind can
+//! shadow be" which is exactly LSN, keeping the trimmer clock-free.
 //!
-//! Auxiliary `.partial` files (crash residue) and
-//! `*.manifest.json` sidecars are removed alongside their segment.
-//! Unknown files in the directory are left alone — the trimmer is
-//! conservative on purpose so a sibling system writing into the same
-//! directory doesn't lose unrelated files.
+//! `.partial` files (crash residue) and `*.manifest.json` sidecars are
+//! removed with their segment. Unknown files left alone, so a sibling
+//! system sharing the dir doesn't lose unrelated files.
 
 use std::io;
 use std::path::Path;
@@ -28,15 +22,12 @@ use wal_rs::pg::wal::segment::{SEGMENT_NAME_LEN, SegmentName};
 
 use crate::wal_stream::WAL_SEG_SIZE;
 
-/// Default retention horizon in WAL bytes. ~16 segments at 16 MiB each
-/// (256 MiB). Enough for shadow to replay through a typical workload
-/// gap without holding multi-GB of catalog WAL on disk.
+/// 256 MiB = ~16 segments at 16 MiB. Enough to replay through a typical
+/// workload gap without holding multi-GB of catalog WAL on disk.
 pub const DEFAULT_RETENTION_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Default trim cadence — every 30 s. Trim cost is dominated by the
-/// shadow PG query (`pg_last_wal_replay_lsn`) + a `read_dir`; both are
-/// sub-millisecond, but doing it once per minute is plenty given
-/// segment cadence is on the same order.
+/// Trim cost is a `pg_last_wal_replay_lsn` query + a `read_dir`, both
+/// sub-ms; 30s is plenty given segment cadence is the same order.
 pub const DEFAULT_TRIM_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
@@ -45,9 +36,7 @@ pub enum RetentionError {
     Io(#[from] io::Error),
 }
 
-/// Trim outcome from one sweep. Tests assert on the counts; the
-/// daemon's status line surfaces them so operators can confirm trim
-/// is keeping up.
+/// Per-category counts from one sweep; surfaced on the daemon status line.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TrimReport {
     pub segments_removed: u64,
@@ -56,11 +45,9 @@ pub struct TrimReport {
     pub bytes_freed: u64,
 }
 
-/// Trim every segment file in `dir` whose end LSN sits below
-/// `cutoff_lsn`. Returns the counts of files removed by category. A
-/// segment's *end* LSN — `start_lsn + WAL_SEG_SIZE` — is the boundary
-/// used so that the segment containing `cutoff_lsn` is preserved
-/// (shadow may still be reading it).
+/// Trim segments whose *end* LSN (`start_lsn + WAL_SEG_SIZE`) is below
+/// `cutoff_lsn`. End-LSN boundary preserves the segment containing the
+/// cutoff: shadow may still be reading it.
 pub async fn trim_below_lsn(dir: &Path, cutoff_lsn: u64) -> Result<TrimReport, RetentionError> {
     let mut report = TrimReport::default();
     if !dir.exists() {
@@ -76,7 +63,7 @@ pub async fn trim_below_lsn(dir: &Path, cutoff_lsn: u64) -> Result<TrimReport, R
         let (seg_str, kind) = classify(&name);
         let seg = match seg_str.and_then(|s| SegmentName::parse(s).ok()) {
             Some(s) => s,
-            None => continue, // unknown file — leave it alone
+            None => continue, // unknown file, leave alone
         };
         let end_lsn = seg.start_lsn(WAL_SEG_SIZE).saturating_add(WAL_SEG_SIZE);
         if end_lsn > cutoff_lsn {
@@ -108,8 +95,8 @@ enum FileKind {
     Partial,
 }
 
-/// Pluck out the 24-hex segment prefix and tag the suffix kind. Returns
-/// `(None, _)` for filenames that don't match any expected shape.
+/// Pluck the 24-hex segment prefix, tag the suffix kind. `(None, _)` for
+/// filenames matching no expected shape.
 fn classify(name: &str) -> (Option<&str>, FileKind) {
     if name.len() == SEGMENT_NAME_LEN && all_hex(name) {
         return (Some(name), FileKind::Segment);
@@ -161,13 +148,11 @@ mod tests {
     async fn keeps_segments_above_cutoff() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
-        // Three consecutive segments on timeline 1. File contents are
-        // stand-ins; the trimmer keys on filename + recorded size only.
+        // Bodies are stand-ins; trimmer keys on filename + size only.
         touch(dir, &seg_name(1, 0, 1), b"seg-1-body");
         touch(dir, &seg_name(1, 0, 2), b"seg-2-body");
         touch(dir, &seg_name(1, 0, 3), b"seg-3-body");
-        // Cutoff sits inside segment 2 → segment 1 should go, 2 stays
-        // (cutoff is below its end), 3 stays.
+        // Cutoff inside segment 2: 1 goes, 2 stays (cutoff below its end), 3 stays.
         let cutoff = SegmentName {
             timeline: 1,
             log_id: 0,

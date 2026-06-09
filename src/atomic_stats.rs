@@ -1,7 +1,5 @@
-//! Single source of truth for atomic-fielded stats structs. `atomic_stats!`
-//! declares a `#[derive(Debug, Default)]` struct of `AtomicU64` counters;
-//! call sites bump via `.fetch_add(_, Relaxed)` and read via `.load(Relaxed)`.
-//! No mirror / snapshot type — the live struct is the API, so the
+//! `atomic_stats!` declares a `#[derive(Debug, Default)]` struct of `AtomicU64`
+//! counters. No mirror / snapshot type: live struct is the API, so the
 //! memory-ordering choice stays visible at every read site.
 
 #[macro_export]

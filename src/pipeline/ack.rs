@@ -1,24 +1,21 @@
 //! Cumulative-ack durability watermark for the parallel pipeline.
 //!
-//! Replaces the serial emitter's synchronous `on_xact_end -> durable_lsn`
-//! with a refcount-driven contiguous watermark. Everything downstream
-//! completes out of order; `emitter_ack_lsn` (which the daemon advertises
-//! as the standby `apply_lsn`, bounding source slot recycling) must not.
+//! Refcount-driven contiguous watermark. Downstream completes out of order;
+//! `emitter_ack_lsn` (advertised as the standby `apply_lsn`, bounding source
+//! slot recycling) must not.
 //!
-//! Reorder assigns each committed/aborted xact a dense `seq` and a
-//! `commit_lsn` (monotonic in `seq`). For each `seq` the collector tracks
-//! how many rows were *placed* (routed by a decoder) and how many have
-//! *acked* (an inserter drained the batch to `EndOfStream`). A `seq` is
-//! **done** once `placed == Some(R)` and `acked == R` (rows=0 xacts —
-//! aborts / empty / filtered — are done as soon as placed). The watermark
-//! is the highest contiguous done `seq`; its `commit_lsn` is published into
-//! the `emitter_ack` atomic. Contiguity is the safety property: commit_lsn
-//! is monotonic in seq, so advertising the contiguous-done commit_lsn never
-//! claims durability for a later seq whose rows are still in flight.
+//! Each xact gets a dense `seq` + `commit_lsn` (monotonic in `seq`). Per
+//! `seq` track rows *placed* (routed by a decoder) and *acked* (inserter
+//! drained to `EndOfStream`). A `seq` is **done** once `placed == Some(R)`
+//! and `acked == R` (rows=0 xacts — abort/empty/filtered — done once placed).
+//! Watermark is highest contiguous done `seq`, its `commit_lsn` published
+//! into `emitter_ack`. Contiguity is the safety property: commit_lsn
+//! monotonic in seq, so the contiguous-done commit_lsn never claims
+//! durability for a later seq whose rows are still in flight.
 //!
-//! Invariant: an inserter sends [`AckEvent::Acked`] only *after*
-//! drain-to-`EndOfStream`. A row counted in `placed` but never acked pins
-//! the watermark forever — the daemon's stall watchdog escalates that.
+//! Invariant: inserter sends [`AckEvent::Acked`] only *after* drain-to-
+//! `EndOfStream`. A row placed but never acked pins the watermark forever;
+//! the daemon's stall watchdog escalates that.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,18 +24,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-/// One event into the collector actor.
 pub enum AckEvent {
-    /// Reorder registered `seq` at `commit_lsn` (in seq order, no gaps).
-    Register { seq: u64, commit_lsn: u64 },
-    /// A decoder finished routing `seq`'s rows; `rows` will be acked.
-    Placed { seq: u64, rows: u64 },
-    /// An inserter drained a batch carrying these `(seq, rows)` counts.
-    Acked { counts: Vec<(u64, u64)> },
-    /// Trailing non-commit WAL: advance to `lsn` iff every registered seq
-    /// is already done (nothing buffered anywhere). Reorder only sends this
+    /// In seq order, no gaps.
+    Register {
+        seq: u64,
+        commit_lsn: u64,
+    },
+    Placed {
+        seq: u64,
+        rows: u64,
+    },
+    Acked {
+        counts: Vec<(u64, u64)>,
+    },
+    /// Advance to `lsn` iff every registered seq done. Reorder sends only
     /// when the xact buffer is empty.
-    Trailing { lsn: u64 },
+    Trailing {
+        lsn: u64,
+    },
 }
 
 struct SeqState {
@@ -53,17 +56,16 @@ impl SeqState {
     }
 }
 
-/// Sync core of the collector — actor is a thin loop over [`Self::apply`].
-/// Split out so it can be unit-tested without spawning a task.
+/// Sync core; actor is a thin loop over [`Self::apply`]. Split out for
+/// unit-testing without a task.
 pub struct AckState {
     map: BTreeMap<u64, SeqState>,
-    /// Lowest seq not yet done == count of contiguous done seqs (dense from 0).
+    /// Lowest seq not yet done == count of contiguous done seqs (dense from 0)
     next_expected: u64,
-    /// Lowest seq not yet placed (its decoder hasn't finished routing rows).
-    /// The DDL barrier waits on this so `FlushAll` can't run ahead of rows
-    /// still in flight from the decode pool.
+    /// Lowest seq not yet placed. DDL barrier waits on this so `FlushAll`
+    /// can't run ahead of rows still in flight from the decode pool.
     placed_frontier: u64,
-    /// Number of seqs registered so far (dense from 0).
+    /// Seqs registered so far (dense from 0).
     registered: u64,
     emitter_ack: Arc<AtomicU64>,
     frontier_tx: watch::Sender<u64>,
@@ -109,7 +111,7 @@ impl AckState {
                 acked: 0,
             },
         );
-        // Seqs are dense from 0, so the count is highest+1.
+        // Dense from 0, so count is highest+1
         self.registered = self.registered.max(seq + 1);
         self.advance();
     }
@@ -134,8 +136,8 @@ impl AckState {
         }
     }
 
-    /// Drain the contiguous done prefix, advancing `emitter_ack` to the
-    /// last done seq's `commit_lsn` and publishing the new frontier.
+    /// Drain the contiguous done prefix, advancing `emitter_ack` to the last
+    /// done seq's `commit_lsn` and publishing the new frontier.
     fn advance(&mut self) {
         let mut moved = false;
         while let Some(s) = self.map.get(&self.next_expected) {
@@ -150,14 +152,12 @@ impl AckState {
         if moved {
             self.frontier_tx.send_replace(self.next_expected);
         }
-        // Advance the placed frontier from where it last stopped, not from
-        // `next_expected`: `[next_expected, placed_frontier)` are already
-        // known placed (done implies placed, so a `next_expected` bump never
-        // strands a placed gap). Restarting at `next_expected` re-walked that
-        // whole run via `BTreeMap::get` on every event — O(N) per event,
-        // O(N^2) overall — which pegged the collector at 100% CPU and stalled
-        // `emitter_ack` whenever the decode pool placed far ahead of durable.
-        // Resuming at `placed_frontier` visits each seq once: O(1) amortized.
+        // Resume from `placed_frontier`, not `next_expected`: done implies
+        // placed, so `[next_expected, placed_frontier)` is already placed and
+        // no bump strands a gap. Restarting at `next_expected` re-walked the
+        // whole run per event — O(N^2), pegging the collector at 100% CPU and
+        // stalling `emitter_ack` when the pool placed far ahead of durable.
+        // Resuming here visits each seq once: O(1) amortized.
         let mut pf = self.placed_frontier.max(self.next_expected);
         while self.map.get(&pf).is_some_and(|s| s.placed.is_some()) {
             pf += 1;
@@ -173,8 +173,8 @@ impl AckState {
         self.next_expected == self.registered
     }
 
-    /// Oldest seq still incomplete (the watermark is pinned behind it),
-    /// for the daemon's stall watchdog. `None` when fully caught up.
+    /// Oldest seq still incomplete (watermark pinned behind it), for the
+    /// daemon's stall watchdog. `None` when fully caught up.
     pub fn oldest_incomplete(&self) -> Option<(u64, u64)> {
         if self.all_done() {
             None
@@ -186,8 +186,8 @@ impl AckState {
     }
 }
 
-/// Producer-side handle. Cloneable; the actor exits when the last handle
-/// drops. Reorder, decoders, and inserters all hold clones.
+/// Producer-side handle. Actor exits when the last clone drops; reorder,
+/// decoders, inserters all hold clones.
 #[derive(Clone)]
 pub struct AckHandle {
     tx: mpsc::UnboundedSender<AckEvent>,
@@ -219,9 +219,9 @@ impl AckHandle {
         self.emitter_ack.load(Ordering::Acquire)
     }
 
-    /// Block until the contiguous-done frontier covers all seqs `< seq`
-    /// (i.e. every earlier xact is durable on ClickHouse). Used by the DDL
-    /// barrier. Returns early if the collector actor has shut down.
+    /// Block until the contiguous-done frontier covers all seqs `< seq` (every
+    /// earlier xact durable on CH). Used by the DDL barrier; returns early if
+    /// the collector actor shut down.
     pub async fn wait_through(&self, seq: u64) {
         let mut r = self.frontier.clone();
         while *r.borrow_and_update() < seq {
@@ -231,10 +231,9 @@ impl AckHandle {
         }
     }
 
-    /// Block until every seq `< seq` has been *placed* (its decoder finished
-    /// routing all its rows to the batcher). The barrier waits on this
-    /// before issuing `FlushAll` so the flush can't seal ahead of rows still
-    /// in flight from the decode pool.
+    /// Block until every seq `< seq` is *placed*. Barrier waits on this before
+    /// `FlushAll` so the flush can't seal ahead of rows still in flight from
+    /// the decode pool.
     pub async fn wait_placed_through(&self, seq: u64) {
         let mut r = self.placed.clone();
         while *r.borrow_and_update() < seq {
@@ -245,9 +244,8 @@ impl AckHandle {
     }
 }
 
-/// Spawn the collector actor. The returned [`AckHandle`] clones feed it;
-/// when all clones drop the actor drains and exits, completing the
-/// [`JoinHandle`].
+/// Spawn the collector actor. When all [`AckHandle`] clones drop it drains
+/// and exits, completing the [`JoinHandle`].
 pub fn spawn(emitter_ack: Arc<AtomicU64>) -> (AckHandle, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<AckEvent>();
     let (frontier_tx, frontier) = watch::channel(0u64);
@@ -298,16 +296,16 @@ mod tests {
         s.register(0, 100);
         s.register(1, 200);
         s.register(2, 300);
-        // seq 2 finishes first — watermark must stay at 0 (nothing done yet).
+        // seq 2 done first, watermark stays at 0
         s.placed(2, 1);
         s.acked(2, 1);
         assert_eq!(ack.load(Ordering::Acquire), 0);
-        // seq 0 done — advance to 100, but 1 still blocks 2.
+        // seq 0 done, but 1 still blocks 2
         s.placed(0, 1);
         s.acked(0, 1);
         assert_eq!(ack.load(Ordering::Acquire), 100);
         assert_eq!(s.oldest_incomplete(), Some((1, 200)));
-        // seq 1 done — frontier jumps over the already-done 2 to 300.
+        // gap fills, frontier jumps over already-done 2
         s.placed(1, 1);
         s.acked(1, 1);
         assert_eq!(ack.load(Ordering::Acquire), 300);
@@ -318,7 +316,7 @@ mod tests {
     fn empty_or_abort_seq_is_done_when_placed_zero() {
         let (mut s, ack) = state();
         s.register(0, 100);
-        s.placed(0, 0); // abort / empty: no rows
+        s.placed(0, 0); // abort/empty
         assert_eq!(ack.load(Ordering::Acquire), 100);
         assert!(s.all_done());
     }
@@ -331,7 +329,7 @@ mod tests {
         s.acked(0, 2);
         assert_eq!(ack.load(Ordering::Acquire), 0); // 2/5 acked
         s.acked(0, 3);
-        assert_eq!(ack.load(Ordering::Acquire), 100); // 5/5
+        assert_eq!(ack.load(Ordering::Acquire), 100);
     }
 
     #[test]
@@ -339,7 +337,7 @@ mod tests {
         let (mut s, ack) = state();
         s.register(0, 100);
         s.acked(0, 3);
-        assert_eq!(ack.load(Ordering::Acquire), 0); // placed unknown
+        assert_eq!(ack.load(Ordering::Acquire), 0); // placed still unknown
         s.placed(0, 3);
         assert_eq!(ack.load(Ordering::Acquire), 100);
     }
@@ -353,33 +351,30 @@ mod tests {
         s.register(0, 100);
         s.register(1, 200);
         s.register(2, 300);
-        // Place 0 and 2 (out of order); frontier stops at the gap (1).
+        // Place 0 and 2 out of order; frontier stops at gap (1)
         s.placed(2, 1);
         assert_eq!(*prx.borrow(), 0);
         s.placed(0, 1);
         assert_eq!(*prx.borrow(), 1, "placed through seq 0");
-        // Filling the gap advances the frontier past the already-placed 2.
+        // Filling gap advances past already-placed 2
         s.placed(1, 1);
         assert_eq!(*prx.borrow(), 3, "placed through all three");
     }
 
-    /// Decode pool places far ahead of the durable watermark (rows in flight
-    /// to CH). `advance` must resume the placed-frontier scan at
-    /// `placed_frontier`, not re-walk `[next_expected, placed_frontier)` every
-    /// event — else this is O(N^2) and pegs the collector. With many seqs the
-    /// O(N^2) form is visibly slow; the resume form stays linear.
+    /// Pool places far ahead of the durable watermark. `advance` must resume
+    /// the placed-frontier scan at `placed_frontier`, not re-walk
+    /// `[next_expected, placed_frontier)` every event — else O(N^2), pegging
+    /// the collector. Many seqs make the O(N^2) form visibly slow.
     #[test]
     fn placed_far_ahead_of_acked_stays_linear() {
         let (mut s, ack) = state();
         let n = 50_000u64;
         for seq in 0..n {
             s.register(seq, (seq + 1) * 10);
-            s.placed(seq, 1); // placed immediately, but nothing acked yet
+            s.placed(seq, 1); // nothing acked yet
         }
-        // Everything placed, nothing durable: watermark pinned at 0.
         assert_eq!(ack.load(Ordering::Acquire), 0);
         assert!(!s.all_done());
-        // Drain durability in order; watermark walks to the last commit_lsn.
         for seq in 0..n {
             s.acked(seq, 1);
         }
@@ -392,12 +387,12 @@ mod tests {
         let (mut s, ack) = state();
         s.register(0, 100);
         s.placed(0, 1);
-        // Not acked yet → trailing must not advance past the buffered row.
+        // Not acked, trailing must not advance past the buffered row
         s.trailing(9_999);
         assert_eq!(ack.load(Ordering::Acquire), 0);
         s.acked(0, 1);
         assert_eq!(ack.load(Ordering::Acquire), 100);
-        // Now fully drained → trailing advances to the dispatched marker.
+        // Fully drained, trailing advances
         s.trailing(9_999);
         assert_eq!(ack.load(Ordering::Acquire), 9_999);
     }

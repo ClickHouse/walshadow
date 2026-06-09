@@ -1,8 +1,8 @@
-//! Reclassifier for records that carry the target relation in
-//! `main_data` rather than a block reference.
+//! Reclassifier for records carrying the target relation in `main_data`
+//! rather than a block reference; the per-record classifier buckets these
+//! as `Class::Empty`.
 //!
-//! The per-record classifier buckets these as `Class::Empty`. Known reachable cases on
-//! PG 15+ captures, cross-checked against
+//! Known reachable cases on PG 15+, cross-checked against
 //! `~/s/postgresql/src/backend/access/`:
 //!
 //! | rmgr  | info               | source                                           | block ref? | reclassified |
@@ -14,18 +14,14 @@
 //! | BTREE | REUSE_PAGE (0xD0)  | nbtpage.c `_bt_getbuf` (recyclable branch)       | **none**  | yes          |
 //! | HEAP  | TRUNCATE (0x30)    | tablecmds.c (only when wal_level=logical)        | none      | no (oid arr) |
 //!
-//! `XLOG_HEAP_TRUNCATE` carries an array of oids (not relfilenodes)
-//! and only fires under `wal_level=logical`. Walshadow targets
-//! `wal_level=replica` for source PG, so the truncate record either
-//! does not appear or — under logical — falls through to the
-//! safe-default Keep with negligible cost.
+//! `XLOG_HEAP_TRUNCATE` carries oids (not relfilenodes) and fires only
+//! under `wal_level=logical`. Walshadow targets `wal_level=replica`, so it
+//! either never appears or falls through to safe-default Keep.
 //!
-//! `XLOG_BTREE_REUSE_PAGE` exists solely to give hot-standby recovery a
-//! conflict horizon (see PG nbtpage.c:933-953 comment). No block is
-//! registered with the record, so it lands as Empty without
-//! reclassification.
+//! `XLOG_BTREE_REUSE_PAGE` exists only to give hot-standby recovery a
+//! conflict horizon (PG nbtpage.c). No block registered, so it lands Empty.
 //!
-//! Layout from PG's `src/include/access/heapam_xlog.h`:
+//! `xl_heap_new_cid` (`src/include/access/heapam_xlog.h`):
 //! ```text
 //! struct xl_heap_new_cid {
 //!     TransactionId top_xid;        // 4
@@ -36,9 +32,9 @@
 //!     ItemPointerData target_tid;   //  6 (block_hi+block_lo+posid)
 //! }
 //! ```
-//! Total 34 bytes. Locator at byte offset 16.
+//! 34 bytes, locator at offset 16.
 //!
-//! Layout from PG's `src/include/access/nbtxlog.h`:
+//! `xl_btree_reuse_page` (`src/include/access/nbtxlog.h`):
 //! ```text
 //! struct xl_btree_reuse_page {
 //!     RelFileLocator    locator;                  // 12
@@ -47,42 +43,37 @@
 //!     bool              isCatalogRel;             //  1
 //! }
 //! ```
-//! Total 25 bytes (no trailing padding once serialised by `XLogRegisterData`).
-//! Locator at byte offset 0.
+//! 25 bytes (no trailing pad after `XLogRegisterData`), locator at offset 0.
 
 use wal_rs::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
-/// `XLOG_HEAP2_NEW_CID` info byte (high nibble).
+/// `XLOG_HEAP2_NEW_CID` info byte
 pub const XLOG_HEAP2_NEW_CID: u8 = 0x70;
-/// `XLOG_BTREE_REUSE_PAGE` info byte (high nibble).
+/// `XLOG_BTREE_REUSE_PAGE` info byte
 pub const XLOG_BTREE_REUSE_PAGE: u8 = 0xD0;
 const NEW_CID_LOCATOR_OFFSET: usize = 16;
 const NEW_CID_MIN_SIZE: usize = 34;
 const BTREE_REUSE_PAGE_MIN_SIZE: usize = 25;
 
-/// `xl_heap_truncate` header size before the relids array. PG
-/// `SizeOfHeapTruncate = offsetof(xl_heap_truncate, relids) = 12` — 9
-/// bytes of dbId+nrelids+flags plus 3 bytes of trailing padding so
-/// the relids array (4-byte aligned `Oid`) starts on a u32 boundary.
+/// `SizeOfHeapTruncate = offsetof(xl_heap_truncate, relids)`: 9 bytes
+/// dbId+nrelids+flags + 3 trailing pad so relids (4-byte `Oid`) aligns
 const HEAP_TRUNCATE_HEADER_SIZE: usize = 12;
 
-/// PG `xl_heap_truncate.flags` bits (heapam_xlog.h).
+/// `xl_heap_truncate.flags` bits (heapam_xlog.h)
 pub const XLH_TRUNCATE_CASCADE: u8 = 1 << 0;
 pub const XLH_TRUNCATE_RESTART_SEQS: u8 = 1 << 1;
 
-/// Parsed body of an `XLOG_HEAP_TRUNCATE` main_data record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeapTruncate {
     pub db_oid: u32,
     pub flags: u8,
-    /// pg_class OIDs of the relations being truncated. Note these are
-    /// **OIDs**, not relfilenodes — TRUNCATE may rewrite the relation
-    /// on commit (new filenode), so the WAL carries the stable id.
+    /// OIDs, not relfilenodes: TRUNCATE may rewrite to a new filenode on
+    /// commit, so WAL carries the stable id
     pub relids: Vec<u32>,
 }
 
-/// Parse `xl_heap_truncate` main_data. Layout (PG `heapam_xlog.h`):
-/// `Oid dbId; uint32 nrelids; uint8 flags; Oid relids[nrelids]`.
+/// Layout (PG `heapam_xlog.h`):
+/// `Oid dbId; uint32 nrelids; uint8 flags; Oid relids[nrelids]`
 pub fn parse_xl_heap_truncate(md: &[u8]) -> Option<HeapTruncate> {
     if md.len() < HEAP_TRUNCATE_HEADER_SIZE {
         return None;
@@ -114,8 +105,8 @@ fn read_locator(md: &[u8], off: usize) -> RelFileNode {
     }
 }
 
-/// Pull `RelFileLocator` out of an Empty-class record's main_data when
-/// the rmgr+info pair is one we know. Returns `None` otherwise.
+/// Pull `RelFileLocator` from an Empty-class record's main_data for known
+/// rmgr+info pairs; `None` otherwise.
 pub fn relation_for_empty(record: &XLogRecord) -> Option<RelFileNode> {
     let rmid = record.header.resource_manager_id;
     let info_high = record.header.info & 0xF0;
@@ -179,7 +170,7 @@ mod tests {
     #[test]
     fn wrong_info_returns_none() {
         let mut r = new_cid_record(1663, 5, 1259);
-        r.header.info = 0x10; // PRUNE
+        r.header.info = 0x10; // HEAP2 PRUNE
         assert!(relation_for_empty(&r).is_none());
     }
 
@@ -228,14 +219,12 @@ mod tests {
     #[test]
     fn btree_non_reuse_info_returns_none() {
         let mut r = btree_reuse_record(1663, 5, 1259);
-        r.header.info = 0xC0; // XLOG_BTREE_VACUUM — block-ref bearing, not Empty
+        r.header.info = 0xC0; // XLOG_BTREE_VACUUM, block-ref bearing not Empty
         assert!(relation_for_empty(&r).is_none());
     }
 
-    /// PG `XLogRegisterData(&xlrec, SizeOfHeapTruncate)` writes the C
-    /// struct including its trailing 3-byte padding so the following
-    /// relids array lands on a 4-byte boundary. Tests mirror the same
-    /// layout.
+    /// PG `XLogRegisterData(&xlrec, SizeOfHeapTruncate)` includes the
+    /// trailing 3-byte pad so relids lands 4-byte aligned
     fn write_truncate_header(md: &mut Vec<u8>, db_oid: u32, nrelids: u32, flags: u8) {
         md.extend_from_slice(&db_oid.to_le_bytes());
         md.extend_from_slice(&nrelids.to_le_bytes());
@@ -259,8 +248,8 @@ mod tests {
     #[test]
     fn parse_xl_heap_truncate_truncated_returns_none() {
         let mut md = Vec::new();
-        write_truncate_header(&mut md, 5, 2, 0); // claims 2 relids
-        md.extend_from_slice(&16400u32.to_le_bytes()); // only one
+        write_truncate_header(&mut md, 5, 2, 0); // claims 2
+        md.extend_from_slice(&16400u32.to_le_bytes()); // supplies 1
         assert!(parse_xl_heap_truncate(&md).is_none());
     }
 

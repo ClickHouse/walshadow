@@ -1,12 +1,10 @@
 //! `walshadow-stream` — full WAL capture pipeline.
 //!
-//! Connects to a source PG in replication mode, issues
-//! `IDENTIFY_SYSTEM` then `START_REPLICATION PHYSICAL` (optionally
-//! bound to a permanent slot), runs a frame loop that filters every
-//! WAL byte, writes filtered segments into the target directory
-//! shadow PG reads via its `restore_command`.
+//! Connects to source PG in replication mode, `IDENTIFY_SYSTEM` then
+//! `START_REPLICATION PHYSICAL` (optionally bound to a permanent slot),
+//! filters every WAL byte, writes filtered segments shadow PG reads via
+//! `restore_command`.
 //!
-//! Usage:
 //! ```text
 //! walshadow-stream \
 //!     --host /tmp/source_sock --port 5432 --user postgres --dbname postgres \
@@ -17,17 +15,6 @@
 //!     [--metrics-bind 127.0.0.1:9484] \
 //!     [--retention-bytes 268435456]
 //! ```
-//!
-//! Operational scaffolding: pre-flight validators
-//! reject mis-configured boots, a Prometheus `/metrics` endpoint
-//! exposes the LSN triple + per-rmgr / xact-buffer / emitter / oracle
-//! counters, `tracing` is wired so `RUST_LOG=walshadow=debug` surfaces
-//! frame-level diagnostics, filtered segments under `--out-dir` are
-//! trimmed once shadow replays past them, the standby-status update
-//! sent back to source is split into the (write, flush, apply) triple
-//! the protocol expects, the CH emitter retries through a bounded
-//! reconnect loop, and `SIGHUP` re-reads `--ch-config` to swap the
-//! per-relation mapping atomically.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -73,35 +60,27 @@ use walshadow::xact_buffer::{
     BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig, XactRecordSink,
 };
 
-/// Bootstrap source impl pick. Hook in front of the WAL pump:
-/// landing catalog files + writing standby.signal so a fresh shadow PG
-/// can be brought up against this run's `out_dir`.
+/// Bootstrap source pick: lands catalog files + standby.signal so a
+/// fresh shadow PG can be brought up against this run's `out_dir`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 enum BootstrapMode {
-    /// Bootstrap disabled — caller supplied shadow data dir externally
-    /// (e.g. via `pg_basebackup`). Default behaviour preserves the
-    /// external-bootstrap daemon flow.
+    /// Caller supplied shadow data dir externally (e.g. `pg_basebackup`)
     #[default]
     Off,
-    /// Source-PG-driven BASE_BACKUP via the replication protocol.
-    /// Reuses the existing `--host` / `--port` / `--user` connection;
-    /// no extra credentials.
+    /// Source-PG-driven BASE_BACKUP over the replication protocol,
+    /// reuses `--host` / `--port` / `--user`, no extra credentials
     Direct,
-    /// wal-g-compatible BASE_BACKUP pulled from a `DynStorage` bucket.
-    /// Storage config is read from `WALG_*` env vars (same convention
-    /// as the wal-rs CLI); `--bootstrap-backup-name` selects which
-    /// backup (LATEST = newest sentinel).
+    /// wal-g-compatible BASE_BACKUP from a `DynStorage` bucket. Storage
+    /// config read from `WALG_*` env vars (wal-rs CLI convention);
+    /// `--bootstrap-backup-name` selects the backup (LATEST = newest sentinel)
     ObjectStore,
 }
 
-/// `decoder + xact_drain` pair that runs on the queueing worker.
-/// Lifted out of [`DaemonSinks`] so the pair (which dispatches inside
-/// a single worker task) is one `RecordSink` value `QueueingRecordSink`
-/// can own.
+/// `decoder + xact_drain` pair as one `RecordSink` for the queueing worker.
 ///
-/// Order: decoder absorbs the heap record into the xact buffer before
-/// xact_drain flushes the matching commit/abort. A multi-statement xact
-/// whose COMMIT lands in the same dispatch batch as its heap records
+/// Order matters: decoder absorbs the heap record into the xact buffer
+/// before xact_drain flushes the matching commit/abort. A multi-statement
+/// xact whose COMMIT lands in the same dispatch batch as its heap records
 /// would otherwise miss the latest writes.
 struct DecoderXactPair<D: RecordSink + Send> {
     decoder: BufferingDecoderSink,
@@ -124,15 +103,14 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         // Decoder has no time-based work; xact_drain forwards to the
-        // observer where the CH emitter's deadline check runs.
+        // CH emitter's deadline check.
         self.xact_drain.on_idle()
     }
 
     fn on_close<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        // Same plumbing as on_idle: decoder has no close work,
-        // xact_drain forwards to the emitter for the final flush.
+        // Decoder has no close work; xact_drain forwards the final flush.
         self.xact_drain.on_close()
     }
 
@@ -146,24 +124,19 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
 
 /// Daemon-side `RecordSink` composite.
 ///
-/// `metrics` stays synchronous on the pump task — its mutations are
-/// counter bumps, never await — so the status line reads them
-/// directly. The decoder/xact-drain pair runs behind a
-/// [`QueueingRecordSink`] so its `wait_for_replay` waits don't park
-/// the pump task, which would freeze the `RecordBytesSink` wire shadow
-/// PG depends on for apply-LSN progress (the deadlock the
-/// streaming tests surface).
+/// `metrics` stays synchronous on the pump task (counter bumps, never
+/// await). The decoder/xact-drain pair runs behind a [`QueueingRecordSink`]
+/// so its `wait_for_replay` waits don't park the pump task, which would
+/// freeze the wire shadow PG depends on for apply-LSN progress (deadlock
+/// the streaming tests surface).
 struct DaemonSinks {
     metrics: MetricsRecordSink,
     decoder_xact: QueueingRecordSink,
-    /// Shared with the `BufferingDecoderSink` running on the queueing
-    /// worker; the status loop polls counters here without contending
-    /// on the worker.
+    /// Shared with the `BufferingDecoderSink` on the queueing worker;
+    /// status loop polls without contending on the worker.
     decoder_stats: Arc<walshadow::decoder_sink::DecoderStats>,
-    /// Shared with the parallel pipeline's inserter pool (which bumps the
-    /// counters post-`EndOfStream`); the status loop polls them here
-    /// without contending on the workers. `None` when the daemon runs
-    /// without a CH pipeline wired.
+    /// Shared with parallel pipeline's inserter pool (bumps counters
+    /// post-`EndOfStream`). `None` when no CH pipeline is wired.
     emitter_stats: Option<Arc<walshadow::ch_emitter::EmitterStats>>,
 }
 
@@ -186,7 +159,7 @@ impl RecordSink for DaemonSinks {
     about = "Stream + filter physical WAL from source PG."
 )]
 struct Args {
-    /// Source PG host (TCP) or unix socket directory (leading `/`).
+    /// Source PG host (TCP) or unix socket directory (leading `/`)
     #[arg(long, default_value = "localhost")]
     host: String,
     #[arg(long, default_value_t = 5432)]
@@ -195,208 +168,178 @@ struct Args {
     user: String,
     #[arg(long, default_value = "postgres")]
     dbname: String,
-    /// Optional cleartext password. Replication-mode connection auth
-    /// supports trust / cleartext / SCRAM-SHA-256.
+    /// Optional cleartext password. Replication-mode auth supports
+    /// trust / cleartext / SCRAM-SHA-256.
     #[arg(long)]
     password: Option<String>,
     /// SSL mode: `disable`, `allow`, `prefer`, `require`, `verify-ca`,
-    /// `verify-full`. TLS is skipped on unix sockets regardless. The
-    /// verify-ca / verify-full modes consult `PGSSLROOTCERT` (or the
-    /// webpki bundle if unset) for the trust anchor — same contract as
-    /// libpq.
+    /// `verify-full`. Skipped on unix sockets regardless. verify-ca /
+    /// verify-full consult `PGSSLROOTCERT` (else webpki bundle) for the
+    /// trust anchor, same contract as libpq.
     #[arg(long, default_value = "prefer")]
     sslmode: String,
-    /// Where filtered segments + manifests land. Shadow PG's
-    /// `restore_command` reads from here.
+    /// Where filtered segments + manifests land; shadow PG's
+    /// `restore_command` reads from here
     #[arg(long)]
     out_dir: PathBuf,
-    /// Optional permanent physical slot name on source PG.
+    /// Optional permanent physical slot name on source PG
     #[arg(long)]
     slot: Option<String>,
-    /// Start LSN in `X/Y` hex form. Defaults to the source's current
+    /// Start LSN in `X/Y` hex form. Defaults to source's current
     /// `pg_current_wal_lsn` (per `IDENTIFY_SYSTEM`), aligned down to a
     /// segment boundary.
     #[arg(long)]
     start_lsn: Option<String>,
-    /// Status-update cadence in seconds.
     #[arg(long, default_value_t = 10)]
     status_interval: u64,
-    /// Stop after this many segments have been shipped (useful for
-    /// smoke tests). Zero = run forever.
+    /// Stop after this many segments shipped (smoke tests). Zero = forever.
     #[arg(long, default_value_t = 0)]
     max_segments: u64,
     /// Shadow PG unix socket directory. Reused as libpq `host=` since
-    /// PG's libpq treats a leading `/` as a socket dir.
+    /// libpq treats a leading `/` as a socket dir.
     #[arg(long)]
     shadow_socket_dir: PathBuf,
-    /// Shadow PG port.
     #[arg(long, default_value_t = 5432)]
     shadow_port: u16,
-    /// Shadow PG user.
     #[arg(long, default_value = "postgres")]
     shadow_user: String,
-    /// Shadow PG database.
     #[arg(long, default_value = "postgres")]
     shadow_dbname: String,
-    /// Wall-clock budget for the initial connect attempt against
-    /// shadow PG. Reused by [`with_transient_retry`] so a still-warming
-    /// shadow doesn't fail the daemon on first boot.
+    /// Wall-clock budget for the initial connect against shadow PG.
+    /// Reused by [`with_transient_retry`] so a still-warming shadow
+    /// doesn't fail the daemon on first boot.
     #[arg(long, default_value_t = 30)]
     shadow_connect_timeout: u64,
-    /// Walsender bind address. `127.0.0.1:0` lets the kernel
-    /// pick a free port; set explicitly when shadow's
-    /// `primary_conninfo` references a fixed port.
+    /// Walsender bind address. `127.0.0.1:0` lets the kernel pick a free
+    /// port; set explicitly when shadow's `primary_conninfo` references
+    /// a fixed port.
     #[arg(long, default_value = "127.0.0.1:0")]
     walsender_bind: SocketAddr,
-    /// Optional file path the daemon writes the actual bound walsender
-    /// address into (one line `host:port`). Useful when
-    /// `--walsender-bind` uses port 0 — the operator (or supervisor)
-    /// reads the file to learn the picked port and configures
-    /// `primary_conninfo` on shadow.
+    /// File the daemon writes the bound walsender address into (one line
+    /// `host:port`). For `--walsender-bind` port 0: operator reads it to
+    /// learn the picked port and configures shadow's `primary_conninfo`.
     #[arg(long)]
     walsender_port_file: Option<PathBuf>,
-    /// Cap on bytes queued onto a slow shadow connection's send buffer
-    /// before the connection is dropped + the wire falls back to
-    /// `restore_command`. "Slow client" backpressure.
+    /// Slow-client backpressure: bytes queued onto a slow shadow
+    /// connection before it's dropped + the wire falls back to
+    /// `restore_command`.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     walsender_slow_threshold: usize,
-    /// Seconds the pump waits for shadow's walreceiver to attach
-    /// before processing records. `0` disables the barrier (degraded
-    /// operators driving shadow purely via `restore_command`).
-    /// `ShadowStreamSink` drops bytes pushed before a connection
-    /// registers; without the barrier the pump can race past
-    /// shadow's `START_REPLICATION` LSN and leave the catalog gate
-    /// timed out against an apply LSN that never advances.
+    /// Seconds the pump waits for shadow's walreceiver to attach before
+    /// processing records. `0` disables the barrier (shadow driven purely
+    /// via `restore_command`). `ShadowStreamSink` drops bytes pushed
+    /// before a connection registers; without the barrier the pump can
+    /// race past shadow's `START_REPLICATION` LSN and leave the catalog
+    /// gate timed out against an apply LSN that never advances.
     #[arg(long, default_value_t = 60)]
     walsender_connect_timeout: u64,
-    /// Soft cap on in-flight records (pump-side buffer + worker
-    /// channel) for the `QueueingRecordSink` feeding the decoder /
-    /// xact-drain worker. Past this watermark the pump yields to let
-    /// the worker drain; a permanently stuck worker still surfaces
-    /// via the catalog `wait_for_replay` timeout on the err slot.
+    /// Soft cap on in-flight records for the `QueueingRecordSink` feeding
+    /// the decoder / xact-drain worker. Past this watermark the pump
+    /// yields to let the worker drain; a stuck worker still surfaces via
+    /// the catalog `wait_for_replay` timeout on the err slot.
     #[arg(long, default_value_t = DEFAULT_QUEUEING_RECORD_SINK_CAPACITY)]
     decoder_queue_capacity: usize,
-    /// Pump-side batch size for the `QueueingRecordSink`. Records
-    /// collect into a local `Vec` before shipping onto the worker
-    /// channel; bigger amortises the per-send overhead but adds
-    /// latency between pump and worker (the worker's
-    /// `wait_for_replay` lags one batch behind the pump).
+    /// Pump-side batch size for the `QueueingRecordSink`. Bigger
+    /// amortises per-send overhead but adds pump→worker latency (worker's
+    /// `wait_for_replay` lags one batch behind).
     #[arg(long, default_value_t = DEFAULT_QUEUEING_BATCH_SIZE)]
     decoder_batch_size: usize,
-    /// Decode-pool size (M): parallel workers doing CPU/IO decode work
-    /// (detoast, type coercion, oracle resolution) feeding the insert
-    /// batcher. Only meaningful with `--ch-config`. `1` (default) keeps
+    /// Decode-pool size (M): parallel decode workers (detoast, type
+    /// coercion, oracle resolution). Only with `--ch-config`. `1` keeps
     /// decode serial so per-table WAL order is preserved; M>1 relaxes
     /// per-table order, relying on `_lsn` ReplacingMergeTree dedup.
     #[arg(long, default_value_t = 1)]
     decoder_pool_size: usize,
-    /// Insert-pool size (N): concurrent ClickHouse connections sending
-    /// INSERTs. Cloud throughput is RTT/part-commit bound, so N>1 is the
-    /// main throughput lever. Only meaningful with `--ch-config`.
+    /// Insert-pool size (N): concurrent ClickHouse INSERT connections.
+    /// Cloud throughput is RTT/part-commit bound, so N>1 is the main
+    /// throughput lever. Only with `--ch-config`.
     #[arg(long, default_value_t = 1)]
     inserter_pool_size: usize,
-    /// Xact / TOAST buffer spill dir. Created on boot if missing;
-    /// wiped clean every startup per the crash-recovery contract in
-    /// [plans/xact.md](../../plans/xact.md).
+    /// Xact / TOAST buffer spill dir. Wiped every startup per the
+    /// crash-recovery contract in [plans/xact.md](../../plans/xact.md).
     #[arg(long)]
     spill_dir: PathBuf,
-    /// In-memory budget for the xact buffer in bytes. Defaults match
-    /// PG's `logical_decoding_work_mem` (64 MiB).
+    /// In-memory xact buffer budget in bytes. Default matches PG's
+    /// `logical_decoding_work_mem` (64 MiB).
     #[arg(long, default_value_t = walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX)]
     xact_buffer_max: usize,
-    /// Optional path to the CH-Native emitter config (TOML).
-    /// When set, drained xact tuples ship to ClickHouse via
-    /// `clickhouse-c-rs`. When unset the daemon stays metrics-only.
-    /// Shape: see [`walshadow::ch_emitter::EmitterConfig::from_toml_str`].
-    /// Reloaded on SIGHUP (atomic mapping swap; connection
-    /// params stay boot-only).
+    /// CH-Native emitter config (TOML). Set → drained tuples ship to
+    /// ClickHouse via `clickhouse-c-rs`; unset → metrics-only. Shape: see
+    /// [`walshadow::ch_emitter::EmitterConfig::from_toml_str`]. Reloaded on
+    /// SIGHUP (atomic mapping swap; connection params stay boot-only).
     #[arg(long)]
     ch_config: Option<PathBuf>,
-    /// Override the TOML's `[ch] flush_timeout_ms` knob from the CLI.
-    /// On the live pipeline (`--ch-config`) `0` (default) selects a
-    /// 100ms partial-batch deadline so cold tables can't pin the
-    /// watermark; positive values set that deadline explicitly,
-    /// capping per-row latency between first append and CH durability.
-    /// No per-xact-close path runs on the live drain (that survives
-    /// only in bootstrap backfill, where it's forced internally).
-    /// SIGHUP reads `--ch-config` only, so use the flag for the boot
-    /// value when you don't want to maintain the knob in TOML.
+    /// CLI override for the TOML's `[ch] flush_timeout_ms`. On the live
+    /// pipeline `0` (default) selects a 100ms partial-batch deadline so
+    /// cold tables can't pin the watermark; positive sets it explicitly.
+    /// No per-xact-close path runs on the live drain (survives only in
+    /// bootstrap backfill, forced internally). SIGHUP reads `--ch-config`
+    /// only, so use this flag for the boot value when not maintaining the
+    /// knob in TOML.
     #[arg(long)]
     ch_flush_timeout_ms: Option<u64>,
-    /// Differential decode oracle: probe 1-in-`<N>` rows
-    /// through shadow PG's `walshadow_decode_disk(oid, bytea)`
-    /// extension function and assert the local decoder matches. `0`
-    /// (default) disables. Requires the `walshadow` extension
-    /// installed on shadow PG; absent extension surfaces as
-    /// `oracle fallback=N` in the status line and the daemon
-    /// silently ships raw on-disk bytes for `PgPending` types.
+    /// Differential decode oracle: probe 1-in-`<N>` rows through shadow
+    /// PG's `walshadow_decode_disk(oid, bytea)` extension function and
+    /// assert the local decoder matches. `0` disables. Requires the
+    /// `walshadow` extension on shadow PG; absent extension surfaces as
+    /// `oracle fallback=N` and the daemon ships raw on-disk bytes for
+    /// `PgPending` types.
     #[arg(long, default_value_t = 0)]
     validate: u32,
-    /// HTTP/Prometheus metrics bind address. Disabled when
-    /// absent; pass `127.0.0.1:9484` for a localhost-only scrape.
+    /// HTTP/Prometheus metrics bind address. Disabled when absent.
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
-    /// Retention horizon in bytes of WAL. Segments older than
-    /// `shadow_replay_lsn - retention_bytes` are deleted on every trim
-    /// cycle. Set to `0` to disable trim entirely.
+    /// WAL retention horizon in bytes. Segments older than
+    /// `shadow_replay_lsn - retention_bytes` deleted every trim cycle.
+    /// `0` disables trim.
     #[arg(long, default_value_t = DEFAULT_RETENTION_BYTES)]
     retention_bytes: u64,
-    /// Skip the pre-flight validators (server_version_num,
-    /// wal_level, REPLICA IDENTITY FULL, slot existence). Useful for
-    /// recovery drills; production should leave this off.
+    /// Skip pre-flight validators (server_version_num, wal_level, REPLICA
+    /// IDENTITY FULL, slot existence). For recovery drills.
     #[arg(long, default_value_t = false)]
     skip_preflight: bool,
-    /// Ignore any `cursor.bin` under `--spill-dir` at boot
-    /// (greenfield resume even when a prior daemon left one). Useful
-    /// for "wipe + restart from a known LSN" drills. The cursor still
-    /// gets rewritten as the new daemon makes progress.
+    /// Ignore any `cursor.bin` under `--spill-dir` at boot (greenfield
+    /// resume even when a prior daemon left one). For "wipe + restart
+    /// from a known LSN" drills. Cursor still rewritten as the new daemon
+    /// progresses.
     #[arg(long, default_value_t = false)]
     ignore_cursor: bool,
-    /// Bootstrap source pick. `off` (default) keeps the
-    /// flow where shadow is bootstrapped externally.
-    /// `direct` issues BASE_BACKUP against source PG over the same
-    /// replication connection; `object_store` pulls a wal-g-format
-    /// backup from `DynStorage` (configured via `WALG_*` env vars).
-    /// In both bootstrap modes, the daemon lands catalog files +
-    /// writes standby.signal + restore_command to
-    /// `--bootstrap-shadow-data-dir`, then resumes the WAL pump at
-    /// the backup's `end_lsn` (overriding any cursor / `--start-lsn`).
+    /// Bootstrap source pick. `off` keeps shadow externally bootstrapped.
+    /// `direct` issues BASE_BACKUP over the same replication connection;
+    /// `object_store` pulls a wal-g-format backup from `DynStorage`
+    /// (`WALG_*` env vars). Both modes land catalog files + standby.signal +
+    /// restore_command to `--bootstrap-shadow-data-dir`, then resume the
+    /// WAL pump at the backup's `end_lsn` (overriding cursor / `--start-lsn`).
     #[arg(long, value_enum, default_value_t = BootstrapMode::Off)]
     bootstrap_mode: BootstrapMode,
-    /// Shadow PG data dir that the bootstrap lands catalogs into. PG
-    /// recovery's `restore_command` will then consume
-    /// `out_dir/<seg>.partial` files to replay WAL beyond `end_lsn`.
-    /// Required when `--bootstrap-mode != off`. Must be empty (or
-    /// non-existent) at boot.
+    /// Shadow PG data dir the bootstrap lands catalogs into; PG recovery's
+    /// `restore_command` then consumes `out_dir/<seg>.partial` to replay
+    /// WAL beyond `end_lsn`. Required when `--bootstrap-mode != off`. Must
+    /// be empty (or non-existent) at boot.
     #[arg(long)]
     bootstrap_shadow_data_dir: Option<PathBuf>,
-    /// Object-store backup name. `LATEST` resolves to the newest
-    /// sentinel; otherwise pass the literal `base_TTTTTTTTLLLLLLLLSSSSSSSS`
-    /// form. Required when `--bootstrap-mode=object_store`.
+    /// Object-store backup name. `LATEST` resolves to newest sentinel;
+    /// otherwise the literal `base_TTTTTTTTLLLLLLLLSSSSSSSS` form. Required
+    /// when `--bootstrap-mode=object_store`.
     #[arg(long, default_value = "LATEST")]
     bootstrap_backup_name: String,
-    /// Object-store fan-out parallelism. 4 is a safe default; raise
-    /// for high-bandwidth buckets, lower for narrow networks.
+    /// Object-store fan-out parallelism. Raise for high-bandwidth buckets.
     #[arg(long, default_value_t = 4)]
     bootstrap_object_store_parallelism: usize,
-    /// BASE_BACKUP fast-checkpoint flag for `direct` mode. Defaults to
-    /// `true` so the bootstrap doesn't wait for the source's
-    /// checkpoint_timeout; flip off if checkpoint cost matters more
-    /// than bootstrap latency.
+    /// BASE_BACKUP fast-checkpoint flag for `direct` mode. `true` avoids
+    /// waiting for source's checkpoint_timeout; flip off if checkpoint
+    /// cost matters more than bootstrap latency.
     #[arg(long, default_value_t = true)]
     bootstrap_fast_checkpoint: bool,
-    /// Auto-spawn shadow PG against `--bootstrap-shadow-data-dir`
-    /// immediately after the bootstrap pump returns. Daemon drives
-    /// `pg_ctl start` against the bootstrapped data dir, then waits
-    /// for `pg_last_wal_replay_lsn` to clear the backup's `end_lsn`
-    /// before continuing. Off by default — operators with an external
-    /// supervisor (systemd, k8s) own shadow lifecycle and don't want
+    /// Auto-spawn shadow PG against `--bootstrap-shadow-data-dir` after
+    /// the bootstrap pump returns (drives `pg_ctl start`, waits for
+    /// `pg_last_wal_replay_lsn` to clear `end_lsn`). Off so external
+    /// supervisors (systemd, k8s) own shadow lifecycle without
     /// double-management.
     #[arg(long, default_value_t = false)]
     bootstrap_autospawn_shadow: bool,
-    /// Wall-clock budget for `--bootstrap-autospawn-shadow`'s wait on
-    /// shadow's replay LSN. Seconds. Exceeded → daemon aborts; no
-    /// further WAL pumping.
+    /// Seconds budget for `--bootstrap-autospawn-shadow`'s wait on shadow's
+    /// replay LSN. Exceeded → daemon aborts.
     #[arg(long, default_value_t = 300)]
     bootstrap_shadow_replay_timeout: u64,
 }
@@ -408,9 +351,8 @@ async fn main() -> Result<()> {
     run(args).await
 }
 
-/// Wire `tracing` once per process. `RUST_LOG` configures the filter;
-/// when unset, defaults to warn-level except for walshadow itself which
-/// stays at info so the daemon's startup banner still emits.
+/// `RUST_LOG` configures the filter; unset defaults to warn except
+/// walshadow=info so the startup banner still emits.
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter =
@@ -447,15 +389,6 @@ async fn run(args: Args) -> Result<()> {
         "source identified",
     );
 
-    // Optional bootstrap step. On a non-off mode, this lands
-    // the catalog tree on `--bootstrap-shadow-data-dir`, writes a
-    // standby.signal + `restore_command` pointing at `--out-dir`, and
-    // returns the backup's `end_lsn` so the WAL pump (further down)
-    // resumes there. When `--ch-config` is also set, bootstrap rows
-    // route through the shared insert tail (no shadow PG needed);
-    // otherwise they drain to a metrics-only observer. The tail makes
-    // every bootstrap row durable on CH before this returns, so the WAL
-    // pump below resumes against a fully-shipped baseline.
     let ch_config = match args.ch_config.as_deref() {
         Some(path) => {
             let toml = tokio::fs::read_to_string(path)
@@ -478,10 +411,6 @@ async fn run(args: Args) -> Result<()> {
                 .context("bootstrap")?,
         )
     };
-    // After run_bootstrap, optionally auto-spawn shadow PG against the
-    // bootstrapped data dir + wait for it to replay past `end_lsn`.
-    // Sync calls live in `block_in_place` because `Shadow::start` +
-    // `Shadow::wait_for_replay` shell out to `pg_ctl` / `psql`.
     if let Some(end_lsn) = bootstrap_end_lsn
         && args.bootstrap_autospawn_shadow
     {
@@ -492,11 +421,8 @@ async fn run(args: Args) -> Result<()> {
         autospawn_shadow_and_wait(&args, shadow_data_dir, end_lsn).await?;
     }
 
-    // Cursor-resume gate. `--start-lsn` (explicit operator
-    // override) wins; otherwise cursor.bin under spill_dir picks up the
-    // last emitter-acked LSN; otherwise greenfield (source's current
-    // write head). `--ignore-cursor` forces greenfield even when a
-    // valid cursor is on disk (recovery drills).
+    // Resume precedence: `--start-lsn` > cursor.bin emitter-ack > greenfield
+    // (source write head). `--ignore-cursor` forces greenfield (recovery drills).
     let cursor_at_boot: Option<cursor::Cursor> = if args.ignore_cursor {
         None
     } else {
@@ -513,16 +439,19 @@ async fn run(args: Args) -> Result<()> {
             }
         }
     };
-    // Bootstrap-mode `end_lsn` outranks the cursor: a fresh bootstrap
-    // means catalog state on shadow is `end_lsn`, so consuming WAL
-    // before that double-counts. `--start-lsn` (explicit operator
-    // override) still wins so recovery drills can rewind further.
-    let raw_start = match (&args.start_lsn, bootstrap_end_lsn, &cursor_at_boot) {
-        (Some(s), _, _) => parse_lsn(s).context("--start-lsn")?,
-        (None, Some(l), _) => l,
-        (None, None, Some(c)) if c.emitter_ack_lsn != 0 => c.emitter_ack_lsn,
-        (None, None, _) => ident.xlogpos,
+    // Bootstrap `end_lsn` outranks the cursor: shadow catalog state is at
+    // `end_lsn`, so consuming WAL before it double-counts. `--start-lsn`
+    // still wins so recovery drills can rewind further.
+    let start_lsn_override = match &args.start_lsn {
+        Some(s) => Some(parse_lsn(s).context("--start-lsn")?),
+        None => None,
     };
+    let raw_start = cursor::resolve_resume_lsn(
+        start_lsn_override,
+        bootstrap_end_lsn,
+        cursor_at_boot.as_ref().map(|c| c.emitter_ack_lsn),
+        ident.xlogpos,
+    );
     let aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
     tracing::info!(
         target: "walshadow",
@@ -537,14 +466,10 @@ async fn run(args: Args) -> Result<()> {
     );
 
     let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned)?;
-    // Walsender listener + ShadowStreamSink.
-    //
-    // Bind the listener BEFORE shadow's walreceiver gets a chance to
-    // connect (the bootstrap barrier in the plan): operators wire
-    // shadow's `primary_conninfo` at this address. Without an active
-    // sink, the catalog gate inside `BufferingDecoderSink` would
-    // deadlock — shadow's replay LSN never advances since segment-
-    // sink fires after per-record dispatch in the new ordering.
+    // Bind walsender listener BEFORE shadow's walreceiver can connect.
+    // Without an active sink, the catalog gate inside `BufferingDecoderSink`
+    // deadlocks: shadow's replay LSN never advances since segment-sink fires
+    // after per-record dispatch in the current ordering.
     let shadow_state = Arc::new(Mutex::new(
         walshadow::shadow_stream::ShadowStreamState::new(
             ident.timeline,
@@ -581,11 +506,9 @@ async fn run(args: Args) -> Result<()> {
         shadow_state.clone(),
     )));
 
-    // Seed the catalog tracker from source's *current* pg_class before
-    // START_REPLICATION. Closes the "long-running source rotated a
-    // mapped catalog above 16384 pre-attach" hole that the < 16384
-    // bootstrap rule misses on its own. Idempotent so `--start-lsn`
-    // resumes seed too.
+    // Seed catalog tracker from source's current pg_class before
+    // START_REPLICATION. Closes the "source rotated a mapped catalog above
+    // 16384 pre-attach" hole the < 16384 bootstrap rule misses. Idempotent.
     {
         let sql_client = feed
             .sql_client()
@@ -604,11 +527,9 @@ async fn run(args: Args) -> Result<()> {
         );
     }
 
-    // Connect the shadow catalog before START_REPLICATION so the
-    // tracker→drain wire is hot from the first record. Wrapped in
-    // with_transient_retry so a still-warming shadow doesn't kill the
-    // daemon on boot. Catalog lives in Arc<Mutex<_>>; clones
-    // fan out to the drain task, BufferingDecoderSink, and oracle.
+    // Connect shadow catalog before START_REPLICATION so the tracker→drain
+    // wire is hot from the first record. with_transient_retry tolerates a
+    // still-warming shadow on boot.
     let shadow_conninfo = socket_conninfo(
         args.shadow_socket_dir
             .to_str()
@@ -636,19 +557,17 @@ async fn run(args: Args) -> Result<()> {
         "shadow connected",
     );
 
-    // Wire the descriptor-cache invalidation epoch. Tracker bumps the
-    // shared atomic on every catalog-touching record; the catalog reads
-    // the atomic at the top of every relation lookup and folds the
-    // delta into a synchronous `invalidate` before the cache check.
+    // Descriptor-cache invalidation epoch: tracker bumps on every
+    // catalog-touching record, catalog folds the delta into `invalidate`
+    // before each relation lookup's cache check.
     let invalidation_epoch = Arc::new(AtomicU64::new(0));
     stream
         .filter_mut()
         .tracker
         .set_invalidation_epoch(invalidation_epoch.clone());
-    // Narrower drop-only counter so sweep_dropped
-    // throttles off pg_class heap_delete instead of every catalog
-    // touch (ADD COLUMN / CREATE INDEX flood pgbench-rate workloads
-    // otherwise).
+    // Narrower drop-only epoch so sweep_dropped throttles off pg_class
+    // heap_delete, not every catalog touch (ADD COLUMN / CREATE INDEX
+    // would flood at pgbench rate otherwise).
     let pg_class_delete_epoch = Arc::new(AtomicU64::new(0));
     stream
         .filter_mut()
@@ -660,9 +579,8 @@ async fn run(args: Args) -> Result<()> {
         cat.set_pg_class_delete_epoch(pg_class_delete_epoch.clone());
     }
 
-    // Pre-flight validators. Run after both source + shadow
-    // SQL clients are up so every check has the connection it needs;
-    // abort the daemon on any finding unless `--skip-preflight` is set.
+    // Pre-flight validators run after both source + shadow SQL clients
+    // are up so every check has its connection.
     if !args.skip_preflight {
         let source_version_num = feed.server_version_num();
         let source_sql = feed
@@ -691,14 +609,11 @@ async fn run(args: Args) -> Result<()> {
         tracing::info!(target: "walshadow::preflight", "pre-flight passed");
     }
 
-    // Seed the schema-diff baseline for operator-pinned
-    // relations before subscribe(), so a pinned table's first post-start
-    // ALTER diffs against boot shape (→ Changed → CH ALTER) rather than
-    // cold-prev_known Added (apply_added skips pinned dests). Runs before
-    // START_REPLICATION so the baseline is in place before any WAL record
-    // is decoded. cfg.tables.keys() is exactly the pinned set; auto-create
-    // tables record their baseline on the first-touch CREATE path so they
-    // need no seeding.
+    // Seed schema-diff baseline for operator-pinned relations before
+    // START_REPLICATION so a pinned table's first post-start ALTER diffs
+    // against boot shape (→ Changed → CH ALTER) rather than cold-prev_known
+    // Added (apply_added skips pinned dests). cfg.tables.keys() is the
+    // pinned set; auto-create tables baseline on first-touch CREATE.
     if let Some(cfg) = ch_config.as_ref() {
         let names: Vec<String> = cfg.tables.keys().cloned().collect();
         let seeded = catalog
@@ -714,11 +629,9 @@ async fn run(args: Args) -> Result<()> {
         );
     }
 
-    // Oracle. Opens its own libpq connection to shadow PG so
-    // its queries don't pessimise the catalog's query-one path. Best-
-    // effort: a still-warming shadow or a connect timeout just
-    // disables the oracle; the daemon keeps running with the raw-
-    // bytes fallback.
+    // Oracle opens its own libpq connection so its queries don't pessimise
+    // the catalog's query-one path. Best-effort: connect failure disables
+    // the oracle, daemon keeps running with the raw-bytes fallback.
     let oracle = match walshadow::oracle::connect_with_budget(
         &shadow_conninfo,
         args.validate,
@@ -746,9 +659,8 @@ async fn run(args: Args) -> Result<()> {
     feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;
-    // Xact buffer + spill dir. Wiped on every startup —
-    // cursor file commits drains atomically so leftover spill files
-    // from a prior crash are always either redundant or stale.
+    // Spill dir wiped every startup: cursor file commits drains
+    // atomically, so leftover spill from a prior crash is redundant or stale.
     let xact_buf_cfg = XactBufferConfig {
         xact_buffer_max: args.xact_buffer_max,
         spill_dir: args.spill_dir.clone(),
@@ -766,16 +678,8 @@ async fn run(args: Args) -> Result<()> {
         "spill dir ready",
     );
 
-    // The buffering decoder (heap → xact buffer) runs behind a
-    // `QueueingRecordSink` worker so its `wait_for_replay` calls don't
-    // park the pump task (which would freeze the shadow-PG wire). Its
-    // drain half differs by mode: with `--ch-config` the parallel
-    // decode+insert pipeline (M decoders, N inserters); without, a
-    // serial metrics-only drain.
-    //
-    // Subscribe to the catalog's schema events (descriptor-fetch +
-    // commit-boundary `sweep_dropped`); shared `Arc<Mutex<…>>` so both the
-    // decoder and the drain stage pull from the same queue.
+    // Shared schema-events queue (descriptor-fetch + commit-boundary
+    // `sweep_dropped`); both decoder and drain stage pull from it.
     let schema_events = Arc::new(std::sync::Mutex::new(catalog.lock().await.subscribe()));
     let decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
         .with_schema_events(schema_events.clone());
@@ -791,14 +695,13 @@ async fn run(args: Args) -> Result<()> {
     let decoder_xact = match ch_config {
         Some(emitter_cfg) => {
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-            // SIGHUP-reloadable mapping shared by the DDL applicator + the
-            // decode pool (was previously owned by the serial Emitter).
+            // SIGHUP-reloadable mapping shared by DDL applicator + decode pool.
             let mapping: MappingHandle =
                 Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
             mapping_handle = Some(mapping.clone());
-            // DDL applicator on its own CH connection; owned by the reorder
-            // coordinator so ALTER / CREATE / DROP / TRUNCATE apply inside
-            // the barrier (after earlier data is durable).
+            // DDL applicator owned by the reorder coordinator so ALTER /
+            // CREATE / DROP / TRUNCATE apply inside the barrier, after
+            // earlier data is durable.
             let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_emitter(&emitter_cfg);
             let applicator =
                 walshadow::ch_ddl::DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone())
@@ -806,17 +709,17 @@ async fn run(args: Args) -> Result<()> {
                     .context("init DDL applicator")?;
             let stats = Arc::new(EmitterStats::default());
             emitter_stats_handle = Some(stats.clone());
-            // Seed the durable watermark at the bootstrap end_lsn so the
-            // resume cursor persists `end_lsn` (not start_lsn) until the
-            // first WAL xact advances it. Without this, a crash between
-            // bootstrap completion and the first post-end_lsn xact going
-            // durable — restarted with --bootstrap-mode=off — would resume
-            // the cursor at start_lsn and re-decode [start_lsn, end_lsn]
-            // against the end_lsn shadow catalog (WAL-version skew). The
-            // tail's `fetch_max` keeps it monotonic as WAL re-reads
-            // [aligned, end_lsn]. See plans/future/parallel_decode_and_insert.md
-            // (Handoff step 3).
-            let emitter_ack = Arc::new(AtomicU64::new(bootstrap_end_lsn.unwrap_or(0)));
+            // Seed durable watermark at `raw_start`, not 0. Status loop
+            // persists this atomic into cursor's emitter_ack_lsn each
+            // interval with no monotonic guard, first write at boot before
+            // any WAL re-read acks. Seeding 0 would clobber a resumed
+            // cursor; a crash before [aligned, raw_start] re-reads acks
+            // then resumes from ident.xlogpos next boot (precedence skips a
+            // zero cursor ack), silently dropping [raw_start, head] WAL that
+            // never reached CH. tail's `fetch_max` keeps it monotonic as WAL
+            // re-reads [aligned, raw_start]. See
+            // plans/future/parallel_decode_and_insert.md (Handoff step 3).
+            let emitter_ack = Arc::new(AtomicU64::new(raw_start));
             pipeline_ack = Some(emitter_ack.clone());
             let pcfg = PipelineConfig {
                 emitter: emitter_cfg,
@@ -854,8 +757,8 @@ async fn run(args: Args) -> Result<()> {
             )
         }
         None => {
-            // Metrics-only (no CH): serial drain to counters. Oracle
-            // wrapper resolves PgPending + fires validator probes when up.
+            // Metrics-only (no CH): serial drain to counters. Oracle wrapper
+            // resolves PgPending + fires validator probes when up.
             let observer: Box<dyn TupleObserver> = match oracle.clone() {
                 Some(o) => Box::new(walshadow::oracle::OracleObserver::new(
                     o,
@@ -885,9 +788,6 @@ async fn run(args: Args) -> Result<()> {
     let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
-    // Metrics endpoint. The registry handle threads through
-    // the status-line loop; the HTTP server task lives until the
-    // runtime tears down.
     let metrics = MetricsRegistry::new();
     let _metrics_server = match args.metrics_bind {
         Some(addr) => {
@@ -900,29 +800,22 @@ async fn run(args: Args) -> Result<()> {
         None => None,
     };
 
-    // SIGHUP handler. Re-reads `--ch-config` and swaps the
-    // live mapping in the emitter via the shared handle. Connection
-    // params stay boot-only; only the per-relation mapping reloads.
+    // SIGHUP swaps only the per-relation mapping; connection params stay boot-only.
     let sighup_path = args.ch_config.clone();
     let sighup_handle = mapping_handle.clone();
     let _sighup_task = spawn_sighup_handler(sighup_path, sighup_handle);
 
-    // Shared shadow_replay_lsn observed by the retention
-    // sweeper (the only thing polling shadow's `pg_last_wal_replay_lsn`
-    // today). Status loop reads the same atomic to feed the cursor
-    // file's `shadow_replay_lsn` slot + the standby-status `apply_lsn`
-    // ceiling. Atomic so the two tasks don't need a shared mutex.
+    // Retention sweeper writes shadow's `pg_last_wal_replay_lsn` here;
+    // status loop reads it for the cursor's `shadow_replay_lsn` slot + the
+    // standby-status `apply_lsn` ceiling.
     let shadow_replay_lsn = Arc::new(AtomicU64::new(0));
-    // Tracked across active ShadowStreamSink connections;
-    // fed by the walsender listener task into the cursor file. Used by
-    // shadow's `START_REPLICATION PHYSICAL` resume on daemon restart.
+    // Aggregate flush across ShadowStreamSink connections, fed into the
+    // cursor for shadow's `START_REPLICATION PHYSICAL` resume on restart.
     let shadow_flush_lsn = Arc::new(AtomicU64::new(0));
 
-    // Retention sweeper. Polls shadow's replay LSN, drops
-    // filtered segments more than `retention_bytes` behind. Disabled
-    // when `retention_bytes == 0`. The sweeper doubles up: its
-    // poll feeds `shadow_replay_lsn` so the main loop doesn't open a
-    // second shadow connection.
+    // Retention sweeper drops filtered segments more than `retention_bytes`
+    // behind shadow's replay LSN. Its poll doubles as the only feed of
+    // `shadow_replay_lsn`, sparing the main loop a second shadow connection.
     let _retention_task = if args.retention_bytes > 0 {
         Some(spawn_retention(
             args.out_dir.clone(),
@@ -934,17 +827,14 @@ async fn run(args: Args) -> Result<()> {
         None
     };
 
-    // Block before the pump loop until shadow's walreceiver has
-    // attached. `ShadowStreamSink::on_wire_chunk` drops bytes when no
-    // connection is registered, so if the pump races past
-    // `START_REPLICATION`'s LSN before walreceiver arrives the gap
-    // is unrecoverable: post-conn frames carry LSNs past walreceiver's
-    // expected continuity, shadow's apply stalls, and the catalog
-    // gate inside `BufferingDecoderSink` times out (the failure mode
-    // `pgbench_acceptance` and `kill_restart`
-    // surfaced). Cap the wait so operators running without a streaming
-    // shadow still boot cleanly — they take the `restore_command`
-    // archive path instead.
+    // Block until shadow's walreceiver attaches. `ShadowStreamSink::
+    // on_wire_chunk` drops bytes with no connection registered, so a pump
+    // racing past `START_REPLICATION`'s LSN before walreceiver arrives
+    // leaves an unrecoverable gap: post-conn frames carry LSNs past
+    // walreceiver's expected continuity, shadow's apply stalls, the catalog
+    // gate times out (pgbench_acceptance / kill_restart failure mode). Cap
+    // the wait so operators without a streaming shadow still boot via the
+    // restore_command archive path.
     if args.walsender_connect_timeout > 0 {
         let timeout = Duration::from_secs(args.walsender_connect_timeout);
         let start = Instant::now();
@@ -977,36 +867,24 @@ async fn run(args: Args) -> Result<()> {
     let start_instant = Instant::now();
     let mut segments_shipped = 0u64;
     let mut prev_dispatched = stream.dispatched_lsn();
-    // Rolling 30 s WAL byte-rate estimate. Status loop
-    // pushes a `(now, source_received_lsn)` sample per tick.
     let mut rate_estimator = RateEstimator::default();
-    // Cursor write cadence matches the source standby-status
-    // cadence so the file's `emitter_ack_lsn` is ≥ the value we advertise
-    // to source as `apply_lsn` on every send. Without this ordering the
-    // slot could advance past a not-yet-durable resume point.
+    // Cursor write cadence matches standby-status cadence so the file's
+    // `emitter_ack_lsn` is ≥ the `apply_lsn` advertised to source on every
+    // send; else the slot could advance past a not-yet-durable resume point.
     let cursor_write_interval = Duration::from_secs(args.status_interval);
     let mut last_cursor_write: Option<Instant> = None;
-    // Inflight-stall watchdog. When xacts_active stays > 0 across two
-    // status intervals without `emitter_ack_lsn` moving, dump the
-    // parked xids' identifiers so the artifact captures who's holding
-    // the slot. One-shot per stall — re-arms when ack advances.
+    // Inflight-stall watchdog: xacts_active > 0 with stalled
+    // `emitter_ack_lsn` dumps the parked xids holding the slot. One-shot
+    // per stall, re-arms when ack advances.
     let mut last_emitter_ack_observed: u64 = 0;
     let mut inflight_stall_since: Option<Instant> = None;
     let mut inflight_stall_logged = false;
     let shutdown_reason = loop {
-        // Snapshot every LSN the cursor + standby status depend on.
-        // dispatched_lsn is filter_durable now that DirSegmentSink
-        // fsyncs every segment + the parent dir. shadow_replay_lsn comes
-        // from the retention sweeper's poll (0 when retention is off).
-        // drain_lsn / emitter_ack_lsn come straight from the xact buffer
-        // — single source of truth.
+        // dispatched_lsn is filter-durable since DirSegmentSink fsyncs each
+        // segment + the parent dir. shadow_replay 0 when retention is off.
         let dispatched = stream.dispatched_lsn();
         let received = feed.last_server_wal_end().max(dispatched);
         let shadow_replay = shadow_replay_lsn.load(Ordering::Acquire);
-        // Pull the latest aggregate flush across active shadow
-        // streaming connections + advertise it as the standby-status
-        // apply ceiling so source's slot recycles in lockstep with
-        // shadow's wire-driven advance.
         let shadow_agg = shadow_state.lock().await.aggregate();
         if let Some(flush) = shadow_agg.min_flush_lsn {
             shadow_flush_lsn.fetch_max(flush, Ordering::Release);
@@ -1014,19 +892,17 @@ async fn run(args: Args) -> Result<()> {
         let (drain_lsn, emitter_ack_lsn) = {
             let b = xact_buffer.lock().await;
             let s = b.stats();
-            // Pipeline path: durable watermark comes from the ack
-            // collector atomic; serial/metrics path: xact buffer field.
+            // Durable watermark: pipeline → ack collector atomic;
+            // serial/metrics → xact buffer field.
             let ea = match &pipeline_ack {
                 Some(a) => a.load(Ordering::Acquire),
                 None => s.emitter_ack_lsn,
             };
             (s.drain_lsn, ea)
         };
-        // apply_lsn ceiling. Treat shadow_replay==0
-        // (sweeper disabled or hasn't reported yet) as "no constraint
-        // from shadow" rather than the literal min — otherwise a fresh
-        // boot with retention off would pin apply_lsn at 0 forever and
-        // source's slot would never recycle.
+        // shadow_replay==0 (sweeper off or not yet reported) means "no
+        // constraint from shadow", not the literal min: else a fresh boot
+        // with retention off pins apply_lsn at 0 and source's slot never recycles.
         let apply_ceiling = match shadow_replay {
             0 => emitter_ack_lsn,
             s => s.min(emitter_ack_lsn),
@@ -1053,18 +929,15 @@ async fn run(args: Args) -> Result<()> {
         let dispatched_before = stream.dispatched_lsn();
         let chunk = tokio::select! {
             biased;
-            // Drain signals first so an in-flight ctrl_c doesn't lose to
-            // a chunk that's already at the head of the queue.
+            // ctrl_c first so it doesn't lose to a chunk already at the queue head.
             sig = tokio::signal::ctrl_c() => {
                 sig.context("install ctrl_c handler")?;
                 break "signal";
             }
-            // Idle tick: with decoder + xact_drain now running behind
-            // QueueingRecordSink, `emitter_ack_lsn` advances in the
-            // worker after the pump has finished pushing. Without a
-            // periodic wakeup, an idle source (kill-restart's
-            // post-catchup quiescence) would freeze metrics + cursor at
-            // whatever values the last chunk landed on.
+            // Idle tick: `emitter_ack_lsn` advances in the queueing worker
+            // after the pump pushes, so without a periodic wakeup an idle
+            // source (kill-restart post-catchup quiescence) freezes metrics
+            // + cursor at the last chunk's values.
             _ = tokio::time::sleep(cursor_write_interval) => None,
             res = feed.next_chunk(status, &mut chunk_buf) => Some(match res? {
                 Some(c) => c,
@@ -1082,18 +955,15 @@ async fn run(args: Args) -> Result<()> {
                 )
                 .await?;
         }
-        // Flush the pump-side accumulator so partial batches don't strand
-        // commits in `decoder_xact.buf` when source goes idle (the
-        // kill-restart drill's post-catchup quiescence). Per-iteration
-        // flush still amortises the worker's wakeup cost across whatever
-        // records the chunk produced.
+        // Flush pump-side accumulator so partial batches don't strand
+        // commits in `decoder_xact.buf` when source goes idle (kill-restart
+        // post-catchup quiescence).
         record_sink
             .decoder_xact
             .flush()
             .await
             .context("flush queueing decoder sink")?;
-        // Surface a pipeline-stage failure (encode reject, retry-exhausted
-        // inserter, decode/catalog error) as a clean daemon exit with the
+        // Surface a pipeline-stage failure as a clean daemon exit with the
         // root cause rather than a silently pinned watermark.
         if let Some(h) = &pipeline_handle
             && let Some(msg) = h.fatal.message()
@@ -1102,14 +972,11 @@ async fn run(args: Args) -> Result<()> {
         }
         let now_dispatched = stream.dispatched_lsn();
         let advanced = now_dispatched != prev_dispatched;
-        // Always refresh metrics + log on advance; on idle ticks just
-        // refresh metrics so emitter_ack_lsn / cursor stay current.
         let (xact_stats, xact_line) = {
             let b = xact_buffer.lock().await;
             let mut stats = b.stats().clone();
-            // Reflect the pipeline ack collector's watermark so the metric +
-            // inflight-stall watchdog track real CH durability, not the
-            // unused xact-buffer field.
+            // Pipeline mode: track the ack collector's watermark (real CH
+            // durability), not the unused xact-buffer field.
             if let Some(a) = &pipeline_ack {
                 stats.emitter_ack_lsn = a.load(Ordering::Acquire);
             }
@@ -1128,9 +995,8 @@ async fn run(args: Args) -> Result<()> {
         let lag_bytes = received.saturating_sub(shadow_apply_lsn);
         rate_estimator.observe(Instant::now(), received);
         let lag_seconds = rate_estimator.seconds_for(lag_bytes);
-        // Re-read the post-worker xact buffer stats for the metric so
-        // emitter_ack_lsn reflects what the queueing worker has actually
-        // drained, not the snapshot taken at the top of this iteration.
+        // Post-worker stats so the metric reflects what the worker drained,
+        // not the top-of-iteration snapshot.
         let emitter_ack_for_metric = xact_stats.emitter_ack_lsn;
         let drain_for_metric = xact_stats.drain_lsn;
         populate_metrics(
@@ -1181,10 +1047,9 @@ async fn run(args: Args) -> Result<()> {
                 break "max-segments";
             }
         }
-        // Inflight-stall watchdog. Re-arm when ack moves; otherwise
-        // after 5s of stall with parked xacts, dump the parked xids
-        // once. Independent of `advanced` so a fully-quiescent pump
-        // still surfaces who's holding the slot.
+        // Re-arm on ack move; else after 5s of stall with parked xacts dump
+        // the xids once. Runs independent of `advanced` so a fully-quiescent
+        // pump still surfaces who's holding the slot.
         if xact_stats.emitter_ack_lsn != last_emitter_ack_observed {
             last_emitter_ack_observed = xact_stats.emitter_ack_lsn;
             inflight_stall_since = None;
@@ -1257,18 +1122,16 @@ async fn run(args: Args) -> Result<()> {
         .close(Some(&mut segment_sink), &mut record_sink)
         .await
         .context("flush partial segment on shutdown")?;
-    // Drain the queueing worker so any records pump-side enqueued but
-    // not yet dispatched run through the decoder + xact_drain chain
-    // before the daemon exits. Surfaces any worker-parked error.
+    // Drain queueing worker so enqueued-but-undispatched records run
+    // through decoder + xact_drain before exit; surfaces worker-parked errors.
     let DaemonSinks { decoder_xact, .. } = record_sink;
     decoder_xact
         .close()
         .await
         .context("drain queueing decoder sink on shutdown")?;
-    // Closing the worker drops the reorder sink, which closes the decode
-    // job queue. Drain the rest of the pipeline in order (decoders →
-    // batcher force-flush → inserters to EndOfStream → ack collector) so no
-    // buffered rows are lost and the final watermark is durable.
+    // Worker close dropped the reorder sink, closing the decode job queue.
+    // Drain rest in order (decoders → batcher force-flush → inserters to
+    // EndOfStream → ack collector) so no rows are lost + final watermark durable.
     if let Some(handle) = pipeline_handle {
         handle
             .join()
@@ -1278,9 +1141,9 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Open a tokio_postgres client against shadow over its unix socket.
-/// Used by [`walshadow::preflight::run`] which needs SQL access
-/// independent of the [`ShadowCatalog`]'s replay-LSN-gated path.
+/// tokio_postgres client against shadow over its unix socket, for
+/// [`walshadow::preflight::run`] which needs SQL access independent of
+/// [`ShadowCatalog`]'s replay-LSN-gated path.
 async fn open_shadow_sql_client(
     socket_dir: &std::path::Path,
     port: u16,
@@ -1300,10 +1163,9 @@ async fn open_shadow_sql_client(
     Ok(client)
 }
 
-/// Spawn the SIGHUP listener task. Each delivery re-parses
-/// `--ch-config`, validates the TOML, and atomically swaps the live
-/// mapping table. Parse errors keep the existing mapping in place +
-/// log; an absent `--ch-config` makes the handler a no-op tap.
+/// SIGHUP listener: re-parses `--ch-config` and atomically swaps the live
+/// mapping. Parse errors keep the existing mapping; absent `--ch-config`
+/// is a no-op tap.
 fn spawn_sighup_handler(
     path: Option<PathBuf>,
     handle: Option<MappingHandle>,
@@ -1356,9 +1218,8 @@ fn spawn_sighup_handler(
     })
 }
 
-/// Spawn the retention sweeper task. Wakes every
-/// [`DEFAULT_TRIM_INTERVAL`], queries shadow's
-/// `pg_last_wal_replay_lsn()`, and trims segments older than
+/// Retention sweeper: every [`DEFAULT_TRIM_INTERVAL`], query shadow's
+/// `pg_last_wal_replay_lsn()` and trim segments older than
 /// `replay_lsn - retention_bytes`.
 fn spawn_retention(
     out_dir: PathBuf,
@@ -1428,8 +1289,7 @@ async fn query_replay_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>
     }
 }
 
-/// Shadow-stream view passed into the metrics publish step.
-/// Bundles the four shadow-side numbers that come from
+/// Shadow-side numbers for the metrics publish step, from
 /// [`ShadowStreamState::aggregate`](walshadow::shadow_stream::ShadowStreamState::aggregate)
 /// + the daemon's [`RateEstimator`].
 struct ShadowMetricsView {
@@ -1522,32 +1382,24 @@ async fn populate_metrics(
     registry.set(snap).await;
 }
 
-/// Orchestrate the BASE_BACKUP into a fresh shadow data dir.
-/// Returns the backup's `end_lsn` so the caller can rebind the WAL pump
-/// past it.
+/// Orchestrate BASE_BACKUP into a fresh shadow data dir; returns the
+/// backup's `end_lsn` so the caller rebinds the WAL pump past it.
 ///
 /// Operator contract after this returns:
 ///
-/// 1. Bring up shadow PG with `standby.signal` + the `restore_command`
+/// 1. Bring up shadow PG with `standby.signal` + `restore_command`
 ///    pointing at `--out-dir` (both written here).
-/// 2. Shadow will consume filtered WAL segments the daemon produces
-///    against `--out-dir` and replay them.
-/// 3. There is no automatic shadow-process management; if a service
-///    manager (systemd, k8s) owns shadow, configure it to start once
-///    `bootstrap_shadow_data_dir` exists and is non-empty (this returns
-///    after that's true).
+/// 2. Shadow consumes filtered WAL segments the daemon produces against
+///    `--out-dir` and replays them.
+/// 3. No automatic shadow-process management; a service manager (systemd,
+///    k8s) owning shadow should start it once `bootstrap_shadow_data_dir`
+///    exists and is non-empty (true once this returns).
 ///
-/// When `ch_config` is `Some`, bootstrap rows route through the shared
-/// insert tail (batcher + N inserters + ack collector) — the same
-/// machinery the WAL pipeline uses. [`walshadow::pipeline::bootstrap::drain`]
-/// resolves each page-walk tuple against the seeded `CatalogMap`, maps
-/// it, and ships a synthetic INSERT (`_op = 1`, `_lsn = start_lsn`,
-/// `_commit_ts = 0`). On completion it seals the open batches
-/// (`FlushAll`) and waits for every bootstrap seq durable on CH
-/// (`wait_through(K)`) before tearing the tail down, so the WAL pump
-/// below resumes against a fully-shipped baseline on the same CH tables.
-/// When `ch_config` is `None`, rows drain to a metrics-only observer via
-/// `drain_backfill` — matches operators running without `--ch-config`.
+/// `ch_config` `Some`: bootstrap rows route through the shared insert tail
+/// (synthetic INSERT `_op = 1`, `_lsn = start_lsn`, `_commit_ts = 0`).
+/// `wait_through(K)` proves every bootstrap seq durable on CH before
+/// teardown, so the WAL pump resumes against a fully-shipped baseline.
+/// `None`: rows drain to a metrics-only observer via `drain_backfill`.
 async fn run_bootstrap(
     src_cfg: &PgConfig,
     feed: &mut SourceFeed,
@@ -1559,9 +1411,9 @@ async fn run_bootstrap(
         .clone()
         .context("--bootstrap-shadow-data-dir required when --bootstrap-mode != off")?;
 
-    // Seed catalog map from source PG inside a REPEATABLE READ snapshot
-    // — DDL between the seed COMMIT and BASE_BACKUP's checkpoint window
-    // is operator-quiesced per the bootstrap out-of-scope contract.
+    // Seed catalog map inside a REPEATABLE READ snapshot. DDL between the
+    // seed COMMIT and BASE_BACKUP's checkpoint window is operator-quiesced
+    // per the bootstrap out-of-scope contract.
     let sql_client = feed
         .sql_client()
         .await
@@ -1577,11 +1429,10 @@ async fn run_bootstrap(
         "catalog map seeded",
     );
 
-    // Object-store bootstrap retains `(settings, storage)` past source
-    // construction so the post-pump hydrate step can pull WAL segments
-    // covering `[start_lsn, end_lsn]` from `wal_005/` into shadow's
-    // `pg_wal/`. Direct mode ships WAL inside `base.tar` via
-    // `BaseBackupOpts { wal: true }`, so no follow-up fetch needed
+    // Object-store mode retains `(settings, storage)` so the post-pump
+    // hydrate can pull WAL `[start_lsn, end_lsn]` from `wal_005/` into
+    // shadow's `pg_wal/`. Direct mode ships WAL inside `base.tar` via
+    // `BaseBackupOpts { wal: true }`, so no follow-up fetch.
     type ObjectStoreHandles = (wal_rs::config::Settings, wal_rs::storage::DynStorage);
     let (source, object_store_handles): (Box<dyn BackupSource>, Option<ObjectStoreHandles>) =
         match args.bootstrap_mode {
@@ -1594,12 +1445,11 @@ async fn run_bootstrap(
                     fast_checkpoint: args.bootstrap_fast_checkpoint,
                     no_verify_checksums: false,
                     max_rate_kib: None,
-                    // Ship pg_wal segments [start_lsn, end_lsn] inside base.tar
-                    // so the auto-spawned shadow can hit `minRecoveryPoint` from
-                    // local WAL alone. Without this, `pg_ctl -w start` polls
-                    // `restore_command` against an `out/` directory that the
-                    // streamer hasn't filled yet (queued behind autospawn) and
-                    // times out
+                    // Ship pg_wal [start_lsn, end_lsn] inside base.tar so the
+                    // auto-spawned shadow hits `minRecoveryPoint` from local WAL
+                    // alone. Else `pg_ctl -w start` polls `restore_command`
+                    // against an `out/` dir the streamer hasn't filled yet
+                    // (queued behind autospawn) and times out.
                     wal: true,
                 };
                 (Box::new(DirectSource::new(src_cfg.clone(), opts)), None)
@@ -1610,8 +1460,8 @@ async fn run_bootstrap(
                 let storage = settings
                     .build_storage()
                     .context("bootstrap: build storage from WALG_* env vars")?;
-                // `LATEST` resolves to the newest sentinel; ObjectStoreSource
-                // will canonicalise via `wal_rs::pg::backup::fetch::resolve_name`.
+                // ObjectStoreSource canonicalises via
+                // `wal_rs::pg::backup::fetch::resolve_name`.
                 let name = args.bootstrap_backup_name.clone();
                 if name != "LATEST" && !name.starts_with(BACKUP_NAME_PREFIX) {
                     anyhow::bail!(
@@ -1627,28 +1477,22 @@ async fn run_bootstrap(
         };
 
     let cfg = BootstrapConfig::new(shadow_data_dir.clone());
-    // PageWalkSink owns one CatalogMap; the tail drain gets a second
-    // clone to resolve rfns → descriptors. Both are immutable lookups, so
-    // duplicating is cheap — `Arc<RelDescriptor>` values stay shared.
+    // Tail drain gets a second CatalogMap clone for rfn → descriptor
+    // lookups; cheap since `Arc<RelDescriptor>` values stay shared.
     let drain_catalog = catalog_map.clone();
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map);
 
     let (shipped, outcome) = match ch_config {
         Some(emitter_cfg) => {
-            // Route bootstrap rows through the shared insert tail (batcher
-            // + N inserters + ack collector) — the same machinery the WAL
-            // pipeline uses, not a separate serial emitter. Bootstrap is
-            // the easy case: every row is op=Insert at _lsn = start_lsn,
-            // no aborts / TRUNCATE / DDL. The per-rfn force-flush dance the
-            // old transitional emitter needed is gone (the batcher owns
-            // INSERT lifecycle), so we keep the operator's flush_timeout;
-            // the tail defaults 0 to its own partial-flush deadline.
+            // Route bootstrap rows through the shared insert tail. Bootstrap
+            // is the easy case: every row op=Insert at _lsn = start_lsn, no
+            // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
+            // defaults 0 to its own partial-flush deadline.
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
             let stats = Arc::new(EmitterStats::default());
-            // Bootstrap's own watermark atomic — discarded after teardown.
-            // The durability proof is `wait_through(K)`; the resume LSN is
-            // carried to `end_lsn` by seeding the WAL pipeline's emitter_ack
-            // (see `run`), so a uniform `commit_lsn = start_lsn` here is fine.
+            // Throwaway watermark atomic: durability proof is `wait_through(K)`,
+            // resume LSN is carried via the WAL pipeline's emitter_ack seed
+            // (see `run`), so uniform `commit_lsn = start_lsn` here is fine.
             let emitter_ack = Arc::new(AtomicU64::new(0));
             let fatal = Fatal::new();
             let inserter_pool_size = args.inserter_pool_size;
@@ -1661,9 +1505,7 @@ async fn run_bootstrap(
             )
             .await
             .context("bootstrap: spawn insert tail")?;
-            // PageWalkSink rfns resolve against the seeded snapshot; the
-            // mapping is the static [table.*] config (no SIGHUP and no
-            // shadow PG during bootstrap).
+            // Static [table.*] mapping (no SIGHUP, no shadow PG during bootstrap).
             let mapping: MappingHandle =
                 Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
             tracing::info!(
@@ -1673,7 +1515,6 @@ async fn run_bootstrap(
                 "bootstrap insert tail started",
             );
 
-            // Drain the page walk into the tail concurrently with the pump.
             let drain = tokio::spawn(bootstrap::drain(
                 rx,
                 drain_catalog,
@@ -1705,8 +1546,7 @@ async fn run_bootstrap(
             (drain_outcome.rows_routed, outcome)
         }
         None => {
-            // Metrics-only — bootstrap rows counted, not shipped.
-            // Matches operators running without `--ch-config`.
+            // Metrics-only: bootstrap rows counted, not shipped.
             let mut observer = MetricsTupleObserver::default();
             let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
             let shipped = drain_res.context("bootstrap drain")?;
@@ -1738,13 +1578,10 @@ async fn run_bootstrap(
         "bootstrap landed",
     );
 
-    // Object-store mode: hydrate shadow's pg_wal/ with the WAL covering
-    // [start_lsn, end_lsn] before pg_ctl. Direct mode already shipped
-    // these segments inside base.tar via BaseBackupOpts { wal: true };
-    // object-store backups keep WAL in wal_005/ separately, so the
-    // daemon pulls it here. Skipping this hydrate would deadlock
-    // autospawn_shadow_and_wait — restore_command points at an empty
-    // out/ dir and primary_conninfo's walsender hasn't bound yet
+    // Object-store mode: hydrate shadow's pg_wal/ before pg_ctl. wal-g
+    // backups keep WAL in wal_005/ separately (direct mode shipped it in
+    // base.tar). Skipping deadlocks autospawn_shadow_and_wait: empty out/
+    // dir for restore_command, walsender not yet bound.
     if let Some((settings, storage)) = object_store_handles {
         fetch_wal_into_pg_wal(
             &settings,
@@ -1758,18 +1595,15 @@ async fn run_bootstrap(
         .context("bootstrap: hydrate shadow pg_wal from object store")?;
     }
 
-    // Lay down standby.signal + primary_conninfo + restore_command.
-    // primary_conninfo points at the daemon's walsender (bound
-    // further down in `run`); restore_command remains the archive
-    // fallback. PG's walreceiver tries the wire first and falls back on
-    // disconnect or end-of-WAL.
+    // primary_conninfo points at the daemon's walsender; restore_command
+    // is the archive fallback. PG's walreceiver tries the wire first, falls
+    // back on disconnect or end-of-WAL.
     write_standby_config(&shadow_data_dir, &args.out_dir, args.walsender_bind)
         .context("bootstrap: write standby.signal + primary_conninfo + restore_command")?;
 
-    // Shadow PG refuses to start on a data dir whose mode isn't 0700 or
-    // 0750. BASE_BACKUP extraction creates the directory at the process
-    // umask (typically 0755) since tar headers carry no entry for the
-    // root, so reassert restrictive perms before pg_ctl runs against it.
+    // PG refuses to start on a data dir whose mode isn't 0700 or 0750.
+    // BASE_BACKUP tar carries no entry for the root, so extraction leaves
+    // it at the process umask (typically 0755); reassert 0700 before pg_ctl.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1783,24 +1617,19 @@ async fn run_bootstrap(
 }
 
 /// Boot shadow PG against the bootstrapped data dir and wait until its
-/// replay LSN clears the backup's `end_lsn`. Drives sync `pg_ctl` +
-/// `psql` shells via `block_in_place` so the multi-threaded runtime
-/// keeps making forward progress on other tasks.
-///
-/// Reuses the existing `--shadow-socket-dir` / `--shadow-port` flags
-/// for the shadow listener config — they're the same socket the
-/// daemon will connect to for `ShadowCatalog` further down the
-/// pipeline.
+/// replay LSN clears `end_lsn`. Sync `pg_ctl` / `psql` shells run via
+/// `block_in_place` so the runtime keeps progressing other tasks.
+/// Reuses `--shadow-socket-dir` / `--shadow-port` (same socket
+/// `ShadowCatalog` connects to later).
 async fn autospawn_shadow_and_wait(
     args: &Args,
     shadow_data_dir: PathBuf,
     end_lsn: u64,
 ) -> Result<()> {
-    // BASE_BACKUP ships source's postgresql.conf verbatim, so shadow
-    // would inherit source's port + listen_addresses + socket dir and
-    // collide with the still-running source. Write last-wins overrides
-    // into postgresql.auto.conf so the cloned cluster comes up on the
-    // operator's `--shadow-*` values.
+    // BASE_BACKUP ships source's postgresql.conf verbatim; without override
+    // shadow inherits source's port / listen_addresses / socket dir and
+    // collides with the still-running source. Write last-wins overrides into
+    // postgresql.auto.conf so the clone comes up on the `--shadow-*` values.
     write_shadow_listener_overrides(&shadow_data_dir, args.shadow_port, &args.shadow_socket_dir)
         .context("bootstrap: write shadow listener overrides")?;
 
@@ -1832,10 +1661,9 @@ async fn autospawn_shadow_and_wait(
     Ok(())
 }
 
-/// Write `standby.signal` + append a `restore_command` line so shadow
-/// PG starts in standby mode and feeds itself from the daemon's
-/// filtered-segment directory. Idempotent: `standby.signal` is a
-/// zero-byte marker file; `restore_command` is appended once.
+/// Write `standby.signal` (zero-byte marker) + append `restore_command`
+/// so shadow starts in standby mode and feeds from the daemon's
+/// filtered-segment dir. Idempotent (appended once).
 fn write_standby_config(
     shadow_data_dir: &Path,
     filter_out_dir: &Path,
@@ -1856,9 +1684,8 @@ fn write_standby_config(
         .create(true)
         .open(&conf)?;
     writeln!(f, "\n{marker}")?;
-    // primary_conninfo wires shadow's walreceiver to walshadow's
-    // walsender. Skip when port=0 — kernel-picked addresses
-    // are unstable across daemon restarts, fall back to archive-only.
+    // Skip primary_conninfo when port=0: kernel-picked addresses are
+    // unstable across daemon restarts, fall back to archive-only.
     if walsender_bind.port() != 0 {
         writeln!(
             f,
@@ -1876,16 +1703,13 @@ fn write_standby_config(
 }
 
 /// Append shadow-side `port` / `unix_socket_directories` /
-/// `listen_addresses` keys to the cloned data dir's
-/// `postgresql.auto.conf`. PG honours last-wins-per-key across the conf
-/// chain, so these override whatever source's conf carried into the
-/// BASE_BACKUP. Idempotent via a `walshadow shadow-listener overrides`
-/// marker — subsequent daemon restarts skip the append.
+/// `listen_addresses` to the cloned data dir's `postgresql.auto.conf`.
+/// PG honours last-wins-per-key across the conf chain, so these override
+/// what source's conf carried into the BASE_BACKUP. Idempotent via a marker.
 ///
-/// `listen_addresses = ''` disables TCP entirely: shadow is local-only
-/// over the socket dir the daemon connects to, never visible on a
-/// network. Operators wanting a TCP shadow override this via their own
-/// `ALTER SYSTEM SET listen_addresses = ...` after first boot.
+/// `listen_addresses = ''` disables TCP: shadow is local-only over the
+/// socket dir. Operators wanting TCP override via `ALTER SYSTEM SET
+/// listen_addresses = ...` after first boot.
 fn write_shadow_listener_overrides(
     shadow_data_dir: &Path,
     port: u16,
@@ -1910,23 +1734,18 @@ fn write_shadow_listener_overrides(
     Ok(())
 }
 
-/// Pull WAL segments covering `[start_lsn, end_lsn]` on `timeline` out
-/// of wal-rs storage and land them in `<shadow_data_dir>/pg_wal/`. The
-/// auto-spawned shadow's standby recovery then hits `minRecoveryPoint`
-/// from local WAL without depending on either `restore_command` (the
-/// streamer's filtered out-dir is empty until the WAL pump starts,
-/// which is after autospawn) or `primary_conninfo` (walsender binds
-/// later in `run`)
+/// Pull WAL `[start_lsn, end_lsn]` on `timeline` from wal-rs storage into
+/// `<shadow_data_dir>/pg_wal/` so auto-spawned shadow recovery hits
+/// `minRecoveryPoint` from local WAL, depending on neither `restore_command`
+/// (filtered out-dir empty until the post-autospawn WAL pump) nor
+/// `primary_conninfo` (walsender binds later in `run`).
 ///
-/// Mirrors the direct-bootstrap path where `BaseBackupOpts { wal: true }`
-/// inlines the same segments inside `base.tar`.
-/// `wal_rs::pg::backup::push::handle` sets `wal: false`, so the
-/// object-store backup tar doesn't carry them — they live in
-/// `wal_005/` separately, populated by `wal-push` / archive_command
+/// `wal_rs::pg::backup::push::handle` sets `wal: false`, so object-store
+/// tars don't carry WAL; it lives in `wal_005/` (wal-push / archive_command).
+/// Direct mode inlines the same segments via `BaseBackupOpts { wal: true }`.
 ///
 /// Missing segments surface as `WAL <name> not found in storage` from
-/// wal-rs's `fetch::handle` — actionable upstream signal that the
-/// operator's archiving pipeline left a gap
+/// wal-rs's `fetch::handle` — the operator's archiving pipeline left a gap.
 async fn fetch_wal_into_pg_wal(
     settings: &wal_rs::config::Settings,
     storage: wal_rs::storage::DynStorage,

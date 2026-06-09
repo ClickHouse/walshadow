@@ -1,8 +1,7 @@
-//! Reconstruct a full 8 KiB page from `XLogRecordBlock.image`. PG's
-//! recovery calls this `RestoreBlockImage`
-//! (src/backend/access/transam/xlogreader.c). walshadow mirrors that
-//! surface so heap + xact-buffer decoders + BASEBACKUP.md path 1B+2A can
-//! consume FPIs produced under `wal_compression = pglz|lz4|zstd`
+//! Reconstruct a full 8 KiB page from `XLogRecordBlock.image`. Mirrors PG's
+//! `RestoreBlockImage` (src/backend/access/transam/xlogreader.c) so decoders +
+//! BASEBACKUP.md path 1B+2A consume FPIs under
+//! `wal_compression = pglz|lz4|zstd`
 
 use wal_rs::pg::walparser::{BLOCK_SIZE, FpiCompressionMethod, XLogRecordBlock};
 
@@ -26,7 +25,6 @@ pub enum FpiError {
     SizeMismatch { got: usize, expected: usize },
 }
 
-/// Reconstruct 8 KiB page this block's FPI represents.
 /// `page_magic` selects PG-14 vs PG-15 bimg_info bit layout; pass
 /// `XLogPageHeader.magic` of the page that started the record
 pub fn restore_block_image(
@@ -80,8 +78,8 @@ pub fn restore_block_image(
             }
         }
         None => {
-            // uncompressed: image bytes are already BLCKSZ - hole_length
-            // (parse.rs enforces this); reject codec-bit corruption
+            // uncompressed: image already BLCKSZ - hole_length (parse.rs
+            // enforces); reject codec-bit corruption
             if ih.is_compressed(page_magic) {
                 return Err(FpiError::UnknownCodec(ih.info));
             }
@@ -95,12 +93,11 @@ pub fn restore_block_image(
         }
     }
 
-    // splice hole: scratch currently holds body_len pre-hole-removed
-    // bytes packed at offset 0; spread around hole zeros
+    // scratch holds body_len bytes packed at offset 0; spread around the
+    // zero-filled hole
     if hole_length > 0 {
         let mut page = [0u8; PAGE_BYTES];
         page[..hole_offset].copy_from_slice(&scratch[..hole_offset]);
-        // hole region remains zero from page init
         page[hole_offset + hole_length..].copy_from_slice(
             &scratch[hole_offset..hole_offset + (PAGE_BYTES - hole_offset - hole_length)],
         );
@@ -190,7 +187,7 @@ mod tests {
     #[test]
     fn no_image_errors() {
         let mut block = build_block(vec![0u8; PAGE_BYTES], 0, 0, 0);
-        block.header.fork_flags = 0; // strip HAS_IMAGE
+        block.header.fork_flags = 0;
         assert!(matches!(
             restore_block_image(&block, XLP_PAGE_MAGIC_PG15),
             Err(FpiError::NoImage),
@@ -208,7 +205,6 @@ mod tests {
 
     #[test]
     fn uncompressed_size_mismatch_errors() {
-        // image length != BLCKSZ - hole_length under uncompressed path
         let block = build_block(vec![0u8; 100], 0, 0, 0);
         assert!(matches!(
             restore_block_image(&block, XLP_PAGE_MAGIC_PG15),
@@ -273,8 +269,8 @@ mod tests {
 
     #[test]
     fn lz4_size_mismatch_short_payload() {
-        // Compressed payload represents fewer than BLCKSZ bytes; with hole_length=0
-        // body_len == BLCKSZ, decompress writes short, SizeMismatch fires.
+        // payload < BLCKSZ but hole_length=0 => body_len == BLCKSZ, short
+        // decompress trips SizeMismatch
         let short = vec![0u8; 256];
         let compressed = lz4_flex::block::compress(&short);
         let block = build_block(compressed, BKP_IMAGE_COMPRESS_LZ4, 0, 0);
@@ -297,8 +293,8 @@ mod tests {
 
     #[test]
     fn pglz_corrupt_image_errors() {
-        // pglz::decompress_into runs with check_complete=true, so any size
-        // mismatch returns None and surfaces FpiError::Pglz. Cover that arm.
+        // decompress_into uses check_complete=true: size mismatch => None =>
+        // FpiError::Pglz
         let block = build_block(vec![0u8; 16], BKP_IMAGE_COMPRESS_PGLZ, 0, 0);
         assert!(matches!(
             restore_block_image(&block, XLP_PAGE_MAGIC_PG15),

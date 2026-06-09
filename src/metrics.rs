@@ -1,21 +1,12 @@
 //! HTTP/Prometheus metrics surface.
 //!
-//! Exposes a `/metrics` endpoint over plain TCP that scrapers like
-//! Prometheus already speak. Output is the Prometheus
+//! `/metrics` over plain TCP, Prometheus
 //! [text-format](https://prometheus.io/docs/instrumenting/exposition_formats/),
-//! hand-rolled to avoid pulling in a `prometheus` crate dependency for
-//! what is otherwise a tiny set of gauges/counters.
+//! hand-rolled to avoid a `prometheus` crate dependency for a tiny gauge set.
 //!
-//! The registry is `Arc`-cloneable: the daemon's main loop populates the
-//! values at status-tick cadence, the HTTP server reads a snapshot per
-//! request. Lock contention is invisible at scrape rates (≤ once/sec
-//! per Prom replica).
-//!
-//! Scope is the LSN triple (resume-safe values land with the durable cursor),
-//! per-rmgr filter counters, xact buffer occupancy, spill stats, oracle
-//! sampler stats, and a daemon-uptime counter. The endpoint is
-//! intentionally read-only (no `/quit`, no admin verbs); operator
-//! actions stay on the CLI side.
+//! Registry is `Arc`-cloneable: daemon's main loop writes at status-tick
+//! cadence, HTTP server reads a snapshot per request. Endpoint is read-only by
+//! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -37,29 +28,22 @@ pub enum MetricsError {
     Bind { addr: String, source: io::Error },
 }
 
-/// Shared snapshot of every value the `/metrics` handler will render.
-/// Daemon updates the gauges on every status-line iteration; HTTP
-/// readers grab a read lock and serialise.
+/// Snapshot of every value `/metrics` renders. Daemon writes per status-line
+/// iteration; HTTP readers take a read lock and serialise.
 #[derive(Debug, Default, Clone)]
 pub struct MetricsSnapshot {
-    /// Source PG's most recent `server_wal_end` (write LSN as PG sees
-    /// it). Walshadow's "source_received_lsn".
+    /// Source PG's most recent `server_wal_end` (write LSN as PG sees it)
     pub source_received_lsn: u64,
-    /// Last segment-boundary LSN the filter has dispatched downstream.
-    /// Becomes filter_durable_lsn once segment fsync lands.
+    /// Last segment-boundary LSN dispatched downstream; becomes durable once
+    /// segment fsync lands
     pub filter_lsn: u64,
-    /// Shadow PG's `pg_last_wal_replay_lsn()`, polled at status-line
-    /// cadence. `0` until first poll.
+    /// Shadow PG's `pg_last_wal_replay_lsn()`, `0` until first poll
     pub shadow_replay_lsn: u64,
-    /// Latest LSN the decoder has committed downstream.
-    /// Currently stays `0` — surface lands here so the endpoint shape
-    /// is fixed before durability work.
+    /// Stays `0`: surface fixed before durability work
     pub decoder_commit_lsn: u64,
-    /// CH emitter ack-LSN. Same placeholder treatment as
-    /// `decoder_commit_lsn`.
+    /// Stays `0`, same as `decoder_commit_lsn`
     pub emitter_ack_lsn: u64,
-    /// Per-(rmgr name, route) record counters. `route` is one of
-    /// `"to_shadow"` / `"to_decoder"`.
+    /// `route` is `"to_shadow"` / `"to_decoder"`
     pub records_by_rm_route: BTreeMap<(String, &'static str), u64>,
     pub xact_active: u64,
     pub xact_bytes_in_memory: u64,
@@ -82,23 +66,18 @@ pub struct MetricsSnapshot {
     pub oracle_validate_mismatches_total: u64,
     pub oracle_errors_total: u64,
     pub uptime_secs: u64,
-    /// `source_received_lsn - min_apply_lsn` across active
-    /// shadow walreceiver connections. Caller saturates to 0 when shadow
-    /// is ahead; when no shadow is connected, caller passes
-    /// `source_received_lsn` (treat disconnect as max lag).
+    /// `source_received_lsn - min_apply_lsn` across active shadow walreceivers.
+    /// Caller saturates to 0 when shadow is ahead; passes `source_received_lsn`
+    /// when none connected (disconnect = max lag)
     pub shadow_apply_lag_bytes: u64,
-    /// `shadow_apply_lag_bytes` divided by a rolling 30 s
-    /// estimate of source WAL byte rate. `f64::INFINITY` when rate is 0
-    /// (renders as `+Inf`).
+    /// `shadow_apply_lag_bytes` / rolling 30s WAL byte-rate estimate.
+    /// `f64::INFINITY` (renders `+Inf`) when rate is 0
     pub shadow_apply_lag_seconds: f64,
-    /// Count of currently-attached walreceiver connections.
     pub shadow_stream_active_connections: u64,
-    /// Cumulative connections dropped by `slow_threshold` overflow.
+    /// Cumulative connections dropped by `slow_threshold` overflow
     pub shadow_stream_dropped_connections_total: u64,
 }
 
-/// Shared handle the daemon clones to write + the HTTP server clones
-/// to read.
 #[derive(Debug, Clone, Default)]
 pub struct MetricsRegistry {
     inner: Arc<RwLock<MetricsSnapshot>>,
@@ -109,23 +88,18 @@ impl MetricsRegistry {
         Self::default()
     }
 
-    /// Replace the live snapshot in-place. Single-writer pattern — the
-    /// daemon's status-line loop is the only writer, so the write lock
-    /// is uncontended.
+    /// Single writer (status-line loop), so the write lock is uncontended.
     pub async fn set(&self, snap: MetricsSnapshot) {
         *self.inner.write().await = snap;
     }
 
-    /// Snapshot-copy for the HTTP renderer. Holds the read lock for
-    /// the duration of the clone (microseconds).
     pub async fn snapshot(&self) -> MetricsSnapshot {
         self.inner.read().await.clone()
     }
 }
 
-/// Rolling 30 s ring of `(timestamp, source_received_lsn)` samples used
-/// to derive a coarse WAL byte-rate for `shadow_apply_lag_seconds`.
-/// Status-loop ticks push fresh samples + prune older than `window`.
+/// Rolling 30s ring of `(timestamp, source_received_lsn)` samples, deriving a
+/// coarse WAL byte-rate for `shadow_apply_lag_seconds`.
 #[derive(Debug)]
 pub struct RateEstimator {
     window: Duration,
@@ -140,7 +114,7 @@ impl RateEstimator {
         }
     }
 
-    /// Push a fresh sample, prune entries older than `window`.
+    /// Push a sample, prune entries older than `window`.
     pub fn observe(&mut self, now: Instant, received_lsn: u64) {
         self.samples.push_back((now, received_lsn));
         let cutoff = now.checked_sub(self.window);
@@ -154,8 +128,7 @@ impl RateEstimator {
         }
     }
 
-    /// Bytes-per-second across the ring. `None` when fewer than two
-    /// samples or zero elapsed time.
+    /// Bytes-per-second across the ring. `None` if < 2 samples or zero elapsed.
     pub fn rate(&self) -> Option<f64> {
         let (front_t, front_lsn) = *self.samples.front()?;
         let (back_t, back_lsn) = *self.samples.back()?;
@@ -170,9 +143,8 @@ impl RateEstimator {
         Some(delta as f64 / elapsed)
     }
 
-    /// Convert a lag in bytes to lag in seconds against the current
-    /// rate estimate. Returns `0.0` when lag is 0, `INFINITY` when rate
-    /// is unknown.
+    /// Lag bytes → seconds against current rate. `0.0` for zero lag,
+    /// `INFINITY` for unknown rate.
     pub fn seconds_for(&self, lag_bytes: u64) -> f64 {
         if lag_bytes == 0 {
             return 0.0;
@@ -190,14 +162,12 @@ impl Default for RateEstimator {
     }
 }
 
-/// Render the snapshot in Prometheus text-format. Every gauge has a
-/// `# HELP` + `# TYPE` line; counters use `_total` suffix per Prom
-/// naming conventions.
+/// Prometheus text-format. Each metric gets `# HELP` + `# TYPE`; counters use
+/// the `_total` suffix per Prom convention.
 pub fn render(snap: &MetricsSnapshot) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(1024);
 
-    // LSN gauges --------------------------------------------------------
     for (name, help, value) in [
         (
             "walshadow_source_received_lsn",
@@ -230,7 +200,6 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         writeln!(s, "{name} {value}").unwrap();
     }
 
-    // Per-rmgr counters -------------------------------------------------
     writeln!(
         s,
         "# HELP walshadow_filter_records_total Records observed by the filter, labeled by rmgr + route."
@@ -245,7 +214,6 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         .unwrap();
     }
 
-    // Xact buffer + spill ----------------------------------------------
     let pairs: &[(&str, &str, &str, u64)] = &[
         (
             "walshadow_xact_active",
@@ -398,7 +366,7 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         writeln!(s, "{name} {value}").unwrap();
     }
 
-    // Float-valued gauge — Prom format accepts `+Inf` for unknown rate.
+    // Prom format accepts `+Inf` for unknown rate
     let name = "walshadow_shadow_apply_lag_seconds";
     writeln!(
         s,
@@ -414,10 +382,8 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     s
 }
 
-/// Spawn the HTTP server task. Returns the bound address (handy when
-/// the caller passed `:0` to pick an ephemeral port) and the join
-/// handle. The task runs until the registry's last clone drops and
-/// `listener.accept` errors, or until the runtime tears down.
+/// Returns the bound address (resolves `:0` ephemeral ports) and join handle.
+/// Task runs until `listener.accept` errors or the runtime tears down.
 pub async fn serve(
     addr: SocketAddr,
     registry: MetricsRegistry,
@@ -462,12 +428,11 @@ async fn handle_client(
     socket: &mut tokio::net::TcpStream,
     registry: &MetricsRegistry,
 ) -> io::Result<()> {
-    // Read up to a 1 KiB request line + headers — enough for any
-    // sensible scraper. Don't parse the request; we serve the same
-    // body for any path so even `curl http://host:port/` works.
+    // Don't parse the request; serve the same body for any path, so even
+    // `curl http://host:port/` works
     let mut buf = [0u8; 1024];
     let n = socket.read(&mut buf).await?;
-    let _ = n; // request body intentionally unused
+    let _ = n;
     let snap = registry.snapshot().await;
     let body = render(&snap);
     let resp = format!(
@@ -541,7 +506,6 @@ mod tests {
         assert!(body.contains("walshadow_shadow_apply_lag_bytes 12345"));
         assert!(body.contains("# HELP walshadow_shadow_apply_lag_seconds"));
         assert!(body.contains("# TYPE walshadow_shadow_apply_lag_seconds gauge"));
-        // {:.3} precision per spec
         assert!(body.contains("walshadow_shadow_apply_lag_seconds 1.235"));
         assert!(body.contains("# HELP walshadow_shadow_stream_active_connections"));
         assert!(body.contains("# TYPE walshadow_shadow_stream_active_connections gauge"));
@@ -578,7 +542,6 @@ mod tests {
         e.observe(t0, 0);
         e.observe(t0 + Duration::from_secs(1), 1_000);
         e.observe(t0 + Duration::from_secs(10), 10_000);
-        // First entry is now older than `window` from latest; pruned.
         let (front_t, _) = *e.samples.front().unwrap();
         assert!(front_t >= t0 + Duration::from_secs(1));
     }

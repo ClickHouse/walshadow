@@ -50,6 +50,32 @@ Likely order:
 4. Delete local retrying wrapper only after storage behavior is
    proven equivalent
 
+Fallback if `object_store` credential model conflicts with WALG-compat:
+
+`object_store`'s `AmazonS3Builder`/`GoogleCloudStorageBuilder` carry
+their own credential/env conventions and may do implicit discovery,
+which fights "preserve WALG environment handling" and "do not scan AWS
+profiles" above. If so the swap stalls and yields zero risk reduction.
+
+Incremental path: keep local `Storage` impls and WALG env reading,
+replace only security-sensitive crypto internals with audited crates.
+Ranked by security value, not line count:
+
+1. SigV4 → `aws-sigv4`. Hand-rolled request signing
+   (`derive_signing_key`, canonical request, AWS4-HMAC-SHA256 assembly)
+   is the highest-risk crypto here. Feeds explicit creds, sidesteps
+   profile discovery, stays WALG-compatible
+2. GCS service-account flow → `yup-oauth2` or `gcp_auth`. Replaces JWT
+   mint plus token cache/refresh, not just the signing step
+3. PEM/DER → `rustls-pemfile`, already in tree (TLS certs only today);
+   reuse for GCS key path instead of `pem_to_der`. No new dependency
+4. S3 XML → `quick-xml`. Lowest stakes; `parse_list_v2`/`extract_xml_tag`
+   are fragile substring matching but response shape is narrow. Last
+
+Items 1-3 are where hand-rolling is actually dangerous; item 4 is
+robustness, not security. This path is mutually exclusive with the
+full `object_store` swap, not additive to it.
+
 ## MPMC queue
 
 Evaluate `async-channel` for `src/pipeline/mpmc.rs`.
@@ -130,6 +156,23 @@ Evaluation notes:
 * Decide separately whether HTTP serving should stay local or move to
   an HTTP crate already in dependency tree
 * Prefer crate-backed encoding before adding more label-heavy metrics
+
+## Considered, kept hand-rolled
+
+Recorded so future readers do not re-litigate these:
+
+* Cursor binary codec (`src/cursor.rs` `encode`/`decode`): durable
+  on-disk 64-byte format with CRC32C trailer. `bincode`/`postcard`
+  would change byte layout and force migration of existing cursor
+  files, for a fixed struct already simple and stable
+* Metrics HTTP serving (`src/metrics.rs` raw `TcpListener`): no HTTP
+  server in tree (`reqwest` is client-only), so a crate means pulling
+  `hyper`/`axum` for one endpoint. `prometheus-client` covers encoding
+  only; keep serving local until endpoint surface grows
+* Env var parse helpers (`wal-rs/src/config` `parse_env_*`): ~30 lines,
+  no validation complexity; `envy`/`config` not worth the dependency
+* `RateEstimator` rolling window (`src/metrics.rs`): single use site,
+  generic but small
 
 ## Recommendation
 

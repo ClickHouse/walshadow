@@ -1,24 +1,19 @@
-//! Insert batcher — the per-table accumulation stage.
+//! Insert batcher — per-table accumulation stage.
 //!
-//! Decoders produce decoded, detoasted, type-resolved rows
-//! ([`RoutedRow`]); the batcher coalesces them per destination table into
-//! budget-sized ClickHouse Native blocks ([`InsertBatch`]) that any idle
-//! inserter can send. Encoding (the per-column byte packing) happens here,
-//! not in the decoders, so rows from all M decoders and all xacts merge
+//! Coalesces decoded rows ([`RoutedRow`]) per destination table into
+//! budget-sized ClickHouse Native blocks ([`InsertBatch`]). Encoding happens
+//! here, not in decoders, so rows from all M decoders and all xacts merge
 //! into one part per flush window per table instead of one part per decoder
 //! per xact.
 //!
-//! A single hub task owns one [`TableEncoder`] per table. This is strictly
-//! more parallel than the old single-connection emitter (which encoded
-//! every table on one task) while keeping batch coalescing intact; per-table
-//! task sharding / hash(pk) splitting is the plan's later optimization.
+//! Single hub task owns one [`TableEncoder`] per table; per-table task
+//! sharding / hash(pk) splitting is the plan's later optimization.
 //!
 //! Flush triggers: `row_budget`, `byte_budget`, a per-table deadline armed
-//! on the first buffered row (so a cold table's rows still reach an inserter
-//! within `flush_timeout` — the watermark would otherwise pin behind them),
-//! and an explicit flush-all from the DDL/TRUNCATE barrier or shutdown.
-//! Each [`InsertBatch`] carries the `(seq, rows)` counts the ack collector
-//! needs.
+//! on first buffered row (so a cold table's rows reach an inserter within
+//! `flush_timeout`, else the watermark pins behind them), and explicit
+//! flush-all from the DDL/TRUNCATE barrier or shutdown. Each [`InsertBatch`]
+//! carries the `(seq, rows)` counts the ack collector needs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,8 +30,8 @@ use crate::heap_decoder::{CommittedTuple, HeapOp};
 use crate::pipeline::{Fatal, mpmc};
 use crate::shadow_catalog::RelDescriptor;
 
-/// One decoded row routed to its destination table. `mapping` and `rel`
-/// are cheap `Arc` clones a decoder resolves once per xact/table.
+/// One decoded row routed to its destination. `mapping`/`rel` are `Arc`
+/// clones a decoder resolves once per xact/table.
 pub struct RoutedRow {
     pub seq: u64,
     pub rel: Arc<RelDescriptor>,
@@ -44,8 +39,8 @@ pub struct RoutedRow {
     pub committed: CommittedTuple,
 }
 
-/// Per-column name + CH type string. The inserter parses `type_repr` into
-/// its own `TypeAst` (which is `Send` but not `Sync`, so can't be shared).
+/// Per-column name + CH type string. Inserter parses `type_repr` into its
+/// own `TypeAst` (`Send` but not `Sync`, so unshareable).
 #[derive(Clone)]
 pub struct ColMeta {
     pub name: String,
@@ -57,8 +52,8 @@ pub struct ColMeta {
 pub struct BatchMeta {
     pub table_key: String,
     pub insert_sql: String,
-    /// Column order matches [`InsertBatch::buffers`]: mapped columns then
-    /// the four synthetic ones (`_lsn`, `_xid`, `_op`, `_commit_ts`).
+    /// Order matches [`InsertBatch::buffers`]: mapped columns then the four
+    /// synthetic (`_lsn`, `_xid`, `_op`, `_commit_ts`).
     pub columns: Vec<ColMeta>,
     pub schema_epoch: u64,
 }
@@ -92,9 +87,9 @@ impl BatchMeta {
     }
 }
 
-/// A complete, independently-durable INSERT's worth of rows. `buffers` are
-/// the owned column slabs; an inserter rebuilds the `BlockBuilder` over
-/// them. `per_seq` tags which xacts' rows it carries for ack accounting.
+/// One independently-durable INSERT's worth of rows. `buffers` are owned
+/// column slabs an inserter rebuilds a `BlockBuilder` over; `per_seq` tags
+/// which xacts' rows it carries for ack accounting.
 pub struct InsertBatch {
     pub meta: Arc<BatchMeta>,
     pub buffers: Vec<ColumnBuf>,
@@ -102,23 +97,19 @@ pub struct InsertBatch {
     pub per_seq: Vec<(u64, u64)>,
 }
 
-/// One message into the batcher. Rows (from the decode pool) and `FlushAll`
-/// (from the reorder/barrier coordinator) share a single FIFO channel so a
-/// barrier's flush can never be processed ahead of rows already enqueued
-/// before it — otherwise the flush would seal a partial set and falsely
-/// signal "earlier data sealed", pinning the barrier's durability wait.
+/// Rows and `FlushAll` share one FIFO channel so a barrier's flush can never
+/// process ahead of rows enqueued before it — else flush seals a partial set
+/// and falsely signals "earlier data sealed", pinning the durability wait.
 pub enum BatcherMsg {
-    /// Single row (bootstrap drain). One channel hop + batcher wakeup per row.
+    /// Single row (bootstrap drain). One channel hop + wakeup per row.
     Row(RoutedRow),
-    /// A chunk of rows from one decode worker. Decoders coalesce a xact's
-    /// rows into chunks (see `decode::DECODE_CHUNK_ROWS`) so the per-row
-    /// channel-send + cross-thread batcher wakeup amortizes over the chunk
-    /// instead of firing per row — the dominant pipeline coordination cost
-    /// under sustained load. Rows in a chunk may carry different `seq`s; the
-    /// batcher routes each independently, so the chunk boundary is free.
+    /// Chunk of rows from one decode worker (see `decode::DECODE_CHUNK_ROWS`),
+    /// amortizing the per-row channel-send + cross-thread wakeup — the
+    /// dominant coordination cost under sustained load. Rows may carry
+    /// different `seq`s; batcher routes each independently.
     Rows(Vec<RoutedRow>),
-    /// Seal every open table and push to inserters, then reply. Used by the
-    /// barrier (drain before DDL/TRUNCATE) and reachable on shutdown.
+    /// Seal every open table, push to inserters, reply. Barrier (drain before
+    /// DDL/TRUNCATE) and shutdown.
     FlushAll(oneshot::Sender<()>),
 }
 
@@ -126,8 +117,8 @@ pub enum BatcherMsg {
 pub struct BatcherConfig {
     pub row_budget: usize,
     pub byte_budget: usize,
-    /// Partial-batch deadline. The caller passes a positive value (0 is
-    /// defaulted upstream) so cold tables can't pin the watermark.
+    /// Partial-batch deadline; caller passes positive (0 defaulted upstream)
+    /// so cold tables can't pin the watermark.
     pub flush_timeout: Duration,
 }
 
@@ -138,12 +129,8 @@ struct Table {
     deadline: Option<Instant>,
 }
 
-/// Spawn the batcher hub.
-///
-/// * `msg_rx` — single FIFO channel of [`BatcherMsg`] (rows from the M
-///   decoders + `FlushAll` from the barrier coordinator). Sharing one
-///   channel is what guarantees a flush seals every row enqueued before it.
-/// * `out` — sealed batches to the inserter pool (spmc).
+/// Spawn the batcher hub. `msg_rx` is one FIFO channel so a flush seals
+/// every row enqueued before it; `out` carries sealed batches to inserters.
 pub fn spawn(
     mut msg_rx: mpsc::Receiver<BatcherMsg>,
     out: mpmc::Sender<InsertBatch>,
@@ -178,7 +165,7 @@ pub fn spawn(
                         }
                         let _ = reply.send(());
                     }
-                    // All senders (decoders + reorder) dropped: final flush.
+                    // All senders dropped: final flush
                     None => {
                         if let Err(e) = flush_all(&mut tables, &out, &mut epoch).await {
                             fatal.set(format!("batcher final flush: {e}"));
@@ -197,9 +184,8 @@ pub fn spawn(
     })
 }
 
-/// Process a decoder's row chunk in order. Per-row budget/deadline trips
-/// behave exactly as the single-row path; the chunk only amortizes the
-/// channel hop, not the coalescing.
+/// Process a decoder's row chunk in order. Chunk only amortizes the channel
+/// hop, not the coalescing; budget/deadline trips behave per-row.
 async fn handle_rows(
     tables: &mut HashMap<String, Table>,
     cfg: &BatcherConfig,
@@ -242,7 +228,7 @@ async fn handle_row(
         HeapOp::Insert => OP_INSERT,
         HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
         HeapOp::Delete => OP_DELETE,
-        // TRUNCATE is a barrier handled by reorder; it must never route here.
+        // TRUNCATE is a reorder barrier; must never route here
         HeapOp::Truncate => return Err("TRUNCATE routed to batcher".into()),
     };
     t.enc
@@ -261,8 +247,8 @@ async fn handle_row(
     Ok(())
 }
 
-/// Seal one table's buffered rows into an [`InsertBatch`] and hand it to an
-/// inserter. No-op when empty. Resets the table's deadline + seq counts.
+/// Seal one table's buffered rows into an [`InsertBatch`] and hand to an
+/// inserter. No-op when empty.
 async fn emit_batch(t: &mut Table, out: &mpmc::Sender<InsertBatch>) -> Result<(), String> {
     let (buffers, n_rows) = t.enc.take_block().map_err(|e| e.to_string())?;
     t.deadline = None;
@@ -295,9 +281,8 @@ async fn flush_due(
     Ok(())
 }
 
-/// Seal every table, then drop all encoders and bump `epoch` so the next
-/// rows rebuild against fresh descriptors (post-DDL) and inserters
-/// re-parse their cached types.
+/// Seal every table, drop all encoders, bump `epoch` so next rows rebuild
+/// against post-DDL descriptors and inserters re-parse cached types.
 async fn flush_all(
     tables: &mut HashMap<String, Table>,
     out: &mpmc::Sender<InsertBatch>,
@@ -392,10 +377,8 @@ mod tests {
         }
     }
 
-    /// Rows from two xacts coalesce into budget-sized batches, and every
-    /// batch carries accurate per-seq row counts (what the ack collector
-    /// compares against). Budget trips + the final flush split the 5 rows
-    /// across batches; the totals must still reconcile per seq.
+    /// Rows from two xacts coalesce into budget-sized batches; per-seq counts
+    /// (what the ack collector compares) reconcile across the split.
     #[tokio::test]
     async fn coalesces_and_tracks_per_seq_counts() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
@@ -424,8 +407,7 @@ mod tests {
                 .await
                 .expect("send seq1");
         }
-        // Drop the sender → final flush + graceful exit, closing the batch
-        // channel once drained.
+        // Drop sender → final flush + graceful exit
         drop(msg_tx);
 
         let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);
@@ -446,10 +428,9 @@ mod tests {
         assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
     }
 
-    /// A single `Rows` chunk carrying mixed seqs trips the row budget
-    /// mid-chunk and still reconciles per-seq counts — same outcome as the
-    /// per-row path, proving the chunk boundary is purely a channel-hop
-    /// amortization (the point of `DECODE_CHUNK_ROWS`).
+    /// A mixed-seq `Rows` chunk trips the budget mid-chunk yet reconciles
+    /// per-seq same as the per-row path — chunk boundary is purely a
+    /// channel-hop amortization (point of `DECODE_CHUNK_ROWS`).
     #[tokio::test]
     async fn rows_chunk_trips_budget_and_tracks_per_seq() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
@@ -491,10 +472,9 @@ mod tests {
         assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
     }
 
-    /// FlushAll seals everything sent before it and replies, even below
-    /// budget and with a huge deadline — the barrier's drain-before-DDL step
-    /// depends on this. Because rows and FlushAll share one FIFO channel,
-    /// the row enqueued first can't be missed (the bug `codex.md` caught).
+    /// FlushAll seals everything sent before it and replies, even below budget
+    /// with a huge deadline (the barrier's drain-before-DDL step). Shared FIFO
+    /// channel means the first-enqueued row can't be missed (bug `codex.md`).
     #[tokio::test]
     async fn flush_all_seals_rows_enqueued_before_it() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
@@ -506,7 +486,7 @@ mod tests {
             BatcherConfig {
                 row_budget: 1_000,
                 byte_budget: 1 << 30,
-                // Huge deadline: only FlushAll (not the timer) can seal.
+                // Huge deadline: only FlushAll, not the timer, can seal
                 flush_timeout: Duration::from_secs(3600),
             },
             Allocator::stdlib(),

@@ -36,15 +36,37 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use walshadow::shadow::{Shadow, ShadowConfig};
 
-// Port slot 17340-range. Below the Linux ephemeral range so outbound
-// connects can't grab a port we're about to bind. CH's
-// `interserver_http_port = http_port + 1` must dodge METRICS / WALSENDER.
-const SOURCE_PORT: u16 = 17341;
-const SHADOW_PORT: u16 = 17342;
-const CH_TCP_PORT: u16 = 17349;
-const CH_HTTP_PORT: u16 = 17350;
-const METRICS_PORT: u16 = 17355;
-const WALSENDER_PORT: u16 = 17356;
+// Port slots in the 17340 / 17360 ranges. Below the Linux ephemeral range
+// so outbound connects can't grab a port we're about to bind. CH's
+// `interserver_http_port = http_port + 1` must dodge metrics / walsender.
+// Two disjoint sets so the 1/1 and 2/2 pool variants run concurrently.
+#[derive(Clone, Copy)]
+struct Ports {
+    source: u16,
+    shadow: u16,
+    ch_tcp: u16,
+    ch_http: u16,
+    metrics: u16,
+    walsender: u16,
+}
+
+const SERIAL_PORTS: Ports = Ports {
+    source: 17341,
+    shadow: 17342,
+    ch_tcp: 17349,
+    ch_http: 17350,
+    metrics: 17355,
+    walsender: 17356,
+};
+
+const POOLED_PORTS: Ports = Ports {
+    source: 17361,
+    shadow: 17362,
+    ch_tcp: 17369,
+    ch_http: 17370,
+    metrics: 17375,
+    walsender: 17376,
+};
 
 fn pgbench_available() -> bool {
     Command::new("pgbench")
@@ -56,12 +78,12 @@ fn pgbench_available() -> bool {
         .unwrap_or(false)
 }
 
-fn make_source(tmp: &tempfile::TempDir) -> Shadow {
+fn make_source(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(
         tmp.path().join("source-data"),
         tmp.path().join("source-filtered"),
     );
-    cfg.port = SOURCE_PORT;
+    cfg.port = port;
     cfg.socket_dir = tmp.path().join("source-sock");
     cfg.ctl_timeout = Duration::from_secs(60);
     fs::create_dir_all(&cfg.filter_out_dir).unwrap();
@@ -199,7 +221,7 @@ fn psql_source(source: &Shadow, sql: &str) -> Result<String> {
             "-h",
             source.config().socket_dir.to_str().unwrap(),
             "-p",
-            &SOURCE_PORT.to_string(),
+            &source.config().port.to_string(),
             "-U",
             "postgres",
             "-d",
@@ -229,7 +251,7 @@ fn pgbench_init(source: &Shadow, scale: u32) -> Result<()> {
             "-h",
             source.config().socket_dir.to_str().unwrap(),
             "-p",
-            &SOURCE_PORT.to_string(),
+            &source.config().port.to_string(),
             "-U",
             "postgres",
             "-d",
@@ -251,8 +273,12 @@ fn pgbench_init(source: &Shadow, scale: u32) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pgbench_acceptance_ddl_intermix() {
+/// Parametrized body: `decoder_pool` / `inserter_pool` are the daemon's
+/// `--decoder-pool-size` / `--inserter-pool-size`. At 2/2 this drives N
+/// concurrent `AsyncClient`s for both bootstrap and WAL under the DDL
+/// barrier, asserting out-of-order INSERTs across connections stay
+/// `_lsn`-correct (the parity oracle at the end).
+async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usize, label: &str) {
     if !fx::pg_available() {
         tracing::warn!("skip: no initdb on PATH");
         return;
@@ -273,7 +299,7 @@ async fn pgbench_acceptance_ddl_intermix() {
     let tmp = tempfile::tempdir().unwrap();
 
     // 1. Source PG.
-    let source = make_source(&tmp);
+    let source = make_source(&tmp, ports.source);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
     fx::append_source_conf(&source).expect("append source conf");
@@ -301,12 +327,12 @@ async fn pgbench_acceptance_ddl_intermix() {
 
     // 4. CH server + dest tables.
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, ports.ch_tcp, ports.ch_http).expect("spawn ch");
     create_pgbench_ch_tables(&ch, "default").expect("create ch dest tables");
 
     // 5. CH-config TOML.
     let ch_config_path = tmp.path().join("ch-config.toml");
-    write_pgbench_ch_config(&ch_config_path, "127.0.0.1", CH_TCP_PORT, "default")
+    write_pgbench_ch_config(&ch_config_path, "127.0.0.1", ports.ch_tcp, "default")
         .expect("write ch-config");
 
     // 6. Shadow autospawn layout — same quirk as direct-bootstrap drill.
@@ -323,13 +349,15 @@ async fn pgbench_acceptance_ddl_intermix() {
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");
     let stderr_path = tmp.path().join("daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{METRICS_PORT}").parse().unwrap();
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{}", ports.metrics).parse().unwrap();
+    let decoder_pool_arg = decoder_pool.to_string();
+    let inserter_pool_arg = inserter_pool.to_string();
     let child = Command::new(bin)
         .args([
             "--host",
             source.config().socket_dir.to_str().unwrap(),
             "--port",
-            &SOURCE_PORT.to_string(),
+            &source.config().port.to_string(),
             "--user",
             "postgres",
             "--dbname",
@@ -341,7 +369,7 @@ async fn pgbench_acceptance_ddl_intermix() {
             "--shadow-socket-dir",
             shadow_sock.to_str().unwrap(),
             "--shadow-port",
-            &SHADOW_PORT.to_string(),
+            &ports.shadow.to_string(),
             "--shadow-user",
             "postgres",
             "--shadow-dbname",
@@ -353,7 +381,7 @@ async fn pgbench_acceptance_ddl_intermix() {
             "--metrics-bind",
             &metrics_addr.to_string(),
             "--walsender-bind",
-            &format!("127.0.0.1:{WALSENDER_PORT}"),
+            &format!("127.0.0.1:{}", ports.walsender),
             "--retention-bytes",
             "0",
             "--ch-config",
@@ -373,6 +401,13 @@ async fn pgbench_acceptance_ddl_intermix() {
             "--bootstrap-autospawn-shadow",
             "--bootstrap-shadow-replay-timeout",
             "180",
+            // N>1 here drives concurrent AsyncClients for bootstrap +
+            // WAL; the end-state parity oracle proves out-of-order
+            // INSERTs across connections stay _lsn-correct.
+            "--decoder-pool-size",
+            &decoder_pool_arg,
+            "--inserter-pool-size",
+            &inserter_pool_arg,
         ])
         // CI sets `WALSHADOW_ARTIFACT_DIR`; bump the daemon to trace
         // for `xact_buffer` so a stalled commit pipeline can be read
@@ -434,7 +469,7 @@ async fn pgbench_acceptance_ddl_intermix() {
                 "-h",
                 source.config().socket_dir.to_str().unwrap(),
                 "-p",
-                &SOURCE_PORT.to_string(),
+                &source.config().port.to_string(),
                 "-U",
                 "postgres",
                 "-d",
@@ -581,7 +616,7 @@ async fn pgbench_acceptance_ddl_intermix() {
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());
-        shadow_cfg.port = SHADOW_PORT;
+        shadow_cfg.port = ports.shadow;
         shadow_cfg.socket_dir = shadow_sock.clone();
         shadow_cfg.ctl_timeout = Duration::from_secs(60);
         let shadow = Shadow::new(shadow_cfg);
@@ -598,9 +633,22 @@ async fn pgbench_acceptance_ddl_intermix() {
         // spill, filtered manifests) before TempDir::drop wipes it. CI
         // uploads $WALSHADOW_ARTIFACT_DIR as a job artifact; local runs
         // leave the env var unset and dump_artifacts no-ops.
-        fx::dump_artifacts(tmp.path(), "pgbench_acceptance_ddl_intermix");
+        fx::dump_artifacts(tmp.path(), label);
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgbench_acceptance_ddl_intermix() {
+    run_ddl_intermix(SERIAL_PORTS, 1, 1, "pgbench_acceptance_ddl_intermix").await;
+}
+
+/// Same drill at decoder/inserter pool 2/2 — the live daemon coverage for
+/// N>1 concurrent `AsyncClient`s under the DDL barrier that the in-process
+/// `pipeline_parallel_{e2e,ddl_e2e}` tests can't provide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgbench_acceptance_ddl_intermix_pooled() {
+    run_ddl_intermix(POOLED_PORTS, 2, 2, "pgbench_acceptance_ddl_intermix_pooled").await;
 }
 
 /// Poll a `std::process::Child` until exit or timeout. Mirrors

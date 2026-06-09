@@ -1,20 +1,18 @@
-//! Reorder worker — the single-threaded commit-order coordinator.
+//! Reorder worker — single-threaded commit-order coordinator.
 //!
-//! Runs as the inner sink of the `QueueingRecordSink` worker (so it stays
-//! off the WAL pump task, preserving the wire-shadow deadlock fix). It
-//! pairs with [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink)
-//! (which accumulates heaps per xid); on each COMMIT / ABORT it assigns a
-//! dense `seq`, [`registers`](crate::pipeline::ack::AckHandle::register) it
-//! with the collector in order, and either dispatches the xact to the
-//! decode pool or — for a DDL / TRUNCATE barrier — quiesces, drains every
-//! earlier seq to durable, and applies the schema change to ClickHouse via
-//! [`DdlApplicator`] before resuming.
+//! Runs as inner sink of the `QueueingRecordSink` worker, off the WAL pump
+//! task (preserves the wire-shadow deadlock fix). Pairs with
+//! [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink); on each
+//! COMMIT/ABORT assigns a dense `seq`, registers it with the collector in
+//! order, then either dispatches to the decode pool or — for a DDL/TRUNCATE
+//! barrier — quiesces, drains earlier seqs to durable, and applies the schema
+//! change via [`DdlApplicator`] before resuming.
 //!
-//! Barrier coarseness is deliberate (DDL/TRUNCATE are rare). Within a
-//! barrier xact, data segments between catalog/truncate ops each get their
-//! own seq and are fenced so a `TRUNCATE` (which carries no `_lsn` and so
-//! can't ride `ReplacingMergeTree` reconciliation) orders correctly against
-//! surrounding inserts.
+//! Barrier coarseness is deliberate (DDL/TRUNCATE rare). Within a barrier
+//! xact, data segments between catalog/truncate ops each get their own seq
+//! and are fenced so a `TRUNCATE` (no `_lsn`, so can't ride
+//! `ReplacingMergeTree` reconciliation) orders correctly against surrounding
+//! inserts.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -51,13 +49,12 @@ pub struct ReorderSink {
     applicator: DdlApplicator,
     ack: AckHandle,
     jobs_tx: mpmc::Sender<DecodeJob>,
-    /// Shared FIFO channel to the batcher (also carries decode-pool rows);
-    /// used to send `FlushAll` so it orders after enqueued rows.
+    /// Shared FIFO channel to the batcher; `FlushAll` here orders after
+    /// enqueued rows.
     msg_tx: mpsc::Sender<BatcherMsg>,
     fatal: Fatal,
-    /// Shared emitter counters. Reorder owns the commit-order boundary, so
-    /// it bumps `xacts_committed` (once per commit) and `truncates_emitted`,
-    /// matching the serial emitter's `on_xact_end_with_lsn` / `route`.
+    /// Reorder owns the commit-order boundary, so bumps `xacts_committed`
+    /// (per commit) and `truncates_emitted`.
     stats: Arc<EmitterStats>,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
@@ -113,8 +110,8 @@ impl ReorderSink {
         )
     }
 
-    /// Drain pending DROP events (post-`sweep_dropped`) into the buffer
-    /// keyed on the commit's `(xid, source_lsn)`. Mirrors
+    /// Drain pending DROP events (post-`sweep_dropped`) into the buffer keyed
+    /// on `(xid, source_lsn)`. Mirrors
     /// `XactRecordSink::route_pending_schema_events`.
     async fn route_pending_schema_events(
         &mut self,
@@ -135,9 +132,9 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Poll-based DROP discovery at the commit boundary, gated on the
-    /// pg_class delete epoch so ADD COLUMN / VACUUM noise doesn't sweep.
-    /// Same logic as `XactRecordSink`'s commit branch.
+    /// Poll-based DROP discovery at commit, gated on the pg_class delete epoch
+    /// so ADD COLUMN / VACUUM noise doesn't sweep. Same as `XactRecordSink`'s
+    /// commit branch.
     async fn maybe_sweep_dropped(&mut self, xid: u32, source_lsn: u64) -> Result<(), SinkError> {
         if self.schema_events.is_none() {
             return Ok(());
@@ -168,10 +165,9 @@ impl ReorderSink {
         Ok(())
     }
 
-    // Helpers below take `&mut self` (not `&self`) so the borrow held
-    // across their awaits is `&mut ReorderSink` (Send) rather than
-    // `&ReorderSink` — the owned `DdlApplicator`/`AsyncClient` is `Send`
-    // but not `Sync`, so a shared ref across an await would not be `Send`.
+    // Helpers take `&mut self` so the borrow across awaits is `&mut Self`
+    // (Send): owned `DdlApplicator`/`AsyncClient` is Send but not Sync, so a
+    // shared `&Self` across an await wouldn't be Send.
     async fn dispatch_job(&mut self, job: DecodeJob) -> Result<(), SinkError> {
         tokio::select! {
             r = self.jobs_tx.send(job) => r.map_err(|_| SinkError::Other("decode job queue closed".into())),
@@ -179,9 +175,8 @@ impl ReorderSink {
         }
     }
 
-    /// Seal every batcher table to the inserters and wait until it replies.
-    /// Sent on the shared row channel so it's ordered after every row
-    /// enqueued before it.
+    /// Seal every batcher table and wait for the reply. Sent on the shared row
+    /// channel so it orders after every row enqueued before it.
     async fn flush_all_batcher(&mut self) -> Result<(), SinkError> {
         let (tx, rx) = oneshot::channel();
         if self.msg_tx.send(BatcherMsg::FlushAll(tx)).await.is_err() {
@@ -193,9 +188,8 @@ impl ReorderSink {
         }
     }
 
-    /// Wait until every dispatched seq has been *placed* — i.e. the decode
-    /// pool has finished routing all their rows onto the shared channel —
-    /// so a subsequent `FlushAll` is ordered after them.
+    /// Wait until every dispatched seq is *placed* (decode pool routed all
+    /// their rows onto the shared channel), so a `FlushAll` orders after them.
     async fn wait_all_placed(&mut self) -> Result<(), SinkError> {
         let through = self.next_seq;
         tokio::select! {
@@ -204,8 +198,8 @@ impl ReorderSink {
         }
     }
 
-    /// Block until every seq `< self.next_seq` is durable on CH, or a
-    /// fatal error trips (e.g. CH down past the inserter retry budget).
+    /// Block until every seq `< self.next_seq` is durable on CH, or a fatal
+    /// trips (e.g. CH down past the inserter retry budget).
     async fn wait_all_durable(&mut self) -> Result<(), SinkError> {
         let through = self.next_seq;
         tokio::select! {
@@ -214,19 +208,18 @@ impl ReorderSink {
         }
     }
 
-    /// Fence: ensure every dispatched seq's rows have been routed (placed),
-    /// then seal the batcher and wait for them all to be durable. Run before
-    /// applying a DDL event / TRUNCATE so it orders strictly after all
-    /// earlier data. The placed-wait is what stops `FlushAll` from sealing a
-    /// partial set while the decode pool is still routing earlier rows.
+    /// Fence before applying a DDL event / TRUNCATE so it orders strictly
+    /// after all earlier data: wait placed, seal batcher, wait durable. The
+    /// placed-wait stops `FlushAll` sealing a partial set while the decode
+    /// pool is still routing earlier rows.
     async fn barrier_fence(&mut self) -> Result<(), SinkError> {
         self.wait_all_placed().await?;
         self.flush_all_batcher().await?;
         self.wait_all_durable().await
     }
 
-    /// Dispatch accumulated barrier data rows as their own seq (decoder
-    /// will `Placed` them). No-op when empty.
+    /// Dispatch accumulated barrier data rows as their own seq. No-op when
+    /// empty.
     async fn dispatch_segment(
         &mut self,
         pending: &mut Vec<DecodedHeap>,
@@ -272,9 +265,9 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Process a barrier xact in source_lsn order: data rows accumulate
-    /// into segments; each DDL event / TRUNCATE is preceded by dispatching
-    /// the pending segment + a fence (so earlier data is durable first).
+    /// Process a barrier xact in source_lsn order: data rows accumulate into
+    /// segments; each DDL event / TRUNCATE is preceded by dispatching the
+    /// pending segment + a fence (so earlier data is durable first).
     async fn run_barrier(&mut self, drained: DrainedXact) -> Result<(), SinkError> {
         let DrainedXact {
             commit_ts,
@@ -304,7 +297,7 @@ impl ReorderSink {
                 pending.push(heap);
             }
         }
-        // Trailing events (no heap follows them in the merge).
+        // Trailing events: no heap follows them in the merge
         while ev_cursor < ordered_events.len() {
             self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
                 .await?;
@@ -312,13 +305,12 @@ impl ReorderSink {
             self.apply_event(&ordered_events[ev_cursor].1).await?;
             ev_cursor += 1;
         }
-        // Trailing data (after the last DDL/TRUNCATE): flows async like a
-        // normal commit — already encodes against the post-DDL shape.
+        // Trailing data flows async like a normal commit, already encoding
+        // against the post-DDL shape.
         self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
             .await
     }
 
-    /// Handle a COMMIT / COMMIT_PREPARED record.
     async fn on_commit(
         &mut self,
         xid: u32,
@@ -334,8 +326,7 @@ impl ReorderSink {
                 .map_err(SinkError::from)?
         };
         self.subxact_tracker.lock().await.forget_tree(xid);
-        // One per drained commit (incl. empty / unmapped-only), matching the
-        // serial emitter's bump in `on_xact_end_with_lsn`.
+        // One per drained commit, incl. empty / unmapped-only
         self.stats.xacts_committed.fetch_add(1, Ordering::Relaxed);
 
         let is_barrier = !drained.ordered_events.is_empty()
@@ -346,8 +337,7 @@ impl ReorderSink {
         if is_barrier {
             self.run_barrier(drained).await
         } else if drained.heaps.is_empty() {
-            // Read-only / empty / unmapped-only commit: a rows=0 seq keeps
-            // the contiguous watermark unbroken.
+            // Empty commit: rows=0 seq keeps the contiguous watermark unbroken
             let seq = self.alloc_seq();
             self.ack.register(seq, drained.commit_lsn);
             self.ack.placed(seq, 0);
@@ -366,8 +356,8 @@ impl ReorderSink {
         }
     }
 
-    /// Handle an ABORT / ABORT_PREPARED record: drop the buffer and emit a
-    /// rows=0 seq through the gate (never a direct ack bump).
+    /// ABORT: drop the buffer, emit a rows=0 seq through the gate (never a
+    /// direct ack bump).
     async fn on_abort(&mut self, xid: u32, info: u8, record: &Record<'_>) -> Result<(), SinkError> {
         let payload = parse_xact_payload(info, &record.parsed.main_data);
         let seq = self.alloc_seq();
@@ -409,8 +399,7 @@ impl RecordSink for ReorderSink {
                     }
                     Ok(())
                 }
-                // PREPARE / INVALIDATIONS: not this stage's territory.
-                // PREPARE allocates no seq; COMMIT_PREPARED drains it later.
+                // PREPARE allocates no seq; COMMIT_PREPARED drains it later
                 _ => Ok(()),
             }
         })
@@ -421,9 +410,8 @@ impl RecordSink for ReorderSink {
         lsn: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            // Trailing non-commit WAL: only when no xact is buffered. The
-            // collector additionally requires every registered seq done
-            // before it lets `emitter_ack` advance to `lsn`.
+            // Trailing non-commit WAL only when no xact buffered; collector
+            // also requires every registered seq done before advancing.
             let active = self.buffer.lock().await.stats().xacts_active;
             if active == 0 {
                 self.ack.trailing(lsn);

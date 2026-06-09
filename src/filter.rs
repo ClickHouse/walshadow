@@ -1,19 +1,14 @@
-//! Per-record routing decision used by the WAL rewriter: where each
-//! record goes, not whether it survives.
-//!
-//! Wraps `classify` + `CatalogTracker` + `main_data` reclassifier into
-//! a stateful `Filter` that callers feed each record in source order.
+//! Per-record routing decision for the WAL rewriter: where each record
+//! goes, not whether it survives. Records fed in source order.
 //!
 //! Route policy:
 //! * `Special` rmgr → ToShadow (recovery plumbing shadow needs verbatim)
-//! * `Catalog` class → ToShadow
-//! * `User` class → ToDecoder (XLOG_NOOP placeholder of same length on
-//!   the shadow stream; original bytes feed the heap decoder)
-//! * `Empty` class → reclassify via `main_data::relation_for_empty`,
-//!   re-checking against `CatalogTracker`. Unrecognised Empty records
-//!   default to ToShadow (correctness over efficiency: false-routing a
-//!   non-catalog record to shadow is wasted bytes; wrongly suppressing
-//!   a catalog record breaks shadow).
+//! * `Catalog` → ToShadow
+//! * `User` → ToDecoder (XLOG_NOOP placeholder on shadow; original bytes
+//!   feed the heap decoder)
+//! * `Empty` → reclassify via `main_data::relation_for_empty` against
+//!   `CatalogTracker`. Unrecognised → ToShadow: correctness over bytes,
+//!   wrongly suppressing a catalog record breaks shadow.
 
 use serde::{Deserialize, Serialize};
 use wal_rs::pg::walparser::{XLogRecord, XLogRecordBlock};
@@ -26,14 +21,11 @@ use crate::main_data;
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 pub enum Route {
-    /// Replay on shadow verbatim — catalog + recovery-plumbing records
-    /// shadow PG needs in its redo stream.
     #[default]
     ToShadow,
-    /// Suppress on the shadow stream as an `XLOG_NOOP` of identical
-    /// length; the original bytes route to the heap decoder for CH
-    /// emission (heap rmgrs) or to nowhere (other user rmgrs, e.g.
-    /// user-index records, which are simply not replayed).
+    /// Suppress on shadow as same-length `XLOG_NOOP`; original bytes go to
+    /// the heap decoder for CH emission, or nowhere for non-heap user
+    /// rmgrs (e.g. user-index records, never replayed).
     ToDecoder,
 }
 
@@ -50,8 +42,8 @@ pub struct FilterStats {
 }
 
 impl FilterStats {
-    /// Field-wise difference. Used by per-segment manifest emission
-    /// against a long-lived [`Filter`] whose `stats` are cumulative.
+    /// Field-wise difference; per-segment manifest carves a window out of
+    /// a long-lived [`Filter`]'s cumulative `stats`.
     pub fn delta_from(&self, prev: &Self) -> Self {
         Self {
             kept: self.kept - prev.kept,
@@ -85,10 +77,9 @@ impl FilterStats {
     }
 }
 
-/// Stateful filter. Updates the catalog tracker on every record then
-/// returns the `Route` based on the *post-update* catalog set so an
-/// XLOG_RELMAP_UPDATE that introduces a new mapped-catalog filenumber
-/// can immediately route subsequent records on that filenumber to shadow.
+/// Routes against the *post-update* catalog set so an XLOG_RELMAP_UPDATE
+/// introducing a new mapped-catalog filenumber immediately routes later
+/// records on that filenumber to shadow.
 pub struct Filter {
     pub tracker: CatalogTracker,
     pub stats: FilterStats,
@@ -109,8 +100,7 @@ impl Filter {
             Class::Special | Class::Catalog => Route::ToShadow,
             Class::User => {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
-                    // classify under-counted because tracker has newer
-                    // filenodes than the bootstrap rule knew about
+                    // tracker has filenodes the bootstrap classify rule misses
                     Route::ToShadow
                 } else {
                     Route::ToDecoder
@@ -132,7 +122,6 @@ impl Filter {
         route
     }
 
-    /// Per-rmgr label string for diagnostics.
     pub fn rmgr_label(record: &XLogRecord) -> String {
         rmgr_label(record.header.resource_manager_id)
     }
@@ -217,7 +206,7 @@ mod tests {
     #[test]
     fn tracker_promotes_user_to_catalog_post_relmap() {
         let mut f = Filter::new();
-        // Manually inject a learned mapping (pg_class on db 5 rewritten to 50000)
+        // Learned mapping: catalog on db 5 rewritten to filenode 50000.
         f.tracker.add(5, 50000);
         let r = rec(RmId::Heap, &[(5, 50000)]);
         assert_eq!(f.decide(&r), Route::ToShadow);
@@ -226,10 +215,8 @@ mod tests {
     #[test]
     fn empty_class_with_known_relation_is_classified_against_tracker() {
         use crate::main_data::XLOG_HEAP2_NEW_CID;
-        // XLOG_HEAP2_NEW_CID carries a locator in main_data — Class::Empty
-        // with `relation_for_empty(Some(rel))`. Build one targeting a
-        // catalog filenode (oid < 16384) → Keep; one targeting a user
-        // filenode → Drop.
+        // XLOG_HEAP2_NEW_CID carries a locator in main_data (Class::Empty).
+        // Catalog filenode (oid < 16384) → Keep; user filenode → Drop.
         fn new_cid_main_data(db: u32, rel: u32) -> Vec<u8> {
             let mut md = Vec::with_capacity(34);
             md.extend_from_slice(&100u32.to_le_bytes()); // top_xid

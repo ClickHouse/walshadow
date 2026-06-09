@@ -1,10 +1,9 @@
 //! Shared PG-15+ WAL page-header parsing for the two segment walkers.
 //!
-//! [`parse_page_header`] is pure: bytes + offset in, outcome out, no
-//! walker state. Validation failures (bad magic / version / flags)
-//! surface as `Err`; the non-error [`PageHeaderParse`] outcomes let each
-//! caller apply its own policy for a short tail (EOF vs truncation vs
-//! "need more bytes").
+//! [`parse_page_header`] is pure (no walker state). Validation failures
+//! (bad magic / version / flags) surface as `Err`; non-error
+//! [`PageHeaderParse`] outcomes let each caller apply its own short-tail
+//! policy (EOF vs truncation vs "need more bytes").
 
 use thiserror::Error;
 use wal_rs::pg::walparser::{
@@ -15,8 +14,8 @@ pub const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
 const SHORT_HEADER_SIZE: usize = 20;
 const LONG_HEADER_SIZE: usize = SHORT_HEADER_SIZE + 16;
 
-/// XLP_FIRST_IS_CONTRECORD | XLP_LONG_HEADER | XLP_BKP_REMOVABLE.
-/// Any bit outside this set means a corrupt page header.
+/// XLP_FIRST_IS_CONTRECORD | XLP_LONG_HEADER | XLP_BKP_REMOVABLE; any
+/// other bit means a corrupt page header.
 const XLP_ALL_FLAGS: u16 = 0x0007;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -37,23 +36,20 @@ pub enum WalkError {
     Truncated(usize),
 }
 
-/// Non-error outcome of [`parse_page_header`]. The incomplete variants
-/// carry no data — the caller decides whether a short tail is clean EOF,
-/// truncation, or a signal to wait for more bytes.
+/// Non-error outcome of [`parse_page_header`]. Incomplete variants carry
+/// no data; caller decides whether a short tail is clean EOF, truncation,
+/// or a signal to wait for more bytes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PageHeaderParse {
-    /// Fewer than the short-header bytes available from `page_start`:
-    /// can't even read magic/info.
+    /// Fewer than short-header bytes from `page_start`; can't read magic/info.
     ShortHeaderIncomplete,
     /// Long-header flag set but the full long header hasn't landed.
     LongHeaderIncomplete,
     /// `magic == 0 && info == 0`: zero page, end of valid data.
     ZeroPage,
-    /// Header parsed and validated.
     Valid {
-        /// Page magic; PG-15 vs PG-14 FPI bit semantics key off this.
+        /// PG-15 vs PG-14 FPI bit semantics key off this.
         magic: u16,
-        /// Record-aligned data-area start =
         /// `page_start + align_up(header_size, alignment)`.
         data_start: usize,
         /// `xlp_rem_len`: bytes of a record continued from the prior page.
@@ -61,7 +57,6 @@ pub enum PageHeaderParse {
     },
 }
 
-/// Parse + validate the page header at `bytes[page_start..]`.
 pub fn parse_page_header(bytes: &[u8], page_start: usize) -> Result<PageHeaderParse, WalkError> {
     if page_start + SHORT_HEADER_SIZE > bytes.len() {
         return Ok(PageHeaderParse::ShortHeaderIncomplete);
@@ -135,7 +130,6 @@ mod tests {
 
     #[test]
     fn long_header_flag_without_bytes_reports_incomplete() {
-        // Short header present, long flag set, but < LONG_HEADER_SIZE bytes.
         let buf = header(XLP_PAGE_MAGIC_PG15, XLP_LONG_HEADER, 0);
         assert_eq!(buf.len(), SHORT_HEADER_SIZE);
         assert_eq!(

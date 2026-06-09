@@ -1,22 +1,15 @@
-//! `walshadow-filter` — drop user-relation WAL records and emit a
-//! filtered segment + manifest sidecar.
+//! `walshadow-filter` — drop user-relation WAL records, emit filtered
+//! segment + manifest sidecar.
 //!
-//! Usage:
 //! ```text
 //! walshadow-filter --in seg.wal[.zst|.gz|.lz4|.lzma|.br][.partial] \
 //!     --out-dir filtered/ [--manifest filtered/seg.json]
 //! ```
-//! Reads `seg.wal` (decompressed transparently by wal-rs if the path
-//! carries a recognised codec suffix), walks every record, drops
-//! user-relation records by NOOP-replacing them in place (xl_prev chain
-//! preserved), writes the result to `filtered/<24-hex-name>` and a JSON
-//! sidecar next to it (or to `--manifest` if given).
 //!
-//! Note on naming layers: this binary handles *segment-file* compression
-//! (whole-segment codec envelope produced by pg_receivewal / archive_command).
-//! It does NOT handle the orthogonal `wal_compression` GUC, which
-//! compresses FPIs *inside* WAL records — that's the
-//! `filter_segment` walker's concern and is already supported.
+//! Handles *segment-file* compression (whole-segment codec envelope from
+//! pg_receivewal/archive_command), NOT the orthogonal `wal_compression`
+//! GUC that compresses FPIs *inside* records — that's `filter_segment`'s
+//! concern.
 
 use std::fs;
 use std::path::PathBuf;

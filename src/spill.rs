@@ -1,20 +1,14 @@
 //! Per-xact append-only spill backend.
 //!
-//! Mirrors PG's `pg_replslot/<slot>/xid-*.snap` shape: one file per
-//! buffered xid under `{data_dir}/spill/`. The xact buffer flushes its
-//! in-memory queue here once `xact_buffer_max` is breached; commit drain
-//! reads the file back in WAL order then unlinks. Abort just unlinks.
+//! Mirrors PG `pg_replslot/<slot>/xid-*.snap`: one file per buffered xid
+//! under `{data_dir}/spill/`. Buffer flushes its in-memory queue here once
+//! `xact_buffer_max` breached; commit drain reads back in WAL order then
+//! unlinks, abort just unlinks.
 //!
-//! ## Why a custom binary encoder
-//!
-//! Spill entries are [`DecodedHeap`] tuples and reassembled
-//! [`ToastChunk`]s. JSON inflates the bytea / chunk_data path 3–4× and
-//! the workload (bulk INSERT/UPDATE) is exactly when that hurts. Adding
-//! `bincode` / `postcard` for a contained format with no
-//! version-skew surface is dead weight. Manual length-prefixed binary
-//! keeps the cost local: ~150 LOC of explicit byte layout, every
-//! decode failure surfaces as [`SpillError::Format`] with a precise
-//! offset.
+//! Custom binary encoder over JSON: JSON inflates the bytea / chunk_data path
+//! 3–4×, worst on the bulk INSERT/UPDATE workload. Manual length-prefixed
+//! binary surfaces every decode failure as [`SpillError::Format`] with a
+//! precise offset.
 //!
 //! ## On-disk layout
 //!
@@ -25,31 +19,25 @@
 //!   tag = 1 → SpillEntry::Chunk  (body = encoded ToastChunk)
 //! ```
 //!
-//! Version bumps on any change to the body encoding. Spill files do
-//! not survive a daemon restart (resume contract wipes the dir on
-//! boot), so the magic + version exists for self-check honesty: a
-//! mid-restart format mismatch surfaces as [`SpillError::Format`]
-//! rather than as a silent body misparse.
-//!
-//! The outer length lets [`SpillReader::next`] skip a malformed body
-//! without forcing the whole file. v1 propagates any malformation as
-//! [`SpillError::Format`] — the xact is unrecoverable anyway, the
-//! caller's only sane response is to drop the buffer.
+//! Version bumps on any body-encoding change. Files don't survive a restart
+//! (resume contract wipes the dir), so magic + version is self-check honesty:
+//! a mid-restart format mismatch surfaces as [`SpillError::Format`] not a
+//! silent misparse. Outer length lets [`SpillReader::next`] skip a malformed
+//! body; v1 propagates any malformation as Format since the xact is
+//! unrecoverable anyway.
 //!
 //! ## Eviction policy
 //!
 //! Largest-xact-first, mirroring PG `ReorderBufferLargestTXN`
-//! (`~/s/postgresql/src/backend/replication/logical/reorderbuffer.c`
-//! L3789). The xact buffer owns the policy decision; [`SpillStore`]
-//! just lays out the files.
+//! (`~/s/postgresql/src/backend/replication/logical/reorderbuffer.c`).
+//! Buffer owns the policy; [`SpillStore`] just lays out files.
 //!
 //! ## Crash recovery
 //!
-//! Startup clears the spill dir wholesale via [`SpillStore::clear`].
-//! Cursor file commits atomically post-drain, so on-disk state is
-//! always "drained-and-in-CH" or "replayable-from-WAL-cursor". No
-//! attempt to replay partial spill files — re-streaming from the
-//! cursor LSN is cheaper than verifying the spill's integrity.
+//! Startup wipes the dir via [`SpillStore::clear`]. Cursor file commits
+//! atomically post-drain, so on-disk state is always "drained-and-in-CH" or
+//! "replayable-from-WAL-cursor"; re-streaming from cursor LSN is cheaper than
+//! verifying spill integrity, so partial files aren't replayed.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -61,36 +49,30 @@ use wal_rs::pg::walparser::RelFileNode;
 
 use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer};
 
-/// One unit the buffer wants to durably stash. Heap tuples and TOAST
-/// chunks share the file because both flush together at commit drain;
-/// keeping the file ordering aligned with WAL order means the drain
-/// pass is a single linear read.
+/// Heap tuples + TOAST chunks share the file: both flush at commit drain,
+/// WAL-aligned ordering keeps the drain a single linear read
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpillEntry {
     Heap(Box<DecodedHeap>),
     Chunk(ToastChunk),
 }
 
-/// One TOAST chunk extracted from a `pg_toast.pg_toast_<oid>` INSERT.
-/// PG `toast_save_datum` writes chunks as `(chunk_id oid, chunk_seq
-/// int4, chunk_data bytea)`; the buffer holds them keyed by
-/// `(toast_relid, value_id)` and concatenates by `chunk_seq` at drain.
+/// One chunk from a `pg_toast.pg_toast_<oid>` INSERT. PG `toast_save_datum`
+/// writes `(chunk_id oid, chunk_seq int4, chunk_data bytea)`; buffer keys by
+/// `(toast_relid, value_id)`, concatenates by `chunk_seq` at drain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToastChunk {
-    /// `RelFileNode.rel_node` of the toast relation the chunk lives on.
-    /// `va_toastrelid` on the referring tuple's [`ToastPointer`] matches
-    /// this field.
+    /// Toast relation `RelFileNode.rel_node`; matches the referring
+    /// [`ToastPointer`]'s `va_toastrelid`
     pub toast_relid: u32,
-    /// `chunk_id` — matches `va_valueid`.
+    /// `chunk_id`, matches `va_valueid`
     pub value_id: u32,
-    /// Per-value chunk index, 0-based. PG writes sequentially.
+    /// 0-based, PG writes sequentially
     pub chunk_seq: u32,
-    /// Source-WAL LSN where the chunk record sat. Keeps WAL-order
-    /// drain stable across spilled + in-memory chunks for the same
-    /// value.
+    /// Keeps WAL-order drain stable across spilled + in-memory chunks for
+    /// one value
     pub source_lsn: u64,
-    /// Raw bytea body of the chunk — `TOAST_MAX_CHUNK_SIZE` ≈ 1996
-    /// bytes typical, last chunk shorter.
+    /// `TOAST_MAX_CHUNK_SIZE` ≈ 1996 bytes typical, last chunk shorter
     pub chunk_data: Vec<u8>,
 }
 
@@ -104,23 +86,19 @@ pub enum SpillError {
 
 pub type Result<T> = std::result::Result<T, SpillError>;
 
-/// File-leading magic. Picked to be ASCII for `xxd`-friendly debug.
+/// ASCII for `xxd`-friendly debug
 pub const SPILL_MAGIC: [u8; 2] = *b"WS";
-/// Current on-disk format. v2 covers `HeapOp::Truncate`'s tag-4
-/// and the `DrainEntry::Catalog` lift.
-/// v1 was the earlier unversioned shape; we never wrote a v1 header,
-/// so older files are simply rejected as "no magic".
+/// v2 covers `HeapOp::Truncate` tag-4 and the `DrainEntry::Catalog` lift. v1
+/// was unversioned and never wrote a header, so older files reject as "no
+/// magic"
 pub const SPILL_VERSION: u16 = 2;
 
-/// Filesystem layout owner. Creates the dir if missing; offers a
-/// `writer(xid, first_lsn)` factory and a startup `clear`.
 pub struct SpillStore {
     dir: PathBuf,
 }
 
 impl SpillStore {
-    /// Open or create `dir`. Synchronous on purpose — called once at
-    /// daemon startup before the tokio runtime gets busy.
+    /// Synchronous: called once at daemon startup before the runtime is busy
     pub fn new(dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
         Ok(Self { dir })
@@ -130,9 +108,8 @@ impl SpillStore {
         &self.dir
     }
 
-    /// Open a fresh per-xid spill file. Filename includes `first_lsn`
-    /// so two streams that picked up the same xid value after a slot
-    /// rotation don't collide on disk.
+    /// Filename includes `first_lsn` so two streams reusing an xid value
+    /// after a slot rotation don't collide on disk
     pub async fn writer(&self, xid: u32, first_lsn: u64) -> Result<SpillWriter> {
         let path = self.dir.join(format!("xid-{xid:010}-{first_lsn:016X}.bin"));
         let mut file = OpenOptions::new()
@@ -152,15 +129,12 @@ impl SpillStore {
         })
     }
 
-    /// Wipe every file under the spill dir. Called at daemon startup
-    /// per the crash-recovery contract: on-disk state is always
-    /// either drained-into-CH or replayable from the cursor's
-    /// `decoder_lsn`, so leftover spill files from a prior crash are
-    /// safe to discard.
+    /// Wipe every spill file. Crash-recovery contract: on-disk state is
+    /// always drained-into-CH or replayable from the cursor's `decoder_lsn`,
+    /// so prior-crash leftovers are safe to discard
     pub async fn clear(&self) -> Result<()> {
         let mut entries = match tokio::fs::read_dir(&self.dir).await {
             Ok(e) => e,
-            // Dir was just created or vanished; nothing to clear.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
@@ -177,7 +151,6 @@ impl SpillStore {
     }
 }
 
-/// Append-only writer for one xact's spill file.
 pub struct SpillWriter {
     file: File,
     path: PathBuf,
@@ -200,9 +173,7 @@ impl SpillWriter {
             SpillEntry::Chunk(_) => 1,
         };
         body.push(tag);
-        // u32 LE length placeholder; back-patched after the body
-        // appends in-place so encoding never goes through a scratch
-        // Vec.
+        // u32 LE length placeholder, back-patched after body appends in place
         let len_off = body.len();
         body.extend_from_slice(&[0u8; 4]);
         let inner_start = body.len();
@@ -217,9 +188,8 @@ impl SpillWriter {
         Ok(())
     }
 
-    /// Flush + close the writer, return a reader positioned at the
-    /// beginning. Caller's responsibility to drive `next()` until
-    /// `Ok(None)` and then `unlink()`.
+    /// Flush + close, return a reader at the start. Caller drives `next()` to
+    /// `Ok(None)` then `unlink()`
     pub async fn finish(mut self) -> Result<SpillReader> {
         self.file.flush().await?;
         self.file.sync_all().await?;
@@ -232,16 +202,14 @@ impl SpillWriter {
         })
     }
 
-    /// Abort path: drop the file unread. Renamed from `discard` so the
-    /// intent is obvious at call sites.
+    /// Abort path: drop the file unread
     pub async fn unlink(self) -> Result<()> {
         unlink_file(self.file, &self.path).await
     }
 }
 
-/// Drop `file` and remove `path`, tolerating an already-gone file
-/// (abort races, crash-cleanup re-runs). Shared by both spill handles'
-/// `unlink`.
+/// Drop `file`, remove `path`, tolerating already-gone (abort races,
+/// crash-cleanup re-runs)
 async fn unlink_file(file: File, path: &Path) -> Result<()> {
     drop(file);
     match tokio::fs::remove_file(path).await {
@@ -251,15 +219,11 @@ async fn unlink_file(file: File, path: &Path) -> Result<()> {
     }
 }
 
-/// Streaming reader for one xact's spill file.
 pub struct SpillReader {
     file: File,
     path: PathBuf,
-    /// `false` until `next()` reads + verifies the leading
-    /// [`SPILL_MAGIC`] + version. Header read is lazy so tests
-    /// constructing a [`SpillReader`] over synthetic bytes can fail
-    /// cleanly with [`SpillError::Format`] when the magic doesn't
-    /// match, mirroring the production "stale spill on disk" path.
+    /// Lazy header check: first `next()` verifies [`SPILL_MAGIC`] + version,
+    /// so a stale on-disk spill fails cleanly with [`SpillError::Format`]
     header_checked: bool,
 }
 
@@ -296,7 +260,7 @@ impl SpillReader {
         Ok(())
     }
 
-    /// One entry per call. Returns `Ok(None)` at clean EOF.
+    /// One entry per call; `Ok(None)` at clean EOF
     pub async fn next(&mut self) -> Result<Option<SpillEntry>> {
         if !self.header_checked {
             self.check_header().await?;
@@ -859,10 +823,9 @@ mod tests {
         w2.write(&SpillEntry::Heap(Box::new(sample_heap(2, 0))))
             .await
             .unwrap();
-        // Drop the writers without finish() so files stay on disk.
+        // Drop without finish() so files stay on disk
         drop(w1);
         drop(w2);
-        // Non-spill file in the same dir survives the clear.
         let bystander = tmp.path().join("README");
         tokio::fs::write(&bystander, b"keep me").await.unwrap();
         store.clear().await.unwrap();
@@ -899,9 +862,7 @@ mod tests {
     async fn malformed_tag_surfaces_format_error() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("xid-0000000000-0000000000000000.bin");
-        // Valid header + tag=255 + len=0 + no body. Header lets the
-        // reader past `check_header`; tag=255 then trips the entry
-        // dispatch.
+        // Valid header + tag=255 + len=0 + no body; tag=255 trips entry dispatch
         let mut bytes = Vec::with_capacity(6 + 5);
         bytes.extend_from_slice(&SPILL_MAGIC);
         bytes.extend_from_slice(&SPILL_VERSION.to_le_bytes());
@@ -925,7 +886,6 @@ mod tests {
     async fn missing_magic_surfaces_format_error() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("xid-0000000000-0000000000000000.bin");
-        // No header bytes — first read should fail on the magic check.
         tokio::fs::write(&path, &[0u8, 0u8, 0u8, 0u8])
             .await
             .unwrap();
@@ -1026,10 +986,8 @@ mod tests {
     async fn round_trip_all_heap_ops() {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
-        // dir() accessor smoke
         assert_eq!(store.dir(), tmp.path());
         let mut w = store.writer(11, 0x500).await.unwrap();
-        // path() accessor smoke
         assert!(w.path().exists());
         for op in [
             HeapOp::Insert,
@@ -1041,11 +999,10 @@ mod tests {
             let mut h = sample_heap(11, 0x600);
             h.op = op;
             if matches!(op, HeapOp::Truncate) {
-                // Truncate carries no tuple payload.
+                // Truncate carries no tuple payload
                 h.new = None;
                 h.old = None;
             } else {
-                // For Update/HotUpdate/Delete an `old` tuple is expected.
                 h.old = Some(DecodedTuple {
                     columns: vec![Some(ColumnValue::Int4(42))],
                     partial: false,
@@ -1083,7 +1040,7 @@ mod tests {
 
     #[test]
     fn cursor_string_rejects_invalid_utf8() {
-        // length 2, body is 0xFF 0xFE — invalid as UTF-8.
+        // len 2, body 0xFF 0xFE invalid UTF-8
         let buf = [2u8, 0, 0, 0, 0xFF, 0xFE];
         let mut cur = Cursor::new(&buf);
         let err = cur.string().unwrap_err();
@@ -1104,7 +1061,7 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_unknown_numeric_kind() {
-        // tag=20 (Numeric), then a bad NumericKind sub-tag.
+        // tag=20 Numeric, bad NumericKind sub-tag
         let buf = [20u8, 99u8];
         let mut cur = Cursor::new(&buf);
         let err = decode_value(&mut cur).unwrap_err();
@@ -1118,7 +1075,7 @@ mod tests {
 
     #[test]
     fn decode_heap_rejects_unknown_op_tag() {
-        // 4 u32 (spc/db/rel/xid) + u64 source_lsn = 24 bytes, then bad op 99.
+        // 4 u32 (spc/db/rel/xid) + u64 source_lsn = 24 bytes, then bad op 99
         let mut buf = vec![0u8; 24];
         buf.push(99u8);
         let mut cur = Cursor::new(&buf);
@@ -1137,9 +1094,8 @@ mod tests {
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let w = store.writer(13, 0).await.unwrap();
         let path = w.path().to_path_buf();
-        // Remove the file out from under the writer.
+        // Remove file out from under the writer; unlink() must swallow NotFound
         tokio::fs::remove_file(&path).await.unwrap();
-        // unlink() must swallow NotFound.
         w.unlink().await.unwrap();
     }
 
@@ -1160,7 +1116,7 @@ mod tests {
     async fn clear_returns_ok_when_dir_vanished() {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
-        // Rip the dir out — read_dir will return NotFound, which clear must absorb.
+        // read_dir returns NotFound, clear must absorb
         tokio::fs::remove_dir_all(tmp.path()).await.unwrap();
         store.clear().await.unwrap();
     }

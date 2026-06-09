@@ -1,37 +1,20 @@
-//! Shadow Postgres lifecycle.
+//! Shadow Postgres lifecycle: the co-located instance walshadow uses
+//! as catalog mirror & decode oracle. Wraps PG binaries (`initdb`,
+//! `pg_ctl`, `psql`) + on-disk plumbing (`postgresql.conf`,
+//! `standby.signal`, `restore_command`).
 //!
-//! Owns the co-located Postgres instance walshadow uses as catalog
-//! mirror & decode oracle. Wraps PG binaries (`initdb`, `pg_ctl`,
-//! `psql`) plus on-disk plumbing (`postgresql.conf`, `standby.signal`,
-//! `restore_command`) into a small struct.
+//! Bootstrap: [`initdb`](Shadow::initdb),
+//! [`write_base_conf`](Shadow::write_base_conf),
+//! [`start`](Shadow::start), [`apply_schema_dump`](Shadow::apply_schema_dump),
+//! [`stop`](Shadow::stop),
+//! [`enable_standby_recovery`](Shadow::enable_standby_recovery),
+//! [`start`](Shadow::start), [`wait_for_replay`](Shadow::wait_for_replay),
+//! [`health`](Shadow::health).
 //!
-//! Typical bootstrap:
-//!
-//! 1. [`Shadow::initdb`] — bootstrap empty cluster
-//! 2. [`Shadow::write_base_conf`] — append walshadow knobs to
-//!    `postgresql.conf` (port, socket dir, autovacuum off, …)
-//! 3. [`Shadow::start`] — start in normal mode for schema restore
-//! 4. [`Shadow::apply_schema_dump`] — pipe a `pg_dump --schema-only`
-//!    payload via `psql -f -`
-//! 5. [`Shadow::stop`] — clean shutdown
-//! 6. [`Shadow::enable_standby_recovery`] — write `standby.signal` &
-//!    append `restore_command` pointing at the filter output dir
-//! 7. [`Shadow::start`] — restart in standby (recovery) mode
-//! 8. [`Shadow::wait_for_replay`] — block on
-//!    `pg_is_in_recovery() AND pg_last_wal_replay_lsn() >= target`
-//! 9. [`Shadow::health`] — periodic catalog probe
-//!
-//! Step 4 stays a primitive: walshadow does not reach out to source PG
-//! here (daemon orchestration owns that). Callers feed in the dump
-//! string they obtained however they prefer.
-//!
-//! Standby signal vs recovery signal: a naive setup says
-//! `recovery.signal`, but §Architecture describes shadow as a
-//! *standby* — `recovery.signal` exits recovery when archive WAL runs
-//! out, which is the wrong primitive. `standby.signal` keeps the
-//! cluster in continuous recovery, retrying `restore_command` on each
-//! new segment landed by the filter. This module writes
-//! `standby.signal`.
+//! `standby.signal` not `recovery.signal`: shadow is a *standby*.
+//! `recovery.signal` exits recovery when archive WAL runs out; wrong
+//! primitive. `standby.signal` stays in continuous recovery, retrying
+//! `restore_command` on each new filter-landed segment.
 
 use std::fs;
 use std::io::Write;
@@ -66,22 +49,18 @@ pub type Result<T> = std::result::Result<T, ShadowError>;
 
 #[derive(Debug, Clone)]
 pub struct ShadowConfig {
-    /// PG data directory (`-D` to all binaries).
+    /// `-D` to all binaries.
     pub data_dir: PathBuf,
-    /// TCP port shadow listens on. Connections still go over the unix
-    /// socket; `listen_addresses` stays empty.
+    /// `port`. Connections still go over the unix socket;
+    /// `listen_addresses` stays empty.
     pub port: u16,
-    /// Directory shadow exposes its unix socket in.
     pub socket_dir: PathBuf,
-    /// Directory walshadow's filter writes filtered segments into.
     /// Source path for shadow's `restore_command`.
     pub filter_out_dir: PathBuf,
-    /// Override location for PG binaries (`initdb`, `pg_ctl`, `psql`).
-    /// `None` → resolved via `$PATH`.
+    /// `None` resolves binaries via `$PATH`.
     pub pg_bin_dir: Option<PathBuf>,
-    /// Per-`pg_ctl` `-t` timeout, used for both start and stop.
+    /// `pg_ctl -t`, both start and stop.
     pub ctl_timeout: Duration,
-    /// [`Shadow::wait_for_replay`] poll interval.
     pub wait_poll: Duration,
 }
 
@@ -118,19 +97,17 @@ impl ShadowConfig {
     }
 }
 
-/// One-shot snapshot of shadow's recovery & catalog state. Used for
-/// liveness / lag monitoring and for spot-checking that catalog replay
-/// produced a sane `pg_class`.
+/// One-shot recovery & catalog state snapshot.
 #[derive(Debug, Clone)]
 pub struct HealthReport {
     pub in_recovery: bool,
-    /// `pg_last_wal_replay_lsn()` — `None` when shadow has not yet
-    /// replayed any WAL (normal-mode startup or just-promoted standby).
+    /// `pg_last_wal_replay_lsn()`; `None` before any WAL replayed
+    /// (normal-mode startup or just-promoted standby).
     pub replay_lsn: Option<u64>,
     pub pg_class_count: u64,
-    /// `relname` for the `pg_proc`-oid row in `pg_class`. Always
-    /// `"pg_proc"` on a healthy cluster — surfaces catalog corruption
-    /// or replay-LSN-pinned-far-behind in a single probe.
+    /// `relname` of the `pg_proc`-oid `pg_class` row. Always
+    /// `"pg_proc"` healthy; surfaces catalog corruption or replay
+    /// pinned far behind in one probe.
     pub pg_proc_relname: String,
 }
 
@@ -170,8 +147,8 @@ impl Shadow {
         Ok(())
     }
 
-    /// Append walshadow's base settings to `postgresql.conf`. Safe to
-    /// call multiple times; each invocation appends a fresh block.
+    /// Append walshadow base settings to `postgresql.conf`. Each call
+    /// appends a fresh block.
     pub fn write_base_conf(&self) -> Result<()> {
         let conf_path = self.config.data_dir.join("postgresql.conf");
         let body = format!(
@@ -194,10 +171,9 @@ impl Shadow {
         Ok(())
     }
 
-    /// Drop `standby.signal` + append `primary_conninfo` (walsender
-    /// hot path) and `restore_command` (archive fallback) to
-    /// `postgresql.conf`. PG's walreceiver tries `primary_conninfo`
-    /// first and falls back to `restore_command` on connect error or
+    /// Drop `standby.signal` + append `primary_conninfo` and
+    /// `restore_command`. PG's walreceiver tries `primary_conninfo`
+    /// first, falls back to `restore_command` on connect error or
     /// end-of-WAL.
     pub fn enable_standby_recovery(&self, primary_conninfo: &str) -> Result<()> {
         let signal = self.config.data_dir.join("standby.signal");
@@ -208,8 +184,7 @@ impl Shadow {
             .filter_out_dir
             .to_str()
             .expect("non-utf8 filter_out_dir");
-        // Escape any embedded single-quote per PG conf-string
-        // doubling convention.
+        // PG conf-string single-quote doubling
         let escaped = primary_conninfo.replace('\'', "''");
         let body = format!(
             "\n# walshadow recovery\n\
@@ -261,24 +236,17 @@ impl Shadow {
         let out = Command::new(self.config.bin("pg_ctl"))
             .args(["-D", self.config.data_str(), "status"])
             .output()?;
-        // pg_ctl status exits 0 if running, 3 if not, 4 if no data dir
+        // pg_ctl status: 0 running, 3 stopped, 4 no data dir
         Ok(out.status.code() == Some(0))
     }
 
-    /// Optional oracle hook: load the `walshadow` extension if
-    /// it's installed system-wide on shadow's PG. Tolerates the absent
-    /// case — the daemon falls back to raw on-disk bytes for Tier 3
-    /// types that aren't in the local matrix. Returns `true` iff the
-    /// extension is now present.
-    ///
-    /// Operators install once via `(cd pgext && sudo make install)`;
-    /// this method is a thin wrapper around the idempotent
-    /// `CREATE EXTENSION IF NOT EXISTS walshadow`.
+    /// Load the `walshadow` extension if installed system-wide
+    /// (operators run `(cd pgext && sudo make install)`). `true` iff
+    /// now present; absence is tolerated, daemon falls back to raw
+    /// on-disk bytes for Tier 3 types outside the local matrix.
     pub fn try_load_oracle_extension(&self) -> Result<bool> {
-        // `IF NOT EXISTS` keeps repeat calls a no-op; absence raises
-        // `extension "walshadow" is not available`, which we
-        // catch and surface as a clean "false" rather than failing the
-        // bootstrap.
+        // Absence raises `extension "walshadow" is not available`;
+        // surface as clean false rather than failing bootstrap.
         match self.psql_one("CREATE EXTENSION IF NOT EXISTS walshadow") {
             Ok(_) => Ok(true),
             Err(ShadowError::Process { stderr, .. }) if stderr.contains("not available") => {
@@ -288,8 +256,7 @@ impl Shadow {
         }
     }
 
-    /// Feed a SQL payload to `psql -f -`. Used to apply
-    /// `pg_dump --schema-only` output during bootstrap.
+    /// Feed a SQL payload to `psql -f -` (eg `pg_dump --schema-only`).
     pub fn apply_schema_dump(&self, sql: &str) -> Result<()> {
         let mut child = Command::new(self.config.bin("psql"))
             .args([
@@ -321,8 +288,8 @@ impl Shadow {
 
     // ----- probes ----------------------------------------------------
 
-    /// Run a single SQL statement, return stdout trimmed. Uses
-    /// `-tAXq` so each row is unadorned.
+    /// Trimmed stdout of one statement. `-tAXq` keeps each row
+    /// unadorned.
     pub fn psql_one(&self, sql: &str) -> Result<String> {
         let out = Command::new(self.config.bin("psql"))
             .args([
@@ -353,9 +320,8 @@ impl Shadow {
         }
     }
 
-    /// `pg_last_wal_replay_lsn()`. `None` when the function returns
-    /// `NULL` (normal-mode cluster, or standby that has not yet
-    /// replayed anything).
+    /// `pg_last_wal_replay_lsn()`; `None` on `NULL` (normal-mode
+    /// cluster, or standby that has not replayed anything).
     pub fn last_replay_lsn(&self) -> Result<Option<u64>> {
         let s = self.psql_one("SELECT pg_last_wal_replay_lsn()")?;
         if s.is_empty() {
@@ -364,8 +330,7 @@ impl Shadow {
         Ok(Some(parse_pg_lsn(&s)?))
     }
 
-    /// Block until shadow is in recovery and replay LSN ≥ `target`,
-    /// or until `timeout` elapses. Returns the replay LSN observed.
+    /// Block until in recovery and replay LSN ≥ `target`, or `timeout`.
     pub fn wait_for_replay(&self, target: u64, timeout: Duration) -> Result<u64> {
         let start = Instant::now();
         loop {
@@ -435,9 +400,8 @@ impl Shadow {
     }
 }
 
-/// Parse PG's `pg_lsn` text form (`"XXXXXXXX/YYYYYYYY"`, hex) into a
-/// 64-bit byte offset. Returns the same value `pg_lsn::bigint` would
-/// in SQL.
+/// PG `pg_lsn` text form (`"XXXXXXXX/YYYYYYYY"` hex) to 64-bit byte
+/// offset, matching `pg_lsn::bigint` in SQL.
 pub fn parse_pg_lsn(s: &str) -> Result<u64> {
     let s = s.trim();
     let (hi, lo) = s
@@ -490,7 +454,7 @@ mod tests {
         let filter_dir = tmp.path().join("filtered");
         fs::create_dir_all(&data_dir).unwrap();
         fs::create_dir_all(&filter_dir).unwrap();
-        // Empty postgresql.conf — append() requires the file to exist.
+        // append() requires the file to exist
         fs::write(data_dir.join("postgresql.conf"), b"# base\n").unwrap();
         let cfg = ShadowConfig::new(data_dir.clone(), filter_dir);
         let shadow = Shadow::new(cfg);

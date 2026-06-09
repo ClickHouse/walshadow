@@ -52,47 +52,58 @@ Done:
   `wait_for_ack_catchup` both pass, so the coarse barrier is not regressing at
   this scale
 
-Ship-blockers remaining:
+Ship-blockers remaining: none. Both cleared — see "Status (2026-06-09)".
 
-* Pool sizes >1 have in-process e2e coverage but no live daemon coverage.
+* DONE (2026-06-09). Pool sizes >1 now have live daemon coverage.
   `tests/pipeline_parallel_e2e.rs` (DML) and `tests/pipeline_parallel_ddl_e2e.rs`
   (ALTER ADD COLUMN + TRUNCATE through `run_barrier`) drive the real
-  `PipelineConfig` fan-out at M=2/N=2. `pgbench_acceptance_ddl_intermix`, the
-  daemon-spawn live test, still hardcodes default 1/1 with no knob. Validate N
-  concurrent `AsyncClient`s under the DDL barrier in the spawned daemon too,
-  confirming out-of-order INSERTs across connections stay `_lsn`-correct
+  `PipelineConfig` fan-out at M=2/N=2 in-process; `pgbench_acceptance.rs` now
+  runs the daemon-spawn drill twice via the parametrized `run_ddl_intermix` —
+  `pgbench_acceptance_ddl_intermix` at 1/1 and
+  `pgbench_acceptance_ddl_intermix_pooled` at 2/2 (disjoint ports, run
+  concurrently). The 2/2 variant drives N concurrent `AsyncClient`s for
+  bootstrap + WAL under the DDL barrier; the end-state parity oracle confirms
+  out-of-order INSERTs across connections stay `_lsn`-correct
 * DONE (2026-06-07). Bootstrap/base-backup now routes through the shared tail
   (Option A), not the serial `Emitter`. See "Status (2026-06-07) — bootstrap
   through the shared tail" below. Externally-toasted columns still error rather
-  than ship (Blockers, refined #2, design in [TOAST.md](TOAST.md)) — fail-fast
-  preserved, now surfaced through the tail's `fatal` instead of the emitter.
+  than ship (Blockers, refined #2, design in [TOAST.md](TOAST.md)); as of
+  2026-06-09 the fail-fast is explicit at the producer (the bootstrap drain),
+  not a generic encoder rejection deep in the tail.
 
 Known gaps:
 
-* `tests/pipeline_e2e.rs`, `tests/bootstrap_direct_ch.rs` still exercise the
-  serial emitter, not `PipelineConfig`. The pooled path has live daemon-spawn
-  coverage via `pgbench_acceptance_ddl_intermix` (M=1/N=1) and in-process
-  coverage via `tests/pipeline_parallel_{e2e,ddl_e2e}.rs` (M=2/N=2, including
-  the DDL + TRUNCATE barrier)
 * Backpressure goal unmet: pump-to-worker still `mpsc::UnboundedSender`
   (`queueing_record_sink.rs`), ack events still `mpsc::unbounded_channel`
-  (`ack.rs`)
+  (`ack.rs`), bootstrap drain channel `mpsc::unbounded_channel`
+  (`pipeline/bootstrap.rs`). This is a robustness gap (unbounded buffering
+  against slow ClickHouse), not a correctness blocker at the validated pool
+  sizes — see Next step 3 and "Backpressure"
 
 Next:
 
-1. Daemon e2e with pool sizes >1; confirm out-of-order INSERTs across N
-   connections stay `_lsn`-correct through the DDL barrier
+1. DONE (2026-06-09). Daemon e2e at pool sizes >1
+   (`pgbench_acceptance_ddl_intermix_pooled`, M=2/N=2); out-of-order INSERTs
+   across N connections confirmed `_lsn`-correct through the DDL barrier by the
+   parity oracle
 2. DONE (2026-06-07). Bootstrap routes through the shared tail (Option A). See
    "Status (2026-06-07) — bootstrap through the shared tail" below. The
    serialized Tap sink events that gated `object_store` (Blockers, refined #5)
    landed earlier, so both Direct and ObjectStore route through the tail. Decode
    pool for bootstrap (parallel-decode Option B) remains gated on measurement
 3. Replace unbounded pump-to-worker + ack channels with bounded ones to close
-   the backpressure chain
-4. DDL barrier optimization, deferred now that N=1 tracks the source: make it
-   DDL-type-aware. ADD COLUMN needs only seal plus epoch bump before post-ALTER
-   rows decode, no global `wait_all_durable`. Reserve the full drain for
-   destructive DDL (DROP/RENAME column, TRUNCATE)
+   the backpressure chain (the one remaining ship-relevant item)
+
+Deferred indefinitely:
+
+* DDL-type-aware barrier optimization. Make `run_barrier` discriminate: ADD
+  COLUMN needs only seal plus epoch bump before post-ALTER rows decode, no
+  global `wait_all_durable`; reserve the full drain for destructive DDL
+  (DROP/RENAME column, TRUNCATE). Not pursued — the coarse barrier holds at the
+  validated pool sizes (the 2/2 live test passes with ADD COLUMN + CREATE INDEX
+  CONCURRENTLY mid-workload), and the cost scales with in-flight backlog, not
+  DDL frequency. Revisit only if a measured workload shows the coarse drain
+  binding throughput at higher N. See "DDL barrier" caveat below
 
 ## Status (2026-06-07) — bootstrap through the shared tail
 
@@ -139,8 +150,28 @@ Coverage:
 * `pipeline::bootstrap` unit tests — per-rfn seq counts, unmapped-skip,
   reappearing-rfn (object_store interleave) yields fresh dense seqs.
 
-Still open: TOAST fail-fast (Blockers, refined #2); parallel-decode Option B
-gated on measurement; backpressure (unbounded pump→drain channel, Next step 3).
+Still open: parallel-decode Option B gated on measurement; backpressure
+(unbounded pump→drain channel, Next step 3). TOAST is now an explicit
+producer-side fail-fast (Blockers, refined #2 — done).
+
+## Status (2026-06-09) — ship-blockers cleared
+
+Both ship-blockers from the 2026-06-07 status are resolved:
+
+* **Live daemon coverage at pool >1.** `pgbench_acceptance.rs` factors the DDL-
+  intermix drill into `run_ddl_intermix(ports, decoder_pool, inserter_pool,
+  label)` and runs it twice on disjoint ports: `pgbench_acceptance_ddl_intermix`
+  (1/1) and `pgbench_acceptance_ddl_intermix_pooled` (2/2). The 2/2 variant
+  spawns N concurrent `AsyncClient`s for both bootstrap and WAL, with ADD COLUMN
+  + CREATE INDEX CONCURRENTLY mid-workload; the end-state parity oracle (count +
+  sum + the `c` column) proves out-of-order INSERTs across connections stay
+  `_lsn`-correct through the DDL barrier. Both run green concurrently (~22s).
+* **TOAST fail-fast, surfaced cleanly.** See Blockers, refined #2 (done).
+
+Remaining work is no longer ship-blocking: backpressure (Next step 3, a
+robustness gap), parallel-decode Option B (gated on measurement), and TOAST
+assembly (separate work item, [TOAST.md](TOAST.md)). The DDL-type-aware barrier
+is deferred indefinitely.
 
 ## Current serial path
 
@@ -257,9 +288,10 @@ Keep barrier coarse. DDL is rare. Do not optimize away ordering. See
 Caveat: coarse cost scales with in-flight backlog, not DDL frequency.
 `run_barrier` freezes the single reorder task on `wait_all_durable` for the
 whole pre-DDL backlog while the source advances, against the serial path's
-surgical per-table wire close. Not a blocker at M=1/N=1 (the live test passes),
-but it grows with N and backlog. See Status next-step 4 (DDL-type-aware
-barrier).
+surgical per-table wire close. Not a blocker at the validated pool sizes (both
+the M=1/N=1 and M=2/N=2 live tests pass with ADD COLUMN + CREATE INDEX
+CONCURRENTLY mid-workload), but it grows with N and backlog. The DDL-type-aware
+optimization is deferred indefinitely (see "Deferred indefinitely" above).
 
 ## Inserter actor
 
@@ -427,7 +459,7 @@ identical either way).
    is wrong: an externally-toasted column errors the bootstrap. Latent only
    because tested fixtures keep values inline (<~2 KiB). Option A's
    no-detoast route therefore preserves a *failure*, not convergent
-   shipping; it must pick an explicit behavior:
+   shipping; the options were:
    * fail-fast (status quo, but documented and surfaced cleanly), or
    * emit NULL / a raw on-disk marker with documented convergence semantics
      (WAL re-emit then supersedes via `_lsn`), or
@@ -435,8 +467,17 @@ identical either way).
      `ToastChunks` map keyed by `(toast_relid, value_id)` and reuse the
      shared detoast.
 
-   The third is the real fix and is its own work item, independent of this
-   push-down; design in [TOAST.md](TOAST.md) (store `pg_toast_*` chunks on
+   DONE (2026-06-09): chose fail-fast, surfaced cleanly. The bootstrap drain
+   (`pipeline/bootstrap.rs::external_toast_block`) scans each *mapped* column
+   before routing and returns a precise error — relation + column + attnum —
+   when it finds a `ColumnValue::ExternalToast`. Previously the pointer flowed
+   to the encoder and tripped a generic `EmitterError::UnsupportedValue`
+   ("xact buffer should have reassembled") deep in the inserter pool, wording
+   that is meaningless for bootstrap (no xact buffer). Unit-tested by
+   `external_toast_fails_fast`.
+
+   The third option is the real fix and is its own work item, independent of
+   this push-down; design in [TOAST.md](TOAST.md) (store `pg_toast_*` chunks on
    ClickHouse).
 3. **Seq numbering continuity at handoff.** Bootstrap registers seqs
    `[0, K)`. The WAL `ReorderSink` must continue at `K`, not 0

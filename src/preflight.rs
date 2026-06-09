@@ -1,19 +1,14 @@
-//! Pre-flight validators run at daemon connect.
+//! Pre-flight validators run at daemon connect. Refuse to start when:
 //!
-//! Refuses to start when any of the following holds:
-//!
-//! - source `server_version_num` < 160_000 (minimum supported major).
-//! - shadow / source major mismatch (a same-physical-WAL standby cannot
-//!   span major versions; PG's own catalog layout changes across them).
+//! - source `server_version_num` < 160_000.
+//! - shadow/source major mismatch: a same-physical-WAL standby can't span
+//!   majors, PG's catalog layout changes across them.
 //! - source `wal_level` not `logical` ([PLAN.md §4]; physical-only WAL
-//!   omits the old-tuple bytes that UPDATE / DELETE need).
+//!   omits the old-tuple bytes UPDATE/DELETE need).
 //! - any mapped relation without `REPLICA IDENTITY FULL` ([PLAN.md
 //!   §"Pitfall #7"]; UPDATE without FULL emits only changed columns, the
-//!   decoder cannot reconstruct the new row).
-//! - `--slot` names a physical slot that does not exist on source.
-//!
-//! Each failure renders to a precise [`PreflightError`] variant; no
-//! silent-skip fall-throughs.
+//!   decoder can't reconstruct the new row).
+//! - `--slot` names a physical slot absent on source.
 
 use std::fmt;
 
@@ -22,8 +17,7 @@ use tokio_postgres::Client;
 
 use crate::ch_emitter::EmitterConfig;
 
-/// Minimum supported source major. PG <16 is unsupported; the
-/// catalog accessors assume PG-16 column layouts.
+/// Catalog accessors assume PG-16 column layouts; PG <16 unsupported.
 pub const MIN_SERVER_VERSION_NUM: i32 = 160_000;
 
 #[derive(Debug, Error)]
@@ -67,9 +61,8 @@ pub enum PreflightError {
     BadShadowVersion(String),
 }
 
-/// Aggregate of every validator finding. Daemons surface this as a
-/// single error message so operators don't fix one issue, restart, and
-/// hit the next.
+/// All validator findings surfaced at once so operators don't fix one
+/// issue, restart, and hit the next.
 #[derive(Debug)]
 pub struct PreflightReport {
     pub errors: Vec<PreflightError>,
@@ -97,9 +90,8 @@ impl fmt::Display for PreflightReport {
 
 impl std::error::Error for PreflightReport {}
 
-/// Drives every check in [`Inputs`] and returns the aggregated report.
-/// Soft errors append to `report.errors`; hard errors (tokio-postgres
-/// transport failures) short-circuit.
+/// Soft findings append to the report; hard errors (tokio-postgres
+/// transport failures) short-circuit [`run`].
 pub struct Inputs<'a> {
     pub source_version_num: i32,
     pub source_sql: &'a Client,
@@ -159,12 +151,9 @@ pub async fn run(input: Inputs<'_>) -> Result<PreflightReport, PreflightError> {
 
     if let Some(cfg) = input.ch_config {
         for key in cfg.tables.keys() {
-            // Keys are `"namespace.relname"`; pass through PG's
-            // `to_regclass(text)` resolver so the lookup honours
-            // search_path / quoting rules and returns NULL on missing
-            // relations rather than raising. Joining `pg_class` keeps
-            // the result a single row with `relreplident::text` so the
-            // binding side stays parameter-free.
+            // Keys are `"namespace.relname"`. `to_regclass(text)` honours
+            // search_path/quoting and returns NULL (not raise) on a missing
+            // relation; the pg_class join yields one row of relreplident.
             let row = input
                 .source_sql
                 .query_opt(
