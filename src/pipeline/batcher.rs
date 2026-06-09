@@ -108,7 +108,15 @@ pub struct InsertBatch {
 /// before it — otherwise the flush would seal a partial set and falsely
 /// signal "earlier data sealed", pinning the barrier's durability wait.
 pub enum BatcherMsg {
+    /// Single row (bootstrap drain). One channel hop + batcher wakeup per row.
     Row(RoutedRow),
+    /// A chunk of rows from one decode worker. Decoders coalesce a xact's
+    /// rows into chunks (see `decode::DECODE_CHUNK_ROWS`) so the per-row
+    /// channel-send + cross-thread batcher wakeup amortizes over the chunk
+    /// instead of firing per row — the dominant pipeline coordination cost
+    /// under sustained load. Rows in a chunk may carry different `seq`s; the
+    /// batcher routes each independently, so the chunk boundary is free.
+    Rows(Vec<RoutedRow>),
     /// Seal every open table and push to inserters, then reply. Used by the
     /// barrier (drain before DDL/TRUNCATE) and reachable on shutdown.
     FlushAll(oneshot::Sender<()>),
@@ -157,6 +165,12 @@ pub fn spawn(
                             break;
                         }
                     }
+                    Some(BatcherMsg::Rows(rows)) => {
+                        if let Err(e) = handle_rows(&mut tables, &cfg, &out, alloc, epoch, rows).await {
+                            fatal.set(format!("batcher: {e}"));
+                            break;
+                        }
+                    }
                     Some(BatcherMsg::FlushAll(reply)) => {
                         if let Err(e) = flush_all(&mut tables, &out, &mut epoch).await {
                             fatal.set(format!("batcher barrier flush: {e}"));
@@ -181,6 +195,23 @@ pub fn spawn(
             }
         }
     })
+}
+
+/// Process a decoder's row chunk in order. Per-row budget/deadline trips
+/// behave exactly as the single-row path; the chunk only amortizes the
+/// channel hop, not the coalescing.
+async fn handle_rows(
+    tables: &mut HashMap<String, Table>,
+    cfg: &BatcherConfig,
+    out: &mpmc::Sender<InsertBatch>,
+    alloc: Allocator,
+    epoch: u64,
+    rows: Vec<RoutedRow>,
+) -> Result<(), String> {
+    for row in rows {
+        handle_row(tables, cfg, out, alloc, epoch, row).await?;
+    }
+    Ok(())
 }
 
 async fn handle_row(
@@ -395,6 +426,51 @@ mod tests {
         }
         // Drop the sender → final flush + graceful exit, closing the batch
         // channel once drained.
+        drop(msg_tx);
+
+        let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);
+        while let Some(b) = batches_rx.recv().await {
+            total += b.n_rows as u64;
+            for (seq, n) in b.per_seq {
+                match seq {
+                    0 => s0 += n,
+                    1 => s1 += n,
+                    other => panic!("unexpected seq {other}"),
+                }
+            }
+        }
+        handle.await.expect("batcher task");
+        assert_eq!(total, 5, "all rows sealed exactly once");
+        assert_eq!(s0, 3, "seq 0 rows");
+        assert_eq!(s1, 2, "seq 1 rows");
+        assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
+    }
+
+    /// A single `Rows` chunk carrying mixed seqs trips the row budget
+    /// mid-chunk and still reconciles per-seq counts — same outcome as the
+    /// per-row path, proving the chunk boundary is purely a channel-hop
+    /// amortization (the point of `DECODE_CHUNK_ROWS`).
+    #[tokio::test]
+    async fn rows_chunk_trips_budget_and_tracks_per_seq() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (batches_tx, batches_rx) = mpmc::channel(64);
+        let fatal = Fatal::new();
+        let handle = spawn(
+            msg_rx,
+            batches_tx,
+            BatcherConfig {
+                row_budget: 2,
+                byte_budget: 1 << 30,
+                flush_timeout: Duration::from_secs(3600),
+            },
+            Allocator::stdlib(),
+            fatal.clone(),
+        );
+        let chunk = vec![row(0, 0), row(0, 1), row(0, 2), row(1, 0), row(1, 1)];
+        msg_tx
+            .send(BatcherMsg::Rows(chunk))
+            .await
+            .expect("send chunk");
         drop(msg_tx);
 
         let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);

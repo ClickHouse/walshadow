@@ -14,6 +14,7 @@ here as they surface; promote into `plans/` when they land
 * [coverage100.md](coverage100.md) — drive `cargo llvm-cov` line coverage toward 100%: tiered work list (pure units → fixtures → live e2e → hard tail)
 * [FUZZ.md](FUZZ.md) — continuous coverage-guided fuzzing (cargo-fuzz/libFuzzer) across wal-rs + walshadow + clickhouse-c-rs: tiered targets, round-trip/differential oracles, C-boundary ASan, unattended-VM supervisor
 * [parallel_decode_and_insert.md](parallel_decode_and_insert.md) — M decoders feeding N inserters against CH Cloud SMT; coalescing seam, cumulative-ack watermark, substrate-agnostic inserter for `clickhouse-c-rs-async`
+* [dependencies.md](dependencies.md) — crates.io replacement candidates for generic object storage, MPMC, retry, throttling, and metrics code
 * [clickhouse_async/INDEX.md](clickhouse_async/INDEX.md) — native sans-io async in clickhouse-c (additive `clickhouse-async.h` + would-block/rewind core + thread-free Rust client); phased, with column-resumption design open
 * [risks.md](risks.md) — measurement-deferred risks and open questions
 * [parked.md](parked.md) — small operational polish + cross-major fixtures + skipped-test drive

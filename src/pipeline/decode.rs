@@ -49,8 +49,10 @@ pub struct DecodeCtx {
     pub catalog: Arc<Mutex<ShadowCatalog>>,
     pub mapping: MappingHandle,
     pub oracle: Option<Arc<Oracle>>,
-    /// Rows go to the batcher on the shared FIFO `BatcherMsg` channel (so a
-    /// barrier `FlushAll` can't overtake them).
+    /// Rows go to the batcher in chunks (capped by [`DECODE_CHUNK_ROWS`] /
+    /// [`DECODE_CHUNK_BYTES`]) on the shared FIFO `BatcherMsg` channel (so a
+    /// barrier `FlushAll` can't overtake them; a whole chunk enqueues as one
+    /// ordered item).
     pub msg_tx: mpsc::Sender<BatcherMsg>,
     /// Shared emitter counters. Decode bumps `foreign_db_rows_skipped` and
     /// `unsupported_relations` on the skip arms so the parallel path keeps
@@ -58,14 +60,41 @@ pub struct DecodeCtx {
     pub stats: Arc<EmitterStats>,
 }
 
+/// Rows a decode worker coalesces before one [`BatcherMsg::Rows`] send.
+pub const DECODE_CHUNK_ROWS: usize = 1024;
+
+/// Decoded payload bytes a worker coalesces before one [`BatcherMsg::Rows`]
+/// send — the second half of the dual trigger with [`DECODE_CHUNK_ROWS`].
+/// Bounds the buffer (and the channel item) for fat detoasted rows that
+/// would otherwise pin many MiB before the row cap fires; comfortably above
+/// the ~100 KiB a full row-cap chunk of ordinary rows reaches, so
+/// steady-state coalescing is unchanged.
+pub const DECODE_CHUNK_BYTES: usize = 4 << 20;
+
+/// Send one coalesced chunk to the batcher. `Err` means the batcher channel
+/// closed (the tail tripped fatal); the caller surfaces it.
+async fn route_chunk(
+    msg_tx: &mpsc::Sender<BatcherMsg>,
+    rows: Vec<RoutedRow>,
+) -> Result<(), String> {
+    msg_tx
+        .send(BatcherMsg::Rows(rows))
+        .await
+        .map_err(|_| "batcher channel closed".to_string())
+}
+
 /// Detoast, resolve, and route every heap of one xact to the batcher.
 /// Returns the number of rows routed (= rows the batcher will encode and
 /// inserters will ack — the `R` the collector compares against). Used by
 /// both the decode workers and the barrier's data segments.
 ///
-/// Foreign-database and unmapped relations are skipped (bumping
-/// `foreign_db_rows_skipped` / `unsupported_relations`, as in the serial
-/// emitter); any other catalog error poisons the stream.
+/// Rows are sent in chunks capped by [`DECODE_CHUNK_ROWS`] or
+/// [`DECODE_CHUNK_BYTES`] (whichever trips first); the buffer is flushed
+/// before returning so every routed row is on the channel by the time the
+/// caller reports `Placed` (the watermark invariant). Foreign-database and
+/// unmapped relations are skipped (bumping `foreign_db_rows_skipped` /
+/// `unsupported_relations`, as in the serial emitter); any other catalog
+/// error poisons the stream.
 pub async fn decode_and_route(
     ctx: &DecodeCtx,
     seq: u64,
@@ -75,6 +104,8 @@ pub async fn decode_and_route(
     chunks: Arc<ToastChunks>,
 ) -> Result<u64, String> {
     let mut routed = 0u64;
+    let mut buf: Vec<RoutedRow> = Vec::new();
+    let mut buf_bytes = 0usize;
     for mut heap in heaps {
         detoast_heap(&mut heap, &chunks, &ctx.catalog, true)
             .await
@@ -117,16 +148,21 @@ pub async fn decode_and_route(
                 maybe_validate_tuple(oracle, &t.columns).await;
             }
         }
-        ctx.msg_tx
-            .send(BatcherMsg::Row(RoutedRow {
-                seq,
-                rel,
-                mapping,
-                committed,
-            }))
-            .await
-            .map_err(|_| "batcher channel closed".to_string())?;
+        buf_bytes += committed.decoded.approx_bytes();
+        buf.push(RoutedRow {
+            seq,
+            rel,
+            mapping,
+            committed,
+        });
         routed += 1;
+        if buf.len() >= DECODE_CHUNK_ROWS || buf_bytes >= DECODE_CHUNK_BYTES {
+            route_chunk(&ctx.msg_tx, std::mem::take(&mut buf)).await?;
+            buf_bytes = 0;
+        }
+    }
+    if !buf.is_empty() {
+        route_chunk(&ctx.msg_tx, buf).await?;
     }
     Ok(routed)
 }
