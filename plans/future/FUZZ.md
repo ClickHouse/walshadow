@@ -201,7 +201,8 @@ the C TU or it sees nothing.
 - **`ch_type_parse`** (also Tier A) — `TypeAst::parse` bottoms out in
   `chc_type_parse`, the type-string grammar is a classic fuzzing win
 - **`chc_async_submit`** — raw wire bytes into the async client, exercises the
-  sans-io decode core (see [clickhouse_async/INDEX.md](clickhouse_async/INDEX.md))
+  sans-io decode core (gated on the clickhouse-c sans-io async work, whose
+  design doc is not in this tree; activate when `clickhouse-async.h` ships)
 
 C-side instrumentation: cargo-fuzz sets `RUSTFLAGS` for sanitizer + sancov on
 Rust, but `cc`-compiled `wrapper.c` and the vendored library are invisible

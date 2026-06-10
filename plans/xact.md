@@ -164,11 +164,11 @@ but v1 propagates as `SpillError::Format` because the xact is
 unrecoverable anyway
 
 `HeapOp` encodes as `0=Insert, 1=Update, 2=HotUpdate, 3=Delete,
-4=Truncate`. **`HeapOp::Truncate` tag-4 was added without bumping
-`SPILL_VERSION`** — academic because resume contract wipes spill dir on
-startup ([`SpillStore::clear`]) and cursor file guarantees on-disk
-state is always "drained into CH" or "replayable from `decoder_lsn`".
-Documented in [future/parked.md](future/parked.md) for a future bump
+4=Truncate`. `SPILL_VERSION = 2` covers `Truncate` tag-4 (initially
+shipped without a bump, fixed since). Version mismatch is near-academic
+anyway: resume contract wipes spill dir on startup
+([`SpillStore::clear`]) and cursor file guarantees on-disk state is
+always "drained into CH" or "replayable from `decoder_lsn`"
 
 `spill_backend` config knob was reserved at design time for
 CH-as-scratch v2; the enum + config surface were NOT shipped in v1.
@@ -183,6 +183,14 @@ ClickHouse-as-scratch path was rejected on three grounds:
 operator wanting this gets a fresh config-surface decision
 
 ## Drain shape
+
+Two consumers exist for the commit drain: the parallel pipeline's
+reorder coordinator (`pipeline/reorder.rs`, with `--ch-config` —
+dispatches `DrainedXact` to the decode pool, durability tracked by the
+ack collector; see [emitter.md](emitter.md)) and the legacy serial
+`XactRecordSink` → `TupleObserver` path (metrics-only runs, inproc
+harness). The observer-ack semantics below describe the serial path;
+the pipeline replaces them with the contiguous-done watermark
 
 `drain_lsn` advances BEFORE `on_xact_end` ack so an observer failure
 leaves `drain_lsn > emitter_ack_lsn`, exactly the gap cursor file
@@ -219,10 +227,13 @@ applicator's `ALTER` on CH before dependent INSERT encodes against
 post-DDL shape
 
 Drain implementation: collect catalog event positions as
-`(heap_index_event_sorts_before, SchemaEvent)`; main dispatch loop
-flushes pending events via `observer.on_schema_event(&ev)` before each
+`(heap_index_event_sorts_before, SchemaEvent)` —
+`DrainedXact.ordered_events`. Serial path flushes pending events via
+`observer.on_schema_event(&ev)` before each
 `observer.on_tuple(&committed)` whose index it sorts in front of;
-trailing events (no heap after) flush at tail
+trailing events (no heap after) flush at tail. Pipeline path walks the
+same positions as barrier segments (fence + apply per event — see
+[emitter.md](emitter.md))
 
 Cross-link: [shadow.md](shadow.md) `SchemaEvent` channel, fed by
 `ShadowCatalog` on Added / Changed / Dropped catalog state
@@ -249,11 +260,10 @@ inline today — the gap is only cross-restart
 
 - [decoder.md](decoder.md) — `DecodedHeap` producer + `BufferingDecoderSink`
 - [source.md](source.md) — `Record` stream entry, classifier
-- [emitter.md](emitter.md) — `TupleObserver` impl consuming commit drain
+- [emitter.md](emitter.md) — pipeline reorder coordinator consuming
+  commit drain (serial `TupleObserver` path on metrics-only runs)
 - [shadow.md](shadow.md) — `ShadowCatalog`, `SchemaEvent` channel
 - [ops.md](ops.md) — `--spill-dir`, cursor file `(drain_lsn,
   emitter_ack_lsn)`
 - [future/two_phase_commit.md](future/two_phase_commit.md) — PREPARE ↔
   COMMIT PREPARED across restart
-- [future/parked.md](future/parked.md) — `SPILL_VERSION` bump for
-  HeapOp::Truncate tag-4

@@ -38,7 +38,8 @@ order:
    `psql -f -`; `BASE_BACKUP` greenfield copies source's catalog files
    directly. `apply_schema_dump` takes `&str` payload, not source
    connection — outbound source connection management lives in daemon
-4. `enable_standby_recovery(primary_conninfo)` — drops `standby.signal`,
+4. `enable_standby_recovery(primary_conninfo)` — writes empty
+   `standby.signal`,
    appends `primary_conninfo = '<walsender>'` + `restore_command =
    'cp <filter_dir>/%f %p'` + `recovery_target_timeline = 'latest'`.
    Standby (not recovery) signal: continuous-feed topology requires
@@ -290,7 +291,7 @@ landing first
 - [decoder.md](decoder.md) — `relation_at` consumer, heap-tuple decode
   against `RelDescriptor`
 - [emitter.md](emitter.md) — `SchemaEvent` channel consumer
-  (`ch_ddl::DdlApplicator`), `await_ready` ordering gate
+  (`ch_ddl::DdlApplicator`), barrier-fence ordering
 - [source.md](source.md) — walsender walshadow consumes from source;
   symmetry with walsender walshadow exposes to shadow
 - [future/risks.md](future/risks.md) — coarse-fire generation

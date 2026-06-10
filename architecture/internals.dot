@@ -64,20 +64,22 @@ digraph internals {
     catgate [label="BufferingDecoderSink\nrelation_at(rfn, lsn)\nwait_for_replay(at_lsn)", fillcolor="#4D4128"];
     decoder [label="heap_decoder\nINSERT / DELETE /\nUPDATE / HOT / TRUNCATE\nTier-1 fixed-width\nTier-2 length-prefixed\nReplica-identity matrix", fillcolor="#4D4128"];
     xactbuf [label="XactBuffer\nper-xid hashmap +\nTOAST reassembly +\nSubxactTracker\nbudget = work_mem", fillcolor="#4D4128"];
-    drain   [label="XactRecordSink\ncommit drain\n(spilled first, mem second,\n WAL-order replay)", fillcolor="#4D4128"];
+    drain   [label="ReorderSink (pipeline/reorder.rs)\ncommit drain, dense seq per xact\n(spilled first, mem second,\n WAL-order replay)\nDDL/TRUNCATE = barrier:\nplaced → FlushAll → durable → apply", fillcolor="#4D4128"];
     catgate -> decoder -> xactbuf -> drain;
   }
   qwrk -> catgate [lhead=cluster_decode];
 
-  // ════════ ⑥ CH emitter — row path ════════
+  // ════════ ⑥ CH pipeline tail — decode pool → batcher → inserter pool ════════
   subgraph cluster_ch {
-    label="⑥ CH emitter — buffer across xacts, atomic-seal INSERT"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    tableenc [label="TableEncoder\nper table; buffer across xacts\nrow/byte budget", fillcolor="#5D4628"];
-    block    [label="BlockBuilder\nNative columns +\n_lsn / _xid / _op / _commit_ts", fillcolor="#5D4628"];
-    chwire   [label="clickhouse-c-rs\nflush_table: open_wire send_query\nsend_data(Some) → send_data(None)\nEndOfStream → clear buffer\nbudget / deadline seal", fillcolor="#5D4628"];
-    tableenc -> block -> chwire;
+    label="⑥ CH pipeline tail — decode ×M → batcher → inserter ×N (pipeline/)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    cdecode  [label="decode pool ×M\ndetoast + resolve_at_pooled\n+ mapping + oracle\nchunk 1024 rows / 4 MiB", fillcolor="#5D4628"];
+    tableenc [label="InsertBatcher\nTableEncoder per table\nNative columns +\n_lsn / _xid / _commit_ts / _is_deleted\nrow/byte budget + deadline seal", fillcolor="#5D4628"];
+    chwire   [label="inserter pool ×N\nBlockBuilder over sealed batch\none complete INSERT each\nsend_with_retry + reconnect", fillcolor="#5D4628"];
+    ackcol   [label="ack collector\ncontiguous-done watermark\n→ emitter_ack_lsn", fillcolor="#4D3A28", shape=note];
+    cdecode -> tableenc -> chwire;
+    chwire -> ackcol [style=dotted, color="#b380b0", label="Acked after\nEndOfStream"];
   }
-  drain -> tableenc [color="#BF8C5F", penwidth=2];
+  drain -> cdecode [color="#BF8C5F", penwidth=2, label="DecodeJob"];
 
   // ════════ ⑦ ShadowCatalog cache + schema-event channel ════════
   subgraph cluster_catalog {
@@ -99,7 +101,7 @@ digraph internals {
     bridge -> ddlapp [style=dashed];
   }
   evtx   -> ddlapp [style=dashed, color="#CBA85E", label="drain at commit"];
-  ddlapp -> chwire [style=dashed, color="#BF8C5F", constraint=false, label="DDL SQL\n(off hot path,\n own CH TCP)"];
+  ddlapp -> ch [style=dashed, color="#BF8C5F", constraint=false, label="DDL SQL\n(inside reorder barrier,\n own CH connection)"];
 
   catgate -> lru   [style=dashed, color="#CBA85E", constraint=false, label="lookup"];
   track   -> inval [style=dashed, color="#CBA85E"];
@@ -121,7 +123,7 @@ digraph internals {
     label="⑨ on-disk caches"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     outdir [label="out/<seg>\n16 MiB filtered\n+ manifest.json", fillcolor="#4D3850", shape=note];
     spill  [label="{spill}/xid-<xid>-<lsn>.bin\nappend-only\n[tag u8 | len u32 | body]", fillcolor="#4D3850", shape=note];
-    cursor [label="{spill}/cursor.bin\n56B atomic rename\n5 LSN fields + CRC32C", fillcolor="#4D3850", shape=note];
+    cursor [label="{spill}/cursor.bin\n64 B atomic rename\n6 LSN fields + CRC32C", fillcolor="#4D3850", shape=note];
   }
 
   // ════════ External edges ════════
@@ -132,7 +134,7 @@ digraph internals {
   segsink -> outdir;
   outdir  -> shd    [style=dashed, color="#6E6963", label="restore_command"];
   xactbuf -> spill  [style=dashed, label="evict largest xact"];
-  drain   -> cursor [style=dotted, color="#b380b0", label="LSN bundle"];
+  ackcol  -> cursor [style=dotted, color="#b380b0", label="emitter_ack_lsn"];
   chwire  -> ch     [color="#BF8C5F", penwidth=2];
 
   // ════════ Anchor sinks at the bottom rank ════════
@@ -148,7 +150,7 @@ digraph internals {
       <TR><TD BGCOLOR="#4D4128"></TD><TD>walshadow decoder + xact buffer</TD></TR>
       <TR><TD BGCOLOR="#4D4D28"></TD><TD>walshadow ShadowCatalog + schema-event tx</TD></TR>
       <TR><TD BGCOLOR="#5D3F40"></TD><TD>walshadow walsender server</TD></TR>
-      <TR><TD BGCOLOR="#5D4628"></TD><TD>walshadow CH emitter + DdlApplicator</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>walshadow CH pipeline tail + DdlApplicator</TD></TR>
       <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact</TD></TR>
       <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>

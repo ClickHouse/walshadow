@@ -13,7 +13,7 @@ digraph timeline_restart {
     style="rounded,filled"; color="#A1A9CC"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     a0 [label="① SIGTERM", fillcolor="#403a36"];
-    a1 [label="② drain in-flight xact\non_xact_end → ack", fillcolor="#4D3A28"];
+    a1 [label="② drain in-flight work\npipeline join: batcher final flush →\ninserters EndOfStream → ack", fillcolor="#4D3A28"];
     a2 [label="③ DirSegmentSink::on_partial_segment\n<seg>.partial", fillcolor="#4D3340"];
     a3 [label="④ cursor::write final state\n(emitter_ack_lsn, drain_lsn, …)", fillcolor="#4D3A28"];
     a4 [label="⑤ process exit", fillcolor="#403a36"];
@@ -68,7 +68,7 @@ digraph timeline_restart {
   // ═════ cursor.bin reference table ═════
   cursor_table [shape=plaintext, label=<
     <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">
-      <TR><TD COLSPAN="4" BGCOLOR="#4D3850"><B>cursor.bin — 5 LSN fields</B></TD></TR>
+      <TR><TD COLSPAN="4" BGCOLOR="#4D3850"><B>cursor.bin — 6 LSN fields (schema v2)</B></TD></TR>
       <TR BGCOLOR="#34302c">
         <TD><B>field</B></TD><TD><B>writer</B></TD><TD><B>role on restart</B></TD><TD><B>role in slot advance</B></TD>
       </TR>
@@ -76,7 +76,8 @@ digraph timeline_restart {
       <TR><TD>filter_durable_lsn</TD><TD>DirSegmentSink::on_segment</TD><TD>archive coverage</TD><TD>flush LSN</TD></TR>
       <TR><TD>shadow_replay_lsn</TD><TD>retention_sweeper</TD><TD>bounds segment trim</TD><TD>caps apply LSN</TD></TR>
       <TR><TD>drain_lsn</TD><TD>XactBuffer::commit</TD><TD>observational</TD><TD>—</TD></TR>
-      <TR><TD><B>emitter_ack_lsn</B></TD><TD>XactBuffer::commit (post-Ok)</TD><TD><B>resume_lsn source</B></TD><TD><B>caps apply LSN</B></TD></TR>
+      <TR><TD><B>emitter_ack_lsn</B></TD><TD>pipeline ack collector (contiguous-done)</TD><TD><B>resume_lsn source</B></TD><TD><B>caps apply LSN</B></TD></TR>
+      <TR><TD>shadow_flush_lsn</TD><TD>walsender rx 'r' aggregate</TD><TD>streaming-fed shadow resumes here</TD><TD>—</TD></TR>
     </TABLE>
   >];
   a9 -> cursor_table [style=invis];

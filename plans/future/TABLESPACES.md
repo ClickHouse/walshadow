@@ -19,10 +19,10 @@ walshadow keys every relation on `(db_node, rel_node)` and discards
 
 - catalog whitelist: `CatalogTracker.nodes: HashSet<(u32,u32)>`
   (`src/catalog_tracker.rs:62`)
-- resolver: `CatalogMapResolver::relation_at` calls
-  `get(rfn.db_node, rfn.rel_node)` (`src/relation_resolver.rs:74`);
+- resolver: bootstrap drain calls
+  `CatalogMap::get(rfn.db_node, rfn.rel_node)`;
   `CatalogMap.by_filenode` is `HashMap<(Oid,Oid), _>`
-  (`src/backup_page_walk.rs:96`)
+  (`src/backup_page_walk.rs`)
 - the design comment spelling out why lives at
   `src/shadow_catalog.rs:939`: *relfilenode is unique per database
   regardless of tablespace*

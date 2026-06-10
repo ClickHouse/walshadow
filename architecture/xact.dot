@@ -71,9 +71,9 @@ digraph xact {
 
     merge [label="pull (top + subxids) from inflight\n  unknown xid → commits_unknown_xid;\n  on_xact_end fires anyway (ack ceiling)\nper xid: SpillReader → unlink + append in_mem\n  → VecDeque ASC by source_lsn\nk-way merge (k = 1+nsub, typically ≤ 4)\n  linear-scan head pick\n  TIE: catalog event BEFORE tuple", fillcolor="#4D4128"];
 
-    detoast [label="detoast_heap\nreassemble (toast_relid, value_id)\n  → BTreeMap<chunk_seq, bytes>\npglz / lz4 inline\nlazy ShadowCatalog::relation_at", fillcolor="#4D4128"];
+    detoast [label="detoast_heap\nreassemble (toast_relid, value_id)\n  → BTreeMap<chunk_seq, bytes>\npglz / lz4 inline\nlazy ShadowCatalog::relation_at\n(pipeline runs this in the decode pool)", fillcolor="#4D4128"];
 
-    dispatch [label="dispatch loop\non_schema_event(ev)  // pre-dependent heap\non_tuple(CommittedTuple{decoded, ts, lsn})\non_xact_end(commit_lsn) → ack_lsn\nsubxact_tracker.forget_tree(top)", fillcolor="#4D4128"];
+    dispatch [label="DrainedXact\n{heaps, chunks, ordered_events}\ncatalog event sorts BEFORE tuple\nsubxact_tracker.forget_tree(top)", fillcolor="#4D4128"];
 
     merge -> detoast -> dispatch;
   }
@@ -81,9 +81,9 @@ digraph xact {
   subt   -> merge [label="(top + subxids)\nauthoritative on COMMIT", style=dashed];
   spill  -> merge [color="#6E6963", style=dashed, label="SpillReader::next\nthen unlink"];
 
-  // ════════ Rank below drain: observer (CH emitter) ════════
-  observer [label="TupleObserver (CH emitter)\non_tuple → BlockBuilder\non_xact_end → durable ack_lsn", fillcolor="#5D4628"];
-  dispatch -> observer [color="#BF8C5F", penwidth=2, label="on_schema_event /\non_tuple / on_xact_end"];
+  // ════════ Rank below drain: consumer (pipeline tail / serial observer) ════════
+  observer [label="consumer\npipeline (--ch-config): ReorderSink seq\n→ decode ×M → batcher → inserter ×N\n→ ack collector watermark\nserial (metrics-only): TupleObserver\non_tuple / on_xact_end", fillcolor="#5D4628"];
+  dispatch -> observer [color="#BF8C5F", penwidth=2, label="DecodeJob /\non_tuple stream"];
 
   // ════════ Bottom: cursor (durability fan-in) ════════
   cursor [label="cursor.bin\ndrain_lsn      = max commit_lsn  (advances FIRST)\nemitter_ack_lsn = max ack_lsn   (lags drain_lsn)", fillcolor="#4D3850", shape=note];
@@ -100,7 +100,7 @@ digraph xact {
       <TR><TD BGCOLOR="#4D3A28"></TD><TD>eviction policy (sync, after absorb)</TD></TR>
       <TR><TD BGCOLOR="#4D4128"></TD><TD>XactBuffer / decoder / drain</TD></TR>
       <TR><TD BGCOLOR="#4D4D28"></TD><TD>ShadowCatalog schema_event_tx</TD></TR>
-      <TR><TD BGCOLOR="#5D4628"></TD><TD>downstream CH emitter (observer)</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>downstream consumer (pipeline tail / observer)</TD></TR>
       <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact (spill / cursor)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
       <TR><TD><FONT COLOR="#c1a78e"><B>━━</B></FONT></TD><TD>buffer-internal control / data</TD></TR>

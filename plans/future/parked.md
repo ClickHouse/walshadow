@@ -5,19 +5,6 @@ allocation-audit pass. One-line per item
 
 ## v1.0 operational polish
 
-* **Bootstrap-autospawn-shadow port override.**
-  `--bootstrap-autospawn-shadow` doesn't rewrite shadow PG's `port` /
-  `unix_socket_directories` / `listen_addresses` into the
-  basebackup'd `postgresql.conf`; autospawn'd shadow collides with
-  source's port. Fix: write three keys into cloned data dir's
-  `postgresql.auto.conf` after basebackup completes. Tests today
-  pre-seed via source's `postgresql.auto.conf` — operator hits same
-  collision without the workaround
-* **Spill format version bump for HeapOp::Truncate tag-4.**
-  `HeapOp::Truncate` got tag `4` in spill encoder without bumping
-  format version. Resume contract per
-  [`src/spill.rs`](../src/spill.rs) is "wipe on startup" so bump is
-  academic, but schema field should rev to v2 for honesty
 * **Deduplicate `ChServer` fixture across `tests/pipeline_e2e.rs` +
   tests/common.** Two callers using one vendored ChServer is fine;
   third caller lifts to shared. Already lifted `bootstrap_ch_fixture`

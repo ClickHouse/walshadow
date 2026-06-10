@@ -5,7 +5,7 @@ owned by walshadow's PG extension. Config rows are written via SQL by
 the same DBA who owns source schema, replicated through the WAL
 stream walshadow's daemon already decodes, and applied atomically at
 each row's commit LSN. Post-config xacts route against the
-post-config shape under the same `await_ready` gate the catalog
+post-config shape under the same barrier fence the catalog
 applicator uses for DDL. TOML stays authoritative for bootstrap
 (connection params) and as the only config surface when WAL processing
 is blocked or the overlay table is absent
@@ -144,8 +144,9 @@ non-empty table, daemon allocates a per-table backfiller task:
    the same projection + target_type stack that WAL-driven rows use
    (single code path, single set of bugs), buffer in spill dir if
    memory pressure, INSERT to CH target under same SETTINGS overlay
-3. **Gate streaming on backfill LSN.** Per-rfn `await_ready` gate
-   set to `Backfilling{snapshot_lsn: N}`. Heap WAL writes for that
+3. **Gate streaming on backfill LSN.** Per-rfn gate (new machinery;
+   today's barrier fence is global) set to
+   `Backfilling{snapshot_lsn: N}`. Heap WAL writes for that
    rfn at LSN ≥ N queue in `XactBuffer` but do NOT drain to CH
    until backfill completes. WAL writes at LSN < N are discarded
    (already in COPY output)
@@ -289,7 +290,7 @@ across config tables:
 
 Shape-changing keys (`target_type`, `exclude`, `engine`, `order_by`)
 bump the catalog generation counter for the affected rfn, so the
-existing `await_ready` gate flushes in-flight rows then rebuilds
+existing barrier fence flushes in-flight rows then rebuilds
 `TablePlan`. Non-shape keys republish through `watch::Receiver` and
 take effect on the next subscriber-side snapshot read with no rfn
 drain. Reroutes that can't be done safely mid-stream (e.g. `target`
@@ -321,11 +322,11 @@ metric, not silently applied
 
 ## Open questions
 
-- **Config row LSN attribution.** `await_ready(rfn, generation)` keys
-  on `(rfn, generation)`. Config flip changing
-  `column_mapping.target_type` for `public.orders` needs to drain
-  through same gate. Cleanest: bump catalog generation counter for
-  affected rfns on config apply, so emitter's gate flushes and
+- **Config row LSN attribution.** Today's barrier fence is global,
+  not keyed; a per-`(rfn, generation)` gate is new machinery. Config
+  flip changing `column_mapping.target_type` for `public.orders`
+  needs to drain through same gate. Cleanest: bump catalog generation
+  counter for affected rfns on config apply, so the fence flushes and
   rebuilds `TablePlan`. One fake-invalidate per config event
   mentioning a relation, acceptable since config events are rare.
   Same gate applies to `exclude` flip — projection shape change

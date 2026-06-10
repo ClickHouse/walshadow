@@ -80,26 +80,27 @@ digraph timeline_streaming {
   qwrk -> gate5 [lhead=cluster_p5];
   recv4 -> gate5 [label="apply_lsn ≥ X\n(unblocks gate)", style=dashed, color="#BD8183"];
 
-  // ═════ ⑥ commit drain → CH (atomic-seal INSERT) ═════
+  // ═════ ⑥ commit drain → CH (parallel pipeline) ═════
   subgraph cluster_p6 {
-    label="⑥ XLOG_XACT_COMMIT  → drain → CH (atomic-seal INSERT)";
+    label="⑥ XLOG_XACT_COMMIT  → reorder → decode → batcher → inserter (pipeline)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     cmt6   [label="XLOG_XACT_COMMIT\nLSN = X'", fillcolor="#3D3D54"];
-    drain6 [label="XactRecordSink::on_record\ndrain spill + memory\nin WAL order", fillcolor="#4D4128"];
-    enc6   [label="TableEncoder::append_row\n_lsn / _xid / _op / _commit_ts", fillcolor="#4D4128"];
-    buf6   [label="buffer across xacts\nin TableEncoder\nNO open wire\npending_max ← X'", fillcolor="#4D4128", shape=note];
-    seal6  [label="seal trigger → flush_table\nopen_wire: send_query INSERT…\nsend_data(Some(block))", fillcolor="#4D4128"];
-    close6 [label="send_data(None) → EndOfStream\nclear buffer (post-ack)\nemitter_ack_lsn := X'", fillcolor="#4D4128"];
+    drain6 [label="ReorderSink::on_record\ndrain spill + memory in WAL order\nassign dense seq, Register(seq, X')", fillcolor="#4D4128"];
+    dec6   [label="decode worker (×M pool)\ndetoast + resolve + mapping\nroute row chunks; Placed(seq, rows)", fillcolor="#4D4128"];
+    enc6   [label="InsertBatcher\nTableEncoder::append_row\n_lsn / _xid / _commit_ts / _is_deleted\nbuffer across xacts", fillcolor="#4D4128"];
+    seal6  [label="seal InsertBatch\nbudget / per-table deadline\n(owned slabs + per_seq)", fillcolor="#4D4128"];
+    close6 [label="inserter (×N pool)\none complete INSERT\nsend_query → send_data → EndOfStream\nAcked(per_seq) after drain", fillcolor="#4D4128"];
+    ack6   [label="ack collector\nseq done ⇔ placed == acked\ncontiguous-done →\nemitter_ack_lsn := X'", fillcolor="#4D3A28", shape=note];
     ch6    [label="ReplacingMergeTree(_lsn)\nmerged in CH", fillcolor="#4D4128"];
 
     cmt6 -> drain6;
-    drain6 -> enc6;
-    enc6 -> buf6;
-    buf6 -> seal6 [style=dashed, label="budget / deadline"];
+    drain6 -> dec6 [label="DecodeJob"];
+    dec6 -> enc6;
+    enc6 -> seal6 [style=dashed, label="budget / deadline"];
     seal6 -> close6;
-    seal6 -> ch6 [label="Native block", color="#BF8C5F"];
-    close6 -> ch6 [style=dashed];
+    close6 -> ch6 [label="Native block", color="#BF8C5F"];
+    close6 -> ack6 [style=dotted, color="#b380b0"];
   }
   buf5 -> cmt6 [label="next record", style=dashed];
 
@@ -119,7 +120,7 @@ digraph timeline_streaming {
     cur7 -> slot7 [color="#B58B86", style=dashed];
   }
   fseg -> seg7 [label="16 MiB boundary", style=dashed, lhead=cluster_p7];
-  sndn6 -> cur7 [style=dotted, color="#b380b0", label="emitter_ack_lsn"];
+  ack6 -> cur7 [style=dotted, color="#b380b0", label="emitter_ack_lsn"];
 
   // ═════ Legend + budget table ═════
   legend [shape=plaintext, label=<
@@ -141,7 +142,7 @@ digraph timeline_streaming {
       <TR><TD>④ shadow apply</TD><TD>ms — walsender wire (independent of ⑤)</TD></TR>
       <TR><TD>④' queue hand-off</TD><TD>~ns enqueue, batch_size=64</TD></TR>
       <TR><TD>⑤ gate clear</TD><TD>ms — driven by ④ apply_lsn</TD></TR>
-      <TR><TD>⑥ CH block send</TD><TD>rows buffered across xacts; seal complete INSERT on budget/deadline</TD></TR>
+      <TR><TD>⑥ CH pipeline</TD><TD>rows buffered across xacts; budget/deadline seals one complete INSERT per batch; N INSERTs in flight; ack on contiguous-done</TD></TR>
       <TR><TD>⑦ segment + cursor</TD><TD>seconds — async, off hot path</TD></TR>
     </TABLE>
   >];

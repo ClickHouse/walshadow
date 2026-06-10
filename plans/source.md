@@ -203,16 +203,15 @@ returns parked error, daemon exits cleanly with real root cause rather
 than hanging
 
 Worker uses `tokio::time::timeout(idle_interval, rx.recv())`. On timeout
-calls `inner.on_idle()` — CH emitter's deadline seal fires there without
-fresh records; the returned durable LSN folds into `emitter_ack_lsn` via
-`note_idle_durable`. Channel close fires `inner.on_close()` for one last
-flush. `on_idle_advance(lsn)` runs after every batch carrying max
-`source_lsn`; xact buffer uses it to advance `emitter_ack_lsn` past
-trailing non-commit WAL (checkpoint, RUNNING_XACTS) when no xact is in
-flight — but capped at the observer's `idle_ack_ceiling(lsn)` so the
-nudge can't promote past rows still buffered in the emitter. Without it
-source's slot pins WAL at last COMMIT, kill-restart idle catchup never
-resolves
+calls `inner.on_idle()`; channel close fires `inner.on_close()` for one
+last flush. `on_idle_advance(lsn)` runs after every batch carrying max
+`source_lsn`; it advances `emitter_ack_lsn` past trailing non-commit WAL
+(checkpoint, RUNNING_XACTS) when no xact is in flight. Pipeline path:
+`ReorderSink::on_idle_advance` routes through the ack collector's
+`Trailing` event, which advances only when every registered seq is done.
+Serial path: xact buffer caps the nudge at the observer's
+`idle_ack_ceiling(lsn)`. Without the idle advance source's slot pins
+WAL at last COMMIT, kill-restart idle catchup never resolves
 
 ## DecoderSink
 
@@ -224,9 +223,10 @@ Per-record decoder dispatch lives in
 [`DecoderSinkError`](../src/decoder_sink.rs).
 [`MetricsTupleObserver`](../src/decoder_sink.rs) hosts
 [`DecoderStats`](../src/decoder_sink.rs) counter;
-[`CollectingTupleObserver`](../src/decoder_sink.rs) is test collector;
-production wires [`EmitterObserver`](../src/ch_emitter.rs) attached via
-SIGHUP-reloadable `MappingHandle`
+[`CollectingTupleObserver`](../src/decoder_sink.rs) is test collector.
+`TupleObserver` serves the metrics-only / harness paths; the production
+CH path bypasses it — commit drain feeds the pipeline's reorder
+coordinator instead ([emitter.md](emitter.md))
 
 Record stats on `DecoderStats`: `toast_chunks_buffered` (TOAST chunks
 routed into xact buffer's chunk slot, distinct from `inserts` for
@@ -249,18 +249,19 @@ fn on_xact_end<'a>(
 
 Returns highest commit_lsn now known durable on observer (CH server
 acked, MergeTree part finalized). Callers advance ack ceiling from
-returned value, not from `commit_lsn` — observer holding INSERTs open
-across xacts can report ack lag without breaking slot-advance gate.
-Default impl returns `commit_lsn` (instant ack); CH emitter overrides
-to thread `flush_timeout` deadline. See [xact.md](xact.md) for where
+returned value, not from `commit_lsn` — a buffering observer can
+report ack lag without breaking slot-advance gate. Default impl
+returns `commit_lsn` (instant ack). See [xact.md](xact.md) for where
 committed tuples land
 
 Two idle-path hooks pair with it: `on_idle() -> Result<u64>` returns the
 commit LSN a deadline-triggered close just made durable (`0` when
 nothing promoted), and `idle_ack_ceiling(lsn) -> u64` caps an idle
 advance at the observer's durable horizon. Defaults are `Ok(0)` and
-`lsn` — non-buffering observers (metrics, collectors) impose no
-constraint; the CH emitter overrides both to surface its hold-open lag
+`lsn`; today's observers (metrics, collectors, oracle wrapper) keep
+them — the serial CH emitter that overrode both was replaced by the
+pipeline, whose durability tracking lives in the ack collector
+([emitter.md](emitter.md))
 
 ## Zero-copy framing
 

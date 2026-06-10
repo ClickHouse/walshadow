@@ -21,12 +21,12 @@ components. Future-work proposals live under [future/](future/INDEX.md)
   read-time defaults
 - [xact.md](xact.md) — `XactBuffer`, `SubxactTracker`, TOAST
   reassembly, local-disk spill, `DrainEntry` ordering
-- [emitter.md](emitter.md) — CH Native atomic-seal INSERT,
-  `BlockBuilder` per relation, `type_bridge`, synthetic columns,
-  `DdlApplicator`, `await_ready` gate
+- [emitter.md](emitter.md) — parallel decode+insert pipeline
+  (reorder → decode ×M → batcher → inserter ×N → ack watermark),
+  `type_bridge`, synthetic columns, `DdlApplicator`, barrier fence
 - [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
   / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
-  `RelationResolver`
+  shared insert tail
 - [ops.md](ops.md) — preflight, metrics, retention, cursor file (v2,
   6 LSNs), standby-status triple, kill-restart drill
 - [oracle.md](oracle.md) — differential decode oracle, walshadow PG

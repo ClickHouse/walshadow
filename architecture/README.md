@@ -3,7 +3,8 @@
 High-level pipeline. Shadow PG runs as catalog-replay sidecar fed by
 walshadow's walsender; filtered segments under `out/` serve as archive
 fallback. CH rows buffer across xacts and seal as complete INSERTs
-(budget / deadline); walshadow pushes DDL through a second CH connection.
+(budget / deadline) shipped over an N-connection inserter pool;
+walshadow pushes DDL through its own CH connection.
 
 ![overview](overview.svg)
 
@@ -13,9 +14,10 @@ Hot path runs top→bottom; ancillaries (catalog cache, walsender server,
 disk artifacts) sit off to the right with `constraint=false` edges so
 they don't pull the main column off axis. `QueueingRecordSink` between
 fan-out and decoder keeps the decoder's `wait_for_replay` off the pump
-task so the walsender wire never stalls behind it. CH cluster bundles
-the steady-state emitter together with `DdlApplicator` (separate CH
-TCP) and `type_bridge`.
+task so the walsender wire never stalls behind it. CH cluster is the
+pipeline tail — decode pool ×M, `InsertBatcher`, inserter pool ×N, ack
+collector — plus `DdlApplicator` (own CH connection) and
+`type_bridge`.
 
 ![internals](internals.svg)
 
@@ -32,11 +34,11 @@ derives off channel ① (cache miss → diff → `SchemaEvent` →
 ### 4. Bootstrap timeline — greenfield in five phases
 
 Catalog seed → BASE_BACKUP pump (MultiplexSink fan-out) → drain to CH →
-shadow handoff → cursor + WAL pump start. Bootstrap-time emitter is
-transitional: `flush_timeout = 0` seals one INSERT per table (at each
-rfn flip) plus budget trips, force-closed at end, no `DdlApplicator`
-wired. Each phase is a labelled cluster; node fill colour-codes the
-actor.
+shadow handoff → cursor + WAL pump start. Drain feeds the same shared
+insert tail streaming uses (batcher + inserter pool + ack collector),
+one ack seq per rfn flip, `tail.finish` seals + waits durable at end;
+no `DdlApplicator` wired. Each phase is a labelled cluster; node fill
+colour-codes the actor.
 
 ![bootstrap timeline](timeline_bootstrap.svg)
 
@@ -44,10 +46,11 @@ actor.
 
 Steady-state hot path, left→right. Bytes path (③→④) stays on the pump
 task; decoder path (③→④'→⑤→⑥) crosses `QueueingRecordSink` so it can
-wait on shadow without parking the wire. CH ⑥ buffers rows across xacts
-with no open wire; a budget or `flush_timeout` trigger seals one complete
-INSERT (`open_wire` → `send_data(Some)` → `send_data(None)` →
-`EndOfStream` → clear buffer).
+wait on shadow without parking the wire. ⑥ is the parallel pipeline:
+reorder assigns a dense seq per commit, decode pool routes rows, the
+batcher buffers per table across xacts and seals one complete INSERT
+per budget/deadline window, inserter pool ships N in flight; the ack
+collector advances `emitter_ack_lsn` on the contiguous-done prefix.
 
 ![streaming timeline](timeline_streaming.svg)
 

@@ -45,6 +45,8 @@ data-rate-bound
 | `RM_CLOG_ID`, `RM_MULTIXACT_ID` | all | xact status for catalog tuples |
 | `RM_STANDBY_ID` | all | recovery housekeeping |
 | `RM_XLOG_ID` | checkpoint, nextoid, parameter-change | recovery plumbing |
+| `RM_SMGR_ID`, `RM_DBASE_ID`, `RM_TBLSPC_ID` | all | file / database / tablespace lifecycle |
+| `RM_COMMIT_TS_ID`, `RM_REPL_ORIGIN_ID` | all | xact metadata replay |
 
 Everything else drops. Catalog set bootstrapped from `pg_class WHERE
 oid < FirstNormalObjectId` (16384) on freshly-initdb'd shadow, then
@@ -83,15 +85,16 @@ Component docs live alongside this overview:
   `SchemaEvent` channel feeding CH DDL applicator
 - [decoder.md](decoder.md) — `heap_decoder` Tier 1/2 type matrix,
   `MULTI_INSERT` fan-out, FPI decompression, `main_data` parsing,
-  `pg_class_decoder` driving `CatalogTracker`, `relation_resolver`
+  `pg_class_decoder` driving `CatalogTracker`
 - [xact.md](xact.md) — `XactBuffer` per-xid hold-and-flush, append-only
   per-xid spill at `{spill_dir}/xid-<xid>-<first_lsn>.bin`,
   `SubxactTracker` + commit-record subxact list authority, TOAST chunk
   reassembly inside buffer
-- [emitter.md](emitter.md) — `ch_emitter` atomic-seal INSERT (rows
-  buffer per table across xacts, seal a complete INSERT on deadline /
-  row / byte budget), `clickhouse-c-rs` `BlockBuilder` + `Client`,
-  `ch_ddl` applicator on a separate CH connection, `type_bridge` PG-OID
+- [emitter.md](emitter.md) — parallel decode+insert pipeline
+  (`src/pipeline/`): reorder coordinator → decode pool ×M →
+  `InsertBatcher` (seal complete INSERTs on deadline / row / byte
+  budget) → inserter pool ×N → contiguous-done ack watermark;
+  `ch_ddl` applicator inside the DDL barrier, `type_bridge` PG-OID
   → CH `TypeAst`
 - [bootstrap.md](bootstrap.md) — greenfield path:
   `backup_source_direct` + `backup_source_object_store`,
@@ -100,7 +103,7 @@ Component docs live alongside this overview:
   to streaming pump at `end_lsn`
 - [ops.md](ops.md) — `preflight` boot-time validators, Prom metrics
   scrape, `tracing_subscriber`, segment `retention`, `cursor` file
-  (five-field layout), per-xact `commit_lsn` carrier, slot advance on
+  (v2, six LSNs), per-xact `commit_lsn` carrier, slot advance on
   `min(shadow_replay, emitter_ack)`
 - [oracle.md](oracle.md) — differential decode oracle: re-encode +
   `SELECT $1::bytea::<typ>::text` round-trip against shadow,
@@ -123,8 +126,10 @@ Component docs live alongside this overview:
    Mitigations: periodic restart, accept while catalog stays MiB-scale,
    briefly promote to vacuum. Default: accept
 4. **wal_level.** Catalog needs `replica`; user-table decoder needs
-   `logical` for old-tuple. Net: `wal_level=logical` plus
-   `REPLICA IDENTITY FULL` on every replicated table, both preflighted
+   `logical` for old-tuple. Net: `wal_level=logical` plus a usable
+   replica-identity key (PRIMARY KEY, `USING INDEX`, or `FULL`) on every
+   replicated table, both preflighted. DELETE only needs the key to mark
+   the row; `FULL` is accepted, not required
 5. **Source DDL that rewrites a user table.** Ordering invariant:
    shadow replay LSN ≥ decoder read LSN. `ShadowCatalog::relation_at`
    blocks until `pg_last_wal_replay_lsn() >= commit_lsn` so decoder
@@ -148,8 +153,8 @@ Component docs live alongside this overview:
 
 ## Acceptance criteria
 
-Source pinned at `wal_level=logical` + `REPLICA IDENTITY FULL` on every
-replicated table
+Source pinned at `wal_level=logical` + a usable replica-identity key
+(PRIMARY KEY / `USING INDEX` / `FULL`) on every replicated table
 
 ### v1.0
 

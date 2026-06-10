@@ -38,10 +38,10 @@
 <!-- src -->
 <g id="node1" class="node">
 <title>src</title>
-<path fill="#3d3d54" stroke="#6e6963" d="M359.88,-1908.25C359.88,-1910.56 336.62,-1912.44 308,-1912.44 279.38,-1912.44 256.12,-1910.56 256.12,-1908.25 256.12,-1908.25 256.12,-1870.56 256.12,-1870.56 256.12,-1868.25 279.38,-1866.38 308,-1866.38 336.62,-1866.38 359.88,-1868.25 359.88,-1870.56 359.88,-1870.56 359.88,-1908.25 359.88,-1908.25"/>
-<path fill="none" stroke="#6e6963" d="M359.88,-1908.25C359.88,-1905.94 336.62,-1904.06 308,-1904.06 279.38,-1904.06 256.12,-1905.94 256.12,-1908.25"/>
+<path fill="#3d3d54" stroke="#6e6963" d="M359.5,-1908.25C359.5,-1910.56 336.42,-1912.44 308,-1912.44 279.58,-1912.44 256.5,-1910.56 256.5,-1908.25 256.5,-1908.25 256.5,-1870.56 256.5,-1870.56 256.5,-1868.25 279.58,-1866.38 308,-1866.38 336.42,-1866.38 359.5,-1868.25 359.5,-1870.56 359.5,-1870.56 359.5,-1908.25 359.5,-1908.25"/>
+<path fill="none" stroke="#6e6963" d="M359.5,-1908.25C359.5,-1905.94 336.42,-1904.06 308,-1904.06 279.58,-1904.06 256.5,-1905.94 256.5,-1908.25"/>
 <text xml:space="preserve" text-anchor="middle" x="308" y="-1892.66" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">source PG</text>
-<text xml:space="preserve" text-anchor="middle" x="308" y="-1879.91" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">wal_level=replica</text>
+<text xml:space="preserve" text-anchor="middle" x="308" y="-1879.91" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">wal_level=logical</text>
 </g>
 <!-- repconn -->
 <g id="node4" class="node">
@@ -91,8 +91,8 @@
 <path fill="none" stroke="#6e6963" d="M596.88,-545C596.88,-540.93 569.59,-537.62 536,-537.62 502.41,-537.62 475.12,-540.93 475.12,-545"/>
 <text xml:space="preserve" text-anchor="middle" x="536" y="-527.81" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">downstream</text>
 <text xml:space="preserve" text-anchor="middle" x="536" y="-515.06" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">BufferingDecoderSink</text>
-<text xml:space="preserve" text-anchor="middle" x="536" y="-502.31" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">+ XactRecordSink</text>
-<text xml:space="preserve" text-anchor="middle" x="536" y="-489.56" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">→ CH emitter</text>
+<text xml:space="preserve" text-anchor="middle" x="536" y="-502.31" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">+ ReorderSink</text>
+<text xml:space="preserve" text-anchor="middle" x="536" y="-489.56" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">→ CH pipeline</text>
 </g>
 <!-- legend -->
 <g id="node21" class="node">

@@ -12,18 +12,17 @@ match on. That's the only coupling — this proposal stands alone.
 
 ## 0. Today: 1 destination, baked in
 
-The emitter holds exactly one CH connection: `Emitter.client:
-Client<'static>` (`src/ch_emitter.rs:1312`) built from a single
-`EmitterConfig { host, port, database, user, password }`
-(`src/ch_emitter.rs:119-153`). `DdlApplicator` opens a second client to
-the *same* endpoint (`src/ch_ddl.rs:143`). A relation maps to one
-`TableMapping { target: String, columns }` (`src/ch_emitter.rs:264`),
-keyed by `"<namespace>.<relname>"` in `route()`
-(`src/ch_emitter.rs:1460`); `target` is copied verbatim into
-`INSERT INTO {target} ... FORMAT Native` in `TablePlan::build`
-(`src/ch_emitter.rs:580`). `NamespaceMapping.target_database`
-(`src/ch_emitter.rs:283`) only picks a CH *database* on the one
-endpoint, not an endpoint. There is no list of endpoints anywhere.
+The pipeline ships to exactly one CH endpoint: the inserter pool
+(`src/pipeline/inserter.rs`) opens N connections all built from a
+single `EmitterConfig { host, port, database, user, password }`
+(`src/ch_emitter.rs`), and `DdlApplicator` opens one more to the
+*same* endpoint (`src/ch_ddl.rs`). A relation maps to one
+`TableMapping { target: String, columns }`, keyed by
+`"<namespace>.<relname>"` in `pipeline::lookup_mapping`; `target` is
+copied verbatim into `INSERT INTO {target} ... FORMAT Native` in
+`TablePlan::build`. `NamespaceMapping.target_database` only picks a CH
+*database* on the one endpoint, not an endpoint. There is no list of
+endpoints anywhere.
 
 ## 1. The baseline alternative: just run more daemons
 
@@ -84,17 +83,20 @@ struct Destination {
 }
 ```
 
-`Emitter` grows `dests: HashMap<DestinationId, Destination>` and the
-per-table encoder state becomes per `(DestinationId, table)`. `route()`
-fans the decoded row to each matched destination's encoder. Sealing,
-budget trips, and reconnect (`src/ch_emitter.rs:1788`) all become
-per-destination — a stall or reconnect on one destination must not
-block sealing on another (modulo §4).
+The tail grows `dests: HashMap<DestinationId, Destination>` — most
+naturally one batcher + inserter pool + ack collector per destination
+— and per-table encoder state becomes per `(DestinationId, table)`.
+The decode pool fans each routed row to every matched destination.
+Sealing, budget trips, and reconnect/retry all become per-destination
+— a stall or reconnect on one destination must not block sealing on
+another (modulo §4).
 
 DDL fans out: a `SchemaEvent` for a relation routed to destinations
 {A,B} applies to A's and B's `DdlApplicator` independently
-(`src/ch_ddl.rs`), each gated by its own `await_ready`. Auto-create and
-`drop_table_strategy` resolve per destination.
+(`src/ch_ddl.rs`), each behind its own barrier fence (today's fence
+spans one destination's seqs; per-destination fencing is new
+machinery). Auto-create and `drop_table_strategy` resolve per
+destination.
 
 ## 4. The hard part: ack accounting and slot advance
 
@@ -134,7 +136,7 @@ multiple WAL reads.
 
 ## 5. Cursor schema
 
-Cursor records a single emitter ack today (`plans/ops.md` five-field
+Cursor records a single emitter ack today (`plans/ops.md` v2 six-LSN
 layout; see also `[[inproc-harness-large-xact]]`). N:M needs
 **per-destination ack LSN** persisted so restart resumes each
 destination from its own position rather than re-emitting from the
