@@ -79,9 +79,8 @@ async fn add_column_default_replicates_pre_alter_default() {
             c Nullable(Int32),\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest table");
 
@@ -152,7 +151,7 @@ async fn add_column_default_replicates_pre_alter_default() {
         .psql_one("SELECT count(*) FROM s14.t")
         .expect("source count");
     let ch_count = ch
-        .query("SELECT count() FROM walshadow_test.s14_t FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.s14_t FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(src_count, ch_count, "row count mismatch");
     assert_eq!(src_count, "2");
@@ -165,7 +164,7 @@ async fn add_column_default_replicates_pre_alter_default() {
         .query(
             "SELECT argMax(c, _lsn) \
              FROM walshadow_test.s14_t \
-             WHERE _op != 'delete' AND id = 1",
+             WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch pre-alter c");
     assert_eq!(
@@ -176,7 +175,7 @@ async fn add_column_default_replicates_pre_alter_default() {
         .query(
             "SELECT argMax(c, _lsn) \
              FROM walshadow_test.s14_t \
-             WHERE _op != 'delete' AND id = 2",
+             WHERE _is_deleted = 0 AND id = 2",
         )
         .expect("ch post-alter c");
     assert_eq!(ch_post, "42");

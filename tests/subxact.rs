@@ -99,9 +99,8 @@ fn create_ch_dest(ch: &fx::ChServer) {
             payload String,\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest table");
 }
@@ -204,7 +203,7 @@ async fn run_drill<F: FnOnce(&Shadow) -> std::thread::JoinHandle<()>>(
 
 async fn assert_ch_rows(ch: &fx::ChServer, expected: &[(i64, &str)]) {
     let ch_count = ch
-        .query("SELECT count() FROM walshadow_test.s14_sub_t FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.s14_sub_t FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(
         ch_count,
@@ -221,7 +220,7 @@ async fn assert_ch_rows(ch: &fx::ChServer, expected: &[(i64, &str)]) {
              ) FROM (\
                  SELECT id, argMax(payload, _lsn) AS payload \
                  FROM walshadow_test.s14_sub_t \
-                 WHERE _op != 'delete' \
+                 WHERE _is_deleted = 0 \
                  GROUP BY id ORDER BY id\
              )",
         )

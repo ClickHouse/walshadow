@@ -9,6 +9,7 @@ database = "demo"
 user = "default"
 password = ""
 compression = "lz4"
+# soft_delete = true
 
 [table."demo.users"]
 target = "demo.users"

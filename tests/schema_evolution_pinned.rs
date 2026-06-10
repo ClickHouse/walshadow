@@ -52,8 +52,7 @@ fn skip_if_missing() -> bool {
 /// Synthetic-column tail every CH dest carries.
 const SYNTHETIC_TAIL: &str = "_lsn UInt64,\
      _xid UInt32,\
-     _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-     _commit_ts DateTime64(6, 'UTC')";
+     _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool";
 
 /// id/name/email mapping shared by both drills.
 fn base_columns() -> Vec<ColumnMapping> {
@@ -119,7 +118,7 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
             name Nullable(String),\
             email Nullable(String),\
             {SYNTHETIC_TAIL}\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     ))
     .expect("create dest");
 
@@ -177,7 +176,7 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
     assert_eq!(col, "signup_ts", "applicator must have added `signup_ts`");
 
     let n = ch
-        .query("SELECT count() FROM walshadow_test.demo_users FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.demo_users FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(n, "1");
 
@@ -185,7 +184,7 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
     let v = ch
         .query(
             "SELECT argMax(signup_ts, _lsn) FROM walshadow_test.demo_users \
-             WHERE _op != 'delete' AND id = 1",
+             WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch signup_ts value");
     assert!(
@@ -245,7 +244,7 @@ async fn pinned_subset_alter_adds_only_new_column() {
             name Nullable(String),\
             email Nullable(String),\
             {SYNTHETIC_TAIL}\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     ))
     .expect("create dest");
 
@@ -315,14 +314,14 @@ async fn pinned_subset_alter_adds_only_new_column() {
     );
 
     let n = ch
-        .query("SELECT count() FROM walshadow_test.demo_users FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.demo_users FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(n, "1");
 
     let v = ch
         .query(
             "SELECT argMax(signup_ts, _lsn) FROM walshadow_test.demo_users \
-             WHERE _op != 'delete' AND id = 1",
+             WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch signup_ts value");
     assert!(

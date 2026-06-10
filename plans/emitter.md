@@ -162,8 +162,8 @@ non-nullable by construction, encoded in `TableEncoder::new`:
 |---|---|---|
 | `_lsn` | `UInt64` | source commit-record LSN. `ReplacingMergeTree(_lsn)` keys dedup on this so restart-and-replay window collapses re-emitted rows to latest LSN per PK |
 | `_xid` | `UInt32` | source xid. Lets analytic queries group all rows from one xact, recover xact boundary CH lost when emitter serialised across tables |
-| `_op` | `Enum8('insert'=1,'update'=2,'delete'=3)` | row-op classification. CH-side `WHERE _op != 3` is the cheap "live rows" filter; HOT_UPDATE collapses to UPDATE (code 2), PG-internal distinction doesn't reach CH |
 | `_commit_ts` | `DateTime64(6, 'UTC')` | xact commit timestamp, shifted from PG's 2000-01-01 epoch to Unix via `DATETIME64_PG_EPOCH_US` |
+| `_is_deleted` | `Bool` | 1 on delete, else 0. `Bool` is `UInt8` underneath (1 wire byte), so it satisfies `ReplacingMergeTree`'s `is_deleted` UInt8 requirement. `ReplacingMergeTree(_lsn, _is_deleted)` second arg collapses deletes on FINAL; `WHERE _is_deleted = 0` is the cheap "live rows" filter. `soft_delete` keeps it out of the engine args to retain tombstones |
 
 `_lsn` is dedup key because emitter ack lags actual CH durability by up
 to one flush window. On restart cursor's `emitter_ack_lsn` rewinds to

@@ -78,9 +78,8 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
             payload Nullable(String),\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest");
 
@@ -167,7 +166,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
 
     let src_count = source.psql_one("SELECT count(*) FROM s19.orders").unwrap();
     let ch_count = ch
-        .query("SELECT count() FROM walshadow_test.s19_orders FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.s19_orders FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(src_count, "6", "source has all six rows");
     assert_eq!(src_count, ch_count, "row count mismatch after ALTER");
@@ -178,7 +177,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
         .query(
             "SELECT groupArray(c) FROM (\
                 SELECT argMax(c, _lsn) AS c FROM walshadow_test.s19_orders \
-                WHERE _op != 'delete' AND id IN (11, 12, 13) GROUP BY id ORDER BY id\
+                WHERE _is_deleted = 0 AND id IN (11, 12, 13) GROUP BY id ORDER BY id\
              )",
         )
         .expect("ch post-alter c");
@@ -188,7 +187,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
     let pre = ch
         .query(
             "SELECT argMax(c, _lsn) FROM walshadow_test.s19_orders \
-             WHERE _op != 'delete' AND id = 1",
+             WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch pre-alter c");
     assert!(
@@ -246,9 +245,8 @@ async fn parallel_pipeline_truncate_orders_after_data() {
             payload Nullable(String),\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest table");
 
@@ -338,7 +336,7 @@ async fn parallel_pipeline_truncate_orders_after_data() {
     );
 
     let ch_count = ch
-        .query("SELECT count() FROM walshadow_test.s19t_t FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.s19t_t FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(
         src_count, ch_count,
@@ -351,7 +349,7 @@ async fn parallel_pipeline_truncate_orders_after_data() {
         .query(
             "SELECT groupArray(id) FROM (\
                 SELECT id FROM walshadow_test.s19t_t FINAL \
-                WHERE _op != 'delete' ORDER BY id\
+                WHERE _is_deleted = 0 ORDER BY id\
              )",
         )
         .expect("ch ids");

@@ -1396,7 +1396,7 @@ async fn populate_metrics(
 ///    exists and is non-empty (true once this returns).
 ///
 /// `ch_config` `Some`: bootstrap rows route through the shared insert tail
-/// (synthetic INSERT `_op = 1`, `_lsn = start_lsn`, `_commit_ts = 0`).
+/// (synthetic INSERT `_lsn = start_lsn`, `_commit_ts = 0`, `_is_deleted = 0`).
 /// `wait_through(K)` proves every bootstrap seq durable on CH before
 /// teardown, so the WAL pump resumes against a fully-shipped baseline.
 /// `None`: rows drain to a metrics-only observer via `drain_backfill`.
