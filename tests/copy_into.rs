@@ -75,9 +75,8 @@ async fn copy_into_multi_insert_replicates() {
             name String,\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest table");
 
@@ -134,7 +133,7 @@ async fn copy_into_multi_insert_replicates() {
         .psql_one("SELECT count(*) FROM s14.copy_t")
         .expect("source count");
     let ch_count = ch
-        .query("SELECT count() FROM walshadow_test.s14_copy_t FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.s14_copy_t FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(src_count, ch_count, "row count after COPY mismatched");
     assert_eq!(src_count, N_ROWS.to_string());
@@ -149,7 +148,7 @@ async fn copy_into_multi_insert_replicates() {
         .query(
             "SELECT lower(hex(MD5(arrayStringConcat(groupArray(name), ',')))) FROM (\
                 SELECT name FROM walshadow_test.s14_copy_t FINAL \
-                WHERE _op != 'delete' ORDER BY id\
+                WHERE _is_deleted = 0 ORDER BY id\
              )",
         )
         .expect("ch md5");

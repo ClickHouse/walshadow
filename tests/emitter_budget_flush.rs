@@ -139,9 +139,8 @@ async fn budget_trips_seal_complete_inserts() {
             val Nullable(String),\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest table");
 
@@ -208,7 +207,7 @@ async fn budget_trips_seal_complete_inserts() {
     );
 
     let count = ch
-        .query("SELECT count() FROM walshadow_test.foo FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.foo FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(count, N.to_string(), "every routed row must be durable");
     let distinct = ch

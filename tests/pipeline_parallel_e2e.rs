@@ -75,9 +75,9 @@ async fn parallel_pipeline_replicates_dml() {
             val Nullable(String),\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id \
+           SETTINGS allow_experimental_replacing_merge_with_cleanup = 1",
     )
     .expect("create dest table");
 
@@ -163,22 +163,47 @@ async fn parallel_pipeline_replicates_dml() {
         .psql_one("SELECT count(*) FROM public.foo")
         .expect("source count");
     let ch_count = ch
-        .query("SELECT count() FROM walshadow_test.foo FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.foo FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(src_count, "2", "source has two surviving rows post-delete");
     assert_eq!(src_count, ch_count, "row count mismatched after DML");
 
     // id=2's UPDATE must win (higher _lsn) under ReplacingMergeTree.
     let id2_val = ch
-        .query("SELECT val FROM walshadow_test.foo FINAL WHERE id = 2 AND _op != 'delete'")
+        .query("SELECT val FROM walshadow_test.foo FINAL WHERE id = 2 AND _is_deleted = 0")
         .expect("ch id=2 val");
     assert_eq!(id2_val, "B", "update replicated");
 
-    // id=3 was deleted — its tombstone hides it under the _op filter.
+    // id=3 was deleted — its tombstone hides it under the _is_deleted filter.
     let id3_live = ch
-        .query("SELECT count() FROM walshadow_test.foo FINAL WHERE id = 3 AND _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.foo FINAL WHERE id = 3 AND _is_deleted = 0")
         .expect("ch id=3 count");
     assert_eq!(id3_live, "0", "delete replicated as tombstone");
+
+    // Emitter codes the delete into ReplacingMergeTree's `_is_deleted`:
+    // id=3's tombstone carries true. Can't observe via FINAL, with
+    // `_is_deleted` as engine arg FINAL drops the deleted row at query time,
+    // not only on CLEANUP. Read winning (max `_lsn`) version raw instead.
+    let id3_flag = ch
+        .query("SELECT argMax(_is_deleted, _lsn) FROM walshadow_test.foo WHERE id = 3")
+        .expect("ch id=3 _is_deleted");
+    assert_eq!(id3_flag, "true", "delete coded into _is_deleted");
+
+    // `OPTIMIZE … FINAL CLEANUP` (gated on the table's experimental
+    // setting) physically drops the deleted row + its history, so an
+    // unfiltered scan no longer sees id=3 — the end-to-end payoff of
+    // wiring the deletion column.
+    ch.query("OPTIMIZE TABLE walshadow_test.foo FINAL CLEANUP")
+        .expect("optimize cleanup");
+    let id3_physical = ch
+        .query("SELECT count() FROM walshadow_test.foo WHERE id = 3")
+        .expect("ch id=3 physical count");
+    assert_eq!(id3_physical, "0", "cleanup purged the tombstone");
+    // Survivors untouched by cleanup; no FINAL/filter needed post-purge.
+    let survivors = ch
+        .query("SELECT count() FROM walshadow_test.foo")
+        .expect("ch survivor count");
+    assert_eq!(survivors, "2", "cleanup kept the two live rows");
 
     // Every dispatched seq drained, so the contiguous-done watermark
     // advanced past its initial 0.

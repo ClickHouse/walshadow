@@ -179,7 +179,7 @@ pub fn pg_basebackup_available() -> bool {
 
 /// Write a `--ch-config` TOML mapping `<schema>.t (id int4, name text)`
 /// onto `<database>.t` on CH. Mirrors the synthetic column shape the
-/// emitter advertises (`_lsn` / `_xid` / `_op` / `_commit_ts`).
+/// emitter advertises (`_lsn` / `_xid` / `_commit_ts` / `_is_deleted`).
 pub fn write_ch_config_toml(
     path: &Path,
     ch_host: &str,
@@ -207,7 +207,7 @@ pub fn write_ch_config_toml(
 }
 
 /// CREATE TABLE on CH matching the mapping above. The synthetic
-/// trailer (`_lsn` / `_xid` / `_op` / `_commit_ts`) matches the
+/// trailer (`_lsn` / `_xid` / `_commit_ts` / `_is_deleted`) matches the
 /// shape the daemon's emitter advertises in its INSERT block; the
 /// engine is `ReplacingMergeTree(_lsn)` so reads with `FINAL` collapse
 /// the bootstrap row to its newest copy if a later WAL update lands.
@@ -219,9 +219,8 @@ pub fn create_ch_dest_table(ch: &ChServer, database: &str, table: &str) -> Resul
             name String,\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id"
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id"
     ))?;
     Ok(())
 }
@@ -471,7 +470,7 @@ impl Drop for StopOnDrop<'_> {
 /// three numbers extracted from both sides; mismatch surfaces as a
 /// detailed panic with both halves' values.
 ///
-/// CH side reads `FINAL WHERE _op != 'delete'` to collapse any
+/// CH side reads `FINAL WHERE _is_deleted = 0` to collapse any
 /// ReplacingMergeTree duplicates (a follow-up WAL UPDATE would
 /// otherwise show twice).
 pub fn assert_ch_matches_source(
@@ -489,15 +488,15 @@ pub fn assert_ch_matches_source(
     ))?;
 
     let ch_count = ch.query(&format!(
-        "SELECT count() FROM {ch_table} FINAL WHERE _op != 'delete'"
+        "SELECT count() FROM {ch_table} FINAL WHERE _is_deleted = 0"
     ))?;
     let ch_sum = ch.query(&format!(
-        "SELECT sum(id) FROM {ch_table} FINAL WHERE _op != 'delete'"
+        "SELECT sum(id) FROM {ch_table} FINAL WHERE _is_deleted = 0"
     ))?;
     // CH's `lower(hex(MD5(...)))` matches PG's `md5(text)` byte-for-byte.
     let ch_md5 = ch.query(&format!(
         "SELECT lower(hex(MD5(arrayStringConcat(groupArray(name), ',')))) \
-         FROM (SELECT name FROM {ch_table} FINAL WHERE _op != 'delete' ORDER BY id)"
+         FROM (SELECT name FROM {ch_table} FINAL WHERE _is_deleted = 0 ORDER BY id)"
     ))?;
 
     if src_count != ch_count {

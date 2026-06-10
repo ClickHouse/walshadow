@@ -11,7 +11,7 @@
 //!   5. pg_switch_wal
 //!
 //! Expected CH end state:
-//!   `SELECT count() FROM target FINAL WHERE _op != 'delete'` == 10
+//!   `SELECT count() FROM target FINAL WHERE _is_deleted = 0` == 10
 //!   The 10 surviving ids match source's post-truncate set.
 
 #![cfg(target_os = "linux")]
@@ -75,9 +75,8 @@ async fn truncate_removes_ch_rows() {
             payload Nullable(String),\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest table");
 
@@ -147,7 +146,7 @@ async fn truncate_removes_ch_rows() {
     assert_eq!(src_count, "10", "source post-truncate count");
 
     let ch_count = ch
-        .query("SELECT count() FROM walshadow_test.s14_truncate_t FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.s14_truncate_t FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(
         src_count, ch_count,
@@ -159,7 +158,7 @@ async fn truncate_removes_ch_rows() {
         .query(
             "SELECT groupArray(id) FROM (\
                 SELECT id FROM walshadow_test.s14_truncate_t FINAL \
-                WHERE _op != 'delete' ORDER BY id\
+                WHERE _is_deleted = 0 ORDER BY id\
              )",
         )
         .expect("ch ids");

@@ -88,9 +88,8 @@ async fn alter_add_column_replicates_without_toml_edit() {
             payload Nullable(String),\
             _lsn UInt64,\
             _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id",
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest");
 
@@ -156,7 +155,7 @@ async fn alter_add_column_replicates_without_toml_edit() {
     // Verify row count + the post-ALTER `c` value.
     let src_count = source.psql_one("SELECT count(*) FROM s15.orders").unwrap();
     let ch_count = ch
-        .query("SELECT count() FROM walshadow_test.s15_orders FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.s15_orders FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(src_count, ch_count);
     assert_eq!(src_count, "2");
@@ -165,7 +164,7 @@ async fn alter_add_column_replicates_without_toml_edit() {
         .query(
             "SELECT argMax(c, _lsn) \
              FROM walshadow_test.s15_orders \
-             WHERE _op != 'delete' AND id = 2",
+             WHERE _is_deleted = 0 AND id = 2",
         )
         .expect("ch post-alter c");
     assert_eq!(ch_post, "hello", "post-ALTER row's c must reach CH");
@@ -177,7 +176,7 @@ async fn alter_add_column_replicates_without_toml_edit() {
         .query(
             "SELECT argMax(c, _lsn) \
              FROM walshadow_test.s15_orders \
-             WHERE _op != 'delete' AND id = 1",
+             WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch pre-alter c");
     assert!(
@@ -276,14 +275,14 @@ async fn create_table_auto_replicates_in_namespace() {
     assert_eq!(tbls, "new_t", "applicator must have auto-created CH table");
 
     let n = ch
-        .query("SELECT count() FROM walshadow_test.new_t FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM walshadow_test.new_t FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(n, "1");
 
     let body = ch
         .query(
             "SELECT argMax(body, _lsn) FROM walshadow_test.new_t \
-             WHERE _op != 'delete' AND id = 1",
+             WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch body");
     assert_eq!(body, "auto");
@@ -474,7 +473,7 @@ async fn auto_create_honors_per_namespace_target_database() {
 
     // Table + row land in the override DB.
     let in_warehouse = ch
-        .query("SELECT count() FROM warehouse.w FINAL WHERE _op != 'delete'")
+        .query("SELECT count() FROM warehouse.w FINAL WHERE _is_deleted = 0")
         .expect("warehouse count");
     assert_eq!(
         in_warehouse, "1",

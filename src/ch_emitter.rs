@@ -1,8 +1,10 @@
 //! CH-native emitter primitives via `clickhouse-c-rs`. Batching, seal
 //! triggers, and xact close live in [`crate::pipeline`], not here.
 //!
-//! Synthetic columns `_lsn UInt64`, `_xid UInt32`, `_op Enum8(...)`,
-//! `_commit_ts DateTime64(6, 'UTC')` append after every mapped column.
+//! Synthetic columns `_lsn UInt64`, `_xid UInt32`, `_commit_ts
+//! DateTime64(6, 'UTC')`, `_is_deleted Bool` append after every mapped
+//! column. `_is_deleted` (1 on delete) wires `ReplacingMergeTree`'s
+//! deletion arg unless `EmitterConfig::soft_delete` keeps it queryable.
 //! PG `TimestampTz` epoch is 2000-01-01; shift to Unix epoch
 //! (`DATETIME64_PG_EPOCH_US`) to match CH `DateTime64(6)`.
 //!
@@ -39,7 +41,7 @@ use crate::shadow_catalog::{CatalogError, RelDescriptor};
 /// `xact_time` and tuple `TimestampTz` are PG-epoch microseconds.
 pub const DATETIME64_PG_EPOCH_US: i64 = 946_684_800_000_000;
 
-/// `_op` Enum8 codes; keep in sync with [`TablePlan::synth_op`]
+/// Heap op codes for [`TableEncoder::append_row`]; `OP_DELETE` sets `_is_deleted`
 pub const OP_INSERT: i8 = 1;
 pub const OP_UPDATE: i8 = 2;
 pub const OP_DELETE: i8 = 3;
@@ -134,6 +136,10 @@ pub struct EmitterConfig {
     /// so the inserter reconnects + resends rather than pinning the
     /// durable watermark forever. Sized far above a healthy round-trip.
     pub insert_timeout: Duration,
+    /// Keep `_is_deleted` out of `ReplacingMergeTree`'s args so delete
+    /// tombstones stay queryable instead of collapsing on FINAL. Column
+    /// always emitted; off by default
+    pub soft_delete: bool,
 }
 
 pub const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
@@ -177,6 +183,7 @@ impl Default for EmitterConfig {
             drop_table_strategy: "retain".into(),
             retry: RetryConfig::default(),
             insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
+            soft_delete: false,
         }
     }
 }
@@ -359,6 +366,9 @@ impl EmitterConfig {
             if let Some(v) = ch.get("drop_table_strategy").and_then(Value::as_str) {
                 out.drop_table_strategy = v.into();
             }
+            if let Some(v) = ch.get("soft_delete").and_then(Value::as_bool) {
+                out.soft_delete = v;
+            }
         }
         if let Some(nss) = root.get("namespace").and_then(Value::as_table) {
             for (k, v) in nss {
@@ -451,8 +461,9 @@ pub struct TablePlan {
     pub columns: Vec<ColumnPlan>,
     pub synth_lsn: ColumnPlan,
     pub synth_xid: ColumnPlan,
-    pub synth_op: ColumnPlan,
     pub synth_commit_ts: ColumnPlan,
+    /// `_is_deleted Bool` (1 on delete, else 0), always appended last
+    pub synth_is_deleted: ColumnPlan,
     /// Pre-formatted so on-tuple paths don't reassemble per row
     pub insert_sql: String,
 }
@@ -535,12 +546,12 @@ impl TablePlan {
         };
         let synth_lsn = mk("_lsn", "UInt64")?;
         let synth_xid = mk("_xid", "UInt32")?;
-        let synth_op = mk("_op", "Enum8('insert' = 1, 'update' = 2, 'delete' = 3)")?;
         let synth_commit_ts = mk("_commit_ts", "DateTime64(6, 'UTC')")?;
+        let synth_is_deleted = mk("_is_deleted", "Bool")?;
         col_sql.push(quote_ident(&synth_lsn.name));
         col_sql.push(quote_ident(&synth_xid.name));
-        col_sql.push(quote_ident(&synth_op.name));
         col_sql.push(quote_ident(&synth_commit_ts.name));
+        col_sql.push(quote_ident(&synth_is_deleted.name));
         let insert_sql = format!(
             "INSERT INTO {} ({}) FORMAT Native",
             mapping.target,
@@ -551,8 +562,8 @@ impl TablePlan {
             columns,
             synth_lsn,
             synth_xid,
-            synth_op,
             synth_commit_ts,
+            synth_is_deleted,
             insert_sql,
         })
     }
@@ -808,13 +819,13 @@ pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterE
         bytes: Vec::new(),
     }); // _xid UInt32
     buffers.push(ColumnBuf::Fixed {
-        width: 1,
-        bytes: Vec::new(),
-    }); // _op Enum8
-    buffers.push(ColumnBuf::Fixed {
         width: 8,
         bytes: Vec::new(),
     }); // _commit_ts DateTime64(6)
+    buffers.push(ColumnBuf::Fixed {
+        width: 1,
+        bytes: Vec::new(),
+    }); // _is_deleted Bool (1 wire byte, same as UInt8)
     Ok(buffers)
 }
 
@@ -840,7 +851,7 @@ impl TableEncoder {
         Ok((old, rows))
     }
 
-    /// Caller picks the source side (DELETE uses `old`) and the `_op` code.
+    /// Caller picks the source side (DELETE uses `old`) and the op code.
     pub fn append_row(
         &mut self,
         committed: &CommittedTuple,
@@ -881,13 +892,14 @@ impl TableEncoder {
                 })?,
             }
         }
-        // Synthetic columns: _lsn, _xid, _op, _commit_ts (unix micros)
+        // Synthetic columns: _lsn, _xid, _commit_ts (unix micros), _is_deleted
         let off = mapping.columns.len();
         push_fixed(&mut self.buffers[off], &decoded.source_lsn.to_le_bytes())?;
         push_fixed(&mut self.buffers[off + 1], &decoded.xid.to_le_bytes())?;
-        push_fixed(&mut self.buffers[off + 2], &op_code.to_le_bytes())?;
         let unix_us = committed.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
-        push_fixed(&mut self.buffers[off + 3], &unix_us.to_le_bytes())?;
+        push_fixed(&mut self.buffers[off + 2], &unix_us.to_le_bytes())?;
+        let is_deleted: u8 = (op_code == OP_DELETE).into();
+        push_fixed(&mut self.buffers[off + 3], &is_deleted.to_le_bytes())?;
         self.rows += 1;
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
         Ok(())
@@ -1682,9 +1694,33 @@ mod tests {
         assert!(plan.insert_sql.contains("`name`"));
         assert!(plan.insert_sql.contains("`_lsn`"));
         assert!(plan.insert_sql.contains("`_xid`"));
-        assert!(plan.insert_sql.contains("`_op`"));
+        assert!(!plan.insert_sql.contains("`_op`"));
         assert!(plan.insert_sql.contains("`_commit_ts`"));
+        assert!(plan.insert_sql.contains("`_is_deleted`"));
         assert!(plan.insert_sql.ends_with(") FORMAT Native"));
+    }
+
+    #[test]
+    fn is_deleted_codes_delete_in_trailing_buffer() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let m = mk_mapping();
+        let plan = TablePlan::build(alloc, &rel, &m).expect("plan builds");
+        assert!(plan.insert_sql.contains("`_is_deleted`"));
+        let mut enc = TableEncoder::new(plan).unwrap();
+        enc.append_row(&committed(1, Some("a")), &m, OP_INSERT)
+            .unwrap();
+        enc.append_row(&committed(1, Some("a")), &m, OP_DELETE)
+            .unwrap();
+        // _is_deleted is the trailing buffer: 0 for insert, 1 for delete
+        let last = enc.buffers.len() - 1;
+        match &enc.buffers[last] {
+            ColumnBuf::Fixed { bytes, width } => {
+                assert_eq!(*width, 1);
+                assert_eq!(bytes, &vec![0u8, 1]);
+            }
+            other => panic!("_is_deleted expected Fixed(1), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1730,9 +1766,12 @@ mod tests {
             }
             other => panic!("_lsn expected Fixed, got {other:?} variant tag"),
         }
-        match &enc.buffers[off + 2] {
-            ColumnBuf::Fixed { bytes, .. } => assert_eq!(bytes, &vec![1u8, 1, 1]),
-            _ => panic!("_op expected Fixed"),
+        match &enc.buffers[off + 3] {
+            ColumnBuf::Fixed { bytes, width } => {
+                assert_eq!(*width, 1);
+                assert_eq!(bytes, &vec![0u8, 0, 0]);
+            }
+            _ => panic!("_is_deleted expected Fixed"),
         }
     }
 
@@ -1776,5 +1815,14 @@ mod tests {
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.columns[0].src_attnum, 1);
         assert_eq!(t.columns[1].target_type, "Nullable(String)");
+        // soft_delete defaults off when the key is absent
+        assert!(!c.soft_delete);
+    }
+
+    #[test]
+    fn config_soft_delete_defaults_off_and_parses_on() {
+        assert!(!EmitterConfig::default().soft_delete);
+        let c = EmitterConfig::from_toml_str("[ch]\nsoft_delete = true\n").unwrap();
+        assert!(c.soft_delete);
     }
 }

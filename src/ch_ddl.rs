@@ -75,6 +75,9 @@ pub struct DdlConfig {
     /// Per-namespace overrides, fallback to the global fields above when
     /// a namespace has none
     pub namespaces: HashMap<String, NamespaceMapping>,
+    /// Keep `_is_deleted` out of `ReplacingMergeTree`'s args so deletes
+    /// stay queryable; mirrors [`EmitterConfig::soft_delete`]
+    pub soft_delete: bool,
 }
 
 impl DdlConfig {
@@ -92,6 +95,7 @@ impl DdlConfig {
             auto_create_namespaces,
             target_database: cfg.database.clone(),
             namespaces: cfg.namespaces.clone(),
+            soft_delete: cfg.soft_delete,
         }
     }
 
@@ -205,7 +209,7 @@ impl DdlApplicator {
             .config
             .target_database_for(&desc.namespace_name)
             .to_owned();
-        let sql = match render_create_table(desc, &target_db)? {
+        let sql = match render_create_table(desc, &target_db, self.config.soft_delete)? {
             Some(s) => s,
             None => {
                 self.stats.skipped += 1;
@@ -502,6 +506,7 @@ pub fn render_add_column(target: &str, name: &str, resolved: &ResolvedColumn) ->
 pub fn render_create_table(
     desc: &RelDescriptor,
     target_database: &str,
+    soft_delete: bool,
 ) -> Result<Option<String>, EmitterError> {
     let target = format!(
         "{}.{}",
@@ -539,8 +544,15 @@ pub fn render_create_table(
     // Synthetic columns mirror `TablePlan::build`
     col_defs.push("`_lsn` UInt64".into());
     col_defs.push("`_xid` UInt32".into());
-    col_defs.push("`_op` Enum8('insert' = 1, 'update' = 2, 'delete' = 3)".into());
     col_defs.push("`_commit_ts` DateTime64(6, 'UTC')".into());
+    col_defs.push("`_is_deleted` Bool".into());
+
+    // soft_delete keeps `_is_deleted` out of the engine args
+    let engine_args = if soft_delete {
+        "`_lsn`"
+    } else {
+        "`_lsn`, `_is_deleted`"
+    };
 
     // ORDER BY: prefer PK columns, else `_lsn`
     let order_by = if pk_attnums.is_empty() {
@@ -563,7 +575,7 @@ pub fn render_create_table(
     };
 
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree(`_lsn`)\nORDER BY {order_by}",
+        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree({engine_args})\nORDER BY {order_by}",
         col_defs.join(",\n  ")
     );
     Ok(Some(sql))
@@ -638,6 +650,7 @@ mod tests {
             auto_create_namespaces: HashSet::new(),
             target_database: "default".into(),
             namespaces,
+            soft_delete: false,
         };
         assert_eq!(cfg.target_database_for("analytics"), "warehouse");
         assert_eq!(cfg.target_database_for("logs"), "default");
@@ -658,6 +671,7 @@ mod tests {
             auto_create_namespaces: HashSet::new(),
             target_database: "default".into(),
             namespaces: HashMap::new(),
+            soft_delete: false,
         };
         assert_eq!(cfg.drop_table_strategy, DropTableStrategy::Retain);
         let cfg = cfg.with_drop_strategy(DropTableStrategy::Drop);
@@ -741,20 +755,39 @@ mod tests {
             ],
             Some(vec![1]),
         );
-        let sql = render_create_table(&d, "default").unwrap().unwrap();
+        let sql = render_create_table(&d, "default", false).unwrap().unwrap();
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS `default`.`orders`"));
         assert!(sql.contains("`id` Int32"));
         assert!(sql.contains("`body` Nullable(String)"));
         assert!(sql.contains("`_lsn` UInt64"));
-        assert!(sql.contains("`_op` Enum8"));
+        assert!(!sql.contains("`_op`"));
+        assert!(sql.contains("`_is_deleted` Bool"));
+        assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`, `_is_deleted`)"));
+        assert!(sql.ends_with("ORDER BY (`id`)"));
+    }
+
+    #[test]
+    fn soft_delete_keeps_is_deleted_out_of_engine_args() {
+        let d = desc(
+            "orders",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "body", TEXTOID, false, None),
+            ],
+            Some(vec![1]),
+        );
+        let sql = render_create_table(&d, "default", true).unwrap().unwrap();
+        // Column always present; soft_delete only drops it from the engine
+        assert!(sql.contains("`_is_deleted` Bool"));
         assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`)"));
+        assert!(!sql.contains("ReplacingMergeTree(`_lsn`, `_is_deleted`)"));
         assert!(sql.ends_with("ORDER BY (`id`)"));
     }
 
     #[test]
     fn render_create_table_falls_back_to_lsn_when_no_pk() {
         let d = desc("events", vec![att(1, "body", TEXTOID, false, None)], None);
-        let sql = render_create_table(&d, "default").unwrap().unwrap();
+        let sql = render_create_table(&d, "default", false).unwrap().unwrap();
         assert!(sql.ends_with("ORDER BY (`_lsn`)"));
     }
 
@@ -763,7 +796,7 @@ mod tests {
         let mut a = att(1, "ship_at", TIMESTAMPTZOID, false, None);
         a.typmod = 3;
         let d = desc("t", vec![a], None);
-        let sql = render_create_table(&d, "db").unwrap().unwrap();
+        let sql = render_create_table(&d, "db", false).unwrap().unwrap();
         assert!(
             sql.contains("`ship_at` Nullable(DateTime64(3, 'UTC'))"),
             "{sql}"
@@ -792,7 +825,7 @@ mod tests {
         // type_bridge falls back to String for unknown OIDs today, so
         // this never hits None; revisit if the bridge grows strictness
         let d = desc("t", vec![att(1, "id", 99999, true, None)], None);
-        let sql = render_create_table(&d, "db").unwrap();
+        let sql = render_create_table(&d, "db", false).unwrap();
         assert!(sql.is_some(), "fallback path keeps the CREATE renderable");
     }
 

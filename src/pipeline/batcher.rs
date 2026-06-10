@@ -53,7 +53,7 @@ pub struct BatchMeta {
     pub table_key: String,
     pub insert_sql: String,
     /// Order matches [`InsertBatch::buffers`]: mapped columns then the four
-    /// synthetic (`_lsn`, `_xid`, `_op`, `_commit_ts`).
+    /// synthetic (`_lsn`, `_xid`, `_commit_ts`, `_is_deleted`).
     pub columns: Vec<ColMeta>,
     pub schema_epoch: u64,
 }
@@ -70,8 +70,8 @@ impl BatchMeta {
         for synth in [
             &plan.synth_lsn,
             &plan.synth_xid,
-            &plan.synth_op,
             &plan.synth_commit_ts,
+            &plan.synth_is_deleted,
         ] {
             columns.push(ColMeta {
                 name: synth.name.clone(),

@@ -161,7 +161,7 @@ fn write_pgbench_ch_config(
 
 /// Pre-create the four pgbench destination tables on CH. Shape mirrors
 /// pgbench's `CREATE TABLE` per `src/bin/pgbench/pgbench.c` plus the
-/// synthetic `_lsn`/`_xid`/`_op`/`_commit_ts` trailer the emitter writes.
+/// synthetic `_lsn`/`_xid`/`_commit_ts`/`_is_deleted` trailer the emitter writes.
 /// `pgbench_accounts` carries an extra `c Int32` for item 1's ADD COLUMN
 /// surface.
 fn create_pgbench_ch_tables(ch: &fx::ChServer, database: &str) -> Result<()> {
@@ -173,9 +173,8 @@ fn create_pgbench_ch_tables(ch: &fx::ChServer, database: &str) -> Result<()> {
         "CREATE OR REPLACE TABLE {database}.pgbench_accounts (\
             aid Int32, bid Int32, abalance Int32, filler String, c Nullable(Int32),\
             _lsn UInt64, _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY aid"
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY aid"
     ))?;
     // filler on branches/tellers/history is char(NN) NULL by default
     // — pgbench's `-i` doesn't populate it (see pgbench.c "filler"
@@ -185,17 +184,15 @@ fn create_pgbench_ch_tables(ch: &fx::ChServer, database: &str) -> Result<()> {
         "CREATE OR REPLACE TABLE {database}.pgbench_branches (\
             bid Int32, bbalance Int32, filler Nullable(String),\
             _lsn UInt64, _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY bid"
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY bid"
     ))?;
     ch.query(&format!(
         "CREATE OR REPLACE TABLE {database}.pgbench_tellers (\
             tid Int32, bid Int32, tbalance Int32, filler Nullable(String),\
             _lsn UInt64, _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY tid"
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY tid"
     ))?;
     // pgbench_history has no PK; order by (tid, mtime, aid) for FINAL
     // merges, lean on `_lsn` for ReplacingMergeTree's version semantics.
@@ -204,9 +201,8 @@ fn create_pgbench_ch_tables(ch: &fx::ChServer, database: &str) -> Result<()> {
             tid Int32, bid Int32, aid Int32, delta Int32,\
             mtime DateTime64(6), filler Nullable(String),\
             _lsn UInt64, _xid UInt32,\
-            _op Enum8('insert' = 1, 'update' = 2, 'delete' = 3),\
-            _commit_ts DateTime64(6, 'UTC')\
-         ) ENGINE = ReplacingMergeTree(_lsn) ORDER BY (tid, mtime, aid)"
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY (tid, mtime, aid)"
     ))?;
     Ok(())
 }
@@ -446,7 +442,7 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
         ] {
             let src = psql_source(&source, &format!("SELECT count(*) FROM {src_table}"))?;
             let chc = ch.query(&format!(
-                "SELECT count() FROM {ch_table} FINAL WHERE _op != 'delete'"
+                "SELECT count() FROM {ch_table} FINAL WHERE _is_deleted = 0"
             ))?;
             anyhow::ensure!(
                 src == expected.to_string(),
@@ -553,7 +549,7 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
         ] {
             let src_count = psql_source(&source, &format!("SELECT count(*) FROM {src_table}"))?;
             let ch_count = ch.query(&format!(
-                "SELECT count() FROM {ch_table} FINAL WHERE _op != 'delete'"
+                "SELECT count() FROM {ch_table} FINAL WHERE _is_deleted = 0"
             ))?;
             anyhow::ensure!(
                 src_count == ch_count,
@@ -565,7 +561,7 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
                 &format!("SELECT coalesce(sum({sum_col}), 0)::text FROM {src_table}"),
             )?;
             let ch_sum = ch.query(&format!(
-                "SELECT sum({sum_col}) FROM {ch_table} FINAL WHERE _op != 'delete'"
+                "SELECT sum({sum_col}) FROM {ch_table} FINAL WHERE _is_deleted = 0"
             ))?;
             // CH returns "0" for empty sum; PG via coalesce returns "0"
             // as well. pgbench_history starts empty pre-workload but
@@ -592,7 +588,7 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
         //     to anything other than 7 or NULL.
         let updated_count = ch.query(
             "SELECT count() FROM default.pgbench_accounts FINAL \
-             WHERE _op != 'delete' AND c IS NOT NULL",
+             WHERE _is_deleted = 0 AND c IS NOT NULL",
         )?;
         anyhow::ensure!(
             updated_count.parse::<u64>().unwrap_or(0) > 0,
@@ -601,7 +597,7 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
         );
         let off_value = ch.query(
             "SELECT count() FROM default.pgbench_accounts FINAL \
-             WHERE _op != 'delete' AND c IS NOT NULL AND c != 7",
+             WHERE _is_deleted = 0 AND c IS NOT NULL AND c != 7",
         )?;
         anyhow::ensure!(
             off_value == "0",
