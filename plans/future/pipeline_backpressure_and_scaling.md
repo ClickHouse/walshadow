@@ -424,7 +424,7 @@ that is cheap, no detoast (see blocker below), just resolve + map:
 PageWalkSink::chunk (decode stays here, single-threaded)
   -> BackfillTuple -> bounded channel
        -> bootstrap drain task:
-            resolve rfn via CatalogMapResolver
+            resolve rfn via CatalogMap
             look up TableMapping
             build CommittedTuple { op=Insert, commit_lsn=start_lsn }
             msg_tx.send(BatcherMsg::Row(RoutedRow { seq, rel, mapping, committed }))
@@ -466,14 +466,15 @@ identical either way).
 
 ### Blockers, refined
 
-1. **`detoast_heap` is concretely typed.** `decode_and_route`
-   (`pipeline/decode.rs`) calls `detoast_heap(&mut heap, &chunks, &ctx.catalog)`,
-   and `detoast_heap` (`xact_buffer.rs`) takes `&Arc<Mutex<ShadowCatalog>>`.
-   The `relation_at` call in `decode_and_route` already dispatches through
-   the `RelationResolver` trait (the impl on `Mutex<ShadowCatalog>`, reached
-   by `Arc` deref), so only detoast pins the concrete catalog. The plan's
-   earlier "swap `DecodeCtx.catalog` to `Arc<dyn RelationResolver>` and
-   `decode_and_route` serves both unchanged" understated this. Two ways:
+1. **`decode_and_route` is concretely typed.** Both its resolve
+   (`shadow_catalog::resolve_at_pooled`) and `detoast_heap`
+   (`xact_buffer.rs`) take `&Arc<Mutex<ShadowCatalog>>` — no
+   `RelationResolver` trait exists in the codebase (it was designed,
+   never landed; bootstrap drain grew its own `CatalogMap` path
+   instead). The plan's earlier "swap `DecodeCtx.catalog` to
+   `Arc<dyn RelationResolver>` and `decode_and_route` serves both
+   unchanged" assumed an abstraction that would have to be introduced
+   first. Two ways:
    * Option A sidesteps it: the bootstrap drain builds `RoutedRow` with a
      thin resolve+map fn that never detoasts, matching today's bootstrap
      semantics exactly.

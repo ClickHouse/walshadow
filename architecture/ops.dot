@@ -7,7 +7,6 @@
 // regeneration spec:
 // sources of truth: plans/ops.md · src/cursor.rs · src/preflight.rs · src/retention.rs · src/metrics.rs
 // subsumes: plans/ops.md § "Cursor file" + "Slot advance" + apply-lag metric
-// known discrepancy: cursor field count — defer to src/cursor.rs (plans/INDEX.md says "five-field", plans/ops.md says "6 LSNs")
 // quality bar:
 //   - cursor write edge (magenta dotted) reads as durability path
 //   - slot-advance edge clearly back to source PG, not confused with metrics export
@@ -33,7 +32,7 @@ digraph ops {
 
     feed     [label="SourceFeed::pump\nlast_server_wal_end\n→ source_received_lsn", fillcolor="#3D3D54"];
     segsink  [label="DirSegmentSink::on_segment\nfsync seg + dir\n→ filter_durable_lsn\n(= flush advertised)", fillcolor="#4D3340"];
-    xact     [label="XactBuffer\nstats.drain_lsn\nstats.emitter_ack_lsn\n(on_xact_end → Ok)", fillcolor="#4D4128"];
+    xact     [label="XactBuffer stats.drain_lsn\n+ pipeline ack collector\nemitter_ack atomic\n(contiguous-done watermark)", fillcolor="#4D4128"];
     sweeper  [label="retention_task (30 s)\nSELECT pg_last_wal_replay_lsn()\n→ Arc&lt;AtomicU64&gt; shadow_replay_lsn", fillcolor="#4D3A28"];
     walsrv   [label="walsender server\nrx 'r' standby frames\nShadowStreamState::aggregate\n→ min_flush_lsn", fillcolor="#5D3F40"];
   }

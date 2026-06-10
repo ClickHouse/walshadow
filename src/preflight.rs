@@ -5,9 +5,14 @@
 //!   majors, PG's catalog layout changes across them.
 //! - source `wal_level` not `logical` ([PLAN.md §4]; physical-only WAL
 //!   omits the old-tuple bytes UPDATE/DELETE need).
-//! - any mapped relation without `REPLICA IDENTITY FULL` ([PLAN.md
-//!   §"Pitfall #7"]; UPDATE without FULL emits only changed columns, the
-//!   decoder can't reconstruct the new row).
+//! - a mapped relation has no usable row key: `REPLICA IDENTITY NOTHING`,
+//!   or `DEFAULT` on a table without a primary key. DELETE logs the key
+//!   columns (the whole old row under `FULL`); without a key the tombstone
+//!   can't identify the row to mark deleted and the CH table has no
+//!   `ORDER BY` key to collapse on. `FULL` is accepted, not required:
+//!   `DEFAULT`-with-PK or `USING INDEX` suffice. The new tuple is logged
+//!   in full at `wal_level=logical` regardless of identity, so the old
+//!   values a delete tombstone clears don't matter.
 //! - `--slot` names a physical slot absent on source.
 
 use std::fmt;
@@ -46,8 +51,10 @@ pub enum PreflightError {
     )]
     SlotMissing { slot: String },
     #[error(
-        "mapped relation {rel} has REPLICA IDENTITY {got:?}, expected 'f' \
-         (FULL); ALTER TABLE {rel} REPLICA IDENTITY FULL on the source"
+        "mapped relation {rel} has REPLICA IDENTITY {got:?} and no usable row \
+         key (DEFAULT needs a PRIMARY KEY; NOTHING has none); DELETE can't mark \
+         the row. Add a PRIMARY KEY, or set REPLICA IDENTITY USING INDEX / FULL \
+         on {rel} at the source"
     )]
     BadReplicaIdentity { rel: String, got: char },
     #[error(
@@ -157,7 +164,9 @@ pub async fn run(input: Inputs<'_>) -> Result<PreflightReport, PreflightError> {
             let row = input
                 .source_sql
                 .query_opt(
-                    "SELECT c.relreplident::text \
+                    "SELECT c.relreplident::text, \
+                            EXISTS (SELECT 1 FROM pg_index i \
+                                    WHERE i.indrelid = c.oid AND i.indisprimary) \
                      FROM pg_class c \
                      WHERE c.oid = to_regclass($1)",
                     &[&key.as_str()],
@@ -166,8 +175,9 @@ pub async fn run(input: Inputs<'_>) -> Result<PreflightReport, PreflightError> {
             match row {
                 Some(r) => {
                     let id: String = r.get(0);
+                    let has_pk: bool = r.get(1);
                     let ch = id.chars().next().unwrap_or('?');
-                    if ch != 'f' {
+                    if !replica_identity_has_key(ch, has_pk) {
                         report.errors.push(PreflightError::BadReplicaIdentity {
                             rel: key.clone(),
                             got: ch,
@@ -182,6 +192,13 @@ pub async fn run(input: Inputs<'_>) -> Result<PreflightReport, PreflightError> {
     }
 
     Ok(report)
+}
+
+/// Replica identity gives DELETE a row key: `FULL`/`USING INDEX` always carry
+/// one, `DEFAULT` only with a primary key, `NOTHING` never. Cleared non-key
+/// values on the tombstone are fine — the key alone marks the row deleted.
+fn replica_identity_has_key(relreplident: char, has_pk: bool) -> bool {
+    matches!(relreplident, 'f' | 'i') || (relreplident == 'd' && has_pk)
 }
 
 async fn scalar_text(client: &Client, sql: &str) -> Result<String, tokio_postgres::Error> {
@@ -218,6 +235,19 @@ mod tests {
         let r = PreflightReport { errors: Vec::new() };
         assert!(r.is_ok());
         assert!(r.into_result().is_ok());
+    }
+
+    #[test]
+    fn replica_identity_key_matrix() {
+        // FULL / USING INDEX always carry a key
+        assert!(replica_identity_has_key('f', false));
+        assert!(replica_identity_has_key('i', false));
+        // DEFAULT only with a PK
+        assert!(replica_identity_has_key('d', true));
+        assert!(!replica_identity_has_key('d', false));
+        // NOTHING never; unknown char never
+        assert!(!replica_identity_has_key('n', true));
+        assert!(!replica_identity_has_key('?', true));
     }
 
     #[test]

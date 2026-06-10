@@ -1,79 +1,179 @@
 # emitter
 
-CH-side ingest: per-relation buffer-then-seal INSERT pump, DDL
-applicator, PG → CH type bridge. Three modules — `src/ch_emitter.rs`,
-`src/ch_ddl.rs`,
-`src/type_bridge.rs`. Consumed through `TupleObserver` so xact-buffer
-drain feeds it verbatim
+CH-side ingest is a parallel decode+insert pipeline (`src/pipeline/`):
+
+```text
+pump -> QueueingRecordSink -> reorder -> [decode x M] -> InsertBatcher
+           -> [inserter x N] -> ClickHouse
+                             \-> ack collector -> emitter_ack_lsn
+```
+
+Pipeline stages live in `src/pipeline/{reorder,decode,batcher,inserter,
+ack,tail,mod}.rs`; encoding primitives (`EmitterConfig`, `TableEncoder`,
+`TablePlan`, `ColumnBuf`, value encode, `EmitterStats`) in
+`src/ch_emitter.rs`; DDL in `src/ch_ddl.rs`; PG → CH type mapping in
+`src/type_bridge.rs`. Pool sizes M/N come from `--decoder-pool-size` /
+`--inserter-pool-size`; size 1 is the degenerate serial case. Design
+history + remaining scaling work in
+[future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
+
+The pipeline stands up only with `--ch-config`. Metrics-only runs keep
+the legacy serial path: `XactRecordSink` draining into a
+`TupleObserver` (`MetricsTupleObserver`, oracle-wrapped when
+`--validate` is up) — counters, no CH
 
 ## Purpose
 
-Translate committed-xact tuple streams from xact-buffer's k-way-merge
-into ClickHouse Native blocks buffered per table and sealed as complete
-INSERTs.
-DDL applicator runs in lockstep on sibling CH connection, consuming
-`SchemaEvent`s off `ShadowCatalog::subscribe` and reshaping CH tables
-to track source PG catalog deltas. Emitter ack-LSN feeds cursor file so
-restart resumes from highest commit-record LSN known durable on CH
+Translate committed-xact tuple streams from xact-buffer drain into
+ClickHouse Native blocks buffered per table and sealed as complete
+INSERTs, with enough parallelism that CH Cloud RTT + part-commit cost
+doesn't bound throughput. DDL applies inside an ordering barrier so
+ALTER / CREATE / DROP / TRUNCATE land strictly after all earlier data
+is durable. Emitter ack-LSN (contiguous-done watermark) feeds cursor
+file + standby `apply_lsn` so restart resumes from highest
+commit-record LSN known durable on CH
 
-## Two CH connections
+## Stage walk
 
 ![emitter](../architecture/emitter.svg)
 
-Per-replica wiring is two TCP sockets, both built off same
-`EmitterConfig` `(host, port, user, password, database)`:
+### Reorder coordinator — `pipeline/reorder.rs`
 
-- `Emitter::client` — steady-state INSERT pump. One open INSERT at a
-  time (CH protocol limit), single-table-at-a-time `send_query` +
-  `send_data` loop. Lazy: no wire activity until first row lands
-- `DdlApplicator::client` — DDL writer. `send_query` + drain to
-  `EndOfStream` per ALTER / CREATE / DROP. Stays idle until a
-  `SchemaEvent` arrives
+Single-threaded commit-order boundary. Runs as inner sink of the
+daemon's `QueueingRecordSink` (off the WAL pump task, preserving the
+wire-shadow deadlock fix). Only `RM_XACT_ID` records reach its match:
 
-Two connections, not one, because CH's `Client` is
-single-query-at-a-time. An in-flight INSERT flush (hot path) would
-block any ALTER that needed to ride same wire. Surgical flush on the
-affected relation lands its buffered rows before the DDL; other tables'
-buffered rows stay untouched across the DDL
+- COMMIT — poll-based DROP sweep (gated on `pg_class_delete_epoch`),
+  `XactBuffer::drain_committed`, then assign one dense `seq`,
+  `ack.register(seq, commit_lsn)`, dispatch a `DecodeJob` to the
+  decode pool. Empty commits register a rows=0 seq so the contiguous
+  watermark never gaps
+- ABORT — drop buffer state, register + place a rows=0 seq (never a
+  direct ack bump; everything moves through the gate)
+- ASSIGNMENT — feed `SubxactTracker`
+- PREPARE — no seq; `COMMIT PREPARED` drains it later (two-phase gap:
+  [future/two_phase_commit.md](future/two_phase_commit.md))
 
-## Hold-open buffer shape
+Barrier xacts (any `SchemaEvent` or `HeapOp::Truncate` in the drain)
+run synchronously: data segments between catalog ops each get their own
+seq, and each DDL / TRUNCATE is preceded by `barrier_fence()` — wait
+all dispatched seqs *placed*, `FlushAll` the batcher, wait all seqs
+*durable* — then `DdlApplicator::apply` / `truncate`. Barrier
+coarseness is deliberate; DDL and TRUNCATE are rare. Trailing data
+after the last event flows async, already encoding against the
+post-DDL shape
 
-Wire shape pivoted from `one-INSERT-per-table-per-xact` to rows held in
-per-table `TableEncoder` buffers across xacts, each flush sealing one
-*complete* INSERT. No INSERT is held open on the wire between flushes:
-`open_wire` issues `send_query`, `close_current_wire` ships the block +
-`send_data(None)` + drains `EndOfStream`, and `flush_table` runs the two
-back-to-back. `Emitter::wire_open_key` carries the transiently-open
-table; `open_wire(key)` no-ops only within one flush's open→close window
+### Decode pool — `pipeline/decode.rs`, ×M
 
-The buffer is cleared only after `EndOfStream` (in
-`close_current_wire`). A mid-flush disconnect rolls the whole
-in-progress INSERT back on CH, so the rows stay buffered and the retry
-replays them — `ReplacingMergeTree(_lsn)` collapses any replay dupes.
-The earlier shape left rows shipped-but-unsealed on an open wire, which
-a disconnect would have lost
+Each worker pulls a `DecodeJob` and per heap: `detoast_heap`, resolve
+descriptor via `shadow_catalog::resolve_at_pooled` (read-only pooled
+resolve, replay-LSN-gated), mapping lookup, oracle `PgPending`
+resolution + sampled validation, then routes `RoutedRow`s to the
+batcher in chunks (`DECODE_CHUNK_ROWS = 1024` / `DECODE_CHUNK_BYTES =
+4 MiB`, amortizing the channel hop). After the xact's last row it
+reports `Placed { seq, rows }`. Decode errors are fatal — a
+never-placed seq would pin the watermark forever
 
-`flush_timeout = 0` keeps legacy seal-per-xact behaviour
-(`emitter_ack_lsn` tracks `drain_lsn` exactly). Non-zero `flush_timeout`
-lets pgbench-shaped 4-table xacts coalesce into one MergeTree part per
-window instead of one per xact. Latency cap is configured timeout from
-first-buffered-row-of-window
+Out-of-order completion across workers is fine: rows carry `source_lsn`
+as `_lsn`, so `ReplacingMergeTree(_lsn)` converges per PK. At M=1
+dispatch order (hence per-table WAL order) is preserved
 
-Deadline timer arms when the first row of a fresh window buffers
-(`on_xact_end_with_lsn` sets `flush_deadline = now + flush_timeout`;
-`open_wire` re-arms defensively). Idle ticks call
-`flush_if_deadline_tripped` via `TupleObserver::on_idle` so the last
-burst before traffic stops doesn't sit past the deadline
+### InsertBatcher — `pipeline/batcher.rs`
 
-## BlockBuilder per relation
+Single hub task owning one `TableEncoder` per destination table.
+Encoding happens here, not in decoders, so rows from all M decoders
+and all xacts merge into one part per flush window per table. Rows and
+`FlushAll` share one FIFO channel (`BatcherMsg`, bound 256) so a
+barrier's flush can never seal ahead of rows enqueued before it
+
+Flush triggers, each sealing one `InsertBatch` (complete INSERT's
+worth of owned column slabs + `per_seq` row counts for the collector):
+
+- `enc.rows >= row_budget` (default 65536)
+- `enc.approx_bytes >= byte_budget` (default 1 MiB)
+- per-table deadline armed on first buffered row (`flush_timeout`;
+  operator `0` is substituted with a 100 ms pipeline default —
+  `DEFAULT_PIPELINE_FLUSH` — else a cold table's rows pin the
+  watermark indefinitely)
+- `FlushAll` from the DDL/TRUNCATE barrier or shutdown — seals every
+  table, drops all encoders, bumps `schema_epoch` so next rows rebuild
+  plans against post-DDL descriptors and inserters re-parse cached
+  types
+
+`flush_timeout` trades part count against ack latency: pgbench-shaped
+4-table xacts coalesce into one MergeTree part per window instead of
+one per xact
+
+### Inserter pool — `pipeline/inserter.rs`, ×N
+
+N `AsyncClient` connections. CH Cloud INSERT cost is mostly RTT +
+object-store part commit, so throughput comes from keeping many
+INSERTs in flight. Each inserter pulls `InsertBatch`es off a shared
+mpmc queue — any idle inserter takes any batch, so a hot table can use
+more than one connection — rebuilds the Native block over the batch's
+owned slabs (`TypeAst` cache keyed on `(table, schema_epoch)`;
+`TypeAst` is `Send` not `Sync`, each inserter parses its own), and
+runs one `send_query` + `send_data` + `send_data_end` +
+drain-to-`EndOfStream`
+
+Durability invariant: `ack.acked(per_seq)` fires **only after** the
+drain returns. Until then a connection drop replays the still-owned
+batch — CH dedups the resend by `_lsn`. `rows_emitted` /
+`blocks_sent` stats bump at the same point, so a long-open window
+shows 0 rows until its first seal
+
+### Ack collector — `pipeline/ack.rs`
+
+Refcount-driven contiguous watermark. Downstream completes out of
+order; `emitter_ack_lsn` (advertised as standby `apply_lsn`, bounding
+source slot recycling) must not. Per seq track rows *placed* (decoder
+routed) and *acked* (inserter drained `EndOfStream`); a seq is done
+once `placed == acked` (rows=0 seqs done at placement). Watermark is
+highest contiguous done seq's `commit_lsn`, published into the
+`emitter_ack` atomic the status loop persists to cursor
+
+`Trailing { lsn }` advances past non-commit WAL only when every
+registered seq is done and the xact buffer is empty (reorder's
+`on_idle_advance` guard). A `placed_frontier` watch channel serves the
+barrier's placed-wait. The frontier scan resumes from `placed_frontier`,
+not `next_expected` — the O(N²) re-walk variant pegged the collector
+at 100% CPU and presented as a chc recv/INSERT hang
+
+`emitter_ack` is seeded at the WAL re-read start (`raw_start`), not 0:
+the status loop persists the atomic with no monotonic guard, and a
+zero first write would clobber a resumed cursor
+
+### Fatal — `pipeline/mod.rs`
+
+One-shot error signal shared across stages. First message wins (root
+cause); pump polls it to exit, the barrier `select`s on it so a CH
+outage mid-fence surfaces instead of hanging. Any stage error → fatal
+→ daemon exits → cursor file resumes on restart
+
+## Connections
+
+N inserter connections + 1 `DdlApplicator` connection, all built off
+the same `EmitterConfig` `(host, port, user, password, database)`.
+DDL rides its own connection because CH's client is
+single-query-at-a-time — an in-flight INSERT would block an ALTER on
+the same wire. Ordering between data and DDL comes from the barrier
+fence, not connection discipline
+
+Compression: feature-gated through walshadow's own `lz4` / `zstd`
+features which forward to `clickhouse-c-rs`. `CompressionChoice::Lz4`
+is default; `build_codec` returns `EmitterError::CompressionUnsupported`
+when variant's feature is off. CH wire default is LZ4 so default build
+matches CH's own posture
+
+## TableEncoder + ColumnBuf
 
 `TableEncoder` owns one `Vec<ColumnBuf>` per destination column, mapped
 + synthetic. Built lazily on first row via `TablePlan::build` off
-descriptor + mapping; cached in `Emitter::tables` keyed on source
-`<namespace>.<relname>`. Encoder is column-major: each column
-accumulates into its own slab, `BlockBuilder` borrows into all slabs at
-flush time, `send_data` ships, then `clear()` zeros lengths while
-keeping allocation
+descriptor + mapping; cached in the batcher hub keyed on source
+`<namespace>.<relname>` until a barrier `FlushAll` clears it. Encoder
+is column-major: each column accumulates into its own slab,
+`take_block` hands the slabs to an `InsertBatch`, the inserter's
+`BlockBuilder` borrows into them at send time
 
 `ColumnBuf` variants:
 
@@ -89,21 +189,6 @@ walshadow-side type table, so `FixedString(N)`, `DateTime64(p)`,
 `Decimal*(p,s)`, `Enum8` etc resolve without walshadow mirroring
 upstream surface. `elem_size == 0` means varlen; only varlen shape
 today is `String`, anything else dies cleanly at `append`
-
-Flush triggers (each seals a *complete* INSERT — open → block →
-`EndOfStream` → clear):
-
-- `enc.rows >= config.row_budget` (default 65536) — `tripped` branch in
-  `Emitter::route`
-- `enc.approx_bytes >= config.byte_budget` (default 1 MiB)
-- xact end (legacy mode), deadline trip, schema event, TRUNCATE,
-  shutdown
-
-Compression: feature-gated through walshadow's own `lz4` / `zstd`
-features which forward to `clickhouse-c-rs`. `CompressionChoice::Lz4`
-is default; `build_codec` returns `EmitterError::CompressionUnsupported`
-when variant's feature is off. CH wire default is LZ4 so default build
-matches CH's own posture
 
 ## Type bridge
 
@@ -167,9 +252,9 @@ non-nullable by construction, encoded in `TableEncoder::new`:
 
 `_lsn` is dedup key because emitter ack lags actual CH durability by up
 to one flush window. On restart cursor's `emitter_ack_lsn` rewinds to
-last close-acked LSN; everything between that and now-stale buffered
-rows re-emits, `ReplacingMergeTree(_lsn)` resolves duplicates
-server-side without walshadow having to track which rows already landed
+last contiguous-done LSN; everything between that and the crash
+re-emits, `ReplacingMergeTree(_lsn)` resolves duplicates server-side
+without walshadow having to track which rows already landed
 
 ## Mapping config
 
@@ -185,10 +270,12 @@ columns = [
 ```
 
 `MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>`
-is live handle emitter consults per row. Handle is cloneable; daemon's
-SIGHUP task swaps whole inner `HashMap` between xacts. Cached
-`TableEncoder`s in `Emitter::tables` keep their old `TablePlan` until
-next route call rebuilds off fresh mapping
+is the live handle the decode pool consults per row. Handle is
+cloneable; daemon's SIGHUP task swaps whole inner `HashMap`. Routing
+picks up the swap immediately; the batcher's cached `TableEncoder`
+keeps its old `TablePlan` until the next barrier `FlushAll` (or
+restart) rebuilds it — a SIGHUP retarget therefore fully applies only
+at the next DDL/TRUNCATE boundary
 
 ### NamespaceMapping (partial)
 
@@ -246,14 +333,17 @@ See [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
 
 ## DdlApplicator
 
-`ch_ddl.rs::DdlApplicator` consumes `SchemaEvent` off
-`ShadowCatalog::subscribe` (`mpsc::UnboundedReceiver`, not bounded —
-plan said bounded, landed code uses unbounded so a stalled applicator
-never back-pressures catalog producer). Apply table:
+`ch_ddl.rs::DdlApplicator`, owned by the reorder coordinator. Events
+originate at `ShadowCatalog::subscribe`
+(`mpsc::UnboundedReceiver<SchemaEvent>` — unbounded so a stalled
+consumer never back-pressures the catalog producer), ride the xact
+buffer keyed on `(xid, source_lsn)`, and surface in `drain_committed`'s
+`ordered_events`; the barrier applies each in source-LSN order. Apply
+table:
 
 | `SchemaEvent` | CH SQL |
 |---|---|
-| `Added { desc }` | `CREATE TABLE IF NOT EXISTS` (in the namespace's `target_database`, else global default) when namespace `auto_create = true` and no pre-pinned mapping. Auto-derives `TableMapping` against that same database post-success so next `route` call ships rows against the new table |
+| `Added { desc }` | `CREATE TABLE IF NOT EXISTS` (in the namespace's `target_database`, else global default) when namespace `auto_create = true` and no pre-pinned mapping. Auto-derives `TableMapping` against that same database post-success so subsequent rows ship against the new table |
 | `Changed { diff }` | `ALTER TABLE … RENAME COLUMN` first (so position-match diffs don't trip into drop+add), then `ALTER TABLE … ADD COLUMN IF NOT EXISTS` per added attnum, then `ALTER TABLE … DROP COLUMN IF EXISTS` per dropped attnum |
 | `Changed.type_changes` | rejected, logged, `stats.type_changes_rejected += n`. Operator handles via manual CH migration |
 | `Dropped { qualified_name }` | gated on the namespace's `DropTableStrategy` (`drop_strategy_for`, else global): `Retain` (default) skips silently, `Warn` skips at WARN, `Drop` runs `DROP TABLE IF EXISTS` |
@@ -269,6 +359,10 @@ operator's TOML used old source name), drops strip `ColumnMapping`,
 adds push new entry derived through `type_bridge::map`. Operator-pinned
 overrides survive: only `src_attnum`-matching entries the applicator
 could have produced get touched
+
+DDL has no retry: an applicator error trips fatal so the operator sees
+it directly. Runtime-config-from-PG work may add bounded reconnect for
+the DDL connection
 
 ### Baseline seeding (the `Added`-vs-`Changed` discriminator)
 
@@ -298,26 +392,34 @@ excluded one. Auto-create tables need no seeding — their first-touch
 drift (column added while the daemon is down folds silently into the
 seeded baseline) — see `plans/future/pinned_ddl_baseline.md` "Deferred".
 
-### await_ready gate
+### Barrier fence (ordering data around DDL)
 
-Coordination with INSERT pump is synchronous, not channel-based.
-`Emitter::dispatch_schema_event` flushes + closes wire on affected key,
-drops `tables[key]`, then calls `applicator.apply` (diagram, top of
-DDL column). Surgical close (this table only) keeps other tables' open
-INSERTs intact, important for pgbench's 4-table-per-xact shape where
-closing-all would break cross-INSERT pipeline
+`ReorderSink::barrier_fence` = `wait_placed_through(next_seq)` (decode
+pool routed every earlier row onto the batcher channel) → batcher
+`FlushAll` + reply (seals every row enqueued before it — shared FIFO
+channel makes the ordering structural) → `wait_through(next_seq)`
+(every earlier seq durable on CH). Only then does the applicator run.
+Fence is global, not per-table: simpler than the surgical
+single-table close the serial emitter did, acceptable because barriers
+are DDL/TRUNCATE-rate. `FlushAll` also bumps `schema_epoch`, so
+post-DDL rows rebuild `TablePlan`s and inserters re-parse types
 
 ## TRUNCATE path
 
-`HeapOp::Truncate` in `Emitter::route`:
+TRUNCATE is a reorder barrier, never a batcher row (`handle_row`
+errors on `HeapOp::Truncate` by construction):
 
-1. Flush any pending rows for relation through `flush_table` (so prior
-   INSERTs in same xact land before truncate)
-2. `close_current_wire` — drops open INSERT if any
-3. Remove relation's `TableEncoder` from `tables`
-4. `send_query("TRUNCATE TABLE <dest>")` on emitter's client
-5. Drain to `EndOfStream` / `Exception`
-6. Bump `stats.truncates_emitted`
+1. dispatch pending data segment as its own seq
+2. `barrier_fence()` — earlier rows for the relation are durable
+3. `DdlApplicator::truncate` runs `TRUNCATE TABLE <dest>` on the DDL
+   connection, drains to `EndOfStream` / `Exception`
+4. bump `stats.truncates_emitted`; subsequent segments of the same
+   xact follow as fresh seqs
+
+Within a barrier xact, data segments between TRUNCATEs each get their
+own seq and fence, so a `TRUNCATE` (no `_lsn`, can't ride
+`ReplacingMergeTree` reconciliation) orders correctly against
+surrounding inserts
 
 `RESTART_SEQS` flag is ignored — sequence state isn't replicated.
 PG's `TRUNCATE … RESTART IDENTITY` arrives as same `HeapOp::Truncate`
@@ -326,13 +428,13 @@ but doesn't propagate through `DecodedHeap`
 
 ## Foreign-DB row skip
 
-Physical replication ships the whole cluster's WAL, so `route` sees
-heap records for relations in other databases. `relation_at` rejects
-those with `CatalogError::ForeignDatabase` (filenode resolved to a
-`db_node` that's neither the shadow DB nor a shared catalog — see
-[shadow.md](shadow.md)). Emitter treats it like an unmapped relation:
-no append, no poison, bump `stats.foreign_db_rows_skipped`, return
-`Ok(())` so the ack advances past it
+Physical replication ships the whole cluster's WAL, so the decode pool
+sees heap records for relations in other databases. `resolve_at_pooled`
+rejects those with `CatalogError::ForeignDatabase` (filenode resolved
+to a `db_node` that's neither the shadow DB nor a shared catalog — see
+[shadow.md](shadow.md)). Worker skips the row: no route, no poison,
+bump `stats.foreign_db_rows_skipped`; the seq's placed count simply
+excludes it so the ack advances past it
 
 ## Read-time defaults integration
 
@@ -342,108 +444,95 @@ carries typoutput text; resolution tiers:
 
 - Tier 1 (immediate): bool / int / float / numeric / text — decoder
   resolves at parse time via `heap_decoder::missing_value_for(att)`,
-  emitter sees fully-decoded `ColumnValue`
+  batcher sees fully-decoded `ColumnValue`
 - Tier 2 (typmod-aware): timestamp / timestamptz / date — decoder
-  resolves with typmod, emitter sees concrete `ColumnValue`
+  resolves with typmod
 - Tier 3 (oracle): unsupported / array / domain types — decoder emits
-  `ColumnValue::PgPending { raw, type_oid }`. Oracle extension
-  (separate PG-side process) resolves at emit time; falls through to
-  raw bytes when oracle absent
+  `ColumnValue::PgPending { raw, type_oid }`. Decode workers run
+  `resolve_pending_tuple` against the shadow-side extension; falls
+  through to raw bytes when oracle absent
 
-`encode_value` in emitter handles `PgPending` by shipping `raw` as
+`encode_value` handles a surviving `PgPending` by shipping `raw` as
 String — no error, no stat bump, operators handle post-process via
 PG-side tooling. See [decoder.md](decoder.md) for tier classification +
 [oracle.md](oracle.md) for extension protocol
 
 ## Ack-LSN tracking
 
-`TupleObserver::on_xact_end(&mut self, commit_lsn: u64) -> Result<u64, …>`
-returns highest LSN known durable on CH. Two values move through
-emitter:
+See [Ack collector](#ack-collector--pipelineackrs) for mechanism. The
+operational contract:
 
-- `pending_max_commit_lsn`: highest `commit_lsn` of any row buffered in
-  a `TableEncoder` but not yet sealed by a completed INSERT
-  (`EndOfStream`). Bumped per tuple in `route`, reset to 0 once every
-  buffer has drained. Nothing is ever shipped-but-unsealed, so this
-  tracks buffered rows alone
-- `last_durable_commit_lsn`: monotonic horizon. Promoted from
-  `pending_max_commit_lsn` only inside `close_all_open_inserts`
-  (deadline trip or legacy per-xact close) or when an empty xact
-  arrives with no rows pending. Promotion is safe precisely because
-  every buffer is drained first — the horizon never passes a
-  still-buffered row
+- `emitter_ack_lsn` in the cursor file is the contiguous-done
+  commit-record LSN — every xact at or below it is fully durable on
+  CH. It lags `drain_lsn` by up to one flush window
+  (`flush_timeout`); the per-table deadline bounds the lag even on
+  cold tables
+- rows=0 seqs (aborts, empty commits, fully-filtered xacts) complete
+  at placement so they never pin the watermark
+- trailing non-commit WAL acks only when the xact buffer is empty and
+  every seq is done — a quiescent-tick nudge can't claim rows still in
+  flight
+- a placed-but-never-acked batch pins the watermark forever by design
+  (retry exhaustion is fatal first); the daemon's stall watchdog
+  surfaces the oldest incomplete seq
 
-Hold-open mode means `last_durable_commit_lsn` lags `drain_lsn` until
-the deadline trips — `emitter_ack_lsn` in cursor file reflects that lag
+See [ops.md](ops.md) for cursor + recovery contract; replay starts
+from `min(shadow_replay_lsn, emitter_ack_lsn)`
 
-`idle_ack_ceiling(lsn)` exposes that horizon to the idle path: when
-nothing is buffered (no open wire, every encoder empty) it returns
-`lsn` (trailing non-commit WAL is shippable-free, safe to ack fully),
-else it caps at `last_durable_commit_lsn` so a quiescent-tick nudge
-can't ack rows still buffered. `on_idle` separately returns the LSN a
-deadline-triggered close just made durable, which the xact buffer folds
-into `emitter_ack_lsn` via `note_idle_durable`. See [ops.md](ops.md)
-for cursor + recovery contract; `cursor.rs` writes value to disk on
-every observer ack and replay starts from
-`min(shadow_replay_lsn, emitter_ack_lsn)`
+## Bootstrap shares the tail
 
-## Bootstrap-time emitter
-
-Transitional emitter spun up by `backfill_bootstrap.rs` for initial
-COPY-FROM drain. No `DdlApplicator` attached (bootstrap descriptor set
-is frozen at snapshot time), no SIGHUP wiring, no held-open behaviour.
-Force-closed at end of bootstrap via `flush_open_inserts`; steady-state
-emitter then opens fresh connections for streaming. See
+`pipeline/tail.rs` packages batcher + inserter pool + ack collector as
+one reusable unit. Greenfield bootstrap
+(`pipeline/bootstrap.rs::drain`) feeds the identical tail from the
+page walk — bootstrap inherits the N-connection pool, reconnect +
+retry, durable watermark, and backpressure for free. One synthetic seq
+per rfn; `tail.finish` seals partial batches, waits all seqs durable,
+then drains the cascade. No `DdlApplicator` attached (bootstrap
+descriptor set is frozen at snapshot time). See
 [bootstrap.md](bootstrap.md)
 
 ## Retry behaviour
 
-Bounded retry on every public `Emitter::*` method. `is_retryable`
-classifies `EmitterError::{Io, Client, ServerException}` as transient
-(network / CH-server / clickhouse-c protocol); `Config`, `Type`,
-`Catalog`, `UnsupportedValue` stay fatal because they encode bugs in
-daemon or mapping that retry would loop forever on
+Retry lives at the inserter, around one prepared INSERT
+(`send_with_retry`): bounded attempts (`RetryConfig::max_attempts`)
+with exponential backoff capped at `max_backoff`, reconnecting between
+attempts. The sealed block is unchanged across retries, so a reconnect
+just resends — CH dedups by `_lsn`. `insert_timeout` (default 30 s)
+wraps the whole send so a connection wedged mid-INSERT surfaces as
+retryable `EmitterError::Timeout` instead of pinning the watermark
 
-Wrapper functions (`route_with_retry`, `on_xact_end_with_retry`,
-`flush_if_deadline_tripped_with_retry`, `flush_open_inserts_with_retry`)
-loop up to `RetryConfig::max_attempts` with exponential backoff capped
-at `max_backoff`, calling `Emitter::reconnect` between attempts.
-`reconnect` opens fresh `TcpStream`, builds new `Client`, hot-swaps
-`self.client`, clears `wire_open_key`. Per-table accumulator state in
-`self.tables` survives so a CH bounce mid-xact lets surviving buffered
-rows flush through new connection on retry
+`is_retryable` classifies `EmitterError::{Io, Client, ServerException,
+Timeout}` as transient (network / CH-server / clickhouse-c protocol);
+`Config`, `Type`, `Catalog`, `UnsupportedValue` stay fatal because
+they encode bugs in daemon or mapping that retry would loop forever on
 
-Budget expiry kills daemon — `route_with_retry` returns last `Err`,
-worker poisons stream, daemon exits, cursor file resumes on restart.
-See [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md) for
-deeper "re-emit from spill" story (segment-buffered replay across
+Budget expiry trips `Fatal` — daemon exits, cursor file resumes on
+restart. See [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md)
+for deeper "re-emit from spill" story (segment-buffered replay across
 extended CH outages) not yet shipped
-
-DDL retry is currently a no-op: `dispatch_schema_event_with_retry`
-calls through without retry — DDL errors poison stream so operator
-sees them directly. Runtime-config-from-PG work may add bounded
-reconnect for DDL connection
 
 ## Cross-links
 
-- [xact.md](xact.md) — `XactBuffer::commit` k-way-merges
-  `CommittedTuple` + `SchemaEvent` in source-LSN order, drains into
-  emitter via `TupleObserver`
+- [xact.md](xact.md) — `XactBuffer::drain_committed` merges
+  `DecodedHeap` + `SchemaEvent` in source-LSN order; reorder consumes
+  the drain
 - [shadow.md](shadow.md) — `ShadowCatalog::subscribe` produces
   `SchemaEvent` stream; catalog snapshot drives descriptors
   `TablePlan::build` reads
 - [decoder.md](decoder.md) — `HeapDecoder` produces `ColumnValue` /
-  `CommittedTuple`. Read-time defaults tier-classify here
-- [ops.md](ops.md) — `cursor.rs` writes `emitter_ack_lsn` to on-disk
-  cursor file; restart resumes from
-  `min(shadow_replay_lsn, emitter_ack_lsn)`
+  `DecodedHeap`. Read-time defaults tier-classify here
+- [ops.md](ops.md) — cursor file, stall watchdog, SIGHUP mapping
+  reload, slot advance on `min(shadow_replay_lsn, emitter_ack_lsn)`
 - [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
   — `clickhouse-c-rs` unsafe surface (`BlockBuilder` borrows into
   `ColumnBuf` slabs, `PosixIo` owns fd, `Client` lifetime invariants)
-- [bootstrap.md](bootstrap.md) — transitional bootstrap emitter wiring,
-  force-close handshake
+- [bootstrap.md](bootstrap.md) — shared-tail wiring, `tail.finish`
+  handshake
 - [oracle.md](oracle.md) — Tier 3 default resolution via PG-side
   extension, `PgPending` routing
+- [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
+  — pipeline design record; remaining: pump wire/record split,
+  bootstrap decode pool (Option B), hot-table sharding, M/N sizing
 - [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
   — runtime-config substrate; `ResolvedConfig` + `watch::Receiver`
   shape partial namespace-mapping work needs to land first

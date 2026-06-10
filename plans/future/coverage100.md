@@ -95,11 +95,12 @@ Covered:
 Use existing in-proc and fixture paths. Extend
 `tests/common/inproc_harness.rs`, fixture replay, or module-local tests
 
-- **Emitter flush variants:** cover `flush_open_inserts`,
-  `flush_if_deadline_tripped`, retry variants, `idle_ack_ceiling`,
-  `RecordSink` `on_idle` / `on_close`, and `Display` / `fmt`.
+- **Pipeline tail variants:** cover batcher deadline / `FlushAll` /
+  budget trips, inserter `send_with_retry` + reconnect arms, ack
+  collector `Trailing` / gap cases, `RecordSink` `on_idle` /
+  `on_close`, and `Display` / `fmt`.
   `tests/emitter_budget_flush.rs` and `tests/emitter_native_types.rs` already
-  build emitters in-proc; add deadline-trip and idle-ack assertions there
+  build the tail in-proc; add deadline-trip and trailing-ack assertions there
 - **`wal_stream` helper sinks:** exercise `CountingRecordSink::on_record`,
   `CollectingBytesSink` chunk / segment-boundary handling, and `Record`
   helpers. Delete helpers if dead after confirming no non-test caller
@@ -113,10 +114,8 @@ Use existing in-proc and fixture paths. Extend
 - **`xact_buffer.rs` detoast and observer errors:** feed truncated pglz and bad
   lz4 TOAST through subxact / large-xact harnesses; inject observer failures
   where callbacks already exist
-- **Live-client accessors:** once emitter harness builds an
-  `Emitter`, assert `applicator_mut`, `last_durable_commit_lsn`, and
-  `idle_ack_ceiling`. Once DDL harness builds a `DdlApplicator`, assert
-  `config` and `config_mut`. These structs hold live `Client<'static>`, so
+- **Live-client accessors:** once DDL harness builds a `DdlApplicator`,
+  assert `config` and `config_mut`. Holds a live `AsyncClient`, so
   pure unit construction is not practical
 - **`queueing_record_sink.rs` worker-stopped branch:** build sink with inner
   `RecordSink` that errors on `on_record`, push batch so worker exits, then

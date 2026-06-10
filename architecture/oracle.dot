@@ -22,16 +22,16 @@ digraph oracle {
   subgraph cluster_decoder {
     label="① decoder — ColumnValue (heap_decoder.rs)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     tier12 [label="ColumnValue::Tier 1/2\nfixed-width / varlena\nlocally rendered\n(no raw bytes kept)", fillcolor="#4D4128"];
-    tier3  [label="ColumnValue::Tier 3\nnumeric / inet / cidr /\ninterval (codecs.rs)\nlocal text + raw bytes", fillcolor="#4D4128"];
+    tier3  [label="ColumnValue::Tier 3\nnumeric / inet / cidr /\ninterval (codecs.rs)\nlocal decode only\n(raw bytes discarded)", fillcolor="#4D4128"];
     pend   [label="ColumnValue::PgPending\n{ type_oid, raw }\njsonb / array / range /\ntsvector / domain / vendor", fillcolor="#5D3F40"];
   }
 
   // ════════ ② oracle observer ════════
   subgraph cluster_oracle {
-    label="② OracleObserver (src/oracle.rs) — TupleObserver wrapper"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    label="② oracle path (src/oracle.rs) — decode pool ×M calls directly; OracleObserver wraps the serial metrics-only path"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     resolve  [label="resolve_pending_tuple\nwalk columns,\nPgPending → resolve_pending\nswap to Text on Ok(Some)", fillcolor="#5D3F40"];
     sampler  [label="Sampler::pick\nAtomicU64::fetch_add(Relaxed)\nrate == 0 short-circuits\nelse 1-in-N hit", fillcolor="#5D3F40", shape=parallelogram];
-    validate [label="validate\ntype_oid ∈ {numeric,\n inet, cidr, interval}\nelse skip", fillcolor="#5D3F40"];
+    validate [label="validate(type_oid, raw, local_text)\nPgPending only (raw present;\n local_text empty) —\nprobe = extension call succeeds\n+ returns text", fillcolor="#5D3F40"];
     stats    [label="OracleStats\nresolved / fallback_raw /\nprobes / matches /\nmismatches / errors", fillcolor="#5D3F40", shape=note];
   }
 
@@ -69,7 +69,8 @@ digraph oracle {
   client  -> ext      [color="#CBA85E", penwidth=2, dir=both, arrowtail=open, lhead=cluster_shadow, label="libpq SELECT\ntokio_postgres pool\n(separate from\n ShadowCatalog)", weight=10];
 
   // ─── validator branch (parallel rail) ───
-  tier3   -> sampler  [color="#b380b0", style=dashed];
+  pend    -> sampler  [color="#b380b0", style=dashed];
+  tier3   -> sampler  [color="#b380b0", style=dotted, label="skipped\n(raw bytes\n discarded)"];
   tier12  -> sampler  [color="#b380b0", style=dotted, label="skipped\n(no raw\n bytes)"];
   sampler -> validate [color="#b380b0", label="1-in-N hit"];
   validate -> client  [color="#CBA85E", label="probe SQL"];
@@ -91,7 +92,7 @@ digraph oracle {
   // ─── emit disposition (off-axis fan-out from oracle) ───
   resolve  -> emit_text [color="#BF8C5F", penwidth=2, constraint=false, label="Ok(Some)\nPgPending\n→ Text"];
   resolve  -> emit_raw  [color="#BF8C5F", style=dashed, constraint=false, label="Ok(None)\next absent /\nNULL / error"];
-  validate -> alarm     [color="#BF8C5F", style=dashed, constraint=false, label="local !=\nshadow"];
+  validate -> alarm     [color="#BF8C5F", style=dashed, constraint=false, label="probe error /\ntext mismatch"];
 
   // ─── Legend ───
   legend [shape=plaintext, label=<
@@ -111,9 +112,9 @@ digraph oracle {
       <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>emit-time disposition</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>pgext install (filesystem)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>trigger sources</B></TD></TR>
-      <TR><TD><B>PgPending</B></TD><TD>always — once per col</TD></TR>
-      <TR><TD><B>Tier 3</B></TD><TD>--validate N, sampler-gated</TD></TR>
-      <TR><TD><B>Tier 1/2</B></TD><TD>not validated (no raw bytes)</TD></TR>
+      <TR><TD><B>PgPending resolve</B></TD><TD>always — once per col</TD></TR>
+      <TR><TD><B>PgPending probe</B></TD><TD>--validate N, sampler-gated</TD></TR>
+      <TR><TD><B>Tier 1/2/3</B></TD><TD>not validated (raw bytes not retained)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>extension-absence</B></TD></TR>
       <TR><TD COLSPAN="2" ALIGN="LEFT">probe_extension at connect →<BR ALIGN="LEFT"/>has_extension=false →<BR ALIGN="LEFT"/>resolve_pending Ok(None) →<BR ALIGN="LEFT"/>stats.fallback_raw++ →<BR ALIGN="LEFT"/>emitter writes raw bytes.<BR ALIGN="LEFT"/>No failure. CREATE EXTENSION<BR ALIGN="LEFT"/>+ reconnect re-enables.</TD></TR>
     </TABLE>

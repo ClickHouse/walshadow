@@ -3,11 +3,12 @@
 //! Two drills, both lean enough to run with `initdb` on PATH and no
 //! ClickHouse or pg_basebackup dependency:
 //!
-//! 1. Pre-flight rejects a source whose `wal_level != 'logical'` AND a
-//!    mapped relation lacking `REPLICA IDENTITY FULL`, surfacing every
-//!    finding from one probe instead of one-error-at-a-time.
-//! 2. Pre-flight passes once the source's `wal_level` is fixed and the
-//!    relation has been re-keyed FULL.
+//! 1. Pre-flight rejects a source whose `wal_level != 'logical'` AND
+//!    mapped relations without a usable row key (`DEFAULT` without PK,
+//!    `NOTHING` even with one), surfacing every finding from one probe
+//!    instead of one-error-at-a-time.
+//! 2. Pre-flight passes once the source's `wal_level` is fixed and every
+//!    mapped relation carries a key: `DEFAULT`+PK, `USING INDEX`, `FULL`.
 //!
 //! The metrics endpoint + retention trim are covered by lib unit tests
 //! (`metrics::tests::http_serve_returns_text_format_body`,
@@ -83,19 +84,21 @@ async fn connect_sql(socket: &std::path::Path, port: u16) -> Result<tokio_postgr
     Ok(client)
 }
 
-fn mapping_for(rel: &str) -> EmitterConfig {
+fn mapping_for(rels: &[&str]) -> EmitterConfig {
     let mut cfg = EmitterConfig::default();
-    cfg.tables.insert(
-        rel.to_string(),
-        TableMapping {
-            target: format!("ch.{rel}"),
-            columns: vec![ColumnMapping {
-                src_attnum: 1,
-                target_name: "id".into(),
-                target_type: "Int64".into(),
-            }],
-        },
-    );
+    for rel in rels {
+        cfg.tables.insert(
+            (*rel).to_string(),
+            TableMapping {
+                target: format!("ch.{rel}"),
+                columns: vec![ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: "Int64".into(),
+                }],
+            },
+        );
+    }
     cfg
 }
 
@@ -109,15 +112,18 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
     let source = make_pg(&tmp, "src-bad", SOURCE_PORT_A);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
-    // wal_level=replica + a relation with the default REPLICA IDENTITY
-    // (`d`) so both validators trip on the same probe.
+    // wal_level=replica + keyless relations so both validators trip on
+    // the same probe: `t` is DEFAULT (`d`) without a PK, `t_nothing` is
+    // NOTHING (`n`) — its PK doesn't rescue it.
     append_conf(&source, "replica");
     source.start().expect("start source");
     let _src_stop = StopOnDrop { sh: &source };
     source
         .apply_schema_dump(
             "CREATE SCHEMA s10;\n\
-             CREATE TABLE s10.t (id bigint PRIMARY KEY, payload text);\n",
+             CREATE TABLE s10.t (id bigint, payload text);\n\
+             CREATE TABLE s10.t_nothing (id bigint PRIMARY KEY, payload text);\n\
+             ALTER TABLE s10.t_nothing REPLICA IDENTITY NOTHING;\n",
         )
         .expect("schema");
 
@@ -134,7 +140,7 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
         .await
         .expect("shadow sql");
 
-    let ch_config = mapping_for("s10.t");
+    let ch_config = mapping_for(&["s10.t", "s10.t_nothing"]);
     let report = walshadow::preflight::run(Inputs {
         source_version_num: 170_000, // > 16, so version check passes
         source_sql: &src_sql,
@@ -156,21 +162,33 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
         report.errors
     );
 
-    let has_repl_ident = report.errors.iter().any(|e| {
+    let has_default_no_pk = report.errors.iter().any(|e| {
         matches!(
             e,
             PreflightError::BadReplicaIdentity { rel, got } if rel == "s10.t" && *got == 'd'
         )
     });
     assert!(
-        has_repl_ident,
+        has_default_no_pk,
         "expected BadReplicaIdentity for s10.t got 'd' in {:?}",
+        report.errors,
+    );
+
+    let has_nothing = report.errors.iter().any(|e| {
+        matches!(
+            e,
+            PreflightError::BadReplicaIdentity { rel, got } if rel == "s10.t_nothing" && *got == 'n'
+        )
+    });
+    assert!(
+        has_nothing,
+        "expected BadReplicaIdentity for s10.t_nothing got 'n' in {:?}",
         report.errors,
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn preflight_passes_once_source_is_logical_and_relation_is_full() {
+async fn preflight_passes_once_source_is_logical_and_relations_keyed() {
     if !pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
@@ -182,11 +200,17 @@ async fn preflight_passes_once_source_is_logical_and_relation_is_full() {
     append_conf(&source, "logical");
     source.start().expect("start source");
     let _src_stop = StopOnDrop { sh: &source };
+    // One mapped relation per accepted identity shape: DEFAULT with PK
+    // (no ALTER needed), USING INDEX, FULL (keyless is fine under FULL).
     source
         .apply_schema_dump(
             "CREATE SCHEMA s10;\n\
              CREATE TABLE s10.t (id bigint PRIMARY KEY, payload text);\n\
-             ALTER TABLE s10.t REPLICA IDENTITY FULL;\n",
+             CREATE TABLE s10.t_idx (id bigint NOT NULL, payload text);\n\
+             CREATE UNIQUE INDEX t_idx_key ON s10.t_idx (id);\n\
+             ALTER TABLE s10.t_idx REPLICA IDENTITY USING INDEX t_idx_key;\n\
+             CREATE TABLE s10.t_full (id bigint, payload text);\n\
+             ALTER TABLE s10.t_full REPLICA IDENTITY FULL;\n",
         )
         .expect("schema");
 
@@ -203,7 +227,7 @@ async fn preflight_passes_once_source_is_logical_and_relation_is_full() {
         .await
         .expect("shadow sql");
 
-    let ch_config = mapping_for("s10.t");
+    let ch_config = mapping_for(&["s10.t", "s10.t_idx", "s10.t_full"]);
     // Make the version-num arg the real source version so the
     // major-mismatch check exercises against the same version both
     // sides are running (source + shadow share initdb's binary).

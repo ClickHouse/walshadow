@@ -32,13 +32,17 @@ hitting 3-4 setup issues see them all at once. Checks driven from
 - `wal_level = 'logical'`. Physical-only WAL omits old-tuple bytes
   UPDATE / DELETE need
 - `--slot` resolves in `pg_replication_slots` when set
-- Every `--ch-config` mapped relation has `relreplident = 'f'`. Uses
+- Every `--ch-config` mapped relation has a usable row key:
+  `relreplident` ∈ {`'f'`, `'i'`}, or `'d'` with a primary key. `'n'` and
+  keyless `'d'` are rejected — DELETE needs a key to mark the row, cleared
+  non-key values are fine. `FULL` is accepted, not required. Uses
   `to_regclass(text)` so missing relations land as `MappedRelMissing`
   (NULL row), not `SqlState::UNDEFINED_TABLE` SQL error. `quote_ident`
   alternative rejected, doesn't handle `"namespace.relname"` form
 
 Each finding renders to a precise variant with operator-actionable text
-(`ALTER TABLE foo REPLICA IDENTITY FULL on the source`). No
+(add a PRIMARY KEY, or `ALTER TABLE foo REPLICA IDENTITY USING INDEX / FULL`
+on the source). No
 silent-skip fall-throughs. `--skip-preflight` exists for development
 work, not production. Daemon prints report and exits non-zero on any
 finding
@@ -65,8 +69,9 @@ Inventory by category:
 - `walshadow_shadow_replay_lsn` — `pg_last_wal_replay_lsn()`, polled
   shared with retention sweeper via one `Arc<AtomicU64>`
 - `walshadow_decoder_commit_lsn` — wired to `XactBufferStats.drain_lsn`
-- `walshadow_emitter_ack_lsn` — `XactBufferStats.emitter_ack_lsn`,
-  single source of truth (see [xact.md](xact.md))
+- `walshadow_emitter_ack_lsn` — pipeline ack collector's atomic
+  (contiguous-done watermark, see [emitter.md](emitter.md)); falls back
+  to `XactBufferStats.emitter_ack_lsn` on the metrics-only serial path
 
 ### Counters
 
@@ -148,9 +153,11 @@ stderr-to-journal deployments don't need it
 atomically swaps emitter's
 `Arc<RwLock<HashMap<String, TableMapping>>>`
 ([`MappingHandle`](../src/ch_emitter.rs)) via
-`*handle.write().await = new`. New mapping picks up at next xact
-boundary; `Emitter::tables` per-table encoder cache clears at end of
-`drain_xact` so next `route()` call consults live handle and rebuilds
+`*handle.write().await = new`. Decode pool consults the handle per
+row, so routing picks up the swap immediately; the batcher's cached
+`TableEncoder` keeps its old `TablePlan` until the next DDL/TRUNCATE
+barrier `FlushAll` (or restart) rebuilds it — a retarget fully lands
+at the next barrier, not the next xact
 
 Mid-xact application rejected: would change CH dest of
 already-buffered rows mid-flush, requiring CH-server-side "redirect"
@@ -349,12 +356,12 @@ v1.0 acceptance §1 end-to-end
 
 Pipeline: `initdb` source PG `wal_level=logical` → `pgbench -i -s 1`
 (100k `pgbench_accounts`, 1 branch, 10 tellers, 0 history) →
-`REPLICA IDENTITY FULL` on all four pgbench tables (preflight rejects
-otherwise) → spawn CH + dest tables ReplacingMergeTree(_lsn) → spawn
+`REPLICA IDENTITY FULL` on all four pgbench tables (keyless
+`pgbench_history` requires FULL or an index; the PK tables would also
+pass under DEFAULT) → spawn CH + dest tables ReplacingMergeTree(_lsn) → spawn
 `walshadow-stream --bootstrap-mode=direct
 --bootstrap-autospawn-shadow` → wait for metrics endpoint
-(bootstrap-finished gate, ~100k rows land via transitional emitter's
-synchronous INSERTs) → `pgbench -T 6 -c 4 -j 2` background (CI uses 6
+(bootstrap-finished gate, ~100k rows land via the shared insert tail) → `pgbench -T 6 -c 4 -j 2` background (CI uses 6
 s, plan called for 30 s) → +2 s `ALTER TABLE pgbench_accounts ADD
 COLUMN c int DEFAULT 7` (exercises read-time defaults via
 `attmissingval`) → +4 s `CREATE INDEX CONCURRENTLY ON pgbench_history
@@ -378,24 +385,29 @@ Test NOT `#[ignore]`. Same runtime skip-gate pattern as kill-restart:
 `fx::pg_available`, `fx::pg_basebackup_available`,
 `fx::clickhouse_available`, plus local `pgbench_available()`
 
-`--ch-flush-timeout-ms 200` holds INSERTs open across xacts; pgbench
-TPC-B writes four tables/xact + per-table close is one CH EndOfStream
-round-trip, so `flush_timeout=0` caps throughput at ~5 xact/s on local
-CH. 200 ms coalesces inserts into one MergeTree part per window, lets
-daemon track pgbench's ~700 xact/s
+`--ch-flush-timeout-ms 200` widens the batcher's per-table flush
+window; pgbench TPC-B writes four tables/xact and each sealed batch is
+one CH EndOfStream round-trip, so tight windows cap throughput on
+local CH (serial emitter at `flush_timeout=0` measured ~5 xact/s; the
+pipeline substitutes a 100 ms floor for `0`). 200 ms coalesces inserts
+into one MergeTree part per window, lets daemon track pgbench's ~700
+xact/s
 
 CI matrix slot for PG 16 / 17 / 18 across same fixture — different
 `postgres` binary — exists, drift surfaces as parity-check diff
 
 ## Bounded CH-emitter retry
 
-[`Emitter::reconnect`](../src/ch_emitter.rs) opens fresh TCP + builds
-new `Client`, hot-swaps `client` / `codec` / `io` while preserving
-per-xact accumulator buffers in `self.tables`.
-[`Emitter::route_with_retry`] + [`Emitter::drain_xact_with_retry`] wrap
-inner ops with bounded exponential backoff per [`RetryConfig`].
-`EmitterError::{Io, Client, ServerException}` is now survived instead
-of killing daemon
+Retry lives per inserter, per sealed batch
+([`send_with_retry`](../src/pipeline/inserter.rs)): bounded
+exponential backoff per [`RetryConfig`](../src/ch_emitter.rs),
+reconnecting between attempts; the batch is unchanged across retries
+so a reconnect just resends. `insert_timeout` (default 30 s) surfaces
+a connection wedged mid-INSERT as retryable `EmitterError::Timeout`
+instead of pinning the watermark.
+`EmitterError::{Io, Client, ServerException, Timeout}` is survived;
+retry exhaustion trips the pipeline `Fatal` (watermark can't advance
+without that batch) and daemon exits, cursor resumes on restart
 
 Residual hazard: rows that landed in CH on old connection + committed
 by CH server before disconnect are duplicated on retry.
@@ -417,15 +429,14 @@ whose first-seen LSN > cursor's ack) is deferred to
 - [xact.md](xact.md) — `drain_lsn` + `emitter_ack_lsn` producers
   (`XactBuffer::commit` / `abort` advance stats after `on_xact_end`
   Ok)
-- [emitter.md](emitter.md) — `on_xact_end` signal interpreted by
-  `XactBufferStats` advance; SIGHUP `MappingHandle` lives here
+- [emitter.md](emitter.md) — ack collector's contiguous-done
+  watermark feeds `emitter_ack_lsn`; SIGHUP `MappingHandle` lives here
 - [bootstrap.md](bootstrap.md) — cursor `start_lsn` falls back to
   bootstrap's `end_lsn` at greenfield boot; `Nullable(T)` requirement
   for post-bootstrap `ADD COLUMN`
 - [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md) —
   deeper re-emit-from-spill story past current retry surface
-- [future/parked.md](future/parked.md) —
-  `--bootstrap-autospawn-shadow` port override + seven
-  originally-`#[ignore]` tests' un-ignore drive items
+- [future/parked.md](future/parked.md) — CH fixture dedup + skipped
+  cross-major test drive items
 - [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
   — narrows TOML scope but doesn't remove `--ch-config` SIGHUP reload

@@ -340,56 +340,56 @@
 <!-- legend -->
 <g id="node18" class="node">
 <title>legend</title>
-<path fill="#6e6963" stroke="none" d="M331.88,-326.5C331.88,-326.5 122.12,-326.5 122.12,-326.5 116.12,-326.5 110.12,-320.5 110.12,-314.5 110.12,-314.5 110.12,-12 110.12,-12 110.12,-6 116.12,0 122.12,0 122.12,0 331.88,0 331.88,0 337.88,0 343.88,-6 343.88,-12 343.88,-12 343.88,-314.5 343.88,-314.5 343.88,-320.5 337.88,-326.5 331.88,-326.5"/>
-<polygon fill="#34302c" stroke="none" points="118.12,-299.75 118.12,-322.5 335.88,-322.5 335.88,-299.75 118.12,-299.75"/>
-<polygon fill="none" stroke="#6e6963" points="118.12,-299.75 118.12,-322.5 335.88,-322.5 335.88,-299.75 118.12,-299.75"/>
+<path fill="#6e6963" stroke="none" d="M337.88,-326.5C337.88,-326.5 116.12,-326.5 116.12,-326.5 110.12,-326.5 104.12,-320.5 104.12,-314.5 104.12,-314.5 104.12,-12 104.12,-12 104.12,-6 110.12,0 116.12,0 116.12,0 337.88,0 337.88,0 343.88,0 349.88,-6 349.88,-12 349.88,-12 349.88,-314.5 349.88,-314.5 349.88,-320.5 343.88,-326.5 337.88,-326.5"/>
+<polygon fill="#34302c" stroke="none" points="112.12,-299.75 112.12,-322.5 341.88,-322.5 341.88,-299.75 112.12,-299.75"/>
+<polygon fill="none" stroke="#6e6963" points="112.12,-299.75 112.12,-322.5 341.88,-322.5 341.88,-299.75 112.12,-299.75"/>
 <text xml:space="preserve" text-anchor="start" x="183.88" y="-309" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#ece1d7">node fill — role</text>
-<polygon fill="#3d3d54" stroke="none" points="118.12,-277 118.12,-299.75 157.62,-299.75 157.62,-277 118.12,-277"/>
-<polygon fill="none" stroke="#6e6963" points="118.12,-277 118.12,-299.75 157.62,-299.75 157.62,-277 118.12,-277"/>
-<polygon fill="none" stroke="#6e6963" points="157.62,-277 157.62,-299.75 335.88,-299.75 335.88,-277 157.62,-277"/>
-<text xml:space="preserve" text-anchor="start" x="189.38" y="-285" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">ingress (walker, parser)</text>
-<polygon fill="#4d3a28" stroke="none" points="118.12,-254.25 118.12,-277 157.62,-277 157.62,-254.25 118.12,-254.25"/>
-<polygon fill="none" stroke="#6e6963" points="118.12,-254.25 118.12,-277 157.62,-277 157.62,-254.25 118.12,-254.25"/>
-<polygon fill="none" stroke="#6e6963" points="157.62,-254.25 157.62,-277 335.88,-277 335.88,-254.25 157.62,-254.25"/>
-<text xml:space="preserve" text-anchor="start" x="168.38" y="-262.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">walshadow filter / rewrite (sync)</text>
-<polygon fill="#4d4d28" stroke="none" points="118.12,-231.5 118.12,-254.25 157.62,-254.25 157.62,-231.5 118.12,-231.5"/>
-<polygon fill="none" stroke="#6e6963" points="118.12,-231.5 118.12,-254.25 157.62,-254.25 157.62,-231.5 118.12,-231.5"/>
-<polygon fill="none" stroke="#6e6963" points="157.62,-231.5 157.62,-254.25 335.88,-254.25 335.88,-231.5 157.62,-231.5"/>
-<text xml:space="preserve" text-anchor="start" x="174.75" y="-239.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">CatalogTracker state + inputs</text>
-<polygon fill="#4d3850" stroke="none" points="118.12,-208.75 118.12,-231.5 157.62,-231.5 157.62,-208.75 118.12,-208.75"/>
-<polygon fill="none" stroke="#6e6963" points="118.12,-208.75 118.12,-231.5 157.62,-231.5 157.62,-208.75 118.12,-208.75"/>
-<polygon fill="none" stroke="#6e6963" points="157.62,-208.75 157.62,-231.5 335.88,-231.5 335.88,-208.75 157.62,-208.75"/>
-<text xml:space="preserve" text-anchor="start" x="189.38" y="-216.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">on&#45;disk / output artifact</text>
-<polygon fill="#34302c" stroke="none" points="118.12,-186 118.12,-208.75 335.88,-208.75 335.88,-186 118.12,-186"/>
-<polygon fill="none" stroke="#6e6963" points="118.12,-186 118.12,-208.75 335.88,-208.75 335.88,-186 118.12,-186"/>
+<polygon fill="#3d3d54" stroke="none" points="112.12,-277 112.12,-299.75 157.62,-299.75 157.62,-277 112.12,-277"/>
+<polygon fill="none" stroke="#6e6963" points="112.12,-277 112.12,-299.75 157.62,-299.75 157.62,-277 112.12,-277"/>
+<polygon fill="none" stroke="#6e6963" points="157.62,-277 157.62,-299.75 341.88,-299.75 341.88,-277 157.62,-277"/>
+<text xml:space="preserve" text-anchor="start" x="192.38" y="-285" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">ingress (walker, parser)</text>
+<polygon fill="#4d3a28" stroke="none" points="112.12,-254.25 112.12,-277 157.62,-277 157.62,-254.25 112.12,-254.25"/>
+<polygon fill="none" stroke="#6e6963" points="112.12,-254.25 112.12,-277 157.62,-277 157.62,-254.25 112.12,-254.25"/>
+<polygon fill="none" stroke="#6e6963" points="157.62,-254.25 157.62,-277 341.88,-277 341.88,-254.25 157.62,-254.25"/>
+<text xml:space="preserve" text-anchor="start" x="171.38" y="-262.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">walshadow filter / rewrite (sync)</text>
+<polygon fill="#4d4d28" stroke="none" points="112.12,-231.5 112.12,-254.25 157.62,-254.25 157.62,-231.5 112.12,-231.5"/>
+<polygon fill="none" stroke="#6e6963" points="112.12,-231.5 112.12,-254.25 157.62,-254.25 157.62,-231.5 112.12,-231.5"/>
+<polygon fill="none" stroke="#6e6963" points="157.62,-231.5 157.62,-254.25 341.88,-254.25 341.88,-231.5 157.62,-231.5"/>
+<text xml:space="preserve" text-anchor="start" x="177.75" y="-239.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">CatalogTracker state + inputs</text>
+<polygon fill="#4d3850" stroke="none" points="112.12,-208.75 112.12,-231.5 157.62,-231.5 157.62,-208.75 112.12,-208.75"/>
+<polygon fill="none" stroke="#6e6963" points="112.12,-208.75 112.12,-231.5 157.62,-231.5 157.62,-208.75 112.12,-208.75"/>
+<polygon fill="none" stroke="#6e6963" points="157.62,-208.75 157.62,-231.5 341.88,-231.5 341.88,-208.75 157.62,-208.75"/>
+<text xml:space="preserve" text-anchor="start" x="192.38" y="-216.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">on&#45;disk / output artifact</text>
+<polygon fill="#34302c" stroke="none" points="112.12,-186 112.12,-208.75 341.88,-208.75 341.88,-186 112.12,-186"/>
+<polygon fill="none" stroke="#6e6963" points="112.12,-186 112.12,-208.75 341.88,-208.75 341.88,-186 112.12,-186"/>
 <text xml:space="preserve" text-anchor="start" x="193.25" y="-195.25" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#ece1d7">edge colour</text>
-<polygon fill="none" stroke="#6e6963" points="118.12,-163.25 118.12,-186 157.62,-186 157.62,-163.25 118.12,-163.25"/>
-<text xml:space="preserve" text-anchor="start" x="131.88" y="-172.5" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#a1a9cc">━━</text>
-<polygon fill="none" stroke="#6e6963" points="157.62,-163.25 157.62,-186 335.88,-186 335.88,-163.25 157.62,-163.25"/>
-<text xml:space="preserve" text-anchor="start" x="187.12" y="-171.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">source replication frame</text>
-<polygon fill="none" stroke="#6e6963" points="118.12,-140.5 118.12,-163.25 157.62,-163.25 157.62,-140.5 118.12,-140.5"/>
-<text xml:space="preserve" text-anchor="start" x="131.88" y="-149.75" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#bd8183">━━</text>
-<polygon fill="none" stroke="#6e6963" points="157.62,-140.5 157.62,-163.25 335.88,-163.25 335.88,-140.5 157.62,-140.5"/>
-<text xml:space="preserve" text-anchor="start" x="176.62" y="-148.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">decision → rewrite (hot path)</text>
-<polygon fill="none" stroke="#6e6963" points="118.12,-117.75 118.12,-140.5 157.62,-140.5 157.62,-117.75 118.12,-117.75"/>
-<text xml:space="preserve" text-anchor="start" x="131.88" y="-127" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#cba85e">┄┄</text>
-<polygon fill="none" stroke="#6e6963" points="157.62,-117.75 157.62,-140.5 335.88,-140.5 335.88,-117.75 157.62,-117.75"/>
-<text xml:space="preserve" text-anchor="start" x="168.75" y="-125.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">tracker update + catalog lookup</text>
-<polygon fill="#34302c" stroke="none" points="118.12,-95 118.12,-117.75 335.88,-117.75 335.88,-95 118.12,-95"/>
-<polygon fill="none" stroke="#6e6963" points="118.12,-95 118.12,-117.75 335.88,-117.75 335.88,-95 118.12,-95"/>
+<polygon fill="none" stroke="#6e6963" points="112.12,-163.25 112.12,-186 157.62,-186 157.62,-163.25 112.12,-163.25"/>
+<text xml:space="preserve" text-anchor="start" x="128.88" y="-172.5" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#a1a9cc">━━</text>
+<polygon fill="none" stroke="#6e6963" points="157.62,-163.25 157.62,-186 341.88,-186 341.88,-163.25 157.62,-163.25"/>
+<text xml:space="preserve" text-anchor="start" x="190.12" y="-171.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">source replication frame</text>
+<polygon fill="none" stroke="#6e6963" points="112.12,-140.5 112.12,-163.25 157.62,-163.25 157.62,-140.5 112.12,-140.5"/>
+<text xml:space="preserve" text-anchor="start" x="128.88" y="-149.75" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#bd8183">━━</text>
+<polygon fill="none" stroke="#6e6963" points="157.62,-140.5 157.62,-163.25 341.88,-163.25 341.88,-140.5 157.62,-140.5"/>
+<text xml:space="preserve" text-anchor="start" x="179.62" y="-148.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">decision → rewrite (hot path)</text>
+<polygon fill="none" stroke="#6e6963" points="112.12,-117.75 112.12,-140.5 157.62,-140.5 157.62,-117.75 112.12,-117.75"/>
+<text xml:space="preserve" text-anchor="start" x="128.88" y="-127" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#cba85e">┄┄</text>
+<polygon fill="none" stroke="#6e6963" points="157.62,-117.75 157.62,-140.5 341.88,-140.5 341.88,-117.75 157.62,-117.75"/>
+<text xml:space="preserve" text-anchor="start" x="171.75" y="-125.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">tracker update + catalog lookup</text>
+<polygon fill="#34302c" stroke="none" points="112.12,-95 112.12,-117.75 341.88,-117.75 341.88,-95 112.12,-95"/>
+<polygon fill="none" stroke="#6e6963" points="112.12,-95 112.12,-117.75 341.88,-117.75 341.88,-95 112.12,-95"/>
 <text xml:space="preserve" text-anchor="start" x="208.25" y="-104.25" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#ece1d7">source</text>
-<polygon fill="none" stroke="#6e6963" points="118.12,-72.25 118.12,-95 335.88,-95 335.88,-72.25 118.12,-72.25"/>
-<text xml:space="preserve" text-anchor="start" x="153.5" y="-81.5" font-family="monospace" font-size="10.00" fill="#ece1d7">src/filter.rs</text>
-<text xml:space="preserve" text-anchor="start" x="221.75" y="-81.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> — Filter::decide</text>
-<polygon fill="none" stroke="#6e6963" points="118.12,-49.5 118.12,-72.25 335.88,-72.25 335.88,-49.5 118.12,-49.5"/>
-<text xml:space="preserve" text-anchor="start" x="125.38" y="-58.75" font-family="monospace" font-size="10.00" fill="#ece1d7">src/catalog_tracker.rs</text>
-<text xml:space="preserve" text-anchor="start" x="240.88" y="-58.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> — CatalogTracker</text>
-<polygon fill="none" stroke="#6e6963" points="118.12,-26.75 118.12,-49.5 335.88,-49.5 335.88,-26.75 118.12,-26.75"/>
-<text xml:space="preserve" text-anchor="start" x="123.12" y="-36" font-family="monospace" font-size="10.00" fill="#ece1d7">src/rewrite.rs</text>
-<text xml:space="preserve" text-anchor="start" x="196.62" y="-36" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> — noop_replace + CRC32C</text>
-<polygon fill="none" stroke="#6e6963" points="118.12,-4 118.12,-26.75 335.88,-26.75 335.88,-4 118.12,-4"/>
-<text xml:space="preserve" text-anchor="start" x="133.25" y="-13.25" font-family="monospace" font-size="10.00" fill="#ece1d7">src/main_data.rs</text>
-<text xml:space="preserve" text-anchor="start" x="217.25" y="-13.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> — empty reclassifier</text>
+<polygon fill="none" stroke="#6e6963" points="112.12,-72.25 112.12,-95 341.88,-95 341.88,-72.25 112.12,-72.25"/>
+<text xml:space="preserve" text-anchor="start" x="148.62" y="-81.5" font-family="monospace" font-size="10.00" fill="#ece1d7">src/filter.rs</text>
+<text xml:space="preserve" text-anchor="start" x="226.62" y="-81.5" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> — Filter::decide</text>
+<polygon fill="none" stroke="#6e6963" points="112.12,-49.5 112.12,-72.25 341.88,-72.25 341.88,-49.5 112.12,-49.5"/>
+<text xml:space="preserve" text-anchor="start" x="117.12" y="-58.75" font-family="monospace" font-size="10.00" fill="#ece1d7">src/catalog_tracker.rs</text>
+<text xml:space="preserve" text-anchor="start" x="249.12" y="-58.75" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> — CatalogTracker</text>
+<polygon fill="none" stroke="#6e6963" points="112.12,-26.75 112.12,-49.5 341.88,-49.5 341.88,-26.75 112.12,-26.75"/>
+<text xml:space="preserve" text-anchor="start" x="117.88" y="-36" font-family="monospace" font-size="10.00" fill="#ece1d7">src/rewrite.rs</text>
+<text xml:space="preserve" text-anchor="start" x="201.88" y="-36" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> — noop_replace + CRC32C</text>
+<polygon fill="none" stroke="#6e6963" points="112.12,-4 112.12,-26.75 341.88,-26.75 341.88,-4 112.12,-4"/>
+<text xml:space="preserve" text-anchor="start" x="127.25" y="-13.25" font-family="monospace" font-size="10.00" fill="#ece1d7">src/main_data.rs</text>
+<text xml:space="preserve" text-anchor="start" x="223.25" y="-13.25" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7"> — empty reclassifier</text>
 </g>
 <!-- manifest&#45;&gt;legend -->
 </g>

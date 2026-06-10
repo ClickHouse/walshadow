@@ -294,8 +294,8 @@ struct Args {
     /// `0` disables trim.
     #[arg(long, default_value_t = DEFAULT_RETENTION_BYTES)]
     retention_bytes: u64,
-    /// Skip pre-flight validators (server_version_num, wal_level, REPLICA
-    /// IDENTITY FULL, slot existence). For recovery drills.
+    /// Skip pre-flight validators (server_version_num, wal_level, replica
+    /// identity / row key, slot existence). For recovery drills.
     #[arg(long, default_value_t = false)]
     skip_preflight: bool,
     /// Ignore any `cursor.bin` under `--spill-dir` at boot (greenfield

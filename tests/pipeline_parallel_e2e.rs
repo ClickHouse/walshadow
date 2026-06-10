@@ -8,9 +8,10 @@
 //! heap decoder → xact buffer → `ReorderSink` → decode pool → inserter
 //! pool → spawned `clickhouse server`.
 //!
-//! Workload: INSERT three rows, UPDATE one, DELETE one (under REPLICA
-//! IDENTITY FULL), then `pg_switch_wal`. Asserts the surviving rows reach
-//! CH and the deleted row's tombstone hides it under `FINAL`.
+//! Workload: INSERT three rows, UPDATE one, DELETE one (under default
+//! REPLICA IDENTITY, keyed by the PK — FULL no longer required), then
+//! `pg_switch_wal`. Asserts the surviving rows reach CH and the deleted
+//! row's key-only tombstone hides it under `FINAL`.
 
 #![cfg(target_os = "linux")]
 
@@ -52,10 +53,11 @@ async fn parallel_pipeline_replicates_dml() {
         shadow_stream_state,
     ) = fx::bootstrap_clusters(
         &tmp,
-        // `bar` is intentionally left out of the CH mappings below so its
-        // rows exercise the decode pool's unmapped-relation skip counter.
+        // `foo` stays on default REPLICA IDENTITY: its PK keys the delete
+        // tombstone, so the WAL old image carries only `id`. `bar` is
+        // intentionally left out of the CH mappings below so its rows
+        // exercise the decode pool's unmapped-relation skip counter.
         "CREATE TABLE public.foo (id int PRIMARY KEY, val text);\n\
-         ALTER TABLE public.foo REPLICA IDENTITY FULL;\n\
          CREATE TABLE public.bar (id int);\n",
         SOURCE_PORT,
         SHADOW_PORT,
@@ -188,6 +190,13 @@ async fn parallel_pipeline_replicates_dml() {
         .query("SELECT argMax(_is_deleted, _lsn) FROM walshadow_test.foo WHERE id = 3")
         .expect("ch id=3 _is_deleted");
     assert_eq!(id3_flag, "true", "delete coded into _is_deleted");
+
+    // Default identity logs only the PK in the delete's old image, so the
+    // tombstone's non-key column lands NULL (clickhouse client prints \N).
+    let id3_tombstone_val = ch
+        .query("SELECT val FROM walshadow_test.foo WHERE id = 3 AND _is_deleted")
+        .expect("ch id=3 tombstone val");
+    assert_eq!(id3_tombstone_val, "\\N", "tombstone carries key only");
 
     // `OPTIMIZE … FINAL CLEANUP` (gated on the table's experimental
     // setting) physically drops the deleted row + its history, so an

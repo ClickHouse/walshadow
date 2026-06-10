@@ -2,9 +2,10 @@
 
 Greenfield initial-attach. Streams source PG's `BASE_BACKUP` through
 one MultiplexSink fanning simultaneously onto shadow PG's data dir
-(catalog seed) and transitional CH emitter (heap-data initial load).
-Single pass over backup bytes, no on-disk spool, no second BASE_BACKUP,
-no shadow-side user-heap landing
+(catalog seed) and the shared pipeline insert tail (heap-data initial
+load — see [emitter.md](emitter.md)). Single pass over backup bytes,
+no on-disk spool, no second BASE_BACKUP, no shadow-side user-heap
+landing
 
 ## Purpose
 
@@ -43,11 +44,16 @@ for rendered diagram. Five clusters top→bottom:
    - denylist contents → Skip; denylist dir entries themselves → Keep
      as empty dirs
 3. **Drain → CH** (concurrent with step 2) — `PageWalkSink` ships
-   `BackfillTuple`s through unbounded mpsc to `drain_backfill`, which
-   synthesizes `CommittedTuple { op=Insert, commit_lsn=start_lsn }` and
-   feeds transitional `Emitter` against `CatalogMapResolver`. Per-table
-   `on_xact_end` fires on every rfn flip so CH's Native protocol does
-   not race new `INSERT` against still-open block on prior table
+   `BackfillTuple`s through bounded mpsc (`BOOTSTRAP_TUPLE_CHANNEL_CAP
+   = 256`, backpressures the tar pump) to
+   `pipeline::bootstrap::drain`, which synthesizes rows
+   `{ op=Insert, commit_lsn=start_lsn }` against the snapshot
+   `CatalogMap` and routes into the shared insert tail (batcher +
+   inserter pool + ack collector, same unit as streaming — see
+   [emitter.md](emitter.md)). One synthetic ack seq per rfn flip;
+   `tail.finish` seals partial batches and waits all seqs durable
+   before handoff. Metrics-only runs (no `--ch-config`) instead drain
+   through legacy `drain_backfill` into a counting `TupleObserver`
 4. **Shadow handoff** — `BootstrapOutcome { start, end }` returned;
    daemon writes `standby.signal`, appends `restore_command` +
    `primary_conninfo` to shadow's `postgresql.auto.conf`,
@@ -108,13 +114,14 @@ Per-source guarantees in `src/backup_source.rs` module docs:
 4. `finish()` fires after the last `end()`, carries `end_lsn`
 5. Paths are cluster-relative & traversal-safe
 
-Sink trait surface (`BackupSink`): sync `start` / `begin` / `chunk` /
-`end` / `finish`, `Send` so ObjectStore worker pool can share
-`Arc<Mutex<dyn BackupSink>>`. Sync surface is load-bearing: `chunk`
-fires from inside tokio runtime context source drives, &
-`mpsc::Sender::blocking_send` panics there. PageWalkSink ships through
-unbounded sender as a result; bounded by concurrent drain task ahead
-of it
+Sink trait surface (`BackupSink`): `#[async_trait]` `start` / `begin`
+/ `chunk` / `end` / `finish`, `Send` so ObjectStore worker pool can
+share `Arc<Mutex<dyn BackupSink>>`. Async surface is load-bearing:
+`chunk` fires inside tokio runtime context source drives, and
+PageWalkSink's bounded `mpsc::Sender::send(...).await` there is what
+backpressures the tar pump against drain throughput (sync trait +
+unbounded channel was the original shape; made async at b57b64e
+precisely to get this bound)
 
 ## Two source impls
 
@@ -261,10 +268,10 @@ decoder, exercised from two callers
   failures bump `tuples_skipped_truncated` so a single torn page does
   not abort whole bootstrap
 
-`BackfillTuple { rfn, xid, source_lsn, columns }` ships over unbounded
-mpsc to orchestrator's drain task. `source_lsn` is
-`StartInfo::start_lsn` for every emitted row — every backfill row tags
-identically
+`BackfillTuple { rfn, xid, source_lsn, columns }` ships over bounded
+mpsc (`BOOTSTRAP_TUPLE_CHANNEL_CAP`) to orchestrator's drain task.
+`source_lsn` is `StartInfo::start_lsn` for every emitted row — every
+backfill row tags identically
 
 V1 limits:
 
@@ -272,50 +279,47 @@ V1 limits:
   captured mid-write walk as-shipped. WAL in `[start_lsn, end_lsn]`
   updating same tuples re-emits at higher `_lsn` &
   `ReplacingMergeTree(_lsn)` collapses duplicate
-- **TOAST-spilled columns surface as `ColumnValue::PgPending`.** Inline
-  varlena decodes through heap decoder; external TOAST chunks are not
-  reassembled here. `pg_toast_<relid>` tar entries are observed but not
-  decoded (page count surfaces via stats; chunk projection deferred to
-  WAL-side TOAST decoder)
+- **TOAST-spilled columns fail fast.** Inline varlena decodes through
+  heap decoder; external pointers surface as
+  `ColumnValue::ExternalToast` and the CH drain rejects the row with
+  relation + column named (no reassembly path exists here).
+  `pg_toast_<relid>` tar entries are observed but not decoded; full
+  chunk-storage design in [future/TOAST.md](future/TOAST.md)
 - **2C CH-side COPY load NOT shipped.** See
   [What is NOT 2C](#what-is-not-2c-ch-side-copy-load) below
 
-Per-relation `BlockBuilder` sequencing: `drain_backfill` issues
-`on_xact_end` whenever rfn flips. CH's Native protocol forbids opening
-new `INSERT INTO B` while `INSERT INTO A` has open data stream; without
-per-table flushes second `send_query` races first INSERT's body bytes
-& CH silently drops everything emitted on that connection.
-`PageWalkSink` emits all rows for one rfn contiguously before moving
-on, so one flush per rfn boundary suffices
+Rfn contiguity is load-bearing for ack accounting: `PageWalkSink`
+emits all rows for one rfn contiguously before moving on, so
+`pipeline::bootstrap::drain` can synthesize one ack-collector seq per
+rfn — `register(seq, start_lsn)` at first row, `placed(seq, rows)` at
+the flip. Under object-store fan-out interleaved tar parts yield more
+seqs and one rfn may span several; per-seq refcount absorbs that. All
+seqs share `commit_lsn = start_lsn`, so the contiguous-done frontier
+proves durability (`wait_through(K)`) while the published watermark
+saturates at `start_lsn`; caller advances resume LSN to `end_lsn`
+only after `tail.finish`
 
-## RelationResolver trait
+## Catalog resolution — two sources, no trait
 
-`src/relation_resolver.rs`. Catalog adapter between emitter & catalog
-source. Single method:
+Bootstrap & steady-state resolve `filenode → descriptor` against
+different catalog sources, but no adapter trait shipped:
 
-```rust
-pub trait RelationResolver: Send + Sync {
-    fn relation_at<'a>(&'a self, rfn: RelFileNode, at_lsn: u64)
-        -> Pin<Box<dyn Future<Output = Result<Arc<RelDescriptor>, CatalogError>> + Send + 'a>>;
-}
-```
+- steady-state decode pool calls
+  `shadow_catalog::resolve_at_pooled(&Arc<Mutex<ShadowCatalog>>, rfn,
+  at_lsn)` — `at_lsn` flows through to the `pg_last_wal_replay_lsn`
+  replay gate
+- `pipeline::bootstrap::drain` takes the snapshot `CatalogMap` from
+  `seed_catalog_from_source` directly and calls
+  `.get(db_node, rel_node)` — no replay gate applies; unknown
+  filenodes skip the row (bumps `unsupported_relations`)
 
-Introduced because emitter needs one catalog op (resolve filenode →
-descriptor), and bootstrap & steady-state speak different catalog
-sources for that op. Two impls:
-
-- `Mutex<ShadowCatalog>: RelationResolver` — steady-state. Delegates to
-  `ShadowCatalog::relation_at` under existing lock; `at_lsn` flows
-  through to `pg_last_wal_replay_lsn` replay gate
-- `CatalogMapResolver` — bootstrap. Snapshot from
-  `seed_catalog_from_source`'s `CatalogMap`; `at_lsn` ignored (no
-  replay gate applies). Unknown filenodes surface as
-  `CatalogError::NotFoundByFilenode`
-
-Emitter holds `Arc<dyn RelationResolver + Send + Sync>`. One vtable
-indirection per row, no generic propagation through daemon's
-`Box<dyn TupleObserver>` chain. Trait-object cost is dominated by CH
-encoding cost on row hot path
+A `RelationResolver` trait abstracting the two was designed (one
+vtable per row) but never landed — the bootstrap drain predates the
+shared tail and grew its own simpler path. Revisit only if a third
+catalog source appears; `detoast_heap`'s `ShadowCatalog` dependency is
+the blocker noted in
+[future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
+(bootstrap decode-pool Option B)
 
 Three buffer shapes were prototyped in parallel worktrees: spool to
 disk, in-mem buffer + sync block, catalog adapter. Catalog adapter
@@ -329,18 +333,25 @@ shipped because it is only shape with bounded memory at scale
 - `seed_in_snapshot(client) -> CatalogMap` — REPEATABLE READ wrapper
   around `seed_catalog_from_source`. Always COMMITs (read-only xact;
   commit-vs-rollback is purely about releasing snapshot)
-- `spawn_greenfield_bootstrap(cfg, source, catalog_map) -> (UnboundedReceiver<BackfillTuple>, JoinHandle<Result<BootstrapOutcome>>)` —
+- `spawn_greenfield_bootstrap(cfg, source, catalog_map) -> (mpsc::Receiver<BackfillTuple>, JoinHandle<Result<BootstrapOutcome>>)` —
   streaming primitive. Caller drains concurrently with source pump;
-  unbounded queue stays bounded by emitter throughput
+  bounded channel backpressures pump against drain rate, so memory is
+  bounded by `BOOTSTRAP_TUPLE_CHANNEL_CAP`, not source tuple count.
+  Drain must run concurrently — a sequential drain-after-pump deadlocks
+  once the channel fills
 - `run_greenfield_bootstrap` — test-only wrapper collecting every tuple
-  into Vec. Production callers must use spawn form: unbounded mpsc
-  queues every tuple in memory if drain runs after pump completes
-- `drain_backfill` — synthesize `CommittedTuple { op=Insert,
-  commit_ts=0, commit_lsn=source_lsn }` per `BackfillTuple`, hand
-  through a `TupleObserver`. `on_xact_end` fires on every rfn flip &
-  one final time after channel close (latter unconditional, fires even
-  on empty channel so transitional emitter's INSERT cleanup always
-  runs)
+  into Vec (spawns its own concurrent collector)
+- `pipeline::bootstrap::drain` — CH path. Synthesizes
+  `{ op=Insert, commit_ts=0, commit_lsn=start_lsn }` per
+  `BackfillTuple`, resolves against `CatalogMap`, routes
+  `BatcherMsg::Row` into the shared tail; one ack seq per rfn flip.
+  Returns `BootstrapDrainOutcome { next_seq, rows_routed }`; caller
+  runs `tail.finish(msg_tx, ack, next_seq, fatal)` to seal + wait
+  durable. Fails fast on `ColumnValue::ExternalToast` (page walk does
+  no TOAST reassembly — [future/TOAST.md](future/TOAST.md))
+- `drain_backfill` — metrics-only path (no `--ch-config`). Hands
+  synthetic `CommittedTuple`s to a `TupleObserver`; `on_xact_end`
+  fires on every rfn flip & once after channel close
 
 `BootstrapOutcome { start, end, disk: DiskLanderStats, page_walk:
 PageWalkStats }` carries LSN pair plus per-sink counters. CLI logs
@@ -438,11 +449,11 @@ as autospawn listener config — same socket daemon connects to for
 
 - [shadow.md](shadow.md) — handoff target. Shadow lifecycle, standby
   recovery config, `wait_for_replay` semantics
-- [emitter.md](emitter.md) — transitional emitter consumes
-  `BackfillTuple` → `CommittedTuple` via same `TupleObserver` /
-  `BlockBuilder` path as steady-state WAL records
+- [emitter.md](emitter.md) — shared insert tail (batcher + inserter
+  pool + ack collector) bootstrap feeds; same shipping path as
+  steady-state WAL records
 - [decoder.md](decoder.md) — `decode_block_data` dispatch shared with
-  WAL hot path; `RelationResolver` consumer
+  WAL hot path
 - [ops.md](ops.md) — cursor advance ordering, `bootstrap_end_lsn` wins
   over `cursor.bin` on start-LSN selection
 - [future/parked.md](future/parked.md) — deferred bootstrap items:

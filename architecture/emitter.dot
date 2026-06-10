@@ -1,118 +1,126 @@
 // walshadow — CH emitter component view
-// Hold-open buffer + atomic-seal INSERT (single CH TCP) + DdlApplicator
-// (second CH TCP). Zoomed-in view of cluster_ch + cluster_ddl from
-// internals.dot. Rows buffer in TableEncoder across xacts with NO open
-// wire; a seal trigger flushes one complete, durable INSERT.
+// Parallel decode+insert pipeline: reorder coordinator (commit order,
+// DDL/TRUNCATE barrier) → decode pool ×M → InsertBatcher (per-table
+// TableEncoder, budget/deadline seal) → inserter pool ×N (one complete
+// INSERT per sealed batch) → ack collector (contiguous-done watermark).
+// Zoomed-in view of cluster_ch + cluster_ddl from internals.dot.
 //
 // regeneration spec:
-// sources of truth: plans/emitter.md · src/ch_emitter.rs · src/ch_ddl.rs · src/type_bridge.rs · clickhouse-c-rs/
-// subsumes: plans/emitter.md § "Hold-open buffer shape" + "DdlApplicator" + "type_bridge"
+// sources of truth: plans/emitter.md · src/pipeline/{reorder,decode,batcher,inserter,ack,tail}.rs · src/ch_emitter.rs · src/ch_ddl.rs · src/type_bridge.rs
+// subsumes: plans/emitter.md § "Stage walk" + "Barrier fence" + "Ack-LSN tracking" + "DdlApplicator"
 // quality bar:
-//   - two CH endpoints visually distinct (separate cylinders, both labelled with TCP number)
+//   - decode ×M and inserter ×N read as pools (stacked node or ×M/×N label), not single tasks
+//   - barrier fence visually orders DDL strictly after earlier data durable (placed → FlushAll → durable)
+//   - ack side-channel (Register/Placed/Acked → watermark) distinct from row path; dotted #b380b0
 //   - rows path solid #BF8C5F, DDL path dashed #BF8C5F — same colour, different style
-//   - buffer node reads as held-across-xacts state with NO open wire; seal is one atomic INSERT
 // shared style: palette.md
 digraph emitter {
   rankdir=TB;
   compound=true;
-  graph [fontname="Helvetica", labelloc="t", label="walshadow CH emitter — hold-open buffer, atomic-seal INSERT + DdlApplicator (dual CH TCP)", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.5, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="walshadow CH emitter — parallel pipeline: reorder → decode ×M → batcher → inserter ×N → ack watermark", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.5, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
 
-  // ═════ producers (upstream, top-left) ═════
+  // ═════ reorder coordinator (upstream, commit-order boundary) ═════
   subgraph cluster_src {
-    label="upstream  (xact buffer drain)";
+    label="reorder coordinator — single-threaded commit order  (pipeline/reorder.rs, inner sink of QueueingRecordSink)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    drain [label="XactRecordSink\ncommit drain\n(k-way merge:\n CommittedTuple ⨝ SchemaEvent\n in source-LSN order)", fillcolor="#4D4128"];
-    cat   [label="ShadowCatalog::subscribe\nSchemaEvent\nAdded / Changed / Dropped\n(unbounded mpsc)", fillcolor="#4D4D28", shape=parallelogram];
+    reorder [label="ReorderSink::on_record (RM_XACT only)\nCOMMIT → drain_committed → dense seq\nABORT / empty commit → rows=0 seq\nbarrier xact (SchemaEvent / TRUNCATE):\n segment → fence → apply, per event", fillcolor="#4D4128"];
+    cat     [label="ShadowCatalog::subscribe\nSchemaEvent\nAdded / Changed / Dropped\n(unbounded mpsc, rides xact buffer\n as ordered_events)", fillcolor="#4D4D28", shape=parallelogram];
   }
 
-  // ═════ row path: buffer across xacts → atomic-seal INSERT (single CH TCP) ═════
-  subgraph cluster_rows {
-    label="row path — Emitter::route → buffer → atomic-seal INSERT  (CH TCP #1)";
+  // ═════ decode pool ═════
+  subgraph cluster_decode {
+    label="decode pool ×M  (pipeline/decode.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    route   [label="Emitter::route\nresolve rel + mapping\nHeapOp dispatch\nskip foreign-DB rows", fillcolor="#5D4628"];
-    enc     [label="TableEncoder::append_row\nper (src qualified_name)\nrow_budget 65536\nbyte_budget 1 MiB", fillcolor="#5D4628"];
-    cols    [label="ColumnBuf slabs\nFixed / String /\nNullableFixed /\nNullableString\ncolumn-major + synthetic\n_lsn/_xid/_op/_commit_ts\nheld across xacts — NO open wire", fillcolor="#5D4628", shape=note];
-    trip    [label="seal trigger\nrow/byte budget · flush_timeout deadline\nlegacy xact-end · schema event\nTRUNCATE · shutdown", fillcolor="#5D4628", shape=diamond];
-    openw   [label="flush_table(key)\nopen_wire: send_query(INSERT…)\nflush_deadline := now + T", fillcolor="#5D4628"];
-    block   [label="BlockBuilder\nborrow into slabs →\nsend_data(Some(block))", fillcolor="#5D4628"];
-    closew  [label="close_current_wire\nsend_data(None) → EndOfStream\nclear buffer (post-ack)\nlast_durable ← pending_max", fillcolor="#5D4628"];
-    trunc   [label="HeapOp::Truncate\nflush + close +\n send_query(TRUNCATE TABLE)", fillcolor="#5D4628"];
-
-    route -> enc -> cols -> trip -> openw -> block -> closew;
-    route -> trunc [style=dashed, label="HeapOp::Truncate", constraint=false];
+    decode [label="decode worker ×M\ndetoast → resolve_at_pooled\n(skip foreign-DB / unmapped)\noracle PgPending + sampled validate\nchunk 1024 rows / 4 MiB", fillcolor="#4D4128"];
   }
 
-  // ═════ DDL path: separate CH TCP ═════
+  // ═════ batcher hub ═════
+  subgraph cluster_batch {
+    label="InsertBatcher — single hub, per-table accumulation  (pipeline/batcher.rs)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    enc  [label="TableEncoder per dest table\nColumnBuf slabs: Fixed / String /\nNullableFixed / NullableString\ncolumn-major + synthetic\n_lsn / _xid / _commit_ts / _is_deleted", fillcolor="#5D4628", shape=note];
+    trip [label="flush trigger\nrow_budget 65536 · byte_budget 1 MiB\nper-table deadline (flush_timeout,\n 0 → 100 ms floor) · FlushAll", fillcolor="#5D4628", shape=diamond];
+    seal [label="seal InsertBatch\nowned slabs + per_seq row counts\nFlushAll also bumps schema_epoch\n(rebuild plans post-DDL)", fillcolor="#5D4628"];
+
+    enc -> trip -> seal;
+  }
+
+  // ═════ inserter pool ═════
+  subgraph cluster_insert {
+    label="inserter pool ×N  (pipeline/inserter.rs)";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    ins [label="inserter ×N — any idle takes any batch\nTypeAst cache per (table, epoch)\nBlockBuilder over owned slabs\nsend_query → send_data → EndOfStream\nsend_with_retry: reconnect + backoff,\ninsert_timeout 30 s; exhaustion = Fatal", fillcolor="#5D4628"];
+  }
+
+  // ═════ DDL path: barrier + applicator (own CH connection) ═════
   subgraph cluster_ddl {
-    label="DDL path — DdlApplicator (CH TCP #2, separate connection)";
+    label="DDL / TRUNCATE — barrier fence + DdlApplicator (own CH connection)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    dispatch [label="Emitter::dispatch_schema_event\n1. flush_table(key)\n2. close_current_wire if key open\n3. drop tables[key]\n4. applicator.apply(event)", fillcolor="#5D4628"];
-    bridge   [label="type_bridge::map\nRelAttr → ResolvedColumn\n(reject widen,\n pk strips Nullable)", fillcolor="#5D4628"];
-    apply    [label="DdlApplicator::apply\nAdded  → CREATE TABLE IF NOT EXISTS\nChanged → RENAME / ADD / DROP COLUMN\nDropped → DropTableStrategy\n(target_database + drop per-namespace)", fillcolor="#5D4628"];
-    ddlsql   [label="send_query(DDL SQL)\n+ drain to EndOfStream\n(per-statement,\n no held-open)", fillcolor="#5D4628"];
+    fence  [label="barrier_fence\n1. wait all seqs placed\n2. batcher FlushAll (+ reply)\n3. wait all seqs durable", fillcolor="#5D4628"];
+    bridge [label="type_bridge::map\nRelAttr → ResolvedColumn\n(reject type change,\n pk strips Nullable)", fillcolor="#5D4628"];
+    apply  [label="DdlApplicator::apply / truncate\nAdded  → CREATE TABLE IF NOT EXISTS\nChanged → RENAME / ADD / DROP COLUMN\nDropped → DropTableStrategy\nTRUNCATE TABLE (no retry: error = Fatal)", fillcolor="#5D4628"];
 
-    dispatch -> apply -> ddlsql;
-    bridge   -> apply [style=dashed, label="resolve types"];
+    fence -> apply;
+    bridge -> apply [style=dashed, label="resolve types"];
   }
 
-  // ═════ CH endpoint (two distinct sockets) ═════
+  // ═════ CH endpoint (N+1 connections) ═════
   subgraph cluster_ch {
-    label="ClickHouse";
+    label="ClickHouse — one endpoint, N+1 connections";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    chrows [label="CH TCP #1\nclickhouse-c-rs Client\nReplacingMergeTree(_lsn)\nNative rows", fillcolor="#4D4128", shape=cylinder];
-    chddl  [label="CH TCP #2\nclickhouse-c-rs Client\nALTER / CREATE /\n DROP / TRUNCATE", fillcolor="#4D4128", shape=cylinder];
+    chrows [label="insert connections ×N\nclickhouse-c-rs AsyncClient\nReplacingMergeTree(_lsn, _is_deleted)\nNative rows", fillcolor="#4D4128", shape=cylinder];
+    chddl  [label="DDL connection\nclickhouse-c-rs AsyncClient\nALTER / CREATE /\n DROP / TRUNCATE", fillcolor="#4D4128", shape=cylinder];
   }
 
-  // ═════ ack-LSN side-channel ═════
-  ack [label="EmitterObserver::on_xact_end / on_idle\nreturns last_durable_commit_lsn\nidle_ack_ceiling caps idle advance\n→ cursor::emitter_ack_lsn", fillcolor="#4D3A28", shape=note];
+  // ═════ ack collector (durability watermark) ═════
+  ack [label="ack collector  (pipeline/ack.rs)\nRegister(seq, commit_lsn) · Placed(seq, rows) · Acked(per_seq)\nseq done ⇔ placed == acked  (rows=0 done at placement)\nwatermark = highest contiguous-done commit_lsn\n→ emitter_ack atomic → cursor + standby apply_lsn", fillcolor="#4D3A28", shape=note];
 
-  // ═════ upstream → emitter ═════
-  drain -> route    [color="#BF8C5F", penwidth=2, lhead=cluster_rows, label="CommittedTuple"];
-  cat   -> dispatch [color="#CBA85E", style=dashed, lhead=cluster_ddl, label="SchemaEvent\ndrain at commit"];
+  // ═════ row path ═════
+  reorder -> decode [color="#BF8C5F", penwidth=2, lhead=cluster_decode, label="DecodeJob\n(mpmc, bound 4M)"];
+  decode  -> enc    [color="#BF8C5F", penwidth=2, lhead=cluster_batch, label="BatcherMsg::Rows\n(FIFO mpsc 256 —\nshared with FlushAll)"];
+  seal    -> ins    [color="#BF8C5F", penwidth=2, lhead=cluster_insert, label="InsertBatch\n(mpmc)"];
+  ins     -> chrows [color="#BF8C5F", penwidth=2, label="one complete INSERT\nper sealed batch"];
 
-  // ═════ emitter → CH ═════
-  block  -> chrows [color="#BF8C5F", penwidth=2, label="Native block"];
-  closew -> chrows [color="#BF8C5F", style=dashed, label="EndOfStream"];
-  trunc  -> chrows [color="#BF8C5F", style=dashed, label="TRUNCATE"];
-  ddlsql -> chddl  [color="#BF8C5F", style=dashed, penwidth=2, label="DDL SQL\n(second TCP)"];
+  // ═════ DDL path ═════
+  cat     -> reorder [color="#CBA85E", style=dashed, label="SchemaEvent\ndrains at commit"];
+  reorder -> fence   [color="#BF8C5F", style=dashed, lhead=cluster_ddl, label="barrier xact:\nper event / TRUNCATE"];
+  apply   -> chddl   [color="#BF8C5F", style=dashed, penwidth=2, label="DDL SQL\n(own connection)"];
+  fence   -> trip    [style=dashed, color="#B58B86", constraint=false, label="FlushAll"];
 
-  // ═════ await_ready gate: DDL completion precedes next row INSERT for same key ═════
-  ddlsql -> route [style=dotted, color="#b380b0", constraint=false, label="await_ready\nnext route rebuilds\nTablePlan off post-DDL desc"];
-
-  // ═════ ack out ═════
-  closew -> ack [style=dotted, color="#b380b0", label="advance ack"];
+  // ═════ ack side-channel ═════
+  reorder -> ack [style=dotted, color="#b380b0", constraint=false, label="Register(seq, commit_lsn)"];
+  decode  -> ack [style=dotted, color="#b380b0", constraint=false, label="Placed(seq, rows)"];
+  ins     -> ack [style=dotted, color="#b380b0", label="Acked(per_seq)\nonly after EndOfStream"];
+  ack     -> fence [style=dotted, color="#b380b0", constraint=false, label="wait_placed_through /\nwait_through"];
 
   // ═════ Legend ═════
   legend [shape=plaintext, label=<
     <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
-      <TR><TD BGCOLOR="#4D4128" WIDTH="28"></TD><TD>xact-buffer drain / ClickHouse</TD></TR>
+      <TR><TD BGCOLOR="#4D4128" WIDTH="28"></TD><TD>reorder / decode pool / ClickHouse</TD></TR>
       <TR><TD BGCOLOR="#4D4D28"></TD><TD>ShadowCatalog schema-event tx</TD></TR>
-      <TR><TD BGCOLOR="#5D4628"></TD><TD>walshadow CH emitter + DdlApplicator</TD></TR>
-      <TR><TD BGCOLOR="#4D3A28"></TD><TD>cursor / ack side-channel</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>batcher / inserters / DdlApplicator</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>ack collector / cursor side-channel</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge style</B></TD></TR>
-      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>CH Native rows (TCP #1, solid)</TD></TR>
-      <TR><TD><FONT COLOR="#BF8C5F"><B>┄┄</B></FONT></TD><TD>CH DDL SQL (TCP #2, dashed)</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>row path (Native rows, solid)</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>┄┄</B></FONT></TD><TD>DDL path (own connection, dashed)</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>┄┄</B></FONT></TD><TD>SchemaEvent off ShadowCatalog</TD></TR>
-      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>await_ready gate / ack-LSN</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>ack events / barrier waits</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>synthetic columns (every dest table)</B></TD></TR>
       <TR><TD><FONT FACE="monospace">_lsn</FONT></TD><TD>UInt64 — commit_lsn; ReplacingMergeTree dedup key</TD></TR>
       <TR><TD><FONT FACE="monospace">_xid</FONT></TD><TD>UInt32 — source xid; recovers xact boundary</TD></TR>
-      <TR><TD><FONT FACE="monospace">_op</FONT></TD><TD>Enum8(insert=1, update=2, delete=3); HOT_UPDATE → 2</TD></TR>
-      <TR><TD><FONT FACE="monospace">_commit_ts</FONT></TD><TD>DateTime64(6, 'UTC'); xl_xact_commit shifted from PG epoch</TD></TR>
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>seal triggers — each flushes one complete INSERT</B></TD></TR>
-      <TR><TD>row_budget</TD><TD>enc.rows ≥ 65536</TD></TR>
-      <TR><TD>byte_budget</TD><TD>enc.approx_bytes ≥ 1 MiB</TD></TR>
-      <TR><TD>deadline</TD><TD>flush_timeout elapsed since first buffered row</TD></TR>
-      <TR><TD>schema event</TD><TD>surgical seal on affected key only</TD></TR>
-      <TR><TD>TRUNCATE / on_close</TD><TD>full seal + drain</TD></TR>
-      <TR><TD COLSPAN="2">seal = open_wire → send_data(Some) → send_data(None) → EndOfStream → clear buffer (replay-safe; CH dedups by _lsn)</TD></TR>
+      <TR><TD><FONT FACE="monospace">_commit_ts</FONT></TD><TD>DateTime64(6, 'UTC'); shifted from PG epoch</TD></TR>
+      <TR><TD><FONT FACE="monospace">_is_deleted</FONT></TD><TD>Bool — 1 on delete; ReplacingMergeTree is_deleted arg unless soft_delete</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>watermark rule</B></TD></TR>
+      <TR><TD COLSPAN="2">downstream completes out of order; emitter_ack advances only on the contiguous-done prefix, so slot recycling never outruns CH durability. Retry-exhausted batch = Fatal (never a silent gap)</TD></TR>
     </TABLE>
   >];
   chrows -> legend [style=invis];

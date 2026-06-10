@@ -98,20 +98,23 @@ Off by default (`rate == 0` short-circuits before any atomic op).
 
 Symmetric probe shape:
 
-1. encode walshadow-decoded value back to PG wire-form bytes (today
-   reuses on-disk raw for `PgPending`; in-tree Tier 3 values still
-   carry their source bytes alongside decoded text)
+1. reuse on-disk raw bytes for `PgPending` (in-tree Tier 3 values —
+   `Numeric`, `Inet` — discard raw bytes at decode, so today only
+   `PgPending` columns probe; full symmetric re-encode is open work)
 2. `SELECT walshadow_decode_disk($1::oid, $2::bytea)` on shadow
-3. compare returned text to walshadow's local rendering
+3. compare returned text to `local_text` — empty for `PgPending`
+   (no local rendering exists), so the probe degrades to "did the
+   extension call succeed + return text"
 4. bump `OracleStats.{probes, matches, mismatches, errors}`
 
 Mismatch is watchdog signal, not gate — row still ships to CH. First
 sampled bad row of a regressed type surfaces in status line via
 `OracleStats::summary`
 
-For pure `PgPending` types there is no local text to diff against;
-validator's role for those types reduces to "did the extension call
-succeed" — folded into resolver's success/error counters today
+Making the probe genuinely differential needs `ColumnValue` Tier 3
+variants to retain source bytes alongside decoded form (or a
+re-encoder per Tier 3 codec) — until then "validator caught a planted
+regression" holds for `PgPending`-routed types, not in-tree Tier 3
 
 Operator policy: `--validate 1000` is ~0.1% sampling, invisible against
 shadow's existing catalog query load

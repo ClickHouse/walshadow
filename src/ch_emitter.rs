@@ -741,6 +741,18 @@ impl ColumnBuf {
         }
     }
 
+    /// Type default for absent values where NULL is unrepresentable: zero
+    /// bytes for fixed shapes (0 / epoch / empty FixedString, matching CH
+    /// column DEFAULT), empty string for varlen. Nullable shapes keep NULL,
+    /// the more faithful absence marker
+    fn append_default(&mut self) {
+        match self {
+            Self::Fixed { width, bytes } => bytes.extend(std::iter::repeat_n(0u8, *width)),
+            Self::String { offsets, data } => offsets.push(data.len() as u64),
+            nullable => nullable.append_null().expect("nullable shape takes NULL"),
+        }
+    }
+
     fn append_fixed_bytes(&mut self, le: &[u8]) -> Result<(), EmitterError> {
         match self {
             Self::Fixed { width, bytes } => {
@@ -870,16 +882,11 @@ impl TableEncoder {
                 .and_then(|t| t.columns.get((col.src_attnum - 1) as usize))
                 .and_then(|opt| opt.as_ref());
             match raw_value {
-                None | Some(ColumnValue::Null) => buf.append_null().map_err(|mut e| {
-                    if let EmitterError::UnsupportedValue {
-                        ref mut target_column,
-                        ..
-                    } = e
-                    {
-                        *target_column = col.target_name.clone();
-                    }
-                    e
-                })?,
+                // Absent / NULL coerces: Nullable target takes NULL,
+                // non-Nullable the type default. Covers key-only delete
+                // tombstones under non-FULL replica identity and NULL
+                // source values mapped onto non-Nullable columns
+                None | Some(ColumnValue::Null) => buf.append_default(),
                 Some(v) => encode_value(buf, v, decimal).map_err(|mut e| {
                     if let EmitterError::UnsupportedValue {
                         ref mut target_column,
@@ -1720,6 +1727,65 @@ mod tests {
                 assert_eq!(bytes, &vec![0u8, 1]);
             }
             other => panic!("_is_deleted expected Fixed(1), got {other:?}"),
+        }
+    }
+
+    /// Key-only old image, the shape a delete logs under non-FULL
+    /// replica identity
+    fn committed_delete(id: i32) -> CommittedTuple {
+        CommittedTuple {
+            decoded: DecodedHeap {
+                rfn: RelFileNode {
+                    spc_node: 1663,
+                    db_node: 5,
+                    rel_node: 16385,
+                },
+                xid: 42,
+                source_lsn: 0xCAFE,
+                op: HeapOp::Delete,
+                new: None,
+                old: Some(DecodedTuple {
+                    columns: vec![Some(ColumnValue::Int4(id)), None],
+                    partial: false,
+                }),
+            },
+            commit_ts: 1_000_000,
+            commit_lsn: 0xD00D,
+        }
+    }
+
+    #[test]
+    fn absent_or_null_coerces_to_default_on_non_nullable_target() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let mut m = mk_mapping();
+        m.columns[1].target_type = "String".into();
+        let plan = TablePlan::build(alloc, &rel, &m).expect("plan builds");
+        let mut enc = TableEncoder::new(plan).unwrap();
+        // Delete: non-key column absent from the key-only old image
+        enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
+        // Insert: genuine NULL mapped onto the non-Nullable column
+        enc.append_row(&committed(4, None), &m, OP_INSERT).unwrap();
+        match &enc.buffers[1] {
+            ColumnBuf::String { offsets, data } => {
+                assert_eq!(offsets, &vec![0u64, 0]);
+                assert!(data.is_empty());
+            }
+            other => panic!("name expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_stays_null_on_nullable_target() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let m = mk_mapping();
+        let plan = TablePlan::build(alloc, &rel, &m).expect("plan builds");
+        let mut enc = TableEncoder::new(plan).unwrap();
+        enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
+        match &enc.buffers[1] {
+            ColumnBuf::NullableString { null_map, .. } => assert_eq!(null_map, &vec![1u8]),
+            other => panic!("name expected NullableString, got {other:?}"),
         }
     }
 

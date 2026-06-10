@@ -3,16 +3,16 @@
 // 5 phases top→bottom in time; this one freezes phases 1-4 and
 // exposes the MultiplexSink fan-out structure — BackupSource trait
 // + two impls, per-file routing, parallel ShadowDataDir + PageWalkSink
-// rails, transitional seal-per-table INSERT (flush_timeout = 0).
+// rails, drain into the shared insert tail (same unit as streaming).
 //
 // regeneration spec:
-// sources of truth: plans/bootstrap.md · src/backup_source_direct.rs · src/backup_source_object_store.rs · src/backup_page_walk.rs · src/backup_source.rs
+// sources of truth: plans/bootstrap.md · src/backup_source_direct.rs · src/backup_source_object_store.rs · src/backup_page_walk.rs · src/backup_source.rs · src/pipeline/{bootstrap,tail}.rs
 // subsumes: plans/bootstrap.md § "MultiplexSink" / fan-out
 // differentiates: timeline_bootstrap.dot walks the 5-phase TIMELINE; this freezes phases 1-4 and exposes the FAN-OUT structure (BackupSource impls, MultiplexSink, simultaneous shadow-dir + CH writes)
 // quality bar:
 //   - "both" fan-out from classify visible (two edges, not one merged)
-//   - RelationResolver feedback edge clearly secondary (dashed, constraint=false)
-//   - bootstrap CH path distinct from steady-state emitter (annotated "no DdlApplicator")
+//   - CatalogMap lookup edge clearly secondary (dashed, constraint=false)
+//   - bootstrap CH path reads as the SAME shared insert tail streaming uses (annotated "no DdlApplicator")
 // shared style: palette.md
 digraph bootstrap {
   rankdir=TB;
@@ -33,9 +33,8 @@ digraph bootstrap {
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     seedq  [label="seed_in_snapshot\nSELECT pg_class / pg_attribute /\npg_type / pg_index WHERE oid≥16384", fillcolor="#4D4D28"];
-    catmap [label="CatalogMap\nrelfilenode → RelDescriptor", fillcolor="#4D4D28", shape=parallelogram];
-    resolv [label="CatalogMapResolver\nimpl RelationResolver\n(at_lsn ignored)", fillcolor="#4D4D28"];
-    seedq -> catmap -> resolv;
+    catmap [label="CatalogMap\n(db_node, rel_node) → RelDescriptor\nsnapshot, no replay gate", fillcolor="#4D4D28", shape=parallelogram];
+    seedq -> catmap;
   }
 
   // ════════ BackupSource trait + two impls ════════
@@ -56,7 +55,7 @@ digraph bootstrap {
 
   // ════════ Orchestrator + MultiplexSink dispatcher ════════
   orch [label="backfill_bootstrap orchestrator\nspawn_greenfield_bootstrap\nholds Arc<Mutex<MultiplexSink<PageWalkSink>>>", fillcolor="#4D3A28"];
-  mux  [label="MultiplexSink (impl BackupSink, sync)\nbegin(meta) → DiskLanderSink.classify():\n  Keep         → lander only\n  SkipDenylist → lander Skip (dir entry kept as empty dir)\n  SkipUserHeap → tap.begin (Tap | Skip)\nchunk / end route to chosen sink; finish observed by both",
+  mux  [label="MultiplexSink (impl BackupSink, async)\nbegin(meta) → DiskLanderSink.classify():\n  Keep         → lander only\n  SkipDenylist → lander Skip (dir entry kept as empty dir)\n  SkipUserHeap → tap.begin (Tap | Skip)\nchunk / end route to chosen sink; finish observed by both",
         fillcolor="#4D3340", width=4.6];
   ev    -> orch [label="drives via run(sink)", color="#A1A9CC"];
   orch  -> mux  [label="install sink"];
@@ -80,10 +79,10 @@ digraph bootstrap {
 
     pwsink [label="PageWalkSink\nparse_base_path → rfn ≥ 16384\naccumulate 8 KiB at a time", fillcolor="#4D4128"];
     walker [label="PageWalker::walk_page\npd_lower/pd_upper bounds-check\nfor each LP_NORMAL ItemIdData slot\n  decode_on_page_tuple\nreshape HeapTupleHeaderData →\n  xl_heap_header + bitmap + cols", fillcolor="#4D4128"];
-    dec    [label="heap_decoder::decode_block_data\nshared with WAL hot path\n(no FPI replay on backup pages;\n external TOAST → ColumnValue::PgPending)", fillcolor="#4D4128"];
+    dec    [label="heap_decoder::decode_block_data\nshared with WAL hot path\n(no FPI replay on backup pages;\n external TOAST → ExternalToast,\n drain fails fast — future/TOAST.md)", fillcolor="#4D4128"];
     bft    [label="BackfillTuple\n{rfn, xid, source_lsn = start_lsn,\n columns}", fillcolor="#4D4128", shape=parallelogram];
-    queue  [label="unbounded mpsc\n(blocking_send forbidden\nfrom tokio context)", fillcolor="#4D4128", shape=parallelogram];
-    drain  [label="drain_backfill task\nsynthesize CommittedTuple\n{op=Insert, commit_lsn=start_lsn}\non_xact_end on every rfn flip", fillcolor="#4D4128"];
+    queue  [label="bounded mpsc (cap 256)\nchunk() awaits a free slot —\nslow drain backpressures the pump", fillcolor="#4D4128", shape=parallelogram];
+    drain  [label="pipeline::bootstrap::drain\nsynthesize row {op=Insert,\n commit_lsn=start_lsn}\nresolve via CatalogMap, route to tail\none ack seq per rfn flip", fillcolor="#4D4128"];
 
     pwsink -> walker -> dec -> bft -> queue -> drain;
   }
@@ -93,28 +92,30 @@ digraph bootstrap {
   mux -> pwsink [label="SkipUserHeap →\ntap.begin (Tap)"];
   { rank=same; lander; pwsink; }
 
-  // ════════ Transitional CH emitter (bootstrap-only) ════════
+  // ════════ Shared insert tail (same unit as streaming) ════════
   subgraph cluster_emit {
-    label="transitional emitter — bootstrap one-shot, force-closed at end (no DdlApplicator wired)";
+    label="shared insert tail (pipeline/tail.rs) — same batcher + inserter pool + ack collector streaming uses; no DdlApplicator (descriptors frozen at snapshot)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    tobs  [label="TupleObserver\nholds Arc<dyn RelationResolver>", fillcolor="#5D4628"];
-    bb    [label="BlockBuilder per relation\nNative columns +\n_lsn=start_lsn / _xid / _op=Insert", fillcolor="#5D4628"];
-    wire  [label="clickhouse-c-rs\nflush_timeout = 0 → seal per table\nopen_wire send_query per table\nsend_data(None) → EndOfStream\nat rfn flip / budget / bootstrap end", fillcolor="#5D4628"];
-    tobs -> bb -> wire;
+    batch [label="InsertBatcher\nTableEncoder per table\nNative columns + _lsn=start_lsn /\n_xid / _commit_ts / _is_deleted=0\nbudget + deadline seal", fillcolor="#5D4628"];
+    ins   [label="inserter pool ×N\none complete INSERT per sealed batch\nsend_with_retry + reconnect", fillcolor="#5D4628"];
+    ackc  [label="ack collector\nRegister(seq, start_lsn) / Placed / Acked\nwait_through(K) = all durable", fillcolor="#4D3A28", shape=note];
+    batch -> ins;
+    ins -> ackc [style=dotted, color="#b380b0", label="Acked"];
   }
-  drain  -> tobs [color="#BF8C5F", penwidth=2, style=dashed, label="per-rfn block"];
-  resolv -> tobs [color="#CBA85E", style=dashed, label="relation_at(rfn, _)"];
+  drain  -> batch  [color="#BF8C5F", penwidth=2, style=dashed, label="BatcherMsg::Row"];
+  drain  -> ackc   [style=dotted, color="#b380b0", constraint=false, label="Register / Placed\n(per rfn)"];
+  catmap -> drain  [color="#CBA85E", style=dashed, constraint=false, label="get(db_node, rel_node)"];
 
   ch [label="ClickHouse\nReplacingMergeTree(_lsn)", fillcolor="#4D4128", shape=cylinder];
-  wire -> ch [color="#BF8C5F", style=dashed, penwidth=2, label="Native\n(bootstrap)"];
+  ins -> ch [color="#BF8C5F", style=dashed, penwidth=2, label="Native\n(bootstrap)"];
 
   // ════════ Handoff at end_lsn ════════
   subgraph cluster_handoff {
-    label="handoff at end_lsn — orchestrator drops emitter, hands cursor to streaming pump";
+    label="handoff at end_lsn — tail.finish (FlushAll → wait durable), cursor to streaming pump";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    out  [label="BootstrapOutcome\n{start_lsn, end_lsn,\n DiskLanderStats, PageWalkStats}", fillcolor="#4D3A28"];
+    out  [label="BootstrapOutcome\n{start_lsn, end_lsn,\n DiskLanderStats, PageWalkStats}\ntail.finish: FlushAll →\nwait_through(next_seq) → drain cascade", fillcolor="#4D3A28"];
     cur  [label="cursor::write\nemitter_ack_lsn = end_lsn\natomic rename + fsync", fillcolor="#4D3A28"];
     curd [label="cursor.bin", fillcolor="#4D3850", shape=note];
     feed [label="SourceFeed open\nSTART_REPLICATION\nPHYSICAL <end_lsn>", fillcolor="#4D3A28"];
@@ -133,26 +134,26 @@ digraph bootstrap {
     <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
       <TR><TD BGCOLOR="#3D3D54" WIDTH="28"></TD><TD>source PG / object store ingress</TD></TR>
-      <TR><TD BGCOLOR="#4D3A28"></TD><TD>orchestrator / BackupSource impls</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>orchestrator / BackupSource impls / ack collector</TD></TR>
       <TR><TD BGCOLOR="#4D3340"></TD><TD>MultiplexSink + DiskLanderSink (rail A)</TD></TR>
       <TR><TD BGCOLOR="#4D4128"></TD><TD>PageWalkSink + heap decoder (rail B)</TD></TR>
-      <TR><TD BGCOLOR="#4D4D28"></TD><TD>CatalogMap seed + RelationResolver</TD></TR>
-      <TR><TD BGCOLOR="#5D4628"></TD><TD>transitional CH emitter (bootstrap-only)</TD></TR>
+      <TR><TD BGCOLOR="#4D4D28"></TD><TD>CatalogMap seed</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>shared insert tail (batcher + inserters)</TD></TR>
       <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact</TD></TR>
       <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres (post-handoff)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
       <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>replication protocol (BASE_BACKUP, START_REPLICATION)</TD></TR>
       <TR><TD><FONT COLOR="#BD8183"><B>┄┄</B></FONT></TD><TD>walsender wire (post-handoff)</TD></TR>
-      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq catalog query / RelationResolver lookup</TD></TR>
-      <TR><TD><FONT COLOR="#BF8C5F"><B>┄┄</B></FONT></TD><TD>CH Native (bootstrap one-shot, force-closed at end)</TD></TR>
-      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq catalog query / CatalogMap lookup</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>┄┄</B></FONT></TD><TD>CH Native (bootstrap, via shared tail)</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability / ack events</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>filesystem (data_dir land, shadow boot)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>file routing (MultiplexSink)</B></TD></TR>
       <TR><TD>catalog filenode<BR/>(fn &lt; 16384 ∪ whitelist)</TD><TD>rail A only</TD></TR>
       <TR><TD>global/, pg_xact/, pg_control,<BR/>tablespace_map, conf files</TD><TD>rail A only</TD></TR>
       <TR><TD>pg_replslot/, pg_stat_tmp/,<BR/>pg_logical/, pgsql_tmp/, temp_*</TD><TD>Skip (denylist;<BR/>dir entry kept as empty dir)</TD></TR>
       <TR><TD>user heap<BR/>base/&lt;db&gt;/&lt;fn ≥ 16384&gt;</TD><TD>rail B only<BR/>(never lands on shadow)</TD></TR>
-      <TR><TD>pg_toast_&lt;relid&gt;</TD><TD>rail B observed,<BR/>chunks not reassembled (V1)</TD></TR>
+      <TR><TD>pg_toast_&lt;relid&gt;</TD><TD>rail B observed, chunks not reassembled;<BR/>ExternalToast value fails fast (V1)</TD></TR>
     </TABLE>
   >];
   ch -> legend [style=invis];

@@ -41,7 +41,9 @@ when any of these fails:
 
 - `server_version_num >= 160_000`, shadow major equals source major
 - `wal_level = logical`
-- every mapped relation has `REPLICA IDENTITY FULL`
+- every mapped relation has a row key for deletes: a PRIMARY KEY
+  (`REPLICA IDENTITY DEFAULT`), `USING INDEX`, or `FULL`. `NOTHING` and
+  keyless `DEFAULT` are rejected. `FULL` is accepted, not required
 - `--slot`, if set, names an existing physical replication slot
 
 Skip with `--skip-preflight` only for recovery drills

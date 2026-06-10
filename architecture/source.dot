@@ -21,9 +21,9 @@ digraph source {
   edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
 
   // ════════ External actors ════════
-  src [label="source PG\nwal_level=replica", fillcolor="#3D3D54", shape=cylinder];
+  src [label="source PG\nwal_level=logical", fillcolor="#3D3D54", shape=cylinder];
   shd [label="shadow PG\nwalreceiver\npg_last_wal_replay_lsn", fillcolor="#3D4128", shape=cylinder];
-  dec [label="downstream\nBufferingDecoderSink\n+ XactRecordSink\n→ CH emitter", fillcolor="#4D4128", shape=cylinder];
+  dec [label="downstream\nBufferingDecoderSink\n+ ReorderSink\n→ CH pipeline", fillcolor="#4D4128", shape=cylinder];
 
   // ════════ ① ingress (pump task) ════════
   subgraph cluster_ingress {

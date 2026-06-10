@@ -175,8 +175,14 @@ buf[abs..abs+len]`:
 | 1114 / 1184 | timestamp / timestamptz | 8 | microseconds since PG epoch |
 | 1266 | timetz | 12 | `TimeTz { micros: i64, tz_seconds: i32 }` |
 | 2950 | uuid | 16 | `Uuid([u8; 16])` raw, no swap |
-| 19 | name | 64 | `Name(String)` via fixed-width path (NUL-padded NAMEDATALEN) |
 | 1186 | interval | 16 | `Interval` via `codecs::decode_interval` (Tier 3 fixed) |
+
+`name` (oid 19, width 64) is **not** wired into `decode_one_value`:
+WAL-decoded `name` columns fall through to `Unsupported`.
+`ColumnValue::Name` variant exists but nothing constructs it from WAL;
+only `missing_value_for` maps `NAMEOID` (as `Text`, attmissingval
+defaults). User tables carrying `name` columns are rare; wire the
+fixed-width arm (NUL-trimmed NAMEDATALEN) when one shows up
 
 PG built with `--disable-integer-datetimes` was removed in PG 10;
 walshadow assumes integer microseconds unconditionally
