@@ -14,6 +14,12 @@
 # at most this long before the INSERT block is flushed, batching multiple
 # xacts into one MergeTree part instead of one-part-per-xact. 0 = legacy
 # emit-per-commit (lowest latency, most parts).
+#
+# DECODER_POOL_SIZE / INSERTER_POOL_SIZE size the parallel decode (detoast +
+# resolve + route) and CH-insert pools. >1 enables parallelism; persisted here
+# so a re-deploy keeps them (they're walshadow-stream CLI args forwarded by the
+# entrypoint's "$@", not config-file knobs). Decode-pool parallelism helps
+# multi-row transactions; inserter-pool parallelism is the CH-throughput lever.
 set -euo pipefail
 cd "$(dirname "$0")"
 source ../aws-env.sh
@@ -21,7 +27,9 @@ source ./state.env   # PUBLIC_IP, KEY_NAME, ...
 source ../lib.sh
 
 IMAGE="${IMAGE:-walshadow:local}"
-FLUSH_TIMEOUT_MS="${FLUSH_TIMEOUT_MS:-1000}"
+FLUSH_TIMEOUT_MS="${FLUSH_TIMEOUT_MS:-50}"
+DECODER_POOL_SIZE="${DECODER_POOL_SIZE:-8}"
+INSERTER_POOL_SIZE="${INSERTER_POOL_SIZE:-4}"
 JAEGER_IMAGE="${JAEGER_IMAGE:-jaegertracing/all-in-one:1.57}"
 JAEGER_MAX_TRACES="${JAEGER_MAX_TRACES:-50000}"
 JAEGER_MEMORY="${JAEGER_MEMORY:-1g}"
@@ -69,6 +77,8 @@ columns = [
 ]
 EOF
 
+echo "decoder-pool-size=$DECODER_POOL_SIZE inserter-pool-size=$INSERTER_POOL_SIZE"
+
 # Memory-bound Jaeger (in-memory storage capped at JAEGER_MAX_TRACES, RAM at
 # JAEGER_MEMORY) on walshadow-net so the daemon ships spans to it by name.
 "${SSH[@]}" "sudo docker network inspect walshadow-net >/dev/null 2>&1 || sudo docker network create walshadow-net"
@@ -90,7 +100,7 @@ EOF
   -v /opt/walshadow/ch-config.toml:/etc/walshadow/ch-config.toml:ro \
   -v walshadow-data:/var/lib/walshadow \
   -p 9484:9484 \
-  $IMAGE --trace-sample-ratio '$TRACE_SAMPLE_RATIO' >/dev/null && echo started"
+  $IMAGE --decoder-pool-size $DECODER_POOL_SIZE --inserter-pool-size $INSERTER_POOL_SIZE --trace-sample-ratio '$TRACE_SAMPLE_RATIO' >/dev/null && echo started"
 
 # Grafana + Prometheus: only uploaded/recreated when FORCE_METRICS=1.
 if [ "${FORCE_METRICS:-0}" = "1" ]; then

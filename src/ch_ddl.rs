@@ -122,7 +122,10 @@ impl DdlConfig {
 
 /// CH-side DDL writer. Owns one AsyncClient over its own TCP.
 pub struct DdlApplicator {
-    client: AsyncClient,
+    /// `None` only for [`DdlApplicator::offline_for_test`]: the bench/test
+    /// reorder path applies no DDL, so `execute` is never reached. Any actual
+    /// `apply`/`truncate` against a `None` client panics loudly.
+    client: Option<AsyncClient>,
     config: DdlConfig,
     mapping: MappingHandle,
     /// Reconnect params, cloned at boot. SIGHUP reloads DDL knobs not
@@ -154,7 +157,7 @@ impl DdlApplicator {
     ) -> Result<Self, EmitterError> {
         let client = connect_client(emitter_cfg).await?;
         Ok(Self {
-            client,
+            client: Some(client),
             config: ddl_cfg,
             mapping,
             conn_cfg: emitter_cfg.clone(),
@@ -162,6 +165,23 @@ impl DdlApplicator {
             query_timeout: emitter_cfg.insert_timeout,
             stats: DdlStats::default(),
         })
+    }
+
+    /// Offline applicator with no CH client, for in-process benchmarks/tests of
+    /// the reorder path (which dispatches data but applies no DDL). `apply`/
+    /// `truncate` panic if ever reached.
+    #[doc(hidden)]
+    pub fn offline_for_test(mapping: MappingHandle) -> Self {
+        let cfg = EmitterConfig::default();
+        Self {
+            client: None,
+            config: DdlConfig::from_emitter(&cfg),
+            mapping,
+            retry: cfg.retry.clone(),
+            query_timeout: cfg.insert_timeout,
+            conn_cfg: cfg,
+            stats: DdlStats::default(),
+        }
     }
 
     pub fn config(&self) -> &DdlConfig {
@@ -455,8 +475,12 @@ impl DdlApplicator {
         let mut backoff = self.retry.initial_backoff;
         loop {
             let attempt_result = match tokio::time::timeout(self.query_timeout, async {
-                self.client.send_query(sql, None).await?;
-                drain_to_end_of_stream(&mut self.client).await
+                let client = self
+                    .client
+                    .as_mut()
+                    .expect("ddl applicator has no client (offline_for_test)");
+                client.send_query(sql, None).await?;
+                drain_to_end_of_stream(client).await
             })
             .await
             {
@@ -478,7 +502,7 @@ impl DdlApplicator {
                     attempt += 1;
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(self.retry.max_backoff);
-                    self.client = connect_client(&self.conn_cfg).await?;
+                    self.client = Some(connect_client(&self.conn_cfg).await?);
                 }
                 Err(e) => return Err(e),
             }

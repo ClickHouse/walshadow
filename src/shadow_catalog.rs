@@ -310,7 +310,10 @@ impl EvictionIndex {
 }
 
 pub struct ShadowCatalog {
-    client: Client,
+    /// `None` only for [`ShadowCatalog::seeded_for_test`]: an offline catalog
+    /// whose entries are pre-loaded so the hot path cache-hits and never
+    /// queries. Any path that would query errors via `ensure_open`.
+    client: Option<Client>,
     conninfo: String,
     config: ShadowCatalogConfig,
     generation: u64,
@@ -349,12 +352,25 @@ pub struct ShadowCatalog {
 macro_rules! query_with_reconnect {
     ($self:ident, $method:ident, $statement:expr, $params:expr) => {{
         $self.ensure_open().await?;
-        match $self.client.$method($statement, $params).await {
+        // `ensure_open` guarantees `Some` (errors otherwise), so these expects
+        // never fire on the live path; a seeded catalog errors above.
+        match $self
+            .client
+            .as_ref()
+            .expect("client present after ensure_open")
+            .$method($statement, $params)
+            .await
+        {
             Ok(r) => Ok(r),
             Err(e) => {
-                if $self.client.is_closed() {
+                if $self.client.as_ref().is_some_and(|c| c.is_closed()) {
                     $self.reconnect().await?;
-                    Ok($self.client.$method($statement, $params).await?)
+                    Ok($self
+                        .client
+                        .as_ref()
+                        .expect("client present after reconnect")
+                        .$method($statement, $params)
+                        .await?)
                 } else {
                     Err(e.into())
                 }
@@ -373,7 +389,7 @@ impl ShadowCatalog {
             let _ = conn.await;
         });
         Ok(Self {
-            client,
+            client: Some(client),
             conninfo: conninfo.to_string(),
             config,
             generation: 0,
@@ -391,6 +407,38 @@ impl ShadowCatalog {
             current_db_oid: None,
             stats: ShadowCatalogStats::default(),
         })
+    }
+
+    /// Offline catalog pre-loaded with `descriptors`, `last_replay_lsn` set to
+    /// `replay_lsn` so `relation_at`/`relation_at_pooled` cache-hit and
+    /// `wait_for_replay` fast-paths — i.e. the decode path runs without a PG
+    /// client. For in-process benchmarks/tests only (`client` is `None`; any
+    /// path that actually queries errors via `ensure_open`).
+    #[doc(hidden)]
+    pub fn seeded_for_test(descriptors: Vec<RelDescriptor>, replay_lsn: u64) -> Self {
+        let mut cat = Self {
+            client: None,
+            conninfo: String::new(),
+            config: ShadowCatalogConfig::default(),
+            generation: 0,
+            by_filenode: HashMap::new(),
+            by_oid: HashMap::new(),
+            prev_known: HashMap::new(),
+            eviction: EvictionIndex::default(),
+            last_replay_lsn: Some(replay_lsn),
+            invalidation_epoch: None,
+            last_seen_epoch: 0,
+            event_tx: None,
+            last_swept_generation: 0,
+            pg_class_delete_epoch: None,
+            last_seen_delete_epoch: 0,
+            current_db_oid: None,
+            stats: ShadowCatalogStats::default(),
+        };
+        for d in descriptors {
+            cat.insert(d);
+        }
+        cat
     }
 
     /// Pair with
@@ -643,7 +691,7 @@ impl ShadowCatalog {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        self.client = client;
+        self.client = Some(client);
         self.stats.reconnects += 1;
         self.generation = self.generation.wrapping_add(1);
         self.stats.generation_bumps += 1;
@@ -652,7 +700,15 @@ impl ShadowCatalog {
     }
 
     async fn ensure_open(&mut self) -> Result<()> {
-        if self.client.is_closed() {
+        let closed = match &self.client {
+            None => {
+                return Err(CatalogError::Parse(
+                    "shadow catalog has no client (seeded_for_test)".into(),
+                ));
+            }
+            Some(c) => c.is_closed(),
+        };
+        if closed {
             self.reconnect().await?;
         }
         Ok(())
