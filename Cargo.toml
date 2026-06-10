@@ -1,5 +1,5 @@
 [workspace]
-members = ["clickhouse-c-rs"]
+members = ["clickhouse-c-rs", "bench"]
 exclude = ["wal-rs"]
 
 [package]
@@ -19,10 +19,6 @@ path = "src/bin/filter.rs"
 [[bin]]
 name = "walshadow-stream"
 path = "src/bin/stream.rs"
-
-[[bin]]
-name = "walshadow-latency-bench"
-path = "src/bin/latency_bench.rs"
 
 [lib]
 name = "walshadow"

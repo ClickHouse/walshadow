@@ -1,0 +1,6 @@
+# secrets / per-run state — never commit (matches every ec2-* subfolder)
+*.pem
+state.env
+
+# copied-back perf/eBPF profiles (large)
+profiles/

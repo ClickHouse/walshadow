@@ -34,6 +34,8 @@ services:
       - max_replication_slots=8
       - -c
       - wal_keep_size=128MB
+      - -c
+      - wal_compression=lz4
     volumes:
       - ./init/source:/docker-entrypoint-initdb.d:ro
       # PG 18+ official image stores data in a major-version subdir

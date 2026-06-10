@@ -1,0 +1,27 @@
+# Builds the walshadow-ec2-bench binary and packages it in a small alpine
+# runtime, so the latency bench can run from INSIDE the VPC (low RTT to the
+# source Postgres / ClickHouse / standby) instead of from a workstation where
+# the WAN round trip caps insert throughput.
+#
+# The bench lives in its own `walshadow-bench` crate (bench/), which is
+# self-contained — it talks to Postgres over tokio-postgres and to ClickHouse
+# over a hand-rolled HTTP client, so it pulls in none of walshadow's WAL/native
+# (clickhouse-c-rs) dependencies. That means no lz4/zstd C toolchain at build
+# time and no codec .so at runtime. The sibling crate manifests are still copied
+# so Cargo can resolve the workspace; only `walshadow-bench` is compiled.
+FROM rust:1-alpine AS builder
+RUN apk add --no-cache build-base
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY clickhouse-c-rs ./clickhouse-c-rs
+COPY wal-rs ./wal-rs
+COPY src ./src
+COPY bench ./bench
+RUN cargo build --release -p walshadow-bench --bin walshadow-ec2-bench
+
+FROM alpine:3.21 AS runtime
+# libgcc for the (dynamically-linked musl) Rust binary; no codec libs needed.
+RUN apk add --no-cache libgcc
+COPY --from=builder /src/target/release/walshadow-ec2-bench /usr/local/bin/walshadow-ec2-bench
+ENTRYPOINT ["walshadow-ec2-bench"]

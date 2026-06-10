@@ -1,0 +1,32 @@
+[package]
+name = "walshadow-bench"
+version = "0.1.0"
+edition = "2024"
+description = "Replication-latency benchmarks (Postgres → ClickHouse / PG standby), engine + CLIs"
+
+# The shared benchmark engine. Self-contained: talks to Postgres over
+# tokio-postgres and to ClickHouse over a hand-rolled HTTP client, so it pulls
+# in none of walshadow's WAL/native dependencies.
+[lib]
+name = "walshadow_bench"
+path = "src/lib.rs"
+
+# Local docker-compose stack (endpoints default to localhost).
+[[bin]]
+name = "walshadow-local-bench"
+path = "src/bin/local_bench.rs"
+
+# EC2 deployment (endpoints resolved from the harness state.env files).
+[[bin]]
+name = "walshadow-ec2-bench"
+path = "src/bin/ec2_bench.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+tokio-postgres = "0.7"
+
+[dev-dependencies]
+tempfile = "3"

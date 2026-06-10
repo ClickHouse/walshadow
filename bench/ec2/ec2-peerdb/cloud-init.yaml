@@ -1,0 +1,23 @@
+#cloud-config
+# Provisions the self-hosted PeerDB host (the OSS engine behind ClickPipes):
+# installs Docker + Compose + git and clones PeerDB. The stack itself is
+# started by deploy.sh, which needs the source + ClickHouse private IPs to
+# create the CDC mirror.
+runcmd:
+  - export DEBIAN_FRONTEND=noninteractive
+  - apt-get update
+  - apt-get install -y ca-certificates curl git
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu
+  # On-CPU profiling tools: perf (linux-tools matching the running kernel) + bcc
+  # eBPF tools (+ headers). Best-effort — don't fail provisioning if unavailable.
+  - apt-get install -y "linux-tools-$(uname -r)" linux-tools-common linux-tools-aws bpfcc-tools "linux-headers-$(uname -r)" || true
+  # PeerDB OSS — pin to the stable branch; docker-compose.yml + run-peerdb.sh live here.
+  # Images are pulled by `docker compose up` in deploy.sh (no build needed).
+  - git clone --depth 1 --branch stable https://github.com/PeerDB-io/peerdb.git /opt/peerdb
