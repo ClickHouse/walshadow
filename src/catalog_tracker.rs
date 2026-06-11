@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tokio_postgres::Client;
 use tokio_postgres::types::Oid;
-use wal_rs::pg::walparser::{RmId, XLogRecord};
+use walross::pg::walparser::{RmId, XLogRecord};
 
 use crate::classify::FIRST_NORMAL_OBJECT_ID;
 use crate::pg_class_decoder::{
@@ -316,7 +316,7 @@ impl CatalogTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::{
+    use walross::pg::walparser::{
         BlockLocation, RelFileNode, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 

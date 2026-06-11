@@ -6,7 +6,7 @@
 //! policy (EOF vs truncation vs "need more bytes").
 
 use thiserror::Error;
-use wal_rs::pg::walparser::{
+use walross::pg::walparser::{
     WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
 };
 

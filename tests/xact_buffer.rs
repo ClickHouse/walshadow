@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use wal_rs::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
+use walross::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::decoder_sink::{DecoderSinkError, TupleObserver};
 use walshadow::filter::Route;
 use walshadow::heap_decoder::{
@@ -26,6 +27,7 @@ use walshadow::heap_decoder::{
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
 use walshadow::spill::ToastChunk;
+use walshadow::toast::{ToastConfig, ToastMode, ToastResolver};
 use walshadow::wal_stream::Record;
 use walshadow::xact_buffer::{XactBuffer, XactBufferConfig, XactBufferError, XactRecordSink};
 
@@ -217,7 +219,17 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, one_col(3)))
         .await
         .unwrap();
-    b.commit(7, 12345, 300, &[], &cat, &mut obs).await.unwrap();
+    b.commit(
+        7,
+        12345,
+        300,
+        &[],
+        &cat,
+        &mut obs,
+        &ToastResolver::disabled(),
+    )
+    .await
+    .unwrap();
     assert_eq!(obs.seen.len(), 2);
     assert_eq!(obs.seen[0].decoded.source_lsn, 100);
     assert_eq!(obs.seen[1].decoded.source_lsn, 200);
@@ -245,7 +257,17 @@ async fn commit_unknown_xid_no_ops() {
     // Ack-LSN coverage: even with no buffered records, the commit's source LSN
     // must advance both ack-LSN gauges so source's slot can recycle
     // past read-only / filter-dropped xacts.
-    b.commit(99, 0, 0x9000, &[], &cat, &mut obs).await.unwrap();
+    b.commit(
+        99,
+        0,
+        0x9000,
+        &[],
+        &cat,
+        &mut obs,
+        &ToastResolver::disabled(),
+    )
+    .await
+    .unwrap();
     assert_eq!(b.stats().commits_unknown_xid, 1);
     assert!(obs.seen.is_empty());
     assert_eq!(b.stats().drain_lsn, 0x9000);
@@ -282,7 +304,9 @@ async fn commit_drains_spilled_then_in_memory_entries() {
             .await
             .unwrap();
     }
-    b.commit(5, 0, 250, &[], &cat, &mut obs).await.unwrap();
+    b.commit(5, 0, 250, &[], &cat, &mut obs, &ToastResolver::disabled())
+        .await
+        .unwrap();
     assert_eq!(obs.seen.len(), 5);
     for (i, c) in obs.seen.iter().enumerate() {
         let lsn = c.decoded.source_lsn;
@@ -327,7 +351,17 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
     b.on_heap(heap(rfn, 7, 200, HeapOp::Insert, col(3)))
         .await
         .unwrap();
-    b.commit(7, 12345, 300, &[8], &cat, &mut obs).await.unwrap();
+    b.commit(
+        7,
+        12345,
+        300,
+        &[8],
+        &cat,
+        &mut obs,
+        &ToastResolver::disabled(),
+    )
+    .await
+    .unwrap();
     let lsns: Vec<u64> = obs.seen.iter().map(|c| c.decoded.source_lsn).collect();
     assert_eq!(lsns, vec![100, 150, 200]);
     // Per-top accounting: one bump, regardless of subxact count.
@@ -375,7 +409,17 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
         .await
         .unwrap();
     }
-    b.commit(33, 12345, 300, &[], &cat, &mut obs).await.unwrap();
+    b.commit(
+        33,
+        12345,
+        300,
+        &[],
+        &cat,
+        &mut obs,
+        &ToastResolver::disabled(),
+    )
+    .await
+    .unwrap();
     assert_eq!(obs.seen.len(), 1);
     let body_col = &obs.seen[0].decoded.new.as_ref().unwrap().columns[1];
     match body_col {
@@ -422,8 +466,19 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         .await
         .unwrap();
     }
+    // Gap only errors with an active store (disabled mode NULL-fills);
+    // disk mode with an empty store keeps the in-xact chunks authoritative
+    let emitter_cfg = EmitterConfig {
+        toast: ToastConfig {
+            mode: ToastMode::Disk,
+            disk_dir: Some(tmp.path().join("toast-store")),
+        },
+        ..Default::default()
+    };
+    let resolver =
+        ToastResolver::from_config(&emitter_cfg, Arc::new(EmitterStats::default())).unwrap();
     let err = b
-        .commit(42, 0, 200, &[], &cat, &mut obs)
+        .commit(42, 0, 200, &[], &cat, &mut obs, &resolver)
         .await
         .expect_err("missing chunk surfaces");
     match err {

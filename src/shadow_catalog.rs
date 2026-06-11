@@ -28,11 +28,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use backon::{ExponentialBuilder, RetryableWithContext};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::types::{Oid, ToSql};
 use tokio_postgres::{Client, NoTls, Row};
-use wal_rs::pg::walparser::RelFileNode;
+use walross::pg::walparser::RelFileNode;
 
 use crate::shadow::parse_pg_lsn;
 
@@ -1087,7 +1088,7 @@ pub async fn resolve_at_pooled(
 /// Strip + dequote the single element of a PG array literal `{val}`, recovering
 /// `attmissingval[1]`'s typoutput form.
 ///
-/// PG array_out quoting (`~/s/postgresql/src/backend/utils/adt/arrayfuncs.c`):
+/// PG array_out quoting (`src/backend/utils/adt/arrayfuncs.c`):
 /// elements with braces/commas/quotes/backslashes/whitespace get `"`-wrapped,
 /// internal `"` and `\` backslash-escaped; NULL renders as bare `NULL`. Returns
 /// `None` on NULL, empty `{}`, or any shape outside single-element 1-D.
@@ -1141,25 +1142,26 @@ pub async fn with_transient_retry<R, F>(
     timeout: Duration,
     initial_backoff: Duration,
     max_backoff: Duration,
-    mut op: F,
+    op: F,
 ) -> Result<R>
 where
     F: AsyncFnMut() -> Result<R>,
 {
-    let start = Instant::now();
-    let mut delay = initial_backoff;
-    loop {
-        match op().await {
-            Ok(r) => return Ok(r),
-            Err(e) => {
-                if !is_transient(&e) || start.elapsed() >= timeout {
-                    return Err(e);
-                }
-                tokio::time::sleep(delay).await;
-                delay = delay.saturating_mul(2).min(max_backoff);
-            }
-        }
-    }
+    let deadline = Instant::now() + timeout;
+    let (_op, result) = (|mut op: F| async move {
+        let r = op().await;
+        (op, r)
+    })
+    .retry(
+        ExponentialBuilder::default()
+            .with_min_delay(initial_backoff)
+            .with_max_delay(max_backoff)
+            .without_max_times(),
+    )
+    .context(op)
+    .when(|e: &CatalogError| is_transient(e) && Instant::now() < deadline)
+    .await;
+    result
 }
 
 /// Any [`CatalogError::Pg`] qualifies: connect-refused and `CANNOT_CONNECT_NOW`

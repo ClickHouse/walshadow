@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::io::AsyncReadExt;
-use wal_rs::pg::wal::segment_file::open_segment_file;
+use walross::pg::wal::segment_file::open_segment_file;
 use walshadow::filter::Filter;
 use walshadow::filter_segment::filter_segment;
 

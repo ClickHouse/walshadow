@@ -29,10 +29,10 @@ use std::future::Future;
 use std::io::Write as _;
 use std::pin::Pin;
 use tokio::sync::Mutex;
-use wal_rs::pg::backup::BACKUP_NAME_PREFIX;
-use wal_rs::pg::replication::base_backup::BaseBackupOpts;
-use wal_rs::pg::replication::conn::PgConfig;
-use wal_rs::pg::replication::tls::SslMode;
+use walross::pg::backup::BACKUP_NAME_PREFIX;
+use walross::pg::replication::base_backup::BaseBackupOpts;
+use walross::pg::replication::conn::PgConfig;
+use walross::pg::replication::tls::SslMode;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -53,6 +53,7 @@ use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
 };
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
+use walshadow::toast::ToastResolver;
 use walshadow::wal_stream::{
     DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
 };
@@ -1284,7 +1285,7 @@ async fn query_replay_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>
         .await?;
     let raw: Option<String> = row.get(0);
     match raw {
-        Some(s) => Ok(Some(wal_rs::pg::backup::parse_pg_lsn(&s)?)),
+        Some(s) => Ok(Some(walross::pg::backup::parse_pg_lsn(&s)?)),
         None => Ok(None),
     }
 }
@@ -1433,7 +1434,7 @@ async fn run_bootstrap(
     // hydrate can pull WAL `[start_lsn, end_lsn]` from `wal_005/` into
     // shadow's `pg_wal/`. Direct mode ships WAL inside `base.tar` via
     // `BaseBackupOpts { wal: true }`, so no follow-up fetch.
-    type ObjectStoreHandles = (wal_rs::config::Settings, wal_rs::storage::DynStorage);
+    type ObjectStoreHandles = (walross::config::Settings, walross::storage::DynStorage);
     let (source, object_store_handles): (Box<dyn BackupSource>, Option<ObjectStoreHandles>) =
         match args.bootstrap_mode {
             BootstrapMode::Direct => {
@@ -1455,13 +1456,13 @@ async fn run_bootstrap(
                 (Box::new(DirectSource::new(src_cfg.clone(), opts)), None)
             }
             BootstrapMode::ObjectStore => {
-                let settings = wal_rs::config::Settings::from_env()
+                let settings = walross::config::Settings::from_env()
                     .context("bootstrap: Settings::from_env (WALG_* env vars)")?;
                 let storage = settings
                     .build_storage()
                     .context("bootstrap: build storage from WALG_* env vars")?;
                 // ObjectStoreSource canonicalises via
-                // `wal_rs::pg::backup::fetch::resolve_name`.
+                // `walross::pg::backup::fetch::resolve_name`.
                 let name = args.bootstrap_backup_name.clone();
                 if name != "LATEST" && !name.starts_with(BACKUP_NAME_PREFIX) {
                     anyhow::bail!(
@@ -1480,7 +1481,17 @@ async fn run_bootstrap(
     // Tail drain gets a second CatalogMap clone for rfn → descriptor
     // lookups; cheap since `Arc<RelDescriptor>` values stay shared.
     let drain_catalog = catalog_map.clone();
-    let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map);
+    // Build the toast resolver up front (validates [toast] config before the
+    // page walk starts) and share its counters with the bootstrap tail. The
+    // store-toast flag tells the page walk whether to decode pg_toast_* pages.
+    let bootstrap_stats = Arc::new(EmitterStats::default());
+    let resolver = match &ch_config {
+        Some(cfg) => ToastResolver::from_config(cfg, bootstrap_stats.clone())
+            .map_err(|e| anyhow::anyhow!("bootstrap: {e}"))?,
+        None => ToastResolver::disabled(),
+    };
+    let store_toast = resolver.stores_chunks();
+    let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
 
     let (shipped, outcome) = match ch_config {
         Some(emitter_cfg) => {
@@ -1489,7 +1500,7 @@ async fn run_bootstrap(
             // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
             // defaults 0 to its own partial-flush deadline.
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-            let stats = Arc::new(EmitterStats::default());
+            let stats = bootstrap_stats.clone();
             // Throwaway watermark atomic: durability proof is `wait_through(K)`,
             // resume LSN is carried via the WAL pipeline's emitter_ack seed
             // (see `run`), so uniform `commit_lsn = start_lsn` here is fine.
@@ -1522,6 +1533,7 @@ async fn run_bootstrap(
                 msg_tx.clone(),
                 ack.clone(),
                 stats.clone(),
+                resolver.clone(),
             ));
             let (drain_res, pump_res) = tokio::join!(drain, pump);
             let drain_outcome = drain_res
@@ -1740,21 +1752,21 @@ fn write_shadow_listener_overrides(
 /// (filtered out-dir empty until the post-autospawn WAL pump) nor
 /// `primary_conninfo` (walsender binds later in `run`).
 ///
-/// `wal_rs::pg::backup::push::handle` sets `wal: false`, so object-store
+/// `walross::pg::backup::push::handle` sets `wal: false`, so object-store
 /// tars don't carry WAL; it lives in `wal_005/` (wal-push / archive_command).
 /// Direct mode inlines the same segments via `BaseBackupOpts { wal: true }`.
 ///
 /// Missing segments surface as `WAL <name> not found in storage` from
 /// wal-rs's `fetch::handle` — the operator's archiving pipeline left a gap.
 async fn fetch_wal_into_pg_wal(
-    settings: &wal_rs::config::Settings,
-    storage: wal_rs::storage::DynStorage,
+    settings: &walross::config::Settings,
+    storage: walross::storage::DynStorage,
     shadow_data_dir: &Path,
     start_lsn: u64,
     end_lsn: u64,
     timeline: u32,
 ) -> Result<()> {
-    use wal_rs::pg::wal::segment::SegmentName;
+    use walross::pg::wal::segment::SegmentName;
 
     let seg_size = WAL_SEG_SIZE;
     let pg_wal_dir = shadow_data_dir.join("pg_wal");
@@ -1770,7 +1782,7 @@ async fn fetch_wal_into_pg_wal(
     loop {
         let name = cur.format();
         let dst = pg_wal_dir.join(&name);
-        wal_rs::pg::wal::fetch::handle(settings, storage.clone(), &name, &dst)
+        walross::pg::wal::fetch::handle(settings, storage.clone(), &name, &dst)
             .await
             .with_context(|| format!("fetch WAL {name} -> {}", dst.display()))?;
         fetched += 1;

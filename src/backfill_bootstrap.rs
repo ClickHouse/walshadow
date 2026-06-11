@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_postgres::Client;
-use wal_rs::pg::walparser::{Oid, RelFileNode};
+use walross::pg::walparser::{Oid, RelFileNode};
 
 use crate::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink, PageWalkStats,
@@ -78,7 +78,7 @@ pub struct BootstrapOutcome {
 /// `rx.recv() == None` signals channel close.
 ///
 /// ```ignore
-/// let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map);
+/// let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
 /// let drained = tokio::spawn(drain_backfill(rx, observer));
 /// let outcome = pump.await?.context("bootstrap pump")?;
 /// let shipped = drained.await?;
@@ -96,6 +96,9 @@ pub fn spawn_greenfield_bootstrap(
     cfg: BootstrapConfig,
     source: Box<dyn BackupSource>,
     catalog_map: CatalogMap,
+    // Walk `pg_toast_*` pages into chunk tuples (chunk store configured) vs
+    // count + skip (disabled mode, values NULL/default-filled).
+    store_toast: bool,
 ) -> (
     mpsc::Receiver<BackfillTuple>,
     JoinHandle<Result<BootstrapOutcome>>,
@@ -114,7 +117,7 @@ pub fn spawn_greenfield_bootstrap(
             })?;
 
         let lander = DiskLanderSink::new(cfg.catalog_filenodes);
-        let page_walk = PageWalkSink::new(catalog_map, tx);
+        let page_walk = PageWalkSink::new(catalog_map, tx, store_toast);
         let mux = MultiplexSink::new(lander, page_walk);
 
         // Keep typed Arc beside erased trait-object Arc to recover stats
@@ -166,8 +169,9 @@ pub async fn run_greenfield_bootstrap(
     cfg: BootstrapConfig,
     source: Box<dyn BackupSource>,
     catalog_map: CatalogMap,
+    store_toast: bool,
 ) -> Result<(BootstrapOutcome, Vec<BackfillTuple>)> {
-    let (mut rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map);
+    let (mut rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
     let drain = tokio::spawn(async move {
         let mut out = Vec::new();
         while let Some(t) = rx.recv().await {
@@ -523,7 +527,7 @@ mod tests {
         let mut catalog = CatalogMap::new();
         catalog.insert(Arc::new(make_rel()));
         let cfg = BootstrapConfig::new(data_dir.clone());
-        let (outcome, tuples) = run_greenfield_bootstrap(cfg, Box::new(source), catalog)
+        let (outcome, tuples) = run_greenfield_bootstrap(cfg, Box::new(source), catalog, false)
             .await
             .unwrap();
 

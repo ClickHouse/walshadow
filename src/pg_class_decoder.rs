@@ -72,7 +72,7 @@
 //! [`DecodeOutcome::OidInPrefix`]; caller learns the rotated filenode via
 //! a later `XLOG_RELMAP_UPDATE` or the `seed_from_source` snapshot.
 
-use wal_rs::pg::walparser::XLogRecord;
+use walross::pg::walparser::XLogRecord;
 
 /// `sizeof(xl_heap_header)`, PG `heapam_xlog.h`
 const XL_HEAP_HEADER_SIZE: usize = 5;
@@ -201,7 +201,7 @@ pub fn info_carries_new_tuple_heap2(_info: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::{
+    use walross::pg::walparser::{
         BlockLocation, RelFileNode, RmId, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 

@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
-use wal_rs::pg::replication::conn::PgConfig;
-use wal_rs::pg::replication::tls::SslMode;
+use walross::pg::replication::conn::PgConfig;
+use walross::pg::replication::tls::SslMode;
 
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{
@@ -518,6 +518,16 @@ impl Pipeline {
 }
 
 pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
+    build_pipeline_with(args, |_| {}).await
+}
+
+/// `build_pipeline` with final say over the emitter config (eg `[toast]`
+/// mode); `tune` runs after mappings + DDL overrides are folded in, before
+/// anything reads the config.
+pub async fn build_pipeline_with(
+    args: BuildPipelineArgs<'_>,
+    tune: impl FnOnce(&mut EmitterConfig),
+) -> Pipeline {
     let BuildPipelineArgs {
         tmp,
         source,
@@ -650,6 +660,8 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
         let rx = catalog.lock().await.subscribe();
         schema_events = Some(Arc::new(std::sync::Mutex::new(rx)));
     }
+
+    tune(&mut emitter_cfg);
 
     // SIGHUP-reloadable mapping shared by the DDL applicator + decode pool.
     let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));

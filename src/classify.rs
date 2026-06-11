@@ -1,7 +1,7 @@
 //! Per-record classification of WAL into catalog / user / special buckets.
 //!
 //! Catalog detection uses `rel_node < FirstNormalObjectId` (16384, see
-//! `~/s/postgresql/src/include/access/transam.h`). Catches non-mapped
+//! PG `src/include/access/transam.h`). Catches non-mapped
 //! catalogs unconditionally + mapped catalogs (pg_class, pg_attribute, …)
 //! only at their initial relfilenode; VACUUM FULL rewrites a mapped
 //! catalog above 16384, so RM_RELMAP_ID + pg_class heap tracking keeps the
@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use wal_rs::pg::walparser::{RmId, XLogRecord};
+use walross::pg::walparser::{RmId, XLogRecord};
 
 /// `FirstNormalObjectId`, pg src/include/access/transam.h
 pub const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
@@ -168,7 +168,7 @@ impl Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::{
+    use walross::pg::walparser::{
         BlockLocation, RelFileNode, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 

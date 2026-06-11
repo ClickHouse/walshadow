@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walross::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::filter::Filter;
 use walshadow::filter_segment::filter_segment;
 
@@ -44,7 +44,7 @@ fn xlog_switch_segment() -> PathBuf {
 
 /// (total_record_count, noop_count) by walking through `WalParser`.
 fn parse_all_records(bytes: &[u8]) -> anyhow::Result<(usize, usize)> {
-    use wal_rs::pg::walparser::RmId;
+    use walross::pg::walparser::RmId;
     let mut parser = WalParser::new();
     let mut total = 0;
     let mut noops = 0;
@@ -177,7 +177,7 @@ async fn oltp_workload_keeps_well_under_one_percent() {
 /// machine relies on its presence at the segment tail.
 #[tokio::test]
 async fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
-    use wal_rs::pg::walparser::RmId;
+    use walross::pg::walparser::RmId;
     const XLOG_SWITCH: u8 = 0x40;
     let seg = xlog_switch_segment();
     if !seg.exists() {
@@ -260,7 +260,7 @@ async fn writes_filtered_segment_and_manifest_via_cli() {
         return;
     }
     // Pass the compressed fixture directly: the CLI now classifies +
-    // decompresses on the input side via wal_rs::pg::wal::segment_file
+    // decompresses on the input side via walross::pg::wal::segment_file
     let bytes = load_segment(&seg).await.expect("load fixture");
 
     let out_dir = tempfile::tempdir().unwrap();

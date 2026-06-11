@@ -62,9 +62,11 @@
 //! downstream by design. Every output stamped with `xid` so xact buffer
 //! can key on it.
 
+use std::borrow::Cow;
+
 use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
-use wal_rs::pg::walparser::{RelFileNode, RmId, XLogRecord};
+use walross::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
 
@@ -1122,7 +1124,7 @@ fn decode_varlena(
             });
         }
         let body = &buf[abs + 1..abs + total];
-        let v = varlena_to_value(att, body, false);
+        let v = varlena_to_value(att.type_oid, Cow::Borrowed(body));
         return Ok((v, total));
     }
     // 4-byte length: bits [1:0] = 00 uncompressed, 10 compressed
@@ -1162,41 +1164,47 @@ fn decode_varlena(
         ));
     }
     let body = &buf[abs + 4..abs + total];
-    Ok((varlena_to_value(att, body, false), total))
+    Ok((varlena_to_value(att.type_oid, Cow::Borrowed(body)), total))
 }
 
-fn varlena_to_value(att: &RelAttr, body: &[u8], _short: bool) -> ColumnValue {
-    match att.type_oid {
-        BYTEAOID => ColumnValue::Bytea(body.to_vec()),
-        TEXTOID | VARCHAROID | BPCHAROID => match std::str::from_utf8(body) {
-            Ok(s) => ColumnValue::Text(s.to_owned()),
+/// Map a varlena body (header stripped, decompressed) to a typed value by the
+/// column's type OID. Shared by the inline decoder (`Cow::Borrowed` into the
+/// WAL buffer) and the TOAST reassembler (`Cow::Owned`, so `detoasted_value`
+/// moves the reassembled buffer into the value instead of copying it). A
+/// detoasted value resolves identically to an inline one — Tier 3 types land
+/// as `PgPending`, resolved at emit by the oracle.
+pub(crate) fn varlena_to_value(type_oid: u32, body: Cow<[u8]>) -> ColumnValue {
+    match type_oid {
+        BYTEAOID => ColumnValue::Bytea(body.into_owned()),
+        TEXTOID | VARCHAROID | BPCHAROID => match String::from_utf8(body.into_owned()) {
+            Ok(s) => ColumnValue::Text(s),
             // PG validates UTF-8 on input; surface bytea not crash if ever invalid
-            Err(_) => ColumnValue::Bytea(body.to_vec()),
+            Err(e) => ColumnValue::Bytea(e.into_bytes()),
         },
-        NUMERICOID => match crate::codecs::decode_numeric(body) {
+        NUMERICOID => match crate::codecs::decode_numeric(&body) {
             Ok(v) => ColumnValue::Numeric(v),
             Err(_) => ColumnValue::Unsupported {
-                type_oid: att.type_oid,
-                raw: body.to_vec(),
+                type_oid,
+                raw: body.into_owned(),
             },
         },
-        INETOID | CIDROID => match crate::codecs::decode_inet(body, att.type_oid == CIDROID) {
+        INETOID | CIDROID => match crate::codecs::decode_inet(&body, type_oid == CIDROID) {
             Ok(v) => ColumnValue::Inet(v),
             Err(_) => ColumnValue::Unsupported {
-                type_oid: att.type_oid,
-                raw: body.to_vec(),
+                type_oid,
+                raw: body.into_owned(),
             },
         },
-        JSONOID => match std::str::from_utf8(body) {
-            Ok(s) => ColumnValue::Json(s.to_owned()),
-            Err(_) => ColumnValue::Bytea(body.to_vec()),
+        JSONOID => match String::from_utf8(body.into_owned()) {
+            Ok(s) => ColumnValue::Json(s),
+            Err(e) => ColumnValue::Bytea(e.into_bytes()),
         },
         // Tier 3 deferred: jsonb, range types, arrays (typcategory='A'),
         // tsvector etc. Carries full on-disk body so the SQL bridge
         // reconstructs the varlena Datum; walshadow extension resolves at emit
         _ => ColumnValue::PgPending {
-            type_oid: att.type_oid,
-            raw: body.to_vec(),
+            type_oid,
+            raw: body.into_owned(),
         },
     }
 }
@@ -1241,7 +1249,7 @@ pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::{
+    use walross::pg::walparser::{
         BlockLocation, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 

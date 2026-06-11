@@ -3,7 +3,7 @@
 //! as `Class::Empty`.
 //!
 //! Known reachable cases on PG 15+, cross-checked against
-//! `~/s/postgresql/src/backend/access/`:
+//! PG `src/backend/access/`:
 //!
 //! | rmgr  | info               | source                                           | block ref? | reclassified |
 //! |-------|--------------------|--------------------------------------------------|-----------|--------------|
@@ -45,7 +45,7 @@
 //! ```
 //! 25 bytes (no trailing pad after `XLogRegisterData`), locator at offset 0.
 
-use wal_rs::pg::walparser::{RelFileNode, RmId, XLogRecord};
+use walross::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 /// `XLOG_HEAP2_NEW_CID` info byte
 pub const XLOG_HEAP2_NEW_CID: u8 = 0x70;
@@ -129,7 +129,7 @@ pub fn relation_for_empty(record: &XLogRecord) -> Option<RelFileNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::XLogRecordHeader;
+    use walross::pg::walparser::XLogRecordHeader;
 
     fn new_cid_record(spc: u32, db: u32, rel: u32) -> XLogRecord<'static> {
         let mut md = Vec::with_capacity(NEW_CID_MIN_SIZE);

@@ -3,7 +3,7 @@
 //! BASEBACKUP.md path 1B+2A consume FPIs under
 //! `wal_compression = pglz|lz4|zstd`
 
-use wal_rs::pg::walparser::{BLOCK_SIZE, FpiCompressionMethod, XLogRecordBlock};
+use walross::pg::walparser::{BLOCK_SIZE, FpiCompressionMethod, XLogRecordBlock};
 
 pub const PAGE_BYTES: usize = BLOCK_SIZE as usize;
 
@@ -110,7 +110,7 @@ pub fn restore_block_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::{
+    use walross::pg::walparser::{
         BKP_BLOCK_HAS_IMAGE, BKP_IMAGE_COMPRESS_LZ4, BKP_IMAGE_COMPRESS_PGLZ,
         BKP_IMAGE_COMPRESS_ZSTD, BKP_IMAGE_HAS_HOLE, XLP_PAGE_MAGIC_PG15, XLogRecordBlockHeader,
         XLogRecordBlockImageHeader,

@@ -258,11 +258,19 @@ landing first
 
 ## Pitfalls
 
-- **autovacuum suspended in recovery.** Shadow runs continuously in
-  recovery, autovacuum cannot reclaim catalog-index bloat from busy-DDL
-  workloads. Default `autovacuum = off`. Bloat resolution: operator
-  promotes shadow briefly, lets autovacuum run, re-attaches. Not
-  automated
+- **shadow vacuums by replay, never locally.** Shadow runs
+  continuously in recovery with `autovacuum = off`; any local catalog
+  write would diverge from source's offset-exact pages & PANIC on
+  next replay (promote-vacuum-reattach is equally unsound: timeline
+  bump, no rewind path against synthetic walsender). Vacuum still
+  happens: filter keeps every catalog-touching
+  prune/vacuum/freeze/index-cleanup record
+  ([filter.md](filter.md) keep table), so source autovacuum on system
+  catalogs replays & reclaims same bytes on shadow's mirror pages.
+  Manual `VACUUM FULL` / `REINDEX` on source catalogs replay too,
+  filenode rotation rides `RM_RELMAP_ID` + `pg_class` heap writes.
+  Steady-state shadow catalog bloat = source catalog bloat + replay
+  lag
 - **wal_level = logical required on source.** Shadow needs full
   old-tuple bytes on user-heap UPDATE/DELETE to drive
   `XLH_UPDATE_CONTAINS_OLD_KEY` decode; `wal_level = replica`

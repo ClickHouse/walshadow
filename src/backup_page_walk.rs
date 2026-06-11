@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use wal_rs::pg::walparser::{Oid, RelFileNode};
+use walross::pg::walparser::{Oid, RelFileNode};
 
 use crate::backup_sink::parse_base_path;
 use crate::backup_source::{
@@ -318,6 +318,11 @@ pub struct PageWalkSink {
     /// parts; one slot would let part B's begin clobber part A's
     /// in-flight entry, mis-framing pages and misattributing rfns.
     cur: HashMap<EntryId, TapEntry>,
+    /// Walk `pg_toast_*` pages into tuples (the drain reinterprets them as
+    /// chunks) instead of counting + skipping. Set when a chunk store is
+    /// configured (`toast mode != disabled`); off keeps the V1 skip so
+    /// disabled-mode bootstrap doesn't decode chunks it would discard.
+    store_toast: bool,
 }
 
 struct TapEntry {
@@ -332,7 +337,11 @@ struct TapEntry {
 }
 
 impl PageWalkSink {
-    pub fn new(catalog: CatalogMap, out_tx: mpsc::Sender<BackfillTuple>) -> Self {
+    pub fn new(
+        catalog: CatalogMap,
+        out_tx: mpsc::Sender<BackfillTuple>,
+        store_toast: bool,
+    ) -> Self {
         Self {
             catalog,
             source_lsn: 0,
@@ -340,6 +349,7 @@ impl PageWalkSink {
             out_tx: Some(out_tx),
             captured: Vec::new(),
             cur: HashMap::new(),
+            store_toast,
         }
     }
 
@@ -353,6 +363,16 @@ impl PageWalkSink {
             out_tx: None,
             captured: Vec::new(),
             cur: HashMap::new(),
+            store_toast: false,
+        }
+    }
+
+    /// Test-mode capturing sink that also walks toast pages.
+    #[cfg(test)]
+    pub fn new_capturing_with_toast(catalog: CatalogMap) -> Self {
+        Self {
+            store_toast: true,
+            ..Self::new_capturing(catalog)
         }
     }
 
@@ -385,8 +405,9 @@ impl PageWalkSink {
                 (block_no, entry.is_toast, entry.desc.clone(), page)
             };
 
-            if is_toast {
-                // V1: count, skip decode; deferred to WAL-side TOAST
+            if is_toast && !self.store_toast {
+                // No chunk store: count, skip decode. Toasted values get
+                // NULL/default-filled at the drain (disabled mode).
                 self.stats.pages_walked += 1;
                 continue;
             }
@@ -394,6 +415,9 @@ impl PageWalkSink {
                 // Filenode absent from seed; stats counted at begin()
                 continue;
             };
+            // toast rels are 3-col heaps (chunk_id, chunk_seq, chunk_data);
+            // walk them through the same decoder, the drain reinterprets
+            // their tuples into chunks.
 
             let walker = PageWalker::new(&desc, self.source_lsn);
             let mut local_out = Vec::new();

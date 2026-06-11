@@ -28,7 +28,7 @@
 //! Once `memory_used > config.xact_buffer_max`, flush the largest
 //! in-memory xact to a [`SpillWriter`]; the xact stays open and later
 //! records append to the file. Mirrors PG `ReorderBufferLargestTXN`
-//! (`~/s/postgresql/src/backend/replication/logical/reorderbuffer.c`).
+//! (`src/backend/replication/logical/reorderbuffer.c`).
 //!
 //! Drain: spilled entries first (older), then in-mem. Eviction always
 //! flushes from front of `in_mem`, holding "spilled older than in-mem".
@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::sync::Mutex;
-use wal_rs::pg::walparser::RmId;
+use walross::pg::walparser::RmId;
 
 use crate::decoder_sink::{DecoderSinkError, DecoderStats, TupleObserver};
 use crate::filter::Route;
@@ -52,12 +52,13 @@ use crate::heap_decoder::{
 };
 use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent, ShadowCatalog};
 use crate::spill::{SpillEntry, SpillError, SpillStore, SpillWriter, ToastChunk};
+use crate::toast::{ChunkMap, ToastResolver};
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
 use std::pin::Pin;
 
 /// Matches PG `logical_decoding_work_mem` default 64 MiB
-/// (`~/s/postgresql/src/backend/utils/misc/guc_tables.c`)
+/// (`src/backend/utils/misc/guc_tables.c`)
 pub const DEFAULT_XACT_BUFFER_MAX: usize = 64 * 1024 * 1024;
 
 /// XLOG_XACT info-op constants, PG `access/xact.h`
@@ -707,6 +708,7 @@ impl XactBuffer {
     /// `commit_lsn` is the `XLOG_XACT_COMMIT` record LSN, stamped into
     /// [`CommittedTuple::commit_lsn`] and bumped into `drain_lsn` /
     /// `emitter_ack_lsn` as the cursor resume gate's monotonic mark.
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit<O: TupleObserver>(
         &mut self,
         top_xid: u32,
@@ -715,6 +717,7 @@ impl XactBuffer {
         subxids: &[u32],
         catalog: &Arc<Mutex<ShadowCatalog>>,
         observer: &mut O,
+        resolver: &ToastResolver,
     ) -> std::result::Result<(), XactBufferError> {
         // Only the top counts for `commits_unknown_xid` so the metric
         // stays per-xact, not per-subxid
@@ -837,7 +840,7 @@ impl XactBuffer {
                     .map_err(|e| XactBufferError::Observer(e.to_string()))?;
                 event_cursor += 1;
             }
-            detoast_heap(&mut heap, &chunks, catalog, false).await?;
+            detoast_heap(&mut heap, &chunks, catalog, false, resolver).await?;
             let committed = CommittedTuple {
                 decoded: heap,
                 commit_ts,
@@ -1106,13 +1109,14 @@ fn accumulate(
 
 pub(crate) async fn detoast_heap(
     heap: &mut DecodedHeap,
-    chunks: &HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
+    chunks: &ChunkMap,
     catalog: &Arc<Mutex<ShadowCatalog>>,
     // Async decode pool can lag past a DDL and re-resolve an older heap,
     // so it reuses the inline cached descriptor without mutating cache or
     // emitting events (`ShadowCatalog::relation_at_pooled`). WAL-ordered
     // observer drain passes `false` for the normal cache-populating path.
     pooled: bool,
+    resolver: &ToastResolver,
 ) -> std::result::Result<(), XactBufferError> {
     let needs = tuple_needs_detoast(heap.new.as_ref()) || tuple_needs_detoast(heap.old.as_ref());
     if !needs {
@@ -1126,11 +1130,30 @@ pub(crate) async fn detoast_heap(
             cat.relation_at(heap.rfn, heap.source_lsn).await?
         }
     };
+    // Pre-window / bootstrap values whose chunks aren't in this xact: pull
+    // them from the durable store into a per-heap supplemental map. Disabled
+    // mode (no store) leaves `extra` empty; a miss then NULL/default-fills.
+    let mut extra = ChunkMap::new();
+    if resolver.stores_chunks() {
+        let mut keys: Vec<(u32, u32)> = Vec::new();
+        collect_toast_keys(heap.new.as_ref(), &mut keys);
+        collect_toast_keys(heap.old.as_ref(), &mut keys);
+        for (relid, value_id) in keys {
+            if chunks.contains_key(&(relid, value_id)) || extra.contains_key(&(relid, value_id)) {
+                continue;
+            }
+            resolver
+                .fetch_into(relid, value_id, &mut extra)
+                .await
+                .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?;
+        }
+    }
+    let maps: [&ChunkMap; 2] = [chunks, &extra];
     if let Some(t) = heap.new.as_mut() {
-        detoast_tuple(t, &rel, chunks)?;
+        detoast_tuple(t, &rel, &maps, resolver)?;
     }
     if let Some(t) = heap.old.as_mut() {
-        detoast_tuple(t, &rel, chunks)?;
+        detoast_tuple(t, &rel, &maps, resolver)?;
     }
     Ok(())
 }
@@ -1144,10 +1167,23 @@ fn tuple_needs_detoast(t: Option<&crate::heap_decoder::DecodedTuple>) -> bool {
         .any(|c| matches!(c, Some(ColumnValue::ExternalToast(_))))
 }
 
+/// Append `(va_toastrelid, va_valueid)` for every on-disk toast pointer.
+fn collect_toast_keys(t: Option<&crate::heap_decoder::DecodedTuple>, out: &mut Vec<(u32, u32)>) {
+    let Some(t) = t else {
+        return;
+    };
+    for c in &t.columns {
+        if let Some(ColumnValue::ExternalToast(p)) = c {
+            out.push((p.va_toastrelid, p.va_valueid));
+        }
+    }
+}
+
 fn detoast_tuple(
     t: &mut crate::heap_decoder::DecodedTuple,
     rel: &RelDescriptor,
-    chunks: &HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
+    maps: &[&ChunkMap],
+    resolver: &ToastResolver,
 ) -> std::result::Result<(), XactBufferError> {
     for (idx, col) in t.columns.iter_mut().enumerate() {
         let Some(ColumnValue::ExternalToast(p)) = col else {
@@ -1155,24 +1191,58 @@ fn detoast_tuple(
         };
         // `ToastPointer: Copy` frees the borrow on `col` before reassign
         let p: ToastPointer = *p;
-        let raw = reassemble(&p, chunks)?;
         let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
-        let new_value = match type_oid {
-            crate::heap_decoder::BYTEAOID => ColumnValue::Bytea(raw),
-            crate::heap_decoder::TEXTOID
-            | crate::heap_decoder::VARCHAROID
-            | crate::heap_decoder::BPCHAROID => match String::from_utf8(raw) {
-                Ok(s) => ColumnValue::Text(s),
-                Err(e) => ColumnValue::Bytea(e.into_bytes()),
-            },
-            _ => ColumnValue::Unsupported { type_oid, raw },
-        };
-        *col = Some(new_value);
+        match try_reassemble(&p, maps)? {
+            Some(raw) => *col = Some(detoasted_value(raw, type_oid)),
+            // Disabled mode: surface the unresolvable value as NULL/default
+            // downstream (`append_default`), counted, never an error.
+            None if resolver.fill_on_miss() => {
+                resolver.note_filled_default();
+                *col = Some(ColumnValue::Null);
+            }
+            // Active store still couldn't rebuild it: a real chunk gap.
+            None => {
+                resolver.note_fetch_miss();
+                return Err(XactBufferError::MissingToastChunk {
+                    toast_relid: p.va_toastrelid,
+                    value_id: p.va_valueid,
+                    missing: first_missing_seq(&p, maps),
+                });
+            }
+        }
     }
     Ok(())
 }
 
-/// PG `VARLENA_EXTSIZE_BITS`, `~/s/postgresql/src/include/varatt.h`
+/// Reassembled `ExternalToast` bytes → typed value, routed through the same
+/// `varlena_to_value` the inline decoder uses so a detoasted value resolves
+/// identically to an inline one. Tier 3 types (jsonb, arrays, large numerics)
+/// land as `PgPending`, resolved at emit by the oracle. `raw` is the
+/// header-stripped, decompressed varlena body, matching the inline `body`;
+/// passed owned so the (large) reassembled buffer moves into the value with
+/// no copy.
+pub(crate) fn detoasted_value(raw: Vec<u8>, type_oid: u32) -> ColumnValue {
+    crate::heap_decoder::varlena_to_value(type_oid, std::borrow::Cow::Owned(raw))
+}
+
+/// First seq missing from the dense 0..N run, for the error message. `0` when
+/// no chunks at all. Only walked on the error path.
+fn first_missing_seq(p: &ToastPointer, maps: &[&ChunkMap]) -> u32 {
+    let key = (p.va_toastrelid, p.va_valueid);
+    match maps.iter().find_map(|m| m.get(&key)) {
+        None => 0,
+        Some(map) => {
+            for (expected, seq) in map.keys().enumerate() {
+                if *seq != expected as u32 {
+                    return expected as u32;
+                }
+            }
+            map.len() as u32
+        }
+    }
+}
+
+/// PG `VARLENA_EXTSIZE_BITS`, `src/include/varatt.h`
 const VARLENA_EXTSIZE_BITS: u32 = 30;
 const VARLENA_EXTSIZE_MASK: u32 = (1u32 << VARLENA_EXTSIZE_BITS) - 1;
 /// PG `VARHDRSZ`, 4-byte varlena header
@@ -1181,32 +1251,31 @@ const VARHDRSZ: i32 = 4;
 const TOAST_COMPRESSION_PGLZ: u8 = 0;
 const TOAST_COMPRESSION_LZ4: u8 = 1;
 
-fn reassemble(
+/// Concatenate a value's chunks (seq 0..N dense) then decompress per the
+/// pointer's method. Looks the value up across `maps` in order (in-xact
+/// chunk map first, then a store-fetched supplement). `Ok(None)` when chunks
+/// are absent or non-dense — the caller decides fill vs error; `Err` only on
+/// a genuine decompression failure.
+pub(crate) fn try_reassemble(
     p: &ToastPointer,
-    chunks: &HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
-) -> std::result::Result<Vec<u8>, XactBufferError> {
+    maps: &[&ChunkMap],
+) -> std::result::Result<Option<Vec<u8>>, XactBufferError> {
     let key = (p.va_toastrelid, p.va_valueid);
-    let map = chunks.get(&key).ok_or(XactBufferError::MissingToastChunk {
-        toast_relid: p.va_toastrelid,
-        value_id: p.va_valueid,
-        missing: 0,
-    })?;
+    let Some(map) = maps.iter().find_map(|m| m.get(&key)) else {
+        return Ok(None);
+    };
     let total: usize = map.values().map(Vec::len).sum();
     let mut concat: Vec<u8> = Vec::with_capacity(total);
     for (expected, (seq, body)) in map.iter().enumerate() {
-        let expected = expected as u32;
-        if *seq != expected {
-            return Err(XactBufferError::MissingToastChunk {
-                toast_relid: p.va_toastrelid,
-                value_id: p.va_valueid,
-                missing: expected,
-            });
+        if *seq != expected as u32 {
+            // Gap in the 0..N run: incomplete, treat as a miss.
+            return Ok(None);
         }
         concat.extend_from_slice(body);
     }
     let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
     if !compressed {
-        return Ok(concat);
+        return Ok(Some(concat));
     }
     let method = ((p.va_extinfo >> VARLENA_EXTSIZE_BITS) & 0x3) as u8;
     let raw_len = (p.va_rawsize - VARHDRSZ).max(0) as usize;
@@ -1216,12 +1285,12 @@ fn reassemble(
             let n = pglz::decompress_into(&concat, &mut out, true)
                 .ok_or_else(|| XactBufferError::Detoast("pglz: stream truncated/corrupt".into()))?;
             out.truncate(n);
-            Ok(out)
+            Ok(Some(out))
         }
         TOAST_COMPRESSION_LZ4 => {
             let out = lz4_flex::decompress(&concat, raw_len)
                 .map_err(|e| XactBufferError::Detoast(format!("lz4: {e}")))?;
-            Ok(out)
+            Ok(Some(out))
         }
         other => Err(XactBufferError::Detoast(format!(
             "unknown compression method {other}"
@@ -1248,6 +1317,10 @@ pub struct XactRecordSink<O: TupleObserver + Send> {
     /// with `wait_for_replay` and serialised the drain at pgbench rates
     pg_class_delete_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
     last_seen_delete_epoch: u64,
+    /// Serial drain is metrics-only (no `--ch-config`), so this stays
+    /// disabled by default: same-xact values reassemble inline, misses
+    /// NULL/default-fill.
+    resolver: ToastResolver,
 }
 
 impl<O: TupleObserver + Send> XactRecordSink<O> {
@@ -1264,7 +1337,13 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
             schema_events: None,
             pg_class_delete_epoch: None,
             last_seen_delete_epoch: 0,
+            resolver: ToastResolver::disabled(),
         }
+    }
+
+    pub fn with_toast_resolver(mut self, resolver: ToastResolver) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// Unset: sink owns a private tracker
@@ -1390,6 +1469,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                         &payload.subxacts,
                         &self.catalog,
                         &mut self.observer,
+                        &self.resolver,
                     )
                     .await
                     .map_err(SinkError::from)?;
@@ -1765,7 +1845,7 @@ mod tests {
     use super::*;
     use crate::heap_decoder::{DecodedTuple, HeapOp};
     use tempfile::tempdir;
-    use wal_rs::pg::walparser::RelFileNode;
+    use walross::pg::walparser::RelFileNode;
 
     fn cfg(dir: PathBuf) -> XactBufferConfig {
         XactBufferConfig {
@@ -2040,6 +2120,26 @@ mod tests {
         let mut d3 = d.clone();
         d3.new.as_mut().unwrap().columns.pop();
         assert!(toast_chunk_from_decoded(d3, &rel).is_none());
+    }
+
+    #[test]
+    fn detoasted_value_routes_tier3_like_inline() {
+        use crate::heap_decoder::{BYTEAOID, JSONBOID, TEXTOID};
+        assert!(
+            matches!(detoasted_value(b"raw".to_vec(), BYTEAOID), ColumnValue::Bytea(b) if b == b"raw")
+        );
+        assert!(
+            matches!(detoasted_value(b"hi".to_vec(), TEXTOID), ColumnValue::Text(s) if s == "hi")
+        );
+        // Tier 3 (jsonb) lands as PgPending carrying the body so the oracle
+        // resolves it like an inline jsonb, not Unsupported
+        match detoasted_value(b"\x01body".to_vec(), JSONBOID) {
+            ColumnValue::PgPending { type_oid, raw } => {
+                assert_eq!(type_oid, JSONBOID);
+                assert_eq!(raw, b"\x01body");
+            }
+            other => panic!("expected PgPending, got {other:?}"),
+        }
     }
 
     // ── subxact tracking ──────────────────────────────────────────────

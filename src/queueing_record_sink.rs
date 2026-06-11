@@ -267,7 +267,7 @@ impl RecordSink for QueueingRecordSink {
 mod tests {
     use super::*;
     use crate::wal_stream::Record;
-    use wal_rs::pg::walparser::XLogRecord;
+    use walross::pg::walparser::XLogRecord;
 
     fn synth(source_lsn: u64) -> Record<'static> {
         Record {

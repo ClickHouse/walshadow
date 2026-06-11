@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, mpsc, oneshot};
-use wal_rs::pg::walparser::RmId;
+use walross::pg::walparser::RmId;
 
 use crate::ch_ddl::DdlApplicator;
 use crate::ch_emitter::EmitterStats;
@@ -38,6 +38,7 @@ use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::BatcherMsg;
 use crate::pipeline::decode::{DecodeJob, ToastChunks};
 use crate::pipeline::{Fatal, mpmc};
+use crate::toast::ToastResolver;
 
 pub struct ReorderSink {
     buffer: Arc<Mutex<XactBuffer>>,
@@ -56,6 +57,10 @@ pub struct ReorderSink {
     /// Reorder owns the commit-order boundary, so bumps `xacts_committed`
     /// (per commit) and `truncates_emitted`.
     stats: Arc<EmitterStats>,
+    /// TOAST chunk store: each commit's chunks persist here (disk / CH) so a
+    /// later re-emit of a pre-window referrer can rebuild its value. No-op
+    /// when disabled.
+    resolver: ToastResolver,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
 }
@@ -73,6 +78,7 @@ impl ReorderSink {
         jobs_tx: mpmc::Sender<DecodeJob>,
         msg_tx: mpsc::Sender<BatcherMsg>,
         stats: Arc<EmitterStats>,
+        resolver: ToastResolver,
         fatal: Fatal,
     ) -> Self {
         let last_seen_delete_epoch = pg_class_delete_epoch
@@ -91,6 +97,7 @@ impl ReorderSink {
             jobs_tx,
             msg_tx,
             stats,
+            resolver,
             fatal,
             next_seq: 0,
         }
@@ -328,6 +335,17 @@ impl ReorderSink {
         self.subxact_tracker.lock().await.forget_tree(xid);
         // One per drained commit, incl. empty / unmapped-only
         self.stats.xacts_committed.fetch_add(1, Ordering::Relaxed);
+
+        // Persist this xact's chunks (disk / CH) before they're consumed by
+        // the decode pool, so a later re-emit of a pre-window referrer finds
+        // them. No-op when disabled or chunk-free. `commit_lsn` is the
+        // convergence `_lsn`; per-chunk LSN was dropped at merge.
+        if !drained.chunks.is_empty() {
+            self.resolver
+                .put_map(&drained.chunks, drained.commit_lsn)
+                .await
+                .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+        }
 
         let is_barrier = !drained.ordered_events.is_empty()
             || drained

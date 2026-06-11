@@ -24,7 +24,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use wal_rs::pg::walparser::RelFileNode;
+use walross::pg::walparser::RelFileNode;
 use walshadow::codecs;
 use walshadow::decoder_sink::{CollectingTupleObserver, TupleObserver};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};

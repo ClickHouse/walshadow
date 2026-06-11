@@ -175,6 +175,12 @@ impl PipelineConfig {
         let m = decoder_pool_size.max(1);
         let fatal = Fatal::new();
 
+        // One resolver shared by the decode pool (fetch on miss) and the
+        // reorder coordinator (put per commit). Disk store opens here; a bad
+        // [toast] config fails the daemon at startup.
+        let resolver = crate::toast::ToastResolver::from_config(&emitter, stats.clone())
+            .map_err(EmitterError::Config)?;
+
         // Shared tail (ack collector + inserter pool + batcher), the same unit
         // bootstrap feeds via the page walk.
         let (msg_tx, ack, tail) = tail::spawn(
@@ -195,6 +201,7 @@ impl PipelineConfig {
             oracle,
             msg_tx: msg_tx.clone(),
             stats: stats.clone(),
+            resolver: resolver.clone(),
         };
         let decoders = decode::spawn_pool(m, ctx, jobs_rx, ack.clone(), fatal.clone());
 
@@ -209,6 +216,7 @@ impl PipelineConfig {
             jobs_tx,
             msg_tx,
             stats,
+            resolver,
             fatal.clone(),
         );
 

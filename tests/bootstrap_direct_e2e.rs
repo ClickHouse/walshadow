@@ -26,9 +26,9 @@ use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
 
-use wal_rs::pg::replication::base_backup::BaseBackupOpts;
-use wal_rs::pg::replication::conn::PgConfig;
-use wal_rs::pg::replication::tls::SslMode;
+use walross::pg::replication::base_backup::BaseBackupOpts;
+use walross::pg::replication::conn::PgConfig;
+use walross::pg::replication::tls::SslMode;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -159,7 +159,7 @@ async fn direct_source_self_hosted_via_replication_protocol() {
 
     let shadow_data = tmp.path().join("shadow-data");
     let cfg = BootstrapConfig::new(shadow_data.clone());
-    let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(direct), catalog_map);
+    let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(direct), catalog_map, false);
 
     let mut observer = RecordingObserver::default();
     let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);

@@ -2,7 +2,7 @@
 //! BASE_BACKUP source.
 //!
 //! Sibling of `bootstrap_direct_ch.rs` covering the wal-g
-//! layout. Setup adds a `wal_rs::pg::backup::push::handle` call between
+//! layout. Setup adds a `walross::pg::backup::push::handle` call between
 //! source workload load and daemon spawn — same fixture pattern as
 //! `bootstrap_object_store_e2e.rs`, just with a live CH server + real
 //! emitter pipeline replacing the `RecordingObserver`.
@@ -12,7 +12,7 @@
 //! ```text
 //! Shadow(source).start()
 //!   → schema + INSERT s14.t (64 rows) + CHECKPOINT + pg_switch_wal
-//!   → wal_rs::pg::backup::push::handle → FsStorage(wal-g/)
+//!   → walross::pg::backup::push::handle → FsStorage(wal-g/)
 //!   → walshadow-stream (subprocess) with
 //!         --bootstrap-mode=object_store
 //!         --bootstrap-object-store-prefix=file://<tmpdir>/wal-g (env)
@@ -41,14 +41,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use wal_rs::compression;
-use wal_rs::config::{DeltaSettings, Settings, StorageSettings};
-use wal_rs::pg::backup::list;
-use wal_rs::pg::backup::push::{self, PushArgs};
-use wal_rs::pg::wal;
-use wal_rs::retry::RetryPolicy;
-use wal_rs::storage::DynStorage;
-use wal_rs::storage::fs::FsStorage;
+use walross::compression;
+use walross::config::{DeltaSettings, Settings, StorageSettings};
+use walross::pg::backup::list;
+use walross::pg::backup::push::{self, PushArgs};
+use walross::pg::wal;
+use walross::retry::RetryPolicy;
+use walross::storage::DynStorage;
+use walross::storage::fs::FsStorage;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
 // Reserved port slot — 17320-range. Below the Linux ephemeral port
@@ -73,7 +73,7 @@ const N_ROWS: i32 = 64;
 /// invoke it inline
 async fn push_completed_wal_segments(
     source: &Shadow,
-    settings: &wal_rs::config::Settings,
+    settings: &walross::config::Settings,
     storage: DynStorage,
 ) -> anyhow::Result<()> {
     let pg_wal = source.config().data_dir.join("pg_wal");
@@ -226,7 +226,7 @@ async fn object_store_bootstrap_ch_end_to_end() {
     fs::create_dir_all(&spill_dir).unwrap();
 
     // 7. Spawn walshadow-stream. The daemon reads `WALG_*` env vars
-    //    via `wal_rs::config::Settings::from_env()`. WALG_FILE_PREFIX
+    //    via `walross::config::Settings::from_env()`. WALG_FILE_PREFIX
     //    is the raw filesystem path (no `file://` prefix) — that's the
     //    wal-g CLI contract `detect_storage` mirrors.
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");

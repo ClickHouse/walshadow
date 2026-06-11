@@ -29,7 +29,7 @@
 //! ## Eviction policy
 //!
 //! Largest-xact-first, mirroring PG `ReorderBufferLargestTXN`
-//! (`~/s/postgresql/src/backend/replication/logical/reorderbuffer.c`).
+//! (`src/backend/replication/logical/reorderbuffer.c`).
 //! Buffer owns the policy; [`SpillStore`] just lays out files.
 //!
 //! ## Crash recovery
@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wal_rs::pg::walparser::RelFileNode;
+use walross::pg::walparser::RelFileNode;
 
 use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer};
 

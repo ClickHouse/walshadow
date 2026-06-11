@@ -16,7 +16,7 @@
 //! aligning the demo case by construction.
 
 use smallvec::smallvec;
-use wal_rs::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
+use walross::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 
 use crate::segment::ByteRanges;
 pub use crate::wal_page::WalkError;
@@ -504,7 +504,7 @@ impl StreamingWalker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wal_rs::pg::walparser::{RmId, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
+    use walross::pg::walparser::{RmId, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
 
     const PG_SEG: usize = 16 * 1024 * 1024;
 

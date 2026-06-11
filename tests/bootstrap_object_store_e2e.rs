@@ -13,7 +13,7 @@
 //! ```text
 //! Shadow(source).start()
 //!   → schema + INSERT + CHECKPOINT
-//!   → wal_rs::pg::backup::push::handle(.., FsStorage(temp/storage), ..)
+//!   → walross::pg::backup::push::handle(.., FsStorage(temp/storage), ..)
 //!   → ObjectStoreSource(settings, FsStorage(temp/storage), name)
 //!   → MultiplexSink(DiskLanderSink + PageWalkSink)
 //!   → mpsc<BackfillTuple>
@@ -39,9 +39,9 @@
 //! Skipped silently when `initdb` isn't on `$PATH` (CI sandboxes
 //! without PG client tooling).
 //!
-//! Operator note: `~/s/wal-g` has the upstream binary if a cross-check
-//! oracle is ever wanted; bootstrap doesn't depend on it. This test runs
-//! purely off `walshadow` + `wal_rs` crates.
+//! Operator note: upstream wal-g binary can serve as a cross-check
+//! oracle if ever wanted; bootstrap doesn't depend on it. This test runs
+//! purely off `walshadow` + `walross` crates.
 
 use std::collections::HashSet;
 use std::fs;
@@ -51,13 +51,13 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use wal_rs::compression;
-use wal_rs::config::{DeltaSettings, Settings, StorageSettings};
-use wal_rs::pg::backup::list;
-use wal_rs::pg::backup::push::{self, PushArgs};
-use wal_rs::retry::RetryPolicy;
-use wal_rs::storage::DynStorage;
-use wal_rs::storage::fs::FsStorage;
+use walross::compression;
+use walross::config::{DeltaSettings, Settings, StorageSettings};
+use walross::pg::backup::list;
+use walross::pg::backup::push::{self, PushArgs};
+use walross::retry::RetryPolicy;
+use walross::storage::DynStorage;
+use walross::storage::fs::FsStorage;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -250,7 +250,7 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
     let shadow_data = tmp.path().join("shadow-data");
     let cfg = BootstrapConfig::new(shadow_data.clone());
     let object_source = ObjectStoreSource::new(settings, storage, backup_name).with_parallelism(2);
-    let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(object_source), catalog_map);
+    let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(object_source), catalog_map, false);
 
     // RecordingObserver wraps a CollectingTupleObserver + counts
     // on_xact_end so the test asserts drain_backfill closes the
