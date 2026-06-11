@@ -16,6 +16,13 @@
 //!     [--retention-bytes 268435456]
 //! ```
 
+// The pipeline allocates rows on the decode thread(s) and frees them on the
+// batcher thread; mimalloc's per-thread caches handle that produce-here/
+// free-there pattern far better than glibc's shared arena (which serializes on
+// its arena lock under that cross-thread churn).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
