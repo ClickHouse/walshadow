@@ -21,10 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use wal_rs::pg::replication::conn::PgConfig;
-use wal_rs::pg::replication::tls::SslMode;
-use wal_rs::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
-use wal_rs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walross::pg::replication::conn::PgConfig;
+use walross::pg::replication::tls::SslMode;
+use walross::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
+use walross::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{

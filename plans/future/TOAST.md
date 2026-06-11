@@ -26,7 +26,7 @@ Detoast today works only for the WAL path and only within a single xact.
   `detoast_heap` → `detoast_tuple` → `reassemble` rebuilds each
   `ExternalToast` into `Bytea` / `Text`.
 * This only works because PG's `toast_save_datum`
-  (`~/s/postgresql/src/backend/access/common/toast_internals.c`) writes the
+  (`src/backend/access/common/toast_internals.c`) writes the
   chunk INSERTs in the *same* xact as the referring tuple, so every chunk a
   value needs is already buffered when the heap drains. The module header
   in `xact_buffer.rs` states this explicitly ("Why bundle TOAST chunks into
@@ -54,6 +54,58 @@ Two gaps fall out:
   bundling invariant is violated, and `reassemble` returns
   `MissingToastChunk`. WAL-only detoast is structurally blind to chunks
   written in the past.
+
+## Chunk-store backend (findings, 2026-06)
+
+The reassembler needs a *store of record* for chunks it didn't see in the
+current xact (bootstrap baseline, pre-window re-emits). That store is now a
+pluggable backend behind `ToastResolver` / the `ChunkStore` trait
+(`src/toast.rs`), selected by `[toast] mode`:
+
+* `disabled` (default) — no store; an unresolved pointer NULL/default-fills
+  at the emitter and is counted (`toast_values_filled_default`), never an
+  error. `fill_on_miss` is true only here. This is the "explicit, surfaced"
+  form the NULL-fallback alternative below allows, *not* silent loss.
+* `disk` — local persistent `DiskChunkStore`: one append-only file per value
+  at `<dir>/<relid>/<value>.chunks`, framed `[seq u32][len u32][body]`,
+  torn-trailing-record tolerant. Dir is persistent, distinct from the wiped
+  `--spill-dir`. A miss here is a hard error, not a fill — opt-in durable
+  storage means an absent chunk is data loss, surfaced loud.
+* `clickhouse` — the mirror-to-CH design in the rest of this doc, shipped
+  as `ClickHouseChunkStore` (`src/toast.rs`). `put` writes chunk rows to a
+  `pg_toast_<relid>` `ReplacingMergeTree(_lsn)` table, `fetch` is a CH
+  `SELECT`; same control flow as `disk` (the store is the only swap).
+
+`disk` shipped first. It decouples the backstop from the CH ingest path and
+from shadow-PG lifecycle, and already exercises the full bootstrap flow end
+to end: the page walk reinterprets `pg_toast_*` tuples into chunks
+(`chunk_from_columns`), persists them, and the drain *defers* any main-table
+tuple carrying a mapped `ExternalToast` until the walk completes (its chunks
+may live in a later-walked toast file), then fetches them back and
+reassembles via `try_reassemble` (`src/pipeline/bootstrap.rs`). That is a
+disk-backed realisation of incremental-delivery steps 2–3 below; the CH
+backend swaps the storage target, not the control flow. (The bootstrap
+module's "explicit fail-fast at the producer" header predates this and is
+stale — the drain now resolves or fills, it no longer fails fast.)
+
+**Why not store pg_toast in the shadow PG catalog.** Tempting, since the
+shadow PG already replays WAL: query it (or let PG detoast natively) and
+reassembly, decompression, and vacuum come for free. Rejected. The shadow
+today is a *catalog* shadow, not a *data* shadow — user-heap (and thus
+`pg_toast`) records are NOOP-rewritten so shadow PG does not PANIC on missing
+pages ([[reference_walshadow_cross_seg_records]]), and the catalog cache
+resolves relations via `pg_relation_filenode` + `pg_attribute`/`pg_type`
+without holding table bytes (`src/shadow_catalog.rs`). Making `pg_toast`
+queryable there means promoting shadow PG to a full data replica, which:
+reintroduces the exact missing-page / cross-seg PANIC class the NOOP rewrite
+exists to avoid; couples every detoast to a `pg_last_wal_replay_lsn` wait +
+the catalog mutex (the relation-resolution bottleneck); and exposes reads to
+shadow vacuum reclaiming a value still needed for a pre-window re-emit. The
+disk and CH backends are append-only, walshadow-owned, and
+lifecycle-independent — they trade owning detoast correctness (compression,
+header variants) and chunk GC for not depending on a heavyweight replica.
+Decompression-for-free is moot anyway: `try_reassemble` already handles
+PGLZ/LZ4 from raw chunks, so disk and CH both get correct detoast without PG.
 
 ## Proposed approach: mirror pg_toast to ClickHouse
 
@@ -90,6 +142,14 @@ range read rebuilds it in order. This differs from the main-table default
 (`rel.kind == 't'` → key on the first two attrs). Chunk records are
 INSERT-only in normal operation, so `_op` is almost always `insert`; the
 column stays for uniformity and for vacuum-driven deletes (see Risks).
+
+*Shipped (R2, `ClickHouseChunkStore`):* the created table is the minimal
+chunk-source form — `chunk_id`, `chunk_seq`, `chunk_data`, `_lsn` only. Under
+R2 it is a reassembler source, not a query-time JOIN target, so the `_xid` /
+`_op` / `_commit_ts` columns above are omitted, and `create_sql` keys
+`ORDER BY (chunk_id, chunk_seq)` directly rather than via
+`render_create_table`. Dropping `_op` removes any landing spot for the
+vacuum-driven delete marker below — chunk GC stays fully deferred (see Risks).
 
 `chunk_id` is the OID (`va_valueid`). Key the CH table on it, not on
 `toast_relid` — `toast_relid` is fixed per table, it identifies *which* CH
@@ -182,8 +242,12 @@ main-table INSERT would then need its chunks not-yet-shipped. Two outs:
 (a) two-pass — walk all `pg_toast_*` filenodes first, then main heaps, so
 chunks precede their referrers; or (b) defer reassembly for any
 bootstrap tuple whose chunks aren't yet local and resolve it from the CH
-toast table after bootstrap drain completes. (a) is simpler and bounded
-(toast files are a known subset of the catalog map); prefer it.
+toast table after bootstrap drain completes. *Shipped: (b).* The drain
+collects referrers as `Deferred`, `put`s all chunks durable, then resolves
+them via `fetch_into` + `try_reassemble` (`resolve_or_fill_toast`,
+`src/pipeline/bootstrap.rs`). (a) was the original preference (simpler,
+bounded) but (b) reuses the WAL miss→fetch path verbatim, so one resolution
+codepath covers bootstrap and pre-window alike.
 
 ### WAL path: keep inline, add CH chunk shipping
 
@@ -207,7 +271,7 @@ same-xact case; the CH store is the durability + pre-window backstop.
 
 PG stores toast chunks as the *compressed* representation when the value
 was compressed; `va_extinfo` top 2 bits carry the method
-(`VARATT_EXTERNAL_GET_COMPRESS_METHOD`, `~/s/postgresql/src/include/varatt.h`),
+(`VARATT_EXTERNAL_GET_COMPRESS_METHOD`, PG `src/include/varatt.h`),
 the low 30 bits (`VARLENA_EXTSIZE_MASK`) the external size.
 `reassemble` (`src/xact_buffer.rs`) already concatenates chunks then, if
 `(va_extinfo & !VARLENA_EXTSIZE_MASK) != 0`, decompresses via
@@ -263,14 +327,24 @@ dedup is purely a dedup, never a value change.
   rows; reassembly has a durable source independent of the WAL window.
   Highest fidelity, costs one CH table per toast relation and a
   chunk-fetch fallback.
+* **Local disk chunk store.** Same control flow, store of record is a local
+  append-only file instead of CH (shipped first). See findings above.
+* **pg_toast in the shadow PG catalog.** Rejected — requires a full data
+  replica and reintroduces the cross-seg PANIC class. See findings above.
 
 ## Open questions / risks
 
 * **Chunk ordering / atomicity across xacts.** Same-xact bundling
-  guaranteed completeness; CH-stored chunks do not. The fetch fallback must
-  treat a gap in `chunk_seq` (0..N dense, the `reassemble` invariant) as
-  "chunks still in flight" vs "value truncated" — distinguish by `va_rawsize`
-  vs summed chunk length, retry the former.
+  guaranteed completeness; CH-stored chunks do not. *Confirmed 2026-06:*
+  `try_reassemble` (`src/xact_buffer.rs`) treats any gap in the dense
+  `chunk_seq` 0..N run as `Ok(None)` — a plain miss — so an incomplete fetched
+  set NULL-fills in `disabled` mode or errors `MissingToastChunk` with an
+  active store. The planned in-flight-vs-truncated distinction (compare
+  `va_rawsize` to summed chunk length, retry the former) is *not* implemented:
+  `fetch` is one SELECT, its result taken as final, no retry. Benign while a
+  completed `put` makes a value's chunks atomically visible (single-node CH,
+  synchronous INSERT ack, chunks immutable per `va_valueid`); reopen if a
+  partial or racing put can surface a torn set.
 * **toast relid ↔ owning rel mapping.** `va_toastrelid` is the toast
   relation's OID; `toast_chunk_from_decoded` already keys on `rel.oid` (not
   `rel_node`) precisely because the pointer carries the OID, and notes the
@@ -282,27 +356,43 @@ dedup is purely a dedup, never a value change.
   `heap_delete` on the toast relation; under `_lsn` / RMT they would need an
   `_op=delete` chunk row (replica identity on the toast table is `nothing`
   by default, so the delete WAL carries no key — same blind spot as system
-  catalogs, [[feedback_pg_version_wal_skew]]). V1 can leak superseded
-  chunk rows on CH (dedup keeps the live `va_valueid`'s chunks correct; dead
-  chunks are unreferenced garbage). Reclaim is a later concern.
+  catalogs, [[feedback_pg_version_wal_skew]]). The shipped CH schema has no
+  `_op` column at all (R2 minimal form), so a delete marker has nowhere to
+  land regardless. V1 leaks superseded chunk rows on CH (dedup keeps the live
+  `va_valueid`'s chunks correct; dead chunks are unreferenced garbage).
+  Reclaim is a later concern.
 * **Very large values.** A multi-MB value is thousands of chunks
   (`TOAST_MAX_CHUNK_SIZE` ≈ 1996 bytes, `EXTERN_TUPLES_PER_PAGE = 4`,
-  `~/s/postgresql/src/include/access/heaptoast.h`). R2 reassembles in memory
-  (already true today via `reassemble`); the CH fetch fallback must page the
-  SELECT, not load all chunks unbounded.
-* **Type reconstruction.** `detoast_tuple` dispatches on the *referring*
-  column's `type_oid`: `BYTEAOID` → `Bytea`, `TEXT/VARCHAR/BPCHAR` → `Text`
-  (invalid UTF-8 falls back to `Bytea`), else `Unsupported`. Tier 3 toasted
-  types (jsonb, arrays, large numerics) currently land as `Unsupported`
-  here — full support should route the reassembled bytes back through
-  `varlena_to_value` / the oracle so a detoasted jsonb resolves like an
-  inline one, instead of erroring. Track separately from the chunk-store
-  work.
+  PG `src/include/access/heaptoast.h`). *Confirmed 2026-06:* the CH
+  fetch streams the SELECT block-by-block (`recv_event` → `read_chunk_block`,
+  `src/toast.rs`), so there is no single unbounded buffered read of the result
+  set. The reassembled value is still fully materialised in memory (the
+  `BTreeMap` supplement, then `try_reassemble`'s concat) — R2-inherent, same as
+  inline `reassemble` today, not specific to the fetch. Bounded-memory
+  streaming reassembly of huge values stays unaddressed.
+* **Type reconstruction.** *Done 2026-06:* `detoasted_value`
+  (`src/xact_buffer.rs`) now delegates to `varlena_to_value`
+  (`src/heap_decoder.rs`, taking a bare `type_oid`), the same dispatch the
+  inline decoder runs on the header-stripped body. A detoasted value resolves
+  identically to an inline one — numeric/inet/json typed directly, Tier 3
+  (jsonb, arrays, ranges, tsvector, …) carried as `PgPending` for the oracle
+  at emit — instead of the old `Unsupported` for everything past bytea/text.
 
 ## Incremental delivery
 
 Smallest-first, each step independently shippable, tied to the
 [[pipeline_backpressure_and_scaling]] TOAST blocker.
+
+**Status (2026-06):** the `disk` backend (see findings above) already lands
+disk-backed equivalents of steps 2–3 — page-walk tap, deferred resolve,
+`try_reassemble` fallback — plus a counted NULL-fill in `disabled` mode that
+supersedes step 1's hard fail-fast. The `clickhouse` backend
+(`ClickHouseChunkStore`) now reuses that same control flow, so steps 2–4 are
+done for CH too: bootstrap chunks `put` to CH toast tables, the bootstrap +
+WAL reassemblers `fetch` them back on a miss, and same-xact WAL chunks `put`
+through `reorder`'s `put_map` for durable re-emit. Step 5's Tier 3 detoast
+routing is also done (`detoasted_value` → `varlena_to_value`); only R1
+query-time-JOIN mode stays deferred.
 
 1. **Fail-fast cleanly.** Make the bootstrap `ExternalToast` path surface a
    documented, counted error instead of a bare `UnsupportedValue` deep in
@@ -311,9 +401,10 @@ Smallest-first, each step independently shippable, tied to the
    "TOAST not yet supported for bootstrap of table X". No data path change.
 2. **Tap toast chunks to CH (bootstrap).** Walk `pg_toast_*` pages instead of
    counting them (reuse `decode_block_data` + `toast_chunk_from_decoded`),
-   create the mirrored CH toast table (`render_create_table` toast branch),
-   ship chunk rows through the shared tail. Two-pass ordering (toast files
-   first). At this point chunks are *on CH* but main-table reassembly still
+   create the mirrored CH toast table (minimal `create_sql`, see schema note),
+   ship chunk rows through the shared tail. Ordering: defer referrers, resolve
+   after all chunks durable (option (b), not the two-pass (a) originally
+   sketched). At this point chunks are *on CH* but main-table reassembly still
    doesn't consult them.
 3. **Reassemble from CH chunks.** Add the `MissingToastChunk` → CH-fetch
    fallback in the R2 reassembler (hydrate the `chunks` map from the CH
@@ -324,6 +415,8 @@ Smallest-first, each step independently shippable, tied to the
    table too (second sink), so a future re-emit of a pre-window referrer
    finds its chunks. Without this, step 3's fallback only covers
    bootstrap-baseline values.
-5. **(Optional) R1 query-time-JOIN mode + Tier 3 detoast routing.** Per-table
-   opt-in pointer storage; route reassembled Tier 3 bytes back through
-   `varlena_to_value`. Deferred behind demand.
+5. **Tier 3 detoast routing (done) + (optional) R1 query-time-JOIN mode.**
+   Tier 3 routing shipped: `detoasted_value` runs reassembled bytes back
+   through `varlena_to_value`, so a detoasted jsonb/array/numeric resolves
+   like an inline one (`PgPending` → oracle). R1 per-table opt-in pointer
+   storage stays deferred behind demand.

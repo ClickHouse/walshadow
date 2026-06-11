@@ -25,6 +25,7 @@ use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::pipeline::{Fatal, mpmc};
 use crate::shadow_catalog::{CatalogError, ShadowCatalog};
+use crate::toast::ToastResolver;
 use crate::xact_buffer::detoast_heap;
 
 /// Reassembled-TOAST chunk map: `(toast_relid, value_id) -> seq -> bytes`.
@@ -53,6 +54,9 @@ pub struct DecodeCtx {
     /// Decode bumps `foreign_db_rows_skipped` / `unsupported_relations` on the
     /// skip arms so the parallel path keeps those metrics live.
     pub stats: Arc<EmitterStats>,
+    /// TOAST chunk store + miss policy for values absent from this xact's
+    /// in-memory chunk map (pre-window re-emits).
+    pub resolver: ToastResolver,
 }
 
 /// Rows coalesced before one [`BatcherMsg::Rows`] send.
@@ -96,7 +100,7 @@ pub async fn decode_and_route(
     let mut buf: Vec<RoutedRow> = Vec::new();
     let mut buf_bytes = 0usize;
     for mut heap in heaps {
-        detoast_heap(&mut heap, &chunks, &ctx.catalog, true)
+        detoast_heap(&mut heap, &chunks, &ctx.catalog, true, &ctx.resolver)
             .await
             .map_err(|e| e.to_string())?;
         let rel =

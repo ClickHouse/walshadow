@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use tokio::io::AsyncReadExt;
-use wal_rs::pg::wal::segment_file::open_segment_file;
+use walross::pg::wal::segment_file::open_segment_file;
 
 pub async fn load_segment(path: &Path) -> anyhow::Result<Vec<u8>> {
     let (_seg, mut r) = open_segment_file(path).await?;

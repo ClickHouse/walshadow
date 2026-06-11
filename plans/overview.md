@@ -122,9 +122,13 @@ Component docs live alongside this overview:
    unconditionally; shadow won't start without them
 2. **CLOG / multixact wholesale.** Catalog replay needs xact-status
    records. Tiny volume, no per-record filtering
-3. **Catalog index bloat.** Shadow autovacuum suspended in recovery.
-   Mitigations: periodic restart, accept while catalog stays MiB-scale,
-   briefly promote to vacuum. Default: accept
+3. **Catalog bloat vacuumed by replay.** Shadow's own autovacuum stays
+   off (recovery blocks it anyway, local writes would diverge
+   offset-exact pages). Filter keeps every catalog
+   prune/vacuum/freeze/index-cleanup record, so source autovacuum on
+   system catalogs replays & reclaims same bytes on shadow. Shadow
+   catalog bloat tracks source within replay lag; cannot out-bloat
+   source
 4. **wal_level.** Catalog needs `replica`; user-table decoder needs
    `logical` for old-tuple. Net: `wal_level=logical` plus a usable
    replica-identity key (PRIMARY KEY, `USING INDEX`, or `FULL`) on every

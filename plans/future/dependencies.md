@@ -67,14 +67,10 @@ Ranked by security value, not line count:
    profile discovery, stays WALG-compatible
 2. GCS service-account flow → `yup-oauth2` or `gcp_auth`. Replaces JWT
    mint plus token cache/refresh, not just the signing step
-3. PEM/DER → `rustls-pemfile`, already in tree (TLS certs only today);
-   reuse for GCS key path instead of `pem_to_der`. No new dependency
-4. S3 XML → `quick-xml`. Lowest stakes; `parse_list_v2`/`extract_xml_tag`
-   are fragile substring matching but response shape is narrow. Last
 
-Items 1-3 are where hand-rolling is actually dangerous; item 4 is
-robustness, not security. This path is mutually exclusive with the
-full `object_store` swap, not additive to it.
+Both remaining items are where hand-rolling is actually dangerous. This
+path is mutually exclusive with the full `object_store` swap, not
+additive to it.
 
 ## MPMC queue
 
@@ -95,29 +91,6 @@ Evaluation notes:
 * Preserve backpressure behavior for decoder/inserter pipeline
 * Keep custom queue only if existing semantics intentionally differ
   from `async-channel`
-
-## Retry and backoff
-
-Evaluate `backon` for non-storage retry loops.
-
-Today:
-
-* `wal-rs/src/retry.rs` defines generic retry policy, exponential
-  backoff, jitter, and `with_retry`
-* `src/pipeline/inserter.rs`, `src/shadow_catalog.rs`, and
-  `src/oracle.rs` each contain localized retry/backoff loops
-
-Why replace: exponential backoff with jitter is generic control-flow
-logic. Storage retries should likely move into `object_store`; remaining
-database/network retry loops can share one crate-backed policy.
-
-Evaluation notes:
-
-* Keep domain-specific retry classification local
-* Map existing max-attempt/budget behavior exactly before deleting
-  custom helper
-* Do not flatten all retry loops if caller-specific logging or cursor
-  safety matters
 
 ## Byte throttling
 
@@ -179,9 +152,8 @@ Recorded so future readers do not re-litigate these:
 1. `object_store`, highest risk removed and largest local protocol
    surface deleted
 2. `async-channel`, low-risk concurrency simplification
-3. `backon`, only after storage retry ownership is clear
-4. `governor`, only if rate limiting requirements grow
-5. `prometheus-client`, when metrics format complexity grows
+3. `governor`, only if rate limiting requirements grow
+4. `prometheus-client`, when metrics format complexity grows
 
 Keep first implementation review-focused: add crate-backed path, run
 existing tests, add behavioral tests for edge cases being delegated,

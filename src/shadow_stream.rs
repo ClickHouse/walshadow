@@ -23,8 +23,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
-use wal_rs::pg::replication::server::{self, ServerError, WalSenderConn, decode_standby_status};
-use wal_rs::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
+use walross::pg::replication::server::{self, ServerError, WalSenderConn, decode_standby_status};
+use walross::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 
 use crate::wal_stream::{RecordBytesSink, SinkError};
 

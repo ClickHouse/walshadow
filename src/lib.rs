@@ -43,6 +43,7 @@ pub mod shadow_stream;
 pub mod source_feed;
 pub mod spill;
 pub mod streaming_walker;
+pub mod toast;
 pub mod type_bridge;
 pub mod wal_page;
 pub mod wal_stream;

@@ -19,7 +19,7 @@ upgrades to Keep when tracker holds the block ref; Empty falls back to
 Keep when `main_data` carries no recognised locator
 
 Catalog detection: `rel_node < FirstNormalObjectId` (16384, see
-`~/s/postgresql/src/include/access/transam.h`). Fresh-initdb shadow has
+PG `src/include/access/transam.h`). Fresh-initdb shadow has
 every system catalog (mapped + non-mapped) at oid < 16384, so bootstrap
 rule covers static catalog set without runtime state
 
@@ -59,7 +59,7 @@ Inputs:
 - `RM_RELMAP_ID / XLOG_RELMAP_UPDATE` — authoritative for mapped
   catalogs. Body is `xl_relmap_update` (dbid+tsid+nbytes) plus 524-byte
   `RelMapFile` (magic `0x592717`, n, 64 mappings, CRC, see
-  `~/s/postgresql/src/backend/utils/cache/relmapper.c`). Each non-zero
+  PG `src/backend/utils/cache/relmapper.c`). Each non-zero
   `(mapoid, mapfilenumber)` adds `mapfilenumber` under record's `dbid`
   (or shared set if `dbid == 0`). Malformed bodies bump counter, apply
   nothing

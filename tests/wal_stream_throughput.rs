@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
-use wal_rs::pg::walparser::{
+use walross::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
 };
 

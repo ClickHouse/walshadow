@@ -36,11 +36,12 @@ lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
 
 [dependencies]
-wal-rs = { path = "wal-rs" }
+walross = { path = "wal-rs" }
 clickhouse-c-rs = { path = "clickhouse-c-rs", default-features = false, features = ["tokio", "tls"] }
 anyhow = "1"
 astral-tokio-tar = { version = "0.6", default-features = false }
 async-trait = "0.1"
+backon = { version = "1", features = ["tokio-sleep"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }

@@ -140,6 +140,9 @@ pub struct EmitterConfig {
     /// tombstones stay queryable instead of collapsing on FINAL. Column
     /// always emitted; off by default
     pub soft_delete: bool,
+    /// Where externally-TOASTed chunks live + miss policy. `[toast]` block;
+    /// default disabled (NULL/default-fill unrecoverable values)
+    pub toast: crate::toast::ToastConfig,
 }
 
 pub const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
@@ -184,6 +187,7 @@ impl Default for EmitterConfig {
             retry: RetryConfig::default(),
             insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
             soft_delete: false,
+            toast: crate::toast::ToastConfig::default(),
         }
     }
 }
@@ -368,6 +372,14 @@ impl EmitterConfig {
             }
             if let Some(v) = ch.get("soft_delete").and_then(Value::as_bool) {
                 out.soft_delete = v;
+            }
+        }
+        if let Some(toast) = root.get("toast").and_then(Value::as_table) {
+            if let Some(v) = toast.get("mode").and_then(Value::as_str) {
+                out.toast.mode = crate::toast::ToastMode::parse(v).map_err(EmitterError::Config)?;
+            }
+            if let Some(v) = toast.get("disk_dir").and_then(Value::as_str) {
+                out.toast.disk_dir = Some(std::path::PathBuf::from(v));
             }
         }
         if let Some(nss) = root.get("namespace").and_then(Value::as_table) {
@@ -1249,6 +1261,16 @@ crate::atomic_stats! {
         /// Legacy serial-emitter counter; pooled pipeline seals via the
         /// batcher's own `flush_timeout` deadline and never bumps this
         pub flush_deadline_trips,
+        /// TOAST chunk rows persisted to the configured store (disk / CH)
+        pub toast_chunks_stored,
+        /// Toasted values reassembled from the store (not the in-xact buffer)
+        pub toast_values_fetched,
+        /// Toasted values NULL/default-filled because no store could rebuild
+        /// them (disabled mode). Surfaced, never silent
+        pub toast_values_filled_default,
+        /// Toasted values whose chunks were absent from an active store
+        /// (disk / CH gap) — a real data gap, not a fill
+        pub toast_fetch_miss,
     }
 }
 
@@ -1304,7 +1326,7 @@ impl std::fmt::Debug for ColumnBuf {
 mod tests {
     use super::*;
     use crate::heap_decoder::{DecodedHeap, DecodedTuple};
-    use wal_rs::pg::walparser::RelFileNode;
+    use walross::pg::walparser::RelFileNode;
 
     #[test]
     fn decimal_type_error_wraps_message_in_type_variant() {
@@ -1361,7 +1383,7 @@ mod tests {
 
     fn mk_rel() -> RelDescriptor {
         use crate::shadow_catalog::{RelAttr, ReplIdent};
-        use wal_rs::pg::walparser::RelFileNode;
+        use walross::pg::walparser::RelFileNode;
         RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,

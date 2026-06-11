@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use wal_rs::pg::walparser::RelFileNode;
+use walross::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
 use walshadow::ch_emitter::{
     ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, MappingHandle, TableMapping,
@@ -32,6 +32,7 @@ use walshadow::heap_decoder::ColumnValue;
 use walshadow::pipeline::batcher::BatcherMsg;
 use walshadow::pipeline::{Fatal, bootstrap, tail};
 use walshadow::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
+use walshadow::toast::ToastResolver;
 
 const CH_TCP_PORT: u16 = 17571;
 const CH_HTTP_PORT: u16 = 17572;
@@ -173,6 +174,7 @@ async fn bootstrap_tail_fans_out_n2() {
         msg_tx.clone(),
         ack.clone(),
         stats.clone(),
+        ToastResolver::disabled(),
     ));
     let outcome = drain.await.expect("drain join").expect("drain ok");
     assert_eq!(outcome.next_seq, 2, "one seq per rfn");

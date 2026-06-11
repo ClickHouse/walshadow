@@ -21,7 +21,7 @@ use crate::backup_source::{
 };
 use crate::classify::FIRST_NORMAL_OBJECT_ID;
 
-/// Mirrors `wal_rs::pg::backup::SYSTEM_DIRS_DENYLIST`, listed locally to
+/// Mirrors `walross::pg::backup::SYSTEM_DIRS_DENYLIST`, listed locally to
 /// avoid a wal-rs build dependency here; wal-rs stays source of truth
 /// for the protocol-driven filter.
 pub const SYSTEM_DIRS_DENYLIST: &[&str] = &[

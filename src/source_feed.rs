@@ -13,10 +13,10 @@ use postgres_protocol::message::backend::Message;
 use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::config::SslMode as TpSslMode;
 use tokio_postgres::{Client, NoTls};
-use wal_rs::pg::backup::parse_pg_lsn;
-use wal_rs::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
-use wal_rs::pg::replication::stream::{Frame, build_status_update, decode_frame};
-use wal_rs::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
+use walross::pg::backup::parse_pg_lsn;
+use walross::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
+use walross::pg::replication::stream::{Frame, build_status_update, decode_frame};
+use walross::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 
 /// Matches wal-rs / wal-g defaults; servers tolerate up to
 /// `wal_sender_timeout` of silence (default 60s).

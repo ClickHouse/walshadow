@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use backon::{ExponentialBuilder, Retryable};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
@@ -373,17 +374,15 @@ pub async fn connect_with_budget(
     budget: Duration,
 ) -> Result<Oracle, OracleError> {
     let deadline = tokio::time::Instant::now() + budget;
-    let mut backoff = Duration::from_millis(100);
-    loop {
-        match Oracle::connect(conninfo, sample_rate).await {
-            Ok(o) => return Ok(o),
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(1));
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    (|| Oracle::connect(conninfo, sample_rate))
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(100))
+                .with_max_delay(Duration::from_secs(1))
+                .without_max_times(),
+        )
+        .when(move |_: &OracleError| tokio::time::Instant::now() < deadline)
+        .await
 }
 
 #[cfg(test)]
