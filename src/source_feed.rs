@@ -13,7 +13,7 @@ use postgres_protocol::message::backend::Message;
 use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::config::SslMode as TpSslMode;
 use tokio_postgres::{Client, NoTls};
-use walross::pg::backup::parse_pg_lsn;
+use walross::pg::backup::{format_pg_lsn, parse_pg_lsn};
 use walross::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
 use walross::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use walross::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
@@ -73,6 +73,19 @@ fn clamp_status(status: StandbyStatus, floors: &mut StatusFloors) -> (u64, u64, 
     floors.flush = status.flush_lsn.max(floors.flush);
     floors.apply = status.apply_lsn.max(floors.apply);
     (floors.write, floors.flush, floors.apply)
+}
+
+/// Build the `START_REPLICATION` command string for a physical replication
+/// start at `start_lsn`. The LSN is rendered via [`format_pg_lsn`] so both
+/// halves use PG's hexadecimal `<hi>/<lo>` `pg_lsn` text form.
+fn build_start_replication_cmd(slot: Option<&str>, start_lsn: u64, timeline: u32) -> String {
+    let lsn = format_pg_lsn(start_lsn);
+    match slot {
+        Some(slot) => {
+            format!("START_REPLICATION SLOT {slot} PHYSICAL {lsn} TIMELINE {timeline}")
+        }
+        None => format!("START_REPLICATION {lsn} TIMELINE {timeline}"),
+    }
 }
 
 /// `IDENTIFY_SYSTEM` result.
@@ -170,18 +183,7 @@ impl SourceFeed {
         start_lsn: u64,
         timeline: u32,
     ) -> Result<()> {
-        let cmd = match slot {
-            Some(slot) => format!(
-                "START_REPLICATION SLOT {slot} PHYSICAL {}/{:X} TIMELINE {timeline}",
-                start_lsn >> 32,
-                start_lsn as u32
-            ),
-            None => format!(
-                "START_REPLICATION {}/{:X} TIMELINE {timeline}",
-                start_lsn >> 32,
-                start_lsn as u32
-            ),
-        };
+        let cmd = build_start_replication_cmd(slot, start_lsn, timeline);
         self.conn.send_query(&cmd).await?;
         self.conn.expect_copy_both_open().await?;
         self.floors = StatusFloors {
@@ -382,5 +384,29 @@ mod tests {
             &mut floors,
         );
         assert_eq!((w, f, a), (5000, 4000, 4000));
+    }
+
+    /// Both halves of the start LSN must be rendered in hexadecimal, matching
+    /// PG's `pg_lsn` text form (`<hi>/<lo>`). A high word of 0xB must serialize
+    /// as "B", not "11" — otherwise the source parses it as hex 0x11 and the
+    /// requested position lands ahead of its WAL flush position.
+    #[test]
+    fn start_replication_renders_high_word_in_hex() {
+        // 0xB/4C000000 — high word past 0x9, where hex and decimal diverge.
+        let lsn = (0xB_u64 << 32) | 0x4C00_0000;
+
+        let with_slot = build_start_replication_cmd(Some("phys"), lsn, 1);
+        assert_eq!(
+            with_slot,
+            "START_REPLICATION SLOT phys PHYSICAL B/4C000000 TIMELINE 1",
+            "high word must be hex (B), not decimal (11)"
+        );
+
+        let no_slot = build_start_replication_cmd(None, lsn, 1);
+        assert_eq!(
+            no_slot,
+            "START_REPLICATION B/4C000000 TIMELINE 1",
+            "high word must be hex (B), not decimal (11)"
+        );
     }
 }
