@@ -397,15 +397,13 @@ mod tests {
 
         let with_slot = build_start_replication_cmd(Some("phys"), lsn, 1);
         assert_eq!(
-            with_slot,
-            "START_REPLICATION SLOT phys PHYSICAL B/4C000000 TIMELINE 1",
+            with_slot, "START_REPLICATION SLOT phys PHYSICAL B/4C000000 TIMELINE 1",
             "high word must be hex (B), not decimal (11)"
         );
 
         let no_slot = build_start_replication_cmd(None, lsn, 1);
         assert_eq!(
-            no_slot,
-            "START_REPLICATION B/4C000000 TIMELINE 1",
+            no_slot, "START_REPLICATION B/4C000000 TIMELINE 1",
             "high word must be hex (B), not decimal (11)"
         );
     }
