@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use walross::pg::backup::format_pg_lsn;
 use walshadow::shadow::{Shadow, ShadowConfig, parse_pg_lsn};
 
 // 17360-range — below the Linux ephemeral port range so outbound
@@ -595,9 +596,8 @@ async fn run_cycle(
     let post_kill_lsn_text = source.psql_one("SELECT pg_current_wal_lsn()::text")?;
     let post_kill_lsn = parse_pg_lsn(&post_kill_lsn_text).context("parse post-kill lsn")?;
     eprintln!(
-        "kill-restart: post-kill source lsn={:X}/{:X}",
-        post_kill_lsn >> 32,
-        post_kill_lsn as u32,
+        "kill-restart: post-kill source lsn={}",
+        format_pg_lsn(post_kill_lsn),
     );
 
     // 8. Restart daemon — same flags. cursor.bin + spill files persist

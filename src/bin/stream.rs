@@ -29,7 +29,7 @@ use std::future::Future;
 use std::io::Write as _;
 use std::pin::Pin;
 use tokio::sync::Mutex;
-use walross::pg::backup::BACKUP_NAME_PREFIX;
+use walross::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walross::pg::replication::base_backup::BaseBackupOpts;
 use walross::pg::replication::conn::PgConfig;
 use walross::pg::replication::tls::SslMode;
@@ -386,7 +386,7 @@ async fn run(args: Args) -> Result<()> {
         target: "walshadow",
         sysid = %ident.sysid,
         timeline = ident.timeline,
-        xlogpos = format!("{:X}/{:X}", ident.xlogpos >> 32, ident.xlogpos as u32),
+        xlogpos = format_pg_lsn(ident.xlogpos),
         "source identified",
     );
 
@@ -456,8 +456,8 @@ async fn run(args: Args) -> Result<()> {
     let aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
     tracing::info!(
         target: "walshadow",
-        raw = format!("{:X}/{:X}", raw_start >> 32, raw_start as u32),
-        aligned = format!("{:X}/{:X}", aligned >> 32, aligned as u32),
+        raw = format_pg_lsn(raw_start),
+        aligned = format_pg_lsn(aligned),
         from_bootstrap = bootstrap_end_lsn.is_some() && args.start_lsn.is_none(),
         from_cursor = bootstrap_end_lsn.is_none()
             && cursor_at_boot.is_some()
@@ -1030,8 +1030,8 @@ async fn run(args: Args) -> Result<()> {
             tracing::info!(
                 target: "walshadow",
                 segments_shipped,
-                last_lsn = format!("{:X}/{:X}", now_dispatched >> 32, now_dispatched as u32),
-                shadow_apply = format!("{:X}/{:X}", shadow_apply_lsn >> 32, shadow_apply_lsn as u32),
+                last_lsn = format_pg_lsn(now_dispatched),
+                shadow_apply = format_pg_lsn(shadow_apply_lsn),
                 source_ahead_bytes = ahead,
                 metrics = %record_sink.metrics.summary(),
                 kept = filter.stats.kept,
@@ -1064,12 +1064,10 @@ async fn run(args: Args) -> Result<()> {
                     .iter()
                     .map(|e| {
                         format!(
-                            "xid={} lsn={:X}/{:X}..{:X}/{:X} heap={} chunk={} bytes={} spill={} cat={} rels=[{}]",
+                            "xid={} lsn={}..{} heap={} chunk={} bytes={} spill={} cat={} rels=[{}]",
                             e.xid,
-                            e.first_lsn >> 32,
-                            e.first_lsn as u32,
-                            e.last_lsn >> 32,
-                            e.last_lsn as u32,
+                            format_pg_lsn(e.first_lsn),
+                            format_pg_lsn(e.last_lsn),
                             e.heap_count,
                             e.chunk_count,
                             e.in_mem_bytes,
@@ -1083,26 +1081,10 @@ async fn run(args: Args) -> Result<()> {
                 tracing::warn!(
                     target: "walshadow",
                     xacts_active = xact_stats.xacts_active,
-                    emitter_ack_lsn = format!(
-                        "{:X}/{:X}",
-                        xact_stats.emitter_ack_lsn >> 32,
-                        xact_stats.emitter_ack_lsn as u32,
-                    ),
-                    drain_lsn = format!(
-                        "{:X}/{:X}",
-                        xact_stats.drain_lsn >> 32,
-                        xact_stats.drain_lsn as u32,
-                    ),
-                    source_received = format!(
-                        "{:X}/{:X}",
-                        received >> 32,
-                        received as u32,
-                    ),
-                    filter_dispatched = format!(
-                        "{:X}/{:X}",
-                        now_dispatched >> 32,
-                        now_dispatched as u32,
-                    ),
+                    emitter_ack_lsn = format_pg_lsn(xact_stats.emitter_ack_lsn),
+                    drain_lsn = format_pg_lsn(xact_stats.drain_lsn),
+                    source_received = format_pg_lsn(received),
+                    filter_dispatched = format_pg_lsn(now_dispatched),
                     inflight = %summary,
                     "xact inflight parked — emitter ack pinned by these xids",
                 );
@@ -1260,7 +1242,7 @@ fn spawn_retention(
                         manifests = r.manifests_removed,
                         partials = r.partials_removed,
                         bytes_freed = r.bytes_freed,
-                        cutoff_lsn = format!("{:X}/{:X}", cutoff >> 32, cutoff as u32),
+                        cutoff_lsn = format_pg_lsn(cutoff),
                         "trim cycle",
                     );
                 }
@@ -1571,16 +1553,8 @@ async fn run_bootstrap(
 
     tracing::info!(
         target: "walshadow::bootstrap",
-        start_lsn = format!(
-            "{:X}/{:X}",
-            outcome.start.start_lsn >> 32,
-            outcome.start.start_lsn as u32
-        ),
-        end_lsn = format!(
-            "{:X}/{:X}",
-            outcome.end.end_lsn >> 32,
-            outcome.end.end_lsn as u32
-        ),
+        start_lsn = format_pg_lsn(outcome.start.start_lsn),
+        end_lsn = format_pg_lsn(outcome.end.end_lsn),
         timeline = outcome.start.timeline,
         kept_files = outcome.disk.kept_files,
         skipped_denylist = outcome.disk.skipped_denylist,
@@ -1655,7 +1629,7 @@ async fn autospawn_shadow_and_wait(
     tracing::info!(
         target: "walshadow::bootstrap",
         data_dir = %shadow_data_dir.display(),
-        end_lsn = format!("{:X}/{:X}", end_lsn >> 32, end_lsn as u32),
+        end_lsn = format_pg_lsn(end_lsn),
         replay_timeout_secs = args.bootstrap_shadow_replay_timeout,
         "auto-spawning shadow PG",
     );
@@ -1667,7 +1641,7 @@ async fn autospawn_shadow_and_wait(
     })?;
     tracing::info!(
         target: "walshadow::bootstrap",
-        replay_lsn = format!("{:X}/{:X}", replay_lsn >> 32, replay_lsn as u32),
+        replay_lsn = format_pg_lsn(replay_lsn),
         "shadow caught up to bootstrap end_lsn",
     );
     Ok(())
@@ -1782,9 +1756,18 @@ async fn fetch_wal_into_pg_wal(
     loop {
         let name = cur.format();
         let dst = pg_wal_dir.join(&name);
-        walross::pg::wal::fetch::handle(settings, storage.clone(), &name, &dst)
-            .await
-            .with_context(|| format!("fetch WAL {name} -> {}", dst.display()))?;
+        // Off: loop enumerates every segment in [start,end] explicitly, so
+        // read-ahead would only duplicate the next iteration's fetch & risk
+        // downloading past end_lsn
+        walross::pg::wal::fetch::handle(
+            settings,
+            storage.clone(),
+            &name,
+            &dst,
+            walross::pg::wal::fetch::Prefetch::Off,
+        )
+        .await
+        .with_context(|| format!("fetch WAL {name} -> {}", dst.display()))?;
         fetched += 1;
         let seg_end = cur.start_lsn(seg_size).saturating_add(seg_size);
         if end_lsn < seg_end {
@@ -1795,8 +1778,8 @@ async fn fetch_wal_into_pg_wal(
     tracing::info!(
         target: "walshadow::bootstrap",
         fetched,
-        start_lsn = format!("{:X}/{:X}", start_lsn >> 32, start_lsn as u32),
-        end_lsn = format!("{:X}/{:X}", end_lsn >> 32, end_lsn as u32),
+        start_lsn = format_pg_lsn(start_lsn),
+        end_lsn = format_pg_lsn(end_lsn),
         timeline,
         "hydrated shadow pg_wal from object store",
     );

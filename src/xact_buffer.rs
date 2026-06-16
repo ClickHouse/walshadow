@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::sync::Mutex;
+use walross::pg::backup::format_pg_lsn;
 use walross::pg::walparser::RmId;
 
 use crate::decoder_sink::{DecoderSinkError, DecoderStats, TupleObserver};
@@ -874,9 +875,9 @@ impl XactBuffer {
         tracing::trace!(
             target: "walshadow::xact_buffer",
             top_xid,
-            commit_lsn = format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn as u32),
-            ack_lsn = format!("{:X}/{:X}", ack_lsn >> 32, ack_lsn as u32),
-            prev_ack = format!("{:X}/{:X}", prev_ack >> 32, prev_ack as u32),
+            commit_lsn = format_pg_lsn(commit_lsn),
+            ack_lsn = format_pg_lsn(ack_lsn),
+            prev_ack = format_pg_lsn(prev_ack),
             "drain complete",
         );
         // One bump per top, not per subxid
@@ -1454,11 +1455,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                     tracing::trace!(
                         target: "walshadow::xact_buffer",
                         xid,
-                        commit_lsn = format!(
-                            "{:X}/{:X}",
-                            record.source_lsn >> 32,
-                            record.source_lsn as u32,
-                        ),
+                        commit_lsn = format_pg_lsn(record.source_lsn),
                         nsubxacts = payload.subxacts.len(),
                         "xact commit",
                     );
@@ -1481,11 +1478,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                     tracing::trace!(
                         target: "walshadow::xact_buffer",
                         xid,
-                        abort_lsn = format!(
-                            "{:X}/{:X}",
-                            record.source_lsn >> 32,
-                            record.source_lsn as u32,
-                        ),
+                        abort_lsn = format_pg_lsn(record.source_lsn),
                         nsubxacts = payload.subxacts.len(),
                         "xact abort",
                     );
