@@ -18,6 +18,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -471,5 +472,225 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     if let Err(e) = result {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+// Distinct port slot for the wire-drop test so it can run concurrently.
+const WD_SOURCE_PORT: u16 = 26181;
+const WD_SHADOW_PORT: u16 = 26182;
+const WD_METRICS_PORT: u16 = 26183;
+const WD_WALSENDER_PORT: u16 = 26184;
+
+/// `kill -<sig> -<pgid>` on the shadow cluster's process group, read from
+/// `postmaster.pid` + `/proc/<pid>/stat` (field 5 = pgrp). Pausing the *group*
+/// (not just the postmaster) stops the walreceiver child too, so it stops
+/// draining walshadow's wire and the send queue backs up.
+/// Kill the shadow's walreceiver (SIGTERM its backend pid). The startup process
+/// restarts it within `wal_retrieve_retry_interval`; with the source advancing
+/// it reconnects requesting an LSN *behind* the live head — the reconnect-gap
+/// the fix must backfill. Retries briefly in case we catch it between restarts.
+fn kill_walreceiver(shadow: &Shadow) -> Result<()> {
+    for _ in 0..50 {
+        let pid = shadow
+            .psql_one("SELECT pid::text FROM pg_stat_activity WHERE backend_type='walreceiver' LIMIT 1")
+            .unwrap_or_default();
+        let pid = pid.trim();
+        if !pid.is_empty() {
+            let _ = Command::new("kill").arg(pid).status();
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100));
+    }
+    bail!("no walreceiver backend appeared to kill")
+}
+
+/// Background WAL generator on the source: a `psql` loop of small inserts into
+/// the no-PK `bs.load`, so the wire keeps flowing for the test's duration. Runs
+/// as its own process group; killed via [`kill_group`].
+fn spawn_writer(socket_dir: &Path) -> Result<Child> {
+    // Deliberately slow (~130 KiB/s): enough to advance the head during the 2s
+    // reconnect window (the gap), but far too slow to *complete* a 16 MiB
+    // segment within the test — so a stranded shadow can't quietly recover via
+    // restore_command (which only serves complete segments).
+    let script = format!(
+        "while :; do psql -h '{}' -p {} -U postgres -d postgres -q -t \
+         -c \"INSERT INTO bs.load SELECT repeat('x',100) FROM generate_series(1,200)\" \
+         >/dev/null 2>&1; sleep 0.2; done",
+        socket_dir.display(),
+        WD_SOURCE_PORT,
+    );
+    Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn background writer")
+}
+
+fn kill_group(child: &mut Child) {
+    let pid = child.id() as i32;
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(format!("-{pid}"))
+        .status();
+    let _ = child.wait();
+}
+
+/// Reproduction / validation harness for the WAL reconnect-gap strand.
+///
+/// A background writer keeps WAL flowing so the shadow streams the in-progress
+/// segment live. We then kill the shadow's walreceiver; it reconnects requesting
+/// an LSN behind the now-advanced head (inside the in-progress segment).
+///
+/// Passes only with the fix: walshadow backfills `[reconnect_lsn, head]` so the
+/// stream is contiguous. Without it the reconnect gets a hole, the shadow
+/// strands (`restore_command` lacks the incomplete segment), replay never
+/// catches up → fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real-PG e2e; run with --ignored. Validates fix-2 (wire reconnect/resume)."]
+async fn wire_drop_midsegment_shadow_resumes_streaming() {
+    if !pg_available() || !pg_basebackup_available() {
+        eprintln!("skip: PG binaries not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = make_pg(&tmp, "wd-source", WD_SOURCE_PORT);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("source base conf");
+    append_source_conf(&source);
+    source.start().expect("start source");
+    let _src_stop = StopOnDrop { sh: &source };
+    source
+        .apply_schema_dump(
+            "CREATE SCHEMA bs;\n\
+             CREATE TABLE bs.t (id bigint PRIMARY KEY, payload text);\n\
+             CREATE TABLE bs.load (payload text);\n",
+        )
+        .expect("apply source schema");
+
+    let shadow_data = tmp.path().join("wd-shadow-data");
+    pg_basebackup(&source, &shadow_data).expect("pg_basebackup");
+    source.psql_one("SELECT pg_switch_wal()").expect("rotate");
+
+    let filter_dir = tmp.path().join("wd-filtered");
+    fs::create_dir_all(&filter_dir).unwrap();
+    let shadow_sock = tmp.path().join("wd-shadow-sock");
+    fs::create_dir_all(&shadow_sock).unwrap();
+    rewrite_for_shadow(&shadow_data, WD_SHADOW_PORT, &shadow_sock).expect("retarget shadow");
+    enable_recovery(&shadow_data, &filter_dir, WD_WALSENDER_PORT).expect("enable recovery");
+    // Slow the walreceiver restart so killing it leaves a multi-second window in
+    // which the writer advances the head — guaranteeing the reconnect lands
+    // behind it (the gap). Overrides the 100ms from rewrite_for_shadow.
+    {
+        let conf = shadow_data.join("postgresql.conf");
+        let mut f = fs::OpenOptions::new().append(true).open(&conf).unwrap();
+        writeln!(f, "wal_retrieve_retry_interval = '2s'").unwrap();
+    }
+
+    let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), filter_dir.clone());
+    shadow_cfg.port = WD_SHADOW_PORT;
+    shadow_cfg.socket_dir = shadow_sock.clone();
+    shadow_cfg.ctl_timeout = Duration::from_secs(60);
+    let shadow = Shadow::new(shadow_cfg);
+    shadow.start().expect("start shadow");
+    let _shd_stop = StopOnDrop { sh: &shadow };
+
+    let spill_dir = tmp.path().join("wd-spill");
+    fs::create_dir_all(&spill_dir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_walshadow-stream");
+    let stderr_path = tmp.path().join("wd-daemon.stderr.log");
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{WD_METRICS_PORT}").parse().unwrap();
+    let mut child = Command::new(bin)
+        .args([
+            "--host", source.config().socket_dir.to_str().unwrap(),
+            "--port", &WD_SOURCE_PORT.to_string(),
+            "--user", "postgres",
+            "--dbname", "postgres",
+            "--sslmode", "disable",
+            "--out-dir", filter_dir.to_str().unwrap(),
+            "--shadow-socket-dir", shadow_sock.to_str().unwrap(),
+            "--shadow-port", &WD_SHADOW_PORT.to_string(),
+            "--shadow-user", "postgres",
+            "--shadow-dbname", "postgres",
+            "--spill-dir", spill_dir.to_str().unwrap(),
+            "--status-interval", "1",
+            "--metrics-bind", &metrics_addr.to_string(),
+            "--walsender-bind", &format!("127.0.0.1:{WD_WALSENDER_PORT}"),
+            // Default (large) threshold: we force the disconnect by killing the
+            // walreceiver, not by overflowing the queue — so baseline streaming
+            // never trips a spurious drop.
+            "--retention-bytes", "0",
+        ])
+        .env("RUST_LOG", "warn,walshadow=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .process_group(0)
+        .spawn()
+        .expect("spawn walshadow-stream");
+
+    let mut writer: Option<Child> = None;
+    let result = (|| -> Result<()> {
+        wait_for_listen(metrics_addr, Duration::from_secs(30)).context("daemon never came up")?;
+
+        // Continuous WAL so the wire stays active (a lone write goes idle and
+        // its trailing record never streams). Started now — shadow is attached
+        // at the pump head, so there's no startup backlog to overflow the queue.
+        writer = Some(
+            spawn_writer(source.config().socket_dir.as_path()).context("spawn writer")?,
+        );
+
+        // Baseline: the live wire keeps the shadow replaying the in-progress segment.
+        sleep(Duration::from_secs(1));
+        let m = walshadow::shadow::parse_pg_lsn(
+            &source.psql_one("SELECT pg_current_wal_lsn()::text").context("baseline lsn")?,
+        )
+        .unwrap();
+        shadow
+            .wait_for_replay(m, Duration::from_secs(25))
+            .context("baseline replay over live wire")?;
+
+        // Force a mid-stream reconnect: kill the walreceiver. The writer keeps
+        // advancing the head during the ~100ms restart, so it reconnects behind
+        // the live head — inside the in-progress segment.
+        kill_walreceiver(&shadow).context("kill walreceiver")?;
+        // Let the 2s restart window elapse (writer advances the head meanwhile)
+        // so the walreceiver reconnects behind it before we check recovery.
+        sleep(Duration::from_secs(3));
+
+        // Recovery: replay must reach a post-reconnect LSN — only possible if
+        // walshadow backfills the gap on reconnect. Without the fix the shadow
+        // gets a hole, strands, and this times out. Budget < the 30s gate.
+        let target = walshadow::shadow::parse_pg_lsn(
+            &source.psql_one("SELECT pg_current_wal_lsn()::text").context("target lsn")?,
+        )
+        .unwrap();
+        let observed = shadow
+            .wait_for_replay(target, Duration::from_secs(25))
+            .context("shadow did not resume streaming after wire drop (strand reproduced)")?;
+        if observed < target {
+            bail!("replay {observed:X} < target {target:X} after wire drop");
+        }
+
+        // A strand would have killed the daemon via the fatal replay-timeout.
+        if let Some(status) = child.try_wait().context("poll daemon")? {
+            bail!("daemon exited during the wire drop: {status:?}");
+        }
+        Ok(())
+    })();
+
+    if let Some(mut w) = writer {
+        kill_group(&mut w);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(e) = result {
+        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        let slog = fs::read_to_string(shadow_data.join("startup.log")).unwrap_or_default();
+        let tail = &slog[slog.len().saturating_sub(2048)..];
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}\n--- shadow startup.log tail ---\n{tail}");
     }
 }
