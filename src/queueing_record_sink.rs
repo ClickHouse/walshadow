@@ -93,15 +93,19 @@ impl QueueingRecordSink {
         let worker = tokio::spawn(async move {
             // Park error, drop in-flight (`n`, or 0 on idle path),
             // close+drain so `in_flight` settles. Caller breaks after.
-            let park_err_and_drain =
-                async |e, n: u64, rx: &mut mpsc::UnboundedReceiver<Vec<Record<'static>>>| {
-                    *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
-                    in_flight_w.fetch_sub(n, Ordering::Relaxed);
-                    rx.close();
-                    while let Some(rest) = rx.recv().await {
-                        in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
-                    }
-                };
+            let park_err_and_drain = async |e: SinkError,
+                                            n: u64,
+                                            rx: &mut mpsc::UnboundedReceiver<
+                Vec<Record<'static>>,
+            >| {
+                tracing::error!(target: "walshadow::pipeline", error = %e, "queueing sink fatal");
+                *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
+                in_flight_w.fetch_sub(n, Ordering::Relaxed);
+                rx.close();
+                while let Some(rest) = rx.recv().await {
+                    in_flight_w.fetch_sub(rest.len() as u64, Ordering::Relaxed);
+                }
+            };
             'outer: loop {
                 match tokio::time::timeout(idle_interval, rx.recv()).await {
                     Ok(Some(batch)) => {
@@ -129,6 +133,7 @@ impl QueueingRecordSink {
                         // INSERTs so the last window's rows reach CH
                         // durably before the worker exits.
                         if let Err(e) = inner.on_close().await {
+                            tracing::error!(target: "walshadow::pipeline", error = %e, "queueing sink fatal on close");
                             *err_w.lock().expect("queueing sink err slot poisoned") = Some(e);
                         }
                         break 'outer;
