@@ -51,9 +51,10 @@ impl Fatal {
     /// calls keep the first.
     pub fn set(&self, msg: String) {
         {
-            let mut g = self.msg.lock().expect("fatal slot poisoned");
-            if g.is_none() {
-                *g = Some(msg);
+            let mut slot = self.msg.lock().expect("fatal slot poisoned");
+            if slot.is_none() {
+                tracing::error!(target: "walshadow::pipeline", error = %msg, "pipeline fatal");
+                *slot = Some(msg);
             }
         }
         self.flag.store(true, Ordering::Release);
