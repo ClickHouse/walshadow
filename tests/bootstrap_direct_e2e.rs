@@ -26,9 +26,9 @@ use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
 
-use walross::pg::replication::base_backup::BaseBackupOpts;
-use walross::pg::replication::conn::PgConfig;
-use walross::pg::replication::tls::SslMode;
+use pgwalrs::pg::replication::base_backup::BaseBackupOpts;
+use pgwalrs::pg::replication::conn::PgConfig;
+use pgwalrs::pg::replication::tls::SslMode;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };

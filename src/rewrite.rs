@@ -10,7 +10,7 @@
 //! ```
 //! body bytes first, then header[0..20] (xl_tot_len through xl_rmid + 2 pad).
 
-use walross::pg::walparser::{
+use pgwalrs::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT,
 };
 
@@ -85,7 +85,7 @@ pub fn compute_crc(record_bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use walross::pg::walparser::{XLP_PAGE_MAGIC_PG15, parse_record_from_bytes};
+    use pgwalrs::pg::walparser::{XLP_PAGE_MAGIC_PG15, parse_record_from_bytes};
 
     fn header_le(xl_tot_len: u32, xl_xid: u32, xl_prev: u64, info: u8, rmid: u8) -> Vec<u8> {
         let mut v = Vec::with_capacity(X_LOG_RECORD_HEADER_SIZE);

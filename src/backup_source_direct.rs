@@ -14,11 +14,11 @@ use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use tokio::sync::{Mutex, mpsc};
-use walross::pg::replication::base_backup::{
+use pgwalrs::pg::replication::base_backup::{
     BackupEvent, BaseBackupOpts, ChannelReader, run_base_backup,
 };
-use walross::pg::replication::conn::{PgConfig, ReplicationConn};
+use pgwalrs::pg::replication::conn::{PgConfig, ReplicationConn};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo, pump_tar_to_sink};
 

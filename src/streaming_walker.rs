@@ -15,8 +15,8 @@
 //! N+1 are lost. PG emits `XLOG_SWITCH` on operator-driven boundaries,
 //! aligning the demo case by construction.
 
+use pgwalrs::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 use smallvec::smallvec;
-use walross::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 
 use crate::segment::ByteRanges;
 pub use crate::wal_page::WalkError;
@@ -504,7 +504,7 @@ impl StreamingWalker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use walross::pg::walparser::{RmId, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
+    use pgwalrs::pg::walparser::{RmId, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
 
     const PG_SEG: usize = 16 * 1024 * 1024;
 

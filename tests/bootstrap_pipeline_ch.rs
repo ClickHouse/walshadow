@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use walross::pg::walparser::RelFileNode;
+use pgwalrs::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
 use walshadow::ch_emitter::{
     ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, MappingHandle, TableMapping,

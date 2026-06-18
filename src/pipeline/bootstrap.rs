@@ -99,7 +99,7 @@ pub async fn drain(
     let mut next_seq = 0u64;
     let mut rows_routed = 0u64;
     // rfn currently accumulating: (rfn, its seq, rows routed for it)
-    let mut open: Option<(walross::pg::walparser::RelFileNode, u64, u64)> = None;
+    let mut open: Option<(pgwalrs::pg::walparser::RelFileNode, u64, u64)> = None;
     let mut chunk_batch: Vec<ToastChunk> = Vec::new();
     let mut deferred: Vec<Deferred> = Vec::new();
     let mut start_lsn = 0u64;
@@ -221,7 +221,7 @@ pub async fn drain(
 }
 
 /// Increment the open seq's routed-row count + the running total.
-fn bump(open: &mut Option<(walross::pg::walparser::RelFileNode, u64, u64)>, rows_routed: &mut u64) {
+fn bump(open: &mut Option<(pgwalrs::pg::walparser::RelFileNode, u64, u64)>, rows_routed: &mut u64) {
     if let Some(slot) = open.as_mut() {
         slot.2 += 1;
     }
@@ -359,9 +359,9 @@ mod tests {
     use crate::pipeline::batcher::BatcherMsg;
     use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
     use crate::toast::DiskChunkStore;
+    use pgwalrs::pg::walparser::RelFileNode;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
-    use walross::pg::walparser::RelFileNode;
 
     fn rel(rel_node: u32) -> Arc<RelDescriptor> {
         let name = format!("t{rel_node}");

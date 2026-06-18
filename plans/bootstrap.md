@@ -88,7 +88,7 @@ pub trait BackupSource: Send {
 Public types:
 
 - `StartInfo { start_lsn, timeline, tablespaces }` — mirrors
-  `walross::pg::replication::base_backup::StartInfo` so callers wired to
+  `pgwalrs::pg::replication::base_backup::StartInfo` so callers wired to
   wal-rs types do not translate. `tablespaces: Vec<Tablespace>`
   re-exports wal-rs's `Tablespace` directly
 - `EndInfo { end_lsn, timeline }` — same shape as wal-rs's EndInfo, no

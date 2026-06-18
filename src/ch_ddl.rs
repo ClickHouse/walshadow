@@ -702,7 +702,7 @@ mod tests {
 
     fn desc(name: &str, attrs: Vec<RelAttr>, pk: Option<Vec<i16>>) -> RelDescriptor {
         RelDescriptor {
-            rfn: walross::pg::walparser::RelFileNode {
+            rfn: pgwalrs::pg::walparser::RelFileNode {
                 spc_node: 1663,
                 db_node: 5,
                 rel_node: 16400,

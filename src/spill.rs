@@ -42,10 +42,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use pgwalrs::pg::walparser::RelFileNode;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use walross::pg::walparser::RelFileNode;
 
 use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer};
 

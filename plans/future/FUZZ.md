@@ -85,7 +85,7 @@ libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 arbitrary = { version = "1", features = ["derive"] }
 walshadow = { path = ".." }
 clickhouse-c-rs = { path = "../clickhouse-c-rs", default-features = false, features = ["lz4"] }
-walross = { path = "../wal-rs" }
+pgwalrs = { path = "../wal-rs" }
 
 [[bin]]
 name = "wal_parse_record"
@@ -113,10 +113,10 @@ ratio of coverage to effort.
 
 | target | entry | crate | risk |
 |---|---|---|---|
-| `wal_parse_record` | `walross::pg::walparser::parse_record_from_bytes(data, page_magic)` | wal-rs | HIGH, core XLogRecord header + block headers + FPI metadata |
-| `wal_extract_locations` | `walross::pg::walparser::extract_block_locations` / `extract_locations_from_wal_file<R: Read>` | wal-rs | HIGH, full-segment walk, integrates lower parsers |
-| `wal_decode_frame` | `walross::pg::replication::stream::decode_frame(payload)` | wal-rs | MED-HIGH, network-facing `'w'`/`'k'` CopyData frames |
-| `daemon_parse_args` | `walross::daemon::protocol::parse_args(body)` | wal-rs | MED, length-prefixed arg vector |
+| `wal_parse_record` | `pgwalrs::pg::walparser::parse_record_from_bytes(data, page_magic)` | wal-rs | HIGH, core XLogRecord header + block headers + FPI metadata |
+| `wal_extract_locations` | `pgwalrs::pg::walparser::extract_block_locations` / `extract_locations_from_wal_file<R: Read>` | wal-rs | HIGH, full-segment walk, integrates lower parsers |
+| `wal_decode_frame` | `pgwalrs::pg::replication::stream::decode_frame(payload)` | wal-rs | MED-HIGH, network-facing `'w'`/`'k'` CopyData frames |
+| `daemon_parse_args` | `pgwalrs::daemon::protocol::parse_args(body)` | wal-rs | MED, length-prefixed arg vector |
 | `wal_page_header` | `walshadow::wal_page::parse_page_header(bytes, page_start)` | walshadow | MED, PG15+ page header magic/flag validation |
 | `heap_truncate` | `walshadow::main_data::parse_xl_heap_truncate(md)` | walshadow | MED, array-count loop over relids |
 | `numeric` | `walshadow::codecs::decode_numeric(body)` | walshadow | MED, weight/dscale/ndigits consistency, NaN/±Inf |
@@ -161,7 +161,7 @@ fuzzer drive the body.
   the same `Unstructured` drives tuple bytes. Exercises bitmap walk,
   prefix/suffix compression, dropped-column and varlena arms
   (see [decoder.md](decoder.md))
-- **`wal_parser_stateful`** — `walross::pg::walparser::WalParser::parse_records_from_page`
+- **`wal_parser_stateful`** — `pgwalrs::pg::walparser::WalParser::parse_records_from_page`
   fed a `Vec<[u8; 8192]>` so continuation-record stitching across page
   boundaries is reachable. Carry the `WalParser` across the vec in one target
   invocation (see [reference: body block ids](reference_walrs_block_ids.md) for
@@ -334,7 +334,7 @@ campaign (that is the VM).
   Tier C exists precisely because a naive byte target would reject ~everything
   at the descriptor mismatch
 - **Re-exported paths only.** `parse_record_from_bytes` and
-  `extract_block_locations` are re-exported from `walross::pg::walparser`;
+  `extract_block_locations` are re-exported from `pgwalrs::pg::walparser`;
   internal helpers (`for_each_block_location_in_record`,
   `read_xlog_record_header`) live in a private submodule, fuzz them through the
   public surface

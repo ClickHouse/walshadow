@@ -29,11 +29,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use backon::{ExponentialBuilder, RetryableWithContext};
+use pgwalrs::pg::walparser::RelFileNode;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::types::{Oid, ToSql};
 use tokio_postgres::{Client, NoTls, Row};
-use walross::pg::walparser::RelFileNode;
 
 use crate::shadow::parse_pg_lsn;
 

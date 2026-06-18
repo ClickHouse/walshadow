@@ -36,7 +36,7 @@ lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
 
 [dependencies]
-walross = { path = "wal-rs" }
+pgwalrs = { path = "wal-rs" }
 clickhouse-c-rs = { path = "clickhouse-c-rs", default-features = false, features = ["tokio", "tls"] }
 anyhow = "1"
 astral-tokio-tar = { version = "0.6", default-features = false }

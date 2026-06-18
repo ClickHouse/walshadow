@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use pgwalrs::pg::backup::{format_pg_lsn, parse_pg_lsn};
+use pgwalrs::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
+use pgwalrs::pg::replication::stream::{Frame, build_status_update, decode_frame};
+use pgwalrs::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 use postgres_protocol::message::backend::Message;
 use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::config::SslMode as TpSslMode;
 use tokio_postgres::{Client, NoTls};
-use walross::pg::backup::{format_pg_lsn, parse_pg_lsn};
-use walross::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
-use walross::pg::replication::stream::{Frame, build_status_update, decode_frame};
-use walross::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 
 /// Matches wal-rs / wal-g defaults; servers tolerate up to
 /// `wal_sender_timeout` of silence (default 60s).

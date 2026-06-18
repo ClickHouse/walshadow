@@ -34,9 +34,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use pgwalrs::pg::wal::segment::SegmentName;
+use pgwalrs::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 use thiserror::Error;
-use walross::pg::wal::segment::SegmentName;
-use walross::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
 use crate::classify::rmgr_label;
 use crate::filter::{Filter, FilterStats, Route};
@@ -47,7 +47,7 @@ use crate::streaming_walker::{CompletedRecord, StreamingWalker, WalkError};
 
 /// 16 MiB initdb default. Non-default seg sizes need operator
 /// coordination: shadow's `initdb --wal-segsize` must match.
-pub const WAL_SEG_SIZE: u64 = walross::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
+pub const WAL_SEG_SIZE: u64 = pgwalrs::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
 #[derive(Debug, Error)]
 pub enum WalStreamError {
@@ -871,7 +871,7 @@ impl WalStream {
 mod tests {
     use super::*;
     use crate::manifest::{Entry, FILTER_VERSION, ManifestStats};
-    use walross::pg::walparser::RmId;
+    use pgwalrs::pg::walparser::RmId;
 
     fn dummy_manifest_entry(offset: u64, rmid: u8) -> Entry {
         Entry {
@@ -894,7 +894,7 @@ mod tests {
 
     #[test]
     fn record_lsn_offset_is_seg_start_plus_entry_offset() {
-        use walross::pg::walparser::XLogRecordHeader;
+        use pgwalrs::pg::walparser::XLogRecordHeader;
         let entry = dummy_manifest_entry(40, RmId::Xact as u8);
         let parsed = ParsedRecord {
             record: XLogRecord {
@@ -1004,7 +1004,7 @@ mod tests {
     }
 
     fn synth_record(offset: u64, rmid: u8) -> Record<'static> {
-        use walross::pg::walparser::XLogRecordHeader;
+        use pgwalrs::pg::walparser::XLogRecordHeader;
         let entry = dummy_manifest_entry(offset, rmid);
         let parsed = ParsedRecord {
             record: XLogRecord {
@@ -1245,7 +1245,7 @@ mod tests {
     }
 
     fn synth_xact_page() -> Vec<u8> {
-        use walross::pg::walparser::{
+        use pgwalrs::pg::walparser::{
             WAL_PAGE_SIZE, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
             XLR_BLOCK_ID_DATA_SHORT,
         };
@@ -1269,8 +1269,8 @@ mod tests {
             v[20..24].copy_from_slice(&crc.to_le_bytes());
             v
         }
-        let r1 = rec(walross::pg::walparser::RmId::Xact as u8);
-        let r2 = rec(walross::pg::walparser::RmId::Xact as u8);
+        let r1 = rec(pgwalrs::pg::walparser::RmId::Xact as u8);
+        let r2 = rec(pgwalrs::pg::walparser::RmId::Xact as u8);
         let mut page = Vec::with_capacity(PAGE_SIZE);
         page.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
         page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());

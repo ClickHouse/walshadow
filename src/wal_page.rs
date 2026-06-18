@@ -5,10 +5,10 @@
 //! [`PageHeaderParse`] outcomes let each caller apply its own short-tail
 //! policy (EOF vs truncation vs "need more bytes").
 
-use thiserror::Error;
-use walross::pg::walparser::{
+use pgwalrs::pg::walparser::{
     WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
 };
+use thiserror::Error;
 
 pub const PAGE_SIZE: usize = WAL_PAGE_SIZE as usize;
 const SHORT_HEADER_SIZE: usize = 20;

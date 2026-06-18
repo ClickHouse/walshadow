@@ -20,9 +20,9 @@ use std::io;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use pgwalrs::pg::walparser::{Oid, RelFileNode};
 use thiserror::Error;
 use tokio::sync::mpsc;
-use walross::pg::walparser::{Oid, RelFileNode};
 
 use crate::backup_sink::parse_base_path;
 use crate::backup_source::{

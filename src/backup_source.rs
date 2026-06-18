@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
 
-use walross::pg::replication::base_backup::Tablespace;
+use pgwalrs::pg::replication::base_backup::Tablespace;
 
 /// Filesystem-object kind. Tar-driven sources translate tar entry types
 /// here; the trait does not expose tar.

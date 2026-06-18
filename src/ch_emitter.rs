@@ -1326,7 +1326,7 @@ impl std::fmt::Debug for ColumnBuf {
 mod tests {
     use super::*;
     use crate::heap_decoder::{DecodedHeap, DecodedTuple};
-    use walross::pg::walparser::RelFileNode;
+    use pgwalrs::pg::walparser::RelFileNode;
 
     #[test]
     fn decimal_type_error_wraps_message_in_type_variant() {
@@ -1383,7 +1383,7 @@ mod tests {
 
     fn mk_rel() -> RelDescriptor {
         use crate::shadow_catalog::{RelAttr, ReplIdent};
-        use walross::pg::walparser::RelFileNode;
+        use pgwalrs::pg::walparser::RelFileNode;
         RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,

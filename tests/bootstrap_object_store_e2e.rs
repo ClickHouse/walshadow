@@ -13,7 +13,7 @@
 //! ```text
 //! Shadow(source).start()
 //!   → schema + INSERT + CHECKPOINT
-//!   → walross::pg::backup::push::handle(.., FsStorage(temp/storage), ..)
+//!   → pgwalrs::pg::backup::push::handle(.., FsStorage(temp/storage), ..)
 //!   → ObjectStoreSource(settings, FsStorage(temp/storage), name)
 //!   → MultiplexSink(DiskLanderSink + PageWalkSink)
 //!   → mpsc<BackfillTuple>
@@ -41,7 +41,7 @@
 //!
 //! Operator note: upstream wal-g binary can serve as a cross-check
 //! oracle if ever wanted; bootstrap doesn't depend on it. This test runs
-//! purely off `walshadow` + `walross` crates.
+//! purely off `walshadow` + `pgwalrs` crates.
 
 use std::collections::HashSet;
 use std::fs;
@@ -51,13 +51,13 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use walross::compression;
-use walross::config::{DeltaSettings, Settings, StorageSettings};
-use walross::pg::backup::list;
-use walross::pg::backup::push::{self, PushArgs};
-use walross::retry::RetryPolicy;
-use walross::storage::DynStorage;
-use walross::storage::fs::FsStorage;
+use pgwalrs::compression;
+use pgwalrs::config::{DeltaSettings, Settings, StorageSettings};
+use pgwalrs::pg::backup::list;
+use pgwalrs::pg::backup::push::{self, PushArgs};
+use pgwalrs::retry::RetryPolicy;
+use pgwalrs::storage::DynStorage;
+use pgwalrs::storage::fs::FsStorage;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };

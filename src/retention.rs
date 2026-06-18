@@ -17,8 +17,8 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use pgwalrs::pg::wal::segment::{SEGMENT_NAME_LEN, SegmentName};
 use thiserror::Error;
-use walross::pg::wal::segment::{SEGMENT_NAME_LEN, SegmentName};
 
 use crate::wal_stream::WAL_SEG_SIZE;
 

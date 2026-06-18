@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use pgwalrs::pg::wal::segment_file::open_segment_file;
+use pgwalrs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use walross::pg::wal::segment_file::open_segment_file;
-use walross::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::classify::Summary;
 
 #[derive(Parser, Debug)]
