@@ -492,7 +492,9 @@ const WD_WALSENDER_PORT: u16 = 26184;
 fn kill_walreceiver(shadow: &Shadow) -> Result<()> {
     for _ in 0..50 {
         let pid = shadow
-            .psql_one("SELECT pid::text FROM pg_stat_activity WHERE backend_type='walreceiver' LIMIT 1")
+            .psql_one(
+                "SELECT pid::text FROM pg_stat_activity WHERE backend_type='walreceiver' LIMIT 1",
+            )
             .unwrap_or_default();
         let pid = pid.trim();
         if !pid.is_empty() {
@@ -606,24 +608,39 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     let metrics_addr: SocketAddr = format!("127.0.0.1:{WD_METRICS_PORT}").parse().unwrap();
     let mut child = Command::new(bin)
         .args([
-            "--host", source.config().socket_dir.to_str().unwrap(),
-            "--port", &WD_SOURCE_PORT.to_string(),
-            "--user", "postgres",
-            "--dbname", "postgres",
-            "--sslmode", "disable",
-            "--out-dir", filter_dir.to_str().unwrap(),
-            "--shadow-socket-dir", shadow_sock.to_str().unwrap(),
-            "--shadow-port", &WD_SHADOW_PORT.to_string(),
-            "--shadow-user", "postgres",
-            "--shadow-dbname", "postgres",
-            "--spill-dir", spill_dir.to_str().unwrap(),
-            "--status-interval", "1",
-            "--metrics-bind", &metrics_addr.to_string(),
-            "--walsender-bind", &format!("127.0.0.1:{WD_WALSENDER_PORT}"),
+            "--host",
+            source.config().socket_dir.to_str().unwrap(),
+            "--port",
+            &WD_SOURCE_PORT.to_string(),
+            "--user",
+            "postgres",
+            "--dbname",
+            "postgres",
+            "--sslmode",
+            "disable",
+            "--out-dir",
+            filter_dir.to_str().unwrap(),
+            "--shadow-socket-dir",
+            shadow_sock.to_str().unwrap(),
+            "--shadow-port",
+            &WD_SHADOW_PORT.to_string(),
+            "--shadow-user",
+            "postgres",
+            "--shadow-dbname",
+            "postgres",
+            "--spill-dir",
+            spill_dir.to_str().unwrap(),
+            "--status-interval",
+            "1",
+            "--metrics-bind",
+            &metrics_addr.to_string(),
+            "--walsender-bind",
+            &format!("127.0.0.1:{WD_WALSENDER_PORT}"),
             // Default (large) threshold: we force the disconnect by killing the
             // walreceiver, not by overflowing the queue — so baseline streaming
             // never trips a spurious drop.
-            "--retention-bytes", "0",
+            "--retention-bytes",
+            "0",
         ])
         .env("RUST_LOG", "warn,walshadow=info")
         .stdout(Stdio::null())
@@ -639,14 +656,14 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
         // Continuous WAL so the wire stays active (a lone write goes idle and
         // its trailing record never streams). Started now — shadow is attached
         // at the pump head, so there's no startup backlog to overflow the queue.
-        writer = Some(
-            spawn_writer(source.config().socket_dir.as_path()).context("spawn writer")?,
-        );
+        writer = Some(spawn_writer(source.config().socket_dir.as_path()).context("spawn writer")?);
 
         // Baseline: the live wire keeps the shadow replaying the in-progress segment.
         sleep(Duration::from_secs(1));
         let m = walshadow::shadow::parse_pg_lsn(
-            &source.psql_one("SELECT pg_current_wal_lsn()::text").context("baseline lsn")?,
+            &source
+                .psql_one("SELECT pg_current_wal_lsn()::text")
+                .context("baseline lsn")?,
         )
         .unwrap();
         shadow
@@ -665,7 +682,9 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
         // walshadow backfills the gap on reconnect. Without the fix the shadow
         // gets a hole, strands, and this times out. Budget < the 30s gate.
         let target = walshadow::shadow::parse_pg_lsn(
-            &source.psql_one("SELECT pg_current_wal_lsn()::text").context("target lsn")?,
+            &source
+                .psql_one("SELECT pg_current_wal_lsn()::text")
+                .context("target lsn")?,
         )
         .unwrap();
         let observed = shadow
