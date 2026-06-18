@@ -6,10 +6,13 @@
 //! shadow's flush/apply LSNs back; the min across connections gates the
 //! catalog.
 //!
-//! Backpressure: a send buffer past `slow_connection_threshold` is
-//! dropped, letting shadow reconnect via the archive (`restore_command`)
-//! path; the catalog gate then polls shadow's apply LSN until streaming
-//! resumes.
+//! Backpressure: a send buffer past `slow_connection_threshold` is dropped and
+//! the walreceiver reconnects. Since the pump streams live (it doesn't replay
+//! history), a reconnect lands *behind* the head; [`ShadowStreamState`] retains
+//! the current segment's wire bytes and backfills `[reconnect_lsn, head]` on
+//! connect so the stream stays contiguous. Older complete segments come from
+//! the archive (`restore_command`); only the in-progress segment — which the
+//! archive lacks — must come over the wire.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -103,6 +106,11 @@ pub struct ShadowStreamState {
     /// Surfaced via [`AggregateLsn::dropped_total`] for the
     /// `walshadow_shadow_stream_dropped_connections_total` gauge.
     dropped_total: u64,
+    /// Current segment's wire bytes `[wire_buf_start, server_wal_end]`, used to
+    /// backfill a reconnect behind the live head (else it gets an unappliable
+    /// gap and strands at segment boundaries). Reset per segment.
+    wire_buf: Vec<u8>,
+    wire_buf_start: u64,
 }
 
 impl ShadowStreamState {
@@ -124,6 +132,8 @@ impl ShadowStreamState {
             slow_threshold,
             server_wal_end: current_lsn,
             dropped_total: 0,
+            wire_buf: Vec::new(),
+            wire_buf_start: current_lsn,
         }
     }
 
@@ -147,7 +157,89 @@ impl ShadowStreamState {
         let id = self.next_conn_id;
         self.next_conn_id += 1;
         self.connections.insert(id, ConnState::fresh(start_lsn));
+        self.backfill_connection(id, start_lsn);
         id
+    }
+
+    /// Append contiguous wire bytes; a non-contiguous LSN re-anchors.
+    fn retain_wire(&mut self, start_lsn: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let buf_end = self.wire_buf_start + self.wire_buf.len() as u64;
+        if self.wire_buf.is_empty() || start_lsn != buf_end {
+            self.wire_buf.clear();
+            self.wire_buf_start = start_lsn;
+        }
+        self.wire_buf.extend_from_slice(bytes);
+    }
+
+    /// Drop the completed segment; `restore_command` serves it from now on.
+    fn reset_wire_buf(&mut self, next_start: u64) {
+        self.wire_buf.clear();
+        self.wire_buf_start = next_start;
+    }
+
+    /// Frame `bytes` (at `start_lsn`) to every connection past its dispatched
+    /// point, bump `server_wal_end`, and retain for backfill.
+    fn dispatch_wire(&mut self, start_lsn: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let end_lsn = start_lsn + bytes.len() as u64;
+        self.server_wal_end = self.server_wal_end.max(end_lsn);
+        self.retain_wire(start_lsn, bytes);
+        let server_wal_end = self.server_wal_end;
+        let ids: Vec<u64> = self.connections.keys().copied().collect();
+        for id in ids {
+            let conn_offset = self
+                .connections
+                .get(&id)
+                .map(|c| c.dispatched_lsn)
+                .unwrap_or(start_lsn);
+            if end_lsn <= conn_offset {
+                continue;
+            }
+            let skip = conn_offset.saturating_sub(start_lsn) as usize;
+            let to_send = &bytes[skip.min(bytes.len())..];
+            if to_send.is_empty() {
+                continue;
+            }
+            let frame_lsn = start_lsn + skip as u64;
+            if self.enqueue_copy_data_with(id, |out| {
+                encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
+            }) {
+                self.advance_dispatched(id, end_lsn);
+            }
+        }
+    }
+
+    /// Replay `[start_lsn, server_wal_end]` so a reconnect behind the live head
+    /// gets a contiguous stream instead of a gap. Older ranges → restore_command.
+    fn backfill_connection(&mut self, id: u64, start_lsn: u64) {
+        let server_wal_end = self.server_wal_end;
+        if start_lsn >= server_wal_end || start_lsn < self.wire_buf_start {
+            return;
+        }
+        let off = (start_lsn - self.wire_buf_start) as usize;
+        if off >= self.wire_buf.len() {
+            return;
+        }
+        let backfill = self.wire_buf[off..].to_vec();
+        const FRAME: usize = 256 * 1024;
+        let mut pos = 0;
+        while pos < backfill.len() {
+            let end = (pos + FRAME).min(backfill.len());
+            let frame_lsn = start_lsn + pos as u64;
+            let chunk = &backfill[pos..end];
+            // Uncapped: a reconnect backfill is bounded (≤ one segment) and
+            // required for recovery, so it must not trip the slow-client cap.
+            self.frame_copy_data(id, None, |out| {
+                encode_wal_data_frame_into(out, frame_lsn, server_wal_end, chunk);
+            });
+            pos = end;
+        }
+        self.advance_dispatched(id, server_wal_end);
     }
 
     pub fn drop_connection(&mut self, id: u64) {
@@ -187,13 +279,16 @@ impl ShadowStreamState {
         true
     }
 
-    /// Append a CopyData envelope wrapping a `'w'`/`'k'` frame, built
-    /// in-place to skip the intermediate `Vec`s per record × connection.
-    /// `build_body` writes everything after the 5-byte CopyData header.
-    /// `false` on `slow_threshold` breach (marks closing, clears queue,
-    /// matching [`enqueue`]).
-    fn enqueue_copy_data_with(&mut self, id: u64, build_body: impl FnOnce(&mut Vec<u8>)) -> bool {
-        let slow_threshold = self.slow_threshold;
+    /// Append a CopyData envelope wrapping a `'w'`/`'k'` frame, built in-place.
+    /// `build_body` writes everything after the 5-byte CopyData header. `cap`
+    /// caps the queue (live traffic); `None` skips the cap for a bounded
+    /// reconnect backfill. `false` on cap breach (marks closing, clears queue).
+    fn frame_copy_data(
+        &mut self,
+        id: u64,
+        cap: Option<usize>,
+        build_body: impl FnOnce(&mut Vec<u8>),
+    ) -> bool {
         let q = self.send_queues.entry(id).or_default();
         let envelope_start = q.len();
         q.push(b'd');
@@ -202,7 +297,9 @@ impl ShadowStreamState {
         let body_start = q.len();
         build_body(q);
         let payload_len = 4 + (q.len() - body_start);
-        if envelope_start + 1 + payload_len > slow_threshold {
+        if let Some(cap) = cap
+            && envelope_start + 1 + payload_len > cap
+        {
             q.truncate(envelope_start);
             if let Some(c) = self.connections.get_mut(&id)
                 && !c.closing
@@ -216,6 +313,11 @@ impl ShadowStreamState {
         q[envelope_start + 1..envelope_start + 5]
             .copy_from_slice(&(payload_len as u32).to_be_bytes());
         true
+    }
+
+    /// Cap-enforcing enqueue for live traffic.
+    fn enqueue_copy_data_with(&mut self, id: u64, build_body: impl FnOnce(&mut Vec<u8>)) -> bool {
+        self.frame_copy_data(id, Some(self.slow_threshold), build_body)
     }
 
     pub fn advance_dispatched(&mut self, id: u64, new_lsn: u64) {
@@ -242,36 +344,7 @@ impl RecordBytesSink for ShadowStreamSink {
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            if bytes.is_empty() {
-                return Ok(());
-            }
-            let mut state = self.state.lock().await;
-            let end_lsn = start_lsn + bytes.len() as u64;
-            state.server_wal_end = state.server_wal_end.max(end_lsn);
-            let server_wal_end = state.server_wal_end;
-            let ids: Vec<u64> = state.connections.keys().copied().collect();
-            for id in ids {
-                let conn_offset = state
-                    .connections
-                    .get(&id)
-                    .map(|c| c.dispatched_lsn)
-                    .unwrap_or(start_lsn);
-                if end_lsn <= conn_offset {
-                    continue;
-                }
-                let skip = conn_offset.saturating_sub(start_lsn) as usize;
-                let to_send = &bytes[skip.min(bytes.len())..];
-                if to_send.is_empty() {
-                    continue;
-                }
-                let frame_lsn = start_lsn + skip as u64;
-                let enqueued = state.enqueue_copy_data_with(id, |out| {
-                    encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
-                });
-                if enqueued {
-                    state.advance_dispatched(id, end_lsn);
-                }
-            }
+            self.state.lock().await.dispatch_wire(start_lsn, bytes);
             Ok(())
         })
     }
@@ -284,29 +357,9 @@ impl RecordBytesSink for ShadowStreamSink {
         Box::pin(async move {
             let mut state = self.state.lock().await;
             let segment_end_lsn = start_lsn + trailing_bytes.len() as u64;
-            state.server_wal_end = state.server_wal_end.max(segment_end_lsn);
-            let server_wal_end = state.server_wal_end;
-            let ids: Vec<u64> = state.connections.keys().copied().collect();
-            for id in ids {
-                let conn_offset = state
-                    .connections
-                    .get(&id)
-                    .map(|c| c.dispatched_lsn)
-                    .unwrap_or(start_lsn);
-                if segment_end_lsn > conn_offset && !trailing_bytes.is_empty() {
-                    let skip = conn_offset.saturating_sub(start_lsn) as usize;
-                    let to_send = &trailing_bytes[skip.min(trailing_bytes.len())..];
-                    if !to_send.is_empty() {
-                        let frame_lsn = start_lsn + skip as u64;
-                        let enqueued = state.enqueue_copy_data_with(id, |out| {
-                            encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
-                        });
-                        if enqueued {
-                            state.advance_dispatched(id, segment_end_lsn);
-                        }
-                    }
-                }
-            }
+            state.dispatch_wire(start_lsn, trailing_bytes);
+            // Segment complete → restore_command owns it; track the next one.
+            state.reset_wire_buf(segment_end_lsn);
             Ok(())
         })
     }
@@ -597,5 +650,58 @@ mod tests {
         // + start_lsn(8) + server_wal_end(8) + send_time(8) = 30 bytes
         assert_eq!(&qa[30..], bytes);
         assert_eq!(&qb[30..], bytes);
+    }
+
+    // 'w' frame prefix: 'd'(1) + len(4) + 'w'(1) + start_lsn(8) + wal_end(8) +
+    // send_time(8) = 30 bytes; payload follows.
+    const WIRE_HDR: usize = 30;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_behind_head_is_backfilled_contiguously() {
+        let state = Arc::new(Mutex::new(fresh_state())); // current_lsn = 0x1000
+        let mut sink = ShadowStreamSink::new(state.clone());
+        sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap();
+        sink.on_wire_chunk(0x1004, b"BBBB").await.unwrap(); // head = 0x1008
+
+        // A reconnect behind the head gets the whole [reconnect_lsn, head] range
+        // from the retained buffer — not just future bytes (which would gap).
+        let mut s = state.lock().await;
+        let id = s.register_connection(0x1000);
+        let q = s.drain_send_queue(id).expect("reconnect backfilled");
+        assert_eq!(&q[WIRE_HDR..], b"AAAABBBB", "backfill must be gap-free");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_at_head_has_no_backfill() {
+        let state = Arc::new(Mutex::new(fresh_state()));
+        let mut sink = ShadowStreamSink::new(state.clone());
+        sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap(); // head = 0x1004
+        let mut s = state.lock().await;
+        let id = s.register_connection(0x1004); // caught up
+        assert!(
+            s.drain_send_queue(id).is_none(),
+            "nothing to backfill at head"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backfill_scoped_to_current_segment() {
+        let state = Arc::new(Mutex::new(fresh_state())); // current_lsn = 0x1000
+        let mut sink = ShadowStreamSink::new(state.clone());
+        sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap();
+        sink.on_segment_boundary(0x1004, b"").await.unwrap(); // resets buf to 0x1004
+        sink.on_wire_chunk(0x1004, b"CCCC").await.unwrap(); // new segment, head = 0x1008
+
+        let mut s = state.lock().await;
+        // Old (completed) segment is restore_command's job — not backfilled.
+        let old = s.register_connection(0x1000);
+        assert!(
+            s.drain_send_queue(old).is_none(),
+            "completed segment not backfilled"
+        );
+        // Current segment is served from the buffer.
+        let cur = s.register_connection(0x1004);
+        let q = s.drain_send_queue(cur).expect("current-segment backfill");
+        assert_eq!(&q[WIRE_HDR..], b"CCCC");
     }
 }
