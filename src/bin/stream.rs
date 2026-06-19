@@ -259,6 +259,11 @@ struct Args {
     /// `wait_for_replay` lags one batch behind).
     #[arg(long, default_value_t = DEFAULT_QUEUEING_BATCH_SIZE)]
     decoder_batch_size: usize,
+    /// Parallel decode+absorb shards keyed on xid. `>1` fans decode across
+    /// cores; TRUNCATE + subtransactions supported, catalog DROP still needs
+    /// `1`. Only meaningful with `--ch-config`.
+    #[arg(long, default_value_t = 4)]
+    queueing_shards: usize,
     /// Decode-pool size (M): parallel decode workers (detoast, type
     /// coercion, oracle resolution). Only with `--ch-config`. `1` keeps
     /// decode serial so per-table WAL order is preserved; M>1 relaxes
@@ -865,15 +870,42 @@ async fn run(args: Args) -> Result<()> {
                 inserters = args.inserter_pool_size.max(1),
                 "parallel decode+insert pipeline started",
             );
-            QueueingRecordSink::spawn(
-                DecoderXactPair {
-                    decoder,
-                    xact_drain: reorder_sink,
-                },
-                args.decoder_batch_size,
-                args.decoder_queue_capacity,
-                span_registry.clone(),
-            )
+            if args.queueing_shards > 1 {
+                let n = args.queueing_shards;
+                // Split the in-memory budget across shards so total stays bounded.
+                let per_shard_max = (args.xact_buffer_max / n).max(1024 * 1024);
+                let mut buffers = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let cfg = XactBufferConfig {
+                        xact_buffer_max: per_shard_max,
+                        spill_dir: args.spill_dir.clone(),
+                    };
+                    buffers.push(Arc::new(Mutex::new(
+                        XactBuffer::new(cfg).context("init shard xact buffer")?,
+                    )));
+                }
+                tracing::info!(
+                    target: "walshadow::pipeline",
+                    shards = n,
+                    "xid-sharded decode+absorb enabled (TRUNCATE + subxacts ok; catalog DROP => fatal)",
+                );
+                QueueingRecordSink::spawn(
+                    reorder_sink.into_sharded(n, buffers, decoder_stats_handle.clone()),
+                    args.decoder_batch_size,
+                    args.decoder_queue_capacity,
+                    span_registry.clone(),
+                )
+            } else {
+                QueueingRecordSink::spawn(
+                    DecoderXactPair {
+                        decoder,
+                        xact_drain: reorder_sink,
+                    },
+                    args.decoder_batch_size,
+                    args.decoder_queue_capacity,
+                    span_registry.clone(),
+                )
+            }
         }
         None => {
             // Metrics-only (no CH): serial drain to counters. Oracle wrapper
@@ -1566,7 +1598,12 @@ async fn populate_metrics(
         spill_xacts_active: xact_stats.spill_xacts_active,
         spill_bytes_active: xact_stats.spill_bytes_active,
         spill_evictions_total: xact_stats.spill_evictions_total,
-        xacts_committed_total: xact_stats.committed_xacts_total,
+        // Commit-order boundary lives in the reorder layer (EmitterStats),
+        // which the sharded path bumps; the main xact_buffer is unused with
+        // >1 shard. Fall back to the buffer count when no pipeline is wired.
+        xacts_committed_total: emitter_stats
+            .map(|s| s.xacts_committed.load(Ordering::Relaxed))
+            .unwrap_or(xact_stats.committed_xacts_total),
         xacts_aborted_total: xact_stats.aborted_xacts_total,
         decoder_decoded_total: decoder_stats.decoded.load(Ordering::Relaxed),
         decoder_partial_total: decoder_stats.partial.load(Ordering::Relaxed),

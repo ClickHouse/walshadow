@@ -148,14 +148,20 @@ impl QueueingRecordSink {
                             "queuingthread",
                             queued_ms = enqueued.elapsed().as_secs_f64() * 1e3,
                         );
-                        let outcome: Result<(), SinkError> = async {
+                        // Reborrow as refs so the `async move` blocks can MOVE
+                        // `batch` (hand owned records to the sink) while
+                        // `inner`/`reg_w` stay owned across batches.
+                        let inner = &mut inner;
+                        let reg_w = &reg_w;
+                        let outcome: Result<(), SinkError> = async move {
                             // Nests under `queuingthread`; one per dequeued batch.
                             let batch_span = trace_span!(batch_sampled, "batch", batch_size = n);
-                            async {
+                            async move {
                                 let mut max_lsn: u64 = 0;
-                                for record in &batch {
-                                    // Open the `txn` span; verdict gates the
-                                    // per-record spans.
+                                // Consume the batch (records are `'static`) so the
+                                // inner sink can MOVE each record.
+                                for record in batch {
+                                    // Open the `txn` span; verdict gates per-record spans.
                                     let sampled = reg_w.as_ref().is_some_and(|reg| {
                                         reg.note_popped(record.parsed.header.xact_id)
                                     });
@@ -169,7 +175,7 @@ impl QueueingRecordSink {
                                         xid = record.parsed.header.xact_id,
                                         rm = rmgr_label(record.parsed.header.resource_manager_id),
                                     );
-                                    inner.on_record(record).instrument(rec_span).await?;
+                                    inner.on_record_owned(record).instrument(rec_span).await?;
                                 }
                                 // Advance idle ack past trailing non-commit WAL
                                 // (`max_lsn` = dispatched high-water).

@@ -46,7 +46,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 use walrus::pg::backup::format_pg_lsn;
-use walrus::pg::walparser::RmId;
+use walrus::pg::walparser::{RelFileNode, RmId};
 
 use crate::decoder_sink::{DecoderSinkError, DecoderStats, TupleObserver};
 use crate::filter::Route;
@@ -1861,6 +1861,20 @@ pub struct BufferingDecoderSink {
     /// shadow-replay gate shows up nested inside the transaction's span.
     /// `None` ⇒ those spans are skipped (no parent to attach to).
     span_registry: Option<TxnSpanRegistry>,
+    /// Inline descriptor memo: skip the per-record `catalog.lock().await` +
+    /// `relation_at` (an async-mutex acquire + lookup on the single worker
+    /// thread) for runs of same-`rfn` records — the bulk-insert shape. Keyed on
+    /// the catalog's invalidation epoch (lock-free atomic the tracker bumps on
+    /// DDL): a bump flushes the map, so the first post-DDL record for a table
+    /// still goes through `relation_at` and fires schema-change events. Stays
+    /// empty (disabled) when no tracker is wired (`epoch` None) — the only safe
+    /// signal. Mirrors the decode pool's `RelCache`.
+    rel_cache: HashMap<RelFileNode, Arc<RelDescriptor>>,
+    rel_cache_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
+    rel_cache_seen_epoch: u64,
+    /// The epoch handle needs the catalog lock; grabbed lazily on the first
+    /// cold miss (`new` is sync). Guards that one-time load.
+    rel_cache_epoch_loaded: bool,
 }
 
 impl BufferingDecoderSink {
@@ -1871,6 +1885,23 @@ impl BufferingDecoderSink {
             stats: Arc::new(DecoderStats::default()),
             schema_events: None,
             span_registry: None,
+            rel_cache: HashMap::new(),
+            rel_cache_epoch: None,
+            rel_cache_seen_epoch: 0,
+            rel_cache_epoch_loaded: false,
+        }
+    }
+
+    /// Flush the inline descriptor memo if the catalog's invalidation epoch
+    /// advanced (DDL) since the last record. Lock-free atomic load in steady
+    /// state; no-op until the epoch handle loads or when no tracker is wired.
+    fn refresh_rel_cache(&mut self) {
+        if let Some(e) = &self.rel_cache_epoch {
+            let cur = e.load(std::sync::atomic::Ordering::Acquire);
+            if cur != self.rel_cache_seen_epoch {
+                self.rel_cache_seen_epoch = cur;
+                self.rel_cache.clear();
+            }
         }
     }
 
@@ -1896,6 +1927,14 @@ impl BufferingDecoderSink {
 
     pub fn stats_handle(&self) -> Arc<DecoderStats> {
         self.stats.clone()
+    }
+
+    /// Replace this sink's `DecoderStats` with a shared one, so several sinks
+    /// (e.g. the xid-shard pool) aggregate into a single counter set the status
+    /// loop reads.
+    pub fn with_stats(mut self, stats: Arc<DecoderStats>) -> Self {
+        self.stats = stats;
+        self
     }
 
     /// Route catalog-fetch [`SchemaEvent`]s into the buffer stamped
@@ -2028,42 +2067,67 @@ impl RecordSink for BufferingDecoderSink {
                 .span_registry
                 .as_ref()
                 .and_then(|r| r.decode_parent(txn_xid));
-            let gate_span = decode_parent
-                .as_ref()
-                .map(|p| {
-                    tracing::info_span!(
-                        target: "walshadow::trace",
-                        parent: p,
-                        "catalog.gate",
-                        lsn = record.source_lsn,
-                    )
-                })
-                .unwrap_or_else(tracing::Span::none);
-            // Per-record sibling of `catalog.gate` for the batch view.
-            let catalog_span = trace_span!(sampled, "catalog", lsn = record.source_lsn);
-            let rel = {
-                let mut cat = self.catalog.lock().await;
-                match cat
-                    .relation_at(rfn, record.source_lsn)
-                    .instrument(gate_span)
-                    .instrument(catalog_span)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(CatalogError::NotFoundByFilenode(_)) => {
-                        self.stats
-                            .catalog_not_found
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(());
+            // Flush the memo on DDL (epoch bump), then serve same-`rfn` runs
+            // lock-free. A hit skips the catalog lock + `relation_at` + its
+            // replay gate; safe because an unchanged epoch means no DDL touched
+            // any catalog, so the cached descriptor is still correct here.
+            self.refresh_rel_cache();
+            let rel = if let Some(desc) = self.rel_cache.get(&rfn) {
+                desc.clone()
+            } else {
+                let gate_span = decode_parent
+                    .as_ref()
+                    .map(|p| {
+                        tracing::info_span!(
+                            target: "walshadow::trace",
+                            parent: p,
+                            "catalog.gate",
+                            lsn = record.source_lsn,
+                        )
+                    })
+                    .unwrap_or_else(tracing::Span::none);
+                // Per-record sibling of `catalog.gate` for the batch view.
+                let catalog_span = trace_span!(sampled, "catalog", lsn = record.source_lsn);
+                let resolved = {
+                    let mut cat = self.catalog.lock().await;
+                    // Grab the epoch handle once, now that we hold the lock.
+                    // No handle (no tracker) ⇒ caching stays disabled.
+                    if !self.rel_cache_epoch_loaded {
+                        self.rel_cache_epoch = cat.invalidation_epoch_handle();
+                        self.rel_cache_seen_epoch = self
+                            .rel_cache_epoch
+                            .as_ref()
+                            .map(|e| e.load(std::sync::atomic::Ordering::Acquire))
+                            .unwrap_or(0);
+                        self.rel_cache_epoch_loaded = true;
                     }
-                    Err(e) => {
-                        // ReplayTimeout means shadow stalled or the wire
-                        // froze; silent skip would shed user-heap writes
-                        // invisibly. Poison the stream so the daemon exits
-                        // and the cursor resumes on next boot.
-                        return Err(DecoderSinkError::from(e).into());
+                    match cat
+                        .relation_at(rfn, record.source_lsn)
+                        .instrument(gate_span)
+                        .instrument(catalog_span)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(CatalogError::NotFoundByFilenode(_)) => {
+                            self.stats
+                                .catalog_not_found
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // ReplayTimeout means shadow stalled or the wire
+                            // froze; silent skip would shed user-heap writes
+                            // invisibly. Poison the stream so the daemon exits
+                            // and the cursor resumes on next boot.
+                            return Err(DecoderSinkError::from(e).into());
+                        }
                     }
+                };
+                // Only memoize when the epoch signal exists to invalidate it.
+                if self.rel_cache_epoch.is_some() {
+                    self.rel_cache.insert(rfn, resolved.clone());
                 }
+                resolved
             };
             // Empty in steady state
             self.drain_schema_events(record.parsed.header.xact_id, record.source_lsn)
@@ -2086,6 +2150,11 @@ impl RecordSink for BufferingDecoderSink {
             let n_decoded = decoded_set.len();
             let buffer_span = trace_span!(sampled, "buffer", rows = n_decoded);
             async move {
+                // Lock once per record, not once per tuple: on_heap /
+                // on_toast_chunk only touch the buffer (never the catalog), so
+                // holding across the record's tuples adds no lock-ordering
+                // inversion with the commit path's buffer→catalog hold.
+                let mut buf = self.buffer.lock().await;
                 for decoded in decoded_set {
                     self.stats.record(&decoded);
                     if rel.kind == 't' {
@@ -2094,7 +2163,6 @@ impl RecordSink for BufferingDecoderSink {
                             self.stats
                                 .toast_chunks_buffered
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let mut buf = self.buffer.lock().await;
                             buf.on_toast_chunk(chunk, xid)
                                 .await
                                 .map_err(SinkError::from)?;
@@ -2104,7 +2172,6 @@ impl RecordSink for BufferingDecoderSink {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     } else {
-                        let mut buf = self.buffer.lock().await;
                         buf.on_heap(decoded).await.map_err(SinkError::from)?;
                     }
                 }

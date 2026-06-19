@@ -154,7 +154,7 @@ async fn toasted_value_replicates_and_rehydrates() {
         vec![
             format!("INSERT INTO public.doc VALUES (1, 'v1', {BODY_SQL})"),
             "INSERT INTO public.doc SELECT g, repeat('f', 500), NULL \
-             FROM generate_series(2, 17) g"
+             FROM generate_series(2, 4000) g"
                 .into(),
             format!("UPDATE public.doc SET meta = {META2_SQL} WHERE id = 1"),
             "SELECT pg_switch_wal()".into(),

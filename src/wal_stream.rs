@@ -146,6 +146,21 @@ pub trait RecordSink {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
+    /// Owned variant of [`Self::on_record`]: the queueing worker already holds
+    /// each record `'static`, so a sink that forwards it onto another channel
+    /// (the xid-shard router) can **move** it here instead of deep-cloning.
+    /// Default borrows the owned record and delegates to `on_record`, so
+    /// inline-consuming sinks pay nothing.
+    fn on_record_owned<'a>(
+        &'a mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>
+    where
+        Self: Send,
+    {
+        Box::pin(async move { self.on_record(&record).await })
+    }
+
     /// Driver tick for time-based work that can't wait on the next
     /// record. CH emitter's hold-INSERT-open path gates close-and-ack
     /// on `flush_timeout`; without this an idle stream sits on rows
