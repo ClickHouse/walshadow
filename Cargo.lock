@@ -1421,7 +1421,9 @@ checksum = "67cbae2e9ce0605b5de065e53f781f82a1b3677ec1c8bbd12a6c3ccfeeeb5d70"
 
 [[package]]
 name = "pgwalrs"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f72dfc949162d44327f9586190fc66d8f30972ede6256bf55195f611a952ba55"
 dependencies = [
  "anyhow",
  "async-compression",
