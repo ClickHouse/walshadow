@@ -906,7 +906,21 @@ async fn run(args: Args) -> Result<()> {
         emitter_stats: emitter_stats_handle,
         span_registry,
     };
-    let mut segment_sink = DirSegmentSink::new(args.out_dir.clone()).context("open out-dir")?;
+    // Segment fsync off the hot path: sink writes+renames, the task fsyncs and
+    // publishes `durable_lsn`. Seed at the resume point.
+    let durable_lsn = Arc::new(AtomicU64::new(stream.dispatched_lsn()));
+    let fsync_fatal = walshadow::pipeline::Fatal::new();
+    let (fsync_tx, fsync_rx) =
+        tokio::sync::mpsc::channel::<walshadow::wal_stream::SegFsync>(SEGMENT_FSYNC_QUEUE);
+    let fsync_task = spawn_segment_fsync(
+        args.out_dir.clone(),
+        fsync_rx,
+        durable_lsn.clone(),
+        fsync_fatal.clone(),
+    );
+    let mut segment_sink =
+        DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx)
+            .context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     let metrics = MetricsRegistry::new();
@@ -1004,9 +1018,9 @@ async fn run(args: Args) -> Result<()> {
     let mut inflight_stall_since: Option<Instant> = None;
     let mut inflight_stall_logged = false;
     let shutdown_reason = loop {
-        // dispatched_lsn is filter-durable since DirSegmentSink fsyncs each
-        // segment + the parent dir. shadow_replay 0 when retention is off.
+        // `durable` (fsynced) lags `dispatched`; advertise it as flush/cursor.
         let dispatched = stream.dispatched_lsn();
+        let durable = durable_lsn.load(Ordering::Acquire);
         let received = feed.last_server_wal_end().max(dispatched);
         let shadow_replay = shadow_replay_lsn.load(Ordering::Acquire);
         let shadow_agg = shadow_state.lock().await.aggregate();
@@ -1033,7 +1047,7 @@ async fn run(args: Args) -> Result<()> {
         };
         let cur = cursor::Cursor {
             source_received_lsn: received,
-            filter_durable_lsn: dispatched,
+            filter_durable_lsn: durable,
             shadow_replay_lsn: shadow_replay,
             drain_lsn,
             emitter_ack_lsn,
@@ -1047,7 +1061,7 @@ async fn run(args: Args) -> Result<()> {
         }
         let status = StandbyStatus {
             write_lsn: received,
-            flush_lsn: dispatched,
+            flush_lsn: durable,
             apply_lsn: apply_ceiling,
         };
         let dispatched_before = stream.dispatched_lsn();
@@ -1091,6 +1105,9 @@ async fn run(args: Args) -> Result<()> {
             && let Some(msg) = h.fatal.message()
         {
             anyhow::bail!("decode+insert pipeline failed: {msg}");
+        }
+        if let Some(msg) = fsync_fatal.message() {
+            anyhow::bail!("segment fsync failed: {msg}");
         }
         let now_dispatched = stream.dispatched_lsn();
         let advanced = now_dispatched != prev_dispatched;
@@ -1228,6 +1245,13 @@ async fn run(args: Args) -> Result<()> {
         .close(Some(&mut segment_sink), &mut record_sink)
         .await
         .context("flush partial segment on shutdown")?;
+    // Drop the sink (closes the fsync queue) and drain the fsync task so the
+    // final partial is durable.
+    drop(segment_sink);
+    fsync_task.await.ok();
+    if let Some(msg) = fsync_fatal.message() {
+        anyhow::bail!("segment fsync failed: {msg}");
+    }
     // Drain queueing worker so enqueued-but-undispatched records run
     // through decoder + xact_drain before exit; surfaces worker-parked errors.
     let DaemonSinks { decoder_xact, .. } = record_sink;
@@ -1320,6 +1344,66 @@ fn spawn_sighup_handler(
                     "ch-config read failed; existing mapping preserved",
                 ),
             }
+        }
+    })
+}
+
+/// Max unsynced segments queued before the pump blocks on `on_segment`;
+const SEGMENT_FSYNC_QUEUE: usize = 64;
+
+/// Background segment durability: drain the fsync queue, then `syncfs` the
+/// filesystem holding `out_dir` once per batch — this flushes every written
+/// segment + manifest + the directory entries in one syscall, avoiding the
+/// per-file `open`+`sync_data` walk (à la PG `recovery_init_sync_method=syncfs`).
+/// Then advance `durable_lsn` to the highest covered LSN. A sync error sets
+/// `fatal` and stops (the main loop then exits rather than advertising
+/// durability past the failure).
+///
+/// `syncfs` error reporting requires Linux >= 5.8; the fd is held for the task's
+/// lifetime so writeback errors on this filesystem are seen. Because it flushes
+/// the *whole* filesystem, `out_dir` should live on a volume walshadow owns —
+/// on a shared disk it may block on unrelated writeback.
+fn spawn_segment_fsync(
+    out_dir: PathBuf,
+    mut rx: tokio::sync::mpsc::Receiver<walshadow::wal_stream::SegFsync>,
+    durable_lsn: Arc<AtomicU64>,
+    fatal: walshadow::pipeline::Fatal,
+) -> tokio::task::JoinHandle<()> {
+    use std::os::unix::io::AsRawFd;
+    tokio::spawn(async move {
+        let dir = match std::fs::File::open(&out_dir) {
+            Ok(f) => f,
+            Err(e) => {
+                fatal.set(format!("open {} for syncfs: {e}", out_dir.display()));
+                return;
+            }
+        };
+        let dirfd = dir.as_raw_fd();
+        while let Some(item) = rx.recv().await {
+            let mut max_lsn = item.end_lsn;
+            while let Ok(next) = rx.try_recv() {
+                max_lsn = max_lsn.max(next.end_lsn);
+            }
+            let synced = tokio::task::spawn_blocking(move || {
+                if unsafe { libc::syncfs(dirfd) } == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+            .await;
+            match synced {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    fatal.set(format!("syncfs {}: {e}", out_dir.display()));
+                    return;
+                }
+                Err(e) => {
+                    fatal.set(format!("syncfs join {}: {e}", out_dir.display()));
+                    return;
+                }
+            }
+            durable_lsn.fetch_max(max_lsn, Ordering::Release);
         }
     })
 }

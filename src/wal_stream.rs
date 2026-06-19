@@ -35,6 +35,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use thiserror::Error;
+use tokio::sync::mpsc;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
@@ -406,16 +407,56 @@ impl RecordBytesSink for NoopBytesSink {
     }
 }
 
+/// A written-and-renamed segment (+ its manifest) awaiting fsync. Handed to
+/// the background durability task; `end_lsn` is one past the bytes covered.
+pub struct SegFsync {
+    pub end_lsn: u64,
+    pub seg_path: std::path::PathBuf,
+    pub mani_path: std::path::PathBuf,
+}
+
+enum Durability {
+    /// fsync (`sync_all` + dir fsync) inline — durable before `on_segment`
+    /// returns. Used by tests and any synchronous-durability caller.
+    Inline,
+    /// Write + rename inline, fsync off the hot path: hand each segment to the
+    /// background task draining `tx`. The caller advances its durable
+    /// watermark from that task, not from this sink.
+    Background {
+        seg_size: u64,
+        tx: mpsc::Sender<SegFsync>,
+    },
+}
+
 /// Writes filtered segments + manifests to a directory shadow PG's
 /// `restore_command` reads from.
 pub struct DirSegmentSink {
     out_dir: std::path::PathBuf,
+    durability: Durability,
 }
 
 impl DirSegmentSink {
+    /// Inline-fsync sink: each segment is durable before `on_segment` returns.
     pub fn new(out_dir: std::path::PathBuf) -> Result<Self, SinkError> {
         std::fs::create_dir_all(&out_dir)?;
-        Ok(Self { out_dir })
+        Ok(Self {
+            out_dir,
+            durability: Durability::Inline,
+        })
+    }
+
+    /// Off-hot-path sink: write + rename inline, fsync in the background task
+    /// draining `tx`. The pump never blocks on fsync.
+    pub fn with_durability(
+        out_dir: std::path::PathBuf,
+        seg_size: u64,
+        tx: mpsc::Sender<SegFsync>,
+    ) -> Result<Self, SinkError> {
+        std::fs::create_dir_all(&out_dir)?;
+        Ok(Self {
+            out_dir,
+            durability: Durability::Background { seg_size, tx },
+        })
     }
 }
 
@@ -427,16 +468,16 @@ impl SegmentSink for DirSegmentSink {
         manifest: &'a Manifest,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
+            let inline = matches!(self.durability, Durability::Inline);
             let name = seg.format();
             let seg_path = self.out_dir.join(&name);
             let tmp = seg_path.with_extension("partial");
-            write_sync_rename(&tmp, &seg_path, bytes).await?;
+            write_sync_rename(&tmp, &seg_path, bytes, inline).await?;
             let mani_path = self.out_dir.join(format!("{name}.manifest.json"));
             let mani_tmp = mani_path.with_extension("manifest.json.partial");
             let body = serde_json::to_vec_pretty(manifest)?;
-            write_sync_rename(&mani_tmp, &mani_path, &body).await?;
-            crate::cursor::fsync_dir(&self.out_dir).await?;
-            Ok(())
+            write_sync_rename(&mani_tmp, &mani_path, &body, inline).await?;
+            self.durably(&seg, bytes.len(), seg_path, mani_path).await
         })
     }
 
@@ -447,19 +488,47 @@ impl SegmentSink for DirSegmentSink {
         manifest: &'a Manifest,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
+            let inline = matches!(self.durability, Durability::Inline);
             let name = seg.format();
             let partial_path = self.out_dir.join(format!("{name}.partial"));
             let tmp = self.out_dir.join(format!("{name}.partial.tmp"));
-            write_sync_rename(&tmp, &partial_path, bytes).await?;
+            write_sync_rename(&tmp, &partial_path, bytes, inline).await?;
             let mani_path = self.out_dir.join(format!("{name}.partial.manifest.json"));
             let mani_tmp = self
                 .out_dir
                 .join(format!("{name}.partial.manifest.json.tmp"));
             let body = serde_json::to_vec_pretty(manifest)?;
-            write_sync_rename(&mani_tmp, &mani_path, &body).await?;
-            crate::cursor::fsync_dir(&self.out_dir).await?;
-            Ok(())
+            write_sync_rename(&mani_tmp, &mani_path, &body, inline).await?;
+            self.durably(&seg, bytes.len(), partial_path, mani_path)
+                .await
         })
+    }
+}
+
+impl DirSegmentSink {
+    /// Finalize a written+renamed segment: inline fsyncs the dir, background
+    /// hands it to the fsync task keyed on the LSN it covers.
+    async fn durably(
+        &self,
+        seg: &SegmentName,
+        bytes_len: usize,
+        seg_path: std::path::PathBuf,
+        mani_path: std::path::PathBuf,
+    ) -> Result<(), SinkError> {
+        match &self.durability {
+            Durability::Inline => crate::cursor::fsync_dir(&self.out_dir).await?,
+            Durability::Background { seg_size, tx } => {
+                let end_lsn = seg.start_lsn(*seg_size) + bytes_len as u64;
+                tx.send(SegFsync {
+                    end_lsn,
+                    seg_path,
+                    mani_path,
+                })
+                .await
+                .map_err(|_| SinkError::Other("segment fsync queue closed".into()))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -467,6 +536,7 @@ async fn write_sync_rename(
     tmp: &std::path::Path,
     final_path: &std::path::Path,
     bytes: &[u8],
+    fsync: bool,
 ) -> Result<(), SinkError> {
     use tokio::io::AsyncWriteExt as _;
     let mut f = tokio::fs::OpenOptions::new()
@@ -476,7 +546,9 @@ async fn write_sync_rename(
         .open(tmp)
         .await?;
     f.write_all(bytes).await?;
-    f.sync_all().await?;
+    if fsync {
+        f.sync_all().await?;
+    }
     drop(f);
     tokio::fs::rename(tmp, final_path).await?;
     Ok(())
@@ -1176,6 +1248,29 @@ mod tests {
                 .join(format!("{name}.partial.manifest.json.tmp"))
                 .exists()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dir_sink_with_durability_writes_inline_and_enqueues_fsync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel::<SegFsync>(4);
+        let mut sink =
+            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx).unwrap();
+        let seg = SegmentName::parse("000000010000000000000003").unwrap();
+        let bytes = vec![0xAAu8; 64];
+        sink.on_segment(seg, &bytes, &dummy_manifest())
+            .await
+            .unwrap();
+
+        // Written + renamed inline; fsync deferred to the background task.
+        let seg_path = tmp.path().join(seg.format());
+        assert_eq!(std::fs::read(&seg_path).unwrap(), bytes);
+        let msg = rx.try_recv().expect("segment enqueued for fsync");
+        assert_eq!(
+            msg.end_lsn,
+            seg.start_lsn(WAL_SEG_SIZE) + bytes.len() as u64
+        );
+        assert_eq!(msg.seg_path, seg_path);
     }
 
     /// Contract: a `RecordBytesSink` sees the full wire stream (record
