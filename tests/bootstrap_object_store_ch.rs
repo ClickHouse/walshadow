@@ -118,6 +118,7 @@ fn test_settings(storage_root: PathBuf) -> Settings {
         upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
+        use_wal_delta: false,
         retry: RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
