@@ -64,9 +64,9 @@
 
 use std::borrow::Cow;
 
-use pgwalrs::pg::walparser::{RelFileNode, RmId, XLogRecord};
 use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
+use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
 
@@ -1249,7 +1249,7 @@ pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgwalrs::pg::walparser::{
+    use walrus::pg::walparser::{
         BlockLocation, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 

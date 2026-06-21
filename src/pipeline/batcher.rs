@@ -304,8 +304,8 @@ mod tests {
     use crate::ch_emitter::ColumnMapping;
     use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
     use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
-    use pgwalrs::pg::walparser::RelFileNode;
     use tokio::sync::oneshot;
+    use walrus::pg::walparser::RelFileNode;
 
     fn rel() -> Arc<RelDescriptor> {
         Arc::new(RelDescriptor {

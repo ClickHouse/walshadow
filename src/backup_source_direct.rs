@@ -1,4 +1,4 @@
-//! Direct base-backup source. Wraps wal-rs's
+//! Direct base-backup source. Wraps wal-rus's
 //! `pg::replication::base_backup::run_base_backup` to drive walshadow's
 //! [`BackupSource`] trait. Tablespace symlinks ride inside the data-dir
 //! archive in PG protocol order, surfacing as `FileKind::Symlink`.
@@ -14,11 +14,11 @@ use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use pgwalrs::pg::replication::base_backup::{
+use tokio::sync::{Mutex, mpsc};
+use walrus::pg::replication::base_backup::{
     BackupEvent, BaseBackupOpts, ChannelReader, run_base_backup,
 };
-use pgwalrs::pg::replication::conn::{PgConfig, ReplicationConn};
-use tokio::sync::{Mutex, mpsc};
+use walrus::pg::replication::conn::{PgConfig, ReplicationConn};
 
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo, pump_tar_to_sink};
 
@@ -47,7 +47,7 @@ impl BackupSource for DirectSource {
             .await
             .context("DirectSource: connect to source PG for BASE_BACKUP")?;
 
-        // depth=8 matches wal-rs internal sizing; producer back-pressures
+        // depth=8 matches wal-rus internal sizing; producer back-pressures
         // on slow archive drain
         let (tx, mut rx) = mpsc::channel::<Result<BackupEvent>>(8);
         let pump = tokio::spawn(async move {
@@ -108,7 +108,7 @@ impl BackupSource for DirectSource {
     }
 }
 
-/// Drain one archive body through `pump_tar_to_sink`. wal-rs's
+/// Drain one archive body through `pump_tar_to_sink`. wal-rus's
 /// `ChannelReader` is `AsyncRead`, so tokio_tar takes it directly, no
 /// SyncIoBridge / spawn_blocking.
 async fn drive_archive(

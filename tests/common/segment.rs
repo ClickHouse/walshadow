@@ -13,8 +13,8 @@
 
 use std::path::Path;
 
-use pgwalrs::pg::wal::segment_file::open_segment_file;
 use tokio::io::AsyncReadExt;
+use walrus::pg::wal::segment_file::open_segment_file;
 
 pub async fn load_segment(path: &Path) -> anyhow::Result<Vec<u8>> {
     let (_seg, mut r) = open_segment_file(path).await?;

@@ -32,8 +32,8 @@ rewrite
 
 ## SourceFeed
 
-[`src/source_feed.rs`](../src/source_feed.rs). Wraps wal-rs's
-[`ReplicationConn`](../wal-rs/src/pg/replication/conn.rs):
+[`src/source_feed.rs`](../src/source_feed.rs). Wraps wal-rus's
+`walrus::pg::replication::conn::ReplicationConn`:
 `IDENTIFY_SYSTEM` → `START_REPLICATION PHYSICAL <slot>? <lsn>
 TIMELINE <tli>` → `next_chunk` loop returning
 [`WalChunk { start_lsn, server_wal_end, data }`](../src/source_feed.rs)
@@ -55,8 +55,8 @@ permanent physical slot, pins source's `pg_wal/` until our `apply_lsn`
 advances; None = slotless, source recycles on `wal_keep_size` schedule.
 Slot caps catch-up, slotless caps source disk burn
 
-TLS / SCRAM via wal-rs's
-[`tls.rs`](../wal-rs/src/pg/replication/tls.rs): modes `disable / allow
+TLS / SCRAM via wal-rus's
+`walrus::pg::replication::tls`: modes `disable / allow
 / prefer / require / verify-ca / verify-full`, verify-* consults
 `PGSSLROOTCERT` or webpki. TLS skipped on unix sockets (PG refuses,
 matching libpq). Auth: trust / cleartext / SCRAM-SHA-256. Sidecar
@@ -67,8 +67,8 @@ matching libpq). Auth: trust / cleartext / SCRAM-SHA-256. Sidecar
 Walshadow's walsender server (other side, feeding shadow) is
 trust-over-loopback only, no TLS, no SCRAM. Listener binds `127.0.0.1`
 or colocated unix socket; cross-host shadow needs TLS + SCRAM-SHA-256,
-see [future/parked.md](future/parked.md). Throttle: wal-rs ships
-[`pg::throttle`](../wal-rs/src/throttle.rs) as token-bucket `AsyncRead`
+see [future/parked.md](future/parked.md). Throttle: wal-rus ships
+`walrus::throttle` as token-bucket `AsyncRead`
 adapter, not wired today (queueing sink's backpressure paces the
 daemon), but the hook exists
 
@@ -142,7 +142,7 @@ into the same buffer must release first —
 `parsed.into_owned()` between filter decide and rewrite
 
 Walker rejects pre-PG-15 magic
-([`XLP_PAGE_MAGIC_PG15`](../wal-rs/src/pg/walparser/types.rs)), emits
+(`walrus::pg::walparser::XLP_PAGE_MAGIC_PG15`), emits
 `BadPageMagic` / `UnsupportedSourceVersion`. Zero `xl_tot_len` or
 `xl_tot_len < X_LOG_RECORD_HEADER_SIZE` fail at page state machine,
 not parser
@@ -271,7 +271,7 @@ allocation for its bytes
 
 `XLogRecord<'a>` and `XLogRecordBlock<'a>` carry `main_data`, per-block
 `image`, per-block `data` as `Cow<'a, [u8]>` in
-[`wal-rs/src/pg/walparser/types.rs`](../wal-rs/src/pg/walparser/types.rs).
+`walrus::pg::walparser::types`.
 Parser populates `Cow::Borrowed(slice)` straight off input — every
 `head.to_vec()` is gone. Defaults to `Cow::Borrowed(&[])` so
 `XLogRecord::default()` stays allocation-free. Test sinks call
@@ -285,7 +285,7 @@ calls `reset_segment()` after. No 16 MiB-per-segment churn.
 cross-page record completion via `Pending::materialise(buf)`;
 `logical_bytes(walker_buf)` hides borrowed-vs-owned distinction
 
-[`stream.rs`](../wal-rs/src/pg/replication/stream.rs) exposes
+`walrus::pg::replication::stream` exposes
 `encode_wal_data_frame_into(&mut Vec<u8>, ...)` and
 `encode_keepalive_frame_into(&mut Vec<u8>, ...)`.
 [`ShadowStreamSink`](../src/shadow_stream.rs) writes CopyData envelope
@@ -305,9 +305,9 @@ header-walk merge in `parse.rs`. See `future/parked.md`
 
 ## Walshadow walsender server
 
-[`wal-rs/src/pg/replication/server.rs`](../wal-rs/src/pg/replication/server.rs).
+`walrus::pg::replication::server`.
 Server side of physical-replication protocol, pairs with
-[`conn.rs`](../wal-rs/src/pg/replication/conn.rs)'s client so wal-rs
+`walrus::pg::replication::conn`'s client so wal-rus
 plays either role
 
 Why homemade: naive approach is "shadow `restore_command` from
@@ -333,7 +333,7 @@ single-timeline empty body. `START_REPLICATION [SLOT _] PHYSICAL <lsn>
 `BASE_BACKUP` unsupported (shadow basebackup'd from source at bootstrap)
 
 `'w'` + `'k'` encoders sit in
-[`stream.rs`](../wal-rs/src/pg/replication/stream.rs) alongside existing
+`walrus::pg::replication::stream` alongside existing
 decoders. Inbound `'r'` standby status via
 `server::decode_standby_status`. `'h'` hot-standby-feedback ignored —
 walshadow holds no source-side slot, no horizon to propagate
@@ -397,6 +397,6 @@ sweeper
 ## Out of scope
 
 Future zero-copy work, `XLogRecord.blocks` smallvec migration,
-single-pass header walk merge in `wal-rs/src/pg/walparser/parse.rs`,
+single-pass header walk merge in `walrus::pg::walparser::parse`,
 parked in [future/parked.md](future/parked.md). TLS / SCRAM on
 walsender server also parked there

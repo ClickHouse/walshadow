@@ -10,8 +10,8 @@
 //!   `CatalogTracker`. Unrecognised → ToShadow: correctness over bytes,
 //!   wrongly suppressing a catalog record breaks shadow.
 
-use pgwalrs::pg::walparser::{XLogRecord, XLogRecordBlock};
 use serde::{Deserialize, Serialize};
+use walrus::pg::walparser::{XLogRecord, XLogRecordBlock};
 
 use crate::catalog_tracker::CatalogTracker;
 use crate::classify::{Class, classify, rmgr_label};
@@ -143,7 +143,7 @@ fn any_block_is_catalog(tracker: &CatalogTracker, blocks: &[XLogRecordBlock]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgwalrs::pg::walparser::{
+    use walrus::pg::walparser::{
         BlockLocation, RelFileNode, RmId, XLogRecordBlockHeader, XLogRecordHeader,
     };
 
@@ -231,7 +231,7 @@ mod tests {
         }
         fn new_cid_record(db: u32, rel: u32) -> XLogRecord<'static> {
             XLogRecord {
-                header: pgwalrs::pg::walparser::XLogRecordHeader {
+                header: walrus::pg::walparser::XLogRecordHeader {
                     resource_manager_id: RmId::Heap2 as u8,
                     info: XLOG_HEAP2_NEW_CID,
                     total_record_length: 64,

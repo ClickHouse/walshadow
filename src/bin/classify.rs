@@ -3,16 +3,16 @@
 //! Consumes raw pg_wal segment files (16 MiB each by default, the on-disk
 //! format pg_receivewal and a running primary write to pg_wal/).
 //! Compressed archives (`.zst`/`.gz`/`.lz4`/`.lzma`/`.br`, optional
-//! `.partial` peer) are auto-detected by suffix and decoded via wal-rs's
+//! `.partial` peer) are auto-detected by suffix and decoded via wal-rus's
 //! `open_segment_file`.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use pgwalrs::pg::wal::segment_file::open_segment_file;
-use pgwalrs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use tokio::io::{AsyncRead, AsyncReadExt};
+use walrus::pg::wal::segment_file::open_segment_file;
+use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::classify::Summary;
 
 #[derive(Parser, Debug)]

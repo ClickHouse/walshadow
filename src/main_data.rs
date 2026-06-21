@@ -45,7 +45,7 @@
 //! ```
 //! 25 bytes (no trailing pad after `XLogRegisterData`), locator at offset 0.
 
-use pgwalrs::pg::walparser::{RelFileNode, RmId, XLogRecord};
+use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 /// `XLOG_HEAP2_NEW_CID` info byte
 pub const XLOG_HEAP2_NEW_CID: u8 = 0x70;
@@ -129,7 +129,7 @@ pub fn relation_for_empty(record: &XLogRecord) -> Option<RelFileNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgwalrs::pg::walparser::XLogRecordHeader;
+    use walrus::pg::walparser::XLogRecordHeader;
 
     fn new_cid_record(spc: u32, db: u32, rel: u32) -> XLogRecord<'static> {
         let mut md = Vec::with_capacity(NEW_CID_MIN_SIZE);

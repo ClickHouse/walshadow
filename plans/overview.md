@@ -11,7 +11,7 @@ every relation lookup
 
 Source: PG 16+, enforced at daemon boot by `src/preflight.rs`. Shadow
 runs same major as source; minor mismatch fine. PG 15 captures parse
-(wal-rs's FPI dispatch keys on `magic >= 0xD110`) but stay
+(wal-rus's FPI dispatch keys on `magic >= 0xD110`) but stay
 operationally unsupported. PG ≤ 14 rejected at segment walker
 
 ## Why a shadow Postgres
@@ -23,7 +23,7 @@ Static-catalog snapshot would force three concessions:
    `SET TABLESPACE`) not observable without external signal
 3. No in-tree oracle when decoder disagrees with PG on Tier 3 values
 
-Second Postgres next to wal-rs, schema only with WAL-driven catalog,
+Second Postgres next to wal-rus, schema only with WAL-driven catalog,
 fixes all three. DDL on source writes catalog heap records; replay
 those into shadow, `pg_catalog` stays current with zero operator
 coordination. Relfilenode rewrites ride same WAL. typsend / typoutput
@@ -75,7 +75,7 @@ Component docs live alongside this overview:
 - [filter.md](filter.md) — per-record keep/drop, CRC32C rewrite,
   `CatalogTracker` whitelist via `RM_RELMAP_ID` + `pg_class` heap
   writes, `main_data` reclassifier
-- [source.md](source.md) — WAL ingestion: wal-rs replication client,
+- [source.md](source.md) — WAL ingestion: wal-rus replication client,
   `SourceFeed`, walsender server feeding shadow at record cadence,
   `WalStream` page walker, `streaming_walker`, `QueueingRecordSink`
   decoupling pump from decoder, `decoder_sink`

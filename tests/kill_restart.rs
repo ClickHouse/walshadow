@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use pgwalrs::pg::backup::format_pg_lsn;
+use walrus::pg::backup::format_pg_lsn;
 use walshadow::shadow::{Shadow, ShadowConfig, parse_pg_lsn};
 
 // 17360-range — below the Linux ephemeral port range so outbound

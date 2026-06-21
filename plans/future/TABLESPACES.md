@@ -13,7 +13,7 @@ consumes as one (weak) key.
 ## 0. What already works, and why
 
 In PG a relation's physical identity is the `RelFileLocator`
-`(spcNode, dbNode, relNode)` (`wal-rs/src/pg/walparser/types.rs:119`).
+`(spcNode, dbNode, relNode)` (`walrus::pg::walparser::types`).
 walshadow keys every relation on `(db_node, rel_node)` and discards
 `spc_node` for identity:
 

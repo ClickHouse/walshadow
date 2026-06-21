@@ -42,7 +42,7 @@ digraph bootstrap {
     label="BackupSource — async fn run(data_dir, Arc<Mutex<dyn BackupSink>>) → (StartInfo, EndInfo)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    direct [label="BackupSourceDirect\nwal-rs run_base_backup\ntokio_tar over ChannelReader", fillcolor="#4D3A28"];
+    direct [label="BackupSourceDirect\nwal-rus run_base_backup\ntokio_tar over ChannelReader", fillcolor="#4D3A28"];
     obj    [label="BackupSourceObjectStore\nfetch_sentinel + list_tar_parts\nbuffer_unordered, pg_control barrier", fillcolor="#4D3A28"];
     ev     [label="per-file events into sink\nstart → begin → chunk* → end → finish\nFileMeta {path, size, mode, kind}", fillcolor="#4D3A28", shape=parallelogram];
     { rank=same; direct; obj; }

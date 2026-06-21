@@ -21,8 +21,8 @@ use crate::backup_source::{
 };
 use crate::classify::FIRST_NORMAL_OBJECT_ID;
 
-/// Mirrors `pgwalrs::pg::backup::SYSTEM_DIRS_DENYLIST`, listed locally to
-/// avoid a wal-rs build dependency here; wal-rs stays source of truth
+/// Mirrors `walrus::pg::backup::SYSTEM_DIRS_DENYLIST`, listed locally to
+/// avoid a wal-rus build dependency here; wal-rus stays source of truth
 /// for the protocol-driven filter.
 pub const SYSTEM_DIRS_DENYLIST: &[&str] = &[
     "pg_replslot",

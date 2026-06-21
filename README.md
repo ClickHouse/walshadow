@@ -140,7 +140,6 @@ surface them
 ```
 src/                walshadow daemon + library
 src/bin/            CLI entry points (stream, filter, classify)
-wal-rs/             physical-WAL parser, separate submodule
 clickhouse-c-rs/    CH-Native client, separate submodule
 pgext/              walshadow decode-bridge extension (PGXS)
 architecture/       overview + internals diagrams

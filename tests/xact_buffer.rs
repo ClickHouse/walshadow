@@ -16,8 +16,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgwalrs::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
 use tokio::sync::Mutex;
+use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::decoder_sink::{DecoderSinkError, TupleObserver};
 use walshadow::filter::Route;

@@ -1,13 +1,13 @@
 //! Byte-positioned WAL segment walker.
 //!
-//! wal-rs `WalParser` discards where each record physically sat in the segment.
+//! wal-rus `WalParser` discards where each record physically sat in the segment.
 //! Rewriter needs that mapping to replace dropped records in place, preserving
 //! every other record's `xl_prev` chain. `logical_bytes` is the contiguous
 //! record (header + body, no page-header interruptions); `byte_ranges` is where
 //! to write it back.
 
-use pgwalrs::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 use smallvec::{SmallVec, smallvec};
+use walrus::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 
 pub use crate::wal_page::WalkError;
 use crate::wal_page::{PAGE_SIZE, PageHeaderParse, align_up, parse_page_header};
@@ -274,7 +274,7 @@ impl<'a> Iterator for SegmentWalker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgwalrs::pg::walparser::{RmId, WalParser, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
+    use walrus::pg::walparser::{RmId, WalParser, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
 
     /// `body` starts after a long header (40-byte prefix), zero-padded to PAGE_SIZE
     fn build_single_page(body: &[u8], magic: u16, remaining_data_len: u32) -> Vec<u8> {
@@ -400,7 +400,7 @@ mod tests {
         assert!(matches!(e, WalkError::BadPageMagic(_, _)));
     }
 
-    /// Magic 0xD10D (PG 14): reject before any FPI record, since wal-rs FPI
+    /// Magic 0xD10D (PG 14): reject before any FPI record, since wal-rus FPI
     /// dispatch keys off `magic >= XLP_PAGE_MAGIC_PG15`
     #[test]
     fn rejects_pre_pg15_magic() {
@@ -414,7 +414,7 @@ mod tests {
         );
     }
 
-    /// Walker boundaries must match wal-rs `WalParser` on the same bytes.
+    /// Walker boundaries must match wal-rus `WalParser` on the same bytes.
     /// Real cross-validation lives in `tests/filter_round_trip.rs`; this is the
     /// synthetic link between the two structures.
     #[test]

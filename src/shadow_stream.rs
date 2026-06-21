@@ -23,11 +23,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgwalrs::pg::replication::server::{self, ServerError, WalSenderConn, decode_standby_status};
-use pgwalrs::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
+use walrus::pg::replication::server::{self, ServerError, WalSenderConn, decode_standby_status};
+use walrus::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 
 use crate::wal_stream::{RecordBytesSink, SinkError};
 

@@ -4,7 +4,7 @@
 //! 1. A fresh PG18 cluster via `initdb` in a tempdir (primary source).
 //! 2. A second cluster via `pg_basebackup` against the primary (the
 //!    walreceiver under test).
-//! 3. The wal-rs walsender server bound to a TCP port.
+//! 3. The wal-rus walsender server bound to a TCP port.
 //! 4. Wires the standby's `primary_conninfo` at the walsender.
 //!
 //! Asserts the standby's walreceiver connects to our walsender,

@@ -24,7 +24,7 @@ digraph filter {
     label="① ingress"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     chunk  [label="WalChunk\n(source-order bytes,\npage-framed)", fillcolor="#3D3D54", shape=parallelogram];
     walker [label="StreamingWalker\nstitch records across pages,\nyield (logical_bytes,\n byte_ranges, page_magic)", fillcolor="#3D3D54"];
-    parse  [label="parse_record_from_bytes\nwal-rs XLogRecord\nblocks + main_data", fillcolor="#3D3D54"];
+    parse  [label="parse_record_from_bytes\nwal-rus XLogRecord\nblocks + main_data", fillcolor="#3D3D54"];
     chunk -> walker -> parse;
   }
 

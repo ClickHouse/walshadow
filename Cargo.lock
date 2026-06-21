@@ -1420,45 +1420,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67cbae2e9ce0605b5de065e53f781f82a1b3677ec1c8bbd12a6c3ccfeeeb5d70"
 
 [[package]]
-name = "pgwalrs"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f72dfc949162d44327f9586190fc66d8f30972ede6256bf55195f611a952ba55"
-dependencies = [
- "anyhow",
- "async-compression",
- "async-trait",
- "aws-lc-rs",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "crc32c",
- "dryoc",
- "fallible-iterator",
- "futures",
- "hex",
- "percent-encoding",
- "postgres-protocol",
- "quick-xml",
- "reqwest",
- "rustls",
- "rustls-pemfile",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "tar",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
- "webpki-roots",
-]
-
-[[package]]
 name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2555,6 +2516,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "wal-rus"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8528e91a2b0e4aa09f21bc5382a9521319fa2b0d852ec03e1fa6902c462bba"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "async-trait",
+ "aws-lc-rs",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "crc32c",
+ "dryoc",
+ "fallible-iterator",
+ "futures",
+ "hex",
+ "percent-encoding",
+ "postgres-protocol",
+ "quick-xml",
+ "reqwest",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tar",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2581,7 +2581,6 @@ dependencies = [
  "futures",
  "lz4_flex",
  "pglz",
- "pgwalrs",
  "postgres-protocol",
  "serde",
  "serde_json",
@@ -2594,6 +2593,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wal-rus",
  "zstd",
 ]
 

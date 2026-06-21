@@ -67,7 +67,7 @@ load-bearing for two reasons:
   (writeable, applications connect, accept new xacts) is not the
   goal. Goal is **WAL relay during the failover window**, not
   application traffic
-- A "feed WAL outward" path. wal-rs's replication client is
+- A "feed WAL outward" path. wal-rus's replication client is
   receive-only against source today; sender-side walsender doesn't
   exist
 
@@ -93,7 +93,7 @@ load-bearing for two reasons:
    - **walshadow-as-primary.** Walshadow opens a walsender-
      compatible session to full-PG and pushes WAL via streaming.
      Requires implementing server side of `START_REPLICATION
-     PHYSICAL` (issuer of bytes, not consumer). Mirrors wal-rs's
+     PHYSICAL` (issuer of bytes, not consumer). Mirrors wal-rus's
      receive-side state machine but matching send-side isn't
      implemented today
 4. Full-PG standby reaches F1, declares consistency, promotes via
@@ -173,7 +173,7 @@ schema-only shadow
   HTTP / file-fetch endpoint for segments and full-PG drives pull
   cadence. If push-via-walsender shape (3b) is chosen, walshadow
   needs fresh send-side of replication protocol, ~1000+ LOC mostly
-  on wal-rs
+  on wal-rus
 - **Slot positioning around failover.** Walshadow's slot lives on
   primary; surviving full-PG standby needs walshadow's slot
   recreated (or pre-created and `pg_replication_slot_advance`'d
@@ -226,7 +226,7 @@ more conservative `rebind` / `rebuild` paths
 
 Sizing (evaluation-grade): ~600 LOC walshadow side for durable
 unfiltered archive + relay-mode state machine + RPC surface, plus
-wal-rs upstream lift sized to 4a (modest, ~200 LOC) or 4b (large,
+wal-rus upstream lift sized to 4a (modest, ~200 LOC) or 4b (large,
 ~1000+ LOC) depending on shape
 
 ## Dependencies
@@ -235,7 +235,7 @@ wal-rs upstream lift sized to 4a (modest, ~200 LOC) or 4b (large,
   telemetry shape witness role needs
 - Full-data-dir BASE_BACKUP on shadow — soft, only for the
   `promote-bridge` disposition
-- Sender-side walsender in wal-rs (if push shape chosen) — hard for
+- Sender-side walsender in wal-rus (if push shape chosen) — hard for
   3b, not needed for 3a
 - Durable unfiltered archive in walshadow — hard for both shapes
 - Failover orchestration layer (operator-provided, Patroni/repmgr/

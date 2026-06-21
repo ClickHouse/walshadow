@@ -19,8 +19,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pgwalrs::pg::walparser::RmId;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use walrus::pg::walparser::RmId;
 
 use crate::ch_ddl::DdlApplicator;
 use crate::ch_emitter::EmitterStats;

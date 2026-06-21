@@ -12,7 +12,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::process::Command;
 
-use pgwalrs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::classify::Summary;
 
 #[path = "common/segment.rs"]

@@ -31,10 +31,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pgwalrs::pg::walparser::{RmId, XLogRecord};
 use thiserror::Error;
 use tokio_postgres::Client;
 use tokio_postgres::types::Oid;
+use walrus::pg::walparser::{RmId, XLogRecord};
 
 use crate::classify::FIRST_NORMAL_OBJECT_ID;
 use crate::pg_class_decoder::{
@@ -316,7 +316,7 @@ impl CatalogTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgwalrs::pg::walparser::{
+    use walrus::pg::walparser::{
         BlockLocation, RelFileNode, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 

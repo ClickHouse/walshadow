@@ -18,7 +18,7 @@ mod fx;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use pgwalrs::pg::walparser::RelFileNode;
+use walrus::pg::walparser::RelFileNode;
 use walshadow::ch_emitter::{
     ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping,
 };

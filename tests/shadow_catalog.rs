@@ -122,7 +122,7 @@ async fn catalog_relation_lookup_by_filenode() {
 
     let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
 
-    let rfn = pgwalrs::pg::walparser::RelFileNode {
+    let rfn = walrus::pg::walparser::RelFileNode {
         spc_node: pg_global_tablespace_oid(),
         db_node: db,
         rel_node: pg_class_filenode,
@@ -185,7 +185,7 @@ async fn user_relation_lookup_and_invalidation() {
     let filenode = user_relation_filenode(&shadow, "wc.things");
     let db = current_db_oid(&shadow);
     // Default user tablespace is pg_default (oid 1663).
-    let rfn = pgwalrs::pg::walparser::RelFileNode {
+    let rfn = walrus::pg::walparser::RelFileNode {
         spc_node: 1663,
         db_node: db,
         rel_node: filenode,
@@ -296,12 +296,12 @@ async fn catalog_reconnects_after_pg_restart() {
     let pg_class_filenode = pg_class_filenode_via_psql(&shadow);
     let pg_namespace_filenode = user_relation_filenode(&shadow, "pg_namespace");
     let db = current_db_oid(&shadow);
-    let rfn_class = pgwalrs::pg::walparser::RelFileNode {
+    let rfn_class = walrus::pg::walparser::RelFileNode {
         spc_node: pg_global_tablespace_oid(),
         db_node: db,
         rel_node: pg_class_filenode,
     };
-    let rfn_namespace = pgwalrs::pg::walparser::RelFileNode {
+    let rfn_namespace = walrus::pg::walparser::RelFileNode {
         spc_node: pg_global_tablespace_oid(),
         db_node: db,
         rel_node: pg_namespace_filenode,
@@ -441,7 +441,7 @@ async fn tracker_signal_drives_invalidate_and_refetches_after_ddl() {
 
     let filenode = user_relation_filenode(&shadow, "wc.things");
     let db = current_db_oid(&shadow);
-    let rfn = pgwalrs::pg::walparser::RelFileNode {
+    let rfn = walrus::pg::walparser::RelFileNode {
         spc_node: 1663,
         db_node: db,
         rel_node: filenode,
@@ -597,7 +597,7 @@ async fn nonexistent_filenode_errors_not_found() {
     let _stop = stop_on_drop(&shadow);
 
     let mut cat = open_catalog(&shadow, Duration::from_secs(2)).await;
-    let bogus = pgwalrs::pg::walparser::RelFileNode {
+    let bogus = walrus::pg::walparser::RelFileNode {
         spc_node: 1663,
         db_node: current_db_oid(&shadow),
         rel_node: 99_999_999,
@@ -675,7 +675,7 @@ async fn replident_matrix_default_nothing_full_index() {
         ("wc.full_t", ReplIdent::Full),
     ];
     for (qualified, expected) in cases {
-        let rfn = pgwalrs::pg::walparser::RelFileNode {
+        let rfn = walrus::pg::walparser::RelFileNode {
             spc_node: 1663,
             db_node: db,
             rel_node: user_relation_filenode(&shadow, qualified),
@@ -691,7 +691,7 @@ async fn replident_matrix_default_nothing_full_index() {
         );
     }
 
-    let rfn_idx = pgwalrs::pg::walparser::RelFileNode {
+    let rfn_idx = walrus::pg::walparser::RelFileNode {
         spc_node: 1663,
         db_node: db,
         rel_node: user_relation_filenode(&shadow, "wc.idx_t"),
@@ -753,12 +753,12 @@ async fn arc_mutex_catalog_serialises_relation_at_across_tasks() {
     let pg_class_filenode = pg_class_filenode_via_psql(&shadow);
     let things_filenode = user_relation_filenode(&shadow, "wc.things");
     let db = current_db_oid(&shadow);
-    let rfn_class = pgwalrs::pg::walparser::RelFileNode {
+    let rfn_class = walrus::pg::walparser::RelFileNode {
         spc_node: pg_global_tablespace_oid(),
         db_node: db,
         rel_node: pg_class_filenode,
     };
-    let rfn_things = pgwalrs::pg::walparser::RelFileNode {
+    let rfn_things = walrus::pg::walparser::RelFileNode {
         spc_node: 1663,
         db_node: db,
         rel_node: things_filenode,

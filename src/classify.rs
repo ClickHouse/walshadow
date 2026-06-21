@@ -12,8 +12,8 @@
 
 use std::collections::BTreeMap;
 
-use pgwalrs::pg::walparser::{RmId, XLogRecord};
 use serde::{Deserialize, Serialize};
+use walrus::pg::walparser::{RmId, XLogRecord};
 
 /// `FirstNormalObjectId`, pg src/include/access/transam.h
 pub const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
@@ -168,7 +168,7 @@ impl Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgwalrs::pg::walparser::{
+    use walrus::pg::walparser::{
         BlockLocation, RelFileNode, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 

@@ -88,10 +88,10 @@ pub trait BackupSource: Send {
 Public types:
 
 - `StartInfo { start_lsn, timeline, tablespaces }` — mirrors
-  `pgwalrs::pg::replication::base_backup::StartInfo` so callers wired to
-  wal-rs types do not translate. `tablespaces: Vec<Tablespace>`
-  re-exports wal-rs's `Tablespace` directly
-- `EndInfo { end_lsn, timeline }` — same shape as wal-rs's EndInfo, no
+  `walrus::pg::replication::base_backup::StartInfo` so callers wired to
+  wal-rus types do not translate. `tablespaces: Vec<Tablespace>`
+  re-exports wal-rus's `Tablespace` directly
+- `EndInfo { end_lsn, timeline }` — same shape as wal-rus's EndInfo, no
   extra fields
 - `FileKind::{File, Dir, Symlink { target: PathBuf }}` — tar entry type
   abstracted above wire format. Tar-driven sources translate; future
@@ -109,7 +109,7 @@ Per-source guarantees in `src/backup_source.rs` module docs:
    tablespace list
 2. Tablespace symlinks emit as `FileKind::Symlink` before any file
    under their subtree
-3. `pg_control` emits last (both wal-rs's `list_tar_parts` & PG's
+3. `pg_control` emits last (both wal-rus's `list_tar_parts` & PG's
    BASE_BACKUP protocol honour this)
 4. `finish()` fires after the last `end()`, carries `end_lsn`
 5. Paths are cluster-relative & traversal-safe
@@ -127,11 +127,11 @@ precisely to get this bound)
 
 ### BackupSourceDirect
 
-`src/backup_source_direct.rs`. Wraps wal-rs's
+`src/backup_source_direct.rs`. Wraps wal-rus's
 `pg::replication::base_backup::run_base_backup`. Issues `BASE_BACKUP`
 on replication-protocol connection, drains `BackupEvent` mpsc:
 
-- `Start(s)` → build `StartInfo` from wal-rs's struct, fire
+- `Start(s)` → build `StartInfo` from wal-rus's struct, fire
   `sink.start`
 - `Archive { body }` → wrap `ChannelReader` in `tokio_tar::Archive`,
   drive `pump_tar_to_sink`. `ChannelReader` is `AsyncRead` already; no
@@ -145,12 +145,12 @@ object-store infra
 
 ### BackupSourceObjectStore
 
-`src/backup_source_object_store.rs`. Wraps wal-rs's `pg::backup::fetch`
+`src/backup_source_object_store.rs`. Wraps wal-rus's `pg::backup::fetch`
 primitives against `DynStorage` bucket (wal-g-compatible layout):
 
 - `resolve_name` → `fetch_sentinel` builds `StartInfo` / `EndInfo`
   from `BackupSentinelDtoV2`. Timeline parses out of backup name's
-  first 8 hex chars via wal-rs's `parse_timeline_from_backup_name`
+  first 8 hex chars via wal-rus's `parse_timeline_from_backup_name`
 - `list_tar_parts` returns part keys; data parts run `parallelism`-wide
   (default `min(4, num_cpus)`) via `buffer_unordered`, sharing
   `Arc<Mutex<dyn BackupSink>>`
@@ -159,7 +159,7 @@ primitives against `DynStorage` bucket (wal-g-compatible layout):
   parts is unusual (wal-g emits exactly one) but loop handles it
 
 V1 constraint: delta chains error out. Incremented files need
-disk-resident base to overlay onto via wal-rs's
+disk-resident base to overlay onto via wal-rus's
 `apply_increment_in_place`, but `Tap` entries never land on disk to be
 incremented. Orchestrator rejects `sentinel.increment_from.is_some()`
 with operator-actionable error pointing at full base
@@ -200,9 +200,9 @@ writes them under `data_dir/path`. Classification via `DiskAction`:
   not in catalog whitelist
 
 `SYSTEM_DIRS_DENYLIST` slice lives at top of `backup_sink.rs` rather
-than re-exported from wal-rs. BASEBACKUP.md proposed it land in
+than re-exported from wal-rus. BASEBACKUP.md proposed it land in
 `pg::backup` upstream; walshadow keeps local copy to avoid coupling
-lookup table to wal-rs's build surface, while wal-rs protocol-driven
+lookup table to wal-rus's build surface, while wal-rus protocol-driven
 filter constant remains source of truth on wire side
 
 `CatalogFilenodes` whitelist covers rotated catalogs (`VACUUM FULL` /

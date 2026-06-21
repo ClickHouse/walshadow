@@ -3,7 +3,7 @@
 Per-WAL-record keep/drop decision, byte-preserving NOOP rewrite. Filter
 consumes parsed `XLogRecord`s in source order, returns `Keep` or `Drop`,
 mutates drop bytes in-place into `XLOG_NOOP` of identical `xl_tot_len`
-with CRC32C recomputed. Output re-parses through wal-rs `WalParser`;
+with CRC32C recomputed. Output re-parses through wal-rus `WalParser`;
 `xl_prev` chain stays intact so shadow PG's recovery never sees a gap
 
 `filtered_lsn == source_lsn` per byte offset, no LSN translation
@@ -108,7 +108,7 @@ body, no page-header interruptions) and rewrites in-place:
    Handles records straddling 2+ pages and headers split across page
    boundary (`Pending::total_len` resolves lazily once 24 header bytes
    accumulate)
-2. `parse_record_from_bytes(logical_bytes, page_magic)` builds wal-rs
+2. `parse_record_from_bytes(logical_bytes, page_magic)` builds wal-rus
    `XLogRecord` so Filter sees populated block refs + main_data. Page
    magic threads through so FPI bit semantics match source PG major
 3. `Filter::decide` updates tracker, returns Keep/Drop
@@ -132,7 +132,7 @@ filtering of one segment file. Usage:
 walshadow-filter --in seg.wal --out-dir filtered/ [--manifest <path>]
 ```
 
-Reads segment via wal-rs `segment_file::open_segment_file` (suffix-keyed
+Reads segment via wal-rus `segment_file::open_segment_file` (suffix-keyed
 codec: `.zst` / `.lz4` / `.gz` / `.lzma` / `.br`, `.partial` peel,
 `Method::None` fallthrough), constructs local `Filter::new()`, calls
 `filter_segment`, writes `filtered/<basename>` + JSON manifest sidecar.
@@ -140,7 +140,7 @@ Per-invocation filter is fine here, CLI takes one segment at a time;
 multi-segment correctness lives in `walshadow-stream` which owns
 long-lived `Filter` on `WalStream`
 
-wal-rs supplies on-wire constants via `pg::walparser` exports —
+wal-rus supplies on-wire constants via `pg::walparser` exports —
 `X_LOG_RECORD_HEADER_SIZE`, `X_LOG_RECORD_ALIGNMENT`,
 `XLR_BLOCK_ID_DATA_SHORT/LONG`, `XLP_LONG_HEADER`,
 `XLP_PAGE_MAGIC_PG15` (kept under that name even though it's the

@@ -17,7 +17,7 @@ digraph internals {
   // ════════ ① ingress ════════
   subgraph cluster_ingress {
     label="① ingress (main loop, tokio)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    feed   [label="SourceFeed::pump\nwal-rs ReplicationConn\nIDENTIFY_SYSTEM +\nSTART_REPLICATION PHYSICAL", fillcolor="#3D3D54"];
+    feed   [label="SourceFeed::pump\nwal-rus ReplicationConn\nIDENTIFY_SYSTEM +\nSTART_REPLICATION PHYSICAL", fillcolor="#3D3D54"];
     chunks [label="WalChunk stream\n(start_lsn, server_wal_end,\n bytes)", fillcolor="#3D3D54", shape=parallelogram];
     feed -> chunks;
   }

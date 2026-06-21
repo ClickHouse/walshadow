@@ -1,10 +1,10 @@
 //! Streaming filter pipeline. Wraps [`StreamingWalker`] in a
-//! segment-aligned accumulator consuming WAL byte chunks from wal-rs's
+//! segment-aligned accumulator consuming WAL byte chunks from wal-rus's
 //! `START_REPLICATION` CopyData stream, dispatching to per-record +
 //! per-segment sinks at record cadence.
 //!
 //! ```text
-//!   wal-rs CopyData('w') chunks
+//!   wal-rus CopyData('w') chunks
 //!              v
 //!     +-----------------+
 //!     |  WalStream::push|  base_lsn aligned to segment boundary
@@ -34,9 +34,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use pgwalrs::pg::wal::segment::SegmentName;
-use pgwalrs::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 use thiserror::Error;
+use walrus::pg::wal::segment::SegmentName;
+use walrus::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
 use crate::classify::rmgr_label;
 use crate::filter::{Filter, FilterStats, Route};
@@ -47,7 +47,7 @@ use crate::streaming_walker::{CompletedRecord, StreamingWalker, WalkError};
 
 /// 16 MiB initdb default. Non-default seg sizes need operator
 /// coordination: shadow's `initdb --wal-segsize` must match.
-pub const WAL_SEG_SIZE: u64 = pgwalrs::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
+pub const WAL_SEG_SIZE: u64 = walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
 #[derive(Debug, Error)]
 pub enum WalStreamError {
@@ -871,7 +871,7 @@ impl WalStream {
 mod tests {
     use super::*;
     use crate::manifest::{Entry, FILTER_VERSION, ManifestStats};
-    use pgwalrs::pg::walparser::RmId;
+    use walrus::pg::walparser::RmId;
 
     fn dummy_manifest_entry(offset: u64, rmid: u8) -> Entry {
         Entry {
@@ -894,7 +894,7 @@ mod tests {
 
     #[test]
     fn record_lsn_offset_is_seg_start_plus_entry_offset() {
-        use pgwalrs::pg::walparser::XLogRecordHeader;
+        use walrus::pg::walparser::XLogRecordHeader;
         let entry = dummy_manifest_entry(40, RmId::Xact as u8);
         let parsed = ParsedRecord {
             record: XLogRecord {
@@ -1004,7 +1004,7 @@ mod tests {
     }
 
     fn synth_record(offset: u64, rmid: u8) -> Record<'static> {
-        use pgwalrs::pg::walparser::XLogRecordHeader;
+        use walrus::pg::walparser::XLogRecordHeader;
         let entry = dummy_manifest_entry(offset, rmid);
         let parsed = ParsedRecord {
             record: XLogRecord {
@@ -1245,7 +1245,7 @@ mod tests {
     }
 
     fn synth_xact_page() -> Vec<u8> {
-        use pgwalrs::pg::walparser::{
+        use walrus::pg::walparser::{
             WAL_PAGE_SIZE, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
             XLR_BLOCK_ID_DATA_SHORT,
         };
@@ -1269,8 +1269,8 @@ mod tests {
             v[20..24].copy_from_slice(&crc.to_le_bytes());
             v
         }
-        let r1 = rec(pgwalrs::pg::walparser::RmId::Xact as u8);
-        let r2 = rec(pgwalrs::pg::walparser::RmId::Xact as u8);
+        let r1 = rec(walrus::pg::walparser::RmId::Xact as u8);
+        let r2 = rec(walrus::pg::walparser::RmId::Xact as u8);
         let mut page = Vec::with_capacity(PAGE_SIZE);
         page.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
         page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());

@@ -41,10 +41,10 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pgwalrs::pg::backup::format_pg_lsn;
-use pgwalrs::pg::walparser::RmId;
 use thiserror::Error;
 use tokio::sync::Mutex;
+use walrus::pg::backup::format_pg_lsn;
+use walrus::pg::walparser::RmId;
 
 use crate::decoder_sink::{DecoderSinkError, DecoderStats, TupleObserver};
 use crate::filter::Route;
@@ -1837,8 +1837,8 @@ mod tests {
 
     use super::*;
     use crate::heap_decoder::{DecodedTuple, HeapOp};
-    use pgwalrs::pg::walparser::RelFileNode;
     use tempfile::tempdir;
+    use walrus::pg::walparser::RelFileNode;
 
     fn cfg(dir: PathBuf) -> XactBufferConfig {
         XactBufferConfig {

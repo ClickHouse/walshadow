@@ -20,9 +20,9 @@ use std::io;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pgwalrs::pg::walparser::{Oid, RelFileNode};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use walrus::pg::walparser::{Oid, RelFileNode};
 
 use crate::backup_sink::parse_base_path;
 use crate::backup_source::{
@@ -33,7 +33,7 @@ use crate::heap_decoder::{
 };
 use crate::shadow_catalog::RelDescriptor;
 
-/// Heap page size, PG compile-time, identical to wal-rs `BLOCK_SIZE`
+/// Heap page size, PG compile-time, identical to wal-rus `BLOCK_SIZE`
 pub const PAGE_BYTES: usize = 8192;
 /// `PageHeaderData` size, 24 bytes since PG 8.x
 pub const SIZE_OF_PAGE_HEADER: usize = 24;

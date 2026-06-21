@@ -286,7 +286,7 @@ landing first
   memory note for PG-17-specific repro layout
 - **WAL struct alignment in body walker.** Body block-id sentinels
   255/254/253/252 must all be handled; missing 252 manifests as
-  `BadBlockId` after SAVEPOINT writes. See wal-rs block-id sentinels
+  `BadBlockId` after SAVEPOINT writes. See wal-rus block-id sentinels
   memory note
 - **cross-segment user-heap records.** Spanning records must
   NOOP-rewrite in both segments; otherwise shadow PG PANICs on missing

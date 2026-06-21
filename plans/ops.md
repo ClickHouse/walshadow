@@ -133,7 +133,7 @@ restart resets
 
 `tracing_subscriber::fmt().with_env_filter(...)` initialised once at
 [`bin/stream.rs`](../src/bin/stream.rs) entry. `RUST_LOG` honoured;
-default `warn` + per-crate overrides. Surfaces wal-rs's frame-level
+default `warn` + per-crate overrides. Surfaces wal-rus's frame-level
 debug calls alongside walshadow's own status-line events
 
 Status line per tick includes `shadow_apply=<lsn>` alongside

@@ -1,7 +1,7 @@
 //! File-streaming bootstrap end-to-end via the
 //! object-store source.
 //!
-//! Self-hosted: wal-rs's own `pg::backup::push::handle` builds a
+//! Self-hosted: wal-rus's own `pg::backup::push::handle` builds a
 //! wal-g-compatible base backup against a live source PG, serialised
 //! to a local `FsStorage` root. ObjectStoreSource then reads it back
 //! through the file-level [`BackupSource`] trait, the multiplex sink
@@ -13,7 +13,7 @@
 //! ```text
 //! Shadow(source).start()
 //!   → schema + INSERT + CHECKPOINT
-//!   → pgwalrs::pg::backup::push::handle(.., FsStorage(temp/storage), ..)
+//!   → walrus::pg::backup::push::handle(.., FsStorage(temp/storage), ..)
 //!   → ObjectStoreSource(settings, FsStorage(temp/storage), name)
 //!   → MultiplexSink(DiskLanderSink + PageWalkSink)
 //!   → mpsc<BackfillTuple>
@@ -22,7 +22,7 @@
 //!
 //! What this exercises end-to-end (not covered by lib unit tests):
 //!
-//! - wal-rs's BASE_BACKUP wire (replication protocol -> tar streamer
+//! - wal-rus's BASE_BACKUP wire (replication protocol -> tar streamer
 //!   -> object-store layout)
 //! - ObjectStoreSource's part-listing, decompress-on-read, pg_control-last
 //!   barrier
@@ -41,7 +41,7 @@
 //!
 //! Operator note: upstream wal-g binary can serve as a cross-check
 //! oracle if ever wanted; bootstrap doesn't depend on it. This test runs
-//! purely off `walshadow` + `pgwalrs` crates.
+//! purely off `walshadow` + `walrus` crates.
 
 use std::collections::HashSet;
 use std::fs;
@@ -51,13 +51,13 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgwalrs::compression;
-use pgwalrs::config::{DeltaSettings, Settings, StorageSettings};
-use pgwalrs::pg::backup::list;
-use pgwalrs::pg::backup::push::{self, PushArgs};
-use pgwalrs::retry::RetryPolicy;
-use pgwalrs::storage::DynStorage;
-use pgwalrs::storage::fs::FsStorage;
+use walrus::compression;
+use walrus::config::{DeltaSettings, Settings, StorageSettings};
+use walrus::pg::backup::list;
+use walrus::pg::backup::push::{self, PushArgs};
+use walrus::retry::RetryPolicy;
+use walrus::storage::DynStorage;
+use walrus::storage::fs::FsStorage;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -172,7 +172,7 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
     let storage: DynStorage = Arc::new(FsStorage::new(&storage_root).unwrap());
     let settings = test_settings(storage_root.clone());
 
-    // wal-rs's push::handle resolves its source PG from libpq env vars.
+    // wal-rus's push::handle resolves its source PG from libpq env vars.
     // We're the only writer in this test binary's address space; other
     // walshadow integration test files are separate cargo test
     // binaries, so the global env state is single-owner here.
@@ -193,7 +193,7 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
 
     push::handle(&settings, storage.clone(), PushArgs::default())
         .await
-        .expect("wal-rs push::handle against source PG");
+        .expect("wal-rus push::handle against source PG");
 
     // Backup name lookup — exactly one backup on a fresh FsStorage.
     let backup_summaries = list::collect(storage.clone())

@@ -5,7 +5,7 @@
 //!
 //! Assertions:
 //! 1. Filtered segment is the same length as the source (byte-preserving).
-//! 2. Every record re-parses through wal-rs's `WalParser` without error.
+//! 2. Every record re-parses through wal-rus's `WalParser` without error.
 //! 3. Manifest record count equals source record count.
 //! 4. Filter dropped >0 user records on a non-DDL-heavy workload.
 //! 5. All `Route::ToDecoder` records show as `XLOG_NOOP` (rmid=0, info=0x20)
@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use pgwalrs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::filter::Filter;
 use walshadow::filter_segment::filter_segment;
 
@@ -44,7 +44,7 @@ fn xlog_switch_segment() -> PathBuf {
 
 /// (total_record_count, noop_count) by walking through `WalParser`.
 fn parse_all_records(bytes: &[u8]) -> anyhow::Result<(usize, usize)> {
-    use pgwalrs::pg::walparser::RmId;
+    use walrus::pg::walparser::RmId;
     let mut parser = WalParser::new();
     let mut total = 0;
     let mut noops = 0;
@@ -177,7 +177,7 @@ async fn oltp_workload_keeps_well_under_one_percent() {
 /// machine relies on its presence at the segment tail.
 #[tokio::test]
 async fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
-    use pgwalrs::pg::walparser::RmId;
+    use walrus::pg::walparser::RmId;
     const XLOG_SWITCH: u8 = 0x40;
     let seg = xlog_switch_segment();
     if !seg.exists() {
@@ -260,7 +260,7 @@ async fn writes_filtered_segment_and_manifest_via_cli() {
         return;
     }
     // Pass the compressed fixture directly: the CLI now classifies +
-    // decompresses on the input side via pgwalrs::pg::wal::segment_file
+    // decompresses on the input side via walrus::pg::wal::segment_file
     let bytes = load_segment(&seg).await.expect("load fixture");
 
     let out_dir = tempfile::tempdir().unwrap();

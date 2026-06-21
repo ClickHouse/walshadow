@@ -22,7 +22,6 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY clickhouse-c-rs ./clickhouse-c-rs
-COPY wal-rs ./wal-rs
 COPY bench ./bench
 COPY src ./src
 RUN cargo build --release --bin walshadow-stream

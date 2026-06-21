@@ -2,7 +2,7 @@
 //! BASE_BACKUP source.
 //!
 //! Sibling of `bootstrap_direct_ch.rs` covering the wal-g
-//! layout. Setup adds a `pgwalrs::pg::backup::push::handle` call between
+//! layout. Setup adds a `walrus::pg::backup::push::handle` call between
 //! source workload load and daemon spawn — same fixture pattern as
 //! `bootstrap_object_store_e2e.rs`, just with a live CH server + real
 //! emitter pipeline replacing the `RecordingObserver`.
@@ -12,7 +12,7 @@
 //! ```text
 //! Shadow(source).start()
 //!   → schema + INSERT s14.t (64 rows) + CHECKPOINT + pg_switch_wal
-//!   → pgwalrs::pg::backup::push::handle → FsStorage(wal-g/)
+//!   → walrus::pg::backup::push::handle → FsStorage(wal-g/)
 //!   → walshadow-stream (subprocess) with
 //!         --bootstrap-mode=object_store
 //!         --bootstrap-object-store-prefix=file://<tmpdir>/wal-g (env)
@@ -41,14 +41,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pgwalrs::compression;
-use pgwalrs::config::{DeltaSettings, Settings, StorageSettings};
-use pgwalrs::pg::backup::list;
-use pgwalrs::pg::backup::push::{self, PushArgs};
-use pgwalrs::pg::wal;
-use pgwalrs::retry::RetryPolicy;
-use pgwalrs::storage::DynStorage;
-use pgwalrs::storage::fs::FsStorage;
+use walrus::compression;
+use walrus::config::{DeltaSettings, Settings, StorageSettings};
+use walrus::pg::backup::list;
+use walrus::pg::backup::push::{self, PushArgs};
+use walrus::pg::wal;
+use walrus::retry::RetryPolicy;
+use walrus::storage::DynStorage;
+use walrus::storage::fs::FsStorage;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
 // Reserved port slot — 17320-range. Below the Linux ephemeral port
@@ -65,7 +65,7 @@ const WALSENDER_PORT: u16 = 17336;
 const N_ROWS: i32 = 64;
 
 /// Walk source's `pg_wal/` and push every completed 24-hex-digit WAL
-/// segment into wal-rs storage. Skips `.partial`, `.history`,
+/// segment into wal-rus storage. Skips `.partial`, `.history`,
 /// `archive_status/`, and any subdirectory entry. Caller forces a
 /// `pg_switch_wal` first so the segment containing the basebackup's
 /// `end_lsn` is on disk in final form. In production this happens
@@ -73,7 +73,7 @@ const N_ROWS: i32 = 64;
 /// invoke it inline
 async fn push_completed_wal_segments(
     source: &Shadow,
-    settings: &pgwalrs::config::Settings,
+    settings: &walrus::config::Settings,
     storage: DynStorage,
 ) -> anyhow::Result<()> {
     let pg_wal = source.config().data_dir.join("pg_wal");
@@ -151,8 +151,8 @@ async fn object_store_bootstrap_ch_end_to_end() {
     // 2. Schema + workload.
     fx::load_source_workload(&source, "s14", N_ROWS).expect("load source workload");
 
-    // 3. wal-rs push::handle stages a base backup into FsStorage. The
-    //    wal-rs CLI reads libpq env vars to find source PG; this test
+    // 3. wal-rus push::handle stages a base backup into FsStorage. The
+    //    wal-rus CLI reads libpq env vars to find source PG; this test
     //    binary is single-test-fn so env-var writes don't race.
     let storage_root = tmp.path().join("wal-g");
     fs::create_dir_all(&storage_root).unwrap();
@@ -172,13 +172,13 @@ async fn object_store_bootstrap_ch_end_to_end() {
     }
     push::handle(&settings, storage.clone(), PushArgs::default())
         .await
-        .expect("wal-rs push::handle against source PG");
+        .expect("wal-rus push::handle against source PG");
 
     // push::handle archives the basebackup files but leaves WAL to
     // archive_command (`wal: false` in its BaseBackupOpts), so the
     // segment containing the backup's `end_lsn` sits unrotated in
     // source's pg_wal/. Force a rotation, then push every completed
-    // segment via wal-rs's wal::push so the daemon's object-store
+    // segment via wal-rus's wal::push so the daemon's object-store
     // hydrate path finds WAL covering [start_lsn, end_lsn] in storage.
     source
         .psql_one("SELECT pg_switch_wal()")
@@ -227,7 +227,7 @@ async fn object_store_bootstrap_ch_end_to_end() {
     fs::create_dir_all(&spill_dir).unwrap();
 
     // 7. Spawn walshadow-stream. The daemon reads `WALG_*` env vars
-    //    via `pgwalrs::config::Settings::from_env()`. WALG_FILE_PREFIX
+    //    via `walrus::config::Settings::from_env()`. WALG_FILE_PREFIX
     //    is the raw filesystem path (no `file://` prefix) — that's the
     //    wal-g CLI contract `detect_storage` mirrors.
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");
@@ -281,7 +281,7 @@ async fn object_store_bootstrap_ch_end_to_end() {
         ])
         // WALG_FILE_PREFIX feeds Settings::from_env's FsStorage path;
         // the daemon's `bootstrap_mode=object_store` arm reads this
-        // exactly the same way wal-rs's CLI does.
+        // exactly the same way wal-rus's CLI does.
         .env("WALG_FILE_PREFIX", &walg_path)
         .env("PGHOST", source.config().socket_dir.to_str().unwrap())
         .env("PGPORT", SOURCE_PORT.to_string())

@@ -1,6 +1,6 @@
 //! Source PG replication pump.
 //!
-//! Wraps `wal-rs`'s [`ReplicationConn`]: `IDENTIFY_SYSTEM`, then
+//! Wraps `wal-rus`'s [`ReplicationConn`]: `IDENTIFY_SYSTEM`, then
 //! `START_REPLICATION PHYSICAL`, then a frame loop surfacing
 //! `CopyData('w')` WAL bytes while handling `CopyData('k')` keepalives
 //! and periodic standby-status replies.
@@ -9,16 +9,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use pgwalrs::pg::backup::{format_pg_lsn, parse_pg_lsn};
-use pgwalrs::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
-use pgwalrs::pg::replication::stream::{Frame, build_status_update, decode_frame};
-use pgwalrs::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 use postgres_protocol::message::backend::Message;
 use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::config::SslMode as TpSslMode;
 use tokio_postgres::{Client, NoTls};
+use walrus::pg::backup::{format_pg_lsn, parse_pg_lsn};
+use walrus::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
+use walrus::pg::replication::stream::{Frame, build_status_update, decode_frame};
+use walrus::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 
-/// Matches wal-rs / wal-g defaults; servers tolerate up to
+/// Matches wal-rus / wal-g defaults; servers tolerate up to
 /// `wal_sender_timeout` of silence (default 60s).
 pub const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -29,7 +29,7 @@ pub struct WalChunk<'a> {
     pub data: &'a [u8],
 }
 
-/// Three LSNs wal-rs's `build_status_update` ships to source PG.
+/// Three LSNs wal-rus's `build_status_update` ships to source PG.
 /// `apply`/`flush` gate source's slot: must not advertise durability
 /// the filter and CH emitter have not reached, else source recycles
 /// un-consumed WAL.
@@ -275,7 +275,7 @@ impl SourceFeed {
     /// Lazily-opened sidecar client. Replication-mode connections only
     /// honour the replication command set, not arbitrary `SELECT`s.
     ///
-    /// TLS reuses wal-rs's `maybe_upgrade` so sslmode + `PGSSLROOTCERT`
+    /// TLS reuses wal-rus's `maybe_upgrade` so sslmode + `PGSSLROOTCERT`
     /// match the replication socket; the wrapped stream goes to
     /// `connect_raw` with `NoTls` and tokio-postgres `ssl_mode` pinned
     /// `Disable` so it does not double-negotiate.
@@ -290,7 +290,7 @@ impl SourceFeed {
     }
 }
 
-/// Mirrors wal-rs's transport choice: unix socket when `host` starts
+/// Mirrors wal-rus's transport choice: unix socket when `host` starts
 /// with `/`, TLS-or-plain TCP otherwise.
 async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
     let mut tp_cfg = tokio_postgres::Config::new();

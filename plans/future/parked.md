@@ -52,7 +52,7 @@ remain unverified against live topology until driven
   `SmallVec<[_; 2]>` keeps common case stack-resident. Allocation
   polish below byte-traffic wins already booked via Cow
 * **Header-walk single-pass merge.** `record.blocks` walk runs
-  twice (once for IDs, once for payloads) in wal-rs parser. Merge
+  twice (once for IDs, once for payloads) in wal-rus parser. Merge
   into single pass since IDs arrive in order. Leftover from wal-g
   port
 
@@ -60,7 +60,7 @@ remain unverified against live topology until driven
 
 * **TLS / SCRAM auth.** Trust-over-loopback only today.
   Production multi-host deployments need this. Sized against
-  wal-rs's auth machinery — the receive-side already speaks SCRAM,
+  wal-rus's auth machinery — the receive-side already speaks SCRAM,
   send-side mirrors
 * **`hot_standby_feedback` (`'h'` frame).** Silently dropped today;
   documented behaviour. Long-running shadow queries that conflict

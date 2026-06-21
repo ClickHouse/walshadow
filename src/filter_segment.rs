@@ -1,8 +1,8 @@
 //! Drive a full segment: walk records, decide `Route`, NOOP-rewrite
 //! ToDecoder records in place, emit manifest sidecar.
 
-use pgwalrs::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 use thiserror::Error;
+use walrus::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
 use crate::filter::{Filter, Route};
 use crate::manifest::{Entry, FILTER_VERSION, Kind, Manifest, ManifestStats};
@@ -130,7 +130,7 @@ pub fn filter_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgwalrs::pg::walparser::{
+    use walrus::pg::walparser::{
         WAL_PAGE_SIZE, WalParser, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
         XLR_BLOCK_ID_DATA_SHORT,
     };
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn drops_user_keeps_special_round_trips() {
-        use pgwalrs::pg::walparser::RmId;
+        use walrus::pg::walparser::RmId;
         // Heap record has no block refs in this minimal build → Empty →
         // kept by safe default; verify xact record kept + re-parses clean.
         let r1 = build_record(RmId::Xact as u8, &[0xAA, 0xBB]);
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn manifest_lists_record_offsets() {
-        use pgwalrs::pg::walparser::RmId;
+        use walrus::pg::walparser::RmId;
         let r = build_record(RmId::Xact as u8, &[0u8; 4]);
         let page = build_page_with_records(&[&r]);
         let mut filter = Filter::new();
@@ -228,7 +228,7 @@ mod tests {
     /// scanning past the record.
     #[test]
     fn xlog_switch_record_passes_through_filter() {
-        use pgwalrs::pg::walparser::RmId;
+        use walrus::pg::walparser::RmId;
         const XLOG_SWITCH: u8 = 0x40;
         let before = build_record(RmId::Xact as u8, &[0xDE, 0xAD]);
         let switch_rec = build_record_info(RmId::Xlog as u8, XLOG_SWITCH, &[]);

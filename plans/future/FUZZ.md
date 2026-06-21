@@ -2,7 +2,7 @@
 
 Stand up coverage-guided fuzzing over every byte-parsing surface walshadow
 owns, sized to run unattended on a VM for weeks. Three crates carry untrusted
-input: [`wal-rs`](../../wal-rs) (Postgres WAL off the replication wire),
+input: `wal-rus` (Postgres WAL off the replication wire),
 walshadow itself (record bodies, codecs, cursor/config files), and
 [`clickhouse-c-rs`](../../clickhouse-c-rs) (ClickHouse Native protocol, type
 strings, all crossing into C). Each is a fuzz target tier below.
@@ -43,28 +43,26 @@ for why hand-rolled WAL struct parsers under-read on padding.
 `cargo fuzz` wants a `fuzz/` member crate sitting beside the crate under test.
 Two complications here:
 
-- `wal-rs` is a git submodule (own repo, own `Cargo.toml`, `exclude`d from the
-  top workspace per root `Cargo.toml`). To let it be fuzzed standalone and
-  upstreamed, give it its own `wal-rs/fuzz/` crate
+- `wal-rus` is an external crates.io dependency (own repo, own `Cargo.toml`).
+  Standalone/upstreamable fuzz targets live in its own repo; walshadow's `fuzz/`
+  crate exercises it transitively and via a direct dep
 - `clickhouse-c-rs` is a workspace member and links C via `cc` in its
   `build.rs`. Its fuzz targets need the sanitizer plumbed into the C TU, see
   the C-boundary section
 
-Land two fuzz crates:
+Land one fuzz crate here; standalone wal-rus targets belong upstream in its
+own repo:
 
 ```
 fuzz/                      # walshadow + clickhouse-c-rs targets
-  Cargo.toml               # depends on walshadow (pulls wal-rs + chc transitively)
+  Cargo.toml               # depends on walshadow (pulls wal-rus + chc transitively)
   fuzz_targets/*.rs
   corpus/<target>/
   artifacts/<target>/
-wal-rs/fuzz/               # wal-rs standalone targets (upstreamable)
-  Cargo.toml
-  fuzz_targets/*.rs
 ```
 
-Generate with `cargo +nightly fuzz init` at each root, then
-`cargo +nightly fuzz add <target>`. Both fuzz crates are themselves `exclude`d
+Generate with `cargo +nightly fuzz init` at the fuzz root, then
+`cargo +nightly fuzz add <target>`. The fuzz crate is itself `exclude`d
 from the parent workspace (cargo-fuzz does this automatically) so the stable
 build is untouched.
 
@@ -85,7 +83,7 @@ libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 arbitrary = { version = "1", features = ["derive"] }
 walshadow = { path = ".." }
 clickhouse-c-rs = { path = "../clickhouse-c-rs", default-features = false, features = ["lz4"] }
-pgwalrs = { path = "../wal-rs" }
+wal-rus = "0.1"
 
 [[bin]]
 name = "wal_parse_record"
@@ -98,8 +96,7 @@ doc = false
 Toolchain: `rustup install nightly` + `cargo install cargo-fuzz`. The same C
 deps CI installs (`liblz4-dev libzstd-dev`, see
 [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)) are needed because
-the chc link still pulls lz4/zstd. wal-rs submodule must be initialized
-(deploy-key dance in CI).
+the chc link still pulls lz4/zstd
 
 ## Target inventory
 
@@ -113,10 +110,10 @@ ratio of coverage to effort.
 
 | target | entry | crate | risk |
 |---|---|---|---|
-| `wal_parse_record` | `pgwalrs::pg::walparser::parse_record_from_bytes(data, page_magic)` | wal-rs | HIGH, core XLogRecord header + block headers + FPI metadata |
-| `wal_extract_locations` | `pgwalrs::pg::walparser::extract_block_locations` / `extract_locations_from_wal_file<R: Read>` | wal-rs | HIGH, full-segment walk, integrates lower parsers |
-| `wal_decode_frame` | `pgwalrs::pg::replication::stream::decode_frame(payload)` | wal-rs | MED-HIGH, network-facing `'w'`/`'k'` CopyData frames |
-| `daemon_parse_args` | `pgwalrs::daemon::protocol::parse_args(body)` | wal-rs | MED, length-prefixed arg vector |
+| `wal_parse_record` | `walrus::pg::walparser::parse_record_from_bytes(data, page_magic)` | wal-rus | HIGH, core XLogRecord header + block headers + FPI metadata |
+| `wal_extract_locations` | `walrus::pg::walparser::extract_block_locations` / `extract_locations_from_wal_file<R: Read>` | wal-rus | HIGH, full-segment walk, integrates lower parsers |
+| `wal_decode_frame` | `walrus::pg::replication::stream::decode_frame(payload)` | wal-rus | MED-HIGH, network-facing `'w'`/`'k'` CopyData frames |
+| `daemon_parse_args` | `walrus::daemon::protocol::parse_args(body)` | wal-rus | MED, length-prefixed arg vector |
 | `wal_page_header` | `walshadow::wal_page::parse_page_header(bytes, page_start)` | walshadow | MED, PG15+ page header magic/flag validation |
 | `heap_truncate` | `walshadow::main_data::parse_xl_heap_truncate(md)` | walshadow | MED, array-count loop over relids |
 | `numeric` | `walshadow::codecs::decode_numeric(body)` | walshadow | MED, weight/dscale/ndigits consistency, NaN/±Inf |
@@ -161,7 +158,7 @@ fuzzer drive the body.
   the same `Unstructured` drives tuple bytes. Exercises bitmap walk,
   prefix/suffix compression, dropped-column and varlena arms
   (see [decoder.md](decoder.md))
-- **`wal_parser_stateful`** — `pgwalrs::pg::walparser::WalParser::parse_records_from_page`
+- **`wal_parser_stateful`** — `walrus::pg::walparser::WalParser::parse_records_from_page`
   fed a `Vec<[u8; 8192]>` so continuation-record stitching across page
   boundaries is reachable. Carry the `WalParser` across the vec in one target
   invocation (see [reference: body block ids](reference_walrs_block_ids.md) for
@@ -233,7 +230,7 @@ Coverage-guided fuzzing converges far faster from real inputs than from zero.
   `wal_parser_stateful`, into individual record byte-ranges (via `SegmentWalker`)
   for `wal_parse_record`. `workload.sql` + `capture.sh` regenerate them against
   any PG major if more variety is wanted
-- **Unit-test vectors** embedded in `wal-rs` `parse.rs` tests and
+- **Unit-test vectors** embedded in `wal-rus` `parse.rs` tests and
   `stream.rs` frame tests are hand-built valid/truncated cases, dump them to
   seed files
 - **Codec seeds**: the numeric NaN/±Inf constants, IPv4/IPv6 inet bodies, and
@@ -302,8 +299,7 @@ campaign (that is the VM).
 
 - **Build smoke**, every PR: a `fuzz-build` job on nightly running
   `cargo +nightly fuzz build` for both fuzz crates. Targets that stop compiling
-  (signature drift after a refactor) fail here. Reuse the existing submodule
-  deploy-key + C-deps steps from `ci.yml`
+  (signature drift after a refactor) fail here.
 - **Regression replay**, every PR: run each committed crash artifact through its
   target as a one-shot (`cargo +nightly fuzz run <target> <artifact>`), or add a
   plain `#[test]` that calls the same entry on the saved bytes so it runs in the
@@ -314,7 +310,7 @@ campaign (that is the VM).
 
 ## Phasing
 
-- **P0** — wal-rs `parse_record_from_bytes` + `extract_locations` (Tier A),
+- **P0** — wal-rus `parse_record_from_bytes` + `extract_locations` (Tier A),
   `filter_roundtrip` + `noop_replace` oracles (Tier B). Core replay-safety
   surface, pure Rust, no external deps, runs on the VM immediately
 - **P1** — remaining Tier A (codecs, page header, frame, daemon, truncate) +
@@ -328,16 +324,15 @@ campaign (that is the VM).
 
 - **Nightly only.** ASan/sancov need `-Z` flags; the stable test + coverage jobs
   stay untouched. Edition 2024 needs a recent nightly
-- **C deps + submodule.** Fuzz builds still link lz4/zstd and need the wal-rs
-  submodule initialized, mirror `ci.yml`
+- **C deps + submodule.** Fuzz builds still link lz4/zstd and need the
+  clickhouse-c submodule initialized, mirror `ci.yml`
 - **`decode_heap_record` is not `&[u8]`-shaped**, it takes a `&RelDescriptor`.
   Tier C exists precisely because a naive byte target would reject ~everything
   at the descriptor mismatch
 - **Re-exported paths only.** `parse_record_from_bytes` and
-  `extract_block_locations` are re-exported from `pgwalrs::pg::walparser`;
+  `extract_block_locations` are re-exported from `walrus::pg::walparser`;
   internal helpers (`for_each_block_location_in_record`,
-  `read_xlog_record_header`) live in a private submodule, fuzz them through the
-  public surface
+  `read_xlog_record_header`), fuzz them through the public surface
 - **CRC, not just length.** WAL record validity is a CRC over the body; the
   round-trip oracles must check `compute_crc`, a length-only check passes
   corrupt records (see [filter.md](filter.md))

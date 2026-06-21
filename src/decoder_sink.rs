@@ -257,7 +257,7 @@ impl DecoderStats {
 mod tests {
     use super::*;
     use crate::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
-    use pgwalrs::pg::walparser::RelFileNode;
+    use walrus::pg::walparser::RelFileNode;
 
     fn wrap(decoded: DecodedHeap) -> CommittedTuple {
         CommittedTuple {

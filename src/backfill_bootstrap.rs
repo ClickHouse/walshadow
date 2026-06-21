@@ -27,10 +27,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use pgwalrs::pg::walparser::{Oid, RelFileNode};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_postgres::Client;
+use walrus::pg::walparser::{Oid, RelFileNode};
 
 use crate::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink, PageWalkStats,

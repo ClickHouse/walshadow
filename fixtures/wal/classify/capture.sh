@@ -3,7 +3,7 @@
 #
 # Default image: postgres:16. walshadow operationally supports PG 16+
 # (see PLAN.md "Supported PostgreSQL versions") and tolerates PG 15
-# captures because wal-rs's FPI parser dispatches off magic >= 0xD110.
+# captures because wal-rus's FPI parser dispatches off magic >= 0xD110.
 # PG ≤ 14 captures are rejected by the segment walker.
 #
 # Override with WALSHADOW_PG_IMAGE=postgres:17 / 18 / etc. Set

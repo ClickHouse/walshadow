@@ -10,7 +10,7 @@
 //!
 //! The test issues DDL + DML on source, then forces a `pg_switch_wal()`
 //! to roll a segment boundary so the filter has a full segment to
-//! produce. After segments land, it re-parses one through wal-rs's
+//! produce. After segments land, it re-parses one through wal-rus's
 //! `WalParser` and asserts the manifest agrees with the parser's
 //! record count.
 
@@ -21,10 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use pgwalrs::pg::replication::conn::PgConfig;
-use pgwalrs::pg::replication::tls::SslMode;
-use pgwalrs::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
-use pgwalrs::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walrus::pg::replication::conn::PgConfig;
+use walrus::pg::replication::tls::SslMode;
+use walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
+use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
@@ -243,7 +243,7 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         "manifest record count must match WalParser's count on filtered bytes",
     );
     // RecordSink contract: parsed records arrive at the RecordSink with
-    // their full XLogRecord shape. Prove the wal-rs →
+    // their full XLogRecord shape. Prove the wal-rus →
     // filter_segment → WalStream chain forwards `parsed.header` and
     // `parsed.blocks` rather than the old scalar-only RecordEvent.
     assert!(!records.records.is_empty(), "RecordSink saw zero records");
@@ -560,10 +560,10 @@ fn require_ssl_on_tcp(sh: &Shadow) {
 /// to 127.0.0.1 with `ssl=on` + `hostnossl … reject`, so a successful
 /// `SELECT 1` and a `pg_stat_ssl.ssl=true` reading prove the sidecar
 /// negotiated TLS (not a plain-TCP fallback). Replication-side TLS
-/// rides the same wal-rs `maybe_upgrade` and is covered by
-/// `wal-rs/src/pg/replication/tls.rs::tests`; this test pins the
+/// rides the same wal-rus `maybe_upgrade` and is covered by
+/// `walrus::pg::replication::tls` tests; this test pins the
 /// tokio-postgres-side wiring (`Config::connect_raw(stream, NoTls)`
-/// with the wal-rs-wrapped stream).
+/// with the wal-rus-wrapped stream).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sidecar_sql_client_negotiates_tls_over_tcp() {
     if !pg_available() {

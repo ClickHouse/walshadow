@@ -7,16 +7,16 @@ flags, test coverage, and operational behavior before landing any swap.
 
 ## Highest-leverage candidate: object storage
 
-Evaluate `object_store` as substrate behind existing `wal-rs`
+Evaluate `object_store` as substrate behind existing `wal-rus`
 `Storage` trait.
 
 Today:
 
-* `wal-rs/src/storage/s3.rs` owns SigV4 signing, multipart upload,
+* `walrus::storage::s3` owns SigV4 signing, multipart upload,
   ListObjectsV2 pagination, XML parsing, request retry interaction
-* `wal-rs/src/storage/gcs.rs` owns service-account JWT/OAuth flow,
+* `walrus::storage::gcs` owns service-account JWT/OAuth flow,
   PEM key parsing, REST upload/download/list/delete, token refresh
-* `wal-rs/src/storage/retrying.rs` layers generic storage retries
+* `walrus::storage::retrying` layers generic storage retries
 
 Why replace: S3/GCS auth and request semantics are protocol-heavy,
 security-sensitive, and easy to drift from provider behavior. This is
@@ -25,7 +25,7 @@ generic object-store work, not WAL-domain logic.
 Candidate fit:
 
 * `object_store::ObjectStore` covers put/get/list/delete/head-style
-  operations expected by wal-rs storage
+  operations expected by wal-rus storage
 * crate includes Amazon S3 and Google Cloud Storage builders
 * crate includes retry, multipart, and throttling support
 * existing `Storage` trait can stay as compatibility boundary for
@@ -97,7 +97,7 @@ Evaluation notes:
 Evaluate `governor` if throttling needs precision, fairness, or shared
 budgeting across readers.
 
-Today: `wal-rs/src/throttle.rs` implements an `AsyncRead` wrapper with
+Today: `walrus::throttle` implements an `AsyncRead` wrapper with
 average-rate sleeping after reads.
 
 Why replace: rate limiting is generic, but current implementation is
@@ -142,7 +142,7 @@ Recorded so future readers do not re-litigate these:
   server in tree (`reqwest` is client-only), so a crate means pulling
   `hyper`/`axum` for one endpoint. `prometheus-client` covers encoding
   only; keep serving local until endpoint surface grows
-* Env var parse helpers (`wal-rs/src/config` `parse_env_*`): ~30 lines,
+* Env var parse helpers (`walrus::config` `parse_env_*`): ~30 lines,
   no validation complexity; `envy`/`config` not worth the dependency
 * `RateEstimator` rolling window (`src/metrics.rs`): single use site,
   generic but small

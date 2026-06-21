@@ -16,7 +16,7 @@
 //!    timeline, user tablespace list.
 //! 2. Tablespace symlinks (`pg_tblspc/<oid>`) emit as `FileKind::Symlink`
 //!    before any file under their subtree.
-//! 3. `pg_control` emits last; PG's BASE_BACKUP protocol and wal-rs's
+//! 3. `pg_control` emits last; PG's BASE_BACKUP protocol and wal-rus's
 //!    `list_tar_parts` both honour this, future impls must too.
 //! 4. `finish()` fires after the last `end()`, carrying end_lsn.
 //! 5. Paths are cluster-relative, sanitised against `..` / absolute-root
@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
 
-use pgwalrs::pg::replication::base_backup::Tablespace;
+use walrus::pg::replication::base_backup::Tablespace;
 
 /// Filesystem-object kind. Tar-driven sources translate tar entry types
 /// here; the trait does not expose tar.
@@ -82,8 +82,8 @@ pub enum FileAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntryId(pub u64);
 
-/// Mirrors wal-rs `pg::replication::base_backup::StartInfo` so callers
-/// wired to wal-rs types don't translate.
+/// Mirrors wal-rus `pg::replication::base_backup::StartInfo` so callers
+/// wired to wal-rus types don't translate.
 #[derive(Debug, Clone)]
 pub struct StartInfo {
     pub start_lsn: u64,
@@ -91,7 +91,7 @@ pub struct StartInfo {
     pub tablespaces: Vec<Tablespace>,
 }
 
-/// Mirrors wal-rs's `EndInfo`.
+/// Mirrors wal-rus's `EndInfo`.
 #[derive(Debug, Clone)]
 pub struct EndInfo {
     pub end_lsn: u64,

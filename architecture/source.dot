@@ -28,7 +28,7 @@ digraph source {
   // ════════ ① ingress (pump task) ════════
   subgraph cluster_ingress {
     label="① ingress (pump task, tokio)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    repconn [label="ReplicationConn (wal-rs)\nIDENTIFY_SYSTEM +\nSTART_REPLICATION PHYSICAL\n+ TLS / SCRAM-SHA-256", fillcolor="#3D3D54"];
+    repconn [label="ReplicationConn (wal-rus)\nIDENTIFY_SYSTEM +\nSTART_REPLICATION PHYSICAL\n+ TLS / SCRAM-SHA-256", fillcolor="#3D3D54"];
     feed    [label="SourceFeed::pump\nnext_chunk frame loop,\n'k' keepalive absorb,\n'r' standby status @ 10s", fillcolor="#3D3D54"];
     chunks  [label="WalChunk\n{ start_lsn, server_wal_end,\n  data: &[u8] }", fillcolor="#3D3D54", shape=parallelogram];
     repconn -> feed -> chunks;
@@ -71,7 +71,7 @@ digraph source {
 
   // ════════ ⑤ walsender server (own tokio task) ════════
   subgraph cluster_walsender {
-    label="⑤ walsender server (wal-rs server.rs — own tokio task)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    label="⑤ walsender server (wal-rus server.rs — own tokio task)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     listener [label="accept loop\n127.0.0.1 TCP +\nSO_REUSEADDR / unix\nStartupMessage replication=true\nIDENTIFY_SYSTEM cached", fillcolor="#5D3F40"];
     sendq    [label="WalSenderConn send queue\nper-conn Vec<u8>\n'w' XLogData + 'k' keepalive\nslow-client cutoff", fillcolor="#5D3F40"];
     stat     [label="decode_standby_status\nrx 'r' write/flush/apply\nShadowStreamState aggregate", fillcolor="#5D3F40"];

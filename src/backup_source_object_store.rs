@@ -2,7 +2,7 @@
 //! BASE_BACKUP from a `DynStorage` bucket, decompresses each tar part,
 //! pumps file events through [`BackupSink`].
 //!
-//! Layout (mirrors wal-g, owned by [`pgwalrs::pg::backup`]):
+//! Layout (mirrors wal-g, owned by [`walrus::pg::backup`]):
 //!
 //! ```text
 //! basebackups_005/
@@ -35,12 +35,12 @@ use tokio::sync::Mutex;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
-use pgwalrs::compression;
-use pgwalrs::config::Settings;
-use pgwalrs::pg::backup::fetch::{fetch_sentinel, list_tar_parts};
-use pgwalrs::pg::backup::{BackupSentinelDtoV2, TablespaceSpec, tar_partitions_prefix};
-use pgwalrs::pg::replication::base_backup::Tablespace;
-use pgwalrs::storage::DynStorage;
+use walrus::compression;
+use walrus::config::Settings;
+use walrus::pg::backup::fetch::{fetch_sentinel, list_tar_parts};
+use walrus::pg::backup::{BackupSentinelDtoV2, TablespaceSpec, tar_partitions_prefix};
+use walrus::pg::replication::base_backup::Tablespace;
+use walrus::storage::DynStorage;
 
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo, pump_tar_to_sink};
 
@@ -84,7 +84,7 @@ impl BackupSource for ObjectStoreSource {
             parallelism,
         } = *self;
 
-        let resolved = pgwalrs::pg::backup::fetch::resolve_name(&storage, &backup_name)
+        let resolved = walrus::pg::backup::fetch::resolve_name(&storage, &backup_name)
             .await
             .with_context(|| format!("ObjectStoreSource: resolve {backup_name}"))?;
         tracing::info!(
@@ -175,7 +175,7 @@ impl BackupSource for ObjectStoreSource {
 }
 
 /// Build (start, end) from sentinel fields. Timeline is the backup
-/// name's first 8 hex chars, per wal-rs `format_backup_name`.
+/// name's first 8 hex chars, per wal-rus `format_backup_name`.
 fn build_lsn_pair(resolved_name: &str, s: &BackupSentinelDtoV2) -> Result<(StartInfo, EndInfo)> {
     let start_lsn = s
         .sentinel
@@ -196,14 +196,14 @@ fn build_lsn_pair(resolved_name: &str, s: &BackupSentinelDtoV2) -> Result<(Start
     ))
 }
 
-/// Wraps `pgwalrs::pg::backup::parse_timeline_from_backup_name` with
+/// Wraps `walrus::pg::backup::parse_timeline_from_backup_name` with
 /// error context
 fn parse_timeline_from_name(name: &str) -> Result<u32> {
-    pgwalrs::pg::backup::parse_timeline_from_backup_name(name)
+    walrus::pg::backup::parse_timeline_from_backup_name(name)
         .ok_or_else(|| anyhow!("ObjectStoreSource: cannot parse timeline from backup name: {name}"))
 }
 
-/// `TablespaceSpec` → `Vec<Tablespace>` so StartInfo speaks wal-rs's
+/// `TablespaceSpec` → `Vec<Tablespace>` so StartInfo speaks wal-rus's
 /// protocol shape regardless of source
 fn tablespaces_from_spec(spec: Option<&TablespaceSpec>) -> Vec<Tablespace> {
     let Some(spec) = spec else {
@@ -270,11 +270,11 @@ fn num_cpus_or(fallback: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgwalrs::pg::backup::BackupSentinelDto;
+    use walrus::pg::backup::BackupSentinelDto;
 
     #[test]
     fn timeline_parses_from_backup_name() {
-        let n = pgwalrs::pg::backup::format_backup_name(0x42, 0x0300_0000, 16 * 1024 * 1024);
+        let n = walrus::pg::backup::format_backup_name(0x42, 0x0300_0000, 16 * 1024 * 1024);
         let tli = parse_timeline_from_name(&n).unwrap();
         assert_eq!(tli, 0x42);
     }
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn build_lsn_pair_requires_start_and_end() {
-        let resolved = pgwalrs::pg::backup::format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
+        let resolved = walrus::pg::backup::format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
         let mut s = BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
                 backup_start_lsn: Some(0x0300_0000),

@@ -27,10 +27,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use pgwalrs::pg::replication::conn::PgConfig;
-use pgwalrs::pg::replication::tls::SslMode;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
+use walrus::pg::replication::conn::PgConfig;
+use walrus::pg::replication::tls::SslMode;
 
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{
