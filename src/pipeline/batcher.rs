@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use clickhouse_c::Allocator;
@@ -24,7 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::ch_emitter::{
-    ColumnBuf, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TableMapping, TablePlan,
+    ColumnBuf, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TableMapping, TablePlan,
 };
 use crate::heap_decoder::{CommittedTuple, HeapOp};
 use crate::pipeline::{Fatal, mpmc};
@@ -137,29 +138,31 @@ pub fn spawn(
     cfg: BatcherConfig,
     alloc: Allocator,
     fatal: Fatal,
+    stats: Arc<EmitterStats>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tables: HashMap<String, Table> = HashMap::new();
         let mut epoch: u64 = 0;
         let mut ticker = tokio::time::interval(cfg.flush_timeout);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let stats = stats.as_ref();
         loop {
             tokio::select! {
                 msg = msg_rx.recv() => match msg {
                     Some(BatcherMsg::Row(r)) => {
-                        if let Err(e) = handle_row(&mut tables, &cfg, &out, alloc, epoch, r).await {
+                        if let Err(e) = handle_row(&mut tables, &cfg, &out, alloc, epoch, r, stats).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
                     }
                     Some(BatcherMsg::Rows(rows)) => {
-                        if let Err(e) = handle_rows(&mut tables, &cfg, &out, alloc, epoch, rows).await {
+                        if let Err(e) = handle_rows(&mut tables, &cfg, &out, alloc, epoch, rows, stats).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
                     }
                     Some(BatcherMsg::FlushAll(reply)) => {
-                        if let Err(e) = flush_all(&mut tables, &out, &mut epoch).await {
+                        if let Err(e) = flush_all(&mut tables, &out, &mut epoch, stats).await {
                             fatal.set(format!("batcher barrier flush: {e}"));
                             break;
                         }
@@ -167,14 +170,14 @@ pub fn spawn(
                     }
                     // All senders dropped: final flush
                     None => {
-                        if let Err(e) = flush_all(&mut tables, &out, &mut epoch).await {
+                        if let Err(e) = flush_all(&mut tables, &out, &mut epoch, stats).await {
                             fatal.set(format!("batcher final flush: {e}"));
                         }
                         break;
                     }
                 },
                 _ = ticker.tick() => {
-                    if let Err(e) = flush_due(&mut tables, &out, Instant::now()).await {
+                    if let Err(e) = flush_due(&mut tables, &out, Instant::now(), stats).await {
                         fatal.set(format!("batcher deadline flush: {e}"));
                         break;
                     }
@@ -193,9 +196,10 @@ async fn handle_rows(
     alloc: Allocator,
     epoch: u64,
     rows: Vec<RoutedRow>,
+    stats: &EmitterStats,
 ) -> Result<(), String> {
     for row in rows {
-        handle_row(tables, cfg, out, alloc, epoch, row).await?;
+        handle_row(tables, cfg, out, alloc, epoch, row, stats).await?;
     }
     Ok(())
 }
@@ -207,7 +211,9 @@ async fn handle_row(
     alloc: Allocator,
     epoch: u64,
     row: RoutedRow,
+    stats: &EmitterStats,
 ) -> Result<(), String> {
+    stats.insertbatch_rows_in.fetch_add(1, Ordering::Relaxed);
     let key = row.rel.qualified_name.as_ref();
     if !tables.contains_key(key) {
         let plan = TablePlan::build(alloc, &row.rel, &row.mapping).map_err(|e| e.to_string())?;
@@ -242,14 +248,20 @@ async fn handle_row(
         t.deadline = Some(Instant::now() + cfg.flush_timeout);
     }
     if t.enc.rows >= cfg.row_budget || t.enc.approx_bytes >= cfg.byte_budget {
-        emit_batch(t, out).await?;
+        emit_batch(t, out, stats).await?;
     }
     Ok(())
 }
 
 /// Seal one table's buffered rows into an [`InsertBatch`] and hand to an
-/// inserter. No-op when empty.
-async fn emit_batch(t: &mut Table, out: &mpmc::Sender<InsertBatch>) -> Result<(), String> {
+/// inserter. No-op when empty. Bumps `insertbatch_batches_out` once the batch
+/// is on the inserter channel (the inserter bumps `inserter_batches_in` once it
+/// drains).
+async fn emit_batch(
+    t: &mut Table,
+    out: &mpmc::Sender<InsertBatch>,
+    stats: &EmitterStats,
+) -> Result<(), String> {
     let (buffers, n_rows) = t.enc.take_block().map_err(|e| e.to_string())?;
     t.deadline = None;
     if n_rows == 0 {
@@ -265,17 +277,22 @@ async fn emit_batch(t: &mut Table, out: &mpmc::Sender<InsertBatch>) -> Result<()
     };
     out.send(batch)
         .await
-        .map_err(|_| "inserter queue closed".to_string())
+        .map_err(|_| "inserter queue closed".to_string())?;
+    stats
+        .insertbatch_batches_out
+        .fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 async fn flush_due(
     tables: &mut HashMap<String, Table>,
     out: &mpmc::Sender<InsertBatch>,
     now: Instant,
+    stats: &EmitterStats,
 ) -> Result<(), String> {
     for t in tables.values_mut() {
         if t.enc.rows > 0 && t.deadline.is_some_and(|d| now >= d) {
-            emit_batch(t, out).await?;
+            emit_batch(t, out, stats).await?;
         }
     }
     Ok(())
@@ -287,10 +304,11 @@ async fn flush_all(
     tables: &mut HashMap<String, Table>,
     out: &mpmc::Sender<InsertBatch>,
     epoch: &mut u64,
+    stats: &EmitterStats,
 ) -> Result<(), String> {
     for t in tables.values_mut() {
         if t.enc.rows > 0 {
-            emit_batch(t, out).await?;
+            emit_batch(t, out, stats).await?;
         }
     }
     tables.clear();
@@ -394,6 +412,7 @@ mod tests {
             },
             Allocator::stdlib(),
             fatal.clone(),
+            Arc::new(EmitterStats::default()),
         );
         for id in 0..3 {
             msg_tx
@@ -446,6 +465,7 @@ mod tests {
             },
             Allocator::stdlib(),
             fatal.clone(),
+            Arc::new(EmitterStats::default()),
         );
         let chunk = vec![row(0, 0), row(0, 1), row(0, 2), row(1, 0), row(1, 1)];
         msg_tx
@@ -491,6 +511,7 @@ mod tests {
             },
             Allocator::stdlib(),
             fatal.clone(),
+            Arc::new(EmitterStats::default()),
         );
         msg_tx
             .send(BatcherMsg::Row(row(0, 1)))

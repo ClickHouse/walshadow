@@ -128,6 +128,7 @@ pub async fn spawn(
         },
         Allocator::stdlib(),
         fatal,
+        stats.clone(),
     );
 
     Ok((

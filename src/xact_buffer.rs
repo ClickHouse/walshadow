@@ -40,9 +40,11 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::walparser::RmId;
 
@@ -434,10 +436,182 @@ struct XactState {
     /// source_lsn ASC. Not spilled: events carry rich `RelDescriptor`
     /// data a spill format would duplicate, and DDL per xact is rare
     catalog_events: Vec<(u64, SchemaEvent)>,
+    /// Per-txn `txn` span; duration = WAL-record→durable latency.
+    span: tracing::Span,
+    /// Child of `span` covering first-buffered→COMMIT-observed (parked-for-
+    /// commit wait); closed atop `commit`, so `txn = buffer.wait + commit.drain`.
+    wait_span: tracing::Span,
+}
+
+/// Root `txn` span, opened at `note_popped` so it starts after the pump→worker
+/// wait (kept as `fill_ms`/`queue_ms` tags). `parent: None` forces a root so it
+/// doesn't collapse into the worker's `batch` span.
+fn new_txn_span(xid: u32, first_lsn: u64) -> tracing::Span {
+    tracing::info_span!(
+        target: "walshadow::trace",
+        parent: None,
+        "txn",
+        xid = xid,
+        first_lsn = first_lsn,
+        fill_ms = tracing::field::Empty,
+        queue_ms = tracing::field::Empty,
+        top_xid = tracing::field::Empty,
+        rows = tracing::field::Empty,
+        spilled = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    )
+}
+
+/// Per-xid hand-off of `txn` spans between the pump (registers at first
+/// sighting) and the worker (opens the span at dequeue; buffer then adopts).
+/// Cheap `Arc` clones shared by the pump and [`XactBuffer`].
+struct TxnSpans {
+    /// Root `txn` span; `None` until `note_popped` opens it.
+    txn: Option<tracing::Span>,
+    first_lsn: u64,
+    /// WAL-read instant; with `shipped_at` yields the `fill_ms` tag.
+    read_at: Instant,
+    /// Ship instant (`note_shipped`); yields the `queue_ms` tag.
+    shipped_at: Option<Instant>,
+    /// Clone of `txn` for the first record's `catalog.gate`/`decode`; nulled at
+    /// `adopt` so only the first record carries them.
+    decode_parent: Option<tracing::Span>,
+    /// Head-sampling verdict, decided once at `open`. `false` skips the `txn`
+    /// span and the per-record spans for this xact.
+    sampled: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct TxnSpanRegistry {
+    inner: Arc<std::sync::Mutex<HashMap<u32, TxnSpans>>>,
+}
+
+impl TxnSpanRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `xid`'s trace tree is sampled. `false` for an unknown xid.
+    pub fn is_sampled(&self, xid: u32) -> bool {
+        self.inner
+            .lock()
+            .expect("txn span registry poisoned")
+            .get(&xid)
+            .is_some_and(|e| e.sampled)
+    }
+
+    /// Pump side: register `xid` at first sighting, stamping the WAL-read
+    /// instant for `fill_ms` and taking the head-sampling decision. The `txn`
+    /// span opens later at `note_popped`. No-op for `xid == 0` and for an
+    /// already-registered xid (records 2..N).
+    pub fn open(&self, xid: u32, first_lsn: u64) {
+        if xid == 0 {
+            return;
+        }
+        self.inner
+            .lock()
+            .expect("txn span registry poisoned")
+            .entry(xid)
+            .or_insert_with(|| TxnSpans {
+                txn: None,
+                first_lsn,
+                read_at: Instant::now(),
+                shipped_at: None,
+                decode_parent: None,
+                sampled: crate::trace::should_sample(),
+            });
+    }
+
+    /// Pump-flush side: stamp the ship instant for the `queue_ms` tag.
+    /// Idempotent; no-op for `xid == 0`.
+    pub fn note_shipped(&self, xid: u32) {
+        if xid == 0 {
+            return;
+        }
+        let mut m = self.inner.lock().expect("txn span registry poisoned");
+        let Some(e) = m.get_mut(&xid) else { return };
+        if e.shipped_at.is_none() {
+            e.shipped_at = Some(Instant::now());
+        }
+    }
+
+    /// Worker side: open the `txn` span (recording the transport wait as
+    /// `fill_ms`/`queue_ms`) and stash `decode_parent`. Idempotent; no-op until
+    /// shipped. Returns the head-sampling verdict for gating per-record spans.
+    pub fn note_popped(&self, xid: u32) -> bool {
+        if xid == 0 {
+            return false;
+        }
+        let mut m = self.inner.lock().expect("txn span registry poisoned");
+        let Some(e) = m.get_mut(&xid) else {
+            return false;
+        };
+        if !e.sampled || e.txn.is_some() {
+            return e.sampled;
+        }
+        let Some(shipped) = e.shipped_at else {
+            return true;
+        };
+        let txn = new_txn_span(xid, e.first_lsn);
+        txn.record(
+            "fill_ms",
+            shipped.duration_since(e.read_at).as_secs_f64() * 1e3,
+        );
+        txn.record("queue_ms", shipped.elapsed().as_secs_f64() * 1e3);
+        e.decode_parent = Some(txn.clone());
+        e.txn = Some(txn);
+        true
+    }
+
+    /// Reorder side: clone of the open `txn` span to parent commit spans.
+    /// `None` if never opened (tracing off / unsampled / not yet dequeued).
+    pub fn txn_span(&self, xid: u32) -> Option<tracing::Span> {
+        self.inner
+            .lock()
+            .expect("txn span registry poisoned")
+            .get(&xid)
+            .and_then(|e| e.txn.clone())
+    }
+
+    /// Worker side: hand the `txn` span to the buffer and null `decode_parent`
+    /// so only the first record carries `catalog.gate`/`decode`. `None` if
+    /// never opened — caller falls back to `new_txn_span`.
+    pub fn adopt(&self, xid: u32) -> Option<tracing::Span> {
+        let mut m = self.inner.lock().expect("txn span registry poisoned");
+        let entry = m.get_mut(&xid)?;
+        entry.decode_parent = None;
+        entry.txn.clone()
+    }
+
+    /// Clone of `txn` for the first record's `catalog.gate`/`decode`; `None`
+    /// once adopted, so only the first record gets them.
+    pub fn decode_parent(&self, xid: u32) -> Option<tracing::Span> {
+        self.inner
+            .lock()
+            .expect("txn span registry poisoned")
+            .get(&xid)?
+            .decode_parent
+            .clone()
+    }
+
+    /// Drop the registry's span handles for a finished xact tree at
+    /// commit/abort (buffer's own clones keep the span alive through drain).
+    pub fn prune(&self, xids: &[u32]) {
+        let mut m = self.inner.lock().expect("txn span registry poisoned");
+        for x in xids {
+            m.remove(x);
+        }
+    }
 }
 
 impl XactState {
-    fn new(first_lsn: u64) -> Self {
+    fn new(first_lsn: u64, span: tracing::Span) -> Self {
+        let wait_span = trace_span!(
+            !span.is_none(),
+            parent: &span,
+            "buffer.wait",
+            first_lsn = first_lsn,
+        );
         Self {
             first_lsn,
             in_mem: Vec::new(),
@@ -445,6 +619,8 @@ impl XactState {
             spill: None,
             spill_bytes: 0,
             catalog_events: Vec::new(),
+            span,
+            wait_span,
         }
     }
 }
@@ -511,6 +687,11 @@ pub struct XactBuffer {
     inflight: HashMap<u32, XactState>,
     bytes_in_memory: usize,
     stats: XactBufferStats,
+    /// Shared with the WAL pump: the pump opens a `txn` span here at first
+    /// sighting of an xid, and `absorb` adopts it so the span starts at
+    /// WAL-read rather than at buffering. Empty (and unused) when tracing
+    /// is off — `absorb` then mints its own span.
+    span_registry: TxnSpanRegistry,
 }
 
 impl XactBuffer {
@@ -522,12 +703,20 @@ impl XactBuffer {
             inflight: HashMap::new(),
             bytes_in_memory: 0,
             stats: XactBufferStats::default(),
+            span_registry: TxnSpanRegistry::new(),
         })
     }
 
-    /// Clear leftover spill files from a prior crash. Safe to wipe: cursor
-    /// file guarantees state was drained-to-CH or replayable from
-    /// `decoder_lsn`. Call once before any `on_*`
+    /// Clone of the [`TxnSpanRegistry`] the pump pushes `txn` spans into.
+    /// Wire this into the pump-side record sink so spans open at WAL read.
+    pub fn span_registry(&self) -> TxnSpanRegistry {
+        self.span_registry.clone()
+    }
+
+    /// Clear leftover spill files from a prior crash. Cursor file
+    /// guarantees on-disk state was either drained-to-CH or
+    /// replayable from `decoder_lsn`, so the spill dir is always
+    /// safe to wipe at startup. Caller invokes once before any `on_*`.
     pub async fn clear_spill_dir(&self) -> std::result::Result<(), XactBufferError> {
         self.store.clear().await?;
         Ok(())
@@ -615,10 +804,17 @@ impl XactBuffer {
     /// event lands BEFORE the heap writes that follow it
     pub fn on_schema_event(&mut self, xid: u32, source_lsn: u64, event: SchemaEvent) {
         let is_new = !self.inflight.contains_key(&xid);
-        let st = self
-            .inflight
-            .entry(xid)
-            .or_insert_with(|| XactState::new(source_lsn));
+        let registry = &self.span_registry;
+        let st = self.inflight.entry(xid).or_insert_with(|| {
+            let span = registry.adopt(xid).unwrap_or_else(|| {
+                if registry.is_sampled(xid) {
+                    new_txn_span(xid, source_lsn)
+                } else {
+                    tracing::Span::none()
+                }
+            });
+            XactState::new(source_lsn, span)
+        });
         st.catalog_events.push((source_lsn, event));
         if is_new {
             self.stats.xacts_active += 1;
@@ -634,10 +830,17 @@ impl XactBuffer {
     ) -> std::result::Result<(), XactBufferError> {
         let sz = approximate_size(&entry);
         let is_new = !self.inflight.contains_key(&xid);
-        let st = self
-            .inflight
-            .entry(xid)
-            .or_insert_with(|| XactState::new(first_lsn));
+        let registry = &self.span_registry;
+        let st = self.inflight.entry(xid).or_insert_with(|| {
+            let span = registry.adopt(xid).unwrap_or_else(|| {
+                if registry.is_sampled(xid) {
+                    new_txn_span(xid, first_lsn)
+                } else {
+                    tracing::Span::none()
+                }
+            });
+            XactState::new(first_lsn, span)
+        });
         if let Some(spill) = st.spill.as_mut() {
             // Already spilling: append straight to disk
             spill.write(&entry).await?;
@@ -725,6 +928,8 @@ impl XactBuffer {
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
         xids.push(top_xid);
         xids.extend_from_slice(subxids);
+        // XactState clones carry the span through the drain; just bound the map.
+        self.span_registry.prune(&xids);
         let mut states: Vec<XactState> = Vec::with_capacity(xids.len());
         for x in &xids {
             if let Some(st) = self.inflight.remove(x) {
@@ -747,14 +952,62 @@ impl XactBuffer {
             self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
             return Ok(());
         }
+        // Concurrency at commit time, counted before we tick this xact's
+        // ids back out. A high value sitting next to a long `commit.drain`
+        // is the multi-source-connection head-of-line-blocking signature:
+        // many xacts live, one fat INSERT draining while the rest wait.
+        let xacts_active_at_commit = self.stats.xacts_active;
+        // Active counter ticks down once per drained xact (top + subs).
         for st in &states {
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
 
-        // Spill (older) first, then in-mem: one `source_lsn`-ASC deque
-        // per xid. Catalog events ride a sibling deque (never spilled)
+        // Clone the per-txn span so it survives the `states` drain and stays
+        // open until `outcome` is recorded; `commit.drain` is its child.
+        let txn_span = states
+            .first()
+            .map(|s| s.span.clone())
+            .unwrap_or_else(tracing::Span::none);
+        txn_span.record("top_xid", top_xid);
+        // Close each `buffer.wait`, so it spans exactly first-record → commit.
+        for st in &mut states {
+            st.wait_span = tracing::Span::none();
+        }
+        // Wall-clock age of PG's commit at the moment we process it. The
+        // WAL commit record carries PG's commit timestamp (PG-epoch µs);
+        // shifted to unix µs it's directly comparable to our clock (all
+        // demo containers share the host clock). This is the PG-commit →
+        // walshadow-processes-commit leg — large here means the wait is
+        // upstream (reading WAL / queue backlog), not in our drain.
+        let pg_commit_age_ms = {
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            let commit_unix_us =
+                commit_ts.saturating_add(crate::ch_emitter::DATETIME64_PG_EPOCH_US);
+            (now_us - commit_unix_us) as f64 / 1000.0
+        };
+        let drain_span = trace_span!(
+            !txn_span.is_none(),
+            parent: &txn_span,
+            "commit.drain",
+            top_xid = top_xid,
+            commit_lsn = commit_lsn,
+            subxids = subxids.len(),
+            xacts_active = xacts_active_at_commit,
+            pg_commit_age_ms = pg_commit_age_ms,
+            rows = tracing::field::Empty,
+            spilled = states.iter().any(|s| s.spill.is_some()),
+        );
+
+        // Drain spill files first (older in WAL order) per xid, then
+        // tack on in-mem entries. Result: one `VecDeque<SpillEntry>` per
+        // xid already sorted by `source_lsn` ASC. Catalog events ride a
+        // sibling `VecDeque<(u64, SchemaEvent)>` per xid for the k-way
+        // merge below — they don't spill.
         let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
         let mut per_xid_catalog: Vec<VecDeque<(u64, SchemaEvent)>> =
             Vec::with_capacity(states.len());
@@ -784,6 +1037,18 @@ impl XactBuffer {
         let mut heaps: Vec<DecodedHeap> = Vec::new();
         let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
         let mut ordered_events: Vec<(usize, SchemaEvent)> = Vec::new();
+        // `merge` brackets the (fully synchronous) k-way merge — confirms
+        // it's cheap rather than an O(n²) surprise on subxact-heavy xacts.
+        // Entered only across sync work; dropped before the dispatch awaits
+        // below (an entered guard held across `.await` would be unsound).
+        let merge_guard = trace_span!(
+            !drain_span.is_none(),
+            parent: &drain_span,
+            "merge",
+            xacts = per_xid.len(),
+            entries = per_xid.iter().map(VecDeque::len).sum::<usize>(),
+        )
+        .entered();
         loop {
             #[derive(Clone, Copy)]
             enum Pick {
@@ -829,6 +1094,8 @@ impl XactBuffer {
                 }
             }
         }
+        drop(merge_guard);
+        drain_span.record("rows", heaps.len());
 
         let mut event_cursor = 0usize;
         for (heap_idx, mut heap) in heaps.into_iter().enumerate() {
@@ -837,6 +1104,7 @@ impl XactBuffer {
                 let ev = &ordered_events[event_cursor].1;
                 observer
                     .on_schema_event(ev)
+                    .instrument(drain_span.clone())
                     .await
                     .map_err(|e| XactBufferError::Observer(e.to_string()))?;
                 event_cursor += 1;
@@ -847,8 +1115,12 @@ impl XactBuffer {
                 commit_ts,
                 commit_lsn,
             };
+            // Under `drain_span` so the emitter's `emit.insert` (the
+            // blocking ClickHouse round-trip, sealed on a budget trip or at
+            // xact end) attaches as a child of this transaction's drain.
             observer
                 .on_tuple(&committed)
+                .instrument(drain_span.clone())
                 .await
                 .map_err(|e| XactBufferError::Observer(e.to_string()))?;
         }
@@ -857,6 +1129,7 @@ impl XactBuffer {
             let ev = &ordered_events[event_cursor].1;
             observer
                 .on_schema_event(ev)
+                .instrument(drain_span.clone())
                 .await
                 .map_err(|e| XactBufferError::Observer(e.to_string()))?;
             event_cursor += 1;
@@ -866,10 +1139,24 @@ impl XactBuffer {
         // With CH flush_timeout > 0, on_xact_end returns last durable
         // commit_lsn (<= commit_lsn), so emitter_ack_lsn lags by design
         self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
+        // `ack` covers the durability handshake. In hold-open mode this is
+        // also where a still-open INSERT gets sealed, so `emit.insert` can
+        // appear under it; `held_open` flags an ack that lagged commit_lsn.
+        let ack_span = trace_span!(
+            !drain_span.is_none(),
+            parent: &drain_span,
+            "ack",
+            commit_lsn = commit_lsn,
+            ack_lsn = tracing::field::Empty,
+            held_open = tracing::field::Empty,
+        );
         let ack_lsn = observer
             .on_xact_end(commit_lsn)
+            .instrument(ack_span.clone())
             .await
             .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+        ack_span.record("ack_lsn", ack_lsn);
+        ack_span.record("held_open", ack_lsn < commit_lsn);
         let prev_ack = self.stats.emitter_ack_lsn;
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
         tracing::trace!(
@@ -882,6 +1169,7 @@ impl XactBuffer {
         );
         // One bump per top, not per subxid
         self.stats.committed_xacts_total += 1;
+        txn_span.record("outcome", "committed");
         Ok(())
     }
 
@@ -1043,12 +1331,19 @@ impl XactBuffer {
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
         xids.push(xid);
         xids.extend_from_slice(subxids);
+        // Drop any pump-opened span handles for the aborted tree. The
+        // per-xid XactState (with its own clone) is removed + dropped in
+        // the loop below, closing the span as aborted.
+        self.span_registry.prune(&xids);
 
         let mut any = false;
         for x in xids {
             let Some(mut st) = self.inflight.remove(&x) else {
                 continue;
             };
+            // Close the per-txn span as aborted; nothing ships, so it has
+            // no commit.drain child — just a short span tagged accordingly.
+            st.span.record("outcome", "aborted");
             any = true;
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
@@ -1574,6 +1869,12 @@ pub struct BufferingDecoderSink {
     stats: Arc<DecoderStats>,
     /// `None` keeps the sink schema-unaware (greenfield bootstrap, tests)
     schema_events: Option<SchemaEventRx>,
+    /// `txn` span registry. When set (tracing on), the decoder parents its
+    /// per-record `catalog.gate`/`decode` spans under the xact's `txn` span
+    /// (via `decode_parent`, set only for the first record), so the
+    /// shadow-replay gate shows up nested inside the transaction's span.
+    /// `None` ⇒ those spans are skipped (no parent to attach to).
+    span_registry: Option<TxnSpanRegistry>,
 }
 
 impl BufferingDecoderSink {
@@ -1583,7 +1884,16 @@ impl BufferingDecoderSink {
             buffer,
             stats: Arc::new(DecoderStats::default()),
             schema_events: None,
+            span_registry: None,
         }
+    }
+
+    /// Wire the [`TxnSpanRegistry`] so per-record decode spans nest under the
+    /// xact's `txn` span. Pass the same registry the WAL pump registers xids
+    /// into ([`XactBuffer::span_registry`]).
+    pub fn with_span_registry(mut self, registry: TxnSpanRegistry) -> Self {
+        self.span_registry = Some(registry);
+        self
     }
 
     /// Share the same `rx` with [`XactRecordSink::with_schema_events`]:
@@ -1721,9 +2031,38 @@ impl RecordSink for BufferingDecoderSink {
                     return Ok(());
                 }
             };
+            // `decode_parent` set only for the first record (holds the replay
+            // gate): `catalog.gate` wraps `relation_at`, `decode` the parse.
+            let txn_xid = record.parsed.header.xact_id;
+            let sampled = self
+                .span_registry
+                .as_ref()
+                .is_some_and(|r| r.is_sampled(txn_xid));
+            let decode_parent = self
+                .span_registry
+                .as_ref()
+                .and_then(|r| r.decode_parent(txn_xid));
+            let gate_span = decode_parent
+                .as_ref()
+                .map(|p| {
+                    tracing::info_span!(
+                        target: "walshadow::trace",
+                        parent: p,
+                        "catalog.gate",
+                        lsn = record.source_lsn,
+                    )
+                })
+                .unwrap_or_else(tracing::Span::none);
+            // Per-record sibling of `catalog.gate` for the batch view.
+            let catalog_span = trace_span!(sampled, "catalog", lsn = record.source_lsn);
             let rel = {
                 let mut cat = self.catalog.lock().await;
-                match cat.relation_at(rfn, record.source_lsn).await {
+                match cat
+                    .relation_at(rfn, record.source_lsn)
+                    .instrument(gate_span)
+                    .instrument(catalog_span)
+                    .await
+                {
                     Ok(r) => r,
                     Err(CatalogError::NotFoundByFilenode(_)) => {
                         self.stats
@@ -1743,9 +2082,14 @@ impl RecordSink for BufferingDecoderSink {
             // Empty in steady state
             self.drain_schema_events(record.parsed.header.xact_id, record.source_lsn)
                 .await?;
-            let decoded_set = match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
-                Ok(set) => set,
-                Err(e) => return Err(DecoderSinkError::from(e).into()),
+            let decoded_set = {
+                let _decode = decode_parent.as_ref().map(|p| {
+                    tracing::info_span!(target: "walshadow::trace", parent: p, "decode").entered()
+                });
+                match decode_heap_record(&record.parsed, record.source_lsn, &rel) {
+                    Ok(set) => set,
+                    Err(e) => return Err(DecoderSinkError::from(e).into()),
+                }
             };
             if decoded_set.is_empty() {
                 self.stats
@@ -1753,28 +2097,35 @@ impl RecordSink for BufferingDecoderSink {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(());
             }
-            for decoded in decoded_set {
-                self.stats.record(&decoded);
-                if rel.kind == 't' {
-                    let xid = decoded.xid;
-                    if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
-                        self.stats
-                            .toast_chunks_buffered
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let mut buf = self.buffer.lock().await;
-                        buf.on_toast_chunk(chunk, xid)
-                            .await
-                            .map_err(SinkError::from)?;
+            let n_decoded = decoded_set.len();
+            let buffer_span = trace_span!(sampled, "buffer", rows = n_decoded);
+            async move {
+                for decoded in decoded_set {
+                    self.stats.record(&decoded);
+                    if rel.kind == 't' {
+                        let xid = decoded.xid;
+                        if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
+                            self.stats
+                                .toast_chunks_buffered
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut buf = self.buffer.lock().await;
+                            buf.on_toast_chunk(chunk, xid)
+                                .await
+                                .map_err(SinkError::from)?;
+                        } else {
+                            self.stats
+                                .toast_chunks_malformed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     } else {
-                        self.stats
-                            .toast_chunks_malformed
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut buf = self.buffer.lock().await;
+                        buf.on_heap(decoded).await.map_err(SinkError::from)?;
                     }
-                } else {
-                    let mut buf = self.buffer.lock().await;
-                    buf.on_heap(decoded).await.map_err(SinkError::from)?;
                 }
+                Ok::<(), SinkError>(())
             }
+            .instrument(buffer_span)
+            .await?;
             Ok(())
         })
     }

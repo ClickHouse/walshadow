@@ -14,10 +14,10 @@ write_files:
           email       String,
           _lsn        UInt64,
           _xid        UInt32,
-          _op         Enum8('insert' = 1, 'update' = 2, 'delete' = 3),
-          _commit_ts  DateTime64(6, 'UTC')
+          _commit_ts  DateTime64(6, 'UTC'),
+          _is_deleted Bool
       )
-      ENGINE = ReplacingMergeTree(_lsn)
+      ENGINE = ReplacingMergeTree(_lsn, _is_deleted)
       ORDER BY id;
 runcmd:
   - export DEBIAN_FRONTEND=noninteractive

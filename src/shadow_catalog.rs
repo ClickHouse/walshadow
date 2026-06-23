@@ -33,6 +33,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::types::{Oid, ToSql};
 use tokio_postgres::{Client, NoTls, Row};
+use tracing::Instrument;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::shadow::parse_pg_lsn;
@@ -734,9 +735,25 @@ impl ShadowCatalog {
     ) -> Result<Arc<RelDescriptor>> {
         self.drain_invalidations();
         if at_lsn > 0 {
-            self.wait_for_replay(at_lsn).await?;
-            // Re-check: a concurrent DDL may have bumped the epoch while
-            // wait_for_replay yielded
+            // `replay.wait` — the poll loop blocking on the shadow PG
+            // replaying up to `at_lsn`. Nests under `catalog.gate` when
+            // the decoder instruments this call; this is where a stalled
+            // shadow shows up (up to the 30s replay timeout). `target_lsn`
+            // is the LSN we need; `replay_lsn` is where the shadow actually
+            // is once the wait returns (== target on the cached fast path).
+            let replay_span = trace_span!(
+                !tracing::Span::current().is_none(),
+                "replay.wait",
+                target_lsn = at_lsn,
+                replay_lsn = tracing::field::Empty,
+            );
+            let replayed = self
+                .wait_for_replay(at_lsn)
+                .instrument(replay_span.clone())
+                .await?;
+            replay_span.record("replay_lsn", replayed);
+            // Re-check after the await: a DDL observed concurrently can
+            // have bumped the epoch while wait_for_replay yielded.
             self.drain_invalidations();
         }
         if let Some(entry) = self.by_filenode.get(&rfn)
@@ -746,8 +763,17 @@ impl ShadowCatalog {
             return Ok(entry.desc.clone());
         }
         self.stats.misses += 1;
+        // `descriptor.fetch` — the pg_class/pg_attribute round-trip to the
+        // shadow PG, only on a cache miss. Sibling of `replay.wait`.
         let desc = self
             .fetch_by_filenode(rfn)
+            .instrument(trace_span!(
+                !tracing::Span::current().is_none(),
+                "descriptor.fetch",
+                spc_node = rfn.spc_node,
+                db_node = rfn.db_node,
+                rel_node = rfn.rel_node,
+            ))
             .await?
             .ok_or(CatalogError::NotFoundByFilenode(rfn))?;
         Ok(self.insert(desc))

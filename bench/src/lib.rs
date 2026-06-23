@@ -88,6 +88,8 @@ pub struct SustainedParams {
     pub duration_secs: u64,
     pub probe_every: u64,
     pub concurrency: u64,
+    /// Rows per multi-row INSERT/COMMIT; 0 or 1 = single-row commits.
+    pub rows_per_xact: u64,
     pub poll_interval_ms: u64,
     pub row_timeout_ms: u64,
     pub id_base: i64,
@@ -215,8 +217,9 @@ pub struct CommonArgs {
     /// Long transactions each thread runs back-to-back.
     #[arg(long, default_value_t = 1)]
     pub rounds: u64,
-    /// Rows per transaction. If > 0, each xact inserts exactly this many rows
-    /// then commits (overrides --xact-secs).
+    /// Rows per transaction. Interleaved: if > 0, each xact inserts exactly this
+    /// many rows then commits (overrides --xact-secs). Sustained: rows per
+    /// multi-row INSERT/COMMIT (0 or 1 = single-row commits).
     #[arg(long, default_value_t = 0)]
     pub rows_per_xact: u64,
     /// How long each transaction stays open before COMMIT (when
@@ -272,6 +275,7 @@ pub async fn dispatch(c: &CommonArgs, pg_host: String, dest_host: String) -> Res
         duration_secs: c.duration_secs,
         probe_every: c.probe_every,
         concurrency: c.concurrency,
+        rows_per_xact: c.rows_per_xact,
         poll_interval_ms: c.poll_interval_ms,
         row_timeout_ms: c.row_timeout_ms,
         id_base: c.id_base,
@@ -421,8 +425,12 @@ pub async fn run_sustained(
     let base = p.id_base + 1_000_000;
     let concurrency: i64 = p.concurrency.max(1) as i64;
     println!(
-        "── sustained load: target {} rows/s for {}s across {} conn(s) (probe every {} rows) ──",
-        p.rate, p.duration_secs, concurrency, p.probe_every
+        "── sustained load: target {} rows/s for {}s across {} conn(s), {} row(s)/txn (probe every {} rows) ──",
+        p.rate,
+        p.duration_secs,
+        concurrency,
+        p.rows_per_xact.max(1),
+        p.probe_every
     );
 
     // One Postgres connection per inserter worker so inserts run in parallel —
@@ -445,30 +453,44 @@ pub async fn run_sustained(
     let duration = Duration::from_secs(p.duration_secs);
     let probe_every: i64 = p.probe_every.max(1) as i64;
     let per_worker_rate = (p.rate.max(1) as f64 / concurrency as f64).max(f64::MIN_POSITIVE);
+    let rows_per_txn: i64 = p.rows_per_xact.max(1) as i64;
     let mut handles = Vec::with_capacity(concurrency as usize);
     for (w, conn) in (0i64..).zip(conns) {
         let tx = tx.clone();
         let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / per_worker_rate));
+            // Tick once per transaction; each inserts `rows_per_txn` rows, so
+            // the row rate stays `rate` and the txn rate is rate/rows_per_txn.
+            let txn_interval = Duration::from_secs_f64(rows_per_txn as f64 / per_worker_rate);
+            let mut tick = tokio::time::interval(txn_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
             let start = Instant::now();
             let mut k: i64 = 0;
             let mut last_id: Option<i64> = None;
+            let mut rows_since_probe: i64 = 0;
             while start.elapsed() < duration {
                 tick.tick().await;
-                let id = base + k * concurrency + w;
-                conn.insert_row(id)
-                    .await
-                    .with_context(|| format!("sustained insert id={id}"))?;
-                if k % probe_every == 0 {
-                    let _ = tx.send((id, Instant::now()));
+                let mut ids = Vec::with_capacity(rows_per_txn as usize);
+                for _ in 0..rows_per_txn {
+                    ids.push(base + k * concurrency + w);
+                    k += 1;
                 }
+                conn.insert_txn(&ids).await.with_context(|| {
+                    format!("sustained insert txn ending id={}", ids.last().unwrap())
+                })?;
+                let commit_at = Instant::now();
+                let id = *ids.last().expect("rows_per_xact >= 1");
                 last_id = Some(id);
-                k += 1;
+                rows_since_probe += rows_per_txn;
+                // One probe per ~probe_every rows; all rows in this txn share
+                // its commit, so the last id stands in for the txn.
+                if rows_since_probe >= probe_every {
+                    let _ = tx.send((id, commit_at));
+                    rows_since_probe = 0;
+                }
             }
-            // Always probe this worker's final row so the drain tail shows.
+            // Probe this worker's final txn so the drain tail shows.
             if let Some(id) = last_id
-                && (k - 1) % probe_every != 0
+                && rows_since_probe != 0
             {
                 let _ = tx.send((id, Instant::now()));
             }
@@ -511,13 +533,23 @@ pub async fn run_sustained(
     }
     let insert_secs = insert_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     let achieved_rate = rows_inserted as f64 / insert_secs;
-    let drain_ms =
-        last_visible.map(|seen| seen.saturating_duration_since(wall_start).as_secs_f64() * 1000.0);
+    // End-to-end span: first insert (wall_start) → last probed row visible in
+    // CH. rows / that = the rate rows actually reached ClickHouse, including
+    // any drain past the insert window. If the daemon keeps up it ≈ the insert
+    // rate; if it falls behind, it's lower (the drain tail stretches the span).
+    let ch_secs = last_visible.map(|seen| seen.saturating_duration_since(wall_start).as_secs_f64());
+    let drain_ms = ch_secs.map(|s| s * 1000.0);
 
     println!("  rows inserted:        {rows_inserted}");
     println!("  insert window:        {insert_secs:.1}s");
     println!("  target insert rate:   {} rows/s", p.rate);
     println!("  achieved insert rate: {achieved_rate:.0} rows/s");
+    if let Some(s) = ch_secs.filter(|s| *s > 0.0) {
+        println!(
+            "  ClickHouse ingest:    {:.0} rows/s ({rows_inserted} rows in {s:.1}s end-to-end)",
+            rows_inserted as f64 / s
+        );
+    }
     Summary::from(&mut samples_ms).print("under-load latency (ms)");
     if let Some(d) = drain_ms {
         println!("  last-probe visible at: {d:.0}ms into the run");
@@ -720,6 +752,35 @@ impl PgClient {
         self.client
             .execute(&self.insert_sql, &[&id, &name, &email])
             .await?;
+        Ok(())
+    }
+
+    /// Insert every id in one multi-row `INSERT` — a single implicit
+    /// transaction, so all rows share one COMMIT (and one commit LSN).
+    pub async fn insert_txn(&self, ids: &[i64]) -> Result<()> {
+        if ids.len() == 1 {
+            return self.insert_row(ids[0]).await;
+        }
+        let mut sql = format!("INSERT INTO {} (id, name, email) VALUES ", self.table);
+        let mut names: Vec<String> = Vec::with_capacity(ids.len());
+        let mut emails: Vec<String> = Vec::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            let b = i * 3;
+            sql.push_str(&format!("(${}, ${}, ${})", b + 1, b + 2, b + 3));
+            names.push(format!("bench-{id}"));
+            emails.push(format!("bench-{id}@lat"));
+        }
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            Vec::with_capacity(ids.len() * 3);
+        for i in 0..ids.len() {
+            params.push(&ids[i]);
+            params.push(&names[i]);
+            params.push(&emails[i]);
+        }
+        self.client.execute(&sql, &params).await?;
         Ok(())
     }
 

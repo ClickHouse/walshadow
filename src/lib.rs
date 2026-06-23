@@ -7,6 +7,18 @@
 //! reverting to greenfield. `xact_buffer` is backed by an append-only
 //! per-xid `spill` file.
 
+/// `info_span!(target: "walshadow::trace", …)` when `$on`, else a no-op span
+/// (fields unevaluated on the unsampled path).
+macro_rules! trace_span {
+    ($on:expr, $($span:tt)+) => {
+        if $on {
+            tracing::info_span!(target: "walshadow::trace", $($span)+)
+        } else {
+            tracing::Span::none()
+        }
+    };
+}
+
 #[macro_use]
 pub mod atomic_stats;
 pub mod backfill_bootstrap;
@@ -44,6 +56,7 @@ pub mod source_feed;
 pub mod spill;
 pub mod streaming_walker;
 pub mod toast;
+pub mod trace;
 pub mod type_bridge;
 pub mod wal_page;
 pub mod wal_stream;

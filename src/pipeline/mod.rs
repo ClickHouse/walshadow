@@ -30,7 +30,7 @@ use crate::ch_ddl::DdlApplicator;
 use crate::ch_emitter::{EmitterConfig, EmitterError, EmitterStats, MappingHandle, TableMapping};
 use crate::oracle::Oracle;
 use crate::shadow_catalog::ShadowCatalog;
-use crate::xact_buffer::{SchemaEventRx, SubxactTracker, XactBuffer};
+use crate::xact_buffer::{SchemaEventRx, SubxactTracker, TxnSpanRegistry, XactBuffer};
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls
 /// [`Fatal::message`] to exit with the root cause; the DDL barrier `select`s
@@ -120,6 +120,9 @@ pub struct PipelineConfig {
     pub schema_events: Option<SchemaEventRx>,
     pub pg_class_delete_epoch: Option<Arc<AtomicU64>>,
     pub stats: Arc<EmitterStats>,
+    /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
+    /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
+    pub span_registry: Option<TxnSpanRegistry>,
 }
 
 /// Spawned-stage join handles + shared signals. The daemon drives the
@@ -172,6 +175,7 @@ impl PipelineConfig {
             schema_events,
             pg_class_delete_epoch,
             stats,
+            span_registry,
         } = self;
         let m = decoder_pool_size.max(1);
         let fatal = Fatal::new();
@@ -219,6 +223,7 @@ impl PipelineConfig {
             stats,
             resolver,
             fatal.clone(),
+            span_registry,
         );
 
         Ok((

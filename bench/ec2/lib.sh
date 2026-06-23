@@ -138,7 +138,7 @@ provision_node() {
   local name="${NODE_NAME:?node.env must set NODE_NAME}"
   local key="${KEY_NAME:-$name}"
   local itype="${INSTANCE_TYPE:-c8i.2xlarge}"
-  local vol="${VOLUME_SIZE:-20}"
+  local vol="${VOLUME_SIZE:-100}"
   local pem="./${key}.pem"
   local state="./state.env"
 

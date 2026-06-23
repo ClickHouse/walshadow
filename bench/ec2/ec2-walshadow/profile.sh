@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
-# On-CPU profile of walshadow for N seconds (default 120), in the background,
-# then return — run just before the benchmark so the capture covers it. Scoped
-# to the walshadow container's processes (NOT system-wide):
-#   * perf → every process in the `walshadow` container (the walshadow-stream
-#            daemon + the auto-spawned shadow Postgres) → /opt/profile/perf-<ts>.data
-#   * eBPF (bcc) → the walshadow-stream daemon (the decode/insert engine; bcc
-#            profiles one process) → /opt/profile/oncpu-walshadow-<ts>.folded
-# teardown.sh copies /opt/profile back to this machine.
-#
-# Usage: ./profile.sh [seconds]
-# Note: tools are installed by cloud-init.
+# Background on-CPU profile (perf over the container, eBPF over walshadow-stream)
+# for N seconds. Usage: ./profile.sh [seconds]
 set -euo pipefail
 cd "$(dirname "$0")"
 source ../aws-env.sh
@@ -28,19 +19,23 @@ OUT=/opt/profile
 sudo install -d -o ubuntu "$OUT"
 sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null 2>&1 || true
 
-# Host PIDs of every process in the walshadow container (docker top shows host
-# PIDs); falls back to pgrep. Covers walshadow-stream + the shadow Postgres.
 PIDS=$(sudo docker top walshadow -eo pid --no-headers 2>/dev/null | awk '{print $1}' | paste -sd,)
 [ -n "$PIDS" ] || PIDS=$(sudo pgrep -f 'walshadow-stream|postgres' 2>/dev/null | paste -sd,)
 [ -n "$PIDS" ] || { echo "no walshadow processes found — is the daemon up?" >&2; exit 1; }
-# The walshadow-stream daemon (decode/insert engine) for the single-PID eBPF profiler.
 WS=$(sudo pgrep -f 'walshadow-stream' 2>/dev/null | head -1 || true)
 [ -n "$WS" ] || WS=$(sudo docker inspect -f '{{.State.Pid}}' walshadow 2>/dev/null || true)
-echo "walshadow pids (perf): $PIDS    walshadow-stream pid (eBPF): ${WS:-none}"
+{ [ -n "$WS" ] && sudo test -d "/proc/$WS"; } \
+  || { echo "walshadow-stream daemon not running — nothing to profile (is the walshadow container up?)" >&2; exit 1; }
+echo "walshadow pids (perf): $PIDS    walshadow-stream pid (eBPF): $WS"
 
 sudo nohup bash -c "
-  { [ -n \"$WS\" ] && profile-bpfcc -F 99 -f -p $WS $DUR > $OUT/oncpu-walshadow-$TS.folded 2>$OUT/oncpu-$TS.log ; } &
-  perf record -F 99 -g -p $PIDS -o $OUT/perf-$TS.data -- sleep $DUR 2>>$OUT/perf-$TS.log \
+  profile-bpfcc -F 99 -f -p $WS $DUR > $OUT/oncpu-walshadow-$TS.folded 2>$OUT/oncpu-$TS.log &
+  # Re-filter to live PIDs: perf -p aborts the record if any one has exited.
+  LIVE=\"\"; for x in \$(echo '$PIDS' | tr ',' ' '); do [ -d /proc/\$x ] && LIVE=\"\$LIVE,\$x\"; done; LIVE=\${LIVE#,}
+  # DWARF unwinding (musl build, no frame pointers); --no-buildid* avoids
+  # finalization that fails on this host.
+  perf record -F 99 --call-graph dwarf,65528 -m 64M --no-buildid --no-buildid-cache \
+    -p \"\$LIVE\" -o $OUT/perf-$TS.data -- sleep $DUR 2>>$OUT/perf-$TS.log \
     || echo 'perf record failed (see log)' >>$OUT/perf-$TS.log
   wait
   chown -R ubuntu $OUT
