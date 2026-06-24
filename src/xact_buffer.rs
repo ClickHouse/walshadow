@@ -1538,14 +1538,10 @@ fn first_missing_seq(p: &ToastPointer, maps: &[&ChunkMap]) -> u32 {
     }
 }
 
-/// PG `VARLENA_EXTSIZE_BITS`, `src/include/varatt.h`
-const VARLENA_EXTSIZE_BITS: u32 = 30;
-const VARLENA_EXTSIZE_MASK: u32 = (1u32 << VARLENA_EXTSIZE_BITS) - 1;
+use crate::heap_decoder::{VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena};
+
 /// PG `VARHDRSZ`, 4-byte varlena header
 const VARHDRSZ: i32 = 4;
-
-const TOAST_COMPRESSION_PGLZ: u8 = 0;
-const TOAST_COMPRESSION_LZ4: u8 = 1;
 
 /// Concatenate a value's chunks (seq 0..N dense) then decompress per the
 /// pointer's method. Looks the value up across `maps` in order (in-xact
@@ -1575,21 +1571,11 @@ pub(crate) fn try_reassemble(
     }
     let method = ((p.va_extinfo >> VARLENA_EXTSIZE_BITS) & 0x3) as u8;
     let raw_len = (p.va_rawsize - VARHDRSZ).max(0) as usize;
-    match method {
-        TOAST_COMPRESSION_PGLZ => {
-            let mut out = vec![0u8; raw_len];
-            let n = pglz::decompress_into(&concat, &mut out, true)
-                .ok_or_else(|| XactBufferError::Detoast("pglz: stream truncated/corrupt".into()))?;
-            out.truncate(n);
-            Ok(Some(out))
-        }
-        TOAST_COMPRESSION_LZ4 => {
-            let out = lz4_flex::decompress(&concat, raw_len)
-                .map_err(|e| XactBufferError::Detoast(format!("lz4: {e}")))?;
-            Ok(Some(out))
-        }
-        other => Err(XactBufferError::Detoast(format!(
-            "unknown compression method {other}"
+    match decompress_varlena(method, &concat, raw_len) {
+        Some(out) => Ok(Some(out)),
+        None => Err(XactBufferError::Detoast(format!(
+            "decompress failed (method {method}, {} bytes → {raw_len})",
+            concat.len()
         ))),
     }
 }
@@ -2190,6 +2176,51 @@ mod tests {
     use crate::heap_decoder::{DecodedTuple, HeapOp};
     use tempfile::tempdir;
     use walrus::pg::walparser::RelFileNode;
+
+    #[test]
+    fn xact_buffer_config_new_uses_default_max() {
+        let c = XactBufferConfig::new(PathBuf::from("/tmp/walshadow-test-spill"));
+        assert_eq!(c.xact_buffer_max, DEFAULT_XACT_BUFFER_MAX);
+    }
+
+    #[test]
+    fn txn_span_registry_full_lifecycle() {
+        crate::trace::set_sample_ratio(1.0);
+        let reg = TxnSpanRegistry::new();
+
+        reg.open(0, 1);
+        reg.note_shipped(0);
+        assert!(!reg.note_popped(0));
+        assert!(!reg.is_sampled(0));
+
+        reg.open(42, 100);
+        assert!(reg.is_sampled(42));
+        assert!(reg.note_popped(42));
+        assert!(reg.txn_span(42).is_none());
+
+        reg.note_shipped(42);
+        assert!(reg.note_popped(42));
+        assert!(reg.txn_span(42).is_some());
+        assert!(reg.decode_parent(42).is_some());
+
+        assert!(reg.adopt(42).is_some());
+        assert!(reg.decode_parent(42).is_none());
+        assert!(reg.adopt(999).is_none());
+
+        reg.prune(&[42]);
+        assert!(reg.txn_span(42).is_none());
+        assert!(!reg.is_sampled(42));
+    }
+
+    #[test]
+    fn xact_buffer_exposes_span_registry() {
+        crate::trace::set_sample_ratio(1.0);
+        let tmp = tempdir().unwrap();
+        let buf = XactBuffer::new(XactBufferConfig::new(tmp.path().to_path_buf())).unwrap();
+        let reg = buf.span_registry();
+        reg.open(7, 1);
+        assert!(reg.is_sampled(7));
+    }
 
     fn cfg(dir: PathBuf) -> XactBufferConfig {
         XactBufferConfig {

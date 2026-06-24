@@ -71,7 +71,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             postgresql-${{ matrix.pg-major }} \
             postgresql-client-${{ matrix.pg-major }} \
-            postgresql-server-dev-${{ matrix.pg-major }}
+            postgresql-server-dev-${{ matrix.pg-major }} \
+            postgresql-${{ matrix.pg-major }}-pgvector
           sudo systemctl stop postgresql 2>/dev/null || true
           PG_BIN=/usr/lib/postgresql/${{ matrix.pg-major }}/bin
           "$PG_BIN/postgres" -V
@@ -125,9 +126,25 @@ jobs:
           fixtures/wal/xlog_switch/capture.sh
           fixtures/wal/vacuum_full_pg_depend/capture.sh
 
+      # Install the walshadow extension before the e2e suite so each shadow PG
+      # can CREATE EXTENSION walshadow for the oracle decode path.
+      - name: Build + install walshadow extension (e2e oracle path)
+        working-directory: walshadow/pgext
+        run: |
+          PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg-major }}/bin/pg_config
+          make PG_CONFIG=$PG_CONFIG
+          sudo make PG_CONFIG=$PG_CONFIG install
+
       - name: Build (workspace + tests)
         working-directory: walshadow
         run: cargo build --workspace --all-targets --locked
+
+      # Each e2e test stages a source + shadow PG cluster on disk; the
+      # runner's root fs is small, so point TMPDIR at the larger /mnt volume.
+      - name: Set TMPDIR to /mnt
+        run: |
+          sudo mkdir -p /mnt/tmp && sudo chmod 1777 /mnt/tmp
+          echo "TMPDIR=/mnt/tmp" >> "$GITHUB_ENV"
 
       # All e2e tests run: shadow_lifecycle, shadow_catalog, catalog_seed,
       # wal_stream_e2e (need initdb), classify_fixture + filter_round_trip
@@ -241,7 +258,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            postgresql-17 postgresql-client-17
+            postgresql-17 postgresql-client-17 \
+            postgresql-server-dev-17 postgresql-17-pgvector
           sudo systemctl stop postgresql 2>/dev/null || true
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
@@ -280,6 +298,22 @@ jobs:
           fixtures/wal/filter/capture.sh
           fixtures/wal/xlog_switch/capture.sh
           fixtures/wal/vacuum_full_pg_depend/capture.sh
+
+      # Install the walshadow extension before the instrumented suite so the
+      # oracle-path tests run instead of skipping.
+      - name: Build + install walshadow extension (e2e oracle path)
+        working-directory: walshadow/pgext
+        run: |
+          PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+          make PG_CONFIG=$PG_CONFIG
+          sudo make PG_CONFIG=$PG_CONFIG install
+
+      # Each e2e test stages a source + shadow PG cluster on disk; the
+      # runner's root fs is small, so point TMPDIR at the larger /mnt volume.
+      - name: Set TMPDIR to /mnt
+        run: |
+          sudo mkdir -p /mnt/tmp && sudo chmod 1777 /mnt/tmp
+          echo "TMPDIR=/mnt/tmp" >> "$GITHUB_ENV"
 
       # Single `--no-report` test pass so cargo only instruments &
       # executes the suite once; subsequent `report` invocations re-read

@@ -21,6 +21,9 @@ components. Future-work proposals live under [future/](future/INDEX.md)
   read-time defaults
 - [xact.md](xact.md) — `XactBuffer`, `SubxactTracker`, TOAST
   reassembly, local-disk spill, `DrainEntry` ordering
+- [TOAST.md](TOAST.md) — full TOAST chunk store (`disabled`/`disk`/
+  `clickhouse`), bootstrap tap + defer-resolve, pre-window miss→fetch;
+  deferred R1 JOIN mode, chunk GC, streaming reassembly
 - [emitter.md](emitter.md) — parallel decode+insert pipeline
   (reorder → decode ×M → batcher → inserter ×N → ack watermark),
   `type_bridge`, synthetic columns, `DdlApplicator`, barrier fence

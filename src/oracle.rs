@@ -240,15 +240,15 @@ async fn probe_extension(client: &Client) -> Result<bool, OracleError> {
 /// writes raw bytes via `encode_value`.
 pub async fn resolve_pending_tuple(oracle: &Oracle, columns: &mut [Option<ColumnValue>]) {
     for col in columns.iter_mut() {
-        if let Some(ColumnValue::PgPending { type_oid, raw }) = col {
-            match oracle.resolve_pending(*type_oid, raw).await {
-                Ok(Some(s)) => {
-                    *col = Some(ColumnValue::Text(s));
-                }
-                _ => {
-                    // fall back: leave PgPending, emitter writes raw bytes
-                }
+        let resolved = match col {
+            Some(ColumnValue::PgPending { type_oid, raw })
+            | Some(ColumnValue::Unsupported { type_oid, raw }) => {
+                oracle.resolve_pending(*type_oid, raw.as_slice()).await
             }
+            _ => continue,
+        };
+        if let Ok(Some(s)) = resolved {
+            *col = Some(ColumnValue::Text(s));
         }
     }
 }

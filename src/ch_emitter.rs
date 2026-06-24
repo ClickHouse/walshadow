@@ -39,7 +39,10 @@ use crate::shadow_catalog::{CatalogError, RelDescriptor};
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
 /// epoch. CH `DateTime64(6)` is Unix microseconds; PG commit-record
 /// `xact_time` and tuple `TimestampTz` are PG-epoch microseconds.
-pub const DATETIME64_PG_EPOCH_US: i64 = 946_684_800_000_000;
+pub const DATETIME64_PG_EPOCH_US: i64 = walrus::pg::replication::PG_EPOCH_USEC;
+
+/// Days between PG `date` epoch (2000-01-01) and the Unix epoch.
+pub const DATE32_PG_EPOCH_DAYS: i32 = (DATETIME64_PG_EPOCH_US / 1_000_000 / 86_400) as i32;
 
 /// Heap op codes for [`TableEncoder::append_row`]; `OP_DELETE` sets `_is_deleted`
 pub const OP_INSERT: i8 = 1;
@@ -143,6 +146,10 @@ pub struct EmitterConfig {
     /// Where externally-TOASTed chunks live + miss policy. `[toast]` block;
     /// default disabled (NULL/default-fill unrecoverable values)
     pub toast: crate::toast::ToastConfig,
+    /// Rows a decode worker coalesces before routing one chunk to the
+    /// batcher (`crate::pipeline::decode::DECODE_CHUNK_ROWS`). Tunable so
+    /// tests can trip the mid-loop flush without a huge xact.
+    pub decode_chunk_rows: usize,
 }
 
 pub const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
@@ -188,6 +195,7 @@ impl Default for EmitterConfig {
             insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
             soft_delete: false,
             toast: crate::toast::ToastConfig::default(),
+            decode_chunk_rows: crate::pipeline::decode::DECODE_CHUNK_ROWS,
         }
     }
 }
@@ -1170,7 +1178,10 @@ fn encode_value(
         ColumnValue::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ColumnValue::Date(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        // saturating so PG ±infinity dates don't overflow
+        ColumnValue::Date(n) => {
+            buf.append_fixed_bytes(&n.saturating_add(DATE32_PG_EPOCH_DAYS).to_le_bytes())
+        }
         // `time` → `Time64(6)`: microseconds since midnight, no epoch offset
         ColumnValue::Time(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
         ColumnValue::Timestamp(n) | ColumnValue::TimestampTz(n) => {
@@ -1182,7 +1193,7 @@ fn encode_value(
         ColumnValue::TimeTz { micros, tz_seconds } => {
             buf.append_string_bytes(crate::codecs::timetz_to_text(*micros, *tz_seconds).as_bytes())
         }
-        ColumnValue::Uuid(b) => buf.append_fixed_bytes(b),
+        ColumnValue::Uuid(b) => buf.append_fixed_bytes(&crate::codecs::uuid_to_ch_wire(b)),
         ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => {
             buf.append_string_bytes(s.as_bytes())
         }

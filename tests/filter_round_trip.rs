@@ -297,3 +297,32 @@ async fn writes_filtered_segment_and_manifest_via_cli() {
             .expect("read manifest");
     assert!(!manifest["records"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn cli_prints_stats_line_without_quiet() {
+    let seg = fixture_segment();
+    if !seg.exists() {
+        eprintln!("skip: no captured segment at {:?}", seg);
+        return;
+    }
+    let out_dir = tempfile::tempdir().unwrap();
+    let exe = env!("CARGO_BIN_EXE_walshadow-filter");
+    let out = Command::new(exe)
+        .arg("--in")
+        .arg(&seg)
+        .arg("--out-dir")
+        .arg(out_dir.path())
+        .output()
+        .expect("run walshadow-filter");
+    assert!(
+        out.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("filtered"),
+        "expected stats line, got {stderr:?}"
+    );
+    assert!(stderr.contains("records"), "got {stderr:?}");
+}

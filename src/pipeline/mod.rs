@@ -207,6 +207,7 @@ impl PipelineConfig {
             msg_tx: msg_tx.clone(),
             stats: stats.clone(),
             resolver: resolver.clone(),
+            chunk_rows: emitter.decode_chunk_rows,
         };
         let decoders = decode::spawn_pool(m, ctx, jobs_rx, ack.clone(), fatal.clone());
 

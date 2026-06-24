@@ -31,6 +31,8 @@ const SOURCE_PORT_A: u16 = 56301;
 const SHADOW_PORT_A: u16 = 56302;
 const SOURCE_PORT_B: u16 = 56303;
 const SHADOW_PORT_B: u16 = 56304;
+const SOURCE_PORT_C: u16 = 56305;
+const SHADOW_PORT_C: u16 = 56306;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -184,6 +186,70 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
         has_nothing,
         "expected BadReplicaIdentity for s10.t_nothing got 'n' in {:?}",
         report.errors,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preflight_rejects_old_version_missing_slot_and_unknown_rel() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = make_pg(&tmp, "src-old", SOURCE_PORT_C);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("source base conf");
+    append_conf(&source, "logical");
+    source.start().expect("start source");
+    let _src_stop = StopOnDrop { sh: &source };
+
+    let shadow = make_pg(&tmp, "shd-old", SHADOW_PORT_C);
+    shadow.initdb().expect("initdb shadow");
+    shadow.write_base_conf().expect("shadow base conf");
+    shadow.start().expect("start shadow");
+    let _shd_stop = StopOnDrop { sh: &shadow };
+
+    let src_sql = connect_sql(&source.config().socket_dir, SOURCE_PORT_C)
+        .await
+        .expect("source sql");
+    let shd_sql = connect_sql(&shadow.config().socket_dir, SHADOW_PORT_C)
+        .await
+        .expect("shadow sql");
+
+    let ch_config = mapping_for(&["s11.ghost"]);
+    let report = walshadow::preflight::run(Inputs {
+        source_version_num: 150_000, // < 16: too old, and major 15 ≠ shadow major
+        source_sql: &src_sql,
+        shadow_sql: &shd_sql,
+        slot: Some("walshadow_absent_slot"),
+        ch_config: Some(&ch_config),
+    })
+    .await
+    .expect("preflight probe runs");
+    assert!(!report.is_ok(), "{:?}", report.errors);
+
+    let has = |f: &dyn Fn(&PreflightError) -> bool| report.errors.iter().any(f);
+    assert!(
+        has(&|e| matches!(e, PreflightError::SourceVersionTooOld { .. })),
+        "{:?}",
+        report.errors
+    );
+    assert!(
+        has(&|e| matches!(e, PreflightError::MajorMismatch { .. })),
+        "{:?}",
+        report.errors
+    );
+    assert!(
+        has(
+            &|e| matches!(e, PreflightError::SlotMissing { slot } if slot == "walshadow_absent_slot")
+        ),
+        "{:?}",
+        report.errors
+    );
+    assert!(
+        has(&|e| matches!(e, PreflightError::MappedRelMissing { rel } if rel == "s11.ghost")),
+        "{:?}",
+        report.errors
     );
 }
 

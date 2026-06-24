@@ -15,6 +15,5 @@ here as they surface; promote into `plans/` when they land
 * [FUZZ.md](FUZZ.md) — continuous coverage-guided fuzzing (cargo-fuzz/libFuzzer) across wal-rus + walshadow + clickhouse-c-rs: tiered targets, round-trip/differential oracles, C-boundary ASan, unattended-VM supervisor
 * [pipeline_backpressure_and_scaling.md](pipeline_backpressure_and_scaling.md) — parallel decode+insert pipeline design record (core landed, current-state doc is [emitter.md](../emitter.md)); remaining work: WAL-pump backpressure via wire/record split, decode/insert scaling (bootstrap Option B, hot-table sharding, N/M sizing)
 * [dependencies.md](dependencies.md) — crates.io replacement candidates for generic object storage, MPMC, retry, throttling, and metrics code
-* [TOAST.md](TOAST.md) — full TOAST support: `pg_toast_<relid>` chunk tables on CH, bootstrap tap, pre-window value fallback (in-xact WAL reassembly already ships — see [xact.md](../xact.md))
 * [risks.md](risks.md) — measurement-deferred risks and open questions
 * [parked.md](parked.md) — small operational polish + cross-major fixtures + skipped-test drive

@@ -283,3 +283,135 @@ async fn oracle_observer_resolves_pg_pending_to_text() {
     use std::sync::atomic::Ordering;
     assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_validate_counts_match_and_mismatch() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let sh = make_pg(&tmp, SHADOW_PORT + 3);
+    sh.initdb().expect("initdb");
+    sh.write_base_conf().expect("write_base_conf");
+    sh.start().expect("start");
+    let _stop = StopOnDrop { sh: &sh };
+    if !matches!(sh.try_load_oracle_extension(), Ok(true)) {
+        eprintln!("skip: walshadow extension not installed on this PG");
+        return;
+    }
+    let conninfo = socket_conninfo(
+        sh.config().socket_dir.to_str().unwrap(),
+        sh.config().port,
+        "postgres",
+        "postgres",
+    );
+    let oracle = Oracle::connect(&conninfo, 1).await.expect("oracle connect");
+
+    use std::sync::atomic::Ordering;
+    use walshadow::heap_decoder::{INT4OID, NUMERICOID};
+    assert!(oracle.validate(NUMERICOID, &numeric_42_bytes(), "42").await);
+    assert!(
+        oracle
+            .validate(NUMERICOID, &numeric_42_bytes(), "not-42")
+            .await
+    );
+    assert_eq!(oracle.stats.probes.load(Ordering::Relaxed), 2);
+    assert_eq!(oracle.stats.matches.load(Ordering::Relaxed), 1);
+    assert_eq!(oracle.stats.mismatches.load(Ordering::Relaxed), 1);
+
+    assert!(!oracle.validate(INT4OID, &0i32.to_le_bytes(), "0").await);
+    assert_eq!(oracle.stats.probes.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_resolve_reconnects_after_backend_restart() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let sh = make_pg(&tmp, SHADOW_PORT + 4);
+    sh.initdb().expect("initdb");
+    sh.write_base_conf().expect("write_base_conf");
+    sh.start().expect("start");
+    let _stop = StopOnDrop { sh: &sh };
+    if !matches!(sh.try_load_oracle_extension(), Ok(true)) {
+        eprintln!("skip: walshadow extension not installed on this PG");
+        return;
+    }
+    let conninfo = socket_conninfo(
+        sh.config().socket_dir.to_str().unwrap(),
+        sh.config().port,
+        "postgres",
+        "postgres",
+    );
+    let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
+    use walshadow::heap_decoder::NUMERICOID;
+    assert_eq!(
+        oracle
+            .resolve_pending(NUMERICOID, &numeric_42_bytes())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("42"),
+    );
+
+    sh.stop().expect("stop");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sh.start().expect("restart");
+
+    assert_eq!(
+        oracle
+            .resolve_pending(NUMERICOID, &numeric_42_bytes())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("42"),
+        "resolve recovers after reconnect",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_resolve_errors_when_backend_down() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let sh = make_pg(&tmp, SHADOW_PORT + 5);
+    sh.initdb().expect("initdb");
+    sh.write_base_conf().expect("write_base_conf");
+    sh.start().expect("start");
+    let _stop = StopOnDrop { sh: &sh };
+    if !matches!(sh.try_load_oracle_extension(), Ok(true)) {
+        eprintln!("skip: walshadow extension not installed on this PG");
+        return;
+    }
+    let conninfo = socket_conninfo(
+        sh.config().socket_dir.to_str().unwrap(),
+        sh.config().port,
+        "postgres",
+        "postgres",
+    );
+    let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
+    use std::sync::atomic::Ordering;
+    use walshadow::heap_decoder::NUMERICOID;
+    assert!(
+        oracle
+            .resolve_pending(NUMERICOID, &numeric_42_bytes())
+            .await
+            .unwrap()
+            .is_some(),
+    );
+
+    sh.stop().expect("stop");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let got = oracle
+        .resolve_pending(NUMERICOID, &numeric_42_bytes())
+        .await
+        .unwrap();
+    assert!(got.is_none(), "no resolution when backend down");
+    assert!(oracle.stats.errors.load(Ordering::Relaxed) >= 1);
+}

@@ -112,3 +112,24 @@ fn cli_produces_json_for_fixture() {
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json output");
     assert!(parsed["records"].as_u64().unwrap() > 0);
 }
+
+#[test]
+fn cli_produces_human_summary_for_fixture() {
+    let dir = fixture_dir();
+    let seg = dir.join("000000010000000000000001.gz");
+    if !seg.exists() {
+        eprintln!("skip: no captured segment at {:?}", seg);
+        return;
+    }
+    let exe = env!("CARGO_BIN_EXE_walshadow-classify");
+    let out = Command::new(exe).arg(&seg).output().unwrap();
+    assert!(
+        out.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("records:"), "got {stdout:?}");
+    assert!(stdout.contains("catalog fraction:"), "got {stdout:?}");
+    assert!(stdout.contains("class"), "got {stdout:?}");
+}

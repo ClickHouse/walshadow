@@ -57,6 +57,8 @@ pub struct DecodeCtx {
     /// TOAST chunk store + miss policy for values absent from this xact's
     /// in-memory chunk map (pre-window re-emits).
     pub resolver: ToastResolver,
+    /// Row cap before a mid-loop chunk route; defaults to [`DECODE_CHUNK_ROWS`].
+    pub chunk_rows: usize,
 }
 
 /// Rows coalesced before one [`BatcherMsg::Rows`] send.
@@ -149,7 +151,7 @@ pub async fn decode_and_route(
             committed,
         });
         routed += 1;
-        if buf.len() >= DECODE_CHUNK_ROWS || buf_bytes >= DECODE_CHUNK_BYTES {
+        if buf.len() >= ctx.chunk_rows || buf_bytes >= DECODE_CHUNK_BYTES {
             route_chunk(&ctx.msg_tx, std::mem::take(&mut buf)).await?;
             buf_bytes = 0;
         }

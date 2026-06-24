@@ -31,6 +31,13 @@ const CH_HTTP_PORT: u16 = 17584;
 // 17585 reserved: ChServer interserver port = http + 1
 const WALSENDER_PORT: u16 = 17586;
 
+const RIF_SOURCE_PORT: u16 = 17591;
+const RIF_SHADOW_PORT: u16 = 17592;
+const RIF_CH_TCP_PORT: u16 = 17593;
+const RIF_CH_HTTP_PORT: u16 = 17594;
+// 17595 reserved: ChServer interserver port = http + 1
+const RIF_WALSENDER_PORT: u16 = 17596;
+
 /// 16 bytes * 512 = 8192, comfortably past the ~2KB toast threshold and
 /// spanning multiple ~2KB toast chunks.
 const BODY_SQL: &str = "repeat('walshadow-toast-', 512)";
@@ -236,6 +243,139 @@ async fn toasted_value_replicates_and_rehydrates() {
     assert!(
         stats.toast_values_fetched.load(Ordering::Relaxed) >= 1,
         "UPDATE rehydrated the unchanged toast value from the store"
+    );
+    assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.toast_fetch_miss.load(Ordering::Relaxed), 0);
+}
+
+/// Under REPLICA IDENTITY FULL the old tuple logs every column (full old TOAST
+/// value); the new tuple omits the unchanged TOAST. The winning version must
+/// still carry the full value, rehydrated from the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replident_full_unchanged_toast_update() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(
+        &tmp,
+        "CREATE TABLE public.doc (id int PRIMARY KEY, meta text, body text);\n\
+         ALTER TABLE public.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n\
+         ALTER TABLE public.doc REPLICA IDENTITY FULL;\n",
+        RIF_SOURCE_PORT,
+        RIF_SHADOW_PORT,
+        RIF_WALSENDER_PORT,
+    )
+    .await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, RIF_CH_TCP_PORT, RIF_CH_HTTP_PORT).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+    ch.query(
+        "CREATE OR REPLACE TABLE walshadow_test.doc (\
+            id Int32,\
+            meta Nullable(String),\
+            body Nullable(String),\
+            _lsn UInt64,\
+            _xid UInt32,\
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+    )
+    .expect("create dest table");
+
+    let mappings = vec![fx::TableMappingSpec {
+        source_table: "public.doc".into(),
+        target_table: "walshadow_test.doc".into(),
+        columns: vec![
+            ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Int32".into(),
+            },
+            ColumnMapping {
+                src_attnum: 2,
+                target_name: "meta".into(),
+                target_type: "Nullable(String)".into(),
+            },
+            ColumnMapping {
+                src_attnum: 3,
+                target_name: "body".into(),
+                target_type: "Nullable(String)".into(),
+            },
+        ],
+    }];
+
+    let mut pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: RIF_CH_TCP_PORT,
+            mappings,
+            app_name: "walshadow-toast-rif",
+            ddl: None,
+        },
+        |cfg| cfg.toast.mode = ToastMode::ClickHouse,
+    )
+    .await;
+
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            format!("INSERT INTO public.doc VALUES (1, 'v1', {BODY_SQL})"),
+            "INSERT INTO public.doc SELECT g, repeat('f', 500), NULL \
+             FROM generate_series(2, 17) g"
+                .into(),
+            format!("UPDATE public.doc SET meta = {META2_SQL} WHERE id = 1"),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay catches up");
+    assert!(observed >= target);
+
+    let stats = pipeline.stats.clone();
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    assert_eq!(
+        ch.query(&format!(
+            "SELECT meta = {META2_SQL} FROM walshadow_test.doc \
+             WHERE id = 1 ORDER BY _lsn DESC LIMIT 1"
+        ))
+        .expect("ch meta"),
+        "1",
+        "UPDATE's meta wins under RIF",
+    );
+    assert_eq!(
+        ch.query(&format!(
+            "SELECT body = {BODY_SQL} FROM walshadow_test.doc \
+             WHERE id = 1 ORDER BY _lsn DESC LIMIT 1"
+        ))
+        .expect("ch body"),
+        "1",
+        "unchanged TOAST body survives the RIF update",
     );
     assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 0);
     assert_eq!(stats.toast_fetch_miss.load(Ordering::Relaxed), 0);
