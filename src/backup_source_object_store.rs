@@ -188,11 +188,14 @@ fn build_lsn_pair(resolved_name: &str, s: &BackupSentinelDtoV2) -> Result<(Start
     let tablespaces = tablespaces_from_spec(s.sentinel.tablespace_spec.as_ref());
     Ok((
         StartInfo {
-            start_lsn,
+            start_lsn: start_lsn.into(),
             timeline,
             tablespaces,
         },
-        EndInfo { end_lsn, timeline },
+        EndInfo {
+            end_lsn: end_lsn.into(),
+            timeline,
+        },
     ))
 }
 
@@ -290,8 +293,8 @@ mod tests {
         let resolved = walrus::pg::backup::format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
         let mut s = BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
-                backup_start_lsn: Some(0x0300_0000),
-                backup_finish_lsn: Some(0x0300_1000),
+                backup_start_lsn: std::num::NonZeroU64::new(0x0300_0000),
+                backup_finish_lsn: std::num::NonZeroU64::new(0x0300_1000),
                 increment_from_lsn: None,
                 increment_from: None,
                 increment_full_name: None,

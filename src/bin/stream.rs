@@ -485,7 +485,7 @@ async fn run(args: Args) -> Result<()> {
         target: "walshadow",
         sysid = %ident.sysid,
         timeline = ident.timeline,
-        xlogpos = format_pg_lsn(ident.xlogpos),
+        xlogpos = format_pg_lsn(ident.xlogpos).to_string(),
         "source identified",
     );
 
@@ -555,8 +555,8 @@ async fn run(args: Args) -> Result<()> {
     let aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
     tracing::info!(
         target: "walshadow",
-        raw = format_pg_lsn(raw_start),
-        aligned = format_pg_lsn(aligned),
+        raw = format_pg_lsn(raw_start).to_string(),
+        aligned = format_pg_lsn(aligned).to_string(),
         from_bootstrap = bootstrap_end_lsn.is_some() && args.start_lsn.is_none(),
         from_cursor = bootstrap_end_lsn.is_none()
             && cursor_at_boot.is_some()
@@ -1146,8 +1146,8 @@ async fn run(args: Args) -> Result<()> {
             tracing::info!(
                 target: "walshadow",
                 segments_shipped,
-                last_lsn = format_pg_lsn(now_dispatched),
-                shadow_apply = format_pg_lsn(shadow_apply_lsn),
+                last_lsn = format_pg_lsn(now_dispatched).to_string(),
+                shadow_apply = format_pg_lsn(shadow_apply_lsn).to_string(),
                 source_ahead_bytes = ahead,
                 metrics = %record_sink.metrics.summary(),
                 kept = filter.stats.kept,
@@ -1197,10 +1197,10 @@ async fn run(args: Args) -> Result<()> {
                 tracing::warn!(
                     target: "walshadow",
                     xacts_active = xact_stats.xacts_active,
-                    emitter_ack_lsn = format_pg_lsn(xact_stats.emitter_ack_lsn),
-                    drain_lsn = format_pg_lsn(xact_stats.drain_lsn),
-                    source_received = format_pg_lsn(received),
-                    filter_dispatched = format_pg_lsn(now_dispatched),
+                    emitter_ack_lsn = format_pg_lsn(xact_stats.emitter_ack_lsn).to_string(),
+                    drain_lsn = format_pg_lsn(xact_stats.drain_lsn).to_string(),
+                    source_received = format_pg_lsn(received).to_string(),
+                    filter_dispatched = format_pg_lsn(now_dispatched).to_string(),
                     inflight = %summary,
                     "xact inflight parked — emitter ack pinned by these xids",
                 );
@@ -1358,7 +1358,7 @@ fn spawn_retention(
                         manifests = r.manifests_removed,
                         partials = r.partials_removed,
                         bytes_freed = r.bytes_freed,
-                        cutoff_lsn = format_pg_lsn(cutoff),
+                        cutoff_lsn = format_pg_lsn(cutoff).to_string(),
                         "trim cycle",
                     );
                 }
@@ -1727,8 +1727,8 @@ async fn run_bootstrap(
 
     tracing::info!(
         target: "walshadow::bootstrap",
-        start_lsn = format_pg_lsn(outcome.start.start_lsn),
-        end_lsn = format_pg_lsn(outcome.end.end_lsn),
+        start_lsn = format_pg_lsn(outcome.start.start_lsn).to_string(),
+        end_lsn = format_pg_lsn(outcome.end.end_lsn).to_string(),
         timeline = outcome.start.timeline,
         kept_files = outcome.disk.kept_files,
         skipped_denylist = outcome.disk.skipped_denylist,
@@ -1803,7 +1803,7 @@ async fn autospawn_shadow_and_wait(
     tracing::info!(
         target: "walshadow::bootstrap",
         data_dir = %shadow_data_dir.display(),
-        end_lsn = format_pg_lsn(end_lsn),
+        end_lsn = format_pg_lsn(end_lsn).to_string(),
         replay_timeout_secs = args.bootstrap_shadow_replay_timeout,
         "auto-spawning shadow PG",
     );
@@ -1815,7 +1815,7 @@ async fn autospawn_shadow_and_wait(
     })?;
     tracing::info!(
         target: "walshadow::bootstrap",
-        replay_lsn = format_pg_lsn(replay_lsn),
+        replay_lsn = format_pg_lsn(replay_lsn).to_string(),
         "shadow caught up to bootstrap end_lsn",
     );
     Ok(())
@@ -1952,8 +1952,8 @@ async fn fetch_wal_into_pg_wal(
     tracing::info!(
         target: "walshadow::bootstrap",
         fetched,
-        start_lsn = format_pg_lsn(start_lsn),
-        end_lsn = format_pg_lsn(end_lsn),
+        start_lsn = format_pg_lsn(start_lsn).to_string(),
+        end_lsn = format_pg_lsn(end_lsn).to_string(),
         timeline,
         "hydrated shadow pg_wal from object store",
     );
