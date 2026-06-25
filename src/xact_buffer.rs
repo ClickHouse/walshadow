@@ -1162,9 +1162,9 @@ impl XactBuffer {
         tracing::trace!(
             target: "walshadow::xact_buffer",
             top_xid,
-            commit_lsn = format_pg_lsn(commit_lsn),
-            ack_lsn = format_pg_lsn(ack_lsn),
-            prev_ack = format_pg_lsn(prev_ack),
+            commit_lsn = format_pg_lsn(commit_lsn).to_string(),
+            ack_lsn = format_pg_lsn(ack_lsn).to_string(),
+            prev_ack = format_pg_lsn(prev_ack).to_string(),
             "drain complete",
         );
         // One bump per top, not per subxid
@@ -1750,7 +1750,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                     tracing::trace!(
                         target: "walshadow::xact_buffer",
                         xid,
-                        commit_lsn = format_pg_lsn(record.source_lsn),
+                        commit_lsn = format_pg_lsn(record.source_lsn).to_string(),
                         nsubxacts = payload.subxacts.len(),
                         "xact commit",
                     );
@@ -1773,7 +1773,7 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                     tracing::trace!(
                         target: "walshadow::xact_buffer",
                         xid,
-                        abort_lsn = format_pg_lsn(record.source_lsn),
+                        abort_lsn = format_pg_lsn(record.source_lsn).to_string(),
                         nsubxacts = payload.subxacts.len(),
                         "xact abort",
                     );
