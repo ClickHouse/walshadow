@@ -518,7 +518,7 @@ impl Pipeline {
 }
 
 pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
-    build_pipeline_with(args, |_| {}).await
+    build_pipeline_inner(args, |_| {}, None).await
 }
 
 /// `build_pipeline` with final say over the emitter config (eg `[toast]`
@@ -527,6 +527,23 @@ pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
 pub async fn build_pipeline_with(
     args: BuildPipelineArgs<'_>,
     tune: impl FnOnce(&mut EmitterConfig),
+) -> Pipeline {
+    build_pipeline_inner(args, tune, None).await
+}
+
+/// `build_pipeline` with the decode oracle wired in, so `PgPending`/`Unsupported`
+/// columns resolve to text via the shadow's `walshadow` extension.
+pub async fn build_pipeline_with_oracle(
+    args: BuildPipelineArgs<'_>,
+    oracle: Arc<walshadow::oracle::Oracle>,
+) -> Pipeline {
+    build_pipeline_inner(args, |_| {}, Some(oracle)).await
+}
+
+async fn build_pipeline_inner(
+    args: BuildPipelineArgs<'_>,
+    tune: impl FnOnce(&mut EmitterConfig),
+    oracle: Option<Arc<walshadow::oracle::Oracle>>,
 ) -> Pipeline {
     let BuildPipelineArgs {
         tmp,
@@ -677,7 +694,7 @@ pub async fn build_pipeline_with(
         inserter_pool_size: 2,
         catalog: catalog.clone(),
         mapping,
-        oracle: None,
+        oracle,
         applicator,
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),

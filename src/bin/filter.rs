@@ -100,3 +100,62 @@ async fn run(args: Args) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_segment() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/wal/classify/segments/000000010000000000000001.gz")
+    }
+
+    #[tokio::test]
+    async fn run_errors_on_missing_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run(Args {
+            input: tmp.path().join("nope.wal"),
+            out_dir: tmp.path().join("out"),
+            manifest: None,
+            quiet: true,
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("open input"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn run_filters_fixture_and_writes_outputs() {
+        let seg = fixture_segment();
+        if !seg.exists() {
+            eprintln!("skip: no captured segment at {seg:?}");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("out");
+        let manifest = tmp.path().join("seg.json");
+        run(Args {
+            input: seg,
+            out_dir: out_dir.clone(),
+            manifest: Some(manifest.clone()),
+            quiet: false,
+        })
+        .await
+        .expect("run");
+        assert!(manifest.exists(), "manifest written");
+        let segs: Vec<_> = fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(segs.len(), 1, "one filtered segment written");
+
+        run(Args {
+            input: fixture_segment(),
+            out_dir,
+            manifest: None,
+            quiet: true,
+        })
+        .await
+        .expect("run quiet, default manifest path");
+    }
+}

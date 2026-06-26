@@ -543,7 +543,7 @@ async fn run(args: Args) -> Result<()> {
     // `end_lsn`, so consuming WAL before it double-counts. `--start-lsn`
     // still wins so recovery drills can rewind further.
     let start_lsn_override = match &args.start_lsn {
-        Some(s) => Some(parse_lsn(s).context("--start-lsn")?),
+        Some(s) => Some(walshadow::shadow::parse_pg_lsn(s).context("--start-lsn")?),
         None => None,
     };
     let raw_start = cursor::resolve_resume_lsn(
@@ -1960,11 +1960,56 @@ async fn fetch_wal_into_pg_wal(
     Ok(())
 }
 
-fn parse_lsn(s: &str) -> Result<u64> {
-    let (hi, lo) = s
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("bad pg_lsn {s:?}: no '/'"))?;
-    let hi = u32::from_str_radix(hi, 16)?;
-    let lo = u32::from_str_radix(lo, 16)?;
-    Ok(((hi as u64) << 32) | (lo as u64))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_standby_config_writes_signal_and_conninfo_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let filt = tmp.path().join("filt");
+        let bind = "127.0.0.1:5999".parse().unwrap();
+        write_standby_config(&data, &filt, bind).unwrap();
+        assert!(data.join("standby.signal").exists());
+        let conf = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
+        assert!(conf.contains("primary_conninfo"), "{conf}");
+        assert!(conf.contains("port=5999"), "{conf}");
+        assert!(conf.contains("restore_command"), "{conf}");
+
+        write_standby_config(&data, &filt, bind).unwrap();
+        let again = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
+        assert_eq!(again.matches("# walshadow bootstrap").count(), 1);
+    }
+
+    #[test]
+    fn write_standby_config_skips_conninfo_when_port_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write_standby_config(&data, tmp.path(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let conf = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
+        assert!(!conf.contains("primary_conninfo"), "{conf}");
+        assert!(conf.contains("restore_command"), "{conf}");
+    }
+
+    #[test]
+    fn write_shadow_listener_overrides_sets_port_socket_and_disables_tcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        write_shadow_listener_overrides(&data, 6543, tmp.path()).unwrap();
+        let conf = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
+        assert!(conf.contains("port = 6543"), "{conf}");
+        assert!(conf.contains("unix_socket_directories"), "{conf}");
+        assert!(conf.contains("listen_addresses = ''"), "{conf}");
+
+        write_shadow_listener_overrides(&data, 6543, tmp.path()).unwrap();
+        let again = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
+        assert_eq!(
+            again
+                .matches("# walshadow shadow-listener overrides")
+                .count(),
+            1
+        );
+    }
 }

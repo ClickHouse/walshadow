@@ -767,6 +767,27 @@ mod tests {
     }
 
     #[test]
+    fn render_create_table_composite_pk_preserves_order_and_forces_non_null() {
+        // ORDER BY follows declared PK order (b, a); PK members forced non-null.
+        let d = desc(
+            "orders",
+            vec![
+                att(1, "a", INT4OID, false, None),
+                att(2, "b", INT4OID, false, None),
+                att(3, "body", TEXTOID, false, None),
+            ],
+            Some(vec![2, 1]),
+        );
+        let sql = render_create_table(&d, "default", false).unwrap().unwrap();
+        assert!(sql.contains("`a` Int32"), "{sql}");
+        assert!(sql.contains("`b` Int32"), "{sql}");
+        assert!(!sql.contains("`a` Nullable"), "{sql}");
+        assert!(!sql.contains("`b` Nullable"), "{sql}");
+        assert!(sql.contains("`body` Nullable(String)"), "{sql}");
+        assert!(sql.ends_with("ORDER BY (`b`, `a`)"), "{sql}");
+    }
+
+    #[test]
     fn soft_delete_keeps_is_deleted_out_of_engine_args() {
         let d = desc(
             "orders",
@@ -789,6 +810,41 @@ mod tests {
         let d = desc("events", vec![att(1, "body", TEXTOID, false, None)], None);
         let sql = render_create_table(&d, "default", false).unwrap().unwrap();
         assert!(sql.ends_with("ORDER BY (`_lsn`)"));
+    }
+
+    #[test]
+    fn render_create_table_order_by_from_replica_identity_index() {
+        // REPLICA IDENTITY USING INDEX: ORDER BY follows the index key cols.
+        let mut d = desc(
+            "events",
+            vec![
+                att(1, "tenant", INT4OID, false, None),
+                att(2, "key", TEXTOID, false, None),
+                att(3, "body", TEXTOID, false, None),
+            ],
+            None,
+        );
+        d.replident = ReplIdent::UsingIndex {
+            index_oid: 16500,
+            key_attnums: vec![2, 1],
+        };
+        let sql = render_create_table(&d, "default", false).unwrap().unwrap();
+        assert!(!sql.contains("`key` Nullable"), "{sql}");
+        assert!(!sql.contains("`tenant` Nullable"), "{sql}");
+        assert!(sql.contains("`body` Nullable(String)"), "{sql}");
+        assert!(sql.ends_with("ORDER BY (`key`, `tenant`)"), "{sql}");
+    }
+
+    #[test]
+    fn render_create_table_falls_back_to_lsn_when_pk_cols_all_dropped() {
+        // PK attnum references a dropped column → empty name list → `_lsn`.
+        let d = desc(
+            "events",
+            vec![att(2, "body", TEXTOID, false, None)],
+            Some(vec![1]),
+        );
+        let sql = render_create_table(&d, "default", false).unwrap().unwrap();
+        assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
     }
 
     #[test]

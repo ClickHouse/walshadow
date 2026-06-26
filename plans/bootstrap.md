@@ -279,12 +279,15 @@ V1 limits:
   captured mid-write walk as-shipped. WAL in `[start_lsn, end_lsn]`
   updating same tuples re-emits at higher `_lsn` &
   `ReplacingMergeTree(_lsn)` collapses duplicate
-- **TOAST-spilled columns fail fast.** Inline varlena decodes through
-  heap decoder; external pointers surface as
-  `ColumnValue::ExternalToast` and the CH drain rejects the row with
-  relation + column named (no reassembly path exists here).
-  `pg_toast_<relid>` tar entries are observed but not decoded; full
-  chunk-storage design in [future/TOAST.md](future/TOAST.md)
+- **TOAST-spilled columns resolve when a chunk store is configured.**
+  Inline varlena decodes through the heap decoder; external pointers
+  surface as `ColumnValue::ExternalToast`. With `[toast] mode != disabled`
+  the page walk decodes `pg_toast_<relid>` pages into chunks, `put`s them
+  to the store, defers the referring tuples, and reassembles after the
+  walk (`resolve_or_fill_toast`, `src/pipeline/bootstrap.rs`). With the
+  default `mode = disabled` an unresolved value NULL/default-fills and is
+  counted, no longer a hard reject. Full chunk-storage design in
+  [TOAST.md](TOAST.md)
 - **2C CH-side COPY load NOT shipped.** See
   [What is NOT 2C](#what-is-not-2c-ch-side-copy-load) below
 
@@ -347,8 +350,9 @@ shipped because it is only shape with bounded memory at scale
   `BatcherMsg::Row` into the shared tail; one ack seq per rfn flip.
   Returns `BootstrapDrainOutcome { next_seq, rows_routed }`; caller
   runs `tail.finish(msg_tx, ack, next_seq, fatal)` to seal + wait
-  durable. Fails fast on `ColumnValue::ExternalToast` (page walk does
-  no TOAST reassembly — [future/TOAST.md](future/TOAST.md))
+  durable. `ColumnValue::ExternalToast` is resolved from the configured
+  chunk store (deferred past the walk, then `resolve_or_fill_toast`), or
+  NULL/default-filled under `[toast] mode = disabled` — [TOAST.md](TOAST.md)
 - `drain_backfill` — metrics-only path (no `--ch-config`). Hands
   synthetic `CommittedTuple`s to a `TupleObserver`; `on_xact_end`
   fires on every rfn flip & once after channel close

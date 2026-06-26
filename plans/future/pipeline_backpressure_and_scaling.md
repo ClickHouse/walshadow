@@ -75,7 +75,7 @@ Ship-blockers remaining: none. Both cleared — see "Status (2026-06-09)".
 * DONE (2026-06-07). Bootstrap/base-backup now routes through the shared tail
   (Option A), not the serial `Emitter`. See "Status (2026-06-07) — bootstrap
   through the shared tail" below. Externally-toasted columns still error rather
-  than ship (Blockers, refined #2, design in [TOAST.md](TOAST.md)); as of
+  than ship (Blockers, refined #2, design in [TOAST.md](../TOAST.md)); as of
   2026-06-09 the fail-fast is explicit at the producer (the bootstrap drain),
   not a generic encoder rejection deep in the tail.
 
@@ -198,7 +198,7 @@ This branch is merge-ready and strictly better than `main`. Remaining items
 are post-merge future work, none ship-blocking: the WAL pump→worker bound
 (needs a wire/record split, Post-merge future work step 3), parallel-decode
 Option B (gated on measurement), and TOAST assembly (separate work item,
-[TOAST.md](TOAST.md)). The DDL-type-aware barrier is deferred indefinitely.
+[TOAST.md](../TOAST.md)). The DDL-type-aware barrier is deferred indefinitely.
 
 ## Current serial path
 
@@ -512,7 +512,7 @@ identical either way).
    `external_toast_fails_fast`.
 
    The third option is the real fix and is its own work item, independent of
-   this push-down; design in [TOAST.md](TOAST.md) (store `pg_toast_*` chunks on
+   this push-down; design in [TOAST.md](../TOAST.md) (store `pg_toast_*` chunks on
    ClickHouse).
 3. **Seq numbering continuity at handoff.** Bootstrap registers seqs
    `[0, K)`. The WAL `ReorderSink` must continue at `K`, not 0

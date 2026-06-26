@@ -1040,6 +1040,26 @@ fn consume_dropped(att: &RelAttr, buf: &[u8], abs: usize) -> Result<usize, Decod
     }
 }
 
+/// PG `va_tcinfo`/`va_extinfo`: codec method in the top 2 bits, size in the low 30.
+pub(crate) const VARLENA_EXTSIZE_BITS: u32 = 30;
+pub(crate) const VARLENA_EXTSIZE_MASK: u32 = (1u32 << VARLENA_EXTSIZE_BITS) - 1;
+const TOAST_COMPRESSION_PGLZ: u8 = 0;
+const TOAST_COMPRESSION_LZ4: u8 = 1;
+
+/// Decompress a varlena codec body. `None` on a corrupt stream or unknown method.
+pub(crate) fn decompress_varlena(method: u8, src: &[u8], raw_len: usize) -> Option<Vec<u8>> {
+    match method {
+        TOAST_COMPRESSION_PGLZ => {
+            let mut out = vec![0u8; raw_len];
+            let n = pglz::decompress_into(src, &mut out, true)?;
+            out.truncate(n);
+            Some(out)
+        }
+        TOAST_COMPRESSION_LZ4 => lz4_flex::decompress(src, raw_len).ok(),
+        _ => None,
+    }
+}
+
 /// Decode a varlena attribute (`typlen == -1`). PG varlena formats (`varatt.h`):
 ///
 /// - `0bxxxxxx00` 4-byte length, uncompressed.
@@ -1153,15 +1173,26 @@ fn decode_varlena(
         });
     }
     if compressed {
-        // In-line compressed: 4-byte header + 4-byte va_tcinfo (extsize +
-        // method) + body; surfaced opaque until a pglz/lz4 codec lands
-        return Ok((
-            ColumnValue::Unsupported {
+        // inline-compressed varlena: 4-byte header, va_tcinfo (size + method), body
+        if total < 8 {
+            return Err(DecodeError::Truncated {
+                offset: abs,
+                need: 8,
+                have: total,
+            });
+        }
+        let tcinfo = u32::from_le_bytes(buf[abs + 4..abs + 8].try_into().unwrap());
+        let raw_len = (tcinfo & VARLENA_EXTSIZE_MASK) as usize;
+        let method = (tcinfo >> VARLENA_EXTSIZE_BITS) as u8;
+        let body = &buf[abs + 8..abs + total];
+        let v = match decompress_varlena(method, body, raw_len) {
+            Some(out) => varlena_to_value(att.type_oid, Cow::Owned(out)),
+            None => ColumnValue::Unsupported {
                 type_oid: att.type_oid,
                 raw: buf[abs..abs + total].to_vec(),
             },
-            total,
-        ));
+        };
+        return Ok((v, total));
     }
     let body = &buf[abs + 4..abs + total];
     Ok((varlena_to_value(att.type_oid, Cow::Borrowed(body)), total))
@@ -1485,6 +1516,70 @@ mod tests {
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         assert_eq!(new.columns[0], Some(ColumnValue::Text("hi".into())));
+    }
+
+    fn inline_compressed_varlena(method: u8, body: &[u8], raw_len: usize) -> Vec<u8> {
+        let total = 8 + body.len();
+        let tcinfo = ((method as u32) << VARLENA_EXTSIZE_BITS) | raw_len as u32;
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&(((total as u32) << 2) | 0b10).to_le_bytes());
+        buf.extend_from_slice(&tcinfo.to_le_bytes());
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    #[test]
+    fn decode_inline_compressed_pglz_text() {
+        let text = "z".repeat(11000);
+        let comp = pglz::compress(text.as_bytes(), &pglz::Strategy::ALWAYS).expect("pglz compress");
+        assert!(comp.len() < text.len(), "must actually compress");
+        let buf = inline_compressed_varlena(0, &comp, text.len());
+        let att = rel_attr(1, "val", TEXTOID, -1, 'i');
+        let (v, consumed) = decode_varlena(&att, &buf, 0).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(v, ColumnValue::Text(text));
+    }
+
+    #[test]
+    fn decode_inline_compressed_lz4_text() {
+        let text = "lz4-".repeat(4000);
+        let comp = lz4_flex::compress(text.as_bytes());
+        let buf = inline_compressed_varlena(1, &comp, text.len());
+        let att = rel_attr(1, "val", TEXTOID, -1, 'i');
+        let (v, consumed) = decode_varlena(&att, &buf, 0).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(v, ColumnValue::Text(text));
+    }
+
+    #[test]
+    fn decode_inline_compressed_corrupt_surfaces_unsupported() {
+        let buf = inline_compressed_varlena(0, &[0xff, 0xff, 0xff, 0xff], 4096);
+        let att = rel_attr(1, "val", TEXTOID, -1, 'i');
+        let (v, consumed) = decode_varlena(&att, &buf, 0).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert!(matches!(
+            v,
+            ColumnValue::Unsupported {
+                type_oid: TEXTOID,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decompress_varlena_roundtrips_and_rejects_unknown() {
+        let data = b"the quick brown fox jumped, jumped, jumped".to_vec();
+        let pglz = pglz::compress(&data, &pglz::Strategy::ALWAYS).expect("pglz compress");
+        assert_eq!(
+            decompress_varlena(0, &pglz, data.len()).as_deref(),
+            Some(data.as_slice())
+        );
+        let lz4 = lz4_flex::compress(&data);
+        assert_eq!(
+            decompress_varlena(1, &lz4, data.len()).as_deref(),
+            Some(data.as_slice())
+        );
+        assert_eq!(decompress_varlena(2, &lz4, data.len()), None);
     }
 
     #[test]

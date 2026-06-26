@@ -23,7 +23,7 @@ mod fx;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::{ColumnMapping, NamespaceMapping};
 use walshadow::shadow::Shadow;
 
 // Each test owns a disjoint port slot. Cargo's default test runner
@@ -56,6 +56,34 @@ const SLOT_TOP_ABORT: PortSlot = PortSlot {
     ch_tcp: 17444,
     ch_http: 17445,
     walsender: 17463,
+};
+const SLOT_TOAST_ROLLBACK: PortSlot = PortSlot {
+    source: 17780,
+    shadow: 17781,
+    ch_tcp: 17782,
+    ch_http: 17783,
+    walsender: 17787,
+};
+const SLOT_IUD_ABORT: PortSlot = PortSlot {
+    source: 17790,
+    shadow: 17791,
+    ch_tcp: 17792,
+    ch_http: 17793,
+    walsender: 17797,
+};
+const SLOT_SP_DDL: PortSlot = PortSlot {
+    source: 17870,
+    shadow: 17871,
+    ch_tcp: 17872,
+    ch_http: 17873,
+    walsender: 17877,
+};
+const SLOT_ASSIGN: PortSlot = PortSlot {
+    source: 17880,
+    shadow: 17881,
+    ch_tcp: 17882,
+    ch_http: 17883,
+    walsender: 17887,
 };
 
 struct PortSlot {
@@ -357,6 +385,223 @@ async fn top_abort_with_subxacts_discards_everything() {
     // The aborted xact's id=1/R1, id=2/R2 (sub), id=3/R3 (post-RELEASE
     // on top) must all be discarded — only the sentinel reaches CH.
     assert_ch_rows(&ch, &[(99, "sentinel")]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn toast_value_in_rolled_back_subxact_is_discarded() {
+    if skip_gate() {
+        return;
+    }
+    let driver = |source: &Shadow| {
+        spawn_txn(
+            source,
+            "BEGIN;\n\
+             INSERT INTO s14.sub_t (id, payload) VALUES (1, repeat('A', 12000));\n\
+             SAVEPOINT s;\n\
+             INSERT INTO s14.sub_t (id, payload) VALUES (2, repeat('B', 12000));\n\
+             ROLLBACK TO SAVEPOINT s;\n\
+             INSERT INTO s14.sub_t (id, payload) VALUES (3, repeat('C', 12000));\n\
+             COMMIT;\n\
+             SELECT pg_switch_wal();\n",
+        )
+    };
+    let (source, ch, _tmp1, _tmp2) =
+        run_drill(SLOT_TOAST_ROLLBACK, "walshadow-subxact-toast", driver).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        source.psql_one("SELECT count(*) FROM s14.sub_t").unwrap(),
+        "2",
+        "source holds id=1 + id=3",
+    );
+    assert_eq!(
+        ch.query("SELECT count() FROM walshadow_test.s14_sub_t FINAL WHERE _is_deleted = 0")
+            .unwrap(),
+        "2",
+    );
+    assert_eq!(
+        ch.query(
+            "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+                SELECT concat(toString(id), ':', toString(length(argMax(payload, _lsn))), \
+                    substring(argMax(payload, _lsn), 1, 1)) AS c \
+                FROM walshadow_test.s14_sub_t WHERE _is_deleted = 0 \
+                GROUP BY id ORDER BY id)"
+        )
+        .unwrap(),
+        "1:12000A,3:12000C",
+    );
+    assert_eq!(
+        ch.query("SELECT count() FROM walshadow_test.s14_sub_t WHERE id = 2")
+            .unwrap(),
+        "0",
+        "rolled-back subxact's TOAST row never reaches CH",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn iud_in_aborted_top_xact_leaves_rows_untouched() {
+    if skip_gate() {
+        return;
+    }
+    let driver = |source: &Shadow| {
+        spawn_txn(
+            source,
+            "INSERT INTO s14.sub_t (id, payload) VALUES (1, 'orig1'), (2, 'orig2');\n\
+             BEGIN;\n\
+             UPDATE s14.sub_t SET payload = 'changed' WHERE id = 1;\n\
+             SAVEPOINT s;\n\
+             DELETE FROM s14.sub_t WHERE id = 2;\n\
+             RELEASE SAVEPOINT s;\n\
+             ROLLBACK;\n\
+             SELECT pg_switch_wal();\n",
+        )
+    };
+    let (source, ch, _tmp1, _tmp2) =
+        run_drill(SLOT_IUD_ABORT, "walshadow-subxact-iud-abort", driver).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        source.psql_one("SELECT count(*) FROM s14.sub_t").unwrap(),
+        "2",
+    );
+    assert_ch_rows(&ch, &[(1, "orig1"), (2, "orig2")]).await;
+    assert_eq!(
+        ch.query("SELECT argMax(_is_deleted, _lsn) FROM walshadow_test.s14_sub_t WHERE id = 2")
+            .unwrap(),
+        "false",
+        "aborted DELETE leaves no tombstone",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn savepoint_after_ddl_rollback_discards_column_and_rows() {
+    if skip_gate() {
+        return;
+    }
+    let slot = SLOT_SP_DDL;
+    let tmp = tempfile::tempdir().unwrap();
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(
+        &tmp,
+        "CREATE SCHEMA s14d;\n",
+        slot.source,
+        slot.shadow,
+        slot.walsender,
+    )
+    .await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    let mut ddl_args = fx::DdlPipelineArgs::default();
+    ddl_args.namespaces.insert(
+        "s14d".into(),
+        NamespaceMapping {
+            target_database: Some("walshadow_test".into()),
+            auto_create: true,
+            drop_table_strategy: None,
+        },
+    );
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port: slot.ch_tcp,
+        mappings: vec![],
+        app_name: "walshadow-subxact-sp-ddl",
+        ddl: Some(ddl_args),
+    })
+    .await;
+
+    let driver = spawn_txn(
+        &source,
+        "CREATE TABLE s14d.t (id bigint PRIMARY KEY, payload text);\n\
+         INSERT INTO s14d.t (id, payload) VALUES (1, 'base');\n\
+         BEGIN;\n\
+         INSERT INTO s14d.t (id, payload) VALUES (2, 'pre-sp');\n\
+         SAVEPOINT sp;\n\
+         ALTER TABLE s14d.t ADD COLUMN extra text;\n\
+         INSERT INTO s14d.t (id, payload, extra) VALUES (3, 'with-extra', 'leak');\n\
+         ROLLBACK TO SAVEPOINT sp;\n\
+         INSERT INTO s14d.t (id, payload) VALUES (4, 'post-rollback');\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay catches up");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    assert_eq!(
+        source.psql_one("SELECT count(*) FROM s14d.t").unwrap(),
+        "3",
+        "source holds id=1,2,4",
+    );
+    let has_extra = ch
+        .query(
+            "SELECT count() FROM system.columns \
+             WHERE database = 'walshadow_test' AND table = 't' AND name = 'extra'",
+        )
+        .unwrap();
+    assert_eq!(has_extra, "0", "rolled-back ADD COLUMN must not leak to CH");
+    assert_eq!(
+        ch.query(
+            "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+                SELECT concat(toString(id), '=', argMax(payload, _lsn)) AS c \
+                FROM walshadow_test.t WHERE _is_deleted = 0 GROUP BY id ORDER BY id)"
+        )
+        .unwrap(),
+        "1=base,2=pre-sp,4=post-rollback",
+        "only original-schema rows survive; id=3 discarded",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_subxacts_emit_assignment_record() {
+    if skip_gate() {
+        return;
+    }
+    let mut sql = String::from("BEGIN;\nINSERT INTO s14.sub_t (id, payload) VALUES (0, 'r0');\n");
+    for i in 1..=70 {
+        sql.push_str(&format!(
+            "SAVEPOINT s{i};\nINSERT INTO s14.sub_t (id, payload) VALUES ({i}, 'r{i}');\n"
+        ));
+    }
+    sql.push_str("COMMIT;\nSELECT pg_switch_wal();\n");
+
+    let driver = |source: &Shadow| spawn_txn(source, &sql);
+    let (source, ch, _t1, _t2) = run_drill(SLOT_ASSIGN, "walshadow-subxact-assign", driver).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        source.psql_one("SELECT count(*) FROM s14.sub_t").unwrap(),
+        "71",
+    );
+    assert_eq!(
+        ch.query("SELECT count() FROM walshadow_test.s14_sub_t FINAL WHERE _is_deleted = 0")
+            .unwrap(),
+        "71",
+    );
 }
 
 fn skip_gate() -> bool {
