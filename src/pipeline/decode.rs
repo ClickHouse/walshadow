@@ -11,22 +11,59 @@
 //! (`project_walshadow_eventual_consistency`). At M=1 dispatch order (hence
 //! per-table WAL order) is preserved.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
+use walrus::pg::walparser::RelFileNode;
 
-use crate::ch_emitter::{EmitterStats, MappingHandle};
+use crate::ch_emitter::{EmitterStats, MappingHandle, TableMapping};
 use crate::heap_decoder::{CommittedTuple, DecodedHeap};
 use crate::oracle::{Oracle, maybe_validate_tuple, resolve_pending_tuple};
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::pipeline::{Fatal, mpmc};
-use crate::shadow_catalog::{CatalogError, ShadowCatalog};
+use crate::shadow_catalog::{CatalogError, RelDescriptor, ShadowCatalog};
 use crate::toast::ToastResolver;
 use crate::xact_buffer::detoast_heap;
+
+/// Caches `RelFileNode → (Postgres descriptor, ClickHouse mapping)` so the pool
+/// skips the shared catalog lock after the first lookup. Flushed when the
+/// catalog's invalidation epoch bumps (DDL).
+pub struct RelCache {
+    epoch: Option<Arc<AtomicU64>>,
+    seen_epoch: u64,
+    map: HashMap<RelFileNode, (Arc<RelDescriptor>, Arc<TableMapping>)>,
+}
+
+impl RelCache {
+    fn new(epoch: Option<Arc<AtomicU64>>) -> Self {
+        let seen_epoch = epoch
+            .as_ref()
+            .map(|e| e.load(Ordering::Acquire))
+            .unwrap_or(0);
+        Self {
+            epoch,
+            seen_epoch,
+            map: HashMap::new(),
+        }
+    }
+
+    /// Flush if the catalog's invalidation epoch advanced (DDL). Called once
+    /// per job — a cheap lock-free atomic load in steady state.
+    fn refresh(&mut self) {
+        if let Some(e) = &self.epoch {
+            let cur = e.load(Ordering::Acquire);
+            if cur != self.seen_epoch {
+                self.seen_epoch = cur;
+                self.map.clear();
+            }
+        }
+    }
+}
 
 /// Reassembled-TOAST chunk map: `(toast_relid, value_id) -> seq -> bytes`.
 pub type ToastChunks = HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>;
@@ -97,7 +134,9 @@ pub async fn decode_and_route(
     commit_lsn: u64,
     heaps: Vec<DecodedHeap>,
     chunks: Arc<ToastChunks>,
+    cache: &mut RelCache,
 ) -> Result<u64, String> {
+    cache.refresh();
     let mut routed = 0u64;
     let mut buf: Vec<RoutedRow> = Vec::new();
     let mut buf_bytes = 0usize;
@@ -105,25 +144,40 @@ pub async fn decode_and_route(
         detoast_heap(&mut heap, &chunks, &ctx.catalog, true, &ctx.resolver)
             .await
             .map_err(|e| e.to_string())?;
-        let rel =
-            match crate::shadow_catalog::resolve_at_pooled(&ctx.catalog, heap.rfn, heap.source_lsn)
+        // Cache hit: no shared catalog lock, no mapping read. Skip/error arms
+        // are never cached, so `foreign_db_rows_skipped`/`unsupported_relations`
+        // still count per row.
+        let (rel, mapping) = match cache.map.entry(heap.rfn) {
+            Entry::Occupied(e) => e.get().clone(),
+            Entry::Vacant(slot) => {
+                let rel = match crate::shadow_catalog::resolve_at_pooled(
+                    &ctx.catalog,
+                    heap.rfn,
+                    heap.source_lsn,
+                )
                 .await
-            {
-                Ok(r) => r,
-                // Physical WAL carries the whole cluster; skip foreign-DB rows
-                Err(CatalogError::ForeignDatabase(_)) => {
-                    ctx.stats
-                        .foreign_db_rows_skipped
-                        .fetch_add(1, Ordering::Relaxed);
+                {
+                    Ok(r) => r,
+                    // Physical WAL carries the whole cluster; skip foreign-DB rows
+                    Err(CatalogError::ForeignDatabase(_)) => {
+                        ctx.stats
+                            .foreign_db_rows_skipped
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                };
+                let Some(mapping) = crate::pipeline::lookup_mapping(
+                    &ctx.mapping,
+                    rel.qualified_name.as_ref(),
+                    &ctx.stats,
+                )
+                .await
+                else {
                     continue;
-                }
-                Err(e) => return Err(e.to_string()),
-            };
-        let Some(mapping) =
-            crate::pipeline::lookup_mapping(&ctx.mapping, rel.qualified_name.as_ref(), &ctx.stats)
-                .await
-        else {
-            continue;
+                };
+                slot.insert((rel, mapping)).clone()
+            }
         };
         let mut committed = CommittedTuple {
             decoded: heap,
@@ -181,6 +235,9 @@ pub fn spawn_pool(
         let ack = ack.clone();
         let fatal = fatal.clone();
         handles.push(tokio::spawn(async move {
+            // Per-worker descriptor cache; epoch handle read once at startup.
+            let epoch = ctx.catalog.lock().await.invalidation_epoch_handle();
+            let mut cache = RelCache::new(epoch);
             while let Some(job) = jobs.recv().await {
                 ctx.stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
                 let seq = job.seq;
@@ -191,6 +248,7 @@ pub fn spawn_pool(
                     job.commit_lsn,
                     job.heaps,
                     job.chunks,
+                    &mut cache,
                 )
                 .await
                 {

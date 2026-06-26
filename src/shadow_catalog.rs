@@ -594,6 +594,12 @@ impl ShadowCatalog {
         self.generation
     }
 
+    /// Lock-free handle to the invalidation epoch (bumped on DDL); `None` when no
+    /// tracker is wired. The decode pool flushes its cache on a bump.
+    pub fn invalidation_epoch_handle(&self) -> Option<Arc<AtomicU64>> {
+        self.invalidation_epoch.clone()
+    }
+
     /// True when [`Self::sweep_dropped`] would do real work. Cheap (atomic
     /// load + compare); gate the per-commit sweep on this to keep pgbench-rate
     /// workloads off the SQL path when nothing's dropped.
