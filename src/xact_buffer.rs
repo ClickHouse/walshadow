@@ -53,6 +53,7 @@ use crate::filter::Route;
 use crate::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, HeapOp, ToastPointer, decode_heap_record,
 };
+use crate::pipeline::decode::RelCache;
 use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent, ShadowCatalog};
 use crate::spill::{SpillEntry, SpillError, SpillStore, SpillWriter, ToastChunk};
 use crate::toast::{ChunkMap, ToastResolver};
@@ -1861,6 +1862,9 @@ pub struct BufferingDecoderSink {
     /// shadow-replay gate shows up nested inside the transaction's span.
     /// `None` ⇒ those spans are skipped (no parent to attach to).
     span_registry: Option<TxnSpanRegistry>,
+    /// Per-`rfn` descriptor memo (see [`RelCache`]). Lazily created on the
+    /// first lookup, since `new` can't take the async catalog lock.
+    rel_cache: Option<RelCache<Arc<RelDescriptor>>>,
 }
 
 impl BufferingDecoderSink {
@@ -1871,6 +1875,7 @@ impl BufferingDecoderSink {
             stats: Arc::new(DecoderStats::default()),
             schema_events: None,
             span_registry: None,
+            rel_cache: None,
         }
     }
 
@@ -2028,42 +2033,61 @@ impl RecordSink for BufferingDecoderSink {
                 .span_registry
                 .as_ref()
                 .and_then(|r| r.decode_parent(txn_xid));
-            let gate_span = decode_parent
-                .as_ref()
-                .map(|p| {
-                    tracing::info_span!(
-                        target: "walshadow::trace",
-                        parent: p,
-                        "catalog.gate",
-                        lsn = record.source_lsn,
-                    )
-                })
-                .unwrap_or_else(tracing::Span::none);
-            // Per-record sibling of `catalog.gate` for the batch view.
-            let catalog_span = trace_span!(sampled, "catalog", lsn = record.source_lsn);
-            let rel = {
-                let mut cat = self.catalog.lock().await;
-                match cat
-                    .relation_at(rfn, record.source_lsn)
-                    .instrument(gate_span)
-                    .instrument(catalog_span)
-                    .await
+            // A hit skips the catalog lock + `relation_at` replay gate; safe
+            // because an unchanged epoch means no DDL invalidated the descriptor.
+            let cached = self.rel_cache.as_mut().and_then(|c| {
+                c.refresh();
+                c.get(rfn).cloned()
+            });
+            let rel = if let Some(desc) = cached {
+                desc
+            } else {
+                let gate_span = decode_parent
+                    .as_ref()
+                    .map(|p| {
+                        tracing::info_span!(
+                            target: "walshadow::trace",
+                            parent: p,
+                            "catalog.gate",
+                            lsn = record.source_lsn,
+                        )
+                    })
+                    .unwrap_or_else(tracing::Span::none);
+                // Per-record sibling of `catalog.gate` for the batch view.
+                let catalog_span = trace_span!(sampled, "catalog", lsn = record.source_lsn);
+                let resolved = {
+                    let mut cat = self.catalog.lock().await;
+                    if self.rel_cache.is_none() {
+                        self.rel_cache = Some(RelCache::new(cat.invalidation_epoch_handle()));
+                    }
+                    match cat
+                        .relation_at(rfn, record.source_lsn)
+                        .instrument(gate_span)
+                        .instrument(catalog_span)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(CatalogError::NotFoundByFilenode(_)) => {
+                            self.stats
+                                .catalog_not_found
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // ReplayTimeout means shadow stalled or the wire
+                            // froze; silent skip would shed user-heap writes
+                            // invisibly. Poison the stream so the daemon exits
+                            // and the cursor resumes on next boot.
+                            return Err(DecoderSinkError::from(e).into());
+                        }
+                    }
+                };
+                if let Some(c) = self.rel_cache.as_mut()
+                    && c.enabled()
                 {
-                    Ok(r) => r,
-                    Err(CatalogError::NotFoundByFilenode(_)) => {
-                        self.stats
-                            .catalog_not_found
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        // ReplayTimeout means shadow stalled or the wire
-                        // froze; silent skip would shed user-heap writes
-                        // invisibly. Poison the stream so the daemon exits
-                        // and the cursor resumes on next boot.
-                        return Err(DecoderSinkError::from(e).into());
-                    }
+                    c.insert(rfn, resolved.clone());
                 }
+                resolved
             };
             // Empty in steady state
             self.drain_schema_events(record.parsed.header.xact_id, record.source_lsn)
@@ -2086,6 +2110,9 @@ impl RecordSink for BufferingDecoderSink {
             let n_decoded = decoded_set.len();
             let buffer_span = trace_span!(sampled, "buffer", rows = n_decoded);
             async move {
+                // Lock once per record (not per tuple); on_heap/on_toast_chunk
+                // never touch the catalog, so no buffer→catalog inversion.
+                let mut buf = self.buffer.lock().await;
                 for decoded in decoded_set {
                     self.stats.record(&decoded);
                     if rel.kind == 't' {
@@ -2094,7 +2121,6 @@ impl RecordSink for BufferingDecoderSink {
                             self.stats
                                 .toast_chunks_buffered
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let mut buf = self.buffer.lock().await;
                             buf.on_toast_chunk(chunk, xid)
                                 .await
                                 .map_err(SinkError::from)?;
@@ -2104,7 +2130,6 @@ impl RecordSink for BufferingDecoderSink {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     } else {
-                        let mut buf = self.buffer.lock().await;
                         buf.on_heap(decoded).await.map_err(SinkError::from)?;
                     }
                 }

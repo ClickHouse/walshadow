@@ -88,6 +88,11 @@ async fn toasted_value_replicates_and_rehydrates() {
     let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
+    // `_lsn` in the sort key: this test asserts both id=1 versions (INSERT +
+    // UPDATE) are present. With `ORDER BY id` they share a key and RMT
+    // collapses them whenever they land in one part — at insert via
+    // `optimize_on_insert`, or later via merge — which made the count flaky
+    // across PG versions (block layout shifts). Distinct keys never collapse.
     ch.query(
         "CREATE OR REPLACE TABLE walshadow_test.doc (\
             id Int32,\
@@ -96,7 +101,7 @@ async fn toasted_value_replicates_and_rehydrates() {
             _lsn UInt64,\
             _xid UInt32,\
             _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
-         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY (id, _lsn)",
     )
     .expect("create dest table");
 

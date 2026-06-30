@@ -33,14 +33,14 @@ use crate::xact_buffer::detoast_heap;
 /// Caches `RelFileNode → (Postgres descriptor, ClickHouse mapping)` so the pool
 /// skips the shared catalog lock after the first lookup. Flushed when the
 /// catalog's invalidation epoch bumps (DDL).
-pub struct RelCache {
+pub struct RelCache<V> {
     epoch: Option<Arc<AtomicU64>>,
     seen_epoch: u64,
-    map: HashMap<RelFileNode, (Arc<RelDescriptor>, Arc<TableMapping>)>,
+    map: HashMap<RelFileNode, V>,
 }
 
-impl RelCache {
-    fn new(epoch: Option<Arc<AtomicU64>>) -> Self {
+impl<V> RelCache<V> {
+    pub fn new(epoch: Option<Arc<AtomicU64>>) -> Self {
         let seen_epoch = epoch
             .as_ref()
             .map(|e| e.load(Ordering::Acquire))
@@ -54,7 +54,7 @@ impl RelCache {
 
     /// Flush if the catalog's invalidation epoch advanced (DDL). Called once
     /// per job — a cheap lock-free atomic load in steady state.
-    fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         if let Some(e) = &self.epoch {
             let cur = e.load(Ordering::Acquire);
             if cur != self.seen_epoch {
@@ -62,6 +62,20 @@ impl RelCache {
                 self.map.clear();
             }
         }
+    }
+
+    /// Without an epoch handle there's no DDL signal, so entries could never be
+    /// invalidated — callers must not memoize.
+    pub fn enabled(&self) -> bool {
+        self.epoch.is_some()
+    }
+
+    pub fn get(&self, rfn: RelFileNode) -> Option<&V> {
+        self.map.get(&rfn)
+    }
+
+    pub fn insert(&mut self, rfn: RelFileNode, value: V) {
+        self.map.insert(rfn, value);
     }
 }
 
@@ -134,7 +148,7 @@ pub async fn decode_and_route(
     commit_lsn: u64,
     heaps: Vec<DecodedHeap>,
     chunks: Arc<ToastChunks>,
-    cache: &mut RelCache,
+    cache: &mut RelCache<(Arc<RelDescriptor>, Arc<TableMapping>)>,
 ) -> Result<u64, String> {
     cache.refresh();
     let mut routed = 0u64;
