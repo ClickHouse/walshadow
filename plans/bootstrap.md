@@ -71,6 +71,46 @@ for rendered diagram. Five clusters top→bottom:
 Phases 1-3 run synchronously inside `run_bootstrap`; phases 4-5 hand off
 to daemon's main loop
 
+## Restart contract
+
+A **completion marker** (`walshadow.bootstrap_complete`, written into the
+shadow data dir only after a bootstrap fully lands) separates initial
+bootstrap from restart — not `PG_VERSION` alone, which can't tell a finished
+bootstrap from one that crashed mid-way or a foreign/externally-seeded dir.
+
+- No marker + bootstrap enabled → run the five greenfield phases. `run_bootstrap`
+  refuses to land onto a dir that already holds `PG_VERSION` without the marker
+  (partial/foreign): the operator clears it, or uses `--bootstrap-mode=off` to
+  resume an externally-managed shadow.
+- Marker present → resume in place, never a base backup.
+- A completed bootstrap persists its `end_lsn` as the initial cursor, so a
+  restart before the first CH ack resumes from `end_lsn` — no `--start-lsn`
+  needed (this is the walshadow-bootstrapped case). An **externally-seeded**
+  shadow (`--bootstrap-mode=off`) has no cursor on first start and no marker;
+  it needs `--start-lsn` until a cursor exists. `--ignore-cursor` alone never
+  replaces an initialized shadow.
+
+Resume uses the same source order as a Postgres standby (source first, then
+archive, then source):
+
+1. Try `START_REPLICATION` at the resume LSN (`stream.next_lsn()`).
+2. On a plain (transient) source failure, retry the source once at that LSN
+   before touching the archive; a removed-WAL (`58P01`) error skips straight to
+   step 3.
+3. If the source still can't serve it and a `[backup]` archive is configured,
+   fetch the segment covering the resume LSN — the whole 16 MiB segment, sliced
+   to begin at the resume LSN (`next_lsn` is byte- not segment-aligned) — and
+   replay it through the live filter + decode sinks, advancing segment by
+   segment.
+4. When the archive lacks the next segment, reconnect the source at the exact
+   handoff LSN (`backon` exponential backoff for transient failures).
+5. If the source reports removed WAL (`58P01`) and the archive cannot cover it,
+   exit without modifying the shadow baseline; base-backup refresh remains an
+   operator action.
+
+Same recovery path (`SourceRecovery::recover`) handles initial attach and
+mid-stream reconnect. Archive is the `[backup]` config in [config.md](config.md).
+
 ## BackupSource trait
 
 `src/backup_source.rs`. One async method that pumps every file in
