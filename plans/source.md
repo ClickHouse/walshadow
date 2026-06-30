@@ -74,12 +74,16 @@ misaligned push). `reconnect` is one attempt; the caller
 out a transient drop until the source returns. A recycled segment (SQLSTATE
 `58P01`, classified by `is_wal_segment_removed` on the code, not the
 locale-dependent message → typed `WalSegmentRemoved`) stops the retry and
-is **fatal**: the
-resume point is gone, so the daemon exits and recovery is a re-seed via
-config `initial_load` (`base_backup`/`object_store`) on restart, not an
-in-place reconnect. The slot + `flush_lsn` cap make this recycle path an
+is **fatal** *mid-stream*: the resume point is gone, so the daemon exits, not
+an in-place reconnect. On the next boot the resume decision
+(`resume_plan::resolve`, see [bootstrap.md](bootstrap.md)) recovers it —
+`Refill` replaying the gap from the `[backup]` archive when one is configured,
+else a `Fresh` re-seed. The slot + `flush_lsn` cap make this recycle path an
 edge (slot `lost` / dropped / source disk full), not the normal CH-stall
-path
+path.
+
+`SourceFeed::slot_restart_lsn(name)` is the boot oracle for that decision: the
+physical slot's `restart_lsn` (oldest WAL the source still retains)
 
 TLS / SCRAM via wal-rus's
 `walrus::pg::replication::tls`: modes `disable / allow

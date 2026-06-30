@@ -69,6 +69,41 @@ for rendered diagram. Five clusters top→bottom:
 Phases 1-3 run synchronously inside `run_bootstrap`; phases 4-5 hand off
 to daemon's main loop
 
+## Boot resume decision
+
+Whether the five-phase greenfield above runs at all is a boot-time choice,
+not a boolean. `resume_plan::resolve` (`src/resume_plan.rs`) folds the durable
+cursor, the shadow data-dir state, and live source state into one of three
+outcomes:
+
+- **`Fresh`** — no usable prior state (no cursor, `--ignore-cursor`, or the
+  shadow dir isn't initialized): run the five-phase greenfield.
+- **`Resume { start_lsn }`** — a physical slot still pins the WAL we need
+  (`restart_lsn <= resume_lsn`): skip bootstrap, plain `START_REPLICATION` at
+  the cursor.
+- **`Refill { from, to }`** — the source recycled `[resume_lsn, head]` and a
+  `[backup]` archive is configured: replay archived WAL through the pump, then
+  rejoin live.
+
+A recycled resume point with no archive to refill from falls back to `Fresh`.
+There is no automatic partial re-seed — an operator resets explicitly with
+`--ignore-cursor`.
+
+Inputs: `resume_lsn` is the durable `cursor.emitter_ack_lsn` as
+`Option<NonZeroU64>` (LSN `0/0` is invalid → `None` → no cursor);
+`shadow_initialized` is `PG_VERSION` present in the shadow data dir; `head` is
+source `IDENTIFY_SYSTEM.xlogpos`; `slot_restart_lsn` is the physical slot's
+oldest retained LSN (`SourceFeed::slot_restart_lsn`, see [source.md](source.md));
+`archive_configured` is whether `[backup]` is set. `bootstrap_off`
+(`--bootstrap-mode off`, shadow externally managed) can never reach `Fresh` —
+it degrades to `Resume`/`Refill` only.
+
+`Refill` replays `[from, handoff)` (segment-aligned) from the archive through
+the same `stream` + sinks the live loop uses — shadow catches up via
+`restore_command`, rows decode to CH — before `START_REPLICATION` picks up
+contiguously at the handoff LSN. A missing segment is a hard error → operator
+re-seeds. The archive is the `[backup]` config (see [config.md](config.md)).
+
 ## BackupSource trait
 
 `src/backup_source.rs`. One async method that pumps every file in

@@ -159,6 +159,9 @@ pub struct EmitterConfig {
     /// (`decoder_pool * inline_value_max`) must fit half
     /// `resident_payload_max` (validated at pipeline spawn)
     pub inline_value_max: usize,
+    /// `[backup]`: archive storage for object-store bootstrap + WAL refill.
+    /// `None` (section omitted) disables refill. Project setting, not `WALG_*`.
+    pub backup: Option<walrus::config::Settings>,
 }
 
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
@@ -217,7 +220,80 @@ impl Default for EmitterConfig {
             source_slot: None,
             resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
             inline_value_max: DEFAULT_INLINE_VALUE_MAX,
+            backup: None,
         }
+    }
+}
+
+/// `[backup]` table → `walrus::config::Settings`. The `archive` URI scheme
+/// (`s3://` / `gs://` / `file://`) selects the backend, mirroring `WALG_*_PREFIX`.
+fn parse_backup(tbl: &toml::value::Table) -> Result<walrus::config::Settings, EmitterError> {
+    use walrus::config::{Settings, StorageSettings};
+    use walrus::storage::gcs::GcsConfig;
+    use walrus::storage::s3::{CredentialSource, Credentials, ImdsProvider, S3Config};
+
+    let err = |m: String| EmitterError::Config(format!("[backup] {m}"));
+    let get_str = |k: &str| tbl.get(k).and_then(toml::Value::as_str).map(str::to_string);
+
+    let archive = get_str("archive")
+        .ok_or_else(|| err("archive required (s3://, gs://, or file://)".into()))?;
+
+    let storage = if let Some(rest) = archive.strip_prefix("s3://") {
+        let (bucket, prefix) = split_bucket_prefix(rest);
+        let creds = match (get_str("access_key"), get_str("secret_key")) {
+            (Some(access_key), Some(secret_key)) => CredentialSource::Static(Credentials {
+                access_key,
+                secret_key,
+                session_token: get_str("session_token"),
+                expires_at: None,
+            }),
+            (None, None) => CredentialSource::Imds(Arc::new(
+                ImdsProvider::from_env().map_err(|e| err(format!("imds: {e}")))?,
+            )),
+            _ => {
+                return Err(err(
+                    "set both access_key and secret_key, or neither (IMDS)".into()
+                ));
+            }
+        };
+        StorageSettings::S3(S3Config {
+            bucket,
+            prefix,
+            region: get_str("region").unwrap_or_else(|| "us-east-1".into()),
+            creds,
+            endpoint: get_str("endpoint"),
+            force_path_style: tbl
+                .get("force_path_style")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false),
+        })
+    } else if let Some(rest) = archive.strip_prefix("gs://") {
+        let (bucket, prefix) = split_bucket_prefix(rest);
+        StorageSettings::Gcs(GcsConfig {
+            bucket,
+            prefix,
+            credentials_path: get_str("credentials_path"),
+        })
+    } else if let Some(path) = archive.strip_prefix("file://") {
+        StorageSettings::Fs {
+            path: path.to_string(),
+        }
+    } else {
+        return Err(err(format!(
+            "archive {archive:?} must start with s3://, gs://, or file://"
+        )));
+    };
+
+    Ok(Settings {
+        storage,
+        ..Settings::default()
+    })
+}
+
+fn split_bucket_prefix(rest: &str) -> (String, String) {
+    match rest.split_once('/') {
+        Some((b, p)) => (b.to_string(), p.trim_end_matches('/').to_string()),
+        None => (rest.to_string(), String::new()),
     }
 }
 
@@ -375,6 +451,9 @@ impl EmitterConfig {
         {
             // Empty string == omitted == slotless.
             out.source_slot = Some(slot.into());
+        }
+        if let Some(bk) = root.get("backup").and_then(Value::as_table) {
+            out.backup = Some(parse_backup(bk)?);
         }
         if let Some(nss) = root.get("namespace").and_then(Value::as_table) {
             for (k, v) in nss {
@@ -2145,5 +2224,93 @@ mod tests {
         assert_eq!(dotted_rel.target, TableTarget::new("default", "b.c"));
         // Interpolation quotes the dot inside the identifier
         assert_eq!(dotted_rel.target.sql(), "`default`.`b.c`");
+    }
+
+    #[test]
+    fn config_backup_absent_is_none() {
+        assert!(EmitterConfig::default().backup.is_none());
+        let c = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").unwrap();
+        assert!(c.backup.is_none());
+    }
+
+    #[test]
+    fn config_backup_s3_static_creds() {
+        use walrus::config::StorageSettings;
+        use walrus::storage::s3::CredentialSource;
+        let c = EmitterConfig::from_toml_str(
+            "[backup]\n\
+             archive = \"s3://my-bucket/walshadow/prefix\"\n\
+             region = \"eu-west-1\"\n\
+             endpoint = \"https://minio.internal\"\n\
+             force_path_style = true\n\
+             access_key = \"AK\"\n\
+             secret_key = \"SK\"\n",
+        )
+        .unwrap();
+        let s3 = match c.backup.expect("backup set").storage {
+            StorageSettings::S3(s3) => s3,
+            other => panic!("expected S3, got {other:?}"),
+        };
+        assert_eq!(s3.bucket, "my-bucket");
+        assert_eq!(s3.prefix, "walshadow/prefix");
+        assert_eq!(s3.region, "eu-west-1");
+        assert_eq!(s3.endpoint.as_deref(), Some("https://minio.internal"));
+        assert!(s3.force_path_style);
+        match s3.creds {
+            CredentialSource::Static(cr) => {
+                assert_eq!(cr.access_key, "AK");
+                assert_eq!(cr.secret_key, "SK");
+            }
+            other => panic!("expected static creds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_backup_s3_defaults_region_and_imds() {
+        use walrus::config::StorageSettings;
+        use walrus::storage::s3::CredentialSource;
+        let c = EmitterConfig::from_toml_str("[backup]\narchive = \"s3://b\"\n").unwrap();
+        let s3 = match c.backup.unwrap().storage {
+            StorageSettings::S3(s3) => s3,
+            other => panic!("expected S3, got {other:?}"),
+        };
+        assert_eq!(s3.bucket, "b");
+        assert_eq!(s3.prefix, "");
+        assert_eq!(s3.region, "us-east-1");
+        assert!(matches!(s3.creds, CredentialSource::Imds(_)));
+    }
+
+    #[test]
+    fn config_backup_gcs_and_file() {
+        use walrus::config::StorageSettings;
+        let gcs = EmitterConfig::from_toml_str(
+            "[backup]\narchive = \"gs://gb/pre\"\ncredentials_path = \"/sa.json\"\n",
+        )
+        .unwrap()
+        .backup
+        .unwrap();
+        match gcs.storage {
+            StorageSettings::Gcs(g) => {
+                assert_eq!(g.bucket, "gb");
+                assert_eq!(g.prefix, "pre");
+                assert_eq!(g.credentials_path.as_deref(), Some("/sa.json"));
+            }
+            other => panic!("expected GCS, got {other:?}"),
+        }
+        let fs = EmitterConfig::from_toml_str("[backup]\narchive = \"file:///var/wal\"\n")
+            .unwrap()
+            .backup
+            .unwrap();
+        assert!(matches!(fs.storage, StorageSettings::Fs { path } if path == "/var/wal"));
+    }
+
+    #[test]
+    fn config_backup_rejects_bad_input() {
+        assert!(EmitterConfig::from_toml_str("[backup]\nregion = \"x\"\n").is_err());
+        assert!(EmitterConfig::from_toml_str("[backup]\narchive = \"http://b\"\n").is_err());
+        assert!(
+            EmitterConfig::from_toml_str("[backup]\narchive = \"s3://b\"\naccess_key = \"AK\"\n")
+                .is_err()
+        );
     }
 }

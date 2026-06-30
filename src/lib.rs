@@ -31,6 +31,7 @@ pub mod mapping;
 pub mod ops;
 pub mod pg;
 pub mod record;
+pub mod resume_plan;
 pub mod runtime_config;
 pub mod schema;
 pub mod source;

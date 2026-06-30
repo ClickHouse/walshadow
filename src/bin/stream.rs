@@ -25,6 +25,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -528,27 +529,11 @@ async fn run(args: Args) -> Result<()> {
     // Effective physical replication slot (`[source] slot` + --slot override);
     // None = slotless.
     let source_slot: Option<String> = ch_config.as_ref().and_then(|c| c.source_slot.clone());
-    let bootstrap_end_lsn: Option<u64> = if matches!(args.bootstrap_mode, BootstrapMode::Off) {
-        None
-    } else {
-        Some(
-            run_bootstrap(&cfg, &mut feed, &args, ch_config.clone())
-                .await
-                .context("bootstrap")?,
-        )
-    };
-    if let Some(end_lsn) = bootstrap_end_lsn
-        && args.bootstrap_autospawn_shadow
-    {
-        let shadow_data_dir = args
-            .bootstrap_shadow_data_dir
-            .clone()
-            .context("--bootstrap-shadow-data-dir required with --bootstrap-autospawn-shadow")?;
-        autospawn_shadow_and_wait(&args, shadow_data_dir, end_lsn).await?;
-    }
 
     // Resume precedence: `--start-lsn` > cursor.bin emitter-ack > greenfield
     // (source write head). `--ignore-cursor` forces greenfield (recovery drills).
+    // Read before the bootstrap decision: a usable cursor lets a restart resume
+    // instead of re-running the full base backup.
     let cursor_at_boot: Option<cursor::Cursor> = if args.ignore_cursor {
         None
     } else {
@@ -565,6 +550,84 @@ async fn run(args: Args) -> Result<()> {
             }
         }
     };
+
+    let shadow_initialized = args
+        .bootstrap_shadow_data_dir
+        .as_deref()
+        .is_some_and(shadow_data_dir_initialized);
+    let resume_lsn = cursor_at_boot
+        .as_ref()
+        .and_then(|c| NonZeroU64::new(c.emitter_ack_lsn));
+    // A physical slot's `restart_lsn` is the oldest WAL the source still
+    // retains for us. If it covers `resume_lsn` a plain resume streams the
+    // gap; if the source recycled past it, refill from the wal-g archive (or,
+    // if no archive is configured, full re-seed).
+    let slot_restart_lsn = if let Some(slot) = source_slot.as_deref() {
+        feed.slot_restart_lsn(slot)
+            .await
+            .with_context(|| format!("query restart_lsn for slot {slot}"))?
+    } else {
+        None
+    };
+    let backup_settings = ch_config.as_ref().and_then(|c| c.backup.clone());
+    let plan = walshadow::resume_plan::resolve(walshadow::resume_plan::Inputs {
+        bootstrap_off: matches!(args.bootstrap_mode, BootstrapMode::Off),
+        ignore_cursor: args.ignore_cursor,
+        resume_lsn,
+        shadow_initialized,
+        head: ident.xlogpos,
+        slot_restart_lsn,
+        archive_configured: backup_settings.is_some(),
+    });
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        ?plan,
+        resume_lsn = format_pg_lsn(resume_lsn.map_or(0, |l| l.get())).to_string(),
+        head = format_pg_lsn(ident.xlogpos).to_string(),
+        "resume plan resolved",
+    );
+    use walshadow::resume_plan::ResumePlan;
+    // Carried to the pre-loop archive replay; `Some((from, head))` on Refill.
+    let mut refill_target: Option<(u64, u64)> = None;
+    let bootstrap_end_lsn: Option<u64> = match plan {
+        ResumePlan::Fresh => Some(
+            run_bootstrap(&cfg, &mut feed, &args, ch_config.clone())
+                .await
+                .context("bootstrap")?,
+        ),
+        ResumePlan::Resume { .. } => {
+            if !matches!(args.bootstrap_mode, BootstrapMode::Off) {
+                tracing::info!(
+                    target: "walshadow::bootstrap",
+                    "resumable cursor + initialized shadow: skipping re-bootstrap",
+                );
+            }
+            None
+        }
+        ResumePlan::Refill { from, to } => {
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                from = format_pg_lsn(from).to_string(),
+                to = format_pg_lsn(to).to_string(),
+                "resume point recycled — refilling gap from wal-g archive",
+            );
+            refill_target = Some((from, to));
+            None
+        }
+    };
+    if let Some(end_lsn) = bootstrap_end_lsn {
+        if args.bootstrap_autospawn_shadow {
+            let shadow_data_dir = args.bootstrap_shadow_data_dir.clone().context(
+                "--bootstrap-shadow-data-dir required with --bootstrap-autospawn-shadow",
+            )?;
+            autospawn_shadow_and_wait(&args, shadow_data_dir, end_lsn).await?;
+        }
+    } else if !matches!(args.bootstrap_mode, BootstrapMode::Off) && args.bootstrap_autospawn_shadow
+    {
+        // Bootstrap skipped (resume) but the daemon owns the shadow: bring the
+        // existing data dir back up so the catalog + WAL replay resume.
+        start_existing_shadow(&args).await?;
+    }
     // Bootstrap `end_lsn` outranks the cursor: shadow catalog state is at
     // `end_lsn`, so consuming WAL before it double-counts. `--start-lsn`
     // still wins so recovery drills can rewind further.
@@ -784,9 +847,9 @@ async fn run(args: Args) -> Result<()> {
         }
     };
 
-    feed.start_physical_replication(source_slot.as_deref(), aligned, ident.timeline)
-        .await
-        .context("START_REPLICATION")?;
+    // START_REPLICATION is issued after the sinks are built (and after any
+    // archive refill advances the stream), just before the pump loop — see
+    // the `refill_target` handling below.
     // Spill dir wiped every startup: cursor file commits drains
     // atomically, so leftover spill from a prior crash is redundant or stale.
     let xact_buf_cfg = XactBufferConfig {
@@ -1211,6 +1274,33 @@ async fn run(args: Args) -> Result<()> {
             );
         }
     }
+
+    // Archive refill (ResumePlan::Refill): the source recycled our resume
+    // point, so replay the missing WAL from the wal-g archive through the same
+    // pump — filter → out_dir (shadow catches up via restore_command) and
+    // decode → CH — before rejoining the live stream. Advances `stream` so the
+    // START_REPLICATION below picks up contiguously at the handoff LSN.
+    if let Some((from, to)) = refill_target {
+        let settings = backup_settings
+            .as_ref()
+            .context("archive refill selected but no [backup] configured")?;
+        let handoff = WalStream::align_down(to, WAL_SEG_SIZE);
+        refill_from_archive(
+            &mut stream,
+            &mut record_sink,
+            &mut segment_sink,
+            settings,
+            &args.spill_dir,
+            ident.timeline,
+            from..handoff,
+        )
+        .await
+        .context("archive refill")?;
+    }
+
+    feed.start_physical_replication(source_slot.as_deref(), stream.next_lsn(), ident.timeline)
+        .await
+        .context("START_REPLICATION")?;
 
     let start_instant = Instant::now();
     let mut segments_shipped = 0u64;
@@ -2169,6 +2259,49 @@ async fn reconnect_or_fatal(
         .map_err(recycled)
 }
 
+/// A data dir holding `PG_VERSION` was initialized by a prior bootstrap (or
+/// external `initdb`), so the shadow can resume rather than reseed.
+fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
+    dir.join("PG_VERSION").exists()
+}
+
+/// A crash leaves the shadow's `postmaster.pid` behind. If `pg_ctl status`
+/// reports not-running, the file is stale and would block `pg_ctl start`.
+fn clear_stale_postmaster_pid(data_dir: &std::path::Path) -> Result<()> {
+    let pid = data_dir.join("postmaster.pid");
+    if pid.exists() {
+        fs::remove_file(&pid).with_context(|| format!("remove stale {}", pid.display()))?;
+    }
+    Ok(())
+}
+
+/// Resume path: bootstrap was skipped but the daemon owns the shadow, so
+/// (re)start the existing data dir. No-op if it's already running; clears a
+/// stale pid from a prior crash first.
+async fn start_existing_shadow(args: &Args) -> Result<()> {
+    let data_dir = args
+        .bootstrap_shadow_data_dir
+        .clone()
+        .context("--bootstrap-shadow-data-dir required to resume shadow")?;
+    let mut cfg = ShadowConfig::new(data_dir.clone(), args.out_dir.clone());
+    cfg.port = args.shadow_port;
+    cfg.socket_dir = args.shadow_socket_dir.clone();
+    cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
+    let shadow = Shadow::new(cfg);
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        data_dir = %data_dir.display(),
+        "resuming: starting existing shadow PG (no reseed)",
+    );
+    tokio::task::block_in_place(move || -> Result<()> {
+        if shadow.is_running().context("resume: shadow status")? {
+            return Ok(());
+        }
+        clear_stale_postmaster_pid(&data_dir)?;
+        shadow.start().context("resume: shadow start")
+    })
+}
+
 /// Orchestrate BASE_BACKUP into a fresh shadow data dir; returns the
 /// backup's `end_lsn` so the caller rebinds the WAL pump past it.
 ///
@@ -2242,11 +2375,13 @@ async fn run_bootstrap(
                 (Box::new(DirectSource::new(src_cfg.clone(), opts)), None)
             }
             BootstrapMode::ObjectStore => {
-                let settings = walrus::config::Settings::from_env()
-                    .context("bootstrap: Settings::from_env (WALG_* env vars)")?;
+                let settings = ch_config
+                    .as_ref()
+                    .and_then(|c| c.backup.clone())
+                    .context("bootstrap: --bootstrap-mode object_store requires a [backup] section in --ch-config")?;
                 let storage = settings
                     .build_storage()
-                    .context("bootstrap: build storage from WALG_* env vars")?;
+                    .context("bootstrap: build archive storage")?;
                 // ObjectStoreSource canonicalises via
                 // `walrus::pg::backup::fetch::resolve_name`.
                 let name = args.bootstrap_backup_name.clone();
@@ -2527,6 +2662,71 @@ fn write_shadow_listener_overrides(
     writeln!(f, "port = {port}")?;
     writeln!(f, "unix_socket_directories = '{}'", socket_dir.display())?;
     writeln!(f, "listen_addresses = ''")?;
+    Ok(())
+}
+
+/// Replay archived WAL `[from, handoff)` through the live pump so a recycled
+/// resume point is refilled before rejoining the live stream. Fetches wal-g
+/// segments from the configured `[backup]` archive and pushes them through
+/// the same `stream` + sinks the loop uses, so `out_dir` gets filtered
+/// segments (shadow catch-up via `restore_command`) and rows decode to CH.
+/// `handoff` is segment-aligned; on return `stream.next_lsn() == handoff`. A
+/// missing segment surfaces as an error → the operator re-seeds (the archive
+/// does not cover the gap).
+async fn refill_from_archive(
+    stream: &mut WalStream,
+    record_sink: &mut (dyn RecordSink + Send),
+    segment_sink: &mut (dyn walshadow::record::SegmentSink + Send),
+    settings: &walrus::config::Settings,
+    spill_dir: &Path,
+    timeline: u32,
+    range: std::ops::Range<u64>,
+) -> Result<()> {
+    let std::ops::Range {
+        start: from,
+        end: handoff,
+    } = range;
+    if handoff <= from {
+        return Ok(());
+    }
+    let storage = settings
+        .build_storage()
+        .context("refill: build archive storage")?;
+    let seg_dir = spill_dir.join("refill_wal");
+    let segments = walshadow::backup_backfill::fetch_gap_segments(
+        settings,
+        &storage,
+        &seg_dir,
+        timeline,
+        from,
+        handoff.saturating_sub(1),
+    )
+    .await
+    .context("refill: fetch archive WAL")?;
+    let mut replayed = 0u64;
+    for (seg, path) in &segments {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("refill: read {}", path.display()))?;
+        stream
+            .push(
+                seg.start_lsn(WAL_SEG_SIZE),
+                &bytes,
+                record_sink,
+                segment_sink,
+            )
+            .await
+            .with_context(|| format!("refill: replay {}", seg.format()))?;
+        replayed += 1;
+    }
+    let _ = tokio::fs::remove_dir_all(&seg_dir).await;
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        segments = replayed,
+        from = format_pg_lsn(from).to_string(),
+        handoff = format_pg_lsn(handoff).to_string(),
+        "archive refill complete — resuming live stream",
+    );
     Ok(())
 }
 

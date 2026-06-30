@@ -12,6 +12,7 @@ use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
 use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::config::SslMode as TpSslMode;
+use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::{Client, NoTls};
 use walrus::pg::backup::{format_pg_lsn, parse_pg_lsn};
 use walrus::pg::replication::conn::{
@@ -58,6 +59,23 @@ impl WalSegmentRemoved {
 pub fn is_wal_segment_removed(err: &anyhow::Error) -> bool {
     err.downcast_ref::<WalSegmentRemoved>()
         .is_some_and(|e| e.error_code == SQLSTATE_UNDEFINED_FILE)
+}
+
+/// `pg_lsn` scanned straight off the binary wire (8-byte big-endian, same
+/// layout as `int8`), skipping the `::text` cast + `parse_pg_lsn` round-trip.
+struct Lsn(u64);
+
+impl FromSql<'_> for Lsn {
+    fn from_sql(
+        _: &Type,
+        raw: &[u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        postgres_protocol::types::int8_from_sql(raw).map(|v| Lsn(v as u64))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::PG_LSN
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -224,6 +242,24 @@ impl SourceFeed {
             .await
             .context("create physical replication slot")?;
         Ok(())
+    }
+
+    /// `restart_lsn` of the named physical slot, or `None` when the slot is
+    /// absent (or hasn't reserved a position yet). It is the oldest WAL the
+    /// source guarantees to retain for the slot — the oracle for whether a
+    /// plain resume can still stream `[resume_lsn, head]`. Runs on the sidecar
+    /// SQL connection.
+    pub async fn slot_restart_lsn(&mut self, name: &str) -> Result<Option<u64>> {
+        let client = self.sql_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT restart_lsn FROM pg_replication_slots \
+                 WHERE slot_name = $1 AND slot_type = 'physical'",
+                &[&name],
+            )
+            .await
+            .context("query pg_replication_slots.restart_lsn")?;
+        Ok(row.and_then(|r| r.get::<_, Option<Lsn>>(0)).map(|l| l.0))
     }
 
     pub async fn identify_system(&mut self) -> Result<SystemIdentity> {

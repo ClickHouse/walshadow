@@ -44,21 +44,26 @@ digraph timeline_restart {
     b0 -> b1 -> b2 -> b3 -> b4 -> b5 -> b6 -> b7 -> b8;
   }
 
-  // ═════ C. WAL overflow → re-bootstrap ═════
+  // ═════ C. source recycled the resume point → resume_plan decision ═════
   subgraph cluster_c {
-    label="C. extended outage  (slot LSN beyond source wal_keep_size)";
+    label="C. extended outage  (slot restart_lsn advanced past resume_lsn — source recycled the gap)";
     style="rounded,filled"; color="#BD8183"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    c0 [label="① extended downtime", fillcolor="#403a36"];
-    c1 [label="② restart:\nSourceFeed::START_REPLICATION →\nERROR requested WAL segment removed", fillcolor="#4D3A28"];
-    c2 [label="③ daemon poisons\nlog ReplayTimeout / WAL gap\nexit non-zero", fillcolor="#4D3A28"];
-    c3 [label="④ operator re-invokes\n--bootstrap-mode=direct\n(or object_store)", fillcolor="#403a36"];
-    c4 [label="⑤ greenfield bootstrap path\n(→ timeline_bootstrap)", fillcolor="#4D3A28"];
-    c5 [label="⑥ shadow data dir wiped\nor diverted to fresh dir", fillcolor="#3D4128"];
-    c6 [label="⑦ new cursor.bin written\nat end_lsn", fillcolor="#4D3A28"];
-    c7 [label="⑧ steady-state reached", fillcolor="#4D4128"];
+    c0 [label="① extended downtime\nresume_lsn falls behind slot restart_lsn", fillcolor="#403a36"];
+    c1 [label="② restart: resume_plan::resolve (boot)\nslot_restart_lsn > resume_lsn →\nsource recycled [resume_lsn, head]\n(mid-stream the same recycle surfaces as\nSTART_REPLICATION 58P01 → typed\nWalSegmentRemoved → fatal exit,\nrecovered on next boot)", fillcolor="#4D3A28"];
+    c2 [label="③ [backup] archive\nconfigured?", fillcolor="#4D3340", shape=diamond, width=2.2, style=filled];
+    c3 [label="④a Refill\nreplay [resume_lsn, handoff) from archive\nthrough the live pump + sinks", fillcolor="#4D3A28"];
+    c4 [label="④b Fresh\ngreenfield re-seed, in-process (no operator\nre-invoke) → timeline_bootstrap", fillcolor="#4D3A28"];
+    c5 [label="⑤a Refill: START_REPLICATION at handoff\nrejoin live", fillcolor="#4D3A28"];
+    c6 [label="⑤b Fresh: shadow data dir wiped\nor diverted to fresh dir", fillcolor="#3D4128"];
+    c7 [label="⑥b Fresh: new cursor.bin written\nat end_lsn", fillcolor="#4D3A28"];
+    c8 [label="⑦ steady-state reached\nCH ReplacingMergeTree(_lsn) dedups", fillcolor="#4D4128"];
 
-    c0 -> c1 -> c2 -> c3 -> c4 -> c5 -> c6 -> c7;
+    c0 -> c1 -> c2;
+    c2 -> c3 [label="yes", color="#8FA875", fontcolor="#8FA875"];
+    c2 -> c4 [label="no", color="#BD8183", fontcolor="#BD8183"];
+    c3 -> c5 -> c8;
+    c4 -> c6 -> c7 -> c8;
   }
 
   // Force A | B | C side by side via invisible head-to-head ordering
@@ -82,7 +87,7 @@ digraph timeline_restart {
   >];
   a9 -> cursor_table [style=invis];
   b8 -> cursor_table [style=invis];
-  c7 -> cursor_table [style=invis];
+  c8 -> cursor_table [style=invis];
 
   // ═════ Legend ═════
   legend [shape=plaintext, label=<
@@ -96,7 +101,7 @@ digraph timeline_restart {
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>scenario cluster border</B></TD></TR>
       <TR><TD><FONT COLOR="#A1A9CC"><B>━</B></FONT></TD><TD>A. clean restart (SIGTERM)</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>━</B></FONT></TD><TD>B. kill -9 mid-stream</TD></TR>
-      <TR><TD><FONT COLOR="#BD8183"><B>━</B></FONT></TD><TD>C. WAL overflow → re-bootstrap</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>━</B></FONT></TD><TD>C. source recycled → Refill / Fresh</TD></TR>
     </TABLE>
   >];
   cursor_table -> legend [style=invis];

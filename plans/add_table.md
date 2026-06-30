@@ -143,7 +143,7 @@ nothing replays `[start_lsn, end_lsn]`.
 ## object_store mode
 
 1. **Resolve backup.** `resolve_name(LATEST)` + `fetch_sentinel` on the wal-g
-   bucket (`WALG_*` env, same surface as bootstrap) → `B_redo`/`B_end` LSNs,
+   bucket (`[backup]` TOML, same source as bootstrap) → `B_redo`/`B_end` LSNs,
    timeline. Delta chains reject (`increment_from` set) with the same
    operator-actionable error as bootstrap: the streaming walk has no
    disk-resident base to overlay
@@ -236,8 +236,8 @@ inserts don't trigger them) and fire twice for copy-back rows.
 
 - **No shadow involvement.** Backup bytes never land in a data dir; the modes
   add no second shadow or scratch cluster
-- **Bucket/creds stay out of the overlay.** Object-store settings ride the
-  same `WALG_*` env surface bootstrap uses, never the source-PG config
+- **Bucket/creds stay out of the overlay.** Object-store settings come from
+  the `[backup]` TOML section bootstrap uses, never the source-PG config
   tables — credentials in a source-PG table is the wrong trust direction
 - **No server-side filtering.** Do not fork the BASE_BACKUP protocol;
   cluster-sized bandwidth is the documented cost of `'base_backup'`, and

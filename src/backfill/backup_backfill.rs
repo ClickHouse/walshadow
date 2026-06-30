@@ -128,14 +128,17 @@ async fn run_base_backup_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Resu
 }
 
 async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Result<PassOutcome> {
-    // Bucket/creds ride the same env surface bootstrap uses (WALG_*), never
-    // the source-PG overlay: credentials in a source table is the wrong
-    // trust direction (plans/add_table.md §Anti-goals)
-    let settings = walrus::config::Settings::from_env()
-        .context("backup_backfill: Settings::from_env (WALG_* env vars)")?;
+    // Archive from the `[backup]` config, never the source-PG overlay:
+    // credentials in a source table is the wrong trust direction
+    // (plans/add_table.md §Anti-goals)
+    let settings = ctx
+        .emitter
+        .backup
+        .as_ref()
+        .context("backup_backfill: object_store initial_load requires a [backup] section")?;
     let storage = settings
         .build_storage()
-        .context("backup_backfill: build storage from WALG_* env vars")?;
+        .context("backup_backfill: build archive storage")?;
     let resolved = walrus::pg::backup::fetch::resolve_name(&storage, "LATEST")
         .await
         .context("backup_backfill: resolve LATEST backup")?;
@@ -163,7 +166,7 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     let (patch, gap_segments) = if b_redo < s_max {
         let seg_dir = ctx.scratch_dir.join("gap_wal");
         let segments =
-            fetch_gap_segments(&settings, &storage, &seg_dir, start.timeline, b_redo, s_max)
+            fetch_gap_segments(settings, &storage, &seg_dir, start.timeline, b_redo, s_max)
                 .await
                 .context(
                     "backup_backfill: fetch archive WAL for the gap (a timeline switch or archive \
@@ -190,7 +193,8 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     };
     outcome.pg_xact_patch_len = patch.len();
 
-    let source = Box::new(ObjectStoreSource::new(settings, storage, resolved).with_parallelism(4));
+    let source =
+        Box::new(ObjectStoreSource::new(settings.clone(), storage, resolved).with_parallelism(4));
     // Tag min(B_redo, S) per rel: gap replay covers (B_redo, S], so walked
     // rows must lose to replayed commits; a backup newer than the opt-in
     // has no replay leg for that rel and tags S
@@ -528,8 +532,9 @@ fn unresolvable_multixact(t: &BackfillTuple) -> String {
 
 /// Fetch archive WAL covering `[from, to]` on `timeline` into `seg_dir`.
 /// A missing segment (archive gap, or the archive switched timelines) errors
-/// through wal-rus's `fetch::handle`.
-async fn fetch_gap_segments(
+/// through wal-rus's `fetch::handle`. Exposed for whole-instance boot refill
+/// (see the `refill_from_archive` path in the stream binary).
+pub async fn fetch_gap_segments(
     settings: &walrus::config::Settings,
     storage: &walrus::storage::DynStorage,
     seg_dir: &Path,

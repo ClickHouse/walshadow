@@ -216,6 +216,12 @@ async fn object_store_bootstrap_ch_end_to_end() {
         &TableTarget::new("default", "t"),
     )
     .expect("write ch-config");
+    // Object-store archive location is a `[backup]` TOML setting now, not
+    // `WALG_*` env. `file://` → FsStorage at the same wal-g root.
+    let archive_uri = format!("file://{}", storage_root.display());
+    let mut ch_config_body = fs::read_to_string(&ch_config_path).expect("read ch-config");
+    ch_config_body.push_str(&format!("\n[backup]\narchive = \"{archive_uri}\"\n"));
+    fs::write(&ch_config_path, ch_config_body).expect("append [backup] to ch-config");
 
     // 6. Shadow layout. `--bootstrap-autospawn-shadow` writes port +
     //    socket overrides into the cloned data dir's auto.conf, so the
@@ -228,15 +234,13 @@ async fn object_store_bootstrap_ch_end_to_end() {
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
 
-    // 7. Spawn walshadow-stream. The daemon reads `WALG_*` env vars
-    //    via `walrus::config::Settings::from_env()`. WALG_FILE_PREFIX
-    //    is the raw filesystem path (no `file://` prefix) — that's the
-    //    wal-g CLI contract `detect_storage` mirrors.
+    // 7. Spawn walshadow-stream. The daemon reads the archive from the
+    //    `[backup]` section of `--ch-config` (built into a
+    //    `walrus::config::Settings`), not `WALG_*` env.
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");
     let stderr_path = tmp.path().join("daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
     let metrics_addr: SocketAddr = format!("127.0.0.1:{METRICS_PORT}").parse().unwrap();
-    let walg_path = storage_root.display().to_string();
     let child = Command::new(bin)
         .args([
             "--host",
@@ -281,10 +285,6 @@ async fn object_store_bootstrap_ch_end_to_end() {
             "--bootstrap-shadow-replay-timeout",
             "120",
         ])
-        // WALG_FILE_PREFIX feeds Settings::from_env's FsStorage path;
-        // the daemon's `bootstrap_mode=object_store` arm reads this
-        // exactly the same way wal-rus's CLI does.
-        .env("WALG_FILE_PREFIX", &walg_path)
         .env("PGHOST", source.config().socket_dir.to_str().unwrap())
         .env("PGPORT", SOURCE_PORT.to_string())
         .env("PGUSER", "postgres")
