@@ -1,15 +1,15 @@
 # Pinned-table DDL baseline — generalize past the boot-time seed
 
-Living doc for the *remaining* schema-event coherency work on
-operator-pinned (and, later, `config_table`) relations.
+Design doc for schema-event coherency on operator-pinned (and,
+via `config_table`) relations.
 
-**Fixed and in code:** a pinned table's first post-start `ALTER ADD
-COLUMN` now replicates without priming DML. `ShadowCatalog::seed_baseline`
+**Boot-time seed:** a pinned table's first post-start `ALTER ADD
+COLUMN` replicates without priming DML. `ShadowCatalog::seed_baseline`
 warms the schema-diff baseline (`prev_known`) with each pinned relation's
 boot-time descriptor before `subscribe()` — called from `bin/stream.rs`
 and the inproc harness, recording the *full source* descriptor so an
-operator-excluded column reads as "excluded", not "added since". Landed
-contract: `plans/emitter.md` "Baseline seeding". Mechanism and tests:
+operator-excluded column reads as "excluded", not "added since". Contract:
+`plans/emitter.md` "Baseline seeding". Mechanism and tests:
 `src/shadow_catalog.rs`, `tests/shadow_catalog.rs`,
 `tests/schema_evolution_pinned.rs`.
 
@@ -21,7 +21,7 @@ across restart, to drops, and to runtime scope changes.
 Non-goal: type-change replication (rejected by `apply_changed`, logged
 not applied; unchanged here).
 
-## Remaining work
+## Baseline coherency across restart, drops, and scope changes
 
 1. **Boot-time drift (Gap 2).** A column added to source while walshadow
    is fully down folds silently into the next boot's seeded baseline, so
@@ -40,7 +40,7 @@ not applied; unchanged here).
    renames and drops across restart — the cases CH-existence cannot own.
    See "Recoverable baseline — the spectrum" (option 3).
 4. **Drop detection for never-fetched relations.** `sweep_dropped` /
-   `emit_dropped` only cover oids present in `prev_known`. Seeding now
+   `emit_dropped` only cover oids present in `prev_known`. Seeding
    covers pinned rels within a lifetime, but a configured-yet-never-
    fetched or auto-create relation dropped at source produces no
    `Dropped` event. Generalise scope to the *configured* set, not the
@@ -51,10 +51,9 @@ not applied; unchanged here).
    relation's baseline synchronously at the config row's commit LSN,
    before its next descriptor fetch. See "Integration with
    `runtime_config_from_pg.md`".
-6. **Remaining tests.** Warm-vs-cold *invariant* equivalence, a
+6. **Tests.** Warm-vs-cold *invariant* equivalence, a
    `RENAME COLUMN` regression (CH `RENAME`, never `DROP`+`ADD`),
-   `DROP COLUMN` coverage, and the CH-existence path. See "Remaining
-   tests".
+   `DROP COLUMN` coverage, and the CH-existence path. See "Tests".
 7. **Temporal catalog (optional).** Bounded version history in the
    walshadow layer; only earns its keep with a second consumer
    (race-free decode under type-change / column-reorder support). Do not
@@ -62,7 +61,7 @@ not applied; unchanged here).
 
 ## The invariant — scope and baseline, not cache warmth
 
-The real defect the reported bug exposed: **the cache decides
+The core defect: **the cache decides
 semantics.** `record_descriptor` (`src/shadow_catalog.rs`) branches
 `Added` vs `Changed` on whether `prev_known` holds the oid, so the same
 relation, same source shape, same config yields different CH SQL purely
@@ -169,7 +168,7 @@ fetched set) fixes drop detection by the same principle.
 Three ways to make `baseline(rel)` recoverable rather than
 cache-resident, weakest to strongest:
 
-1. **Seed from source at boot** — *landed* (`seed_baseline`). Warms
+1. **Seed from source at boot** (`seed_baseline`). Warms
    `prev_known` for every in-scope relation before `subscribe()`, so
    within one daemon lifetime no in-scope relation is ever cold and the
    decision is cache-independent. Re-derived from the live catalog at each
@@ -193,11 +192,11 @@ cache-resident, weakest to strongest:
    no-ops → baseline silently becomes source-now). Most machinery,
    strongest guarantee for renames/drops.
 
-Next step from here: adopt the hybrid in "Querying ClickHouse" — CH
+The hybrid in "Querying ClickHouse": CH
 existence as the table/column *creation* discriminator (durable,
 cache-free, closes Gap-2-for-adds), with a source-shape baseline (the
-landed seed now, option 3's persistence later) retained for rename/drop
-fidelity.
+boot-time seed, option 3's persistence for durability) retained for
+rename/drop fidelity.
 
 ### Querying ClickHouse for the baseline
 
@@ -261,16 +260,16 @@ side before comparison.
 
 If a column is added to source while walshadow is entirely down, at next
 boot the seeded baseline equals the already-evolved source shape, so no
-future diff fires and CH stays behind. The landed seed does not fix this
+future diff fires and CH stays behind. Seeding at boot does not fix this
 by design (it treats the boot shape as the agreed baseline); auto-create
 shares the hole (restart → `Added` → `CREATE IF NOT EXISTS` no-ops →
 baseline silently becomes source-now). The principled closes are above:
 querying CH for existence closes it for `ADD COLUMN` with no persistence,
 and persisting the source-shape baseline (option 3) closes it for
-renames/drops too. Operators recover in the interim by SIGHUP'ing an
-updated mapping.
+renames/drops too. Operators recover without a durable baseline by
+SIGHUP'ing an updated mapping.
 
-A narrower complement, if Gap 2 bites before the durable fix lands:
+A narrower complement, absent a durable baseline:
 reconcile inside `apply_added` for pinned tables — on `Added`, instead of
 skipping, diff the descriptor against the pinned mapping and run
 `ADD COLUMN IF NOT EXISTS` for each descriptor column missing from the
@@ -347,7 +346,7 @@ Under the overlay, `replication_scope` is the resolver's table set, not
   cache miss looks the data up," applied to the baseline ledger and driven
   by the config event instead of by boot.
 
-## Remaining tests
+## Tests
 
 - **Warm-vs-cold invariant.** Drive the same pinned-table `ALTER` twice —
   once with `prev_known` seeded, once with it forcibly cleared between

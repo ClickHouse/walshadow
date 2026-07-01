@@ -21,14 +21,15 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use clickhouse_c::Allocator;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::ch_emitter::{
     ColumnBuf, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TableMapping, TablePlan,
 };
+use crate::config::ResolvedConfig;
 use crate::heap_decoder::{CommittedTuple, HeapOp};
-use crate::pipeline::Fatal;
+use crate::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::shadow_catalog::RelDescriptor;
 
 /// One decoded row routed to its destination. `mapping`/`rel` are `Arc`
@@ -139,24 +140,28 @@ pub fn spawn(
     alloc: Allocator,
     fatal: Fatal,
     stats: Arc<EmitterStats>,
+    mut config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tables: HashMap<String, Table> = HashMap::new();
         let mut epoch: u64 = 0;
-        let mut ticker = tokio::time::interval(cfg.flush_timeout);
+        let mut live = effective_cfg(&cfg, config_rx.as_ref());
+        let mut ticker = tokio::time::interval(live.flush_timeout);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let stats = stats.as_ref();
         loop {
             tokio::select! {
                 msg = msg_rx.recv() => match msg {
                     Some(BatcherMsg::Row(r)) => {
-                        if let Err(e) = handle_row(&mut tables, &cfg, &out, alloc, epoch, r, stats).await {
+                        live = effective_cfg(&cfg, config_rx.as_ref());
+                        if let Err(e) = handle_row(&mut tables, &live, &out, alloc, epoch, r, stats).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
                     }
                     Some(BatcherMsg::Rows(rows)) => {
-                        if let Err(e) = handle_rows(&mut tables, &cfg, &out, alloc, epoch, rows, stats).await {
+                        live = effective_cfg(&cfg, config_rx.as_ref());
+                        if let Err(e) = handle_rows(&mut tables, &live, &out, alloc, epoch, rows, stats).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
@@ -182,9 +187,52 @@ pub fn spawn(
                         break;
                     }
                 }
+                // Live emitter-knob change: re-arm the deadline ticker to the
+                // new flush_timeout. Budgets are re-read per message below.
+                _ = config_changed(&mut config_rx) => {
+                    live = effective_cfg(&cfg, config_rx.as_ref());
+                    ticker = tokio::time::interval(live.flush_timeout);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                }
             }
         }
     })
+}
+
+/// Effective batch knobs: the live resolved snapshot when the overlay is wired,
+/// else the boot config. A zero live `flush_timeout` falls back to the pipeline
+/// default so a cold table can't pin the watermark.
+fn effective_cfg(
+    boot: &BatcherConfig,
+    rx: Option<&watch::Receiver<Arc<ResolvedConfig>>>,
+) -> BatcherConfig {
+    match rx {
+        Some(rx) => {
+            let r = rx.borrow();
+            let flush_timeout = if r.flush_timeout.is_zero() {
+                DEFAULT_PIPELINE_FLUSH
+            } else {
+                r.flush_timeout
+            };
+            BatcherConfig {
+                row_budget: r.row_budget,
+                byte_budget: r.byte_budget,
+                flush_timeout,
+            }
+        }
+        None => *boot,
+    }
+}
+
+/// Resolve once the config watch republishes; parks forever when the overlay
+/// is off, so the select branch stays inert.
+async fn config_changed(rx: &mut Option<watch::Receiver<Arc<ResolvedConfig>>>) {
+    match rx {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Process a decoder's row chunk in order. Chunk only amortizes the channel
@@ -413,6 +461,7 @@ mod tests {
             Allocator::stdlib(),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
+            None,
         );
         for id in 0..3 {
             msg_tx
@@ -466,6 +515,7 @@ mod tests {
             Allocator::stdlib(),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
+            None,
         );
         let chunk = vec![row(0, 0), row(0, 1), row(0, 2), row(1, 0), row(1, 1)];
         msg_tx
@@ -512,6 +562,7 @@ mod tests {
             Allocator::stdlib(),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
+            None,
         );
         msg_tx
             .send(BatcherMsg::Row(row(0, 1)))

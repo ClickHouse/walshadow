@@ -53,7 +53,7 @@ for rendered diagram. Five clusters top→bottom:
    [emitter.md](emitter.md)). One synthetic ack seq per rfn flip;
    `tail.finish` seals partial batches and waits all seqs durable
    before handoff. Metrics-only runs (no `--ch-config`) instead drain
-   through legacy `drain_backfill` into a counting `TupleObserver`
+   through `drain_backfill` into a counting `TupleObserver`
 4. **Shadow handoff** — `BootstrapOutcome { start, end }` returned;
    daemon writes `standby.signal`, appends `restore_command` +
    `primary_conninfo` to shadow's `postgresql.auto.conf`,
@@ -119,9 +119,9 @@ Sink trait surface (`BackupSink`): `#[async_trait]` `start` / `begin`
 share `Arc<Mutex<dyn BackupSink>>`. Async surface is load-bearing:
 `chunk` fires inside tokio runtime context source drives, and
 PageWalkSink's bounded `mpsc::Sender::send(...).await` there is what
-backpressures the tar pump against drain throughput (sync trait +
-unbounded channel was the original shape; made async at b57b64e
-precisely to get this bound)
+backpressures the tar pump against drain throughput (async surface +
+bounded channel exist precisely to get this bound; a sync trait +
+unbounded channel would not)
 
 ## Two source impls
 
@@ -166,7 +166,7 @@ with operator-actionable error pointing at full base
 
 Source path: storage credentials only. Zero source PG load for backup
 payload (catalog seed still needs source reachable; air-gapped restore
-documented as open item)
+requires source connectivity for the seed)
 
 ## Shared helpers
 
@@ -276,8 +276,8 @@ backfill row tags identically
 V1 limits:
 
 - **No FPI replay on backup pages.** Pages with `pd_lsn < start_lsn`
-  captured mid-write walk as-shipped. WAL in `[start_lsn, end_lsn]`
-  updating same tuples re-emits at higher `_lsn` &
+  captured mid-write walk as they land in the backup. WAL in
+  `[start_lsn, end_lsn]` updating same tuples re-emits at higher `_lsn` &
   `ReplacingMergeTree(_lsn)` collapses duplicate
 - **TOAST-spilled columns resolve when a chunk store is configured.**
   Inline varlena decodes through the heap decoder; external pointers
@@ -286,10 +286,10 @@ V1 limits:
   to the store, defers the referring tuples, and reassembles after the
   walk (`resolve_or_fill_toast`, `src/pipeline/bootstrap.rs`). With the
   default `mode = disabled` an unresolved value NULL/default-fills and is
-  counted, no longer a hard reject. Full chunk-storage design in
+  counted, not rejected. Full chunk-storage design in
   [TOAST.md](TOAST.md)
-- **2C CH-side COPY load NOT shipped.** See
-  [What is NOT 2C](#what-is-not-2c-ch-side-copy-load) below
+- **No 2C CH-side COPY load.** PageWalkSink (2A) is the sole
+  initial-load path; see [Why not 2C](#why-not-2c-ch-side-copy-load) below
 
 Rfn contiguity is load-bearing for ack accounting: `PageWalkSink`
 emits all rows for one rfn contiguously before moving on, so
@@ -305,7 +305,7 @@ only after `tail.finish`
 ## Catalog resolution — two sources, no trait
 
 Bootstrap & steady-state resolve `filenode → descriptor` against
-different catalog sources, but no adapter trait shipped:
+different catalog sources, with no adapter trait between them:
 
 - steady-state decode pool calls
   `shadow_catalog::resolve_at_pooled(&Arc<Mutex<ShadowCatalog>>, rfn,
@@ -316,17 +316,16 @@ different catalog sources, but no adapter trait shipped:
   `.get(db_node, rel_node)` — no replay gate applies; unknown
   filenodes skip the row (bumps `unsupported_relations`)
 
-A `RelationResolver` trait abstracting the two was designed (one
-vtable per row) but never landed — the bootstrap drain predates the
-shared tail and grew its own simpler path. Revisit only if a third
-catalog source appears; `detoast_heap`'s `ShadowCatalog` dependency is
-the blocker noted in
+A `RelationResolver` trait abstracting the two (one vtable per row) is
+not warranted: the bootstrap drain uses a simpler direct path than the
+shared tail. Worth revisiting only if a third catalog source appears;
+`detoast_heap`'s `ShadowCatalog` dependency is the blocker noted in
 [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
 (bootstrap decode-pool Option B)
 
-Three buffer shapes were prototyped in parallel worktrees: spool to
-disk, in-mem buffer + sync block, catalog adapter. Catalog adapter
-shipped because it is only shape with bounded memory at scale
+Three buffer shapes are possible: spool to disk, in-mem buffer + sync
+block, catalog adapter. Bootstrap uses the catalog adapter because it
+is the only shape with bounded memory at scale
 (`O(tables × byte_budget)`) & no on-disk format
 
 ## Orchestrator
@@ -359,8 +358,7 @@ shipped because it is only shape with bounded memory at scale
 
 `BootstrapOutcome { start, end, disk: DiskLanderStats, page_walk:
 PageWalkStats }` carries LSN pair plus per-sink counters. CLI logs
-one-line summary at INFO; metrics integration is open work
-(carry-forward item)
+one-line summary at INFO; counters do not feed the metrics pipeline
 
 Error handling: source pump errors propagate through JoinHandle; drain
 task errors return through `drain_backfill` future. Both must be
@@ -368,19 +366,18 @@ task errors return through `drain_backfill` future. Both must be
 is emitter rejection — `bootstrap drain: emitter rejected tuple`
 wraps inner `DecoderSinkError` with context
 
-## What is NOT 2C CH-side COPY load
+## Why not 2C CH-side COPY load
 
-BASEBACKUP.md proposed Use Case 2C — parallel `COPY` from source PG to
-CH, coordinated against `pg_export_snapshot()` so COPY snapshot &
-BASE_BACKUP's start checkpoint align. Recommended as v1.0 default in
-original doc. **Not shipped.** PageWalkSink (2A) is only initial-load
-path today
+BASEBACKUP.md's Use Case 2C is parallel `COPY` from source PG to CH,
+coordinated against `pg_export_snapshot()` so COPY snapshot &
+BASE_BACKUP's start checkpoint align. Bootstrap does not use it;
+PageWalkSink (2A) is the sole initial-load path
 
 Why: 2C's per-OID binary-COPY adapter list (`decode_numeric_pgcopy_binary`
-& peers) is net-new codec walshadow would carry forever, growing as
-type coverage expands. 2A's deferred work (FPI replay, TOAST chunk
-decode, on-disk page → tuple projection) is WAL-decoder work emitter
-has to land anyway. One decoder vs two — 2A wins on maintenance cost
+& peers) is a separate codec walshadow would carry forever, growing as
+type coverage expands. 2A's outstanding items (FPI replay, TOAST chunk
+decode, on-disk page → tuple projection) are WAL-decoder work emitter
+needs anyway. One decoder vs two — 2A wins on maintenance cost
 
 PageWalkSink walks pages from BASE_BACKUP tar bytes; does not issue
 `COPY` against source PG. Source-side load during bootstrap is purely
@@ -442,7 +439,7 @@ override via `ALTER SYSTEM` after first boot
 Sync `pg_ctl` + `psql` shells run inside `tokio::task::block_in_place`
 so multi-threaded runtime keeps making forward progress on other tasks
 while `wait_for_replay` polls. Single-threaded runtime would deadlock
-here — documented constraint at design time
+here — hard constraint
 
 `--bootstrap-shadow-replay-timeout` (default 300 s) bounds wait.
 Operator-supplied `--shadow-socket-dir` / `--shadow-port` flags double

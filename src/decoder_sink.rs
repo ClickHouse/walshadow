@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::heap_decoder::{CommittedTuple, DecodeError};
+use crate::runtime_config::ConfigEvent;
 use crate::shadow_catalog::{CatalogError, SchemaEvent};
 use crate::wal_stream::SinkError;
 
@@ -62,6 +63,17 @@ pub trait TupleObserver: Send {
     fn on_schema_event<'a>(
         &'a mut self,
         _event: &'a SchemaEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Dispatched alongside `on_schema_event` for a source-PG config-table
+    /// write, at its `source_lsn` in the drain. The parallel pipeline applies
+    /// config in the reorder coordinator's barrier instead, so this fires only
+    /// on the serial drain path; default no-op.
+    fn on_config_event<'a>(
+        &'a mut self,
+        _event: &'a ConfigEvent,
     ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }

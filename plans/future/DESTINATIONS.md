@@ -170,14 +170,13 @@ host = "ch-analytics"; port = 9000; database = "an"; ...
 ```
 
 Routing *rules* (which relation → which destination) are logical, not
-connection state, so they belong in the runtime-config overlay once it
-lands: extend `config_table` / `config_namespace` (see
-`plans/future/runtime_config_from_pg.md` §1) with a `destinations
-text[]` column. Until the overlay ships, rules live in TOML
-`[table.…]` / `[namespace.…]` blocks with a new `destinations` field
-(absent → the single default destination, preserving today's behavior
-byte-for-byte). This makes §0 the zero-destination-config special case
-of §2, so existing TOML keeps working unchanged.
+connection state, so they belong in the runtime-config overlay: extend
+`config_table` / `config_namespace` (schema in [../config.md](../config.md))
+with a `destinations text[]` column. TOML `[table.…]` / `[namespace.…]` blocks
+gain a `destinations` field (absent → the single default destination, preserving
+the single-destination behavior byte-for-byte). This makes §0 the
+zero-destination-config special case of §2, so existing TOML keeps working
+unchanged.
 
 ## 7. What does not change
 

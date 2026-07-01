@@ -31,16 +31,18 @@ use crate::wal_stream::{Record, RecordSink, SinkError};
 use tracing::Instrument;
 
 use crate::xact_buffer::{
-    DrainedXact, SchemaEventRx, SubxactTracker, TxnSpanRegistry, XLOG_XACT_ABORT,
+    DrainEntry, DrainedXact, SchemaEventRx, SubxactTracker, TxnSpanRegistry, XLOG_XACT_ABORT,
     XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
     XLOG_XACT_OPMASK, XactBuffer, drain_pending_schema_events, parse_xact_assignment,
     parse_xact_payload,
 };
 
+use crate::config::ConfigResolver;
 use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::BatcherMsg;
 use crate::pipeline::decode::{DecodeJob, ToastChunks};
+use crate::runtime_config::ConfigEvent;
 use crate::toast::ToastResolver;
 
 pub struct ReorderSink {
@@ -66,6 +68,10 @@ pub struct ReorderSink {
     /// later re-emit of a pre-window referrer can rebuild its value. No-op
     /// when disabled.
     resolver: ToastResolver,
+    /// Runtime-config overlay resolver. `Some` with the config overlay active;
+    /// a `DrainEntry::Config` applies to it inside the barrier fence so
+    /// trailing rows route against post-config state (plan §6).
+    config_resolver: Option<Arc<ConfigResolver>>,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
     /// Per-txn span map (shared with the pump + buffer). `Some` only when
@@ -88,6 +94,7 @@ impl ReorderSink {
         msg_tx: mpsc::Sender<BatcherMsg>,
         stats: Arc<EmitterStats>,
         resolver: ToastResolver,
+        config_resolver: Option<Arc<ConfigResolver>>,
         fatal: Fatal,
         span_registry: Option<TxnSpanRegistry>,
     ) -> Self {
@@ -103,6 +110,7 @@ impl ReorderSink {
             msg_tx,
             stats,
             resolver,
+            config_resolver,
             fatal,
             next_seq: 0,
             span_registry,
@@ -121,6 +129,20 @@ impl ReorderSink {
                 .message()
                 .unwrap_or_else(|| "pipeline fatal".into()),
         )
+    }
+
+    /// Apply a config-table change to the resolver inside the barrier fence, so
+    /// the fenced routing-map write lands before the trailing segment
+    /// dispatches. Infallible (Regime A): a malformed value is rejected at
+    /// merge and logged, never fatal.
+    ///
+    /// Owned args, not `&self`: `ReorderSink` holds a `!Sync` CH client, so a
+    /// shared self-borrow held across the apply's `.await` would poison the
+    /// `on_record` future's `Send` bound.
+    async fn apply_config(config_resolver: Option<Arc<ConfigResolver>>, event: ConfigEvent) {
+        if let Some(cfg) = config_resolver {
+            cfg.apply_config_event(event).await;
+        }
     }
 
     /// Drain pending DROP events (post-`sweep_dropped`) into the buffer keyed
@@ -302,7 +324,12 @@ impl ReorderSink {
                 self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
                     .await?;
                 self.barrier_fence().await?;
-                self.apply_event(&ordered_events[ev_cursor].1).await?;
+                match &ordered_events[ev_cursor].1 {
+                    DrainEntry::Catalog(ev) => self.apply_event(ev).await?,
+                    DrainEntry::Config(ev) => {
+                        Self::apply_config(self.config_resolver.clone(), ev.clone()).await
+                    }
+                }
                 ev_cursor += 1;
             }
             if matches!(heap.op, HeapOp::Truncate) {
@@ -319,7 +346,12 @@ impl ReorderSink {
             self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
                 .await?;
             self.barrier_fence().await?;
-            self.apply_event(&ordered_events[ev_cursor].1).await?;
+            match &ordered_events[ev_cursor].1 {
+                DrainEntry::Catalog(ev) => self.apply_event(ev).await?,
+                DrainEntry::Config(ev) => {
+                    Self::apply_config(self.config_resolver.clone(), ev.clone()).await
+                }
+            }
             ev_cursor += 1;
         }
         // Trailing data flows async like a normal commit, already encoding

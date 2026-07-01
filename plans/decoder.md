@@ -110,7 +110,7 @@ ntuples:u16
 ```
 
 Gate is `XLH_INSERT_CONTAINS_NEW_TUPLE` (bit 3), **not**
-`XLH_INSERT_NO_LOGICAL` as earlier plan drafted. PG sets
+`XLH_INSERT_NO_LOGICAL`. PG sets
 `CONTAINS_NEW_TUPLE` whenever logical decoding needs payload, and
 walshadow's hard `wal_level=logical` floor means bit is effectively
 always on; missing-bit treated as "writer stripped payload, skip
@@ -202,8 +202,8 @@ in-line compressed), on-disk TOAST pointer `varattrib_1b_e`
 | 114 | json | `Json(String)` (varlena text on disk, passed through) |
 
 In-line compressed varlenas (`pglz` / `lz4` body inside regular column,
-distinct from FPI compression) surface as `Unsupported` today;
-oracle's roadmap covers them. TOAST pointers surface as
+distinct from FPI compression) surface as `Unsupported`; handling them
+is scoped to the oracle path. TOAST pointers surface as
 `ExternalToast(ToastPointer { va_rawsize, va_extinfo, va_valueid,
 va_toastrelid })` for TOAST reassembly to dereference
 
@@ -269,10 +269,9 @@ Decoder closes gap via `missing_value_for(att)`:
 - Anything else: `PgPending { type_oid, raw: text.as_bytes().to_vec() }`
   so shadow's `typinput` recovers bytea via oracle path
 
-> Earlier plan sketched `codecs.rs` binary array-element decoder at
-> missing-value path. That implementation did not land. Actual code
-> uses `RelAttr.missing_text` (PG-text form) and `missing_value_for(att)`
-> which routes Tier 3 through `PgPending` instead of binary decoding
+Missing-value path uses `RelAttr.missing_text` (PG-text form) and
+`missing_value_for(att)`, which routes Tier 3 through `PgPending` rather
+than decoding binary array elements in `codecs.rs`
 
 Physical NULL (bitmap bit clear within writer's `natts` window) still
 wins: missing-value substitution only fires for trailing attributes
@@ -368,14 +367,13 @@ record eagerly, leaves abort-then-ghost-row reconciliation to buffer
 
 ## Cross-major fixture concerns
 
-MULTI_INSERT and `xl_xact_commit` tail-walk semantics have **not** been
-pinned by per-major captured fixtures across PG 16/17/18. Risk called
-for snapshotting MULTI_INSERT fixtures via existing
-`tests/classify_fixture.rs` infra; not landed. Same gap exists for
+MULTI_INSERT and `xl_xact_commit` tail-walk semantics lack per-major
+captured fixtures across PG 16/17/18. `tests/classify_fixture.rs` infra
+snapshots MULTI_INSERT fixtures; the same fixture gap covers
 `XACT_XINFO_HAS_SUBXACTS` layout. Drift in either record's per-major
 shape would surface as silent decode mismatch on exactly one major.
 Tracked in [future/parked.md](future/parked.md). Structural cousins —
 `xl_heap_*` headers, `xl_heap_multi_insert` field order,
 `attmissingval` encoding — are stable per WAL alignment memory note +
-direct catalog cross-check against PG 16/17/18 source, but
-fixture-level confirmation is owed
+direct catalog cross-check against PG 16/17/18 source, absent
+fixture-level confirmation

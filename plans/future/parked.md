@@ -7,8 +7,8 @@ allocation-audit pass. One-line per item
 
 * **Deduplicate `ChServer` fixture across `tests/pipeline_e2e.rs` +
   tests/common.** Two callers using one vendored ChServer is fine;
-  third caller lifts to shared. Already lifted `bootstrap_ch_fixture`
-  + `http_get` / `parse_metric`
+  third caller lifts to shared. `bootstrap_ch_fixture`
+  + `http_get` / `parse_metric` are shared
 * **OnceCell shared CH-server fixture.** Five acceptance tests each
   spawn own CH (~5 s × N startup). Total CI cost ~25 s of unique
   boot time. Flag if test count doubles
@@ -19,7 +19,7 @@ allocation-audit pass. One-line per item
   `tests/classify_fixture.rs`.** Cross-major drift in tail-walk
   semantics would surface as silent decoder mismatch under one
   specific major. cross-major snapshot fixtures called for snapshot
-  fixtures across majors. Not done
+  fixtures across majors
 
 ## Drive currently-skipped tests
 
@@ -50,7 +50,7 @@ remain unverified against live topology until driven
   allocator pressure
 * **`XLogRecord.blocks` smallvec.** Records average 0-2 blocks;
   `SmallVec<[_; 2]>` keeps common case stack-resident. Allocation
-  polish below byte-traffic wins already booked via Cow
+  polish below byte-traffic wins from Cow
 * **Header-walk single-pass merge.** `record.blocks` walk runs
   twice (once for IDs, once for payloads) in wal-rus parser. Merge
   into single pass since IDs arrive in order. Leftover from wal-g
@@ -78,7 +78,7 @@ remain unverified against live topology until driven
 * **TRUNCATE strategy knob.** v1 emits single `TRUNCATE TABLE <dest>`
   per relation. Per-table `truncate_strategy = "passthrough" |
   "ignore"` knob once downstream consumer asks. Defer-until-asked
-* **DROP TABLE propagation polish.** Basic path landed via
+* **DROP TABLE propagation polish.** Basic path runs via
   `SchemaEvent` + `DrainEntry::Catalog` channel. Corner cases
   (CASCADE, RESTRICT, dependent objects) need pinning against
   fixture matrix

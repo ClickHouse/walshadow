@@ -15,10 +15,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use clickhouse_c::Allocator;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::ch_emitter::{EmitterConfig, EmitterError, EmitterStats};
+use crate::config::ResolvedConfig;
 use crate::pipeline::ack::{self, AckHandle};
 use crate::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::pipeline::inserter;
@@ -94,6 +95,20 @@ pub async fn spawn(
     emitter_ack: Arc<AtomicU64>,
     fatal: Fatal,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
+    spawn_with_config(emitter, inserter_pool_size, stats, emitter_ack, fatal, None).await
+}
+
+/// [`spawn`] plus a live config receiver: the batcher re-reads
+/// budgets/flush and the inserter pool re-reads compression/retry from it on
+/// each republish. `None` == boot values only (bootstrap + tests use [`spawn`]).
+pub async fn spawn_with_config(
+    emitter: &EmitterConfig,
+    inserter_pool_size: usize,
+    stats: Arc<EmitterStats>,
+    emitter_ack: Arc<AtomicU64>,
+    fatal: Fatal,
+    config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
     let n = inserter_pool_size.max(1);
 
     let (ack, collector) = ack::spawn(emitter_ack);
@@ -110,9 +125,11 @@ pub async fn spawn(
         ack.clone(),
         stats.clone(),
         fatal.clone(),
+        config_rx.clone(),
     )
     .await?;
 
+    // Boot fallback for the batcher; the live path re-reads from `config_rx`.
     let flush_timeout = if emitter.flush_timeout.is_zero() {
         DEFAULT_PIPELINE_FLUSH
     } else {
@@ -129,6 +146,7 @@ pub async fn spawn(
         Allocator::global(&mimalloc::MiMalloc),
         fatal,
         stats.clone(),
+        config_rx,
     );
 
     Ok((

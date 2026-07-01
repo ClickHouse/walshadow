@@ -54,6 +54,7 @@ use crate::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, HeapOp, ToastPointer, decode_heap_record,
 };
 use crate::pipeline::decode::RelCache;
+use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent, ShadowCatalog};
 use crate::spill::{SpillEntry, SpillError, SpillStore, SpillWriter, ToastChunk};
 use crate::toast::{ChunkMap, ToastResolver};
@@ -429,6 +430,21 @@ impl XactBufferStats {
     }
 }
 
+/// One non-tuple item interleaved into a committed xact's drain, ordered by
+/// `source_lsn`. Heap tuples ride the sibling `heaps` vec (batched for the
+/// decode pool); a `DrainEntry` is applied in WAL order *between* heap
+/// segments. `Catalog` is DDL the applicator fences on. The runtime-config
+/// work (`plans/future/runtime_config_from_pg.md` §3, §6) extends this with
+/// `Config`/`Signal`, which flow through the same per-xid queue and so inherit
+/// the merge tie-break: a control event sorts before a heap at equal LSN.
+#[derive(Debug, Clone)]
+pub enum DrainEntry {
+    Catalog(SchemaEvent),
+    /// Source-PG config-table write, applied at its position to the resolver
+    /// so trailing rows in the same xact route against the post-config shape.
+    Config(ConfigEvent),
+}
+
 struct XactState {
     /// Sticky across spill rotations; distinguishes two xids that collide
     /// after a slot rebuild
@@ -441,7 +457,7 @@ struct XactState {
     spill_bytes: u64,
     /// source_lsn ASC. Not spilled: events carry rich `RelDescriptor`
     /// data a spill format would duplicate, and DDL per xact is rare
-    catalog_events: Vec<(u64, SchemaEvent)>,
+    events: Vec<(u64, DrainEntry)>,
     /// Per-txn `txn` span; duration = WAL-record→durable latency.
     span: tracing::Span,
     /// Child of `span` covering first-buffered→COMMIT-observed (parked-for-
@@ -624,7 +640,7 @@ impl XactState {
             in_mem_bytes: 0,
             spill: None,
             spill_bytes: 0,
-            catalog_events: Vec::new(),
+            events: Vec::new(),
             span,
             wait_span,
         }
@@ -758,7 +774,7 @@ impl XactBuffer {
                         }
                     }
                 }
-                for (lsn, _) in &st.catalog_events {
+                for (lsn, _) in &st.events {
                     last_lsn = last_lsn.max(*lsn);
                 }
                 let rels_str = rels
@@ -774,7 +790,7 @@ impl XactBuffer {
                     chunk_count,
                     in_mem_bytes: st.in_mem_bytes as u64,
                     spilled: st.spill.is_some(),
-                    catalog_events: st.catalog_events.len() as u64,
+                    catalog_events: st.events.len() as u64,
                     rels: rels_str,
                 }
             })
@@ -806,9 +822,9 @@ impl XactBuffer {
         self.absorb(xid, first_lsn, entry).await
     }
 
-    /// Drains in `source_lsn` order at commit, so a DDL's `Added`/`Changed`
-    /// event lands BEFORE the heap writes that follow it
-    pub fn on_schema_event(&mut self, xid: u32, source_lsn: u64, event: SchemaEvent) {
+    /// Lazily insert the xid's state (adopting its `txn` span) and queue a
+    /// control event at `source_lsn` for the commit-drain k-way merge.
+    fn push_drain_entry(&mut self, xid: u32, source_lsn: u64, entry: DrainEntry) {
         let is_new = !self.inflight.contains_key(&xid);
         let registry = &self.span_registry;
         let st = self.inflight.entry(xid).or_insert_with(|| {
@@ -821,11 +837,23 @@ impl XactBuffer {
             });
             XactState::new(source_lsn, span)
         });
-        st.catalog_events.push((source_lsn, event));
+        st.events.push((source_lsn, entry));
         if is_new {
             self.stats.xacts_active += 1;
             self.stats.xacts_total += 1;
         }
+    }
+
+    /// Drains in `source_lsn` order at commit, so a DDL's `Added`/`Changed`
+    /// event lands BEFORE the heap writes that follow it
+    pub fn on_schema_event(&mut self, xid: u32, source_lsn: u64, event: SchemaEvent) {
+        self.push_drain_entry(xid, source_lsn, DrainEntry::Catalog(event));
+    }
+
+    /// Config-table write, interleaved into the drain at its `source_lsn` so it
+    /// applies before the heap writes it precedes in WAL (plan §6)
+    pub fn on_config_event(&mut self, xid: u32, source_lsn: u64, event: ConfigEvent) {
+        self.push_drain_entry(xid, source_lsn, DrainEntry::Config(event));
     }
 
     async fn absorb(
@@ -1015,8 +1043,7 @@ impl XactBuffer {
         // sibling `VecDeque<(u64, SchemaEvent)>` per xid for the k-way
         // merge below — they don't spill.
         let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
-        let mut per_xid_catalog: Vec<VecDeque<(u64, SchemaEvent)>> =
-            Vec::with_capacity(states.len());
+        let mut per_xid_events: Vec<VecDeque<(u64, DrainEntry)>> = Vec::with_capacity(states.len());
         for mut st in states.drain(..) {
             let in_mem = std::mem::take(&mut st.in_mem);
             let mut entries: VecDeque<SpillEntry> = VecDeque::with_capacity(in_mem.len());
@@ -1034,15 +1061,15 @@ impl XactBuffer {
             per_xid.push(entries);
             // Arrival order == WAL order: decoder sink pushes on observe,
             // so the Vec is already source_lsn ASC
-            let cat: VecDeque<(u64, SchemaEvent)> = std::mem::take(&mut st.catalog_events).into();
-            per_xid_catalog.push(cat);
+            let evs: VecDeque<(u64, DrainEntry)> = std::mem::take(&mut st.events).into();
+            per_xid_events.push(evs);
         }
 
         // k-way merge of per_xid heads by `source_lsn` ASC. k = 1 +
         // nsubxacts, typically <= 4, so linear head-pick beats a heap
         let mut heaps: Vec<DecodedHeap> = Vec::new();
         let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
-        let mut ordered_events: Vec<(usize, SchemaEvent)> = Vec::new();
+        let mut ordered_events: Vec<(usize, DrainEntry)> = Vec::new();
         // `merge` brackets the (fully synchronous) k-way merge — confirms
         // it's cheap rather than an O(n²) surprise on subxact-heavy xacts.
         // Entered only across sync work; dropped before the dispatch awaits
@@ -1059,23 +1086,26 @@ impl XactBuffer {
             #[derive(Clone, Copy)]
             enum Pick {
                 Spill(usize, u64),
-                Catalog(usize, u64),
+                Event(usize, u64),
             }
             let mut best: Option<Pick> = None;
             let best_lsn = |p: Pick| match p {
-                Pick::Spill(_, l) | Pick::Catalog(_, l) => l,
+                Pick::Spill(_, l) | Pick::Event(_, l) => l,
             };
-            // Catalog wins ties: PG writes the DDL catalog mutation before
-            // the dependent heap, and the lazy refetch stamps the schema
-            // event with the triggering heap's source_lsn, so they share
-            // an LSN. Catalog-first lands the `ALTER` on CH before the
-            // dependent INSERT encodes against the post-DDL shape
-            for (i, q) in per_xid_catalog.iter().enumerate() {
+            // Control events (`DrainEntry`) win ties against heaps: PG writes
+            // a DDL's catalog mutation before the dependent heap, and the lazy
+            // refetch stamps the schema event with the triggering heap's
+            // source_lsn, so they share an LSN. Event-first lands the `ALTER`
+            // on CH before the dependent INSERT encodes against the post-DDL
+            // shape. The events loop runs before the heaps loop and uses `<=`
+            // (heaps use `<`), so any `DrainEntry` — Catalog now, Config/Signal
+            // per runtime-config §3/§6 — inherits the same tie-break
+            for (i, q) in per_xid_events.iter().enumerate() {
                 let Some(&(lsn, _)) = q.front() else {
                     continue;
                 };
                 if best.is_none_or(|b| lsn <= best_lsn(b)) {
-                    best = Some(Pick::Catalog(i, lsn));
+                    best = Some(Pick::Event(i, lsn));
                 }
             }
             for (i, q) in per_xid.iter().enumerate() {
@@ -1093,8 +1123,8 @@ impl XactBuffer {
                     let entry = per_xid[i].pop_front().expect("just peeked head");
                     accumulate(entry, &mut heaps, &mut chunks);
                 }
-                Pick::Catalog(i, _) => {
-                    let (_lsn, ev) = per_xid_catalog[i].pop_front().expect("just peeked head");
+                Pick::Event(i, _) => {
+                    let (_lsn, ev) = per_xid_events[i].pop_front().expect("just peeked head");
                     // Event sorts before heaps[heaps.len()]
                     ordered_events.push((heaps.len(), ev));
                 }
@@ -1107,12 +1137,18 @@ impl XactBuffer {
         for (heap_idx, mut heap) in heaps.into_iter().enumerate() {
             while event_cursor < ordered_events.len() && ordered_events[event_cursor].0 <= heap_idx
             {
-                let ev = &ordered_events[event_cursor].1;
-                observer
-                    .on_schema_event(ev)
-                    .instrument(drain_span.clone())
-                    .await
-                    .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+                match &ordered_events[event_cursor].1 {
+                    DrainEntry::Catalog(ev) => observer
+                        .on_schema_event(ev)
+                        .instrument(drain_span.clone())
+                        .await
+                        .map_err(|e| XactBufferError::Observer(e.to_string()))?,
+                    DrainEntry::Config(ev) => observer
+                        .on_config_event(ev)
+                        .instrument(drain_span.clone())
+                        .await
+                        .map_err(|e| XactBufferError::Observer(e.to_string()))?,
+                }
                 event_cursor += 1;
             }
             detoast_heap(&mut heap, &chunks, catalog, false, resolver).await?;
@@ -1132,12 +1168,18 @@ impl XactBuffer {
         }
         // Trailing events with no heap after them
         while event_cursor < ordered_events.len() {
-            let ev = &ordered_events[event_cursor].1;
-            observer
-                .on_schema_event(ev)
-                .instrument(drain_span.clone())
-                .await
-                .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+            match &ordered_events[event_cursor].1 {
+                DrainEntry::Catalog(ev) => observer
+                    .on_schema_event(ev)
+                    .instrument(drain_span.clone())
+                    .await
+                    .map_err(|e| XactBufferError::Observer(e.to_string()))?,
+                DrainEntry::Config(ev) => observer
+                    .on_config_event(ev)
+                    .instrument(drain_span.clone())
+                    .await
+                    .map_err(|e| XactBufferError::Observer(e.to_string()))?,
+            }
             event_cursor += 1;
         }
         // drain_lsn ticks before the ack so an observer failure leaves
@@ -1222,8 +1264,7 @@ impl XactBuffer {
 
         // Spill (older) then in-mem per xid, source_lsn-ASC; see [`Self::commit`]
         let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
-        let mut per_xid_catalog: Vec<VecDeque<(u64, SchemaEvent)>> =
-            Vec::with_capacity(states.len());
+        let mut per_xid_events: Vec<VecDeque<(u64, DrainEntry)>> = Vec::with_capacity(states.len());
         for mut st in states.drain(..) {
             let in_mem = std::mem::take(&mut st.in_mem);
             let mut entries: VecDeque<SpillEntry> = VecDeque::with_capacity(in_mem.len());
@@ -1239,31 +1280,33 @@ impl XactBuffer {
             }
             entries.extend(in_mem);
             per_xid.push(entries);
-            let cat: VecDeque<(u64, SchemaEvent)> = std::mem::take(&mut st.catalog_events).into();
-            per_xid_catalog.push(cat);
+            let evs: VecDeque<(u64, DrainEntry)> = std::mem::take(&mut st.events).into();
+            per_xid_events.push(evs);
         }
 
         let mut heaps: Vec<DecodedHeap> = Vec::new();
         let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
-        let mut ordered_events: Vec<(usize, SchemaEvent)> = Vec::new();
+        let mut ordered_events: Vec<(usize, DrainEntry)> = Vec::new();
         loop {
             #[derive(Clone, Copy)]
             enum Pick {
                 Spill(usize, u64),
-                Catalog(usize, u64),
+                Event(usize, u64),
             }
             let mut best: Option<Pick> = None;
             let best_lsn = |p: Pick| match p {
-                Pick::Spill(_, l) | Pick::Catalog(_, l) => l,
+                Pick::Spill(_, l) | Pick::Event(_, l) => l,
             };
-            // Catalog events tie-break first: PG writes the DDL's catalog
-            // mutation before the dependent heap, and they can share an LSN.
-            for (i, q) in per_xid_catalog.iter().enumerate() {
+            // Control events (`DrainEntry`) tie-break before heaps at equal
+            // LSN: PG writes a DDL's catalog mutation before the dependent
+            // heap, and they can share an LSN. Config/Signal (runtime-config
+            // §3/§6) extend the same queue and inherit this ordering.
+            for (i, q) in per_xid_events.iter().enumerate() {
                 let Some(&(lsn, _)) = q.front() else {
                     continue;
                 };
                 if best.is_none_or(|b| lsn <= best_lsn(b)) {
-                    best = Some(Pick::Catalog(i, lsn));
+                    best = Some(Pick::Event(i, lsn));
                 }
             }
             for (i, q) in per_xid.iter().enumerate() {
@@ -1281,8 +1324,8 @@ impl XactBuffer {
                     let entry = per_xid[i].pop_front().expect("just peeked head");
                     accumulate(entry, &mut heaps, &mut chunks);
                 }
-                Pick::Catalog(i, _) => {
-                    let (_lsn, ev) = per_xid_catalog[i].pop_front().expect("just peeked head");
+                Pick::Event(i, _) => {
+                    let (_lsn, ev) = per_xid_events[i].pop_front().expect("just peeked head");
                     ordered_events.push((heaps.len(), ev));
                 }
             }
@@ -1387,8 +1430,9 @@ pub struct DrainedXact {
     pub commit_lsn: u64,
     pub heaps: Vec<DecodedHeap>,
     pub chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
-    /// Event sorts before `heaps[heap_index]`
-    pub ordered_events: Vec<(usize, SchemaEvent)>,
+    /// Each entry sorts before `heaps[heap_index]`; `DrainEntry::Catalog` is
+    /// the only variant today, Config/Signal extend it per runtime-config plan
+    pub ordered_events: Vec<(usize, DrainEntry)>,
     /// False for read-only / filter-dropped / unknown xid
     pub had_states: bool,
 }
@@ -1890,6 +1934,9 @@ pub struct BufferingDecoderSink {
     /// at worker position, keyed by the record's xid so the commit sink
     /// consumes it only at that xact's own commit
     pending_sweeps: Option<crate::catalog_tracker::PendingSweeps>,
+    /// Source-PG schema holding the `config_*` overlay tables. `Some` diverts
+    /// their heap writes to `on_config_event` (never CH); `None` = overlay off.
+    config_schema: Option<Arc<str>>,
 }
 
 impl BufferingDecoderSink {
@@ -1903,6 +1950,7 @@ impl BufferingDecoderSink {
             rel_cache: None,
             invalidation_epoch: None,
             pending_sweeps: None,
+            config_schema: None,
         }
     }
 
@@ -1918,6 +1966,15 @@ impl BufferingDecoderSink {
     ) -> Self {
         self.invalidation_epoch = Some(invalidation);
         self.pending_sweeps = pending_sweeps;
+        self
+    }
+
+    /// Names the source-PG schema whose `config_*` tables carry the runtime
+    /// config overlay (`[runtime_config] schema`). Their heap writes divert to
+    /// `on_config_event` instead of CH routing (plan §2); `None` keeps the
+    /// decoder overlay-unaware.
+    pub fn with_config_schema(mut self, schema: Arc<str>) -> Self {
+        self.config_schema = Some(schema);
         self
     }
 
@@ -2160,6 +2217,23 @@ impl RecordSink for BufferingDecoderSink {
                 self.stats
                     .skipped_op
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            // Runtime-config overlay: config-table heap writes never reach CH.
+            // Detect by resolved qualified name (rotation-proof — a rewritten
+            // relfilenode still resolves to the same schema.name), interpret each
+            // tuple into a ConfigEvent stamped (xid, source_lsn) so it drains in
+            // WAL order and applies at its commit LSN (plan §2/§6).
+            if let Some(schema) = self.config_schema.as_deref()
+                && rel.namespace_name.as_str() == schema
+                && let Some(kind) = ConfigTableKind::from_relname(rel.name.as_str())
+            {
+                let mut buf = self.buffer.lock().await;
+                for decoded in &decoded_set {
+                    if let Some(ev) = crate::runtime_config::interpret(kind, decoded, &rel) {
+                        buf.on_config_event(decoded.xid, decoded.source_lsn, ev);
+                    }
+                }
                 return Ok(());
             }
             let n_decoded = decoded_set.len();

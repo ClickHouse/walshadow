@@ -14,11 +14,11 @@ ack,tail,mod}.rs`; encoding primitives (`EmitterConfig`, `TableEncoder`,
 `src/ch_emitter.rs`; DDL in `src/ch_ddl.rs`; PG → CH type mapping in
 `src/type_bridge.rs`. Pool sizes M/N come from `--decoder-pool-size` /
 `--inserter-pool-size`; size 1 is the degenerate serial case. Design
-history + remaining scaling work in
+and scaling axes in
 [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
 
-The pipeline stands up only with `--ch-config`. Metrics-only runs keep
-the legacy serial path: `XactRecordSink` draining into a
+The pipeline stands up only with `--ch-config`. Metrics-only runs use
+the serial path: `XactRecordSink` draining into a
 `TupleObserver` (`MetricsTupleObserver`, oracle-wrapped when
 `--validate` is up) — counters, no CH
 
@@ -305,28 +305,29 @@ override. The per-namespace `target_database` drives both the CREATE
 and the derived row-routing mapping, so rows and DDL land in the same
 database
 
-## NOT yet landed for namespace mapping
+## Namespace mapping gaps
 
-`auto_create`, `target_database`, and `drop_table_strategy` ship, plus
+`auto_create`, `target_database`, and `drop_table_strategy` resolve through
 the resolver substrate ([config.md](config.md)): `ResolvedConfig`
 (`tables` + `namespaces` + `columns` type-override table) published on a
-`watch::Receiver<Arc<ResolvedConfig>>`, CLI > TOML merge, SIGHUP
-republish. The decode pool still reads `Arc<RwLock<HashMap>>` for the
-per-row hot path; a refresher bridges the watch snapshot into it. The
-richer namespace surface the plan called for is still missing:
+`watch::Receiver<Arc<ResolvedConfig>>`, CLI > PG-row > TOML merge, SIGHUP
+republish. The decode pool reads `Arc<RwLock<HashMap>>` for the per-row hot
+path; a refresher bridges the watch snapshot into it. The richer namespace
+surface is not covered:
 
-- `ResolvedConfig::columns` population: the field exists as the overlay
-  hook but has no TOML surface and nothing reads it yet — per-column type
-  override is still per-table TOML only
+- `ResolvedConfig::columns` consumption: the `config_column` overlay
+  populates the field (WAL-tracked, [config.md](config.md)) but the
+  projection does not read it — per-column type override applies only via
+  per-table TOML
 - `NamespaceMapping.order_by_default`: `render_create_table` hard-codes
   `ORDER BY (_lsn)` fallback when no PK exists
 - `NamespaceMapping.engine_default`: `render_create_table` hard-codes
-  `ENGINE = ReplacingMergeTree(_lsn)`. Plan wanted per-namespace
-  override (e.g., `MergeTree`, `CollapsingMergeTree`)
+  `ENGINE = ReplacingMergeTree(_lsn)`; no per-namespace override (e.g.,
+  `MergeTree`, `CollapsingMergeTree`)
 
-See [config.md](config.md) for the landed resolver substrate and
+See [config.md](config.md) for the resolver substrate + overlay and
 [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) for
-the pg-driven overlay that builds on it
+the source-PG-driven work (signals, opt-in + backfill, net-new knobs)
 
 ## DdlApplicator
 
@@ -505,8 +506,8 @@ they encode bugs in daemon or mapping that retry would loop forever on
 
 Budget expiry trips `Fatal` — daemon exits, cursor file resumes on
 restart. See [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md)
-for deeper "re-emit from spill" story (segment-buffered replay across
-extended CH outages) not yet shipped
+for the deeper "re-emit from spill" design (segment-buffered replay across
+extended CH outages)
 
 ## Cross-links
 
@@ -530,8 +531,8 @@ extended CH outages) not yet shipped
 - [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
   — pipeline design record; remaining: pump wire/record split,
   bootstrap decode pool (Option B), hot-table sharding, M/N sizing
-- [config.md](config.md) — landed resolver substrate: `ResolvedConfig`
-  + `watch::Receiver`, CLI > TOML merge, SIGHUP republish
+- [config.md](config.md) — resolver substrate: `ResolvedConfig`
+  + `watch::Receiver`, CLI > PG-row > TOML merge, SIGHUP republish
 - [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
   — pg-driven config overlay building on the resolver substrate
 - [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md) —

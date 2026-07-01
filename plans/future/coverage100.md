@@ -123,7 +123,7 @@ outcome: execute it in CI, refactor it into testable code, or remove it from
 configured denominator
 
 1. **CLI denominator, 476 missed lines** (`stream` 461, `filter` 11,
-   `classify` 4; `latency_bench` no longer exists). `filter`/`classify` are
+   `classify` 4). `filter`/`classify` are
    near the floor; `stream` is the whole decision. Choose coverage or exclusion
    explicitly. `stream` coverage means bootstrap off/direct/object-store paths,
    CH emitter + DDL setup, metrics-only observer, oracle wrapper on/off,
@@ -164,7 +164,7 @@ configured denominator
   fault injection for every item above, including all binaries and all
   defensive failures
 - **Practical 100% line gate:** exclude any intentional non-product files (none
-  outstanding now that `latency_bench` is gone); cover or refactor shipped
+  currently); cover or refactor existing
   binaries; add decoder/emitter/control-plane matrix tests; add deterministic
   fault injection; gate configured denominator with `--fail-under-lines 100`
 - **High-water floor:** if stream/CLI or defensive product-file exclusions are
@@ -176,7 +176,7 @@ configured denominator
 1. Finish Tier B fixture and in-proc tests
 2. Land config parser and DDL fixtures from Tier D, dense coverage work
 3. Extend Tier C live e2e tests
-4. Decide binary denominator, cover or exclude shipped CLI paths
+4. Decide binary denominator, cover or exclude CLI paths
 5. Add decoder matrix, emitter/DDL matrix, then fault injection for remaining
    defensive lines
 6. Add `--fail-under-lines N` to CI coverage job once baseline is accepted,

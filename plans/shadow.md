@@ -242,24 +242,23 @@ descriptors across generation bumps so diff source-of-truth survives
 invalidation. Channel consumed by CH DDL applicator inside worker task
 — see [emitter.md](emitter.md)
 
-## NOT shipped yet from namespace mapping
+## Namespace mapping gaps
 
-Channel is **unbounded** (`mpsc::unbounded_channel`); earlier plan
-spoke of `mpsc::channel(64)` for back-pressure but implementation uses
-unbounded send because applicator runs in same worker task as decoder,
-back-pressure surfaces naturally as task-local await depth rather than
-channel saturation
+Channel is **unbounded** (`mpsc::unbounded_channel`): the applicator runs in
+the same worker task as the decoder, so back-pressure surfaces naturally as
+task-local await depth rather than channel saturation, and a bounded
+`mpsc::channel(64)` would buy nothing.
 
-`NamespaceMapping` ([src/ch_emitter.rs](../src/ch_emitter.rs)) ships
-`auto_create`, `target_database`, and `drop_table_strategy` (the latter
-two resolved per-namespace in `DdlApplicator`). Plan additionally listed
-`type_overrides`, `order_by_default`, `engine_default` — still missing.
-The `watch::Receiver<Arc<ResolvedConfig>>` resolver substrate **landed**
-([config.md](config.md)): CLI > TOML merge, SIGHUP republish, and the
-DdlApplicator refreshes namespace config from it per apply. The decode
-pool still reads `Arc<RwLock<HashMap>>` on the hot path, bridged from the
-watch snapshot by a refresher task. The remaining precedence layer
-(WAL-config between CLI and TOML) is
+`NamespaceMapping` ([src/ch_emitter.rs](../src/ch_emitter.rs)) carries
+`auto_create`, `target_database`, and `drop_table_strategy` (the latter two
+resolved per-namespace in `DdlApplicator`); `type_overrides`,
+`order_by_default`, and `engine_default` are not covered. The
+`watch::Receiver<Arc<ResolvedConfig>>` resolver substrate
+([config.md](config.md)) merges CLI > PG-row > TOML with SIGHUP republish, and
+the DdlApplicator refreshes namespace config from it per apply. The decode pool
+reads `Arc<RwLock<HashMap>>` on the hot path, bridged from the watch snapshot by
+a refresher task. The source-PG-driven work (signal channel, per-table opt-in +
+backfill, net-new knobs) is
 [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
 
 ## Pitfalls

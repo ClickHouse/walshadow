@@ -40,10 +40,10 @@ components. Future-work proposals live under [future/](future/INDEX.md)
 
 ## Future work
 
-[future/INDEX.md](future/INDEX.md) collects work not yet shipped:
+[future/INDEX.md](future/INDEX.md) collects design docs for unbuilt work:
 runtime config overlay from source PG, two-phase commit, sequence-state
 replication, cross-table ordering, CH-bounce recovery, parked operational
-polish. Promote into `plans/` when an item lands
+polish. Promote into `plans/` once an item is built
 
 ## Architecture diagrams
 

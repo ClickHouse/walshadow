@@ -83,8 +83,8 @@ load-bearing for two reasons:
 2. Operator (or HA orchestrator) confirms primary loss and
    instructs walshadow to enter **relay mode**
 3. Walshadow connects to surviving full-PG standby and ships WAL
-   bytes between F2 and F1, byte-identical to what primary would
-   have shipped. Two implementation shapes:
+   bytes between F2 and F1, byte-identical to primary's own WAL
+   emission. Two implementation shapes:
    - **`restore_command` shim.** Full-PG's `restore_command` is
      configured to fetch from walshadow's unfiltered archive
      directory. Standby pulls segments at its own cadence. Simplest;

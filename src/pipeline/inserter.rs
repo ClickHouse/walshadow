@@ -21,11 +21,13 @@ use crate::ch_emitter::{
     EmitterConfig, EmitterError, EmitterStats, append_buf, connect_client, drain_to_end_of_stream,
     is_retryable, reconnect_if_idle,
 };
+use crate::config::ResolvedConfig;
 use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatchMeta, InsertBatch};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tokio::sync::watch;
 
 struct Inserter {
     client: AsyncClient,
@@ -38,6 +40,10 @@ struct Inserter {
     asts: HashMap<String, (u64, Vec<TypeAst>)>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
+    /// Live emitter knobs. `Some` with the overlay active: retry budget +
+    /// compression are re-read at each batch boundary (a compression change
+    /// reconnects, since the codec is fixed at connect).
+    config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 }
 
 impl Inserter {
@@ -113,6 +119,25 @@ impl Inserter {
 
     async fn run(mut self, rx: async_channel::Receiver<InsertBatch>, fatal: Fatal) {
         while let Ok(batch) = rx.recv().await {
+            // Live emitter knobs (overlay active): pick up the retry budget and
+            // compression. A compression change needs a fresh client — the codec
+            // is fixed at connect — reconnected here at a batch boundary, never
+            // mid-INSERT. Snapshot into owned values first so no watch borrow is
+            // held across the reconnect's `&mut self`.
+            let live = self.config_rx.as_ref().map(|rx| {
+                let r = rx.borrow();
+                (r.retry_max_attempts, r.compression)
+            });
+            if let Some((retry_max, compression)) = live {
+                self.config.retry.max_attempts = retry_max;
+                if compression != self.config.compression {
+                    self.config.compression = compression;
+                    if let Err(e) = self.reconnect().await {
+                        fatal.set(format!("inserter compression reconnect: {e}"));
+                        break;
+                    }
+                }
+            }
             if let Err(e) = self.ensure_asts(&batch.meta) {
                 fatal.set(format!("inserter type parse: {e}"));
                 break;
@@ -176,6 +201,7 @@ pub async fn spawn_pool(
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     fatal: Fatal,
+    config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 ) -> Result<Vec<JoinHandle<()>>, EmitterError> {
     let mut handles = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
@@ -188,6 +214,7 @@ pub async fn spawn_pool(
             asts: HashMap::new(),
             ack: ack.clone(),
             stats: stats.clone(),
+            config_rx: config_rx.clone(),
         };
         let rx = rx.clone();
         let fatal = fatal.clone();
