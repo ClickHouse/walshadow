@@ -28,7 +28,7 @@ use crate::ch_emitter::{
     ColumnBuf, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TableMapping, TablePlan,
 };
 use crate::heap_decoder::{CommittedTuple, HeapOp};
-use crate::pipeline::{Fatal, mpmc};
+use crate::pipeline::Fatal;
 use crate::shadow_catalog::RelDescriptor;
 
 /// One decoded row routed to its destination. `mapping`/`rel` are `Arc`
@@ -134,7 +134,7 @@ struct Table {
 /// every row enqueued before it; `out` carries sealed batches to inserters.
 pub fn spawn(
     mut msg_rx: mpsc::Receiver<BatcherMsg>,
-    out: mpmc::Sender<InsertBatch>,
+    out: async_channel::Sender<InsertBatch>,
     cfg: BatcherConfig,
     alloc: Allocator,
     fatal: Fatal,
@@ -192,7 +192,7 @@ pub fn spawn(
 async fn handle_rows(
     tables: &mut HashMap<String, Table>,
     cfg: &BatcherConfig,
-    out: &mpmc::Sender<InsertBatch>,
+    out: &async_channel::Sender<InsertBatch>,
     alloc: Allocator,
     epoch: u64,
     rows: Vec<RoutedRow>,
@@ -207,7 +207,7 @@ async fn handle_rows(
 async fn handle_row(
     tables: &mut HashMap<String, Table>,
     cfg: &BatcherConfig,
-    out: &mpmc::Sender<InsertBatch>,
+    out: &async_channel::Sender<InsertBatch>,
     alloc: Allocator,
     epoch: u64,
     row: RoutedRow,
@@ -259,7 +259,7 @@ async fn handle_row(
 /// drains).
 async fn emit_batch(
     t: &mut Table,
-    out: &mpmc::Sender<InsertBatch>,
+    out: &async_channel::Sender<InsertBatch>,
     stats: &EmitterStats,
 ) -> Result<(), String> {
     let (buffers, n_rows) = t.enc.take_block().map_err(|e| e.to_string())?;
@@ -286,7 +286,7 @@ async fn emit_batch(
 
 async fn flush_due(
     tables: &mut HashMap<String, Table>,
-    out: &mpmc::Sender<InsertBatch>,
+    out: &async_channel::Sender<InsertBatch>,
     now: Instant,
     stats: &EmitterStats,
 ) -> Result<(), String> {
@@ -302,7 +302,7 @@ async fn flush_due(
 /// against post-DDL descriptors and inserters re-parse cached types.
 async fn flush_all(
     tables: &mut HashMap<String, Table>,
-    out: &mpmc::Sender<InsertBatch>,
+    out: &async_channel::Sender<InsertBatch>,
     epoch: &mut u64,
     stats: &EmitterStats,
 ) -> Result<(), String> {
@@ -400,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn coalesces_and_tracks_per_seq_counts() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
-        let (batches_tx, batches_rx) = mpmc::channel(64);
+        let (batches_tx, batches_rx) = async_channel::bounded(64);
         let fatal = Fatal::new();
         let handle = spawn(
             msg_rx,
@@ -430,7 +430,7 @@ mod tests {
         drop(msg_tx);
 
         let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);
-        while let Some(b) = batches_rx.recv().await {
+        while let Ok(b) = batches_rx.recv().await {
             total += b.n_rows as u64;
             for (seq, n) in b.per_seq {
                 match seq {
@@ -453,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn rows_chunk_trips_budget_and_tracks_per_seq() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
-        let (batches_tx, batches_rx) = mpmc::channel(64);
+        let (batches_tx, batches_rx) = async_channel::bounded(64);
         let fatal = Fatal::new();
         let handle = spawn(
             msg_rx,
@@ -475,7 +475,7 @@ mod tests {
         drop(msg_tx);
 
         let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);
-        while let Some(b) = batches_rx.recv().await {
+        while let Ok(b) = batches_rx.recv().await {
             total += b.n_rows as u64;
             for (seq, n) in b.per_seq {
                 match seq {
@@ -498,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn flush_all_seals_rows_enqueued_before_it() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
-        let (batches_tx, batches_rx) = mpmc::channel(64);
+        let (batches_tx, batches_rx) = async_channel::bounded(64);
         let fatal = Fatal::new();
         let handle = spawn(
             msg_rx,

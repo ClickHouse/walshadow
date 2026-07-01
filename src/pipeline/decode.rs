@@ -23,9 +23,9 @@ use walrus::pg::walparser::RelFileNode;
 use crate::ch_emitter::{EmitterStats, MappingHandle, TableMapping};
 use crate::heap_decoder::{CommittedTuple, DecodedHeap};
 use crate::oracle::{Oracle, maybe_validate_tuple, resolve_pending_tuple};
+use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
-use crate::pipeline::{Fatal, mpmc};
 use crate::shadow_catalog::{CatalogError, RelDescriptor, ShadowCatalog};
 use crate::toast::ToastResolver;
 use crate::xact_buffer::detoast_heap;
@@ -238,7 +238,7 @@ pub async fn decode_and_route(
 pub fn spawn_pool(
     m: usize,
     ctx: DecodeCtx,
-    jobs: mpmc::Receiver<DecodeJob>,
+    jobs: async_channel::Receiver<DecodeJob>,
     ack: AckHandle,
     fatal: Fatal,
 ) -> Vec<JoinHandle<()>> {
@@ -252,7 +252,7 @@ pub fn spawn_pool(
             // Per-worker descriptor cache; epoch handle read once at startup.
             let epoch = ctx.catalog.lock().await.invalidation_epoch_handle();
             let mut cache = RelCache::new(epoch);
-            while let Some(job) = jobs.recv().await {
+            while let Ok(job) = jobs.recv().await {
                 ctx.stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
                 let seq = job.seq;
                 match decode_and_route(

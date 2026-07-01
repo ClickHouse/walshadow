@@ -39,6 +39,7 @@ wal-rus = "0.2"
 clickhouse-c-rs = { path = "clickhouse-c-rs", default-features = false, features = ["tokio", "tls"] }
 anyhow = "1"
 astral-tokio-tar = { version = "0.6", default-features = false }
+async-channel = "2.5"
 async-trait = "0.1"
 backon = { version = "1", features = ["tokio-sleep"] }
 bytes = "1"

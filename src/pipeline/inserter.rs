@@ -21,9 +21,9 @@ use crate::ch_emitter::{
     EmitterConfig, EmitterError, EmitterStats, append_buf, connect_client, drain_to_end_of_stream,
     is_retryable,
 };
+use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatchMeta, InsertBatch};
-use crate::pipeline::{Fatal, mpmc};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -106,8 +106,8 @@ impl Inserter {
         }
     }
 
-    async fn run(mut self, rx: mpmc::Receiver<InsertBatch>, fatal: Fatal) {
-        while let Some(batch) = rx.recv().await {
+    async fn run(mut self, rx: async_channel::Receiver<InsertBatch>, fatal: Fatal) {
+        while let Ok(batch) = rx.recv().await {
             if let Err(e) = self.ensure_asts(&batch.meta) {
                 fatal.set(format!("inserter type parse: {e}"));
                 break;
@@ -167,7 +167,7 @@ impl Inserter {
 pub async fn spawn_pool(
     n: usize,
     config: &EmitterConfig,
-    rx: mpmc::Receiver<InsertBatch>,
+    rx: async_channel::Receiver<InsertBatch>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     fatal: Fatal,
