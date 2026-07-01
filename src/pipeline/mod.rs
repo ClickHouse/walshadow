@@ -15,7 +15,6 @@ pub mod batcher;
 pub mod bootstrap;
 pub mod decode;
 pub mod inserter;
-pub mod mpmc;
 pub mod reorder;
 pub mod tail;
 
@@ -198,7 +197,7 @@ impl PipelineConfig {
         .await?;
 
         // Job-queue bound scales with the decode pool for bounded overlap
-        let (jobs_tx, jobs_rx) = mpmc::channel::<decode::DecodeJob>((m * 4).max(8));
+        let (jobs_tx, jobs_rx) = async_channel::bounded::<decode::DecodeJob>((m * 4).max(8));
 
         let ctx = decode::DecodeCtx {
             catalog: catalog.clone(),

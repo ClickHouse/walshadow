@@ -37,10 +37,10 @@ use crate::xact_buffer::{
     parse_xact_payload,
 };
 
+use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::BatcherMsg;
 use crate::pipeline::decode::{DecodeJob, ToastChunks};
-use crate::pipeline::{Fatal, mpmc};
 use crate::toast::ToastResolver;
 
 pub struct ReorderSink {
@@ -52,7 +52,7 @@ pub struct ReorderSink {
     last_seen_delete_epoch: u64,
     applicator: DdlApplicator,
     ack: AckHandle,
-    jobs_tx: mpmc::Sender<DecodeJob>,
+    jobs_tx: async_channel::Sender<DecodeJob>,
     /// Shared FIFO channel to the batcher; `FlushAll` here orders after
     /// enqueued rows.
     msg_tx: mpsc::Sender<BatcherMsg>,
@@ -82,7 +82,7 @@ impl ReorderSink {
         pg_class_delete_epoch: Option<Arc<AtomicU64>>,
         applicator: DdlApplicator,
         ack: AckHandle,
-        jobs_tx: mpmc::Sender<DecodeJob>,
+        jobs_tx: async_channel::Sender<DecodeJob>,
         msg_tx: mpsc::Sender<BatcherMsg>,
         stats: Arc<EmitterStats>,
         resolver: ToastResolver,

@@ -22,7 +22,7 @@ use crate::ch_emitter::{EmitterConfig, EmitterError, EmitterStats};
 use crate::pipeline::ack::{self, AckHandle};
 use crate::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::pipeline::inserter;
-use crate::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal, mpmc};
+use crate::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 
 /// Spawned tail stages; holding this keeps the tasks owned by the caller.
 pub struct TailParts {
@@ -101,7 +101,7 @@ pub async fn spawn(
     // Rows and FlushAll share one FIFO channel so a flush can't overtake rows
     // enqueued before it
     let (msg_tx, msg_rx) = mpsc::channel::<BatcherMsg>(256);
-    let (batches_tx, batches_rx) = mpmc::channel::<InsertBatch>((n * 2).max(4));
+    let (batches_tx, batches_rx) = async_channel::bounded::<InsertBatch>((n * 2).max(4));
 
     let inserters = inserter::spawn_pool(
         n,
