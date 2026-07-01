@@ -155,6 +155,10 @@ pub struct EmitterConfig {
     /// batcher (`crate::pipeline::decode::DECODE_CHUNK_ROWS`). Tunable so
     /// tests can trip the mid-loop flush without a huge xact.
     pub decode_chunk_rows: usize,
+    /// `[runtime_config] schema`: source-PG schema housing the `config_*`
+    /// overlay tables. `None` (field empty or omitted) disables the whole
+    /// overlay subsystem — no boot seed, no config_decoder, pure TOML+CLI.
+    pub runtime_config_schema: Option<String>,
 }
 
 pub const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
@@ -203,6 +207,7 @@ impl Default for EmitterConfig {
             soft_delete: false,
             toast: crate::toast::ToastConfig::default(),
             decode_chunk_rows: crate::pipeline::decode::DECODE_CHUNK_ROWS,
+            runtime_config_schema: None,
         }
     }
 }
@@ -396,6 +401,13 @@ impl EmitterConfig {
             if let Some(v) = toast.get("disk_dir").and_then(Value::as_str) {
                 out.toast.disk_dir = Some(std::path::PathBuf::from(v));
             }
+        }
+        if let Some(rc) = root.get("runtime_config").and_then(Value::as_table)
+            && let Some(schema) = rc.get("schema").and_then(Value::as_str)
+            && !schema.is_empty()
+        {
+            // Empty string == omitted == overlay disabled.
+            out.runtime_config_schema = Some(schema.into());
         }
         if let Some(nss) = root.get("namespace").and_then(Value::as_table) {
             for (k, v) in nss {

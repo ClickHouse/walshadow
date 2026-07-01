@@ -1,11 +1,9 @@
-# Pipeline backpressure and scaling (parallel decode+insert: landed; remaining work)
+# Pipeline backpressure and scaling
 
-The parallel decode+insert pipeline (pooled decoders feeding pooled inserters)
-has landed and is merge-ready; this doc now tracks the remaining work —
-WAL-pump backpressure and decode/insert scaling — over the landed design
-reference below.
+WAL-pump backpressure and decode/insert scaling for the parallel decode+insert
+pipeline (pooled decoders feeding pooled inserters); design reference below.
 
-Original thesis — move serial decode+send tail into two pools:
+Thesis — move serial decode+send tail into two pools:
 
 * M decoders for CPU work: tuple parse, catalog projection, type coercion,
   detoast, Native encoding
@@ -16,115 +14,100 @@ RTT plus object-storage part commit, so throughput comes from keeping
 many INSERTs in flight. CPU parallelism matters only once decode cannot
 feed inserters.
 
-`clickhouse-c-rs-async` and the pooled decode→insert pipeline have landed.
+`clickhouse-c-rs-async` backs the pooled decode→insert pipeline.
 WAL and bootstrap both run the pooled tail (M decoders / N inserters, default
 1/1); out-of-order INSERTs reconcile by `_lsn` and the contiguous-done
-watermark drives slot feedback. As of 2026-06-09 the branch is **merge-ready**
-and superior to `main` on every axis: N concurrent `AsyncClient` inserters,
-async IO that never parks tokio workers, bootstrap through the shared tail,
-and bounded bootstrap backpressure. What remains is post-merge future work,
-not ship-blockers — see "Post-merge future work" and "Backpressure".
+watermark drives slot feedback. The design spans every axis: N concurrent
+`AsyncClient` inserters, async IO that never parks tokio workers, bootstrap
+through the shared tail, and bounded bootstrap backpressure. Extension axes
+live under "Future work" and "Backpressure".
 
 Out-of-order INSERTs are OK. `_lsn` plus `ReplacingMergeTree(_lsn)` makes
 final state order-independent (`ch_ddl.rs`,
 [[project_walshadow_eventual_consistency]]). Slot feedback still needs a
 strict contiguous durable watermark.
 
-## Status (2026-06-07) — pooled WAL path green at M=1/N=1
+## Pooled WAL path at M=1/N=1
 
 Pipeline built in `src/pipeline/` (`mpmc`, `ack`, `batcher`, `inserter`,
 `decode`, `reorder`), wired into `bin/stream.rs` behind
 `--decoder-pool-size` / `--inserter-pool-size` (default 1/1). With `--ch-config`
-set the WAL path always runs the pooled pipeline (`PipelineConfig::spawn`);
-bootstrap still routes through the serial `Emitter`.
+set the WAL path always runs the pooled pipeline (`PipelineConfig::spawn`).
 
-Done:
+Correctness properties:
 
 * Five P0 correctness invariants in code: TRUNCATE-as-barrier,
   ack-after-drain, contiguous-done watermark, aborts through gate, accurate
   per-seq counts
 * Watermark, mpmc, batcher coalescing unit-tested hermetically
-* `FlushAll` race fixed: rows + flush share one FIFO `BatcherMsg` channel,
+* `FlushAll` race guarded: rows + flush share one FIFO `BatcherMsg` channel,
   reorder waits on ack collector's placed-frontier before issuing `FlushAll`.
-  Was a nondeterministic hang in the `flush_all` batcher test at
-  `flush_timeout=3600s` (caught by codex, not the design review)
-* Clean build + clippy, serial/bootstrap path untouched, 376 lib tests plus
-  hermetic integration tests green
+  Without that ordering the `flush_all` batcher test hangs nondeterministically
+  at `flush_timeout=3600s`
+* Serial/bootstrap path untouched, covered by hermetic integration tests
 * `pgbench_acceptance_ddl_intermix` (live PG+CH, pooled WAL path at M=1/N=1,
   ADD COLUMN + CREATE INDEX CONCURRENTLY mid-workload) green 5/5, ~22s.
-  Resolves the 2026-06-05 watermark-pin failure. Root cause was per-INSERT RTT
-  cost at `flush_timeout=0`: each pgbench xact's four per-table INSERT closes
-  cost 4×RTT (~5 xact/s on local CH), so `emitter_ack` could never track the
-  ~700 xact/s source. `--ch-flush-timeout-ms 200` coalesces rows into one part
-  per window and lets N=1 hold the source rate. Barrier +
-  `wait_for_ack_catchup` both pass, so the coarse barrier is not regressing at
-  this scale
+  Guards against watermark pin under per-INSERT RTT cost: at `flush_timeout=0`
+  each pgbench xact's four per-table INSERT closes cost 4×RTT (~5 xact/s on
+  local CH), so `emitter_ack` cannot track the ~700 xact/s source.
+  `--ch-flush-timeout-ms 200` coalesces rows into one part per window and lets
+  N=1 hold the source rate. Barrier + `wait_for_ack_catchup` both pass, so the
+  coarse barrier does not regress at this scale
 
-Ship-blockers remaining: none. Both cleared — see "Status (2026-06-09)".
+Live daemon coverage extends past M=1/N=1:
 
-* DONE (2026-06-09). Pool sizes >1 now have live daemon coverage.
-  `tests/pipeline_parallel_e2e.rs` (DML) and `tests/pipeline_parallel_ddl_e2e.rs`
+* `tests/pipeline_parallel_e2e.rs` (DML) and `tests/pipeline_parallel_ddl_e2e.rs`
   (ALTER ADD COLUMN + TRUNCATE through `run_barrier`) drive the real
-  `PipelineConfig` fan-out at M=2/N=2 in-process; `pgbench_acceptance.rs` now
+  `PipelineConfig` fan-out at M=2/N=2 in-process; `pgbench_acceptance.rs`
   runs the daemon-spawn drill twice via the parametrized `run_ddl_intermix` —
   `pgbench_acceptance_ddl_intermix` at 1/1 and
   `pgbench_acceptance_ddl_intermix_pooled` at 2/2 (disjoint ports, run
   concurrently). The 2/2 variant drives N concurrent `AsyncClient`s for
   bootstrap + WAL under the DDL barrier; the end-state parity oracle confirms
   out-of-order INSERTs across connections stay `_lsn`-correct
-* DONE (2026-06-07). Bootstrap/base-backup now routes through the shared tail
-  (Option A), not the serial `Emitter`. See "Status (2026-06-07) — bootstrap
-  through the shared tail" below. Externally-toasted columns still error rather
-  than ship (Blockers, refined #2, design in [TOAST.md](../TOAST.md)); as of
-  2026-06-09 the fail-fast is explicit at the producer (the bootstrap drain),
-  not a generic encoder rejection deep in the tail.
+* Bootstrap/base-backup routes through the shared tail (Option A), not a serial
+  `Emitter`. See "Bootstrap through the shared tail" below. Externally-toasted
+  columns error rather than ship (Blockers, refined #2, design in
+  [TOAST.md](../TOAST.md)); the fail-fast is explicit at the producer (the
+  bootstrap drain), not a generic encoder rejection deep in the tail.
 
-Known gaps (none ship-blocking):
+Backpressure is correct per channel, not one uniform "bound everything" goal
+(the three ingress channels have different constraints):
 
-* Backpressure is now correct per channel, not one uniform "bound everything"
-  goal (the old framing was wrong — the three ingress channels have different
-  constraints). Bootstrap ingress is bounded: `BackupSink` is async end to end
-  and the page-walk→drain channel is a bounded `mpsc::channel`
+* Bootstrap ingress is bounded: `BackupSink` is async end to end and the
+  page-walk→drain channel is a bounded `mpsc::channel`
   (`BOOTSTRAP_TUPLE_CHANNEL_CAP`), so a saturated inserter parks the page walk
-  and the source fetch instead of buffering a whole relation (2026-06-09). The
+  and the source fetch instead of buffering a whole relation. The
   ack-events channel (`ack.rs`) stays unbounded by design — the collector is
   pure-sync `state.apply`, strictly faster than any producer, so it cannot
   back up. The pump→worker channel (`queueing_record_sink.rs`) is soft-capped,
-  not hard-bounded, on purpose: a hard bound deadlocks shadow apply. Closing it
-  needs a wire/record split, post-merge. See "Backpressure"
+  not hard-bounded, on purpose: a hard bound deadlocks shadow apply. A hard
+  bound there needs a wire/record split. See "Backpressure"
 
-Post-merge future work:
+Future work:
 
-1. DONE (2026-06-09). Daemon e2e at pool sizes >1
-   (`pgbench_acceptance_ddl_intermix_pooled`, M=2/N=2); out-of-order INSERTs
-   across N connections confirmed `_lsn`-correct through the DDL barrier by the
-   parity oracle
-2. DONE (2026-06-07). Bootstrap routes through the shared tail (Option A). See
-   "Status (2026-06-07) — bootstrap through the shared tail" below. The
-   serialized Tap sink events that gated `object_store` (Blockers, refined #5)
-   landed earlier, so both Direct and ObjectStore route through the tail. Decode
-   pool for bootstrap (parallel-decode Option B) remains gated on measurement
-3. Bound the pump→worker backpressure by splitting wire delivery from record
-   dispatch so the wire side runs ahead (paced by shadow apply) while record
-   dispatch blocks on a bounded queue. Architectural, not a channel swap; the
-   ack channel stays unbounded by design and the bootstrap ingress is already
-   bounded (see "Backpressure")
+* Bound the pump→worker backpressure by splitting wire delivery from record
+  dispatch so the wire side runs ahead (paced by shadow apply) while record
+  dispatch blocks on a bounded queue. Architectural, not a channel swap; the
+  ack channel stays unbounded by design and the bootstrap ingress is already
+  bounded (see "Backpressure")
+* Decode pool for bootstrap (parallel-decode Option B) gated on measurement
 
-Deferred indefinitely:
+Out of scope:
 
 * DDL-type-aware barrier optimization. Make `run_barrier` discriminate: ADD
   COLUMN needs only seal plus epoch bump before post-ALTER rows decode, no
   global `wait_all_durable`; reserve the full drain for destructive DDL
-  (DROP/RENAME column, TRUNCATE). Not pursued — the coarse barrier holds at the
+  (DROP/RENAME column, TRUNCATE). The coarse barrier holds at the
   validated pool sizes (the 2/2 live test passes with ADD COLUMN + CREATE INDEX
   CONCURRENTLY mid-workload), and the cost scales with in-flight backlog, not
-  DDL frequency. Revisit only if a measured workload shows the coarse drain
+  DDL frequency. Relevant only if a measured workload shows the coarse drain
   binding throughput at higher N. See "DDL barrier" caveat below
 
-## Status (2026-06-07) — bootstrap through the shared tail
+## Bootstrap through the shared tail
 
-Bootstrap (greenfield base backup) now feeds the same batcher → inserter →
-ack tail as WAL, replacing the transitional serial `Emitter`. Direct and
+Bootstrap (greenfield base backup) feeds the same batcher → inserter →
+ack tail as WAL, not a serial `Emitter`. Direct and
 ObjectStore sources both route through it.
 
 Shape (Option A — decode stays in the page-walk sink):
@@ -143,11 +126,11 @@ Shape (Option A — decode stays in the page-walk sink):
   completion sequence: `BatcherMsg::FlushAll` → `ack.wait_through(K)` →
   teardown. The metrics-only (no `--ch-config`) arm still uses `drain_backfill`.
 
-Handoff (resume-LSN correctness): implemented as a **separate** tail instance
-torn down at end-of-bootstrap, *not* the shared-instance handoff sketched under
+Handoff (resume-LSN correctness): a **separate** tail instance
+torn down at end-of-bootstrap, *not* the shared-instance handoff described under
 "Handoff: shared tail" below. `run()` stands bootstrap up before shadow-PG spawn
 / `START_REPLICATION`, so holding one tail (and its CH sockets) idle across the
-multi-second autospawn was not worth the coupling. This is the plan's own
+multi-second autospawn is not worth the coupling. This is the plan's own
 sanctioned "run steps 1–3 before opening `START_REPLICATION`" conservative
 alternative (no overlap, identical durability guarantee). The explicit `end_lsn`
 bump (step 3) is realized by **seeding the WAL pipeline's `emitter_ack` atomic to
@@ -166,16 +149,16 @@ Coverage:
 * `pipeline::bootstrap` unit tests — per-rfn seq counts, unmapped-skip,
   reappearing-rfn (object_store interleave) yields fresh dense seqs.
 
-Still open: parallel-decode Option B gated on measurement. The bootstrap
-page-walk→drain channel is now bounded + async (see "Backpressure"), so this
-path's backpressure is closed; only the WAL pump→worker bound remains
-(post-merge, Post-merge future work step 3). TOAST is an explicit
-producer-side fail-fast (Blockers, refined #2 — done).
+Open axis: parallel-decode Option B gated on measurement. The bootstrap
+page-walk→drain channel is bounded + async (see "Backpressure"), so this
+path's backpressure is closed; only the WAL pump→worker bound is open
+(Future work). TOAST is an explicit
+producer-side fail-fast (Blockers, refined #2).
 
-## Status (2026-06-09) — merge ready
+## Pool-parallel coverage and bootstrap backpressure
 
-Both ship-blockers from the 2026-06-07 status are resolved, and the bootstrap
-ingress backpressure is now closed:
+The pooled pipeline covers the following invariants, and the bootstrap
+ingress backpressure is closed:
 
 * **Live daemon coverage at pool >1.** `pgbench_acceptance.rs` factors the DDL-
   intermix drill into `run_ddl_intermix(ports, decoder_pool, inserter_pool,
@@ -185,20 +168,18 @@ ingress backpressure is now closed:
   + CREATE INDEX CONCURRENTLY mid-workload; the end-state parity oracle (count +
   sum + the `c` column) proves out-of-order INSERTs across connections stay
   `_lsn`-correct through the DDL barrier. Both run green concurrently (~22s).
-* **TOAST fail-fast, surfaced cleanly.** See Blockers, refined #2 (done).
+* **TOAST fail-fast, surfaced cleanly.** See Blockers, refined #2.
 * **Bootstrap backpressure, bounded.** `BackupSink` is async end to end (the
-  shared sink `Mutex` is now `tokio::sync::Mutex`, all methods `async fn`), so
+  shared sink `Mutex` is a `tokio::sync::Mutex`, all methods `async fn`), so
   `PageWalkSink::chunk` awaits a bounded page-walk→drain channel
   (`BOOTSTRAP_TUPLE_CHANNEL_CAP`) directly. A saturated inserter parks the page
   walk → tar body read → object-store fetch — empty-channel backpressure, no
-  whole-relation buffer. Lib + clippy green, 384 lib tests pass. See
-  "Backpressure".
+  whole-relation buffer. See "Backpressure".
 
-This branch is merge-ready and strictly better than `main`. Remaining items
-are post-merge future work, none ship-blocking: the WAL pump→worker bound
-(needs a wire/record split, Post-merge future work step 3), parallel-decode
+Future work axes: the WAL pump→worker bound
+(needs a wire/record split, Future work), parallel-decode
 Option B (gated on measurement), and TOAST assembly (separate work item,
-[TOAST.md](../TOAST.md)). The DDL-type-aware barrier is deferred indefinitely.
+[TOAST.md](../TOAST.md)). The DDL-type-aware barrier is out of scope.
 
 ## Current serial path
 
@@ -318,7 +299,7 @@ whole pre-DDL backlog while the source advances, against the serial path's
 surgical per-table wire close. Not a blocker at the validated pool sizes (both
 the M=1/N=1 and M=2/N=2 live tests pass with ADD COLUMN + CREATE INDEX
 CONCURRENTLY mid-workload), but it grows with N and backlog. The DDL-type-aware
-optimization is deferred indefinitely (see "Deferred indefinitely" above).
+optimization is out of scope (see "Out of scope" above).
 
 ## Inserter actor
 
@@ -350,13 +331,12 @@ concurrent `AsyncClient`s on one runtime, each with its own out buffer.
 Goal: base-backup (greenfield bootstrap) feeds the *same* batcher →
 inserter → ack machinery as WAL, not a separate serial emitter. One
 shipping path means bootstrap inherits the N-connection inserter pool,
-reconnect + retry, the durable watermark, and backpressure for free, and
-the transitional `Emitter` swap at end-of-bootstrap goes away. Bootstrap
+reconnect + retry, the durable watermark, and backpressure for free, with
+no `Emitter` swap at end-of-bootstrap. Bootstrap
 is the *easy* case for the tail: every row is `op=Insert` at one
-`_lsn = start_lsn`, there are no aborts, no TRUNCATE, no DDL barriers. The
-only reason it doesn't already use the tail is history, not difficulty.
+`_lsn = start_lsn`, there are no aborts, no TRUNCATE, no DDL barriers.
 
-### Today's two serial walls
+### The two serial walls a serial emitter would hit
 
 ```text
 BackupSource (Direct | ObjectStore)
@@ -369,11 +349,11 @@ BackupSource (Direct | ObjectStore)
                            -> per-rfn force-flush (flush_timeout=0)
 ```
 
-Status: Wall 2 is gone — bootstrap routes through the shared N-inserter tail
-(DONE 2026-06-07) — and the sink mutex + `chunk` are now async over a bounded
-channel (DONE 2026-06-09). Wall 1 (decode still single-threaded on the sink
-task) remains, gated on measurement (Option B). The bullets below describe the
-original (pre-pipeline) walls for context.
+A serial emitter would hit two walls. Wall 2 does not apply — bootstrap routes
+through the shared N-inserter tail — and the sink mutex + `chunk` are async over
+a bounded channel. Wall 1 (decode single-threaded on the sink task) stands,
+gated on measurement (Option B). The bullets below describe both walls a serial
+emitter faces, for context.
 
 * **Wall 1, decode under the sink mutex.** Page-walk *and* the per-tuple
   `decode_block_data` run inside `PageWalkSink::chunk`
@@ -386,14 +366,14 @@ original (pre-pipeline) walls for context.
   only detoasts + resolves + routes *already-decoded* `DecodedHeap`s. For
   bootstrap the heavy decode is the page walk, and it sits on the sink
   task, not in any pool.
-* **Wall 2, one INSERT connection.** The transitional `Emitter` holds a
+* **Wall 2, one INSERT connection.** A serial `Emitter` holds a
   single `AsyncClient`, opens one INSERT at a time, and force-flushes on
   each rfn flip because CH's Native protocol forbids a new `Query` while an
   INSERT data stream is open (`run_bootstrap` sets `flush_timeout=0`,
   `bin/stream.rs`). On Cloud SMT this is the dominant cost, the same
-  per-INSERT RTT + part-commit wall the WAL pipeline removed with N
-  inserters. The batcher already owns per-table INSERT lifecycle, so the
-  per-rfn flush dance disappears the moment bootstrap routes through it.
+  per-INSERT RTT + part-commit wall N inserters avoid. The batcher owns
+  per-table INSERT lifecycle, so routing bootstrap through it drops the
+  per-rfn flush dance.
 
 ### What's reusable: the tail, not `PipelineConfig::spawn`
 
@@ -436,9 +416,9 @@ PageWalkSink::chunk (decode stays here, single-threaded)
 This captures the Cloud win (Wall 2) with the smallest change. Decode
 (Wall 1) stays single-threaded; remove it only if measurement shows
 page-walk decode can't feed N inserters (Option B below). `PageWalkSink::chunk`
-is async (the sink `Mutex` is now `tokio::sync::Mutex`), so `ship_tuple`
+is async (the sink `Mutex` is a `tokio::sync::Mutex`), so `ship_tuple`
 awaits the bounded page-walk→drain channel directly: a full channel parks the
-page walk and the source fetch, no intermediate buffer (DONE 2026-06-09, see
+page walk and the source fetch, no intermediate buffer (see
 "Backpressure").
 
 ### Synthetic seq scheme
@@ -469,11 +449,11 @@ identical either way).
 1. **`decode_and_route` is concretely typed.** Both its resolve
    (`shadow_catalog::resolve_at_pooled`) and `detoast_heap`
    (`xact_buffer.rs`) take `&Arc<Mutex<ShadowCatalog>>` — no
-   `RelationResolver` trait exists in the codebase (it was designed,
-   never landed; bootstrap drain grew its own `CatalogMap` path
-   instead). The plan's earlier "swap `DecodeCtx.catalog` to
+   `RelationResolver` trait exists in the codebase; the bootstrap
+   drain uses its own `CatalogMap` path
+   instead. Sharing `decode_and_route` via a "swap `DecodeCtx.catalog` to
    `Arc<dyn RelationResolver>` and `decode_and_route` serves both
-   unchanged" assumed an abstraction that would have to be introduced
+   unchanged" route requires introducing that abstraction
    first. Two ways:
    * Option A sidesteps it: the bootstrap drain builds `RoutedRow` with a
      thin resolve+map fn that never detoasts, matching today's bootstrap
@@ -481,7 +461,7 @@ identical either way).
    * To share one `decode_and_route` (needed for Option B), abstract
      `detoast_heap` over `RelationResolver` (it only needs `relation_at`)
      and make detoast a no-op when `chunks` is empty.
-2. **TOAST — current behavior is fail, not ship.** Page walk produces
+2. **TOAST — behavior is fail, not ship.** Page walk produces
    `ColumnValue::ExternalToast` for externally-stored columns
    (`decode_block_data` → `decode_varlena`, VARTAG_ONDISK), and the
    orchestrator has no `ToastChunks` (V1 observes `pg_toast_*` pages but
@@ -489,24 +469,24 @@ identical either way).
    xact-buffer path (`detoast_heap`, `xact_buffer.rs`); the bootstrap
    `BackfillTuple → Emitter` path never runs it, so an `ExternalToast`
    reaches the emitter and is *rejected* — `ch_emitter.rs` returns
-   `EmitterError::UnsupportedValue` ("unresolved TOAST pointer"). So a prior
-   claim that bootstrap "ships unreassembled and converges via WAL re-emit"
-   is wrong: an externally-toasted column errors the bootstrap. Latent only
+   `EmitterError::UnsupportedValue` ("unresolved TOAST pointer"). Bootstrap
+   does not "ship unreassembled and converge via WAL re-emit": an
+   externally-toasted column errors the bootstrap. Latent only
    because tested fixtures keep values inline (<~2 KiB). Option A's
    no-detoast route therefore preserves a *failure*, not convergent
-   shipping; the options were:
-   * fail-fast (status quo, but documented and surfaced cleanly), or
+   shipping; the options are:
+   * fail-fast (documented and surfaced cleanly), or
    * emit NULL / a raw on-disk marker with documented convergence semantics
      (WAL re-emit then supersedes via `_lsn`), or
    * implement TOAST assembly first: tap `pg_toast_*` filenodes into a
      `ToastChunks` map keyed by `(toast_relid, value_id)` and reuse the
      shared detoast.
 
-   DONE (2026-06-09): chose fail-fast, surfaced cleanly. The bootstrap drain
+   Choice: fail-fast, surfaced cleanly. The bootstrap drain
    (`pipeline/bootstrap.rs::external_toast_block`) scans each *mapped* column
    before routing and returns a precise error — relation + column + attnum —
-   when it finds a `ColumnValue::ExternalToast`. Previously the pointer flowed
-   to the encoder and tripped a generic `EmitterError::UnsupportedValue`
+   when it finds a `ColumnValue::ExternalToast`. This keeps the pointer from
+   flowing to the encoder and tripping a generic `EmitterError::UnsupportedValue`
    ("xact buffer should have reassembled") deep in the inserter pool, wording
    that is meaningless for bootstrap (no xact buffer). Unit-tested by
    `external_toast_fails_fast`.
@@ -522,35 +502,35 @@ identical either way).
    `all_done`/contiguity hold across the seam.
 4. **No reorder inputs.** Bootstrap stands up `tail::spawn` directly. It
    does not touch `XactBuffer`/`DdlApplicator`/`SubxactTracker`.
-5. **Sink interleaving across concurrent parts, fixed.** `ObjectStoreSource`
+5. **Sink interleaving across concurrent parts.** `ObjectStoreSource`
    drains parts under `buffer_unordered(parallelism)` (default `min(4,
    cores)`), and `pump_entry` re-locks the shared sink *per chunk* (the std
    `Mutex` is released across each `body.read().await`), not per file.
-   `PageWalkSink`/`MultiplexSink` previously held a single per-entry slot
-   (`cur: Option<TapEntry>` / `routed_to_tap: bool`), so two concurrent parts'
-   Tap files interleaved `begin`/`chunk` on that one slot: part B's `begin`
-   clobbered the entry part A was mid-stream on, misframing pages and decoding
-   them against the wrong relation. Pre-existing in the serial object_store→CH
-   path too (Keep files were safe since `write_kept` bypasses the sink, and
-   the e2e fixture is single-part so it stayed hidden). Fixed by keying
+   A single per-entry slot (`cur: Option<TapEntry>` / `routed_to_tap: bool`)
+   on `PageWalkSink`/`MultiplexSink` would let two concurrent parts'
+   Tap files interleave `begin`/`chunk` on that one slot: part B's `begin`
+   clobbers the entry part A is mid-stream on, misframing pages and decoding
+   them against the wrong relation. This clobber applies to the serial
+   object_store→CH path too (Keep files are safe since `write_kept` bypasses the
+   sink, and a single-part e2e fixture keeps it latent). Keying
    per-entry sink state on a source-allocated `EntryId` (`begin`/`chunk`/`end`
-   all take it; `PageWalkSink.cur` is now `HashMap<EntryId, TapEntry>`,
-   `MultiplexSink` a `HashSet<EntryId>`); the mutex still serializes calls,
-   the key just stops the logical clobber. Per-rfn seqs are then safe: the
-   drain is the single channel consumer, so it assigns seqs by rfn-flips *as
+   all take it; `PageWalkSink.cur` is `HashMap<EntryId, TapEntry>`,
+   `MultiplexSink` a `HashSet<EntryId>`) avoids it; the mutex still serializes
+   calls, the key just stops the logical clobber. Per-rfn seqs are then safe:
+   the drain is the single channel consumer, so it assigns seqs by rfn-flips *as
    observed in the channel*, not by file boundary. Interleaving just yields
    more (still dense, still `commit_lsn = start_lsn`) seqs, a given rfn may
    span more than one seq, which the per-seq refcount handles like any two
-   rels. Direct mode was never affected (one sequential entry stream).
+   rels. Direct mode is unaffected (one sequential entry stream).
 
-### Handoff: shared tail, delete the transitional emitter
+### Handoff: shared tail, no separate emitter
 
 Stand up `tail::spawn` once. Bootstrap feeds it via the page-walk drain
 registering seqs `[0, K)`; on bootstrap completion, hand the same `msg_tx`
 and `AckHandle` to the WAL `ReorderSink`, which continues at seq `K`. The
-inserter pool, batcher, and ack collector persist across the seam, so the
-transitional `Emitter` and its end-of-bootstrap teardown go away (the plan's
-stated goal), with no inserter reconnect at the seam.
+inserter pool, batcher, and ack collector persist across the seam, so no
+separate `Emitter` or end-of-bootstrap teardown is needed, with no inserter
+reconnect at the seam.
 
 Completion sequence at end of bootstrap, once the page-walk drain has
 `placed` every bootstrap seq:
@@ -634,9 +614,9 @@ WALG_* / AWS_* env -> Settings::from_env -> build_storage -> DynStorage
 
 Because the source layer is shared, the tail wiring in "Base backup through
 the same pipeline" applies to S3 too — the parallel tail does not care
-whether bytes came off the replication socket or out of a bucket, and the
-concurrent-part sink interleaving that used to make this unsafe is now fixed
-(per-entry `EntryId` keying, Blockers, refined #5). What's S3-specific:
+whether bytes came off the replication socket or out of a bucket, and
+concurrent-part sink interleaving stays safe via
+per-entry `EntryId` keying (Blockers, refined #5). What's S3-specific:
 
 * **Fan-out today is fetch/decompress/tar-parse only.** `ObjectStoreSource`
   drains data parts `buffer_unordered(parallelism)` (default `min(4, cores)`,
@@ -673,11 +653,11 @@ task's await *is* the drum, and the internal WAL chain
 bounded `mpmc`/`mpsc`, the terminal await is the CH send itself. Steady-state
 memory there is the sum of those bounded buffers.
 
-The three ingress channels are not one problem with one fix (the earlier
-"bound every channel" framing was too coarse):
+The three ingress channels are not one problem with one fix (a uniform
+"bound every channel" framing is too coarse):
 
-* **Bootstrap page-walk → drain: bounded (DONE 2026-06-09).** `BackupSink` is
-  async end to end (sink `Mutex` → `tokio::sync::Mutex`, all methods
+* **Bootstrap page-walk → drain: bounded.** `BackupSink` is
+  async end to end (sink `Mutex` is a `tokio::sync::Mutex`, all methods
   `async fn`); `PageWalkSink::ship_tuple` awaits a bounded `mpsc::channel`
   (`BOOTSTRAP_TUPLE_CHANNEL_CAP`). A full channel parks the page walk → the tar
   body read → the object-store fetch. No standing buffer; the bootstrap paces
@@ -688,8 +668,8 @@ The three ingress channels are not one problem with one fix (the earlier
   producer, so the channel cannot back up. Bounding it buys zero memory and
   would force `ack.acked` off its non-blocking fire-and-forget on the inserter
   hot path.
-* **Pump → worker (`queueing_record_sink.rs`): soft-capped on purpose; real
-  bound is post-merge.** `on_record` and shadow-wire delivery are lockstep in
+* **Pump → worker (`queueing_record_sink.rs`): soft-capped on purpose; a hard
+  bound is future work.** `on_record` and shadow-wire delivery are lockstep in
   `wal_stream.rs::drain_records`, and `ReorderSink::maybe_sweep_dropped` →
   `ShadowCatalog::wait_for_replay` couples decode to shadow apply, which needs
   the pump to keep feeding *subsequent* wire bytes (walreceiver flush
@@ -699,8 +679,7 @@ The three ingress channels are not one problem with one fix (the earlier
   CH-slower-than-WAL this buffer can still grow, buffering WAL in walshadow RAM
   rather than letting the PG slot hold it on disk. The fix is to split wire
   delivery (runs ahead, paced by shadow apply) from record dispatch (blocks on
-  a bounded queue) — architectural, not a channel swap. Post-merge (Post-merge
-  future work step 3).
+  a bounded queue) — architectural, not a channel swap. Future work.
 
 ## Sizing
 

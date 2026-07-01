@@ -49,6 +49,7 @@ pub mod preflight;
 pub mod queueing_record_sink;
 pub mod retention;
 pub mod rewrite;
+pub mod runtime_config;
 pub mod segment;
 pub mod shadow;
 pub mod shadow_catalog;

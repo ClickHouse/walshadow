@@ -155,7 +155,7 @@ witness use case (re-seeding a full-PG replica from shadow) is
 itself deferred (see `sync_commit_witness.md`); promoting both
 ideas together is a natural pairing if either materialises
 
-Neither A1 nor A2 blocks any landed surface. Land when a consumer with
+Neither A1 nor A2 blocks any existing surface. Land when a consumer with
 a specific use case forces the matrix
 
 ## Dependencies

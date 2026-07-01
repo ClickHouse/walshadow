@@ -88,9 +88,9 @@ pub type Result<T> = std::result::Result<T, SpillError>;
 
 /// ASCII for `xxd`-friendly debug
 pub const SPILL_MAGIC: [u8; 2] = *b"WS";
-/// v2 covers `HeapOp::Truncate` tag-4 and the `DrainEntry::Catalog` lift. v1
-/// was unversioned and never wrote a header, so older files reject as "no
-/// magic"
+/// v2 added the `HeapOp::Truncate` tag-4 body encoding. `DrainEntry` events
+/// (Catalog, and Config/Signal per the runtime-config plan) are drain-time,
+/// never spilled, so they don't touch this format
 pub const SPILL_VERSION: u16 = 2;
 
 pub struct SpillStore {

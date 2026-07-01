@@ -124,6 +124,9 @@ pub struct PipelineConfig {
     /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
     /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
     pub span_registry: Option<TxnSpanRegistry>,
+    /// Runtime-config overlay resolver, applied to inside the reorder barrier
+    /// when a `DrainEntry::Config` drains. `None` disables live config apply.
+    pub config_resolver: Option<Arc<crate::config::ConfigResolver>>,
 }
 
 /// Spawned-stage join handles + shared signals. The daemon drives the
@@ -177,6 +180,7 @@ impl PipelineConfig {
             pending_sweeps,
             stats,
             span_registry,
+            config_resolver,
         } = self;
         let m = decoder_pool_size.max(1);
         let fatal = Fatal::new();
@@ -187,14 +191,19 @@ impl PipelineConfig {
         let resolver = crate::toast::ToastResolver::from_config(&emitter, stats.clone())
             .map_err(EmitterError::Config)?;
 
+        // Live emitter knobs (budgets/flush/compression/retry) reach the batcher
+        // + inserter pool via this receiver; `None` keeps them at boot values.
+        let tail_config_rx = config_resolver.as_ref().map(|r| r.subscribe());
+
         // Shared tail (ack collector + inserter pool + batcher), the same unit
         // bootstrap feeds via the page walk.
-        let (msg_tx, ack, tail) = tail::spawn(
+        let (msg_tx, ack, tail) = tail::spawn_with_config(
             &emitter,
             inserter_pool_size,
             stats.clone(),
             emitter_ack.clone(),
             fatal.clone(),
+            tail_config_rx,
         )
         .await?;
 
@@ -224,6 +233,7 @@ impl PipelineConfig {
             msg_tx,
             stats,
             resolver,
+            config_resolver,
             fatal.clone(),
             span_registry,
         );

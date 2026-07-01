@@ -22,8 +22,8 @@ Three responsibilities collapse into one struct:
 
 Catalog access is lazy: only heaps where any column is
 `ColumnValue::ExternalToast` hit `ShadowCatalog::relation_at`, and only
-at drain. Per-xact descriptor cache was tried then removed — duplicated
-shadow's own LRU surface
+at drain. No per-xact descriptor cache — it would duplicate shadow's
+own LRU surface
 
 ![xact](../architecture/xact.svg)
 
@@ -164,30 +164,30 @@ but v1 propagates as `SpillError::Format` because the xact is
 unrecoverable anyway
 
 `HeapOp` encodes as `0=Insert, 1=Update, 2=HotUpdate, 3=Delete,
-4=Truncate`. `SPILL_VERSION = 2` covers `Truncate` tag-4 (initially
-shipped without a bump, fixed since). Version mismatch is near-academic
-anyway: resume contract wipes spill dir on startup
+4=Truncate`. `SPILL_VERSION = 2` covers `Truncate` tag-4. Version
+mismatch is near-academic anyway: resume contract wipes spill dir on
+startup
 ([`SpillStore::clear`]) and cursor file guarantees on-disk state is
 always "drained into CH" or "replayable from `decoder_lsn`"
 
-`spill_backend` config knob was reserved at design time for
-CH-as-scratch v2; the enum + config surface were NOT shipped in v1.
-ClickHouse-as-scratch path was rejected on three grounds:
+Spill backend is local disk only; no `spill_backend` config knob or
+enum surface for a CH-as-scratch alternative. ClickHouse-as-scratch is
+rejected on three grounds:
 
 - commit-drain latency: ms × n_toast per round trip vs µs sequential
   read
 - 2× wire bandwidth: same TOAST bytes ingress CH twice
 - MergeTree hygiene: short-lived staging is canonical anti-pattern
 
-`src/spill_ch.rs` placeholder was never created. Future diskless
-operator wanting this gets a fresh config-surface decision
+There is no `src/spill_ch.rs`. A diskless operator wanting this faces a
+fresh config-surface decision
 
 ## Drain shape
 
 Two consumers exist for the commit drain: the parallel pipeline's
 reorder coordinator (`pipeline/reorder.rs`, with `--ch-config` —
 dispatches `DrainedXact` to the decode pool, durability tracked by the
-ack collector; see [emitter.md](emitter.md)) and the legacy serial
+ack collector; see [emitter.md](emitter.md)) and the serial
 `XactRecordSink` → `TupleObserver` path (metrics-only runs, inproc
 harness). The observer-ack semantics below describe the serial path;
 the pipeline replaces them with the contiguous-done watermark
@@ -253,8 +253,8 @@ drivers) will silently lose prepared writes across walshadow restart
 between `PREPARE` and `COMMIT PREPARED`. Cross-link
 [future/two_phase_commit.md](future/two_phase_commit.md)
 
-`XactRecordSink` does process `COMMIT_PREPARED` / `ABORT_PREPARED`
-inline today — the gap is only cross-restart
+`XactRecordSink` processes `COMMIT_PREPARED` / `ABORT_PREPARED`
+inline — the gap is only cross-restart
 
 ## Cross-links
 

@@ -802,6 +802,12 @@ async fn run(args: Args) -> Result<()> {
         // a pump-position bump would be consumable before pre-DDL records
         // finish decoding
         .with_catalog_signals(invalidation_epoch.clone(), Some(pending_sweeps.clone()));
+    if let Some(schema) = ch_config
+        .as_ref()
+        .and_then(|c| c.runtime_config_schema.as_deref())
+    {
+        decoder = decoder.with_config_schema(Arc::from(schema));
+    }
     if let Some(reg) = &span_registry {
         decoder = decoder.with_span_registry(reg.clone());
     }
@@ -814,10 +820,10 @@ async fn run(args: Args) -> Result<()> {
     let mut pipeline_ack: Option<Arc<AtomicU64>> = None;
     // Layered config resolver (CLI > TOML); `Some` only with `--ch-config`.
     // Moved into the SIGHUP task, which re-reads TOML and republishes.
-    let mut config_resolver: Option<ConfigResolver> = None;
+    let mut config_resolver: Option<Arc<ConfigResolver>> = None;
 
     let decoder_xact = match ch_config {
-        Some(emitter_cfg) => {
+        Some(mut emitter_cfg) => {
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
             // Live routing map shared by DDL applicator + decode pool. The
             // refresher below rewrites it on every republished snapshot.
@@ -828,10 +834,43 @@ async fn run(args: Args) -> Result<()> {
             // mapping refresher + DDL applicator subscribe.
             let cli_overrides = CliOverrides {
                 drop_table_strategy: args.drop_table_strategy.clone(),
+                flush_timeout: args
+                    .ch_flush_timeout_ms
+                    .map(std::time::Duration::from_millis),
             };
-            let (resolver, config_rx) =
-                ConfigResolver::new(&emitter_cfg, cli_overrides, args.ch_config.clone());
-            spawn_mapping_refresher(config_rx.clone(), mapping.clone(), invalidation_epoch.clone());
+            let (resolver, config_rx) = ConfigResolver::new(
+                &emitter_cfg,
+                cli_overrides,
+                args.ch_config.clone(),
+                mapping.clone(),
+                invalidation_epoch.clone(),
+            );
+            spawn_mapping_refresher(config_rx.clone(), mapping.clone());
+            // Runtime-config overlay (§7): before the pump consumes WAL, seed the
+            // resolver from source PG's config_* tables via the sidecar libpq
+            // connection. Post-seed writes arrive live off the WAL stream. Refuse
+            // to start if the named schema is not installed — explicit opt-in
+            // means the operator expects the overlay present.
+            if let Some(schema) = emitter_cfg.runtime_config_schema.clone() {
+                let client = feed
+                    .sql_client()
+                    .await
+                    .context("sidecar sql for runtime-config seed")?;
+                seed_runtime_config(client, &schema, &resolver)
+                    .await
+                    .context("seed runtime config overlay")?;
+            }
+            // Fold the resolved emitter knobs back onto the boot config so the
+            // pipeline's initial batcher/inserter match the seeded + CLI values;
+            // they track the watch channel live thereafter.
+            {
+                let rc = config_rx.borrow();
+                emitter_cfg.row_budget = rc.row_budget;
+                emitter_cfg.byte_budget = rc.byte_budget;
+                emitter_cfg.flush_timeout = rc.flush_timeout;
+                emitter_cfg.compression = rc.compression;
+                emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
+            }
             // DDL applicator owned by the reorder coordinator so ALTER /
             // CREATE / DROP / TRUNCATE apply inside the barrier, after
             // earlier data is durable. Seeds DDL config from the resolved
@@ -879,6 +918,7 @@ async fn run(args: Args) -> Result<()> {
                 pending_sweeps: Some(pending_sweeps.clone()),
                 stats,
                 span_registry: span_registry.clone(),
+                config_resolver: config_resolver.clone(),
             };
             let (reorder_sink, handle) = pcfg
                 .spawn(emitter_ack)
@@ -1320,11 +1360,139 @@ async fn open_shadow_sql_client(
     Ok(client)
 }
 
+/// Quote a SQL identifier: wrap in double quotes, double any embedded quote.
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Seed the resolver overlay from source PG's `<schema>.config_*` tables via
+/// the sidecar libpq connection (plan §7). Refuses (Err → daemon exits) when
+/// the schema is named but not installed, or the install is newer than this
+/// daemon understands — explicit opt-in should not silently no-op.
+async fn seed_runtime_config(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    resolver: &ConfigResolver,
+) -> anyhow::Result<()> {
+    use walshadow::runtime_config::{ColumnRow, ConfigOverlay, GlobalRow, NamespaceRow, TableRow};
+    let s = quote_ident(schema);
+    let mut overlay = ConfigOverlay::default();
+
+    // The config_global read doubles as the install probe: a missing table
+    // errors here, so a schema named but not installed refuses to start rather
+    // than silently no-op (explicit opt-in). config_global is the singleton, so
+    // 0 rows (greenfield) is fine — all TOML defaults then apply.
+    if let Some(row) = client
+        .query_opt(
+            &format!(
+                "SELECT row_budget, byte_budget, flush_timeout_ms, compression, \
+                 retry_max_attempts, drop_table_strategy FROM {s}.config_global WHERE id = 1"
+            ),
+            &[],
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "runtime_config schema {schema:?} not installed (config_global unreadable); \
+                 set [runtime_config] schema = \"\" to disable the overlay"
+            )
+        })?
+    {
+        overlay.global = Some(GlobalRow {
+            row_budget: row.get("row_budget"),
+            byte_budget: row.get("byte_budget"),
+            flush_timeout_ms: row.get("flush_timeout_ms"),
+            compression: row.get("compression"),
+            retry_max_attempts: row
+                .get::<_, Option<i32>>("retry_max_attempts")
+                .map(i64::from),
+            drop_table_strategy: row.get("drop_table_strategy"),
+        });
+    }
+
+    for row in client
+        .query(
+            &format!(
+                "SELECT namespace, target_database, auto_create, drop_table_strategy \
+                 FROM {s}.config_namespace"
+            ),
+            &[],
+        )
+        .await
+        .context("read config_namespace")?
+    {
+        let namespace: String = row.get("namespace");
+        overlay.namespaces.insert(
+            namespace,
+            NamespaceRow {
+                target_database: row.get("target_database"),
+                auto_create: row.get("auto_create"),
+                drop_table_strategy: row.get("drop_table_strategy"),
+            },
+        );
+    }
+
+    for row in client
+        .query(
+            &format!("SELECT namespace, relname, target FROM {s}.config_table"),
+            &[],
+        )
+        .await
+        .context("read config_table")?
+    {
+        let namespace: String = row.get("namespace");
+        let relname: String = row.get("relname");
+        overlay.tables.insert(
+            format!("{namespace}.{relname}"),
+            TableRow {
+                target: row.get("target"),
+            },
+        );
+    }
+
+    for row in client
+        .query(
+            &format!("SELECT namespace, relname, attname, target_type FROM {s}.config_column"),
+            &[],
+        )
+        .await
+        .context("read config_column")?
+    {
+        let namespace: String = row.get("namespace");
+        let relname: String = row.get("relname");
+        let attname: String = row.get("attname");
+        overlay.columns.insert(
+            (format!("{namespace}.{relname}"), attname),
+            ColumnRow {
+                target_type: row.get("target_type"),
+            },
+        );
+    }
+
+    let (has_global, n_ns, n_tbl, n_col) = (
+        overlay.global.is_some(),
+        overlay.namespaces.len(),
+        overlay.tables.len(),
+        overlay.columns.len(),
+    );
+    resolver.seed_overlay(overlay).await;
+    tracing::info!(
+        target: "walshadow::config",
+        schema,
+        global = has_global,
+        namespaces = n_ns,
+        tables = n_tbl,
+        columns = n_col,
+        "runtime config overlay seeded from source PG",
+    );
+    Ok(())
+}
+
 /// SIGHUP listener: re-reads `--ch-config` and republishes the resolved
 /// snapshot through the resolver (CLI overrides stay on top). Read/parse
 /// errors keep the last snapshot in effect; absent resolver (metrics-only)
 /// is a no-op tap.
-fn spawn_sighup_handler(resolver: Option<ConfigResolver>) -> tokio::task::JoinHandle<()> {
+fn spawn_sighup_handler(resolver: Option<Arc<ConfigResolver>>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(s) => s,
@@ -1363,19 +1531,15 @@ fn spawn_sighup_handler(resolver: Option<ConfigResolver>) -> tokio::task::JoinHa
 /// Applies each republished [`ResolvedConfig`] snapshot to the live routing
 /// map. Full swap of the operator mapping, matching the boot seed; runs
 /// until the resolver's sender drops (SIGHUP disabled or daemon teardown).
-/// `epoch` bumps after each swap so decode-pool workers drop cached
-/// pre-reload mapping snapshots.
 fn spawn_mapping_refresher(
     mut config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     mapping: MappingHandle,
-    epoch: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Boot value already seeded into `mapping`; react to republishes.
         while config_rx.changed().await.is_ok() {
             let tables = config_rx.borrow_and_update().tables.clone();
             *mapping.write().await = tables;
-            walshadow::ch_ddl::bump_mapping_epoch(Some(&epoch));
             tracing::info!(
                 target: "walshadow::config",
                 "routing map refreshed from resolved config",
