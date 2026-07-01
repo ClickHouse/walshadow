@@ -13,8 +13,6 @@ path = "src/lib.rs"
 default = ["lz4"]
 lz4 = []
 tokio = ["dep:tokio"]
-# rustls TLS for the blocking Client (tls::TlsIo) and, when `tokio` is also
-# on, AsyncClient::connect_tls.
 tls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
 zstd = []
 

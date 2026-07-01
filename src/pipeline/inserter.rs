@@ -177,7 +177,7 @@ pub async fn spawn_pool(
         let client = connect_client(config).await?;
         let inserter = Inserter {
             client,
-            alloc: Allocator::stdlib(),
+            alloc: Allocator::global(&mimalloc::MiMalloc),
             config: config.clone(),
             asts: HashMap::new(),
             ack: ack.clone(),
