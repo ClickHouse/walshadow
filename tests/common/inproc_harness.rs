@@ -672,8 +672,20 @@ async fn build_pipeline_inner(
 
     // SIGHUP-reloadable mapping shared by the DDL applicator + decode pool.
     let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
-    let ddl_cfg = DdlConfig::from_emitter(&emitter_cfg);
-    let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone())
+    // Resolver seeds the DDL applicator's live config layers. Harness runs
+    // no SIGHUP, so the sender drops with `_config_resolver` at scope end
+    // and the applicator keeps the boot snapshot.
+    let (_config_resolver, config_rx) = walshadow::config::ConfigResolver::new(
+        &emitter_cfg,
+        walshadow::config::CliOverrides::default(),
+        None,
+    );
+    let ddl_cfg = DdlConfig::from_resolved(
+        &config_rx.borrow(),
+        emitter_cfg.database.clone(),
+        emitter_cfg.soft_delete,
+    );
+    let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone(), config_rx.clone())
         .await
         .expect("ddl applicator init")
         .with_invalidation_epoch(inv_epoch.clone());

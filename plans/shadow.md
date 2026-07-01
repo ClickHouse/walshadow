@@ -253,14 +253,14 @@ channel saturation
 `NamespaceMapping` ([src/ch_emitter.rs](../src/ch_emitter.rs)) ships
 `auto_create`, `target_database`, and `drop_table_strategy` (the latter
 two resolved per-namespace in `DdlApplicator`). Plan additionally listed
-`type_overrides`, `order_by_default`, `engine_default` — none landed.
-Accompanying
-`watch::Receiver<Arc<ResolvedConfig>>` resolver refactor also did not
-land — emitter still consumes `Arc<RwLock<HashMap>>` on SIGHUP. Closing
-those gaps is prerequisite for runtime-config-from-PG. See
-[future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) —
-CLI > WAL-config > TOML precedence merge depends on resolver substrate
-landing first
+`type_overrides`, `order_by_default`, `engine_default` — still missing.
+The `watch::Receiver<Arc<ResolvedConfig>>` resolver substrate **landed**
+([config.md](config.md)): CLI > TOML merge, SIGHUP republish, and the
+DdlApplicator refreshes namespace config from it per apply. The decode
+pool still reads `Arc<RwLock<HashMap>>` on the hot path, bridged from the
+watch snapshot by a refresher task. The remaining precedence layer
+(WAL-config between CLI and TOML) is
+[future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
 
 ## Pitfalls
 
