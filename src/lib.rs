@@ -32,6 +32,7 @@ pub mod ch_ddl;
 pub mod ch_emitter;
 pub mod classify;
 pub mod codecs;
+pub mod config;
 pub mod cursor;
 pub mod decoder_sink;
 pub mod filter;

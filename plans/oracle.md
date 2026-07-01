@@ -74,10 +74,7 @@ Files:
 - [`pgext/Makefile`](../pgext/Makefile) — PGXS-driven, `REGRESS =
   walshadow` for pg_regress
 
-Installed into **shadow PG** today. Runtime-config-from-PG work
-([future/runtime_config_from_pg.md](future/runtime_config_from_pg.md))
-plans to relocate install to source side; resolver code changes only
-at conninfo level
+Installed into **shadow PG**; stays shadow-only.
 
 ## Absence semantics
 
@@ -133,5 +130,3 @@ surface
   routing through `heap_decoder`
 - [shadow.md](shadow.md) — extension install site,
   `try_load_oracle_extension`, lc_* pinning
-- [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
-  — wants extension reachable on source PG

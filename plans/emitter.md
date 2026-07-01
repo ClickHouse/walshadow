@@ -307,30 +307,26 @@ database
 
 ## NOT yet landed for namespace mapping
 
-`auto_create`, `target_database`, and `drop_table_strategy` ship; the
+`auto_create`, `target_database`, and `drop_table_strategy` ship, plus
+the resolver substrate ([config.md](config.md)): `ResolvedConfig`
+(`tables` + `namespaces` + `columns` type-override table) published on a
+`watch::Receiver<Arc<ResolvedConfig>>`, CLI > TOML merge, SIGHUP
+republish. The decode pool still reads `Arc<RwLock<HashMap>>` for the
+per-row hot path; a refresher bridges the watch snapshot into it. The
 richer namespace surface the plan called for is still missing:
 
-- `ResolvedConfig` struct: design called for one pre-materialised value
-  carrying `tables`, `namespaces`, and a
-  `columns: HashMap<(String, String), ColumnMapping>` type-override
-  table. Today no such type; mapping lives in
-  `Arc<RwLock<HashMap<String, TableMapping>>>` and namespace defaults
-  live separately on `EmitterConfig::namespaces`
-- `watch::Receiver<Arc<ResolvedConfig>>` emitter wiring:
-  runtime-config-from-PG path wants emitter to consume watch stream so
-  config changes propagate without SIGHUP. Today's reload channel is
-  `RwLock` swap kicked by SIGHUP
+- `ResolvedConfig::columns` population: the field exists as the overlay
+  hook but has no TOML surface and nothing reads it yet — per-column type
+  override is still per-table TOML only
 - `NamespaceMapping.order_by_default`: `render_create_table` hard-codes
   `ORDER BY (_lsn)` fallback when no PK exists
 - `NamespaceMapping.engine_default`: `render_create_table` hard-codes
   `ENGINE = ReplacingMergeTree(_lsn)`. Plan wanted per-namespace
   override (e.g., `MergeTree`, `CollapsingMergeTree`)
-- `NamespaceMapping.type_overrides`: plan wanted per-column type
-  overrides keyed on `(namespace, src_attname)`. Today only path is
-  per-table TOML
 
-See [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
-— pg-driven config substrate depends on this resolver shape
+See [config.md](config.md) for the landed resolver substrate and
+[future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) for
+the pg-driven overlay that builds on it
 
 ## DdlApplicator
 
@@ -534,8 +530,9 @@ extended CH outages) not yet shipped
 - [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
   — pipeline design record; remaining: pump wire/record split,
   bootstrap decode pool (Option B), hot-table sharding, M/N sizing
+- [config.md](config.md) — landed resolver substrate: `ResolvedConfig`
+  + `watch::Receiver`, CLI > TOML merge, SIGHUP republish
 - [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
-  — runtime-config substrate; `ResolvedConfig` + `watch::Receiver`
-  shape partial namespace-mapping work needs to land first
+  — pg-driven config overlay building on the resolver substrate
 - [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md) —
   spill-buffered re-emit for extended CH outages

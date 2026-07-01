@@ -26,12 +26,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use clickhouse_c::AsyncClient;
+use tokio::sync::watch;
 
 use crate::ch_emitter::{
     ColumnMapping, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, RetryConfig,
     TableMapping, connect_client, drain_to_end_of_stream, is_retryable, quote_ident,
     reconnect_if_idle,
 };
+use crate::config::ResolvedConfig;
 use crate::shadow_catalog::{RelDescriptor, SchemaDiff, SchemaEvent};
 use crate::type_bridge::{self, ResolvedColumn};
 
@@ -63,9 +65,10 @@ impl DropTableStrategy {
     }
 }
 
-/// Knobs that don't ride the INSERT pump but flow through the same TOML
-/// reload path. SIGHUP reload swaps the inner via
-/// [`DdlApplicator::config_mut`].
+/// Knobs that don't ride the INSERT pump. [`DdlApplicator`] rebuilds them
+/// from a republished [`ResolvedConfig`] snapshot at each apply, so SIGHUP
+/// (and the future overlay) retarget namespaces + drop strategy without a
+/// restart.
 #[derive(Debug, Clone)]
 pub struct DdlConfig {
     pub drop_table_strategy: DropTableStrategy,
@@ -84,21 +87,28 @@ pub struct DdlConfig {
 }
 
 impl DdlConfig {
-    pub fn from_emitter(cfg: &EmitterConfig) -> Self {
-        let auto_create_namespaces: HashSet<String> = cfg
+    /// Build from a resolved snapshot. `target_database` (`[ch] database`)
+    /// and `soft_delete` are boot-only connection knobs the resolver does
+    /// not republish, so callers thread them through unchanged.
+    pub fn from_resolved(
+        resolved: &ResolvedConfig,
+        target_database: String,
+        soft_delete: bool,
+    ) -> Self {
+        let auto_create_namespaces: HashSet<String> = resolved
             .namespaces
             .iter()
             .filter(|(_, v)| v.auto_create)
             .map(|(k, _)| k.clone())
             .collect();
         let drop_table_strategy =
-            DropTableStrategy::parse(&cfg.drop_table_strategy).unwrap_or_default();
+            DropTableStrategy::parse(&resolved.drop_table_strategy).unwrap_or_default();
         Self {
             drop_table_strategy,
             auto_create_namespaces,
-            target_database: cfg.database.clone(),
-            namespaces: cfg.namespaces.clone(),
-            soft_delete: cfg.soft_delete,
+            target_database,
+            namespaces: resolved.namespaces.clone(),
+            soft_delete,
         }
     }
 
@@ -127,6 +137,10 @@ impl DdlConfig {
 pub struct DdlApplicator {
     client: AsyncClient,
     config: DdlConfig,
+    /// Live config layers. `refresh_config` folds a republished snapshot
+    /// into `config` (namespaces + drop strategy) at each apply, so SIGHUP
+    /// and the future overlay retarget DDL without a restart.
+    config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     mapping: MappingHandle,
     /// Reconnect params, cloned at boot. SIGHUP reloads DDL knobs not
     /// connection params, so a reconnect re-dials the boot endpoint.
@@ -161,11 +175,13 @@ impl DdlApplicator {
         emitter_cfg: &EmitterConfig,
         ddl_cfg: DdlConfig,
         mapping: MappingHandle,
+        config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     ) -> Result<Self, EmitterError> {
         let client = connect_client(emitter_cfg).await?;
         Ok(Self {
             client,
             config: ddl_cfg,
+            config_rx,
             mapping,
             conn_cfg: emitter_cfg.clone(),
             retry: emitter_cfg.retry.clone(),
@@ -187,13 +203,25 @@ impl DdlApplicator {
         &self.config
     }
 
-    pub fn config_mut(&mut self) -> &mut DdlConfig {
-        &mut self.config
+    /// Fold a republished snapshot into `config` (namespaces + drop
+    /// strategy). `target_database` + `soft_delete` are boot-only, so they
+    /// carry over. No-op until the resolver sends a new value; called at
+    /// each apply so DDL runs against the current config.
+    fn refresh_config(&mut self) {
+        if self.config_rx.has_changed().unwrap_or(false) {
+            let snap = self.config_rx.borrow_and_update();
+            self.config = DdlConfig::from_resolved(
+                &snap,
+                self.config.target_database.clone(),
+                self.config.soft_delete,
+            );
+        }
     }
 
     /// Errors propagate; the worker task turns them into
     /// `DecoderSinkError` so the daemon poisons the stream cleanly.
     pub async fn apply(&mut self, event: &SchemaEvent) -> Result<(), EmitterError> {
+        self.refresh_config();
         match event {
             SchemaEvent::Added { desc } => self.apply_added(desc).await,
             SchemaEvent::Changed { old, new, diff } => self.apply_changed(old, new, diff).await,

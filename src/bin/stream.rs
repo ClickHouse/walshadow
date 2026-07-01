@@ -35,7 +35,7 @@ use std::fs;
 use std::future::Future;
 use std::io::Write as _;
 use std::pin::Pin;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
@@ -47,6 +47,7 @@ use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, MappingHandle};
+use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig};
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
@@ -293,6 +294,12 @@ struct Args {
     /// knob in TOML.
     #[arg(long)]
     ch_flush_timeout_ms: Option<u64>,
+    /// CLI override for the TOML's `[ch] drop_table_strategy` (`retain` /
+    /// `drop` / `warn`). Highest-precedence layer: wins over TOML and
+    /// survives SIGHUP reload, so an operator can pin the drop policy from
+    /// the command line without editing TOML. Absent defers to TOML.
+    #[arg(long)]
+    drop_table_strategy: Option<String>,
     /// Differential decode oracle: probe 1-in-`<N>` rows through shadow
     /// PG's `walshadow_decode_disk(oid, bytea)` extension function and
     /// assert the local decoder matches. `0` disables. Requires the
@@ -800,29 +807,50 @@ async fn run(args: Args) -> Result<()> {
     }
     let decoder_stats_handle = decoder.stats_handle();
 
-    let mut mapping_handle: Option<MappingHandle> = None;
     let mut emitter_stats_handle: Option<Arc<EmitterStats>> = None;
     let mut pipeline_handle: Option<PipelineHandle> = None;
     // When the pipeline is wired, the durable watermark comes from its ack
     // collector atomic instead of the xact buffer's synchronous field.
     let mut pipeline_ack: Option<Arc<AtomicU64>> = None;
+    // Layered config resolver (CLI > TOML); `Some` only with `--ch-config`.
+    // Moved into the SIGHUP task, which re-reads TOML and republishes.
+    let mut config_resolver: Option<ConfigResolver> = None;
 
     let decoder_xact = match ch_config {
         Some(emitter_cfg) => {
             let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-            // SIGHUP-reloadable mapping shared by DDL applicator + decode pool.
+            // Live routing map shared by DDL applicator + decode pool. The
+            // refresher below rewrites it on every republished snapshot.
             let mapping: MappingHandle =
                 Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
-            mapping_handle = Some(mapping.clone());
+            // Resolver merges CLI over TOML and publishes ResolvedConfig on
+            // the watch substrate; SIGHUP re-reads TOML and republishes. The
+            // mapping refresher + DDL applicator subscribe.
+            let cli_overrides = CliOverrides {
+                drop_table_strategy: args.drop_table_strategy.clone(),
+            };
+            let (resolver, config_rx) =
+                ConfigResolver::new(&emitter_cfg, cli_overrides, args.ch_config.clone());
+            spawn_mapping_refresher(config_rx.clone(), mapping.clone(), invalidation_epoch.clone());
             // DDL applicator owned by the reorder coordinator so ALTER /
             // CREATE / DROP / TRUNCATE apply inside the barrier, after
-            // earlier data is durable.
-            let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_emitter(&emitter_cfg);
-            let applicator =
-                walshadow::ch_ddl::DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone())
-                    .await
-                    .context("init DDL applicator")?
-                    .with_invalidation_epoch(invalidation_epoch.clone());
+            // earlier data is durable. Seeds DDL config from the resolved
+            // snapshot; refreshes per apply as the resolver republishes.
+            let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_resolved(
+                &config_rx.borrow(),
+                emitter_cfg.database.clone(),
+                emitter_cfg.soft_delete,
+            );
+            let applicator = walshadow::ch_ddl::DdlApplicator::new(
+                &emitter_cfg,
+                ddl_cfg,
+                mapping.clone(),
+                config_rx,
+            )
+            .await
+            .context("init DDL applicator")?
+            .with_invalidation_epoch(invalidation_epoch.clone());
+            config_resolver = Some(resolver);
             let stats = Arc::new(EmitterStats::default());
             emitter_stats_handle = Some(stats.clone());
             // Seed durable watermark at `raw_start`, not 0. Status loop
@@ -934,10 +962,10 @@ async fn run(args: Args) -> Result<()> {
         None => None,
     };
 
-    // SIGHUP swaps only the per-relation mapping; connection params stay boot-only.
-    let sighup_path = args.ch_config.clone();
-    let sighup_handle = mapping_handle.clone();
-    let _sighup_task = spawn_sighup_handler(sighup_path, sighup_handle, invalidation_epoch.clone());
+    // SIGHUP re-reads TOML and republishes the resolved snapshot; the
+    // mapping refresher + DDL applicator pick it up. Connection params stay
+    // boot-only. No resolver (metrics-only) makes SIGHUP a no-op tap.
+    let _sighup_task = spawn_sighup_handler(config_resolver);
 
     // Retention sweeper writes shadow's `pg_last_wal_replay_lsn` here;
     // status loop reads it for the cursor's `shadow_replay_lsn` slot + the
@@ -1292,15 +1320,11 @@ async fn open_shadow_sql_client(
     Ok(client)
 }
 
-/// SIGHUP listener: re-parses `--ch-config` and atomically swaps the live
-/// mapping. Parse errors keep the existing mapping; absent `--ch-config`
-/// is a no-op tap. `epoch` bumps after each swap so decode-pool workers
-/// drop cached pre-reload mapping snapshots.
-fn spawn_sighup_handler(
-    path: Option<PathBuf>,
-    handle: Option<MappingHandle>,
-    epoch: Arc<AtomicU64>,
-) -> tokio::task::JoinHandle<()> {
+/// SIGHUP listener: re-reads `--ch-config` and republishes the resolved
+/// snapshot through the resolver (CLI overrides stay on top). Read/parse
+/// errors keep the last snapshot in effect; absent resolver (metrics-only)
+/// is a no-op tap.
+fn spawn_sighup_handler(resolver: Option<ConfigResolver>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(s) => s,
@@ -1317,35 +1341,45 @@ fn spawn_sighup_handler(
             if sig.recv().await.is_none() {
                 return;
             }
-            let (Some(p), Some(h)) = (path.as_deref(), handle.as_ref()) else {
+            let Some(resolver) = resolver.as_ref() else {
                 tracing::info!(target: "walshadow::sighup", "SIGHUP ignored (no --ch-config)");
                 continue;
             };
-            match tokio::fs::read_to_string(p).await {
-                Ok(toml) => match EmitterConfig::from_toml_str(&toml) {
-                    Ok(cfg) => {
-                        *h.write().await = cfg.tables;
-                        walshadow::ch_ddl::bump_mapping_epoch(Some(&epoch));
-                        tracing::info!(
-                            target: "walshadow::sighup",
-                            path = %p.display(),
-                            "ch-config reload applied",
-                        );
-                    }
-                    Err(e) => tracing::warn!(
-                        target: "walshadow::sighup",
-                        error = %e,
-                        path = %p.display(),
-                        "ch-config parse failed; existing mapping preserved",
-                    ),
-                },
+            match resolver.reload().await {
+                Ok(()) => tracing::info!(
+                    target: "walshadow::sighup",
+                    "ch-config reload published",
+                ),
                 Err(e) => tracing::warn!(
                     target: "walshadow::sighup",
                     error = %e,
-                    path = %p.display(),
-                    "ch-config read failed; existing mapping preserved",
+                    "ch-config reload failed; existing config preserved",
                 ),
             }
+        }
+    })
+}
+
+/// Applies each republished [`ResolvedConfig`] snapshot to the live routing
+/// map. Full swap of the operator mapping, matching the boot seed; runs
+/// until the resolver's sender drops (SIGHUP disabled or daemon teardown).
+/// `epoch` bumps after each swap so decode-pool workers drop cached
+/// pre-reload mapping snapshots.
+fn spawn_mapping_refresher(
+    mut config_rx: watch::Receiver<Arc<ResolvedConfig>>,
+    mapping: MappingHandle,
+    epoch: Arc<AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Boot value already seeded into `mapping`; react to republishes.
+        while config_rx.changed().await.is_ok() {
+            let tables = config_rx.borrow_and_update().tables.clone();
+            *mapping.write().await = tables;
+            walshadow::ch_ddl::bump_mapping_epoch(Some(&epoch));
+            tracing::info!(
+                target: "walshadow::config",
+                "routing map refreshed from resolved config",
+            );
         }
     })
 }
