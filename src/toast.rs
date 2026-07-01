@@ -275,7 +275,7 @@ impl ClickHouseChunkStore {
         Self {
             conn,
             database,
-            alloc: Allocator::stdlib(),
+            alloc: Allocator::global(&mimalloc::MiMalloc),
             state: Mutex::new(ChState {
                 client: None,
                 created: HashSet::new(),

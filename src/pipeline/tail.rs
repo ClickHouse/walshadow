@@ -126,7 +126,7 @@ pub async fn spawn(
             byte_budget: emitter.byte_budget,
             flush_timeout,
         },
-        Allocator::stdlib(),
+        Allocator::global(&mimalloc::MiMalloc),
         fatal,
         stats.clone(),
     );
