@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::ch_emitter::{
     EmitterConfig, EmitterError, EmitterStats, append_buf, connect_client, drain_to_end_of_stream,
-    is_retryable,
+    is_retryable, reconnect_if_idle,
 };
 use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
@@ -29,6 +29,7 @@ use std::sync::atomic::Ordering;
 
 struct Inserter {
     client: AsyncClient,
+    last_used: std::time::Instant,
     alloc: Allocator,
     config: EmitterConfig,
     /// Parsed column types per table, refreshed when a batch's `schema_epoch`
@@ -74,6 +75,7 @@ impl Inserter {
         let retry = self.config.retry.clone();
         let mut attempt = 0u32;
         let mut backoff = retry.initial_backoff;
+        reconnect_if_idle(&mut self.client, &self.config, self.last_used).await?;
         loop {
             let attempt_result = match tokio::time::timeout(self.config.insert_timeout, async {
                 self.client.send_query(sql, None).await?;
@@ -93,7 +95,10 @@ impl Inserter {
                 }),
             };
             match attempt_result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.last_used = std::time::Instant::now();
+                    return Ok(());
+                }
                 Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
                     self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
                     attempt += 1;
@@ -177,6 +182,7 @@ pub async fn spawn_pool(
         let client = connect_client(config).await?;
         let inserter = Inserter {
             client,
+            last_used: std::time::Instant::now(),
             alloc: Allocator::global(&mimalloc::MiMalloc),
             config: config.clone(),
             asts: HashMap::new(),

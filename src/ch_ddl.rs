@@ -28,6 +28,7 @@ use clickhouse_c::AsyncClient;
 use crate::ch_emitter::{
     ColumnMapping, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, RetryConfig,
     TableMapping, connect_client, drain_to_end_of_stream, is_retryable, quote_ident,
+    reconnect_if_idle,
 };
 use crate::shadow_catalog::{RelDescriptor, SchemaDiff, SchemaEvent};
 use crate::type_bridge::{self, ResolvedColumn};
@@ -132,6 +133,7 @@ pub struct DdlApplicator {
     /// Per-attempt cap (shares `EmitterConfig::insert_timeout`); a
     /// half-open CH socket can't park the reorder barrier past this
     query_timeout: Duration,
+    last_used: std::time::Instant,
     pub stats: DdlStats,
 }
 
@@ -160,6 +162,7 @@ impl DdlApplicator {
             conn_cfg: emitter_cfg.clone(),
             retry: emitter_cfg.retry.clone(),
             query_timeout: emitter_cfg.insert_timeout,
+            last_used: std::time::Instant::now(),
             stats: DdlStats::default(),
         })
     }
@@ -453,6 +456,7 @@ impl DdlApplicator {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
         let mut attempt = 0u32;
         let mut backoff = self.retry.initial_backoff;
+        reconnect_if_idle(&mut self.client, &self.conn_cfg, self.last_used).await?;
         loop {
             let attempt_result = match tokio::time::timeout(self.query_timeout, async {
                 self.client.send_query(sql, None).await?;
@@ -468,7 +472,10 @@ impl DdlApplicator {
                 }),
             };
             match attempt_result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.last_used = std::time::Instant::now();
+                    return Ok(());
+                }
                 Err(e) if is_retryable(&e) && attempt < self.retry.max_attempts => {
                     tracing::warn!(
                         target: "walshadow::ch_ddl",
