@@ -31,7 +31,7 @@
 //! bytes + accumulated manifest. No re-parse, no second walk.
 
 use std::collections::BTreeMap;
-use std::future::Future;
+use std::future::{self, Future};
 use std::pin::Pin;
 
 use thiserror::Error;
@@ -155,7 +155,7 @@ pub trait RecordSink {
     fn on_idle<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(future::ready(Ok(())))
     }
 
     /// Final hook before drop, fired by the queueing worker after its
@@ -165,7 +165,7 @@ pub trait RecordSink {
     fn on_close<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(future::ready(Ok(())))
     }
 
     /// Post-batch nudge from the queueing worker: every record with
@@ -179,7 +179,7 @@ pub trait RecordSink {
         &'a mut self,
         _lsn: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -206,7 +206,19 @@ pub trait RecordBytesSink: Send {
         _start_lsn: u64,
         _trailing_bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(future::ready(Ok(())))
+    }
+
+    /// Fires unconditionally once a segment is retired to disk, with the
+    /// new current-segment start LSN. Sinks retaining wire bytes drop
+    /// everything below it here: a completed segment is served from disk,
+    /// so its wire bytes no longer need retaining. Runs on every flush,
+    /// unlike `on_segment_boundary` (tail-send only).
+    fn on_segment_retired<'a>(
+        &'a mut self,
+        _new_start_lsn: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -403,7 +415,7 @@ impl RecordBytesSink for NoopBytesSink {
         _start_lsn: u64,
         _bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -862,6 +874,7 @@ impl WalStream {
             .await?;
         self.walker.truncate_first_segment();
         self.current_lsn += self.seg_size;
+        self.bytes_sink.on_segment_retired(self.current_lsn).await?;
         self.wire_offset = self.wire_offset.saturating_sub(seg_size);
         self.stats_at_segment_start = self.filter.stats;
         self.relmap_at_segment_start = self.filter.tracker.relmap_updates;
@@ -1383,5 +1396,90 @@ mod tests {
         }
         page.resize(PAGE_SIZE, 0);
         page
+    }
+
+    /// A single record that fills two full WAL pages, so it ends exactly on
+    /// the second page's boundary. With one page per segment, this straddles
+    /// the seg-0/seg-1 boundary and ends flush on the seg-1/seg-2 boundary —
+    /// so both segment flushes see `wire_offset >= seg_size`.
+    fn synth_two_page_spanning_record() -> (Vec<u8>, Vec<u8>) {
+        use walrus::pg::walparser::{
+            WAL_PAGE_SIZE, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
+            XLR_BLOCK_ID_DATA_LONG,
+        };
+        const PAGE: usize = WAL_PAGE_SIZE as usize; // 8192
+        const LONG_HDR: usize = 40;
+        const SHORT_HDR: usize = 24;
+        let p0_data = PAGE - LONG_HDR; // 8152
+        let p1_data = PAGE - SHORT_HDR; // 8168
+        let total = p0_data + p1_data; // 16320, record ends at end of page1
+        let main_data_len = total - X_LOG_RECORD_HEADER_SIZE - 5; // 254 marker + u32 len
+
+        let mut rec = Vec::with_capacity(total);
+        rec.extend_from_slice(&(total as u32).to_le_bytes());
+        rec.extend_from_slice(&0u32.to_le_bytes()); // xid
+        rec.extend_from_slice(&0u64.to_le_bytes()); // prev
+        rec.push(0); // info
+        rec.push(walrus::pg::walparser::RmId::Xact as u8);
+        rec.push(0);
+        rec.push(0);
+        rec.extend_from_slice(&0u32.to_le_bytes()); // crc (unvalidated)
+        rec.push(XLR_BLOCK_ID_DATA_LONG);
+        rec.extend_from_slice(&(main_data_len as u32).to_le_bytes());
+        rec.resize(total, 0xAA);
+
+        let mut page0 = Vec::with_capacity(PAGE);
+        page0.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+        page0.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        page0.extend_from_slice(&1u32.to_le_bytes()); // tli
+        page0.extend_from_slice(&0u64.to_le_bytes()); // page_addr
+        page0.extend_from_slice(&0u32.to_le_bytes()); // rem_len (record starts here)
+        page0.extend_from_slice(&12345u64.to_le_bytes()); // sysid
+        page0.extend_from_slice(&(8192u32 * 1024).to_le_bytes());
+        page0.extend_from_slice(&8192u32.to_le_bytes());
+        page0.extend_from_slice(&[0u8; 4]);
+        page0.extend_from_slice(&rec[..p0_data]);
+        assert_eq!(page0.len(), PAGE);
+
+        let mut page1 = Vec::with_capacity(PAGE);
+        page1.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+        page1.extend_from_slice(&0u16.to_le_bytes()); // short header
+        page1.extend_from_slice(&1u32.to_le_bytes()); // tli
+        page1.extend_from_slice(&(PAGE as u64).to_le_bytes()); // page_addr
+        page1.extend_from_slice(&(p1_data as u32).to_le_bytes()); // rem_len (continuation on this page)
+        page1.extend_from_slice(&[0u8; 4]); // pad to 24
+        page1.extend_from_slice(&rec[p0_data..]);
+        assert_eq!(page1.len(), PAGE);
+
+        (page0, page1)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shadow_wire_buf_bounded_when_record_straddles_segment() {
+        use crate::shadow_stream::{ShadowStreamSink, ShadowStreamState};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        const SEG: u64 = walrus::pg::walparser::WAL_PAGE_SIZE as u64;
+        let state = Arc::new(Mutex::new(ShadowStreamState::new(
+            1,
+            "sys".into(),
+            0,
+            64 * 1024 * 1024,
+        )));
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        ws.set_bytes_sink(Box::new(ShadowStreamSink::new(state.clone())));
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+
+        let (page0, page1) = synth_two_page_spanning_record();
+        ws.push(0, &page0, &mut rec, &mut seg).await.unwrap();
+        ws.push(SEG, &page1, &mut rec, &mut seg).await.unwrap();
+
+        let len = state.lock().await.wire_buf_len() as u64;
+        assert!(
+            len <= SEG,
+            "wire_buf retained {len} bytes across a straddling boundary (> {SEG})",
+        );
     }
 }
