@@ -52,6 +52,7 @@ with the referring tuple in WAL. In-xact WAL reassembly is the fast path — see
   carries no key — same blind spot as system catalogs,
   [[feedback_pg_version_wal_skew]]), so a delete marker has nowhere to land.
   Dead chunk rows leak; dedup keeps the live `va_valueid`'s chunks correct.
+  GC design: [future/toast_chunk_gc.md](future/toast_chunk_gc.md).
 - **Bounded-memory streaming reassembly.** A multi-MB value is thousands of
   chunks. `fetch` streams the SELECT block-by-block (no unbounded buffered
   result read), but the reassembled value is still fully materialised in memory

@@ -291,8 +291,9 @@ impl SourceFeed {
 }
 
 /// Mirrors wal-rus's transport choice: unix socket when `host` starts
-/// with `/`, TLS-or-plain TCP otherwise.
-async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
+/// with `/`, TLS-or-plain TCP otherwise. Shared with the COPY backfiller
+/// ([`crate::copy_backfill`]), which opens its own session per backfill.
+pub(crate) async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
     let mut tp_cfg = tokio_postgres::Config::new();
     tp_cfg
         .user(cfg.user.as_str())

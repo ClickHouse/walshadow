@@ -127,6 +127,9 @@ pub struct PipelineConfig {
     /// Runtime-config overlay resolver, applied to inside the reorder barrier
     /// when a `DrainEntry::Config` drains. `None` disables live config apply.
     pub config_resolver: Option<Arc<crate::config::ConfigResolver>>,
+    /// COPY backfiller for `initial_load='copy'` opt-ins; `None` streams from
+    /// the opt-in LSN only.
+    pub backfiller: Option<Arc<crate::copy_backfill::CopyBackfiller>>,
 }
 
 /// Spawned-stage join handles + shared signals. The daemon drives the
@@ -181,6 +184,7 @@ impl PipelineConfig {
             stats,
             span_registry,
             config_resolver,
+            backfiller,
         } = self;
         let m = decoder_pool_size.max(1);
         let fatal = Fatal::new();
@@ -234,6 +238,7 @@ impl PipelineConfig {
             stats,
             resolver,
             config_resolver,
+            backfiller,
             fatal.clone(),
             span_registry,
         );

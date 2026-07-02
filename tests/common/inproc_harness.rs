@@ -450,6 +450,13 @@ pub struct BuildPipelineArgs<'a> {
 pub struct DdlPipelineArgs {
     pub namespaces: std::collections::HashMap<String, NamespaceMapping>,
     pub drop_table_strategy: Option<String>,
+    /// Source-PG schema holding the `config_*` runtime-config overlay tables
+    /// (TOML `[runtime_config] schema`). `Some` diverts their heap writes into
+    /// `ConfigEvent`s (never CH) and enables per-table opt-in dispatch —
+    /// same wiring `bin/stream.rs` stands up when the schema is configured.
+    /// Install the tables on source via `sql/runtime_config_install.sql`
+    /// inside the bootstrap `schema_sql`.
+    pub config_schema: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +630,7 @@ async fn build_pipeline_inner(
     fs::create_dir_all(&spill_dir).unwrap();
     let xact_buf_cfg = XactBufferConfig {
         xact_buffer_max: walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX,
-        spill_dir,
+        spill_dir: spill_dir.clone(),
     };
     let xact_buffer = XactBuffer::new(xact_buf_cfg).expect("xact buffer");
     let xact_buffer = Arc::new(Mutex::new(xact_buffer));
@@ -693,6 +700,22 @@ async fn build_pipeline_inner(
         .with_invalidation_epoch(inv_epoch.clone());
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
+    // COPY backfiller (`initial_load='copy'` opt-ins): own source SQL session +
+    // CH tail per backfill, resume ledger beside the spill dir (mirrors
+    // bin/stream.rs when `[runtime_config] schema` is set).
+    let backfiller = match ddl.as_ref().and_then(|d| d.config_schema.as_ref()) {
+        Some(_) => Some(Arc::new(
+            walshadow::copy_backfill::CopyBackfiller::new(
+                pgcfg.clone(),
+                emitter_cfg.clone(),
+                mapping.clone(),
+                stats.clone(),
+                &spill_dir,
+            )
+            .await,
+        )),
+        None => None,
+    };
     let pcfg = PipelineConfig {
         emitter: emitter_cfg,
         decoder_pool_size: 2,
@@ -708,6 +731,7 @@ async fn build_pipeline_inner(
         stats: stats.clone(),
         span_registry: None,
         config_resolver: Some(config_resolver.clone()),
+        backfiller,
     };
     let (reorder, handle) = pcfg
         .spawn(emitter_ack.clone())
@@ -718,6 +742,9 @@ async fn build_pipeline_inner(
         .with_catalog_signals(inv_epoch, ddl.as_ref().map(|_| pending_sweeps.clone()));
     if let Some(rx) = &schema_events {
         decoder = decoder.with_schema_events(rx.clone());
+    }
+    if let Some(schema) = ddl.as_ref().and_then(|d| d.config_schema.as_deref()) {
+        decoder = decoder.with_config_schema(Arc::from(schema));
     }
     let sinks = PipelineSinks {
         metrics: MetricsRecordSink::default(),

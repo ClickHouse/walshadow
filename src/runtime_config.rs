@@ -73,6 +73,37 @@ pub struct NamespaceRow {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TableRow {
     pub target: Option<String>,
+    /// Inclusion switch: `Some(true)` opt-in, `Some(false)` opt-out, `None`
+    /// leaves scope unchanged (legacy target-override-only behavior).
+    pub replicate: Option<bool>,
+    /// One-time backfill mode for pre-opt-in rows, raw ([`InitialLoadMode`]
+    /// parses at dispatch in [`crate::opt_in`], validate-late like every
+    /// overlay value); `None` streams from the opt-in LSN with no backfill.
+    pub initial_load: Option<String>,
+}
+
+/// Parsed `config_table.initial_load` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialLoadMode {
+    /// Snapshot-free COPY at `_lsn = S` ([`crate::copy_backfill`]).
+    Copy,
+    /// Fresh `BASE_BACKUP` page-walk filtered to the opted-in rels
+    /// (plans/future/initial_load_backup.md).
+    BaseBackup,
+    /// Object-store base backup + archive-WAL gap replay, filtered
+    /// (plans/future/initial_load_backup.md).
+    ObjectStore,
+}
+
+impl InitialLoadMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "copy" => Some(Self::Copy),
+            "base_backup" => Some(Self::BaseBackup),
+            "object_store" => Some(Self::ObjectStore),
+            _ => None,
+        }
+    }
 }
 
 /// `config_column` row (key = `(namespace.relname, attname)`).
@@ -296,6 +327,8 @@ pub fn interpret(
                 qname,
                 row: TableRow {
                     target: field_string(rel, &cols, "target"),
+                    replicate: field_bool(rel, &cols, "replicate"),
+                    initial_load: field_string(rel, &cols, "initial_load"),
                 },
             })
         }
@@ -531,6 +564,44 @@ mod tests {
                 attr(1, "namespace", 25),
                 attr(2, "relname", 25),
                 attr(3, "target", 25),
+                attr(4, "replicate", 16),
+                attr(5, "initial_load", 25),
+            ],
+        );
+        let new = vec![
+            Some(ColumnValue::Text("public".into())),
+            Some(ColumnValue::Text("events".into())),
+            Some(ColumnValue::Text("default.events".into())),
+            Some(ColumnValue::Bool(true)),
+            Some(ColumnValue::Text("copy".into())),
+        ];
+        match interpret(
+            ConfigTableKind::Table,
+            &heap(HeapOp::Insert, Some(new), None),
+            &r,
+        )
+        .unwrap()
+        {
+            ConfigEvent::TableUpserted { qname, row } => {
+                assert_eq!(qname, "public.events");
+                assert_eq!(row.target.as_deref(), Some("default.events"));
+                assert_eq!(row.replicate, Some(true));
+                assert_eq!(row.initial_load.as_deref(), Some("copy"));
+            }
+            other => panic!("expected TableUpserted, got {other:?}"),
+        }
+    }
+
+    /// A pre-opt-in `config_table` row (only `target`, no `replicate`/
+    /// `initial_load` columns) still interprets, with the new fields `None`.
+    #[test]
+    fn table_upsert_absent_switches_default_none() {
+        let r = rel(
+            CONFIG_TABLE,
+            vec![
+                attr(1, "namespace", 25),
+                attr(2, "relname", 25),
+                attr(3, "target", 25),
             ],
         );
         let new = vec![
@@ -545,9 +616,9 @@ mod tests {
         )
         .unwrap()
         {
-            ConfigEvent::TableUpserted { qname, row } => {
-                assert_eq!(qname, "public.events");
-                assert_eq!(row.target.as_deref(), Some("default.events"));
+            ConfigEvent::TableUpserted { row, .. } => {
+                assert_eq!(row.replicate, None);
+                assert_eq!(row.initial_load, None);
             }
             other => panic!("expected TableUpserted, got {other:?}"),
         }

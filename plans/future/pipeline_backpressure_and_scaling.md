@@ -290,8 +290,7 @@ Barrier sequence:
 5. Resume pipeline
 
 Keep barrier coarse. DDL is rare. Do not optimize away ordering. See
-[pinned_ddl_baseline.md](pinned_ddl_baseline.md),
-[[reference_pinned_table_ddl_baseline]].
+[pinned_ddl_baseline.md](pinned_ddl_baseline.md).
 
 Caveat: coarse cost scales with in-flight backlog, not DDL frequency.
 `run_barrier` freezes the single reorder task on `wait_all_durable` for the

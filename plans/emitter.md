@@ -386,9 +386,19 @@ Seeds the *full source* descriptor, never the mapping: a pinned subset's
 unmapped columns sit in the baseline and read as "operator-excluded", so
 a later `ALTER` adds only genuinely-new columns, never re-adds an
 excluded one. Auto-create tables need no seeding — their first-touch
-`Added` → `CREATE TABLE` already records a baseline. Open: boot-time
-drift (column added while the daemon is down folds silently into the
-seeded baseline) — see `plans/future/pinned_ddl_baseline.md` "Deferred".
+`Added` → `CREATE TABLE` already records a baseline.
+
+`config_table` opt-ins warm the same ledger through the opt-in dispatch
+(`src/opt_in.rs`): the descriptor resolve inside `apply_table_opt_in`
+records the baseline via `record_descriptor` — at the config row's
+commit LSN on a live opt-in, at boot on the re-run over seeded rows. So
+a post-opt-in `ALTER` diffs against the opt-in shape, never trips the
+cold-`prev_known` → `Added` path. The boot re-run fires post-`subscribe`
+so each opted-in rel enqueues one `Added`; benign — `apply_added` skips
+mapped rels. Together the resolved scope, not just `cfg.tables`, is warm
+for one daemon lifetime. Open: boot-time drift (column added while the
+daemon is down folds silently into the seeded baseline) — see
+`plans/future/pinned_ddl_baseline.md`.
 
 ### Barrier fence (ordering data around DDL)
 

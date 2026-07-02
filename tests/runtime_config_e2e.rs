@@ -1,0 +1,633 @@
+//! Runtime-config overlay e2e drills (plans/future/runtime_config_from_pg.md
+//! §Acceptance drills): operator writes to source-PG `walshadow.config_table`
+//! drive per-table scope live off the WAL stream.
+//!
+//! 1. `opt_in_via_config_table_replicates_new_table`
+//!    * Pre-existing empty `app.events`, no TOML mapping.
+//!    * Operator inserts `config_table (replicate=true, initial_load='copy')`.
+//!    * Expect: daemon auto-creates the CH table from the descriptor and
+//!      subsequent inserts land — no TOML edit, no CH DDL, no restart.
+//!
+//! 2. `opt_out_mid_stream_drains_and_halts`
+//!    * `app.orders` TOML-mapped and replicating.
+//!    * Operator inserts `config_table (replicate=false)` between two INSERTs.
+//!    * Expect: rows committed before the opt-out drain to CH, rows after
+//!      never emit, CH target retained.
+//!
+//! 3. `forward_decl_materializes_on_create_table`
+//!    * Operator inserts `config_table (replicate=true)` for a table that
+//!      does not exist; row parks as a forward-declaration.
+//!    * Source later runs `CREATE TABLE`; the parked row materialises and
+//!      subsequent inserts land on CH under the declared config.
+//!
+//! 4. `opt_in_non_empty_backfills_pre_opt_in_rows`
+//!    * `app.inventory` populated before the WAL stream ever starts (rows
+//!      unreachable via WAL), then opted in with `initial_load='copy'`.
+//!    * Expect: COPY backfill lands the pre-opt-in rows at `_lsn = S`; a
+//!      post-opt-in UPDATE outranks the COPY baseline by `commit_lsn > S`;
+//!      a post-opt-in INSERT streams normally. Exercises native
+//!      (int8/timestamptz), numeric-as-text, and cast-to-text (jsonb) wire
+//!      decode paths.
+//!
+//! 5. `opt_in_then_alter_add_column_reaches_ch`
+//!    * `app.gadgets` opted in via `config_table`, then source runs
+//!      `ALTER TABLE ... ADD COLUMN`.
+//!    * Expect: the ALTER diffs against the baseline the opt-in dispatch
+//!      recorded at the config row's commit LSN → `Changed` → CH
+//!      `ADD COLUMN`, and a trailing INSERT carries the new column. A cold
+//!      baseline would instead surface `Added`, which `apply_added` skips
+//!      for mapped rels — CH would stay a column behind
+//!      (plans/future/pinned_ddl_baseline.md).
+//!
+//! Source-side `config_*` install runs the real `sql/runtime_config_install.sql`
+//! inside the bootstrap schema dump, so the drills double as install-script
+//! coverage (psql `\if` default-schema guard included).
+
+#![cfg(target_os = "linux")]
+
+#[path = "common/inproc_harness.rs"]
+mod fx;
+
+use std::time::Duration;
+
+use walshadow::ch_emitter::ColumnMapping;
+
+const INSTALL_SQL: &str = include_str!("../sql/runtime_config_install.sql");
+
+// Each test shifts these by +0 / +10 / +20. CH `interserver_http_port =
+// http_port + 1`, keep a gap before WALSENDER_PORT.
+const SOURCE_PORT: u16 = 17701;
+const SHADOW_PORT: u16 = 17702;
+const CH_TCP_PORT: u16 = 17703;
+const CH_HTTP_PORT: u16 = 17704;
+const WALSENDER_PORT: u16 = 17708;
+
+fn overlay_ddl_args() -> fx::DdlPipelineArgs {
+    fx::DdlPipelineArgs {
+        config_schema: Some("walshadow".into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opt_in_via_config_table_replicates_new_table() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.events (id bigint PRIMARY KEY, body text);\n"
+    );
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, SOURCE_PORT, SHADOW_PORT, WALSENDER_PORT).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    // No TOML mapping — the config row alone brings app.events into scope.
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port: CH_TCP_PORT,
+        mappings: vec![],
+        app_name: "walshadow-config-opt-in",
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate, initial_load) \
+             VALUES ('app', 'events', true, 'copy')"
+                .into(),
+            "INSERT INTO app.events (id, body) VALUES (1, 'in-scope')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    let tbls = ch
+        .query(
+            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'events'",
+        )
+        .expect("ch table existence");
+    assert_eq!(tbls, "events", "opt-in must auto-create the CH table");
+
+    let n = ch
+        .query("SELECT count() FROM walshadow_test.events FINAL WHERE _is_deleted = 0")
+        .expect("ch count");
+    assert_eq!(n, "1", "post-opt-in insert must reach CH");
+
+    let body = ch
+        .query(
+            "SELECT argMax(body, _lsn) FROM walshadow_test.events \
+             WHERE _is_deleted = 0 AND id = 1",
+        )
+        .expect("ch body");
+    assert_eq!(body, "in-scope");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opt_out_mid_stream_drains_and_halts() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source_port = SOURCE_PORT + 10;
+    let shadow_port = SHADOW_PORT + 10;
+    let ch_tcp_port = CH_TCP_PORT + 10;
+    let ch_http_port = CH_HTTP_PORT + 10;
+    let walsender_port = WALSENDER_PORT + 10;
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.orders (id bigint PRIMARY KEY, note text);\n"
+    );
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+    ch.query(
+        "CREATE OR REPLACE TABLE walshadow_test.orders (\
+            id Int64,\
+            note Nullable(String),\
+            _lsn UInt64,\
+            _xid UInt32,\
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+    )
+    .expect("create dest");
+
+    let mappings = vec![fx::TableMappingSpec {
+        source_table: "app.orders".into(),
+        target_table: "walshadow_test.orders".into(),
+        columns: vec![
+            ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Int64".into(),
+            },
+            ColumnMapping {
+                src_attnum: 2,
+                target_name: "note".into(),
+                target_type: "Nullable(String)".into(),
+            },
+        ],
+    }];
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port,
+        mappings,
+        app_name: "walshadow-config-opt-out",
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    // Commit order fixes semantics: id=1 precedes the opt-out (drains to CH),
+    // id=2 follows it (never emits). The opt-out applies inside the barrier
+    // fence, after id=1 is durable.
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO app.orders (id, note) VALUES (1, 'before opt-out')".into(),
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate) \
+             VALUES ('app', 'orders', false)"
+                .into(),
+            "INSERT INTO app.orders (id, note) VALUES (2, 'after opt-out')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    // Source has both rows; CH stopped at the opt-out boundary.
+    let src = source.psql_one("SELECT count(*) FROM app.orders").unwrap();
+    assert_eq!(src, "2");
+    let n = ch
+        .query("SELECT count() FROM walshadow_test.orders FINAL WHERE _is_deleted = 0")
+        .expect("ch count");
+    assert_eq!(n, "1", "row committed after replicate=false must not emit");
+    let ids = ch
+        .query("SELECT id FROM walshadow_test.orders FINAL WHERE _is_deleted = 0")
+        .expect("ch ids");
+    assert_eq!(ids, "1", "only the pre-opt-out row reaches CH");
+
+    // Target retained (opt-out is a routing change, not a DROP).
+    let exists = ch
+        .query(
+            "SELECT count() FROM system.tables WHERE database = 'walshadow_test' AND name = 'orders'",
+        )
+        .expect("ch system.tables");
+    assert_eq!(exists, "1", "opt-out must retain the CH target");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forward_decl_materializes_on_create_table() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source_port = SOURCE_PORT + 20;
+    let shadow_port = SHADOW_PORT + 20;
+    let ch_tcp_port = CH_TCP_PORT + 20;
+    let ch_http_port = CH_HTTP_PORT + 20;
+    let walsender_port = WALSENDER_PORT + 20;
+    let schema_sql = format!("{INSTALL_SQL}\nCREATE SCHEMA app;\n");
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port,
+        mappings: vec![],
+        app_name: "walshadow-config-fwd-decl",
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    // Phase A: the config row lands and applies while `app.later` does not
+    // exist anywhere — deterministically parks as a forward-declaration.
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate) \
+             VALUES ('app', 'later', true)"
+                .into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "phase A: no segments shipped in 45s");
+
+    // Parked: nothing materialised yet.
+    let pre = ch
+        .query(
+            "SELECT count() FROM system.tables WHERE database = 'walshadow_test' AND name = 'later'",
+        )
+        .expect("ch system.tables");
+    assert_eq!(pre, "0", "forward-decl must not create a CH table yet");
+
+    // Phase B: CREATE TABLE arrives; the parked row materialises inside the
+    // same barrier, so the trailing insert routes.
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "CREATE TABLE app.later (id bigint PRIMARY KEY, body text)".into(),
+            "INSERT INTO app.later (id, body) VALUES (1, 'declared-first')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "phase B: no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    let tbls = ch
+        .query(
+            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'later'",
+        )
+        .expect("ch table existence");
+    assert_eq!(
+        tbls, "later",
+        "CREATE TABLE must materialise the parked opt-in"
+    );
+
+    let body = ch
+        .query(
+            "SELECT argMax(body, _lsn) FROM walshadow_test.later \
+             WHERE _is_deleted = 0 AND id = 1",
+        )
+        .expect("ch body");
+    assert_eq!(body, "declared-first");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source_port = SOURCE_PORT + 30;
+    let shadow_port = SHADOW_PORT + 30;
+    let ch_tcp_port = CH_TCP_PORT + 30;
+    let ch_http_port = CH_HTTP_PORT + 30;
+    let walsender_port = WALSENDER_PORT + 30;
+    // Rows land before the WAL stream ever starts, so COPY is the only path
+    // that can carry them to CH. Column mix drives all three wire-decode
+    // paths: int8/text/timestamptz native, numeric via ::text, jsonb cast.
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.inventory (\
+            id bigint PRIMARY KEY,\
+            name text,\
+            price numeric(10,2),\
+            added_at timestamptz,\
+            meta jsonb);\n\
+         INSERT INTO app.inventory VALUES\
+            (1, 'anvil',  10.00, '2024-01-02 03:04:05+00', '{{\"a\": 1}}'),\
+            (2, 'bolt',   12.50, '2024-01-02 03:04:06+00', '{{\"b\": 2}}'),\
+            (3, 'crate',  99.99, NULL, NULL);\n"
+    );
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port,
+        mappings: vec![],
+        app_name: "walshadow-config-backfill",
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    // Opt-in commits at S; the UPDATE + INSERT commit after S so they ride
+    // WAL with commit_lsn > S and outrank the COPY baseline at _lsn = S.
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate, initial_load) \
+             VALUES ('app', 'inventory', true, 'copy')"
+                .into(),
+            "UPDATE app.inventory SET name = 'anvil-v2' WHERE id = 1".into(),
+            "INSERT INTO app.inventory (id, name, price) VALUES (100, 'dowel', 0.25)".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    // Backfill runs as a detached task on its own CH tail; poll for
+    // convergence (3 COPY rows + 1 streamed row) rather than racing it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut n = String::new();
+    while std::time::Instant::now() < deadline {
+        n = ch
+            .query("SELECT count(DISTINCT id) FROM walshadow_test.inventory FINAL WHERE _is_deleted = 0")
+            .unwrap_or_default();
+        if n == "4" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(n, "4", "3 backfilled + 1 streamed row must reach CH");
+
+    // Untouched pre-opt-in row: COPY carried every column faithfully.
+    let bolt = ch
+        .query(
+            "SELECT argMax(name, _lsn), argMax(price, _lsn), argMax(added_at, _lsn), \
+                    argMax(meta, _lsn) \
+             FROM walshadow_test.inventory WHERE _is_deleted = 0 AND id = 2",
+        )
+        .expect("ch backfilled row");
+    assert_eq!(bolt, "bolt\t12.5\t2024-01-02 03:04:06.000000\t{\"b\": 2}");
+
+    // NULLs survive the wire.
+    let crate_row = ch
+        .query(
+            "SELECT argMax(name, _lsn), isNull(argMax(added_at, _lsn)), \
+                    isNull(argMax(meta, _lsn)) \
+             FROM walshadow_test.inventory WHERE _is_deleted = 0 AND id = 3",
+        )
+        .expect("ch null row");
+    assert_eq!(crate_row, "crate\t1\t1");
+
+    // Post-opt-in UPDATE (commit_lsn > S) beats the COPY baseline.
+    let anvil = ch
+        .query(
+            "SELECT argMax(name, _lsn) FROM walshadow_test.inventory \
+             WHERE _is_deleted = 0 AND id = 1",
+        )
+        .expect("ch mutated row");
+    assert_eq!(
+        anvil, "anvil-v2",
+        "WAL mutation must outrank the COPY baseline"
+    );
+
+    // Post-opt-in INSERT streams via WAL, no COPY involvement.
+    let dowel = ch
+        .query(
+            "SELECT argMax(name, _lsn) FROM walshadow_test.inventory \
+             WHERE _is_deleted = 0 AND id = 100",
+        )
+        .expect("ch streamed row");
+    assert_eq!(dowel, "dowel");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opt_in_then_alter_add_column_reaches_ch() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source_port = SOURCE_PORT + 40;
+    let shadow_port = SHADOW_PORT + 40;
+    let ch_tcp_port = CH_TCP_PORT + 40;
+    let ch_http_port = CH_HTTP_PORT + 40;
+    let walsender_port = WALSENDER_PORT + 40;
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.gadgets (id bigint PRIMARY KEY, name text);\n"
+    );
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    // No TOML mapping — scope and baseline both come from the config row.
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port,
+        mappings: vec![],
+        app_name: "walshadow-config-opt-in-alter",
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    // Commit order fixes semantics: the opt-in records the two-column
+    // baseline, id=1 routes at that shape, the ALTER diffs against it
+    // (Changed → CH ADD COLUMN inside the barrier), id=2 carries qty.
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate) \
+             VALUES ('app', 'gadgets', true)"
+                .into(),
+            "INSERT INTO app.gadgets (id, name) VALUES (1, 'pre-alter')".into(),
+            "ALTER TABLE app.gadgets ADD COLUMN qty integer".into(),
+            "INSERT INTO app.gadgets (id, name, qty) VALUES (2, 'post-alter', 7)".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    // qty on CH proves the ALTER surfaced as Changed: the opt-in CREATE
+    // pre-dates the ALTER, so only an applied CH ADD COLUMN puts it there.
+    let qty_col = ch
+        .query(
+            "SELECT count() FROM system.columns \
+             WHERE database = 'walshadow_test' AND table = 'gadgets' AND name = 'qty'",
+        )
+        .expect("ch column existence");
+    assert_eq!(qty_col, "1", "post-opt-in ALTER must ADD COLUMN on CH");
+
+    // Post-ALTER row carries the new column (mapping extended with the DDL).
+    let post = ch
+        .query(
+            "SELECT argMax(name, _lsn), argMax(qty, _lsn) \
+             FROM walshadow_test.gadgets WHERE _is_deleted = 0 AND id = 2",
+        )
+        .expect("ch post-alter row");
+    assert_eq!(post, "post-alter\t7");
+
+    // Pre-ALTER row backfills NULL for the added column.
+    let pre = ch
+        .query(
+            "SELECT argMax(name, _lsn), isNull(argMax(qty, _lsn)) \
+             FROM walshadow_test.gadgets WHERE _is_deleted = 0 AND id = 1",
+        )
+        .expect("ch pre-alter row");
+    assert_eq!(pre, "pre-alter\t1");
+}

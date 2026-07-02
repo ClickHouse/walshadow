@@ -464,6 +464,24 @@ impl ShadowCatalog {
         Ok(seeded)
     }
 
+    /// Resolve a `"namespace.relname"` to its current source descriptor via
+    /// shadow's `pg_class` (`to_regclass`, same path as [`Self::seed_baseline`]),
+    /// or `None` when the rel isn't known yet — the forward-declared case the
+    /// per-table opt-in dispatch parks in `pending_decl`.
+    pub async fn descriptor_by_qname(&mut self, qname: &str) -> Result<Option<Arc<RelDescriptor>>> {
+        let row = self
+            .query_one_retry("SELECT to_regclass($1)::oid", &[&qname])
+            .await?;
+        let Some(oid) = row.get::<_, Option<Oid>>(0) else {
+            return Ok(None);
+        };
+        match self.relation_by_oid(oid).await {
+            Ok(desc) => Ok(Some(desc)),
+            Err(CatalogError::NotFoundByOid(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Emit `Dropped` for an oid seen via pg_class `heap_delete`. Returns
     /// `false` for an oid the catalog never saw (CH never learned it either,
     /// nothing for the applicator to do).

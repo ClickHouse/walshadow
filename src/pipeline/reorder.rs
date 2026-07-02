@@ -38,6 +38,7 @@ use crate::xact_buffer::{
 };
 
 use crate::config::ConfigResolver;
+use crate::copy_backfill::CopyBackfiller;
 use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::BatcherMsg;
@@ -72,6 +73,9 @@ pub struct ReorderSink {
     /// a `DrainEntry::Config` applies to it inside the barrier fence so
     /// trailing rows route against post-config state (plan §6).
     config_resolver: Option<Arc<ConfigResolver>>,
+    /// COPY backfiller for `initial_load='copy'` opt-ins; spawns off the barrier
+    /// (detached task, own CH tail), the apply only records + launches.
+    backfiller: Option<Arc<CopyBackfiller>>,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
     /// Per-txn span map (shared with the pump + buffer). `Some` only when
@@ -95,6 +99,7 @@ impl ReorderSink {
         stats: Arc<EmitterStats>,
         resolver: ToastResolver,
         config_resolver: Option<Arc<ConfigResolver>>,
+        backfiller: Option<Arc<CopyBackfiller>>,
         fatal: Fatal,
         span_registry: Option<TxnSpanRegistry>,
     ) -> Self {
@@ -111,6 +116,7 @@ impl ReorderSink {
             stats,
             resolver,
             config_resolver,
+            backfiller,
             fatal,
             next_seq: 0,
             span_registry,
@@ -131,18 +137,52 @@ impl ReorderSink {
         )
     }
 
-    /// Apply a config-table change to the resolver inside the barrier fence, so
-    /// the fenced routing-map write lands before the trailing segment
-    /// dispatches. Infallible (Regime A): a malformed value is rejected at
-    /// merge and logged, never fatal.
+    /// Apply a config-table change inside the barrier fence, so the fenced
+    /// routing-map write lands before the trailing segment dispatches. Merge
+    /// itself is infallible (Regime A: a malformed value is rejected + logged,
+    /// never fatal); the per-table opt-in dispatch can create a CH table, so it
+    /// surfaces CH errors like a DDL apply.
     ///
-    /// Owned args, not `&self`: `ReorderSink` holds a `!Sync` CH client, so a
-    /// shared self-borrow held across the apply's `.await` would poison the
-    /// `on_record` future's `Send` bound.
-    async fn apply_config(config_resolver: Option<Arc<ConfigResolver>>, event: ConfigEvent) {
-        if let Some(cfg) = config_resolver {
-            cfg.apply_config_event(event).await;
+    /// `&mut self` (like [`Self::apply_event`]): the opt-in dispatch needs
+    /// `&mut applicator` (the `!Sync` CH client) + `&catalog`, both fields of
+    /// self. `&mut self`-across-await stays `Send`; only a shared `&self` would
+    /// poison the sink future's `Send` bound.
+    async fn apply_config(
+        &mut self,
+        event: &ConfigEvent,
+        commit_lsn: u64,
+    ) -> Result<(), SinkError> {
+        let Some(resolver) = self.config_resolver.clone() else {
+            return Ok(());
+        };
+        // Overlay merge first (target overrides, global/namespace knobs).
+        resolver.apply_config_event(event.clone()).await;
+        // Then inclusion dispatch for table rows: create the CH table +
+        // register / drop the descriptor-derived mapping. `commit_lsn` is the
+        // backfill boundary `S` for an `initial_load` opt-in.
+        match event {
+            ConfigEvent::TableUpserted { qname, row } => {
+                crate::opt_in::apply_table_opt_in(
+                    &resolver,
+                    &mut self.applicator,
+                    &self.catalog,
+                    self.backfiller.as_ref(),
+                    qname,
+                    row,
+                    commit_lsn,
+                )
+                .await
+                .map_err(|e| SinkError::Other(format!("opt-in: {e}")))?;
+            }
+            ConfigEvent::TableRemoved { qname } => {
+                resolver.exclude_table(qname).await;
+                if let Some(b) = &self.backfiller {
+                    b.note_opt_out(qname).await;
+                }
+            }
+            _ => {}
         }
+        Ok(())
     }
 
     /// Drain pending DROP events (post-`sweep_dropped`) into the buffer keyed
@@ -285,7 +325,17 @@ impl ReorderSink {
         self.applicator
             .apply(event)
             .await
-            .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))
+            .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))?;
+        // A `CREATE TABLE` for a forward-declared opt-in materialises here, in
+        // the same barrier before this xact's trailing rows dispatch.
+        if let SchemaEvent::Added { desc } = event
+            && let Some(resolver) = self.config_resolver.clone()
+        {
+            crate::opt_in::materialize_pending_on_added(&resolver, &mut self.applicator, desc)
+                .await
+                .map_err(|e| SinkError::Other(format!("opt-in materialize: {e}")))?;
+        }
+        Ok(())
     }
 
     async fn apply_truncate(&mut self, heap: &DecodedHeap) -> Result<(), SinkError> {
@@ -326,9 +376,7 @@ impl ReorderSink {
                 self.barrier_fence().await?;
                 match &ordered_events[ev_cursor].1 {
                     DrainEntry::Catalog(ev) => self.apply_event(ev).await?,
-                    DrainEntry::Config(ev) => {
-                        Self::apply_config(self.config_resolver.clone(), ev.clone()).await
-                    }
+                    DrainEntry::Config(ev) => self.apply_config(ev, commit_lsn).await?,
                 }
                 ev_cursor += 1;
             }
@@ -348,9 +396,7 @@ impl ReorderSink {
             self.barrier_fence().await?;
             match &ordered_events[ev_cursor].1 {
                 DrainEntry::Catalog(ev) => self.apply_event(ev).await?,
-                DrainEntry::Config(ev) => {
-                    Self::apply_config(self.config_resolver.clone(), ev.clone()).await
-                }
+                DrainEntry::Config(ev) => self.apply_config(ev, commit_lsn).await?,
             }
             ev_cursor += 1;
         }

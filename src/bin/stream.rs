@@ -821,6 +821,9 @@ async fn run(args: Args) -> Result<()> {
     // Layered config resolver (CLI > TOML); `Some` only with `--ch-config`.
     // Moved into the SIGHUP task, which re-reads TOML and republishes.
     let mut config_resolver: Option<Arc<ConfigResolver>> = None;
+    // COPY backfiller for `initial_load='copy'` opt-ins; `Some` only with the
+    // runtime-config overlay active.
+    let mut copy_backfiller: Option<Arc<walshadow::copy_backfill::CopyBackfiller>> = None;
 
     let decoder_xact = match ch_config {
         Some(mut emitter_cfg) => {
@@ -851,12 +854,14 @@ async fn run(args: Args) -> Result<()> {
             // connection. Post-seed writes arrive live off the WAL stream. Refuse
             // to start if the named schema is not installed — explicit opt-in
             // means the operator expects the overlay present.
+            let mut seeded_table_rows: Vec<(String, walshadow::runtime_config::TableRow)> =
+                Vec::new();
             if let Some(schema) = emitter_cfg.runtime_config_schema.clone() {
                 let client = feed
                     .sql_client()
                     .await
                     .context("sidecar sql for runtime-config seed")?;
-                seed_runtime_config(client, &schema, &resolver)
+                seeded_table_rows = seed_runtime_config(client, &schema, &resolver)
                     .await
                     .context("seed runtime config overlay")?;
             }
@@ -880,7 +885,7 @@ async fn run(args: Args) -> Result<()> {
                 emitter_cfg.database.clone(),
                 emitter_cfg.soft_delete,
             );
-            let applicator = walshadow::ch_ddl::DdlApplicator::new(
+            let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
                 &emitter_cfg,
                 ddl_cfg,
                 mapping.clone(),
@@ -889,9 +894,45 @@ async fn run(args: Args) -> Result<()> {
             .await
             .context("init DDL applicator")?
             .with_invalidation_epoch(invalidation_epoch.clone());
-            config_resolver = Some(resolver);
             let stats = Arc::new(EmitterStats::default());
             emitter_stats_handle = Some(stats.clone());
+            // COPY backfiller for `initial_load='copy'` opt-ins: own source SQL
+            // session + CH tail per backfill, spill-dir ledger dedups restarts.
+            if emitter_cfg.runtime_config_schema.is_some() {
+                copy_backfiller = Some(Arc::new(
+                    walshadow::copy_backfill::CopyBackfiller::new(
+                        cfg.clone(),
+                        emitter_cfg.clone(),
+                        mapping.clone(),
+                        stats.clone(),
+                        &args.spill_dir,
+                    )
+                    .await,
+                ));
+            }
+            // Re-materialise per-table opt-in scope from the seeded config_table
+            // rows. Live edits arrive off WAL via the reorder coordinator, but a
+            // restart replays WAL from past these rows' commit LSN, so the seed
+            // is the only chance to rebuild their scope (the CH tables persist).
+            // `raw_start` is the backfill boundary S for a first-seen
+            // `initial_load` row: COPY covers commits before it, WAL the rest;
+            // the ledger resumes/no-ops rows seen on an earlier boot.
+            for (qname, row) in &seeded_table_rows {
+                if row.replicate.is_some() {
+                    walshadow::opt_in::apply_table_opt_in(
+                        &resolver,
+                        &mut applicator,
+                        &catalog,
+                        copy_backfiller.as_ref(),
+                        qname,
+                        row,
+                        raw_start,
+                    )
+                    .await
+                    .with_context(|| format!("seed opt-in for {qname}"))?;
+                }
+            }
+            config_resolver = Some(resolver);
             // Seed durable watermark at `raw_start`, not 0. Status loop
             // persists this atomic into cursor's emitter_ack_lsn each
             // interval with no monotonic guard, first write at boot before
@@ -919,6 +960,7 @@ async fn run(args: Args) -> Result<()> {
                 stats,
                 span_registry: span_registry.clone(),
                 config_resolver: config_resolver.clone(),
+                backfiller: copy_backfiller.clone(),
             };
             let (reorder_sink, handle) = pcfg
                 .spawn(emitter_ack)
@@ -1001,6 +1043,11 @@ async fn run(args: Args) -> Result<()> {
         }
         None => None,
     };
+
+    // Kept for the status loop's config metrics (opt-in / pending-decl gauges);
+    // the sighup handler takes ownership of `config_resolver` below.
+    let metrics_resolver = config_resolver.clone();
+    let metrics_backfiller = copy_backfiller.clone();
 
     // SIGHUP re-reads TOML and republishes the resolved snapshot; the
     // mapping refresher + DDL applicator pick it up. Connection params stay
@@ -1226,6 +1273,8 @@ async fn run(args: Args) -> Result<()> {
                 active_connections: shadow_agg.active_connections as u64,
                 dropped_total: shadow_agg.dropped_total,
             },
+            metrics_resolver.as_deref(),
+            metrics_backfiller.as_deref(),
         )
         .await;
         if advanced {
@@ -1373,7 +1422,7 @@ async fn seed_runtime_config(
     client: &tokio_postgres::Client,
     schema: &str,
     resolver: &ConfigResolver,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, walshadow::runtime_config::TableRow)>> {
     use walshadow::runtime_config::{ColumnRow, ConfigOverlay, GlobalRow, NamespaceRow, TableRow};
     let s = quote_ident(schema);
     let mut overlay = ConfigOverlay::default();
@@ -1432,11 +1481,11 @@ async fn seed_runtime_config(
         );
     }
 
+    // `SELECT *` + `try_get` for the post-v1 columns so a newer daemon reads an
+    // older install (missing `replicate`/`initial_load`) without a hard error —
+    // the additive-schema promise. Re-running the install adds the columns.
     for row in client
-        .query(
-            &format!("SELECT namespace, relname, target FROM {s}.config_table"),
-            &[],
-        )
+        .query(&format!("SELECT * FROM {s}.config_table"), &[])
         .await
         .context("read config_table")?
     {
@@ -1446,6 +1495,8 @@ async fn seed_runtime_config(
             format!("{namespace}.{relname}"),
             TableRow {
                 target: row.get("target"),
+                replicate: row.try_get("replicate").ok().flatten(),
+                initial_load: row.try_get("initial_load").ok().flatten(),
             },
         );
     }
@@ -1475,6 +1526,14 @@ async fn seed_runtime_config(
         overlay.tables.len(),
         overlay.columns.len(),
     );
+    // Snapshot table rows for the boot opt-in dispatch: on restart the resume
+    // cursor is past these rows' commit LSN, so WAL replay won't re-deliver
+    // them — the seed is the only chance to re-materialise their scope.
+    let table_rows: Vec<(String, TableRow)> = overlay
+        .tables
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     resolver.seed_overlay(overlay).await;
     tracing::info!(
         target: "walshadow::config",
@@ -1485,7 +1544,7 @@ async fn seed_runtime_config(
         columns = n_col,
         "runtime config overlay seeded from source PG",
     );
-    Ok(())
+    Ok(table_rows)
 }
 
 /// SIGHUP listener: re-reads `--ch-config` and republishes the resolved
@@ -1739,6 +1798,8 @@ async fn populate_metrics(
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
     uptime_secs: u64,
     shadow_view: ShadowMetricsView,
+    config_resolver: Option<&ConfigResolver>,
+    backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
 ) {
     use std::collections::BTreeMap;
     use walshadow::classify::rmgr_label;
@@ -1826,6 +1887,10 @@ async fn populate_metrics(
         shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
         shadow_stream_dropped_connections_total: shadow_view.dropped_total,
+        config_pending_decl_rels: config_resolver.map(|r| r.pending_decl_count()).unwrap_or(0),
+        config_replicate_opt_in_total: config_resolver.map(|r| r.opt_in_total()).unwrap_or(0),
+        config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),
+        config_backfills_pending: backfiller.map(|b| b.pending_count()).unwrap_or(0),
     };
     registry.set(snap).await;
 }

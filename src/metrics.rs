@@ -60,6 +60,16 @@ pub struct MetricsSnapshot {
     pub emitter_blocks_total: u64,
     pub emitter_xacts_total: u64,
     pub emitter_unsupported_relations: u64,
+    /// Forward-declared per-table opt-ins (`config_table.replicate=true`)
+    /// awaiting their `CREATE TABLE`.
+    pub config_pending_decl_rels: u64,
+    /// Cumulative `replicate=true` materialisations / `replicate=false`
+    /// exclusions applied via the config overlay.
+    pub config_replicate_opt_in_total: u64,
+    pub config_replicate_opt_out_total: u64,
+    /// `initial_load='copy'` backfills recorded in the ledger but not yet
+    /// COPY-complete (in flight, or awaiting re-COPY on next boot).
+    pub config_backfills_pending: u64,
     // Pipeline flow + process gauges; see `render` for descriptions.
     pub pump_queue_depth: u64,
     pub queue_records_out_total: u64,
@@ -423,6 +433,30 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "Connections dropped by slow-client cutoff since daemon start.",
             "counter",
             snap.shadow_stream_dropped_connections_total,
+        ),
+        (
+            "walshadow_config_pending_decl_rels",
+            "Forward-declared per-table opt-ins awaiting their CREATE TABLE.",
+            "gauge",
+            snap.config_pending_decl_rels,
+        ),
+        (
+            "walshadow_config_replicate_opt_in_total",
+            "Total config_table.replicate=true materialisations applied.",
+            "counter",
+            snap.config_replicate_opt_in_total,
+        ),
+        (
+            "walshadow_config_replicate_opt_out_total",
+            "Total config_table.replicate=false / removals applied.",
+            "counter",
+            snap.config_replicate_opt_out_total,
+        ),
+        (
+            "walshadow_config_backfills_pending",
+            "initial_load backfills recorded but not yet COPY-complete.",
+            "gauge",
+            snap.config_backfills_pending,
         ),
     ];
     for (name, help, kind, value) in pairs {
