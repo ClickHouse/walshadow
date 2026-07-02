@@ -174,10 +174,15 @@ impl ShadowStreamState {
         self.wire_buf.extend_from_slice(bytes);
     }
 
-    /// Drop the completed segment; `restore_command` serves it from now on.
-    fn reset_wire_buf(&mut self, next_start: u64) {
-        self.wire_buf.clear();
-        self.wire_buf_start = next_start;
+    /// Drop retained wire bytes below `lsn` (completed segments; `restore_command`
+    /// serves those), keeping `[lsn, head]` for in-progress-segment backfill.
+    fn trim_wire_buf_before(&mut self, lsn: u64) {
+        if lsn <= self.wire_buf_start {
+            return;
+        }
+        let drop = ((lsn - self.wire_buf_start) as usize).min(self.wire_buf.len());
+        self.wire_buf.drain(..drop);
+        self.wire_buf_start = lsn;
     }
 
     /// Frame `bytes` (at `start_lsn`) to every connection past its dispatched
@@ -259,6 +264,11 @@ impl ShadowStreamState {
     /// Listener pulls framed bytes out of here.
     pub fn drain_send_queue(&mut self, id: u64) -> Option<Vec<u8>> {
         self.send_queues.remove(&id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wire_buf_len(&self) -> usize {
+        self.wire_buf.len()
     }
 
     /// Overflowing `slow_threshold` marks the connection `closing` and
@@ -356,10 +366,17 @@ impl RecordBytesSink for ShadowStreamSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             let mut state = self.state.lock().await;
-            let segment_end_lsn = start_lsn + trailing_bytes.len() as u64;
             state.dispatch_wire(start_lsn, trailing_bytes);
-            // Segment complete → restore_command owns it; track the next one.
-            state.reset_wire_buf(segment_end_lsn);
+            Ok(())
+        })
+    }
+
+    fn on_segment_retired<'a>(
+        &'a mut self,
+        new_start_lsn: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.state.lock().await.trim_wire_buf_before(new_start_lsn);
             Ok(())
         })
     }
@@ -689,7 +706,7 @@ mod tests {
         let state = Arc::new(Mutex::new(fresh_state())); // current_lsn = 0x1000
         let mut sink = ShadowStreamSink::new(state.clone());
         sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap();
-        sink.on_segment_boundary(0x1004, b"").await.unwrap(); // resets buf to 0x1004
+        sink.on_segment_retired(0x1004).await.unwrap(); // trims completed segment
         sink.on_wire_chunk(0x1004, b"CCCC").await.unwrap(); // new segment, head = 0x1008
 
         let mut s = state.lock().await;
@@ -703,5 +720,30 @@ mod tests {
         let cur = s.register_connection(0x1004);
         let q = s.drain_send_queue(cur).expect("current-segment backfill");
         assert_eq!(&q[WIRE_HDR..], b"CCCC");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_segment_retired_trims_completed_keeps_straddling_bytes() {
+        let state = Arc::new(Mutex::new(fresh_state())); // current_lsn = 0x1000
+        let mut sink = ShadowStreamSink::new(state.clone());
+        // Wire dispatched past the 0x1004 boundary into the next segment — the
+        // straddle case where the old on_segment_boundary reset was skipped.
+        sink.on_wire_chunk(0x1000, b"AAAABBBB").await.unwrap(); // head = 0x1008
+        sink.on_segment_retired(0x1004).await.unwrap();
+
+        let mut s = state.lock().await;
+        assert_eq!(
+            s.wire_buf_len(),
+            4,
+            "completed segment dropped, in-progress [0x1004,0x1008) kept"
+        );
+        let cur = s.register_connection(0x1004);
+        let q = s.drain_send_queue(cur).expect("in-progress backfill kept");
+        assert_eq!(&q[WIRE_HDR..], b"BBBB", "no gap after trim");
+        let old = s.register_connection(0x1000);
+        assert!(
+            s.drain_send_queue(old).is_none(),
+            "completed segment falls to restore_command"
+        );
     }
 }
