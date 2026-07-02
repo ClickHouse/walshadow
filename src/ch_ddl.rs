@@ -278,6 +278,33 @@ impl DdlApplicator {
         Ok(())
     }
 
+    /// `CREATE TABLE IF NOT EXISTS` for an opted-in rel, regardless of
+    /// `auto_create` or an existing mapping. Unlike `apply_added`, does
+    /// not gate on the namespace opt-in set and does not write the routing map
+    /// — the [`crate::config::ConfigResolver`] owns the opt-in mapping so it
+    /// survives the republish full-swap. Returns `false` when the descriptor
+    /// has no bridgeable shape (nothing created; caller should not map it).
+    /// Idempotent: `IF NOT EXISTS` no-ops a re-create.
+    pub async fn ensure_ch_table(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
+        self.refresh_config();
+        let target_db = self
+            .config
+            .target_database_for(&desc.namespace_name)
+            .to_owned();
+        let Some(sql) = render_create_table(desc, &target_db, self.config.soft_delete)? else {
+            tracing::warn!(
+                target: "walshadow::ch_ddl",
+                qname = %desc.qualified_name,
+                "opt-in skipped: no bridgeable CH shape",
+            );
+            self.stats.skipped += 1;
+            return Ok(false);
+        };
+        self.execute(&sql).await?;
+        self.stats.creates_applied += 1;
+        Ok(true)
+    }
+
     async fn apply_changed(
         &mut self,
         _old: &RelDescriptor,

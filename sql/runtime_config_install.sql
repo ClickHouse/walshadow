@@ -40,9 +40,16 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_namespace (
 -- Per-relation destination mapping, keyed on qualified name (text, not
 -- relfilenode: rfn is unknown at row-insert time for forward-declared tables).
 CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_table (
-    namespace text NOT NULL,
-    relname   text NOT NULL,
-    target    text,                  -- "<database>.<table>" on ClickHouse
+    namespace    text NOT NULL,
+    relname      text NOT NULL,
+    target       text,               -- "<database>.<table>" on ClickHouse
+    replicate    boolean,            -- inclusion switch: true opt-in, false
+                                     -- opt-out, NULL leaves scope unchanged
+                                     -- (target override only, as before)
+    initial_load text,               -- one-time backfill mode for pre-opt-in
+                                     -- rows: 'copy' | 'base_backup' |
+                                     -- 'object_store'; NULL streams from the
+                                     -- opt-in LSN with no backfill
     PRIMARY KEY (namespace, relname)
 );
 
@@ -54,6 +61,12 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_column (
     target_type text,                -- ClickHouse type expression
     PRIMARY KEY (namespace, relname, attname)
 );
+
+-- Additive upgrade: columns introduced after the initial config_table shape.
+-- CREATE TABLE IF NOT EXISTS above no-ops on an existing install, so an
+-- upgrading deployment re-runs this to gain the columns the newer daemon reads.
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS replicate    boolean;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS initial_load text;
 
 -- REPLICA IDENTITY FULL logs the complete old-row image on UPDATE/DELETE, so a
 -- DELETE always carries the key columns the decoder reads (namespace/relname/

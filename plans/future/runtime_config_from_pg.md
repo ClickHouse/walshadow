@@ -142,18 +142,23 @@ surgical when the xact also carries changes to keep.
 ## Per-table opt-in and initial-load path
 
 The base `config_table` ([../config.md](../config.md)) carries only `target`.
-This adds two columns —
-`replicate` (bool, doubles as the inclusion switch) and `initial_load` (bool) —
-collapsing three intents into one relation: (a) override mapping for a table
-already in scope, (b) forward-declare config for a table that doesn't yet exist,
-(c) opt an existing-but-unreplicated table into scope plus initial-load it.
-Resolver inspects `replicate` + `initial_load` + catalog state to dispatch:
+This adds two columns — `replicate` (bool, doubles as the inclusion switch)
+and `initial_load` (text mode: NULL none, `'copy'`, `'base_backup'`,
+`'object_store'`) — collapsing three intents into one relation: (a) override
+mapping for a table already in scope, (b) forward-declare config for a table
+that doesn't yet exist, (c) opt an existing-but-unreplicated table into scope
+plus initial-load it. `'copy'` is the snapshot-free COPY below; the
+backup-sourced modes are designed in
+[initial_load_backup.md](initial_load_backup.md). Unknown mode strings warn
+and stream from the opt-in LSN only (validate-late, never crash). Resolver
+inspects `replicate` + `initial_load` + catalog state to dispatch:
 
 | row state | rfn known? | table empty? | action |
 |---|---|---|---|
-| `replicate=t, initial_load=f` | yes | n/a | inclusion-list add; WAL-driven from current LSN, no backfill |
-| `replicate=t, initial_load=t` | yes | yes | mark streaming, no backfill needed |
-| `replicate=t, initial_load=t` | yes | no | enqueue backfill (see below) |
+| `replicate=t, initial_load=NULL` | yes | n/a | inclusion-list add; WAL-driven from current LSN, no backfill |
+| `replicate=t, initial_load='copy'` | yes | yes | mark streaming, no backfill needed |
+| `replicate=t, initial_load='copy'` | yes | no | enqueue COPY backfill (see below) |
+| `replicate=t, initial_load='base_backup'/'object_store'` | yes | no | enqueue backup-sourced backfill ([initial_load_backup.md](initial_load_backup.md)) |
 | `replicate=t` | no (forward-decl) | n/a | hold row, materialize when CREATE TABLE for matching qualname arrives via catalog applicator |
 | `replicate=f` | yes | n/a | inclusion-list remove; mid-stream exclusion drains in-flight rows then halts further emission |
 
@@ -209,11 +214,11 @@ buffer-insert time, backfill must regain a drain step — quiesce or wait out xa
 in-flight at `S` before COPY.
 
 Resume after a daemon crash mid-backfill is a plain re-COPY: state persists `S`
-per rfn; on restart re-issue COPY at `_lsn = S`. Dedup makes it idempotent, so no
+per table; on restart re-issue COPY at `_lsn = S`. Dedup makes it idempotent, so no
 CH truncate and no fresh snapshot. Chunked COPY by primary-key range is then
 trivial: each chunk is an independent statement snapshot at the same `_lsn = S`,
-since WAL fills any inter-chunk gap. The `initial_load=chunked:<col>` variant
-loses its snapshot-sharing hazard.
+since WAL fills any inter-chunk gap. An `initial_load='copy:chunked:<col>'`
+mode variant loses its snapshot-sharing hazard.
 
 ## Net-new knobs
 
@@ -225,8 +230,6 @@ behind it, distinct from the knobs the resolver resolves ([../config.md](../conf
 | `engine` / `order_by` | table, namespace | text | fixed in `ch_ddl` (engine hardcoded `ReplacingMergeTree`, order_by derived from PK/replica-identity index); shape change, needs rfn drain + `TablePlan` rebuild |
 | `exclude` | column | bool | `ColumnMapping` has no such field; drops a column from projection + future DDL; shape change |
 | `ch_settings` | global, namespace, table | jsonb | applied to INSERT/CREATE TABLE, merged narrow-wins |
-| `replicate` | table | bool | inclusion switch (see opt-in above); no such switch, inclusion is implicit via a `[table]` mapping + namespace `auto_create` |
-| `initial_load` | table | bool | backfiller trigger (see above); the backfiller lives in `src/backfill_bootstrap.rs` but has no per-table knob |
 | `sample_rate` | (TOML only) | float | emitter row-drop sampling for debug, distinct from the `--validate` oracle sampler in `src/oracle.rs` |
 | `signal_prefix` | (TOML only) | text | which `pg_logical_emit_message` prefix to scan |
 | `admin_database` | (TOML only) | text | which database's signals the daemon honors for global imperatives; empty = source db |
@@ -342,11 +345,11 @@ subcommand walking the three layers.
   nothing, `emitter_ack_lsn` still advances past `commit_lsn`. Variant: the tag in
   a rolled-back savepoint leaves the surrounding xact replicating normally
 - **Opt-in empty table.** Pre-existing empty `app.events` not in scope. Operator
-  inserts `config_table (…, replicate=true, initial_load=true)`. Backfiller sees
+  inserts `config_table (…, replicate=true, initial_load='copy')`. Backfiller sees
   zero rows, no COPY, per-rfn state flips to `Streaming`; subsequent inserts land
   on CH
 - **Opt-in non-empty table.** Pre-existing `app.orders` with 10M rows. Operator
-  inserts `config_table (…, initial_load=true)`. Daemon streams orders' WAL from
+  inserts `config_table (…, initial_load='copy')`. Daemon streams orders' WAL from
   opt-in LSN `S` and concurrently COPYs at `_lsn = S`; updates/deletes committed
   during the COPY win by `commit_lsn > S`. Source state == CH state once WAL apply
   passes `P_hi`. Variant: mutate a row mid-backfill and assert CH reflects the

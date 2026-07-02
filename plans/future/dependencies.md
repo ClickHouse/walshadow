@@ -72,26 +72,6 @@ Both remaining items are where hand-rolling is actually dangerous. This
 path is mutually exclusive with the full `object_store` swap, not
 additive to it.
 
-## MPMC queue
-
-Evaluate `async-channel` for `src/pipeline/mpmc.rs`.
-
-Today: local bounded MPMC queue uses `Mutex<VecDeque<T>>`,
-`Semaphore`, manual close state, and custom receiver clone semantics.
-
-Why replace: bounded async MPMC with close semantics is generic
-concurrency plumbing. `async-channel` already provides bounded
-multi-producer/multi-consumer channels, cloneable sender/receiver
-handles, async send/recv, close, and length/capacity inspection.
-
-Evaluation notes:
-
-* Preserve existing public wrapper if call sites rely on current names
-* Check closed-channel wake behavior against current tests
-* Preserve backpressure behavior for decoder/inserter pipeline
-* Keep custom queue only if existing semantics intentionally differ
-  from `async-channel`
-
 ## Byte throttling
 
 Evaluate `governor` if throttling needs precision, fairness, or shared
@@ -151,9 +131,8 @@ Recorded so future readers do not re-litigate these:
 
 1. `object_store`, highest risk removed and largest local protocol
    surface deleted
-2. `async-channel`, low-risk concurrency simplification
-3. `governor`, only if rate limiting requirements grow
-4. `prometheus-client`, when metrics format complexity grows
+2. `governor`, only if rate limiting requirements grow
+3. `prometheus-client`, when metrics format complexity grows
 
 Keep first implementation review-focused: add crate-backed path, run
 existing tests, add behavioral tests for edge cases being delegated,

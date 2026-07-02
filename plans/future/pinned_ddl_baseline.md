@@ -1,33 +1,26 @@
-# Pinned-table DDL baseline — generalize past the boot-time seed
+# Pinned-table DDL baseline — durable coherency
 
-Design doc for schema-event coherency on operator-pinned (and,
-via `config_table`) relations.
-
-**Boot-time seed:** a pinned table's first post-start `ALTER ADD
-COLUMN` replicates without priming DML. `ShadowCatalog::seed_baseline`
-warms the schema-diff baseline (`prev_known`) with each pinned relation's
-boot-time descriptor before `subscribe()` — called from `bin/stream.rs`
-and the inproc harness, recording the *full source* descriptor so an
-operator-excluded column reads as "excluded", not "added since". Contract:
-`plans/emitter.md` "Baseline seeding". Mechanism and tests:
-`src/shadow_catalog.rs`, `tests/shadow_catalog.rs`,
-`tests/schema_evolution_pinned.rs`.
-
-That seed makes the `Added`-vs-`Changed` decision cache-independent only
-*within one daemon lifetime*. Everything below is the general invariant —
-**an in-process cache must never decide which CH SQL runs** — extended
-across restart, to drops, and to runtime scope changes.
+Design doc for schema-event coherency on operator-pinned and
+`config_table`-scoped relations across restart, drops, and downtime.
+Within one daemon lifetime the schema-diff baseline (`prev_known`) is
+warm for the whole resolved scope — `ShadowCatalog::seed_baseline` at
+boot for TOML-pinned rels, the per-table opt-in dispatch for
+`config_table` rels (`plans/emitter.md` "Baseline seeding",
+`plans/config.md`). Everything below extends the general invariant —
+**an in-process cache must never decide which CH SQL runs** — past one
+lifetime: across restart, to drops during downtime, and to durable
+rename/drop fidelity.
 
 Non-goal: type-change replication (rejected by `apply_changed`, logged
 not applied; unchanged here).
 
-## Baseline coherency across restart, drops, and scope changes
+## Open
 
 1. **Boot-time drift (Gap 2).** A column added to source while walshadow
    is fully down folds silently into the next boot's seeded baseline, so
-   no diff ever fires and CH stays a column behind. Auto-create shares the
-   hole (`CREATE IF NOT EXISTS` no-ops on restart → baseline becomes
-   source-now). See "Boot-time drift (Gap 2)".
+   no diff ever fires and CH stays a column behind. Auto-create and the
+   opt-in boot re-seed share the hole (`CREATE IF NOT EXISTS` no-ops on
+   restart → baseline becomes source-now). See "Boot-time drift (Gap 2)".
 2. **Query CH for existence (the hybrid).** Replace the `Added`-vs-
    `Changed` warmth test with a CH-existence test (`system.tables` /
    `system.columns`): closes Gap 2 for the dominant `ADD COLUMN` case
@@ -39,18 +32,18 @@ not applied; unchanged here).
    agreement (boot / `CREATE` / applied `ALTER`). Closes Gap 2 for
    renames and drops across restart — the cases CH-existence cannot own.
    See "Recoverable baseline — the spectrum" (option 3).
-4. **Drop detection for never-fetched relations.** `sweep_dropped` /
-   `emit_dropped` only cover oids present in `prev_known`. Seeding
-   covers pinned rels within a lifetime, but a configured-yet-never-
-   fetched or auto-create relation dropped at source produces no
-   `Dropped` event. Generalise scope to the *configured* set, not the
-   fetched set. See "Scope is a configuration question".
-5. **`runtime_config_from_pg.md` integration.** Seed/recover the baseline
-   over the *resolved* scope, and on a runtime scope addition
-   (`config_table.replicate` flips true mid-stream) establish that
-   relation's baseline synchronously at the config row's commit LSN,
-   before its next descriptor fetch. See "Integration with
-   `runtime_config_from_pg.md`".
+4. **Drop detection across downtime.** A configured relation dropped at
+   source while the daemon is down never enters `prev_known` — the boot
+   seed skips a NULL `to_regclass`, the opt-in seed parks the row as a
+   forward-declaration — so no `Dropped` event fires and the CH table
+   lingers. Generalise sweep scope to the *configured* set, not the
+   seeded set. See "Scope is a configuration question".
+5. **Opt-in mapping vs republish.** `mutate_mapping_for_diff` extends
+   only the live `MappingHandle` after an applied `ALTER`; the
+   resolver's opt-in mapping keeps its materialize-time shape, so the
+   next republish (SIGHUP, any config event) reverts the extension and
+   post-ALTER columns stop routing. Extensions must land where the
+   resolver merges from.
 6. **Tests.** Warm-vs-cold *invariant* equivalence, a
    `RENAME COLUMN` regression (CH `RENAME`, never `DROP`+`ADD`),
    `DROP COLUMN` coverage, and the CH-existence path. See "Tests".
@@ -85,8 +78,8 @@ questions:
   `emit_dropped` removes entries), cold at every boot and resume, never
   reconstructed on a miss.
 
-The boot-time seed warms the ledger at boot. The general fix is to stop
-letting any cache's warmth pick the branch — across restart too.
+Seeding warms the ledger for the resolved scope. The general fix is to
+stop letting any cache's warmth pick the branch — across restart too.
 
 ### Why "miss → look up the catalog" does not, by itself, fix the baseline
 
@@ -127,7 +120,7 @@ Only a baseline that records the *full source shape at agreement time*
 separates "excluded by the operator" from "appeared after we synced."
 The mapping holds the exclusion decision; the source-shape baseline holds
 the agreement point. You need both, and neither is derivable from the
-other or from the live catalog. This is why the seed records the
+other or from the live catalog. This is why seeding records the
 *descriptor*, not the mapping.
 
 ### The decision as a pure function
@@ -153,27 +146,28 @@ and `baseline` are produced, never which arm runs.
 
 ### Scope is a configuration question — and the Dropped path shares the bug
 
-Whether a relation is replicated is answered by the resolved config
-(TOML `tables` today, `config_table.replicate` after
-`runtime_config_from_pg.md`), not by cache presence. The same conflation
-hides in drop detection: `sweep_dropped` only polls oids already in
-`prev_known`, and `emit_dropped` returns `false` for an oid the catalog
-never fetched. A configured table dropped at source before its descriptor
-was ever touched produces no `Dropped` event — cache warmth deciding
-semantics again. Generalising scope to the configured set (not the
-fetched set) fixes drop detection by the same principle.
+Whether a relation is replicated is answered by the resolved config, not
+by cache presence. Within one lifetime seeding holds the two equal:
+every relation in the resolved scope enters `prev_known` at boot or at
+opt-in, so `sweep_dropped`'s poll set *is* the configured set. Across
+downtime they diverge: `sweep_dropped` only polls oids already in
+`prev_known`, and a configured relation dropped while the daemon was
+down is never seeded, so no `Dropped` fires — cache warmth deciding
+semantics again. Generalising the sweep to the configured set (the
+config keys carry the qualified names a `Dropped` event needs) fixes
+drop detection by the same principle.
 
 ### Recoverable baseline — the spectrum
 
 Three ways to make `baseline(rel)` recoverable rather than
 cache-resident, weakest to strongest:
 
-1. **Seed from source at boot** (`seed_baseline`). Warms
-   `prev_known` for every in-scope relation before `subscribe()`, so
+1. **Seed from source** (`seed_baseline`, the opt-in dispatch). Warms
+   `prev_known` for every in-scope relation at boot or at opt-in, so
    within one daemon lifetime no in-scope relation is ever cold and the
-   decision is cache-independent. Re-derived from the live catalog at each
-   boot, so it assumes boot-shape == agreement-shape; a column added while
-   the daemon was down folds silently into the baseline (Gap 2).
+   decision is cache-independent. Re-derived from the live catalog, so it
+   assumes seed-shape == agreement-shape; a column added while the daemon
+   was down folds silently into the baseline (Gap 2).
 2. **Query CH for the actual state** (`system.tables` / `system.columns`
    on the dest). The honest, durable record of what CH holds,
    reconstructible across restarts with zero new persistence — CH *is*
@@ -195,7 +189,7 @@ cache-resident, weakest to strongest:
 The hybrid in "Querying ClickHouse": CH
 existence as the table/column *creation* discriminator (durable,
 cache-free, closes Gap-2-for-adds), with a source-shape baseline (the
-boot-time seed, option 3's persistence for durability) retained for
+seed, option 3's persistence for durability) retained for
 rename/drop fidelity.
 
 ### Querying ClickHouse for the baseline
@@ -234,14 +228,17 @@ store**, for three concrete reasons:
    `DROP COLUMN` the old CH column — **data loss**. Distinguishing rename
    from drop+add needs the *previous source shape*, i.e. the source-shape
    baseline, not CH.
-2. **Implicit exclusion is ambiguous (pre-overlay).** A pinned subset
-   leaves excluded columns absent from both the mapping and CH. "In
-   source, not in CH" then means *either* "excluded" *or* "added since" —
-   the footgun. This dissolves once `runtime_config_from_pg.md` makes
-   exclusion explicit (`config_column.exclude`): the rule becomes "add if
-   in source AND not in CH AND not excluded," and CH-as-truth becomes safe
-   for adds. CH-baseline's footgun is exactly co-extensive with implicit
-   exclusion; the overlay removes it.
+2. **Implicit exclusion is ambiguous — for TOML-pinned subsets.** A
+   pinned subset leaves excluded columns absent from both the mapping and
+   CH. "In source, not in CH" then means *either* "excluded" *or* "added
+   since" — the footgun. `config_table` opt-ins carry no implicit
+   exclusion (the mapping derives from the full descriptor;
+   `config_column` holds type overrides only), so CH-existence
+   reconciliation is already safe on that scope; TOML-pinned subsets keep
+   the footgun until exclusion is explicit (`config_column.exclude`,
+   `runtime_config_from_pg.md`), at which point the rule becomes "add if
+   in source AND not in CH AND not excluded" and CH-as-truth is safe
+   everywhere.
 3. **Couples the decision to CH availability and timing.** Baseline
    resolution would now require a CH round-trip (the applicator already
    owns a CH client, so it is reachable) and inherits CH's async-DDL
@@ -260,14 +257,14 @@ side before comparison.
 
 If a column is added to source while walshadow is entirely down, at next
 boot the seeded baseline equals the already-evolved source shape, so no
-future diff fires and CH stays behind. Seeding at boot does not fix this
-by design (it treats the boot shape as the agreed baseline); auto-create
-shares the hole (restart → `Added` → `CREATE IF NOT EXISTS` no-ops →
-baseline silently becomes source-now). The principled closes are above:
-querying CH for existence closes it for `ADD COLUMN` with no persistence,
-and persisting the source-shape baseline (option 3) closes it for
-renames/drops too. Operators recover without a durable baseline by
-SIGHUP'ing an updated mapping.
+future diff fires and CH stays behind. Seeding does not fix this by
+design (it treats the seed shape as the agreed baseline); auto-create
+and the opt-in boot re-seed share the hole (restart →
+`CREATE IF NOT EXISTS` no-ops → baseline silently becomes source-now).
+The principled closes are above: querying CH for existence closes it for
+`ADD COLUMN` with no persistence, and persisting the source-shape
+baseline (option 3) closes it for renames/drops too. Operators recover
+without a durable baseline by SIGHUP'ing an updated mapping.
 
 A narrower complement, absent a durable baseline:
 reconcile inside `apply_added` for pinned tables — on `Added`, instead of
@@ -328,23 +325,6 @@ Verdict: do not time-travel PG; if temporal is wanted, build it in the
 walshadow layer as bounded version history — but for *this* baseline
 problem option 3 (single persisted agreed descriptor) is the lighter
 equivalent.
-
-### Integration with `runtime_config_from_pg.md`
-
-Under the overlay, `replication_scope` is the resolver's table set, not
-`cfg.tables`. Two consequences:
-
-- Seed/recover the baseline by iterating the *resolved* scope, so a table
-  configured via `config_table` is seeded identically to a TOML-pinned
-  one.
-- A scope addition at runtime (`config_table.replicate` flips true
-  mid-stream) is the same event as boot for that one relation: the
-  resolver must synchronously establish its baseline from source at the
-  config row's commit LSN, *before* the next descriptor fetch for it, so
-  the first post-opt-in `ALTER` diffs against the opt-in shape rather than
-  tripping the cold-`prev_known` → `Added` path. This is precisely "a
-  cache miss looks the data up," applied to the baseline ledger and driven
-  by the config event instead of by boot.
 
 ## Tests
 
