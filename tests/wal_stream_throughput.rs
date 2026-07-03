@@ -323,6 +323,7 @@ async fn pump_throughput_breakdown() {
                         source_lsn: r.source_lsn,
                         page_magic: r.page_magic,
                         route: r.route,
+                        catalog_signal: r.catalog_signal,
                     };
                     // Push then immediately pop to drop, so we measure
                     // clone+drop without growing memory unboundedly.

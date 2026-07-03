@@ -664,14 +664,11 @@ async fn run(args: Args) -> Result<()> {
         "shadow connected",
     );
 
-    // Descriptor-cache invalidation epoch: tracker bumps on every
-    // catalog-touching record, catalog folds the delta into `invalidate`
-    // before each relation lookup's cache check.
+    // Descriptor-cache invalidation epoch: decoder worker bumps off each
+    // record's tracker verdict (`with_catalog_signals` below), catalog
+    // folds the delta into `invalidate` before each relation lookup's
+    // cache check. Mapping writes + SIGHUP reload bump out-of-band.
     let invalidation_epoch = Arc::new(AtomicU64::new(0));
-    stream
-        .filter_mut()
-        .tracker
-        .set_invalidation_epoch(invalidation_epoch.clone());
     // Narrower drop-only epoch so sweep_dropped throttles off pg_class
     // heap_delete, not every catalog touch (ADD COLUMN / CREATE INDEX
     // would flood at pgbench rate otherwise).
@@ -796,7 +793,14 @@ async fn run(args: Args) -> Result<()> {
             None
         };
     let mut decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
-        .with_schema_events(schema_events.clone());
+        .with_schema_events(schema_events.clone())
+        // Re-bump at worker position: the queueing sink below decouples
+        // the decoder from the pump, so the tracker's observe-time bumps
+        // alone would be consumable before pre-DDL records finish decoding
+        .with_catalog_signal_epochs(
+            invalidation_epoch.clone(),
+            Some(pg_class_delete_epoch.clone()),
+        );
     if let Some(reg) = &span_registry {
         decoder = decoder.with_span_registry(reg.clone());
     }

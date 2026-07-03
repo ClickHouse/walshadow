@@ -39,6 +39,7 @@ use tokio::sync::mpsc;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
 
+use crate::catalog_tracker::CatalogSignal;
 use crate::classify::rmgr_label;
 use crate::filter::{Filter, FilterStats, Route};
 use crate::filter_segment::{FilterSegmentError, ParsedRecord, filter_segment};
@@ -110,6 +111,12 @@ pub struct Record<'a> {
     pub source_lsn: u64,
     pub page_magic: u16,
     pub route: Route,
+    /// Tracker verdict from `decide` time; the decoder worker bumps
+    /// invalidation epochs when this record passes through it, so
+    /// consumption stays in stream order once `QueueingRecordSink`
+    /// decouples the worker from the pump (see `catalog_tracker` module
+    /// doc)
+    pub catalog_signal: CatalogSignal,
 }
 
 impl Record<'static> {
@@ -129,6 +136,9 @@ impl Record<'static> {
             source_lsn: seg_start_lsn + entry.offset,
             page_magic: parsed.page_magic,
             route,
+            // Manifest carries no tracker verdict; manifest-built records
+            // never feed the live decoder (close() doesn't re-dispatch)
+            catalog_signal: CatalogSignal::None,
         }
     }
 }
@@ -267,6 +277,7 @@ impl RecordSink for CollectingRecordSink {
                 source_lsn: record.source_lsn,
                 page_magic: record.page_magic,
                 route: record.route,
+                catalog_signal: record.catalog_signal,
             });
             Ok(())
         })
@@ -731,6 +742,7 @@ impl WalStream {
             // and so the decoder reads the original bytes after the
             // shadow stream is clobbered.
             let route;
+            let catalog_signal;
             let parsed_for_sink: XLogRecord<'static>;
             {
                 let parsed = parse_record_from_bytes(
@@ -741,7 +753,7 @@ impl WalStream {
                     offset: start_offset,
                     source,
                 })?;
-                route = self.filter.decide(&parsed);
+                (route, catalog_signal) = self.filter.decide_with_signal(&parsed);
                 // `rewrite_record` below mutates walker.buf that `parsed`
                 // views; dispatch needs the original parse, not post-rewrite.
                 parsed_for_sink = parsed.into_owned();
@@ -800,6 +812,7 @@ impl WalStream {
                 source_lsn,
                 page_magic,
                 route,
+                catalog_signal,
             };
             record_sink.on_record(&record).await?;
         }

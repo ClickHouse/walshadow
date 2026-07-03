@@ -605,10 +605,6 @@ async fn build_pipeline_inner(
     let catalog = Arc::new(Mutex::new(catalog));
 
     let inv_epoch = Arc::new(AtomicU64::new(0));
-    stream
-        .filter_mut()
-        .tracker
-        .set_invalidation_epoch(inv_epoch.clone());
     catalog
         .lock()
         .await
@@ -689,7 +685,7 @@ async fn build_pipeline_inner(
     let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone())
         .await
         .expect("ddl applicator init")
-        .with_invalidation_epoch(inv_epoch);
+        .with_invalidation_epoch(inv_epoch.clone());
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
     let pcfg = PipelineConfig {
@@ -712,7 +708,8 @@ async fn build_pipeline_inner(
         .await
         .expect("spawn decode+insert pipeline");
 
-    let mut decoder = BufferingDecoderSink::new(catalog, xact_buffer.clone());
+    let mut decoder = BufferingDecoderSink::new(catalog, xact_buffer.clone())
+        .with_catalog_signal_epochs(inv_epoch, ddl.as_ref().map(|_| del_epoch.clone()));
     if let Some(rx) = &schema_events {
         decoder = decoder.with_schema_events(rx.clone());
     }

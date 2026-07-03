@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use walrus::pg::walparser::{XLogRecord, XLogRecordBlock};
 
-use crate::catalog_tracker::CatalogTracker;
+use crate::catalog_tracker::{CatalogSignal, CatalogTracker};
 use crate::classify::{Class, classify, rmgr_label};
 use crate::main_data;
 
@@ -94,7 +94,16 @@ impl Filter {
     }
 
     pub fn decide(&mut self, record: &XLogRecord) -> Route {
-        self.tracker.observe(record);
+        self.decide_with_signal(record).0
+    }
+
+    /// [`Self::decide`] plus the tracker's [`CatalogSignal`] verdict, stamped
+    /// on the outgoing [`Record`](crate::wal_stream::Record) so the decoder
+    /// worker bumps invalidation epochs at its own stream position (a
+    /// pump-position bump would be consumable before pre-DDL records finish
+    /// decoding; see `catalog_tracker` module doc)
+    pub fn decide_with_signal(&mut self, record: &XLogRecord) -> (Route, CatalogSignal) {
+        let signal = self.tracker.observe(record);
         let class = classify(record);
         let route = match class {
             Class::Special | Class::Catalog => Route::ToShadow,
@@ -119,7 +128,7 @@ impl Filter {
         };
         self.stats
             .record(class, route, record.header.total_record_length as u64);
-        route
+        (route, signal)
     }
 
     pub fn rmgr_label(record: &XLogRecord) -> String {
@@ -246,6 +255,20 @@ mod tests {
         assert_eq!(f.decide(&new_cid_record(5, 1259)), Route::ToShadow);
         // user filenode → Drop
         assert_eq!(f.decide(&new_cid_record(5, 20000)), Route::ToDecoder);
+    }
+
+    #[test]
+    fn decide_with_signal_surfaces_tracker_verdict() {
+        use crate::catalog_tracker::CatalogSignal;
+        let mut f = Filter::new();
+        // pg_class heap insert (info 0x00, undecodable empty body: coarse
+        // signal still fires)
+        let (route, signal) = f.decide_with_signal(&rec(RmId::Heap, &[(5, 1259)]));
+        assert_eq!(route, Route::ToShadow);
+        assert_eq!(signal, CatalogSignal::Invalidate);
+        let (route, signal) = f.decide_with_signal(&rec(RmId::Heap, &[(5, 20000)]));
+        assert_eq!(route, Route::ToDecoder);
+        assert_eq!(signal, CatalogSignal::None);
     }
 
     #[test]

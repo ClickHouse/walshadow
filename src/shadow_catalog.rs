@@ -322,8 +322,10 @@ pub struct ShadowCatalog {
     prev_known: HashMap<Oid, Arc<RelDescriptor>>,
     eviction: EvictionIndex,
     last_replay_lsn: Option<u64>,
-    /// Shared with upstream [`CatalogTracker`](crate::catalog_tracker::CatalogTracker);
-    /// an advance triggers `invalidate`. `None` standalone (tests, batch tools).
+    /// Bumped by the decoder worker off each record's
+    /// [`CatalogSignal`](crate::catalog_tracker::CatalogSignal) and by
+    /// mapping writes / SIGHUP reload; an advance triggers `invalidate`.
+    /// `None` standalone (tests, batch tools).
     invalidation_epoch: Option<Arc<AtomicU64>>,
     /// Latest epoch already folded into `generation`
     last_seen_epoch: u64,
@@ -570,8 +572,9 @@ impl ShadowCatalog {
         self.prev_known.insert(oid, new.clone());
     }
 
-    /// Pass the same `Arc` clone as upstream
-    /// [`CatalogTracker::set_invalidation_epoch`](crate::catalog_tracker::CatalogTracker::set_invalidation_epoch).
+    /// Pass the same `Arc` clone as the decoder sink's
+    /// `with_catalog_signals` and the DDL applicator's
+    /// `with_invalidation_epoch`.
     pub fn set_invalidation_epoch(&mut self, epoch: Arc<AtomicU64>) {
         // Adopt current value as seen so a non-zero epoch (catalog opened
         // mid-stream) doesn't spuriously invalidate on first lookup
@@ -594,8 +597,8 @@ impl ShadowCatalog {
         self.generation
     }
 
-    /// Lock-free handle to the invalidation epoch (bumped on DDL); `None` when no
-    /// tracker is wired. The decode pool flushes its cache on a bump.
+    /// Lock-free handle to the invalidation epoch (bumped on DDL); `None`
+    /// standalone. The decode pool flushes its cache on a bump.
     pub fn invalidation_epoch_handle(&self) -> Option<Arc<AtomicU64>> {
         self.invalidation_epoch.clone()
     }
@@ -758,8 +761,9 @@ impl ShadowCatalog {
                 .instrument(replay_span.clone())
                 .await?;
             replay_span.record("replay_lsn", replayed);
-            // Re-check after the await: a DDL observed concurrently can
-            // have bumped the epoch while wait_for_replay yielded.
+            // Re-check after the await: a concurrent mapping write /
+            // SIGHUP reload can have bumped the epoch while
+            // wait_for_replay yielded.
             self.drain_invalidations();
         }
         if let Some(entry) = self.by_filenode.get(&rfn)
