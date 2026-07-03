@@ -29,11 +29,12 @@ untouched.
 - `tables` — per-relation destination mapping, keyed `"<namespace>.<relname>"`
 - `namespaces` — per-namespace defaults (`auto_create`, `target_database`,
   `drop_table_strategy`)
-- `columns` — per-`(namespace.relname, source attname)` type override,
-  populated from the `config_column` overlay and WAL-tracked. The emitted
-  projection does not consume it; that wiring (source-attname→attnum resolution
-  plus a `TablePlan` rebuild) lives in
-  [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
+- `columns` — per-column CH-type override from the `config_column` overlay,
+  keyed `"<namespace>.<relname>"` → source attname → CH type expression,
+  WAL-tracked. Consumed by `TablePlan::build` (the batcher's plan cache),
+  which resolves attname→attnum against the descriptor at hand and swaps the
+  column's encode type when the override is wire-compatible (see §column
+  overrides below)
 - `drop_table_strategy` — global DROP fallback; per-namespace overrides it
 - `row_budget`, `byte_budget`, `flush_timeout` — emitter batch-seal triggers,
   read live by the batcher per seal decision (ticker re-armed on change)
@@ -176,13 +177,51 @@ via `usize` conversion + `> 0`; `flush_timeout_ms`/`retry_max_attempts` via
 unsigned conversion; `compression` via `CompressionChoice::parse` **then
 `build_codec`**, so a codec unsupported at compile time (e.g. zstd with the
 feature off) is rejected at merge, never surfaced as a fatal when the inserter
-reconnects. Rejections increment a counter (`ConfigResolver::rejections`) and log
-at WARN. Validation runs at merge, not at decode.
+reconnects; `config_column.target_type` via `TypeAst::parse` (wire
+compatibility needs the descriptor, so that check falls back at plan build —
+§column overrides). Rejections increment a counter
+(`ConfigResolver::rejections`) and log at WARN. Validation runs at merge, not
+at decode.
 
 `config_table.target` overrides the destination only of a table already mapped by
 TOML (which carries the column projection); a row for an unmapped table would
 need column auto-derivation, so it is skipped with a WARN rather than emitting a
 column-less INSERT.
+
+## Column overrides
+
+`config_column.target_type` reaches the emitted projection in two stages,
+because the two failure classes surface at different points:
+
+- **Merge (resolver):** the type string parses via `TypeAst::parse` or the row
+  is rejected (rejections tick, WARN, prior value kept) — a malformed type must
+  never reach a `TablePlan` build, whose error would poison the batcher. The
+  overlay mirrors the PG row (bad value included), so "prior" here is the last
+  accepted override, carried forward off the previous published snapshot; a
+  boot seed of a bad row has no prior, the column keeps its descriptor-derived
+  type. An explicit row DELETE clears the override — retention covers bad
+  updates only
+- **Plan build (batcher):** `TablePlan::build` is where the descriptor meets
+  the mapping, so attname→attnum resolves exactly there; the override swaps the
+  column's encode type only when wire-compatible. `encode_value` performs no
+  arithmetic conversion, so admissibility (`override_wire`) is: a
+  Decimal-encoded source takes any Decimal, String, or a signed
+  Int32/64/128/256 as a scale-0 decimal (`numeric(38,0)` → `Int128`); a
+  string-shaped source takes string-shaped; a fixed-width source takes a
+  same-width non-Decimal reinterpretation (`Int32` → `UInt32`). Inadmissible
+  (`numeric` → `Float32`, `Int32` → `String`) keeps the default with a WARN
+
+Fencing needs no extra machinery: a `Column*` apply runs under the reorder
+barrier whose fence already `FlushAll`ed the batcher, clearing its plan cache,
+so post-apply rows rebuild plans against the republished snapshot. The
+dedicated backfill tails (COPY / backup passes) receive the same watch
+receiver, so backfilled rows encode under the same overrides as WAL-driven
+rows. The greenfield bootstrap tail stays TOML-only (no resolver exists yet at
+that phase).
+
+The override changes the projection only — CH-side DDL (`CREATE TABLE` /
+`ADD COLUMN`) still renders bridge-derived types; retyping an existing CH
+column stays an operator migration.
 
 ## Subscribers
 
@@ -198,7 +237,8 @@ point, not the consumer set. Four consumers:
   `refresh_config` at the top of each `apply`
 - **Batcher** ([`pipeline/batcher.rs`](../src/pipeline/batcher.rs)) — reads
   `row_budget`/`byte_budget`/`flush_timeout` off the watch per seal decision;
-  re-arms the idle-flush ticker when `flush_timeout` changes
+  re-arms the idle-flush ticker when `flush_timeout` changes; feeds
+  `ResolvedConfig::columns` to each `TablePlan` build (§column overrides)
 - **Inserter** ([`pipeline/inserter.rs`](../src/pipeline/inserter.rs)) — reads
   `retry_max_attempts` per attempt loop and `compression` at each batch boundary,
   reconnecting when the codec changes
@@ -210,13 +250,29 @@ resolver (metrics-only run, no `--ch-config`) makes it a no-op tap. Install
 failure drops the resolver, so `has_changed` returns `Err` and subscribers freeze
 at the boot snapshot — reload disabled, config still serves.
 
-## Known limitation
+## Mapping lifecycle
 
-Republish full-swaps the operator `tables`, dropping mappings the DDL applicator
-auto-derived on `auto_create`. An auto-created table loses its routing entry on
-the next reload until a fresh `Added` re-derives it. Mapping lifecycle is owned
-by the per-table opt-in work
-([future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)).
+Republish rebuilds the routing map whole from the merge inputs, so every
+runtime mapping mutation must be recorded in a layer republish rebuilds from.
+The resolver owns that state: opt-in mappings (`materialize_opt_in`) and a
+`derived` layer holding `auto_create`-derived mappings
+(`register_derived_mapping`) plus ALTER diff folds (`apply_schema_diff`).
+The `DdlApplicator` routes through these when built `with_resolver`; its
+direct-handle writes remain only for resolver-less contexts (bootstrap drain,
+tests), where nothing republishes.
+
+Layer order at resolve: TOML `base`, then `derived`, then opt-in — so an
+explicit opt-in beats an auto-derivation, and a diff fold on a TOML-owned
+mapping lands copy-on-write in `derived`, shadowing the TOML entry (a SIGHUP
+TOML re-read cannot revert an applied source ALTER; restart re-derives from
+TOML + WAL replay). Source `DROP TABLE` under strategy=Drop forgets the
+derived/opt-in entry (`forget_derived_mapping`) so a future `Added`
+re-derives columns; an overlay `replicate=true` row re-parks as a
+forward-declaration so a source re-create re-materialises the opt-in against
+the fresh descriptor. A TOML-pinned mapping is operator-managed and stays;
+strategy=Drop hands dest lifecycle to source DDL, so `apply_added` re-creates
+the dest from the mapping on a source re-create — create → drop → create
+round-trips without operator CH work.
 
 ## Deferred
 
@@ -247,6 +303,16 @@ Source-PG-driven work that builds on this resolver lives in
 - **Validation rejection.** Insert `config_global.compression = 'brotli'` (or a
   negative budget). Resolver rejects, `rejections` ticks, daemon stays up, other
   keys unaffected; UPDATE to a valid value and the next apply picks it up
+- **Target-type override.** Source column `numeric(38,0)` default-maps to
+  `Decimal(38, 0)`. Operator sets `config_column.target_type = 'Int128'`; the
+  barrier flush rebuilds the plan, post-config rows encode as scale-0 `Int128`.
+  Setting `'Float32'` instead keeps `Decimal(38, 0)` with a WARN
+  (wire-incompatible); an unparseable string rejects at merge, `rejections`
+  ticks
+- **Auto-create survives republish.** `auto_create` namespace, source runs
+  `CREATE TABLE` + INSERTs (mapping auto-derived), then any config row applies
+  (republish full-swap). Subsequent INSERTs still reach CH — the derived
+  mapping is resolver-owned, not clobbered
 
 ## Cross-links
 

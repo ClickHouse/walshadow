@@ -134,9 +134,8 @@ impl<'a> SegmentWalker<'a> {
         }
         // No pending => segment started mid-record (continuation from a prior
         // segment); skip silently, header never seen
-        let p = match self.pending.as_mut() {
-            Some(p) => p,
-            None => return Ok(()),
+        let Some(p) = self.pending.as_mut() else {
+            return Ok(());
         };
         let chunk = &self.bytes[data_start..cont_end];
         p.accumulated.extend_from_slice(chunk);

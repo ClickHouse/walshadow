@@ -467,9 +467,8 @@ impl PageWalkSink {
             // Take the page so the entry borrow drops before touching
             // self.stats / out_tx.send
             let (block_no, is_toast, desc_opt, page) = {
-                let entry = match self.cur.get_mut(&id) {
-                    Some(e) => e,
-                    None => return Ok(()),
+                let Some(entry) = self.cur.get_mut(&id) else {
+                    return Ok(());
                 };
                 if entry.slru.is_some() || entry.page_buf.len() < PAGE_BYTES {
                     return Ok(());

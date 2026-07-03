@@ -328,14 +328,13 @@ fn chunk_from_columns(
     if cols.len() < 3 {
         return None;
     }
-    let value_id = match cols[0].as_ref()? {
-        ColumnValue::Oid(v) => *v,
-        _ => return None,
+    let &ColumnValue::Oid(value_id) = cols[0].as_ref()? else {
+        return None;
     };
-    let chunk_seq = match cols[1].as_ref()? {
-        ColumnValue::Int4(v) => *v as u32,
-        _ => return None,
+    let &ColumnValue::Int4(chunk_seq) = cols[1].as_ref()? else {
+        return None;
     };
+    let chunk_seq = chunk_seq as u32;
     let chunk_data = match cols[2].as_ref()? {
         ColumnValue::Bytea(b) => b.clone(),
         ColumnValue::Text(s) => s.clone().into_bytes(),

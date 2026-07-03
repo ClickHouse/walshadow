@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::backup::BACKUP_NAME_PREFIX;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
@@ -96,6 +96,9 @@ pub struct PassContext {
     /// Scratch root (`{spill_dir}/backup_backfill`): fetched gap segments,
     /// replay xact-buffer spill, the never-written source data_dir.
     pub scratch_dir: PathBuf,
+    /// Live resolved config for the pass tail (`config_column` overrides);
+    /// `None` == boot values only.
+    pub config_rx: Option<watch::Receiver<Arc<crate::config::ResolvedConfig>>>,
 }
 
 /// Per-pass observability summary, logged by the caller.
@@ -291,12 +294,13 @@ async fn walk_and_ship(
     // Dedicated tail: own CH connection, own seq space, own fatal — the
     // live pipeline never blocks on a backfill (Regime A)
     let fatal = Fatal::new();
-    let (msg_tx, ack, tail) = tail::spawn(
+    let (msg_tx, ack, tail) = tail::spawn_with_config(
         &ctx.emitter,
         1,
         ctx.stats.clone(),
         Arc::new(AtomicU64::new(0)),
         fatal.clone(),
+        ctx.config_rx.clone(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("backup_backfill: spawn insert tail: {e}"))?;
@@ -951,18 +955,15 @@ impl crate::decoder_sink::TupleObserver for ReplayRouter {
             else {
                 return Ok(());
             };
-            let seq = match &mut self.open {
-                Some((seq, rows)) => {
-                    *rows += 1;
-                    *seq
-                }
-                None => {
-                    let seq = self.next_seq;
-                    self.next_seq += 1;
-                    self.ack.register(seq, committed.commit_lsn);
-                    self.open = Some((seq, 1));
-                    seq
-                }
+            let seq = if let Some((seq, rows)) = &mut self.open {
+                *rows += 1;
+                *seq
+            } else {
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                self.ack.register(seq, committed.commit_lsn);
+                self.open = Some((seq, 1));
+                seq
             };
             self.msg_tx
                 .send(BatcherMsg::Row(RoutedRow {

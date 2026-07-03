@@ -28,13 +28,16 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
 
-use crate::ch_ddl::{DropTableStrategy, derive_columns_for_mapping, sql_ident};
+use clickhouse_c::{Allocator, TypeAst};
+
+use crate::ch_ddl::{
+    DropTableStrategy, derive_columns_for_mapping, fold_diff_into_mapping, sql_ident,
+};
 use crate::ch_emitter::{
-    ColumnMapping, CompressionChoice, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping,
-    TableMapping,
+    CompressionChoice, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, TableMapping,
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
-use crate::shadow_catalog::RelDescriptor;
+use crate::shadow_catalog::{RelDescriptor, SchemaDiff};
 
 /// Pre-materialised resolved config, snapshotted by subscribers via
 /// `watch::Receiver<Arc<ResolvedConfig>>`. Rebuilt whole on every reload,
@@ -45,12 +48,13 @@ pub struct ResolvedConfig {
     pub tables: HashMap<String, TableMapping>,
     /// Per-namespace defaults keyed on PG schema name
     pub namespaces: HashMap<String, NamespaceMapping>,
-    /// Per-column override keyed on `("<namespace>.<relname>", source attname)`,
-    /// populated from the `config_column` overlay. Captured + WAL-tracked;
-    /// wiring it into the emitted projection (needs source-attname→attnum
-    /// resolution + a TablePlan rebuild) is a follow-up, so nothing reads it
-    /// yet — same status as before the overlay landed.
-    pub columns: HashMap<(String, String), ColumnMapping>,
+    /// Per-column CH-type override from the `config_column` overlay, keyed
+    /// `"<namespace>.<relname>"` → source attname → CH type expression.
+    /// Type strings are parse-validated at merge (Regime A: malformed
+    /// rejected, prior value kept). Consumed by `TablePlan::build`, which
+    /// resolves attname→attnum against the descriptor at hand and swaps the
+    /// column's encode type when the override is wire-compatible.
+    pub columns: HashMap<String, HashMap<String, String>>,
     /// Global DROP TABLE strategy fallback (`retain` / `drop` / `warn`);
     /// per-namespace `NamespaceMapping::drop_table_strategy` overrides it
     pub drop_table_strategy: String,
@@ -76,6 +80,7 @@ impl Default for ResolvedConfig {
             &ConfigOverlay::default(),
             &CliOverrides::default(),
             &OptInState::default(),
+            &HashMap::new(),
         )
         .0
     }
@@ -107,6 +112,13 @@ struct OptInState {
     /// Descriptor-derived mappings for tables opted in via `replicate=true`,
     /// keyed `"<namespace>.<relname>"`. Overlaid onto `resolved.tables`.
     mappings: HashMap<String, TableMapping>,
+    /// Applicator-derived runtime mappings: `auto_create` CREATEs and ALTER
+    /// diff folds ([`ConfigResolver::apply_schema_diff`]). Overlaid onto
+    /// `resolved.tables` under `mappings`, so opt-in wins. Living here (not
+    /// only in the live handle) is what makes them survive the republish
+    /// full-swap — closing the auto-create half of the [config.md] "Known
+    /// limitation" clobber.
+    derived: HashMap<String, TableMapping>,
     /// Tables opted out via `replicate=false` / `TableRemoved`; removed from
     /// `resolved.tables` even when TOML-mapped.
     excluded: HashSet<String>,
@@ -168,7 +180,7 @@ impl ConfigResolver {
     ) -> (Arc<Self>, watch::Receiver<Arc<ResolvedConfig>>) {
         let overlay = ConfigOverlay::default();
         let opt_in = OptInState::default();
-        let (initial, _) = Self::resolve(base, &overlay, &cli, &opt_in);
+        let (initial, _) = Self::resolve(base, &overlay, &cli, &opt_in, &HashMap::new());
         let (tx, rx) = watch::channel(Arc::new(initial));
         let this = Arc::new(Self {
             toml_path,
@@ -256,6 +268,7 @@ impl ConfigResolver {
             .opt_in
             .mappings
             .insert(qname.clone(), TableMapping { target, columns });
+        inner.opt_in.derived.remove(&qname);
         inner.opt_in.excluded.remove(&qname);
         inner.opt_in.pending_decl.remove(&qname);
         self.pending_decl
@@ -273,6 +286,7 @@ impl ConfigResolver {
     pub async fn exclude_table(&self, qname: &str) {
         let mut inner = self.inner.lock().await;
         inner.opt_in.mappings.remove(qname);
+        inner.opt_in.derived.remove(qname);
         inner.opt_in.pending_decl.remove(qname);
         inner.opt_in.excluded.insert(qname.to_owned());
         self.pending_decl
@@ -301,6 +315,69 @@ impl ConfigResolver {
         row
     }
 
+    /// Whether the operator opted this rel out (`replicate=false`). Read by
+    /// `DdlApplicator::apply_added` so an excluded rel skips auto-create.
+    pub async fn is_excluded(&self, qname: &str) -> bool {
+        self.inner.lock().await.opt_in.excluded.contains(qname)
+    }
+
+    /// Record an applicator-derived mapping (`auto_create` CREATE TABLE) so
+    /// it survives republish, write the fenced routing map, republish. Runs
+    /// inside the reorder barrier like the DDL that produced it.
+    pub async fn register_derived_mapping(&self, qname: &str, mapping: TableMapping) {
+        let mut inner = self.inner.lock().await;
+        inner.opt_in.derived.insert(qname.to_owned(), mapping);
+        self.republish(&inner).await;
+    }
+
+    /// Forget a runtime-derived mapping (source DROP TABLE under
+    /// strategy=Drop) so a future `Added` re-derives columns. TOML-pinned
+    /// mappings are untouched — republish rebuilds them from `base`, and
+    /// `DdlApplicator::apply_added` re-creates their dest on a source
+    /// re-create. An overlay `replicate=true` row re-parks as a
+    /// forward-declaration so a re-create re-materialises the opt-in
+    /// against the fresh descriptor.
+    pub async fn forget_derived_mapping(&self, qname: &str) {
+        let mut inner = self.inner.lock().await;
+        inner.opt_in.derived.remove(qname);
+        inner.opt_in.mappings.remove(qname);
+        if let Some(row) = inner.overlay.tables.get(qname)
+            && row.replicate == Some(true)
+        {
+            let row = row.clone();
+            inner.opt_in.pending_decl.insert(qname.to_owned(), row);
+            self.pending_decl
+                .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
+        }
+        self.republish(&inner).await;
+    }
+
+    /// Fold an ALTER diff into the layer owning the rel's mapping so the
+    /// auto-extension survives republish: opt-in / derived fold in place; a
+    /// TOML-owned mapping folds copy-on-write into `derived` (which shadows
+    /// `base` at resolve, so a SIGHUP TOML re-read can't revert the fold).
+    /// Unmapped or excluded rels no-op without republish, mirroring
+    /// `mutate_mapping_for_diff`'s early return.
+    pub async fn apply_schema_diff(&self, new: &RelDescriptor, diff: &SchemaDiff) {
+        let mut inner = self.inner.lock().await;
+        let qname = new.qualified_name.as_ref();
+        if inner.opt_in.excluded.contains(qname) {
+            return;
+        }
+        if let Some(m) = inner.opt_in.mappings.get_mut(qname) {
+            fold_diff_into_mapping(m, new, diff);
+        } else if let Some(m) = inner.opt_in.derived.get_mut(qname) {
+            fold_diff_into_mapping(m, new, diff);
+        } else if let Some(base) = inner.base.tables.get(qname) {
+            let mut m = base.clone();
+            fold_diff_into_mapping(&mut m, new, diff);
+            inner.opt_in.derived.insert(qname.to_owned(), m);
+        } else {
+            return;
+        }
+        self.republish(&inner).await;
+    }
+
     /// CH target database for a namespace: per-namespace override (overlay then
     /// TOML) else the global `[ch] database`. Mirrors
     /// [`crate::ch_ddl::DdlConfig::target_database_for`].
@@ -322,8 +399,14 @@ impl ConfigResolver {
 
     /// Rebuild the resolved snapshot, write the fenced routing map, publish.
     async fn republish(&self, inner: &MergeInputs) {
-        let (resolved, rejections) =
-            Self::resolve(&inner.base, &inner.overlay, &self.cli, &inner.opt_in);
+        let prev = self.tx.borrow().clone();
+        let (resolved, rejections) = Self::resolve(
+            &inner.base,
+            &inner.overlay,
+            &self.cli,
+            &inner.opt_in,
+            &prev.columns,
+        );
         self.rejections.store(rejections, Ordering::Relaxed);
         *self.mapping.write().await = resolved.tables.clone();
         // Decode workers cache rfn→(descriptor, mapping) per epoch, cache
@@ -338,11 +421,15 @@ impl ConfigResolver {
     /// overrides on top. Returns the resolved config and the count of overlay
     /// values rejected as malformed (kept at the pre-overlay value, logged at
     /// WARN — Regime A: a bad row never crashes or freezes the pump).
+    /// `prev_columns` is the last published snapshot's column overrides: a
+    /// `target_type` that fails to parse falls back to its entry there, so a
+    /// malformed update can't revert an already-accepted encode type.
     fn resolve(
         base: &EmitterConfig,
         overlay: &ConfigOverlay,
         cli: &CliOverrides,
         opt_in: &OptInState,
+        prev_columns: &HashMap<String, HashMap<String, String>>,
     ) -> (ResolvedConfig, u64) {
         let mut rejections = 0u64;
         let mut rc = ResolvedConfig {
@@ -357,9 +444,13 @@ impl ConfigResolver {
             retry_max_attempts: base.retry.max_attempts,
         };
 
-        // Opt-in inclusion (before the overlay target loop so an opt-in row
-        // that also sets `target` finds its mapping there). Descriptor-derived,
-        // so these carry the projection a bare `config_table.target` lacks.
+        // Runtime-derived layers (before the overlay target loop so a
+        // `config_table.target` row finds its mapping here). Both carry the
+        // descriptor-derived projection a bare `target` row lacks; derived
+        // first so an explicit opt-in wins over an auto-create.
+        for (qname, mapping) in &opt_in.derived {
+            rc.tables.insert(qname.clone(), mapping.clone());
+        }
         for (qname, mapping) in &opt_in.mappings {
             rc.tables.insert(qname.clone(), mapping.clone());
         }
@@ -462,14 +553,28 @@ impl ConfigResolver {
 
         for ((qname, attname), row) in &overlay.columns {
             if let Some(ty) = &row.target_type {
-                rc.columns.insert(
-                    (qname.clone(), attname.clone()),
-                    ColumnMapping {
-                        src_attnum: 0,
-                        target_name: attname.clone(),
-                        target_type: ty.clone(),
-                    },
-                );
+                // Parse-validate here so a malformed type never reaches a
+                // TablePlan build (whose error would poison the batcher).
+                // Wire-shape compatibility needs the descriptor, so that
+                // check (with fallback) runs at plan build instead.
+                if TypeAst::parse(ty, Allocator::stdlib()).is_ok() {
+                    rc.columns
+                        .entry(qname.clone())
+                        .or_default()
+                        .insert(attname.clone(), ty.clone());
+                } else {
+                    rejections += 1;
+                    // Bad update keeps last accepted override (prev snapshot);
+                    // overlay mirrors PG rows so retention can't live there
+                    let prior = prev_columns.get(qname).and_then(|m| m.get(attname));
+                    if let Some(prior) = prior {
+                        rc.columns
+                            .entry(qname.clone())
+                            .or_default()
+                            .insert(attname.clone(), prior.clone());
+                    }
+                    tracing::warn!(target: "walshadow::config", qname = %qname, attname = %attname, value = %ty, kept_prior = prior.is_some(), "config_column.target_type rejected: unparseable CH type");
+                }
             }
         }
 
@@ -543,6 +648,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
+            &HashMap::new(),
         );
         assert_eq!(r.drop_table_strategy, "drop");
         // CLI beats overlay.
@@ -550,7 +656,13 @@ mod tests {
             drop_table_strategy: Some("warn".into()),
             ..Default::default()
         };
-        let (r, _) = ConfigResolver::resolve(&base, &overlay, &cli, &OptInState::default());
+        let (r, _) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &cli,
+            &OptInState::default(),
+            &HashMap::new(),
+        );
         assert_eq!(r.drop_table_strategy, "warn");
     }
 
@@ -562,6 +674,7 @@ mod tests {
             &ConfigOverlay::default(),
             &CliOverrides::default(),
             &OptInState::default(),
+            &HashMap::new(),
         );
         assert_eq!(r.drop_table_strategy, "drop");
     }
@@ -586,6 +699,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
+            &HashMap::new(),
         );
         assert_eq!(rej, 0);
         assert_eq!(r.row_budget, 1000);
@@ -611,6 +725,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
+            &HashMap::new(),
         );
         assert_eq!(rej, 3);
         // Prior (TOML/base) values survive each rejection.
@@ -650,6 +765,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
+            &HashMap::new(),
         );
         let ns = r.namespaces.get("public").unwrap();
         assert!(ns.auto_create);
@@ -721,6 +837,7 @@ mod tests {
             &ConfigOverlay::default(),
             &CliOverrides::default(),
             &opt_in,
+            &HashMap::new(),
         );
         assert!(r.tables.contains_key("public.events"), "opt-in included");
         assert!(
@@ -776,6 +893,244 @@ mod tests {
         );
         assert!(!mapping.read().await.contains_key("public.events"));
         assert_eq!(resolver.opt_out_total(), 1);
+    }
+
+    #[tokio::test]
+    async fn derived_mapping_survives_republish() {
+        let base = base_with("retain");
+        let (mapping, epoch) = dummy_handles();
+        let (resolver, mut rx) =
+            ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        resolver
+            .register_derived_mapping(
+                "public.auto",
+                TableMapping {
+                    target: "default.auto".into(),
+                    columns: Vec::new(),
+                },
+            )
+            .await;
+        assert!(rx.changed().await.is_ok());
+        assert!(rx.borrow_and_update().tables.contains_key("public.auto"));
+        assert!(mapping.read().await.contains_key("public.auto"));
+        // An unrelated overlay apply full-swaps the handle; the derived
+        // mapping must survive (the [config.md] "Known limitation" clobber)
+        resolver
+            .apply_config_event(ConfigEvent::GlobalCleared)
+            .await;
+        assert!(rx.changed().await.is_ok());
+        assert!(rx.borrow_and_update().tables.contains_key("public.auto"));
+        assert!(mapping.read().await.contains_key("public.auto"));
+        // Source DROP TABLE under strategy=Drop forgets it everywhere
+        resolver.forget_derived_mapping("public.auto").await;
+        assert!(!mapping.read().await.contains_key("public.auto"));
+        assert!(rx.changed().await.is_ok());
+        assert!(!rx.borrow_and_update().tables.contains_key("public.auto"));
+    }
+
+    #[tokio::test]
+    async fn forget_reparks_opt_in_row_as_pending_decl() {
+        let base = base_with("drop");
+        let (mapping, epoch) = dummy_handles();
+        let (resolver, _rx) =
+            ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        resolver
+            .apply_config_event(ConfigEvent::TableUpserted {
+                qname: "public.events".into(),
+                row: TableRow {
+                    replicate: Some(true),
+                    ..Default::default()
+                },
+            })
+            .await;
+        resolver
+            .materialize_opt_in(&rel_desc("public", "events"), None)
+            .await;
+        assert!(mapping.read().await.contains_key("public.events"));
+        // Source DROP under strategy=Drop: mapping forgotten, opt-in row
+        // re-parked so the next CREATE re-materialises it
+        resolver.forget_derived_mapping("public.events").await;
+        assert!(!mapping.read().await.contains_key("public.events"));
+        assert_eq!(resolver.pending_decl_count(), 1);
+        let row = resolver
+            .take_pending_decl("public.events")
+            .await
+            .expect("re-parked");
+        assert_eq!(row.replicate, Some(true));
+    }
+
+    #[tokio::test]
+    async fn schema_diff_fold_survives_republish() {
+        use crate::shadow_catalog::RelAttr;
+        // TOML-owned mapping: the fold lands copy-on-write in the derived
+        // layer, so neither a config apply nor a SIGHUP re-merge reverts it
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n[table.\"public.events\"]\ntarget = \"default.events\"\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n",
+        )
+        .unwrap();
+        let (mapping, epoch) = dummy_handles();
+        let (resolver, _rx) =
+            ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        let mut desc = rel_desc("public", "events");
+        desc.attributes.push(RelAttr {
+            attnum: 2,
+            name: "note".into(),
+            type_oid: 25, // text
+            typmod: -1,
+            not_null: false,
+            dropped: false,
+            type_name: "text".into(),
+            type_byval: false,
+            type_len: -1,
+            type_align: 'i',
+            type_storage: 'x',
+            missing_text: None,
+        });
+        let diff = SchemaDiff {
+            added_columns: vec![desc.attributes[1].clone()],
+            dropped_columns: vec![],
+            renamed_columns: vec![],
+            type_changes: vec![],
+        };
+        resolver.apply_schema_diff(&desc, &diff).await;
+        let has_note = |m: &HashMap<String, TableMapping>| {
+            m.get("public.events")
+                .is_some_and(|t| t.columns.iter().any(|c| c.src_attnum == 2))
+        };
+        assert!(has_note(&*mapping.read().await), "fold reaches the handle");
+        resolver
+            .apply_config_event(ConfigEvent::GlobalCleared)
+            .await;
+        assert!(
+            has_note(&*mapping.read().await),
+            "fold survives the republish full-swap"
+        );
+    }
+
+    #[test]
+    fn column_override_validated_at_merge() {
+        use crate::runtime_config::ColumnRow;
+        let base = base_with("retain");
+        let mut overlay = ConfigOverlay::default();
+        overlay.columns.insert(
+            ("public.t".into(), "amount".into()),
+            ColumnRow {
+                target_type: Some("Int128".into()),
+            },
+        );
+        overlay.columns.insert(
+            ("public.t".into(), "bad".into()),
+            ColumnRow {
+                target_type: Some("NotAType(".into()),
+            },
+        );
+        let (r, rej) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(rej, 1, "unparseable type rejected");
+        let t = r.columns.get("public.t").expect("table entry");
+        assert_eq!(t.get("amount").map(String::as_str), Some("Int128"));
+        assert!(!t.contains_key("bad"));
+    }
+
+    #[test]
+    fn column_override_invalid_update_keeps_last_accepted() {
+        use crate::runtime_config::ColumnRow;
+        let base = base_with("retain");
+        let key = ("public.t".to_owned(), "amount".to_owned());
+        let mut overlay = ConfigOverlay::default();
+        overlay.columns.insert(
+            key.clone(),
+            ColumnRow {
+                target_type: Some("Decimal(38, 2)".into()),
+            },
+        );
+        let (first, rej) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(rej, 0);
+        // Malformed update replaces the overlay row wholesale; merge keeps
+        // the accepted value off the previous snapshot
+        overlay.columns.insert(
+            key,
+            ColumnRow {
+                target_type: Some("NotAType(".into()),
+            },
+        );
+        let (second, rej) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &first.columns,
+        );
+        assert_eq!(rej, 1);
+        let amount = |r: &ResolvedConfig| {
+            r.columns
+                .get("public.t")
+                .and_then(|t| t.get("amount"))
+                .cloned()
+        };
+        assert_eq!(amount(&second).as_deref(), Some("Decimal(38, 2)"));
+        // Retention carries forward while the bad row stays in the overlay
+        let (third, rej) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &second.columns,
+        );
+        assert_eq!(rej, 1);
+        assert_eq!(amount(&third).as_deref(), Some("Decimal(38, 2)"));
+    }
+
+    #[tokio::test]
+    async fn column_override_survives_malformed_update_until_removed() {
+        use crate::runtime_config::ColumnRow;
+        let base = base_with("retain");
+        let (mapping, epoch) = dummy_handles();
+        let (resolver, mut rx) =
+            ConfigResolver::new(&base, CliOverrides::default(), None, mapping, epoch);
+        let upsert = |ty: &str| ConfigEvent::ColumnUpserted {
+            qname: "public.t".into(),
+            attname: "amount".into(),
+            row: ColumnRow {
+                target_type: Some(ty.into()),
+            },
+        };
+        resolver.apply_config_event(upsert("Decimal(38, 2)")).await;
+        assert!(rx.changed().await.is_ok());
+        assert_eq!(
+            rx.borrow_and_update().columns["public.t"]["amount"],
+            "Decimal(38, 2)"
+        );
+        resolver.apply_config_event(upsert("NotAType(")).await;
+        assert!(rx.changed().await.is_ok());
+        assert_eq!(
+            rx.borrow_and_update().columns["public.t"]["amount"],
+            "Decimal(38, 2)",
+            "malformed update keeps last accepted override"
+        );
+        assert_eq!(resolver.rejections(), 1);
+        // Explicit DELETE clears; retention applies to bad updates only
+        resolver
+            .apply_config_event(ConfigEvent::ColumnRemoved {
+                qname: "public.t".into(),
+                attname: "amount".into(),
+            })
+            .await;
+        assert!(rx.changed().await.is_ok());
+        assert!(!rx.borrow_and_update().columns.contains_key("public.t"));
+        assert_eq!(resolver.rejections(), 0, "gauge clears with the bad row");
     }
 
     #[tokio::test]

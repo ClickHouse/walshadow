@@ -2125,14 +2125,11 @@ impl RecordSink for BufferingDecoderSink {
             if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
                 return Ok(());
             }
-            let rfn = match record.parsed.blocks.first() {
-                Some(b) => b.header.location.rel,
-                None => {
-                    self.stats
-                        .skipped_no_block
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(());
-                }
+            let Some(rfn) = record.parsed.blocks.first().map(|b| b.header.location.rel) else {
+                self.stats
+                    .skipped_no_block
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
             };
             // `decode_parent` set only for the first record (holds the replay
             // gate): `catalog.gate` wraps `relation_at`, `decode` the parse.
@@ -2296,14 +2293,13 @@ fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<T
     if new.columns.len() < 3 {
         return None;
     }
-    let value_id = match new.columns[0].as_ref()? {
-        ColumnValue::Oid(v) => *v,
-        _ => return None,
+    let &ColumnValue::Oid(value_id) = new.columns[0].as_ref()? else {
+        return None;
     };
-    let chunk_seq = match new.columns[1].as_ref()? {
-        ColumnValue::Int4(v) => *v as u32,
-        _ => return None,
+    let &ColumnValue::Int4(chunk_seq) = new.columns[1].as_ref()? else {
+        return None;
     };
+    let chunk_seq = chunk_seq as u32;
     let chunk_data = match new.columns[2].take()? {
         ColumnValue::Bytea(b) => b,
         // Text-typed toast chunk: re-encode to bytes (not a normal flow)

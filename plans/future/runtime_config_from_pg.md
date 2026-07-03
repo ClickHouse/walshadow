@@ -15,9 +15,6 @@ This document covers:
 - **net-new knobs** with no runtime path (`engine`, `order_by`, `exclude`,
   `ch_settings`, `sample_rate`, and the TOML-only `signal_prefix` /
   `admin_database`)
-- **wiring `ResolvedConfig::columns` into the emitted projection** (the
-  `config_column` overlay is captured + WAL-tracked; the projection does not
-  consume it)
 - **degraded-mode fallback** when the WAL pump is blocked and overlay freshness
   can't be guaranteed
 - **observability** for the layered resolver: per-resolved-key metric with a
@@ -242,18 +239,6 @@ rebuilds `TablePlan`. Non-shape keys take effect on the next subscriber-side
 snapshot read. Reroutes that can't be done safely mid-stream (`target` rename on a
 streaming rfn) are rejected at merge with an explanatory metric.
 
-## Column-type projection wiring
-
-The `config_column` overlay is seeded, WAL-tracked, and merged into
-`ResolvedConfig::columns`, but the projection does not consume it: `interpret`
-populates a `ColumnMapping` with `src_attnum: 0`. Wiring it into the emitted
-projection needs source-attname→attnum resolution (the overlay keys on name; the
-projection keys on attnum) and a `TablePlan` rebuild on change, gated by the same
-epoch bump the apply fires for `Column*` events. `target_type` drives a CAST in the projection,
-validated against CH types at merge (reject precision-losing casts, e.g.
-`numeric(38,0)` → `Float32`). `exclude` (above) drops the column from projection +
-DDL through the same rebuild.
-
 ## Degraded-mode TOML fallback
 
 WAL pump blocked, config rows unreachable (pre-flight failing, slot dropped). The
@@ -366,11 +351,6 @@ subcommand walking the three layers.
 - **Column exclude.** Set `config_column.exclude = true` for `public.orders.notes`.
   Subsequent rows arrive on CH without the column; re-clearing restores emission,
   projection rebuilds after the in-flight rfn drain
-- **Target-type override.** Source column `numeric(38,0)` default-maps to
-  `Decimal(38,0)`. Operator sets `config_column.target_type = 'Int128'`. Resolver
-  validates representability, the rfn drain gate fires, post-config rows arrive cast
-  to `Int128`. Resolver rejects `target_type = 'Float32'` (precision loss) at merge,
-  keeps the prior value
 - **CH settings passthrough.** Set `config_table.ch_settings = '{"max_insert_threads":4}'`
   for one table. Inserts for that table carry the SETTINGS clause; other tables
   unaffected; global default merges with table-scoped under narrow-wins

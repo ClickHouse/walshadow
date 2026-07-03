@@ -697,14 +697,15 @@ async fn build_pipeline_inner(
     let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone(), config_rx.clone())
         .await
         .expect("ddl applicator init")
-        .with_invalidation_epoch(inv_epoch.clone());
+        .with_invalidation_epoch(inv_epoch.clone())
+        .with_resolver(config_resolver.clone());
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
     // COPY backfiller (`initial_load='copy'` opt-ins): own source SQL session +
     // CH tail per backfill, resume ledger beside the spill dir (mirrors
     // bin/stream.rs when `[runtime_config] schema` is set).
-    let backfiller = match ddl.as_ref().and_then(|d| d.config_schema.as_ref()) {
-        Some(_) => Some(Arc::new(
+    let backfiller = if ddl.as_ref().is_some_and(|d| d.config_schema.is_some()) {
+        Some(Arc::new(
             walshadow::copy_backfill::CopyBackfiller::new(
                 pgcfg.clone(),
                 emitter_cfg.clone(),
@@ -712,10 +713,12 @@ async fn build_pipeline_inner(
                 stats.clone(),
                 catalog.clone(),
                 &spill_dir,
+                Some(config_rx.clone()),
             )
             .await,
-        )),
-        None => None,
+        ))
+    } else {
+        None
     };
     let pcfg = PipelineConfig {
         emitter: emitter_cfg,

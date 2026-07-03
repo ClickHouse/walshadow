@@ -2,7 +2,7 @@
 //!
 //! | event | CH SQL |
 //! |---|---|
-//! | `Added` | `CREATE TABLE IF NOT EXISTS …` (only when namespace `auto_create = true`) |
+//! | `Added` | `CREATE TABLE IF NOT EXISTS …` (namespace `auto_create = true`; a mapped rel re-creates its dest when strategy = drop) |
 //! | `Changed.added_columns` | `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` per column in attnum order |
 //! | `Changed.renamed_columns` | `ALTER TABLE … RENAME COLUMN IF EXISTS … TO …` first |
 //! | `Changed.dropped_columns` | `ALTER TABLE … DROP COLUMN IF EXISTS …` |
@@ -33,7 +33,7 @@ use crate::ch_emitter::{
     TableMapping, connect_client, drain_to_end_of_stream, is_retryable, quote_ident,
     reconnect_if_idle,
 };
-use crate::config::ResolvedConfig;
+use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::shadow_catalog::{RelDescriptor, SchemaDiff, SchemaEvent};
 use crate::type_bridge::{self, ResolvedColumn};
 
@@ -156,6 +156,12 @@ pub struct DdlApplicator {
     /// so a worker whose refresh consumed the record-time bump drops its
     /// pre-apply snapshot
     invalidation_epoch: Option<Arc<AtomicU64>>,
+    /// Owner of runtime-derived mapping state. Set: auto-created mappings,
+    /// diff folds, and DROP forgets record into the resolver so the
+    /// republish full-swap preserves them. Unset (bootstrap drain, tests
+    /// without a resolver): mutate the live handle directly — no republish
+    /// runs in those contexts, so nothing clobbers the write.
+    resolver: Option<Arc<ConfigResolver>>,
     pub stats: DdlStats,
 }
 
@@ -188,6 +194,7 @@ impl DdlApplicator {
             query_timeout: emitter_cfg.insert_timeout,
             last_used: std::time::Instant::now(),
             invalidation_epoch: None,
+            resolver: None,
             stats: DdlStats::default(),
         })
     }
@@ -196,6 +203,13 @@ impl DdlApplicator {
     /// bumps (bootstrap drain, tests without a decode pool)
     pub fn with_invalidation_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
         self.invalidation_epoch = Some(epoch);
+        self
+    }
+
+    /// Route mapping writes through the resolver so they survive its
+    /// republish full-swap (the [config.md] "Known limitation" clobber).
+    pub fn with_resolver(mut self, resolver: Arc<ConfigResolver>) -> Self {
+        self.resolver = Some(resolver);
         self
     }
 
@@ -233,12 +247,24 @@ impl DdlApplicator {
     }
 
     async fn apply_added(&mut self, desc: &RelDescriptor) -> Result<(), EmitterError> {
-        // Pre-declared mapping wins: dest is operator-managed, skip auto-create
-        if self
-            .mapping_target(desc.qualified_name.as_ref())
-            .await
-            .is_some()
-        {
+        // Pre-declared mapping wins: dest is operator-managed, skip
+        // auto-create. Exception: strategy=drop hands dest lifecycle to
+        // source DDL, so a CREATE after our DROP re-creates the dest from
+        // the mapping (its columns are the emitter's INSERT contract);
+        // IF NOT EXISTS no-ops when the dest still stands
+        if let Some(m) = self.mapping_for(desc.qualified_name.as_ref()).await {
+            if self.config.drop_strategy_for(&desc.namespace_name) == DropTableStrategy::Drop {
+                let sql = render_create_table_from_mapping(desc, &m, self.config.soft_delete);
+                self.execute(&sql).await?;
+                self.stats.creates_applied += 1;
+            } else {
+                self.stats.skipped += 1;
+            }
+            return Ok(());
+        }
+        // Operator opt-out (`replicate=false`) beats namespace auto_create:
+        // no CH mirror, no mapping
+        if self.is_excluded(desc.qualified_name.as_ref()).await {
             self.stats.skipped += 1;
             return Ok(());
         }
@@ -256,12 +282,9 @@ impl DdlApplicator {
             .config
             .target_database_for(&desc.namespace_name)
             .to_owned();
-        let sql = match render_create_table(desc, &target_db, self.config.soft_delete)? {
-            Some(s) => s,
-            None => {
-                self.stats.skipped += 1;
-                return Ok(());
-            }
+        let Some(sql) = render_create_table(desc, &target_db, self.config.soft_delete)? else {
+            self.stats.skipped += 1;
+            return Ok(());
         };
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
@@ -270,11 +293,8 @@ impl DdlApplicator {
         let target = format!("{}.{}", sql_ident(&target_db), sql_ident(&desc.name));
         let columns = derive_columns_for_mapping(desc);
         let mapping = TableMapping { target, columns };
-        {
-            let mut m = self.mapping.write().await;
-            m.insert(desc.qualified_name.as_ref().to_owned(), mapping);
-        }
-        bump_mapping_epoch(self.invalidation_epoch.as_ref());
+        self.register_mapping(desc.qualified_name.as_ref(), mapping)
+            .await;
         Ok(())
     }
 
@@ -312,14 +332,11 @@ impl DdlApplicator {
         diff: &SchemaDiff,
     ) -> Result<(), EmitterError> {
         let key = new.qualified_name.as_ref().to_owned();
-        let target = match self.mapping_target(&key).await {
-            Some(t) => t,
-            None => {
-                // No target, can't ALTER; `Added` handles the
-                // not-yet-learned case
-                self.stats.skipped += 1;
-                return Ok(());
-            }
+        let Some(target) = self.mapping_target(&key).await else {
+            // No target, can't ALTER; `Added` handles the
+            // not-yet-learned case
+            self.stats.skipped += 1;
+            return Ok(());
         };
         // RENAME before ADD/DROP so position-matched renames don't trip
         // a later diff into a drop+add pair
@@ -357,13 +374,10 @@ impl DdlApplicator {
                     pk_attnums: Some(ref nums),
                 } if nums.contains(&att.attnum)
             );
-            let resolved = match type_bridge::map(att, pk_member) {
-                Ok(r) => r,
-                Err(type_bridge::BridgeError::UnsupportedType { .. }) => {
-                    // Unbridged type; operator TOML override is the recovery path
-                    self.stats.skipped += 1;
-                    continue;
-                }
+            let Ok(resolved) = type_bridge::map(att, pk_member) else {
+                // Unbridged type; operator TOML override is the recovery path
+                self.stats.skipped += 1;
+                continue;
             };
             let sql = render_add_column(&target, &att.name, &resolved);
             self.execute(&sql).await?;
@@ -404,17 +418,14 @@ impl DdlApplicator {
         // rows against the new shape without TOML edits; operator-pinned
         // `target_name` overrides survive (only touch entries the
         // applicator could have produced, by src_attnum match)
-        mutate_mapping_for_diff(&self.mapping, self.invalidation_epoch.as_ref(), new, diff).await;
+        self.fold_mapping_diff(new, diff).await;
         Ok(())
     }
 
     async fn apply_dropped(&mut self, qualified_name: &str) -> Result<(), EmitterError> {
-        let target = match self.mapping_target(qualified_name).await {
-            Some(t) => t,
-            None => {
-                self.stats.skipped += 1;
-                return Ok(());
-            }
+        let Some(target) = self.mapping_target(qualified_name).await else {
+            self.stats.skipped += 1;
+            return Ok(());
         };
         // Namespace is prefix of `namespace.name` (see
         // `RelDescriptor::build_qualified_name`)
@@ -444,12 +455,12 @@ impl DdlApplicator {
                 let sql = format!("DROP TABLE IF EXISTS {target}");
                 self.execute(&sql).await?;
                 self.stats.drops_applied += 1;
-                // Forget the auto-mapped entry so a future Added re-derives columns
-                {
-                    let mut m = self.mapping.write().await;
-                    m.remove(qualified_name);
-                }
-                bump_mapping_epoch(self.invalidation_epoch.as_ref());
+                // Forget the runtime-derived entry so a future Added
+                // re-derives columns. A TOML-pinned mapping stays (operator
+                // owns it; republish would resurrect it anyway) — a source
+                // re-create restores its dest via apply_added's
+                // strategy=drop path
+                self.forget_mapping(qualified_name).await;
                 Ok(())
             }
         }
@@ -471,6 +482,55 @@ impl DdlApplicator {
         m.get(qualified_name).map(|t| t.target.clone())
     }
 
+    async fn mapping_for(&mut self, qualified_name: &str) -> Option<TableMapping> {
+        self.mapping.read().await.get(qualified_name).cloned()
+    }
+
+    /// Operator opt-out (`replicate=false`); nothing excluded without a
+    /// resolver. `&mut self` like siblings: `&self` across await would
+    /// demand `DdlApplicator: Sync`, blocked by chc client's raw pointer
+    async fn is_excluded(&mut self, qualified_name: &str) -> bool {
+        if let Some(r) = &self.resolver {
+            r.is_excluded(qualified_name).await
+        } else {
+            false
+        }
+    }
+
+    /// Mapping writes route per `resolver` field: resolver-owned entries
+    /// survive the republish full-swap (republish writes the live handle +
+    /// bumps the epoch); resolver-less path mutates the live handle and
+    /// bumps directly
+    async fn register_mapping(&mut self, qualified_name: &str, mapping: TableMapping) {
+        if let Some(r) = &self.resolver {
+            r.register_derived_mapping(qualified_name, mapping).await;
+        } else {
+            self.mapping
+                .write()
+                .await
+                .insert(qualified_name.to_owned(), mapping);
+            bump_mapping_epoch(self.invalidation_epoch.as_ref());
+        }
+    }
+
+    async fn fold_mapping_diff(&mut self, new: &RelDescriptor, diff: &SchemaDiff) {
+        if let Some(r) = &self.resolver {
+            r.apply_schema_diff(new, diff).await;
+        } else {
+            mutate_mapping_for_diff(&self.mapping, self.invalidation_epoch.as_ref(), new, diff)
+                .await;
+        }
+    }
+
+    async fn forget_mapping(&mut self, qualified_name: &str) {
+        if let Some(r) = &self.resolver {
+            r.forget_derived_mapping(qualified_name).await;
+        } else {
+            self.mapping.write().await.remove(qualified_name);
+            bump_mapping_epoch(self.invalidation_epoch.as_ref());
+        }
+    }
+
     /// Run one DDL statement with the same bounded timeout +
     /// reconnect/retry as the INSERT pump. DDL applies inside the
     /// reorder barrier, so a half-open socket would otherwise park the
@@ -483,19 +543,18 @@ impl DdlApplicator {
         let mut backoff = self.retry.initial_backoff;
         reconnect_if_idle(&mut self.client, &self.conn_cfg, self.last_used).await?;
         loop {
-            let attempt_result = match tokio::time::timeout(self.query_timeout, async {
+            let attempt_result = tokio::time::timeout(self.query_timeout, async {
                 self.client.send_query(sql, None).await?;
                 drain_to_end_of_stream(&mut self.client).await
             })
             .await
-            {
-                Ok(r) => r,
-                // Park past the cap (half-open socket) must not pin the
-                // barrier forever; surface a retryable timeout
-                Err(_elapsed) => Err(EmitterError::Timeout {
+            // Park past the cap (half-open socket) must not pin the
+            // barrier forever; surface a retryable timeout
+            .unwrap_or_else(|_| {
+                Err(EmitterError::Timeout {
                     secs: self.query_timeout.as_secs(),
-                }),
-            };
+                })
+            });
             match attempt_result {
                 Ok(()) => {
                     self.last_used = std::time::Instant::now();
@@ -545,43 +604,53 @@ async fn mutate_mapping_for_diff(
         let Some(target_mapping) = m.get_mut(&key) else {
             return;
         };
-        for (attnum, old_name, new_name) in &diff.renamed_columns {
-            for c in &mut target_mapping.columns {
-                if c.src_attnum == *attnum && &c.target_name == old_name {
-                    c.target_name = new_name.clone();
-                }
-            }
-        }
-        for attnum in &diff.dropped_columns {
-            target_mapping.columns.retain(|c| c.src_attnum != *attnum);
-        }
-        // Skip adds the operator already pre-declared
-        for att in &diff.added_columns {
-            if target_mapping
-                .columns
-                .iter()
-                .any(|c| c.src_attnum == att.attnum)
-            {
-                continue;
-            }
-            let pk_member = matches!(
-                new.replident,
-                crate::shadow_catalog::ReplIdent::Default {
-                    pk_attnums: Some(ref nums),
-                } if nums.contains(&att.attnum)
-            );
-            let resolved = match type_bridge::map(att, pk_member) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            target_mapping.columns.push(ColumnMapping {
-                src_attnum: att.attnum,
-                target_name: att.name.clone(),
-                target_type: resolved.ch_type,
-            });
-        }
+        fold_diff_into_mapping(target_mapping, new, diff);
     }
     bump_mapping_epoch(epoch);
+}
+
+/// The fold itself, shared with `ConfigResolver::apply_schema_diff` (the
+/// resolver-owned path, where the folded mapping must live in a layer the
+/// republish full-swap rebuilds from).
+pub(crate) fn fold_diff_into_mapping(
+    target_mapping: &mut TableMapping,
+    new: &RelDescriptor,
+    diff: &SchemaDiff,
+) {
+    for (attnum, old_name, new_name) in &diff.renamed_columns {
+        for c in &mut target_mapping.columns {
+            if c.src_attnum == *attnum && &c.target_name == old_name {
+                c.target_name = new_name.clone();
+            }
+        }
+    }
+    for attnum in &diff.dropped_columns {
+        target_mapping.columns.retain(|c| c.src_attnum != *attnum);
+    }
+    // Skip adds the operator already pre-declared
+    for att in &diff.added_columns {
+        if target_mapping
+            .columns
+            .iter()
+            .any(|c| c.src_attnum == att.attnum)
+        {
+            continue;
+        }
+        let pk_member = matches!(
+            new.replident,
+            crate::shadow_catalog::ReplIdent::Default {
+                pk_attnums: Some(ref nums),
+            } if nums.contains(&att.attnum)
+        );
+        let Ok(resolved) = type_bridge::map(att, pk_member) else {
+            continue;
+        };
+        target_mapping.columns.push(ColumnMapping {
+            src_attnum: att.attnum,
+            target_name: att.name.clone(),
+            target_type: resolved.ch_type,
+        });
+    }
 }
 
 /// `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <n> <ty> [DEFAULT <expr>]`.
@@ -599,6 +668,46 @@ pub fn render_add_column(target: &str, name: &str, resolved: &ResolvedColumn) ->
     s
 }
 
+/// PK / replica-identity key attnums driving `ORDER BY` + non-null forcing
+fn replident_key_attnums(desc: &RelDescriptor) -> Vec<i16> {
+    match &desc.replident {
+        crate::shadow_catalog::ReplIdent::Default {
+            pk_attnums: Some(n),
+        } => n.clone(),
+        crate::shadow_catalog::ReplIdent::UsingIndex { key_attnums, .. } => key_attnums.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Shared CREATE tail: synthetic columns (mirror `TablePlan::build`),
+/// engine, `ORDER BY` key names (else `_lsn`)
+fn render_create_sql(
+    target: &str,
+    mut col_defs: Vec<String>,
+    key_names: Vec<String>,
+    soft_delete: bool,
+) -> String {
+    col_defs.push("`_lsn` UInt64".into());
+    col_defs.push("`_xid` UInt32".into());
+    col_defs.push("`_commit_ts` DateTime64(6, 'UTC')".into());
+    col_defs.push("`_is_deleted` Bool".into());
+    // soft_delete keeps `_is_deleted` out of the engine args
+    let engine_args = if soft_delete {
+        "`_lsn`"
+    } else {
+        "`_lsn`, `_is_deleted`"
+    };
+    let order_by = if key_names.is_empty() {
+        "(`_lsn`)".to_string()
+    } else {
+        format!("({})", key_names.join(", "))
+    };
+    format!(
+        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree({engine_args})\nORDER BY {order_by}",
+        col_defs.join(",\n  ")
+    )
+}
+
 /// `CREATE TABLE IF NOT EXISTS` for an autodiscovered relation. `None`
 /// when a column's type can't be bridged; caller logs + skips.
 pub fn render_create_table(
@@ -611,26 +720,17 @@ pub fn render_create_table(
         quote_ident(target_database),
         quote_ident(&desc.name)
     );
-    let pk_attnums: Vec<i16> = match &desc.replident {
-        crate::shadow_catalog::ReplIdent::Default {
-            pk_attnums: Some(n),
-        } => n.clone(),
-        crate::shadow_catalog::ReplIdent::UsingIndex { key_attnums, .. } => key_attnums.clone(),
-        _ => Vec::new(),
-    };
+    let pk_attnums = replident_key_attnums(desc);
     let mut col_defs: Vec<String> = Vec::with_capacity(desc.attributes.len() + 4);
     for att in &desc.attributes {
         if att.dropped {
             continue;
         }
         let pk_member = pk_attnums.contains(&att.attnum);
-        let resolved = match type_bridge::map(att, pk_member) {
-            Ok(r) => r,
-            Err(type_bridge::BridgeError::UnsupportedType { .. }) => {
-                // Skip the half-renderable CREATE; operator installs a
-                // TOML override and re-triggers via Added on next refetch
-                return Ok(None);
-            }
+        let Ok(resolved) = type_bridge::map(att, pk_member) else {
+            // Skip the half-renderable CREATE; operator installs a
+            // TOML override and re-triggers via Added on next refetch
+            return Ok(None);
         };
         let mut def = format!("{} {}", quote_ident(&att.name), resolved.ch_type);
         if let Some(d) = resolved.default_sql {
@@ -639,44 +739,50 @@ pub fn render_create_table(
         }
         col_defs.push(def);
     }
-    // Synthetic columns mirror `TablePlan::build`
-    col_defs.push("`_lsn` UInt64".into());
-    col_defs.push("`_xid` UInt32".into());
-    col_defs.push("`_commit_ts` DateTime64(6, 'UTC')".into());
-    col_defs.push("`_is_deleted` Bool".into());
+    let key_names: Vec<String> = pk_attnums
+        .iter()
+        .filter_map(|a| {
+            desc.attributes
+                .iter()
+                .find(|att| att.attnum == *a && !att.dropped)
+                .map(|att| quote_ident(&att.name))
+        })
+        .collect();
+    Ok(Some(render_create_sql(
+        &target,
+        col_defs,
+        key_names,
+        soft_delete,
+    )))
+}
 
-    // soft_delete keeps `_is_deleted` out of the engine args
-    let engine_args = if soft_delete {
-        "`_lsn`"
-    } else {
-        "`_lsn`, `_is_deleted`"
-    };
-
-    // ORDER BY: prefer PK columns, else `_lsn`
-    let order_by = if pk_attnums.is_empty() {
-        "(`_lsn`)".to_string()
-    } else {
-        let names: Vec<String> = pk_attnums
-            .iter()
-            .filter_map(|a| {
-                desc.attributes
-                    .iter()
-                    .find(|att| att.attnum == *a && !att.dropped)
-                    .map(|att| quote_ident(&att.name))
-            })
-            .collect();
-        if names.is_empty() {
-            "(`_lsn`)".to_string()
-        } else {
-            format!("({})", names.join(", "))
-        }
-    };
-
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree({engine_args})\nORDER BY {order_by}",
-        col_defs.join(",\n  ")
-    );
-    Ok(Some(sql))
+/// `CREATE TABLE IF NOT EXISTS` rendered from an existing mapping — the
+/// re-create path for a mapped dest dropped under strategy=drop. Columns
+/// come from the mapping (the emitter's INSERT contract), not the
+/// descriptor; `ORDER BY` resolves the descriptor's key attnums through
+/// the mapping, skipping Nullable targets (CH rejects nullable sort
+/// keys), else `_lsn`
+pub fn render_create_table_from_mapping(
+    desc: &RelDescriptor,
+    mapping: &TableMapping,
+    soft_delete: bool,
+) -> String {
+    let col_defs: Vec<String> = mapping
+        .columns
+        .iter()
+        .map(|c| format!("{} {}", quote_ident(&c.target_name), c.target_type))
+        .collect();
+    let key_names: Vec<String> = replident_key_attnums(desc)
+        .iter()
+        .filter_map(|a| {
+            mapping
+                .columns
+                .iter()
+                .find(|c| c.src_attnum == *a && !c.target_type.starts_with("Nullable"))
+                .map(|c| quote_ident(&c.target_name))
+        })
+        .collect();
+    render_create_sql(&mapping.target, col_defs, key_names, soft_delete)
 }
 
 /// CH identifier; alias of `quote_ident` for callers building qualified
@@ -688,22 +794,15 @@ pub fn sql_ident(name: &str) -> String {
 /// Default `Vec<ColumnMapping>` for an auto-discovered table; operator
 /// TOML overrides win the next SIGHUP.
 pub fn derive_columns_for_mapping(desc: &RelDescriptor) -> Vec<ColumnMapping> {
-    let pk_attnums: Vec<i16> = match &desc.replident {
-        crate::shadow_catalog::ReplIdent::Default {
-            pk_attnums: Some(n),
-        } => n.clone(),
-        crate::shadow_catalog::ReplIdent::UsingIndex { key_attnums, .. } => key_attnums.clone(),
-        _ => Vec::new(),
-    };
+    let pk_attnums = replident_key_attnums(desc);
     let mut out = Vec::with_capacity(desc.attributes.len());
     for att in &desc.attributes {
         if att.dropped {
             continue;
         }
         let pk_member = pk_attnums.contains(&att.attnum);
-        let resolved = match type_bridge::map(att, pk_member) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let Ok(resolved) = type_bridge::map(att, pk_member) else {
+            continue;
         };
         out.push(ColumnMapping {
             src_attnum: att.attnum,
@@ -954,6 +1053,58 @@ mod tests {
             sql.contains("`ship_at` Nullable(DateTime64(3, 'UTC'))"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn render_create_table_from_mapping_uses_pinned_shape() {
+        let d = desc(
+            "orders",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "body", TEXTOID, false, None),
+            ],
+            Some(vec![1]),
+        );
+        let m = TableMapping {
+            target: "warehouse.orders_pinned".into(),
+            columns: vec![
+                ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "order_id".into(),
+                    target_type: "Int64".into(),
+                },
+                ColumnMapping {
+                    src_attnum: 2,
+                    target_name: "payload".into(),
+                    target_type: "Nullable(String)".into(),
+                },
+            ],
+        };
+        let sql = render_create_table_from_mapping(&d, &m, false);
+        assert!(
+            sql.contains("CREATE TABLE IF NOT EXISTS warehouse.orders_pinned"),
+            "{sql}"
+        );
+        assert!(sql.contains("`order_id` Int64"), "{sql}");
+        assert!(sql.contains("`payload` Nullable(String)"), "{sql}");
+        assert!(sql.contains("`_lsn` UInt64"), "{sql}");
+        // ORDER BY resolves the descriptor's pk attnum to the mapped name
+        assert!(sql.ends_with("ORDER BY (`order_id`)"), "{sql}");
+    }
+
+    #[test]
+    fn render_create_table_from_mapping_nullable_key_falls_back_to_lsn() {
+        let d = desc("t", vec![att(1, "id", INT4OID, false, None)], Some(vec![1]));
+        let m = TableMapping {
+            target: "db.t".into(),
+            columns: vec![ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Nullable(Int32)".into(),
+            }],
+        };
+        let sql = render_create_table_from_mapping(&d, &m, false);
+        assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
     }
 
     #[test]

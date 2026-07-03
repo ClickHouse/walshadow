@@ -450,9 +450,8 @@ fn decode_multi_insert(
         });
     }
 
-    let block = match record.blocks.first() {
-        Some(b) => b,
-        None => return Ok(SmallVec::new()),
+    let Some(block) = record.blocks.first() else {
+        return Ok(SmallVec::new());
     };
     let data = &block.data;
     let mut cursor = 0usize;
@@ -509,20 +508,17 @@ fn decode_insert(
     xid: u32,
     rel: &RelDescriptor,
 ) -> Result<DecodedHeap, DecodeError> {
-    let block = match record.blocks.first() {
-        Some(b) => b,
-        None => {
-            // PG always references target page; emit empty new rather than
-            // fail the stream
-            return Ok(DecodedHeap {
-                rfn,
-                xid,
-                source_lsn,
-                op: HeapOp::Insert,
-                new: None,
-                old: None,
-            });
-        }
+    let Some(block) = record.blocks.first() else {
+        // PG always references target page; emit empty new rather than
+        // fail the stream
+        return Ok(DecodedHeap {
+            rfn,
+            xid,
+            source_lsn,
+            op: HeapOp::Insert,
+            new: None,
+            old: None,
+        });
     };
     let new = decode_new_tuple_block(&block.data, 0, rel)?;
     Ok(DecodedHeap {
@@ -556,26 +552,25 @@ fn decode_update(
     let has_old_tuple = flags & XLH_UPDATE_CONTAINS_OLD_TUPLE != 0;
     let has_old_key = flags & XLH_UPDATE_CONTAINS_OLD_KEY != 0;
 
-    let new = match record.blocks.first() {
-        Some(b) => {
-            let mut cursor = 0;
-            let prefixlen = if has_prefix {
-                read_u16(&b.data, &mut cursor)? as usize
-            } else {
-                0
-            };
-            let suffixlen = if has_suffix {
-                read_u16(&b.data, &mut cursor)? as usize
-            } else {
-                0
-            };
-            let mut t = decode_tuple_payload(&b.data, cursor, rel, prefixlen, suffixlen)?;
-            if has_prefix || has_suffix {
-                t.partial = true;
-            }
-            Some(t)
+    let new = if let Some(b) = record.blocks.first() {
+        let mut cursor = 0;
+        let prefixlen = if has_prefix {
+            read_u16(&b.data, &mut cursor)? as usize
+        } else {
+            0
+        };
+        let suffixlen = if has_suffix {
+            read_u16(&b.data, &mut cursor)? as usize
+        } else {
+            0
+        };
+        let mut t = decode_tuple_payload(&b.data, cursor, rel, prefixlen, suffixlen)?;
+        if has_prefix || has_suffix {
+            t.partial = true;
         }
-        None => None,
+        Some(t)
+    } else {
+        None
     };
 
     let old = if has_old_tuple || has_old_key {
@@ -1185,13 +1180,12 @@ fn decode_varlena(
         let raw_len = (tcinfo & VARLENA_EXTSIZE_MASK) as usize;
         let method = (tcinfo >> VARLENA_EXTSIZE_BITS) as u8;
         let body = &buf[abs + 8..abs + total];
-        let v = match decompress_varlena(method, body, raw_len) {
-            Some(out) => varlena_to_value(att.type_oid, Cow::Owned(out)),
-            None => ColumnValue::Unsupported {
+        let v = decompress_varlena(method, body, raw_len)
+            .map(|out| varlena_to_value(att.type_oid, Cow::Owned(out)))
+            .unwrap_or_else(|| ColumnValue::Unsupported {
                 type_oid: att.type_oid,
                 raw: buf[abs..abs + total].to_vec(),
-            },
-        };
+            });
         return Ok((v, total));
     }
     let body = &buf[abs + 4..abs + total];
@@ -1256,10 +1250,9 @@ fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Decode
         });
     }
     let body = &buf[abs..end];
-    let value = match std::str::from_utf8(body) {
-        Ok(s) => ColumnValue::Text(s.to_owned()),
-        Err(_) => ColumnValue::Bytea(body.to_vec()),
-    };
+    let value = std::str::from_utf8(body)
+        .map(|s| ColumnValue::Text(s.to_owned()))
+        .unwrap_or_else(|_| ColumnValue::Bytea(body.to_vec()));
     Ok((value, (end - abs) + 1)) // include trailing NUL
 }
 

@@ -131,6 +131,18 @@ struct Table {
     deadline: Option<Instant>,
 }
 
+/// Per-message routing state shared by every row of one `BatcherMsg`.
+struct RowCtx<'a> {
+    cfg: BatcherConfig,
+    out: &'a async_channel::Sender<InsertBatch>,
+    alloc: Allocator,
+    epoch: u64,
+    /// Live snapshot for `config_column` overrides at plan build; `None`
+    /// when the overlay is off.
+    resolved: Option<&'a ResolvedConfig>,
+    stats: &'a EmitterStats,
+}
+
 /// Spawn the batcher hub. `msg_rx` is one FIFO channel so a flush seals
 /// every row enqueued before it; `out` carries sealed batches to inserters.
 pub fn spawn(
@@ -145,7 +157,8 @@ pub fn spawn(
     tokio::spawn(async move {
         let mut tables: HashMap<String, Table> = HashMap::new();
         let mut epoch: u64 = 0;
-        let mut live = effective_cfg(&cfg, config_rx.as_ref());
+        let mut snap = snapshot(config_rx.as_ref());
+        let mut live = effective_cfg(&cfg, snap.as_deref());
         let mut ticker = tokio::time::interval(live.flush_timeout);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let stats = stats.as_ref();
@@ -153,15 +166,19 @@ pub fn spawn(
             tokio::select! {
                 msg = msg_rx.recv() => match msg {
                     Some(BatcherMsg::Row(r)) => {
-                        live = effective_cfg(&cfg, config_rx.as_ref());
-                        if let Err(e) = handle_row(&mut tables, &live, &out, alloc, epoch, r, stats).await {
+                        snap = snapshot(config_rx.as_ref());
+                        live = effective_cfg(&cfg, snap.as_deref());
+                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, resolved: snap.as_deref(), stats };
+                        if let Err(e) = handle_row(&mut tables, &ctx, r).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
                     }
                     Some(BatcherMsg::Rows(rows)) => {
-                        live = effective_cfg(&cfg, config_rx.as_ref());
-                        if let Err(e) = handle_rows(&mut tables, &live, &out, alloc, epoch, rows, stats).await {
+                        snap = snapshot(config_rx.as_ref());
+                        live = effective_cfg(&cfg, snap.as_deref());
+                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, resolved: snap.as_deref(), stats };
+                        if let Err(e) = handle_rows(&mut tables, &ctx, rows).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
@@ -190,7 +207,8 @@ pub fn spawn(
                 // Live emitter-knob change: re-arm the deadline ticker to the
                 // new flush_timeout. Budgets are re-read per message below.
                 _ = config_changed(&mut config_rx) => {
-                    live = effective_cfg(&cfg, config_rx.as_ref());
+                    snap = snapshot(config_rx.as_ref());
+                    live = effective_cfg(&cfg, snap.as_deref());
                     ticker = tokio::time::interval(live.flush_timeout);
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 }
@@ -199,39 +217,39 @@ pub fn spawn(
     })
 }
 
+/// Latest resolved snapshot off the watch, `None` when the overlay is off.
+/// One `Arc` clone per message; also feeds the per-table column overrides at
+/// plan build.
+fn snapshot(rx: Option<&watch::Receiver<Arc<ResolvedConfig>>>) -> Option<Arc<ResolvedConfig>> {
+    rx.map(|rx| rx.borrow().clone())
+}
+
 /// Effective batch knobs: the live resolved snapshot when the overlay is wired,
 /// else the boot config. A zero live `flush_timeout` falls back to the pipeline
 /// default so a cold table can't pin the watermark.
-fn effective_cfg(
-    boot: &BatcherConfig,
-    rx: Option<&watch::Receiver<Arc<ResolvedConfig>>>,
-) -> BatcherConfig {
-    match rx {
-        Some(rx) => {
-            let r = rx.borrow();
-            let flush_timeout = if r.flush_timeout.is_zero() {
-                DEFAULT_PIPELINE_FLUSH
-            } else {
-                r.flush_timeout
-            };
-            BatcherConfig {
-                row_budget: r.row_budget,
-                byte_budget: r.byte_budget,
-                flush_timeout,
-            }
-        }
-        None => *boot,
+fn effective_cfg(boot: &BatcherConfig, resolved: Option<&ResolvedConfig>) -> BatcherConfig {
+    let Some(r) = resolved else {
+        return *boot;
+    };
+    let flush_timeout = if r.flush_timeout.is_zero() {
+        DEFAULT_PIPELINE_FLUSH
+    } else {
+        r.flush_timeout
+    };
+    BatcherConfig {
+        row_budget: r.row_budget,
+        byte_budget: r.byte_budget,
+        flush_timeout,
     }
 }
 
 /// Resolve once the config watch republishes; parks forever when the overlay
 /// is off, so the select branch stays inert.
 async fn config_changed(rx: &mut Option<watch::Receiver<Arc<ResolvedConfig>>>) {
-    match rx {
-        Some(rx) => {
-            let _ = rx.changed().await;
-        }
-        None => std::future::pending::<()>().await,
+    if let Some(rx) = rx {
+        let _ = rx.changed().await;
+    } else {
+        std::future::pending::<()>().await
     }
 }
 
@@ -239,33 +257,32 @@ async fn config_changed(rx: &mut Option<watch::Receiver<Arc<ResolvedConfig>>>) {
 /// hop, not the coalescing; budget/deadline trips behave per-row.
 async fn handle_rows(
     tables: &mut HashMap<String, Table>,
-    cfg: &BatcherConfig,
-    out: &async_channel::Sender<InsertBatch>,
-    alloc: Allocator,
-    epoch: u64,
+    ctx: &RowCtx<'_>,
     rows: Vec<RoutedRow>,
-    stats: &EmitterStats,
 ) -> Result<(), String> {
     for row in rows {
-        handle_row(tables, cfg, out, alloc, epoch, row, stats).await?;
+        handle_row(tables, ctx, row).await?;
     }
     Ok(())
 }
 
 async fn handle_row(
     tables: &mut HashMap<String, Table>,
-    cfg: &BatcherConfig,
-    out: &async_channel::Sender<InsertBatch>,
-    alloc: Allocator,
-    epoch: u64,
+    ctx: &RowCtx<'_>,
     row: RoutedRow,
-    stats: &EmitterStats,
 ) -> Result<(), String> {
-    stats.insertbatch_rows_in.fetch_add(1, Ordering::Relaxed);
+    ctx.stats
+        .insertbatch_rows_in
+        .fetch_add(1, Ordering::Relaxed);
     let key = row.rel.qualified_name.as_ref();
     if !tables.contains_key(key) {
-        let plan = TablePlan::build(alloc, &row.rel, &row.mapping).map_err(|e| e.to_string())?;
-        let meta = Arc::new(BatchMeta::from_plan(&plan, key.to_owned(), epoch));
+        // Column-type overrides re-read per plan build; a `Column*` config
+        // event applies under the barrier fence, whose FlushAll cleared this
+        // plan cache, so post-apply rows rebuild against the new snapshot
+        let overrides = ctx.resolved.and_then(|rc| rc.columns.get(key));
+        let plan = TablePlan::build(ctx.alloc, &row.rel, &row.mapping, overrides)
+            .map_err(|e| e.to_string())?;
+        let meta = Arc::new(BatchMeta::from_plan(&plan, key.to_owned(), ctx.epoch));
         let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
         tables.insert(
             key.to_owned(),
@@ -293,10 +310,10 @@ async fn handle_row(
         _ => t.seq_counts.push((row.seq, 1)),
     }
     if t.deadline.is_none() {
-        t.deadline = Some(Instant::now() + cfg.flush_timeout);
+        t.deadline = Some(Instant::now() + ctx.cfg.flush_timeout);
     }
-    if t.enc.rows >= cfg.row_budget || t.enc.approx_bytes >= cfg.byte_budget {
-        emit_batch(t, out, stats).await?;
+    if t.enc.rows >= ctx.cfg.row_budget || t.enc.approx_bytes >= ctx.cfg.byte_budget {
+        emit_batch(t, ctx.out, ctx.stats).await?;
     }
     Ok(())
 }

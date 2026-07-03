@@ -39,6 +39,13 @@
 //!      for mapped rels — CH would stay a column behind
 //!      (plans/future/pinned_ddl_baseline.md).
 //!
+//! 6. `column_target_type_override_reaches_projection`
+//!    * CH dest pre-created `Decimal(38, 2)`, TOML maps the stale
+//!      `Decimal(38, 0)`, operator inserts `config_column.target_type`.
+//!    * Expect: post-override rows encode at the override's scale — the
+//!      stored `123.45` (vs a scale-0 `123`) proves the override reached
+//!      the projection (plans/config.md §Column overrides).
+//!
 //! Source-side `config_*` install runs the real `sql/runtime_config_install.sql`
 //! inside the bootstrap schema dump, so the drills double as install-script
 //! coverage (psql `\if` default-schema guard included).
@@ -630,4 +637,123 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
         )
         .expect("ch pre-alter row");
     assert_eq!(pre, "pre-alter\t1");
+}
+
+/// Drill 6: `config_column.target_type` reaches the emitted projection
+/// (plans/config.md §Column overrides). CH dest pre-created with
+/// `Decimal(38, 2)` while TOML deliberately maps the stale bridge default
+/// `Decimal(38, 0)`; the override row lands via WAL before the DML. The
+/// stored scale is the witness: an applied override encodes `123.45`, a
+/// dropped one encodes scale-0 `123`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn column_target_type_override_reaches_projection() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source_port = SOURCE_PORT + 50;
+    let shadow_port = SHADOW_PORT + 50;
+    let ch_tcp_port = CH_TCP_PORT + 50;
+    let ch_http_port = CH_HTTP_PORT + 50;
+    let walsender_port = WALSENDER_PORT + 50;
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.ledger (id bigint PRIMARY KEY, amount numeric);\n"
+    );
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+    // Operator-migrated dest type; the override is what makes the
+    // projection match it
+    ch.query(
+        "CREATE OR REPLACE TABLE walshadow_test.ledger (\
+            id Int64,\
+            amount Decimal(38, 2),\
+            _lsn UInt64,\
+            _xid UInt32,\
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+    )
+    .expect("create dest");
+
+    let mappings = vec![fx::TableMappingSpec {
+        source_table: "app.ledger".into(),
+        target_table: "walshadow_test.ledger".into(),
+        columns: vec![
+            ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Int64".into(),
+            },
+            ColumnMapping {
+                src_attnum: 2,
+                target_name: "amount".into(),
+                target_type: "Decimal(38, 0)".into(),
+            },
+        ],
+    }];
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port,
+        mappings,
+        app_name: "walshadow-config-column-override",
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    // Override commits before the DML, so the row's plan build (barrier
+    // fence flushed the cache at the config apply) sees scale 2.
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO walshadow.config_column (namespace, relname, attname, target_type) \
+             VALUES ('app', 'ledger', 'amount', 'Decimal(38, 2)')"
+                .into(),
+            "INSERT INTO app.ledger (id, amount) VALUES (1, 123.45)".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    let amount = ch
+        .query(
+            "SELECT argMax(amount, _lsn) \
+             FROM walshadow_test.ledger WHERE _is_deleted = 0 AND id = 1",
+        )
+        .expect("ch row");
+    assert_eq!(
+        amount, "123.45",
+        "override must drive the encode scale (a dropped override stores 123)"
+    );
 }

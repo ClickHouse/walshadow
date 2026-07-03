@@ -56,7 +56,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use walrus::pg::backup::{format_pg_lsn, parse_pg_lsn};
 use walrus::pg::replication::conn::PgConfig;
 
@@ -65,6 +65,7 @@ use crate::backup_backfill::{BackupRequest, PassContext, PassOutcome};
 use crate::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
 use crate::ch_emitter::{EmitterConfig, EmitterStats, MappingHandle};
 use crate::codecs::NumericKind;
+use crate::config::ResolvedConfig;
 use crate::heap_decoder::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, ColumnValue, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID,
     INT4OID, INT8OID, JSONOID, NAMEOID, NUMERICOID, OIDOID, TEXTOID, TIMEOID, TIMESTAMPOID,
@@ -499,6 +500,10 @@ pub struct CopyBackfiller {
     /// record decode.
     catalog: Arc<Mutex<ShadowCatalog>>,
     spill_dir: PathBuf,
+    /// Live resolved config for the dedicated backfill tails, so backfilled
+    /// rows encode under the same `config_column` overrides WAL-driven rows
+    /// use. `None` == boot values only.
+    config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
     inner: Mutex<Inner>,
     /// Ledger entries not yet `done` (gauge; mirrors the ledger under the lock).
     pending: AtomicU64,
@@ -515,6 +520,7 @@ impl CopyBackfiller {
         stats: Arc<EmitterStats>,
         catalog: Arc<Mutex<ShadowCatalog>>,
         spill_dir: &Path,
+        config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
     ) -> Self {
         let ledger = Ledger::load(spill_dir).await;
         let pending = AtomicU64::new(ledger.pending_count());
@@ -530,6 +536,7 @@ impl CopyBackfiller {
             stats,
             catalog,
             spill_dir: spill_dir.to_path_buf(),
+            config_rx,
             inner: Mutex::new(Inner {
                 ledger,
                 active: HashSet::new(),
@@ -764,6 +771,7 @@ impl CopyBackfiller {
             stats: self.stats.clone(),
             catalog: self.catalog.clone(),
             scratch_dir: self.spill_dir.join("backup_backfill"),
+            config_rx: self.config_rx.clone(),
         };
         let outcome = crate::backup_backfill::run_pass(&ctx, mode, reqs).await?;
         self.publish_staged(&staging, reqs).await;
@@ -1081,12 +1089,13 @@ impl CopyBackfiller {
 
         // Dedicated tail: own CH connection, own seq space, own fatal.
         let fatal = Fatal::new();
-        let (msg_tx, ack, tail) = tail::spawn(
+        let (msg_tx, ack, tail) = tail::spawn_with_config(
             &self.emitter,
             1,
             self.stats.clone(),
             Arc::new(AtomicU64::new(0)),
             fatal.clone(),
+            self.config_rx.clone(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("backfill: spawn insert tail: {e}"))?;
@@ -1124,9 +1133,10 @@ impl CopyBackfiller {
                 }
                 let mut columns: Vec<Option<ColumnValue>> = vec![None; natts];
                 for (raw, cp) in fields.into_iter().zip(&plan) {
-                    let v = match raw {
-                        None => ColumnValue::Null,
-                        Some(raw) => decode_field(cp.kind, raw).map_err(anyhow::Error::msg)?,
+                    let v = if let Some(raw) = raw {
+                        decode_field(cp.kind, raw).map_err(anyhow::Error::msg)?
+                    } else {
+                        ColumnValue::Null
                     };
                     columns[(cp.attnum - 1).max(0) as usize] = Some(v);
                 }

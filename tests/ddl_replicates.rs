@@ -383,6 +383,149 @@ async fn drop_table_strategy_drop_removes_dest() {
     );
 }
 
+/// TOML-pinned mapping under `drop_table_strategy = drop`: source
+/// create → drop → create round-trips without operator CH work. The
+/// DROP removes the CH dest but the pinned mapping stays in resolver
+/// state (republish rebuilds it from TOML), so the re-CREATE's `Added`
+/// must re-create the dest from the mapping rather than skip it as
+/// operator-managed — otherwise post-recreate rows INSERT into a
+/// missing table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_mapping_create_drop_create_recreates_dest() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    // +50, not +40: 1750x belongs to pipeline_parallel_e2e
+    let source_port = SOURCE_PORT + 50;
+    let shadow_port = SHADOW_PORT + 50;
+    let ch_tcp_port = CH_TCP_PORT + 50;
+    let ch_http_port = CH_HTTP_PORT + 50;
+    let walsender_port = WALSENDER_PORT + 50;
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(
+        &tmp,
+        "CREATE SCHEMA s15pin;\n\
+         CREATE TABLE s15pin.t (id bigint PRIMARY KEY, body text);\n",
+        source_port,
+        shadow_port,
+        walsender_port,
+    )
+    .await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+    // Operator-managed dest for the pinned mapping (custom table name so
+    // the re-create must come from the mapping, not the descriptor).
+    ch.query(
+        "CREATE OR REPLACE TABLE walshadow_test.s15pin_t (\
+            id Int64,\
+            body Nullable(String),\
+            _lsn UInt64,\
+            _xid UInt32,\
+            _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+    )
+    .expect("create dest");
+
+    let mappings = vec![fx::TableMappingSpec {
+        source_table: "s15pin.t".into(),
+        target_table: "walshadow_test.s15pin_t".into(),
+        columns: vec![
+            ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Int64".into(),
+            },
+            ColumnMapping {
+                src_attnum: 2,
+                target_name: "body".into(),
+                target_type: "Nullable(String)".into(),
+            },
+        ],
+    }];
+
+    let ddl_args = fx::DdlPipelineArgs {
+        drop_table_strategy: Some("drop".into()),
+        ..Default::default()
+    };
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port,
+        mappings,
+        app_name: "walshadow-ddl-pinned-recreate",
+        ddl: Some(ddl_args),
+    })
+    .await;
+
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO s15pin.t (id, body) VALUES (1, 'pre')".into(),
+            "SELECT pg_switch_wal()".into(),
+            "DROP TABLE s15pin.t".into(),
+            "SELECT pg_switch_wal()".into(),
+            "CREATE TABLE s15pin.t (id bigint PRIMARY KEY, body text)".into(),
+            "INSERT INTO s15pin.t (id, body) VALUES (2, 'post')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 3, Duration::from_secs(60)).await;
+    let _ = driver.join();
+    assert!(shipped >= 3, "expected ≥3 shipped segments, got {shipped}");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    // Dest re-created from the pinned mapping after the source re-CREATE.
+    let exists = ch
+        .query(
+            "SELECT count() FROM system.tables WHERE database = 'walshadow_test' AND name = 's15pin_t'",
+        )
+        .expect("ch system.tables count");
+    assert_eq!(
+        exists, "1",
+        "dest must be re-created after source re-CREATE"
+    );
+
+    // Only the post-recreate row survives (pre-drop rows fell with the dest).
+    let n = ch
+        .query("SELECT count() FROM walshadow_test.s15pin_t FINAL WHERE _is_deleted = 0")
+        .expect("ch count");
+    assert_eq!(n, "1");
+
+    let body = ch
+        .query(
+            "SELECT argMax(body, _lsn) FROM walshadow_test.s15pin_t \
+             WHERE _is_deleted = 0 AND id = 2",
+        )
+        .expect("ch body");
+    assert_eq!(body, "post", "post-recreate row must reach the new dest");
+}
+
 /// F6: a namespace's `target_database` override must route both the
 /// auto-created CH table and its rows to that database, not the global
 /// `[ch] database`. Before the fix, `DdlConfig::from_emitter` discarded
