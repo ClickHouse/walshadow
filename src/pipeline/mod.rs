@@ -117,7 +117,9 @@ pub struct PipelineConfig {
     pub buffer: Arc<Mutex<XactBuffer>>,
     pub subxact_tracker: Arc<Mutex<SubxactTracker>>,
     pub schema_events: Option<SchemaEventRx>,
-    pub pg_class_delete_epoch: Option<Arc<AtomicU64>>,
+    /// Same handle as the decoder's `with_catalog_signals` armer; reorder
+    /// consumes at the arming xact's commit
+    pub pending_sweeps: Option<crate::catalog_tracker::PendingSweeps>,
     pub stats: Arc<EmitterStats>,
     /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
     /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
@@ -172,7 +174,7 @@ impl PipelineConfig {
             buffer,
             subxact_tracker,
             schema_events,
-            pg_class_delete_epoch,
+            pending_sweeps,
             stats,
             span_registry,
         } = self;
@@ -215,7 +217,7 @@ impl PipelineConfig {
             catalog,
             subxact_tracker,
             schema_events,
-            pg_class_delete_epoch,
+            pending_sweeps,
             applicator,
             ack,
             jobs_tx,

@@ -1,8 +1,8 @@
 // walshadow — ShadowCatalog internal state + schema-event emission
 // Internal-state companion to shadow_communication.dot (channels). Here:
 // LRU shape + generation counter + invalidation-epoch fold + reconnect
-// resilience (folded into libpq node) + DROP sweep + SchemaEvent
-// fan-out to DdlApplicator / XactBuffer.
+// resilience (folded into libpq node) + xid-armed DROP sweep +
+// SchemaEvent fan-out to DdlApplicator / XactBuffer.
 //
 // regeneration spec:
 // sources of truth: plans/shadow.md · src/shadow_catalog.rs
@@ -22,13 +22,17 @@ digraph shadow_catalog {
 
   // ──────── Top rank: external producer + consumer ────────
   { rank=same;
-    tracker [label="CatalogTracker\n(filter pipeline, sync)\ncatalog WAL writes →\nepoch bump (Release-store)", fillcolor="#4D3A28"];
+    tracker [label="CatalogTracker\n(filter pipeline, sync)\ncatalog WAL writes →\nepoch bump (Release-store)\n+ CatalogSignal verdict on Record", fillcolor="#4D3A28"];
     caller  [label="BufferingDecoderSink\nrelation_at(rfn, at_lsn)\n(decoder worker task)", fillcolor="#4D4128"];
   }
 
-  // ──────── Shared cross-pipeline atomics ────────
-  atomics [label="Arc<AtomicU64>\ninvalidation_epoch  (any catalog WAL)\npg_class_delete_epoch  (heap_delete only)", fillcolor="#4D4D28", shape=ellipse];
-  tracker -> atomics [label="set_*_epoch", style=dashed, color="#CBA85E"];
+  // ──────── Shared cross-pipeline state ────────
+  atomics [label="invalidation_epoch\nArc<AtomicU64>\n(any catalog WAL write)", fillcolor="#4D4D28", shape=ellipse];
+  psweeps [label="PendingSweeps\nMutex<HashSet<xid>>\narmed per pg_class heap_delete", fillcolor="#4D4D28", shape=ellipse];
+  tracker -> atomics [label="bump at\npump position", style=dashed, color="#CBA85E"];
+  tracker -> caller  [label="CatalogSignal\nrides Record", style=dashed, color="#CBA85E"];
+  caller  -> atomics [label="re-bump at\nworker position", style=dashed, color="#CBA85E"];
+  caller  -> psweeps [label="arm(xid) on\nInvalidateSweep", style=dashed, color="#CBA85E"];
 
   // ──────── ShadowCatalog cluster — full internal state ────────
   subgraph cluster_cat {
@@ -49,7 +53,7 @@ digraph shadow_catalog {
 
     prev    [label="prev_known\nHashMap<Oid, Arc<RelDescriptor>>\nlast-seen shape per oid", fillcolor="#4D4D28", shape=folder];
 
-    sweep   [label="sweep_dropped\npoll pg_class for known oids;\nmissing → emit Dropped\nthrottled by pg_class_delete_epoch", fillcolor="#4D4D28"];
+    sweep   [label="sweep_dropped\npoll pg_class for known oids;\nmissing → emit Dropped\nno internal throttle", fillcolor="#4D4D28"];
   }
 
   // ──────── Shadow PG (consolidated endpoint) ────────
@@ -81,7 +85,7 @@ digraph shadow_catalog {
   gencnt  -> lru    [label="gen mismatch ⇒ miss", style=dashed, color="#CBA85E"];
 
   // ──────── DROP sweep path ────────
-  atomics -> sweep  [label="gate by\npg_class_delete_epoch", style=dashed, color="#CBA85E"];
+  psweeps -> sweep  [label="disarm at armed xact's commit ⇒\nwait_for_replay(commit lsn), sweep\n(abort disarms, no sweep)", style=dashed, color="#CBA85E"];
   sweep   -> libpq  [label="SELECT oid = ANY($1)\nFROM pg_class", style=dashed, color="#CBA85E"];
   sweep   -> prev   [label="remove missing", style=dashed, color="#CBA85E"];
   sweep   -> evtx   [label="Dropped { oid, qname }", color="#CBA85E"];
@@ -107,7 +111,7 @@ digraph shadow_catalog {
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>SchemaEvent variants</B></TD></TR>
       <TR><TD><B>Added</B></TD><TD>first sight of oid → CREATE TABLE (post-DROP re-create, seed_from_source)</TD></TR>
       <TR><TD><B>Changed</B></TD><TD>refetched shape ≠ prev_known: ADD/DROP/RENAME COLUMN, type widen (rejected for now)</TD></TR>
-      <TR><TD><B>Dropped</B></TD><TD>emit_dropped (pg_class heap_delete) or sweep_dropped poll → DROP TABLE</TD></TR>
+      <TR><TD><B>Dropped</B></TD><TD>sweep_dropped poll at armed xact's commit (PendingSweeps) → DROP TABLE</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>generation invariant</B></TD></TR>
       <TR><TD COLSPAN="2">one DDL → one bump → every cache entry stale on next access. Coarse-fire over-invalidates (hint-bit / autovac noise count) but never under-invalidates — schema correctness is the floor, refetch cost the negotiable.</TD></TR>
     </TABLE>

@@ -134,10 +134,15 @@ predicate over-invalidates but cannot under-invalidate. Fast-path
 post-bump refetch ms-cadence (see
 [future/risks.md](future/risks.md))
 
-`pg_class_delete_epoch` is narrower DROP-TABLE counter so
-`sweep_dropped` can skip its SQL probe when no heap_delete fired since
-prior sweep. ADD COLUMN / CREATE INDEX no longer drive per-commit
-shadow PG sweeps at pgbench rate
+DROP discovery is xid-keyed, not counter-keyed
+(`catalog_tracker::PendingSweeps`): the decoder worker arms the xid of
+each pg_class heap_delete record, commit sinks disarm + run
+`sweep_dropped` only at that xact's own commit. A counter consumed at
+whatever commit drained first swept while the dying tuple was still
+MVCC-alive in shadow (interleaved commit before the DROP's commit
+replayed) and lost the `Dropped` event. ADD COLUMN / CREATE INDEX
+never arm, so pgbench-rate commits skip the SQL probe entirely;
+aborts disarm without sweeping
 
 ## Reconnect resilience
 
@@ -227,9 +232,10 @@ Variants (see diagram legend for trigger → DDL mapping):
   Renames detected by attnum-match + name-diff heuristic; PG's `RENAME
   COLUMN` keeps attnum intact, natural case lands here
 - `Dropped { oid, qualified_name }` — `emit_dropped(oid)` from
-  `pg_class_decoder` heap_delete branch, or `sweep_dropped` poll for
-  catalogs with `relreplident = 'n'` where heap_delete carries no old
-  tuple to extract oid from
+  `pg_class_decoder` heap_delete branch, or `sweep_dropped` poll (at
+  the dropping xact's commit, `PendingSweeps`-gated) for catalogs with
+  `relreplident = 'n'` where heap_delete carries no old tuple to
+  extract oid from
 
 `prev_known: HashMap<Oid, Arc<RelDescriptor>>` retains last-seen
 descriptors across generation bumps so diff source-of-truth survives

@@ -40,10 +40,20 @@
 //! excludes interleaved rows), so its replay gate guarantees a fresh
 //! fetch. Out-of-band bumpers stay: mapping writes
 //! (`crate::ch_ddl::bump_mapping_epoch`) and SIGHUP mapping reload.
+//!
+//! DROP discovery cannot ride the same counter: a drop only becomes
+//! visible to `sweep_dropped`'s pg_class probe once the *dropping xact's
+//! commit* replays in shadow. An epoch consumed at whatever commit drains
+//! first (any interleaved xact committing between the heap_delete and the
+//! DROP's commit) sweeps at a replay position where the dying tuple is
+//! still MVCC-alive, finds nothing, and swallows the signal — the Dropped
+//! event is lost. [`PendingSweeps`] therefore keys arming by xid:
+//! [`CatalogSignal::InvalidateSweep`] arms the writing xact at worker
+//! position; commit sinks consume only at that xact's own commit, whose
+//! replay gate guarantees the drop is visible. Aborts disarm.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 use tokio_postgres::Client;
@@ -75,8 +85,47 @@ pub enum CatalogSignal {
     None,
     /// Relmap update or pg_class insert/update: descriptor caches flush
     Invalidate,
-    /// pg_class heap_delete (DROP shape): also arms `sweep_dropped`
+    /// pg_class heap_delete (DROP shape): also arms `sweep_dropped` for
+    /// the writing xact via [`PendingSweeps`]
     InvalidateSweep,
+}
+
+/// DROP-sweep arming keyed by xid. The decoder worker arms on
+/// [`CatalogSignal::InvalidateSweep`] with the record's xact id; commit
+/// sinks disarm at that xact's commit and only then run
+/// `ShadowCatalog::sweep_dropped`, so the sweep's replay gate (commit
+/// LSN of the dropping xact) guarantees the drop is MVCC-visible in
+/// shadow. Aborts disarm without sweeping. Uncontended std mutex: armer
+/// and consumer run on the same queueing worker.
+#[derive(Debug, Clone, Default)]
+pub struct PendingSweeps(Arc<std::sync::Mutex<HashSet<u32>>>);
+
+impl PendingSweeps {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn arm(&self, xid: u32) {
+        self.0.lock().expect("pending sweeps poisoned").insert(xid);
+    }
+
+    /// Remove every xid of a finished xact (top, prepared-xact id,
+    /// subxacts); true when any was armed. Commit acts on true, abort
+    /// discards the result.
+    pub fn disarm(&self, top: u32, twophase: Option<u32>, subxacts: &[u32]) -> bool {
+        let mut set = self.0.lock().expect("pending sweeps poisoned");
+        if set.is_empty() {
+            return false;
+        }
+        let mut hit = set.remove(&top);
+        if let Some(x) = twophase {
+            hit |= set.remove(&x);
+        }
+        for x in subxacts {
+            hit |= set.remove(x);
+        }
+        hit
+    }
 }
 
 #[derive(Debug, Default)]
@@ -88,10 +137,6 @@ pub struct CatalogTracker {
     /// `rel == PG_CLASS_OID` (mapped-catalog relfilenode == oid until
     /// first rewrite).
     pg_class_filenode: HashMap<u32, u32>,
-    /// Bumped only on pg_class heap_delete (the shape DROP TABLE writes),
-    /// so `ShadowCatalog::sweep_dropped` throttles off drops and skips a
-    /// per-commit shadow round-trip for non-drop DDL. Senderless: `None`.
-    pg_class_delete_epoch: Option<Arc<AtomicU64>>,
     pub relmap_updates: u64,
     /// pg_class heap writes the decoder couldn't reconstruct (truncated /
     /// malformed `t_hoff`). OID-prefix-compressed records count in
@@ -125,17 +170,6 @@ impl CatalogTracker {
     pub fn add(&mut self, db_node: u32, rel_node: u32) {
         self.nodes.insert((db_node, rel_node));
     }
-
-    pub fn set_pg_class_delete_epoch(&mut self, epoch: Arc<AtomicU64>) {
-        self.pg_class_delete_epoch = Some(epoch);
-    }
-
-    fn signal_pg_class_delete(&mut self) {
-        if let Some(e) = &self.pg_class_delete_epoch {
-            e.fetch_add(1, Ordering::Release);
-        }
-    }
-
 
     /// `rel < FIRST_NORMAL_OBJECT_ID` is the bootstrap rule; relmap
     /// updates add post-rewrite filenumbers. `db_node == 0` (shared:
@@ -172,8 +206,9 @@ impl CatalogTracker {
         }
         // DROP TABLE writes pg_class heap_delete, skipped by the
         // insert/update-only harvest path. Signal anyway so cache
-        // invalidates + sweep_dropped runs next commit. Dying tuple OID
-        // not decoded: catalogs default relreplident='n', WAL omits it.
+        // invalidates + sweep_dropped runs at this xact's commit. Dying
+        // tuple OID not decoded: catalogs default relreplident='n', WAL
+        // omits it.
         if rm == RmId::Heap as u8 {
             let info_op = info_high & 0x70;
             if info_op == 0x10 {
@@ -185,14 +220,14 @@ impl CatalogTracker {
     }
 
     /// Coarse-fire (no row decode) when a record hits the current
-    /// pg_class filenode, for ops the harvest path skips (DELETE). Also
-    /// bumps `pg_class_delete_epoch` for the DROP-TABLE sweep.
+    /// pg_class filenode, for ops the harvest path skips (DELETE). The
+    /// `InvalidateSweep` verdict arms the DROP sweep at the worker
+    /// ([`PendingSweeps`], keyed by the record's xid).
     fn signal_pg_class_touch(&mut self, record: &XLogRecord) -> CatalogSignal {
         if self.pg_class_block(record).is_none() {
             return CatalogSignal::None;
         }
         self.invalidation_signals_sent += 1;
-        self.signal_pg_class_delete();
         CatalogSignal::InvalidateSweep
     }
 
@@ -764,5 +799,36 @@ mod tests {
         r.main_data.to_mut().truncate(4); // len < 12 + REL_MAP_FILE_SIZE
         t.observe(&r);
         assert!(!t.is_catalog(5, 50000));
+    }
+
+    #[test]
+    fn pending_sweeps_consumed_only_at_arming_xacts_commit() {
+        let p = PendingSweeps::new();
+        p.arm(100);
+        // Interleaved commit of another xact must not consume the arm:
+        // the drop isn't commit-visible in shadow before xid 100 commits
+        assert!(!p.disarm(200, None, &[]));
+        assert!(p.disarm(100, None, &[]));
+        assert!(!p.disarm(100, None, &[]), "single consumption");
+    }
+
+    #[test]
+    fn pending_sweeps_disarm_matches_subxact_and_twophase() {
+        let p = PendingSweeps::new();
+        // heap_delete written under subxact 101, top commit lists it
+        p.arm(101);
+        assert!(p.disarm(100, None, &[101, 102]));
+        // COMMIT PREPARED: header xid differs, prepared xid in payload
+        p.arm(300);
+        assert!(p.disarm(0, Some(300), &[]));
+    }
+
+    #[test]
+    fn pending_sweeps_abort_disarms_without_refire() {
+        let p = PendingSweeps::new();
+        p.arm(100);
+        // Abort path discards the result; later commits must not sweep
+        assert!(p.disarm(100, None, &[]));
+        assert!(!p.disarm(100, None, &[]));
     }
 }

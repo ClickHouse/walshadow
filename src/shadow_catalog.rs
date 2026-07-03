@@ -331,13 +331,6 @@ pub struct ShadowCatalog {
     last_seen_epoch: u64,
     /// `None` keeps the producer side a no-op (standalone catalog, pre-applicator tests)
     event_tx: Option<mpsc::UnboundedSender<SchemaEvent>>,
-    /// Throttle marker: skip the sweep SQL round-trip when no DDL has fired
-    /// since the prior sweep (pgbench-rate commit-boundary callers)
-    last_swept_generation: u64,
-    /// Narrower than [`Self::invalidation_epoch`]: bumps only on pg_class
-    /// `heap_delete`, so ADD COLUMN / CREATE INDEX don't drive per-commit sweeps
-    pg_class_delete_epoch: Option<Arc<AtomicU64>>,
-    last_seen_delete_epoch: u64,
     /// DB oid this client is connected to. Rejects foreign-DB filenodes before
     /// the relfilenode query (relfilenodes unique only within a DB). Survives
     /// `reconnect` since `conninfo` pins the DB.
@@ -387,19 +380,9 @@ impl ShadowCatalog {
             invalidation_epoch: None,
             last_seen_epoch: 0,
             event_tx: None,
-            last_swept_generation: 0,
-            pg_class_delete_epoch: None,
-            last_seen_delete_epoch: 0,
             current_db_oid: None,
             stats: ShadowCatalogStats::default(),
         })
-    }
-
-    /// Pair with
-    /// [`crate::catalog_tracker::CatalogTracker::set_pg_class_delete_epoch`].
-    pub fn set_pg_class_delete_epoch(&mut self, epoch: Arc<AtomicU64>) {
-        self.last_seen_delete_epoch = epoch.load(Ordering::Acquire);
-        self.pg_class_delete_epoch = Some(epoch);
     }
 
     /// Install the schema-event sink, returning its `Receiver`. Single
@@ -503,24 +486,20 @@ impl ShadowCatalog {
     ///
     /// Needed because the natural path (decoder sees pg_class `heap_delete`)
     /// doesn't fire for `relreplident = 'n'` system catalogs — PG omits the old
-    /// tuple from WAL, so the dropped oid is unextractable. Costs one SQL
-    /// round-trip per sweep, throttled by `last_swept_generation` so per-commit
-    /// callers no-op down to an atomic load when no DDL fired.
+    /// tuple from WAL, so the dropped oid is unextractable. Callers gate on
+    /// [`PendingSweeps`](crate::catalog_tracker::PendingSweeps): the sweep
+    /// runs only at the commit of an xact that wrote pg_class heap_delete,
+    /// after `wait_for_replay` past that commit, so the drop is MVCC-visible.
+    /// No internal throttle: epoch/generation comparisons here re-created the
+    /// consume-early race (an earlier sweep folding a later DROP's bump made
+    /// the drop's own commit no-op and lost the event).
+    ///
+    /// A shadow replaying ahead can surface a LATER armed xact's drop at an
+    /// earlier armed commit; the later xact's own sweep then finds nothing
+    /// and no-ops. Benign: attribution shifts to an earlier commit LSN,
+    /// never lost, and the end state (relation dropped) is identical.
     pub async fn sweep_dropped(&mut self) -> Result<usize> {
-        // Fold pending invalidations FIRST so a DDL since the prior sweep bumps
-        // `generation` past `last_swept_generation`
-        self.drain_invalidations();
-        // Snapshot DROP-only epoch BEFORE the query: a concurrent advance the
-        // post-query update would otherwise swallow re-fires next sweep
-        let snapshot_delete_epoch = self
-            .pg_class_delete_epoch
-            .as_ref()
-            .map(|e| e.load(Ordering::Acquire))
-            .unwrap_or(self.last_seen_delete_epoch);
-        if self.prev_known.is_empty()
-            || (self.last_swept_generation == self.generation
-                && snapshot_delete_epoch == self.last_seen_delete_epoch)
-        {
+        if self.prev_known.is_empty() {
             return Ok(0);
         }
         let known: Vec<Oid> = self.prev_known.keys().copied().collect();
@@ -537,8 +516,6 @@ impl ShadowCatalog {
                 emitted += 1;
             }
         }
-        self.last_swept_generation = self.generation;
-        self.last_seen_delete_epoch = snapshot_delete_epoch;
         Ok(emitted)
     }
 
@@ -601,30 +578,6 @@ impl ShadowCatalog {
     /// standalone. The decode pool flushes its cache on a bump.
     pub fn invalidation_epoch_handle(&self) -> Option<Arc<AtomicU64>> {
         self.invalidation_epoch.clone()
-    }
-
-    /// True when [`Self::sweep_dropped`] would do real work. Cheap (atomic
-    /// load + compare); gate the per-commit sweep on this to keep pgbench-rate
-    /// workloads off the SQL path when nothing's dropped.
-    pub fn has_pending_sweep(&self) -> bool {
-        if self.prev_known.is_empty() {
-            return false;
-        }
-        // No DROP-only counter wired: conservative fallback (any invalidation
-        // triggers a sweep). Extra SQL/commit, but correctness over throughput.
-        let current = match &self.pg_class_delete_epoch {
-            Some(e) => e.load(Ordering::Acquire),
-            None => {
-                let inv = self
-                    .invalidation_epoch
-                    .as_ref()
-                    .map(|e| e.load(Ordering::Acquire))
-                    .unwrap_or(self.last_seen_epoch);
-                return inv != self.last_seen_epoch
-                    || self.last_swept_generation != self.generation;
-            }
-        };
-        current != self.last_seen_delete_epoch
     }
 
     pub fn stats(&self) -> &ShadowCatalogStats {

@@ -76,14 +76,16 @@ Inputs:
   before walshadow attached" hole. Shared catalogs seed under
   `db_node = 0`, per-db under `current_database()` oid
 - DROP TABLE coarse signal — `heap_delete` against current `pg_class`
-  filenode bumps invalidation epoch so ShadowCatalog drops cached
+  filenode signals `InvalidateSweep` so ShadowCatalog drops cached
   descriptors. No tuple decode (system catalogs default to
   `relreplident = 'n'`, WAL omits dying tuple)
 
-`set_invalidation_epoch` / `set_pg_class_delete_epoch` attach
-`Arc<AtomicU64>` counters shared with `ShadowCatalog::sweep_dropped`.
-Senderless trackers (CLI, batch tests) leave both `None`, signal is a
-no-op
+`observe` returns a `CatalogSignal` verdict stamped on the record; the
+decoder worker bumps the shared `Arc<AtomicU64>` invalidation epoch at
+its own stream position (a pump-position bump would be consumable
+before pre-DDL records finish decoding). `InvalidateSweep` also arms
+`PendingSweeps` with the record's xid — the sweep must run at the
+dropping xact's own commit (see [shadow.md](shadow.md))
 
 ## Rewrite path
 

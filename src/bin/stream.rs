@@ -669,19 +669,15 @@ async fn run(args: Args) -> Result<()> {
     // folds the delta into `invalidate` before each relation lookup's
     // cache check. Mapping writes + SIGHUP reload bump out-of-band.
     let invalidation_epoch = Arc::new(AtomicU64::new(0));
-    // Narrower drop-only epoch so sweep_dropped throttles off pg_class
-    // heap_delete, not every catalog touch (ADD COLUMN / CREATE INDEX
-    // would flood at pgbench rate otherwise).
-    let pg_class_delete_epoch = Arc::new(AtomicU64::new(0));
-    stream
-        .filter_mut()
-        .tracker
-        .set_pg_class_delete_epoch(pg_class_delete_epoch.clone());
-    {
-        let mut cat = catalog.lock().await;
-        cat.set_invalidation_epoch(invalidation_epoch.clone());
-        cat.set_pg_class_delete_epoch(pg_class_delete_epoch.clone());
-    }
+    // DROP-sweep arming, keyed by xid: decoder worker arms at pg_class
+    // heap_delete records (never ADD COLUMN / CREATE INDEX noise), commit
+    // sink consumes only at the arming xact's own commit so the replay
+    // gate makes the drop visible before sweep_dropped probes shadow.
+    let pending_sweeps = walshadow::catalog_tracker::PendingSweeps::new();
+    catalog
+        .lock()
+        .await
+        .set_invalidation_epoch(invalidation_epoch.clone());
 
     // Pre-flight validators run after both source + shadow SQL clients
     // are up so every check has its connection.
@@ -794,13 +790,11 @@ async fn run(args: Args) -> Result<()> {
         };
     let mut decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
         .with_schema_events(schema_events.clone())
-        // Re-bump at worker position: the queueing sink below decouples
-        // the decoder from the pump, so the tracker's observe-time bumps
-        // alone would be consumable before pre-DDL records finish decoding
-        .with_catalog_signal_epochs(
-            invalidation_epoch.clone(),
-            Some(pg_class_delete_epoch.clone()),
-        );
+        // Bump / arm at worker position off each record's tracker verdict:
+        // the queueing sink below decouples the decoder from the pump, so
+        // a pump-position bump would be consumable before pre-DDL records
+        // finish decoding
+        .with_catalog_signals(invalidation_epoch.clone(), Some(pending_sweeps.clone()));
     if let Some(reg) = &span_registry {
         decoder = decoder.with_span_registry(reg.clone());
     }
@@ -854,7 +848,7 @@ async fn run(args: Args) -> Result<()> {
                 buffer: xact_buffer.clone(),
                 subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
                 schema_events: Some(schema_events.clone()),
-                pg_class_delete_epoch: Some(pg_class_delete_epoch.clone()),
+                pending_sweeps: Some(pending_sweeps.clone()),
                 stats,
                 span_registry: span_registry.clone(),
             };
@@ -892,7 +886,7 @@ async fn run(args: Args) -> Result<()> {
             };
             let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer)
                 .with_schema_events(schema_events)
-                .with_pg_class_delete_epoch(pg_class_delete_epoch.clone());
+                .with_pending_sweeps(pending_sweeps.clone());
             QueueingRecordSink::spawn(
                 DecoderXactPair {
                     decoder,

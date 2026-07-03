@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use walrus::pg::walparser::RmId;
@@ -48,8 +48,10 @@ pub struct ReorderSink {
     catalog: Arc<Mutex<ShadowCatalog>>,
     subxact_tracker: Arc<Mutex<SubxactTracker>>,
     schema_events: Option<SchemaEventRx>,
-    pg_class_delete_epoch: Option<Arc<AtomicU64>>,
-    last_seen_delete_epoch: u64,
+    /// Armed by the decoder at pg_class heap_delete records, consumed
+    /// only at the arming xact's own commit (see
+    /// [`PendingSweeps`](crate::catalog_tracker::PendingSweeps))
+    pending_sweeps: Option<crate::catalog_tracker::PendingSweeps>,
     applicator: DdlApplicator,
     ack: AckHandle,
     jobs_tx: async_channel::Sender<DecodeJob>,
@@ -79,7 +81,7 @@ impl ReorderSink {
         catalog: Arc<Mutex<ShadowCatalog>>,
         subxact_tracker: Arc<Mutex<SubxactTracker>>,
         schema_events: Option<SchemaEventRx>,
-        pg_class_delete_epoch: Option<Arc<AtomicU64>>,
+        pending_sweeps: Option<crate::catalog_tracker::PendingSweeps>,
         applicator: DdlApplicator,
         ack: AckHandle,
         jobs_tx: async_channel::Sender<DecodeJob>,
@@ -89,17 +91,12 @@ impl ReorderSink {
         fatal: Fatal,
         span_registry: Option<TxnSpanRegistry>,
     ) -> Self {
-        let last_seen_delete_epoch = pg_class_delete_epoch
-            .as_ref()
-            .map(|e| e.load(Ordering::Acquire))
-            .unwrap_or(0);
         Self {
             buffer,
             catalog,
             subxact_tracker,
             schema_events,
-            pg_class_delete_epoch,
-            last_seen_delete_epoch,
+            pending_sweeps,
             applicator,
             ack,
             jobs_tx,
@@ -148,19 +145,23 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Poll-based DROP discovery at commit, gated on the pg_class delete epoch
-    /// so ADD COLUMN / VACUUM noise doesn't sweep. Same as `XactRecordSink`'s
-    /// commit branch.
-    async fn maybe_sweep_dropped(&mut self, xid: u32, source_lsn: u64) -> Result<(), SinkError> {
+    /// Poll-based DROP discovery, run only at the commit of an xact that
+    /// wrote pg_class heap_delete (ADD COLUMN / VACUUM noise never arms)
+    /// so the replay gate makes the drop visible in shadow. Same as
+    /// `XactRecordSink`'s commit branch.
+    async fn maybe_sweep_dropped(
+        &mut self,
+        xid: u32,
+        payload: &crate::xact_buffer::XactCommitPayload,
+        source_lsn: u64,
+    ) -> Result<(), SinkError> {
         if self.schema_events.is_none() {
             return Ok(());
         }
-        let current = self
-            .pg_class_delete_epoch
-            .as_ref()
-            .map(|e| e.load(Ordering::Acquire))
-            .unwrap_or(self.last_seen_delete_epoch);
-        if current == self.last_seen_delete_epoch {
+        let Some(pending) = &self.pending_sweeps else {
+            return Ok(());
+        };
+        if !pending.disarm(xid, payload.twophase_xid, &payload.subxacts) {
             return Ok(());
         }
         let dropped = {
@@ -174,7 +175,6 @@ impl ReorderSink {
                 .await
                 .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?
         };
-        self.last_seen_delete_epoch = current;
         if dropped > 0 {
             self.route_pending_schema_events(xid, source_lsn).await?;
         }
@@ -342,7 +342,8 @@ impl ReorderSink {
             .as_ref()
             .and_then(|r| r.txn_span(xid))
             .unwrap_or_else(tracing::Span::none);
-        self.maybe_sweep_dropped(xid, record.source_lsn).await?;
+        self.maybe_sweep_dropped(xid, &payload, record.source_lsn)
+            .await?;
         let drain_span = trace_span!(
             !txn.is_none(),
             parent: &txn,
@@ -435,6 +436,10 @@ impl ReorderSink {
     /// direct ack bump).
     async fn on_abort(&mut self, xid: u32, info: u8, record: &Record<'_>) -> Result<(), SinkError> {
         let payload = parse_xact_payload(info, &record.parsed.main_data);
+        // Rolled-back pg_class heap_delete resurrects the row; drop the arm
+        if let Some(pending) = &self.pending_sweeps {
+            pending.disarm(xid, payload.twophase_xid, &payload.subxacts);
+        }
         let seq = self.alloc_seq();
         self.ack.register(seq, record.source_lsn);
         {

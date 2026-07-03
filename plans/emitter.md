@@ -43,7 +43,8 @@ Single-threaded commit-order boundary. Runs as inner sink of the
 daemon's `QueueingRecordSink` (off the WAL pump task, preserving the
 wire-shadow deadlock fix). Only `RM_XACT_ID` records reach its match:
 
-- COMMIT — poll-based DROP sweep (gated on `pg_class_delete_epoch`),
+- COMMIT — poll-based DROP sweep (only when this commit's xid set was
+  armed by a pg_class heap_delete, `PendingSweeps`),
   `XactBuffer::drain_committed`, then assign one dense `seq`,
   `ack.register(seq, commit_lsn)`, dispatch a `DecodeJob` to the
   decode pool. Empty commits register a rows=0 seq so the contiguous
