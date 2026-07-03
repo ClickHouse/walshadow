@@ -67,9 +67,12 @@ pub struct MetricsSnapshot {
     /// exclusions applied via the config overlay.
     pub config_replicate_opt_in_total: u64,
     pub config_replicate_opt_out_total: u64,
-    /// `initial_load='copy'` backfills recorded in the ledger but not yet
-    /// COPY-complete (in flight, or awaiting re-COPY on next boot).
+    /// `initial_load` backfills recorded in the ledger but not yet complete
+    /// (in flight, or awaiting re-run on next boot).
     pub config_backfills_pending: u64,
+    /// `config_backfills_pending` split `[copy, base_backup, object_store]`;
+    /// rendered as `mode=` labelled series under the umbrella gauge.
+    pub config_backfills_pending_by_mode: [u64; 3],
     // Pipeline flow + process gauges; see `render` for descriptions.
     pub pump_queue_depth: u64,
     pub queue_records_out_total: u64,
@@ -452,17 +455,29 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "counter",
             snap.config_replicate_opt_out_total,
         ),
-        (
-            "walshadow_config_backfills_pending",
-            "initial_load backfills recorded but not yet COPY-complete.",
-            "gauge",
-            snap.config_backfills_pending,
-        ),
     ];
     for (name, help, kind, value) in pairs {
         writeln!(s, "# HELP {name} {help}").unwrap();
         writeln!(s, "# TYPE {name} {kind}").unwrap();
         writeln!(s, "{name} {value}").unwrap();
+    }
+
+    // Umbrella count bare + per-mode labelled series in one family
+    {
+        let name = "walshadow_config_backfills_pending";
+        writeln!(
+            s,
+            "# HELP {name} initial_load backfills recorded but not yet complete."
+        )
+        .unwrap();
+        writeln!(s, "# TYPE {name} gauge").unwrap();
+        writeln!(s, "{name} {}", snap.config_backfills_pending).unwrap();
+        for (mode, v) in ["copy", "base_backup", "object_store"]
+            .iter()
+            .zip(snap.config_backfills_pending_by_mode)
+        {
+            writeln!(s, "{name}{{mode=\"{mode}\"}} {v}").unwrap();
+        }
     }
 
     // Prom format accepts `+Inf` for unknown rate

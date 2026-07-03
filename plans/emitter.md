@@ -40,8 +40,8 @@ commit-record LSN known durable on CH
 ### Reorder coordinator — `pipeline/reorder.rs`
 
 Single-threaded commit-order boundary. Runs as inner sink of the
-daemon's `QueueingRecordSink` (off the WAL pump task, preserving the
-wire-shadow deadlock fix). Only `RM_XACT_ID` records reach its match:
+daemon's `QueueingRecordSink` (off the WAL pump task, so replay gates
+never pace wire delivery). Only `RM_XACT_ID` records reach its match:
 
 - COMMIT — poll-based DROP sweep (only when this commit's xid set was
   armed by a pg_class heap_delete, `PendingSweeps`),
@@ -263,6 +263,8 @@ without walshadow having to track which rows already landed
 
 ```toml
 [table."public.foo"]
+replicate = true
+initial_load = "none"
 target = "default.foo"
 columns = [
   { attnum = 1, target = "id",   type = "UInt64" },

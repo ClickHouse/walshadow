@@ -47,8 +47,8 @@ with the referring tuple in WAL. In-xact WAL reassembly is the fast path — see
   view / UDF / client-side) and a pointer column carrying `va_extinfo` +
   `va_rawsize`. R2 inline is the default.
 - **Chunk GC / vacuum reclaim.** PG drops superseded chunks when a value is
-  deleted or updated to a new `va_valueid`. The emitted CH schema has no `_op`
-  column and the toast relation's replica identity is `nothing` (delete WAL
+  deleted or updated to a new `va_valueid`. The emitted CH chunk schema has no
+  `_is_deleted` column and the toast relation's replica identity is `nothing` (delete WAL
   carries no key — same blind spot as system catalogs,
   [[feedback_pg_version_wal_skew]]), so a delete marker has nowhere to land.
   Dead chunk rows leak; dedup keeps the live `va_valueid`'s chunks correct.

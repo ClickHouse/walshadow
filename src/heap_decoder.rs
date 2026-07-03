@@ -1264,7 +1264,7 @@ fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Decode
 }
 
 /// True iff `attnum` is part of the relation's replica identity. Emitter gates
-/// `_op=delete/update` propagation on this, staying agnostic to [`ReplIdent`].
+/// delete/update old-key propagation on this, staying agnostic to [`ReplIdent`].
 pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
     match replident {
         ReplIdent::Full => true,

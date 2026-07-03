@@ -93,6 +93,8 @@ fn tuple(rel_node: u32, id: i32) -> BackfillTuple {
             rel_node,
         },
         xid: 1000 + id as u32,
+        xmax: 0,
+        infomask: 0,
         source_lsn: START_LSN,
         columns: vec![Some(ColumnValue::Int4(id))],
     }

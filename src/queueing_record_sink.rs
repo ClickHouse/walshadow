@@ -5,12 +5,13 @@
 //!
 //! Pump awaits `on_wire_chunk` (shadow-wire bytes) then `on_record`
 //! (decoder/xact buffer/emitter) per record. Decoder's
-//! `ShadowCatalog::wait_for_replay` clears against bytes the wire
-//! already pushed. Under DDL-mixed workload (`pgbench_acceptance`,
-//! `kill_restart` drills) it can exceed one record latency, parking
-//! the pump inside the await: bytes_sink stops firing, walsender
-//! queues drain, shadow's walreceiver starves, apply LSN stalls below
-//! `record.source_lsn`, wait trips its 30s catalog timeout. Deadlock.
+//! `ShadowCatalog::wait_for_replay` targets bytes the wire already
+//! pushed but clears only once shadow *applies* them: send queue →
+//! walreceiver flush → startup replay → poll. Under DDL-mixed workload
+//! the gate exceeds one record latency; awaited inline it parks the
+//! pump for that whole round-trip and couples wire pacing to decode,
+//! turning any delivery path that needs fresh pump bytes into a
+//! deadlock.
 //!
 //! Break the lockstep: `on_record` owns the record `'static`, pushes
 //! onto an mpsc channel, returns. Worker drains through the inner sink

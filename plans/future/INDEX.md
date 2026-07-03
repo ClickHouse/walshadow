@@ -6,7 +6,6 @@ surface; promote into `plans/` once built
 * [TABLESPACES.md](TABLESPACES.md) — source-tablespace correctness: bootstrap page-walk + shadow directory materialization
 * [DESTINATIONS.md](DESTINATIONS.md) — N:M ClickHouse destination routing: fan-out/fan-in, per-dest ack accounting, slot-advance tension
 * [runtime_config_from_pg.md](runtime_config_from_pg.md) — source-PG runtime config: signal channel, per-table opt-in + backfill, net-new knobs, degraded-mode fallback (resolver substrate in [config.md](../config.md))
-* [initial_load_backup.md](initial_load_backup.md) — backup-sourced per-table initial load: filtered BASE_BACKUP / object-store page walk, archive-WAL gap replay, visibility gate, `_lsn` tagging invariant
 * [shadow_schema_export.md](shadow_schema_export.md) — shadow PG as schema-only catalog donor to third-party clusters
 * [sync_commit_witness.md](sync_commit_witness.md) — walshadow as RPO=0 durability standby
 * [two_phase_commit.md](two_phase_commit.md) — `XLOG_XACT_PREPARE` handling and gxid-keyed buffer

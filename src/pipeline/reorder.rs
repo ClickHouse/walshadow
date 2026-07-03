@@ -1,7 +1,7 @@
 //! Reorder worker — single-threaded commit-order coordinator.
 //!
 //! Runs as inner sink of the `QueueingRecordSink` worker, off the WAL pump
-//! task (preserves the wire-shadow deadlock fix). Pairs with
+//! task (replay gates never pace wire delivery). Pairs with
 //! [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink); on each
 //! COMMIT/ABORT assigns a dense `seq`, registers it with the collector in
 //! order, then either dispatches to the decode pool or — for a DDL/TRUNCATE

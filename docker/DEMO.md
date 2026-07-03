@@ -115,10 +115,10 @@ $dc exec source psql -U postgres -d postgres -c \
     "UPDATE demo.users SET email='opifex@merces-digna' WHERE id=1"
 
 $dc exec clickhouse clickhouse-client --query \
-    "SELECT id, email, _op, _lsn FROM demo.users FINAL ORDER BY id"
+    "SELECT id, email, _lsn FROM demo.users FINAL ORDER BY id"
 ```
 
-Row 1's email updates; `_op` reads `update` — CDC in flight. Pure
+Row 1's email updates; its `_lsn` advances — CDC in flight. Pure
 demonstration now: walshadow seeds each pinned relation's column baseline
 at startup, so Beat 2's schema change replicates even if you skip this
 beat. (Pre-seed this row change was load-bearing — a pinned table needed
@@ -176,7 +176,7 @@ Snapshot of a streamed pgbench table:
 $dc exec clickhouse clickhouse-client --query \
     "SELECT count() FROM demo.pgbench_history"
 $dc exec clickhouse clickhouse-client --query \
-    "SELECT aid, abalance, _op, _lsn FROM demo.pgbench_accounts FINAL ORDER BY aid LIMIT 5"
+    "SELECT aid, abalance, _lsn FROM demo.pgbench_accounts FINAL ORDER BY aid LIMIT 5"
 ```
 
 Shadow PG (in-container standby) replay position:

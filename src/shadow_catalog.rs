@@ -482,6 +482,28 @@ impl ShadowCatalog {
         }
     }
 
+    /// Resolve a table's TOAST relation descriptor (`pg_class.reltoastrelid`
+    /// → `pg_toast.pg_toast_<oid>`), `None` when the rel has no TOAST table.
+    /// Backup-sourced backfills seed the page-walk filter with it so a
+    /// filtered walk carries the rel's external chunks.
+    pub async fn toast_descriptor_for(&mut self, oid: Oid) -> Result<Option<Arc<RelDescriptor>>> {
+        let row = self
+            .query_one_retry(
+                "SELECT coalesce((SELECT reltoastrelid FROM pg_class WHERE oid = $1), 0)::oid",
+                &[&oid],
+            )
+            .await?;
+        let toast_oid: Oid = row.get(0);
+        if toast_oid == 0 {
+            return Ok(None);
+        }
+        match self.relation_by_oid(toast_oid).await {
+            Ok(desc) => Ok(Some(desc)),
+            Err(CatalogError::NotFoundByOid(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Emit `Dropped` for an oid seen via pg_class `heap_delete`. Returns
     /// `false` for an oid the catalog never saw (CH never learned it either,
     /// nothing for the applicator to do).

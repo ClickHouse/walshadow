@@ -23,6 +23,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +57,7 @@ use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
 use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
+use walshadow::runtime_config::InitialLoadMode;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
     ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
@@ -135,9 +137,9 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
 ///
 /// `metrics` stays synchronous on the pump task (counter bumps, never
 /// await). The decoder/xact-drain pair runs behind a [`QueueingRecordSink`]
-/// so its `wait_for_replay` waits don't park the pump task, which would
-/// freeze the wire shadow PG depends on for apply-LSN progress (deadlock
-/// the streaming tests surface).
+/// so its `wait_for_replay` waits don't park the pump task: each gate
+/// would freeze wire delivery for a full shadow apply round-trip and
+/// couple wire pacing to decode.
 struct DaemonSinks {
     metrics: MetricsRecordSink,
     decoder_xact: QueueingRecordSink,
@@ -821,8 +823,8 @@ async fn run(args: Args) -> Result<()> {
     // Layered config resolver (CLI > TOML); `Some` only with `--ch-config`.
     // Moved into the SIGHUP task, which re-reads TOML and republishes.
     let mut config_resolver: Option<Arc<ConfigResolver>> = None;
-    // COPY backfiller for `initial_load='copy'` opt-ins; `Some` only with the
-    // runtime-config overlay active.
+    // COPY backfiller for `initial_load='copy'`; `Some` with SQL opt-ins or
+    // TOML-pinned initial loads.
     let mut copy_backfiller: Option<Arc<walshadow::copy_backfill::CopyBackfiller>> = None;
 
     let decoder_xact = match ch_config {
@@ -889,22 +891,27 @@ async fn run(args: Args) -> Result<()> {
                 &emitter_cfg,
                 ddl_cfg,
                 mapping.clone(),
-                config_rx,
+                config_rx.clone(),
             )
             .await
             .context("init DDL applicator")?
             .with_invalidation_epoch(invalidation_epoch.clone());
             let stats = Arc::new(EmitterStats::default());
             emitter_stats_handle = Some(stats.clone());
-            // COPY backfiller for `initial_load='copy'` opt-ins: own source SQL
-            // session + CH tail per backfill, spill-dir ledger dedups restarts.
-            if emitter_cfg.runtime_config_schema.is_some() {
+            // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
+            // own source session + CH tail per backfill or pass, spill-dir
+            // ledger dedups restarts.
+            let toml_initial_load = emitter_cfg.table_initial_loads.values().any(|mode| {
+                InitialLoadMode::parse(mode).is_some_and(|m| m != InitialLoadMode::None)
+            });
+            if emitter_cfg.runtime_config_schema.is_some() || toml_initial_load {
                 copy_backfiller = Some(Arc::new(
                     walshadow::copy_backfill::CopyBackfiller::new(
                         cfg.clone(),
                         emitter_cfg.clone(),
                         mapping.clone(),
                         stats.clone(),
+                        catalog.clone(),
                         &args.spill_dir,
                     )
                     .await,
@@ -932,6 +939,22 @@ async fn run(args: Args) -> Result<()> {
                     .with_context(|| format!("seed opt-in for {qname}"))?;
                 }
             }
+            let sql_scoped_tables: HashSet<String> = seeded_table_rows
+                .iter()
+                .filter(|(_, row)| row.replicate.is_some())
+                .map(|(qname, _)| qname.clone())
+                .collect();
+            let active_tables: HashSet<String> =
+                config_rx.borrow().tables.keys().cloned().collect();
+            apply_toml_initial_loads(
+                &catalog,
+                copy_backfiller.as_ref(),
+                &emitter_cfg.table_initial_loads,
+                &active_tables,
+                &sql_scoped_tables,
+                raw_start,
+            )
+            .await?;
             config_resolver = Some(resolver);
             // Seed durable watermark at `raw_start`, not 0. Status loop
             // persists this atomic into cursor's emitter_ack_lsn each
@@ -1547,6 +1570,51 @@ async fn seed_runtime_config(
     Ok(table_rows)
 }
 
+async fn apply_toml_initial_loads(
+    catalog: &Arc<Mutex<ShadowCatalog>>,
+    backfiller: Option<&Arc<walshadow::copy_backfill::CopyBackfiller>>,
+    table_initial_loads: &std::collections::HashMap<String, String>,
+    active_tables: &HashSet<String>,
+    sql_scoped_tables: &HashSet<String>,
+    raw_start: u64,
+) -> anyhow::Result<()> {
+    for (qname, mode) in table_initial_loads {
+        if !active_tables.contains(qname) || sql_scoped_tables.contains(qname) {
+            continue;
+        }
+        match InitialLoadMode::parse(mode) {
+            Some(InitialLoadMode::None) => {}
+            Some(parsed) => {
+                let desc = catalog.lock().await.descriptor_by_qname(qname).await?;
+                let Some(desc) = desc else {
+                    tracing::warn!(
+                        target: "walshadow::config",
+                        qname,
+                        "TOML initial_load ignored: source rel unknown",
+                    );
+                    continue;
+                };
+                match backfiller {
+                    Some(b) => b.note_opt_in(&desc, parsed, raw_start).await,
+                    None => tracing::info!(
+                        target: "walshadow::config",
+                        qname,
+                        mode,
+                        "TOML initial_load requested but no backfiller wired; streaming from start LSN only",
+                    ),
+                }
+            }
+            None => tracing::warn!(
+                target: "walshadow::config",
+                qname,
+                mode,
+                "unknown TOML initial_load mode; streaming from start LSN only",
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// SIGHUP listener: re-reads `--ch-config` and republishes the resolved
 /// snapshot through the resolver (CLI overrides stay on top). Read/parse
 /// errors keep the last snapshot in effect; absent resolver (metrics-only)
@@ -1891,6 +1959,7 @@ async fn populate_metrics(
         config_replicate_opt_in_total: config_resolver.map(|r| r.opt_in_total()).unwrap_or(0),
         config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),
         config_backfills_pending: backfiller.map(|b| b.pending_count()).unwrap_or(0),
+        config_backfills_pending_by_mode: backfiller.map(|b| b.pending_by_mode()).unwrap_or([0; 3]),
     };
     registry.set(snap).await;
 }

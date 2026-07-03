@@ -669,8 +669,8 @@ impl WalStream {
         &mut self,
         lsn: u64,
         bytes: &[u8],
-        record_sink: &mut dyn RecordSink,
-        segment_sink: &mut dyn SegmentSink,
+        record_sink: &mut (dyn RecordSink + Send),
+        segment_sink: &mut (dyn SegmentSink + Send),
     ) -> Result<u64, WalStreamError> {
         if self.poisoned {
             return Err(WalStreamError::Poisoned);
@@ -719,7 +719,7 @@ impl WalStream {
     /// apply LSN, not against `restore_command` segment landing.
     async fn drain_records(
         &mut self,
-        record_sink: &mut dyn RecordSink,
+        record_sink: &mut (dyn RecordSink + Send),
     ) -> Result<(), WalStreamError> {
         loop {
             let completed: CompletedRecord = match self.walker.try_next() {
@@ -828,7 +828,7 @@ impl WalStream {
     /// ships seg-0 with rewritten partial bytes.
     async fn try_flush_first_segment(
         &mut self,
-        segment_sink: &mut dyn SegmentSink,
+        segment_sink: &mut (dyn SegmentSink + Send),
     ) -> Result<bool, WalStreamError> {
         let seg_size = self.seg_size as usize;
         if self.walker.buffer_len() < seg_size {
@@ -902,8 +902,8 @@ impl WalStream {
     /// `restore_command` doesn't pick it up as complete.
     pub async fn close(
         mut self,
-        mut partial_sink: Option<&mut dyn SegmentSink>,
-        record_sink: &mut dyn RecordSink,
+        mut partial_sink: Option<&mut (dyn SegmentSink + Send)>,
+        record_sink: &mut (dyn RecordSink + Send),
     ) -> Result<(), WalStreamError> {
         // Drain full segments first: buf may exceed seg_size if a record
         // straddled the boundary at shutdown. These ship as normal (not

@@ -565,6 +565,8 @@ mod tests {
             tx.send(BackfillTuple {
                 rfn,
                 xid: 100 + v,
+                xmax: 0,
+                infomask: 0,
                 source_lsn: 0xCAFE,
                 columns: vec![Some(crate::heap_decoder::ColumnValue::Int4(v as i32))],
             })
@@ -638,6 +640,8 @@ mod tests {
             tx.send(BackfillTuple {
                 rfn,
                 xid: v,
+                xmax: 0,
+                infomask: 0,
                 source_lsn: 1,
                 columns: vec![Some(crate::heap_decoder::ColumnValue::Int4(v as i32))],
             })

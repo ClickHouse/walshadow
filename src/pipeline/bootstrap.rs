@@ -416,6 +416,8 @@ mod tests {
                 rel_node,
             },
             xid: 99,
+            xmax: 0,
+            infomask: 0,
             source_lsn: 0x1000,
             columns: vec![Some(ColumnValue::Int4(id))],
         }
@@ -502,6 +504,8 @@ mod tests {
                 rel_node,
             },
             xid: 99,
+            xmax: 0,
+            infomask: 0,
             source_lsn: 0x1000,
             columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
                 va_rawsize: 9,
@@ -522,6 +526,8 @@ mod tests {
                 rel_node,
             },
             xid: 99,
+            xmax: 0,
+            infomask: 0,
             source_lsn: 0x1000,
             columns: vec![
                 Some(ColumnValue::Oid(value_id)),

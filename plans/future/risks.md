@@ -26,15 +26,12 @@ Over-invalidates: an unrelated `ALTER TABLE t1 ADD COLUMN` evicts
 typically benign because catalog writes are rare relative to heap
 record dispatches
 
-Cross-link: [memory note "PG version WAL skew"][mem-pg-skew] —
 PG 17's broader pg_class writes hit this granularity harder than
 PG 16. Decoder fidelity is unaffected; cache freshness churn is
 
 Defer finer scheme (per-relation invalidation keyed on relOid +
 relfilenode) until measurement says cache miss rate is hurting
 streaming throughput
-
-[mem-pg-skew]: /home/erpre/.claude/projects/-home-erpre-s-walshadow/memory/feedback_pg_version_wal_skew.md
 
 ## Filter ↔ decoder ordering near boundaries
 

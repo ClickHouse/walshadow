@@ -11,14 +11,15 @@
 //! never re-delivers it — the seed is the only chance to re-materialise the
 //! opt-in mapping (the CH table itself persists across restarts).
 //!
-//! `initial_load='copy'` on a non-empty rel hands off to the
-//! [`crate::copy_backfill::CopyBackfiller`]: a snapshot-free COPY of pre-opt-in
-//! rows at `_lsn = S` (the opt-in LSN), converging with the WAL stream via
-//! `ReplacingMergeTree(_lsn)` dedup. The backfiller's ledger dedups restarts;
-//! `None` (backfiller not wired) streams from the opt-in LSN only.
-//! Backup-sourced modes (`'base_backup'`, `'object_store'`,
-//! plans/future/initial_load_backup.md) warn and stream from the opt-in LSN
-//! until wired; so do unknown mode strings (validate-late, never crash).
+//! `initial_load` on a non-empty rel hands off to the
+//! [`crate::copy_backfill::CopyBackfiller`]: `'copy'` issues a snapshot-free
+//! COPY of pre-opt-in rows at `_lsn = S` (the opt-in LSN); `'base_backup'` /
+//! `'object_store'` coalesce into a backup-sourced page-walk pass
+//! ([`crate::backup_backfill`], plans/add_table.md). All
+//! converge with the WAL stream via `ReplacingMergeTree(_lsn)` dedup, and the
+//! backfiller's ledger dedups restarts. `None` (backfiller not wired) streams
+//! from the opt-in LSN only; so do unknown mode strings (validate-late, never
+//! crash).
 
 use std::sync::Arc;
 
@@ -126,20 +127,16 @@ async fn opt_in_known(
     resolver.materialize_opt_in(desc, row.target.clone()).await;
     if let Some(mode) = row.initial_load.as_deref() {
         match InitialLoadMode::parse(mode) {
-            Some(InitialLoadMode::Copy) => match backfiller {
-                Some(b) => b.note_opt_in(desc, opt_in_lsn).await,
+            Some(InitialLoadMode::None) => {}
+            Some(parsed) => match backfiller {
+                Some(b) => b.note_opt_in(desc, parsed, opt_in_lsn).await,
                 None => tracing::info!(
                     target: "walshadow::config",
                     qname = %desc.qualified_name,
+                    mode,
                     "initial_load requested but no backfiller wired; streaming from opt-in LSN only",
                 ),
             },
-            Some(InitialLoadMode::BaseBackup | InitialLoadMode::ObjectStore) => tracing::warn!(
-                target: "walshadow::config",
-                qname = %desc.qualified_name,
-                mode,
-                "backup-sourced initial_load not implemented (plans/future/initial_load_backup.md); streaming from opt-in LSN only",
-            ),
             None => tracing::warn!(
                 target: "walshadow::config",
                 qname = %desc.qualified_name,

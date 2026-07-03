@@ -127,6 +127,9 @@ pub struct EmitterConfig {
     pub flush_timeout: Duration,
     /// Keyed on `"<namespace>.<relname>"`
     pub tables: HashMap<String, TableMapping>,
+    /// Per-table initial-load mode from TOML `[table.*]` blocks. Applies at
+    /// boot for pinned mappings; SQL opt-ins carry their own mode.
+    pub table_initial_loads: HashMap<String, String>,
     /// Per-namespace defaults keyed on PG schema name; per-table
     /// entries in `tables` win for the relation they name
     pub namespaces: HashMap<String, NamespaceMapping>,
@@ -199,6 +202,7 @@ impl Default for EmitterConfig {
             byte_budget: DEFAULT_BYTE_BUDGET,
             flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
             tables: HashMap::new(),
+            table_initial_loads: HashMap::new(),
             namespaces: HashMap::new(),
             drop_table_strategy: "retain".into(),
             retry: RetryConfig::default(),
@@ -327,6 +331,8 @@ impl EmitterConfig {
     /// compression = "lz4"   # one of none / lz4 / zstd
     ///
     /// [table."public.foo"]
+    /// replicate = true
+    /// initial_load = "none"  # one of none / copy / base_backup / object_store
     /// target = "default.foo"
     /// columns = [
     ///   { attnum = 1, target = "id",   type = "UInt64" },
@@ -441,6 +447,10 @@ impl EmitterConfig {
                 let t = v
                     .as_table()
                     .ok_or_else(|| EmitterError::Config(format!("table.{k}: expected a table")))?;
+                let replicate = t.get("replicate").and_then(Value::as_bool).unwrap_or(true);
+                if !replicate {
+                    continue;
+                }
                 let target = t
                     .get("target")
                     .and_then(Value::as_str)
@@ -488,6 +498,9 @@ impl EmitterConfig {
                 }
                 out.tables
                     .insert(k.clone(), TableMapping { target, columns });
+                if let Some(mode) = t.get("initial_load").and_then(Value::as_str) {
+                    out.table_initial_loads.insert(k.clone(), mode.to_string());
+                }
             }
         }
         Ok(out)
@@ -1783,7 +1796,6 @@ mod tests {
         assert!(plan.insert_sql.contains("`name`"));
         assert!(plan.insert_sql.contains("`_lsn`"));
         assert!(plan.insert_sql.contains("`_xid`"));
-        assert!(!plan.insert_sql.contains("`_op`"));
         assert!(plan.insert_sql.contains("`_commit_ts`"));
         assert!(plan.insert_sql.contains("`_is_deleted`"));
         assert!(plan.insert_sql.ends_with(") FORMAT Native"));
@@ -1938,6 +1950,7 @@ mod tests {
             byte_budget = 4096
 
             [table."public.foo"]
+            initial_load = "copy"
             target = "default.foo"
             columns = [
               { attnum = 1, target = "id",   type = "UInt64" },
@@ -1963,8 +1976,25 @@ mod tests {
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.columns[0].src_attnum, 1);
         assert_eq!(t.columns[1].target_type, "Nullable(String)");
+        assert_eq!(
+            c.table_initial_loads.get("public.foo").map(String::as_str),
+            Some("copy")
+        );
         // soft_delete defaults off when the key is absent
         assert!(!c.soft_delete);
+    }
+
+    #[test]
+    fn config_table_replicate_false_skips_mapping() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.\"public.skip\"]\n\
+             replicate = false\n\
+             initial_load = \"copy\"\n",
+        )
+        .unwrap();
+        assert!(!c.tables.contains_key("public.skip"));
+        assert!(!c.table_initial_loads.contains_key("public.skip"));
     }
 
     #[test]

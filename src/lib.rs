@@ -22,6 +22,8 @@ macro_rules! trace_span {
 #[macro_use]
 pub mod atomic_stats;
 pub mod backfill_bootstrap;
+pub mod backfill_staging;
+pub mod backup_backfill;
 pub mod backup_page_walk;
 pub mod backup_sink;
 pub mod backup_source;
@@ -62,6 +64,7 @@ pub mod streaming_walker;
 pub mod toast;
 pub mod trace;
 pub mod type_bridge;
+pub mod visibility;
 pub mod wal_page;
 pub mod wal_stream;
 pub mod xact_buffer;

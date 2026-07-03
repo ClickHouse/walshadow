@@ -250,7 +250,7 @@ reconciliation, durable and cache-free), keep a *source-shape* baseline
 for *rename/drop* fidelity. Diffing then runs in two spaces — CH
 existence checks in target-name space, the source-shape diff in PG attnum
 space — reconciled via the mapping (`src_attnum ↔ target_name`), filtering
-the synthetic `_lsn` / `_xid` / `_op` / `_commit_ts` columns out of the CH
+the synthetic `_lsn` / `_xid` / `_commit_ts` / `_is_deleted` columns out of the CH
 side before comparison.
 
 ### Boot-time drift (Gap 2)
