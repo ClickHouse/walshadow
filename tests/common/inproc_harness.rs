@@ -610,19 +610,10 @@ async fn build_pipeline_inner(
         .await
         .set_invalidation_epoch(inv_epoch.clone());
 
-    // pg_class delete epoch gates the reorder coordinator's commit-boundary
-    // DROP sweep. Only the DDL path needs it (mirrors bin/stream.rs).
-    let del_epoch = Arc::new(AtomicU64::new(0));
-    if ddl.is_some() {
-        stream
-            .filter_mut()
-            .tracker
-            .set_pg_class_delete_epoch(del_epoch.clone());
-        catalog
-            .lock()
-            .await
-            .set_pg_class_delete_epoch(del_epoch.clone());
-    }
+    // Xid-keyed DROP-sweep arming for the reorder coordinator's
+    // commit-boundary sweep. Only the DDL path needs it (mirrors
+    // bin/stream.rs).
+    let pending_sweeps = walshadow::catalog_tracker::PendingSweeps::new();
 
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await
@@ -699,7 +690,7 @@ async fn build_pipeline_inner(
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
         schema_events: schema_events.clone(),
-        pg_class_delete_epoch: ddl.as_ref().map(|_| del_epoch.clone()),
+        pending_sweeps: ddl.as_ref().map(|_| pending_sweeps.clone()),
         stats: stats.clone(),
         span_registry: None,
     };
@@ -709,7 +700,7 @@ async fn build_pipeline_inner(
         .expect("spawn decode+insert pipeline");
 
     let mut decoder = BufferingDecoderSink::new(catalog, xact_buffer.clone())
-        .with_catalog_signal_epochs(inv_epoch, ddl.as_ref().map(|_| del_epoch.clone()));
+        .with_catalog_signals(inv_epoch, ddl.as_ref().map(|_| pending_sweeps.clone()));
     if let Some(rx) = &schema_events {
         decoder = decoder.with_schema_events(rx.clone());
     }

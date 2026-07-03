@@ -151,11 +151,15 @@ impl SubxactTracker {
 }
 
 /// Parsed body of `xl_xact_commit` / `xl_xact_abort`. Consumer needs
-/// only timestamp + subxact list; remaining xinfo tails are skip-walked
+/// timestamp + subxact list + prepared xid; remaining xinfo tails are
+/// skip-walked
 #[derive(Debug, Default)]
 pub(crate) struct XactCommitPayload {
     pub(crate) xact_time: i64,
     pub(crate) subxacts: Vec<u32>,
+    /// `xl_xact_twophase` xid on COMMIT/ABORT PREPARED; the header's
+    /// `xact_id` is the finishing backend's, not the prepared xact's
+    pub(crate) twophase_xid: Option<u32>,
 }
 
 /// Parse `xl_xact_assignment` (PG `access/xact.h`) into `(xtop,
@@ -296,6 +300,7 @@ pub(crate) fn parse_xact_payload(info: u8, main_data: &[u8]) -> XactCommitPayloa
         if main_data.len() < p + 4 {
             return out;
         }
+        out.twophase_xid = Some(u32::from_le_bytes(main_data[p..p + 4].try_into().unwrap()));
         p += 4;
         if xinfo & XACT_XINFO_HAS_GID != 0 {
             // null-terminated GID
@@ -1594,12 +1599,14 @@ pub struct XactRecordSink<O: TupleObserver + Send> {
     /// Same handle [`BufferingDecoderSink`] holds; this sink drains it
     /// post-`sweep_dropped` to route `Dropped` events into the buffer
     schema_events: Option<SchemaEventRx>,
-    /// Shared with `ShadowCatalog`/`CatalogTracker`
-    /// `set_pg_class_delete_epoch`. Atomic-load skips the per-commit
-    /// catalog-lock acquire when no DROP TABLE fired; that lock contends
-    /// with `wait_for_replay` and serialised the drain at pgbench rates
-    pg_class_delete_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
-    last_seen_delete_epoch: u64,
+    /// Armed by [`BufferingDecoderSink`] at pg_class heap_delete records,
+    /// consumed here only at the arming xact's own commit — an epoch
+    /// consumed at an interleaved commit sweeps before the drop is
+    /// commit-visible in shadow and loses the Dropped event. Also skips
+    /// the per-commit catalog-lock acquire when no DROP fired; that lock
+    /// contends with `wait_for_replay` and serialised the drain at
+    /// pgbench rates
+    pending_sweeps: Option<crate::catalog_tracker::PendingSweeps>,
     /// Serial drain is metrics-only (no `--ch-config`), so this stays
     /// disabled by default: same-xact values reassemble inline, misses
     /// NULL/default-fill.
@@ -1618,8 +1625,7 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             observer,
             schema_events: None,
-            pg_class_delete_epoch: None,
-            last_seen_delete_epoch: 0,
+            pending_sweeps: None,
             resolver: ToastResolver::disabled(),
         }
     }
@@ -1635,22 +1641,21 @@ impl<O: TupleObserver + Send> XactRecordSink<O> {
         self
     }
 
-    /// Sink runs [`ShadowCatalog::sweep_dropped`] per commit; resulting
-    /// `Dropped` events flow into the buffer keyed on the commit's
-    /// xid + LSN. Pass the same `rx` as
+    /// Sink runs [`ShadowCatalog::sweep_dropped`] at armed commits;
+    /// resulting `Dropped` events flow into the buffer keyed on the
+    /// commit's xid + LSN. Pass the same `rx` as
     /// [`BufferingDecoderSink::with_schema_events`].
     pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
         self.schema_events = Some(rx);
         self
     }
 
-    /// Pair with
-    /// [`crate::catalog_tracker::CatalogTracker::set_pg_class_delete_epoch`]
-    /// and [`ShadowCatalog::set_pg_class_delete_epoch`]; gates
-    /// [`ShadowCatalog::sweep_dropped`] without the contended catalog lock.
-    pub fn with_pg_class_delete_epoch(mut self, epoch: Arc<std::sync::atomic::AtomicU64>) -> Self {
-        self.last_seen_delete_epoch = epoch.load(std::sync::atomic::Ordering::Acquire);
-        self.pg_class_delete_epoch = Some(epoch);
+    /// Pass the same handle as
+    /// [`BufferingDecoderSink::with_catalog_signals`]; gates
+    /// [`ShadowCatalog::sweep_dropped`] on the arming xact's commit
+    /// without the contended catalog lock.
+    pub fn with_pending_sweeps(mut self, pending: crate::catalog_tracker::PendingSweeps) -> Self {
+        self.pending_sweeps = Some(pending);
         self
     }
 
@@ -1703,32 +1708,29 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                     // catalogs default to `relreplident = 'n'`, so
                     // heap_delete WAL omits the dying oid; only way to
                     // detect a drop is asking shadow if known oids still
-                    // exist. Epoch gate fires only on heap_delete against
+                    // exist. Arming fires only on heap_delete against
                     // pg_class (DROP TABLE's WAL signature), not on the
-                    // ADD COLUMN / CREATE INDEX / VACUUM catalog flood.
-                    if self.schema_events.is_some() {
-                        let current_delete_epoch = self
-                            .pg_class_delete_epoch
-                            .as_ref()
-                            .map(|e| e.load(std::sync::atomic::Ordering::Acquire))
-                            .unwrap_or(self.last_seen_delete_epoch);
-                        if current_delete_epoch != self.last_seen_delete_epoch {
-                            let mut cat = self.catalog.lock().await;
-                            if record.source_lsn > 0 {
-                                cat.wait_for_replay(record.source_lsn)
-                                    .await
-                                    .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
-                            }
-                            let dropped_count = cat
-                                .sweep_dropped()
+                    // ADD COLUMN / CREATE INDEX / VACUUM catalog flood;
+                    // consumption only at the arming xact's own commit,
+                    // whose replay gate makes the drop visible in shadow.
+                    if self.schema_events.is_some()
+                        && let Some(pending) = &self.pending_sweeps
+                        && pending.disarm(xid, payload.twophase_xid, &payload.subxacts)
+                    {
+                        let mut cat = self.catalog.lock().await;
+                        if record.source_lsn > 0 {
+                            cat.wait_for_replay(record.source_lsn)
                                 .await
                                 .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
-                            drop(cat);
-                            self.last_seen_delete_epoch = current_delete_epoch;
-                            if dropped_count > 0 {
-                                self.route_pending_schema_events(xid, record.source_lsn)
-                                    .await?;
-                            }
+                        }
+                        let dropped_count = cat
+                            .sweep_dropped()
+                            .await
+                            .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
+                        drop(cat);
+                        if dropped_count > 0 {
+                            self.route_pending_schema_events(xid, record.source_lsn)
+                                .await?;
                         }
                     }
                     let mut buf = self.buffer.lock().await;
@@ -1757,6 +1759,11 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                 }
                 XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
                     let payload = parse_xact_payload(info, &record.parsed.main_data);
+                    // Rolled-back pg_class heap_delete resurrects the row;
+                    // no sweep, drop the arm
+                    if let Some(pending) = &self.pending_sweeps {
+                        pending.disarm(xid, payload.twophase_xid, &payload.subxacts);
+                    }
                     tracing::trace!(
                         target: "walshadow::xact_buffer",
                         xid,
@@ -1878,9 +1885,11 @@ pub struct BufferingDecoderSink {
     /// gate guarantees a fresh fetch. `None` (bootstrap, tests without an
     /// epoch) skips the bump
     invalidation_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// [`CatalogSignal::InvalidateSweep`] sibling of `invalidation_epoch`,
-    /// arming `ShadowCatalog::sweep_dropped` at worker position
-    pg_class_delete_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// [`CatalogSignal::InvalidateSweep`](crate::catalog_tracker::CatalogSignal::InvalidateSweep)
+    /// sibling of `invalidation_epoch`: arms `ShadowCatalog::sweep_dropped`
+    /// at worker position, keyed by the record's xid so the commit sink
+    /// consumes it only at that xact's own commit
+    pending_sweeps: Option<crate::catalog_tracker::PendingSweeps>,
 }
 
 impl BufferingDecoderSink {
@@ -1893,21 +1902,22 @@ impl BufferingDecoderSink {
             span_registry: None,
             rel_cache: None,
             invalidation_epoch: None,
-            pg_class_delete_epoch: None,
+            pending_sweeps: None,
         }
     }
 
-    /// Wire the shared epochs for [`Record::catalog_signal`] re-bumps (same
-    /// `Arc`s as `CatalogTracker::set_invalidation_epoch` /
-    /// `set_pg_class_delete_epoch`). Production must set these whenever the
+    /// Wire [`Record::catalog_signal`] targets: the invalidation-epoch
+    /// bump (same `Arc` as `ShadowCatalog::set_invalidation_epoch`)
+    /// and the DROP-sweep armer (same handle as the commit sink's
+    /// `with_pending_sweeps`). Production must set these whenever the
     /// sink runs behind a `QueueingRecordSink`.
-    pub fn with_catalog_signal_epochs(
+    pub fn with_catalog_signals(
         mut self,
         invalidation: Arc<std::sync::atomic::AtomicU64>,
-        pg_class_delete: Option<Arc<std::sync::atomic::AtomicU64>>,
+        pending_sweeps: Option<crate::catalog_tracker::PendingSweeps>,
     ) -> Self {
         self.invalidation_epoch = Some(invalidation);
-        self.pg_class_delete_epoch = pg_class_delete;
+        self.pending_sweeps = pending_sweeps;
         self
     }
 
@@ -2037,9 +2047,9 @@ impl RecordSink for BufferingDecoderSink {
                     e.fetch_add(1, std::sync::atomic::Ordering::Release);
                 }
                 if record.catalog_signal == crate::catalog_tracker::CatalogSignal::InvalidateSweep
-                    && let Some(e) = &self.pg_class_delete_epoch
+                    && let Some(p) = &self.pending_sweeps
                 {
-                    e.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    p.arm(record.parsed.header.xact_id);
                 }
             }
             let rm = record.parsed.header.resource_manager_id;
@@ -2683,6 +2693,25 @@ mod tests {
         let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &[1, 2, 3, 4]);
         assert_eq!(p.xact_time, 0);
         assert!(p.subxacts.is_empty());
+        assert_eq!(p.twophase_xid, None);
+    }
+
+    #[test]
+    fn parse_xact_payload_extracts_twophase_xid_past_inval_skip() {
+        // COMMIT PREPARED shape: xinfo = INVALS | TWOPHASE | GID; the
+        // prepared xid keys DROP-sweep disarm (header xact_id is the
+        // finishing backend's, not the prepared xact's)
+        let mut body = Vec::new();
+        body.extend_from_slice(&42i64.to_le_bytes()); // xact_time
+        body.extend_from_slice(
+            &(XACT_XINFO_HAS_INVALS | XACT_XINFO_HAS_TWOPHASE | XACT_XINFO_HAS_GID).to_le_bytes(),
+        );
+        body.extend_from_slice(&1i32.to_le_bytes()); // nmsgs
+        body.extend_from_slice(&[0u8; 16]); // SharedInvalidationMessage
+        body.extend_from_slice(&0x1234u32.to_le_bytes()); // xl_xact_twophase
+        body.extend_from_slice(b"gid\0");
+        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &body);
+        assert_eq!(p.twophase_xid, Some(0x1234));
     }
 
     #[tokio::test(flavor = "current_thread")]

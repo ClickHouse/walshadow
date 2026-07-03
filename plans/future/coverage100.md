@@ -107,7 +107,7 @@ existing harnesses rather than adding binaries
 - `backfill_bootstrap.rs` drain arms and `backup_source*` start / finish /
   tablespace symlink: extend `tests/bootstrap_*_e2e.rs` with tablespace-bearing
   source
-- Catalog-bound accessors: assert `shadow_catalog` `has_pending_sweep` /
+- Catalog-bound accessors: assert `shadow_catalog`
   `last_observed_replay` and `xact_buffer` `with_subxact_tracker` /
   `subxact_tracker` where existing catalog e2e tests already have real
   `ShadowCatalog`

@@ -399,7 +399,7 @@ original (pre-pipeline) walls for context.
 
 `PipelineConfig::spawn` is WAL-shaped: it wires `ReorderSink` (which needs
 `XactBuffer`, `SubxactTracker`, `DdlApplicator`, `schema_events`,
-`pg_class_delete_epoch`) plus the decode pool, batcher, inserters, ack.
+`pending_sweeps`) plus the decode pool, batcher, inserters, ack.
 Bootstrap has none of the reorder inputs. The reusable unit is the
 **tail = batcher + inserter pool + ack collector**, fed by a
 `mpsc::Sender<BatcherMsg>` and an `AckHandle`. Factor it out of
