@@ -1273,6 +1273,12 @@ fn encode_value(
 /// atomically on SIGHUP reload; readers see the swap between rows, and a
 /// table's cached [`TablePlan`] rebuilds on the next epoch (after a
 /// barrier) so subsequent batches encode against the new map.
+///
+/// Contract: every write must be followed (after the guard drops) by
+/// [`crate::ch_ddl::bump_mapping_epoch`] on the shared invalidation epoch —
+/// decode-pool `RelCache`s key mapping-snapshot freshness on it, and the
+/// decoder worker's record-time bump lands before barrier apply mutates
+/// this map.
 pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>;
 
 crate::atomic_stats! {

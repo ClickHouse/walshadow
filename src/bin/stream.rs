@@ -682,7 +682,7 @@ async fn run(args: Args) -> Result<()> {
         .set_pg_class_delete_epoch(pg_class_delete_epoch.clone());
     {
         let mut cat = catalog.lock().await;
-        cat.set_invalidation_epoch(invalidation_epoch);
+        cat.set_invalidation_epoch(invalidation_epoch.clone());
         cat.set_pg_class_delete_epoch(pg_class_delete_epoch.clone());
     }
 
@@ -823,7 +823,8 @@ async fn run(args: Args) -> Result<()> {
             let applicator =
                 walshadow::ch_ddl::DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone())
                     .await
-                    .context("init DDL applicator")?;
+                    .context("init DDL applicator")?
+                    .with_invalidation_epoch(invalidation_epoch.clone());
             let stats = Arc::new(EmitterStats::default());
             emitter_stats_handle = Some(stats.clone());
             // Seed durable watermark at `raw_start`, not 0. Status loop
@@ -938,7 +939,7 @@ async fn run(args: Args) -> Result<()> {
     // SIGHUP swaps only the per-relation mapping; connection params stay boot-only.
     let sighup_path = args.ch_config.clone();
     let sighup_handle = mapping_handle.clone();
-    let _sighup_task = spawn_sighup_handler(sighup_path, sighup_handle);
+    let _sighup_task = spawn_sighup_handler(sighup_path, sighup_handle, invalidation_epoch.clone());
 
     // Retention sweeper writes shadow's `pg_last_wal_replay_lsn` here;
     // status loop reads it for the cursor's `shadow_replay_lsn` slot + the
@@ -1295,10 +1296,12 @@ async fn open_shadow_sql_client(
 
 /// SIGHUP listener: re-parses `--ch-config` and atomically swaps the live
 /// mapping. Parse errors keep the existing mapping; absent `--ch-config`
-/// is a no-op tap.
+/// is a no-op tap. `epoch` bumps after each swap so decode-pool workers
+/// drop cached pre-reload mapping snapshots.
 fn spawn_sighup_handler(
     path: Option<PathBuf>,
     handle: Option<MappingHandle>,
+    epoch: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -1324,6 +1327,7 @@ fn spawn_sighup_handler(
                 Ok(toml) => match EmitterConfig::from_toml_str(&toml) {
                     Ok(cfg) => {
                         *h.write().await = cfg.tables;
+                        walshadow::ch_ddl::bump_mapping_epoch(Some(&epoch));
                         tracing::info!(
                             target: "walshadow::sighup",
                             path = %p.display(),
