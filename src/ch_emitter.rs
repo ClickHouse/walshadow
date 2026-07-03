@@ -139,6 +139,11 @@ pub struct EmitterConfig {
     /// so the inserter reconnects + resends rather than pinning the
     /// durable watermark forever. Sized far above a healthy round-trip.
     pub insert_timeout: Duration,
+    /// A CH connection idle longer than this may be half-open (NAT/LB/CH
+    /// idle-reap); reconnect before the next op instead of blocking the
+    /// full `insert_timeout` on a dead socket. Guards the start of a run,
+    /// when connections sat idle since the previous one.
+    pub idle_reconnect: Duration,
     /// Keep `_is_deleted` out of `ReplacingMergeTree`'s args so delete
     /// tombstones stay queryable instead of collapsing on FINAL. Column
     /// always emitted; off by default
@@ -153,6 +158,7 @@ pub struct EmitterConfig {
 }
 
 pub const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
 
 /// Bounded-retry knobs. Retryable error (IO, clickhouse-c protocol,
 /// ServerException) triggers reconnect + retry up to `max_attempts`
@@ -193,6 +199,7 @@ impl Default for EmitterConfig {
             drop_table_strategy: "retain".into(),
             retry: RetryConfig::default(),
             insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
+            idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
             soft_delete: false,
             toast: crate::toast::ToastConfig::default(),
             decode_chunk_rows: crate::pipeline::decode::DECODE_CHUNK_ROWS,
@@ -627,6 +634,22 @@ pub(crate) async fn connect_client(config: &EmitterConfig) -> Result<AsyncClient
         AsyncClient::connect(addr, opts, codec).await?
     };
     Ok(client)
+}
+
+/// Reconnect `client` when idle since `last_used` exceeds `config.idle_reconnect`.
+/// A long-idle socket may be silently half-open; the first op on it would
+/// otherwise block the full `insert_timeout` before the reconnect-retry path
+/// notices. No-op during active streaming (connections used sub-second).
+pub(crate) async fn reconnect_if_idle(
+    client: &mut AsyncClient,
+    config: &EmitterConfig,
+    last_used: std::time::Instant,
+) -> Result<bool, EmitterError> {
+    if last_used.elapsed() >= config.idle_reconnect {
+        *client = connect_client(config).await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Drain a CH response stream to `EndOfStream`, surfacing any
