@@ -143,22 +143,23 @@ surgical when the xact also carries changes to keep.
 
 The base `config_table` ([../config.md](../config.md)) carries only `target`.
 This adds two columns — `replicate` (bool, doubles as the inclusion switch)
-and `initial_load` (text mode: NULL none, `'copy'`, `'base_backup'`,
-`'object_store'`) — collapsing three intents into one relation: (a) override
+and `initial_load` (text mode: `'none'`, `'copy'`, `'base_backup'`,
+`'object_store'`; SQL NULL means omitted) — collapsing three intents into one
+relation: (a) override
 mapping for a table already in scope, (b) forward-declare config for a table
 that doesn't yet exist, (c) opt an existing-but-unreplicated table into scope
 plus initial-load it. `'copy'` is the snapshot-free COPY below; the
 backup-sourced modes are designed in
-[initial_load_backup.md](initial_load_backup.md). Unknown mode strings warn
+[add_table.md](../add_table.md). Unknown mode strings warn
 and stream from the opt-in LSN only (validate-late, never crash). Resolver
 inspects `replicate` + `initial_load` + catalog state to dispatch:
 
 | row state | rfn known? | table empty? | action |
 |---|---|---|---|
-| `replicate=t, initial_load=NULL` | yes | n/a | inclusion-list add; WAL-driven from current LSN, no backfill |
+| `replicate=t, initial_load='none'/NULL` | yes | n/a | inclusion-list add; WAL-driven from current LSN, no backfill |
 | `replicate=t, initial_load='copy'` | yes | yes | mark streaming, no backfill needed |
 | `replicate=t, initial_load='copy'` | yes | no | enqueue COPY backfill (see below) |
-| `replicate=t, initial_load='base_backup'/'object_store'` | yes | no | enqueue backup-sourced backfill ([initial_load_backup.md](initial_load_backup.md)) |
+| `replicate=t, initial_load='base_backup'/'object_store'` | yes | no | enqueue backup-sourced backfill ([add_table.md](../add_table.md)) |
 | `replicate=t` | no (forward-decl) | n/a | hold row, materialize when CREATE TABLE for matching qualname arrives via catalog applicator |
 | `replicate=f` | yes | n/a | inclusion-list remove; mid-stream exclusion drains in-flight rows then halts further emission |
 

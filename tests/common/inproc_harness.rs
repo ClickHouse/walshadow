@@ -710,6 +710,7 @@ async fn build_pipeline_inner(
                 emitter_cfg.clone(),
                 mapping.clone(),
                 stats.clone(),
+                catalog.clone(),
                 &spill_dir,
             )
             .await,
@@ -772,7 +773,7 @@ async fn build_pipeline_inner(
 /// `segments_needed` segments have shipped or `deadline` elapses.
 /// Returns the count shipped. Generic over the record sink so the
 /// [`Pipeline`] drive and the bootstrap drills reuse one loop.
-pub async fn pump_until<S: RecordSink>(
+pub async fn pump_until<S: RecordSink + Send>(
     feed: &mut SourceFeed,
     stream: &mut WalStream,
     record_sink: &mut S,

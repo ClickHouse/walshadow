@@ -111,6 +111,8 @@ password = ""
 compression = "lz4"
 
 [table."public.users"]
+replicate = true
+initial_load = "none"
 target = "users"
 columns = [
     { attnum = 1, target = "id",    type = "UInt64" },

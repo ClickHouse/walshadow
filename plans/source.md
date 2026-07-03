@@ -179,14 +179,14 @@ NOOP for shadow's benefit). Pre-rewrite parse carried on
 Decouples decoder's `ShadowCatalog::wait_for_replay` from pump task
 
 Wire ordering fires `RecordBytesSink::on_wire_chunk` before
-`RecordSink::on_record` per record, both awaited inline. Steady
-workload: catalog gate resolves in ms because shadow's apply LSN
-advances on the wire. Sustained DDL: gate can take seconds — pump task
-parks inside the await, `bytes_sink` stops firing → walsender
-per-connection queues drain → shadow's walreceiver stalls → apply LSN
-sticks below `record.source_lsn` → `wait_for_replay` trips 30s timeout.
-Pump and shadow deadlocked (`pgbench_acceptance` + `kill_restart`
-failure mode)
+`RecordSink::on_record` per record, so the catalog gate always targets
+bytes already handed to the wire; it clears once shadow applies them
+(walsender queue → walreceiver flush → startup replay → poll), a chain
+independent of pump. Steady workload: gate resolves in ms. Sustained
+DDL: gate takes seconds — awaited inline on pump it freezes wire
+delivery for each full apply round-trip and couples wire pacing to
+decode, turning any delivery path that needs fresh pump bytes into a
+deadlock
 
 `QueueingRecordSink::spawn` takes inner `RecordSink + Send + 'static`,
 `batch_size`, `soft_cap`. Pump-side `on_record` clones record to
@@ -354,7 +354,8 @@ Sink: `ShadowStreamSink` composes via
 [`ShadowStreamState`](../src/shadow_stream.rs) behind one
 `Arc<Mutex>`. Slow-client cutoff drops socket past
 `walsender_slow_threshold` queued bytes; shadow catches up via
-`restore_command` from `out/`. See [shadow.md](shadow.md)
+`restore_command` from `out/` plus in-segment `wire_buf` backfill on
+reconnect. See [shadow.md](shadow.md)
 
 ## Binary
 

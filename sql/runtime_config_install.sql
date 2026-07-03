@@ -47,9 +47,8 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_table (
                                      -- opt-out, NULL leaves scope unchanged
                                      -- (target override only, as before)
     initial_load text,               -- one-time backfill mode for pre-opt-in
-                                     -- rows: 'copy' | 'base_backup' |
-                                     -- 'object_store'; NULL streams from the
-                                     -- opt-in LSN with no backfill
+                                     -- rows: 'none' | 'copy' | 'base_backup'
+                                     -- | 'object_store'; NULL means omitted
     PRIMARY KEY (namespace, relname)
 );
 

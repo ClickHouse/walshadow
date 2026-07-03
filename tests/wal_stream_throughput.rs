@@ -159,7 +159,7 @@ async fn run_case(
     seg: &[u8],
     records: u64,
     iterations: usize,
-    record_sink: &mut dyn RecordSink,
+    record_sink: &mut (dyn RecordSink + Send),
     bytes_sink: Option<Box<dyn walshadow::wal_stream::RecordBytesSink + Send>>,
 ) {
     let mut stream = WalStream::new(1, SEG_SIZE, 0).unwrap();

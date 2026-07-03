@@ -175,8 +175,13 @@ impl BackupSource for ObjectStoreSource {
 }
 
 /// Build (start, end) from sentinel fields. Timeline is the backup
-/// name's first 8 hex chars, per wal-rus `format_backup_name`.
-fn build_lsn_pair(resolved_name: &str, s: &BackupSentinelDtoV2) -> Result<(StartInfo, EndInfo)> {
+/// name's first 8 hex chars, per wal-rus `format_backup_name`. Shared with
+/// the per-table backup backfill's sentinel pre-resolve
+/// ([`crate::backup_backfill`]).
+pub(crate) fn build_lsn_pair(
+    resolved_name: &str,
+    s: &BackupSentinelDtoV2,
+) -> Result<(StartInfo, EndInfo)> {
     let start_lsn = s
         .sentinel
         .backup_start_lsn

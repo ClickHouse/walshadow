@@ -231,11 +231,11 @@ struct ChState {
 /// Mirror `pg_toast_<relid>` relations to ClickHouse, one CH table per toast
 /// relation, chunks as rows. Backs [`ToastMode::ClickHouse`].
 ///
-/// Schema (minimal mirror — under R2 in `plans/future/TOAST.md` the table is a
+/// Schema (minimal mirror — under R2 in `plans/TOAST.md` the table is a
 /// chunk *source* for the reassembler, not a query-time JOIN target, so it
 /// stores only what the reassembler needs plus the `_lsn` convergence key; the
-/// [`ChunkStore`] layer carries no `_xid`/`_commit_ts`/`_op`, so those doc
-/// columns are omitted):
+/// [`ChunkStore`] layer carries no `_xid`/`_commit_ts`/`_is_deleted`, so those
+/// doc columns are omitted):
 ///
 /// ```text
 /// CREATE TABLE `<db>`.`pg_toast_<relid>` (

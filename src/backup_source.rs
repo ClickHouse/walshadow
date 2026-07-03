@@ -53,7 +53,7 @@ pub enum FileKind {
 /// - `global/1213` shared catalog
 /// - `pg_control` controlfile
 /// - `pg_tblspc/16384` tablespace symlink
-/// - `pg_xact/0000` clog file
+/// - `pg_xact/0000` transaction-status file
 #[derive(Debug, Clone)]
 pub struct FileMeta {
     pub path: PathBuf,

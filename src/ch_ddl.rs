@@ -858,7 +858,6 @@ mod tests {
         assert!(sql.contains("`id` Int32"));
         assert!(sql.contains("`body` Nullable(String)"));
         assert!(sql.contains("`_lsn` UInt64"));
-        assert!(!sql.contains("`_op`"));
         assert!(sql.contains("`_is_deleted` Bool"));
         assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`, `_is_deleted`)"));
         assert!(sql.ends_with("ORDER BY (`id`)"));

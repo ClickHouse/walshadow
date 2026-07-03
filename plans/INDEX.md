@@ -2,7 +2,8 @@
 
 Component docs for walshadow's current implementation state. Start at
 [overview.md](overview.md) for system shape, then drop into individual
-components. Future-work proposals live under [future/](future/INDEX.md)
+components. Future-work proposals live under [future/](future/INDEX.md).
+Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
 
 ## Components
 

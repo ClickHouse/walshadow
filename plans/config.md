@@ -67,14 +67,16 @@ daemon — preserving walshadow's read-only-source posture. Four tables:
   `drop_table_strategy`
 - `config_namespace` — key `namespace`: `target_database`, `auto_create`,
   `drop_table_strategy`
-- `config_table` — key `(namespace, relname)`: `target` (`"<db>.<table>"`).
-  Text key, not relfilenode — rfn is unknown at row-insert time for
+- `config_table` — key `(namespace, relname)`: `target` (`"<db>.<table>"`),
+  `replicate`, `initial_load` (`none`, `copy`, `base_backup`, `object_store`).
+  Text key, not relfilenode, rfn is unknown at row-insert time for
   forward-declared tables
 - `config_column` — key `(namespace, relname, attname)`: `target_type`
 
 Every column is nullable and NULL means "daemon default / TOML applies", so the
 schema grows additively: a newer daemon reading an older install still works.
-All four carry `REPLICA IDENTITY FULL` — see decode below.
+TOML `[table.*]` blocks take the same mode strings; omitting the key there
+matches SQL NULL. All four carry `REPLICA IDENTITY FULL`, see decode below.
 
 ## Decode + interpret
 
@@ -135,8 +137,11 @@ contexts (boot seed, SIGHUP) and the DDL applicator's own `DdlConfig` refresh.
 `bin/stream.rs::seed_runtime_config` runs between catalog seed and pump start,
 when the overlay is enabled: four `SELECT`s through the source sidecar libpq
 connection populate a `ConfigOverlay`, handed to `ConfigResolver::seed_overlay`,
-then the pump starts and WAL becomes the only config source. The `config_global`
-read doubles as the install probe: a missing table errors there, so a schema
+then the pump starts and WAL becomes the only config source. TOML
+`initial_load` for pinned mappings dispatches after this seed
+([add_table.md](add_table.md) covers the backup-sourced modes), so SQL
+inclusion/exclusion rows win. The `config_global` read doubles as the install
+probe: a missing table errors there, so a schema
 named in TOML but not installed refuses to start rather than silently no-op
 (explicit opt-in). A present-but-empty `config_global` is fine — greenfield
 falls through to TOML defaults, behaviour identical to TOML-only.

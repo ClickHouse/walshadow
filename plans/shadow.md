@@ -212,10 +212,13 @@ exposes `min_flush_lsn`, `min_apply_lsn`, `active_connections`,
 `dropped_total` for cursor write loop + metrics
 
 Backpressure: per-connection send queue caps at `slow_threshold` bytes;
-overflow drops socket & lets shadow reconnect via archive
-(`restore_command`) path. `server_wal_end` advanced only to bytes
-already enqueued — advertising higher value crashes PG 18's
-walreceiver on still-zero page it tries to read
+overflow drops socket & lets shadow reconnect — completed segments via
+archive (`restore_command`), in-progress segment via `wire_buf`
+backfill at register (else reconnect strands on an unappliable gap at
+segment boundary). Listener injects `'k'` keepalive past 10 s idle so
+walreceiver flushes & replies without fresh WAL. `server_wal_end`
+advanced only to bytes already enqueued — advertising higher value
+crashes PG 18's walreceiver on still-zero page it tries to read
 
 Segment cadence preserved on top of record cadence: `DirSegmentSink`
 still writes one 16 MiB segment + manifest per boundary. Wire is hot

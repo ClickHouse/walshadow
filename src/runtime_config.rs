@@ -78,30 +78,43 @@ pub struct TableRow {
     pub replicate: Option<bool>,
     /// One-time backfill mode for pre-opt-in rows, raw ([`InitialLoadMode`]
     /// parses at dispatch in [`crate::opt_in`], validate-late like every
-    /// overlay value); `None` streams from the opt-in LSN with no backfill.
+    /// overlay value); absent / `none` streams from opt-in LSN.
     pub initial_load: Option<String>,
 }
 
 /// Parsed `config_table.initial_load` mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InitialLoadMode {
+    /// No backfill, stream from opt-in LSN only.
+    None,
     /// Snapshot-free COPY at `_lsn = S` ([`crate::copy_backfill`]).
     Copy,
     /// Fresh `BASE_BACKUP` page-walk filtered to the opted-in rels
-    /// (plans/future/initial_load_backup.md).
+    /// (plans/add_table.md).
     BaseBackup,
     /// Object-store base backup + archive-WAL gap replay, filtered
-    /// (plans/future/initial_load_backup.md).
+    /// (plans/add_table.md).
     ObjectStore,
 }
 
 impl InitialLoadMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "none" => Some(Self::None),
             "copy" => Some(Self::Copy),
             "base_backup" => Some(Self::BaseBackup),
             "object_store" => Some(Self::ObjectStore),
             _ => None,
+        }
+    }
+
+    /// Inverse of [`Self::parse`]; ledger serialization + metrics labels.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Copy => "copy",
+            Self::BaseBackup => "base_backup",
+            Self::ObjectStore => "object_store",
         }
     }
 }
@@ -622,5 +635,20 @@ mod tests {
             }
             other => panic!("expected TableUpserted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn initial_load_parse_accepts_explicit_none() {
+        assert_eq!(InitialLoadMode::parse("none"), Some(InitialLoadMode::None));
+        assert_eq!(InitialLoadMode::parse("copy"), Some(InitialLoadMode::Copy));
+        assert_eq!(
+            InitialLoadMode::parse("base_backup"),
+            Some(InitialLoadMode::BaseBackup)
+        );
+        assert_eq!(
+            InitialLoadMode::parse("object_store"),
+            Some(InitialLoadMode::ObjectStore)
+        );
+        assert_eq!(InitialLoadMode::parse("null"), None);
     }
 }
