@@ -37,12 +37,11 @@ fn pg_binary(name: &str) -> Option<PathBuf> {
 }
 
 fn pg_version_compatible() -> bool {
-    let out = match std::process::Command::new("initdb")
+    let Ok(out) = std::process::Command::new("initdb")
         .arg("--version")
         .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
+    else {
+        return false;
     };
     if !out.status.success() {
         return false;

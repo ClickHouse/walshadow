@@ -48,10 +48,10 @@ struct Inserter {
 
 impl Inserter {
     fn ensure_asts(&mut self, meta: &BatchMeta) -> Result<(), EmitterError> {
-        let fresh = match self.asts.get(&meta.table_key) {
-            Some((epoch, _)) => *epoch != meta.schema_epoch,
-            None => true,
-        };
+        let fresh = self
+            .asts
+            .get(&meta.table_key)
+            .is_none_or(|(epoch, _)| *epoch != meta.schema_epoch);
         if fresh {
             let mut parsed = Vec::with_capacity(meta.columns.len());
             for col in &meta.columns {
@@ -83,7 +83,7 @@ impl Inserter {
         let mut backoff = retry.initial_backoff;
         reconnect_if_idle(&mut self.client, &self.config, self.last_used).await?;
         loop {
-            let attempt_result = match tokio::time::timeout(self.config.insert_timeout, async {
+            let attempt_result = tokio::time::timeout(self.config.insert_timeout, async {
                 self.client.send_query(sql, None).await?;
                 self.client.send_data(Some(bb)).await?;
                 self.client.send_data_end().await?;
@@ -91,15 +91,14 @@ impl Inserter {
                 drain_to_end_of_stream(&mut self.client).await
             })
             .await
-            {
-                Ok(r) => r,
-                // A connection wedged mid-INSERT must not pin the watermark:
-                // surface a retryable timeout so the retry arm reconnects and
-                // resends on a fresh socket. CH dedups the resend by `_lsn`.
-                Err(_elapsed) => Err(EmitterError::Timeout {
+            // A connection wedged mid-INSERT must not pin the watermark:
+            // surface a retryable timeout so the retry arm reconnects and
+            // resends on a fresh socket. CH dedups the resend by `_lsn`.
+            .unwrap_or_else(|_| {
+                Err(EmitterError::Timeout {
                     secs: self.config.insert_timeout.as_secs(),
-                }),
-            };
+                })
+            });
             match attempt_result {
                 Ok(()) => {
                     self.last_used = std::time::Instant::now();
@@ -163,9 +162,10 @@ impl Inserter {
                             break;
                         }
                     }
-                    match build_err {
-                        Some(e) => Err(e),
-                        None => self.send_with_retry(&batch.meta.insert_sql, &bb).await,
+                    if let Some(e) = build_err {
+                        Err(e)
+                    } else {
+                        self.send_with_retry(&batch.meta.insert_sql, &bb).await
                     }
                 }
                 Err(e) => Err(e.into()),

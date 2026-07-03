@@ -562,10 +562,18 @@ pub struct DecimalWire {
 
 impl TablePlan {
     /// Synthetic columns always non-nullable (emitter always populates).
+    ///
+    /// `column_overrides` is the `config_column` overlay slice for this rel
+    /// (source attname → CH type). Resolved here because this is where the
+    /// descriptor meets the mapping: attname→attnum comes from `rel`, and an
+    /// inadmissible override (see [`override_wire`]) falls back to the
+    /// mapping's type with a WARN — a config row must degrade, never poison
+    /// the batcher (Regime A).
     pub(crate) fn build(
         alloc: Allocator,
         rel: &RelDescriptor,
         mapping: &TableMapping,
+        column_overrides: Option<&HashMap<String, String>>,
     ) -> Result<Self, EmitterError> {
         let mut columns = Vec::with_capacity(mapping.columns.len());
         let mut col_sql = Vec::with_capacity(mapping.columns.len() + 4);
@@ -574,17 +582,54 @@ impl TablePlan {
         // pre-ALTER xacts legitimately see fewer attnums. append_row
         // emits NULL for any missing attnum, so a static-config typo
         // surfaces as an always-NULL column (or CH reject if non-nullable)
-        let _ = rel;
         for c in &mapping.columns {
             let ast = TypeAst::parse(&c.target_type, alloc)
                 .map_err(|e| EmitterError::Type(format!("{}: {e}", c.target_type)))?;
             let decimal = decimal_wire_of(&ast);
-            columns.push(ColumnPlan {
+            let mut plan = ColumnPlan {
                 name: c.target_name.clone(),
                 type_repr: c.target_type.clone(),
                 ast,
                 decimal,
-            });
+            };
+            if let Some(ov) = column_overrides
+                && let Some(ty) = rel
+                    .attributes
+                    .iter()
+                    .find(|a| a.attnum == c.src_attnum && !a.dropped)
+                    .and_then(|a| ov.get(&a.name))
+            {
+                match TypeAst::parse(ty, alloc) {
+                    Ok(oast) => {
+                        if let Some(decimal) = override_wire(&plan.ast, &oast) {
+                            plan = ColumnPlan {
+                                name: plan.name,
+                                type_repr: ty.clone(),
+                                ast: oast,
+                                decimal,
+                            };
+                        } else {
+                            tracing::warn!(
+                                target: "walshadow::emitter",
+                                qname = %rel.qualified_name,
+                                column = %c.target_name,
+                                default = %c.target_type,
+                                value = %ty,
+                                "config_column.target_type not wire-compatible; keeping default",
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "walshadow::emitter",
+                        qname = %rel.qualified_name,
+                        column = %c.target_name,
+                        value = %ty,
+                        error = %e,
+                        "config_column.target_type unparseable; keeping default",
+                    ),
+                }
+            }
+            columns.push(plan);
             col_sql.push(quote_ident(&c.target_name));
         }
         let mk = |name: &str, ty: &str| -> Result<ColumnPlan, EmitterError> {
@@ -1037,6 +1082,71 @@ fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
         scale: u8::try_from(inner.decimal_scale()).ok()?,
         width: DecimalWidth::from_elem_size(inner.elem_size())?,
     })
+}
+
+/// Buffer shape a type encodes into, Nullable-transparent (the null map is
+/// orthogonal to the value wire).
+enum WireShape {
+    Fixed(usize),
+    Str,
+}
+
+fn wire_shape_of(ast: &TypeAst) -> Option<(WireShape, Kind)> {
+    let view = ast.view();
+    let inner = if view.kind() == Some(Kind::Nullable) {
+        view.child(0)?
+    } else {
+        view
+    };
+    let shape = match inner.elem_size() {
+        0 => WireShape::Str,
+        w => WireShape::Fixed(w),
+    };
+    Some((shape, inner.kind()?))
+}
+
+/// Whether a `config_column.target_type` override may replace `default` in
+/// the encode plan, and the `DecimalWire` the plan should carry if so.
+/// `encode_value` performs no arithmetic conversion — it writes the source
+/// value's natural wire bytes — so an override is admissible only when
+/// those bytes are valid wire data for the override type:
+///
+/// - Decimal-encoded source (`numeric`): any Decimal (the text→scaled path
+///   converts), String (lossless text), or a signed Int32/64/128/256 as a
+///   scale-0 decimal (the plan's acceptance drill: `numeric(38,0)` →
+///   `Int128`). Unsigned ints rejected — a negative value would encode as
+///   wrapped garbage
+/// - String-shaped source: string-shaped override only
+/// - Fixed-width source: same-width non-Decimal override (reinterpretation,
+///   e.g. `Int32` → `UInt32`); Decimal rejected because a nonzero scale
+///   would silently rescale the value
+fn override_wire(default: &TypeAst, over: &TypeAst) -> Option<Option<DecimalWire>> {
+    if decimal_wire_of(default).is_some() {
+        if let Some(w) = decimal_wire_of(over) {
+            return Some(Some(w));
+        }
+        return match wire_shape_of(over)? {
+            (WireShape::Str, _) => Some(None),
+            (WireShape::Fixed(w), Kind::Int32 | Kind::Int64 | Kind::Int128 | Kind::Int256) => {
+                Some(Some(DecimalWire {
+                    scale: 0,
+                    width: DecimalWidth::from_elem_size(w)?,
+                }))
+            }
+            _ => None,
+        };
+    }
+    match (wire_shape_of(default)?.0, wire_shape_of(over)?.0) {
+        (WireShape::Str, WireShape::Str) => Some(None),
+        (WireShape::Fixed(a), WireShape::Fixed(b)) if a == b => {
+            if decimal_wire_of(over).is_some() {
+                None
+            } else {
+                Some(None)
+            }
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1505,10 +1615,10 @@ mod tests {
     }
 
     fn committed(id: i32, name: Option<&str>) -> CommittedTuple {
-        let name_col = match name {
-            None => Some(ColumnValue::Null),
-            Some(s) => Some(ColumnValue::Text(s.to_string())),
-        };
+        let name_col = Some(
+            name.map(|s| ColumnValue::Text(s.to_string()))
+                .unwrap_or(ColumnValue::Null),
+        );
         CommittedTuple {
             decoded: DecodedHeap {
                 rfn: RelFileNode {
@@ -1790,7 +1900,7 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m).expect("plan builds");
+        let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
         assert!(plan.insert_sql.contains("INSERT INTO default.foo"));
         assert!(plan.insert_sql.contains("`id`"));
         assert!(plan.insert_sql.contains("`name`"));
@@ -1802,11 +1912,88 @@ mod tests {
     }
 
     #[test]
+    fn table_plan_applies_admissible_column_override() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let mut m = mk_mapping();
+        // numeric-shaped default: the plan drill `numeric(38,0)` → `Int128`
+        m.columns[0].target_type = "Decimal(38, 0)".into();
+        let overrides: HashMap<String, String> = [("id".to_string(), "Int128".to_string())].into();
+        let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
+        assert_eq!(plan.columns[0].type_repr, "Int128");
+        // scale-0 decimal wire keeps the numeric text→scaled encode path
+        assert_eq!(
+            plan.columns[0].decimal,
+            Some(DecimalWire {
+                scale: 0,
+                width: DecimalWidth::D128
+            })
+        );
+        assert_eq!(plan.columns[1].type_repr, "Nullable(String)");
+    }
+
+    #[test]
+    fn table_plan_override_keys_on_source_attname_not_target_name() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let mut m = mk_mapping();
+        // Operator-renamed CH column: override still keys on source attname
+        m.columns[1].target_name = "label".into();
+        let overrides: HashMap<String, String> =
+            [("name".to_string(), "String".to_string())].into();
+        let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
+        assert_eq!(plan.columns[1].name, "label");
+        assert_eq!(plan.columns[1].type_repr, "String");
+    }
+
+    #[test]
+    fn table_plan_keeps_default_on_wire_incompatible_override() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let m = mk_mapping();
+        // encode_value writes int4 as 4 LE bytes; no textualization exists,
+        // so Int32 → String must fall back rather than poison the batcher
+        let overrides: HashMap<String, String> = [("id".to_string(), "String".to_string())].into();
+        let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
+        assert_eq!(plan.columns[0].type_repr, "Int32");
+    }
+
+    #[test]
+    fn override_wire_admissibility() {
+        let alloc = Allocator::stdlib();
+        let p = |s: &str| TypeAst::parse(s, alloc).unwrap();
+        // Decimal-encoded source: Decimal / String / signed ints convert
+        let dec = p("Decimal(38, 0)");
+        assert!(override_wire(&dec, &p("Decimal(38, 2)")).is_some());
+        assert!(override_wire(&dec, &p("String")).is_some());
+        assert_eq!(
+            override_wire(&dec, &p("Int128")),
+            Some(Some(DecimalWire {
+                scale: 0,
+                width: DecimalWidth::D128
+            }))
+        );
+        // Unsigned wraps negatives, floats reinterpret bits: rejected
+        assert!(override_wire(&dec, &p("UInt128")).is_none());
+        assert!(override_wire(&dec, &p("Float32")).is_none());
+        // Fixed-width source: same-width reinterpretation only, no Decimal
+        // (a nonzero scale would silently rescale)
+        let i = p("Int32");
+        assert!(override_wire(&i, &p("UInt32")).is_some());
+        assert!(override_wire(&i, &p("Int64")).is_none());
+        assert!(override_wire(&i, &p("Decimal32(2)")).is_none());
+        // String-shaped source: string-shaped override only
+        let s = p("Nullable(String)");
+        assert!(override_wire(&s, &p("String")).is_some());
+        assert!(override_wire(&s, &p("Int64")).is_none());
+    }
+
+    #[test]
     fn is_deleted_codes_delete_in_trailing_buffer() {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m).expect("plan builds");
+        let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
         assert!(plan.insert_sql.contains("`_is_deleted`"));
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(1, Some("a")), &m, OP_INSERT)
@@ -1854,7 +2041,7 @@ mod tests {
         let rel = mk_rel();
         let mut m = mk_mapping();
         m.columns[1].target_type = "String".into();
-        let plan = TablePlan::build(alloc, &rel, &m).expect("plan builds");
+        let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
         let mut enc = TableEncoder::new(plan).unwrap();
         // Delete: non-key column absent from the key-only old image
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
@@ -1874,7 +2061,7 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m).expect("plan builds");
+        let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
         match &enc.buffers[1] {
@@ -1888,7 +2075,7 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m).unwrap();
+        let plan = TablePlan::build(alloc, &rel, &m, None).unwrap();
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(7, Some("seven")), &m, OP_INSERT)
             .unwrap();

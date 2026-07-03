@@ -437,8 +437,8 @@ fn init_tracing(
 
     // Best-effort: a bad endpoint logs and degrades to no-traces rather
     // than refusing to boot — observability never blocks the pipeline.
-    let provider = match otlp_endpoint {
-        Some(endpoint) => match build_otlp_provider(endpoint) {
+    let provider = if let Some(endpoint) = otlp_endpoint {
+        match build_otlp_provider(endpoint) {
             Ok(p) => {
                 opentelemetry::global::set_tracer_provider(p.clone());
                 Some(p)
@@ -447,8 +447,9 @@ fn init_tracing(
                 eprintln!("walshadow: OTLP exporter init failed for {endpoint}: {e:#}");
                 None
             }
-        },
-        None => None,
+        }
+    } else {
+        None
     };
 
     // `walshadow::trace` spans only feed the OTLP exporter; with none attached
@@ -505,18 +506,17 @@ async fn run(args: Args) -> Result<()> {
         "source identified",
     );
 
-    let ch_config = match args.ch_config.as_deref() {
-        Some(path) => {
-            let toml = tokio::fs::read_to_string(path)
-                .await
-                .with_context(|| format!("read --ch-config {}", path.display()))?;
-            let mut cfg = EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?;
-            if let Some(ms) = args.ch_flush_timeout_ms {
-                cfg.flush_timeout = std::time::Duration::from_millis(ms);
-            }
-            Some(cfg)
+    let ch_config = if let Some(path) = args.ch_config.as_deref() {
+        let toml = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("read --ch-config {}", path.display()))?;
+        let mut cfg = EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?;
+        if let Some(ms) = args.ch_flush_timeout_ms {
+            cfg.flush_timeout = std::time::Duration::from_millis(ms);
         }
-        None => None,
+        Some(cfg)
+    } else {
+        None
     };
     let bootstrap_end_lsn: Option<u64> = if matches!(args.bootstrap_mode, BootstrapMode::Off) {
         None
@@ -558,10 +558,11 @@ async fn run(args: Args) -> Result<()> {
     // Bootstrap `end_lsn` outranks the cursor: shadow catalog state is at
     // `end_lsn`, so consuming WAL before it double-counts. `--start-lsn`
     // still wins so recovery drills can rewind further.
-    let start_lsn_override = match &args.start_lsn {
-        Some(s) => Some(walshadow::shadow::parse_pg_lsn(s).context("--start-lsn")?),
-        None => None,
-    };
+    let start_lsn_override = args
+        .start_lsn
+        .as_deref()
+        .map(|s| walshadow::shadow::parse_pg_lsn(s).context("--start-lsn"))
+        .transpose()?;
     let raw_start = cursor::resolve_resume_lsn(
         start_lsn_override,
         bootstrap_end_lsn,
@@ -827,209 +828,207 @@ async fn run(args: Args) -> Result<()> {
     // TOML-pinned initial loads.
     let mut copy_backfiller: Option<Arc<walshadow::copy_backfill::CopyBackfiller>> = None;
 
-    let decoder_xact = match ch_config {
-        Some(mut emitter_cfg) => {
-            let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-            // Live routing map shared by DDL applicator + decode pool. The
-            // refresher below rewrites it on every republished snapshot.
-            let mapping: MappingHandle =
-                Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
-            // Resolver merges CLI over TOML and publishes ResolvedConfig on
-            // the watch substrate; SIGHUP re-reads TOML and republishes. The
-            // mapping refresher + DDL applicator subscribe.
-            let cli_overrides = CliOverrides {
-                drop_table_strategy: args.drop_table_strategy.clone(),
-                flush_timeout: args
-                    .ch_flush_timeout_ms
-                    .map(std::time::Duration::from_millis),
-            };
-            let (resolver, config_rx) = ConfigResolver::new(
-                &emitter_cfg,
-                cli_overrides,
-                args.ch_config.clone(),
-                mapping.clone(),
-                invalidation_epoch.clone(),
-            );
-            spawn_mapping_refresher(config_rx.clone(), mapping.clone());
-            // Runtime-config overlay (§7): before the pump consumes WAL, seed the
-            // resolver from source PG's config_* tables via the sidecar libpq
-            // connection. Post-seed writes arrive live off the WAL stream. Refuse
-            // to start if the named schema is not installed — explicit opt-in
-            // means the operator expects the overlay present.
-            let mut seeded_table_rows: Vec<(String, walshadow::runtime_config::TableRow)> =
-                Vec::new();
-            if let Some(schema) = emitter_cfg.runtime_config_schema.clone() {
-                let client = feed
-                    .sql_client()
-                    .await
-                    .context("sidecar sql for runtime-config seed")?;
-                seeded_table_rows = seed_runtime_config(client, &schema, &resolver)
-                    .await
-                    .context("seed runtime config overlay")?;
-            }
-            // Fold the resolved emitter knobs back onto the boot config so the
-            // pipeline's initial batcher/inserter match the seeded + CLI values;
-            // they track the watch channel live thereafter.
-            {
-                let rc = config_rx.borrow();
-                emitter_cfg.row_budget = rc.row_budget;
-                emitter_cfg.byte_budget = rc.byte_budget;
-                emitter_cfg.flush_timeout = rc.flush_timeout;
-                emitter_cfg.compression = rc.compression;
-                emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
-            }
-            // DDL applicator owned by the reorder coordinator so ALTER /
-            // CREATE / DROP / TRUNCATE apply inside the barrier, after
-            // earlier data is durable. Seeds DDL config from the resolved
-            // snapshot; refreshes per apply as the resolver republishes.
-            let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_resolved(
-                &config_rx.borrow(),
-                emitter_cfg.database.clone(),
-                emitter_cfg.soft_delete,
-            );
-            let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
-                &emitter_cfg,
-                ddl_cfg,
-                mapping.clone(),
-                config_rx.clone(),
-            )
-            .await
-            .context("init DDL applicator")?
-            .with_invalidation_epoch(invalidation_epoch.clone());
-            let stats = Arc::new(EmitterStats::default());
-            emitter_stats_handle = Some(stats.clone());
-            // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
-            // own source session + CH tail per backfill or pass, spill-dir
-            // ledger dedups restarts.
-            let toml_initial_load = emitter_cfg.table_initial_loads.values().any(|mode| {
-                InitialLoadMode::parse(mode).is_some_and(|m| m != InitialLoadMode::None)
-            });
-            if emitter_cfg.runtime_config_schema.is_some() || toml_initial_load {
-                copy_backfiller = Some(Arc::new(
-                    walshadow::copy_backfill::CopyBackfiller::new(
-                        cfg.clone(),
-                        emitter_cfg.clone(),
-                        mapping.clone(),
-                        stats.clone(),
-                        catalog.clone(),
-                        &args.spill_dir,
-                    )
-                    .await,
-                ));
-            }
-            // Re-materialise per-table opt-in scope from the seeded config_table
-            // rows. Live edits arrive off WAL via the reorder coordinator, but a
-            // restart replays WAL from past these rows' commit LSN, so the seed
-            // is the only chance to rebuild their scope (the CH tables persist).
-            // `raw_start` is the backfill boundary S for a first-seen
-            // `initial_load` row: COPY covers commits before it, WAL the rest;
-            // the ledger resumes/no-ops rows seen on an earlier boot.
-            for (qname, row) in &seeded_table_rows {
-                if row.replicate.is_some() {
-                    walshadow::opt_in::apply_table_opt_in(
-                        &resolver,
-                        &mut applicator,
-                        &catalog,
-                        copy_backfiller.as_ref(),
-                        qname,
-                        row,
-                        raw_start,
-                    )
-                    .await
-                    .with_context(|| format!("seed opt-in for {qname}"))?;
-                }
-            }
-            let sql_scoped_tables: HashSet<String> = seeded_table_rows
-                .iter()
-                .filter(|(_, row)| row.replicate.is_some())
-                .map(|(qname, _)| qname.clone())
-                .collect();
-            let active_tables: HashSet<String> =
-                config_rx.borrow().tables.keys().cloned().collect();
-            apply_toml_initial_loads(
-                &catalog,
-                copy_backfiller.as_ref(),
-                &emitter_cfg.table_initial_loads,
-                &active_tables,
-                &sql_scoped_tables,
-                raw_start,
-            )
-            .await?;
-            config_resolver = Some(resolver);
-            // Seed durable watermark at `raw_start`, not 0. Status loop
-            // persists this atomic into cursor's emitter_ack_lsn each
-            // interval with no monotonic guard, first write at boot before
-            // any WAL re-read acks. Seeding 0 would clobber a resumed
-            // cursor; a crash before [aligned, raw_start] re-reads acks
-            // then resumes from ident.xlogpos next boot (precedence skips a
-            // zero cursor ack), silently dropping [raw_start, head] WAL that
-            // never reached CH. tail's `fetch_max` keeps it monotonic as WAL
-            // re-reads [aligned, raw_start]. See
-            // plans/future/pipeline_backpressure_and_scaling.md (Handoff step 3).
-            let emitter_ack = Arc::new(AtomicU64::new(raw_start));
-            pipeline_ack = Some(emitter_ack.clone());
-            let pcfg = PipelineConfig {
-                emitter: emitter_cfg,
-                decoder_pool_size: args.decoder_pool_size,
-                inserter_pool_size: args.inserter_pool_size,
-                catalog: catalog.clone(),
-                mapping,
-                oracle: oracle.clone(),
-                applicator,
-                buffer: xact_buffer.clone(),
-                subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-                schema_events: Some(schema_events.clone()),
-                pending_sweeps: Some(pending_sweeps.clone()),
-                stats,
-                span_registry: span_registry.clone(),
-                config_resolver: config_resolver.clone(),
-                backfiller: copy_backfiller.clone(),
-            };
-            let (reorder_sink, handle) = pcfg
-                .spawn(emitter_ack)
+    let decoder_xact = if let Some(mut emitter_cfg) = ch_config {
+        let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+        // Live routing map shared by DDL applicator + decode pool. The
+        // refresher below rewrites it on every republished snapshot.
+        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+        // Resolver merges CLI over TOML and publishes ResolvedConfig on
+        // the watch substrate; SIGHUP re-reads TOML and republishes. The
+        // mapping refresher + DDL applicator subscribe.
+        let cli_overrides = CliOverrides {
+            drop_table_strategy: args.drop_table_strategy.clone(),
+            flush_timeout: args
+                .ch_flush_timeout_ms
+                .map(std::time::Duration::from_millis),
+        };
+        let (resolver, config_rx) = ConfigResolver::new(
+            &emitter_cfg,
+            cli_overrides,
+            args.ch_config.clone(),
+            mapping.clone(),
+            invalidation_epoch.clone(),
+        );
+        spawn_mapping_refresher(config_rx.clone(), mapping.clone());
+        // Runtime-config overlay (§7): before the pump consumes WAL, seed the
+        // resolver from source PG's config_* tables via the sidecar libpq
+        // connection. Post-seed writes arrive live off the WAL stream. Refuse
+        // to start if the named schema is not installed — explicit opt-in
+        // means the operator expects the overlay present.
+        let mut seeded_table_rows: Vec<(String, walshadow::runtime_config::TableRow)> = Vec::new();
+        if let Some(schema) = emitter_cfg.runtime_config_schema.clone() {
+            let client = feed
+                .sql_client()
                 .await
-                .context("spawn decode+insert pipeline")?;
-            pipeline_handle = Some(handle);
-            tracing::info!(
-                target: "walshadow::pipeline",
-                addr = %addr,
-                decoders = args.decoder_pool_size.max(1),
-                inserters = args.inserter_pool_size.max(1),
-                "parallel decode+insert pipeline started",
-            );
-            QueueingRecordSink::spawn(
-                DecoderXactPair {
-                    decoder,
-                    xact_drain: reorder_sink,
-                },
-                args.decoder_batch_size,
-                args.decoder_queue_capacity,
-                span_registry.clone(),
-            )
+                .context("sidecar sql for runtime-config seed")?;
+            seeded_table_rows = seed_runtime_config(client, &schema, &resolver)
+                .await
+                .context("seed runtime config overlay")?;
         }
-        None => {
-            // Metrics-only (no CH): serial drain to counters. Oracle wrapper
-            // resolves PgPending + fires validator probes when up.
-            let observer: Box<dyn TupleObserver> = match oracle.clone() {
-                Some(o) => Box::new(walshadow::oracle::OracleObserver::new(
-                    o,
-                    Box::new(MetricsTupleObserver::default()) as Box<dyn TupleObserver>,
-                )),
-                None => Box::new(MetricsTupleObserver::default()),
-            };
-            let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer)
-                .with_schema_events(schema_events)
-                .with_pending_sweeps(pending_sweeps.clone());
-            QueueingRecordSink::spawn(
-                DecoderXactPair {
-                    decoder,
-                    xact_drain,
-                },
-                args.decoder_batch_size,
-                args.decoder_queue_capacity,
-                span_registry.clone(),
-            )
+        // Fold the resolved emitter knobs back onto the boot config so the
+        // pipeline's initial batcher/inserter match the seeded + CLI values;
+        // they track the watch channel live thereafter.
+        {
+            let rc = config_rx.borrow();
+            emitter_cfg.row_budget = rc.row_budget;
+            emitter_cfg.byte_budget = rc.byte_budget;
+            emitter_cfg.flush_timeout = rc.flush_timeout;
+            emitter_cfg.compression = rc.compression;
+            emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
         }
+        // DDL applicator owned by the reorder coordinator so ALTER /
+        // CREATE / DROP / TRUNCATE apply inside the barrier, after
+        // earlier data is durable. Seeds DDL config from the resolved
+        // snapshot; refreshes per apply as the resolver republishes.
+        let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_resolved(
+            &config_rx.borrow(),
+            emitter_cfg.database.clone(),
+            emitter_cfg.soft_delete,
+        );
+        let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
+            &emitter_cfg,
+            ddl_cfg,
+            mapping.clone(),
+            config_rx.clone(),
+        )
+        .await
+        .context("init DDL applicator")?
+        .with_invalidation_epoch(invalidation_epoch.clone())
+        .with_resolver(resolver.clone());
+        let stats = Arc::new(EmitterStats::default());
+        emitter_stats_handle = Some(stats.clone());
+        // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
+        // own source session + CH tail per backfill or pass, spill-dir
+        // ledger dedups restarts.
+        let toml_initial_load = emitter_cfg
+            .table_initial_loads
+            .values()
+            .any(|mode| InitialLoadMode::parse(mode).is_some_and(|m| m != InitialLoadMode::None));
+        if emitter_cfg.runtime_config_schema.is_some() || toml_initial_load {
+            copy_backfiller = Some(Arc::new(
+                walshadow::copy_backfill::CopyBackfiller::new(
+                    cfg.clone(),
+                    emitter_cfg.clone(),
+                    mapping.clone(),
+                    stats.clone(),
+                    catalog.clone(),
+                    &args.spill_dir,
+                    Some(config_rx.clone()),
+                )
+                .await,
+            ));
+        }
+        // Re-materialise per-table opt-in scope from the seeded config_table
+        // rows. Live edits arrive off WAL via the reorder coordinator, but a
+        // restart replays WAL from past these rows' commit LSN, so the seed
+        // is the only chance to rebuild their scope (the CH tables persist).
+        // `raw_start` is the backfill boundary S for a first-seen
+        // `initial_load` row: COPY covers commits before it, WAL the rest;
+        // the ledger resumes/no-ops rows seen on an earlier boot.
+        for (qname, row) in &seeded_table_rows {
+            if row.replicate.is_some() {
+                walshadow::opt_in::apply_table_opt_in(
+                    &resolver,
+                    &mut applicator,
+                    &catalog,
+                    copy_backfiller.as_ref(),
+                    qname,
+                    row,
+                    raw_start,
+                )
+                .await
+                .with_context(|| format!("seed opt-in for {qname}"))?;
+            }
+        }
+        let sql_scoped_tables: HashSet<String> = seeded_table_rows
+            .iter()
+            .filter(|(_, row)| row.replicate.is_some())
+            .map(|(qname, _)| qname.clone())
+            .collect();
+        let active_tables: HashSet<String> = config_rx.borrow().tables.keys().cloned().collect();
+        apply_toml_initial_loads(
+            &catalog,
+            copy_backfiller.as_ref(),
+            &emitter_cfg.table_initial_loads,
+            &active_tables,
+            &sql_scoped_tables,
+            raw_start,
+        )
+        .await?;
+        config_resolver = Some(resolver);
+        // Seed durable watermark at `raw_start`, not 0. Status loop
+        // persists this atomic into cursor's emitter_ack_lsn each
+        // interval with no monotonic guard, first write at boot before
+        // any WAL re-read acks. Seeding 0 would clobber a resumed
+        // cursor; a crash before [aligned, raw_start] re-reads acks
+        // then resumes from ident.xlogpos next boot (precedence skips a
+        // zero cursor ack), silently dropping [raw_start, head] WAL that
+        // never reached CH. tail's `fetch_max` keeps it monotonic as WAL
+        // re-reads [aligned, raw_start]. See
+        // plans/future/pipeline_backpressure_and_scaling.md (Handoff step 3).
+        let emitter_ack = Arc::new(AtomicU64::new(raw_start));
+        pipeline_ack = Some(emitter_ack.clone());
+        let pcfg = PipelineConfig {
+            emitter: emitter_cfg,
+            decoder_pool_size: args.decoder_pool_size,
+            inserter_pool_size: args.inserter_pool_size,
+            catalog: catalog.clone(),
+            mapping,
+            oracle: oracle.clone(),
+            applicator,
+            buffer: xact_buffer.clone(),
+            subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
+            schema_events: Some(schema_events.clone()),
+            pending_sweeps: Some(pending_sweeps.clone()),
+            stats,
+            span_registry: span_registry.clone(),
+            config_resolver: config_resolver.clone(),
+            backfiller: copy_backfiller.clone(),
+        };
+        let (reorder_sink, handle) = pcfg
+            .spawn(emitter_ack)
+            .await
+            .context("spawn decode+insert pipeline")?;
+        pipeline_handle = Some(handle);
+        tracing::info!(
+            target: "walshadow::pipeline",
+            addr = %addr,
+            decoders = args.decoder_pool_size.max(1),
+            inserters = args.inserter_pool_size.max(1),
+            "parallel decode+insert pipeline started",
+        );
+        QueueingRecordSink::spawn(
+            DecoderXactPair {
+                decoder,
+                xact_drain: reorder_sink,
+            },
+            args.decoder_batch_size,
+            args.decoder_queue_capacity,
+            span_registry.clone(),
+        )
+    } else {
+        // Metrics-only (no CH): serial drain to counters. Oracle wrapper
+        // resolves PgPending + fires validator probes when up.
+        let observer: Box<dyn TupleObserver> = if let Some(o) = oracle.clone() {
+            Box::new(walshadow::oracle::OracleObserver::new(
+                o,
+                Box::new(MetricsTupleObserver::default()) as Box<dyn TupleObserver>,
+            ))
+        } else {
+            Box::new(MetricsTupleObserver::default())
+        };
+        let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer)
+            .with_schema_events(schema_events)
+            .with_pending_sweeps(pending_sweeps.clone());
+        QueueingRecordSink::spawn(
+            DecoderXactPair {
+                decoder,
+                xact_drain,
+            },
+            args.decoder_batch_size,
+            args.decoder_queue_capacity,
+            span_registry.clone(),
+        )
     };
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
@@ -1056,15 +1055,14 @@ async fn run(args: Args) -> Result<()> {
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     let metrics = MetricsRegistry::new();
-    let _metrics_server = match args.metrics_bind {
-        Some(addr) => {
-            let (bound, _handle) = walshadow::metrics::serve(addr, metrics.clone())
-                .await
-                .context("bind metrics endpoint")?;
-            tracing::info!(target: "walshadow::metrics", addr = %bound, "metrics endpoint serving");
-            Some(_handle)
-        }
-        None => None,
+    let _metrics_server = if let Some(addr) = args.metrics_bind {
+        let (bound, _handle) = walshadow::metrics::serve(addr, metrics.clone())
+            .await
+            .context("bind metrics endpoint")?;
+        tracing::info!(target: "walshadow::metrics", addr = %bound, "metrics endpoint serving");
+        Some(_handle)
+    } else {
+        None
     };
 
     // Kept for the status loop's config metrics (opt-in / pending-decl gauges);
@@ -1169,10 +1167,10 @@ async fn run(args: Args) -> Result<()> {
             let s = b.stats();
             // Durable watermark: pipeline → ack collector atomic;
             // serial/metrics → xact buffer field.
-            let ea = match &pipeline_ack {
-                Some(a) => a.load(Ordering::Acquire),
-                None => s.emitter_ack_lsn,
-            };
+            let ea = pipeline_ack
+                .as_ref()
+                .map(|a| a.load(Ordering::Acquire))
+                .unwrap_or(s.emitter_ack_lsn);
             (s.drain_lsn, ea)
         };
         // shadow_replay==0 (sweeper off or not yet reported) means "no
@@ -1259,10 +1257,10 @@ async fn run(args: Args) -> Result<()> {
             let line = stats.summary();
             (stats, line)
         };
-        let oracle_line = match &oracle {
-            Some(o) => o.stats.summary(),
-            None => String::new(),
-        };
+        let oracle_line = oracle
+            .as_ref()
+            .map(|o| o.stats.summary())
+            .unwrap_or_default();
         let oracle_stats = oracle.as_ref().map(|o| o.stats.as_ref());
         let decoder_stats: &walshadow::decoder_sink::DecoderStats = &record_sink.decoder_stats;
         let emitter_stats: Option<&walshadow::ch_emitter::EmitterStats> =
@@ -2066,88 +2064,85 @@ async fn run_bootstrap(
     // page walk starts) and share its counters with the bootstrap tail. The
     // store-toast flag tells the page walk whether to decode pg_toast_* pages.
     let bootstrap_stats = Arc::new(EmitterStats::default());
-    let resolver = match &ch_config {
-        Some(cfg) => ToastResolver::from_config(cfg, bootstrap_stats.clone())
-            .map_err(|e| anyhow::anyhow!("bootstrap: {e}"))?,
-        None => ToastResolver::disabled(),
+    let resolver = if let Some(cfg) = &ch_config {
+        ToastResolver::from_config(cfg, bootstrap_stats.clone())
+            .map_err(|e| anyhow::anyhow!("bootstrap: {e}"))?
+    } else {
+        ToastResolver::disabled()
     };
     let store_toast = resolver.stores_chunks();
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
 
-    let (shipped, outcome) = match ch_config {
-        Some(emitter_cfg) => {
-            // Route bootstrap rows through the shared insert tail. Bootstrap
-            // is the easy case: every row op=Insert at _lsn = start_lsn, no
-            // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
-            // defaults 0 to its own partial-flush deadline.
-            let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-            let stats = bootstrap_stats.clone();
-            // Throwaway watermark atomic: durability proof is `wait_through(K)`,
-            // resume LSN is carried via the WAL pipeline's emitter_ack seed
-            // (see `run`), so uniform `commit_lsn = start_lsn` here is fine.
-            let emitter_ack = Arc::new(AtomicU64::new(0));
-            let fatal = Fatal::new();
-            let inserter_pool_size = args.inserter_pool_size;
-            let (msg_tx, ack, tail) = tail::spawn(
-                &emitter_cfg,
-                inserter_pool_size,
-                stats.clone(),
-                emitter_ack,
-                fatal.clone(),
-            )
+    let (shipped, outcome) = if let Some(emitter_cfg) = ch_config {
+        // Route bootstrap rows through the shared insert tail. Bootstrap
+        // is the easy case: every row op=Insert at _lsn = start_lsn, no
+        // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
+        // defaults 0 to its own partial-flush deadline.
+        let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+        let stats = bootstrap_stats.clone();
+        // Throwaway watermark atomic: durability proof is `wait_through(K)`,
+        // resume LSN is carried via the WAL pipeline's emitter_ack seed
+        // (see `run`), so uniform `commit_lsn = start_lsn` here is fine.
+        let emitter_ack = Arc::new(AtomicU64::new(0));
+        let fatal = Fatal::new();
+        let inserter_pool_size = args.inserter_pool_size;
+        let (msg_tx, ack, tail) = tail::spawn(
+            &emitter_cfg,
+            inserter_pool_size,
+            stats.clone(),
+            emitter_ack,
+            fatal.clone(),
+        )
+        .await
+        .context("bootstrap: spawn insert tail")?;
+        // Static [table.*] mapping (no SIGHUP, no shadow PG during bootstrap).
+        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            addr = %addr,
+            inserters = inserter_pool_size.max(1),
+            "bootstrap insert tail started",
+        );
+
+        let drain = tokio::spawn(bootstrap::drain(
+            rx,
+            drain_catalog,
+            mapping,
+            msg_tx.clone(),
+            ack.clone(),
+            stats.clone(),
+            resolver.clone(),
+        ));
+        let (drain_res, pump_res) = tokio::join!(drain, pump);
+        let drain_outcome = drain_res
+            .context("bootstrap drain join")?
+            .map_err(|e| anyhow::anyhow!("bootstrap drain: {e}"))?;
+        let outcome: BootstrapOutcome = pump_res
+            .context("bootstrap pump join")?
+            .context("bootstrap pump")?;
+        let k = drain_outcome.next_seq;
+
+        tail.finish(msg_tx, ack, k, &fatal)
             .await
-            .context("bootstrap: spawn insert tail")?;
-            // Static [table.*] mapping (no SIGHUP, no shadow PG during bootstrap).
-            let mapping: MappingHandle =
-                Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
-            tracing::info!(
-                target: "walshadow::bootstrap",
-                addr = %addr,
-                inserters = inserter_pool_size.max(1),
-                "bootstrap insert tail started",
-            );
-
-            let drain = tokio::spawn(bootstrap::drain(
-                rx,
-                drain_catalog,
-                mapping,
-                msg_tx.clone(),
-                ack.clone(),
-                stats.clone(),
-                resolver.clone(),
-            ));
-            let (drain_res, pump_res) = tokio::join!(drain, pump);
-            let drain_outcome = drain_res
-                .context("bootstrap drain join")?
-                .map_err(|e| anyhow::anyhow!("bootstrap drain: {e}"))?;
-            let outcome: BootstrapOutcome = pump_res
-                .context("bootstrap pump join")?
-                .context("bootstrap pump")?;
-            let k = drain_outcome.next_seq;
-
-            tail.finish(msg_tx, ack, k, &fatal)
-                .await
-                .map_err(|m| anyhow::anyhow!("bootstrap: {m}"))?;
-            tracing::info!(
-                target: "walshadow::bootstrap",
-                rows_routed = drain_outcome.rows_routed,
-                rows_emitted = stats.rows_emitted.load(Ordering::Relaxed),
-                blocks_sent = stats.blocks_sent.load(Ordering::Relaxed),
-                seqs = k,
-                "bootstrap insert tail drained",
-            );
-            (drain_outcome.rows_routed, outcome)
-        }
-        None => {
-            // Metrics-only: bootstrap rows counted, not shipped.
-            let mut observer = MetricsTupleObserver::default();
-            let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
-            let shipped = drain_res.context("bootstrap drain")?;
-            let outcome: BootstrapOutcome = pump_res
-                .context("bootstrap pump join")?
-                .context("bootstrap pump")?;
-            (shipped, outcome)
-        }
+            .map_err(|m| anyhow::anyhow!("bootstrap: {m}"))?;
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            rows_routed = drain_outcome.rows_routed,
+            rows_emitted = stats.rows_emitted.load(Ordering::Relaxed),
+            blocks_sent = stats.blocks_sent.load(Ordering::Relaxed),
+            seqs = k,
+            "bootstrap insert tail drained",
+        );
+        (drain_outcome.rows_routed, outcome)
+    } else {
+        // Metrics-only: bootstrap rows counted, not shipped.
+        let mut observer = MetricsTupleObserver::default();
+        let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
+        let shipped = drain_res.context("bootstrap drain")?;
+        let outcome: BootstrapOutcome = pump_res
+            .context("bootstrap pump join")?
+            .context("bootstrap pump")?;
+        (shipped, outcome)
     };
 
     tracing::info!(

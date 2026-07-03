@@ -56,14 +56,13 @@ pub async fn trim_below_lsn(dir: &Path, cutoff_lsn: u64) -> Result<TrimReport, R
     let mut rd = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = rd.next_entry().await? {
         let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
         };
-        let (seg_str, kind) = classify(&name);
-        let seg = match seg_str.and_then(|s| SegmentName::parse(s).ok()) {
-            Some(s) => s,
-            None => continue, // unknown file, leave alone
+        let (seg_str, kind) = classify(name);
+        // Unknown file, leave alone
+        let Some(seg) = seg_str.and_then(|s| SegmentName::parse(s).ok()) else {
+            continue;
         };
         let end_lsn = seg.start_lsn(WAL_SEG_SIZE).saturating_add(WAL_SEG_SIZE);
         if end_lsn > cutoff_lsn {

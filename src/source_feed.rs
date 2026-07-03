@@ -215,10 +215,10 @@ impl SourceFeed {
                 .status_interval
                 .saturating_sub(self.last_status.elapsed())
                 .max(Duration::from_millis(50));
-            let msg = match tokio::time::timeout(timeout, self.conn.recv_message()).await {
-                Ok(r) => r?,
-                Err(_) => continue,
+            let Ok(msg) = tokio::time::timeout(timeout, self.conn.recv_message()).await else {
+                continue;
             };
+            let msg = msg?;
             match msg {
                 Message::CopyData(d) => {
                     let payload: Bytes = d.into_bytes();
