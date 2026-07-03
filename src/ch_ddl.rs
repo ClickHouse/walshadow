@@ -21,6 +21,8 @@
 //! against the new shape.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use clickhouse_c::AsyncClient;
@@ -134,6 +136,12 @@ pub struct DdlApplicator {
     /// half-open CH socket can't park the reorder barrier past this
     query_timeout: Duration,
     last_used: std::time::Instant,
+    /// Decode-pool `RelCache`s key mapping snapshots on this epoch, but it
+    /// bumps when the DDL record passes the decoder worker, before the
+    /// barrier mutates the mapping here. Bump again on every mapping write
+    /// so a worker whose refresh consumed the record-time bump drops its
+    /// pre-apply snapshot
+    invalidation_epoch: Option<Arc<AtomicU64>>,
     pub stats: DdlStats,
 }
 
@@ -163,8 +171,16 @@ impl DdlApplicator {
             retry: emitter_cfg.retry.clone(),
             query_timeout: emitter_cfg.insert_timeout,
             last_used: std::time::Instant::now(),
+            invalidation_epoch: None,
             stats: DdlStats::default(),
         })
+    }
+
+    /// Same handle as `CatalogTracker::set_invalidation_epoch`. Unset skips
+    /// bumps (bootstrap drain, tests without a decode pool)
+    pub fn with_invalidation_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
+        self.invalidation_epoch = Some(epoch);
+        self
     }
 
     pub fn config(&self) -> &DdlConfig {
@@ -226,8 +242,11 @@ impl DdlApplicator {
         let target = format!("{}.{}", sql_ident(&target_db), sql_ident(&desc.name));
         let columns = derive_columns_for_mapping(desc);
         let mapping = TableMapping { target, columns };
-        let mut m = self.mapping.write().await;
-        m.insert(desc.qualified_name.as_ref().to_owned(), mapping);
+        {
+            let mut m = self.mapping.write().await;
+            m.insert(desc.qualified_name.as_ref().to_owned(), mapping);
+        }
+        bump_mapping_epoch(self.invalidation_epoch.as_ref());
         Ok(())
     }
 
@@ -330,60 +349,8 @@ impl DdlApplicator {
         // rows against the new shape without TOML edits; operator-pinned
         // `target_name` overrides survive (only touch entries the
         // applicator could have produced, by src_attnum match)
-        self.mutate_mapping_for_diff(_old, new, diff).await;
+        mutate_mapping_for_diff(&self.mapping, self.invalidation_epoch.as_ref(), new, diff).await;
         Ok(())
-    }
-
-    async fn mutate_mapping_for_diff(
-        &mut self,
-        old: &RelDescriptor,
-        new: &RelDescriptor,
-        diff: &SchemaDiff,
-    ) {
-        let key = new.qualified_name.as_ref().to_owned();
-        let mut m = self.mapping.write().await;
-        let Some(target_mapping) = m.get_mut(&key) else {
-            return;
-        };
-        // Rename the CH column only when TOML used the OLD source name;
-        // an operator-pinned different name is left alone (CH runs no
-        // ALTER for it either, see `apply_changed`)
-        for (attnum, old_name, new_name) in &diff.renamed_columns {
-            for c in &mut target_mapping.columns {
-                if c.src_attnum == *attnum && &c.target_name == old_name {
-                    c.target_name = new_name.clone();
-                }
-            }
-        }
-        for attnum in &diff.dropped_columns {
-            target_mapping.columns.retain(|c| c.src_attnum != *attnum);
-        }
-        // Skip adds the operator already pre-declared
-        for att in &diff.added_columns {
-            if target_mapping
-                .columns
-                .iter()
-                .any(|c| c.src_attnum == att.attnum)
-            {
-                continue;
-            }
-            let pk_member = matches!(
-                new.replident,
-                crate::shadow_catalog::ReplIdent::Default {
-                    pk_attnums: Some(ref nums),
-                } if nums.contains(&att.attnum)
-            );
-            let resolved = match type_bridge::map(att, pk_member) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            target_mapping.columns.push(ColumnMapping {
-                src_attnum: att.attnum,
-                target_name: att.name.clone(),
-                target_type: resolved.ch_type,
-            });
-        }
-        let _ = old;
     }
 
     async fn apply_dropped(&mut self, qualified_name: &str) -> Result<(), EmitterError> {
@@ -423,8 +390,11 @@ impl DdlApplicator {
                 self.execute(&sql).await?;
                 self.stats.drops_applied += 1;
                 // Forget the auto-mapped entry so a future Added re-derives columns
-                let mut m = self.mapping.write().await;
-                m.remove(qualified_name);
+                {
+                    let mut m = self.mapping.write().await;
+                    m.remove(qualified_name);
+                }
+                bump_mapping_epoch(self.invalidation_epoch.as_ref());
                 Ok(())
             }
         }
@@ -491,6 +461,72 @@ impl DdlApplicator {
             }
         }
     }
+}
+
+/// Flush decode-pool `RelCache` mapping snapshots after a mapping write.
+/// Call only after the write guard drops: bump-before-write would let a
+/// racing `RelCache::refresh` cache the pre-write map under the post-bump
+/// epoch, going permanently stale
+pub fn bump_mapping_epoch(epoch: Option<&Arc<AtomicU64>>) {
+    if let Some(e) = epoch {
+        e.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Fold a `Changed` diff into the live mapping, then bump the epoch so
+/// decode-pool workers holding a pre-diff snapshot re-resolve. Renames touch
+/// only entries whose `target_name` still equals the OLD source name; an
+/// operator-pinned different name is left alone (CH runs no ALTER for it
+/// either, see `apply_changed`)
+async fn mutate_mapping_for_diff(
+    mapping: &MappingHandle,
+    epoch: Option<&Arc<AtomicU64>>,
+    new: &RelDescriptor,
+    diff: &SchemaDiff,
+) {
+    let key = new.qualified_name.as_ref().to_owned();
+    {
+        let mut m = mapping.write().await;
+        let Some(target_mapping) = m.get_mut(&key) else {
+            return;
+        };
+        for (attnum, old_name, new_name) in &diff.renamed_columns {
+            for c in &mut target_mapping.columns {
+                if c.src_attnum == *attnum && &c.target_name == old_name {
+                    c.target_name = new_name.clone();
+                }
+            }
+        }
+        for attnum in &diff.dropped_columns {
+            target_mapping.columns.retain(|c| c.src_attnum != *attnum);
+        }
+        // Skip adds the operator already pre-declared
+        for att in &diff.added_columns {
+            if target_mapping
+                .columns
+                .iter()
+                .any(|c| c.src_attnum == att.attnum)
+            {
+                continue;
+            }
+            let pk_member = matches!(
+                new.replident,
+                crate::shadow_catalog::ReplIdent::Default {
+                    pk_attnums: Some(ref nums),
+                } if nums.contains(&att.attnum)
+            );
+            let resolved = match type_bridge::map(att, pk_member) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            target_mapping.columns.push(ColumnMapping {
+                src_attnum: att.attnum,
+                target_name: att.name.clone(),
+                target_type: resolved.ch_type,
+            });
+        }
+    }
+    bump_mapping_epoch(epoch);
 }
 
 /// `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <n> <ty> [DEFAULT <expr>]`.
@@ -931,5 +967,63 @@ mod tests {
             m.get("public.orders").map(|t| t.target.clone())
         });
         assert_eq!(target.as_deref(), Some("default.orders"));
+    }
+
+    #[test]
+    fn mapping_mutation_bumps_invalidation_epoch() {
+        let map: std::collections::HashMap<String, TableMapping> = [(
+            "public.orders".into(),
+            TableMapping {
+                target: "default.orders".into(),
+                columns: vec![ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: "Int32".into(),
+                }],
+            },
+        )]
+        .into_iter()
+        .collect();
+        let handle: MappingHandle = Arc::new(tokio::sync::RwLock::new(map));
+        let epoch = Arc::new(AtomicU64::new(7));
+        let new = desc(
+            "orders",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "c", TEXTOID, false, None),
+            ],
+            Some(vec![1]),
+        );
+        let diff = SchemaDiff {
+            added_columns: vec![att(2, "c", TEXTOID, false, None)],
+            dropped_columns: vec![],
+            renamed_columns: vec![],
+            type_changes: vec![],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Mapped relation: column folded in, epoch bumped so decode-pool
+            // RelCaches drop pre-diff mapping snapshots
+            mutate_mapping_for_diff(&handle, Some(&epoch), &new, &diff).await;
+            let m = handle.read().await;
+            let cols = &m.get("public.orders").unwrap().columns;
+            assert!(
+                cols.iter()
+                    .any(|c| c.src_attnum == 2 && c.target_name == "c")
+            );
+        });
+        assert_eq!(epoch.load(Ordering::Acquire), 8);
+
+        // Unmapped relation: early return, no spurious bump
+        let ghost = desc("ghost", vec![att(1, "id", INT4OID, true, None)], None);
+        rt.block_on(mutate_mapping_for_diff(
+            &handle,
+            Some(&epoch),
+            &ghost,
+            &diff,
+        ));
+        assert_eq!(epoch.load(Ordering::Acquire), 8);
     }
 }

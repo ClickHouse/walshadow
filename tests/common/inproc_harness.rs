@@ -609,7 +609,10 @@ async fn build_pipeline_inner(
         .filter_mut()
         .tracker
         .set_invalidation_epoch(inv_epoch.clone());
-    catalog.lock().await.set_invalidation_epoch(inv_epoch);
+    catalog
+        .lock()
+        .await
+        .set_invalidation_epoch(inv_epoch.clone());
 
     // pg_class delete epoch gates the reorder coordinator's commit-boundary
     // DROP sweep. Only the DDL path needs it (mirrors bin/stream.rs).
@@ -685,7 +688,8 @@ async fn build_pipeline_inner(
     let ddl_cfg = DdlConfig::from_emitter(&emitter_cfg);
     let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone())
         .await
-        .expect("ddl applicator init");
+        .expect("ddl applicator init")
+        .with_invalidation_epoch(inv_epoch);
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
     let pcfg = PipelineConfig {
