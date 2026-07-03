@@ -509,6 +509,7 @@ fn xact_record(info_op: u8, xid: u32, xact_time: i64) -> Record<'static> {
         source_lsn: 0,
         page_magic: 0xD110,
         route: Route::ToShadow,
+        catalog_signal: walshadow::catalog_tracker::CatalogSignal::None,
     }
 }
 

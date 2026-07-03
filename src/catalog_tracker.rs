@@ -18,14 +18,28 @@
 //!   16384 before walshadow attached, so its `XLOG_RELMAP_UPDATE` sits
 //!   in pre-attach WAL the bootstrap rule never sees.
 //!
-//! Invalidation signal: when
-//! [`set_invalidation_epoch`](CatalogTracker::set_invalidation_epoch) attaches an
-//! `AtomicU64`, every relmap-update / pg_class-heap-write observe bumps
-//! it. [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog) shares the
+//! Invalidation signal: [`observe`](CatalogTracker::observe) returns a
+//! [`CatalogSignal`] verdict that rides the
+//! [`Record`](crate::wal_stream::Record) to the decoder worker, where
+//! [`BufferingDecoderSink`](crate::xact_buffer::BufferingDecoderSink)
+//! bumps the shared invalidation epoch at its own stream position.
+//! [`ShadowCatalog`](crate::shadow_catalog::ShadowCatalog) shares the
 //! atomic, acquire-loads at every relation lookup, and invalidates before
-//! the cache check. Synchronous so a catalog write in the same
-//! `WalStream::push` batch as the dependent heap INSERT can't lose the
-//! race against an async drain task. Senderless trackers bump nothing.
+//! the cache check.
+//!
+//! Bumping here at observe time instead would be premature once
+//! [`QueueingRecordSink`](crate::queueing_record_sink::QueueingRecordSink)
+//! decouples the decoder from the pump: the tracker observes at pump
+//! position while the decoder worker may still be thousands of records
+//! behind. A worker lookup for a pre-DDL record then consumes the bump,
+//! fetches from a shadow that hasn't replayed the DDL's commit, and
+//! caches the pre-DDL descriptor as fresh — permanently, since no second
+//! bump comes. Bumping when the DDL record itself passes the worker keeps
+//! consumption in record order: any later lookup of the altered relation
+//! is triggered by a record past the DDL's commit (AccessExclusive lock
+//! excludes interleaved rows), so its replay gate guarantees a fresh
+//! fetch. Out-of-band bumpers stay: mapping writes
+//! (`crate::ch_ddl::bump_mapping_epoch`) and SIGHUP mapping reload.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -51,6 +65,20 @@ const REL_MAP_FILE_SIZE: usize = 4 + 4 + MAX_MAPPINGS * 8 + 4; // magic + n + ma
 /// `pg_class.oid`, fixed PG catalog OID
 pub const PG_CLASS_OID: u32 = 1259;
 
+/// Which shared epochs one observed record should bump. Returned by
+/// [`CatalogTracker::observe`] and stamped on the outgoing
+/// [`Record`](crate::wal_stream::Record) so the decoder worker can bump
+/// at its own stream position (see module doc)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogSignal {
+    #[default]
+    None,
+    /// Relmap update or pg_class insert/update: descriptor caches flush
+    Invalidate,
+    /// pg_class heap_delete (DROP shape): also arms `sweep_dropped`
+    InvalidateSweep,
+}
+
 #[derive(Debug, Default)]
 pub struct CatalogTracker {
     /// `(db_node, rel_node)`; `db_node == 0` is the shared catalog set,
@@ -60,9 +88,6 @@ pub struct CatalogTracker {
     /// `rel == PG_CLASS_OID` (mapped-catalog relfilenode == oid until
     /// first rewrite).
     pg_class_filenode: HashMap<u32, u32>,
-    /// Bumped on every catalog-touching observe; ShadowCatalog acquire-
-    /// loads and invalidates before its cache check. Senderless: `None`.
-    invalidation_epoch: Option<Arc<AtomicU64>>,
     /// Bumped only on pg_class heap_delete (the shape DROP TABLE writes),
     /// so `ShadowCatalog::sweep_dropped` throttles off drops and skips a
     /// per-commit shadow round-trip for non-drop DDL. Senderless: `None`.
@@ -80,8 +105,9 @@ pub struct CatalogTracker {
     /// non-mapped catalog (pg_depend, pg_namespace, …).
     pub pg_class_writes_oid_in_prefix: u64,
     pub seeded_from_source: u64,
-    /// Epoch bumps emitted here; catalog's `generation_bumps` may lag as
-    /// it collapses bumps between lookups into one `invalidate`.
+    /// Non-`None` verdicts returned by `observe`; catalog's
+    /// `generation_bumps` may lag as it collapses bumps between lookups
+    /// into one `invalidate`.
     pub invalidation_signals_sent: u64,
 }
 
@@ -100,19 +126,8 @@ impl CatalogTracker {
         self.nodes.insert((db_node, rel_node));
     }
 
-    pub fn set_invalidation_epoch(&mut self, epoch: Arc<AtomicU64>) {
-        self.invalidation_epoch = Some(epoch);
-    }
-
     pub fn set_pg_class_delete_epoch(&mut self, epoch: Arc<AtomicU64>) {
         self.pg_class_delete_epoch = Some(epoch);
-    }
-
-    fn signal_invalidation(&mut self) {
-        if let Some(e) = &self.invalidation_epoch {
-            e.fetch_add(1, Ordering::Release);
-            self.invalidation_signals_sent += 1;
-        }
     }
 
     fn signal_pg_class_delete(&mut self) {
@@ -120,6 +135,7 @@ impl CatalogTracker {
             e.fetch_add(1, Ordering::Release);
         }
     }
+
 
     /// `rel < FIRST_NORMAL_OBJECT_ID` is the bootstrap rule; relmap
     /// updates add post-rewrite filenumbers. `db_node == 0` (shared:
@@ -138,43 +154,46 @@ impl CatalogTracker {
     }
 
     /// Filters internally on rmgr + info; safe to call unconditionally.
-    pub fn observe(&mut self, record: &XLogRecord) {
+    /// Returned verdict rides the record to the decoder worker, which
+    /// bumps invalidation epochs at its own stream position (see module
+    /// doc).
+    pub fn observe(&mut self, record: &XLogRecord) -> CatalogSignal {
         let rm = record.header.resource_manager_id;
         let info_high = record.header.info & 0xF0;
 
         if rm == RmId::RelMap as u8 && info_high == XLOG_RELMAP_UPDATE {
-            self.handle_relmap_update(record);
-            return;
+            return self.handle_relmap_update(record);
         }
 
         let heap_new_tuple = rm == RmId::Heap as u8 && info_carries_new_tuple_heap(info_high);
         let heap2_new_tuple = rm == RmId::Heap2 as u8 && info_carries_new_tuple_heap2(info_high);
         if heap_new_tuple || heap2_new_tuple {
-            self.harvest_pg_class_blocks(record);
-            return;
+            return self.harvest_pg_class_blocks(record);
         }
         // DROP TABLE writes pg_class heap_delete, skipped by the
-        // insert/update-only harvest path. Bump epoch anyway so cache
+        // insert/update-only harvest path. Signal anyway so cache
         // invalidates + sweep_dropped runs next commit. Dying tuple OID
         // not decoded: catalogs default relreplident='n', WAL omits it.
         if rm == RmId::Heap as u8 {
             let info_op = info_high & 0x70;
             if info_op == 0x10 {
                 // HEAP_DELETE
-                self.signal_pg_class_touch(record);
+                return self.signal_pg_class_touch(record);
             }
         }
+        CatalogSignal::None
     }
 
     /// Coarse-fire (no row decode) when a record hits the current
     /// pg_class filenode, for ops the harvest path skips (DELETE). Also
     /// bumps `pg_class_delete_epoch` for the DROP-TABLE sweep.
-    fn signal_pg_class_touch(&mut self, record: &XLogRecord) {
+    fn signal_pg_class_touch(&mut self, record: &XLogRecord) -> CatalogSignal {
         if self.pg_class_block(record).is_none() {
-            return;
+            return CatalogSignal::None;
         }
-        self.signal_invalidation();
+        self.invalidation_signals_sent += 1;
         self.signal_pg_class_delete();
+        CatalogSignal::InvalidateSweep
     }
 
     /// First block's `(db_node, rel_node)` iff it targets the current
@@ -191,9 +210,9 @@ impl CatalogTracker {
     /// Decode block 0 when `record` targets pg_class. PG registers the
     /// new tuple via `XLogRegisterBufData(0, ...)`; later block refs
     /// (heap_update's block 1 old page) carry no tuple, must not decode.
-    fn harvest_pg_class_blocks(&mut self, record: &XLogRecord) {
+    fn harvest_pg_class_blocks(&mut self, record: &XLogRecord) -> CatalogSignal {
         let Some((db, _rel)) = self.pg_class_block(record) else {
-            return;
+            return CatalogSignal::None;
         };
         match decode_pg_class_tuple(record, 0) {
             DecodeOutcome::Decoded(row) => {
@@ -215,7 +234,8 @@ impl CatalogTracker {
         }
         // Coarse-fire regardless: over-invalidation is cheap (lazy
         // refetch), under-invalidation silently masks DDL.
-        self.signal_invalidation();
+        self.invalidation_signals_sent += 1;
+        CatalogSignal::Invalidate
     }
 
     /// Falls back to `rel == PG_CLASS_OID` until a filenode is observed
@@ -227,27 +247,27 @@ impl CatalogTracker {
         }
     }
 
-    fn handle_relmap_update(&mut self, record: &XLogRecord) {
+    fn handle_relmap_update(&mut self, record: &XLogRecord) -> CatalogSignal {
         self.relmap_updates += 1;
         let md = &record.main_data;
         // xl_relmap_update header: dbid(4) + tsid(4) + nbytes(4) = 12
         if md.len() < 12 + REL_MAP_FILE_SIZE {
-            return;
+            return CatalogSignal::None;
         }
         let dbid = u32::from_le_bytes(md[0..4].try_into().unwrap());
         let _tsid = u32::from_le_bytes(md[4..8].try_into().unwrap());
         let nbytes = i32::from_le_bytes(md[8..12].try_into().unwrap()) as usize;
         if nbytes != REL_MAP_FILE_SIZE {
-            return;
+            return CatalogSignal::None;
         }
         let map = &md[12..12 + REL_MAP_FILE_SIZE];
         let magic = i32::from_le_bytes(map[0..4].try_into().unwrap());
         if magic != RELMAPPER_FILEMAGIC {
-            return;
+            return CatalogSignal::None;
         }
         let num_mappings = i32::from_le_bytes(map[4..8].try_into().unwrap()) as usize;
         if num_mappings > MAX_MAPPINGS {
-            return;
+            return CatalogSignal::None;
         }
         let mappings = &map[8..8 + MAX_MAPPINGS * 8];
         for i in 0..num_mappings {
@@ -261,7 +281,8 @@ impl CatalogTracker {
                 }
             }
         }
-        self.signal_invalidation();
+        self.invalidation_signals_sent += 1;
+        CatalogSignal::Invalidate
     }
 
     /// Query source `pg_class` for every catalog relation (oid < 16384).
@@ -581,44 +602,34 @@ mod tests {
         assert_eq!(t.relmap_updates, 1); // counted, no update applied
     }
 
-    fn fresh_epoch() -> Arc<AtomicU64> {
-        Arc::new(AtomicU64::new(0))
-    }
-
     #[test]
-    fn observe_relmap_update_fires_signal_when_attached() {
-        let epoch = fresh_epoch();
+    fn observe_relmap_update_signals() {
         let mut t = CatalogTracker::new();
-        t.set_invalidation_epoch(epoch.clone());
-        t.observe(&relmap_record(5, &[(1259, 50000)]));
-        assert_eq!(epoch.load(Ordering::Acquire), 1, "relmap update must bump");
+        let v = t.observe(&relmap_record(5, &[(1259, 50000)]));
+        assert_eq!(v, CatalogSignal::Invalidate, "relmap update must signal");
         assert_eq!(t.invalidation_signals_sent, 1);
     }
 
     #[test]
-    fn observe_pg_class_decoded_fires_signal_when_attached() {
-        let epoch = fresh_epoch();
+    fn observe_pg_class_decoded_signals() {
         let mut t = CatalogTracker::new();
-        t.set_invalidation_epoch(epoch.clone());
         let data = pg_class_block_data(2615, 30000);
-        t.observe(&heap_block_record(RmId::Heap, 0x00, 5, 1259, data));
+        let v = t.observe(&heap_block_record(RmId::Heap, 0x00, 5, 1259, data));
         assert_eq!(
-            epoch.load(Ordering::Acquire),
-            1,
-            "decoded pg_class write must bump",
+            v,
+            CatalogSignal::Invalidate,
+            "decoded pg_class write must signal",
         );
         assert_eq!(t.invalidation_signals_sent, 1);
     }
 
     #[test]
-    fn observe_pg_class_oid_in_prefix_fires_signal_when_attached() {
-        let epoch = fresh_epoch();
+    fn observe_pg_class_oid_in_prefix_signals() {
         let mut t = CatalogTracker::new();
-        t.set_invalidation_epoch(epoch.clone());
         let data = pg_class_update_block_prefix_88(40000);
         let mut md = xl_heap_update_no_compression();
         md[7] = 0x20;
-        t.observe(&heap_block_record_with_main(
+        let v = t.observe(&heap_block_record_with_main(
             RmId::Heap,
             0x20,
             5,
@@ -627,41 +638,65 @@ mod tests {
             md,
         ));
         assert_eq!(
-            epoch.load(Ordering::Acquire),
-            1,
-            "oid_in_prefix is still a catalog mutation — must bump",
+            v,
+            CatalogSignal::Invalidate,
+            "oid_in_prefix is still a catalog mutation — must signal",
         );
         assert_eq!(t.invalidation_signals_sent, 1);
     }
 
     #[test]
-    fn observe_pg_class_undecoded_still_bumps_epoch() {
-        let epoch = fresh_epoch();
+    fn observe_pg_class_undecoded_still_signals() {
         let mut t = CatalogTracker::new();
-        t.set_invalidation_epoch(epoch.clone());
         // Undecoded but still touched pg_class: coarse signal, cache drops
-        t.observe(&heap_block_record(RmId::Heap, 0x00, 5, 1259, vec![]));
-        assert_eq!(epoch.load(Ordering::Acquire), 1);
+        let v = t.observe(&heap_block_record(RmId::Heap, 0x00, 5, 1259, vec![]));
+        assert_eq!(v, CatalogSignal::Invalidate);
         assert_eq!(t.invalidation_signals_sent, 1);
         assert_eq!(t.pg_class_writes_undecoded, 1);
     }
 
     #[test]
-    fn observe_without_sender_is_a_no_op() {
+    fn observe_verdict_matches_signal_kind() {
+        // Verdict rides the record; the decoder worker bumps epochs off it
+        // at its own stream position
         let mut t = CatalogTracker::new();
-        t.observe(&relmap_record(5, &[(1259, 50000)]));
-        assert_eq!(t.invalidation_signals_sent, 0);
+        assert_eq!(
+            t.observe(&relmap_record(5, &[(1259, 50000)])),
+            CatalogSignal::Invalidate,
+        );
+        let data = pg_class_block_data(2615, 30000);
+        assert_eq!(
+            t.observe(&heap_block_record(RmId::Heap, 0x00, 5, 50000, data)),
+            CatalogSignal::Invalidate,
+        );
+        // HEAP_DELETE on pg_class: DROP shape, arms the sweep too
+        assert_eq!(
+            t.observe(&heap_block_record(RmId::Heap, 0x10, 5, 50000, vec![])),
+            CatalogSignal::InvalidateSweep,
+        );
+        // User-table write: no catalog effect
+        assert_eq!(
+            t.observe(&heap_block_record(
+                RmId::Heap,
+                0x00,
+                5,
+                60000,
+                vec![0u8; 16]
+            )),
+            CatalogSignal::None,
+        );
+        // Malformed relmap: counted but not applied, no signal
+        let mut r = relmap_record(5, &[(1247, 70000)]);
+        r.main_data.to_mut().truncate(8);
+        assert_eq!(t.observe(&r), CatalogSignal::None);
     }
 
     #[test]
     fn observe_non_catalog_record_does_not_signal() {
-        let epoch = fresh_epoch();
         let mut t = CatalogTracker::new();
-        t.set_invalidation_epoch(epoch.clone());
         // User-table relfilenode (no relmap seen), harvest skipped
         let rec = heap_block_record(RmId::Heap, 0x00, 5, 50000, vec![0u8; 16]);
-        t.observe(&rec);
-        assert_eq!(epoch.load(Ordering::Acquire), 0);
+        assert_eq!(t.observe(&rec), CatalogSignal::None);
         assert_eq!(t.invalidation_signals_sent, 0);
     }
 

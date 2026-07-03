@@ -324,6 +324,7 @@ impl RecordSink for SharedCollectingSink {
                 source_lsn: r.source_lsn,
                 page_magic: r.page_magic,
                 route: r.route,
+                catalog_signal: r.catalog_signal,
             });
             Ok(())
         })

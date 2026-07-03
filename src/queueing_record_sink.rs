@@ -333,6 +333,7 @@ impl RecordSink for QueueingRecordSink {
                 source_lsn: record.source_lsn,
                 page_magic: record.page_magic,
                 route: record.route,
+                catalog_signal: record.catalog_signal,
             });
             if self.buf.len() >= self.batch_size {
                 self.flush_buf()?;
@@ -359,19 +360,20 @@ mod tests {
             source_lsn,
             page_magic: 0,
             route: crate::filter::Route::ToShadow,
+            catalog_signal: crate::catalog_tracker::CatalogSignal::None,
         }
     }
 
-    struct CaptureLsn(Arc<StdMutex<Vec<u64>>>);
+    struct CaptureLsn(Arc<StdMutex<Vec<(u64, crate::catalog_tracker::CatalogSignal)>>>);
     impl RecordSink for CaptureLsn {
         fn on_record<'a>(
             &'a mut self,
             r: &'a Record<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
             let sink = self.0.clone();
-            let lsn = r.source_lsn;
+            let item = (r.source_lsn, r.catalog_signal);
             Box::pin(async move {
-                sink.lock().unwrap().push(lsn);
+                sink.lock().unwrap().push(item);
                 Ok(())
             })
         }
@@ -379,13 +381,28 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_records_in_order() {
-        let collected = Arc::new(StdMutex::new(Vec::<u64>::new()));
+        use crate::catalog_tracker::CatalogSignal;
+        let collected = Arc::new(StdMutex::new(Vec::new()));
         let mut q = QueueingRecordSink::spawn(CaptureLsn(collected.clone()), 2, 8, None);
-        for lsn in [10, 20, 30, 40, 50] {
+        for lsn in [10, 20, 30, 40] {
             q.on_record(&synth(lsn)).await.expect("send");
         }
+        // `catalog_signal` must survive the clone-to-owned hop: the worker's
+        // decoder bumps epochs off it (see `catalog_tracker` module doc)
+        let mut ddl = synth(50);
+        ddl.catalog_signal = CatalogSignal::Invalidate;
+        q.on_record(&ddl).await.expect("send");
         q.close().await.expect("close");
-        assert_eq!(collected.lock().unwrap().as_slice(), &[10, 20, 30, 40, 50]);
+        assert_eq!(
+            collected.lock().unwrap().as_slice(),
+            &[
+                (10, CatalogSignal::None),
+                (20, CatalogSignal::None),
+                (30, CatalogSignal::None),
+                (40, CatalogSignal::None),
+                (50, CatalogSignal::Invalidate),
+            ],
+        );
     }
 
     #[tokio::test]

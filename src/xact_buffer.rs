@@ -1865,6 +1865,22 @@ pub struct BufferingDecoderSink {
     /// Per-`rfn` descriptor memo (see [`RelCache`]). Lazily created on the
     /// first lookup, since `new` can't take the async catalog lock.
     rel_cache: Option<RelCache<Arc<RelDescriptor>>>,
+    /// Bump target for [`Record::catalog_signal`], the sole record-ordered
+    /// bump site (mapping writes + SIGHUP reload bump out-of-band). This
+    /// sink runs on the queueing worker, which can lag the pump by
+    /// thousands of records; an observe-time bump would be consumable by a
+    /// pre-DDL record's lookup, which fetches from a shadow that hasn't
+    /// replayed the DDL's commit and caches the pre-DDL descriptor as
+    /// fresh with no later bump to flush it. Bumping when the DDL record
+    /// itself passes through keeps consumption in-order: any later lookup
+    /// of the altered relation is triggered by a record past the DDL's
+    /// commit (AccessExclusive excludes interleaved rows), so its replay
+    /// gate guarantees a fresh fetch. `None` (bootstrap, tests without an
+    /// epoch) skips the bump
+    invalidation_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// [`CatalogSignal::InvalidateSweep`] sibling of `invalidation_epoch`,
+    /// arming `ShadowCatalog::sweep_dropped` at worker position
+    pg_class_delete_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl BufferingDecoderSink {
@@ -1876,7 +1892,23 @@ impl BufferingDecoderSink {
             schema_events: None,
             span_registry: None,
             rel_cache: None,
+            invalidation_epoch: None,
+            pg_class_delete_epoch: None,
         }
+    }
+
+    /// Wire the shared epochs for [`Record::catalog_signal`] re-bumps (same
+    /// `Arc`s as `CatalogTracker::set_invalidation_epoch` /
+    /// `set_pg_class_delete_epoch`). Production must set these whenever the
+    /// sink runs behind a `QueueingRecordSink`.
+    pub fn with_catalog_signal_epochs(
+        mut self,
+        invalidation: Arc<std::sync::atomic::AtomicU64>,
+        pg_class_delete: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Self {
+        self.invalidation_epoch = Some(invalidation);
+        self.pg_class_delete_epoch = pg_class_delete;
+        self
     }
 
     /// Wire the [`TxnSpanRegistry`] so per-record decode spans nest under the
@@ -1997,6 +2029,19 @@ impl RecordSink for BufferingDecoderSink {
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
+            // Bump before anything else so subsequent records' lookups
+            // (this record routes ToShadow, no lookups of its own) see the
+            // signal in stream order (see `invalidation_epoch` field doc)
+            if record.catalog_signal != crate::catalog_tracker::CatalogSignal::None {
+                if let Some(e) = &self.invalidation_epoch {
+                    e.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                if record.catalog_signal == crate::catalog_tracker::CatalogSignal::InvalidateSweep
+                    && let Some(e) = &self.pg_class_delete_epoch
+                {
+                    e.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+            }
             let rm = record.parsed.header.resource_manager_id;
             // TRUNCATE rides Route::ToShadow (shadow replays it) but the
             // decoder still fans out per-relid HeapOp::Truncate for CH.
