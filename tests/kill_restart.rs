@@ -43,7 +43,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use walrus::pg::backup::format_pg_lsn;
+use walshadow::ch_emitter::TableTarget;
 use walshadow::shadow::{Shadow, ShadowConfig, parse_pg_lsn};
+use walshadow::shadow_catalog::RelName;
 
 // 17360-range — below the Linux ephemeral port range so outbound
 // connects can't grab a port we're about to bind. CH's
@@ -381,8 +383,8 @@ fn write_ch_config(ch_config_path: &Path) -> Result<()> {
         "127.0.0.1",
         CH_TCP_PORT,
         "default",
-        "kr.t",
-        "default.kr_t",
+        &RelName::new("kr", "t"),
+        &TableTarget::new("default", "kr_t"),
     )
 }
 

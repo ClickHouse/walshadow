@@ -21,6 +21,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
+use walshadow::shadow_catalog::RelName;
 
 const SOURCE_PORT: u16 = 17421;
 const SHADOW_PORT: u16 = 17422;
@@ -81,8 +83,8 @@ async fn copy_into_multi_insert_replicates() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "s14.copy_t".into(),
-        target_table: "walshadow_test.s14_copy_t".into(),
+        source_table: RelName::new("s14", "copy_t"),
+        target_table: TableTarget::new("walshadow_test", "s14_copy_t"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

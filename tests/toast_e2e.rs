@@ -22,6 +22,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
+use walshadow::shadow_catalog::RelName;
 use walshadow::toast::ToastMode;
 
 const SOURCE_PORT: u16 = 17581;
@@ -106,8 +108,8 @@ async fn toasted_value_replicates_and_rehydrates() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "public.doc".into(),
-        target_table: "walshadow_test.doc".into(),
+        source_table: RelName::new("public", "doc"),
+        target_table: TableTarget::new("walshadow_test", "doc"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,
@@ -301,8 +303,8 @@ async fn replident_full_unchanged_toast_update() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "public.doc".into(),
-        target_table: "walshadow_test.doc".into(),
+        source_table: RelName::new("public", "doc"),
+        target_table: TableTarget::new("walshadow_test", "doc"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

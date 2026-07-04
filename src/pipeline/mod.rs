@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use crate::ch_ddl::DdlApplicator;
 use crate::ch_emitter::{EmitterConfig, EmitterError, EmitterStats, MappingHandle, TableMapping};
 use crate::oracle::Oracle;
-use crate::shadow_catalog::ShadowCatalog;
+use crate::shadow_catalog::{RelName, ShadowCatalog};
 use crate::xact_buffer::{SchemaEventRx, SubxactTracker, TxnSpanRegistry, XactBuffer};
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls
@@ -91,10 +91,10 @@ const DEFAULT_PIPELINE_FLUSH: Duration = Duration::from_millis(100);
 /// and returns None when the relation maps to no destination
 pub(crate) async fn lookup_mapping(
     mapping: &MappingHandle,
-    qualified_name: &str,
+    rel: &RelName,
     stats: &EmitterStats,
 ) -> Option<Arc<TableMapping>> {
-    match mapping.read().await.get(qualified_name) {
+    match mapping.read().await.get(rel) {
         Some(v) => Some(Arc::new(v.clone())),
         None => {
             stats

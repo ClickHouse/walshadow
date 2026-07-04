@@ -161,23 +161,23 @@ impl ReorderSink {
         // register / drop the descriptor-derived mapping. `commit_lsn` is the
         // backfill boundary `S` for an `initial_load` opt-in.
         match event {
-            ConfigEvent::TableUpserted { qname, row } => {
+            ConfigEvent::TableUpserted { rel, row } => {
                 crate::opt_in::apply_table_opt_in(
                     &resolver,
                     &mut self.applicator,
                     &self.catalog,
                     self.backfiller.as_ref(),
-                    qname,
+                    rel,
                     row,
                     commit_lsn,
                 )
                 .await
                 .map_err(|e| SinkError::Other(format!("opt-in: {e}")))?;
             }
-            ConfigEvent::TableRemoved { qname } => {
-                resolver.exclude_table(qname).await;
+            ConfigEvent::TableRemoved { rel } => {
+                resolver.exclude_table(rel).await;
                 if let Some(b) = &self.backfiller {
-                    b.note_opt_out(qname).await;
+                    b.note_opt_out(rel).await;
                 }
             }
             _ => {}
@@ -347,7 +347,7 @@ impl ReorderSink {
             Err(e) => return Err(SinkError::from(DecoderSinkError::from(e))),
         };
         self.applicator
-            .truncate(rel.qualified_name.as_ref())
+            .truncate(&rel.rel_name)
             .await
             .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);

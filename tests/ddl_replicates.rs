@@ -28,7 +28,9 @@ mod fx;
 
 use std::time::Duration;
 
+use walshadow::ch_emitter::TableTarget;
 use walshadow::ch_emitter::{ColumnMapping, NamespaceMapping};
+use walshadow::shadow_catalog::RelName;
 
 // Each test shifts these by +0 / +10 / +20. The CH server's
 // `interserver_http_port = http_port + 1` so leave a 5-port gap
@@ -94,8 +96,8 @@ async fn alter_add_column_replicates_without_toml_edit() {
     .expect("create dest");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "s15.orders".into(),
-        target_table: "walshadow_test.s15_orders".into(),
+        source_table: RelName::new("s15", "orders"),
+        target_table: TableTarget::new("walshadow_test", "s15_orders"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,
@@ -441,8 +443,8 @@ async fn pinned_mapping_create_drop_create_recreates_dest() {
     .expect("create dest");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "s15pin.t".into(),
-        target_table: "walshadow_test.s15pin_t".into(),
+        source_table: RelName::new("s15pin", "t"),
+        target_table: TableTarget::new("walshadow_test", "s15pin_t"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

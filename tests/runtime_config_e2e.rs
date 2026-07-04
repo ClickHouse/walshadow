@@ -58,6 +58,8 @@ mod fx;
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
+use walshadow::shadow_catalog::RelName;
 
 const INSTALL_SQL: &str = include_str!("../sql/runtime_config_install.sql");
 
@@ -208,8 +210,8 @@ async fn opt_out_mid_stream_drains_and_halts() {
     .expect("create dest");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "app.orders".into(),
-        target_table: "walshadow_test.orders".into(),
+        source_table: RelName::new("app", "orders"),
+        target_table: TableTarget::new("walshadow_test", "orders"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,
@@ -692,8 +694,8 @@ async fn column_target_type_override_reaches_projection() {
     .expect("create dest");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "app.ledger".into(),
-        target_table: "walshadow_test.ledger".into(),
+        source_table: RelName::new("app", "ledger"),
+        target_table: TableTarget::new("walshadow_test", "ledger"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

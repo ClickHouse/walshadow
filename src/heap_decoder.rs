@@ -1273,6 +1273,7 @@ pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shadow_catalog::RelName;
     use walrus::pg::walparser::{
         BlockLocation, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
@@ -1309,9 +1310,7 @@ mod tests {
             },
             oid: 16384,
             namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name: "t".into(),
-            qualified_name: RelDescriptor::build_qualified_name("public", "t"),
+            rel_name: RelName::new("public", "t"),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },

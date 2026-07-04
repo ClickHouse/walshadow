@@ -25,6 +25,7 @@ use crate::config::ResolvedConfig;
 use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatchMeta, InsertBatch};
+use crate::shadow_catalog::RelName;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::watch;
@@ -37,7 +38,7 @@ struct Inserter {
     /// Parsed column types per table, refreshed when a batch's `schema_epoch`
     /// changes. `TypeAst` is `Send` but not `Sync`, so each inserter parses
     /// its own.
-    asts: HashMap<String, (u64, Vec<TypeAst>)>,
+    asts: HashMap<RelName, (u64, Vec<TypeAst>)>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     /// Live emitter knobs. `Some` with the overlay active: retry budget +

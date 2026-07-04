@@ -73,7 +73,7 @@ use crate::heap_decoder::{
 };
 use crate::pipeline::{Fatal, bootstrap, tail};
 use crate::runtime_config::InitialLoadMode;
-use crate::shadow_catalog::{RelDescriptor, ShadowCatalog};
+use crate::shadow_catalog::{RelDescriptor, RelName, ShadowCatalog};
 use crate::source_feed::open_sql_client;
 use crate::toast::ToastResolver;
 
@@ -90,7 +90,8 @@ const BACKUP_COALESCE_WINDOW: Duration = Duration::from_millis(1000);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LedgerEntry {
-    qname: String,
+    namespace: String,
+    relname: String,
     s_lsn: u64,
     done: bool,
     /// [`InitialLoadMode`] string; absent in pre-mode ledgers ⇒ `copy`
@@ -125,7 +126,7 @@ struct LedgerRec {
 
 struct Ledger {
     dir: PathBuf,
-    entries: HashMap<String, LedgerRec>,
+    entries: HashMap<RelName, LedgerRec>,
 }
 
 impl Ledger {
@@ -140,7 +141,7 @@ impl Ledger {
                         // degrades to re-COPY like a corrupt ledger would
                         let mode = InitialLoadMode::parse(&e.mode).unwrap_or(InitialLoadMode::Copy);
                         (
-                            e.qname,
+                            RelName::new(&e.namespace, &e.relname),
                             LedgerRec {
                                 s_lsn: e.s_lsn,
                                 done: e.done,
@@ -175,8 +176,9 @@ impl Ledger {
         let list: Vec<LedgerEntry> = self
             .entries
             .iter()
-            .map(|(qname, rec)| LedgerEntry {
-                qname: qname.clone(),
+            .map(|(rel, rec)| LedgerEntry {
+                namespace: rel.namespace.to_string(),
+                relname: rel.name.to_string(),
                 s_lsn: rec.s_lsn,
                 done: rec.done,
                 mode: rec.mode.as_str().into(),
@@ -480,7 +482,7 @@ struct Inner {
     /// qnames with a task running or queued this boot; stops a re-upserted
     /// config row (or a boot-seed + WAL-replay double-fire) from starting a
     /// second backfill.
-    active: HashSet<String>,
+    active: HashSet<RelName>,
     /// Backup-mode opt-ins awaiting their coalesce window; a mode's first
     /// enqueue spawns the pass runner, later ones ride the same pass.
     queued: HashMap<InitialLoadMode, Vec<BackupRequest>>,
@@ -592,17 +594,17 @@ impl CopyBackfiller {
         if mode == InitialLoadMode::None {
             return;
         }
-        let qname = desc.qualified_name.as_ref().to_owned();
+        let rel = desc.rel_name.clone();
         let (s_lsn, mode, spawn_pass, resume) = {
             let mut inner = self.inner.lock().await;
-            let (s_lsn, mode) = match inner.ledger.entries.get(&qname) {
+            let (s_lsn, mode) = match inner.ledger.entries.get(&rel) {
                 Some(rec) if rec.done => return,
                 // Boot re-runs the recorded mode at the recorded S; the
                 // config row's current mode applies only to a fresh entry
                 Some(rec) => (rec.s_lsn, rec.mode),
                 None => {
                     inner.ledger.entries.insert(
-                        qname.clone(),
+                        rel.clone(),
                         LedgerRec {
                             s_lsn: opt_in_lsn,
                             done: false,
@@ -614,7 +616,7 @@ impl CopyBackfiller {
                     if let Err(e) = inner.ledger.persist().await {
                         tracing::warn!(
                             target: "walshadow::backfill",
-                            qname = %qname,
+                            qname = %rel,
                             error = %e,
                             "backfill ledger persist failed; a crash before completion re-streams without backfill",
                         );
@@ -622,7 +624,7 @@ impl CopyBackfiller {
                     (opt_in_lsn, mode)
                 }
             };
-            if !inner.active.insert(qname.clone()) {
+            if !inner.active.insert(rel.clone()) {
                 return;
             }
             self.refresh_gauges(&inner.ledger);
@@ -632,7 +634,7 @@ impl CopyBackfiller {
             let resume = inner
                 .ledger
                 .entries
-                .get(&qname)
+                .get(&rel)
                 .filter(|r| r.swapped)
                 .cloned();
             let mut spawn_pass = false;
@@ -654,7 +656,7 @@ impl CopyBackfiller {
         };
         if let Some(rec) = resume {
             let this = self.clone();
-            tokio::spawn(async move { this.resume_swap(qname, rec).await });
+            tokio::spawn(async move { this.resume_swap(rel, rec).await });
             return;
         }
         match mode {
@@ -678,24 +680,21 @@ impl CopyBackfiller {
     /// against the shared routing map, so its remaining rows skip once the
     /// mapping is gone; its completion mark no-ops (entry absent). A queued
     /// backup request is withdrawn before its pass fires.
-    pub async fn note_opt_out(&self, qname: &str) {
+    pub async fn note_opt_out(&self, rel: &RelName) {
         let mut inner = self.inner.lock().await;
         for q in inner.queued.values_mut() {
-            if let Some(i) = q
-                .iter()
-                .position(|r| r.desc.qualified_name.as_ref() == qname)
-            {
+            if let Some(i) = q.iter().position(|r| r.desc.rel_name == *rel) {
                 q.swap_remove(i);
-                inner.active.remove(qname);
+                inner.active.remove(rel);
                 break;
             }
         }
-        if inner.ledger.entries.remove(qname).is_some()
+        if inner.ledger.entries.remove(rel).is_some()
             && let Err(e) = inner.ledger.persist().await
         {
             tracing::warn!(
                 target: "walshadow::backfill",
-                qname,
+                qname = %rel,
                 error = %e,
                 "backfill ledger persist failed on opt-out",
             );
@@ -747,7 +746,7 @@ impl CopyBackfiller {
         }
         let mut inner = self.inner.lock().await;
         for r in &reqs {
-            inner.active.remove(r.desc.qualified_name.as_ref());
+            inner.active.remove(&r.desc.rel_name);
         }
         self.refresh_gauges(&inner.ledger);
     }
@@ -785,11 +784,10 @@ impl CopyBackfiller {
     async fn publish_staged(&self, plan: &StagingPlan, reqs: &[BackupRequest]) {
         // Rels skipped at prepare had no mapping, so their rows had nowhere
         // to route; mark done exactly as an unstaged pass would have
-        let staged: HashSet<&str> = plan.rels.iter().map(|r| r.qname.as_str()).collect();
+        let staged: HashSet<&RelName> = plan.rels.iter().map(|r| &r.rel).collect();
         for r in reqs {
-            let qname = r.desc.qualified_name.as_ref();
-            if !staged.contains(qname) {
-                self.mark_done_entry(qname).await;
+            if !staged.contains(&r.desc.rel_name) {
+                self.mark_done_entry(&r.desc.rel_name).await;
             }
         }
         if plan.rels.is_empty() {
@@ -816,7 +814,7 @@ impl CopyBackfiller {
                 Err(e) => {
                     tracing::error!(
                         target: "walshadow::backfill",
-                        qname = %rel.qname,
+                        qname = %rel.rel,
                         error = %format!("{e:#}"),
                         "staging swap failed; boot resumes from the recorded phase",
                     );
@@ -834,7 +832,7 @@ impl CopyBackfiller {
             if let Err(e) = self.finish_swapped(&mut sess, rel).await {
                 tracing::error!(
                     target: "walshadow::backfill",
-                    qname = %rel.qname,
+                    qname = %rel.rel,
                     error = %format!("{e:#}"),
                     "staging copy-back failed; entry stays swapped (boot resumes)",
                 );
@@ -846,11 +844,11 @@ impl CopyBackfiller {
     /// or DDL moved the destination shape mid-pass (the loaded copy has the
     /// pre-DDL shape; entry stays pending, next boot re-loads).
     async fn swap_rel(&self, sess: &mut StagingSession, rel: &StagingRel) -> anyhow::Result<bool> {
-        if !self.mapping.read().await.contains_key(&rel.qname) {
+        if !self.mapping.read().await.contains_key(&rel.rel) {
             sess.drop_staging(rel).await?;
             tracing::info!(
                 target: "walshadow::backfill",
-                qname = %rel.qname,
+                qname = %rel.rel,
                 "rel unmapped at publish (opt-out mid-pass); staging discarded",
             );
             return Ok(false);
@@ -863,7 +861,7 @@ impl CopyBackfiller {
             sess.drop_staging(rel).await?;
             tracing::warn!(
                 target: "walshadow::backfill",
-                qname = %rel.qname,
+                qname = %rel.rel,
                 "destination schema changed mid-pass; staging discarded, entry stays pending",
             );
             return Ok(false);
@@ -875,7 +873,7 @@ impl CopyBackfiller {
         // Persist precedes EXCHANGE: post-swap the staging name holds the
         // only copy of the live-window rows, and a pending-looking entry
         // would re-run the pass and rebuild staging over it
-        if !self.mark_swapped(&rel.qname, &uuid).await {
+        if !self.mark_swapped(&rel.rel, &uuid).await {
             anyhow::bail!("ledger persist failed; exchange withheld");
         }
         sess.exchange(rel).await?;
@@ -889,7 +887,7 @@ impl CopyBackfiller {
     ) -> anyhow::Result<()> {
         sess.copy_back(rel).await?;
         sess.drop_staging(rel).await?;
-        self.mark_done_entry(&rel.qname).await;
+        self.mark_done_entry(&rel.rel).await;
         Ok(())
     }
 
@@ -897,40 +895,38 @@ impl CopyBackfiller {
     /// phase apart: unchanged = exchange never applied (staging still holds
     /// the load), changed = exchange applied (staging holds the pre-swap
     /// storage), missing = copy-back + drop ran, only the done mark is owed.
-    async fn resume_swap(self: Arc<Self>, qname: String, rec: LedgerRec) {
-        if let Err(e) = self.resume_swap_inner(&qname, &rec).await {
+    async fn resume_swap(self: Arc<Self>, name: RelName, rec: LedgerRec) {
+        if let Err(e) = self.resume_swap_inner(&name, &rec).await {
             tracing::error!(
                 target: "walshadow::backfill",
-                qname = %qname,
+                qname = %name,
                 error = %format!("{e:#}"),
                 "swap resume failed; entry stays swapped (retry next boot)",
             );
         }
         let mut inner = self.inner.lock().await;
-        inner.active.remove(&qname);
+        inner.active.remove(&name);
         self.refresh_gauges(&inner.ledger);
     }
 
-    async fn resume_swap_inner(&self, qname: &str, rec: &LedgerRec) -> anyhow::Result<()> {
+    async fn resume_swap_inner(&self, name: &RelName, rec: &LedgerRec) -> anyhow::Result<()> {
         let target = self
             .mapping
             .read()
             .await
-            .get(qname)
+            .get(name)
             .map(|m| m.target.clone())
-            .with_context(|| format!("swapped entry {qname} unmapped; staging table orphaned"))?;
-        let (database, table) = backfill_staging::parse_target(&target, &self.emitter.database)
-            .with_context(|| format!("unparseable mapping target {target:?}"))?;
+            .with_context(|| format!("swapped entry {name} unmapped; staging table orphaned"))?;
         let rel = StagingRel {
-            qname: qname.to_owned(),
-            database,
-            table,
+            rel: name.clone(),
+            database: target.database,
+            table: target.table,
             s_lsn: rec.s_lsn,
         };
         let mut sess = StagingSession::connect(&self.emitter).await?;
         match sess.table_uuid(&rel.database, &rel.staging_table()).await? {
             None => {
-                self.mark_done_entry(qname).await;
+                self.mark_done_entry(name).await;
                 return Ok(());
             }
             Some(u) if Some(&u) == rec.staging_uuid.as_ref() => {
@@ -941,7 +937,7 @@ impl CopyBackfiller {
                     .await?;
                 if real_fp != staging_fp {
                     sess.drop_staging(&rel).await?;
-                    self.clear_swapped(qname).await;
+                    self.clear_swapped(name).await;
                     anyhow::bail!(
                         "destination schema changed before exchange; load discarded, entry re-pends"
                     );
@@ -953,15 +949,15 @@ impl CopyBackfiller {
         tokio::time::sleep(self.emitter.insert_timeout).await;
         sess.copy_back(&rel).await?;
         sess.drop_staging(&rel).await?;
-        self.mark_done_entry(qname).await;
+        self.mark_done_entry(name).await;
         Ok(())
     }
 
     /// `false` (caller must not exchange) when the entry vanished (opt-out
     /// raced the publish) or the persist failed.
-    async fn mark_swapped(&self, qname: &str, uuid: &str) -> bool {
+    async fn mark_swapped(&self, name: &RelName, uuid: &str) -> bool {
         let mut inner = self.inner.lock().await;
-        let Some(rec) = inner.ledger.entries.get_mut(qname) else {
+        let Some(rec) = inner.ledger.entries.get_mut(name) else {
             return false;
         };
         rec.swapped = true;
@@ -969,11 +965,11 @@ impl CopyBackfiller {
         if let Err(e) = inner.ledger.persist().await {
             tracing::warn!(
                 target: "walshadow::backfill",
-                qname,
+                qname = %name,
                 error = %e,
                 "ledger persist failed; exchange withheld, entry stays pending",
             );
-            let rec = inner.ledger.entries.get_mut(qname).expect("just present");
+            let rec = inner.ledger.entries.get_mut(name).expect("just present");
             rec.swapped = false;
             rec.staging_uuid = None;
             return false;
@@ -981,16 +977,16 @@ impl CopyBackfiller {
         true
     }
 
-    async fn mark_done_entry(&self, qname: &str) {
+    async fn mark_done_entry(&self, name: &RelName) {
         let mut inner = self.inner.lock().await;
-        if let Some(rec) = inner.ledger.entries.get_mut(qname) {
+        if let Some(rec) = inner.ledger.entries.get_mut(name) {
             rec.done = true;
             rec.swapped = false;
             rec.staging_uuid = None;
             if let Err(e) = inner.ledger.persist().await {
                 tracing::warn!(
                     target: "walshadow::backfill",
-                    qname,
+                    qname = %name,
                     error = %e,
                     "backfill ledger persist failed; next boot resumes (idempotent)",
                 );
@@ -999,15 +995,15 @@ impl CopyBackfiller {
         self.refresh_gauges(&inner.ledger);
     }
 
-    async fn clear_swapped(&self, qname: &str) {
+    async fn clear_swapped(&self, name: &RelName) {
         let mut inner = self.inner.lock().await;
-        if let Some(rec) = inner.ledger.entries.get_mut(qname) {
+        if let Some(rec) = inner.ledger.entries.get_mut(name) {
             rec.swapped = false;
             rec.staging_uuid = None;
             if let Err(e) = inner.ledger.persist().await {
                 tracing::warn!(
                     target: "walshadow::backfill",
-                    qname,
+                    qname = %name,
                     error = %e,
                     "backfill ledger persist failed on swap clear",
                 );
@@ -1017,18 +1013,17 @@ impl CopyBackfiller {
     }
 
     async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: u64) {
-        let qname = desc.qualified_name.as_ref().to_owned();
         let res = self.copy_once(&desc, s_lsn).await;
         let mut inner = self.inner.lock().await;
-        inner.active.remove(&qname);
+        inner.active.remove(&desc.rel_name);
         match res {
             Ok(outcome) => {
-                if let Some(entry) = inner.ledger.entries.get_mut(&qname) {
+                if let Some(entry) = inner.ledger.entries.get_mut(&desc.rel_name) {
                     entry.done = true;
                     if let Err(e) = inner.ledger.persist().await {
                         tracing::warn!(
                             target: "walshadow::backfill",
-                            qname = %qname,
+                            qname = %desc.rel_name,
                             error = %e,
                             "backfill ledger persist failed; next boot re-COPYs (idempotent)",
                         );
@@ -1036,7 +1031,7 @@ impl CopyBackfiller {
                 }
                 tracing::info!(
                     target: "walshadow::backfill",
-                    qname = %qname,
+                    qname = %desc.rel_name,
                     rows = outcome.rows,
                     s_lsn = %format_pg_lsn(s_lsn),
                     p_hi = %format_pg_lsn(outcome.p_hi),
@@ -1049,7 +1044,7 @@ impl CopyBackfiller {
             Err(e) => {
                 tracing::error!(
                     target: "walshadow::backfill",
-                    qname = %qname,
+                    qname = %desc.rel_name,
                     error = %format!("{e:#}"),
                     "backfill failed; entry stays pending (re-COPY on next boot)",
                 );
@@ -1065,8 +1060,8 @@ impl CopyBackfiller {
     ) -> anyhow::Result<CopyOutcome> {
         let qtable = format!(
             "{}.{}",
-            quote_pg_ident(&desc.namespace_name),
-            quote_pg_ident(&desc.name)
+            quote_pg_ident(&desc.rel_name.namespace),
+            quote_pg_ident(&desc.rel_name.name)
         );
         let client = open_sql_client(&self.pg)
             .await
@@ -1191,7 +1186,7 @@ async fn current_wal_lsn(client: &tokio_postgres::Client) -> anyhow::Result<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shadow_catalog::{RelAttr, ReplIdent};
+    use crate::shadow_catalog::{RelAttr, RelName, ReplIdent};
     use walrus::pg::walparser::RelFileNode;
 
     fn attr(attnum: i16, name: &str, type_oid: u32, dropped: bool) -> RelAttr {
@@ -1220,9 +1215,7 @@ mod tests {
             },
             oid: 16400,
             namespace_oid: 2200,
-            namespace_name: "app".into(),
-            name: "orders".into(),
-            qualified_name: RelDescriptor::build_qualified_name("app", "orders"),
+            rel_name: RelName::new("app", "orders"),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -1351,7 +1344,7 @@ mod tests {
         let mut ledger = Ledger::load(tmp.path()).await;
         assert_eq!(ledger.pending_count(), 0);
         ledger.entries.insert(
-            "app.orders".into(),
+            RelName::new("app", "orders"),
             LedgerRec {
                 s_lsn: 0x1000,
                 done: false,
@@ -1361,7 +1354,7 @@ mod tests {
             },
         );
         ledger.entries.insert(
-            "app.done".into(),
+            RelName::new("app", "done"),
             LedgerRec {
                 s_lsn: 0x800,
                 done: true,
@@ -1371,7 +1364,7 @@ mod tests {
             },
         );
         ledger.entries.insert(
-            "app.mid_swap".into(),
+            RelName::new("app", "mid_swap"),
             LedgerRec {
                 s_lsn: 0x2000,
                 done: false,
@@ -1383,14 +1376,14 @@ mod tests {
         ledger.persist().await.unwrap();
 
         let again = Ledger::load(tmp.path()).await;
-        let orders = again.entries.get("app.orders").unwrap();
+        let orders = again.entries.get(&RelName::new("app", "orders")).unwrap();
         assert_eq!((orders.s_lsn, orders.done), (0x1000, false));
         assert_eq!(orders.mode, InitialLoadMode::Copy);
         assert!(!orders.swapped);
-        let done = again.entries.get("app.done").unwrap();
+        let done = again.entries.get(&RelName::new("app", "done")).unwrap();
         assert_eq!((done.s_lsn, done.done), (0x800, true));
         assert_eq!(done.mode, InitialLoadMode::ObjectStore, "mode round-trips");
-        let mid = again.entries.get("app.mid_swap").unwrap();
+        let mid = again.entries.get(&RelName::new("app", "mid_swap")).unwrap();
         assert!(mid.swapped, "swap phase round-trips");
         assert_eq!(mid.staging_uuid.as_deref(), Some("a-uuid"));
         assert_eq!(again.pending_count(), 2, "swapped counts as pending");
@@ -1413,12 +1406,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(
             tmp.path().join(LEDGER_FILENAME),
-            br#"[{"qname":"app.legacy","s_lsn":4096,"done":false}]"#,
+            br#"[{"namespace":"app","relname":"legacy","s_lsn":4096,"done":false}]"#,
         )
         .await
         .unwrap();
         let ledger = Ledger::load(tmp.path()).await;
-        let rec = ledger.entries.get("app.legacy").unwrap();
+        let rec = ledger.entries.get(&RelName::new("app", "legacy")).unwrap();
         assert_eq!(rec.mode, InitialLoadMode::Copy);
         assert_eq!(rec.s_lsn, 4096);
         assert!(!rec.done);

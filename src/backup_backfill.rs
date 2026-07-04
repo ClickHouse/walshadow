@@ -946,12 +946,8 @@ impl crate::decoder_sink::TupleObserver for ReplayRouter {
                 self.commits_past_s += 1;
                 return Ok(());
             }
-            let Some(mapping) = crate::pipeline::lookup_mapping(
-                &self.mapping,
-                rel.qualified_name.as_ref(),
-                &self.stats,
-            )
-            .await
+            let Some(mapping) =
+                crate::pipeline::lookup_mapping(&self.mapping, &rel.rel_name, &self.stats).await
             else {
                 return Ok(());
             };

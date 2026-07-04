@@ -25,6 +25,8 @@ mod fx;
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
+use walshadow::shadow_catalog::RelName;
 
 const SOURCE_PORT: u16 = 17401;
 const SHADOW_PORT: u16 = 17402;
@@ -85,8 +87,8 @@ async fn add_column_default_replicates_pre_alter_default() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "s14.t".into(),
-        target_table: "walshadow_test.s14_t".into(),
+        source_table: RelName::new("s14", "t"),
+        target_table: TableTarget::new("walshadow_test", "s14_t"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

@@ -21,6 +21,7 @@ use thiserror::Error;
 use tokio_postgres::Client;
 
 use crate::ch_emitter::EmitterConfig;
+use crate::shadow_catalog::RelName;
 
 /// Catalog accessors assume PG-16 column layouts; PG <16 unsupported.
 pub const MIN_SERVER_VERSION_NUM: i32 = 160_000;
@@ -56,12 +57,12 @@ pub enum PreflightError {
          the row. Add a PRIMARY KEY, or set REPLICA IDENTITY USING INDEX / FULL \
          on {rel} at the source"
     )]
-    BadReplicaIdentity { rel: String, got: char },
+    BadReplicaIdentity { rel: RelName, got: char },
     #[error(
         "mapped relation {rel} not found on source (configured in --ch-config \
-         but `{rel}::regclass` resolves to nothing)"
+         but absent from pg_class)"
     )]
-    MappedRelMissing { rel: String },
+    MappedRelMissing { rel: RelName },
     #[error("pg query: {0}")]
     Pg(#[from] tokio_postgres::Error),
     #[error("shadow_version_num could not be parsed: {0:?}")]
@@ -158,9 +159,9 @@ pub async fn run(input: Inputs<'_>) -> Result<PreflightReport, PreflightError> {
 
     if let Some(cfg) = input.ch_config {
         for key in cfg.tables.keys() {
-            // Keys are `"namespace.relname"`. `to_regclass(text)` honours
-            // search_path/quoting and returns NULL (not raise) on a missing
-            // relation; the pg_class join yields one row of relreplident.
+            // pg_class⋈pg_namespace by parts: zero rows (not raise) on a
+            // missing relation; one row of relreplident otherwise.
+            let (ns, name): (&str, &str) = (&key.namespace, &key.name);
             let row = input
                 .source_sql
                 .query_opt(
@@ -168,8 +169,9 @@ pub async fn run(input: Inputs<'_>) -> Result<PreflightReport, PreflightError> {
                             EXISTS (SELECT 1 FROM pg_index i \
                                     WHERE i.indrelid = c.oid AND i.indisprimary) \
                      FROM pg_class c \
-                     WHERE c.oid = to_regclass($1)",
-                    &[&key.as_str()],
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = $1 AND c.relname = $2",
+                    &[&ns, &name],
                 )
                 .await?;
             match row {

@@ -181,12 +181,8 @@ pub async fn decode_and_route(
                     }
                     Err(e) => return Err(e.to_string()),
                 };
-                let Some(mapping) = crate::pipeline::lookup_mapping(
-                    &ctx.mapping,
-                    rel.qualified_name.as_ref(),
-                    &ctx.stats,
-                )
-                .await
+                let Some(mapping) =
+                    crate::pipeline::lookup_mapping(&ctx.mapping, &rel.rel_name, &ctx.stats).await
                 else {
                     continue;
                 };

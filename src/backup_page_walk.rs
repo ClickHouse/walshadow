@@ -125,7 +125,7 @@ impl CatalogMap {
 
     pub fn insert(&mut self, desc: Arc<RelDescriptor>) {
         let key = (desc.rfn.db_node, desc.rfn.rel_node);
-        if desc.namespace_name == PG_TOAST_NS {
+        if &*desc.rel_name.namespace == PG_TOAST_NS {
             self.toast_filenodes.insert(key, desc.oid);
         }
         self.by_filenode.insert(key, desc);
@@ -644,7 +644,7 @@ impl BackupSink for PageWalkSink {
 /// Test fixture `public.t(id int4)`, shared with `backfill_bootstrap`
 #[cfg(test)]
 pub(crate) fn make_rel() -> RelDescriptor {
-    use crate::shadow_catalog::{RelAttr, ReplIdent};
+    use crate::shadow_catalog::{RelAttr, RelName, ReplIdent};
     RelDescriptor {
         rfn: RelFileNode {
             spc_node: 1663,
@@ -653,9 +653,7 @@ pub(crate) fn make_rel() -> RelDescriptor {
         },
         oid: 16400,
         namespace_oid: 2200,
-        namespace_name: "public".into(),
-        name: "t".into(),
-        qualified_name: RelDescriptor::build_qualified_name("public", "t"),
+        rel_name: RelName::new("public", "t"),
         kind: 'r',
         persistence: 'p',
         replident: ReplIdent::Default { pk_attnums: None },
@@ -704,6 +702,7 @@ pub(crate) fn synth_single_tuple_page(value: i32) -> [u8; PAGE_BYTES] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shadow_catalog::RelName;
     use std::path::PathBuf;
 
     #[tokio::test]
@@ -794,11 +793,11 @@ mod tests {
     fn catalog_map_routes_filenodes_and_marks_toast() {
         let mut m = CatalogMap::new();
         let mut rel = make_rel();
-        rel.namespace_name = "public".into();
+        rel.rel_name = RelName::new("public", &rel.rel_name.name);
         m.insert(Arc::new(rel.clone()));
         let mut toast_rel = rel.clone();
         toast_rel.rfn.rel_node = 99999;
-        toast_rel.namespace_name = "pg_toast".into();
+        toast_rel.rel_name = RelName::new("pg_toast", &toast_rel.rel_name.name);
         m.insert(Arc::new(toast_rel));
 
         assert!(m.get(5, 16400).is_some());

@@ -138,7 +138,8 @@ surgical when the xact also carries changes to keep.
 
 ## Per-table opt-in and initial-load path
 
-The base `config_table` ([../config.md](../config.md)) carries only `target`.
+The base `config_table` ([../config.md](../config.md)) carries only the
+target columns.
 This adds two columns — `replicate` (bool, doubles as the inclusion switch)
 and `initial_load` (text mode: `'none'`, `'copy'`, `'base_backup'`,
 `'object_store'`; SQL NULL means omitted) — collapsing three intents into one
@@ -160,8 +161,8 @@ inspects `replicate` + `initial_load` + catalog state to dispatch:
 | `replicate=t` | no (forward-decl) | n/a | hold row, materialize when CREATE TABLE for matching qualname arrives via catalog applicator |
 | `replicate=f` | yes | n/a | inclusion-list remove; mid-stream exclusion drains in-flight rows then halts further emission |
 
-Keyed on **qualified name**, not rfn. Resolver maintains a
-`pending_decl: HashMap<QualifiedName, ConfigTable>` populated from rows whose
+Keyed on **relation name** (`(namespace, relname)` pair), not rfn. Resolver
+maintains a `pending_decl: HashMap<RelName, TableRow>` populated from rows whose
 target rfn doesn't exist. The catalog applicator notifies the resolver on each
 new rel; resolver pops the matching pending entry and registers the rfn↔config
 binding. Stale entries (rel never created, or dropped and recreated under a
@@ -340,8 +341,8 @@ subcommand walking the three layers.
   during the COPY win by `commit_lsn > S`. Source state == CH state once WAL apply
   passes `P_hi`. Variant: mutate a row mid-backfill and assert CH reflects the
   mutation, not the COPY baseline
-- **Forward-decl.** Operator inserts `config_table (qname = "app.new_table",
-  replicate=true)` for a table that doesn't exist. Resolver parks it in
+- **Forward-decl.** Operator inserts `config_table (namespace = 'app',
+  relname = 'new_table', replicate = true)` for a table that doesn't exist. Resolver parks it in
   `pending_decl`. Source runs `CREATE TABLE app.new_table (...)`; the catalog
   applicator notifies the resolver, the pending row resolves, subsequent inserts
   land on CH under the declared config

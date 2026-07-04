@@ -9,7 +9,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
 use walshadow::shadow::Shadow;
+use walshadow::shadow_catalog::RelName;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
 const SLOT_IUD: PortSlot = PortSlot {
@@ -69,8 +71,8 @@ const SCHEMA_SQL: &str = "CREATE SCHEMA sd;\n\
 
 fn mapping() -> Vec<fx::TableMappingSpec> {
     vec![fx::TableMappingSpec {
-        source_table: "sd.t".into(),
-        target_table: "walshadow_test.sd_t".into(),
+        source_table: RelName::new("sd", "t"),
+        target_table: TableTarget::new("walshadow_test", "sd_t"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

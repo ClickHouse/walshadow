@@ -171,9 +171,9 @@ backoff policy varyable per call site
 
 What catalog produces per relation:
 
-- `rfn: RelFileNode`, `oid: Oid`, `namespace_oid`, `namespace_name`,
-  `name`, `qualified_name: Arc<str>` (pre-formatted for hot-path
-  routing)
+- `rfn: RelFileNode`, `oid: Oid`, `namespace_oid`, `rel_name: RelName`
+  (structured `{ namespace, name }` pair, `Arc<str>` parts for hot-path
+  routing; joined only at SQL interpolation / `Display`)
 - `kind` (`pg_class.relkind`: `'r'` table / `'p'` partitioned / etc),
   `persistence` (`'p'` / `'u'` / `'t'`)
 - `replident: ReplIdent` — resolved from `pg_class.relreplident`
@@ -234,7 +234,7 @@ Variants (see diagram legend for trigger → DDL mapping):
   `added_columns`, `dropped_columns`, `renamed_columns`, `type_changes`.
   Renames detected by attnum-match + name-diff heuristic; PG's `RENAME
   COLUMN` keeps attnum intact, natural case lands here
-- `Dropped { oid, qualified_name }` — `emit_dropped(oid)` from
+- `Dropped { oid, rel_name }` — `emit_dropped(oid)` from
   `pg_class_decoder` heap_delete branch, or `sweep_dropped` poll (at
   the dropping xact's commit, `PendingSweeps`-gated) for catalogs with
   `relreplident = 'n'` where heap_delete carries no old tuple to

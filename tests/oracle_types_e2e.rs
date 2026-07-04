@@ -15,8 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
 use walshadow::oracle::Oracle;
 use walshadow::shadow::Shadow;
+use walshadow::shadow_catalog::RelName;
 use walshadow::shadow_catalog::socket_conninfo;
 
 struct PortSlot {
@@ -216,8 +218,8 @@ async fn arrays_resolve_via_oracle() {
             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
         vec![fx::TableMappingSpec {
-            source_table: "public.arr".into(),
-            target_table: "walshadow_test.arr".into(),
+            source_table: RelName::new("public", "arr"),
+            target_table: TableTarget::new("walshadow_test", "arr"),
             columns: vec![
                 col(1, "id", "Int32"),
                 col(2, "ints", "Nullable(String)"),
@@ -270,8 +272,8 @@ async fn enums_resolve_via_oracle() {
             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
         vec![fx::TableMappingSpec {
-            source_table: "public.en".into(),
-            target_table: "walshadow_test.en".into(),
+            source_table: RelName::new("public", "en"),
+            target_table: TableTarget::new("walshadow_test", "en"),
             columns: vec![
                 col(1, "id", "Int32"),
                 col(2, "m", "Nullable(String)"),
@@ -319,8 +321,8 @@ async fn geometric_types_resolve_via_oracle() {
             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
         vec![fx::TableMappingSpec {
-            source_table: "public.geo".into(),
-            target_table: "walshadow_test.geo".into(),
+            source_table: RelName::new("public", "geo"),
+            target_table: TableTarget::new("walshadow_test", "geo"),
             columns: vec![
                 col(1, "id", "Int32"),
                 col(2, "p", "Nullable(String)"),
@@ -370,8 +372,8 @@ async fn pgvector_resolves_via_oracle() {
             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
         vec![fx::TableMappingSpec {
-            source_table: "public.vec".into(),
-            target_table: "walshadow_test.vec".into(),
+            source_table: RelName::new("public", "vec"),
+            target_table: TableTarget::new("walshadow_test", "vec"),
             columns: vec![
                 col(1, "id", "Int32"),
                 col(2, "v", "Nullable(String)"),
@@ -409,8 +411,8 @@ async fn array_update_under_rif_resolves_old_tuple() {
             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
         vec![fx::TableMappingSpec {
-            source_table: "public.arr".into(),
-            target_table: "walshadow_test.arr".into(),
+            source_table: RelName::new("public", "arr"),
+            target_table: TableTarget::new("walshadow_test", "arr"),
             columns: vec![col(1, "id", "Int32"), col(2, "ints", "Nullable(String)")],
         }],
         "INSERT INTO public.arr VALUES (1, '{1,2}');\n\

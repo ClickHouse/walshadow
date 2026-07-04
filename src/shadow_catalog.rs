@@ -60,17 +60,42 @@ pub enum CatalogError {
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
 
+/// Structured relation identity: (namespace, relname) as separate parts.
+/// Never joined into one string for storage, keying, or config — a joined
+/// "ns.rel" collides for names containing dots and forces lossy parse-back.
+/// Joining happens only at interpolation: SQL text quotes each part at the
+/// call site; `Display` renders for logs.
+///
+/// `Arc<str>` parts so hot-path consumers (routing map keys, batcher
+/// grouping) clone by refcount, no per-row allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RelName {
+    pub namespace: Arc<str>,
+    pub name: Arc<str>,
+}
+
+impl RelName {
+    pub fn new(namespace: &str, name: &str) -> Self {
+        Self {
+            namespace: Arc::from(namespace),
+            name: Arc::from(name),
+        }
+    }
+}
+
+impl std::fmt::Display for RelName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.namespace, self.name)
+    }
+}
+
 /// Fully-resolved description of one PG relation, sized for heap-tuple decoding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelDescriptor {
     pub rfn: RelFileNode,
     pub oid: Oid,
     pub namespace_oid: Oid,
-    pub namespace_name: String,
-    pub name: String,
-    /// `"{namespace_name}.{name}"` cached so hot-path consumers (CH emitter
-    /// routing, qualified-name observers) skip per-row reformatting
-    pub qualified_name: Arc<str>,
+    pub rel_name: RelName,
     /// `pg_class.relkind`: `'r'` table, `'i'` index, `'S'` sequence,
     /// `'t'` toast, `'v'` view, `'m'` matview, `'c'` composite,
     /// `'f'` foreign, `'p'` partitioned
@@ -82,17 +107,6 @@ pub struct RelDescriptor {
     /// catalog round-trip
     pub replident: ReplIdent,
     pub attributes: Vec<RelAttr>,
-}
-
-impl RelDescriptor {
-    /// For callers building a descriptor manually (tests, bootstrap).
-    pub fn build_qualified_name(namespace_name: &str, name: &str) -> Arc<str> {
-        let mut s = String::with_capacity(namespace_name.len() + 1 + name.len());
-        s.push_str(namespace_name);
-        s.push('.');
-        s.push_str(name);
-        Arc::<str>::from(s)
-    }
 }
 
 /// Resolved `pg_class.relreplident` (stored as a single char d/n/f/i). The
@@ -159,7 +173,7 @@ pub enum SchemaEvent {
     },
     Dropped {
         oid: Oid,
-        qualified_name: Arc<str>,
+        rel_name: RelName,
     },
 }
 
@@ -435,21 +449,17 @@ impl ShadowCatalog {
     /// `send_event` no-ops while `event_tx` is `None`, so seeding emits no
     /// `Added` and does zero CH work at boot.
     ///
-    /// `qualified_names` are `"namespace.relname"` pinned-mapping keys, resolved
-    /// via `to_regclass($1)` (NULL skipped, defensive: preflight guarantees
-    /// existence). Oids already in `prev_known` skipped → idempotent across
-    /// `--start-lsn` resume.
+    /// `rel_names` are pinned-mapping keys, resolved via pg_class⋈pg_namespace
+    /// (miss skipped, defensive: preflight guarantees existence). Oids already
+    /// in `prev_known` skipped → idempotent across `--start-lsn` resume.
     ///
     /// Records the *full* source descriptor, not the pinned subset, so unmapped
     /// columns sit in the baseline as "excluded", never "added since". See
     /// `plans/future/pinned_ddl_baseline.md`.
-    pub async fn seed_baseline(&mut self, qualified_names: &[String]) -> Result<usize> {
+    pub async fn seed_baseline(&mut self, rel_names: &[RelName]) -> Result<usize> {
         let mut seeded = 0usize;
-        for name in qualified_names {
-            let row = self
-                .query_one_retry("SELECT to_regclass($1)::oid", &[&name.as_str()])
-                .await?;
-            let Some(oid) = row.get::<_, Option<Oid>>(0) else {
+        for rel in rel_names {
+            let Some(oid) = self.oid_by_name(rel).await? else {
                 continue;
             };
             if self.prev_known.contains_key(&oid) {
@@ -464,15 +474,28 @@ impl ShadowCatalog {
         Ok(seeded)
     }
 
-    /// Resolve a `"namespace.relname"` to its current source descriptor via
-    /// shadow's `pg_class` (`to_regclass`, same path as [`Self::seed_baseline`]),
-    /// or `None` when the rel isn't known yet — the forward-declared case the
-    /// per-table opt-in dispatch parks in `pending_decl`.
-    pub async fn descriptor_by_qname(&mut self, qname: &str) -> Result<Option<Arc<RelDescriptor>>> {
+    async fn oid_by_name(&mut self, rel: &RelName) -> Result<Option<Oid>> {
+        let (ns, name): (&str, &str) = (&rel.namespace, &rel.name);
         let row = self
-            .query_one_retry("SELECT to_regclass($1)::oid", &[&qname])
+            .query_opt_retry(
+                "SELECT c.oid FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&ns, &name],
+            )
             .await?;
-        let Some(oid) = row.get::<_, Option<Oid>>(0) else {
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    /// Resolve a relation name to its current source descriptor via shadow's
+    /// `pg_class` (same path as [`Self::seed_baseline`]), or `None` when the
+    /// rel isn't known yet — the forward-declared case the per-table opt-in
+    /// dispatch parks in `pending_decl`.
+    pub async fn descriptor_by_name(
+        &mut self,
+        rel: &RelName,
+    ) -> Result<Option<Arc<RelDescriptor>>> {
+        let Some(oid) = self.oid_by_name(rel).await? else {
             return Ok(None);
         };
         match self.relation_by_oid(oid).await {
@@ -515,7 +538,7 @@ impl ShadowCatalog {
         // Filenode entry stays; evicted lazily on next access
         self.send_event(SchemaEvent::Dropped {
             oid,
-            qualified_name: prev.qualified_name.clone(),
+            rel_name: prev.rel_name.clone(),
         });
         true
     }
@@ -960,14 +983,11 @@ impl ShadowCatalog {
         let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
         let replident = self.fetch_replident(replident_char, oid).await?;
         let attributes = self.fetch_attributes(oid).await?;
-        let qualified_name = RelDescriptor::build_qualified_name(&namespace_name, &name);
         Ok(RelDescriptor {
             rfn,
             oid,
             namespace_oid,
-            namespace_name,
-            name,
-            qualified_name,
+            rel_name: RelName::new(&namespace_name, &name),
             kind,
             persistence,
             replident,
@@ -1370,9 +1390,7 @@ mod tests {
             rfn: rfn(oid),
             oid,
             namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name: format!("t{oid}"),
-            qualified_name: RelDescriptor::build_qualified_name("public", &format!("t{oid}")),
+            rel_name: RelName::new("public", &format!("t{oid}")),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },

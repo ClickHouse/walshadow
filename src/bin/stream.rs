@@ -60,7 +60,7 @@ use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
-    ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
+    RelName, ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
 };
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::toast::ToastResolver;
@@ -725,7 +725,7 @@ async fn run(args: Args) -> Result<()> {
     // Added (apply_added skips pinned dests). cfg.tables.keys() is the
     // pinned set; auto-create tables baseline on first-touch CREATE.
     if let Some(cfg) = ch_config.as_ref() {
-        let names: Vec<String> = cfg.tables.keys().cloned().collect();
+        let names: Vec<RelName> = cfg.tables.keys().cloned().collect();
         let seeded = catalog
             .lock()
             .await
@@ -855,7 +855,7 @@ async fn run(args: Args) -> Result<()> {
         // connection. Post-seed writes arrive live off the WAL stream. Refuse
         // to start if the named schema is not installed — explicit opt-in
         // means the operator expects the overlay present.
-        let mut seeded_table_rows: Vec<(String, walshadow::runtime_config::TableRow)> = Vec::new();
+        let mut seeded_table_rows: Vec<(RelName, walshadow::runtime_config::TableRow)> = Vec::new();
         if let Some(schema) = emitter_cfg.runtime_config_schema.clone() {
             let client = feed
                 .sql_client()
@@ -925,27 +925,27 @@ async fn run(args: Args) -> Result<()> {
         // `raw_start` is the backfill boundary S for a first-seen
         // `initial_load` row: COPY covers commits before it, WAL the rest;
         // the ledger resumes/no-ops rows seen on an earlier boot.
-        for (qname, row) in &seeded_table_rows {
+        for (rel, row) in &seeded_table_rows {
             if row.replicate.is_some() {
                 walshadow::opt_in::apply_table_opt_in(
                     &resolver,
                     &mut applicator,
                     &catalog,
                     copy_backfiller.as_ref(),
-                    qname,
+                    rel,
                     row,
                     raw_start,
                 )
                 .await
-                .with_context(|| format!("seed opt-in for {qname}"))?;
+                .with_context(|| format!("seed opt-in for {rel}"))?;
             }
         }
-        let sql_scoped_tables: HashSet<String> = seeded_table_rows
+        let sql_scoped_tables: HashSet<RelName> = seeded_table_rows
             .iter()
             .filter(|(_, row)| row.replicate.is_some())
-            .map(|(qname, _)| qname.clone())
+            .map(|(rel, _)| rel.clone())
             .collect();
-        let active_tables: HashSet<String> = config_rx.borrow().tables.keys().cloned().collect();
+        let active_tables: HashSet<RelName> = config_rx.borrow().tables.keys().cloned().collect();
         apply_toml_initial_loads(
             &catalog,
             copy_backfiller.as_ref(),
@@ -1443,7 +1443,7 @@ async fn seed_runtime_config(
     client: &tokio_postgres::Client,
     schema: &str,
     resolver: &ConfigResolver,
-) -> anyhow::Result<Vec<(String, walshadow::runtime_config::TableRow)>> {
+) -> anyhow::Result<Vec<(RelName, walshadow::runtime_config::TableRow)>> {
     use walshadow::runtime_config::{ColumnRow, ConfigOverlay, GlobalRow, NamespaceRow, TableRow};
     let s = quote_ident(schema);
     let mut overlay = ConfigOverlay::default();
@@ -1513,9 +1513,10 @@ async fn seed_runtime_config(
         let namespace: String = row.get("namespace");
         let relname: String = row.get("relname");
         overlay.tables.insert(
-            format!("{namespace}.{relname}"),
+            RelName::new(&namespace, &relname),
             TableRow {
-                target: row.get("target"),
+                target_database: row.try_get("target_database").ok().flatten(),
+                target_table: row.try_get("target_table").ok().flatten(),
                 replicate: row.try_get("replicate").ok().flatten(),
                 initial_load: row.try_get("initial_load").ok().flatten(),
             },
@@ -1534,7 +1535,7 @@ async fn seed_runtime_config(
         let relname: String = row.get("relname");
         let attname: String = row.get("attname");
         overlay.columns.insert(
-            (format!("{namespace}.{relname}"), attname),
+            (RelName::new(&namespace, &relname), attname),
             ColumnRow {
                 target_type: row.get("target_type"),
             },
@@ -1550,7 +1551,7 @@ async fn seed_runtime_config(
     // Snapshot table rows for the boot opt-in dispatch: on restart the resume
     // cursor is past these rows' commit LSN, so WAL replay won't re-deliver
     // them — the seed is the only chance to re-materialise their scope.
-    let table_rows: Vec<(String, TableRow)> = overlay
+    let table_rows: Vec<(RelName, TableRow)> = overlay
         .tables
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -1571,23 +1572,23 @@ async fn seed_runtime_config(
 async fn apply_toml_initial_loads(
     catalog: &Arc<Mutex<ShadowCatalog>>,
     backfiller: Option<&Arc<walshadow::copy_backfill::CopyBackfiller>>,
-    table_initial_loads: &std::collections::HashMap<String, String>,
-    active_tables: &HashSet<String>,
-    sql_scoped_tables: &HashSet<String>,
+    table_initial_loads: &std::collections::HashMap<RelName, String>,
+    active_tables: &HashSet<RelName>,
+    sql_scoped_tables: &HashSet<RelName>,
     raw_start: u64,
 ) -> anyhow::Result<()> {
-    for (qname, mode) in table_initial_loads {
-        if !active_tables.contains(qname) || sql_scoped_tables.contains(qname) {
+    for (rel, mode) in table_initial_loads {
+        if !active_tables.contains(rel) || sql_scoped_tables.contains(rel) {
             continue;
         }
         match InitialLoadMode::parse(mode) {
             Some(InitialLoadMode::None) => {}
             Some(parsed) => {
-                let desc = catalog.lock().await.descriptor_by_qname(qname).await?;
+                let desc = catalog.lock().await.descriptor_by_name(rel).await?;
                 let Some(desc) = desc else {
                     tracing::warn!(
                         target: "walshadow::config",
-                        qname,
+                        qname = %rel,
                         "TOML initial_load ignored: source rel unknown",
                     );
                     continue;
@@ -1596,7 +1597,7 @@ async fn apply_toml_initial_loads(
                     Some(b) => b.note_opt_in(&desc, parsed, raw_start).await,
                     None => tracing::info!(
                         target: "walshadow::config",
-                        qname,
+                        qname = %rel,
                         mode,
                         "TOML initial_load requested but no backfiller wired; streaming from start LSN only",
                     ),
@@ -1604,7 +1605,7 @@ async fn apply_toml_initial_loads(
             }
             None => tracing::warn!(
                 target: "walshadow::config",
-                qname,
+                qname = %rel,
                 mode,
                 "unknown TOML initial_load mode; streaming from start LSN only",
             ),

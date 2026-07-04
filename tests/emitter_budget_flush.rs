@@ -23,12 +23,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping,
+    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping, TableTarget,
 };
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
-use walshadow::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
+use walshadow::shadow_catalog::{RelAttr, RelDescriptor, RelName, ReplIdent};
 
 const CH_TCP_PORT: u16 = 17619;
 const CH_HTTP_PORT: u16 = 17620;
@@ -44,9 +44,7 @@ fn rel_descriptor() -> Arc<RelDescriptor> {
         rfn: RFN,
         oid: 16385,
         namespace_oid: 2200,
-        namespace_name: "public".into(),
-        name: "foo".into(),
-        qualified_name: RelDescriptor::build_qualified_name("public", "foo"),
+        rel_name: RelName::new("public", "foo"),
         kind: 'r',
         persistence: 'p',
         replident: ReplIdent::Default { pk_attnums: None },
@@ -85,7 +83,7 @@ fn rel_descriptor() -> Arc<RelDescriptor> {
 
 fn mapping() -> Arc<TableMapping> {
     Arc::new(TableMapping {
-        target: "walshadow_test.foo".into(),
+        target: TableTarget::new("walshadow_test", "foo"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

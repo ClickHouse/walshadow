@@ -21,9 +21,10 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
-use walshadow::ch_emitter::{ColumnMapping, EmitterConfig, TableMapping};
+use walshadow::ch_emitter::{ColumnMapping, EmitterConfig, TableMapping, TableTarget};
 use walshadow::preflight::{Inputs, PreflightError};
 use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow_catalog::RelName;
 
 // Non-overlapping ports so a leftover from an earlier failed run doesn't
 // shadow the next start.
@@ -86,13 +87,13 @@ async fn connect_sql(socket: &std::path::Path, port: u16) -> Result<tokio_postgr
     Ok(client)
 }
 
-fn mapping_for(rels: &[&str]) -> EmitterConfig {
+fn mapping_for(rels: &[(&str, &str)]) -> EmitterConfig {
     let mut cfg = EmitterConfig::default();
-    for rel in rels {
+    for (ns, rel) in rels {
         cfg.tables.insert(
-            (*rel).to_string(),
+            RelName::new(ns, rel),
             TableMapping {
-                target: format!("ch.{rel}"),
+                target: TableTarget::new("ch", rel),
                 columns: vec![ColumnMapping {
                     src_attnum: 1,
                     target_name: "id".into(),
@@ -142,7 +143,7 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
         .await
         .expect("shadow sql");
 
-    let ch_config = mapping_for(&["s10.t", "s10.t_nothing"]);
+    let ch_config = mapping_for(&[("s10", "t"), ("s10", "t_nothing")]);
     let report = walshadow::preflight::run(Inputs {
         source_version_num: 170_000, // > 16, so version check passes
         source_sql: &src_sql,
@@ -167,7 +168,7 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
     let has_default_no_pk = report.errors.iter().any(|e| {
         matches!(
             e,
-            PreflightError::BadReplicaIdentity { rel, got } if rel == "s10.t" && *got == 'd'
+            PreflightError::BadReplicaIdentity { rel, got } if *rel == RelName::new("s10", "t") && *got == 'd'
         )
     });
     assert!(
@@ -179,7 +180,7 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
     let has_nothing = report.errors.iter().any(|e| {
         matches!(
             e,
-            PreflightError::BadReplicaIdentity { rel, got } if rel == "s10.t_nothing" && *got == 'n'
+            PreflightError::BadReplicaIdentity { rel, got } if *rel == RelName::new("s10", "t_nothing") && *got == 'n'
         )
     });
     assert!(
@@ -216,7 +217,7 @@ async fn preflight_rejects_old_version_missing_slot_and_unknown_rel() {
         .await
         .expect("shadow sql");
 
-    let ch_config = mapping_for(&["s11.ghost"]);
+    let ch_config = mapping_for(&[("s11", "ghost")]);
     let report = walshadow::preflight::run(Inputs {
         source_version_num: 150_000, // < 16: too old, and major 15 ≠ shadow major
         source_sql: &src_sql,
@@ -247,7 +248,9 @@ async fn preflight_rejects_old_version_missing_slot_and_unknown_rel() {
         report.errors
     );
     assert!(
-        has(&|e| matches!(e, PreflightError::MappedRelMissing { rel } if rel == "s11.ghost")),
+        has(
+            &|e| matches!(e, PreflightError::MappedRelMissing { rel } if *rel == RelName::new("s11", "ghost"))
+        ),
         "{:?}",
         report.errors
     );
@@ -293,7 +296,7 @@ async fn preflight_passes_once_source_is_logical_and_relations_keyed() {
         .await
         .expect("shadow sql");
 
-    let ch_config = mapping_for(&["s10.t", "s10.t_idx", "s10.t_full"]);
+    let ch_config = mapping_for(&[("s10", "t"), ("s10", "t_idx"), ("s10", "t_full")]);
     // Make the version-num arg the real source version so the
     // major-mismatch check exercises against the same version both
     // sides are running (source + shadow share initdb's binary).

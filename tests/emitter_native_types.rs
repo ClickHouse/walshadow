@@ -20,13 +20,13 @@ use std::sync::atomic::AtomicU64;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping,
+    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping, TableTarget,
 };
 use walshadow::codecs::NumericKind;
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
-use walshadow::shadow_catalog::{RelDescriptor, ReplIdent};
+use walshadow::shadow_catalog::{RelDescriptor, RelName, ReplIdent};
 
 const CH_TCP_PORT: u16 = 17629;
 const CH_HTTP_PORT: u16 = 17630;
@@ -47,9 +47,7 @@ fn rel_descriptor() -> RelDescriptor {
         rfn: RFN,
         oid: 16385,
         namespace_oid: 2200,
-        namespace_name: "public".into(),
-        name: "things".into(),
-        qualified_name: RelDescriptor::build_qualified_name("public", "things"),
+        rel_name: RelName::new("public", "things"),
         kind: 'r',
         persistence: 'p',
         replident: ReplIdent::Default { pk_attnums: None },
@@ -94,7 +92,7 @@ async fn native_numeric_time_timetz_round_trip() {
     // `cfg.tables`), so the destination shape lives here.
     let rel = Arc::new(rel_descriptor());
     let mapping = Arc::new(TableMapping {
-        target: "walshadow_test.things".into(),
+        target: TableTarget::new("walshadow_test", "things"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

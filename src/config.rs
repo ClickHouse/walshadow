@@ -30,31 +30,30 @@ use tokio::sync::{Mutex, watch};
 
 use clickhouse_c::{Allocator, TypeAst};
 
-use crate::ch_ddl::{
-    DropTableStrategy, derive_columns_for_mapping, fold_diff_into_mapping, sql_ident,
-};
+use crate::ch_ddl::{DropTableStrategy, derive_columns_for_mapping, fold_diff_into_mapping};
 use crate::ch_emitter::{
     CompressionChoice, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, TableMapping,
+    TableTarget,
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
-use crate::shadow_catalog::{RelDescriptor, SchemaDiff};
+use crate::shadow_catalog::{RelDescriptor, RelName, SchemaDiff};
 
 /// Pre-materialised resolved config, snapshotted by subscribers via
 /// `watch::Receiver<Arc<ResolvedConfig>>`. Rebuilt whole on every reload,
 /// so a snapshot is internally consistent — no per-field tearing.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
-    /// Per-relation destination mapping keyed on `"<namespace>.<relname>"`
-    pub tables: HashMap<String, TableMapping>,
+    /// Per-relation destination mapping
+    pub tables: HashMap<RelName, TableMapping>,
     /// Per-namespace defaults keyed on PG schema name
     pub namespaces: HashMap<String, NamespaceMapping>,
     /// Per-column CH-type override from the `config_column` overlay, keyed
-    /// `"<namespace>.<relname>"` → source attname → CH type expression.
+    /// rel → source attname → CH type expression.
     /// Type strings are parse-validated at merge (Regime A: malformed
     /// rejected, prior value kept). Consumed by `TablePlan::build`, which
     /// resolves attname→attnum against the descriptor at hand and swaps the
     /// column's encode type when the override is wire-compatible.
-    pub columns: HashMap<String, HashMap<String, String>>,
+    pub columns: HashMap<RelName, HashMap<String, String>>,
     /// Global DROP TABLE strategy fallback (`retain` / `drop` / `warn`);
     /// per-namespace `NamespaceMapping::drop_table_strategy` overrides it
     pub drop_table_strategy: String,
@@ -109,22 +108,22 @@ pub struct CliOverrides {
 /// rels, the clobber the base [config.md] "Known limitation" describes.
 #[derive(Debug, Clone, Default)]
 struct OptInState {
-    /// Descriptor-derived mappings for tables opted in via `replicate=true`,
-    /// keyed `"<namespace>.<relname>"`. Overlaid onto `resolved.tables`.
-    mappings: HashMap<String, TableMapping>,
+    /// Descriptor-derived mappings for tables opted in via `replicate=true`.
+    /// Overlaid onto `resolved.tables`.
+    mappings: HashMap<RelName, TableMapping>,
     /// Applicator-derived runtime mappings: `auto_create` CREATEs and ALTER
     /// diff folds ([`ConfigResolver::apply_schema_diff`]). Overlaid onto
     /// `resolved.tables` under `mappings`, so opt-in wins. Living here (not
     /// only in the live handle) is what makes them survive the republish
     /// full-swap — closing the auto-create half of the [config.md] "Known
     /// limitation" clobber.
-    derived: HashMap<String, TableMapping>,
+    derived: HashMap<RelName, TableMapping>,
     /// Tables opted out via `replicate=false` / `TableRemoved`; removed from
     /// `resolved.tables` even when TOML-mapped.
-    excluded: HashSet<String>,
+    excluded: HashSet<RelName>,
     /// `replicate=true` rows whose rel isn't known yet (forward-declared),
     /// materialised when the matching `CREATE TABLE` arrives.
-    pending_decl: HashMap<String, TableRow>,
+    pending_decl: HashMap<RelName, TableRow>,
 }
 
 /// The mutable merge inputs, behind one lock so an apply is atomic against a
@@ -256,21 +255,26 @@ impl ConfigResolver {
     /// pending / excluded state, bump the cache epoch, republish. Idempotent —
     /// a re-apply overwrites with an identical mapping. The caller must ensure
     /// the CH table exists first (see `DdlApplicator::ensure_ch_table`).
-    pub async fn materialize_opt_in(&self, desc: &RelDescriptor, target_override: Option<String>) {
+    pub async fn materialize_opt_in(
+        &self,
+        desc: &RelDescriptor,
+        db_override: Option<String>,
+        table_override: Option<String>,
+    ) {
         let mut inner = self.inner.lock().await;
-        let qname = desc.qualified_name.as_ref().to_owned();
-        let target = target_override.unwrap_or_else(|| {
-            let db = Self::target_db_for(&inner, &desc.namespace_name);
-            format!("{}.{}", sql_ident(&db), sql_ident(&desc.name))
-        });
+        let rel = desc.rel_name.clone();
+        let target = TableTarget {
+            database: db_override.unwrap_or_else(|| Self::target_db_for(&inner, &rel.namespace)),
+            table: table_override.unwrap_or_else(|| rel.name.to_string()),
+        };
         let columns = derive_columns_for_mapping(desc);
         inner
             .opt_in
             .mappings
-            .insert(qname.clone(), TableMapping { target, columns });
-        inner.opt_in.derived.remove(&qname);
-        inner.opt_in.excluded.remove(&qname);
-        inner.opt_in.pending_decl.remove(&qname);
+            .insert(rel.clone(), TableMapping { target, columns });
+        inner.opt_in.derived.remove(&rel);
+        inner.opt_in.excluded.remove(&rel);
+        inner.opt_in.pending_decl.remove(&rel);
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         self.opt_in_total.fetch_add(1, Ordering::Relaxed);
@@ -283,12 +287,12 @@ impl ConfigResolver {
     /// out even when TOML-mapped, bump the cache epoch, republish. In-flight
     /// rows already dispatched still drain; further rows drop at
     /// `lookup_mapping`.
-    pub async fn exclude_table(&self, qname: &str) {
+    pub async fn exclude_table(&self, rel: &RelName) {
         let mut inner = self.inner.lock().await;
-        inner.opt_in.mappings.remove(qname);
-        inner.opt_in.derived.remove(qname);
-        inner.opt_in.pending_decl.remove(qname);
-        inner.opt_in.excluded.insert(qname.to_owned());
+        inner.opt_in.mappings.remove(rel);
+        inner.opt_in.derived.remove(rel);
+        inner.opt_in.pending_decl.remove(rel);
+        inner.opt_in.excluded.insert(rel.clone());
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         self.opt_out_total.fetch_add(1, Ordering::Relaxed);
@@ -299,17 +303,17 @@ impl ConfigResolver {
     /// Park a `replicate=true` row whose rel isn't known yet; materialised when
     /// the matching `CREATE TABLE` arrives (see [`Self::take_pending_decl`]).
     /// No routing change, so no republish.
-    pub async fn park_pending_decl(&self, qname: String, row: TableRow) {
+    pub async fn park_pending_decl(&self, rel: RelName, row: TableRow) {
         let mut inner = self.inner.lock().await;
-        inner.opt_in.pending_decl.insert(qname, row);
+        inner.opt_in.pending_decl.insert(rel, row);
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
     }
 
     /// Remove and return a parked forward-declaration, if any.
-    pub async fn take_pending_decl(&self, qname: &str) -> Option<TableRow> {
+    pub async fn take_pending_decl(&self, rel: &RelName) -> Option<TableRow> {
         let mut inner = self.inner.lock().await;
-        let row = inner.opt_in.pending_decl.remove(qname);
+        let row = inner.opt_in.pending_decl.remove(rel);
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         row
@@ -317,16 +321,16 @@ impl ConfigResolver {
 
     /// Whether the operator opted this rel out (`replicate=false`). Read by
     /// `DdlApplicator::apply_added` so an excluded rel skips auto-create.
-    pub async fn is_excluded(&self, qname: &str) -> bool {
-        self.inner.lock().await.opt_in.excluded.contains(qname)
+    pub async fn is_excluded(&self, rel: &RelName) -> bool {
+        self.inner.lock().await.opt_in.excluded.contains(rel)
     }
 
     /// Record an applicator-derived mapping (`auto_create` CREATE TABLE) so
     /// it survives republish, write the fenced routing map, republish. Runs
     /// inside the reorder barrier like the DDL that produced it.
-    pub async fn register_derived_mapping(&self, qname: &str, mapping: TableMapping) {
+    pub async fn register_derived_mapping(&self, rel: &RelName, mapping: TableMapping) {
         let mut inner = self.inner.lock().await;
-        inner.opt_in.derived.insert(qname.to_owned(), mapping);
+        inner.opt_in.derived.insert(rel.clone(), mapping);
         self.republish(&inner).await;
     }
 
@@ -337,15 +341,15 @@ impl ConfigResolver {
     /// re-create. An overlay `replicate=true` row re-parks as a
     /// forward-declaration so a re-create re-materialises the opt-in
     /// against the fresh descriptor.
-    pub async fn forget_derived_mapping(&self, qname: &str) {
+    pub async fn forget_derived_mapping(&self, rel: &RelName) {
         let mut inner = self.inner.lock().await;
-        inner.opt_in.derived.remove(qname);
-        inner.opt_in.mappings.remove(qname);
-        if let Some(row) = inner.overlay.tables.get(qname)
+        inner.opt_in.derived.remove(rel);
+        inner.opt_in.mappings.remove(rel);
+        if let Some(row) = inner.overlay.tables.get(rel)
             && row.replicate == Some(true)
         {
             let row = row.clone();
-            inner.opt_in.pending_decl.insert(qname.to_owned(), row);
+            inner.opt_in.pending_decl.insert(rel.clone(), row);
             self.pending_decl
                 .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         }
@@ -360,18 +364,18 @@ impl ConfigResolver {
     /// `mutate_mapping_for_diff`'s early return.
     pub async fn apply_schema_diff(&self, new: &RelDescriptor, diff: &SchemaDiff) {
         let mut inner = self.inner.lock().await;
-        let qname = new.qualified_name.as_ref();
-        if inner.opt_in.excluded.contains(qname) {
+        let rel = &new.rel_name;
+        if inner.opt_in.excluded.contains(rel) {
             return;
         }
-        if let Some(m) = inner.opt_in.mappings.get_mut(qname) {
+        if let Some(m) = inner.opt_in.mappings.get_mut(rel) {
             fold_diff_into_mapping(m, new, diff);
-        } else if let Some(m) = inner.opt_in.derived.get_mut(qname) {
+        } else if let Some(m) = inner.opt_in.derived.get_mut(rel) {
             fold_diff_into_mapping(m, new, diff);
-        } else if let Some(base) = inner.base.tables.get(qname) {
+        } else if let Some(base) = inner.base.tables.get(rel) {
             let mut m = base.clone();
             fold_diff_into_mapping(&mut m, new, diff);
-            inner.opt_in.derived.insert(qname.to_owned(), m);
+            inner.opt_in.derived.insert(rel.clone(), m);
         } else {
             return;
         }
@@ -429,7 +433,7 @@ impl ConfigResolver {
         overlay: &ConfigOverlay,
         cli: &CliOverrides,
         opt_in: &OptInState,
-        prev_columns: &HashMap<String, HashMap<String, String>>,
+        prev_columns: &HashMap<RelName, HashMap<String, String>>,
     ) -> (ResolvedConfig, u64) {
         let mut rejections = 0u64;
         let mut rc = ResolvedConfig {
@@ -445,14 +449,14 @@ impl ConfigResolver {
         };
 
         // Runtime-derived layers (before the overlay target loop so a
-        // `config_table.target` row finds its mapping here). Both carry the
-        // descriptor-derived projection a bare `target` row lacks; derived
+        // `config_table` target row finds its mapping here). Both carry the
+        // descriptor-derived projection a bare target row lacks; derived
         // first so an explicit opt-in wins over an auto-create.
-        for (qname, mapping) in &opt_in.derived {
-            rc.tables.insert(qname.clone(), mapping.clone());
+        for (rel, mapping) in &opt_in.derived {
+            rc.tables.insert(rel.clone(), mapping.clone());
         }
-        for (qname, mapping) in &opt_in.mappings {
-            rc.tables.insert(qname.clone(), mapping.clone());
+        for (rel, mapping) in &opt_in.mappings {
+            rc.tables.insert(rel.clone(), mapping.clone());
         }
 
         // Layer 2: source-PG overlay.
@@ -533,25 +537,33 @@ impl ConfigResolver {
             }
         }
 
-        for (qname, row) in &overlay.tables {
-            // `target` overrides the destination of a table already mapped by
-            // TOML or opted in above (both carry the column projection). A
-            // `config_table` row that only sets `target` for an unmapped table
-            // can't be routed without a projection — `replicate=true` is the
-            // way to bring such a table into scope. `target` NULL = no reroute.
-            if let Some(target) = &row.target {
-                match rc.tables.get_mut(qname) {
-                    Some(m) => m.target = target.clone(),
+        for (rel, row) in &overlay.tables {
+            // `target_database`/`target_table` override the destination of a
+            // table already mapped by TOML or opted in above (both carry the
+            // column projection). A `config_table` row that only sets a target
+            // for an unmapped table can't be routed without a projection —
+            // `replicate=true` is the way to bring such a table into scope.
+            // NULL = that part unchanged.
+            if row.target_database.is_some() || row.target_table.is_some() {
+                match rc.tables.get_mut(rel) {
+                    Some(m) => {
+                        if let Some(db) = &row.target_database {
+                            m.target.database = db.clone();
+                        }
+                        if let Some(t) = &row.target_table {
+                            m.target.table = t.clone();
+                        }
+                    }
                     None => tracing::warn!(
                         target: "walshadow::config",
-                        qname,
-                        "config_table.target ignored: no mapping (set replicate=true to opt-in)",
+                        qname = %rel,
+                        "config_table target ignored: no mapping (set replicate=true to opt-in)",
                     ),
                 }
             }
         }
 
-        for ((qname, attname), row) in &overlay.columns {
+        for ((rel, attname), row) in &overlay.columns {
             if let Some(ty) = &row.target_type {
                 // Parse-validate here so a malformed type never reaches a
                 // TablePlan build (whose error would poison the batcher).
@@ -559,21 +571,21 @@ impl ConfigResolver {
                 // check (with fallback) runs at plan build instead.
                 if TypeAst::parse(ty, Allocator::stdlib()).is_ok() {
                     rc.columns
-                        .entry(qname.clone())
+                        .entry(rel.clone())
                         .or_default()
                         .insert(attname.clone(), ty.clone());
                 } else {
                     rejections += 1;
                     // Bad update keeps last accepted override (prev snapshot);
                     // overlay mirrors PG rows so retention can't live there
-                    let prior = prev_columns.get(qname).and_then(|m| m.get(attname));
+                    let prior = prev_columns.get(rel).and_then(|m| m.get(attname));
                     if let Some(prior) = prior {
                         rc.columns
-                            .entry(qname.clone())
+                            .entry(rel.clone())
                             .or_default()
                             .insert(attname.clone(), prior.clone());
                     }
-                    tracing::warn!(target: "walshadow::config", qname = %qname, attname = %attname, value = %ty, kept_prior = prior.is_some(), "config_column.target_type rejected: unparseable CH type");
+                    tracing::warn!(target: "walshadow::config", qname = %rel, attname = %attname, value = %ty, kept_prior = prior.is_some(), "config_column.target_type rejected: unparseable CH type");
                 }
             }
         }
@@ -581,8 +593,8 @@ impl ConfigResolver {
         // Opt-out (last, so exclusion wins over any TOML/overlay mapping):
         // a `replicate=false` rel leaves the routing map, so `lookup_mapping`
         // returns None and the decode pool drops its rows mid-stream.
-        for qname in &opt_in.excluded {
-            rc.tables.remove(qname);
+        for rel in &opt_in.excluded {
+            rc.tables.remove(rel);
         }
 
         // Layer 1: CLI (top). Survives SIGHUP + stale overlay rows.
@@ -740,7 +752,7 @@ mod tests {
         // carries the column projection); the columns survive the override.
         let base = EmitterConfig::from_toml_str(
             "[ch]\ndrop_table_strategy = \"retain\"\n\
-             [table.\"public.events\"]\ntarget = \"old.events\"\n\
+             [table.public.events]\ntarget_database = \"old\"\n\
              columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n",
         )
         .unwrap();
@@ -754,9 +766,9 @@ mod tests {
             },
         );
         overlay.tables.insert(
-            "public.events".into(),
+            RelName::new("public", "events"),
             TableRow {
-                target: Some("default.events".into()),
+                target_database: Some("default".into()),
                 ..Default::default()
             },
         );
@@ -770,8 +782,8 @@ mod tests {
         let ns = r.namespaces.get("public").unwrap();
         assert!(ns.auto_create);
         assert_eq!(ns.target_database.as_deref(), Some("default"));
-        let t = r.tables.get("public.events").unwrap();
-        assert_eq!(t.target, "default.events");
+        let t = r.tables.get(&RelName::new("public", "events")).unwrap();
+        assert_eq!(t.target, TableTarget::new("default", "events"));
         assert_eq!(
             t.columns.len(),
             1,
@@ -790,9 +802,7 @@ mod tests {
             },
             oid: 30000,
             namespace_oid: 2200,
-            namespace_name: namespace.into(),
-            name: name.into(),
-            qualified_name: RelDescriptor::build_qualified_name(namespace, name),
+            rel_name: RelName::new(namespace, name),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -819,19 +829,19 @@ mod tests {
         // excluded qname is dropped even when TOML-mapped.
         let base = EmitterConfig::from_toml_str(
             "[ch]\n\
-             [table.\"public.keep\"]\ntarget = \"old.keep\"\n\
+             [table.public.keep]\ntarget_database = \"old\"\n\
              columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n",
         )
         .unwrap();
         let mut opt_in = OptInState::default();
         opt_in.mappings.insert(
-            "public.events".into(),
+            RelName::new("public", "events"),
             TableMapping {
-                target: "default.events".into(),
+                target: TableTarget::new("default", "events"),
                 columns: Vec::new(),
             },
         );
-        opt_in.excluded.insert("public.keep".into());
+        opt_in.excluded.insert(RelName::new("public", "keep"));
         let (r, _) = ConfigResolver::resolve(
             &base,
             &ConfigOverlay::default(),
@@ -839,9 +849,12 @@ mod tests {
             &opt_in,
             &HashMap::new(),
         );
-        assert!(r.tables.contains_key("public.events"), "opt-in included");
         assert!(
-            !r.tables.contains_key("public.keep"),
+            r.tables.contains_key(&RelName::new("public", "events")),
+            "opt-in included"
+        );
+        assert!(
+            !r.tables.contains_key(&RelName::new("public", "keep")),
             "excluded rel dropped even when TOML-mapped"
         );
     }
@@ -858,18 +871,16 @@ mod tests {
             epoch.clone(),
         );
         resolver
-            .materialize_opt_in(&rel_desc("public", "events"), None)
+            .materialize_opt_in(&rel_desc("public", "events"), None, None)
             .await;
         assert!(rx.changed().await.is_ok());
         let snap = rx.borrow_and_update();
-        let t = snap.tables.get("public.events").expect("mapping present");
-        assert!(
-            t.target.contains("events"),
-            "target derived from descriptor"
-        );
+        let rel = RelName::new("public", "events");
+        let t = snap.tables.get(&rel).expect("mapping present");
+        assert_eq!(t.target.table, "events", "target derived from descriptor");
         assert!(!t.columns.is_empty(), "columns derived from descriptor");
         // Fenced routing map written + cache epoch bumped for the decode pool.
-        assert!(mapping.read().await.contains_key("public.events"));
+        assert!(mapping.read().await.contains_key(&rel));
         assert!(epoch.load(Ordering::Relaxed) >= 1);
         assert_eq!(resolver.opt_in_total(), 1);
     }
@@ -877,21 +888,22 @@ mod tests {
     #[tokio::test]
     async fn exclude_table_removes_mapping() {
         let base = EmitterConfig::from_toml_str(
-            "[ch]\n[table.\"public.events\"]\ntarget = \"default.events\"\n\
+            "[ch]\n[table.public.events]\n\
              columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n",
         )
         .unwrap();
         let (mapping, epoch) = dummy_handles();
         let (resolver, mut rx) =
             ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
-        assert!(rx.borrow().tables.contains_key("public.events"));
-        resolver.exclude_table("public.events").await;
+        let rel = RelName::new("public", "events");
+        assert!(rx.borrow().tables.contains_key(&rel));
+        resolver.exclude_table(&rel).await;
         assert!(rx.changed().await.is_ok());
         assert!(
-            !rx.borrow_and_update().tables.contains_key("public.events"),
+            !rx.borrow_and_update().tables.contains_key(&rel),
             "opt-out drops the mapping"
         );
-        assert!(!mapping.read().await.contains_key("public.events"));
+        assert!(!mapping.read().await.contains_key(&rel));
         assert_eq!(resolver.opt_out_total(), 1);
     }
 
@@ -901,31 +913,32 @@ mod tests {
         let (mapping, epoch) = dummy_handles();
         let (resolver, mut rx) =
             ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        let rel = RelName::new("public", "auto");
         resolver
             .register_derived_mapping(
-                "public.auto",
+                &rel,
                 TableMapping {
-                    target: "default.auto".into(),
+                    target: TableTarget::new("default", "auto"),
                     columns: Vec::new(),
                 },
             )
             .await;
         assert!(rx.changed().await.is_ok());
-        assert!(rx.borrow_and_update().tables.contains_key("public.auto"));
-        assert!(mapping.read().await.contains_key("public.auto"));
+        assert!(rx.borrow_and_update().tables.contains_key(&rel));
+        assert!(mapping.read().await.contains_key(&rel));
         // An unrelated overlay apply full-swaps the handle; the derived
         // mapping must survive (the [config.md] "Known limitation" clobber)
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;
         assert!(rx.changed().await.is_ok());
-        assert!(rx.borrow_and_update().tables.contains_key("public.auto"));
-        assert!(mapping.read().await.contains_key("public.auto"));
+        assert!(rx.borrow_and_update().tables.contains_key(&rel));
+        assert!(mapping.read().await.contains_key(&rel));
         // Source DROP TABLE under strategy=Drop forgets it everywhere
-        resolver.forget_derived_mapping("public.auto").await;
-        assert!(!mapping.read().await.contains_key("public.auto"));
+        resolver.forget_derived_mapping(&rel).await;
+        assert!(!mapping.read().await.contains_key(&rel));
         assert!(rx.changed().await.is_ok());
-        assert!(!rx.borrow_and_update().tables.contains_key("public.auto"));
+        assert!(!rx.borrow_and_update().tables.contains_key(&rel));
     }
 
     #[tokio::test]
@@ -934,9 +947,10 @@ mod tests {
         let (mapping, epoch) = dummy_handles();
         let (resolver, _rx) =
             ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        let rel = RelName::new("public", "events");
         resolver
             .apply_config_event(ConfigEvent::TableUpserted {
-                qname: "public.events".into(),
+                rel: rel.clone(),
                 row: TableRow {
                     replicate: Some(true),
                     ..Default::default()
@@ -944,18 +958,15 @@ mod tests {
             })
             .await;
         resolver
-            .materialize_opt_in(&rel_desc("public", "events"), None)
+            .materialize_opt_in(&rel_desc("public", "events"), None, None)
             .await;
-        assert!(mapping.read().await.contains_key("public.events"));
+        assert!(mapping.read().await.contains_key(&rel));
         // Source DROP under strategy=Drop: mapping forgotten, opt-in row
         // re-parked so the next CREATE re-materialises it
-        resolver.forget_derived_mapping("public.events").await;
-        assert!(!mapping.read().await.contains_key("public.events"));
+        resolver.forget_derived_mapping(&rel).await;
+        assert!(!mapping.read().await.contains_key(&rel));
         assert_eq!(resolver.pending_decl_count(), 1);
-        let row = resolver
-            .take_pending_decl("public.events")
-            .await
-            .expect("re-parked");
+        let row = resolver.take_pending_decl(&rel).await.expect("re-parked");
         assert_eq!(row.replicate, Some(true));
     }
 
@@ -965,7 +976,7 @@ mod tests {
         // TOML-owned mapping: the fold lands copy-on-write in the derived
         // layer, so neither a config apply nor a SIGHUP re-merge reverts it
         let base = EmitterConfig::from_toml_str(
-            "[ch]\n[table.\"public.events\"]\ntarget = \"default.events\"\n\
+            "[ch]\n[table.public.events]\n\
              columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n",
         )
         .unwrap();
@@ -994,8 +1005,8 @@ mod tests {
             type_changes: vec![],
         };
         resolver.apply_schema_diff(&desc, &diff).await;
-        let has_note = |m: &HashMap<String, TableMapping>| {
-            m.get("public.events")
+        let has_note = |m: &HashMap<RelName, TableMapping>| {
+            m.get(&RelName::new("public", "events"))
                 .is_some_and(|t| t.columns.iter().any(|c| c.src_attnum == 2))
         };
         assert!(has_note(&*mapping.read().await), "fold reaches the handle");
@@ -1014,13 +1025,13 @@ mod tests {
         let base = base_with("retain");
         let mut overlay = ConfigOverlay::default();
         overlay.columns.insert(
-            ("public.t".into(), "amount".into()),
+            (RelName::new("public", "t"), "amount".into()),
             ColumnRow {
                 target_type: Some("Int128".into()),
             },
         );
         overlay.columns.insert(
-            ("public.t".into(), "bad".into()),
+            (RelName::new("public", "t"), "bad".into()),
             ColumnRow {
                 target_type: Some("NotAType(".into()),
             },
@@ -1033,7 +1044,10 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(rej, 1, "unparseable type rejected");
-        let t = r.columns.get("public.t").expect("table entry");
+        let t = r
+            .columns
+            .get(&RelName::new("public", "t"))
+            .expect("table entry");
         assert_eq!(t.get("amount").map(String::as_str), Some("Int128"));
         assert!(!t.contains_key("bad"));
     }
@@ -1042,7 +1056,7 @@ mod tests {
     fn column_override_invalid_update_keeps_last_accepted() {
         use crate::runtime_config::ColumnRow;
         let base = base_with("retain");
-        let key = ("public.t".to_owned(), "amount".to_owned());
+        let key = (RelName::new("public", "t"), "amount".to_owned());
         let mut overlay = ConfigOverlay::default();
         overlay.columns.insert(
             key.clone(),
@@ -1076,7 +1090,7 @@ mod tests {
         assert_eq!(rej, 1);
         let amount = |r: &ResolvedConfig| {
             r.columns
-                .get("public.t")
+                .get(&RelName::new("public", "t"))
                 .and_then(|t| t.get("amount"))
                 .cloned()
         };
@@ -1101,7 +1115,7 @@ mod tests {
         let (resolver, mut rx) =
             ConfigResolver::new(&base, CliOverrides::default(), None, mapping, epoch);
         let upsert = |ty: &str| ConfigEvent::ColumnUpserted {
-            qname: "public.t".into(),
+            rel: RelName::new("public", "t"),
             attname: "amount".into(),
             row: ColumnRow {
                 target_type: Some(ty.into()),
@@ -1110,13 +1124,13 @@ mod tests {
         resolver.apply_config_event(upsert("Decimal(38, 2)")).await;
         assert!(rx.changed().await.is_ok());
         assert_eq!(
-            rx.borrow_and_update().columns["public.t"]["amount"],
+            rx.borrow_and_update().columns[&RelName::new("public", "t")]["amount"],
             "Decimal(38, 2)"
         );
         resolver.apply_config_event(upsert("NotAType(")).await;
         assert!(rx.changed().await.is_ok());
         assert_eq!(
-            rx.borrow_and_update().columns["public.t"]["amount"],
+            rx.borrow_and_update().columns[&RelName::new("public", "t")]["amount"],
             "Decimal(38, 2)",
             "malformed update keeps last accepted override"
         );
@@ -1124,12 +1138,16 @@ mod tests {
         // Explicit DELETE clears; retention applies to bad updates only
         resolver
             .apply_config_event(ConfigEvent::ColumnRemoved {
-                qname: "public.t".into(),
+                rel: RelName::new("public", "t"),
                 attname: "amount".into(),
             })
             .await;
         assert!(rx.changed().await.is_ok());
-        assert!(!rx.borrow_and_update().columns.contains_key("public.t"));
+        assert!(
+            !rx.borrow_and_update()
+                .columns
+                .contains_key(&RelName::new("public", "t"))
+        );
         assert_eq!(resolver.rejections(), 0, "gauge clears with the bad row");
     }
 
@@ -1139,13 +1157,14 @@ mod tests {
         let (mapping, epoch) = dummy_handles();
         let (resolver, _rx) =
             ConfigResolver::new(&base, CliOverrides::default(), None, mapping, epoch);
+        let rel = RelName::new("app", "later");
         resolver
-            .park_pending_decl("app.later".into(), TableRow::default())
+            .park_pending_decl(rel.clone(), TableRow::default())
             .await;
         assert_eq!(resolver.pending_decl_count(), 1);
-        assert!(resolver.take_pending_decl("app.later").await.is_some());
+        assert!(resolver.take_pending_decl(&rel).await.is_some());
         assert_eq!(resolver.pending_decl_count(), 0);
-        assert!(resolver.take_pending_decl("app.later").await.is_none());
+        assert!(resolver.take_pending_decl(&rel).await.is_none());
     }
 
     #[tokio::test]

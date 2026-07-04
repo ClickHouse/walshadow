@@ -38,7 +38,7 @@ use crate::backup_page_walk::{
 use crate::backup_sink::{CatalogFilenodes, DiskLanderSink, DiskLanderStats, MultiplexSink};
 use crate::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::decoder_sink::TupleObserver;
-use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent, parse_array_one_element};
+use crate::shadow_catalog::{RelAttr, RelDescriptor, RelName, ReplIdent, parse_array_one_element};
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
@@ -279,14 +279,11 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         };
         let replident = fetch_replident(client, replident_char, oid).await?;
         let attributes = fetch_attributes(client, oid).await?;
-        let qualified_name = RelDescriptor::build_qualified_name(&namespace_name, &name);
         let desc = RelDescriptor {
             rfn,
             oid,
             namespace_oid,
-            namespace_name,
-            name,
-            qualified_name,
+            rel_name: RelName::new(&namespace_name, &name),
             kind,
             persistence,
             replident,

@@ -30,11 +30,11 @@ use tokio::sync::watch;
 
 use crate::ch_emitter::{
     ColumnMapping, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, RetryConfig,
-    TableMapping, connect_client, drain_to_end_of_stream, is_retryable, quote_ident,
+    TableMapping, TableTarget, connect_client, drain_to_end_of_stream, is_retryable, quote_ident,
     reconnect_if_idle,
 };
 use crate::config::{ConfigResolver, ResolvedConfig};
-use crate::shadow_catalog::{RelDescriptor, SchemaDiff, SchemaEvent};
+use crate::shadow_catalog::{RelDescriptor, RelName, SchemaDiff, SchemaEvent};
 use crate::type_bridge::{self, ResolvedColumn};
 
 /// Per-relation DROP TABLE behaviour, matches `--drop-table-strategy`.
@@ -239,10 +239,7 @@ impl DdlApplicator {
         match event {
             SchemaEvent::Added { desc } => self.apply_added(desc).await,
             SchemaEvent::Changed { old, new, diff } => self.apply_changed(old, new, diff).await,
-            SchemaEvent::Dropped {
-                oid: _,
-                qualified_name,
-            } => self.apply_dropped(qualified_name).await,
+            SchemaEvent::Dropped { oid: _, rel_name } => self.apply_dropped(rel_name).await,
         }
     }
 
@@ -252,8 +249,8 @@ impl DdlApplicator {
         // source DDL, so a CREATE after our DROP re-creates the dest from
         // the mapping (its columns are the emitter's INSERT contract);
         // IF NOT EXISTS no-ops when the dest still stands
-        if let Some(m) = self.mapping_for(desc.qualified_name.as_ref()).await {
-            if self.config.drop_strategy_for(&desc.namespace_name) == DropTableStrategy::Drop {
+        if let Some(m) = self.mapping_for(&desc.rel_name).await {
+            if self.config.drop_strategy_for(&desc.rel_name.namespace) == DropTableStrategy::Drop {
                 let sql = render_create_table_from_mapping(desc, &m, self.config.soft_delete);
                 self.execute(&sql).await?;
                 self.stats.creates_applied += 1;
@@ -264,14 +261,14 @@ impl DdlApplicator {
         }
         // Operator opt-out (`replicate=false`) beats namespace auto_create:
         // no CH mirror, no mapping
-        if self.is_excluded(desc.qualified_name.as_ref()).await {
+        if self.is_excluded(&desc.rel_name).await {
             self.stats.skipped += 1;
             return Ok(());
         }
         if !self
             .config
             .auto_create_namespaces
-            .contains(&desc.namespace_name)
+            .contains(&*desc.rel_name.namespace)
         {
             self.stats.skipped += 1;
             return Ok(());
@@ -280,7 +277,7 @@ impl DdlApplicator {
         // rows and DDL land in the same database
         let target_db = self
             .config
-            .target_database_for(&desc.namespace_name)
+            .target_database_for(&desc.rel_name.namespace)
             .to_owned();
         let Some(sql) = render_create_table(desc, &target_db, self.config.soft_delete)? else {
             self.stats.skipped += 1;
@@ -290,11 +287,10 @@ impl DdlApplicator {
         self.stats.creates_applied += 1;
         // Auto-derive a TableMapping so the emitter ships rows against
         // the new CH table without TOML edits
-        let target = format!("{}.{}", sql_ident(&target_db), sql_ident(&desc.name));
+        let target = TableTarget::new(&target_db, &desc.rel_name.name);
         let columns = derive_columns_for_mapping(desc);
         let mapping = TableMapping { target, columns };
-        self.register_mapping(desc.qualified_name.as_ref(), mapping)
-            .await;
+        self.register_mapping(&desc.rel_name, mapping).await;
         Ok(())
     }
 
@@ -309,12 +305,12 @@ impl DdlApplicator {
         self.refresh_config();
         let target_db = self
             .config
-            .target_database_for(&desc.namespace_name)
+            .target_database_for(&desc.rel_name.namespace)
             .to_owned();
         let Some(sql) = render_create_table(desc, &target_db, self.config.soft_delete)? else {
             tracing::warn!(
                 target: "walshadow::ch_ddl",
-                qname = %desc.qualified_name,
+                qname = %desc.rel_name,
                 "opt-in skipped: no bridgeable CH shape",
             );
             self.stats.skipped += 1;
@@ -331,13 +327,14 @@ impl DdlApplicator {
         new: &RelDescriptor,
         diff: &SchemaDiff,
     ) -> Result<(), EmitterError> {
-        let key = new.qualified_name.as_ref().to_owned();
+        let key = new.rel_name.clone();
         let Some(target) = self.mapping_target(&key).await else {
             // No target, can't ALTER; `Added` handles the
             // not-yet-learned case
             self.stats.skipped += 1;
             return Ok(());
         };
+        let target = target.sql();
         // RENAME before ADD/DROP so position-matched renames don't trip
         // a later diff into a drop+add pair
         for (_attnum, old_name, new_name) in &diff.renamed_columns {
@@ -408,7 +405,7 @@ impl DdlApplicator {
             self.stats.type_changes_rejected += diff.type_changes.len() as u64;
             tracing::warn!(
                 target: "walshadow::ch_ddl",
-                relation = %new.qualified_name,
+                relation = %new.rel_name,
                 type_changes = diff.type_changes.len(),
                 "unsupported schema change: type widening / domain change \
                  (manual operator migration required)"
@@ -422,20 +419,17 @@ impl DdlApplicator {
         Ok(())
     }
 
-    async fn apply_dropped(&mut self, qualified_name: &str) -> Result<(), EmitterError> {
-        let Some(target) = self.mapping_target(qualified_name).await else {
+    async fn apply_dropped(&mut self, rel: &RelName) -> Result<(), EmitterError> {
+        let Some(target) = self.mapping_target(rel).await else {
             self.stats.skipped += 1;
             return Ok(());
         };
-        // Namespace is prefix of `namespace.name` (see
-        // `RelDescriptor::build_qualified_name`)
-        let namespace = qualified_name.split('.').next().unwrap_or_default();
-        match self.config.drop_strategy_for(namespace) {
+        match self.config.drop_strategy_for(&rel.namespace) {
             DropTableStrategy::Retain => {
                 self.stats.skipped += 1;
                 tracing::info!(
                     target: "walshadow::ch_ddl",
-                    source = qualified_name,
+                    source = %rel,
                     dest = %target,
                     "source DROP TABLE; CH dest retained per strategy=retain",
                 );
@@ -445,14 +439,14 @@ impl DdlApplicator {
                 self.stats.skipped += 1;
                 tracing::warn!(
                     target: "walshadow::ch_ddl",
-                    source = qualified_name,
+                    source = %rel,
                     dest = %target,
                     "source DROP TABLE; CH dest retained per strategy=warn",
                 );
                 Ok(())
             }
             DropTableStrategy::Drop => {
-                let sql = format!("DROP TABLE IF EXISTS {target}");
+                let sql = format!("DROP TABLE IF EXISTS {}", target.sql());
                 self.execute(&sql).await?;
                 self.stats.drops_applied += 1;
                 // Forget the runtime-derived entry so a future Added
@@ -460,7 +454,7 @@ impl DdlApplicator {
                 // owns it; republish would resurrect it anyway) — a source
                 // re-create restores its dest via apply_added's
                 // strategy=drop path
-                self.forget_mapping(qualified_name).await;
+                self.forget_mapping(rel).await;
                 Ok(())
             }
         }
@@ -470,28 +464,29 @@ impl DdlApplicator {
     /// coordinator calls this inside a barrier (after earlier data is
     /// durable) so the truncate orders correctly against inserts despite
     /// the otherwise out-of-order pipeline.
-    pub async fn truncate(&mut self, qualified_name: &str) -> Result<(), EmitterError> {
-        let Some(target) = self.mapping_target(qualified_name).await else {
+    pub async fn truncate(&mut self, rel: &RelName) -> Result<(), EmitterError> {
+        let Some(target) = self.mapping_target(rel).await else {
             return Ok(());
         };
-        self.execute(&format!("TRUNCATE TABLE {target}")).await
+        self.execute(&format!("TRUNCATE TABLE {}", target.sql()))
+            .await
     }
 
-    async fn mapping_target(&mut self, qualified_name: &str) -> Option<String> {
+    async fn mapping_target(&mut self, rel: &RelName) -> Option<TableTarget> {
         let m = self.mapping.read().await;
-        m.get(qualified_name).map(|t| t.target.clone())
+        m.get(rel).map(|t| t.target.clone())
     }
 
-    async fn mapping_for(&mut self, qualified_name: &str) -> Option<TableMapping> {
-        self.mapping.read().await.get(qualified_name).cloned()
+    async fn mapping_for(&mut self, rel: &RelName) -> Option<TableMapping> {
+        self.mapping.read().await.get(rel).cloned()
     }
 
     /// Operator opt-out (`replicate=false`); nothing excluded without a
     /// resolver. `&mut self` like siblings: `&self` across await would
     /// demand `DdlApplicator: Sync`, blocked by chc client's raw pointer
-    async fn is_excluded(&mut self, qualified_name: &str) -> bool {
+    async fn is_excluded(&mut self, rel: &RelName) -> bool {
         if let Some(r) = &self.resolver {
-            r.is_excluded(qualified_name).await
+            r.is_excluded(rel).await
         } else {
             false
         }
@@ -501,14 +496,11 @@ impl DdlApplicator {
     /// survive the republish full-swap (republish writes the live handle +
     /// bumps the epoch); resolver-less path mutates the live handle and
     /// bumps directly
-    async fn register_mapping(&mut self, qualified_name: &str, mapping: TableMapping) {
+    async fn register_mapping(&mut self, rel: &RelName, mapping: TableMapping) {
         if let Some(r) = &self.resolver {
-            r.register_derived_mapping(qualified_name, mapping).await;
+            r.register_derived_mapping(rel, mapping).await;
         } else {
-            self.mapping
-                .write()
-                .await
-                .insert(qualified_name.to_owned(), mapping);
+            self.mapping.write().await.insert(rel.clone(), mapping);
             bump_mapping_epoch(self.invalidation_epoch.as_ref());
         }
     }
@@ -522,11 +514,11 @@ impl DdlApplicator {
         }
     }
 
-    async fn forget_mapping(&mut self, qualified_name: &str) {
+    async fn forget_mapping(&mut self, rel: &RelName) {
         if let Some(r) = &self.resolver {
-            r.forget_derived_mapping(qualified_name).await;
+            r.forget_derived_mapping(rel).await;
         } else {
-            self.mapping.write().await.remove(qualified_name);
+            self.mapping.write().await.remove(rel);
             bump_mapping_epoch(self.invalidation_epoch.as_ref());
         }
     }
@@ -598,10 +590,9 @@ async fn mutate_mapping_for_diff(
     new: &RelDescriptor,
     diff: &SchemaDiff,
 ) {
-    let key = new.qualified_name.as_ref().to_owned();
     {
         let mut m = mapping.write().await;
-        let Some(target_mapping) = m.get_mut(&key) else {
+        let Some(target_mapping) = m.get_mut(&new.rel_name) else {
             return;
         };
         fold_diff_into_mapping(target_mapping, new, diff);
@@ -715,11 +706,7 @@ pub fn render_create_table(
     target_database: &str,
     soft_delete: bool,
 ) -> Result<Option<String>, EmitterError> {
-    let target = format!(
-        "{}.{}",
-        quote_ident(target_database),
-        quote_ident(&desc.name)
-    );
+    let target = TableTarget::new(target_database, &desc.rel_name.name).sql();
     let pk_attnums = replident_key_attnums(desc);
     let mut col_defs: Vec<String> = Vec::with_capacity(desc.attributes.len() + 4);
     for att in &desc.attributes {
@@ -782,13 +769,7 @@ pub fn render_create_table_from_mapping(
                 .map(|c| quote_ident(&c.target_name))
         })
         .collect();
-    render_create_sql(&mapping.target, col_defs, key_names, soft_delete)
-}
-
-/// CH identifier; alias of `quote_ident` for callers building qualified
-/// (database, table) names.
-pub fn sql_ident(name: &str) -> String {
-    quote_ident(name)
+    render_create_sql(&mapping.target.sql(), col_defs, key_names, soft_delete)
 }
 
 /// Default `Vec<ColumnMapping>` for an auto-discovered table; operator
@@ -906,9 +887,7 @@ mod tests {
             },
             oid: 16400,
             namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name: name.into(),
-            qualified_name: RelDescriptor::build_qualified_name("public", name),
+            rel_name: RelName::new("public", name),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: pk },
@@ -1066,7 +1045,7 @@ mod tests {
             Some(vec![1]),
         );
         let m = TableMapping {
-            target: "warehouse.orders_pinned".into(),
+            target: TableTarget::new("warehouse", "orders_pinned"),
             columns: vec![
                 ColumnMapping {
                     src_attnum: 1,
@@ -1082,7 +1061,7 @@ mod tests {
         };
         let sql = render_create_table_from_mapping(&d, &m, false);
         assert!(
-            sql.contains("CREATE TABLE IF NOT EXISTS warehouse.orders_pinned"),
+            sql.contains("CREATE TABLE IF NOT EXISTS `warehouse`.`orders_pinned`"),
             "{sql}"
         );
         assert!(sql.contains("`order_id` Int64"), "{sql}");
@@ -1096,7 +1075,7 @@ mod tests {
     fn render_create_table_from_mapping_nullable_key_falls_back_to_lsn() {
         let d = desc("t", vec![att(1, "id", INT4OID, false, None)], Some(vec![1]));
         let m = TableMapping {
-            target: "db.t".into(),
+            target: TableTarget::new("db", "t"),
             columns: vec![ColumnMapping {
                 src_attnum: 1,
                 target_name: "id".into(),
@@ -1150,10 +1129,10 @@ mod tests {
 
     #[test]
     fn mapping_target_returns_pinned_table() {
-        let map: std::collections::HashMap<String, TableMapping> = [(
-            "public.orders".into(),
+        let map: std::collections::HashMap<RelName, TableMapping> = [(
+            RelName::new("public", "orders"),
             TableMapping {
-                target: "default.orders".into(),
+                target: TableTarget::new("default", "orders"),
                 columns: vec![ColumnMapping {
                     src_attnum: 1,
                     target_name: "id".into(),
@@ -1169,17 +1148,18 @@ mod tests {
             .unwrap();
         let target = rt.block_on(async {
             let m = handle.read().await;
-            m.get("public.orders").map(|t| t.target.clone())
+            m.get(&RelName::new("public", "orders"))
+                .map(|t| t.target.clone())
         });
-        assert_eq!(target.as_deref(), Some("default.orders"));
+        assert_eq!(target, Some(TableTarget::new("default", "orders")));
     }
 
     #[test]
     fn mapping_mutation_bumps_invalidation_epoch() {
-        let map: std::collections::HashMap<String, TableMapping> = [(
-            "public.orders".into(),
+        let map: std::collections::HashMap<RelName, TableMapping> = [(
+            RelName::new("public", "orders"),
             TableMapping {
-                target: "default.orders".into(),
+                target: TableTarget::new("default", "orders"),
                 columns: vec![ColumnMapping {
                     src_attnum: 1,
                     target_name: "id".into(),
@@ -1213,7 +1193,7 @@ mod tests {
             // RelCaches drop pre-diff mapping snapshots
             mutate_mapping_for_diff(&handle, Some(&epoch), &new, &diff).await;
             let m = handle.read().await;
-            let cols = &m.get("public.orders").unwrap().columns;
+            let cols = &m.get(&RelName::new("public", "orders")).unwrap().columns;
             assert!(
                 cols.iter()
                     .any(|c| c.src_attnum == 2 && c.target_name == "c")
