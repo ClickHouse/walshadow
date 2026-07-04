@@ -10,8 +10,7 @@
 #     SKIP_BUILD=1 /opt/bench/run_bench_suite.sh myrun
 set -euo pipefail
 cd "$(dirname "$0")"
-source ../aws-env.sh
-source ./state.env   # PUBLIC_IP, KEY_NAME, ...
+source ./state.env   # PUBLIC_IP, PEM, ...
 source ../lib.sh
 
 IMAGE="${IMAGE:-walshadow-bench:local}"

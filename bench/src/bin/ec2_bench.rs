@@ -1,7 +1,7 @@
 //! Replication-latency benchmarks against the EC2 walshadow deployment
 //! (the three-node stack under `bench/ec2/`: source Postgres → walshadow →
 //! ClickHouse). Same engine + CLI as `local_bench` (`../bench.rs`); the
-//! only difference is that endpoints are resolved from the provisioners'
+//! only difference is that endpoints are resolved from the terraform-written
 //! `state.env` files instead of defaulting to localhost.
 //!
 //! `--network` picks which IP to read:
@@ -44,9 +44,9 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Network::Public)]
     network: Network,
 
-    /// Directory holding the per-node provisioner folders (each with a
-    /// `state.env`). Defaults to `infra` relative to the current dir.
-    #[arg(long, default_value = "infra")]
+    /// Directory holding the per-node folders (each with a `state.env`).
+    /// Default assumes the current dir is the repo root.
+    #[arg(long, default_value = "bench/ec2")]
     state_dir: PathBuf,
 }
 

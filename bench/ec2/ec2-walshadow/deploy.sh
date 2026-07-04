@@ -3,8 +3,8 @@
 # ch-config.toml pointed at the ClickHouse private IP, and (re)starts the
 # container streaming from the source PG private IP into ClickHouse.
 #
-# Prereqs: ./provision.sh has run (state.env exists), the source-pg and
-# clickhouse nodes are up, and `walshadow:local` exists locally
+# Prereqs: stack.sh has applied terraform (state.env exists, source-pg and
+# clickhouse nodes up) and `walshadow:local` exists locally
 #   (docker build -f docker/Dockerfile -t walshadow:local <repo-root>).
 #
 # Endpoint IPs are read from the sibling state.env files; override with
@@ -16,8 +16,7 @@
 # emit-per-commit (lowest latency, most parts).
 set -euo pipefail
 cd "$(dirname "$0")"
-source ../aws-env.sh
-source ./state.env   # PUBLIC_IP, KEY_NAME, ...
+source ./state.env   # PUBLIC_IP, PEM, ...
 source ../lib.sh
 
 IMAGE="${IMAGE:-walshadow:local}"

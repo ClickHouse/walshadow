@@ -6,18 +6,16 @@
 #             excluding the Docker daemon / kernel / OS) → /opt/profile/perf-<ts>.data
 #   * eBPF (bcc) → the flow-worker (the CDC engine; bcc profiles one process)
 #             → /opt/profile/oncpu-flowworker-<ts>.folded
-# teardown.sh copies /opt/profile back to this machine.
+# stack.sh down copies /opt/profile back to this machine.
 #
 # Usage: ./profile.sh [seconds]
 # Note: tools are installed by cloud-init; in-container Go binaries may
 # symbolize only partially from the host.
 set -euo pipefail
 cd "$(dirname "$0")"
-source ../aws-env.sh
-source ./state.env   # PUBLIC_IP, KEY_NAME
+source ./state.env   # PUBLIC_IP, PEM
 
 DUR="${1:-120}"
-PEM="./${KEY_NAME}.pem"
 SSH=(ssh -i "$PEM" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "ubuntu@$PUBLIC_IP")
 
 echo "starting on-CPU profile of PeerDB on $PUBLIC_IP for ${DUR}s (background)…"
@@ -47,4 +45,4 @@ sudo nohup bash -c "
 " >/dev/null 2>&1 &
 echo "capturing ${DUR}s → $OUT/perf-$TS.data + oncpu-flowworker-$TS.folded (background)"
 PROF
-echo "started — now kick off the benchmark. Run ./teardown.sh later to copy the profiles back."
+echo "started — now kick off the benchmark. ../stack.sh down copies the profiles back."
