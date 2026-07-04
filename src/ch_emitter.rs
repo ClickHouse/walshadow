@@ -34,7 +34,7 @@ use thiserror::Error;
 
 use crate::decoder_sink::DecoderSinkError;
 use crate::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
-use crate::shadow_catalog::{CatalogError, RelDescriptor};
+use crate::shadow_catalog::{CatalogError, RelDescriptor, RelName};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
 /// epoch. CH `DateTime64(6)` is Unix microseconds; PG commit-record
@@ -95,8 +95,8 @@ impl From<EmitterError> for DecoderSinkError {
 }
 
 /// Per-replica connection + mapping config. TOML `[ch]` table holds
-/// connection params, `[table."<src>"]` blocks declare per-relation
-/// mapping; parse via [`EmitterConfig::from_toml_str`].
+/// connection params, `[table.<namespace>.<relname>]` blocks declare
+/// per-relation mapping; parse via [`EmitterConfig::from_toml_str`].
 #[derive(Debug, Clone)]
 pub struct EmitterConfig {
     pub host: String,
@@ -125,11 +125,10 @@ pub struct EmitterConfig {
     /// row is at most `flush_timeout` from durable. Throughput: small
     /// commits coalesce into one MergeTree part per flush window.
     pub flush_timeout: Duration,
-    /// Keyed on `"<namespace>.<relname>"`
-    pub tables: HashMap<String, TableMapping>,
+    pub tables: HashMap<RelName, TableMapping>,
     /// Per-table initial-load mode from TOML `[table.*]` blocks. Applies at
     /// boot for pinned mappings; SQL opt-ins carry their own mode.
-    pub table_initial_loads: HashMap<String, String>,
+    pub table_initial_loads: HashMap<RelName, String>,
     /// Per-namespace defaults keyed on PG schema name; per-table
     /// entries in `tables` win for the relation they name
     pub namespaces: HashMap<String, NamespaceMapping>,
@@ -284,8 +283,41 @@ impl CompressionChoice {
 /// column.
 #[derive(Debug, Clone)]
 pub struct TableMapping {
-    pub target: String,
+    pub target: TableTarget,
     pub columns: Vec<ColumnMapping>,
+}
+
+/// CH destination as unquoted parts. Joined only at SQL construction via
+/// [`TableTarget::sql`]; a stored pre-quoted "db.tbl" string collides for
+/// names containing dots and forces lossy parse-back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableTarget {
+    pub database: String,
+    pub table: String,
+}
+
+impl TableTarget {
+    pub fn new(database: &str, table: &str) -> Self {
+        Self {
+            database: database.into(),
+            table: table.into(),
+        }
+    }
+
+    /// Quoted `` `db`.`table` `` for interpolation into CH SQL.
+    pub fn sql(&self) -> String {
+        format!(
+            "{}.{}",
+            quote_ident(&self.database),
+            quote_ident(&self.table)
+        )
+    }
+}
+
+impl std::fmt::Display for TableTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.database, self.table)
+    }
 }
 
 /// Per-namespace defaults. Operator-pinned blocks shaped like:
@@ -330,10 +362,11 @@ impl EmitterConfig {
     /// password = ""
     /// compression = "lz4"   # one of none / lz4 / zstd
     ///
-    /// [table."public.foo"]
+    /// [table.public.foo]     # [table.<namespace>.<relname>], quote weird names
     /// replicate = true
     /// initial_load = "none"  # one of none / copy / base_backup / object_store
-    /// target = "default.foo"
+    /// target_database = "default"  # optional: namespace override, else [ch] database
+    /// target_table = "foo"         # optional: source relname
     /// columns = [
     ///   { attnum = 1, target = "id",   type = "UInt64" },
     ///   { attnum = 2, target = "name", type = "Nullable(String)" },
@@ -443,63 +476,94 @@ impl EmitterConfig {
             }
         }
         if let Some(tbls) = root.get("table").and_then(Value::as_table) {
-            for (k, v) in tbls {
-                let t = v
-                    .as_table()
-                    .ok_or_else(|| EmitterError::Config(format!("table.{k}: expected a table")))?;
-                let replicate = t.get("replicate").and_then(Value::as_bool).unwrap_or(true);
-                if !replicate {
-                    continue;
-                }
-                let target = t
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| EmitterError::Config(format!("table.{k}: missing target")))?
-                    .to_string();
-                let cols_v = t.get("columns").and_then(Value::as_array).ok_or_else(|| {
-                    EmitterError::Config(format!("table.{k}: missing columns array"))
+            // Two key levels: [table.<namespace>.<relname>]. Names with
+            // weird characters (dots included) quote per TOML key rules
+            for (ns, rels) in tbls {
+                let rels = rels.as_table().ok_or_else(|| {
+                    EmitterError::Config(format!(
+                        "table.{ns}: expected [table.<namespace>.<relname>] blocks"
+                    ))
                 })?;
-                let mut columns = Vec::with_capacity(cols_v.len());
-                for (i, c) in cols_v.iter().enumerate() {
-                    let ct = c.as_table().ok_or_else(|| {
-                        EmitterError::Config(format!("table.{k}.columns[{i}]: expected a table"))
+                for (name, v) in rels {
+                    let t = v.as_table().ok_or_else(|| {
+                        EmitterError::Config(format!("table.{ns}.{name}: expected a table"))
                     })?;
-                    let src_attnum =
-                        ct.get("attnum")
-                            .and_then(Value::as_integer)
+                    let replicate = t.get("replicate").and_then(Value::as_bool).unwrap_or(true);
+                    if !replicate {
+                        continue;
+                    }
+                    let database = t
+                        .get("target_database")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            out.namespaces
+                                .get(ns.as_str())
+                                .and_then(|n| n.target_database.as_deref())
+                        })
+                        .unwrap_or(&out.database)
+                        .to_string();
+                    let table = t
+                        .get("target_table")
+                        .and_then(Value::as_str)
+                        .unwrap_or(name)
+                        .to_string();
+                    let cols_v = t.get("columns").and_then(Value::as_array).ok_or_else(|| {
+                        EmitterError::Config(format!("table.{ns}.{name}: missing columns array"))
+                    })?;
+                    let mut columns = Vec::with_capacity(cols_v.len());
+                    for (i, c) in cols_v.iter().enumerate() {
+                        let ct = c.as_table().ok_or_else(|| {
+                            EmitterError::Config(format!(
+                                "table.{ns}.{name}.columns[{i}]: expected a table"
+                            ))
+                        })?;
+                        let src_attnum =
+                            ct.get("attnum")
+                                .and_then(Value::as_integer)
+                                .ok_or_else(|| {
+                                    EmitterError::Config(format!(
+                                        "table.{ns}.{name}.columns[{i}]: missing attnum"
+                                    ))
+                                })?;
+                        let target_name = ct
+                            .get("target")
+                            .and_then(Value::as_str)
                             .ok_or_else(|| {
                                 EmitterError::Config(format!(
-                                    "table.{k}.columns[{i}]: missing attnum"
+                                    "table.{ns}.{name}.columns[{i}]: missing target"
                                 ))
-                            })?;
-                    let target_name = ct
-                        .get("target")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            EmitterError::Config(format!("table.{k}.columns[{i}]: missing target"))
-                        })?
-                        .to_string();
-                    let target_type = ct
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            EmitterError::Config(format!("table.{k}.columns[{i}]: missing type"))
-                        })?
-                        .to_string();
-                    columns.push(ColumnMapping {
-                        src_attnum: i16::try_from(src_attnum).map_err(|_| {
-                            EmitterError::Config(format!(
-                                "table.{k}.columns[{i}].attnum {src_attnum} out of i16 range"
-                            ))
-                        })?,
-                        target_name,
-                        target_type,
-                    });
-                }
-                out.tables
-                    .insert(k.clone(), TableMapping { target, columns });
-                if let Some(mode) = t.get("initial_load").and_then(Value::as_str) {
-                    out.table_initial_loads.insert(k.clone(), mode.to_string());
+                            })?
+                            .to_string();
+                        let target_type = ct
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                EmitterError::Config(format!(
+                                    "table.{ns}.{name}.columns[{i}]: missing type"
+                                ))
+                            })?
+                            .to_string();
+                        columns.push(ColumnMapping {
+                            src_attnum: i16::try_from(src_attnum).map_err(|_| {
+                                EmitterError::Config(format!(
+                                    "table.{ns}.{name}.columns[{i}].attnum {src_attnum} out of i16 range"
+                                ))
+                            })?,
+                            target_name,
+                            target_type,
+                        });
+                    }
+                    let rel = RelName::new(ns, name);
+                    out.tables.insert(
+                        rel.clone(),
+                        TableMapping {
+                            target: TableTarget { database, table },
+                            columns,
+                        },
+                    );
+                    if let Some(mode) = t.get("initial_load").and_then(Value::as_str) {
+                        out.table_initial_loads.insert(rel, mode.to_string());
+                    }
                 }
             }
         }
@@ -509,7 +573,7 @@ impl EmitterConfig {
 
 /// Cached plan for one destination table, built lazily on first row.
 pub struct TablePlan {
-    pub target: String,
+    pub target: TableTarget,
     pub columns: Vec<ColumnPlan>,
     pub synth_lsn: ColumnPlan,
     pub synth_xid: ColumnPlan,
@@ -611,7 +675,7 @@ impl TablePlan {
                         } else {
                             tracing::warn!(
                                 target: "walshadow::emitter",
-                                qname = %rel.qualified_name,
+                                qname = %rel.rel_name,
                                 column = %c.target_name,
                                 default = %c.target_type,
                                 value = %ty,
@@ -621,7 +685,7 @@ impl TablePlan {
                     }
                     Err(e) => tracing::warn!(
                         target: "walshadow::emitter",
-                        qname = %rel.qualified_name,
+                        qname = %rel.rel_name,
                         column = %c.target_name,
                         value = %ty,
                         error = %e,
@@ -651,7 +715,7 @@ impl TablePlan {
         col_sql.push(quote_ident(&synth_is_deleted.name));
         let insert_sql = format!(
             "INSERT INTO {} ({}) FORMAT Native",
-            mapping.target,
+            mapping.target.sql(),
             col_sql.join(", "),
         );
         Ok(Self {
@@ -1414,7 +1478,7 @@ fn encode_value(
 /// decode-pool `RelCache`s key mapping-snapshot freshness on it, and the
 /// decoder worker's record-time bump lands before barrier apply mutates
 /// this map.
-pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>;
+pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<RelName, TableMapping>>>;
 
 crate::atomic_stats! {
     /// CH emitter counters. `fetch_add(_, Relaxed)`; status loop reads
@@ -1548,7 +1612,7 @@ mod tests {
 
     fn mk_mapping() -> TableMapping {
         TableMapping {
-            target: "default.foo".into(),
+            target: TableTarget::new("default", "foo"),
             columns: vec![
                 ColumnMapping {
                     src_attnum: 1,
@@ -1575,9 +1639,7 @@ mod tests {
             },
             oid: 16385,
             namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name: "foo".into(),
-            qualified_name: RelDescriptor::build_qualified_name("public", "foo"),
+            rel_name: RelName::new("public", "foo"),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -1901,7 +1963,7 @@ mod tests {
         let rel = mk_rel();
         let m = mk_mapping();
         let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
-        assert!(plan.insert_sql.contains("INSERT INTO default.foo"));
+        assert!(plan.insert_sql.contains("INSERT INTO `default`.`foo`"));
         assert!(plan.insert_sql.contains("`id`"));
         assert!(plan.insert_sql.contains("`name`"));
         assert!(plan.insert_sql.contains("`_lsn`"));
@@ -2136,9 +2198,8 @@ mod tests {
             row_budget = 1024
             byte_budget = 4096
 
-            [table."public.foo"]
+            [table.public.foo]
             initial_load = "copy"
-            target = "default.foo"
             columns = [
               { attnum = 1, target = "id",   type = "UInt64" },
               { attnum = 2, target = "name", type = "Nullable(String)" },
@@ -2158,13 +2219,15 @@ mod tests {
         );
         assert_eq!(c.row_budget, 1024);
         assert_eq!(c.byte_budget, 4096);
-        let t = c.tables.get("public.foo").expect("mapping present");
-        assert_eq!(t.target, "default.foo");
+        let rel = RelName::new("public", "foo");
+        let t = c.tables.get(&rel).expect("mapping present");
+        // target_database/target_table omitted: [ch] database + source relname
+        assert_eq!(t.target, TableTarget::new("default", "foo"));
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.columns[0].src_attnum, 1);
         assert_eq!(t.columns[1].target_type, "Nullable(String)");
         assert_eq!(
-            c.table_initial_loads.get("public.foo").map(String::as_str),
+            c.table_initial_loads.get(&rel).map(String::as_str),
             Some("copy")
         );
         // soft_delete defaults off when the key is absent
@@ -2175,13 +2238,14 @@ mod tests {
     fn config_table_replicate_false_skips_mapping() {
         let c = EmitterConfig::from_toml_str(
             "[ch]\n\
-             [table.\"public.skip\"]\n\
+             [table.public.skip]\n\
              replicate = false\n\
              initial_load = \"copy\"\n",
         )
         .unwrap();
-        assert!(!c.tables.contains_key("public.skip"));
-        assert!(!c.table_initial_loads.contains_key("public.skip"));
+        let rel = RelName::new("public", "skip");
+        assert!(!c.tables.contains_key(&rel));
+        assert!(!c.table_initial_loads.contains_key(&rel));
     }
 
     #[test]
@@ -2189,5 +2253,26 @@ mod tests {
         assert!(!EmitterConfig::default().soft_delete);
         let c = EmitterConfig::from_toml_str("[ch]\nsoft_delete = true\n").unwrap();
         assert!(c.soft_delete);
+    }
+
+    /// Dotted names stay inside their TOML key level: schema `a.b` table `c`
+    /// and schema `a` table `b.c` are distinct rels, distinct targets.
+    #[test]
+    fn config_table_dotted_names_do_not_collide() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             database = \"default\"\n\
+             [table.\"a.b\".c]\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n\
+             [table.a.\"b.c\"]\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n",
+        )
+        .unwrap();
+        let dotted_ns = c.tables.get(&RelName::new("a.b", "c")).expect("a.b / c");
+        let dotted_rel = c.tables.get(&RelName::new("a", "b.c")).expect("a / b.c");
+        assert_eq!(dotted_ns.target, TableTarget::new("default", "c"));
+        assert_eq!(dotted_rel.target, TableTarget::new("default", "b.c"));
+        // Interpolation quotes the dot inside the identifier
+        assert_eq!(dotted_rel.target.sql(), "`default`.`b.c`");
     }
 }

@@ -49,7 +49,9 @@ use walrus::pg::wal;
 use walrus::retry::RetryPolicy;
 use walrus::storage::DynStorage;
 use walrus::storage::fs::FsStorage;
+use walshadow::ch_emitter::TableTarget;
 use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow_catalog::RelName;
 
 // Reserved port slot — 17320-range. Below the Linux ephemeral port
 // range (32768-60999) so outbound TCP connects can't grab a port the
@@ -210,8 +212,8 @@ async fn object_store_bootstrap_ch_end_to_end() {
         "127.0.0.1",
         CH_TCP_PORT,
         "default",
-        "s14.t",
-        "default.t",
+        &RelName::new("s14", "t"),
+        &TableTarget::new("default", "t"),
     )
     .expect("write ch-config");
 

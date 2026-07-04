@@ -117,8 +117,7 @@ fn write_pgbench_ch_config(
          database = \"{ch_database}\"\n\
          compression = \"lz4\"\n\
          \n\
-         [table.\"public.pgbench_accounts\"]\n\
-         target = \"{ch_database}.pgbench_accounts\"\n\
+         [table.public.pgbench_accounts]\n\
          columns = [\n  \
            {{ attnum = 1, target = \"aid\",      type = \"Int32\"  }},\n  \
            {{ attnum = 2, target = \"bid\",      type = \"Int32\"  }},\n  \
@@ -127,16 +126,14 @@ fn write_pgbench_ch_config(
            {{ attnum = 5, target = \"c\",        type = \"Nullable(Int32)\" }},\n\
          ]\n\
          \n\
-         [table.\"public.pgbench_branches\"]\n\
-         target = \"{ch_database}.pgbench_branches\"\n\
+         [table.public.pgbench_branches]\n\
          columns = [\n  \
            {{ attnum = 1, target = \"bid\",      type = \"Int32\"  }},\n  \
            {{ attnum = 2, target = \"bbalance\", type = \"Int32\"  }},\n  \
            {{ attnum = 3, target = \"filler\",   type = \"Nullable(String)\" }},\n\
          ]\n\
          \n\
-         [table.\"public.pgbench_tellers\"]\n\
-         target = \"{ch_database}.pgbench_tellers\"\n\
+         [table.public.pgbench_tellers]\n\
          columns = [\n  \
            {{ attnum = 1, target = \"tid\",      type = \"Int32\"  }},\n  \
            {{ attnum = 2, target = \"bid\",      type = \"Int32\"  }},\n  \
@@ -144,8 +141,7 @@ fn write_pgbench_ch_config(
            {{ attnum = 4, target = \"filler\",   type = \"Nullable(String)\" }},\n\
          ]\n\
          \n\
-         [table.\"public.pgbench_history\"]\n\
-         target = \"{ch_database}.pgbench_history\"\n\
+         [table.public.pgbench_history]\n\
          columns = [\n  \
            {{ attnum = 1, target = \"tid\",    type = \"Int32\"  }},\n  \
            {{ attnum = 2, target = \"bid\",    type = \"Int32\"  }},\n  \

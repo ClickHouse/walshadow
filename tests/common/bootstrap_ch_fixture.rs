@@ -24,7 +24,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use walshadow::ch_emitter::TableTarget;
 use walshadow::shadow::Shadow;
+use walshadow::shadow_catalog::RelName;
 
 /// ClickHouse server subprocess wrapper shared by the pipeline DDL
 /// drill, both bootstrap-to-CH drills, and the
@@ -185,8 +187,8 @@ pub fn write_ch_config_toml(
     ch_host: &str,
     ch_port: u16,
     ch_database: &str,
-    source_table: &str,
-    target_table: &str,
+    source_table: &RelName,
+    target_table: &TableTarget,
 ) -> Result<()> {
     let body = format!(
         "[ch]\n\
@@ -195,12 +197,17 @@ pub fn write_ch_config_toml(
          database = \"{ch_database}\"\n\
          compression = \"lz4\"\n\
          \n\
-         [table.\"{source_table}\"]\n\
-         target = \"{target_table}\"\n\
+         [table.\"{src_ns}\".\"{src_name}\"]\n\
+         target_database = \"{tgt_db}\"\n\
+         target_table = \"{tgt_table}\"\n\
          columns = [\n  \
            {{ attnum = 1, target = \"id\",   type = \"Int32\"  }},\n  \
            {{ attnum = 2, target = \"name\", type = \"String\" }},\n\
          ]\n",
+        src_ns = source_table.namespace,
+        src_name = source_table.name,
+        tgt_db = target_table.database,
+        tgt_table = target_table.table,
     );
     fs::write(path, body).with_context(|| format!("write ch-config {}", path.display()))?;
     Ok(())

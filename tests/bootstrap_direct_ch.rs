@@ -39,7 +39,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use walshadow::ch_emitter::TableTarget;
 use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow_catalog::RelName;
 
 // Reserved port slot — 17300-range. Kept below the Linux ephemeral
 // port range (32768-60999) so an outbound TCP connect from the daemon
@@ -108,8 +110,8 @@ async fn direct_bootstrap_ch_end_to_end() {
         "127.0.0.1",
         CH_TCP_PORT,
         "default",
-        "s14.t",
-        "default.t",
+        &RelName::new("s14", "t"),
+        &TableTarget::new("default", "t"),
     )
     .expect("write ch-config");
 

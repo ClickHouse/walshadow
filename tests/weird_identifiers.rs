@@ -9,7 +9,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
 use walshadow::shadow::Shadow;
+use walshadow::shadow_catalog::RelName;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
 const SLOT: PortSlot = PortSlot {
@@ -36,8 +38,11 @@ const SCHEMA_SQL: &str = "CREATE SCHEMA w;\n\
 
 fn mappings() -> Vec<fx::TableMappingSpec> {
     let idval = |t: &str| fx::TableMappingSpec {
-        source_table: format!("w.{t}"),
-        target_table: format!("walshadow_test.w_{}", t.replace(['-', '%'], "_")),
+        source_table: RelName::new("w", t),
+        target_table: TableTarget::new(
+            "walshadow_test",
+            &format!("w_{}", t.replace(['-', '%'], "_")),
+        ),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,
@@ -56,8 +61,8 @@ fn mappings() -> Vec<fx::TableMappingSpec> {
         idval("MixedCase"),
         idval("weird-%name"),
         fx::TableMappingSpec {
-            source_table: "w.cols".into(),
-            target_table: "walshadow_test.w_cols".into(),
+            source_table: RelName::new("w", "cols"),
+            target_table: TableTarget::new("walshadow_test", "w_cols"),
             columns: vec![
                 ColumnMapping {
                     src_attnum: 1,

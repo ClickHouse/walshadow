@@ -30,6 +30,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
+use walshadow::shadow_catalog::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_schema_evolution_orders_after_data() {
@@ -84,8 +86,8 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
     .expect("create dest");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "s19.orders".into(),
-        target_table: "walshadow_test.s19_orders".into(),
+        source_table: RelName::new("s19", "orders"),
+        target_table: TableTarget::new("walshadow_test", "s19_orders"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,
@@ -251,8 +253,8 @@ async fn parallel_pipeline_truncate_orders_after_data() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "s19t.t".into(),
-        target_table: "walshadow_test.s19t_t".into(),
+        source_table: RelName::new("s19t", "t"),
+        target_table: TableTarget::new("walshadow_test", "s19t_t"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

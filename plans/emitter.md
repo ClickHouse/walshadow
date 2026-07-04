@@ -259,20 +259,26 @@ without walshadow having to track which rows already landed
 
 ## Mapping config
 
-`EmitterConfig::tables` parses from TOML `[table."<src>"]` blocks:
+`EmitterConfig::tables` parses from TOML `[table.<namespace>.<relname>]`
+blocks (two key levels; names with weird characters quote per TOML key
+rules). Destination parts stay separate — `TableTarget { database, table }`
+joins only at SQL construction (`TableTarget::sql`); `target_database`
+defaults to the namespace override else `[ch] database`, `target_table` to
+the source relname:
 
 ```toml
-[table."public.foo"]
+[table.public.foo]
 replicate = true
 initial_load = "none"
-target = "default.foo"
+target_database = "default"
+target_table = "foo"
 columns = [
   { attnum = 1, target = "id",   type = "UInt64" },
   { attnum = 2, target = "name", type = "Nullable(String)" },
 ]
 ```
 
-`MappingHandle = Arc<tokio::sync::RwLock<HashMap<String, TableMapping>>>`
+`MappingHandle = Arc<tokio::sync::RwLock<HashMap<RelName, TableMapping>>>`
 is the live handle the decode pool consults per row. Handle is
 cloneable; daemon's SIGHUP task swaps whole inner `HashMap`. Routing
 picks up the swap immediately; the batcher's cached `TableEncoder`
@@ -342,7 +348,7 @@ table:
 | `Added { desc }` | `CREATE TABLE IF NOT EXISTS` (in the namespace's `target_database`, else global default) when namespace `auto_create = true` and no pre-pinned mapping. Auto-derives `TableMapping` against that same database post-success so subsequent rows ship against the new table. A mapped rel under strategy = drop instead re-creates its dest from the mapping (`render_create_table_from_mapping`) — dest lifecycle follows source DDL, so create → drop → create round-trips; `IF NOT EXISTS` no-ops when the dest still stands |
 | `Changed { diff }` | `ALTER TABLE … RENAME COLUMN` first (so position-match diffs don't trip into drop+add), then `ALTER TABLE … ADD COLUMN IF NOT EXISTS` per added attnum, then `ALTER TABLE … DROP COLUMN IF EXISTS` per dropped attnum |
 | `Changed.type_changes` | rejected, logged, `stats.type_changes_rejected += n`. Operator handles via manual CH migration |
-| `Dropped { qualified_name }` | gated on the namespace's `DropTableStrategy` (`drop_strategy_for`, else global): `Retain` (default) skips silently, `Warn` skips at WARN, `Drop` runs `DROP TABLE IF EXISTS` |
+| `Dropped { rel_name }` | gated on the namespace's `DropTableStrategy` (`drop_strategy_for`, else global): `Retain` (default) skips silently, `Warn` skips at WARN, `Drop` runs `DROP TABLE IF EXISTS` |
 
 `render_create_table` builds CREATE off descriptor: attributes through
 `type_bridge::map`, PK columns first in `ORDER BY` (else `_lsn`
@@ -375,7 +381,7 @@ before its first `ALTER` records the post-ALTER shape as `Added`, which
 `apply_added` skips for pinned dests (operator-managed CH) → CH stays a
 column behind.
 
-`ShadowCatalog::seed_baseline(qualified_names)` warms `prev_known` for
+`ShadowCatalog::seed_baseline(rel_names)` warms `prev_known` for
 every pinned relation before `subscribe()` so the cache never decides the
 branch: `bin/stream.rs` calls it after preflight / before
 `START_REPLICATION` over `cfg.tables.keys()` (the inproc harness mirrors

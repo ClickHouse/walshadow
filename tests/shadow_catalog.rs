@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow_catalog::RelName;
 use walshadow::shadow_catalog::{
     CatalogError, ReplIdent, SchemaEvent, ShadowCatalog, ShadowCatalogConfig, socket_conninfo,
     with_transient_retry,
@@ -128,8 +129,8 @@ async fn catalog_relation_lookup_by_filenode() {
         rel_node: pg_class_filenode,
     };
     let desc = cat.relation_at(rfn, 0).await.expect("relation_at pg_class");
-    assert_eq!(desc.name, "pg_class");
-    assert_eq!(desc.namespace_name, "pg_catalog");
+    assert_eq!(&*desc.rel_name.name, "pg_class");
+    assert_eq!(&*desc.rel_name.namespace, "pg_catalog");
     assert_eq!(desc.kind, 'r');
     assert_eq!(desc.persistence, 'p');
     assert!(
@@ -193,8 +194,8 @@ async fn user_relation_lookup_and_invalidation() {
 
     let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
     let desc = cat.relation_at(rfn, 0).await.expect("relation_at things");
-    assert_eq!(desc.name, "things");
-    assert_eq!(desc.namespace_name, "wc");
+    assert_eq!(&*desc.rel_name.name, "things");
+    assert_eq!(&*desc.rel_name.namespace, "wc");
     assert_eq!(desc.kind, 'r');
     // id, name, payload — three user columns (pg ≥ 12 dropped system cols
     // from attnum >= 1 visibility).
@@ -233,7 +234,7 @@ async fn user_relation_lookup_and_invalidation() {
         .relation_at(rfn, 0)
         .await
         .expect("relation_at after invalidate");
-    assert_eq!(again.name, "things");
+    assert_eq!(&*again.rel_name.name, "things");
     assert_eq!(
         cat.stats().fetches,
         fetches_before + 1,
@@ -245,7 +246,7 @@ async fn user_relation_lookup_and_invalidation() {
         .relation_by_oid(desc.oid)
         .await
         .expect("relation_by_oid");
-    assert_eq!(by_oid.name, "things");
+    assert_eq!(&*by_oid.rel_name.name, "things");
     assert_eq!(by_oid.rfn.rel_node, filenode);
 }
 
@@ -310,7 +311,7 @@ async fn catalog_reconnects_after_pg_restart() {
         .relation_at(rfn_class, 0)
         .await
         .expect("relation_at pre-restart");
-    assert_eq!(first.name, "pg_class");
+    assert_eq!(&*first.rel_name.name, "pg_class");
     let gen_before = cat.generation();
     let reconnects_before = cat.stats().reconnects;
     let bumps_before = cat.stats().generation_bumps;
@@ -326,7 +327,7 @@ async fn catalog_reconnects_after_pg_restart() {
         .relation_at(rfn_namespace, 0)
         .await
         .expect("relation_at post-restart");
-    assert_eq!(after.name, "pg_namespace");
+    assert_eq!(&*after.rel_name.name, "pg_namespace");
     assert!(
         cat.generation() > gen_before,
         "reconnect must bump generation (was {gen_before}, now {})",
@@ -526,7 +527,7 @@ async fn seed_baseline_makes_first_alter_emit_changed_not_added() {
     // Warm prev_known for `wc.seeded` only. Pre-subscribe, so no event
     // leaks; `wc.cold` stays cold.
     let seeded = cat
-        .seed_baseline(&["wc.seeded".to_string()])
+        .seed_baseline(&[RelName::new("wc", "seeded")])
         .await
         .expect("seed_baseline");
     assert_eq!(seeded, 1, "exactly one mapped relation seeded");
@@ -786,8 +787,8 @@ async fn arc_mutex_catalog_serialises_relation_at_across_tasks() {
             .relation_at(rfn_class, 0)
             .await
             .expect("relation_at pg_class second-call from task A");
-        assert_eq!(desc.name, "pg_class");
-        assert_eq!(again.name, "pg_class");
+        assert_eq!(&*desc.rel_name.name, "pg_class");
+        assert_eq!(&*again.rel_name.name, "pg_class");
         desc.oid
     });
     let task_b = tokio::spawn(async move {
@@ -798,7 +799,7 @@ async fn arc_mutex_catalog_serialises_relation_at_across_tasks() {
             .relation_at(rfn_things, 0)
             .await
             .expect("relation_at wc.things from task B");
-        assert_eq!(desc.name, "things");
+        assert_eq!(&*desc.rel_name.name, "things");
         desc.oid
     });
     let started = Instant::now();

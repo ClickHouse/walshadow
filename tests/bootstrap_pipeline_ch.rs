@@ -27,11 +27,12 @@ use walrus::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
 use walshadow::ch_emitter::{
     ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, MappingHandle, TableMapping,
+    TableTarget,
 };
 use walshadow::heap_decoder::ColumnValue;
 use walshadow::pipeline::batcher::BatcherMsg;
 use walshadow::pipeline::{Fatal, bootstrap, tail};
-use walshadow::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
+use walshadow::shadow_catalog::{RelAttr, RelDescriptor, RelName, ReplIdent};
 use walshadow::toast::ToastResolver;
 
 const CH_TCP_PORT: u16 = 17571;
@@ -50,9 +51,7 @@ fn rel(rel_node: u32, name: &str) -> Arc<RelDescriptor> {
         },
         oid: rel_node,
         namespace_oid: 2200,
-        namespace_name: "public".into(),
-        name: name.into(),
-        qualified_name: RelDescriptor::build_qualified_name("public", name),
+        rel_name: RelName::new("public", name),
         kind: 'r',
         persistence: 'p',
         replident: ReplIdent::Default { pk_attnums: None },
@@ -74,9 +73,9 @@ fn rel(rel_node: u32, name: &str) -> Arc<RelDescriptor> {
     .into()
 }
 
-fn id_mapping(target: &str) -> TableMapping {
+fn id_mapping(target_table: &str) -> TableMapping {
     TableMapping {
-        target: target.into(),
+        target: TableTarget::new("walshadow_test", target_table),
         columns: vec![ColumnMapping {
             src_attnum: 1,
             target_name: "id".into(),
@@ -135,9 +134,9 @@ async fn bootstrap_tail_fans_out_n2() {
         ..Default::default()
     };
     cfg.tables
-        .insert("public.foo".into(), id_mapping("walshadow_test.foo"));
+        .insert(RelName::new("public", "foo"), id_mapping("foo"));
     cfg.tables
-        .insert("public.baz".into(), id_mapping("walshadow_test.baz"));
+        .insert(RelName::new("public", "baz"), id_mapping("baz"));
 
     let mut catalog = CatalogMap::new();
     catalog.insert(rel(16400, "foo"));

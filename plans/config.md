@@ -68,9 +68,10 @@ daemon — preserving walshadow's read-only-source posture. Four tables:
   `drop_table_strategy`
 - `config_namespace` — key `namespace`: `target_database`, `auto_create`,
   `drop_table_strategy`
-- `config_table` — key `(namespace, relname)`: `target` (`"<db>.<table>"`),
+- `config_table` — key `(namespace, relname)`: `target_database`,
+  `target_table` (each NULL = derived: namespace default / source relname),
   `replicate`, `initial_load` (`none`, `copy`, `base_backup`, `object_store`).
-  Text key, not relfilenode, rfn is unknown at row-insert time for
+  Name key, not relfilenode, rfn is unknown at row-insert time for
   forward-declared tables
 - `config_column` — key `(namespace, relname, attname)`: `target_type`
 
@@ -85,8 +86,8 @@ No `config_decoder` task, no relfilenode filter. Config-table writes ride the
 normal heap-decode path and are intercepted in
 [`BufferingDecoderSink::on_record`](../src/xact_buffer.rs) after decode, before
 routing to CH: a write is a config write when its resolved descriptor has
-`namespace_name == <schema>` and `ConfigTableKind::from_relname(name)` matches
-one of the four tables. Detection by resolved qualified name is **rotation-proof
+`rel_name.namespace == <schema>` and `ConfigTableKind::from_relname(name)` matches
+one of the four tables. Detection by resolved relation name is **rotation-proof
 for free** — TRUNCATE / VACUUM FULL / rewrite rotates the relfilenode but the
 decode path re-resolves every descriptor, so the name still matches, with no
 frozen filter to refetch. Config writes never reach CH (the implicit namespace
@@ -183,10 +184,11 @@ compatibility needs the descriptor, so that check falls back at plan build —
 (`ConfigResolver::rejections`) and log at WARN. Validation runs at merge, not
 at decode.
 
-`config_table.target` overrides the destination only of a table already mapped by
-TOML (which carries the column projection); a row for an unmapped table would
-need column auto-derivation, so it is skipped with a WARN rather than emitting a
-column-less INSERT.
+`config_table.target_database` / `target_table` override the destination only
+of a table already mapped by TOML (which carries the column projection); a row
+for an unmapped table would need column auto-derivation, so it is skipped with
+a WARN rather than emitting a column-less INSERT. NULL leaves that part of the
+destination unchanged.
 
 ## Column overrides
 

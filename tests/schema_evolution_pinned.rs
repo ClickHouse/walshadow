@@ -32,6 +32,8 @@ mod fx;
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
+use walshadow::shadow_catalog::RelName;
 
 // +0 / +10 shift per test. CH interserver_http_port = http_port + 1, so
 // leave a 5-port gap between CH_HTTP_PORT and WALSENDER_PORT.
@@ -123,8 +125,8 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
     .expect("create dest");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "demo.users".into(),
-        target_table: "walshadow_test.demo_users".into(),
+        source_table: RelName::new("demo", "users"),
+        target_table: TableTarget::new("walshadow_test", "demo_users"),
         columns: base_columns(),
     }];
 
@@ -249,8 +251,8 @@ async fn pinned_subset_alter_adds_only_new_column() {
     .expect("create dest");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "demo.users".into(),
-        target_table: "walshadow_test.demo_users".into(),
+        source_table: RelName::new("demo", "users"),
+        target_table: TableTarget::new("walshadow_test", "demo_users"),
         // id/name/email only — internal_notes (attnum 4) left unmapped.
         columns: base_columns(),
     }];

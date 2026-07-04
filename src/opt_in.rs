@@ -30,7 +30,7 @@ use crate::ch_emitter::EmitterError;
 use crate::config::ConfigResolver;
 use crate::copy_backfill::CopyBackfiller;
 use crate::runtime_config::{InitialLoadMode, TableRow};
-use crate::shadow_catalog::{RelDescriptor, ShadowCatalog};
+use crate::shadow_catalog::{RelDescriptor, RelName, ShadowCatalog};
 
 /// Dispatch one `config_table` row's inclusion intent. `opt_in_lsn` is the
 /// backfill boundary `S`: the row's commit LSN on the live path, the WAL
@@ -49,13 +49,13 @@ pub async fn apply_table_opt_in(
     applicator: &mut DdlApplicator,
     catalog: &Arc<Mutex<ShadowCatalog>>,
     backfiller: Option<&Arc<CopyBackfiller>>,
-    qname: &str,
+    rel: &RelName,
     row: &TableRow,
     opt_in_lsn: u64,
 ) -> Result<(), EmitterError> {
     match row.replicate {
         Some(true) => {
-            let desc = catalog.lock().await.descriptor_by_qname(qname).await?;
+            let desc = catalog.lock().await.descriptor_by_name(rel).await?;
             match desc {
                 Some(desc) => {
                     opt_in_known(resolver, applicator, backfiller, &desc, row, opt_in_lsn).await?
@@ -63,19 +63,17 @@ pub async fn apply_table_opt_in(
                 None => {
                     tracing::warn!(
                         target: "walshadow::config",
-                        qname,
+                        qname = %rel,
                         "config_table.replicate=true for unknown rel; parked as forward-declaration",
                     );
-                    resolver
-                        .park_pending_decl(qname.to_owned(), row.clone())
-                        .await;
+                    resolver.park_pending_decl(rel.clone(), row.clone()).await;
                 }
             }
         }
         Some(false) => {
-            resolver.exclude_table(qname).await;
+            resolver.exclude_table(rel).await;
             if let Some(b) = backfiller {
-                b.note_opt_out(qname).await;
+                b.note_opt_out(rel).await;
             }
         }
         None => {}
@@ -95,14 +93,11 @@ pub async fn materialize_pending_on_added(
     applicator: &mut DdlApplicator,
     desc: &Arc<RelDescriptor>,
 ) -> Result<(), EmitterError> {
-    if let Some(row) = resolver
-        .take_pending_decl(desc.qualified_name.as_ref())
-        .await
-    {
+    if let Some(row) = resolver.take_pending_decl(&desc.rel_name).await {
         if row.initial_load.is_some() {
             tracing::info!(
                 target: "walshadow::config",
-                qname = %desc.qualified_name,
+                qname = %desc.rel_name,
                 "forward-declared opt-in: initial_load unnecessary (rel born after the declaration)",
             );
         }
@@ -124,7 +119,9 @@ async fn opt_in_known(
     if !applicator.ensure_ch_table(desc).await? {
         return Ok(());
     }
-    resolver.materialize_opt_in(desc, row.target.clone()).await;
+    resolver
+        .materialize_opt_in(desc, row.target_database.clone(), row.target_table.clone())
+        .await;
     if let Some(mode) = row.initial_load.as_deref() {
         match InitialLoadMode::parse(mode) {
             Some(InitialLoadMode::None) => {}
@@ -132,14 +129,14 @@ async fn opt_in_known(
                 Some(b) => b.note_opt_in(desc, parsed, opt_in_lsn).await,
                 None => tracing::info!(
                     target: "walshadow::config",
-                    qname = %desc.qualified_name,
+                    qname = %desc.rel_name,
                     mode,
                     "initial_load requested but no backfiller wired; streaming from opt-in LSN only",
                 ),
             },
             None => tracing::warn!(
                 target: "walshadow::config",
-                qname = %desc.qualified_name,
+                qname = %desc.rel_name,
                 mode,
                 "unknown initial_load mode; streaming from opt-in LSN only",
             ),

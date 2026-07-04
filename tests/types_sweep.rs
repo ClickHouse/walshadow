@@ -10,7 +10,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use walshadow::ch_emitter::ColumnMapping;
+use walshadow::ch_emitter::TableTarget;
 use walshadow::shadow::Shadow;
+use walshadow::shadow_catalog::RelName;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
 const SLOT_BROAD: PortSlot = PortSlot {
@@ -171,8 +173,8 @@ async fn broad_type_fidelity() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "public.types_t".into(),
-        target_table: "walshadow_test.types_t".into(),
+        source_table: RelName::new("public", "types_t"),
+        target_table: TableTarget::new("walshadow_test", "types_t"),
         columns: vec![
             col(1, "id", "Int32"),
             col(2, "i2", "Int16"),
@@ -336,8 +338,8 @@ async fn nan_and_infinity() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "public.ni".into(),
-        target_table: "walshadow_test.ni".into(),
+        source_table: RelName::new("public", "ni"),
+        target_table: TableTarget::new("walshadow_test", "ni"),
         columns: vec![
             col(1, "id", "Int32"),
             col(2, "f4", "Float32"),
@@ -434,8 +436,8 @@ async fn time_precision() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "public.tp".into(),
-        target_table: "walshadow_test.tp".into(),
+        source_table: RelName::new("public", "tp"),
+        target_table: TableTarget::new("walshadow_test", "tp"),
         columns: vec![
             col(1, "id", "Int32"),
             col(2, "t", "Time64(6)"),
@@ -539,8 +541,8 @@ async fn large_numeric() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "public.ln".into(),
-        target_table: "walshadow_test.ln".into(),
+        source_table: RelName::new("public", "ln"),
+        target_table: TableTarget::new("walshadow_test", "ln"),
         columns: vec![
             col(1, "id", "Int32"),
             col(2, "d", "Decimal(38,4)"),
@@ -647,8 +649,8 @@ async fn json_null_vs_sql_null() {
     .expect("create dest table");
 
     let mappings = vec![fx::TableMappingSpec {
-        source_table: "public.jn".into(),
-        target_table: "walshadow_test.jn".into(),
+        source_table: RelName::new("public", "jn"),
+        target_table: TableTarget::new("walshadow_test", "jn"),
         columns: vec![col(1, "id", "Int32"), col(2, "j", "Nullable(String)")],
     }];
 

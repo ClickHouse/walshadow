@@ -23,8 +23,10 @@ mod fx;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use walshadow::ch_emitter::TableTarget;
 use walshadow::ch_emitter::{ColumnMapping, NamespaceMapping};
 use walshadow::shadow::Shadow;
+use walshadow::shadow_catalog::RelName;
 
 // Each test owns a disjoint port slot. Cargo's default test runner
 // parallelises tests within a binary, so reusing slots would collide
@@ -97,8 +99,8 @@ struct PortSlot {
 /// Single mapping shape every subxact test reuses.
 fn mapping() -> Vec<fx::TableMappingSpec> {
     vec![fx::TableMappingSpec {
-        source_table: "s14.sub_t".into(),
-        target_table: "walshadow_test.s14_sub_t".into(),
+        source_table: RelName::new("s14", "sub_t"),
+        target_table: TableTarget::new("walshadow_test", "s14_sub_t"),
         columns: vec![
             ColumnMapping {
                 src_attnum: 1,

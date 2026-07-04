@@ -25,64 +25,20 @@ use clickhouse_c::{AsyncClient, Block, Event};
 
 use crate::backup_backfill::BackupRequest;
 use crate::ch_emitter::{
-    EmitterConfig, EmitterError, MappingHandle, RetryConfig, TableMapping, connect_client,
-    drain_to_end_of_stream, is_retryable, quote_ident,
+    EmitterConfig, EmitterError, MappingHandle, RetryConfig, TableMapping, TableTarget,
+    connect_client, drain_to_end_of_stream, is_retryable, quote_ident,
 };
+use crate::shadow_catalog::RelName;
 
 /// `orders` loads into `orders__wsstg`; deterministic so a retry or boot
 /// recovery finds the prior attempt's table
 pub const STAGING_SUFFIX: &str = "__wsstg";
 
-/// Split a mapping target into unquoted `(database, table)`. Accepts the
-/// opt-in derived shape (`` `db`.`t` ``, doubled-backtick escapes) and bare
-/// TOML shapes (`db.t`, `t`); a db-less target lands in `default_db`.
-pub fn parse_target(target: &str, default_db: &str) -> Option<(String, String)> {
-    let mut parts: Vec<String> = Vec::new();
-    if target.contains('`') {
-        let mut it = target.chars().peekable();
-        loop {
-            if it.next()? != '`' {
-                return None;
-            }
-            let mut cur = String::new();
-            loop {
-                match it.next()? {
-                    '`' if it.peek() == Some(&'`') => {
-                        it.next();
-                        cur.push('`');
-                    }
-                    '`' => break,
-                    c => cur.push(c),
-                }
-            }
-            parts.push(cur);
-            match it.next() {
-                None => break,
-                Some('.') => continue,
-                Some(_) => return None,
-            }
-        }
-    } else {
-        match target.rsplit_once('.') {
-            Some((db, t)) => parts.extend([db.to_owned(), t.to_owned()]),
-            None => parts.push(target.to_owned()),
-        }
-    }
-    match parts.len() {
-        1 => Some((default_db.to_owned(), parts.pop()?)),
-        2 => {
-            let t = parts.pop()?;
-            Some((parts.pop()?, t))
-        }
-        _ => None,
-    }
-}
-
 /// One rel's swap identities. `database`/`table` are the unquoted
 /// destination parts; `s_lsn` drives the copy-back filter.
 #[derive(Debug, Clone)]
 pub struct StagingRel {
-    pub qname: String,
+    pub rel: RelName,
     pub database: String,
     pub table: String,
     pub s_lsn: u64,
@@ -127,37 +83,31 @@ pub async fn prepare(
 ) -> Result<StagingPlan> {
     let mut sess = StagingSession::connect(emitter).await?;
     let live_map = live.read().await.clone();
-    let mut staged: HashMap<String, TableMapping> = HashMap::new();
+    let mut staged: HashMap<RelName, TableMapping> = HashMap::new();
     let mut rels = Vec::new();
     for r in reqs {
-        let qname = r.desc.qualified_name.as_ref();
-        let Some(m) = live_map.get(qname) else {
+        let name = &r.desc.rel_name;
+        let Some(m) = live_map.get(name) else {
             tracing::warn!(
                 target: "walshadow::backfill_staging",
-                qname,
+                qname = %name,
                 "no mapping at pass start; rows will skip",
             );
             continue;
         };
-        let Some((database, table)) = parse_target(&m.target, &emitter.database) else {
-            bail!(
-                "backfill_staging: unparseable mapping target {:?} for {qname}",
-                m.target
-            );
-        };
         let rel = StagingRel {
-            qname: qname.to_owned(),
-            database,
-            table,
+            rel: name.clone(),
+            database: m.target.database.clone(),
+            table: m.target.table.clone(),
             s_lsn: r.s_lsn,
         };
         sess.rebuild_staging(&rel)
             .await
-            .with_context(|| format!("backfill_staging: rebuild staging for {qname}"))?;
+            .with_context(|| format!("backfill_staging: rebuild staging for {name}"))?;
         staged.insert(
-            qname.to_owned(),
+            name.clone(),
             TableMapping {
-                target: rel.staging_sql(),
+                target: TableTarget::new(&rel.database, &rel.staging_table()),
                 columns: m.columns.clone(),
             },
         );
@@ -410,36 +360,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_target_handles_quoted_and_bare_shapes() {
-        assert_eq!(
-            parse_target("`db`.`orders`", "default"),
-            Some(("db".into(), "orders".into()))
-        );
-        assert_eq!(
-            parse_target("db.orders", "default"),
-            Some(("db".into(), "orders".into()))
-        );
-        assert_eq!(
-            parse_target("orders", "default"),
-            Some(("default".into(), "orders".into()))
-        );
-        assert_eq!(
-            parse_target("`orders`", "default"),
-            Some(("default".into(), "orders".into()))
-        );
-        // Embedded dot + doubled backtick stay inside the quoted ident
-        assert_eq!(
-            parse_target("`d.b`.`or``ders`", "default"),
-            Some(("d.b".into(), "or`ders".into()))
-        );
-        assert_eq!(parse_target("`db`.`t`.`x`", "default"), None);
-        assert_eq!(parse_target("`unterminated", "default"), None);
-    }
-
-    #[test]
     fn staging_rel_renders_sql_names() {
         let rel = StagingRel {
-            qname: "public.orders".into(),
+            rel: RelName::new("public", "orders"),
             database: "db".into(),
             table: "orders".into(),
             s_lsn: 0x5000,

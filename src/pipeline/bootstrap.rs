@@ -150,8 +150,7 @@ pub async fn drain(
         }
 
         let Some(mapping) =
-            crate::pipeline::lookup_mapping(&mapping_handle, rel.qualified_name.as_ref(), &stats)
-                .await
+            crate::pipeline::lookup_mapping(&mapping_handle, &rel.rel_name, &stats).await
         else {
             continue;
         };
@@ -308,7 +307,7 @@ async fn resolve_or_fill_toast(
                 return Err(format!(
                     "bootstrap: relation {} column {} value_id={} on toast relid={} \
                      has no chunks in the store (see plans/future/TOAST.md)",
-                    rel.qualified_name, c.target_name, p.va_valueid, p.va_toastrelid
+                    rel.rel_name, c.target_name, p.va_valueid, p.va_toastrelid
                 ));
             }
         }
@@ -352,11 +351,11 @@ fn chunk_from_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ch_emitter::{ColumnMapping, EmitterConfig, TableMapping};
+    use crate::ch_emitter::{ColumnMapping, EmitterConfig, TableMapping, TableTarget};
     use crate::heap_decoder::{ColumnValue, ToastPointer};
     use crate::pipeline::ack;
     use crate::pipeline::batcher::BatcherMsg;
-    use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
+    use crate::shadow_catalog::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use crate::toast::DiskChunkStore;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
@@ -364,7 +363,6 @@ mod tests {
 
     fn rel(rel_node: u32) -> Arc<RelDescriptor> {
         let name = format!("t{rel_node}");
-        let qualified_name = RelDescriptor::build_qualified_name("public", &name);
         Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -373,9 +371,7 @@ mod tests {
             },
             oid: rel_node,
             namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name,
-            qualified_name,
+            rel_name: RelName::new("public", &name),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -398,7 +394,7 @@ mod tests {
 
     fn mapping_for(rel_node: u32) -> TableMapping {
         TableMapping {
-            target: format!("default.t{rel_node}"),
+            target: TableTarget::new("default", &format!("t{rel_node}")),
             columns: vec![ColumnMapping {
                 src_attnum: 1,
                 target_name: "id".into(),
@@ -425,7 +421,6 @@ mod tests {
     /// Main rel with one mapped `bytea` column (attnum 1), the detoast target.
     fn bytea_rel(rel_node: u32) -> Arc<RelDescriptor> {
         let name = format!("t{rel_node}");
-        let qualified_name = RelDescriptor::build_qualified_name("public", &name);
         Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -434,9 +429,7 @@ mod tests {
             },
             oid: rel_node,
             namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name,
-            qualified_name,
+            rel_name: RelName::new("public", &name),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -459,7 +452,7 @@ mod tests {
 
     fn bytea_mapping_for(rel_node: u32) -> TableMapping {
         TableMapping {
-            target: format!("default.t{rel_node}"),
+            target: TableTarget::new("default", &format!("t{rel_node}")),
             columns: vec![ColumnMapping {
                 src_attnum: 1,
                 target_name: "b".into(),
@@ -473,7 +466,6 @@ mod tests {
     /// reinterprets a toast tuple's columns positionally (`chunk_from_columns`).
     fn toast_rel(rel_node: u32) -> Arc<RelDescriptor> {
         let name = format!("pg_toast_{rel_node}");
-        let qualified_name = RelDescriptor::build_qualified_name("pg_toast", &name);
         Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -482,9 +474,7 @@ mod tests {
             },
             oid: rel_node,
             namespace_oid: 99,
-            namespace_name: "pg_toast".into(),
-            name,
-            qualified_name,
+            rel_name: RelName::new("pg_toast", &name),
             kind: 't',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -544,8 +534,8 @@ mod tests {
         catalog.insert(rel(16400));
         catalog.insert(rel(16401));
         let mut tables = HashMap::new();
-        tables.insert("public.t16400".to_string(), mapping_for(16400));
-        tables.insert("public.t16401".to_string(), mapping_for(16401));
+        tables.insert(RelName::new("public", "t16400"), mapping_for(16400));
+        tables.insert(RelName::new("public", "t16401"), mapping_for(16401));
         let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
 
         let emitter_ack = Arc::new(AtomicU64::new(0));
@@ -596,7 +586,7 @@ mod tests {
         catalog.insert(rel(16400));
         catalog.insert(rel(16401)); // resolvable but unmapped
         let mut tables = HashMap::new();
-        tables.insert("public.t16400".to_string(), mapping_for(16400));
+        tables.insert(RelName::new("public", "t16400"), mapping_for(16400));
         let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
 
         let emitter_ack = Arc::new(AtomicU64::new(0));
@@ -641,7 +631,7 @@ mod tests {
         let mut catalog = CatalogMap::new();
         catalog.insert(bytea_rel(16400));
         let mut tables = HashMap::new();
-        tables.insert("public.t16400".to_string(), bytea_mapping_for(16400));
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
 
         let emitter_ack = Arc::new(AtomicU64::new(0));
@@ -697,7 +687,7 @@ mod tests {
         catalog.insert(bytea_rel(16400));
         catalog.insert(toast_rel(16500));
         let mut tables = HashMap::new();
-        tables.insert("public.t16400".to_string(), bytea_mapping_for(16400));
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
 
         let emitter_ack = Arc::new(AtomicU64::new(0));

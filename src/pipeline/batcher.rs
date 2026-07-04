@@ -30,7 +30,7 @@ use crate::ch_emitter::{
 use crate::config::ResolvedConfig;
 use crate::heap_decoder::{CommittedTuple, HeapOp};
 use crate::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
-use crate::shadow_catalog::RelDescriptor;
+use crate::shadow_catalog::{RelDescriptor, RelName};
 
 /// One decoded row routed to its destination. `mapping`/`rel` are `Arc`
 /// clones a decoder resolves once per xact/table.
@@ -52,7 +52,7 @@ pub struct ColMeta {
 /// Immutable per-table block shape, shared by every batch of that table
 /// until a barrier rebuilds it (bumping `schema_epoch`).
 pub struct BatchMeta {
-    pub table_key: String,
+    pub table_key: RelName,
     pub insert_sql: String,
     /// Order matches [`InsertBatch::buffers`]: mapped columns then the four
     /// synthetic (`_lsn`, `_xid`, `_commit_ts`, `_is_deleted`).
@@ -61,7 +61,7 @@ pub struct BatchMeta {
 }
 
 impl BatchMeta {
-    fn from_plan(plan: &TablePlan, table_key: String, schema_epoch: u64) -> Self {
+    fn from_plan(plan: &TablePlan, table_key: RelName, schema_epoch: u64) -> Self {
         let mut columns = Vec::with_capacity(plan.columns.len() + 4);
         for c in &plan.columns {
             columns.push(ColMeta {
@@ -155,7 +155,7 @@ pub fn spawn(
     mut config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tables: HashMap<String, Table> = HashMap::new();
+        let mut tables: HashMap<RelName, Table> = HashMap::new();
         let mut epoch: u64 = 0;
         let mut snap = snapshot(config_rx.as_ref());
         let mut live = effective_cfg(&cfg, snap.as_deref());
@@ -256,7 +256,7 @@ async fn config_changed(rx: &mut Option<watch::Receiver<Arc<ResolvedConfig>>>) {
 /// Process a decoder's row chunk in order. Chunk only amortizes the channel
 /// hop, not the coalescing; budget/deadline trips behave per-row.
 async fn handle_rows(
-    tables: &mut HashMap<String, Table>,
+    tables: &mut HashMap<RelName, Table>,
     ctx: &RowCtx<'_>,
     rows: Vec<RoutedRow>,
 ) -> Result<(), String> {
@@ -267,14 +267,14 @@ async fn handle_rows(
 }
 
 async fn handle_row(
-    tables: &mut HashMap<String, Table>,
+    tables: &mut HashMap<RelName, Table>,
     ctx: &RowCtx<'_>,
     row: RoutedRow,
 ) -> Result<(), String> {
     ctx.stats
         .insertbatch_rows_in
         .fetch_add(1, Ordering::Relaxed);
-    let key = row.rel.qualified_name.as_ref();
+    let key = &row.rel.rel_name;
     if !tables.contains_key(key) {
         // Column-type overrides re-read per plan build; a `Column*` config
         // event applies under the barrier fence, whose FlushAll cleared this
@@ -282,10 +282,10 @@ async fn handle_row(
         let overrides = ctx.resolved.and_then(|rc| rc.columns.get(key));
         let plan = TablePlan::build(ctx.alloc, &row.rel, &row.mapping, overrides)
             .map_err(|e| e.to_string())?;
-        let meta = Arc::new(BatchMeta::from_plan(&plan, key.to_owned(), ctx.epoch));
+        let meta = Arc::new(BatchMeta::from_plan(&plan, key.clone(), ctx.epoch));
         let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
         tables.insert(
-            key.to_owned(),
+            key.clone(),
             Table {
                 enc,
                 meta,
@@ -294,7 +294,7 @@ async fn handle_row(
             },
         );
     }
-    let t = tables.get_mut(key).expect("just inserted");
+    let t = tables.get_mut(&row.rel.rel_name).expect("just inserted");
     let op = match row.committed.decoded.op {
         HeapOp::Insert => OP_INSERT,
         HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
@@ -350,7 +350,7 @@ async fn emit_batch(
 }
 
 async fn flush_due(
-    tables: &mut HashMap<String, Table>,
+    tables: &mut HashMap<RelName, Table>,
     out: &async_channel::Sender<InsertBatch>,
     now: Instant,
     stats: &EmitterStats,
@@ -366,7 +366,7 @@ async fn flush_due(
 /// Seal every table, drop all encoders, bump `epoch` so next rows rebuild
 /// against post-DDL descriptors and inserters re-parse cached types.
 async fn flush_all(
-    tables: &mut HashMap<String, Table>,
+    tables: &mut HashMap<RelName, Table>,
     out: &async_channel::Sender<InsertBatch>,
     epoch: &mut u64,
     stats: &EmitterStats,
@@ -384,9 +384,9 @@ async fn flush_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ch_emitter::ColumnMapping;
+    use crate::ch_emitter::{ColumnMapping, TableTarget};
     use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
-    use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
+    use crate::shadow_catalog::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use tokio::sync::oneshot;
     use walrus::pg::walparser::RelFileNode;
 
@@ -399,9 +399,7 @@ mod tests {
             },
             oid: 16385,
             namespace_oid: 2200,
-            namespace_name: "public".into(),
-            name: "t".into(),
-            qualified_name: RelDescriptor::build_qualified_name("public", "t"),
+            rel_name: RelName::new("public", "t"),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -424,7 +422,7 @@ mod tests {
 
     fn mapping() -> Arc<TableMapping> {
         Arc::new(TableMapping {
-            target: "default.t".into(),
+            target: TableTarget::new("default", "t"),
             columns: vec![ColumnMapping {
                 src_attnum: 1,
                 target_name: "id".into(),

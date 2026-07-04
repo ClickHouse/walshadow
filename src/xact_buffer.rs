@@ -2222,8 +2222,8 @@ impl RecordSink for BufferingDecoderSink {
             // tuple into a ConfigEvent stamped (xid, source_lsn) so it drains in
             // WAL order and applies at its commit LSN (plan §2/§6).
             if let Some(schema) = self.config_schema.as_deref()
-                && rel.namespace_name.as_str() == schema
-                && let Some(kind) = ConfigTableKind::from_relname(rel.name.as_str())
+                && &*rel.rel_name.namespace == schema
+                && let Some(kind) = ConfigTableKind::from_relname(&rel.rel_name.name)
             {
                 let mut buf = self.buffer.lock().await;
                 for decoded in &decoded_set {
@@ -2559,7 +2559,7 @@ mod tests {
     #[test]
     fn toast_chunk_from_decoded_recognises_three_col_shape() {
         use crate::heap_decoder::{DecodedTuple, HeapOp};
-        use crate::shadow_catalog::{RelAttr, ReplIdent};
+        use crate::shadow_catalog::{RelAttr, RelName, ReplIdent};
         let rel = RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -2568,9 +2568,7 @@ mod tests {
             },
             oid: 99,
             namespace_oid: 99,
-            namespace_name: "pg_toast".into(),
-            name: "pg_toast_16385".into(),
-            qualified_name: RelDescriptor::build_qualified_name("pg_toast", "pg_toast_16385"),
+            rel_name: RelName::new("pg_toast", "pg_toast_16385"),
             kind: 't',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },

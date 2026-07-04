@@ -33,6 +33,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
 
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
+use walshadow::ch_emitter::TableTarget;
 use walshadow::ch_emitter::{
     ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, MappingHandle, NamespaceMapping,
     TableMapping,
@@ -40,6 +41,7 @@ use walshadow::ch_emitter::{
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle};
 use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow_catalog::RelName;
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::wal_stream::{
@@ -423,8 +425,8 @@ pub async fn bootstrap_clusters(
 // ---------------------------------------------------------------------------
 
 pub struct TableMappingSpec {
-    pub source_table: String,
-    pub target_table: String,
+    pub source_table: RelName,
+    pub target_table: TableTarget,
     pub columns: Vec<ColumnMapping>,
 }
 
@@ -664,7 +666,7 @@ async fn build_pipeline_inner(
         if let Some(s) = &d.drop_table_strategy {
             emitter_cfg.drop_table_strategy = s.clone();
         }
-        let names: Vec<String> = emitter_cfg.tables.keys().cloned().collect();
+        let names: Vec<RelName> = emitter_cfg.tables.keys().cloned().collect();
         catalog
             .lock()
             .await

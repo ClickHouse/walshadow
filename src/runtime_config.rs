@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
-use crate::shadow_catalog::RelDescriptor;
+use crate::shadow_catalog::{RelDescriptor, RelName};
 
 pub const CONFIG_GLOBAL: &str = "config_global";
 pub const CONFIG_NAMESPACE: &str = "config_namespace";
@@ -69,10 +69,13 @@ pub struct NamespaceRow {
     pub drop_table_strategy: Option<String>,
 }
 
-/// `config_table` row (key = `namespace.relname`).
+/// `config_table` row (key = `(namespace, relname)`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TableRow {
-    pub target: Option<String>,
+    /// CH destination override, one part per column; NULL = that part
+    /// derived (namespace target_database / source relname)
+    pub target_database: Option<String>,
+    pub target_table: Option<String>,
     /// Inclusion switch: `Some(true)` opt-in, `Some(false)` opt-out, `None`
     /// leaves scope unchanged (legacy target-override-only behavior).
     pub replicate: Option<bool>,
@@ -141,19 +144,19 @@ pub enum ConfigEvent {
         namespace: String,
     },
     TableUpserted {
-        qname: String,
+        rel: RelName,
         row: TableRow,
     },
     TableRemoved {
-        qname: String,
+        rel: RelName,
     },
     ColumnUpserted {
-        qname: String,
+        rel: RelName,
         attname: String,
         row: ColumnRow,
     },
     ColumnRemoved {
-        qname: String,
+        rel: RelName,
         attname: String,
     },
 }
@@ -176,10 +179,8 @@ impl ConfigEvent {
 pub struct ConfigOverlay {
     pub global: Option<GlobalRow>,
     pub namespaces: HashMap<String, NamespaceRow>,
-    /// Keyed on `"<namespace>.<relname>"`.
-    pub tables: HashMap<String, TableRow>,
-    /// Keyed on `("<namespace>.<relname>", attname)`.
-    pub columns: HashMap<(String, String), ColumnRow>,
+    pub tables: HashMap<RelName, TableRow>,
+    pub columns: HashMap<(RelName, String), ColumnRow>,
 }
 
 impl ConfigOverlay {
@@ -194,21 +195,17 @@ impl ConfigOverlay {
             ConfigEvent::NamespaceRemoved { namespace } => {
                 self.namespaces.remove(&namespace);
             }
-            ConfigEvent::TableUpserted { qname, row } => {
-                self.tables.insert(qname, row);
+            ConfigEvent::TableUpserted { rel, row } => {
+                self.tables.insert(rel, row);
             }
-            ConfigEvent::TableRemoved { qname } => {
-                self.tables.remove(&qname);
+            ConfigEvent::TableRemoved { rel } => {
+                self.tables.remove(&rel);
             }
-            ConfigEvent::ColumnUpserted {
-                qname,
-                attname,
-                row,
-            } => {
-                self.columns.insert((qname, attname), row);
+            ConfigEvent::ColumnUpserted { rel, attname, row } => {
+                self.columns.insert((rel, attname), row);
             }
-            ConfigEvent::ColumnRemoved { qname, attname } => {
-                self.columns.remove(&(qname, attname));
+            ConfigEvent::ColumnRemoved { rel, attname } => {
+                self.columns.remove(&(rel, attname));
             }
         }
     }
@@ -281,14 +278,6 @@ fn field_string(rel: &RelDescriptor, cols: &[Option<ColumnValue>], name: &str) -
     }
 }
 
-fn qualified(namespace: &str, relname: &str) -> String {
-    let mut s = String::with_capacity(namespace.len() + 1 + relname.len());
-    s.push_str(namespace);
-    s.push('.');
-    s.push_str(relname);
-    s
-}
-
 /// Interpret a config-table heap write into a [`ConfigEvent`]. `rel` must
 /// describe the same relation `decoded` targets. `None` when the write carries
 /// no usable image or the row key is missing.
@@ -329,33 +318,34 @@ pub fn interpret(
             })
         }
         ConfigTableKind::Table => {
-            let qname = qualified(
+            let key = RelName::new(
                 &field_string(rel, &cols, "namespace")?,
                 &field_string(rel, &cols, "relname")?,
             );
             if removed {
-                return Some(ConfigEvent::TableRemoved { qname });
+                return Some(ConfigEvent::TableRemoved { rel: key });
             }
             Some(ConfigEvent::TableUpserted {
-                qname,
+                rel: key,
                 row: TableRow {
-                    target: field_string(rel, &cols, "target"),
+                    target_database: field_string(rel, &cols, "target_database"),
+                    target_table: field_string(rel, &cols, "target_table"),
                     replicate: field_bool(rel, &cols, "replicate"),
                     initial_load: field_string(rel, &cols, "initial_load"),
                 },
             })
         }
         ConfigTableKind::Column => {
-            let qname = qualified(
+            let key = RelName::new(
                 &field_string(rel, &cols, "namespace")?,
                 &field_string(rel, &cols, "relname")?,
             );
             let attname = field_string(rel, &cols, "attname")?;
             if removed {
-                return Some(ConfigEvent::ColumnRemoved { qname, attname });
+                return Some(ConfigEvent::ColumnRemoved { rel: key, attname });
             }
             Some(ConfigEvent::ColumnUpserted {
-                qname,
+                rel: key,
                 attname,
                 row: ColumnRow {
                     target_type: field_string(rel, &cols, "target_type"),
@@ -398,9 +388,7 @@ mod tests {
             },
             oid: 20000,
             namespace_oid: 2200,
-            namespace_name: "walshadow".into(),
-            name: name.into(),
-            qualified_name: RelDescriptor::build_qualified_name("walshadow", name),
+            rel_name: RelName::new("walshadow", name),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Full,
@@ -570,21 +558,23 @@ mod tests {
     }
 
     #[test]
-    fn table_upsert_builds_qualified_key() {
+    fn table_upsert_builds_structured_key() {
         let r = rel(
             CONFIG_TABLE,
             vec![
                 attr(1, "namespace", 25),
                 attr(2, "relname", 25),
-                attr(3, "target", 25),
-                attr(4, "replicate", 16),
-                attr(5, "initial_load", 25),
+                attr(3, "target_database", 25),
+                attr(4, "target_table", 25),
+                attr(5, "replicate", 16),
+                attr(6, "initial_load", 25),
             ],
         );
         let new = vec![
             Some(ColumnValue::Text("public".into())),
             Some(ColumnValue::Text("events".into())),
-            Some(ColumnValue::Text("default.events".into())),
+            Some(ColumnValue::Text("default".into())),
+            Some(ColumnValue::Text("events".into())),
             Some(ColumnValue::Bool(true)),
             Some(ColumnValue::Text("copy".into())),
         ];
@@ -595,9 +585,10 @@ mod tests {
         )
         .unwrap()
         {
-            ConfigEvent::TableUpserted { qname, row } => {
-                assert_eq!(qname, "public.events");
-                assert_eq!(row.target.as_deref(), Some("default.events"));
+            ConfigEvent::TableUpserted { rel, row } => {
+                assert_eq!(rel, RelName::new("public", "events"));
+                assert_eq!(row.target_database.as_deref(), Some("default"));
+                assert_eq!(row.target_table.as_deref(), Some("events"));
                 assert_eq!(row.replicate, Some(true));
                 assert_eq!(row.initial_load.as_deref(), Some("copy"));
             }
@@ -605,8 +596,8 @@ mod tests {
         }
     }
 
-    /// A pre-opt-in `config_table` row (only `target`, no `replicate`/
-    /// `initial_load` columns) still interprets, with the new fields `None`.
+    /// A pre-opt-in `config_table` row (only target columns, no `replicate`/
+    /// `initial_load`) still interprets, with the new fields `None`.
     #[test]
     fn table_upsert_absent_switches_default_none() {
         let r = rel(
@@ -614,13 +605,13 @@ mod tests {
             vec![
                 attr(1, "namespace", 25),
                 attr(2, "relname", 25),
-                attr(3, "target", 25),
+                attr(3, "target_table", 25),
             ],
         );
         let new = vec![
             Some(ColumnValue::Text("public".into())),
             Some(ColumnValue::Text("events".into())),
-            Some(ColumnValue::Text("default.events".into())),
+            Some(ColumnValue::Text("events".into())),
         ];
         match interpret(
             ConfigTableKind::Table,

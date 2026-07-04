@@ -194,7 +194,7 @@ bumping schema_epoch; barrier and shutdown path
 ([emitter.md](emitter.md))
 
 **forward declaration** — `config_table` row whose relation doesn't
-exist yet; parked keyed on qualified name, materialized when matching
+exist yet; parked keyed on `(namespace, relname)`, materialized when matching
 CREATE TABLE arrives ([config.md](config.md))
 
 **FPI** — full-page image on a WAL block ref; `restore_block_image`
