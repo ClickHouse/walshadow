@@ -13,8 +13,7 @@
 # PeerDB stages ClickHouse CDC through the MinIO bundled in its compose file.
 set -euo pipefail
 cd "$(dirname "$0")"
-source ../aws-env.sh
-source ./state.env   # PUBLIC_IP, KEY_NAME, ...
+source ./state.env   # PUBLIC_IP, PEM, ...
 source ../lib.sh
 
 node_ssh_setup
@@ -41,7 +40,7 @@ echo "waiting for cloud-init to finish (Docker install + PeerDB clone)…"
 # via the s3() function. The quickstart compose hardcodes that staging endpoint
 # to http://host.docker.internal:9001 — only reachable from THIS box. Our
 # ClickHouse runs on a separate host, so rewrite it to this box's private IP
-# (MinIO is published on :9001; provision.sh opens 9001 to the VPC). Idempotent.
+# (MinIO is published on :9001; terraform opens 9001 to the VPC). Idempotent.
 echo "pointing PeerDB S3 staging endpoint at http://$PRIVATE_IP:9001 (for the external ClickHouse)…"
 "${SSH[@]}" "sudo sed -i -E 's|(PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ENDPOINT_URL_S3:[[:space:]]*).*|\\1http://$PRIVATE_IP:9001|' /opt/peerdb/docker-compose.yml"
 

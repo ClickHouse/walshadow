@@ -1,6 +1,12 @@
-# secrets / per-run state — never commit (matches every ec2-* subfolder)
+# secrets / terraform-generated per-node endpoint manifests — never commit
 *.pem
 state.env
 
 # copied-back perf/eBPF profiles (large)
 profiles/
+
+# terraform local state (single operator, no remote backend)
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/setup.auto.tfvars
+terraform/.terraform.lock.hcl

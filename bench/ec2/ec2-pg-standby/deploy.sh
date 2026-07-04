@@ -10,8 +10,7 @@
 # SOURCE_PRIVATE_IP=...). Re-running takes a fresh base backup.
 set -euo pipefail
 cd "$(dirname "$0")"
-source ../aws-env.sh
-source ./state.env   # PUBLIC_IP, KEY_NAME, ...
+source ./state.env   # PUBLIC_IP, PEM, ...
 source ../lib.sh
 
 # MUST match the primary's major version for physical replication.
