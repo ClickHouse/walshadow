@@ -14,13 +14,51 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::config::SslMode as TpSslMode;
 use tokio_postgres::{Client, NoTls};
 use walrus::pg::backup::{format_pg_lsn, parse_pg_lsn};
-use walrus::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
+use walrus::pg::replication::conn::{
+    PgConfig, ReplicationConn, error_code, error_message, message_kind,
+};
 use walrus::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use walrus::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 
 /// Matches wal-rus / wal-g defaults; servers tolerate up to
 /// `wal_sender_timeout` of silence (default 60s).
 pub const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// SQLSTATE for a WAL segment the source has already recycled
+/// (`undefined_file`). Locale-independent, unlike the message text.
+pub const SQLSTATE_UNDEFINED_FILE: &str = "58P01";
+
+/// The source recycled the requested LSN's WAL segment. Fatal — the resume
+/// point is gone; recovery is a re-bootstrap / backfill via config, not a
+/// reconnect. Typed so the pump distinguishes it from a transient drop.
+#[derive(Debug, thiserror::Error)]
+#[error("source WAL segment already removed (SQLSTATE {error_code}): {message}")]
+pub struct WalSegmentRemoved {
+    pub error_code: String,
+    pub message: String,
+}
+
+impl WalSegmentRemoved {
+    /// walrus collapses the `START_REPLICATION` reply `ErrorResponse` to a flat
+    /// string, discarding the SQLSTATE — the one spot forced to read the message
+    /// to recover the recycled-segment case, so detection stays typed.
+    fn from_start_replication(err: anyhow::Error) -> anyhow::Error {
+        let text = format!("{err:#}");
+        if text.contains(SQLSTATE_UNDEFINED_FILE) {
+            anyhow::Error::new(WalSegmentRemoved {
+                error_code: SQLSTATE_UNDEFINED_FILE.to_string(),
+                message: text,
+            })
+        } else {
+            err
+        }
+    }
+}
+
+pub fn is_wal_segment_removed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<WalSegmentRemoved>()
+        .is_some_and(|e| e.error_code == SQLSTATE_UNDEFINED_FILE)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WalChunk<'a> {
@@ -132,6 +170,62 @@ impl SourceFeed {
         self
     }
 
+    /// Re-establish a dropped replication connection and resume streaming at
+    /// exactly `resume_lsn` — the byte-contiguous
+    /// [`crate::wal_stream::WalStream::next_lsn`] resume point, never
+    /// `dispatched_lsn` (which lags by any buffered in-progress record). A
+    /// timeline change is a failover and can't resume in place; a recycled
+    /// segment surfaces to the caller (fatal, see [`is_wal_segment_removed`]).
+    ///
+    /// One attempt — the caller drives backoff/retry (`backon`) and decides
+    /// which errors are transient vs fatal (see `reconnect_or_fatal` in the
+    /// stream binary).
+    pub async fn reconnect(
+        cfg: &PgConfig,
+        slot: Option<&str>,
+        resume_lsn: u64,
+        timeline: u32,
+        status_interval: Duration,
+    ) -> Result<Self> {
+        let mut feed = SourceFeed::connect(cfg)
+            .await
+            .context("reconnect to source PG")?
+            .with_status_interval(status_interval);
+        let ident = feed
+            .identify_system()
+            .await
+            .context("IDENTIFY_SYSTEM on reconnect")?;
+        if ident.timeline != timeline {
+            bail!(
+                "source timeline changed {timeline} -> {} (failover); cannot resume in place",
+                ident.timeline
+            );
+        }
+        feed.start_physical_replication(slot, resume_lsn, timeline)
+            .await
+            .context("START_REPLICATION on reconnect")?;
+        Ok(feed)
+    }
+
+    /// Ensure a physical replication slot exists, reserving WAL immediately so
+    /// the source retains segments from the slot's `restart_lsn` onward — a
+    /// stalled/disconnected consumer resumes without the segment being
+    /// recycled. Idempotent: a pre-existing slot is left untouched. Runs on the
+    /// sidecar SQL connection.
+    pub async fn ensure_physical_slot(&mut self, name: &str) -> Result<()> {
+        let client = self.sql_client().await?;
+        client
+            .execute(
+                "SELECT pg_create_physical_replication_slot($1, true) \
+                 WHERE NOT EXISTS \
+                 (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                &[&name],
+            )
+            .await
+            .context("create physical replication slot")?;
+        Ok(())
+    }
+
     pub async fn identify_system(&mut self) -> Result<SystemIdentity> {
         self.conn.send_query("IDENTIFY_SYSTEM").await?;
         let mut sysid = String::new();
@@ -185,7 +279,10 @@ impl SourceFeed {
     ) -> Result<()> {
         let cmd = build_start_replication_cmd(slot, start_lsn, timeline);
         self.conn.send_query(&cmd).await?;
-        self.conn.expect_copy_both_open().await?;
+        self.conn
+            .expect_copy_both_open()
+            .await
+            .map_err(WalSegmentRemoved::from_start_replication)?;
         self.floors = StatusFloors {
             write: start_lsn,
             flush: start_lsn,
@@ -241,7 +338,16 @@ impl SourceFeed {
                     }
                 }
                 Message::CopyDone => return Ok(None),
-                Message::ErrorResponse(e) => bail!("source: {}", error_message(&e)),
+                Message::ErrorResponse(e) => {
+                    let (code, message) = (error_code(&e), error_message(&e));
+                    if code == SQLSTATE_UNDEFINED_FILE {
+                        return Err(anyhow::Error::new(WalSegmentRemoved {
+                            error_code: code,
+                            message,
+                        }));
+                    }
+                    bail!("source: {message}");
+                }
                 m => {
                     tracing::debug!(
                         target: "walshadow::source_feed",

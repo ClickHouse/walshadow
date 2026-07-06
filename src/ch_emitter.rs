@@ -161,6 +161,10 @@ pub struct EmitterConfig {
     /// overlay tables. `None` (field empty or omitted) disables the whole
     /// overlay subsystem — no boot seed, no config_decoder, pure TOML+CLI.
     pub runtime_config_schema: Option<String>,
+    /// `[source] slot`: physical replication slot to create + stream from on
+    /// the source. `Some` reserves WAL so a stalled/disconnected consumer
+    /// resumes without recycling; `None` runs slotless. Boot-only.
+    pub source_slot: Option<String>,
 }
 
 pub const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
@@ -211,6 +215,7 @@ impl Default for EmitterConfig {
             toast: crate::toast::ToastConfig::default(),
             decode_chunk_rows: crate::pipeline::decode::DECODE_CHUNK_ROWS,
             runtime_config_schema: None,
+            source_slot: None,
         }
     }
 }
@@ -447,6 +452,13 @@ impl EmitterConfig {
         {
             // Empty string == omitted == overlay disabled.
             out.runtime_config_schema = Some(schema.into());
+        }
+        if let Some(src) = root.get("source").and_then(Value::as_table)
+            && let Some(slot) = src.get("slot").and_then(Value::as_str)
+            && !slot.is_empty()
+        {
+            // Empty string == omitted == slotless.
+            out.source_slot = Some(slot.into());
         }
         if let Some(nss) = root.get("namespace").and_then(Value::as_table) {
             for (k, v) in nss {

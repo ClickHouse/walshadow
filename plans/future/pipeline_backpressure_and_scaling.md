@@ -12,28 +12,28 @@ feed inserters. Out-of-order INSERTs are fine — `_lsn` plus
 ([[project_walshadow_eventual_consistency]]) — but slot feedback still
 needs the strict contiguous durable watermark.
 
-## Pump→worker bound (wire/record split)
+## Pump→worker bound (implemented — hard cap)
 
-The pump→worker channel (`queueing_record_sink.rs`) is soft-capped, not
-hard-bounded. `on_record` and shadow-wire delivery run lockstep in
-`wal_stream.rs::drain_records`, wire chunk before record, so every
-`ShadowCatalog::wait_for_replay` target sits behind the wire head: the
-gate waits on shadow *apply* of already-sent bytes, never on bytes the
-pump has yet to produce. Delivery of sent bytes is pump-independent
-(listener task drains `send_queues`, idle keepalives force walreceiver
-flush, `wire_buf` backfill covers in-segment reconnects,
-`restore_command` older ranges), so a pump parked in a hard-bounded
-`on_record` cannot starve a pending gate. It still freezes for the full
-send → walreceiver flush → replay → poll round-trip each time the queue
-fills while a gate is pending, and it couples wire progress to decode
-progress, turning any delivery path that does need fresh pump bytes
-into a deadlock. The soft cap (yield past `soft_cap`) keeps wire
-delivery independent of decode; the cost is an unbounded buffer: under
-sustained CH-slower-than-WAL it grows, holding WAL in walshadow RAM
-rather than letting the PG slot hold it on disk.
+The pump→worker channel (`queueing_record_sink.rs`) is hard-bounded: a
+`mpsc::channel(max_records / batch_size)` whose `send().await` blocks the
+pump when full. Real backpressure — a sustained CH-slower-than-WAL run
+parks the pump on the source socket (TCP backpressure → with a physical
+slot + the `flush_lsn` cap, the source holds WAL on its disk, see
+[source.md](../source.md)) instead of growing walshadow RAM without limit.
 
-Fix: split wire delivery (runs ahead, paced by shadow apply) from record
-dispatch (blocks on a bounded queue). Architectural, not a channel swap.
+Deadlock-safe, even though `on_record` and shadow-wire delivery run
+lockstep in `wal_stream.rs::drain_records` and
+`ReorderSink::maybe_sweep_dropped` → `ShadowCatalog::wait_for_replay`
+couples decode to shadow apply. Two facts break the feared deadlock:
+`on_wire_chunk` fires *before* `on_record` per record, and the walsender
+feeds shadow on an **independent** per-connection task (+keepalive-on-idle,
+`shadow_stream.rs`), not from the pump. So a parked pump only withholds
+*future* wire (`> resume`); every LSN a worker `wait_for_replay` can target
+is a dispatched record's own `source_lsn`, always ≤ the highest wire
+already enqueued (dispatch is FIFO ascending, wire precedes dispatch), and
+that wire reaches shadow independently → replay advances → the wait clears.
+The bytes always lead the wait target; the wait is never for bytes shadow
+hasn't received.
 
 The other two ingress channels need nothing: bootstrap page-walk→drain
 is bounded (`BOOTSTRAP_TUPLE_CHANNEL_CAP`, a full channel parks the page
