@@ -24,9 +24,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use roaring::RoaringBitmap;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::spill::ToastChunk;
-use walshadow::toast::{ChunkMap, ChunkStore, ClickHouseChunkStore, ToastMode, ToastResolver};
+use walshadow::toast::{
+    ChunkMap, ChunkStore, ClickHouseChunkStore, GcHorizon, ToastMode, ToastResolver,
+};
 
 const CH_TCP_PORT: u16 = 17639;
 const CH_HTTP_PORT: u16 = 17640;
@@ -173,6 +176,68 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         "8192",
         "0x2000 wins the dedup"
     );
+
+    // GC surface: enumeration mirrors the mirrored tables + stored values.
+    let mut relids = store.gc_relids().await.unwrap();
+    relids.sort_unstable();
+    assert_eq!(relids, vec![16500, 16600]);
+    let now = std::time::SystemTime::now();
+    let none_live = RoaringBitmap::new();
+    let all = GcHorizon {
+        lsn: u64::MAX,
+        scan_start: now,
+    };
+    let dead = store.gc_dead_values(16500, &none_live, &all).await.unwrap();
+    assert_eq!(dead.iter().collect::<Vec<_>>(), vec![7, 9]);
+    // Live ids anti-joined out during the scan.
+    let live: RoaringBitmap = [7].into_iter().collect();
+    let dead = store.gc_dead_values(16500, &live, &all).await.unwrap();
+    assert_eq!(dead.iter().collect::<Vec<_>>(), vec![9]);
+    // Horizon below a value's max(_lsn) drops it from candidates — models
+    // a reused-OID re-put generation (7 re-shipped at 0x2000).
+    let mid = GcHorizon {
+        lsn: 0x1000,
+        scan_start: now,
+    };
+    let dead = store.gc_dead_values(16500, &none_live, &mid).await.unwrap();
+    assert_eq!(
+        dead.iter().collect::<Vec<_>>(),
+        vec![9],
+        "per-value max(_lsn) distinguishes valueid generations"
+    );
+    // Never-stored relid mirrors fetch's missing-table convention.
+    assert!(
+        store
+            .gc_dead_values(70000, &none_live, &all)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Reused-OID guard: horizon below the value's _lsn deletes nothing —
+    // models a re-put generation landing after candidate computation.
+    let early = GcHorizon {
+        lsn: 0x0800,
+        scan_start: now,
+    };
+    assert_eq!(store.gc_delete(16500, &dead, &early).await.unwrap(), 0);
+    assert_eq!(
+        store.fetch(16500, 9).await.unwrap(),
+        BTreeMap::from([(0u32, b"zz".to_vec())]),
+        "newer generation survives a stale-horizon delete"
+    );
+
+    // Horizon at the value's _lsn collects it; unrelated value untouched.
+    let horizon = GcHorizon {
+        lsn: 0x1000,
+        scan_start: now,
+    };
+    assert_eq!(store.gc_delete(16500, &dead, &horizon).await.unwrap(), 1);
+    assert!(store.fetch(16500, 9).await.unwrap().is_empty());
+    assert_eq!(store.fetch(16500, 7).await.unwrap().len(), 3);
+    // Idempotent re-delete: rows already gone, nothing counted.
+    assert_eq!(store.gc_delete(16500, &dead, &horizon).await.unwrap(), 0);
+    assert!(store.fetch(16500, 9).await.unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

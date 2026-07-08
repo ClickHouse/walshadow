@@ -2473,7 +2473,16 @@ impl RecordSink for BufferingDecoderSink {
                     self.stats.record(&decoded);
                     if rel.kind == 't' {
                         let xid = decoded.xid;
-                        if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
+                        if decoded.op != HeapOp::Insert {
+                            // heap_toast_delete's DELETE (or an owning-table
+                            // TRUNCATE fan-out): TID-keyed, unappliable to the
+                            // (chunk_id, seq) store. Dropped by design; the GC
+                            // sweep reclaims dead values
+                            // (plans/TOAST.md)
+                            self.stats
+                                .toast_chunk_deletes
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
                             self.stats
                                 .toast_chunks_buffered
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

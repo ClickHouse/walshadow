@@ -23,8 +23,10 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
 - [xact.md](xact.md) — `XactBuffer`, `SubxactTracker`, TOAST
   reassembly, local-disk spill, `DrainEntry` ordering
 - [TOAST.md](TOAST.md) — full TOAST chunk store (`disabled`/`disk`/
-  `clickhouse`), bootstrap tap + defer-resolve, pre-window miss→fetch;
-  deferred R1 JOIN mode, chunk GC, streaming reassembly
+  `clickhouse`), bootstrap tap + defer-resolve, pre-window miss→fetch,
+  dead-chunk GC sweep (source anti-join gated on emitter ack,
+  `_lsn`/mtime reused-OID guards); deferred R1 JOIN mode, streaming
+  reassembly
 - [emitter.md](emitter.md) — parallel decode+insert pipeline
   (reorder → decode ×M → batcher → inserter ×N → ack watermark),
   `type_bridge`, synthetic columns, `DdlApplicator`, barrier fence

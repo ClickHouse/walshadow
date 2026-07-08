@@ -466,6 +466,11 @@ impl EmitterConfig {
             if let Some(v) = toast.get("disk_dir").and_then(Value::as_str) {
                 out.toast.disk_dir = Some(std::path::PathBuf::from(v));
             }
+            if let Some(v) = toast.get("gc_interval_secs").and_then(Value::as_integer)
+                && let Ok(secs) = u64::try_from(v)
+            {
+                out.toast.gc_interval = Duration::from_secs(secs);
+            }
         }
         if let Some(rc) = root.get("runtime_config").and_then(Value::as_table)
             && let Some(schema) = rc.get("schema").and_then(Value::as_str)
@@ -1541,6 +1546,13 @@ crate::atomic_stats! {
         /// Toasted values whose chunks were absent from an active store
         /// (disk / CH gap) — a real data gap, not a fill
         pub toast_fetch_miss,
+        /// GC sweeps completed against the chunk store (`crate::toast_gc`)
+        pub toast_gc_sweeps,
+        /// Dead toast values deleted from the chunk store by GC
+        pub toast_gc_values_deleted,
+        /// GC sweeps skipped: source PG unreachable (degraded mode, never
+        /// an error)
+        pub toast_gc_skipped_source_unreachable,
         // Pipeline-flow counters; `_out`/`_in` pairs give channel depth. See
         // `metrics::render`.
         pub queue_jobs_out,
@@ -2229,6 +2241,11 @@ mod tests {
             row_budget = 1024
             byte_budget = 4096
 
+            [toast]
+            mode = "disk"
+            disk_dir = "/var/lib/walshadow/toast"
+            gc_interval_secs = 900
+
             [table.public.foo]
             initial_load = "copy"
             columns = [
@@ -2263,6 +2280,20 @@ mod tests {
         );
         // soft_delete defaults off when the key is absent
         assert!(!c.soft_delete);
+        assert_eq!(c.toast.mode, crate::toast::ToastMode::Disk);
+        assert_eq!(
+            c.toast.disk_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/walshadow/toast"))
+        );
+        assert_eq!(c.toast.gc_interval, Duration::from_secs(900));
+        // gc_interval_secs omitted => GC disabled
+        assert_eq!(
+            EmitterConfig::from_toml_str("[ch]\n")
+                .unwrap()
+                .toast
+                .gc_interval,
+            Duration::ZERO
+        );
     }
 
     #[test]

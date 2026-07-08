@@ -177,6 +177,11 @@ crate::atomic_stats! {
         /// chunk_id/seq/data, type mismatch). Surfaces a corrupt catalog or
         /// future TOAST layout as a counter, not silent loss
         pub toast_chunks_malformed,
+        /// DELETE/TRUNCATE on a toast rel: TID-keyed (replica identity
+        /// `nothing`), no chunk_id to apply against the store, dropped by
+        /// design — dead chunks reclaimed by the GC sweep
+        /// (`crate::toast_gc`), not per-record
+        pub toast_chunk_deletes,
     }
 }
 
@@ -240,7 +245,7 @@ impl DecoderStats {
         use std::fmt::Write as _;
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = format!("decoded={}", ld(&self.decoded));
-        let pairs: [(&str, u64); 10] = [
+        let pairs: [(&str, u64); 11] = [
             ("ins", ld(&self.inserts)),
             ("upd", ld(&self.updates)),
             ("hot", ld(&self.hot_updates)),
@@ -251,6 +256,7 @@ impl DecoderStats {
             ("not_found", ld(&self.catalog_not_found)),
             ("toast", ld(&self.toast_chunks_buffered)),
             ("toast_bad", ld(&self.toast_chunks_malformed)),
+            ("toast_del", ld(&self.toast_chunk_deletes)),
         ];
         for (label, n) in pairs {
             if n > 0 {

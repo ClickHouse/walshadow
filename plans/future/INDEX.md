@@ -9,7 +9,6 @@ surface; promote into `plans/` once built
 * [shadow_schema_export.md](shadow_schema_export.md) — shadow PG as schema-only catalog donor to third-party clusters
 * [sync_commit_witness.md](sync_commit_witness.md) — walshadow as RPO=0 durability standby
 * [two_phase_commit.md](two_phase_commit.md) — `XLOG_XACT_PREPARE` handling and gxid-keyed buffer
-* [toast_chunk_gc.md](toast_chunk_gc.md) — reclaim dead toast chunks: source anti-join sweep gated on emitter ack, WAL-driven TID-mapped alternative for archive replay
 * [ch_bounce_recovery.md](ch_bounce_recovery.md) — deeper re-emit-from-spill on retry-budget exhaustion
 * [pinned_ddl_baseline.md](pinned_ddl_baseline.md) — schema-event outcome must be a function of config + baseline, not cache warmth: CH-existence / persisted-baseline options for cross-restart consistency, drop detection across downtime, opt-in mapping vs republish
 * [coverage100.md](coverage100.md) — drive `cargo llvm-cov` line coverage toward 100%: tiered work list (pure units → fixtures → live e2e → hard tail)
