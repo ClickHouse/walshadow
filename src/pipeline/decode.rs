@@ -82,14 +82,17 @@ impl<V> RelCache<V> {
 /// Reassembled-TOAST chunk map: `(toast_relid, value_id) -> seq -> bytes`.
 pub type ToastChunks = HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>;
 
-/// `chunks` is `Arc` so the barrier coordinator can dispatch several data
-/// segments of one xact sharing the same TOAST chunk map without cloning.
+/// `chunks` holds the xact's chunk-map generations (oldest first), each
+/// immutable once sealed by the drain: batches / barrier segments of one
+/// xact share payloads via `Arc` while later slices are still loading. A
+/// heap's referenced value lives in exactly one generation (chunk WAL
+/// precedes referrer).
 pub struct DecodeJob {
     pub seq: u64,
     pub commit_ts: i64,
     pub commit_lsn: u64,
     pub heaps: Vec<DecodedHeap>,
-    pub chunks: Arc<ToastChunks>,
+    pub chunks: Vec<Arc<ToastChunks>>,
 }
 
 /// Shared dependencies a decode worker (or the barrier's inline data path)
@@ -147,15 +150,16 @@ pub async fn decode_and_route(
     commit_ts: i64,
     commit_lsn: u64,
     heaps: Vec<DecodedHeap>,
-    chunks: Arc<ToastChunks>,
+    chunks: Vec<Arc<ToastChunks>>,
     cache: &mut RelCache<(Arc<RelDescriptor>, Arc<TableMapping>)>,
 ) -> Result<u64, String> {
     cache.refresh();
+    let chunk_maps: Vec<&ToastChunks> = chunks.iter().map(Arc::as_ref).collect();
     let mut routed = 0u64;
     let mut buf: Vec<RoutedRow> = Vec::new();
     let mut buf_bytes = 0usize;
     for mut heap in heaps {
-        detoast_heap(&mut heap, &chunks, &ctx.catalog, true, &ctx.resolver)
+        detoast_heap(&mut heap, &chunk_maps, &ctx.catalog, true, &ctx.resolver)
             .await
             .map_err(|e| e.to_string())?;
         // Cache hit: no shared catalog lock, no mapping read. Skip/error arms

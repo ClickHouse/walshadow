@@ -53,6 +53,13 @@ pub const OP_DELETE: i8 = 3;
 pub const DEFAULT_ROW_BUDGET: usize = 65_536;
 pub const DEFAULT_BYTE_BUDGET: usize = 1 << 20; // 1 MiB
 
+/// Default commit-drain slice budgets
+/// ([`crate::xact_buffer::CommittedDrain::next_batch`]). Bytes sized at
+/// half the default `xact_buffer_max`: a slice plus the one loading behind
+/// it stay within the ingest budget.
+pub const DEFAULT_DRAIN_BATCH_ROWS: usize = 65_536;
+pub const DEFAULT_DRAIN_BATCH_BYTES: usize = 32 << 20; // 32 MiB
+
 /// Default flush timeout (ms). `0` keeps serial emitter's
 /// close-INSERT-on-every-xact-end behaviour (bootstrap backfill only);
 /// live pipeline substitutes a 100ms partial-batch deadline for `0` so
@@ -157,6 +164,12 @@ pub struct EmitterConfig {
     /// batcher (`crate::pipeline::decode::DECODE_CHUNK_ROWS`). Tunable so
     /// tests can trip the mid-loop flush without a huge xact.
     pub decode_chunk_rows: usize,
+    /// Row / byte budget per commit-drain slice
+    /// ([`crate::xact_buffer::CommittedDrain::next_batch`]). Bounds decoded
+    /// heap rows resident while a spilled xact streams back; TOAST chunk
+    /// generations stay per-xact.
+    pub drain_batch_rows: usize,
+    pub drain_batch_bytes: usize,
     /// `[runtime_config] schema`: source-PG schema housing the `config_*`
     /// overlay tables. `None` (field empty or omitted) disables the whole
     /// overlay subsystem — no boot seed, no config_decoder, pure TOML+CLI.
@@ -210,6 +223,8 @@ impl Default for EmitterConfig {
             soft_delete: false,
             toast: crate::toast::ToastConfig::default(),
             decode_chunk_rows: crate::pipeline::decode::DECODE_CHUNK_ROWS,
+            drain_batch_rows: DEFAULT_DRAIN_BATCH_ROWS,
+            drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
             runtime_config_schema: None,
         }
     }
@@ -405,6 +420,12 @@ impl EmitterConfig {
             }
             if let Some(v) = ch.get("byte_budget").and_then(Value::as_integer) {
                 out.byte_budget = usize::try_from(v).unwrap_or(DEFAULT_BYTE_BUDGET);
+            }
+            if let Some(v) = ch.get("drain_batch_rows").and_then(Value::as_integer) {
+                out.drain_batch_rows = usize::try_from(v).unwrap_or(DEFAULT_DRAIN_BATCH_ROWS);
+            }
+            if let Some(v) = ch.get("drain_batch_bytes").and_then(Value::as_integer) {
+                out.drain_batch_bytes = usize::try_from(v).unwrap_or(DEFAULT_DRAIN_BATCH_BYTES);
             }
             if let Some(v) = ch.get("flush_timeout_ms").and_then(Value::as_integer)
                 && let Ok(ms) = u64::try_from(v)

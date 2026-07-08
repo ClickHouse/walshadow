@@ -387,6 +387,24 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
         va_valueid: 55,
         va_toastrelid: toast_oid,
     }));
+    // Chunks buffered before the referring heap, as in WAL:
+    // `toast_save_datum` writes chunk INSERTs before the referring tuple,
+    // and the streaming drain detoasts each heap at yield against the
+    // chunks merged so far.
+    for (seq, body) in [(0u32, &b"Hell"[..]), (1, b"o, "), (2, b"wor")] {
+        b.on_toast_chunk(
+            ToastChunk {
+                toast_relid: toast_oid,
+                value_id: 55,
+                chunk_seq: seq,
+                source_lsn: 0,
+                chunk_data: body.to_vec(),
+            },
+            33,
+        )
+        .await
+        .unwrap();
+    }
     // source_lsn=0 bypasses the shadow-replay gate in
     // `ShadowCatalog::relation_at` — shadow PG isn't in recovery in
     // this test (no `standby.signal`), so `pg_last_wal_replay_lsn()`
@@ -395,20 +413,6 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     b.on_heap(heap(rfn, 33, 0, HeapOp::Insert, vec![id_col, body_ptr]))
         .await
         .unwrap();
-    for (seq, body) in [(0u32, &b"Hell"[..]), (1, b"o, "), (2, b"wor")] {
-        b.on_toast_chunk(
-            ToastChunk {
-                toast_relid: toast_oid,
-                value_id: 55,
-                chunk_seq: seq,
-                source_lsn: 102 + seq as u64,
-                chunk_data: body.to_vec(),
-            },
-            33,
-        )
-        .await
-        .unwrap();
-    }
     b.commit(
         33,
         12345,
@@ -446,19 +450,15 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         va_valueid: 1,
         va_toastrelid: toast_oid,
     }));
-    // source_lsn=0 to bypass the shadow-replay gate; see sibling test
-    // for the rationale.
-    b.on_heap(heap(rfn, 42, 0, HeapOp::Insert, vec![id_col, body_ptr]))
-        .await
-        .unwrap();
-    // Only chunks 0 + 2 — seq 1 missing.
+    // Only chunks 0 + 2 — seq 1 missing. Buffered before the referring
+    // heap per WAL order (see sibling test).
     for (seq, body) in [(0u32, &b"AAA"[..]), (2, b"CCC")] {
         b.on_toast_chunk(
             ToastChunk {
                 toast_relid: toast_oid,
                 value_id: 1,
                 chunk_seq: seq,
-                source_lsn: 101 + seq as u64,
+                source_lsn: 0,
                 chunk_data: body.to_vec(),
             },
             42,
@@ -466,6 +466,11 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         .await
         .unwrap();
     }
+    // source_lsn=0 to bypass the shadow-replay gate; see sibling test
+    // for the rationale.
+    b.on_heap(heap(rfn, 42, 0, HeapOp::Insert, vec![id_col, body_ptr]))
+        .await
+        .unwrap();
     // Gap only errors with an active store (disabled mode NULL-fills);
     // disk mode with an empty store keeps the in-xact chunks authoritative
     let emitter_cfg = EmitterConfig {

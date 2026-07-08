@@ -49,6 +49,9 @@ pub struct MetricsSnapshot {
     pub xact_bytes_in_memory: u64,
     pub spill_xacts_active: u64,
     pub spill_bytes_active: u64,
+    /// Bytes resident inside an active commit drain (merge heads + in-mem
+    /// tail + unsealed chunk map), the drain-streaming bound
+    pub drain_resident_bytes: u64,
     pub spill_evictions_total: u64,
     pub xacts_committed_total: u64,
     pub xacts_aborted_total: u64,
@@ -262,6 +265,12 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "Bytes currently held across all active xact spill files.",
             "gauge",
             snap.spill_bytes_active,
+        ),
+        (
+            "walshadow_drain_resident_bytes",
+            "Bytes resident inside an active commit drain (merge heads + unsealed chunks).",
+            "gauge",
+            snap.drain_resident_bytes,
         ),
         (
             "walshadow_spill_evictions_total",
