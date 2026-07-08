@@ -391,7 +391,7 @@ mod tests {
             rel_name: RelName::new("walshadow", name),
             kind: 'r',
             persistence: 'p',
-            replident: ReplIdent::Full,
+            replident: ReplIdent::Full { pk_attnums: None },
             attributes: attrs,
         }
     }

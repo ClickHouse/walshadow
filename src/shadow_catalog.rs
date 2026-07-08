@@ -121,8 +121,11 @@ pub enum ReplIdent {
     Default { pk_attnums: Option<Vec<i16>> },
     /// `'n'`. Old-tuple payload empty; emitter drops UPDATE/DELETE
     Nothing,
-    /// `'f'`. Old-tuple payload mirrors every non-dropped column
-    Full,
+    /// `'f'`. Old-tuple payload mirrors every non-dropped column. `pk_attnums`
+    /// (`pg_index.indkey` for `indisprimary`) is still captured so the CH sort
+    /// key can use the primary key — FULL designates no key *index*, but the
+    /// table can still have a PK, and `ORDER BY _lsn` would collapse rows.
+    Full { pk_attnums: Option<Vec<i16>> },
     /// `'i'`. Old-tuple payload carries `indexrelid`'s columns at `key_attnums`
     /// (`pg_index.indkey`)
     UsingIndex {
@@ -1013,7 +1016,21 @@ impl ShadowCatalog {
                 Ok(ReplIdent::Default { pk_attnums })
             }
             'n' => Ok(ReplIdent::Nothing),
-            'f' => Ok(ReplIdent::Full),
+            'f' => {
+                // FULL logs all columns but names no key index; still capture
+                // the PK so the CH ORDER BY uses it instead of `_lsn`.
+                let row = self
+                    .query_opt_retry(
+                        "SELECT indkey::int2[] \
+                         FROM pg_index \
+                         WHERE indrelid = $1 AND indisprimary = true \
+                         LIMIT 1",
+                        &[&rel_oid],
+                    )
+                    .await?;
+                let pk_attnums = row.map(|r| r.get::<_, Vec<i16>>(0));
+                Ok(ReplIdent::Full { pk_attnums })
+            }
             'i' => {
                 // indkey is int2vector; cast to int2[] for tokio-postgres'
                 // Kind::Array(int2) → Vec<i16> decode
