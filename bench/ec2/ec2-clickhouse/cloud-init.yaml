@@ -1,24 +1,15 @@
 #cloud-config
 # Provisions the walshadow ClickHouse destination on a fresh Ubuntu host:
-# installs Docker, then runs clickhouse/clickhouse-server:24.8 with the
-# demo.users destination table pre-created — mirroring the `clickhouse`
-# service in docker/docker-compose.yml.
+# installs Docker, then runs clickhouse/clickhouse-server:24.8. Only the demo
+# database is pre-created — walshadow owns table creation now (overlay-driven
+# scope: config_namespace.auto_create + config_table.replicate auto-create each
+# destination table with descriptor-derived column types), so a hand-pinned
+# demo.users would only drift from the source shape (e.g. bigint→Int64).
 write_files:
   - path: /opt/walshadow/init/clickhouse/01-schema.sql
     permissions: '0644'
     content: |
       CREATE DATABASE IF NOT EXISTS demo;
-      CREATE TABLE IF NOT EXISTS demo.users (
-          id          UInt64,
-          name        String,
-          email       String,
-          _lsn        UInt64,
-          _xid        UInt32,
-          _commit_ts  DateTime64(6, 'UTC'),
-          _is_deleted Bool
-      )
-      ENGINE = ReplacingMergeTree(_lsn, _is_deleted)
-      ORDER BY id;
 runcmd:
   - export DEBIAN_FRONTEND=noninteractive
   - apt-get update

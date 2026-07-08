@@ -35,6 +35,10 @@ case " $* " in
     *" --inserter-pool-size "*) ;;
     *) POOL_ARGS+=(--inserter-pool-size "${WALSHADOW_INSERTER_POOL:-4}") ;;
 esac
+case " $* " in
+    *" --xact-buffer-max "*) ;;
+    *) POOL_ARGS+=(--xact-buffer-max "${WALSHADOW_XACT_BUFFER_MAX:-1073741824}") ;;
+esac
 
 exec walshadow-stream \
     --host "${WALSHADOW_SOURCE_HOST:-source}" \
