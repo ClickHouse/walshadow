@@ -673,7 +673,7 @@ async fn replident_matrix_default_nothing_full_index() {
             },
         ),
         ("wc.nothing_t", ReplIdent::Nothing),
-        ("wc.full_t", ReplIdent::Full),
+        ("wc.full_t", ReplIdent::Full { pk_attnums: None }),
     ];
     for (qualified, expected) in cases {
         let rfn = walrus::pg::walparser::RelFileNode {

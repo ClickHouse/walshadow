@@ -1260,7 +1260,7 @@ fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Decode
 /// delete/update old-key propagation on this, staying agnostic to [`ReplIdent`].
 pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
     match replident {
-        ReplIdent::Full => true,
+        ReplIdent::Full { .. } => true,
         ReplIdent::Nothing => false,
         ReplIdent::Default { pk_attnums } => pk_attnums
             .as_ref()
@@ -1946,7 +1946,7 @@ mod tests {
 
     #[test]
     fn is_replica_identity_attr_matrix() {
-        let full = ReplIdent::Full;
+        let full = ReplIdent::Full { pk_attnums: None };
         let nothing = ReplIdent::Nothing;
         let default_pk = ReplIdent::Default {
             pk_attnums: Some(vec![1, 2]),

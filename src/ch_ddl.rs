@@ -666,6 +666,12 @@ fn replident_key_attnums(desc: &RelDescriptor) -> Vec<i16> {
             pk_attnums: Some(n),
         } => n.clone(),
         crate::shadow_catalog::ReplIdent::UsingIndex { key_attnums, .. } => key_attnums.clone(),
+        // FULL replica identity still exposes the PK (captured in fetch_replident)
+        // so ORDER BY uses the key, not `_lsn` (which would collapse all rows
+        // sharing an `_lsn`, e.g. an entire backfill tagged one LSN).
+        crate::shadow_catalog::ReplIdent::Full {
+            pk_attnums: Some(n),
+        } => n.clone(),
         _ => Vec::new(),
     }
 }
@@ -939,6 +945,27 @@ mod tests {
         assert!(sql.contains("`_is_deleted` Bool"));
         assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`, `_is_deleted`)"));
         assert!(sql.ends_with("ORDER BY (`id`)"));
+    }
+
+    #[test]
+    fn render_create_table_full_replica_identity_orders_by_pk_not_lsn() {
+        // REPLICA IDENTITY FULL exposes no key *index* but the table still has a
+        // PK; ORDER BY must use it, else `ORDER BY _lsn` collapses every row
+        // sharing an `_lsn` (e.g. a whole backfill tagged one LSN).
+        let mut d = desc(
+            "orders",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "body", TEXTOID, false, None),
+            ],
+            None,
+        );
+        d.replident = ReplIdent::Full {
+            pk_attnums: Some(vec![1]),
+        };
+        let sql = render_create_table(&d, "default", false).unwrap().unwrap();
+        assert!(sql.ends_with("ORDER BY (`id`)"), "{sql}");
+        assert!(!sql.contains("ORDER BY _lsn"), "{sql}");
     }
 
     #[test]

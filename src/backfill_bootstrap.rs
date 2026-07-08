@@ -327,7 +327,18 @@ async fn fetch_replident(client: &Client, c: char, rel_oid: Oid) -> Result<ReplI
             Ok(ReplIdent::Default { pk_attnums })
         }
         'n' => Ok(ReplIdent::Nothing),
-        'f' => Ok(ReplIdent::Full),
+        'f' => {
+            // Capture the PK even under FULL so the CH ORDER BY uses it, not `_lsn`.
+            let row = client
+                .query_opt(
+                    "SELECT indkey::int2[] FROM pg_index \
+                     WHERE indrelid = $1 AND indisprimary = true LIMIT 1",
+                    &[&rel_oid],
+                )
+                .await?;
+            let pk_attnums = row.map(|r| r.get::<_, Vec<i16>>(0));
+            Ok(ReplIdent::Full { pk_attnums })
+        }
         'i' => {
             let row = client
                 .query_one(
