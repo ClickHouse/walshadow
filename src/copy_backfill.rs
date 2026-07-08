@@ -57,7 +57,7 @@ use anyhow::Context as _;
 use futures::StreamExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, mpsc, watch};
-use walrus::pg::backup::{format_pg_lsn, parse_pg_lsn};
+use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::conn::PgConfig;
 
 use crate::backfill_staging::{self, StagingPlan, StagingRel, StagingSession};
@@ -71,6 +71,7 @@ use crate::heap_decoder::{
     INT4OID, INT8OID, JSONOID, NAMEOID, NUMERICOID, OIDOID, TEXTOID, TIMEOID, TIMESTAMPOID,
     TIMESTAMPTZOID, UUIDOID, VARCHAROID,
 };
+use crate::pg::{current_wal_lsn, quote_ident};
 use crate::pipeline::{Fatal, bootstrap, tail};
 use crate::runtime_config::InitialLoadMode;
 use crate::shadow_catalog::{RelDescriptor, RelName, ShadowCatalog};
@@ -350,20 +351,6 @@ struct ColPlan {
     kind: WireKind,
 }
 
-/// PG identifier quoting (double-quote, double embedded quotes).
-fn quote_pg_ident(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() + 2);
-    out.push('"');
-    for c in name.chars() {
-        if c == '"' {
-            out.push('"');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
-}
-
 fn wire_kind(type_oid: u32) -> Option<WireKind> {
     Some(match type_oid {
         BOOLOID => WireKind::Bool,
@@ -398,7 +385,7 @@ fn column_plan(desc: &RelDescriptor) -> (String, Vec<ColPlan>, usize) {
         if a.dropped {
             continue;
         }
-        let ident = quote_pg_ident(&a.name);
+        let ident = quote_ident(&a.name);
         let (expr, kind) = match wire_kind(a.type_oid) {
             Some(k) => (ident, k),
             None if a.type_oid == NUMERICOID => (format!("{ident}::text"), WireKind::NumericText),
@@ -1060,8 +1047,8 @@ impl CopyBackfiller {
     ) -> anyhow::Result<CopyOutcome> {
         let qtable = format!(
             "{}.{}",
-            quote_pg_ident(&desc.rel_name.namespace),
-            quote_pg_ident(&desc.rel_name.name)
+            quote_ident(&desc.rel_name.namespace),
+            quote_ident(&desc.rel_name.name)
         );
         let client = open_sql_client(&self.pg)
             .await
@@ -1174,15 +1161,6 @@ struct CopyOutcome {
     p_hi: u64,
 }
 
-async fn current_wal_lsn(client: &tokio_postgres::Client) -> anyhow::Result<u64> {
-    let text: String = client
-        .query_one("SELECT pg_current_wal_lsn()::text", &[])
-        .await
-        .context("backfill: pg_current_wal_lsn")?
-        .get(0);
-    parse_pg_lsn(&text).context("backfill: parse pg_current_wal_lsn")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1291,12 +1269,6 @@ mod tests {
         assert_eq!(plan[0].kind, WireKind::Int8);
         assert_eq!(plan[1].kind, WireKind::NumericText);
         assert_eq!(plan[2].kind, WireKind::CastText);
-    }
-
-    #[test]
-    fn quote_pg_ident_doubles_quotes() {
-        assert_eq!(quote_pg_ident("plain"), "\"plain\"");
-        assert_eq!(quote_pg_ident("we\"ird"), "\"we\"\"ird\"");
     }
 
     #[test]

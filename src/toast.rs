@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use clickhouse_c::{Allocator, AsyncClient, Block, BlockBuilder, Event, TypeAst};
+use roaring::RoaringBitmap;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -86,6 +87,26 @@ pub struct ToastConfig {
     /// Required when `mode = disk`. Persistent across restarts; must not be
     /// the wiped `--spill-dir`.
     pub disk_dir: Option<PathBuf>,
+    /// `gc_interval_secs`: cadence of the dead-chunk sweep
+    /// ([`crate::toast_gc`]). Zero (default) disables GC.
+    pub gc_interval: Duration,
+}
+
+/// Sweep guards (`plans/TOAST.md`): chunks the liveness scans could not
+/// see must survive — a fresh commit's chunks land mid-sweep, a dead
+/// value's OID gets re-allocated and re-put. Candidate scan excludes
+/// values past these bounds and the delete re-checks them.
+#[derive(Debug, Clone, Copy)]
+pub struct GcHorizon {
+    /// `pg_current_wal_lsn()` read before the source liveness scans, with
+    /// the sweep's visibility barrier making every commit `<=` it
+    /// scan-visible; rows above it may belong to commits the scans missed,
+    /// so CH mode considers and deletes only chunk rows with `_lsn <=` this.
+    pub lsn: u64,
+    /// Sweep start instant; disk frames carry no LSN, so a value file
+    /// modified at/after it is skipped (re-put ⇒ live again, next sweep
+    /// re-evaluates).
+    pub scan_start: std::time::SystemTime,
 }
 
 /// Durable chunk store: persist chunks, read them back by value.
@@ -101,6 +122,28 @@ pub trait ChunkStore: Send + Sync {
         toast_relid: u32,
         value_id: u32,
     ) -> Result<BTreeMap<u32, Vec<u8>>, ChunkStoreError>;
+    /// Toast relids with chunks present (GC enumeration).
+    async fn gc_relids(&self) -> Result<Vec<u32>, ChunkStoreError>;
+    /// Dead value ids for one relid: stored − `live`, minus values whose
+    /// max `_lsn` exceeds `horizon.lsn` (fresh commit the scan couldn't
+    /// see, or reused-OID re-put ⇒ live again; LSN-less stores defer that
+    /// guard to `gc_delete`). Anti-join runs inside the scan so peak
+    /// memory is O(dead), never O(stored).
+    async fn gc_dead_values(
+        &self,
+        toast_relid: u32,
+        live: &RoaringBitmap,
+        horizon: &GcHorizon,
+    ) -> Result<RoaringBitmap, ChunkStoreError>;
+    /// Delete dead values' chunks, guarded by `horizon` against puts
+    /// landing after candidate computation. Idempotent; returns values
+    /// actually deleted (may undershoot `dead` via the horizon guard).
+    async fn gc_delete(
+        &self,
+        toast_relid: u32,
+        dead: &RoaringBitmap,
+        horizon: &GcHorizon,
+    ) -> Result<u64, ChunkStoreError>;
 }
 
 /// On-disk chunk store. One file per value at
@@ -111,13 +154,20 @@ pub trait ChunkStore: Send + Sync {
 /// bootstrap walk.
 pub struct DiskChunkStore {
     dir: PathBuf,
+    /// Serializes `put`'s open-append against `gc_delete`'s stat-unlink: an
+    /// unlink between them would strand the append on an orphaned inode
+    /// (silent chunk loss).
+    gc_lock: Mutex<()>,
 }
 
 impl DiskChunkStore {
     /// Create the root dir. Synchronous: called once at daemon start.
     pub fn new(dir: PathBuf) -> Result<Self, ChunkStoreError> {
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            gc_lock: Mutex::new(()),
+        })
     }
 
     pub fn dir(&self) -> &Path {
@@ -165,6 +215,7 @@ impl ChunkStore for DiskChunkStore {
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&c.chunk_data);
             }
+            let _guard = self.gc_lock.lock().await;
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -206,6 +257,73 @@ impl ChunkStore for DiskChunkStore {
         }
         Ok(out)
     }
+
+    async fn gc_relids(&self) -> Result<Vec<u32>, ChunkStoreError> {
+        numeric_entries(&self.dir, |name| name.parse().ok()).await
+    }
+
+    async fn gc_dead_values(
+        &self,
+        toast_relid: u32,
+        live: &RoaringBitmap,
+        _horizon: &GcHorizon,
+    ) -> Result<RoaringBitmap, ChunkStoreError> {
+        // Frames carry no LSN; gc_delete's mtime guard stands in for the
+        // horizon. Anti-join filters during the dir walk.
+        let dir = self.dir.join(toast_relid.to_string());
+        let ids = numeric_entries(&dir, |name| {
+            name.strip_suffix(".chunks")
+                .and_then(|s| s.parse().ok())
+                .filter(|id| !live.contains(*id))
+        })
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn gc_delete(
+        &self,
+        toast_relid: u32,
+        dead: &RoaringBitmap,
+        horizon: &GcHorizon,
+    ) -> Result<u64, ChunkStoreError> {
+        let mut deleted = 0u64;
+        for value_id in dead {
+            let path = self.value_path(toast_relid, value_id);
+            let _guard = self.gc_lock.lock().await;
+            let meta = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            // Appended at/after sweep start: may be a reused-OID re-put past
+            // the scan snapshot — live again, next sweep re-evaluates.
+            if meta.modified()? >= horizon.scan_start {
+                continue;
+            }
+            tokio::fs::remove_file(&path).await?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+}
+
+/// Directory entries whose names `parse` accepts; missing dir ⇒ empty.
+async fn numeric_entries<T>(
+    dir: &Path,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, ChunkStoreError> {
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    while let Some(entry) = rd.next_entry().await? {
+        if let Some(v) = entry.file_name().to_str().and_then(&parse) {
+            out.push(v);
+        }
+    }
+    Ok(out)
 }
 
 /// CH server error codes treated as "no chunks for this relid" rather than a
@@ -213,6 +331,9 @@ impl ChunkStore for DiskChunkStore {
 /// finds no such table/database, mirroring the disk store's missing-file path.
 const CH_UNKNOWN_TABLE: i32 = 60;
 const CH_UNKNOWN_DATABASE: i32 = 81;
+
+/// Value ids per GC `DELETE` statement, bounding SQL size.
+const GC_DELETE_BATCH: usize = 8192;
 
 /// Connection + per-process table-creation cache, behind one mutex. A single
 /// client suffices: toast ops are off the hot path (bootstrap baseline +
@@ -260,6 +381,9 @@ pub struct ClickHouseChunkStore {
     /// For [`BlockBuilder`] + [`TypeAst`] on the `put` path. `Copy`, `Sync`.
     alloc: Allocator,
     state: Mutex<ChState>,
+    /// GC's own connection: a sweep's synchronous lightweight DELETE must
+    /// not hold `state` against commit-drain `put`s.
+    gc_state: Mutex<ChState>,
     retry: RetryConfig,
     query_timeout: Duration,
 }
@@ -277,6 +401,10 @@ impl ClickHouseChunkStore {
             database,
             alloc: Allocator::global(&mimalloc::MiMalloc),
             state: Mutex::new(ChState {
+                client: None,
+                created: HashSet::new(),
+            }),
+            gc_state: Mutex::new(ChState {
                 client: None,
                 created: HashSet::new(),
             }),
@@ -306,6 +434,55 @@ impl ClickHouseChunkStore {
         format!(
             "INSERT INTO {} (`chunk_id`, `chunk_seq`, `chunk_data`, `_lsn`) FORMAT Native",
             self.toast_table(toast_relid)
+        )
+    }
+
+    /// GC enumeration: every `pg_toast_*` table in the dest db; foreign
+    /// names are filtered at parse ([`read_relid_block`]).
+    fn gc_relids_sql(&self) -> String {
+        format!(
+            "SELECT `name` FROM `system`.`tables` WHERE `database` = {} AND `name` LIKE 'pg_toast_%'",
+            quote_str(&self.database)
+        )
+    }
+
+    /// Candidate scan server-side: in-order aggregation streams over the
+    /// `(chunk_id, chunk_seq)` sort key (no whole-table hash agg on the
+    /// server), `HAVING` drops values put past the horizon (fresh commit
+    /// the liveness scan couldn't see, reused OID ⇒ live again) before
+    /// they cross the wire.
+    fn gc_dead_values_sql(&self, toast_relid: u32, horizon_lsn: u64) -> String {
+        format!(
+            "SELECT `chunk_id` FROM {} GROUP BY `chunk_id` HAVING max(`_lsn`) <= {} \
+             SETTINGS optimize_aggregation_in_order = 1",
+            self.toast_table(toast_relid),
+            horizon_lsn
+        )
+    }
+
+    /// Lightweight DELETE, not tombstone rows: RMT reclaims tombstones only
+    /// on merge, and parts holding dead-forever values may never merge again.
+    /// The `_lsn` predicate re-excludes puts landing between candidate
+    /// computation and apply, with no coordination against `put`.
+    fn gc_delete_sql(&self, toast_relid: u32, value_ids: &[u32], horizon_lsn: u64) -> String {
+        format!(
+            "DELETE FROM {} WHERE `_lsn` <= {} AND `chunk_id` IN ({})",
+            self.toast_table(toast_relid),
+            horizon_lsn,
+            in_list(value_ids)
+        )
+    }
+
+    /// Values the paired DELETE actually holds rows for: distinct candidate
+    /// `chunk_id`s with rows at/under the horizon. Read before the DELETE —
+    /// nothing else deletes, and puts landing between carry `_lsn` past the
+    /// horizon, so the count is exact.
+    fn gc_count_sql(&self, toast_relid: u32, value_ids: &[u32], horizon_lsn: u64) -> String {
+        format!(
+            "SELECT countDistinct(`chunk_id`) FROM {} WHERE `_lsn` <= {} AND `chunk_id` IN ({})",
+            self.toast_table(toast_relid),
+            horizon_lsn,
+            in_list(value_ids)
         )
     }
 
@@ -398,17 +575,17 @@ impl ClickHouseChunkStore {
         Ok(())
     }
 
-    async fn fetch_locked(
+    /// One SELECT drained to EndOfStream under the pool's bounded
+    /// reconnect/retry + per-attempt timeout, rows accumulated via `parse`
+    /// (Native streams one block at a time, never one unbounded buffered
+    /// read). No table/db => empty rows, not a fault — mirrors the disk
+    /// store's missing-file path.
+    async fn query_locked<A: Default>(
         &self,
         state: &mut ChState,
-        toast_relid: u32,
-        value_id: u32,
-    ) -> Result<BTreeMap<u32, Vec<u8>>, EmitterError> {
-        let sql = format!(
-            "SELECT `chunk_seq`, `chunk_data` FROM {} WHERE `chunk_id` = {} ORDER BY `chunk_seq`",
-            self.toast_table(toast_relid),
-            value_id
-        );
+        sql: &str,
+        parse: impl Fn(&Block, &mut A) -> Result<(), EmitterError>,
+    ) -> Result<A, EmitterError> {
         let mut attempt = 0u32;
         let mut backoff = self.retry.initial_backoff;
         loop {
@@ -418,14 +595,11 @@ impl ClickHouseChunkStore {
             let res = {
                 let client = state.client.as_mut().expect("just connected");
                 match tokio::time::timeout(self.query_timeout, async {
-                    client.send_query(&sql, None).await?;
-                    let mut out: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+                    client.send_query(sql, None).await?;
+                    let mut out = A::default();
                     loop {
                         match client.recv_event().await? {
-                            // Native streams the result one block at a time, so
-                            // a large value pages in naturally — never one
-                            // unbounded buffered read.
-                            Event::Data(block) => read_chunk_block(&block, &mut out)?,
+                            Event::Data(block) => parse(&block, &mut out)?,
                             Event::EndOfStream => break,
                             Event::Exception(exc) => {
                                 return Err(EmitterError::ServerException {
@@ -449,12 +623,10 @@ impl ClickHouseChunkStore {
             };
             match res {
                 Ok(out) => return Ok(out),
-                // No table/db => no chunks ever stored for this relid; surface
-                // an empty map (caller decides fill vs. error), not a fault.
                 Err(EmitterError::ServerException { code, .. })
                     if code == CH_UNKNOWN_TABLE || code == CH_UNKNOWN_DATABASE =>
                 {
-                    return Ok(BTreeMap::new());
+                    return Ok(A::default());
                 }
                 Err(e) if is_retryable(&e) && attempt < self.retry.max_attempts => {
                     attempt += 1;
@@ -466,11 +638,48 @@ impl ClickHouseChunkStore {
             }
         }
     }
+
+    async fn fetch_locked(
+        &self,
+        state: &mut ChState,
+        toast_relid: u32,
+        value_id: u32,
+    ) -> Result<BTreeMap<u32, Vec<u8>>, EmitterError> {
+        let sql = format!(
+            "SELECT `chunk_seq`, `chunk_data` FROM {} WHERE `chunk_id` = {} ORDER BY `chunk_seq`",
+            self.toast_table(toast_relid),
+            value_id
+        );
+        self.query_locked(state, &sql, read_chunk_block).await
+    }
 }
 
-/// Append one fetched Data block's `(chunk_seq UInt32, chunk_data String)`
-/// rows into `out`. Column order matches the `SELECT`. The header block
-/// (0 rows) contributes nothing.
+/// CH string literal: single-quoted, backslash + quote escaped.
+fn quote_str(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// `IN (…)` body for a value-id batch.
+fn in_list(value_ids: &[u32]) -> String {
+    use std::fmt::Write as _;
+    // ilog10+1 digits, +1 comma
+    let cap = value_ids
+        .iter()
+        .map(|id| id.checked_ilog10().unwrap_or(0) as usize + 2)
+        .sum();
+    let mut s = String::with_capacity(cap);
+    for (i, id) in value_ids.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        write!(s, "{id}").unwrap();
+    }
+    s
+}
+
+/// Insert one fetched Data block's `(chunk_seq UInt32, chunk_data String)`
+/// rows into `out`, last-wins by seq matching the append-file dedup. Column
+/// order matches the `SELECT`. The header block (0 rows) contributes nothing.
 fn read_chunk_block(block: &Block, out: &mut BTreeMap<u32, Vec<u8>>) -> Result<(), EmitterError> {
     let n = block.n_rows();
     if n == 0 {
@@ -502,6 +711,83 @@ fn read_chunk_block(block: &Block, out: &mut BTreeMap<u32, Vec<u8>>) -> Result<(
     Ok(())
 }
 
+/// `(name String)` rows → toast relids parsed from `pg_toast_<relid>`;
+/// non-matching names skipped.
+fn read_relid_block(block: &Block, out: &mut Vec<u32>) -> Result<(), EmitterError> {
+    let n = block.n_rows();
+    if n == 0 {
+        return Ok(());
+    }
+    let (offsets, data) = block
+        .column(0)
+        .and_then(|c| c.string())
+        .ok_or_else(|| EmitterError::Type("toast gc: name not String".into()))?;
+    for i in 0..n {
+        let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
+        let end = offsets[i] as usize;
+        if let Some(relid) = std::str::from_utf8(&data[start..end])
+            .ok()
+            .and_then(|s| s.strip_prefix("pg_toast_"))
+            .and_then(|s| s.parse().ok())
+        {
+            out.push(relid);
+        }
+    }
+    Ok(())
+}
+
+/// `(chunk_id UInt32)` rows surviving the anti-join against `live`,
+/// filtered per block so peak memory stays O(dead).
+fn read_dead_block(
+    block: &Block,
+    live: &RoaringBitmap,
+    out: &mut RoaringBitmap,
+) -> Result<(), EmitterError> {
+    let n = block.n_rows();
+    if n == 0 {
+        return Ok(());
+    }
+    let (elem, ids) = block
+        .column(0)
+        .and_then(|c| c.fixed())
+        .ok_or_else(|| EmitterError::Type("toast gc: chunk_id not fixed-width".into()))?;
+    if elem != 4 {
+        return Err(EmitterError::Type(format!(
+            "toast gc: chunk_id elem size {elem} != 4"
+        )));
+    }
+    for i in 0..n {
+        let id = u32::from_le_bytes(ids[i * 4..i * 4 + 4].try_into().unwrap());
+        if !live.contains(id) {
+            out.insert(id);
+        }
+    }
+    Ok(())
+}
+
+/// Single `UInt64` aggregate row (count).
+fn read_count_block(block: &Block, out: &mut Vec<u64>) -> Result<(), EmitterError> {
+    let n = block.n_rows();
+    if n == 0 {
+        return Ok(());
+    }
+    let (elem, bytes) = block
+        .column(0)
+        .and_then(|c| c.fixed())
+        .ok_or_else(|| EmitterError::Type("toast gc: count not fixed-width".into()))?;
+    if elem != 8 {
+        return Err(EmitterError::Type(format!(
+            "toast gc: count elem size {elem} != 8"
+        )));
+    }
+    for i in 0..n {
+        out.push(u64::from_le_bytes(
+            bytes[i * 8..i * 8 + 8].try_into().unwrap(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ChunkStore for ClickHouseChunkStore {
     async fn put(&self, chunks: &[ToastChunk]) -> Result<(), ChunkStoreError> {
@@ -523,6 +809,65 @@ impl ChunkStore for ClickHouseChunkStore {
         self.fetch_locked(&mut state, toast_relid, value_id)
             .await
             .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
+    }
+
+    async fn gc_relids(&self) -> Result<Vec<u32>, ChunkStoreError> {
+        let mut state = self.gc_state.lock().await;
+        self.query_locked(&mut state, &self.gc_relids_sql(), read_relid_block)
+            .await
+            .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
+    }
+
+    async fn gc_dead_values(
+        &self,
+        toast_relid: u32,
+        live: &RoaringBitmap,
+        horizon: &GcHorizon,
+    ) -> Result<RoaringBitmap, ChunkStoreError> {
+        let mut state = self.gc_state.lock().await;
+        self.query_locked(
+            &mut state,
+            &self.gc_dead_values_sql(toast_relid, horizon.lsn),
+            |block, out| read_dead_block(block, live, out),
+        )
+        .await
+        .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
+    }
+
+    async fn gc_delete(
+        &self,
+        toast_relid: u32,
+        dead: &RoaringBitmap,
+        horizon: &GcHorizon,
+    ) -> Result<u64, ChunkStoreError> {
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let mut state = self.gc_state.lock().await;
+        // Batch to bound statement size; each DELETE is idempotent.
+        let mut deleted = 0u64;
+        let mut iter = dead.iter().peekable();
+        let mut batch: Vec<u32> = Vec::with_capacity(GC_DELETE_BATCH.min(dead.len() as usize));
+        while iter.peek().is_some() {
+            batch.extend(iter.by_ref().take(GC_DELETE_BATCH));
+            // Count first: DELETE reports no affected rows, and the horizon
+            // freezes the counted set (interleaved puts land past it).
+            let counts = self
+                .query_locked(
+                    &mut state,
+                    &self.gc_count_sql(toast_relid, &batch, horizon.lsn),
+                    read_count_block,
+                )
+                .await
+                .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))?;
+            let sql = self.gc_delete_sql(toast_relid, &batch, horizon.lsn);
+            self.exec_write(&mut state, &sql, None)
+                .await
+                .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))?;
+            deleted += counts.iter().sum::<u64>();
+            batch.clear();
+        }
+        Ok(deleted)
     }
 }
 
@@ -598,6 +943,13 @@ impl ToastResolver {
     /// disabled mode.
     pub fn stores_chunks(&self) -> bool {
         self.store.is_some()
+    }
+
+    /// Shared store handle for the GC sweep ([`crate::toast_gc`]); sharing
+    /// (not a second instance) is what serializes disk-mode delete against
+    /// put. `None` for disabled mode — nothing to collect.
+    pub fn store(&self) -> Option<Arc<dyn ChunkStore>> {
+        self.store.clone()
     }
 
     /// Whether an unresolved pointer should NULL/default-fill rather than
@@ -744,6 +1096,99 @@ mod tests {
         assert_eq!(got.len(), 2, "torn tail ignored, clean prefix kept");
         assert_eq!(got.get(&0).unwrap(), b"good");
         assert_eq!(got.get(&1).unwrap(), b"alsogood");
+    }
+
+    #[tokio::test]
+    async fn disk_store_gc_lists_and_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::new(tmp.path().to_path_buf()).unwrap();
+        store
+            .put(&[
+                chunk(16500, 7, 0, b"abc"),
+                chunk(16500, 9, 0, b"zz"),
+                chunk(16600, 3, 0, b"xy"),
+            ])
+            .await
+            .unwrap();
+
+        let mut relids = store.gc_relids().await.unwrap();
+        relids.sort_unstable();
+        assert_eq!(relids, vec![16500, 16600]);
+        // scan_start in the future: every file's mtime precedes it
+        let horizon = GcHorizon {
+            lsn: u64::MAX,
+            scan_start: std::time::SystemTime::now() + Duration::from_secs(60),
+        };
+        let none_live = RoaringBitmap::new();
+        let dead = store
+            .gc_dead_values(16500, &none_live, &horizon)
+            .await
+            .unwrap();
+        assert_eq!(dead.iter().collect::<Vec<_>>(), vec![7, 9]);
+        // Live ids filtered during the dir walk
+        let live: RoaringBitmap = [9].into_iter().collect();
+        let dead = store.gc_dead_values(16500, &live, &horizon).await.unwrap();
+        assert_eq!(dead.iter().collect::<Vec<_>>(), vec![7]);
+        assert!(
+            store
+                .gc_dead_values(404, &none_live, &horizon)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(store.gc_delete(16500, &dead, &horizon).await.unwrap(), 1);
+        assert!(store.fetch(16500, 7).await.unwrap().is_empty());
+        assert!(!store.fetch(16500, 9).await.unwrap().is_empty());
+        // Idempotent: already gone
+        assert_eq!(store.gc_delete(16500, &dead, &horizon).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn disk_store_gc_delete_skips_fresh_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::new(tmp.path().to_path_buf()).unwrap();
+        store.put(&[chunk(1, 1, 0, b"live-again")]).await.unwrap();
+        // scan_start before the put's mtime models a re-put after the sweep
+        // began (reused OID): value skipped, chunks intact
+        let horizon = GcHorizon {
+            lsn: u64::MAX,
+            scan_start: std::time::SystemTime::UNIX_EPOCH,
+        };
+        let dead: RoaringBitmap = [1].into_iter().collect();
+        assert_eq!(store.gc_delete(1, &dead, &horizon).await.unwrap(), 0);
+        assert_eq!(
+            store.fetch(1, 1).await.unwrap().get(&0).unwrap(),
+            b"live-again"
+        );
+    }
+
+    #[test]
+    fn ch_store_renders_gc_sql() {
+        let cfg = EmitterConfig {
+            database: "wh".into(),
+            ..Default::default()
+        };
+        let store = ClickHouseChunkStore::new(cfg);
+        assert_eq!(
+            store.gc_relids_sql(),
+            "SELECT `name` FROM `system`.`tables` \
+             WHERE `database` = 'wh' AND `name` LIKE 'pg_toast_%'"
+        );
+        assert_eq!(
+            store.gc_dead_values_sql(16500, 0x2000),
+            "SELECT `chunk_id` FROM `wh`.`pg_toast_16500` GROUP BY `chunk_id` \
+             HAVING max(`_lsn`) <= 8192 SETTINGS optimize_aggregation_in_order = 1"
+        );
+        assert_eq!(
+            store.gc_delete_sql(16500, &[7, 9], 0x2000),
+            "DELETE FROM `wh`.`pg_toast_16500` WHERE `_lsn` <= 8192 AND `chunk_id` IN (7,9)"
+        );
+        assert_eq!(
+            store.gc_count_sql(16500, &[7, 9], 0x2000),
+            "SELECT countDistinct(`chunk_id`) FROM `wh`.`pg_toast_16500` \
+             WHERE `_lsn` <= 8192 AND `chunk_id` IN (7,9)"
+        );
     }
 
     #[tokio::test]

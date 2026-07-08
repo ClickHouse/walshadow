@@ -141,6 +141,10 @@ pub struct PipelineHandle {
     /// the standby `apply_lsn` and writes it to the resume cursor.
     pub emitter_ack: Arc<AtomicU64>,
     pub fatal: Fatal,
+    /// Resolver shared by decode + reorder; the daemon's GC sweep
+    /// ([`crate::toast_gc`]) borrows its store so disk-mode delete
+    /// serializes against put.
+    pub toast: crate::toast::ToastResolver,
     decoders: Vec<JoinHandle<()>>,
     tail: tail::TailParts,
 }
@@ -236,7 +240,7 @@ impl PipelineConfig {
             jobs_tx,
             msg_tx,
             stats,
-            resolver,
+            resolver.clone(),
             config_resolver,
             backfiller,
             fatal.clone(),
@@ -250,6 +254,7 @@ impl PipelineConfig {
             PipelineHandle {
                 emitter_ack,
                 fatal,
+                toast: resolver,
                 decoders,
                 tail,
             },

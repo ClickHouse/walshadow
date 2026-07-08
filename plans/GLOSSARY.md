@@ -507,6 +507,14 @@ chunks so reassembly doesn't depend on WAL adjacency: `disabled`
 in `pg_toast_<relid>` ReplacingMergeTree table)
 ([TOAST.md](TOAST.md))
 
+**toast GC sweep** — periodic source anti-join reclaim of dead chunk
+values (`[toast] gc_interval_secs`): `pre = pg_current_wal_lsn()` +
+snapshot-visibility barrier before the scans, live `chunk_id`s from the
+source toast rel, `S = pg_current_wal_lsn()` after the scans, delete
+gated on `emitter_ack ≥ S`; `_lsn <= pre` / mtime guards keep chunks the
+scans couldn't see (fresh commits, reused-OID re-puts)
+([TOAST.md](TOAST.md))
+
 **ToastPointer / ExternalToast** — on-disk external varlena pointer
 (`va_toastrelid`, `va_valueid`, `va_extinfo`, `va_rawsize`) surfacing as
 `ColumnValue::ExternalToast`; resolved via xact-buffer reassembly or

@@ -52,6 +52,7 @@ use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig};
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
+use walshadow::pg::quote_ident;
 use walshadow::pipeline::{Fatal, PipelineConfig, PipelineHandle, bootstrap, tail};
 use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
@@ -1013,6 +1014,7 @@ async fn run(args: Args) -> Result<()> {
         // plans/future/pipeline_backpressure_and_scaling.md (Handoff step 3).
         let emitter_ack = Arc::new(AtomicU64::new(raw_start));
         pipeline_ack = Some(emitter_ack.clone());
+        let toast_gc_interval = emitter_cfg.toast.gc_interval;
         let pcfg = PipelineConfig {
             emitter: emitter_cfg,
             decoder_pool_size: args.decoder_pool_size,
@@ -1025,7 +1027,7 @@ async fn run(args: Args) -> Result<()> {
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             schema_events: Some(schema_events.clone()),
             pending_sweeps: Some(pending_sweeps.clone()),
-            stats,
+            stats: stats.clone(),
             span_registry: span_registry.clone(),
             config_resolver: config_resolver.clone(),
             backfiller: copy_backfiller.clone(),
@@ -1034,6 +1036,32 @@ async fn run(args: Args) -> Result<()> {
             .spawn(emitter_ack)
             .await
             .context("spawn decode+insert pipeline")?;
+        // Toast chunk GC: source anti-join sweep off the hot path, borrowing
+        // the pipeline's store so disk-mode delete serializes against put.
+        if toast_gc_interval > Duration::ZERO {
+            if let Some(store) = handle.toast.store() {
+                // Detached task: dropping the JoinHandle never cancels it
+                let _toast_gc_task = walshadow::toast_gc::ToastGc {
+                    store,
+                    source: cfg.clone(),
+                    emitter_ack: handle.emitter_ack.clone(),
+                    interval: toast_gc_interval,
+                    ack_wait: toast_gc_interval.min(Duration::from_secs(60)),
+                    stats: stats.clone(),
+                }
+                .spawn();
+                tracing::info!(
+                    target: "walshadow::toast_gc",
+                    interval_secs = toast_gc_interval.as_secs(),
+                    "toast chunk GC armed",
+                );
+            } else {
+                tracing::warn!(
+                    target: "walshadow::toast_gc",
+                    "[toast] gc_interval_secs set but mode = disabled; nothing to collect",
+                );
+            }
+        }
         pipeline_handle = Some(handle);
         tracing::info!(
             target: "walshadow::pipeline",
@@ -1505,11 +1533,6 @@ async fn open_shadow_sql_client(
     Ok(client)
 }
 
-/// Quote a SQL identifier: wrap in double quotes, double any embedded quote.
-fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
-
 /// Seed the resolver overlay from source PG's `<schema>.config_*` tables via
 /// the sidecar libpq connection (plan §7). Refuses (Err → daemon exits) when
 /// the schema is named but not installed, or the install is newer than this
@@ -1977,6 +2000,19 @@ async fn populate_metrics(
         decoder_partial_total: decoder_stats.partial.load(Ordering::Relaxed),
         decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
         decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
+        decoder_toast_deletes_total: decoder_stats.toast_chunk_deletes.load(Ordering::Relaxed),
+        toast_gc_sweeps_total: emitter_stats
+            .map(|s| s.toast_gc_sweeps.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_gc_values_deleted_total: emitter_stats
+            .map(|s| s.toast_gc_values_deleted.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_gc_skipped_source_unreachable_total: emitter_stats
+            .map(|s| {
+                s.toast_gc_skipped_source_unreachable
+                    .load(Ordering::Relaxed)
+            })
+            .unwrap_or(0),
         emitter_rows_total: emitter_stats
             .map(|s| s.rows_emitted.load(Ordering::Relaxed))
             .unwrap_or(0),

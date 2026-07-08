@@ -477,6 +477,7 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         toast: ToastConfig {
             mode: ToastMode::Disk,
             disk_dir: Some(tmp.path().join("toast-store")),
+            ..Default::default()
         },
         ..Default::default()
     };
