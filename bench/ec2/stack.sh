@@ -83,13 +83,18 @@ up() {
   [ "$setup" = pg ] && ch=false
   echo "▲ bringing up '$setup' (streamer: $dir)"
   apply_setup "$setup" "$ch" "$(tfvar bench_runner false)"
+  # Base source-PG post-boot setup (runtime-config overlay + replicate-all seed);
+  # idempotent, runs before the streamer's deploy so the daemon seeds from it.
+  if [ -x ec2-source-pg/deploy.sh ]; then ( cd ec2-source-pg && ./deploy.sh ); fi
   if [ -x "$dir/deploy.sh" ]; then ( cd "$dir" && ./deploy.sh ); fi
   echo "✅ '$setup' up"
 }
 
 down() {
+  local all=false a
+  for a in "$@"; do [ "$a" = "--all" ] && all=true; done
   pre_down
-  if [ "${1:-}" = "--all" ]; then
+  if [ "$all" = true ]; then
     tf destroy
     rm -f "$TFVARS"
     echo "✅ everything down"
@@ -123,7 +128,7 @@ status() {
 cmd="${1:-}"; shift || true
 case "$cmd" in
   up)     [ $# -ge 1 ] || { usage; exit 1; }; up "$1" ;;
-  down)   down "${1:-}" ;;
+  down)   down "$@" ;;
   bench)  bench "${1:-}" ;;
   status) status ;;
   *)      usage; exit 1 ;;
