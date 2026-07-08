@@ -13,6 +13,16 @@
 //! monotonic in seq, so the contiguous-done commit_lsn never claims
 //! durability for a later seq whose rows are still in flight.
 //!
+//! ## Commit groups
+//!
+//! One commit may span several seqs (drain-stream batches, DDL-barrier
+//! segments), all carrying the same `commit_lsn`. Only the commit's *final*
+//! seq publishes: a non-final slice registered via
+//! [`AckHandle::register_partial`] gates contiguity but never advances
+//! `emitter_ack` — else the first durable slice would claim the whole
+//! commit while later slices are still in flight, and a restart would
+//! resume past never-inserted rows.
+//!
 //! Invariant: inserter sends [`AckEvent::Acked`] only *after* drain-to-
 //! `EndOfStream`. A row placed but never acked pins the watermark forever;
 //! the daemon's stall watchdog escalates that.
@@ -25,10 +35,13 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub enum AckEvent {
-    /// In seq order, no gaps.
+    /// In seq order, no gaps. `publish: false` marks a non-final slice of a
+    /// multi-seq commit: done-ness gates contiguity, `commit_lsn` never
+    /// publishes.
     Register {
         seq: u64,
         commit_lsn: u64,
+        publish: bool,
     },
     Placed {
         seq: u64,
@@ -46,6 +59,7 @@ pub enum AckEvent {
 
 struct SeqState {
     commit_lsn: u64,
+    publish: bool,
     placed: Option<u64>,
     acked: u64,
 }
@@ -91,7 +105,11 @@ impl AckState {
 
     pub fn apply(&mut self, ev: AckEvent) {
         match ev {
-            AckEvent::Register { seq, commit_lsn } => self.register(seq, commit_lsn),
+            AckEvent::Register {
+                seq,
+                commit_lsn,
+                publish,
+            } => self.register(seq, commit_lsn, publish),
             AckEvent::Placed { seq, rows } => self.placed(seq, rows),
             AckEvent::Acked { counts } => {
                 for (seq, n) in counts {
@@ -102,11 +120,12 @@ impl AckState {
         }
     }
 
-    fn register(&mut self, seq: u64, commit_lsn: u64) {
+    fn register(&mut self, seq: u64, commit_lsn: u64, publish: bool) {
         self.map.insert(
             seq,
             SeqState {
                 commit_lsn,
+                publish,
                 placed: None,
                 acked: 0,
             },
@@ -137,14 +156,16 @@ impl AckState {
     }
 
     /// Drain the contiguous done prefix, advancing `emitter_ack` to the last
-    /// done seq's `commit_lsn` and publishing the new frontier.
+    /// done *publishing* seq's `commit_lsn` and publishing the new frontier.
     fn advance(&mut self) {
         let mut moved = false;
         while let Some(s) = self.map.get(&self.next_expected) {
             if !s.done() {
                 break;
             }
-            self.emitter_ack.fetch_max(s.commit_lsn, Ordering::Release);
+            if s.publish {
+                self.emitter_ack.fetch_max(s.commit_lsn, Ordering::Release);
+            }
             self.map.remove(&self.next_expected);
             self.next_expected += 1;
             moved = true;
@@ -197,8 +218,24 @@ pub struct AckHandle {
 }
 
 impl AckHandle {
+    /// Register a commit's final (or only) seq; its `commit_lsn` publishes
+    /// once the contiguous-done frontier passes it.
     pub fn register(&self, seq: u64, commit_lsn: u64) {
-        let _ = self.tx.send(AckEvent::Register { seq, commit_lsn });
+        let _ = self.tx.send(AckEvent::Register {
+            seq,
+            commit_lsn,
+            publish: true,
+        });
+    }
+
+    /// Register a non-final slice of a multi-seq commit: counts toward
+    /// contiguity but never advances `emitter_ack` (see module doc).
+    pub fn register_partial(&self, seq: u64, commit_lsn: u64) {
+        let _ = self.tx.send(AckEvent::Register {
+            seq,
+            commit_lsn,
+            publish: false,
+        });
     }
 
     pub fn placed(&self, seq: u64, rows: u64) {
@@ -282,7 +319,7 @@ mod tests {
     fn in_order_advances_to_each_commit() {
         let (mut s, ack) = state();
         for seq in 0..3u64 {
-            s.register(seq, (seq + 1) * 100);
+            s.register(seq, (seq + 1) * 100, true);
             s.placed(seq, 2);
             s.acked(seq, 2);
         }
@@ -293,9 +330,9 @@ mod tests {
     #[test]
     fn out_of_order_done_holds_watermark_until_gap_fills() {
         let (mut s, ack) = state();
-        s.register(0, 100);
-        s.register(1, 200);
-        s.register(2, 300);
+        s.register(0, 100, true);
+        s.register(1, 200, true);
+        s.register(2, 300, true);
         // seq 2 done first, watermark stays at 0
         s.placed(2, 1);
         s.acked(2, 1);
@@ -315,7 +352,7 @@ mod tests {
     #[test]
     fn empty_or_abort_seq_is_done_when_placed_zero() {
         let (mut s, ack) = state();
-        s.register(0, 100);
+        s.register(0, 100, true);
         s.placed(0, 0); // abort/empty
         assert_eq!(ack.load(Ordering::Acquire), 100);
         assert!(s.all_done());
@@ -324,7 +361,7 @@ mod tests {
     #[test]
     fn rows_split_across_batches_complete_at_total() {
         let (mut s, ack) = state();
-        s.register(0, 100);
+        s.register(0, 100, true);
         s.placed(0, 5);
         s.acked(0, 2);
         assert_eq!(ack.load(Ordering::Acquire), 0); // 2/5 acked
@@ -335,7 +372,7 @@ mod tests {
     #[test]
     fn acked_before_placed_still_completes() {
         let (mut s, ack) = state();
-        s.register(0, 100);
+        s.register(0, 100, true);
         s.acked(0, 3);
         assert_eq!(ack.load(Ordering::Acquire), 0); // placed still unknown
         s.placed(0, 3);
@@ -348,9 +385,9 @@ mod tests {
         let (ftx, _frx) = watch::channel(0u64);
         let (ptx, prx) = watch::channel(0u64);
         let mut s = AckState::new(ack, ftx, ptx);
-        s.register(0, 100);
-        s.register(1, 200);
-        s.register(2, 300);
+        s.register(0, 100, true);
+        s.register(1, 200, true);
+        s.register(2, 300, true);
         // Place 0 and 2 out of order; frontier stops at gap (1)
         s.placed(2, 1);
         assert_eq!(*prx.borrow(), 0);
@@ -370,7 +407,7 @@ mod tests {
         let (mut s, ack) = state();
         let n = 50_000u64;
         for seq in 0..n {
-            s.register(seq, (seq + 1) * 10);
+            s.register(seq, (seq + 1) * 10, true);
             s.placed(seq, 1); // nothing acked yet
         }
         assert_eq!(ack.load(Ordering::Acquire), 0);
@@ -382,10 +419,67 @@ mod tests {
         assert_eq!(ack.load(Ordering::Acquire), n * 10);
     }
 
+    /// First durable slice of a multi-slice commit must not publish the
+    /// commit LSN: a restart at that point would resume past rows still in
+    /// the later slices.
+    #[test]
+    fn partial_slices_never_publish_commit_lsn() {
+        let (mut s, ack) = state();
+        s.register(0, 500, false);
+        s.register(1, 500, false);
+        s.register(2, 500, true); // final slice
+        s.placed(0, 1);
+        s.acked(0, 1);
+        assert_eq!(ack.load(Ordering::Acquire), 0, "first slice durable");
+        s.placed(1, 1);
+        s.acked(1, 1);
+        assert_eq!(ack.load(Ordering::Acquire), 0, "second slice durable");
+        s.placed(2, 1);
+        s.acked(2, 1);
+        assert_eq!(ack.load(Ordering::Acquire), 500, "final slice publishes");
+        assert!(s.all_done());
+    }
+
+    /// Final slice done out of order still waits for earlier partial slices
+    /// (contiguity), then one advance publishes exactly once.
+    #[test]
+    fn final_slice_blocked_by_earlier_partial_gap() {
+        let (mut s, ack) = state();
+        s.register(0, 500, false);
+        s.register(1, 500, true);
+        s.placed(1, 1);
+        s.acked(1, 1);
+        assert_eq!(ack.load(Ordering::Acquire), 0, "gap at partial seq 0");
+        s.placed(0, 1);
+        s.acked(0, 1);
+        assert_eq!(ack.load(Ordering::Acquire), 500);
+    }
+
+    /// Barrier shape: data segments as partial seqs, trailing rows=0 final
+    /// marker carries the publication.
+    #[test]
+    fn rows_zero_final_marker_publishes_after_partial_segments() {
+        let (mut s, ack) = state();
+        s.register(0, 500, false);
+        s.register(1, 500, false);
+        s.register(2, 500, true);
+        s.placed(2, 0); // marker done immediately once placed
+        s.placed(0, 2);
+        s.acked(0, 2);
+        s.placed(1, 3);
+        assert_eq!(ack.load(Ordering::Acquire), 0, "segment 1 not acked");
+        s.acked(1, 3);
+        assert_eq!(ack.load(Ordering::Acquire), 500);
+        // Next commit publishes independently
+        s.register(3, 600, true);
+        s.placed(3, 0);
+        assert_eq!(ack.load(Ordering::Acquire), 600);
+    }
+
     #[test]
     fn trailing_advances_only_when_all_done() {
         let (mut s, ack) = state();
-        s.register(0, 100);
+        s.register(0, 100, true);
         s.placed(0, 1);
         // Not acked, trailing must not advance past the buffered row
         s.trailing(9_999);

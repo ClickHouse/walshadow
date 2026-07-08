@@ -35,11 +35,11 @@
 //!
 //! Spill-to-ClickHouse (Option B) is deferred; v1 is local-disk-only.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use thiserror::Error;
@@ -56,7 +56,7 @@ use crate::heap_decoder::{
 use crate::pipeline::decode::RelCache;
 use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent, ShadowCatalog};
-use crate::spill::{SpillEntry, SpillError, SpillStore, SpillWriter, ToastChunk};
+use crate::spill::{SpillEntry, SpillError, SpillReader, SpillStore, SpillWriter, ToastChunk};
 use crate::toast::{ChunkMap, ToastResolver};
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
@@ -386,6 +386,9 @@ pub struct XactBufferStats {
     pub bytes_in_memory: u64,
     pub xacts_total: u64,
     pub spill_xacts_active: u64,
+    /// Spilled bytes awaiting commit drain. Drops when a drain takes
+    /// ownership, though the file unlinks only post-dispatch; resident
+    /// drain bytes are the separate [`XactBuffer::drain_resident_bytes`]
     pub spill_bytes_active: u64,
     pub spill_evictions_total: u64,
     pub committed_xacts_total: u64,
@@ -714,6 +717,13 @@ pub struct XactBuffer {
     /// WAL-read rather than at buffering. Empty (and unused) when tracing
     /// is off — `absorb` then mints its own span.
     span_registry: TxnSpanRegistry,
+    /// Bytes resident inside an active commit drain (decoded merge heads +
+    /// in-mem tail + unsealed chunk map). Arc'd so a detached
+    /// [`CommittedDrain`] keeps accounting after the buffer lock releases;
+    /// distinct from `spill_bytes_active` (on-disk bytes awaiting drain).
+    drain_resident: Arc<AtomicU64>,
+    /// High-water mark of `drain_resident`, monotonic per process.
+    drain_resident_peak: Arc<AtomicU64>,
 }
 
 impl XactBuffer {
@@ -726,7 +736,21 @@ impl XactBuffer {
             bytes_in_memory: 0,
             stats: XactBufferStats::default(),
             span_registry: TxnSpanRegistry::new(),
+            drain_resident: Arc::new(AtomicU64::new(0)),
+            drain_resident_peak: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Current bytes resident in an active drain; `0` when no drain runs.
+    pub fn drain_resident_bytes(&self) -> u64 {
+        self.drain_resident.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic high-water mark of [`Self::drain_resident_bytes`]. For a
+    /// spilled xact this stays near merge-heads + chunk bytes, far below the
+    /// xact's decoded size — the drain-streaming bound.
+    pub fn drain_resident_peak(&self) -> u64 {
+        self.drain_resident_peak.load(Ordering::Relaxed)
     }
 
     /// Clone of the [`TxnSpanRegistry`] the pump pushes `txn` spans into.
@@ -938,6 +962,47 @@ impl XactBuffer {
         Ok(())
     }
 
+    /// Convert removed states into a lazy k-way merge, releasing their
+    /// spill accounting (`spill_bytes_active` counts bytes awaiting drain;
+    /// the drain owns them from here). Files stay on disk until
+    /// [`MergedDrain::finish`] unlinks post-dispatch.
+    async fn open_drain(
+        &mut self,
+        states: Vec<XactState>,
+    ) -> std::result::Result<MergedDrain, XactBufferError> {
+        let mut gauge = ResidentGauge {
+            cur: self.drain_resident.clone(),
+            peak: self.drain_resident_peak.clone(),
+            held: 0,
+        };
+        let mut sources = Vec::with_capacity(states.len());
+        let mut events = Vec::with_capacity(states.len());
+        for mut st in states {
+            let reader = match st.spill.take() {
+                Some(writer) => {
+                    let bc = writer.byte_count();
+                    self.stats.spill_bytes_active =
+                        self.stats.spill_bytes_active.saturating_sub(bc);
+                    self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
+                    Some(writer.finish().await?)
+                }
+                None => None,
+            };
+            let in_mem = std::mem::take(&mut st.in_mem);
+            sources.push(MergeSource::open(reader, in_mem, &mut gauge).await?);
+            // Arrival order == WAL order: decoder sink pushes on observe,
+            // so the Vec is already source_lsn ASC
+            events.push(std::mem::take(&mut st.events).into());
+        }
+        Ok(MergedDrain {
+            sources,
+            events,
+            chunks: ChunkMap::new(),
+            chunk_bytes: 0,
+            gauge,
+        })
+    }
+
     /// Drain xact `xid` to `observer` in WAL order, substituting each
     /// `ExternalToast` with its reassembled `Bytea` / `Text` via
     /// [`ShadowCatalog::relation_at`]. No-op for unknown `xid`
@@ -1037,107 +1102,16 @@ impl XactBuffer {
             spilled = states.iter().any(|s| s.spill.is_some()),
         );
 
-        // Drain spill files first (older in WAL order) per xid, then
-        // tack on in-mem entries. Result: one `VecDeque<SpillEntry>` per
-        // xid already sorted by `source_lsn` ASC. Catalog events ride a
-        // sibling `VecDeque<(u64, SchemaEvent)>` per xid for the k-way
-        // merge below — they don't spill.
-        let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
-        let mut per_xid_events: Vec<VecDeque<(u64, DrainEntry)>> = Vec::with_capacity(states.len());
-        for mut st in states.drain(..) {
-            let in_mem = std::mem::take(&mut st.in_mem);
-            let mut entries: VecDeque<SpillEntry> = VecDeque::with_capacity(in_mem.len());
-            if let Some(writer) = st.spill.take() {
-                let bc = writer.byte_count();
-                self.stats.spill_bytes_active = self.stats.spill_bytes_active.saturating_sub(bc);
-                self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
-                let mut reader = writer.finish().await?;
-                while let Some(entry) = reader.next().await? {
-                    entries.push_back(entry);
-                }
-                reader.unlink().await?;
-            }
-            entries.extend(in_mem);
-            per_xid.push(entries);
-            // Arrival order == WAL order: decoder sink pushes on observe,
-            // so the Vec is already source_lsn ASC
-            let evs: VecDeque<(u64, DrainEntry)> = std::mem::take(&mut st.events).into();
-            per_xid_events.push(evs);
-        }
-
-        // k-way merge of per_xid heads by `source_lsn` ASC. k = 1 +
-        // nsubxacts, typically <= 4, so linear head-pick beats a heap
-        let mut heaps: Vec<DecodedHeap> = Vec::new();
-        let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
-        let mut ordered_events: Vec<(usize, DrainEntry)> = Vec::new();
-        // `merge` brackets the (fully synchronous) k-way merge — confirms
-        // it's cheap rather than an O(n²) surprise on subxact-heavy xacts.
-        // Entered only across sync work; dropped before the dispatch awaits
-        // below (an entered guard held across `.await` would be unsound).
-        let merge_guard = trace_span!(
-            !drain_span.is_none(),
-            parent: &drain_span,
-            "merge",
-            xacts = per_xid.len(),
-            entries = per_xid.iter().map(VecDeque::len).sum::<usize>(),
-        )
-        .entered();
-        loop {
-            #[derive(Clone, Copy)]
-            enum Pick {
-                Spill(usize, u64),
-                Event(usize, u64),
-            }
-            let mut best: Option<Pick> = None;
-            let best_lsn = |p: Pick| match p {
-                Pick::Spill(_, l) | Pick::Event(_, l) => l,
-            };
-            // Control events (`DrainEntry`) win ties against heaps: PG writes
-            // a DDL's catalog mutation before the dependent heap, and the lazy
-            // refetch stamps the schema event with the triggering heap's
-            // source_lsn, so they share an LSN. Event-first lands the `ALTER`
-            // on CH before the dependent INSERT encodes against the post-DDL
-            // shape. The events loop runs before the heaps loop and uses `<=`
-            // (heaps use `<`), so any `DrainEntry` — Catalog now, Config/Signal
-            // per runtime-config §3/§6 — inherits the same tie-break
-            for (i, q) in per_xid_events.iter().enumerate() {
-                let Some(&(lsn, _)) = q.front() else {
-                    continue;
-                };
-                if best.is_none_or(|b| lsn <= best_lsn(b)) {
-                    best = Some(Pick::Event(i, lsn));
-                }
-            }
-            for (i, q) in per_xid.iter().enumerate() {
-                let Some(head) = q.front() else { continue };
-                let lsn = entry_lsn(head);
-                if best.is_none_or(|b| lsn < best_lsn(b)) {
-                    best = Some(Pick::Spill(i, lsn));
-                }
-            }
-            let Some(pick) = best else {
-                break;
-            };
-            match pick {
-                Pick::Spill(i, _) => {
-                    let entry = per_xid[i].pop_front().expect("just peeked head");
-                    accumulate(entry, &mut heaps, &mut chunks);
-                }
-                Pick::Event(i, _) => {
-                    let (_lsn, ev) = per_xid_events[i].pop_front().expect("just peeked head");
-                    // Event sorts before heaps[heaps.len()]
-                    ordered_events.push((heaps.len(), ev));
-                }
-            }
-        }
-        drop(merge_guard);
-        drain_span.record("rows", heaps.len());
-
-        let mut event_cursor = 0usize;
-        for (heap_idx, mut heap) in heaps.into_iter().enumerate() {
-            while event_cursor < ordered_events.len() && ordered_events[event_cursor].0 <= heap_idx
-            {
-                match &ordered_events[event_cursor].1 {
+        // Lazy k-way merge: one decoded head per source, in-mem tails
+        // chained behind spill readers (eviction discipline holds "spilled
+        // older than in-mem"). Dispatch happens per pick, so peak residency
+        // is merge heads + the chunk map — not the whole decoded xact that
+        // spilled precisely because it exceeded the buffer budget.
+        let mut drain = self.open_drain(states).await?;
+        let mut rows: u64 = 0;
+        while let Some(item) = drain.next().await? {
+            match item {
+                MergeItem::Event(ev) => match &ev {
                     DrainEntry::Catalog(ev) => observer
                         .on_schema_event(ev)
                         .instrument(drain_span.clone())
@@ -1148,40 +1122,32 @@ impl XactBuffer {
                         .instrument(drain_span.clone())
                         .await
                         .map_err(|e| XactBufferError::Observer(e.to_string()))?,
+                },
+                MergeItem::Heap(mut heap) => {
+                    detoast_heap(&mut heap, &[drain.chunks()], catalog, false, resolver).await?;
+                    let committed = CommittedTuple {
+                        decoded: *heap,
+                        commit_ts,
+                        commit_lsn,
+                    };
+                    // Under `drain_span` so the emitter's `emit.insert` (the
+                    // blocking ClickHouse round-trip, sealed on a budget trip
+                    // or at xact end) attaches as a child of this
+                    // transaction's drain.
+                    observer
+                        .on_tuple(&committed)
+                        .instrument(drain_span.clone())
+                        .await
+                        .map_err(|e| XactBufferError::Observer(e.to_string()))?;
+                    rows += 1;
                 }
-                event_cursor += 1;
             }
-            detoast_heap(&mut heap, &chunks, catalog, false, resolver).await?;
-            let committed = CommittedTuple {
-                decoded: heap,
-                commit_ts,
-                commit_lsn,
-            };
-            // Under `drain_span` so the emitter's `emit.insert` (the
-            // blocking ClickHouse round-trip, sealed on a budget trip or at
-            // xact end) attaches as a child of this transaction's drain.
-            observer
-                .on_tuple(&committed)
-                .instrument(drain_span.clone())
-                .await
-                .map_err(|e| XactBufferError::Observer(e.to_string()))?;
         }
-        // Trailing events with no heap after them
-        while event_cursor < ordered_events.len() {
-            match &ordered_events[event_cursor].1 {
-                DrainEntry::Catalog(ev) => observer
-                    .on_schema_event(ev)
-                    .instrument(drain_span.clone())
-                    .await
-                    .map_err(|e| XactBufferError::Observer(e.to_string()))?,
-                DrainEntry::Config(ev) => observer
-                    .on_config_event(ev)
-                    .instrument(drain_span.clone())
-                    .await
-                    .map_err(|e| XactBufferError::Observer(e.to_string()))?,
-            }
-            event_cursor += 1;
-        }
+        drain_span.record("rows", rows);
+        // Unlink spill files only now, after dispatch: an observer error
+        // above abandons the partially consumed reader on disk (startup
+        // wipe + redecode-from-ack cover replay).
+        drain.finish().await?;
         // drain_lsn ticks before the ack so an observer failure leaves
         // drain_lsn ahead of emitter_ack_lsn, the gap the cursor surfaces.
         // With CH flush_timeout > 0, on_xact_end returns last durable
@@ -1221,18 +1187,18 @@ impl XactBuffer {
         Ok(())
     }
 
-    /// Parallel-pipeline drain: k-way merge by `source_lsn`, return
-    /// still-toasted heaps + chunk map + interleaved events *without*
-    /// detoast or dispatch (those move to the decode pool / barrier
-    /// coordinator). Unlike [`Self::commit`], leaves `emitter_ack_lsn`
-    /// to the pipeline ack collector.
+    /// Parallel-pipeline drain: hand back a [`CommittedDrain`] that streams
+    /// bounded [`DrainedBatch`] slices from the same lazy k-way merge as
+    /// [`Self::commit`], *without* detoast or dispatch (those move to the
+    /// decode pool / barrier coordinator). Unlike `commit`, leaves
+    /// `emitter_ack_lsn` to the pipeline ack collector.
     pub async fn drain_committed(
         &mut self,
         top_xid: u32,
         commit_ts: i64,
         commit_lsn: u64,
         subxids: &[u32],
-    ) -> std::result::Result<DrainedXact, XactBufferError> {
+    ) -> std::result::Result<CommittedDrain, XactBufferError> {
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
         xids.push(top_xid);
         xids.extend_from_slice(subxids);
@@ -1247,13 +1213,12 @@ impl XactBuffer {
             // Read-only / filter-dropped: reorder coordinator still
             // registers a seq so the contiguous watermark passes commit_lsn
             self.stats.commits_unknown_xid += 1;
-            return Ok(DrainedXact {
+            return Ok(CommittedDrain {
                 commit_ts,
                 commit_lsn,
-                heaps: Vec::new(),
-                chunks: HashMap::new(),
-                ordered_events: Vec::new(),
                 had_states: false,
+                merged: None,
+                generations: Vec::new(),
             });
         }
         for st in &states {
@@ -1261,83 +1226,14 @@ impl XactBuffer {
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
-
-        // Spill (older) then in-mem per xid, source_lsn-ASC; see [`Self::commit`]
-        let mut per_xid: Vec<VecDeque<SpillEntry>> = Vec::with_capacity(states.len());
-        let mut per_xid_events: Vec<VecDeque<(u64, DrainEntry)>> = Vec::with_capacity(states.len());
-        for mut st in states.drain(..) {
-            let in_mem = std::mem::take(&mut st.in_mem);
-            let mut entries: VecDeque<SpillEntry> = VecDeque::with_capacity(in_mem.len());
-            if let Some(writer) = st.spill.take() {
-                let bc = writer.byte_count();
-                self.stats.spill_bytes_active = self.stats.spill_bytes_active.saturating_sub(bc);
-                self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
-                let mut reader = writer.finish().await?;
-                while let Some(entry) = reader.next().await? {
-                    entries.push_back(entry);
-                }
-                reader.unlink().await?;
-            }
-            entries.extend(in_mem);
-            per_xid.push(entries);
-            let evs: VecDeque<(u64, DrainEntry)> = std::mem::take(&mut st.events).into();
-            per_xid_events.push(evs);
-        }
-
-        let mut heaps: Vec<DecodedHeap> = Vec::new();
-        let mut chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>> = HashMap::new();
-        let mut ordered_events: Vec<(usize, DrainEntry)> = Vec::new();
-        loop {
-            #[derive(Clone, Copy)]
-            enum Pick {
-                Spill(usize, u64),
-                Event(usize, u64),
-            }
-            let mut best: Option<Pick> = None;
-            let best_lsn = |p: Pick| match p {
-                Pick::Spill(_, l) | Pick::Event(_, l) => l,
-            };
-            // Control events (`DrainEntry`) tie-break before heaps at equal
-            // LSN: PG writes a DDL's catalog mutation before the dependent
-            // heap, and they can share an LSN. Config/Signal (runtime-config
-            // §3/§6) extend the same queue and inherit this ordering.
-            for (i, q) in per_xid_events.iter().enumerate() {
-                let Some(&(lsn, _)) = q.front() else {
-                    continue;
-                };
-                if best.is_none_or(|b| lsn <= best_lsn(b)) {
-                    best = Some(Pick::Event(i, lsn));
-                }
-            }
-            for (i, q) in per_xid.iter().enumerate() {
-                let Some(head) = q.front() else { continue };
-                let lsn = entry_lsn(head);
-                if best.is_none_or(|b| lsn < best_lsn(b)) {
-                    best = Some(Pick::Spill(i, lsn));
-                }
-            }
-            let Some(pick) = best else {
-                break;
-            };
-            match pick {
-                Pick::Spill(i, _) => {
-                    let entry = per_xid[i].pop_front().expect("just peeked head");
-                    accumulate(entry, &mut heaps, &mut chunks);
-                }
-                Pick::Event(i, _) => {
-                    let (_lsn, ev) = per_xid_events[i].pop_front().expect("just peeked head");
-                    ordered_events.push((heaps.len(), ev));
-                }
-            }
-        }
+        let merged = self.open_drain(states).await?;
         self.stats.committed_xacts_total += 1;
-        Ok(DrainedXact {
+        Ok(CommittedDrain {
             commit_ts,
             commit_lsn,
-            heaps,
-            chunks,
-            ordered_events,
             had_states: true,
+            merged: Some(merged),
+            generations: Vec::new(),
         })
     }
 
@@ -1421,41 +1317,313 @@ impl XactBuffer {
     }
 }
 
-/// Committed xact for the parallel pipeline. Heaps still TOAST-toasted;
-/// decode pool handles detoast + routing. Non-empty `ordered_events` (or
-/// a `HeapOp::Truncate` heap) makes this a barrier the reorder
-/// coordinator serializes against ClickHouse.
-pub struct DrainedXact {
-    pub commit_ts: i64,
-    pub commit_lsn: u64,
-    pub heaps: Vec<DecodedHeap>,
-    pub chunks: HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
-    /// Each entry sorts before `heaps[heap_index]`; `DrainEntry::Catalog` is
-    /// the only variant today, Config/Signal extend it per runtime-config plan
-    pub ordered_events: Vec<(usize, DrainEntry)>,
-    /// False for read-only / filter-dropped / unknown xid
-    pub had_states: bool,
+/// Tracks bytes resident inside an active drain (decoded merge heads +
+/// in-mem tail + unsealed chunk map). Contribution subtracts on drop so an
+/// abandoned drain (observer error) can't wedge the gauge.
+struct ResidentGauge {
+    cur: Arc<AtomicU64>,
+    peak: Arc<AtomicU64>,
+    held: u64,
 }
 
-fn accumulate(
-    entry: SpillEntry,
-    heaps: &mut Vec<DecodedHeap>,
-    chunks: &mut HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>,
-) {
-    match entry {
-        SpillEntry::Heap(h) => heaps.push(*h),
-        SpillEntry::Chunk(c) => {
-            chunks
-                .entry((c.toast_relid, c.value_id))
-                .or_default()
-                .insert(c.chunk_seq, c.chunk_data);
+impl ResidentGauge {
+    fn add(&mut self, n: usize) {
+        self.held += n as u64;
+        let now = self.cur.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+    }
+
+    fn sub(&mut self, n: usize) {
+        let n = (n as u64).min(self.held);
+        self.held -= n;
+        self.cur.fetch_sub(n, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ResidentGauge {
+    fn drop(&mut self) {
+        self.cur.fetch_sub(self.held, Ordering::Relaxed);
+    }
+}
+
+/// Lazy merge source for one xid: spill-reader head (older in WAL order)
+/// chained with the in-mem tail, one decoded entry resident. `pop` refills
+/// from the reader until EOF, then drains `in_mem`. The EOF reader parks in
+/// `spent` so the file unlinks only at [`MergedDrain::finish`],
+/// post-dispatch.
+struct MergeSource {
+    head: Option<SpillEntry>,
+    reader: Option<SpillReader>,
+    spent: Option<SpillReader>,
+    in_mem: VecDeque<SpillEntry>,
+}
+
+impl MergeSource {
+    async fn open(
+        reader: Option<SpillReader>,
+        in_mem: Vec<SpillEntry>,
+        gauge: &mut ResidentGauge,
+    ) -> std::result::Result<Self, SpillError> {
+        // Tail entries are resident from the start (they left the buffer's
+        // `bytes_in_memory` at commit); spill entries join at decode.
+        for e in &in_mem {
+            gauge.add(approximate_size(e));
         }
+        let mut src = Self {
+            head: None,
+            reader,
+            spent: None,
+            in_mem: in_mem.into(),
+        };
+        src.refill(gauge).await?;
+        Ok(src)
+    }
+
+    async fn refill(&mut self, gauge: &mut ResidentGauge) -> std::result::Result<(), SpillError> {
+        debug_assert!(self.head.is_none());
+        if let Some(r) = self.reader.as_mut() {
+            if let Some(entry) = r.next().await? {
+                gauge.add(approximate_size(&entry));
+                self.head = Some(entry);
+                return Ok(());
+            }
+            self.spent = self.reader.take();
+        }
+        // Already counted at `open`; moving to head keeps it resident
+        self.head = self.in_mem.pop_front();
+        Ok(())
+    }
+
+    fn head_lsn(&self) -> Option<u64> {
+        self.head.as_ref().map(entry_lsn)
+    }
+
+    async fn pop(
+        &mut self,
+        gauge: &mut ResidentGauge,
+    ) -> std::result::Result<Option<SpillEntry>, SpillError> {
+        let Some(entry) = self.head.take() else {
+            return Ok(None);
+        };
+        gauge.sub(approximate_size(&entry));
+        self.refill(gauge).await?;
+        Ok(Some(entry))
+    }
+}
+
+enum MergeItem {
+    Heap(Box<DecodedHeap>),
+    Event(DrainEntry),
+}
+
+/// Lazy k-way merge over per-xid sources + event queues, `source_lsn` ASC.
+/// k = 1 + nsubxacts, typically <= 4, so linear head-pick beats a heap.
+///
+/// Control events (`DrainEntry`) win ties against ANY same-LSN data entry:
+/// PG writes a DDL's catalog mutation before the dependent heap, and the
+/// lazy refetch stamps the schema event with the triggering heap's
+/// source_lsn, so they share an LSN. Event-first lands the `ALTER` on CH
+/// before the dependent INSERT encodes against the post-DDL shape. The
+/// events loop runs before the data loop and uses `<=` (data uses `<`), so
+/// any `DrainEntry` — Catalog now, Config/Signal per runtime-config §3/§6 —
+/// inherits the tie-break.
+///
+/// Toast chunks fold into `chunks` and never surface as items: a chunk's
+/// WAL position precedes its referrer, so the map is complete for every
+/// heap yielded after it. Drop-after-first-use would be wrong — one value
+/// can be referenced by several row versions in one xact (unchanged-toast
+/// UPDATE chain) — so entries live until [`Self::take_chunks`] / drop.
+struct MergedDrain {
+    sources: Vec<MergeSource>,
+    events: Vec<VecDeque<(u64, DrainEntry)>>,
+    chunks: ChunkMap,
+    chunk_bytes: usize,
+    gauge: ResidentGauge,
+}
+
+impl MergedDrain {
+    async fn next(&mut self) -> std::result::Result<Option<MergeItem>, XactBufferError> {
+        loop {
+            enum Pick {
+                Data(usize),
+                Event(usize),
+            }
+            let mut best: Option<(Pick, u64)> = None;
+            for (i, q) in self.events.iter().enumerate() {
+                let Some(&(lsn, _)) = q.front() else {
+                    continue;
+                };
+                if best.as_ref().is_none_or(|&(_, b)| lsn <= b) {
+                    best = Some((Pick::Event(i), lsn));
+                }
+            }
+            for (i, s) in self.sources.iter().enumerate() {
+                let Some(lsn) = s.head_lsn() else { continue };
+                if best.as_ref().is_none_or(|&(_, b)| lsn < b) {
+                    best = Some((Pick::Data(i), lsn));
+                }
+            }
+            let Some((pick, _)) = best else {
+                return Ok(None);
+            };
+            match pick {
+                Pick::Event(i) => {
+                    let (_lsn, ev) = self.events[i].pop_front().expect("just peeked head");
+                    return Ok(Some(MergeItem::Event(ev)));
+                }
+                Pick::Data(i) => {
+                    let entry = self.sources[i]
+                        .pop(&mut self.gauge)
+                        .await?
+                        .expect("just peeked head");
+                    match entry {
+                        SpillEntry::Heap(h) => return Ok(Some(MergeItem::Heap(h))),
+                        SpillEntry::Chunk(c) => {
+                            self.chunk_bytes += c.chunk_data.len();
+                            self.gauge.add(c.chunk_data.len());
+                            self.chunks
+                                .entry((c.toast_relid, c.value_id))
+                                .or_default()
+                                .insert(c.chunk_seq, c.chunk_data);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn chunks(&self) -> &ChunkMap {
+        &self.chunks
+    }
+
+    /// Chunks accumulated since the last take, sealed into a generation.
+    fn take_chunks(&mut self) -> ChunkMap {
+        self.gauge.sub(self.chunk_bytes);
+        self.chunk_bytes = 0;
+        std::mem::take(&mut self.chunks)
+    }
+
+    /// Every head empty and every event queue drained.
+    fn is_exhausted(&self) -> bool {
+        self.sources.iter().all(|s| s.head.is_none()) && self.events.iter().all(VecDeque::is_empty)
+    }
+
+    /// Unlink spill files; call only after dispatch completes. An error
+    /// path drops `self` instead, leaving files for inspection (startup
+    /// wipe + redecode-from-ack cover replay).
+    async fn finish(self) -> std::result::Result<(), XactBufferError> {
+        for s in self.sources {
+            if let Some(r) = s.spent {
+                r.unlink().await?;
+            }
+            if let Some(r) = s.reader {
+                r.unlink().await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One bounded slice of a committed xact for the parallel pipeline. Heaps
+/// still TOAST-toasted; the decode pool handles detoast + routing.
+/// Non-empty `ordered_events` (or a `HeapOp::Truncate` heap) makes the
+/// slice a barrier the reorder coordinator serializes against ClickHouse.
+pub struct DrainedBatch {
+    /// `source_lsn` ASC within the slice; later slices strictly follow.
+    pub heaps: Vec<DecodedHeap>,
+    /// Each entry sorts before `heaps[i]`, `i` slice-local.
+    /// `DrainEntry::Catalog` + `Config` today, Signal per runtime-config plan
+    pub ordered_events: Vec<(usize, DrainEntry)>,
+    /// Chunk generations sealed so far, oldest first. A chunk's WAL position
+    /// precedes its referrer, so every heap's value lives in exactly one
+    /// generation sealed no later than this slice; slices share payloads via
+    /// `Arc` instead of copying per batch, and each generation is immutable
+    /// once sealed (decode pool reads while later slices load).
+    pub chunks: Vec<Arc<ChunkMap>>,
+    /// Generation sealed with this slice (last element of `chunks`) — the
+    /// only chunks not yet handed out, the toast-store put target.
+    pub new_chunks: Option<Arc<ChunkMap>>,
+    /// Last slice of the commit. Only its seq may publish `commit_lsn` in
+    /// the ack (`register` vs `register_partial`): an earlier slice
+    /// publishing would claim durability for rows still in flight.
+    pub is_final: bool,
+}
+
+/// Streaming handle for one committed xact: pull [`DrainedBatch`] slices,
+/// then [`Self::finish`] to unlink spill files once dispatch completes.
+pub struct CommittedDrain {
+    pub commit_ts: i64,
+    pub commit_lsn: u64,
+    /// False for read-only / filter-dropped / unknown xid.
+    pub had_states: bool,
+    merged: Option<MergedDrain>,
+    generations: Vec<Arc<ChunkMap>>,
+}
+
+impl CommittedDrain {
+    /// Next slice, `None` once exhausted. The slice closes at the first
+    /// heap reaching `max_rows` / `max_bytes` (budget is a trigger, not a
+    /// hard cap: one oversized row still ships alone). Slices only cut at
+    /// heap boundaries, so a value's contiguous chunk run never splits
+    /// across generations.
+    pub async fn next_batch(
+        &mut self,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> std::result::Result<Option<DrainedBatch>, XactBufferError> {
+        let Some(m) = self.merged.as_mut() else {
+            return Ok(None);
+        };
+        let mut heaps: Vec<DecodedHeap> = Vec::new();
+        let mut ordered_events: Vec<(usize, DrainEntry)> = Vec::new();
+        let mut bytes = 0usize;
+        while heaps.len() < max_rows.max(1) && bytes < max_bytes.max(1) {
+            match m.next().await? {
+                None => break,
+                Some(MergeItem::Event(ev)) => ordered_events.push((heaps.len(), ev)),
+                Some(MergeItem::Heap(h)) => {
+                    bytes += h.approx_bytes();
+                    heaps.push(*h);
+                }
+            }
+        }
+        let is_final = m.is_exhausted();
+        let new_chunks = {
+            let sealed = m.take_chunks();
+            (!sealed.is_empty()).then(|| Arc::new(sealed))
+        };
+        if let Some(g) = &new_chunks {
+            self.generations.push(g.clone());
+        }
+        if heaps.is_empty() && ordered_events.is_empty() && new_chunks.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(DrainedBatch {
+            heaps,
+            ordered_events,
+            chunks: self.generations.clone(),
+            new_chunks,
+            is_final,
+        }))
+    }
+
+    /// Unlink spill files; call after the final slice dispatches. On an
+    /// error path drop instead: files stay for inspection, startup wipe +
+    /// redecode-from-ack cover replay.
+    pub async fn finish(mut self) -> std::result::Result<(), XactBufferError> {
+        if let Some(m) = self.merged.take() {
+            m.finish().await?;
+        }
+        Ok(())
     }
 }
 
 pub(crate) async fn detoast_heap(
     heap: &mut DecodedHeap,
-    chunks: &ChunkMap,
+    // Chunk-map generations, oldest first; a value lives in exactly one
+    // (single map on the serial path, sealed drain-batch generations on the
+    // parallel path)
+    chunk_maps: &[&ChunkMap],
     catalog: &Arc<Mutex<ShadowCatalog>>,
     // Async decode pool can lag past a DDL and re-resolve an older heap,
     // so it reuses the inline cached descriptor without mutating cache or
@@ -1485,7 +1653,11 @@ pub(crate) async fn detoast_heap(
         collect_toast_keys(heap.new.as_ref(), &mut keys);
         collect_toast_keys(heap.old.as_ref(), &mut keys);
         for (relid, value_id) in keys {
-            if chunks.contains_key(&(relid, value_id)) || extra.contains_key(&(relid, value_id)) {
+            if chunk_maps
+                .iter()
+                .any(|m| m.contains_key(&(relid, value_id)))
+                || extra.contains_key(&(relid, value_id))
+            {
                 continue;
             }
             resolver
@@ -1494,7 +1666,8 @@ pub(crate) async fn detoast_heap(
                 .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?;
         }
     }
-    let maps: [&ChunkMap; 2] = [chunks, &extra];
+    let mut maps: Vec<&ChunkMap> = chunk_maps.to_vec();
+    maps.push(&extra);
     if let Some(t) = heap.new.as_mut() {
         detoast_tuple(t, &rel, &maps, resolver)?;
     }
@@ -2793,5 +2966,209 @@ mod tests {
         assert!(b.active_xids().is_empty());
         // One bump per terminator record, not per subxid
         assert_eq!(b.stats().aborted_xacts_total, 1);
+    }
+
+    // ── drain streaming ───────────────────────────────────────────────
+
+    fn chunk(value_id: u32, seq: u32, lsn: u64, body: &[u8]) -> ToastChunk {
+        ToastChunk {
+            toast_relid: 16400,
+            value_id,
+            chunk_seq: seq,
+            source_lsn: lsn,
+            chunk_data: body.to_vec(),
+        }
+    }
+
+    fn dropped_event(oid: u32) -> SchemaEvent {
+        use crate::shadow_catalog::RelName;
+        SchemaEvent::Dropped {
+            oid,
+            rel_name: RelName::new("public", &format!("t{oid}")),
+        }
+    }
+
+    /// Interleave a batch's events at their local indices with its heaps:
+    /// `e<oid>` / `h<lsn>` labels for order assertions.
+    fn flatten_batch(batch: &DrainedBatch) -> Vec<String> {
+        let label = |e: &DrainEntry| match e {
+            DrainEntry::Catalog(SchemaEvent::Dropped { oid, .. }) => format!("e{oid}"),
+            other => panic!("unexpected event {other:?}"),
+        };
+        let mut out = Vec::new();
+        let mut ev = 0usize;
+        for (i, h) in batch.heaps.iter().enumerate() {
+            while ev < batch.ordered_events.len() && batch.ordered_events[ev].0 <= i {
+                out.push(label(&batch.ordered_events[ev].1));
+                ev += 1;
+            }
+            out.push(format!("h{}", h.source_lsn));
+        }
+        while ev < batch.ordered_events.len() {
+            out.push(label(&batch.ordered_events[ev].1));
+            ev += 1;
+        }
+        out
+    }
+
+    /// Batched drain must reproduce the serial merge order: spilled + in-mem
+    /// across top/subxact by `source_lsn` ASC, events winning ties, trailing
+    /// event after the last heap. `is_final` only on the last slice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_batches_merge_lsn_order_events_first() {
+        let tmp = tempdir().unwrap();
+        // 1 KiB budget: xid 1's 512-byte payloads spill, xid 2 stays in memory
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        for lsn in [100u64, 120, 140] {
+            b.on_heap(heap_with_value(1, lsn, 512)).await.unwrap();
+        }
+        b.on_heap(heap_with_value(2, 110, 16)).await.unwrap();
+        b.on_heap(heap_with_value(2, 130, 16)).await.unwrap();
+        // Ties heap@120; event-first tie-break puts it before the heap
+        b.on_schema_event(1, 120, dropped_event(7));
+        // Trailing, no heap after it
+        b.on_schema_event(2, 150, dropped_event(8));
+        assert!(b.stats().spill_xacts_active >= 1, "xid 1 must spill");
+
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[2]).await.unwrap();
+        assert!(drain.had_states);
+        let mut order: Vec<String> = Vec::new();
+        let mut finals = Vec::new();
+        while let Some(batch) = drain.next_batch(2, usize::MAX).await.unwrap() {
+            order.extend(flatten_batch(&batch));
+            finals.push(batch.is_final);
+            if batch.is_final {
+                break;
+            }
+        }
+        assert_eq!(
+            order,
+            ["h100", "h110", "e7", "h120", "h130", "h140", "e8"]
+                .map(str::to_string)
+                .to_vec(),
+        );
+        assert!(finals.pop().unwrap(), "last slice flags final");
+        assert!(finals.iter().all(|f| !f), "earlier slices non-final");
+        assert!(drain.next_batch(2, usize::MAX).await.unwrap().is_none());
+        drain.finish().await.unwrap();
+        assert_eq!(b.stats().committed_xacts_total, 1);
+        assert!(b.active_xids().is_empty());
+    }
+
+    /// A chunk generation sealed with an earlier slice must stay visible to
+    /// later slices carrying the referrer (unchanged-toast UPDATE chain).
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_batch_chunk_generations_cover_cross_batch_referrer() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        b.on_toast_chunk(chunk(55, 0, 100, b"ab"), 9).await.unwrap();
+        b.on_toast_chunk(chunk(55, 1, 105, b"cd"), 9).await.unwrap();
+        b.on_heap(heap_with_value(9, 110, 16)).await.unwrap();
+        b.on_heap(heap_with_value(9, 300, 16)).await.unwrap();
+
+        let mut drain = b.drain_committed(9, 0, 0x1000, &[]).await.unwrap();
+        let b1 = drain.next_batch(1, usize::MAX).await.unwrap().unwrap();
+        assert_eq!(b1.heaps.len(), 1);
+        let g1 = b1.new_chunks.as_ref().expect("chunks seal with slice 1");
+        assert!(g1.contains_key(&(16400, 55)));
+        let b2 = drain.next_batch(1, usize::MAX).await.unwrap().unwrap();
+        assert!(b2.is_final);
+        assert!(b2.new_chunks.is_none(), "no fresh chunks in slice 2");
+        let maps: Vec<&ChunkMap> = b2.chunks.iter().map(Arc::as_ref).collect();
+        let p = ToastPointer {
+            va_rawsize: 8,
+            va_extinfo: 0,
+            va_valueid: 55,
+            va_toastrelid: 16400,
+        };
+        let raw = try_reassemble(&p, &maps).unwrap().expect("value visible");
+        assert_eq!(raw, b"abcd");
+        drain.finish().await.unwrap();
+    }
+
+    fn spill_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("xid-"))
+            .collect()
+    }
+
+    /// Spill files survive the whole batch pull (redecode-from-disk on an
+    /// abandoned drain) and unlink only at `finish`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_spill_unlinks_only_at_finish() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        for i in 0..8u64 {
+            b.on_heap(heap_with_value(3, 100 + i, 512)).await.unwrap();
+        }
+        assert_eq!(spill_files(tmp.path()).len(), 1);
+        let mut drain = b.drain_committed(3, 0, 0x5000, &[]).await.unwrap();
+        assert_eq!(
+            b.stats().spill_bytes_active,
+            0,
+            "drain owns the bytes once opened"
+        );
+        while let Some(batch) = drain.next_batch(2, usize::MAX).await.unwrap() {
+            if batch.is_final {
+                break;
+            }
+        }
+        assert_eq!(
+            spill_files(tmp.path()).len(),
+            1,
+            "file persists until finish"
+        );
+        drain.finish().await.unwrap();
+        assert!(spill_files(tmp.path()).is_empty());
+    }
+
+    /// The drain-resident gauge bounds what the merge holds: for a fully
+    /// spilled xact, peak stays near merge-heads, far below the xact size.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_resident_gauge_stays_bounded() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let n = 64u64;
+        for i in 0..n {
+            b.on_heap(heap_with_value(4, 100 + i, 512)).await.unwrap();
+        }
+        let total = n * 512;
+        let mut drain = b.drain_committed(4, 0, 0x9000, &[]).await.unwrap();
+        let mut rows = 0usize;
+        while let Some(batch) = drain.next_batch(4, usize::MAX).await.unwrap() {
+            rows += batch.heaps.len();
+            assert!(
+                b.drain_resident_bytes() < total / 4,
+                "resident {} vs xact {total}",
+                b.drain_resident_bytes(),
+            );
+            if batch.is_final {
+                break;
+            }
+        }
+        assert_eq!(rows as u64, n);
+        assert!(b.drain_resident_peak() > 0, "gauge saw the merge heads");
+        assert!(
+            b.drain_resident_peak() < total / 4,
+            "peak {} vs xact {total}",
+            b.drain_resident_peak(),
+        );
+        drain.finish().await.unwrap();
+        assert_eq!(b.drain_resident_bytes(), 0, "gauge drains with the drain");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_committed_unknown_xid_yields_no_batches() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let mut drain = b.drain_committed(999, 0, 0x100, &[]).await.unwrap();
+        assert!(!drain.had_states);
+        assert!(drain.next_batch(10, 1000).await.unwrap().is_none());
+        drain.finish().await.unwrap();
+        assert_eq!(b.stats().commits_unknown_xid, 1);
+        assert_eq!(b.stats().drain_lsn, 0x100);
     }
 }

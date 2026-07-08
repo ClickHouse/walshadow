@@ -241,6 +241,8 @@ impl PipelineConfig {
             backfiller,
             fatal.clone(),
             span_registry,
+            emitter.drain_batch_rows,
+            emitter.drain_batch_bytes,
         );
 
         Ok((

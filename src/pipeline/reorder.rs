@@ -31,7 +31,7 @@ use crate::wal_stream::{Record, RecordSink, SinkError};
 use tracing::Instrument;
 
 use crate::xact_buffer::{
-    DrainEntry, DrainedXact, SchemaEventRx, SubxactTracker, TxnSpanRegistry, XLOG_XACT_ABORT,
+    DrainEntry, DrainedBatch, SchemaEventRx, SubxactTracker, TxnSpanRegistry, XLOG_XACT_ABORT,
     XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
     XLOG_XACT_OPMASK, XactBuffer, drain_pending_schema_events, parse_xact_assignment,
     parse_xact_payload,
@@ -78,6 +78,11 @@ pub struct ReorderSink {
     backfiller: Option<Arc<CopyBackfiller>>,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
+    /// Drain-slice budget: rows / bytes per [`DrainedBatch`] pulled from the
+    /// buffer. Bounds resident decoded rows while a spilled xact streams
+    /// back; the decode pool works one slice while the next loads.
+    batch_rows: usize,
+    batch_bytes: usize,
     /// Per-txn span map (shared with the pump + buffer). `Some` only when
     /// OTLP tracing is on; reorder parents `commit.drain`/`dispatch` under
     /// the `txn` and prunes the entry at commit (the buffer prunes at abort).
@@ -102,6 +107,8 @@ impl ReorderSink {
         backfiller: Option<Arc<CopyBackfiller>>,
         fatal: Fatal,
         span_registry: Option<TxnSpanRegistry>,
+        batch_rows: usize,
+        batch_bytes: usize,
     ) -> Self {
         Self {
             buffer,
@@ -119,6 +126,8 @@ impl ReorderSink {
             backfiller,
             fatal,
             next_seq: 0,
+            batch_rows,
+            batch_bytes,
             span_registry,
         }
     }
@@ -298,25 +307,27 @@ impl ReorderSink {
     }
 
     /// Dispatch accumulated barrier data rows as their own seq. No-op when
-    /// empty.
+    /// empty. Always a non-final slice: the commit's trailing rows=0 marker
+    /// carries the LSN publication, so a durable segment can't claim the
+    /// whole commit while later segments are in flight.
     async fn dispatch_segment(
         &mut self,
         pending: &mut Vec<DecodedHeap>,
         commit_ts: i64,
         commit_lsn: u64,
-        chunks: &Arc<ToastChunks>,
+        chunks: &[Arc<ToastChunks>],
     ) -> Result<(), SinkError> {
         if pending.is_empty() {
             return Ok(());
         }
         let seq = self.alloc_seq();
-        self.ack.register(seq, commit_lsn);
+        self.ack.register_partial(seq, commit_lsn);
         let job = DecodeJob {
             seq,
             commit_ts,
             commit_lsn,
             heaps: std::mem::take(pending),
-            chunks: chunks.clone(),
+            chunks: chunks.to_vec(),
         };
         self.dispatch_job(job).await
     }
@@ -354,19 +365,25 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Process a barrier xact in source_lsn order: data rows accumulate into
-    /// segments; each DDL event / TRUNCATE is preceded by dispatching the
-    /// pending segment + a fence (so earlier data is durable first).
-    async fn run_barrier(&mut self, drained: DrainedXact) -> Result<(), SinkError> {
-        let DrainedXact {
-            commit_ts,
-            commit_lsn,
+    /// Process one barrier slice in source_lsn order: data rows accumulate
+    /// into segments; each DDL event / TRUNCATE is preceded by dispatching
+    /// the pending segment + a fence (so earlier data is durable first).
+    /// The fence waits durability through `next_seq`, which covers every
+    /// seq of earlier slices too — no event is crossed by data from any
+    /// prior slice of the commit. Data-data ordering across slices needs no
+    /// fence (per-PK `_lsn` convergence).
+    async fn run_barrier_batch(
+        &mut self,
+        batch: DrainedBatch,
+        commit_ts: i64,
+        commit_lsn: u64,
+    ) -> Result<(), SinkError> {
+        let DrainedBatch {
             heaps,
-            chunks,
             ordered_events,
+            chunks,
             ..
-        } = drained;
-        let chunks = Arc::new(chunks);
+        } = batch;
         let mut pending: Vec<DecodedHeap> = Vec::new();
         let mut ev_cursor = 0usize;
         for (heap_idx, heap) in heaps.into_iter().enumerate() {
@@ -389,7 +406,7 @@ impl ReorderSink {
                 pending.push(heap);
             }
         }
-        // Trailing events: no heap follows them in the merge
+        // Trailing events: no heap follows them in this slice
         while ev_cursor < ordered_events.len() {
             self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
                 .await?;
@@ -400,7 +417,7 @@ impl ReorderSink {
             }
             ev_cursor += 1;
         }
-        // Trailing data flows async like a normal commit, already encoding
+        // Trailing data flows async like a normal slice, already encoding
         // against the post-DDL shape.
         self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
             .await
@@ -437,10 +454,9 @@ impl ReorderSink {
             xid = xid,
             commit_lsn = record.source_lsn,
         );
-        let drained = {
+        let mut drain = {
             let mut buf = self.buffer.lock().await;
             buf.drain_committed(xid, payload.xact_time, record.source_lsn, &payload.subxacts)
-                .instrument(drain_span)
                 .instrument(reorder_span)
                 .await
                 .map_err(SinkError::from)?
@@ -448,8 +464,6 @@ impl ReorderSink {
         self.subxact_tracker.lock().await.forget_tree(xid);
         // One per drained commit, incl. empty / unmapped-only
         self.stats.xacts_committed.fetch_add(1, Ordering::Relaxed);
-        txn.record("rows", drained.heaps.len() as u64);
-        txn.record("outcome", "committed");
         // Prune the committed tree's span handles (else the map grows
         // unbounded); the local `txn` clone keeps the span alive for dispatch.
         if let Some(r) = &self.span_registry {
@@ -459,55 +473,88 @@ impl ReorderSink {
             r.prune(&xids);
         }
 
-        // Persist this xact's chunks (disk / CH) before they're consumed by
-        // the decode pool, so a later re-emit of a pre-window referrer finds
-        // them. No-op when disabled or chunk-free. `commit_lsn` is the
-        // convergence `_lsn`; per-chunk LSN was dropped at merge.
-        if !drained.chunks.is_empty() {
-            self.resolver
-                .put_map(&drained.chunks, drained.commit_lsn)
+        // Pull bounded slices from the lazy merge: the decode pool works one
+        // while the next loads, so a spilled xact never rematerializes whole.
+        let commit_ts = drain.commit_ts;
+        let commit_lsn = drain.commit_lsn;
+        let mut rows_total: u64 = 0;
+        // Set once a slice's seq registered as publishing (final data slice);
+        // otherwise the trailing rows=0 marker publishes.
+        let mut published = false;
+        loop {
+            let Some(batch) = drain
+                .next_batch(self.batch_rows, self.batch_bytes)
+                .instrument(drain_span.clone())
                 .await
-                .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
-        }
-
-        let is_barrier = !drained.ordered_events.is_empty()
-            || drained
-                .heaps
-                .iter()
-                .any(|h| matches!(h.op, HeapOp::Truncate));
-        if is_barrier {
-            self.run_barrier(drained)
-                .instrument(trace_span!(
-                    !txn.is_none(),
-                    parent: &txn,
-                    "commit.barrier",
-                ))
-                .await
-        } else if drained.heaps.is_empty() {
-            // Empty commit: rows=0 seq keeps the contiguous watermark unbroken
-            let seq = self.alloc_seq();
-            self.ack.register(seq, drained.commit_lsn);
-            self.ack.placed(seq, 0);
-            Ok(())
-        } else {
-            let seq = self.alloc_seq();
-            self.ack.register(seq, drained.commit_lsn);
-            let job = DecodeJob {
-                seq,
-                commit_ts: drained.commit_ts,
-                commit_lsn: drained.commit_lsn,
-                heaps: drained.heaps,
-                chunks: Arc::new(drained.chunks),
+                .map_err(SinkError::from)?
+            else {
+                break;
             };
-            self.dispatch_job(job)
-                .instrument(trace_span!(
-                    !txn.is_none(),
-                    parent: &txn,
-                    "dispatch",
-                    seq = seq,
-                ))
-                .await
+            rows_total += batch.heaps.len() as u64;
+            // Persist this slice's sealed chunks (disk / CH) before any
+            // consumer, so a later re-emit of a pre-window referrer finds
+            // them. Earlier slices reference only earlier generations,
+            // already put. `commit_lsn` is the convergence `_lsn`; per-chunk
+            // LSN was dropped at merge.
+            if let Some(new) = &batch.new_chunks {
+                self.resolver
+                    .put_map(new, commit_lsn)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+            }
+            let is_barrier = !batch.ordered_events.is_empty()
+                || batch.heaps.iter().any(|h| matches!(h.op, HeapOp::Truncate));
+            let is_final = batch.is_final;
+            if is_barrier {
+                self.run_barrier_batch(batch, commit_ts, commit_lsn)
+                    .instrument(trace_span!(
+                        !txn.is_none(),
+                        parent: &txn,
+                        "commit.barrier",
+                    ))
+                    .await?;
+            } else if !batch.heaps.is_empty() {
+                let seq = self.alloc_seq();
+                if is_final {
+                    self.ack.register(seq, commit_lsn);
+                    published = true;
+                } else {
+                    self.ack.register_partial(seq, commit_lsn);
+                }
+                let job = DecodeJob {
+                    seq,
+                    commit_ts,
+                    commit_lsn,
+                    heaps: batch.heaps,
+                    chunks: batch.chunks,
+                };
+                self.dispatch_job(job)
+                    .instrument(trace_span!(
+                        !txn.is_none(),
+                        parent: &txn,
+                        "dispatch",
+                        seq = seq,
+                    ))
+                    .await?;
+            }
+            if is_final {
+                break;
+            }
         }
+        // Unlink spill files now that every slice dispatched; an error above
+        // drops the drain instead, leaving files for inspection.
+        drain.finish().await.map_err(SinkError::from)?;
+        txn.record("rows", rows_total);
+        txn.record("outcome", "committed");
+        if !published {
+            // rows=0 marker: publishes commit_lsn once every earlier slice
+            // is durable. Covers empty / read-only commits and barrier
+            // slices (whose segments all register partial).
+            let seq = self.alloc_seq();
+            self.ack.register(seq, commit_lsn);
+            self.ack.placed(seq, 0);
+        }
+        Ok(())
     }
 
     /// ABORT: drop the buffer, emit a rows=0 seq through the gate (never a

@@ -1289,7 +1289,7 @@ async fn run(args: Args) -> Result<()> {
         }
         let now_dispatched = stream.dispatched_lsn();
         let advanced = now_dispatched != prev_dispatched;
-        let (xact_stats, xact_line) = {
+        let (xact_stats, drain_resident_bytes, xact_line) = {
             let b = xact_buffer.lock().await;
             let mut stats = b.stats().clone();
             // Pipeline mode: track the ack collector's watermark (real CH
@@ -1298,7 +1298,7 @@ async fn run(args: Args) -> Result<()> {
                 stats.emitter_ack_lsn = a.load(Ordering::Acquire);
             }
             let line = stats.summary();
-            (stats, line)
+            (stats, b.drain_resident_bytes(), line)
         };
         let oracle_line = oracle
             .as_ref()
@@ -1327,6 +1327,7 @@ async fn run(args: Args) -> Result<()> {
             record_sink.decoder_xact.in_flight(),
             record_sink.decoder_xact.processed(),
             &xact_stats,
+            drain_resident_bytes,
             decoder_stats,
             emitter_stats,
             oracle_stats,
@@ -1903,6 +1904,7 @@ async fn populate_metrics(
     pump_queue_depth: u64,
     queue_records_out_total: u64,
     xact_stats: &walshadow::xact_buffer::XactBufferStats,
+    drain_resident_bytes: u64,
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
     emitter_stats: Option<&walshadow::ch_emitter::EmitterStats>,
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
@@ -1936,6 +1938,7 @@ async fn populate_metrics(
         xact_bytes_in_memory: xact_stats.bytes_in_memory,
         spill_xacts_active: xact_stats.spill_xacts_active,
         spill_bytes_active: xact_stats.spill_bytes_active,
+        drain_resident_bytes,
         spill_evictions_total: xact_stats.spill_evictions_total,
         xacts_committed_total: xact_stats.committed_xacts_total,
         xacts_aborted_total: xact_stats.aborted_xacts_total,
