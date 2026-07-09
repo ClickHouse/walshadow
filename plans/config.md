@@ -51,8 +51,12 @@ matches steady state.
 
 Bootstrap fixed points stay on `EmitterConfig`, boot-only, never republished:
 connection params (`[ch] host/port/user/password/database/secure`), toast store,
-`soft_delete`. These describe how to reach CH or wire into pipeline stages at
-spawn; a live swap would mean reconnecting or rebuilding the pipeline.
+`soft_delete`, and the source physical replication slot (`[source] slot` →
+`source_slot`, with a `--slot` CLI override applied at parse time à la
+`--ch-flush-timeout-ms`; created idempotently before pre-flight, streamed
+from, and resumed against on reconnect — see [source.md](source.md)). These describe how
+to reach CH/source or wire into pipeline stages at spawn; a live swap would mean
+reconnecting or rebuilding the pipeline.
 `target_database` and `soft_delete` thread into the DDL applicator at
 construction and carry across refreshes unchanged.
 

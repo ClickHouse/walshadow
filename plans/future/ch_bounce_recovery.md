@@ -78,7 +78,12 @@ emitter's retry path
   matters only if the workload demands lower-latency recovery than
   "operator restart + WAL re-read"
 * WAL re-read from cursor is fast — bounded by source-side retention
-  and walshadow's decode throughput, not by spill replay
+  and walshadow's decode throughput, not by spill replay. A physical
+  slot + the `flush_lsn = min(durable, apply_ceiling)` cap now hold
+  source WAL through the CH outage (slot `restart_lsn` sticks at the
+  CH-durable point), so re-read from cursor stays available unless the
+  slot goes `lost` / source disk fills — that edge is fatal and recovers
+  via config `initial_load` re-seed (see [../source.md](../source.md))
 * Spill format extension would re-open the spill-format-version-bump
   debt; better paid once than twice
 

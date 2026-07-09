@@ -51,9 +51,35 @@ have not reached and let source recycle un-filtered WAL. Cadence
 `wal_sender_timeout` default 60s gives 6× headroom
 
 `slot: Option<&str>` on `start_physical_replication`: Some = bind
-permanent physical slot, pins source's `pg_wal/` until our `apply_lsn`
-advances; None = slotless, source recycles on `wal_keep_size` schedule.
-Slot caps catch-up, slotless caps source disk burn
+permanent physical slot, pins source's `pg_wal/`; None = slotless, source
+recycles on `wal_keep_size` schedule. Slot caps catch-up, slotless caps
+source disk burn. Slot name comes from config (`[source] slot` →
+`EmitterConfig.source_slot`), with a `--slot` CLI override applied at parse
+time (CLI > TOML, boot-only — same idiom as `--ch-flush-timeout-ms`).
+`SourceFeed::ensure_physical_slot(name)` creates it idempotently with
+immediate WAL reservation (`pg_create_physical_replication_slot(name,
+true)`), run before pre-flight (which requires the slot to exist). A
+physical slot's `restart_lsn` tracks the reported **flush** LSN, so the
+pump caps `flush_lsn` at `apply_ceiling = min(shadow_replay, emitter_ack)`
+(see [ops.md](ops.md)): the source retains WAL until CH has durably
+ingested it, not merely until walshadow fsynced its filter output.
+
+`SourceFeed::reconnect(cfg, slot, resume_lsn, timeline, interval)`
+re-establishes a dropped replication connection (e.g. source
+`wal_sender_timeout` fired during a CH-stall backpressure) and resumes at
+`resume_lsn = stream.next_lsn()` — the byte-contiguous resume point, never
+`dispatched_lsn` (which lags by any buffered in-progress record →
+misaligned push). `reconnect` is one attempt; the caller
+(`reconnect_or_fatal`) drives `backon` exponential-backoff retry to ride
+out a transient drop until the source returns. A recycled segment (SQLSTATE
+`58P01`, classified by `is_wal_segment_removed` on the code, not the
+locale-dependent message → typed `WalSegmentRemoved`) stops the retry and
+is **fatal**: the
+resume point is gone, so the daemon exits and recovery is a re-seed via
+config `initial_load` (`base_backup`/`object_store`) on restart, not an
+in-place reconnect. The slot + `flush_lsn` cap make this recycle path an
+edge (slot `lost` / dropped / source disk full), not the normal CH-stall
+path
 
 TLS / SCRAM via wal-rus's
 `walrus::pg::replication::tls`: modes `disable / allow
@@ -189,18 +215,21 @@ decode, turning any delivery path that needs fresh pump bytes into a
 deadlock
 
 `QueueingRecordSink::spawn` takes inner `RecordSink + Send + 'static`,
-`batch_size`, `soft_cap`. Pump-side `on_record` clones record to
+`batch_size`, `max_records`. Pump-side `on_record` clones record to
 `'static` via `record.parsed.clone().into_owned()`, pushes onto local
-`Vec`, ships when `len >= batch_size` onto unbounded
-`mpsc::UnboundedSender<Vec<Record<'static>>>`. Worker drains at its own
-pace through inner sink
+`Vec`, ships when `len >= batch_size` onto a **bounded**
+`mpsc::Sender<Vec<Record<'static>>>` sized `max_records / batch_size`.
+Worker drains at its own pace through inner sink
 
-Backpressure soft only. `in_flight: AtomicU64` tracks records in channel
-+ pump buffer; crossing `soft_cap` triggers `tokio::task::yield_now()`.
-Hard cap open-ended — permanently stalled worker surfaces catalog
-`wait_for_replay` timeout on shared err slot, pump's next `on_record`
-returns parked error, daemon exits cleanly with real root cause rather
-than hanging
+Backpressure hard. `flush_buf`'s `tx.send().await` blocks the pump when
+the channel is full, so a CH-slower-than-WAL run parks the pump on the
+source socket (→ the physical slot holds WAL on source disk) instead of
+growing walshadow RAM. Deadlock-safe despite the wire/record lockstep
+above: `on_wire_chunk` fires before `on_record`, and the walsender feeds
+shadow on an independent per-connection task (+keepalive-on-idle), so a
+parked pump only withholds *future* wire — never the ≤`resume` bytes any
+pending `wait_for_replay` needs (bytes lead the wait target). See
+[future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
 
 Worker uses `tokio::time::timeout(idle_interval, rx.recv())`. On timeout
 calls `inner.on_idle()`; channel close fires `inner.on_close()` for one
@@ -371,10 +400,13 @@ walsender listener before shadow's walreceiver attaches; construct
 `QueueingRecordSink::spawn(DecoderXactPair { decoder, xact_drain },
 batch_size, capacity)`); open `WalStream` + `DirSegmentSink`, attach
 `ShadowStreamSink` via `set_bytes_sink`; spawn metrics endpoint, SIGHUP
-handler, retention sweeper, cursor write loop; wait for walsender
+handler, retention sweeper, cursor write loop; ensure the configured physical slot before pre-flight; wait for walsender
 connect barrier; pump loop: `feed.next_chunk()` → `stream.push(lsn,
 bytes, &mut record_sink, &mut segment_sink)` → cursor advance → status
-update → repeat
+update → repeat. A `next_chunk` error routes through `reconnect_or_fatal`:
+transient drop → `SourceFeed::reconnect` at `stream.next_lsn()`; recycled
+segment (`58P01`) → fatal exit (re-seed via config `initial_load` on
+restart)
 
 `DecoderXactPair` order is fixed: decoder absorbs heap record into xact
 buffer *before* xact_drain flushes matching commit/abort.

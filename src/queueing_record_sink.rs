@@ -41,10 +41,11 @@ use crate::xact_buffer::TxnSpanRegistry;
 /// over the clone-into-owned baseline.
 pub const DEFAULT_QUEUEING_BATCH_SIZE: usize = 64;
 
-/// Soft in-flight cap (channel batches + pump buffer). Past it the
-/// pump yields so the worker drains. No hard cap: a permanently
-/// stalled worker surfaces via the `wait_for_replay` timeout on the
-/// shared err slot.
+/// Hard in-flight cap (channel batches + pump buffer). The channel is bounded
+/// at `max_records / batch_size`, so past it the pump's `send` blocks — real
+/// backpressure to the source instead of unbounded RAM growth. Deadlock-safe:
+/// shadow is fed by an independent walsender task (+keepalive), so a parked
+/// pump can't starve `wait_for_replay`.
 pub const DEFAULT_QUEUEING_RECORD_SINK_CAPACITY: usize = 16_384;
 
 /// Worker `on_idle` cadence. Lets CH emitter's hold-INSERT-open
@@ -55,7 +56,7 @@ pub const DEFAULT_QUEUEING_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 /// Construct via [`QueueingRecordSink::spawn`].
 pub struct QueueingRecordSink {
     /// Each batch carries its ship `Instant` for the worker's `queued_ms`.
-    tx: Option<mpsc::UnboundedSender<(Instant, Vec<Record<'static>>)>>,
+    tx: Option<mpsc::Sender<(Instant, Vec<Record<'static>>)>>,
     /// Pump-side accumulator; shipped as one message at `batch_size` (or `close`).
     buf: Vec<Record<'static>>,
     batch_size: usize,
@@ -64,7 +65,6 @@ pub struct QueueingRecordSink {
     /// Records the worker has dispatched; with `in_flight`, tells a draining
     /// queue from a stalled one.
     processed: Arc<AtomicU64>,
-    soft_cap: u64,
     worker: Option<JoinHandle<()>>,
     /// Per-txn span map; `Some` only with OTLP on. `flush_buf` stamps each
     /// shipped record's ship instant (`note_shipped`).
@@ -76,7 +76,7 @@ impl QueueingRecordSink {
     pub fn spawn<S>(
         inner: S,
         batch_size: usize,
-        soft_cap: usize,
+        max_records: usize,
         span_registry: Option<TxnSpanRegistry>,
     ) -> Self
     where
@@ -85,28 +85,32 @@ impl QueueingRecordSink {
         Self::spawn_with_idle(
             inner,
             batch_size,
-            soft_cap,
+            max_records,
             DEFAULT_QUEUEING_IDLE_INTERVAL,
             span_registry,
         )
     }
 
     /// Worker owns `inner`, drains batches, dispatches each record.
-    /// `soft_cap` triggers `yield_now` once in-flight (channel + pump
-    /// buffer) exceeds it. `idle_interval` paces `inner.on_idle()` on a
-    /// quiescent channel so time-based observer work (CH emitter's
-    /// hold-INSERT-open deadline) fires without fresh records.
+    /// `max_records` bounds records in flight (channel + pump buffer):
+    /// the channel holds `max_records / batch_size` batches, so a slow
+    /// worker blocks the pump's send instead of growing without limit.
+    /// `idle_interval` paces `inner.on_idle()` on a quiescent channel so
+    /// time-based observer work (CH emitter's hold-INSERT-open deadline)
+    /// fires without fresh records.
     pub fn spawn_with_idle<S>(
         mut inner: S,
         batch_size: usize,
-        soft_cap: usize,
+        max_records: usize,
         idle_interval: Duration,
         span_registry: Option<TxnSpanRegistry>,
     ) -> Self
     where
         S: RecordSink + Send + 'static,
     {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Vec<Record<'static>>)>();
+        let batch_size = batch_size.max(1);
+        let channel_cap = (max_records / batch_size).max(1);
+        let (tx, mut rx) = mpsc::channel::<(Instant, Vec<Record<'static>>)>(channel_cap);
         let err = Arc::new(StdMutex::new(None));
         let in_flight = Arc::new(AtomicU64::new(0));
         let processed = Arc::new(AtomicU64::new(0));
@@ -114,14 +118,13 @@ impl QueueingRecordSink {
         let in_flight_w = in_flight.clone();
         let processed_w = processed.clone();
         let reg_w = span_registry.clone();
-        let batch_size = batch_size.max(1);
         let idle_interval = idle_interval.max(Duration::from_millis(1));
         let worker = tokio::spawn(async move {
             // Park error, drop in-flight (`n`, or 0 on idle path),
             // close+drain so `in_flight` settles. Caller breaks after.
             let park_err_and_drain = async |e: SinkError,
                                             n: u64,
-                                            rx: &mut mpsc::UnboundedReceiver<(
+                                            rx: &mut mpsc::Receiver<(
                 Instant,
                 Vec<Record<'static>>,
             )>| {
@@ -217,7 +220,6 @@ impl QueueingRecordSink {
             err,
             in_flight,
             processed,
-            soft_cap: soft_cap.max(1) as u64,
             worker: Some(worker),
             span_registry,
         }
@@ -240,10 +242,10 @@ impl QueueingRecordSink {
         if let Some(e) = self.take_pending_error() {
             return Err(e);
         }
-        self.flush_buf()
+        self.flush_buf().await
     }
 
-    fn flush_buf(&mut self) -> Result<(), SinkError> {
+    async fn flush_buf(&mut self) -> Result<(), SinkError> {
         if self.buf.is_empty() {
             return Ok(());
         }
@@ -261,7 +263,9 @@ impl QueueingRecordSink {
             .tx
             .as_ref()
             .ok_or_else(|| SinkError::Other("queueing record sink already closed".into()))?;
-        if tx.send((Instant::now(), batch)).is_err() {
+        // Blocking the pump here is deadlock-safe: shadow is fed by an independent
+        // walsender task (+keepalive), so a parked pump can't starve wait_for_replay.
+        if tx.send((Instant::now(), batch)).await.is_err() {
             self.in_flight.fetch_sub(n, Ordering::Relaxed);
             if let Some(e) = self.take_pending_error() {
                 return Err(e);
@@ -277,7 +281,7 @@ impl QueueingRecordSink {
     /// Call after the pump stops feeding records.
     pub async fn close(mut self) -> Result<(), SinkError> {
         // Flush tail before dropping sender so worker sees final batch.
-        self.flush_buf()?;
+        self.flush_buf().await?;
         self.tx.take();
         if let Some(handle) = self.worker.take() {
             // Treat a worker panic as a sink error so daemon shutdown
@@ -337,12 +341,7 @@ impl RecordSink for QueueingRecordSink {
                 catalog_signal: record.catalog_signal,
             });
             if self.buf.len() >= self.batch_size {
-                self.flush_buf()?;
-                // Soft backpressure: yield only when actually behind,
-                // checked at flush time to keep per-record cost low.
-                if self.in_flight.load(Ordering::Relaxed) > self.soft_cap {
-                    tokio::task::yield_now().await;
-                }
+                self.flush_buf().await?;
             }
             Ok(())
         })

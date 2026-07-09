@@ -200,7 +200,8 @@ struct Args {
     /// `restore_command` reads from here
     #[arg(long)]
     out_dir: PathBuf,
-    /// Optional permanent physical slot name on source PG
+    /// CLI override for the TOML's `[source] slot` (physical replication
+    /// slot). Unset defers to config; unset in both = slotless.
     #[arg(long)]
     slot: Option<String>,
     /// Start LSN in `X/Y` hex form. Defaults to source's current
@@ -514,10 +515,17 @@ async fn run(args: Args) -> Result<()> {
         if let Some(ms) = args.ch_flush_timeout_ms {
             cfg.flush_timeout = std::time::Duration::from_millis(ms);
         }
+        // CLI override wins over TOML `[source] slot` (CLI > config).
+        if args.slot.is_some() {
+            cfg.source_slot = args.slot.clone();
+        }
         Some(cfg)
     } else {
         None
     };
+    // Effective physical replication slot (`[source] slot` + --slot override);
+    // None = slotless.
+    let source_slot: Option<String> = ch_config.as_ref().and_then(|c| c.source_slot.clone());
     let bootstrap_end_lsn: Option<u64> = if matches!(args.bootstrap_mode, BootstrapMode::Off) {
         None
     } else {
@@ -689,6 +697,14 @@ async fn run(args: Args) -> Result<()> {
         .await
         .set_invalidation_epoch(invalidation_epoch.clone());
 
+    // Create the configured slot before preflight, which requires it to exist.
+    if let Some(slot) = source_slot.as_deref() {
+        feed.ensure_physical_slot(slot)
+            .await
+            .with_context(|| format!("ensure physical replication slot {slot}"))?;
+        tracing::info!(target: "walshadow", slot, "physical replication slot ready");
+    }
+
     // Pre-flight validators run after both source + shadow SQL clients
     // are up so every check has its connection.
     if !args.skip_preflight {
@@ -708,7 +724,7 @@ async fn run(args: Args) -> Result<()> {
             source_version_num,
             source_sql,
             shadow_sql: &shadow_sql,
-            slot: args.slot.as_deref(),
+            slot: source_slot.as_deref(),
             ch_config: ch_config.as_ref(),
         })
         .await
@@ -766,7 +782,7 @@ async fn run(args: Args) -> Result<()> {
         }
     };
 
-    feed.start_physical_replication(args.slot.as_deref(), aligned, ident.timeline)
+    feed.start_physical_replication(source_slot.as_deref(), aligned, ident.timeline)
         .await
         .context("START_REPLICATION")?;
     // Spill dir wiped every startup: cursor file commits drains
@@ -1194,9 +1210,12 @@ async fn run(args: Args) -> Result<()> {
                 .context("write resume cursor")?;
             last_cursor_write = Some(Instant::now());
         }
+        // flush drives a physical slot's restart_lsn (what the source retains),
+        // so cap it at apply_ceiling: the source keeps WAL until CH has durably
+        // applied it (and shadow replayed), never recycling un-consumed WAL.
         let status = StandbyStatus {
             write_lsn: received,
-            flush_lsn: durable,
+            flush_lsn: durable.min(apply_ceiling),
             apply_lsn: apply_ceiling,
         };
         let dispatched_before = stream.dispatched_lsn();
@@ -1210,10 +1229,34 @@ async fn run(args: Args) -> Result<()> {
             // Idle tick so metrics/cursor keep tracking the draining pipeline
             // when no new WAL arrives.
             _ = tokio::time::sleep(metrics_tick) => None,
-            res = feed.next_chunk(status, &mut chunk_buf) => Some(match res? {
-                Some(c) => c,
-                None => break "CopyDone",
-            }),
+            res = feed.next_chunk(status, &mut chunk_buf) => match res {
+                Ok(Some(c)) => Some(c),
+                Ok(None) => break "CopyDone",
+                Err(e) => {
+                    let resume = stream.next_lsn();
+                    tracing::warn!(
+                        target: "walshadow",
+                        error = %e,
+                        resume_lsn = format_pg_lsn(resume).to_string(),
+                        "source stream error — recovering",
+                    );
+                    feed = reconnect_or_fatal(
+                        e,
+                        &cfg,
+                        source_slot.as_deref(),
+                        resume,
+                        ident.timeline,
+                        Duration::from_secs(args.status_interval),
+                    )
+                    .await?;
+                    tracing::info!(
+                        target: "walshadow",
+                        resume_lsn = format_pg_lsn(resume).to_string(),
+                        "source reconnected — resuming replication",
+                    );
+                    None
+                }
+            },
         };
         let server_end = chunk.as_ref().map(|c| c.server_wal_end).unwrap_or(received);
         if let Some(chunk) = chunk {
@@ -1961,6 +2004,47 @@ async fn populate_metrics(
         config_backfills_pending_by_mode: backfiller.map(|b| b.pending_by_mode()).unwrap_or([0; 3]),
     };
     registry.set(snap).await;
+}
+
+/// Recover from a source stream error. A transient drop retries the reconnect
+/// with exponential backoff until the source is back; a recycled segment
+/// (58P01) is fatal — the resume point is gone, so the daemon exits and
+/// recovery is a re-seed via config `initial_load` on restart, not a reconnect.
+async fn reconnect_or_fatal(
+    e: anyhow::Error,
+    cfg: &PgConfig,
+    slot: Option<&str>,
+    resume_lsn: u64,
+    timeline: u32,
+    status_interval: Duration,
+) -> Result<SourceFeed> {
+    use backon::{ExponentialBuilder, Retryable};
+
+    let recycled = |e: anyhow::Error| {
+        e.context(
+            "source WAL segment recycled past the resume point; \
+             re-seed the affected tables via config initial_load \
+             (base_backup/object_store), then restart",
+        )
+    };
+    if walshadow::source_feed::is_wal_segment_removed(&e) {
+        return Err(recycled(e));
+    }
+    // Ride out a transient drop (source restart, wal_sender_timeout, brief
+    // network blip); only a recycled segment stops the retry and is fatal.
+    (|| SourceFeed::reconnect(cfg, slot, resume_lsn, timeline, status_interval))
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(10))
+                .without_max_times(),
+        )
+        .when(|e: &anyhow::Error| !walshadow::source_feed::is_wal_segment_removed(e))
+        .notify(|e: &anyhow::Error, d: Duration| {
+            tracing::warn!(target: "walshadow", error = %e, retry_in_ms = d.as_millis() as u64, "source reconnect failed — retrying");
+        })
+        .await
+        .map_err(recycled)
 }
 
 /// Orchestrate BASE_BACKUP into a fresh shadow data dir; returns the
