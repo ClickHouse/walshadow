@@ -576,6 +576,8 @@ mod tests {
                 xmax: 0,
                 infomask: 0,
                 source_lsn: 0xCAFE,
+                blkno: 0,
+                offnum: 0,
                 columns: vec![Some(crate::heap_decoder::ColumnValue::Int4(v as i32))],
             })
             .await
@@ -651,6 +653,8 @@ mod tests {
                 xmax: 0,
                 infomask: 0,
                 source_lsn: 1,
+                blkno: 0,
+                offnum: 0,
                 columns: vec![Some(crate::heap_decoder::ColumnValue::Int4(v as i32))],
             })
             .await

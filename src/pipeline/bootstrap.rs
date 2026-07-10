@@ -47,6 +47,7 @@ use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::shadow_catalog::RelDescriptor;
 use crate::spill::ToastChunk;
 use crate::toast::{ChunkMap, ToastResolver};
+use crate::toast_tid::TidEvent;
 use crate::xact_buffer::{detoasted_value, try_reassemble};
 
 /// Caller runs the completion sequence from this: `FlushAll` →
@@ -136,14 +137,10 @@ pub async fn drain(
         // a zero-row placeholder (no destination row). `rel.oid` matches the
         // referring pointer's `va_toastrelid`.
         if catalog.is_toast(rfn.db_node, rfn.rel_node) {
-            if let Some(chunk) = chunk_from_columns(&tuple.columns, rel.oid, source_lsn) {
+            if let Some(chunk) = chunk_from_columns(&tuple, rel.oid) {
                 chunk_batch.push(chunk);
                 if chunk_batch.len() >= CHUNK_PUT_BATCH {
-                    resolver
-                        .put(&chunk_batch)
-                        .await
-                        .map_err(|e| format!("bootstrap: toast store put: {e}"))?;
-                    chunk_batch.clear();
+                    flush_chunks(&resolver, &mut chunk_batch, source_lsn).await?;
                 }
             }
             continue;
@@ -183,10 +180,7 @@ pub async fn drain(
 
     // All chunks durable before resolving deferred referrers.
     if !chunk_batch.is_empty() {
-        resolver
-            .put(&chunk_batch)
-            .await
-            .map_err(|e| format!("bootstrap: toast store put: {e}"))?;
+        flush_chunks(&resolver, &mut chunk_batch, start_lsn).await?;
     }
 
     if !deferred.is_empty() {
@@ -281,7 +275,7 @@ async fn resolve_or_fill_toast(
                 continue;
             }
             resolver
-                .fetch_into(key.0, key.1, &mut chunks)
+                .fetch_into(key.0, key.1, tuple.source_lsn, &mut chunks)
                 .await
                 .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?;
         }
@@ -315,15 +309,43 @@ async fn resolve_or_fill_toast(
     Ok(())
 }
 
+/// Put a chunk batch, then record its births with the TID tracker (chunks
+/// durable first, mirroring the WAL-side apply order). Walk-side births
+/// cover dead-at-walk tuples too: their deletes may still arrive in
+/// replayed WAL and must resolve.
+async fn flush_chunks(
+    resolver: &ToastResolver,
+    batch: &mut Vec<ToastChunk>,
+    lsn: u64,
+) -> Result<(), String> {
+    resolver
+        .put(batch)
+        .await
+        .map_err(|e| format!("bootstrap: toast store put: {e}"))?;
+    let births: Vec<TidEvent> = batch
+        .iter()
+        .filter(|c| c.offnum != 0)
+        .map(|c| TidEvent::Birth {
+            toast_relid: c.toast_relid,
+            blkno: c.blkno,
+            offnum: c.offnum,
+            value_id: c.value_id,
+        })
+        .collect();
+    resolver
+        .apply_tid_events(&births, lsn)
+        .await
+        .map_err(|e| format!("bootstrap: toast tid journal: {e}"))?;
+    batch.clear();
+    Ok(())
+}
+
 /// Reinterpret a `pg_toast_*` tuple's 3 columns (`chunk_id oid`,
 /// `chunk_seq int4`, `chunk_data bytea`) into a [`ToastChunk`]. `toast_relid`
 /// is the toast rel's pg_class OID (`RelDescriptor::oid`), matching the
 /// referring pointer's `va_toastrelid`.
-fn chunk_from_columns(
-    cols: &[Option<ColumnValue>],
-    toast_relid: u32,
-    source_lsn: u64,
-) -> Option<ToastChunk> {
+fn chunk_from_columns(tuple: &BackfillTuple, toast_relid: u32) -> Option<ToastChunk> {
+    let cols = &tuple.columns;
     if cols.len() < 3 {
         return None;
     }
@@ -343,7 +365,9 @@ fn chunk_from_columns(
         toast_relid,
         value_id,
         chunk_seq,
-        source_lsn,
+        source_lsn: tuple.source_lsn,
+        blkno: tuple.blkno,
+        offnum: tuple.offnum,
         chunk_data,
     })
 }
@@ -414,6 +438,8 @@ mod tests {
             xmax: 0,
             infomask: 0,
             source_lsn: 0x1000,
+            blkno: 0,
+            offnum: 0,
             columns: vec![Some(ColumnValue::Int4(id))],
         }
     }
@@ -496,6 +522,8 @@ mod tests {
             xmax: 0,
             infomask: 0,
             source_lsn: 0x1000,
+            blkno: 0,
+            offnum: 0,
             columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
                 va_rawsize: 9,
                 va_extinfo: 5,
@@ -518,6 +546,8 @@ mod tests {
             xmax: 0,
             infomask: 0,
             source_lsn: 0x1000,
+            blkno: 1,
+            offnum: 1,
             columns: vec![
                 Some(ColumnValue::Oid(value_id)),
                 Some(ColumnValue::Int4(seq)),

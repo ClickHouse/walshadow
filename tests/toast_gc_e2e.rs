@@ -1,18 +1,20 @@
 //! TOAST chunk GC end-to-end (`plans/TOAST.md`): source PG →
-//! walshadow pipeline → CH chunk store, then a sweep against the live source.
+//! walshadow pipeline → CH chunk store, TID-death-driven sweep. No source
+//! SQL session: deaths resolve from decoded WAL deletes at commit.
 //!
 //! Drills the acceptance list in one flow:
-//! * UPDATE rewrites a toasted value to a new valueid → old valueid collected
-//! * DELETE of the referring row → its valueid collected
-//! * candidates apply only after `emitter_ack ≥ S` (idle streams never clear
-//!   the gate — ack is a commit watermark — so the test nudges commits while
-//!   the sweep waits)
+//! * UPDATE rewrites a toasted value to a new valueid → old valueid's death
+//!   resolves (same-xact chunk delete) and its chunks collect
+//! * DELETE of the referring row → its valueid collects
+//! * deaths apply only once `emitter_ack ≥ death_lsn` (pending until the
+//!   death's own commit drains; the sweep loop below converges on that)
 //! * a subsequent referring row (unchanged-toast UPDATE) still reassembles
 //!   from the swept store
-//! * toast deletes tick `toast_chunk_deletes`, not `toast_chunks_malformed`
+//! * toast deletes tick `toast_chunk_deletes` + `toast_deaths_resolved`,
+//!   never `toast_chunks_malformed` / `toast_deaths_unresolved`
 //!
-//! Store/horizon semantics in isolation live in `toast_resolvers.rs` (CH)
-//! and `src/toast.rs` unit tests (disk mtime guard).
+//! Store/death semantics in isolation live in `toast_resolvers.rs` (CH),
+//! `src/toast.rs` (disk) and `src/toast_tid.rs` (tracker) unit tests.
 
 #![cfg(target_os = "linux")]
 
@@ -22,8 +24,6 @@ mod fx;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::SslMode;
 use walshadow::ch_emitter::{ColumnMapping, TableTarget};
 use walshadow::shadow_catalog::RelName;
 use walshadow::toast::ToastMode;
@@ -112,6 +112,7 @@ async fn sweep_collects_dead_values_and_survivors_reassemble() {
         ],
     }];
 
+    let tid_journal = tmp.path().join("toast-tids.journal");
     let mut pipeline = fx::build_pipeline_with(
         fx::BuildPipelineArgs {
             tmp: &tmp,
@@ -125,7 +126,10 @@ async fn sweep_collects_dead_values_and_survivors_reassemble() {
             app_name: "walshadow-toast-gc",
             ddl: None,
         },
-        |cfg| cfg.toast.mode = ToastMode::ClickHouse,
+        move |cfg| {
+            cfg.toast.mode = ToastMode::ClickHouse;
+            cfg.toast.tid_journal = Some(tid_journal);
+        },
     )
     .await;
 
@@ -178,50 +182,30 @@ async fn sweep_collects_dead_values_and_survivors_reassemble() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Sweep with the pipeline's own store + ack watermark, sidecar SQL to
-    // the source — the daemon's wiring, driven once for determinism.
-    let scfg = source.config();
+    // Sweep with the pipeline's own store + tracker + ack watermark — the
+    // daemon's wiring, driven directly. Deaths stay pending until the ack
+    // passes their commit; loop until both collect.
     let gc = ToastGc {
         store: pipeline.handle.toast.store().expect("ch store armed"),
-        source: PgConfig {
-            host: scfg.socket_dir.to_string_lossy().into_owned(),
-            port: scfg.port,
-            user: "postgres".into(),
-            password: None,
-            database: "postgres".into(),
-            application_name: "walshadow-toast-gc".into(),
-            sslmode: SslMode::Disable,
-        },
+        tracker: pipeline.handle.toast.tracker().expect("tid tracker armed"),
         emitter_ack: pipeline.ack.clone(),
         interval: Duration::from_secs(3600),
-        ack_wait: Duration::from_secs(20),
         stats: pipeline.stats.clone(),
     };
-    let sweep = tokio::spawn(async move { gc.sweep_once().await });
-    // Ack is a commit watermark, so an idle stream never reaches an S read
-    // after its last commit; nudge commits + pump until the gate clears.
-    let mut nudge = 0;
-    while !sweep.is_finished() {
-        assert!(nudge < 20, "sweep still blocked after {nudge} nudges");
-        nudge += 1;
-        fx::spawn_workload(
-            &source,
-            vec![
-                format!(
-                    "INSERT INTO public.doc VALUES ({}, 'nudge', NULL)",
-                    1000 + nudge
-                ),
-                "SELECT pg_switch_wal()".into(),
-            ],
-        )
-        .join()
-        .ok();
-        fx::pump_segments(&mut pipeline, 1, Duration::from_secs(3)).await;
+    let mut deleted = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while deleted < 2 {
+        let outcome = gc.sweep_once().await.expect("sweep completes");
+        deleted += outcome.deleted;
+        assert!(
+            Instant::now() < deadline,
+            "GC never collected both deaths (deleted {deleted})"
+        );
+        if deleted < 2 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
-    let outcome = sweep.await.expect("sweep task").expect("sweep completes");
-    assert_eq!(outcome.relids, 1);
-    assert_eq!(outcome.candidates, 2, "A and C dead, B live");
-    assert_eq!(outcome.deleted, 2);
+    assert_eq!(deleted, 2, "A and C dead, B live");
     assert!(pipeline.stats.toast_gc_sweeps.load(Ordering::Relaxed) >= 1);
     assert_eq!(
         pipeline
@@ -231,9 +215,14 @@ async fn sweep_collects_dead_values_and_survivors_reassemble() {
         2
     );
     assert_eq!(
+        pipeline.stats.toast_deaths_resolved.load(Ordering::Relaxed),
+        2,
+        "both deaths resolved from decoded WAL deletes"
+    );
+    assert_eq!(
         pipeline
             .stats
-            .toast_gc_skipped_source_unreachable
+            .toast_deaths_unresolved
             .load(Ordering::Relaxed),
         0
     );

@@ -177,10 +177,9 @@ crate::atomic_stats! {
         /// chunk_id/seq/data, type mismatch). Surfaces a corrupt catalog or
         /// future TOAST layout as a counter, not silent loss
         pub toast_chunks_malformed,
-        /// DELETE/TRUNCATE on a toast rel: TID-keyed (replica identity
-        /// `nothing`), no chunk_id to apply against the store, dropped by
-        /// design — dead chunks reclaimed by the GC sweep
-        /// (`crate::toast_gc`), not per-record
+        /// DELETE on a toast rel: TID-keyed (replica identity `nothing`),
+        /// buffered for commit-time death resolution against the birth map
+        /// (`crate::toast_tid`); GC applies resolved deaths off the hot path
         pub toast_chunk_deletes,
     }
 }

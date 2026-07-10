@@ -55,6 +55,9 @@ use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastP
 pub enum SpillEntry {
     Heap(Box<DecodedHeap>),
     Chunk(ToastChunk),
+    /// `XLOG_HEAP_DELETE` on a toast rel: TID-keyed, resolved to a dead
+    /// `value_id` at commit via [`crate::toast_tid`]
+    ToastDelete(ToastDelete),
 }
 
 /// One chunk from a `pg_toast.pg_toast_<oid>` INSERT. PG `toast_save_datum`
@@ -72,8 +75,25 @@ pub struct ToastChunk {
     /// Keeps WAL-order drain stable across spilled + in-memory chunks for
     /// one value
     pub source_lsn: u64,
+    /// TID of the chunk's heap tuple: birth key for TID death tracking
+    /// ([`crate::toast_tid`]). 0/0 when synthesized off the merged chunk
+    /// map (store `put_map` rows, never seen by the tracker)
+    pub blkno: u32,
+    pub offnum: u16,
     /// `TOAST_MAX_CHUNK_SIZE` ≈ 1996 bytes typical, last chunk shorter
     pub chunk_data: Vec<u8>,
+}
+
+/// TID of a deleted toast tuple. PG `toast_delete_datum` deletes every chunk
+/// of a value in one xact; resolving any one delete against the seq-0 birth
+/// map identifies the dead value, so only that one produces a death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToastDelete {
+    /// Toast rel pg_class OID (matches the birth's `toast_relid`)
+    pub toast_relid: u32,
+    pub blkno: u32,
+    pub offnum: u16,
+    pub source_lsn: u64,
 }
 
 #[derive(Debug, Error)]
@@ -88,10 +108,11 @@ pub type Result<T> = std::result::Result<T, SpillError>;
 
 /// ASCII for `xxd`-friendly debug
 pub const SPILL_MAGIC: [u8; 2] = *b"WS";
-/// v2 added the `HeapOp::Truncate` tag-4 body encoding. `DrainEntry` events
-/// (Catalog, and Config/Signal per the runtime-config plan) are drain-time,
-/// never spilled, so they don't touch this format
-pub const SPILL_VERSION: u16 = 2;
+/// v2 added the `HeapOp::Truncate` tag-4 body encoding. v3 added chunk
+/// TIDs + the `ToastDelete` entry (TID death tracking). `DrainEntry`
+/// events (Catalog, and Config/Signal per the runtime-config plan) are
+/// drain-time, never spilled, so they don't touch this format
+pub const SPILL_VERSION: u16 = 3;
 
 pub struct SpillStore {
     dir: PathBuf,
@@ -171,6 +192,7 @@ impl SpillWriter {
         let tag: u8 = match entry {
             SpillEntry::Heap(_) => 0,
             SpillEntry::Chunk(_) => 1,
+            SpillEntry::ToastDelete(_) => 2,
         };
         body.push(tag);
         // u32 LE length placeholder, back-patched after body appends in place
@@ -180,6 +202,7 @@ impl SpillWriter {
         match entry {
             SpillEntry::Heap(h) => encode_heap_into(&mut body, h),
             SpillEntry::Chunk(c) => encode_chunk_into(&mut body, c),
+            SpillEntry::ToastDelete(d) => encode_toast_delete_into(&mut body, d),
         }
         let inner_len = (body.len() - inner_start) as u32;
         body[len_off..len_off + 4].copy_from_slice(&inner_len.to_le_bytes());
@@ -286,6 +309,11 @@ impl SpillReader {
                 let mut cur = Cursor::new(&body);
                 let c = decode_chunk(&mut cur)?;
                 SpillEntry::Chunk(c)
+            }
+            2 => {
+                let mut cur = Cursor::new(&body);
+                let d = decode_toast_delete(&mut cur)?;
+                SpillEntry::ToastDelete(d)
             }
             other => {
                 return Err(SpillError::Format {
@@ -491,12 +519,21 @@ fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
 }
 
 fn encode_chunk_into(out: &mut Vec<u8>, c: &ToastChunk) {
-    out.reserve(32 + c.chunk_data.len());
+    out.reserve(40 + c.chunk_data.len());
     push_u32(out, c.toast_relid);
     push_u32(out, c.value_id);
     push_u32(out, c.chunk_seq);
     push_u64(out, c.source_lsn);
+    push_u32(out, c.blkno);
+    push_u16(out, c.offnum);
     push_bytes(out, &c.chunk_data);
+}
+
+fn encode_toast_delete_into(out: &mut Vec<u8>, d: &ToastDelete) {
+    push_u32(out, d.toast_relid);
+    push_u32(out, d.blkno);
+    push_u16(out, d.offnum);
+    push_u64(out, d.source_lsn);
 }
 
 // ── decoding ────────────────────────────────────────────────────────
@@ -713,13 +750,26 @@ fn decode_chunk(c: &mut Cursor) -> Result<ToastChunk> {
     let value_id = c.u32()?;
     let chunk_seq = c.u32()?;
     let source_lsn = c.u64()?;
+    let blkno = c.u32()?;
+    let offnum = c.u16()?;
     let chunk_data = c.bytes()?;
     Ok(ToastChunk {
         toast_relid,
         value_id,
         chunk_seq,
         source_lsn,
+        blkno,
+        offnum,
         chunk_data,
+    })
+}
+
+fn decode_toast_delete(c: &mut Cursor) -> Result<ToastDelete> {
+    Ok(ToastDelete {
+        toast_relid: c.u32()?,
+        blkno: c.u32()?,
+        offnum: c.u16()?,
+        source_lsn: c.u64()?,
     })
 }
 
@@ -763,6 +813,8 @@ mod tests {
             value_id,
             chunk_seq: seq,
             source_lsn: lsn,
+            blkno: 12,
+            offnum: 4,
             chunk_data: body.to_vec(),
         }
     }
@@ -808,6 +860,27 @@ mod tests {
             other => panic!("expected Chunk, got {other:?}"),
         }
         assert!(r.next().await.unwrap().is_none(), "EOF expected");
+        r.unlink().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn round_trip_toast_delete() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let mut w = store.writer(7, 0x100).await.unwrap();
+        let d = ToastDelete {
+            toast_relid: 16400,
+            blkno: 3,
+            offnum: 9,
+            source_lsn: 0x2200,
+        };
+        w.write(&SpillEntry::ToastDelete(d)).await.unwrap();
+        let mut r = w.finish().await.unwrap();
+        match r.next().await.unwrap().unwrap() {
+            SpillEntry::ToastDelete(d2) => assert_eq!(d2, d),
+            other => panic!("expected ToastDelete, got {other:?}"),
+        }
+        assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
     }
 

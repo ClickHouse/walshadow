@@ -1129,6 +1129,10 @@ impl CopyBackfiller {
                         xmax: 0,
                         infomask: 0,
                         source_lsn: s_lsn,
+                        // COPY text rows have no on-page TID (values arrive
+                        // detoasted, no chunks flow here)
+                        blkno: 0,
+                        offnum: 0,
                         columns,
                     })
                     .await

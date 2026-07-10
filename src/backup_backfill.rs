@@ -1254,6 +1254,8 @@ mod tests {
             xmax,
             infomask,
             source_lsn: 0x1000,
+            blkno: 0,
+            offnum: 0,
             columns: Vec::new(),
         }
     }

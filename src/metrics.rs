@@ -62,7 +62,8 @@ pub struct MetricsSnapshot {
     pub decoder_toast_deletes_total: u64,
     pub toast_gc_sweeps_total: u64,
     pub toast_gc_values_deleted_total: u64,
-    pub toast_gc_skipped_source_unreachable_total: u64,
+    pub toast_deaths_resolved_total: u64,
+    pub toast_deaths_unresolved_total: u64,
     pub emitter_rows_total: u64,
     pub emitter_blocks_total: u64,
     pub emitter_xacts_total: u64,
@@ -320,7 +321,7 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         ),
         (
             "walshadow_decoder_toast_deletes_total",
-            "DELETE/TRUNCATE records on toast relations, dropped by design (TID-keyed; GC sweep reclaims).",
+            "DELETE records on toast relations, buffered for TID death resolution.",
             "counter",
             snap.decoder_toast_deletes_total,
         ),
@@ -337,10 +338,16 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             snap.toast_gc_values_deleted_total,
         ),
         (
-            "walshadow_toast_gc_skipped_source_unreachable_total",
-            "GC sweeps skipped because source PG was unreachable.",
+            "walshadow_toast_deaths_resolved_total",
+            "Toast deaths resolved to a value + commit LSN by the TID tracker.",
             "counter",
-            snap.toast_gc_skipped_source_unreachable_total,
+            snap.toast_deaths_resolved_total,
+        ),
+        (
+            "walshadow_toast_deaths_unresolved_total",
+            "TOAST tracking gaps which can leak stored chunks.",
+            "counter",
+            snap.toast_deaths_unresolved_total,
         ),
         (
             "walshadow_emitter_rows_total",

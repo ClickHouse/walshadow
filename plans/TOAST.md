@@ -11,10 +11,24 @@ with the referring tuple in WAL. In-xact WAL reassembly is the fast path — see
 
 - **Stores.** `disabled` (default; NULL/default-fill on miss, counted
   `toast_values_filled_default`, never an error), `disk` (`DiskChunkStore`,
-  append-only file per value, miss is a hard error), `clickhouse`
-  (`ClickHouseChunkStore`, chunks as rows in a `pg_toast_<relid>`
-  `ReplacingMergeTree(_lsn)` table, minimal `chunk_id`/`chunk_seq`/`chunk_data`/
-  `_lsn` form, `ORDER BY (chunk_id, chunk_seq)`). All `src/toast.rs`.
+  append-only file per value, framed `[seq][len][lsn][body]` under a magic
+  header — headerless pre-LSN files read as `lsn = 0` and upgrade on the
+  next append — miss is a hard error), `clickhouse` (`ClickHouseChunkStore`,
+  chunks as rows in a `pg_toast_<relid>` `ReplacingMergeTree(_lsn)` table,
+  minimal `chunk_id`/`chunk_seq`/`chunk_data`/`_lsn` form,
+  `ORDER BY (chunk_id, _lsn, chunk_seq)`). All `src/toast.rs`.
+- **Generations.** `GetNewOidWithIndex` checks a fresh `va_valueid` only
+  against the live toast index, so a dead-and-vacuumed id can be
+  re-allocated: one `(toast_relid, chunk_id)` may hold several generations,
+  written whole under one commit LSN each (one xact writes every chunk of a
+  value; bootstrap stamps a uniform walk LSN). `fetch` returns max-LSN group
+  no later than referring record, so lagging decode cannot read a future
+  generation and a shorter regeneration never yields new seq 0 + stale
+  suffix. Generation LSN in ClickHouse sorting key keeps older generations
+  available until ack-gated GC. Defense in depth: `try_reassemble` validates
+  concatenated length against the pointer's stored size, as PG's
+  `toast_fetch_datum` does (`src/backend/access/common/detoast.c`) — a
+  mismatch is a loud error, never a silent chimera.
 - **WAL path.** Same-xact values reassemble inline from the buffered chunk map
   (`reassemble`, `src/xact_buffer.rs`), the fast path; chunks also `put`
   to the store for future re-emit. A `MissingToastChunk` miss (pre-window
@@ -38,64 +52,78 @@ with the referring tuple in WAL. In-xact WAL reassembly is the fast path — see
   dedup is purely a dedup, never a value change
   ([[project_walshadow_eventual_consistency]]).
 
-## Chunk GC — source anti-join sweep
+## Chunk GC — TID death tracking
 
 PG drops superseded chunks in the same xact as the superseding main-table op
 (`heap_toast_delete`, PG `src/backend/access/heap/heaptoast.c`), but the toast
 rel's replica identity is `nothing`: the delete WAL carries a TID, no
-`chunk_id` — unappliable to the `(chunk_id, chunk_seq)` store (same blind spot
-as system catalogs, [[feedback_pg_version_wal_skew]]). The decoder drops it
-under `toast_chunk_deletes`; dead values accumulate. Correctness never depends
-on GC — chunks are immutable per `va_valueid`, dedup keeps live values right,
-the leak is storage-only. GC's risk is the inverse: deleting a chunk a future
+`chunk_id` — unappliable directly to the `(chunk_id, chunk_seq)` store (same
+blind spot as system catalogs, [[feedback_pg_version_wal_skew]]). Correctness
+never depends on GC — generations are immutable, fetch keeps the newest, the
+leak is storage-only. GC's risk is the inverse: deleting a chunk a future
 fetch needs.
 
-Sweep (`src/toast_gc.rs`, `[toast] gc_interval_secs`, 0 = disabled default):
-per store relid, anti-join store valueids against the live source toast rel
-over a sidecar SQL session. Bounds precede the scans: read
-`pre = pg_current_wal_lsn()`, then snapshot `xmax` in a separate statement
-(a statement's snapshot precedes its target-list eval, so a combined read
-anchors `xmax` before `pre` and a xact can take xid ≥ `xmax` yet commit
-≤ `pre`; ordered, any commit ≤ `pre` holds a xid below `xmax`), then wait
-`pg_snapshot_xmin ≥ xmax`. PG orders commit WAL-record → flush → sync-rep
-wait → `ProcArrayEndTransaction` (PG `src/backend/access/transam/xact.c`),
-so walsender ships a commit — and its chunks land with `_lsn ≤ pre` — while
-snapshots still miss it, unboundedly long under sync-rep wait; the barrier
-makes every commit ≤ `pre` scan-visible, and later commits carry
-`_lsn > pre`. Absence at a scan's statement snapshot then proves death,
-never a not-yet-visible insert. Live sets stream into roaring bitmaps and
-the store scan anti-joins against them inline — CH aggregates in order over
-the `(chunk_id, chunk_seq)` sort key (no whole-table hash agg) with `HAVING
-max(_lsn) <= pre`, disk filters during the dir walk — so a sweep holds
-compressed bitmaps plus dead ids, never the stored set. `S =
-pg_current_wal_lsn()` read **after** the scans gates deletion on
-`emitter_ack ≥ S`. Fetches serve replay re-decode (starts at ack) and fresh
-WAL keeping a pre-window `va_valueid`; a dead value's every referencing
-record has LSN < `L_dead` ≤ statement snapshot ≤ `S`, so ack past `S` means
-no fetch can want it. A dropped source rel rides the same argument (empty
-live set, drop LSN ≤ `S`) — orphaned store tables collect fully. Ack is a
-commit watermark, so an idle stream never reaches an `S` read after its last
-commit; both waits are time-bounded, expiry abandons the round, and the
-stateless next sweep recomputes. Deletion is idempotent.
+The tracker (`src/toast_tid.rs`) keeps the TID→`chunk_id` bridge: every
+observed chunk INSERT births a map entry (blkno from block ref 0, offnum from
+`xl_heap_insert`; page-walk tuples carry their on-page TID), every toast
+DELETE (offnum in `xl_heap_delete`) resolves against it at commit into a
+`(chunk_id, death commit LSN)`. Deletes buffer through the xact spill like
+chunks, so aborts discard them and the drain merge preserves WAL order —
+an xact can toast a value and delete it (INSERT then UPDATE of the same
+row), so a death may target a same-commit birth. Per-chunk (not per-value)
+mapping lets each sibling delete resolve against its own entry —
+`toast_deaths_unresolved` then signals genuine leaks, not sibling noise —
+at one map entry per stored chunk (~2KB of value bytes each). Each mapping
+retains its birth LSN so stale replay cannot replace or delete a newer
+occupant. A birth landing on an occupied TID replaces the mapping and counts
+an unresolved leak, never a death: relation rewrites can reuse numeric TIDs
+while the prior value remains live.
 
-Valueid reuse is the wrinkle: `GetNewOidWithIndex` checks uniqueness only
-against the live toast index, so a dead valueid's OID can be re-allocated and
-re-put mid-sweep. The `pre` horizon guards twice — `HAVING max(_lsn) <= pre`
-drops re-puts at candidate scan, and the delete re-checks: lightweight
-`DELETE … WHERE _lsn <= pre AND chunk_id IN (…)` on a dedicated connection
-(tombstone rows rejected: `ReplacingMergeTree` reclaims them only on merge,
-and parts holding dead-forever values may never merge — a second leak). A
-pre-delete `countDistinct` over the same predicate keeps the deleted count
-exact: nothing else deletes, interleaved puts land past `pre`. Disk frames
-carry no LSN: skip when file mtime ≥ sweep start, unlink-vs-append
-serialized in-store — why the sweep borrows the pipeline's store instance
-rather than opening a second one. Source unreachable ⇒ sweep skips and
-counts (`toast_gc_skipped_source_unreachable`), never errors.
+State is an append-only journal beside the store (`[toast] tid_journal`,
+defaulting into `disk_dir`; explicit for `clickhouse` mode), fsynced per
+applied commit before the commit's rows dispatch — `emitter_ack` never
+covers a commit whose events aren't durable, and replay from ack re-applies
+idempotently (re-births and re-deaths are no-ops). Rebuilt at startup, torn
+tail truncated, compacted to live map + pending deaths after GC when it
+outgrows them.
 
-Rejected: WAL-driven tombstones (decode toast deletes by TID, persist a
-TID→chunk map beside the store) would serve archive replay with no live
-source, but collects only deletes observed while the store is enabled —
-pre-enable history leaks forever. The sweep catches every class.
+The sweep (`src/toast_gc.rs`, `[toast] gc_interval_secs`, 0 = disabled
+default) needs no source PG session: it applies every pending death with
+`death_lsn ≤ emitter_ack` as a bounded delete — rows of that value with
+`lsn ≤ death_lsn` (`DELETE … WHERE chunk_id = V AND _lsn <= L` lightweight
+deletes on CH, tombstone rows rejected: RMT reclaims them only on merge and
+parts holding dead-forever values may never merge; frame-filtering rewrite
+on disk, serialized in-store against `put` — why the sweep borrows the
+pipeline's store instance). Fetches serve replay re-decode (starts at ack)
+and fresh WAL keeping a pre-window `va_valueid`; every record referencing
+the dead generation precedes its death record, so `ack ≥ death_lsn` means
+no fetch can want rows under the bound, and a reused-OID rebirth commits
+past it and survives — the death LSN is an exact generation boundary, so
+even a currently-live id's dead generations collect. Deaths whose ack
+hasn't caught up stay pending; completions journal only after the store
+delete succeeds, deletes are idempotent, and a pre-delete `countDistinct`
+over the same predicate keeps the deleted count exact (nothing else
+deletes; interleaved puts land past the bound).
+
+Untracked classes leak, storage-only, counted `toast_deaths_unresolved`:
+chunks predating the journal (greenfield-walk tuples dead before WAL
+coverage — the backup walk's visibility gate never ships those), toast rels
+rewritten by `VACUUM FULL`/`CLUSTER` (the new heap arrives as `log_newpage`
+FPIs, no tuple-level inserts, so the map stales for that rel), and
+TRUNCATE / DROP of the owning table (relfilenode swap, no per-tuple
+deletes; `xl_heap_truncate` lists only logically-logged rels, never toast).
+
+Rejected: source anti-join sweep (per relid, anti-join store valueids
+against the live source toast rel under a `pg_current_wal_lsn()` horizon +
+`pg_snapshot_xmin` visibility barrier). Catches every leak class including
+the ones above, but requires a sidecar SQL session with `pg_toast` schema
+read (superuser or `pg_read_all_data` — replication privileges don't
+grant it), cannot collect a reused id's dead generations (a live id is
+excluded whole, so a shorter regeneration's stale suffix never collects),
+and its LSN-less disk guard reduced to an mtime-vs-wall-clock comparison
+that coarse mtime granularity or clock steps can defeat into deleting a
+live re-put. Worth revisiting only as an explicit repair mode for the
+untracked leak classes.
 
 ## Scope limits
 
@@ -111,12 +139,13 @@ pre-enable history leaks forever. The sweep catches every class.
   (the `BTreeMap` supplement, then `try_reassemble`'s concat) — R2-inherent,
   same as inline `reassemble`. Streaming reassembly of huge values is out of
   scope.
-- **Torn-fetch distinction.** `fetch` is one SELECT, its result taken as final,
-  no retry. No in-flight-vs-truncated distinction (which would compare
-  `va_rawsize` to summed chunk length and retry the in-flight case). Benign
-  while a completed `put` makes a value's chunks atomically visible (single-node
-  CH, synchronous INSERT ack, chunks immutable per `va_valueid`); reopen if a
-  partial or racing `put` can surface a torn set.
+- **Torn-fetch distinction.** `fetch` is one SELECT, its result taken as
+  final, no retry. `try_reassemble`'s stored-size check turns a torn set
+  into a loud error rather than distinguishing in-flight (retryable) from
+  truncated. Benign while a completed `put` makes a generation's chunks
+  atomically visible (single-node CH, synchronous INSERT ack, generations
+  written whole under one LSN); reopen if a partial or racing `put` can
+  surface a torn set.
 
 ## Rejected alternatives
 

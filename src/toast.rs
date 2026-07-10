@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use clickhouse_c::{Allocator, AsyncClient, Block, BlockBuilder, Event, TypeAst};
-use roaring::RoaringBitmap;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +37,7 @@ use crate::ch_emitter::{
     is_retryable, quote_ident,
 };
 use crate::spill::ToastChunk;
+use crate::toast_tid::{TidEvent, TidTracker};
 
 /// `(toast_relid, value_id) -> chunk_seq -> bytes`. Same shape as the WAL
 /// in-xact chunk map ([`crate::pipeline::decode::ToastChunks`]).
@@ -87,76 +87,98 @@ pub struct ToastConfig {
     /// Required when `mode = disk`. Persistent across restarts; must not be
     /// the wiped `--spill-dir`.
     pub disk_dir: Option<PathBuf>,
+    /// `tid_journal`: TID death-tracking journal path
+    /// ([`crate::toast_tid`]). Defaults to `<disk_dir>/tids.journal` in
+    /// disk mode; required explicitly for `clickhouse` mode (local durable
+    /// state). Absent ⇒ no tracking, GC has nothing to collect.
+    pub tid_journal: Option<PathBuf>,
     /// `gc_interval_secs`: cadence of the dead-chunk sweep
     /// ([`crate::toast_gc`]). Zero (default) disables GC.
     pub gc_interval: Duration,
 }
 
-/// Sweep guards (`plans/TOAST.md`): chunks the liveness scans could not
-/// see must survive — a fresh commit's chunks land mid-sweep, a dead
-/// value's OID gets re-allocated and re-put. Candidate scan excludes
-/// values past these bounds and the delete re-checks them.
-#[derive(Debug, Clone, Copy)]
-pub struct GcHorizon {
-    /// `pg_current_wal_lsn()` read before the source liveness scans, with
-    /// the sweep's visibility barrier making every commit `<=` it
-    /// scan-visible; rows above it may belong to commits the scans missed,
-    /// so CH mode considers and deletes only chunk rows with `_lsn <=` this.
-    pub lsn: u64,
-    /// Sweep start instant; disk frames carry no LSN, so a value file
-    /// modified at/after it is skipped (re-put ⇒ live again, next sweep
-    /// re-evaluates).
-    pub scan_start: std::time::SystemTime,
-}
-
 /// Durable chunk store: persist chunks, read them back by value.
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
-    /// Persist chunks. Idempotent: a value's chunks are immutable in PG
-    /// (written once under a fresh `va_valueid`), so a re-`put` of the same
-    /// `(relid, value_id, seq)` is byte-identical.
+    /// Persist chunks. Idempotent: re-`put`s of a `(relid, value_id, seq)`
+    /// under the same LSN are byte-identical (replay re-emit); a reused
+    /// `va_valueid` re-puts under a higher LSN and `fetch`'s newest-
+    /// generation selection keeps reads coherent.
     async fn put(&self, chunks: &[ToastChunk]) -> Result<(), ChunkStoreError>;
-    /// All chunks for one value, by `chunk_seq`. Empty map = no such value.
+    /// Newest generation at or before `max_lsn`, by `chunk_seq`. Bound keeps
+    /// lagging decode from reading a future reused-OID generation. Empty map
+    /// means no eligible generation.
     async fn fetch(
         &self,
         toast_relid: u32,
         value_id: u32,
+        max_lsn: u64,
     ) -> Result<BTreeMap<u32, Vec<u8>>, ChunkStoreError>;
-    /// Toast relids with chunks present (GC enumeration).
-    async fn gc_relids(&self) -> Result<Vec<u32>, ChunkStoreError>;
-    /// Dead value ids for one relid: stored − `live`, minus values whose
-    /// max `_lsn` exceeds `horizon.lsn` (fresh commit the scan couldn't
-    /// see, or reused-OID re-put ⇒ live again; LSN-less stores defer that
-    /// guard to `gc_delete`). Anti-join runs inside the scan so peak
-    /// memory is O(dead), never O(stored).
-    async fn gc_dead_values(
+    /// Delete dead generations: for each `(value_id, death_lsn)`, rows of
+    /// that value with `lsn <= death_lsn`. A rebirth (reused OID) carries
+    /// `lsn > death_lsn` and survives. Idempotent; returns values that had
+    /// rows to delete.
+    async fn gc_values(
         &self,
         toast_relid: u32,
-        live: &RoaringBitmap,
-        horizon: &GcHorizon,
-    ) -> Result<RoaringBitmap, ChunkStoreError>;
-    /// Delete dead values' chunks, guarded by `horizon` against puts
-    /// landing after candidate computation. Idempotent; returns values
-    /// actually deleted (may undershoot `dead` via the horizon guard).
-    async fn gc_delete(
-        &self,
-        toast_relid: u32,
-        dead: &RoaringBitmap,
-        horizon: &GcHorizon,
+        deaths: &[(u32, u64)],
     ) -> Result<u64, ChunkStoreError>;
 }
 
+/// Newest-generation fold shared by both stores: keep rows at the value's
+/// max LSN, last-wins per seq within it. Order-independent over the input.
+struct GenFold {
+    max_allowed_lsn: u64,
+    generation_lsn: Option<u64>,
+    out: BTreeMap<u32, Vec<u8>>,
+}
+
+impl GenFold {
+    fn at(max_allowed_lsn: u64) -> Self {
+        Self {
+            max_allowed_lsn,
+            generation_lsn: None,
+            out: BTreeMap::new(),
+        }
+    }
+
+    fn add(&mut self, seq: u32, lsn: u64, body: Vec<u8>) {
+        if lsn > self.max_allowed_lsn {
+            return;
+        }
+        match self.generation_lsn {
+            None => self.generation_lsn = Some(lsn),
+            Some(current) if lsn > current => {
+                self.out.clear();
+                self.generation_lsn = Some(lsn);
+            }
+            Some(current) if lsn < current => return,
+            Some(_) => {}
+        }
+        self.out.insert(seq, body);
+    }
+}
+
+impl Default for GenFold {
+    fn default() -> Self {
+        Self::at(u64::MAX)
+    }
+}
+
 /// On-disk chunk store. One file per value at
-/// `<dir>/<toast_relid>/<value_id>.chunks`, a sequence of framed records
-/// `[seq u32 LE][len u32 LE][body]`. Appends are idempotent (fetch dedups by
-/// seq, last wins); a torn trailing record from a crash mid-append is
-/// tolerated on read (truncated tail ignored) and re-appended on the next
-/// bootstrap walk.
+/// `<dir>/<toast_relid>/<value_id>.chunks`: an 8-byte header
+/// (`WSTC` + version u16 + reserved u16) then framed records
+/// `[seq u32 LE][len u32 LE][lsn u64 LE][body]`. Headerless files are the
+/// pre-LSN v1 format (`[seq][len][body]`), read as `lsn = 0` and upgraded
+/// in place on the next append. Appends are idempotent (fetch keeps the
+/// max-LSN generation, last-wins per seq); a torn trailing record from a
+/// crash mid-append is tolerated on read (truncated tail ignored) and
+/// re-appended by replay from ack.
 pub struct DiskChunkStore {
     dir: PathBuf,
-    /// Serializes `put`'s open-append against `gc_delete`'s stat-unlink: an
-    /// unlink between them would strand the append on an orphaned inode
-    /// (silent chunk loss).
+    /// Serializes `put`'s open-append against `gc_values`' read-rewrite: an
+    /// unlink/rename between them would strand the append on an orphaned
+    /// inode (silent chunk loss).
     gc_lock: Mutex<()>,
 }
 
@@ -181,8 +203,87 @@ impl DiskChunkStore {
     }
 }
 
-/// Record header: `seq` then `len`, both u32 LE.
-const REC_HEADER: usize = 8;
+/// v1 record header: `seq` then `len`, both u32 LE. No file header.
+const REC_HEADER_V1: usize = 8;
+/// v2 record header: `seq` u32, `len` u32, `lsn` u64.
+const REC_HEADER_V2: usize = 16;
+/// v2 file header: magic + version u16 + reserved u16.
+const FILE_MAGIC: [u8; 4] = *b"WSTC";
+const FILE_VERSION: u16 = 2;
+const FILE_HEADER: usize = 8;
+
+fn file_header() -> [u8; FILE_HEADER] {
+    let mut h = [0u8; FILE_HEADER];
+    h[..4].copy_from_slice(&FILE_MAGIC);
+    h[4..6].copy_from_slice(&FILE_VERSION.to_le_bytes());
+    h
+}
+
+/// A v1 file starts with its first record's `seq` (small LE int), never
+/// the magic.
+fn is_v2(bytes: &[u8]) -> bool {
+    bytes.len() >= FILE_HEADER && bytes[..4] == FILE_MAGIC
+}
+
+fn push_frame(buf: &mut Vec<u8>, seq: u32, lsn: u64, body: &[u8]) {
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&lsn.to_le_bytes());
+    buf.extend_from_slice(body);
+}
+
+/// Parse frames of either format, torn tail ignored. `f` sees
+/// `(seq, lsn, body)`; v1 frames carry `lsn = 0`.
+fn walk_frames(bytes: &[u8], mut f: impl FnMut(u32, u64, &[u8])) {
+    let (mut off, header) = if is_v2(bytes) {
+        (FILE_HEADER, REC_HEADER_V2)
+    } else {
+        (0, REC_HEADER_V1)
+    };
+    while off + header <= bytes.len() {
+        let seq = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+        let lsn = if header == REC_HEADER_V2 {
+            u64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap())
+        } else {
+            0
+        };
+        let body_start = off + header;
+        let body_end = body_start + len;
+        if body_end > bytes.len() {
+            // Torn trailing record from a crash mid-append: stop at the
+            // last clean boundary. Earlier records remain valid.
+            break;
+        }
+        f(seq, lsn, &bytes[body_start..body_end]);
+        off = body_end;
+    }
+}
+
+impl DiskChunkStore {
+    /// Read a value file, `None` when absent.
+    async fn read_value(&self, path: &Path) -> Result<Option<Vec<u8>>, ChunkStoreError> {
+        let mut file = match File::open(path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await?;
+        Ok(Some(bytes))
+    }
+
+    /// Atomic whole-file replace, fsynced before rename.
+    async fn rewrite(&self, path: &Path, contents: &[u8]) -> Result<(), ChunkStoreError> {
+        let tmp = path.with_extension("chunks.tmp");
+        let mut f = File::create(&tmp).await?;
+        f.write_all(contents).await?;
+        f.sync_all().await?;
+        drop(f);
+        tokio::fs::rename(&tmp, path).await?;
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl ChunkStore for DiskChunkStore {
@@ -205,24 +306,39 @@ impl ChunkStore for DiskChunkStore {
             }
             let mut buf = Vec::new();
             for c in group {
-                let len = u32::try_from(c.chunk_data.len()).map_err(|_| {
+                u32::try_from(c.chunk_data.len()).map_err(|_| {
                     ChunkStoreError::Format(format!(
                         "chunk relid={relid} value={value_id} seq={} too large",
                         c.chunk_seq
                     ))
                 })?;
-                buf.extend_from_slice(&c.chunk_seq.to_le_bytes());
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(&c.chunk_data);
+                push_frame(&mut buf, c.chunk_seq, c.source_lsn, &c.chunk_data);
             }
             let _guard = self.gc_lock.lock().await;
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await?;
-            file.write_all(&buf).await?;
-            file.sync_all().await?;
+            match self.read_value(&path).await? {
+                // v1 file: upgrade in place (old frames as lsn 0), then the
+                // new frames — one atomic rewrite
+                Some(existing) if !is_v2(&existing) => {
+                    let mut upgraded = file_header().to_vec();
+                    walk_frames(&existing, |seq, lsn, body| {
+                        push_frame(&mut upgraded, seq, lsn, body);
+                    });
+                    upgraded.extend_from_slice(&buf);
+                    self.rewrite(&path, &upgraded).await?;
+                }
+                existing => {
+                    let mut file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .await?;
+                    if existing.is_none() {
+                        file.write_all(&file_header()).await?;
+                    }
+                    file.write_all(&buf).await?;
+                    file.sync_all().await?;
+                }
+            }
         }
         Ok(())
     }
@@ -231,99 +347,51 @@ impl ChunkStore for DiskChunkStore {
         &self,
         toast_relid: u32,
         value_id: u32,
+        max_lsn: u64,
     ) -> Result<BTreeMap<u32, Vec<u8>>, ChunkStoreError> {
         let path = self.value_path(toast_relid, value_id);
-        let mut file = match File::open(&path).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-            Err(e) => return Err(e.into()),
+        let Some(bytes) = self.read_value(&path).await? else {
+            return Ok(BTreeMap::new());
         };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).await?;
-        let mut out: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-        let mut off = 0usize;
-        while off + REC_HEADER <= bytes.len() {
-            let seq = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-            let len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
-            let body_start = off + REC_HEADER;
-            let body_end = body_start + len;
-            if body_end > bytes.len() {
-                // Torn trailing record from a crash mid-append: stop at the
-                // last clean boundary. Earlier records remain valid.
-                break;
-            }
-            out.insert(seq, bytes[body_start..body_end].to_vec());
-            off = body_end;
-        }
-        Ok(out)
+        let mut fold = GenFold::at(max_lsn);
+        walk_frames(&bytes, |seq, lsn, body| fold.add(seq, lsn, body.to_vec()));
+        Ok(fold.out)
     }
 
-    async fn gc_relids(&self) -> Result<Vec<u32>, ChunkStoreError> {
-        numeric_entries(&self.dir, |name| name.parse().ok()).await
-    }
-
-    async fn gc_dead_values(
+    async fn gc_values(
         &self,
         toast_relid: u32,
-        live: &RoaringBitmap,
-        _horizon: &GcHorizon,
-    ) -> Result<RoaringBitmap, ChunkStoreError> {
-        // Frames carry no LSN; gc_delete's mtime guard stands in for the
-        // horizon. Anti-join filters during the dir walk.
-        let dir = self.dir.join(toast_relid.to_string());
-        let ids = numeric_entries(&dir, |name| {
-            name.strip_suffix(".chunks")
-                .and_then(|s| s.parse().ok())
-                .filter(|id| !live.contains(*id))
-        })
-        .await?;
-        Ok(ids.into_iter().collect())
-    }
-
-    async fn gc_delete(
-        &self,
-        toast_relid: u32,
-        dead: &RoaringBitmap,
-        horizon: &GcHorizon,
+        deaths: &[(u32, u64)],
     ) -> Result<u64, ChunkStoreError> {
         let mut deleted = 0u64;
-        for value_id in dead {
+        for &(value_id, death_lsn) in deaths {
             let path = self.value_path(toast_relid, value_id);
             let _guard = self.gc_lock.lock().await;
-            let meta = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
+            let Some(bytes) = self.read_value(&path).await? else {
+                continue;
             };
-            // Appended at/after sweep start: may be a reused-OID re-put past
-            // the scan snapshot — live again, next sweep re-evaluates.
-            if meta.modified()? >= horizon.scan_start {
+            // Keep frames past the death LSN (rebirth of a reused OID)
+            let mut kept = file_header().to_vec();
+            let mut dropped = false;
+            walk_frames(&bytes, |seq, lsn, body| {
+                if lsn > death_lsn {
+                    push_frame(&mut kept, seq, lsn, body);
+                } else {
+                    dropped = true;
+                }
+            });
+            if !dropped {
                 continue;
             }
-            tokio::fs::remove_file(&path).await?;
+            if kept.len() == FILE_HEADER {
+                tokio::fs::remove_file(&path).await?;
+            } else {
+                self.rewrite(&path, &kept).await?;
+            }
             deleted += 1;
         }
         Ok(deleted)
     }
-}
-
-/// Directory entries whose names `parse` accepts; missing dir ⇒ empty.
-async fn numeric_entries<T>(
-    dir: &Path,
-    parse: impl Fn(&str) -> Option<T>,
-) -> Result<Vec<T>, ChunkStoreError> {
-    let mut rd = match tokio::fs::read_dir(dir).await {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut out = Vec::new();
-    while let Some(entry) = rd.next_entry().await? {
-        if let Some(v) = entry.file_name().to_str().and_then(&parse) {
-            out.push(v);
-        }
-    }
-    Ok(out)
 }
 
 /// CH server error codes treated as "no chunks for this relid" rather than a
@@ -332,8 +400,9 @@ async fn numeric_entries<T>(
 const CH_UNKNOWN_TABLE: i32 = 60;
 const CH_UNKNOWN_DATABASE: i32 = 81;
 
-/// Value ids per GC `DELETE` statement, bounding SQL size.
-const GC_DELETE_BATCH: usize = 8192;
+/// Deaths per GC `DELETE` statement, bounding SQL size (each carries a
+/// `(chunk_id, _lsn)` predicate).
+const GC_DELETE_BATCH: usize = 1024;
 
 /// Connection + per-process table-creation cache, behind one mutex. A single
 /// client suffices: toast ops are off the hot path (bootstrap baseline +
@@ -365,14 +434,13 @@ struct ChState {
 ///   `chunk_data` String,   -- raw bytea body, compressed as PG wrote it
 ///   `_lsn`       UInt64    -- ReplacingMergeTree dedup / convergence key
 /// ) ENGINE = ReplacingMergeTree(`_lsn`)
-/// ORDER BY (`chunk_id`, `chunk_seq`)
+/// ORDER BY (`chunk_id`, `_lsn`, `chunk_seq`)
 /// ```
 ///
-/// `ORDER BY (chunk_id, chunk_seq)` keeps a value's chunks contiguous so a
-/// range read rebuilds it in order. Re-shipped chunks (bootstrap baseline then
-/// WAL re-emit) collapse on `_lsn`; PG chunk rows are immutable per
-/// `va_valueid`, so duplicates are byte-identical and `fetch`'s last-write-wins
-/// `BTreeMap` is correct without `FINAL`.
+/// Generation LSN belongs to sorting key so merges retain older generations
+/// until ack-gated GC. This lets lagging decode fetch newest generation no
+/// later than referring WAL record. Re-ships of same generation collapse;
+/// `GenFold` keeps reads coherent without `FINAL`.
 pub struct ClickHouseChunkStore {
     /// Connection params (host/port/tls/compression/auth) reused from the main
     /// emitter; toast tables land in `conn.database`.
@@ -425,7 +493,7 @@ impl ClickHouseChunkStore {
         format!(
             "CREATE TABLE IF NOT EXISTS {} (\n  \
              `chunk_id` UInt32,\n  `chunk_seq` UInt32,\n  `chunk_data` String,\n  `_lsn` UInt64\n\
-             ) ENGINE = ReplacingMergeTree(`_lsn`)\nORDER BY (`chunk_id`, `chunk_seq`)",
+             ) ENGINE = ReplacingMergeTree(`_lsn`)\nORDER BY (`chunk_id`, `_lsn`, `chunk_seq`)",
             self.toast_table(toast_relid)
         )
     }
@@ -437,52 +505,27 @@ impl ClickHouseChunkStore {
         )
     }
 
-    /// GC enumeration: every `pg_toast_*` table in the dest db; foreign
-    /// names are filtered at parse ([`read_relid_block`]).
-    fn gc_relids_sql(&self) -> String {
-        format!(
-            "SELECT `name` FROM `system`.`tables` WHERE `database` = {} AND `name` LIKE 'pg_toast_%'",
-            quote_str(&self.database)
-        )
-    }
-
-    /// Candidate scan server-side: in-order aggregation streams over the
-    /// `(chunk_id, chunk_seq)` sort key (no whole-table hash agg on the
-    /// server), `HAVING` drops values put past the horizon (fresh commit
-    /// the liveness scan couldn't see, reused OID ⇒ live again) before
-    /// they cross the wire.
-    fn gc_dead_values_sql(&self, toast_relid: u32, horizon_lsn: u64) -> String {
-        format!(
-            "SELECT `chunk_id` FROM {} GROUP BY `chunk_id` HAVING max(`_lsn`) <= {} \
-             SETTINGS optimize_aggregation_in_order = 1",
-            self.toast_table(toast_relid),
-            horizon_lsn
-        )
-    }
-
     /// Lightweight DELETE, not tombstone rows: RMT reclaims tombstones only
     /// on merge, and parts holding dead-forever values may never merge again.
-    /// The `_lsn` predicate re-excludes puts landing between candidate
-    /// computation and apply, with no coordination against `put`.
-    fn gc_delete_sql(&self, toast_relid: u32, value_ids: &[u32], horizon_lsn: u64) -> String {
+    /// The per-death `_lsn` bound is the generation boundary: a reused-OID
+    /// rebirth carries `_lsn` past its predecessor's death and survives,
+    /// with no coordination against `put`.
+    fn gc_delete_sql(&self, toast_relid: u32, deaths: &[(u32, u64)]) -> String {
         format!(
-            "DELETE FROM {} WHERE `_lsn` <= {} AND `chunk_id` IN ({})",
+            "DELETE FROM {} WHERE {}",
             self.toast_table(toast_relid),
-            horizon_lsn,
-            in_list(value_ids)
+            death_predicate(deaths)
         )
     }
 
-    /// Values the paired DELETE actually holds rows for: distinct candidate
-    /// `chunk_id`s with rows at/under the horizon. Read before the DELETE —
-    /// nothing else deletes, and puts landing between carry `_lsn` past the
-    /// horizon, so the count is exact.
-    fn gc_count_sql(&self, toast_relid: u32, value_ids: &[u32], horizon_lsn: u64) -> String {
+    /// Values the paired DELETE actually holds rows for. Read before the
+    /// DELETE — nothing else deletes, and interleaved puts (rebirths) carry
+    /// `_lsn` past the death bound, so the count is exact.
+    fn gc_count_sql(&self, toast_relid: u32, deaths: &[(u32, u64)]) -> String {
         format!(
-            "SELECT countDistinct(`chunk_id`) FROM {} WHERE `_lsn` <= {} AND `chunk_id` IN ({})",
+            "SELECT countDistinct(`chunk_id`) FROM {} WHERE {}",
             self.toast_table(toast_relid),
-            horizon_lsn,
-            in_list(value_ids)
+            death_predicate(deaths)
         )
     }
 
@@ -644,43 +687,38 @@ impl ClickHouseChunkStore {
         state: &mut ChState,
         toast_relid: u32,
         value_id: u32,
+        max_lsn: u64,
     ) -> Result<BTreeMap<u32, Vec<u8>>, EmitterError> {
         let sql = format!(
-            "SELECT `chunk_seq`, `chunk_data` FROM {} WHERE `chunk_id` = {} ORDER BY `chunk_seq`",
+            "SELECT `chunk_seq`, `chunk_data`, `_lsn` FROM {} WHERE `chunk_id` = {} \
+             AND `_lsn` <= {} \
+             ORDER BY `chunk_seq`",
             self.toast_table(toast_relid),
-            value_id
+            value_id,
+            max_lsn,
         );
-        self.query_locked(state, &sql, read_chunk_block).await
+        let fold = self.query_locked(state, &sql, read_chunk_block).await?;
+        Ok(fold.out)
     }
 }
 
-/// CH string literal: single-quoted, backslash + quote escaped.
-fn quote_str(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
-}
-
-/// `IN (…)` body for a value-id batch.
-fn in_list(value_ids: &[u32]) -> String {
+/// OR-joined per-death generation bounds.
+fn death_predicate(deaths: &[(u32, u64)]) -> String {
     use std::fmt::Write as _;
-    // ilog10+1 digits, +1 comma
-    let cap = value_ids
-        .iter()
-        .map(|id| id.checked_ilog10().unwrap_or(0) as usize + 2)
-        .sum();
-    let mut s = String::with_capacity(cap);
-    for (i, id) in value_ids.iter().enumerate() {
+    let mut s = String::with_capacity(deaths.len() * 40);
+    for (i, (value_id, death_lsn)) in deaths.iter().enumerate() {
         if i > 0 {
-            s.push(',');
+            s.push_str(" OR ");
         }
-        write!(s, "{id}").unwrap();
+        write!(s, "(`chunk_id` = {value_id} AND `_lsn` <= {death_lsn})").unwrap();
     }
     s
 }
 
-/// Insert one fetched Data block's `(chunk_seq UInt32, chunk_data String)`
-/// rows into `out`, last-wins by seq matching the append-file dedup. Column
-/// order matches the `SELECT`. The header block (0 rows) contributes nothing.
-fn read_chunk_block(block: &Block, out: &mut BTreeMap<u32, Vec<u8>>) -> Result<(), EmitterError> {
+/// Fold one fetched Data block's `(chunk_seq UInt32, chunk_data String,
+/// _lsn UInt64)` rows into the newest-generation selection. Column order
+/// matches the `SELECT`. The header block (0 rows) contributes nothing.
+fn read_chunk_block(block: &Block, out: &mut GenFold) -> Result<(), EmitterError> {
     let n = block.n_rows();
     if n == 0 {
         return Ok(());
@@ -691,6 +729,9 @@ fn read_chunk_block(block: &Block, out: &mut BTreeMap<u32, Vec<u8>>) -> Result<(
     let data_col = block
         .column(1)
         .ok_or_else(|| EmitterError::Type("toast fetch: missing chunk_data column".into()))?;
+    let lsn_col = block
+        .column(2)
+        .ok_or_else(|| EmitterError::Type("toast fetch: missing _lsn column".into()))?;
     let (elem, seq_bytes) = seq_col
         .fixed()
         .ok_or_else(|| EmitterError::Type("toast fetch: chunk_seq not fixed-width".into()))?;
@@ -699,68 +740,23 @@ fn read_chunk_block(block: &Block, out: &mut BTreeMap<u32, Vec<u8>>) -> Result<(
             "toast fetch: chunk_seq elem size {elem} != 4"
         )));
     }
+    let (lsn_elem, lsn_bytes) = lsn_col
+        .fixed()
+        .ok_or_else(|| EmitterError::Type("toast fetch: _lsn not fixed-width".into()))?;
+    if lsn_elem != 8 {
+        return Err(EmitterError::Type(format!(
+            "toast fetch: _lsn elem size {lsn_elem} != 8"
+        )));
+    }
     let (offsets, data) = data_col
         .string()
         .ok_or_else(|| EmitterError::Type("toast fetch: chunk_data not String".into()))?;
     for i in 0..n {
         let seq = u32::from_le_bytes(seq_bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        let lsn = u64::from_le_bytes(lsn_bytes[i * 8..i * 8 + 8].try_into().unwrap());
         let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
         let end = offsets[i] as usize;
-        out.insert(seq, data[start..end].to_vec());
-    }
-    Ok(())
-}
-
-/// `(name String)` rows → toast relids parsed from `pg_toast_<relid>`;
-/// non-matching names skipped.
-fn read_relid_block(block: &Block, out: &mut Vec<u32>) -> Result<(), EmitterError> {
-    let n = block.n_rows();
-    if n == 0 {
-        return Ok(());
-    }
-    let (offsets, data) = block
-        .column(0)
-        .and_then(|c| c.string())
-        .ok_or_else(|| EmitterError::Type("toast gc: name not String".into()))?;
-    for i in 0..n {
-        let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
-        let end = offsets[i] as usize;
-        if let Some(relid) = std::str::from_utf8(&data[start..end])
-            .ok()
-            .and_then(|s| s.strip_prefix("pg_toast_"))
-            .and_then(|s| s.parse().ok())
-        {
-            out.push(relid);
-        }
-    }
-    Ok(())
-}
-
-/// `(chunk_id UInt32)` rows surviving the anti-join against `live`,
-/// filtered per block so peak memory stays O(dead).
-fn read_dead_block(
-    block: &Block,
-    live: &RoaringBitmap,
-    out: &mut RoaringBitmap,
-) -> Result<(), EmitterError> {
-    let n = block.n_rows();
-    if n == 0 {
-        return Ok(());
-    }
-    let (elem, ids) = block
-        .column(0)
-        .and_then(|c| c.fixed())
-        .ok_or_else(|| EmitterError::Type("toast gc: chunk_id not fixed-width".into()))?;
-    if elem != 4 {
-        return Err(EmitterError::Type(format!(
-            "toast gc: chunk_id elem size {elem} != 4"
-        )));
-    }
-    for i in 0..n {
-        let id = u32::from_le_bytes(ids[i * 4..i * 4 + 4].try_into().unwrap());
-        if !live.contains(id) {
-            out.insert(id);
-        }
+        out.add(seq, lsn, data[start..end].to_vec());
     }
     Ok(())
 }
@@ -804,79 +800,60 @@ impl ChunkStore for ClickHouseChunkStore {
         &self,
         toast_relid: u32,
         value_id: u32,
+        max_lsn: u64,
     ) -> Result<BTreeMap<u32, Vec<u8>>, ChunkStoreError> {
         let mut state = self.state.lock().await;
-        self.fetch_locked(&mut state, toast_relid, value_id)
+        self.fetch_locked(&mut state, toast_relid, value_id, max_lsn)
             .await
             .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
     }
 
-    async fn gc_relids(&self) -> Result<Vec<u32>, ChunkStoreError> {
-        let mut state = self.gc_state.lock().await;
-        self.query_locked(&mut state, &self.gc_relids_sql(), read_relid_block)
-            .await
-            .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
-    }
-
-    async fn gc_dead_values(
+    async fn gc_values(
         &self,
         toast_relid: u32,
-        live: &RoaringBitmap,
-        horizon: &GcHorizon,
-    ) -> Result<RoaringBitmap, ChunkStoreError> {
-        let mut state = self.gc_state.lock().await;
-        self.query_locked(
-            &mut state,
-            &self.gc_dead_values_sql(toast_relid, horizon.lsn),
-            |block, out| read_dead_block(block, live, out),
-        )
-        .await
-        .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
-    }
-
-    async fn gc_delete(
-        &self,
-        toast_relid: u32,
-        dead: &RoaringBitmap,
-        horizon: &GcHorizon,
+        deaths: &[(u32, u64)],
     ) -> Result<u64, ChunkStoreError> {
-        if dead.is_empty() {
+        if deaths.is_empty() {
             return Ok(0);
         }
         let mut state = self.gc_state.lock().await;
         // Batch to bound statement size; each DELETE is idempotent.
         let mut deleted = 0u64;
-        let mut iter = dead.iter().peekable();
-        let mut batch: Vec<u32> = Vec::with_capacity(GC_DELETE_BATCH.min(dead.len() as usize));
-        while iter.peek().is_some() {
-            batch.extend(iter.by_ref().take(GC_DELETE_BATCH));
-            // Count first: DELETE reports no affected rows, and the horizon
-            // freezes the counted set (interleaved puts land past it).
+        for batch in deaths.chunks(GC_DELETE_BATCH) {
+            // Count first: DELETE reports no affected rows, and the death
+            // bounds freeze the counted set (interleaved puts land past them).
             let counts = self
                 .query_locked(
                     &mut state,
-                    &self.gc_count_sql(toast_relid, &batch, horizon.lsn),
+                    &self.gc_count_sql(toast_relid, batch),
                     read_count_block,
                 )
                 .await
                 .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))?;
-            let sql = self.gc_delete_sql(toast_relid, &batch, horizon.lsn);
+            let batch_hits = counts.iter().sum::<u64>();
+            if batch_hits == 0 {
+                // Nothing to delete (replayed deaths, or no such table);
+                // skipping also spares the mutation
+                continue;
+            }
+            let sql = self.gc_delete_sql(toast_relid, batch);
             self.exec_write(&mut state, &sql, None)
                 .await
                 .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))?;
-            deleted += counts.iter().sum::<u64>();
-            batch.clear();
+            deleted += batch_hits;
         }
         Ok(deleted)
     }
 }
 
-/// Resolution policy + optional store, threaded into the detoast paths and
-/// the bootstrap drain. Cheap to clone (everything behind `Arc`).
+/// Resolution policy + optional store + TID death tracker, threaded into
+/// the detoast paths and the bootstrap drain. Cheap to clone (everything
+/// behind `Arc`).
 #[derive(Clone)]
 pub struct ToastResolver {
     mode: ToastMode,
     store: Option<Arc<dyn ChunkStore>>,
+    tracker: Option<Arc<TidTracker>>,
     stats: Arc<EmitterStats>,
 }
 
@@ -887,43 +864,75 @@ impl ToastResolver {
         Self {
             mode: ToastMode::Disabled,
             store: None,
+            tracker: None,
             stats: Arc::new(EmitterStats::default()),
         }
     }
 
     /// Build from the emitter config (CH mode reuses its connection params),
-    /// sharing the emitter's live counters. Reads `emitter.toast` for mode +
-    /// disk dir.
+    /// sharing the emitter's live counters. Reads `emitter.toast` for mode,
+    /// disk dir + TID journal.
     pub fn from_config(emitter: &EmitterConfig, stats: Arc<EmitterStats>) -> Result<Self, String> {
         let cfg = &emitter.toast;
-        match cfg.mode {
-            ToastMode::Disabled => Ok(Self {
+        let open_tracker = |path: PathBuf| {
+            TidTracker::open(path, stats.clone())
+                .map(Arc::new)
+                .map_err(|e| format!("toast tid journal: {e}"))
+        };
+        let resolver = match cfg.mode {
+            ToastMode::Disabled => Self {
                 mode: ToastMode::Disabled,
                 store: None,
+                tracker: None,
                 stats,
-            }),
+            },
             ToastMode::Disk => {
                 let dir = cfg
                     .disk_dir
                     .clone()
                     .ok_or("toast mode=disk requires [toast] disk_dir")?;
+                let journal = cfg
+                    .tid_journal
+                    .clone()
+                    .unwrap_or_else(|| dir.join("tids.journal"));
                 let store =
                     DiskChunkStore::new(dir).map_err(|e| format!("toast disk store: {e}"))?;
-                Ok(Self {
+                Self {
                     mode: ToastMode::Disk,
                     store: Some(Arc::new(store)),
+                    tracker: Some(open_tracker(journal)?),
                     stats,
-                })
+                }
             }
             ToastMode::ClickHouse => {
                 let store = ClickHouseChunkStore::new(emitter.clone());
-                Ok(Self {
+                // Journal is local durable state; without a configured path
+                // deaths go untracked and GC has nothing to collect
+                let tracker = cfg.tid_journal.clone().map(open_tracker).transpose()?;
+                if tracker.is_none() {
+                    tracing::warn!(
+                        target: "walshadow::toast",
+                        "[toast] mode=clickhouse without tid_journal: dead chunks accumulate",
+                    );
+                }
+                Self {
                     mode: ToastMode::ClickHouse,
                     store: Some(Arc::new(store)),
+                    tracker,
                     stats,
-                })
+                }
             }
+        };
+        // Tracking without GC never collects: pending deaths + journal grow
+        // with churn (deferred work — enabling GC later drains them)
+        if resolver.tracker.is_some() && cfg.gc_interval.is_zero() {
+            tracing::warn!(
+                target: "walshadow::toast",
+                "[toast] TID tracking armed with gc_interval_secs = 0: \
+                 resolved deaths accumulate until GC is enabled",
+            );
         }
+        Ok(resolver)
     }
 
     #[cfg(test)]
@@ -931,6 +940,21 @@ impl ToastResolver {
         Self {
             mode: ToastMode::Disk,
             store: Some(store),
+            tracker: None,
+            stats,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_store_and_tracker(
+        store: Arc<dyn ChunkStore>,
+        tracker: Arc<TidTracker>,
+        stats: Arc<EmitterStats>,
+    ) -> Self {
+        Self {
+            mode: ToastMode::Disk,
+            store: Some(store),
+            tracker: Some(tracker),
             stats,
         }
     }
@@ -952,6 +976,12 @@ impl ToastResolver {
         self.store.clone()
     }
 
+    /// Shared TID tracker handle for the GC sweep. `None` when tracking is
+    /// off (disabled mode, or CH mode without `tid_journal`).
+    pub fn tracker(&self) -> Option<Arc<TidTracker>> {
+        self.tracker.clone()
+    }
+
     /// Whether an unresolved pointer should NULL/default-fill rather than
     /// error. True only for disabled mode; disk/CH treat a miss as a real
     /// gap (opt-in durable storage means a miss is data loss, surfaced loud).
@@ -965,12 +995,13 @@ impl ToastResolver {
         &self,
         toast_relid: u32,
         value_id: u32,
+        max_lsn: u64,
         into: &mut ChunkMap,
     ) -> Result<bool, ChunkStoreError> {
         let Some(store) = &self.store else {
             return Ok(false);
         };
-        let chunks = store.fetch(toast_relid, value_id).await?;
+        let chunks = store.fetch(toast_relid, value_id, max_lsn).await?;
         if chunks.is_empty() {
             return Ok(false);
         }
@@ -997,8 +1028,9 @@ impl ToastResolver {
     }
 
     /// Persist an in-xact chunk map, stamping `source_lsn` (per-chunk LSN is
-    /// dropped at merge; `commit_lsn` is the convergence `_lsn`). No-op when
-    /// there is no store or the map is empty.
+    /// dropped at merge; `commit_lsn` is the convergence `_lsn` and the
+    /// value's generation LSN). No-op when there is no store or the map is
+    /// empty.
     pub async fn put_map(&self, map: &ChunkMap, source_lsn: u64) -> Result<(), ChunkStoreError> {
         if self.store.is_none() || map.is_empty() {
             return Ok(());
@@ -1011,11 +1043,44 @@ impl ToastResolver {
                     value_id: *value_id,
                     chunk_seq: *seq,
                     source_lsn,
+                    // TIDs ride tid_events, not the merged map
+                    blkno: 0,
+                    offnum: 0,
                     chunk_data: body.clone(),
                 });
             }
         }
         self.put(&rows).await
+    }
+
+    /// Persist one commit's chunks then apply its TID events (births +
+    /// death resolution, [`crate::toast_tid`]). Chunks first: a crash
+    /// between the two re-observes both from ack, and a journaled birth
+    /// must never precede its chunks' durability.
+    pub async fn apply_commit(
+        &self,
+        map: &ChunkMap,
+        tid_events: &[TidEvent],
+        commit_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        self.put_map(map, commit_lsn).await?;
+        if let Some(tracker) = &self.tracker {
+            tracker.apply(tid_events, commit_lsn).await?;
+        }
+        Ok(())
+    }
+
+    /// Apply walk-side TID births (bootstrap page walk). No-op without a
+    /// tracker.
+    pub async fn apply_tid_events(
+        &self,
+        tid_events: &[TidEvent],
+        lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        if let Some(tracker) = &self.tracker {
+            tracker.apply(tid_events, lsn).await?;
+        }
+        Ok(())
     }
 
     /// Count one value that was NULL/default-filled because it couldn't be
@@ -1037,21 +1102,28 @@ impl ToastResolver {
 mod tests {
     use super::*;
 
-    fn chunk(relid: u32, value_id: u32, seq: u32, body: &[u8]) -> ToastChunk {
+    fn chunk_at(relid: u32, value_id: u32, seq: u32, lsn: u64, body: &[u8]) -> ToastChunk {
         ToastChunk {
             toast_relid: relid,
             value_id,
             chunk_seq: seq,
-            source_lsn: 0x1000,
+            source_lsn: lsn,
+            blkno: 0,
+            offnum: 0,
             chunk_data: body.to_vec(),
         }
+    }
+
+    fn chunk(relid: u32, value_id: u32, seq: u32, body: &[u8]) -> ToastChunk {
+        chunk_at(relid, value_id, seq, 0x1000, body)
     }
 
     #[tokio::test]
     async fn disk_store_roundtrip_across_puts() {
         let tmp = tempfile::tempdir().unwrap();
         let store = DiskChunkStore::new(tmp.path().to_path_buf()).unwrap();
-        // Two puts for the same value (chunks split across pages/commits).
+        // Two puts for the same value under one generation LSN (bootstrap
+        // batches split a value's chunks across put calls).
         store
             .put(&[chunk(16500, 7, 0, b"abc"), chunk(16500, 7, 1, b"de")])
             .await
@@ -1060,19 +1132,19 @@ mod tests {
         // Unrelated value in the same relation.
         store.put(&[chunk(16500, 9, 0, b"zz")]).await.unwrap();
 
-        let got = store.fetch(16500, 7).await.unwrap();
+        let got = store.fetch(16500, 7, u64::MAX).await.unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got.get(&0).unwrap(), b"abc");
         assert_eq!(got.get(&1).unwrap(), b"de");
         assert_eq!(got.get(&2).unwrap(), b"f");
 
-        let other = store.fetch(16500, 9).await.unwrap();
+        let other = store.fetch(16500, 9, u64::MAX).await.unwrap();
         assert_eq!(other.len(), 1);
         assert_eq!(other.get(&0).unwrap(), b"zz");
 
         // Absent value → empty, not error.
-        assert!(store.fetch(16500, 999).await.unwrap().is_empty());
-        assert!(store.fetch(404, 1).await.unwrap().is_empty());
+        assert!(store.fetch(16500, 999, u64::MAX).await.unwrap().is_empty());
+        assert!(store.fetch(404, 1, u64::MAX).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1092,75 +1164,104 @@ mod tests {
         f.sync_all().await.unwrap();
         drop(f);
 
-        let got = store.fetch(1, 1).await.unwrap();
+        let got = store.fetch(1, 1, u64::MAX).await.unwrap();
         assert_eq!(got.len(), 2, "torn tail ignored, clean prefix kept");
         assert_eq!(got.get(&0).unwrap(), b"good");
         assert_eq!(got.get(&1).unwrap(), b"alsogood");
     }
 
+    /// Pre-LSN v1 file (headerless `[seq][len][body]` frames): read as
+    /// lsn 0, upgraded in place by the next append, newer generation wins.
     #[tokio::test]
-    async fn disk_store_gc_lists_and_deletes() {
+    async fn disk_store_reads_and_upgrades_v1_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::new(tmp.path().to_path_buf()).unwrap();
+        let path = store.value_path(1, 7);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let mut v1 = Vec::new();
+        for (seq, body) in [(0u32, b"old0".as_slice()), (1, b"old1")] {
+            v1.extend_from_slice(&seq.to_le_bytes());
+            v1.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            v1.extend_from_slice(body);
+        }
+        tokio::fs::write(&path, &v1).await.unwrap();
+
+        let got = store.fetch(1, 7, u64::MAX).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.get(&0).unwrap(), b"old0");
+
+        // Append (reused OID regeneration, shorter): upgrades the file,
+        // fetch returns only the new generation
+        store
+            .put(&[chunk_at(1, 7, 0, 0x2000, b"new0")])
+            .await
+            .unwrap();
+        let got = store.fetch(1, 7, u64::MAX).await.unwrap();
+        assert_eq!(got.len(), 1, "stale v1 suffix dropped");
+        assert_eq!(got.get(&0).unwrap(), b"new0");
+    }
+
+    /// Reused-OID regeneration: fetch returns the newest generation whole,
+    /// never a chimera of new seq 0 + stale suffix.
+    #[tokio::test]
+    async fn disk_store_fetch_selects_newest_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let store = DiskChunkStore::new(tmp.path().to_path_buf()).unwrap();
         store
             .put(&[
-                chunk(16500, 7, 0, b"abc"),
-                chunk(16500, 9, 0, b"zz"),
-                chunk(16600, 3, 0, b"xy"),
+                chunk_at(1, 7, 0, 0x1000, b"g1-0"),
+                chunk_at(1, 7, 1, 0x1000, b"g1-1"),
+                chunk_at(1, 7, 2, 0x1000, b"g1-2"),
             ])
             .await
             .unwrap();
-
-        let mut relids = store.gc_relids().await.unwrap();
-        relids.sort_unstable();
-        assert_eq!(relids, vec![16500, 16600]);
-        // scan_start in the future: every file's mtime precedes it
-        let horizon = GcHorizon {
-            lsn: u64::MAX,
-            scan_start: std::time::SystemTime::now() + Duration::from_secs(60),
-        };
-        let none_live = RoaringBitmap::new();
-        let dead = store
-            .gc_dead_values(16500, &none_live, &horizon)
+        // Shorter regeneration under a later commit
+        store
+            .put(&[
+                chunk_at(1, 7, 0, 0x2000, b"g2-0"),
+                chunk_at(1, 7, 1, 0x2000, b"g2-1"),
+            ])
             .await
             .unwrap();
-        assert_eq!(dead.iter().collect::<Vec<_>>(), vec![7, 9]);
-        // Live ids filtered during the dir walk
-        let live: RoaringBitmap = [9].into_iter().collect();
-        let dead = store.gc_dead_values(16500, &live, &horizon).await.unwrap();
-        assert_eq!(dead.iter().collect::<Vec<_>>(), vec![7]);
-        assert!(
-            store
-                .gc_dead_values(404, &none_live, &horizon)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        assert_eq!(store.gc_delete(16500, &dead, &horizon).await.unwrap(), 1);
-        assert!(store.fetch(16500, 7).await.unwrap().is_empty());
-        assert!(!store.fetch(16500, 9).await.unwrap().is_empty());
-        // Idempotent: already gone
-        assert_eq!(store.gc_delete(16500, &dead, &horizon).await.unwrap(), 0);
+        let old = store.fetch(1, 7, 0x1fff).await.unwrap();
+        assert_eq!(old.len(), 3);
+        assert_eq!(old.get(&0).unwrap(), b"g1-0");
+        let got = store.fetch(1, 7, u64::MAX).await.unwrap();
+        assert_eq!(got.len(), 2, "old generation's seq 2 dropped");
+        assert_eq!(got.get(&0).unwrap(), b"g2-0");
+        assert_eq!(got.get(&1).unwrap(), b"g2-1");
     }
 
     #[tokio::test]
-    async fn disk_store_gc_delete_skips_fresh_files() {
+    async fn disk_store_gc_deletes_dead_generation_only() {
         let tmp = tempfile::tempdir().unwrap();
         let store = DiskChunkStore::new(tmp.path().to_path_buf()).unwrap();
-        store.put(&[chunk(1, 1, 0, b"live-again")]).await.unwrap();
-        // scan_start before the put's mtime models a re-put after the sweep
-        // began (reused OID): value skipped, chunks intact
-        let horizon = GcHorizon {
-            lsn: u64::MAX,
-            scan_start: std::time::SystemTime::UNIX_EPOCH,
-        };
-        let dead: RoaringBitmap = [1].into_iter().collect();
-        assert_eq!(store.gc_delete(1, &dead, &horizon).await.unwrap(), 0);
-        assert_eq!(
-            store.fetch(1, 1).await.unwrap().get(&0).unwrap(),
-            b"live-again"
-        );
+        store
+            .put(&[chunk_at(16500, 7, 0, 0x1000, b"abc")])
+            .await
+            .unwrap();
+        store
+            .put(&[chunk_at(16500, 9, 0, 0x1000, b"zz")])
+            .await
+            .unwrap();
+
+        // 7 died at 0x1800; 9 stays live
+        assert_eq!(store.gc_values(16500, &[(7, 0x1800)]).await.unwrap(), 1);
+        assert!(store.fetch(16500, 7, u64::MAX).await.unwrap().is_empty());
+        assert!(!store.fetch(16500, 9, u64::MAX).await.unwrap().is_empty());
+        // Idempotent: already gone
+        assert_eq!(store.gc_values(16500, &[(7, 0x1800)]).await.unwrap(), 0);
+
+        // Rebirth past the death LSN survives its predecessor's GC
+        store
+            .put(&[chunk_at(16500, 9, 0, 0x3000, b"reborn")])
+            .await
+            .unwrap();
+        assert_eq!(store.gc_values(16500, &[(9, 0x2000)]).await.unwrap(), 1);
+        let got = store.fetch(16500, 9, u64::MAX).await.unwrap();
+        assert_eq!(got.get(&0).unwrap(), b"reborn", "rebirth survives");
     }
 
     #[test]
@@ -1171,24 +1272,29 @@ mod tests {
         };
         let store = ClickHouseChunkStore::new(cfg);
         assert_eq!(
-            store.gc_relids_sql(),
-            "SELECT `name` FROM `system`.`tables` \
-             WHERE `database` = 'wh' AND `name` LIKE 'pg_toast_%'"
+            store.gc_delete_sql(16500, &[(7, 0x2000), (9, 0x3000)]),
+            "DELETE FROM `wh`.`pg_toast_16500` WHERE \
+             (`chunk_id` = 7 AND `_lsn` <= 8192) OR (`chunk_id` = 9 AND `_lsn` <= 12288)"
         );
         assert_eq!(
-            store.gc_dead_values_sql(16500, 0x2000),
-            "SELECT `chunk_id` FROM `wh`.`pg_toast_16500` GROUP BY `chunk_id` \
-             HAVING max(`_lsn`) <= 8192 SETTINGS optimize_aggregation_in_order = 1"
-        );
-        assert_eq!(
-            store.gc_delete_sql(16500, &[7, 9], 0x2000),
-            "DELETE FROM `wh`.`pg_toast_16500` WHERE `_lsn` <= 8192 AND `chunk_id` IN (7,9)"
-        );
-        assert_eq!(
-            store.gc_count_sql(16500, &[7, 9], 0x2000),
+            store.gc_count_sql(16500, &[(7, 0x2000)]),
             "SELECT countDistinct(`chunk_id`) FROM `wh`.`pg_toast_16500` \
-             WHERE `_lsn` <= 8192 AND `chunk_id` IN (7,9)"
+             WHERE (`chunk_id` = 7 AND `_lsn` <= 8192)"
         );
+    }
+
+    /// Order-independent newest-generation fold: same-LSN duplicates merge,
+    /// a higher LSN resets, stragglers below the max drop.
+    #[test]
+    fn gen_fold_keeps_max_lsn_group() {
+        let mut fold = GenFold::default();
+        fold.add(0, 0x1000, b"g1-0".to_vec());
+        fold.add(1, 0x1000, b"g1-1".to_vec());
+        fold.add(0, 0x2000, b"g2-0".to_vec());
+        fold.add(1, 0x1000, b"late-stale".to_vec());
+        fold.add(0, 0x2000, b"g2-0".to_vec());
+        assert_eq!(fold.out.len(), 1);
+        assert_eq!(fold.out.get(&0).unwrap(), b"g2-0");
     }
 
     #[tokio::test]
@@ -1197,7 +1303,7 @@ mod tests {
         assert!(r.fill_on_miss());
         assert!(!r.stores_chunks());
         let mut map = ChunkMap::new();
-        assert!(!r.fetch_into(1, 2, &mut map).await.unwrap());
+        assert!(!r.fetch_into(1, 2, u64::MAX, &mut map).await.unwrap());
         assert!(map.is_empty());
         // put is a no-op
         r.put(&[chunk(1, 2, 0, b"x")]).await.unwrap();
@@ -1218,12 +1324,16 @@ mod tests {
         assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 1);
 
         let mut out = ChunkMap::new();
-        assert!(r.fetch_into(16500, 7, &mut out).await.unwrap());
+        assert!(r.fetch_into(16500, 7, u64::MAX, &mut out).await.unwrap());
         assert_eq!(out.get(&(16500, 7)).unwrap().get(&0).unwrap(), b"hi");
         assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
 
         let mut empty = ChunkMap::new();
-        assert!(!r.fetch_into(16500, 404, &mut empty).await.unwrap());
+        assert!(
+            !r.fetch_into(16500, 404, u64::MAX, &mut empty)
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1243,7 +1353,7 @@ mod tests {
         assert!(create.contains("`chunk_data` String"));
         assert!(create.contains("`_lsn` UInt64"));
         assert!(create.contains("ENGINE = ReplacingMergeTree(`_lsn`)"));
-        assert!(create.ends_with("ORDER BY (`chunk_id`, `chunk_seq`)"));
+        assert!(create.ends_with("ORDER BY (`chunk_id`, `_lsn`, `chunk_seq`)"));
 
         assert_eq!(
             store.insert_sql(16500),
