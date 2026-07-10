@@ -1125,14 +1125,12 @@ impl TableEncoder {
 
 pub(crate) fn append_buf<'a>(
     bb: &mut BlockBuilder<'a>,
-    name: &str,
+    name: &'a str,
     ast: &'a TypeAst,
     buf: &'a ColumnBuf,
     n_rows: usize,
 ) -> Result<(), EmitterError> {
-    // SAFETY: BlockBuilder retains pointers into these slabs until
-    // `send_data` returns; buffers in `TableEncoder.buffers` are not
-    // mutated until `clear()` runs after this returns
+    // Batch metadata and buffers remain immutable until send_data returns
     match buf {
         ColumnBuf::Fixed { bytes, .. } => {
             bb.append_fixed(name, ast.view(), bytes, n_rows)?;

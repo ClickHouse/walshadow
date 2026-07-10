@@ -89,6 +89,18 @@ impl Codec {
     pub(crate) fn as_ptr(self: Pin<&Self>) -> *const sys::chc_codec {
         &self.raw
     }
+
+    pub(crate) fn supports(self: Pin<&Self>, compression: Compression) -> bool {
+        match compression {
+            Compression::None => true,
+            Compression::Lz4 => {
+                self.raw.lz4_compress.is_some() && self.raw.lz4_decompress.is_some()
+            }
+            Compression::Zstd => {
+                self.raw.zstd_compress.is_some() && self.raw.zstd_decompress.is_some()
+            }
+        }
+    }
 }
 
 unsafe impl Send for Codec {}

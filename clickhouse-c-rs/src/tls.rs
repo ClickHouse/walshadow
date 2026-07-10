@@ -117,6 +117,14 @@ unsafe impl ClientIo for TlsIo {
         // SAFETY: hands back the address of a field; does not move `self`.
         unsafe { &mut self.get_unchecked_mut().io as *mut sys::chc_io }
     }
+
+    fn set_read_timeout(self: Pin<&mut Self>, timeout: Option<core::time::Duration>) -> Result<()> {
+        unsafe { self.get_unchecked_mut() }
+            .stream
+            .sock
+            .set_read_timeout(timeout)?;
+        Ok(())
+    }
 }
 
 // The chc_io.ud raw pointer makes TlsIo !Send automatically. It points at
