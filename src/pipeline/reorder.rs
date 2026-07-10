@@ -502,6 +502,16 @@ impl ReorderSink {
                     .await
                     .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
             }
+            // Journal the slice's TID births/deaths after its chunks are
+            // durable (a birth must never precede its chunks), so ack implies
+            // both. Deaths can arrive in a chunk-free slice, so this is
+            // independent of `new_chunks`.
+            if !batch.new_tid_events.is_empty() {
+                self.resolver
+                    .apply_tid_events(&batch.new_tid_events, commit_lsn)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast tid apply: {e}")))?;
+            }
             let is_barrier = !batch.ordered_events.is_empty()
                 || batch.heaps.iter().any(|h| matches!(h.op, HeapOp::Truncate));
             let is_final = batch.is_final;

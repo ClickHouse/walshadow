@@ -1036,17 +1036,16 @@ async fn run(args: Args) -> Result<()> {
             .spawn(emitter_ack)
             .await
             .context("spawn decode+insert pipeline")?;
-        // Toast chunk GC: source anti-join sweep off the hot path, borrowing
+        // Toast chunk GC: TID-death-driven sweep off the hot path, borrowing
         // the pipeline's store so disk-mode delete serializes against put.
         if toast_gc_interval > Duration::ZERO {
-            if let Some(store) = handle.toast.store() {
+            if let (Some(store), Some(tracker)) = (handle.toast.store(), handle.toast.tracker()) {
                 // Detached task: dropping the JoinHandle never cancels it
                 let _toast_gc_task = walshadow::toast_gc::ToastGc {
                     store,
-                    source: cfg.clone(),
+                    tracker,
                     emitter_ack: handle.emitter_ack.clone(),
                     interval: toast_gc_interval,
-                    ack_wait: toast_gc_interval.min(Duration::from_secs(60)),
                     stats: stats.clone(),
                 }
                 .spawn();
@@ -1058,7 +1057,7 @@ async fn run(args: Args) -> Result<()> {
             } else {
                 tracing::warn!(
                     target: "walshadow::toast_gc",
-                    "[toast] gc_interval_secs set but mode = disabled; nothing to collect",
+                    "[toast] gc_interval_secs set but no store/tid_journal; nothing to collect",
                 );
             }
         }
@@ -2007,11 +2006,11 @@ async fn populate_metrics(
         toast_gc_values_deleted_total: emitter_stats
             .map(|s| s.toast_gc_values_deleted.load(Ordering::Relaxed))
             .unwrap_or(0),
-        toast_gc_skipped_source_unreachable_total: emitter_stats
-            .map(|s| {
-                s.toast_gc_skipped_source_unreachable
-                    .load(Ordering::Relaxed)
-            })
+        toast_deaths_resolved_total: emitter_stats
+            .map(|s| s.toast_deaths_resolved.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_deaths_unresolved_total: emitter_stats
+            .map(|s| s.toast_deaths_unresolved.load(Ordering::Relaxed))
             .unwrap_or(0),
         emitter_rows_total: emitter_stats
             .map(|s| s.rows_emitted.load(Ordering::Relaxed))

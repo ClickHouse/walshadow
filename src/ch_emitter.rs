@@ -466,6 +466,9 @@ impl EmitterConfig {
             if let Some(v) = toast.get("disk_dir").and_then(Value::as_str) {
                 out.toast.disk_dir = Some(std::path::PathBuf::from(v));
             }
+            if let Some(v) = toast.get("tid_journal").and_then(Value::as_str) {
+                out.toast.tid_journal = Some(std::path::PathBuf::from(v));
+            }
             if let Some(v) = toast.get("gc_interval_secs").and_then(Value::as_integer)
                 && let Ok(secs) = u64::try_from(v)
             {
@@ -1550,9 +1553,12 @@ crate::atomic_stats! {
         pub toast_gc_sweeps,
         /// Dead toast values deleted from the chunk store by GC
         pub toast_gc_values_deleted,
-        /// GC sweeps skipped: source PG unreachable (degraded mode, never
-        /// an error)
-        pub toast_gc_skipped_source_unreachable,
+        /// Toast deaths resolved to a dead value + commit LSN by the TID
+        /// tracker (`crate::toast_tid`)
+        pub toast_deaths_resolved,
+        /// Tracking gaps which can leak chunks until manual cleanup:
+        /// untracked deletes, TID collisions, relation rewrites, TRUNCATE/DROP
+        pub toast_deaths_unresolved,
         // Pipeline-flow counters; `_out`/`_in` pairs give channel depth. See
         // `metrics::render`.
         pub queue_jobs_out,
@@ -2244,6 +2250,7 @@ mod tests {
             [toast]
             mode = "disk"
             disk_dir = "/var/lib/walshadow/toast"
+            tid_journal = "/var/lib/walshadow/toast/tids.journal"
             gc_interval_secs = 900
 
             [table.public.foo]
@@ -2284,6 +2291,12 @@ mod tests {
         assert_eq!(
             c.toast.disk_dir.as_deref(),
             Some(std::path::Path::new("/var/lib/walshadow/toast"))
+        );
+        assert_eq!(
+            c.toast.tid_journal.as_deref(),
+            Some(std::path::Path::new(
+                "/var/lib/walshadow/toast/tids.journal"
+            ))
         );
         assert_eq!(c.toast.gc_interval, Duration::from_secs(900));
         // gc_interval_secs omitted => GC disabled

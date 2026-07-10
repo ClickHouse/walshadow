@@ -58,6 +58,7 @@ use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent, ShadowCatalog};
 use crate::spill::{SpillEntry, SpillError, SpillReader, SpillStore, SpillWriter, ToastChunk};
 use crate::toast::{ChunkMap, ToastResolver};
+use crate::toast_tid::TidEvent;
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
 use std::pin::Pin;
@@ -329,6 +330,7 @@ fn entry_lsn(e: &SpillEntry) -> u64 {
     match e {
         SpillEntry::Heap(h) => h.source_lsn,
         SpillEntry::Chunk(c) => c.source_lsn,
+        SpillEntry::ToastDelete(d) => d.source_lsn,
     }
 }
 
@@ -665,6 +667,7 @@ fn approximate_size(entry: &SpillEntry) -> usize {
             sz
         }
         SpillEntry::Chunk(c) => std::mem::size_of::<ToastChunk>() + c.chunk_data.len(),
+        SpillEntry::ToastDelete(_) => std::mem::size_of::<crate::spill::ToastDelete>(),
     }
 }
 
@@ -833,6 +836,11 @@ impl XactBuffer {
                             last_lsn = last_lsn.max(c.source_lsn);
                             rels.insert((0, c.toast_relid));
                         }
+                        SpillEntry::ToastDelete(d) => {
+                            chunk_count += 1;
+                            last_lsn = last_lsn.max(d.source_lsn);
+                            rels.insert((0, d.toast_relid));
+                        }
                     }
                 }
                 for (lsn, _) in &st.events {
@@ -881,6 +889,19 @@ impl XactBuffer {
         let first_lsn = chunk.source_lsn;
         let entry = SpillEntry::Chunk(chunk);
         self.absorb(xid, first_lsn, entry).await
+    }
+
+    /// TID-keyed toast DELETE, resolved to a dead value at commit
+    /// ([`crate::toast_tid`]). Buffered like chunks so aborts discard it
+    /// and the drain merge keeps WAL order against same-xact births.
+    pub async fn on_toast_delete(
+        &mut self,
+        delete: crate::spill::ToastDelete,
+        xid: u32,
+    ) -> std::result::Result<(), XactBufferError> {
+        let first_lsn = delete.source_lsn;
+        self.absorb(xid, first_lsn, SpillEntry::ToastDelete(delete))
+            .await
     }
 
     /// Lazily insert the xid's state (adopting its `txn` span) and queue a
@@ -1036,6 +1057,7 @@ impl XactBuffer {
             events,
             chunks: ChunkMap::new(),
             chunk_bytes: 0,
+            tid_events: Vec::new(),
             gauge,
         })
     }
@@ -1495,6 +1517,10 @@ struct MergedDrain {
     events: Vec<VecDeque<(u64, DrainEntry)>>,
     chunks: ChunkMap,
     chunk_bytes: usize,
+    // Births (per-chunk TID) + deaths (toast DELETEs) folded in WAL order,
+    // sealed per slice alongside `chunks`. Applied to the TID tracker at the
+    // store-put site; the serial `commit` path never seals so they stay moot.
+    tid_events: Vec<TidEvent>,
     gauge: ResidentGauge,
 }
 
@@ -1536,6 +1562,17 @@ impl MergedDrain {
                     match entry {
                         SpillEntry::Heap(h) => return Ok(Some(MergeItem::Heap(h))),
                         SpillEntry::Chunk(c) => {
+                            // Per-chunk TID birth keeps sibling deletes
+                            // resolvable. offnum is 1-based in PG; 0 marks a
+                            // chunk without a TID (defensive, unexpected shape)
+                            if c.offnum != 0 {
+                                self.tid_events.push(TidEvent::Birth {
+                                    toast_relid: c.toast_relid,
+                                    blkno: c.blkno,
+                                    offnum: c.offnum,
+                                    value_id: c.value_id,
+                                });
+                            }
                             self.chunk_bytes += c.chunk_data.len();
                             self.gauge.add(c.chunk_data.len());
                             self.chunks
@@ -1543,6 +1580,13 @@ impl MergedDrain {
                                 .or_default()
                                 .insert(c.chunk_seq, c.chunk_data);
                         }
+                        // TID-keyed DELETE, resolved to a dead value at the
+                        // store-put site; never surfaces as a heap.
+                        SpillEntry::ToastDelete(d) => self.tid_events.push(TidEvent::Death {
+                            toast_relid: d.toast_relid,
+                            blkno: d.blkno,
+                            offnum: d.offnum,
+                        }),
                     }
                 }
             }
@@ -1558,6 +1602,12 @@ impl MergedDrain {
         self.gauge.sub(self.chunk_bytes);
         self.chunk_bytes = 0;
         std::mem::take(&mut self.chunks)
+    }
+
+    /// TID births/deaths accumulated since the last take, sealed with the
+    /// slice (WAL order preserved). Not gauged: each event is a few bytes.
+    fn take_tid_events(&mut self) -> Vec<TidEvent> {
+        std::mem::take(&mut self.tid_events)
     }
 
     /// Every head empty and every event queue drained.
@@ -1600,6 +1650,11 @@ pub struct DrainedBatch {
     /// Generation sealed with this slice (last element of `chunks`) — the
     /// only chunks not yet handed out, the toast-store put target.
     pub new_chunks: Option<Arc<ChunkMap>>,
+    /// TID births/deaths sealed with this slice, WAL-ordered. Journaled to
+    /// the TID tracker after `new_chunks` is durable (a birth must not precede
+    /// its chunks). Present even when `new_chunks` is None: a death can arrive
+    /// in a chunk-free slice.
+    pub new_tid_events: Vec<TidEvent>,
     /// Last slice of the commit. Only its seq may publish `commit_lsn` in
     /// the ack (`register` vs `register_partial`): an earlier slice
     /// publishing would claim durability for rows still in flight.
@@ -1649,10 +1704,15 @@ impl CommittedDrain {
             let sealed = m.take_chunks();
             (!sealed.is_empty()).then(|| Arc::new(sealed))
         };
+        let new_tid_events = m.take_tid_events();
         if let Some(g) = &new_chunks {
             self.generations.push(g.clone());
         }
-        if heaps.is_empty() && ordered_events.is_empty() && new_chunks.is_none() {
+        if heaps.is_empty()
+            && ordered_events.is_empty()
+            && new_chunks.is_none()
+            && new_tid_events.is_empty()
+        {
             return Ok(None);
         }
         Ok(Some(DrainedBatch {
@@ -1660,6 +1720,7 @@ impl CommittedDrain {
             ordered_events,
             chunks: self.generations.clone(),
             new_chunks,
+            new_tid_events,
             is_final,
         }))
     }
@@ -1718,7 +1779,7 @@ pub(crate) async fn detoast_heap(
                 continue;
             }
             resolver
-                .fetch_into(relid, value_id, &mut extra)
+                .fetch_into(relid, value_id, heap.source_lsn, &mut extra)
                 .await
                 .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?;
         }
@@ -1844,6 +1905,19 @@ pub(crate) fn try_reassemble(
             return Ok(None);
         }
         concat.extend_from_slice(body);
+    }
+    // PG toast_fetch_datum validates the same way (src/backend/access/common/
+    // detoast.c): concatenated chunks must equal the pointer's stored size.
+    // A mismatch is generation mixing (reused va_valueid leaving stale
+    // higher-seq chunks) or corruption — loud, never a silent chimera.
+    let extsize = (p.va_extinfo & VARLENA_EXTSIZE_MASK) as usize;
+    if concat.len() != extsize {
+        return Err(XactBufferError::Detoast(format!(
+            "toast value {}/{}: chunks sum to {} bytes, pointer says {extsize}",
+            p.va_toastrelid,
+            p.va_valueid,
+            concat.len()
+        )));
     }
     let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
     if !compressed {
@@ -2465,6 +2539,12 @@ impl RecordSink for BufferingDecoderSink {
             }
             let n_decoded = decoded_set.len();
             let buffer_span = trace_span!(sampled, "buffer", rows = n_decoded);
+            // TID for the toast branch: single-tuple INSERT/DELETE only
+            // (toast_save_datum never multi-inserts). blkno rides block ref
+            // 0; offnum sits in xl_heap_insert[0..2] / xl_heap_delete[4..6].
+            let tid = (rel.kind == 't' && n_decoded == 1)
+                .then(|| toast_record_tid(&record.parsed))
+                .flatten();
             async move {
                 // Lock once per record (not per tuple); on_heap/on_toast_chunk
                 // never touch the catalog, so no buffer→catalog inversion.
@@ -2473,16 +2553,34 @@ impl RecordSink for BufferingDecoderSink {
                     self.stats.record(&decoded);
                     if rel.kind == 't' {
                         let xid = decoded.xid;
-                        if decoded.op != HeapOp::Insert {
-                            // heap_toast_delete's DELETE (or an owning-table
-                            // TRUNCATE fan-out): TID-keyed, unappliable to the
-                            // (chunk_id, seq) store. Dropped by design; the GC
-                            // sweep reclaims dead values
-                            // (plans/TOAST.md)
+                        if decoded.op == HeapOp::Delete
+                            && let Some((blkno, offnum)) = tid
+                        {
+                            // heap_toast_delete's DELETE: TID-keyed. Buffered
+                            // for commit-time death resolution against the
+                            // seq-0 birth map (crate::toast_tid)
                             self.stats
                                 .toast_chunk_deletes
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        } else if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel) {
+                            buf.on_toast_delete(
+                                crate::spill::ToastDelete {
+                                    toast_relid: rel.oid,
+                                    blkno,
+                                    offnum,
+                                    source_lsn: decoded.source_lsn,
+                                },
+                                xid,
+                            )
+                            .await
+                            .map_err(SinkError::from)?;
+                        } else if decoded.op != HeapOp::Insert {
+                            // Non-delete non-insert (TRUNCATE fan-out never
+                            // reaches here — kind 't' is filtered there):
+                            // nothing to apply against the store
+                            self.stats
+                                .toast_chunk_deletes
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel, tid) {
                             self.stats
                                 .toast_chunks_buffered
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2507,6 +2605,27 @@ impl RecordSink for BufferingDecoderSink {
     }
 }
 
+/// TID of a single-tuple toast-rel INSERT / DELETE: blkno from block ref 0,
+/// offnum from the record's `xl_heap_insert` / `xl_heap_delete` main data
+/// (PG `access/heapam_xlog.h`). `None` for other shapes.
+fn toast_record_tid(record: &walrus::pg::walparser::XLogRecord) -> Option<(u32, u16)> {
+    use crate::heap_decoder::{XLOG_HEAP_DELETE, XLOG_HEAP_INSERT, XLOG_HEAP_OPMASK};
+    if record.header.resource_manager_id != walrus::pg::walparser::RmId::Heap as u8 {
+        return None;
+    }
+    let md = &record.main_data;
+    let off = match record.header.info & XLOG_HEAP_OPMASK {
+        // xl_heap_insert: offnum:u16 + flags:u8
+        XLOG_HEAP_INSERT => 0,
+        // xl_heap_delete: xmax:u32 + offnum:u16 + ...
+        XLOG_HEAP_DELETE => 4,
+        _ => return None,
+    };
+    let offnum = u16::from_le_bytes(md.get(off..off + 2)?.try_into().ok()?);
+    let blkno = record.blocks.first()?.header.location.block_no;
+    Some((blkno, offnum))
+}
+
 /// Drain queued [`SchemaEvent`]s; channel is unbounded + same-task
 pub(crate) fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent> {
     let mut out = Vec::new();
@@ -2524,7 +2643,11 @@ pub(crate) fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent
 /// Keyed on the toast rel's pg_class OID ([`RelDescriptor::oid`]), not
 /// `rel_node`: the referring tuple's `va_toastrelid` is the OID. They
 /// diverge after `VACUUM FULL` / `CLUSTER` on the toast rel.
-fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<ToastChunk> {
+fn toast_chunk_from_decoded(
+    mut d: DecodedHeap,
+    rel: &RelDescriptor,
+    tid: Option<(u32, u16)>,
+) -> Option<ToastChunk> {
     if d.op != HeapOp::Insert {
         return None;
     }
@@ -2545,11 +2668,14 @@ fn toast_chunk_from_decoded(mut d: DecodedHeap, rel: &RelDescriptor) -> Option<T
         ColumnValue::Text(s) => s.into_bytes(),
         _ => return None,
     };
+    let (blkno, offnum) = tid.unwrap_or((0, 0));
     Some(ToastChunk {
         toast_relid: rel.oid,
         value_id,
         chunk_seq,
         source_lsn: d.source_lsn,
+        blkno,
+        offnum,
         chunk_data,
     })
 }
@@ -2909,17 +3035,19 @@ mod tests {
             }),
             old: None,
         };
-        let chunk = toast_chunk_from_decoded(d.clone(), &rel).expect("recognised toast shape");
+        let chunk = toast_chunk_from_decoded(d.clone(), &rel, Some((7, 3)))
+            .expect("recognised toast shape");
         assert_eq!(chunk.toast_relid, 99); // pg_class.oid, not rel_node
         assert_eq!(chunk.value_id, 55);
         assert_eq!(chunk.chunk_seq, 2);
         assert_eq!(chunk.chunk_data, b"hello");
+        assert_eq!((chunk.blkno, chunk.offnum), (7, 3));
         let mut d2 = d.clone();
         d2.op = HeapOp::Update;
-        assert!(toast_chunk_from_decoded(d2, &rel).is_none());
+        assert!(toast_chunk_from_decoded(d2, &rel, None).is_none());
         let mut d3 = d.clone();
         d3.new.as_mut().unwrap().columns.pop();
-        assert!(toast_chunk_from_decoded(d3, &rel).is_none());
+        assert!(toast_chunk_from_decoded(d3, &rel, None).is_none());
     }
 
     #[test]
@@ -3080,6 +3208,8 @@ mod tests {
             value_id,
             chunk_seq: seq,
             source_lsn: lsn,
+            blkno: 0,
+            offnum: 1 + seq as u16,
             chunk_data: body.to_vec(),
         }
     }
@@ -3181,7 +3311,7 @@ mod tests {
         let maps: Vec<&ChunkMap> = b2.chunks.iter().map(Arc::as_ref).collect();
         let p = ToastPointer {
             va_rawsize: 8,
-            va_extinfo: 0,
+            va_extinfo: 4, // extsize = "abcd", no compression
             va_valueid: 55,
             va_toastrelid: 16400,
         };

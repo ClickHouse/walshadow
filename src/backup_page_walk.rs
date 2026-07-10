@@ -82,6 +82,10 @@ pub struct BackfillTuple {
     /// `t_infomask` hint bits
     pub infomask: u16,
     pub source_lsn: u64,
+    /// On-page TID; toast tuples become chunk births keyed on it
+    /// ([`crate::toast_tid`])
+    pub blkno: u32,
+    pub offnum: u16,
     /// Attnum-1 indexed, matching `RelDescriptor.attributes`
     pub columns: Vec<Option<ColumnValue>>,
 }
@@ -182,6 +186,7 @@ impl<'a> PageWalker<'a> {
     pub fn walk_page(
         &self,
         page: &[u8],
+        block_no: u32,
         out: &mut Vec<BackfillTuple>,
         stats: &mut PageWalkStats,
     ) -> Result<(), PageWalkError> {
@@ -240,6 +245,9 @@ impl<'a> PageWalker<'a> {
                         xmax,
                         infomask,
                         source_lsn: self.source_lsn,
+                        blkno: block_no,
+                        // OffsetNumber is 1-based (PG off/itemid.h)
+                        offnum: (i + 1) as u16,
                         columns,
                     });
                     stats.tuples_emitted += 1;
@@ -500,7 +508,7 @@ impl PageWalkSink {
                 .unwrap_or(self.source_lsn);
             let walker = PageWalker::new(&desc, lsn);
             let mut local_out = Vec::new();
-            if let Err(e) = walker.walk_page(&page, &mut local_out, &mut self.stats) {
+            if let Err(e) = walker.walk_page(&page, block_no, &mut local_out, &mut self.stats) {
                 tracing::warn!(
                     target = "walshadow::backup_page_walk",
                     block = block_no,
@@ -726,7 +734,7 @@ mod tests {
         let page = synth_single_tuple_page(42);
         let mut out = Vec::new();
         let mut stats = PageWalkStats::default();
-        walker.walk_page(&page, &mut out, &mut stats).unwrap();
+        walker.walk_page(&page, 0, &mut out, &mut stats).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].source_lsn, 0xABCD);
         assert_eq!(out[0].xid, 99);
@@ -746,7 +754,7 @@ mod tests {
         page[14..16].copy_from_slice(&(PAGE_BYTES as u16).to_le_bytes());
         let mut out = Vec::new();
         let mut stats = PageWalkStats::default();
-        walker.walk_page(&page, &mut out, &mut stats).unwrap();
+        walker.walk_page(&page, 0, &mut out, &mut stats).unwrap();
         assert!(out.is_empty());
         assert_eq!(stats.pages_walked, 1);
         assert_eq!(stats.slots_seen, 0);
@@ -769,7 +777,7 @@ mod tests {
         page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + 4].copy_from_slice(&new_raw.to_le_bytes());
         let mut out = Vec::new();
         let mut stats = PageWalkStats::default();
-        walker.walk_page(&page, &mut out, &mut stats).unwrap();
+        walker.walk_page(&page, 0, &mut out, &mut stats).unwrap();
         assert!(out.is_empty());
         assert_eq!(stats.tuples_skipped_lp_flag, 1);
         assert_eq!(stats.tuples_emitted, 0);
@@ -785,7 +793,7 @@ mod tests {
         page[14..16].copy_from_slice(&(SIZE_OF_PAGE_HEADER as u16).to_le_bytes());
         let mut out = Vec::new();
         let mut stats = PageWalkStats::default();
-        let err = walker.walk_page(&page, &mut out, &mut stats);
+        let err = walker.walk_page(&page, 0, &mut out, &mut stats);
         assert!(matches!(err, Err(PageWalkError::BadPageHeader { .. })));
     }
 
