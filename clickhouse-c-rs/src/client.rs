@@ -7,6 +7,7 @@ use core::ffi::c_char;
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::slice;
+use core::time::Duration;
 
 use crate::alloc::Allocator;
 use crate::block::Block;
@@ -16,8 +17,6 @@ use crate::error::{Error, ErrorKind, Result, check};
 use crate::io::ClientIo;
 use crate::sys;
 
-pub const DEFAULT_REVISION: u64 = sys::CHC_CLIENT_DEFAULT_REVISION;
-
 /// Connection settings. NUL-terminated `CString`-style buffers held
 /// inline so the C side's borrowed pointers stay valid through
 /// [`Client::init`].
@@ -26,10 +25,6 @@ pub struct ClientOpts {
     database: Option<Vec<u8>>,
     user: Option<Vec<u8>>,
     password: Option<Vec<u8>>,
-    pub client_version_major: u64,
-    pub client_version_minor: u64,
-    pub client_version_patch: u64,
-    pub client_revision: u64,
     pub compression: Compression,
     pub read_buffer_bytes: usize,
 }
@@ -41,10 +36,6 @@ impl Default for ClientOpts {
             database: None,
             user: None,
             password: None,
-            client_version_major: 0,
-            client_version_minor: 0,
-            client_version_patch: 0,
-            client_revision: 0,
             compression: Compression::None,
             read_buffer_bytes: 0,
         }
@@ -79,14 +70,30 @@ impl ClientOpts {
         raw.database = ptr_or_null(&self.database);
         raw.user = ptr_or_null(&self.user);
         raw.password = ptr_or_null(&self.password);
-        raw.client_version_major = self.client_version_major;
-        raw.client_version_minor = self.client_version_minor;
-        raw.client_version_patch = self.client_version_patch;
-        raw.client_revision = self.client_revision;
         raw.compression = self.compression as i32;
         raw.codec = codec.unwrap_or(core::ptr::null());
         raw.read_buffer_bytes = self.read_buffer_bytes;
         raw
+    }
+
+    pub(crate) fn validate_codec(&self, codec: Option<Pin<&Codec>>) -> Result<()> {
+        if self.compression == Compression::None {
+            return Ok(());
+        }
+        let codec = codec.ok_or_else(|| {
+            Error::new(
+                ErrorKind::Usage,
+                format!("{:?} compression requires a codec", self.compression),
+            )
+        })?;
+        if codec.supports(self.compression) {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::Usage,
+                format!("codec does not support {:?} compression", self.compression),
+            ))
+        }
     }
 }
 
@@ -154,7 +161,7 @@ pub struct Client<'fd> {
     // [`PosixIo`](crate::PosixIo) or a `tls::TlsIo`. `chc_client` retains
     // the `chc_io` pointer minted from this backend, so it must outlive
     // the client; the box keeps it pinned through `Drop`.
-    _io: Pin<Box<dyn ClientIo + Send + 'fd>>,
+    io: Pin<Box<dyn ClientIo + Send + 'fd>>,
 }
 
 impl<'fd> Client<'fd> {
@@ -191,6 +198,7 @@ impl<'fd> Client<'fd> {
         mut io: Pin<Box<I>>,
         codec: Option<Pin<Box<Codec>>>,
     ) -> Result<Self> {
+        opts.validate_codec(codec.as_ref().map(|codec| codec.as_ref()))?;
         let codec_ptr = codec.as_ref().map(|c| c.as_ref().as_ptr());
         let raw_opts = opts.to_raw(codec_ptr);
         let alloc = Box::new(alloc);
@@ -210,7 +218,7 @@ impl<'fd> Client<'fd> {
             raw: NonNull::new(out).expect("chc_client_init returned OK with NULL"),
             alloc,
             _codec: codec,
-            _io: io,
+            io,
         })
     }
 
@@ -221,6 +229,12 @@ impl<'fd> Client<'fd> {
         } else {
             Some(ServerInfo::from_raw(unsafe { &*p }))
         }
+    }
+
+    /// Set backend read timeout. Refresh before each operation when using
+    /// [`PosixIo`](crate::PosixIo), whose timeout is an absolute deadline.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
+        self.io.as_mut().set_read_timeout(timeout)
     }
 
     pub fn send_query(&mut self, sql: &str, query_id: Option<&str>) -> Result<()> {
@@ -524,5 +538,32 @@ impl ProfileInfo {
             applied_limit: raw.applied_limit != 0,
             calculated_rows_before_limit: raw.calculated_rows_before_limit != 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientOpts;
+    use crate::{Codec, Compression, ErrorKind};
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn compression_requires_matching_codec() {
+        let missing = ClientOpts {
+            compression: Compression::Lz4,
+            ..ClientOpts::new()
+        }
+        .validate_codec(None)
+        .expect_err("missing codec");
+        assert_eq!(missing.kind, ErrorKind::Usage);
+
+        let codec = Codec::lz4();
+        let mismatch = ClientOpts {
+            compression: Compression::Zstd,
+            ..ClientOpts::new()
+        }
+        .validate_codec(Some(codec.as_ref()))
+        .expect_err("mismatched codec");
+        assert_eq!(mismatch.kind, ErrorKind::Usage);
     }
 }

@@ -161,6 +161,7 @@ fn quickstart_tcp_client() -> Result<(), Box<dyn std::error::Error>> {
     opts.compression = Compression::Lz4;
 
     let mut client = Client::init(&opts, Allocator::stdlib(), io, Some(codec))?;
+    client.set_read_timeout(None)?;
     // --- README snippet ends ---
 
     // Bring up a table for the INSERT FORMAT Native path the README shows.

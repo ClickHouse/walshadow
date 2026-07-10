@@ -21,6 +21,7 @@ use core::pin::Pin;
 use core::time::Duration;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
+use crate::error::{Error, ErrorKind, Result};
 use crate::sys;
 
 /// I/O backend a [`Client`](crate::Client) talks through. Hands the C
@@ -46,6 +47,15 @@ use crate::sys;
 pub unsafe trait ClientIo {
     /// Pointer to the `chc_io` vtable, valid while `self` is pinned alive.
     fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io;
+
+    /// Set backend read timeout. Refresh before each operation when backend
+    /// uses an absolute deadline.
+    fn set_read_timeout(self: Pin<&mut Self>, _timeout: Option<Duration>) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::Usage,
+            "I/O backend does not support read timeouts",
+        ))
+    }
 }
 
 pub struct PosixIo<'fd> {
@@ -159,6 +169,11 @@ unsafe impl<'fd> ClientIo for PosixIo<'fd> {
         // Inherent method wins path resolution over this trait method, so
         // no recursion; block.rs / builder.rs still call it directly.
         Self::io_ptr(self)
+    }
+
+    fn set_read_timeout(self: Pin<&mut Self>, timeout: Option<Duration>) -> Result<()> {
+        Self::set_read_timeout(self, timeout);
+        Ok(())
     }
 }
 

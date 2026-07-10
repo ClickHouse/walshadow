@@ -43,8 +43,7 @@ pub use async_client::AsyncClient;
 pub use block::{Block, BlockOpts, Column, ColumnLayout, LowCardinalityView};
 pub use builder::BlockBuilder;
 pub use client::{
-    Client, ClientOpts, DEFAULT_REVISION, Event, Exception, PacketKind, ProfileInfo, Progress,
-    ServerInfo,
+    Client, ClientOpts, Event, Exception, PacketKind, ProfileInfo, Progress, ServerInfo,
 };
 pub use codec::{Codec, Compression, cityhash128};
 pub use error::{Error, ErrorKind, Result};

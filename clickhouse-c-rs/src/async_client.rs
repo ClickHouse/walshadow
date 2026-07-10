@@ -133,6 +133,7 @@ impl AsyncClient {
         opts: ClientOpts,
         codec: Option<Pin<Box<Codec>>>,
     ) -> Result<Self> {
+        opts.validate_codec(codec.as_ref().map(|codec| codec.as_ref()))?;
         let alloc = Box::new(Allocator::stdlib());
         let read_buf_bytes = if opts.read_buffer_bytes == 0 {
             DEFAULT_READ_BUF_BYTES

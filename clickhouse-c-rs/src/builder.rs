@@ -2,20 +2,19 @@
 //! `chc_block_builder_append_*`; this wrapper holds the lifetime
 //! invariant through `BlockBuilder<'a>`.
 
-use core::ffi::c_char;
 use core::marker::PhantomData;
 use core::pin::Pin;
 use core::ptr::NonNull;
 
 use crate::alloc::Allocator;
 use crate::block::BlockOpts;
-use crate::error::{Result, check};
+use crate::error::{Error, ErrorKind, Result, check};
 use crate::io::PosixIo;
 use crate::sys;
 use crate::types::TypeRef;
 
 /// Append-side counterpart to [`Block`](crate::Block). The lifetime `'a`
-/// binds the caller-owned column slabs that the builder references
+/// binds caller-owned column names and slabs that the builder references
 /// without copying.
 pub struct BlockBuilder<'a> {
     raw: NonNull<sys::chc_block_builder>,
@@ -39,19 +38,27 @@ impl<'a> BlockBuilder<'a> {
 
     /// Fixed-width column. `data` must be `n_rows * elem_size_of(t)`
     /// little-endian bytes. The slab is borrowed; do not free or mutate
-    /// until the builder is dropped or [`Self::write`] is called.
+    /// until the builder is dropped.
     pub fn append_fixed(
         &mut self,
-        name: &str,
+        name: &'a str,
         ty: TypeRef<'a>,
         data: &'a [u8],
         n_rows: usize,
     ) -> Result<()> {
+        let elem_size = ty.elem_size();
+        if elem_size != 0 {
+            require_covers(
+                "fixed data",
+                data.len(),
+                checked_len(n_rows, elem_size, "fixed data")?,
+            )?;
+        }
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_block_builder_append_fixed(
                 self.raw.as_ptr(),
-                name.as_ptr().cast::<c_char>(),
+                name.as_ptr().cast(),
                 name.len(),
                 ty.raw,
                 data.as_ptr().cast(),
@@ -66,16 +73,17 @@ impl<'a> BlockBuilder<'a> {
     /// row `i` in `data`, host byte order.
     pub fn append_string(
         &mut self,
-        name: &str,
+        name: &'a str,
         offsets: &'a [u64],
         data: &'a [u8],
         n_rows: usize,
     ) -> Result<()> {
+        validate_string(offsets, data.len(), n_rows, "string")?;
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_block_builder_append_string(
                 self.raw.as_ptr(),
-                name.as_ptr().cast::<c_char>(),
+                name.as_ptr().cast(),
                 name.len(),
                 offsets.as_ptr(),
                 data.as_ptr(),
@@ -88,17 +96,26 @@ impl<'a> BlockBuilder<'a> {
 
     pub fn append_nullable_fixed(
         &mut self,
-        name: &str,
+        name: &'a str,
         ty: TypeRef<'a>,
         null_map: &'a [u8],
         inner_data: &'a [u8],
         n_rows: usize,
     ) -> Result<()> {
+        require_len("nullable null map", null_map.len(), n_rows)?;
+        let elem_size = ty.child(0).map(|inner| inner.elem_size()).unwrap_or(0);
+        if elem_size != 0 {
+            require_covers(
+                "nullable fixed data",
+                inner_data.len(),
+                checked_len(n_rows, elem_size, "nullable fixed data")?,
+            )?;
+        }
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_block_builder_append_nullable_fixed(
                 self.raw.as_ptr(),
-                name.as_ptr().cast::<c_char>(),
+                name.as_ptr().cast(),
                 name.len(),
                 ty.raw,
                 null_map.as_ptr(),
@@ -112,18 +129,20 @@ impl<'a> BlockBuilder<'a> {
 
     pub fn append_nullable_string(
         &mut self,
-        name: &str,
+        name: &'a str,
         ty: TypeRef<'a>,
         null_map: &'a [u8],
         inner_offsets: &'a [u64],
         inner_data: &'a [u8],
         n_rows: usize,
     ) -> Result<()> {
+        require_len("nullable null map", null_map.len(), n_rows)?;
+        validate_string(inner_offsets, inner_data.len(), n_rows, "nullable string")?;
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_block_builder_append_nullable_string(
                 self.raw.as_ptr(),
-                name.as_ptr().cast::<c_char>(),
+                name.as_ptr().cast(),
                 name.len(),
                 ty.raw,
                 null_map.as_ptr(),
@@ -138,17 +157,26 @@ impl<'a> BlockBuilder<'a> {
 
     pub fn append_array_fixed(
         &mut self,
-        name: &str,
+        name: &'a str,
         ty: TypeRef<'a>,
         offsets: &'a [u64],
         values: &'a [u8],
         n_rows: usize,
     ) -> Result<()> {
+        let inner_n = validate_offsets(offsets, n_rows, "array")?;
+        let elem_size = ty.child(0).map(|inner| inner.elem_size()).unwrap_or(0);
+        if elem_size != 0 {
+            require_covers(
+                "array fixed values",
+                values.len(),
+                checked_len(inner_n, elem_size, "array fixed values")?,
+            )?;
+        }
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_block_builder_append_array_fixed(
                 self.raw.as_ptr(),
-                name.as_ptr().cast::<c_char>(),
+                name.as_ptr().cast(),
                 name.len(),
                 ty.raw,
                 offsets.as_ptr(),
@@ -162,18 +190,25 @@ impl<'a> BlockBuilder<'a> {
 
     pub fn append_array_string(
         &mut self,
-        name: &str,
+        name: &'a str,
         ty: TypeRef<'a>,
         offsets: &'a [u64],
         values_offsets: &'a [u64],
         values_data: &'a [u8],
         n_rows: usize,
     ) -> Result<()> {
+        let inner_n = validate_offsets(offsets, n_rows, "array")?;
+        validate_string(
+            values_offsets,
+            values_data.len(),
+            inner_n,
+            "array string values",
+        )?;
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_block_builder_append_array_string(
                 self.raw.as_ptr(),
-                name.as_ptr().cast::<c_char>(),
+                name.as_ptr().cast(),
                 name.len(),
                 ty.raw,
                 offsets.as_ptr(),
@@ -193,17 +228,18 @@ impl<'a> BlockBuilder<'a> {
     /// the server rejects malformed documents at INSERT time.
     pub fn append_json_string(
         &mut self,
-        name: &str,
+        name: &'a str,
         ty: TypeRef<'a>,
         offsets: &'a [u64],
         data: &'a [u8],
         n_rows: usize,
     ) -> Result<()> {
+        validate_string(offsets, data.len(), n_rows, "JSON string")?;
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_block_builder_append_json_string(
                 self.raw.as_ptr(),
-                name.as_ptr().cast::<c_char>(),
+                name.as_ptr().cast(),
                 name.len(),
                 ty.raw,
                 offsets.as_ptr(),
@@ -220,7 +256,7 @@ impl<'a> BlockBuilder<'a> {
     /// null sentinel and store key=0 for null rows.
     pub fn append_low_cardinality_string(
         &mut self,
-        name: &str,
+        name: &'a str,
         ty: TypeRef<'a>,
         key_size: i32,
         keys: &'a [u8],
@@ -229,11 +265,18 @@ impl<'a> BlockBuilder<'a> {
         dict_n: usize,
         n_rows: usize,
     ) -> Result<()> {
+        validate_low_cardinality_keys(keys, key_size, n_rows, dict_n)?;
+        validate_string(
+            dict_offsets,
+            dict_data.len(),
+            dict_n,
+            "LowCardinality dictionary",
+        )?;
         let mut err = sys::chc_err::zeroed();
         let rc = unsafe {
             sys::chc_block_builder_append_low_cardinality_string(
                 self.raw.as_ptr(),
-                name.as_ptr().cast::<c_char>(),
+                name.as_ptr().cast(),
                 name.len(),
                 ty.raw,
                 key_size,
@@ -268,6 +311,99 @@ impl<'a> BlockBuilder<'a> {
     pub(crate) fn as_ptr(&self) -> *const sys::chc_block_builder {
         self.raw.as_ptr().cast_const()
     }
+}
+
+fn usage(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::Usage, message)
+}
+
+fn checked_len(count: usize, width: usize, label: &str) -> Result<usize> {
+    count
+        .checked_mul(width)
+        .ok_or_else(|| usage(format!("{label} length overflow: {count} * {width}")))
+}
+
+// Row-count arrays (offsets, null maps, LC keys) restate `n_rows`; a
+// mismatch means the caller disagrees with itself, so require exact.
+fn require_len(label: &str, actual: usize, expected: usize) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(usage(format!(
+            "{label} length mismatch: got {actual}, expected {expected}"
+        )))
+    }
+}
+
+// Raw byte slabs are read as a computed prefix; C never sees the slab
+// length, so trailing slack is harmless. Only the too-short case is a bug.
+fn require_covers(label: &str, actual: usize, needed: usize) -> Result<()> {
+    if actual >= needed {
+        Ok(())
+    } else {
+        Err(usage(format!(
+            "{label} too short: got {actual}, need at least {needed}"
+        )))
+    }
+}
+
+fn validate_offsets(offsets: &[u64], n_rows: usize, label: &str) -> Result<usize> {
+    require_len(&format!("{label} offsets"), offsets.len(), n_rows)?;
+    let mut previous = 0;
+    for (row, &end) in offsets.iter().enumerate() {
+        if end < previous {
+            return Err(usage(format!(
+                "{label} offsets not monotonic at row {row}: {end} < {previous}"
+            )));
+        }
+        previous = end;
+    }
+    usize::try_from(previous).map_err(|_| {
+        usage(format!(
+            "{label} final offset does not fit usize: {previous}"
+        ))
+    })
+}
+
+fn validate_string(offsets: &[u64], data_len: usize, n_rows: usize, label: &str) -> Result<()> {
+    let final_offset = validate_offsets(offsets, n_rows, label)?;
+    require_covers(&format!("{label} data"), data_len, final_offset)
+}
+
+fn validate_low_cardinality_keys(
+    keys: &[u8],
+    key_size: i32,
+    n_rows: usize,
+    dict_n: usize,
+) -> Result<()> {
+    let key_size = match key_size {
+        1 | 2 | 4 | 8 => key_size as usize,
+        _ => {
+            return Err(usage(format!(
+                "LowCardinality key size must be 1, 2, 4, or 8, got {key_size}"
+            )));
+        }
+    };
+    require_len(
+        "LowCardinality keys",
+        keys.len(),
+        checked_len(n_rows, key_size, "LowCardinality keys")?,
+    )?;
+    for (row, key) in keys.chunks_exact(key_size).enumerate() {
+        let value = match key_size {
+            1 => u64::from(key[0]),
+            2 => u64::from(u16::from_ne_bytes(key.try_into().expect("key width"))),
+            4 => u64::from(u32::from_ne_bytes(key.try_into().expect("key width"))),
+            8 => u64::from_ne_bytes(key.try_into().expect("key width")),
+            _ => unreachable!(),
+        };
+        if value >= dict_n as u64 {
+            return Err(usage(format!(
+                "LowCardinality key out of range at row {row}: {value} >= {dict_n}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl<'a> Drop for BlockBuilder<'a> {

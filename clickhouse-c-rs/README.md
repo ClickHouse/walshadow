@@ -51,10 +51,11 @@ same allocator the C side used. `Client` boxes its `Allocator` so the
 heap address the C side stashes in `c->al` stays valid through every
 later call & through `chc_client_close`.
 
-**No-copy column slabs.** `chc_block_builder_append_*` retains raw
-pointers to caller-owned bytes until `chc_block_write`. Mirrored as
-`BlockBuilder<'a>`; each `append_*` takes `&'a [u8]` / `&'a [u64]` &
-each appended `TypeRef<'a>`. Caller keeps slabs alive for `'a`.
+**No-copy columns.** `chc_block_builder_append_*` retains raw pointers
+to caller-owned names and bytes for the builder lifetime. Mirrored as
+`BlockBuilder<'a>`; each `append_*` takes `&'a str`, `&'a [u8]` /
+`&'a [u64]` & each appended `TypeRef<'a>`. Caller keeps inputs alive
+for `'a`.
 
 **Self-referential C structs.** `chc_io` carries a pointer back into the
 `chc_posix_io` state it was initialized from; `PosixIo` holds both inline
@@ -193,6 +194,8 @@ let mut opts = ClientOpts::new()
 opts.compression = Compression::Lz4;
 
 let mut client = Client::init(&opts, Allocator::stdlib(), io, Some(codec))?;
+// Refresh before each blocking operation to apply a fresh absolute deadline:
+// client.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
 client.send_query("INSERT INTO t FORMAT Native", None)?;
 // send one or more data blocks via client.send_data(Some(&bb)),
