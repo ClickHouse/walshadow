@@ -35,8 +35,8 @@
 //!
 //! Spill-to-ClickHouse (Option B) is deferred; v1 is local-disk-only.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -705,11 +705,47 @@ pub struct InflightSnapshotEntry {
     pub rels: String,
 }
 
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PendingDurableXact {
+    first_lsn: u64,
+    commit_lsn: u64,
+}
+
+#[derive(Debug, Default)]
+struct PendingDurable {
+    by_first_lsn: BinaryHeap<Reverse<PendingDurableXact>>,
+}
+
+impl PendingDurable {
+    fn push(&mut self, first_lsn: u64, commit_lsn: u64) {
+        self.by_first_lsn.push(Reverse(PendingDurableXact {
+            first_lsn,
+            commit_lsn,
+        }));
+    }
+
+    fn prune(&mut self, durable_ack: u64) {
+        while self
+            .by_first_lsn
+            .peek()
+            .is_some_and(|Reverse(xact)| xact.commit_lsn <= durable_ack)
+        {
+            self.by_first_lsn.pop();
+        }
+    }
+
+    fn min_first_lsn(&self) -> Option<u64> {
+        self.by_first_lsn.peek().map(|Reverse(xact)| xact.first_lsn)
+    }
+}
+
 /// Per-xact + TOAST buffer with spill-to-disk overflow, keyed by `xid`
 pub struct XactBuffer {
     config: XactBufferConfig,
     store: SpillStore,
     inflight: HashMap<u32, XactState>,
+    /// Committed transactions waiting for durable acknowledgment
+    pending_durable: PendingDurable,
     bytes_in_memory: usize,
     stats: XactBufferStats,
     /// Shared with the WAL pump: the pump opens a `txn` span here at first
@@ -733,6 +769,7 @@ impl XactBuffer {
             config,
             store,
             inflight: HashMap::new(),
+            pending_durable: PendingDurable::default(),
             bytes_in_memory: 0,
             stats: XactBufferStats::default(),
             span_registry: TxnSpanRegistry::new(),
@@ -1051,6 +1088,10 @@ impl XactBuffer {
             self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
             return Ok(());
         }
+        // Preserve floor after states leave `inflight`
+        if let Some(first) = states.iter().map(|st| st.first_lsn).min() {
+            self.pending_durable.push(first, commit_lsn);
+        }
         // Concurrency at commit time, counted before we tick this xact's
         // ids back out. A high value sitting next to a long `commit.drain`
         // is the multi-source-connection head-of-line-blocking signature:
@@ -1173,6 +1214,8 @@ impl XactBuffer {
         ack_span.record("held_open", ack_lsn < commit_lsn);
         let prev_ack = self.stats.emitter_ack_lsn;
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
+        let ack = self.stats.emitter_ack_lsn;
+        self.pending_durable.prune(ack);
         tracing::trace!(
             target: "walshadow::xact_buffer",
             top_xid,
@@ -1221,6 +1264,10 @@ impl XactBuffer {
                 generations: Vec::new(),
             });
         }
+        // Preserve floor while decoded slices remain undurable
+        if let Some(first) = states.iter().map(|st| st.first_lsn).min() {
+            self.pending_durable.push(first, commit_lsn);
+        }
         for st in &states {
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
@@ -1249,6 +1296,16 @@ impl XactBuffer {
         }
         self.stats.drain_lsn = self.stats.drain_lsn.max(lsn);
         self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(lsn.min(ack_ceiling));
+    }
+
+    /// Floor durable acknowledgment at first record of each undurable transaction
+    pub fn resume_safe_lsn(&mut self, durable_ack: u64) -> u64 {
+        self.pending_durable.prune(durable_ack);
+        self.inflight
+            .values()
+            .map(|st| st.first_lsn)
+            .chain(self.pending_durable.min_first_lsn())
+            .fold(durable_ack, u64::min)
     }
 
     /// Fold an observer-reported durable LSN into `emitter_ack_lsn` only;
@@ -2652,6 +2709,44 @@ mod tests {
         b.note_idle_durable(260);
         assert_eq!(b.stats().drain_lsn, 200);
         assert_eq!(b.stats().emitter_ack_lsn, 260);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_safe_lsn_floors_at_undurable_xacts() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        // Use acknowledgment when no transactions remain
+        assert_eq!(b.resume_safe_lsn(500), 500);
+        // Open transactions lower resume point
+        b.on_heap(heap_with_value(7, 100, 16)).await.unwrap();
+        b.on_heap(heap_with_value(8, 150, 16)).await.unwrap();
+        assert_eq!(b.resume_safe_lsn(500), 100);
+        // Keep floor while committed slices remain undurable
+        let drain = b.drain_committed(8, 0, 200, &[]).await.unwrap();
+        assert!(drain.had_states);
+        drop(drain);
+        assert_eq!(b.resume_safe_lsn(180), 100, "open xid 7 still floors");
+        b.abort(7, 210, &[]).await.unwrap();
+        assert_eq!(b.resume_safe_lsn(180), 150, "xid 8 undurable at ack 180");
+        // Drop floor once acknowledgment reaches commit
+        assert_eq!(b.resume_safe_lsn(200), 200);
+        // Ignore commits without buffered rows
+        let empty = b.drain_committed(9, 0, 300, &[]).await.unwrap();
+        assert!(!empty.had_states);
+        assert_eq!(b.resume_safe_lsn(300), 300);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_safe_lsn_uses_tree_min_over_subxacts() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        // Use earliest record across transaction tree
+        b.on_heap(heap_with_value(20, 400, 16)).await.unwrap();
+        b.on_heap(heap_with_value(21, 420, 16)).await.unwrap();
+        let drain = b.drain_committed(21, 0, 450, &[20]).await.unwrap();
+        drop(drain);
+        assert_eq!(b.resume_safe_lsn(440), 400);
+        assert_eq!(b.resume_safe_lsn(450), 450);
     }
 
     #[tokio::test(flavor = "current_thread")]
