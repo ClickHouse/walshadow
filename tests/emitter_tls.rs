@@ -72,7 +72,7 @@ fn openssl(args: &[&std::ffi::OsStr]) {
         .stderr(Stdio::null())
         .status()
         .expect("spawn openssl");
-    assert!(status.success(), "openssl {:?} failed", &args[0]);
+    assert!(status.success(), "openssl {:?} failed", args[0]);
 }
 
 /// CA + a leaf server cert it signs. Returns (leaf cert PEM, leaf key

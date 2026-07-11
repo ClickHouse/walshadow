@@ -1173,10 +1173,7 @@ pub(crate) fn parse_array_one_element(raw: &str) -> Option<String> {
         loop {
             match chars.next() {
                 Some('"') => return (chars.next().is_none()).then_some(out),
-                Some('\\') => match chars.next() {
-                    Some(c) => out.push(c),
-                    None => return None,
-                },
+                Some('\\') => out.push(chars.next()?),
                 Some(c) => out.push(c),
                 None => return None,
             }

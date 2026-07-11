@@ -38,7 +38,7 @@ fn openssl(args: &[&std::ffi::OsStr]) -> TestResult {
         .stderr(Stdio::null())
         .status()?;
     if !status.success() {
-        return Err(io::Error::other(format!("openssl {:?} failed", &args[0])).into());
+        return Err(io::Error::other(format!("openssl {:?} failed", args[0])).into());
     }
     Ok(())
 }
