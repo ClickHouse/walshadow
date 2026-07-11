@@ -291,8 +291,10 @@ impl<'a> BlockBuilder<'a> {
         check(rc, &err)
     }
 
-    /// Serialize through an `Io`. `opts` matches what [`Block::read`]
+    /// Serialize through an `Io`. `opts` matches what [`BlockReader`]
     /// uses; clickhouse-local accepts the default (all-zeros).
+    ///
+    /// [`BlockReader`]: crate::BlockReader
     pub fn write(&self, io: Pin<&mut PosixIo<'_>>, opts: BlockOpts) -> Result<()> {
         let raw_opts = opts.to_raw();
         let mut err = sys::chc_err::zeroed();

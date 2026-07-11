@@ -191,10 +191,10 @@ Highest memory-safety payoff, hardest setup. Parsing happens in the vendored
 `clickhouse-c` C library; the Rust side tracks lifetimes. ASan must instrument
 the C TU or it sees nothing.
 
-- **`ch_block_read`** — `clickhouse_c_rs::Block::read(io, alloc, opts)`. Wrap
-  the fuzz `&[u8]` in an in-memory `PosixIo` (no socket), vary `BlockOpts`
-  (`has_block_info`, `has_custom_serialization`) from the input. Decodes a
-  Native columnar block, the densest C parsing surface
+- **`ch_block_read`** — `clickhouse_c_rs::BlockReader::new(io, alloc, opts)`
+  then `read()`. Wrap the fuzz `&[u8]` in an in-memory `PosixIo` (no socket),
+  vary `BlockOpts` (`has_block_info`, `has_custom_serialization`) from the
+  input. Decodes a Native columnar block, the densest C parsing surface
 - **`ch_type_parse`** (also Tier A) — `TypeAst::parse` bottoms out in
   `chc_type_parse`, the type-string grammar is a classic fuzzing win
 - **`chc_async_submit`** — raw wire bytes into the async client, exercises the

@@ -40,7 +40,7 @@ mod types;
 pub use alloc::Allocator;
 #[cfg(feature = "tokio")]
 pub use async_client::AsyncClient;
-pub use block::{Block, BlockOpts, Column, ColumnLayout, LowCardinalityView};
+pub use block::{Block, BlockOpts, BlockReader, Column, ColumnLayout, LowCardinalityView};
 pub use builder::BlockBuilder;
 pub use client::{
     Client, ClientOpts, Event, Exception, PacketKind, ProfileInfo, Progress, ServerInfo,

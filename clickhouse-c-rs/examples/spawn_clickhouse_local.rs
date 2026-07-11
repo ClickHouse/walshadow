@@ -8,7 +8,7 @@ use std::io::Write;
 use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
-use clickhouse_c::{Allocator, Block, BlockOpts, ColumnLayout, Kind, PosixIo};
+use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, ColumnLayout, Kind, PosixIo};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = std::env::args()
@@ -36,7 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdout_lock = std::io::stdout();
     let mut out = stdout_lock.lock();
 
-    while let Some(block) = Block::read(io.as_mut(), alloc, opts)? {
+    let mut reader = BlockReader::new(io.as_mut(), alloc, opts)?;
+    while let Some(block) = reader.read()? {
         for row in 0..block.n_rows() {
             for col in 0..block.n_columns() {
                 if col > 0 {
@@ -48,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    drop(reader);
     drop(io);
     drop(stdout);
     child.wait()?;

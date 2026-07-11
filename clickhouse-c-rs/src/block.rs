@@ -1,8 +1,8 @@
 //! Owned [`Block`] and borrowed [`Column`] views.
 //!
-//! A block is returned by [`Block::read`] (for free-standing `chc_io`,
-//! e.g. piping `clickhouse local`'s stdout) or by `Packet::take_block`
-//! (TCP path).
+//! A block is returned by [`BlockReader::read`] (for a free-standing
+//! `chc_io`, e.g. piping `clickhouse local`'s stdout) or by
+//! `Packet::take_block` (TCP path).
 
 use core::pin::Pin;
 use core::ptr::NonNull;
@@ -72,23 +72,6 @@ pub struct Block {
 }
 
 impl Block {
-    /// Decode one block from an `Io`. Returns `Ok(None)` on a clean EOF at
-    /// a block boundary.
-    pub fn read(
-        io: Pin<&mut PosixIo<'_>>,
-        alloc: Allocator,
-        opts: BlockOpts,
-    ) -> Result<Option<Self>> {
-        let raw_opts = opts.to_raw();
-        let mut out: *mut sys::chc_block = core::ptr::null_mut();
-        let mut err = sys::chc_err::zeroed();
-        let rc = unsafe {
-            sys::chc_block_read(io.io_ptr(), alloc.as_ptr(), &raw_opts, &mut out, &mut err)
-        };
-        check(rc, &err)?;
-        Ok(NonNull::new(out).map(|raw| Self { raw, alloc }))
-    }
-
     /// Wrap a raw block pointer with an allocator and take ownership.
     ///
     /// # Safety
@@ -172,6 +155,80 @@ impl Drop for Block {
 }
 
 unsafe impl Send for Block {}
+
+/// Streams successive [`Block`]s off one `chc_io` (a pipe from
+/// `clickhouse local`, a raw block socket). Holds a single buffered reader so
+/// bytes read past a block boundary stay buffered for the next [`read`]; a
+/// fresh reader per block would drop that over-read tail and lose every block
+/// after the first.
+///
+/// [`read`]: BlockReader::read
+pub struct BlockReader<'io, 'fd> {
+    raw: NonNull<sys::chc_in>,
+    // Keeps the pinned PosixIo borrowed & fixed: `raw` holds a chc_io pointer
+    // into it for the reader's lifetime.
+    _io: Pin<&'io mut PosixIo<'fd>>,
+    alloc: Allocator,
+    opts: sys::chc_block_opts,
+}
+
+impl<'io, 'fd> BlockReader<'io, 'fd> {
+    /// Open a reader over `io`. `opts` matches the block frames on the wire
+    /// (`BlockOpts::default()` for `clickhouse local`).
+    pub fn new(
+        mut io: Pin<&'io mut PosixIo<'fd>>,
+        alloc: Allocator,
+        opts: BlockOpts,
+    ) -> Result<Self> {
+        let raw_opts = opts.to_raw();
+        let mut raw: *mut sys::chc_in = core::ptr::null_mut();
+        let mut err = sys::chc_err::zeroed();
+        let rc = unsafe {
+            sys::chc_rs_in_new(
+                io.as_mut().io_ptr(),
+                alloc.as_ptr(),
+                raw_opts.read_buffer_bytes,
+                &mut raw,
+                &mut err,
+            )
+        };
+        check(rc, &err)?;
+        let raw = NonNull::new(raw).expect("chc_rs_in_new returned CHC_OK with null reader");
+        Ok(Self {
+            raw,
+            _io: io,
+            alloc,
+            opts: raw_opts,
+        })
+    }
+
+    /// Decode the next block. Returns `Ok(None)` on a clean EOF at a block
+    /// boundary.
+    pub fn read(&mut self) -> Result<Option<Block>> {
+        let mut out: *mut sys::chc_block = core::ptr::null_mut();
+        let mut err = sys::chc_err::zeroed();
+        let rc = unsafe {
+            sys::chc_block_read(
+                self.raw.as_ptr(),
+                self.alloc.as_ptr(),
+                &self.opts,
+                &mut out,
+                &mut err,
+            )
+        };
+        check(rc, &err)?;
+        Ok(NonNull::new(out).map(|raw| Block {
+            raw,
+            alloc: self.alloc,
+        }))
+    }
+}
+
+impl Drop for BlockReader<'_, '_> {
+    fn drop(&mut self) {
+        unsafe { sys::chc_rs_in_destroy(self.raw.as_ptr(), self.alloc.as_ptr()) };
+    }
+}
 
 /// Borrowed view into one column of a [`Block`].
 #[derive(Clone, Copy)]

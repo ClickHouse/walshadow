@@ -10,7 +10,7 @@ use std::net::TcpStream;
 use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
-use clickhouse_c::{Allocator, Block, BlockBuilder, BlockOpts, PosixIo, TypeAst};
+use clickhouse_c::{Allocator, BlockBuilder, BlockOpts, BlockReader, PosixIo, TypeAst};
 #[cfg(feature = "lz4")]
 use clickhouse_c::{Client, ClientOpts, Codec, Compression, Event};
 
@@ -51,9 +51,10 @@ fn quickstart_decode_clickhouse_local() -> Result<(), Box<dyn std::error::Error>
     let mut io = PosixIo::new(stdout.as_fd());
 
     let alloc = Allocator::stdlib();
+    let mut reader = BlockReader::new(io.as_mut(), alloc, BlockOpts::default())?;
     let mut total_rows = 0usize;
     let mut saw_values: Vec<u64> = Vec::new();
-    while let Some(block) = Block::read(io.as_mut(), alloc, BlockOpts::default())? {
+    while let Some(block) = reader.read()? {
         total_rows += block.n_rows();
         // README placeholder: block.n_rows(), block.column(i).fixed() / .string() / ...
         if let Some(c) = block.column(0)
@@ -66,6 +67,7 @@ fn quickstart_decode_clickhouse_local() -> Result<(), Box<dyn std::error::Error>
             }
         }
     }
+    drop(reader);
     drop(io);
     drop(stdout);
     child.wait()?;
