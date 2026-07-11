@@ -9,7 +9,7 @@
 //! [`Client`](crate::Client) holds the vtable pointer: hence
 //! [`PhantomPinned`] and the `Pin<Box<Self>>` the constructors return,
 //! mirroring [`TlsIo`](crate::tls::TlsIo). The rest of the crate
-//! ([`Client`](crate::Client), [`Block::read`](crate::Block::read),
+//! ([`Client`](crate::Client), [`BlockReader`](crate::BlockReader),
 //! [`BlockBuilder::write`](crate::BlockBuilder::write)) expresses the
 //! borrow as `Pin<&mut PosixIo>`.
 //!

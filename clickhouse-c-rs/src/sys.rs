@@ -234,8 +234,19 @@ impl chc_block_opts {
 }
 
 unsafe extern "C" {
-    pub fn chc_block_read(
+    // Buffered reader box (wrapper.c) wrapping the implementation-private
+    // chc_in, so a BlockReader can stream successive blocks off one reader.
+    pub fn chc_rs_in_new(
         io: *mut chc_io,
+        al: *const chc_alloc,
+        cap: usize,
+        out: *mut *mut chc_in,
+        err: *mut chc_err,
+    ) -> c_int;
+    pub fn chc_rs_in_destroy(input: *mut chc_in, al: *const chc_alloc);
+
+    pub fn chc_block_read(
+        input: *mut chc_in,
         al: *const chc_alloc,
         opts: *const chc_block_opts,
         out: *mut *mut chc_block,

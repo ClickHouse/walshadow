@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
-use clickhouse_c::{Allocator, Block, BlockBuilder, BlockOpts, ErrorKind, PosixIo, TypeAst};
+use clickhouse_c::{Allocator, BlockBuilder, BlockOpts, BlockReader, ErrorKind, PosixIo, TypeAst};
 
 /// Connected (writer, reader) TCP pair on loopback.
 fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -39,7 +39,9 @@ fn validate_accepts_roundtripped_block() {
     drop(writer);
 
     let mut rio = PosixIo::new(reader.as_fd());
-    let block = Block::read(rio.as_mut(), alloc, BlockOpts::default())
+    let block = BlockReader::new(rio.as_mut(), alloc, BlockOpts::default())
+        .expect("reader")
+        .read()
         .expect("read")
         .expect("a block");
 
@@ -103,11 +105,14 @@ fn read_timeout_fires_on_idle_socket() {
     rio.as_mut()
         .set_read_timeout(Some(Duration::from_millis(50)));
 
+    let mut block_reader =
+        BlockReader::new(rio.as_mut(), alloc, BlockOpts::default()).expect("reader");
     let start = Instant::now();
-    let Err(err) = Block::read(rio.as_mut(), alloc, BlockOpts::default()) else {
+    let Err(err) = block_reader.read() else {
         panic!("idle read must hit the deadline, not return a block/EOF");
     };
     let elapsed = start.elapsed();
+    drop(block_reader);
 
     assert_eq!(err.kind, ErrorKind::Io, "got {err:?}");
     assert!(

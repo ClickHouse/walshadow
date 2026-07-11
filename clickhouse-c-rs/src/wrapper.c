@@ -39,3 +39,33 @@ chc_rs_monotonic_us(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
+
+/* Persistent io-backed reader for streaming successive Native blocks. The
+ * chc_in body is implementation-private (behind CHC_IMPLEMENTATION), so Rust
+ * cannot allocate it by value; heap-box it here through the caller's
+ * allocator. src/block.rs (BlockReader) holds the handle across
+ * chc_block_read calls so bytes read past a block boundary stay buffered for
+ * the next block; a fresh reader per block would drop that tail and lose
+ * every block after the first. */
+int
+chc_rs_in_new(chc_io *io, const chc_alloc *al, size_t cap,
+              chc_in **out, chc_err *err)
+{
+    chc_in *in = al->alloc(al->ud, sizeof *in);
+    if (!in) return chc__err_set(err, CHC_ERR_OOM, "chc_in alloc failed");
+    int rc = chc_in_init(in, io, al, cap, err);
+    if (rc != CHC_OK) {
+        al->free(al->ud, in, sizeof *in);
+        return rc;
+    }
+    *out = in;
+    return CHC_OK;
+}
+
+void
+chc_rs_in_destroy(chc_in *in, const chc_alloc *al)
+{
+    if (!in) return;
+    chc_in_free(in);
+    al->free(al->ud, in, sizeof *in);
+}

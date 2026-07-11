@@ -115,7 +115,7 @@ in a tight scope and awaits only on the copied `&[u8]`.
 ### Decode `clickhouse local`'s stdout
 
 ```rust
-use clickhouse_c::{Allocator, Block, BlockOpts, PosixIo};
+use clickhouse_c::{Allocator, BlockOpts, BlockReader, PosixIo};
 use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
@@ -129,9 +129,13 @@ let stdout = child.stdout.take().unwrap();
 let mut io = PosixIo::new(stdout.as_fd());
 
 let alloc = Allocator::stdlib();
-while let Some(block) = Block::read(io.as_mut(), alloc, BlockOpts::default())? {
+// One reader across all reads: bytes read past a block boundary stay
+// buffered, so multi-block results decode without dropping the tail.
+let mut reader = BlockReader::new(io.as_mut(), alloc, BlockOpts::default())?;
+while let Some(block) = reader.read()? {
     // block.n_rows(), block.column(i).fixed() / .string() / ...
 }
+drop(reader);
 drop(io);
 drop(stdout);     // close pipe
 child.wait()?;
