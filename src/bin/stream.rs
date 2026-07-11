@@ -1179,15 +1179,17 @@ async fn run(args: Args) -> Result<()> {
             shadow_flush_lsn.fetch_max(flush, Ordering::Release);
         }
         let (drain_lsn, emitter_ack_lsn) = {
-            let b = xact_buffer.lock().await;
-            let s = b.stats();
+            let mut b = xact_buffer.lock().await;
             // Durable watermark: pipeline → ack collector atomic;
             // serial/metrics → xact buffer field.
             let ea = pipeline_ack
                 .as_ref()
                 .map(|a| a.load(Ordering::Acquire))
-                .unwrap_or(s.emitter_ack_lsn);
-            (s.drain_lsn, ea)
+                .unwrap_or(b.stats().emitter_ack_lsn);
+            let drain_lsn = b.stats().drain_lsn;
+            // Keep every undurable transaction reachable after restart
+            // Read acknowledgment first so no transaction escapes floor
+            (drain_lsn, b.resume_safe_lsn(ea))
         };
         // shadow_replay==0 (sweeper off or not yet reported) means "no
         // constraint from shadow", not the literal min: else a fresh boot
