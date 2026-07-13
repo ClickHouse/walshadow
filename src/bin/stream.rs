@@ -60,7 +60,7 @@ use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
-    RelName, ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
+    RelName, SchemaEvent, ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
 };
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::toast::ToastResolver;
@@ -971,6 +971,35 @@ async fn run(args: Args) -> Result<()> {
             raw_start,
         )
         .await?;
+        // Baseline seeding suppresses the Added event for pinned mappings, so a
+        // plain TOML mapping (no initial_load, no opt-in) would tail into a
+        // missing CH table. Ensure those dests here; the others own their copy.
+        for rel in &active_tables {
+            if sql_scoped_tables.contains(rel) {
+                continue;
+            }
+            let has_initial_load = emitter_cfg
+                .table_initial_loads
+                .get(rel)
+                .and_then(|mode| InitialLoadMode::parse(mode))
+                .is_some_and(|m| m != InitialLoadMode::None);
+            if has_initial_load {
+                continue;
+            }
+            let Some(desc) = catalog
+                .lock()
+                .await
+                .descriptor_by_name(rel)
+                .await
+                .with_context(|| format!("resolve descriptor for pinned mapping {rel}"))?
+            else {
+                continue;
+            };
+            applicator
+                .apply(&SchemaEvent::Added { desc })
+                .await
+                .with_context(|| format!("ensure CH dest for pinned mapping {rel}"))?;
+        }
         config_resolver = Some(resolver);
         // Seed durable watermark at `raw_start`, not 0. Status loop
         // persists this atomic into cursor's emitter_ack_lsn each

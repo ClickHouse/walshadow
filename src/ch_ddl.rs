@@ -162,6 +162,7 @@ pub struct DdlApplicator {
     /// without a resolver): mutate the live handle directly — no republish
     /// runs in those contexts, so nothing clobbers the write.
     resolver: Option<Arc<ConfigResolver>>,
+    ensured_databases: HashSet<String>,
     pub stats: DdlStats,
 }
 
@@ -195,6 +196,7 @@ impl DdlApplicator {
             last_used: std::time::Instant::now(),
             invalidation_epoch: None,
             resolver: None,
+            ensured_databases: HashSet::new(),
             stats: DdlStats::default(),
         })
     }
@@ -244,19 +246,13 @@ impl DdlApplicator {
     }
 
     async fn apply_added(&mut self, desc: &RelDescriptor) -> Result<(), EmitterError> {
-        // Pre-declared mapping wins: dest is operator-managed, skip
-        // auto-create. Exception: strategy=drop hands dest lifecycle to
-        // source DDL, so a CREATE after our DROP re-creates the dest from
-        // the mapping (its columns are the emitter's INSERT contract);
-        // IF NOT EXISTS no-ops when the dest still stands
+        // Mapped dest created from the mapping when missing; IF NOT EXISTS
+        // no-ops an operator-managed table and re-creates after strategy=drop.
         if let Some(m) = self.mapping_for(&desc.rel_name).await {
-            if self.config.drop_strategy_for(&desc.rel_name.namespace) == DropTableStrategy::Drop {
-                let sql = render_create_table_from_mapping(desc, &m, self.config.soft_delete);
-                self.execute(&sql).await?;
-                self.stats.creates_applied += 1;
-            } else {
-                self.stats.skipped += 1;
-            }
+            self.ensure_database(&m.target.database).await?;
+            let sql = render_create_table_from_mapping(desc, &m, self.config.soft_delete);
+            self.execute(&sql).await?;
+            self.stats.creates_applied += 1;
             return Ok(());
         }
         // Operator opt-out (`replicate=false`) beats namespace auto_create:
@@ -283,6 +279,7 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         };
+        self.ensure_database(&target_db).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
         // Auto-derive a TableMapping so the emitter ships rows against
@@ -316,6 +313,7 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(false);
         };
+        self.ensure_database(&target_db).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
         Ok(true)
@@ -529,6 +527,16 @@ impl DdlApplicator {
     /// barrier and ack frontier indefinitely. Every emitted statement is
     /// idempotent (`IF [NOT] EXISTS`, `RENAME COLUMN IF EXISTS`,
     /// `TRUNCATE`), so a reconnect resends and CH no-ops the second apply.
+    async fn ensure_database(&mut self, db: &str) -> Result<(), EmitterError> {
+        if self.ensured_databases.contains(db) {
+            return Ok(());
+        }
+        let sql = format!("CREATE DATABASE IF NOT EXISTS {}", quote_ident(db));
+        self.execute(&sql).await?;
+        self.ensured_databases.insert(db.to_owned());
+        Ok(())
+    }
+
     async fn execute(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
         let mut attempt = 0u32;
