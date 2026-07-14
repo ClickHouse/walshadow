@@ -3,6 +3,7 @@ name = "walshadow-bench"
 version = "0.1.0"
 edition = "2024"
 description = "Replication-latency benchmarks (Postgres → ClickHouse / PG standby), engine + CLIs"
+license = "AGPL-3.0-only"
 
 # The shared benchmark engine. Self-contained: talks to Postgres over
 # tokio-postgres and to ClickHouse over a hand-rolled HTTP client, so it pulls
