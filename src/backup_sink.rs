@@ -47,20 +47,53 @@ pub fn is_system_dir(path: &Path) -> bool {
     SYSTEM_DIRS_DENYLIST.contains(&head) || head.starts_with("temp_")
 }
 
-/// Parse `base/<dbid>/<filenode>`, `.<seg>` (>1 GiB segments), and
-/// `_fsm` / `_vm` suffixes (all map to the same filenode). `None`
-/// outside `base/`.
-pub fn parse_base_path(path: &Path) -> Option<(u32, u32)> {
+/// Relation fork of a `base/` file. Non-main forks never carry tuples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelFork {
+    Main,
+    Fsm,
+    Vm,
+}
+
+/// Parsed `base/<dbid>/<filenode>[_fsm|_vm][.<seg>]`. `None` outside
+/// `base/` or for non-relation leaves (`_init`, temp rels), which the
+/// lander Keeps for shadow recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseRelFile {
+    pub db: u32,
+    pub filenode: u32,
+    pub fork: RelFork,
+    /// `.N` suffix: relation segment of `RELSEG_SIZE` blocks (1 GiB
+    /// default); block numbers are global across segments
+    pub segno: u32,
+}
+
+pub fn parse_base_path(path: &Path) -> Option<BaseRelFile> {
     let s = path.to_str()?;
     let rest = s.strip_prefix("base/")?;
     let mut it = rest.splitn(2, '/');
     let db: u32 = it.next()?.parse().ok()?;
     let leaf = it.next()?;
-    let stem = leaf.split('.').next()?;
-    let stem = stem.strip_suffix("_fsm").unwrap_or(stem);
-    let stem = stem.strip_suffix("_vm").unwrap_or(stem);
+    let mut dot = leaf.splitn(2, '.');
+    let stem = dot.next()?;
+    let segno: u32 = match dot.next() {
+        Some(seg) => seg.parse().ok()?,
+        None => 0,
+    };
+    let (stem, fork) = if let Some(s) = stem.strip_suffix("_fsm") {
+        (s, RelFork::Fsm)
+    } else if let Some(s) = stem.strip_suffix("_vm") {
+        (s, RelFork::Vm)
+    } else {
+        (stem, RelFork::Main)
+    };
     let filenode: u32 = stem.parse().ok()?;
-    Some((db, filenode))
+    Some(BaseRelFile {
+        db,
+        filenode,
+        fork,
+        segno,
+    })
 }
 
 /// `relfilenode < 16384` is always bootstrap catalog. Rotated-catalog
@@ -143,8 +176,8 @@ impl DiskLanderSink {
                 DiskAction::SkipDenylist
             };
         }
-        if let Some((db, filenode)) = parse_base_path(&meta.path) {
-            return if self.catalog_filenodes.is_catalog(db, filenode) {
+        if let Some(f) = parse_base_path(&meta.path) {
+            return if self.catalog_filenodes.is_catalog(f.db, f.filenode) {
                 DiskAction::Keep
             } else {
                 DiskAction::SkipUserHeap
@@ -302,19 +335,32 @@ mod tests {
 
     #[test]
     fn parse_base_path_handles_segments_fsm_vm() {
-        assert_eq!(parse_base_path(Path::new("base/5/16400")), Some((5, 16400)));
+        let f = |filenode, fork, segno| {
+            Some(BaseRelFile {
+                db: 5,
+                filenode,
+                fork,
+                segno,
+            })
+        };
+        assert_eq!(
+            parse_base_path(Path::new("base/5/16400")),
+            f(16400, RelFork::Main, 0)
+        );
         assert_eq!(
             parse_base_path(Path::new("base/5/16400.1")),
-            Some((5, 16400))
+            f(16400, RelFork::Main, 1)
         );
         assert_eq!(
             parse_base_path(Path::new("base/5/16400_fsm")),
-            Some((5, 16400))
+            f(16400, RelFork::Fsm, 0)
         );
         assert_eq!(
-            parse_base_path(Path::new("base/5/16400_vm")),
-            Some((5, 16400))
+            parse_base_path(Path::new("base/5/16400_vm.2")),
+            f(16400, RelFork::Vm, 2)
         );
+        assert_eq!(parse_base_path(Path::new("base/5/16400_init")), None);
+        assert_eq!(parse_base_path(Path::new("base/5/16400.x")), None);
         assert_eq!(parse_base_path(Path::new("global/1213")), None);
         assert_eq!(parse_base_path(Path::new("pg_control")), None);
     }

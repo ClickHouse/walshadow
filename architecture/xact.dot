@@ -23,7 +23,7 @@ digraph xact {
   // (feeds subt + abort + merge, all aligned beneath it)
   { rank=same;
     catevt  [label="ShadowCatalog\nschema_event_tx\nAdded / Changed / Dropped", fillcolor="#4D4D28"];
-    decoder [label="BufferingDecoderSink\nheap_decoder + TOAST reshape\nstamps source_lsn, xid", fillcolor="#4D4128"];
+    decoder [label="BufferingDecoderSink\nheap + TOAST birth/death reshape\nSMGR marker + invisible-record stash\nstamps source_lsn, xid", fillcolor="#4D4128"];
     xaclog  [label="XLOG_XACT_*\nASSIGNMENT 0x50 (hint)\nCOMMIT 0x00 / _PREPARED 0x30\nABORT  0x20 / _PREPARED  0x40", fillcolor="#3D3D54"];
   }
 
@@ -33,12 +33,13 @@ digraph xact {
       <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2">
         <TR><TD ALIGN="LEFT"><B>XactBuffer</B></TD></TR>
         <TR><TD ALIGN="LEFT">inflight: HashMap&lt;xid, XactState&gt;</TD></TR>
-        <TR><TD ALIGN="LEFT">bytes_in_memory · stats · store: SpillStore</TD></TR>
+        <TR><TD ALIGN="LEFT">markers · pending_stash · pending_durable</TD></TR>
+        <TR><TD ALIGN="LEFT">bytes_in_memory · drain_resident · SpillStore</TD></TR>
         <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9"><I>XactState (per xid):</I></FONT></TD></TR>
         <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">first_lsn · in_mem: Vec&lt;SpillEntry&gt; · in_mem_bytes</FONT></TD></TR>
         <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">spill: Option&lt;SpillWriter&gt; · spill_bytes</FONT></TD></TR>
-        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">catalog_events: Vec&lt;(lsn, SchemaEvent)&gt;</FONT></TD></TR>
-        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">SpillEntry = Heap(DecodedHeap) | Chunk(ToastChunk)</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">events: Vec&lt;(lsn, DrainEntry)&gt; · stash_rfns</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">SpillEntry = Heap | Chunk | ToastDelete | Raw</FONT></TD></TR>
       </TABLE>
     >, fillcolor="#4D4128", shape=box];
 
@@ -51,15 +52,15 @@ digraph xact {
 
   // producer → state (vertical drops, no cross-traffic)
   catevt  -> buf   [label="on_schema_event\n(xid, source_lsn, ev)", color="#CBA85E", style=dashed];
-  decoder -> buf   [label="absorb Heap / Chunk"];
+  decoder -> buf   [label="absorb Heap / Chunk /\nToastDelete / Raw"];
   xaclog  -> subt  [label="ASSIGNMENT 0x50\nadd_subxact(top, subs)"];
   xaclog  -> abort [label="ABORT / _PREPARED"];
   buf     -> idle  [style=dashed, label="xacts_active == 0"];
 
   // ════════ Rank 2: evict + spill (sidecar pair under buf) ════════
   { rank=same;
-    evict [label="maybe_evict\nbytes_in_memory > xact_buffer_max (64 MiB)\npick largest in-mem xact\n(mirrors PG ReorderBufferLargestTXN)\n→ evict_xact: lazy-open SpillWriter,\ndrain in_mem → write(entry), zero bytes\n(catalog_events stay in memory)", fillcolor="#4D3A28"];
-    spill [label="{spill}/xid-{xid:010}-{first_lsn:016X}.bin\n[\"WS\" magic | u16 ver=2]\n[tag u8 | u32 LE inner_len | body]*\n  tag=0 → Heap   tag=1 → Chunk\nappend-only, fsync on finish", fillcolor="#4D3850", shape=note];
+    evict [label="maybe_evict\nbytes_in_memory > xact_buffer_max (64 MiB)\npick largest in-mem xact\n(mirrors PG ReorderBufferLargestTXN)\n→ evict_xact: lazy-open SpillWriter,\ndrain in_mem → write(entry), zero bytes\nDrainEntry events stay in memory", fillcolor="#4D3A28"];
+    spill [label="{spill}/xid-{xid:010}-{first_lsn:016X}.bin\n[\"WS\" magic | u16 ver=4]\n[tag u8 | u32 LE inner_len | body]*\n0 Heap · 1 Chunk · 2 ToastDelete · 3 Raw\nappend-only, fsync on finish", fillcolor="#4D3850", shape=note];
   }
   buf   -> evict [label="after every absorb\nwhile over budget"];
   evict -> spill [color="#6E6963", style=dashed, label="SpillWriter::write"];
@@ -69,21 +70,23 @@ digraph xact {
   subgraph cluster_drain {
     label="commit(top_xid, ts, commit_lsn, subxids) — k-way merge"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    merge [label="pull (top + subxids) from inflight\n  unknown xid → commits_unknown_xid;\n  on_xact_end fires anyway (ack ceiling)\nper xid: SpillReader → unlink + append in_mem\n  → VecDeque ASC by source_lsn\nk-way merge (k = 1+nsub, typically ≤ 4)\n  linear-scan head pick\n  TIE: catalog event BEFORE tuple", fillcolor="#4D4128"];
+    merge [label="pull (top + subxids) from inflight\nper xid: SpillReader + in_mem + events\n→ source_lsn k-way merge\nChunk → ChunkMap + ToastRow birth\nToastDelete → tombstone row\nRaw → commit-resolved toast op\nTIE: control event BEFORE heap", fillcolor="#4D4128"];
 
-    detoast [label="detoast_heap\nreassemble (toast_relid, value_id)\n  → BTreeMap<chunk_seq, bytes>\npglz / lz4 inline\nlazy ShadowCatalog::relation_at\n(pipeline runs this in the decode pool)", fillcolor="#4D4128"];
+    dispatch [label="CommittedDrain → DrainedBatch slices\n{heaps, chunks, ordered_events,\n new_rows, truncate_rows, is_final}\nrow/event cursors preserve WAL order", fillcolor="#4D4128"];
 
-    dispatch [label="DrainedXact\n{heaps, chunks, ordered_events}\ncatalog event sorts BEFORE tuple\nsubxact_tracker.forget_tree(top)", fillcolor="#4D4128"];
-
-    merge -> detoast -> dispatch;
+    merge -> dispatch;
   }
   xaclog -> merge [label="COMMIT / _PREPARED\nparse_xact_payload"];
   subt   -> merge [label="(top + subxids)\nauthoritative on COMMIT", style=dashed];
   spill  -> merge [color="#6E6963", style=dashed, label="SpillReader::next\nthen unlink"];
 
   // ════════ Rank below drain: consumer (pipeline tail / serial observer) ════════
+  detoast [label="detoast_heap\nin-xact ChunkMap fast path\nstore fetch(relid, value_id, source_lsn)\npglz / lz4 inline\npipeline: decode pool; serial: inline", fillcolor="#4D4128"];
   observer [label="consumer\npipeline (--ch-config): ReorderSink seq\n→ decode ×M → batcher → inserter ×N\n→ ack collector watermark\nserial (metrics-only): TupleObserver\non_tuple / on_xact_end", fillcolor="#5D4628"];
-  dispatch -> observer [color="#BF8C5F", penwidth=2, label="DecodeJob /\non_tuple stream"];
+  dispatch -> detoast [color="#BF8C5F", penwidth=2, label="DecodeJob /\nserial heap"];
+  detoast -> observer [color="#BF8C5F", penwidth=2, label="decoded row /\non_tuple stream"];
+  store [label="ToastResolver::put(new_rows)\nbefore publishing marker\nbarrier cursors interleave wipes / O−B", fillcolor="#5D4628", shape=cylinder];
+  dispatch -> store [color="#BF8C5F", style=dashed, label="births + tombstones"];
 
   // ════════ Bottom: cursor (durability fan-in) ════════
   cursor [label="cursor.bin\ndrain_lsn      = max commit_lsn  (advances FIRST)\nemitter_ack_lsn = max ack_lsn   (lags drain_lsn)", fillcolor="#4D3850", shape=note];
@@ -111,7 +114,7 @@ digraph xact {
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>k-way merge — ordering rules</B></TD></TR>
       <TR><TD COLSPAN="2">heads sorted ASC by source_lsn</TD></TR>
       <TR><TD COLSPAN="2">tie: catalog event BEFORE tuple (PG writes pg_class first)</TD></TR>
-      <TR><TD COLSPAN="2">heaps run through detoast post-merge; chunks fold into (relid, value_id)</TD></TR>
+      <TR><TD COLSPAN="2">heaps detoast post-merge; chunk maps resolve rows; ToastRows persist separately</TD></TR>
       <TR><TD COLSPAN="2">drain_lsn advances BEFORE on_xact_end ack — cursor surfaces the gap</TD></TR>
     </TABLE>
   >];

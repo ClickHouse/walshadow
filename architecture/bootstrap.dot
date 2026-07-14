@@ -79,10 +79,10 @@ digraph bootstrap {
 
     pwsink [label="PageWalkSink\nparse_base_path → rfn ≥ 16384\naccumulate 8 KiB at a time", fillcolor="#4D4128"];
     walker [label="PageWalker::walk_page\npd_lower/pd_upper bounds-check\nfor each LP_NORMAL ItemIdData slot\n  decode_on_page_tuple\nreshape HeapTupleHeaderData →\n  xl_heap_header + bitmap + cols", fillcolor="#4D4128"];
-    dec    [label="heap_decoder::decode_block_data\nshared with WAL hot path\n(no FPI replay on backup pages;\n external TOAST → ExternalToast,\n drain fails fast — future/TOAST.md)", fillcolor="#4D4128"];
+    dec    [label="heap_decoder::decode_block_data\nshared with WAL hot path\nmain tuple → BackfillTuple\npg_toast tuple → columns + on-page TID\n(no FPI replay on backup pages)", fillcolor="#4D4128"];
     bft    [label="BackfillTuple\n{rfn, xid, source_lsn = start_lsn,\n columns}", fillcolor="#4D4128", shape=parallelogram];
     queue  [label="bounded mpsc (cap 256)\nchunk() awaits a free slot —\nslow drain backpressures the pump", fillcolor="#4D4128", shape=parallelogram];
-    drain  [label="pipeline::bootstrap::drain\nsynthesize row {op=Insert,\n commit_lsn=start_lsn}\nresolve via CatalogMap, route to tail\none ack seq per rfn flip", fillcolor="#4D4128"];
+    drain  [label="pipeline::bootstrap::drain\ntoast tuple → batch ToastRow\nmain ExternalToast → Deferred\nflush mirror rows, then resolve deferred\nmap + route main rows to tail\none ack seq per rfn flip", fillcolor="#4D4128"];
 
     pwsink -> walker -> dec -> bft -> queue -> drain;
   }
@@ -108,7 +108,9 @@ digraph bootstrap {
   catmap -> drain  [color="#CBA85E", style=dashed, constraint=false, label="get(db_node, rel_node)"];
 
   ch [label="ClickHouse\nReplacingMergeTree(_lsn)", fillcolor="#4D4128", shape=cylinder];
+  toastch [label="ClickHouse TOAST mirrors\npg_toast_<relid>\nTID-keyed births + tombstones", fillcolor="#4D4128", shape=cylinder];
   ins -> ch [color="#BF8C5F", style=dashed, penwidth=2, label="Native\n(bootstrap)"];
+  drain -> toastch [color="#BF8C5F", style=dashed, penwidth=2, label="ToastResolver::put\nbefore deferred fetch"];
 
   // ════════ Handoff at end_lsn ════════
   subgraph cluster_handoff {
@@ -153,8 +155,8 @@ digraph bootstrap {
       <TR><TD>global/, pg_xact/, pg_control,<BR/>tablespace_map, conf files</TD><TD>rail A only</TD></TR>
       <TR><TD>pg_replslot/, pg_stat_tmp/,<BR/>pg_logical/, pgsql_tmp/, temp_*</TD><TD>Skip (denylist;<BR/>dir entry kept as empty dir)</TD></TR>
       <TR><TD>user heap<BR/>base/&lt;db&gt;/&lt;fn ≥ 16384&gt;</TD><TD>rail B only<BR/>(never lands on shadow)</TD></TR>
-      <TR><TD>pg_toast_&lt;relid&gt;</TD><TD>rail B observed, chunks not reassembled;<BR/>ExternalToast value fails fast (V1)</TD></TR>
+      <TR><TD>pg_toast_&lt;relid&gt;</TD><TD>rail B decodes on-page TIDs;<BR/>mirror put precedes deferred resolution</TD></TR>
     </TABLE>
   >];
-  ch -> legend [style=invis];
+  toastch -> legend [style=invis];
 }

@@ -5,7 +5,7 @@
 // triple to source slot → feeds retention sweeper & Prom metrics.
 //
 // regeneration spec:
-// sources of truth: plans/ops.md · src/cursor.rs · src/preflight.rs · src/retention.rs · src/metrics.rs
+// sources of truth: plans/ops.md · plans/TOAST.md · src/cursor.rs · src/toast_retire.rs · src/preflight.rs · src/retention.rs · src/metrics.rs
 // subsumes: plans/ops.md § "Cursor file" + "Slot advance" + apply-lag metric
 // quality bar:
 //   - cursor write edge (magenta dotted) reads as durability path
@@ -24,6 +24,7 @@ digraph ops {
   shd   [label="shadow PG\npg_last_wal_replay_lsn()\n+ walreceiver 'r' frames", fillcolor="#3D4128", shape=cylinder];
   src   [label="source PG\npg_replication_slots\nconfirmed_flush_lsn", fillcolor="#3D3D54", shape=cylinder];
   prom  [label="Prometheus scrape\n/metrics", fillcolor="#3D3D54", shape=cylinder];
+  toastmirror [label="CH TOAST mirrors\npg_toast_<relid>", fillcolor="#4D4128", shape=cylinder];
 
   // ═════ A. LSN inputs (left column, fed by xact/segment/wire) ═════
   subgraph cluster_inputs {
@@ -55,6 +56,8 @@ digraph ops {
 
   // ═════ C. Sinks (right column) ═════
   cursor_bin [label="{spill_dir}/cursor.bin\n64 B, schema v2, CRC32C\natomic rename via cursor.bin.tmp\n(boot: emitter_ack_lsn is\nresume floor, seg-aligned)", fillcolor="#4D3850", shape=note];
+  retire_bin [label="{spill_dir}/toast_retires.bin\npending (toast_relid, drop commit_lsn)\nfsync on enqueue/remove\nsurvives spill cleanup", fillcolor="#4D3850", shape=note];
+  retire_flush [label="flush_due_retires\nstandup + commit + idle\nwhen aligned resume floor > drop LSN\nTRUNCATE mirror, then remove entry", fillcolor="#4D3A28"];
 
   outdir [label="out/<seg>\nfiltered 16 MiB WAL\n+ manifest.json", fillcolor="#4D3850", shape=note];
 
@@ -76,6 +79,10 @@ digraph ops {
 
   // Cursor durability path (MAIN — purple dotted)
   cwrite -> cursor_bin [color="#b380b0", style=dotted, penwidth=2, label="every 10 s\n(atomic rename)"];
+  xact -> retire_bin [color="#6E6963", style=dashed, label="toast Dropped barrier\nenqueue before commit ack"];
+  cursor_bin -> retire_flush [color="#b380b0", style=dotted, label="persisted resume floor"];
+  retire_bin -> retire_flush [color="#6E6963", style=dashed, label="pending wipes"];
+  retire_flush -> toastmirror [color="#BF8C5F", style=dashed, label="retire_mirror"];
 
   // Slot advance path
   sendst -> src [color="#A1A9CC", penwidth=2, label="standby-status triple\n(write/flush/apply)"];
@@ -90,7 +97,7 @@ digraph ops {
 
   // Rank pinning so external endpoints anchor each side
   { rank=same; shd; feed; }
-  { rank=same; src; cursor_bin; }
+  { rank=same; src; cursor_bin; retire_bin; }
 
   // cursor.bin layout reference table
   cursor_table [shape=plaintext, label=<

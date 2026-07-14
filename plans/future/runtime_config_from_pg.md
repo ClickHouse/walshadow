@@ -6,12 +6,14 @@ on source PG, seeded at boot and applied live at each row's commit LSN, merged
 **CLI > PG-row > TOML**, detected inline by resolved qualified name, interpreted
 into `ConfigEvent`s, applied through `DrainEntry::Config` under the barrier fence.
 
-This document covers:
+Implemented baseline lives in [config.md](../config.md) and
+[add_table.md](../add_table.md): boot seed, commit-ordered config rows,
+per-table opt-in, `initial_load`, and column overrides. This document keeps
+only remaining extensions:
 
 - a **signal channel** for imperatives that don't fit a stored row (`flush_now`,
   pause/resume, xact-scoped `ignore-transaction`, `force_reseed`,
   `drop_slot_at_lsn`)
-- **per-table opt-in + snapshot-free backfill** (`replicate`, `initial_load`)
 - **net-new knobs** with no runtime path (`engine`, `order_by`, `exclude`,
   `ch_settings`, `sample_rate`, and the TOML-only `signal_prefix` /
   `admin_database`)
@@ -106,9 +108,9 @@ at commit, but still advance the cursor". Pieces:
   subxact/savepoint semantics for free: a message in a rolled-back subxact drops
   with that subxact's `abort` (matches PG never delivering it); a message in top
   or a committed subxact rides into the states collected at commit
-- **Drop at commit.** The commit drain, after collecting states, if any `ignore`:
-  unlink spill, discard heaps + catalog_events, return an empty `DrainedXact` at
-  `commit_lsn`. That routes through the empty-commit branch, which registers a
+- **Drop at commit.** Commit drain, after collecting states, if any `ignore`:
+  unlink spill, discard heaps + drain events, return no `DrainedBatch` at
+  `commit_lsn`. Empty-commit branch registers a
   rows=0 seq so the contiguous ack watermark passes `commit_lsn`, slot recycles,
   nothing reaches CH
 
@@ -136,88 +138,13 @@ writes. Natural generalization: `ignore-relation <oid>` /
 `ignore-changes-for <qname>` filters only some rels out of the drained set,
 surgical when the xact also carries changes to keep.
 
-## Per-table opt-in and initial-load path
+## Implemented baseline dependency
 
-The base `config_table` ([../config.md](../config.md)) carries only the
-target columns.
-This adds two columns — `replicate` (bool, doubles as the inclusion switch)
-and `initial_load` (text mode: `'none'`, `'copy'`, `'base_backup'`,
-`'object_store'`; SQL NULL means omitted) — collapsing three intents into one
-relation: (a) override
-mapping for a table already in scope, (b) forward-declare config for a table
-that doesn't yet exist, (c) opt an existing-but-unreplicated table into scope
-plus initial-load it. `'copy'` is the snapshot-free COPY below; the
-backup-sourced modes are designed in
-[add_table.md](../add_table.md). Unknown mode strings warn
-and stream from the opt-in LSN only (validate-late, never crash). Resolver
-inspects `replicate` + `initial_load` + catalog state to dispatch:
-
-| row state | rfn known? | table empty? | action |
-|---|---|---|---|
-| `replicate=t, initial_load='none'/NULL` | yes | n/a | inclusion-list add; WAL-driven from current LSN, no backfill |
-| `replicate=t, initial_load='copy'` | yes | yes | mark streaming, no backfill needed |
-| `replicate=t, initial_load='copy'` | yes | no | enqueue COPY backfill (see below) |
-| `replicate=t, initial_load='base_backup'/'object_store'` | yes | no | enqueue backup-sourced backfill ([add_table.md](../add_table.md)) |
-| `replicate=t` | no (forward-decl) | n/a | hold row, materialize when CREATE TABLE for matching qualname arrives via catalog applicator |
-| `replicate=f` | yes | n/a | inclusion-list remove; mid-stream exclusion drains in-flight rows then halts further emission |
-
-Keyed on **relation name** (`(namespace, relname)` pair), not rfn. Resolver
-maintains a `pending_decl: HashMap<RelName, TableRow>` populated from rows whose
-target rfn doesn't exist. The catalog applicator notifies the resolver on each
-new rel; resolver pops the matching pending entry and registers the rfn↔config
-binding. Stale entries (rel never created, or dropped and recreated under a
-different namespace) tick `walshadow_pending_decl_rels{qname=…}` for ops
-visibility.
-
-**Backfill path (snapshot-free, convergence via WAL replay).** No
-`pg_export_snapshot`, no `SET TRANSACTION SNAPSHOT`, no logical slot. Correctness
-rests on two walshadow-specific properties generic logical initial sync can't
-assume: the CH sink is order-independent LWW (`ReplacingMergeTree(_lsn)` keeps the
-max-`_lsn` version per key regardless of arrival order), and the `XactBuffer`
-buffers user-heap changes per-xid *inclusion-agnostically* (mapping resolved at
-commit-drain via `pipeline::lookup_mapping`, not at buffer insert). So COPY output
-and WAL output can interleave freely, and an xact in-flight when the table enters
-scope is never lost. When initial-load is required for an existing non-empty
-table, the daemon allocates a per-table backfiller task:
-
-1. **Opt-in fences the boundary, no pin.** The `config_table` row commits at LSN
-   `S`. From `S` on, the rfn has a mapping, so its heap writes route to CH
-   normally; the only writes absent from the WAL side are xacts that *already
-   committed before `S`* — xacts in-flight at `S` had their rfn writes buffered
-   (inclusion-agnostic) and route at their own commit once the mapping exists.
-   **Apply everything from `S`; discard nothing.** No per-rfn gate, no held queue
-2. **COPY out, no snapshot coordination.** After the opt-in applies, issue
-   `COPY (SELECT … FROM <qname>) TO STDOUT (FORMAT BINARY)` on the sidecar
-   connection. A lone `COPY(SELECT)` runs under its own statement snapshot `P`
-   (READ COMMITTED suffices), and `P ≥ S` because it is issued after the opt-in
-   commit is durable — so COPY sees every xact that committed at or before `S`,
-   exactly the ones the WAL side dropped. Requires COPY run on the node walshadow
-   streams WAL from. Stream rows through the same projection + target_type stack
-   WAL-driven rows use, buffer in the spill dir under memory pressure, INSERT to
-   CH with `_lsn = S` for every row
-3. **Convergence, not a cut.** COPY rows carry `_lsn = S`; every post-opt-in
-   mutation rides its real `commit_lsn > S`. Order-independent dedup resolves per
-   key: an update/delete during backfill beats the COPY baseline, an untouched row
-   keeps its COPY value, a row seen by both dedups to the WAL copy. Backfill
-   merely seeds rows the pre-`S` WAL never carried. Write amplification (rows
-   mutated in `(S, P]` written twice) is absorbed by RMT merges
-4. **Completion is observability, not correctness.** No boundary to release.
-   After COPY EOF, read `pg_current_wal_lsn()` → `P_hi`, an upper bound on `P`.
-   Report rfn `backfill_state="converged"` once WAL apply passes `P_hi`. The
-   daemon does NOT write `initial_load` back to source (no two-way sync); the
-   operator reads completion from metrics
-
-**Coupling to document.** Correctness for xacts in-flight at `S` depends on
-inclusion-agnostic buffering. If walshadow ever moves inclusion filtering to
-buffer-insert time, backfill must regain a drain step — quiesce or wait out xacts
-in-flight at `S` before COPY.
-
-Resume after a daemon crash mid-backfill is a plain re-COPY: state persists `S`
-per table; on restart re-issue COPY at `_lsn = S`. Dedup makes it idempotent, so no
-CH truncate and no fresh snapshot. Chunked COPY by primary-key range is then
-trivial: each chunk is an independent statement snapshot at the same `_lsn = S`,
-since WAL fills any inter-chunk gap. An `initial_load='copy:chunked:<col>'`
-mode variant loses its snapshot-sharing hazard.
+Per-table `replicate`, forward declarations, `initial_load` modes, crash-safe
+backfill ledgers, and convergence rules are current behavior. See
+[config.md](../config.md) and [add_table.md](../add_table.md). Extensions below
+must preserve inclusion-agnostic buffering and `_lsn` convergence guarantees
+documented there
 
 ## Net-new knobs
 
@@ -331,24 +258,6 @@ subcommand walking the three layers.
   The xact commits on source, shadow replays any catalog change, CH receives
   nothing, `emitter_ack_lsn` still advances past `commit_lsn`. Variant: the tag in
   a rolled-back savepoint leaves the surrounding xact replicating normally
-- **Opt-in empty table.** Pre-existing empty `app.events` not in scope. Operator
-  inserts `config_table (…, replicate=true, initial_load='copy')`. Backfiller sees
-  zero rows, no COPY, per-rfn state flips to `Streaming`; subsequent inserts land
-  on CH
-- **Opt-in non-empty table.** Pre-existing `app.orders` with 10M rows. Operator
-  inserts `config_table (…, initial_load='copy')`. Daemon streams orders' WAL from
-  opt-in LSN `S` and concurrently COPYs at `_lsn = S`; updates/deletes committed
-  during the COPY win by `commit_lsn > S`. Source state == CH state once WAL apply
-  passes `P_hi`. Variant: mutate a row mid-backfill and assert CH reflects the
-  mutation, not the COPY baseline
-- **Forward-decl.** Operator inserts `config_table (namespace = 'app',
-  relname = 'new_table', replicate = true)` for a table that doesn't exist. Resolver parks it in
-  `pending_decl`. Source runs `CREATE TABLE app.new_table (...)`; the catalog
-  applicator notifies the resolver, the pending row resolves, subsequent inserts
-  land on CH under the declared config
-- **Opt-out mid-stream.** `app.orders` actively replicating. Operator updates
-  `config_table.replicate = false`. In-flight rows drain to CH, no further
-  emission. CH target retained per `on_drop` policy
 - **Column exclude.** Set `config_column.exclude = true` for `public.orders.notes`.
   Subsequent rows arrive on CH without the column; re-clearing restores emission,
   projection rebuilds after the in-flight rfn drain

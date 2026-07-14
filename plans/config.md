@@ -282,7 +282,8 @@ round-trips without operator CH work.
 
 ## Deferred
 
-Source-PG-driven work that builds on this resolver lives in
+Unbuilt signal commands, net-new knobs, degraded mode, and resolver-source
+observability live in
 [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md).
 
 ## Acceptance drills
@@ -326,5 +327,5 @@ Source-PG-driven work that builds on this resolver lives in
   the `ResolvedConfig` shape
 - [shadow.md](shadow.md) — `ShadowCatalog::subscribe` feeds the DDL applicator
   that refreshes from the resolver
-- [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) — the
-  source-PG-driven work that builds on this resolver
+- [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) —
+  unbuilt signal commands, knobs, degraded mode, and observability

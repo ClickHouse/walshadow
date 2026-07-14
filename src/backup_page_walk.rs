@@ -9,11 +9,8 @@
 //!   `[start_lsn, end_lsn]` re-emit at higher `_lsn` and
 //!   `ReplacingMergeTree(_lsn)` collapses the duplicate. Accepted
 //!   brief-duplicate window, see [plans/bootstrap.md](../plans/bootstrap.md).
-//! - TOAST-spilled columns surface as `ColumnValue::PgPending`. Inline
-//!   varlena decodes; external TOAST chunk reassembly is WAL-shared work,
-//!   not done here.
-//! - `pg_toast_<relid>` tar entries observed but not decoded; chunk
-//!   projection deferred to WAL-side TOAST decoder.
+//! - With chunk storage enabled, walk `pg_toast_<relid>` pages and let
+//!   bootstrap drain resolve deferred referrers
 
 use std::collections::HashMap;
 use std::io;
@@ -24,7 +21,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use walrus::pg::walparser::{Oid, RelFileNode};
 
-use crate::backup_sink::parse_base_path;
+use crate::backup_sink::{BaseRelFile, RelFork, parse_base_path};
 use crate::backup_source::{
     BackupSink, EndInfo, EntryId, FileAction, FileKind, FileMeta, StartInfo,
 };
@@ -35,6 +32,10 @@ use crate::shadow_catalog::RelDescriptor;
 
 /// Heap page size, PG compile-time, identical to wal-rus `BLOCK_SIZE`
 pub const PAGE_BYTES: usize = 8192;
+/// Blocks per relation segment: PG `RELSEG_SIZE` (pg_config.h), 1 GiB
+/// default at 8 KiB pages. A `.N` file's first page is global block
+/// `N * RELSEG_BLOCKS`
+pub const RELSEG_BLOCKS: u32 = 131_072;
 /// `PageHeaderData` size, 24 bytes since PG 8.x
 pub const SIZE_OF_PAGE_HEADER: usize = 24;
 pub const SIZE_OF_ITEM_ID: usize = 4;
@@ -82,8 +83,8 @@ pub struct BackfillTuple {
     /// `t_infomask` hint bits
     pub infomask: u16,
     pub source_lsn: u64,
-    /// On-page TID; toast tuples become chunk births keyed on it
-    /// ([`crate::toast_tid`])
+    /// On-page TID; toast tuples become store rows keyed on it
+    /// ([`crate::toast::ToastRow`])
     pub blkno: u32,
     pub offnum: u16,
     /// Attnum-1 indexed, matching `RelDescriptor.attributes`
@@ -119,7 +120,6 @@ impl BackfillTuple {
 #[derive(Debug, Default, Clone)]
 pub struct CatalogMap {
     by_filenode: HashMap<(Oid, Oid), Arc<RelDescriptor>>,
-    toast_filenodes: HashMap<(Oid, Oid), Oid>,
 }
 
 impl CatalogMap {
@@ -128,11 +128,8 @@ impl CatalogMap {
     }
 
     pub fn insert(&mut self, desc: Arc<RelDescriptor>) {
-        let key = (desc.rfn.db_node, desc.rfn.rel_node);
-        if &*desc.rel_name.namespace == PG_TOAST_NS {
-            self.toast_filenodes.insert(key, desc.oid);
-        }
-        self.by_filenode.insert(key, desc);
+        self.by_filenode
+            .insert((desc.rfn.db_node, desc.rfn.rel_node), desc);
     }
 
     pub fn get(&self, db_node: Oid, rel_node: Oid) -> Option<Arc<RelDescriptor>> {
@@ -140,7 +137,9 @@ impl CatalogMap {
     }
 
     pub fn is_toast(&self, db_node: Oid, rel_node: Oid) -> bool {
-        self.toast_filenodes.contains_key(&(db_node, rel_node))
+        self.by_filenode
+            .get(&(db_node, rel_node))
+            .is_some_and(|d| &*d.rel_name.namespace == PG_TOAST_NS)
     }
 
     pub fn len(&self) -> usize {
@@ -259,13 +258,36 @@ impl<'a> PageWalker<'a> {
     }
 }
 
+/// Tuple bytes behind `offnum`'s line pointer, `None` unless the slot is
+/// `LP_NORMAL` and in-bounds. Serves commit-time decode of a stashed
+/// insert whose tuple rides only the FPI (`HEAP_INSERT_NO_LOGICAL` strips
+/// `REGBUF_KEEP_DATA`, so a checkpoint mid-rewrite leaves no block data)
+pub(crate) fn page_tuple_bytes(page: &[u8], offnum: u16) -> Option<&[u8]> {
+    if offnum == 0 || page.len() < SIZE_OF_PAGE_HEADER {
+        return None;
+    }
+    let pd_lower = u16::from_le_bytes(page[12..14].try_into().unwrap()) as usize;
+    let off = SIZE_OF_PAGE_HEADER + (offnum as usize - 1) * SIZE_OF_ITEM_ID;
+    if off + SIZE_OF_ITEM_ID > pd_lower.min(page.len()) {
+        return None;
+    }
+    let raw = u32::from_le_bytes(page[off..off + 4].try_into().unwrap());
+    let lp_off = (raw & 0x7FFF) as usize;
+    let lp_flags = ((raw >> 15) & 0x3) as u8;
+    let lp_len = ((raw >> 17) & 0x7FFF) as usize;
+    if lp_flags != LP_NORMAL || lp_len == 0 || lp_off + lp_len > page.len() {
+        return None;
+    }
+    Some(&page[lp_off..lp_off + lp_len])
+}
+
 /// Decode one on-page tuple into `(xmin, xmax, infomask, columns)`.
 /// On-disk shape carries a full `HeapTupleHeaderData` (23 bytes); the
 /// shared heap decoder consumes the `xl_heap_header` (5 bytes) shape PG
 /// strips into WAL via
 /// `XLogRegisterBufData(0, tup->t_data + SizeofHeapTupleHeader, ...)`,
 /// so reshape before calling it. `None` on truncated / malformed header.
-fn decode_on_page_tuple(
+pub(crate) fn decode_on_page_tuple(
     tuple: &[u8],
     rel: &RelDescriptor,
 ) -> Option<(u32, u32, u16, Vec<Option<ColumnValue>>)> {
@@ -339,10 +361,7 @@ pub struct PageWalkSink {
     /// parts; one slot would let part B's begin clobber part A's
     /// in-flight entry, mis-framing pages and misattributing rfns.
     cur: HashMap<EntryId, TapEntry>,
-    /// Walk `pg_toast_*` pages into tuples (the drain reinterprets them as
-    /// chunks) instead of counting + skipping. Set when a chunk store is
-    /// configured (`toast mode != disabled`); off keeps the V1 skip so
-    /// disabled-mode bootstrap doesn't decode chunks it would discard.
+    /// Decode TOAST pages only when configured store consumes them
     store_toast: bool,
     /// `pg_xact/` segments Tap into here for backfill visibility gate
     /// (plans/add_table.md); `None` (greenfield) keeps Skip.
@@ -360,9 +379,10 @@ enum SlruSegment {
 }
 
 struct TapEntry {
-    /// Block number within the relation, 0-based per tar entry. V1 walks
-    /// each >1 GiB segment (`.1`, `.2` suffixes) as block 0 onward;
-    /// correct for the LSN-stamp case since every row gets `source_lsn`
+    /// Block number within the relation, global across `.N` segments
+    /// (seeded `segno * RELSEG_BLOCKS`): TOAST rows key on
+    /// `(blkno, offnum)`, and all walk rows share one LSN, so per-file
+    /// numbering would collide segment TIDs at equal version
     block_no: u32,
     /// Carry-over bytes when a chunk read straddled a page boundary
     page_buf: Vec<u8>,
@@ -447,7 +467,7 @@ impl PageWalkSink {
         self.source_lsn
     }
 
-    fn classify(&self, meta: &FileMeta) -> Option<(u32, u32)> {
+    fn classify(&self, meta: &FileMeta) -> Option<BaseRelFile> {
         if !matches!(meta.kind, FileKind::File) {
             return None;
         }
@@ -488,8 +508,6 @@ impl PageWalkSink {
             };
 
             if is_toast && !self.store_toast {
-                // No chunk store: count, skip decode. Toasted values get
-                // NULL/default-filled at the drain (disabled mode).
                 self.stats.pages_walked += 1;
                 continue;
             }
@@ -497,10 +515,6 @@ impl PageWalkSink {
                 // Filenode absent from seed; stats counted at begin()
                 continue;
             };
-            // toast rels are 3-col heaps (chunk_id, chunk_seq, chunk_data);
-            // walk them through the same decoder, the drain reinterprets
-            // their tuples into chunks.
-
             let lsn = self
                 .lsn_overrides
                 .get(&(desc.rfn.db_node, desc.rfn.rel_node))
@@ -561,13 +575,17 @@ impl BackupSink for PageWalkSink {
             );
             return Ok(FileAction::Tap);
         }
-        let Some((db, rel)) = self.classify(meta) else {
+        let Some(f) = self.classify(meta) else {
             // Not base/<db>/<filenode>; multiplex sink falls back to lander
             return Ok(FileAction::Skip);
         };
+        if f.fork != RelFork::Main {
+            // fsm/vm carry no tuples; keep them out of the TID-producing walk
+            return Ok(FileAction::Skip);
+        }
         self.stats.files_seen += 1;
-        let desc = self.catalog.get(db, rel);
-        let is_toast = self.catalog.is_toast(db, rel);
+        let desc = self.catalog.get(f.db, f.filenode);
+        let is_toast = self.catalog.is_toast(f.db, f.filenode);
         if is_toast {
             self.stats.toast_files_observed += 1;
         } else if desc.is_some() {
@@ -582,7 +600,7 @@ impl BackupSink for PageWalkSink {
         self.cur.insert(
             entry,
             TapEntry {
-                block_no: 0,
+                block_no: f.segno.saturating_mul(RELSEG_BLOCKS),
                 page_buf: Vec::with_capacity(PAGE_BYTES * 2),
                 is_toast,
                 desc,
@@ -861,6 +879,75 @@ mod tests {
         assert_eq!(sink.stats.tuples_emitted, 1);
     }
 
+    /// `.N` segment tuples get global block numbers: same local page +
+    /// offnum in the base file and `.1` must yield distinct TIDs, else
+    /// toast rows collide at equal walk LSN and merge keeps either.
+    #[tokio::test]
+    async fn pagewalk_sink_seeds_segment_block_numbers() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        let mut sink = PageWalkSink::new_capturing(catalog);
+        sink.start(&StartInfo {
+            start_lsn: 0x1000,
+            timeline: 1,
+            tablespaces: Vec::new(),
+        })
+        .await
+        .unwrap();
+        for (i, path) in ["base/5/16400", "base/5/16400.1"].iter().enumerate() {
+            let meta = FileMeta {
+                path: PathBuf::from(path),
+                size: PAGE_BYTES as u64,
+                mode: 0o600,
+                kind: FileKind::File,
+            };
+            let id = EntryId(i as u64);
+            assert_eq!(sink.begin(id, &meta).await.unwrap(), FileAction::Tap);
+            sink.chunk(id, &synth_single_tuple_page(7)).await.unwrap();
+            sink.end(id).await.unwrap();
+        }
+        assert_eq!(sink.captured.len(), 2);
+        assert_eq!(
+            (sink.captured[0].blkno, sink.captured[0].offnum),
+            (0, 1),
+            "base file walks from block 0"
+        );
+        assert_eq!(
+            (sink.captured[1].blkno, sink.captured[1].offnum),
+            (RELSEG_BLOCKS, 1),
+            "segment 1 walks from its global block"
+        );
+    }
+
+    /// fsm/vm forks carry no tuples; they must not enter the walk.
+    #[tokio::test]
+    async fn pagewalk_sink_skips_non_main_forks() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        let mut sink = PageWalkSink::new_capturing(catalog);
+        sink.start(&StartInfo {
+            start_lsn: 0x1000,
+            timeline: 1,
+            tablespaces: Vec::new(),
+        })
+        .await
+        .unwrap();
+        for path in ["base/5/16400_fsm", "base/5/16400_vm", "base/5/16400_vm.1"] {
+            let meta = FileMeta {
+                path: PathBuf::from(path),
+                size: PAGE_BYTES as u64,
+                mode: 0o600,
+                kind: FileKind::File,
+            };
+            assert_eq!(
+                sink.begin(EntryId(9), &meta).await.unwrap(),
+                FileAction::Skip,
+                "{path}"
+            );
+        }
+        assert_eq!(sink.stats.files_seen, 0);
+    }
+
     #[tokio::test]
     async fn pagewalk_sink_skips_when_filenode_absent_from_catalog() {
         let sink = PageWalkSink::new_capturing(CatalogMap::new());
@@ -870,7 +957,15 @@ mod tests {
             mode: 0,
             kind: FileKind::File,
         });
-        assert_eq!(m, Some((5, 16400)));
+        assert_eq!(
+            m,
+            Some(BaseRelFile {
+                db: 5,
+                filenode: 16400,
+                fork: RelFork::Main,
+                segno: 0,
+            })
+        );
 
         let mut sink = sink;
         sink.start(&StartInfo {

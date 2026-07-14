@@ -37,6 +37,7 @@ use std::future::Future;
 use std::io::Write as _;
 use std::pin::Pin;
 use tokio::sync::{Mutex, watch};
+use tokio_postgres::types::PgLsn;
 use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
@@ -838,6 +839,11 @@ async fn run(args: Args) -> Result<()> {
     // When the pipeline is wired, the durable watermark comes from its ack
     // collector atomic instead of the xact buffer's synchronous field.
     let mut pipeline_ack: Option<Arc<AtomicU64>> = None;
+    // `emitter_ack_lsn` as last persisted to the resume cursor; status loop
+    // stores it after each durable write, reorder gates deferred toast-mirror
+    // retires on it (a wipe is safe only once no restart can replay a
+    // pre-drop referrer).
+    let mut resume_floor: Option<Arc<AtomicU64>> = None;
     // Layered config resolver (CLI > TOML); `Some` only with `--ch-config`.
     // Moved into the SIGHUP task, which re-reads TOML and republishes.
     let mut config_resolver: Option<Arc<ConfigResolver>> = None;
@@ -1014,7 +1020,18 @@ async fn run(args: Args) -> Result<()> {
         // plans/future/pipeline_backpressure_and_scaling.md (Handoff step 3).
         let emitter_ack = Arc::new(AtomicU64::new(raw_start));
         pipeline_ack = Some(emitter_ack.clone());
-        let toast_gc_interval = emitter_cfg.toast.gc_interval;
+        // Seed at raw_start like the ack: any Dropped queued during the
+        // boot re-read of [aligned, raw_start] has commit_lsn ≥ aligned, so
+        // its retire holds until a later cursor write moves the floor's
+        // segment past it.
+        let floor = Arc::new(AtomicU64::new(raw_start));
+        resume_floor = Some(floor.clone());
+        // Deferred retires queued before a stop; entries below `aligned`
+        // never replay their drop, so the post-spawn flush below is their
+        // only route to the wipe.
+        let retires = walshadow::toast_retire::RetireLedger::load(&args.spill_dir)
+            .await
+            .context("load toast retire ledger")?;
         let pcfg = PipelineConfig {
             emitter: emitter_cfg,
             decoder_pool_size: args.decoder_pool_size,
@@ -1031,36 +1048,17 @@ async fn run(args: Args) -> Result<()> {
             span_registry: span_registry.clone(),
             config_resolver: config_resolver.clone(),
             backfiller: copy_backfiller.clone(),
+            retires,
+            resume_floor: floor,
         };
-        let (reorder_sink, handle) = pcfg
+        let (mut reorder_sink, handle) = pcfg
             .spawn(emitter_ack)
             .await
             .context("spawn decode+insert pipeline")?;
-        // Toast chunk GC: TID-death-driven sweep off the hot path, borrowing
-        // the pipeline's store so disk-mode delete serializes against put.
-        if toast_gc_interval > Duration::ZERO {
-            if let (Some(store), Some(tracker)) = (handle.toast.store(), handle.toast.tracker()) {
-                // Detached task: dropping the JoinHandle never cancels it
-                let _toast_gc_task = walshadow::toast_gc::ToastGc {
-                    store,
-                    tracker,
-                    emitter_ack: handle.emitter_ack.clone(),
-                    interval: toast_gc_interval,
-                    stats: stats.clone(),
-                }
-                .spawn();
-                tracing::info!(
-                    target: "walshadow::toast_gc",
-                    interval_secs = toast_gc_interval.as_secs(),
-                    "toast chunk GC armed",
-                );
-            } else {
-                tracing::warn!(
-                    target: "walshadow::toast_gc",
-                    "[toast] gc_interval_secs set but no store/tid_journal; nothing to collect",
-                );
-            }
-        }
+        reorder_sink
+            .flush_due_retires()
+            .await
+            .context("boot flush of due toast-mirror retires")?;
         pipeline_handle = Some(handle);
         tracing::info!(
             target: "walshadow::pipeline",
@@ -1267,6 +1265,9 @@ async fn run(args: Args) -> Result<()> {
                 .await
                 .context("write resume cursor")?;
             last_cursor_write = Some(Instant::now());
+            if let Some(f) = &resume_floor {
+                f.store(cur.emitter_ack_lsn, Ordering::Release);
+            }
         }
         // flush drives a physical slot's restart_lsn (what the source retains),
         // so cap it at apply_ceiling: the source keeps WAL until CH has durably
@@ -1893,13 +1894,10 @@ async fn open_retention_client(conninfo: &str) -> Result<tokio_postgres::Client>
 
 async fn query_replay_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>> {
     let row = client
-        .query_one("SELECT pg_last_wal_replay_lsn()::text", &[])
+        .query_one("SELECT pg_last_wal_replay_lsn()", &[])
         .await?;
-    let raw: Option<String> = row.get(0);
-    match raw {
-        Some(s) => Ok(Some(walrus::pg::backup::parse_pg_lsn(&s)?)),
-        None => Ok(None),
-    }
+    let lsn: Option<PgLsn> = row.get(0);
+    Ok(lsn.map(u64::from))
 }
 
 /// Shadow-side numbers for the metrics publish step, from
@@ -2000,17 +1998,33 @@ async fn populate_metrics(
         decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
         decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
         decoder_toast_deletes_total: decoder_stats.toast_chunk_deletes.load(Ordering::Relaxed),
-        toast_gc_sweeps_total: emitter_stats
-            .map(|s| s.toast_gc_sweeps.load(Ordering::Relaxed))
+        toast_tombstones_stored_total: emitter_stats
+            .map(|s| s.toast_tombstones_stored.load(Ordering::Relaxed))
             .unwrap_or(0),
-        toast_gc_values_deleted_total: emitter_stats
-            .map(|s| s.toast_gc_values_deleted.load(Ordering::Relaxed))
+        toast_values_filled_superseded_total: emitter_stats
+            .map(|s| s.toast_values_filled_superseded.load(Ordering::Relaxed))
             .unwrap_or(0),
-        toast_deaths_resolved_total: emitter_stats
-            .map(|s| s.toast_deaths_resolved.load(Ordering::Relaxed))
+        toast_values_filled_mismatch_total: emitter_stats
+            .map(|s| s.toast_values_filled_mismatch.load(Ordering::Relaxed))
             .unwrap_or(0),
-        toast_deaths_unresolved_total: emitter_stats
-            .map(|s| s.toast_deaths_unresolved.load(Ordering::Relaxed))
+        toast_mirror_truncates_total: emitter_stats
+            .map(|s| s.toast_mirror_truncates.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_mirror_retires_total: emitter_stats
+            .map(|s| s.toast_mirror_retires.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_rewrite_barriers_total: emitter_stats
+            .map(|s| s.toast_rewrite_barriers.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_stash_buffered_total: decoder_stats.toast_stash_buffered.load(Ordering::Relaxed),
+        toast_stash_decoded_total: emitter_stats
+            .map(|s| s.toast_stash_decoded.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_stash_discarded_total: emitter_stats
+            .map(|s| s.toast_stash_discarded.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_stash_skipped_total: emitter_stats
+            .map(|s| s.toast_stash_skipped.load(Ordering::Relaxed))
             .unwrap_or(0),
         emitter_rows_total: emitter_stats
             .map(|s| s.rows_emitted.load(Ordering::Relaxed))
@@ -2214,13 +2228,12 @@ async fn run_bootstrap(
     // Tail drain gets a second CatalogMap clone for rfn → descriptor
     // lookups; cheap since `Arc<RelDescriptor>` values stay shared.
     let drain_catalog = catalog_map.clone();
-    // Build the toast resolver up front (validates [toast] config before the
-    // page walk starts) and share its counters with the bootstrap tail. The
-    // store-toast flag tells the page walk whether to decode pg_toast_* pages.
+    // Build the toast resolver up front, sharing its counters with the
+    // bootstrap tail. The store-toast flag tells the page walk whether to
+    // decode pg_toast_* pages.
     let bootstrap_stats = Arc::new(EmitterStats::default());
     let resolver = if let Some(cfg) = &ch_config {
         ToastResolver::from_config(cfg, bootstrap_stats.clone())
-            .map_err(|e| anyhow::anyhow!("bootstrap: {e}"))?
     } else {
         ToastResolver::disabled()
     };

@@ -178,9 +178,11 @@ crate::atomic_stats! {
         /// future TOAST layout as a counter, not silent loss
         pub toast_chunks_malformed,
         /// DELETE on a toast rel: TID-keyed (replica identity `nothing`),
-        /// buffered for commit-time death resolution against the birth map
-        /// (`crate::toast_tid`); GC applies resolved deaths off the hot path
+        /// buffered as a store tombstone row applied at commit drain
         pub toast_chunk_deletes,
+        /// Records on marker-proven invisible filenodes stashed raw for
+        /// commit-time resolution (same-xact CREATE / TRUNCATE / rewrite)
+        pub toast_stash_buffered,
     }
 }
 

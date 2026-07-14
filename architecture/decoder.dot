@@ -20,16 +20,20 @@ digraph decoder {
   edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
 
   // ════════ ingress ════════
-  record [label="WAL Record\nRM_HEAP / RM_HEAP2\nrfn = blocks[0].location.rel\nxid, source_lsn, info", fillcolor="#3D3D54", shape=parallelogram];
+  record [label="WAL Record\nRM_SMGR / RM_HEAP / RM_HEAP2\nrfn = blocks[0].location.rel\nxid, source_lsn, info", fillcolor="#3D3D54", shape=parallelogram];
 
   // ════════ sink + truncate intercept ════════
   subgraph cluster_sink {
     label="BufferingDecoderSink::on_record (xact_buffer.rs)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    sink     [label="on_record\nrm == Heap && info == TRUNCATE?", fillcolor="#4D4128"];
+    sink     [label="on_record\nSMGR CREATE?\nHeap TRUNCATE?\nother heap op?", fillcolor="#4D4128"];
+    marker   [label="note_smgr_create\nmain-fork generation marker\nproves stash completeness", fillcolor="#4D4128"];
     trunc    [label="handle_truncate\nparse_xl_heap_truncate\nwait_for_replay(source_lsn)\nfor relid in relids:\n  relation_by_oid → fan out\n  HeapOp::Truncate\n(kind in {'r','p'} only)", fillcolor="#4D4128"];
     relat    [label="ShadowCatalog::relation_at(rfn, lsn)\nLRU + libpq fetch", fillcolor="#4D4D28"];
+    stash    [label="stash_invisible\nSpillEntry::Raw\nmain data + block data/images\ncommit: relation_at(rfn, commit_lsn)\ntoast decode | ordinary skip | discard", fillcolor="#4D4128"];
+    sink -> marker [label="SMGR CREATE", style=dashed];
     sink -> trunc [label="0x30 TRUNCATE", style=dashed];
-    sink -> relat [label="other ops"];
+    sink -> relat [label="other heap ops"];
+    relat -> stash [label="NotFoundByFilenode\nor known candidate", style=dashed];
   }
   record -> sink;
 
@@ -88,6 +92,12 @@ digraph decoder {
 
   xactbuf [label="XactBuffer::on_heap\nper-xid bucket\n+ TOAST reassembly\n+ subxact tracker", fillcolor="#4D4128", shape=cylinder];
   decoded -> xactbuf [color="#BF8C5F", penwidth=2];
+  marker -> xactbuf [style=dashed, color="#CBA85E", label="marker + stash rfn"];
+  stash -> xactbuf [color="#BF8C5F", style=dashed, label="Raw"];
+
+  toastop [label="relkind = 't'\nINSERT → ToastChunk + TID\nDELETE → ToastDelete + TID\nrecord LSN versions mirror row", fillcolor="#4D4128", shape=note];
+  decoded -> toastop [style=dashed, color="#BF8C5F"];
+  toastop -> xactbuf [style=dashed, color="#BF8C5F"];
 
   // ════════ side cluster: replica identity ════════
   subgraph cluster_replident {

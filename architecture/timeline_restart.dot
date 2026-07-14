@@ -17,7 +17,7 @@ digraph timeline_restart {
     a2 [label="③ DirSegmentSink::on_partial_segment\n<seg>.partial", fillcolor="#4D3340"];
     a3 [label="④ cursor::write final state\n(emitter_ack_lsn, drain_lsn, …)", fillcolor="#4D3A28"];
     a4 [label="⑤ process exit", fillcolor="#403a36"];
-    a5 [label="⑥ restart:\ncursor::read → Cursor{…}\nresume_lsn = segment-aligned\ndown to emitter_ack_lsn", fillcolor="#4D3A28"];
+    a5 [label="⑥ restart:\ncursor::read → segment-aligned resume_lsn\nload toast_retires.bin\nflush entries below resume floor", fillcolor="#4D3A28"];
     a6 [label="⑦ Shadow::start in recovery mode\n(if not already running)", fillcolor="#3D4128"];
     a7 [label="⑧ walsender listener up\nbefore walreceiver connects", fillcolor="#4D3340"];
     a8 [label="⑨ SourceFeed open\nSTART_REPLICATION PHYSICAL <resume_lsn>", fillcolor="#4D3A28"];
@@ -33,8 +33,8 @@ digraph timeline_restart {
 
     b0 [label="① kill -9 (no drain)", fillcolor="#403a36"];
     b1 [label="② OS reaps process\nbuffers lost; cursor.bin = last fsync\nspill files on disk\npartial segment write rolled back", fillcolor="#4D3A28"];
-    b2 [label="③ restart:\nspill::clear() wipes xid-*.bin\n(resume contract)", fillcolor="#4D3A28"];
-    b3 [label="④ cursor::read\nresume_lsn = emitter_ack_lsn\n(slot-safe)", fillcolor="#4D3A28"];
+    b2 [label="③ restart:\nspill::clear() wipes xid-*.bin\ntoast_retires.bin survives", fillcolor="#4D3A28"];
+    b3 [label="④ cursor::read\nresume_lsn = segment-aligned emitter_ack\nflush due toast mirror retires", fillcolor="#4D3A28"];
     b4 [label="⑤ shadow PG recovers on its own\nwalreceiver retry timer", fillcolor="#3D4128"];
     b5 [label="⑥ shadow asks START_REPLICATION\nPHYSICAL <its flush_lsn>", fillcolor="#3D4128"];
     b6 [label="⑦ walshadow honours both:\n• upstream feed at resume_lsn\n• shadow feed at shadow's flush_lsn", fillcolor="#4D3A28"];

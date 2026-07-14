@@ -1,0 +1,108 @@
+// walshadow — TOAST resolution, ClickHouse mirror, and lifecycle
+//
+// regeneration spec:
+// sources of truth: plans/TOAST.md · src/toast.rs · src/toast_retire.rs · src/xact_buffer.rs · src/pipeline/{bootstrap,reorder,decode}.rs
+// subsumes: plans/TOAST.md § Store / Lifecycle / Scope limits
+// quality bar:
+//   - in-xact fast path and store-backed slow path stay distinct
+//   - births/tombstones reach mirror before publishing ack
+//   - TRUNCATE, DROP retirement, and rewrite barrier show different semantics
+//   - bootstrap put-before-resolve ordering remains visible
+// shared style: palette.md
+digraph toast {
+  rankdir=TB;
+  compound=true;
+  newrank=true;
+  graph [fontname="Helvetica", labelloc="t", label="walshadow TOAST — in-xact reassembly + TID-keyed ClickHouse mirror + lifecycle", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.6, bgcolor="#272623", fontcolor="#ECE1D7"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
+  edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
+
+  wal [label="source WAL\nheap + pg_toast records", fillcolor="#3D3D54", shape=parallelogram];
+
+  subgraph cluster_stream {
+    label="streaming commit — WAL order, abort-safe";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    decode [label="BufferingDecoderSink\nmain heap → DecodedHeap\ntoast INSERT → ToastChunk\ntoast DELETE → ToastDelete\nTID + record LSN", fillcolor="#4D4128"];
+    spill [label="XactBuffer / spill v4\nHeap | Chunk | ToastDelete | Raw\nabort discards", fillcolor="#4D4128"];
+    drain [label="CommittedDrain → DrainedBatch\nchunks: Arc<ChunkMap> generations\nnew_rows: births + tombstones\nordered row/event cursors", fillcolor="#4D4128"];
+    detoast [label="decode pool\ndetoast_heap\ntry in-xact ChunkMap first", fillcolor="#5D4628"];
+    rows [label="main-table rows\ninline Text / Bytea / PgPending", fillcolor="#5D4628", shape=parallelogram];
+
+    decode -> spill -> drain;
+    drain -> detoast [label="heaps + chunk maps"];
+    detoast -> rows;
+  }
+  wal -> decode;
+
+  subgraph cluster_store {
+    label="ToastResolver / ChunkStore — store-backed slow path";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    resolver [label="ToastResolver\ndisabled | clickhouse", fillcolor="#4D4D28"];
+    put [label="put(new_rows)\nbefore commit publishing marker", fillcolor="#4D4D28"];
+    fetch [label="fetch(relid, value_id, max_lsn)\nper-TID latest ≤ max_lsn\nlive rows → newest per seq", fillcolor="#4D4D28"];
+    mirror [label="CH pg_toast_<relid>\nReplacingMergeTree(_lsn, _is_deleted)\nORDER BY (blkno, offnum)\nbirth or tombstone per TID", fillcolor="#4D4128", shape=cylinder];
+    miss [label="miss policy\ndisabled → default fill\nstore miss → superseded fill\nshort run → mismatch fill\nmissing mirror → fatal", fillcolor="#5D3F40", shape=note];
+
+    resolver -> put;
+    resolver -> fetch;
+    put -> mirror [color="#BF8C5F", penwidth=2];
+    fetch -> mirror [dir=both, arrowtail=open, color="#CBA85E"];
+    fetch -> miss [style=dashed];
+  }
+  drain -> put [label="new_rows\nWAL ordered", color="#BF8C5F"];
+  detoast -> fetch [label="pointer absent from\nin-xact maps", color="#CBA85E", style=dashed];
+
+  subgraph cluster_bootstrap {
+    label="bootstrap — put all chunks before deferred resolution";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    walk [label="PageWalkSink\nmain tuples + pg_toast tuples\non-page TID, walk LSN", fillcolor="#4D3340"];
+    defer [label="pipeline::bootstrap::drain\nbatch ToastRows\ndefer mapped ExternalToast", fillcolor="#4D3340"];
+    resolve [label="flush chunks → resolve deferred\nbootstrap miss = hard error", fillcolor="#4D3340"];
+    walk -> defer -> resolve;
+  }
+  defer -> put [label="ToastRows", color="#BF8C5F"];
+  resolve -> fetch [label="after flush", color="#CBA85E", style=dashed];
+  resolve -> rows [label="resolved bootstrap rows", color="#BF8C5F"];
+
+  subgraph cluster_lifecycle {
+    label="lifecycle barriers — TRUNCATE, DROP, rewrite stay distinct";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    trunc [label="owner TRUNCATE\nfence main rows\nTRUNCATE dest + mirror in slice", fillcolor="#5D4628"];
+    drop [label="toast SchemaEvent::Dropped\nenqueue (relid, commit_lsn)", fillcolor="#5D4628"];
+    ledger [label="toast_retires.bin\nfsynced RetireLedger", fillcolor="#4D3850", shape=note];
+    floor [label="persisted resume floor\nsegment passes drop commit", fillcolor="#4D3A28"];
+    retire [label="retire_mirror\nTRUNCATE table, never DROP", fillcolor="#5D4628"];
+    marker [label="XLOG_SMGR_CREATE marker\n+ SpillEntry::Raw stash\nresolve at commit", fillcolor="#5D4628"];
+    barrier [label="rewrite_barrier O − B\nresidual tombstones @ commit LSN\nafter generation births", fillcolor="#5D4628"];
+
+    drop -> ledger [color="#6E6963", style=dashed];
+    ledger -> floor [style=dashed];
+    floor -> retire;
+    marker -> barrier;
+  }
+  trunc -> mirror [label="wipe", color="#BF8C5F", style=dashed];
+  retire -> mirror [label="wipe when replay-safe", color="#BF8C5F", style=dashed];
+  barrier -> mirror [label="insert residual deaths", color="#BF8C5F", style=dashed];
+  drain -> trunc [label="truncate_rows cursor", style=dashed];
+  drain -> drop [label="ordered Dropped", style=dashed];
+  decode -> marker [label="invisible generation", style=dashed];
+
+  main [label="CH destination tables\nReplacingMergeTree(_lsn)", fillcolor="#4D4128", shape=cylinder];
+  rows -> main [color="#BF8C5F", penwidth=2];
+
+  legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>invariants</B></TD></TR>
+      <TR><TD>same-xact</TD><TD>ChunkMap wins, no store read</TD></TR>
+      <TR><TD>store write</TD><TD>births/tombstones durable before commit publication</TD></TR>
+      <TR><TD>as-of read</TD><TD>future TID generations invisible at referring LSN</TD></TR>
+      <TR><TD>DROP</TD><TD>persist intent before ack, wipe after replay floor passes</TD></TR>
+      <TR><TD>rewrite</TD><TD>preserve old as-of windows, close residuals with O − B</TD></TR>
+    </TABLE>
+  >];
+  main -> legend [style=invis];
+}

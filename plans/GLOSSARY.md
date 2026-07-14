@@ -153,17 +153,19 @@ whose backup file contents skip while dir entries land empty
 under shadow's data dir; user-heap files route to Skip or Tap
 ([bootstrap.md](bootstrap.md))
 
-**drain** — commit-time flush of an xact's buffered heaps, reassembled
-TOAST, and ordered events; `drain_committed` yields `DrainedXact`
-consumed by reorder coordinator ([xact.md](xact.md))
+**drain** — commit-time flush of an xact's buffered heaps, TOAST
+births/deaths, chunk maps, and ordered events; `drain_committed` yields
+`CommittedDrain`, whose bounded `DrainedBatch` slices feed reorder
+coordinator ([xact.md](xact.md))
 
 **drain_lsn** — cursor LSN advancing before `on_xact_end` ack;
 `drain_lsn > emitter_ack_lsn` gap is how an observer failure surfaces
 ([xact.md](xact.md))
 
-**DrainEntry** — drain item kinds: Tuple / Catalog / Config.
-Catalog-before-tuple tie-break at equal `(xid, source_lsn)` so ALTER
-lands on CH before dependent INSERT encodes
+**DrainEntry** — ordered control item: Catalog / Config / ToastBarrier.
+Heaps merge beside control items; catalog-before-heap tie-break at equal
+`(xid, source_lsn)` makes ALTER land before dependent INSERT encodes,
+`OrderedEvent.row_idx` puts TOAST rows before lifecycle barriers
 ([xact.md](xact.md), [config.md](config.md))
 
 **emitter_ack_lsn** — contiguous-done commit LSN: every xact at/below is
@@ -209,6 +211,12 @@ through shared decode path ([add_table.md](add_table.md))
 **generation counter** — ShadowCatalog cache invalidation: single u64
 bumped on any pg_class write. Coarse-fires by design, over-invalidates
 but cannot under-invalidate ([shadow.md](shadow.md))
+
+**generation marker** — main-fork `XLOG_SMGR_CREATE` remembered by
+filenode; gates toast-stash admission and proves generation
+completeness (records cannot precede creation), its LSN the `O` as-of
+point for the rewrite barrier. A toast resolution without one fails
+closed ([TOAST.md](TOAST.md))
 
 **greenfield** — fresh attach, no cursor on disk; bootstrap scenario and
 resume fallback when cursor read fails
@@ -301,8 +309,9 @@ via `walshadow_decode_disk` (same `typoutput` PG would call), diffed
 against local decode. `--validate N` samples 1-in-N; mismatch is a
 watchdog signal, row still ships ([oracle.md](oracle.md))
 
-**ordered_events** — DrainedXact's catalog/config event positions
-interleaved with heaps; pipeline walks them as barrier segments
+**ordered_events** — `DrainedBatch` catalog/config/toast-barrier positions
+interleaved with heaps and TOAST-row cursors; pipeline walks them as
+barrier segments
 ([xact.md](xact.md))
 
 **overlay** — PG-row config layer: DBA-written `config_*` rows on source
@@ -397,6 +406,12 @@ barriers ([emitter.md](emitter.md))
 **restore_command fallback** — shadow's archive channel
 (`cp <out_dir>/%f %p`) at segment cadence when walsender wire drops or a
 slow connection is cut off ([shadow.md](shadow.md))
+
+**rewrite barrier** — store-side residual deaths `O - B` closing a
+marker-proven toast generation: TIDs live as of the generation marker
+with no row past it tombstone at commit LSN, after the generation's
+births are put. One insert-select; replay re-runs insert nothing, the
+mirror is never truncated ([TOAST.md](TOAST.md))
 
 **retention** — sweeper trimming filtered segments whose end LSN falls
 below `replay_lsn - retention_bytes`; `--retention-bytes 0` disables
@@ -503,16 +518,33 @@ else routed `PgPending` to oracle ([decoder.md](decoder.md))
 
 **TOAST chunk store** — `[toast] mode` selecting store of record for
 chunks so reassembly doesn't depend on WAL adjacency: `disabled`
-(NULL/default-fill on miss, counted), `disk`, `clickhouse` (chunk rows
-in `pg_toast_<relid>` ReplacingMergeTree table)
+(NULL/default-fill on miss, counted), `clickhouse` (TID-keyed rows in a
+`pg_toast_<relid>` `ReplacingMergeTree(_lsn, _is_deleted)` table)
 ([TOAST.md](TOAST.md))
 
-**toast GC sweep** — periodic source anti-join reclaim of dead chunk
-values (`[toast] gc_interval_secs`): `pre = pg_current_wal_lsn()` +
-snapshot-visibility barrier before the scans, live `chunk_id`s from the
-source toast rel, `S = pg_current_wal_lsn()` after the scans, delete
-gated on `emitter_ack ≥ S`; `_lsn <= pre` / mtime guards keep chunks the
-scans couldn't see (fresh commits, reused-OID re-puts)
+**toast mirror retire** — on a toast rel's `Dropped` (owner DROP /
+rewrite) the mirror is emptied but never CH-dropped: a crash-replay
+re-emit detoasts before the mapping lookup, and fetch against a dropped
+mirror is `MissingMirror` (fatal) where an empty one superseded-fills.
+Deferred until the persisted resume cursor's segment passes the dropping
+commit — a same-`_lsn` replayed fill wouldn't dedup against its durable
+original. Queue persists in the `toast_retires.bin` ledger (fsynced at
+enqueue, before the dropping commit's ack) so a stop inside the wait
+window can't orphan the wipe: pipeline standup flushes entries whose
+drop resume never replays; counted `toast_mirror_retires` at execution
+([TOAST.md](TOAST.md))
+
+**toast stash** — raw decode inputs (`SpillEntry::Raw`) of records
+whose filenode is MVCC-invisible at record time (rewrite generation,
+same-xact CREATE/TRUNCATE + INSERT), admitted by generation marker,
+resolved at commit via `relation_at(rfn, commit_lsn)` and decoded in
+the drain merge; unresolvable → discarded counted, ordinary heap →
+fenced skipped ([TOAST.md](TOAST.md))
+
+**toast tombstone** — store row `(blkno, offnum, 0, 0, '',
+delete_record_lsn, 1)` a toast DELETE lands at its TID; supersedes the
+data row so RMT merge reclaims dead chunks with no walshadow GC, fetch
+resolves per-TID as-of state at the referring record's LSN
 ([TOAST.md](TOAST.md))
 
 **ToastPointer / ExternalToast** — on-disk external varlena pointer

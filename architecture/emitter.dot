@@ -26,7 +26,7 @@ digraph emitter {
     label="reorder coordinator — single-threaded commit order  (pipeline/reorder.rs, inner sink of QueueingRecordSink)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    reorder [label="ReorderSink::on_record (RM_XACT only)\nCOMMIT → drain_committed → dense seq\nABORT / empty commit → rows=0 seq\nbarrier xact (SchemaEvent / TRUNCATE):\n segment → fence → apply, per event", fillcolor="#4D4128"];
+    reorder [label="ReorderSink::on_record (RM_XACT only)\nCOMMIT → CommittedDrain / DrainedBatch\nABORT / empty commit → rows=0 seq\nbarrier: Catalog / Config / ToastBarrier / TRUNCATE\nput new_rows through sealed row/event cursors", fillcolor="#4D4128"];
     cat     [label="ShadowCatalog::subscribe\nSchemaEvent\nAdded / Changed / Dropped\n(unbounded mpsc, rides xact buffer\n as ordered_events)", fillcolor="#4D4D28", shape=parallelogram];
   }
 
@@ -35,7 +35,7 @@ digraph emitter {
     label="decode pool ×M  (pipeline/decode.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    decode [label="decode worker ×M\ndetoast → resolve_at_pooled\n(skip foreign-DB / unmapped)\noracle PgPending + sampled validate\nchunk 1024 rows / 4 MiB", fillcolor="#4D4128"];
+    decode [label="decode worker ×M\ndetoast: ChunkMap, then store as-of fetch\nresolve_at_pooled; mapping\noracle PgPending + sampled validate\nchunk 1024 rows / 4 MiB", fillcolor="#4D4128"];
   }
 
   // ═════ batcher hub ═════
@@ -60,25 +60,29 @@ digraph emitter {
 
   // ═════ DDL path: barrier + applicator (own CH connection) ═════
   subgraph cluster_ddl {
-    label="DDL / TRUNCATE — barrier fence + DdlApplicator (own CH connection)";
+    label="ordered control barriers — DDL / config / TOAST lifecycle";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     fence  [label="barrier_fence\n1. wait all seqs placed\n2. batcher FlushAll (+ reply)\n3. wait all seqs durable", fillcolor="#5D4628"];
     bridge [label="type_bridge::map\nRelAttr → ResolvedColumn\n(reject type change,\n pk strips Nullable)", fillcolor="#5D4628"];
-    apply  [label="DdlApplicator::apply / truncate\nAdded  → CREATE TABLE IF NOT EXISTS\nChanged → RENAME / ADD / DROP COLUMN\nDropped → DropTableStrategy\nTRUNCATE TABLE (no retry: error = Fatal)", fillcolor="#5D4628"];
+    apply  [label="apply ordered control\nCatalog → DdlApplicator\nConfig → resolver republish\nowner TRUNCATE → dest + toast mirror wipe\nToastBarrier → rewrite O−B\ntoast Dropped → durable retire enqueue", fillcolor="#5D4628"];
 
     fence -> apply;
     bridge -> apply [style=dashed, label="resolve types"];
   }
 
-  // ═════ CH endpoint (N+1 connections) ═════
+  // ═════ CH endpoint ═════
   subgraph cluster_ch {
-    label="ClickHouse — one endpoint, N+1 connections";
+    label="ClickHouse — main insert pool + DDL + TOAST store connections";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     chrows [label="insert connections ×N\nclickhouse-c-rs AsyncClient\nReplacingMergeTree(_lsn, _is_deleted)\nNative rows", fillcolor="#4D4128", shape=cylinder];
     chddl  [label="DDL connection\nclickhouse-c-rs AsyncClient\nALTER / CREATE /\n DROP / TRUNCATE", fillcolor="#4D4128", shape=cylinder];
+    chtoast [label="TOAST store connection\npg_toast_<relid> mirrors\nput / as-of fetch / truncate / O−B", fillcolor="#4D4128", shape=cylinder];
   }
+
+  toastput [label="ToastResolver\nput births + tombstones before publish\nas-of fetch for pre-window values", fillcolor="#4D4D28"];
+  ledger [label="{spill_dir}/toast_retires.bin\nfsynced before dropping commit ack\nstandup / commit / idle flush", fillcolor="#4D3850", shape=note];
 
   // ═════ ack collector (durability watermark) ═════
   ack [label="ack collector  (pipeline/ack.rs)\nRegister(seq, commit_lsn) · Placed(seq, rows) · Acked(per_seq)\nseq done ⇔ placed == acked  (rows=0 done at placement)\nwatermark = highest contiguous-done commit_lsn\n→ emitter_ack atomic → cursor + standby apply_lsn", fillcolor="#4D3A28", shape=note];
@@ -88,11 +92,17 @@ digraph emitter {
   decode  -> enc    [color="#BF8C5F", penwidth=2, lhead=cluster_batch, label="BatcherMsg::Rows\n(FIFO mpsc 256 —\nshared with FlushAll)"];
   seal    -> ins    [color="#BF8C5F", penwidth=2, lhead=cluster_insert, label="InsertBatch\n(mpmc)"];
   ins     -> chrows [color="#BF8C5F", penwidth=2, label="one complete INSERT\nper sealed batch"];
+  reorder -> toastput [color="#BF8C5F", style=dashed, label="new_rows cursors"];
+  decode  -> toastput [color="#CBA85E", style=dashed, label="fetch"];
+  toastput -> chtoast [color="#BF8C5F", penwidth=2];
 
   // ═════ DDL path ═════
   cat     -> reorder [color="#CBA85E", style=dashed, label="SchemaEvent\ndrains at commit"];
   reorder -> fence   [color="#BF8C5F", style=dashed, lhead=cluster_ddl, label="barrier xact:\nper event / TRUNCATE"];
   apply   -> chddl   [color="#BF8C5F", style=dashed, penwidth=2, label="DDL SQL\n(own connection)"];
+  apply   -> chtoast [color="#BF8C5F", style=dashed, label="truncate / O−B"];
+  apply   -> ledger  [color="#6E6963", style=dashed, label="toast DROP enqueue"];
+  ledger  -> chtoast [color="#BF8C5F", style=dashed, label="retire once resume floor passes"];
   fence   -> trip    [style=dashed, color="#B58B86", constraint=false, label="FlushAll"];
 
   // ═════ ack side-channel ═════

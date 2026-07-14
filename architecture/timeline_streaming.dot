@@ -74,7 +74,7 @@ digraph timeline_streaming {
 
     gate5 [label="BufferingDecoderSink\nrelation_at(rfn, X)\nwait_for_replay(X)", fillcolor="#4D4128"];
     dec5  [label="heap_decoder\n→ DecodedHeap", fillcolor="#4D4128"];
-    buf5  [label="XactBuffer::insert(xid)\n(per-xid mem + spill,\n SubxactTracker on subtree)", fillcolor="#4D4128"];
+    buf5  [label="XactBuffer\nHeap / Chunk / ToastDelete / Raw\nper-xid mem + spill v4\nSMGR markers + SubxactTracker", fillcolor="#4D4128"];
     gate5 -> dec5 -> buf5;
   }
   qwrk -> gate5 [lhead=cluster_p5];
@@ -86,13 +86,13 @@ digraph timeline_streaming {
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     cmt6   [label="XLOG_XACT_COMMIT\nLSN = X'", fillcolor="#3D3D54"];
-    drain6 [label="ReorderSink::on_record\ndrain spill + memory in WAL order\nassign dense seq, Register(seq, X')", fillcolor="#4D4128"];
-    dec6   [label="decode worker (×M pool)\ndetoast + resolve + mapping\nroute row chunks; Placed(seq, rows)", fillcolor="#4D4128"];
+    drain6 [label="ReorderSink::on_record\nDrainedBatch slices in WAL order\nput TOAST births/tombstones before publish\nbarrier row/event cursors; dense seq", fillcolor="#4D4128"];
+    dec6   [label="decode worker (×M pool)\ndetoast via ChunkMap / as-of mirror fetch\nresolve + mapping\nroute main rows; Placed(seq, rows)", fillcolor="#4D4128"];
     enc6   [label="InsertBatcher\nTableEncoder::append_row\n_lsn / _xid / _commit_ts / _is_deleted\nbuffer across xacts", fillcolor="#4D4128"];
     seal6  [label="seal InsertBatch\nbudget / per-table deadline\n(owned slabs + per_seq)", fillcolor="#4D4128"];
     close6 [label="inserter (×N pool)\none complete INSERT\nsend_query → send_data → EndOfStream\nAcked(per_seq) after drain", fillcolor="#4D4128"];
     ack6   [label="ack collector\nseq done ⇔ placed == acked\ncontiguous-done →\nemitter_ack_lsn := X'", fillcolor="#4D3A28", shape=note];
-    ch6    [label="ReplacingMergeTree(_lsn)\nmerged in CH", fillcolor="#4D4128"];
+    ch6    [label="ClickHouse\nmain ReplacingMergeTree(_lsn)\nTID-keyed pg_toast_<relid> mirrors", fillcolor="#4D4128"];
 
     cmt6 -> drain6;
     drain6 -> dec6 [label="DecodeJob"];

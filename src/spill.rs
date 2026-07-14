@@ -15,15 +15,17 @@
 //! ```text
 //! [2 bytes "WS" magic] [u16 LE version] then repeating:
 //! [u8 tag] [u32 len LE] [body of `len` bytes]
-//!   tag = 0 → SpillEntry::Heap   (body = encoded DecodedHeap)
-//!   tag = 1 → SpillEntry::Chunk  (body = encoded ToastChunk)
+//!   tag = 0 → SpillEntry::Heap        (body = encoded DecodedHeap)
+//!   tag = 1 → SpillEntry::Chunk       (body = encoded ToastChunk)
+//!   tag = 2 → SpillEntry::ToastDelete (body = encoded ToastDelete)
+//!   tag = 3 → SpillEntry::Raw         (body = encoded RawRecord)
 //! ```
 //!
 //! Version bumps on any body-encoding change. Files don't survive a restart
 //! (resume contract wipes the dir), so magic + version is self-check honesty:
 //! a mid-restart format mismatch surfaces as [`SpillError::Format`] not a
 //! silent misparse. Outer length lets [`SpillReader::next`] skip a malformed
-//! body; v1 propagates any malformation as Format since the xact is
+//! body; reader propagates any malformation as Format since xact is
 //! unrecoverable anyway.
 //!
 //! ## Eviction policy
@@ -55,9 +57,145 @@ use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastP
 pub enum SpillEntry {
     Heap(Box<DecodedHeap>),
     Chunk(ToastChunk),
-    /// `XLOG_HEAP_DELETE` on a toast rel: TID-keyed, resolved to a dead
-    /// `value_id` at commit via [`crate::toast_tid`]
     ToastDelete(ToastDelete),
+    /// Undecoded record on a filenode invisible at record time (same-xact
+    /// CREATE / TRUNCATE / rewrite generation); decoded at commit once
+    /// `relation_at(rfn, commit_lsn)` resolves the survivor
+    Raw(Box<RawRecord>),
+}
+
+/// Raw decode inputs for one WAL record, enough to re-run
+/// [`crate::heap_decoder::decode_heap_record`] after commit-time
+/// resolution. Block images survive so an insert whose tuple lives only
+/// in an FPI (`HEAP_INSERT_NO_LOGICAL` strips `REGBUF_KEEP_DATA`, PG
+/// `src/backend/access/heap/heapam.c`) still decodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawRecord {
+    pub rm: u8,
+    pub info: u8,
+    pub source_lsn: u64,
+    /// Selects PG-14 vs PG-15 FPI bit semantics for image restore
+    pub page_magic: u16,
+    pub main_data: Vec<u8>,
+    pub blocks: Vec<RawBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawBlock {
+    pub block_id: u8,
+    pub fork_flags: u8,
+    pub data_length: u16,
+    pub image_length: u16,
+    pub hole_offset: u16,
+    pub hole_length: u16,
+    pub bimg_info: u8,
+    pub spc_node: u32,
+    pub db_node: u32,
+    pub rel_node: u32,
+    pub block_no: u32,
+    pub image: Vec<u8>,
+    pub data: Vec<u8>,
+}
+
+impl RawRecord {
+    pub fn from_parsed(
+        parsed: &walrus::pg::walparser::XLogRecord<'_>,
+        source_lsn: u64,
+        page_magic: u16,
+    ) -> Self {
+        Self {
+            rm: parsed.header.resource_manager_id,
+            info: parsed.header.info,
+            source_lsn,
+            page_magic,
+            main_data: parsed.main_data.to_vec(),
+            blocks: parsed
+                .blocks
+                .iter()
+                .map(|b| RawBlock {
+                    block_id: b.header.block_id,
+                    fork_flags: b.header.fork_flags,
+                    data_length: b.header.data_length,
+                    image_length: b.header.image_header.image_length,
+                    hole_offset: b.header.image_header.hole_offset,
+                    hole_length: b.header.image_header.hole_length,
+                    bimg_info: b.header.image_header.info,
+                    spc_node: b.header.location.rel.spc_node,
+                    db_node: b.header.location.rel.db_node,
+                    rel_node: b.header.location.rel.rel_node,
+                    block_no: b.header.location.block_no,
+                    image: b.image.to_vec(),
+                    data: b.data.to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild a borrowed record for the shared heap decoder. `xact_id` /
+    /// CRC are irrelevant post-commit and stay zero.
+    pub fn to_xlog_record(&self) -> walrus::pg::walparser::XLogRecord<'_> {
+        use walrus::pg::walparser::{
+            BlockLocation, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
+            XLogRecordBlockImageHeader, XLogRecordHeader,
+        };
+        XLogRecord {
+            header: XLogRecordHeader {
+                info: self.info,
+                resource_manager_id: self.rm,
+                ..Default::default()
+            },
+            main_data_len: self.main_data.len() as u32,
+            origin: 0,
+            toplevel_xid: 0,
+            blocks: self
+                .blocks
+                .iter()
+                .map(|b| XLogRecordBlock {
+                    header: XLogRecordBlockHeader {
+                        block_id: b.block_id,
+                        fork_flags: b.fork_flags,
+                        data_length: b.data_length,
+                        image_header: XLogRecordBlockImageHeader {
+                            image_length: b.image_length,
+                            hole_offset: b.hole_offset,
+                            hole_length: b.hole_length,
+                            info: b.bimg_info,
+                        },
+                        location: BlockLocation {
+                            rel: RelFileNode {
+                                spc_node: b.spc_node,
+                                db_node: b.db_node,
+                                rel_node: b.rel_node,
+                            },
+                            block_no: b.block_no,
+                        },
+                    },
+                    image: std::borrow::Cow::Borrowed(&b.image[..]),
+                    data: std::borrow::Cow::Borrowed(&b.data[..]),
+                })
+                .collect(),
+            main_data: std::borrow::Cow::Borrowed(&self.main_data[..]),
+        }
+    }
+
+    /// Target filenode: block 0's relation, matching decoder convention
+    pub fn rfn(&self) -> Option<RelFileNode> {
+        self.blocks.first().map(|b| RelFileNode {
+            spc_node: b.spc_node,
+            db_node: b.db_node,
+            rel_node: b.rel_node,
+        })
+    }
+
+    pub fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.main_data.len()
+            + self
+                .blocks
+                .iter()
+                .map(|b| std::mem::size_of::<RawBlock>() + b.image.len() + b.data.len())
+                .sum::<usize>()
+    }
 }
 
 /// One chunk from a `pg_toast.pg_toast_<oid>` INSERT. PG `toast_save_datum`
@@ -65,31 +203,21 @@ pub enum SpillEntry {
 /// `(toast_relid, value_id)`, concatenates by `chunk_seq` at drain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToastChunk {
-    /// Toast relation `RelFileNode.rel_node`; matches the referring
-    /// [`ToastPointer`]'s `va_toastrelid`
     pub toast_relid: u32,
-    /// `chunk_id`, matches `va_valueid`
     pub value_id: u32,
     /// 0-based, PG writes sequentially
     pub chunk_seq: u32,
-    /// Keeps WAL-order drain stable across spilled + in-memory chunks for
-    /// one value
     pub source_lsn: u64,
-    /// TID of the chunk's heap tuple: birth key for TID death tracking
-    /// ([`crate::toast_tid`]). 0/0 when synthesized off the merged chunk
-    /// map (store `put_map` rows, never seen by the tracker)
+    /// Invalid TID cannot enter mirror, but remains usable in transaction
     pub blkno: u32,
     pub offnum: u16,
     /// `TOAST_MAX_CHUNK_SIZE` ≈ 1996 bytes typical, last chunk shorter
     pub chunk_data: Vec<u8>,
 }
 
-/// TID of a deleted toast tuple. PG `toast_delete_datum` deletes every chunk
-/// of a value in one xact; resolving any one delete against the seq-0 birth
-/// map identifies the dead value, so only that one produces a death.
+/// Deleted TOAST tuple TID, one tombstone per chunk
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToastDelete {
-    /// Toast rel pg_class OID (matches the birth's `toast_relid`)
     pub toast_relid: u32,
     pub blkno: u32,
     pub offnum: u16,
@@ -108,11 +236,11 @@ pub type Result<T> = std::result::Result<T, SpillError>;
 
 /// ASCII for `xxd`-friendly debug
 pub const SPILL_MAGIC: [u8; 2] = *b"WS";
-/// v2 added the `HeapOp::Truncate` tag-4 body encoding. v3 added chunk
-/// TIDs + the `ToastDelete` entry (TID death tracking). `DrainEntry`
-/// events (Catalog, and Config/Signal per the runtime-config plan) are
-/// drain-time, never spilled, so they don't touch this format
-pub const SPILL_VERSION: u16 = 3;
+/// v2 added `HeapOp::Truncate` tag-4 body encoding. v3 added chunk TIDs and
+/// `ToastDelete` entries. v4 added tag-3 `Raw` stashed records. `DrainEntry`
+/// events (Catalog, ToastBarrier, and Config/Signal per the runtime-config
+/// plan) are drain-time, never spilled, so they don't touch this format
+pub const SPILL_VERSION: u16 = 4;
 
 pub struct SpillStore {
     dir: PathBuf,
@@ -193,6 +321,7 @@ impl SpillWriter {
             SpillEntry::Heap(_) => 0,
             SpillEntry::Chunk(_) => 1,
             SpillEntry::ToastDelete(_) => 2,
+            SpillEntry::Raw(_) => 3,
         };
         body.push(tag);
         // u32 LE length placeholder, back-patched after body appends in place
@@ -203,6 +332,7 @@ impl SpillWriter {
             SpillEntry::Heap(h) => encode_heap_into(&mut body, h),
             SpillEntry::Chunk(c) => encode_chunk_into(&mut body, c),
             SpillEntry::ToastDelete(d) => encode_toast_delete_into(&mut body, d),
+            SpillEntry::Raw(r) => encode_raw_into(&mut body, r),
         }
         let inner_len = (body.len() - inner_start) as u32;
         body[len_off..len_off + 4].copy_from_slice(&inner_len.to_le_bytes());
@@ -314,6 +444,11 @@ impl SpillReader {
                 let mut cur = Cursor::new(&body);
                 let d = decode_toast_delete(&mut cur)?;
                 SpillEntry::ToastDelete(d)
+            }
+            3 => {
+                let mut cur = Cursor::new(&body);
+                let r = decode_raw(&mut cur)?;
+                SpillEntry::Raw(Box::new(r))
             }
             other => {
                 return Err(SpillError::Format {
@@ -534,6 +669,31 @@ fn encode_toast_delete_into(out: &mut Vec<u8>, d: &ToastDelete) {
     push_u32(out, d.blkno);
     push_u16(out, d.offnum);
     push_u64(out, d.source_lsn);
+}
+
+fn encode_raw_into(out: &mut Vec<u8>, r: &RawRecord) {
+    out.reserve(32 + r.approx_bytes());
+    push_u8(out, r.rm);
+    push_u8(out, r.info);
+    push_u64(out, r.source_lsn);
+    push_u16(out, r.page_magic);
+    push_bytes(out, &r.main_data);
+    push_u32(out, r.blocks.len() as u32);
+    for b in &r.blocks {
+        push_u8(out, b.block_id);
+        push_u8(out, b.fork_flags);
+        push_u16(out, b.data_length);
+        push_u16(out, b.image_length);
+        push_u16(out, b.hole_offset);
+        push_u16(out, b.hole_length);
+        push_u8(out, b.bimg_info);
+        push_u32(out, b.spc_node);
+        push_u32(out, b.db_node);
+        push_u32(out, b.rel_node);
+        push_u32(out, b.block_no);
+        push_bytes(out, &b.image);
+        push_bytes(out, &b.data);
+    }
 }
 
 // ── decoding ────────────────────────────────────────────────────────
@@ -773,6 +933,41 @@ fn decode_toast_delete(c: &mut Cursor) -> Result<ToastDelete> {
     })
 }
 
+fn decode_raw(c: &mut Cursor) -> Result<RawRecord> {
+    let rm = c.u8()?;
+    let info = c.u8()?;
+    let source_lsn = c.u64()?;
+    let page_magic = c.u16()?;
+    let main_data = c.bytes()?;
+    let nblocks = c.u32()? as usize;
+    let mut blocks = Vec::with_capacity(nblocks);
+    for _ in 0..nblocks {
+        blocks.push(RawBlock {
+            block_id: c.u8()?,
+            fork_flags: c.u8()?,
+            data_length: c.u16()?,
+            image_length: c.u16()?,
+            hole_offset: c.u16()?,
+            hole_length: c.u16()?,
+            bimg_info: c.u8()?,
+            spc_node: c.u32()?,
+            db_node: c.u32()?,
+            rel_node: c.u32()?,
+            block_no: c.u32()?,
+            image: c.bytes()?,
+            data: c.bytes()?,
+        });
+    }
+    Ok(RawRecord {
+        rm,
+        info,
+        source_lsn,
+        page_magic,
+        main_data,
+        blocks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,6 +1074,62 @@ mod tests {
         match r.next().await.unwrap().unwrap() {
             SpillEntry::ToastDelete(d2) => assert_eq!(d2, d),
             other => panic!("expected ToastDelete, got {other:?}"),
+        }
+        assert!(r.next().await.unwrap().is_none());
+        r.unlink().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn round_trip_raw_record() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let mut w = store.writer(9, 0x300).await.unwrap();
+        let raw = RawRecord {
+            rm: 10,
+            info: 0x80,
+            source_lsn: 0x4242,
+            page_magic: 0xD114,
+            main_data: vec![1, 0, 8],
+            blocks: vec![RawBlock {
+                block_id: 0,
+                fork_flags: 0x20,
+                data_length: 4,
+                image_length: 100,
+                hole_offset: 24,
+                hole_length: 7000,
+                bimg_info: 0x05,
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 24680,
+                block_no: 3,
+                image: vec![0xAB; 100],
+                data: vec![1, 2, 3, 4],
+            }],
+        };
+        w.write(&SpillEntry::Raw(Box::new(raw.clone())))
+            .await
+            .unwrap();
+        let mut r = w.finish().await.unwrap();
+        match r.next().await.unwrap().unwrap() {
+            SpillEntry::Raw(got) => {
+                assert_eq!(*got, raw);
+                let rec = got.to_xlog_record();
+                assert_eq!(rec.header.resource_manager_id, 10);
+                assert_eq!(rec.header.info, 0x80);
+                assert_eq!(rec.blocks.len(), 1);
+                assert_eq!(rec.blocks[0].header.location.block_no, 3);
+                assert_eq!(rec.blocks[0].header.image_header.hole_length, 7000);
+                assert_eq!(&*rec.main_data, &[1, 0, 8]);
+                assert_eq!(
+                    got.rfn(),
+                    Some(RelFileNode {
+                        spc_node: 1663,
+                        db_node: 5,
+                        rel_node: 24680,
+                    })
+                );
+            }
+            other => panic!("expected Raw, got {other:?}"),
         }
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();

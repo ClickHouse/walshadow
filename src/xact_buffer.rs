@@ -36,7 +36,7 @@
 //! Spill-to-ClickHouse (Option B) is deferred; v1 is local-disk-only.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,8 +46,9 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 use walrus::pg::backup::format_pg_lsn;
-use walrus::pg::walparser::RmId;
+use walrus::pg::walparser::{RelFileNode, RmId};
 
+use crate::ch_emitter::EmitterStats;
 use crate::decoder_sink::{DecoderSinkError, DecoderStats, TupleObserver};
 use crate::filter::Route;
 use crate::heap_decoder::{
@@ -56,9 +57,11 @@ use crate::heap_decoder::{
 use crate::pipeline::decode::RelCache;
 use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent, ShadowCatalog};
-use crate::spill::{SpillEntry, SpillError, SpillReader, SpillStore, SpillWriter, ToastChunk};
-use crate::toast::{ChunkMap, ToastResolver};
-use crate::toast_tid::TidEvent;
+use crate::spill::{
+    RawRecord, SpillEntry, SpillError, SpillReader, SpillStore, SpillWriter, ToastChunk,
+    ToastDelete,
+};
+use crate::toast::{ChunkMap, ToastResolver, ToastRow};
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
 use std::pin::Pin;
@@ -331,6 +334,7 @@ fn entry_lsn(e: &SpillEntry) -> u64 {
         SpillEntry::Heap(h) => h.source_lsn,
         SpillEntry::Chunk(c) => c.source_lsn,
         SpillEntry::ToastDelete(d) => d.source_lsn,
+        SpillEntry::Raw(r) => r.source_lsn,
     }
 }
 
@@ -367,6 +371,14 @@ pub enum XactBufferError {
     },
     #[error("toast decompression: {0}")]
     Detoast(String),
+    /// Stashed set resolved to a toast heap without its `XLOG_SMGR_CREATE`
+    /// marker: observation began mid-xact, so the generation cannot prove
+    /// completeness and a silent partial decode would leave the mirror
+    /// unauditable. Fail closed; operator takes a fresh snapshot
+    #[error(
+        "toast generation for rel {relid} observed without XLOG_SMGR_CREATE marker; fresh snapshot required"
+    )]
+    IncompleteToastGeneration { relid: u32 },
 }
 
 impl From<XactBufferError> for SinkError {
@@ -438,16 +450,22 @@ impl XactBufferStats {
 /// One non-tuple item interleaved into a committed xact's drain, ordered by
 /// `source_lsn`. Heap tuples ride the sibling `heaps` vec (batched for the
 /// decode pool); a `DrainEntry` is applied in WAL order *between* heap
-/// segments. `Catalog` is DDL the applicator fences on. The runtime-config
-/// work (`plans/future/runtime_config_from_pg.md` §3, §6) extends this with
-/// `Config`/`Signal`, which flow through the same per-xid queue and so inherit
-/// the merge tie-break: a control event sorts before a heap at equal LSN.
+/// segments. `Catalog` fences DDL, `Config` refreshes runtime mapping,
+/// `ToastBarrier` closes rewrite generations. All inherit merge tie-break:
+/// control event sorts before heap at equal LSN.
 #[derive(Debug, Clone)]
 pub enum DrainEntry {
     Catalog(SchemaEvent),
     /// Source-PG config-table write, applied at its position to the resolver
     /// so trailing rows in the same xact route against the post-config shape.
     Config(ConfigEvent),
+    /// Residual `O - B` deaths for one resolved rewrite generation, queued
+    /// at commit LSN so it drains after every stashed birth. Applied via
+    /// [`ToastResolver::rewrite_barrier`] once the generation's rows are put.
+    ToastBarrier {
+        toast_relid: u32,
+        marker_lsn: u64,
+    },
 }
 
 struct XactState {
@@ -460,9 +478,13 @@ struct XactState {
     /// `None` until first eviction
     spill: Option<SpillWriter>,
     spill_bytes: u64,
-    /// source_lsn ASC. Not spilled: events carry rich `RelDescriptor`
-    /// data a spill format would duplicate, and DDL per xact is rare
+    /// source_lsn ASC. Not spilled: typed control state would duplicate
+    /// catalog/config encodings; events per xact stay small
     events: Vec<(u64, DrainEntry)>,
+    /// Filenodes this xact wrote that were invisible at record time
+    /// (same-xact CREATE / TRUNCATE / rewrite generations, or markerless
+    /// tracking). Resolved at commit via `relation_at(rfn, commit_lsn)`.
+    stash_rfns: HashSet<RelFileNode>,
     /// Per-txn `txn` span; duration = WAL-record→durable latency.
     span: tracing::Span,
     /// Child of `span` covering first-buffered→COMMIT-observed (parked-for-
@@ -646,6 +668,7 @@ impl XactState {
             spill: None,
             spill_bytes: 0,
             events: Vec::new(),
+            stash_rfns: HashSet::new(),
             span,
             wait_span,
         }
@@ -668,6 +691,7 @@ fn approximate_size(entry: &SpillEntry) -> usize {
         }
         SpillEntry::Chunk(c) => std::mem::size_of::<ToastChunk>() + c.chunk_data.len(),
         SpillEntry::ToastDelete(_) => std::mem::size_of::<crate::spill::ToastDelete>(),
+        SpillEntry::Raw(r) => r.approx_bytes(),
     }
 }
 
@@ -742,11 +766,115 @@ impl PendingDurable {
     }
 }
 
+/// Backstop on remembered `XLOG_SMGR_CREATE` markers (~20 B each). Markers
+/// are consumed at their xact's commit resolution; leftovers come from
+/// xid-less creates that never see stashed writes, so the cap only guards
+/// against pathological churn
+const MARKER_CAP: usize = 65536;
+
+/// Commit-time verdict for one stashed filenode
+#[derive(Debug, Clone)]
+pub enum StashOutcome {
+    /// Resolved toast heap: decode stashed records at drain
+    Toast(Arc<RelDescriptor>),
+    /// Resolved ordinary heap/index: decode stays fenced off (lower-bound
+    /// `relation_at` can return a later same-filenode shape), counted
+    Skip,
+}
+
+/// Resolution map for a finishing tree; filenodes absent from `outcomes`
+/// discard their records (dropped or rotated away, end-state-neutral)
+#[derive(Default)]
+pub struct StashResolution {
+    outcomes: HashMap<RelFileNode, StashOutcome>,
+    stats: Option<Arc<EmitterStats>>,
+}
+
+/// Resolve the finishing tree's stashed filenodes with
+/// `relation_at(rfn, commit_lsn)` (replay-gated so shadow reflects the
+/// commit), install outcomes for the imminent drain, and queue `O - B`
+/// barriers for marker-proven toast generations. A toast heap without its
+/// marker fails closed ([`XactBufferError::IncompleteToastGeneration`]).
+/// Callers drain the catalog's schema-event channel afterwards:
+/// resolution can surface `Added` for newly visible rels.
+pub async fn resolve_stash(
+    buffer: &Arc<Mutex<XactBuffer>>,
+    catalog: &Arc<Mutex<ShadowCatalog>>,
+    top_xid: u32,
+    subxids: &[u32],
+    commit_lsn: u64,
+    stats: Arc<EmitterStats>,
+) -> std::result::Result<(), XactBufferError> {
+    let rfns = {
+        let buf = buffer.lock().await;
+        let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
+        xids.push(top_xid);
+        xids.extend_from_slice(subxids);
+        buf.stash_candidates(&xids)
+    };
+    if rfns.is_empty() {
+        return Ok(());
+    }
+    let mut outcomes: HashMap<RelFileNode, StashOutcome> = HashMap::new();
+    let mut barriers: Vec<(u32, u64)> = Vec::new();
+    for rfn in &rfns {
+        let resolved = {
+            let mut cat = catalog.lock().await;
+            cat.relation_at(*rfn, commit_lsn).await
+        };
+        match resolved {
+            Ok(rel) if rel.kind == 't' => {
+                let marker = buffer.lock().await.marker_lsn(*rfn);
+                let Some(marker_lsn) = marker else {
+                    return Err(XactBufferError::IncompleteToastGeneration { relid: rel.oid });
+                };
+                barriers.push((rel.oid, marker_lsn));
+                outcomes.insert(*rfn, StashOutcome::Toast(rel));
+            }
+            Ok(_) => {
+                outcomes.insert(*rfn, StashOutcome::Skip);
+            }
+            // Dropped or rotated away by this xid or a later commit already
+            // replayed; AEL supersession makes the discard end-state-neutral
+            Err(CatalogError::NotFoundByFilenode(_)) | Err(CatalogError::ForeignDatabase(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut buf = buffer.lock().await;
+    for (toast_relid, marker_lsn) in barriers {
+        buf.on_toast_barrier(top_xid, commit_lsn, toast_relid, marker_lsn);
+    }
+    buf.forget_markers(&rfns);
+    buf.install_stash_resolution(
+        top_xid,
+        StashResolution {
+            outcomes,
+            stats: Some(stats),
+        },
+    );
+    Ok(())
+}
+
 /// Per-xact + TOAST buffer with spill-to-disk overflow, keyed by `xid`
 pub struct XactBuffer {
     config: XactBufferConfig,
     store: SpillStore,
     inflight: HashMap<u32, XactState>,
+    /// `XLOG_SMGR_CREATE` main-fork markers by filenode. Global, not
+    /// per-xid: the record can precede its xact's xid assignment (header
+    /// carries `GetCurrentTransactionIdIfAny`). Presence proves every
+    /// record on that filenode was observable, gating both stash admission
+    /// and the `O - B` completeness claim; the LSN is the barrier's as-of
+    /// point for `O`
+    markers: HashMap<RelFileNode, u64>,
+    /// Insertion order for the cap prune, tagged with each generation's
+    /// marker lsn: eviction skips entries whose lsn no longer matches
+    /// `markers` (consumed out-of-band, or filenode reused by a later
+    /// generation holding its own queue entry)
+    marker_order: VecDeque<(RelFileNode, u64)>,
+    /// Commit-time resolution installed by [`resolve_stash`] just before
+    /// the drain pops it, keyed by top xid
+    pending_stash: HashMap<u32, StashResolution>,
     /// Committed transactions waiting for durable acknowledgment
     pending_durable: PendingDurable,
     bytes_in_memory: usize,
@@ -772,6 +900,9 @@ impl XactBuffer {
             config,
             store,
             inflight: HashMap::new(),
+            markers: HashMap::new(),
+            marker_order: VecDeque::new(),
+            pending_stash: HashMap::new(),
             pending_durable: PendingDurable::default(),
             bytes_in_memory: 0,
             stats: XactBufferStats::default(),
@@ -841,6 +972,13 @@ impl XactBuffer {
                             last_lsn = last_lsn.max(d.source_lsn);
                             rels.insert((0, d.toast_relid));
                         }
+                        SpillEntry::Raw(r) => {
+                            chunk_count += 1;
+                            last_lsn = last_lsn.max(r.source_lsn);
+                            if let Some(rfn) = r.rfn() {
+                                rels.insert((rfn.db_node, rfn.rel_node));
+                            }
+                        }
                     }
                 }
                 for (lsn, _) in &st.events {
@@ -891,9 +1029,9 @@ impl XactBuffer {
         self.absorb(xid, first_lsn, entry).await
     }
 
-    /// TID-keyed toast DELETE, resolved to a dead value at commit
-    /// ([`crate::toast_tid`]). Buffered like chunks so aborts discard it
-    /// and the drain merge keeps WAL order against same-xact births.
+    /// TID-keyed toast DELETE, a store tombstone row at commit drain.
+    /// Buffered like chunks so aborts discard it and the drain merge keeps
+    /// WAL order against same-xact births.
     pub async fn on_toast_delete(
         &mut self,
         delete: crate::spill::ToastDelete,
@@ -907,23 +1045,111 @@ impl XactBuffer {
     /// Lazily insert the xid's state (adopting its `txn` span) and queue a
     /// control event at `source_lsn` for the commit-drain k-way merge.
     fn push_drain_entry(&mut self, xid: u32, source_lsn: u64, entry: DrainEntry) {
+        self.state_for(xid, source_lsn)
+            .events
+            .push((source_lsn, entry));
+    }
+
+    /// Get-or-create the xid's state, adopting its `txn` span
+    fn state_for(&mut self, xid: u32, first_lsn: u64) -> &mut XactState {
         let is_new = !self.inflight.contains_key(&xid);
-        let registry = &self.span_registry;
-        let st = self.inflight.entry(xid).or_insert_with(|| {
-            let span = registry.adopt(xid).unwrap_or_else(|| {
-                if registry.is_sampled(xid) {
-                    new_txn_span(xid, source_lsn)
-                } else {
-                    tracing::Span::none()
-                }
-            });
-            XactState::new(source_lsn, span)
-        });
-        st.events.push((source_lsn, entry));
         if is_new {
             self.stats.xacts_active += 1;
             self.stats.xacts_total += 1;
         }
+        let registry = &self.span_registry;
+        self.inflight.entry(xid).or_insert_with(|| {
+            let span = registry.adopt(xid).unwrap_or_else(|| {
+                if registry.is_sampled(xid) {
+                    new_txn_span(xid, first_lsn)
+                } else {
+                    tracing::Span::none()
+                }
+            });
+            XactState::new(first_lsn, span)
+        })
+    }
+
+    /// Record a main-fork `XLOG_SMGR_CREATE`. With a valid xid the filenode
+    /// also joins that xact's stash candidates, so a zero-record generation
+    /// (rewrite of an empty toast heap) still resolves at commit and emits
+    /// its residual `O - B` deaths
+    pub fn note_smgr_create(&mut self, xid: u32, rfn: RelFileNode, lsn: u64) {
+        if self.markers.insert(rfn, lsn) != Some(lsn) {
+            self.marker_order.push_back((rfn, lsn));
+            while self.marker_order.len() > MARKER_CAP {
+                if let Some((old, old_lsn)) = self.marker_order.pop_front()
+                    && self.markers.get(&old) == Some(&old_lsn)
+                {
+                    self.markers.remove(&old);
+                }
+            }
+        }
+        if xid != 0 {
+            self.state_for(xid, lsn).stash_rfns.insert(rfn);
+        }
+    }
+
+    pub fn marker_lsn(&self, rfn: RelFileNode) -> Option<u64> {
+        self.markers.get(&rfn).copied()
+    }
+
+    /// Stash raw decode inputs for a record whose filenode was invisible at
+    /// record time; rides the per-xid spill so subxact/abort discard and
+    /// commit-merge ordering come for free
+    pub async fn stash_raw(
+        &mut self,
+        xid: u32,
+        raw: RawRecord,
+    ) -> std::result::Result<(), XactBufferError> {
+        let Some(rfn) = raw.rfn() else {
+            return Ok(());
+        };
+        let lsn = raw.source_lsn;
+        self.state_for(xid, lsn).stash_rfns.insert(rfn);
+        self.absorb(xid, lsn, SpillEntry::Raw(Box::new(raw))).await
+    }
+
+    /// Track an unresolvable filenode without payload: no marker means the
+    /// set can't prove completeness, so entries aren't kept, but commit
+    /// resolution must still fail closed if the filenode turns out toast
+    pub fn track_unresolvable(&mut self, xid: u32, lsn: u64, rfn: RelFileNode) {
+        self.state_for(xid, lsn).stash_rfns.insert(rfn);
+    }
+
+    /// Fast path for the decoder: a filenode already stashed under `xid`
+    /// (or marker-registered to it) can never resolve for that xact's own
+    /// records — its pg_class row is MVCC-invisible until commit — so the
+    /// replay-gated lookup is skippable
+    pub fn is_stash_candidate(&self, xid: u32, rfn: RelFileNode) -> bool {
+        self.inflight
+            .get(&xid)
+            .is_some_and(|st| st.stash_rfns.contains(&rfn))
+    }
+
+    /// Union of stash candidates across the finishing tree
+    pub fn stash_candidates(&self, xids: &[u32]) -> Vec<RelFileNode> {
+        let mut out: Vec<RelFileNode> = Vec::new();
+        for x in xids {
+            if let Some(st) = self.inflight.get(x) {
+                out.extend(st.stash_rfns.iter().copied());
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Drop consumed markers post-resolution (abort drops via its states)
+    pub fn forget_markers(&mut self, rfns: &[RelFileNode]) {
+        for rfn in rfns {
+            self.markers.remove(rfn);
+        }
+    }
+
+    /// Install commit-time resolution for `top_xid`'s imminent drain
+    pub fn install_stash_resolution(&mut self, top_xid: u32, res: StashResolution) {
+        self.pending_stash.insert(top_xid, res);
     }
 
     /// Drains in `source_lsn` order at commit, so a DDL's `Added`/`Changed`
@@ -938,6 +1164,25 @@ impl XactBuffer {
         self.push_drain_entry(xid, source_lsn, DrainEntry::Config(event));
     }
 
+    /// Queue a rewrite generation's residual-death barrier at commit LSN,
+    /// after every stashed birth in the merge order
+    pub fn on_toast_barrier(
+        &mut self,
+        xid: u32,
+        commit_lsn: u64,
+        toast_relid: u32,
+        marker_lsn: u64,
+    ) {
+        self.push_drain_entry(
+            xid,
+            commit_lsn,
+            DrainEntry::ToastBarrier {
+                toast_relid,
+                marker_lsn,
+            },
+        );
+    }
+
     async fn absorb(
         &mut self,
         xid: u32,
@@ -945,32 +1190,17 @@ impl XactBuffer {
         entry: SpillEntry,
     ) -> std::result::Result<(), XactBufferError> {
         let sz = approximate_size(&entry);
-        let is_new = !self.inflight.contains_key(&xid);
-        let registry = &self.span_registry;
-        let st = self.inflight.entry(xid).or_insert_with(|| {
-            let span = registry.adopt(xid).unwrap_or_else(|| {
-                if registry.is_sampled(xid) {
-                    new_txn_span(xid, first_lsn)
-                } else {
-                    tracing::Span::none()
-                }
-            });
-            XactState::new(first_lsn, span)
-        });
+        let st = self.state_for(xid, first_lsn);
         if let Some(spill) = st.spill.as_mut() {
             // Already spilling: append straight to disk
             spill.write(&entry).await?;
             let bc = spill.byte_count();
-            self.stats.spill_bytes_active += bc - st.spill_bytes;
-            st.spill_bytes = bc;
+            let prev = std::mem::replace(&mut st.spill_bytes, bc);
+            self.stats.spill_bytes_active += bc - prev;
         } else {
             st.in_mem.push(entry);
             st.in_mem_bytes += sz;
             self.bytes_in_memory += sz;
-        }
-        if is_new {
-            self.stats.xacts_active += 1;
-            self.stats.xacts_total += 1;
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
         self.maybe_evict().await?;
@@ -1027,6 +1257,8 @@ impl XactBuffer {
     async fn open_drain(
         &mut self,
         states: Vec<XactState>,
+        collect_rows: bool,
+        stash: StashResolution,
     ) -> std::result::Result<MergedDrain, XactBufferError> {
         let mut gauge = ResidentGauge {
             cur: self.drain_resident.clone(),
@@ -1057,7 +1289,10 @@ impl XactBuffer {
             events,
             chunks: ChunkMap::new(),
             chunk_bytes: 0,
-            tid_events: Vec::new(),
+            collect_rows,
+            rows: Vec::new(),
+            row_bytes: 0,
+            stash,
             gauge,
         })
     }
@@ -1170,8 +1405,14 @@ impl XactBuffer {
         // older than in-mem"). Dispatch happens per pick, so peak residency
         // is merge heads + the chunk map — not the whole decoded xact that
         // spilled precisely because it exceeded the buffer budget.
-        let mut drain = self.open_drain(states).await?;
+        let stash = self.pending_stash.remove(&top_xid).unwrap_or_default();
+        let mut drain = self
+            .open_drain(states, resolver.stores_chunks(), stash)
+            .await?;
         let mut rows: u64 = 0;
+        // Applied after the store put below: residuals read the mirror, so
+        // this xact's births must land first
+        let mut toast_barriers: Vec<(u32, u64)> = Vec::new();
         while let Some(item) = drain.next().await? {
             match item {
                 MergeItem::Event(ev) => match &ev {
@@ -1185,6 +1426,10 @@ impl XactBuffer {
                         .instrument(drain_span.clone())
                         .await
                         .map_err(|e| XactBufferError::Observer(e.to_string()))?,
+                    DrainEntry::ToastBarrier {
+                        toast_relid,
+                        marker_lsn,
+                    } => toast_barriers.push((*toast_relid, *marker_lsn)),
                 },
                 MergeItem::Heap(mut heap) => {
                     detoast_heap(&mut heap, &[drain.chunks()], catalog, false, resolver).await?;
@@ -1207,6 +1452,18 @@ impl XactBuffer {
             }
         }
         drain_span.record("rows", rows);
+        // Put store rows before returning: a later commit's referrer may fetch
+        let store_rows = drain.take_rows();
+        resolver
+            .put(&store_rows)
+            .await
+            .map_err(|e| XactBufferError::Detoast(format!("toast store put: {e}")))?;
+        for (toast_relid, marker_lsn) in toast_barriers {
+            resolver
+                .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
+                .await
+                .map_err(|e| XactBufferError::Detoast(format!("toast rewrite barrier: {e}")))?;
+        }
         // Unlink spill files only now, after dispatch: an observer error
         // above abandons the partially consumed reader on disk (startup
         // wipe + redecode-from-ack cover replay).
@@ -1263,6 +1520,9 @@ impl XactBuffer {
         commit_ts: i64,
         commit_lsn: u64,
         subxids: &[u32],
+        // `resolver.stores_chunks()` at the caller: collect store rows only
+        // when a put consumer exists
+        collect_rows: bool,
     ) -> std::result::Result<CommittedDrain, XactBufferError> {
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
         xids.push(top_xid);
@@ -1295,7 +1555,8 @@ impl XactBuffer {
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
-        let merged = self.open_drain(states).await?;
+        let stash = self.pending_stash.remove(&top_xid).unwrap_or_default();
+        let merged = self.open_drain(states, collect_rows, stash).await?;
         self.stats.committed_xacts_total += 1;
         Ok(CommittedDrain {
             commit_ts,
@@ -1368,6 +1629,11 @@ impl XactBuffer {
             // Close the per-txn span as aborted; nothing ships, so it has
             // no commit.drain child — just a short span tagged accordingly.
             st.span.record("outcome", "aborted");
+            // Aborted creates leave their filenodes forever unresolvable;
+            // drop the markers with the states
+            for rfn in &st.stash_rfns {
+                self.markers.remove(rfn);
+            }
             any = true;
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
@@ -1517,10 +1783,12 @@ struct MergedDrain {
     events: Vec<VecDeque<(u64, DrainEntry)>>,
     chunks: ChunkMap,
     chunk_bytes: usize,
-    // Births (per-chunk TID) + deaths (toast DELETEs) folded in WAL order,
-    // sealed per slice alongside `chunks`. Applied to the TID tracker at the
-    // store-put site; the serial `commit` path never seals so they stay moot.
-    tid_events: Vec<TidEvent>,
+    // Skip duplicated chunk bodies when no store consumes rows
+    collect_rows: bool,
+    rows: Vec<ToastRow>,
+    row_bytes: usize,
+    /// Commit-time verdicts for stashed filenodes; empty when nothing stashed
+    stash: StashResolution,
     gauge: ResidentGauge,
 }
 
@@ -1561,36 +1829,68 @@ impl MergedDrain {
                         .expect("just peeked head");
                     match entry {
                         SpillEntry::Heap(h) => return Ok(Some(MergeItem::Heap(h))),
-                        SpillEntry::Chunk(c) => {
-                            // Per-chunk TID birth keeps sibling deletes
-                            // resolvable. offnum is 1-based in PG; 0 marks a
-                            // chunk without a TID (defensive, unexpected shape)
-                            if c.offnum != 0 {
-                                self.tid_events.push(TidEvent::Birth {
-                                    toast_relid: c.toast_relid,
-                                    blkno: c.blkno,
-                                    offnum: c.offnum,
-                                    value_id: c.value_id,
-                                });
-                            }
-                            self.chunk_bytes += c.chunk_data.len();
-                            self.gauge.add(c.chunk_data.len());
-                            self.chunks
-                                .entry((c.toast_relid, c.value_id))
-                                .or_default()
-                                .insert(c.chunk_seq, c.chunk_data);
-                        }
-                        // TID-keyed DELETE, resolved to a dead value at the
-                        // store-put site; never surfaces as a heap.
-                        SpillEntry::ToastDelete(d) => self.tid_events.push(TidEvent::Death {
-                            toast_relid: d.toast_relid,
-                            blkno: d.blkno,
-                            offnum: d.offnum,
-                        }),
+                        SpillEntry::Chunk(c) => self.fold_chunk(c),
+                        SpillEntry::ToastDelete(d) => self.fold_delete(d),
+                        SpillEntry::Raw(raw) => self.fold_raw(&raw)?,
                     }
                 }
             }
         }
+    }
+
+    fn fold_chunk(&mut self, c: ToastChunk) {
+        // InvalidOffsetNumber cannot key mirror rows
+        if self.collect_rows && c.offnum != 0 {
+            self.row_bytes += c.chunk_data.len();
+            self.gauge.add(c.chunk_data.len());
+            self.rows.push(ToastRow::from_chunk(&c));
+        }
+        self.chunk_bytes += c.chunk_data.len();
+        self.gauge.add(c.chunk_data.len());
+        self.chunks
+            .entry((c.toast_relid, c.value_id))
+            .or_default()
+            .insert(c.chunk_seq, c.chunk_data);
+    }
+
+    fn fold_delete(&mut self, d: ToastDelete) {
+        if self.collect_rows {
+            self.rows.push(ToastRow::tombstone(&d));
+        }
+    }
+
+    /// Decode a stashed record against its commit-time verdict: toast heaps
+    /// fold chunks/tombstones into the same maps as live-path entries (so
+    /// same-xact referrers detoast and mirror rows flow), fenced heaps and
+    /// unresolvable filenodes count and drop
+    fn fold_raw(&mut self, raw: &RawRecord) -> std::result::Result<(), XactBufferError> {
+        let Some(rfn) = raw.rfn() else {
+            return Ok(());
+        };
+        let bump = |c: &dyn Fn(&EmitterStats) -> &AtomicU64| {
+            if let Some(s) = &self.stash.stats {
+                c(s).fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        let rel = match self.stash.outcomes.get(&rfn) {
+            Some(StashOutcome::Toast(rel)) => rel.clone(),
+            Some(StashOutcome::Skip) => {
+                bump(&|s| &s.toast_stash_skipped);
+                return Ok(());
+            }
+            None => {
+                bump(&|s| &s.toast_stash_discarded);
+                return Ok(());
+            }
+        };
+        bump(&|s| &s.toast_stash_decoded);
+        for op in decode_stashed_toast(raw, &rel)? {
+            match op {
+                StashedToastOp::Chunk(c) => self.fold_chunk(c),
+                StashedToastOp::Delete(d) => self.fold_delete(d),
+            }
+        }
+        Ok(())
     }
 
     fn chunks(&self) -> &ChunkMap {
@@ -1604,10 +1904,10 @@ impl MergedDrain {
         std::mem::take(&mut self.chunks)
     }
 
-    /// TID births/deaths accumulated since the last take, sealed with the
-    /// slice (WAL order preserved). Not gauged: each event is a few bytes.
-    fn take_tid_events(&mut self) -> Vec<TidEvent> {
-        std::mem::take(&mut self.tid_events)
+    fn take_rows(&mut self) -> Vec<ToastRow> {
+        self.gauge.sub(self.row_bytes);
+        self.row_bytes = 0;
+        std::mem::take(&mut self.rows)
     }
 
     /// Every head empty and every event queue drained.
@@ -1631,6 +1931,13 @@ impl MergedDrain {
     }
 }
 
+/// Event ordered before `heaps[heap_idx]`, after `new_rows[..row_idx]`
+pub struct OrderedEvent {
+    pub heap_idx: usize,
+    pub row_idx: usize,
+    pub event: DrainEntry,
+}
+
 /// One bounded slice of a committed xact for the parallel pipeline. Heaps
 /// still TOAST-toasted; the decode pool handles detoast + routing.
 /// Non-empty `ordered_events` (or a `HeapOp::Truncate` heap) makes the
@@ -1638,23 +1945,17 @@ impl MergedDrain {
 pub struct DrainedBatch {
     /// `source_lsn` ASC within the slice; later slices strictly follow.
     pub heaps: Vec<DecodedHeap>,
-    /// Each entry sorts before `heaps[i]`, `i` slice-local.
-    /// `DrainEntry::Catalog` + `Config` today, Signal per runtime-config plan
-    pub ordered_events: Vec<(usize, DrainEntry)>,
+    pub ordered_events: Vec<OrderedEvent>,
     /// Chunk generations sealed so far, oldest first. A chunk's WAL position
     /// precedes its referrer, so every heap's value lives in exactly one
     /// generation sealed no later than this slice; slices share payloads via
     /// `Arc` instead of copying per batch, and each generation is immutable
     /// once sealed (decode pool reads while later slices load).
     pub chunks: Vec<Arc<ChunkMap>>,
-    /// Generation sealed with this slice (last element of `chunks`) — the
-    /// only chunks not yet handed out, the toast-store put target.
-    pub new_chunks: Option<Arc<ChunkMap>>,
-    /// TID births/deaths sealed with this slice, WAL-ordered. Journaled to
-    /// the TID tracker after `new_chunks` is durable (a birth must not precede
-    /// its chunks). Present even when `new_chunks` is None: a death can arrive
-    /// in a chunk-free slice.
-    pub new_tid_events: Vec<TidEvent>,
+    /// WAL-ordered births and tombstones, empty without store
+    pub new_rows: Vec<ToastRow>,
+    /// `new_rows` cursor for each TRUNCATE heap
+    pub truncate_rows: Vec<usize>,
     /// Last slice of the commit. Only its seq may publish `commit_lsn` in
     /// the ack (`register` vs `register_partial`): an earlier slice
     /// publishing would claim durability for rows still in flight.
@@ -1687,40 +1988,42 @@ impl CommittedDrain {
             return Ok(None);
         };
         let mut heaps: Vec<DecodedHeap> = Vec::new();
-        let mut ordered_events: Vec<(usize, DrainEntry)> = Vec::new();
+        let mut ordered_events: Vec<OrderedEvent> = Vec::new();
+        let mut truncate_rows: Vec<usize> = Vec::new();
         let mut bytes = 0usize;
         while heaps.len() < max_rows.max(1) && bytes < max_bytes.max(1) {
             match m.next().await? {
                 None => break,
-                Some(MergeItem::Event(ev)) => ordered_events.push((heaps.len(), ev)),
+                Some(MergeItem::Event(event)) => ordered_events.push(OrderedEvent {
+                    heap_idx: heaps.len(),
+                    row_idx: m.rows.len(),
+                    event,
+                }),
                 Some(MergeItem::Heap(h)) => {
+                    if h.op == HeapOp::Truncate {
+                        truncate_rows.push(m.rows.len());
+                    }
                     bytes += h.approx_bytes();
                     heaps.push(*h);
                 }
             }
         }
         let is_final = m.is_exhausted();
-        let new_chunks = {
-            let sealed = m.take_chunks();
-            (!sealed.is_empty()).then(|| Arc::new(sealed))
-        };
-        let new_tid_events = m.take_tid_events();
-        if let Some(g) = &new_chunks {
-            self.generations.push(g.clone());
+        let sealed = m.take_chunks();
+        let sealed_empty = sealed.is_empty();
+        if !sealed_empty {
+            self.generations.push(Arc::new(sealed));
         }
-        if heaps.is_empty()
-            && ordered_events.is_empty()
-            && new_chunks.is_none()
-            && new_tid_events.is_empty()
-        {
+        let new_rows = m.take_rows();
+        if heaps.is_empty() && ordered_events.is_empty() && sealed_empty && new_rows.is_empty() {
             return Ok(None);
         }
         Ok(Some(DrainedBatch {
             heaps,
             ordered_events,
             chunks: self.generations.clone(),
-            new_chunks,
-            new_tid_events,
+            new_rows,
+            truncate_rows,
             is_final,
         }))
     }
@@ -1750,8 +2053,10 @@ pub(crate) async fn detoast_heap(
     pooled: bool,
     resolver: &ToastResolver,
 ) -> std::result::Result<(), XactBufferError> {
-    let needs = tuple_needs_detoast(heap.new.as_ref()) || tuple_needs_detoast(heap.old.as_ref());
-    if !needs {
+    let mut keys: Vec<(u32, u32)> = Vec::new();
+    collect_toast_keys(heap.new.as_ref(), &mut keys);
+    collect_toast_keys(heap.old.as_ref(), &mut keys);
+    if keys.is_empty() {
         return Ok(());
     }
     let rel: Arc<RelDescriptor> = {
@@ -1767,9 +2072,6 @@ pub(crate) async fn detoast_heap(
     // mode (no store) leaves `extra` empty; a miss then NULL/default-fills.
     let mut extra = ChunkMap::new();
     if resolver.stores_chunks() {
-        let mut keys: Vec<(u32, u32)> = Vec::new();
-        collect_toast_keys(heap.new.as_ref(), &mut keys);
-        collect_toast_keys(heap.old.as_ref(), &mut keys);
         for (relid, value_id) in keys {
             if chunk_maps
                 .iter()
@@ -1784,24 +2086,13 @@ pub(crate) async fn detoast_heap(
                 .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?;
         }
     }
-    let mut maps: Vec<&ChunkMap> = chunk_maps.to_vec();
-    maps.push(&extra);
     if let Some(t) = heap.new.as_mut() {
-        detoast_tuple(t, &rel, &maps, resolver)?;
+        detoast_tuple(t, &rel, chunk_maps, &extra, resolver)?;
     }
     if let Some(t) = heap.old.as_mut() {
-        detoast_tuple(t, &rel, &maps, resolver)?;
+        detoast_tuple(t, &rel, chunk_maps, &extra, resolver)?;
     }
     Ok(())
-}
-
-fn tuple_needs_detoast(t: Option<&crate::heap_decoder::DecodedTuple>) -> bool {
-    let Some(t) = t else {
-        return false;
-    };
-    t.columns
-        .iter()
-        .any(|c| matches!(c, Some(ColumnValue::ExternalToast(_))))
 }
 
 /// Append `(va_toastrelid, va_valueid)` for every on-disk toast pointer.
@@ -1819,9 +2110,12 @@ fn collect_toast_keys(t: Option<&crate::heap_decoder::DecodedTuple>, out: &mut V
 fn detoast_tuple(
     t: &mut crate::heap_decoder::DecodedTuple,
     rel: &RelDescriptor,
-    maps: &[&ChunkMap],
+    xact_maps: &[&ChunkMap],
+    extra: &ChunkMap,
     resolver: &ToastResolver,
 ) -> std::result::Result<(), XactBufferError> {
+    let mut maps: Vec<&ChunkMap> = xact_maps.to_vec();
+    maps.push(extra);
     for (idx, col) in t.columns.iter_mut().enumerate() {
         let Some(ColumnValue::ExternalToast(p)) = col else {
             continue;
@@ -1829,22 +2123,39 @@ fn detoast_tuple(
         // `ToastPointer: Copy` frees the borrow on `col` before reassign
         let p: ToastPointer = *p;
         let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
-        match try_reassemble(&p, maps)? {
-            Some(raw) => *col = Some(detoasted_value(raw, type_oid)),
+        let key = (p.va_toastrelid, p.va_valueid);
+        match try_reassemble(&p, &maps)? {
+            Reassembled::Bytes(raw) => *col = Some(detoasted_value(raw, type_oid)),
             // Disabled mode: surface the unresolvable value as NULL/default
             // downstream (`append_default`), counted, never an error.
-            None if resolver.fill_on_miss() => {
+            Reassembled::Missing if resolver.fill_on_miss() => {
                 resolver.note_filled_default();
                 *col = Some(ColumnValue::Null);
             }
-            // Active store still couldn't rebuild it: a real chunk gap.
-            None => {
+            // In-xact chunks present but gapped or short: decode bug,
+            // surfaced loud.
+            outcome if xact_maps.iter().any(|m| m.contains_key(&key)) => {
                 resolver.note_fetch_miss();
-                return Err(XactBufferError::MissingToastChunk {
-                    toast_relid: p.va_toastrelid,
-                    value_id: p.va_valueid,
-                    missing: first_missing_seq(&p, maps),
+                return Err(match outcome {
+                    Reassembled::SizeMismatch { got, want } => XactBufferError::Detoast(format!(
+                        "toast value {}/{}: chunks sum to {got} bytes, pointer says {want}",
+                        p.va_toastrelid, p.va_valueid
+                    )),
+                    _ => XactBufferError::MissingToastChunk {
+                        toast_relid: p.va_toastrelid,
+                        value_id: p.va_valueid,
+                        missing: first_missing_seq(&p, &maps),
+                    },
                 });
+            }
+            // Safe only after supersession or replayed owner TRUNCATE
+            Reassembled::Missing => {
+                resolver.note_filled_superseded();
+                *col = Some(ColumnValue::Null);
+            }
+            Reassembled::SizeMismatch { .. } => {
+                resolver.note_filled_mismatch();
+                *col = Some(ColumnValue::Null);
             }
         }
     }
@@ -1884,49 +2195,51 @@ use crate::heap_decoder::{VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress
 /// PG `VARHDRSZ`, 4-byte varlena header
 const VARHDRSZ: i32 = 4;
 
+/// Chunk coverage outcome, decompression failures remain errors
+pub(crate) enum Reassembled {
+    Bytes(Vec<u8>),
+    Missing,
+    /// Dense run failing PostgreSQL stored-size check
+    SizeMismatch {
+        got: usize,
+        want: usize,
+    },
+}
+
 /// Concatenate a value's chunks (seq 0..N dense) then decompress per the
 /// pointer's method. Looks the value up across `maps` in order (in-xact
-/// chunk map first, then a store-fetched supplement). `Ok(None)` when chunks
-/// are absent or non-dense — the caller decides fill vs error; `Err` only on
-/// a genuine decompression failure.
+/// chunk map first, then a store-fetched supplement).
 pub(crate) fn try_reassemble(
     p: &ToastPointer,
     maps: &[&ChunkMap],
-) -> std::result::Result<Option<Vec<u8>>, XactBufferError> {
+) -> std::result::Result<Reassembled, XactBufferError> {
     let key = (p.va_toastrelid, p.va_valueid);
     let Some(map) = maps.iter().find_map(|m| m.get(&key)) else {
-        return Ok(None);
+        return Ok(Reassembled::Missing);
     };
     let total: usize = map.values().map(Vec::len).sum();
     let mut concat: Vec<u8> = Vec::with_capacity(total);
     for (expected, (seq, body)) in map.iter().enumerate() {
         if *seq != expected as u32 {
-            // Gap in the 0..N run: incomplete, treat as a miss.
-            return Ok(None);
+            return Ok(Reassembled::Missing);
         }
         concat.extend_from_slice(body);
     }
-    // PG toast_fetch_datum validates the same way (src/backend/access/common/
-    // detoast.c): concatenated chunks must equal the pointer's stored size.
-    // A mismatch is generation mixing (reused va_valueid leaving stale
-    // higher-seq chunks) or corruption — loud, never a silent chimera.
     let extsize = (p.va_extinfo & VARLENA_EXTSIZE_MASK) as usize;
     if concat.len() != extsize {
-        return Err(XactBufferError::Detoast(format!(
-            "toast value {}/{}: chunks sum to {} bytes, pointer says {extsize}",
-            p.va_toastrelid,
-            p.va_valueid,
-            concat.len()
-        )));
+        return Ok(Reassembled::SizeMismatch {
+            got: concat.len(),
+            want: extsize,
+        });
     }
     let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
     if !compressed {
-        return Ok(Some(concat));
+        return Ok(Reassembled::Bytes(concat));
     }
     let method = ((p.va_extinfo >> VARLENA_EXTSIZE_BITS) & 0x3) as u8;
     let raw_len = (p.va_rawsize - VARHDRSZ).max(0) as usize;
     match decompress_varlena(method, &concat, raw_len) {
-        Some(out) => Ok(Some(out)),
+        Some(out) => Ok(Reassembled::Bytes(out)),
         None => Err(XactBufferError::Detoast(format!(
             "decompress failed (method {method}, {} bytes → {raw_len})",
             concat.len()
@@ -2081,6 +2394,23 @@ impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
                                 .await?;
                         }
                     }
+                    // Deferred resolution for filenodes invisible at record
+                    // time; installs decode verdicts + `O - B` barriers
+                    // ahead of the drain
+                    resolve_stash(
+                        &self.buffer,
+                        &self.catalog,
+                        xid,
+                        &payload.subxacts,
+                        record.source_lsn,
+                        self.resolver.stats_handle(),
+                    )
+                    .await
+                    .map_err(SinkError::from)?;
+                    // Resolution can surface Added events for newly
+                    // visible rels
+                    self.route_pending_schema_events(xid, record.source_lsn)
+                        .await?;
                     let mut buf = self.buffer.lock().await;
                     // Surfaces subxact-id mismatches between heap-record
                     // xact_id and the top's commit-record subxact list
@@ -2335,6 +2665,36 @@ impl BufferingDecoderSink {
         Ok(())
     }
 
+    /// Stash raw inputs for a record whose filenode is invisible at record
+    /// time. Marker-proven filenodes keep payload for commit-time decode
+    /// ([`resolve_stash`]); markerless ones are tracked payload-free so a
+    /// toast resolution can fail closed on the incomplete set.
+    async fn stash_invisible(
+        &mut self,
+        record: &Record<'_>,
+        rfn: walrus::pg::walparser::RelFileNode,
+    ) -> std::result::Result<(), SinkError> {
+        let xid = record.parsed.header.xact_id;
+        let mut buf = self.buffer.lock().await;
+        if buf.marker_lsn(rfn).is_some() {
+            let raw = crate::spill::RawRecord::from_parsed(
+                &record.parsed,
+                record.source_lsn,
+                record.page_magic,
+            );
+            buf.stash_raw(xid, raw).await.map_err(SinkError::from)?;
+            self.stats
+                .toast_stash_buffered
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            buf.track_unresolvable(xid, record.source_lsn, rfn);
+            self.stats
+                .catalog_not_found
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Push one `HeapOp::Truncate` per relation. TRUNCATE uniquely
     /// carries pg_class OIDs (not relfilenodes) and no block ref, so the
     /// standard `relation_at(rfn)` path doesn't fit.
@@ -2423,6 +2783,22 @@ impl RecordSink for BufferingDecoderSink {
                     return self.handle_truncate(record).await;
                 }
             }
+            // Main-fork creation marker, also Route::ToShadow: gates stash
+            // admission and proves generation completeness for the rewrite
+            // barrier (records on a filenode cannot precede its creation)
+            if rm == RmId::Smgr as u8
+                && record.parsed.header.info & 0xF0 == crate::main_data::XLOG_SMGR_CREATE
+                && let Some((rfn, fork)) =
+                    crate::main_data::parse_xl_smgr_create(&record.parsed.main_data)
+                && fork == crate::main_data::MAIN_FORKNUM
+            {
+                self.buffer.lock().await.note_smgr_create(
+                    record.parsed.header.xact_id,
+                    rfn,
+                    record.source_lsn,
+                );
+                return Ok(());
+            }
             if record.route != Route::ToDecoder {
                 return Ok(());
             }
@@ -2438,6 +2814,12 @@ impl RecordSink for BufferingDecoderSink {
             // `decode_parent` set only for the first record (holds the replay
             // gate): `catalog.gate` wraps `relation_at`, `decode` the parse.
             let txn_xid = record.parsed.header.xact_id;
+            // Known-invisible filenode for this xact (already stashed or
+            // marker-registered): its pg_class row stays MVCC-invisible
+            // until commit, so skip the replay-gated lookup per record
+            if txn_xid != 0 && self.buffer.lock().await.is_stash_candidate(txn_xid, rfn) {
+                return self.stash_invisible(record, rfn).await;
+            }
             let sampled = self
                 .span_registry
                 .as_ref()
@@ -2481,10 +2863,17 @@ impl RecordSink for BufferingDecoderSink {
                     {
                         Ok(r) => r,
                         Err(CatalogError::NotFoundByFilenode(_)) => {
-                            self.stats
-                                .catalog_not_found
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return Ok(());
+                            // Filenode invisible at record LSN: created by
+                            // this still-open xact (same-xact CREATE /
+                            // TRUNCATE / rewrite generation) or gone
+                            drop(cat);
+                            if txn_xid == 0 {
+                                self.stats
+                                    .catalog_not_found
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                return Ok(());
+                            }
+                            return self.stash_invisible(record, rfn).await;
                         }
                         Err(e) => {
                             // ReplayTimeout means shadow stalled or the wire
@@ -2557,8 +2946,7 @@ impl RecordSink for BufferingDecoderSink {
                             && let Some((blkno, offnum)) = tid
                         {
                             // heap_toast_delete's DELETE: TID-keyed. Buffered
-                            // for commit-time death resolution against the
-                            // seq-0 birth map (crate::toast_tid)
+                            // as a store tombstone row applied at commit drain
                             self.stats
                                 .toast_chunk_deletes
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2581,6 +2969,23 @@ impl RecordSink for BufferingDecoderSink {
                                 .toast_chunk_deletes
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         } else if let Some(chunk) = toast_chunk_from_decoded(decoded, &rel, tid) {
+                            if tid.is_none() {
+                                // No TID → no store row key: the chunk still
+                                // serves same-xact resolution, but its birth
+                                // never reaches the mirror (a later referrer
+                                // superseded-fills). toast_save_datum never
+                                // multi-inserts, so this shape is unexpected.
+                                tracing::warn!(
+                                    target: "walshadow::xact_buffer",
+                                    toast_relid = chunk.toast_relid,
+                                    value_id = chunk.value_id,
+                                    chunk_seq = chunk.chunk_seq,
+                                    "toast chunk without TID; not mirrored",
+                                );
+                                self.stats
+                                    .toast_chunks_malformed
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             self.stats
                                 .toast_chunks_buffered
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2636,9 +3041,122 @@ pub(crate) fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent
     out
 }
 
-/// Repack a TOAST table INSERT (Insert, 3 columns: `chunk_id oid`,
-/// `chunk_seq int4`, `chunk_data bytea`) into a [`ToastChunk`]; `None`
-/// for shapes that don't fit.
+enum StashedToastOp {
+    Chunk(ToastChunk),
+    Delete(ToastDelete),
+}
+
+/// Decode one stashed record against its resolved toast descriptor,
+/// mirroring the live decoder-sink reinterpretation: INSERT → chunk birth,
+/// DELETE → TID tombstone, other ops carry nothing for the mirror.
+/// Malformed bytes are fatal (`Detoast`), matching the plan's
+/// "catalog, replay, and malformed-record errors are fatal, not absence".
+fn decode_stashed_toast(
+    raw: &RawRecord,
+    rel: &Arc<RelDescriptor>,
+) -> std::result::Result<Vec<StashedToastOp>, XactBufferError> {
+    use crate::heap_decoder::{XLOG_HEAP_INSERT, XLOG_HEAP_OPMASK};
+    let rec = raw.to_xlog_record();
+    // Rewrite-path inserts are HEAP_INSERT_NO_LOGICAL (no REGBUF_KEEP_DATA,
+    // PG src/backend/access/heap/rewriteheap.c): a checkpoint mid-rewrite
+    // leaves the chunk tuple only inside the block image
+    if raw.rm == RmId::Heap as u8
+        && raw.info & XLOG_HEAP_OPMASK == XLOG_HEAP_INSERT
+        && rec
+            .blocks
+            .first()
+            .is_some_and(|b| b.header.has_image() && !b.header.has_data())
+    {
+        return decode_image_insert(raw, rel);
+    }
+    let decoded_set = decode_heap_record(&rec, raw.source_lsn, rel)
+        .map_err(|e| XactBufferError::Detoast(format!("stashed record decode: {e}")))?;
+    let tid = (decoded_set.len() == 1)
+        .then(|| toast_record_tid(&rec))
+        .flatten();
+    let mut out = Vec::with_capacity(decoded_set.len());
+    for decoded in decoded_set {
+        match decoded.op {
+            HeapOp::Insert => {
+                if let Some(chunk) = toast_chunk_from_decoded(decoded, rel, tid) {
+                    if tid.is_none() {
+                        tracing::warn!(
+                            target: "walshadow::xact_buffer",
+                            toast_relid = chunk.toast_relid,
+                            value_id = chunk.value_id,
+                            "stashed toast chunk without TID; not mirrored",
+                        );
+                    }
+                    out.push(StashedToastOp::Chunk(chunk));
+                }
+            }
+            HeapOp::Delete => {
+                if let Some((blkno, offnum)) = tid {
+                    out.push(StashedToastOp::Delete(ToastDelete {
+                        toast_relid: rel.oid,
+                        blkno,
+                        offnum,
+                        source_lsn: raw.source_lsn,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Image-carried chunk tuple: restore the FPI and read the tuple behind
+/// the record's offnum, reusing the bootstrap on-page decoder
+fn decode_image_insert(
+    raw: &RawRecord,
+    rel: &Arc<RelDescriptor>,
+) -> std::result::Result<Vec<StashedToastOp>, XactBufferError> {
+    let rec = raw.to_xlog_record();
+    let Some((blkno, offnum)) = toast_record_tid(&rec) else {
+        return Err(XactBufferError::Detoast(
+            "stashed image insert lacks offnum".into(),
+        ));
+    };
+    let block = rec.blocks.first().expect("image checked by caller");
+    let page = crate::fpi::restore_block_image(block, raw.page_magic)
+        .map_err(|e| XactBufferError::Detoast(format!("stashed FPI restore: {e}")))?;
+    let Some(tuple) = crate::backup_page_walk::page_tuple_bytes(&page, offnum) else {
+        return Err(XactBufferError::Detoast(format!(
+            "stashed image insert: no LP_NORMAL tuple at ({blkno},{offnum})"
+        )));
+    };
+    let Some((_, _, _, mut columns)) = crate::backup_page_walk::decode_on_page_tuple(tuple, rel)
+    else {
+        return Err(XactBufferError::Detoast(format!(
+            "stashed image insert: malformed tuple at ({blkno},{offnum})"
+        )));
+    };
+    let Some((value_id, chunk_seq, chunk_data)) =
+        crate::heap_decoder::take_toast_chunk_columns(&mut columns)
+    else {
+        tracing::warn!(
+            target: "walshadow::xact_buffer",
+            toast_relid = rel.oid,
+            blkno,
+            offnum,
+            "stashed image tuple not a toast chunk shape",
+        );
+        return Ok(Vec::new());
+    };
+    Ok(vec![StashedToastOp::Chunk(ToastChunk {
+        toast_relid: rel.oid,
+        value_id,
+        chunk_seq,
+        source_lsn: raw.source_lsn,
+        blkno,
+        offnum,
+        chunk_data,
+    })])
+}
+
+/// Repack a TOAST table INSERT into a [`ToastChunk`]; `None` for shapes
+/// that don't fit.
 ///
 /// Keyed on the toast rel's pg_class OID ([`RelDescriptor::oid`]), not
 /// `rel_node`: the referring tuple's `va_toastrelid` is the OID. They
@@ -2651,23 +3169,8 @@ fn toast_chunk_from_decoded(
     if d.op != HeapOp::Insert {
         return None;
     }
-    let new = d.new.as_mut()?;
-    if new.columns.len() < 3 {
-        return None;
-    }
-    let &ColumnValue::Oid(value_id) = new.columns[0].as_ref()? else {
-        return None;
-    };
-    let &ColumnValue::Int4(chunk_seq) = new.columns[1].as_ref()? else {
-        return None;
-    };
-    let chunk_seq = chunk_seq as u32;
-    let chunk_data = match new.columns[2].take()? {
-        ColumnValue::Bytea(b) => b,
-        // Text-typed toast chunk: re-encode to bytes (not a normal flow)
-        ColumnValue::Text(s) => s.into_bytes(),
-        _ => return None,
-    };
+    let (value_id, chunk_seq, chunk_data) =
+        crate::heap_decoder::take_toast_chunk_columns(&mut d.new.as_mut()?.columns)?;
     let (blkno, offnum) = tid.unwrap_or((0, 0));
     Some(ToastChunk {
         toast_relid: rel.oid,
@@ -2791,6 +3294,31 @@ mod tests {
     }
 
     #[test]
+    fn marker_cap_eviction_skips_stale_entry_of_reused_filenode() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rfn = |rel_node| RelFileNode {
+            spc_node: 1663,
+            db_node: 5,
+            rel_node,
+        };
+        let a = rfn(90_000);
+        // Generation 1 consumed at resolution; queue entry stays behind
+        b.note_smgr_create(0, a, 10);
+        b.forget_markers(&[a]);
+        // Generation 2 reuses the filenode
+        b.note_smgr_create(0, a, 20);
+        // Churn pops the stale (a, 10) queue entry; live marker survives
+        for i in 0..(MARKER_CAP - 1) as u32 {
+            b.note_smgr_create(0, rfn(100_000 + i), 100 + u64::from(i));
+        }
+        assert_eq!(b.marker_lsn(a), Some(20));
+        // Next churn pops (a, 20) itself; cap evicts live marker
+        b.note_smgr_create(0, rfn(200_000), 999_999);
+        assert_eq!(b.marker_lsn(a), None);
+    }
+
+    #[test]
     fn xact_buffer_error_converts_to_sink_and_decoder_errors() {
         let s: SinkError = XactBufferError::Observer("boom".into()).into();
         match s {
@@ -2857,7 +3385,7 @@ mod tests {
         b.on_heap(heap_with_value(8, 150, 16)).await.unwrap();
         assert_eq!(b.resume_safe_lsn(500), 100);
         // Keep floor while committed slices remain undurable
-        let drain = b.drain_committed(8, 0, 200, &[]).await.unwrap();
+        let drain = b.drain_committed(8, 0, 200, &[], false).await.unwrap();
         assert!(drain.had_states);
         drop(drain);
         assert_eq!(b.resume_safe_lsn(180), 100, "open xid 7 still floors");
@@ -2866,7 +3394,7 @@ mod tests {
         // Drop floor once acknowledgment reaches commit
         assert_eq!(b.resume_safe_lsn(200), 200);
         // Ignore commits without buffered rows
-        let empty = b.drain_committed(9, 0, 300, &[]).await.unwrap();
+        let empty = b.drain_committed(9, 0, 300, &[], false).await.unwrap();
         assert!(!empty.had_states);
         assert_eq!(b.resume_safe_lsn(300), 300);
     }
@@ -2878,7 +3406,7 @@ mod tests {
         // Use earliest record across transaction tree
         b.on_heap(heap_with_value(20, 400, 16)).await.unwrap();
         b.on_heap(heap_with_value(21, 420, 16)).await.unwrap();
-        let drain = b.drain_committed(21, 0, 450, &[20]).await.unwrap();
+        let drain = b.drain_committed(21, 0, 450, &[20], false).await.unwrap();
         drop(drain);
         assert_eq!(b.resume_safe_lsn(440), 400);
         assert_eq!(b.resume_safe_lsn(450), 450);
@@ -3070,6 +3598,148 @@ mod tests {
         }
     }
 
+    fn bytea_rel() -> RelDescriptor {
+        use crate::shadow_catalog::{RelName, ReplIdent};
+        RelDescriptor {
+            rfn: RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 16400,
+            },
+            oid: 16400,
+            namespace_oid: 2200,
+            rel_name: RelName::new("public", "t"),
+            kind: 'r',
+            persistence: 'p',
+            replident: ReplIdent::Default { pk_attnums: None },
+            attributes: vec![crate::shadow_catalog::RelAttr {
+                attnum: 1,
+                name: "b".into(),
+                type_oid: crate::heap_decoder::BYTEAOID,
+                typmod: -1,
+                not_null: false,
+                dropped: false,
+                type_name: "bytea".into(),
+                type_byval: false,
+                type_len: -1,
+                type_align: 'i',
+                type_storage: 'x',
+                missing_text: None,
+            }],
+        }
+    }
+
+    fn toast_ptr_tuple(value_id: u32) -> DecodedTuple {
+        DecodedTuple {
+            columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
+                va_rawsize: 8,
+                va_extinfo: 4, // 4 bytes, uncompressed
+                va_valueid: value_id,
+                va_toastrelid: 16500,
+            }))],
+            partial: false,
+        }
+    }
+
+    /// Miss policy split: in-xact gap stays a hard error; a store-side miss
+    /// (key absent from every xact map) NULL-fills + counts superseded;
+    /// disabled mode NULL-fills + counts default.
+    #[test]
+    fn detoast_tuple_splits_in_xact_gap_from_store_miss() {
+        let rel = bytea_rel();
+        let stats = Arc::new(crate::ch_emitter::EmitterStats::default());
+        let store_resolver =
+            ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats.clone());
+
+        // Store miss: no xact map holds the key → superseded fill
+        let mut t = toast_ptr_tuple(55);
+        detoast_tuple(&mut t, &rel, &[], &ChunkMap::new(), &store_resolver).unwrap();
+        assert_eq!(t.columns[0], Some(ColumnValue::Null));
+        assert_eq!(
+            stats
+                .toast_values_filled_superseded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // In-xact gap: key present but seq 1 missing → hard error
+        let mut gapped = ChunkMap::new();
+        gapped.insert(
+            (16500, 55),
+            std::collections::BTreeMap::from([(0u32, b"ab".to_vec()), (2u32, b"cd".to_vec())]),
+        );
+        let mut t = toast_ptr_tuple(55);
+        let err = detoast_tuple(&mut t, &rel, &[&gapped], &ChunkMap::new(), &store_resolver)
+            .expect_err("in-xact gap surfaces");
+        assert!(matches!(
+            err,
+            XactBufferError::MissingToastChunk { missing: 1, .. }
+        ));
+        assert_eq!(
+            stats
+                .toast_fetch_miss
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Store-resolved hit still reassembles
+        let mut extra = ChunkMap::new();
+        extra.insert(
+            (16500, 55),
+            std::collections::BTreeMap::from([(0u32, b"abcd".to_vec())]),
+        );
+        let mut t = toast_ptr_tuple(55);
+        detoast_tuple(&mut t, &rel, &[], &extra, &store_resolver).unwrap();
+        assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
+
+        // Store-side dense-but-short run (partial merge collapse): fills,
+        // counted mismatch — not superseded, not a hard error
+        let mut short = ChunkMap::new();
+        short.insert(
+            (16500, 55),
+            std::collections::BTreeMap::from([(0u32, b"ab".to_vec())]),
+        );
+        let mut t = toast_ptr_tuple(55);
+        detoast_tuple(&mut t, &rel, &[], &short, &store_resolver).unwrap();
+        assert_eq!(t.columns[0], Some(ColumnValue::Null));
+        assert_eq!(
+            stats
+                .toast_values_filled_mismatch
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .toast_values_filled_superseded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "short run counts mismatch, not superseded"
+        );
+
+        // In-xact dense-but-short: decode bug, hard error
+        let mut xact_short = ChunkMap::new();
+        xact_short.insert(
+            (16500, 55),
+            std::collections::BTreeMap::from([(0u32, b"ab".to_vec())]),
+        );
+        let mut t = toast_ptr_tuple(55);
+        let err = detoast_tuple(
+            &mut t,
+            &rel,
+            &[&xact_short],
+            &ChunkMap::new(),
+            &store_resolver,
+        )
+        .expect_err("in-xact size mismatch surfaces");
+        assert!(matches!(err, XactBufferError::Detoast(_)));
+
+        // Disabled mode: any miss NULL-fills as before, counted default
+        let disabled = ToastResolver::disabled();
+        let mut t = toast_ptr_tuple(55);
+        detoast_tuple(&mut t, &rel, &[], &ChunkMap::new(), &disabled).unwrap();
+        assert_eq!(t.columns[0], Some(ColumnValue::Null));
+    }
+
     // ── subxact tracking ──────────────────────────────────────────────
 
     #[test]
@@ -3232,14 +3902,14 @@ mod tests {
         let mut out = Vec::new();
         let mut ev = 0usize;
         for (i, h) in batch.heaps.iter().enumerate() {
-            while ev < batch.ordered_events.len() && batch.ordered_events[ev].0 <= i {
-                out.push(label(&batch.ordered_events[ev].1));
+            while ev < batch.ordered_events.len() && batch.ordered_events[ev].heap_idx <= i {
+                out.push(label(&batch.ordered_events[ev].event));
                 ev += 1;
             }
             out.push(format!("h{}", h.source_lsn));
         }
         while ev < batch.ordered_events.len() {
-            out.push(label(&batch.ordered_events[ev].1));
+            out.push(label(&batch.ordered_events[ev].event));
             ev += 1;
         }
         out
@@ -3264,7 +3934,7 @@ mod tests {
         b.on_schema_event(2, 150, dropped_event(8));
         assert!(b.stats().spill_xacts_active >= 1, "xid 1 must spill");
 
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[2]).await.unwrap();
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[2], false).await.unwrap();
         assert!(drain.had_states);
         let mut order: Vec<String> = Vec::new();
         let mut finals = Vec::new();
@@ -3289,8 +3959,7 @@ mod tests {
         assert!(b.active_xids().is_empty());
     }
 
-    /// A chunk generation sealed with an earlier slice must stay visible to
-    /// later slices carrying the referrer (unchanged-toast UPDATE chain).
+    /// Preserve chunk generations across slice boundaries
     #[tokio::test(flavor = "current_thread")]
     async fn drain_batch_chunk_generations_cover_cross_batch_referrer() {
         let tmp = tempdir().unwrap();
@@ -3298,16 +3967,35 @@ mod tests {
         b.on_toast_chunk(chunk(55, 0, 100, b"ab"), 9).await.unwrap();
         b.on_toast_chunk(chunk(55, 1, 105, b"cd"), 9).await.unwrap();
         b.on_heap(heap_with_value(9, 110, 16)).await.unwrap();
+        b.on_toast_delete(
+            crate::spill::ToastDelete {
+                toast_relid: 16400,
+                blkno: 7,
+                offnum: 3,
+                source_lsn: 200,
+            },
+            9,
+        )
+        .await
+        .unwrap();
         b.on_heap(heap_with_value(9, 300, 16)).await.unwrap();
 
-        let mut drain = b.drain_committed(9, 0, 0x1000, &[]).await.unwrap();
+        let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
         let b1 = drain.next_batch(1, usize::MAX).await.unwrap().unwrap();
         assert_eq!(b1.heaps.len(), 1);
-        let g1 = b1.new_chunks.as_ref().expect("chunks seal with slice 1");
-        assert!(g1.contains_key(&(16400, 55)));
+        assert_eq!(b1.new_rows.len(), 2);
+        assert_eq!(b1.new_rows[0].lsn, 100);
+        assert_eq!(b1.new_rows[0].offnum, 1);
+        assert_eq!(b1.new_rows[1].lsn, 105);
+        assert!(!b1.new_rows[1].is_tombstone());
+        assert!(b1.chunks.last().unwrap().contains_key(&(16400, 55)));
         let b2 = drain.next_batch(1, usize::MAX).await.unwrap().unwrap();
         assert!(b2.is_final);
-        assert!(b2.new_chunks.is_none(), "no fresh chunks in slice 2");
+        assert_eq!(b2.new_rows.len(), 1);
+        let t = &b2.new_rows[0];
+        assert!(t.is_tombstone());
+        assert_eq!((t.blkno, t.offnum, t.chunk_id, t.lsn), (7, 3, 0, 200));
+        assert!(t.chunk_data.is_empty());
         let maps: Vec<&ChunkMap> = b2.chunks.iter().map(Arc::as_ref).collect();
         let p = ToastPointer {
             va_rawsize: 8,
@@ -3315,8 +4003,39 @@ mod tests {
             va_valueid: 55,
             va_toastrelid: 16400,
         };
-        let raw = try_reassemble(&p, &maps).unwrap().expect("value visible");
+        let Reassembled::Bytes(raw) = try_reassemble(&p, &maps).unwrap() else {
+            panic!("value visible");
+        };
         assert_eq!(raw, b"abcd");
+        drain.finish().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_batch_seals_row_cursors_at_events_and_truncates() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        b.on_toast_chunk(chunk(55, 0, 100, b"ab"), 9).await.unwrap();
+        let mut trunc = heap_with_value(9, 110, 16);
+        trunc.op = HeapOp::Truncate;
+        trunc.new = None;
+        b.on_heap(trunc).await.unwrap();
+        b.on_toast_chunk(chunk(56, 0, 120, b"cd"), 9).await.unwrap();
+        b.on_schema_event(9, 130, dropped_event(7));
+        b.on_toast_chunk(chunk(57, 0, 140, b"ef"), 9).await.unwrap();
+        b.on_heap(heap_with_value(9, 150, 16)).await.unwrap();
+
+        let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
+        let batch = drain
+            .next_batch(usize::MAX, usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(batch.is_final);
+        assert_eq!(batch.new_rows.len(), 3);
+        assert_eq!(batch.truncate_rows, vec![1]);
+        assert_eq!(batch.ordered_events.len(), 1);
+        let ev = &batch.ordered_events[0];
+        assert_eq!((ev.heap_idx, ev.row_idx), (1, 2));
         drain.finish().await.unwrap();
     }
 
@@ -3339,7 +4058,7 @@ mod tests {
             b.on_heap(heap_with_value(3, 100 + i, 512)).await.unwrap();
         }
         assert_eq!(spill_files(tmp.path()).len(), 1);
-        let mut drain = b.drain_committed(3, 0, 0x5000, &[]).await.unwrap();
+        let mut drain = b.drain_committed(3, 0, 0x5000, &[], false).await.unwrap();
         assert_eq!(
             b.stats().spill_bytes_active,
             0,
@@ -3370,7 +4089,7 @@ mod tests {
             b.on_heap(heap_with_value(4, 100 + i, 512)).await.unwrap();
         }
         let total = n * 512;
-        let mut drain = b.drain_committed(4, 0, 0x9000, &[]).await.unwrap();
+        let mut drain = b.drain_committed(4, 0, 0x9000, &[], false).await.unwrap();
         let mut rows = 0usize;
         while let Some(batch) = drain.next_batch(4, usize::MAX).await.unwrap() {
             rows += batch.heaps.len();
@@ -3398,7 +4117,7 @@ mod tests {
     async fn drain_committed_unknown_xid_yields_no_batches() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        let mut drain = b.drain_committed(999, 0, 0x100, &[]).await.unwrap();
+        let mut drain = b.drain_committed(999, 0, 0x100, &[], false).await.unwrap();
         assert!(!drain.had_states);
         assert!(drain.next_batch(10, 1000).await.unwrap().is_none());
         drain.finish().await.unwrap();

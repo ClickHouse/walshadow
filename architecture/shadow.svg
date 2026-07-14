@@ -391,7 +391,7 @@
 <polygon fill="none" stroke="#6e6963" points="227,-46 227,-67 556,-67 556,-46 227,-46"/>
 <text text-anchor="start" x="366.5" y="-55" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#ece1d7">Dropped</text>
 <polygon fill="none" stroke="#6e6963" points="556,-46 556,-67 1288,-67 1288,-46 556,-46"/>
-<text text-anchor="start" x="732" y="-54" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">sweep_dropped poll at armed xact&#39;s commit (PendingSweeps) → DROP TABLE</text>
+<text text-anchor="start" x="698" y="-54" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">sweep at armed commit → configured dest action; pg_toast → durable deferred mirror retire</text>
 <polygon fill="#34302c" stroke="transparent" points="227,-25 227,-46 1288,-46 1288,-25 227,-25"/>
 <polygon fill="none" stroke="#6e6963" points="227,-25 227,-46 1288,-46 1288,-25 227,-25"/>
 <text text-anchor="start" x="699" y="-34" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00" fill="#ece1d7">generation invariant</text>

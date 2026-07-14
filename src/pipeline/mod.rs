@@ -130,6 +130,12 @@ pub struct PipelineConfig {
     /// COPY backfiller for `initial_load='copy'` opt-ins; `None` streams from
     /// the opt-in LSN only.
     pub backfiller: Option<Arc<crate::copy_backfill::CopyBackfiller>>,
+    /// Durable queue of deferred toast-mirror retires, loaded from the
+    /// spill dir; entries due at resume retire via the post-spawn
+    /// [`reorder::ReorderSink::flush_due_retires`] call
+    pub retires: crate::toast_retire::RetireLedger,
+    /// Last durable resume cursor, seeded at the resume point
+    pub resume_floor: Arc<AtomicU64>,
 }
 
 /// Spawned-stage join handles + shared signals. The daemon drives the
@@ -141,9 +147,6 @@ pub struct PipelineHandle {
     /// the standby `apply_lsn` and writes it to the resume cursor.
     pub emitter_ack: Arc<AtomicU64>,
     pub fatal: Fatal,
-    /// Resolver shared by decode + reorder; the daemon's GC sweep
-    /// ([`crate::toast_gc`]) borrows its store so disk-mode delete
-    /// serializes against put.
     pub toast: crate::toast::ToastResolver,
     decoders: Vec<JoinHandle<()>>,
     tail: tail::TailParts,
@@ -189,15 +192,15 @@ impl PipelineConfig {
             span_registry,
             config_resolver,
             backfiller,
+            retires,
+            resume_floor,
         } = self;
         let m = decoder_pool_size.max(1);
         let fatal = Fatal::new();
 
         // One resolver shared by the decode pool (fetch on miss) and the
-        // reorder coordinator (put per commit). Disk store opens here; a bad
-        // [toast] config fails the daemon at startup.
-        let resolver = crate::toast::ToastResolver::from_config(&emitter, stats.clone())
-            .map_err(EmitterError::Config)?;
+        // reorder coordinator (put per commit).
+        let resolver = crate::toast::ToastResolver::from_config(&emitter, stats.clone());
 
         // Live emitter knobs (budgets/flush/compression/retry) reach the batcher
         // + inserter pool via this receiver; `None` keeps them at boot values.
@@ -247,6 +250,8 @@ impl PipelineConfig {
             span_registry,
             emitter.drain_batch_rows,
             emitter.drain_batch_bytes,
+            retires,
+            resume_floor,
         );
 
         Ok((
