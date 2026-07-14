@@ -31,12 +31,10 @@ use std::time::{Duration, Instant};
 use backon::{ExponentialBuilder, RetryableWithContext};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
-use tokio_postgres::types::{Oid, ToSql};
+use tokio_postgres::types::{Oid, PgLsn, ToSql};
 use tokio_postgres::{Client, NoTls, Row};
 use tracing::Instrument;
 use walrus::pg::walparser::RelFileNode;
-
-use crate::shadow::parse_pg_lsn;
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -413,7 +411,8 @@ impl ShadowCatalog {
     /// Bootstrap fan-out: resolve every relation in the named (`auto_create`)
     /// namespaces, emit `Added` for each unseen oid. Idempotent across daemon
     /// restarts via the applicator's `CREATE TABLE IF NOT EXISTS`. Other
-    /// namespaces stay undisclosed until first WAL touch.
+    /// namespaces stay undisclosed until first WAL touch. Each owner's toast
+    /// rel resolves alongside it, same rationale as [`Self::seed_baseline`].
     pub async fn seed_from_source(&mut self, namespaces: &[String]) -> Result<usize> {
         if namespaces.is_empty() {
             return Ok(0);
@@ -441,6 +440,7 @@ impl ShadowCatalog {
                 Err(CatalogError::NotFoundByOid(_)) => continue,
                 Err(e) => return Err(e),
             }
+            self.toast_descriptor_for(oid).await?;
         }
         Ok(added)
     }
@@ -459,6 +459,11 @@ impl ShadowCatalog {
     /// Records the *full* source descriptor, not the pinned subset, so unmapped
     /// columns sit in the baseline as "excluded", never "added since". See
     /// `plans/future/pinned_ddl_baseline.md`.
+    ///
+    /// Each owner's toast rel is resolved too: [`Self::sweep_dropped`] probes
+    /// only `prev_known`, so a post-restart owner DROP retires the CH chunk
+    /// mirror only when the toast oid was seeded; cold, the mirror leaks until
+    /// a chunk decode re-warms it.
     pub async fn seed_baseline(&mut self, rel_names: &[RelName]) -> Result<usize> {
         let mut seeded = 0usize;
         for rel in rel_names {
@@ -473,6 +478,9 @@ impl ShadowCatalog {
                 Err(CatalogError::NotFoundByOid(_)) => continue,
                 Err(e) => return Err(e),
             }
+            // Toast oid into prev_known too, else sweep_dropped can't
+            // surface it after restart
+            self.toast_descriptor_for(oid).await?;
         }
         Ok(seeded)
     }
@@ -593,6 +601,12 @@ impl ShadowCatalog {
     }
 
     fn record_descriptor(&mut self, new: &Arc<RelDescriptor>) {
+        // Indexes have no CH lifecycle: keep them out of the event stream +
+        // drop sweep, else an owner DROP surfaces its pg_toast index as a
+        // second pg_toast `Dropped` and double-counts the mirror retire
+        if matches!(new.kind, 'i' | 'I') {
+            return;
+        }
         let oid = new.oid;
         match self.prev_known.get(&oid).cloned() {
             None => {
@@ -729,13 +743,10 @@ impl ShadowCatalog {
         let start = Instant::now();
         loop {
             let row = self
-                .query_one_retry("SELECT pg_last_wal_replay_lsn()::text", &[])
+                .query_one_retry("SELECT pg_last_wal_replay_lsn()", &[])
                 .await?;
-            let raw: Option<String> = row.get(0);
-            if let Some(s) = raw {
-                let lsn = parse_pg_lsn(&s).map_err(|e| {
-                    CatalogError::Parse(format!("pg_last_wal_replay_lsn {s:?}: {e}"))
-                })?;
+            let lsn = row.get::<_, Option<PgLsn>>(0).map(u64::from);
+            if let Some(lsn) = lsn {
                 self.last_replay_lsn = Some(self.last_replay_lsn.map_or(lsn, |old| old.max(lsn)));
                 if lsn >= target {
                     return Ok(lsn);

@@ -2859,7 +2859,6 @@ dependencies = [
  "opentelemetry_sdk",
  "pglz",
  "postgres-protocol",
- "roaring",
  "serde",
  "serde_json",
  "smallvec",

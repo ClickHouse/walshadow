@@ -459,21 +459,10 @@ impl EmitterConfig {
                 out.soft_delete = v;
             }
         }
-        if let Some(toast) = root.get("toast").and_then(Value::as_table) {
-            if let Some(v) = toast.get("mode").and_then(Value::as_str) {
-                out.toast.mode = crate::toast::ToastMode::parse(v).map_err(EmitterError::Config)?;
-            }
-            if let Some(v) = toast.get("disk_dir").and_then(Value::as_str) {
-                out.toast.disk_dir = Some(std::path::PathBuf::from(v));
-            }
-            if let Some(v) = toast.get("tid_journal").and_then(Value::as_str) {
-                out.toast.tid_journal = Some(std::path::PathBuf::from(v));
-            }
-            if let Some(v) = toast.get("gc_interval_secs").and_then(Value::as_integer)
-                && let Ok(secs) = u64::try_from(v)
-            {
-                out.toast.gc_interval = Duration::from_secs(secs);
-            }
+        if let Some(toast) = root.get("toast").and_then(Value::as_table)
+            && let Some(v) = toast.get("mode").and_then(Value::as_str)
+        {
+            out.toast.mode = crate::toast::ToastMode::parse(v).map_err(EmitterError::Config)?;
         }
         if let Some(rc) = root.get("runtime_config").and_then(Value::as_table)
             && let Some(schema) = rc.get("schema").and_then(Value::as_str)
@@ -1539,26 +1528,28 @@ crate::atomic_stats! {
         /// Legacy serial-emitter counter; pooled pipeline seals via the
         /// batcher's own `flush_timeout` deadline and never bumps this
         pub flush_deadline_trips,
-        /// TOAST chunk rows persisted to the configured store (disk / CH)
         pub toast_chunks_stored,
+        pub toast_tombstones_stored,
         /// Toasted values reassembled from the store (not the in-xact buffer)
         pub toast_values_fetched,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,
-        /// Toasted values whose chunks were absent from an active store
-        /// (disk / CH gap) — a real data gap, not a fill
+        pub toast_values_filled_superseded,
+        pub toast_values_filled_mismatch,
         pub toast_fetch_miss,
-        /// GC sweeps completed against the chunk store (`crate::toast_gc`)
-        pub toast_gc_sweeps,
-        /// Dead toast values deleted from the chunk store by GC
-        pub toast_gc_values_deleted,
-        /// Toast deaths resolved to a dead value + commit LSN by the TID
-        /// tracker (`crate::toast_tid`)
-        pub toast_deaths_resolved,
-        /// Tracking gaps which can leak chunks until manual cleanup:
-        /// untracked deletes, TID collisions, relation rewrites, TRUNCATE/DROP
-        pub toast_deaths_unresolved,
+        pub toast_mirror_truncates,
+        pub toast_mirror_retires,
+        /// Rewrite generations closed with residual `O - B` tombstones
+        pub toast_rewrite_barriers,
+        /// Stashed records decoded at commit against a resolved toast heap
+        pub toast_stash_decoded,
+        /// Stashed records discarded: filenode unresolvable post-commit
+        /// (dropped or rotated away), end-state-neutral by AEL supersession
+        pub toast_stash_discarded,
+        /// Stashed records resolved to a non-toast heap; ordinary-heap decode
+        /// stays fenced off until a shadow replay fence exists
+        pub toast_stash_skipped,
         // Pipeline-flow counters; `_out`/`_in` pairs give channel depth. See
         // `metrics::render`.
         pub queue_jobs_out,
@@ -2248,10 +2239,7 @@ mod tests {
             byte_budget = 4096
 
             [toast]
-            mode = "disk"
-            disk_dir = "/var/lib/walshadow/toast"
-            tid_journal = "/var/lib/walshadow/toast/tids.journal"
-            gc_interval_secs = 900
+            mode = "clickhouse"
 
             [table.public.foo]
             initial_load = "copy"
@@ -2287,26 +2275,14 @@ mod tests {
         );
         // soft_delete defaults off when the key is absent
         assert!(!c.soft_delete);
-        assert_eq!(c.toast.mode, crate::toast::ToastMode::Disk);
+        assert_eq!(c.toast.mode, crate::toast::ToastMode::ClickHouse);
+        // Toast block omitted => disabled
         assert_eq!(
-            c.toast.disk_dir.as_deref(),
-            Some(std::path::Path::new("/var/lib/walshadow/toast"))
+            EmitterConfig::from_toml_str("[ch]\n").unwrap().toast.mode,
+            crate::toast::ToastMode::Disabled
         );
-        assert_eq!(
-            c.toast.tid_journal.as_deref(),
-            Some(std::path::Path::new(
-                "/var/lib/walshadow/toast/tids.journal"
-            ))
-        );
-        assert_eq!(c.toast.gc_interval, Duration::from_secs(900));
-        // gc_interval_secs omitted => GC disabled
-        assert_eq!(
-            EmitterConfig::from_toml_str("[ch]\n")
-                .unwrap()
-                .toast
-                .gc_interval,
-            Duration::ZERO
-        );
+        // Removed disk mode surfaces as a config error, not a silent default
+        assert!(EmitterConfig::from_toml_str("[ch]\n[toast]\nmode = \"disk\"\n").is_err());
     }
 
     #[test]

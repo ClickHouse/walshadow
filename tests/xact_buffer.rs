@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::EmitterStats;
 use walshadow::decoder_sink::{DecoderSinkError, TupleObserver};
 use walshadow::filter::Route;
 use walshadow::heap_decoder::{
@@ -27,7 +27,7 @@ use walshadow::heap_decoder::{
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
 use walshadow::spill::ToastChunk;
-use walshadow::toast::{ToastConfig, ToastMode, ToastResolver};
+use walshadow::toast::{MemChunkStore, ToastResolver};
 use walshadow::wal_stream::Record;
 use walshadow::xact_buffer::{XactBuffer, XactBufferConfig, XactBufferError, XactRecordSink};
 
@@ -475,18 +475,13 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
     b.on_heap(heap(rfn, 42, 0, HeapOp::Insert, vec![id_col, body_ptr]))
         .await
         .unwrap();
-    // Gap only errors with an active store (disabled mode NULL-fills);
-    // disk mode with an empty store keeps the in-xact chunks authoritative
-    let emitter_cfg = EmitterConfig {
-        toast: ToastConfig {
-            mode: ToastMode::Disk,
-            disk_dir: Some(tmp.path().join("toast-store")),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let resolver =
-        ToastResolver::from_config(&emitter_cfg, Arc::new(EmitterStats::default())).unwrap();
+    // In-xact gap stays a hard error even with an active store (disabled
+    // mode NULL-fills): the value's key is present in the xact's chunk map,
+    // so the gap is a decode bug, never a merge-collapsed store miss
+    let resolver = ToastResolver::with_store(
+        Arc::new(MemChunkStore::new()),
+        Arc::new(EmitterStats::default()),
+    );
     let err = b
         .commit(42, 0, 200, &[], &cat, &mut obs, &resolver)
         .await

@@ -22,11 +22,10 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
   read-time defaults
 - [xact.md](xact.md) — `XactBuffer`, `SubxactTracker`, TOAST
   reassembly, local-disk spill, `DrainEntry` ordering
-- [TOAST.md](TOAST.md) — full TOAST chunk store (`disabled`/`disk`/
-  `clickhouse`), bootstrap tap + defer-resolve, pre-window miss→fetch,
-  dead-chunk GC sweep (source anti-join gated on emitter ack,
-  `_lsn`/mtime reused-OID guards); deferred R1 JOIN mode, streaming
-  reassembly
+- [TOAST.md](TOAST.md) — TID-keyed `pg_toast_<relid>` CH mirror
+  (`disabled`/`clickhouse`), delete tombstones + RMT-merge reclaim,
+  as-of fetch, superseded-fill miss policy, bootstrap tap +
+  defer-resolve; deferred R1 JOIN mode, streaming reassembly
 - [emitter.md](emitter.md) — parallel decode+insert pipeline
   (reorder → decode ×M → batcher → inserter ×N → ack watermark),
   `type_bridge`, synthetic columns, `DdlApplicator`, barrier fence
@@ -44,18 +43,17 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
 ## Future work
 
 [future/INDEX.md](future/INDEX.md) collects design docs for unbuilt work:
-runtime config overlay from source PG, two-phase commit, sequence-state
-replication, cross-table ordering, CH-bounce recovery, parked operational
-polish. Promote into `plans/` once an item is built
+runtime-config signals and net-new knobs, two-phase commit,
+sequence-state replication, cross-table ordering, CH-bounce recovery,
+parked operational polish. Promote built behavior into `plans/`
 
 ## Architecture diagrams
 
 Live under [architecture/](../architecture/README.md). System-level
 SVGs cover overview, internals, shadow communication, bootstrap
-timeline, streaming timeline, restart timelines. Per-component SVGs
-(one per file in this index, embedded inline) cover filter, source,
-shadow, decoder, xact, emitter, bootstrap, ops, oracle. Updated
-on architecturally load-bearing changes
+timeline, streaming timeline, restart timelines. Component SVGs cover
+filter, source, shadow, decoder, xact, TOAST, emitter, bootstrap, ops,
+and oracle. Updated on architecturally load-bearing changes
 
 ## Regenerating diagrams
 

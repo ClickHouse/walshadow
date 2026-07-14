@@ -1,8 +1,7 @@
 //! Source-PG sidecar SQL helpers shared across sweep/backfill/config paths.
 
 use tokio_postgres::Client;
-use tokio_postgres::types::{FromSql, Type};
-use walrus::pg::backup::parse_pg_lsn;
+use tokio_postgres::types::{FromSql, PgLsn, Type};
 
 /// PG identifier: double-quoted, embedded quotes doubled.
 pub fn quote_ident(ident: &str) -> String {
@@ -11,10 +10,9 @@ pub fn quote_ident(ident: &str) -> String {
 
 /// `pg_current_wal_lsn()` of the connected server.
 pub async fn current_wal_lsn(client: &Client) -> anyhow::Result<u64> {
-    let row = client
-        .query_one("SELECT pg_current_wal_lsn()::text", &[])
-        .await?;
-    parse_pg_lsn(row.get(0))
+    let row = client.query_one("SELECT pg_current_wal_lsn()", &[]).await?;
+    let lsn: PgLsn = row.get(0);
+    Ok(lsn.into())
 }
 
 /// `pg_snapshot_xmax(pg_current_snapshot())`; statement's active snapshot,

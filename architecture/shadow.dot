@@ -111,7 +111,7 @@ digraph shadow_catalog {
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>SchemaEvent variants</B></TD></TR>
       <TR><TD><B>Added</B></TD><TD>first sight of oid → CREATE TABLE (post-DROP re-create, seed_from_source)</TD></TR>
       <TR><TD><B>Changed</B></TD><TD>refetched shape ≠ prev_known: ADD/DROP/RENAME COLUMN, type widen (rejected for now)</TD></TR>
-      <TR><TD><B>Dropped</B></TD><TD>sweep_dropped poll at armed xact's commit (PendingSweeps) → DROP TABLE</TD></TR>
+      <TR><TD><B>Dropped</B></TD><TD>sweep at armed commit → configured dest action; pg_toast → durable deferred mirror retire</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>generation invariant</B></TD></TR>
       <TR><TD COLSPAN="2">one DDL → one bump → every cache entry stale on next access. Coarse-fire over-invalidates (hint-bit / autovac noise count) but never under-invalidates — schema correctness is the floor, refetch cost the negotiable.</TD></TR>
     </TABLE>

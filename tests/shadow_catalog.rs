@@ -584,6 +584,153 @@ async fn seed_baseline_makes_first_alter_emit_changed_not_added() {
     }
 }
 
+/// `seed_baseline` warms each owner's toast rel into `prev_known`, so an
+/// owner DROP with no interim chunk decode (the cold-restart state) still
+/// surfaces the toast rel's `Dropped` via `sweep_dropped`, the event the
+/// reorder coordinator retires the CH chunk mirror on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seed_baseline_warms_toast_rel_for_drop_sweep() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, 55611);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    shadow
+        .apply_schema_dump(
+            "CREATE SCHEMA wc;\n\
+             CREATE TABLE wc.doc (id bigint PRIMARY KEY, body text);\n",
+        )
+        .expect("schema dump");
+
+    let owner_oid = relation_oid(&shadow, "wc.doc");
+    let toast_oid: u32 = shadow
+        .psql_one("SELECT reltoastrelid::int8 FROM pg_class WHERE oid = 'wc.doc'::regclass")
+        .expect("psql toast relid")
+        .parse()
+        .expect("toast oid is integer");
+    assert_ne!(toast_oid, 0, "text column must give wc.doc a toast rel");
+
+    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let seeded = cat
+        .seed_baseline(&[RelName::new("wc", "doc")])
+        .await
+        .expect("seed_baseline");
+    assert_eq!(seeded, 1, "seeded counts owners, not toast rels");
+    let mut rx = cat.subscribe();
+    assert!(
+        rx.try_recv().is_err(),
+        "seed ran before subscribe — no event must have leaked",
+    );
+
+    shadow
+        .apply_schema_dump("DROP TABLE wc.doc;")
+        .expect("drop table");
+
+    let dropped = cat.sweep_dropped().await.expect("sweep_dropped");
+    assert_eq!(dropped, 2, "owner + toast rel must both surface");
+    let mut got: Vec<(u32, String)> = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        let SchemaEvent::Dropped { oid, rel_name } = ev else {
+            panic!("expected Dropped, got {ev:?}");
+        };
+        got.push((oid, rel_name.namespace.to_string()));
+    }
+    got.sort_unstable();
+    let mut want = vec![
+        (owner_oid, "wc".to_string()),
+        (toast_oid, "pg_toast".to_string()),
+    ];
+    want.sort_unstable();
+    assert_eq!(got, want, "toast Dropped must carry the pg_toast namespace");
+}
+
+/// Index descriptors resolve (stash `Skip` verdicts need them) but stay out
+/// of the event stream and `sweep_dropped`: a pg_toast index surfacing as
+/// `Dropped` would double-count the chunk-mirror retire at owner DROP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_descriptor_emits_no_events_and_skips_drop_sweep() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, 55612);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    shadow
+        .apply_schema_dump(
+            "CREATE SCHEMA wc;\n\
+             CREATE TABLE wc.doc (id bigint PRIMARY KEY, body text);\n",
+        )
+        .expect("schema dump");
+
+    let owner_oid = relation_oid(&shadow, "wc.doc");
+    let pkey_rfn: u32 = shadow
+        .psql_one("SELECT relfilenode::int8 FROM pg_class WHERE oid = 'wc.doc_pkey'::regclass")
+        .expect("pkey relfilenode")
+        .parse()
+        .expect("relfilenode is integer");
+    let toast_index_rfn: u32 = shadow
+        .psql_one(
+            "SELECT i.relfilenode::int8 FROM pg_class c \
+             JOIN pg_index x ON x.indrelid = c.reltoastrelid \
+             JOIN pg_class i ON i.oid = x.indexrelid \
+             WHERE c.oid = 'wc.doc'::regclass",
+        )
+        .expect("toast index relfilenode")
+        .parse()
+        .expect("relfilenode is integer");
+
+    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    cat.seed_baseline(&[RelName::new("wc", "doc")])
+        .await
+        .expect("seed_baseline");
+    let mut rx = cat.subscribe();
+    for rfn in [pkey_rfn, toast_index_rfn] {
+        let desc = cat
+            .relation_at(
+                walrus::pg::walparser::RelFileNode {
+                    spc_node: 1663,
+                    db_node: current_db_oid(&shadow),
+                    rel_node: rfn,
+                },
+                0,
+            )
+            .await
+            .expect("index resolves by filenode");
+        assert_eq!(desc.kind, 'i');
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "index descriptor loads must emit no Added",
+    );
+
+    shadow
+        .apply_schema_dump("DROP TABLE wc.doc;")
+        .expect("drop table");
+    let dropped = cat.sweep_dropped().await.expect("sweep_dropped");
+    assert_eq!(dropped, 2, "owner + toast rel only; indexes never tracked");
+    let mut got: Vec<String> = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        let SchemaEvent::Dropped { rel_name, .. } = ev else {
+            panic!("expected Dropped, got {ev:?}");
+        };
+        got.push(format!("{}.{}", rel_name.namespace, rel_name.name));
+    }
+    got.sort_unstable();
+    let toast_name = format!("pg_toast.pg_toast_{owner_oid}");
+    assert_eq!(got, vec![toast_name, "wc.doc".to_string()]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nonexistent_filenode_errors_not_found() {
     if !pg_available() {

@@ -17,7 +17,8 @@ fan-out and decoder keeps the decoder's `wait_for_replay` off the pump
 task so the walsender wire never stalls behind it. CH cluster is the
 pipeline tail — decode pool ×M, `InsertBatcher`, inserter pool ×N, ack
 collector — plus `DdlApplicator` (own CH connection) and
-`type_bridge`.
+`type_bridge`. TOAST side path persists TID-keyed births/tombstones,
+serves as-of fetches, and applies lifecycle barriers.
 
 ![internals](internals.svg)
 
@@ -37,8 +38,9 @@ Catalog seed → BASE_BACKUP pump (MultiplexSink fan-out) → drain to CH →
 shadow handoff → cursor + WAL pump start. Drain feeds the same shared
 insert tail streaming uses (batcher + inserter pool + ack collector),
 one ack seq per rfn flip, `tail.finish` seals + waits durable at end;
-no `DdlApplicator` wired. Each phase is a labelled cluster; node fill
-colour-codes the actor.
+TOAST rows flush before deferred external values resolve; no
+`DdlApplicator` wired. Each phase is a labelled cluster; node fill
+colour-codes actor.
 
 ![bootstrap timeline](timeline_bootstrap.svg)
 
@@ -50,7 +52,9 @@ wait on shadow without parking the wire. ⑥ is the parallel pipeline:
 reorder assigns a dense seq per commit, decode pool routes rows, the
 batcher buffers per table across xacts and seals one complete INSERT
 per budget/deadline window, inserter pool ships N in flight; the ack
-collector advances `emitter_ack_lsn` on the contiguous-done prefix.
+collector advances `emitter_ack_lsn` on contiguous-done prefix. Reorder
+persists TOAST births/tombstones before commit publication; decode uses
+in-xact maps then as-of mirror fetch.
 
 ![streaming timeline](timeline_streaming.svg)
 
@@ -59,13 +63,15 @@ collector advances `emitter_ack_lsn` on the contiguous-done prefix.
 Side-by-side columns: A. clean SIGTERM, B. kill -9 mid-stream
 (validated by `tests/kill_restart.rs` drill), C. WAL overflow →
 re-bootstrap. Includes cursor.bin six-field reference table.
+`toast_retires.bin` survives xid-spill cleanup and flushes due mirror
+retirements from persisted resume floor at standup.
 
 ![restart timelines](timeline_restart.svg)
 
 ## Component diagrams
 
-One per file under [`../plans/`](../plans/INDEX.md). Embedded inline in
-the matching plan doc. Render alongside the six above.
+Focused views for components with load-bearing topology. Embedded inline
+in matching plan docs. Render alongside six system views above.
 
 | component | source | embedded in |
 |---|---|---|
@@ -74,6 +80,7 @@ the matching plan doc. Render alongside the six above.
 | shadow | [`shadow.dot`](shadow.dot) | [`plans/shadow.md`](../plans/shadow.md) |
 | decoder | [`decoder.dot`](decoder.dot) | [`plans/decoder.md`](../plans/decoder.md) |
 | xact | [`xact.dot`](xact.dot) | [`plans/xact.md`](../plans/xact.md) |
+| TOAST | [`toast.dot`](toast.dot) | [`plans/TOAST.md`](../plans/TOAST.md) |
 | emitter | [`emitter.dot`](emitter.dot) | [`plans/emitter.md`](../plans/emitter.md) |
 | bootstrap | [`bootstrap.dot`](bootstrap.dot) | [`plans/bootstrap.md`](../plans/bootstrap.md) |
 | ops | [`ops.dot`](ops.dot) | [`plans/ops.md`](../plans/ops.md) |
@@ -114,3 +121,4 @@ for f in *.dot; do dot -Tsvg "$f" -o "${f%.dot}.svg"; dot -Tpng "$f" -o "${f%.do
 | greenfield bootstrap | [`plans/bootstrap.md`](../plans/bootstrap.md) |
 | durable cursor | [`plans/ops.md`](../plans/ops.md) |
 | xact buffer + disk spill | [`plans/xact.md`](../plans/xact.md) |
+| TOAST mirror, fetch, bootstrap, rewrite, retirement | [`plans/TOAST.md`](../plans/TOAST.md) |

@@ -59,7 +59,15 @@ Barrier xacts (any `SchemaEvent` or `HeapOp::Truncate` in the drain)
 run synchronously: data segments between catalog ops each get their own
 seq, and each DDL / TRUNCATE is preceded by `barrier_fence()` — wait
 all dispatched seqs *placed*, `FlushAll` the batcher, wait all seqs
-*durable* — then `DdlApplicator::apply` / `truncate`. Barrier
+*durable* — then `DdlApplicator::apply` / `truncate`. Toast lifecycle
+rides the same applies: owner TRUNCATE wipes the toast mirror in-slice;
+a toast rel's `Dropped` only queues its retire (durably, in the
+`toast_retires.bin` ledger) — the wipe defers until the persisted
+resume floor's segment passes the dropping commit, flushed at commit
+boundaries, idle advance, and pipeline standup ([TOAST.md](TOAST.md)
+Lifecycle). The slice's `new_rows` puts interleave with the
+applies via sealed merge cursors ([TOAST.md](TOAST.md)
+Lifecycle). Barrier
 coarseness is deliberate; DDL and TRUNCATE are rare. Trailing data
 after the last event flows async, already encoding against the
 post-DDL shape
@@ -340,7 +348,10 @@ originate at `ShadowCatalog::subscribe`
 (`mpsc::UnboundedReceiver<SchemaEvent>` — unbounded so a stalled
 consumer never back-pressures the catalog producer), ride the xact
 buffer keyed on `(xid, source_lsn)`, and surface in `drain_committed`'s
-`ordered_events`; the barrier applies each in source-LSN order. Apply
+`ordered_events`; the barrier applies each in source-LSN order.
+`DrainEntry::ToastBarrier` rides the same loop at commit LSN: the
+put-cursor flushes the generation's births first, then the barrier runs
+the store-side residual insert-select ([TOAST.md](TOAST.md)). Apply
 table:
 
 | `SchemaEvent` | CH SQL |

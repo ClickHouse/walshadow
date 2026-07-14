@@ -1256,6 +1256,30 @@ fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Decode
     Ok((value, (end - abs) + 1)) // include trailing NUL
 }
 
+/// Take `(chunk_id, chunk_seq, chunk_data)` out of a `pg_toast_*` tuple's
+/// 3 columns (`chunk_id oid`, `chunk_seq int4`, `chunk_data bytea`);
+/// `None` for shapes that don't fit
+pub(crate) fn take_toast_chunk_columns(
+    cols: &mut [Option<ColumnValue>],
+) -> Option<(u32, u32, Vec<u8>)> {
+    if cols.len() < 3 {
+        return None;
+    }
+    let &ColumnValue::Oid(chunk_id) = cols[0].as_ref()? else {
+        return None;
+    };
+    let &ColumnValue::Int4(chunk_seq) = cols[1].as_ref()? else {
+        return None;
+    };
+    let chunk_data = match cols[2].take()? {
+        ColumnValue::Bytea(b) => b,
+        // Text-typed toast chunk: re-encode to bytes (not a normal flow)
+        ColumnValue::Text(s) => s.into_bytes(),
+        _ => return None,
+    };
+    Some((chunk_id, chunk_seq as u32, chunk_data))
+}
+
 /// True iff `attnum` is part of the relation's replica identity. Emitter gates
 /// delete/update old-key propagation on this, staying agnostic to [`ReplIdent`].
 pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {

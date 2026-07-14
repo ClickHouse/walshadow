@@ -509,6 +509,11 @@ pub struct Pipeline {
     pub chunk_buf: Vec<u8>,
     pub handle: PipelineHandle,
     pub ack: Arc<AtomicU64>,
+    /// Persisted-resume-cursor stand-in gating deferred toast-mirror
+    /// retires; the daemon's status loop advances it after each durable
+    /// cursor write, tests store into it directly. Seeds at the boot
+    /// head, so retires queued by this run defer until a test advances it.
+    pub resume_floor: Arc<AtomicU64>,
     /// Same `EmitterStats` Arc the daemon exports to Prometheus; lets tests
     /// assert the parallel path keeps the emitter counters live.
     pub stats: Arc<EmitterStats>,
@@ -703,6 +708,14 @@ async fn build_pipeline_inner(
         .with_resolver(config_resolver.clone());
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
+    // Boot head stands in for the daemon's cursor resume point: retires
+    // queued by this run defer (their drop commits past the head) until a
+    // test advances the floor; ledger entries from a prior run's drop
+    // segment are due and retire in the boot flush below.
+    let resume_floor = Arc::new(AtomicU64::new(ident.xlogpos));
+    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir)
+        .await
+        .expect("load toast retire ledger");
     // COPY backfiller (`initial_load='copy'` opt-ins): own source SQL session +
     // CH tail per backfill, resume ledger beside the spill dir (mirrors
     // bin/stream.rs when `[runtime_config] schema` is set).
@@ -738,11 +751,19 @@ async fn build_pipeline_inner(
         span_registry: None,
         config_resolver: Some(config_resolver.clone()),
         backfiller,
+        retires,
+        resume_floor: resume_floor.clone(),
     };
-    let (reorder, handle) = pcfg
+    let (mut reorder, handle) = pcfg
         .spawn(emitter_ack.clone())
         .await
         .expect("spawn decode+insert pipeline");
+    // Prior run's drop segment is below the boot head; retire its queued
+    // mirrors now — no commit will replay the drop (mirrors bin/stream.rs)
+    reorder
+        .flush_due_retires()
+        .await
+        .expect("boot flush of due toast-mirror retires");
 
     let mut decoder = BufferingDecoderSink::new(catalog, xact_buffer.clone())
         .with_catalog_signals(inv_epoch, ddl.as_ref().map(|_| pending_sweeps.clone()));
@@ -770,6 +791,7 @@ async fn build_pipeline_inner(
         chunk_buf,
         handle,
         ack: emitter_ack,
+        resume_floor,
         stats,
     }
 }
@@ -833,6 +855,23 @@ pub async fn pump_segments(
         deadline,
     )
     .await
+}
+
+/// Poll `sql` until it returns `want` or the deadline passes (commit drains
+/// land asynchronously after a segment ships).
+pub async fn wait_query(ch: &ChServer, sql: &str, want: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let got = ch.query(sql).unwrap_or_else(|_| "<query failed>".into());
+        if got == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: want {want:?}, last {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Driver thread that fires a sequence of `-c` statements at the source

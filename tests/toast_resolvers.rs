@@ -1,17 +1,17 @@
-//! All three `[toast] mode` resolvers built via `from_config`, driven through
-//! the same `ToastResolver` flow (`put_map` / `fetch_into`) the WAL +
-//! bootstrap paths use: `clickhouse` and `disk` share one store-backed
-//! scenario, `disabled` pins the no-store policy (put_map no-op, fetch_into
-//! false, fill-on-miss).
+//! Both `[toast] mode` resolvers built via `from_config`, driven through the
+//! same `ToastResolver` flow (`put` / `fetch_into`) the WAL + bootstrap paths
+//! use: `clickhouse` runs a store-backed scenario, `disabled` pins the
+//! no-store policy (put no-op, fetch_into false, fill-on-miss).
 //!
 //! The ClickHouse chunk-store backend additionally runs against a real
-//! ClickHouse: chunk rows mirror `pg_toast_<relid>` relations, `put` writes
-//! them, `fetch` reads them back into the reassembler's `(seq -> bytes)` map.
-//! Pins the schema (`ReplacingMergeTree(_lsn)` keyed on
-//! `(chunk_id, chunk_seq)`), the byte-transparency of `chunk_data` (raw bytea,
-//! non-UTF-8 included), the missing-table -> empty-map convention, `_lsn`
-//! convergence on re-put, newest-generation selection under `va_valueid`
-//! reuse, and death-LSN-bounded GC deletes.
+//! ClickHouse: TID-keyed rows mirror `pg_toast_<relid>` relations, `put`
+//! writes chunk births + delete tombstones, `fetch` resolves per-TID as-of
+//! state at the referring LSN into the reassembler's `(seq -> bytes)` map.
+//! Pins the v2 schema (`ReplacingMergeTree(_lsn, _is_deleted)` ordered by
+//! TID), byte-transparency of `chunk_data` (raw bytea, non-UTF-8 included),
+//! the missing-mirror hard error, tombstone visibility, TID reuse,
+//! reused-`va_valueid` generation separation, and fetch over
+//! merge-collapsed parts.
 //!
 //! Full pipeline coverage (PG WAL -> reassembly -> CH row) lives in
 //! `toast_e2e.rs`.
@@ -26,23 +26,34 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::spill::ToastChunk;
-use walshadow::toast::{ChunkMap, ChunkStore, ClickHouseChunkStore, ToastMode, ToastResolver};
+use walshadow::spill::ToastDelete;
+use walshadow::toast::{
+    ChunkMap, ChunkStore, ChunkStoreError, ClickHouseChunkStore, ToastMode, ToastResolver, ToastRow,
+};
 
 const CH_TCP_PORT: u16 = 17639;
 const CH_HTTP_PORT: u16 = 17640;
 const DB: &str = "walshadow_toast_test";
 
-fn chunk(relid: u32, value_id: u32, seq: u32, lsn: u64, body: &[u8]) -> ToastChunk {
-    ToastChunk {
+fn row(relid: u32, value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
+    ToastRow {
         toast_relid: relid,
-        value_id,
+        blkno: tid.0,
+        offnum: tid.1,
+        chunk_id: value_id,
         chunk_seq: seq,
-        source_lsn: lsn,
-        blkno: 0,
-        offnum: 0,
         chunk_data: body.to_vec(),
+        lsn,
     }
+}
+
+fn tomb(relid: u32, tid: (u32, u16), lsn: u64) -> ToastRow {
+    ToastRow::tombstone(&ToastDelete {
+        toast_relid: relid,
+        blkno: tid.0,
+        offnum: tid.1,
+        source_lsn: lsn,
+    })
 }
 
 fn config(port: u16) -> EmitterConfig {
@@ -54,21 +65,23 @@ fn config(port: u16) -> EmitterConfig {
     }
 }
 
-/// WAL-path scenario shared by both store-backed resolvers (disk, clickhouse):
-/// stamp an in-xact chunk map at commit LSN, rehydrate a pre-window re-emit
-/// via `fetch_into`, surface a genuine gap as `false`.
+/// WAL-path scenario for the store-backed resolver: put chunk rows at their
+/// record LSNs, rehydrate a pre-window re-emit via `fetch_into`, surface a
+/// genuine miss as `false`, count tombstones separately.
 async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
     assert!(resolver.stores_chunks());
     assert!(!resolver.fill_on_miss());
 
-    // The WAL path's in-xact chunk map, stamped with the commit LSN.
-    let mut map = ChunkMap::new();
-    map.insert(
-        (16700, 42),
-        BTreeMap::from([(0u32, b"hello ".to_vec()), (1u32, b"world".to_vec())]),
-    );
-    resolver.put_map(&map, 0xABCD).await.unwrap();
+    resolver
+        .put(&[
+            row(16700, 42, 0, (1, 1), 0xAB00, b"hello "),
+            row(16700, 42, 1, (1, 2), 0xAB01, b"world"),
+            tomb(16700, (9, 9), 0xAB02),
+        ])
+        .await
+        .unwrap();
     assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.toast_tombstones_stored.load(Ordering::Relaxed), 1);
 
     // Pre-window re-emit: the in-xact buffer missed these chunks, so the
     // reassembler rehydrates them from the store.
@@ -84,7 +97,7 @@ async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
     assert_eq!(value.get(&1).unwrap(), b"world");
     assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
 
-    // Genuine gap -> no hydration, false (caller surfaces the miss).
+    // Genuine miss -> no hydration, false (caller fills + counts).
     let mut empty = ChunkMap::new();
     assert!(
         !resolver
@@ -113,23 +126,27 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     // is raw-byte transparent, not text.
     store
         .put(&[
-            chunk(16500, 7, 0, 0x1000, b"abc"),
-            chunk(16500, 7, 1, 0x1000, b"de"),
+            row(16500, 7, 0, (1, 1), 0x1000, b"abc"),
+            row(16500, 7, 1, (1, 2), 0x1001, b"de"),
         ])
         .await
         .unwrap();
+    // Background merges collapse superseded versions on their own schedule
+    // (the design's superseded-fill case). Freeze the mirror — targeted, and
+    // only once the first put created it: a global STOP MERGES doesn't cover
+    // tables created after it. Re-enabled before the merge stage.
+    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_16500"))
+        .expect("stop merges");
     store
-        .put(&[chunk(16500, 7, 2, 0x1000, b"\x00\xff\x01")])
+        .put(&[row(16500, 7, 2, (1, 3), 0x1002, b"\x00\xff\x01")])
         .await
         .unwrap();
-    store
-        .put(&[chunk(16500, 9, 0, 0x1000, b"zz")])
-        .await
-        .unwrap();
+    // Multi-relid put splits per table
     store
         .put(&[
-            chunk(16600, 3, 0, 0x1000, b"xy"),
-            chunk(16600, 3, 1, 0x1000, b"z"),
+            row(16500, 9, 0, (3, 1), 0x1100, b"zz"),
+            row(16600, 3, 0, (1, 1), 0x1100, b"xy"),
+            row(16600, 3, 1, (1, 2), 0x1101, b"z"),
         ])
         .await
         .unwrap();
@@ -150,10 +167,16 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         BTreeMap::from([(0u32, b"xy".to_vec()), (1u32, b"z".to_vec())])
     );
 
+    // Bound below every row -> no generation visible yet.
+    assert!(store.fetch(16500, 7, 0x0fff).await.unwrap().is_empty());
     // Table exists, no such value_id -> empty (caller decides fill vs error).
     assert!(store.fetch(16500, 999, u64::MAX).await.unwrap().is_empty());
-    // Relation never received a chunk -> no CH table -> empty, not error.
-    assert!(store.fetch(70000, 1, u64::MAX).await.unwrap().is_empty());
+    // Relation never received a chunk -> no CH table -> hard error, fast
+    // (no retry): mirror absence is never proof of supersession.
+    assert!(matches!(
+        store.fetch(70000, 1, u64::MAX).await,
+        Err(ChunkStoreError::MissingMirror(70000))
+    ));
 
     // Rows really landed on CH, in the mirrored table.
     assert_eq!(
@@ -162,97 +185,214 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         "4"
     );
 
-    // Reused OID with same shape under a higher generation LSN. Both
-    // generations remain addressable until GC.
+    // Re-put is byte-identical (replay re-emit): RMT collapses the copies.
     store
-        .put(&[
-            chunk(16500, 7, 0, 0x2000, b"abc"),
-            chunk(16500, 7, 1, 0x2000, b"de"),
-            chunk(16500, 7, 2, 0x2000, b"\x00\xff\x01"),
-        ])
+        .put(&[row(16500, 7, 0, (1, 1), 0x1000, b"abc")])
         .await
         .unwrap();
-    let after = store.fetch(16500, 7, u64::MAX).await.unwrap();
-    assert_eq!(after.get(&0).unwrap(), b"abc");
-    assert_eq!(after.len(), 3);
     assert_eq!(
         ch.query(&format!("SELECT count() FROM {DB}.pg_toast_16500 FINAL"))
             .unwrap(),
-        "7",
-        "generation key retains old rows for lagging decode"
-    );
-    assert_eq!(
-        ch.query(&format!(
-            "SELECT max(_lsn) FROM {DB}.pg_toast_16500 WHERE chunk_id = 7 AND chunk_seq = 0"
-        ))
-        .unwrap(),
-        "8192",
-        "newest generation is present"
+        "4",
+        "re-emit dedups under (TID, _lsn)"
     );
 
-    // Reused-OID regeneration, shorter than its predecessor: fetch returns
-    // the newest generation whole, never new seq 0 + stale suffix.
+    // Death of value 9: a tombstone at its TID. Visible history is as-of.
+    store.put(&[tomb(16500, (3, 1), 0x1800)]).await.unwrap();
+    assert_eq!(
+        store.fetch(16500, 9, 0x17FF).await.unwrap(),
+        BTreeMap::from([(0u32, b"zz".to_vec())]),
+        "referrer before the death still resolves"
+    );
+    assert!(
+        store.fetch(16500, 9, u64::MAX).await.unwrap().is_empty(),
+        "dead past its tombstone"
+    );
+
+    // Line-pointer reuse: a new value born at the dead TID supersedes the
+    // tombstone; the old occupant stays dead, its window intact.
+    store
+        .put(&[row(16500, 13, 0, (3, 1), 0x2000, b"reborn")])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fetch(16500, 13, u64::MAX).await.unwrap(),
+        BTreeMap::from([(0u32, b"reborn".to_vec())])
+    );
+    assert!(store.fetch(16500, 9, u64::MAX).await.unwrap().is_empty());
+    assert_eq!(
+        store.fetch(16500, 9, 0x17FF).await.unwrap(),
+        BTreeMap::from([(0u32, b"zz".to_vec())])
+    );
+
+    // Reused va_valueid: generation 1 dies (tombstones), generation 2 lands
+    // at fresh TIDs, shorter. A lagging referrer keeps generation 1 whole; a
+    // current one gets generation 2 only — never new seq 0 + stale suffix.
     store
         .put(&[
-            chunk(16500, 11, 0, 0x1000, b"g1-0"),
-            chunk(16500, 11, 1, 0x1000, b"g1-1"),
-            chunk(16500, 11, 2, 0x1000, b"g1-2"),
+            row(16500, 11, 0, (5, 1), 0x3000, b"g1-0"),
+            row(16500, 11, 1, (5, 2), 0x3001, b"g1-1"),
+            row(16500, 11, 2, (5, 3), 0x3002, b"g1-2"),
         ])
         .await
         .unwrap();
     store
         .put(&[
-            chunk(16500, 11, 0, 0x4000, b"g2-0"),
-            chunk(16500, 11, 1, 0x4000, b"g2-1"),
+            tomb(16500, (5, 1), 0x3800),
+            tomb(16500, (5, 2), 0x3801),
+            tomb(16500, (5, 3), 0x3802),
+            row(16500, 11, 0, (6, 1), 0x4000, b"g2-0"),
+            row(16500, 11, 1, (6, 2), 0x4001, b"g2-1"),
         ])
         .await
         .unwrap();
-    let old = store.fetch(16500, 11, 0x1800).await.unwrap();
+    let old = store.fetch(16500, 11, 0x3400).await.unwrap();
     assert_eq!(old.len(), 3, "older referrer keeps first generation");
     assert_eq!(old.get(&0).unwrap(), b"g1-0");
     let regen = store.fetch(16500, 11, u64::MAX).await.unwrap();
-    assert_eq!(regen.len(), 2, "stale generation's seq 2 dropped");
+    assert_eq!(regen.len(), 2, "dead generation's seq 2 dropped");
     assert_eq!(regen.get(&0).unwrap(), b"g2-0");
     assert_eq!(regen.get(&1).unwrap(), b"g2-1");
 
-    // GC: death-LSN-bounded deletes. A death below a value's rows deletes
-    // nothing (rebirth past the death survives, replayed deaths no-op).
-    assert_eq!(store.gc_values(16500, &[(9, 0x0800)]).await.unwrap(), 0);
-    assert_eq!(
-        store.fetch(16500, 9, u64::MAX).await.unwrap(),
-        BTreeMap::from([(0u32, b"zz".to_vec())]),
-        "rows past the death bound survive"
-    );
-
-    // Death at the value's LSN collects it; unrelated value untouched.
-    assert_eq!(store.gc_values(16500, &[(9, 0x1000)]).await.unwrap(), 1);
-    assert!(store.fetch(16500, 9, u64::MAX).await.unwrap().is_empty());
-    assert_eq!(store.fetch(16500, 7, u64::MAX).await.unwrap().len(), 3);
-    // Idempotent re-delete: rows already gone, nothing counted.
-    assert_eq!(store.gc_values(16500, &[(9, 0x1000)]).await.unwrap(), 0);
-
-    // Generation separation mid-reuse: value 11's first generation died at
-    // 0x1800 (before the 0x4000 rebirth); the bounded delete collects the
-    // dead generation while the live one keeps serving.
-    assert_eq!(store.gc_values(16500, &[(11, 0x1800)]).await.unwrap(), 1);
-    let survivor = store.fetch(16500, 11, u64::MAX).await.unwrap();
-    assert_eq!(survivor.len(), 2);
-    assert_eq!(survivor.get(&0).unwrap(), b"g2-0");
+    // Merge is the reclaimer: OPTIMIZE FINAL collapses superseded versions
+    // per TID (dead chunk_data reclaimed, tombstones retained), and fetch
+    // stays correct over the merged parts.
+    ch.query(&format!("SYSTEM START MERGES {DB}.pg_toast_16500"))
+        .expect("start merges");
+    ch.query(&format!("OPTIMIZE TABLE {DB}.pg_toast_16500 FINAL"))
+        .unwrap();
     assert_eq!(
         ch.query(&format!(
-            "SELECT count() FROM {DB}.pg_toast_16500 WHERE chunk_id = 11"
+            "SELECT count() FROM {DB}.pg_toast_16500 WHERE chunk_id = 11 AND _is_deleted = 0"
         ))
         .unwrap(),
         "2",
-        "dead generation's rows physically gone"
+        "dead generation's data rows merged away, no walshadow GC"
+    );
+    assert_eq!(
+        ch.query(&format!(
+            "SELECT count() FROM {DB}.pg_toast_16500 WHERE chunk_id = 9"
+        ))
+        .unwrap(),
+        "0",
+        "tombstoned value's data row merged away"
+    );
+    assert_eq!(
+        store.fetch(16500, 11, u64::MAX).await.unwrap().len(),
+        2,
+        "fetch over merged parts"
+    );
+    // Collapsed history: the lagging bound now misses — the documented
+    // superseded-fill case, empty not error.
+    assert!(store.fetch(16500, 11, 0x3400).await.unwrap().is_empty());
+    assert!(store.fetch(16500, 9, 0x17FF).await.unwrap().is_empty());
+
+    // Mirror wipe (owner TRUNCATE / retired toast rel): rows gone, table
+    // kept — fetch turns empty (superseded fill), never MissingMirror.
+    store.truncate_mirror(16600).await.unwrap();
+    assert!(store.fetch(16600, 3, u64::MAX).await.unwrap().is_empty());
+    assert_eq!(
+        ch.query(&format!("SELECT count() FROM {DB}.pg_toast_16600"))
+            .unwrap(),
+        "0"
+    );
+    // Never-created mirror stays missing (TRUNCATE ... IF EXISTS no-op).
+    store.truncate_mirror(70000).await.unwrap();
+    assert!(matches!(
+        store.fetch(70000, 1, u64::MAX).await,
+        Err(ChunkStoreError::MissingMirror(70000))
+    ));
+    // Post-wipe births repopulate the kept table.
+    store
+        .put(&[row(16600, 5, 0, (9, 1), 0x5000, b"post-wipe")])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fetch(16600, 5, u64::MAX).await.unwrap(),
+        BTreeMap::from([(0u32, b"post-wipe".to_vec())])
+    );
+}
+
+/// `rewrite_barrier` against real CH: residual `O - B` tombstones at the
+/// commit LSN for TIDs live as of the marker with no row past it; reused
+/// TIDs and pre-marker deaths untouched; re-runs insert nothing (replay
+/// convergence); missing mirror no-ops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ch_chunk_store_rewrite_barrier_residuals() {
+    if !fx::clickhouse_available() {
+        eprintln!("skip: no clickhouse binary on PATH");
+        return;
+    }
+    let ch_tmp = tempfile::tempdir().unwrap();
+    // +8: sibling tests' interserver ports are their http_port + 1
+    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT + 8, CH_HTTP_PORT + 8).expect("spawn ch");
+    ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
+        .expect("create db");
+
+    let store = ClickHouseChunkStore::new(config(ch.port));
+    // Old generation: value 7 at (0,1)/(0,2), value 9 dead pre-marker at
+    // (0,3), value 11 live at (1,1). The death rides its own put: RMT
+    // collapses same-key rows within one inserted block regardless of
+    // merge state, and the as-of assertions below need (0,3)'s history.
+    store
+        .put(&[
+            row(16800, 7, 0, (0, 1), 0x1000, b"a"),
+            row(16800, 7, 1, (0, 2), 0x1001, b"b"),
+            row(16800, 9, 0, (0, 3), 0x1002, b"c"),
+            row(16800, 11, 0, (1, 1), 0x1003, b"d"),
+        ])
+        .await
+        .unwrap();
+    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_16800"))
+        .expect("stop merges");
+    store.put(&[tomb(16800, (0, 3), 0x1500)]).await.unwrap();
+    // Rewrite generation reuses (0,1) for value 7's single chunk.
+    store
+        .put(&[row(16800, 7, 0, (0, 1), 0x3000, b"a2")])
+        .await
+        .unwrap();
+    store.rewrite_barrier(16800, 0x2000, 0x4000).await.unwrap();
+
+    // Residuals: (0,2) and (1,1) die at the commit LSN; reused (0,1) and
+    // pre-marker-dead (0,3) untouched.
+    assert_eq!(
+        ch.query(&format!(
+            "SELECT groupArray((blkno, offnum)) FROM (\
+               SELECT blkno, offnum FROM {DB}.pg_toast_16800 \
+               WHERE _lsn = 16384 AND _is_deleted = 1 ORDER BY blkno, offnum)"
+        ))
+        .unwrap(),
+        "[(0,2),(1,1)]"
+    );
+    assert_eq!(
+        store.fetch(16800, 7, u64::MAX).await.unwrap(),
+        BTreeMap::from([(0u32, b"a2".to_vec())]),
+        "reused TID survives at its birth version"
+    );
+    assert!(store.fetch(16800, 11, u64::MAX).await.unwrap().is_empty());
+    // Pre-rewrite window intact: no destructive step ran.
+    assert_eq!(store.fetch(16800, 7, 0x1fff).await.unwrap().len(), 2);
+    assert_eq!(
+        store.fetch(16800, 9, 0x14ff).await.unwrap(),
+        BTreeMap::from([(0u32, b"c".to_vec())])
     );
 
-    // Never-stored relid mirrors fetch's missing-table convention.
-    assert_eq!(store.gc_values(70000, &[(1, u64::MAX)]).await.unwrap(), 0);
+    // Replay re-run: prior residuals sit past the marker, nothing inserts.
+    store.rewrite_barrier(16800, 0x2000, 0x4000).await.unwrap();
+    assert_eq!(
+        ch.query(&format!(
+            "SELECT count() FROM {DB}.pg_toast_16800 WHERE _lsn = 16384"
+        ))
+        .unwrap(),
+        "2",
+        "barrier re-run must insert nothing"
+    );
+    // Never-populated mirror: no table, nothing lived, no-op.
+    store.rewrite_barrier(70000, 0x10, 0x20).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ch_resolver_put_map_then_fetch_into() {
+async fn ch_resolver_put_rows_then_fetch_into() {
     if !fx::clickhouse_available() {
         eprintln!("skip: no clickhouse binary on PATH");
         return;
@@ -266,23 +406,8 @@ async fn ch_resolver_put_map_then_fetch_into() {
     let mut cfg = config(ch.port);
     cfg.toast.mode = ToastMode::ClickHouse;
     let stats = Arc::new(EmitterStats::default());
-    let resolver = ToastResolver::from_config(&cfg, stats.clone()).unwrap();
-    assert_eq!(resolver.mode(), ToastMode::ClickHouse);
-    drive_store_backed(&resolver, &stats).await;
-}
-
-#[tokio::test]
-async fn disk_resolver_put_map_then_fetch_into() {
-    let mut cfg = EmitterConfig::default();
-    cfg.toast.mode = ToastMode::Disk;
-    // mode=disk without disk_dir is a config error, not a silent fallback.
-    assert!(ToastResolver::from_config(&cfg, Arc::new(EmitterStats::default())).is_err());
-
-    let dir = tempfile::tempdir().unwrap();
-    cfg.toast.disk_dir = Some(dir.path().to_path_buf());
-    let stats = Arc::new(EmitterStats::default());
-    let resolver = ToastResolver::from_config(&cfg, stats.clone()).unwrap();
-    assert_eq!(resolver.mode(), ToastMode::Disk);
+    let resolver = ToastResolver::from_config(&cfg, stats.clone());
+    assert!(resolver.stores_chunks());
     drive_store_backed(&resolver, &stats).await;
 }
 
@@ -291,15 +416,15 @@ async fn disabled_resolver_no_store_fills_on_miss() {
     // ToastMode::Disabled is the config default.
     let cfg = EmitterConfig::default();
     let stats = Arc::new(EmitterStats::default());
-    let resolver = ToastResolver::from_config(&cfg, stats.clone()).unwrap();
-    assert_eq!(resolver.mode(), ToastMode::Disabled);
+    let resolver = ToastResolver::from_config(&cfg, stats.clone());
     assert!(!resolver.stores_chunks());
     assert!(resolver.fill_on_miss());
 
-    // put_map is a no-op: nothing persisted, nothing counted.
-    let mut map = ChunkMap::new();
-    map.insert((16700, 42), BTreeMap::from([(0u32, b"hello".to_vec())]));
-    resolver.put_map(&map, 0xABCD).await.unwrap();
+    // put is a no-op: nothing persisted, nothing counted.
+    resolver
+        .put(&[row(16700, 42, 0, (1, 1), 0xAB00, b"hello")])
+        .await
+        .unwrap();
     assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 0);
 
     // No store to hydrate from: false even for a just-put value, out untouched.

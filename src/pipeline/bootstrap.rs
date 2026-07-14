@@ -1,38 +1,8 @@
-//! Bootstrap producer — feeds shared insert [`tail`](crate::pipeline::tail)
-//! from a page walk.
+//! Bootstrap page-walk producer
 //!
-//! Greenfield base backup: every row `op=Insert` at one `_lsn = start_lsn`,
-//! no aborts/TRUNCATE/DDL barriers. Resolve + map only, no detoast or oracle
-//! resolution (Option A in `plans/future/pipeline_backpressure_and_scaling.md`);
-//! page-walk decode stays single-threaded in
-//! [`PageWalkSink`](crate::backup_page_walk::PageWalkSink).
-//!
-//! ## Synthetic seq scheme — one seq per rfn
-//!
-//! Collector keys on dense `seq`s with `commit_lsn` monotonic in `seq`.
-//! Bootstrap has no commit boundaries and one uniform `_lsn`, so synthesizes
-//! seqs. `PageWalkSink` emits a rfn's rows contiguously, so unit is one seq
-//! per rfn: `register(seq, commit_lsn = start_lsn)` at first row,
-//! `placed(seq, rows)` at rfn flip (or channel close).
-//!
-//! Every seq shares `commit_lsn = start_lsn`, so the contiguous-done
-//! frontier proves durability (`wait_through(K)`) but published `emitter_ack`
-//! saturates at `start_lsn`. Caller advances resume LSN to `end_lsn` after
-//! `wait_through(K)`: durability and persisted resume LSN differ here.
-//!
-//! Under `object_store` fan-out the drain is sole channel consumer, assigning
-//! seqs by rfn-flips as observed in the channel. Interleaving parts yield more
-//! dense seqs and a rfn may span several, handled by the per-seq refcount.
-//!
-//! ## TOAST — explicit fail-fast at the producer
-//!
-//! Option-A drain does no detoast and page walk has no `pg_toast_*`
-//! reassembly, so externally-toasted mapped columns can't be reproduced.
-//! Detect `ColumnValue::ExternalToast` before routing and fail fast with
-//! relation + column, rather than a generic `EmitterError::UnsupportedValue`
-//! deep in the inserter pool whose "xact buffer should have reassembled"
-//! wording is meaningless here. TOAST assembly is its own work item (see
-//! `plans/future/TOAST.md`).
+//! Every row uses `start_lsn`. Persist TOAST mirrors before resolving deferred
+//! referrers. Caller waits through synthetic sequence frontier before advancing
+//! resume LSN to backup end
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -45,49 +15,27 @@ use crate::heap_decoder::ColumnValue;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::shadow_catalog::RelDescriptor;
-use crate::spill::ToastChunk;
-use crate::toast::{ChunkMap, ToastResolver};
-use crate::toast_tid::TidEvent;
-use crate::xact_buffer::{detoasted_value, try_reassemble};
+use crate::toast::{ChunkMap, ToastResolver, ToastRow};
+use crate::xact_buffer::{Reassembled, detoasted_value, try_reassemble};
 
-/// Caller runs the completion sequence from this: `FlushAll` →
-/// `wait_through(next_seq)` → advance resume LSN.
+/// Completion frontier for `FlushAll` and resume advance
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BootstrapDrainOutcome {
-    /// Dense over `[0, next_seq)`; durability proof is `wait_through(next_seq)`.
+    /// Dense over `[0, next_seq)`
     pub next_seq: u64,
     pub rows_routed: u64,
 }
 
-/// Chunk-put batch size: a value's chunks span pages, so accumulate before
-/// hitting the store rather than one append per chunk.
 const CHUNK_PUT_BATCH: usize = 256;
 
-/// A main-table tuple whose mapped value is externally TOASTed, held until
-/// the whole walk completes so its chunks (in any later `pg_toast_*` file)
-/// are durable before reassembly. Bounded by the count of toasted rows.
+/// Referrer waiting for later `pg_toast_*` files
 struct Deferred {
     tuple: BackfillTuple,
     rel: Arc<RelDescriptor>,
     mapping: Arc<TableMapping>,
 }
 
-/// Drain page-walk tuples into the shared tail.
-///
-/// Synthesizes one seq per rfn against `ack`. Unmapped/unresolved relations
-/// skipped (bumping `unsupported_relations`, matching WAL decode pool).
-///
-/// TOAST per `resolver`:
-/// * `pg_toast_*` tuples (a chunk store is configured, so the page walk
-///   surfaced them) are reinterpreted into chunks and persisted, never
-///   routed to a destination table.
-/// * a main-table tuple with a mapped externally-TOASTed value is, with a
-///   store, *deferred* and resolved after the walk (its chunks may live in a
-///   `pg_toast_*` file walked later); disabled, it is NULL/default-filled
-///   inline.
-///
-/// Errors when the batcher channel closes early (tail tripped `fatal`) or,
-/// in disk/CH mode, when a deferred value's chunks are genuinely absent.
+/// Drain page-walk tuples into shared insert tail
 pub async fn drain(
     mut rx: mpsc::Receiver<BackfillTuple>,
     catalog: CatalogMap,
@@ -99,9 +47,8 @@ pub async fn drain(
 ) -> Result<BootstrapDrainOutcome, String> {
     let mut next_seq = 0u64;
     let mut rows_routed = 0u64;
-    // rfn currently accumulating: (rfn, its seq, rows routed for it)
     let mut open: Option<(walrus::pg::walparser::RelFileNode, u64, u64)> = None;
-    let mut chunk_batch: Vec<ToastChunk> = Vec::new();
+    let mut chunk_batch: Vec<ToastRow> = Vec::new();
     let mut deferred: Vec<Deferred> = Vec::new();
     let mut start_lsn = 0u64;
 
@@ -110,8 +57,6 @@ pub async fn drain(
         let source_lsn = tuple.source_lsn;
         start_lsn = source_lsn;
 
-        // rfn flip (or first tuple): place prior seq, register new.
-        // commit_lsn = source_lsn = start_lsn for every bootstrap row
         let same = matches!(&open, Some((r, _, _)) if *r == rfn);
         let seq = if same {
             open.as_ref().expect("same implies open").1
@@ -126,21 +71,16 @@ pub async fn drain(
             s
         };
 
-        // Page walk only emits known filenodes, so catalog miss is defensive;
-        // mapping miss is a relation in no destination.
         let Some(rel) = catalog.get(rfn.db_node, rfn.rel_node) else {
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
 
-        // pg_toast_* tuple: reinterpret into a chunk + persist. The seq stays
-        // a zero-row placeholder (no destination row). `rel.oid` matches the
-        // referring pointer's `va_toastrelid`.
         if catalog.is_toast(rfn.db_node, rfn.rel_node) {
-            if let Some(chunk) = chunk_from_columns(&tuple, rel.oid) {
-                chunk_batch.push(chunk);
+            if let Some(row) = row_from_columns(tuple, rel.oid) {
+                chunk_batch.push(row);
                 if chunk_batch.len() >= CHUNK_PUT_BATCH {
-                    flush_chunks(&resolver, &mut chunk_batch, source_lsn).await?;
+                    flush_chunks(&resolver, &mut chunk_batch).await?;
                 }
             }
             continue;
@@ -154,7 +94,6 @@ pub async fn drain(
 
         if has_mapped_external_toast(&tuple, &mapping) {
             if resolver.stores_chunks() {
-                // Defer: chunks may live in a pg_toast_* file not yet walked.
                 deferred.push(Deferred {
                     tuple,
                     rel,
@@ -162,7 +101,6 @@ pub async fn drain(
                 });
                 continue;
             }
-            // Disabled: NULL/default-fill inline (no store to consult).
             let mut tuple = tuple;
             resolve_or_fill_toast(&mut tuple, &rel, &mapping, &resolver).await?;
             route_row(&msg_tx, seq, rel, mapping, tuple).await?;
@@ -178,9 +116,8 @@ pub async fn drain(
         ack.placed(seq, rows);
     }
 
-    // All chunks durable before resolving deferred referrers.
     if !chunk_batch.is_empty() {
-        flush_chunks(&resolver, &mut chunk_batch, start_lsn).await?;
+        flush_chunks(&resolver, &mut chunk_batch).await?;
     }
 
     if !deferred.is_empty() {
@@ -213,7 +150,6 @@ pub async fn drain(
     })
 }
 
-/// Increment the open seq's routed-row count + the running total.
 fn bump(open: &mut Option<(walrus::pg::walparser::RelFileNode, u64, u64)>, rows_routed: &mut u64) {
     if let Some(slot) = open.as_mut() {
         slot.2 += 1;
@@ -240,9 +176,7 @@ async fn route_row(
         .map_err(|_| "bootstrap: batcher channel closed".to_string())
 }
 
-/// True when a mapped (shipped) column carries an unresolved TOAST pointer.
-/// Encoder ships exactly `mapping.columns`, so a toasted column outside the
-/// mapping never reaches ClickHouse and needn't resolve.
+/// Check only columns routed to ClickHouse
 fn has_mapped_external_toast(tuple: &BackfillTuple, mapping: &TableMapping) -> bool {
     mapping.columns.iter().any(|c| {
         usize::try_from(c.src_attnum as i32 - 1)
@@ -252,9 +186,7 @@ fn has_mapped_external_toast(tuple: &BackfillTuple, mapping: &TableMapping) -> b
     })
 }
 
-/// Resolve every mapped externally-TOASTed column in place: fetch its chunks
-/// from the store (disk/CH) and reassemble, or — disabled — NULL/default-fill.
-/// A genuine store gap (disk/CH) is a hard error.
+/// Resolve mapped TOAST pointers or fill in disabled mode
 async fn resolve_or_fill_toast(
     tuple: &mut BackfillTuple,
     rel: &RelDescriptor,
@@ -291,16 +223,22 @@ async fn resolve_or_fill_toast(
         let p = *p;
         let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
         match try_reassemble(&p, &maps).map_err(|e| e.to_string())? {
-            Some(raw) => tuple.columns[idx] = Some(detoasted_value(raw, type_oid)),
-            None if resolver.fill_on_miss() => {
+            Reassembled::Bytes(raw) => tuple.columns[idx] = Some(detoasted_value(raw, type_oid)),
+            Reassembled::Missing if resolver.fill_on_miss() => {
                 resolver.note_filled_default();
                 tuple.columns[idx] = Some(ColumnValue::Null);
             }
-            None => {
+            // No superseding version can precede deferred resolution
+            outcome => {
                 resolver.note_fetch_miss();
+                let detail = match outcome {
+                    Reassembled::SizeMismatch { got, want } => {
+                        format!("chunks sum to {got} bytes, pointer says {want}")
+                    }
+                    _ => "has no chunks in the store".into(),
+                };
                 return Err(format!(
-                    "bootstrap: relation {} column {} value_id={} on toast relid={} \
-                     has no chunks in the store (see plans/future/TOAST.md)",
+                    "bootstrap: relation {} column {} value_id={} on toast relid={}: {detail}",
                     rel.rel_name, c.target_name, p.va_valueid, p.va_toastrelid
                 ));
             }
@@ -309,66 +247,29 @@ async fn resolve_or_fill_toast(
     Ok(())
 }
 
-/// Put a chunk batch, then record its births with the TID tracker (chunks
-/// durable first, mirroring the WAL-side apply order). Walk-side births
-/// cover dead-at-walk tuples too: their deletes may still arrive in
-/// replayed WAL and must resolve.
-async fn flush_chunks(
-    resolver: &ToastResolver,
-    batch: &mut Vec<ToastChunk>,
-    lsn: u64,
-) -> Result<(), String> {
+/// Replay tombstones supersede walk rows for dead referrers
+async fn flush_chunks(resolver: &ToastResolver, batch: &mut Vec<ToastRow>) -> Result<(), String> {
     resolver
         .put(batch)
         .await
         .map_err(|e| format!("bootstrap: toast store put: {e}"))?;
-    let births: Vec<TidEvent> = batch
-        .iter()
-        .filter(|c| c.offnum != 0)
-        .map(|c| TidEvent::Birth {
-            toast_relid: c.toast_relid,
-            blkno: c.blkno,
-            offnum: c.offnum,
-            value_id: c.value_id,
-        })
-        .collect();
-    resolver
-        .apply_tid_events(&births, lsn)
-        .await
-        .map_err(|e| format!("bootstrap: toast tid journal: {e}"))?;
     batch.clear();
     Ok(())
 }
 
-/// Reinterpret a `pg_toast_*` tuple's 3 columns (`chunk_id oid`,
-/// `chunk_seq int4`, `chunk_data bytea`) into a [`ToastChunk`]. `toast_relid`
-/// is the toast rel's pg_class OID (`RelDescriptor::oid`), matching the
-/// referring pointer's `va_toastrelid`.
-fn chunk_from_columns(tuple: &BackfillTuple, toast_relid: u32) -> Option<ToastChunk> {
-    let cols = &tuple.columns;
-    if cols.len() < 3 {
-        return None;
-    }
-    let &ColumnValue::Oid(value_id) = cols[0].as_ref()? else {
-        return None;
-    };
-    let &ColumnValue::Int4(chunk_seq) = cols[1].as_ref()? else {
-        return None;
-    };
-    let chunk_seq = chunk_seq as u32;
-    let chunk_data = match cols[2].as_ref()? {
-        ColumnValue::Bytea(b) => b.clone(),
-        ColumnValue::Text(s) => s.clone().into_bytes(),
-        _ => return None,
-    };
-    Some(ToastChunk {
+/// Convert PostgreSQL TOAST tuple shape into mirror row
+fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastRow> {
+    let (chunk_id, chunk_seq, chunk_data) =
+        crate::heap_decoder::take_toast_chunk_columns(&mut tuple.columns)?;
+    debug_assert_ne!(tuple.offnum, 0, "walked toast tuple without TID");
+    Some(ToastRow {
         toast_relid,
-        value_id,
-        chunk_seq,
-        source_lsn: tuple.source_lsn,
         blkno: tuple.blkno,
         offnum: tuple.offnum,
+        chunk_id,
+        chunk_seq,
         chunk_data,
+        lsn: tuple.source_lsn,
     })
 }
 
@@ -380,7 +281,7 @@ mod tests {
     use crate::pipeline::ack;
     use crate::pipeline::batcher::BatcherMsg;
     use crate::shadow_catalog::{RelAttr, RelDescriptor, RelName, ReplIdent};
-    use crate::toast::DiskChunkStore;
+    use crate::toast::MemChunkStore;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
     use walrus::pg::walparser::RelFileNode;
@@ -677,8 +578,7 @@ mod tests {
 
         let stats = Arc::new(EmitterStats::default());
         // from_config (not disabled()) so the resolver shares this stats handle
-        let resolver =
-            ToastResolver::from_config(&EmitterConfig::default(), stats.clone()).unwrap();
+        let resolver = ToastResolver::from_config(&EmitterConfig::default(), stats.clone());
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
@@ -708,11 +608,12 @@ mod tests {
         collector.await.unwrap();
     }
 
-    /// Disk resolver: a `pg_toast_*` page tuple is persisted as a chunk, then
-    /// a deferred main tuple fetches it back, reassembles the value, and routes
-    /// it as a `Bytea` under the trailing deferred-resolution seq.
+    /// Store-backed resolver: a `pg_toast_*` page tuple is persisted as a
+    /// row, then a deferred main tuple fetches it back, reassembles the
+    /// value, and routes it as a `Bytea` under the trailing
+    /// deferred-resolution seq.
     #[tokio::test]
-    async fn disk_resolver_reassembles_toast_from_chunk() {
+    async fn store_resolver_reassembles_toast_from_chunk() {
         let mut catalog = CatalogMap::new();
         catalog.insert(bytea_rel(16400));
         catalog.insert(toast_rel(16500));
@@ -736,9 +637,8 @@ mod tests {
             .unwrap();
         drop(tup_tx);
 
-        let tmp = tempfile::tempdir().unwrap();
         let stats = Arc::new(EmitterStats::default());
-        let store = Arc::new(DiskChunkStore::new(tmp.path().to_path_buf()).unwrap());
+        let store = Arc::new(MemChunkStore::new());
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,

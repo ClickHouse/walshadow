@@ -281,6 +281,20 @@ of working dir keeps spill files + cursor coherent.
 `cursor::cursor_path` is single choke point for any future
 `--cursor-dir` HA knob
 
+### TOAST retirement ledger
+
+[`src/toast_retire.rs`](../src/toast_retire.rs) persists
+`{spill_dir}/toast_retires.bin` beside cursor. Each entry is
+`(toast_relid, dropping_commit_lsn)`. Enqueue fsyncs inside dropping
+xact's barrier before commit can publish; removal fsyncs after mirror
+wipe. Startup spill cleanup removes only `xid-*.bin`, never ledger
+
+`flush_due_retires` runs at pipeline standup, commit boundaries, and
+idle advance. Entry becomes due once segment-aligned persisted resume
+floor passes dropping commit. Then resolver truncates mirror and removes
+entry. Crash between wipe and removal repeats idempotent truncate. See
+[TOAST.md](TOAST.md) for replay-safety proof
+
 ## Resume semantics
 
 Boot order ([`bin/stream.rs`](../src/bin/stream.rs)):

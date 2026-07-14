@@ -287,8 +287,7 @@ async fn walk_and_ship(
         }
     }
 
-    let resolver = ToastResolver::from_config(&ctx.emitter, ctx.stats.clone())
-        .map_err(|e| anyhow::anyhow!("backup_backfill: {e}"))?;
+    let resolver = ToastResolver::from_config(&ctx.emitter, ctx.stats.clone());
     let store_toast = resolver.stores_chunks();
 
     // Dedicated tail: own CH connection, own seq space, own fatal — the

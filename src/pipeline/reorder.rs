@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use walrus::pg::walparser::RmId;
@@ -27,7 +27,7 @@ use crate::ch_emitter::EmitterStats;
 use crate::decoder_sink::DecoderSinkError;
 use crate::heap_decoder::{DecodedHeap, HeapOp};
 use crate::shadow_catalog::{CatalogError, SchemaEvent, ShadowCatalog};
-use crate::wal_stream::{Record, RecordSink, SinkError};
+use crate::wal_stream::{Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream};
 use tracing::Instrument;
 
 use crate::xact_buffer::{
@@ -45,6 +45,7 @@ use crate::pipeline::batcher::BatcherMsg;
 use crate::pipeline::decode::{DecodeJob, ToastChunks};
 use crate::runtime_config::ConfigEvent;
 use crate::toast::ToastResolver;
+use crate::toast_retire::RetireLedger;
 
 pub struct ReorderSink {
     buffer: Arc<Mutex<XactBuffer>>,
@@ -65,9 +66,7 @@ pub struct ReorderSink {
     /// Reorder owns the commit-order boundary, so bumps `xacts_committed`
     /// (per commit) and `truncates_emitted`.
     stats: Arc<EmitterStats>,
-    /// TOAST chunk store: each commit's chunks persist here (disk / CH) so a
-    /// later re-emit of a pre-window referrer can rebuild its value. No-op
-    /// when disabled.
+    /// TOAST chunk resolver shared with decode workers
     resolver: ToastResolver,
     /// Runtime-config overlay resolver. `Some` with the config overlay active;
     /// a `DrainEntry::Config` applies to it inside the barrier fence so
@@ -76,6 +75,12 @@ pub struct ReorderSink {
     /// COPY backfiller for `initial_load='copy'` opt-ins; spawns off the barrier
     /// (detached task, own CH tail), the apply only records + launches.
     backfiller: Option<Arc<CopyBackfiller>>,
+    /// Retires wait until persisted replay floor passes dropping commit;
+    /// ledger persists queue so a stop inside the wait window can't leak
+    /// the mirror (resume never replays the drop)
+    retires: RetireLedger,
+    /// Last durable resume cursor, 0 before first write
+    resume_floor: Arc<AtomicU64>,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
     /// Drain-slice budget: rows / bytes per [`DrainedBatch`] pulled from the
@@ -109,6 +114,8 @@ impl ReorderSink {
         span_registry: Option<TxnSpanRegistry>,
         batch_rows: usize,
         batch_bytes: usize,
+        retires: RetireLedger,
+        resume_floor: Arc<AtomicU64>,
     ) -> Self {
         Self {
             buffer,
@@ -129,6 +136,8 @@ impl ReorderSink {
             batch_rows,
             batch_bytes,
             span_registry,
+            retires,
+            resume_floor,
         }
     }
 
@@ -332,7 +341,7 @@ impl ReorderSink {
         self.dispatch_job(job).await
     }
 
-    async fn apply_event(&mut self, event: &SchemaEvent) -> Result<(), SinkError> {
+    async fn apply_event(&mut self, event: &SchemaEvent, commit_lsn: u64) -> Result<(), SinkError> {
         self.applicator
             .apply(event)
             .await
@@ -346,7 +355,76 @@ impl ReorderSink {
                 .await
                 .map_err(|e| SinkError::Other(format!("opt-in materialize: {e}")))?;
         }
+        // Immediate DROP wipe corrupts same-LSN replay fills. Ledger fsync
+        // here precedes this commit's ack publication, so any persisted
+        // cursor whose floor passed the drop already holds the entry.
+        if let SchemaEvent::Dropped { oid, rel_name } = event
+            && &*rel_name.namespace == "pg_toast"
+            && self.resolver.stores_chunks()
+        {
+            self.retires
+                .push(*oid, commit_lsn)
+                .await
+                .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
+        }
         Ok(())
+    }
+
+    /// Retire below aligned persisted floor
+    ///
+    /// Restart re-reads floor segment, DROP lock excludes later referrers.
+    /// Pub for boot: entries due at resume must retire during standup —
+    /// their drop never replays, so no commit re-triggers this flush.
+    /// Ledger removal persists after each wipe; a crash between re-runs
+    /// an idempotent `TRUNCATE` on the emptied mirror
+    pub async fn flush_due_retires(&mut self) -> Result<(), SinkError> {
+        if self.retires.is_empty() {
+            return Ok(());
+        }
+        let cut = WalStream::align_down(self.resume_floor.load(Ordering::Acquire), WAL_SEG_SIZE);
+        for (oid, commit_lsn) in self.retires.due(cut) {
+            self.resolver
+                .retire_mirror(oid)
+                .await
+                .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
+            self.retires
+                .remove(oid, commit_lsn)
+                .await
+                .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Residual `O - B` deaths for one rewrite generation; barrier loop
+    /// already flushed its births
+    async fn apply_toast_barrier(
+        &mut self,
+        toast_relid: u32,
+        marker_lsn: u64,
+        commit_lsn: u64,
+    ) -> Result<(), SinkError> {
+        self.resolver
+            .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
+            .await
+            .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))
+    }
+
+    async fn apply_drain_entry(
+        &mut self,
+        entry: &DrainEntry,
+        commit_lsn: u64,
+    ) -> Result<(), SinkError> {
+        match entry {
+            DrainEntry::Catalog(ev) => self.apply_event(ev, commit_lsn).await,
+            DrainEntry::Config(ev) => self.apply_config(ev, commit_lsn).await,
+            DrainEntry::ToastBarrier {
+                toast_relid,
+                marker_lsn,
+            } => {
+                self.apply_toast_barrier(*toast_relid, *marker_lsn, commit_lsn)
+                    .await
+            }
+        }
     }
 
     async fn apply_truncate(&mut self, heap: &DecodedHeap) -> Result<(), SinkError> {
@@ -362,16 +440,41 @@ impl ReorderSink {
             .await
             .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
+        // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`
+        if self.resolver.stores_chunks() {
+            let toast = {
+                let mut cat = self.catalog.lock().await;
+                cat.toast_descriptor_for(rel.oid)
+                    .await
+                    .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?
+            };
+            if let Some(t) = toast {
+                self.resolver
+                    .truncate_mirror(t.oid)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
+            }
+        }
         Ok(())
     }
 
-    /// Process one barrier slice in source_lsn order: data rows accumulate
-    /// into segments; each DDL event / TRUNCATE is preceded by dispatching
-    /// the pending segment + a fence (so earlier data is durable first).
-    /// The fence waits durability through `next_seq`, which covers every
-    /// seq of earlier slices too — no event is crossed by data from any
-    /// prior slice of the commit. Data-data ordering across slices needs no
-    /// fence (per-PK `_lsn` convergence).
+    async fn put_rows_to(
+        &mut self,
+        rows: &[crate::toast::ToastRow],
+        cursor: &mut usize,
+        end: usize,
+    ) -> Result<(), SinkError> {
+        if end > *cursor {
+            self.resolver
+                .put(&rows[*cursor..end])
+                .await
+                .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+            *cursor = end;
+        }
+        Ok(())
+    }
+
+    /// Fence each apply after preceding data
     async fn run_barrier_batch(
         &mut self,
         batch: DrainedBatch,
@@ -382,22 +485,34 @@ impl ReorderSink {
             heaps,
             ordered_events,
             chunks,
+            new_rows,
+            truncate_rows,
             ..
         } = batch;
         let mut pending: Vec<DecodedHeap> = Vec::new();
         let mut ev_cursor = 0usize;
+        let mut rows_cursor = 0usize;
+        let mut trunc_cursor = 0usize;
         for (heap_idx, heap) in heaps.into_iter().enumerate() {
-            while ev_cursor < ordered_events.len() && ordered_events[ev_cursor].0 <= heap_idx {
+            while ev_cursor < ordered_events.len() && ordered_events[ev_cursor].heap_idx <= heap_idx
+            {
+                self.put_rows_to(
+                    &new_rows,
+                    &mut rows_cursor,
+                    ordered_events[ev_cursor].row_idx,
+                )
+                .await?;
                 self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
                     .await?;
                 self.barrier_fence().await?;
-                match &ordered_events[ev_cursor].1 {
-                    DrainEntry::Catalog(ev) => self.apply_event(ev).await?,
-                    DrainEntry::Config(ev) => self.apply_config(ev, commit_lsn).await?,
-                }
+                self.apply_drain_entry(&ordered_events[ev_cursor].event, commit_lsn)
+                    .await?;
                 ev_cursor += 1;
             }
             if matches!(heap.op, HeapOp::Truncate) {
+                self.put_rows_to(&new_rows, &mut rows_cursor, truncate_rows[trunc_cursor])
+                    .await?;
+                trunc_cursor += 1;
                 self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
                     .await?;
                 self.barrier_fence().await?;
@@ -406,19 +521,22 @@ impl ReorderSink {
                 pending.push(heap);
             }
         }
-        // Trailing events: no heap follows them in this slice
         while ev_cursor < ordered_events.len() {
+            self.put_rows_to(
+                &new_rows,
+                &mut rows_cursor,
+                ordered_events[ev_cursor].row_idx,
+            )
+            .await?;
             self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
                 .await?;
             self.barrier_fence().await?;
-            match &ordered_events[ev_cursor].1 {
-                DrainEntry::Catalog(ev) => self.apply_event(ev).await?,
-                DrainEntry::Config(ev) => self.apply_config(ev, commit_lsn).await?,
-            }
+            self.apply_drain_entry(&ordered_events[ev_cursor].event, commit_lsn)
+                .await?;
             ev_cursor += 1;
         }
-        // Trailing data flows async like a normal slice, already encoding
-        // against the post-DDL shape.
+        self.put_rows_to(&new_rows, &mut rows_cursor, new_rows.len())
+            .await?;
         self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
             .await
     }
@@ -429,6 +547,7 @@ impl ReorderSink {
         info: u8,
         record: &Record<'_>,
     ) -> Result<(), SinkError> {
+        self.flush_due_retires().await?;
         let payload = parse_xact_payload(info, &record.parsed.main_data);
         // Parent for this commit's spans; held until on_commit returns so it
         // outlives the prune below. No-op span when tracing off/unsampled.
@@ -438,6 +557,19 @@ impl ReorderSink {
             .and_then(|r| r.txn_span(xid))
             .unwrap_or_else(tracing::Span::none);
         self.maybe_sweep_dropped(xid, &payload, record.source_lsn)
+            .await?;
+        crate::xact_buffer::resolve_stash(
+            &self.buffer,
+            &self.catalog,
+            xid,
+            &payload.subxacts,
+            record.source_lsn,
+            self.stats.clone(),
+        )
+        .await
+        .map_err(SinkError::from)?;
+        // Resolution can surface Added events for newly visible rels
+        self.route_pending_schema_events(xid, record.source_lsn)
             .await?;
         let drain_span = trace_span!(
             !txn.is_none(),
@@ -456,10 +588,16 @@ impl ReorderSink {
         );
         let mut drain = {
             let mut buf = self.buffer.lock().await;
-            buf.drain_committed(xid, payload.xact_time, record.source_lsn, &payload.subxacts)
-                .instrument(reorder_span)
-                .await
-                .map_err(SinkError::from)?
+            buf.drain_committed(
+                xid,
+                payload.xact_time,
+                record.source_lsn,
+                &payload.subxacts,
+                self.resolver.stores_chunks(),
+            )
+            .instrument(reorder_span)
+            .await
+            .map_err(SinkError::from)?
         };
         self.subxact_tracker.lock().await.forget_tree(xid);
         // One per drained commit, incl. empty / unmapped-only
@@ -491,30 +629,16 @@ impl ReorderSink {
                 break;
             };
             rows_total += batch.heaps.len() as u64;
-            // Persist this slice's sealed chunks (disk / CH) before any
-            // consumer, so a later re-emit of a pre-window referrer finds
-            // them. Earlier slices reference only earlier generations,
-            // already put. `commit_lsn` is the convergence `_lsn`; per-chunk
-            // LSN was dropped at merge.
-            if let Some(new) = &batch.new_chunks {
-                self.resolver
-                    .put_map(new, commit_lsn)
-                    .await
-                    .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
-            }
-            // Journal the slice's TID births/deaths after its chunks are
-            // durable (a birth must never precede its chunks), so ack implies
-            // both. Deaths can arrive in a chunk-free slice, so this is
-            // independent of `new_chunks`.
-            if !batch.new_tid_events.is_empty() {
-                self.resolver
-                    .apply_tid_events(&batch.new_tid_events, commit_lsn)
-                    .await
-                    .map_err(|e| SinkError::Other(format!("toast tid apply: {e}")))?;
-            }
             let is_barrier = !batch.ordered_events.is_empty()
                 || batch.heaps.iter().any(|h| matches!(h.op, HeapOp::Truncate));
             let is_final = batch.is_final;
+            // Store rows must precede publishing marker
+            if !is_barrier && !batch.new_rows.is_empty() {
+                self.resolver
+                    .put(&batch.new_rows)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+            }
             if is_barrier {
                 self.run_barrier_batch(batch, commit_ts, commit_lsn)
                     .instrument(trace_span!(
@@ -631,6 +755,9 @@ impl RecordSink for ReorderSink {
             if active == 0 {
                 self.ack.trailing(lsn);
                 self.buffer.lock().await.advance_idle(lsn, lsn);
+                // Quiescent source never re-enters on_commit; retire due
+                // drops here so the flush doesn't wait for a later commit
+                self.flush_due_retires().await?;
             }
             Ok(())
         })

@@ -7,15 +7,16 @@ Lives in [`src/xact_buffer.rs`](../src/xact_buffer.rs) +
 
 ## Purpose
 
-Buffer every decoded heap tuple + reassembled TOAST chunk per xid from
-first heap touch until matching `XLOG_XACT_COMMIT` / `_PREPARED` drains
-it; abort discards. Mirrors PG `ReorderBuffer` shape for the same
-problem in logical decoding, minus snapshot building (catalog state
-already lives in shadow PG, see [shadow.md](shadow.md))
+Buffer every decoded heap tuple, TOAST birth/death, and commit-time raw
+record per xid from first touch until matching `XLOG_XACT_COMMIT` /
+`_PREPARED` drains it; abort discards. Mirrors PG `ReorderBuffer` shape
+for the same problem in logical decoding, minus snapshot building
+(catalog state already lives in shadow PG, see [shadow.md](shadow.md))
 
 Three responsibilities collapse into one struct:
 
-- per-xid sub-buffer for heaps + chunks, ordered by `source_lsn`
+- per-xid sub-buffer for heaps, chunks, tombstones, and raw records,
+  ordered by `source_lsn`
 - spill-to-local-disk backend when in-memory budget breaches
 - subxact tracker hinting early eviction & funneling commit drain
   across `top + subxids`
@@ -29,8 +30,9 @@ own LRU surface
 
 ## Buffer shape
 
-`XactBuffer { config, store, inflight: HashMap<u32, XactState>,
-bytes_in_memory, stats }`. One `XactState` per inflight xid:
+`XactBuffer` owns inflight xid state, global generation markers,
+commit-time stash resolutions, pending-durable accounting, memory gauges,
+and spill backend. One `XactState` per inflight xid:
 
 ```text
 XactState {
@@ -39,7 +41,8 @@ XactState {
     in_mem_bytes,                           // approximate accounting
     spill: Option<SpillWriter>,             // None until first eviction
     spill_bytes,                            // mirrors writer.byte_count()
-    catalog_events: Vec<(u64, SchemaEvent)>, // lsn-stamped
+    events: Vec<(u64, DrainEntry)>,          // catalog/config/toast barriers
+    stash_rfns: HashSet<RelFileNode>,        // commit-time resolution set
 }
 ```
 
@@ -62,9 +65,9 @@ is correct because:
   its parent — long-lived tops with many subxacts shed memory evenly
   across the family
 
-Catalog events are *not* spilled. Spilling would require encoding
-`RelDescriptor` snapshots which duplicates [decoder.md](decoder.md)
-shape; practical case is a handful of DDL events per xact
+Drain events are *not* spilled. Catalog and config events carry typed
+state; toast barriers carry only relation + marker identity. Practical
+case is a handful of control events per xact
 
 `inflight_snapshot` is the diagnostic surface for "a commit for this
 xid never arrived" investigations — heap / chunk / event / spill
@@ -87,12 +90,32 @@ BTreeMap<chunk_seq, Vec<u8>>>`; `reassemble` walks BTreeMap checking
 `TOAST_COMPRESSION_LZ4` via `lz4_flex::decompress`. Method tag lives in
 top bits of `va_extinfo` past `VARLENA_EXTSIZE_BITS = 30`
 
-Missing chunk surfaces as
+A gap in the xact's own chunk maps surfaces as
 `XactBufferError::MissingToastChunk { toast_relid, value_id, missing }`
-rather than silent loss. Malformed chunk shape (wrong column count,
+rather than silent loss (a store-side miss instead superseded-fills,
+[TOAST.md](TOAST.md)). Malformed chunk shape (wrong column count,
 wrong types) bumps `DecoderStats.toast_chunks_malformed`; malformed
 counter wired into decoder fan-out so silent toast loss is visible on
 status line
+
+## Commit-time stash
+
+Records on a filenode `relation_at` cannot resolve at record time (the
+creating xact's pg_class row is MVCC-invisible until commit: rewrite
+generations, same-xact CREATE/TRUNCATE + INSERT) ride the same per-xid
+spill as `SpillEntry::Raw` — raw rmgr/info + main data + blocks with
+images + record LSN — so subxact merge ordering and abort discard come
+for free. Admission is gated on the filenode's `XLOG_SMGR_CREATE`
+marker (observed pre-route-gate, global by filenode since the record
+can precede xid assignment); once a filenode is a stash candidate the
+per-record replay-gated lookup is skipped — the xact's own records can
+never resolve. At commit `resolve_stash` resolves each candidate with
+`relation_at(rfn, commit_lsn)`, installs per-filenode verdicts the
+drain merge consumes (toast → decode like live chunks, ordinary heap →
+fenced skip, unresolvable → counted discard), and queues a
+`DrainEntry::ToastBarrier` at commit LSN per marker-proven toast
+generation ([TOAST.md](TOAST.md)). Lifting the ordinary-heap fence:
+[future/xact_stash.md](future/xact_stash.md)
 
 ## Subxact tracker
 
@@ -147,13 +170,15 @@ File layout:
 
 ```text
 [2 bytes "WS" magic = SPILL_MAGIC]
-[u16 LE version = SPILL_VERSION = 2]
+[u16 LE version = SPILL_VERSION = 4]
 repeating:
   [u8 tag]
   [u32 LE inner_len]
   [body of inner_len bytes]
-    tag=0 → SpillEntry::Heap   (encoded DecodedHeap)
-    tag=1 → SpillEntry::Chunk  (encoded ToastChunk)
+    tag=0 → SpillEntry::Heap        (encoded DecodedHeap)
+    tag=1 → SpillEntry::Chunk       (encoded ToastChunk, TID + record LSN)
+    tag=2 → SpillEntry::ToastDelete (TID-keyed, a store tombstone at drain)
+    tag=3 → SpillEntry::Raw         (rmgr/info/main data/blocks + images)
 ```
 
 `SpillReader::check_header()` runs lazily on first `next()`: rejects
@@ -164,9 +189,10 @@ but v1 propagates as `SpillError::Format` because the xact is
 unrecoverable anyway
 
 `HeapOp` encodes as `0=Insert, 1=Update, 2=HotUpdate, 3=Delete,
-4=Truncate`. `SPILL_VERSION = 2` covers `Truncate` tag-4. Version
-mismatch is near-academic anyway: resume contract wipes spill dir on
-startup
+4=Truncate`. v2 added `Truncate`; v3 added chunk TIDs + `ToastDelete`;
+v4 added raw stashed records.
+Version mismatch is near-academic anyway: resume contract wipes spill
+dir on startup
 ([`SpillStore::clear`]) and cursor file guarantees on-disk state is
 always "drained into CH" or "replayable from `decoder_lsn`"
 
@@ -184,10 +210,11 @@ fresh config-surface decision
 
 ## Drain shape
 
-Two consumers exist for the commit drain: the parallel pipeline's
-reorder coordinator (`pipeline/reorder.rs`, with `--ch-config` —
-dispatches `DrainedXact` to the decode pool, durability tracked by the
-ack collector; see [emitter.md](emitter.md)) and the serial
+Two consumers exist for commit drain: parallel pipeline's reorder
+coordinator (`pipeline/reorder.rs`, with `--ch-config`) pulls bounded
+`DrainedBatch` slices from `CommittedDrain`, dispatching heaps to decode
+pool while applying store rows and ordered barriers; ack collector tracks
+durability (see [emitter.md](emitter.md)). Serial
 `XactRecordSink` → `TupleObserver` path (metrics-only runs, inproc
 harness). The observer-ack semantics below describe the serial path;
 the pipeline replaces them with the contiguous-done watermark
@@ -211,14 +238,16 @@ alone. Both no-op while a xact is in flight
 `evictions`, `commit_unk`, `abort_unk` only when non-zero. Matches
 [decoder.md](decoder.md)'s `DecoderStats::summary` convention
 
-## DrainEntry::{Tuple, Catalog}
+## Drain entries and batch cursors
 
 Catalog events arrive via `BufferingDecoderSink::drain_schema_events`
 after every `relation_at` and via
 `XactRecordSink::route_pending_schema_events` after every
 `ShadowCatalog::sweep_dropped`. Both push into
-`XactState.catalog_events` keyed on same `(xid, source_lsn)` the
-triggering record carried
+`XactState.events` as `DrainEntry::Catalog`, keyed on same
+`(xid, source_lsn)` triggering record carried. Runtime config changes
+use `DrainEntry::Config`; rewrite generations close with
+`DrainEntry::ToastBarrier`
 
 Tie-break rule (catalog before tuple) matters because when decoder
 stamps a schema event with triggering heap's `source_lsn` (catalog
@@ -226,14 +255,16 @@ refetch is lazy), the two share an LSN; routing catalog first lands
 applicator's `ALTER` on CH before dependent INSERT encodes against
 post-DDL shape
 
-Drain implementation: collect catalog event positions as
-`(heap_index_event_sorts_before, SchemaEvent)` —
-`DrainedXact.ordered_events`. Serial path flushes pending events via
+Parallel drain records each event as `OrderedEvent { heap_idx, row_idx,
+event }` in `DrainedBatch.ordered_events`. `heap_idx` orders control
+events against heaps; `row_idx` orders TOAST mirror births/deaths before
+each control event. `truncate_rows` supplies equivalent row cursors for
+`HeapOp::Truncate`. Serial path flushes pending events via
 `observer.on_schema_event(&ev)` before each
 `observer.on_tuple(&committed)` whose index it sorts in front of;
 trailing events (no heap after) flush at tail. Pipeline path walks the
-same positions as barrier segments (fence + apply per event — see
-[emitter.md](emitter.md))
+same positions as barrier segments, puts store rows through each cursor,
+then fences and applies each event (see [emitter.md](emitter.md))
 
 Cross-link: [shadow.md](shadow.md) `SchemaEvent` channel, fed by
 `ShadowCatalog` on Added / Changed / Dropped catalog state

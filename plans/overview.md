@@ -89,7 +89,12 @@ Component docs live alongside this overview:
 - [xact.md](xact.md) — `XactBuffer` per-xid hold-and-flush, append-only
   per-xid spill at `{spill_dir}/xid-<xid>-<first_lsn>.bin`,
   `SubxactTracker` + commit-record subxact list authority, TOAST chunk
-  reassembly inside buffer
+  maps, delete tombstones, and commit-time raw stash
+- [TOAST.md](TOAST.md) — TID-keyed ClickHouse mirrors, as-of fetch,
+  bootstrap defer-resolve, TRUNCATE/DROP lifecycle, rewrite barriers,
+  and durable retirement queue
+- [config.md](config.md) + [add_table.md](add_table.md) — layered live
+  config, source-PG overlay, per-table opt-in, and initial-load modes
 - [emitter.md](emitter.md) — parallel decode+insert pipeline
   (`src/pipeline/`): reorder coordinator → decode pool ×M →
   `InsertBatcher` (seal complete INSERTs on deadline / row / byte
@@ -103,8 +108,8 @@ Component docs live alongside this overview:
   to streaming pump at `end_lsn`
 - [ops.md](ops.md) — `preflight` boot-time validators, Prom metrics
   scrape, `tracing_subscriber`, segment `retention`, `cursor` file
-  (v2, six LSNs), per-xact `commit_lsn` carrier, slot advance on
-  `min(shadow_replay, emitter_ack)`
+  (v2, six LSNs), durable TOAST retirement ledger, per-xact
+  `commit_lsn` carrier, slot advance on `min(shadow_replay, emitter_ack)`
 - [oracle.md](oracle.md) — differential decode oracle: re-encode +
   `SELECT $1::bytea::<typ>::text` round-trip against shadow,
   `--validate <N>` sampling, walshadow PG extension (`pgext/`) exposing

@@ -105,6 +105,21 @@ fn read_locator(md: &[u8], off: usize) -> RelFileNode {
     }
 }
 
+/// `XLOG_SMGR_CREATE` info byte (PG `catalog/storage_xlog.h`)
+pub const XLOG_SMGR_CREATE: u8 = 0x10;
+/// PG `MAIN_FORKNUM`
+pub const MAIN_FORKNUM: i32 = 0;
+
+/// Layout (PG `catalog/storage_xlog.h`):
+/// `xl_smgr_create { RelFileLocator rlocator; ForkNumber forknum }`
+pub fn parse_xl_smgr_create(md: &[u8]) -> Option<(RelFileNode, i32)> {
+    if md.len() < 16 {
+        return None;
+    }
+    let forknum = i32::from_le_bytes(md[12..16].try_into().unwrap());
+    Some((read_locator(md, 0), forknum))
+}
+
 /// Pull `RelFileLocator` from an Empty-class record's main_data for known
 /// rmgr+info pairs; `None` otherwise.
 pub fn relation_for_empty(record: &XLogRecord) -> Option<RelFileNode> {
