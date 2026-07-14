@@ -21,15 +21,19 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::spill::ToastDelete;
 use walshadow::toast::{
-    ChunkMap, ChunkStore, ChunkStoreError, ClickHouseChunkStore, ToastMode, ToastResolver, ToastRow,
+    ChunkStore, ChunkStoreError, ClickHouseChunkStore, FetchedValue, ToastMode, ToastResolver,
+    ToastRow,
 };
+
+fn assembled(body: &[u8]) -> FetchedValue {
+    FetchedValue::Assembled(body.to_vec())
+}
 
 const CH_TCP_PORT: u16 = 17639;
 const CH_HTTP_PORT: u16 = 17640;
@@ -42,7 +46,7 @@ fn row(relid: u32, value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u
         offnum: tid.1,
         chunk_id: value_id,
         chunk_seq: seq,
-        chunk_data: body.to_vec(),
+        chunk_data: bytes::Bytes::copy_from_slice(body),
         lsn,
     }
 }
@@ -66,8 +70,8 @@ fn config(port: u16) -> EmitterConfig {
 }
 
 /// WAL-path scenario for the store-backed resolver: put chunk rows at their
-/// record LSNs, rehydrate a pre-window re-emit via `fetch_into`, surface a
-/// genuine miss as `false`, count tombstones separately.
+/// record LSNs, rehydrate a pre-window re-emit via `fetch_value`, surface a
+/// genuine miss as `Missing`, count tombstones separately.
 async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
     assert!(resolver.stores_chunks());
     assert!(!resolver.fill_on_miss());
@@ -84,27 +88,17 @@ async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
     assert_eq!(stats.toast_tombstones_stored.load(Ordering::Relaxed), 1);
 
     // Pre-window re-emit: the in-xact buffer missed these chunks, so the
-    // reassembler rehydrates them from the store.
-    let mut out = ChunkMap::new();
-    assert!(
-        resolver
-            .fetch_into(16700, 42, u64::MAX, &mut out)
-            .await
-            .unwrap()
-    );
-    let value = out.get(&(16700, 42)).unwrap();
-    assert_eq!(value.get(&0).unwrap(), b"hello ");
-    assert_eq!(value.get(&1).unwrap(), b"world");
+    // reassembler rehydrates the value from the store.
+    let got = resolver.fetch_value(16700, 42, u64::MAX, 11).await.unwrap();
+    assert_eq!(got, Some(assembled(b"hello world")));
     assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
 
-    // Genuine miss -> no hydration, false (caller fills + counts).
-    let mut empty = ChunkMap::new();
-    assert!(
-        !resolver
-            .fetch_into(16700, 404, u64::MAX, &mut empty)
-            .await
-            .unwrap()
-    );
+    // Genuine miss -> Missing (caller fills + counts).
+    let miss = resolver
+        .fetch_value(16700, 404, u64::MAX, 11)
+        .await
+        .unwrap();
+    assert_eq!(miss, Some(FetchedValue::Missing));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -151,30 +145,34 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         .await
         .unwrap();
 
-    // Reassembly-shaped fetch: dense seqs, in order.
-    let got = store.fetch(16500, 7, u64::MAX).await.unwrap();
-    assert_eq!(got.len(), 3);
-    assert_eq!(got.get(&0).unwrap(), b"abc");
-    assert_eq!(got.get(&1).unwrap(), b"de");
-    assert_eq!(got.get(&2).unwrap(), b"\x00\xff\x01");
+    // Reassembly-shaped fetch: dense seqs assembled in order, raw-byte
+    // transparent.
+    let got = store.fetch(16500, 7, u64::MAX, 8).await.unwrap();
+    assert_eq!(got, assembled(b"abcde\x00\xff\x01"));
 
     assert_eq!(
-        store.fetch(16500, 9, u64::MAX).await.unwrap(),
-        BTreeMap::from([(0u32, b"zz".to_vec())])
+        store.fetch(16500, 9, u64::MAX, 2).await.unwrap(),
+        assembled(b"zz")
     );
     assert_eq!(
-        store.fetch(16600, 3, u64::MAX).await.unwrap(),
-        BTreeMap::from([(0u32, b"xy".to_vec()), (1u32, b"z".to_vec())])
+        store.fetch(16600, 3, u64::MAX, 3).await.unwrap(),
+        assembled(b"xyz")
     );
 
     // Bound below every row -> no generation visible yet.
-    assert!(store.fetch(16500, 7, 0x0fff).await.unwrap().is_empty());
-    // Table exists, no such value_id -> empty (caller decides fill vs error).
-    assert!(store.fetch(16500, 999, u64::MAX).await.unwrap().is_empty());
+    assert_eq!(
+        store.fetch(16500, 7, 0x0fff, 8).await.unwrap(),
+        FetchedValue::Missing
+    );
+    // Table exists, no such value_id -> Missing (caller decides fill vs error).
+    assert_eq!(
+        store.fetch(16500, 999, u64::MAX, 1).await.unwrap(),
+        FetchedValue::Missing
+    );
     // Relation never received a chunk -> no CH table -> hard error, fast
     // (no retry): mirror absence is never proof of supersession.
     assert!(matches!(
-        store.fetch(70000, 1, u64::MAX).await,
+        store.fetch(70000, 1, u64::MAX, 1).await,
         Err(ChunkStoreError::MissingMirror(70000))
     ));
 
@@ -200,12 +198,13 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     // Death of value 9: a tombstone at its TID. Visible history is as-of.
     store.put(&[tomb(16500, (3, 1), 0x1800)]).await.unwrap();
     assert_eq!(
-        store.fetch(16500, 9, 0x17FF).await.unwrap(),
-        BTreeMap::from([(0u32, b"zz".to_vec())]),
+        store.fetch(16500, 9, 0x17FF, 2).await.unwrap(),
+        assembled(b"zz"),
         "referrer before the death still resolves"
     );
-    assert!(
-        store.fetch(16500, 9, u64::MAX).await.unwrap().is_empty(),
+    assert_eq!(
+        store.fetch(16500, 9, u64::MAX, 2).await.unwrap(),
+        FetchedValue::Missing,
         "dead past its tombstone"
     );
 
@@ -216,13 +215,16 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         .await
         .unwrap();
     assert_eq!(
-        store.fetch(16500, 13, u64::MAX).await.unwrap(),
-        BTreeMap::from([(0u32, b"reborn".to_vec())])
+        store.fetch(16500, 13, u64::MAX, 6).await.unwrap(),
+        assembled(b"reborn")
     );
-    assert!(store.fetch(16500, 9, u64::MAX).await.unwrap().is_empty());
     assert_eq!(
-        store.fetch(16500, 9, 0x17FF).await.unwrap(),
-        BTreeMap::from([(0u32, b"zz".to_vec())])
+        store.fetch(16500, 9, u64::MAX, 2).await.unwrap(),
+        FetchedValue::Missing
+    );
+    assert_eq!(
+        store.fetch(16500, 9, 0x17FF, 2).await.unwrap(),
+        assembled(b"zz")
     );
 
     // Reused va_valueid: generation 1 dies (tombstones), generation 2 lands
@@ -246,13 +248,15 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         ])
         .await
         .unwrap();
-    let old = store.fetch(16500, 11, 0x3400).await.unwrap();
-    assert_eq!(old.len(), 3, "older referrer keeps first generation");
-    assert_eq!(old.get(&0).unwrap(), b"g1-0");
-    let regen = store.fetch(16500, 11, u64::MAX).await.unwrap();
-    assert_eq!(regen.len(), 2, "dead generation's seq 2 dropped");
-    assert_eq!(regen.get(&0).unwrap(), b"g2-0");
-    assert_eq!(regen.get(&1).unwrap(), b"g2-1");
+    let old = store.fetch(16500, 11, 0x3400, 12).await.unwrap();
+    assert_eq!(
+        old,
+        assembled(b"g1-0g1-1g1-2"),
+        "older referrer keeps first generation"
+    );
+    // Dead generation's seq 2 dropped: only g2 assembles at head
+    let regen = store.fetch(16500, 11, u64::MAX, 8).await.unwrap();
+    assert_eq!(regen, assembled(b"g2-0g2-1"));
 
     // Merge is the reclaimer: OPTIMIZE FINAL collapses superseded versions
     // per TID (dead chunk_data reclaimed, tombstones retained), and fetch
@@ -278,19 +282,28 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         "tombstoned value's data row merged away"
     );
     assert_eq!(
-        store.fetch(16500, 11, u64::MAX).await.unwrap().len(),
-        2,
+        store.fetch(16500, 11, u64::MAX, 8).await.unwrap(),
+        assembled(b"g2-0g2-1"),
         "fetch over merged parts"
     );
     // Collapsed history: the lagging bound now misses — the documented
-    // superseded-fill case, empty not error.
-    assert!(store.fetch(16500, 11, 0x3400).await.unwrap().is_empty());
-    assert!(store.fetch(16500, 9, 0x17FF).await.unwrap().is_empty());
+    // superseded-fill case, Missing not error.
+    assert_eq!(
+        store.fetch(16500, 11, 0x3400, 12).await.unwrap(),
+        FetchedValue::Missing
+    );
+    assert_eq!(
+        store.fetch(16500, 9, 0x17FF, 2).await.unwrap(),
+        FetchedValue::Missing
+    );
 
     // Mirror wipe (owner TRUNCATE / retired toast rel): rows gone, table
-    // kept — fetch turns empty (superseded fill), never MissingMirror.
+    // kept — fetch turns Missing (superseded fill), never MissingMirror.
     store.truncate_mirror(16600).await.unwrap();
-    assert!(store.fetch(16600, 3, u64::MAX).await.unwrap().is_empty());
+    assert_eq!(
+        store.fetch(16600, 3, u64::MAX, 3).await.unwrap(),
+        FetchedValue::Missing
+    );
     assert_eq!(
         ch.query(&format!("SELECT count() FROM {DB}.pg_toast_16600"))
             .unwrap(),
@@ -299,7 +312,7 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     // Never-created mirror stays missing (TRUNCATE ... IF EXISTS no-op).
     store.truncate_mirror(70000).await.unwrap();
     assert!(matches!(
-        store.fetch(70000, 1, u64::MAX).await,
+        store.fetch(70000, 1, u64::MAX, 1).await,
         Err(ChunkStoreError::MissingMirror(70000))
     ));
     // Post-wipe births repopulate the kept table.
@@ -308,8 +321,42 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         .await
         .unwrap();
     assert_eq!(
-        store.fetch(16600, 5, u64::MAX).await.unwrap(),
-        BTreeMap::from([(0u32, b"post-wipe".to_vec())])
+        store.fetch(16600, 5, u64::MAX, 9).await.unwrap(),
+        assembled(b"post-wipe")
+    );
+
+    // One value split over many result blocks: fetch_sql caps
+    // max_block_size, the assembler validates seq order across block
+    // boundaries. 3000 chunks > 2 blocks at 1024 rows each.
+    let n = 3000u32;
+    let rows: Vec<ToastRow> = (0..n)
+        .map(|i| {
+            row(
+                16500,
+                21,
+                i,
+                (100 + i / 100, 1 + (i % 100) as u16),
+                0x6000 + u64::from(i),
+                &[b'a' + (i % 26) as u8],
+            )
+        })
+        .collect();
+    for slice in rows.chunks(500) {
+        store.put(slice).await.unwrap();
+    }
+    let expected: Vec<u8> = (0..n).map(|i| b'a' + (i % 26) as u8).collect();
+    assert_eq!(
+        store.fetch(16500, 21, u64::MAX, n as usize).await.unwrap(),
+        FetchedValue::Assembled(expected),
+        "value assembled across block boundaries"
+    );
+    // Wrong pointer size against the same run: deviation fills, not errors
+    assert_eq!(
+        store
+            .fetch(16500, 21, u64::MAX, n as usize + 1)
+            .await
+            .unwrap(),
+        FetchedValue::Mismatch { got: n as usize }
     );
 }
 
@@ -365,16 +412,22 @@ async fn ch_chunk_store_rewrite_barrier_residuals() {
         "[(0,2),(1,1)]"
     );
     assert_eq!(
-        store.fetch(16800, 7, u64::MAX).await.unwrap(),
-        BTreeMap::from([(0u32, b"a2".to_vec())]),
+        store.fetch(16800, 7, u64::MAX, 2).await.unwrap(),
+        assembled(b"a2"),
         "reused TID survives at its birth version"
     );
-    assert!(store.fetch(16800, 11, u64::MAX).await.unwrap().is_empty());
-    // Pre-rewrite window intact: no destructive step ran.
-    assert_eq!(store.fetch(16800, 7, 0x1fff).await.unwrap().len(), 2);
     assert_eq!(
-        store.fetch(16800, 9, 0x14ff).await.unwrap(),
-        BTreeMap::from([(0u32, b"c".to_vec())])
+        store.fetch(16800, 11, u64::MAX, 1).await.unwrap(),
+        FetchedValue::Missing
+    );
+    // Pre-rewrite window intact: no destructive step ran.
+    assert_eq!(
+        store.fetch(16800, 7, 0x1fff, 2).await.unwrap(),
+        assembled(b"ab")
+    );
+    assert_eq!(
+        store.fetch(16800, 9, 0x14ff, 1).await.unwrap(),
+        assembled(b"c")
     );
 
     // Replay re-run: prior residuals sit past the marker, nothing inserts.
@@ -427,14 +480,13 @@ async fn disabled_resolver_no_store_fills_on_miss() {
         .unwrap();
     assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 0);
 
-    // No store to hydrate from: false even for a just-put value, out untouched.
-    let mut out = ChunkMap::new();
+    // No store to hydrate from: None even for a just-put value.
     assert!(
-        !resolver
-            .fetch_into(16700, 42, u64::MAX, &mut out)
+        resolver
+            .fetch_value(16700, 42, u64::MAX, 5)
             .await
             .unwrap()
+            .is_none()
     );
-    assert!(out.is_empty());
     assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 0);
 }

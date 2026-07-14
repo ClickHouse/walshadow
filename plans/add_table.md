@@ -58,11 +58,12 @@ on the backfiller (`src/copy_backfill.rs`); visibility gate in
   backup-era `pg_xact` says `xmin` committed and `xmax` absent/aborted; infomask
   hint bits (`HEAP_XMIN_COMMITTED`, `HEAP_XMAX_INVALID`, PG
   `src/include/access/htup_details.h`) short-circuit most lookups. Unhinted
-  tuples defer in memory until walk EOF, bounded by the unhinted count — same
-  posture as the drain's deferred-TOAST buffer. Deferrals resolve only after
-  a successful walk (`pg_xact` complete only then): a failed source drops the
-  sink too, and partial `pg_xact` reads committed deleters as in-progress,
-  emitting dead tuples reruns can't remove.
+  tuples defer until walk EOF through a `DeferredSpool` (in-memory prefix,
+  disk past it — [xact.md](xact.md) Spill backend) —
+  same posture as the drain's deferred-TOAST spool. Deferrals resolve only
+  after a successful walk (`pg_xact` complete only then): a failed source
+  drops the sink too, and partial `pg_xact` reads committed deleters as
+  in-progress, emitting dead tuples reruns can't remove.
   Skipped in-flight tuples are re-delivered by the mode's WAL leg; skipped
   aborted tuples were never real. Dead-but-unvacuumed tuples stop
   resurrecting — the gate is what makes these modes higher-fidelity than
@@ -88,9 +89,10 @@ on the backfiller (`src/copy_backfill.rs`); visibility gate in
   → dedicated insert tail (own CH connection); the live pipeline never blocks
   on a backfill. Rows route via a per-pass snapshot of the mapping pointed at
   staging tables — the destination is untouched until publish (§Staging
-  swap). Regime A ([config.md](config.md) §Failure containment) holds: a
-  failed pass leaves every entry pending in the ledger, never poisons the
-  pump
+  swap). The pass resolver shares the pipeline's memory budget
+  (`PassContext`, [emitter.md](emitter.md) Memory budget). Regime A
+  ([config.md](config.md) §Failure containment) holds: a failed pass
+  leaves every entry pending in the ledger, never poisons the pump
 - **Ledger.** `backfills.json` entries carry `mode` (absent ⇒ `copy`) and the
   staging-swap phase (`swapped` + staging uuid, §Staging swap); boot re-runs
   the recorded mode at the recorded `S` — or resumes the swap tail — the

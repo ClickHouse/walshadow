@@ -43,6 +43,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
@@ -211,8 +212,9 @@ pub struct ToastChunk {
     /// Invalid TID cannot enter mirror, but remains usable in transaction
     pub blkno: u32,
     pub offnum: u16,
-    /// `TOAST_MAX_CHUNK_SIZE` ≈ 1996 bytes typical, last chunk shorter
-    pub chunk_data: Vec<u8>,
+    /// `TOAST_MAX_CHUNK_SIZE` ≈ 1996 bytes typical, last chunk shorter.
+    /// Shared body: resolution map and mirror row hold one allocation
+    pub chunk_data: bytes::Bytes,
 }
 
 /// Deleted TOAST tuple TID, one tombstone per chunk
@@ -261,15 +263,15 @@ impl SpillStore {
     /// after a slot rotation don't collide on disk
     pub async fn writer(&self, xid: u32, first_lsn: u64) -> Result<SpillWriter> {
         let path = self.dir.join(format!("xid-{xid:010}-{first_lsn:016X}.bin"));
+        let mut header = [0u8; 4];
+        header[..2].copy_from_slice(&SPILL_MAGIC);
+        header[2..].copy_from_slice(&SPILL_VERSION.to_le_bytes());
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .read(true)
             .open(&path)
             .await?;
-        let mut header = [0u8; 4];
-        header[..2].copy_from_slice(&SPILL_MAGIC);
-        header[2..].copy_from_slice(&SPILL_VERSION.to_le_bytes());
         file.write_all(&header).await?;
         Ok(SpillWriter {
             file,
@@ -289,14 +291,165 @@ impl SpillStore {
         };
         while let Some(entry) = entries.next_entry().await? {
             let p = entry.path();
-            if p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|s| s.starts_with("xid-") && s.ends_with(".bin"))
-            {
+            if p.file_name().and_then(|n| n.to_str()).is_some_and(|s| {
+                (s.starts_with("xid-") || s.starts_with("toastbody-")) && s.ends_with(".bin")
+            }) {
                 let _ = tokio::fs::remove_file(&p).await;
             }
         }
         Ok(())
+    }
+}
+
+/// Positional range in one transaction body spool
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyRef {
+    pub offset: u64,
+    pub len: u32,
+}
+
+/// Read side of one commit drain's TOAST body spool. Consumers hold
+/// `Arc<BodySpoolFile>`; unlink-while-open is safe, fd pins data until
+/// last reader drops
+#[derive(Debug)]
+pub struct BodySpoolFile {
+    file: std::fs::File,
+    path: PathBuf,
+    /// Disk accounting rides the shared handle, not the writer: unlink
+    /// removes the pathname while open fds keep blocks allocated, so the
+    /// spool-bytes gauge releases only when the last owner (writer or
+    /// reader view) drops
+    spool_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
+    held_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl BodySpoolFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn charge(&self, n: u64) {
+        self.held_bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        if let Some(gauge) = &self.spool_bytes {
+            gauge.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Positional read, no shared cursor: decode workers read concurrently.
+    /// Sync from async context; production wants spawn_blocking or a
+    /// buffered pread layer for cold reads
+    pub fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(out, offset)
+    }
+
+    pub fn read(&self, r: BodyRef) -> io::Result<Vec<u8>> {
+        let mut out = vec![0u8; r.len as usize];
+        self.read_at(r.offset, &mut out)?;
+        Ok(out)
+    }
+}
+
+impl Drop for BodySpoolFile {
+    fn drop(&mut self) {
+        if let Some(gauge) = &self.spool_bytes {
+            gauge.fetch_sub(
+                self.held_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Write coalescing threshold; refs into the buffered tail become readable
+/// at the next [`BodySpoolWriter::flush`]
+const BODY_SPOOL_BUF: usize = 256 << 10;
+
+/// Drain-owned append side of the xact body spool. Raw concatenated
+/// bodies, no framing: [`BodyRef`]s are process-local and files never
+/// survive restart ([`SpillStore::clear`])
+pub struct BodySpoolWriter {
+    shared: Arc<BodySpoolFile>,
+    len: u64,
+    buf: Vec<u8>,
+}
+
+impl BodySpoolWriter {
+    /// Distinct prefix from xact spill so startup wipes both families;
+    /// `commit_lsn` disambiguates xid reuse across slot rotations
+    pub fn create(
+        dir: &Path,
+        xid: u32,
+        commit_lsn: u64,
+        spool_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<Self> {
+        let path = dir.join(format!("toastbody-{xid:010}-{commit_lsn:016X}.bin"));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok(Self {
+            shared: Arc::new(BodySpoolFile {
+                file,
+                path,
+                spool_bytes,
+                held_bytes: std::sync::atomic::AtomicU64::new(0),
+            }),
+            len: 0,
+            buf: Vec::new(),
+        })
+    }
+
+    pub fn append(&mut self, body: &[u8]) -> Result<BodyRef> {
+        let len = u32::try_from(body.len()).map_err(|_| SpillError::Format {
+            offset: self.len as usize,
+            detail: "toast body over u32".into(),
+        })?;
+        self.shared.charge(u64::from(len));
+        let r = BodyRef {
+            offset: self.len,
+            len,
+        };
+        self.buf.extend_from_slice(body);
+        self.len += u64::from(len);
+        if self.buf.len() >= BODY_SPOOL_BUF {
+            self.flush()?;
+        }
+        Ok(r)
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        if !self.buf.is_empty() {
+            use std::io::Write;
+            (&self.shared.file).write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    /// Total appended bytes
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Reader handle for batch views; outlives writer and unlink
+    pub fn shared(&self) -> &Arc<BodySpoolFile> {
+        &self.shared
+    }
+
+    /// Post-dispatch cleanup; open reader views stay valid via fd
+    pub fn unlink(self) -> Result<()> {
+        match std::fs::remove_file(&self.shared.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -467,19 +620,19 @@ impl SpillReader {
 
 // ── encoding ────────────────────────────────────────────────────────
 
-fn push_u8(out: &mut Vec<u8>, v: u8) {
+pub(crate) fn push_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
 }
-fn push_u16(out: &mut Vec<u8>, v: u16) {
+pub(crate) fn push_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn push_u32(out: &mut Vec<u8>, v: u32) {
+pub(crate) fn push_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 fn push_i32(out: &mut Vec<u8>, v: i32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn push_u64(out: &mut Vec<u8>, v: u64) {
+pub(crate) fn push_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 fn push_i64(out: &mut Vec<u8>, v: i64) {
@@ -531,7 +684,7 @@ fn encode_opt_tuple(out: &mut Vec<u8>, t: Option<&DecodedTuple>) {
     }
 }
 
-fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
+pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
     match v {
         ColumnValue::Null => push_u8(out, 0),
         ColumnValue::Bool(b) => {
@@ -698,13 +851,13 @@ fn encode_raw_into(out: &mut Vec<u8>, r: &RawRecord) {
 
 // ── decoding ────────────────────────────────────────────────────────
 
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
@@ -720,19 +873,19 @@ impl<'a> Cursor<'a> {
         Ok(s)
     }
 
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.need(1)?[0])
     }
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.need(2)?.try_into().unwrap()))
     }
-    fn u32(&mut self) -> Result<u32> {
+    pub(crate) fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.need(4)?.try_into().unwrap()))
     }
     fn i32(&mut self) -> Result<i32> {
         Ok(i32::from_le_bytes(self.need(4)?.try_into().unwrap()))
     }
-    fn u64(&mut self) -> Result<u64> {
+    pub(crate) fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.need(8)?.try_into().unwrap()))
     }
     fn i64(&mut self) -> Result<i64> {
@@ -744,7 +897,7 @@ impl<'a> Cursor<'a> {
     fn f64(&mut self) -> Result<f64> {
         Ok(f64::from_le_bytes(self.need(8)?.try_into().unwrap()))
     }
-    fn bytes(&mut self) -> Result<Vec<u8>> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>> {
         let n = self.u32()? as usize;
         Ok(self.need(n)?.to_vec())
     }
@@ -809,7 +962,7 @@ fn decode_opt_tuple(c: &mut Cursor) -> Result<Option<DecodedTuple>> {
     Ok(Some(DecodedTuple { columns, partial }))
 }
 
-fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
+pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
     let tag = c.u8()?;
     let v = match tag {
         0 => ColumnValue::Null,
@@ -912,7 +1065,7 @@ fn decode_chunk(c: &mut Cursor) -> Result<ToastChunk> {
     let source_lsn = c.u64()?;
     let blkno = c.u32()?;
     let offnum = c.u16()?;
-    let chunk_data = c.bytes()?;
+    let chunk_data = bytes::Bytes::from(c.bytes()?);
     Ok(ToastChunk {
         toast_relid,
         value_id,
@@ -1010,7 +1163,7 @@ mod tests {
             source_lsn: lsn,
             blkno: 12,
             offnum: 4,
-            chunk_data: body.to_vec(),
+            chunk_data: bytes::Bytes::copy_from_slice(body),
         }
     }
 
@@ -1180,6 +1333,69 @@ mod tests {
         assert!(path.exists());
         w.unlink().await.unwrap();
         assert!(!path.exists(), "writer.unlink() must remove file");
+    }
+
+    #[test]
+    fn body_spool_appends_reads_and_survives_unlink() {
+        let tmp = tempdir().unwrap();
+        let mut w = BodySpoolWriter::create(tmp.path(), 7, 0x1000, None).unwrap();
+        let a = w.append(b"hello").unwrap();
+        let b = w.append(b"world!").unwrap();
+        assert_eq!((a.offset, a.len), (0, 5));
+        assert_eq!((b.offset, b.len), (5, 6));
+        assert_eq!(w.len(), 11);
+        w.flush().unwrap();
+        let shared = w.shared().clone();
+        assert_eq!(shared.read(a).unwrap(), b"hello");
+        assert_eq!(shared.read(b).unwrap(), b"world!");
+        let name = shared
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("toastbody-") && name.ends_with(".bin"));
+        let path = shared.path().to_path_buf();
+        w.unlink().unwrap();
+        assert!(!path.exists(), "unlink removes the name");
+        // Open fd pins data: readers holding the Arc stay valid
+        assert_eq!(shared.read(b).unwrap(), b"world!");
+    }
+
+    /// Unlink drops the pathname only: the spool-bytes gauge stays
+    /// charged while a reader view holds the fd (blocks stay allocated),
+    /// releasing with the last owner
+    #[tokio::test(flavor = "current_thread")]
+    async fn spool_gauge_releases_with_last_reader() {
+        let tmp = tempdir().unwrap();
+        let gauge = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut w = BodySpoolWriter::create(tmp.path(), 5, 0x30, Some(gauge.clone())).unwrap();
+        w.append(&[7u8; 48]).unwrap();
+        w.flush().unwrap();
+        let reader = w.shared().clone();
+        w.unlink().unwrap();
+        assert_eq!(
+            gauge.load(std::sync::atomic::Ordering::Relaxed),
+            48,
+            "open reader pins disk bytes"
+        );
+        drop(reader);
+        assert_eq!(gauge.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_wipes_body_spools_too() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let mut w = BodySpoolWriter::create(tmp.path(), 3, 0x20, None).unwrap();
+        w.append(b"x").unwrap();
+        w.flush().unwrap();
+        let path = w.shared().path().to_path_buf();
+        // Simulate crash: writer dropped without unlink
+        drop(w);
+        assert!(path.exists());
+        store.clear().await.unwrap();
+        assert!(!path.exists(), "startup wipe reclaims body spools");
     }
 
     #[tokio::test(flavor = "current_thread")]

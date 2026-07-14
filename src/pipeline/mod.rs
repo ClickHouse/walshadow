@@ -136,6 +136,10 @@ pub struct PipelineConfig {
     pub retires: crate::toast_retire::RetireLedger,
     /// Last durable resume cursor, seeded at the resume point
     pub resume_floor: Arc<AtomicU64>,
+    /// Shared resident-payload pool ([`build_budget`]); backup passes run
+    /// concurrently with the pipeline and must draw from the same pool.
+    /// `None` builds one at spawn
+    pub budget: Option<crate::budget::MemoryBudget>,
 }
 
 /// Spawned-stage join handles + shared signals. The daemon drives the
@@ -148,6 +152,8 @@ pub struct PipelineHandle {
     pub emitter_ack: Arc<AtomicU64>,
     pub fatal: Fatal,
     pub toast: crate::toast::ToastResolver,
+    /// Global resident-payload pool, exposed for the metrics loop
+    pub budget: crate::budget::MemoryBudget,
     decoders: Vec<JoinHandle<()>>,
     tail: tail::TailParts,
 }
@@ -194,13 +200,20 @@ impl PipelineConfig {
             backfiller,
             retires,
             resume_floor,
+            budget,
         } = self;
         let m = decoder_pool_size.max(1);
         let fatal = Fatal::new();
 
+        let budget = match budget {
+            Some(b) => b,
+            None => build_budget(&emitter, m).map_err(EmitterError::Config)?,
+        };
+
         // One resolver shared by the decode pool (fetch on miss) and the
         // reorder coordinator (put per commit).
-        let resolver = crate::toast::ToastResolver::from_config(&emitter, stats.clone());
+        let resolver = crate::toast::ToastResolver::from_config(&emitter, stats.clone())
+            .with_budget(budget.clone());
 
         // Live emitter knobs (budgets/flush/compression/retry) reach the batcher
         // + inserter pool via this receiver; `None` keeps them at boot values.
@@ -250,6 +263,7 @@ impl PipelineConfig {
             span_registry,
             emitter.drain_batch_rows,
             emitter.drain_batch_bytes,
+            Some(budget.clone()),
             retires,
             resume_floor,
         );
@@ -260,9 +274,92 @@ impl PipelineConfig {
                 emitter_ack,
                 fatal,
                 toast: resolver,
+                budget,
                 decoders,
                 tail,
             },
         ))
+    }
+}
+
+/// Validated shared pool from `[memory]` knobs; built once per process
+/// and handed to every metered component (pipeline, backup passes)
+pub fn build_budget(
+    emitter: &EmitterConfig,
+    decoders: usize,
+) -> Result<crate::budget::MemoryBudget, String> {
+    let reserve = leaf_reserve_for(
+        emitter.resident_payload_max,
+        emitter.inline_value_max,
+        decoders,
+    )?;
+    // Progress invariant: a drain admits slices while holding its sealed
+    // generations (bounded by the body-spool + index caps), so the
+    // compartment must fit both plus slice headroom or a mid-drain admit
+    // could wait on units the drain itself holds
+    let admission_max = emitter.resident_payload_max - reserve;
+    let drain_floor = crate::xact_buffer::TOAST_BODY_SPOOL_MEM_MAX
+        + crate::xact_buffer::TOAST_INDEX_MEM_MAX
+        + 2 * emitter.drain_batch_bytes;
+    if admission_max < drain_floor {
+        return Err(format!(
+            "admission compartment {admission_max} below drain floor {drain_floor} \
+             (body spool cap + index cap + 2x drain_batch_bytes); raise \
+             resident_payload_max or lower drain_batch_bytes",
+        ));
+    }
+    Ok(crate::budget::MemoryBudget::with_leaf_reserve(
+        emitter.resident_payload_max,
+        reserve,
+    ))
+}
+
+/// Leaf reserve: one in-flight per-value transient per decode worker.
+/// Reserve capped at half the pool so admission keeps meaningful
+/// headroom — at equality every nonempty slice would fail `admit`
+pub fn leaf_reserve_for(
+    resident_payload_max: usize,
+    inline_value_max: usize,
+    decoders: usize,
+) -> Result<usize, String> {
+    let reserve = decoders.max(1).saturating_mul(inline_value_max);
+    if reserve > resident_payload_max / 2 {
+        return Err(format!(
+            "leaf reserve {reserve} ({} decoders x inline_value_max {inline_value_max}) \
+             exceeds half of resident_payload_max {resident_payload_max}; raise \
+             resident_payload_max or lower inline_value_max / decoder pool",
+            decoders.max(1),
+        ));
+    }
+    Ok(reserve)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default byte values with a wide decode pool must fail startup, not
+    /// zero out the admission compartment
+    #[test]
+    fn leaf_reserve_rejects_zero_admission_headroom() {
+        let defaults = crate::ch_emitter::EmitterConfig::default();
+        let (pool, value) = (defaults.resident_payload_max, defaults.inline_value_max);
+        assert_eq!(leaf_reserve_for(pool, value, 1), Ok(value));
+        assert_eq!(leaf_reserve_for(pool, value, 4), Ok(4 * value));
+        assert!(leaf_reserve_for(pool, value, 8).is_err());
+        // Equality with the pool previously passed the old check and left
+        // admission_max == 0
+        assert!(leaf_reserve_for(pool, pool / 8, 8).is_err());
+    }
+
+    /// Admission must fit one drain's retained state plus slice headroom,
+    /// else a mid-drain admit could wait on units the drain itself holds
+    #[test]
+    fn build_budget_rejects_admission_below_drain_floor() {
+        let mut cfg = crate::ch_emitter::EmitterConfig::default();
+        assert!(build_budget(&cfg, 4).is_ok());
+        cfg.resident_payload_max = 64 << 20;
+        cfg.inline_value_max = 1 << 20;
+        assert!(build_budget(&cfg, 1).is_err());
     }
 }

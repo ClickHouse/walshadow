@@ -44,6 +44,11 @@ then apply. Global, acceptable because barriers run at DDL rate
 
 **baseline ledger** — see prev_known
 
+**body spool** — per-drain `toastbody-*` file of raw concatenated
+chunk bodies past `toast_body_mem_max`; resolution map and mirror rows
+hold `BodyRef` ranges, disk gauge rides the shared file owner until
+its last reader drops ([xact.md](xact.md), [TOAST.md](TOAST.md))
+
 **bootstrap** — greenfield initial attach: stream source `BASE_BACKUP`
 once through `MultiplexSink`, catalog files land on shadow data dir
 while user-heap pages Tap through page walk into shared insert tail;
@@ -144,6 +149,12 @@ mapping lookup, PgPending resolve, route rows to batcher, report
 Columns indexed attnum-1 to catalog length; `Some(Null)` explicit NULL,
 `None` absent-from-WAL, `partial` flags elision/truncation
 ([decoder.md](decoder.md))
+
+**deferred spool** — append-only `DeferredSpool` bounding scan-sized
+deferral (bootstrap TOAST referrers, backup visibility gate): in-memory
+prefix, versioned file past it, sequential replay at walk EOF;
+disposable derived state
+([bootstrap.md](bootstrap.md), [add_table.md](add_table.md))
 
 **denylist** — volatile system dirs (`pg_replslot`, `pg_stat_tmp`, …)
 whose backup file contents skip while dir entries land empty
@@ -285,6 +296,13 @@ than pg_class heap writes ([filter.md](filter.md),
 decode pool consults per row; refresher / SIGHUP swap it whole, cached
 encoders rebuild at next barrier ([emitter.md](emitter.md),
 [config.md](config.md))
+
+**memory budget / MemoryPermit** — process-wide resident-payload byte
+pool (`[memory]`), admission + leaf compartments; permits attach to
+owning values, transfer with batch hand-off, release on drop
+post-insert-ack; requests above a compartment's satisfiable share
+proceed with only that share metered (overshoot, counted)
+([emitter.md](emitter.md))
 
 **MultiplexSink** — bootstrap sink composing DiskLanderSink with a Tap
 sink (PageWalkSink), per-file dispatch over one backup pass

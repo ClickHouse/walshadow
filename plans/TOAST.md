@@ -44,12 +44,14 @@ Reclamation is `ReplacingMergeTree` merge behavior, not walshadow logic.
 - **Data flow.** Chunk INSERTs and toast DELETEs buffer through the xact
   spill (`SpillEntry::Chunk` / `ToastDelete`, both carrying TID + record
   LSN), so aborts discard them and the drain merge preserves WAL order. The
-  drain collects them as `ToastRow`s (gated on `stores_chunks()`, sealed per
-  slice in `DrainedBatch.new_rows`); reorder `put`s a slice's rows before the
+  drain collects them as `ToastRowRef`s (gated on `stores_chunks()`, body
+  behind `Body`, sealed per slice in `DrainedBatch.new_rows`); reorder
+  materializes bodies just in time (`put_row_refs`, batches sealed at
+  `CHUNK_PUT_BATCH` rows / `CHUNK_PUT_BYTES` under a leaf permit) before the
   commit's publishing ack marker, so a later referrer's fetch finds them
   durable — barrier slices interleave puts with mirror wipes via merge
-  cursors sealed with the slice (see Lifecycle). The serial gap-replay path puts its collected rows at commit
-  for the same reason. No
+  cursors sealed with the slice (see Lifecycle). The serial gap-replay path
+  puts its collected rows at commit for the same reason. No
   fsync, no journal, no ack coupling: toast rows ride the main-table
   durability story (CH insert ack → emitter ack).
 - **Fetch.** `fetch(relid, value_id, max_lsn)` is an as-of query: candidate
@@ -95,8 +97,10 @@ Reclamation is `ReplacingMergeTree` merge behavior, not walshadow logic.
   `toast_chunks_malformed`, a later referrer superseded-fills.
 - **Bootstrap.** Page walk decodes `pg_toast_*` tuples into rows at their
   on-page TID + walk LSN; the drain defers any main-table tuple carrying a
-  mapped `ExternalToast` (`Deferred`), `put`s all rows durable, then resolves
-  via `resolve_or_fill_toast` (`src/pipeline/bootstrap.rs`). Walk-side rows
+  mapped `ExternalToast` into a deferred spool (memory prefix, disk past it —
+  [bootstrap.md](bootstrap.md)), `put`s all rows durable, then replays the
+  spool through `resolve_or_fill_toast` (`src/pipeline/bootstrap.rs`) against
+  the mapping frozen at defer time. Walk-side rows
   cover dead-at-walk referrers too: a replayed WAL delete supersedes them
   with a higher-LSN tombstone. TID identity makes the walk
   fork/segment-aware: `_fsm`/`_vm` files are skipped, and a `.N` segment's
@@ -220,15 +224,28 @@ logically-logged rels, never toast):
   view / UDF / client-side) and a pointer column carrying `va_extinfo` +
   `va_rawsize`. R2 inline is the default.
 - **Bounded-memory streaming reassembly.** A multi-MB value is thousands of
-  chunks. `fetch` streams the SELECT block-by-block (no unbounded buffered
-  result read), but the reassembled value is still fully materialised in memory
-  (the `BTreeMap` supplement, then `try_reassemble`'s concat) — R2-inherent,
-  same as inline `reassemble`. Streaming reassembly of huge values is out of
-  scope.
-- **Row/chunk-map byte duplication.** A drained slice holds its toast bytes
-  twice: the resolution `ChunkMap` and the store `ToastRow`s. Bounded per
-  slice, gauged (`drain_resident_bytes`); shared `Arc<[u8]>` bodies are the
-  lever if it measures.
+  chunks. `fetch` streams the SELECT block-by-block (`max_block_size`-capped,
+  seq order validated across blocks) and assembles into one exact-capacity
+  buffer sized from the pointer's `va_extsize` — but the assembled value is
+  still fully materialised in memory, R2-inherent, same as inline
+  reassembly. A value whose `va_rawsize` / `va_extsize` exceeds
+  `inline_value_max` rejects typed and non-retryable (`ValueTooLarge`)
+  before any assembly or decompress allocation; resolution runs under a
+  leaf permit sized by `check_value_caps` ([emitter.md](emitter.md) Memory
+  budget). Streaming reassembly of values past the cap is out of scope.
+- **Drain payload residency.** A commit drain shares each chunk body once:
+  resolution map and mirror row hold one `Bytes` allocation, charged to the
+  chunk ownership share (`drain_chunk_resident_bytes`; rows carry ref
+  metadata only, `drain_row_resident_bytes`). Past `toast_body_mem_max`
+  cumulative body bytes the drain appends bodies once to a per-xact
+  `toastbody-*` spool and both consumers hold `BodyRef` ranges
+  ([xact.md](xact.md) Spill backend), so resident payload stops scaling
+  with the xact's total TOAST bytes. Ref metadata still scales with chunk
+  count, capped by `toast_index_mem_max` (typed `ToastIndexOverflow`,
+  non-retryable — replay hits the same cardinality). Gauges count
+  ownership: transfer into a sealed generation or row batch is not release;
+  each generation carries its resident share and admission permit until its
+  last holder drops.
 
 ## Rejected alternatives
 

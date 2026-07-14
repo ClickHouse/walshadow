@@ -178,7 +178,18 @@ pub struct EmitterConfig {
     /// the source. `Some` reserves WAL so a stalled/disconnected consumer
     /// resumes without recycling; `None` runs slotless. Boot-only.
     pub source_slot: Option<String>,
+    /// `[memory] resident_payload_max`: global resident payload permit
+    /// pool ([`crate::budget::MemoryBudget`])
+    pub resident_payload_max: usize,
+    /// `[memory] inline_value_max`: hard per-value decode-target cap;
+    /// also sizes the budget's leaf reserve per decode worker. Reserve
+    /// (`decoder_pool * inline_value_max`) must fit half
+    /// `resident_payload_max` (validated at pipeline spawn)
+    pub inline_value_max: usize,
 }
+
+pub const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
+pub const DEFAULT_INLINE_VALUE_MAX: usize = 64 << 20;
 
 pub const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
@@ -231,6 +242,8 @@ impl Default for EmitterConfig {
             drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
             runtime_config_schema: None,
             source_slot: None,
+            resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
+            inline_value_max: DEFAULT_INLINE_VALUE_MAX,
         }
     }
 }
@@ -463,6 +476,15 @@ impl EmitterConfig {
             && let Some(v) = toast.get("mode").and_then(Value::as_str)
         {
             out.toast.mode = crate::toast::ToastMode::parse(v).map_err(EmitterError::Config)?;
+        }
+        if let Some(mem) = root.get("memory").and_then(Value::as_table) {
+            if let Some(v) = mem.get("resident_payload_max").and_then(Value::as_integer) {
+                out.resident_payload_max =
+                    usize::try_from(v).unwrap_or(DEFAULT_RESIDENT_PAYLOAD_MAX);
+            }
+            if let Some(v) = mem.get("inline_value_max").and_then(Value::as_integer) {
+                out.inline_value_max = usize::try_from(v).unwrap_or(DEFAULT_INLINE_VALUE_MAX);
+            }
         }
         if let Some(rc) = root.get("runtime_config").and_then(Value::as_table)
             && let Some(schema) = rc.get("schema").and_then(Value::as_str)
@@ -1538,6 +1560,11 @@ crate::atomic_stats! {
         pub toast_values_filled_superseded,
         pub toast_values_filled_mismatch,
         pub toast_fetch_miss,
+        /// Gauge: bytes resident in the bootstrap TOAST-deferred spool's
+        /// in-memory prefix, zeroed after replay
+        pub bootstrap_deferred_bytes,
+        /// Gauge: encoded bytes in the bootstrap TOAST-deferred spool file
+        pub bootstrap_deferred_spool_bytes,
         pub toast_mirror_truncates,
         pub toast_mirror_retires,
         /// Rewrite generations closed with residual `O - B` tombstones
@@ -2283,6 +2310,23 @@ mod tests {
         );
         // Removed disk mode surfaces as a config error, not a silent default
         assert!(EmitterConfig::from_toml_str("[ch]\n[toast]\nmode = \"disk\"\n").is_err());
+    }
+
+    #[test]
+    fn config_memory_section_round_trip() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [memory]\n\
+             resident_payload_max = 1048576\n\
+             inline_value_max = 65536\n",
+        )
+        .unwrap();
+        assert_eq!(c.resident_payload_max, 1 << 20);
+        assert_eq!(c.inline_value_max, 64 << 10);
+        // Omitted section keeps defaults
+        let d = EmitterConfig::from_toml_str("[ch]\n").unwrap();
+        assert_eq!(d.resident_payload_max, DEFAULT_RESIDENT_PAYLOAD_MAX);
+        assert_eq!(d.inline_value_max, DEFAULT_INLINE_VALUE_MAX);
     }
 
     #[test]

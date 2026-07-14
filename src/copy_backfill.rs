@@ -493,6 +493,11 @@ pub struct CopyBackfiller {
     /// rows encode under the same `config_column` overrides WAL-driven rows
     /// use. `None` == boot values only.
     config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    /// Pipeline's resident-payload pool: backup passes run concurrently
+    /// with live streaming and draw from the same budget
+    budget: Option<crate::budget::MemoryBudget>,
+    /// Fixed scratch paths require one cluster backup pass at a time
+    backup_pass_lock: Mutex<()>,
     inner: Mutex<Inner>,
     /// Ledger entries not yet `done` (gauge; mirrors the ledger under the lock).
     pending: AtomicU64,
@@ -502,6 +507,7 @@ pub struct CopyBackfiller {
 }
 
 impl CopyBackfiller {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         pg: PgConfig,
         emitter: EmitterConfig,
@@ -510,6 +516,7 @@ impl CopyBackfiller {
         catalog: Arc<Mutex<ShadowCatalog>>,
         spill_dir: &Path,
         config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+        budget: Option<crate::budget::MemoryBudget>,
     ) -> Self {
         let ledger = Ledger::load(spill_dir).await;
         let pending = AtomicU64::new(ledger.pending_count());
@@ -526,6 +533,8 @@ impl CopyBackfiller {
             catalog,
             spill_dir: spill_dir.to_path_buf(),
             config_rx,
+            budget,
+            backup_pass_lock: Mutex::new(()),
             inner: Mutex::new(Inner {
                 ledger,
                 active: HashSet::new(),
@@ -702,7 +711,11 @@ impl CopyBackfiller {
         if reqs.is_empty() {
             return;
         }
-        match self.staged_pass(mode, &reqs).await {
+        let outcome = {
+            let _pass = self.backup_pass_lock.lock().await;
+            self.staged_pass(mode, &reqs).await
+        };
+        match outcome {
             Ok(outcome) => {
                 tracing::info!(
                     target: "walshadow::backfill",
@@ -758,6 +771,7 @@ impl CopyBackfiller {
             catalog: self.catalog.clone(),
             scratch_dir: self.spill_dir.join("backup_backfill"),
             config_rx: self.config_rx.clone(),
+            budget: self.budget.clone(),
         };
         let outcome = crate::backup_backfill::run_pass(&ctx, mode, reqs).await?;
         self.publish_staged(&staging, reqs).await;
@@ -1092,7 +1106,12 @@ impl CopyBackfiller {
             msg_tx.clone(),
             ack.clone(),
             self.stats.clone(),
+            // Disabled resolver never defers; spool stays empty
             ToastResolver::disabled(),
+            crate::spool::DeferredSpool::new(
+                self.spill_dir.join("copy_deferred.bin"),
+                crate::spool::DEFERRED_SPOOL_MEM_MAX,
+            ),
         ));
 
         let (select_list, plan, natts) = column_plan(desc);

@@ -99,6 +99,7 @@ Component docs live alongside this overview:
   (`src/pipeline/`): reorder coordinator → decode pool ×M →
   `InsertBatcher` (seal complete INSERTs on deadline / row / byte
   budget) → inserter pool ×N → contiguous-done ack watermark;
+  resident-payload permit pool bounding payload bytes across stages;
   `ch_ddl` applicator inside the DDL barrier, `type_bridge` PG-OID
   → CH `TypeAst`
 - [bootstrap.md](bootstrap.md) — greenfield path:

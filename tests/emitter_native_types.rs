@@ -166,6 +166,8 @@ async fn native_numeric_time_timetz_round_trip() {
             rel,
             mapping,
             committed: tuple,
+            permit: None,
+            value_permit: None,
         }))
         .await
         .expect("route row");

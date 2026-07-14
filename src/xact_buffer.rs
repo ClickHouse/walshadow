@@ -58,10 +58,13 @@ use crate::pipeline::decode::RelCache;
 use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::shadow_catalog::{CatalogError, RelDescriptor, SchemaEvent, ShadowCatalog};
 use crate::spill::{
-    RawRecord, SpillEntry, SpillError, SpillReader, SpillStore, SpillWriter, ToastChunk,
-    ToastDelete,
+    BodySpoolFile, BodySpoolWriter, RawRecord, SpillEntry, SpillError, SpillReader, SpillStore,
+    SpillWriter, ToastChunk, ToastDelete,
 };
-use crate::toast::{ChunkMap, ToastResolver, ToastRow};
+use crate::toast::{
+    Body, ChunkRefMap, FetchedValue, ToastResolver, ToastRowRef, ToastValueError, ValueRef,
+    check_value_caps, detoasted_value, finish_value, pointer_extsize,
+};
 use crate::wal_stream::{Record, RecordSink, SinkError};
 
 use std::pin::Pin;
@@ -338,12 +341,30 @@ fn entry_lsn(e: &SpillEntry) -> u64 {
     }
 }
 
+/// Resident cap on one commit drain's memory-held chunk bodies; bodies
+/// past it spool to disk (`toastbody-*`), refs stay resident
+pub const TOAST_BODY_SPOOL_MEM_MAX: usize = 16 << 20;
+
+/// Cap on resident chunk-index + mirror-row-ref metadata per commit
+/// drain; breach fails the drain with a typed non-retryable error before
+/// further allocation. ~`CHUNK_REF_META`/chunk ⇒ default admits ~500k
+/// chunks ≈ 1 GB TOAST payload per xact
+pub const TOAST_INDEX_MEM_MAX: usize = 64 << 20;
+
+/// Resident approximation per indexed chunk: one `ValueRef`/tail entry or
+/// one row ref, container overhead included
+const CHUNK_REF_META: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct XactBufferConfig {
     /// In-memory budget across all active xacts before eviction
     pub xact_buffer_max: usize,
     /// Per-xid spill files land here
     pub spill_dir: PathBuf,
+    /// Per-drain memory-held chunk body budget before body spooling
+    pub toast_body_mem_max: usize,
+    /// Per-drain chunk/row-ref metadata cap
+    pub toast_index_mem_max: usize,
 }
 
 impl XactBufferConfig {
@@ -351,6 +372,8 @@ impl XactBufferConfig {
         Self {
             xact_buffer_max: DEFAULT_XACT_BUFFER_MAX,
             spill_dir,
+            toast_body_mem_max: TOAST_BODY_SPOOL_MEM_MAX,
+            toast_index_mem_max: TOAST_INDEX_MEM_MAX,
         }
     }
 }
@@ -371,6 +394,14 @@ pub enum XactBufferError {
     },
     #[error("toast decompression: {0}")]
     Detoast(String),
+    /// Non-retryable: replay hits the same cardinality. Raise
+    /// `toast_index_mem_max` or reduce per-xact TOAST chunk count
+    #[error("toast index metadata {bytes} bytes exceeds cap {max}")]
+    ToastIndexOverflow { bytes: usize, max: usize },
+    /// Hard value cap, checked before allocation. Non-retryable:
+    /// replay decodes same value; raise `inline_value_max`
+    #[error("toast value of {rawsize} bytes exceeds inline_value_max {max}")]
+    ValueTooLarge { rawsize: usize, max: usize },
     /// Stashed set resolved to a toast heap without its `XLOG_SMGR_CREATE`
     /// marker: observation began mid-xact, so the generation cannot prove
     /// completeness and a silent partial decode would leave the mirror
@@ -379,6 +410,15 @@ pub enum XactBufferError {
         "toast generation for rel {relid} observed without XLOG_SMGR_CREATE marker; fresh snapshot required"
     )]
     IncompleteToastGeneration { relid: u32 },
+}
+
+impl From<ToastValueError> for XactBufferError {
+    fn from(value: ToastValueError) -> Self {
+        match value {
+            ToastValueError::Detoast(detail) => Self::Detoast(detail),
+            ToastValueError::ValueTooLarge { rawsize, max } => Self::ValueTooLarge { rawsize, max },
+        }
+    }
 }
 
 impl From<XactBufferError> for SinkError {
@@ -884,13 +924,20 @@ pub struct XactBuffer {
     /// WAL-read rather than at buffering. Empty (and unused) when tracing
     /// is off — `absorb` then mints its own span.
     span_registry: TxnSpanRegistry,
-    /// Bytes resident inside an active commit drain (decoded merge heads +
-    /// in-mem tail + unsealed chunk map). Arc'd so a detached
-    /// [`CommittedDrain`] keeps accounting after the buffer lock releases;
-    /// distinct from `spill_bytes_active` (on-disk bytes awaiting drain).
+    /// Bytes resident inside an active commit drain (merge heads + in-mem
+    /// tail + chunk generations + mirror rows, until each consumer drops
+    /// its share). Arc'd so a detached [`CommittedDrain`] keeps accounting
+    /// after the buffer lock releases; distinct from `spill_bytes_active`
+    /// (on-disk bytes awaiting drain).
     drain_resident: Arc<AtomicU64>,
     /// High-water mark of `drain_resident`, monotonic per process.
     drain_resident_peak: Arc<AtomicU64>,
+    /// Category shares of `drain_resident`
+    drain_head_resident: Arc<AtomicU64>,
+    drain_chunk_resident: Arc<AtomicU64>,
+    drain_row_resident: Arc<AtomicU64>,
+    /// Bytes in transaction body spool files (disk, not resident)
+    toast_spool_bytes: Arc<AtomicU64>,
 }
 
 impl XactBuffer {
@@ -909,12 +956,35 @@ impl XactBuffer {
             span_registry: TxnSpanRegistry::new(),
             drain_resident: Arc::new(AtomicU64::new(0)),
             drain_resident_peak: Arc::new(AtomicU64::new(0)),
+            drain_head_resident: Arc::new(AtomicU64::new(0)),
+            drain_chunk_resident: Arc::new(AtomicU64::new(0)),
+            drain_row_resident: Arc::new(AtomicU64::new(0)),
+            toast_spool_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// Current bytes resident in an active drain; `0` when no drain runs.
+    /// Current bytes resident in an active drain; `0` when no drain runs
+    /// and no consumer still holds a sealed generation or row batch.
     pub fn drain_resident_bytes(&self) -> u64 {
         self.drain_resident.load(Ordering::Relaxed)
+    }
+
+    /// Bytes in sealed chunk generations, counted until the last holder
+    /// (drain batch / decode job) drops its `Arc`.
+    pub fn drain_chunk_resident_bytes(&self) -> u64 {
+        self.drain_chunk_resident.load(Ordering::Relaxed)
+    }
+
+    /// Bytes in collected mirror rows, counted until the row batch drops
+    /// after its store put.
+    pub fn drain_row_resident_bytes(&self) -> u64 {
+        self.drain_row_resident.load(Ordering::Relaxed)
+    }
+
+    /// Bytes in transaction body spool files: disk, not resident; drops
+    /// with the drain (unlink at finish, wipe on error path restart)
+    pub fn toast_spool_bytes(&self) -> u64 {
+        self.toast_spool_bytes.load(Ordering::Relaxed)
     }
 
     /// Monotonic high-water mark of [`Self::drain_resident_bytes`]. For a
@@ -1259,12 +1329,12 @@ impl XactBuffer {
         states: Vec<XactState>,
         collect_rows: bool,
         stash: StashResolution,
+        // Body spool identity (`toastbody-{xid}-{lsn}.bin`), lazily
+        // created once memory-held chunk bytes cross `toast_body_mem_max`
+        top_xid: u32,
+        commit_lsn: u64,
     ) -> std::result::Result<MergedDrain, XactBufferError> {
-        let mut gauge = ResidentGauge {
-            cur: self.drain_resident.clone(),
-            peak: self.drain_resident_peak.clone(),
-            held: 0,
-        };
+        let mut gauge = self.drain_gauge(&self.drain_head_resident);
         let mut sources = Vec::with_capacity(states.len());
         let mut events = Vec::with_capacity(states.len());
         for mut st in states {
@@ -1287,14 +1357,34 @@ impl XactBuffer {
         Ok(MergedDrain {
             sources,
             events,
-            chunks: ChunkMap::new(),
+            chunks: ChunkRefMap::new(),
             chunk_bytes: 0,
             collect_rows,
             rows: Vec::new(),
             row_bytes: 0,
             stash,
             gauge,
+            chunk_gauge: self.drain_gauge(&self.drain_chunk_resident),
+            row_gauge: self.drain_gauge(&self.drain_row_resident),
+            spool: None,
+            spool_dir: self.store.dir().to_path_buf(),
+            spool_xid: top_xid,
+            spool_lsn: commit_lsn,
+            spool_gauge: self.toast_spool_bytes.clone(),
+            mem_body_bytes: 0,
+            body_mem_max: self.config.toast_body_mem_max,
+            index_meta_bytes: 0,
+            index_mem_max: self.config.toast_index_mem_max,
         })
+    }
+
+    fn drain_gauge(&self, cat: &Arc<AtomicU64>) -> ResidentGauge {
+        ResidentGauge {
+            cur: self.drain_resident.clone(),
+            peak: self.drain_resident_peak.clone(),
+            cat: cat.clone(),
+            held: 0,
+        }
     }
 
     /// Drain xact `xid` to `observer` in WAL order, substituting each
@@ -1407,7 +1497,7 @@ impl XactBuffer {
         // spilled precisely because it exceeded the buffer budget.
         let stash = self.pending_stash.remove(&top_xid).unwrap_or_default();
         let mut drain = self
-            .open_drain(states, resolver.stores_chunks(), stash)
+            .open_drain(states, resolver.stores_chunks(), stash, top_xid, commit_lsn)
             .await?;
         let mut rows: u64 = 0;
         // Applied after the store put below: residuals read the mirror, so
@@ -1432,7 +1522,20 @@ impl XactBuffer {
                     } => toast_barriers.push((*toast_relid, *marker_lsn)),
                 },
                 MergeItem::Heap(mut heap) => {
-                    detoast_heap(&mut heap, &[drain.chunks()], catalog, false, resolver).await?;
+                    // Refs may point into the unflushed spool tail; no-op
+                    // when nothing buffered
+                    drain.flush_spool()?;
+                    // Serial observer emits synchronously; the leaf permit
+                    // covers decoded values through `on_tuple`
+                    let _value_permit = detoast_heap(
+                        &mut heap,
+                        drain.spool_file(),
+                        &[drain.chunks()],
+                        catalog,
+                        false,
+                        resolver,
+                    )
+                    .await?;
                     let committed = CommittedTuple {
                         decoded: *heap,
                         commit_ts,
@@ -1452,10 +1555,12 @@ impl XactBuffer {
             }
         }
         drain_span.record("rows", rows);
-        // Put store rows before returning: a later commit's referrer may fetch
+        // Put store rows before returning: a later commit's referrer may
+        // fetch. Trailing chunks may sit in the spool write buffer
+        drain.flush_spool()?;
         let store_rows = drain.take_rows();
         resolver
-            .put(&store_rows)
+            .put_row_refs(store_rows.spool(), &store_rows)
             .await
             .map_err(|e| XactBufferError::Detoast(format!("toast store put: {e}")))?;
         for (toast_relid, marker_lsn) in toast_barriers {
@@ -1556,7 +1661,9 @@ impl XactBuffer {
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
         let stash = self.pending_stash.remove(&top_xid).unwrap_or_default();
-        let merged = self.open_drain(states, collect_rows, stash).await?;
+        let merged = self
+            .open_drain(states, collect_rows, stash, top_xid, commit_lsn)
+            .await?;
         self.stats.committed_xacts_total += 1;
         Ok(CommittedDrain {
             commit_ts,
@@ -1662,18 +1769,22 @@ impl XactBuffer {
     }
 }
 
-/// Tracks bytes resident inside an active drain (decoded merge heads +
-/// in-mem tail + unsealed chunk map). Contribution subtracts on drop so an
-/// abandoned drain (observer error) can't wedge the gauge.
+/// Tracks bytes resident inside an active drain. One instance per
+/// category (merge heads / sealed chunk generations / mirror rows), all
+/// feeding one total. Contribution subtracts on drop so an abandoned
+/// drain (observer error) can't wedge the gauge.
 struct ResidentGauge {
     cur: Arc<AtomicU64>,
     peak: Arc<AtomicU64>,
+    /// Category share of `cur`
+    cat: Arc<AtomicU64>,
     held: u64,
 }
 
 impl ResidentGauge {
     fn add(&mut self, n: usize) {
         self.held += n as u64;
+        self.cat.fetch_add(n as u64, Ordering::Relaxed);
         let now = self.cur.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         self.peak.fetch_max(now, Ordering::Relaxed);
     }
@@ -1681,12 +1792,27 @@ impl ResidentGauge {
     fn sub(&mut self, n: usize) {
         let n = (n as u64).min(self.held);
         self.held -= n;
+        self.cat.fetch_sub(n, Ordering::Relaxed);
         self.cur.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Move `n` held bytes into a share the new owner drops when done.
+    /// Totals unchanged: ownership transfer is not release.
+    fn split(&mut self, n: usize) -> ResidentGauge {
+        let n = (n as u64).min(self.held);
+        self.held -= n;
+        ResidentGauge {
+            cur: self.cur.clone(),
+            peak: self.peak.clone(),
+            cat: self.cat.clone(),
+            held: n,
+        }
     }
 }
 
 impl Drop for ResidentGauge {
     fn drop(&mut self) {
+        self.cat.fetch_sub(self.held, Ordering::Relaxed);
         self.cur.fetch_sub(self.held, Ordering::Relaxed);
     }
 }
@@ -1778,18 +1904,44 @@ enum MergeItem {
 /// heap yielded after it. Drop-after-first-use would be wrong — one value
 /// can be referenced by several row versions in one xact (unchanged-toast
 /// UPDATE chain) — so entries live until [`Self::take_chunks`] / drop.
+///
+/// Bodies stay in memory until their cumulative bytes cross
+/// `body_mem_max`, then append once to a transaction body spool;
+/// resolution refs and mirror row refs share the range, so resident state
+/// past the threshold is metadata plus read buffers (M2).
 struct MergedDrain {
     sources: Vec<MergeSource>,
     events: Vec<VecDeque<(u64, DrainEntry)>>,
-    chunks: ChunkMap,
+    /// Live (unsealed) generation
+    chunks: ChunkRefMap,
     chunk_bytes: usize,
-    // Skip duplicated chunk bodies when no store consumes rows
+    // Skip duplicated mirror refs when no store consumes rows
     collect_rows: bool,
-    rows: Vec<ToastRow>,
+    rows: Vec<ToastRowRef>,
     row_bytes: usize,
     /// Commit-time verdicts for stashed filenodes; empty when nothing stashed
     stash: StashResolution,
+    /// Merge heads + in-mem tail
     gauge: ResidentGauge,
+    /// Unsealed chunk map (memory bodies + ref metadata, never file
+    /// bodies); shares split off with each sealed generation
+    chunk_gauge: ResidentGauge,
+    /// Collected mirror rows; shares split off with each taken batch
+    row_gauge: ResidentGauge,
+    /// Lazily created at threshold crossing; None while memory-resident
+    spool: Option<BodySpoolWriter>,
+    spool_dir: PathBuf,
+    spool_xid: u32,
+    spool_lsn: u64,
+    /// Spool file bytes, `walshadow_toast_xact_spool_bytes`; charged by
+    /// the writer's shared file owner, released with its last holder
+    spool_gauge: Arc<AtomicU64>,
+    /// Cumulative memory-held body bytes, monotone (spooling never reverts)
+    mem_body_bytes: usize,
+    body_mem_max: usize,
+    /// Cumulative ref metadata, checked against `index_mem_max`
+    index_meta_bytes: usize,
+    index_mem_max: usize,
 }
 
 impl MergedDrain {
@@ -1829,8 +1981,8 @@ impl MergedDrain {
                         .expect("just peeked head");
                     match entry {
                         SpillEntry::Heap(h) => return Ok(Some(MergeItem::Heap(h))),
-                        SpillEntry::Chunk(c) => self.fold_chunk(c),
-                        SpillEntry::ToastDelete(d) => self.fold_delete(d),
+                        SpillEntry::Chunk(c) => self.fold_chunk(c)?,
+                        SpillEntry::ToastDelete(d) => self.fold_delete(d)?,
                         SpillEntry::Raw(raw) => self.fold_raw(&raw)?,
                     }
                 }
@@ -1838,25 +1990,79 @@ impl MergedDrain {
         }
     }
 
-    fn fold_chunk(&mut self, c: ToastChunk) {
-        // InvalidOffsetNumber cannot key mirror rows
-        if self.collect_rows && c.offnum != 0 {
-            self.row_bytes += c.chunk_data.len();
-            self.gauge.add(c.chunk_data.len());
-            self.rows.push(ToastRow::from_chunk(&c));
+    /// Cap resident ref metadata before allocating more; typed
+    /// non-retryable error fails the drain loud, replay-safe
+    fn reserve_meta(&mut self, n: usize) -> std::result::Result<(), XactBufferError> {
+        if self.index_meta_bytes + n > self.index_mem_max {
+            return Err(XactBufferError::ToastIndexOverflow {
+                bytes: self.index_meta_bytes + n,
+                max: self.index_mem_max,
+            });
         }
-        self.chunk_bytes += c.chunk_data.len();
-        self.gauge.add(c.chunk_data.len());
-        self.chunks
-            .entry((c.toast_relid, c.value_id))
-            .or_default()
-            .insert(c.chunk_seq, c.chunk_data);
+        self.index_meta_bytes += n;
+        Ok(())
     }
 
-    fn fold_delete(&mut self, d: ToastDelete) {
-        if self.collect_rows {
-            self.rows.push(ToastRow::tombstone(&d));
+    /// Body kept memory-resident below `body_mem_max` cumulative bytes,
+    /// appended once to the body spool past it (resolution map and mirror
+    /// rows share either form)
+    fn fold_body(&mut self, data: &bytes::Bytes) -> std::result::Result<Body, XactBufferError> {
+        if self.spool.is_none() {
+            if self.mem_body_bytes + data.len() <= self.body_mem_max {
+                self.mem_body_bytes += data.len();
+                return Ok(Body::Mem(data.clone()));
+            }
+            self.spool = Some(BodySpoolWriter::create(
+                &self.spool_dir,
+                self.spool_xid,
+                self.spool_lsn,
+                Some(self.spool_gauge.clone()),
+            )?);
         }
+        let spool = self.spool.as_mut().expect("just created");
+        let r = spool.append(data)?;
+        Ok(Body::File(r))
+    }
+
+    fn fold_chunk(&mut self, c: ToastChunk) -> std::result::Result<(), XactBufferError> {
+        // InvalidOffsetNumber cannot key mirror rows
+        let collect_row = self.collect_rows && c.offnum != 0;
+        self.reserve_meta(CHUNK_REF_META * (1 + usize::from(collect_row)))?;
+        let body = self.fold_body(&c.chunk_data)?;
+        // File bodies live on disk, outside resident shares (M7)
+        let mem_len = match &body {
+            Body::Mem(b) => b.len(),
+            Body::File(_) => 0,
+        };
+        if collect_row {
+            // Mem body is the same allocation the ref map holds, charged
+            // once under the chunk gauge (M7); rows carry metadata only
+            self.row_bytes += CHUNK_REF_META;
+            self.row_gauge.add(CHUNK_REF_META);
+            self.rows.push(ToastRowRef::with_body(&c, body.clone()));
+        }
+        self.chunk_bytes += mem_len + CHUNK_REF_META;
+        self.chunk_gauge.add(mem_len + CHUNK_REF_META);
+        match self.chunks.entry((c.toast_relid, c.value_id)) {
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                o.get_mut().push(c.chunk_seq, body);
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(ValueRef::new(c.chunk_seq, body));
+            }
+        }
+        Ok(())
+    }
+
+    fn fold_delete(&mut self, d: ToastDelete) -> std::result::Result<(), XactBufferError> {
+        if !self.collect_rows {
+            return Ok(());
+        }
+        self.reserve_meta(CHUNK_REF_META)?;
+        self.row_bytes += CHUNK_REF_META;
+        self.row_gauge.add(CHUNK_REF_META);
+        self.rows.push(ToastRowRef::tombstone(&d));
+        Ok(())
     }
 
     /// Decode a stashed record against its commit-time verdict: toast heaps
@@ -1886,28 +2092,59 @@ impl MergedDrain {
         bump(&|s| &s.toast_stash_decoded);
         for op in decode_stashed_toast(raw, &rel)? {
             match op {
-                StashedToastOp::Chunk(c) => self.fold_chunk(c),
-                StashedToastOp::Delete(d) => self.fold_delete(d),
+                StashedToastOp::Chunk(c) => self.fold_chunk(c)?,
+                StashedToastOp::Delete(d) => self.fold_delete(d)?,
             }
         }
         Ok(())
     }
 
-    fn chunks(&self) -> &ChunkMap {
+    fn chunks(&self) -> &ChunkRefMap {
         &self.chunks
     }
 
-    /// Chunks accumulated since the last take, sealed into a generation.
-    fn take_chunks(&mut self) -> ChunkMap {
-        self.gauge.sub(self.chunk_bytes);
-        self.chunk_bytes = 0;
-        std::mem::take(&mut self.chunks)
+    /// Make appended bodies readable through [`Self::spool_file`]; no-op
+    /// while memory-resident or when nothing buffered
+    fn flush_spool(&mut self) -> std::result::Result<(), XactBufferError> {
+        if let Some(s) = self.spool.as_mut() {
+            s.flush()?;
+        }
+        Ok(())
     }
 
-    fn take_rows(&mut self) -> Vec<ToastRow> {
-        self.gauge.sub(self.row_bytes);
+    fn spool_file(&self) -> Option<&BodySpoolFile> {
+        self.spool.as_ref().map(|s| s.shared().as_ref())
+    }
+
+    fn spool_handle(&self) -> Option<Arc<BodySpoolFile>> {
+        self.spool.as_ref().map(|s| s.shared().clone())
+    }
+
+    /// Chunks accumulated since the last take, sealed into a generation.
+    /// Bytes stay gauged until the generation's last holder drops; spool
+    /// flush makes the sealed refs readable to decode workers.
+    fn take_chunks(&mut self) -> std::result::Result<ChunkGeneration, XactBufferError> {
+        self.flush_spool()?;
+        let resident = self.chunk_gauge.split(self.chunk_bytes);
+        self.chunk_bytes = 0;
+        Ok(ChunkGeneration {
+            map: std::mem::take(&mut self.chunks),
+            spool: self.spool_handle(),
+            _resident: resident,
+            _permit: None,
+        })
+    }
+
+    /// Rows collected since the last take; bytes stay gauged until the
+    /// batch drops after its store put.
+    fn take_rows(&mut self) -> ToastRowBatch {
+        let resident = self.row_gauge.split(self.row_bytes);
         self.row_bytes = 0;
-        std::mem::take(&mut self.rows)
+        ToastRowBatch {
+            rows: std::mem::take(&mut self.rows),
+            spool: self.spool_handle(),
+            _resident: resident,
+        }
     }
 
     /// Every head empty and every event queue drained.
@@ -1915,10 +2152,15 @@ impl MergedDrain {
         self.sources.iter().all(|s| s.head.is_none()) && self.events.iter().all(VecDeque::is_empty)
     }
 
-    /// Unlink spill files; call only after dispatch completes. An error
-    /// path drops `self` instead, leaving files for inspection (startup
-    /// wipe + redecode-from-ack cover replay).
+    /// Unlink spill files + body spool; call only after dispatch
+    /// completes. In-flight decode/store readers keep the spool via
+    /// `Arc<BodySpoolFile>` open fds. An error path drops `self` instead,
+    /// leaving files for inspection (startup wipe + redecode-from-ack
+    /// cover replay).
     async fn finish(self) -> std::result::Result<(), XactBufferError> {
+        if let Some(s) = self.spool {
+            s.unlink()?;
+        }
         for s in self.sources {
             if let Some(r) = s.spent {
                 r.unlink().await?;
@@ -1928,6 +2170,71 @@ impl MergedDrain {
             }
         }
         Ok(())
+    }
+}
+
+/// Sealed, immutable chunk generation. Carries its resident-gauge share
+/// (memory bodies + ref metadata, never file bodies) and, under an active
+/// budget, its admission permit — both released when the last `Arc`
+/// drops, since the generation outlives the slice that first shipped it
+/// (retained by the drain and every later decode job). Container
+/// hand-off is not release. Spool handle backs `File` refs; may mix with
+/// `Mem` bodies in the generation sealed at the threshold crossing.
+pub struct ChunkGeneration {
+    map: ChunkRefMap,
+    spool: Option<Arc<BodySpoolFile>>,
+    _resident: ResidentGauge,
+    _permit: Option<crate::budget::MemoryPermit>,
+}
+
+impl ChunkGeneration {
+    pub fn map(&self) -> &ChunkRefMap {
+        &self.map
+    }
+
+    pub fn spool(&self) -> Option<&BodySpoolFile> {
+        self.spool.as_deref()
+    }
+
+    /// Gauged resident bytes (Mem bodies + ref metadata), the admission
+    /// share this generation contributes
+    pub fn resident_bytes(&self) -> usize {
+        self._resident.held as usize
+    }
+}
+
+impl std::ops::Deref for ChunkGeneration {
+    type Target = ChunkRefMap;
+    fn deref(&self) -> &ChunkRefMap {
+        &self.map
+    }
+}
+
+/// WAL-ordered mirror row refs with their resident-gauge share (ref
+/// metadata only — Mem bodies are shared with the generation's map and
+/// charged there); bytes count until the batch drops after its store put.
+pub struct ToastRowBatch {
+    rows: Vec<ToastRowRef>,
+    spool: Option<Arc<BodySpoolFile>>,
+    _resident: ResidentGauge,
+}
+
+impl ToastRowBatch {
+    pub fn spool(&self) -> Option<&BodySpoolFile> {
+        self.spool.as_deref()
+    }
+
+    /// Gauged resident bytes (ref metadata; bodies count under the
+    /// owning generation)
+    pub fn resident_bytes(&self) -> usize {
+        self._resident.held as usize
+    }
+}
+
+impl std::ops::Deref for ToastRowBatch {
+    type Target = [ToastRowRef];
+    fn deref(&self) -> &[ToastRowRef] {
+        &self.rows
     }
 }
 
@@ -1951,9 +2258,9 @@ pub struct DrainedBatch {
     /// generation sealed no later than this slice; slices share payloads via
     /// `Arc` instead of copying per batch, and each generation is immutable
     /// once sealed (decode pool reads while later slices load).
-    pub chunks: Vec<Arc<ChunkMap>>,
+    pub chunks: Vec<Arc<ChunkGeneration>>,
     /// WAL-ordered births and tombstones, empty without store
-    pub new_rows: Vec<ToastRow>,
+    pub new_rows: ToastRowBatch,
     /// `new_rows` cursor for each TRUNCATE heap
     pub truncate_rows: Vec<usize>,
     /// Last slice of the commit. Only its seq may publish `commit_lsn` in
@@ -1970,7 +2277,7 @@ pub struct CommittedDrain {
     /// False for read-only / filter-dropped / unknown xid.
     pub had_states: bool,
     merged: Option<MergedDrain>,
-    generations: Vec<Arc<ChunkMap>>,
+    generations: Vec<Arc<ChunkGeneration>>,
 }
 
 impl CommittedDrain {
@@ -1983,6 +2290,7 @@ impl CommittedDrain {
         &mut self,
         max_rows: usize,
         max_bytes: usize,
+        budget: Option<&crate::budget::MemoryBudget>,
     ) -> std::result::Result<Option<DrainedBatch>, XactBufferError> {
         let Some(m) = self.merged.as_mut() else {
             return Ok(None);
@@ -2009,12 +2317,15 @@ impl CommittedDrain {
             }
         }
         let is_final = m.is_exhausted();
-        let sealed = m.take_chunks();
-        let sealed_empty = sealed.is_empty();
+        let mut sealed = m.take_chunks()?;
+        let sealed_empty = sealed.map.is_empty();
+        let new_rows = m.take_rows();
         if !sealed_empty {
+            if let Some(budget) = budget {
+                sealed._permit = Some(budget.admit(sealed.resident_bytes()).await);
+            }
             self.generations.push(Arc::new(sealed));
         }
-        let new_rows = m.take_rows();
         if heaps.is_empty() && ordered_events.is_empty() && sealed_empty && new_rows.is_empty() {
             return Ok(None);
         }
@@ -2039,12 +2350,18 @@ impl CommittedDrain {
     }
 }
 
+/// Returns the leaf permit shrunk to the decoded bytes retained in the
+/// heap's tuples; the caller rides it with the routed row to insert ack
+/// so decoded values (and their encoder slab copy) stay covered past
+/// this call. `None` without budget or external values.
 pub(crate) async fn detoast_heap(
     heap: &mut DecodedHeap,
-    // Chunk-map generations, oldest first; a value lives in exactly one
-    // (single map on the serial path, sealed drain-batch generations on the
+    // Xact body spool backing `File` refs; None while memory-resident
+    spool: Option<&BodySpoolFile>,
+    // Ref-map generations, oldest first; a value lives in exactly one
+    // (live map on the serial path, sealed drain-batch generations on the
     // parallel path)
-    chunk_maps: &[&ChunkMap],
+    chunk_maps: &[&ChunkRefMap],
     catalog: &Arc<Mutex<ShadowCatalog>>,
     // Async decode pool can lag past a DDL and re-resolve an older heap,
     // so it reuses the inline cached descriptor without mutating cache or
@@ -2052,13 +2369,21 @@ pub(crate) async fn detoast_heap(
     // observer drain passes `false` for the normal cache-populating path.
     pooled: bool,
     resolver: &ToastResolver,
-) -> std::result::Result<(), XactBufferError> {
-    let mut keys: Vec<(u32, u32)> = Vec::new();
-    collect_toast_keys(heap.new.as_ref(), &mut keys);
-    collect_toast_keys(heap.old.as_ref(), &mut keys);
-    if keys.is_empty() {
-        return Ok(());
+) -> std::result::Result<Option<crate::budget::MemoryPermit>, XactBufferError> {
+    let mut pointers: Vec<ToastPointer> = Vec::new();
+    collect_toast_pointers(heap.new.as_ref(), &mut pointers);
+    collect_toast_pointers(heap.old.as_ref(), &mut pointers);
+    if pointers.is_empty() {
+        return Ok(None);
     }
+    let leaf_need = check_value_caps(&pointers, resolver.inline_value_max())?;
+    // One leaf at a time per worker: reserved for the heap's aggregate
+    // resolution peak (every retained decoded value + the largest
+    // single-value transient), shrunk to retained bytes before return
+    let mut leaf = match resolver.budget() {
+        Some(b) => Some(b.acquire(leaf_need).await),
+        None => None,
+    };
     let rel: Arc<RelDescriptor> = {
         let mut cat = catalog.lock().await;
         if pooled {
@@ -2067,133 +2392,190 @@ pub(crate) async fn detoast_heap(
             cat.relation_at(heap.rfn, heap.source_lsn).await?
         }
     };
-    // Pre-window / bootstrap values whose chunks aren't in this xact: pull
-    // them from the durable store into a per-heap supplemental map. Disabled
-    // mode (no store) leaves `extra` empty; a miss then NULL/default-fills.
-    let mut extra = ChunkMap::new();
-    if resolver.stores_chunks() {
-        for (relid, value_id) in keys {
-            if chunk_maps
-                .iter()
-                .any(|m| m.contains_key(&(relid, value_id)))
-                || extra.contains_key(&(relid, value_id))
-            {
-                continue;
-            }
-            resolver
-                .fetch_into(relid, value_id, heap.source_lsn, &mut extra)
-                .await
-                .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?;
-        }
+    let mut uses: HashMap<(u32, u32), u32> = HashMap::new();
+    for p in &pointers {
+        *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
     }
+    let mut res = ValueResolution {
+        spool,
+        xact_maps: chunk_maps,
+        resolver,
+        source_lsn: heap.source_lsn,
+        uses,
+        cache: HashMap::new(),
+        retained: 0,
+    };
     if let Some(t) = heap.new.as_mut() {
-        detoast_tuple(t, &rel, chunk_maps, &extra, resolver)?;
+        res.resolve_tuple(t, &rel).await?;
     }
     if let Some(t) = heap.old.as_mut() {
-        detoast_tuple(t, &rel, chunk_maps, &extra, resolver)?;
+        res.resolve_tuple(t, &rel).await?;
     }
-    Ok(())
+    if let Some(p) = leaf.as_mut() {
+        p.shrink(res.retained as u64);
+    }
+    Ok(leaf)
 }
 
-/// Append `(va_toastrelid, va_valueid)` for every on-disk toast pointer.
-fn collect_toast_keys(t: Option<&crate::heap_decoder::DecodedTuple>, out: &mut Vec<(u32, u32)>) {
+/// Append every on-disk toast pointer; carries `va_extinfo`/`va_rawsize`
+/// so store fetch can cap allocation.
+fn collect_toast_pointers(
+    t: Option<&crate::heap_decoder::DecodedTuple>,
+    out: &mut Vec<ToastPointer>,
+) {
     let Some(t) = t else {
         return;
     };
     for c in &t.columns {
         if let Some(ColumnValue::ExternalToast(p)) = c {
-            out.push((p.va_toastrelid, p.va_valueid));
+            out.push(*p);
         }
     }
 }
 
-fn detoast_tuple(
-    t: &mut crate::heap_decoder::DecodedTuple,
-    rel: &RelDescriptor,
-    xact_maps: &[&ChunkMap],
-    extra: &ChunkMap,
-    resolver: &ToastResolver,
-) -> std::result::Result<(), XactBufferError> {
-    let mut maps: Vec<&ChunkMap> = xact_maps.to_vec();
-    maps.push(extra);
-    for (idx, col) in t.columns.iter_mut().enumerate() {
-        let Some(ColumnValue::ExternalToast(p)) = col else {
-            continue;
-        };
-        // `ToastPointer: Copy` frees the borrow on `col` before reassign
-        let p: ToastPointer = *p;
-        let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
-        let key = (p.va_toastrelid, p.va_valueid);
-        match try_reassemble(&p, &maps)? {
-            Reassembled::Bytes(raw) => *col = Some(detoasted_value(raw, type_oid)),
-            // Disabled mode: surface the unresolvable value as NULL/default
-            // downstream (`append_default`), counted, never an error.
-            Reassembled::Missing if resolver.fill_on_miss() => {
-                resolver.note_filled_default();
-                *col = Some(ColumnValue::Null);
-            }
-            // In-xact chunks present but gapped or short: decode bug,
-            // surfaced loud.
-            outcome if xact_maps.iter().any(|m| m.contains_key(&key)) => {
-                resolver.note_fetch_miss();
-                return Err(match outcome {
-                    Reassembled::SizeMismatch { got, want } => XactBufferError::Detoast(format!(
-                        "toast value {}/{}: chunks sum to {got} bytes, pointer says {want}",
-                        p.va_toastrelid, p.va_valueid
-                    )),
-                    _ => XactBufferError::MissingToastChunk {
-                        toast_relid: p.va_toastrelid,
-                        value_id: p.va_valueid,
-                        missing: first_missing_seq(&p, &maps),
-                    },
-                });
-            }
-            // Safe only after supersession or replayed owner TRUNCATE
-            Reassembled::Missing => {
-                resolver.note_filled_superseded();
-                *col = Some(ColumnValue::Null);
-            }
-            Reassembled::SizeMismatch { .. } => {
-                resolver.note_filled_mismatch();
-                *col = Some(ColumnValue::Null);
-            }
-        }
-    }
-    Ok(())
+/// Store-fetched value decoded once per key; cloned for all but the last
+/// use, which moves the buffer
+enum CachedValue {
+    Decoded(Vec<u8>),
+    /// Safe only after supersession or replayed owner TRUNCATE
+    Missing,
+    Mismatch,
 }
 
-/// Reassembled `ExternalToast` bytes → typed value, routed through the same
-/// `varlena_to_value` the inline decoder uses so a detoasted value resolves
-/// identically to an inline one. Tier 3 types (jsonb, arrays, large numerics)
-/// land as `PgPending`, resolved at emit by the oracle. `raw` is the
-/// header-stripped, decompressed varlena body, matching the inline `body`;
-/// passed owned so the (large) reassembled buffer moves into the value with
-/// no copy.
-pub(crate) fn detoasted_value(raw: Vec<u8>, type_oid: u32) -> ColumnValue {
-    crate::heap_decoder::varlena_to_value(type_oid, std::borrow::Cow::Owned(raw))
+/// Per-heap value resolution: on-demand store fetch (never all values at
+/// once), decoded bytes tallied in `retained` for the leaf-permit shrink
+struct ValueResolution<'a> {
+    spool: Option<&'a BodySpoolFile>,
+    xact_maps: &'a [&'a ChunkRefMap],
+    resolver: &'a ToastResolver,
+    source_lsn: u64,
+    /// Pointer occurrences per key across both tuples, sizing cache
+    /// retention (last use moves instead of cloning)
+    uses: HashMap<(u32, u32), u32>,
+    cache: HashMap<(u32, u32), CachedValue>,
+    retained: usize,
 }
 
-/// First seq missing from the dense 0..N run, for the error message. `0` when
-/// no chunks at all. Only walked on the error path.
-fn first_missing_seq(p: &ToastPointer, maps: &[&ChunkMap]) -> u32 {
-    let key = (p.va_toastrelid, p.va_valueid);
-    match maps.iter().find_map(|m| m.get(&key)) {
-        None => 0,
-        Some(map) => {
-            for (expected, seq) in map.keys().enumerate() {
-                if *seq != expected as u32 {
-                    return expected as u32;
+impl ValueResolution<'_> {
+    async fn resolve_tuple(
+        &mut self,
+        t: &mut crate::heap_decoder::DecodedTuple,
+        rel: &RelDescriptor,
+    ) -> std::result::Result<(), XactBufferError> {
+        for (idx, col) in t.columns.iter_mut().enumerate() {
+            let Some(ColumnValue::ExternalToast(p)) = col else {
+                continue;
+            };
+            // `ToastPointer: Copy` frees the borrow on `col` before reassign
+            let p: ToastPointer = *p;
+            let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
+            let key = (p.va_toastrelid, p.va_valueid);
+            if let Some(v) = self.xact_maps.iter().find_map(|m| m.get(&key)) {
+                match reassemble_value_ref(&p, self.spool, v)? {
+                    Reassembled::Bytes(raw) => {
+                        self.retained += raw.len();
+                        *col = Some(detoasted_value(raw, type_oid));
+                    }
+                    // Disabled mode: surface the unresolvable value as
+                    // NULL/default downstream (`append_default`), counted,
+                    // never an error.
+                    Reassembled::Missing if self.resolver.fill_on_miss() => {
+                        self.resolver.note_filled_default();
+                        *col = Some(ColumnValue::Null);
+                    }
+                    // In-xact chunks gapped or short: decode bug, surfaced loud
+                    outcome => {
+                        self.resolver.note_fetch_miss();
+                        return Err(match outcome {
+                            Reassembled::SizeMismatch { got, want } => {
+                                XactBufferError::Detoast(format!(
+                                    "toast value {}/{}: chunks sum to {got} bytes, pointer says {want}",
+                                    p.va_toastrelid, p.va_valueid
+                                ))
+                            }
+                            _ => XactBufferError::MissingToastChunk {
+                                toast_relid: p.va_toastrelid,
+                                value_id: p.va_valueid,
+                                missing: first_missing_seq_ref(v),
+                            },
+                        });
+                    }
                 }
+                continue;
             }
-            map.len() as u32
+            *col = Some(self.resolve_store(&p, type_oid).await?);
         }
+        Ok(())
+    }
+
+    /// Pre-window / bootstrap value whose chunks aren't in this xact,
+    /// fetched assembled against the pointer's stored size
+    async fn resolve_store(
+        &mut self,
+        p: &ToastPointer,
+        type_oid: u32,
+    ) -> std::result::Result<ColumnValue, XactBufferError> {
+        if self.resolver.fill_on_miss() {
+            // Disabled mode: no store to consult
+            self.resolver.note_filled_default();
+            return Ok(ColumnValue::Null);
+        }
+        let key = (p.va_toastrelid, p.va_valueid);
+        if !self.cache.contains_key(&key) {
+            let fetched = self
+                .resolver
+                .fetch_value(key.0, key.1, self.source_lsn, pointer_extsize(p))
+                .await
+                .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?
+                .expect("store checked via fill_on_miss");
+            let cached = match fetched {
+                FetchedValue::Assembled(stored) => CachedValue::Decoded(finish_value(p, stored)?),
+                FetchedValue::Missing => CachedValue::Missing,
+                FetchedValue::Mismatch { .. } => CachedValue::Mismatch,
+            };
+            self.cache.insert(key, cached);
+        }
+        match self.cache.get(&key).expect("just primed") {
+            CachedValue::Missing => {
+                self.resolver.note_filled_superseded();
+                return Ok(ColumnValue::Null);
+            }
+            CachedValue::Mismatch => {
+                self.resolver.note_filled_mismatch();
+                return Ok(ColumnValue::Null);
+            }
+            CachedValue::Decoded(_) => {}
+        }
+        let uses = self.uses.get_mut(&key).expect("counted in detoast_heap");
+        *uses -= 1;
+        let raw = if *uses > 0 {
+            let Some(CachedValue::Decoded(v)) = self.cache.get(&key) else {
+                unreachable!("matched Decoded above")
+            };
+            v.clone()
+        } else {
+            let Some(CachedValue::Decoded(v)) = self.cache.remove(&key) else {
+                unreachable!("matched Decoded above")
+            };
+            v
+        };
+        self.retained += raw.len();
+        Ok(detoasted_value(raw, type_oid))
     }
 }
 
-use crate::heap_decoder::{VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena};
-
-/// PG `VARHDRSZ`, 4-byte varlena header
-const VARHDRSZ: i32 = 4;
+/// First seq missing from a ref value's dense coverage, for the error
+/// message. Only walked on the error path.
+fn first_missing_seq_ref(v: &ValueRef) -> u32 {
+    let mut next = v.run_chunks;
+    for (&seq, _) in v.tail.range(v.run_chunks..) {
+        if seq != next {
+            return next;
+        }
+        next += 1;
+    }
+    next
+}
 
 /// Chunk coverage outcome, decompression failures remain errors
 pub(crate) enum Reassembled {
@@ -2206,45 +2588,53 @@ pub(crate) enum Reassembled {
     },
 }
 
-/// Concatenate a value's chunks (seq 0..N dense) then decompress per the
-/// pointer's method. Looks the value up across `maps` in order (in-xact
-/// chunk map first, then a store-fetched supplement).
-pub(crate) fn try_reassemble(
+/// Reassemble one in-xact value from its refs: validate dense coverage
+/// and pointer size BEFORE any read, then copy memory bodies /
+/// positional-read spool ranges into one exact-size buffer, decompress
+/// per the pointer's method. Tail keys below `run_chunks` are
+/// byte-identical duplicates of run chunks (PG chunk immutability),
+/// skipped.
+pub(crate) fn reassemble_value_ref(
     p: &ToastPointer,
-    maps: &[&ChunkMap],
+    spool: Option<&BodySpoolFile>,
+    v: &ValueRef,
 ) -> std::result::Result<Reassembled, XactBufferError> {
-    let key = (p.va_toastrelid, p.va_valueid);
-    let Some(map) = maps.iter().find_map(|m| m.get(&key)) else {
-        return Ok(Reassembled::Missing);
-    };
-    let total: usize = map.values().map(Vec::len).sum();
-    let mut concat: Vec<u8> = Vec::with_capacity(total);
-    for (expected, (seq, body)) in map.iter().enumerate() {
-        if *seq != expected as u32 {
+    let mut total = v.run.len as usize;
+    for (next, (&seq, b)) in (v.run_chunks..).zip(v.tail.range(v.run_chunks..)) {
+        if seq != next {
             return Ok(Reassembled::Missing);
         }
-        concat.extend_from_slice(body);
+        total += b.len();
     }
-    let extsize = (p.va_extinfo & VARLENA_EXTSIZE_MASK) as usize;
-    if concat.len() != extsize {
+    let extsize = pointer_extsize(p);
+    if total != extsize {
         return Ok(Reassembled::SizeMismatch {
-            got: concat.len(),
+            got: total,
             want: extsize,
         });
     }
-    let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
-    if !compressed {
-        return Ok(Reassembled::Bytes(concat));
+    let need_spool = || {
+        spool.ok_or_else(|| XactBufferError::Detoast("file chunk refs without body spool".into()))
+    };
+    let read_err = |e: std::io::Error| XactBufferError::Detoast(format!("body spool read: {e}"));
+    let mut concat = vec![0u8; total];
+    let mut off = 0usize;
+    if v.run.len > 0 {
+        need_spool()?
+            .read_at(v.run.offset, &mut concat[..v.run.len as usize])
+            .map_err(read_err)?;
+        off = v.run.len as usize;
     }
-    let method = ((p.va_extinfo >> VARLENA_EXTSIZE_BITS) & 0x3) as u8;
-    let raw_len = (p.va_rawsize - VARHDRSZ).max(0) as usize;
-    match decompress_varlena(method, &concat, raw_len) {
-        Some(out) => Ok(Reassembled::Bytes(out)),
-        None => Err(XactBufferError::Detoast(format!(
-            "decompress failed (method {method}, {} bytes → {raw_len})",
-            concat.len()
-        ))),
+    for (_, b) in v.tail.range(v.run_chunks..) {
+        match b {
+            Body::Mem(bytes) => concat[off..off + bytes.len()].copy_from_slice(bytes),
+            Body::File(r) => need_spool()?
+                .read_at(r.offset, &mut concat[off..off + r.len as usize])
+                .map_err(read_err)?,
+        }
+        off += b.len();
     }
+    Ok(Reassembled::Bytes(finish_value(p, concat)?))
 }
 
 /// `RecordSink` for `RM_XACT_ID` records. Separate from
@@ -3151,7 +3541,7 @@ fn decode_image_insert(
         source_lsn: raw.source_lsn,
         blkno,
         offnum,
-        chunk_data,
+        chunk_data: bytes::Bytes::from(chunk_data),
     })])
 }
 
@@ -3179,7 +3569,7 @@ fn toast_chunk_from_decoded(
         source_lsn: d.source_lsn,
         blkno,
         offnum,
-        chunk_data,
+        chunk_data: bytes::Bytes::from(chunk_data),
     })
 }
 
@@ -3191,7 +3581,7 @@ mod tests {
     //! unit-test stub catalog would duplicate the production cache.
 
     use super::*;
-    use crate::heap_decoder::{DecodedTuple, HeapOp};
+    use crate::heap_decoder::{DecodedTuple, HeapOp, VARLENA_EXTSIZE_BITS};
     use tempfile::tempdir;
     use walrus::pg::walparser::RelFileNode;
 
@@ -3243,7 +3633,7 @@ mod tests {
     fn cfg(dir: PathBuf) -> XactBufferConfig {
         XactBufferConfig {
             xact_buffer_max: 1024,
-            spill_dir: dir,
+            ..XactBufferConfig::new(dir)
         }
     }
 
@@ -3425,7 +3815,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let cfg = XactBufferConfig {
             xact_buffer_max: 4096,
-            spill_dir: tmp.path().to_path_buf(),
+            ..XactBufferConfig::new(tmp.path().to_path_buf())
         };
         let mut b = XactBuffer::new(cfg).unwrap();
         b.on_heap(heap_with_value(1, 100, 8192)).await.unwrap();
@@ -3568,7 +3958,7 @@ mod tests {
         assert_eq!(chunk.toast_relid, 99); // pg_class.oid, not rel_node
         assert_eq!(chunk.value_id, 55);
         assert_eq!(chunk.chunk_seq, 2);
-        assert_eq!(chunk.chunk_data, b"hello");
+        assert_eq!(&chunk.chunk_data[..], b"hello");
         assert_eq!((chunk.blkno, chunk.offnum), (7, 3));
         let mut d2 = d.clone();
         d2.op = HeapOp::Update;
@@ -3641,20 +4031,118 @@ mod tests {
         }
     }
 
+    /// Ref map of memory bodies for one value's `(seq, body)` chunks
+    fn mem_refs(key: (u32, u32), chunks: &[(u32, &'static [u8])]) -> ChunkRefMap {
+        let mut map = ChunkRefMap::new();
+        for &(seq, body) in chunks {
+            let body = Body::Mem(bytes::Bytes::from_static(body));
+            match map.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    o.get_mut().push(seq, body);
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(ValueRef::new(seq, body));
+                }
+            }
+        }
+        map
+    }
+
+    /// V3 cap fires before allocation with a typed non-retryable error;
+    /// leaf need sizes for the worst per-value transient
+    #[test]
+    fn value_cap_rejects_before_allocation() {
+        let ptr = |rawsize, extinfo| ToastPointer {
+            va_rawsize: rawsize,
+            va_extinfo: extinfo,
+            va_valueid: 1,
+            va_toastrelid: 16500,
+        };
+        // Uncompressed: leaf need = extsize
+        assert_eq!(check_value_caps(&[ptr(104, 100)], 1000).unwrap(), 100);
+        // Compressed (method bits set): extsize + rawsize
+        let compressed = 80u32 | (1 << VARLENA_EXTSIZE_BITS);
+        assert_eq!(
+            check_value_caps(&[ptr(104, compressed)], 1000).unwrap(),
+            180
+        );
+        // Decode target over cap: typed error before allocation
+        let err = check_value_caps(&[ptr(2000, 100)], 1000).unwrap_err();
+        assert!(matches!(
+            err,
+            ToastValueError::ValueTooLarge {
+                rawsize: 1996,
+                max: 1000
+            }
+        ));
+        // Stored form over cap trips too (caps ChunkAssembler expected_size)
+        let err = check_value_caps(&[ptr(104, 1500)], 1000).unwrap_err();
+        assert!(matches!(err, ToastValueError::ValueTooLarge { .. }));
+    }
+
+    /// Spool + file-ref map for one value's `(seq, body)` chunks; `lsn`
+    /// keys the spool filename so one tempdir hosts several
+    fn file_refs(
+        dir: &std::path::Path,
+        lsn: u64,
+        key: (u32, u32),
+        chunks: &[(u32, &[u8])],
+    ) -> (BodySpoolWriter, ChunkRefMap) {
+        let mut w = BodySpoolWriter::create(dir, 1, lsn, None).unwrap();
+        let mut map = ChunkRefMap::new();
+        for &(seq, body) in chunks {
+            let r = Body::File(w.append(body).unwrap());
+            match map.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    o.get_mut().push(seq, r);
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(ValueRef::new(seq, r));
+                }
+            }
+        }
+        w.flush().unwrap();
+        (w, map)
+    }
+
+    /// One-key resolution scope with cache pre-seeded to a store outcome
+    fn seeded<'a>(
+        resolver: &'a ToastResolver,
+        spool: Option<&'a BodySpoolFile>,
+        xact_maps: &'a [&'a ChunkRefMap],
+        cache: HashMap<(u32, u32), CachedValue>,
+    ) -> ValueResolution<'a> {
+        ValueResolution {
+            spool,
+            xact_maps,
+            resolver,
+            source_lsn: 0,
+            uses: HashMap::from([((16500u32, 55u32), 1)]),
+            cache,
+            retained: 0,
+        }
+    }
+
     /// Miss policy split: in-xact gap stays a hard error; a store-side miss
     /// (key absent from every xact map) NULL-fills + counts superseded;
     /// disabled mode NULL-fills + counts default.
-    #[test]
-    fn detoast_tuple_splits_in_xact_gap_from_store_miss() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_tuple_splits_in_xact_gap_from_store_miss() {
         let rel = bytea_rel();
+        let tmp = tempdir().unwrap();
         let stats = Arc::new(crate::ch_emitter::EmitterStats::default());
         let store_resolver =
             ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats.clone());
 
+        let key = (16500u32, 55u32);
+
         // Store miss: no xact map holds the key → superseded fill
         let mut t = toast_ptr_tuple(55);
-        detoast_tuple(&mut t, &rel, &[], &ChunkMap::new(), &store_resolver).unwrap();
+        let cache = HashMap::from([(key, CachedValue::Missing)]);
+        let mut r = seeded(&store_resolver, None, &[], cache);
+        r.resolve_tuple(&mut t, &rel).await.unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Null));
+        assert_eq!(r.retained, 0, "fills retain nothing");
         assert_eq!(
             stats
                 .toast_values_filled_superseded
@@ -3663,13 +4151,12 @@ mod tests {
         );
 
         // In-xact gap: key present but seq 1 missing → hard error
-        let mut gapped = ChunkMap::new();
-        gapped.insert(
-            (16500, 55),
-            std::collections::BTreeMap::from([(0u32, b"ab".to_vec()), (2u32, b"cd".to_vec())]),
-        );
+        let gapped = mem_refs(key, &[(0, b"ab"), (2, b"cd")]);
+        let maps = [&gapped];
         let mut t = toast_ptr_tuple(55);
-        let err = detoast_tuple(&mut t, &rel, &[&gapped], &ChunkMap::new(), &store_resolver)
+        let err = seeded(&store_resolver, None, &maps, HashMap::new())
+            .resolve_tuple(&mut t, &rel)
+            .await
             .expect_err("in-xact gap surfaces");
         assert!(matches!(
             err,
@@ -3682,25 +4169,47 @@ mod tests {
             1
         );
 
-        // Store-resolved hit still reassembles
-        let mut extra = ChunkMap::new();
-        extra.insert(
-            (16500, 55),
-            std::collections::BTreeMap::from([(0u32, b"abcd".to_vec())]),
-        );
+        // In-xact memory refs resolve without spool
+        let whole = mem_refs(key, &[(0, b"ab"), (1, b"cd")]);
+        let maps = [&whole];
         let mut t = toast_ptr_tuple(55);
-        detoast_tuple(&mut t, &rel, &[], &extra, &store_resolver).unwrap();
+        let mut r = seeded(&store_resolver, None, &maps, HashMap::new());
+        r.resolve_tuple(&mut t, &rel).await.unwrap();
+        assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
+        assert_eq!(r.retained, 4, "decoded bytes tally for the permit shrink");
+
+        // In-xact file refs resolve through the spool
+        let (w, spooled) = file_refs(tmp.path(), 0x10, key, &[(0, b"ab"), (1, b"cd")]);
+        let maps = [&spooled];
+        let mut t = toast_ptr_tuple(55);
+        seeded(
+            &store_resolver,
+            Some(w.shared().as_ref()),
+            &maps,
+            HashMap::new(),
+        )
+        .resolve_tuple(&mut t, &rel)
+        .await
+        .unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
 
-        // Store-side dense-but-short run (partial merge collapse): fills,
-        // counted mismatch — not superseded, not a hard error
-        let mut short = ChunkMap::new();
-        short.insert(
-            (16500, 55),
-            std::collections::BTreeMap::from([(0u32, b"ab".to_vec())]),
-        );
+        // Store-resolved hit lands assembled bytes
         let mut t = toast_ptr_tuple(55);
-        detoast_tuple(&mut t, &rel, &[], &short, &store_resolver).unwrap();
+        let cache = HashMap::from([(key, CachedValue::Decoded(b"abcd".to_vec()))]);
+        let mut r = seeded(&store_resolver, None, &[], cache);
+        r.resolve_tuple(&mut t, &rel).await.unwrap();
+        assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
+        assert_eq!(r.retained, 4);
+        assert!(r.cache.is_empty(), "last use moves the buffer out");
+
+        // Store-side run deviation (partial merge collapse): fills,
+        // counted mismatch — not superseded, not a hard error
+        let mut t = toast_ptr_tuple(55);
+        let cache = HashMap::from([(key, CachedValue::Mismatch)]);
+        seeded(&store_resolver, None, &[], cache)
+            .resolve_tuple(&mut t, &rel)
+            .await
+            .unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Null));
         assert_eq!(
             stats
@@ -3716,28 +4225,76 @@ mod tests {
             "short run counts mismatch, not superseded"
         );
 
-        // In-xact dense-but-short: decode bug, hard error
-        let mut xact_short = ChunkMap::new();
-        xact_short.insert(
-            (16500, 55),
-            std::collections::BTreeMap::from([(0u32, b"ab".to_vec())]),
-        );
+        // In-xact dense-but-short: decode bug, hard error. Size check
+        // fires before any spool read
+        let xact_short = mem_refs(key, &[(0, b"ab")]);
+        let maps = [&xact_short];
         let mut t = toast_ptr_tuple(55);
-        let err = detoast_tuple(
-            &mut t,
-            &rel,
-            &[&xact_short],
-            &ChunkMap::new(),
-            &store_resolver,
-        )
-        .expect_err("in-xact size mismatch surfaces");
+        let err = seeded(&store_resolver, None, &maps, HashMap::new())
+            .resolve_tuple(&mut t, &rel)
+            .await
+            .expect_err("in-xact size mismatch surfaces");
         assert!(matches!(err, XactBufferError::Detoast(_)));
 
         // Disabled mode: any miss NULL-fills as before, counted default
         let disabled = ToastResolver::disabled();
         let mut t = toast_ptr_tuple(55);
-        detoast_tuple(&mut t, &rel, &[], &ChunkMap::new(), &disabled).unwrap();
+        seeded(&disabled, None, &[], HashMap::new())
+            .resolve_tuple(&mut t, &rel)
+            .await
+            .unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Null));
+    }
+
+    /// Store fetch runs once per key: decode once, clone for earlier
+    /// duplicate uses (old/new tuple reuse), move the buffer on the last
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_store_fetches_once_and_moves_last_use() {
+        use crate::toast::{ChunkStore, MemChunkStore, ToastRow};
+        let store = Arc::new(MemChunkStore::new());
+        store
+            .put(&[ToastRow {
+                toast_relid: 16500,
+                blkno: 1,
+                offnum: 1,
+                chunk_id: 55,
+                chunk_seq: 0,
+                chunk_data: bytes::Bytes::from_static(b"abcd"),
+                lsn: 1,
+            }])
+            .await
+            .unwrap();
+        let stats = Arc::new(crate::ch_emitter::EmitterStats::default());
+        let resolver = ToastResolver::with_store(store, stats.clone());
+        let p = ToastPointer {
+            va_rawsize: 8,
+            va_extinfo: 4,
+            va_valueid: 55,
+            va_toastrelid: 16500,
+        };
+        let mut r = ValueResolution {
+            spool: None,
+            xact_maps: &[],
+            resolver: &resolver,
+            source_lsn: 10,
+            uses: HashMap::from([((16500u32, 55u32), 2)]),
+            cache: HashMap::new(),
+            retained: 0,
+        };
+        let first = r.resolve_store(&p, 17).await.unwrap();
+        assert!(!r.cache.is_empty(), "pending duplicate use stays cached");
+        let second = r.resolve_store(&p, 17).await.unwrap();
+        assert_eq!(first, ColumnValue::Bytea(b"abcd".to_vec()));
+        assert_eq!(second, ColumnValue::Bytea(b"abcd".to_vec()));
+        assert!(r.cache.is_empty(), "last use moves the buffer out");
+        assert_eq!(r.retained, 8, "both uses retain their copy");
+        assert_eq!(
+            stats
+                .toast_values_fetched
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one fetch serves both uses"
+        );
     }
 
     // ── subxact tracking ──────────────────────────────────────────────
@@ -3880,7 +4437,7 @@ mod tests {
             source_lsn: lsn,
             blkno: 0,
             offnum: 1 + seq as u16,
-            chunk_data: body.to_vec(),
+            chunk_data: bytes::Bytes::copy_from_slice(body),
         }
     }
 
@@ -3938,7 +4495,7 @@ mod tests {
         assert!(drain.had_states);
         let mut order: Vec<String> = Vec::new();
         let mut finals = Vec::new();
-        while let Some(batch) = drain.next_batch(2, usize::MAX).await.unwrap() {
+        while let Some(batch) = drain.next_batch(2, usize::MAX, None).await.unwrap() {
             order.extend(flatten_batch(&batch));
             finals.push(batch.is_final);
             if batch.is_final {
@@ -3953,7 +4510,13 @@ mod tests {
         );
         assert!(finals.pop().unwrap(), "last slice flags final");
         assert!(finals.iter().all(|f| !f), "earlier slices non-final");
-        assert!(drain.next_batch(2, usize::MAX).await.unwrap().is_none());
+        assert!(
+            drain
+                .next_batch(2, usize::MAX, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         drain.finish().await.unwrap();
         assert_eq!(b.stats().committed_xacts_total, 1);
         assert!(b.active_xids().is_empty());
@@ -3981,7 +4544,11 @@ mod tests {
         b.on_heap(heap_with_value(9, 300, 16)).await.unwrap();
 
         let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
-        let b1 = drain.next_batch(1, usize::MAX).await.unwrap().unwrap();
+        let b1 = drain
+            .next_batch(1, usize::MAX, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(b1.heaps.len(), 1);
         assert_eq!(b1.new_rows.len(), 2);
         assert_eq!(b1.new_rows[0].lsn, 100);
@@ -3989,21 +4556,32 @@ mod tests {
         assert_eq!(b1.new_rows[1].lsn, 105);
         assert!(!b1.new_rows[1].is_tombstone());
         assert!(b1.chunks.last().unwrap().contains_key(&(16400, 55)));
-        let b2 = drain.next_batch(1, usize::MAX).await.unwrap().unwrap();
+        // Mirror row refs materialize below threshold without a spool
+        let row0 = b1.new_rows[0].materialize(b1.new_rows.spool()).unwrap();
+        assert_eq!(&row0.chunk_data[..], b"ab");
+        let b2 = drain
+            .next_batch(1, usize::MAX, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(b2.is_final);
         assert_eq!(b2.new_rows.len(), 1);
         let t = &b2.new_rows[0];
         assert!(t.is_tombstone());
         assert_eq!((t.blkno, t.offnum, t.chunk_id, t.lsn), (7, 3, 0, 200));
         assert!(t.chunk_data.is_empty());
-        let maps: Vec<&ChunkMap> = b2.chunks.iter().map(Arc::as_ref).collect();
         let p = ToastPointer {
             va_rawsize: 8,
             va_extinfo: 4, // extsize = "abcd", no compression
             va_valueid: 55,
             va_toastrelid: 16400,
         };
-        let Reassembled::Bytes(raw) = try_reassemble(&p, &maps).unwrap() else {
+        let v = b2.chunks.iter().find_map(|g| g.get(&(16400, 55))).unwrap();
+        // Below threshold both bodies stay memory-resident in the tail
+        assert_eq!((v.run_chunks, v.tail.len()), (0, 2));
+        let spool = b2.chunks.iter().find_map(|g| g.spool());
+        assert!(spool.is_none(), "no spool below threshold");
+        let Reassembled::Bytes(raw) = reassemble_value_ref(&p, spool, v).unwrap() else {
             panic!("value visible");
         };
         assert_eq!(raw, b"abcd");
@@ -4026,7 +4604,7 @@ mod tests {
 
         let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
         let batch = drain
-            .next_batch(usize::MAX, usize::MAX)
+            .next_batch(usize::MAX, usize::MAX, None)
             .await
             .unwrap()
             .unwrap();
@@ -4064,7 +4642,7 @@ mod tests {
             0,
             "drain owns the bytes once opened"
         );
-        while let Some(batch) = drain.next_batch(2, usize::MAX).await.unwrap() {
+        while let Some(batch) = drain.next_batch(2, usize::MAX, None).await.unwrap() {
             if batch.is_final {
                 break;
             }
@@ -4091,7 +4669,7 @@ mod tests {
         let total = n * 512;
         let mut drain = b.drain_committed(4, 0, 0x9000, &[], false).await.unwrap();
         let mut rows = 0usize;
-        while let Some(batch) = drain.next_batch(4, usize::MAX).await.unwrap() {
+        while let Some(batch) = drain.next_batch(4, usize::MAX, None).await.unwrap() {
             rows += batch.heaps.len();
             assert!(
                 b.drain_resident_bytes() < total / 4,
@@ -4113,13 +4691,193 @@ mod tests {
         assert_eq!(b.drain_resident_bytes(), 0, "gauge drains with the drain");
     }
 
+    /// Ownership accounting in the memory-threshold regime: sealed chunk
+    /// generations and taken mirror rows stay gauged while any consumer
+    /// holds them — container hand-off is not release. Below
+    /// `toast_body_mem_max` resident chunk bytes scale with the xact's
+    /// total TOAST bytes (plus ref metadata) until every batch drops.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_resident_counts_generations_and_rows_until_drop() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let n = 16u32;
+        let body = [7u8; 512];
+        for i in 0..n {
+            let lsn = 100 + 2 * u64::from(i);
+            b.on_toast_chunk(chunk(50 + i, 0, lsn, &body), 9)
+                .await
+                .unwrap();
+            b.on_heap(heap_with_value(9, lsn + 1, 16)).await.unwrap();
+        }
+        let total = u64::from(n) * (512 + CHUNK_REF_META as u64);
+        let mut drain = b.drain_committed(9, 0, 0x9000, &[], true).await.unwrap();
+        let mut held: Vec<DrainedBatch> = Vec::new();
+        while let Some(batch) = drain.next_batch(2, usize::MAX, None).await.unwrap() {
+            let is_final = batch.is_final;
+            held.push(batch);
+            if is_final {
+                break;
+            }
+        }
+        assert!(
+            held.last().unwrap().chunks.len() > 1,
+            "slices sealed multiple generations"
+        );
+        assert_eq!(b.drain_chunk_resident_bytes(), total);
+        // Rows share the generation's Mem bodies, gauging metadata only
+        assert_eq!(
+            b.drain_row_resident_bytes(),
+            u64::from(n) * CHUNK_REF_META as u64
+        );
+        assert_eq!(b.toast_spool_bytes(), 0, "below threshold, no spool");
+        drain.finish().await.unwrap();
+        assert_eq!(
+            b.drain_chunk_resident_bytes(),
+            total,
+            "finish releases spill files, not held generations"
+        );
+        held.clear();
+        assert_eq!(b.drain_chunk_resident_bytes(), 0);
+        assert_eq!(b.drain_row_resident_bytes(), 0);
+        assert_eq!(b.drain_resident_bytes(), 0);
+    }
+
+    fn toastbody_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("toastbody-"))
+            .collect()
+    }
+
+    /// Flip of the retention test: past `toast_body_mem_max` bodies spool
+    /// to disk, so resident chunk bytes stay ≤ threshold + ref metadata
+    /// even while every batch of a multi-generation drain is held. Mixed
+    /// Mem/File generations resolve; spool unlinks at finish with held
+    /// readers surviving via fd.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_spools_bodies_past_mem_threshold() {
+        let tmp = tempdir().unwrap();
+        let mut c = cfg(tmp.path().to_path_buf());
+        c.toast_body_mem_max = 1024;
+        let mut b = XactBuffer::new(c).unwrap();
+        let n = 8u32;
+        let body = [7u8; 512];
+        for i in 0..n {
+            let lsn = 100 + 2 * u64::from(i);
+            b.on_toast_chunk(chunk(50 + i, 0, lsn, &body), 9)
+                .await
+                .unwrap();
+            b.on_heap(heap_with_value(9, lsn + 1, 16)).await.unwrap();
+        }
+        let mut drain = b.drain_committed(9, 0, 0x9000, &[], true).await.unwrap();
+        let mut held: Vec<DrainedBatch> = Vec::new();
+        while let Some(batch) = drain.next_batch(2, usize::MAX, None).await.unwrap() {
+            let is_final = batch.is_final;
+            held.push(batch);
+            if is_final {
+                break;
+            }
+        }
+        // First two bodies fill the 1024-byte budget, rest hit disk
+        let meta = u64::from(n) * CHUNK_REF_META as u64;
+        assert_eq!(b.drain_chunk_resident_bytes(), 1024 + meta);
+        assert_eq!(b.drain_row_resident_bytes(), meta);
+        assert_eq!(b.toast_spool_bytes(), u64::from(n - 2) * 512);
+        assert_eq!(toastbody_files(tmp.path()).len(), 1);
+        let last = held.last().unwrap();
+        let spool = last.chunks.iter().find_map(|g| g.spool());
+        assert!(spool.is_some(), "post-threshold generations carry spool");
+        let p = |value_id| ToastPointer {
+            va_rawsize: 516,
+            va_extinfo: 512, // uncompressed
+            va_valueid: value_id,
+            va_toastrelid: 16400,
+        };
+        // Mem value (gen 0) and File value (late gen) both resolve; File
+        // run held compact (whole value one contiguous range)
+        let mem_v = last
+            .chunks
+            .iter()
+            .find_map(|g| g.get(&(16400, 50)))
+            .unwrap();
+        assert_eq!((mem_v.run_chunks, mem_v.tail.len()), (0, 1));
+        let Reassembled::Bytes(raw) = reassemble_value_ref(&p(50), spool, mem_v).unwrap() else {
+            panic!("mem value visible");
+        };
+        assert_eq!(raw.len(), 512);
+        let file_v = last
+            .chunks
+            .iter()
+            .find_map(|g| g.get(&(16400, 50 + n - 1)))
+            .unwrap();
+        assert_eq!(
+            (file_v.run_chunks, file_v.run.len, file_v.tail.len()),
+            (1, 512, 0)
+        );
+        let Reassembled::Bytes(raw) = reassemble_value_ref(&p(50 + n - 1), spool, file_v).unwrap()
+        else {
+            panic!("file value visible");
+        };
+        assert_eq!(raw.len(), 512);
+        // Mirror row refs materialize from the same spool
+        let rows = &held.last().unwrap().new_rows;
+        for r in rows.iter() {
+            assert_eq!(r.materialize(rows.spool()).unwrap().chunk_data.len(), 512);
+        }
+        drain.finish().await.unwrap();
+        assert_eq!(
+            b.toast_spool_bytes(),
+            u64::from(n - 2) * 512,
+            "held readers pin unlinked disk bytes in gauge + quota"
+        );
+        assert!(
+            toastbody_files(tmp.path()).is_empty(),
+            "finish unlinks spool"
+        );
+        // Held readers survive unlink via open fd
+        let spool = last.chunks.iter().find_map(|g| g.spool());
+        let Reassembled::Bytes(raw) = reassemble_value_ref(&p(50 + n - 1), spool, file_v).unwrap()
+        else {
+            panic!("read-after-unlink via open fd");
+        };
+        assert_eq!(raw.len(), 512);
+        held.clear();
+        assert_eq!(b.drain_chunk_resident_bytes(), 0);
+        assert_eq!(b.drain_row_resident_bytes(), 0);
+        assert_eq!(b.drain_resident_bytes(), 0);
+        assert_eq!(b.toast_spool_bytes(), 0, "gauge drops with the last reader");
+    }
+
+    /// Metadata cap: typed non-retryable error before further allocation
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_fails_loud_past_index_meta_cap() {
+        let tmp = tempdir().unwrap();
+        let mut c = cfg(tmp.path().to_path_buf());
+        // Chunk + row ref cost 2×CHUNK_REF_META per fold; second fold trips
+        c.toast_index_mem_max = 3 * CHUNK_REF_META;
+        let mut b = XactBuffer::new(c).unwrap();
+        b.on_toast_chunk(chunk(50, 0, 100, b"aa"), 9).await.unwrap();
+        b.on_toast_chunk(chunk(51, 0, 102, b"bb"), 9).await.unwrap();
+        b.on_heap(heap_with_value(9, 110, 16)).await.unwrap();
+        let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
+        let Err(err) = drain.next_batch(usize::MAX, usize::MAX, None).await else {
+            panic!("cap breach surfaces");
+        };
+        assert!(matches!(
+            err,
+            XactBufferError::ToastIndexOverflow { max, .. } if max == 3 * CHUNK_REF_META
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn drain_committed_unknown_xid_yields_no_batches() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let mut drain = b.drain_committed(999, 0, 0x100, &[], false).await.unwrap();
         assert!(!drain.had_states);
-        assert!(drain.next_batch(10, 1000).await.unwrap().is_none());
+        assert!(drain.next_batch(10, 1000, None).await.unwrap().is_none());
         drain.finish().await.unwrap();
         assert_eq!(b.stats().commits_unknown_xid, 1);
         assert_eq!(b.stats().drain_lsn, 0x100);

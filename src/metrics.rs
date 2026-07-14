@@ -50,8 +50,28 @@ pub struct MetricsSnapshot {
     pub spill_xacts_active: u64,
     pub spill_bytes_active: u64,
     /// Bytes resident inside an active commit drain (merge heads + in-mem
-    /// tail + unsealed chunk map), the drain-streaming bound
+    /// tail + chunk generations + mirror rows held by consumers)
     pub drain_resident_bytes: u64,
+    /// Chunk-generation share of `drain_resident_bytes`, held until the
+    /// last drain batch / decode job drops its generation
+    pub drain_chunk_resident_bytes: u64,
+    /// Mirror-row share of `drain_resident_bytes`, held until store put
+    pub drain_row_resident_bytes: u64,
+    /// Bytes in transaction TOAST body spool files (disk, not resident)
+    pub toast_xact_spool_bytes: u64,
+    /// Bytes held by live [`crate::budget::MemoryBudget`] permits
+    pub resident_payload_bytes: u64,
+    pub resident_payload_peak_bytes: u64,
+    /// Budget acquisitions that had to wait for a release
+    pub memory_budget_waits_total: u64,
+    /// Requests above a budget compartment's satisfiable share, admitted
+    /// with only that share metered
+    pub memory_budget_overshoots_total: u64,
+    /// Bytes resident in the bootstrap TOAST-deferred spool's in-memory
+    /// prefix
+    pub bootstrap_deferred_bytes: u64,
+    /// Encoded bytes in the bootstrap TOAST-deferred spool file
+    pub bootstrap_deferred_spool_bytes: u64,
     pub spill_evictions_total: u64,
     pub xacts_committed_total: u64,
     pub xacts_aborted_total: u64,
@@ -279,9 +299,63 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         ),
         (
             "walshadow_drain_resident_bytes",
-            "Bytes resident inside an active commit drain (merge heads + unsealed chunks).",
+            "Bytes resident inside an active commit drain (heads + chunk generations + mirror rows).",
             "gauge",
             snap.drain_resident_bytes,
+        ),
+        (
+            "walshadow_drain_chunk_resident_bytes",
+            "Chunk-generation share of drain_resident_bytes, held until consumers drop.",
+            "gauge",
+            snap.drain_chunk_resident_bytes,
+        ),
+        (
+            "walshadow_drain_row_resident_bytes",
+            "Mirror-row share of drain_resident_bytes, held until store put completes.",
+            "gauge",
+            snap.drain_row_resident_bytes,
+        ),
+        (
+            "walshadow_toast_xact_spool_bytes",
+            "Bytes in transaction TOAST body spool files (disk, not resident).",
+            "gauge",
+            snap.toast_xact_spool_bytes,
+        ),
+        (
+            "walshadow_resident_payload_bytes",
+            "Bytes held by live memory-budget permits across pipeline stages.",
+            "gauge",
+            snap.resident_payload_bytes,
+        ),
+        (
+            "walshadow_resident_payload_peak_bytes",
+            "High-water mark of resident payload permit bytes.",
+            "gauge",
+            snap.resident_payload_peak_bytes,
+        ),
+        (
+            "walshadow_memory_budget_waits_total",
+            "Budget acquisitions that waited for a release.",
+            "counter",
+            snap.memory_budget_waits_total,
+        ),
+        (
+            "walshadow_memory_budget_overshoots_total",
+            "Requests above a budget compartment, admitted with only the satisfiable share metered.",
+            "counter",
+            snap.memory_budget_overshoots_total,
+        ),
+        (
+            "walshadow_bootstrap_deferred_bytes",
+            "Resident bytes in the bootstrap TOAST-deferred spool's in-memory prefix.",
+            "gauge",
+            snap.bootstrap_deferred_bytes,
+        ),
+        (
+            "walshadow_bootstrap_deferred_spool_bytes",
+            "Encoded bytes in the bootstrap TOAST-deferred spool file.",
+            "gauge",
+            snap.bootstrap_deferred_spool_bytes,
         ),
         (
             "walshadow_spill_evictions_total",

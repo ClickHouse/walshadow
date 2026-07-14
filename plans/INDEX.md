@@ -21,14 +21,15 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
   matrix, FPI decompression, `main_data` parsers, `pg_class_decoder`,
   read-time defaults
 - [xact.md](xact.md) — `XactBuffer`, `SubxactTracker`, TOAST
-  reassembly, local-disk spill, `DrainEntry` ordering
+  reassembly, local-disk spill + body spool, `DrainEntry` ordering
 - [TOAST.md](TOAST.md) — TID-keyed `pg_toast_<relid>` CH mirror
   (`disabled`/`clickhouse`), delete tombstones + RMT-merge reclaim,
   as-of fetch, superseded-fill miss policy, bootstrap tap +
   defer-resolve; deferred R1 JOIN mode, streaming reassembly
 - [emitter.md](emitter.md) — parallel decode+insert pipeline
   (reorder → decode ×M → batcher → inserter ×N → ack watermark),
-  `type_bridge`, synthetic columns, `DdlApplicator`, barrier fence
+  memory budget, `type_bridge`, synthetic columns, `DdlApplicator`,
+  barrier fence
 - [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
   / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
   shared insert tail

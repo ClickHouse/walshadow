@@ -39,6 +39,14 @@ pub struct RoutedRow {
     pub rel: Arc<RelDescriptor>,
     pub mapping: Arc<TableMapping>,
     pub committed: CommittedTuple,
+    /// Admission permit share riding the row into batcher slabs and the
+    /// in-flight insert block; released post-insert-ack when the covering
+    /// [`InsertBatch`] drops
+    pub permit: Option<Arc<crate::budget::MemoryPermit>>,
+    /// Detoast leaf permit shrunk to this row's decoded TOAST bytes;
+    /// rides like `permit` so decoded values and their encoder slab copy
+    /// stay covered to insert ack
+    pub value_permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
 
 /// Per-column name + CH type string. Inserter parses `type_repr` into its
@@ -97,6 +105,8 @@ pub struct InsertBatch {
     pub buffers: Vec<ColumnBuf>,
     pub n_rows: usize,
     pub per_seq: Vec<(u64, u64)>,
+    /// Admission permit shares covering these rows, dropped post-insert-ack
+    pub permits: Vec<Arc<crate::budget::MemoryPermit>>,
 }
 
 /// Rows and `FlushAll` share one FIFO channel so a barrier's flush can never
@@ -128,6 +138,8 @@ struct Table {
     enc: TableEncoder,
     meta: Arc<BatchMeta>,
     seq_counts: Vec<(u64, u64)>,
+    slice_permits: Vec<Arc<crate::budget::MemoryPermit>>,
+    value_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     deadline: Option<Instant>,
 }
 
@@ -290,11 +302,21 @@ async fn handle_row(
                 enc,
                 meta,
                 seq_counts: Vec::new(),
+                slice_permits: Vec::new(),
+                value_permits: Vec::new(),
                 deadline: None,
             },
         );
     }
     let t = tables.get_mut(&row.rel.rel_name).expect("just inserted");
+    if let Some(p) = row.permit
+        && !t.slice_permits.iter().any(|held| Arc::ptr_eq(held, &p))
+    {
+        t.slice_permits.push(p);
+    }
+    if let Some(p) = row.value_permit {
+        t.value_permits.push(p);
+    }
     let op = match row.committed.decoded.op {
         HeapOp::Insert => OP_INSERT,
         HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
@@ -331,14 +353,19 @@ async fn emit_batch(
     t.deadline = None;
     if n_rows == 0 {
         t.seq_counts.clear();
+        t.slice_permits.clear();
+        t.value_permits.clear();
         return Ok(());
     }
     let per_seq = std::mem::take(&mut t.seq_counts);
+    let mut permits = std::mem::take(&mut t.slice_permits);
+    permits.append(&mut t.value_permits);
     let batch = InsertBatch {
         meta: t.meta.clone(),
         buffers,
         n_rows,
         per_seq,
+        permits,
     };
     out.send(batch)
         .await
@@ -455,6 +482,8 @@ mod tests {
                 commit_ts: 0,
                 commit_lsn: (seq + 1) * 100,
             },
+            permit: None,
+            value_permit: None,
         }
     }
 
