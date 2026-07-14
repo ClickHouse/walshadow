@@ -6,6 +6,7 @@ name = "walshadow"
 version = "0.1.0"
 edition = "2024"
 description = "Schema-only Postgres + WAL replay catalog mirror for CDC to ClickHouse"
+license = "AGPL-3.0-only"
 
 [[bin]]
 name = "walshadow-classify"
