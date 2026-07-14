@@ -31,10 +31,10 @@ use crate::wal_stream::{Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream};
 use tracing::Instrument;
 
 use crate::xact_buffer::{
-    DrainEntry, DrainedBatch, SchemaEventRx, SubxactTracker, TxnSpanRegistry, XLOG_XACT_ABORT,
-    XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
-    XLOG_XACT_OPMASK, XactBuffer, drain_pending_schema_events, parse_xact_assignment,
-    parse_xact_payload,
+    ChunkGeneration, DrainEntry, DrainedBatch, SchemaEventRx, SubxactTracker, ToastRowBatch,
+    TxnSpanRegistry, XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT,
+    XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, XactBuffer,
+    drain_pending_schema_events, parse_xact_assignment, parse_xact_payload,
 };
 
 use crate::config::ConfigResolver;
@@ -42,7 +42,7 @@ use crate::copy_backfill::CopyBackfiller;
 use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::BatcherMsg;
-use crate::pipeline::decode::{DecodeJob, ToastChunks};
+use crate::pipeline::decode::DecodeJob;
 use crate::runtime_config::ConfigEvent;
 use crate::toast::ToastResolver;
 use crate::toast_retire::RetireLedger;
@@ -88,6 +88,9 @@ pub struct ReorderSink {
     /// back; the decode pool works one slice while the next loads.
     batch_rows: usize,
     batch_bytes: usize,
+    /// Global resident-payload pool; slice admission acquired here before
+    /// dispatch, riding rows to insert ack. `None` = unmetered (tests)
+    budget: Option<crate::budget::MemoryBudget>,
     /// Per-txn span map (shared with the pump + buffer). `Some` only when
     /// OTLP tracing is on; reorder parents `commit.drain`/`dispatch` under
     /// the `txn` and prunes the entry at commit (the buffer prunes at abort).
@@ -114,6 +117,7 @@ impl ReorderSink {
         span_registry: Option<TxnSpanRegistry>,
         batch_rows: usize,
         batch_bytes: usize,
+        budget: Option<crate::budget::MemoryBudget>,
         retires: RetireLedger,
         resume_floor: Arc<AtomicU64>,
     ) -> Self {
@@ -135,6 +139,7 @@ impl ReorderSink {
             next_seq: 0,
             batch_rows,
             batch_bytes,
+            budget,
             span_registry,
             retires,
             resume_floor,
@@ -324,7 +329,8 @@ impl ReorderSink {
         pending: &mut Vec<DecodedHeap>,
         commit_ts: i64,
         commit_lsn: u64,
-        chunks: &[Arc<ToastChunks>],
+        chunks: &[Arc<ChunkGeneration>],
+        permit: &Option<Arc<crate::budget::MemoryPermit>>,
     ) -> Result<(), SinkError> {
         if pending.is_empty() {
             return Ok(());
@@ -337,6 +343,7 @@ impl ReorderSink {
             commit_lsn,
             heaps: std::mem::take(pending),
             chunks: chunks.to_vec(),
+            permit: permit.clone(),
         };
         self.dispatch_job(job).await
     }
@@ -458,15 +465,16 @@ impl ReorderSink {
         Ok(())
     }
 
+    /// Bounded just-in-time materialization from the batch's body spool
     async fn put_rows_to(
         &mut self,
-        rows: &[crate::toast::ToastRow],
+        rows: &ToastRowBatch,
         cursor: &mut usize,
         end: usize,
     ) -> Result<(), SinkError> {
         if end > *cursor {
             self.resolver
-                .put(&rows[*cursor..end])
+                .put_row_refs(rows.spool(), &rows[*cursor..end])
                 .await
                 .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
             *cursor = end;
@@ -480,6 +488,7 @@ impl ReorderSink {
         batch: DrainedBatch,
         commit_ts: i64,
         commit_lsn: u64,
+        permit: Option<Arc<crate::budget::MemoryPermit>>,
     ) -> Result<(), SinkError> {
         let DrainedBatch {
             heaps,
@@ -502,7 +511,7 @@ impl ReorderSink {
                     ordered_events[ev_cursor].row_idx,
                 )
                 .await?;
-                self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
+                self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks, &permit)
                     .await?;
                 self.barrier_fence().await?;
                 self.apply_drain_entry(&ordered_events[ev_cursor].event, commit_lsn)
@@ -513,7 +522,7 @@ impl ReorderSink {
                 self.put_rows_to(&new_rows, &mut rows_cursor, truncate_rows[trunc_cursor])
                     .await?;
                 trunc_cursor += 1;
-                self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
+                self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks, &permit)
                     .await?;
                 self.barrier_fence().await?;
                 self.apply_truncate(&heap).await?;
@@ -528,7 +537,7 @@ impl ReorderSink {
                 ordered_events[ev_cursor].row_idx,
             )
             .await?;
-            self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
+            self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks, &permit)
                 .await?;
             self.barrier_fence().await?;
             self.apply_drain_entry(&ordered_events[ev_cursor].event, commit_lsn)
@@ -537,7 +546,7 @@ impl ReorderSink {
         }
         self.put_rows_to(&new_rows, &mut rows_cursor, new_rows.len())
             .await?;
-        self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks)
+        self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks, &permit)
             .await
     }
 
@@ -621,7 +630,7 @@ impl ReorderSink {
         let mut published = false;
         loop {
             let Some(batch) = drain
-                .next_batch(self.batch_rows, self.batch_bytes)
+                .next_batch(self.batch_rows, self.batch_bytes, self.budget.as_ref())
                 .instrument(drain_span.clone())
                 .await
                 .map_err(SinkError::from)?
@@ -629,18 +638,30 @@ impl ReorderSink {
                 break;
             };
             rows_total += batch.heaps.len() as u64;
+            // Admission before dispatch keeps backpressure here. Sealed
+            // generations already carry permits acquired by `next_batch`;
+            // slice permit covers decoded heap bytes + row metadata
+            let permit = match &self.budget {
+                Some(b) => {
+                    let bytes = batch.heaps.iter().map(|h| h.approx_bytes()).sum::<usize>()
+                        + batch.new_rows.resident_bytes();
+                    Some(Arc::new(b.admit(bytes).await))
+                }
+                None => None,
+            };
             let is_barrier = !batch.ordered_events.is_empty()
                 || batch.heaps.iter().any(|h| matches!(h.op, HeapOp::Truncate));
             let is_final = batch.is_final;
-            // Store rows must precede publishing marker
+            // Store rows must precede publishing marker; refs materialize
+            // just in time per sealed slice
             if !is_barrier && !batch.new_rows.is_empty() {
                 self.resolver
-                    .put(&batch.new_rows)
+                    .put_row_refs(batch.new_rows.spool(), &batch.new_rows)
                     .await
                     .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
             }
             if is_barrier {
-                self.run_barrier_batch(batch, commit_ts, commit_lsn)
+                self.run_barrier_batch(batch, commit_ts, commit_lsn, permit)
                     .instrument(trace_span!(
                         !txn.is_none(),
                         parent: &txn,
@@ -661,6 +682,7 @@ impl ReorderSink {
                     commit_lsn,
                     heaps: batch.heaps,
                     chunks: batch.chunks,
+                    permit,
                 };
                 self.dispatch_job(job)
                     .instrument(trace_span!(

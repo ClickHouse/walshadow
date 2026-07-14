@@ -4,6 +4,7 @@
 //! referrers. Caller waits through synthetic sequence frontier before advancing
 //! resume LSN to backup end
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -11,12 +12,15 @@ use tokio::sync::mpsc;
 
 use crate::backup_page_walk::{BackfillTuple, CatalogMap};
 use crate::ch_emitter::{EmitterStats, MappingHandle, TableMapping};
-use crate::heap_decoder::ColumnValue;
+use crate::heap_decoder::{ColumnValue, ToastPointer};
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::shadow_catalog::RelDescriptor;
-use crate::toast::{ChunkMap, ToastResolver, ToastRow};
-use crate::xact_buffer::{Reassembled, detoasted_value, try_reassemble};
+use crate::spool::DeferredSpool;
+use crate::toast::{
+    CHUNK_PUT_BATCH, CHUNK_PUT_BYTES, FetchedValue, ToastResolver, ToastRow, check_value_caps,
+    detoasted_value, finish_value, pointer_extsize,
+};
 
 /// Completion frontier for `FlushAll` and resume advance
 #[derive(Debug, Clone, Copy, Default)]
@@ -26,16 +30,10 @@ pub struct BootstrapDrainOutcome {
     pub rows_routed: u64,
 }
 
-const CHUNK_PUT_BATCH: usize = 256;
-
-/// Referrer waiting for later `pg_toast_*` files
-struct Deferred {
-    tuple: BackfillTuple,
-    rel: Arc<RelDescriptor>,
-    mapping: Arc<TableMapping>,
-}
-
-/// Drain page-walk tuples into shared insert tail
+/// Drain page-walk tuples into shared insert tail. `deferred` spools
+/// referrers waiting for later `pg_toast_*` files; at replay the
+/// descriptor and mapping re-resolve from frozen per-pass snapshots
+#[allow(clippy::too_many_arguments)]
 pub async fn drain(
     mut rx: mpsc::Receiver<BackfillTuple>,
     catalog: CatalogMap,
@@ -44,14 +42,20 @@ pub async fn drain(
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     resolver: ToastResolver,
+    mut deferred: DeferredSpool,
 ) -> Result<BootstrapDrainOutcome, String> {
+    let mappings: HashMap<_, _> = mapping_handle
+        .read()
+        .await
+        .iter()
+        .map(|(name, mapping)| (name.clone(), Arc::new(mapping.clone())))
+        .collect();
     let mut next_seq = 0u64;
     let mut rows_routed = 0u64;
     let mut open: Option<(walrus::pg::walparser::RelFileNode, u64, u64)> = None;
     let mut chunk_batch: Vec<ToastRow> = Vec::new();
-    let mut deferred: Vec<Deferred> = Vec::new();
+    let mut chunk_batch_bytes = 0usize;
     let mut start_lsn = 0u64;
-
     while let Some(tuple) = rx.recv().await {
         let rfn = tuple.rfn;
         let source_lsn = tuple.source_lsn;
@@ -78,37 +82,43 @@ pub async fn drain(
 
         if catalog.is_toast(rfn.db_node, rfn.rel_node) {
             if let Some(row) = row_from_columns(tuple, rel.oid) {
+                chunk_batch_bytes += row.chunk_data.len();
                 chunk_batch.push(row);
-                if chunk_batch.len() >= CHUNK_PUT_BATCH {
+                if chunk_batch.len() >= CHUNK_PUT_BATCH || chunk_batch_bytes >= CHUNK_PUT_BYTES {
                     flush_chunks(&resolver, &mut chunk_batch).await?;
+                    chunk_batch_bytes = 0;
                 }
             }
             continue;
         }
 
-        let Some(mapping) =
-            crate::pipeline::lookup_mapping(&mapping_handle, &rel.rel_name, &stats).await
-        else {
+        let Some(mapping) = mappings.get(&rel.rel_name).cloned() else {
+            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
 
         if has_mapped_external_toast(&tuple, &mapping) {
             if resolver.stores_chunks() {
-                deferred.push(Deferred {
-                    tuple,
-                    rel,
-                    mapping,
-                });
+                deferred
+                    .push(tuple)
+                    .await
+                    .map_err(|e| format!("bootstrap: deferred spool: {e}"))?;
+                stats
+                    .bootstrap_deferred_bytes
+                    .store(deferred.resident_bytes() as u64, Ordering::Relaxed);
+                stats
+                    .bootstrap_deferred_spool_bytes
+                    .store(deferred.spooled_bytes(), Ordering::Relaxed);
                 continue;
             }
             let mut tuple = tuple;
-            resolve_or_fill_toast(&mut tuple, &rel, &mapping, &resolver).await?;
-            route_row(&msg_tx, seq, rel, mapping, tuple).await?;
+            let permit = resolve_or_fill_toast(&mut tuple, &rel, &mapping, &resolver).await?;
+            route_row(&msg_tx, seq, rel, mapping, tuple, permit).await?;
             bump(&mut open, &mut rows_routed);
             continue;
         }
 
-        route_row(&msg_tx, seq, rel, mapping, tuple).await?;
+        route_row(&msg_tx, seq, rel, mapping, tuple, None).await?;
         bump(&mut open, &mut rows_routed);
     }
 
@@ -120,27 +130,47 @@ pub async fn drain(
         flush_chunks(&resolver, &mut chunk_batch).await?;
     }
 
-    if !deferred.is_empty() {
+    if deferred.records() > 0 {
         tracing::info!(
             target: "walshadow::bootstrap",
-            deferred = deferred.len(),
+            deferred = deferred.records(),
+            spooled_bytes = deferred.spooled_bytes(),
             "resolving deferred TOAST tuples from chunk store",
         );
         let seq = next_seq;
         next_seq += 1;
         ack.register(seq, start_lsn);
         let mut placed = 0u64;
-        for d in deferred {
-            let Deferred {
-                mut tuple,
-                rel,
-                mapping,
-            } = d;
-            resolve_or_fill_toast(&mut tuple, &rel, &mapping, &resolver).await?;
-            route_row(&msg_tx, seq, rel, mapping, tuple).await?;
+        let mut replay = deferred
+            .into_reader()
+            .await
+            .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
+        while let Some(mut tuple) = replay
+            .next()
+            .await
+            .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
+        {
+            let Some(rel) = catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
+                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let Some(mapping) = mappings.get(&rel.rel_name).cloned() else {
+                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let permit = resolve_or_fill_toast(&mut tuple, &rel, &mapping, &resolver).await?;
+            route_row(&msg_tx, seq, rel, mapping, tuple, permit).await?;
             placed += 1;
             rows_routed += 1;
         }
+        replay
+            .finish()
+            .await
+            .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
+        stats.bootstrap_deferred_bytes.store(0, Ordering::Relaxed);
+        stats
+            .bootstrap_deferred_spool_bytes
+            .store(0, Ordering::Relaxed);
         ack.placed(seq, placed);
     }
 
@@ -163,6 +193,7 @@ async fn route_row(
     rel: Arc<RelDescriptor>,
     mapping: Arc<TableMapping>,
     tuple: BackfillTuple,
+    value_permit: Option<crate::budget::MemoryPermit>,
 ) -> Result<(), String> {
     let committed = tuple.into_committed_insert();
     msg_tx
@@ -171,6 +202,8 @@ async fn route_row(
             rel,
             mapping,
             committed,
+            permit: None,
+            value_permit: value_permit.map(Arc::new),
         }))
         .await
         .map_err(|_| "bootstrap: batcher channel closed".to_string())
@@ -186,33 +219,35 @@ fn has_mapped_external_toast(tuple: &BackfillTuple, mapping: &TableMapping) -> b
     })
 }
 
-/// Resolve mapped TOAST pointers or fill in disabled mode
+/// Resolve mapped TOAST pointers or fill in disabled mode. Value cap
+/// checked before any fetch; the returned leaf permit is shrunk to the
+/// retained decoded bytes and rides the routed row to insert ack
 async fn resolve_or_fill_toast(
     tuple: &mut BackfillTuple,
     rel: &RelDescriptor,
     mapping: &TableMapping,
     resolver: &ToastResolver,
-) -> Result<(), String> {
-    let mut chunks = ChunkMap::new();
-    if resolver.stores_chunks() {
-        for c in &mapping.columns {
-            let Ok(idx) = usize::try_from(c.src_attnum as i32 - 1) else {
-                continue;
-            };
-            let Some(Some(ColumnValue::ExternalToast(p))) = tuple.columns.get(idx) else {
-                continue;
-            };
-            let key = (p.va_toastrelid, p.va_valueid);
-            if chunks.contains_key(&key) {
-                continue;
-            }
-            resolver
-                .fetch_into(key.0, key.1, tuple.source_lsn, &mut chunks)
-                .await
-                .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?;
-        }
+) -> Result<Option<crate::budget::MemoryPermit>, String> {
+    let mut pointers: Vec<ToastPointer> = Vec::new();
+    for c in &mapping.columns {
+        let Some(Some(ColumnValue::ExternalToast(p))) = usize::try_from(c.src_attnum as i32 - 1)
+            .ok()
+            .and_then(|idx| tuple.columns.get(idx))
+        else {
+            continue;
+        };
+        pointers.push(*p);
     }
-    let maps: [&ChunkMap; 1] = [&chunks];
+    if pointers.is_empty() {
+        return Ok(None);
+    }
+    let need = check_value_caps(&pointers, resolver.inline_value_max())
+        .map_err(|e| format!("bootstrap: {e}"))?;
+    let mut leaf = match resolver.budget() {
+        Some(b) => Some(b.acquire(need).await),
+        None => None,
+    };
+    let mut retained = 0usize;
     for c in &mapping.columns {
         let Ok(idx) = usize::try_from(c.src_attnum as i32 - 1) else {
             continue;
@@ -222,18 +257,28 @@ async fn resolve_or_fill_toast(
         };
         let p = *p;
         let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
-        match try_reassemble(&p, &maps).map_err(|e| e.to_string())? {
-            Reassembled::Bytes(raw) => tuple.columns[idx] = Some(detoasted_value(raw, type_oid)),
-            Reassembled::Missing if resolver.fill_on_miss() => {
+        let extsize = pointer_extsize(&p);
+        let fetched = resolver
+            .fetch_value(p.va_toastrelid, p.va_valueid, tuple.source_lsn, extsize)
+            .await
+            .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?;
+        match fetched {
+            Some(FetchedValue::Assembled(stored)) => {
+                let raw = finish_value(&p, stored).map_err(|e| e.to_string())?;
+                retained += raw.len();
+                tuple.columns[idx] = Some(detoasted_value(raw, type_oid));
+            }
+            None => {
                 resolver.note_filled_default();
                 tuple.columns[idx] = Some(ColumnValue::Null);
             }
-            // No superseding version can precede deferred resolution
-            outcome => {
+            // No superseding version can precede deferred resolution: the
+            // walk put these chunks moments earlier, a miss is a bug
+            Some(outcome) => {
                 resolver.note_fetch_miss();
                 let detail = match outcome {
-                    Reassembled::SizeMismatch { got, want } => {
-                        format!("chunks sum to {got} bytes, pointer says {want}")
+                    FetchedValue::Mismatch { got } => {
+                        format!("chunks sum to {got} bytes, pointer says {extsize}")
                     }
                     _ => "has no chunks in the store".into(),
                 };
@@ -244,7 +289,10 @@ async fn resolve_or_fill_toast(
             }
         }
     }
-    Ok(())
+    if let Some(p) = leaf.as_mut() {
+        p.shrink(retained as u64);
+    }
+    Ok(leaf)
 }
 
 /// Replay tombstones supersede walk rows for dead referrers
@@ -268,7 +316,7 @@ fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastR
         offnum: tuple.offnum,
         chunk_id,
         chunk_seq,
-        chunk_data,
+        chunk_data: bytes::Bytes::from(chunk_data),
         lsn: tuple.source_lsn,
     })
 }
@@ -277,6 +325,15 @@ fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastR
 mod tests {
     use super::*;
     use crate::ch_emitter::{ColumnMapping, EmitterConfig, TableMapping, TableTarget};
+    use crate::spool::DEFERRED_SPOOL_MEM_MAX;
+
+    /// Mem-only under the default threshold; path never created
+    fn mem_spool() -> DeferredSpool {
+        DeferredSpool::new(
+            std::env::temp_dir().join("ws-bootstrap-test-unused.bin"),
+            DEFERRED_SPOOL_MEM_MAX,
+        )
+    }
     use crate::heap_decoder::{ColumnValue, ToastPointer};
     use crate::pipeline::ack;
     use crate::pipeline::batcher::BatcherMsg;
@@ -491,6 +548,7 @@ mod tests {
             ack.clone(),
             stats.clone(),
             ToastResolver::disabled(),
+            mem_spool(),
         ));
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
@@ -540,6 +598,7 @@ mod tests {
             ack.clone(),
             stats.clone(),
             ToastResolver::disabled(),
+            mem_spool(),
         ));
 
         let mut seqs: Vec<u64> = Vec::new();
@@ -587,6 +646,7 @@ mod tests {
             ack.clone(),
             stats.clone(),
             resolver,
+            mem_spool(),
         ));
 
         let mut rows = Vec::new();
@@ -625,6 +685,7 @@ mod tests {
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
+        let spool_tmp = tempfile::tempdir().unwrap();
 
         // toast chunk first (its own zero-row seq), then the referring main row
         tup_tx
@@ -647,6 +708,8 @@ mod tests {
             ack.clone(),
             stats.clone(),
             ToastResolver::with_store(store, stats.clone()),
+            // Threshold 0: deferred referrer rides a real spool file
+            DeferredSpool::new(spool_tmp.path().join("bootstrap_deferred.bin"), 0),
         ));
 
         let mut rows = Vec::new();
@@ -662,6 +725,64 @@ mod tests {
         assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
         assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 1);
         assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// SIGHUP unmapping between defer and replay: the deferred row lands
+    /// under the mapping captured at defer, not the live handle — one
+    /// relation's initial load keeps one target shape
+    #[tokio::test]
+    async fn deferred_replay_uses_mapping_frozen_at_defer() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        catalog.insert(toast_rel(16500));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
+
+        let emitter_ack = Arc::new(AtomicU64::new(0));
+        let (ack, collector) = ack::spawn(emitter_ack);
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
+
+        tup_tx
+            .send(toast_chunk_tuple(16500, 1, 0, b"hello"))
+            .await
+            .unwrap();
+        tup_tx
+            .send(bytea_toast_tuple(16400, 16500, 1))
+            .await
+            .unwrap();
+
+        let stats = Arc::new(EmitterStats::default());
+        let store = Arc::new(MemChunkStore::new());
+        let drain_task = tokio::spawn(drain(
+            tup_rx,
+            catalog,
+            mapping.clone(),
+            msg_tx,
+            ack.clone(),
+            stats.clone(),
+            ToastResolver::with_store(store, stats.clone()),
+            mem_spool(),
+        ));
+        // Wait for the referrer to defer, then unmap before walk EOF
+        while stats.bootstrap_deferred_bytes.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        mapping.write().await.clear();
+        drop(tup_tx);
+
+        let mut rows = Vec::new();
+        while let Some(BatcherMsg::Row(r)) = msg_rx.recv().await {
+            rows.push(r);
+        }
+        let outcome = drain_task.await.unwrap().unwrap();
+        assert_eq!(outcome.rows_routed, 1, "unmapping must not drop the row");
+        assert_eq!(rows.len(), 1);
+        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
+        assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
         drop(ack);
         collector.await.unwrap();
     }

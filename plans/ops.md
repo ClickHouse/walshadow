@@ -87,7 +87,22 @@ Inventory by category:
 ### Buffer gauges
 
 `walshadow_xact_{active,bytes_in_memory}`,
-`walshadow_spill_{xacts_active,bytes_active}`
+`walshadow_spill_{xacts_active,bytes_active}`,
+`walshadow_drain_resident_bytes` + `walshadow_drain_{chunk,row}_resident_bytes`
+ownership shares (held until the last drain consumer drops, see
+[TOAST.md](TOAST.md) Drain payload residency),
+`walshadow_toast_xact_spool_bytes` (body-spool disk, not resident),
+`walshadow_bootstrap_deferred_{bytes,spool_bytes}` (deferred-spool
+memory prefix / file)
+
+### Memory budget
+
+`walshadow_resident_payload_bytes` / `_peak_bytes` — bytes held by live
+budget permits across pipeline stages;
+`walshadow_memory_budget_{waits,overshoots}_total` — acquisitions that
+waited for a release / requests above a compartment admitted with only
+the satisfiable share metered. See [emitter.md](emitter.md) Memory
+budget
 
 ### Shadow apply lag
 

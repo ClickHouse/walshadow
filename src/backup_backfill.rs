@@ -67,6 +67,7 @@ use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::pipeline::{Fatal, ack::AckHandle, bootstrap, tail};
 use crate::runtime_config::InitialLoadMode;
 use crate::shadow_catalog::{RelDescriptor, ShadowCatalog};
+use crate::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
 use crate::toast::ToastResolver;
 use crate::visibility::{
     PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView, Visibility, tuple_visibility,
@@ -99,6 +100,9 @@ pub struct PassContext {
     /// Live resolved config for the pass tail (`config_column` overrides);
     /// `None` == boot values only.
     pub config_rx: Option<watch::Receiver<Arc<crate::config::ResolvedConfig>>>,
+    /// Pipeline's resident-payload pool (pass runs concurrently with live
+    /// streaming); `None` = unmetered
+    pub budget: Option<crate::budget::MemoryBudget>,
 }
 
 /// Per-pass observability summary, logged by the caller.
@@ -287,7 +291,10 @@ async fn walk_and_ship(
         }
     }
 
-    let resolver = ToastResolver::from_config(&ctx.emitter, ctx.stats.clone());
+    let mut resolver = ToastResolver::from_config(&ctx.emitter, ctx.stats.clone());
+    if let Some(b) = &ctx.budget {
+        resolver = resolver.with_budget(b.clone());
+    }
     let store_toast = resolver.stores_chunks();
 
     // Dedicated tail: own CH connection, own seq space, own fatal — the
@@ -320,6 +327,12 @@ async fn walk_and_ship(
     tokio::fs::create_dir_all(&data_dir).await.ok();
 
     let (walk_ok_tx, walk_ok_rx) = oneshot::channel();
+    // Deferred spools live under scratch; stale files from a crashed pass
+    // block create_new, remove first
+    let gate_spool_path = ctx.scratch_dir.join("gate_deferred.bin");
+    let toast_spool_path = ctx.scratch_dir.join("bootstrap_deferred.bin");
+    tokio::fs::remove_file(&gate_spool_path).await.ok();
+    tokio::fs::remove_file(&toast_spool_path).await.ok();
     let gate = tokio::spawn(gate_task(
         walk_rx,
         gated_tx,
@@ -328,6 +341,7 @@ async fn walk_and_ship(
         pg_multixact,
         patch,
         walk_ok_rx,
+        DeferredSpool::new(gate_spool_path, DEFERRED_SPOOL_MEM_MAX),
     ));
     let drain = tokio::spawn(bootstrap::drain(
         gated_rx,
@@ -337,6 +351,7 @@ async fn walk_and_ship(
         ack.clone(),
         ctx.stats.clone(),
         resolver.clone(),
+        DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX),
     ));
 
     // Success signal before the joins: gate resolves deferred tuples only
@@ -450,6 +465,7 @@ struct GateStats {
 /// when a failed source drops the sink mid-walk. An unresolvable multixact
 /// errors the pass: emitting risks resurrecting a dead version whose delete
 /// predates WAL coverage, skipping risks dropping a live row.
+#[allow(clippy::too_many_arguments)]
 async fn gate_task(
     mut rx: mpsc::Receiver<BackfillTuple>,
     tx: mpsc::Sender<BackfillTuple>,
@@ -458,9 +474,9 @@ async fn gate_task(
     pg_multixact: Arc<std::sync::Mutex<PgMultiXactAccum>>,
     patch: PgXactPatch,
     walk_ok: oneshot::Receiver<()>,
+    mut deferred: DeferredSpool,
 ) -> Result<GateStats, String> {
     let mut stats = GateStats::default();
-    let mut deferred: Vec<BackfillTuple> = Vec::new();
     while let Some(t) = rx.recv().await {
         if filter.is_toast(t.rfn.db_node, t.rfn.rel_node) {
             if tx.send(t).await.is_err() {
@@ -479,18 +495,22 @@ async fn gate_task(
                 }
             }
             Visibility::Skip => stats.gated += 1,
-            Visibility::Defer => deferred.push(t),
+            Visibility::Defer => deferred
+                .push(t)
+                .await
+                .map_err(|e| format!("backup_backfill: deferred spool: {e}"))?,
             Visibility::Unresolvable => return Err(unresolvable_multixact(&t)),
         }
     }
-    // Walk EOF: sink dropped. Deferred buffer bounded by count of unhinted
-    // tuples, same in-memory posture as the drain's deferred-TOAST buffer.
-    stats.deferred = deferred.len() as u64;
+    // Walk EOF: sink dropped. Deferred tuples sit in the spool past its
+    // in-memory prefix, resident bytes bounded regardless of unhinted count.
+    stats.deferred = deferred.records();
     // pg_xact is complete only if the walk finished; a partial accum reads
     // committed deleters as in-progress and recent aborts as ancient-committed,
     // emitting dead tuples a rerun can't remove
     if walk_ok.await.is_err() {
         stats.gated += stats.deferred;
+        deferred.discard().await;
         return Ok(stats);
     }
     // Take the accums out so no std guard is held across the sends below
@@ -498,7 +518,15 @@ async fn gate_task(
     let multi = std::mem::take(&mut *pg_multixact.lock().expect("pg_multixact accum lock"));
     stats.pg_xact_segments = accum.segment_count();
     let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
-    for t in deferred {
+    let mut replay = deferred
+        .into_reader()
+        .await
+        .map_err(|e| format!("backup_backfill: deferred spool seal: {e}"))?;
+    while let Some(t) = replay
+        .next()
+        .await
+        .map_err(|e| format!("backup_backfill: deferred spool replay: {e}"))?
+    {
         match tuple_visibility(t.xid, t.xmax, t.infomask, Some(&view)) {
             Visibility::Emit => {
                 if t.infomask & crate::visibility::HEAP_XMAX_IS_MULTI != 0 {
@@ -513,6 +541,10 @@ async fn gate_task(
             Visibility::Unresolvable => return Err(unresolvable_multixact(&t)),
         }
     }
+    replay
+        .finish()
+        .await
+        .map_err(|e| format!("backup_backfill: deferred spool cleanup: {e}"))?;
     Ok(stats)
 }
 
@@ -966,6 +998,8 @@ impl crate::decoder_sink::TupleObserver for ReplayRouter {
                     rel: rel.clone(),
                     mapping,
                     committed: committed.clone(),
+                    permit: None,
+                    value_permit: None,
                 }))
                 .await
                 .map_err(|_| {
@@ -1259,6 +1293,14 @@ mod tests {
         }
     }
 
+    /// Mem-only under the default threshold; path never created
+    fn mem_spool() -> DeferredSpool {
+        DeferredSpool::new(
+            std::env::temp_dir().join("ws-gate-test-unused.bin"),
+            DEFERRED_SPOOL_MEM_MAX,
+        )
+    }
+
     #[tokio::test]
     async fn gate_task_routes_hinted_defers_unhinted_and_resolves_at_eof() {
         let filter = CatalogMap::new();
@@ -1271,6 +1313,9 @@ mod tests {
         let (walk_tx, walk_rx) = mpsc::channel(16);
         let (gated_tx, mut gated_rx) = mpsc::channel(16);
         let (walk_ok_tx, walk_ok_rx) = oneshot::channel();
+        // Threshold 0: deferred tuples traverse a real spool file
+        let tmp = tempfile::tempdir().unwrap();
+        let spool_path = tmp.path().join("gate_deferred.bin");
         let gate = tokio::spawn(gate_task(
             walk_rx,
             gated_tx,
@@ -1279,6 +1324,7 @@ mod tests {
             pg_multixact,
             patch,
             walk_ok_rx,
+            DeferredSpool::new(spool_path.clone(), 0),
         ));
 
         // Hinted-committed: passes through immediately
@@ -1312,6 +1358,7 @@ mod tests {
         assert_eq!(stats.emitted, 2);
         assert_eq!(stats.gated, 2);
         assert_eq!(stats.deferred, 2);
+        assert!(!spool_path.exists(), "replay unlinks the spool");
     }
 
     /// Failed source drops the sink mid-walk: channel close without the
@@ -1330,6 +1377,9 @@ mod tests {
         let (walk_tx, walk_rx) = mpsc::channel(16);
         let (gated_tx, mut gated_rx) = mpsc::channel(16);
         let (walk_ok_tx, walk_ok_rx) = oneshot::channel::<()>();
+        // Threshold 0: discard must unlink the spool file
+        let tmp = tempfile::tempdir().unwrap();
+        let spool_path = tmp.path().join("gate_deferred.bin");
         let gate = tokio::spawn(gate_task(
             walk_rx,
             gated_tx,
@@ -1338,6 +1388,7 @@ mod tests {
             pg_multixact,
             patch,
             walk_ok_rx,
+            DeferredSpool::new(spool_path.clone(), 0),
         ));
 
         // Hinted-committed: routed before the failure, stays flushed
@@ -1403,6 +1454,7 @@ mod tests {
             pg_multixact,
             patch,
             walk_ok_rx,
+            mem_spool(),
         ));
 
         walk_tx
@@ -1442,6 +1494,7 @@ mod tests {
             pg_multixact,
             PgXactPatch::new(),
             walk_ok_rx,
+            mem_spool(),
         ));
 
         walk_tx

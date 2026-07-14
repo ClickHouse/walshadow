@@ -635,10 +635,7 @@ async fn build_pipeline_inner(
 
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
-    let xact_buf_cfg = XactBufferConfig {
-        xact_buffer_max: walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX,
-        spill_dir: spill_dir.clone(),
-    };
+    let xact_buf_cfg = XactBufferConfig::new(spill_dir.clone());
     let xact_buffer = XactBuffer::new(xact_buf_cfg).expect("xact buffer");
     let xact_buffer = Arc::new(Mutex::new(xact_buffer));
 
@@ -729,6 +726,7 @@ async fn build_pipeline_inner(
                 catalog.clone(),
                 &spill_dir,
                 Some(config_rx.clone()),
+                None,
             )
             .await,
         ))
@@ -753,6 +751,7 @@ async fn build_pipeline_inner(
         backfiller,
         retires,
         resume_floor: resume_floor.clone(),
+        budget: None,
     };
     let (mut reorder, handle) = pcfg
         .spawn(emitter_ack.clone())

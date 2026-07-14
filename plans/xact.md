@@ -83,9 +83,16 @@ relfilenode — `va_toastrelid` on referring `ToastPointer` is an OID,
 the two diverge after `VACUUM FULL` / `CLUSTER`)
 
 Chunks ride same `XactState.in_mem` deque as heaps. At drain, k-way
-merge accumulates them into `HashMap<(toast_relid, value_id),
-BTreeMap<chunk_seq, Vec<u8>>>`; `reassemble` walks BTreeMap checking
-`seq == expected`, concatenates. Compression decoded inline:
+merge folds them into `ChunkRefMap` (`(toast_relid, value_id) →
+ValueRef`: dense contiguous spool run + out-of-pattern tail). Bodies
+are shared `Bytes` — resolution map and mirror row hold one
+allocation, charged once — kept memory-resident until
+`toast_body_mem_max` cumulative bytes per drain, appended once to the
+drain's `toastbody-*` body spool past it with `BodyRef` ranges
+resident. Ref metadata caps at `toast_index_mem_max`, breach is typed
+non-retryable `ToastIndexOverflow`. `reassemble_value_ref` walks a
+value's run + tail checking `seq == expected`, concatenates.
+Compression decoded inline:
 `TOAST_COMPRESSION_PGLZ` via `pglz::decompress_into`,
 `TOAST_COMPRESSION_LZ4` via `lz4_flex::decompress`. Method tag lives in
 top bits of `va_extinfo` past `VARLENA_EXTSIZE_BITS = 30`
@@ -196,6 +203,17 @@ dir on startup
 ([`SpillStore::clear`]) and cursor file guarantees on-disk state is
 always "drained into CH" or "replayable from `decoder_lsn`"
 
+Sibling file families share the dir and the startup wipe: per-drain
+TOAST body spools (`toastbody-{xid:010}-{commit_lsn:016X}.bin`, raw
+concatenated bodies, no framing — `BodyRef` ranges are process-local)
+and deferred-record spools ([`src/spool.rs`](../src/spool.rs), own
+"WD" magic + version so a cross-read fails as `SpillError::Format`).
+Disk is unmetered — spilling is the pressure release for the memory
+budget, so it must always succeed; sizing the spill volume is an
+operator concern. Each file's disk gauge rides its shared owner: an
+unlinked body spool stays charged while decode/store readers hold its
+fd, releasing with the last holder
+
 Spill backend is local disk only; no `spill_backend` config knob or
 enum surface for a CH-as-scratch alternative. ClickHouse-as-scratch is
 rejected on three grounds:
@@ -218,6 +236,19 @@ durability (see [emitter.md](emitter.md)). Serial
 `XactRecordSink` → `TupleObserver` path (metrics-only runs, inproc
 harness). The observer-ack semantics below describe the serial path;
 the pipeline replaces them with the contiguous-done watermark
+
+Each slice seals accumulated chunks into an immutable
+`ChunkGeneration` shared by `Arc` (the drain and every later slice's
+decode job re-reference all generations sealed so far). A generation
+carries its resident-gauge share and, under an active budget, its
+admission permit — both release at last-holder drop, container
+hand-off is not release ([emitter.md](emitter.md) Memory budget).
+`drain_resident_bytes` gauges ownership with
+`drain_chunk_resident_bytes` / `drain_row_resident_bytes` shares;
+`toast_xact_spool_bytes` gauges body-spool disk. `finish()` unlinks
+spill + spool files after dispatch; an error path drops instead,
+leaving files for inspection (startup wipe + redecode-from-ack cover
+replay)
 
 `drain_lsn` advances BEFORE `on_xact_end` ack so an observer failure
 leaves `drain_lsn > emitter_ack_lsn`, exactly the gap cursor file

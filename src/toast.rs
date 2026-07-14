@@ -12,14 +12,31 @@ use clickhouse_c::{Allocator, AsyncClient, Block, BlockBuilder, Event, TypeAst};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use bytes::Bytes;
+
 use crate::ch_emitter::{
     EmitterConfig, EmitterError, EmitterStats, connect_client, drain_to_end_of_stream,
     is_retryable, quote_ident,
 };
-use crate::spill::{ToastChunk, ToastDelete};
+use crate::heap_decoder::{
+    ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
+};
+use crate::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 
-/// `(toast_relid, value_id) -> chunk_seq -> bytes`
-pub type ChunkMap = HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>;
+/// `(toast_relid, value_id) -> chunk_seq -> bytes`; bodies shared with
+/// mirror rows via `Bytes`
+pub type ChunkMap = HashMap<(u32, u32), BTreeMap<u32, Bytes>>;
+
+/// Row seal for one store put slice
+pub const CHUNK_PUT_BATCH: usize = 256;
+/// Byte seal for one store put slice; typical chunks trip the row seal
+/// first, this bounds atypically fat bodies
+pub const CHUNK_PUT_BYTES: usize = 4 << 20;
+/// Fetch result rows per block: bounds one block's buffer to ~2 MiB at
+/// `TOAST_MAX_CHUNK_SIZE`, ordering validated across block boundaries
+const FETCH_BLOCK_ROWS: usize = 1024;
+/// PG `VARHDRSZ`, 4-byte varlena header
+const VARHDRSZ: i32 = 4;
 
 #[derive(Debug, Error)]
 pub enum ChunkStoreError {
@@ -28,6 +45,69 @@ pub enum ChunkStoreError {
     /// Mirror absence does not prove supersession, never fill
     #[error("toast store: no mirror for toast relid {0}")]
     MissingMirror(u32),
+    /// Body spool read at row materialization
+    #[error("toast store io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum ToastValueError {
+    #[error("toast decompression: {0}")]
+    Detoast(String),
+    #[error("toast value of {rawsize} bytes exceeds inline_value_max {max}")]
+    ValueTooLarge { rawsize: usize, max: usize },
+}
+
+/// Bytes stored in toast relation
+pub(crate) fn pointer_extsize(p: &ToastPointer) -> usize {
+    (p.va_extinfo & VARLENA_EXTSIZE_MASK) as usize
+}
+
+/// Validate value caps, return heap leaf-permit need
+pub(crate) fn check_value_caps(
+    pointers: &[ToastPointer],
+    max: usize,
+) -> Result<usize, ToastValueError> {
+    let mut retained = 0usize;
+    let mut transient = 0usize;
+    for p in pointers {
+        let raw = (p.va_rawsize - VARHDRSZ).max(0) as usize;
+        let ext = pointer_extsize(p);
+        if raw.max(ext) > max {
+            return Err(ToastValueError::ValueTooLarge {
+                rawsize: raw.max(ext),
+                max,
+            });
+        }
+        let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
+        retained += if compressed { raw } else { ext };
+        if compressed {
+            transient = transient.max(ext);
+        }
+    }
+    Ok(retained + transient)
+}
+
+/// Convert raw TOAST bytes through inline varlena decoder
+pub(crate) fn detoasted_value(raw: Vec<u8>, type_oid: u32) -> ColumnValue {
+    crate::heap_decoder::varlena_to_value(type_oid, std::borrow::Cow::Owned(raw))
+}
+
+/// Convert stored bytes to raw bytes using pointer compression method
+pub(crate) fn finish_value(p: &ToastPointer, stored: Vec<u8>) -> Result<Vec<u8>, ToastValueError> {
+    let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
+    if !compressed {
+        return Ok(stored);
+    }
+    let method = ((p.va_extinfo >> VARLENA_EXTSIZE_BITS) & 0x3) as u8;
+    let raw_len = (p.va_rawsize - VARHDRSZ).max(0) as usize;
+    match decompress_varlena(method, &stored, raw_len) {
+        Some(out) => Ok(out),
+        None => Err(ToastValueError::Detoast(format!(
+            "decompress failed (method {method}, {} bytes → {raw_len})",
+            stored.len()
+        ))),
+    }
 }
 
 /// `[toast] mode`
@@ -62,29 +142,21 @@ pub struct ToastConfig {
 
 /// Chunk birth or TID tombstone, keyed by heap TID and record LSN
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToastRow {
+pub struct ToastRow<B = Bytes> {
     pub toast_relid: u32,
     pub blkno: u32,
     pub offnum: u16,
     /// `va_valueid`, InvalidOid marks tombstones
     pub chunk_id: u32,
     pub chunk_seq: u32,
-    pub chunk_data: Vec<u8>,
+    pub chunk_data: B,
     /// Record LSN orders same-commit birth and death at one TID
     pub lsn: u64,
 }
 
-impl ToastRow {
+impl<B: From<Bytes>> ToastRow<B> {
     pub fn from_chunk(c: &ToastChunk) -> Self {
-        Self {
-            toast_relid: c.toast_relid,
-            blkno: c.blkno,
-            offnum: c.offnum,
-            chunk_id: c.value_id,
-            chunk_seq: c.chunk_seq,
-            chunk_data: c.chunk_data.clone(),
-            lsn: c.source_lsn,
-        }
+        Self::with_body(c, c.chunk_data.clone().into())
     }
 
     pub fn tombstone(d: &ToastDelete) -> Self {
@@ -94,8 +166,22 @@ impl ToastRow {
             offnum: d.offnum,
             chunk_id: 0,
             chunk_seq: 0,
-            chunk_data: Vec::new(),
+            chunk_data: Bytes::new().into(),
             lsn: d.source_lsn,
+        }
+    }
+}
+
+impl<B> ToastRow<B> {
+    pub fn with_body(c: &ToastChunk, chunk_data: B) -> Self {
+        Self {
+            toast_relid: c.toast_relid,
+            blkno: c.blkno,
+            offnum: c.offnum,
+            chunk_id: c.value_id,
+            chunk_seq: c.chunk_seq,
+            chunk_data,
+            lsn: c.source_lsn,
         }
     }
 
@@ -104,21 +190,201 @@ impl ToastRow {
     }
 }
 
+/// Chunk body location: memory until a drain's cumulative chunk bytes
+/// cross the spool threshold, file-backed past it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Body {
+    Mem(Bytes),
+    File(BodyRef),
+}
+
+impl Body {
+    pub fn len(&self) -> usize {
+        match self {
+            Body::Mem(b) => b.len(),
+            Body::File(r) => r.len as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Body bytes: `Mem` is a refcount clone, `File` positional-reads
+    pub fn load(&self, spool: Option<&BodySpoolFile>) -> std::io::Result<Bytes> {
+        match self {
+            Body::Mem(b) => Ok(b.clone()),
+            Body::File(r) => spool
+                .ok_or_else(|| std::io::Error::other("file body without spool"))?
+                .read(*r)
+                .map(Bytes::from),
+        }
+    }
+}
+
+impl From<Bytes> for Body {
+    fn from(value: Bytes) -> Self {
+        Self::Mem(value)
+    }
+}
+
+/// Per-value chunk coverage: dense contiguous spool-prefix run plus
+/// out-of-pattern tail. PG `toast_save_datum` writes one value's chunk
+/// INSERTs consecutively from a single backend, so file-backed values
+/// normally collapse to one run; a run records no chunk boundaries, so
+/// deviations (and all memory bodies) land in `tail`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRef {
+    /// Concatenated spool bodies of seq `0..run_chunks`; `len` 0 when
+    /// value is memory-resident or started out of pattern
+    pub run: BodyRef,
+    pub run_chunks: u32,
+    /// Reassembly expects dense `run_chunks..N` here; keys below
+    /// `run_chunks` are byte-identical re-inserts (PG chunk rows immutable
+    /// per value id), ignored
+    pub tail: BTreeMap<u32, Body>,
+}
+
+impl ValueRef {
+    pub fn new(seq: u32, body: Body) -> Self {
+        let mut v = Self {
+            run: BodyRef { offset: 0, len: 0 },
+            run_chunks: 0,
+            tail: BTreeMap::new(),
+        };
+        v.push(seq, body);
+        v
+    }
+
+    /// Extend run on dense contiguous file append, else tail (last-wins)
+    pub fn push(&mut self, seq: u32, body: Body) {
+        if let Body::File(r) = body
+            && self.tail.is_empty()
+            && seq == self.run_chunks
+            && (self.run_chunks == 0 || r.offset == self.run.offset + u64::from(self.run.len))
+        {
+            if self.run_chunks == 0 {
+                self.run = r;
+            } else {
+                self.run.len += r.len;
+            }
+            self.run_chunks += 1;
+            return;
+        }
+        self.tail.insert(seq, body);
+    }
+}
+
+/// File-backed generation map: [`ChunkMap`] keying, bodies as
+/// memory bytes or spool ranges
+pub type ChunkRefMap = HashMap<(u32, u32), ValueRef>;
+
+/// TOAST row with body deferred behind memory or spool reference
+pub type ToastRowRef = ToastRow<Body>;
+
+impl ToastRow<Body> {
+    /// Just-in-time body load for bounded store puts
+    pub fn materialize(&self, spool: Option<&BodySpoolFile>) -> std::io::Result<ToastRow> {
+        Ok(ToastRow {
+            toast_relid: self.toast_relid,
+            blkno: self.blkno,
+            offnum: self.offnum,
+            chunk_id: self.chunk_id,
+            chunk_seq: self.chunk_seq,
+            chunk_data: self.chunk_data.load(spool)?,
+            lsn: self.lsn,
+        })
+    }
+}
+
+/// Store-side value fetch outcome. Ordering violations are transport
+/// errors, not outcomes: ascending dense feed is part of the fetch
+/// contract.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FetchedValue {
+    /// No live chunk visible at bound
+    Missing,
+    /// Chunk run deviates from pointer size (partial merge collapse or
+    /// generation mixing): gapped, short, or over-long. Fills per miss
+    /// policy, counted distinctly
+    Mismatch { got: usize },
+    /// Exactly `expected_size` bytes, seq-dense from 0
+    Assembled(Vec<u8>),
+}
+
+/// Ordered chunk assembler: seqs must arrive ascending, bytes append into
+/// one exact-capacity buffer. Seq regression (disorder / duplicate) is a
+/// contract violation; gap, short run, and overrun resolve to
+/// [`FetchedValue::Mismatch`] at finish.
+pub struct ChunkAssembler {
+    expected: usize,
+    next_seq: u32,
+    gapped: bool,
+    got: usize,
+    buf: Vec<u8>,
+}
+
+impl ChunkAssembler {
+    pub fn new(expected: usize) -> Self {
+        Self {
+            expected,
+            next_seq: 0,
+            gapped: false,
+            got: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    /// `Err` on non-ascending seq: fetch order contract broken
+    pub fn push(&mut self, seq: u32, body: &[u8]) -> Result<(), String> {
+        if seq < self.next_seq {
+            return Err(format!(
+                "chunk_seq {seq} after {}: fetch order contract broken",
+                self.next_seq.wrapping_sub(1)
+            ));
+        }
+        if seq > self.next_seq {
+            self.gapped = true;
+        }
+        self.next_seq = seq + 1;
+        self.got += body.len();
+        if !self.gapped && self.got <= self.expected {
+            if self.buf.capacity() == 0 {
+                self.buf.reserve_exact(self.expected);
+            }
+            self.buf.extend_from_slice(body);
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> FetchedValue {
+        if self.next_seq == 0 {
+            FetchedValue::Missing
+        } else if self.gapped || self.got != self.expected {
+            FetchedValue::Mismatch { got: self.got }
+        } else {
+            FetchedValue::Assembled(self.buf)
+        }
+    }
+}
+
 /// Durable TID-keyed chunk store
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
     /// Replay emits byte-identical rows at equal key and version
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError>;
-    /// Return newest live row per sequence at `max_lsn`
+    /// Assemble newest live row per sequence at `max_lsn` against the
+    /// pointer's stored size (`va_extsize`)
     ///
-    /// Return empty when no live row remains at bound,
+    /// [`FetchedValue::Missing`] when no live row remains at bound,
     /// [`ChunkStoreError::MissingMirror`] when mirror is absent
     async fn fetch(
         &self,
         toast_relid: u32,
         value_id: u32,
         max_lsn: u64,
-    ) -> Result<BTreeMap<u32, Vec<u8>>, ChunkStoreError>;
+        expected_size: usize,
+    ) -> Result<FetchedValue, ChunkStoreError>;
     /// Empty mirror without dropping it
     ///
     /// Owner TRUNCATE orders destination wipe after replayed fills. DROP callers
@@ -163,7 +429,8 @@ impl ChunkStore for MemChunkStore {
         toast_relid: u32,
         value_id: u32,
         max_lsn: u64,
-    ) -> Result<BTreeMap<u32, Vec<u8>>, ChunkStoreError> {
+        expected_size: usize,
+    ) -> Result<FetchedValue, ChunkStoreError> {
         let mirrors = self.mirrors.lock().unwrap();
         let Some(rows) = mirrors.get(&toast_relid) else {
             return Err(ChunkStoreError::MissingMirror(toast_relid));
@@ -193,10 +460,11 @@ impl ChunkStore for MemChunkStore {
                 })
                 .or_insert((r.lsn, &r.chunk_data));
         }
-        Ok(newest
-            .into_iter()
-            .map(|(seq, (_, body))| (seq, body.to_vec()))
-            .collect())
+        let mut asm = ChunkAssembler::new(expected_size);
+        for (seq, (_, body)) in newest {
+            asm.push(seq, body).map_err(ChunkStoreError::Clickhouse)?;
+        }
+        Ok(asm.finish())
     }
 
     async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError> {
@@ -353,7 +621,8 @@ impl ClickHouseChunkStore {
              )\n\
              WHERE `chunk_id` = {value_id} AND `dead` = 0\n\
              GROUP BY `chunk_seq`\n\
-             ORDER BY `chunk_seq`"
+             ORDER BY `chunk_seq`\n\
+             SETTINGS max_block_size = {FETCH_BLOCK_ROWS}"
         )
     }
 
@@ -508,7 +777,9 @@ impl ClickHouseChunkStore {
     }
 }
 
-fn read_chunk_block(block: &Block, out: &mut BTreeMap<u32, Vec<u8>>) -> Result<(), EmitterError> {
+/// Feed one result block into the assembler; seq order validated across
+/// block boundaries (final `ORDER BY chunk_seq` is the contract)
+fn read_chunk_block(block: &Block, asm: &mut ChunkAssembler) -> Result<(), EmitterError> {
     let n = block.n_rows();
     if n == 0 {
         return Ok(());
@@ -534,7 +805,8 @@ fn read_chunk_block(block: &Block, out: &mut BTreeMap<u32, Vec<u8>>) -> Result<(
         let seq = u32::from_le_bytes(seq_bytes[i * 4..i * 4 + 4].try_into().unwrap());
         let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
         let end = offsets[i] as usize;
-        out.insert(seq, data[start..end].to_vec());
+        asm.push(seq, &data[start..end])
+            .map_err(|e| EmitterError::Type(format!("toast fetch: {e}")))?;
     }
     Ok(())
 }
@@ -556,10 +828,21 @@ impl ChunkStore for ClickHouseChunkStore {
         toast_relid: u32,
         value_id: u32,
         max_lsn: u64,
-    ) -> Result<BTreeMap<u32, Vec<u8>>, ChunkStoreError> {
+        expected_size: usize,
+    ) -> Result<FetchedValue, ChunkStoreError> {
         let sql = self.fetch_sql(toast_relid, value_id, max_lsn);
         let mut state = self.state.lock().await;
-        self.query_locked(&mut state, &sql, read_chunk_block)
+        let asm: Option<ChunkAssembler> = self
+            .query_locked(
+                &mut state,
+                &sql,
+                |block, out: &mut Option<ChunkAssembler>| {
+                    read_chunk_block(
+                        block,
+                        out.get_or_insert_with(|| ChunkAssembler::new(expected_size)),
+                    )
+                },
+            )
             .await
             .map_err(|e| match e {
                 EmitterError::ServerException { code, .. }
@@ -568,7 +851,8 @@ impl ChunkStore for ClickHouseChunkStore {
                     ChunkStoreError::MissingMirror(toast_relid)
                 }
                 e => ChunkStoreError::Clickhouse(e.to_string()),
-            })
+            })?;
+        Ok(asm.map_or(FetchedValue::Missing, ChunkAssembler::finish))
     }
 
     async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError> {
@@ -606,6 +890,11 @@ impl ChunkStore for ClickHouseChunkStore {
 pub struct ToastResolver {
     store: Option<Arc<dyn ChunkStore>>,
     stats: Arc<EmitterStats>,
+    /// V3 hard per-value decode-target cap, checked before allocation
+    inline_value_max: usize,
+    /// Leaf permits for per-value transients (assembly, decompress, JIT
+    /// materialization); `None` = unmetered (serial/metrics-only paths)
+    budget: Option<crate::budget::MemoryBudget>,
 }
 
 impl ToastResolver {
@@ -613,6 +902,8 @@ impl ToastResolver {
         Self {
             store: None,
             stats: Arc::new(EmitterStats::default()),
+            inline_value_max: usize::MAX,
+            budget: None,
         }
     }
 
@@ -621,7 +912,12 @@ impl ToastResolver {
             ToastMode::Disabled => None,
             ToastMode::ClickHouse => Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
         };
-        Self { store, stats }
+        Self {
+            store,
+            stats,
+            inline_value_max: emitter.inline_value_max,
+            budget: None,
+        }
     }
 
     /// Store-backed resolver for tests
@@ -629,7 +925,29 @@ impl ToastResolver {
         Self {
             store: Some(store),
             stats,
+            inline_value_max: usize::MAX,
+            budget: None,
         }
+    }
+
+    /// Leaf-permit pool, attached at pipeline spawn
+    pub fn with_budget(mut self, budget: crate::budget::MemoryBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Per-value cap override (tests)
+    pub fn with_inline_value_max(mut self, max: usize) -> Self {
+        self.inline_value_max = max;
+        self
+    }
+
+    pub fn inline_value_max(&self) -> usize {
+        self.inline_value_max
+    }
+
+    pub fn budget(&self) -> Option<&crate::budget::MemoryBudget> {
+        self.budget.as_ref()
     }
 
     pub fn stores_chunks(&self) -> bool {
@@ -646,26 +964,27 @@ impl ToastResolver {
         self.store.is_none()
     }
 
-    /// Fetch chunks into resolution map, return false without rows or store
-    pub async fn fetch_into(
+    /// As-of store fetch assembled against the pointer's stored size;
+    /// `None` without store
+    pub async fn fetch_value(
         &self,
         toast_relid: u32,
         value_id: u32,
         max_lsn: u64,
-        into: &mut ChunkMap,
-    ) -> Result<bool, ChunkStoreError> {
+        expected_size: usize,
+    ) -> Result<Option<FetchedValue>, ChunkStoreError> {
         let Some(store) = &self.store else {
-            return Ok(false);
+            return Ok(None);
         };
-        let chunks = store.fetch(toast_relid, value_id, max_lsn).await?;
-        if chunks.is_empty() {
-            return Ok(false);
+        let v = store
+            .fetch(toast_relid, value_id, max_lsn, expected_size)
+            .await?;
+        if matches!(v, FetchedValue::Assembled(_)) {
+            self.stats
+                .toast_values_fetched
+                .fetch_add(1, Ordering::Relaxed);
         }
-        self.stats
-            .toast_values_fetched
-            .fetch_add(1, Ordering::Relaxed);
-        into.insert((toast_relid, value_id), chunks);
-        Ok(true)
+        Ok(Some(v))
     }
 
     /// Persist births and tombstones, no-op without store
@@ -685,6 +1004,55 @@ impl ToastResolver {
             .toast_tombstones_stored
             .fetch_add(tombstones, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// [`Self::put_batched`] over row refs: materialize each slice just in
+    /// time so resident bodies peak at one sealed slice, covered by one
+    /// leaf permit acquired before the reads
+    pub async fn put_row_refs(
+        &self,
+        spool: Option<&BodySpoolFile>,
+        rows: &[ToastRowRef],
+    ) -> Result<(), ChunkStoreError> {
+        if self.store.is_none() || rows.is_empty() {
+            return Ok(());
+        }
+        let mut start = 0usize;
+        while start < rows.len() {
+            let mut end = start;
+            let mut bytes = 0usize;
+            while end < rows.len() && end - start < CHUNK_PUT_BATCH && bytes < CHUNK_PUT_BYTES {
+                bytes += rows[end].chunk_data.len();
+                end += 1;
+            }
+            let _leaf = match &self.budget {
+                Some(b) => Some(b.acquire(bytes).await),
+                None => None,
+            };
+            let mut batch: Vec<ToastRow> = Vec::with_capacity(end - start);
+            for r in &rows[start..end] {
+                batch.push(r.materialize(spool)?);
+            }
+            self.put(&batch).await?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// [`Self::put`] in WAL-order slices sealed at [`CHUNK_PUT_BATCH`] rows
+    /// or [`CHUNK_PUT_BYTES`], bounding one ClickHouse block build
+    pub async fn put_batched(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
+        let mut start = 0usize;
+        let mut bytes = 0usize;
+        for (i, r) in rows.iter().enumerate() {
+            if i > start && (i - start >= CHUNK_PUT_BATCH || bytes >= CHUNK_PUT_BYTES) {
+                self.put(&rows[start..i]).await?;
+                start = i;
+                bytes = 0;
+            }
+            bytes += r.chunk_data.len();
+        }
+        self.put(&rows[start..]).await
     }
 
     async fn clear_mirror(
@@ -768,9 +1136,13 @@ mod tests {
             offnum: tid.1,
             chunk_id: value_id,
             chunk_seq: seq,
-            chunk_data: body.to_vec(),
+            chunk_data: Bytes::copy_from_slice(body),
             lsn,
         }
+    }
+
+    fn assembled(body: &[u8]) -> FetchedValue {
+        FetchedValue::Assembled(body.to_vec())
     }
 
     fn tomb(tid: (u32, u16), lsn: u64) -> ToastRow {
@@ -793,13 +1165,14 @@ mod tests {
             ])
             .await
             .unwrap();
-        let got = store.fetch(16500, 7, u64::MAX).await.unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got.get(&0).unwrap(), b"abc");
-        assert_eq!(got.get(&1).unwrap(), b"de");
-        assert!(store.fetch(16500, 404, u64::MAX).await.unwrap().is_empty());
+        let got = store.fetch(16500, 7, u64::MAX, 5).await.unwrap();
+        assert_eq!(got, assembled(b"abcde"));
+        assert_eq!(
+            store.fetch(16500, 404, u64::MAX, 3).await.unwrap(),
+            FetchedValue::Missing
+        );
         assert!(matches!(
-            store.fetch(404, 7, u64::MAX).await,
+            store.fetch(404, 7, u64::MAX, 3).await,
             Err(ChunkStoreError::MissingMirror(404))
         ));
     }
@@ -811,10 +1184,16 @@ mod tests {
             .put(&[row(7, 0, (1, 1), 0x1000, b"abc"), tomb((1, 1), 0x2000)])
             .await
             .unwrap();
-        let live = store.fetch(16500, 7, 0x1fff).await.unwrap();
-        assert_eq!(live.get(&0).unwrap(), b"abc");
-        assert!(store.fetch(16500, 7, 0x2000).await.unwrap().is_empty());
-        assert!(store.fetch(16500, 7, u64::MAX).await.unwrap().is_empty());
+        let live = store.fetch(16500, 7, 0x1fff, 3).await.unwrap();
+        assert_eq!(live, assembled(b"abc"));
+        assert_eq!(
+            store.fetch(16500, 7, 0x2000, 3).await.unwrap(),
+            FetchedValue::Missing
+        );
+        assert_eq!(
+            store.fetch(16500, 7, u64::MAX, 3).await.unwrap(),
+            FetchedValue::Missing
+        );
     }
 
     #[tokio::test]
@@ -828,11 +1207,14 @@ mod tests {
             ])
             .await
             .unwrap();
-        assert!(store.fetch(16500, 7, u64::MAX).await.unwrap().is_empty());
-        let new = store.fetch(16500, 9, u64::MAX).await.unwrap();
-        assert_eq!(new.get(&0).unwrap(), b"new");
-        let old = store.fetch(16500, 7, 0x1fff).await.unwrap();
-        assert_eq!(old.get(&0).unwrap(), b"old");
+        assert_eq!(
+            store.fetch(16500, 7, u64::MAX, 3).await.unwrap(),
+            FetchedValue::Missing
+        );
+        let new = store.fetch(16500, 9, u64::MAX, 3).await.unwrap();
+        assert_eq!(new, assembled(b"new"));
+        let old = store.fetch(16500, 7, 0x1fff, 3).await.unwrap();
+        assert_eq!(old, assembled(b"old"));
     }
 
     #[tokio::test]
@@ -848,12 +1230,11 @@ mod tests {
             ])
             .await
             .unwrap();
-        let old = store.fetch(16500, 7, 0x1fff).await.unwrap();
-        assert_eq!(old.len(), 2);
-        assert_eq!(old.get(&0).unwrap(), b"g1-0");
-        let new = store.fetch(16500, 7, u64::MAX).await.unwrap();
-        assert_eq!(new.len(), 1, "dead generation's seq 1 dropped");
-        assert_eq!(new.get(&0).unwrap(), b"g2-0");
+        let old = store.fetch(16500, 7, 0x1fff, 8).await.unwrap();
+        assert_eq!(old, assembled(b"g1-0g1-1"));
+        // Dead generation's seq 1 dropped: only g2's seq 0 assembles
+        let new = store.fetch(16500, 7, u64::MAX, 4).await.unwrap();
+        assert_eq!(new, assembled(b"g2-0"));
     }
 
     #[tokio::test]
@@ -866,9 +1247,8 @@ mod tests {
             ])
             .await
             .unwrap();
-        let got = store.fetch(16500, 7, u64::MAX).await.unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got.get(&0).unwrap(), b"copy-b");
+        let got = store.fetch(16500, 7, u64::MAX, 6).await.unwrap();
+        assert_eq!(got, assembled(b"copy-b"));
     }
 
     #[tokio::test]
@@ -878,15 +1258,13 @@ mod tests {
             .put(&[row(7, 0, (1, 1), 0x1000, b"x"), tomb((1, 1), 0x1001)])
             .await
             .unwrap();
-        assert!(store.fetch(16500, 7, u64::MAX).await.unwrap().is_empty());
         assert_eq!(
-            store
-                .fetch(16500, 7, 0x1000)
-                .await
-                .unwrap()
-                .get(&0)
-                .unwrap(),
-            b"x"
+            store.fetch(16500, 7, u64::MAX, 1).await.unwrap(),
+            FetchedValue::Missing
+        );
+        assert_eq!(
+            store.fetch(16500, 7, 0x1000, 1).await.unwrap(),
+            assembled(b"x")
         );
     }
 
@@ -902,11 +1280,17 @@ mod tests {
             .await
             .unwrap();
         store.truncate_mirror(16500).await.unwrap();
-        assert!(store.fetch(16500, 7, u64::MAX).await.unwrap().is_empty());
-        assert_eq!(store.fetch(200, 9, u64::MAX).await.unwrap().len(), 1);
+        assert_eq!(
+            store.fetch(16500, 7, u64::MAX, 3).await.unwrap(),
+            FetchedValue::Missing
+        );
+        assert_eq!(
+            store.fetch(200, 9, u64::MAX, 2).await.unwrap(),
+            assembled(b"zz")
+        );
         store.truncate_mirror(404).await.unwrap();
         assert!(matches!(
-            store.fetch(404, 7, u64::MAX).await,
+            store.fetch(404, 7, u64::MAX, 3).await,
             Err(ChunkStoreError::MissingMirror(404))
         ));
         store
@@ -914,13 +1298,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store
-                .fetch(16500, 11, u64::MAX)
-                .await
-                .unwrap()
-                .get(&0)
-                .unwrap(),
-            b"new"
+            store.fetch(16500, 11, u64::MAX, 3).await.unwrap(),
+            assembled(b"new")
         );
     }
 
@@ -946,14 +1325,16 @@ mod tests {
             .unwrap();
         store.rewrite_barrier(16500, 0x2000, 0x4000).await.unwrap();
         // Reused TID survives at the birth version
-        let v7 = store.fetch(16500, 7, u64::MAX).await.unwrap();
-        assert_eq!(v7.len(), 1);
-        assert_eq!(v7.get(&0).unwrap(), b"a2");
+        let v7 = store.fetch(16500, 7, u64::MAX, 2).await.unwrap();
+        assert_eq!(v7, assembled(b"a2"));
         // Residual live TIDs (1,2) and (3,1) tombstoned; dead (2,1) untouched
-        assert!(store.fetch(16500, 11, u64::MAX).await.unwrap().is_empty());
+        assert_eq!(
+            store.fetch(16500, 11, u64::MAX, 1).await.unwrap(),
+            FetchedValue::Missing
+        );
         // As-of before the rewrite still resolves the old generation whole
-        let old = store.fetch(16500, 7, 0x1fff).await.unwrap();
-        assert_eq!(old.len(), 2);
+        let old = store.fetch(16500, 7, 0x1fff, 2).await.unwrap();
+        assert_eq!(old, assembled(b"ab"));
         // Re-run converges: prior residuals sit past the marker, no new rows
         let before = store.mirrors.lock().unwrap().get(&16500).unwrap().len();
         store.rewrite_barrier(16500, 0x2000, 0x4000).await.unwrap();
@@ -961,7 +1342,10 @@ mod tests {
         assert_eq!(before, after, "barrier re-run must insert nothing");
         // Empty generation: nothing past marker, every live TID dies
         store.rewrite_barrier(16500, 0x5000, 0x6000).await.unwrap();
-        assert!(store.fetch(16500, 7, u64::MAX).await.unwrap().is_empty());
+        assert_eq!(
+            store.fetch(16500, 7, u64::MAX, 2).await.unwrap(),
+            FetchedValue::Missing
+        );
         // Missing mirror is a no-op
         store.rewrite_barrier(404, 0x10, 0x20).await.unwrap();
     }
@@ -982,6 +1366,106 @@ mod tests {
     }
 
     #[test]
+    fn value_ref_extends_run_only_on_dense_contiguous_file_append() {
+        let f = |offset, len| Body::File(BodyRef { offset, len });
+        // Dense contiguous file appends stay one compact run
+        let mut v = ValueRef::new(0, f(0, 4));
+        v.push(1, f(4, 4));
+        v.push(2, f(8, 2));
+        assert_eq!((v.run.offset, v.run.len, v.run_chunks), (0, 10, 3));
+        assert!(v.tail.is_empty());
+        // Non-contiguous append (another value interleaved) → tail
+        v.push(3, f(20, 4));
+        assert_eq!(v.run_chunks, 3);
+        assert_eq!(v.tail.get(&3), Some(&f(20, 4)));
+        // Later dense chunk still lands in tail once degraded
+        v.push(4, f(24, 4));
+        assert_eq!(v.tail.len(), 2);
+        // Out-of-order start: empty run, tail from the get-go
+        let v2 = ValueRef::new(2, f(0, 4));
+        assert_eq!((v2.run_chunks, v2.run.len), (0, 0));
+        assert_eq!(v2.tail.get(&2), Some(&f(0, 4)));
+        // Memory bodies never extend a run
+        let mut v3 = ValueRef::new(0, Body::Mem(Bytes::from_static(b"abcd")));
+        v3.push(1, f(0, 4));
+        assert_eq!(v3.run_chunks, 0);
+        assert_eq!(v3.tail.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn put_row_refs_materializes_mem_and_file_bodies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = crate::spill::BodySpoolWriter::create(tmp.path(), 1, 0x40, None).unwrap();
+        let store = Arc::new(MemChunkStore::new());
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(store.clone(), stats);
+        let mut refs = vec![ToastRowRef {
+            toast_relid: 16500,
+            blkno: 1,
+            offnum: 1,
+            chunk_id: 7,
+            chunk_seq: 0,
+            chunk_data: Body::Mem(Bytes::from_static(b"aaaa")),
+            lsn: 0x1000,
+        }];
+        for seq in 1..3u32 {
+            let body = vec![b'a' + seq as u8; 4];
+            refs.push(ToastRowRef {
+                toast_relid: 16500,
+                blkno: 1,
+                offnum: 1 + seq as u16,
+                chunk_id: 7,
+                chunk_seq: seq,
+                chunk_data: Body::File(w.append(&body).unwrap()),
+                lsn: 0x1000 + u64::from(seq),
+            });
+        }
+        refs.push(ToastRowRef::tombstone(&ToastDelete {
+            toast_relid: 16500,
+            blkno: 9,
+            offnum: 9,
+            source_lsn: 0x2000,
+        }));
+        w.flush().unwrap();
+        r.put_row_refs(Some(w.shared().as_ref()), &refs)
+            .await
+            .unwrap();
+        let got = store.fetch(16500, 7, u64::MAX, 12).await.unwrap();
+        assert_eq!(got, assembled(b"aaaabbbbcccc"));
+        // Tombstone materializes bodiless, no spool needed
+        let tomb = refs[3].materialize(None).unwrap();
+        assert!(tomb.is_tombstone() && tomb.chunk_data.is_empty());
+        // File body without spool is an error, not a panic
+        assert!(refs[1].materialize(None).is_err());
+    }
+
+    /// Oversized under a tiny budget: overshoots and stores, never an
+    /// error, OOM, or forever-wait
+    #[tokio::test(flavor = "current_thread")]
+    async fn put_row_refs_oversized_slice_overshoots_under_tiny_budget() {
+        let store = Arc::new(MemChunkStore::new());
+        let stats = Arc::new(EmitterStats::default());
+        let budget = crate::budget::MemoryBudget::new(1 << 10);
+        let r = ToastResolver::with_store(store.clone(), stats).with_budget(budget.clone());
+        let refs = [ToastRowRef {
+            toast_relid: 16500,
+            blkno: 1,
+            offnum: 1,
+            chunk_id: 7,
+            chunk_seq: 0,
+            chunk_data: Body::Mem(Bytes::from(vec![0u8; 2 << 10])),
+            lsn: 0x1000,
+        }];
+        r.put_row_refs(None, &refs).await.unwrap();
+        assert_eq!(
+            store.fetch(16500, 7, u64::MAX, 2 << 10).await.unwrap(),
+            assembled(&vec![0u8; 2 << 10])
+        );
+        assert_eq!(budget.overshoots_total(), 1);
+        assert_eq!(budget.resident_bytes(), 0, "nothing leaked");
+    }
+
+    #[test]
     fn toast_mode_parse_rejects_disk() {
         assert!(ToastMode::parse("disk").is_err());
         assert!(ToastMode::parse("local").is_err());
@@ -994,9 +1478,7 @@ mod tests {
         let r = ToastResolver::disabled();
         assert!(r.fill_on_miss());
         assert!(!r.stores_chunks());
-        let mut map = ChunkMap::new();
-        assert!(!r.fetch_into(1, 2, u64::MAX, &mut map).await.unwrap());
-        assert!(map.is_empty());
+        assert!(r.fetch_value(1, 2, u64::MAX, 3).await.unwrap().is_none());
         r.put(&[row(2, 0, (1, 1), 0x1000, b"x")]).await.unwrap();
     }
 
@@ -1013,16 +1495,66 @@ mod tests {
         assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 1);
         assert_eq!(stats.toast_tombstones_stored.load(Ordering::Relaxed), 1);
 
-        let mut out = ChunkMap::new();
-        assert!(r.fetch_into(16500, 7, u64::MAX, &mut out).await.unwrap());
-        assert_eq!(out.get(&(16500, 7)).unwrap().get(&0).unwrap(), b"hi");
+        let got = r.fetch_value(16500, 7, u64::MAX, 2).await.unwrap();
+        assert_eq!(got, Some(assembled(b"hi")));
         assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
 
-        let mut empty = ChunkMap::new();
-        assert!(
-            !r.fetch_into(16500, 404, u64::MAX, &mut empty)
-                .await
-                .unwrap()
+        let miss = r.fetch_value(16500, 404, u64::MAX, 2).await.unwrap();
+        assert_eq!(miss, Some(FetchedValue::Missing));
+        assert_eq!(
+            stats.toast_values_fetched.load(Ordering::Relaxed),
+            1,
+            "miss does not count as fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn assembler_maps_deviations_per_miss_policy() {
+        // Gap: seqs 0,2 (partial collapse can leave any subset)
+        let mut asm = ChunkAssembler::new(4);
+        asm.push(0, b"ab").unwrap();
+        asm.push(2, b"cd").unwrap();
+        assert_eq!(asm.finish(), FetchedValue::Mismatch { got: 4 });
+        // Dense but short
+        let mut asm = ChunkAssembler::new(4);
+        asm.push(0, b"ab").unwrap();
+        assert_eq!(asm.finish(), FetchedValue::Mismatch { got: 2 });
+        // Overrun stops copying, reports full got
+        let mut asm = ChunkAssembler::new(3);
+        asm.push(0, b"ab").unwrap();
+        asm.push(1, b"cd").unwrap();
+        assert_eq!(asm.finish(), FetchedValue::Mismatch { got: 4 });
+        // Disorder / duplicate is a contract error, not an outcome
+        let mut asm = ChunkAssembler::new(4);
+        asm.push(1, b"cd").unwrap();
+        assert!(asm.push(0, b"ab").is_err());
+        let mut asm = ChunkAssembler::new(4);
+        asm.push(0, b"ab").unwrap();
+        assert!(asm.push(0, b"ab").is_err());
+        // Empty is Missing
+        assert_eq!(ChunkAssembler::new(4).finish(), FetchedValue::Missing);
+        // Exact assembles
+        let mut asm = ChunkAssembler::new(4);
+        asm.push(0, b"ab").unwrap();
+        asm.push(1, b"cd").unwrap();
+        assert_eq!(asm.finish(), assembled(b"abcd"));
+    }
+
+    #[tokio::test]
+    async fn put_batched_preserves_order_across_slices() {
+        let store = Arc::new(MemChunkStore::new());
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(store.clone(), stats);
+        let rows: Vec<ToastRow> = (0..CHUNK_PUT_BATCH as u32 + 3)
+            .map(|i| row(7, i, (1, 1 + i as u16), 0x1000 + u64::from(i), b"aa"))
+            .collect();
+        r.put_batched(&rows).await.unwrap();
+        let expected = 2 * rows.len();
+        let got = store.fetch(16500, 7, u64::MAX, expected).await.unwrap();
+        assert_eq!(
+            got,
+            assembled(&b"aa".repeat(rows.len())),
+            "all slices landed, in order"
         );
     }
 
@@ -1091,7 +1623,8 @@ mod tests {
              )\n\
              WHERE `chunk_id` = 7 AND `dead` = 0\n\
              GROUP BY `chunk_seq`\n\
-             ORDER BY `chunk_seq`"
+             ORDER BY `chunk_seq`\n\
+             SETTINGS max_block_size = 1024"
         );
     }
 

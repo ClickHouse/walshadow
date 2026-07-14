@@ -791,7 +791,7 @@ async fn run(args: Args) -> Result<()> {
     // atomically, so leftover spill from a prior crash is redundant or stale.
     let xact_buf_cfg = XactBufferConfig {
         xact_buffer_max: args.xact_buffer_max,
-        spill_dir: args.spill_dir.clone(),
+        ..XactBufferConfig::new(args.spill_dir.clone())
     };
     let xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
     xact_buffer
@@ -927,6 +927,11 @@ async fn run(args: Args) -> Result<()> {
             .table_initial_loads
             .values()
             .any(|mode| InitialLoadMode::parse(mode).is_some_and(|m| m != InitialLoadMode::None));
+        // One validated resident-payload pool for the pipeline and every
+        // concurrent backup pass
+        let pipeline_budget =
+            walshadow::pipeline::build_budget(&emitter_cfg, args.decoder_pool_size)
+                .map_err(|e| anyhow::anyhow!("memory budget: {e}"))?;
         if emitter_cfg.runtime_config_schema.is_some() || toml_initial_load {
             copy_backfiller = Some(Arc::new(
                 walshadow::copy_backfill::CopyBackfiller::new(
@@ -937,6 +942,7 @@ async fn run(args: Args) -> Result<()> {
                     catalog.clone(),
                     &args.spill_dir,
                     Some(config_rx.clone()),
+                    Some(pipeline_budget.clone()),
                 )
                 .await,
             ));
@@ -1050,6 +1056,7 @@ async fn run(args: Args) -> Result<()> {
             backfiller: copy_backfiller.clone(),
             retires,
             resume_floor: floor,
+            budget: Some(pipeline_budget),
         };
         let (mut reorder_sink, handle) = pcfg
             .spawn(emitter_ack)
@@ -1348,7 +1355,7 @@ async fn run(args: Args) -> Result<()> {
         }
         let now_dispatched = stream.dispatched_lsn();
         let advanced = now_dispatched != prev_dispatched;
-        let (xact_stats, drain_resident_bytes, xact_line) = {
+        let (xact_stats, drain_resident, xact_line) = {
             let b = xact_buffer.lock().await;
             let mut stats = b.stats().clone();
             // Pipeline mode: track the ack collector's watermark (real CH
@@ -1357,7 +1364,13 @@ async fn run(args: Args) -> Result<()> {
                 stats.emitter_ack_lsn = a.load(Ordering::Acquire);
             }
             let line = stats.summary();
-            (stats, b.drain_resident_bytes(), line)
+            let resident = DrainResident {
+                total: b.drain_resident_bytes(),
+                chunks: b.drain_chunk_resident_bytes(),
+                rows: b.drain_row_resident_bytes(),
+                spool: b.toast_spool_bytes(),
+            };
+            (stats, resident, line)
         };
         let oracle_line = oracle
             .as_ref()
@@ -1386,7 +1399,8 @@ async fn run(args: Args) -> Result<()> {
             record_sink.decoder_xact.in_flight(),
             record_sink.decoder_xact.processed(),
             &xact_stats,
-            drain_resident_bytes,
+            drain_resident,
+            pipeline_handle.as_ref().map(|h| &h.budget),
             decoder_stats,
             emitter_stats,
             oracle_stats,
@@ -1943,6 +1957,14 @@ fn read_process_stats() -> (f64, u64) {
     (cpu, rss)
 }
 
+/// Drain-resident + spool gauge readings taken under one buffer lock
+struct DrainResident {
+    total: u64,
+    chunks: u64,
+    rows: u64,
+    spool: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn populate_metrics(
     registry: &MetricsRegistry,
@@ -1955,7 +1977,8 @@ async fn populate_metrics(
     pump_queue_depth: u64,
     queue_records_out_total: u64,
     xact_stats: &walshadow::xact_buffer::XactBufferStats,
-    drain_resident_bytes: u64,
+    drain_resident: DrainResident,
+    budget: Option<&walshadow::budget::MemoryBudget>,
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
     emitter_stats: Option<&walshadow::ch_emitter::EmitterStats>,
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
@@ -1989,7 +2012,20 @@ async fn populate_metrics(
         xact_bytes_in_memory: xact_stats.bytes_in_memory,
         spill_xacts_active: xact_stats.spill_xacts_active,
         spill_bytes_active: xact_stats.spill_bytes_active,
-        drain_resident_bytes,
+        drain_resident_bytes: drain_resident.total,
+        drain_chunk_resident_bytes: drain_resident.chunks,
+        drain_row_resident_bytes: drain_resident.rows,
+        toast_xact_spool_bytes: drain_resident.spool,
+        resident_payload_bytes: budget.map(|b| b.resident_bytes()).unwrap_or(0),
+        resident_payload_peak_bytes: budget.map(|b| b.peak_bytes()).unwrap_or(0),
+        memory_budget_waits_total: budget.map(|b| b.waits_total()).unwrap_or(0),
+        memory_budget_overshoots_total: budget.map(|b| b.overshoots_total()).unwrap_or(0),
+        bootstrap_deferred_bytes: emitter_stats
+            .map(|s| s.bootstrap_deferred_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        bootstrap_deferred_spool_bytes: emitter_stats
+            .map(|s| s.bootstrap_deferred_spool_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0),
         spill_evictions_total: xact_stats.spill_evictions_total,
         xacts_committed_total: xact_stats.committed_xacts_total,
         xacts_aborted_total: xact_stats.aborted_xacts_total,
@@ -2232,8 +2268,12 @@ async fn run_bootstrap(
     // bootstrap tail. The store-toast flag tells the page walk whether to
     // decode pg_toast_* pages.
     let bootstrap_stats = Arc::new(EmitterStats::default());
+    // Leaf-only pool for the bootstrap tail: caps each value (V3) and
+    // bounds decoded rows in flight to insert ack; no admission stage
     let resolver = if let Some(cfg) = &ch_config {
-        ToastResolver::from_config(cfg, bootstrap_stats.clone())
+        ToastResolver::from_config(cfg, bootstrap_stats.clone()).with_budget(
+            walshadow::budget::MemoryBudget::new(cfg.resident_payload_max),
+        )
     } else {
         ToastResolver::disabled()
     };
@@ -2271,6 +2311,8 @@ async fn run_bootstrap(
             "bootstrap insert tail started",
         );
 
+        let deferred_path = args.spill_dir.join("bootstrap_deferred.bin");
+        tokio::fs::remove_file(&deferred_path).await.ok();
         let drain = tokio::spawn(bootstrap::drain(
             rx,
             drain_catalog,
@@ -2279,6 +2321,10 @@ async fn run_bootstrap(
             ack.clone(),
             stats.clone(),
             resolver.clone(),
+            walshadow::spool::DeferredSpool::new(
+                deferred_path,
+                walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
+            ),
         ));
         let (drain_res, pump_res) = tokio::join!(drain, pump);
         let drain_outcome = drain_res

@@ -11,8 +11,8 @@
 //! (`project_walshadow_eventual_consistency`). At M=1 dispatch order (hence
 //! per-table WAL order) is preserved.
 
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,8 +27,8 @@ use crate::pipeline::Fatal;
 use crate::pipeline::ack::AckHandle;
 use crate::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::shadow_catalog::{CatalogError, RelDescriptor, ShadowCatalog};
-use crate::toast::ToastResolver;
-use crate::xact_buffer::detoast_heap;
+use crate::toast::{ChunkRefMap, ToastResolver};
+use crate::xact_buffer::{ChunkGeneration, detoast_heap};
 
 /// Caches `RelFileNode → (Postgres descriptor, ClickHouse mapping)` so the pool
 /// skips the shared catalog lock after the first lookup. Flushed when the
@@ -79,20 +79,21 @@ impl<V> RelCache<V> {
     }
 }
 
-/// Reassembled-TOAST chunk map: `(toast_relid, value_id) -> seq -> bytes`.
-pub type ToastChunks = HashMap<(u32, u32), BTreeMap<u32, Vec<u8>>>;
-
 /// `chunks` holds the xact's chunk-map generations (oldest first), each
 /// immutable once sealed by the drain: batches / barrier segments of one
 /// xact share payloads via `Arc` while later slices are still loading. A
 /// heap's referenced value lives in exactly one generation (chunk WAL
-/// precedes referrer).
+/// precedes referrer). Each generation carries its resident-gauge share,
+/// released when the last holder drops.
 pub struct DecodeJob {
     pub seq: u64,
     pub commit_ts: i64,
     pub commit_lsn: u64,
     pub heaps: Vec<DecodedHeap>,
-    pub chunks: Vec<Arc<ToastChunks>>,
+    pub chunks: Vec<Arc<ChunkGeneration>>,
+    /// Slice admission permit; shares ride every routed row through the
+    /// batcher to the in-flight insert, releasing post-insert-ack
+    pub permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
 
 /// Shared dependencies a decode worker (or the barrier's inline data path)
@@ -144,24 +145,36 @@ async fn route_chunk(
 /// Foreign-database and unmapped relations are skipped (bumping
 /// `foreign_db_rows_skipped` / `unsupported_relations`); any other catalog
 /// error poisons the stream.
+#[allow(clippy::too_many_arguments)]
 pub async fn decode_and_route(
     ctx: &DecodeCtx,
     seq: u64,
     commit_ts: i64,
     commit_lsn: u64,
     heaps: Vec<DecodedHeap>,
-    chunks: Vec<Arc<ToastChunks>>,
+    chunks: Vec<Arc<ChunkGeneration>>,
+    permit: Option<Arc<crate::budget::MemoryPermit>>,
     cache: &mut RelCache<(Arc<RelDescriptor>, Arc<TableMapping>)>,
 ) -> Result<u64, String> {
     cache.refresh();
-    let chunk_maps: Vec<&ToastChunks> = chunks.iter().map(Arc::as_ref).collect();
+    let ref_maps: Vec<&ChunkRefMap> = chunks.iter().map(|g| g.map()).collect();
+    // One spool per xact; generations sealed before spooling carry None
+    let spool = chunks.iter().find_map(|g| g.spool());
     let mut routed = 0u64;
     let mut buf: Vec<RoutedRow> = Vec::new();
     let mut buf_bytes = 0usize;
     for mut heap in heaps {
-        detoast_heap(&mut heap, &chunk_maps, &ctx.catalog, true, &ctx.resolver)
-            .await
-            .map_err(|e| e.to_string())?;
+        let value_permit = detoast_heap(
+            &mut heap,
+            spool,
+            &ref_maps,
+            &ctx.catalog,
+            true,
+            &ctx.resolver,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map(Arc::new);
         // Cache hit: no shared catalog lock, no mapping read. Skip/error arms
         // are never cached, so `foreign_db_rows_skipped`/`unsupported_relations`
         // still count per row.
@@ -217,6 +230,8 @@ pub async fn decode_and_route(
             rel,
             mapping,
             committed,
+            permit: permit.clone(),
+            value_permit,
         });
         routed += 1;
         if buf.len() >= ctx.chunk_rows || buf_bytes >= DECODE_CHUNK_BYTES {
@@ -262,6 +277,7 @@ pub fn spawn_pool(
                     job.commit_lsn,
                     job.heaps,
                     job.chunks,
+                    job.permit,
                     &mut cache,
                 )
                 .await

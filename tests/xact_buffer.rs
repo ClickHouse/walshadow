@@ -143,7 +143,7 @@ fn heap(
 fn cfg(spill_dir: std::path::PathBuf, budget: usize) -> XactBufferConfig {
     XactBufferConfig {
         xact_buffer_max: budget,
-        spill_dir,
+        ..XactBufferConfig::new(spill_dir)
     }
 }
 
@@ -400,7 +400,7 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
                 source_lsn: 0,
                 blkno: 0,
                 offnum: 1 + seq as u16,
-                chunk_data: body.to_vec(),
+                chunk_data: bytes::Bytes::copy_from_slice(body),
             },
             33,
         )
@@ -463,7 +463,7 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
                 source_lsn: 0,
                 blkno: 0,
                 offnum: 1 + seq as u16,
-                chunk_data: body.to_vec(),
+                chunk_data: bytes::Bytes::copy_from_slice(body),
             },
             42,
         )

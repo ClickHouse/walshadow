@@ -283,8 +283,15 @@ V1 limits:
   Inline varlena decodes through the heap decoder; external pointers
   surface as `ColumnValue::ExternalToast`. With `[toast] mode != disabled`
   the page walk decodes `pg_toast_<relid>` pages into chunks, `put`s them
-  to the store, defers the referring tuples, and reassembles after the
-  walk (`resolve_or_fill_toast`, `src/pipeline/bootstrap.rs`). With the
+  to the store, defers the referring tuples into a `DeferredSpool`
+  (`bootstrap_deferred.bin` under the spill dir: in-memory prefix to
+  `DEFERRED_SPOOL_MEM_MAX`, file past it — gauged
+  `walshadow_bootstrap_deferred_{bytes,spool_bytes}`), and replays after
+  the walk (`resolve_or_fill_toast`, `src/pipeline/bootstrap.rs`) against
+  the mapping frozen at defer time. Resolution runs under a leaf-only
+  memory budget sized `resident_payload_max`: each value caps at
+  `inline_value_max` (typed reject), permits ride `RoutedRow` to insert
+  ack ([emitter.md](emitter.md) Memory budget). With the
   default `mode = disabled` an unresolved value NULL/default-fills and is
   counted, not rejected. Full chunk-storage design in
   [TOAST.md](TOAST.md)
@@ -350,8 +357,9 @@ is the only shape with bounded memory at scale
   Returns `BootstrapDrainOutcome { next_seq, rows_routed }`; caller
   runs `tail.finish(msg_tx, ack, next_seq, fatal)` to seal + wait
   durable. `ColumnValue::ExternalToast` is resolved from the configured
-  chunk store (deferred past the walk, then `resolve_or_fill_toast`), or
-  NULL/default-filled under `[toast] mode = disabled` — [TOAST.md](TOAST.md)
+  chunk store (deferred through a disk spool past the walk, then
+  `resolve_or_fill_toast`), or NULL/default-filled under
+  `[toast] mode = disabled` — [TOAST.md](TOAST.md)
 - `drain_backfill` — metrics-only path (no `--ch-config`). Hands
   synthetic `CommittedTuple`s to a `TupleObserver`; `on_xact_end`
   fires on every rfn flip & once after channel close

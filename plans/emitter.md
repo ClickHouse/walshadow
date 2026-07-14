@@ -55,6 +55,13 @@ never pace wire delivery). Only `RM_XACT_ID` records reach its match:
 - PREPARE — no seq; `COMMIT PREPARED` drains it later (two-phase gap:
   [future/two_phase_commit.md](future/two_phase_commit.md))
 
+Under an active memory budget every slice admits before dispatch, so
+budget backpressure lands at the reorder, not mid-decode: newly sealed
+chunk generations each admit a permit stored on the generation
+(released with its last holder), and a slice permit covering decoded
+heap bytes + row-batch metadata rides every routed row to insert ack
+(see Memory budget below)
+
 Barrier xacts (any `SchemaEvent` or `HeapOp::Truncate` in the drain)
 run synchronously: data segments between catalog ops each get their own
 seq, and each DDL / TRUNCATE is preceded by `barrier_fence()` — wait
@@ -83,6 +90,12 @@ batcher in chunks (`DECODE_CHUNK_ROWS = 1024` / `DECODE_CHUNK_BYTES =
 reports `Placed { seq, rows }`. Decode errors are fatal — a
 never-placed seq would pin the watermark forever
 
+`detoast_heap` acquires a leaf permit for the heap's aggregate value
+peak (`check_value_caps`), shrinks it to retained decoded bytes, and
+returns it; the worker attaches it as `RoutedRow.value_permit` beside
+the slice admission permit, so decoded values and their encoder slab
+copy stay covered to insert ack
+
 Out-of-order completion across workers is fine: rows carry `source_lsn`
 as `_lsn`, so `ReplacingMergeTree(_lsn)` converges per PK. At M=1
 dispatch order (hence per-table WAL order) is preserved
@@ -96,7 +109,8 @@ and all xacts merge into one part per flush window per table. Rows and
 barrier's flush can never seal ahead of rows enqueued before it
 
 Flush triggers, each sealing one `InsertBatch` (complete INSERT's
-worth of owned column slabs + `per_seq` row counts for the collector):
+worth of owned column slabs + `per_seq` row counts for the collector +
+the rows' admission/value permits, dropped post-insert-ack):
 
 - `enc.rows >= row_budget` (default 65536)
 - `enc.approx_bytes >= byte_budget` (default 1 MiB)
@@ -127,9 +141,10 @@ drain-to-`EndOfStream`
 
 Durability invariant: `ack.acked(per_seq)` fires **only after** the
 drain returns. Until then a connection drop replays the still-owned
-batch — CH dedups the resend by `_lsn`. `rows_emitted` /
-`blocks_sent` stats bump at the same point, so a long-open window
-shows 0 rows until its first seal
+batch — CH dedups the resend by `_lsn`. The batch (and its memory
+permits) drops after the ack, so budget release never precedes
+durability. `rows_emitted` / `blocks_sent` stats bump at the same
+point, so a long-open window shows 0 rows until its first seal
 
 ### Ack collector — `pipeline/ack.rs`
 
@@ -158,6 +173,55 @@ One-shot error signal shared across stages. First message wins (root
 cause); pump polls it to exit, the barrier `select`s on it so a CH
 outage mid-fence surfaces instead of hanging. Any stage error → fatal
 → daemon exits → cursor file resumes on restart
+
+## Memory budget
+
+[`src/budget.rs`](../src/budget.rs): one process-wide resident-payload
+pool (`[memory] resident_payload_max`, default 512 MiB) of weighted
+byte permits. Channels bound item counts; the pool bounds bytes —
+decode and insert concurrency divide it instead of multiplying
+per-worker allowances. Stages acquire before allocating payload,
+attach the permit to the owning value, release on drop; batch hand-off
+transfers the permit with the bytes, never re-acquires
+
+Two compartments, one deadlock model:
+
+- **Admission** (`admit`) at pipeline entry points that can block —
+  drain slice admission, sealed chunk generations — draws from
+  `total - leaf_reserve`
+- **Leaf** (`acquire`) for per-value allocations made while holding
+  admission — store-fetch assembly, decompress output, body-spool read
+  buffers, JIT mirror-row batches — draws from the whole pool
+
+The reserve (`decoder_pool × inline_value_max`) is never consumed by
+admission and workers hold at most one leaf, so a leaf under admission
+waits only on other leaf holders — never a cycle. `build_budget` /
+`leaf_reserve_for` (`pipeline/mod.rs`) validate at spawn that the
+reserve fits half the pool (so admission keeps meaningful headroom)
+and that admission fits one drain's retained state (body-spool +
+index caps + slice headroom, so a mid-drain admit never waits on
+units the drain itself holds). Acquisition never fails: a request
+above a compartment's satisfiable share proceeds with only that share
+metered (overshoot, counted) — a leaf clamps its waited share to the
+reserve, an oversized admission passes unmetered — so one pathological
+item softens the bound instead of stalling or failing the pipeline
+
+`inline_value_max` (default 64 MiB) is the hard per-value cap:
+`check_value_caps` rejects a value whose `va_rawsize` / `va_extsize`
+exceeds it (`ValueTooLarge`, typed, non-retryable — replay decodes the
+same value) before any assembly or decompress allocation, and sizes
+the leaf need as aggregate retained bytes plus largest compressed
+transient across the heap's pointers (duplicate old/new uses each
+count). Resolution fetches per key on first use, decompresses
+immediately, clones only for non-final uses, moves the buffer out on
+last use
+
+Gauges/counters: `walshadow_resident_payload_bytes` (+ `_peak_bytes`),
+`walshadow_memory_budget_{waits,overshoots}_total`. Backup passes
+share the pipeline pool (`PassContext.budget` →
+`ToastResolver::with_budget`); the greenfield bootstrap tail runs a
+leaf-only pool of the same size — no admission stage, values capped
+and held to insert ack ([bootstrap.md](bootstrap.md))
 
 ## Connections
 

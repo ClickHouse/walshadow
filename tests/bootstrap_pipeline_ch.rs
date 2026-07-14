@@ -178,6 +178,10 @@ async fn bootstrap_tail_fans_out_n2() {
         ack.clone(),
         stats.clone(),
         ToastResolver::disabled(),
+        walshadow::spool::DeferredSpool::new(
+            std::env::temp_dir().join("ws-bootstrap-ch-unused.bin"),
+            walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
+        ),
     ));
     let outcome = drain.await.expect("drain join").expect("drain ok");
     assert_eq!(outcome.next_seq, 2, "one seq per rfn");
