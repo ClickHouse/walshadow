@@ -118,16 +118,49 @@ impl Inserter {
             // held across the reconnect's `&mut self`.
             let live = self.config_rx.as_ref().map(|rx| {
                 let r = rx.borrow();
-                (r.retry_max_attempts, r.compression)
+                (
+                    r.retry_max_attempts,
+                    r.compression,
+                    (
+                        r.host.clone(),
+                        r.port,
+                        r.database.clone(),
+                        r.user.clone(),
+                        r.password.clone(),
+                        r.secure,
+                    ),
+                )
             });
-            if let Some((retry_max, compression)) = live {
+            if let Some((retry_max, compression, (host, port, database, user, password, secure))) =
+                live
+            {
                 self.config.retry.max_attempts = retry_max;
+                // A compression or connection change needs a fresh client (codec
+                // + socket are fixed at connect) — reconnect at the batch
+                // boundary, never mid-INSERT.
+                let mut need_reconnect = false;
                 if compression != self.config.compression {
                     self.config.compression = compression;
-                    if let Err(e) = self.reconnect().await {
-                        fatal.set(format!("inserter compression reconnect: {e}"));
-                        break;
-                    }
+                    need_reconnect = true;
+                }
+                if host != self.config.host
+                    || port != self.config.port
+                    || database != self.config.database
+                    || user != self.config.user
+                    || password != self.config.password
+                    || secure != self.config.secure
+                {
+                    self.config.host = host;
+                    self.config.port = port;
+                    self.config.database = database;
+                    self.config.user = user;
+                    self.config.password = password;
+                    self.config.secure = secure;
+                    need_reconnect = true;
+                }
+                if need_reconnect && let Err(e) = self.reconnect().await {
+                    fatal.set(format!("inserter live-config reconnect: {e}"));
+                    break;
                 }
             }
             if let Err(e) = self.ensure_asts(&batch.meta) {

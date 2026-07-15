@@ -420,15 +420,16 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
     let guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
-        // 8. Wait for daemon's metrics endpoint. Crossing this barrier
-        //    means: bootstrap finished (≈100k pgbench_accounts rows
-        //    drained to CH), shadow up, WAL pump running.
+        // 8. Wait for the daemon's metrics endpoint (liveness). The daemon
+        //    binds it before the ≈100k-row bootstrap drains to CH, so it is
+        //    not a bootstrap-complete signal on its own.
         fx::wait_for_listen(metrics_addr, Duration::from_secs(300))
             .context("daemon metrics endpoint never came up")?;
 
         // 9. Post-bootstrap row-count parity. pgbench -i -s 1 produces
         //    deterministic counts: 100000 accounts, 1 branch, 10 tellers,
-        //    0 history rows.
+        //    0 history rows. The bootstrap drains asynchronously, so poll CH
+        //    until it matches rather than racing an immediate assert.
         for (src_table, ch_table, expected) in [
             ("pgbench_accounts", "default.pgbench_accounts", 100_000_u64),
             ("pgbench_branches", "default.pgbench_branches", 1),
@@ -436,17 +437,25 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
             ("pgbench_history", "default.pgbench_history", 0),
         ] {
             let src = psql_source(&source, &format!("SELECT count(*) FROM {src_table}"))?;
-            let chc = ch.query(&format!(
-                "SELECT count() FROM {ch_table} FINAL WHERE _is_deleted = 0"
-            ))?;
             anyhow::ensure!(
                 src == expected.to_string(),
                 "source {src_table} count {src} != expected {expected}"
             );
-            anyhow::ensure!(
-                src == chc,
-                "bootstrap mismatch {src_table}: source={src}, ch={chc}"
-            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                let chc = ch
+                    .query(&format!(
+                        "SELECT count() FROM {ch_table} FINAL WHERE _is_deleted = 0"
+                    ))
+                    .unwrap_or_default();
+                if chc == src {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("bootstrap mismatch {src_table}: source={src}, ch={chc}");
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
         }
 
         // 10. Background pgbench workload. -T 6 wallclock keeps the

@@ -692,6 +692,7 @@ async fn build_pipeline_inner(
         &emitter_cfg,
         walshadow::config::CliOverrides::default(),
         None,
+        toml::Table::new(),
         mapping.clone(),
         inv_epoch.clone(),
     );

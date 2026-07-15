@@ -288,17 +288,35 @@ async fn object_store_bootstrap_ch_end_to_end() {
     let guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
-        // 8. Wait for daemon's metrics endpoint, bootstrap done,
-        //    daemon-owned shadow live, WAL pump alive. Bootstrap-emitter
-        //    INSERTs flush to CH synchronously before the streaming
-        //    pump starts, so the 64-row fixture lands on CH by this
-        //    point.
+        // 8. Wait for the daemon's metrics endpoint (liveness). The daemon
+        //    binds it before the bootstrap tail drains to CH, so it is not
+        //    a bootstrap-complete signal on its own.
         fx::wait_for_listen(metrics_addr, Duration::from_secs(30))
             .context("daemon metrics endpoint never came up")?;
 
-        // 9. Oracle. ChildGuard's Drop SIGKILLs the daemon at end of
-        //    scope; we don't need a `pg_switch_wal` + drain cycle since
-        //    the test surface is bootstrap correctness, not streaming.
+        // 9. Poll until the bootstrap rows are durable on CH — the tail
+        //    drains asynchronously, so racing it with an immediate assert
+        //    flakes on slow CI.
+        let src_count = source
+            .psql_one("SELECT count(*) FROM s14.t")
+            .context("source count")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let n = ch
+                .query("SELECT count() FROM default.t FINAL WHERE _is_deleted = 0")
+                .unwrap_or_default();
+            if n == src_count {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("bootstrap rows never reached CH: source={src_count}, ch={n}");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // 10. Oracle. ChildGuard's Drop SIGKILLs the daemon at end of scope;
+        //     no `pg_switch_wal` + drain cycle since the surface is bootstrap
+        //     correctness, not streaming.
         fx::assert_ch_matches_source(&ch, &source, "s14.t", "default.t")
             .context("source vs CH parity")?;
 

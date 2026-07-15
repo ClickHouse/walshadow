@@ -255,10 +255,13 @@ point, not the consumer set. Four consumers:
 
 ## SIGHUP
 
-`spawn_sighup_handler` holds the resolver and calls `reload()` on each signal. No
-resolver (metrics-only run, no `--ch-config`) makes it a no-op tap. Install
-failure drops the resolver, so `has_changed` returns `Err` and subscribers freeze
-at the boot snapshot — reload disabled, config still serves.
+`run` installs the handler at boot; install failure is fatal, so a running
+daemon always has the reload path armed. `spawn_sighup_reload` holds the
+process-lifetime `Reloader` and calls `Reloader::reload()` on each signal —
+the same path as the control socket's `config reload`
+([control.md](control.md)). The `Reloader` carries the running session's
+resolver (`set_resolver`); with none registered (metrics-only run, no
+`--ch-config`) reload is a no-op tap.
 
 ## Mapping lifecycle
 

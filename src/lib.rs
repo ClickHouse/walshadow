@@ -52,7 +52,7 @@ pub use emit::{ch_ddl, ch_emitter, pipeline};
 #[doc(hidden)]
 pub use filter::{catalog_tracker, classify, filter_segment, main_data, pg_class_decoder, rewrite};
 #[doc(hidden)]
-pub use ops::{metrics, oracle, preflight, retention, trace};
+pub use ops::{control, metrics, oracle, preflight, retention, trace};
 #[doc(hidden)]
 pub use source::{
     manifest, queueing_record_sink, segment_sink, shadow_stream, source_feed, wal_stream,
