@@ -48,27 +48,27 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, MappingHandle};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig};
 use walshadow::cursor;
 use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
+use walshadow::mapping::MappingHandle;
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
-use walshadow::pg::quote_ident;
+use walshadow::pg::{quote_ident, socket_conninfo};
 use walshadow::pipeline::{Fatal, PipelineConfig, PipelineHandle, bootstrap, tail};
 use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
+use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE};
 use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
 use walshadow::runtime_config::InitialLoadMode;
+use walshadow::schema::{RelName, SchemaEvent};
+use walshadow::segment_sink::{DirSegmentSink, SegFsync};
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{
-    RelName, SchemaEvent, ShadowCatalog, ShadowCatalogConfig, socket_conninfo, with_transient_retry,
-};
+use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, with_transient_retry};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::toast::ToastResolver;
-use walshadow::wal_stream::{
-    DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
-};
+use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{
     BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig, XactRecordSink,
 };
@@ -153,7 +153,7 @@ struct DaemonSinks {
     emitter_stats: Option<Arc<walshadow::ch_emitter::EmitterStats>>,
     /// Per-txn span map; `Some` only with OTLP on. Registering at WAL read
     /// (here) makes the `txn` span cover the pump→worker channel wait.
-    span_registry: Option<walshadow::xact_buffer::TxnSpanRegistry>,
+    span_registry: Option<walshadow::trace::TxnSpanRegistry>,
 }
 
 impl RecordSink for DaemonSinks {
@@ -571,7 +571,7 @@ async fn run(args: Args) -> Result<()> {
     let start_lsn_override = args
         .start_lsn
         .as_deref()
-        .map(|s| walshadow::shadow::parse_pg_lsn(s).context("--start-lsn"))
+        .map(|s| walshadow::pg::parse_pg_lsn(s).context("--start-lsn"))
         .transpose()?;
     let raw_start = cursor::resolve_resume_lsn(
         start_lsn_override,
@@ -643,7 +643,7 @@ async fn run(args: Args) -> Result<()> {
             .context("open sidecar sql client for seed_from_source")?;
         let added = stream
             .filter_mut()
-            .tracker
+            .tracker_mut()
             .seed_from_source(sql_client)
             .await
             .context("seed_from_source")?;
@@ -947,6 +947,8 @@ async fn run(args: Args) -> Result<()> {
                 .await,
             ));
         }
+        let backfiller_effects: Option<Arc<dyn walshadow::opt_in::Backfiller>> =
+            copy_backfiller.clone().map(|backfiller| backfiller as _);
         // Re-materialise per-table opt-in scope from the seeded config_table
         // rows. Live edits arrive off WAL via the reorder coordinator, but a
         // restart replays WAL from past these rows' commit LSN, so the seed
@@ -960,7 +962,7 @@ async fn run(args: Args) -> Result<()> {
                     &resolver,
                     &mut applicator,
                     &catalog,
-                    copy_backfiller.as_ref(),
+                    backfiller_effects.as_ref(),
                     rel,
                     row,
                     raw_start,
@@ -1053,7 +1055,7 @@ async fn run(args: Args) -> Result<()> {
             stats: stats.clone(),
             span_registry: span_registry.clone(),
             config_resolver: config_resolver.clone(),
-            backfiller: copy_backfiller.clone(),
+            backfiller: backfiller_effects,
             retires,
             resume_floor: floor,
             budget: Some(pipeline_budget),
@@ -1118,8 +1120,7 @@ async fn run(args: Args) -> Result<()> {
     // publishes `durable_lsn`. Seed at the resume point.
     let durable_lsn = Arc::new(AtomicU64::new(stream.dispatched_lsn()));
     let fsync_fatal = walshadow::pipeline::Fatal::new();
-    let (fsync_tx, fsync_rx) =
-        tokio::sync::mpsc::channel::<walshadow::wal_stream::SegFsync>(SEGMENT_FSYNC_QUEUE);
+    let (fsync_tx, fsync_rx) = tokio::sync::mpsc::channel::<SegFsync>(SEGMENT_FSYNC_QUEUE);
     let fsync_task = spawn_segment_fsync(
         args.out_dir.clone(),
         fsync_rx,
@@ -1421,6 +1422,8 @@ async fn run(args: Args) -> Result<()> {
             prev_dispatched = now_dispatched;
             let ahead = server_end.saturating_sub(dispatched_before);
             let filter = stream.filter();
+            let filter_stats = filter.stats();
+            let tracker_stats = filter.tracker().stats();
             tracing::info!(
                 target: "walshadow",
                 segments_shipped,
@@ -1428,11 +1431,11 @@ async fn run(args: Args) -> Result<()> {
                 shadow_apply = format_pg_lsn(shadow_apply_lsn).to_string(),
                 source_ahead_bytes = ahead,
                 metrics = %record_sink.metrics.summary(),
-                kept = filter.stats.kept,
-                dropped = filter.stats.dropped,
-                relmap_updates = filter.tracker.relmap_updates,
-                pg_class_undecoded = filter.tracker.pg_class_writes_undecoded,
-                pg_class_oid_in_prefix = filter.tracker.pg_class_writes_oid_in_prefix,
+                kept = filter_stats.kept,
+                dropped = filter_stats.dropped,
+                relmap_updates = tracker_stats.relmap_updates,
+                pg_class_undecoded = tracker_stats.pg_class_writes_undecoded,
+                pg_class_oid_in_prefix = tracker_stats.pg_class_writes_oid_in_prefix,
                 decoder = %decoder_stats.summary(),
                 xact_buffer = %xact_line,
                 oracle = %oracle_line,
@@ -1803,7 +1806,7 @@ const SEGMENT_FSYNC_QUEUE: usize = 64;
 /// on a shared disk it may block on unrelated writeback.
 fn spawn_segment_fsync(
     out_dir: PathBuf,
-    mut rx: tokio::sync::mpsc::Receiver<walshadow::wal_stream::SegFsync>,
+    mut rx: tokio::sync::mpsc::Receiver<SegFsync>,
     durable_lsn: Arc<AtomicU64>,
     fatal: walshadow::pipeline::Fatal,
 ) -> tokio::task::JoinHandle<()> {
@@ -1988,15 +1991,15 @@ async fn populate_metrics(
     backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
 ) {
     use std::collections::BTreeMap;
-    use walshadow::classify::rmgr_label;
+    use walshadow::record::rmgr_label;
     let (proc_cpu, proc_rss) = read_process_stats();
     let mut by_rm = BTreeMap::new();
     for ((rm, route), n) in &rec_metrics.by_rm_route {
         let key = (
             rmgr_label(*rm).to_string(),
             match route {
-                walshadow::filter::Route::ToShadow => "to_shadow",
-                walshadow::filter::Route::ToDecoder => "to_decoder",
+                walshadow::record::Route::ToShadow => "to_shadow",
+                walshadow::record::Route::ToDecoder => "to_decoder",
             },
         );
         by_rm.insert(key, *n);

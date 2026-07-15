@@ -1,11 +1,8 @@
-//! walshadow — schema-only Postgres + WAL replay catalog mirror for CDC.
+//! Schema-only Postgres and WAL replay catalog mirror for CDC
 //!
-//! `segment` is private, reachable only via `filter_segment`. `wal_page`
-//! is the shared PG-15+ page-header parse for both segment walkers.
-//! `ch_emitter` is driven by the top crate's `lz4`/`zstd` features which
-//! forward to clickhouse-c-rs. `cursor` boot path consults it before
-//! reverting to greenfield. `xact_buffer` is backed by an append-only
-//! per-xid `spill` file.
+//! Keep WAL parsing internals private. Expose contract modules for schema,
+//! records, mappings, PostgreSQL paths, ClickHouse transport, and backfill
+//! requests
 
 /// `info_span!(target: "walshadow::trace", …)` when `$on`, else a no-op span
 /// (fields unevaluated on the unsampled path).
@@ -21,54 +18,48 @@ macro_rules! trace_span {
 
 #[macro_use]
 pub mod atomic_stats;
-pub mod backfill_bootstrap;
-pub mod backfill_staging;
-pub mod backup_backfill;
-pub mod backup_page_walk;
-pub mod backup_sink;
-pub mod backup_source;
-pub mod backup_source_direct;
-pub mod backup_source_object_store;
+pub mod backfill;
 pub mod budget;
-pub mod catalog_tracker;
-pub mod ch_ddl;
-pub mod ch_emitter;
-pub mod classify;
-pub mod codecs;
+pub mod catalog;
+pub mod ch;
 pub mod config;
-pub mod copy_backfill;
-pub mod cursor;
-pub mod decoder_sink;
+pub mod decode;
+pub mod emit;
 pub mod filter;
-pub mod filter_segment;
-pub mod fpi;
-pub mod heap_decoder;
-pub mod main_data;
-pub mod manifest;
-pub mod metrics;
-pub mod opt_in;
-pub mod oracle;
+pub mod fs;
+pub mod mapping;
+pub mod ops;
 pub mod pg;
-pub mod pg_class_decoder;
-pub mod pipeline;
-pub mod preflight;
-pub mod queueing_record_sink;
-pub mod retention;
-pub mod rewrite;
+pub mod record;
 pub mod runtime_config;
-pub mod segment;
-pub mod shadow;
-pub mod shadow_catalog;
-pub mod shadow_stream;
-pub mod source_feed;
-pub mod spill;
-pub mod spool;
-pub mod streaming_walker;
+pub mod schema;
+pub mod source;
 pub mod toast;
-pub mod toast_retire;
-pub mod trace;
-pub mod type_bridge;
-pub mod visibility;
-pub mod wal_page;
-pub mod wal_stream;
-pub mod xact_buffer;
+pub mod xact;
+
+#[doc(hidden)]
+pub use backfill::{
+    backfill_bootstrap, backfill_staging, backfill_types, backup_backfill, backup_page_walk,
+    backup_sentinel, backup_source, backup_source_direct, backup_source_object_store,
+    copy_backfill, opt_in, pg_path, spool,
+};
+#[doc(hidden)]
+pub use catalog::{shadow, shadow_catalog, type_bridge};
+#[doc(hidden)]
+pub use decode::{codecs, decoder_sink, fpi, heap_decoder, visibility, wal_xact};
+#[doc(hidden)]
+pub use emit::{ch_ddl, ch_emitter, pipeline};
+#[doc(hidden)]
+pub use filter::{
+    catalog_tracker, classify, filter_segment, main_data, manifest, pg_class_decoder, rewrite,
+};
+#[doc(hidden)]
+pub use ops::{metrics, oracle, preflight, retention, trace};
+#[doc(hidden)]
+pub use source::{
+    cursor, queueing_record_sink, segment_sink, shadow_stream, source_feed, wal_stream,
+};
+#[doc(hidden)]
+pub use toast::toast_retire;
+#[doc(hidden)]
+pub use xact::{spill, xact_buffer};

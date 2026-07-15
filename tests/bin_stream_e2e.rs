@@ -390,7 +390,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         let target_text = source
             .psql_one("SELECT pg_current_wal_lsn()::text")
             .expect("source lsn");
-        let target = walshadow::shadow::parse_pg_lsn(&target_text).expect("parse target lsn");
+        let target = walshadow::pg::parse_pg_lsn(&target_text).expect("parse target lsn");
         let observed = shadow
             .wait_for_replay(target, Duration::from_secs(30))
             .expect("shadow replay catches up");
@@ -660,7 +660,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
 
         // Baseline: the live wire keeps the shadow replaying the in-progress segment.
         sleep(Duration::from_secs(1));
-        let m = walshadow::shadow::parse_pg_lsn(
+        let m = walshadow::pg::parse_pg_lsn(
             &source
                 .psql_one("SELECT pg_current_wal_lsn()::text")
                 .context("baseline lsn")?,
@@ -681,7 +681,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
         // Recovery: replay must reach a post-reconnect LSN — only possible if
         // walshadow backfills the gap on reconnect. Without the fix the shadow
         // gets a hole, strands, and this times out. Budget < the 30s gate.
-        let target = walshadow::shadow::parse_pg_lsn(
+        let target = walshadow::pg::parse_pg_lsn(
             &source
                 .psql_one("SELECT pg_current_wal_lsn()::text")
                 .context("target lsn")?,

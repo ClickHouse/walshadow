@@ -14,12 +14,12 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use walshadow::ch_emitter::ColumnMapping;
-use walshadow::ch_emitter::TableTarget;
+use walshadow::mapping::ColumnMapping;
+use walshadow::mapping::TableTarget;
 use walshadow::oracle::Oracle;
+use walshadow::pg::socket_conninfo;
+use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
-use walshadow::shadow_catalog::RelName;
-use walshadow::shadow_catalog::socket_conninfo;
 
 struct PortSlot {
     source: u16,

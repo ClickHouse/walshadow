@@ -20,15 +20,16 @@ use tokio::sync::Mutex;
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::decoder_sink::{DecoderSinkError, TupleObserver};
-use walshadow::filter::Route;
 use walshadow::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
 };
+use walshadow::pg::socket_conninfo;
+use walshadow::record::Route;
+use walshadow::record::{Record, RecordSink as _};
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
+use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 use walshadow::spill::ToastChunk;
 use walshadow::toast::{MemChunkStore, ToastResolver};
-use walshadow::wal_stream::Record;
 use walshadow::xact_buffer::{XactBuffer, XactBufferConfig, XactBufferError, XactRecordSink};
 
 fn pg_available() -> bool {
@@ -514,13 +515,12 @@ fn xact_record(info_op: u8, xid: u32, xact_time: i64) -> Record<'static> {
         source_lsn: 0,
         page_magic: 0xD110,
         route: Route::ToShadow,
-        catalog_signal: walshadow::catalog_tracker::CatalogSignal::None,
+        catalog_signal: walshadow::record::CatalogSignal::None,
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xact_record_sink_routes_commit_and_abort() {
-    use walshadow::wal_stream::RecordSink as _;
     let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55706).await else {
         return;
     };

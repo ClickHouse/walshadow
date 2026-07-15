@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use walshadow::pg::socket_conninfo;
+use walshadow::schema::{RelName, ReplIdent, SchemaEvent};
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::RelName;
 use walshadow::shadow_catalog::{
-    CatalogError, ReplIdent, SchemaEvent, ShadowCatalog, ShadowCatalogConfig, socket_conninfo,
-    with_transient_retry,
+    CatalogError, ShadowCatalog, ShadowCatalogConfig, with_transient_retry,
 };
 
 fn pg_available() -> bool {

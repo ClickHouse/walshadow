@@ -29,9 +29,9 @@ mod fx;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use walshadow::ch_emitter::ColumnMapping;
-use walshadow::ch_emitter::TableTarget;
-use walshadow::shadow_catalog::RelName;
+use walshadow::mapping::ColumnMapping;
+use walshadow::mapping::TableTarget;
+use walshadow::schema::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_schema_evolution_orders_after_data() {

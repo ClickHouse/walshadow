@@ -30,13 +30,14 @@ use tokio::sync::{Mutex, watch};
 
 use clickhouse_c::{Allocator, TypeAst};
 
-use crate::ch_ddl::{DropTableStrategy, derive_columns_for_mapping, fold_diff_into_mapping};
-use crate::ch_emitter::{
-    CompressionChoice, EmitterConfig, EmitterError, MappingHandle, NamespaceMapping, TableMapping,
-    TableTarget,
+use crate::ch::{CompressionChoice, EmitterError};
+use crate::emit::ch_emitter::EmitterConfig;
+use crate::mapping::{
+    DropTableStrategy, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
+    derive_columns_for_mapping, fold_diff_into_mapping,
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
-use crate::shadow_catalog::{RelDescriptor, RelName, SchemaDiff};
+use crate::schema::{RelDescriptor, RelName, SchemaDiff};
 
 /// Pre-materialised resolved config, snapshotted by subscribers via
 /// `watch::Receiver<Arc<ResolvedConfig>>`. Rebuilt whole on every reload,
@@ -384,7 +385,7 @@ impl ConfigResolver {
 
     /// CH target database for a namespace: per-namespace override (overlay then
     /// TOML) else the global `[ch] database`. Mirrors
-    /// [`crate::ch_ddl::DdlConfig::target_database_for`].
+    /// [`crate::emit::ch_ddl::DdlConfig::target_database_for`].
     fn target_db_for(inner: &MergeInputs, namespace: &str) -> String {
         inner
             .overlay
@@ -792,7 +793,7 @@ mod tests {
     }
 
     fn rel_desc(namespace: &str, name: &str) -> RelDescriptor {
-        use crate::shadow_catalog::{RelAttr, ReplIdent};
+        use crate::schema::{RelAttr, ReplIdent};
         use walrus::pg::walparser::RelFileNode;
         RelDescriptor {
             rfn: RelFileNode {
@@ -972,7 +973,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_diff_fold_survives_republish() {
-        use crate::shadow_catalog::RelAttr;
+        use crate::schema::RelAttr;
         // TOML-owned mapping: the fold lands copy-on-write in the derived
         // layer, so neither a config apply nor a SIGHUP re-merge reverts it
         let base = EmitterConfig::from_toml_str(

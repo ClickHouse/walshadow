@@ -34,7 +34,7 @@ Mixed-block records (any block ref touching catalog) classify as
 catalog index plus a user relation in the same record; prefer
 false-keep to false-drop
 
-`rmgr_label` returns human-readable rmgr name for diagnostics; unknown
+`record::rmgr_label` returns human-readable rmgr name for diagnostics; unknown
 ids stringify as `rmgr_N` for forward compat with future PG majors
 
 ## CatalogTracker

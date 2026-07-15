@@ -8,7 +8,7 @@ mod fx;
 
 use std::time::Duration;
 
-use walshadow::ch_emitter::NamespaceMapping;
+use walshadow::mapping::NamespaceMapping;
 use walshadow::shadow::Shadow;
 
 struct PortSlot {

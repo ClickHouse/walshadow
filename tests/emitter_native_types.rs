@@ -19,14 +19,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use walrus::pg::walparser::RelFileNode;
-use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping, TableTarget,
-};
+use walshadow::ch::CompressionChoice;
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::codecs::NumericKind;
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
+use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
-use walshadow::shadow_catalog::{RelDescriptor, RelName, ReplIdent};
+use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
 
 const CH_TCP_PORT: u16 = 17629;
 const CH_HTTP_PORT: u16 = 17630;

@@ -35,9 +35,9 @@ mod fx;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use walshadow::ch_emitter::{ColumnMapping, TableTarget};
-use walshadow::shadow_catalog::RelName;
-use walshadow::toast::ToastMode;
+use walshadow::mapping::ToastMode;
+use walshadow::mapping::{ColumnMapping, TableTarget};
+use walshadow::schema::RelName;
 
 const SOURCE_PORT: u16 = 17731;
 const SHADOW_PORT: u16 = 17732;

@@ -229,7 +229,7 @@ async fn vacuum_full_pg_depend_ticks_oid_in_prefix_not_undecoded() {
     let mut filter = Filter::new();
     let (_out, manifest, _parsed) = filter_segment(&bytes, "vac", &mut filter).expect("filter");
 
-    let tracker = &filter.tracker;
+    let tracker = filter.tracker().stats();
     eprintln!(
         "VACUUM FULL pg_depend fixture: {} records, oid_in_prefix={}, undecoded={}, decoded={}",
         manifest.stats.records,

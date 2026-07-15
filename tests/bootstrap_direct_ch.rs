@@ -39,9 +39,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use walshadow::ch_emitter::TableTarget;
+use walshadow::mapping::TableTarget;
+use walshadow::schema::RelName;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::RelName;
 
 // Reserved port slot — 17300-range. Kept below the Linux ephemeral
 // port range (32768-60999) so an outbound TCP connect from the daemon

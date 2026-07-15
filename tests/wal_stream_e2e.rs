@@ -25,11 +25,11 @@ use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
 use walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walshadow::record::{CollectingRecordSink, MetricsRecordSink, WAL_SEG_SIZE};
+use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
-use walshadow::wal_stream::{
-    CollectingRecordSink, DirSegmentSink, MetricsRecordSink, WAL_SEG_SIZE, WalStream,
-};
+use walshadow::wal_stream::WalStream;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -382,14 +382,14 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         let sql_client = feed.sql_client().await.expect("sidecar sql client");
         let added = stream
             .filter_mut()
-            .tracker
+            .tracker_mut()
             .seed_from_source(sql_client)
             .await
             .expect("seed_from_source");
         assert!(added > 0, "seed must add ≥1 catalog filenode");
     }
     assert!(
-        stream.filter().tracker.is_catalog(db, pg_class_fn),
+        stream.filter().tracker().is_catalog(db, pg_class_fn),
         "after seed, rotated pg_class filenode {pg_class_fn} (db {db}) must be catalog",
     );
 
@@ -459,7 +459,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
     assert!(segments_shipped >= 1, "no segments shipped in 15s");
 
     let filter = stream.filter();
-    let tracker = &filter.tracker;
+    let tracker = filter.tracker().stats();
     // CREATE TABLE / ALTER TABLE write to pg_class. With seed,
     // `is_pg_class_relfilenode(db, pg_class_fn)` is true and the
     // decoder runs on every such block — counters must move off zero.
@@ -474,15 +474,16 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
     // The same writes were classified User but promoted to Keep via
     // the tracker's catalog set — kept_user counts them.
     assert!(
-        filter.stats.kept_user > 0,
+        filter.stats().kept_user > 0,
         "expected pg_class writes on rotated filenode to be kept as user-classified \
          catalog records; kept_user={}",
-        filter.stats.kept_user,
+        filter.stats().kept_user,
     );
     eprintln!(
         "pre-rotated e2e: pg_class_fn={pg_class_fn}, recognized={recognized}, \
          kept_user={}, dropped={}",
-        filter.stats.kept_user, filter.stats.dropped,
+        filter.stats().kept_user,
+        filter.stats().dropped,
     );
 }
 

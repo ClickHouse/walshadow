@@ -29,13 +29,13 @@ use std::time::{Duration, Instant};
 
 use clickhouse_c::tls::{self, rustls};
 use walrus::pg::walparser::RelFileNode;
-use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, TableMapping, TableTarget,
-};
+use walshadow::ch::CompressionChoice;
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
+use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
-use walshadow::shadow_catalog::{RelDescriptor, RelName, ReplIdent};
+use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
 
 const RFN: RelFileNode = RelFileNode {
     spc_node: 1663,

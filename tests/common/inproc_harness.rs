@@ -32,21 +32,22 @@ use tokio::sync::Mutex;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
 
+use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
-use walshadow::ch_emitter::TableTarget;
-use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, MappingHandle, NamespaceMapping,
-    TableMapping,
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::mapping::{
+    ColumnMapping, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
 };
+use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle};
+use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE};
+use walshadow::schema::RelName;
+use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::RelName;
-use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, socket_conninfo};
+use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
-use walshadow::wal_stream::{
-    DirSegmentSink, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, WalStream,
-};
+use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
 // ---------------------------------------------------------------------------
@@ -372,7 +373,7 @@ pub async fn bootstrap_clusters(
     let xlogpos_str = source
         .psql_one("SELECT pg_current_wal_lsn()::text")
         .expect("read source xlogpos");
-    let xlogpos = walshadow::shadow::parse_pg_lsn(&xlogpos_str).expect("parse xlogpos");
+    let xlogpos = walshadow::pg::parse_pg_lsn(&xlogpos_str).expect("parse xlogpos");
     let aligned = WalStream::align_down(xlogpos, WAL_SEG_SIZE);
     let shadow_stream_state = Arc::new(Mutex::new(
         walshadow::shadow_stream::ShadowStreamState::new(1, sysid, aligned, 64 * 1024 * 1024),
@@ -596,7 +597,7 @@ async fn build_pipeline_inner(
         let sql_client = feed.sql_client().await.expect("sidecar sql client");
         stream
             .filter_mut()
-            .tracker
+            .tracker_mut()
             .seed_from_source(sql_client)
             .await
             .expect("seed_from_source");
@@ -662,7 +663,7 @@ async fn build_pipeline_inner(
     // relations so a pinned table's first ALTER surfaces as Changed, and
     // subscribe the decoder to the catalog's schema-event channel so
     // ALTER/CREATE/DROP reach the reorder coordinator as `ordered_events`.
-    let mut schema_events: Option<walshadow::xact_buffer::SchemaEventRx> = None;
+    let mut schema_events: Option<walshadow::schema::SchemaEventRx> = None;
     if let Some(d) = ddl.as_ref() {
         emitter_cfg.namespaces = d.namespaces.clone();
         if let Some(s) = &d.drop_table_strategy {
@@ -716,23 +717,24 @@ async fn build_pipeline_inner(
     // COPY backfiller (`initial_load='copy'` opt-ins): own source SQL session +
     // CH tail per backfill, resume ledger beside the spill dir (mirrors
     // bin/stream.rs when `[runtime_config] schema` is set).
-    let backfiller = if ddl.as_ref().is_some_and(|d| d.config_schema.is_some()) {
-        Some(Arc::new(
-            walshadow::copy_backfill::CopyBackfiller::new(
-                pgcfg.clone(),
-                emitter_cfg.clone(),
-                mapping.clone(),
-                stats.clone(),
-                catalog.clone(),
-                &spill_dir,
-                Some(config_rx.clone()),
-                None,
-            )
-            .await,
-        ))
-    } else {
-        None
-    };
+    let backfiller: Option<Arc<dyn walshadow::opt_in::Backfiller>> =
+        if ddl.as_ref().is_some_and(|d| d.config_schema.is_some()) {
+            Some(Arc::new(
+                walshadow::copy_backfill::CopyBackfiller::new(
+                    pgcfg.clone(),
+                    emitter_cfg.clone(),
+                    mapping.clone(),
+                    stats.clone(),
+                    catalog.clone(),
+                    &spill_dir,
+                    Some(config_rx.clone()),
+                    None,
+                )
+                .await,
+            ))
+        } else {
+            None
+        };
     let pcfg = PipelineConfig {
         emitter: emitter_cfg,
         decoder_pool_size: 2,

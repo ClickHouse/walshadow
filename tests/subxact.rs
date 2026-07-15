@@ -23,10 +23,10 @@ mod fx;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use walshadow::ch_emitter::TableTarget;
-use walshadow::ch_emitter::{ColumnMapping, NamespaceMapping};
+use walshadow::mapping::TableTarget;
+use walshadow::mapping::{ColumnMapping, NamespaceMapping};
+use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
-use walshadow::shadow_catalog::RelName;
 
 // Each test owns a disjoint port slot. Cargo's default test runner
 // parallelises tests within a binary, so reusing slots would collide

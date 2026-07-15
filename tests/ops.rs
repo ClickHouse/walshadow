@@ -21,10 +21,11 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
-use walshadow::ch_emitter::{ColumnMapping, EmitterConfig, TableMapping, TableTarget};
+use walshadow::ch_emitter::EmitterConfig;
+use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::preflight::{Inputs, PreflightError};
+use walshadow::schema::RelName;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::RelName;
 
 // Non-overlapping ports so a leftover from an earlier failed run doesn't
 // shadow the next start.

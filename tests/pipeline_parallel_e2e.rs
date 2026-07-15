@@ -20,9 +20,9 @@ mod fx;
 
 use std::time::Duration;
 
-use walshadow::ch_emitter::ColumnMapping;
-use walshadow::ch_emitter::TableTarget;
-use walshadow::shadow_catalog::RelName;
+use walshadow::mapping::ColumnMapping;
+use walshadow::mapping::TableTarget;
+use walshadow::schema::RelName;
 
 const SOURCE_PORT: u16 = 17501;
 const SHADOW_PORT: u16 = 17502;

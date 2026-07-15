@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use tokio_postgres::NoTls;
 use walshadow::catalog_tracker::{CatalogTracker, PG_CLASS_OID};
+use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::socket_conninfo;
 
 fn pg_available() -> bool {
     Command::new("initdb")
