@@ -9,8 +9,9 @@
 
 use std::path::PathBuf;
 
+use walshadow::record::{CollectingRecordSink, CollectingSegmentSink, Record};
 use walshadow::shadow_stream::{ShadowStreamSink, ShadowStreamState};
-use walshadow::wal_stream::{CollectingRecordSink, CollectingSegmentSink, Record, WalStream};
+use walshadow::wal_stream::WalStream;
 
 #[path = "common/segment.rs"]
 mod segment;
@@ -30,7 +31,7 @@ struct RecordKey {
     info: u8,
     xact_id: u32,
     total_len: u32,
-    route: walshadow::filter::Route,
+    route: walshadow::record::Route,
     page_magic: u16,
     block_locators: Vec<(u32, u32, u32)>,
 }

@@ -25,13 +25,13 @@ use walrus::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
 };
 
-use walshadow::filter::Route;
 use walshadow::manifest::Kind;
-use walshadow::rewrite::compute_crc;
-use walshadow::wal_stream::{
-    CollectingRecordSink, CollectingSegmentSink, CompositeRecordSink, Record, RecordSink,
-    SinkError, WalStream,
+use walshadow::record::Route;
+use walshadow::record::{
+    CollectingRecordSink, CollectingSegmentSink, CompositeRecordSink, Record, RecordSink, SinkError,
 };
+use walshadow::rewrite::compute_crc;
+use walshadow::wal_stream::WalStream;
 
 /// Synthetic segment / page size: one 8 KiB page per segment. Math in
 /// `WalStream::segment_for_lsn` requires `seg_size` to divide `2^32`;
@@ -232,9 +232,9 @@ async fn catalog_tracker_state_survives_segment_boundary() {
 
     // Cumulative filter stats sanity: 2 records seen total, both kept.
     let filter = stream.filter();
-    assert_eq!(filter.stats.kept, 2);
-    assert_eq!(filter.stats.dropped, 0);
-    assert_eq!(filter.tracker.relmap_updates, 1);
+    assert_eq!(filter.stats().kept, 2);
+    assert_eq!(filter.stats().dropped, 0);
+    assert_eq!(filter.tracker().stats().relmap_updates, 1);
 
     // RecordSink routes reflect the same outcome.
     assert_eq!(records.records[0].route, Route::ToShadow);

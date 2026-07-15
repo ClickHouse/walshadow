@@ -29,8 +29,8 @@ use walshadow::codecs;
 use walshadow::decoder_sink::{CollectingTupleObserver, TupleObserver};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::oracle::{Oracle, OracleObserver};
+use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::socket_conninfo;
 
 const SHADOW_PORT: u16 = 56301;
 
@@ -178,7 +178,7 @@ async fn oracle_with_extension_resolves_tier3_disk_bytes() {
 
     // numeric — 42
     let txt = oracle
-        .resolve_pending(walshadow::heap_decoder::NUMERICOID, &numeric_42_bytes())
+        .resolve_pending(walshadow::schema::NUMERICOID, &numeric_42_bytes())
         .await
         .expect("resolve numeric")
         .expect("resolved Some");
@@ -186,7 +186,7 @@ async fn oracle_with_extension_resolves_tier3_disk_bytes() {
 
     // inet — 192.168.0.1
     let txt = oracle
-        .resolve_pending(walshadow::heap_decoder::INETOID, &inet_192_168_0_1_bytes())
+        .resolve_pending(walshadow::schema::INETOID, &inet_192_168_0_1_bytes())
         .await
         .expect("resolve inet")
         .expect("resolved Some");
@@ -195,7 +195,7 @@ async fn oracle_with_extension_resolves_tier3_disk_bytes() {
     // interval — 1 month 2 days 3 microseconds
     let txt = oracle
         .resolve_pending(
-            walshadow::heap_decoder::INTERVALOID,
+            walshadow::schema::INTERVALOID,
             &interval_1mon_2day_3us_bytes(),
         )
         .await
@@ -261,7 +261,7 @@ async fn oracle_observer_resolves_pg_pending_to_text() {
             op: HeapOp::Insert,
             new: Some(DecodedTuple {
                 columns: vec![Some(ColumnValue::PgPending {
-                    type_oid: walshadow::heap_decoder::NUMERICOID,
+                    type_oid: walshadow::schema::NUMERICOID,
                     raw: numeric_42_bytes(),
                 })],
                 partial: false,
@@ -309,7 +309,7 @@ async fn oracle_validate_counts_match_and_mismatch() {
     let oracle = Oracle::connect(&conninfo, 1).await.expect("oracle connect");
 
     use std::sync::atomic::Ordering;
-    use walshadow::heap_decoder::{INT4OID, NUMERICOID};
+    use walshadow::schema::{INT4OID, NUMERICOID};
     assert!(oracle.validate(NUMERICOID, &numeric_42_bytes(), "42").await);
     assert!(
         oracle
@@ -347,7 +347,7 @@ async fn oracle_resolve_reconnects_after_backend_restart() {
         "postgres",
     );
     let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
-    use walshadow::heap_decoder::NUMERICOID;
+    use walshadow::schema::NUMERICOID;
     assert_eq!(
         oracle
             .resolve_pending(NUMERICOID, &numeric_42_bytes())
@@ -396,7 +396,7 @@ async fn oracle_resolve_errors_when_backend_down() {
     );
     let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
     use std::sync::atomic::Ordering;
-    use walshadow::heap_decoder::NUMERICOID;
+    use walshadow::schema::NUMERICOID;
     assert!(
         oracle
             .resolve_pending(NUMERICOID, &numeric_42_bytes())

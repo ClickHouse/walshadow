@@ -20,11 +20,10 @@ use walrus::pg::walparser::{
 };
 
 use walshadow::queueing_record_sink::QueueingRecordSink;
+use walshadow::record::{CollectingSegmentSink, CountingRecordSink, Record, RecordSink, SinkError};
 use walshadow::rewrite::compute_crc;
 use walshadow::shadow_stream::{ShadowStreamSink, ShadowStreamState};
-use walshadow::wal_stream::{
-    CollectingSegmentSink, CountingRecordSink, Record, RecordSink, SinkError, WalStream,
-};
+use walshadow::wal_stream::WalStream;
 
 /// 8 KiB single-page segments. Multi-page WAL needs proper short page
 /// headers between every PAGE_SIZE boundary; for a benchmark we keep
@@ -160,7 +159,7 @@ async fn run_case(
     records: u64,
     iterations: usize,
     record_sink: &mut (dyn RecordSink + Send),
-    bytes_sink: Option<Box<dyn walshadow::wal_stream::RecordBytesSink + Send>>,
+    bytes_sink: Option<Box<dyn walshadow::record::RecordBytesSink + Send>>,
 ) {
     let mut stream = WalStream::new(1, SEG_SIZE, 0).unwrap();
     if let Some(bs) = bytes_sink {
@@ -223,7 +222,7 @@ async fn pump_throughput_breakdown() {
             64 * 1024 * 1024,
         )));
         let mut sink = CounterSink::default();
-        let bs: Box<dyn walshadow::wal_stream::RecordBytesSink + Send> =
+        let bs: Box<dyn walshadow::record::RecordBytesSink + Send> =
             Box::new(ShadowStreamSink::new(state.clone()));
         run_case(
             "counter + shadow bytes_sink",
@@ -273,7 +272,7 @@ async fn pump_throughput_breakdown() {
             counter: counter.clone(),
         };
         let mut queueing = QueueingRecordSink::spawn(inner, 256, 16_384, None);
-        let bs: Box<dyn walshadow::wal_stream::RecordBytesSink + Send> =
+        let bs: Box<dyn walshadow::record::RecordBytesSink + Send> =
             Box::new(ShadowStreamSink::new(state.clone()));
         run_case(
             "queueing(counter) + shadow",

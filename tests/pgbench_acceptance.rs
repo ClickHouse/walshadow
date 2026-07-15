@@ -520,7 +520,7 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
         let target_lsn_text =
             psql_source(&source, "SELECT pg_current_wal_lsn()::text").context("read source LSN")?;
         let target_lsn =
-            walshadow::shadow::parse_pg_lsn(&target_lsn_text).context("parse source LSN")?;
+            walshadow::pg::parse_pg_lsn(&target_lsn_text).context("parse source LSN")?;
         wait_for_ack_catchup(metrics_addr, target_lsn, Duration::from_secs(60))
             .context("emitter ack catchup")?;
 

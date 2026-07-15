@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use walshadow::ch_emitter::{CompressionChoice, EmitterConfig, EmitterStats};
+use walshadow::ch::CompressionChoice;
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::pipeline::Fatal;
 use walshadow::pipeline::tail;
 

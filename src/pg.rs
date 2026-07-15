@@ -3,6 +3,31 @@
 use tokio_postgres::Client;
 use tokio_postgres::types::{FromSql, PgLsn, Type};
 
+pub use walrus::pg::backup::parse_pg_lsn;
+
+pub fn parse_array_one_element(raw: &str) -> Option<String> {
+    let inner = raw.strip_prefix('{')?.strip_suffix('}')?;
+    if inner.is_empty() || inner == "NULL" {
+        return None;
+    }
+    let Some(rest) = inner.strip_prefix('"') else {
+        return Some(inner.to_owned());
+    };
+    let mut output = String::with_capacity(rest.len());
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '"' => return chars.next().is_none().then_some(output),
+            '\\' => output.push(chars.next()?),
+            character => output.push(character),
+        }
+    }
+}
+
+pub fn socket_conninfo(socket_dir: &str, port: u16, user: &str, dbname: &str) -> String {
+    format!("host={socket_dir} port={port} user={user} dbname={dbname}")
+}
+
 /// PG identifier: double-quoted, embedded quotes doubled.
 pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))

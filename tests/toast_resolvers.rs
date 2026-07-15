@@ -25,10 +25,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::mapping::ToastMode;
 use walshadow::spill::ToastDelete;
 use walshadow::toast::{
-    ChunkStore, ChunkStoreError, ClickHouseChunkStore, FetchedValue, ToastMode, ToastResolver,
-    ToastRow,
+    ChunkStore, ChunkStoreError, ClickHouseChunkStore, FetchedValue, ToastResolver, ToastRow,
 };
 
 fn assembled(body: &[u8]) -> FetchedValue {

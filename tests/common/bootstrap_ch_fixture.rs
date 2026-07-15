@@ -24,9 +24,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use walshadow::ch_emitter::TableTarget;
+use walshadow::mapping::TableTarget;
+use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
-use walshadow::shadow_catalog::RelName;
 
 /// ClickHouse server subprocess wrapper shared by the pipeline DDL
 /// drill, both bootstrap-to-CH drills, and the

@@ -8,10 +8,10 @@ mod fx;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use walshadow::ch_emitter::ColumnMapping;
-use walshadow::ch_emitter::TableTarget;
+use walshadow::mapping::ColumnMapping;
+use walshadow::mapping::TableTarget;
+use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
-use walshadow::shadow_catalog::RelName;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
 const SLOT_BASIC: PortSlot = PortSlot {

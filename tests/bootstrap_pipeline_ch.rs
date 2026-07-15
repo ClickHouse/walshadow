@@ -25,14 +25,13 @@ use std::time::Duration;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
-use walshadow::ch_emitter::{
-    ColumnMapping, CompressionChoice, EmitterConfig, EmitterStats, MappingHandle, TableMapping,
-    TableTarget,
-};
+use walshadow::ch::CompressionChoice;
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::heap_decoder::ColumnValue;
+use walshadow::mapping::{ColumnMapping, MappingHandle, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::BatcherMsg;
 use walshadow::pipeline::{Fatal, bootstrap, tail};
-use walshadow::shadow_catalog::{RelAttr, RelDescriptor, RelName, ReplIdent};
+use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 use walshadow::toast::ToastResolver;
 
 const CH_TCP_PORT: u16 = 17571;

@@ -31,9 +31,9 @@ mod fx;
 
 use std::time::Duration;
 
-use walshadow::ch_emitter::ColumnMapping;
-use walshadow::ch_emitter::TableTarget;
-use walshadow::shadow_catalog::RelName;
+use walshadow::mapping::ColumnMapping;
+use walshadow::mapping::TableTarget;
+use walshadow::schema::RelName;
 
 // +0 / +10 shift per test. CH interserver_http_port = http_port + 1, so
 // leave a 5-port gap between CH_HTTP_PORT and WALSENDER_PORT.

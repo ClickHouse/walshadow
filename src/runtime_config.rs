@@ -21,8 +21,8 @@
 
 use std::collections::HashMap;
 
-use crate::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
-use crate::shadow_catalog::{RelDescriptor, RelName};
+use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
+use crate::schema::{RelDescriptor, RelName};
 
 pub const CONFIG_GLOBAL: &str = "config_global";
 pub const CONFIG_NAMESPACE: &str = "config_namespace";
@@ -80,7 +80,7 @@ pub struct TableRow {
     /// leaves scope unchanged (legacy target-override-only behavior).
     pub replicate: Option<bool>,
     /// One-time backfill mode for pre-opt-in rows, raw ([`InitialLoadMode`]
-    /// parses at dispatch in [`crate::opt_in`], validate-late like every
+    /// parses at dispatch in [`crate::backfill::opt_in`], validate-late like every
     /// overlay value); absent / `none` streams from opt-in LSN.
     pub initial_load: Option<String>,
 }
@@ -90,7 +90,7 @@ pub struct TableRow {
 pub enum InitialLoadMode {
     /// No backfill, stream from opt-in LSN only.
     None,
-    /// Snapshot-free COPY at `_lsn = S` ([`crate::copy_backfill`]).
+    /// Snapshot-free COPY at `_lsn = S` ([`crate::backfill::copy_backfill`]).
     Copy,
     /// Fresh `BASE_BACKUP` page-walk filtered to the opted-in rels
     /// (plans/add_table.md).
@@ -129,7 +129,7 @@ pub struct ColumnRow {
 }
 
 /// One applied config change, interpreted from a config-table heap write and
-/// carried through [`crate::xact_buffer::DrainEntry::Config`] to apply at the
+/// carried through [`crate::xact::xact_buffer::DrainEntry::Config`] to apply at the
 /// row's commit LSN.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigEvent {
@@ -358,8 +358,8 @@ pub fn interpret(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
-    use crate::shadow_catalog::{RelAttr, RelDescriptor, ReplIdent};
+    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
+    use crate::schema::{RelAttr, RelDescriptor, ReplIdent};
     use walrus::pg::walparser::RelFileNode;
 
     fn attr(attnum: i16, name: &str, type_oid: u32) -> RelAttr {
