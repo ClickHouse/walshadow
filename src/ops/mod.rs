@@ -1,3 +1,4 @@
+pub mod control;
 pub mod metrics;
 pub mod oracle;
 pub mod preflight;

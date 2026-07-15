@@ -9,11 +9,12 @@
 //! mutated live by [`ConfigResolver::apply_config_event`] as config-table WAL
 //! writes drain at their commit LSN. `resolve` is the single merge point.
 //!
-//! Connection params (`[ch] host/port/...`) and TOAST stay boot-only fixed
-//! points on [`EmitterConfig`]. Everything the operator tunes lives on
-//! `ResolvedConfig` and reloads live: per-relation mapping, per-namespace
-//! defaults, drop-table strategy, and the emitter batch/compression/retry
-//! knobs (read live by the batcher + inserter off the watch channel).
+//! Everything the operator tunes lives on `ResolvedConfig` and reloads live:
+//! per-relation mapping, per-namespace defaults, drop-table strategy, the
+//! emitter batch/compression/retry knobs, the CH connection, and the
+//! columns-less table opt-ins — all read off the watch channel (batcher,
+//! inserter, DDL applicator, reorder coordinator). Only TOAST + the source
+//! connection stay boot-only.
 //!
 //! **Storage: in-memory.** The overlay is a derived cache — re-seeded from PG
 //! then caught up by WAL replay on restart — so it holds no checkpoint. The
@@ -68,6 +69,18 @@ pub struct ResolvedConfig {
     pub compression: CompressionChoice,
     /// CH client retry budget (live: inserter reads per attempt loop)
     pub retry_max_attempts: u32,
+    /// CH connection (live: inserter + DDL applicator reconnect on change).
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    pub secure: bool,
+    /// Columns-less `[table.*]` opt-in intents (live: reorder coordinator
+    /// applies the add/remove diff at a commit barrier).
+    pub table_opt_ins: HashMap<RelName, TableRow>,
+    /// `[stream] paused` (live: pump idles when true).
+    pub paused: bool,
 }
 
 impl Default for ResolvedConfig {
@@ -144,6 +157,9 @@ struct MergeInputs {
 pub struct ConfigResolver {
     /// `--ch-config`; `None` disables reload (nothing to re-read)
     toml_path: Option<PathBuf>,
+    /// CLI-arg `[source]` base layer, merged under the file on reload (matches
+    /// boot's `load_effective`).
+    cli_source_base: toml::Table,
     cli: CliOverrides,
     inner: Mutex<MergeInputs>,
     tx: watch::Sender<Arc<ResolvedConfig>>,
@@ -175,6 +191,7 @@ impl ConfigResolver {
         base: &EmitterConfig,
         cli: CliOverrides,
         toml_path: Option<PathBuf>,
+        cli_source_base: toml::Table,
         mapping: MappingHandle,
         invalidation_epoch: Arc<AtomicU64>,
     ) -> (Arc<Self>, watch::Receiver<Arc<ResolvedConfig>>) {
@@ -184,6 +201,7 @@ impl ConfigResolver {
         let (tx, rx) = watch::channel(Arc::new(initial));
         let this = Arc::new(Self {
             toml_path,
+            cli_source_base,
             cli,
             inner: Mutex::new(MergeInputs {
                 base: base.clone(),
@@ -447,6 +465,14 @@ impl ConfigResolver {
             flush_timeout: base.flush_timeout,
             compression: base.compression,
             retry_max_attempts: base.retry.max_attempts,
+            host: base.host.clone(),
+            port: base.port,
+            database: base.database.clone(),
+            user: base.user.clone(),
+            password: base.password.clone(),
+            secure: base.secure,
+            table_opt_ins: base.table_opt_ins.clone(),
+            paused: base.paused,
         };
 
         // Runtime-derived layers (before the overlay target loop so a
@@ -609,16 +635,16 @@ impl ConfigResolver {
         (rc, rejections)
     }
 
-    /// Re-read TOML (SIGHUP), re-merge with overlay + CLI, publish. Connection
-    /// params in the reloaded file are ignored — boot-only. Parse / read
-    /// errors surface to the caller and leave the last snapshot in effect
-    /// (watch retains it; no send on failure).
+    /// Re-read the config (base `--ch-config` + conf.d, CLI-source base under
+    /// it), re-merge with overlay + CLI, publish. Carries the CH connection +
+    /// table opt-ins live; the source connection isn't in scope here. Parse /
+    /// read errors surface to the caller and leave the last snapshot in effect.
     pub async fn reload(&self) -> Result<(), EmitterError> {
         let Some(path) = &self.toml_path else {
             return Ok(());
         };
-        let toml = tokio::fs::read_to_string(path).await?;
-        let base = EmitterConfig::from_toml_str(&toml)?;
+        let merged = crate::ch_emitter::load_effective(path, self.cli_source_base.clone()).await?;
+        let base = EmitterConfig::from_table(&merged)?;
         let mut inner = self.inner.lock().await;
         inner.base = base;
         self.republish(&inner).await;
@@ -954,6 +980,7 @@ mod tests {
             &base,
             CliOverrides::default(),
             None,
+            toml::Table::new(),
             mapping.clone(),
             epoch.clone(),
         );
@@ -980,8 +1007,14 @@ mod tests {
         )
         .unwrap();
         let (mapping, epoch) = dummy_handles();
-        let (resolver, mut rx) =
-            ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping.clone(),
+            epoch,
+        );
         let rel = RelName::new("public", "events");
         assert!(rx.borrow().tables.contains_key(&rel));
         resolver.exclude_table(&rel).await;
@@ -998,8 +1031,14 @@ mod tests {
     async fn derived_mapping_survives_republish() {
         let base = base_with("retain");
         let (mapping, epoch) = dummy_handles();
-        let (resolver, mut rx) =
-            ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping.clone(),
+            epoch,
+        );
         let rel = RelName::new("public", "auto");
         resolver
             .register_derived_mapping(
@@ -1032,8 +1071,14 @@ mod tests {
     async fn forget_reparks_opt_in_row_as_pending_decl() {
         let base = base_with("drop");
         let (mapping, epoch) = dummy_handles();
-        let (resolver, _rx) =
-            ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        let (resolver, _rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping.clone(),
+            epoch,
+        );
         let rel = RelName::new("public", "events");
         resolver
             .apply_config_event(ConfigEvent::TableUpserted {
@@ -1068,8 +1113,14 @@ mod tests {
         )
         .unwrap();
         let (mapping, epoch) = dummy_handles();
-        let (resolver, _rx) =
-            ConfigResolver::new(&base, CliOverrides::default(), None, mapping.clone(), epoch);
+        let (resolver, _rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping.clone(),
+            epoch,
+        );
         let mut desc = rel_desc("public", "events");
         desc.attributes.push(RelAttr {
             attnum: 2,
@@ -1199,8 +1250,14 @@ mod tests {
         use crate::runtime_config::ColumnRow;
         let base = base_with("retain");
         let (mapping, epoch) = dummy_handles();
-        let (resolver, mut rx) =
-            ConfigResolver::new(&base, CliOverrides::default(), None, mapping, epoch);
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping,
+            epoch,
+        );
         let upsert = |ty: &str| ConfigEvent::ColumnUpserted {
             rel: RelName::new("public", "t"),
             attname: "amount".into(),
@@ -1242,8 +1299,14 @@ mod tests {
     async fn pending_decl_parks_and_takes() {
         let base = base_with("retain");
         let (mapping, epoch) = dummy_handles();
-        let (resolver, _rx) =
-            ConfigResolver::new(&base, CliOverrides::default(), None, mapping, epoch);
+        let (resolver, _rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping,
+            epoch,
+        );
         let rel = RelName::new("app", "later");
         resolver
             .park_pending_decl(rel.clone(), TableRow::default())
@@ -1258,8 +1321,14 @@ mod tests {
     async fn seed_and_apply_republish() {
         let base = base_with("retain");
         let (mapping, epoch) = dummy_handles();
-        let (resolver, mut rx) =
-            ConfigResolver::new(&base, CliOverrides::default(), None, mapping, epoch);
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping,
+            epoch,
+        );
         assert_eq!(rx.borrow().drop_table_strategy, "retain");
 
         let overlay = ConfigOverlay {
@@ -1284,8 +1353,14 @@ mod tests {
     async fn reload_without_path_is_noop() {
         let base = base_with("retain");
         let (mapping, epoch) = dummy_handles();
-        let (resolver, rx) =
-            ConfigResolver::new(&base, CliOverrides::default(), None, mapping, epoch);
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping,
+            epoch,
+        );
         resolver.reload().await.unwrap();
         assert_eq!(rx.borrow().drop_table_strategy, "retain");
     }

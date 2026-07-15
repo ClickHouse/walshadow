@@ -118,8 +118,8 @@ pub struct DdlApplicator {
     /// and the future overlay retarget DDL without a restart.
     config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     mapping: MappingHandle,
-    /// Reconnect params, cloned at boot. SIGHUP reloads DDL knobs not
-    /// connection params, so a reconnect re-dials the boot endpoint.
+    /// Reconnect params; `refresh_config` updates the connection fields live
+    /// from a republished snapshot and re-dials on change.
     conn_cfg: EmitterConfig,
     retry: RetryConfig,
     /// Per-attempt cap (shares `EmitterConfig::insert_timeout`); a
@@ -199,21 +199,52 @@ impl DdlApplicator {
     /// strategy). `target_database` + `soft_delete` are boot-only, so they
     /// carry over. No-op until the resolver sends a new value; called at
     /// each apply so DDL runs against the current config.
-    fn refresh_config(&mut self) {
-        if self.config_rx.has_changed().unwrap_or(false) {
+    async fn refresh_config(&mut self) -> Result<(), EmitterError> {
+        if !self.config_rx.has_changed().unwrap_or(false) {
+            return Ok(());
+        }
+        let (cfg, conn) = {
             let snap = self.config_rx.borrow_and_update();
-            self.config = DdlConfig::from_resolved(
+            let cfg = DdlConfig::from_resolved(
                 &snap,
                 self.config.target_database.clone(),
                 self.config.soft_delete,
             );
+            let conn = (
+                snap.host.clone(),
+                snap.port,
+                snap.database.clone(),
+                snap.user.clone(),
+                snap.password.clone(),
+                snap.secure,
+            );
+            (cfg, conn)
+        };
+        self.config = cfg;
+        let (host, port, database, user, password, secure) = conn;
+        if host != self.conn_cfg.host
+            || port != self.conn_cfg.port
+            || database != self.conn_cfg.database
+            || user != self.conn_cfg.user
+            || password != self.conn_cfg.password
+            || secure != self.conn_cfg.secure
+        {
+            self.conn_cfg.host = host;
+            self.conn_cfg.port = port;
+            self.conn_cfg.database = database;
+            self.conn_cfg.user = user;
+            self.conn_cfg.password = password;
+            self.conn_cfg.secure = secure;
+            self.client = connect_client(&self.conn_cfg).await?;
+            self.last_used = std::time::Instant::now();
         }
+        Ok(())
     }
 
     /// Errors propagate; the worker task turns them into
     /// `DecoderSinkError` so the daemon poisons the stream cleanly.
     pub async fn apply(&mut self, event: &SchemaEvent) -> Result<(), EmitterError> {
-        self.refresh_config();
+        self.refresh_config().await?;
         match event {
             SchemaEvent::Added { desc } => self.apply_added(desc).await,
             SchemaEvent::Changed { old, new, diff } => self.apply_changed(old, new, diff).await,
@@ -275,7 +306,7 @@ impl DdlApplicator {
     /// has no bridgeable shape (nothing created; caller should not map it).
     /// Idempotent: `IF NOT EXISTS` no-ops a re-create.
     pub async fn ensure_ch_table(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
-        self.refresh_config();
+        self.refresh_config().await?;
         let target_db = self
             .config
             .target_database_for(&desc.rel_name.namespace)
