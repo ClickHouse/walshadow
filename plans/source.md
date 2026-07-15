@@ -70,20 +70,16 @@ re-establishes a dropped replication connection (e.g. source
 `resume_lsn = stream.next_lsn()` — the byte-contiguous resume point, never
 `dispatched_lsn` (which lags by any buffered in-progress record →
 misaligned push). `reconnect` is one attempt; the caller
-(`reconnect_or_fatal`) drives `backon` exponential-backoff retry to ride
-out a transient drop until the source returns. A recycled segment (SQLSTATE
-`58P01`, classified by `is_wal_segment_removed` on the code, not the
-locale-dependent message → typed `WalSegmentRemoved`) stops the retry and
-is **fatal** *mid-stream*: the resume point is gone, so the daemon exits, not
-an in-place reconnect. On the next boot the resume decision
-(`resume_plan::resolve`, see [bootstrap.md](bootstrap.md)) recovers it —
-`Refill` replaying the gap from the `[backup]` archive when one is configured,
-else a `Fresh` re-seed. The slot + `flush_lsn` cap make this recycle path an
-edge (slot `lost` / dropped / source disk full), not the normal CH-stall
-path.
-
-`SourceFeed::slot_restart_lsn(name)` is the boot oracle for that decision: the
-physical slot's `restart_lsn` (oldest WAL the source still retains)
+(`recover_source`) tries `[backup]` archive first, then drives `backon`
+exponential-backoff reconnect once archive lacks next segment. Archived full
+segments pass through same `WalStream` + sinks, preserving contiguous filter,
+shadow, and CH state. Reconnect starts at exact `stream.next_lsn()`. A recycled
+segment (SQLSTATE `58P01`, classified by `is_wal_segment_removed` on code, not
+locale-dependent message → typed `WalSegmentRemoved`) stops retry. Failure
+from both sources exits without re-bootstrap; operator decides whether to
+refresh from base backup. Slot + `flush_lsn` cap make this path an edge (slot
+`lost` / dropped / source disk full), not normal CH-stall path. See
+[bootstrap.md](bootstrap.md) restart contract.
 
 TLS / SCRAM via wal-rus's
 `walrus::pg::replication::tls`: modes `disable / allow
@@ -407,10 +403,10 @@ batch_size, capacity)`); open `WalStream` + `DirSegmentSink`, attach
 handler, retention sweeper, cursor write loop; ensure the configured physical slot before pre-flight; wait for walsender
 connect barrier; pump loop: `feed.next_chunk()` → `stream.push(lsn,
 bytes, &mut record_sink, &mut segment_sink)` → cursor advance → status
-update → repeat. A `next_chunk` error routes through `reconnect_or_fatal`:
-transient drop → `SourceFeed::reconnect` at `stream.next_lsn()`; recycled
-segment (`58P01`) → fatal exit (re-seed via config `initial_load` on
-restart)
+update → repeat. A `next_chunk` error routes through `recover_source`:
+archive replay first when `[backup]` exists, then `SourceFeed::reconnect` at
+`stream.next_lsn()` when archive lacks next segment. Missing WAL in both
+sources exits for operator resolution, never automatic base backup
 
 `DecoderXactPair` order is fixed: decoder absorbs heap record into xact
 buffer *before* xact_drain flushes matching commit/abort.

@@ -81,9 +81,10 @@ secret_key = "…"
 credentials_path = "/gcs-sa.json"      # gcs, optional
 ```
 
-Omitting the section leaves `EmitterConfig.backup = None`: object-store
-bootstrap/backfill error out, and a recycled resume point can only re-seed
-`Fresh` (no `Refill`) — see [bootstrap.md](bootstrap.md) boot resume decision.
+Omitting section leaves `EmitterConfig.backup = None`: object-store
+bootstrap/backfill error out, and source WAL removal stops restart with an
+operator-actionable error. Daemon never substitutes a fresh base backup for
+missing archive coverage. See [bootstrap.md](bootstrap.md) restart contract.
 
 ## `<schema>.config_*` tables
 

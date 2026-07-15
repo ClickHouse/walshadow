@@ -69,40 +69,28 @@ for rendered diagram. Five clusters top→bottom:
 Phases 1-3 run synchronously inside `run_bootstrap`; phases 4-5 hand off
 to daemon's main loop
 
-## Boot resume decision
+## Restart contract
 
-Whether the five-phase greenfield above runs at all is a boot-time choice,
-not a boolean. `resume_plan::resolve` (`src/resume_plan.rs`) folds the durable
-cursor, the shadow data-dir state, and live source state into one of three
-outcomes:
+Presence of `PG_VERSION` in shadow data dir separates initial bootstrap from
+restart. Uninitialized dir with bootstrap enabled runs five greenfield phases.
+Initialized dir always resumes in place and never triggers a base backup.
+Missing cursor on initialized dir is an error unless operator supplies
+`--start-lsn`. To request fresh base backup, operator provides empty or new
+shadow data dir; `--ignore-cursor` alone does not replace initialized state.
 
-- **`Fresh`** — no usable prior state (no cursor, `--ignore-cursor`, or the
-  shadow dir isn't initialized): run the five-phase greenfield.
-- **`Resume { start_lsn }`** — a physical slot still pins the WAL we need
-  (`restart_lsn <= resume_lsn`): skip bootstrap, plain `START_REPLICATION` at
-  the cursor.
-- **`Refill { from, to }`** — the source recycled `[resume_lsn, head]` and a
-  `[backup]` archive is configured: replay archived WAL through the pump, then
-  rejoin live.
+Resume uses same source order as standby recovery:
 
-A recycled resume point with no archive to refill from falls back to `Fresh`.
-There is no automatic partial re-seed — an operator resets explicitly with
-`--ignore-cursor`.
+1. Try `START_REPLICATION` at segment-aligned cursor LSN
+2. On source failure, fetch consecutive segments from `[backup]` archive and
+   replay them through live filter + decode sinks
+3. When archive lacks next segment, try `START_REPLICATION` again at exact
+   `stream.next_lsn()` handoff
+4. If source reports removed WAL (`58P01`) and archive cannot cover handoff,
+   exit without modifying shadow baseline; base-backup refresh remains
+   operator action
 
-Inputs: `resume_lsn` is the durable `cursor.emitter_ack_lsn` as
-`Option<NonZeroU64>` (LSN `0/0` is invalid → `None` → no cursor);
-`shadow_initialized` is `PG_VERSION` present in the shadow data dir; `head` is
-source `IDENTIFY_SYSTEM.xlogpos`; `slot_restart_lsn` is the physical slot's
-oldest retained LSN (`SourceFeed::slot_restart_lsn`, see [source.md](source.md));
-`archive_configured` is whether `[backup]` is set. `bootstrap_off`
-(`--bootstrap-mode off`, shadow externally managed) can never reach `Fresh` —
-it degrades to `Resume`/`Refill` only.
-
-`Refill` replays `[from, handoff)` (segment-aligned) from the archive through
-the same `stream` + sinks the live loop uses — shadow catches up via
-`restore_command`, rows decode to CH — before `START_REPLICATION` picks up
-contiguously at the handoff LSN. A missing segment is a hard error → operator
-re-seeds. The archive is the `[backup]` config (see [config.md](config.md)).
+Same recovery path handles initial attach and mid-stream reconnect. Archive is
+`[backup]` config described in [config.md](config.md).
 
 ## BackupSource trait
 

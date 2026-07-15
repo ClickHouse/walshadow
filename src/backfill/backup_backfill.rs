@@ -533,7 +533,7 @@ fn unresolvable_multixact(t: &BackfillTuple) -> String {
 /// Fetch archive WAL covering `[from, to]` on `timeline` into `seg_dir`.
 /// A missing segment (archive gap, or the archive switched timelines) errors
 /// through wal-rus's `fetch::handle`. Exposed for whole-instance boot refill
-/// (see the `refill_from_archive` path in the stream binary).
+/// (see archive recovery path in stream binary).
 pub async fn fetch_gap_segments(
     settings: &walrus::config::Settings,
     storage: &walrus::storage::DynStorage,

@@ -62,7 +62,7 @@ in-xact maps then as-of mirror fetch.
 
 Side-by-side columns: A. clean SIGTERM, B. kill -9 mid-stream
 (validated by `tests/kill_restart.rs` drill), C. WAL overflow →
-re-bootstrap. Includes cursor.bin six-field reference table.
+source/archive/source fallback or operator resolution. Includes cursor.bin six-field reference table.
 `toast_retires.bin` survives xid-spill cleanup and flushes due mirror
 retirements from persisted resume floor at standup.
 
