@@ -1,5 +1,5 @@
 [workspace]
-members = ["clickhouse-c-rs", "bench"]
+members = ["clickhouse-c-rs", "bench", "walshadow-peerdb"]
 
 [package]
 name = "walshadow"

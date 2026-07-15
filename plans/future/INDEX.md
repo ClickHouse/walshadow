@@ -16,6 +16,7 @@ surface; promote into `plans/` once built
 * [coverage100.md](coverage100.md) — drive `cargo llvm-cov` line coverage toward 100%: tiered work list (pure units → fixtures → live e2e → hard tail)
 * [FUZZ.md](FUZZ.md) — continuous coverage-guided fuzzing (cargo-fuzz/libFuzzer) across wal-rus + walshadow + clickhouse-c-rs: tiered targets, round-trip/differential oracles, C-boundary ASan, unattended-VM supervisor
 * [pipeline_backpressure_and_scaling.md](pipeline_backpressure_and_scaling.md) — parallel decode+insert pipeline: WAL-pump backpressure via wire/record split, decode/insert scaling (bootstrap Option B, hot-table sharding, N/M sizing); pipeline substrate in [emitter.md](../emitter.md)
+* [peerdb.md](peerdb.md) — `walshadow-peerdb/` crate: PeerDB flow HTTP API shim translating onto the control daemon's unix-socket protocol; endpoint map, accept-&-ignore surface, control-protocol extensions
 * [dependencies.md](dependencies.md) — crates.io replacement candidates for generic object storage, MPMC, retry, throttling, and metrics code
 * [risks.md](risks.md) — measurement-deferred risks and open questions
 * [parked.md](parked.md) — small operational polish + cross-major fixtures + skipped-test drive

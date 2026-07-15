@@ -1,0 +1,34 @@
+[package]
+name = "walshadow-peerdb"
+version = "0.1.0"
+edition = "2024"
+description = "PeerDB flow HTTP API shim: grpc-gateway JSON surface translated onto walshadow-control's unix-socket line protocol"
+license = "AGPL-3.0-only"
+
+# Thin translator: PeerDB clients on one side, walshadow-control's unix
+# socket on the other. Owns zero replication logic; pulls in none of
+# walshadow's WAL / native-protocol dependencies.
+[[bin]]
+name = "walshadow-peerdb"
+path = "src/main.rs"
+
+[lib]
+name = "walshadow_peerdb"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "fs", "sync", "io-util", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+[dev-dependencies]
+tempfile = "3"
