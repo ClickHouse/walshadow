@@ -2126,6 +2126,28 @@ mod tests {
         assert!(c.soft_delete);
     }
 
+    #[test]
+    fn namespace_toml_parses_auto_create() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [namespace.s1]\n\
+             auto_create = true\n\
+             [namespace.s2]\n\
+             auto_create = false\n\
+             [namespace.s3]\n\
+             target_database = \"warehouse\"\n",
+        )
+        .unwrap();
+        assert!(c.namespaces["s1"].auto_create, "explicit true");
+        assert!(!c.namespaces["s2"].auto_create, "explicit false");
+        // Key absent defaults off (unwrap_or(false)).
+        assert!(!c.namespaces["s3"].auto_create, "absent defaults off");
+        assert_eq!(
+            c.namespaces["s3"].target_database.as_deref(),
+            Some("warehouse")
+        );
+    }
+
     /// Dotted names stay inside their TOML key level: schema `a.b` table `c`
     /// and schema `a` table `b.c` are distinct rels, distinct targets.
     #[test]

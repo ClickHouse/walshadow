@@ -792,6 +792,92 @@ mod tests {
         );
     }
 
+    fn auto_create_set(
+        base: &EmitterConfig,
+        overlay: &ConfigOverlay,
+    ) -> std::collections::HashSet<String> {
+        use crate::emit::ch_ddl::DdlConfig;
+        let (r, _) = ConfigResolver::resolve(
+            base,
+            overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &HashMap::new(),
+        );
+        DdlConfig::from_resolved(&r, "db".into(), false).auto_create_namespaces
+    }
+
+    #[test]
+    fn ddl_config_auto_create_from_toml() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n[namespace.s1]\nauto_create = true\n[namespace.s2]\nauto_create = false\n",
+        )
+        .unwrap();
+        let ns = auto_create_set(&base, &ConfigOverlay::default());
+        assert!(ns.contains("s1"), "TOML auto_create=true enables");
+        assert!(!ns.contains("s2"), "TOML auto_create=false stays off");
+    }
+
+    #[test]
+    fn ddl_config_auto_create_from_overlay() {
+        // No TOML namespace; the overlay alone turns it on.
+        let base = base_with("retain");
+        let mut overlay = ConfigOverlay::default();
+        overlay.namespaces.insert(
+            "s1".into(),
+            NamespaceRow {
+                auto_create: Some(true),
+                ..Default::default()
+            },
+        );
+        let ns = auto_create_set(&base, &overlay);
+        assert!(ns.contains("s1"), "overlay auto_create=true enables");
+    }
+
+    #[test]
+    fn overlay_auto_create_overrides_toml() {
+        // TOML false, overlay true → enabled.
+        let base =
+            EmitterConfig::from_toml_str("[ch]\n[namespace.s1]\nauto_create = false\n").unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.namespaces.insert(
+            "s1".into(),
+            NamespaceRow {
+                auto_create: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(
+            auto_create_set(&base, &overlay).contains("s1"),
+            "overlay true beats TOML false"
+        );
+
+        // TOML true, overlay false → disabled.
+        let base =
+            EmitterConfig::from_toml_str("[ch]\n[namespace.s1]\nauto_create = true\n").unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.namespaces.insert(
+            "s1".into(),
+            NamespaceRow {
+                auto_create: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !auto_create_set(&base, &overlay).contains("s1"),
+            "overlay false beats TOML true"
+        );
+    }
+
+    #[test]
+    fn ddl_config_no_auto_create_when_unset() {
+        let base = base_with("retain");
+        assert!(
+            auto_create_set(&base, &ConfigOverlay::default()).is_empty(),
+            "no source sets auto_create → empty set"
+        );
+    }
+
     fn rel_desc(namespace: &str, name: &str) -> RelDescriptor {
         use crate::schema::{RelAttr, ReplIdent};
         use walrus::pg::walparser::RelFileNode;
