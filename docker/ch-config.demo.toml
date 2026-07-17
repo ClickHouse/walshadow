@@ -26,16 +26,17 @@ compression = "lz4"
 # pgbench's hundreds of xact/s.
 flush_timeout_ms = 200
 
-[table."demo.users"]
-target = "demo.users"
+# [table.<namespace>.<relname>]; destination defaults to
+# [ch] database + source relname, override via target_database / target_table
+[table.demo.users]
 columns = [
     { attnum = 1, target = "id",    type = "UInt64" },
     { attnum = 2, target = "name",  type = "String" },
     { attnum = 3, target = "email", type = "String" },
 ]
 
-[table."public.pgbench_accounts"]
-target = "demo.pgbench_accounts"
+[table.public.pgbench_accounts]
+target_database = "demo"
 columns = [
     { attnum = 1, target = "aid",      type = "Int32"  },
     { attnum = 2, target = "bid",      type = "Int32"  },
@@ -43,16 +44,16 @@ columns = [
     { attnum = 4, target = "filler",   type = "String" },
 ]
 
-[table."public.pgbench_branches"]
-target = "demo.pgbench_branches"
+[table.public.pgbench_branches]
+target_database = "demo"
 columns = [
     { attnum = 1, target = "bid",      type = "Int32" },
     { attnum = 2, target = "bbalance", type = "Int32" },
     { attnum = 3, target = "filler",   type = "Nullable(String)" },
 ]
 
-[table."public.pgbench_tellers"]
-target = "demo.pgbench_tellers"
+[table.public.pgbench_tellers]
+target_database = "demo"
 columns = [
     { attnum = 1, target = "tid",      type = "Int32" },
     { attnum = 2, target = "bid",      type = "Int32" },
@@ -60,8 +61,8 @@ columns = [
     { attnum = 4, target = "filler",   type = "Nullable(String)" },
 ]
 
-[table."public.pgbench_history"]
-target = "demo.pgbench_history"
+[table.public.pgbench_history]
+target_database = "demo"
 columns = [
     { attnum = 1, target = "tid",    type = "Int32" },
     { attnum = 2, target = "bid",    type = "Int32" },

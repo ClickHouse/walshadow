@@ -11,8 +11,9 @@ password = ""
 compression = "lz4"
 # soft_delete = true
 
-[table."demo.users"]
-target = "demo.users"
+# [table.<namespace>.<relname>]; destination defaults to
+# [ch] database + source relname, override via target_database / target_table
+[table.demo.users]
 columns = [
     { attnum = 1, target = "id",    type = "UInt64" },
     { attnum = 2, target = "name",  type = "String" },
