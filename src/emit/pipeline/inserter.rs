@@ -22,7 +22,7 @@ use crate::ch::{
     reconnect_if_idle, with_timeout,
 };
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, append_buf};
+use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, build_leaves, build_roots};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatchMeta, InsertBatch};
@@ -140,28 +140,30 @@ impl Inserter {
                 .asts
                 .remove(&batch.meta.table_key)
                 .expect("ensure_asts inserted");
-            let result = match BlockBuilder::new(self.alloc) {
-                Ok(mut bb) => {
-                    let mut build_err = None;
-                    for (i, col) in batch.meta.columns.iter().enumerate() {
-                        if let Err(e) = append_buf(
-                            &mut bb,
-                            &col.name,
-                            &asts[i],
-                            &batch.buffers[i],
-                            batch.n_rows,
-                        ) {
-                            build_err = Some(e);
-                            break;
-                        }
-                    }
-                    if let Some(e) = build_err {
-                        Err(e)
-                    } else {
-                        self.send_with_retry(&batch.meta.insert_sql, &bb).await
-                    }
+            let result = 'send: {
+                let leaves = match build_leaves(&batch.buffers, batch.n_rows) {
+                    Ok(v) => v,
+                    Err(e) => break 'send Err(e),
+                };
+                let roots = match build_roots(&leaves, &batch.buffers) {
+                    Ok(v) => v,
+                    Err(e) => break 'send Err(e),
+                };
+                let mut bb = BlockBuilder::new();
+                let appended: Result<(), EmitterError> = batch
+                    .meta
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .try_for_each(|(i, col)| {
+                        let node = roots[i].as_ref().unwrap_or(&leaves[i]);
+                        bb.append(&col.name, asts[i].view(), node)
+                            .map_err(Into::into)
+                    });
+                match appended {
+                    Ok(()) => self.send_with_retry(&batch.meta.insert_sql, &bb).await,
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e.into()),
             };
             self.asts
                 .insert(batch.meta.table_key.clone(), (epoch, asts));

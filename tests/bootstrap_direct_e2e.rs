@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::SslMode;
+use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -147,6 +147,7 @@ async fn direct_source_self_hosted_via_replication_protocol() {
         database: "postgres".into(),
         application_name: "walshadow-bootstrap-direct".into(),
         sslmode: SslMode::Disable,
+        tls: TlsParams::default(),
     };
     let opts = BaseBackupOpts {
         label: "bootstrap-direct".into(),

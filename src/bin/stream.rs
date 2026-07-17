@@ -41,7 +41,7 @@ use tokio_postgres::types::PgLsn;
 use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::SslMode;
+use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -494,6 +494,8 @@ async fn run(args: Args) -> Result<()> {
         database: args.dbname.clone(),
         application_name: "walshadow".into(),
         sslmode,
+        // Cert/key material rides PGSSL* env, matching libpq (--sslmode doc)
+        tls: TlsParams::resolve(&walrus::config::Vars::default()),
     };
     let mut feed = SourceFeed::connect(&cfg)
         .await
@@ -2242,8 +2244,9 @@ async fn run_bootstrap(
                 (Box::new(DirectSource::new(src_cfg.clone(), opts)), None)
             }
             BootstrapMode::ObjectStore => {
-                let settings = walrus::config::Settings::from_env()
-                    .context("bootstrap: Settings::from_env (WALG_* env vars)")?;
+                let settings =
+                    walrus::config::Settings::resolve(&walrus::config::Vars::default(), None)
+                        .context("bootstrap: Settings::resolve (WALG_* env vars)")?;
                 let storage = settings
                     .build_storage()
                     .context("bootstrap: build storage from WALG_* env vars")?;

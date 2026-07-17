@@ -185,9 +185,92 @@ unsafe extern "C" {
 
 /* ---- columns ---- */
 
+// Public column tree, mirroring `struct chc_column` in clickhouse.h. The
+// reader allocates & owns instances (freed by chc_block_destroy); the
+// chc_build_* constructors initialize caller-owned instances over caller
+// slabs for the writer. Pointers are host byte order. Rust never reads the
+// union arms directly (the chc_column_* accessors do that for the reader,
+// chc_build_* fills them for the writer), but the layout must match exactly
+// so by-value returns from chc_build_* and Box<chc_column> nodes are sound;
+// tests/layout.rs guards it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct chc_column_fixed {
+    pub data: *mut c_void,
+    pub elem_size: usize,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct chc_column_str {
+    pub data: *mut u8,
+    pub offsets: *mut u64,
+    pub bytes: usize,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct chc_column_nullable {
+    pub null_map: *mut u8,
+    pub inner: *mut chc_column,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct chc_column_array {
+    pub offsets: *mut u64,
+    pub values: *mut chc_column,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct chc_column_tuple {
+    pub children: *mut *mut chc_column,
+    pub arity: usize,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct chc_column_lc {
+    pub key_size: c_int,
+    pub keys: *mut c_void,
+    pub dict: *mut chc_column,
+    pub dict_n: usize,
+}
+
+// Anonymous union in C; named `payload` here. Exactly one arm is live,
+// selected by `layout`.
+#[repr(C)]
+pub union chc_column_payload {
+    pub fixed: chc_column_fixed,
+    pub str_: chc_column_str,
+    pub nullable: chc_column_nullable,
+    pub array: chc_column_array,
+    pub tuple: chc_column_tuple,
+    pub lc: chc_column_lc,
+}
+
 #[repr(C)]
 pub struct chc_column {
-    _opaque: [u8; 0],
+    pub layout: chc_col_kind,
+    pub n_rows: usize,
+    pub payload: chc_column_payload,
+}
+
+unsafe extern "C" {
+    // Compositional builders returning a node over caller slabs (no copy,
+    // no alloc). Children must outlive the write. Nest to match any
+    // composite the reader emits.
+    pub fn chc_build_fixed(data: *const c_void, elem_size: usize, n_rows: usize) -> chc_column;
+    pub fn chc_build_string(offsets: *const u64, data: *const u8, n_rows: usize) -> chc_column;
+    pub fn chc_build_nullable(null_map: *const u8, inner: *mut chc_column) -> chc_column;
+    pub fn chc_build_array(
+        offsets: *const u64,
+        n_rows: usize,
+        values: *mut chc_column,
+    ) -> chc_column;
+    pub fn chc_build_tuple(children: *mut *mut chc_column, arity: usize) -> chc_column;
+    pub fn chc_build_lc(
+        key_size: c_int,
+        keys: *const c_void,
+        n_rows: usize,
+        dict: *mut chc_column,
+    ) -> chc_column;
 }
 
 unsafe extern "C" {
@@ -270,134 +353,65 @@ unsafe extern "C" {
 
 /* ---- block builder ---- */
 
+// One block column: name, full CH type & column tree (chc_build_* output or
+// reader output for round-trip). All three slabs stay caller-owned & must
+// outlive the write.
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct chc_block_col {
+    pub name: *const c_char,
+    pub name_len: usize,
+    pub type_: *const chc_type,
+    pub col: *const chc_column,
+}
+
+impl chc_block_col {
+    pub const fn zeroed() -> Self {
+        Self {
+            name: core::ptr::null(),
+            name_len: 0,
+            type_: core::ptr::null(),
+            col: core::ptr::null(),
+        }
+    }
+}
+
+// Stack builder over caller-provided chc_block_col storage. The wrapper in
+// src/builder.rs owns a Vec<chc_block_col> and keeps `cols` pointed at it.
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct chc_block_builder {
-    _opaque: [u8; 0],
+    pub cols: *mut chc_block_col,
+    pub n_cols: usize,
+    pub n_rows: usize,
+}
+
+impl chc_block_builder {
+    pub const fn zeroed() -> Self {
+        Self {
+            cols: core::ptr::null_mut(),
+            n_cols: 0,
+            n_rows: 0,
+        }
+    }
 }
 
 unsafe extern "C" {
-    pub fn chc_block_builder_init(
-        out: *mut *mut chc_block_builder,
-        al: *const chc_alloc,
-        err: *mut chc_err,
-    ) -> c_int;
-    pub fn chc_block_builder_destroy(bb: *mut chc_block_builder);
-
-    pub fn chc_block_builder_append_fixed(
+    pub fn chc_block_builder_init(bb: *mut chc_block_builder, cols: *mut chc_block_col);
+    pub fn chc_block_builder_append(
         bb: *mut chc_block_builder,
         name: *const c_char,
         name_len: usize,
         t: *const chc_type,
-        data: *const c_void,
-        n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
+        col: *const chc_column,
+    );
 
-    pub fn chc_block_builder_append_string(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        offsets: *const u64,
-        data: *const u8,
+    pub fn chc_block_write_cols(
+        io: *mut chc_io,
+        cols: *const chc_block_col,
+        n_cols: usize,
         n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
-
-    pub fn chc_block_builder_append_nullable_fixed(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        t: *const chc_type,
-        null_map: *const u8,
-        inner_data: *const c_void,
-        n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
-
-    pub fn chc_block_builder_append_nullable_string(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        t: *const chc_type,
-        null_map: *const u8,
-        inner_offsets: *const u64,
-        inner_data: *const u8,
-        n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
-
-    pub fn chc_block_builder_append_array_fixed(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        t: *const chc_type,
-        offsets: *const u64,
-        values: *const c_void,
-        n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
-
-    pub fn chc_block_builder_append_array_string(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        t: *const chc_type,
-        offsets: *const u64,
-        values_offsets: *const u64,
-        values_data: *const u8,
-        n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
-
-    pub fn chc_block_builder_append_array_nested_fixed(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        t: *const chc_type,
-        ndim: c_int,
-        level_offsets: *const *const u64,
-        level_offsets_len: *const usize,
-        values: *const c_void,
-        n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
-
-    pub fn chc_block_builder_append_array_nested_string(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        t: *const chc_type,
-        ndim: c_int,
-        level_offsets: *const *const u64,
-        level_offsets_len: *const usize,
-        values_offsets: *const u64,
-        values_data: *const u8,
-        n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
-
-    pub fn chc_block_builder_append_json_string(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        t: *const chc_type,
-        offsets: *const u64,
-        data: *const u8,
-        n_rows: usize,
-        err: *mut chc_err,
-    ) -> c_int;
-
-    pub fn chc_block_builder_append_low_cardinality_string(
-        bb: *mut chc_block_builder,
-        name: *const c_char,
-        name_len: usize,
-        t: *const chc_type,
-        key_size: c_int,
-        keys: *const c_void,
-        dict_offsets: *const u64,
-        dict_data: *const u8,
-        dict_n: usize,
-        n_rows: usize,
+        opts: *const chc_block_opts,
         err: *mut chc_err,
     ) -> c_int;
 

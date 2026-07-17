@@ -30,7 +30,7 @@ use anyhow::{Context, Result, bail};
 use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::SslMode;
+use walrus::pg::replication::tls::{SslMode, TlsParams};
 
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
@@ -581,6 +581,7 @@ async fn build_pipeline_inner(
         database: "postgres".into(),
         application_name: app_name.into(),
         sslmode: SslMode::Disable,
+        tls: TlsParams::default(),
     };
     let mut feed = SourceFeed::connect(&pgcfg)
         .await

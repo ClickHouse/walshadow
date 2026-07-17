@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use walrus::pg::backup::parse_pg_lsn;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::SslMode;
+use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 
@@ -62,6 +62,7 @@ fn pg_cfg(sh: &Shadow) -> PgConfig {
         database: "postgres".into(),
         application_name: "source-reconnect-test".into(),
         sslmode: SslMode::Disable,
+        tls: TlsParams::default(),
     }
 }
 

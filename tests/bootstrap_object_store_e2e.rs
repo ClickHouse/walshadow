@@ -52,10 +52,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use walrus::compression;
-use walrus::config::{DeltaSettings, Settings, StorageSettings};
+use walrus::config::{Settings, StorageSettings, Vars};
 use walrus::pg::backup::list;
 use walrus::pg::backup::push::{self, PushArgs};
-use walrus::retry::RetryPolicy;
+use walrus::pg::replication::conn::PgConfig;
 use walrus::storage::DynStorage;
 use walrus::storage::fs::FsStorage;
 use walshadow::backfill_bootstrap::{
@@ -127,16 +127,7 @@ fn test_settings(storage_root: PathBuf) -> Settings {
         },
         compression: compression::Method::None,
         compression_level: 0,
-        upload_concurrency: 1,
-        upload_queue: 1,
-        download_concurrency: 1,
-        prevent_wal_overwrite: false,
-        use_wal_delta: false,
-        retry: RetryPolicy::default(),
-        network_rate_limit: 0,
-        disk_rate_limit: 0,
-        delta: DeltaSettings::default(),
-        crypter: None,
+        ..Default::default()
     }
 }
 
@@ -191,7 +182,8 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
         std::env::remove_var("PGPASSWORD");
     }
 
-    push::handle(&settings, storage.clone(), PushArgs::default())
+    let cfg = PgConfig::resolve(&Vars::default()).expect("resolve source PgConfig from libpq env");
+    push::handle(&settings, storage.clone(), PushArgs::default(), cfg)
         .await
         .expect("wal-rus push::handle against source PG");
 

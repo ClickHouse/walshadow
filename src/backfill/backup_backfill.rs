@@ -131,8 +131,8 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     // Bucket/creds ride the same env surface bootstrap uses (WALG_*), never
     // the source-PG overlay: credentials in a source table is the wrong
     // trust direction (plans/add_table.md §Anti-goals)
-    let settings = walrus::config::Settings::from_env()
-        .context("backup_backfill: Settings::from_env (WALG_* env vars)")?;
+    let settings = walrus::config::Settings::resolve(&walrus::config::Vars::default(), None)
+        .context("backup_backfill: Settings::resolve (WALG_* env vars)")?;
     let storage = settings
         .build_storage()
         .context("backup_backfill: build storage from WALG_* env vars")?;

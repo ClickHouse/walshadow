@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clickhouse_c::{Allocator, BlockBuilder, Kind, TypeAst};
+use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
 
 #[cfg(test)]
 use crate::ch::is_retryable;
@@ -940,35 +940,46 @@ impl TableEncoder {
     }
 }
 
-pub(crate) fn append_buf<'a>(
-    bb: &mut BlockBuilder<'a>,
-    name: &'a str,
-    ast: &'a TypeAst,
-    buf: &'a ColumnBuf,
+/// Innermost leaf node per column: the `Nullable` value slab, or the whole
+/// column when not nullable. A `ColumnBuilder` node borrows its slabs and
+/// cannot move once a wrapper or the block aliases it, so the caller owns
+/// these leaves for the block's lifetime. Buffers stay immutable until
+/// `send_data` returns.
+pub(crate) fn build_leaves(
+    bufs: &[ColumnBuf],
     n_rows: usize,
-) -> Result<(), EmitterError> {
-    // Batch metadata and buffers remain immutable until send_data returns
-    match buf {
-        ColumnBuf::Fixed { bytes, .. } => {
-            bb.append_fixed(name, ast.view(), bytes, n_rows)?;
-        }
-        ColumnBuf::String { offsets, data } => {
-            bb.append_string(name, offsets, data, n_rows)?;
-        }
-        ColumnBuf::NullableFixed {
-            null_map, inner, ..
-        } => {
-            bb.append_nullable_fixed(name, ast.view(), null_map, inner, n_rows)?;
-        }
-        ColumnBuf::NullableString {
-            offsets,
-            data,
-            null_map,
-        } => {
-            bb.append_nullable_string(name, ast.view(), null_map, offsets, data, n_rows)?;
-        }
-    }
-    Ok(())
+) -> Result<Vec<ColumnBuilder<'_>>, EmitterError> {
+    bufs.iter()
+        .map(|buf| match buf {
+            ColumnBuf::Fixed { width, bytes: data }
+            | ColumnBuf::NullableFixed {
+                width, inner: data, ..
+            } => ColumnBuilder::fixed(data, *width, n_rows).map_err(Into::into),
+            ColumnBuf::String { offsets, data }
+            | ColumnBuf::NullableString { offsets, data, .. } => {
+                ColumnBuilder::string(offsets, data, n_rows).map_err(Into::into)
+            }
+        })
+        .collect()
+}
+
+/// `Nullable` wrapper per column, `None` when the column is not nullable.
+/// Each wrapper aliases its leaf in `leaves`, so `leaves` must be fully built
+/// (no further pushes) and outlive the wrappers. Pair with [`build_leaves`]:
+/// the block appends `roots[i]` when `Some`, else `leaves[i]`.
+pub(crate) fn build_roots<'l, 'b: 'l>(
+    leaves: &'l [ColumnBuilder<'b>],
+    bufs: &'b [ColumnBuf],
+) -> Result<Vec<Option<ColumnBuilder<'l>>>, EmitterError> {
+    leaves
+        .iter()
+        .zip(bufs)
+        .map(|(leaf, buf)| match buf {
+            ColumnBuf::NullableFixed { null_map, .. }
+            | ColumnBuf::NullableString { null_map, .. } => Ok(Some(leaf.nullable(null_map)?)),
+            ColumnBuf::Fixed { .. } | ColumnBuf::String { .. } => Ok(None),
+        })
+        .collect()
 }
 
 fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {

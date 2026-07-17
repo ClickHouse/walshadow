@@ -1027,7 +1027,7 @@ pub(crate) fn decompress_varlena(method: u8, src: &[u8], raw_len: usize) -> Opti
             out.truncate(n);
             Some(out)
         }
-        TOAST_COMPRESSION_LZ4 => lz4_flex::decompress(src, raw_len).ok(),
+        TOAST_COMPRESSION_LZ4 => lz4::block::decompress(src, Some(raw_len as i32)).ok(),
         _ => None,
     }
 }
@@ -1536,7 +1536,7 @@ mod tests {
     #[test]
     fn decode_inline_compressed_lz4_text() {
         let text = "lz4-".repeat(4000);
-        let comp = lz4_flex::compress(text.as_bytes());
+        let comp = lz4::block::compress(text.as_bytes(), None, false).expect("lz4 compress");
         let buf = inline_compressed_varlena(1, &comp, text.len());
         let att = rel_attr(1, "val", TEXTOID, -1, 'i');
         let (v, consumed) = decode_varlena(&att, &buf, 0).unwrap();
@@ -1567,12 +1567,12 @@ mod tests {
             decompress_varlena(0, &pglz, data.len()).as_deref(),
             Some(data.as_slice())
         );
-        let lz4 = lz4_flex::compress(&data);
+        let lz4_data = lz4::block::compress(&data, None, false).expect("lz4 compress");
         assert_eq!(
-            decompress_varlena(1, &lz4, data.len()).as_deref(),
+            decompress_varlena(1, &lz4_data, data.len()).as_deref(),
             Some(data.as_slice())
         );
-        assert_eq!(decompress_varlena(2, &lz4, data.len()), None);
+        assert_eq!(decompress_varlena(2, &lz4_data, data.len()), None);
     }
 
     #[test]
