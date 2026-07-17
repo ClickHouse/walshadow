@@ -10,7 +10,9 @@ use std::net::TcpStream;
 use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
-use clickhouse_c::{Allocator, BlockBuilder, BlockOpts, BlockReader, PosixIo, TypeAst};
+use clickhouse_c::{
+    Allocator, BlockBuilder, BlockOpts, BlockReader, ColumnBuilder, PosixIo, TypeAst,
+};
 #[cfg(feature = "lz4")]
 use clickhouse_c::{Client, ClientOpts, Codec, Compression, Event};
 
@@ -115,12 +117,11 @@ fn quickstart_encode_block() -> Result<(), Box<dyn std::error::Error>> {
     let alloc = Allocator::stdlib();
     let ty = TypeAst::parse("UInt32", alloc)?;
     let data: Vec<u32> = (0..1000).collect();
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(data.as_ptr().cast(), std::mem::size_of_val(&data[..]))
-    };
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-    let mut bb = BlockBuilder::new(alloc)?;
-    bb.append_fixed("x", ty.view(), bytes, data.len())?;
+    let col = ColumnBuilder::fixed(&bytes, ty.view().elem_size(), data.len())?;
+    let mut bb = BlockBuilder::new();
+    bb.append("x", ty.view(), &col)?;
     bb.write(io.as_mut(), BlockOpts::default())?;
     drop(io);
     drop(stdin); // EOF for the child
@@ -180,11 +181,10 @@ fn quickstart_tcp_client() -> Result<(), Box<dyn std::error::Error>> {
     let alloc = Allocator::stdlib();
     let ty = TypeAst::parse("UInt32", alloc)?;
     let data: Vec<u32> = (0..10).collect();
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(data.as_ptr().cast(), std::mem::size_of_val(&data[..]))
-    };
-    let mut bb = BlockBuilder::new(alloc)?;
-    bb.append_fixed("x", ty.view(), bytes, data.len())?;
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let col = ColumnBuilder::fixed(&bytes, ty.view().elem_size(), data.len())?;
+    let mut bb = BlockBuilder::new();
+    bb.append("x", ty.view(), &col)?;
     client.send_data(Some(&bb))?;
     drop(bb);
     client.send_data(None)?;

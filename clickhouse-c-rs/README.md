@@ -45,17 +45,25 @@ not checked because `clickhouse-c` exposes no buffer-capacity API.
 
 **Allocators thread through every owning constructor.** `chc_alloc` is
 a vtable. `Allocator` wraps it `Copy + Send + Sync`. `TypeAst` /
-`Block` / `BlockBuilder` / `Client` each take an `Allocator` at
-construction & store it; `Drop` calls the matching destroy with the
-same allocator the C side used. `Client` boxes its `Allocator` so the
+`Block` / `Client` each take an `Allocator` at construction & store it;
+`Drop` calls the matching destroy with the same allocator the C side
+used. `BlockBuilder` needs none — it owns caller-side `chc_block_col`
+storage as a `Vec` and the C writer allocates nothing. `Client` boxes
+its `Allocator` so the
 heap address the C side stashes in `c->al` stays valid through every
 later call & through `chc_client_close`.
 
-**No-copy columns.** `chc_block_builder_append_*` retains raw pointers
-to caller-owned names and bytes for the builder lifetime. Mirrored as
-`BlockBuilder<'a>`; each `append_*` takes `&'a str`, `&'a [u8]` /
-`&'a [u64]` & each appended `TypeRef<'a>`. Caller keeps inputs alive
-for `'a`.
+**No-copy columns.** The writer builds each column as a `chc_column`
+tree (`chc_build_fixed` / `_string` / `_nullable` / `_array` / `_tuple`
+/ `_lc`) whose nodes retain raw pointers into caller-owned slabs; the
+tree and slabs must outlive the write. Mirrored as `ColumnBuilder<'a>`:
+leaves (`fixed`, `string`) compose with wrappers (`nullable`, `array`,
+`low_cardinality`, `tuple`) to match any composite the reader emits,
+e.g. `Array(Nullable(UInt32))`. Caller owns each node; wrappers borrow
+child nodes and keep them immovable until the write completes.
+`BlockBuilder::append(name, ty, col)` records one built column against a
+`&'a str` name and `TypeRef<'a>`; the C writer checks the tree matches
+`ty` structurally. Caller keeps inputs alive for `'a`.
 
 **Self-referential C structs.** `chc_io` carries a pointer back into the
 `chc_posix_io` state it was initialized from; `PosixIo` holds both inline
@@ -148,7 +156,7 @@ needs both flags depending on negotiated server revision.
 ### Encode a block & feed it back in
 
 ```rust
-use clickhouse_c::{Allocator, BlockBuilder, BlockOpts, PosixIo, TypeAst};
+use clickhouse_c::{Allocator, BlockBuilder, BlockOpts, ColumnBuilder, PosixIo, TypeAst};
 use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 
@@ -167,16 +175,17 @@ let bytes: &[u8] = unsafe {
     core::slice::from_raw_parts(data.as_ptr().cast(), std::mem::size_of_val(&data[..]))
 };
 
-let mut bb = BlockBuilder::new(alloc)?;
-bb.append_fixed("x", ty.view(), bytes, data.len())?;
+let mut bb = BlockBuilder::new();
+let col = ColumnBuilder::fixed(bytes, ty.view().elem_size(), data.len())?;
+bb.append("x", ty.view(), &col)?;
 bb.write(io.as_mut(), BlockOpts::default())?;
 drop(io);
 drop(stdin);      // EOF for the child
 child.wait()?;
 ```
 
-ClickHouse Native is little-endian on the wire & `append_fixed`
-expects LE bytes. Big-endian hosts swap before append.
+ClickHouse Native is little-endian on the wire & `ColumnBuilder::fixed`
+expects LE bytes. Big-endian hosts swap before build.
 
 ### TCP client
 
@@ -299,8 +308,8 @@ Mirrors upstream's list plus Rust-specific items:
   event loops can drive `chc_async_*` through `sys`
 - `Variant` / `Dynamic` / `JSON` / `AggregateFunction` decoding —
   upstream excludes from v1 (25.x / 26.x wire format still shifting).
-  `BlockBuilder::append_json_string` covers the STRING-serialization
-  path for `JSON`
+  A `ColumnBuilder::string` column under a `JSON` type covers the
+  STRING-serialization write path
 
 ## License
 

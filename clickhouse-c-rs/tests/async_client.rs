@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use clickhouse_c::{AsyncClient, Block, BlockBuilder, ClientOpts, Event, TypeAst};
+use clickhouse_c::{AsyncClient, Block, BlockBuilder, ClientOpts, ColumnBuilder, Event, TypeAst};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -185,16 +185,17 @@ async fn async_insert_select_roundtrip() -> TestResult {
         .send_query("INSERT INTO async_roundtrip FORMAT Native", None)
         .await?;
     let ids = [10i32, 20, 30];
-    let id_bytes = unsafe {
-        core::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), std::mem::size_of_val(&ids))
-    };
+    let id_bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
     let names = ["alpha", "beta", "gamma"];
     let (name_offsets, name_data) = string_column(&names);
     let alloc = clickhouse_c::Allocator::stdlib();
     let id_type = TypeAst::parse("Int32", alloc)?;
-    let mut block = BlockBuilder::new(alloc)?;
-    block.append_fixed("id", id_type.view(), id_bytes, ids.len())?;
-    block.append_string("name", &name_offsets, &name_data, names.len())?;
+    let name_type = TypeAst::parse("String", alloc)?;
+    let id_col = ColumnBuilder::fixed(&id_bytes, id_type.view().elem_size(), ids.len())?;
+    let name_col = ColumnBuilder::string(&name_offsets, &name_data, names.len())?;
+    let mut block = BlockBuilder::new();
+    block.append("id", id_type.view(), &id_col)?;
+    block.append("name", name_type.view(), &name_col)?;
     client.send_data(Some(&block)).await?;
     client.send_data_end().await?;
     drain(&mut client).await?;

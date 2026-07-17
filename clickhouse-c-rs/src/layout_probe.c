@@ -55,6 +55,26 @@ CHC_RS_FIELD(chc_block_opts, has_block_info)
 CHC_RS_FIELD(chc_block_opts, has_custom_serialization)
 CHC_RS_FIELD(chc_block_opts, read_buffer_bytes)
 
+/* chc_column: layout + n_rows + an anonymous union. Rust never reads the
+ * union arms (chc_build_* fills them, the chc_column_* accessors read them),
+ * so only overall size/align and the two named fields plus the union offset
+ * need pinning; the size check transitively catches any arm-size drift. */
+CHC_RS_LAYOUT(chc_column)
+CHC_RS_FIELD(chc_column, layout)
+CHC_RS_FIELD(chc_column, n_rows)
+size_t chc_rs_off_chc_column__payload(void) { return offsetof(chc_column, fixed); }
+
+CHC_RS_LAYOUT(chc_block_col)
+CHC_RS_FIELD(chc_block_col, name)
+CHC_RS_FIELD(chc_block_col, name_len)
+CHC_RS_FIELD(chc_block_col, type)
+CHC_RS_FIELD(chc_block_col, col)
+
+CHC_RS_LAYOUT(chc_block_builder)
+CHC_RS_FIELD(chc_block_builder, cols)
+CHC_RS_FIELD(chc_block_builder, n_cols)
+CHC_RS_FIELD(chc_block_builder, n_rows)
+
 /* clickhouse-compression.h */
 CHC_RS_LAYOUT(chc_codec)
 CHC_RS_FIELD(chc_codec, ud)

@@ -107,7 +107,7 @@ mod tests {
     use std::sync::{LazyLock, Mutex};
 
     use super::Allocator;
-    use crate::{BlockBuilder, TypeAst};
+    use crate::{BlockBuilder, ColumnBuilder, TypeAst};
 
     static CHECKED: LazyLock<CheckedAlloc> = LazyLock::new(|| CheckedAlloc {
         live: Mutex::new(HashMap::new()),
@@ -184,13 +184,12 @@ mod tests {
         );
 
         let alloc = Allocator::global(&*CHECKED);
-        drop(BlockBuilder::new(alloc).expect("empty builder"));
+        drop(BlockBuilder::new());
         let ty = TypeAst::parse("UInt32", alloc).expect("UInt32");
         let data = 7u32.to_le_bytes();
-        let mut builder = BlockBuilder::new(alloc).expect("builder");
-        builder
-            .append_fixed("x", ty.view(), &data, 1)
-            .expect("append");
+        let col = ColumnBuilder::fixed(&data, ty.view().elem_size(), 1).expect("fixed");
+        let mut builder = BlockBuilder::new();
+        builder.append("x", ty.view(), &col).expect("append");
         drop(builder);
         drop(ty);
 

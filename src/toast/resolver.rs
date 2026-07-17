@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use clickhouse_c::{Allocator, AsyncClient, Block, BlockBuilder, Event, TypeAst};
+use clickhouse_c::{Allocator, AsyncClient, Block, BlockBuilder, ColumnBuilder, Event, TypeAst};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -670,14 +670,26 @@ impl ClickHouseChunkStore {
             let u16_ast = TypeAst::parse("UInt16", self.alloc)?;
             let u32_ast = TypeAst::parse("UInt32", self.alloc)?;
             let u64_ast = TypeAst::parse("UInt64", self.alloc)?;
-            let mut bb = BlockBuilder::new(self.alloc)?;
-            bb.append_fixed("blkno", u32_ast.view(), &blkno, n)?;
-            bb.append_fixed("offnum", u16_ast.view(), &offnum, n)?;
-            bb.append_fixed("chunk_id", u32_ast.view(), &chunk_id, n)?;
-            bb.append_fixed("chunk_seq", u32_ast.view(), &chunk_seq, n)?;
-            bb.append_string("chunk_data", &offsets, &data, n)?;
-            bb.append_fixed("_lsn", u64_ast.view(), &lsn, n)?;
-            bb.append_fixed("_is_deleted", u8_ast.view(), &is_deleted, n)?;
+            let string_ast = TypeAst::parse("String", self.alloc)?;
+            let u8_w = u8_ast.view().elem_size();
+            let u16_w = u16_ast.view().elem_size();
+            let u32_w = u32_ast.view().elem_size();
+            let u64_w = u64_ast.view().elem_size();
+            let blkno_col = ColumnBuilder::fixed(&blkno, u32_w, n)?;
+            let offnum_col = ColumnBuilder::fixed(&offnum, u16_w, n)?;
+            let chunk_id_col = ColumnBuilder::fixed(&chunk_id, u32_w, n)?;
+            let chunk_seq_col = ColumnBuilder::fixed(&chunk_seq, u32_w, n)?;
+            let chunk_data_col = ColumnBuilder::string(&offsets, &data, n)?;
+            let lsn_col = ColumnBuilder::fixed(&lsn, u64_w, n)?;
+            let is_deleted_col = ColumnBuilder::fixed(&is_deleted, u8_w, n)?;
+            let mut bb = BlockBuilder::new();
+            bb.append("blkno", u32_ast.view(), &blkno_col)?;
+            bb.append("offnum", u16_ast.view(), &offnum_col)?;
+            bb.append("chunk_id", u32_ast.view(), &chunk_id_col)?;
+            bb.append("chunk_seq", u32_ast.view(), &chunk_seq_col)?;
+            bb.append("chunk_data", string_ast.view(), &chunk_data_col)?;
+            bb.append("_lsn", u64_ast.view(), &lsn_col)?;
+            bb.append("_is_deleted", u8_ast.view(), &is_deleted_col)?;
             let insert = self.insert_sql(relid);
             self.exec_write(state, &insert, Some(&bb)).await?;
         }

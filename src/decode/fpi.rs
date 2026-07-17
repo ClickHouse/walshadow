@@ -58,8 +58,9 @@ pub fn restore_block_image(
             }
         }
         Some(FpiCompressionMethod::Lz4) => {
-            let written = lz4_flex::block::decompress_into(&block.image, body)
-                .map_err(|e| FpiError::Lz4(e.to_string()))?;
+            let written =
+                lz4::block::decompress_to_buffer(&block.image, Some(body.len() as i32), body)
+                    .map_err(|e| FpiError::Lz4(e.to_string()))?;
             if written != body_len {
                 return Err(FpiError::SizeMismatch {
                     got: written,
@@ -252,7 +253,7 @@ mod tests {
     #[test]
     fn lz4_round_trip() {
         let page = synth_page();
-        let compressed = lz4_flex::block::compress(&page);
+        let compressed = lz4::block::compress(&page, None, false).expect("lz4 compress");
         let block = build_block(compressed, BKP_IMAGE_COMPRESS_LZ4, 0, 0);
         let out = restore_block_image(&block, XLP_PAGE_MAGIC_PG15).unwrap();
         assert_eq!(out, page);
@@ -272,7 +273,7 @@ mod tests {
         // payload < BLCKSZ but hole_length=0 => body_len == BLCKSZ, short
         // decompress trips SizeMismatch
         let short = vec![0u8; 256];
-        let compressed = lz4_flex::block::compress(&short);
+        let compressed = lz4::block::compress(&short, None, false).expect("lz4 compress");
         let block = build_block(compressed, BKP_IMAGE_COMPRESS_LZ4, 0, 0);
         assert!(matches!(
             restore_block_image(&block, XLP_PAGE_MAGIC_PG15),

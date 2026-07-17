@@ -6,7 +6,9 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
-use clickhouse_c::{Allocator, BlockBuilder, BlockOpts, BlockReader, ErrorKind, PosixIo, TypeAst};
+use clickhouse_c::{
+    Allocator, BlockBuilder, BlockOpts, BlockReader, ColumnBuilder, ErrorKind, PosixIo, TypeAst,
+};
 
 /// Connected (writer, reader) TCP pair on loopback.
 fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -24,15 +26,13 @@ fn validate_accepts_roundtripped_block() {
 
     let ty = TypeAst::parse("UInt32", alloc).expect("UInt32");
     let data: [u32; 4] = [1, 2, 3, 4];
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(&data))
-    };
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
 
     let mut wio = PosixIo::new(writer.as_fd());
     let name = String::from("x");
-    let mut bb = BlockBuilder::new(alloc).expect("builder");
-    bb.append_fixed(&name, ty.view(), bytes, data.len())
-        .expect("append");
+    let col = ColumnBuilder::fixed(&bytes, ty.view().elem_size(), data.len()).expect("fixed");
+    let mut bb = BlockBuilder::new();
+    bb.append(&name, ty.view(), &col).expect("append");
     bb.write(wio.as_mut(), BlockOpts::default()).expect("write");
     // Block is tiny, fits the socket buffer; closing flushes it to the reader.
     drop(wio);
@@ -59,21 +59,22 @@ fn validate_accepts_roundtripped_block() {
 fn builder_rejects_inconsistent_slabs() {
     let alloc = Allocator::stdlib();
     let uint32 = TypeAst::parse("UInt32", alloc).expect("UInt32");
-    let array = TypeAst::parse("Array(UInt32)", alloc).expect("Array(UInt32)");
-    let mut bb = BlockBuilder::new(alloc).expect("builder");
+    let elem = uint32.view().elem_size();
 
-    let err = bb
-        .append_fixed("fixed", uint32.view(), &[], 1)
+    let err = ColumnBuilder::fixed(&[], elem, 1)
+        .map(drop)
         .expect_err("short fixed data");
     assert_eq!(err.kind, ErrorKind::Usage);
 
-    let err = bb
-        .append_string("string", &[2, 1], &[0], 2)
+    let err = ColumnBuilder::string(&[2, 1], &[0], 2)
+        .map(drop)
         .expect_err("decreasing offsets");
     assert_eq!(err.kind, ErrorKind::Usage);
 
-    let err = bb
-        .append_array_fixed("array", array.view(), &[], &[], 1)
+    let leaf = ColumnBuilder::fixed(&[], elem, 0).expect("empty leaf for array");
+    let err = leaf
+        .array(&[], 1)
+        .map(drop)
         .expect_err("short array offsets");
     assert_eq!(err.kind, ErrorKind::Usage);
 }
@@ -85,14 +86,10 @@ fn builder_accepts_oversized_slabs() {
 
     // 1 UInt32 row needs 4 bytes; hand in 8. Trailing slack is never read.
     let fixed = [1u8, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef];
-    let mut bb = BlockBuilder::new(alloc).expect("builder");
-    bb.append_fixed("fixed", uint32.view(), &fixed, 1)
-        .expect("fixed slab with slack");
+    ColumnBuilder::fixed(&fixed, uint32.view().elem_size(), 1).expect("fixed slab with slack");
 
     // 2 string rows ending at offset 3; data buffer runs past it.
-    let mut bb = BlockBuilder::new(alloc).expect("builder");
-    bb.append_string("string", &[1, 3], b"abcdefg", 2)
-        .expect("string slab with slack");
+    ColumnBuilder::string(&[1, 3], b"abcdefg", 2).expect("string slab with slack");
 }
 
 #[test]

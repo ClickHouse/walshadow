@@ -4,8 +4,8 @@
 //! since midnight), `timetz` → `String` (lossless text with zone).
 //! Confirms the wire encoding the bridge advertises matches what the
 //! server stores. The encoding path (`TableEncoder::append_row` →
-//! `append_buf`) is shared with the WAL/bootstrap producers, so this
-//! pins it through the same tail those use.
+//! `build_leaves`/`build_roots`) is shared with the WAL/bootstrap
+//! producers, so this pins it through the same tail those use.
 //!
 //! `Time64` is gated behind `enable_time_time64_type=1`; the harness's
 //! `ChServer::spawn` enables it in the default profile.

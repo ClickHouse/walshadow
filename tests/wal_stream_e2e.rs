@@ -22,7 +22,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::SslMode;
+use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::record::{CollectingRecordSink, MetricsRecordSink, WAL_SEG_SIZE};
@@ -105,6 +105,7 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         database: "postgres".into(),
         application_name: "walshadow-test".into(),
         sslmode: SslMode::Disable,
+        tls: TlsParams::default(),
     };
     let mut feed = SourceFeed::connect(&pgcfg)
         .await
@@ -366,6 +367,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         database: "postgres".into(),
         application_name: "walshadow-pre-rotated".into(),
         sslmode: SslMode::Disable,
+        tls: TlsParams::default(),
     };
     let mut feed = SourceFeed::connect(&pgcfg)
         .await
@@ -597,6 +599,7 @@ async fn sidecar_sql_client_negotiates_tls_over_tcp() {
         database: "postgres".into(),
         application_name: "walshadow-tls-test".into(),
         sslmode: SslMode::Require,
+        tls: TlsParams::default(),
     };
     let mut feed = SourceFeed::connect(&pgcfg)
         .await
@@ -673,6 +676,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         database: "postgres".into(),
         application_name: "walshadow-shutdown".into(),
         sslmode: SslMode::Disable,
+        tls: TlsParams::default(),
     };
     let mut feed = SourceFeed::connect(&pgcfg)
         .await

@@ -427,7 +427,7 @@ pub(crate) async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
         if cfg.sslmode == SslMode::Disable {
             Box::new(raw)
         } else {
-            let (sock, _used_tls) = maybe_upgrade(raw, &cfg.host, cfg.sslmode)
+            let (sock, _used_tls) = maybe_upgrade(raw, &cfg.host, cfg.sslmode, &cfg.tls)
                 .await
                 .with_context(|| format!("tls negotiation against {addr}"))?;
             sock

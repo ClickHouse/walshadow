@@ -47,6 +47,25 @@ unsafe extern "C" {
     fn chc_rs_off_chc_block_opts__has_custom_serialization() -> usize;
     fn chc_rs_off_chc_block_opts__read_buffer_bytes() -> usize;
 
+    fn chc_rs_size_chc_column() -> usize;
+    fn chc_rs_align_chc_column() -> usize;
+    fn chc_rs_off_chc_column__layout() -> usize;
+    fn chc_rs_off_chc_column__n_rows() -> usize;
+    fn chc_rs_off_chc_column__payload() -> usize;
+
+    fn chc_rs_size_chc_block_col() -> usize;
+    fn chc_rs_align_chc_block_col() -> usize;
+    fn chc_rs_off_chc_block_col__name() -> usize;
+    fn chc_rs_off_chc_block_col__name_len() -> usize;
+    fn chc_rs_off_chc_block_col__type() -> usize;
+    fn chc_rs_off_chc_block_col__col() -> usize;
+
+    fn chc_rs_size_chc_block_builder() -> usize;
+    fn chc_rs_align_chc_block_builder() -> usize;
+    fn chc_rs_off_chc_block_builder__cols() -> usize;
+    fn chc_rs_off_chc_block_builder__n_cols() -> usize;
+    fn chc_rs_off_chc_block_builder__n_rows() -> usize;
+
     fn chc_rs_size_chc_codec() -> usize;
     fn chc_rs_align_chc_codec() -> usize;
     fn chc_rs_off_chc_codec__ud() -> usize;
@@ -234,6 +253,59 @@ fn chc_block_opts_matches_c() {
         sys::chc_block_opts,
         read_buffer_bytes,
         chc_rs_off_chc_block_opts__read_buffer_bytes
+    );
+}
+
+#[test]
+fn chc_column_matches_c() {
+    layout!(
+        sys::chc_column,
+        chc_rs_size_chc_column,
+        chc_rs_align_chc_column
+    );
+    field!(sys::chc_column, layout, chc_rs_off_chc_column__layout);
+    field!(sys::chc_column, n_rows, chc_rs_off_chc_column__n_rows);
+    field!(sys::chc_column, payload, chc_rs_off_chc_column__payload);
+}
+
+#[test]
+fn chc_block_col_matches_c() {
+    layout!(
+        sys::chc_block_col,
+        chc_rs_size_chc_block_col,
+        chc_rs_align_chc_block_col
+    );
+    field!(sys::chc_block_col, name, chc_rs_off_chc_block_col__name);
+    field!(
+        sys::chc_block_col,
+        name_len,
+        chc_rs_off_chc_block_col__name_len
+    );
+    field!(sys::chc_block_col, type_, chc_rs_off_chc_block_col__type);
+    field!(sys::chc_block_col, col, chc_rs_off_chc_block_col__col);
+}
+
+#[test]
+fn chc_block_builder_matches_c() {
+    layout!(
+        sys::chc_block_builder,
+        chc_rs_size_chc_block_builder,
+        chc_rs_align_chc_block_builder
+    );
+    field!(
+        sys::chc_block_builder,
+        cols,
+        chc_rs_off_chc_block_builder__cols
+    );
+    field!(
+        sys::chc_block_builder,
+        n_cols,
+        chc_rs_off_chc_block_builder__n_cols
+    );
+    field!(
+        sys::chc_block_builder,
+        n_rows,
+        chc_rs_off_chc_block_builder__n_rows
     );
 }
 
