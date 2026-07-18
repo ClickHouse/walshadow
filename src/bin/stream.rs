@@ -485,6 +485,14 @@ fn init_tracing(
 }
 
 async fn run(args: Args) -> Result<()> {
+    let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .inspect_err(|e| {
+            tracing::warn!(
+                target: "walshadow::sighup",
+                error = %e,
+                "SIGHUP install failed; reload disabled",
+            );
+        })?;
     let sslmode = SslMode::parse(&args.sslmode).context("--sslmode")?;
     let cfg = PgConfig {
         host: args.host.clone(),
@@ -1153,7 +1161,7 @@ async fn run(args: Args) -> Result<()> {
     // SIGHUP re-reads TOML and republishes the resolved snapshot; the
     // mapping refresher + DDL applicator pick it up. Connection params stay
     // boot-only. No resolver (metrics-only) makes SIGHUP a no-op tap.
-    let _sighup_task = spawn_sighup_handler(config_resolver);
+    let _sighup_task = spawn_sighup_handler(sighup, config_resolver);
 
     // Retention sweeper writes shadow's `pg_last_wal_replay_lsn` here;
     // status loop reads it for the cursor's `shadow_replay_lsn` slot + the
@@ -1735,19 +1743,11 @@ async fn apply_toml_initial_loads(
 /// snapshot through the resolver (CLI overrides stay on top). Read/parse
 /// errors keep the last snapshot in effect; absent resolver (metrics-only)
 /// is a no-op tap.
-fn spawn_sighup_handler(resolver: Option<Arc<ConfigResolver>>) -> tokio::task::JoinHandle<()> {
+fn spawn_sighup_handler(
+    mut sig: tokio::signal::unix::Signal,
+    resolver: Option<Arc<ConfigResolver>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    target: "walshadow::sighup",
-                    error = %e,
-                    "SIGHUP install failed; reload disabled",
-                );
-                return;
-            }
-        };
         loop {
             if sig.recv().await.is_none() {
                 return;
