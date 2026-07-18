@@ -116,10 +116,10 @@ pub struct EmitterConfig {
     /// via `[namespace.<ns>] drop_table_strategy = ...`
     pub drop_table_strategy: String,
     pub retry: RetryConfig,
-    /// Wall-clock cap on a single INSERT attempt. A connection that
-    /// wedges mid-INSERT surfaces as retryable [`EmitterError::Timeout`]
-    /// so the inserter reconnects + resends rather than pinning the
-    /// durable watermark forever. Sized far above a healthy round-trip.
+    /// Wall-clock limit for one INSERT attempt. If connection stalls
+    /// mid-INSERT, return retryable [`EmitterError::Timeout`] so inserter
+    /// reconnects and resends without blocking durable watermark
+    /// Set well above healthy round-trip time
     pub insert_timeout: Duration,
     /// A CH connection idle longer than this may be half-open (NAT/LB/CH
     /// idle-reap); reconnect before the next op instead of blocking the

@@ -5,8 +5,8 @@
 #                table pre-created
 #   walshadow  — custom image carrying walshadow-stream + the
 #                walshadow PG extension. Boots an in-container shadow
-#                PG via --bootstrap-mode=direct + --bootstrap-autospawn
-#                then streams source's WAL into clickhouse
+#                PG via --bootstrap-mode=direct on empty volume, resumes it
+#                on later starts, then streams source WAL into clickhouse
 #
 # Quick start (from repo root):
 #   git submodule update --init --recursive

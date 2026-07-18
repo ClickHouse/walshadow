@@ -303,7 +303,7 @@ pub fn parse_metric(body: &str, name: &str) -> Option<u64> {
 
 /// Poll a TCP port until accept succeeds. Used as a coarse readiness
 /// gate for `walshadow-stream`'s metrics endpoint — by the time it's
-/// listening, bootstrap + autospawn-shadow + WAL pump init have all
+/// listening, bootstrap, shadow startup, and WAL pump setup have all
 /// finished and bootstrap rows have drained to CH.
 pub fn wait_for_listen(addr: std::net::SocketAddr, deadline: Duration) -> Result<()> {
     let start = Instant::now();

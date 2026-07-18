@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# walshadow demo entrypoint. Wipes any stale shadow data dir so
-# --bootstrap-mode=direct sees an empty target, then execs the daemon
-# pointed at the docker-compose source / clickhouse hostnames.
+# walshadow demo entrypoint. Creates state directories, then execs daemon
+# against docker-compose source and ClickHouse services
 
 set -euo pipefail
 
@@ -10,14 +9,7 @@ OUT_DIR="${WALSHADOW_OUT_DIR:-/var/lib/walshadow/out}"
 SPILL_DIR="${WALSHADOW_SPILL_DIR:-/var/lib/walshadow/spill}"
 SOCKET_DIR="${WALSHADOW_SHADOW_SOCKET_DIR:-/var/run/postgresql}"
 
-# Direct bootstrap refuses to land into a non-empty data dir, mirror
-# initdb's contract. Drop the volume contents on every (re)start so
-# `docker compose up --force-recreate` rebootstraps cleanly.
-if [ -d "$SHADOW_DATA" ]; then
-    find "$SHADOW_DATA" -mindepth 1 -delete
-else
-    mkdir -p "$SHADOW_DATA"
-fi
+mkdir -p "$SHADOW_DATA"
 # Shadow PG refuses to start on anything other than 0700/0750. Named
 # volume mount drops Dockerfile-time perms, so reassert on each boot.
 chmod 700 "$SHADOW_DATA"
@@ -54,7 +46,6 @@ exec walshadow-stream \
     --shadow-dbname postgres \
     --bootstrap-mode direct \
     --bootstrap-shadow-data-dir "$SHADOW_DATA" \
-    --bootstrap-autospawn-shadow \
     --walsender-bind 127.0.0.1:5433 \
     --ch-config "${WALSHADOW_CH_CONFIG:-/etc/walshadow/ch-config.toml}" \
     --metrics-bind 0.0.0.0:9484 \

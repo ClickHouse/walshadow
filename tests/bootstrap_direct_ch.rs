@@ -5,7 +5,7 @@
 //! direct bootstrap pipeline against a `RecordingObserver` (no live
 //! CH). This drill runs the real daemon binary
 //! (`target/debug/walshadow-stream`) with
-//! `--bootstrap-mode=direct --bootstrap-autospawn-shadow --ch-config`
+//! `--bootstrap-mode=direct --bootstrap-shadow-data-dir --ch-config`
 //! against a self-hosted source PG + spawned `clickhouse server`,
 //! then verifies the bootstrap rows land in CH end-to-end.
 //!
@@ -18,7 +18,7 @@
 //!         → run_bootstrap (DirectSource BASE_BACKUP → MultiplexSink)
 //!         → pipeline::bootstrap::drain → shared tail (batcher + inserter
 //!           pool + ack) → CH default.t
-//!         → autospawn shadow PG against bootstrap_shadow_data_dir
+//!         → start shadow PG against bootstrap_shadow_data_dir
 //!         → ShadowCatalog connect + preflight + WAL pump
 //!   → assert_ch_matches_source(ch, source, "s14.t", "default.t")
 //! ```
@@ -115,11 +115,8 @@ async fn direct_bootstrap_ch_end_to_end() {
     )
     .expect("write ch-config");
 
-    // 5. Shadow data dir + socket layout for the daemon's autospawn.
-    //    `--bootstrap-autospawn-shadow` writes the shadow-side
-    //    `port` / `unix_socket_directories` / `listen_addresses`
-    //    overrides into the cloned data dir's postgresql.auto.conf and
-    //    asserts mode 0700 before pg_ctl start.
+    // 5. Shadow data dir and socket layout. Daemon writes listener
+    //    config and sets data dir mode to 0700 before pg_ctl start
     let bootstrap_shadow_data_dir = tmp.path().join("shadow-data");
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
@@ -178,7 +175,6 @@ async fn direct_bootstrap_ch_end_to_end() {
             "direct",
             "--bootstrap-shadow-data-dir",
             bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-autospawn-shadow",
             "--bootstrap-shadow-replay-timeout",
             "120",
         ])
@@ -189,14 +185,10 @@ async fn direct_bootstrap_ch_end_to_end() {
         .spawn()
         .expect("spawn walshadow-stream");
     let guard = fx::ChildGuard::new(child);
-    // Drop guard for the shadow PG the daemon's autospawn brings up —
-    // stops it after the test so leftover postmasters don't linger.
-    // SAFETY: only set up paths; we'll attach the Shadow handle after
-    // the daemon has exited so we can issue pg_ctl stop against it.
 
     let result = (|| -> Result<()> {
         // 7. Wait for the daemon's metrics endpoint. Crossing this
-        //    barrier means: bootstrap finished, autospawn'd shadow is
+        //    barrier means: bootstrap finished, daemon-owned shadow is
         //    serving, preflight passed, WAL pump is in its main loop.
         //    The bootstrap tail's `wait_through(K)` makes every backfill
         //    row durable on CH before the daemon hands off to the streaming
@@ -214,9 +206,12 @@ async fn direct_bootstrap_ch_end_to_end() {
         Ok(())
     })();
 
-    // 11. Tear down the autospawn'd shadow PG so the data dir's
-    //     postmaster is reaped before tempdir cleanup. The daemon
-    //     doesn't stop shadow on its own (autospawn is start-only).
+    // 11. Kill daemon before shadow so supervisor cannot restart it
+    //     SIGKILL skips shadow cleanup, stop any remaining postmaster
+    let _ = guard.into_inner().map(|mut c| {
+        let _ = c.kill();
+        let _ = c.wait();
+    });
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());
@@ -226,11 +221,6 @@ async fn direct_bootstrap_ch_end_to_end() {
         let shadow = Shadow::new(shadow_cfg);
         let _ = shadow.stop();
     }
-    // Drain guard so any leftover child also gets cleaned.
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
 
     if let Err(e) = result {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();

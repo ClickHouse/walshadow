@@ -55,10 +55,12 @@ for rendered diagram. Five clusters top→bottom:
    before handoff. Metrics-only runs (no `--ch-config`) instead drain
    through `drain_backfill` into a counting `TupleObserver`
 4. **Shadow handoff** — `BootstrapOutcome { start, end }` returned;
-   daemon writes `standby.signal`, appends `restore_command` +
-   `primary_conninfo` to shadow's `postgresql.auto.conf`,
-   `--bootstrap-autospawn-shadow` optionally drives `Shadow::start` +
-   `wait_for_replay(end_lsn, timeout)` under `block_in_place`
+   daemon writes `standby.signal` and calls `materialize_conf` to
+   replace shadow's config files. Config includes walshadow settings,
+   minimum GUC values from `pg_control`, `restore_command`, and
+   `primary_conninfo`. Daemon empties `postgresql.auto.conf`, starts
+   shadow with `start_with_floor_retry`, waits for `end_lsn` with
+   `wait_for_replay`, then supervises it (see [shadow.md](shadow.md))
 5. **Cursor + WAL pump start** — `cursor::write` lands
    `emitter_ack_lsn = end_lsn` atomically, `SourceFeed` opens
    `START_REPLICATION PHYSICAL <slot> <end_lsn>`, steady-state emitter
@@ -426,33 +428,38 @@ opt into Nullable for post-attach columns. Differential oracle does
 not patch this, it is structural shape difference between
 bootstrap-time & WAL-time decode
 
-## Operator-facing autospawn shape
+## Daemon-owned shadow
 
-`--bootstrap-autospawn-shadow` (default off): daemon drives shadow
-lifecycle itself via `Shadow::start` + `Shadow::wait_for_replay(end_lsn,
-timeout)`. Off-by-default because production deploys typically run
-shadow under systemd / k8s; on-by-default would conflict with
-operator-owned supervision
+Setting `--bootstrap-shadow-data-dir` makes daemon own shadow
+lifecycle. At startup it bootstraps an empty data dir or resumes an
+initialized cluster. `--bootstrap-mode` selects only bootstrap source.
+Bootstrap writes `walshadow_bootstrap.incomplete` before extraction
+and removes it after backup and required WAL land. If marker survives,
+daemon fails without changing data dir. Automatic rebootstrap is not
+part of standby lifecycle; operator-initiated workflow may add it later.
+Omit data-dir flag to run shadow as an external process, such as k8s
+sidecar
 
-When on, `autospawn_shadow_and_wait` calls
-`write_shadow_listener_overrides` to append last-wins `port` /
-`unix_socket_directories` / `listen_addresses = ''` keys to cloned data
-dir's `postgresql.auto.conf` (BASE_BACKUP shipped source's
-`postgresql.conf` verbatim, so without these overrides shadow would
-inherit source's port & socket dir & collide with still-running source).
-`listen_addresses = ''` disables TCP entirely; shadow is local-only
-over socket dir daemon connects to. Operators wanting TCP shadow
-override via `ALTER SYSTEM` after first boot
+Object-store mode currently fetches backup-required WAL during initial
+bootstrap. Future object-store recovery belongs in WAL acquisition loop,
+parallel to live primary path; it must not transition existing standby
+back into `BASE_BACKUP`
 
-Sync `pg_ctl` + `psql` shells run inside `tokio::task::block_in_place`
-so multi-threaded runtime keeps making forward progress on other tasks
-while `wait_for_replay` polls. Single-threaded runtime would deadlock
-here — hard constraint
+Daemon does not rely on config files from backup. Debian stores
+`postgresql.conf` under `/etc/postgresql/<v>/<cluster>`, so
+BASE_BACKUP from Debian does not include it. A backed-up
+`postgresql.auto.conf` can also contain `ALTER SYSTEM` settings that
+override appended values. `materialize_conf` replaces all four config
+files instead ([shadow.md](shadow.md)). `listen_addresses = ''`
+disables TCP, daemon connects through local socket
 
-`--bootstrap-shadow-replay-timeout` (default 300 s) bounds wait.
-Operator-supplied `--shadow-socket-dir` / `--shadow-port` flags double
-as autospawn listener config — same socket daemon connects to for
-`ShadowCatalog` further down pipeline
+Synchronous `pg_ctl` and `psql` commands run inside
+`tokio::task::spawn_blocking`, keeping runtime responsive while
+`wait_for_replay` polls
+
+`--bootstrap-shadow-replay-timeout` (default 300 s) limits post-bootstrap
+wait. `--shadow-socket-dir` and `--shadow-port` configure shadow
+listener used later by `ShadowCatalog`
 
 ## Cross-links
 

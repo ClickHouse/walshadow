@@ -198,12 +198,16 @@ containing `cutoff_lsn` is preserved (shadow may still be reading it).
 files left alone — trimmer is conservative on purpose so sibling
 system writing into same dir doesn't lose unrelated files
 
-Sweeper task in `bin/stream.rs` ticks every
-`DEFAULT_TRIM_INTERVAL = 30s`, polls
-`SELECT pg_last_wal_replay_lsn()::text` from shadow, computes
-`cutoff_lsn = replay_lsn.saturating_sub(retention_bytes)`. Single
-`Arc<AtomicU64>` shared with status loop so metrics gauge + sweeper
-see the same value with one round-trip
+Sweeper task in `bin/stream.rs` runs every
+`DEFAULT_TRIM_INTERVAL = 30s`. It reads replay LSN from
+`pg_last_wal_replay_lsn()` and last restartpoint REDO LSN from
+`pg_control_checkpoint()`, then computes
+`cutoff_lsn = min(replay_lsn - retention_bytes, redo)`. Restarted
+shadow recovers from restartpoint, not current replay position, so
+`restore_command` must still find those segments. A failed query
+closes client and reconnects on next cycle because daemon may restart
+shadow. Status loop and sweeper share one `Arc<AtomicU64>`, so one
+query updates both metrics gauge and sweeper
 
 `--retention-bytes` default `DEFAULT_RETENTION_BYTES = 256 MiB` (~16 ×
 16 MiB segments). `--retention-bytes 0` disables sweeper outright.
@@ -319,9 +323,19 @@ Boot order ([`bin/stream.rs`](../src/bin/stream.rs)):
 Start-LSN precedence:
 
 1. `--start-lsn <hex>` — explicit operator override
-2. `cursor.emitter_ack_lsn` (segment-aligned down) when cursor present
+2. fresh bootstrap `end_lsn`, because shadow catalog already includes
+   earlier WAL
+3. `cursor.emitter_ack_lsn` (segment-aligned down) when cursor present
    and `--ignore-cursor` unset
-3. Source's current write head — greenfield
+4. Source's current write LSN when no saved state exists
+
+Resolved LSN aligns down to segment boundary. When no bootstrap ran and no
+`--start-lsn` was given, it cannot exceed end of last sealed segment
+in `out/` (`retention::max_segment_end`). Shadow alternates between
+`primary_conninfo` and `restore_command`, so archive must stay
+continuous until live streaming begins. Starting after archive end
+would leave a missing segment and prevent shadow from resuming. CH
+removes re-read duplicates by `_lsn`
 
 Per-field restart role is on cursor.bin layout table in diagram above.
 `emitter_ack_lsn` is load-bearing resume LSN (daemon restarts here);
@@ -389,7 +403,7 @@ Pipeline: `initdb` source PG `wal_level=logical` → `pgbench -i -s 1`
 `pgbench_history` requires FULL or an index; the PK tables would also
 pass under DEFAULT) → spawn CH + dest tables ReplacingMergeTree(_lsn) → spawn
 `walshadow-stream --bootstrap-mode=direct
---bootstrap-autospawn-shadow` → wait for metrics endpoint
+--bootstrap-shadow-data-dir <path>` → wait for metrics endpoint
 (bootstrap-finished gate, ~100k rows land via the shared insert tail) → `pgbench -T 6 -c 4 -j 2` background (CI uses 6
 s, plan called for 30 s) → +2 s `ALTER TABLE pgbench_accounts ADD
 COLUMN c int DEFAULT 7` (exercises read-time defaults via

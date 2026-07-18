@@ -127,7 +127,7 @@ configured denominator
    near the floor; `stream` is the whole decision. Choose coverage or exclusion
    explicitly. `stream` coverage means bootstrap off/direct/object-store paths,
    CH emitter + DDL setup, metrics-only observer, oracle wrapper on/off,
-   retention loop, object-store WAL fetch, autospawn success/failure, and
+   retention loop, object-store WAL fetch, shadow startup success/failure, and
    shutdown hooks. Prefer moving pure helpers into library modules before
    testing
 2. **Decoder/value matrix, `heap_decoder.rs`.** Varlena short / 4-byte /
@@ -144,7 +144,7 @@ configured denominator
 4. **Live control plane.** Validation hard-error, `seed_from_source`
    empty/known/new relation/not-found/error paths, TCP walsender listener,
    COPYDATA enqueue error, TCP/TLS source transports, direct/object-store
-   bootstrap, tablespace symlink, object-store WAL fetch, and shadow autospawn.
+   bootstrap, tablespace symlink, object-store WAL fetch, and shadow lifecycle.
    Extend existing e2e tests where state is real; add injectable clients or
    failing readers/writers where deterministic faults are needed
 5. **Defensive OS/transport/fault lines.** Add explicit fault injection for

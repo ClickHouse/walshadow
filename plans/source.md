@@ -390,10 +390,13 @@ reconnect. See [shadow.md](shadow.md)
 
 [`src/bin/stream.rs`](../src/bin/stream.rs). `walshadow-stream` daemon
 entry point. Boots in order: args + pre-flight validators
-([`preflight.rs`](../src/preflight.rs)); optional bootstrap (direct
-`BASE_BACKUP` from source, or wal-g-compatible from object store);
-`SourceFeed` connect + `IDENTIFY_SYSTEM` + derive `start_lsn` from
-cursor / `--start-lsn` / source's `xlogpos` aligned down;
+([`preflight.rs`](../src/preflight.rs)); bootstrap empty shadow or resume
+initialized shadow when `--bootstrap-shadow-data-dir` is set; bootstrap
+from direct `BASE_BACKUP` or wal-g-compatible object store backup
+([shadow.md](shadow.md)); connect `SourceFeed`; run `IDENTIFY_SYSTEM`;
+derive `start_lsn` from bootstrap `end_lsn`, cursor, `--start-lsn`, or
+source `xlogpos`; align it down and limit it to sealed archive end
+([ops.md](ops.md));
 `ShadowCatalog` + `XactBuffer` + `schema_events` subscription; bind
 walsender listener before shadow's walreceiver attaches; construct
 [`DaemonSinks`](../src/bin/stream.rs) (`MetricsRecordSink` +

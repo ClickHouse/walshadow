@@ -87,6 +87,33 @@ pub async fn trim_below_lsn(dir: &Path, cutoff_lsn: u64) -> Result<TrimReport, R
     Ok(report)
 }
 
+/// Return highest end LSN among sealed segments in `dir`
+/// Return `None` when no sealed segment exists
+/// Ignore `.partial` files because `restore_command` serves only sealed
+/// segments
+pub async fn max_segment_end(dir: &Path) -> Result<Option<u64>, RetentionError> {
+    let mut max_end = None;
+    if !dir.exists() {
+        return Ok(max_end);
+    }
+    let mut rd = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let (seg_str, kind) = classify(&name);
+        if !matches!(kind, FileKind::Segment) {
+            continue;
+        }
+        let Some(seg) = seg_str.and_then(|s| SegmentName::parse(s).ok()) else {
+            continue;
+        };
+        let end = seg.start_lsn(WAL_SEG_SIZE).saturating_add(WAL_SEG_SIZE);
+        max_end = Some(max_end.map_or(end, |m: u64| m.max(end)));
+    }
+    Ok(max_end)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum FileKind {
     Segment,
@@ -223,6 +250,33 @@ mod tests {
         let report = trim_below_lsn(dir, u64::MAX).await.unwrap();
         assert_eq!(report.segments_removed, 0);
         assert!(dir.join(raw).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_segment_end_keys_on_sealed_segments_only() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        assert_eq!(max_segment_end(dir).await.unwrap(), None);
+        touch(dir, &seg_name(1, 0, 2), b"seg");
+        touch(dir, &seg_name(1, 0, 4), b"seg");
+        // Ignore partial segment, manifest, and unrelated file
+        touch(dir, &format!("{}.partial", seg_name(1, 0, 7)), b"p");
+        touch(dir, &format!("{}.manifest.json", seg_name(1, 0, 7)), b"{}");
+        touch(dir, "README", b"hi");
+        let want = SegmentName {
+            timeline: 1,
+            log_id: 0,
+            seg_no: 4,
+        }
+        .start_lsn(WAL_SEG_SIZE)
+            + WAL_SEG_SIZE;
+        assert_eq!(max_segment_end(dir).await.unwrap(), Some(want));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_segment_end_missing_dir_is_none() {
+        let missing = std::path::Path::new("/this/path/does/not/exist/walshadow-retention-test");
+        assert_eq!(max_segment_end(missing).await.unwrap(), None);
     }
 
     #[test]

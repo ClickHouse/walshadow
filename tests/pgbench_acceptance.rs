@@ -10,7 +10,7 @@
 //!    refuses non-FULL identity on tracked rels)
 //! 3. spawn CH + pre-create dest tables ReplacingMergeTree(_lsn)
 //! 4. spawn walshadow-stream `--bootstrap-mode=direct
-//!    --bootstrap-autospawn-shadow` against the four-table CH config
+//!    --bootstrap-shadow-data-dir` against four-table CH config
 //! 5. await bootstrap (metrics endpoint up) → assert row counts match
 //! 6. `pgbench -T 30 -c 4 -j 2` in background; at +10s ADD COLUMN c
 //!    int DEFAULT 7 on pgbench_accounts (item 1 read-time defaults);
@@ -327,7 +327,7 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
     write_pgbench_ch_config(&ch_config_path, "127.0.0.1", ports.ch_tcp, "default")
         .expect("write ch-config");
 
-    // 6. Shadow autospawn layout — same quirk as direct-bootstrap drill.
+    // 6. Daemon-owned shadow layout, same quirk as direct-bootstrap drill.
     let bootstrap_shadow_data_dir = tmp.path().join("shadow-data");
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
@@ -390,7 +390,6 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
             "direct",
             "--bootstrap-shadow-data-dir",
             bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-autospawn-shadow",
             "--bootstrap-shadow-replay-timeout",
             "180",
             // N>1 here drives concurrent AsyncClients for bootstrap +
@@ -603,8 +602,12 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
         Ok(())
     })();
 
-    // Tear down autospawn'd shadow PG so postmaster is reaped before
-    // tempdir cleanup. Daemon's autospawn is start-only.
+    // Kill daemon before shadow so supervisor cannot restart it
+    // Stop any remaining postmaster before tempdir cleanup
+    let _ = guard.into_inner().map(|mut c| {
+        let _ = c.kill();
+        let _ = c.wait();
+    });
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());
@@ -614,10 +617,6 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
         let shadow = Shadow::new(shadow_cfg);
         let _ = shadow.stop();
     }
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
 
     if let Err(e) = result {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();

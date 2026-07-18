@@ -10,9 +10,10 @@ accepts writes from anywhere but source WAL feed
 
 Two surfaces:
 
-- **lifecycle** — process management (`initdb`, conf, `pg_ctl`),
-  bootstrap restore, recovery-mode startup. Owned by `Shadow` in
-  `src/shadow.rs`. Production daemon defers supervision to systemd
+- **lifecycle** — process management (config, `pg_ctl`), bootstrap
+  restore, recovery startup, supervision. `Shadow` in
+  `src/catalog/shadow.rs` provides operations. Daemon owns full
+  lifecycle whenever `--bootstrap-shadow-data-dir` is set
 - **catalog API** — async libpq client + LRU + replay-LSN gate +
   schema-event channel. Owned by `ShadowCatalog` in
   `src/shadow_catalog.rs`. Consumed by heap decoder & CH DDL applicator
@@ -23,39 +24,76 @@ otherwise compose at daemon level
 
 ## Lifecycle
 
-`Shadow` ([src/shadow.rs](../src/shadow.rs)) wraps `initdb`, `pg_ctl`,
-`psql` plus on-disk plumbing (`postgresql.conf`, `standby.signal`,
-`restore_command`, `primary_conninfo`) behind one struct. Bootstrap
-order:
+`Shadow` ([src/catalog/shadow.rs](../src/catalog/shadow.rs)) wraps
+`initdb`, `pg_ctl`, `psql`, and config files (`postgresql.conf`,
+`pg_hba.conf`, `standby.signal`, `restore_command`,
+`primary_conninfo`) in one struct. Daemon boot order with
+`--bootstrap-shadow-data-dir`:
 
-1. `initdb` — fresh empty cluster (~50 MiB, ~400 `pg_class` rows)
-2. `write_base_conf` — append walshadow knobs (port, unix socket,
-   `autovacuum = off`, `fsync = off`, `hot_standby = on`,
-   `wal_level = replica`, `max_wal_senders = 0`,
-   `listen_addresses = ''`)
-3. schema-only restore — see [bootstrap.md](bootstrap.md). Two paths:
-   `apply_schema_dump(sql)` pipes `pg_dump --schema-only` through
-   `psql -f -`; `BASE_BACKUP` greenfield copies source's catalog files
-   directly. `apply_schema_dump` takes `&str` payload, not source
-   connection — outbound source connection management lives in daemon
-4. `enable_standby_recovery(primary_conninfo)` — writes empty
-   `standby.signal`,
-   appends `primary_conninfo = '<walsender>'` + `restore_command =
-   'cp <filter_dir>/%f %p'` + `recovery_target_timeline = 'latest'`.
-   Standby (not recovery) signal: continuous-feed topology requires
-   staying in recovery indefinitely
-5. `start` — `pg_ctl -w start`, blocks until postmaster accepts
-   connections (~600 ms on PG 18, standby mode)
-6. `wait_for_replay(target, timeout)` — polls
-   `pg_last_wal_replay_lsn() ≥ target`. `target = 0` waits for any
-   non-NULL observation (post-startup catch-up)
-7. `health` — recovery state + replay LSN + `pg_class` count +
-   `pg_proc` lookup. Single-probe corruption canary
+1. Choose bootstrap or resume. Bootstrap only an empty data dir
+   according to `--bootstrap-mode` (see [bootstrap.md](bootstrap.md)).
+   Resume initialized cluster regardless of mode. If
+   `walshadow_bootstrap.incomplete` exists, fail without changing data
+   dir. Never turn standby recovery failure into automatic rebootstrap
+2. Run `write_standby_signal`. Standby signal keeps shadow in recovery
+   while it receives continuous WAL stream
+3. Run `control_guc_floor` and
+   `materialize_conf(floor, primary_conninfo)`. They read five minimum
+   GUC values from shadow's `pg_control` with `pg_controldata`.
+   `LC_ALL=C` keeps output labels stable. PostgreSQL
+   checks these values against `pg_control`, so reading them locally
+   matches WAL being replayed and avoids querying source. Current
+   source settings can differ from values required by older WAL. For
+   example, shadow with `max_connections = 100` cannot start when
+   `pg_control` requires 500. Replace `postgresql.conf` with
+   walshadow settings (port, unix socket,
+   `autovacuum = off`, `fsync = on`, `hot_standby = on`,
+   `wal_level = replica`, `listen_addresses = ''`),
+   `restore_command = 'cp <filter_dir>/%f %p'`,
+   `recovery_target_timeline = 'latest'`, and `primary_conninfo =
+   '<walsender>'`. Empty `postgresql.auto.conf` to remove source
+   `ALTER SYSTEM` settings included by BASE_BACKUP. Write
+   socket-only `pg_hba.conf` using trust authentication and empty
+   `pg_ident.conf`. Do not use config files from backup because Debian
+   stores them outside data dir under
+   `/etc/postgresql/<v>/<cluster>`
+4. Run `clear_stale_pid`, then `start_with_floor_retry`.
+   `pg_ctl -w start` waits for postmaster to accept connections
+   (~600 ms on PG 18 in standby mode). WAL can raise required GUC
+   values during startup. PostgreSQL first updates `pg_control`, then
+   aborts startup. On failure, read new values and retry. Return error
+   if values did not change. Include end of `startup.log` because
+   `pg_ctl` only reports "could not start server" while log includes
+   required value. After a fresh bootstrap, run
+   `wait_for_replay(end_lsn, timeout)` against WAL included in backup
+5. Call `is_running` every 2 s. If postmaster stops, restart it with
+   backoff and read minimum GUC values again. Hot standby can pause
+   replay when WAL requires higher value. Detect a pause with
+   `pg_get_wal_replay_pause_state()`, then confirm the cause: a floor
+   raise writes the higher value to `pg_control` before pausing, so a
+   `control_guc_floor` above the running `current_setting` values marks
+   it. Only then call `pg_wal_replay_resume()`; resume shuts server down,
+   allowing restart with updated values. A pause with floor equal to
+   running settings (operator `pg_wal_replay_pause`, recovery target)
+   holds untouched. On daemon exit, run `pg_ctl stop -m fast` so data
+   dir is ready for next startup
+6. Run `health` to check recovery state, replay LSN, `pg_class` count,
+   and `pg_proc` lookup in one corruption probe
+
+After bootstrap marker clears, every later start is standby recovery.
+WAL unavailability leaves recovery waiting or restarting against configured
+WAL sources; it never invokes bootstrap or replaces data dir
+
+Tests use `initdb` to create empty cluster (~50 MiB, ~400 `pg_class`
+rows), call `write_base_conf`, restore schema with
+`apply_schema_dump(sql)`, then call
+`enable_standby_recovery(primary_conninfo)`. `apply_schema_dump` sends
+`pg_dump --schema-only` output to `psql -f -` and accepts `&str`, not
+source connection
 
 Probes route through `psql -tAXq -c` via `psql_one` helper. Real libpq
 client lives in `ShadowCatalog`; mixing the two at this layer would
-duplicate connection state for no measurable win. Production deploys
-run shadow under systemd — walshadow does not babysit postmaster
+duplicate connection state for no measurable win
 
 ## Three channels to shadow
 
@@ -71,10 +109,11 @@ for rendered diagram:
    walreceiver (`primary_conninfo` in shadow's conf). Record-cadence
    WAL push, ms-scale. See [source.md](source.md) for source-side
    walsender walshadow itself consumes
-3. **restore_command archive fallback** — `cp out/%f %p` pulls completed
-   16 MiB segments from filter output dir. Segment-cadence, used by
-   shadow's walreceiver when wire disconnects or shadow restarts past
-   walshadow's segment-retention window
+3. **restore_command archive fallback** — `cp out/%f %p` copies
+   completed 16 MiB segments from filter output dir. Startup recovery
+   uses it after wire disconnects and while catching up after restart.
+   Retention keeps segments back to shadow's last restartpoint, see
+   [ops.md](ops.md)
 
 Channels (2) & (3) coexist by PG design: walreceiver tries
 `primary_conninfo` first, falls back to `restore_command` on connect
@@ -148,7 +187,7 @@ aborts disarm without sweeping
 
 `ShadowCatalog` stashes `conninfo` at construct time; diagram's
 reconnect path triggers transparently on client close (shadow bounce,
-OOM kill, systemd restart):
+OOM kill, supervisor restart):
 
 - `reconnect()` & `ensure_open()` are **private** async fns on
   `ShadowCatalog`. Earlier notes presented them as `pub` for
@@ -284,11 +323,13 @@ backfill, net-new knobs) is
   `XLH_UPDATE_CONTAINS_OLD_KEY` decode; `wal_level = replica`
   insufficient. Shadow itself runs at `wal_level = replica` because it
   never emits logical decoding
-- **process supervision out of scope.** Production deploys run shadow
-  under systemd, which owns crash recovery & restart policy.
-  `Shadow::start` / `stop` are bootstrap & test helpers; daemon does
-  not babysit postmaster. `ShadowCatalog`'s reconnect path absorbs
-  supervisor-driven bounces transparently
+- **daemon supervises process.** With
+  `--bootstrap-shadow-data-dir` set the daemon starts, probes, and
+  restarts postmaster with capped backoff, then stops it on exit.
+  Initialized standby always resumes; daemon never replaces it with a
+  new base backup. `ShadowCatalog` reconnects after each restart.
+  Without flag, shadow runs as external process such as k8s sidecar,
+  and another supervisor owns it
 - **PG version skew on cross-WAL replay.** Shadow's PG version must
   match (or exceed in compatible ways) source's. See PG 17 repro docker
   memory note for PG-17-specific repro layout
