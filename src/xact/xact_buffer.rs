@@ -1454,7 +1454,7 @@ impl XactBuffer {
 /// Tracks bytes resident inside an active drain. One instance per
 /// category (merge heads / sealed chunk generations / mirror rows), all
 /// feeding one total. Contribution subtracts on drop so an abandoned
-/// drain (observer error) can't wedge the gauge.
+/// drain (observer error) can't leave the gauge stuck.
 struct ResidentGauge {
     cur: Arc<AtomicU64>,
     peak: Arc<AtomicU64>,

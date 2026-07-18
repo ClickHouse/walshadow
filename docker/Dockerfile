@@ -4,8 +4,7 @@
 #   2. postgres:N-alpine     -> walshadow PG extension, compiled against the
 #      exact runtime PG (same image) so PG_MODULE_MAGIC matches. The stream
 #      binary itself links no PG, so it builds separately.
-#   3. postgres:N-alpine runtime carries both, so shadow PG (auto-spawned in
-#      this same container by --bootstrap-autospawn-shadow) can
+#   3. postgres:N-alpine runtime carries both, so daemon-owned shadow PG can
 #      `CREATE EXTENSION walshadow` against its own $libdir.
 
 ARG PG_MAJOR=18

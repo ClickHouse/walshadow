@@ -19,7 +19,7 @@
 //!         --bootstrap-backup-name=<resolved>
 //!     → ObjectStoreSource → MultiplexSink → pipeline::bootstrap::drain
 //!     → shared tail (batcher + inserter pool + ack) → default.t
-//!     → autospawn shadow PG against bootstrap_shadow_data_dir
+//!     → start shadow PG against bootstrap_shadow_data_dir
 //!     → WAL pump main loop
 //!   → assert_ch_matches_source(ch, source, "s14.t", "default.t")
 //! ```
@@ -209,9 +209,8 @@ async fn object_store_bootstrap_ch_end_to_end() {
     )
     .expect("write ch-config");
 
-    // 6. Shadow layout. `--bootstrap-autospawn-shadow` writes port +
-    //    socket overrides into the cloned data dir's auto.conf, so the
-    //    test no longer pre-seeds source-side overrides.
+    // 6. Shadow layout. Daemon writes port and socket config, so test
+    //    does not add source settings before bootstrap
     let bootstrap_shadow_data_dir = tmp.path().join("shadow-data");
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
@@ -269,7 +268,6 @@ async fn object_store_bootstrap_ch_end_to_end() {
             bootstrap_shadow_data_dir.to_str().unwrap(),
             "--bootstrap-backup-name",
             &backup_name,
-            "--bootstrap-autospawn-shadow",
             "--bootstrap-shadow-replay-timeout",
             "120",
         ])
@@ -290,8 +288,8 @@ async fn object_store_bootstrap_ch_end_to_end() {
     let guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
-        // 8. Wait for the daemon's metrics endpoint — bootstrap done,
-        //    autospawn'd shadow live, WAL pump alive. Bootstrap-emitter
+        // 8. Wait for daemon's metrics endpoint, bootstrap done,
+        //    daemon-owned shadow live, WAL pump alive. Bootstrap-emitter
         //    INSERTs flush to CH synchronously before the streaming
         //    pump starts, so the 64-row fixture lands on CH by this
         //    point.
@@ -307,7 +305,12 @@ async fn object_store_bootstrap_ch_end_to_end() {
         Ok(())
     })();
 
-    // 12. Tear down autospawn'd shadow PG.
+    // 12. Kill daemon before shadow so supervisor cannot restart it
+    //     Stop any remaining postmaster
+    let _ = guard.into_inner().map(|mut c| {
+        let _ = c.kill();
+        let _ = c.wait();
+    });
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());
@@ -317,10 +320,6 @@ async fn object_store_bootstrap_ch_end_to_end() {
         let shadow = Shadow::new(shadow_cfg);
         let _ = shadow.stop();
     }
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
 
     if let Err(e) = result {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();

@@ -79,8 +79,8 @@ Component docs live alongside this overview:
   `SourceFeed`, walsender server feeding shadow at record cadence,
   `WalStream` page walker, `streaming_walker`, `QueueingRecordSink`
   decoupling pump from decoder, `decoder_sink`
-- [shadow.md](shadow.md) — shadow PG lifecycle (`initdb`,
-  `recovery.signal`, supervision), `ShadowCatalog` libpq cache with
+- [shadow.md](shadow.md) — shadow PG lifecycle (`materialize_conf`,
+  `standby.signal`, supervision), `ShadowCatalog` libpq cache with
   generation counter + `relation_at` replay-LSN gate, per-relation
   `SchemaEvent` channel feeding CH DDL applicator
 - [decoder.md](decoder.md) — `heap_decoder` Tier 1/2 type matrix,

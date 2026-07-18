@@ -260,7 +260,7 @@ impl StagingSession {
     /// stream delivered during the pass carry `_lsn > S`; anything at or
     /// below `S` is prior-life state the swap just purged and must not come
     /// back. Column list is the intersection (destination order) so DDL
-    /// applied to the destination after the swap can't wedge the copy-back.
+    /// applied to the destination after the swap can't block the copy-back.
     pub async fn copy_back(&mut self, rel: &StagingRel) -> Result<()> {
         let real_cols = self
             .query_strings(&format!(

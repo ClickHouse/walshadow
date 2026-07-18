@@ -34,10 +34,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::fs;
 use std::future::Future;
-use std::io::Write as _;
 use std::pin::Pin;
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::PgLsn;
+use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
@@ -60,11 +60,13 @@ use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
 use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE};
-use walshadow::retention::{DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, trim_below_lsn};
+use walshadow::retention::{
+    DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, max_segment_end, trim_below_lsn,
+};
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::{RelName, SchemaEvent};
 use walshadow::segment_sink::{DirSegmentSink, SegFsync};
-use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, with_transient_retry};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::toast::ToastResolver;
@@ -73,11 +75,13 @@ use walshadow::xact_buffer::{
     BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig, XactRecordSink,
 };
 
-/// Bootstrap source pick: lands catalog files + standby.signal so a
-/// fresh shadow PG can be brought up against this run's `out_dir`.
+/// Choose bootstrap source for empty shadow data dir
+/// Initialized data dir resumes regardless of mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 enum BootstrapMode {
-    /// Caller supplied shadow data dir externally (e.g. `pg_basebackup`)
+    /// Never bootstrap. Without `--bootstrap-shadow-data-dir`, manage shadow
+    /// externally. With data dir, manage initialized cluster but reject
+    /// empty dir
     #[default]
     Off,
     /// Source-PG-driven BASE_BACKUP over the replication protocol,
@@ -232,8 +236,12 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     shadow_connect_timeout: u64,
     /// Walsender bind address. `127.0.0.1:0` lets the kernel pick a free
-    /// port; set explicitly when shadow's `primary_conninfo` references
-    /// a fixed port.
+    /// port, valid only for externally managed shadow (no
+    /// `--bootstrap-shadow-data-dir`): operator reads
+    /// `--walsender-port-file` and configures `primary_conninfo` by hand.
+    /// Daemon-owned shadow bakes this address into shadow's generated
+    /// `primary_conninfo` before shadow starts, so it rejects port 0 —
+    /// pass an explicit port there.
     #[arg(long, default_value = "127.0.0.1:0")]
     walsender_bind: SocketAddr,
     /// File the daemon writes the bound walsender address into (one line
@@ -341,18 +349,17 @@ struct Args {
     /// progresses.
     #[arg(long, default_value_t = false)]
     ignore_cursor: bool,
-    /// Bootstrap source pick. `off` keeps shadow externally bootstrapped.
-    /// `direct` issues BASE_BACKUP over the same replication connection;
-    /// `object_store` pulls a wal-g-format backup from `DynStorage`
-    /// (`WALG_*` env vars). Both modes land catalog files + standby.signal +
-    /// restore_command to `--bootstrap-shadow-data-dir`, then resume the
-    /// WAL pump at the backup's `end_lsn` (overriding cursor / `--start-lsn`).
+    /// Bootstrap source for empty shadow data dir. `off` never bootstraps;
+    /// `direct` runs BASE_BACKUP over current replication connection;
+    /// `object_store` reads wal-g-format backup from `DynStorage`
+    /// (`WALG_*` env vars). Initialized data dir resumes without bootstrap
+    /// regardless of mode
     #[arg(long, value_enum, default_value_t = BootstrapMode::Off)]
     bootstrap_mode: BootstrapMode,
-    /// Shadow PG data dir the bootstrap lands catalogs into; PG recovery's
-    /// `restore_command` then consumes `out_dir/<seg>.partial` to replay
-    /// WAL beyond `end_lsn`. Required when `--bootstrap-mode != off`. Must
-    /// be empty (or non-existent) at boot.
+    /// Shadow PG data dir. When set, daemon bootstraps or resumes shadow,
+    /// writes config, starts and supervises postmaster, then stops it on
+    /// exit. When unset, manage shadow externally. Required when
+    /// `--bootstrap-mode != off`
     #[arg(long)]
     bootstrap_shadow_data_dir: Option<PathBuf>,
     /// Object-store backup name. `LATEST` resolves to newest sentinel;
@@ -368,15 +375,8 @@ struct Args {
     /// cost matters more than bootstrap latency.
     #[arg(long, default_value_t = true)]
     bootstrap_fast_checkpoint: bool,
-    /// Auto-spawn shadow PG against `--bootstrap-shadow-data-dir` after
-    /// the bootstrap pump returns (drives `pg_ctl start`, waits for
-    /// `pg_last_wal_replay_lsn` to clear `end_lsn`). Off so external
-    /// supervisors (systemd, k8s) own shadow lifecycle without
-    /// double-management.
-    #[arg(long, default_value_t = false)]
-    bootstrap_autospawn_shadow: bool,
-    /// Seconds budget for `--bootstrap-autospawn-shadow`'s wait on shadow's
-    /// replay LSN. Exceeded → daemon aborts.
+    /// Maximum seconds to wait for shadow replay after bootstrap
+    /// Abort daemon when timeout expires
     #[arg(long, default_value_t = 300)]
     bootstrap_shadow_replay_timeout: u64,
 }
@@ -493,6 +493,15 @@ async fn run(args: Args) -> Result<()> {
                 "SIGHUP install failed; reload disabled",
             );
         })?;
+    // Match systemd SIGTERM with ctrl_c shutdown path
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .inspect_err(|e| {
+            tracing::warn!(
+                target: "walshadow",
+                error = %e,
+                "SIGTERM install failed",
+            );
+        })?;
     let sslmode = SslMode::parse(&args.sslmode).context("--sslmode")?;
     let cfg = PgConfig {
         host: args.host.clone(),
@@ -538,24 +547,37 @@ async fn run(args: Args) -> Result<()> {
     // Effective physical replication slot (`[source] slot` + --slot override);
     // None = slotless.
     let source_slot: Option<String> = ch_config.as_ref().and_then(|c| c.source_slot.clone());
-    let bootstrap_end_lsn: Option<u64> = if matches!(args.bootstrap_mode, BootstrapMode::Off) {
-        None
-    } else {
+    let shadow_start = resolve_shadow_start(&args)?;
+    let bootstrap_end_lsn: Option<u64> = if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
         Some(
             run_bootstrap(&cfg, &mut feed, &args, ch_config.clone())
                 .await
                 .context("bootstrap")?,
         )
+    } else {
+        None
     };
-    if let Some(end_lsn) = bootstrap_end_lsn
-        && args.bootstrap_autospawn_shadow
-    {
-        let shadow_data_dir = args
-            .bootstrap_shadow_data_dir
-            .clone()
-            .context("--bootstrap-shadow-data-dir required with --bootstrap-autospawn-shadow")?;
-        autospawn_shadow_and_wait(&args, shadow_data_dir, end_lsn).await?;
-    }
+    // Regenerate config because walsender address and port may change
+    // Read minimum GUC values from shadow pg_control
+    // Keep shadow alive until pipeline teardown finishes
+    let shadow_lifecycle: Option<ShadowLifecycle> = match &shadow_start {
+        ShadowStart::External => None,
+        ShadowStart::Bootstrap(dir) | ShadowStart::Resume(dir) => {
+            let shadow = Arc::new(build_owned_shadow(&args, dir.clone()));
+            let conninfo = walsender_primary_conninfo(args.walsender_bind);
+            shadow
+                .write_standby_signal()
+                .context("write standby.signal")?;
+            start_owned_shadow(
+                &shadow,
+                conninfo.clone(),
+                bootstrap_end_lsn,
+                Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+            )
+            .await?;
+            Some(ShadowLifecycle::spawn(shadow, conninfo))
+        }
+    };
 
     // Resume precedence: `--start-lsn` > cursor.bin emitter-ack > greenfield
     // (source write head). `--ignore-cursor` forces greenfield (recovery drills).
@@ -589,7 +611,26 @@ async fn run(args: Args) -> Result<()> {
         cursor_at_boot.as_ref().map(|c| c.emitter_ack_lsn),
         ident.xlogpos,
     );
-    let aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
+    let mut aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
+    // Keep archive continuous until live streaming begins
+    // Starting after last sealed segment leaves shadow missing WAL
+    // Re-read from earlier LSN, CH removes duplicates using `_lsn`
+    // Preserve fresh bootstrap position and explicit `--start-lsn`
+    if bootstrap_end_lsn.is_none()
+        && start_lsn_override.is_none()
+        && let Some(archive_end) = max_segment_end(&args.out_dir)
+            .await
+            .context("scan out-dir for sealed archive end")?
+        && archive_end < aligned
+    {
+        tracing::info!(
+            target: "walshadow",
+            archive_end = format_pg_lsn(archive_end).to_string(),
+            unclamped = format_pg_lsn(aligned).to_string(),
+            "resume clamped to sealed archive end",
+        );
+        aligned = archive_end;
+    }
     tracing::info!(
         target: "walshadow",
         raw = format_pg_lsn(raw_start).to_string(),
@@ -1303,6 +1344,7 @@ async fn run(args: Args) -> Result<()> {
                 sig.context("install ctrl_c handler")?;
                 break "signal";
             }
+            _ = sigterm.recv() => break "signal",
             // Idle tick so metrics/cursor keep tracking the draining pipeline
             // when no new WAL arrives.
             _ = tokio::time::sleep(metrics_tick) => None,
@@ -1534,6 +1576,9 @@ async fn run(args: Args) -> Result<()> {
             .join()
             .await
             .map_err(|m| anyhow::anyhow!("decode+insert pipeline drain failed: {m}"))?;
+    }
+    if let Some(lifecycle) = shadow_lifecycle {
+        lifecycle.shutdown().await;
     }
     Ok(())
 }
@@ -1851,9 +1896,11 @@ fn spawn_segment_fsync(
     })
 }
 
-/// Retention sweeper: every [`DEFAULT_TRIM_INTERVAL`], query shadow's
-/// `pg_last_wal_replay_lsn()` and trim segments older than
-/// `replay_lsn - retention_bytes`.
+/// Every [`DEFAULT_TRIM_INTERVAL`], read shadow replay LSN and last
+/// restartpoint REDO LSN, then trim below
+/// `min(replay_lsn - retention_bytes, redo)`
+/// Keep WAL from restartpoint because shadow resumes recovery there
+/// Reconnect after failed query because daemon may restart shadow
 fn spawn_retention(
     out_dir: PathBuf,
     retention_bytes: u64,
@@ -1861,29 +1908,37 @@ fn spawn_retention(
     shadow_replay_lsn: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let client = match open_retention_client(&shadow_conninfo).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    target: "walshadow::retention",
-                    error = %e,
-                    "shadow connect failed; retention disabled",
-                );
-                return;
-            }
-        };
+        let mut client: Option<tokio_postgres::Client> = None;
         loop {
             tokio::time::sleep(DEFAULT_TRIM_INTERVAL).await;
-            let lsn = match query_replay_lsn(&client).await {
-                Ok(Some(l)) => l,
-                Ok(None) => continue, // shadow hasn't replayed anything yet
+            if client.is_none() {
+                match open_retention_client(&shadow_conninfo).await {
+                    Ok(c) => client = Some(c),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "walshadow::retention",
+                            error = %e,
+                            "shadow connect failed; retrying next cycle",
+                        );
+                        continue;
+                    }
+                }
+            }
+            let (replay, redo) = match query_replay_state(client.as_ref().expect("just set")).await
+            {
+                Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(target: "walshadow::retention", error = %e, "lsn query");
+                    client = None;
                     continue;
                 }
             };
+            // Wait until shadow replays first record
+            let Some(lsn) = replay else { continue };
             shadow_replay_lsn.fetch_max(lsn, Ordering::Release);
-            let cutoff = lsn.saturating_sub(retention_bytes);
+            let cutoff = lsn
+                .saturating_sub(retention_bytes)
+                .min(redo.unwrap_or(u64::MAX));
             match trim_below_lsn(&out_dir, cutoff).await {
                 Ok(r) if r.segments_removed > 0 => {
                     tracing::info!(
@@ -1911,12 +1966,16 @@ async fn open_retention_client(conninfo: &str) -> Result<tokio_postgres::Client>
     Ok(client)
 }
 
-async fn query_replay_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>> {
+async fn query_replay_state(client: &tokio_postgres::Client) -> Result<(Option<u64>, Option<u64>)> {
     let row = client
-        .query_one("SELECT pg_last_wal_replay_lsn()", &[])
+        .query_one(
+            "SELECT pg_last_wal_replay_lsn(), redo_lsn FROM pg_control_checkpoint()",
+            &[],
+        )
         .await?;
-    let lsn: Option<PgLsn> = row.get(0);
-    Ok(lsn.map(u64::from))
+    let replay: Option<PgLsn> = row.get(0);
+    let redo: Option<PgLsn> = row.get(1);
+    Ok((replay.map(u64::from), redo.map(u64::from)))
 }
 
 /// Shadow-side numbers for the metrics publish step, from
@@ -2171,18 +2230,11 @@ async fn reconnect_or_fatal(
         .map_err(recycled)
 }
 
-/// Orchestrate BASE_BACKUP into a fresh shadow data dir; returns the
-/// backup's `end_lsn` so the caller rebinds the WAL pump past it.
-///
-/// Operator contract after this returns:
-///
-/// 1. Bring up shadow PG with `standby.signal` + `restore_command`
-///    pointing at `--out-dir` (both written here).
-/// 2. Shadow consumes filtered WAL segments the daemon produces against
-///    `--out-dir` and replays them.
-/// 3. No automatic shadow-process management; a service manager (systemd,
-///    k8s) owning shadow should start it once `bootstrap_shadow_data_dir`
-///    exists and is non-empty (true once this returns).
+/// Run BASE_BACKUP into new shadow data dir and return backup `end_lsn`
+/// Caller starts WAL pump from returned LSN, then starts and supervises
+/// shadow in [`run`]
+/// [`BOOTSTRAP_INCOMPLETE_MARKER`] remains after any failed bootstrap;
+/// automatic rebootstrap is intentionally unsupported
 ///
 /// `ch_config` `Some`: bootstrap rows route through the shared insert tail
 /// (synthetic INSERT `_lsn = start_lsn`, `_commit_ts = 0`, `_is_deleted = 0`).
@@ -2199,6 +2251,9 @@ async fn run_bootstrap(
         .bootstrap_shadow_data_dir
         .clone()
         .context("--bootstrap-shadow-data-dir required when --bootstrap-mode != off")?;
+    prepare_bootstrap_dir(&shadow_data_dir)
+        .await
+        .context("prepare shadow data dir for bootstrap")?;
 
     // Seed catalog map inside a REPEATABLE READ snapshot. DDL between the
     // seed COMMIT and BASE_BACKUP's checkpoint window is operator-quiesced
@@ -2234,11 +2289,10 @@ async fn run_bootstrap(
                     fast_checkpoint: args.bootstrap_fast_checkpoint,
                     no_verify_checksums: false,
                     max_rate_kib: None,
-                    // Ship pg_wal [start_lsn, end_lsn] inside base.tar so the
-                    // auto-spawned shadow hits `minRecoveryPoint` from local WAL
-                    // alone. Else `pg_ctl -w start` polls `restore_command`
-                    // against an `out/` dir the streamer hasn't filled yet
-                    // (queued behind autospawn) and times out.
+                    // Ship pg_wal [start_lsn, end_lsn] inside base.tar so
+                    // daemon-owned shadow reaches `minRecoveryPoint` locally.
+                    // Otherwise `pg_ctl -w start` polls `restore_command`
+                    // against empty `out/` before WAL pump starts and times out.
                     wal: true,
                 };
                 (Box::new(DirectSource::new(src_cfg.clone(), opts)), None)
@@ -2379,8 +2433,8 @@ async fn run_bootstrap(
 
     // Object-store mode: hydrate shadow's pg_wal/ before pg_ctl. wal-g
     // backups keep WAL in wal_005/ separately (direct mode shipped it in
-    // base.tar). Skipping deadlocks autospawn_shadow_and_wait: empty out/
-    // dir for restore_command, walsender not yet bound.
+    // base.tar). Skipping blocks shadow startup: restore_command sees empty
+    // out/ and walsender has not bound yet.
     if let Some((settings, storage)) = object_store_handles {
         fetch_wal_into_pg_wal(
             &settings,
@@ -2394,12 +2448,6 @@ async fn run_bootstrap(
         .context("bootstrap: hydrate shadow pg_wal from object store")?;
     }
 
-    // primary_conninfo points at the daemon's walsender; restore_command
-    // is the archive fallback. PG's walreceiver tries the wire first, falls
-    // back on disconnect or end-of-WAL.
-    write_standby_config(&shadow_data_dir, &args.out_dir, args.walsender_bind)
-        .context("bootstrap: write standby.signal + primary_conninfo + restore_command")?;
-
     // PG refuses to start on a data dir whose mode isn't 0700 or 0750.
     // BASE_BACKUP tar carries no entry for the root, so extraction leaves
     // it at the process umask (typically 0755); reassert 0700 before pg_ctl.
@@ -2412,132 +2460,334 @@ async fn run_bootstrap(
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 
+    tokio::fs::remove_file(shadow_data_dir.join(BOOTSTRAP_INCOMPLETE_MARKER))
+        .await
+        .context("clear completed bootstrap marker")?;
+
     Ok(outcome.end.end_lsn)
 }
 
-/// Boot shadow PG against the bootstrapped data dir and wait until its
-/// replay LSN clears `end_lsn`. Sync `pg_ctl` / `psql` shells run via
-/// `block_in_place` so the runtime keeps progressing other tasks.
-/// Reuses `--shadow-socket-dir` / `--shadow-port` (same socket
-/// `ShadowCatalog` connects to later).
-async fn autospawn_shadow_and_wait(
-    args: &Args,
-    shadow_data_dir: PathBuf,
-    end_lsn: u64,
-) -> Result<()> {
-    // BASE_BACKUP ships source's postgresql.conf verbatim; without override
-    // shadow inherits source's port / listen_addresses / socket dir and
-    // collides with the still-running source. Write last-wins overrides into
-    // postgresql.auto.conf so the clone comes up on the `--shadow-*` values.
-    write_shadow_listener_overrides(&shadow_data_dir, args.shadow_port, &args.shadow_socket_dir)
-        .context("bootstrap: write shadow listener overrides")?;
+/// Mark bootstrap before extraction, clear only after backup and required
+/// object-store WAL land successfully. Refuse automatic rebootstrap when
+/// marker survives a failed run
+const BOOTSTRAP_INCOMPLETE_MARKER: &str = "walshadow_bootstrap.incomplete";
 
-    let mut cfg = ShadowConfig::new(shadow_data_dir.clone(), args.out_dir.clone());
+/// Choose external management, one-time bootstrap, or resume from
+/// `--bootstrap-shadow-data-dir` and data dir state
+/// Mode only chooses bootstrap source
+enum ShadowStart {
+    /// Connect to externally managed shadow when no data dir is given
+    External,
+    Bootstrap(PathBuf),
+    Resume(PathBuf),
+}
+
+fn resolve_shadow_start(args: &Args) -> Result<ShadowStart> {
+    let Some(dir) = &args.bootstrap_shadow_data_dir else {
+        anyhow::ensure!(
+            matches!(args.bootstrap_mode, BootstrapMode::Off),
+            "--bootstrap-mode {:?} requires --bootstrap-shadow-data-dir",
+            args.bootstrap_mode,
+        );
+        return Ok(ShadowStart::External);
+    };
+    anyhow::ensure!(
+        args.walsender_bind.port() != 0,
+        "--walsender-bind {} has port 0; daemon-owned shadow bakes this \
+         address into shadow's primary_conninfo before shadow starts, so the \
+         port must be known upfront, pass an explicit --walsender-bind port",
+        args.walsender_bind,
+    );
+    for (flag, other) in [
+        ("--out-dir", &args.out_dir),
+        ("--spill-dir", &args.spill_dir),
+        ("--shadow-socket-dir", &args.shadow_socket_dir),
+    ] {
+        anyhow::ensure!(
+            !paths_overlap(dir, other),
+            "--bootstrap-shadow-data-dir {} overlaps {flag} {}",
+            dir.display(),
+            other.display(),
+        );
+    }
+    anyhow::ensure!(
+        !dir.join(BOOTSTRAP_INCOMPLETE_MARKER).exists(),
+        "shadow data dir {} contains {BOOTSTRAP_INCOMPLETE_MARKER}; bootstrap incomplete, automatic rebootstrap unsupported, choose a new empty data dir or use operator recovery",
+        dir.display(),
+    );
+    if dir.join("PG_VERSION").exists() {
+        if !matches!(args.bootstrap_mode, BootstrapMode::Off) {
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                data_dir = %dir.display(),
+                "shadow data dir already initialized, resuming without bootstrap",
+            );
+        }
+        return Ok(ShadowStart::Resume(dir.clone()));
+    }
+    anyhow::ensure!(
+        !matches!(args.bootstrap_mode, BootstrapMode::Off),
+        "shadow data dir {} does not contain an initialized cluster; --bootstrap-mode off cannot bootstrap it, pass direct or object_store",
+        dir.display(),
+    );
+    Ok(ShadowStart::Bootstrap(dir.clone()))
+}
+
+/// True if `a` and `b` are the same path, or one is an ancestor of the other
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    match (std::path::absolute(a), std::path::absolute(b)) {
+        (Ok(a), Ok(b)) => a == b || a.starts_with(&b) || b.starts_with(&a),
+        _ => true,
+    }
+}
+
+/// Require empty data dir and mark bootstrap in progress
+/// Never clear partial or initialized standby state automatically
+async fn prepare_bootstrap_dir(dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("create {}", dir.display()))?;
+    let mut rd = tokio::fs::read_dir(dir).await?;
+    anyhow::ensure!(
+        rd.next_entry().await?.is_none(),
+        "shadow data dir {} is non-empty; automatic rebootstrap unsupported, choose a new empty data dir or use operator recovery",
+        dir.display(),
+    );
+    tokio::fs::write(dir.join(BOOTSTRAP_INCOMPLETE_MARKER), b"").await?;
+    Ok(())
+}
+
+fn build_owned_shadow(args: &Args, data_dir: PathBuf) -> Shadow {
+    let mut cfg = ShadowConfig::new(data_dir, args.out_dir.clone());
     cfg.port = args.shadow_port;
     cfg.socket_dir = args.shadow_socket_dir.clone();
     cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
-    let shadow = Shadow::new(cfg);
-    let timeout = Duration::from_secs(args.bootstrap_shadow_replay_timeout);
-
-    tracing::info!(
-        target: "walshadow::bootstrap",
-        data_dir = %shadow_data_dir.display(),
-        end_lsn = format_pg_lsn(end_lsn).to_string(),
-        replay_timeout_secs = args.bootstrap_shadow_replay_timeout,
-        "auto-spawning shadow PG",
-    );
-    let replay_lsn = tokio::task::block_in_place(move || -> Result<u64> {
-        shadow.start().context("auto-spawn: shadow start")?;
-        shadow
-            .wait_for_replay(end_lsn, timeout)
-            .context("auto-spawn: wait_for_replay")
-    })?;
-    tracing::info!(
-        target: "walshadow::bootstrap",
-        replay_lsn = format_pg_lsn(replay_lsn).to_string(),
-        "shadow caught up to bootstrap end_lsn",
-    );
-    Ok(())
+    cfg.user = args.shadow_user.clone();
+    cfg.dbname = args.shadow_dbname.clone();
+    Shadow::new(cfg)
 }
 
-/// Write `standby.signal` (zero-byte marker) + append `restore_command`
-/// so shadow starts in standby mode and feeds from the daemon's
-/// filtered-segment dir. Idempotent (appended once).
-fn write_standby_config(
-    shadow_data_dir: &Path,
-    filter_out_dir: &Path,
-    walsender_bind: SocketAddr,
-) -> Result<()> {
-    fs::create_dir_all(shadow_data_dir)?;
-    fs::write(shadow_data_dir.join("standby.signal"), b"")?;
-    let conf = shadow_data_dir.join("postgresql.auto.conf");
-    let marker = "# walshadow bootstrap";
-    if conf.exists() {
-        let existing = fs::read_to_string(&conf).unwrap_or_default();
-        if existing.contains(marker) {
-            return Ok(());
-        }
-    }
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&conf)?;
-    writeln!(f, "\n{marker}")?;
-    // Skip primary_conninfo when port=0: kernel-picked addresses are
-    // unstable across daemon restarts, fall back to archive-only.
-    if walsender_bind.port() != 0 {
-        writeln!(
-            f,
-            "primary_conninfo = 'host={} port={} user=walshadow application_name=shadow sslmode=disable'",
-            walsender_bind.ip(),
-            walsender_bind.port(),
-        )?;
-    }
-    writeln!(
-        f,
-        "restore_command = 'cp {}/%f %p'",
-        filter_out_dir.display()
-    )?;
-    Ok(())
+/// Return `None` for kernel-assigned port because it may change after
+/// restart. Shadow then reads only archive through `restore_command`
+fn walsender_primary_conninfo(bind: SocketAddr) -> Option<String> {
+    (bind.port() != 0).then(|| {
+        format!(
+            "host={} port={} user=walshadow application_name=shadow sslmode=disable",
+            bind.ip(),
+            bind.port(),
+        )
+    })
 }
 
-/// Append shadow-side `port` / `unix_socket_directories` /
-/// `listen_addresses` to the cloned data dir's `postgresql.auto.conf`.
-/// PG honours last-wins-per-key across the conf chain, so these override
-/// what source's conf carried into the BASE_BACKUP. Idempotent via a marker.
-///
-/// `listen_addresses = ''` disables TCP: shadow is local-only over the
-/// socket dir. Operators wanting TCP override via `ALTER SYSTEM SET
-/// listen_addresses = ...` after first boot.
-fn write_shadow_listener_overrides(
-    shadow_data_dir: &Path,
-    port: u16,
-    socket_dir: &Path,
+/// Start daemon-owned shadow with current walsender address and minimum
+/// GUC values from its `pg_control`
+/// After fresh bootstrap, wait for backup `end_lsn`; direct mode includes
+/// required WAL in `base.tar`
+/// Restart a postmaster left alive by an unclean prior exit so it binds
+/// this daemon's port, socket, and walsender address
+async fn start_owned_shadow(
+    shadow: &Arc<Shadow>,
+    conninfo: Option<String>,
+    replay_target: Option<u64>,
+    replay_timeout: Duration,
 ) -> Result<()> {
-    let conf = shadow_data_dir.join("postgresql.auto.conf");
-    let marker = "# walshadow shadow-listener overrides";
-    if conf.exists() {
-        let existing = fs::read_to_string(&conf).unwrap_or_default();
-        if existing.contains(marker) {
-            return Ok(());
+    let s = shadow.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if s.is_running().context("shadow status probe")? {
+            // Adopt only fires after unclean prior exit left the postmaster
+            // alive holding stale port/socket/primary_conninfo. Stop so the
+            // restart below binds params this daemon connects and streams with;
+            // start_with_floor_retry regenerates conf.
+            tracing::warn!(
+                target: "walshadow::shadow",
+                "shadow alive from unclean exit; restarting under fresh config",
+            );
+            s.stop().context("stop stale shadow before restart")?;
+        }
+        s.clear_stale_pid().context("clear stale postmaster.pid")?;
+        s.start_with_floor_retry(conninfo.as_deref())
+            .context("shadow start")?;
+        if let Some(target) = replay_target {
+            let lsn = s
+                .wait_for_replay(target, replay_timeout)
+                .context("wait for shadow replay of bootstrap end_lsn")?;
+            tracing::info!(
+                target: "walshadow::shadow",
+                replay_lsn = format_pg_lsn(lsn).to_string(),
+                "shadow caught up to bootstrap end_lsn",
+            );
+        }
+        Ok(())
+    })
+    .await
+    .context("shadow start task")?
+}
+
+const SHADOW_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const SHADOW_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Supervise daemon-owned shadow, restarting stopped postmaster with
+/// backoff. `ShadowCatalog` reconnects after restart
+/// Read minimum GUC values from `pg_control` before each restart because
+/// replayed `XLOG_PARAMETER_CHANGE` may raise them
+/// Call `shutdown` on clean exit; Drop is just a fallback, its abort
+/// can race a restart already in flight on the blocking pool
+struct ShadowLifecycle {
+    shadow: Arc<Shadow>,
+    supervisor: Option<tokio::task::JoinHandle<()>>,
+    cancel: CancellationToken,
+}
+
+impl ShadowLifecycle {
+    fn spawn(shadow: Arc<Shadow>, conninfo: Option<String>) -> Self {
+        let cancel = CancellationToken::new();
+        let supervisor = tokio::spawn(Self::supervise(shadow.clone(), conninfo, cancel.clone()));
+        Self {
+            shadow,
+            supervisor: Some(supervisor),
+            cancel,
         }
     }
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&conf)?;
-    writeln!(f, "\n{marker}")?;
-    writeln!(f, "port = {port}")?;
-    writeln!(f, "unix_socket_directories = '{}'", socket_dir.display())?;
-    writeln!(f, "listen_addresses = ''")?;
-    Ok(())
+
+    async fn supervise(shadow: Arc<Shadow>, conninfo: Option<String>, cancel: CancellationToken) {
+        let mut backoff = Duration::from_secs(1);
+        // Edge-trigger the foreign-pause log so a held operator pause does
+        // not spam once per tick
+        let mut foreign_logged = false;
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(SHADOW_PROBE_INTERVAL) => {}
+            }
+            match probe_blocking(&shadow, |s| s.is_running()).await {
+                Some(true) => {
+                    backoff = Duration::from_secs(1);
+                    // Higher GUC requirement pauses active hot standby
+                    // Resume forces shutdown, then restart uses new values
+                    // Ignore probe errors while psql waits for consistency
+                    let s = shadow.clone();
+                    let outcome =
+                        tokio::task::spawn_blocking(move || s.try_pg_wal_replay_resume()).await;
+                    match outcome {
+                        Ok(Ok(ResumeOutcome::ResumedForFloor)) => {
+                            foreign_logged = false;
+                            tracing::warn!(
+                                target: "walshadow::shadow",
+                                "shadow replay paused because GUC value is below primary; \
+                                 resumed replay to restart with required value",
+                            );
+                        }
+                        Ok(Ok(ResumeOutcome::PausedForeign)) => {
+                            if !foreign_logged {
+                                foreign_logged = true;
+                                tracing::info!(
+                                    target: "walshadow::shadow",
+                                    "shadow replay paused for a reason other than GUC floor \
+                                     (eg operator pg_wal_replay_pause); leaving paused",
+                                );
+                            }
+                        }
+                        Ok(Ok(ResumeOutcome::NotPaused)) => foreign_logged = false,
+                        _ => {}
+                    }
+                }
+                Some(false) => {
+                    tracing::warn!(
+                        target: "walshadow::shadow",
+                        "shadow postmaster stopped, restarting",
+                    );
+                    let ci = conninfo.clone();
+                    let restarted = probe_blocking(&shadow, move |s| {
+                        s.clear_stale_pid()?;
+                        s.start_with_floor_retry(ci.as_deref())
+                    })
+                    .await;
+                    if restarted.is_some() {
+                        tracing::info!(target: "walshadow::shadow", "shadow restarted");
+                        backoff = Duration::from_secs(1);
+                    } else {
+                        tokio::select! {
+                            () = cancel.cancelled() => return,
+                            () = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(SHADOW_RESTART_BACKOFF_MAX);
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Signal supervisor and join it — this waits out any probe/restart
+    /// already in flight rather than racing past it — then stop shadow
+    /// with the now-settled state. Call on every clean exit path; Drop
+    /// covers whatever this misses.
+    async fn shutdown(mut self) {
+        self.cancel.cancel();
+        if let Some(h) = self.supervisor.take()
+            && let Err(e) = h.await
+        {
+            tracing::warn!(target: "walshadow::shadow", error = %e, "shadow supervisor join failed");
+        }
+        if let Some(true) = probe_blocking(&self.shadow, |s| s.is_running()).await
+            && probe_blocking(&self.shadow, |s| s.stop()).await.is_none()
+        {
+            tracing::warn!(target: "walshadow::shadow", "shadow stop on shutdown failed");
+        }
+    }
+}
+
+/// Run blocking `pg_ctl` operation outside async runtime
+/// Return `None` after logging failure
+async fn probe_blocking<T: Send + 'static>(
+    shadow: &Arc<Shadow>,
+    op: impl FnOnce(&Shadow) -> walshadow::shadow::Result<T> + Send + 'static,
+) -> Option<T> {
+    let s = shadow.clone();
+    match tokio::task::spawn_blocking(move || op(&s)).await {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "walshadow::shadow", error = %e, "shadow op failed");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(target: "walshadow::shadow", error = %e, "shadow op join failed");
+            None
+        }
+    }
+}
+
+impl Drop for ShadowLifecycle {
+    fn drop(&mut self) {
+        if let Some(h) = &self.supervisor {
+            h.abort();
+        }
+        // Daemon is exiting, blocking pg_ctl cannot delay other work
+        match self.shadow.is_running() {
+            Ok(true) => {
+                if let Err(e) = self.shadow.stop() {
+                    tracing::warn!(
+                        target: "walshadow::shadow",
+                        error = %e,
+                        "shadow stop on daemon exit failed",
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                target: "walshadow::shadow",
+                error = %e,
+                "shadow status probe on daemon exit failed",
+            ),
+        }
+    }
 }
 
 /// Pull WAL `[start_lsn, end_lsn]` on `timeline` from wal-rus storage into
-/// `<shadow_data_dir>/pg_wal/` so auto-spawned shadow recovery hits
+/// `<shadow_data_dir>/pg_wal/` so daemon-owned shadow recovery reaches
 /// `minRecoveryPoint` from local WAL, depending on neither `restore_command`
-/// (filtered out-dir empty until the post-autospawn WAL pump) nor
-/// `primary_conninfo` (walsender binds later in `run`).
+/// (filtered out-dir stays empty until WAL pump starts) nor `primary_conninfo`
+/// (walsender binds later in `run`).
 ///
 /// `walrus::pg::backup::push::handle` sets `wal: false`, so object-store
 /// tars don't carry WAL; it lives in `wal_005/` (wal-push / archive_command).
@@ -2603,52 +2853,119 @@ async fn fetch_wal_into_pg_wal(
 mod tests {
     use super::*;
 
-    #[test]
-    fn write_standby_config_writes_signal_and_conninfo_idempotently() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let filt = tmp.path().join("filt");
-        let bind = "127.0.0.1:5999".parse().unwrap();
-        write_standby_config(&data, &filt, bind).unwrap();
-        assert!(data.join("standby.signal").exists());
-        let conf = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
-        assert!(conf.contains("primary_conninfo"), "{conf}");
-        assert!(conf.contains("port=5999"), "{conf}");
-        assert!(conf.contains("restore_command"), "{conf}");
-
-        write_standby_config(&data, &filt, bind).unwrap();
-        let again = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
-        assert_eq!(again.matches("# walshadow bootstrap").count(), 1);
+    fn args_from(argv: &[&str]) -> Args {
+        let base = [
+            "walshadow-stream",
+            "--out-dir",
+            "/tmp/out",
+            "--spill-dir",
+            "/tmp/spill",
+            "--shadow-socket-dir",
+            "/tmp/sock",
+        ];
+        Args::parse_from(base.iter().copied().chain(argv.iter().copied()))
     }
 
     #[test]
-    fn write_standby_config_skips_conninfo_when_port_zero() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        write_standby_config(&data, tmp.path(), "127.0.0.1:0".parse().unwrap()).unwrap();
-        let conf = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
-        assert!(!conf.contains("primary_conninfo"), "{conf}");
-        assert!(conf.contains("restore_command"), "{conf}");
+    fn shadow_start_external_without_data_dir() {
+        assert!(matches!(
+            resolve_shadow_start(&args_from(&[])).unwrap(),
+            ShadowStart::External
+        ));
+        assert!(resolve_shadow_start(&args_from(&["--bootstrap-mode", "direct"])).is_err());
     }
 
     #[test]
-    fn write_shadow_listener_overrides_sets_port_socket_and_disables_tcp() {
+    fn shadow_start_bootstrap_vs_resume_keys_on_dir_state() {
         let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        fs::create_dir_all(&data).unwrap();
-        write_shadow_listener_overrides(&data, 6543, tmp.path()).unwrap();
-        let conf = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
-        assert!(conf.contains("port = 6543"), "{conf}");
-        assert!(conf.contains("unix_socket_directories"), "{conf}");
-        assert!(conf.contains("listen_addresses = ''"), "{conf}");
+        let dir = tmp.path().join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+        let direct = |d: &str| {
+            args_from(&[
+                "--bootstrap-mode",
+                "direct",
+                "--bootstrap-shadow-data-dir",
+                d,
+                "--walsender-bind",
+                "127.0.0.1:5555",
+            ])
+        };
+        let off = |d: &str| {
+            args_from(&[
+                "--bootstrap-shadow-data-dir",
+                d,
+                "--walsender-bind",
+                "127.0.0.1:5555",
+            ])
+        };
 
-        write_shadow_listener_overrides(&data, 6543, tmp.path()).unwrap();
-        let again = fs::read_to_string(data.join("postgresql.auto.conf")).unwrap();
-        assert_eq!(
-            again
-                .matches("# walshadow shadow-listener overrides")
-                .count(),
-            1
+        // Direct bootstraps empty dir, off rejects it
+        assert!(matches!(
+            resolve_shadow_start(&direct(dir_str)).unwrap(),
+            ShadowStart::Bootstrap(_)
+        ));
+        assert!(resolve_shadow_start(&off(dir_str)).is_err());
+
+        // Resume initialized dir regardless of mode
+        std::fs::write(dir.join("PG_VERSION"), b"17\n").unwrap();
+        assert!(matches!(
+            resolve_shadow_start(&direct(dir_str)).unwrap(),
+            ShadowStart::Resume(_)
+        ));
+        assert!(matches!(
+            resolve_shadow_start(&off(dir_str)).unwrap(),
+            ShadowStart::Resume(_)
+        ));
+
+        // Incomplete bootstrap never triggers automatic rebootstrap
+        std::fs::write(dir.join(BOOTSTRAP_INCOMPLETE_MARKER), b"").unwrap();
+        assert!(resolve_shadow_start(&direct(dir_str)).is_err());
+        assert!(resolve_shadow_start(&off(dir_str)).is_err());
+        assert!(dir.join("PG_VERSION").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepare_bootstrap_dir_marks_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        prepare_bootstrap_dir(&dir).await.unwrap();
+        assert!(dir.join(BOOTSTRAP_INCOMPLETE_MARKER).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepare_bootstrap_dir_refuses_nonempty_dir_without_deleting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        std::fs::create_dir_all(dir.join("sibling-archive")).unwrap();
+        assert!(prepare_bootstrap_dir(&dir).await.is_err());
+        assert!(dir.join("sibling-archive").exists());
+    }
+
+    #[test]
+    fn shadow_start_rejects_kernel_picked_port_for_owned_shadow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+        // Default --walsender-bind is 127.0.0.1:0 (kernel-picked); daemon
+        // can't bake an unknown port into shadow's primary_conninfo.
+        assert!(
+            resolve_shadow_start(&args_from(&[
+                "--bootstrap-mode",
+                "direct",
+                "--bootstrap-shadow-data-dir",
+                dir_str,
+            ]))
+            .is_err()
         );
+    }
+
+    #[test]
+    fn walsender_conninfo_skipped_on_kernel_picked_port() {
+        assert!(walsender_primary_conninfo("127.0.0.1:0".parse().unwrap()).is_none());
+        let ci = walsender_primary_conninfo("127.0.0.1:5441".parse().unwrap()).unwrap();
+        assert!(ci.contains("host=127.0.0.1"), "{ci}");
+        assert!(ci.contains("port=5441"), "{ci}");
     }
 }
