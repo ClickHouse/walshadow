@@ -28,6 +28,7 @@ mod fx;
 
 use std::time::Duration;
 
+use walshadow::ch_emitter::EmitterConfig;
 use walshadow::mapping::TableTarget;
 use walshadow::mapping::{ColumnMapping, NamespaceMapping};
 use walshadow::schema::RelName;
@@ -633,4 +634,111 @@ async fn auto_create_honors_per_namespace_target_database() {
         in_global, "0",
         "table must not be created in the global database",
     );
+}
+
+/// Same as `create_table_auto_replicates_in_namespace`, but the auto-create
+/// namespace comes from a parsed TOML `[namespace.<ns>]` block rather than a
+/// programmatic `NamespaceMapping` — exercising the real
+/// `EmitterConfig::from_toml_str` → resolve → `CREATE TABLE` path end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_table_auto_replicates_from_toml_namespace() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source_port = SOURCE_PORT + 60;
+    let shadow_port = SHADOW_PORT + 60;
+    let ch_tcp_port = CH_TCP_PORT + 60;
+    let ch_http_port = CH_HTTP_PORT + 60;
+    let walsender_port = WALSENDER_PORT + 60;
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(
+        &tmp,
+        "CREATE SCHEMA s15toml;\n",
+        source_port,
+        shadow_port,
+        walsender_port,
+    )
+    .await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    // Empty programmatic namespaces — the TOML parsed in `tune` is the only
+    // source of the auto-create flag.
+    let mut pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port,
+            mappings: vec![],
+            app_name: "walshadow-ddl-create-auto-toml",
+            ddl: Some(fx::DdlPipelineArgs::default()),
+        },
+        |cfg| {
+            cfg.namespaces = EmitterConfig::from_toml_str(
+                "[ch]\n\
+                 [namespace.s15toml]\n\
+                 target_database = \"walshadow_test\"\n\
+                 auto_create = true\n",
+            )
+            .expect("namespace toml parses")
+            .namespaces;
+        },
+    )
+    .await;
+
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "CREATE TABLE s15toml.new_t (id bigint PRIMARY KEY, body text)".into(),
+            "INSERT INTO s15toml.new_t (id, body) VALUES (1, 'toml-auto')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(60)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 60s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    let tbls = ch
+        .query(
+            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'new_t'",
+        )
+        .expect("ch table existence");
+    assert_eq!(
+        tbls, "new_t",
+        "TOML [namespace] auto_create must create the CH table"
+    );
+
+    let body = ch
+        .query(
+            "SELECT argMax(body, _lsn) FROM walshadow_test.new_t \
+             WHERE _is_deleted = 0 AND id = 1",
+        )
+        .expect("ch body");
+    assert_eq!(body, "toml-auto");
 }
