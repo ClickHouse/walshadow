@@ -72,3 +72,4 @@ mimalloc = "0.1.52"
 
 [dev-dependencies]
 tempfile = "3"
+toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }

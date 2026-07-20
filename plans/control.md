@@ -11,33 +11,56 @@ external consumer is the `walshadow-peerdb` HTTP shim (branch `origin/peerdbapi`
 
 `--control-socket <path>` binds a `UnixListener` (`src/ops/control.rs::serve`,
 modeled on `metrics::serve` + the `shadow_stream.rs` bind pattern). Absent →
-disabled. The client is the same binary: `walshadow-stream ctl <words…>`
-(detected in `main` before daemon-arg parsing so it needs no daemon flags;
-`--socket`, env `WALSHADOW_CONTROL_SOCKET`, default `/run/walshadow/control.sock`).
+disabled. The client is the same binary: `walshadow-stream ctl <verb>` with the
+command body as a TOML fragment on stdin (`ctl apply <<TOML … TOML`); detected in
+`main` before daemon-arg parsing so it needs no daemon flags (`--socket`, env
+`WALSHADOW_CONTROL_SOCKET`, default `/run/walshadow/control.sock`).
 
-Wire protocol (one request per connection, `handle_conn`): a single
-`\n`-terminated line `<noun> <verb> [key=value …] [positional …]`,
-whitespace-split into borrowed `&str` slices (`Request<'a>`); values cannot
-contain whitespace (v1 limitation). Response: `OK\n` + optional payload (kv or
-tab-separated lines), or `ERR <message>\n`. `dispatch` matches `(noun, verb)`.
+The command is a bare **verb**. The TOML body already has section headers, so
+target rides in body, not command: `apply` takes an arbitrary fragment (any mix
+of `[source]` / `[ch]` / `[table.*]` / `[stream]`) and merges it in one atomic
+reload. CLI ergonomics (friendly aliases) are a separate layer above these verbs,
+not the daemon's concern.
+
+Wire protocol (one request per connection, `handle_conn`): a `<verb>` header
+line selects the handler; everything after the first newline is the config, a
+TOML document, read to EOF (the client half-closes its write side). TOML keeps
+full value typing (int/float/±inf/nan/array) and quotes arbitrary strings, so a
+value may contain spaces, `=`, newlines. Response: `OK\n` + an optional payload
+that is *also* TOML (`show`/`status` are tables, `tables`/`columns` are
+`[[tables]]`/`[[columns]]` arrays, `schemas` an array of strings), or
+`ERR <message>\n`. `Request::parse` + `encode_request` are the codec.
 
 ### Verbs
-- `source set|get|test`, `dest set|get|test` — connection config. `set` writes
-  the fragment; `test` connects (source: `tokio-postgres` NoTls; dest: TCP
-  probe), honoring ephemeral `key=value` overrides.
-- `tables list [<ns>]`, `tables select <ns.rel>…`, `tables clear` — table
-  opt-in. `list` enumerates source `pg_class` + marks `selected` from the merged
-  config; `select` writes `[table.<ns>.<rel>] replicate` to the fragment.
-- `schemas list`, `columns list <ns> <rel>` — source-PG introspection.
-- `stream stop|start` — pause/resume (writes `[stream] paused` + reloads).
-- `stream reload` / `config reload` — live reload.
-- `stream status` — `state=running|paused` + `rows_synced`, `backfills_pending`,
-  `lag_bytes`, `lag_seconds`, `uptime_secs` (all from the metrics snapshot).
-- `config show` — merged effective config (passwords masked).
+- `apply` — deep-merge the request body (any sections) into the fragment,
+  validate the merged effective config the way boot does
+  (`EmitterConfig::from_table`), reload. A fragment that won't parse is rejected
+  and rolled back so it can't wedge the next reload / restart. Connection config,
+  table opt-in (`[table.<ns>.<rel>] replicate = true`, `initial_load`), and pause
+  (`[stream] paused = true`) are all just sections in the body.
+- `unset` — mask keys out of the fragment, then validate + reload. The body
+  mirrors the config shape (same TOML dialect as `apply`, inverted): a non-table
+  value — the sentinel `""` — removes that key including any subtree, a section
+  recurses. So `[source] password = ""` drops one key, `[table] demo = ""` one
+  namespace, top-level `table = ""` the whole section. The sole delete
+  primitive; only the API's own fragment is touched.
+- `reload` — live reload (re-read merged config + republish; SIGHUP over the
+  socket).
+- `show` — merged effective config (passwords masked).
+- `status` — a TOML table: `state = "running"|"paused"` + `rows_synced`,
+  `backfills_pending`, `lag_bytes`, `lag_seconds`, `uptime_secs` (all from the
+  metrics snapshot).
+- `tables` (`namespace`) — enumerate source `pg_class` as an `[[tables]]` array
+  (`namespace`, `name`, `selected`, `replica_identity`), marking `selected` from
+  the merged config; `schemas` (array of strings), `columns` (`namespace`,
+  `relname` → `[[columns]]` with `name`, `type`, `notnull`) — source-PG
+  introspection.
 
-`SharedCtx { ch_config, source_base, metrics, reloader }` is handed to the
-handlers. `Reloader` holds only the running session's `Arc<ConfigResolver>`
-(`set_resolver`, `reload`) — there is no start/stop/restart state machine.
+`SharedCtx { ch_config, source_base, metrics, reloader, frag_lock }` is handed to
+the handlers; `frag_lock` serializes fragment read-modify-write so concurrent
+`apply`/`unset` can't lose an update or race a rollback. `Reloader` holds only
+the running session's `Arc<ConfigResolver>` (`set_resolver`, `reload`) — there is
+no start/stop/restart state machine.
 
 ## Config: base + conf.d merge
 
@@ -49,9 +72,9 @@ the CLI-arg `[source]` defaults *under* the file so source connection resolves
 file-over-CLI (matches `EmitterConfig` boot).
 
 The control API writes **only its own fragment**, `ch-config.d/50-api.toml`
-(`frag_path`) — sparse, only the keys it sets. The operator's base
+(`frag_path`) — sparse, only the keys `apply`/`unset` set. The operator's base
 `ch-config.toml` is never rewritten (can be read-only mounted); other channels
-can own other fragments. `get`/`test`/introspection/`status` read the merged
+can own other fragments. `show`/introspection/`status` read the merged
 effective config (`get_config` = `load_effective`).
 
 Sections: `[source]` (source conn), `[ch]` (dest conn + emitter knobs),
@@ -92,18 +115,21 @@ Consumers pick it up live:
 before). Without `columns` → an opt-in intent (`runtime_config::TableRow` into
 `EmitterConfig.table_opt_ins`), materialized via `apply_table_opt_in`
 (descriptor-derived auto-create, optional `initial_load` backfill) — the exact
-path the source-PG `config_table` overlay uses. So `ctl tables select` writes
-`[table.<ns>.<rel>] replicate = true` (deselect → `replicate = false`) and the
-daemon applies it on reload — **no source-PG writes from control**. The
-`config_table` + WAL overlay ([config.md], [future/runtime_config_from_pg.md])
-still exists independently for direct-PG operators.
+path the source-PG `config_table` overlay uses. So opting a table in is
+`ctl apply <<'[table.<ns>.<rel>]' replicate = true` (out → `replicate = false`,
+or `unset` the block), applied on reload — **no source-PG writes from control**.
+Because `apply` is a deep-merge, opting one table in leaves every other opt-in
+and every operator-pinned base mapping alone. The `config_table` + WAL overlay
+([config.md], [future/runtime_config_from_pg.md]) still exists independently for
+direct-PG operators.
 
 ## Pause
 
-`stream stop` writes `[stream] paused = true` to the fragment + reloads; the pump
-stops consuming source WAL (idles at `next_chunk`), freezing its LSN and the
-slot's confirmed position — nothing downstream drops. `stream start` clears it;
-the pump resumes from the same LSN, so every table continues where it left off.
+`apply` of `[stream] paused = true` writes the flag to the fragment + reloads;
+the pump stops consuming source WAL (idles at `next_chunk`), freezing its LSN and
+the slot's confirmed position — nothing downstream drops. `paused = false`
+resumes; the pump continues from the same LSN, so every table picks up where it
+left off.
 Retention across a pause requires a replication slot (`[source] slot`); without
 one, `wal_keep_size` bounds pause duration before the source recycles WAL. A
 pause longer than `wal_sender_timeout` may drop the replication connection;
@@ -137,13 +163,13 @@ read-only mount.
 - `src/emit/pipeline/reorder.rs` — `maybe_apply_reload` opt-in diff at commit.
 
 ## Status / open edges
-- e2e-verified live: table add (auto-create) + opt-out (retain) via `ctl tables
-  select` + `ctl reload`, no restart, base file untouched.
-- The lifecycle-strip + pause-as-config is the newest slice; build/e2e it after
-  the wiring lands (`RUSTFLAGS="-D warnings" cargo build --all-targets`).
+- e2e-verified live: pause/resume + table add (auto-create) via `ctl apply`
+  (`[stream] paused` / `[table.*] replicate`) + `ctl reload` and via SIGHUP, no
+  restart, base file untouched.
 - Live CH-connection swap needs a second ClickHouse to test fully.
 - `ToastResolver` live CH reconnect (for `[toast] mode = disk`) is a TODO.
-- Control still opens source-PG read connections for introspection/test
+- Control still opens source-PG read connections for introspection
   (`// TODO` on `pg_connect`) — route through the daemon's catalog later.
-- The `walshadow-peerdb` shim's PAUSED/RUNNING map to `stream stop/start`;
-  create-mirror maps to `tables select` + `reload` (no separate `start`).
+- The `walshadow-peerdb` shim's PAUSED/RUNNING map to `apply [stream] paused`;
+  create-mirror maps to one `apply` carrying `[source]` + `[ch]` + `[table.*]`
+  (source, dest, and tables in a single atomic reload).

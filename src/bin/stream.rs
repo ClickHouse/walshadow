@@ -189,7 +189,7 @@ struct CtlArgs {
         default_value = "/run/walshadow/control.sock"
     )]
     socket: PathBuf,
-    /// Request words, e.g. `stream status` or `source set host=db port=5432`.
+    /// Control verb, such as `status` or `apply`, read TOML body from stdin
     #[arg(trailing_var_arg = true, required = true)]
     request: Vec<String>,
 }
@@ -341,10 +341,7 @@ struct Args {
     /// HTTP/Prometheus metrics bind address. Disabled when absent.
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
-    /// Control unix socket for the `ctl` command surface (source/dest get/set/
-    /// test, table select, reload). Absent disables the socket. `ctl` edits only
-    /// its own fragment under `<--ch-config>.d/`; the base file is never
-    /// rewritten. SIGHUP live-reloads the merged config independently of this.
+    /// Control socket path, omit to disable control API
     #[arg(long)]
     control_socket: Option<PathBuf>,
     /// OTLP/gRPC endpoint for traces, e.g. `http://localhost:4317`. Absent
@@ -436,17 +433,23 @@ async fn main() -> Result<()> {
     result
 }
 
-/// Client mode: send one request line to the daemon's control socket, print the
-/// response, exit non-zero on `ERR`. Values must not contain whitespace (v1
-/// line-protocol limitation).
 async fn run_ctl(socket: PathBuf, request: Vec<String>) -> Result<()> {
+    use std::io::{IsTerminal, Read};
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let line = request.join(" ");
+    let verb = request.first().map(String::as_str).unwrap_or_default();
+    let config: toml::Table = if std::io::stdin().is_terminal() {
+        toml::Table::new()
+    } else {
+        let mut body = String::new();
+        std::io::stdin().read_to_string(&mut body)?;
+        body.parse().context("parse config body as TOML")?
+    };
+    let doc = walshadow::control::encode_request(verb, config)?;
     let mut stream = tokio::net::UnixStream::connect(&socket)
         .await
         .with_context(|| format!("connect control socket {}", socket.display()))?;
-    stream.write_all(line.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
+    stream.write_all(doc.as_bytes()).await?;
     stream.flush().await?;
     stream.shutdown().await.ok();
     let mut resp = String::new();
@@ -633,6 +636,7 @@ async fn run(args: Args) -> Result<()> {
             source_base: cli_source_base(&args),
             metrics: metrics.clone(),
             reloader: reloader.clone(),
+            frag_lock: Arc::new(Mutex::new(())),
         };
         Some(
             walshadow::control::serve(sock, ctx)
