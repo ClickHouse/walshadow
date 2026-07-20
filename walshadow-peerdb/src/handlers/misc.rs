@@ -14,7 +14,7 @@ pub async fn version(app: &App) -> Json<Value> {
 
 pub async fn instance_info(app: &App) -> Json<Value> {
     // ready == control socket answers
-    let status = match app.control.call(&["stream".into(), "status".into()]).await {
+    let status = match app.control.call("status", &toml::Table::new()).await {
         Ok(_) => "INSTANCE_STATUS_READY",
         Err(_) => "INSTANCE_STATUS_UNKNOWN",
     };

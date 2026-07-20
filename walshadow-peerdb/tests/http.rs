@@ -1,6 +1,7 @@
 //! Acceptance drills from plans/future/peerdb.md against an in-process
-//! mock control daemon speaking the line protocol
+//! mock control daemon speaking the TOML socket protocol
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -9,27 +10,70 @@ use hyper::body::Bytes;
 use hyper::{Request, StatusCode};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use toml::{Table, Value as Toml};
 
 use walshadow_peerdb::control::ControlClient;
 use walshadow_peerdb::routes::{App, handle};
 use walshadow_peerdb::state::Store;
 
-/// Scripted control daemon: records request lines, answers from a handler
+/// Fixed source catalog: (namespace, relname, relreplident)
+const CATALOG: &[(&str, &str, &str)] = &[
+    ("public", "users", "d"),
+    ("public", "orders", "f"),
+    ("audit", "log", "d"),
+];
+
+/// Mock daemon mirroring the real one: `apply` merges into an accumulated
+/// config table, `unset` masks it, and the read verbs answer from that
+/// state so the handlers exercise real config-fragment logic
 struct MockControl {
-    lines: Arc<Mutex<Vec<String>>>,
-    /// `stream status` payload toggled by stream start/stop
-    running: Arc<Mutex<bool>>,
-    /// extra kv appended to a running `stream status` payload
-    status_extra: Arc<Mutex<String>>,
+    cfg: Arc<Mutex<Table>>,
+    rows_synced: Arc<Mutex<i64>>,
+}
+
+fn merge(base: &mut Table, over: Table) {
+    for (k, v) in over {
+        match (base.get_mut(&k), v) {
+            (Some(Toml::Table(bt)), Toml::Table(ot)) => merge(bt, ot),
+            (_, v) => {
+                base.insert(k, v);
+            }
+        }
+    }
+}
+
+fn mask(root: &mut Table, m: &Table) {
+    for (k, v) in m {
+        if let Toml::Table(sub) = v {
+            if let Some(Toml::Table(t)) = root.get_mut(k) {
+                mask(t, sub);
+            }
+        } else {
+            root.remove(k);
+        }
+    }
+}
+
+fn selected_set(cfg: &Table) -> HashSet<(String, String)> {
+    let mut out = HashSet::new();
+    if let Some(Toml::Table(tbl)) = cfg.get("table") {
+        for (ns, nsv) in tbl {
+            if let Some(nst) = nsv.as_table() {
+                for rel in nst.keys() {
+                    out.insert((ns.clone(), rel.clone()));
+                }
+            }
+        }
+    }
+    out
 }
 
 impl MockControl {
     fn spawn(dir: &std::path::Path) -> (PathBuf, Arc<Self>) {
         let socket = dir.join("control.sock");
         let mock = Arc::new(MockControl {
-            lines: Arc::new(Mutex::new(Vec::new())),
-            running: Arc::new(Mutex::new(false)),
-            status_extra: Arc::new(Mutex::new(String::new())),
+            cfg: Arc::new(Mutex::new(Table::new())),
+            rows_synced: Arc::new(Mutex::new(0)),
         });
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -42,24 +86,24 @@ impl MockControl {
                 };
                 let m = m.clone();
                 tokio::spawn(async move {
+                    // read to EOF: the client half-closes after writing
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 512];
                     loop {
-                        let Ok(n) = stream.read(&mut chunk).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.contains(&b'\n') {
-                            break;
+                        match stream.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            Err(_) => return,
                         }
                     }
-                    let line = String::from_utf8_lossy(&buf);
-                    let line = line.split('\n').next().unwrap_or("").trim().to_string();
-                    let resp = m.handle(&line);
-                    m.lines.lock().unwrap().push(line);
+                    let text = String::from_utf8_lossy(&buf);
+                    let (verb, body) = text.split_once('\n').unwrap_or((text.as_ref(), ""));
+                    let body: Table = if body.trim().is_empty() {
+                        Table::new()
+                    } else {
+                        body.parse().unwrap()
+                    };
+                    let resp = m.handle(verb.trim(), body);
                     let _ = stream.write_all(resp.as_bytes()).await;
                     let _ = stream.shutdown().await;
                 });
@@ -68,42 +112,123 @@ impl MockControl {
         (socket, mock)
     }
 
-    fn handle(&self, line: &str) -> String {
-        let verb = line
-            .split_whitespace()
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" ");
-        match verb.as_str() {
-            "source set" | "dest set" | "source test" | "dest test" | "tables select"
-            | "tables clear" => "OK\n".into(),
-            "stream start" => {
-                *self.running.lock().unwrap() = true;
-                "OK\npid=42\n".into()
-            }
-            "stream stop" => {
-                *self.running.lock().unwrap() = false;
+    fn handle(&self, verb: &str, body: Table) -> String {
+        match verb {
+            "apply" => {
+                merge(&mut self.cfg.lock().unwrap(), body);
                 "OK\n".into()
             }
-            "stream status" => {
-                if *self.running.lock().unwrap() {
-                    let extra = self.status_extra.lock().unwrap().clone();
-                    format!("OK\nstate=running\npid=42\nlag_bytes=2097152\n{extra}")
-                } else {
-                    "OK\nstate=stopped\n".into()
-                }
+            "unset" => {
+                mask(&mut self.cfg.lock().unwrap(), &body);
+                "OK\n".into()
             }
-            "tables list" => {
-                "OK\npublic.users\tno\tdefault\npublic.orders\tno\tfull\naudit.log\tno\tdefault\n"
-                    .into()
+            "reload" => "OK\n".into(),
+            "status" => ok(&self.status_table()),
+            "tables" => ok(&self.tables_table(body.get("namespace").and_then(Toml::as_str))),
+            "schemas" => {
+                let mut ns: Vec<&str> = CATALOG.iter().map(|(n, _, _)| *n).collect();
+                ns.sort();
+                ns.dedup();
+                let mut out = Table::new();
+                out.insert(
+                    "schemas".into(),
+                    Toml::Array(ns.into_iter().map(Into::into).collect()),
+                );
+                ok(&out)
             }
-            _ => format!("ERR unknown command {verb}\n"),
+            "columns" => ok(&columns_table(body.get("relname").and_then(Toml::as_str))),
+            other => format!("ERR unknown command {other}\n"),
         }
     }
 
-    fn lines(&self) -> Vec<String> {
-        self.lines.lock().unwrap().clone()
+    fn status_table(&self) -> Table {
+        let cfg = self.cfg.lock().unwrap();
+        let paused = cfg
+            .get("stream")
+            .and_then(Toml::as_table)
+            .and_then(|t| t.get("paused"))
+            .and_then(Toml::as_bool)
+            .unwrap_or(false);
+        let mut t = Table::new();
+        t.insert("paused".into(), paused.into());
+        t.insert(
+            "rows_synced".into(),
+            (*self.rows_synced.lock().unwrap()).into(),
+        );
+        t.insert("backfills_pending".into(), 0i64.into());
+        t.insert("lag_bytes".into(), 2_097_152i64.into());
+        t.insert("lag_seconds".into(), 0.0.into());
+        t.insert("uptime_secs".into(), 0i64.into());
+        t
     }
+
+    fn tables_table(&self, ns_filter: Option<&str>) -> Table {
+        let selected = selected_set(&self.cfg.lock().unwrap());
+        let mut arr = Vec::new();
+        for (ns, name, ri) in CATALOG {
+            if ns_filter.is_some_and(|f| f != *ns) {
+                continue;
+            }
+            let mut t = Table::new();
+            t.insert(
+                "selected".into(),
+                selected
+                    .contains(&(ns.to_string(), name.to_string()))
+                    .into(),
+            );
+            t.insert("replica_identity".into(), (*ri).into());
+            t.insert("namespace".into(), (*ns).into());
+            t.insert("name".into(), (*name).into());
+            arr.push(Toml::Table(t));
+        }
+        let mut out = Table::new();
+        out.insert("tables".into(), Toml::Array(arr));
+        out
+    }
+
+    fn cfg(&self) -> Table {
+        self.cfg.lock().unwrap().clone()
+    }
+}
+
+fn ok(body: &Table) -> String {
+    format!("OK\n{}", toml::to_string(body).unwrap())
+}
+
+fn columns_table(relname: Option<&str>) -> Table {
+    let cols: &[(&str, &str, bool)] = match relname {
+        Some("users") => &[("id", "bigint", true), ("email", "text", false)],
+        _ => &[],
+    };
+    let arr = cols
+        .iter()
+        .map(|(n, ty, nn)| {
+            let mut t = Table::new();
+            t.insert("name".into(), (*n).into());
+            t.insert("type".into(), (*ty).into());
+            t.insert("notnull".into(), (*nn).into());
+            Toml::Table(t)
+        })
+        .collect();
+    let mut out = Table::new();
+    out.insert("columns".into(), Toml::Array(arr));
+    out
+}
+
+/// Read a scalar at `cfg[section][key]` for assertions
+fn at<'a>(cfg: &'a Table, section: &str, key: &str) -> Option<&'a Toml> {
+    cfg.get(section)
+        .and_then(Toml::as_table)
+        .and_then(|t| t.get(key))
+}
+
+/// Whether the accumulated config opts `ns.rel` in
+fn opted_in(cfg: &Table, ns: &str, rel: &str) -> bool {
+    cfg.get("table")
+        .and_then(Toml::as_table)
+        .and_then(|t| t.get(ns))
+        .and_then(Toml::as_table)
+        .is_some_and(|t| t.contains_key(rel))
 }
 
 async fn shim(dir: &std::path::Path, password: Option<&str>) -> (App, Arc<MockControl>) {
@@ -182,20 +307,20 @@ async fn curl_lifecycle() {
     let (status, body) = call(&app, "POST", "/v1/peers/create", Some(ch_peer("ch"))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "CREATED");
-    let lines = mock.lines();
-    assert!(
-        lines
-            .iter()
-            .any(|l| l == "source set host=src-db port=5432 dbname=app user=postgres password=pgpw sslmode=prefer"),
-        "{lines:?}"
+    let cfg = mock.cfg();
+    assert_eq!(at(&cfg, "source", "host").unwrap().as_str(), Some("src-db"));
+    assert_eq!(at(&cfg, "source", "port").unwrap().as_integer(), Some(5432));
+    assert_eq!(at(&cfg, "source", "dbname").unwrap().as_str(), Some("app"));
+    assert_eq!(
+        at(&cfg, "source", "sslmode").unwrap().as_str(),
+        Some("prefer")
     );
-    assert!(
-        lines.iter().any(|l| l
-            == "dest set host=ch port=9000 database=cdc user=default password=chpw secure=false"),
-        "{lines:?}"
-    );
+    assert_eq!(at(&cfg, "ch", "host").unwrap().as_str(), Some("ch"));
+    assert_eq!(at(&cfg, "ch", "port").unwrap().as_integer(), Some(9000));
+    assert_eq!(at(&cfg, "ch", "database").unwrap().as_str(), Some("cdc"));
+    assert_eq!(at(&cfg, "ch", "secure").unwrap().as_bool(), Some(false));
 
-    // validate both (kv overrides ride on `test`)
+    // validate both (structural under the TOML protocol)
     let (status, body) = call(&app, "POST", "/v1/peers/validate", Some(pg_peer("pg"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "VALID");
@@ -215,14 +340,12 @@ async fn curl_lifecycle() {
     let (status, body) = call(&app, "POST", "/v1/flows/cdc/create", Some(create.clone())).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["workflowId"], "m1");
-    let lines = mock.lines();
+    let cfg = mock.cfg();
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "tables select public.users public.orders"),
-        "{lines:?}"
+        opted_in(&cfg, "public", "users") && opted_in(&cfg, "public", "orders"),
+        "{cfg:?}"
     );
-    assert!(lines.iter().any(|l| l == "stream start"), "{lines:?}");
+    assert_eq!(at(&cfg, "stream", "paused").unwrap().as_bool(), Some(false));
 
     // duplicate create without attach → ALREADY_EXISTS
     let (status, body) = call(&app, "POST", "/v1/flows/cdc/create", Some(create.clone())).await;
@@ -235,8 +358,8 @@ async fn curl_lifecycle() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["workflowId"], "m1");
 
-    // status: running, rows synced from control extension key
-    *mock.status_extra.lock().unwrap() = "rows_synced=1234\n".into();
+    // status: running, rows synced from the status reply
+    *mock.rows_synced.lock().unwrap() = 1234;
     let (status, body) = call(
         &app,
         "POST",
@@ -254,7 +377,7 @@ async fn curl_lifecycle() {
     let (_, body) = call(&app, "GET", "/v1/mirrors/total_rows_synced/m1", None).await;
     assert_eq!(body["totalCount"], "1234");
 
-    // pause → stream stop, status PAUSED
+    // pause → stream.paused = true, status PAUSED
     let (status, _) = call(
         &app,
         "POST",
@@ -263,7 +386,10 @@ async fn curl_lifecycle() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(mock.lines().iter().any(|l| l == "stream stop"));
+    assert_eq!(
+        at(&mock.cfg(), "stream", "paused").unwrap().as_bool(),
+        Some(true)
+    );
     let (_, body) = call(
         &app,
         "POST",
@@ -298,12 +424,12 @@ async fn curl_lifecycle() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let cfg = mock.cfg();
     assert!(
-        mock.lines()
-            .iter()
-            .any(|l| l == "tables select public.users public.orders audit.log"),
-        "{:?}",
-        mock.lines()
+        opted_in(&cfg, "public", "users")
+            && opted_in(&cfg, "public", "orders")
+            && opted_in(&cfg, "audit", "log"),
+        "{cfg:?}"
     );
 
     // mirror listing shows the singleton
@@ -322,7 +448,10 @@ async fn curl_lifecycle() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(mock.lines().iter().any(|l| l == "tables clear"));
+    assert!(
+        !mock.cfg().contains_key("table"),
+        "terminate clears the opt-in set"
+    );
     let (_, body) = call(&app, "GET", "/v1/mirrors/list", None).await;
     assert_eq!(body["mirrors"], json!([]));
     let (status, body) = call(
@@ -401,7 +530,7 @@ async fn introspection_endpoints() {
     let (app, _mock) = shim(dir.path(), None).await;
     call(&app, "POST", "/v1/peers/create", Some(pg_peer("pg"))).await;
 
-    // schemas fall back to namespaces from `tables list` pre-extension
+    // schemas comes straight from the `schemas` verb
     let (status, body) = call(&app, "GET", "/v1/peers/schemas?peer_name=pg", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["schemas"], json!(["audit", "public"]));
@@ -424,7 +553,7 @@ async fn introspection_endpoints() {
         json!(["public.users", "public.orders", "audit.log"])
     );
 
-    // columns needs the control extension → 501 until it lands
+    // columns answers from the `columns` verb
     let (status, body) = call(
         &app,
         "GET",
@@ -432,13 +561,18 @@ async fn introspection_endpoints() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cols = body["columns"].as_array().unwrap();
+    assert_eq!(cols.len(), 2);
+    assert_eq!(cols[0]["name"], "id");
+    assert_eq!(cols[0]["type"], "bigint");
 
-    // slots synthesized from stream status
+    // slots synthesized from status; the daemon streams unless paused, so an
+    // unpaused config presents the slot as active
     let (status, body) = call(&app, "GET", "/v1/peers/slots/pg", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["slotData"][0]["slotName"], "walshadow");
-    assert_eq!(body["slotData"][0]["active"], false);
+    assert_eq!(body["slotData"][0]["active"], true);
     let (_, body) = call(&app, "GET", "/v1/peers/stats/pg", None).await;
     assert_eq!(body["statData"], json!([]));
 }
@@ -524,12 +658,17 @@ async fn tolerant_decode_and_errors() {
     let (status, body) = call(&app, "POST", "/v1/flows/cdc/create", Some(create)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // password with a space rejected until control gains value quoting
-    let mut spaced = pg_peer("pg2");
+    // TOML bodies carry spaces: a spaced password applies verbatim
+    let mut spaced = pg_peer("pg");
     spaced["peer"]["postgresConfig"]["password"] = json!("p w");
-    let (status, body) = call(&app, "POST", "/v1/peers/validate", Some(spaced)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], 3);
+    spaced["allowUpdate"] = json!(true);
+    let (status, body) = call(&app, "POST", "/v1/peers/create", Some(spaced)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "CREATED");
+    assert_eq!(
+        at(&mock.cfg(), "source", "password").unwrap().as_str(),
+        Some("p w")
+    );
 
     // malformed body → grpc-shaped 400
     let req = Request::builder()

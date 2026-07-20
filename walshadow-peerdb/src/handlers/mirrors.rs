@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
+use toml::{Table, Value as TomlValue};
 
-use crate::control::{ControlError, parse_kv_body, parse_tables_body, positional};
+use crate::control::parse_tables;
 use crate::error::GrpcError;
 use crate::handlers::{
-    check_dest_identifier, flow_status_from_kv, parse_body, rows_synced_from_kv, split_identifier,
-    warn_flow_ignored, warn_mapping_ignored,
+    check_dest_identifier, flow_status_from_status, parse_body, rows_synced_from_status,
+    split_identifier, warn_flow_ignored, warn_mapping_ignored,
 };
 use crate::model::{
     CDCBatch, CDCMirrorStatus, CreateCDCFlowRequest, CreateCDCFlowResponse, FlowStateChangeRequest,
@@ -64,35 +65,99 @@ fn reject_unsupported_modes(cfg: &crate::model::FlowConnectionConfigs) -> Result
     Ok(())
 }
 
-async fn stream_status_kv(app: &App) -> Result<HashMap<String, String>, GrpcError> {
-    let body = app
-        .control
-        .call(&["stream".into(), "status".into()])
+async fn stream_status(app: &App) -> Result<Table, GrpcError> {
+    app.control
+        .call("status", &Table::new())
         .await
-        .map_err(GrpcError::from)?;
-    Ok(parse_kv_body(&body))
+        .map_err(GrpcError::from)
 }
 
-async fn select_tables(app: &App, tables: &[TableRef]) -> Result<(), GrpcError> {
-    let mut parts = vec!["tables".into(), "select".into()];
+/// `[table.<ns>.<rel>] replicate = true` blocks under a `table` root; empty
+/// when no tables (the daemon reads a present block as opted-in)
+fn tables_fragment(tables: &[TableRef]) -> Table {
+    let mut by_ns: BTreeMap<&str, Table> = BTreeMap::new();
     for t in tables {
-        parts.push(positional(&format!("{}.{}", t.namespace, t.relname))?);
+        let mut block = Table::new();
+        block.insert("replicate".into(), true.into());
+        by_ns
+            .entry(&t.namespace)
+            .or_default()
+            .insert(t.relname.clone(), TomlValue::Table(block));
     }
-    if tables.is_empty() {
-        parts = vec!["tables".into(), "clear".into()];
+    let mut root = Table::new();
+    if !by_ns.is_empty() {
+        let mut table = Table::new();
+        for (ns, rels) in by_ns {
+            table.insert(ns.into(), TomlValue::Table(rels));
+        }
+        root.insert("table".into(), TomlValue::Table(table));
     }
+    root
+}
+
+fn set_paused(root: &mut Table, paused: bool) {
+    let mut stream = Table::new();
+    stream.insert("paused".into(), paused.into());
+    root.insert("stream".into(), TomlValue::Table(stream));
+}
+
+/// Reconcile the opt-in set: opt in `desired` (idempotent) then remove
+/// `previous` entries no longer wanted. Applying before unsetting keeps a
+/// still-wanted table selected at every step, so a live stream never drops
+async fn reconcile_tables(
+    app: &App,
+    desired: &[TableRef],
+    previous: &[TableRef],
+) -> Result<(), GrpcError> {
+    let add = tables_fragment(desired);
+    if !add.is_empty() {
+        app.control
+            .call("apply", &add)
+            .await
+            .map_err(GrpcError::from)?;
+    }
+    let removed: Vec<&TableRef> = previous.iter().filter(|p| !desired.contains(p)).collect();
+    if !removed.is_empty() {
+        let mut by_ns: BTreeMap<&str, Table> = BTreeMap::new();
+        for t in &removed {
+            by_ns
+                .entry(&t.namespace)
+                .or_default()
+                .insert(t.relname.clone(), TomlValue::String(String::new()));
+        }
+        let mut table = Table::new();
+        for (ns, rels) in by_ns {
+            table.insert(ns.into(), TomlValue::Table(rels));
+        }
+        let mut mask = Table::new();
+        mask.insert("table".into(), TomlValue::Table(table));
+        app.control
+            .call("unset", &mask)
+            .await
+            .map_err(GrpcError::from)?;
+    }
+    Ok(())
+}
+
+/// Drop the whole shim-owned `[table]` section from the fragment
+async fn clear_tables(app: &App) -> Result<(), GrpcError> {
+    let mut mask = Table::new();
+    mask.insert("table".into(), TomlValue::String(String::new()));
     app.control
-        .call(&parts)
+        .call("unset", &mask)
         .await
         .map_err(GrpcError::from)
         .map(|_| ())
 }
 
-fn map_start_err(e: ControlError) -> GrpcError {
-    match e {
-        ControlError::Daemon(m) if m.contains("not set") => GrpcError::failed_precondition(m),
-        other => other.into(),
-    }
+async fn apply_paused(app: &App, paused: bool) -> Result<(), GrpcError> {
+    let mut root = Table::new();
+    set_paused(&mut root, paused);
+    app.control
+        .call("apply", &root)
+        .await
+        .map_err(GrpcError::from)
+        .map(|_| ())
 }
 
 pub async fn validate_cdc(app: &App, v: Value) -> Result<Json<Value>, GrpcError> {
@@ -107,26 +172,19 @@ pub async fn validate_cdc(app: &App, v: Value) -> Result<Json<Value>, GrpcError>
     for m in &cfg.table_mappings {
         wanted.push(opt_in_table(m)?);
     }
-    app.control
-        .call(&["source".into(), "test".into()])
-        .await
-        .map_err(|e| match e {
-            ControlError::Daemon(m) => GrpcError::invalid(format!("source validation: {m}")),
-            other => other.into(),
-        })?;
-    app.control
-        .call(&["dest".into(), "test".into()])
-        .await
-        .map_err(|e| match e {
-            ControlError::Daemon(m) => GrpcError::invalid(format!("destination validation: {m}")),
-            other => other.into(),
-        })?;
+    // `tables` connects to the (already-applied) source, so reachability and
+    // table existence validate together; the protocol has no destination probe
     let body = app
         .control
-        .call(&["tables".into(), "list".into()])
+        .call("tables", &Table::new())
         .await
-        .map_err(GrpcError::from)?;
-    let known = parse_tables_body(&body);
+        .map_err(|e| match e {
+            crate::control::ControlError::Daemon(m) => {
+                GrpcError::invalid(format!("source validation: {m}"))
+            }
+            other => other.into(),
+        })?;
+    let known = parse_tables(&body);
     for t in &wanted {
         if !known
             .iter()
@@ -174,11 +232,14 @@ pub async fn create_cdc(app: &App, v: Value) -> Result<Json<CreateCDCFlowRespons
         tables.push(opt_in_table(m)?);
     }
 
-    select_tables(app, &tables).await?;
+    // opt in the tables and unpause in one apply, so the stream never runs
+    // over an empty selection nor sits selected-but-paused between reloads
+    let mut frag = tables_fragment(&tables);
+    set_paused(&mut frag, false);
     app.control
-        .call(&["stream".into(), "start".into()])
+        .call("apply", &frag)
         .await
-        .map_err(map_start_err)?;
+        .map_err(GrpcError::from)?;
 
     let raw_config = v
         .get("connectionConfigs")
@@ -273,7 +334,7 @@ pub async fn state_change(app: &App, v: Value) -> Result<Json<Value>, GrpcError>
                 "walshadow always backfills newly opted-in tables",
             );
         }
-        select_tables(app, &tables).await?;
+        reconcile_tables(app, &tables, &mirror.tables).await?;
         app.store
             .update(|s| {
                 if let Some(m) = &mut s.mirror {
@@ -286,16 +347,10 @@ pub async fn state_change(app: &App, v: Value) -> Result<Json<Value>, GrpcError>
 
     match req.requested_flow_state {
         FlowStatus::Paused => {
-            app.control
-                .call(&["stream".into(), "stop".into()])
-                .await
-                .map_err(GrpcError::from)?;
+            apply_paused(app, true).await?;
         }
         FlowStatus::Running => {
-            app.control
-                .call(&["stream".into(), "start".into()])
-                .await
-                .map_err(map_start_err)?;
+            apply_paused(app, false).await?;
         }
         FlowStatus::Terminated => {
             if !req.skip_destination_drop {
@@ -306,19 +361,10 @@ pub async fn state_change(app: &App, v: Value) -> Result<Json<Value>, GrpcError>
                     "destination tables are never dropped on terminate",
                 );
             }
-            // already-stopped is the common path (pause, then terminate)
-            if let Err(e) = app.control.call(&["stream".into(), "stop".into()]).await {
-                match e {
-                    ControlError::Daemon(msg) => {
-                        tracing::info!(error = %msg, "stream stop during terminate");
-                    }
-                    other => return Err(other.into()),
-                }
-            }
-            app.control
-                .call(&["tables".into(), "clear".into()])
-                .await
-                .map_err(GrpcError::from)?;
+            // pausing then clearing the opt-in set is idempotent: a
+            // pause-then-terminate re-pauses without error
+            apply_paused(app, true).await?;
+            clear_tables(app).await?;
             app.store
                 .update(|s| {
                     s.mirror = None;
@@ -385,8 +431,8 @@ pub async fn mirror_status(app: &App, v: Value) -> Result<Json<MirrorStatusRespo
             req.flow_job_name
         )));
     };
-    let kvs = stream_status_kv(app).await?;
-    let rows = rows_synced_from_kv(&kvs);
+    let status = stream_status(app).await?;
+    let rows = rows_synced_from_status(&status);
     Ok(Json(MirrorStatusResponse {
         flow_job_name: mirror.name.clone(),
         cdc_status: CDCMirrorStatus {
@@ -401,7 +447,7 @@ pub async fn mirror_status(app: &App, v: Value) -> Result<Json<MirrorStatusRespo
             destination_type: "CLICKHOUSE",
             rows_synced: rows,
         },
-        current_flow_state: flow_status_from_kv(&kvs),
+        current_flow_state: flow_status_from_status(&status),
         created_at: timestamp_rfc3339(mirror.created_at_unix),
     }))
 }
@@ -411,8 +457,8 @@ pub async fn list_mirrors(app: &App) -> Result<Json<Value>, GrpcError> {
     let Some(mirror) = &state.mirror else {
         return Ok(Json(json!({"mirrors": []})));
     };
-    let status = match stream_status_kv(app).await {
-        Ok(kvs) => flow_status_from_kv(&kvs),
+    let status = match stream_status(app).await {
+        Ok(s) => flow_status_from_status(&s),
         // list should render even with control down
         Err(_) => FlowStatus::Unknown,
     };
@@ -444,8 +490,8 @@ async fn mirror_rows(app: &App, flow_job_name: &str) -> (i64, i64) {
     let Some(mirror) = state.mirror.as_ref().filter(|m| m.name == flow_job_name) else {
         return (0, 0);
     };
-    let rows = match stream_status_kv(app).await {
-        Ok(kvs) => rows_synced_from_kv(&kvs),
+    let rows = match stream_status(app).await {
+        Ok(s) => rows_synced_from_status(&s),
         Err(_) => 0,
     };
     (rows, mirror.created_at_unix)

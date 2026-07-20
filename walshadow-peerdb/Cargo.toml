@@ -2,7 +2,7 @@
 name = "walshadow-peerdb"
 version = "0.1.0"
 edition = "2024"
-description = "PeerDB flow HTTP API shim: grpc-gateway JSON surface translated onto walshadow-control's unix-socket line protocol"
+description = "PeerDB flow HTTP API shim: grpc-gateway JSON surface translated onto walshadow-control's TOML socket protocol"
 license = "AGPL-3.0-only"
 
 # Thin translator: PeerDB clients on one side, walshadow-control's unix
@@ -26,6 +26,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
+toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "fs", "sync", "io-util", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }

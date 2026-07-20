@@ -46,7 +46,7 @@ where
         ("POST", "/v1/peers/create") => peers::create_peer(app, json_body(body).await?)
             .await
             .into_response(),
-        ("POST", "/v1/peers/validate") => peers::validate_peer(app, json_body(body).await?)
+        ("POST", "/v1/peers/validate") => peers::validate_peer(json_body(body).await?)
             .await
             .into_response(),
         ("POST", "/v1/peers/drop") => peers::drop_peer(app, json_body(body).await?)

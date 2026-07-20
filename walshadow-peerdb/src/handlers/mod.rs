@@ -2,63 +2,49 @@ pub mod mirrors;
 pub mod misc;
 pub mod peers;
 
-use std::collections::HashMap;
-
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::Value as JsonValue;
+use toml::{Table, Value};
 
-use crate::control::kv;
 use crate::error::GrpcError;
 use crate::model::{ClickhouseConfig, FlowStatus, PostgresConfig, TableMapping};
 use crate::warn::warn_ignored;
 
-pub fn parse_body<T: DeserializeOwned>(v: Value) -> Result<T, GrpcError> {
+pub fn parse_body<T: DeserializeOwned>(v: JsonValue) -> Result<T, GrpcError> {
     serde_json::from_value(v).map_err(|e| GrpcError::invalid(format!("malformed request: {e}")))
 }
 
-/// `source set …` line for a submitted Postgres peer config
-pub fn source_set_parts(cfg: &PostgresConfig) -> Result<Vec<String>, GrpcError> {
+/// Wrap a section table under its config key, ready to `apply`
+fn section(key: &str, table: Table) -> Table {
+    let mut root = Table::new();
+    root.insert(key.into(), Value::Table(table));
+    root
+}
+
+/// `[source]` apply fragment for a submitted Postgres peer config
+pub fn source_fragment(cfg: &PostgresConfig) -> Table {
     let port = if cfg.port == 0 { 5432 } else { cfg.port };
-    Ok(vec![
-        "source".into(),
-        "set".into(),
-        kv("host", &cfg.host)?,
-        kv("port", &port.to_string())?,
-        kv("dbname", &cfg.database)?,
-        kv("user", &cfg.user)?,
-        kv("password", &cfg.password)?,
-        kv("sslmode", cfg.sslmode())?,
-    ])
+    let mut src = Table::new();
+    src.insert("host".into(), cfg.host.clone().into());
+    src.insert("port".into(), i64::from(port).into());
+    src.insert("dbname".into(), cfg.database.clone().into());
+    src.insert("user".into(), cfg.user.clone().into());
+    src.insert("password".into(), cfg.password.clone().into());
+    src.insert("sslmode".into(), cfg.sslmode().into());
+    section("source", src)
 }
 
-/// `dest set …` line for a submitted ClickHouse peer config
-pub fn dest_set_parts(cfg: &ClickhouseConfig) -> Result<Vec<String>, GrpcError> {
+/// `[ch]` apply fragment for a submitted ClickHouse peer config
+pub fn dest_fragment(cfg: &ClickhouseConfig) -> Table {
     let port = if cfg.port == 0 { 9000 } else { cfg.port };
-    Ok(vec![
-        "dest".into(),
-        "set".into(),
-        kv("host", &cfg.host)?,
-        kv("port", &port.to_string())?,
-        kv("database", &cfg.database)?,
-        kv("user", &cfg.user)?,
-        kv("password", &cfg.password)?,
-        kv("secure", if cfg.disable_tls { "false" } else { "true" })?,
-    ])
-}
-
-/// Same kv set as the `set` line, appended to `source test` / `dest test`
-/// as ephemeral overrides (control-protocol extension; a pre-extension
-/// daemon ignores them and tests its persisted config)
-pub fn source_test_parts(cfg: &PostgresConfig) -> Result<Vec<String>, GrpcError> {
-    let mut parts = source_set_parts(cfg)?;
-    parts[1] = "test".into();
-    Ok(parts)
-}
-
-pub fn dest_test_parts(cfg: &ClickhouseConfig) -> Result<Vec<String>, GrpcError> {
-    let mut parts = dest_set_parts(cfg)?;
-    parts[1] = "test".into();
-    Ok(parts)
+    let mut ch = Table::new();
+    ch.insert("host".into(), cfg.host.clone().into());
+    ch.insert("port".into(), i64::from(port).into());
+    ch.insert("database".into(), cfg.database.clone().into());
+    ch.insert("user".into(), cfg.user.clone().into());
+    ch.insert("password".into(), cfg.password.clone().into());
+    ch.insert("secure".into(), (!cfg.disable_tls).into());
+    section("ch", ch)
 }
 
 pub fn warn_pg_ignored(cfg: &PostgresConfig) {
@@ -275,26 +261,33 @@ pub fn check_dest_identifier(m: &TableMapping) -> Result<(), GrpcError> {
     )))
 }
 
-/// `stream status` payload → FlowStatus. `backfill=in_progress` and
-/// `rows_synced=<n>` are control-protocol extensions; absent keys degrade
-/// to RUNNING / 0
-pub fn flow_status_from_kv(kvs: &HashMap<String, String>) -> FlowStatus {
-    match kvs.get("state").map(String::as_str) {
-        Some("running") => {
-            if kvs.get("backfill").is_some_and(|b| b == "in_progress") {
-                FlowStatus::Snapshot
-            } else {
-                FlowStatus::Running
-            }
-        }
-        Some("stopped") => FlowStatus::Paused,
-        _ => FlowStatus::Unknown,
+/// `status` reply → FlowStatus. Paused reflects the config `stream.paused`
+/// flag; a pending backfill surfaces as SNAPSHOT. A live daemon always
+/// answers running or paused; UNKNOWN is reserved for an unreachable one,
+/// which the callers derive from a failed call
+pub fn flow_status_from_status(status: &Table) -> FlowStatus {
+    if status
+        .get("paused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        FlowStatus::Paused
+    } else if status
+        .get("backfills_pending")
+        .and_then(Value::as_integer)
+        .unwrap_or(0)
+        > 0
+    {
+        FlowStatus::Snapshot
+    } else {
+        FlowStatus::Running
     }
 }
 
-pub fn rows_synced_from_kv(kvs: &HashMap<String, String>) -> i64 {
-    kvs.get("rows_synced")
-        .and_then(|v| v.parse().ok())
+pub fn rows_synced_from_status(status: &Table) -> i64 {
+    status
+        .get("rows_synced")
+        .and_then(Value::as_integer)
         .unwrap_or(0)
 }
 
@@ -328,29 +321,22 @@ mod tests {
 
     #[test]
     fn status_mapping() {
-        let kvs = |pairs: &[(&str, &str)]| {
-            pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<HashMap<_, _>>()
-        };
+        let status = |toml: &str| toml.parse::<Table>().unwrap();
         assert_eq!(
-            flow_status_from_kv(&kvs(&[("state", "running")])),
+            flow_status_from_status(&status("paused = false")),
             FlowStatus::Running
         );
         assert_eq!(
-            flow_status_from_kv(&kvs(&[("state", "running"), ("backfill", "in_progress")])),
+            flow_status_from_status(&status("paused = false\nbackfills_pending = 2")),
             FlowStatus::Snapshot
         );
         assert_eq!(
-            flow_status_from_kv(&kvs(&[("state", "stopped")])),
+            flow_status_from_status(&status("paused = true")),
             FlowStatus::Paused
         );
-        assert_eq!(
-            flow_status_from_kv(&kvs(&[("state", "exited"), ("exit_code", "1")])),
-            FlowStatus::Unknown
-        );
-        assert_eq!(rows_synced_from_kv(&kvs(&[("rows_synced", "77")])), 77);
-        assert_eq!(rows_synced_from_kv(&kvs(&[])), 0);
+        // absent paused key degrades to running, not unknown
+        assert_eq!(flow_status_from_status(&Table::new()), FlowStatus::Running);
+        assert_eq!(rows_synced_from_status(&status("rows_synced = 77")), 77);
+        assert_eq!(rows_synced_from_status(&Table::new()), 0);
     }
 }

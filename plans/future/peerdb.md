@@ -2,13 +2,12 @@
 
 Second workspace crate exposing PeerDB's flow HTTP API — the grpc-gateway JSON
 surface over `FlowService` (PeerDB `protos/route.proto`) — as a thin translator
-onto the control daemon's unix-socket line protocol (`control/`,
-`walshadow-control`). Goal: control planes and UIs that already speak PeerDB
-(ClickPipes, peerdb-ui) drive walshadow unchanged. The shim owns zero
-replication logic and none of walshadow's WAL / native-protocol dependencies;
-process supervision, config persistence, streamer launch stay in the control
-daemon. Dependency surface mirrors `control/`: tokio, serde, an HTTP server
-(bare hyper), unix-socket client
+onto the control daemon's TOML socket protocol (`ops/control.rs`). Goal: control
+planes and UIs that already speak PeerDB (ClickPipes, peerdb-ui) drive walshadow
+unchanged. The shim owns zero replication logic and none of walshadow's WAL /
+native-protocol dependencies; process supervision, config persistence, streamer
+launch stay in the control daemon. Dependency surface: tokio, serde, `toml`, an
+HTTP server (bare hyper), unix-socket client
 
 ```
 PeerDB client ──HTTP/JSON──▶ walshadow-peerdb ──unix socket──▶ walshadow-control ──▶ walshadow-stream
@@ -38,7 +37,7 @@ PeerDB's HTTP gateway port so existing client config carries over
 - **Errors** in grpc-gateway shape `{"code": <grpc code>, "message": …}` with
   the gateway's HTTP status mapping (3→400, 5→404, 6→409, 12→501, 13→500,
   14→503). `ERR <msg>` from the control socket maps to code 13 unless the
-  handler knows better
+  handler knows better; socket connect failure maps to 14
 - **Auth**: honor the `Authorization` header against a `PEERDB_PASSWORD`-style
   env var (constant-time compare), unauthenticated when unset — mirrors
   PeerDB gateway behavior
@@ -54,14 +53,14 @@ success-shaped empty bodies so callers proceed; *reject* returns
 
 | route | control action |
 |---|---|
-| `POST /v1/peers/create` | `postgres_config` → `source set host=… port=… dbname=… user=… password=… sslmode=…`; `clickhouse_config` → `dest set …`; peer name recorded in registry |
-| `POST /v1/peers/validate` | `source test` / `dest test` with request-supplied kv (needs ephemeral-override extension, below) |
+| `POST /v1/peers/create` | `postgres_config` → `apply` `[source]`; `clickhouse_config` → `apply` `[ch]`; peer name recorded in registry |
+| `POST /v1/peers/validate` | structural check only — the protocol has no non-persisting connection probe (see Validation below) |
 | `POST /v1/peers/drop` | forget registry entry; refuse while the mirror references it |
-| `POST /v1/mirrors/cdc/validate` | `source test` + `dest test` + table existence via `tables list` |
-| `POST /v1/flows/cdc/create` | resolve `sourceName`/`destinationName` against registry, `tables select <ns.rel>…`, `stream start`; `workflow_id` = `flow_job_name` |
-| `POST /v1/mirrors/state_change` | `STATUS_PAUSED` → `stream stop`; `STATUS_RUNNING` → `stream start`; `STATUS_TERMINATED` → `stream stop` + `tables clear` + forget mirror; `flowConfigUpdate.additionalTables`/`removedTables` → recompute opt-in set → `tables select` |
-| `POST /v1/mirrors/status` | `stream status` → `FlowStatus` (mapping below) + `CDCMirrorStatus` skeleton |
-| `GET /v1/mirrors/list`, `/v1/mirrors/names` | singleton from mirror record + live `stream status` |
+| `POST /v1/mirrors/cdc/validate` | `tables` — connecting to the applied source proves reachability + table existence in one call; no destination probe |
+| `POST /v1/flows/cdc/create` | resolve `sourceName`/`destinationName` against registry, then one `apply` carrying `[table.<ns>.<rel>] replicate = true` per mapping plus `[stream] paused = false`; `workflow_id` = `flow_job_name` |
+| `POST /v1/mirrors/state_change` | `STATUS_PAUSED` → `apply [stream] paused = true`; `STATUS_RUNNING` → `apply [stream] paused = false`; `STATUS_TERMINATED` → pause + `unset table` + forget mirror; `flowConfigUpdate.additionalTables`/`removedTables` → `apply` the opted-in blocks, `unset` the dropped ones |
+| `POST /v1/mirrors/status` | `status` → `FlowStatus` (mapping below) + `CDCMirrorStatus` skeleton |
+| `GET /v1/mirrors/list`, `/v1/mirrors/names` | singleton from mirror record + live `status` |
 
 `TableMapping.sourceTableIdentifier` splits into (namespace, relname) at
 ingress; dotted strings exist only at control-line interpolation.
@@ -74,8 +73,8 @@ per-table target rename exists in runtime config
 | route | source |
 |---|---|
 | `GET /v1/peers/list`, `/info/{name}`, `/type/{name}` | registry; `peerdb_redacted` fields masked |
-| `GET /v1/peers/schemas`, `/tables`, `/tables/all`, `/columns` | source-PG introspection via control verbs (`schemas list`, scoped `tables list`, `columns list` — extensions below) |
-| `GET /v1/peers/slots/{peer}`, `/stats/{peer}` | synthesized from `stream status` lag metrics; physical slot presented in logical-slot clothing |
+| `GET /v1/peers/schemas`, `/tables`, `/tables/all`, `/columns` | source-PG introspection via the `schemas` / `tables` (optional `namespace`) / `columns` (`namespace` + `relname`) verbs, which connect to the applied source |
+| `GET /v1/peers/slots/{peer}`, `/stats/{peer}` | synthesized from `status` lag metrics; physical slot presented in logical-slot clothing, `active` = not paused |
 | `GET /v1/mirrors/cdc/batches/*`, `cdc/graph`, `cdc/table_total_counts`, `total_rows_synced` | synthesized from metrics scrape (`emitter_rows` etc); one coarse synthetic batch per response, enough for UI rendering |
 | `GET /v1/peers/columns/all_type_conversions` | static table of walshadow's PG→CH type map |
 | `GET /v1/version`, `/v1/instance/info` | shim + streamer version, ready flag |
@@ -98,18 +97,19 @@ fields log at WARN once per key so silent divergence is greppable
 
 ## FlowStatus mapping
 
-| control `stream status` | FlowStatus |
+| control `status` | FlowStatus |
 |---|---|
-| running, backfill in progress | `STATUS_SNAPSHOT` |
-| running | `STATUS_RUNNING` |
-| stopped by request | `STATUS_PAUSED` |
-| exited (crash) | `STATUS_UNKNOWN` |
+| not paused, `backfills_pending > 0` | `STATUS_SNAPSHOT` |
+| not paused | `STATUS_RUNNING` |
+| `paused = true` | `STATUS_PAUSED` |
+| socket unreachable | `STATUS_UNKNOWN` |
 | mirror forgotten | `STATUS_TERMINATED` |
 
-`STATUS_PAUSING`/`STATUS_TERMINATING` transients unused — control stop is
-synchronous within its timeout. Distinguishing stopped-by-request from
-crash-exited, and surfacing backfill progress, are control `stream status`
-extensions
+`paused` reflects the `[stream] paused` config flag, not streamer liveness; a
+live daemon always answers running or paused, so UNKNOWN means the socket did
+not answer (list/instance endpoints degrade to it, others surface 503).
+`STATUS_PAUSING`/`STATUS_TERMINATING` transients unused — an `apply` reloads
+synchronously
 
 ## Shim state
 
@@ -120,18 +120,32 @@ daemon's state; the shim's copy exists to echo `GetPeerInfo` and to re-derive
 `source`/`dest` role on peer reference. Single writer (the shim), same
 durability model as the control daemon's `state.json`
 
-## Control-protocol extensions
+## Control protocol
 
-Prerequisites in `control/`, kept small:
+The daemon speaks a TOML socket protocol (`ops/control.rs`): one
+`<verb>\n<toml body>` request per connection, EOF-framed, answered `OK\n[toml]`
+or `ERR <msg>`. TOML bodies preserve scalar types and carry values with spaces
+(passwords), so the shim needs no client-side quoting. Verbs it drives:
 
-- ephemeral kv overrides on `source test` / `dest test` — validate a config
-  without persisting it (`ValidatePeer` semantics)
-- `schemas list`, `tables list <ns>`, `columns list <ns> <rel>` for the
-  introspection endpoints
-- value quoting or single-line JSON framing — line protocol v1 forbids spaces
-  in values; passwords arriving over the PeerDB API will contain them
-- `stream status` additions: rows-synced counters, backfill progress,
-  stopped-by-request vs exited discrimination
+- `apply` / `unset` — merge a TOML fragment into `ch-config.d/50-api.toml`, or
+  mask keys out of it; each validates the merged config and live-reloads, and
+  only ever touches that one fragment so operator-owned base config stays
+  read-only
+- `status` — `paused`, `rows_synced`, `backfills_pending`, `lag_bytes`,
+  `lag_seconds`, `uptime_secs`
+- `tables` (optional `namespace`) / `schemas` / `columns` (`namespace` +
+  `relname`) — source-PG introspection; `[[tables]]` carry `selected` and
+  `replica_identity`, `[[columns]]` carry `name` / `type` / `notnull`
+
+### Validation
+
+The protocol has no non-persisting connection probe — `apply` mutates and
+reloads. So `ValidatePeer` is structural (supported type + host present);
+connectivity surfaces when `create_peer` applies the config, or on
+`mirrors/cdc/validate`, which lists source tables over the live socket. There
+is no destination probe: ClickHouse reachability first shows when the stream
+runs. Per-column key membership isn't in the `columns` reply, so introspected
+columns report `isKey`/`isReplicaIdentity` false
 
 ## Anti-goals
 
@@ -172,7 +186,7 @@ Prerequisites in `control/`, kept small:
 - **Peer names vs stored config drift.** Registry keeps the submitted peer
   config; control keeps the applied one. An operator editing via the control
   CLI directly leaves the shim's echo stale. Option: `GetPeerInfo` re-reads
-  `source get` / `dest get` and merges, treating control as truth for
+  the daemon's `show` config and merges, treating control as truth for
   connection fields
 - **Type-conversion endpoint fidelity.** UI column-type pickers read
   `all_type_conversions`; serving walshadow's real map constrains what the UI
@@ -181,9 +195,9 @@ Prerequisites in `control/`, kept small:
 ## Acceptance drills
 
 - **curl lifecycle.** Create PG peer, create CH peer, validate both, create
-  CDC mirror over two tables → `stream status` running, `MirrorStatus` =
+  CDC mirror over two tables → `status` not paused, `MirrorStatus` =
   `STATUS_RUNNING`. Insert rows on source → `total_rows_synced` climbs.
-  `state_change` PAUSED stops the streamer; RUNNING resumes;
+  `state_change` PAUSED pauses the streamer; RUNNING resumes;
   `flowConfigUpdate.additionalTables` grows the opt-in set and backfills;
   TERMINATED stops + clears, `mirrors/list` empties
 - **peerdb-ui smoke.** UI pointed at the shim renders peer list, mirror

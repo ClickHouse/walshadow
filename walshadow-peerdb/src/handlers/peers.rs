@@ -1,10 +1,10 @@
 use serde_json::{Value, json};
+use toml::{Table, Value as TomlValue};
 
-use crate::control::{ControlError, parse_tables_body, positional};
+use crate::control::parse_tables;
 use crate::error::GrpcError;
 use crate::handlers::{
-    dest_set_parts, dest_test_parts, parse_body, source_set_parts, source_test_parts,
-    warn_ch_ignored, warn_pg_ignored,
+    dest_fragment, parse_body, source_fragment, warn_ch_ignored, warn_pg_ignored,
 };
 use crate::model::{
     ColumnsItem, CreatePeerRequest, CreatePeerResponse, DbType, DropPeerRequest, PeerActivityQuery,
@@ -23,10 +23,10 @@ fn peer_failed(message: impl Into<String>) -> Json<CreatePeerResponse> {
     })
 }
 
-/// Role + control line from a submitted peer; rejects unsupported types
-fn peer_role_and_set(
+/// Role + `apply` fragment from a submitted peer; rejects unsupported types
+fn peer_role_and_fragment(
     peer: &crate::model::Peer,
-) -> Result<(Role, &'static str, Vec<String>), GrpcError> {
+) -> Result<(Role, &'static str, Table), GrpcError> {
     match (
         &peer.db_type,
         &peer.postgres_config,
@@ -37,14 +37,14 @@ fn peer_role_and_set(
                 return Err(GrpcError::invalid("postgresConfig.host required"));
             }
             warn_pg_ignored(cfg);
-            Ok((Role::Source, "POSTGRES", source_set_parts(cfg)?))
+            Ok((Role::Source, "POSTGRES", source_fragment(cfg)))
         }
         (DbType::Clickhouse, _, Some(cfg)) => {
             if cfg.host.is_empty() {
                 return Err(GrpcError::invalid("clickhouseConfig.host required"));
             }
             warn_ch_ignored(cfg);
-            Ok((Role::Dest, "CLICKHOUSE", dest_set_parts(cfg)?))
+            Ok((Role::Dest, "CLICKHOUSE", dest_fragment(cfg)))
         }
         (t, _, _) => Err(GrpcError::unimplemented(format!(
             "peer type {} unsupported; walshadow mirrors Postgres → ClickHouse",
@@ -61,7 +61,7 @@ pub async fn create_peer(app: &App, v: Value) -> Result<Json<CreatePeerResponse>
     if peer.name.is_empty() {
         return Ok(peer_failed("peer name required"));
     }
-    let (role, db_type, set_parts) = peer_role_and_set(&peer)?;
+    let (role, db_type, fragment) = peer_role_and_fragment(&peer)?;
 
     let state = app.store.get().await;
     if let Some(existing) = state.peers.get(&peer.name) {
@@ -90,7 +90,7 @@ pub async fn create_peer(app: &App, v: Value) -> Result<Json<CreatePeerResponse>
     }
 
     app.control
-        .call(&set_parts)
+        .call("apply", &fragment)
         .await
         .map_err(GrpcError::from)?;
     let raw_peer = v.get("peer").cloned().unwrap_or(Value::Null);
@@ -114,36 +114,41 @@ pub async fn create_peer(app: &App, v: Value) -> Result<Json<CreatePeerResponse>
     }))
 }
 
-pub async fn validate_peer(app: &App, v: Value) -> Result<Json<ValidatePeerResponse>, GrpcError> {
+/// The TOML protocol has no non-persisting connection probe (`apply` would
+/// mutate and reload the daemon), so validation is structural: the request
+/// must carry a supported peer type with a host. Connectivity surfaces when
+/// the config is applied by `create_peer`, or on `mirrors/cdc/validate`,
+/// which lists source tables over the live socket
+pub async fn validate_peer(v: Value) -> Result<Json<ValidatePeerResponse>, GrpcError> {
     let req: ValidatePeerRequest = parse_body(v)?;
     let Some(peer) = req.peer else {
         return Err(GrpcError::invalid("peer required"));
     };
-    let test_parts = match (
+    let invalid = match (
         &peer.db_type,
         &peer.postgres_config,
         &peer.clickhouse_config,
     ) {
-        (DbType::Postgres, Some(cfg), _) => source_test_parts(cfg)?,
-        (DbType::Clickhouse, _, Some(cfg)) => dest_test_parts(cfg)?,
-        (t, _, _) => {
-            return Ok(Json(ValidatePeerResponse {
-                status: "INVALID",
-                message: format!("peer type {} unsupported", t.as_str()),
-            }));
+        (DbType::Postgres, Some(cfg), _) if cfg.host.is_empty() => {
+            Some("postgresConfig.host required".into())
         }
+        (DbType::Postgres, Some(_), _) => None,
+        (DbType::Clickhouse, _, Some(cfg)) if cfg.host.is_empty() => {
+            Some("clickhouseConfig.host required".into())
+        }
+        (DbType::Clickhouse, _, Some(_)) => None,
+        (t, _, _) => Some(format!("peer type {} unsupported", t.as_str())),
     };
-    match app.control.call(&test_parts).await {
-        Ok(_) => Ok(Json(ValidatePeerResponse {
+    Ok(Json(match invalid {
+        None => ValidatePeerResponse {
             status: "VALID",
             message: String::new(),
-        })),
-        Err(ControlError::Daemon(msg)) => Ok(Json(ValidatePeerResponse {
+        },
+        Some(message) => ValidatePeerResponse {
             status: "INVALID",
-            message: msg,
-        })),
-        Err(e) => Err(e.into()),
-    }
+            message,
+        },
+    }))
 }
 
 pub async fn drop_peer(app: &App, v: Value) -> Result<Json<Value>, GrpcError> {
@@ -242,46 +247,34 @@ async fn require_source(app: &App, peer_name: &str) -> Result<(), GrpcError> {
 
 pub async fn schemas(app: &App, q: PeerActivityQuery) -> Result<Json<Value>, GrpcError> {
     require_source(app, &q.peer_name).await?;
-    let schemas = match app.control.call(&["schemas".into(), "list".into()]).await {
-        Ok(body) => body.lines().map(str::to_string).collect::<Vec<_>>(),
-        // pre-extension daemon: derive namespaces from the table list
-        Err(ControlError::UnknownCommand(_)) => {
-            let body = app
-                .control
-                .call(&["tables".into(), "list".into()])
-                .await
-                .map_err(GrpcError::from)?;
-            let mut namespaces: Vec<String> = parse_tables_body(&body)
-                .into_iter()
-                .map(|t| t.namespace)
-                .collect();
-            namespaces.sort();
-            namespaces.dedup();
-            namespaces
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let body = app
+        .control
+        .call("schemas", &Table::new())
+        .await
+        .map_err(GrpcError::from)?;
+    let schemas: Vec<&str> = body
+        .get("schemas")
+        .and_then(TomlValue::as_array)
+        .map(|a| a.iter().filter_map(TomlValue::as_str).collect())
+        .unwrap_or_default();
     Ok(Json(json!({"schemas": schemas})))
 }
 
-/// `tables list`, filtered to one namespace when asked. The scoped
-/// `tables list <ns>` extension is a payload-size optimization only; a
-/// pre-extension daemon ignores the positional and returns everything,
-/// so the namespace filter always applies shim-side
+/// `tables`, scoped to one namespace when asked; the daemon filters
 async fn list_tables(
     app: &App,
     namespace: Option<&str>,
 ) -> Result<Vec<crate::control::TableRow>, GrpcError> {
-    let mut parts = vec!["tables".into(), "list".into()];
+    let mut req = Table::new();
     if let Some(ns) = namespace {
-        parts.push(positional(ns)?);
+        req.insert("namespace".into(), ns.into());
     }
-    let body = app.control.call(&parts).await.map_err(GrpcError::from)?;
-    let mut rows = parse_tables_body(&body);
-    if let Some(ns) = namespace {
-        rows.retain(|t| t.namespace == ns);
-    }
-    Ok(rows)
+    let body = app
+        .control
+        .call("tables", &req)
+        .await
+        .map_err(GrpcError::from)?;
+    Ok(parse_tables(&body))
 }
 
 pub async fn tables_in_schema(app: &App, q: SchemaTablesQuery) -> Result<Json<Value>, GrpcError> {
@@ -311,55 +304,61 @@ pub async fn all_tables(app: &App, q: PeerActivityQuery) -> Result<Json<Value>, 
 
 pub async fn columns(app: &App, q: TableColumnsQuery) -> Result<Json<Value>, GrpcError> {
     require_source(app, &q.peer_name).await?;
-    // `columns list <ns> <rel>` is a control-protocol extension; expected
-    // payload one column per line: name\ttype[\tkey]
+    let mut req = Table::new();
+    req.insert("namespace".into(), q.schema_name.clone().into());
+    req.insert("relname".into(), q.table_name.clone().into());
     let body = app
         .control
-        .call(&[
-            "columns".into(),
-            "list".into(),
-            positional(&q.schema_name)?,
-            positional(&q.table_name)?,
-        ])
+        .call("columns", &req)
         .await
         .map_err(GrpcError::from)?;
+    // `columns` carries name/type/notnull; the protocol exposes no per-column
+    // key membership, so is_key / is_replica_identity stay false
     let columns: Vec<_> = body
-        .lines()
-        .filter_map(|l| {
-            let mut cols = l.split('\t');
-            let name = cols.next()?.to_string();
-            let column_type = cols.next().unwrap_or("").to_string();
-            let is_key = cols.next() == Some("key");
-            Some(ColumnsItem {
-                name,
-                column_type,
-                is_key,
-                qkind: String::new(),
-                is_replica_identity: is_key,
-            })
+        .get("columns")
+        .and_then(TomlValue::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let t = v.as_table()?;
+                    Some(ColumnsItem {
+                        name: t.get("name").and_then(TomlValue::as_str)?.to_string(),
+                        column_type: t
+                            .get("type")
+                            .and_then(TomlValue::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        is_key: false,
+                        qkind: String::new(),
+                        is_replica_identity: false,
+                    })
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     Ok(Json(json!({"columns": columns})))
 }
 
 pub async fn slots(app: &App, peer_name: String) -> Result<Json<Value>, GrpcError> {
     require_source(app, &peer_name).await?;
-    let body = app
+    let status = app
         .control
-        .call(&["stream".into(), "status".into()])
+        .call("status", &Table::new())
         .await
         .map_err(GrpcError::from)?;
-    let kvs = crate::control::parse_kv_body(&body);
-    let lag_bytes: f32 = kvs
+    let lag_bytes = status
         .get("lag_bytes")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
+        .and_then(TomlValue::as_integer)
+        .unwrap_or(0) as f32;
     // physical slot presented in logical-slot clothing
     let slot = SlotInfo {
         slot_name: "walshadow".into(),
         redo_lsn: String::new(),
         restart_lsn: String::new(),
-        active: kvs.get("state").map(String::as_str) == Some("running"),
+        active: !status
+            .get("paused")
+            .and_then(TomlValue::as_bool)
+            .unwrap_or(true),
         lag_in_mb: lag_bytes / (1024.0 * 1024.0),
         confirmed_flush_lsn: String::new(),
         wal_status: "reserved".into(),
