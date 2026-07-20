@@ -1,41 +1,10 @@
-//! Control-plane + live-reconfigure e2e drills against the real
-//! `walshadow-stream` binary (plans/control.md).
+//! Exercises live control changes against real PostgreSQL and ClickHouse
 //!
-//! Each drill spawns the daemon in `--bootstrap-mode=direct
-//! --bootstrap-autospawn-shadow` against a self-hosted source PG + a
-//! spawned `clickhouse server`, with `--control-socket` + a base
-//! `--ch-config` that pins `demo.users`. The daemon backfills the
-//! seed row at bootstrap, then runs its single streaming session
-//! forever; the tests drive it live via the `ctl` subcommand + SIGHUP
-//! and assert against CH.
-//!
-//! 1. `pause_resume_via_ctl_and_sighup_no_restart`
-//!    * `ctl stream stop` freezes the pump at its LSN (a write made
-//!      while paused never reaches CH); `ctl stream start` resumes from
-//!      the same LSN and the frozen write lands. The process never
-//!      restarts (uptime is monotonic across the cycle) — pause is a
-//!      config reload, not a session bounce. A second cycle drives the
-//!      pause purely through SIGHUP: a bare fragment write does *not*
-//!      pause (the pump keeps streaming) until SIGHUP triggers the
-//!      reload.
-//!
-//! 2. `live_table_opt_in_auto_creates_on_reload`
-//!    * An existing table absent from the config and from CH is brought
-//!      in live via `ctl tables select` + `ctl stream reload`; the opt-in
-//!      auto-creates the CH table and backfills the pre-opt-in row
-//!      (backfill on by default), then streams. The coordinator retries
-//!      the opt-in until the shadow catalog has replayed the CREATE, so
-//!      an out-of-band select racing that replay still lands.
-//!
-//! 3. `tables_select_preserves_previously_pinned_table`
-//!    * `ctl tables select <new>` is additive — it must not touch any
-//!      other table's scope, in particular the base-config-pinned
-//!      `demo.users`. Regression for the bug where select rewrote the
-//!      fragment with `replicate = false` for every other in-scope table,
-//!      silently opting `demo.users` out.
+//! Covers pause and reload without restart, table opt-in after catalog replay,
+//! and regression where applying one table opted pinned tables out
 //!
 //! Skipped silently when `initdb`, `pg_basebackup`, or `clickhouse` is
-//! absent. Linux-only (unix sockets + POSIX data dirs).
+//! absent. Linux only because tests use Unix sockets and POSIX data dirs
 
 #![cfg(target_os = "linux")]
 
@@ -234,7 +203,6 @@ impl Harness {
                 "direct",
                 "--bootstrap-shadow-data-dir",
                 shadow_data.to_str().unwrap(),
-                "--bootstrap-autospawn-shadow",
                 "--bootstrap-shadow-replay-timeout",
                 "120",
             ])
@@ -276,13 +244,28 @@ impl Harness {
 
     /// One `ctl` request against the live socket; returns trimmed stdout.
     fn ctl(&self, words: &[&str]) -> Result<String> {
-        let out = Command::new(&self.bin)
+        self.ctl_body(words, "")
+    }
+
+    fn ctl_body(&self, words: &[&str], body: &str) -> Result<String> {
+        use std::io::Write;
+        let mut child = Command::new(&self.bin)
             .arg("ctl")
             .arg("--socket")
             .arg(&self.control_socket)
             .args(words)
-            .output()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .context("spawn ctl")?;
+        child
+            .stdin
+            .take()
+            .context("ctl stdin")?
+            .write_all(body.as_bytes())
+            .context("write ctl body")?;
+        let out = child.wait_with_output().context("ctl output")?;
         if !out.status.success() {
             bail!(
                 "ctl {:?} failed: {}",
@@ -293,15 +276,18 @@ impl Harness {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    /// Value of one `key=` line from `ctl stream status`.
     fn status_field(&self, key: &str) -> Result<String> {
-        let body = self.ctl(&["stream", "status"])?;
-        for line in body.lines() {
-            if let Some(v) = line.strip_prefix(&format!("{key}=")) {
-                return Ok(v.to_string());
-            }
-        }
-        bail!("no {key} in status: {body}")
+        let body = self.ctl(&["status"])?;
+        let t: toml::Table = body
+            .parse()
+            .with_context(|| format!("parse status toml: {body}"))?;
+        let v = t
+            .get(key)
+            .with_context(|| format!("no {key} in status: {body}"))?;
+        Ok(match v {
+            toml::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
     }
 
     /// SIGHUP the daemon (triggers `spawn_sighup_reload` → config reload).
@@ -429,29 +415,25 @@ async fn pause_resume_via_ctl_and_sighup_no_restart() {
 
         // --- ctl pause/resume -------------------------------------------
         let uptime_before: u64 = h.status_field("uptime_secs")?.parse().unwrap_or(0);
-        h.ctl(&["stream", "stop"])?;
-        assert_eq!(h.status_field("state")?, "paused", "stop → paused");
-        // Fragment written, base file untouched (we assert the API only
-        // owns the conf.d drop-in by construction — base is never edited).
+        h.ctl_body(&["apply"], "[stream]\npaused = true")?;
+        assert_eq!(h.status_field("paused")?, "true", "apply paused → paused");
+        // API must only write its own fragment
         let frag = fs::read_to_string(&h.frag_path).context("read fragment")?;
         assert!(frag.contains("paused = true"), "fragment: {frag}");
 
-        // Let the pump re-loop into the paused state — it re-reads `paused`
-        // on a 250ms idle tick, so pause settles within that window (a write
-        // racing the tick would leak one in-flight chunk).
+        // Wait past idle tick so next write cannot race pause
         tokio::time::sleep(Duration::from_millis(600)).await;
         // A write made once paused has settled must not reach CH.
         h.psql("UPDATE demo.users SET email = 'while-paused@x' WHERE id = 1")?;
         h.assert_ch_stable(USER_EMAIL, "baseline@x", Duration::from_secs(5))
             .await?;
 
-        // Resume: the frozen write lands (resumed from the same LSN).
-        h.ctl(&["stream", "start"])?;
-        assert_eq!(h.status_field("state")?, "running", "start → running");
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        assert_eq!(h.status_field("paused")?, "false", "apply resume → running");
         h.wait_ch(USER_EMAIL, "while-paused@x", Duration::from_secs(15))
             .await?;
 
-        // No restart: uptime is monotonic and the process is the same.
+        // Uptime catches hidden restarts
         let uptime_after: u64 = h.status_field("uptime_secs")?.parse().unwrap_or(0);
         assert!(
             uptime_after >= uptime_before,
@@ -460,8 +442,7 @@ async fn pause_resume_via_ctl_and_sighup_no_restart() {
         assert!(h.alive(), "daemon exited during pause/resume");
 
         // --- SIGHUP-triggered reload ------------------------------------
-        // A bare fragment write is NOT applied until a reload fires: the
-        // pump keeps streaming, so this write reaches CH.
+        // Fragment changes stay inactive until reload
         fs::write(&h.frag_path, "[stream]\npaused = true\n").context("write frag")?;
         h.psql("UPDATE demo.users SET email = 'pre-sighup@x' WHERE id = 1")?;
         h.wait_ch(USER_EMAIL, "pre-sighup@x", Duration::from_secs(15))
@@ -514,12 +495,12 @@ async fn live_table_opt_in_auto_creates_on_reload() {
             "gizmos must not exist on CH before opt-in",
         );
 
-        // Opt in live + reload (backfill on by default). The opt-in applies
-        // once the shadow catalog has replayed the CREATE; the coordinator
-        // retries pending opt-ins each commit, so drive trigger commits until
-        // it lands (a table created just before `select` races that replay).
-        h.ctl(&["tables", "select", "demo.gizmos"])?;
-        h.ctl(&["stream", "reload"])?;
+        // CREATE may not have reached shadow catalog, trigger commits until it does
+        h.ctl_body(
+            &["apply"],
+            "[table.demo.gizmos]\nreplicate = true\ninitial_load = \"copy\"",
+        )?;
+        h.ctl(&["reload"])?;
         let mut created = false;
         let deadline = Instant::now() + Duration::from_secs(45);
         while Instant::now() < deadline {
@@ -534,7 +515,7 @@ async fn live_table_opt_in_auto_creates_on_reload() {
             bail!("opt-in never auto-created the CH table demo.gizmos");
         }
 
-        // backfill=copy (default) carried the pre-opt-in row into CH.
+        // Pre-opt-in row proves copy ran
         h.wait_ch(
             "SELECT argMax(label, _lsn) FROM demo.gizmos WHERE _is_deleted = 0 AND id = 1",
             "alpha",
@@ -543,7 +524,6 @@ async fn live_table_opt_in_auto_creates_on_reload() {
         .await
         .context("default backfill did not carry the pre-opt-in row")?;
 
-        // A post-opt-in insert streams too.
         h.psql("INSERT INTO demo.gizmos VALUES (2, 'beta')")?;
         h.wait_ch(
             "SELECT argMax(label, _lsn) FROM demo.gizmos WHERE _is_deleted = 0 AND id = 2",
@@ -564,33 +544,27 @@ async fn live_table_opt_in_auto_creates_on_reload() {
     }
 }
 
-/// `ctl tables select` is additive: selecting one table must never opt
-/// another out. Regression for the bug where select wrote `replicate =
-/// false` for every *other* in-scope table (incl. the base-pinned
-/// `demo.users`), silently freezing it.
+/// Regression: applying one table used to opt pinned tables out
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tables_select_preserves_previously_pinned_table() {
+async fn apply_preserves_previously_pinned_table() {
     if !gated() {
         return;
     }
     let mut h = Harness::up(&P3).await.expect("bring up harness");
 
     let result = async {
-        // demo.users replicates (pinned by base config).
         h.psql("UPDATE demo.users SET email = 'before-select@x' WHERE id = 1")?;
         h.wait_ch(USER_EMAIL, "before-select@x", Duration::from_secs(15))
             .await?;
 
-        // Select an unrelated table + reload.
         h.psql(
             "CREATE TABLE demo.gadgets (id bigint PRIMARY KEY, label text);\
              ALTER TABLE demo.gadgets REPLICA IDENTITY FULL;",
         )?;
-        h.ctl(&["tables", "select", "demo.gadgets"])?;
-        h.ctl(&["stream", "reload"])?;
+        h.ctl_body(&["apply"], "[table.demo.gadgets]\nreplicate = true")?;
+        h.ctl(&["reload"])?;
 
-        // demo.users must still replicate — selecting gadgets said nothing
-        // about users, and select is additive.
+        // Unrelated apply must preserve pinned mapping
         h.psql("UPDATE demo.users SET email = 'after-select@x' WHERE id = 1")?;
         h.wait_ch(USER_EMAIL, "after-select@x", Duration::from_secs(15))
             .await

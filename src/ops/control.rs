@@ -1,21 +1,9 @@
-//! In-process control plane: a request/response line protocol over a Unix
-//! socket, folded into the daemon (no separate binary, no child process). Every
-//! change is a live reload — the daemon streams one session, never restarts.
+//! In-process control plane over a Unix socket
 //!
-//! Config is the daemon's own TOML — `[source]`, `[ch]`, `[table.*]`, and
-//! `[stream] paused` — merged from `ch-config.toml` + `ch-config.d/`. `set` /
-//! `tables select` / `stream stop|start` edit only the API's own fragment
-//! (`ch-config.d/50-api.toml`) then `reload`; `get` / `test` / introspection
-//! read the merged effective config. Table selection is `[table.<ns>.<rel>]
-//! replicate = true`; pause is `[stream] paused = true`. No source-PG writes.
-//!
-//! Wire protocol (one request per connection): `<noun> <verb> [key=value …]
-//! [positional …]`, whitespace-separated. Values are borrowed slices of the
-//! line, so a value cannot contain whitespace (v1 limitation; quoting/JSON
-//! framing is a future extension). Response: `OK\n` + optional payload, or
-//! `ERR <message>\n`. Consumer contract: the `walshadow-peerdb` shim.
+//! TOML bodies preserve config types and let one request update several
+//! sections atomically. Mutations only touch `ch-config.d/50-api.toml`, keeping
+//! operator-owned config read-only. PeerDB shim consumes this protocol
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -67,43 +55,37 @@ pub struct SharedCtx {
     pub source_base: Table,
     pub metrics: MetricsRegistry,
     pub reloader: Arc<Reloader>,
+    /// Prevents concurrent fragment updates from overwriting each other
+    pub frag_lock: Arc<Mutex<()>>,
 }
 
 // ---------------------------------------------------------------------------
-// Line protocol
+// TOML request protocol
 // ---------------------------------------------------------------------------
 
+/// Keeps CLI and PeerDB shim request framing consistent
+pub fn encode_request(verb: &str, config: Table) -> Result<String> {
+    let body = toml::to_string(&config).context("serialize request config")?;
+    Ok(format!("{verb}\n{body}"))
+}
+
 pub struct Request<'a> {
-    pub noun: &'a str,
     pub verb: &'a str,
-    pub kv: HashMap<&'a str, &'a str>,
-    pub positional: Vec<&'a str>,
+    pub config: Table,
 }
 
 impl<'a> Request<'a> {
-    /// Whitespace-split slices of the request line; `key=value` tokens go to
-    /// `kv`, bare tokens to `positional`. Values are borrowed slices, so a value
-    /// cannot contain whitespace (line-protocol v1 limitation).
-    pub fn parse(line: &'a str) -> Option<Request<'a>> {
-        let mut it = line.split_whitespace();
-        let noun = it.next()?;
-        let verb = it.next().unwrap_or_default();
-        let mut kv = HashMap::new();
-        let mut positional = Vec::new();
-        for t in it {
-            match t.split_once('=') {
-                Some((k, v)) => {
-                    kv.insert(k, v);
-                }
-                None => positional.push(t),
-            }
-        }
-        Some(Request {
-            noun,
-            verb,
-            kv,
-            positional,
-        })
+    /// Preserves TOML types and quoted values across control socket
+    pub fn parse(buf: &'a [u8]) -> Result<Request<'a>> {
+        let text = std::str::from_utf8(buf).context("request not utf-8")?;
+        let (head, body) = text.split_once('\n').unwrap_or((text, ""));
+        let verb = head.split_whitespace().next().context("empty request")?;
+        let config = if body.trim().is_empty() {
+            Table::new()
+        } else {
+            body.parse().context("parse request config toml")?
+        };
+        Ok(Request { verb, config })
     }
 }
 
@@ -121,6 +103,9 @@ pub fn ok_with(body: &str) -> String {
 }
 pub fn err(msg: impl std::fmt::Display) -> String {
     format!("ERR {msg}\n")
+}
+fn ok_toml(t: &Table) -> String {
+    ok_with(&toml::to_string(t).unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -161,66 +146,94 @@ pub async fn serve(path: PathBuf, ctx: SharedCtx) -> Result<tokio::task::JoinHan
 }
 
 async fn handle_conn(mut stream: UnixStream, ctx: &SharedCtx) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(512);
-    let mut chunk = [0u8; 512];
-    loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.contains(&b'\n') || buf.len() > 64 * 1024 {
-            break;
-        }
-    }
-    let line = str::from_utf8(&buf).map_err(std::io::Error::other)?;
-    let line = line.split('\n').next().unwrap_or("").trim();
-    let resp = dispatch(line, ctx).await;
+    // EOF framing allows newlines in TOML values
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let resp = dispatch(&buf, ctx).await;
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
     let _ = stream.shutdown().await;
     Ok(())
 }
 
-async fn dispatch(line: &str, ctx: &SharedCtx) -> String {
-    let Some(req) = Request::parse(line) else {
-        return err("malformed request line");
+async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
+    let req = match Request::parse(buf) {
+        Ok(r) => r,
+        Err(e) => return err(format!("{e:#}")),
     };
-    // `dest` maps to the TOML `[ch]` section; `source` to `[source]`.
-    let res: Result<String> = match (req.noun, req.verb) {
-        ("source", "set") => conn_set(ctx, "source", &req).await,
-        ("source", "get") => conn_get(ctx, "source").await,
-        ("source", "test") => source_test(ctx, &req).await,
-        ("dest", "set") => conn_set(ctx, "ch", &req).await,
-        ("dest", "get") => conn_get(ctx, "ch").await,
-        ("dest", "test") => dest_test(ctx, &req).await,
-        ("tables", "list") => tables_list(ctx, &req).await,
-        ("tables", "select") => tables_set(ctx, &req, true).await,
-        ("tables", "deselect") => tables_set(ctx, &req, false).await,
-        ("tables", "clear") => tables_clear(ctx).await,
-        ("schemas", "list") => schemas_list(ctx).await,
-        ("columns", "list") => columns_list(ctx, &req.positional).await,
-        ("stream", "stop") => set_paused(ctx, true).await,
-        ("stream", "start") => set_paused(ctx, false).await,
-        ("stream", "reload") | ("config", "reload") => ctx.reloader.reload().await.map(|()| ok()),
-        ("stream", "status") => stream_status(ctx).await,
-        ("config", "show") => config_show(ctx).await,
-        (n, v) => Err(anyhow::anyhow!("unknown command {n} {v}")),
+    let res: Result<String> = match req.verb {
+        "apply" => apply(ctx, &req).await,
+        "unset" => unset(ctx, &req).await,
+        "reload" => ctx.reloader.reload().await.map(|()| ok()),
+        "show" => config_show(ctx).await,
+        "status" => stream_status(ctx).await,
+        "tables" => tables_list(ctx, &req).await,
+        "schemas" => schemas_list(ctx).await,
+        "columns" => columns_list(ctx, &req).await,
+        other => Err(anyhow::anyhow!("unknown command {other}")),
     };
     res.unwrap_or_else(|e| err(format!("{e:#}")))
 }
 
 // ---- handlers -------------------------------------------------------------
 
-/// Pause/resume is a config flag: write `[stream] paused` into the fragment,
-/// then reload so the pump picks it up live.
-async fn set_paused(ctx: &SharedCtx, paused: bool) -> Result<String> {
+/// Keeps invalid fragments from breaking reloads or later starts
+async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
+    if req.config.is_empty() {
+        bail!("empty apply (send a TOML fragment as the body)");
+    }
     let frag = frag_path(&ctx.ch_config);
+    let _guard = ctx.frag_lock.lock().await;
+    let prev = tokio::fs::read(&frag).await.ok();
     let mut root = load(&frag).await?;
-    section_mut(&mut root, "stream").insert("paused".into(), Value::Boolean(paused));
+    crate::ch_emitter::merge_tables(&mut root, req.config.clone());
     save(&frag, &root).await?;
+    commit_or_rollback(ctx, &frag, prev).await
+}
+
+/// Removes named keys without touching operator-owned base config
+async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
+    let frag = frag_path(&ctx.ch_config);
+    let _guard = ctx.frag_lock.lock().await;
+    let prev = tokio::fs::read(&frag).await.ok();
+    let mut root = load(&frag).await?;
+    apply_mask(&mut root, &req.config);
+    save(&frag, &root).await?;
+    commit_or_rollback(ctx, &frag, prev).await
+}
+
+fn apply_mask(root: &mut Table, mask: &Table) {
+    for (k, v) in mask {
+        if let Value::Table(sub) = v {
+            if let Some(Value::Table(t)) = root.get_mut(k) {
+                apply_mask(t, sub);
+            }
+        } else {
+            root.remove(k);
+        }
+    }
+}
+
+/// Restores last valid fragment when validation fails
+async fn commit_or_rollback(ctx: &SharedCtx, frag: &Path, prev: Option<Vec<u8>>) -> Result<String> {
+    if let Err(e) = validate(ctx).await {
+        if let Some(bytes) = prev {
+            tokio::fs::write(frag, bytes).await?;
+        } else {
+            tokio::fs::remove_file(frag).await?;
+        }
+        return Err(e).context("rejected: merged config invalid");
+    }
     ctx.reloader.reload().await?;
     Ok(ok())
+}
+
+/// Matches startup validation so accepted fragments remain restart-safe
+async fn validate(ctx: &SharedCtx) -> Result<()> {
+    let merged = get_config(ctx).await?;
+    crate::ch_emitter::EmitterConfig::from_table(&merged)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn frag_path(ch_config: &Path) -> PathBuf {
@@ -231,109 +244,50 @@ async fn get_config(ctx: &SharedCtx) -> Result<Table> {
     Ok(crate::ch_emitter::load_effective(&ctx.ch_config, ctx.source_base.clone()).await?)
 }
 
-async fn conn_set(ctx: &SharedCtx, section: &str, req: &Request<'_>) -> Result<String> {
-    let frag = frag_path(&ctx.ch_config);
-    let mut root = load(&frag).await?;
-    let sec = section_mut(&mut root, section);
-    for (&k, &v) in &req.kv {
-        sec.insert(k.to_string(), coerce(v));
-    }
-    save(&frag, &root).await?;
-    Ok(ok())
-}
-
-async fn conn_get(ctx: &SharedCtx, section: &str) -> Result<String> {
+async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
     let root = get_config(ctx).await?;
-    let mut b = String::new();
-    if let Some(Value::Table(sec)) = root.get(section) {
-        for (k, v) in sec {
-            let shown = if k == "password" {
-                "***".to_string()
-            } else {
-                render(v)
-            };
-            line(&mut b, k, &shown);
-        }
-    }
-    Ok(ok_with(&b))
-}
-
-async fn source_test(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
-    let root = get_config(ctx).await?;
-    pg_connect(&root, &req.kv)
-        .await?
-        .simple_query("SELECT 1")
-        .await?;
-    Ok(ok())
-}
-
-async fn dest_test(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
-    let root = get_config(ctx).await?;
-    let host = ov(&root, "ch", "host", &req.kv);
-    if host.is_empty() {
-        bail!("destination host not set");
-    }
-    let port = {
-        let p = ov(&root, "ch", "port", &req.kv);
-        if p.is_empty() { "9000".into() } else { p }
-    };
-    let addr = format!("{host}:{port}");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("connect timeout to {addr}"))?
-    .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
-    Ok(ok())
-}
-
-async fn tables_list(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
-    let root = get_config(ctx).await?;
-    let client = pg_connect(&root, &HashMap::new()).await?;
-    let ns = req.positional.first().copied();
+    let client = pg_connect(&root).await?;
+    let ns = req.config.get("namespace").and_then(Value::as_str);
     let base = "SELECT n.nspname, c.relname, c.relreplident \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema') \
            AND n.nspname NOT LIKE 'pg\\_%'";
-    let rows = match ns {
-        Some(ns) => {
-            client
-                .query(&format!("{base} AND n.nspname=$1 ORDER BY 1,2"), &[&ns])
-                .await
-        }
-        None => client.query(&format!("{base} ORDER BY 1,2"), &[]).await,
+    let rows = if let Some(ns) = ns {
+        client
+            .query(&format!("{base} AND n.nspname=$1 ORDER BY 1,2"), &[&ns])
+            .await
+    } else {
+        client.query(&format!("{base} ORDER BY 1,2"), &[]).await
     }
     .context("list tables")?;
-    let selected: std::collections::HashSet<String> = selected_tables(&root)
-        .into_iter()
-        .map(|(ns, rel)| format!("{ns}.{rel}"))
-        .collect();
-    let mut b = String::new();
-    use std::fmt::Write;
+    let selected: std::collections::HashSet<(String, String)> =
+        selected_tables(&root).into_iter().collect();
+    let mut arr = Vec::with_capacity(rows.len());
     for r in rows {
         let ns: String = r.get(0);
         let rel: String = r.get(1);
         let ident: i8 = r.get(2);
-        let full = format!("{ns}.{rel}");
-        let sel = if selected.contains(&full) {
-            "yes"
-        } else {
-            "no"
-        };
-        let rif = if ident as u8 == b'f' {
-            "full"
-        } else {
-            "default"
-        };
-        writeln!(b, "{full}\t{sel}\t{rif}").ok();
+        let mut t = Table::new();
+        t.insert(
+            "selected".into(),
+            selected.contains(&(ns.clone(), rel.clone())).into(),
+        );
+        t.insert(
+            "replica_identity".into(),
+            Value::String((ident as u8 as char).to_string()),
+        );
+        t.insert("namespace".into(), ns.into());
+        t.insert("name".into(), rel.into());
+        arr.push(Value::Table(t));
     }
-    Ok(ok_with(&b))
+    let mut out = Table::new();
+    out.insert("tables".into(), Value::Array(arr));
+    Ok(ok_toml(&out))
 }
 
 async fn schemas_list(ctx: &SharedCtx) -> Result<String> {
     let root = get_config(ctx).await?;
-    let client = pg_connect(&root, &HashMap::new()).await?;
+    let client = pg_connect(&root).await?;
     let rows = client
         .query(
             "SELECT nspname FROM pg_namespace \
@@ -343,20 +297,21 @@ async fn schemas_list(ctx: &SharedCtx) -> Result<String> {
         )
         .await
         .context("list schemas")?;
-    let mut b = String::new();
-    for r in rows {
-        b.push_str(&r.get::<_, String>(0));
-        b.push('\n');
-    }
-    Ok(ok_with(&b))
+    let names: Vec<Value> = rows.iter().map(|r| r.get::<_, String>(0).into()).collect();
+    let mut out = Table::new();
+    out.insert("schemas".into(), Value::Array(names));
+    Ok(ok_toml(&out))
 }
 
-async fn columns_list(ctx: &SharedCtx, positional: &[&str]) -> Result<String> {
-    let [ns, rel, ..] = positional else {
-        bail!("usage: columns list <namespace> <relname>");
+async fn columns_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
+    let (Some(ns), Some(rel)) = (
+        req.config.get("namespace").and_then(Value::as_str),
+        req.config.get("relname").and_then(Value::as_str),
+    ) else {
+        bail!("usage: columns list with [config] `namespace = \"..\"`, `relname = \"..\"`");
     };
     let root = get_config(ctx).await?;
-    let client = pg_connect(&root, &HashMap::new()).await?;
+    let client = pg_connect(&root).await?;
     let rows = client
         .query(
             "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull \
@@ -364,68 +319,21 @@ async fn columns_list(ctx: &SharedCtx, positional: &[&str]) -> Result<String> {
              JOIN pg_namespace n ON n.oid=c.relnamespace \
              WHERE n.nspname=$1 AND c.relname=$2 AND a.attnum>0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
-            &[ns, rel],
+            &[&ns, &rel],
         )
         .await
         .context("list columns")?;
-    let mut b = String::new();
-    use std::fmt::Write;
+    let mut arr = Vec::with_capacity(rows.len());
     for r in rows {
-        let name: String = r.get(0);
-        let ty: String = r.get(1);
-        let nn: bool = r.get(2);
-        writeln!(b, "{name}\t{ty}\t{}", if nn { "notnull" } else { "null" }).ok();
+        let mut t = Table::new();
+        t.insert("name".into(), r.get::<_, String>(0).into());
+        t.insert("type".into(), r.get::<_, String>(1).into());
+        t.insert("notnull".into(), r.get::<_, bool>(2).into());
+        arr.push(Value::Table(t));
     }
-    Ok(ok_with(&b))
-}
-
-/// Additive: `select` writes `replicate = true`, `deselect` writes
-/// `replicate = false`, for the named tables only — never touching any other
-/// table's scope. So opting one table in/out leaves every other opt-in and
-/// every operator-pinned base mapping alone. `clear` drops the fragment's
-/// whole `[table]` section.
-///
-/// `select` backfills existing rows by default (`initial_load = copy`); pass
-/// `backfill=false` to opt a table in without a snapshot (stream from the
-/// opt-in LSN forward only). `deselect` never sets `initial_load`.
-async fn tables_set(ctx: &SharedCtx, req: &Request<'_>, replicate: bool) -> Result<String> {
-    let selection = &req.positional;
-    if selection.is_empty() {
-        bail!("no tables given");
-    }
-    for t in selection {
-        if t.split_once('.').is_none() {
-            bail!("table {t:?} must be namespace.relname");
-        }
-    }
-    let backfill = req
-        .kv
-        .get("backfill")
-        .map(|v| !matches!(*v, "false" | "0" | "no"))
-        .unwrap_or(true);
-    let frag = frag_path(&ctx.ch_config);
-    let mut root = load(&frag).await?;
-    for t in selection {
-        let (ns, rel) = t.split_once('.').unwrap();
-        set_table_replicate(&mut root, ns, rel, replicate);
-        if replicate {
-            let block = section_mut(section_mut(section_mut(&mut root, "table"), ns), rel);
-            block.insert(
-                "initial_load".into(),
-                Value::String(if backfill { "copy" } else { "none" }.into()),
-            );
-        }
-    }
-    save(&frag, &root).await?;
-    Ok(ok())
-}
-
-async fn tables_clear(ctx: &SharedCtx) -> Result<String> {
-    let frag = frag_path(&ctx.ch_config);
-    let mut root = load(&frag).await?;
-    root.remove("table");
-    save(&frag, &root).await?;
-    Ok(ok())
+    let mut out = Table::new();
+    out.insert("columns".into(), Value::Array(arr));
+    Ok(ok_toml(&out))
 }
 
 /// (namespace, relname) for every `[table.<ns>.<rel>]` block in `root` whose
@@ -448,13 +356,6 @@ fn selected_tables(root: &Table) -> Vec<(String, String)> {
     out
 }
 
-fn set_table_replicate(root: &mut Table, ns: &str, rel: &str, v: bool) {
-    let tbl = section_mut(root, "table");
-    let nst = section_mut(tbl, ns);
-    let block = section_mut(nst, rel);
-    block.insert("replicate".into(), Value::Boolean(v));
-}
-
 async fn stream_status(ctx: &SharedCtx) -> Result<String> {
     let paused = get_config(ctx)
         .await?
@@ -464,26 +365,23 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let snap = ctx.metrics.snapshot().await;
-    let mut b = String::new();
-    line(&mut b, "state", if paused { "paused" } else { "running" });
-    line(&mut b, "rows_synced", &snap.emitter_rows_total.to_string());
-    line(
-        &mut b,
-        "backfills_pending",
-        &snap.config_backfills_pending.to_string(),
+    let mut out = Table::new();
+    out.insert("paused".into(), paused.into());
+    out.insert(
+        "rows_synced".into(),
+        (snap.emitter_rows_total as i64).into(),
     );
-    line(
-        &mut b,
-        "lag_bytes",
-        &snap.shadow_apply_lag_bytes.to_string(),
+    out.insert(
+        "backfills_pending".into(),
+        (snap.config_backfills_pending as i64).into(),
     );
-    line(
-        &mut b,
-        "lag_seconds",
-        &snap.shadow_apply_lag_seconds.to_string(),
+    out.insert(
+        "lag_bytes".into(),
+        (snap.shadow_apply_lag_bytes as i64).into(),
     );
-    line(&mut b, "uptime_secs", &snap.uptime_secs.to_string());
-    Ok(ok_with(&b))
+    out.insert("lag_seconds".into(), snap.shadow_apply_lag_seconds.into());
+    out.insert("uptime_secs".into(), (snap.uptime_secs as i64).into());
+    Ok(ok_toml(&out))
 }
 
 async fn config_show(ctx: &SharedCtx) -> Result<String> {
@@ -522,33 +420,6 @@ async fn save(path: &Path, root: &Table) -> Result<()> {
     Ok(())
 }
 
-fn section_mut<'a>(root: &'a mut Table, name: &str) -> &'a mut Table {
-    let entry = root
-        .entry(name.to_string())
-        .or_insert_with(|| Value::Table(Table::new()));
-    match entry {
-        Value::Table(t) => t,
-        other => {
-            *other = Value::Table(Table::new());
-            match other {
-                Value::Table(t) => t,
-                _ => unreachable!(),
-            }
-        }
-    }
-}
-
-/// TOML value from a wire string: bool / integer if it parses, else string.
-fn coerce(s: &str) -> Value {
-    if s == "true" || s == "false" {
-        Value::Boolean(s == "true")
-    } else if let Ok(i) = s.parse::<i64>() {
-        Value::Integer(i)
-    } else {
-        Value::String(s.to_string())
-    }
-}
-
 fn render(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -557,38 +428,25 @@ fn render(v: &Value) -> String {
 }
 
 fn str_at(root: &Table, section: &str, key: &str) -> String {
-    match root
-        .get(section)
+    root.get(section)
         .and_then(Value::as_table)
         .and_then(|t| t.get(key))
-    {
-        Some(v) => render(v),
-        None => String::new(),
-    }
+        .map(render)
+        .unwrap_or_default()
 }
 
-/// Value for `section.key`, overridden by `ov[key]` when present (ephemeral test).
-fn ov(root: &Table, section: &str, key: &str, over: &HashMap<&str, &str>) -> String {
-    over.get(key)
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| str_at(root, section, key))
-}
-
-/// Connect to source PG from `[source]` (NoTls; ephemeral `over` wins). TLS
-/// source probes are a v1 limitation — `sslmode` is forwarded to the streamer.
-// TODO: remove control's direct PG read access (introspection) — route through
-// the daemon's catalog instead.
-async fn pg_connect(root: &Table, over: &HashMap<&str, &str>) -> Result<Client> {
-    let host = ov(root, "source", "host", over);
+// TODO: use daemon catalog, direct NoTls connection cannot inspect TLS-only sources
+async fn pg_connect(root: &Table) -> Result<Client> {
+    let host = str_at(root, "source", "host");
     if host.is_empty() {
         bail!("source host not set");
     }
     let mut cfg = tokio_postgres::Config::new();
     cfg.host(&host)
-        .port(ov(root, "source", "port", over).parse().unwrap_or(5432))
-        .dbname(nonempty(ov(root, "source", "dbname", over), "postgres"))
-        .user(nonempty(ov(root, "source", "user", over), "postgres"));
-    let pw = ov(root, "source", "password", over);
+        .port(str_at(root, "source", "port").parse().unwrap_or(5432))
+        .dbname(nonempty(str_at(root, "source", "dbname"), "postgres"))
+        .user(nonempty(str_at(root, "source", "user"), "postgres"));
+    let pw = str_at(root, "source", "password");
     if !pw.is_empty() {
         cfg.password(&pw);
     }
@@ -604,10 +462,6 @@ async fn pg_connect(root: &Table, over: &HashMap<&str, &str>) -> Result<Client> 
 
 // ---- misc -----------------------------------------------------------------
 
-fn line(b: &mut String, k: &str, v: &str) {
-    use std::fmt::Write;
-    writeln!(b, "{k}={v}").ok();
-}
 fn nonempty(v: String, default: &str) -> String {
     if v.is_empty() { default.to_string() } else { v }
 }
@@ -621,37 +475,66 @@ fn set_mode_600(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn cfg(toml: &str) -> Table {
+        if toml.is_empty() {
+            Table::new()
+        } else {
+            toml.parse().unwrap()
+        }
+    }
+
     #[test]
     fn request_parse() {
-        let r = Request::parse("tables select public.users public.orders").unwrap();
-        assert_eq!((r.noun, r.verb), ("tables", "select"));
-        assert_eq!(r.positional, vec!["public.users", "public.orders"]);
-        let r = Request::parse("source set host=db port=5432").unwrap();
-        assert_eq!(r.kv.get("host"), Some(&"db"));
-        assert_eq!(r.kv.get("port"), Some(&"5432"));
-        assert!(Request::parse("").is_none());
+        // TOML must preserve scalar types and quoted delimiters
+        let doc = encode_request(
+            "apply",
+            cfg("[ch]\nhost = \"db\"\nport = 5432\npassword = \"p a$$=w\""),
+        )
+        .unwrap();
+        let r = Request::parse(doc.as_bytes()).unwrap();
+        assert_eq!(r.verb, "apply");
+        let ch = r.config.get("ch").and_then(Value::as_table).unwrap();
+        assert_eq!(ch.get("host").and_then(Value::as_str), Some("db"));
+        assert_eq!(ch.get("port").and_then(Value::as_integer), Some(5432));
+        assert_eq!(ch.get("password").and_then(Value::as_str), Some("p a$$=w"));
+
+        assert!(Request::parse(b"").is_err());
+        let r = Request::parse(b"status").unwrap();
+        assert_eq!(r.verb, "status");
+        assert!(r.config.is_empty());
     }
 
     #[test]
-    fn coerce_types() {
-        assert_eq!(coerce("5432"), Value::Integer(5432));
-        assert_eq!(coerce("true"), Value::Boolean(true));
-        assert_eq!(coerce("ch.local"), Value::String("ch.local".into()));
+    fn apply_mask_removes_and_recurses() {
+        let mut root = cfg(
+            "[source]\nhost = \"h\"\npassword = \"p\"\n[table.demo.a]\nreplicate = true\n[table.demo.b]\nreplicate = true\n",
+        );
+        apply_mask(&mut root, &cfg("[source]\npassword = \"\""));
+        assert_eq!(str_at(&root, "source", "host"), "h");
+        assert!(root["source"].as_table().unwrap().get("password").is_none());
+        apply_mask(&mut root, &cfg("[table.demo]\na = \"\"\nmissing = \"\""));
+        let demo = root["table"].as_table().unwrap()["demo"]
+            .as_table()
+            .unwrap();
+        assert!(demo.get("a").is_none() && demo.get("b").is_some());
+        apply_mask(&mut root, &cfg("table = \"\""));
+        assert!(root.get("table").is_none());
     }
 
-    #[test]
-    fn section_edit_roundtrips() {
-        let mut root = Table::new();
-        section_mut(&mut root, "ch").insert("host".into(), coerce("ch"));
-        section_mut(&mut root, "ch").insert("port".into(), coerce("9000"));
-        assert_eq!(str_at(&root, "ch", "host"), "ch");
-        assert_eq!(str_at(&root, "ch", "port"), "9000");
+    fn ctx_at(dir: &Path) -> SharedCtx {
+        SharedCtx {
+            ch_config: dir.join("ch-config.toml"),
+            source_base: Table::new(),
+            metrics: MetricsRegistry::new(),
+            reloader: Arc::new(Reloader::default()),
+            frag_lock: Arc::new(Mutex::new(())),
+        }
     }
 
-    async fn call(sock: &Path, req: &str) -> String {
+    async fn call(sock: &Path, verb: &str, config: &str) -> String {
+        let doc = encode_request(verb, cfg(config)).unwrap();
         let mut s = UnixStream::connect(sock).await.unwrap();
-        s.write_all(req.as_bytes()).await.unwrap();
-        s.write_all(b"\n").await.unwrap();
+        s.write_all(doc.as_bytes()).await.unwrap();
         s.shutdown().await.unwrap();
         let mut r = String::new();
         s.read_to_string(&mut r).await.unwrap();
@@ -659,50 +542,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socket_set_get_status_roundtrip() {
+    async fn apply_show_status_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
-        let ctx = SharedCtx {
-            ch_config: dir.path().join("ch-config.toml"),
-            source_base: Table::new(),
-            metrics: MetricsRegistry::new(),
-            reloader: Arc::new(Reloader::default()),
-        };
-        let _h = serve(sock.clone(), ctx.clone()).await.unwrap();
+        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
 
         assert!(
-            call(&sock, "dest set host=ch port=9000 database=demo")
-                .await
-                .starts_with("OK")
+            call(
+                &sock,
+                "apply",
+                "[ch]\nhost = \"ch\"\nport = 9000\ndatabase = \"demo\"\n[stream]\npaused = true"
+            )
+            .await
+            .starts_with("OK")
         );
-        // base ch-config.toml is never written; the API wrote a conf.d fragment.
+        // Keep operator-owned base config untouched
         assert!(!dir.path().join("ch-config.toml").exists());
         assert!(dir.path().join("ch-config.d/50-api.toml").exists());
-        let got = call(&sock, "dest get").await;
-        assert!(got.contains("host=ch"), "{got}");
-        assert!(got.contains("port=9000"), "{got}");
+
+        let shown = call(&sock, "show", "").await;
+        assert!(shown.contains("host = \"ch\""), "{shown}");
+        assert!(shown.contains("paused = true"), "{shown}");
+
         assert!(
-            call(&sock, "dest set password=secret")
+            call(&sock, "apply", "[ch]\npassword = \"secret\"")
                 .await
                 .starts_with("OK")
         );
-        assert!(call(&sock, "dest get").await.contains("password=***"));
+        let shown = call(&sock, "show", "").await;
+        assert!(shown.contains("password = \"***\""), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
 
-        assert!(call(&sock, "stream status").await.contains("state=running"));
-        // pause is a config flag written to the fragment.
-        assert!(call(&sock, "stream stop").await.starts_with("OK"));
-        assert!(call(&sock, "stream status").await.contains("state=paused"));
-
-        assert!(call(&sock, "config show").await.contains("\"ch\""));
-        assert!(call(&sock, "bogus verb").await.starts_with("ERR"));
+        let status = call(&sock, "status", "").await;
+        assert!(status.contains("paused = true"), "{status}");
+        let parsed: Table = status.strip_prefix("OK\n").unwrap().parse().unwrap();
+        assert_eq!(parsed.get("paused").and_then(Value::as_bool), Some(true));
+        assert!(call(&sock, "bogus", "").await.starts_with("ERR"));
+        assert!(call(&sock, "apply", "").await.starts_with("ERR"));
     }
 
-    // `select` is additive: it writes `replicate` for the named tables only,
-    // never touching an operator-pinned base mapping (regression for the bug
-    // where selecting one table wrote `replicate = false` for every other
-    // in-scope table, silently opting the pinned `demo.users` out).
+    // Regression: applying one table used to opt every other table out
     #[tokio::test]
-    async fn tables_select_is_additive() {
+    async fn apply_merges_unset_removes() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
         let base = dir.path().join("ch-config.toml");
@@ -711,51 +592,66 @@ mod tests {
             "[table.demo.users]\ncolumns = [{ attnum = 1, target = \"id\", type = \"Int64\" }]\n",
         )
         .unwrap();
-        let ctx = SharedCtx {
-            ch_config: base,
-            source_base: Table::new(),
-            metrics: MetricsRegistry::new(),
-            reloader: Arc::new(Reloader::default()),
-        };
-        let _h = serve(sock.clone(), ctx.clone()).await.unwrap();
+        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
         let frag = dir.path().join("ch-config.d/50-api.toml");
 
         assert!(
-            call(&sock, "tables select demo.gizmos")
-                .await
-                .starts_with("OK")
+            call(
+                &sock,
+                "apply",
+                "[table.demo.gizmos]\nreplicate = true\ninitial_load = \"copy\""
+            )
+            .await
+            .starts_with("OK")
         );
         let f = std::fs::read_to_string(&frag).unwrap();
         assert!(f.contains("gizmos"), "{f}");
         assert!(
             !f.contains("users"),
-            "select must not touch the pinned users mapping: {f}"
+            "apply must not touch the pinned users mapping: {f}"
         );
-        // select backfills by default.
         assert!(f.contains("initial_load = \"copy\""), "{f}");
 
-        // backfill=false opts in without a snapshot.
         assert!(
-            call(&sock, "tables select demo.widgets backfill=false")
+            call(&sock, "apply", "[table.demo.widgets]\nreplicate = true")
+                .await
+                .starts_with("OK")
+        );
+        let f = std::fs::read_to_string(&frag).unwrap();
+        assert!(f.contains("gizmos") && f.contains("widgets"), "{f}");
+
+        assert!(
+            call(&sock, "unset", "[table.demo]\ngizmos = \"\"")
+                .await
+                .starts_with("OK")
+        );
+        let f = std::fs::read_to_string(&frag).unwrap();
+        assert!(!f.contains("gizmos") && f.contains("widgets"), "{f}");
+        assert!(call(&sock, "unset", "table = \"\"").await.starts_with("OK"));
+        assert!(!std::fs::read_to_string(&frag).unwrap().contains("widgets"));
+        // Empty unset is a nop, not an error
+        assert!(call(&sock, "unset", "").await.starts_with("OK"));
+    }
+
+    // Invalid fragments must not poison later reloads or starts
+    #[tokio::test]
+    async fn apply_rejects_and_rolls_back_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+        let frag = dir.path().join("ch-config.d/50-api.toml");
+
+        assert!(
+            call(&sock, "apply", "[ch]\nhost = \"ch\"\nport = 9000")
                 .await
                 .starts_with("OK")
         );
         assert!(
-            std::fs::read_to_string(&frag)
-                .unwrap()
-                .contains("initial_load = \"none\"")
-        );
-
-        // deselect flips only the named table.
-        assert!(
-            call(&sock, "tables deselect demo.gizmos")
+            call(&sock, "apply", "[ch]\nport = 70000")
                 .await
-                .starts_with("OK")
+                .starts_with("ERR")
         );
-        assert!(std::fs::read_to_string(&frag).unwrap().contains("false"));
-
-        // clear drops the whole [table] section.
-        assert!(call(&sock, "tables clear").await.starts_with("OK"));
-        assert!(!std::fs::read_to_string(&frag).unwrap().contains("gizmos"));
+        let f = std::fs::read_to_string(&frag).unwrap();
+        assert!(f.contains("port = 9000") && !f.contains("70000"), "{f}");
     }
 }
