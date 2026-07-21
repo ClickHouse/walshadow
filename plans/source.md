@@ -253,8 +253,8 @@ Per-record decoder dispatch lives in
 [`MetricsTupleObserver`](../src/decoder_sink.rs) hosts
 [`DecoderStats`](../src/decoder_sink.rs) counter;
 [`CollectingTupleObserver`](../src/decoder_sink.rs) is test collector.
-`TupleObserver` serves the metrics-only / harness paths; the production
-CH path bypasses it — commit drain feeds the pipeline's reorder
+`TupleObserver` is the greenfield-bootstrap page-walk drain destination
+(`drain_backfill`); WAL commit drain feeds the pipeline's reorder
 coordinator instead ([emitter.md](emitter.md))
 
 Record stats on `DecoderStats`: `toast_chunks_buffered` (TOAST chunks
@@ -394,7 +394,7 @@ entry point. Boots in order: args + pre-flight validators
 initialized shadow when `--bootstrap-shadow-data-dir` is set; bootstrap
 from direct `BASE_BACKUP` or wal-g-compatible object store backup
 ([shadow.md](shadow.md)); connect `SourceFeed`; run `IDENTIFY_SYSTEM`;
-derive `start_lsn` from bootstrap `end_lsn`, cursor, `--start-lsn`, or
+derive `start_lsn` from bootstrap `end_lsn`, manifest, `--start-lsn`, or
 source `xlogpos`; align it down and limit it to sealed archive end
 ([ops.md](ops.md));
 `ShadowCatalog` + `XactBuffer` + `schema_events` subscription; bind
@@ -403,9 +403,9 @@ walsender listener before shadow's walreceiver attaches; construct
 `QueueingRecordSink::spawn(DecoderXactPair { decoder, xact_drain },
 batch_size, capacity)`); open `WalStream` + `DirSegmentSink`, attach
 `ShadowStreamSink` via `set_bytes_sink`; spawn metrics endpoint, SIGHUP
-handler, retention sweeper, cursor write loop; ensure the configured physical slot before pre-flight; wait for walsender
+handler, retention sweeper, status loop; ensure the configured physical slot before pre-flight; wait for walsender
 connect barrier; pump loop: `feed.next_chunk()` → `stream.push(lsn,
-bytes, &mut record_sink, &mut segment_sink)` → cursor advance → status
+bytes, &mut record_sink, &mut segment_sink)` → manifest advance → status
 update → repeat. A `next_chunk` error routes through `reconnect_or_fatal`:
 transient drop → `SourceFeed::reconnect` at `stream.next_lsn()`; recycled
 segment (`58P01`) → fatal exit (re-seed via config `initial_load` on
@@ -415,7 +415,7 @@ restart)
 buffer *before* xact_drain flushes matching commit/abort.
 Multi-statement xact whose COMMIT lands in same dispatch batch as its
 heap writes would otherwise miss latest writes. See [ops.md](ops.md)
-for cursor advance, metrics endpoint, SIGHUP semantics, retention
+for manifest advance, metrics endpoint, SIGHUP semantics, retention
 sweeper
 
 ## Cross-links
@@ -428,7 +428,7 @@ sweeper
   `primary_conninfo` + `restore_command` dual-source
 - [xact.md](xact.md) — xact buffer, TOAST reassembly, where committed
   tuples land
-- [ops.md](ops.md) — cursor advance, metrics, SIGHUP, retention
+- [ops.md](ops.md) — manifest advance, metrics, SIGHUP, retention
 
 ## Out of scope
 

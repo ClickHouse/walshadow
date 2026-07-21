@@ -44,22 +44,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::Instrument;
-use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::walparser::{RelFileNode, RmId};
 
 use crate::catalog::shadow_catalog::{CatalogError, ShadowCatalog};
-use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, TupleObserver};
+use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats};
 use crate::decode::heap_decoder::{
-    ColumnValue, CommittedTuple, DecodedHeap, HeapOp, ToastPointer, decode_heap_record,
+    ColumnValue, DecodedHeap, HeapOp, ToastPointer, decode_heap_record,
 };
 #[cfg(test)]
 use crate::decode::wal_xact::{
     XACT_XINFO_HAS_DBINFO, XACT_XINFO_HAS_GID, XACT_XINFO_HAS_INVALS, XACT_XINFO_HAS_SUBXACTS,
-    XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO,
-};
-use crate::decode::wal_xact::{
-    XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
-    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
+    XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO, parse_xact_assignment, parse_xact_payload,
 };
 use crate::emit::ch_emitter::EmitterStats;
 use crate::ops::trace::{InflightSnapshotEntry, TxnSpanRegistry, new_txn_span};
@@ -315,14 +310,10 @@ pub struct XactBufferStats {
     /// Aborts for xids never buffered. Runs higher than
     /// `commits_unknown_xid`: aborts often hit xacts that wrote nothing
     pub aborts_unknown_xid: u64,
-    /// Highest commit-record LSN drained into observer `on_tuple`.
-    /// Snapshot for cursor `drain_lsn`, monotonic
+    /// Highest commit-record LSN handed to a drain. Snapshot for the
+    /// manifest `drain` role, monotonic. The durable-ack sibling lives in
+    /// the pipeline ack collector, not here
     pub drain_lsn: u64,
-    /// Highest commit-record LSN observer `on_xact_end` reported durable.
-    /// Snapshot for `cursor.emitter_ack_lsn`, monotonic. Lags `drain_lsn`
-    /// when observer (CH emitter `flush_timeout > 0`) holds rows in open
-    /// INSERTs
-    pub emitter_ack_lsn: u64,
 }
 
 impl XactBufferStats {
@@ -391,8 +382,8 @@ struct XactState {
     /// Per-txn `txn` span; duration = WAL-record→durable latency.
     span: tracing::Span,
     /// Child of `span` covering first-buffered→COMMIT-observed (parked-for-
-    /// commit wait); closed atop `commit`, so `txn = buffer.wait + commit.drain`.
-    wait_span: tracing::Span,
+    /// commit wait); closes when the drain consumes the state.
+    _wait_span: tracing::Span,
 }
 
 impl XactState {
@@ -412,7 +403,7 @@ impl XactState {
             events: Vec::new(),
             stash_rfns: HashSet::new(),
             span,
-            wait_span,
+            _wait_span: wait_span,
         }
     }
 }
@@ -759,7 +750,7 @@ impl XactBuffer {
         out
     }
 
-    /// Detoast descriptor is fetched in [`XactBuffer::commit`] on demand:
+    /// Detoast descriptor is fetched in [`detoast_heap`] after drain:
     /// no per-xact rel cache here, catalog's LRU covers repeat lookups
     pub async fn on_heap(
         &mut self,
@@ -1070,237 +1061,10 @@ impl XactBuffer {
         }
     }
 
-    /// Drain xact `xid` to `observer` in WAL order, substituting each
-    /// `ExternalToast` with its reassembled `Bytea` / `Text` via
-    /// [`ShadowCatalog::relation_at`]. No-op for unknown `xid`
-    /// (read-only or filter-dropped).
-    ///
-    /// `commit_lsn` is the `XLOG_XACT_COMMIT` record LSN, stamped into
-    /// [`CommittedTuple::commit_lsn`] and bumped into `drain_lsn` /
-    /// `emitter_ack_lsn` as the cursor resume gate's monotonic mark.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn commit<O: TupleObserver>(
-        &mut self,
-        top_xid: u32,
-        commit_ts: i64,
-        commit_lsn: u64,
-        subxids: &[u32],
-        catalog: &Arc<Mutex<ShadowCatalog>>,
-        observer: &mut O,
-        resolver: &ToastResolver,
-    ) -> std::result::Result<(), XactBufferError> {
-        // Only the top counts for `commits_unknown_xid` so the metric
-        // stays per-xact, not per-subxid
-        let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
-        xids.push(top_xid);
-        xids.extend_from_slice(subxids);
-        // XactState clones carry the span through the drain; just bound the map.
-        self.span_registry.prune(&xids);
-        let mut states: Vec<XactState> = Vec::with_capacity(xids.len());
-        for x in &xids {
-            if let Some(st) = self.inflight.remove(x) {
-                states.push(st);
-            }
-        }
-
-        if states.is_empty() {
-            self.stats.commits_unknown_xid += 1;
-            // Read-only / filter-dropped still advances the ack ceiling so
-            // the slot can recycle WAL up to commit_lsn. Route through
-            // `on_xact_end` anyway so an observer holding prior rows in
-            // open inserts clamps the ack at its own durable horizon,
-            // else we'd claim durability for client-buffered rows
-            self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
-            let ack_lsn = observer
-                .on_xact_end(commit_lsn)
-                .await
-                .map_err(|e| XactBufferError::Observer(e.to_string()))?;
-            self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
-            return Ok(());
-        }
-        // Preserve floor after states leave `inflight`
-        if let Some(first) = states.iter().map(|st| st.first_lsn).min() {
-            self.pending_durable.push(first, commit_lsn);
-        }
-        // Concurrency at commit time, counted before we tick this xact's
-        // ids back out. A high value sitting next to a long `commit.drain`
-        // is the multi-source-connection head-of-line-blocking signature:
-        // many xacts live, one fat INSERT draining while the rest wait.
-        let xacts_active_at_commit = self.stats.xacts_active;
-        // Active counter ticks down once per drained xact (top + subs).
-        for st in &states {
-            self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
-            self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
-        }
-        self.stats.bytes_in_memory = self.bytes_in_memory as u64;
-
-        // Clone the per-txn span so it survives the `states` drain and stays
-        // open until `outcome` is recorded; `commit.drain` is its child.
-        let txn_span = states
-            .first()
-            .map(|s| s.span.clone())
-            .unwrap_or_else(tracing::Span::none);
-        txn_span.record("top_xid", top_xid);
-        // Close each `buffer.wait`, so it spans exactly first-record → commit.
-        for st in &mut states {
-            st.wait_span = tracing::Span::none();
-        }
-        // Wall-clock age of PG's commit at the moment we process it. The
-        // WAL commit record carries PG's commit timestamp (PG-epoch µs);
-        // shifted to unix µs it's directly comparable to our clock (all
-        // demo containers share the host clock). This is the PG-commit →
-        // walshadow-processes-commit leg — large here means the wait is
-        // upstream (reading WAL / queue backlog), not in our drain.
-        let pg_commit_age_ms = {
-            let now_us = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_micros() as i64)
-                .unwrap_or(0);
-            let commit_unix_us = commit_ts.saturating_add(walrus::pg::replication::PG_EPOCH_USEC);
-            (now_us - commit_unix_us) as f64 / 1000.0
-        };
-        let drain_span = trace_span!(
-            !txn_span.is_none(),
-            parent: &txn_span,
-            "commit.drain",
-            top_xid = top_xid,
-            commit_lsn = commit_lsn,
-            subxids = subxids.len(),
-            xacts_active = xacts_active_at_commit,
-            pg_commit_age_ms = pg_commit_age_ms,
-            rows = tracing::field::Empty,
-            spilled = states.iter().any(|s| s.spill.is_some()),
-        );
-
-        // Lazy k-way merge: one decoded head per source, in-mem tails
-        // chained behind spill readers (eviction discipline holds "spilled
-        // older than in-mem"). Dispatch happens per pick, so peak residency
-        // is merge heads + the chunk map — not the whole decoded xact that
-        // spilled precisely because it exceeded the buffer budget.
-        let stash = self.pending_stash.remove(&top_xid).unwrap_or_default();
-        let mut drain = self
-            .open_drain(states, resolver.stores_chunks(), stash, top_xid, commit_lsn)
-            .await?;
-        let mut rows: u64 = 0;
-        // Applied after the store put below: residuals read the mirror, so
-        // this xact's births must land first
-        let mut toast_barriers: Vec<(u32, u64)> = Vec::new();
-        while let Some(item) = drain.next().await? {
-            match item {
-                MergeItem::Event(ev) => match &ev {
-                    DrainEntry::Catalog(ev) => observer
-                        .on_schema_event(ev)
-                        .instrument(drain_span.clone())
-                        .await
-                        .map_err(|e| XactBufferError::Observer(e.to_string()))?,
-                    DrainEntry::Config(ev) => observer
-                        .on_config_event(ev)
-                        .instrument(drain_span.clone())
-                        .await
-                        .map_err(|e| XactBufferError::Observer(e.to_string()))?,
-                    DrainEntry::ToastBarrier {
-                        toast_relid,
-                        marker_lsn,
-                    } => toast_barriers.push((*toast_relid, *marker_lsn)),
-                },
-                MergeItem::Heap(mut heap) => {
-                    // Refs may point into the unflushed spool tail; no-op
-                    // when nothing buffered
-                    drain.flush_spool()?;
-                    // Serial observer emits synchronously; the leaf permit
-                    // covers decoded values through `on_tuple`
-                    let _value_permit = detoast_heap(
-                        &mut heap,
-                        drain.spool_file(),
-                        &[drain.chunks()],
-                        catalog,
-                        false,
-                        resolver,
-                    )
-                    .await?;
-                    let committed = CommittedTuple {
-                        decoded: *heap,
-                        commit_ts,
-                        commit_lsn,
-                    };
-                    // Under `drain_span` so the emitter's `emit.insert` (the
-                    // blocking ClickHouse round-trip, sealed on a budget trip
-                    // or at xact end) attaches as a child of this
-                    // transaction's drain.
-                    observer
-                        .on_tuple(&committed)
-                        .instrument(drain_span.clone())
-                        .await
-                        .map_err(|e| XactBufferError::Observer(e.to_string()))?;
-                    rows += 1;
-                }
-            }
-        }
-        drain_span.record("rows", rows);
-        // Put store rows before returning: a later commit's referrer may
-        // fetch. Trailing chunks may sit in the spool write buffer
-        drain.flush_spool()?;
-        let store_rows = drain.take_rows();
-        resolver
-            .put_row_refs(store_rows.spool(), &store_rows)
-            .await
-            .map_err(|e| XactBufferError::Detoast(format!("toast store put: {e}")))?;
-        for (toast_relid, marker_lsn) in toast_barriers {
-            resolver
-                .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
-                .await
-                .map_err(|e| XactBufferError::Detoast(format!("toast rewrite barrier: {e}")))?;
-        }
-        // Unlink spill files only now, after dispatch: an observer error
-        // above abandons the partially consumed reader on disk (startup
-        // wipe + redecode-from-ack cover replay).
-        drain.finish().await?;
-        // drain_lsn ticks before the ack so an observer failure leaves
-        // drain_lsn ahead of emitter_ack_lsn, the gap the cursor surfaces.
-        // With CH flush_timeout > 0, on_xact_end returns last durable
-        // commit_lsn (<= commit_lsn), so emitter_ack_lsn lags by design
-        self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
-        // `ack` covers the durability handshake. In hold-open mode this is
-        // also where a still-open INSERT gets sealed, so `emit.insert` can
-        // appear under it; `held_open` flags an ack that lagged commit_lsn.
-        let ack_span = trace_span!(
-            !drain_span.is_none(),
-            parent: &drain_span,
-            "ack",
-            commit_lsn = commit_lsn,
-            ack_lsn = tracing::field::Empty,
-            held_open = tracing::field::Empty,
-        );
-        let ack_lsn = observer
-            .on_xact_end(commit_lsn)
-            .instrument(ack_span.clone())
-            .await
-            .map_err(|e| XactBufferError::Observer(e.to_string()))?;
-        ack_span.record("ack_lsn", ack_lsn);
-        ack_span.record("held_open", ack_lsn < commit_lsn);
-        let prev_ack = self.stats.emitter_ack_lsn;
-        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(ack_lsn);
-        let ack = self.stats.emitter_ack_lsn;
-        self.pending_durable.prune(ack);
-        tracing::trace!(
-            target: "walshadow::xact_buffer",
-            top_xid,
-            commit_lsn = format_pg_lsn(commit_lsn).to_string(),
-            ack_lsn = format_pg_lsn(ack_lsn).to_string(),
-            prev_ack = format_pg_lsn(prev_ack).to_string(),
-            "drain complete",
-        );
-        // One bump per top, not per subxid
-        self.stats.committed_xacts_total += 1;
-        txn_span.record("outcome", "committed");
-        Ok(())
-    }
-
-    /// Parallel-pipeline drain: hand back a [`CommittedDrain`] that streams
-    /// bounded [`DrainedBatch`] slices from the same lazy k-way merge as
-    /// [`Self::commit`], *without* detoast or dispatch (those move to the
-    /// decode pool / barrier coordinator). Unlike `commit`, leaves
-    /// `emitter_ack_lsn` to the pipeline ack collector.
+    /// Commit drain: hand back a [`CommittedDrain`] that streams bounded
+    /// [`DrainedBatch`] slices from a lazy k-way merge. Detoast and dispatch
+    /// run in the decode pool / barrier coordinator; pipeline ack collector
+    /// owns `emitter_ack_lsn`.
     pub async fn drain_committed(
         &mut self,
         top_xid: u32,
@@ -1356,18 +1120,15 @@ impl XactBuffer {
         })
     }
 
-    /// When no xact in flight, advance `drain_lsn` to `lsn` and
-    /// `emitter_ack_lsn` to `min(lsn, ack_ceiling)`. Lets the slot recycle
-    /// trailing post-COMMIT WAL (page padding, RUNNING_XACTS, CHECKPOINT)
-    /// when quiescent. `ack_ceiling` is the observer's durable horizon: in
-    /// hold-open mode rows sit in open INSERTs, so the ack must not pass
-    /// what's durable else source recycles unwritten WAL.
-    pub fn advance_idle(&mut self, lsn: u64, ack_ceiling: u64) {
+    /// When no xact in flight, advance `drain_lsn` to `lsn`: trailing
+    /// post-COMMIT WAL (page padding, RUNNING_XACTS, CHECKPOINT) counts as
+    /// drained when quiescent. The durable ack side lives in the ack
+    /// collector (`AckHandle::trailing`).
+    pub fn advance_idle(&mut self, lsn: u64) {
         if self.stats.xacts_active != 0 {
             return;
         }
         self.stats.drain_lsn = self.stats.drain_lsn.max(lsn);
-        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(lsn.min(ack_ceiling));
     }
 
     /// Floor durable acknowledgment at first record of each undurable transaction
@@ -1380,15 +1141,10 @@ impl XactBuffer {
             .fold(durable_ack, u64::min)
     }
 
-    /// Fold an observer-reported durable LSN into `emitter_ack_lsn` only;
-    /// `drain_lsn` already covers commit boundaries
-    pub fn note_idle_durable(&mut self, lsn: u64) {
-        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(lsn);
-    }
-
     /// Discard xact `xid` + spill file. No-op if unknown. `abort_lsn` is
-    /// the `XLOG_XACT_ABORT` record LSN; advances `drain_lsn` /
-    /// `emitter_ack_lsn` so the cursor counts aborts as fully consumed
+    /// the `XLOG_XACT_ABORT` record LSN; advances `drain_lsn` so aborts
+    /// count as fully consumed (the ack side rides the reorder's rows=0
+    /// abort seq through the collector)
     pub async fn abort(
         &mut self,
         xid: u32,
@@ -1396,7 +1152,6 @@ impl XactBuffer {
         subxids: &[u32],
     ) -> std::result::Result<(), XactBufferError> {
         self.stats.drain_lsn = self.stats.drain_lsn.max(abort_lsn);
-        self.stats.emitter_ack_lsn = self.stats.emitter_ack_lsn.max(abort_lsn);
         // `xid` is header xact_id: top abort or subxact standalone
         // rollback. Drop `xid` + every sub. For mid-xact subxact rollback
         // (PG `RecordSubTransactionAbort` writes a separate
@@ -1781,21 +1536,13 @@ impl MergedDrain {
         Ok(())
     }
 
-    fn chunks(&self) -> &ChunkRefMap {
-        &self.chunks
-    }
-
-    /// Make appended bodies readable through [`Self::spool_file`]; no-op
+    /// Make appended bodies readable through the spool handle; no-op
     /// while memory-resident or when nothing buffered
     fn flush_spool(&mut self) -> std::result::Result<(), XactBufferError> {
         if let Some(s) = self.spool.as_mut() {
             s.flush()?;
         }
         Ok(())
-    }
-
-    fn spool_file(&self) -> Option<&BodySpoolFile> {
-        self.spool.as_ref().map(|s| s.shared().as_ref())
     }
 
     fn spool_handle(&self) -> Option<Arc<BodySpoolFile>> {
@@ -1951,6 +1698,77 @@ pub struct DrainedBatch {
     pub is_final: bool,
 }
 
+/// One step of a [`DrainedBatch`] apply plan (see [`DrainedBatch::into_walk`]).
+pub enum WalkStep {
+    /// Seal store rows: put `new_rows[cursor..upto]` before the next step
+    /// (`upto` may equal the cursor — nothing to put).
+    Rows {
+        upto: usize,
+    },
+    Event(DrainEntry),
+    Truncate(DecodedHeap),
+    Heap(DecodedHeap),
+}
+
+/// [`DrainedBatch`] decomposed into its apply plan plus the payload fields
+/// consumers read alongside the steps.
+pub struct DrainWalk {
+    pub steps: Vec<WalkStep>,
+    pub chunks: Vec<Arc<ChunkGeneration>>,
+    pub new_rows: ToastRowBatch,
+    pub is_final: bool,
+}
+
+impl DrainedBatch {
+    /// Cursor-ordered apply plan — the single implementation of the
+    /// `ordered_events` / `truncate_rows` interleave: an event fires before
+    /// the heap it sorts ahead of, `Rows` seals store births/deaths before
+    /// each event / truncate and once at the tail. Reorder barriers and
+    /// backup gap replay both consume this.
+    pub fn into_walk(self) -> DrainWalk {
+        let DrainedBatch {
+            heaps,
+            ordered_events,
+            chunks,
+            new_rows,
+            truncate_rows,
+            is_final,
+        } = self;
+        let mut steps =
+            Vec::with_capacity(heaps.len() + 2 * ordered_events.len() + truncate_rows.len() + 1);
+        let mut events = ordered_events.into_iter().peekable();
+        let mut trunc = truncate_rows.into_iter();
+        for (heap_idx, heap) in heaps.into_iter().enumerate() {
+            while let Some(e) = events.next_if(|e| e.heap_idx <= heap_idx) {
+                steps.push(WalkStep::Rows { upto: e.row_idx });
+                steps.push(WalkStep::Event(e.event));
+            }
+            if matches!(heap.op, HeapOp::Truncate) {
+                let upto = trunc
+                    .next()
+                    .expect("truncate_rows cursor per Truncate heap");
+                steps.push(WalkStep::Rows { upto });
+                steps.push(WalkStep::Truncate(heap));
+            } else {
+                steps.push(WalkStep::Heap(heap));
+            }
+        }
+        for e in events {
+            steps.push(WalkStep::Rows { upto: e.row_idx });
+            steps.push(WalkStep::Event(e.event));
+        }
+        steps.push(WalkStep::Rows {
+            upto: new_rows.len(),
+        });
+        DrainWalk {
+            steps,
+            chunks,
+            new_rows,
+            is_final,
+        }
+    }
+}
+
 /// Streaming handle for one committed xact: pull [`DrainedBatch`] slices,
 /// then [`Self::finish`] to unlink spill files once dispatch completes.
 pub struct CommittedDrain {
@@ -2036,7 +1854,8 @@ impl CommittedDrain {
 /// heap's tuples; the caller rides it with the routed row to insert ack
 /// so decoded values (and their encoder slab copy) stay covered past
 /// this call. `None` without budget or external values.
-pub(crate) async fn detoast_heap(
+/// Pub for the decode pool, gap replay, and tests.
+pub async fn detoast_heap(
     heap: &mut DecodedHeap,
     // Xact body spool backing `File` refs; None while memory-resident
     spool: Option<&BodySpoolFile>,
@@ -2319,291 +2138,6 @@ pub(crate) fn reassemble_value_ref(
     Ok(Reassembled::Bytes(finish_value(p, concat)?))
 }
 
-/// `RecordSink` for `RM_XACT_ID` records. Separate from
-/// [`BufferingDecoderSink`] because xact records are `Route::ToShadow`
-/// (shadow PG needs them for CLOG) so the decoder sink skips them.
-pub struct XactRecordSink<O: TupleObserver + Send> {
-    buffer: Arc<Mutex<XactBuffer>>,
-    catalog: Arc<Mutex<ShadowCatalog>>,
-    /// Hint only: canonical subxact list arrives inline on commit / abort.
-    /// Tracker covers eviction policy needing the family before COMMIT
-    subxact_tracker: Arc<Mutex<SubxactTracker>>,
-    observer: O,
-    /// Same handle [`BufferingDecoderSink`] holds; this sink drains it
-    /// post-`sweep_dropped` to route `Dropped` events into the buffer
-    schema_events: Option<SchemaEventRx>,
-    /// Armed by [`BufferingDecoderSink`] at pg_class heap_delete records,
-    /// consumed here only at the arming xact's own commit — an epoch
-    /// consumed at an interleaved commit sweeps before the drop is
-    /// commit-visible in shadow and loses the Dropped event. Also skips
-    /// the per-commit catalog-lock acquire when no DROP fired; that lock
-    /// contends with `wait_for_replay` and serialised the drain at
-    /// pgbench rates
-    pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
-    /// Serial drain is metrics-only (no `--ch-config`), so this stays
-    /// disabled by default: same-xact values reassemble inline, misses
-    /// NULL/default-fill.
-    resolver: ToastResolver,
-}
-
-impl<O: TupleObserver + Send> XactRecordSink<O> {
-    pub fn new(
-        buffer: Arc<Mutex<XactBuffer>>,
-        catalog: Arc<Mutex<ShadowCatalog>>,
-        observer: O,
-    ) -> Self {
-        Self {
-            buffer,
-            catalog,
-            subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-            observer,
-            schema_events: None,
-            pending_sweeps: None,
-            resolver: ToastResolver::disabled(),
-        }
-    }
-
-    pub fn with_toast_resolver(mut self, resolver: ToastResolver) -> Self {
-        self.resolver = resolver;
-        self
-    }
-
-    /// Unset: sink owns a private tracker
-    pub fn with_subxact_tracker(mut self, tracker: Arc<Mutex<SubxactTracker>>) -> Self {
-        self.subxact_tracker = tracker;
-        self
-    }
-
-    /// Sink runs [`ShadowCatalog::sweep_dropped`] at armed commits;
-    /// resulting `Dropped` events flow into the buffer keyed on the
-    /// commit's xid + LSN. Pass the same `rx` as
-    /// [`BufferingDecoderSink::with_schema_events`].
-    pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
-        self.schema_events = Some(rx);
-        self
-    }
-
-    /// Pass the same handle as
-    /// [`BufferingDecoderSink::with_catalog_signals`]; gates
-    /// [`ShadowCatalog::sweep_dropped`] on the arming xact's commit
-    /// without the contended catalog lock.
-    pub fn with_pending_sweeps(
-        mut self,
-        pending: crate::filter::catalog_tracker::PendingSweeps,
-    ) -> Self {
-        self.pending_sweeps = Some(pending);
-        self
-    }
-
-    pub fn observer_mut(&mut self) -> &mut O {
-        &mut self.observer
-    }
-
-    pub fn subxact_tracker(&self) -> &Arc<Mutex<SubxactTracker>> {
-        &self.subxact_tracker
-    }
-
-    /// Route queued [`SchemaEvent`]s into the buffer keyed on `(xid, source_lsn)`
-    async fn route_pending_schema_events(
-        &mut self,
-        xid: u32,
-        source_lsn: u64,
-    ) -> std::result::Result<(), SinkError> {
-        let Some(rx) = self.schema_events.as_ref() else {
-            return Ok(());
-        };
-        let pending = drain_pending_schema_events(rx);
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let mut buf = self.buffer.lock().await;
-        for ev in pending {
-            buf.on_schema_event(xid, source_lsn, ev);
-        }
-        Ok(())
-    }
-}
-
-impl<O: TupleObserver + Send> RecordSink for XactRecordSink<O> {
-    fn on_record<'a>(
-        &'a mut self,
-        record: &'a Record<'a>,
-    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            if record.parsed.header.resource_manager_id != RmId::Xact as u8 {
-                return Ok(());
-            }
-            let info = record.parsed.header.info;
-            let op = info & XLOG_XACT_OPMASK;
-            let xid = record.parsed.header.xact_id;
-            match op {
-                XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
-                    let payload = parse_xact_payload(info, &record.parsed.main_data);
-                    // Poll-based DROP TABLE discovery at commit. PG system
-                    // catalogs default to `relreplident = 'n'`, so
-                    // heap_delete WAL omits the dying oid; only way to
-                    // detect a drop is asking shadow if known oids still
-                    // exist. Arming fires only on heap_delete against
-                    // pg_class (DROP TABLE's WAL signature), not on the
-                    // ADD COLUMN / CREATE INDEX / VACUUM catalog flood;
-                    // consumption only at the arming xact's own commit,
-                    // whose replay gate makes the drop visible in shadow.
-                    if self.schema_events.is_some()
-                        && let Some(pending) = &self.pending_sweeps
-                        && pending.disarm(xid, payload.twophase_xid, &payload.subxacts)
-                    {
-                        let mut cat = self.catalog.lock().await;
-                        if record.source_lsn > 0 {
-                            cat.wait_for_replay(record.source_lsn)
-                                .await
-                                .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
-                        }
-                        let dropped_count = cat
-                            .sweep_dropped()
-                            .await
-                            .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
-                        drop(cat);
-                        if dropped_count > 0 {
-                            self.route_pending_schema_events(xid, record.source_lsn)
-                                .await?;
-                        }
-                    }
-                    // Deferred resolution for filenodes invisible at record
-                    // time; installs decode verdicts + `O - B` barriers
-                    // ahead of the drain
-                    resolve_stash(
-                        &self.buffer,
-                        &self.catalog,
-                        xid,
-                        &payload.subxacts,
-                        record.source_lsn,
-                        self.resolver.stats_handle(),
-                    )
-                    .await
-                    .map_err(SinkError::from)?;
-                    // Resolution can surface Added events for newly
-                    // visible rels
-                    self.route_pending_schema_events(xid, record.source_lsn)
-                        .await?;
-                    let mut buf = self.buffer.lock().await;
-                    // Surfaces subxact-id mismatches between heap-record
-                    // xact_id and the top's commit-record subxact list
-                    tracing::trace!(
-                        target: "walshadow::xact_buffer",
-                        xid,
-                        commit_lsn = format_pg_lsn(record.source_lsn).to_string(),
-                        nsubxacts = payload.subxacts.len(),
-                        "xact commit",
-                    );
-                    buf.commit(
-                        xid,
-                        payload.xact_time,
-                        record.source_lsn,
-                        &payload.subxacts,
-                        &self.catalog,
-                        &mut self.observer,
-                        &self.resolver,
-                    )
-                    .await
-                    .map_err(SinkError::from)?;
-                    drop(buf);
-                    self.subxact_tracker.lock().await.forget_tree(xid);
-                }
-                XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
-                    let payload = parse_xact_payload(info, &record.parsed.main_data);
-                    // Rolled-back pg_class heap_delete resurrects the row;
-                    // no sweep, drop the arm
-                    if let Some(pending) = &self.pending_sweeps {
-                        pending.disarm(xid, payload.twophase_xid, &payload.subxacts);
-                    }
-                    tracing::trace!(
-                        target: "walshadow::xact_buffer",
-                        xid,
-                        abort_lsn = format_pg_lsn(record.source_lsn).to_string(),
-                        nsubxacts = payload.subxacts.len(),
-                        "xact abort",
-                    );
-                    let mut buf = self.buffer.lock().await;
-                    buf.abort(xid, record.source_lsn, &payload.subxacts)
-                        .await
-                        .map_err(SinkError::from)?;
-                    drop(buf);
-                    // Harmless for standalone subxact abort (drops the
-                    // single edge); top abort clears the family
-                    self.subxact_tracker.lock().await.forget_tree(xid);
-                }
-                XLOG_XACT_ASSIGNMENT => {
-                    // Hint for eviction policy; correctness rides on the
-                    // commit / abort record's authoritative subxact list
-                    if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data) {
-                        self.subxact_tracker.lock().await.assign(xtop, &subs);
-                    }
-                }
-                _ => {
-                    // XLOG_XACT_PREPARE / INVALIDATIONS unhandled. 2PC
-                    // deferred: xact stays buffered until COMMIT_PREPARED
-                }
-            }
-            Ok(())
-        })
-    }
-
-    /// Buffer has no time-based work; hook exists so the CH emitter's
-    /// hold-INSERT-open deadline fires without waiting on next commit
-    fn on_idle<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let durable = self
-                .observer
-                .on_idle()
-                .await
-                .map_err(|e| SinkError::Other(e.to_string()))?;
-            // Deadline close promotes the durable horizon; fold into ack
-            // so retention advances with no further commit
-            if durable != 0 {
-                self.buffer.lock().await.note_idle_durable(durable);
-            }
-            Ok(())
-        })
-    }
-
-    /// Final force-flush for the CH emitter's hold-INSERT-open path;
-    /// without it, rows buffered at shutdown stay non-durable
-    fn on_close<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            self.observer
-                .on_close()
-                .await
-                .map_err(|e| SinkError::Other(e.to_string()))
-        })
-    }
-
-    fn on_idle_advance<'a>(
-        &'a mut self,
-        lsn: u64,
-    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            // Cap ack at the durable horizon: nudge must not promote past
-            // rows held in open INSERTs
-            let ceiling = self.observer.idle_ack_ceiling(lsn);
-            let mut buf = self.buffer.lock().await;
-            buf.advance_idle(lsn, ceiling);
-            Ok(())
-        })
-    }
-}
-
-/// Shared schema-event receiver. `std::sync::Mutex` wrapper lets both
-/// [`BufferingDecoderSink`] (drain after every `relation_at`) and
-/// [`XactRecordSink`] (drain after every `sweep_dropped`) pull from the
-/// same queue.
 /// Decodes `Route::ToDecoder` user-heap records into the xact buffer.
 /// Toast-relation INSERTs (`rel.kind == 't'`) reinterpret as
 /// [`ToastChunk`]; semantic errors absorb into [`DecoderStats`] rather
@@ -2693,9 +2227,9 @@ impl BufferingDecoderSink {
         self
     }
 
-    /// Share the same `rx` with [`XactRecordSink::with_schema_events`]:
-    /// channel drains from both sides (decoder for Added/Changed at fetch
-    /// time, xact-record sink for Dropped at commit via `sweep_dropped`).
+    /// Share the same `rx` with the reorder coordinator: channel drains
+    /// from both sides (decoder for Added/Changed at fetch time, reorder
+    /// for Dropped at commit via `sweep_dropped`).
     pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
         self.schema_events = Some(rx);
         self
@@ -3431,23 +2965,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn advance_idle_caps_ack_at_ceiling() {
+    async fn advance_idle_moves_drain_lsn_monotonically() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        // Hold-open: ceiling below dispatched lsn caps emitter_ack
-        b.advance_idle(100, 50);
+        b.advance_idle(100);
         assert_eq!(b.stats().drain_lsn, 100);
-        assert_eq!(b.stats().emitter_ack_lsn, 50);
-        b.advance_idle(200, 200);
-        assert_eq!(b.stats().drain_lsn, 200);
-        assert_eq!(b.stats().emitter_ack_lsn, 200);
-        // Regressing inputs never lower either field
-        b.advance_idle(150, 100);
-        assert_eq!(b.stats().drain_lsn, 200);
-        assert_eq!(b.stats().emitter_ack_lsn, 200);
-        b.note_idle_durable(260);
-        assert_eq!(b.stats().drain_lsn, 200);
-        assert_eq!(b.stats().emitter_ack_lsn, 260);
+        // Regressing input never lowers the field
+        b.advance_idle(50);
+        assert_eq!(b.stats().drain_lsn, 100);
+        // Inflight xact parks the advance
+        b.on_heap(heap_with_value(7, 150, 16)).await.unwrap();
+        b.advance_idle(300);
+        assert_eq!(b.stats().drain_lsn, 100);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3526,23 +3055,20 @@ mod tests {
         b.abort(2, 300, &[]).await.unwrap();
     }
 
-    /// Aborts must advance the LSNs, else an all-abort workload never
-    /// advances the slot
+    /// Aborts must advance `drain_lsn`, else an all-abort workload never
+    /// advances the slot (the ack side rides the reorder's abort seq)
     #[tokio::test(flavor = "current_thread")]
-    async fn abort_advances_ack_lsns_for_resume_cursor() {
+    async fn abort_advances_drain_lsn() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         b.on_heap(heap_with_value(7, 100, 16)).await.unwrap();
         b.abort(7, 0x4000, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x4000);
-        assert_eq!(b.stats().emitter_ack_lsn, 0x4000);
-        // Lower-LSN abort must not regress the monotonic marks
+        // Lower-LSN abort must not regress the monotonic mark
         b.abort(99, 0x100, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x4000);
-        assert_eq!(b.stats().emitter_ack_lsn, 0x4000);
         b.abort(101, 0x8000, &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x8000);
-        assert_eq!(b.stats().emitter_ack_lsn, 0x8000);
     }
 
     #[test]

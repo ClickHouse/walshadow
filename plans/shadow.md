@@ -248,7 +248,7 @@ Per-connection state:
 
 Aggregate view (`ShadowStreamState::aggregate() → AggregateLsn`)
 exposes `min_flush_lsn`, `min_apply_lsn`, `active_connections`,
-`dropped_total` for cursor write loop + metrics
+`dropped_total` for status loop + metrics
 
 Backpressure: per-connection send queue caps at `slow_threshold` bytes;
 overflow drops socket & lets shadow reconnect — completed segments via

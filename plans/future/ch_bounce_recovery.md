@@ -27,7 +27,7 @@ either
 * Expired budget kills daemon. Cursor written at the last durable
   boundary (decoder LSN advanced only after the emitter acked or the
   xact spilled to disk + cursor fsynced)
-* Restart resumes from `cursor.bin`. WAL still on source, so any xact
+* Restart resumes from `manifest.toml`. WAL still on source, so any xact
   whose commit LSN exceeded cursor at kill time is re-decoded clean
 * `ReplacingMergeTree(_lsn)` dedups any rows the pre-kill daemon
   managed to land before the kill. End-state matches non-interrupted

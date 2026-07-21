@@ -86,12 +86,12 @@ digraph timeline_streaming {
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     cmt6   [label="XLOG_XACT_COMMIT\nLSN = X'", fillcolor="#3D3D54"];
-    drain6 [label="ReorderSink::on_record\nDrainedBatch slices in WAL order\nput TOAST births/tombstones before publish\nbarrier row/event cursors; dense seq", fillcolor="#4D4128"];
+    drain6 [label="transaction reorder\nwalk rows + changes in WAL order\nsave TOAST changes before publishing commit", fillcolor="#4D4128"];
     dec6   [label="decode worker (×M pool)\ndetoast via ChunkMap / as-of mirror fetch\nresolve + mapping\nroute main rows; Placed(seq, rows)", fillcolor="#4D4128"];
     enc6   [label="InsertBatcher\nTableEncoder::append_row\n_lsn / _xid / _commit_ts / _is_deleted\nbuffer across xacts", fillcolor="#4D4128"];
     seal6  [label="seal InsertBatch\nbudget / per-table deadline\n(owned slabs + per_seq)", fillcolor="#4D4128"];
     close6 [label="inserter (×N pool)\none complete INSERT\nsend_query → send_data → EndOfStream\nAcked(per_seq) after drain", fillcolor="#4D4128"];
-    ack6   [label="ack collector\nseq done ⇔ placed == acked\ncontiguous-done →\nemitter_ack_lsn := X'", fillcolor="#4D3A28", shape=note];
+    ack6   [label="ack collector\npublish X' after every\nearlier commit completes", fillcolor="#4D3A28", shape=note];
     ch6    [label="ClickHouse\nmain ReplacingMergeTree(_lsn)\nTID-keyed pg_toast_<relid> mirrors", fillcolor="#4D4128"];
 
     cmt6 -> drain6;
@@ -106,21 +106,22 @@ digraph timeline_streaming {
 
   // ═════ ⑦ async durability (off hot path) ═════
   subgraph cluster_p7 {
-    label="⑦ async durability  (off hot path, segment / cursor cadence)";
+    label="⑦ async durability  (off hot path, segment / manifest cadence)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     seg7  [label="DirSegmentSink::on_segment\nfsync segment + manifest\nfsync parent dir", fillcolor="#4D3340"];
     out7  [label="out/<seg>\n+ manifest.json", fillcolor="#4D3850", shape=note];
-    cur7  [label="status loop (10 s)\ncursor::write\nSourceFeed::send_status\napply-lag metric", fillcolor="#4D3A28"];
-    curd7 [label="cursor.bin\natomic rename", fillcolor="#4D3850", shape=note];
-    slot7 [label="source slot advance\napply = min(\n shadow_replay,\n emitter_ack)", fillcolor="#3D3D54"];
+    status7 [label="status loop\nchoose safe restart point\nsave manifest, then publish point\nand send source feedback", fillcolor="#4D3A28"];
+    manifest7 [label="manifest.toml\nsource identity + restart state", fillcolor="#4D3850", shape=note];
+    slot7 [label="source slot advance\nnever past shadow replay\nor durable ClickHouse data", fillcolor="#3D3D54"];
 
     seg7 -> out7;
-    cur7 -> curd7;
-    cur7 -> slot7 [color="#B58B86", style=dashed];
+    seg7 -> status7 [style=dotted, color="#b380b0", label="saved WAL"];
+    status7 -> manifest7 [style=dotted, color="#b380b0", penwidth=2, label="save first"];
+    status7 -> slot7 [color="#B58B86", style=dashed];
   }
   fseg -> seg7 [label="16 MiB boundary", style=dashed, lhead=cluster_p7];
-  ack6 -> cur7 [style=dotted, color="#b380b0", label="emitter_ack_lsn"];
+  ack6 -> status7 [style=dotted, color="#b380b0", label="durable progress"];
 
   // ═════ Legend + budget table ═════
   legend [shape=plaintext, label=<
@@ -137,13 +138,13 @@ digraph timeline_streaming {
       <TR><TD><FONT COLOR="#BD8183"><B>━━</B></FONT></TD><TD>walsender wire → shadow (hot path)</TD></TR>
       <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>ClickHouse Native block</TD></TR>
       <TR><TD><FONT COLOR="#B58B86"><B>┄┄</B></FONT></TD><TD>standby status to source slot</TD></TR>
-      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability write</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>ack + manifest durability</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>hot-path budget</B></TD></TR>
       <TR><TD>④ shadow apply</TD><TD>ms — walsender wire (independent of ⑤)</TD></TR>
       <TR><TD>④' queue hand-off</TD><TD>~ns enqueue, batch_size=64</TD></TR>
       <TR><TD>⑤ gate clear</TD><TD>ms — driven by ④ apply_lsn</TD></TR>
       <TR><TD>⑥ CH pipeline</TD><TD>rows buffered across xacts; budget/deadline seals one complete INSERT per batch; N INSERTs in flight; ack on contiguous-done</TD></TR>
-      <TR><TD>⑦ segment + cursor</TD><TD>seconds — async, off hot path</TD></TR>
+      <TR><TD>⑦ segment + manifest</TD><TD>seconds — async, off hot path; save restart point before sharing it</TD></TR>
     </TABLE>
   >];
   ch6 -> legend [style=invis];

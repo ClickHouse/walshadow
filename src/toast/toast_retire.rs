@@ -1,111 +1,74 @@
 //! Durable queue of deferred toast-mirror retirements. Lives at
-//! `{spill_dir}/toast_retires.bin` beside `cursor.bin` (survives
+//! `{spill_dir}/toast_retires.toml` beside `manifest.toml` (survives
 //! `clear_spill_dir`, which removes only `xid-*.bin`).
 //!
 //! A toast rel's `Dropped` only queues its retire; the wipe defers until
-//! the persisted resume floor's segment passes the dropping commit.
-//! The floor advances independently of the flush, so a stop after the
-//! cursor passes the drop but before a later commit flushes leaves this
-//! ledger as the only route to the wipe — resume never replays the drop.
+//! the persisted resolved floor passes the dropping commit. The floor
+//! advances independently of the flush, so a stop after the floor passes
+//! the drop but before a later commit flushes leaves this ledger as the
+//! only route to the wipe — resume never replays the drop.
 //!
 //! Entries persist at enqueue, inside the dropping xact's barrier apply —
 //! strictly before its commit publishes to the ack collector, so any
-//! cursor whose floor passed the drop was written after the entry was
+//! manifest whose floor passed the drop was written after the entry was
 //! durable. Removal persists after the wipe; a crash between the two
 //! re-runs an idempotent `TRUNCATE` on the already-empty mirror. A
 //! replayed drop re-pushes an identical entry; dedup keeps one.
 //!
 //! ## Schema
 //!
-//! `MAGIC (8B) | version u32 LE | count u32 LE |
-//!  count × (toast_relid u32 LE | commit_lsn u64 LE) | crc32c u32 LE`
+//! ```toml
+//! version = 1
 //!
-//! CRC32C covers every preceding byte. Persist is crash-safe: write+fsync
-//! `.tmp`, rename, fsync dir. A corrupt file is an error, never an empty
-//! fallback — silently dropping entries reintroduces the mirror leak.
+//! [[retire]]
+//! toast_relid = 16500
+//! commit_lsn = "0/1A2B3C4D"
+//! ```
+//!
+//! Persist is crash-safe via [`crate::fs::write_atomic`]. A corrupt file
+//! is an error, never an empty fallback — silently dropping entries
+//! reintroduces the mirror leak.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 
-use crate::fs::fsync_dir;
+use crate::source::manifest::Lsn;
 
-pub const RETIRE_LEDGER_FILENAME: &str = "toast_retires.bin";
+pub const RETIRE_LEDGER_FILENAME: &str = "toast_retires.toml";
 
-/// Bump on any layout change; load rejects mismatched versions.
+/// Bump on any schema change; load rejects mismatched versions.
 pub const RETIRE_LEDGER_VERSION: u32 = 1;
-
-/// `WSRTRS` + version-byte + reserved-byte.
-const MAGIC: &[u8; 8] = b"WSRTRS\x01\x00";
-
-const HEADER_LEN: usize = MAGIC.len() + 4 /*version*/ + 4 /*count*/;
-const ENTRY_LEN: usize = 4 + 8;
-const CRC_LEN: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum RetireLedgerError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
-    #[error("ledger size {got} inconsistent with entry count")]
-    Size { got: usize },
-    #[error("bad magic header")]
-    BadMagic,
+    #[error("ledger parse: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("ledger serialize: {0}")]
+    Ser(#[from] toml::ser::Error),
     #[error("unsupported ledger schema version {0} (this build expects {RETIRE_LEDGER_VERSION})")]
     Version(u32),
-    #[error("crc mismatch: stored={stored:#X}, computed={computed:#X}")]
-    Crc { stored: u32, computed: u32 },
 }
 
 pub fn ledger_path(spill_dir: &Path) -> PathBuf {
     spill_dir.join(RETIRE_LEDGER_FILENAME)
 }
 
-fn encode(entries: &[(u32, u64)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN + entries.len() * ENTRY_LEN + CRC_LEN);
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&RETIRE_LEDGER_VERSION.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (toast_relid, commit_lsn) in entries {
-        out.extend_from_slice(&toast_relid.to_le_bytes());
-        out.extend_from_slice(&commit_lsn.to_le_bytes());
-    }
-    let crc = crc32c::crc32c(&out);
-    out.extend_from_slice(&crc.to_le_bytes());
-    out
+#[derive(Serialize, Deserialize)]
+struct RetireFile {
+    version: u32,
+    #[serde(default)]
+    retire: Vec<RetireEntry>,
 }
 
-fn decode(bytes: &[u8]) -> Result<Vec<(u32, u64)>, RetireLedgerError> {
-    if bytes.len() < HEADER_LEN + CRC_LEN {
-        return Err(RetireLedgerError::Size { got: bytes.len() });
-    }
-    if &bytes[0..8] != MAGIC {
-        return Err(RetireLedgerError::BadMagic);
-    }
-    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    if version != RETIRE_LEDGER_VERSION {
-        return Err(RetireLedgerError::Version(version));
-    }
-    let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    let payload_len = HEADER_LEN + count * ENTRY_LEN;
-    if bytes.len() != payload_len + CRC_LEN {
-        return Err(RetireLedgerError::Size { got: bytes.len() });
-    }
-    let stored = u32::from_le_bytes(bytes[payload_len..payload_len + 4].try_into().unwrap());
-    let computed = crc32c::crc32c(&bytes[..payload_len]);
-    if stored != computed {
-        return Err(RetireLedgerError::Crc { stored, computed });
-    }
-    let mut entries = Vec::with_capacity(count);
-    for i in 0..count {
-        let off = HEADER_LEN + i * ENTRY_LEN;
-        let toast_relid = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-        let commit_lsn = u64::from_le_bytes(bytes[off + 4..off + 12].try_into().unwrap());
-        entries.push((toast_relid, commit_lsn));
-    }
-    Ok(entries)
+#[derive(Serialize, Deserialize)]
+struct RetireEntry {
+    toast_relid: u32,
+    commit_lsn: Lsn,
 }
 
 /// Pending `(toast_relid, dropping commit_lsn)` retires, persisted on
@@ -117,17 +80,29 @@ pub struct RetireLedger {
 }
 
 impl RetireLedger {
-    /// Absent file is an empty ledger; corrupt is an error (see module doc).
+    /// Absent file is an empty ledger; corrupt is an error (see module
+    /// doc).
     pub async fn load(spill_dir: &Path) -> Result<Self, RetireLedgerError> {
-        let entries = match tokio::fs::read(ledger_path(spill_dir)).await {
-            Ok(bytes) => decode(&bytes)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(Self {
+        let mut ledger = Self {
             dir: spill_dir.to_path_buf(),
-            entries,
-        })
+            entries: Vec::new(),
+        };
+        match tokio::fs::read_to_string(ledger_path(spill_dir)).await {
+            Ok(text) => {
+                let file: RetireFile = toml::from_str(&text)?;
+                if file.version != RETIRE_LEDGER_VERSION {
+                    return Err(RetireLedgerError::Version(file.version));
+                }
+                ledger.entries = file
+                    .retire
+                    .into_iter()
+                    .map(|e| (e.toast_relid, e.commit_lsn.0))
+                    .collect();
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(ledger)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -138,7 +113,7 @@ impl RetireLedger {
         &self.entries
     }
 
-    /// Entries whose dropping commit precedes `cut` (aligned persisted
+    /// Entries whose dropping commit precedes `cut` (persisted resolved
     /// floor); snapshot so the caller can await between removals.
     pub fn due(&self, cut: u64) -> Vec<(u32, u64)> {
         self.entries
@@ -177,20 +152,19 @@ impl RetireLedger {
     }
 
     async fn persist(&self) -> Result<(), RetireLedgerError> {
-        let final_path = ledger_path(&self.dir);
-        let tmp_path = self.dir.join(format!("{RETIRE_LEDGER_FILENAME}.tmp"));
-        let bytes = encode(&self.entries);
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .await?;
-        f.write_all(&bytes).await?;
-        f.sync_all().await?;
-        drop(f);
-        tokio::fs::rename(&tmp_path, &final_path).await?;
-        fsync_dir(&self.dir).await?;
+        let file = RetireFile {
+            version: RETIRE_LEDGER_VERSION,
+            retire: self
+                .entries
+                .iter()
+                .map(|&(toast_relid, commit_lsn)| RetireEntry {
+                    toast_relid,
+                    commit_lsn: Lsn(commit_lsn),
+                })
+                .collect(),
+        };
+        let text = toml::to_string(&file)?;
+        crate::fs::write_atomic(&self.dir, RETIRE_LEDGER_FILENAME, text.as_bytes()).await?;
         Ok(())
     }
 }
@@ -262,39 +236,49 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut ledger = RetireLedger::load(tmp.path()).await.unwrap();
         ledger.push(16500, 0x1000).await.unwrap();
-        let path = ledger_path(tmp.path());
-        let mut bytes = std::fs::read(&path).unwrap();
-        *bytes.last_mut().unwrap() ^= 0xFF;
-        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(ledger_path(tmp.path()), "version = 1\n[[retire").unwrap();
         let err = RetireLedger::load(tmp.path()).await.unwrap_err();
-        assert!(matches!(err, RetireLedgerError::Crc { .. }), "{err:?}");
+        assert!(matches!(err, RetireLedgerError::Parse(_)), "{err:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn truncated_file_is_error() {
+    async fn bad_lsn_is_error() {
         let tmp = tempdir().unwrap();
-        let mut ledger = RetireLedger::load(tmp.path()).await.unwrap();
-        ledger.push(16500, 0x1000).await.unwrap();
-        let path = ledger_path(tmp.path());
-        let bytes = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &bytes[..bytes.len() - 6]).unwrap();
+        std::fs::write(
+            ledger_path(tmp.path()),
+            "version = 1\n\n[[retire]]\ntoast_relid = 1\ncommit_lsn = \"nope\"\n",
+        )
+        .unwrap();
         let err = RetireLedger::load(tmp.path()).await.unwrap_err();
-        assert!(matches!(err, RetireLedgerError::Size { .. }), "{err:?}");
+        assert!(matches!(err, RetireLedgerError::Parse(_)), "{err:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn wrong_version_is_error() {
         let tmp = tempdir().unwrap();
-        let mut ledger = RetireLedger::load(tmp.path()).await.unwrap();
-        ledger.push(16500, 0x1000).await.unwrap();
-        let path = ledger_path(tmp.path());
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes[8..12].copy_from_slice(&999u32.to_le_bytes());
-        let crc = crc32c::crc32c(&bytes[..bytes.len() - CRC_LEN]);
-        let at = bytes.len() - CRC_LEN;
-        bytes[at..].copy_from_slice(&crc.to_le_bytes());
-        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(ledger_path(tmp.path()), "version = 999\n").unwrap();
         let err = RetireLedger::load(tmp.path()).await.unwrap_err();
         assert!(matches!(err, RetireLedgerError::Version(999)), "{err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn archive_lag_defers_due_retire() {
+        // PLAN_XACT2 finding 5 composition: ack in segment N+2, sealed
+        // archive end N, drop commit in N+1 — resolved floor clamps to N,
+        // entry stays; archive catching up past N+1 releases it
+        use crate::record::WAL_SEG_SIZE as SEG;
+        use crate::source::manifest::resolved_floor;
+        let n = 7 * SEG;
+        let tmp = tempdir().unwrap();
+        let mut ledger = RetireLedger::load(tmp.path()).await.unwrap();
+        ledger.push(16500, n + SEG + 42).await.unwrap();
+        assert!(
+            ledger.due(resolved_floor(n + 2 * SEG + 5, n)).is_empty(),
+            "archive lag must defer the retire",
+        );
+        assert_eq!(
+            ledger.due(resolved_floor(n + 2 * SEG + 5, n + 2 * SEG)),
+            vec![(16500, n + SEG + 42)],
+        );
     }
 }

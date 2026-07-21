@@ -6,7 +6,7 @@
 // Zoomed-in view of cluster_ch + cluster_ddl from internals.dot.
 //
 // regeneration spec:
-// sources of truth: plans/emitter.md · src/pipeline/{reorder,decode,batcher,inserter,ack,tail}.rs · src/ch_emitter.rs · src/ch_ddl.rs · src/type_bridge.rs
+// sources of truth: plans/emitter.md · src/emit/pipeline/{reorder,decode,batcher,inserter,ack,tail}.rs · src/emit/{ch_emitter,ch_ddl}.rs · src/catalog/type_bridge.rs
 // subsumes: plans/emitter.md § "Stage walk" + "Barrier fence" + "Ack-LSN tracking" + "DdlApplicator"
 // quality bar:
 //   - decode ×M and inserter ×N read as pools (stacked node or ×M/×N label), not single tasks
@@ -17,22 +17,22 @@
 digraph emitter {
   rankdir=TB;
   compound=true;
-  graph [fontname="Helvetica", labelloc="t", label="walshadow CH emitter — parallel pipeline: reorder → decode ×M → batcher → inserter ×N → ack watermark", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.5, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="walshadow emitter — one ordered pipeline, ClickHouse or metrics only", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.5, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8, color="#c1a78e", fontcolor="#ECE1D7"];
 
   // ═════ reorder coordinator (upstream, commit-order boundary) ═════
   subgraph cluster_src {
-    label="reorder coordinator — single-threaded commit order  (pipeline/reorder.rs, inner sink of QueueingRecordSink)";
+    label="reorder coordinator — single-threaded commit order  (emit/pipeline/reorder.rs, inner sink of QueueingRecordSink)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    reorder [label="ReorderSink::on_record (RM_XACT only)\nCOMMIT → CommittedDrain / DrainedBatch\nABORT / empty commit → rows=0 seq\nbarrier: Catalog / Config / ToastBarrier / TRUNCATE\nput new_rows through sealed row/event cursors", fillcolor="#4D4128"];
+    reorder [label="transaction reorder\nwalk rows and changes in WAL order\nempty commits and aborts still advance progress\nschema and truncate changes wait for earlier rows", fillcolor="#4D4128"];
     cat     [label="ShadowCatalog::subscribe\nSchemaEvent\nAdded / Changed / Dropped\n(unbounded mpsc, rides xact buffer\n as ordered_events)", fillcolor="#4D4D28", shape=parallelogram];
   }
 
   // ═════ decode pool ═════
   subgraph cluster_decode {
-    label="decode pool ×M  (pipeline/decode.rs)";
+    label="decode pool ×M  (emit/pipeline/decode.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     decode [label="decode worker ×M\ndetoast: ChunkMap, then store as-of fetch\nresolve_at_pooled; mapping\noracle PgPending + sampled validate\nchunk 1024 rows / 4 MiB", fillcolor="#4D4128"];
@@ -40,7 +40,7 @@ digraph emitter {
 
   // ═════ batcher hub ═════
   subgraph cluster_batch {
-    label="InsertBatcher — single hub, per-table accumulation  (pipeline/batcher.rs)";
+    label="InsertBatcher — single hub, per-table accumulation  (emit/pipeline/batcher.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     enc  [label="TableEncoder per dest table\nColumnBuf slabs: Fixed / String /\nNullableFixed / NullableString\ncolumn-major + synthetic\n_lsn / _xid / _commit_ts / _is_deleted", fillcolor="#5D4628", shape=note];
@@ -52,7 +52,7 @@ digraph emitter {
 
   // ═════ inserter pool ═════
   subgraph cluster_insert {
-    label="inserter pool ×N  (pipeline/inserter.rs)";
+    label="inserter pool ×N  (emit/pipeline/inserter.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     ins [label="inserter ×N — any idle takes any batch\nTypeAst cache per (table, epoch)\nBlockBuilder over owned slabs\nsend_query → send_data → EndOfStream\nsend_with_retry: reconnect + backoff,\ninsert_timeout 30 s; exhaustion = Fatal", fillcolor="#5D4628"];
@@ -82,17 +82,20 @@ digraph emitter {
   }
 
   toastput [label="ToastResolver\nput births + tombstones before publish\nas-of fetch for pre-window values", fillcolor="#4D4D28"];
-  ledger [label="{spill_dir}/toast_retires.bin\nfsynced before dropping commit ack\nstandup / commit / idle flush", fillcolor="#4D3850", shape=note];
+  ledger [label="toast_retires.toml\nsaved mirror retirements", fillcolor="#4D3850", shape=note];
+
+  nulltail [label="metrics-only tail\nno ClickHouse connection\nacknowledge rows immediately", fillcolor="#4D3A28", shape=note];
 
   // ═════ ack collector (durability watermark) ═════
-  ack [label="ack collector  (pipeline/ack.rs)\nRegister(seq, commit_lsn) · Placed(seq, rows) · Acked(per_seq)\nseq done ⇔ placed == acked  (rows=0 done at placement)\nwatermark = highest contiguous-done commit_lsn\n→ emitter_ack atomic → cursor + standby apply_lsn", fillcolor="#4D3A28", shape=note];
+  ack [label="ack collector\nwait for every earlier commit\npublish latest durable position\nfeed manifest + source feedback", fillcolor="#4D3A28", shape=note];
 
   // ═════ row path ═════
   reorder -> decode [color="#BF8C5F", penwidth=2, lhead=cluster_decode, label="DecodeJob\n(mpmc, bound 4M)"];
   decode  -> enc    [color="#BF8C5F", penwidth=2, lhead=cluster_batch, label="BatcherMsg::Rows\n(FIFO mpsc 256 —\nshared with FlushAll)"];
   seal    -> ins    [color="#BF8C5F", penwidth=2, lhead=cluster_insert, label="InsertBatch\n(mpmc)"];
   ins     -> chrows [color="#BF8C5F", penwidth=2, label="one complete INSERT\nper sealed batch"];
-  reorder -> toastput [color="#BF8C5F", style=dashed, label="new_rows cursors"];
+  decode  -> nulltail [color="#BF8C5F", style=dashed, constraint=false, label="metrics only"];
+  reorder -> toastput [color="#BF8C5F", style=dashed, label="TOAST changes"];
   decode  -> toastput [color="#CBA85E", style=dashed, label="fetch"];
   toastput -> chtoast [color="#BF8C5F", penwidth=2];
 
@@ -102,13 +105,14 @@ digraph emitter {
   apply   -> chddl   [color="#BF8C5F", style=dashed, penwidth=2, label="DDL SQL\n(own connection)"];
   apply   -> chtoast [color="#BF8C5F", style=dashed, label="truncate / O−B"];
   apply   -> ledger  [color="#6E6963", style=dashed, label="toast DROP enqueue"];
-  ledger  -> chtoast [color="#BF8C5F", style=dashed, label="retire once resume floor passes"];
+  ledger  -> chtoast [color="#BF8C5F", style=dashed, label="retire after saved\nrestart point passes"];
   fence   -> trip    [style=dashed, color="#B58B86", constraint=false, label="FlushAll"];
 
   // ═════ ack side-channel ═════
   reorder -> ack [style=dotted, color="#b380b0", constraint=false, label="Register(seq, commit_lsn)"];
   decode  -> ack [style=dotted, color="#b380b0", constraint=false, label="Placed(seq, rows)"];
   ins     -> ack [style=dotted, color="#b380b0", label="Acked(per_seq)\nonly after EndOfStream"];
+  nulltail -> ack [style=dotted, color="#b380b0", constraint=false, label="done"];
   ack     -> fence [style=dotted, color="#b380b0", constraint=false, label="wait_placed_through /\nwait_through"];
 
   // ═════ Legend ═════
@@ -118,7 +122,7 @@ digraph emitter {
       <TR><TD BGCOLOR="#4D4128" WIDTH="28"></TD><TD>reorder / decode pool / ClickHouse</TD></TR>
       <TR><TD BGCOLOR="#4D4D28"></TD><TD>ShadowCatalog schema-event tx</TD></TR>
       <TR><TD BGCOLOR="#5D4628"></TD><TD>batcher / inserters / DdlApplicator</TD></TR>
-      <TR><TD BGCOLOR="#4D3A28"></TD><TD>ack collector / cursor side-channel</TD></TR>
+      <TR><TD BGCOLOR="#4D3A28"></TD><TD>ack collector / null tail / manifest side-channel</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge style</B></TD></TR>
       <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>row path (Native rows, solid)</TD></TR>
       <TR><TD><FONT COLOR="#BF8C5F"><B>┄┄</B></FONT></TD><TD>DDL path (own connection, dashed)</TD></TR>
@@ -130,7 +134,7 @@ digraph emitter {
       <TR><TD><FONT FACE="monospace">_commit_ts</FONT></TD><TD>DateTime64(6, 'UTC'); shifted from PG epoch</TD></TR>
       <TR><TD><FONT FACE="monospace">_is_deleted</FONT></TD><TD>Bool — 1 on delete; ReplacingMergeTree is_deleted arg unless soft_delete</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>watermark rule</B></TD></TR>
-      <TR><TD COLSPAN="2">downstream completes out of order; emitter_ack advances only on the contiguous-done prefix, so slot recycling never outruns CH durability. Retry-exhausted batch = Fatal (never a silent gap)</TD></TR>
+      <TR><TD COLSPAN="2">commits may finish out of order; progress advances only after every earlier commit is durable. Failed batch stops process so restart can replay it.</TD></TR>
     </TABLE>
   >];
   chrows -> legend [style=invis];

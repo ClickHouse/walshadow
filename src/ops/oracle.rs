@@ -14,8 +14,6 @@
 //! oracle queries don't observe replay-LSN gating and mustn't pessimise the
 //! catalog's query-one path.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -26,8 +24,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 
 use crate::decode::codecs::NumericKind;
-use crate::decode::decoder_sink::{DecoderSinkError, TupleObserver};
-use crate::decode::heap_decoder::{ColumnValue, CommittedTuple};
+use crate::decode::heap_decoder::ColumnValue;
 
 #[derive(Debug, Error)]
 pub enum OracleError {
@@ -295,75 +292,6 @@ impl OracleStats {
     }
 }
 
-/// [`TupleObserver`] wrapper: resolve PgPending columns, optionally validate,
-/// forward mutated clone to inner. One clone per tuple; hot workloads can
-/// bypass via `--validate 0 --without-oracle` (raw bytes for PgPending).
-pub struct OracleObserver<O: TupleObserver + Send> {
-    oracle: Arc<Oracle>,
-    inner: O,
-}
-
-impl<O: TupleObserver + Send> OracleObserver<O> {
-    pub fn new(oracle: Arc<Oracle>, inner: O) -> Self {
-        Self { oracle, inner }
-    }
-
-    pub fn inner_mut(&mut self) -> &mut O {
-        &mut self.inner
-    }
-}
-
-impl<O: TupleObserver + Send> TupleObserver for OracleObserver<O> {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a CommittedTuple,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut owned = committed.clone();
-            if let Some(t) = owned.decoded.new.as_mut() {
-                resolve_pending_tuple(&self.oracle, &mut t.columns).await;
-            }
-            if let Some(t) = owned.decoded.old.as_mut() {
-                resolve_pending_tuple(&self.oracle, &mut t.columns).await;
-            }
-            if let Some(t) = owned.decoded.new.as_ref() {
-                maybe_validate_tuple(&self.oracle, &t.columns).await;
-            }
-            self.inner.on_tuple(&owned).await
-        })
-    }
-
-    fn on_xact_end<'a>(
-        &'a mut self,
-        commit_lsn: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
-        self.inner.on_xact_end(commit_lsn)
-    }
-
-    fn on_schema_event<'a>(
-        &'a mut self,
-        event: &'a crate::schema::SchemaEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        self.inner.on_schema_event(event)
-    }
-
-    fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
-        self.inner.idle_ack_ceiling(lsn)
-    }
-
-    fn on_idle<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
-        self.inner.on_idle()
-    }
-
-    fn on_close<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        self.inner.on_close()
-    }
-}
-
 /// Connect with a timeout budget so a still-warming shadow doesn't pin the
 /// daemon at boot. Matches the catalog's
 /// [`with_transient_retry`](crate::catalog::shadow_catalog::with_transient_retry) shape.
@@ -421,32 +349,5 @@ mod tests {
         assert!(!out.contains("fallback"));
         assert!(!out.contains("mismatch"));
         assert!(!out.contains("err"));
-    }
-
-    struct ProbeObserver {
-        tuples: u32,
-    }
-    impl TupleObserver for ProbeObserver {
-        fn on_tuple<'a>(
-            &'a mut self,
-            _committed: &'a CommittedTuple,
-        ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    #[test]
-    fn inner_mut_aliases_wrapped_observer() {
-        // client=None: accessor under test never touches the connection
-        let oracle = Arc::new(Oracle {
-            client: Mutex::new(None),
-            conninfo: String::new(),
-            has_extension: AtomicBool::new(false),
-            stats: Arc::new(OracleStats::default()),
-            sampler: Sampler::new(0),
-        });
-        let mut obs = OracleObserver::new(oracle, ProbeObserver { tuples: 0 });
-        obs.inner_mut().tuples += 5;
-        assert_eq!(obs.inner_mut().tuples, 5);
     }
 }

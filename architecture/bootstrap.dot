@@ -6,7 +6,7 @@
 // rails, drain into the shared insert tail (same unit as streaming).
 //
 // regeneration spec:
-// sources of truth: plans/bootstrap.md · src/backup_source_direct.rs · src/backup_source_object_store.rs · src/backup_page_walk.rs · src/backup_source.rs · src/pipeline/{bootstrap,tail}.rs
+// sources of truth: plans/bootstrap.md · src/backfill/{backup_source_direct,backup_source_object_store,backup_page_walk,backup_source}.rs · src/emit/pipeline/{bootstrap,tail}.rs
 // subsumes: plans/bootstrap.md § "MultiplexSink" / fan-out
 // differentiates: timeline_bootstrap.dot walks the 5-phase TIMELINE; this freezes phases 1-4 and exposes the FAN-OUT structure (BackupSource impls, MultiplexSink, simultaneous shadow-dir + CH writes)
 // quality bar:
@@ -114,18 +114,18 @@ digraph bootstrap {
 
   // ════════ Handoff at end_lsn ════════
   subgraph cluster_handoff {
-    label="handoff at end_lsn — tail.finish (FlushAll → wait durable), cursor to streaming pump";
+    label="handoff — finish initial load, start streaming";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     out  [label="BootstrapOutcome\n{start_lsn, end_lsn,\n DiskLanderStats, PageWalkStats}\ntail.finish: FlushAll →\nwait_through(next_seq) → drain cascade", fillcolor="#4D3A28"];
-    cur  [label="cursor::write\nemitter_ack_lsn = end_lsn\natomic rename + fsync", fillcolor="#4D3A28"];
-    curd [label="cursor.bin", fillcolor="#4D3850", shape=note];
+    seed [label="use backup end as\nnew restart point", fillcolor="#4D3A28"];
+    manifest [label="manifest.toml\nsaved restart state", fillcolor="#4D3850", shape=note];
     feed [label="SourceFeed open\nSTART_REPLICATION\nPHYSICAL <end_lsn>", fillcolor="#4D3A28"];
     shd  [label="shadow PG\npostmaster + walreceiver\nbegin replay at end_lsn", fillcolor="#3D4128", shape=cylinder];
 
-    out -> cur;
-    cur -> curd [color="#b380b0", style=dotted, label="atomic rename"];
-    cur -> feed;
+    out -> seed;
+    seed -> feed;
+    feed -> manifest [color="#b380b0", style=dotted, label="save on first\nstatus update"];
     feed -> shd [color="#BD8183", style=dashed, label="walsender wire\n(steady-state)"];
   }
   orch -> out  [label="finish()\nend_lsn", color="#A1A9CC", constraint=false];
@@ -148,7 +148,7 @@ digraph bootstrap {
       <TR><TD><FONT COLOR="#BD8183"><B>┄┄</B></FONT></TD><TD>walsender wire (post-handoff)</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq catalog query / CatalogMap lookup</TD></TR>
       <TR><TD><FONT COLOR="#BF8C5F"><B>┄┄</B></FONT></TD><TD>CH Native (bootstrap, via shared tail)</TD></TR>
-      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability / ack events</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>manifest durability / ack events</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>filesystem (data_dir land, shadow boot)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>file routing (MultiplexSink)</B></TD></TR>
       <TR><TD>catalog filenode<BR/>(fn &lt; 16384 ∪ whitelist)</TD><TD>rail A only</TD></TR>

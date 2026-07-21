@@ -4,7 +4,7 @@
 // except the abort→spill backwards unlink.
 //
 // regeneration spec:
-// sources of truth: plans/xact.md · src/xact_buffer.rs · src/spill.rs
+// sources of truth: plans/xact.md · src/xact/{xact_buffer,spill}.rs · src/emit/pipeline/reorder.rs · src/backfill/backup_backfill.rs
 // subsumes: plans/xact.md § "Buffer shape" + "Eviction policy" + "Spill backend" + "Drain shape"
 // quality bar:
 //   - spill round-trip (write → file → read) visually traceable
@@ -33,7 +33,7 @@ digraph xact {
       <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2">
         <TR><TD ALIGN="LEFT"><B>XactBuffer</B></TD></TR>
         <TR><TD ALIGN="LEFT">inflight: HashMap&lt;xid, XactState&gt;</TD></TR>
-        <TR><TD ALIGN="LEFT">markers · pending_stash · pending_durable</TD></TR>
+        <TR><TD ALIGN="LEFT">markers · pending stash · unfinished commits</TD></TR>
         <TR><TD ALIGN="LEFT">bytes_in_memory · drain_resident · SpillStore</TD></TR>
         <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9"><I>XactState (per xid):</I></FONT></TD></TR>
         <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9">first_lsn · in_mem: Vec&lt;SpillEntry&gt; · in_mem_bytes</FONT></TD></TR>
@@ -45,9 +45,9 @@ digraph xact {
 
     subt  [label="SubxactTracker\nparent: HashMap<xid, top>\nchildren: HashMap<top, Vec<xid>>", fillcolor="#4D4128"];
 
-    abort [label="abort(xid, abort_lsn, subxids)\ndrop XactState (top + subs)\nSpillWriter::unlink per xid\ndrain_lsn / emitter_ack_lsn ↑\nforget_tree(top)", fillcolor="#4D4128"];
+    abort [label="abort\ndrop transaction + children\nunlink spill files\nadvance consumed position", fillcolor="#4D4128"];
 
-    idle  [label="advance_idle(lsn)\nfires when xacts_active == 0\nlifts drain_lsn / ack_lsn", fillcolor="#4D4128"];
+    idle  [label="idle progress\nadvance only with no\nopen transaction", fillcolor="#4D4128"];
   }
 
   // producer → state (vertical drops, no cross-traffic)
@@ -68,11 +68,11 @@ digraph xact {
 
   // ════════ Rank 3+: commit drain (linear pipeline, the only remaining cluster) ════════
   subgraph cluster_drain {
-    label="commit(top_xid, ts, commit_lsn, subxids) — k-way merge"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    label="commit drain — merge transaction family, preserve WAL order"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     merge [label="pull (top + subxids) from inflight\nper xid: SpillReader + in_mem + events\n→ source_lsn k-way merge\nChunk → ChunkMap + ToastRow birth\nToastDelete → tombstone row\nRaw → commit-resolved toast op\nTIE: control event BEFORE heap", fillcolor="#4D4128"];
 
-    dispatch [label="CommittedDrain → DrainedBatch slices\n{heaps, chunks, ordered_events,\n new_rows, truncate_rows, is_final}\nrow/event cursors preserve WAL order", fillcolor="#4D4128"];
+    dispatch [label="bounded committed batches\none shared walk keeps rows, TOAST,\nand table changes in WAL order", fillcolor="#4D4128"];
 
     merge -> dispatch;
   }
@@ -80,20 +80,24 @@ digraph xact {
   subt   -> merge [label="(top + subxids)\nauthoritative on COMMIT", style=dashed];
   spill  -> merge [color="#6E6963", style=dashed, label="SpillReader::next\nthen unlink"];
 
-  // ════════ Rank below drain: consumer (pipeline tail / serial observer) ════════
-  detoast [label="detoast_heap\nin-xact ChunkMap fast path\nstore fetch(relid, value_id, source_lsn)\npglz / lz4 inline\npipeline: decode pool; serial: inline", fillcolor="#4D4128"];
-  observer [label="consumer\npipeline (--ch-config): ReorderSink seq\n→ decode ×M → batcher → inserter ×N\n→ ack collector watermark\nserial (metrics-only): TupleObserver\non_tuple / on_xact_end", fillcolor="#5D4628"];
-  dispatch -> detoast [color="#BF8C5F", penwidth=2, label="DecodeJob /\nserial heap"];
-  detoast -> observer [color="#BF8C5F", penwidth=2, label="decoded row /\non_tuple stream"];
-  store [label="ToastResolver::put(new_rows)\nbefore publishing marker\nbarrier cursors interleave wipes / O−B", fillcolor="#5D4628", shape=cylinder];
-  dispatch -> store [color="#BF8C5F", style=dashed, label="births + tombstones"];
+  // ════════ Rank below drain: shared consumers ════════
+  detoast [label="resolve large values\ncurrent transaction first,\nmirror history second", fillcolor="#4D4128"];
+  consumer [label="shared consumers\nlive pipeline: ClickHouse or metrics only\nbackup replay: same ordered walk", fillcolor="#5D4628"];
+  dispatch -> detoast [color="#BF8C5F", penwidth=2, label="rows"];
+  detoast -> consumer [color="#BF8C5F", penwidth=2, label="decoded rows"];
+  dispatch -> consumer [color="#BF8C5F", style=dashed, label="table changes"];
+  store [label="TOAST mirror\nsave changes before publishing commit\ninterleave table wipes and rewrites", fillcolor="#5D4628", shape=cylinder];
+  dispatch -> store [color="#BF8C5F", style=dashed, label="TOAST changes"];
 
-  // ════════ Bottom: cursor (durability fan-in) ════════
-  cursor [label="cursor.bin\ndrain_lsn      = max commit_lsn  (advances FIRST)\nemitter_ack_lsn = max ack_lsn   (lags drain_lsn)", fillcolor="#4D3850", shape=note];
-  dispatch -> cursor [color="#b380b0", style=dotted, label="drain_lsn ↑\n(pre-ack)"];
-  observer -> cursor [color="#b380b0", style=dotted, label="emitter_ack_lsn ↑"];
-  abort    -> cursor [color="#b380b0", style=dotted, label="abort_lsn ↑"];
-  idle     -> cursor [color="#b380b0", style=dotted, label="idle ↑"];
+  // ════════ Bottom: durable floor fan-in ════════
+  safe [label="ack collector + transaction state\nchoose safe restart point\nstay behind open or unfinished work", fillcolor="#4D3A28"];
+  manifest [label="manifest.toml\nsaved restart state", fillcolor="#4D3850", shape=note];
+  consumer -> safe [color="#b380b0", style=dotted, label="downstream completed"];
+  buf      -> safe [color="#b380b0", style=dotted, label="open transactions"];
+  dispatch -> safe [color="#b380b0", style=dotted, label="drained"];
+  abort    -> safe [color="#b380b0", style=dotted];
+  idle     -> safe [color="#b380b0", style=dotted];
+  safe     -> manifest [color="#b380b0", style=dotted, penwidth=2, label="status update"];
 
   // ════════ Legend ════════
   legend [shape=plaintext, label=<
@@ -103,20 +107,20 @@ digraph xact {
       <TR><TD BGCOLOR="#4D3A28"></TD><TD>eviction policy (sync, after absorb)</TD></TR>
       <TR><TD BGCOLOR="#4D4128"></TD><TD>XactBuffer / decoder / drain</TD></TR>
       <TR><TD BGCOLOR="#4D4D28"></TD><TD>ShadowCatalog schema_event_tx</TD></TR>
-      <TR><TD BGCOLOR="#5D4628"></TD><TD>downstream consumer (pipeline tail / observer)</TD></TR>
-      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact (spill / cursor)</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>downstream consumer (pipeline / gap replay)</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>on-disk artifact (spill / manifest)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
       <TR><TD><FONT COLOR="#c1a78e"><B>━━</B></FONT></TD><TD>buffer-internal control / data</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>┄┄</B></FONT></TD><TD>schema event (lsn-stamped)</TD></TR>
-      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>CH Native rows + DDL via observer</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>walk steps to pipeline / replay consumers</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>spill file IO (write / read / unlink)</TD></TR>
-      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability (drain_lsn / emitter_ack_lsn)</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>ack + manifest durability</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>k-way merge — ordering rules</B></TD></TR>
       <TR><TD COLSPAN="2">heads sorted ASC by source_lsn</TD></TR>
       <TR><TD COLSPAN="2">tie: catalog event BEFORE tuple (PG writes pg_class first)</TD></TR>
       <TR><TD COLSPAN="2">heaps detoast post-merge; chunk maps resolve rows; ToastRows persist separately</TD></TR>
-      <TR><TD COLSPAN="2">drain_lsn advances BEFORE on_xact_end ack — cursor surfaces the gap</TD></TR>
+      <TR><TD COLSPAN="2">saved restart point never passes open or unfinished transaction</TD></TR>
     </TABLE>
   >];
-  cursor -> legend [style=invis];
+  manifest -> legend [style=invis];
 }

@@ -43,7 +43,7 @@ fontcolor #ECE1D7
 | libpq catalog query | #CBA85E | solid (bidir on cache fill) |
 | CH Native rows | #BF8C5F | solid |
 | CH DDL SQL (separate TCP) | #BF8C5F | dashed |
-| cursor durability | #b380b0 | dotted |
+| manifest durability / ack events | #b380b0 | dotted |
 | filesystem / restore_command | #6E6963 | dashed |
 | error / sidecar feedback | #B58B86 | dashed, constraint=false |
 

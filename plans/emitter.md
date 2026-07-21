@@ -17,10 +17,13 @@ ack,tail,mod}.rs`; encoding primitives (`EmitterConfig`, `TableEncoder`,
 and scaling axes in
 [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
 
-The pipeline stands up only with `--ch-config`. Metrics-only runs use
-the serial path: `XactRecordSink` draining into a
-`TupleObserver` (`MetricsTupleObserver`, oracle-wrapped when
-`--validate` is up) — counters, no CH
+Metrics-only runs (no `--ch-config`) stand up the same pipeline in its
+degenerate configuration: `TailKind::Null` swaps batcher + inserters
+for a swallow task that acks rows at receipt (zero CH connections), no
+`DdlApplicator` (schema events observed, never applied), empty mapping
+so the decode pool routes nothing and seqs complete at placement —
+watermark, idle advance, and slot semantics identical to a CH run.
+Oracle `--validate` sampling runs in the decode pool either way
 
 ## Purpose
 
@@ -29,8 +32,8 @@ ClickHouse Native blocks buffered per table and sealed as complete
 INSERTs, with enough parallelism that CH Cloud RTT + part-commit cost
 doesn't bound throughput. DDL applies inside an ordering barrier so
 ALTER / CREATE / DROP / TRUNCATE land strictly after all earlier data
-is durable. Emitter ack-LSN (contiguous-done watermark) feeds cursor
-file + standby `apply_lsn` so restart resumes from highest
+is durable. Emitter ack-LSN (contiguous-done watermark) feeds the
+manifest + standby `apply_lsn` so restart resumes from highest
 commit-record LSN known durable on CH
 
 ## Stage walk
@@ -69,8 +72,8 @@ all dispatched seqs *placed*, `FlushAll` the batcher, wait all seqs
 *durable* — then `DdlApplicator::apply` / `truncate`. Toast lifecycle
 rides the same applies: owner TRUNCATE wipes the toast mirror in-slice;
 a toast rel's `Dropped` only queues its retire (durably, in the
-`toast_retires.bin` ledger) — the wipe defers until the persisted
-resume floor's segment passes the dropping commit, flushed at commit
+`toast_retires.toml` ledger) — the wipe defers until the persisted
+resolved floor passes the dropping commit, flushed at commit
 boundaries, idle advance, and pipeline standup ([TOAST.md](TOAST.md)
 Lifecycle). The slice's `new_rows` puts interleave with the
 applies via sealed merge cursors ([TOAST.md](TOAST.md)
@@ -154,7 +157,7 @@ source slot recycling) must not. Per seq track rows *placed* (decoder
 routed) and *acked* (inserter drained `EndOfStream`); a seq is done
 once `placed == acked` (rows=0 seqs done at placement). Watermark is
 highest contiguous done seq's `commit_lsn`, published into the
-`emitter_ack` atomic the status loop persists to cursor
+`emitter_ack` atomic the status loop persists to the manifest
 
 `Trailing { lsn }` advances past non-commit WAL only when every
 registered seq is done and the xact buffer is empty (reorder's
@@ -165,14 +168,14 @@ at 100% CPU and presented as a chc recv/INSERT hang
 
 `emitter_ack` is seeded at the WAL re-read start (`raw_start`), not 0:
 the status loop persists the atomic with no monotonic guard, and a
-zero first write would clobber a resumed cursor
+zero first write would clobber a resumed manifest
 
 ### Fatal — `pipeline/mod.rs`
 
 One-shot error signal shared across stages. First message wins (root
 cause); pump polls it to exit, the barrier `select`s on it so a CH
 outage mid-fence surfaces instead of hanging. Any stage error → fatal
-→ daemon exits → cursor file resumes on restart
+→ daemon exits → manifest resumes on restart
 
 ## Memory budget
 
@@ -324,7 +327,7 @@ non-nullable by construction, encoded in `TableEncoder::new`:
 | `_is_deleted` | `Bool` | 1 on delete, else 0. `Bool` is `UInt8` underneath (1 wire byte), so it satisfies `ReplacingMergeTree`'s `is_deleted` UInt8 requirement. `ReplacingMergeTree(_lsn, _is_deleted)` second arg collapses deletes on FINAL; `WHERE _is_deleted = 0` is the cheap "live rows" filter. `soft_delete` keeps it out of the engine args to retain tombstones |
 
 `_lsn` is dedup key because emitter ack lags actual CH durability by up
-to one flush window. On restart cursor's `emitter_ack_lsn` rewinds to
+to one flush window. On restart the manifest floor rewinds to
 last contiguous-done LSN; everything between that and the crash
 re-emits, `ReplacingMergeTree(_lsn)` resolves duplicates server-side
 without walshadow having to track which rows already landed
@@ -555,7 +558,7 @@ PG-side tooling. See [decoder.md](decoder.md) for tier classification +
 See [Ack collector](#ack-collector--pipelineackrs) for mechanism. The
 operational contract:
 
-- `emitter_ack_lsn` in the cursor file is the contiguous-done
+- `emitter_ack` in the manifest is the contiguous-done
   commit-record LSN — every xact at or below it is fully durable on
   CH. It lags `drain_lsn` by up to one flush window
   (`flush_timeout`); the per-table deadline bounds the lag even on
@@ -569,8 +572,8 @@ operational contract:
   (retry exhaustion is fatal first); the daemon's stall watchdog
   surfaces the oldest incomplete seq
 
-See [ops.md](ops.md) for cursor + recovery contract; replay starts
-from `min(shadow_replay_lsn, emitter_ack_lsn)`
+See [ops.md](ops.md) for manifest + recovery contract; slot advance
+keys on `min(shadow_replay, emitter_ack)`, replay starts at the floor
 
 ## Bootstrap shares the tail
 
@@ -599,7 +602,7 @@ Timeout}` as transient (network / CH-server / clickhouse-c protocol);
 `Config`, `Type`, `Catalog`, `UnsupportedValue` stay fatal because
 they encode bugs in daemon or mapping that retry would loop forever on
 
-Budget expiry trips `Fatal` — daemon exits, cursor file resumes on
+Budget expiry trips `Fatal` — daemon exits, manifest resumes on
 restart. See [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md)
 for the deeper "re-emit from spill" design (segment-buffered replay across
 extended CH outages)
@@ -614,7 +617,7 @@ extended CH outages)
   `TablePlan::build` reads
 - [decoder.md](decoder.md) — `HeapDecoder` produces `ColumnValue` /
   `DecodedHeap`. Read-time defaults tier-classify here
-- [ops.md](ops.md) — cursor file, stall watchdog, SIGHUP mapping
+- [ops.md](ops.md) — manifest, stall watchdog, SIGHUP mapping
   reload, slot advance on `min(shadow_replay_lsn, emitter_ack_lsn)`
 - [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
   — `clickhouse-c-rs` unsafe surface (`BlockBuilder` borrows into

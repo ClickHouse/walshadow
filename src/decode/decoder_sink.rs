@@ -1,10 +1,10 @@
 //! Shared types for the heap-tuple decoder fan-out: [`TupleObserver`],
 //! [`DecoderStats`], [`DecoderSinkError`].
 //!
-//! CH path drains through the parallel [`pipeline`](crate::emit::pipeline);
-//! metrics-only path (no `--ch-config`) drains to [`MetricsTupleObserver`].
-//! Catalog gate timeouts poison the stream, so no `replay_timeout` counter:
-//! silent loss is impossible by construction.
+//! WAL commits drain through the parallel [`pipeline`](crate::emit::pipeline);
+//! [`TupleObserver`] is the greenfield-bootstrap page-walk drain destination
+//! (`drain_backfill`). Catalog gate timeouts poison the stream, so no
+//! `replay_timeout` counter: silent loss is impossible by construction.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,8 +16,6 @@ use crate::catalog::shadow_catalog::CatalogError;
 use crate::ch::EmitterError;
 use crate::decode::heap_decoder::{CommittedTuple, DecodeError};
 use crate::record::SinkError;
-use crate::runtime_config::ConfigEvent;
-use crate::schema::SchemaEvent;
 
 #[derive(Debug, Error)]
 pub enum DecoderSinkError {
@@ -46,10 +44,8 @@ impl From<EmitterError> for DecoderSinkError {
 /// CH emitter needs `commit_ts` for its `_commit_ts` synthetic column.
 ///
 /// `on_xact_end` fires after every tuple in a committed xact is delivered.
-/// Returns highest commit_lsn now durable on the observer (CH server acked,
-/// MergeTree part finalized). Callers advance their ack ceiling from the
-/// return value, NOT `commit_lsn`, so an observer holding INSERTs open across
-/// xacts reports ack lag without breaking the slot-advance gate. Default
+/// Returns highest commit_lsn now durable on the observer. Callers advance
+/// their ack ceiling from the return value, NOT `commit_lsn`. Default
 /// returns `commit_lsn` (instant ack).
 pub trait TupleObserver: Send {
     fn on_tuple<'a>(
@@ -62,96 +58,6 @@ pub trait TupleObserver: Send {
         commit_lsn: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
         Box::pin(async move { Ok(commit_lsn) })
-    }
-
-    /// Dispatched from [`crate::xact::xact_buffer::XactBuffer::commit`]'s k-way merge
-    /// in `source_lsn` order alongside `on_tuple`, so DDL (ALTER/CREATE/DROP)
-    /// lands on dest before the next `on_tuple` encodes against post-DDL shape.
-    /// Default no-op: non-CH observers ignore schema events.
-    fn on_schema_event<'a>(
-        &'a mut self,
-        _event: &'a SchemaEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Dispatched alongside `on_schema_event` for a source-PG config-table
-    /// write, at its `source_lsn` in the drain. The parallel pipeline applies
-    /// config in the reorder coordinator's barrier instead, so this fires only
-    /// on the serial drain path; default no-op.
-    fn on_config_event<'a>(
-        &'a mut self,
-        _event: &'a ConfigEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Ceiling for an idle-advance ack at `lsn`. Returns `lsn` when observer
-    /// holds nothing client-side; otherwise its durable horizon, so a
-    /// quiescent-tick nudge can't promote the emitter ack past rows still
-    /// buffered in open INSERTs. Default `lsn`: non-buffering observers.
-    fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
-        lsn
-    }
-
-    /// Observer-layer mirror of [`crate::record::RecordSink::on_idle`]:
-    /// CH emitter closes hold-open INSERTs once `flush_timeout` elapses with no
-    /// fresh xact_end to piggyback the deadline check on. Returns commit LSN
-    /// made durable by any deadline-triggered close (`0` = nothing promoted),
-    /// folded into `emitter_ack_lsn`. Default no-op `Ok(0)`.
-    fn on_idle<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(0) })
-    }
-
-    /// Observer-layer mirror of [`crate::record::RecordSink::on_close`]:
-    /// CH emitter force-flushes any held-open INSERT on daemon shutdown.
-    fn on_close<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-/// Forwarding impl so the daemon picks an observer at runtime without making
-/// [`crate::xact::xact_buffer::XactRecordSink`] generic over a closed enum.
-impl<T: TupleObserver + ?Sized> TupleObserver for Box<T> {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a CommittedTuple,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        (**self).on_tuple(committed)
-    }
-
-    fn on_xact_end<'a>(
-        &'a mut self,
-        commit_lsn: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
-        (**self).on_xact_end(commit_lsn)
-    }
-
-    fn on_schema_event<'a>(
-        &'a mut self,
-        event: &'a SchemaEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        (**self).on_schema_event(event)
-    }
-
-    fn idle_ack_ceiling(&self, lsn: u64) -> u64 {
-        (**self).idle_ack_ceiling(lsn)
-    }
-
-    fn on_idle<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
-        (**self).on_idle()
-    }
-
-    fn on_close<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        (**self).on_close()
     }
 }
 

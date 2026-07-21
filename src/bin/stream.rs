@@ -50,12 +50,12 @@ use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig};
-use walshadow::cursor;
-use walshadow::decoder_sink::{MetricsTupleObserver, TupleObserver};
+use walshadow::decoder_sink::MetricsTupleObserver;
+use walshadow::manifest;
 use walshadow::mapping::MappingHandle;
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
 use walshadow::pg::{quote_ident, socket_conninfo};
-use walshadow::pipeline::{Fatal, PipelineConfig, PipelineHandle, bootstrap, tail};
+use walshadow::pipeline::{Fatal, PipelineConfig, TailKind, bootstrap, tail};
 use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
@@ -71,9 +71,7 @@ use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, with_transie
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 use walshadow::toast::ToastResolver;
 use walshadow::wal_stream::WalStream;
-use walshadow::xact_buffer::{
-    BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig, XactRecordSink,
-};
+use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
 /// Choose bootstrap source for empty shadow data dir
 /// Initialized data dir resumes regardless of mode
@@ -343,10 +341,12 @@ struct Args {
     /// identity / row key, slot existence). For recovery drills.
     #[arg(long, default_value_t = false)]
     skip_preflight: bool,
-    /// Ignore any `cursor.bin` under `--spill-dir` at boot (greenfield
-    /// resume even when a prior daemon left one). For "wipe + restart
-    /// from a known LSN" drills. Cursor still rewritten as the new daemon
-    /// progresses.
+    /// Ignore `manifest.toml` resume LSNs under `--spill-dir` at boot
+    /// (greenfield resume even when a prior daemon left one), adopt a
+    /// changed source timeline, and authorize boot past an unreadable or
+    /// corrupt manifest (otherwise fatal). Source identity gate still
+    /// applies; the manifest rewrites as the new daemon progresses. For
+    /// "wipe + restart from a known LSN" drills.
     #[arg(long, default_value_t = false)]
     ignore_cursor: bool,
     /// Bootstrap source for empty shadow data dir. `off` never bootstraps;
@@ -579,67 +579,93 @@ async fn run(args: Args) -> Result<()> {
         }
     };
 
-    // Resume precedence: `--start-lsn` > cursor.bin emitter-ack > greenfield
-    // (source write head). `--ignore-cursor` forces greenfield (recovery drills).
-    let cursor_at_boot: Option<cursor::Cursor> = if args.ignore_cursor {
-        None
-    } else {
-        match cursor::read(&args.spill_dir).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    target: "walshadow::cursor",
-                    error = %e,
-                    spill_dir = %args.spill_dir.display(),
-                    "cursor file unreadable; falling back to greenfield",
-                );
-                None
-            }
-        }
+    let live_identity = manifest::SourceIdentity {
+        system_id: ident.sysid.parse().context("IDENTIFY_SYSTEM sysid")?,
+        timeline: ident.timeline,
     };
-    // Bootstrap `end_lsn` outranks the cursor: shadow catalog state is at
-    // `end_lsn`, so consuming WAL before it double-counts. `--start-lsn`
-    // still wins so recovery drills can rewind further.
     let start_lsn_override = args
         .start_lsn
         .as_deref()
         .map(|s| walshadow::pg::parse_pg_lsn(s).context("--start-lsn"))
         .transpose()?;
-    let raw_start = cursor::resolve_resume_lsn(
+    // Identity gate runs before `--ignore-cursor`: the flag discards resume
+    // LSNs, not artifact ownership. Foreign system_id is fatal regardless
+    // (retire/backfill ledgers would act on another cluster's state); a
+    // timeline-only change (promoted source) passes under `--ignore-cursor`,
+    // live identity persists at the next manifest write.
+    let manifest_at_boot: Option<manifest::Manifest> =
+        match manifest::load(&args.spill_dir, &live_identity).await {
+            Ok(m) => m,
+            Err(manifest::ManifestError::ForeignSource { stored, live })
+                if args.ignore_cursor && stored.system_id == live.system_id =>
+            {
+                tracing::warn!(
+                    target: "walshadow::manifest",
+                    stored_timeline = stored.timeline,
+                    live_timeline = live.timeline,
+                    "--ignore-cursor adopts new source timeline",
+                );
+                None
+            }
+            Err(e @ manifest::ManifestError::ForeignSource { .. }) => {
+                anyhow::bail!("{e}");
+            }
+            Err(e) if args.ignore_cursor || start_lsn_override.is_some() => {
+                tracing::warn!(
+                    target: "walshadow::manifest",
+                    error = %e,
+                    spill_dir = %args.spill_dir.display(),
+                    "manifest unreadable; operator override discards it",
+                );
+                None
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "manifest at {} unreadable: {e}; restore it, or authorize \
+                     recovery with --ignore-cursor / --start-lsn",
+                    manifest::manifest_path(&args.spill_dir).display(),
+                );
+            }
+        };
+    // Resume precedence: `--start-lsn` > bootstrap end > manifest emitter-ack
+    // > greenfield (source write head). `--ignore-cursor` forces greenfield
+    // (recovery drills). Bootstrap `end_lsn` outranks the manifest: shadow
+    // catalog state is at `end_lsn`, so consuming WAL before it double-counts.
+    let manifest_at_boot = if args.ignore_cursor {
+        None
+    } else {
+        manifest_at_boot
+    };
+    let raw_start = manifest::resolve_resume_lsn(
         start_lsn_override,
         bootstrap_end_lsn,
-        cursor_at_boot.as_ref().map(|c| c.emitter_ack_lsn),
+        manifest_at_boot.as_ref().map(|m| m.lsn.emitter_ack.0),
         ident.xlogpos,
     );
-    let mut aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
-    // Keep archive continuous until live streaming begins
-    // Starting after last sealed segment leaves shadow missing WAL
-    // Re-read from earlier LSN, CH removes duplicates using `_lsn`
-    // Preserve fresh bootstrap position and explicit `--start-lsn`
-    if bootstrap_end_lsn.is_none()
-        && start_lsn_override.is_none()
-        && let Some(archive_end) = max_segment_end(&args.out_dir)
+    let pinned = bootstrap_end_lsn.is_some() || start_lsn_override.is_some();
+    let floor_at_boot = manifest_at_boot
+        .as_ref()
+        .map(|m| m.floor.0)
+        .filter(|f| *f != 0);
+    // Archive-end scan only feeds the greenfield clamp (keep archive
+    // continuous until live streaming begins: starting after last sealed
+    // segment leaves shadow missing WAL; re-read from earlier LSN, CH
+    // removes duplicates using `_lsn`). A persisted floor folded the clamp
+    // at write time.
+    let archive_end = if !pinned && floor_at_boot.is_none() {
+        max_segment_end(&args.out_dir)
             .await
             .context("scan out-dir for sealed archive end")?
-        && archive_end < aligned
-    {
-        tracing::info!(
-            target: "walshadow",
-            archive_end = format_pg_lsn(archive_end).to_string(),
-            unclamped = format_pg_lsn(aligned).to_string(),
-            "resume clamped to sealed archive end",
-        );
-        aligned = archive_end;
-    }
+    } else {
+        None
+    };
+    let aligned = manifest::resolve_start(raw_start, floor_at_boot, pinned, archive_end);
     tracing::info!(
         target: "walshadow",
         raw = format_pg_lsn(raw_start).to_string(),
         aligned = format_pg_lsn(aligned).to_string(),
         from_bootstrap = bootstrap_end_lsn.is_some() && args.start_lsn.is_none(),
-        from_cursor = bootstrap_end_lsn.is_none()
-            && cursor_at_boot.is_some()
-            && args.start_lsn.is_none()
-            && cursor_at_boot.as_ref().is_some_and(|c| c.emitter_ack_lsn != 0),
+        from_floor = floor_at_boot.is_some() && !pinned,
         "start LSN",
     );
 
@@ -886,15 +912,29 @@ async fn run(args: Args) -> Result<()> {
     let decoder_stats_handle = decoder.stats_handle();
 
     let mut emitter_stats_handle: Option<Arc<EmitterStats>> = None;
-    let mut pipeline_handle: Option<PipelineHandle> = None;
-    // When the pipeline is wired, the durable watermark comes from its ack
-    // collector atomic instead of the xact buffer's synchronous field.
-    let mut pipeline_ack: Option<Arc<AtomicU64>> = None;
-    // `emitter_ack_lsn` as last persisted to the resume cursor; status loop
-    // stores it after each durable write, reorder gates deferred toast-mirror
-    // retires on it (a wipe is safe only once no restart can replay a
-    // pre-drop referrer).
-    let mut resume_floor: Option<Arc<AtomicU64>> = None;
+    // Durable watermark (ack collector atomic). Seed at `raw_start`, not 0:
+    // status loop persists this atomic into the manifest's `emitter_ack`
+    // each interval with no monotonic guard, first write at boot before any
+    // WAL re-read acks. Seeding 0 would clobber a resumed manifest; a crash
+    // before [aligned, raw_start] re-reads acks then resumes from
+    // ident.xlogpos next boot (precedence skips a zero ack), silently
+    // dropping [raw_start, head] WAL that never reached CH. tail's
+    // `fetch_max` keeps it monotonic as WAL re-reads [aligned, raw_start].
+    // See plans/future/pipeline_backpressure_and_scaling.md (Handoff step 3).
+    let emitter_ack = Arc::new(AtomicU64::new(raw_start));
+    // Persisted resolved floor. Seed with the resolved start: aligned +
+    // archive-clamped, the exact position a crash-now restart replays from.
+    // Any Dropped queued during the boot re-read of [aligned, raw_start] has
+    // commit_lsn ≥ aligned, so its retire holds until a later manifest write
+    // moves the floor past it.
+    let resume_floor = Arc::new(AtomicU64::new(aligned));
+    // Deferred retires queued before a stop; entries below `aligned` never
+    // replay their drop, so the post-spawn flush below is their only route
+    // to the wipe. Loaded in metrics-only runs too (inert without a chunk
+    // store), preserved for a later CH run over the same spill dir.
+    let retires = walshadow::toast_retire::RetireLedger::load(&args.spill_dir)
+        .await
+        .context("load toast retire ledger")?;
     // Layered config resolver (CLI > TOML); `Some` only with `--ch-config`.
     // Moved into the SIGHUP task, which re-reads TOML and republishes.
     let mut config_resolver: Option<Arc<ConfigResolver>> = None;
@@ -902,7 +942,7 @@ async fn run(args: Args) -> Result<()> {
     // TOML-pinned initial loads.
     let mut copy_backfiller: Option<Arc<walshadow::copy_backfill::CopyBackfiller>> = None;
 
-    let decoder_xact = if let Some(mut emitter_cfg) = ch_config {
+    let pcfg = if let Some(mut emitter_cfg) = ch_config {
         let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
         // Live routing map shared by DDL applicator + decode pool. The
         // refresher below rewrites it on every republished snapshot.
@@ -1067,38 +1107,22 @@ async fn run(args: Args) -> Result<()> {
                 .with_context(|| format!("ensure CH dest for pinned mapping {rel}"))?;
         }
         config_resolver = Some(resolver);
-        // Seed durable watermark at `raw_start`, not 0. Status loop
-        // persists this atomic into cursor's emitter_ack_lsn each
-        // interval with no monotonic guard, first write at boot before
-        // any WAL re-read acks. Seeding 0 would clobber a resumed
-        // cursor; a crash before [aligned, raw_start] re-reads acks
-        // then resumes from ident.xlogpos next boot (precedence skips a
-        // zero cursor ack), silently dropping [raw_start, head] WAL that
-        // never reached CH. tail's `fetch_max` keeps it monotonic as WAL
-        // re-reads [aligned, raw_start]. See
-        // plans/future/pipeline_backpressure_and_scaling.md (Handoff step 3).
-        let emitter_ack = Arc::new(AtomicU64::new(raw_start));
-        pipeline_ack = Some(emitter_ack.clone());
-        // Seed at raw_start like the ack: any Dropped queued during the
-        // boot re-read of [aligned, raw_start] has commit_lsn ≥ aligned, so
-        // its retire holds until a later cursor write moves the floor's
-        // segment past it.
-        let floor = Arc::new(AtomicU64::new(raw_start));
-        resume_floor = Some(floor.clone());
-        // Deferred retires queued before a stop; entries below `aligned`
-        // never replay their drop, so the post-spawn flush below is their
-        // only route to the wipe.
-        let retires = walshadow::toast_retire::RetireLedger::load(&args.spill_dir)
-            .await
-            .context("load toast retire ledger")?;
-        let pcfg = PipelineConfig {
+        tracing::info!(
+            target: "walshadow::pipeline",
+            addr = %addr,
+            decoders = args.decoder_pool_size.max(1),
+            inserters = args.inserter_pool_size.max(1),
+            "parallel decode+insert pipeline starting",
+        );
+        PipelineConfig {
             emitter: emitter_cfg,
             decoder_pool_size: args.decoder_pool_size,
             inserter_pool_size: args.inserter_pool_size,
             catalog: catalog.clone(),
             mapping,
             oracle: oracle.clone(),
-            applicator,
+            applicator: Some(applicator),
+            tail: TailKind::ClickHouse,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             schema_events: Some(schema_events.clone()),
@@ -1108,58 +1132,60 @@ async fn run(args: Args) -> Result<()> {
             config_resolver: config_resolver.clone(),
             backfiller: backfiller_effects,
             retires,
-            resume_floor: floor,
+            resume_floor: resume_floor.clone(),
             budget: Some(pipeline_budget),
-        };
-        let (mut reorder_sink, handle) = pcfg
-            .spawn(emitter_ack)
-            .await
-            .context("spawn decode+insert pipeline")?;
-        reorder_sink
-            .flush_due_retires()
-            .await
-            .context("boot flush of due toast-mirror retires")?;
-        pipeline_handle = Some(handle);
+        }
+    } else {
+        // Metrics-only (no CH): the identical pipeline with a null tail —
+        // zero CH connections, no DDL applicator, no oracle (nothing ships,
+        // PgPending stays raw). The empty mapping routes nothing, so seqs
+        // complete at placement and the watermark + slot advance move as in
+        // a CH run. Emitter stats stay unexported (`emitter_stats_handle`
+        // None), matching the old serial surface.
         tracing::info!(
             target: "walshadow::pipeline",
-            addr = %addr,
             decoders = args.decoder_pool_size.max(1),
-            inserters = args.inserter_pool_size.max(1),
-            "parallel decode+insert pipeline started",
+            "metrics-only pipeline (null tail) starting",
         );
-        QueueingRecordSink::spawn(
-            DecoderXactPair {
-                decoder,
-                xact_drain: reorder_sink,
-            },
-            args.decoder_batch_size,
-            args.decoder_queue_capacity,
-            span_registry.clone(),
-        )
-    } else {
-        // Metrics-only (no CH): serial drain to counters. Oracle wrapper
-        // resolves PgPending + fires validator probes when up.
-        let observer: Box<dyn TupleObserver> = if let Some(o) = oracle.clone() {
-            Box::new(walshadow::oracle::OracleObserver::new(
-                o,
-                Box::new(MetricsTupleObserver::default()) as Box<dyn TupleObserver>,
-            ))
-        } else {
-            Box::new(MetricsTupleObserver::default())
-        };
-        let xact_drain = XactRecordSink::new(xact_buffer.clone(), catalog.clone(), observer)
-            .with_schema_events(schema_events)
-            .with_pending_sweeps(pending_sweeps.clone());
-        QueueingRecordSink::spawn(
-            DecoderXactPair {
-                decoder,
-                xact_drain,
-            },
-            args.decoder_batch_size,
-            args.decoder_queue_capacity,
-            span_registry.clone(),
-        )
+        PipelineConfig {
+            emitter: EmitterConfig::default(),
+            decoder_pool_size: args.decoder_pool_size,
+            inserter_pool_size: args.inserter_pool_size,
+            catalog: catalog.clone(),
+            mapping: Arc::new(tokio::sync::RwLock::new(Default::default())),
+            oracle: None,
+            applicator: None,
+            tail: TailKind::Null,
+            buffer: xact_buffer.clone(),
+            subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
+            schema_events: Some(schema_events.clone()),
+            pending_sweeps: Some(pending_sweeps.clone()),
+            stats: Arc::new(EmitterStats::default()),
+            span_registry: span_registry.clone(),
+            config_resolver: None,
+            backfiller: None,
+            retires,
+            resume_floor: resume_floor.clone(),
+            budget: None,
+        }
     };
+    let (mut reorder_sink, pipeline_handle) = pcfg
+        .spawn(emitter_ack.clone())
+        .await
+        .context("spawn decode+insert pipeline")?;
+    reorder_sink
+        .flush_due_retires()
+        .await
+        .context("boot flush of due toast-mirror retires")?;
+    let decoder_xact = QueueingRecordSink::spawn(
+        DecoderXactPair {
+            decoder,
+            xact_drain: reorder_sink,
+        },
+        args.decoder_batch_size,
+        args.decoder_queue_capacity,
+        span_registry.clone(),
+    );
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder_xact,
@@ -1267,9 +1293,9 @@ async fn run(args: Args) -> Result<()> {
     let mut segments_shipped = 0u64;
     let mut prev_dispatched = stream.dispatched_lsn();
     let mut rate_estimator = RateEstimator::default();
-    // Cursor write cadence matches standby-status cadence so the file's
-    // `emitter_ack_lsn` is ≥ the `apply_lsn` advertised to source on every
-    // send; else the slot could advance past a not-yet-durable resume point.
+    // Manifest write cadence. Slot safety doesn't ride on it: advertised
+    // flush_lsn is capped at the persisted floor below, so a lagging write
+    // only delays slot advance, never overshoots it.
     let cursor_write_interval = Duration::from_secs(args.status_interval);
     let mut last_cursor_write: Option<Instant> = None;
     // Fast metrics-refresh tick (decoupled from cursor/status): an idle source
@@ -1293,12 +1319,7 @@ async fn run(args: Args) -> Result<()> {
         }
         let (drain_lsn, emitter_ack_lsn) = {
             let mut b = xact_buffer.lock().await;
-            // Durable watermark: pipeline → ack collector atomic;
-            // serial/metrics → xact buffer field.
-            let ea = pipeline_ack
-                .as_ref()
-                .map(|a| a.load(Ordering::Acquire))
-                .unwrap_or(b.stats().emitter_ack_lsn);
+            let ea = emitter_ack.load(Ordering::Acquire);
             let drain_lsn = b.stats().drain_lsn;
             // Keep every undurable transaction reachable after restart
             // Read acknowledgment first so no transaction escapes floor
@@ -1311,29 +1332,34 @@ async fn run(args: Args) -> Result<()> {
             0 => emitter_ack_lsn,
             s => s.min(emitter_ack_lsn),
         };
-        let cur = cursor::Cursor {
-            source_received_lsn: received,
-            filter_durable_lsn: durable,
-            shadow_replay_lsn: shadow_replay,
-            drain_lsn,
-            emitter_ack_lsn,
-            shadow_flush_lsn: shadow_flush_lsn.load(Ordering::Acquire),
+        let cur = manifest::Manifest {
+            version: manifest::MANIFEST_VERSION,
+            floor: manifest::Lsn(manifest::resolved_floor(emitter_ack_lsn, durable)),
+            source: live_identity.clone(),
+            lsn: manifest::LsnSet {
+                source_received: manifest::Lsn(received),
+                filter_durable: manifest::Lsn(durable),
+                shadow_replay: manifest::Lsn(shadow_replay),
+                drain: manifest::Lsn(drain_lsn),
+                emitter_ack: manifest::Lsn(emitter_ack_lsn),
+                shadow_flush: manifest::Lsn(shadow_flush_lsn.load(Ordering::Acquire)),
+            },
         };
         if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
-            cursor::write(&args.spill_dir, &cur)
+            manifest::write(&args.spill_dir, &cur)
                 .await
-                .context("write resume cursor")?;
+                .context("write resume manifest")?;
             last_cursor_write = Some(Instant::now());
-            if let Some(f) = &resume_floor {
-                f.store(cur.emitter_ack_lsn, Ordering::Release);
-            }
+            // Publish only after persist: pruners cut against what a
+            // crash-now restart actually resumes from.
+            resume_floor.store(cur.floor.0, Ordering::Release);
         }
-        // flush drives a physical slot's restart_lsn (what the source retains),
-        // so cap it at apply_ceiling: the source keeps WAL until CH has durably
-        // applied it (and shadow replayed), never recycling un-consumed WAL.
+        // flush caps physical slot's restart_lsn.
+        // Manifest writes are cadence-gated above while keepalive replies inside
+        // next_chunk can send this status at any time.
         let status = StandbyStatus {
             write_lsn: received,
-            flush_lsn: durable.min(apply_ceiling),
+            flush_lsn: apply_ceiling.min(resume_floor.load(Ordering::Acquire)),
             apply_lsn: apply_ceiling,
         };
         let dispatched_before = stream.dispatched_lsn();
@@ -1398,9 +1424,7 @@ async fn run(args: Args) -> Result<()> {
             .context("flush queueing decoder sink")?;
         // Surface a pipeline-stage failure as a clean daemon exit with the
         // root cause rather than a silently pinned watermark.
-        if let Some(h) = &pipeline_handle
-            && let Some(msg) = h.fatal.message()
-        {
+        if let Some(msg) = pipeline_handle.fatal.message() {
             anyhow::bail!("decode+insert pipeline failed: {msg}");
         }
         if let Some(msg) = fsync_fatal.message() {
@@ -1410,12 +1434,7 @@ async fn run(args: Args) -> Result<()> {
         let advanced = now_dispatched != prev_dispatched;
         let (xact_stats, drain_resident, xact_line) = {
             let b = xact_buffer.lock().await;
-            let mut stats = b.stats().clone();
-            // Pipeline mode: track the ack collector's watermark (real CH
-            // durability), not the unused xact-buffer field.
-            if let Some(a) = &pipeline_ack {
-                stats.emitter_ack_lsn = a.load(Ordering::Acquire);
-            }
+            let stats = b.stats().clone();
             let line = stats.summary();
             let resident = DrainResident {
                 total: b.drain_resident_bytes(),
@@ -1437,9 +1456,9 @@ async fn run(args: Args) -> Result<()> {
         let lag_bytes = received.saturating_sub(shadow_apply_lsn);
         rate_estimator.observe(Instant::now(), received);
         let lag_seconds = rate_estimator.seconds_for(lag_bytes);
-        // Post-worker stats so the metric reflects what the worker drained,
-        // not the top-of-iteration snapshot.
-        let emitter_ack_for_metric = xact_stats.emitter_ack_lsn;
+        // Post-worker snapshots so the metric reflects what the worker
+        // drained, not the top-of-iteration values.
+        let emitter_ack_for_metric = emitter_ack.load(Ordering::Acquire);
         let drain_for_metric = xact_stats.drain_lsn;
         populate_metrics(
             &metrics,
@@ -1453,7 +1472,7 @@ async fn run(args: Args) -> Result<()> {
             record_sink.decoder_xact.processed(),
             &xact_stats,
             drain_resident,
-            pipeline_handle.as_ref().map(|h| &h.budget),
+            Some(&pipeline_handle.budget),
             decoder_stats,
             emitter_stats,
             oracle_stats,
@@ -1500,8 +1519,8 @@ async fn run(args: Args) -> Result<()> {
         // Re-arm on ack move; else after 5s of stall with parked xacts dump
         // the xids once. Runs independent of `advanced` so a fully-quiescent
         // pump still surfaces who's holding the slot.
-        if xact_stats.emitter_ack_lsn != last_emitter_ack_observed {
-            last_emitter_ack_observed = xact_stats.emitter_ack_lsn;
+        if emitter_ack_for_metric != last_emitter_ack_observed {
+            last_emitter_ack_observed = emitter_ack_for_metric;
             inflight_stall_since = None;
             inflight_stall_logged = false;
         }
@@ -1530,7 +1549,7 @@ async fn run(args: Args) -> Result<()> {
                 tracing::warn!(
                     target: "walshadow",
                     xacts_active = xact_stats.xacts_active,
-                    emitter_ack_lsn = format_pg_lsn(xact_stats.emitter_ack_lsn).to_string(),
+                    emitter_ack_lsn = format_pg_lsn(emitter_ack_for_metric).to_string(),
                     drain_lsn = format_pg_lsn(xact_stats.drain_lsn).to_string(),
                     source_received = format_pg_lsn(received).to_string(),
                     filter_dispatched = format_pg_lsn(now_dispatched).to_string(),
@@ -1571,12 +1590,10 @@ async fn run(args: Args) -> Result<()> {
     // Worker close dropped the reorder sink, closing the decode job queue.
     // Drain rest in order (decoders → batcher force-flush → inserters to
     // EndOfStream → ack collector) so no rows are lost + final watermark durable.
-    if let Some(handle) = pipeline_handle {
-        handle
-            .join()
-            .await
-            .map_err(|m| anyhow::anyhow!("decode+insert pipeline drain failed: {m}"))?;
-    }
+    pipeline_handle
+        .join()
+        .await
+        .map_err(|m| anyhow::anyhow!("decode+insert pipeline drain failed: {m}"))?;
     if let Some(lifecycle) = shadow_lifecycle {
         lifecycle.shutdown().await;
     }
@@ -1936,9 +1953,7 @@ fn spawn_retention(
             // Wait until shadow replays first record
             let Some(lsn) = replay else { continue };
             shadow_replay_lsn.fetch_max(lsn, Ordering::Release);
-            let cutoff = lsn
-                .saturating_sub(retention_bytes)
-                .min(redo.unwrap_or(u64::MAX));
+            let cutoff = manifest::retention_cutoff(lsn, retention_bytes, redo);
             match trim_below_lsn(&out_dir, cutoff).await {
                 Ok(r) if r.segments_removed > 0 => {
                     tracing::info!(

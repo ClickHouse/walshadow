@@ -1,4 +1,4 @@
-pub mod cursor;
+pub mod manifest;
 pub mod queueing_record_sink;
 pub(super) mod segment;
 pub mod segment_sink;

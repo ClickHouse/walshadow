@@ -40,7 +40,7 @@ use walshadow::mapping::{
 };
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
-use walshadow::pipeline::{PipelineConfig, PipelineHandle};
+use walshadow::pipeline::{PipelineConfig, PipelineHandle, TailKind};
 use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE};
 use walshadow::schema::RelName;
 use walshadow::segment_sink::DirSegmentSink;
@@ -510,10 +510,10 @@ pub struct Pipeline {
     pub chunk_buf: Vec<u8>,
     pub handle: PipelineHandle,
     pub ack: Arc<AtomicU64>,
-    /// Persisted-resume-cursor stand-in gating deferred toast-mirror
-    /// retires; the daemon's status loop advances it after each durable
-    /// cursor write, tests store into it directly. Seeds at the boot
-    /// head, so retires queued by this run defer until a test advances it.
+    /// Persisted-resolved-floor stand-in gating deferred toast-mirror
+    /// retires; the daemon's status loop advances it after each manifest
+    /// persist, tests store into it directly. Seeds at the boot head, so
+    /// retires queued by this run defer until a test advances it.
     pub resume_floor: Arc<AtomicU64>,
     /// Same `EmitterStats` Arc the daemon exports to Prometheus; lets tests
     /// assert the parallel path keeps the emitter counters live.
@@ -707,11 +707,15 @@ async fn build_pipeline_inner(
         .with_resolver(config_resolver.clone());
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
-    // Boot head stands in for the daemon's cursor resume point: retires
-    // queued by this run defer (their drop commits past the head) until a
-    // test advances the floor; ledger entries from a prior run's drop
-    // segment are due and retire in the boot flush below.
-    let resume_floor = Arc::new(AtomicU64::new(ident.xlogpos));
+    // Aligned boot head stands in for the daemon's resolved floor (a
+    // rebuilt harness re-reads from the segment start, like a daemon
+    // restart): retires queued by this run defer until a test advances
+    // the floor; ledger entries below a prior run's segment are due and
+    // retire in the boot flush below.
+    let resume_floor = Arc::new(AtomicU64::new(WalStream::align_down(
+        ident.xlogpos,
+        WAL_SEG_SIZE,
+    )));
     let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir)
         .await
         .expect("load toast retire ledger");
@@ -743,7 +747,8 @@ async fn build_pipeline_inner(
         catalog: catalog.clone(),
         mapping,
         oracle,
-        applicator,
+        applicator: Some(applicator),
+        tail: TailKind::ClickHouse,
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
         schema_events: schema_events.clone(),

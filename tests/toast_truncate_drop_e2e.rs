@@ -9,7 +9,7 @@
 //!   mirror intact, destination bytes exact, zero fills
 //! * ledger recovery — floor passes the drop segment before the stop and
 //!   no later commit flushes the queue; the rebuilt pipeline's standup
-//!   retires off the persisted `toast_retires.bin` alone (resume never
+//!   retires off the persisted `toast_retires.toml` alone (resume never
 //!   replays the drop)
 //!
 //! Single-pipeline TRUNCATE + deferred-DROP-retire flow lives in
@@ -411,7 +411,7 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
 /// the DROP and the WAL switch puts the next boot's resume head past the
 /// drop segment (durable-cursor stand-in), then the run stops with no
 /// later commit to flush the queue. Resume never replays the drop, so
-/// run 2's standup flush off `toast_retires.bin` is the only route to
+/// run 2's standup flush off `toast_retires.toml` is the only route to
 /// the wipe — the mirror must come up empty with no poke commit and no
 /// WAL pumped at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

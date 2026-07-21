@@ -114,10 +114,6 @@ Evaluation notes:
 
 Recorded so future readers do not re-litigate these:
 
-* Cursor binary codec (`src/cursor.rs` `encode`/`decode`): durable
-  on-disk 64-byte format with CRC32C trailer. `bincode`/`postcard`
-  would change byte layout and force migration of existing cursor
-  files, for a fixed struct already simple and stable
 * Metrics HTTP serving (`src/metrics.rs` raw `TcpListener`): no HTTP
   server in tree (`reqwest` is client-only), so a crate means pulling
   `hyper`/`axum` for one endpoint. `prometheus-client` covers encoding

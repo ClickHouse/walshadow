@@ -50,8 +50,8 @@ Reclamation is `ReplacingMergeTree` merge behavior, not walshadow logic.
   `CHUNK_PUT_BATCH` rows / `CHUNK_PUT_BYTES` under a leaf permit) before the
   commit's publishing ack marker, so a later referrer's fetch finds them
   durable — barrier slices interleave puts with mirror wipes via merge
-  cursors sealed with the slice (see Lifecycle). The serial gap-replay path
-  puts its collected rows at commit for the same reason. No
+  cursors sealed with the slice (see Lifecycle). Gap replay puts rows
+  through the same walk steps for the same reason. No
   fsync, no journal, no ack coupling: toast rows ride the main-table
   durability story (CH insert ack → emitter ack).
 - **Fetch.** `fetch(relid, value_id, max_lsn)` is an as-of query: candidate
@@ -118,8 +118,8 @@ Reclamation is `ReplacingMergeTree` merge behavior, not walshadow logic.
   and drop; only `pg_toast_*` decode is config-gated (`store_toast`). Seeds
   every toast rel in the catalog — no per-table filter. A re-seed of a live
   deployment runs as a one-off against a scratch
-  `--bootstrap-shadow-data-dir` and separate `--out-dir` so the live cursor
-  stays untouched.
+  `--bootstrap-shadow-data-dir` and separate `--out-dir` so the live
+  manifest stays untouched.
 - **Decode shape (R2).** Value reassembled before the main-table INSERT,
   stored inline `Bytea`/`Text`; `encode_value` (`src/ch_emitter.rs`) needs no
   toast-specific handling. Tier 3 detoast routing: `detoasted_value` runs
@@ -150,7 +150,7 @@ logically-logged rels, never toast):
 - **DROP** (owner DROP, or a rewrite retiring its old toast rel) surfaces
   the toast rel's `Dropped` via `sweep_dropped`; reorder queues the retire
   and executes it — emptied, table kept, counted `toast_mirror_retires` —
-  only once the persisted resume cursor's segment passes the dropping
+  only once the persisted resolved floor passes the dropping
   commit. Deferral is what makes the wipe replay-safe: durability of
   earlier referrer versions is not enough, since a crash before the
   commit's publishing marker replays it, and a pre-drop referrer re-emit
@@ -159,10 +159,10 @@ logically-logged rels, never toast):
   can't arbitrate (a retained dest under `drop_table_strategy=retain`
   keeps whichever merges last). Once the floor's segment passes, no
   restart re-reads any pre-drop referrer, so the wipe is unobservable.
-  The queue is durable (`toast_retires.bin` beside `cursor.bin`,
+  The queue is durable (`toast_retires.toml` beside `manifest.toml`,
   `toast_retire::RetireLedger`): the entry fsyncs inside the dropping
   xact's barrier apply, strictly before its commit can publish to the
-  ack collector, so any persisted cursor whose floor passed the drop
+  ack collector, so any persisted manifest whose floor passed the drop
   already holds it. Flushes run at each commit boundary, at idle
   advance, and at pipeline standup — the standup flush is the only
   route to the wipe for an entry whose floor passed before a stop,
