@@ -109,7 +109,7 @@ fn append_source_conf(sh: &Shadow) -> Result<()> {
     writeln!(f, "wal_level = logical")?;
     writeln!(f, "max_wal_senders = 4")?;
     // Plan §"Risks": pin retention well past 250 ms of WAL so the
-    // restart's START_REPLICATION from the cursor LSN sits inside the
+    // restart's START_REPLICATION from the manifest LSN sits inside the
     // retained window.
     writeln!(f, "wal_keep_size = '128MB'")?;
     Ok(())
@@ -174,8 +174,8 @@ fn enable_recovery(data_dir: &Path, restore_from: &Path, walsender_port: u16) ->
 }
 
 /// Daemon argv used by every spawn in the drill. Captures every flag
-/// that must stay identical across kill / restart so the cursor + spill
-/// dir continuity is preserved.
+/// that must stay identical across kill / restart so the manifest +
+/// spill dir continuity is preserved.
 struct DaemonFlags {
     source_sock: PathBuf,
     shadow_sock: PathBuf,
@@ -465,7 +465,7 @@ async fn run_drill() -> Result<()> {
     fx::create_ch_dest_table(&ch, "default", "kr_t").context("create ch dest table")?;
 
     // 4. Daemon flags — identical across every spawn so kill / restart
-    //    resumes from the cursor + spill dir.
+    //    resumes from the manifest + spill dir.
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir)?;
     let ch_config_path = tmp.path().join("ch-config.toml");
@@ -603,7 +603,7 @@ async fn run_cycle(
         format_pg_lsn(post_kill_lsn),
     );
 
-    // 8. Restart daemon — same flags. cursor.bin + spill files persist
+    // 8. Restart daemon — same flags. manifest.toml + spill files persist
     //    across the kill; SO_REUSEADDR on --walsender-bind lets the
     //    fresh process re-bind the same port.
     let restart_stderr = stderr_path.with_extension("restart.log");
@@ -620,6 +620,20 @@ async fn run_cycle(
     // 10. Oracle. Reuses the count + sum + md5 helper from item 9.
     fx::assert_ch_matches_source(ch, source, "kr.t", "default.kr_t")
         .context("source vs CH parity")?;
+
+    // Resume manifest is on disk, parseable, floor never above the ack.
+    let text = fs::read_to_string(flags.spill_dir.join("manifest.toml"))
+        .context("read manifest.toml after restart")?;
+    let m: toml::Value = toml::from_str(&text).context("parse manifest.toml")?;
+    let lsn = |v: &toml::Value| parse_pg_lsn(v.as_str().expect("pg_lsn string")).unwrap();
+    let floor = lsn(&m["floor"]);
+    let ack = lsn(&m["lsn"]["emitter_ack"]);
+    assert!(
+        floor <= ack,
+        "manifest floor {} above emitter ack {}",
+        format_pg_lsn(floor),
+        format_pg_lsn(ack),
+    );
 
     // 11. Drain restart daemon for the next cycle. `into_inner` strips
     //     the guard so we drive the SIGKILL + reap explicitly — letting

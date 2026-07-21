@@ -341,7 +341,7 @@ to `XLOG_RELMAP_UPDATE` or `seed_from_source` to learn rotated filenode
 pub struct DecodedHeap {
     pub rfn: RelFileNode,    // block 0 location (or relation_by_oid for Truncate)
     pub xid: u32,            // from record header; xact buffer keys on this
-    pub source_lsn: u64,     // for cursor + LSN propagation
+    pub source_lsn: u64,     // for manifest + LSN propagation
     pub op: HeapOp,
     pub new: Option<DecodedTuple>,
     pub old: Option<DecodedTuple>,

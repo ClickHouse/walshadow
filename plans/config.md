@@ -125,9 +125,10 @@ enum DrainEntry {
 `DrainEntry::Config` events ride the same `ordered_events` interleave and barrier
 apply as `DrainEntry::Catalog`: interpreted events stamp `(xid, source_lsn)` and
 merge into the heap stream by LSN, so a config row preceding heap writes in WAL
-position applies before those writes drain. Two apply sites share the enum: the
-serial `commit()` path in `xact_buffer.rs` and the live pipeline's `run_barrier`
-in [`pipeline/reorder.rs`](../src/pipeline/reorder.rs).
+position applies before those writes drain. One apply site owns the enum: the
+pipeline's `run_barrier_batch` in
+[`pipeline/reorder.rs`](../src/emit/pipeline/reorder.rs), walking
+`DrainedBatch::into_walk` steps.
 
 `ConfigResolver::apply_config_event` mutates the overlay, **writes the live
 `MappingHandle` synchronously under the barrier fence**, bumps

@@ -64,21 +64,24 @@ digraph internals {
     catgate [label="BufferingDecoderSink\nrelation_at(rfn, lsn)\nwait_for_replay(at_lsn)", fillcolor="#4D4128"];
     decoder [label="heap_decoder\nINSERT / DELETE /\nUPDATE / HOT / TRUNCATE\nTier-1 fixed-width\nTier-2 length-prefixed\nReplica-identity matrix", fillcolor="#4D4128"];
     xactbuf [label="XactBuffer + spill v4\nHeap / Chunk / ToastDelete / Raw\nSMGR markers + commit stash\nSubxactTracker\nbudget = work_mem", fillcolor="#4D4128"];
-    drain   [label="ReorderSink (pipeline/reorder.rs)\nCommittedDrain → DrainedBatch slices\nnew_rows + row/event cursors\nCatalog / Config / ToastBarrier / TRUNCATE:\nplaced → FlushAll → durable → apply", fillcolor="#4D4128"];
+    drain   [label="transaction reorder\nwalk committed rows + changes in WAL order\nwait for earlier data before table changes", fillcolor="#4D4128"];
     catgate -> decoder -> xactbuf -> drain;
   }
   qwrk -> catgate [lhead=cluster_decode];
 
-  // ════════ ⑥ CH pipeline tail — decode pool → batcher → inserter pool ════════
+  // ════════ ⑥ emitter pipeline ════════
   subgraph cluster_ch {
-    label="⑥ CH pipeline tail — decode ×M → batcher → inserter ×N (pipeline/)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    label="⑥ emitter pipeline — shared path for ClickHouse and metrics-only runs"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     cdecode  [label="decode pool ×M\ndetoast via ChunkMap / store as-of fetch\nresolve_at_pooled + mapping + oracle\nchunk 1024 rows / 4 MiB", fillcolor="#5D4628"];
     tableenc [label="InsertBatcher\nTableEncoder per table\nNative columns +\n_lsn / _xid / _commit_ts / _is_deleted\nrow/byte budget + deadline seal", fillcolor="#5D4628"];
     chwire   [label="inserter pool ×N\nBlockBuilder over sealed batch\none complete INSERT each\nsend_with_retry + reconnect", fillcolor="#5D4628"];
-    ackcol   [label="ack collector\ncontiguous-done watermark\n→ emitter_ack_lsn", fillcolor="#4D3A28", shape=note];
+    nulltail [label="metrics-only tail\nno ClickHouse connection\nacknowledge immediately", fillcolor="#4D3A28", shape=note];
+    ackcol   [label="ack collector\npublish latest position after\nevery earlier commit completes", fillcolor="#4D3A28", shape=note];
     toastio  [label="ToastResolver / CH mirrors\nput births+tombstones before publish\nfetch pre-window values\ntruncate / retire / rewrite O−B", fillcolor="#5D4628"];
     cdecode -> tableenc -> chwire;
     chwire -> ackcol [style=dotted, color="#b380b0", label="Acked after\nEndOfStream"];
+    cdecode -> nulltail [style=dashed, color="#BF8C5F", constraint=false, label="metrics only"];
+    nulltail -> ackcol [style=dotted, color="#b380b0", constraint=false, label="done"];
   }
   drain -> cdecode [color="#BF8C5F", penwidth=2, label="DecodeJob"];
   drain -> toastio [color="#BF8C5F", style=dashed, label="new_rows + barriers"];
@@ -126,8 +129,8 @@ digraph internals {
     label="⑨ on-disk caches"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     outdir [label="out/<seg>\n16 MiB filtered\n+ manifest.json", fillcolor="#4D3850", shape=note];
     spill  [label="{spill}/xid-<xid>-<lsn>.bin\nappend-only\n[tag u8 | len u32 | body]", fillcolor="#4D3850", shape=note];
-    cursor [label="{spill}/cursor.bin\n64 B atomic rename\n6 LSN fields + CRC32C", fillcolor="#4D3850", shape=note];
-    retires [label="{spill}/toast_retires.bin\nfsynced deferred mirror wipes", fillcolor="#4D3850", shape=note];
+    manifest [label="{spill}/manifest.toml\nsource identity + safe restart state\nheld behind open work", fillcolor="#4D3850", shape=note];
+    retires [label="{spill}/toast_retires.toml\nsaved mirror retirements", fillcolor="#4D3850", shape=note];
   }
 
   // ════════ External edges ════════
@@ -138,11 +141,12 @@ digraph internals {
   segsink -> outdir;
   outdir  -> shd    [style=dashed, color="#6E6963", label="restore_command"];
   xactbuf -> spill  [style=dashed, label="evict largest xact"];
-  ackcol  -> cursor [style=dotted, color="#b380b0", label="emitter_ack_lsn"];
+  ackcol  -> manifest [style=dotted, color="#b380b0", label="status loop saves\ndurable progress"];
   chwire  -> ch     [color="#BF8C5F", penwidth=2];
   toastio -> ch     [color="#BF8C5F", style=dashed, label="pg_toast_<relid>"];
   drain   -> retires [color="#6E6963", style=dashed, label="toast DROP"];
-  retires -> toastio [color="#6E6963", style=dashed, label="resume-floor flush"];
+  manifest -> toastio [color="#6E6963", style=dashed, label="saved cleanup point"];
+  retires -> toastio [color="#6E6963", style=dashed, label="pending retirements"];
 
   // ════════ Anchor sinks at the bottom rank ════════
   { rank=sink; shd; ch; }
@@ -165,7 +169,7 @@ digraph internals {
       <TR><TD><FONT COLOR="#BD8183"><B>━━</B></FONT></TD><TD>walsender wire (hot path)</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq catalog query / schema event</TD></TR>
       <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>CH Native (rows + DDL SQL)</TD></TR>
-      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>ack + manifest durability</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>filesystem (restore_command)</TD></TR>
     </TABLE>
   >];

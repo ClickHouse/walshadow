@@ -173,6 +173,14 @@ fn http_get(addr: SocketAddr, path: &str) -> Result<String> {
     Ok(txt[body_start..].to_string())
 }
 
+/// Parse one Prom gauge/counter value from a /metrics body.
+fn metric_u64(body: &str, name: &str) -> Result<u64> {
+    body.lines()
+        .find_map(|l| l.strip_prefix(name).map(str::trim))
+        .and_then(|v| v.parse().ok())
+        .with_context(|| format!("{name} not in metrics body"))
+}
+
 /// Wait for a child to exit, polling every 100 ms up to `deadline`.
 /// Returns the exit status on success; kills + reaps the child on
 /// timeout so a stuck daemon doesn't outlive the test.
@@ -332,6 +340,8 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
                 "expected {name} in /metrics body: {body}",
             );
         }
+        let ack_at_boot = metric_u64(&body, "walshadow_emitter_ack_lsn")
+            .context("emitter_ack gauge in first scrape")?;
 
         // 6. Drive workload. The daemon filters user-heap WAL records
         //    (rmgr=HEAP, class=User → replaced with XLOG_NOOP) — only
@@ -368,6 +378,24 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
                 "workload psql failed: {}",
                 String::from_utf8_lossy(&out.stderr),
             );
+        }
+
+        // 6b. Null-tail watermark: the metrics-only pipeline's contiguous
+        //     ack must advance past the workload's commits — routed-nothing
+        //     seqs complete at placement, so a stalled gauge means the
+        //     degenerate tail wedged.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let body = http_get(metrics_addr, "/metrics").context("ack poll scrape")?;
+            let ack = metric_u64(&body, "walshadow_emitter_ack_lsn")
+                .context("emitter_ack gauge in poll scrape")?;
+            if ack > ack_at_boot {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                bail!("emitter_ack_lsn never advanced past boot value {ack_at_boot}");
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
 
         // 7. Wait for the daemon to hit `--max-segments=1` and exit
@@ -438,11 +466,11 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             "shadow's bs.t must stay empty — daemon filter should drop user-heap WAL",
         );
 
-        // 10. Daemon side-effects: cursor + at least one filtered
+        // 10. Daemon side-effects: manifest + at least one filtered
         //     segment file landed under --out-dir.
         assert!(
-            spill_dir.join("cursor.bin").exists(),
-            "cursor.bin should be written before clean exit",
+            spill_dir.join("manifest.toml").exists(),
+            "manifest.toml should be written before clean exit",
         );
         let seg_files: Vec<_> = fs::read_dir(&shadow_filter_dir)
             .expect("read filter dir")

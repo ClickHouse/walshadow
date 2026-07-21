@@ -9,18 +9,18 @@ digraph timeline_restart {
 
   // ═════ A. clean restart (SIGTERM) ═════
   subgraph cluster_a {
-    label="A. clean restart  (SIGTERM, cursor flushed, slot inside wal_keep_size)";
+    label="A. clean restart  (SIGTERM, saved restart point still available)";
     style="rounded,filled"; color="#A1A9CC"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     a0 [label="① SIGTERM", fillcolor="#403a36"];
-    a1 [label="② drain in-flight work\npipeline join: batcher final flush →\ninserters EndOfStream → ack", fillcolor="#4D3A28"];
-    a2 [label="③ DirSegmentSink::on_partial_segment\n<seg>.partial", fillcolor="#4D3340"];
-    a3 [label="④ cursor::write final state\n(emitter_ack_lsn, drain_lsn, …)", fillcolor="#4D3A28"];
+    a1 [label="② save partial WAL segment", fillcolor="#4D3340"];
+    a2 [label="③ drain queued work\nand finish ClickHouse writes", fillcolor="#4D3A28"];
+    a3 [label="④ latest manifest remains\nconservative restart point", fillcolor="#4D3A28"];
     a4 [label="⑤ process exit", fillcolor="#403a36"];
-    a5 [label="⑥ restart:\ncursor::read → segment-aligned resume_lsn\nload toast_retires.bin\nflush entries below resume floor", fillcolor="#4D3A28"];
+    a5 [label="⑥ restart:\ncheck source identity\nload manifest.toml + toast_retires.toml\nresume from saved point", fillcolor="#4D3A28"];
     a6 [label="⑦ Shadow::start in recovery mode\n(if not already running)", fillcolor="#3D4128"];
     a7 [label="⑧ walsender listener up\nbefore walreceiver connects", fillcolor="#4D3340"];
-    a8 [label="⑨ SourceFeed open\nSTART_REPLICATION PHYSICAL <resume_lsn>", fillcolor="#4D3A28"];
+    a8 [label="⑨ resume source WAL stream\nfrom saved point", fillcolor="#4D3A28"];
     a9 [label="⑩ records re-flow\nCH ReplacingMergeTree(_lsn) dedups", fillcolor="#4D4128"];
 
     a0 -> a1 -> a2 -> a3 -> a4 -> a5 -> a6 -> a7 -> a8 -> a9;
@@ -28,16 +28,16 @@ digraph timeline_restart {
 
   // ═════ B. kill -9 mid-stream ═════
   subgraph cluster_b {
-    label="B. kill -9 mid-stream  (last fsynced cursor authoritative)";
+    label="B. kill -9 mid-stream  (last saved manifest authoritative)";
     style="rounded,filled"; color="#CBA85E"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     b0 [label="① kill -9 (no drain)", fillcolor="#403a36"];
-    b1 [label="② OS reaps process\nbuffers lost; cursor.bin = last fsync\nspill files on disk\npartial segment write rolled back", fillcolor="#4D3A28"];
-    b2 [label="③ restart:\nspill::clear() wipes xid-*.bin\ntoast_retires.bin survives", fillcolor="#4D3A28"];
-    b3 [label="④ cursor::read\nresume_lsn = segment-aligned emitter_ack\nflush due toast mirror retires", fillcolor="#4D3A28"];
+    b1 [label="② OS reaps process\nmemory lost; last complete manifest survives\npartial manifest write ignored", fillcolor="#4D3A28"];
+    b2 [label="③ restart:\nclear transaction spill files\nkeep toast_retires.toml", fillcolor="#4D3A28"];
+    b3 [label="④ check source identity\nresume from saved restart point\nflush safe mirror retirements", fillcolor="#4D3A28"];
     b4 [label="⑤ shadow PG recovers on its own\nwalreceiver retry timer", fillcolor="#3D4128"];
     b5 [label="⑥ shadow asks START_REPLICATION\nPHYSICAL <its flush_lsn>", fillcolor="#3D4128"];
-    b6 [label="⑦ walshadow honours both:\n• upstream feed at resume_lsn\n• shadow feed at shadow's flush_lsn", fillcolor="#4D3A28"];
+    b6 [label="⑦ resume source from saved point\nresume shadow from its own progress", fillcolor="#4D3A28"];
     b7 [label="⑧ overlap records replayed\nCH dedups on _lsn\nshadow apply monotonic", fillcolor="#4D4128"];
     b8 [label="⑨ steady-state reached", fillcolor="#4D3A28"];
 
@@ -55,7 +55,7 @@ digraph timeline_restart {
     c3 [label="④ operator re-invokes\n--bootstrap-mode=direct\n(or object_store)", fillcolor="#403a36"];
     c4 [label="⑤ greenfield bootstrap path\n(→ timeline_bootstrap)", fillcolor="#4D3A28"];
     c5 [label="⑥ shadow data dir wiped\nor diverted to fresh dir", fillcolor="#3D4128"];
-    c6 [label="⑦ new cursor.bin written\nat end_lsn", fillcolor="#4D3A28"];
+    c6 [label="⑦ first status update saves\nnew manifest.toml", fillcolor="#4D3A28"];
     c7 [label="⑧ steady-state reached", fillcolor="#4D4128"];
 
     c0 -> c1 -> c2 -> c3 -> c4 -> c5 -> c6 -> c7;
@@ -65,24 +65,10 @@ digraph timeline_restart {
   a0 -> b0 [style=invis, weight=100];
   b0 -> c0 [style=invis, weight=100];
 
-  // ═════ cursor.bin reference table ═════
-  cursor_table [shape=plaintext, label=<
-    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">
-      <TR><TD COLSPAN="4" BGCOLOR="#4D3850"><B>cursor.bin — 6 LSN fields (schema v2)</B></TD></TR>
-      <TR BGCOLOR="#34302c">
-        <TD><B>field</B></TD><TD><B>writer</B></TD><TD><B>role on restart</B></TD><TD><B>role in slot advance</B></TD>
-      </TR>
-      <TR><TD>source_received_lsn</TD><TD>SourceFeed::pump</TD><TD>observational</TD><TD>write LSN</TD></TR>
-      <TR><TD>filter_durable_lsn</TD><TD>DirSegmentSink::on_segment</TD><TD>archive coverage</TD><TD>flush LSN</TD></TR>
-      <TR><TD>shadow_replay_lsn</TD><TD>retention_sweeper</TD><TD>bounds segment trim</TD><TD>caps apply LSN</TD></TR>
-      <TR><TD>drain_lsn</TD><TD>XactBuffer::commit</TD><TD>observational</TD><TD>—</TD></TR>
-      <TR><TD><B>emitter_ack_lsn</B></TD><TD>pipeline ack collector (contiguous-done)</TD><TD><B>resume_lsn source</B></TD><TD><B>caps apply LSN</B></TD></TR>
-      <TR><TD>shadow_flush_lsn</TD><TD>walsender rx 'r' aggregate</TD><TD>streaming-fed shadow resumes here</TD><TD>—</TD></TR>
-    </TABLE>
-  >];
-  a9 -> cursor_table [style=invis];
-  b8 -> cursor_table [style=invis];
-  c7 -> cursor_table [style=invis];
+  manifest [label="manifest.toml\nsource identity + saved restart point\nrecent pipeline progress", fillcolor="#4D3850", shape=note];
+  a9 -> manifest [style=invis];
+  b8 -> manifest [style=invis];
+  c7 -> manifest [style=invis];
 
   // ═════ Legend ═════
   legend [shape=plaintext, label=<
@@ -99,5 +85,5 @@ digraph timeline_restart {
       <TR><TD><FONT COLOR="#BD8183"><B>━</B></FONT></TD><TD>C. WAL overflow → re-bootstrap</TD></TR>
     </TABLE>
   >];
-  cursor_table -> legend [style=invis];
+  manifest -> legend [style=invis];
 }

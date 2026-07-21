@@ -93,7 +93,7 @@ on the backfiller (`src/copy_backfill.rs`); visibility gate in
   (`PassContext`, [emitter.md](emitter.md) Memory budget). Regime A
   ([config.md](config.md) §Failure containment) holds: a failed pass
   leaves every entry pending in the ledger, never poisons the pump
-- **Ledger.** `backfills.json` entries carry `mode` (absent ⇒ `copy`) and the
+- **Ledger.** `backfills.toml` entries carry `mode` (absent ⇒ `copy`) and the
   staging-swap phase (`swapped` + staging uuid, §Staging swap); boot re-runs
   the recorded mode at the recorded `S` — or resumes the swap tail — the
   config row's current mode applies only to a fresh entry. Dedup keeps
@@ -162,11 +162,12 @@ nothing replays `[start_lsn, end_lsn]`.
    set; rows tag `_lsn = min(B_redo, S)` per rel; the gate resolves deferred
    tuples against backup pg_xact + patch at successful walk EOF
 4. **Gap replay.** The fetched segments drive the shared decode path
-   (`BufferingDecoderSink` + `XactRecordSink`, so subxacts, TOAST reassembly
-   and update/delete decode match the hot path) over records whose block-0
-   rfn is in the filter set; committed rows ship at real commit LSNs through
-   the same insert tail, continuing the walk's seq space. Commits `≤ B_redo`
-   drop (the walked copy carries them); commits `> S` drop per rel — the live
+   (`BufferingDecoderSink` + `ReplaySink` over `drain_committed` +
+   `into_walk`, so subxacts, TOAST reassembly and update/delete decode
+   match the hot path) over records whose block-0 rfn is in the filter
+   set; committed rows ship at real commit LSNs through the same insert
+   tail, continuing the walk's seq space. Commits `≤ B_redo` drop (the
+   walked copy carries them); commits `> S` drop per rel — the live
    stream owns them (dedup absorbs overlap regardless)
 
 Convergence: walk EOF + gap replay reaching `S`. As with COPY, completion is

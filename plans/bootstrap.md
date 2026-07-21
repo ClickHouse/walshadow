@@ -61,12 +61,12 @@ for rendered diagram. Five clusters top→bottom:
    `primary_conninfo`. Daemon empties `postgresql.auto.conf`, starts
    shadow with `start_with_floor_retry`, waits for `end_lsn` with
    `wait_for_replay`, then supervises it (see [shadow.md](shadow.md))
-5. **Cursor + WAL pump start** — `cursor::write` lands
-   `emitter_ack_lsn = end_lsn` atomically, `SourceFeed` opens
-   `START_REPLICATION PHYSICAL <slot> <end_lsn>`, steady-state emitter
-   (now backed by live `ShadowCatalog`) takes over. `bootstrap_end_lsn`
-   wins over any prior `cursor.bin` value on start-LSN selection chain
-   (`--start-lsn` still wins for recovery drills)
+5. **Manifest + WAL pump start** — the ack atomic seeds at `end_lsn`
+   (first status tick persists it to `manifest.toml`), `SourceFeed`
+   opens `START_REPLICATION PHYSICAL <slot> <end_lsn>`, steady-state
+   emitter (now backed by live `ShadowCatalog`) takes over.
+   `bootstrap_end_lsn` wins over any prior manifest value on start-LSN
+   selection chain (`--start-lsn` still wins for recovery drills)
 
 Phases 1-3 run synchronously inside `run_bootstrap`; phases 4-5 hand off
 to daemon's main loop
@@ -470,8 +470,8 @@ listener used later by `ShadowCatalog`
   steady-state WAL records
 - [decoder.md](decoder.md) — `decode_block_data` dispatch shared with
   WAL hot path
-- [ops.md](ops.md) — cursor advance ordering, `bootstrap_end_lsn` wins
-  over `cursor.bin` on start-LSN selection
+- [ops.md](ops.md) — manifest advance ordering, `bootstrap_end_lsn`
+  wins over the manifest floor on start-LSN selection
 - [future/parked.md](future/parked.md) — deferred bootstrap items:
   TOAST cross-archive reassembly, LocalDir source, delta-chain support
   on `ObjectStoreSource`, per-chunk resume mid-bootstrap, air-gapped

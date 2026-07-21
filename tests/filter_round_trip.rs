@@ -205,7 +205,7 @@ async fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
     );
     assert_eq!(
         switch_entry.kind,
-        walshadow::manifest::Kind::Kept,
+        walshadow::filter::manifest::Kind::Kept,
         "XLOG_SWITCH must be kept (special rmgr policy)",
     );
 }

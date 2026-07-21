@@ -25,7 +25,7 @@ use walrus::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
 };
 
-use walshadow::manifest::Kind;
+use walshadow::filter::manifest::Kind;
 use walshadow::record::Route;
 use walshadow::record::{
     CollectingRecordSink, CollectingSegmentSink, CompositeRecordSink, Record, RecordSink, SinkError,

@@ -132,10 +132,6 @@ feedback advances on ([emitter.md](emitter.md))
 S. Observability only, nothing gates on it
 ([add_table.md](add_table.md))
 
-**cursor / `cursor.bin`** — 64-byte durable file in spill dir persisting
-six LSNs + CRC across `kill -9`, written by atomic rename;
-`emitter_ack_lsn` is the load-bearing resume LSN ([ops.md](ops.md))
-
 **DdlApplicator** — applies SchemaEvents to CH in source-LSN order
 inside the barrier, own connection, no retry (error trips Fatal); also
 runs TRUNCATE and gated DROP per DropTableStrategy
@@ -169,9 +165,9 @@ births/deaths, chunk maps, and ordered events; `drain_committed` yields
 `CommittedDrain`, whose bounded `DrainedBatch` slices feed reorder
 coordinator ([xact.md](xact.md))
 
-**drain_lsn** — cursor LSN advancing before `on_xact_end` ack;
-`drain_lsn > emitter_ack_lsn` gap is how an observer failure surfaces
-([xact.md](xact.md))
+**drain_lsn** — manifest LSN advancing at drain, ahead of durability;
+the gap against the ack collector's `emitter_ack` is how a stalled tail
+surfaces ([xact.md](xact.md))
 
 **DrainEntry** — ordered control item: Catalog / Config / ToastBarrier.
 Heaps merge beside control items; catalog-before-heap tie-break at equal
@@ -229,8 +225,8 @@ completeness (records cannot precede creation), its LSN the `O` as-of
 point for the rewrite barrier. A toast resolution without one fails
 closed ([TOAST.md](TOAST.md))
 
-**greenfield** — fresh attach, no cursor on disk; bootstrap scenario and
-resume fallback when cursor read fails
+**greenfield** — fresh attach, no manifest on disk; bootstrap scenario
+and resume fallback when manifest parse fails
 ([bootstrap.md](bootstrap.md), [ops.md](ops.md))
 
 **heap decoder** — in-tree WAL heap-tuple decoder
@@ -269,7 +265,7 @@ throttling `sweep_dropped` ([filter.md](filter.md),
 **keep-fraction** — share of records filter keeps: ~0.04% steady OLTP,
 8%+ in DDL-heavy windows ([filter.md](filter.md))
 
-**ledger (`backfills.json`)** — durable record of backfills with mode
+**ledger (`backfills.toml`)** — durable record of backfills with mode
 and S; boot re-runs recorded mode at recorded S, `_lsn` dedup keeps
 re-runs idempotent ([add_table.md](add_table.md))
 
@@ -283,7 +279,12 @@ continuous WAL coverage of the rel begins, never later, so they lose to
 every WAL-delivered mutation the walked state doesn't reflect
 ([add_table.md](add_table.md))
 
-**manifest** — per-segment sidecar indexing record
+**manifest / `manifest.toml`** — durable TOML file in spill dir
+persisting six LSNs, resolved floor, and source identity across
+`kill -9`, written by atomic rename; the floor is the load-bearing
+resume LSN = decode floor = GC cut ([ops.md](ops.md))
+
+**manifest (segment)** — per-segment sidecar indexing record
 `{offset, len, rmid, info, kind}` plus filter stats
 ([filter.md](filter.md))
 
@@ -544,9 +545,9 @@ chunks so reassembly doesn't depend on WAL adjacency: `disabled`
 rewrite) the mirror is emptied but never CH-dropped: a crash-replay
 re-emit detoasts before the mapping lookup, and fetch against a dropped
 mirror is `MissingMirror` (fatal) where an empty one superseded-fills.
-Deferred until the persisted resume cursor's segment passes the dropping
+Deferred until the persisted resolved floor passes the dropping
 commit — a same-`_lsn` replayed fill wouldn't dedup against its durable
-original. Queue persists in the `toast_retires.bin` ledger (fsynced at
+original. Queue persists in the `toast_retires.toml` ledger (fsynced at
 enqueue, before the dropping commit's ack) so a stop inside the wait
 window can't orphan the wipe: pipeline standup flushes entries whose
 drop resume never replays; counted `toast_mirror_retires` at execution

@@ -33,7 +33,7 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
 - [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
   / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
   shared insert tail
-- [ops.md](ops.md) — preflight, metrics, retention, cursor file (v2,
+- [ops.md](ops.md) — preflight, metrics, retention, manifest (floor,
   6 LSNs), standby-status triple, kill-restart drill
 - [oracle.md](oracle.md) — differential decode oracle, walshadow PG
   extension, `--validate` sampling

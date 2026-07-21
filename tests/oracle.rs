@@ -14,10 +14,9 @@
 //!    the returned text matches PG's `typoutput`. Skipped silently
 //!    when the extension isn't installed (the harness probes
 //!    `walshadow_decode_disk` in `pg_proc` and returns a skip).
-//! 3. `oracle_observer_resolves_pg_pending_to_text` — drives an
-//!    `OracleObserver` over a `CollectingTupleObserver` with a
-//!    `PgPending` column, asserts the resolved tuple downstream
-//!    carries a `Text` value matching PG's representation.
+//! 3. `oracle_resolves_pg_pending_to_text` — runs the decode pool's
+//!    `resolve_pending_tuple` over a `PgPending` column, asserts the
+//!    resolved tuple carries a `Text` value matching PG's representation.
 
 use std::fs;
 use std::process::Command;
@@ -26,9 +25,8 @@ use std::time::Duration;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::codecs;
-use walshadow::decoder_sink::{CollectingTupleObserver, TupleObserver};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
-use walshadow::oracle::{Oracle, OracleObserver};
+use walshadow::oracle::{Oracle, resolve_pending_tuple};
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
@@ -219,7 +217,7 @@ async fn oracle_with_extension_resolves_tier3_disk_bytes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_observer_resolves_pg_pending_to_text() {
+async fn oracle_resolves_pg_pending_to_text() {
     if !pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
@@ -243,13 +241,9 @@ async fn oracle_observer_resolves_pg_pending_to_text() {
     );
     let oracle = Arc::new(Oracle::connect(&conninfo, 0).await.expect("oracle connect"));
 
-    // Wire one PgPending column (numeric 42) through the OracleObserver.
-    // Inner: a CollectingTupleObserver that lets us inspect the
-    // mutated tuple the inner observer sees.
-    let inner = CollectingTupleObserver::default();
-    let mut wrapped = OracleObserver::new(oracle.clone(), inner);
-
-    let committed = CommittedTuple {
+    // Wire one PgPending column (numeric 42) through the decode pool's
+    // resolution path.
+    let mut committed = CommittedTuple {
         decoded: DecodedHeap {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -271,11 +265,11 @@ async fn oracle_observer_resolves_pg_pending_to_text() {
         commit_ts: 0,
         commit_lsn: 0,
     };
-    wrapped.on_tuple(&committed).await.unwrap();
+    if let Some(t) = committed.decoded.new.as_mut() {
+        resolve_pending_tuple(&oracle, &mut t.columns).await;
+    }
 
-    let inner = wrapped.inner_mut();
-    assert_eq!(inner.tuples.len(), 1);
-    let new = inner.tuples[0].decoded.new.as_ref().unwrap();
+    let new = committed.decoded.new.as_ref().unwrap();
     match &new.columns[0] {
         Some(ColumnValue::Text(s)) => assert_eq!(s, "42"),
         other => panic!("expected Text(\"42\"), got {other:?}"),

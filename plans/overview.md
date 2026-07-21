@@ -105,12 +105,13 @@ Component docs live alongside this overview:
 - [bootstrap.md](bootstrap.md) — greenfield path:
   `backup_source_direct` + `backup_source_object_store`,
   `backup_page_walk`, `MultiplexSink` fanning to shadow's data dir and
-  CH simultaneously, `backfill_bootstrap` orchestrator, cursor handoff
+  CH simultaneously, `backfill_bootstrap` orchestrator, resume handoff
   to streaming pump at `end_lsn`
 - [ops.md](ops.md) — `preflight` boot-time validators, Prom metrics
-  scrape, `tracing_subscriber`, segment `retention`, `cursor` file
-  (v2, six LSNs), durable TOAST retirement ledger, per-xact
-  `commit_lsn` carrier, slot advance on `min(shadow_replay, emitter_ack)`
+  scrape, `tracing_subscriber`, segment `retention`, resume
+  `manifest.toml` (six LSNs + resolved floor + source identity),
+  durable TOAST retirement ledger, per-xact `commit_lsn` carrier, slot
+  advance on `min(shadow_replay, emitter_ack)`
 - [oracle.md](oracle.md) — differential decode oracle: re-encode +
   `SELECT $1::bytea::<typ>::text` round-trip against shadow,
   `--validate <N>` sampling, walshadow PG extension (`pgext/`) exposing
@@ -222,7 +223,7 @@ Tracked in [`plans/future/`](future/INDEX.md):
 - **Two-phase commit.** `XLOG_XACT_PREPARE` ignored; `PREPARE` ↔
   `COMMIT PREPARED` across daemon restarts can lose prepared writes
 - **CH-server-bounce recovery.** Bounded retry; expired budget kills
-  daemon, cursor file resumes on restart
+  daemon, manifest resumes on restart
 
 Speculative, not committed:
 [future/shadow_schema_export.md](future/shadow_schema_export.md) (ship

@@ -1,9 +1,10 @@
 # xact — per-xid buffer, spill backend, subxact tracker
 
-Lives in [`src/xact_buffer.rs`](../src/xact_buffer.rs) +
-[`src/spill.rs`](../src/spill.rs). Sits between decoder fan-out (see
-[decoder.md](decoder.md)) and commit-drain observer (see
-[emitter.md](emitter.md)). Source record stream: see [source.md](source.md)
+Lives in [`src/xact/xact_buffer.rs`](../src/xact/xact_buffer.rs) +
+[`src/xact/spill.rs`](../src/xact/spill.rs). Sits between decoder
+fan-out (see [decoder.md](decoder.md)) and the reorder coordinator's
+commit drain (see [emitter.md](emitter.md)). Source record stream: see
+[source.md](source.md)
 
 ## Purpose
 
@@ -200,8 +201,8 @@ unrecoverable anyway
 v4 added raw stashed records.
 Version mismatch is near-academic anyway: resume contract wipes spill
 dir on startup
-([`SpillStore::clear`]) and cursor file guarantees on-disk state is
-always "drained into CH" or "replayable from `decoder_lsn`"
+([`SpillStore::clear`]) and manifest guarantees on-disk state is
+always "drained into CH" or "replayable from the floor"
 
 Sibling file families share the dir and the startup wipe: per-drain
 TOAST body spools (`toastbody-{xid:010}-{commit_lsn:016X}.bin`, raw
@@ -228,14 +229,15 @@ fresh config-surface decision
 
 ## Drain shape
 
-Two consumers exist for commit drain: parallel pipeline's reorder
-coordinator (`pipeline/reorder.rs`, with `--ch-config`) pulls bounded
-`DrainedBatch` slices from `CommittedDrain`, dispatching heaps to decode
-pool while applying store rows and ordered barriers; ack collector tracks
-durability (see [emitter.md](emitter.md)). Serial
-`XactRecordSink` → `TupleObserver` path (metrics-only runs, inproc
-harness). The observer-ack semantics below describe the serial path;
-the pipeline replaces them with the contiguous-done watermark
+One consumer exists for commit drain: the pipeline's reorder
+coordinator (`pipeline/reorder.rs`) pulls bounded `DrainedBatch` slices
+from `CommittedDrain`, dispatching heaps to decode pool while applying
+store rows and ordered barriers; ack collector tracks durability (see
+[emitter.md](emitter.md)). Metrics-only runs use the same coordinator
+over a null tail; backup gap replay drives `drain_committed` through
+its own serial `ReplaySink`. Every consumer walks a slice via
+`DrainedBatch::into_walk` — the single implementation of the
+events/truncate cursor interleave
 
 Each slice seals accumulated chunks into an immutable
 `ChunkGeneration` shared by `Arc` (the drain and every later slice's
@@ -250,19 +252,16 @@ spill + spool files after dispatch; an error path drops instead,
 leaving files for inspection (startup wipe + redecode-from-ack cover
 replay)
 
-`drain_lsn` advances BEFORE `on_xact_end` ack so an observer failure
-leaves `drain_lsn > emitter_ack_lsn`, exactly the gap cursor file
-surfaces. `emitter_ack_lsn` lags whenever the CH emitter holds rows
-buffered under `flush_timeout > 0`. Both snapshot back into cursor file
-maintained by [ops.md](ops.md)
+`drain_lsn` advances at `drain_committed`, ahead of durability — the
+gap against the ack collector's `emitter_ack` (which lags by up to one
+flush window) is exactly what the manifest surfaces. Both snapshot into
+the manifest maintained by [ops.md](ops.md)
 
-Idle ticks keep the ack moving without a commit: `advance_idle(lsn,
-ack_ceiling)` lifts `drain_lsn` to the dispatched `lsn` but
-`emitter_ack_lsn` only to `min(lsn, ack_ceiling)` — the observer's
-durable horizon (`idle_ack_ceiling`), so a quiescent nudge can't promote
-the ack past rows still buffered in the emitter. `note_idle_durable(lsn)`
-folds a deadline-triggered close's durable LSN into `emitter_ack_lsn`
-alone. Both no-op while a xact is in flight
+Idle ticks keep the marks moving without a commit: `advance_idle(lsn)`
+lifts `drain_lsn` to the dispatched `lsn`; the ack side rides the
+reorder's `AckHandle::trailing`, which advances only when every
+registered seq is done and the buffer is empty. Both no-op while a
+xact is in flight
 
 `XactBufferStats::summary` renders `xact_active`, `bytes_in_mem`,
 `spill_active`, `spill_bytes`, `commit`, `abort` always; appends
@@ -272,8 +271,8 @@ alone. Both no-op while a xact is in flight
 ## Drain entries and batch cursors
 
 Catalog events arrive via `BufferingDecoderSink::drain_schema_events`
-after every `relation_at` and via
-`XactRecordSink::route_pending_schema_events` after every
+after every `relation_at` and via the reorder coordinator's
+`route_pending_schema_events` after every
 `ShadowCatalog::sweep_dropped`. Both push into
 `XactState.events` as `DrainEntry::Catalog`, keyed on same
 `(xid, source_lsn)` triggering record carried. Runtime config changes
@@ -286,16 +285,15 @@ refetch is lazy), the two share an LSN; routing catalog first lands
 applicator's `ALTER` on CH before dependent INSERT encodes against
 post-DDL shape
 
-Parallel drain records each event as `OrderedEvent { heap_idx, row_idx,
-event }` in `DrainedBatch.ordered_events`. `heap_idx` orders control
-events against heaps; `row_idx` orders TOAST mirror births/deaths before
-each control event. `truncate_rows` supplies equivalent row cursors for
-`HeapOp::Truncate`. Serial path flushes pending events via
-`observer.on_schema_event(&ev)` before each
-`observer.on_tuple(&committed)` whose index it sorts in front of;
-trailing events (no heap after) flush at tail. Pipeline path walks the
-same positions as barrier segments, puts store rows through each cursor,
-then fences and applies each event (see [emitter.md](emitter.md))
+Drain records each event as `OrderedEvent { heap_idx, row_idx, event }`
+in `DrainedBatch.ordered_events`. `heap_idx` orders control events
+against heaps; `row_idx` orders TOAST mirror births/deaths before each
+control event. `truncate_rows` supplies equivalent row cursors for
+`HeapOp::Truncate`. `DrainedBatch::into_walk` compiles the three
+cursors into one `WalkStep` sequence (`Rows` seals store rows before
+each `Event`/`Truncate`, once at the tail); the reorder barrier fences
+and applies each step (see [emitter.md](emitter.md)), gap replay ships
+`Heap` steps and ignores catalog/config events
 
 Cross-link: [shadow.md](shadow.md) `SchemaEvent` channel, fed by
 `ShadowCatalog` on Added / Changed / Dropped catalog state
@@ -315,7 +313,7 @@ drivers) will silently lose prepared writes across walshadow restart
 between `PREPARE` and `COMMIT PREPARED`. Cross-link
 [future/two_phase_commit.md](future/two_phase_commit.md)
 
-`XactRecordSink` processes `COMMIT_PREPARED` / `ABORT_PREPARED`
+`ReorderSink` processes `COMMIT_PREPARED` / `ABORT_PREPARED`
 inline — the gap is only cross-restart
 
 ## Cross-links
@@ -323,9 +321,9 @@ inline — the gap is only cross-restart
 - [decoder.md](decoder.md) — `DecodedHeap` producer + `BufferingDecoderSink`
 - [source.md](source.md) — `Record` stream entry, classifier
 - [emitter.md](emitter.md) — pipeline reorder coordinator consuming
-  commit drain (serial `TupleObserver` path on metrics-only runs)
+  commit drain (null tail on metrics-only runs)
 - [shadow.md](shadow.md) — `ShadowCatalog`, `SchemaEvent` channel
-- [ops.md](ops.md) — `--spill-dir`, cursor file `(drain_lsn,
-  emitter_ack_lsn)`
+- [ops.md](ops.md) — `--spill-dir`, manifest (`drain`, `emitter_ack`,
+  floor)
 - [future/two_phase_commit.md](future/two_phase_commit.md) — PREPARE ↔
   COMMIT PREPARED across restart

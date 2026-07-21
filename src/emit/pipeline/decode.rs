@@ -161,8 +161,8 @@ pub async fn decode_and_route(
             commit_lsn,
         };
         if let Some(oracle) = &ctx.oracle {
-            // Mirror OracleObserver::on_tuple: resolve PgPending via shadow PG
-            // extension, then fire the 1-in-N validator probe
+            // Resolve PgPending via shadow PG extension, then fire the 1-in-N
+            // validator probe
             if let Some(t) = committed.decoded.new.as_mut() {
                 resolve_pending_tuple(oracle, &mut t.columns).await;
             }

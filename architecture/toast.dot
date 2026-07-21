@@ -1,7 +1,7 @@
 // walshadow — TOAST resolution, ClickHouse mirror, and lifecycle
 //
 // regeneration spec:
-// sources of truth: plans/TOAST.md · src/toast.rs · src/toast_retire.rs · src/xact_buffer.rs · src/pipeline/{bootstrap,reorder,decode}.rs
+// sources of truth: plans/TOAST.md · src/toast/{resolver,toast_retire}.rs · src/xact/xact_buffer.rs · src/emit/pipeline/{bootstrap,reorder,decode}.rs
 // subsumes: plans/TOAST.md § Store / Lifecycle / Scope limits
 // quality bar:
 //   - in-xact fast path and store-backed slow path stay distinct
@@ -25,7 +25,7 @@ digraph toast {
 
     decode [label="BufferingDecoderSink\nmain heap → DecodedHeap\ntoast INSERT → ToastChunk\ntoast DELETE → ToastDelete\nTID + record LSN", fillcolor="#4D4128"];
     spill [label="XactBuffer / spill v4\nHeap | Chunk | ToastDelete | Raw\nabort discards", fillcolor="#4D4128"];
-    drain [label="CommittedDrain → DrainedBatch\nchunks: Arc<ChunkMap> generations\nnew_rows: births + tombstones\nordered row/event cursors", fillcolor="#4D4128"];
+    drain [label="committed transaction\nshared ordered walk keeps chunks,\nrows, and table changes together", fillcolor="#4D4128"];
     detoast [label="decode pool\ndetoast_heap\ntry in-xact ChunkMap first", fillcolor="#5D4628"];
     rows [label="main-table rows\ninline Text / Bytea / PgPending", fillcolor="#5D4628", shape=parallelogram];
 
@@ -73,8 +73,8 @@ digraph toast {
 
     trunc [label="owner TRUNCATE\nfence main rows\nTRUNCATE dest + mirror in slice", fillcolor="#5D4628"];
     drop [label="toast SchemaEvent::Dropped\nenqueue (relid, commit_lsn)", fillcolor="#5D4628"];
-    ledger [label="toast_retires.bin\nfsynced RetireLedger", fillcolor="#4D3850", shape=note];
-    floor [label="persisted resume floor\nsegment passes drop commit", fillcolor="#4D3A28"];
+    ledger [label="toast_retires.toml\nsaved retirements", fillcolor="#4D3850", shape=note];
+    floor [label="saved restart point\nhas passed drop", fillcolor="#4D3A28"];
     retire [label="retire_mirror\nTRUNCATE table, never DROP", fillcolor="#5D4628"];
     marker [label="XLOG_SMGR_CREATE marker\n+ SpillEntry::Raw stash\nresolve at commit", fillcolor="#5D4628"];
     barrier [label="rewrite_barrier O − B\nresidual tombstones @ commit LSN\nafter generation births", fillcolor="#5D4628"];
@@ -87,8 +87,8 @@ digraph toast {
   trunc -> mirror [label="wipe", color="#BF8C5F", style=dashed];
   retire -> mirror [label="wipe when replay-safe", color="#BF8C5F", style=dashed];
   barrier -> mirror [label="insert residual deaths", color="#BF8C5F", style=dashed];
-  drain -> trunc [label="truncate_rows cursor", style=dashed];
-  drain -> drop [label="ordered Dropped", style=dashed];
+  drain -> trunc [label="truncate step", style=dashed];
+  drain -> drop [label="drop step", style=dashed];
   decode -> marker [label="invisible generation", style=dashed];
 
   main [label="CH destination tables\nReplacingMergeTree(_lsn)", fillcolor="#4D4128", shape=cylinder];

@@ -75,7 +75,9 @@ pub struct WalChunk<'a> {
 pub struct StandbyStatus {
     /// `write_lsn` PG sees: WAL pump read + committed to store locally.
     pub write_lsn: u64,
-    /// `flush_lsn` PG sees: filter durably wrote out to segments.
+    /// `flush_lsn` PG sees: drives a physical slot's restart_lsn, so the
+    /// caller caps it at its persisted resume floor — source must retain
+    /// WAL a crash-now restart re-requests.
     pub flush_lsn: u64,
     /// `apply_lsn` PG sees: bounded by shadow replay LSN and CH emitter
     /// ack LSN, so source's slot won't recycle un-consumed WAL.
@@ -104,8 +106,10 @@ struct StatusFloors {
     apply: u64,
 }
 
-/// PG rejects a regressing flush/apply, so hold each field at its own
-/// high-water, independent of the others.
+/// PG assigns a physical slot's restart_lsn from flush unconditionally
+/// (`PhysicalConfirmReceivedLocation`), so a stale lower value walks the
+/// slot backwards, below recycled WAL it can read as invalidatable under
+/// max_slot_wal_keep_size. Hold each field at its own high-water.
 fn clamp_status(status: StandbyStatus, floors: &mut StatusFloors) -> (u64, u64, u64) {
     floors.write = status.write_lsn.max(floors.write);
     floors.flush = status.flush_lsn.max(floors.flush);
@@ -283,11 +287,9 @@ impl SourceFeed {
             .expect_copy_both_open()
             .await
             .map_err(WalSegmentRemoved::from_start_replication)?;
-        self.floors = StatusFloors {
-            write: start_lsn,
-            flush: start_lsn,
-            apply: start_lsn,
-        };
+        // Floors stay zero: they high-water values actually sent. Seeding at
+        // start_lsn would lift flush to the live resume position on reconnect,
+        // advancing source's slot past the caller's persisted floor.
         self.last_status = Instant::now();
         Ok(())
     }
@@ -365,8 +367,6 @@ impl SourceFeed {
     }
 
     async fn send_status(&mut self, status: StandbyStatus) -> Result<()> {
-        // PG treats a regressing flush/apply as a protocol violation
-        // and may force-disconnect; clamp_status holds per-field floors.
         let (write, flush, apply) = clamp_status(status, &mut self.floors);
         let payload = build_status_update(write, flush, apply);
         self.conn.send_copy_data(&payload).await?;

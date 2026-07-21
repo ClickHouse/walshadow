@@ -99,6 +99,44 @@ pub async fn spawn(
     spawn_with_config(emitter, inserter_pool_size, stats, emitter_ack, fatal, None).await
 }
 
+/// Metrics-only tail: ack collector + one swallow task, zero CH
+/// connections. Every routed row acks at swallow (permits release on
+/// drop) so nothing can pin the watermark; `FlushAll` replies
+/// immediately — nothing buffers. Keeps the placed/acked protocol
+/// identical to the CH tail, so reorder/decode stages run unchanged.
+pub fn spawn_null(emitter_ack: Arc<AtomicU64>) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
+    let (ack, collector) = ack::spawn(emitter_ack);
+    let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(256);
+    let swallow_ack = ack.clone();
+    let batcher = tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                BatcherMsg::Row(r) => swallow_ack.acked(vec![(r.seq, 1)]),
+                BatcherMsg::Rows(rows) => {
+                    let mut counts: std::collections::HashMap<u64, u64> =
+                        std::collections::HashMap::new();
+                    for r in &rows {
+                        *counts.entry(r.seq).or_insert(0) += 1;
+                    }
+                    swallow_ack.acked(counts.into_iter().collect());
+                }
+                BatcherMsg::FlushAll(reply) => {
+                    let _ = reply.send(());
+                }
+            }
+        }
+    });
+    (
+        msg_tx,
+        ack,
+        TailParts {
+            collector,
+            batcher,
+            inserters: Vec::new(),
+        },
+    )
+}
+
 /// [`spawn`] plus a live config receiver: the batcher re-reads
 /// budgets/flush and the inserter pool re-reads compression/retry from it on
 /// each republish. `None` == boot values only (bootstrap + tests use [`spawn`]).

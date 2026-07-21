@@ -27,9 +27,8 @@ use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{DecodedHeap, HeapOp};
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::EmitterStats;
-use crate::record::{Record, RecordSink, SinkError, WAL_SEG_SIZE};
+use crate::record::{Record, RecordSink, SinkError};
 use crate::schema::{SchemaEvent, SchemaEventRx};
-use crate::source::wal_stream::WalStream;
 use tracing::Instrument;
 
 use crate::decode::wal_xact::{
@@ -39,7 +38,7 @@ use crate::decode::wal_xact::{
 };
 use crate::ops::trace::TxnSpanRegistry;
 use crate::xact::xact_buffer::{
-    ChunkGeneration, DrainEntry, DrainedBatch, SubxactTracker, ToastRowBatch, XactBuffer,
+    ChunkGeneration, DrainEntry, DrainedBatch, SubxactTracker, ToastRowBatch, WalkStep, XactBuffer,
     drain_pending_schema_events,
 };
 
@@ -61,7 +60,9 @@ pub struct ReorderSink {
     /// only at the arming xact's own commit (see
     /// [`PendingSweeps`](crate::filter::catalog_tracker::PendingSweeps))
     pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
-    applicator: DdlApplicator,
+    /// `None` on the metrics-only (null-tail) configuration: schema events
+    /// and truncates are observed, never applied to CH
+    applicator: Option<DdlApplicator>,
     ack: AckHandle,
     jobs_tx: async_channel::Sender<DecodeJob>,
     /// Shared FIFO channel to the batcher; `FlushAll` here orders after
@@ -84,7 +85,9 @@ pub struct ReorderSink {
     /// ledger persists queue so a stop inside the wait window can't leak
     /// the mirror (resume never replays the drop)
     retires: RetireLedger,
-    /// Last durable resume cursor, 0 before first write
+    /// Persisted resolved floor (aligned, archive-clamped) — the position
+    /// a crash-now restart resumes from. Seeded at the resolved start,
+    /// advanced only after each manifest persist.
     resume_floor: Arc<AtomicU64>,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
@@ -110,7 +113,7 @@ impl ReorderSink {
         subxact_tracker: Arc<Mutex<SubxactTracker>>,
         schema_events: Option<SchemaEventRx>,
         pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
-        applicator: DdlApplicator,
+        applicator: Option<DdlApplicator>,
         ack: AckHandle,
         jobs_tx: async_channel::Sender<DecodeJob>,
         msg_tx: mpsc::Sender<BatcherMsg>,
@@ -190,17 +193,19 @@ impl ReorderSink {
         // backfill boundary `S` for an `initial_load` opt-in.
         match event {
             ConfigEvent::TableUpserted { rel, row } => {
-                crate::backfill::opt_in::apply_table_opt_in(
-                    &resolver,
-                    &mut self.applicator,
-                    &self.catalog,
-                    self.backfiller.as_ref(),
-                    rel,
-                    row,
-                    commit_lsn,
-                )
-                .await
-                .map_err(|e| SinkError::Other(format!("opt-in: {e}")))?;
+                if let Some(applicator) = self.applicator.as_mut() {
+                    crate::backfill::opt_in::apply_table_opt_in(
+                        &resolver,
+                        applicator,
+                        &self.catalog,
+                        self.backfiller.as_ref(),
+                        rel,
+                        row,
+                        commit_lsn,
+                    )
+                    .await
+                    .map_err(|e| SinkError::Other(format!("opt-in: {e}")))?;
+                }
             }
             ConfigEvent::TableRemoved { rel } => {
                 resolver.exclude_table(rel).await;
@@ -354,7 +359,10 @@ impl ReorderSink {
     }
 
     async fn apply_event(&mut self, event: &SchemaEvent, commit_lsn: u64) -> Result<(), SinkError> {
-        self.applicator
+        let Some(applicator) = self.applicator.as_mut() else {
+            return Ok(());
+        };
+        applicator
             .apply(event)
             .await
             .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))?;
@@ -363,13 +371,9 @@ impl ReorderSink {
         if let SchemaEvent::Added { desc } = event
             && let Some(resolver) = self.config_resolver.clone()
         {
-            crate::backfill::opt_in::materialize_pending_on_added(
-                &resolver,
-                &mut self.applicator,
-                desc,
-            )
-            .await
-            .map_err(|e| SinkError::Other(format!("opt-in materialize: {e}")))?;
+            crate::backfill::opt_in::materialize_pending_on_added(&resolver, applicator, desc)
+                .await
+                .map_err(|e| SinkError::Other(format!("opt-in materialize: {e}")))?;
         }
         // Immediate DROP wipe corrupts same-LSN replay fills. Ledger fsync
         // here precedes this commit's ack publication, so any persisted
@@ -386,18 +390,21 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Retire below aligned persisted floor
+    /// Retire below persisted resolved floor
     ///
-    /// Restart re-reads floor segment, DROP lock excludes later referrers.
+    /// Restart resumes at the floor, DROP lock excludes later referrers.
     /// Pub for boot: entries due at resume must retire during standup —
     /// their drop never replays, so no commit re-triggers this flush.
     /// Ledger removal persists after each wipe; a crash between re-runs
     /// an idempotent `TRUNCATE` on the emptied mirror
     pub async fn flush_due_retires(&mut self) -> Result<(), SinkError> {
-        if self.retires.is_empty() {
+        // Disabled resolver no-ops retire_mirror: flushing would drop ledger
+        // entries without wiping mirrors, leaking them for a later CH run
+        // over the same spill dir
+        if !self.resolver.stores_chunks() || self.retires.is_empty() {
             return Ok(());
         }
-        let cut = WalStream::align_down(self.resume_floor.load(Ordering::Acquire), WAL_SEG_SIZE);
+        let cut = self.resume_floor.load(Ordering::Acquire);
         for (oid, commit_lsn) in self.retires.due(cut) {
             self.resolver
                 .retire_mirror(oid)
@@ -444,6 +451,9 @@ impl ReorderSink {
     }
 
     async fn apply_truncate(&mut self, heap: &DecodedHeap) -> Result<(), SinkError> {
+        let Some(applicator) = self.applicator.as_mut() else {
+            return Ok(());
+        };
         let rel = match crate::catalog::shadow_catalog::resolve_at(
             &self.catalog,
             heap.rfn,
@@ -455,7 +465,7 @@ impl ReorderSink {
             Err(CatalogError::ForeignDatabase(_)) => return Ok(()),
             Err(e) => return Err(SinkError::from(DecoderSinkError::from(e))),
         };
-        self.applicator
+        applicator
             .truncate(&rel.rel_name)
             .await
             .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
@@ -495,7 +505,8 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Fence each apply after preceding data
+    /// Fence each apply after preceding data; step order owned by
+    /// [`DrainedBatch::into_walk`]
     async fn run_barrier_batch(
         &mut self,
         batch: DrainedBatch,
@@ -503,63 +514,43 @@ impl ReorderSink {
         commit_lsn: u64,
         permit: Option<Arc<crate::budget::MemoryPermit>>,
     ) -> Result<(), SinkError> {
-        let DrainedBatch {
-            heaps,
-            ordered_events,
-            chunks,
-            new_rows,
-            truncate_rows,
-            ..
-        } = batch;
+        let walk = batch.into_walk();
         let mut pending: Vec<DecodedHeap> = Vec::new();
-        let mut ev_cursor = 0usize;
         let mut rows_cursor = 0usize;
-        let mut trunc_cursor = 0usize;
-        for (heap_idx, heap) in heaps.into_iter().enumerate() {
-            while ev_cursor < ordered_events.len() && ordered_events[ev_cursor].heap_idx <= heap_idx
-            {
-                self.put_rows_to(
-                    &new_rows,
-                    &mut rows_cursor,
-                    ordered_events[ev_cursor].row_idx,
-                )
-                .await?;
-                self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks, &permit)
+        for step in walk.steps {
+            match step {
+                WalkStep::Rows { upto } => {
+                    self.put_rows_to(&walk.new_rows, &mut rows_cursor, upto)
+                        .await?;
+                }
+                WalkStep::Event(entry) => {
+                    self.dispatch_segment(
+                        &mut pending,
+                        commit_ts,
+                        commit_lsn,
+                        &walk.chunks,
+                        &permit,
+                    )
                     .await?;
-                self.barrier_fence().await?;
-                self.apply_drain_entry(&ordered_events[ev_cursor].event, commit_lsn)
+                    self.barrier_fence().await?;
+                    self.apply_drain_entry(&entry, commit_lsn).await?;
+                }
+                WalkStep::Truncate(heap) => {
+                    self.dispatch_segment(
+                        &mut pending,
+                        commit_ts,
+                        commit_lsn,
+                        &walk.chunks,
+                        &permit,
+                    )
                     .await?;
-                ev_cursor += 1;
-            }
-            if matches!(heap.op, HeapOp::Truncate) {
-                self.put_rows_to(&new_rows, &mut rows_cursor, truncate_rows[trunc_cursor])
-                    .await?;
-                trunc_cursor += 1;
-                self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks, &permit)
-                    .await?;
-                self.barrier_fence().await?;
-                self.apply_truncate(&heap).await?;
-            } else {
-                pending.push(heap);
+                    self.barrier_fence().await?;
+                    self.apply_truncate(&heap).await?;
+                }
+                WalkStep::Heap(heap) => pending.push(heap),
             }
         }
-        while ev_cursor < ordered_events.len() {
-            self.put_rows_to(
-                &new_rows,
-                &mut rows_cursor,
-                ordered_events[ev_cursor].row_idx,
-            )
-            .await?;
-            self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks, &permit)
-                .await?;
-            self.barrier_fence().await?;
-            self.apply_drain_entry(&ordered_events[ev_cursor].event, commit_lsn)
-                .await?;
-            ev_cursor += 1;
-        }
-        self.put_rows_to(&new_rows, &mut rows_cursor, new_rows.len())
-            .await?;
-        self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &chunks, &permit)
+        self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &walk.chunks, &permit)
             .await
     }
 
@@ -789,7 +780,7 @@ impl RecordSink for ReorderSink {
             let active = self.buffer.lock().await.stats().xacts_active;
             if active == 0 {
                 self.ack.trailing(lsn);
-                self.buffer.lock().await.advance_idle(lsn, lsn);
+                self.buffer.lock().await.advance_idle(lsn);
                 // Quiescent source never re-enters on_commit; retire due
                 // drops here so the flush doesn't wait for a later commit
                 self.flush_due_retires().await?;

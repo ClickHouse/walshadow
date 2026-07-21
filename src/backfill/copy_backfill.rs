@@ -36,7 +36,7 @@
 //!
 //! ## Resume ledger
 //!
-//! `{spill_dir}/backfills.json` persists per-qname `{s_lsn, done, mode}`. The
+//! `{spill_dir}/backfills.toml` persists per-qname `{s_lsn, done, mode}`. The
 //! opt-in's WAL event is not re-delivered after the ack passes `S`, so the
 //! ledger is what carries an unfinished backfill across a restart: boot
 //! re-seeds opt-ins from `config_table` and re-runs the *recorded* mode for
@@ -56,7 +56,6 @@ use std::time::Duration;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::StreamExt as _;
-use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, mpsc, watch};
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::conn::PgConfig;
@@ -82,7 +81,8 @@ use crate::schema::{
 use crate::source::source_feed::open_sql_client;
 use crate::toast::ToastResolver;
 
-const LEDGER_FILENAME: &str = "backfills.json";
+const LEDGER_FILENAME: &str = "backfills.toml";
+const LEDGER_VERSION: u32 = 1;
 
 /// Backup-mode opt-ins wait this long for siblings before the pass fires, so
 /// an opt-in burst (several rows in one xact, or a boot seed) coalesces into
@@ -94,12 +94,19 @@ const BACKUP_COALESCE_WINDOW: Duration = Duration::from_millis(1000);
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize, serde::Deserialize)]
+struct LedgerFile {
+    version: u32,
+    #[serde(default)]
+    backfill: Vec<LedgerEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct LedgerEntry {
     namespace: String,
     relname: String,
-    s_lsn: u64,
+    s_lsn: crate::source::manifest::Lsn,
     done: bool,
-    /// [`InitialLoadMode`] string; absent in pre-mode ledgers ⇒ `copy`
+    /// [`InitialLoadMode`] string; absent ⇒ `copy`
     #[serde(default = "default_ledger_mode")]
     mode: String,
     /// Backup-mode staging swap phase (plans/add_table.md §Staging swap):
@@ -136,74 +143,77 @@ struct Ledger {
 
 impl Ledger {
     async fn load(spill_dir: &Path) -> Self {
+        let mut ledger = Self {
+            dir: spill_dir.to_path_buf(),
+            entries: HashMap::new(),
+        };
         let path = spill_dir.join(LEDGER_FILENAME);
-        let entries = match tokio::fs::read(&path).await {
-            Ok(bytes) => match serde_json::from_slice::<Vec<LedgerEntry>>(&bytes) {
-                Ok(list) => list
-                    .into_iter()
-                    .map(|e| {
-                        // Only this daemon writes modes; an unparseable one
-                        // degrades to re-COPY like a corrupt ledger would
-                        let mode = InitialLoadMode::parse(&e.mode).unwrap_or(InitialLoadMode::Copy);
-                        (
-                            RelName::new(&e.namespace, &e.relname),
-                            LedgerRec {
-                                s_lsn: e.s_lsn,
-                                done: e.done,
-                                mode,
-                                swapped: e.swapped,
-                                staging_uuid: e.staging_uuid,
-                            },
-                        )
-                    })
-                    .collect(),
+        if let Ok(text) = tokio::fs::read_to_string(&path).await {
+            match toml::from_str::<LedgerFile>(&text) {
+                Ok(file) if file.version == LEDGER_VERSION => {
+                    ledger.entries = file
+                        .backfill
+                        .into_iter()
+                        .map(|e| {
+                            // Only this daemon writes modes; an unparseable one
+                            // degrades to re-COPY like a corrupt ledger would
+                            let mode =
+                                InitialLoadMode::parse(&e.mode).unwrap_or(InitialLoadMode::Copy);
+                            (
+                                RelName::new(&e.namespace, &e.relname),
+                                LedgerRec {
+                                    s_lsn: e.s_lsn.0,
+                                    done: e.done,
+                                    mode,
+                                    swapped: e.swapped,
+                                    staging_uuid: e.staging_uuid,
+                                },
+                            )
+                        })
+                        .collect();
+                }
+                // Degrades to re-COPY (idempotent), never to data loss
+                Ok(file) => {
+                    tracing::warn!(
+                        target: "walshadow::backfill",
+                        path = %path.display(),
+                        version = file.version,
+                        "backfill ledger version unsupported; treating as empty",
+                    );
+                }
                 Err(e) => {
-                    // Degrades to re-COPY (idempotent), never to data loss
                     tracing::warn!(
                         target: "walshadow::backfill",
                         path = %path.display(),
                         error = %e,
                         "backfill ledger unreadable; treating as empty",
                     );
-                    HashMap::new()
                 }
-            },
-            Err(_) => HashMap::new(),
-        };
-        Self {
-            dir: spill_dir.to_path_buf(),
-            entries,
+            }
         }
+        ledger
     }
 
-    /// Crash-safe persist: write+fsync `.tmp`, rename, fsync dir.
+    /// Crash-safe persist via [`crate::fs::write_atomic`].
     async fn persist(&self) -> std::io::Result<()> {
-        let list: Vec<LedgerEntry> = self
-            .entries
-            .iter()
-            .map(|(rel, rec)| LedgerEntry {
-                namespace: rel.namespace.to_string(),
-                relname: rel.name.to_string(),
-                s_lsn: rec.s_lsn,
-                done: rec.done,
-                mode: rec.mode.as_str().into(),
-                swapped: rec.swapped,
-                staging_uuid: rec.staging_uuid.clone(),
-            })
-            .collect();
-        let bytes = serde_json::to_vec(&list).expect("ledger serialize");
-        let tmp = self.dir.join(format!("{LEDGER_FILENAME}.tmp"));
-        let mut f = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .await?;
-        f.write_all(&bytes).await?;
-        f.sync_all().await?;
-        drop(f);
-        tokio::fs::rename(&tmp, self.dir.join(LEDGER_FILENAME)).await?;
-        crate::fs::fsync_dir(&self.dir).await
+        let file = LedgerFile {
+            version: LEDGER_VERSION,
+            backfill: self
+                .entries
+                .iter()
+                .map(|(rel, rec)| LedgerEntry {
+                    namespace: rel.namespace.to_string(),
+                    relname: rel.name.to_string(),
+                    s_lsn: crate::source::manifest::Lsn(rec.s_lsn),
+                    done: rec.done,
+                    mode: rec.mode.as_str().into(),
+                    swapped: rec.swapped,
+                    staging_uuid: rec.staging_uuid.clone(),
+                })
+                .collect(),
+        };
+        let text = toml::to_string(&file).expect("ledger serialize");
+        crate::fs::write_atomic(&self.dir, LEDGER_FILENAME, text.as_bytes()).await
     }
 
     fn pending_count(&self) -> u64 {
@@ -1413,22 +1423,5 @@ mod tests {
             corrupt.entries.is_empty(),
             "corrupt ledger degrades to re-COPY"
         );
-    }
-
-    /// Pre-mode ledger files (no `mode` field) load as `copy`.
-    #[tokio::test]
-    async fn ledger_defaults_missing_mode_to_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(
-            tmp.path().join(LEDGER_FILENAME),
-            br#"[{"namespace":"app","relname":"legacy","s_lsn":4096,"done":false}]"#,
-        )
-        .await
-        .unwrap();
-        let ledger = Ledger::load(tmp.path()).await;
-        let rec = ledger.entries.get(&RelName::new("app", "legacy")).unwrap();
-        assert_eq!(rec.mode, InitialLoadMode::Copy);
-        assert_eq!(rec.s_lsn, 4096);
-        assert!(!rec.done);
     }
 }

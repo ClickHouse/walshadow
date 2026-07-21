@@ -74,24 +74,24 @@ digraph timeline_bootstrap {
   }
   bs2 -> end4 [label="finish", lhead=cluster_p4, color="#A1A9CC"];
 
-  // ═════ ⑤ cursor + WAL pump start ═════
+  // ═════ ⑤ WAL streaming start ═════
   subgraph cluster_p5 {
-    label="⑤ cursor + WAL pump start  (→ steady-state)";
+    label="⑤ WAL streaming start  (→ steady-state)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    cur5   [label="cursor::write\nemitter_ack_lsn = end_lsn", fillcolor="#4D3A28"];
-    curd5  [label="cursor.bin\natomic rename + fsync", fillcolor="#4D3850", shape=note];
+    seed5  [label="use backup end as\nnew restart point", fillcolor="#4D3A28"];
+    manifest5 [label="manifest.toml\nsaved restart state", fillcolor="#4D3850", shape=note];
     feed5  [label="SourceFeed open\nSTART_REPLICATION\nPHYSICAL <end_lsn>", fillcolor="#4D3A28"];
     repl5  [label="streaming protocol\nopens at end_lsn", fillcolor="#3D3D54"];
     apply5 [label="pg_last_wal_replay_lsn ≥ end_lsn\nready for relation_at gate", fillcolor="#3D4128"];
     hot5   [label="hot streaming\n(pipeline: reorder → decode ×M\n→ same tail + DdlApplicator)\n→ timeline_streaming", fillcolor="#4D3A28", shape=cds];
 
-    cur5  -> curd5 [label="fsync"];
-    cur5  -> feed5;
+    seed5 -> feed5;
+    feed5 -> manifest5 [label="first status update", color="#b380b0", style=dotted];
     feed5 -> repl5 [label="START_REPLICATION", color="#A1A9CC", dir=both, arrowtail=open];
     feed5 -> hot5;
   }
-  out4 -> cur5  [label="next phase",  lhead=cluster_p5];
+  out4 -> seed5 [label="next phase", lhead=cluster_p5];
   shd4 -> apply5 [label="replay catches up", style=dashed, color="#869461"];
 
   // ═════ Legend ═════

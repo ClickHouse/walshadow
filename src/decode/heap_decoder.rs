@@ -296,7 +296,8 @@ pub enum HeapOp {
 }
 
 /// One drained tuple, fully reassembled. `commit_ts` is the commit-record
-/// `xact_time` carried through [`crate::xact::xact_buffer::XactBuffer::commit`].
+/// `xact_time` carried through
+/// [`crate::xact::xact_buffer::XactBuffer::drain_committed`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTuple {
     pub decoded: DecodedHeap,

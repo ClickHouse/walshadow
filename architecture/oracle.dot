@@ -26,9 +26,9 @@ digraph oracle {
     pend   [label="ColumnValue::PgPending\n{ type_oid, raw }\njsonb / array / range /\ntsvector / domain / vendor", fillcolor="#5D3F40"];
   }
 
-  // ════════ ② oracle observer ════════
+  // ════════ ② oracle decode path ════════
   subgraph cluster_oracle {
-    label="② oracle path (src/oracle.rs) — decode pool ×M calls directly; OracleObserver wraps the serial metrics-only path"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    label="② oracle path — ClickHouse decode workers call directly; metrics-only runs skip it"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     resolve  [label="resolve_pending_tuple\nwalk columns,\nPgPending → resolve_pending\nswap to Text on Ok(Some)", fillcolor="#5D3F40"];
     sampler  [label="Sampler::pick\nAtomicU64::fetch_add(Relaxed)\nrate == 0 short-circuits\nelse 1-in-N hit", fillcolor="#5D3F40", shape=parallelogram];
     validate [label="validate(type_oid, raw, local_text)\nPgPending only (raw present;\n local_text empty) —\nprobe = extension call succeeds\n+ returns text", fillcolor="#5D3F40"];
@@ -100,7 +100,7 @@ digraph oracle {
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill</B></TD></TR>
       <TR><TD BGCOLOR="#3D3D54" WIDTH="20"></TD><TD>CLI gate</TD></TR>
       <TR><TD BGCOLOR="#4D4128"></TD><TD>decoder ColumnValue</TD></TR>
-      <TR><TD BGCOLOR="#5D3F40"></TD><TD>oracle (src/oracle.rs)</TD></TR>
+      <TR><TD BGCOLOR="#5D3F40"></TD><TD>oracle (src/ops/oracle.rs)</TD></TR>
       <TR><TD BGCOLOR="#4D4D28"></TD><TD>libpq client (own pool)</TD></TR>
       <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow PG / extension</TD></TR>
       <TR><TD BGCOLOR="#4D3850"></TD><TD>pgext/ build artifact</TD></TR>

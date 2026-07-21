@@ -2,8 +2,8 @@
 
 Operational scaffolding for production deployment. Four sibling
 surfaces: preflight validators, HTTP/Prom metrics, filtered-segment
-retention, durable cursor file. None touches decoder fidelity; job is
-to make long-running daemon survivable, observable, resumable
+retention, durable resume manifest. None touches decoder fidelity; job
+is to make long-running daemon survivable, observable, resumable
 
 ## Purpose
 
@@ -13,10 +13,10 @@ to make long-running daemon survivable, observable, resumable
   occupancy as Prom text so operators see lag before CH does
 - Retain filtered segments below shadow's replay head for configurable
   debug window, drop older ones to bound disk
-- Persist resume state (six LSNs + CRC) across `kill -9` so daemon
-  restart hands source's slot byte-identical write/flush/apply triple,
-  and `cargo test --test kill_restart` proves end-state parity over 15
-  seeded kill/restart cycles
+- Persist resume state (six LSNs + resolved floor + source identity)
+  across `kill -9` so daemon restart hands source's slot byte-identical
+  write/flush/apply triple, and `cargo test --test kill_restart` proves
+  end-state parity over 15 seeded kill/restart cycles
 
 ## Preflight validators
 
@@ -70,8 +70,7 @@ Inventory by category:
   shared with retention sweeper via one `Arc<AtomicU64>`
 - `walshadow_decoder_commit_lsn` — wired to `XactBufferStats.drain_lsn`
 - `walshadow_emitter_ack_lsn` — pipeline ack collector's atomic
-  (contiguous-done watermark, see [emitter.md](emitter.md)); falls back
-  to `XactBufferStats.emitter_ack_lsn` on the metrics-only serial path
+  (contiguous-done watermark, see [emitter.md](emitter.md))
 
 ### Counters
 
@@ -202,7 +201,10 @@ Sweeper task in `bin/stream.rs` runs every
 `DEFAULT_TRIM_INTERVAL = 30s`. It reads replay LSN from
 `pg_last_wal_replay_lsn()` and last restartpoint REDO LSN from
 `pg_control_checkpoint()`, then computes
-`cutoff_lsn = min(replay_lsn - retention_bytes, redo)`. Restarted
+`cutoff_lsn = manifest::retention_cutoff(replay, retention_bytes, redo)
+= min(replay_lsn - retention_bytes, redo)` — shadow-recovery domain,
+distinct from the manifest floor but owned by the same module so every
+LSN-cut rule lives on one page. Restarted
 shadow recovers from restartpoint, not current replay position, so
 `restore_command` must still find those segments. A failed query
 closes client and reconnects on next cycle because daemon may restart
@@ -218,16 +220,16 @@ maps to bytes once
 `TrimReport { segments_removed, manifests_removed, partials_removed,
 bytes_freed }` surfaces at status line
 
-## Cursor durability + slot advance
+## Manifest durability + slot advance
 
 ![ops](../architecture/ops.svg)
 
 `status_loop` in [`bin/stream.rs`](../src/bin/stream.rs) is single
 choke point: snapshots all six LSNs at `--status-interval` cadence
-(default 10 s), writes `cursor.bin` via atomic rename, emits
-standby-status triple on replication socket. Diagram covers
-producer-of-each-field wiring; sections below pin load-bearing
-semantics
+(default 10 s), writes `manifest.toml` via atomic rename, publishes the
+persisted floor to pruners, emits standby-status triple on replication
+socket. Diagram covers producer-of-each-field wiring; sections below
+pin load-bearing semantics
 
 ## Standby-status triple
 
@@ -251,100 +253,117 @@ cross-links: [filter.md](filter.md) (`filter_durable_lsn`),
 [emitter.md](emitter.md) (`on_xact_end → Ok` signal advancing
 `emitter_ack_lsn`)
 
-## Cursor file
+## Manifest
 
-[`src/cursor.rs`](../src/cursor.rs). `{spill_dir}/cursor.bin`, 64 bytes
-on disk, schema version 2 (v2 added `shadow_flush_lsn` to v1 layout)
+[`src/source/manifest.rs`](../src/source/manifest.rs).
+`{spill_dir}/manifest.toml`, schema version 1:
 
+```toml
+version = 1
+# resume LSN = decode floor = GC cut; segment-aligned, archive-clamped
+floor = "0/6A000000"
+
+[source]           # identity gate for every spill-dir artifact
+system_id = 7334001234567890123
+timeline = 1
+
+[lsn]              # pg_lsn text form; six roles
+source_received = "0/6A2B3C4D"
+filter_durable = "0/6A000000"
+shadow_replay = "0/69FF0120"
+drain = "0/69FE0000"
+emitter_ack = "0/69FD8000"
+shadow_flush = "0/69FC0000"
 ```
-MAGIC "WSCRSR\x01\x00"        (8 B)
-version u32 LE                (4 B)
-source_received_lsn u64 LE    (8 B)
-filter_durable_lsn  u64 LE    (8 B)
-shadow_replay_lsn   u64 LE    (8 B)
-drain_lsn           u64 LE    (8 B)
-emitter_ack_lsn     u64 LE    (8 B)
-shadow_flush_lsn    u64 LE    (8 B)
-crc32c              u32 LE    (4 B)
-```
 
-Constants: `CURSOR_FILENAME = "cursor.bin"`, `CURSOR_VERSION = 2`,
-`CURSOR_FILE_LEN = 64`, `LSN_COUNT = 6`. CRC32C matches PG's own
-checksum algorithm so future "log on every checksum failure" taps
-share code paths. Magic prefix doubles as `file`/`binwalk`-friendly
-identifier
+`floor` is the one durable floor: `manifest::resolved_floor(emitter_ack,
+filter_durable) = align_down(emitter_ack).min(filter_durable)`.
+`filter_durable` is the fsynced sealed-segment boundary — a
+crash-durable lower bound on the sealed archive end — so the archive
+clamp folds in at write time. Restart resumes AT the persisted floor
+and every pruner cuts against it, published to the shared atomic only
+after each persist: cut ≤ resume by construction, never by test. An
+operator `--start-lsn` rewind below the floor bypasses that guarantee
+(same contract as wiped spill)
 
-Writer is `create+write_all+sync_all+rename+fsync_dir` against
-`cursor.bin.tmp` → `cursor.bin`. `kill -9` between `OpenOptions::open`
-+ `rename` leaves valid-magic, valid-CRC stale `.tmp` on disk; boot
-path only reads `cursor.bin` so stale `.tmp` is ignored. Code comment
-in `cursor::write` pins invariant
+`[source]` gates every nonvolatile spill-dir artifact: reusing a spill
+dir against a different cluster must not load foreign resume LSNs,
+retire oids, or backfill state. `system_id` mismatch is fatal (remedy:
+wipe the spill dir or point at the old one). Timeline-only mismatch is
+fatal too; `--ignore-cursor` adopts the live timeline (promoted source)
+and greenfields the LSNs, keeping the ledgers — same cluster, oids and
+LSNs stay valid
 
-Reader (`cursor::read`) returns `Ok(None)` for greenfield (file
-absent), `Ok(Some)` for valid file, `Err(CursorError::{Size, BadMagic,
-Version, Crc, Io})` for corrupt. Boot path logs error and falls back
-to greenfield resume
+Writer is [`crate::fs::write_atomic`]: write+fsync `manifest.toml.tmp`,
+rename, fsync dir. `kill -9` mid-write leaves a stale `.tmp` no boot
+path reads. No CRC field — rename discipline yields old-complete or
+new-complete. Missing manifest = greenfield; unreadable, unsupported,
+or corrupt manifest is fatal unless `--ignore-cursor` or `--start-lsn`
+authorizes discarding it
 
-`--ignore-cursor` forces greenfield boot even with valid file on disk.
-Picked over `rm cursor.bin` because `rm` between cursor write + daemon
-launch races a still-running daemon; flag is atomic with boot sequence
-and leaves prior cursor on disk for forensics
+`--ignore-cursor` discards resume LSNs even with a valid manifest on
+disk (identity gate still applies). Picked over `rm manifest.toml`
+because `rm` between manifest write + daemon launch races a
+still-running daemon; flag is atomic with boot sequence and leaves the
+prior manifest on disk for forensics
 
 Write cadence equals `--status-interval` (default 10 s). Per-xact
-cursor write rejected on cost grounds — 1k cursors/sec worth of
+manifest write rejected on cost grounds — 1k writes/sec worth of
 disk+fsync+dir-fsync on busy OLTP workload; PLAN §5 acceptance doesn't
 require per-xact granularity
 
-Cursor lives at `{spill_dir}/cursor.bin` not `--cursor-path` so `mv`
-of working dir keeps spill files + cursor coherent.
-`cursor::cursor_path` is single choke point for any future
-`--cursor-dir` HA knob
+Manifest lives at `{spill_dir}/manifest.toml`, not a standalone path
+flag, so `mv` of working dir keeps spill files + manifest coherent.
+`manifest::manifest_path` is single choke point for any future HA knob
 
 ### TOAST retirement ledger
 
-[`src/toast_retire.rs`](../src/toast_retire.rs) persists
-`{spill_dir}/toast_retires.bin` beside cursor. Each entry is
-`(toast_relid, dropping_commit_lsn)`. Enqueue fsyncs inside dropping
-xact's barrier before commit can publish; removal fsyncs after mirror
-wipe. Startup spill cleanup removes only `xid-*.bin`, never ledger
+[`src/toast/toast_retire.rs`](../src/toast/toast_retire.rs) persists
+`{spill_dir}/toast_retires.toml` beside the manifest (`version` +
+`[[retire]] {toast_relid, commit_lsn}`; corrupt ledger is a hard
+error, never an empty fallback). Enqueue fsyncs
+inside dropping xact's barrier before commit can publish; removal
+fsyncs after mirror wipe. Startup spill cleanup removes only
+`xid-*.bin`, never ledger
 
 `flush_due_retires` runs at pipeline standup, commit boundaries, and
-idle advance. Entry becomes due once segment-aligned persisted resume
-floor passes dropping commit. Then resolver truncates mirror and removes
-entry. Crash between wipe and removal repeats idempotent truncate. See
+idle advance. Entry becomes due once the persisted resolved floor
+passes dropping commit — the flush consumes the published floor
+verbatim, no local recompute. Then resolver truncates mirror and
+removes entry. Crash between wipe and removal repeats idempotent
+truncate. Flush no-ops without a chunk store (metrics-only runs):
+disabled-resolver retires would drop entries without wiping mirrors,
+leaking them for a later CH run over the same spill dir. See
 [TOAST.md](TOAST.md) for replay-safety proof
 
 ## Resume semantics
 
 Boot order ([`bin/stream.rs`](../src/bin/stream.rs)):
-`IDENTIFY_SYSTEM` → cursor read → resolve start LSN → preflight →
-`START_REPLICATION`
+`IDENTIFY_SYSTEM` → manifest load (identity gate) →
+resolve start LSN → preflight → `START_REPLICATION`
 
-Start-LSN precedence:
+Start-LSN precedence (`manifest::resolve_resume_lsn` +
+`manifest::resolve_start`):
 
-1. `--start-lsn <hex>` — explicit operator override
-2. fresh bootstrap `end_lsn`, because shadow catalog already includes
-   earlier WAL
-3. `cursor.emitter_ack_lsn` (segment-aligned down) when cursor present
-   and `--ignore-cursor` unset
-4. Source's current write LSN when no saved state exists
+1. `--start-lsn <hex>` — explicit operator override, aligned down
+2. fresh bootstrap `end_lsn` (aligned), because shadow catalog already
+   includes earlier WAL
+3. manifest `floor` when nonzero — already aligned + archive-clamped
+4. greenfield: source's current write LSN aligned down, clamped back to
+   end of last sealed segment in `out/` (`retention::max_segment_end`).
+   Shadow alternates between `primary_conninfo` and `restore_command`,
+   so archive must stay continuous until live streaming begins;
+   starting after archive end would leave a missing segment. CH removes
+   re-read duplicates by `_lsn`
 
-Resolved LSN aligns down to segment boundary. When no bootstrap ran and no
-`--start-lsn` was given, it cannot exceed end of last sealed segment
-in `out/` (`retention::max_segment_end`). Shadow alternates between
-`primary_conninfo` and `restore_command`, so archive must stay
-continuous until live streaming begins. Starting after archive end
-would leave a missing segment and prevent shadow from resuming. CH
-removes re-read duplicates by `_lsn`
+`emitter_ack` still seeds the ack atomic (unaligned; see the code
+comment at the seed site) and feeds precedence 3's floor via the status
+loop. `shadow_flush` lets streaming-fed shadow's resume position
+survive daemon bounce without re-archiving from `out/`.
+Bookkeeping-only fields (`source_received`, `drain`) gate nothing on
+restart but surface as metrics
 
-Per-field restart role is on cursor.bin layout table in diagram above.
-`emitter_ack_lsn` is load-bearing resume LSN (daemon restarts here);
-`shadow_flush_lsn` lets streaming-fed shadow's resume position survive
-daemon bounce without re-archiving from `out/`. Bookkeeping-only
-fields (`source_received_lsn`, `drain_lsn`) gate nothing on restart
-but surface as metrics
-
-Dual-cursor contract for `kill -9` + restart: spill dir + cursor file
+Dual-artifact contract for `kill -9` + restart: spill dir + manifest
 persist between kill and restart
 
 ## Kill-restart drill
@@ -357,7 +376,7 @@ stand up once, daemon cycles inside
 Strategies:
 
 1. **mid-segment** — kill before in-flight segment reaches 16 MiB seal.
-   Walshadow's cursor resumes from sub-segment LSN; streaming-fed
+   Walshadow's manifest resumes the stream; streaming-fed
    shadow re-streams unsealed bytes via wire, archive path catches up
    via partial-segment re-fetch
 2. **mid-xact** — kill while at least one large xact is open (sized to
@@ -450,17 +469,17 @@ a connection wedged mid-INSERT as retryable `EmitterError::Timeout`
 instead of pinning the watermark.
 `EmitterError::{Io, Client, ServerException, Timeout}` is survived;
 retry exhaustion trips the pipeline `Fatal` (watermark can't advance
-without that batch) and daemon exits, cursor resumes on restart
+without that batch) and daemon exits, manifest resumes on restart
 
 Residual hazard: rows that landed in CH on old connection + committed
 by CH server before disconnect are duplicated on retry.
 `ReplacingMergeTree(_lsn)` collapses dupes on `FINAL`; eager-read
 consumers see dup window. Acceptable for v1.0
 
-Dual-cursor narrows dup window, slot-advance via `emitter_ack_lsn`
+Dual-artifact resume narrows dup window, slot-advance via `emitter_ack`
 means retry replays from per-xact ack point, not from segment boundary.
 Deeper re-emit-from-spill story (replay spill files keyed on xids
-whose first-seen LSN > cursor's ack) is deferred to
+whose first-seen LSN > manifest's ack) is deferred to
 [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md)
 
 ## Cross-links
@@ -469,12 +488,11 @@ whose first-seen LSN > cursor's ack) is deferred to
   fsync chain)
 - [shadow.md](shadow.md) — `shadow_replay_lsn` (sweeper poll) +
   `shadow_flush_lsn` (streaming) producers
-- [xact.md](xact.md) — `drain_lsn` + `emitter_ack_lsn` producers
-  (`XactBuffer::commit` / `abort` advance stats after `on_xact_end`
-  Ok)
+- [xact.md](xact.md) — `drain_lsn` producer (`drain_committed` /
+  `abort` / idle advance)
 - [emitter.md](emitter.md) — ack collector's contiguous-done
-  watermark feeds `emitter_ack_lsn`; SIGHUP `MappingHandle` lives here
-- [bootstrap.md](bootstrap.md) — cursor `start_lsn` falls back to
+  watermark feeds `emitter_ack`; SIGHUP `MappingHandle` lives here
+- [bootstrap.md](bootstrap.md) — resume `start_lsn` falls back to
   bootstrap's `end_lsn` at greenfield boot; `Nullable(T)` requirement
   for post-bootstrap `ADD COLUMN`
 - [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md) —

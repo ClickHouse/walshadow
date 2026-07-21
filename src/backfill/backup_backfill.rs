@@ -28,7 +28,7 @@
 //! abort + [`PgXactPatch`] harvest) → filtered walk (gate resolves deferred
 //! tuples against backup pg_xact + patch at successful walk EOF) → gap replay
 //! through the shared decode path ([`BufferingDecoderSink`] +
-//! [`XactRecordSink`]) with
+//! [`XactBuffer::drain_committed`]) with
 //! rows emitted at real commit LSNs, commits past a rel's `S` dropped (the
 //! live stream owns them; dedup absorbs overlap regardless).
 //!
@@ -61,13 +61,14 @@ use crate::backfill::backup_source::{BackupSink, BackupSource};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
-use crate::decode::heap_decoder::{XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
+use crate::catalog::shadow_catalog::ShadowCatalog;
+use crate::decode::heap_decoder::{CommittedTuple, XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
 use crate::decode::visibility::{
     PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView, Visibility, tuple_visibility,
 };
 use crate::decode::wal_xact::{
-    XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
-    XLOG_XACT_OPMASK, parse_xact_payload,
+    XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
+    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
 };
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
@@ -81,9 +82,10 @@ use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
 use crate::source::wal_stream::WalStream;
-use crate::toast::ToastResolver;
+use crate::toast::{ChunkRefMap, ToastResolver};
 use crate::xact::xact_buffer::{
-    BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig, XactRecordSink,
+    BufferingDecoderSink, DrainEntry, DrainedBatch, SubxactTracker, WalkStep, XactBuffer,
+    XactBufferConfig, detoast_heap, resolve_stash,
 };
 
 /// Run one coalesced backup pass for `reqs` (all sharing `mode`).
@@ -794,8 +796,9 @@ struct ReplayStats {
 /// Replay the gap through the shared decode path: heap records whose rfn is
 /// in the filter set feed the same [`BufferingDecoderSink`] the hot path
 /// uses (subxacts, TOAST reassembly, update/delete decode for free); commit
-/// records drain through [`XactRecordSink`] into a router that ships rows at
-/// their real commit LSNs on the pass's tail.
+/// records drain through [`XactBuffer::drain_committed`] +
+/// [`DrainedBatch::into_walk`] — the same apply plan the reorder barrier
+/// runs — shipping rows at their real commit LSNs on the pass's tail.
 #[allow(clippy::too_many_arguments)]
 async fn replay_gap(
     ctx: &PassContext,
@@ -832,11 +835,20 @@ async fn replay_gap(
         }
     }
 
-    let router = ReplayRouter {
+    let mut sink = ReplaySink {
+        decoder: BufferingDecoderSink::new(ctx.catalog.clone(), buffer.clone()),
+        buffer,
+        catalog: ctx.catalog.clone(),
+        subxact_tracker: SubxactTracker::new(),
+        resolver,
+        filter_rfns,
         targets,
         b_redo,
         mapping: ctx.mapping.clone(),
         stats: ctx.stats.clone(),
+        budget: ctx.budget.clone(),
+        batch_rows: ctx.emitter.drain_batch_rows,
+        batch_bytes: ctx.emitter.drain_batch_bytes,
         msg_tx,
         ack,
         next_seq,
@@ -844,37 +856,205 @@ async fn replay_gap(
         rows_replayed: 0,
         commits_past_s: 0,
     };
-    let decoder = BufferingDecoderSink::new(ctx.catalog.clone(), buffer.clone());
-    let xact = XactRecordSink::new(buffer, ctx.catalog.clone(), router)
-        .with_toast_resolver(resolver)
-        .with_subxact_tracker(Arc::new(Mutex::new(SubxactTracker::new())));
-    let mut pair = ReplayPair {
-        decoder,
-        xact,
-        filter_rfns,
-    };
-    pump_segments_through(segments, timeline, &mut pair).await?;
+    pump_segments_through(segments, timeline, &mut sink).await?;
 
-    let router = pair.xact.observer_mut();
-    if let Some((seq, rows)) = router.open.take() {
-        router.ack.placed(seq, rows);
-    }
     Ok(ReplayStats {
-        next_seq: router.next_seq,
-        rows_replayed: router.rows_replayed,
-        commits_past_s: router.commits_past_s,
+        next_seq: sink.next_seq,
+        rows_replayed: sink.rows_replayed,
+        commits_past_s: sink.commits_past_s,
     })
 }
 
-/// Serial decoder + xact-drain pair over pre-filtered records; mirrors the
-/// daemon's `DecoderXactPair` without the queueing worker.
-struct ReplayPair {
+/// Serial gap drain over pre-filtered records; mirrors the daemon's
+/// `DecoderXactPair` without the queueing worker. Rows gate per rel: one
+/// seq per commit that routed at least one row, real `commit_lsn`, commits
+/// at or under `b_redo` live in the walked backup pages, commits past the
+/// rel's `S` belong to the live stream (dedup absorbs overlap regardless).
+/// Catalog/config drain entries are ignored — the live stream owns DDL and
+/// the prescan aborts on filtered-rel catalog skew below `S`.
+struct ReplaySink {
     decoder: BufferingDecoderSink,
-    xact: XactRecordSink<ReplayRouter>,
+    buffer: Arc<Mutex<XactBuffer>>,
+    catalog: Arc<Mutex<ShadowCatalog>>,
+    subxact_tracker: SubxactTracker,
+    resolver: ToastResolver,
     filter_rfns: HashSet<(Oid, Oid)>,
+    targets: HashMap<(Oid, Oid), (Arc<RelDescriptor>, u64)>,
+    b_redo: u64,
+    mapping: MappingHandle,
+    stats: Arc<EmitterStats>,
+    budget: Option<crate::budget::MemoryBudget>,
+    /// Drain-slice budget, same knobs as the pipeline reorder
+    batch_rows: usize,
+    batch_bytes: usize,
+    msg_tx: mpsc::Sender<BatcherMsg>,
+    ack: AckHandle,
+    next_seq: u64,
+    /// Current commit's `(seq, rows routed)`; registered lazily on its
+    /// first routed row so row-less commits consume no seq
+    open: Option<(u64, u64)>,
+    rows_replayed: u64,
+    commits_past_s: u64,
 }
 
-impl RecordSink for ReplayPair {
+impl ReplaySink {
+    async fn on_commit(
+        &mut self,
+        xid: u32,
+        info: u8,
+        record: &Record<'_>,
+    ) -> std::result::Result<(), SinkError> {
+        let payload = parse_xact_payload(info, &record.parsed.main_data);
+        // Deferred resolution for filenodes invisible at record time;
+        // installs decode verdicts + `O - B` barriers ahead of the drain
+        resolve_stash(
+            &self.buffer,
+            &self.catalog,
+            xid,
+            &payload.subxacts,
+            record.source_lsn,
+            self.resolver.stats_handle(),
+        )
+        .await
+        .map_err(SinkError::from)?;
+        let mut drain = self
+            .buffer
+            .lock()
+            .await
+            .drain_committed(
+                xid,
+                payload.xact_time,
+                record.source_lsn,
+                &payload.subxacts,
+                self.resolver.stores_chunks(),
+            )
+            .await
+            .map_err(SinkError::from)?;
+        while let Some(batch) = drain
+            .next_batch(self.batch_rows, self.batch_bytes, self.budget.as_ref())
+            .await
+            .map_err(SinkError::from)?
+        {
+            self.apply_batch(batch, drain.commit_ts, drain.commit_lsn)
+                .await?;
+        }
+        drain.finish().await.map_err(SinkError::from)?;
+        if let Some((seq, rows)) = self.open.take() {
+            self.ack.placed(seq, rows);
+        }
+        self.subxact_tracker.forget_tree(xid);
+        Ok(())
+    }
+
+    async fn apply_batch(
+        &mut self,
+        batch: DrainedBatch,
+        commit_ts: i64,
+        commit_lsn: u64,
+    ) -> std::result::Result<(), SinkError> {
+        let walk = batch.into_walk();
+        let ref_maps: Vec<&ChunkRefMap> = walk.chunks.iter().map(|g| g.map()).collect();
+        // One spool per xact; generations sealed before spooling carry None
+        let spool = walk.chunks.iter().find_map(|g| g.spool());
+        let mut rows_cursor = 0usize;
+        for step in walk.steps {
+            match step {
+                WalkStep::Rows { upto } => {
+                    if upto > rows_cursor {
+                        self.resolver
+                            .put_row_refs(walk.new_rows.spool(), &walk.new_rows[rows_cursor..upto])
+                            .await
+                            .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+                        rows_cursor = upto;
+                    }
+                }
+                // Live stream owns DDL/config apply
+                WalkStep::Event(DrainEntry::Catalog(_))
+                | WalkStep::Event(DrainEntry::Config(_)) => {}
+                WalkStep::Event(DrainEntry::ToastBarrier {
+                    toast_relid,
+                    marker_lsn,
+                }) => {
+                    self.resolver
+                        .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
+                        .await
+                        .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
+                }
+                WalkStep::Truncate(_) => {
+                    // xl_heap_truncate carries no block ref, never passes the
+                    // rfn filter
+                    debug_assert!(false, "TRUNCATE heap in gap replay");
+                }
+                WalkStep::Heap(mut heap) => {
+                    let rfn = heap.rfn;
+                    let Some((rel, s_cap)) = self.targets.get(&(rfn.db_node, rfn.rel_node)) else {
+                        continue;
+                    };
+                    if commit_lsn <= self.b_redo {
+                        // Backup pages already reflect this commit; the walked
+                        // copy (tagged min(B_redo, S)) carries it
+                        continue;
+                    }
+                    if commit_lsn > *s_cap {
+                        self.commits_past_s += 1;
+                        continue;
+                    }
+                    let rel = rel.clone();
+                    let value_permit = detoast_heap(
+                        &mut heap,
+                        spool,
+                        &ref_maps,
+                        &self.catalog,
+                        false,
+                        &self.resolver,
+                    )
+                    .await
+                    .map_err(SinkError::from)?;
+                    let Some(mapping) = crate::emit::pipeline::lookup_mapping(
+                        &self.mapping,
+                        &rel.rel_name,
+                        &self.stats,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let seq = if let Some((seq, rows)) = &mut self.open {
+                        *rows += 1;
+                        *seq
+                    } else {
+                        let seq = self.next_seq;
+                        self.next_seq += 1;
+                        self.ack.register(seq, commit_lsn);
+                        self.open = Some((seq, 1));
+                        seq
+                    };
+                    self.msg_tx
+                        .send(BatcherMsg::Row(RoutedRow {
+                            seq,
+                            rel,
+                            mapping,
+                            committed: CommittedTuple {
+                                decoded: heap,
+                                commit_ts,
+                                commit_lsn,
+                            },
+                            permit: None,
+                            value_permit: value_permit.map(Arc::new),
+                        }))
+                        .await
+                        .map_err(|_| {
+                            SinkError::Other("backup_backfill: replay tail closed".into())
+                        })?;
+                    self.rows_replayed += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RecordSink for ReplaySink {
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
@@ -890,113 +1070,37 @@ impl RecordSink for ReplayPair {
                     self.decoder.on_record(record).await?;
                 }
             } else if rm == RmId::Xact as u8 {
-                self.xact.on_record(record).await?;
+                let info = record.parsed.header.info;
+                let xid = record.parsed.header.xact_id;
+                match info & XLOG_XACT_OPMASK {
+                    XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
+                        self.on_commit(xid, info, record).await?;
+                    }
+                    XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
+                        let payload = parse_xact_payload(info, &record.parsed.main_data);
+                        self.buffer
+                            .lock()
+                            .await
+                            .abort(xid, record.source_lsn, &payload.subxacts)
+                            .await
+                            .map_err(SinkError::from)?;
+                        self.subxact_tracker.forget_tree(xid);
+                    }
+                    XLOG_XACT_ASSIGNMENT => {
+                        // Hint for eviction policy; correctness rides on the
+                        // commit / abort record's authoritative subxact list
+                        if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data)
+                        {
+                            self.subxact_tracker.assign(xtop, &subs);
+                        }
+                    }
+                    _ => {
+                        // PREPARE / INVALIDATIONS unhandled; xact stays
+                        // buffered until COMMIT_PREPARED
+                    }
+                }
             }
             Ok(())
-        })
-    }
-}
-
-/// [`crate::decode::decoder_sink::TupleObserver`] shipping gap-committed rows onto
-/// the pass tail: one seq per commit that routed at least one row, real
-/// `commit_lsn`, per-rel drop past its `S` (the live stream owns those;
-/// dedup absorbs the overlap regardless).
-struct ReplayRouter {
-    targets: HashMap<(Oid, Oid), (Arc<RelDescriptor>, u64)>,
-    b_redo: u64,
-    mapping: MappingHandle,
-    stats: Arc<EmitterStats>,
-    msg_tx: mpsc::Sender<BatcherMsg>,
-    ack: AckHandle,
-    next_seq: u64,
-    /// Current commit's `(seq, rows routed)`; registered lazily on its
-    /// first routed row so row-less commits consume no seq
-    open: Option<(u64, u64)>,
-    rows_replayed: u64,
-    commits_past_s: u64,
-}
-
-impl crate::decode::decoder_sink::TupleObserver for ReplayRouter {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a crate::decode::heap_decoder::CommittedTuple,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = std::result::Result<(), crate::decode::decoder_sink::DecoderSinkError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let rfn = committed.decoded.rfn;
-            let Some((rel, s_cap)) = self.targets.get(&(rfn.db_node, rfn.rel_node)) else {
-                return Ok(());
-            };
-            if committed.commit_lsn <= self.b_redo {
-                // Backup pages already reflect this commit; the walked copy
-                // (tagged min(B_redo, S)) carries it
-                return Ok(());
-            }
-            if committed.commit_lsn > *s_cap {
-                self.commits_past_s += 1;
-                return Ok(());
-            }
-            let Some(mapping) =
-                crate::emit::pipeline::lookup_mapping(&self.mapping, &rel.rel_name, &self.stats)
-                    .await
-            else {
-                return Ok(());
-            };
-            let seq = if let Some((seq, rows)) = &mut self.open {
-                *rows += 1;
-                *seq
-            } else {
-                let seq = self.next_seq;
-                self.next_seq += 1;
-                self.ack.register(seq, committed.commit_lsn);
-                self.open = Some((seq, 1));
-                seq
-            };
-            self.msg_tx
-                .send(BatcherMsg::Row(RoutedRow {
-                    seq,
-                    rel: rel.clone(),
-                    mapping,
-                    committed: committed.clone(),
-                    permit: None,
-                    value_permit: None,
-                }))
-                .await
-                .map_err(|_| {
-                    crate::decode::decoder_sink::DecoderSinkError::Observer(
-                        "backup_backfill: replay tail closed".into(),
-                    )
-                })?;
-            self.rows_replayed += 1;
-            Ok(())
-        })
-    }
-
-    fn on_xact_end<'a>(
-        &'a mut self,
-        commit_lsn: u64,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = std::result::Result<
-                        u64,
-                        crate::decode::decoder_sink::DecoderSinkError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            if let Some((seq, rows)) = self.open.take() {
-                self.ack.placed(seq, rows);
-            }
-            Ok(commit_lsn)
         })
     }
 }

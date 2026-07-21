@@ -1,14 +1,12 @@
-// walshadow — cursor durability + slot-advance feedback loop
-// status_loop is the orchestrator: gathers LSN inputs from xact buffer,
-// segment sink, shadow-replay sweeper, walsender-rx standby frames →
-// writes cursor.bin (atomic rename, CRC32C) → emits standby-status
-// triple to source slot → feeds retention sweeper & Prom metrics.
+// walshadow — manifest durability + slot-advance feedback loop
+// Status loop gathers progress, saves manifest, then publishes cleanup
+// point and source feedback.
 //
 // regeneration spec:
-// sources of truth: plans/ops.md · plans/TOAST.md · src/cursor.rs · src/toast_retire.rs · src/preflight.rs · src/retention.rs · src/metrics.rs
-// subsumes: plans/ops.md § "Cursor file" + "Slot advance" + apply-lag metric
+// sources of truth: plans/ops.md · plans/TOAST.md · src/source/manifest.rs · src/toast/toast_retire.rs · src/ops/{preflight,retention,metrics}.rs · src/bin/stream.rs
+// subsumes: plans/ops.md § "Manifest" + "Slot advance" + apply-lag metric
 // quality bar:
-//   - cursor write edge (magenta dotted) reads as durability path
+//   - persist → publish ordering reads as one durability path
 //   - slot-advance edge clearly back to source PG, not confused with metrics export
 //   - preflight noted as boot-only (not in tick loop)
 // shared style: palette.md
@@ -16,108 +14,92 @@ digraph ops {
   rankdir=TB;
   compound=true;
   newrank=true;
-  graph [fontname="Helvetica", labelloc="t", label="walshadow — cursor durability + slot advance (status_loop, 10 s cadence)", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.8, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="walshadow — save restart state before cleanup or source feedback", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.8, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
 
   // ═════ External endpoints ═════
-  shd   [label="shadow PG\npg_last_wal_replay_lsn()\n+ walreceiver 'r' frames", fillcolor="#3D4128", shape=cylinder];
-  src   [label="source PG\npg_replication_slots\nconfirmed_flush_lsn", fillcolor="#3D3D54", shape=cylinder];
+  shd   [label="shadow PostgreSQL\nreceive + replay progress", fillcolor="#3D4128", shape=cylinder];
+  src   [label="source PostgreSQL\nreplication slot", fillcolor="#3D3D54", shape=cylinder];
   prom  [label="Prometheus scrape\n/metrics", fillcolor="#3D3D54", shape=cylinder];
-  toastmirror [label="CH TOAST mirrors\npg_toast_<relid>", fillcolor="#4D4128", shape=cylinder];
+  toastmirror [label="ClickHouse TOAST mirrors", fillcolor="#4D4128", shape=cylinder];
 
   // ═════ A. LSN inputs (left column, fed by xact/segment/wire) ═════
   subgraph cluster_inputs {
-    label="LSN sources (single source of truth per field)";
+    label="progress sources";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    feed     [label="SourceFeed::pump\nlast_server_wal_end\n→ source_received_lsn", fillcolor="#3D3D54"];
-    segsink  [label="DirSegmentSink::on_segment\nfsync seg + dir\n→ filter_durable_lsn\n(= flush advertised)", fillcolor="#4D3340"];
-    xact     [label="XactBuffer stats.drain_lsn\n+ pipeline ack collector\nemitter_ack atomic\n(contiguous-done watermark)", fillcolor="#4D4128"];
-    sweeper  [label="retention_task (30 s)\nSELECT pg_last_wal_replay_lsn()\n→ Arc&lt;AtomicU64&gt; shadow_replay_lsn", fillcolor="#4D3A28"];
-    walsrv   [label="walsender server\nrx 'r' standby frames\nShadowStreamState::aggregate\n→ min_flush_lsn", fillcolor="#5D3F40"];
+    feed     [label="source connection\nidentity + received WAL position", fillcolor="#3D3D54"];
+    segsink  [label="filtered WAL archive\nsave segment before reporting progress", fillcolor="#4D3340"];
+    xact     [label="transaction pipeline\nopen transactions + durable progress", fillcolor="#4D4128"];
+    sweeper  [label="shadow replay monitor\ntrack recovery progress", fillcolor="#4D3A28"];
+    walsrv   [label="shadow receiver feedback\ntrack safe handoff point", fillcolor="#5D3F40"];
   }
 
   // ═════ B. status_loop orchestrator (centre column) ═════
   subgraph cluster_status {
-    label="status_loop (bin/stream.rs, --status-interval = 10 s)";
+    label="periodic status loop";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    snap   [label="snapshot 6 LSNs\nbuild Cursor { … }", fillcolor="#4D3A28"];
-    apply  [label="apply_ceiling =\nshadow_replay==0\n  ? emitter_ack\n  : min(shadow_replay, emitter_ack)", fillcolor="#4D3A28"];
-    cwrite [label="cursor::write\ntmp → fsync → rename → fsync_dir", fillcolor="#4D3A28"];
-    triple [label="StandbyStatus {\n  write = source_received,\n  flush = filter_durable,\n  apply = apply_ceiling\n}", fillcolor="#4D3A28"];
-    sendst [label="SourceFeed::send_status\n'r' frame on replication socket", fillcolor="#3D3D54"];
+    snap   [label="collect source, archive, shadow,\ntransaction, and ClickHouse progress", fillcolor="#4D3A28"];
+    floor  [label="choose safe restart point\nnever pass saved WAL or\nan unfinished transaction", fillcolor="#4D3A28"];
+    apply  [label="cap source feedback at\nshadow + ClickHouse progress", fillcolor="#4D3A28"];
+    mwrite [label="save manifest.toml\nusing atomic replacement", fillcolor="#4D3A28"];
+    publish [label="share saved restart point\nwith cleanup tasks", fillcolor="#4D3A28"];
+    triple [label="build source feedback\nwrite / flush / apply positions", fillcolor="#4D3A28"];
+    sendst [label="send feedback\nto source replication slot", fillcolor="#3D3D54"];
+    snap -> floor;
+    floor -> mwrite [color="#b380b0", style=dotted, penwidth=2];
+    mwrite -> publish [color="#b380b0", style=dotted, penwidth=2];
     snap -> apply;
-    snap -> cwrite [color="#b380b0", style=dotted, penwidth=2];
     apply -> triple;
     triple -> sendst;
   }
 
   // ═════ C. Sinks (right column) ═════
-  cursor_bin [label="{spill_dir}/cursor.bin\n64 B, schema v2, CRC32C\natomic rename via cursor.bin.tmp\n(boot: emitter_ack_lsn is\nresume floor, seg-aligned)", fillcolor="#4D3850", shape=note];
-  retire_bin [label="{spill_dir}/toast_retires.bin\npending (toast_relid, drop commit_lsn)\nfsync on enqueue/remove\nsurvives spill cleanup", fillcolor="#4D3850", shape=note];
-  retire_flush [label="flush_due_retires\nstandup + commit + idle\nwhen aligned resume floor > drop LSN\nTRUNCATE mirror, then remove entry", fillcolor="#4D3A28"];
+  manifest_toml [label="manifest.toml\nsource identity + restart state", fillcolor="#4D3850", shape=note];
+  retire_toml [label="toast_retires.toml\nsaved mirror retirements", fillcolor="#4D3850", shape=note];
+  retire_flush [label="apply mirror retirements\nonce restart can no longer replay drop", fillcolor="#4D3A28"];
 
   outdir [label="out/<seg>\nfiltered 16 MiB WAL\n+ manifest.json", fillcolor="#4D3850", shape=note];
 
-  trim   [label="trim_below_lsn\ncutoff = shadow_replay\n  − retention_bytes\n(default 256 MiB)", fillcolor="#4D3A28"];
+  trim   [label="trim old filtered WAL\nkeep shadow recovery window", fillcolor="#4D3A28"];
 
-  metrics [label="MetricsSnapshot → text\nwalshadow_*_lsn gauges,\nshadow_apply_lag_bytes/seconds,\nRateEstimator (30 s window)", fillcolor="#4D4128"];
+  metrics [label="metrics snapshot\nexport progress + apply lag", fillcolor="#4D4128"];
 
   // ═════ Wiring ═════
   // shadow PG sits left of the inputs cluster, feeds sweeper + walsrv
-  shd -> sweeper [style=dashed, color="#CBA85E", label="libpq SELECT"];
-  shd -> walsrv  [style=dashed, color="#BD8183", label="walreceiver 'r'"];
+  shd -> sweeper [style=dashed, color="#CBA85E", label="replay query"];
+  shd -> walsrv  [style=dashed, color="#BD8183", label="receiver feedback"];
 
   // Inputs → status_loop snapshot (all converge on `snap`)
-  feed    -> snap [label="source_received_lsn"];
-  segsink -> snap [label="filter_durable_lsn"];
-  xact    -> snap [label="drain_lsn,\nemitter_ack_lsn"];
-  sweeper -> snap [label="shadow_replay_lsn"];
-  walsrv  -> snap [label="shadow_flush_lsn", color="#BD8183"];
+  feed    -> snap [label="source"];
+  segsink -> snap [label="saved WAL"];
+  xact    -> snap [label="transactions"];
+  sweeper -> snap [label="shadow replay"];
+  walsrv  -> snap [label="shadow receive", color="#BD8183"];
 
-  // Cursor durability path (MAIN — purple dotted)
-  cwrite -> cursor_bin [color="#b380b0", style=dotted, penwidth=2, label="every 10 s\n(atomic rename)"];
-  xact -> retire_bin [color="#6E6963", style=dashed, label="toast Dropped barrier\nenqueue before commit ack"];
-  cursor_bin -> retire_flush [color="#b380b0", style=dotted, label="persisted resume floor"];
-  retire_bin -> retire_flush [color="#6E6963", style=dashed, label="pending wipes"];
-  retire_flush -> toastmirror [color="#BF8C5F", style=dashed, label="retire_mirror"];
+  // Manifest durability path
+  mwrite -> manifest_toml [color="#b380b0", style=dotted, penwidth=2, label="save"];
+  xact -> retire_toml [color="#6E6963", style=dashed, label="record drop"];
+  publish -> retire_flush [color="#b380b0", style=dotted, label="safe point"];
+  retire_toml -> retire_flush [color="#6E6963", style=dashed, label="pending"];
+  retire_flush -> toastmirror [color="#BF8C5F", style=dashed, label="wipe mirror"];
 
   // Slot advance path
-  sendst -> src [color="#A1A9CC", penwidth=2, label="standby-status triple\n(write/flush/apply)"];
+  sendst -> src [color="#A1A9CC", penwidth=2, label="replication feedback"];
 
-  // Retention sweeper trims outdir below shadow_replay − retention_bytes
+  // Retention sweeper uses independent shadow-recovery cut
   sweeper -> trim   [color="#6E6963", style=dashed];
-  trim    -> outdir [color="#6E6963", style=dashed, label="rm < cutoff"];
+  trim    -> outdir [color="#6E6963", style=dashed, label="remove old files"];
 
   // Metrics tap (off main flow but ranks below snap so it points down with gravity)
-  snap    -> metrics [style=dashed, color="#CBA85E", label="LSN gauges +\napply_lag_*"];
+  snap    -> metrics [style=dashed, color="#CBA85E", label="progress + apply lag"];
   metrics -> prom    [color="#A1A9CC", label="HTTP /metrics"];
 
   // Rank pinning so external endpoints anchor each side
   { rank=same; shd; feed; }
-  { rank=same; src; cursor_bin; retire_bin; }
-
-  // cursor.bin layout reference table
-  cursor_table [shape=plaintext, label=<
-    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">
-      <TR><TD COLSPAN="3" BGCOLOR="#4D3850"><B>cursor.bin layout — 64 B, schema v2</B></TD></TR>
-      <TR BGCOLOR="#34302c">
-        <TD><B>offset</B></TD><TD><B>field</B></TD><TD><B>role</B></TD>
-      </TR>
-      <TR><TD>0..8</TD><TD>MAGIC "WSCRSR\x01\x00"</TD><TD>file id + reserved</TD></TR>
-      <TR><TD>8..12</TD><TD>version u32 LE</TD><TD>schema = 2 (added shadow_flush_lsn)</TD></TR>
-      <TR><TD>12..20</TD><TD>source_received_lsn</TD><TD>bookkeeping, gates nothing</TD></TR>
-      <TR><TD>20..28</TD><TD>filter_durable_lsn</TD><TD>standby flush_lsn advertised</TD></TR>
-      <TR><TD>28..36</TD><TD>shadow_replay_lsn</TD><TD>apply ceiling (when nonzero)</TD></TR>
-      <TR><TD>36..44</TD><TD>drain_lsn</TD><TD>observer; ≥ emitter_ack</TD></TR>
-      <TR><TD>44..52</TD><TD><B>emitter_ack_lsn</B></TD><TD><B>resume LSN + apply ceiling</B></TD></TR>
-      <TR><TD>52..60</TD><TD>shadow_flush_lsn</TD><TD>walsender hands shadow back here</TD></TR>
-      <TR><TD>60..64</TD><TD>crc32c u32 LE</TD><TD>covers bytes 0..60 (PG-compatible CRC)</TD></TR>
-    </TABLE>
-  >];
-  cursor_bin -> cursor_table [style=invis];
+  { rank=same; src; manifest_toml; retire_toml; }
 
   // Legend
   legend [shape=plaintext, label=<
@@ -134,9 +116,9 @@ digraph ops {
       <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>source replication ('r' standby) / Prom scrape</TD></TR>
       <TR><TD><FONT COLOR="#BD8183"><B>━━</B></FONT></TD><TD>walsender wire ('r' from shadow)</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq catalog query / metrics tap</TD></TR>
-      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>cursor durability (atomic rename, CRC32C)</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>···</B></FONT></TD><TD>manifest persist → floor publish</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>filesystem (segment trim)</TD></TR>
     </TABLE>
   >];
-  cursor_table -> legend [style=invis];
+  manifest_toml -> legend [style=invis];
 }

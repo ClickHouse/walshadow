@@ -1,7 +1,10 @@
-//! `XactBuffer` commit/drain + detoast against a live
+//! `XactBuffer` commit-drain + detoast against a live
 //! shadow PG. Skipped silently if `initdb` is not on `$PATH`.
 //!
-//! The buffer's commit path needs
+//! Drains run the pipeline path: `drain_committed` →
+//! [`DrainedBatch::into_walk`](walshadow::xact_buffer::DrainedBatch::into_walk)
+//! → `detoast_heap`, the same steps the reorder coordinator and gap replay
+//! consume. Detoast needs
 //! [`ShadowCatalog::relation_at`](walshadow::shadow_catalog::ShadowCatalog::relation_at)
 //! to resolve `rfn` → `RelDescriptor` for any heap with an
 //! `ExternalToast` column. Mocking that out adds a stub seam to a
@@ -17,20 +20,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordHeader};
+use walrus::pg::walparser::RelFileNode;
 use walshadow::ch_emitter::EmitterStats;
-use walshadow::decoder_sink::{DecoderSinkError, TupleObserver};
 use walshadow::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
 };
 use walshadow::pg::socket_conninfo;
-use walshadow::record::Route;
-use walshadow::record::{Record, RecordSink as _};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 use walshadow::spill::ToastChunk;
-use walshadow::toast::{MemChunkStore, ToastResolver};
-use walshadow::xact_buffer::{XactBuffer, XactBufferConfig, XactBufferError, XactRecordSink};
+use walshadow::toast::{ChunkRefMap, MemChunkStore, ToastResolver};
+use walshadow::xact_buffer::{
+    WalkStep, XactBuffer, XactBufferConfig, XactBufferError, detoast_heap,
+};
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -148,25 +150,44 @@ fn cfg(spill_dir: std::path::PathBuf, budget: usize) -> XactBufferConfig {
     }
 }
 
-#[derive(Default)]
-struct CollectObs {
-    seen: Vec<CommittedTuple>,
-}
-
-impl TupleObserver for CollectObs {
-    fn on_tuple<'a>(
-        &'a mut self,
-        c: &'a CommittedTuple,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = std::result::Result<(), DecoderSinkError>> + Send + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            self.seen.push(c.clone());
-            Ok(())
-        })
+/// Pipeline-path drain: `drain_committed` → `into_walk` → `detoast_heap`
+/// per heap step, collecting [`CommittedTuple`]s in walk order.
+async fn drain_all(
+    b: &mut XactBuffer,
+    cat: &Arc<Mutex<ShadowCatalog>>,
+    resolver: &ToastResolver,
+    xid: u32,
+    commit_ts: i64,
+    commit_lsn: u64,
+    subxids: &[u32],
+) -> Result<Vec<CommittedTuple>, XactBufferError> {
+    let mut drain = b
+        .drain_committed(
+            xid,
+            commit_ts,
+            commit_lsn,
+            subxids,
+            resolver.stores_chunks(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(batch) = drain.next_batch(usize::MAX, usize::MAX, None).await? {
+        let walk = batch.into_walk();
+        let ref_maps: Vec<&ChunkRefMap> = walk.chunks.iter().map(|g| g.map()).collect();
+        let spool = walk.chunks.iter().find_map(|g| g.spool());
+        for step in walk.steps {
+            if let WalkStep::Heap(mut heap) = step {
+                detoast_heap(&mut heap, spool, &ref_maps, cat, false, resolver).await?;
+                out.push(CommittedTuple {
+                    decoded: heap,
+                    commit_ts: drain.commit_ts,
+                    commit_lsn: drain.commit_lsn,
+                });
+            }
+        }
     }
+    drain.finish().await?;
+    Ok(out)
 }
 
 /// Spin up shadow PG with one user table `wc.things(id int, body text)`.
@@ -204,7 +225,6 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let mut obs = CollectObs::default();
     let one_col = |id: i32| {
         vec![
             Some(ColumnValue::Int4(id)),
@@ -220,59 +240,45 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, one_col(3)))
         .await
         .unwrap();
-    b.commit(
-        7,
-        12345,
-        300,
-        &[],
-        &cat,
-        &mut obs,
-        &ToastResolver::disabled(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(obs.seen.len(), 2);
-    assert_eq!(obs.seen[0].decoded.source_lsn, 100);
-    assert_eq!(obs.seen[1].decoded.source_lsn, 200);
-    assert_eq!(obs.seen[0].commit_ts, 12345);
-    assert_eq!(obs.seen[1].commit_ts, 12345);
+    let seen = drain_all(&mut b, &cat, &ToastResolver::disabled(), 7, 12345, 300, &[])
+        .await
+        .unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].decoded.source_lsn, 100);
+    assert_eq!(seen[1].decoded.source_lsn, 200);
+    assert_eq!(seen[0].commit_ts, 12345);
+    assert_eq!(seen[1].commit_ts, 12345);
     // Commit-LSN carriage: every tuple carries the commit-record LSN so the
-    // emitter can stamp its ack ceiling without re-reading the buffer.
-    assert_eq!(obs.seen[0].commit_lsn, 300);
-    assert_eq!(obs.seen[1].commit_lsn, 300);
+    // emitter can stamp `_lsn` without re-reading the buffer.
+    assert_eq!(seen[0].commit_lsn, 300);
+    assert_eq!(seen[1].commit_lsn, 300);
     assert_eq!(b.stats().committed_xacts_total, 1);
     assert_eq!(b.stats().drain_lsn, 300);
-    assert_eq!(b.stats().emitter_ack_lsn, 300);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_unknown_xid_no_ops() {
-    let Some((tmp, shadow, cat, _rfn)) = fixture_shadow_with_things(55702).await else {
+    let Some((tmp, shadow, _cat, _rfn)) = fixture_shadow_with_things(55702).await else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
-    let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let mut obs = CollectObs::default();
-    // Ack-LSN coverage: even with no buffered records, the commit's source LSN
-    // must advance both ack-LSN gauges so source's slot can recycle
-    // past read-only / filter-dropped xacts.
-    b.commit(
-        99,
-        0,
-        0x9000,
-        &[],
-        &cat,
-        &mut obs,
-        &ToastResolver::disabled(),
-    )
-    .await
-    .unwrap();
+    // Even with no buffered records the commit's source LSN advances
+    // `drain_lsn`, and the caller still registers a seq (had_states=false)
+    // so the contiguous watermark passes read-only / filter-dropped xacts.
+    let mut drain = b.drain_committed(99, 0, 0x9000, &[], false).await.unwrap();
+    assert!(!drain.had_states);
+    assert!(
+        drain
+            .next_batch(usize::MAX, usize::MAX, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drain.finish().await.unwrap();
     assert_eq!(b.stats().commits_unknown_xid, 1);
-    assert!(obs.seen.is_empty());
     assert_eq!(b.stats().drain_lsn, 0x9000);
-    assert_eq!(b.stats().emitter_ack_lsn, 0x9000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -284,7 +290,6 @@ async fn commit_drains_spilled_then_in_memory_entries() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let mut obs = CollectObs::default();
     let fat_col = vec![
         Some(ColumnValue::Int4(0)),
         Some(ColumnValue::Bytea(vec![0u8; 700])),
@@ -305,11 +310,11 @@ async fn commit_drains_spilled_then_in_memory_entries() {
             .await
             .unwrap();
     }
-    b.commit(5, 0, 250, &[], &cat, &mut obs, &ToastResolver::disabled())
+    let seen = drain_all(&mut b, &cat, &ToastResolver::disabled(), 5, 0, 250, &[])
         .await
         .unwrap();
-    assert_eq!(obs.seen.len(), 5);
-    for (i, c) in obs.seen.iter().enumerate() {
+    assert_eq!(seen.len(), 5);
+    for (i, c) in seen.iter().enumerate() {
         let lsn = c.decoded.source_lsn;
         if i < 3 {
             assert!(lsn < 200, "entry {i} expected spilled (lsn<200), got {lsn}");
@@ -336,7 +341,6 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let mut obs = CollectObs::default();
     let col = |id: i32| {
         vec![
             Some(ColumnValue::Int4(id)),
@@ -352,18 +356,18 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
     b.on_heap(heap(rfn, 7, 200, HeapOp::Insert, col(3)))
         .await
         .unwrap();
-    b.commit(
+    let seen = drain_all(
+        &mut b,
+        &cat,
+        &ToastResolver::disabled(),
         7,
         12345,
         300,
         &[8],
-        &cat,
-        &mut obs,
-        &ToastResolver::disabled(),
     )
     .await
     .unwrap();
-    let lsns: Vec<u64> = obs.seen.iter().map(|c| c.decoded.source_lsn).collect();
+    let lsns: Vec<u64> = seen.iter().map(|c| c.decoded.source_lsn).collect();
     assert_eq!(lsns, vec![100, 150, 200]);
     // Per-top accounting: one bump, regardless of subxact count.
     assert_eq!(b.stats().committed_xacts_total, 1);
@@ -379,7 +383,6 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let mut obs = CollectObs::default();
     // wc.things schema: (id int4, body text). Column 0 = id, column 1 = body.
     let id_col = Some(ColumnValue::Int4(1));
     let body_ptr = Some(ColumnValue::ExternalToast(ToastPointer {
@@ -390,8 +393,8 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     }));
     // Chunks buffered before the referring heap, as in WAL:
     // `toast_save_datum` writes chunk INSERTs before the referring tuple,
-    // and the streaming drain detoasts each heap at yield against the
-    // chunks merged so far.
+    // and the drain seals chunk generations no later than the slice whose
+    // heaps reference them.
     for (seq, body) in [(0u32, &b"Hell"[..]), (1, b"o, "), (2, b"wor")] {
         b.on_toast_chunk(
             ToastChunk {
@@ -416,19 +419,19 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     b.on_heap(heap(rfn, 33, 0, HeapOp::Insert, vec![id_col, body_ptr]))
         .await
         .unwrap();
-    b.commit(
+    let seen = drain_all(
+        &mut b,
+        &cat,
+        &ToastResolver::disabled(),
         33,
         12345,
         300,
         &[],
-        &cat,
-        &mut obs,
-        &ToastResolver::disabled(),
     )
     .await
     .unwrap();
-    assert_eq!(obs.seen.len(), 1);
-    let body_col = &obs.seen[0].decoded.new.as_ref().unwrap().columns[1];
+    assert_eq!(seen.len(), 1);
+    let body_col = &seen[0].decoded.new.as_ref().unwrap().columns[1];
     match body_col {
         Some(ColumnValue::Text(s)) => assert_eq!(s, "Hello, wor"),
         other => panic!("expected Text after detoast, got {other:?}"),
@@ -445,7 +448,6 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let mut obs = CollectObs::default();
     let id_col = Some(ColumnValue::Int4(1));
     let body_ptr = Some(ColumnValue::ExternalToast(ToastPointer {
         va_rawsize: 8,
@@ -483,8 +485,7 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         Arc::new(MemChunkStore::new()),
         Arc::new(EmitterStats::default()),
     );
-    let err = b
-        .commit(42, 0, 200, &[], &cat, &mut obs, &resolver)
+    let err = drain_all(&mut b, &cat, &resolver, 42, 0, 200, &[])
         .await
         .expect_err("missing chunk surfaces");
     match err {
@@ -496,70 +497,6 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         }
         other => panic!("expected MissingToastChunk, got {other:?}"),
     }
-}
-
-fn xact_record(info_op: u8, xid: u32, xact_time: i64) -> Record<'static> {
-    let mut main_data = Vec::with_capacity(8);
-    main_data.extend_from_slice(&xact_time.to_le_bytes());
-    Record {
-        parsed: XLogRecord {
-            header: XLogRecordHeader {
-                resource_manager_id: RmId::Xact as u8,
-                info: info_op,
-                xact_id: xid,
-                ..Default::default()
-            },
-            main_data: std::borrow::Cow::Owned(main_data),
-            ..Default::default()
-        },
-        source_lsn: 0,
-        page_magic: 0xD110,
-        route: Route::ToShadow,
-        catalog_signal: walshadow::record::CatalogSignal::None,
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn xact_record_sink_routes_commit_and_abort() {
-    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55706).await else {
-        return;
-    };
-    let _stop = stop_on_drop(&shadow);
-    let cat = Arc::new(Mutex::new(cat));
-    let spill_dir = tmp.path().join("spill");
-    let buf = Arc::new(Mutex::new(XactBuffer::new(cfg(spill_dir, 1024)).unwrap()));
-    {
-        let mut b = buf.lock().await;
-        let col = |id: i32| {
-            vec![
-                Some(ColumnValue::Int4(id)),
-                Some(ColumnValue::Text("z".into())),
-            ]
-        };
-        b.on_heap(heap(rfn, 7, 100, HeapOp::Insert, col(1)))
-            .await
-            .unwrap();
-        b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, col(2)))
-            .await
-            .unwrap();
-        b.on_heap(heap(rfn, 9, 120, HeapOp::Insert, col(3)))
-            .await
-            .unwrap();
-    }
-    let mut sink = XactRecordSink::new(buf.clone(), cat.clone(), CollectObs::default());
-    let commit = xact_record(0x00, 7, 0x1234); // XLOG_XACT_COMMIT
-    sink.on_record(&commit).await.unwrap();
-    let abort = xact_record(0x20, 8, 0); // XLOG_XACT_ABORT
-    sink.on_record(&abort).await.unwrap();
-    // PREPARE — buffer must keep xid=9 alive.
-    let prepare = xact_record(0x10, 9, 0);
-    sink.on_record(&prepare).await.unwrap();
-    assert_eq!(sink.observer_mut().seen.len(), 1);
-    assert_eq!(sink.observer_mut().seen[0].decoded.xid, 7);
-    assert_eq!(sink.observer_mut().seen[0].commit_ts, 0x1234);
-    let b = buf.lock().await;
-    assert_eq!(b.stats().committed_xacts_total, 1);
-    assert_eq!(b.stats().aborted_xacts_total, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

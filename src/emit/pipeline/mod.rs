@@ -109,6 +109,13 @@ pub(crate) async fn lookup_mapping(
     }
 }
 
+/// Tail selection: `ClickHouse` ships sealed blocks over N connections;
+/// `Null` acks at swallow — metrics-only runs, zero CH connections.
+pub enum TailKind {
+    ClickHouse,
+    Null,
+}
+
 /// Inputs the daemon supplies to stand up the pipeline.
 pub struct PipelineConfig {
     pub emitter: EmitterConfig,
@@ -117,7 +124,10 @@ pub struct PipelineConfig {
     pub catalog: Arc<Mutex<ShadowCatalog>>,
     pub mapping: MappingHandle,
     pub oracle: Option<Arc<Oracle>>,
-    pub applicator: DdlApplicator,
+    /// `None` observes schema events / truncates without CH DDL (pairs
+    /// with [`TailKind::Null`])
+    pub applicator: Option<DdlApplicator>,
+    pub tail: TailKind,
     pub buffer: Arc<Mutex<XactBuffer>>,
     pub subxact_tracker: Arc<Mutex<SubxactTracker>>,
     pub schema_events: Option<SchemaEventRx>,
@@ -138,7 +148,8 @@ pub struct PipelineConfig {
     /// spill dir; entries due at resume retire via the post-spawn
     /// [`reorder::ReorderSink::flush_due_retires`] call
     pub retires: crate::toast::toast_retire::RetireLedger,
-    /// Last durable resume cursor, seeded at the resume point
+    /// Persisted resolved floor (aligned, archive-clamped), seeded at the
+    /// resolved start; pruners cut against it verbatim
     pub resume_floor: Arc<AtomicU64>,
     /// Shared resident-payload pool ([`build_budget`]); backup passes run
     /// concurrently with the pipeline and must draw from the same pool.
@@ -194,6 +205,7 @@ impl PipelineConfig {
             mapping,
             oracle,
             applicator,
+            tail,
             buffer,
             subxact_tracker,
             schema_events,
@@ -224,16 +236,21 @@ impl PipelineConfig {
         let tail_config_rx = config_resolver.as_ref().map(|r| r.subscribe());
 
         // Shared tail (ack collector + inserter pool + batcher), the same unit
-        // bootstrap feeds via the page walk.
-        let (msg_tx, ack, tail) = tail::spawn_with_config(
-            &emitter,
-            inserter_pool_size,
-            stats.clone(),
-            emitter_ack.clone(),
-            fatal.clone(),
-            tail_config_rx,
-        )
-        .await?;
+        // bootstrap feeds via the page walk. Null swaps in the swallow task.
+        let (msg_tx, ack, tail) = match tail {
+            TailKind::ClickHouse => {
+                tail::spawn_with_config(
+                    &emitter,
+                    inserter_pool_size,
+                    stats.clone(),
+                    emitter_ack.clone(),
+                    fatal.clone(),
+                    tail_config_rx,
+                )
+                .await?
+            }
+            TailKind::Null => tail::spawn_null(emitter_ack.clone()),
+        };
 
         // Job-queue bound scales with the decode pool for bounded overlap
         let (jobs_tx, jobs_rx) = async_channel::bounded::<decode::DecodeJob>((m * 4).max(8));
