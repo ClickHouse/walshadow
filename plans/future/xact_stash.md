@@ -1,530 +1,803 @@
-# xact stash — generic commit-time raw-record decode
+# xact stash: generic raw-record decode from catalog history
 
-Status: future, extends the commit-time stash in [xact.md](../xact.md) and
+Status: future, extends commit-time stash in [xact.md](../xact.md) and
 [TOAST.md](../TOAST.md)
 
 ## Decision
 
-Promote raw-record stash from toast-only decode to a generic xact-buffer
-capability: any record on an MVCC-invisible filenode decodes at commit
-against a commit-accurate descriptor. Substrate already exists and is
-kind-agnostic — `SpillEntry::Raw`, the `XLOG_SMGR_CREATE` marker map,
-`resolve_stash` — only verdicts, descriptor fidelity, and naming are
-toast-shaped
+Do not generalize toast stash with per-commit resolution bundles
 
-Three mechanisms carry the promotion:
+Build one durable, LSN-indexed catalog history and make every WAL heap decoder
+read descriptors from it. Capture full relation descriptors from shadow at
+catalog commit boundaries, persist each capture before publishing successor
+WAL, then answer `descriptor_at(rfn, lsn)` from bounded intervals rather than
+current shadow state
 
-1. shadow publication fence at commit record *end*: result-bearing,
-   force-flushed, live-wire only
-2. durable per-commit `ResolutionBundle`: one artifact both fence
-   release and crash re-decode depend on
-3. resolve-once dataflow: every heap reaching the emitter travels as
-   `ResolvedHeap` carrying descriptor and route; nothing downstream
-   re-resolves. Live and stash paths converge on the same envelope, so
-   future producers (rewrite FPI, [two_phase_commit.md](two_phase_commit.md))
-   plug in without new plumbing
+Treat generic stash decode as first consumer of this history, not as owner of
+another consistency protocol. Same source must serve live rows, delayed rows,
+spilled rows, toast ownership, schema events, restart replay, and future
+prepared-xact or rewrite consumers
+
+Five changes form one dependency chain:
+
+1. replace independent restart and GC calculations with one durable manifest
+2. collapse serial and pipeline drain consumers into one ordered apply path
+3. capture durable descriptor history at catalog boundaries
+4. put routing and shape config in WAL order, split descriptor and route stages
+5. enable ordinary raw decode only after all preceding prerequisites land
+
+Reject prior `ResolutionBundle` design. A stash-only fence leaves identical
+cold-cache race on live rows, while bundle contents grow toward a per-commit
+snapshot of every decode input. One sparse history closes both paths and
+removes bundle identity, lineage-proof, retention, and resolver-lane protocols
 
 ## Current gap
 
-`StashOutcome::Skip` fences every non-toast resolution: committed rows
-never reach ClickHouse, counted `toast_stash_skipped`. Lost classes:
+`StashOutcome::Skip` drops every non-toast stash candidate. Committed rows do
+not reach ClickHouse for common cases:
 
-- `BEGIN; CREATE TABLE; COPY; COMMIT` — entire initial load
-- same-xact `TRUNCATE` + reload — every reloaded row (toast side already
-  decodes; main tuples skip)
+- `BEGIN; CREATE TABLE; COPY; COMMIT`
+- existing-table `TRUNCATE` plus reload in one xact
 
-Root cause: `relation_at(rfn, commit_lsn)` imposes a lower replay bound
-only. `QueueingRecordSink` decouples decoder workers from shadow replay,
-so shadow can apply a later same-filenode `ALTER` before the worker
-resolves this commit — lookup then returns future `pg_attribute` shape,
-and an `Added` publication would carry future columns. Toast tolerates
-this because chunk shape is fixed (`chunk_id, chunk_seq, chunk_data`);
-ordinary heaps cannot
+Directly changing `Skip` to ordinary decode is unsafe. Correct tuple decode at
+record LSN `L` requires `descriptor(rfn, L)`. `relation_at(rfn, L)` only waits
+for `shadow_replay >= L`, then queries current catalog state at some unbounded
+later position. Worker lag, cache eviction, or restart can therefore substitute
+post-`ALTER` shape for pre-`ALTER` row
 
-A second, quieter gap: today resolution context evaporates immediately.
-`DecodedHeap` carries only rfn/xid/LSN/op/tuples, so pipeline decode
-re-resolves the relation from the live catalog, re-reads the live
-mapping, and detoast re-resolves again. Each re-resolution is a window
-where a later `ALTER`, cache eviction, or restart substitutes future
-shape — a commit-time snapshot that protects only the first parse
-protects nothing. Fixing the descriptor race requires killing the
-re-resolutions, not adding one more lookup
+Race affects live path too:
 
-## Dataflow
+1. row for existing relation appears before `ALTER`
+2. decoder worker falls behind
+3. shadow replays through `ALTER`
+4. descriptor cache is cold or evicted
+5. lookup for old row fetches post-`ALTER` descriptor
 
+Carrying fetched descriptor downstream prevents later re-resolution, but does
+not make initial fetch correct. Name, replica identity, dropped positions,
+column overrides, and encoding plan can all change, not only tuple width
+
+Current inputs also follow four clocks:
+
+- shadow replay position
+- decoder and drain position
+- config state from WAL rows, boot seed, and SIGHUP
+- live Oracle conversion time
+
+Replay stability needs one WAL-positioned ordering domain, not pairwise bridges
+between clocks
+
+## Scope
+
+This plan covers:
+
+- descriptor history for every live and stashed heap record
+- ordinary `INSERT`, `MULTI_INSERT`, `UPDATE`, `HOT_UPDATE`, and `DELETE`
+  operations already supported by heap decoder
+- same-xact `CREATE` plus writes
+- same-xact `TRUNCATE` plus writes when resulting generation is catalog-visible
+- toast relation identity and main-relation descriptor lookup
+- schema-event and routing order
+- spill xid fidelity and multi-insert fanout
+- restart, source identity, retention, and fail-closed behavior
+
+Keep outside scope:
+
+- main-heap rewrite FPI decode
+- generation never visible in catalog at any capture boundary
+- mapped materialized-view replacement semantics
+- PREPARE-durable xact buffering
+- arbitrary historic MVCC snapshots inside PostgreSQL
+
+Never-visible generations remain fail closed until FPI capture supplies tuple
+and lineage data. Examples include rewrite output, intermediate generations
+superseded inside one xact, and some materialized-view refresh paths
+
+## Architecture
+
+```text
+source wire -> pump/classifier ---- bytes ----> shadow
+                  |                              ^
+                  | catalog boundary             | hold after commit EndRecPtr
+                  v                              |
+          catalog capture lane -----------------+
+                  |
+                  v
+       durable metadata journal + manifest
+          | descriptor intervals
+          | schema changes
+          | WAL config changes
+          v
+decoder -> xact buffer -> merged drain -> DescribedHeap
+                                         |
+                              apply preceding metadata/config
+                                         |
+                                         v
+                                      RoutedHeap -> emit
 ```
-source wire ─▶ pump/classifier ──bytes──▶ shadow (wire + archive segs)
-                    │                        ▲ hold at tracked commit END
-                    │ FenceRequest           │ release on Ok(bundle)
-                    ▼                        │
-              resolver lane ──▶ ResolutionBundle (fsync) ─┘
-                    │                 durable, per commit
-                    ▼
-              (bundle indexed by top_xid)
-                    │
-decoder workers ─▶ xact buffer ─▶ drain merge ─▶ ResolvedHeap ─▶ emit
-                   (spill v5)      raw decode     {decoded,
-                                   via bundle      descriptor: Arc,
-                                                   route}
-```
 
-Each boundary has one typed artifact; each artifact is produced once
-and only consumed downstream:
+Catalog capture is only live shadow lookup in row-decode architecture. Heap
+decode, detoast, schema apply, routing, plan construction, and replay consume
+durable metadata history
 
-- `Record` carries `end_lsn` alongside start LSN
-- `FenceRequest { top_xid, subxids, commit_start, commit_end,
-  candidates }` from pump to resolver
-- `ResolutionBundle` from resolver to fence release, drain decode, and
-  crash replay
-- `ResolvedHeap` from drain decode to encoder/emitter
+Hold shadow publication only at catalog-mutating commits. DML-only commits do
+not park. Capture cost remains tied to DDL rate and one local batched snapshot,
+never ClickHouse latency or drain backlog
 
 ## Invariants
 
-1. Shadow may replay through a fenced commit, but receives no bytes
-   past the commit record end until that commit's `ResolutionBundle`
-   is durable
-2. Decode verdict is a pure function of (stashed records, bundle);
-   re-decode after restart yields byte-identical rows, preserving
-   `_lsn` dedup as pure dedup
-3. Abort discards stash and tracking; no speculative descriptors are
-   minted from catalog WAL
-4. Generations without positive resolution proof fail closed for
-   replicated rels — a partial decode is silent row loss, worse than
-   an explicit resnapshot demand
-5. Fence holds are bounded by replay catch-up plus one batched catalog
-   read on a dedicated lane; never coupled to ClickHouse ack, drain
-   backlog, or queued barrier work
-6. Downstream of resolution, no live catalog or mapping read for a
-   bundle-backed heap; descriptor and route travel with the row
+1. `descriptor_at(rfn, L)` is durable pure function of source identity,
+   timeline, database, and WAL position for every decodable generation
+2. Decoder never reads descriptor version whose interval begins after row's
+   effective schema position
+3. Successor WAL cannot reach shadow or archive until catalog-boundary capture
+   covering preceding commit is durable
+4. Schema and route inputs apply in WAL order, route attaches only after all
+   preceding metadata and config events apply
+5. WAL replay emits byte-identical rows for equal source records; live Oracle
+   output and placeholder fallback never feed replayable rows
+6. Unknown invalidation, ambiguous interval, missing history, corrupt history,
+   or never-visible generation fails closed before partial emit
+7. One manifest computes actual restart point and one GC cut for every durable
+   artifact family
+8. Publication hold never waits for ClickHouse, committed drain, or queued
+   barrier work
 
-## Record end LSN
+## WAL positions
 
-`Record::source_lsn` is record start. `pg_last_wal_replay_lsn()`
-reports `lastReplayedEndRecPtr` — end of last applied record (PG
-`src/backend/access/transam/xlogrecovery.c`). Comparing replay against
-commit *start* releases early: previous record can end exactly at
-commit start before the commit applies, snapshot lookup still sees the
-creating xact as invisible
+### PostgreSQL EndRecPtr
 
-`Record` grows `end_lsn`; every fence-side comparison uses it:
-
-- replay wait: `replay >= commit_end`
-- publication boundary: bytes ≤ commit_end delivered, successor bytes held
-- crash test "safe to fresh-resolve": `shadow replay <= recorded fence end`
-- missing-bundle fail-closed comparison
-
-Record-start stays `commit_lsn` for row versioning and cursor semantics
-
-## Fence
-
-Pump-side hold on shadow publication at stash-carrying commits:
-
-- classifier already parses `XLOG_SMGR_CREATE` (Route::ToShadow) and
-  heap block filenodes pump-side; mirror the marker set there, plus the
-  set of xids whose heap records touch a marker filenode — same
-  admission rule as `is_stash_candidate`
-- protocol at a tracked xid's commit, in order:
-  1. register a result-bearing fence waiter (before the commit can
-     reach any worker)
-  2. forward the commit record's wire bytes, append the commit to the
-     decoder queue
-  3. force `QueueingRecordSink::flush()` — normal flush runs only
-     after the whole source chunk returns, so parking without a forced
-     flush strands the commit in the pump buffer and deadlocks
-  4. submit `FenceRequest` to the resolver lane, await the fence
-     `Result`
-  5. on `Ok`, resume successor-byte publication; on `Err`, terminate
-     the pump — worker error, panic, catalog timeout, bundle-write
-     failure, and channel closure all wake the waiter with `Err`
-     (a parked pump has no next call for deferred error surfacing)
-- abort clears tracking without a park
-- wire and archive segments are written by the same pump task, so one
-  hold point covers both delivery paths; a parked pump completes no
-  segment, so `restore_command` cannot bypass the hold on reconnect
-- crash while parked: shadow never received bytes past commit end, so
-  restart re-decodes, re-parks, resolves identically
-- markers are consumed at resolution (`forget_markers`), so later xids
-  touching the same filenode never park — false-positive parks are
-  limited to bare CREATEs with no stashed writes, one replay-wait each
-
-Fence lives at the pump feeding shadow, shared by both drain consumers
-(pipeline reorder and serial `XactRecordSink`)
-
-### Live wire required
-
-Archive segments publish whole, after drain and segment flush; a fence
-cannot hold mid-segment and later amend the segment with original
-successor bytes. Fenced stash therefore requires an active walreceiver:
-reject archive-only configuration (`--walsender-connect-timeout=0`) at
-startup. Archive remains a post-release fallback only. Operational
-consequence: shadow wire loss during a fence recovers by live
-reconnect, not by the archive segment containing that commit
-
-## Resolver lane
-
-Resolution runs on a dedicated pre-drain lane, not inside drain commit:
-the drain path runs `flush_due_retires` (which can call ClickHouse via
-`retire_mirror`) and sits behind all older queue entries — DDL,
-truncate barriers, downstream backpressure. Routing resolution through
-it would couple fence holds to ClickHouse outages, violating
-invariant 5
-
-The lane consumes `FenceRequest`s:
-
-1. wait `shadow replay >= commit_end` on a dedicated shadow connection
-   (or cache-bypassing fetch — worker-position invalidation state can
-   make the shared cache stale)
-2. resolve all candidates in one batched catalog read: single query
-   over the candidate rfn set joining pg_class/pg_attribute, not the
-   serial per-candidate class + replident + attributes round trips of
-   `relation_at` today
-3. build the `ResolutionBundle`, write durable, release the fence
-
-Drain-side `resolve_stash` becomes a bundle lookup by top_xid — no
-catalog access at drain time
-
-## ResolutionBundle
-
-One versioned, checksummed file per fenced commit — write temp, fsync,
-rename, fsync directory. Single atomic unit avoids partially persisted
-per-rfn sets and gives fence release exactly one durable condition.
-Contents:
-
-- top xid, commit start LSN, commit end LSN
-- per-candidate outcome, keyed by rfn:
-  - ordinary: full `RelDescriptor` (see fidelity below), marker LSN
-  - toast: toast relation OID, marker LSN — fixed chunk shape removes
-    the descriptor need, not the identity need. Crash after release but
-    before chunks drain, followed by shadow replaying a later
-    drop/rewrite, must still resolve chunk ownership from the bundle,
-    or the main row cannot detoast
-  - discard: reason, with the positive proof that justified it
-- schema-event intents: first resolution of a new rel emits
-  `SchemaEvent::Added` through a volatile channel today; crash after
-  release but before apply loses it, and bundle-based reload bypasses
-  `relation_at` so nothing regenerates it. The intent is part of the
-  bundle; drain replays it idempotently at the marker LSN
-- routing input: config-version reference for the commit position
-  (see verdicts)
-- completion marker
-
-Bundle lives beside the durable cursor and toast-retire ledger under a
-nonvolatile filename prefix: `SpillStore::clear` removes only
-`xid-*.bin` and `toastbody-*.bin`, so boot wipe does not touch it, and
-cursor + bundle share one filesystem for ordering
-
-Load rejects unknown versions and checksum failures — fail closed, not
-best-effort parse
-
-### Retention
-
-Restart begins at `align_down(emitter_ack_lsn, WAL_SEG_SIZE)`, not at
-the exact persisted commit LSN, so "floor passed the commit" is not
-prune-safe — the restart still rereads the commit's whole segment.
-Same rule the toast-retire ledger already uses:
-
-```
-cut = align_down(durably persisted resume-safe emitter floor)
-prune bundle iff commit_start_lsn < cut
-```
-
-Read the floor only after the crash-safe cursor write succeeds;
-in-memory ack advancement is insufficient
-
-Missing bundle on restart: fresh resolution is safe iff shadow replay
-≤ recorded fence end and no durable release evidence exists (crash
-while parked). Shadow past the fence end with no bundle is unprovable
-shape — fail closed. Explicit `--start-lsn` rewind into pruned range:
-reject unless bundles are retained
-
-## ResolvedHeap
-
-The envelope every heap travels in from drain decode to emit:
+Keep record start and PostgreSQL next-record position distinct:
 
 ```rust
-struct ResolvedHeap {
-    decoded: DecodedHeap,
-    descriptor: Arc<RelDescriptor>,
-    route: Option<Arc<TableMapping>>,
+struct Record {
+    source_lsn: u64,
+    next_lsn: u64,
+    wire_end_lsn: u64,
+    // ...
 }
 ```
 
-Exact shape may evolve; requirements are fixed:
+`source_lsn` remains row version and ordering position. `next_lsn` must match
+PostgreSQL `XLogReaderState::EndRecPtr`, not last physical record byte:
 
-- raw tuple parse, detoast, DDL event, routing, and encoder-plan
-  construction all read the same envelope
-- no catalog or live-mapping re-resolution downstream — the current
-  hops (pipeline decode re-resolving relation and mapping, xact-buffer
-  detoast re-resolving descriptor) are removed, not bypassed
-- spill and batch memory accounting includes retained context
+- ordinary record advances by aligned total length
+- page-spanning record advances from continuation-page address by aligned
+  remaining length
+- segment-spanning record follows same continuation semantics
+- `XLOG_SWITCH` advances to segment end
 
-Live path constructs the envelope at decode time from the
-epoch-validated cache; stash path from the bundle. Downstream is
-source-blind — one code path, and future producers (rewrite FPI pages,
-prepared xacts) join by constructing the same envelope
+Keep `wire_end_lsn` only for byte framing. Never use it for replay comparison
 
-Per-filenode caches (`relation_at_pooled`) are not a substitute: a
-later inline lookup can replace the same-filenode entry before a
-pooled worker reads it. Ownership travels with the row or not at all
+All capture boundaries use `next_lsn`:
 
-## Raw substrate repairs
+- wait until `pg_last_wal_replay_lsn() >= commit.next_lsn`
+- deliver bytes through commit, hold every successor byte
+- stamp capture batch with commit start and `next_lsn`
+- compare crash recovery against exact `next_lsn`
 
-Two structural changes before ordinary heaps decode correctly:
+Port arithmetic from PostgreSQL `xlogreader.c`, keep version-specific tests
+beside WAL walker
 
-- spill v5 persists xid in `RawRecord`: `to_xlog_record` leaves
-  `xact_id` zero today, and the emitter writes header xid into `_xid` —
-  every generic raw-decoded row would emit `_xid = 0`, breaking
-  byte-identical replay and user-visible metadata
-- pending decoded-heap queue in `MergedDrain`: one raw
-  `XLOG_HEAP2_MULTI_INSERT` yields multiple heaps, `fold_raw` currently
-  folds one entry with no queue. All tuples of one raw record emit
-  before the merge advances past that record LSN; event-before-heap
-  tie-break at equal LSN preserved; queued decoded memory accounted
+### Effective schema position
 
-## Drain decode
+Each descriptor version carries two positions:
 
-- Raw ordinary-heap records decode inside the k-way merge like live
-  records: descriptor from the bundle, `ResolvedHeap` into the
-  committed-tuple path, record-LSN ordered — the same-xact TRUNCATE
-  wipe barrier orders correctly for free
-- resolve toast verdicts before ordinary heap decode: a CREATE that
-  makes both a main rel and its toast rel stashes both generations, and
-  main-tuple detoast reads the in-xact chunk map the toast decode fills
-- bundle-carried `Added` intents are stamped at the filenode's marker
-  LSN, not commit LSN: the marker precedes every stashed record by
-  construction, so catalog-before-tuple ordering creates the CH table
-  ahead of its rows. Commit-LSN stamping would sort the event after
-  the tuples it gates
+```rust
+struct CatalogVersion {
+    valid_from: WalPosition,
+    captured_at: WalPosition,
+    value: CatalogValue,
+}
+
+enum CatalogValue {
+    Present(Arc<RelDescriptor>),
+    Dropped { oid: Oid },
+}
+```
+
+`captured_at` is catalog commit `next_lsn`, point where shadow snapshot became
+visible and journal batch became eligible for publication
+
+`valid_from` is earliest proven relation-specific schema position:
+
+- bootstrap baseline uses bootstrap handoff LSN
+- new filenode uses observed `XLOG_SMGR_CREATE` marker
+- existing relation change uses earliest relation-specific catalog mutation or
+  invalidation position
+- drop uses relation-specific drop observation
+
+Capture final committed descriptor only. If one xact produces multiple
+incompatible layouts for same generation and user rows overlap intermediate
+layouts, no single sampled version proves decode. Mark interval ambiguous and
+fail closed. Permit compatible transitions only through explicit physical
+compatibility predicate, including attnum-preserving rename, replica-identity
+change, and append-only column addition with complete dropped-slot layout
+
+Never guess `valid_from` from commit time when same-xact rows precede commit. If
+parser can identify changed relation but not exact change position, publish
+post-commit version for future rows and fail closed for overlapping rows
+
+### Catalog frontier and decode admission
+
+Pump owns monotonic catalog frontier: highest dispatched WAL position with no
+unresolved committed catalog boundary before it. Publication hold advances
+frontier through catalog commit only after journal batch becomes durable
+
+Record dispatch after catalog boundary therefore proves required history is
+present. Handle records inside catalog-changing xact separately:
+
+- first catalog record marks top xid catalog-dirty before later user record can
+  decode
+- `XLOG_SMGR_CREATE` marks new rfn immediately
+- user heap record after dirty mark stays `SpillEntry::Raw`, even when old
+  descriptor exists for same rfn
+- commit drain waits for catalog frontier through commit `next_lsn`, then
+  selects captured interval and decodes raw records
+- user record before first catalog mutation may decode against predecessor
+  interval
+- abort clears dirty state and raw records without journal append
+
+When relation identity for dirty catalog records is not known yet, defer all
+later user heap records in that top xid. Prefer extra raw buffering over stale
+decode. Capture batch later narrows affected relations; unrelated deferred rows
+decode through unchanged intervals
+
+Multiple catalog changes after dirty mark may expose intermediate layout which
+final snapshot cannot recover. Compatibility check or ambiguity record decides,
+never timing or cache state
+
+## Catalog-boundary detection
+
+Track catalog mutation by top xid in pump classifier, including assigned
+subxids. Existing `CatalogTracker` and `pg_class_decoder` provide starting
+signals, but capture admission must not depend on decoder-worker cache state
+
+Build affected-relation observations from:
+
+- relcache invalidation messages in commit records carrying `HAS_INVALS`
+- `XLOG_XACT_INVALIDATIONS` records
+- decoded `pg_class` identities already available to `CatalogTracker`
+- relation identifiers from other catalog tuples needed for exact change
+  position, especially `pg_attribute` and `pg_index`
+- `XLOG_SMGR_CREATE` markers for new filenode generations
+- `XLOG_SMGR_TRUNCATE` and heap `TRUNCATE` OIDs where relevant
+
+Decode `SharedInvalidationMessage` with explicit PostgreSQL-major layouts.
+Unknown tag, short payload, unsupported major, or unresolved database identity
+must never mean no change
+
+Fallback for incomplete affected-rel enumeration:
+
+1. capture all catalog-visible user relations in affected database
+2. diff against durable preceding snapshot to find changes and drops
+3. retain conservative post-commit versions
+4. fail closed for user records in any interval whose exact `valid_from` cannot
+   be proved
+
+Full scan is acceptable as rare DDL-rate fallback. It preserves future rows
+without claiming correctness for ambiguous intra-xact history
+
+## Publication hold
+
+At each catalog-mutating top-level commit:
+
+1. register result-bearing boundary waiter before commit can leave pump
+2. forward commit bytes through `next_lsn` to shadow
+3. enqueue commit for decoder path
+4. force `QueueingRecordSink::flush()` so commit cannot remain stranded inside
+   current source chunk
+5. wait for shadow replay through exact `next_lsn`
+6. capture affected descriptors on dedicated shadow connection
+7. append one checksummed journal batch, fsync data, atomically advance manifest
+   frontier, fsync directory
+8. release successor-byte publication on `Ok`
+9. terminate pump on error
+
+Waiter selects between capture result and terminal transport or worker-health
+signal. Channel closure, worker panic, replay timeout, catalog error, journal
+error, manifest error, and permanent walreceiver loss wake waiter with `Err`
+
+Do not wait for decoder to process commit. Forced flush proves delivery to
+queue, health signal proves task remains viable. Capture lane never calls
+ClickHouse and never queues behind `flush_due_retires`
+
+Crash behavior follows hold position:
+
+- before journal fsync, successor bytes were not published, restart replays and
+  recaptures boundary
+- after journal fsync but before release, duplicate capture is idempotent by
+  source identity, timeline, commit `next_lsn`, and batch digest
+- after release, durable batch already covers every published successor record
+- partial tail without valid batch footer or checksum is ignored, then same
+  boundary is recaptured before publication resumes
+
+### Live wire requirement
+
+Whole archive segments cannot stop after a mid-segment commit and later append
+original successor bytes. Catalog-boundary hold therefore requires active
+walreceiver, while archive remains post-release recovery path
+
+Enforce capability, not flag value:
+
+- reject `--walsender-connect-timeout=0`
+- fail startup if walreceiver does not attach before configured timeout
+- during hold, reconnect live wire before catalog timeout or fail boundary
+- prevent `restore_command` from observing segment containing unreleased bytes
+
+Positive timeout without attachment must fail startup, not warn and continue
+archive-only
+
+## Durable metadata journal
+
+Store one append-only journal beside cursor state. Journal header binds data to:
+
+- source system identifier
+- PostgreSQL major
+- timeline
+- source database OID
+- WAL segment size
+- format version
+
+Reject source replacement, incompatible major, timeline mismatch without
+declared history transition, or checksum failure. Never load files solely by
+xid or filenode
+
+Each catalog batch contains:
+
+- commit start and `next_lsn`
+- affected relation observations and trigger positions
+- complete new descriptor versions
+- explicit drop versions
+- old and new descriptor digests
+- deterministic schema intent derived from durable predecessor
+- toast main/relation ownership intervals
+- ambiguity records for intervals that must fail closed
+- batch checksum and completion footer
+
+Key descriptor lookup by `(source, timeline, db_node, spc_node, rel_node)` and
+search version intervals by WAL position. Retain relation OID as identity and
+lineage field, not lookup substitute, because filenodes rotate
+
+Schema intent must not depend on volatile `ShadowCatalog::prev_known`.
+Derive `EnsureRelation`, `Changed`, or `Dropped` from preceding journal version
+and descriptor digest. Replaying journal produces same event at same
+`valid_from` position
+
+Config events may share journal framing so compaction can checkpoint one ordered
+metadata state. They still originate only from WAL-decoded config rows
+
+### Capture snapshot
+
+Use one SQL statement or explicit read-only repeatable-read transaction after
+shadow reaches boundary. Batched capture must include:
+
+- `pg_class`, `pg_namespace`, and relation identity
+- every positive `pg_attribute.attnum`, including dropped positions
+- type metadata needed for physical decode
+- `pg_index` data for primary and replica-identity keys
+- relation persistence and relkind
+- toast ownership in both directions
+
+Preserve foreign-database guard before rfn lookup. `rel_node` is unique only
+inside database identity
+
+Query dropped attributes without `pg_type` inner join. PostgreSQL can zero
+`atttypid` while retaining physical `attlen` and `attalign`; descriptor must
+keep one slot per positive attnum and consume bytes for dropped positions
+
+Serialize complete versioned `RelDescriptor` and `RelAttr`, including:
+
+- namespace, relation name, OID, rfn, relkind, persistence
+- attnum, name, dropped flag, nullability, missing value
+- type OID/name, length, alignment, by-value, storage, typmod
+- replica identity mode, index OID, key attnums
+- toast relation identity
+
+Do not reconstruct any field from live catalog downstream
+
+### Bootstrap and migration
+
+Greenfield bootstrap captures complete catalog baseline at bootstrap handoff
+LSN before streaming starts. Decoder never requests history before that point
+
+Existing deployments enabling catalog history need one explicit transition:
+
+- drain to durable boundary, capture complete baseline, start new history epoch
+- or resnapshot
+
+Do not seed current descriptors and silently claim coverage for earlier replay
+range. Explicit `--start-lsn` before retained baseline must fail startup
+
+## One manifest and one GC cut
+
+Replace independent retention formulas with one crash-safe manifest and one
+shared helper used by startup and pruning. Manifest owns at least:
+
+```text
+source identity
+timeline
+effective durable resume LSN
+decoder floor
+catalog frontier
+shadow recovery floor
+GC cut
+metadata checkpoint generation
+immutable routing seed digest and contents
+```
+
+Compute effective resume with exact startup rules, including segment alignment,
+cursor `emitter_ack_lsn`, `filter_durable_lsn`, sealed-archive clamp, bootstrap
+handoff, and explicit override validation. Pruner must call same helper rather
+than duplicate formula
+
+Compute one conservative cut from every durable floor. Apply cut to artifact
+families with format-specific mechanics only:
+
+- archive and spool segments remove complete units ending at or below cut
+- xid spill removes only transactions proven below cut and no longer live
+- toast-retire entries compact below cut
+- metadata journal compacts old batches into checkpoint, retaining predecessor
+  descriptor/config version needed to answer first position at cut
+
+Persist new checkpoint and manifest before deleting old journal segments.
+Crash between manifest fsync, deletion, and directory fsync must load either
+old complete generation or new complete generation
+
+Required archive-clamp case:
+
+1. cursor ack reaches segment `N+2`
+2. sealed archive ends at `N`
+3. metadata version needed by replay lies in `N+1`
+4. GC runs
+5. restart clamps to archive end
+6. version remains available and replay succeeds
+
+Reject operator rewind below GC cut. Never treat missing history as cache miss
+eligible for current-state lookup
+
+## Descriptor and route stages
+
+Split row context at actual ordering boundary:
+
+```rust
+struct DescribedHeap {
+    decoded: DecodedHeap,
+    descriptor: Arc<RelDescriptor>,
+}
+
+struct RouteSnapshot {
+    mapping: Arc<TableMapping>,
+    column_overrides: Arc<ColumnOverrides>,
+    row_encoding: Arc<RowEncodingSnapshot>,
+}
+
+struct RoutedHeap {
+    described: DescribedHeap,
+    route: Arc<RouteSnapshot>,
+}
+```
+
+`MergedDrain` decodes raw records with catalog history and yields
+`DescribedHeap`. Reorder coordinator then:
+
+1. applies preceding schema and config entries
+2. resolves route for following WAL interval
+3. snapshots every encoding-relevant mapping field
+4. constructs `RoutedHeap`
+5. dispatches trailing segment
+
+Route must include column overrides consumed by `TablePlan`, namespace defaults,
+auto-create result, destination, and any other state capable of changing row
+values or uncompressed CH row encoding. `TableMapping` alone is insufficient
+
+Detoast and physical tuple decode use `DescribedHeap`. Encoder plan uses
+`RoutedHeap`. No stage performs another catalog or live-mapping lookup
+
+Account retained descriptors and route snapshots in spill, queued-batch, and
+resident-memory budgets
+
+## Routing and config clock
+
+Make routing and shape config pure function of WAL position:
+
+- persist immutable TOML/CLI routing seed in manifest when history epoch starts
+- reject changed routing seed on restart until operator starts new drained epoch
+  or resnapshot
+- apply table, namespace, column, mapping, and shape changes only through
+  WAL-ordered config overlay after pump starts
+- limit SIGHUP to operational knobs whose value cannot change logical row
+  contents, schema, or destination, such as budgets, compression, retry, and
+  observability
+- apply each WAL config entry through same reorder site as schema entry
+
+Boot source-table seed must correspond to baseline LSN and become durable before
+streaming. Later source config changes come only from decoded WAL, never fresh
+side query on restart
+
+Append committed config events to metadata journal before first event from that
+xact applies. Config-only commits need no shadow publication hold: stable boot
+seed plus retained source WAL can reproduce append after crash. Identify event
+by source, timeline, commit LSN, record LSN, and ordinal, not xid alone
+
+Journal compaction folds config events below GC cut into checkpointed config
+state. Replayed event append is idempotent and must match stored digest
+
+This removes per-commit config-version references. Route at `L` derives from
+durable seed plus ordered config entries through `L`
+
+## Replay and Oracle policy
+
+Keep byte-identical replay invariant. `_lsn` is ReplacingMergeTree version, but
+equal-version rows with different bodies do not have a safe deterministic
+winner. Dedup-sufficiency therefore cannot permit value drift
+
+WAL row decode may use only deterministic in-process codecs. `PgPending`,
+`Unsupported`, compressed varlena without local decoder, or any value requiring
+live `walshadow_decode_disk` fails closed before row dispatch
+
+Remove placeholder fallback from replayable WAL path. Oracle may remain for
+diagnostics or explicitly non-replayable tooling, never for rows governed by
+cursor rewind
+
+Expand local codecs independently. Do not persist per-value Oracle output in
+metadata journal, that recreates per-row bundle state and couples catalog hold
+to value volume
+
+## Raw substrate
+
+Complete both repairs before ordinary raw verdict is enabled:
+
+- spill v5 persists original xid in `RawRecord`; reconstructing record with
+  `xact_id = 0` corrupts `_xid`
+- `MergedDrain` owns pending decoded-item queue because one
+  `XLOG_HEAP2_MULTI_INSERT` yields multiple heaps
+
+Queue every tuple from one raw record before merge advances beyond record LSN.
+Preserve event-before-heap tie break at equal LSN and include queued decoded
+memory in budget accounting
+
+Raw ordinary decode resolves descriptor from journal, produces
+`DescribedHeap`, and enters same committed-tuple path as live decode. Do not
+maintain separate stash emitter
+
+Resolve toast ownership before main tuple detoast for generations created in
+same xact. Ownership comes from descriptor intervals, not current catalog or
+per-commit bundle
 
 ### TRUNCATE
 
-Existing-table TRUNCATE + reload works once new-filenode raw rows
-decode: the truncate barrier uses the old, visible descriptor
+Existing-table `TRUNCATE` plus reload works when final new generation is
+catalog-visible: old generation and truncate event come from history, SMGR
+marker anchors new generation, final capture supplies new descriptor
 
-Same-xact CREATE + INSERT + TRUNCATE + INSERT does not: the relation is
-invisible when `handle_truncate` resolves by OID, and the TRUNCATE
-record carries OIDs, not filenodes, so marker admission never sees it.
-Defer unresolved TRUNCATE OIDs to commit-time resolution via the
-bundle, preserving the truncate record LSN for barrier ordering
+`CREATE; INSERT; TRUNCATE; INSERT` contains first generation never visible at a
+commit boundary. Fail closed until explicit lineage/FPI work can prove first
+rows are safely superseded. Do not revive discard-proof taxonomy in stash
 
-### Image-only decode
+Preserve TRUNCATE record LSN and resolve OIDs through durable catalog history so
+wipe barrier remains ordered before post-truncate rows
 
-Ordinary INSERT/COPY retains tuple bytes with `REGBUF_KEEP_DATA` under
-`wal_level=logical` ([decoder.md](../decoder.md)); a checkpoint
-mid-COPY attaches an FPI but block data still carries the tuple, so
-that case exercises the normal path. The genuine image-only source is
-`HEAP_INSERT_NO_LOGICAL` — the rewrite path (PG
-`src/backend/access/heap/rewriteheap.c`), out of scope here. Until
-rewrite FPI admission lands, an image-only ordinary record is a
-fail-closed error, tested with a synthetic record carrying an image
-and no block data. The eventual ordinary image helper (distinct from
-the toast-specific one returning `StashedToastOp`) constructs
-`DecodedHeap` preserving original xid and operation, malformed line
-pointer fails closed
+### Image-only records
 
-## Verdicts
+Logical ordinary INSERT/COPY keeps tuple block data with
+`REGBUF_KEEP_DATA`, including checkpoint-mid-COPY cases. True image-only source
+is rewrite path using `HEAP_INSERT_NO_LOGICAL`
 
-`StashOutcome::{Toast(desc), Heap(desc), Discard(proof)}`:
+Until main rewrite FPI admission lands, image-only ordinary record fails closed.
+Synthetic image-only test must carry image without block data. Do not use
+checkpoint-mid-COPY as proxy
 
-- `Heap` for every supported ordinary relkind, independent of current
-  mapping. Routing is not a resolution-time property: config events
-  apply inside drain by WAL position ([config.md](../config.md)), so a
-  config-table row in the same xact can add the mapping ahead of
-  trailing stashed rows, opt-in mid-xact splits route/discard by
-  record position, and auto-created rels gain their mapping only when
-  the `Added` event applies. A per-rfn mapped/unmapped verdict cannot
-  represent any of these. Drain barriers decide the route per record;
-  unmapped-at-position rows discard there, counted by reason. Fence
-  still parks for unmapped rels (pump cannot know mapping); release
-  happens at resolution regardless
-- byte-identical restart requires routing input be replay-stable: the
-  bundle records a config-version reference, and replayed drain applies
-  the same ordered config stream. Non-WAL config changes (SIGHUP, file
-  edit) landing between dispatch and crash replay are the residual
-  hazard — see open questions
-- markerless resolution of a replicated rel fails closed — converts
-  today's silent skip into an explicit fresh-snapshot demand, matching
-  the toast posture (`IncompleteToastGeneration`)
-- unresolvable-at-commit candidates discard only on positive proof:
-  created-and-dropped within the xact, or the superseding generation
-  is itself captured completely. Rotated-away is not neutral — with
-  main-heap rewrite FPI out of scope, `BEGIN; TRUNCATE t; INSERT;
-  ALTER TABLE t ... TYPE ...; COMMIT` leaves the intermediate
-  generation unresolvable, the final generation uncaptured, and a
-  discard would apply the CH truncate while emitting nothing. Without
-  proof: fail closed
-- mapped relkind `m` is unsupported, fail closed: `REFRESH
-  MATERIALIZED VIEW` is replacement-shaped, a discard leaves a stale
-  destination
+## One drain consumer
 
-## Descriptor fidelity
+Remove duplicate ordered apply implementations. Run serial
+`XactRecordSink` behavior as degenerate pipeline configuration with one worker
+and synchronous observer. Keep one merge, one schema/config apply site, one
+route snapshot point, and one barrier implementation
 
-Bundles serialize the full `RelDescriptor`/`RelAttr`, versioned — not
-a minimal `(attnum, name, type oid, dropped)` projection. Tuple decode
-and DDL/routing reproduction need type len/align/byval/storage, typmod,
-missing value, dropped flag, nullability, type name, replica identity
-and key attnums, persistence, relkind, namespace and relation identity.
-Anything less re-derives shape from a live catalog, which is the race
-this plan exists to close
+Metrics-only and test paths use same ordering engine. Do not preserve alternate
+catalog-event semantics for convenience
 
-Dropped columns expose a live fidelity gap to fix on the way: PG keeps
-`attlen`/`attalign` on dropped attributes while zeroing `atttypid`
-(PG `src/backend/catalog/heap.c`), but the catalog query inner-joins
-`pg_type`, so dropped attributes vanish from the descriptor instead of
-consuming their physical tuple bytes. Fetch dropped attributes without
-requiring `pg_type`, read physical fields from `pg_attribute`
-directly, keep one descriptor element per positive attnum including
-dropped positions
+## Fail-closed boundary
 
-## Consumers
+Stop before any partial xact emit when:
 
-- current: toast generations (rewrites, same-xact toast churn)
-- this plan: ordinary-heap same-xact CREATE+INSERT and TRUNCATE+INSERT
-- prospective: rewrite main-heap FPI walk — `log_newpage` pages of a
-  rewriting ALTER carry post-rewrite tuples; decoding them would
-  re-emit exact bytes instead of relying on the applicator's CH-side
-  type conversion, and would give unresolvable-generation candidates
-  their positive proof. Needs FPI admission into the stash (today only
-  heap-rmgr records stash)
-- prospective: [two_phase_commit.md](two_phase_commit.md) — a
-  PREPARE-durable buffer is the same spill substrate producing the same
-  `ResolvedHeap` envelope; the PREPARE-to-COMMIT-PREPARED restart gap
-  is inherited unchanged
+- descriptor interval is absent or ambiguous
+- generation never became catalog-visible
+- affected-relation invalidation cannot be decoded safely
+- descriptor journal or manifest is missing, corrupt, or source-mismatched
+- dropped-column physical metadata is incomplete
+- operation has image only
+- relation is mapped materialized view awaiting replacement semantics
+- deterministic codec is unavailable
+- explicit rewind precedes retained baseline
 
-## Observability
+Abort and subxact abort discard buffered raw records, observations, and pending
+metadata events. Never publish descriptor from aborted catalog transaction
 
-- rename `toast_stash_*` → `stash_*`; `stash_decoded` splits by kind,
-  `stash_skipped` retires with the fence, discards gain a reason label
-- fence: parks, hold duration, releases by result (ok/error)
-- resolver lane: queue depth, batched-read duration
-- bundles: persisted/loaded/pruned counts and bytes
-- fail-closed count by reason (markerless, unresolvable-no-proof,
-  missing-bundle, checksum, image-only, relkind)
+Unmapped relation with complete descriptor remains normal route discard at
+record position. Missing descriptor is not equivalent to unmapped
 
-## Phases
+## Delivery order
 
-0. Transport and fence, no row-path change: `end_lsn` on `Record`,
-   force-flush result-bearing fence protocol, live-wire startup
-   requirement, resolver lane, bundle persist/load/prune. Ordinary
-   verdict still skips; assert bundle descriptor equals `relation_at`
-   under a forced worker-lag ALTER race — proves fence and bundle with
-   zero row-path change
-1. Ordinary INSERT and MULTI_INSERT decode: `ResolvedHeap` end to end,
-   spill v5 xid preservation, multi-insert pending queue, replayable
-   `Added` at marker LSN
-2. Interplay: toast/main chunk-map ordering, ordered-config routing at
-   drain, existing-table TRUNCATE, deferred TRUNCATE-OID resolution
-3. Hardening: fail-closed unresolved generations, dropped-column
-   descriptor fidelity, crash matrix
-4. Surface generalization: metric renames, promote the
-   [xact.md](../xact.md) stash section to kind-neutral wording with
-   toast as one consumer, discard-proof taxonomy
+Treat order as dependencies, not independently shippable row features
 
-Separate future work: main rewrite FPI admission, materialized-view
-refresh
+1. unify manifest and effective-resume/GC helper
+2. collapse serial drain into pipeline ordering path
+3. add exact `next_lsn`, boundary hold, worker health propagation, and active
+   walreceiver enforcement without changing row verdicts
+4. add journal format, bootstrap seed, affected-rel capture, dropped-slot
+   fidelity, source validation, compaction, and crash recovery
+5. switch all live descriptor lookup and schema events to journal, remove
+   generation epoch, lazy invalidation, `prev_known`, and volatile schema-event
+   channel
+6. persist routing seed, constrain SIGHUP, journal WAL config, add staged
+   `DescribedHeap`/`RoutedHeap`, and enforce deterministic codec policy
+7. add spill v5 xid and multi-insert pending queue
+8. atomically enable ordinary raw `INSERT`, `MULTI_INSERT`, `UPDATE`,
+   `HOT_UPDATE`, and `DELETE`
+9. generalize stash metrics and documentation
+10. later, admit rewrite FPI to cover never-visible generations
+
+Keep ordinary raw decode behind one feature gate until steps 1 through 7 pass.
+Do not enable insert family before descriptor fidelity, config ordering, and
+fail-closed policy
 
 ## Acceptance
 
-Fence protocol:
+### EndRecPtr and hold
 
-- decoder_batch_size > 1; commit mid source CopyData chunk
-- worker error before commit; error during bundle write; worker panic —
-  each wakes the fence waiter with `Err`, pump terminates
-- false-positive tracked commit (bare CREATE, no stashed writes) —
-  parks once, releases at resolution
-- archive-only configuration rejected at startup when fence enabled
+- unaligned single-page record computes PostgreSQL `EndRecPtr`
+- page-spanning and segment-spanning records compute exact next position
+- record ending on page boundary remains correct
+- `XLOG_SWITCH` advances to segment end
+- replay equal to exact commit `next_lsn` permits capture
+- decoder batch size greater than one, commit mid-CopyData chunk, forced flush
+  prevents deadlock
+- capture error, journal error, worker error, worker panic, channel closure, and
+  walreceiver loss wake waiter with `Err`
+- positive walreceiver timeout with no attachment fails startup
+- DML-only commit does not park
+- bare DDL with no replicated rows parks once and releases after durable capture
 
-Retention:
+### Catalog history
 
-- floor one byte past commit, same segment — bundle retained
-- floor at next segment boundary — bundle prunable
-- crash between cursor fsync and bundle deletion; between deletion and
-  directory fsync
-- `--start-lsn` rewind into pruned range rejected
+- existing table, cold cache, pre-`ALTER` row, later same-rfn `ALTER`, forced
+  worker lag, old row uses old descriptor
+- same sequence after restart and cache eviction produces identical row bytes
+- CREATE plus plain/toasted COPY captures descriptor at marker and emits rows
+- existing-table TRUNCATE plus reload resolves final generation
+- relation rename, replica-identity change, and column override bind to correct
+  WAL interval
+- dropped column retains physical slot and subsequent values decode correctly
+- batched snapshot preserves primary and replica-identity index attnums
+- foreign database rfn never resolves through local database query
+- schema `Ensure`/`Changed`/`Dropped` event replays from journal without
+  `prev_known`
+- multiple incompatible layouts inside one xact fail closed when intermediate
+  shape was never captured
+- unknown invalidation tag triggers full-scan fallback or fail closed, never
+  false no-change
 
-Decode:
+### Raw operations
 
-- `BEGIN; CREATE TABLE; COPY` (toasted + plain) `; COMMIT` — table,
-  rows, toast values land, `_xid` matches source; one xact end to end
-- same-xact TRUNCATE + reload — exactly the reloaded rows survive the
-  wipe barrier
-- CREATE + INSERT + TRUNCATE + INSERT in one xact — only post-truncate
-  rows land
-- CREATE + INSERT + `ALTER ADD COLUMN` + INSERT + COMMIT — both batches
-  decode at commit shape (tuple natts handles the pre-ALTER batch)
-- multi-insert raw record — every tuple emits before merge advances
-- commit followed by next-xact same-filenode ALTER under forced worker
-  lag — bundle reflects the commit, ALTER applies afterwards as its own
-  event
-- descriptor with dropped columns — physical bytes consumed, values
-  correct
+- CREATE, INSERT, UPDATE, COMMIT emits final row with source xid
+- CREATE, INSERT, DELETE, COMMIT emits ordered tombstone
+- TRUNCATE, INSERT, UPDATE, COMMIT preserves wipe ordering
+- multi-insert emits every tuple before merge advances
+- multi-insert followed by later update preserves LSN order
+- replica identity default, full, and index changes decode old image correctly
+- subxact update/delete followed by subxact abort emits nothing from aborted
+  branch
+- unsupported no-payload heap operation remains explicit fail-closed result
 
-Crash matrix:
+### Routing
 
-- crash while parked — restart re-parks and resolves, no divergence
-- crash after release, before floor passes the commit — bundle
-  re-decode is byte-identical, including `Added` replay and toast
-  identity
-- bundle removed with shadow past fence end — fail closed
-- bundle checksum failure — fail closed
+- unmapped CREATE plus INSERT discards at route stage, counted by reason
+- config-table opt-in before row in same xact routes row
+- row before opt-in discards, trailing row routes
+- auto-create schema event applies before route snapshot
+- route snapshot includes column override consumed by `TablePlan`
+- restart with changed TOML mapping seed refuses stream until new epoch
+- SIGHUP operational knob applies, SIGHUP mapping/shape mutation is rejected
 
-Fail closed:
+### Replay codecs
 
-- attach mid-xact (markerless) for a replicated rel
-- TRUNCATE + reload + rewriting ALTER in one xact — no discard, no
-  partial emit
-- mapped matview refresh
+- locally decoded values replay byte-identically after crash
+- `jsonb`, array, domain, custom type, and compressed varlena without local codec
+  fail closed before any xact row dispatch
+- shadow extension present, absent, changed, or injected Oracle error cannot alter
+  WAL output because WAL path never queries Oracle
+
+### Durability and GC
+
+- crash before batch footer ignores tail and recaptures boundary
+- crash after journal fsync but before release accepts idempotent duplicate
+- crash after release reloads descriptor and schema event from journal
+- checksum, unknown version, source-system mismatch, and timeline mismatch fail
+  closed
+- cursor in `N+2`, archive end in `N`, required metadata in `N+1`, GC then
+  restart retains metadata and replays successfully
+- crash before and after checkpoint rename, manifest fsync, old-segment delete,
+  and directory fsync always loads one complete generation
+- explicit start LSN before baseline or GC cut is rejected
+
+### Fail closed
+
+- markerless replicated generation without history
+- CREATE, INSERT, TRUNCATE, INSERT where first generation never becomes visible
+- TRUNCATE, reload, rewriting ALTER where intermediate generation disappears
+- mapped materialized-view refresh
 - synthetic image-only ordinary record
 
-Routing:
+## Observability
 
-- unmapped rel CREATE+INSERT — rows discard at drain position, counted
-- config-table opt-in mid-xact — pre-row discards, post-row routes
-- top-level and subxact abort — no rows, tracking cleared
+- `catalog_boundary_holds_total{result}` and hold duration
+- walreceiver attachment and reconnect state
+- capture rows, full-scan fallbacks, snapshot duration, affected-rel count
+- journal frontier, versions, bytes, checkpoint generation, and GC cut
+- descriptor lookups by hit, missing, ambiguous, corrupt, and source mismatch
+- schema events by deterministic intent
+- fail-closed rows and xacts by reason
+- raw decoded records and rows by operation
+- pending multi-insert rows and bytes
+- manifest effective resume, archive clamp, decoder floor, and shadow recovery
+  floor
+
+Rename remaining `toast_stash_*` metrics only after generic path lands. Keep
+toast-specific counters where behavior remains toast-only
+
+## Removed mechanisms
+
+Delete after journal path becomes authoritative:
+
+- per-commit `ResolutionBundle`
+- `FenceRequest` keyed by top xid
+- bundle resolver lane, bundle loader, and bundle pruner
+- stash discard-proof taxonomy
+- live `relation_at` calls from row decode and detoast
+- generation epoch and lazy descriptor eviction as correctness mechanisms
+- volatile `prev_known` schema baseline
+- route lookup inside decode worker
+- serial ordered-event apply path
+
+Keep shadow catalog client only for boundary capture, bootstrap validation, and
+operational inspection
 
 ## Rejected
 
-- fence keyed on commit record start: `pg_last_wal_replay_lsn` reports
-  record end; a start comparison releases before the commit applies
-- park inside `on_record` without forced flush: commit strands in the
-  pump buffer, decoder never sees it, deadlock
-- notification-only fence release: worker errors surface on the next
-  pump call, which a parked pump never makes
-- resolution inside drain commit: sits behind `flush_due_retires` and
-  arbitrary queue backlog — couples shadow publication to ClickHouse
-- archive-only delivery under fence: segments publish whole, cannot
-  hold mid-segment
-- per-rfn mapped/unmapped verdict at resolution: contradicts ordered
-  config apply, cannot express mid-xact opt-in or auto-create
-- discard of unresolvable generations without proof: silent loss when
-  the superseding generation is uncaptured (rewrite FPI out of scope)
-- minimal descriptor projection: cannot decode tuples (len/align/byval,
-  missing values, dropped positions) nor reproduce DDL/routing
-- checkpoint-mid-COPY as the image-only acceptance: `REGBUF_KEEP_DATA`
-  keeps tuple bytes in block data, the image path never executes
-- versioned descriptors from catalog WAL decode:
-  `XLH_UPDATE_PREFIX_FROM_OLD` elision (PG
-  `src/include/access/heapam_xlog.h`) breaks identity on same-page
-  pg_class updates, pg_attribute layout is version-sensitive, and the
-  overlay duplicates shadow's whole catalog job
-- speculative descriptors minted at record time: xid ownership, abort
-  discard, and worker-ordering surface — the observe-versus-apply class
-- durability-coupled fence (hold shadow until the CH floor passes the
-  commit): couples all decode progress to CH latency and outages;
-  bundle durability is the sufficient condition at file-fsync cost
-- per-record exact replay gate: reintroduces the pump lockstep
-  `QueueingRecordSink` exists to break
-- bundles inside the spill dir wipe set or in ClickHouse: wiped exactly
-  when needed, or fence release blocks on a remote round trip
+- stash-only publication fence, leaves live cold-cache race intact
+- per-commit bundles, input closure expands to routing, Oracle, schema baseline,
+  source identity, and lineage while adding another GC protocol
+- top-xid bundle identity, xids wrap and do not identify source timeline or
+  commit
+- current-state lookup plus descriptor ownership, preserves wrong initial
+  descriptor
+- per-record shadow lockstep, correct but serializes decoder behind libpq and
+  defeats queued pump
+- catalog tuple reconstruction from WAL, duplicates MVCC visibility and
+  version-sensitive catalog layout; boundary sampling lets PostgreSQL interpret
+  its own catalog
+- current PG catalog time travel, standby exposes moving current state and
+  cannot retain arbitrary historic snapshots
+- non-WAL mapping reload during streaming, route becomes wall-clock dependent
+- attach route before ordered events apply, cannot represent auto-create or
+  mid-xact opt-in
+- weaken replay to dedup-sufficiency, equal `_lsn` with different bodies has no
+  safe deterministic winner
+- persist per-value Oracle output, creates row-volume durability and capture
+  coupling
+- discard never-visible generation based on marker inference, marker proves
+  observation start but not identity or lineage
+- independent artifact retention formulas, startup archive clamp already proves
+  they diverge
+- archive-only boundary hold, whole segment publication cannot stop at commit
 
-## Open questions
+## Future consumers
 
-- routing replay stability for non-WAL config: persist the effective
-  route projection per dispatched segment, or pin a durable config
-  version across the replayed range and defer SIGHUP-applied mapping
-  changes to a recorded LSN? Config-table-sourced changes are already
-  WAL-ordered and safe
-- rewrite main-heap FPI consumer: is applicator-cast versus PG-rewrite
-  divergence observable in practice (timestamp/text formatting), enough
-  to justify FPI admission? It is also the missing positive proof for
-  rewrite-superseded generations
+- rewrite FPI walk can add descriptor-backed tuples for generations never
+  visible at commit and retire largest fail-closed class
+- [two_phase_commit.md](two_phase_commit.md) can persist PREPARE buffers while
+  reusing catalog history unchanged
+- audit tooling can inspect relation shape and routing state at any retained WAL
+  position
