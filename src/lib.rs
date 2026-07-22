@@ -44,7 +44,7 @@ pub use backfill::{
     copy_backfill, opt_in, pg_path, spool,
 };
 #[doc(hidden)]
-pub use catalog::{shadow, shadow_catalog, type_bridge};
+pub use catalog::{desc_log, shadow, shadow_catalog, type_bridge};
 #[doc(hidden)]
 pub use decode::{codecs, decoder_sink, fpi, heap_decoder, visibility, wal_xact};
 #[doc(hidden)]
@@ -55,8 +55,8 @@ pub use filter::{catalog_tracker, classify, filter_segment, main_data, pg_class_
 pub use ops::{control, metrics, oracle, preflight, retention, trace};
 #[doc(hidden)]
 pub use source::{
-    boundary_hold, manifest, queueing_record_sink, segment_sink, shadow_stream, source_feed,
-    wal_stream,
+    boundary_hold, catalog_capture, manifest, queueing_record_sink, segment_sink, shadow_stream,
+    source_feed, wal_stream,
 };
 #[doc(hidden)]
 pub use toast::toast_retire;

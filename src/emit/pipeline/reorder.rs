@@ -23,24 +23,22 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
 
-use crate::catalog::shadow_catalog::{CatalogError, ShadowCatalog};
-use crate::decode::decoder_sink::DecoderSinkError;
+use crate::catalog::desc_log::{DescriptorLog, LookupResult};
+use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::decode::heap_decoder::{DecodedHeap, HeapOp};
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
-use crate::schema::{RelName, SchemaEvent, SchemaEventRx};
+use crate::schema::{RelDescriptor, RelName, SchemaEvent};
 use tracing::Instrument;
 
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
-    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, XactCommitPayload, parse_xact_assignment,
-    parse_xact_payload,
+    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
 };
 use crate::ops::trace::TxnSpanRegistry;
 use crate::xact::xact_buffer::{
     ChunkGeneration, DrainEntry, DrainedBatch, SubxactTracker, ToastRowBatch, WalkStep, XactBuffer,
-    drain_pending_schema_events,
 };
 
 use crate::config::{ConfigResolver, ResolvedConfig};
@@ -54,13 +52,11 @@ use crate::toast::toast_retire::RetireLedger;
 
 pub struct ReorderSink {
     buffer: Arc<Mutex<XactBuffer>>,
+    /// Interval-scoped descriptor oracle: stash resolution + truncate
+    log: Arc<DescriptorLog>,
+    /// Opt-in dispatch still resolves by name against live shadow
     catalog: Arc<Mutex<ShadowCatalog>>,
     subxact_tracker: Arc<Mutex<SubxactTracker>>,
-    schema_events: Option<SchemaEventRx>,
-    /// Armed by the decoder at pg_class heap_delete records, consumed
-    /// only at the arming xact's own commit (see
-    /// [`PendingSweeps`](crate::filter::catalog_tracker::PendingSweeps))
-    pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
     /// `None` on the metrics-only (null-tail) configuration: schema events
     /// and truncates are observed, never applied to CH
     applicator: Option<DdlApplicator>,
@@ -121,10 +117,9 @@ impl ReorderSink {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer: Arc<Mutex<XactBuffer>>,
+        log: Arc<DescriptorLog>,
         catalog: Arc<Mutex<ShadowCatalog>>,
         subxact_tracker: Arc<Mutex<SubxactTracker>>,
-        schema_events: Option<SchemaEventRx>,
-        pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
         applicator: Option<DdlApplicator>,
         ack: AckHandle,
         jobs_tx: async_channel::Sender<DecodeJob>,
@@ -155,10 +150,9 @@ impl ReorderSink {
             .unwrap_or_default();
         Self {
             buffer,
+            log,
             catalog,
             subxact_tracker,
-            schema_events,
-            pending_sweeps,
             applicator,
             ack,
             jobs_tx,
@@ -339,64 +333,6 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Drain pending DROP events (post-`sweep_dropped`) into the buffer keyed
-    /// on `(xid, source_lsn)`. Mirrors
-    /// `XactRecordSink::route_pending_schema_events`.
-    async fn route_pending_schema_events(
-        &mut self,
-        xid: u32,
-        source_lsn: u64,
-    ) -> Result<(), SinkError> {
-        let Some(rx) = self.schema_events.as_ref() else {
-            return Ok(());
-        };
-        let pending = drain_pending_schema_events(rx);
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let mut buf = self.buffer.lock().await;
-        for ev in pending {
-            buf.on_schema_event(xid, source_lsn, ev);
-        }
-        Ok(())
-    }
-
-    /// Poll-based DROP discovery, run only at the commit of an xact that
-    /// wrote pg_class heap_delete (ADD COLUMN / VACUUM noise never arms)
-    /// so the replay gate makes the drop visible in shadow. Same as
-    /// `XactRecordSink`'s commit branch.
-    async fn maybe_sweep_dropped(
-        &mut self,
-        xid: u32,
-        payload: &XactCommitPayload,
-        source_lsn: u64,
-    ) -> Result<(), SinkError> {
-        if self.schema_events.is_none() {
-            return Ok(());
-        }
-        let Some(pending) = &self.pending_sweeps else {
-            return Ok(());
-        };
-        if !pending.disarm(xid, payload.twophase_xid, &payload.subxacts) {
-            return Ok(());
-        }
-        let dropped = {
-            let mut cat = self.catalog.lock().await;
-            if source_lsn > 0 {
-                cat.wait_for_replay(source_lsn)
-                    .await
-                    .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
-            }
-            cat.sweep_dropped()
-                .await
-                .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?
-        };
-        if dropped > 0 {
-            self.route_pending_schema_events(xid, source_lsn).await?;
-        }
-        Ok(())
-    }
-
     // Helpers take `&mut self` so the borrow across awaits is `&mut Self`
     // (Send): owned `DdlApplicator`/`AsyncClient` is Send but not Sync, so a
     // shared `&Self` across an await wouldn't be Send.
@@ -518,6 +454,27 @@ impl ReorderSink {
     /// their drop never replays, so no commit re-triggers this flush.
     /// Ledger removal persists after each wipe; a crash between re-runs
     /// an idempotent `TRUNCATE` on the emptied mirror
+    /// Boot Added pass: every relation `Present` in the descriptor log at
+    /// resume gets an `Added` apply (idempotent `CREATE TABLE IF NOT
+    /// EXISTS` + forward-declaration materialise). Runs pre-pump every
+    /// boot, like [`Self::flush_due_retires`] — brownfield auto-create
+    /// tables exist at attach instead of first write, and newly enabled
+    /// auto-create/mapping picks up existing rels without log mutation.
+    pub async fn apply_boot_events(
+        &mut self,
+        descs: Vec<Arc<RelDescriptor>>,
+        resume_lsn: u64,
+    ) -> Result<(), SinkError> {
+        for desc in descs {
+            if desc.kind == 't' {
+                continue;
+            }
+            self.apply_event(&SchemaEvent::Added { desc }, resume_lsn)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn flush_due_retires(&mut self) -> Result<(), SinkError> {
         // Disabled resolver no-ops retire_mirror: flushing would drop ledger
         // entries without wiping mirrors, leaking them for a later CH run
@@ -575,36 +532,41 @@ impl ReorderSink {
         let Some(applicator) = self.applicator.as_mut() else {
             return Ok(());
         };
-        let rel = match crate::catalog::shadow_catalog::resolve_at(
-            &self.catalog,
-            heap.rfn,
-            heap.source_lsn,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(CatalogError::ForeignDatabase(_)) => return Ok(()),
-            Err(e) => return Err(SinkError::from(DecoderSinkError::from(e))),
+        let rel = match self.log.descriptor_at(heap.rfn, heap.source_lsn) {
+            LookupResult::Present(rel) => rel,
+            LookupResult::ForeignDb => return Ok(()),
+            // The truncating commit itself retired this rfn (rotation's
+            // Retired lands at the new generation's bias-early valid_from,
+            // before the truncate record) — the relation is the chain's
+            // last Present
+            LookupResult::Retired => match self.log.present_before(heap.rfn, heap.source_lsn) {
+                Some(rel) => rel,
+                None => {
+                    return Err(SinkError::Other(format!(
+                        "truncate descriptor for {:?} at {:#X}: retired with no predecessor",
+                        heap.rfn, heap.source_lsn,
+                    )));
+                }
+            },
+            other => {
+                return Err(SinkError::Other(format!(
+                    "truncate descriptor for {:?} at {:#X}: {other:?}",
+                    heap.rfn, heap.source_lsn,
+                )));
+            }
         };
         applicator
             .truncate(&rel.rel_name)
             .await
             .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
-        // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`
-        if self.resolver.stores_chunks() {
-            let toast = {
-                let mut cat = self.catalog.lock().await;
-                cat.toast_descriptor_for(rel.oid)
-                    .await
-                    .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?
-            };
-            if let Some(t) = toast {
-                self.resolver
-                    .truncate_mirror(t.oid)
-                    .await
-                    .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
-            }
+        // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`;
+        // the descriptor carries the owner's toast oid
+        if self.resolver.stores_chunks() && rel.toast_oid != 0 {
+            self.resolver
+                .truncate_mirror(rel.toast_oid)
+                .await
+                .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
         }
         Ok(())
     }
@@ -682,7 +644,12 @@ impl ReorderSink {
         record: &Record<'_>,
     ) -> Result<(), SinkError> {
         self.flush_due_retires().await?;
-        let payload = parse_xact_payload(info, &record.parsed.main_data);
+        let payload = parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+            .unwrap_or_default();
+        // COMMIT PREPARED: header xid is the finishing backend's (0-ish),
+        // the buffered work lives under the prepared xid — drain there, or
+        // capture-keyed events would never leave the buffer
+        let xid = payload.twophase_xid.unwrap_or(xid);
         // Parent for this commit's spans; held until on_commit returns so it
         // outlives the prune below. No-op span when tracing off/unsampled.
         let txn = self
@@ -690,21 +657,16 @@ impl ReorderSink {
             .as_ref()
             .and_then(|r| r.txn_span(xid))
             .unwrap_or_else(tracing::Span::none);
-        self.maybe_sweep_dropped(xid, &payload, record.source_lsn)
-            .await?;
         crate::xact::xact_buffer::resolve_stash(
             &self.buffer,
-            &self.catalog,
+            &self.log,
             xid,
             &payload.subxacts,
-            record.source_lsn,
+            record.next_lsn,
             self.stats.clone(),
         )
         .await
         .map_err(SinkError::from)?;
-        // Resolution can surface Added events for newly visible rels
-        self.route_pending_schema_events(xid, record.source_lsn)
-            .await?;
         let drain_span = trace_span!(
             !txn.is_none(),
             parent: &txn,
@@ -844,11 +806,10 @@ impl ReorderSink {
     /// ABORT: drop the buffer, emit a rows=0 seq through the gate (never a
     /// direct ack bump).
     async fn on_abort(&mut self, xid: u32, info: u8, record: &Record<'_>) -> Result<(), SinkError> {
-        let payload = parse_xact_payload(info, &record.parsed.main_data);
-        // Rolled-back pg_class heap_delete resurrects the row; drop the arm
-        if let Some(pending) = &self.pending_sweeps {
-            pending.disarm(xid, payload.twophase_xid, &payload.subxacts);
-        }
+        let payload = parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+            .unwrap_or_default();
+        // ABORT PREPARED: buffered state keys off the prepared xid
+        let xid = payload.twophase_xid.unwrap_or(xid);
         let seq = self.alloc_seq();
         self.ack.register(seq, record.source_lsn);
         {

@@ -318,9 +318,8 @@ routed into xact buffer's chunk slot, distinct from `inserts` for
 user-table writes); `toast_chunks_malformed` (TOAST inserts decoder
 couldn't reinterpret as chunk — missing `chunk_id`/`seq`/`data`, type
 mismatch — surfaces corrupt catalog as counter, not silent loss);
-`catalog_not_found` (heap record on relation `relation_at` couldn't
-resolve, counted not retried — xact buffer reordering handles
-legitimate races); `skipped_no_block` (`record.parsed.blocks` empty:
+`catalog_not_found` (heap record whose descriptor-log lookup answered
+a tombstone / uncovered interval, counted not retried); `skipped_no_block` (`record.parsed.blocks` empty:
 LOCK, INPLACE, TRUNCATE)
 
 `on_xact_end` signature:

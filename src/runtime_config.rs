@@ -387,6 +387,7 @@ mod tests {
                 rel_node: 20000,
             },
             oid: 20000,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("walshadow", name),
             kind: 'r',

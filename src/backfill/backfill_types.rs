@@ -5,6 +5,7 @@ use tokio::sync::{Mutex, watch};
 use walrus::pg::replication::conn::PgConfig;
 
 use crate::budget::MemoryBudget;
+use crate::catalog::desc_log::DescriptorLog;
 use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
@@ -23,6 +24,7 @@ pub struct PassContext {
     pub mapping: MappingHandle,
     pub stats: Arc<EmitterStats>,
     pub catalog: Arc<Mutex<ShadowCatalog>>,
+    pub log: Arc<DescriptorLog>,
     pub scratch_dir: PathBuf,
     pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
     pub budget: Option<MemoryBudget>,

@@ -15,8 +15,10 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
   `WalStream`, `StreamingWalker`, fan-out sinks, `QueueingRecordSink`,
   `DecoderSink`, walshadow walsender server
 - [shadow.md](shadow.md) — shadow PG lifecycle, `ShadowCatalog` async
-  libpq cache, `RelDescriptor`, `SchemaEvent` channel, reconnect
-  resilience
+  libpq client, `RelDescriptor`, reconnect resilience
+- [desc_log.md](desc_log.md) — durable descriptor log: boundary
+  capture, interval lookups, replay-from-log, seed + coverage horizon,
+  GC against the resolved floor
 - [decoder.md](decoder.md) — heap-tuple decoder, Tier 1/2 codec
   matrix, FPI decompression, `main_data` parsers, `pg_class_decoder`,
   read-time defaults

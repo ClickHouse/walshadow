@@ -39,7 +39,8 @@ pub type DecodedHeaps = SmallVec<[DecodedHeap; 1]>;
 `SmallVec<[_; 1]>` keeps single-tuple INSERT / UPDATE / HOT_UPDATE /
 DELETE stack-allocated; only `XLOG_HEAP2_MULTI_INSERT` with
 `ntuples > 1` spills to heap. Caller owns `RelDescriptor` resolution
-via `ShadowCatalog::relation_at`; `TRUNCATE` is intercepted upstream
+via the descriptor log's interval lookup
+([desc_log.md](desc_log.md)); `TRUNCATE` is intercepted upstream
 (`BufferingDecoderSink::handle_truncate`) because its `main_data`
 carries pg_class OIDs rather than a relfilenode
 

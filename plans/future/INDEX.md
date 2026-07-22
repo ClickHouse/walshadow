@@ -3,7 +3,8 @@
 Planning-only docs for unbuilt work. Drop new proposals here as they
 surface; promote into `plans/` once built
 
-* [TABLESPACES.md](TABLESPACES.md) — source-tablespace correctness: bootstrap page-walk + shadow directory materialization
+* [TABLESPACES.md](TABLESPACES.md) — source-tablespace correctness: bootstrap page-walk + shadow directory materialization; full-rfn physical identity invariant
+* [catalog_capture_completeness.md](catalog_capture_completeness.md) — catalog → descriptor dependency taxonomy: capture-all trigger set, pg_type/typname staleness, rename events, toast-spool retire on rotation
 * [DESTINATIONS.md](DESTINATIONS.md) — N:M ClickHouse destination routing: fan-out/fan-in, per-dest ack accounting, slot-advance tension
 * [runtime_config_from_pg.md](runtime_config_from_pg.md) — source-PG runtime config: signal channel, net-new knobs, degraded-mode fallback, resolver observability (resolver substrate + per-table opt-in + column overrides in [config.md](../config.md))
 * [shadow_schema_export.md](shadow_schema_export.md) — shadow PG as schema-only catalog donor to third-party clusters

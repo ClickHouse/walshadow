@@ -49,6 +49,7 @@ fn rel(rel_node: u32, name: &str) -> Arc<RelDescriptor> {
             rel_node,
         },
         oid: rel_node,
+        toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", name),
         kind: 'r',
