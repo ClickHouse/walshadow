@@ -55,7 +55,8 @@ pub use filter::{catalog_tracker, classify, filter_segment, main_data, pg_class_
 pub use ops::{control, metrics, oracle, preflight, retention, trace};
 #[doc(hidden)]
 pub use source::{
-    manifest, queueing_record_sink, segment_sink, shadow_stream, source_feed, wal_stream,
+    boundary_hold, manifest, queueing_record_sink, segment_sink, shadow_stream, source_feed,
+    wal_stream,
 };
 #[doc(hidden)]
 pub use toast::toast_retire;

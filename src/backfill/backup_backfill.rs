@@ -1154,9 +1154,8 @@ mod tests {
                 ..Default::default()
             },
             source_lsn: 0x5000,
-            page_magic: 0,
             route: Route::ToShadow,
-            catalog_signal: crate::record::CatalogSignal::None,
+            ..Default::default()
         }
     }
 

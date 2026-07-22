@@ -335,6 +335,26 @@ impl ShadowStreamState {
             c.dispatched_lsn = c.dispatched_lsn.max(new_lsn);
         }
     }
+
+    /// Enqueue a reply-requested `'k'` keepalive on every active
+    /// connection. Shadow's walreceiver answers immediately with fresh
+    /// flush/apply LSNs — non-forced replies otherwise fire only when the
+    /// flush position advances or `wal_receiver_status_interval` elapses,
+    /// so a publication hold waiting on apply progress prods through this.
+    pub fn request_status(&mut self) {
+        let server_wal_end = self.server_wal_end;
+        let ids: Vec<u64> = self
+            .connections
+            .iter()
+            .filter(|(_, c)| !c.closing)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let _ = self.enqueue_copy_data_with(id, |out| {
+                encode_keepalive_frame_into(out, server_wal_end, true);
+            });
+        }
+    }
 }
 
 pub struct ShadowStreamSink {

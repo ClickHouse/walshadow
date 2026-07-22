@@ -134,6 +134,12 @@ pub struct MetricsSnapshot {
     pub shadow_stream_active_connections: u64,
     /// Cumulative connections dropped by `slow_threshold` overflow
     pub shadow_stream_dropped_connections_total: u64,
+    /// Publication holds released at catalog-mutating commit boundaries
+    pub catalog_boundary_holds_total: u64,
+    /// Holds woken with Err (worker death, walreceiver loss, timeout)
+    pub catalog_boundary_hold_failures_total: u64,
+    /// Cumulative seconds spent parked in released holds
+    pub catalog_boundary_hold_seconds_total: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -602,6 +608,18 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             snap.shadow_stream_dropped_connections_total,
         ),
         (
+            "walshadow_catalog_boundary_holds_total",
+            "Publication holds released at catalog-mutating commit boundaries.",
+            "counter",
+            snap.catalog_boundary_holds_total,
+        ),
+        (
+            "walshadow_catalog_boundary_hold_failures_total",
+            "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
+            "counter",
+            snap.catalog_boundary_hold_failures_total,
+        ),
+        (
             "walshadow_config_pending_decl_rels",
             "Forward-declared per-table opt-ins awaiting their CREATE TABLE.",
             "gauge",
@@ -657,6 +675,15 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     } else {
         writeln!(s, "{name} {:.3}", snap.shadow_apply_lag_seconds).unwrap();
     }
+
+    let name = "walshadow_catalog_boundary_hold_seconds_total";
+    writeln!(
+        s,
+        "# HELP {name} Cumulative seconds the pump parked in released catalog-boundary holds.",
+    )
+    .unwrap();
+    writeln!(s, "# TYPE {name} counter").unwrap();
+    writeln!(s, "{name} {:.3}", snap.catalog_boundary_hold_seconds_total).unwrap();
 
     // Process CPU as a float counter (seconds); rate() ≈ cores in use.
     let name = "walshadow_process_cpu_seconds_total";
