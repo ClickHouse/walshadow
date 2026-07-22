@@ -175,6 +175,25 @@ impl RecordSink for DaemonSinks {
     }
 }
 
+/// `walshadow-stream ctl <words…>`: drive a running daemon's control socket.
+/// Detected before daemon-arg parsing so `ctl` needn't supply daemon args.
+#[derive(Debug, Parser)]
+#[command(
+    name = "walshadow-stream ctl",
+    about = "Control a running walshadow-stream daemon."
+)]
+struct CtlArgs {
+    #[arg(
+        long,
+        env = "WALSHADOW_CONTROL_SOCKET",
+        default_value = "/run/walshadow/control.sock"
+    )]
+    socket: PathBuf,
+    /// Control verb, such as `status` or `apply`, read TOML body from stdin
+    #[arg(trailing_var_arg = true, required = true)]
+    request: Vec<String>,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "walshadow-stream",
@@ -322,6 +341,9 @@ struct Args {
     /// HTTP/Prometheus metrics bind address. Disabled when absent.
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
+    /// Control socket path, omit to disable control API
+    #[arg(long)]
+    control_socket: Option<PathBuf>,
     /// OTLP/gRPC endpoint for traces, e.g. `http://localhost:4317`. Absent
     /// disables tracing (zero overhead); falls back to
     /// `OTEL_EXPORTER_OTLP_ENDPOINT`. Spans emit at the `walshadow::trace`
@@ -383,6 +405,14 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
+    // `ctl` client mode is detected before daemon-arg parsing so it needn't
+    // supply the daemon's required args.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("ctl") {
+        let rest = std::iter::once(format!("{} ctl", argv[0])).chain(argv.into_iter().skip(2));
+        let ctl = CtlArgs::parse_from(rest);
+        return run_ctl(ctl.socket, ctl.request).await;
+    }
     let args = Args::parse();
     walshadow::trace::set_sample_ratio(args.trace_sample_ratio);
     // `--otlp-endpoint` wins; otherwise honor the conventional env var.
@@ -401,6 +431,43 @@ async fn main() -> Result<()> {
         tracing::warn!(target: "walshadow", error = %e, "otlp tracer shutdown");
     }
     result
+}
+
+async fn run_ctl(socket: PathBuf, request: Vec<String>) -> Result<()> {
+    use std::io::{IsTerminal, Read};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let verb = request.first().map(String::as_str).unwrap_or_default();
+    let config: toml::Table = if std::io::stdin().is_terminal() {
+        toml::Table::new()
+    } else {
+        let mut body = String::new();
+        std::io::stdin().read_to_string(&mut body)?;
+        body.parse().context("parse config body as TOML")?
+    };
+    let doc = walshadow::control::encode_request(verb, config)?;
+    let mut stream = tokio::net::UnixStream::connect(&socket)
+        .await
+        .with_context(|| format!("connect control socket {}", socket.display()))?;
+    stream.write_all(doc.as_bytes()).await?;
+    stream.flush().await?;
+    stream.shutdown().await.ok();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await?;
+    let first = resp.lines().next().unwrap_or("");
+    if let Some(rest) = first.strip_prefix("OK") {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            println!("{rest}");
+        }
+        for l in resp.lines().skip(1) {
+            println!("{l}");
+        }
+        Ok(())
+    } else {
+        eprint!("{resp}");
+        std::process::exit(1);
+    }
 }
 
 /// OTLP/gRPC batch tracer provider for `endpoint`. Must run inside the tokio
@@ -484,17 +551,60 @@ fn init_tracing(
     provider
 }
 
+fn tget(root: &toml::Table, section: &str, key: &str) -> Option<String> {
+    match root.get(section)?.as_table()?.get(key)? {
+        toml::Value::String(s) => Some(s.clone()),
+        v => Some(v.to_string()),
+    }
+}
+
+/// `[source]` defaults from the CLI args — the base layer under the config file
+/// for connection resolution, shared by the session and the control surface.
+fn cli_source_base(args: &Args) -> toml::Table {
+    let mut s = toml::Table::new();
+    s.insert("host".into(), args.host.clone().into());
+    s.insert("port".into(), (args.port as i64).into());
+    s.insert("user".into(), args.user.clone().into());
+    s.insert("dbname".into(), args.dbname.clone().into());
+    if let Some(p) = &args.password {
+        s.insert("password".into(), p.clone().into());
+    }
+    s.insert("sslmode".into(), args.sslmode.clone().into());
+    let mut root = toml::Table::new();
+    root.insert("source".into(), toml::Value::Table(s));
+    root
+}
+
+fn spawn_sighup_reload(
+    mut sig: tokio::signal::unix::Signal,
+    reloader: Arc<walshadow::control::Reloader>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while sig.recv().await.is_some() {
+            tracing::info!(target: "walshadow", "SIGHUP — live reload");
+            if let Err(e) = reloader.reload().await {
+                tracing::warn!(target: "walshadow", error = %format!("{e:#}"), "reload failed");
+            }
+        }
+    })
+}
+
+/// Process-lifetime entry: bind metrics + control socket + SIGHUP, then stream
+/// one session. Every reconfigure (socket / SIGHUP) is a live reload — no
+/// restart. Ctrl-C breaks the pump loop and drains gracefully.
 async fn run(args: Args) -> Result<()> {
+    use walshadow::control::{Reloader, SharedCtx};
+
     let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .inspect_err(|e| {
             tracing::warn!(
                 target: "walshadow::sighup",
                 error = %e,
-                "SIGHUP install failed; reload disabled",
+                "SIGHUP install failed",
             );
         })?;
     // Match systemd SIGTERM with ctrl_c shutdown path
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .inspect_err(|e| {
             tracing::warn!(
                 target: "walshadow",
@@ -502,13 +612,70 @@ async fn run(args: Args) -> Result<()> {
                 "SIGTERM install failed",
             );
         })?;
-    let sslmode = SslMode::parse(&args.sslmode).context("--sslmode")?;
+
+    let metrics = MetricsRegistry::new();
+    let reloader = Arc::new(Reloader::default());
+
+    let _metrics_server = if let Some(addr) = args.metrics_bind {
+        let (bound, h) = walshadow::metrics::serve(addr, metrics.clone())
+            .await
+            .context("bind metrics endpoint")?;
+        tracing::info!(target: "walshadow::metrics", addr = %bound, "metrics endpoint serving");
+        Some(h)
+    } else {
+        None
+    };
+
+    let _control_server = if let Some(sock) = args.control_socket.clone() {
+        let ch_config = args
+            .ch_config
+            .clone()
+            .context("--control-socket requires --ch-config")?;
+        let ctx = SharedCtx {
+            ch_config,
+            source_base: cli_source_base(&args),
+            metrics: metrics.clone(),
+            reloader: reloader.clone(),
+            frag_lock: Arc::new(Mutex::new(())),
+        };
+        Some(
+            walshadow::control::serve(sock, ctx)
+                .await
+                .context("bind control socket")?,
+        )
+    } else {
+        None
+    };
+    let _sighup = spawn_sighup_reload(sighup, reloader.clone());
+
+    run_session(&args, &metrics, &reloader, sigterm).await
+}
+
+async fn run_session(
+    args: &Args,
+    metrics: &MetricsRegistry,
+    reloader: &Arc<walshadow::control::Reloader>,
+    mut sigterm: tokio::signal::unix::Signal,
+) -> Result<()> {
+    // Clone the Arc-backed registry so the body's `&metrics` uses are unchanged.
+    let metrics = metrics.clone();
+
+    let merged: toml::Table = match args.ch_config.as_deref() {
+        Some(p) => walshadow::ch_emitter::load_effective(p, cli_source_base(args))
+            .await
+            .with_context(|| format!("load config {}", p.display()))?,
+        None => cli_source_base(args),
+    };
+    let sslmode = SslMode::parse(&tget(&merged, "source", "sslmode").unwrap_or_default())
+        .context("--sslmode")?;
     let cfg = PgConfig {
-        host: args.host.clone(),
-        port: args.port,
-        user: args.user.clone(),
-        password: args.password.clone(),
-        database: args.dbname.clone(),
+        host: tget(&merged, "source", "host").unwrap_or_default(),
+        port: tget(&merged, "source", "port")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(args.port),
+        user: tget(&merged, "source", "user").unwrap_or_default(),
+        password: tget(&merged, "source", "password"),
+        database: tget(&merged, "source", "dbname").unwrap_or_default(),
         application_name: "walshadow".into(),
         sslmode,
         // Cert/key material rides PGSSL* env, matching libpq (--sslmode doc)
@@ -528,11 +695,9 @@ async fn run(args: Args) -> Result<()> {
         "source identified",
     );
 
-    let ch_config = if let Some(path) = args.ch_config.as_deref() {
-        let toml = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("read --ch-config {}", path.display()))?;
-        let mut cfg = EmitterConfig::from_toml_str(&toml).context("parse --ch-config")?;
+    // `[ch]` presence decides emitter vs metrics-only.
+    let ch_config = if merged.contains_key("ch") {
+        let mut cfg = EmitterConfig::from_table(&merged).context("parse ch config")?;
         if let Some(ms) = args.ch_flush_timeout_ms {
             cfg.flush_timeout = std::time::Duration::from_millis(ms);
         }
@@ -547,10 +712,10 @@ async fn run(args: Args) -> Result<()> {
     // Effective physical replication slot (`[source] slot` + --slot override);
     // None = slotless.
     let source_slot: Option<String> = ch_config.as_ref().and_then(|c| c.source_slot.clone());
-    let shadow_start = resolve_shadow_start(&args)?;
+    let shadow_start = resolve_shadow_start(args)?;
     let bootstrap_end_lsn: Option<u64> = if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
         Some(
-            run_bootstrap(&cfg, &mut feed, &args, ch_config.clone())
+            run_bootstrap(&cfg, &mut feed, args, ch_config.clone())
                 .await
                 .context("bootstrap")?,
         )
@@ -563,7 +728,7 @@ async fn run(args: Args) -> Result<()> {
     let shadow_lifecycle: Option<ShadowLifecycle> = match &shadow_start {
         ShadowStart::External => None,
         ShadowStart::Bootstrap(dir) | ShadowStart::Resume(dir) => {
-            let shadow = Arc::new(build_owned_shadow(&args, dir.clone()));
+            let shadow = Arc::new(build_owned_shadow(args, dir.clone()));
             let conninfo = walsender_primary_conninfo(args.walsender_bind);
             shadow
                 .write_standby_signal()
@@ -960,9 +1125,11 @@ async fn run(args: Args) -> Result<()> {
             &emitter_cfg,
             cli_overrides,
             args.ch_config.clone(),
+            cli_source_base(args),
             mapping.clone(),
             invalidation_epoch.clone(),
         );
+        reloader.set_resolver(Some(resolver.clone())).await;
         spawn_mapping_refresher(config_rx.clone(), mapping.clone());
         // Runtime-config overlay (§7): before the pump consumes WAL, seed the
         // resolver from source PG's config_* tables via the sidecar libpq
@@ -1017,6 +1184,12 @@ async fn run(args: Args) -> Result<()> {
         let toml_initial_load = emitter_cfg
             .table_initial_loads
             .values()
+            .chain(
+                emitter_cfg
+                    .table_opt_ins
+                    .values()
+                    .filter_map(|r| r.initial_load.as_ref()),
+            )
             .any(|mode| InitialLoadMode::parse(mode).is_some_and(|m| m != InitialLoadMode::None));
         // One validated resident-payload pool for the pipeline and every
         // concurrent backup pass
@@ -1060,6 +1233,21 @@ async fn run(args: Args) -> Result<()> {
                 )
                 .await
                 .with_context(|| format!("seed opt-in for {rel}"))?;
+            }
+        }
+        for (rel, row) in &emitter_cfg.table_opt_ins {
+            if row.replicate.is_some() {
+                walshadow::opt_in::apply_table_opt_in(
+                    &resolver,
+                    &mut applicator,
+                    &catalog,
+                    backfiller_effects.as_ref(),
+                    rel,
+                    row,
+                    raw_start,
+                )
+                .await
+                .with_context(|| format!("config opt-in for {rel}"))?;
             }
         }
         let sql_scoped_tables: HashSet<RelName> = seeded_table_rows
@@ -1209,26 +1397,13 @@ async fn run(args: Args) -> Result<()> {
             .context("open out-dir")?;
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
-    let metrics = MetricsRegistry::new();
-    let _metrics_server = if let Some(addr) = args.metrics_bind {
-        let (bound, _handle) = walshadow::metrics::serve(addr, metrics.clone())
-            .await
-            .context("bind metrics endpoint")?;
-        tracing::info!(target: "walshadow::metrics", addr = %bound, "metrics endpoint serving");
-        Some(_handle)
-    } else {
-        None
-    };
-
-    // Kept for the status loop's config metrics (opt-in / pending-decl gauges);
-    // the sighup handler takes ownership of `config_resolver` below.
+    // Metrics endpoint + control socket + SIGHUP are process-lifetime (bound in
+    // `run`); the session only writes into the shared registry.
     let metrics_resolver = config_resolver.clone();
     let metrics_backfiller = copy_backfiller.clone();
-
-    // SIGHUP re-reads TOML and republishes the resolved snapshot; the
-    // mapping refresher + DDL applicator pick it up. Connection params stay
-    // boot-only. No resolver (metrics-only) makes SIGHUP a no-op tap.
-    let _sighup_task = spawn_sighup_handler(sighup, config_resolver);
+    // config_resolver stays owned here (dropped at session end → mapping
+    // refresher exits); mapping/budget live-reload arrives via the WAL overlay.
+    let _ = &config_resolver;
 
     // Retention sweeper writes shadow's `pg_last_wal_replay_lsn` here;
     // status loop reads it for the cursor's `shadow_replay_lsn` slot + the
@@ -1307,7 +1482,14 @@ async fn run(args: Args) -> Result<()> {
     let mut last_emitter_ack_observed: u64 = 0;
     let mut inflight_stall_since: Option<Instant> = None;
     let mut inflight_stall_logged = false;
+    // Pump reads `paused` live off the resolver watch; when paused it idles
+    // (stops consuming source WAL) without tearing anything down.
+    let pump_config_rx = config_resolver.as_ref().map(|r| r.subscribe());
     let shutdown_reason = loop {
+        let paused = pump_config_rx
+            .as_ref()
+            .map(|rx| rx.borrow().paused)
+            .unwrap_or(false);
         // `durable` (fsynced) lags `dispatched`; advertise it as flush/cursor.
         let dispatched = stream.dispatched_lsn();
         let durable = durable_lsn.load(Ordering::Acquire);
@@ -1365,16 +1547,17 @@ async fn run(args: Args) -> Result<()> {
         let dispatched_before = stream.dispatched_lsn();
         let chunk = tokio::select! {
             biased;
-            // ctrl_c first so it doesn't lose to a chunk already at the queue head.
             sig = tokio::signal::ctrl_c() => {
                 sig.context("install ctrl_c handler")?;
                 break "signal";
             }
             _ = sigterm.recv() => break "signal",
-            // Idle tick so metrics/cursor keep tracking the draining pipeline
-            // when no new WAL arrives.
+            // Idle tick so metrics/cursor keep tracking, and so a `paused` flip
+            // is picked up promptly.
             _ = tokio::time::sleep(metrics_tick) => None,
-            res = feed.next_chunk(status, &mut chunk_buf) => match res {
+            // Paused: stop consuming source WAL (idle); resume re-enables this
+            // arm and the pump continues from the same LSN.
+            res = feed.next_chunk(status, &mut chunk_buf), if !paused => match res {
                 Ok(Some(c)) => Some(c),
                 Ok(None) => break "CopyDone",
                 Err(e) => {
@@ -1799,38 +1982,6 @@ async fn apply_toml_initial_loads(
         }
     }
     Ok(())
-}
-
-/// SIGHUP listener: re-reads `--ch-config` and republishes the resolved
-/// snapshot through the resolver (CLI overrides stay on top). Read/parse
-/// errors keep the last snapshot in effect; absent resolver (metrics-only)
-/// is a no-op tap.
-fn spawn_sighup_handler(
-    mut sig: tokio::signal::unix::Signal,
-    resolver: Option<Arc<ConfigResolver>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if sig.recv().await.is_none() {
-                return;
-            }
-            let Some(resolver) = resolver.as_ref() else {
-                tracing::info!(target: "walshadow::sighup", "SIGHUP ignored (no --ch-config)");
-                continue;
-            };
-            match resolver.reload().await {
-                Ok(()) => tracing::info!(
-                    target: "walshadow::sighup",
-                    "ch-config reload published",
-                ),
-                Err(e) => tracing::warn!(
-                    target: "walshadow::sighup",
-                    error = %e,
-                    "ch-config reload failed; existing config preserved",
-                ),
-            }
-        }
-    })
 }
 
 /// Applies each republished [`ResolvedConfig`] snapshot to the live routing

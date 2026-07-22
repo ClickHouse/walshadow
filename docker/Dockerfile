@@ -22,6 +22,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY clickhouse-c-rs ./clickhouse-c-rs
 COPY bench ./bench
+COPY walshadow-peerdb ./walshadow-peerdb
 COPY src ./src
 # Cache mounts persist cargo's registry/git and the target dir across builds,
 # so a source change recompiles only the changed crates, not all deps. The
@@ -63,7 +64,10 @@ RUN chmod +x /usr/local/bin/walshadow-entrypoint \
         /var/lib/walshadow/shadow-data \
         /var/lib/walshadow/out \
         /var/lib/walshadow/spill \
-        /var/run/postgresql
+        /var/run/postgresql \
+        /var/run/walshadow \
+        /etc/walshadow \
+        /etc/walshadow/ch-config.d
 
 USER postgres
 ENTRYPOINT ["/usr/local/bin/walshadow-entrypoint"]

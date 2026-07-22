@@ -37,6 +37,7 @@ use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::mapping::{
     ColumnMapping, NamespaceMapping, TableMapping, TableTarget, ToastConfig, ToastMode,
 };
+use crate::runtime_config::TableRow;
 use crate::schema::{RelDescriptor, RelName};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
@@ -109,6 +110,10 @@ pub struct EmitterConfig {
     /// Per-table initial-load mode from TOML `[table.*]` blocks. Applies at
     /// boot for pinned mappings; SQL opt-ins carry their own mode.
     pub table_initial_loads: HashMap<RelName, String>,
+    pub table_opt_ins: HashMap<RelName, TableRow>,
+    /// `[stream] paused`: pump idles (stops consuming source WAL) when true.
+    /// Live via reload.
+    pub paused: bool,
     /// Per-namespace defaults keyed on PG schema name; per-table
     /// entries in `tables` win for the relation they name
     pub namespaces: HashMap<String, NamespaceMapping>,
@@ -203,6 +208,8 @@ impl Default for EmitterConfig {
             flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
             tables: HashMap::new(),
             table_initial_loads: HashMap::new(),
+            table_opt_ins: HashMap::new(),
+            paused: false,
             namespaces: HashMap::new(),
             drop_table_strategy: "retain".into(),
             retry: RetryConfig::default(),
@@ -282,9 +289,14 @@ impl EmitterConfig {
     /// ]
     /// ```
     pub fn from_toml_str(s: &str) -> Result<Self, EmitterError> {
-        use toml::Value;
-        let root: Value = toml::de::from_str(s)
+        let root: toml::Table = toml::from_str(s)
             .map_err(|e: toml::de::Error| EmitterError::Config(format!("toml: {e}")))?;
+        Self::from_table(&root)
+    }
+
+    /// Build from an already-parsed (and possibly conf.d-merged) TOML table.
+    pub fn from_table(root: &toml::Table) -> Result<Self, EmitterError> {
+        use toml::Value;
         let mut out = Self::default();
         if let Some(ch) = root.get("ch").and_then(Value::as_table) {
             if let Some(v) = ch.get("host").and_then(Value::as_str) {
@@ -369,6 +381,14 @@ impl EmitterConfig {
             // Empty string == omitted == overlay disabled.
             out.runtime_config_schema = Some(schema.into());
         }
+        if let Some(v) = root
+            .get("stream")
+            .and_then(Value::as_table)
+            .and_then(|t| t.get("paused"))
+            .and_then(Value::as_bool)
+        {
+            out.paused = v;
+        }
         if let Some(src) = root.get("source").and_then(Value::as_table)
             && let Some(slot) = src.get("slot").and_then(Value::as_str)
             && !slot.is_empty()
@@ -416,8 +436,30 @@ impl EmitterConfig {
                     let t = v.as_table().ok_or_else(|| {
                         EmitterError::Config(format!("table.{ns}.{name}: expected a table"))
                     })?;
-                    let replicate = t.get("replicate").and_then(Value::as_bool).unwrap_or(true);
-                    if !replicate {
+                    let replicate = t.get("replicate").and_then(Value::as_bool);
+                    let rel = RelName::new(ns, name);
+                    let Some(cols_v) = t.get("columns").and_then(Value::as_array) else {
+                        out.table_opt_ins.insert(
+                            rel,
+                            TableRow {
+                                target_database: t
+                                    .get("target_database")
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                                target_table: t
+                                    .get("target_table")
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                                replicate,
+                                initial_load: t
+                                    .get("initial_load")
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                            },
+                        );
+                        continue;
+                    };
+                    if replicate == Some(false) {
                         continue;
                     }
                     let database = t
@@ -435,9 +477,6 @@ impl EmitterConfig {
                         .and_then(Value::as_str)
                         .unwrap_or(name)
                         .to_string();
-                    let cols_v = t.get("columns").and_then(Value::as_array).ok_or_else(|| {
-                        EmitterError::Config(format!("table.{ns}.{name}: missing columns array"))
-                    })?;
                     let mut columns = Vec::with_capacity(cols_v.len());
                     for (i, c) in cols_v.iter().enumerate() {
                         let ct = c.as_table().ok_or_else(|| {
@@ -481,7 +520,6 @@ impl EmitterConfig {
                             target_type,
                         });
                     }
-                    let rel = RelName::new(ns, name);
                     out.tables.insert(
                         rel.clone(),
                         TableMapping {
@@ -1423,6 +1461,71 @@ impl std::fmt::Debug for ColumnBuf {
     }
 }
 
+/// Load `--ch-config` and deep-merge every `*.toml` in the sibling conf.d
+/// directory (`<ch-config>.d/`, e.g. `ch-config.toml` → `ch-config.d/`), in
+/// lexical filename order (later wins) — like Postgres `include_dir`. The base
+/// file may be absent (empty table); a malformed fragment is a hard error.
+pub async fn load_merged(ch_config: &std::path::Path) -> Result<toml::Table, EmitterError> {
+    let mut root: toml::Table = match tokio::fs::read_to_string(ch_config).await {
+        Ok(s) => toml::from_str(&s).map_err(|e: toml::de::Error| {
+            EmitterError::Config(format!("parse {}: {e}", ch_config.display()))
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => {
+            return Err(EmitterError::Config(format!(
+                "read {}: {e}",
+                ch_config.display()
+            )));
+        }
+    };
+    let dir = ch_config.with_extension("d");
+    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+        let mut frags: Vec<std::path::PathBuf> = Vec::new();
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            let p = ent.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("toml") {
+                frags.push(p);
+            }
+        }
+        frags.sort();
+        for p in frags {
+            let s = tokio::fs::read_to_string(&p)
+                .await
+                .map_err(|e| EmitterError::Config(format!("read {}: {e}", p.display())))?;
+            let frag: toml::Table = toml::from_str(&s).map_err(|e: toml::de::Error| {
+                EmitterError::Config(format!("parse {}: {e}", p.display()))
+            })?;
+            merge_tables(&mut root, frag);
+        }
+    }
+    Ok(root)
+}
+
+/// Recursive deep-merge: table-vs-table recurses; any other value from `over`
+/// overwrites `base`.
+pub fn merge_tables(base: &mut toml::Table, over: toml::Table) {
+    for (k, v) in over {
+        match (base.get_mut(&k), v) {
+            (Some(toml::Value::Table(bt)), toml::Value::Table(ot)) => merge_tables(bt, ot),
+            (_, v) => {
+                base.insert(k, v);
+            }
+        }
+    }
+}
+
+/// Effective config: `base` (e.g. the daemon's CLI-arg source defaults) with
+/// the on-disk `--ch-config` + conf.d merged over it. Single resolution point
+/// shared by the daemon session and the control surface.
+pub async fn load_effective(
+    ch_config: &std::path::Path,
+    base: toml::Table,
+) -> Result<toml::Table, EmitterError> {
+    let mut root = base;
+    merge_tables(&mut root, load_merged(ch_config).await?);
+    Ok(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2178,5 +2281,61 @@ mod tests {
         assert_eq!(dotted_rel.target, TableTarget::new("default", "b.c"));
         // Interpolation quotes the dot inside the identifier
         assert_eq!(dotted_rel.target.sql(), "`default`.`b.c`");
+    }
+
+    #[test]
+    fn merge_tables_deep_and_overwrite() {
+        let mut base: toml::Table = toml::from_str(
+            "[ch]\nhost = \"base\"\nport = 9000\n[table.\"public.users\"]\ntarget = \"demo.users\"\n",
+        )
+        .unwrap();
+        let over: toml::Table = toml::from_str("[ch]\nhost = \"frag\"\n").unwrap();
+        merge_tables(&mut base, over);
+        // fragment overrides [ch].host, keeps [ch].port and the base [table.*].
+        assert_eq!(
+            base["ch"].as_table().unwrap()["host"].as_str(),
+            Some("frag")
+        );
+        assert_eq!(
+            base["ch"].as_table().unwrap()["port"].as_integer(),
+            Some(9000)
+        );
+        assert!(base.get("table").is_some(), "base [table.*] survived");
+    }
+
+    #[tokio::test]
+    async fn load_merged_base_plus_confd_lexical() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ch-config.toml");
+        let confd = dir.path().join("ch-config.d");
+        tokio::fs::write(&base, "[ch]\nhost = \"base\"\nport = 9000\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&confd).await.unwrap();
+        tokio::fs::write(confd.join("10-x.toml"), "[ch]\nhost = \"ten\"\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            confd.join("50-api.toml"),
+            "[ch]\nhost = \"fifty\"\ndatabase = \"demo\"\n",
+        )
+        .await
+        .unwrap();
+        let merged = load_merged(&base).await.unwrap();
+        let ch = merged["ch"].as_table().unwrap();
+        // Higher-numbered fragment wins; base port and fragment database persist.
+        assert_eq!(ch["host"].as_str(), Some("fifty"));
+        assert_eq!(ch["port"].as_integer(), Some(9000));
+        assert_eq!(ch["database"].as_str(), Some("demo"));
+        let cfg = EmitterConfig::from_table(&merged).unwrap();
+        assert_eq!(cfg.host, "fifty");
+        assert_eq!(cfg.database, "demo");
+    }
+
+    #[tokio::test]
+    async fn load_merged_absent_base_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = load_merged(&dir.path().join("nope.toml")).await.unwrap();
+        assert!(merged.is_empty());
     }
 }

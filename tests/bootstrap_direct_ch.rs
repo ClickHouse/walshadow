@@ -187,19 +187,34 @@ async fn direct_bootstrap_ch_end_to_end() {
     let guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
-        // 7. Wait for the daemon's metrics endpoint. Crossing this
-        //    barrier means: bootstrap finished, daemon-owned shadow is
-        //    serving, preflight passed, WAL pump is in its main loop.
-        //    The bootstrap tail's `wait_through(K)` makes every backfill
-        //    row durable on CH before the daemon hands off to the streaming
-        //    pump, so the 64-row fixture is fully on CH at this barrier.
+        // 7. Wait for the daemon's metrics endpoint (liveness). The daemon
+        //    binds it before the bootstrap drains to CH, so this is not a
+        //    bootstrap-complete signal on its own.
         fx::wait_for_listen(metrics_addr, Duration::from_secs(30))
             .context("daemon metrics endpoint never came up")?;
 
-        // 8. Oracle: count + sum(id) + md5(string_agg(name, ',' ORDER
-        //    BY id)) must match across both sides. The test exercises
-        //    the bootstrap surface; no post-bootstrap workload here, so
-        //    we don't need to drive a `pg_switch_wal` + drain cycle.
+        // 8. Poll until the bootstrap rows are durable on CH — the tail
+        //    drains asynchronously, so racing it with an immediate assert
+        //    flakes on slow CI.
+        let src_count = source
+            .psql_one("SELECT count(*) FROM s14.t")
+            .context("source count")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let n = ch
+                .query("SELECT count() FROM default.t FINAL WHERE _is_deleted = 0")
+                .unwrap_or_default();
+            if n == src_count {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("bootstrap rows never reached CH: source={src_count}, ch={n}");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // 9. Oracle: count + sum(id) + md5(string_agg(name, ',' ORDER BY id))
+        //    must match across both sides.
         fx::assert_ch_matches_source(&ch, &source, "s14.t", "default.t")
             .context("source vs CH parity")?;
 
