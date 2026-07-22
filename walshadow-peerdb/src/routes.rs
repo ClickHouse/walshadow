@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body, Bytes};
 use hyper::{Request, Response, Uri};
@@ -10,6 +12,7 @@ use crate::error::GrpcError;
 use crate::handlers::{mirrors, misc, peers};
 use crate::response::IntoResponse;
 use crate::state::Store;
+use crate::stats::StatsHistory;
 
 pub struct App {
     pub control: ControlClient,
@@ -17,6 +20,8 @@ pub struct App {
     /// PEERDB_PASSWORD-style shared secret; unauthenticated when None
     pub password: Option<String>,
     pub version: String,
+    /// Sampled rows-synced history backing the sync-history graph
+    pub stats: Arc<StatsHistory>,
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;

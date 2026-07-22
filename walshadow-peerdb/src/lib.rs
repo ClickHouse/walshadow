@@ -7,4 +7,5 @@ pub mod pb;
 pub mod response;
 pub mod routes;
 pub mod state;
+pub mod stats;
 pub mod warn;

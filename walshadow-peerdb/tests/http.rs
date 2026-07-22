@@ -238,6 +238,7 @@ async fn shim(dir: &std::path::Path, password: Option<&str>) -> (App, Arc<MockCo
         store: Store::load(dir.join("state.json")).await.unwrap(),
         password: password.map(str::to_string),
         version: "walshadow-peerdb-test".into(),
+        stats: Arc::new(walshadow_peerdb::stats::StatsHistory::new()),
     };
     (app, mock)
 }
@@ -702,6 +703,7 @@ async fn tolerant_decode_and_errors() {
         store: Store::load(dir2.path().join("state.json")).await.unwrap(),
         password: None,
         version: "t".into(),
+        stats: Arc::new(walshadow_peerdb::stats::StatsHistory::new()),
     };
     let (status, body) = call(&downed, "POST", "/v1/peers/create", Some(pg_peer("pg"))).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");

@@ -432,6 +432,9 @@ pub struct GetCDCBatchesRequest {
 pub struct GraphRequest {
     #[serde(alias = "flow_job_name")]
     pub flow_job_name: String,
+    /// PeerDB TimeAggregateType; accepts the enum number or name
+    #[serde(alias = "aggregate_type", deserialize_with = "enum_name_or_number")]
+    pub aggregate_type: Option<EnumToken>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

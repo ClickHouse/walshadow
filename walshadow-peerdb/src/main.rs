@@ -47,6 +47,24 @@ async fn main() -> Result<()> {
         store: Store::load(cli.state_file).await?,
         password: cli.password.filter(|p| !p.is_empty()),
         version: format!("walshadow-peerdb-{}", env!("CARGO_PKG_VERSION")),
+        stats: Arc::new(walshadow_peerdb::stats::StatsHistory::new()),
+    });
+
+    // Sample the daemon's cumulative rows-synced counter on a timer so
+    // cdc_graph can serve a sync-history series (the shim keeps no history and
+    // the control socket exposes only the live aggregate).
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                if let Ok(status) = app.control.call("status", &toml::Table::new()).await {
+                    let rows = walshadow_peerdb::handlers::rows_synced_from_status(&status);
+                    app.stats.record(walshadow_peerdb::pb::now_unix(), rows);
+                }
+            }
+        }
     });
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await

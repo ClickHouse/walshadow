@@ -13,7 +13,7 @@ use crate::model::{
     CDCBatch, CDCMirrorStatus, CreateCDCFlowRequest, CreateCDCFlowResponse, FlowStateChangeRequest,
     FlowStatus, ListMirrorsItem, MirrorStatusRequest, MirrorStatusResponse, TableMapping,
 };
-use crate::pb::{now_unix, timestamp_rfc3339};
+use crate::pb::{EnumToken, now_unix, timestamp_rfc3339};
 use crate::response::Json;
 use crate::routes::App;
 use crate::state::{MirrorRecord, Role, ShimState, TableRef};
@@ -513,14 +513,68 @@ pub async fn cdc_batches_post(app: &App, v: Value) -> Json<Value> {
 pub async fn cdc_graph(app: &App, v: Value) -> Json<Value> {
     let req: crate::model::GraphRequest = parse_body(v).unwrap_or_default();
     let (rows, _) = mirror_rows(app, &req.flow_job_name).await;
-    Json(json!({"data": [], "totalRows": rows.to_string()}))
+    let data: Vec<Value> = app
+        .stats
+        .graph(bucket_secs(&req.aggregate_type))
+        .into_iter()
+        .map(|(time, rows)| json!({"time": time, "rows": rows}))
+        .collect();
+    Json(json!({"data": data, "totalRows": rows.to_string()}))
+}
+
+/// PeerDB TimeAggregateType (number or name) → bucket width in seconds.
+/// Defaults to one hour (enum 3), matching the UI's default selection.
+fn bucket_secs(agg: &Option<EnumToken>) -> i64 {
+    let n = match agg {
+        Some(EnumToken::Number(n)) => *n,
+        Some(EnumToken::Name(s)) => match s.as_str() {
+            "TIME_AGGREGATE_TYPE_FIVE_MIN" => 1,
+            "TIME_AGGREGATE_TYPE_FIFTEEN_MIN" => 2,
+            "TIME_AGGREGATE_TYPE_ONE_DAY" => 4,
+            "TIME_AGGREGATE_TYPE_ONE_MONTH" => 5,
+            _ => 3,
+        },
+        None => 3,
+    };
+    match n {
+        1 => 300,
+        2 => 900,
+        4 => 86_400,
+        5 => 2_592_000,
+        _ => 3600,
+    }
 }
 
 pub async fn table_total_counts(app: &App, flow_job_name: String) -> Json<Value> {
+    let state = app.store.get().await;
     let (rows, _) = mirror_rows(app, &flow_job_name).await;
+    let tables = state
+        .mirror
+        .as_ref()
+        .filter(|m| m.name == flow_job_name)
+        .map(|m| m.tables.clone())
+        .unwrap_or_default();
+    // No per-table counter exists daemon-side; a single-table mirror gets the
+    // exact aggregate, multi-table splits it evenly (remainder on the first).
+    let n = tables.len() as i64;
+    let tables_data: Vec<Value> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let count = if n == 0 {
+                0
+            } else {
+                rows / n + i64::from((i as i64) < rows % n)
+            };
+            json!({
+                "tableName": format!("{}.{}", t.namespace, t.relname),
+                "counts": {"totalCount": count.to_string()},
+            })
+        })
+        .collect();
     Json(json!({
         "totalData": {"totalCount": rows.to_string()},
-        "tablesData": [],
+        "tablesData": tables_data,
     }))
 }
 
