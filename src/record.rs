@@ -74,9 +74,17 @@ pub enum SinkError {
 pub struct Record<'a> {
     pub parsed: XLogRecord<'a>,
     pub source_lsn: u64,
+    /// PG `XLogReaderState::EndRecPtr`: aligned end of this record, the
+    /// position `pg_last_wal_replay_lsn()` reports once shadow applies it.
+    /// `XLOG_SWITCH` advances to segment end. Replay comparisons use this,
+    /// never the last physical wire byte.
+    pub next_lsn: u64,
     pub page_magic: u16,
     pub route: Route,
     pub catalog_signal: CatalogSignal,
+    /// Commit of a catalog-mutating xact: pump must hold successor-byte
+    /// publication until shadow replays through `next_lsn`
+    pub catalog_boundary: bool,
 }
 
 pub trait RecordSink {
@@ -160,9 +168,11 @@ impl RecordSink for CollectingRecordSink {
             self.records.push(Record {
                 parsed: record.parsed.clone().into_owned(),
                 source_lsn: record.source_lsn,
+                next_lsn: record.next_lsn,
                 page_magic: record.page_magic,
                 route: record.route,
                 catalog_signal: record.catalog_signal,
+                catalog_boundary: record.catalog_boundary,
             });
             Ok(())
         })

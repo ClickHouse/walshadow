@@ -427,6 +427,17 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             "shadow replay {observed:X} < target {target:X}",
         );
 
+        // 8b. CREATE TABLE bs.t2's commit is a catalog boundary: the pump
+        //     must have parked once and released via shadow replay (info
+        //     line at the walshadow::boundary_hold target). Metrics can't
+        //     carry this assertion — the endpoint dies with the
+        //     max-segments exit before a poll reliably observes it.
+        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        assert!(
+            stderr.contains("catalog boundary released"),
+            "catalog commit never parked the pump\n--- daemon stderr ---\n{stderr}",
+        );
+
         // 9a. Catalog mirroring: bs.t2 was created during the
         //     workload — DDL records pass through the filter, shadow
         //     replays them, the table must exist on both sides with

@@ -322,9 +322,11 @@ impl RecordSink for SharedCollectingSink {
             self.0.lock().unwrap().push(Record {
                 parsed: r.parsed.clone().into_owned(),
                 source_lsn: r.source_lsn,
+                next_lsn: r.next_lsn,
                 page_magic: r.page_magic,
                 route: r.route,
                 catalog_signal: r.catalog_signal,
+                catalog_boundary: r.catalog_boundary,
             });
             Ok(())
         })

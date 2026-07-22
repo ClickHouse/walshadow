@@ -393,6 +393,37 @@ impl CatalogTracker {
     }
 }
 
+/// Well-formed `XLOG_RELMAP_UPDATE` record, shared with filter-engine tests.
+#[cfg(test)]
+pub(crate) fn test_relmap_record(dbid: u32, mappings: &[(u32, u32)]) -> XLogRecord<'static> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&dbid.to_le_bytes());
+    data.extend_from_slice(&1664u32.to_le_bytes()); // tsid pg_global
+    data.extend_from_slice(&(REL_MAP_FILE_SIZE as i32).to_le_bytes());
+    data.extend_from_slice(&RELMAPPER_FILEMAGIC.to_le_bytes());
+    data.extend_from_slice(&(mappings.len() as i32).to_le_bytes());
+    for &(oid, fnum) in mappings {
+        data.extend_from_slice(&oid.to_le_bytes());
+        data.extend_from_slice(&fnum.to_le_bytes());
+    }
+    for _ in mappings.len()..MAX_MAPPINGS {
+        data.extend_from_slice(&[0u8; 8]);
+    }
+    data.extend_from_slice(&0u32.to_le_bytes()); // crc, ignored
+
+    XLogRecord {
+        header: walrus::pg::walparser::XLogRecordHeader {
+            resource_manager_id: RmId::RelMap as u8,
+            info: XLOG_RELMAP_UPDATE,
+            total_record_length: 24 + data.len() as u32,
+            ..Default::default()
+        },
+        main_data_len: data.len() as u32,
+        main_data: std::borrow::Cow::Owned(data),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,34 +431,7 @@ mod tests {
         BlockLocation, RelFileNode, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
 
-    fn relmap_record(dbid: u32, mappings: &[(u32, u32)]) -> XLogRecord<'static> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&dbid.to_le_bytes());
-        data.extend_from_slice(&1664u32.to_le_bytes()); // tsid pg_global
-        data.extend_from_slice(&(REL_MAP_FILE_SIZE as i32).to_le_bytes());
-        data.extend_from_slice(&RELMAPPER_FILEMAGIC.to_le_bytes());
-        data.extend_from_slice(&(mappings.len() as i32).to_le_bytes());
-        for &(oid, fnum) in mappings {
-            data.extend_from_slice(&oid.to_le_bytes());
-            data.extend_from_slice(&fnum.to_le_bytes());
-        }
-        for _ in mappings.len()..MAX_MAPPINGS {
-            data.extend_from_slice(&[0u8; 8]);
-        }
-        data.extend_from_slice(&0u32.to_le_bytes()); // crc, ignored
-
-        XLogRecord {
-            header: XLogRecordHeader {
-                resource_manager_id: RmId::RelMap as u8,
-                info: XLOG_RELMAP_UPDATE,
-                total_record_length: 24 + data.len() as u32,
-                ..Default::default()
-            },
-            main_data_len: data.len() as u32,
-            main_data: std::borrow::Cow::Owned(data),
-            ..Default::default()
-        }
-    }
+    use super::test_relmap_record as relmap_record;
 
     fn heap_block_record(
         rm: RmId,

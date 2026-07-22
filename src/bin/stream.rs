@@ -48,6 +48,9 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
+use walshadow::boundary_hold::{
+    BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
+};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig};
 use walshadow::decoder_sink::MetricsTupleObserver;
@@ -146,7 +149,11 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
 /// couple wire pacing to decode.
 struct DaemonSinks {
     metrics: MetricsRecordSink,
-    decoder_xact: QueueingRecordSink,
+    /// Queueing sink wrapped with the catalog-boundary publication hold:
+    /// at a catalog-mutating commit the pump parks here until shadow
+    /// replays through the commit's `next_lsn`, so successor bytes reach
+    /// neither the shadow wire nor the archive while held.
+    decoder_xact: BoundaryHoldSink,
     /// Shared with the `BufferingDecoderSink` on the queueing worker;
     /// status loop polls without contending on the worker.
     decoder_stats: Arc<walshadow::decoder_sink::DecoderStats>,
@@ -272,13 +279,21 @@ struct Args {
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     walsender_slow_threshold: usize,
     /// Seconds the pump waits for shadow's walreceiver to attach before
-    /// processing records. `0` disables the barrier (shadow driven purely
-    /// via `restore_command`). `ShadowStreamSink` drops bytes pushed
-    /// before a connection registers; without the barrier the pump can
-    /// race past shadow's `START_REPLICATION` LSN and leave the catalog
-    /// gate timed out against an apply LSN that never advances.
+    /// processing records. Must be positive; no attachment within it fails
+    /// startup. Catalog-boundary holds require a live wire: whole archive
+    /// segments can't stop publication at a mid-segment commit, so
+    /// archive-only operation (the old `0` escape hatch) is rejected.
+    /// `ShadowStreamSink` also drops bytes pushed before a connection
+    /// registers; a pump racing past shadow's `START_REPLICATION` LSN
+    /// leaves an apply LSN that never advances.
     #[arg(long, default_value_t = 60)]
     walsender_connect_timeout: u64,
+    /// Seconds a catalog-boundary publication hold may wait for shadow to
+    /// replay through a catalog-mutating commit before failing the daemon.
+    /// Keep well under source's `wal_sender_timeout` (default 60s): the
+    /// pump answers no source keepalives while parked.
+    #[arg(long, default_value_t = 30)]
+    catalog_hold_timeout: u64,
     /// Soft cap on in-flight records for the `QueueingRecordSink` feeding
     /// the decoder / xact-drain worker. Past this watermark the pump
     /// yields to let the worker drain; a stuck worker still surfaces via
@@ -589,12 +604,28 @@ fn spawn_sighup_reload(
     })
 }
 
+/// Enforce capability, not flag value: catalog-boundary holds need an
+/// active walreceiver, so archive-only operation is not startable.
+fn validate_transport_args(args: &Args) -> Result<()> {
+    anyhow::ensure!(
+        args.walsender_connect_timeout > 0,
+        "--walsender-connect-timeout 0 (archive-only shadow) is unsupported: \
+         catalog-boundary publication holds require an attached walreceiver",
+    );
+    anyhow::ensure!(
+        args.catalog_hold_timeout > 0,
+        "--catalog-hold-timeout must be positive",
+    );
+    Ok(())
+}
+
 /// Process-lifetime entry: bind metrics + control socket + SIGHUP, then stream
 /// one session. Every reconfigure (socket / SIGHUP) is a live reload — no
 /// restart. Ctrl-C breaks the pump loop and drains gracefully.
 async fn run(args: Args) -> Result<()> {
     use walshadow::control::{Reloader, SharedCtx};
 
+    validate_transport_args(&args)?;
     let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .inspect_err(|e| {
             tracing::warn!(
@@ -1396,6 +1427,15 @@ async fn run_session(
         args.decoder_queue_capacity,
         span_registry.clone(),
     );
+    let boundary_gate = CatalogBoundaryGate::new(
+        shadow_state.clone(),
+        BoundaryGateConfig {
+            hold_timeout: Duration::from_secs(args.catalog_hold_timeout),
+            ..BoundaryGateConfig::default()
+        },
+    );
+    let boundary_hold_stats = boundary_gate.stats.clone();
+    let decoder_xact = BoundaryHoldSink::new(decoder_xact, boundary_gate);
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder_xact,
@@ -1454,36 +1494,31 @@ async fn run_session(
     // racing past `START_REPLICATION`'s LSN before walreceiver arrives
     // leaves an unrecoverable gap: post-conn frames carry LSNs past
     // walreceiver's expected continuity, shadow's apply stalls, the catalog
-    // gate times out (pgbench_acceptance / kill_restart failure mode). Cap
-    // the wait so operators without a streaming shadow still boot via the
-    // restore_command archive path.
-    if args.walsender_connect_timeout > 0 {
+    // gate times out (pgbench_acceptance / kill_restart failure mode). No
+    // attachment fails startup: catalog-boundary holds require a live wire,
+    // and archive-only operation can't stop publication at a mid-segment
+    // commit (restore_command must never observe unreleased bytes).
+    {
         let timeout = Duration::from_secs(args.walsender_connect_timeout);
         let start = Instant::now();
-        let mut attached = false;
         loop {
             if shadow_state.lock().await.aggregate().active_connections > 0 {
-                attached = true;
                 break;
             }
-            if start.elapsed() >= timeout {
-                break;
-            }
+            anyhow::ensure!(
+                start.elapsed() < timeout,
+                "no walreceiver attached to walsender {walsender_addr} within \
+                 {}s; catalog-boundary holds require a live wire — point \
+                 shadow's primary_conninfo here or raise --walsender-connect-timeout",
+                args.walsender_connect_timeout,
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if attached {
-            tracing::info!(
-                target: "walshadow",
-                wait = ?start.elapsed(),
-                "walsender connected — starting pump",
-            );
-        } else {
-            tracing::warn!(
-                target: "walshadow",
-                timeout_secs = args.walsender_connect_timeout,
-                "no walsender connection within boot barrier — proceeding (shadow on restore_command path)",
-            );
-        }
+        tracing::info!(
+            target: "walshadow",
+            wait = ?start.elapsed(),
+            "walsender connected — starting pump",
+        );
     }
 
     let source_recovery = SourceRecovery {
@@ -1701,6 +1736,7 @@ async fn run_session(
                 active_connections: shadow_agg.active_connections as u64,
                 dropped_total: shadow_agg.dropped_total,
             },
+            &boundary_hold_stats,
             metrics_resolver.as_deref(),
             metrics_backfiller.as_deref(),
         )
@@ -2249,6 +2285,7 @@ async fn populate_metrics(
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
     uptime_secs: u64,
     shadow_view: ShadowMetricsView,
+    boundary_hold: &BoundaryHoldStats,
     config_resolver: Option<&ConfigResolver>,
     backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
 ) {
@@ -2381,6 +2418,9 @@ async fn populate_metrics(
         shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
         shadow_stream_dropped_connections_total: shadow_view.dropped_total,
+        catalog_boundary_holds_total: boundary_hold.holds.load(Ordering::Relaxed),
+        catalog_boundary_hold_failures_total: boundary_hold.failures.load(Ordering::Relaxed),
+        catalog_boundary_hold_seconds_total: boundary_hold.hold_seconds_total(),
         config_pending_decl_rels: config_resolver.map(|r| r.pending_decl_count()).unwrap_or(0),
         config_replicate_opt_in_total: config_resolver.map(|r| r.opt_in_total()).unwrap_or(0),
         config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),
@@ -3395,6 +3435,16 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn transport_args_reject_archive_only_and_zero_hold_timeout() {
+        assert!(validate_transport_args(&args_from(&[])).is_ok());
+        assert!(
+            validate_transport_args(&args_from(&["--walsender-connect-timeout", "0"])).is_err(),
+            "archive-only escape hatch must fail startup",
+        );
+        assert!(validate_transport_args(&args_from(&["--catalog-hold-timeout", "0"])).is_err());
     }
 
     #[test]

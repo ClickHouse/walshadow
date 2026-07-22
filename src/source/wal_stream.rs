@@ -32,7 +32,9 @@
 
 use thiserror::Error;
 use walrus::pg::wal::segment::SegmentName;
-use walrus::pg::walparser::{ParseError, XLogRecord, parse_record_from_bytes};
+use walrus::pg::walparser::{
+    ParseError, RmId, X_LOG_RECORD_ALIGNMENT, X_LOG_SWITCH, XLogRecord, parse_record_from_bytes,
+};
 
 use crate::filter::manifest::{Entry, FILTER_VERSION, Kind, Manifest};
 use crate::filter::rewrite::{RewriteError, noop_replace};
@@ -238,8 +240,7 @@ impl WalStream {
             // NOOP below can take `&mut self.walker` without conflict,
             // and so the decoder reads the original bytes after the
             // shadow stream is clobbered.
-            let route;
-            let catalog_signal;
+            let verdict;
             let parsed_for_sink: XLogRecord<'static>;
             {
                 let parsed = parse_record_from_bytes(
@@ -250,11 +251,12 @@ impl WalStream {
                     offset: start_offset,
                     source,
                 })?;
-                (route, catalog_signal) = self.filter.decide_with_signal(&parsed);
+                verdict = self.filter.decide_record(&parsed);
                 // `rewrite_record` below mutates walker.buf that `parsed`
                 // views; dispatch needs the original parse, not post-rewrite.
                 parsed_for_sink = parsed.into_owned();
             }
+            let route = verdict.route;
             let kind = match route {
                 Route::ToShadow => Kind::Kept,
                 Route::ToDecoder => Kind::Dropped,
@@ -304,12 +306,15 @@ impl WalStream {
             }
 
             let source_lsn = self.current_lsn + start_offset as u64;
+            let next_lsn = self.end_rec_ptr(&last_range, &parsed_for_sink);
             let record = Record {
                 parsed: parsed_for_sink,
                 source_lsn,
+                next_lsn,
                 page_magic,
                 route,
-                catalog_signal,
+                catalog_signal: verdict.signal,
+                catalog_boundary: verdict.catalog_boundary,
             };
             if let Some(sink) = record_sink.as_deref_mut() {
                 sink.on_record(&record).await?;
@@ -420,6 +425,28 @@ impl WalStream {
                 .await?;
         }
         Ok(())
+    }
+
+    /// PG `XLogReaderState::EndRecPtr` for a record whose final byte range
+    /// is `last_range` (walker-buffer offset + len, base `current_lsn`).
+    ///
+    /// Ports xlogreader.c's arithmetic: single-page records advance
+    /// `RecPtr + MAXALIGN(xl_tot_len)`; page- and segment-spanning records
+    /// advance `last_page_addr + page_header_size + MAXALIGN(rem_len)` —
+    /// both collapse to aligning the final range's end, since a
+    /// continuation range starts at its page's aligned data offset.
+    /// `XLOG_SWITCH` pretends to extend to segment end.
+    fn end_rec_ptr(&self, last_range: &(usize, usize), parsed: &XLogRecord) -> u64 {
+        let (off, len) = *last_range;
+        let aligned_len = (len + X_LOG_RECORD_ALIGNMENT - 1) & !(X_LOG_RECORD_ALIGNMENT - 1);
+        let mut end = self.current_lsn + off as u64 + aligned_len as u64;
+        if parsed.header.resource_manager_id == RmId::Xlog as u8
+            && parsed.header.info & 0xF0 == X_LOG_SWITCH
+        {
+            end += self.seg_size - 1;
+            end -= end % self.seg_size;
+        }
+        end
     }
 
     fn segment_for_lsn(&self, lsn: u64) -> SegmentName {
@@ -902,6 +929,324 @@ mod tests {
         assert_eq!(page1.len(), PAGE);
 
         (page0, page1)
+    }
+
+    /// General record-bytes builder: optional block ref (no data) +
+    /// optional short main_data, CRC patched like `synth_xact_page`.
+    fn raw_rec(
+        rmid: u8,
+        info: u8,
+        xid: u32,
+        block: Option<(u32, u32, u32)>,
+        main_data: Option<&[u8]>,
+    ) -> Vec<u8> {
+        use walrus::pg::walparser::XLR_BLOCK_ID_DATA_SHORT;
+        let mut v = Vec::new();
+        v.extend_from_slice(&0u32.to_le_bytes()); // tot_len backpatched
+        v.extend_from_slice(&xid.to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes()); // prev
+        v.push(info);
+        v.push(rmid);
+        v.push(0);
+        v.push(0);
+        v.extend_from_slice(&0u32.to_le_bytes()); // crc backpatched
+        if let Some((spc, db, rel)) = block {
+            v.push(0); // block_id 0
+            v.push(0); // fork_flags: main fork, no image/data
+            v.extend_from_slice(&0u16.to_le_bytes()); // data_length
+            v.extend_from_slice(&spc.to_le_bytes());
+            v.extend_from_slice(&db.to_le_bytes());
+            v.extend_from_slice(&rel.to_le_bytes());
+            v.extend_from_slice(&0u32.to_le_bytes()); // block_no
+        }
+        if let Some(md) = main_data {
+            v.push(XLR_BLOCK_ID_DATA_SHORT);
+            v.push(md.len() as u8);
+            v.extend_from_slice(md);
+        }
+        let total = v.len() as u32;
+        v[0..4].copy_from_slice(&total.to_le_bytes());
+        let crc = crate::filter::rewrite::compute_crc(&v);
+        v[20..24].copy_from_slice(&crc.to_le_bytes());
+        v
+    }
+
+    fn page_of(records: &[Vec<u8>], page_len: usize) -> Vec<u8> {
+        use walrus::pg::walparser::{XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
+        let mut page = Vec::with_capacity(page_len);
+        page.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        page.extend_from_slice(&1u32.to_le_bytes()); // timeline
+        page.extend_from_slice(&0u64.to_le_bytes()); // page_address
+        page.extend_from_slice(&0u32.to_le_bytes()); // remaining_data_len
+        page.extend_from_slice(&12345u64.to_le_bytes()); // sysid
+        page.extend_from_slice(&(page_len as u32).to_le_bytes()); // seg_size
+        page.extend_from_slice(&8192u32.to_le_bytes()); // blcksz
+        page.extend_from_slice(&[0u8; 4]); // pad to 40
+        for r in records {
+            page.extend_from_slice(r);
+            let pad = (8 - (page.len() % 8)) % 8;
+            page.extend(std::iter::repeat_n(0u8, pad));
+        }
+        page.resize(page_len, 0);
+        page
+    }
+
+    /// PG EndRecPtr: single-page records advance by MAXALIGN(xl_tot_len);
+    /// an unaligned length (30 → 32) must not leak into `next_lsn`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_lsn_advances_by_maxaligned_total_len() {
+        const SEG: u64 = 8192;
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &synth_xact_page(), &mut rec, &mut seg)
+            .await
+            .unwrap();
+        // synth records are 30 bytes at offsets 40 and 72
+        assert_eq!(rec.records[0].source_lsn, 40);
+        assert_eq!(rec.records[0].next_lsn, 72);
+        assert_eq!(rec.records[1].source_lsn, 72);
+        assert_eq!(rec.records[1].next_lsn, 104);
+    }
+
+    /// Page-spanning record: EndRecPtr = continuation-page data start +
+    /// MAXALIGN(rem_len), NOT record start + MAXALIGN(total) (page header
+    /// bytes intervene).
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_lsn_cross_page_record_uses_continuation_page_arithmetic() {
+        use walrus::pg::walparser::{WAL_PAGE_SIZE, X_LOG_RECORD_HEADER_SIZE, XLP_PAGE_MAGIC_PG15};
+        const PAGE: usize = WAL_PAGE_SIZE as usize;
+        const SEG: u64 = 2 * PAGE as u64; // both pages in one segment
+        // 8200-byte record from page-0 offset 40: 8152 on page 0, 48 on
+        // page 1 whose data starts at PAGE + 24 (short header)
+        let total = 8200usize;
+        let main_data_len = total - X_LOG_RECORD_HEADER_SIZE - 5;
+        let mut record = Vec::with_capacity(total);
+        record.extend_from_slice(&(total as u32).to_le_bytes());
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.extend_from_slice(&0u64.to_le_bytes());
+        record.push(0);
+        record.push(RmId::Xact as u8);
+        record.push(0);
+        record.push(0);
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.push(walrus::pg::walparser::XLR_BLOCK_ID_DATA_LONG);
+        record.extend_from_slice(&(main_data_len as u32).to_le_bytes());
+        record.resize(total, 0xAA);
+
+        let p0_data = PAGE - 40;
+        let mut page0 = page_of(&[], PAGE);
+        page0.truncate(40);
+        page0.extend_from_slice(&record[..p0_data]);
+
+        let mut page1 = Vec::with_capacity(PAGE);
+        page1.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+        page1.extend_from_slice(&0u16.to_le_bytes()); // short header
+        page1.extend_from_slice(&1u32.to_le_bytes());
+        page1.extend_from_slice(&(PAGE as u64).to_le_bytes());
+        page1.extend_from_slice(&((total - p0_data) as u32).to_le_bytes()); // rem_len = 48
+        page1.extend_from_slice(&[0u8; 4]); // pad to 24
+        page1.extend_from_slice(&record[p0_data..]);
+        page1.resize(PAGE, 0);
+
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &page0, &mut rec, &mut seg).await.unwrap();
+        assert!(rec.records.is_empty());
+        ws.push(PAGE as u64, &page1, &mut rec, &mut seg)
+            .await
+            .unwrap();
+        assert_eq!(rec.records[0].source_lsn, 40);
+        // PAGE + 24 (continuation data start) + MAXALIGN(48)
+        assert_eq!(rec.records[0].next_lsn, PAGE as u64 + 24 + 48);
+    }
+
+    /// Segment-spanning record ending flush on a page boundary: EndRecPtr
+    /// is exactly the boundary address.
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_lsn_segment_spanning_record_ends_on_boundary() {
+        const SEG: u64 = walrus::pg::walparser::WAL_PAGE_SIZE as u64;
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        let (page0, page1) = synth_two_page_spanning_record();
+        ws.push(0, &page0, &mut rec, &mut seg).await.unwrap();
+        ws.push(SEG, &page1, &mut rec, &mut seg).await.unwrap();
+        assert_eq!(rec.records.len(), 1);
+        assert_eq!(rec.records[0].next_lsn, 2 * SEG);
+    }
+
+    /// XLOG_SWITCH pretends to extend to segment end.
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_lsn_xlog_switch_advances_to_segment_end() {
+        const SEG: u64 = 8192;
+        let switch = raw_rec(RmId::Xlog as u8, X_LOG_SWITCH, 0, None, None);
+        let page = page_of(&[switch], SEG as usize);
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &page, &mut rec, &mut seg).await.unwrap();
+        assert_eq!(rec.records[0].source_lsn, 40);
+        assert_eq!(rec.records[0].next_lsn, SEG);
+    }
+
+    /// Bare-DDL commit (catalog write + commit, no replicated rows) parks
+    /// the pump: successor bytes reach neither the shadow wire nor the
+    /// segment sink until shadow's apply LSN passes the commit's
+    /// `next_lsn`; then everything flows and the hold releases exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_commit_parks_pump_until_shadow_replay() {
+        use crate::record::CountingRecordSink;
+        use crate::source::boundary_hold::{
+            BoundaryGateConfig, BoundaryHoldSink, CatalogBoundaryGate,
+        };
+        use crate::source::queueing_record_sink::QueueingRecordSink;
+        use crate::source::shadow_stream::ShadowStreamState;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Mutex;
+
+        const SEG: u64 = 8192;
+        // A: catalog heap insert (pg_class) xid 7 — 44 bytes at 40
+        let a = raw_rec(RmId::Heap as u8, 0x00, 7, Some((1663, 5, 1259)), None);
+        assert_eq!(a.len(), 44);
+        // B: commit xid 7 — 34 bytes at 88, EndRecPtr 128
+        let b = raw_rec(RmId::Xact as u8, 0x00, 7, None, Some(&0i64.to_le_bytes()));
+        assert_eq!(b.len(), 34);
+        // C: user heap insert xid 8 — successor bytes that must hold
+        let c = raw_rec(RmId::Heap as u8, 0x00, 8, Some((1663, 5, 50000)), None);
+        let page = page_of(&[a, b, c], SEG as usize);
+        let (b_wire_end, b_next_lsn, c_wire_end) = (40 + 44 + 4 + 34, 128u64, 128 + 44);
+
+        let state = Arc::new(Mutex::new(ShadowStreamState::new(1, "sys".into(), 0, 1024)));
+        let conn = state.lock().await.register_connection(0);
+
+        type Chunks = Arc<std::sync::Mutex<Vec<(u64, usize)>>>;
+        let chunks: Chunks = Arc::default();
+        struct SpanLog(Chunks);
+        impl RecordBytesSink for SpanLog {
+            fn on_wire_chunk<'a>(
+                &'a mut self,
+                start_lsn: u64,
+                bytes: &'a [u8],
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                self.0.lock().unwrap().push((start_lsn, bytes.len()));
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        ws.set_bytes_sink(Box::new(SpanLog(chunks.clone())));
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 64, 1024, None);
+        let gate = CatalogBoundaryGate::new(
+            state.clone(),
+            BoundaryGateConfig {
+                hold_timeout: Duration::from_secs(10),
+                poll_interval: Duration::from_millis(1),
+            },
+        );
+        let stats = gate.stats.clone();
+        let mut sink = BoundaryHoldSink::new(q, gate);
+        let pump = tokio::spawn(async move {
+            let mut seg = CollectingSegmentSink::default();
+            ws.push(0, &page, &mut sink, &mut seg).await.unwrap();
+            (sink, seg.segments.len())
+        });
+
+        // Wait for the pump to park: commit B's wire chunk dispatched…
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let max_end = chunks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(s, l)| s + *l as u64)
+                .max()
+                .unwrap_or(0);
+            if max_end >= b_wire_end as u64 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "commit bytes never reached the wire",
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // …and successor C's withheld while apply lags.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let max_end = chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, l)| s + *l as u64)
+            .max()
+            .unwrap();
+        assert_eq!(
+            max_end, b_wire_end as u64,
+            "successor bytes published during hold",
+        );
+        assert_eq!(stats.holds.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Shadow replays through the commit's EndRecPtr → release.
+        state
+            .lock()
+            .await
+            .observe_status(conn, b_next_lsn, b_next_lsn, b_next_lsn);
+        let (sink, segs_shipped) = pump.await.unwrap();
+        assert_eq!(stats.holds.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(stats.failures.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let max_end = chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, l)| s + *l as u64)
+            .max()
+            .unwrap();
+        assert!(
+            max_end >= c_wire_end as u64,
+            "successor flowed after release"
+        );
+        assert_eq!(segs_shipped, 1, "segment shipped only after release");
+        sink.close().await.unwrap();
+    }
+
+    /// DML-only commit never parks: push completes with no walreceiver
+    /// attached and no apply progress at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dml_only_commit_does_not_park() {
+        use crate::record::CountingRecordSink;
+        use crate::source::boundary_hold::{
+            BoundaryGateConfig, BoundaryHoldSink, CatalogBoundaryGate,
+        };
+        use crate::source::queueing_record_sink::QueueingRecordSink;
+        use crate::source::shadow_stream::ShadowStreamState;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Mutex;
+
+        const SEG: u64 = 8192;
+        let ins = raw_rec(RmId::Heap as u8, 0x00, 8, Some((1663, 5, 50000)), None);
+        let commit = raw_rec(RmId::Xact as u8, 0x00, 8, None, Some(&0i64.to_le_bytes()));
+        let page = page_of(&[ins, commit], SEG as usize);
+
+        let state = Arc::new(Mutex::new(ShadowStreamState::new(1, "sys".into(), 0, 1024)));
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
+        let gate = CatalogBoundaryGate::new(state, BoundaryGateConfig::default());
+        let stats = gate.stats.clone();
+        let mut sink = BoundaryHoldSink::new(q, gate);
+        let mut seg = CollectingSegmentSink::default();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ws.push(0, &page, &mut sink, &mut seg),
+        )
+        .await
+        .expect("DML-only commit must not park")
+        .unwrap();
+        assert_eq!(stats.holds.load(std::sync::atomic::Ordering::Relaxed), 0);
+        sink.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

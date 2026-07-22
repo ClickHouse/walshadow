@@ -130,6 +130,20 @@ when walker buffer crosses 16 MiB; records straddling the boundary hold
 the flush until the spanning record completes, rewrite then lands
 uniformly across both segs
 
+Each `Record` carries two positions. `source_lsn` is record start — row
+version and ordering key. `next_lsn` is PG `XLogReaderState::EndRecPtr`
+(xlogreader.c arithmetic: single-page advances `MAXALIGN(xl_tot_len)`;
+page/segment-spanning advances last continuation page's data start +
+`MAXALIGN(rem_len)`; `XLOG_SWITCH` extends to segment end) — the value
+`pg_last_wal_replay_lsn()` reports once shadow applies the record, so
+every replay comparison uses it, never the last physical wire byte.
+`Filter::decide_record` additionally stamps `catalog_boundary` on
+commit records of catalog-mutating xacts: the filter marks xids dirty
+when a record touches a catalog relation (bootstrap `< 16384` rule,
+tracker-promoted filenodes, relmap updates) and drains marks at that
+xact's commit/abort — commit record subxact lists and prepared xids
+included, aborts clear without a boundary
+
 Poisoned flag: any error returned to `push` (sink Err, walker
 BadPageMagic, parse failure, rewrite failure) sets `self.poisoned =
 true`; subsequent `push` calls short-circuit with
@@ -244,6 +258,45 @@ last flush. `on_idle_advance(lsn)` runs after every batch carrying max
 Serial path: xact buffer caps the nudge at the observer's
 `idle_ack_ceiling(lsn)`. Without the idle advance source's slot pins
 WAL at last COMMIT, kill-restart idle catchup never resolves
+
+## Catalog-boundary publication hold
+
+[`src/boundary_hold.rs`](../src/boundary_hold.rs). At a
+`catalog_boundary` commit the pump must not publish successor bytes
+until shadow replays through the commit's `next_lsn` — the seam future
+catalog capture samples shadow at ([future/xact_stash.md](future/xact_stash.md))
+
+[`BoundaryHoldSink`](../src/boundary_hold.rs) wraps
+`QueueingRecordSink` in the daemon's sink chain and blocks inside
+`on_record`: `WalStream` dispatches wire bytes for record N, then
+awaits the record sink before framing N+1, so parking there withholds
+every successor byte from both the shadow wire and the archive segment
+sink (segment flush follows record drain; `restore_command` never
+observes unreleased bytes). At the boundary it first force-flushes the
+pump-side batch so the commit cannot strand in the accumulator, then
+parks in [`CatalogBoundaryGate::hold`](../src/boundary_hold.rs) until
+the aggregate walreceiver apply LSN reaches `next_lsn`. DML-only
+commits never park; hold cost is DDL-rate
+
+Shadow keeps applying while the pump parks: the walsender listener
+flushes already-queued frames on its own task. Walreceivers report
+apply progress only when flush advances or on
+`wal_receiver_status_interval`, so the gate prods each poll tick with a
+reply-requested `'k'` keepalive (`ShadowStreamState::request_status`)
+and observes apply at poll cadence (ms). Waiter is result-bearing:
+decoder-worker death (`QueueingRecordSink::worker_alive`, channel
+closed on fatal error or panic; parked root cause preferred over the
+generic hold error), walreceiver loss past the deadline, and
+`--catalog-hold-timeout` expiry (default 30s, keep under source's
+`wal_sender_timeout`) wake it with `Err`, poisoning the stream and
+terminating the pump. Walreceiver loss mid-hold is tolerated until the
+deadline — a reconnect backfills the in-progress segment from
+`wire_buf` and replay resumes. Never waits on ClickHouse, committed
+drains, or queued barrier work — only shadow replay of shipped bytes
+
+Metrics: `walshadow_catalog_boundary_holds_total`,
+`_hold_failures_total`, `_hold_seconds_total`; each release logs an
+info line with held duration at target `walshadow::boundary_hold`
 
 ## DecoderSink
 
@@ -378,7 +431,11 @@ colocated containers. `--walsender-bind` picks address; port-0 +
 barrier on `--walsender-connect-timeout` waits for shadow's walreceiver
 to attach before pump starts — `ShadowStreamSink::on_wire_chunk` drops
 bytes pushed before any connection registers, missed gap is
-unrecoverable
+unrecoverable. Attachment is a startup requirement, not best-effort:
+zero timeout is rejected and expiry without a connection fails boot.
+Catalog-boundary holds need a live wire — whole archive segments cannot
+stop publication at a mid-segment commit, so archive-only operation is
+not startable
 
 Sink: `ShadowStreamSink` composes via
 [`WalStream::set_bytes_sink`](../src/wal_stream.rs). Per-connection

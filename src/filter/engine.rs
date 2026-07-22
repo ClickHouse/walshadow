@@ -10,8 +10,14 @@
 //!   `CatalogTracker`. Unrecognised → ToShadow: correctness over bytes,
 //!   wrongly suppressing a catalog record breaks shadow.
 
-use walrus::pg::walparser::{XLogRecord, XLogRecordBlock};
+use std::collections::HashSet;
 
+use walrus::pg::walparser::{RmId, XLogRecord, XLogRecordBlock};
+
+use crate::decode::wal_xact::{
+    XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
+    XLOG_XACT_OPMASK, parse_xact_payload,
+};
 use crate::filter::catalog_tracker::{CatalogTracker, CatalogTrackerStats};
 use crate::filter::classify::{Class, classify};
 use crate::filter::main_data;
@@ -91,12 +97,27 @@ pub(crate) struct FilterSnapshot {
     catalog: CatalogTrackerStats,
 }
 
+/// Full routing verdict for one record; see [`Filter::decide_record`].
+#[derive(Debug, Clone, Copy)]
+pub struct Verdict {
+    pub route: Route,
+    pub signal: CatalogSignal,
+    /// Commit record of a catalog-mutating xact (top, subxact, or prepared
+    /// xid wrote a catalog-touching record). Pump holds shadow publication
+    /// here until replay passes the commit's `next_lsn`
+    pub catalog_boundary: bool,
+}
+
 /// Routes against the *post-update* catalog set so an XLOG_RELMAP_UPDATE
 /// introducing a new mapped-catalog filenumber immediately routes later
 /// records on that filenumber to shadow.
 pub struct Filter {
     tracker: CatalogTracker,
     stats: FilterStats,
+    /// Xids (top or sub) that wrote a catalog-touching record; drained at
+    /// their commit / abort. Crash-orphaned xids linger, bounded by
+    /// workload (no commit ever arrives to hold on)
+    catalog_dirty_xids: HashSet<u32>,
 }
 
 impl Filter {
@@ -104,11 +125,12 @@ impl Filter {
         Self {
             tracker: CatalogTracker::new(),
             stats: FilterStats::default(),
+            catalog_dirty_xids: HashSet::new(),
         }
     }
 
     pub fn decide(&mut self, record: &XLogRecord) -> Route {
-        self.decide_with_signal(record).0
+        self.decide_record(record).route
     }
 
     pub fn tracker(&self) -> &CatalogTracker {
@@ -137,38 +159,88 @@ impl Filter {
         )
     }
 
-    /// [`Self::decide`] plus the tracker's [`CatalogSignal`] verdict, stamped
-    /// on the outgoing [`Record`](crate::record::Record) so the decoder
-    /// worker bumps invalidation epochs at its own stream position (a
-    /// pump-position bump would be consumable before pre-DDL records finish
-    /// decoding; see `catalog_tracker` module doc)
+    /// [`Self::decide_record`] narrowed to `(route, signal)`.
     pub fn decide_with_signal(&mut self, record: &XLogRecord) -> (Route, CatalogSignal) {
+        let v = self.decide_record(record);
+        (v.route, v.signal)
+    }
+
+    /// Route plus the tracker's [`CatalogSignal`] verdict, stamped on the
+    /// outgoing [`Record`](crate::record::Record) so the decoder worker
+    /// bumps invalidation epochs at its own stream position (a
+    /// pump-position bump would be consumable before pre-DDL records finish
+    /// decoding; see `catalog_tracker` module doc), plus the
+    /// catalog-boundary verdict driving the pump's publication hold.
+    pub fn decide_record(&mut self, record: &XLogRecord) -> Verdict {
         let signal = self.tracker.observe(record);
         let class = classify(record);
-        let route = match class {
-            Class::Special | Class::Catalog => Route::ToShadow,
+        // `catalog_touch` marks the record's xid dirty: only paths proving a
+        // catalog relation was written qualify. `Empty`'s None → ToShadow
+        // safe default must not dirty (would hold at unrelated commits)
+        let (route, catalog_touch) = match class {
+            Class::Catalog => (Route::ToShadow, true),
+            // Relmap update (VACUUM FULL mapped catalog) is Special-class
+            Class::Special => (Route::ToShadow, signal != CatalogSignal::None),
             Class::User => {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
                     // tracker has filenodes the bootstrap classify rule misses
-                    Route::ToShadow
+                    (Route::ToShadow, true)
                 } else {
-                    Route::ToDecoder
+                    (Route::ToDecoder, false)
                 }
             }
             Class::Empty => match main_data::relation_for_empty(record) {
                 Some(rel) => {
                     if self.tracker.is_catalog(rel.db_node, rel.rel_node) {
-                        Route::ToShadow
+                        (Route::ToShadow, true)
                     } else {
-                        Route::ToDecoder
+                        (Route::ToDecoder, false)
                     }
                 }
-                None => Route::ToShadow, // safe default
+                None => (Route::ToShadow, false), // safe default
             },
         };
+        let xid = record.header.xact_id;
+        if catalog_touch && xid != 0 {
+            self.catalog_dirty_xids.insert(xid);
+        }
+        let catalog_boundary = self.observe_xact_end(record);
         self.stats
             .record(class, route, record.header.total_record_length as u64);
-        (route, signal)
+        Verdict {
+            route,
+            signal,
+            catalog_boundary,
+        }
+    }
+
+    /// Drain dirty xids at commit / abort. Commit of any dirty xid (top,
+    /// listed subxact, or prepared xid) is a catalog boundary; abort clears
+    /// without holding — rolled-back catalog changes never become visible
+    /// in shadow. Commit records carry the full committed-subxact list
+    /// (`xactGetCommittedChildren`), so no ASSIGNMENT tracking is needed.
+    fn observe_xact_end(&mut self, record: &XLogRecord) -> bool {
+        if record.header.resource_manager_id != RmId::Xact as u8
+            || self.catalog_dirty_xids.is_empty()
+        {
+            return false;
+        }
+        let info = record.header.info;
+        let op = info & XLOG_XACT_OPMASK;
+        let is_commit = op == XLOG_XACT_COMMIT || op == XLOG_XACT_COMMIT_PREPARED;
+        let is_abort = op == XLOG_XACT_ABORT || op == XLOG_XACT_ABORT_PREPARED;
+        if !is_commit && !is_abort {
+            return false;
+        }
+        let payload = parse_xact_payload(info, &record.main_data);
+        let mut hit = self.catalog_dirty_xids.remove(&record.header.xact_id);
+        if let Some(x) = payload.twophase_xid {
+            hit |= self.catalog_dirty_xids.remove(&x);
+        }
+        for x in &payload.subxacts {
+            hit |= self.catalog_dirty_xids.remove(x);
+        }
+        hit && is_commit
     }
 
     pub fn rmgr_label(record: &XLogRecord) -> String {
@@ -327,5 +399,123 @@ mod tests {
         f.decide(&rec(RmId::Heap, &[(5, 20001)]));
         assert_eq!(f.stats.kept, 1);
         assert_eq!(f.stats.dropped, 2);
+    }
+
+    fn rec_with_xid(rm: RmId, rels: &[(u32, u32)], xid: u32) -> XLogRecord<'static> {
+        let mut r = rec(rm, rels);
+        r.header.xact_id = xid;
+        r
+    }
+
+    /// `xl_xact_commit` / `xl_xact_abort` main_data: xact_time, then
+    /// optional xinfo + subxact / twophase sections.
+    fn xact_end(op: u8, xid: u32, subxacts: &[u32], twophase: Option<u32>) -> XLogRecord<'static> {
+        let mut info = op;
+        let mut md: Vec<u8> = 0i64.to_le_bytes().to_vec();
+        if !subxacts.is_empty() || twophase.is_some() {
+            info |= XLOG_XACT_HAS_INFO;
+            let mut xinfo = 0u32;
+            if !subxacts.is_empty() {
+                xinfo |= 1 << 1; // XACT_XINFO_HAS_SUBXACTS
+            }
+            if twophase.is_some() {
+                xinfo |= 1 << 4; // XACT_XINFO_HAS_TWOPHASE
+            }
+            md.extend_from_slice(&xinfo.to_le_bytes());
+            if !subxacts.is_empty() {
+                md.extend_from_slice(&(subxacts.len() as i32).to_le_bytes());
+                for x in subxacts {
+                    md.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            if let Some(x) = twophase {
+                md.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let mut r = rec_with_xid(RmId::Xact, &[], xid);
+        r.header.info = info;
+        r.main_data = std::borrow::Cow::Owned(md);
+        r
+    }
+
+    use crate::decode::wal_xact::XLOG_XACT_HAS_INFO;
+
+    #[test]
+    fn catalog_commit_is_boundary_dml_commit_is_not() {
+        let mut f = Filter::new();
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 7));
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 20000)], 8));
+        // DML-only xid 8 commit: never parks
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT, 8, &[], None));
+        assert!(!v.catalog_boundary);
+        // Catalog-dirty xid 7 commit: boundary, drained after
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None));
+        assert!(v.catalog_boundary);
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None));
+        assert!(!v.catalog_boundary, "dirty mark consumed once");
+    }
+
+    #[test]
+    fn abort_clears_dirty_without_boundary() {
+        let mut f = Filter::new();
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 7));
+        let v = f.decide_record(&xact_end(XLOG_XACT_ABORT, 7, &[], None));
+        assert!(!v.catalog_boundary, "rolled-back DDL never holds");
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None));
+        assert!(!v.catalog_boundary, "abort drained the mark");
+    }
+
+    #[test]
+    fn subxact_catalog_write_marks_top_commit() {
+        let mut f = Filter::new();
+        // DDL under savepoint: catalog record carries subxid 101
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 101));
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT, 100, &[101, 102], None));
+        assert!(v.catalog_boundary);
+    }
+
+    #[test]
+    fn commit_prepared_matches_prepared_xid() {
+        let mut f = Filter::new();
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 300));
+        // COMMIT PREPARED: header xid differs, prepared xid in payload
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT_PREPARED, 0, &[], Some(300)));
+        assert!(v.catalog_boundary);
+    }
+
+    #[test]
+    fn relmap_update_marks_writing_xid() {
+        use crate::filter::catalog_tracker::test_relmap_record as relmap;
+        let mut f = Filter::new();
+        let mut r = relmap(5, &[(1259, 50000)]);
+        r.header.xact_id = 9;
+        f.decide_record(&r);
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT, 9, &[], None));
+        assert!(
+            v.catalog_boundary,
+            "VACUUM FULL relmap write holds at commit"
+        );
+    }
+
+    #[test]
+    fn empty_safe_default_route_does_not_dirty() {
+        let mut f = Filter::new();
+        // Class::Empty, unrecognised main_data → ToShadow safe default
+        let r = rec_with_xid(RmId::Heap, &[], 7);
+        assert_eq!(f.decide_record(&r).route, Route::ToShadow);
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None));
+        assert!(
+            !v.catalog_boundary,
+            "safe-default keep is not a catalog touch"
+        );
+    }
+
+    #[test]
+    fn tracker_promoted_user_record_dirties() {
+        let mut f = Filter::new();
+        f.tracker.add(5, 50000); // rotated mapped catalog above 16384
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 50000)], 7));
+        let v = f.decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None));
+        assert!(v.catalog_boundary);
     }
 }
