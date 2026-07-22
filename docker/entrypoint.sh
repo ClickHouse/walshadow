@@ -15,6 +15,10 @@ mkdir -p "$SHADOW_DATA"
 chmod 700 "$SHADOW_DATA"
 mkdir -p "$OUT_DIR" "$SPILL_DIR" "$SOCKET_DIR"
 
+# conf.d drop-in dir the control API writes fragments into (base is ro).
+CH_CONFIG="${WALSHADOW_CH_CONFIG:-/etc/walshadow/ch-config.toml}"
+mkdir -p "${CH_CONFIG%.toml}.d"
+
 # Pool sizes default here for the local stack, but the EC2 deploy.sh forwards
 # explicit --decoder-pool-size/--inserter-pool-size via "$@"; clap rejects a
 # flag passed twice, so only inject our defaults when the caller didn't.
@@ -49,6 +53,7 @@ exec walshadow-stream \
     --walsender-bind 127.0.0.1:5433 \
     --ch-config "${WALSHADOW_CH_CONFIG:-/etc/walshadow/ch-config.toml}" \
     --metrics-bind 0.0.0.0:9484 \
+    --control-socket "${WALSHADOW_CONTROL_SOCKET:-/var/run/walshadow/control.sock}" \
     --status-interval "${WALSHADOW_STATUS_INTERVAL:-5}" \
     "${POOL_ARGS[@]}" \
     "$@"

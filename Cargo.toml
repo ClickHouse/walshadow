@@ -45,7 +45,7 @@ async-trait = "0.1"
 backon = { version = "1", features = ["tokio-sleep"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
 fallible-iterator = "0.2"
 futures = "0.3"
@@ -72,3 +72,4 @@ mimalloc = "0.1.52"
 
 [dev-dependencies]
 tempfile = "3"
+toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }

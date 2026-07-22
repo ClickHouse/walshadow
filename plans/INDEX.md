@@ -35,6 +35,11 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
   shared insert tail
 - [ops.md](ops.md) — preflight, metrics, retention, manifest (floor,
   6 LSNs), standby-status triple, kill-restart drill
+- [control.md](control.md) — in-process control plane: `ctl` unix-socket
+  line protocol, base+`conf.d` config merge (API writes only its
+  `50-api.toml` fragment), live reload (mappings/budgets/CH-conn/table
+  selection/pause) with no restart, config-driven table opt-in, pause as
+  `[stream] paused`, `Reloader` (no session lifecycle)
 - [oracle.md](oracle.md) — differential decode oracle, walshadow PG
   extension, `--validate` sampling
 - [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)

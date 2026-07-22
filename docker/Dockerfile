@@ -63,7 +63,10 @@ RUN chmod +x /usr/local/bin/walshadow-entrypoint \
         /var/lib/walshadow/shadow-data \
         /var/lib/walshadow/out \
         /var/lib/walshadow/spill \
-        /var/run/postgresql
+        /var/run/postgresql \
+        /var/run/walshadow \
+        /etc/walshadow \
+        /etc/walshadow/ch-config.d
 
 USER postgres
 ENTRYPOINT ["/usr/local/bin/walshadow-entrypoint"]

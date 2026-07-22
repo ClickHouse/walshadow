@@ -19,7 +19,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{Mutex, mpsc, oneshot};
+use std::collections::{HashMap, HashSet};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
 
 use crate::catalog::shadow_catalog::{CatalogError, ShadowCatalog};
@@ -28,7 +29,7 @@ use crate::decode::heap_decoder::{DecodedHeap, HeapOp};
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
-use crate::schema::{SchemaEvent, SchemaEventRx};
+use crate::schema::{RelName, SchemaEvent, SchemaEventRx};
 use tracing::Instrument;
 
 use crate::decode::wal_xact::{
@@ -42,12 +43,12 @@ use crate::xact::xact_buffer::{
     drain_pending_schema_events,
 };
 
-use crate::config::ConfigResolver;
+use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::decode::DecodeJob;
-use crate::runtime_config::ConfigEvent;
+use crate::runtime_config::{ConfigEvent, TableRow};
 use crate::toast::ToastResolver;
 use crate::toast::toast_retire::RetireLedger;
 
@@ -103,6 +104,17 @@ pub struct ReorderSink {
     /// OTLP tracing is on; reorder parents `commit.drain`/`dispatch` under
     /// the `txn` and prunes the entry at commit (the buffer prunes at abort).
     span_registry: Option<TxnSpanRegistry>,
+    /// Live-reload receiver + the config-driven opt-in set applied so far. On a
+    /// republish (`ctl reload` / SIGHUP), the coordinator diffs `table_opt_ins`
+    /// at the next commit barrier — add → `apply_table_opt_in`, drop →
+    /// `exclude_table` (CH table retained).
+    reload_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    applied_opt_ins: HashSet<RelName>,
+    /// Opt-ins whose descriptor the shadow catalog can't resolve yet — a table
+    /// created just before `ctl tables select` races the CREATE's replay into
+    /// the shadow. Retried each commit until it resolves, then created +
+    /// backfilled (moves to `applied_opt_ins`).
+    pending_opt_ins: HashMap<RelName, TableRow>,
 }
 
 impl ReorderSink {
@@ -129,6 +141,18 @@ impl ReorderSink {
         retires: RetireLedger,
         resume_floor: Arc<AtomicU64>,
     ) -> Self {
+        let reload_rx = config_resolver.as_ref().map(|r| r.subscribe());
+        let applied_opt_ins = reload_rx
+            .as_ref()
+            .map(|rx| {
+                rx.borrow()
+                    .table_opt_ins
+                    .iter()
+                    .filter(|(_, row)| row.replicate == Some(true))
+                    .map(|(rel, _)| rel.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             buffer,
             catalog,
@@ -151,7 +175,104 @@ impl ReorderSink {
             span_registry,
             retires,
             resume_floor,
+            reload_rx,
+            applied_opt_ins,
+            pending_opt_ins: HashMap::new(),
         }
+    }
+
+    /// Apply a live config reload's table opt-in/opt-out diff at a commit
+    /// barrier (`opt_in_lsn = commit_lsn`). Base config (mappings/budgets/CH
+    /// connection) already republished onto the watch; here we do the part that
+    /// needs the applicator/catalog — create/drop the CH scope.
+    async fn maybe_apply_reload(&mut self, commit_lsn: u64) -> Result<(), SinkError> {
+        let Some(resolver) = self.config_resolver.clone() else {
+            return Ok(());
+        };
+        // On a republish, re-diff `table_opt_ins`: opt-outs drain now, new
+        // opt-ins queue as pending, dropped intents leave the queue.
+        let changed = self
+            .reload_rx
+            .as_mut()
+            .is_some_and(|rx| rx.has_changed().unwrap_or(false));
+        if changed {
+            let desired: Vec<(RelName, TableRow)> = {
+                let rx = self.reload_rx.as_mut().unwrap();
+                let snap = rx.borrow_and_update();
+                snap.table_opt_ins
+                    .iter()
+                    .map(|(rel, row)| (rel.clone(), row.clone()))
+                    .collect()
+            };
+            let desired_in: HashSet<RelName> = desired
+                .iter()
+                .filter(|(_, row)| row.replicate == Some(true))
+                .map(|(rel, _)| rel.clone())
+                .collect();
+            let stale: Vec<RelName> = self
+                .applied_opt_ins
+                .iter()
+                .filter(|rel| !desired_in.contains(*rel))
+                .cloned()
+                .collect();
+            for rel in stale {
+                resolver.exclude_table(&rel).await;
+                if let Some(b) = &self.backfiller {
+                    b.note_opt_out(&rel).await;
+                }
+                self.applied_opt_ins.remove(&rel);
+            }
+            self.pending_opt_ins
+                .retain(|rel, _| desired_in.contains(rel));
+            for (rel, row) in desired {
+                if row.replicate == Some(true) && !self.applied_opt_ins.contains(&rel) {
+                    self.pending_opt_ins.insert(rel, row);
+                }
+            }
+        }
+        // Each commit, apply any pending opt-in the shadow catalog can now
+        // resolve — a table created just before `select` races the CREATE's
+        // replay, so retry until the descriptor lands, then create + backfill.
+        if self.pending_opt_ins.is_empty() {
+            return Ok(());
+        }
+        // No applicator (bootstrap drain / tests without DDL) → can't create
+        // CH tables, so opt-ins stay pending.
+        let Some(applicator) = self.applicator.as_mut() else {
+            return Ok(());
+        };
+        let candidates: Vec<(RelName, TableRow)> = self
+            .pending_opt_ins
+            .iter()
+            .map(|(rel, row)| (rel.clone(), row.clone()))
+            .collect();
+        for (rel, row) in candidates {
+            let known = self
+                .catalog
+                .lock()
+                .await
+                .descriptor_by_name(&rel)
+                .await
+                .map_err(|e| SinkError::Other(format!("opt-in descriptor lookup: {e}")))?
+                .is_some();
+            if !known {
+                continue;
+            }
+            crate::backfill::opt_in::apply_table_opt_in(
+                &resolver,
+                applicator,
+                &self.catalog,
+                self.backfiller.as_ref(),
+                &rel,
+                &row,
+                commit_lsn,
+            )
+            .await
+            .map_err(|e| SinkError::Other(format!("reload opt-in: {e}")))?;
+            self.pending_opt_ins.remove(&rel);
+            self.applied_opt_ins.insert(rel);
+        }
+        Ok(())
     }
 
     fn alloc_seq(&mut self) -> u64 {
@@ -628,6 +749,9 @@ impl ReorderSink {
         // while the next loads, so a spilled xact never rematerializes whole.
         let commit_ts = drain.commit_ts;
         let commit_lsn = drain.commit_lsn;
+        // Apply any pending live-reload opt-in/opt-out diff before this commit's
+        // rows so newly-selected tables are in scope + created for it.
+        self.maybe_apply_reload(commit_lsn).await?;
         let mut rows_total: u64 = 0;
         // Set once a slice's seq registered as publishing (final data slice);
         // otherwise the trailing rows=0 marker publishes.
