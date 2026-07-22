@@ -57,11 +57,34 @@ Memory budget; `spill.dir` stays the `--spill-dir` CLI arg), and the source
 physical replication slot (`[source] slot` →
 `source_slot`, with a `--slot` CLI override applied at parse time à la
 `--ch-flush-timeout-ms`; created idempotently before pre-flight, streamed
-from, and resumed against on reconnect — see [source.md](source.md)). These describe how
-to reach CH/source or wire into pipeline stages at spawn; a live swap would mean
-reconnecting or rebuilding the pipeline.
+from, and resumed against on reconnect — see [source.md](source.md)), and the
+backup archive (`[backup]` → `EmitterConfig.backup`, see below). These describe
+how to reach CH/source or wire into pipeline stages at spawn; a live swap would
+mean reconnecting or rebuilding the pipeline.
 `target_database` and `soft_delete` thread into the DDL applicator at
 construction and carry across refreshes unchanged.
+
+## `[backup]` archive
+
+Storage for object-store bootstrap, WAL refill, and object-store backfill,
+parsed into a `walrus::config::Settings` (`parse_backup` reuses walrus's own
+`StorageSettings`/`S3Config`/`GcsConfig`).
+
+```toml
+[backup]
+archive = "s3://my-bucket/walshadow"   # s3:// | gs:// | file://  — required; scheme picks the backend
+region  = "us-east-1"                  # s3, optional (default us-east-1)
+endpoint = "https://minio.internal"    # s3, optional
+force_path_style = true                # s3, optional
+access_key = "…"                       # s3, optional — both keys → static creds, neither → IMDSv2
+secret_key = "…"
+credentials_path = "/gcs-sa.json"      # gcs, optional
+```
+
+Omitting section leaves `EmitterConfig.backup = None`: object-store
+bootstrap/backfill error out, and source WAL removal stops restart with an
+operator-actionable error. Daemon never substitutes a fresh base backup for
+missing archive coverage. See [bootstrap.md](bootstrap.md) restart contract.
 
 ## `<schema>.config_*` tables
 

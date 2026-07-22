@@ -44,21 +44,30 @@ digraph timeline_restart {
     b0 -> b1 -> b2 -> b3 -> b4 -> b5 -> b6 -> b7 -> b8;
   }
 
-  // ═════ C. WAL overflow → re-bootstrap ═════
+  // ═════ C. source recycled resume point → archive fallback ═════
   subgraph cluster_c {
-    label="C. extended outage  (slot LSN beyond source wal_keep_size)";
+    label="C. restart recovery  (source → archive → source)";
     style="rounded,filled"; color="#BD8183"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    c0 [label="① extended downtime", fillcolor="#403a36"];
-    c1 [label="② restart:\nSourceFeed::START_REPLICATION →\nERROR requested WAL segment removed", fillcolor="#4D3A28"];
-    c2 [label="③ daemon poisons\nlog ReplayTimeout / WAL gap\nexit non-zero", fillcolor="#4D3A28"];
-    c3 [label="④ operator re-invokes\n--bootstrap-mode=direct\n(or object_store)", fillcolor="#403a36"];
-    c4 [label="⑤ greenfield bootstrap path\n(→ timeline_bootstrap)", fillcolor="#4D3A28"];
-    c5 [label="⑥ shadow data dir wiped\nor diverted to fresh dir", fillcolor="#3D4128"];
-    c6 [label="⑦ first status update saves\nnew manifest.toml", fillcolor="#4D3A28"];
-    c7 [label="⑧ steady-state reached", fillcolor="#4D4128"];
+    c0 [label="① restart: initialized shadow (no incomplete marker)\n→ resume in place, never base backup\nresume_lsn = manifest end_lsn (after bootstrap)\nor --start-lsn", fillcolor="#403a36"];
+    c1 [label="② START_REPLICATION at resume_lsn\n(stream.next_lsn)", fillcolor="#4D3A28"];
+    c2 [label="③ transient drop → retry source once\n(primary_conninfo first)", fillcolor="#4D3A28"];
+    c3 [label="④ fetch [backup] segment covering resume_lsn\n(full segment sliced from resume_lsn);\nreplay through live filter + decode sinks", fillcolor="#4D3340"];
+    c4 [label="⑤ archive lacks next segment\nreconnect source at exact handoff (backoff)", fillcolor="#4D3A28"];
+    c5 [label="⑥ source has handoff WAL\nresume live stream", fillcolor="#4D3A28"];
+    c6 [label="⑥ 58P01 + archive can't cover\nexit; operator decides base refresh", fillcolor="#403a36"];
+    c7 [label="⑦ steady-state reached\nCH ReplacingMergeTree(_lsn) dedups", fillcolor="#4D4128"];
 
-    c0 -> c1 -> c2 -> c3 -> c4 -> c5 -> c6 -> c7;
+    c0 -> c1;
+    c1 -> c7 [label="available", color="#8FA875", fontcolor="#8FA875"];
+    c1 -> c2 [label="drop", color="#CBA85E", fontcolor="#CBA85E"];
+    c1 -> c3 [label="58P01", color="#BD8183", fontcolor="#BD8183"];
+    c2 -> c7 [label="source back", color="#8FA875", fontcolor="#8FA875"];
+    c2 -> c3 [label="still down", color="#BD8183", fontcolor="#BD8183"];
+    c3 -> c4;
+    c4 -> c5 [label="available", color="#8FA875", fontcolor="#8FA875"];
+    c4 -> c6 [label="58P01", color="#BD8183", fontcolor="#BD8183"];
+    c5 -> c7;
   }
 
   // Force A | B | C side by side via invisible head-to-head ordering
@@ -82,7 +91,7 @@ digraph timeline_restart {
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>scenario cluster border</B></TD></TR>
       <TR><TD><FONT COLOR="#A1A9CC"><B>━</B></FONT></TD><TD>A. clean restart (SIGTERM)</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>━</B></FONT></TD><TD>B. kill -9 mid-stream</TD></TR>
-      <TR><TD><FONT COLOR="#BD8183"><B>━</B></FONT></TD><TD>C. WAL overflow → re-bootstrap</TD></TR>
+      <TR><TD><FONT COLOR="#BD8183"><B>━</B></FONT></TD><TD>C. source → archive → source</TD></TR>
     </TABLE>
   >];
   manifest -> legend [style=invis];

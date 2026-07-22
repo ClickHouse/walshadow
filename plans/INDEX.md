@@ -32,7 +32,7 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
   barrier fence
 - [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
   / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
-  shared insert tail
+  shared insert tail, restart source fallback contract
 - [ops.md](ops.md) — preflight, metrics, retention, manifest (floor,
   6 LSNs), standby-status triple, kill-restart drill
 - [control.md](control.md) — in-process control plane: `ctl` unix-socket

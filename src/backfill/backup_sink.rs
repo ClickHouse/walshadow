@@ -12,7 +12,6 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::path::Path;
 
 use async_trait::async_trait;
 
@@ -95,8 +94,9 @@ impl DiskLanderSink {
     /// Exposed so MultiplexSink reuses the predicate for first-pass dispatch
     pub fn classify(&self, meta: &FileMeta) -> DiskAction {
         if is_system_dir(&meta.path) {
-            // Keep the denylist dir entry itself, Skip everything under it
-            return if matches!(meta.kind, FileKind::Dir) && is_top_level(&meta.path) {
+            // Keep the dir tree (PG requires nested ones like
+            // pg_logical/snapshots to exist), skip only file contents under it.
+            return if matches!(meta.kind, FileKind::Dir) {
                 DiskAction::Keep
             } else {
                 DiskAction::SkipDenylist
@@ -239,15 +239,11 @@ impl<T: BackupSink> BackupSink for MultiplexSink<T> {
     }
 }
 
-fn is_top_level(path: &Path) -> bool {
-    path.components().count() == 1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backfill::pg_path::{BaseRelFile, RelFork, is_system_dir, parse_base_path};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn is_system_dir_matches_denylist() {
@@ -302,6 +298,40 @@ mod tests {
         c.insert(0, 99999); // db_node 0 = shared catalog
         assert!(c.is_catalog(5, 99999));
         assert!(c.is_catalog(7, 99999));
+    }
+
+    #[test]
+    fn disk_lander_keeps_required_nested_denylist_dirs() {
+        // PG opens pg_logical/snapshots (and mappings) at the first restartpoint
+        // and ERRORs if absent, so the landing must keep these nested dir entries
+        // — not just the top-level pg_logical/. Their *file* contents stay skipped.
+        let lander = DiskLanderSink::new(CatalogFilenodes::new());
+        let dir = |p: &str| FileMeta {
+            path: PathBuf::from(p),
+            size: 0,
+            mode: 0,
+            kind: FileKind::Dir,
+        };
+        assert_eq!(lander.classify(&dir("pg_logical")), DiskAction::Keep);
+        assert_eq!(
+            lander.classify(&dir("pg_logical/snapshots")),
+            DiskAction::Keep,
+            "pg_logical/snapshots dir dropped -> shadow PG fails at restartpoint",
+        );
+        assert_eq!(
+            lander.classify(&dir("pg_logical/mappings")),
+            DiskAction::Keep,
+        );
+        assert_eq!(
+            lander.classify(&FileMeta {
+                path: PathBuf::from("pg_logical/snapshots/0-1A2B3C.snap"),
+                size: 0,
+                mode: 0,
+                kind: FileKind::File,
+            }),
+            DiskAction::SkipDenylist,
+            "file contents under a denylisted dir stay skipped",
+        );
     }
 
     #[test]

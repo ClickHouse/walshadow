@@ -59,9 +59,10 @@ mirror history.
 
 Side-by-side columns: A. clean SIGTERM, B. kill -9 mid-stream
 (validated by `tests/kill_restart.rs` drill), C. WAL overflow →
-re-bootstrap. Includes `manifest.toml` restart state and source identity.
-`toast_retires.toml` survives transaction-spill cleanup and flushes safe
-mirror retirements at startup.
+source/archive/source fallback, else operator resolution. Includes
+`manifest.toml` restart state and source identity. `toast_retires.toml`
+survives transaction-spill cleanup and flushes safe mirror retirements at
+startup.
 
 ![restart timelines](timeline_restart.svg)
 
