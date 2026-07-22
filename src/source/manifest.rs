@@ -65,7 +65,10 @@ use crate::source::wal_stream::WalStream;
 pub const MANIFEST_FILENAME: &str = "manifest.toml";
 
 /// Bump on any schema change; boot path rejects mismatched versions.
-pub const MANIFEST_VERSION: u32 = 1;
+// v2: descriptor-log-aware builds. Any v1 spill dir predates the log and
+// cannot be resumed against (decode would read uncovered intervals); the
+// version gate turns that into a deterministic upgrade failure.
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// LSN persisted in postgres `pg_lsn` text form (`1A/2B3C4D5E`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

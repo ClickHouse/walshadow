@@ -15,10 +15,13 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use walrus::pg::walparser::RelFileNode;
 
-use crate::catalog::shadow_catalog::{CatalogError, ShadowCatalog};
+use std::collections::HashMap;
+
+use crate::catalog::desc_log::{DescriptorLog, LookupResult};
 use crate::decode::heap_decoder::{CommittedTuple, DecodedHeap};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::Fatal;
@@ -28,7 +31,7 @@ use crate::mapping::{MappingHandle, TableMapping};
 use crate::ops::oracle::{Oracle, maybe_validate_tuple, resolve_pending_tuple};
 use crate::schema::RelDescriptor;
 use crate::toast::{ChunkRefMap, ToastResolver};
-use crate::xact::xact_buffer::{ChunkGeneration, RelCache, detoast_heap};
+use crate::xact::xact_buffer::{ChunkGeneration, detoast_heap};
 
 /// `chunks` holds the xact's chunk-map generations (oldest first), each
 /// immutable once sealed by the drain: batches / barrier segments of one
@@ -51,7 +54,7 @@ pub struct DecodeJob {
 /// needs to turn heaps into routed rows.
 #[derive(Clone)]
 pub struct DecodeCtx {
-    pub catalog: Arc<Mutex<ShadowCatalog>>,
+    pub log: Arc<DescriptorLog>,
     pub mapping: MappingHandle,
     pub oracle: Option<Arc<Oracle>>,
     /// Shared FIFO `BatcherMsg` channel: a chunk enqueues as one ordered item
@@ -102,9 +105,10 @@ pub async fn decode_and_route(
     heaps: Vec<DecodedHeap>,
     chunks: Vec<Arc<ChunkGeneration>>,
     permit: Option<Arc<crate::budget::MemoryPermit>>,
-    cache: &mut RelCache<(Arc<RelDescriptor>, Arc<TableMapping>)>,
 ) -> Result<u64, String> {
-    cache.refresh();
+    // Per-job memo: mapping mutations apply inside the barrier fence,
+    // between jobs, so nothing invalidates within one job
+    let mut memo: HashMap<RelFileNode, (Arc<RelDescriptor>, Arc<TableMapping>)> = HashMap::new();
     let ref_maps: Vec<&ChunkRefMap> = chunks.iter().map(|g| g.map()).collect();
     // One spool per xact; generations sealed before spooling carry None
     let spool = chunks.iter().find_map(|g| g.spool());
@@ -112,39 +116,40 @@ pub async fn decode_and_route(
     let mut buf: Vec<RoutedRow> = Vec::new();
     let mut buf_bytes = 0usize;
     for mut heap in heaps {
-        let value_permit = detoast_heap(
-            &mut heap,
-            spool,
-            &ref_maps,
-            &ctx.catalog,
-            true,
-            &ctx.resolver,
-        )
-        .await
-        .map_err(|e| e.to_string())?
-        .map(Arc::new);
-        // Cache hit: no shared catalog lock, no mapping read. Skip/error arms
-        // are never cached, so `foreign_db_rows_skipped`/`unsupported_relations`
-        // still count per row.
-        let (rel, mapping) = match cache.entry(heap.rfn) {
+        let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &ctx.log, &ctx.resolver)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(Arc::new);
+        // Memo hit: no mapping read. Skip/error arms are never memoised, so
+        // `foreign_db_rows_skipped`/`unsupported_relations` count per row.
+        let (rel, mapping) = match memo.entry(heap.rfn) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(slot) => {
-                let rel = match crate::catalog::shadow_catalog::resolve_at_pooled(
-                    &ctx.catalog,
-                    heap.rfn,
-                    heap.source_lsn,
-                )
-                .await
-                {
-                    Ok(r) => r,
+                let rel = match ctx.log.descriptor_at(heap.rfn, heap.source_lsn) {
+                    LookupResult::Present(rel) => rel,
                     // Physical WAL carries the whole cluster; skip foreign-DB rows
-                    Err(CatalogError::ForeignDatabase(_)) => {
+                    LookupResult::ForeignDb => {
                         ctx.stats
                             .foreign_db_rows_skipped
                             .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    Err(e) => return Err(e.to_string()),
+                    // Rel died before the coverage horizon: its end state is
+                    // already in CH / backfill, nothing to route
+                    LookupResult::NotCovered if heap.source_lsn <= ctx.log.covered_through() => {
+                        ctx.stats
+                            .foreign_db_rows_skipped
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    // Drained records must have coverage — anything else is
+                    // a log bug; a silent skip would shed rows invisibly
+                    other => {
+                        return Err(format!(
+                            "descriptor for {:?} at {:#X} not covered: {other:?}",
+                            heap.rfn, heap.source_lsn,
+                        ));
+                    }
                 };
                 let Some(mapping) =
                     crate::emit::pipeline::lookup_mapping(&ctx.mapping, &rel.rel_name, &ctx.stats)
@@ -213,9 +218,6 @@ pub fn spawn_pool(
         let ack = ack.clone();
         let fatal = fatal.clone();
         handles.push(tokio::spawn(async move {
-            // Per-worker descriptor cache; epoch handle read once at startup.
-            let epoch = ctx.catalog.lock().await.invalidation_epoch_handle();
-            let mut cache = RelCache::new(epoch);
             while let Ok(job) = jobs.recv().await {
                 ctx.stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
                 let seq = job.seq;
@@ -227,7 +229,6 @@ pub fn spawn_pool(
                     job.heaps,
                     job.chunks,
                     job.permit,
-                    &mut cache,
                 )
                 .await
                 {

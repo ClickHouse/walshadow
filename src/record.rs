@@ -52,12 +52,32 @@ pub enum Route {
     ToDecoder,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CatalogSignal {
-    #[default]
-    None,
-    Invalidate,
-    InvalidateSweep,
+/// One catalog-mutating commit: what descriptor capture needs to enumerate
+/// the affected relations. Built by the filter at the commit record.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BoundaryInfo {
+    /// Xid the xact's buffered work drains under: prepared xid for
+    /// COMMIT/ABORT PREPARED (header xid is 0 there), else header xid
+    pub drain_xid: u32,
+    /// First catalog-touching record LSN across the xact tree; valid_from
+    /// fallback when no per-oid source is sharper
+    pub tree_first_touch: u64,
+    /// Dirty-tracker pg_class decodes ∪ commit relcache invals (local db,
+    /// user oids)
+    pub oids: Vec<AffectedOid>,
+    /// relId==0 whole-relcache inval, or a write to a descriptor-feeding
+    /// catalog whose changes relcache invals don't enumerate (pg_namespace:
+    /// namespace rename changes every embedded namespace text with zero
+    /// per-relation invals)
+    pub capture_all: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffectedOid {
+    pub oid: u32,
+    /// First pg_class touch this xact when decoded pump-side; capture's
+    /// preferred valid_from after SMGR markers
+    pub pg_class_touch: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -81,10 +101,11 @@ pub struct Record<'a> {
     pub next_lsn: u64,
     pub page_magic: u16,
     pub route: Route,
-    pub catalog_signal: CatalogSignal,
     /// Commit of a catalog-mutating xact: pump must hold successor-byte
     /// publication until shadow replays through `next_lsn`
     pub catalog_boundary: bool,
+    /// Capture input for a catalog boundary; `Some` iff `catalog_boundary`
+    pub boundary_info: Option<std::sync::Arc<BoundaryInfo>>,
 }
 
 pub trait RecordSink {
@@ -171,8 +192,8 @@ impl RecordSink for CollectingRecordSink {
                 next_lsn: record.next_lsn,
                 page_magic: record.page_magic,
                 route: record.route,
-                catalog_signal: record.catalog_signal,
                 catalog_boundary: record.catalog_boundary,
+                boundary_info: record.boundary_info.clone(),
             });
             Ok(())
         })

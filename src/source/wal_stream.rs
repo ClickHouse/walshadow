@@ -65,6 +65,12 @@ pub enum WalStreamError {
         #[source]
         source: ParseError,
     },
+    #[error("commit payload at offset {offset}: {source}")]
+    Payload {
+        offset: usize,
+        #[source]
+        source: crate::decode::wal_xact::XactPayloadError,
+    },
     #[error("rewrite record at offset {offset}: {source}")]
     Rewrite {
         offset: usize,
@@ -251,7 +257,13 @@ impl WalStream {
                     offset: start_offset,
                     source,
                 })?;
-                verdict = self.filter.decide_record(&parsed);
+                verdict = self
+                    .filter
+                    .decide_record(&parsed, self.current_lsn + start_offset as u64, page_magic)
+                    .map_err(|source| WalStreamError::Payload {
+                        offset: start_offset,
+                        source,
+                    })?;
                 // `rewrite_record` below mutates walker.buf that `parsed`
                 // views; dispatch needs the original parse, not post-rewrite.
                 parsed_for_sink = parsed.into_owned();
@@ -313,8 +325,8 @@ impl WalStream {
                 next_lsn,
                 page_magic,
                 route,
-                catalog_signal: verdict.signal,
                 catalog_boundary: verdict.catalog_boundary,
+                boundary_info: verdict.boundary,
             };
             if let Some(sink) = record_sink.as_deref_mut() {
                 sink.on_record(&record).await?;
@@ -802,7 +814,7 @@ mod tests {
             }
         }
 
-        let page = synth_xact_page();
+        let page = synth_two_record_page();
         let mut ws = WalStream::new(1, SEG, 0).unwrap();
         ws.set_bytes_sink(Box::new(SharedCollector(
             collector_chunks.clone(),
@@ -829,7 +841,7 @@ mod tests {
         assert_eq!(&reconstructed, seg_bytes, "wire bytes match segment bytes");
     }
 
-    fn synth_xact_page() -> Vec<u8> {
+    fn synth_two_record_page() -> Vec<u8> {
         use walrus::pg::walparser::{
             WAL_PAGE_SIZE, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
             XLR_BLOCK_ID_DATA_SHORT,
@@ -854,8 +866,8 @@ mod tests {
             v[20..24].copy_from_slice(&crc.to_le_bytes());
             v
         }
-        let r1 = rec(walrus::pg::walparser::RmId::Xact as u8);
-        let r2 = rec(walrus::pg::walparser::RmId::Xact as u8);
+        let r1 = rec(walrus::pg::walparser::RmId::Clog as u8);
+        let r2 = rec(walrus::pg::walparser::RmId::Clog as u8);
         let mut page = Vec::with_capacity(PAGE_SIZE);
         page.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
         page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
@@ -1000,7 +1012,7 @@ mod tests {
         let mut ws = WalStream::new(1, SEG, 0).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
-        ws.push(0, &synth_xact_page(), &mut rec, &mut seg)
+        ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
             .await
             .unwrap();
         // synth records are 30 bytes at offsets 40 and 72

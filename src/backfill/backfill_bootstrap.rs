@@ -40,7 +40,6 @@ use crate::backfill::backup_sink::{
 };
 use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::decode::decoder_sink::TupleObserver;
-use crate::pg::parse_array_one_element;
 use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 
 #[derive(Debug, Clone)]
@@ -250,7 +249,10 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
                 c.relkind::text, \
                 c.relpersistence::text, \
                 c.relreplident::text, \
-                c.reltablespace::oid, \
+                c.reltoastrelid::oid, \
+                coalesce(nullif(c.reltablespace, 0), \
+                         (SELECT dattablespace FROM pg_database \
+                          WHERE datname = current_database()))::oid, \
                 coalesce(pg_relation_filenode(c.oid), 0)::oid \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -269,8 +271,9 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         let kind = one_char(row.get::<_, String>(4), "relkind")?;
         let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
         let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
-        let spc_node: Oid = row.get(7);
-        let rel_node: Oid = row.get(8);
+        let toast_oid: Oid = row.get(7);
+        let spc_node: Oid = row.get(8);
+        let rel_node: Oid = row.get(9);
         if rel_node == 0 {
             // No heap to page-walk (partitioned parent / view / sequence)
             continue;
@@ -285,6 +288,7 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         let desc = RelDescriptor {
             rfn,
             oid,
+            toast_oid,
             namespace_oid,
             rel_name: RelName::new(&namespace_name, &name),
             kind,
@@ -361,47 +365,14 @@ async fn fetch_replident(client: &Client, c: char, rel_oid: Oid) -> Result<ReplI
 }
 
 async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>> {
-    let rows = client
-        .query(
-            "SELECT \
-                a.attnum::int2, \
-                a.attname::text, \
-                a.atttypid::oid, \
-                a.atttypmod::int4, \
-                a.attnotnull::bool, \
-                a.attisdropped::bool, \
-                t.typname::text, \
-                t.typbyval::bool, \
-                t.typlen::int2, \
-                t.typalign::text, \
-                t.typstorage::text, \
-                CASE WHEN a.atthasmissing THEN a.attmissingval::text END \
-             FROM pg_attribute a \
-             JOIN pg_type t ON t.oid = a.atttypid \
-             WHERE a.attrelid = $1 AND a.attnum >= 1 \
-             ORDER BY a.attnum",
-            &[&rel_oid],
-        )
-        .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let raw_missing: Option<String> = row.get(11);
-        out.push(RelAttr {
-            attnum: row.get(0),
-            name: row.get(1),
-            type_oid: row.get(2),
-            typmod: row.get(3),
-            not_null: row.get(4),
-            dropped: row.get(5),
-            type_name: row.get(6),
-            type_byval: row.get(7),
-            type_len: row.get(8),
-            type_align: one_char(row.get::<_, String>(9), "typalign")?,
-            type_storage: one_char(row.get::<_, String>(10), "typstorage")?,
-            missing_text: raw_missing.as_deref().and_then(parse_array_one_element),
-        });
-    }
-    Ok(out)
+    let rows = client.query(crate::pg::ATTR_SQL, &[&rel_oid]).await?;
+    rows.iter()
+        .map(|row| {
+            crate::pg::RawAttr::from_row(row)
+                .build()
+                .map_err(|e| anyhow::anyhow!("bootstrap: {e}"))
+        })
+        .collect()
 }
 
 async fn current_database_oid(client: &Client) -> Result<Oid> {

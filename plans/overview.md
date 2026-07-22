@@ -80,9 +80,9 @@ Component docs live alongside this overview:
   `WalStream` page walker, `streaming_walker`, `QueueingRecordSink`
   decoupling pump from decoder, `decoder_sink`
 - [shadow.md](shadow.md) — shadow PG lifecycle (`materialize_conf`,
-  `standby.signal`, supervision), `ShadowCatalog` libpq cache with
-  generation counter + `relation_at` replay-LSN gate, per-relation
-  `SchemaEvent` channel feeding CH DDL applicator
+  `standby.signal`, supervision), `ShadowCatalog` libpq client feeding
+  descriptor capture ([desc_log.md](desc_log.md)) + name-keyed opt-in
+  resolution
 - [decoder.md](decoder.md) — `heap_decoder` Tier 1/2 type matrix,
   `MULTI_INSERT` fan-out, FPI decompression, `main_data` parsing,
   `pg_class_decoder` driving `CatalogTracker`
@@ -141,12 +141,13 @@ Component docs live alongside this overview:
    replica-identity key (PRIMARY KEY, `USING INDEX`, or `FULL`) on every
    replicated table, both preflighted. DELETE only needs the key to mark
    the row; `FULL` is accepted, not required
-5. **Source DDL that rewrites a user table.** Ordering invariant:
-   shadow replay LSN ≥ decoder read LSN. `ShadowCatalog::relation_at`
-   blocks until `pg_last_wal_replay_lsn() >= commit_lsn` so decoder
-   reads post-DDL catalog for heap records. Fast-path `ADD COLUMN`
-   skips rewrite; read-time defaults via `attmissingval` cover
-   bootstrap-then-ALTER skew
+5. **Source DDL that rewrites a user table.** Descriptor capture runs
+   inside the catalog-boundary hold with shadow applied exactly through
+   the commit's `next_lsn`; decode reads interval-scoped answers from
+   the durable descriptor log ([desc_log.md](desc_log.md)), so a record
+   always decodes against the shape that produced it. Fast-path
+   `ADD COLUMN` skips rewrite; read-time defaults via `attmissingval`
+   cover bootstrap-then-ALTER skew
 6. **Shadow PG version skew.** Same major as source. Daemon refuses to
    start on mismatch or PG < 16
 7. **Catalog cache invalidation granularity.** Single generation bumps

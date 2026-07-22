@@ -499,9 +499,10 @@ pub struct CopyBackfiller {
     emitter: EmitterConfig,
     mapping: MappingHandle,
     stats: Arc<EmitterStats>,
-    /// Shadow catalog for backup passes: toast-rel descriptors, gap-replay
-    /// record decode.
+    /// Shadow catalog for backup passes: toast-rel descriptors by name
     catalog: Arc<Mutex<ShadowCatalog>>,
+    /// Descriptor log for gap-replay record decode
+    log: Arc<crate::catalog::desc_log::DescriptorLog>,
     spill_dir: PathBuf,
     /// Live resolved config for the dedicated backfill tails, so backfilled
     /// rows encode under the same `config_column` overrides WAL-driven rows
@@ -528,6 +529,7 @@ impl CopyBackfiller {
         mapping: MappingHandle,
         stats: Arc<EmitterStats>,
         catalog: Arc<Mutex<ShadowCatalog>>,
+        log: Arc<crate::catalog::desc_log::DescriptorLog>,
         spill_dir: &Path,
         config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
         budget: Option<crate::budget::MemoryBudget>,
@@ -545,6 +547,7 @@ impl CopyBackfiller {
             mapping,
             stats,
             catalog,
+            log,
             spill_dir: spill_dir.to_path_buf(),
             config_rx,
             budget,
@@ -783,6 +786,7 @@ impl CopyBackfiller {
             mapping: staging.mapping.clone(),
             stats: self.stats.clone(),
             catalog: self.catalog.clone(),
+            log: self.log.clone(),
             scratch_dir: self.spill_dir.join("backup_backfill"),
             config_rx: self.config_rx.clone(),
             budget: self.budget.clone(),
@@ -1245,6 +1249,7 @@ mod tests {
                 rel_node: 16400,
             },
             oid: 16400,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("app", "orders"),
             kind: 'r',

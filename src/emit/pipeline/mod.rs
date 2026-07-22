@@ -32,7 +32,7 @@ use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::mapping::{MappingHandle, TableMapping};
 use crate::ops::oracle::Oracle;
 use crate::ops::trace::TxnSpanRegistry;
-use crate::schema::{RelName, SchemaEventRx};
+use crate::schema::RelName;
 use crate::xact::xact_buffer::{SubxactTracker, XactBuffer};
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls
@@ -130,10 +130,9 @@ pub struct PipelineConfig {
     pub tail: TailKind,
     pub buffer: Arc<Mutex<XactBuffer>>,
     pub subxact_tracker: Arc<Mutex<SubxactTracker>>,
-    pub schema_events: Option<SchemaEventRx>,
-    /// Same handle as the decoder's `with_catalog_signals` armer; reorder
-    /// consumes at the arming xact's commit
-    pub pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
+    /// Durable descriptor log: decode pool + reorder read interval-scoped
+    /// descriptors from it
+    pub log: Arc<crate::catalog::desc_log::DescriptorLog>,
     pub stats: Arc<EmitterStats>,
     /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
     /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
@@ -208,8 +207,7 @@ impl PipelineConfig {
             tail,
             buffer,
             subxact_tracker,
-            schema_events,
-            pending_sweeps,
+            log,
             stats,
             span_registry,
             config_resolver,
@@ -256,7 +254,7 @@ impl PipelineConfig {
         let (jobs_tx, jobs_rx) = async_channel::bounded::<decode::DecodeJob>((m * 4).max(8));
 
         let ctx = decode::DecodeCtx {
-            catalog: catalog.clone(),
+            log: log.clone(),
             mapping,
             oracle,
             msg_tx: msg_tx.clone(),
@@ -268,10 +266,9 @@ impl PipelineConfig {
 
         let reorder = reorder::ReorderSink::new(
             buffer,
+            log,
             catalog,
             subxact_tracker,
-            schema_events,
-            pending_sweeps,
             applicator,
             ack,
             jobs_tx,

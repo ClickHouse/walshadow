@@ -61,7 +61,6 @@ use crate::backfill::backup_source::{BackupSink, BackupSource};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
-use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::decode::heap_decoder::{CommittedTuple, XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
 use crate::decode::visibility::{
     PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView, Visibility, tuple_visibility,
@@ -692,11 +691,15 @@ impl PrescanSink {
             let xid = record.parsed.header.xact_id;
             match info & XLOG_XACT_OPMASK {
                 XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
-                    let payload = parse_xact_payload(info, &record.parsed.main_data);
+                    let payload =
+                        parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+                            .unwrap_or_default();
                     self.patch.commit(xid, &payload.subxacts);
                 }
                 XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
-                    let payload = parse_xact_payload(info, &record.parsed.main_data);
+                    let payload =
+                        parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+                            .unwrap_or_default();
                     self.patch.abort(xid, &payload.subxacts);
                 }
                 _ => {}
@@ -841,9 +844,9 @@ async fn replay_gap(
     }
 
     let mut sink = ReplaySink {
-        decoder: BufferingDecoderSink::new(ctx.catalog.clone(), buffer.clone()),
+        decoder: BufferingDecoderSink::new(ctx.log.clone(), buffer.clone()),
         buffer,
-        catalog: ctx.catalog.clone(),
+        log: ctx.log.clone(),
         subxact_tracker: SubxactTracker::new(),
         resolver,
         filter_rfns,
@@ -880,7 +883,7 @@ async fn replay_gap(
 struct ReplaySink {
     decoder: BufferingDecoderSink,
     buffer: Arc<Mutex<XactBuffer>>,
-    catalog: Arc<Mutex<ShadowCatalog>>,
+    log: Arc<crate::catalog::desc_log::DescriptorLog>,
     subxact_tracker: SubxactTracker,
     resolver: ToastResolver,
     filter_rfns: HashSet<(Oid, Oid)>,
@@ -909,15 +912,16 @@ impl ReplaySink {
         info: u8,
         record: &Record<'_>,
     ) -> std::result::Result<(), SinkError> {
-        let payload = parse_xact_payload(info, &record.parsed.main_data);
+        let payload = parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+            .unwrap_or_default();
         // Deferred resolution for filenodes invisible at record time;
         // installs decode verdicts + `O - B` barriers ahead of the drain
         resolve_stash(
             &self.buffer,
-            &self.catalog,
+            &self.log,
             xid,
             &payload.subxacts,
-            record.source_lsn,
+            record.next_lsn,
             self.resolver.stats_handle(),
         )
         .await
@@ -1005,16 +1009,10 @@ impl ReplaySink {
                         continue;
                     }
                     let rel = rel.clone();
-                    let value_permit = detoast_heap(
-                        &mut heap,
-                        spool,
-                        &ref_maps,
-                        &self.catalog,
-                        false,
-                        &self.resolver,
-                    )
-                    .await
-                    .map_err(SinkError::from)?;
+                    let value_permit =
+                        detoast_heap(&mut heap, spool, &ref_maps, &self.log, &self.resolver)
+                            .await
+                            .map_err(SinkError::from)?;
                     let Some(mapping) = crate::emit::pipeline::lookup_mapping(
                         &self.mapping,
                         &rel.rel_name,
@@ -1082,7 +1080,9 @@ impl RecordSink for ReplaySink {
                         self.on_commit(xid, info, record).await?;
                     }
                     XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
-                        let payload = parse_xact_payload(info, &record.parsed.main_data);
+                        let payload =
+                            parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+                                .unwrap_or_default();
                         self.buffer
                             .lock()
                             .await

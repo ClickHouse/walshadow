@@ -1311,6 +1311,7 @@ mod tests {
                 rel_node: rel,
             },
             oid: 16384,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "t"),
             kind: 'r',

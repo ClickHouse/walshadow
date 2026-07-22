@@ -330,6 +330,12 @@ archive-only
 
 ## Durable metadata journal
 
+The descriptor log ([../desc_log.md](../desc_log.md)) is this journal:
+capture-time descriptor batches, identity-bound header, replay-from-log
+determinism. The stash fence lift consumes it via
+`descriptor_at(rfn, commit.next_lsn)` instead of building a parallel
+store. Original requirements, all satisfied there:
+
 Store one append-only journal beside cursor state. Journal header binds data to:
 
 - source system identifier

@@ -42,7 +42,9 @@ DDL / TRUNCATE / config apply: wait placed, `FlushAll`, wait durable,
 then apply. Global, acceptable because barriers run at DDL rate
 ([emitter.md](emitter.md))
 
-**baseline ledger** — see prev_known
+**baseline ledger** — the descriptor log's per-oid predecessor chain;
+decides SchemaEvent `Added` vs `Changed`, durable across restarts
+([desc_log.md](desc_log.md))
 
 **body spool** — per-drain `toastbody-*` file of raw concatenated
 chunk bodies past `toast_body_mem_max`; resolution map and mirror rows
@@ -256,11 +258,10 @@ resend the still-owned batch and `_lsn` dedup absorbs duplicates
 but not installed refuses boot, keeping overlay opt-in explicit
 ([config.md](config.md))
 
-**invalidation_epoch** — shared `AtomicU64` bumped on relmap / pg_class
-writes and shape-changing config events; ShadowCatalog loads it per
-lookup, `pg_class_delete_epoch` is the narrower DROP-only sibling
-throttling `sweep_dropped` ([filter.md](filter.md),
-[shadow.md](shadow.md))
+**interval lookup** — `descriptor_at(rfn, L)` / `descriptor_by_oid_at`:
+binary search of a key's version chain for the last entry with
+`valid_from <= L`; wait-free, replaces cache + invalidation machinery
+([desc_log.md](desc_log.md))
 
 **keep-fraction** — share of records filter keeps: ~0.04% steady OLTP,
 8%+ in DDL-heavy windows ([filter.md](filter.md))
@@ -379,11 +380,10 @@ usable replica identity, slot existence) aggregated into one report so
 multiple findings surface at once; `--skip-preflight` for drills
 ([ops.md](ops.md))
 
-**prev_known / baseline ledger** — last source shape CH and source
-agreed on, per oid; decides SchemaEvent `Added` vs `Changed`.
-`seed_baseline` warms it for pinned rels at boot so a cold cache never
-mis-branches post-boot ALTER ([shadow.md](shadow.md),
-[emitter.md](emitter.md))
+**predecessor (log)** — the per-oid entry preceding a batch in the
+descriptor log's history order; capture diffs against it for events,
+boot replay uses `predecessor_before` so re-derived events ignore the
+loaded head ([desc_log.md](desc_log.md))
 
 **QueueingRecordSink** — unbounded mpsc decoupling pump from decoder's
 replay wait; `soft_cap` yields past threshold, hard bound deliberately
@@ -436,9 +436,11 @@ mirror is never truncated ([TOAST.md](TOAST.md))
 below `replay_lsn - retention_bytes`; `--retention-bytes 0` disables
 ([ops.md](ops.md))
 
-**rfn** — RelFileLocator `(db_node, rel_node)`; relation identity in WAL
-block refs. Unique only within a database, hence foreign-DB skip
-([decoder.md](decoder.md), [shadow.md](shadow.md))
+**rfn** — RelFileLocator `(spc_node, db_node, rel_node)`; physical
+relation identity in WAL block refs. Relfilenumbers are unique only per
+database of one tablespace, so all three components are load-bearing
+([future/TABLESPACES.md](future/TABLESPACES.md) §0); foreign-DB locators
+skip ([decoder.md](decoder.md), [shadow.md](shadow.md))
 
 **rfn flip** — bootstrap drain boundary between one relfilenode's rows
 and the next; each flip closes one synthetic ack seq (bootstrap has no
@@ -481,9 +483,9 @@ never hosts user-heap data, never written locally (local write would
 diverge offset-exact pages and PANIC on replay)
 ([overview.md](overview.md), [shadow.md](shadow.md))
 
-**ShadowCatalog** — async libpq cache over shadow's unix socket:
-replay-gated `relation_at`, generation-checked descriptor cache,
-SchemaEvent channel, auto-reconnect with transient retry
+**ShadowCatalog** — async libpq client over shadow's unix socket:
+batched descriptor fetches for capture, name-keyed resolution for
+opt-in/backfill, replay gate, auto-reconnect with transient retry
 ([shadow.md](shadow.md))
 
 **shadow-zero carve-out** — `shadow_replay_lsn == 0` treated as "no
@@ -554,11 +556,12 @@ drop resume never replays; counted `toast_mirror_retires` at execution
 ([TOAST.md](TOAST.md))
 
 **toast stash** — raw decode inputs (`SpillEntry::Raw`) of records
-whose filenode is MVCC-invisible at record time (rewrite generation,
+whose filenode is unresolvable at record time (rewrite generation,
 same-xact CREATE/TRUNCATE + INSERT), admitted by generation marker,
-resolved at commit via `relation_at(rfn, commit_lsn)` and decoded in
-the drain merge; unresolvable → discarded counted, ordinary heap →
-fenced skipped ([TOAST.md](TOAST.md))
+resolved at commit against the descriptor log at the commit's
+`next_lsn` and decoded in the drain merge; tombstoned/uncovered →
+discarded counted, ordinary heap → fenced skipped
+([TOAST.md](TOAST.md))
 
 **toast tombstone** — store row `(blkno, offnum, 0, 0, '',
 delete_record_lsn, 1)` a toast DELETE lands at its TID; supersedes the

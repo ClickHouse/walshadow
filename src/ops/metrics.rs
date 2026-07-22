@@ -140,6 +140,32 @@ pub struct MetricsSnapshot {
     pub catalog_boundary_hold_failures_total: u64,
     /// Cumulative seconds spent parked in released holds
     pub catalog_boundary_hold_seconds_total: f64,
+    /// Boundaries captured via shadow SQL fan-out
+    pub desc_capture_sql_total: u64,
+    /// Boundaries replayed from stored descriptor-log batches
+    pub desc_capture_log_replay_total: u64,
+    /// Boundaries at or below the seed's covered_through, skipped
+    pub desc_capture_skipped_covered_total: u64,
+    /// Capture-all boundaries (whole-relcache inval / pg_namespace write)
+    pub desc_capture_all_total: u64,
+    /// Descriptors fetched across SQL captures
+    pub desc_capture_rels_total: u64,
+    /// Cumulative seconds inside descriptor capture (part of the hold)
+    pub desc_capture_seconds_total: f64,
+    pub desc_events_added_total: u64,
+    pub desc_events_changed_total: u64,
+    pub desc_events_dropped_total: u64,
+    /// Descriptor-log index entries / tail bytes / batches
+    pub desc_log_entries: u64,
+    pub desc_log_tail_bytes: u64,
+    pub desc_log_batches: u64,
+    pub desc_log_gc_total: u64,
+    pub desc_log_gc_dropped_entries_total: u64,
+    pub desc_lookups_present_total: u64,
+    pub desc_lookups_dropped_total: u64,
+    pub desc_lookups_retired_total: u64,
+    pub desc_lookups_not_covered_total: u64,
+    pub desc_lookups_foreign_db_total: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -620,6 +646,114 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             snap.catalog_boundary_hold_failures_total,
         ),
         (
+            "walshadow_desc_capture_total_sql",
+            "Catalog boundaries captured via shadow SQL fan-out.",
+            "counter",
+            snap.desc_capture_sql_total,
+        ),
+        (
+            "walshadow_desc_capture_total_log_replay",
+            "Catalog boundaries replayed from stored descriptor-log batches.",
+            "counter",
+            snap.desc_capture_log_replay_total,
+        ),
+        (
+            "walshadow_desc_capture_skipped_covered_total",
+            "Boundaries at or below the seed's covered_through, skipped.",
+            "counter",
+            snap.desc_capture_skipped_covered_total,
+        ),
+        (
+            "walshadow_desc_capture_all_total",
+            "Capture-all boundaries (whole-relcache inval / pg_namespace write).",
+            "counter",
+            snap.desc_capture_all_total,
+        ),
+        (
+            "walshadow_desc_capture_rels_total",
+            "Descriptors fetched across SQL captures.",
+            "counter",
+            snap.desc_capture_rels_total,
+        ),
+        (
+            "walshadow_desc_events_added_total",
+            "Added schema events produced by descriptor capture.",
+            "counter",
+            snap.desc_events_added_total,
+        ),
+        (
+            "walshadow_desc_events_changed_total",
+            "Changed schema events produced by descriptor capture.",
+            "counter",
+            snap.desc_events_changed_total,
+        ),
+        (
+            "walshadow_desc_events_dropped_total",
+            "Dropped schema events produced by descriptor capture.",
+            "counter",
+            snap.desc_events_dropped_total,
+        ),
+        (
+            "walshadow_desc_log_entries",
+            "Descriptor-log index entries resident.",
+            "gauge",
+            snap.desc_log_entries,
+        ),
+        (
+            "walshadow_desc_log_tail_bytes",
+            "Descriptor-log tail bytes since last checkpoint.",
+            "gauge",
+            snap.desc_log_tail_bytes,
+        ),
+        (
+            "walshadow_desc_log_batches",
+            "Descriptor-log batches resident.",
+            "gauge",
+            snap.desc_log_batches,
+        ),
+        (
+            "walshadow_desc_log_gc_total",
+            "Descriptor-log checkpoint compactions.",
+            "counter",
+            snap.desc_log_gc_total,
+        ),
+        (
+            "walshadow_desc_log_gc_dropped_entries_total",
+            "Entries dropped by descriptor-log GC.",
+            "counter",
+            snap.desc_log_gc_dropped_entries_total,
+        ),
+        (
+            "walshadow_desc_lookups_present_total",
+            "Descriptor lookups answered Present.",
+            "counter",
+            snap.desc_lookups_present_total,
+        ),
+        (
+            "walshadow_desc_lookups_dropped_total",
+            "Descriptor lookups answered Dropped.",
+            "counter",
+            snap.desc_lookups_dropped_total,
+        ),
+        (
+            "walshadow_desc_lookups_retired_total",
+            "Descriptor lookups answered Retired (rotated-away filenode).",
+            "counter",
+            snap.desc_lookups_retired_total,
+        ),
+        (
+            "walshadow_desc_lookups_not_covered_total",
+            "Descriptor lookups answered NotCovered.",
+            "counter",
+            snap.desc_lookups_not_covered_total,
+        ),
+        (
+            "walshadow_desc_lookups_foreign_db_total",
+            "Descriptor lookups on a foreign database's filenode.",
+            "counter",
+            snap.desc_lookups_foreign_db_total,
+        ),
+        (
             "walshadow_config_pending_decl_rels",
             "Forward-declared per-table opt-ins awaiting their CREATE TABLE.",
             "gauge",
@@ -684,6 +818,14 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     .unwrap();
     writeln!(s, "# TYPE {name} counter").unwrap();
     writeln!(s, "{name} {:.3}", snap.catalog_boundary_hold_seconds_total).unwrap();
+    let name = "walshadow_desc_capture_seconds_total";
+    writeln!(
+        s,
+        "# HELP {name} Cumulative seconds inside descriptor capture (within the boundary hold)."
+    )
+    .unwrap();
+    writeln!(s, "# TYPE {name} counter").unwrap();
+    writeln!(s, "{name} {:.3}", snap.desc_capture_seconds_total).unwrap();
 
     // Process CPU as a float counter (seconds); rate() ≈ cores in use.
     let name = "walshadow_process_cpu_seconds_total";

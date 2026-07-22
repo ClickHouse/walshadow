@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch_emitter::EmitterStats;
+use walshadow::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use walshadow::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
 };
@@ -150,11 +151,53 @@ fn cfg(spill_dir: std::path::PathBuf, budget: usize) -> XactBufferConfig {
     }
 }
 
+/// Seed a descriptor log from the shadow catalog's current state: the
+/// interval oracle detoast reads (mirrors the daemon's boot seed).
+async fn log_from_catalog(cat: &Arc<Mutex<ShadowCatalog>>, dir: &std::path::Path) -> DescriptorLog {
+    let mut guard = cat.lock().await;
+    let db_oid = guard.current_database_oid().await.expect("db oid");
+    let (_, descs) = guard.fetch_all_descriptors().await.expect("fetch all");
+    drop(guard);
+    let log = DescriptorLog::open(
+        dir,
+        DescLogIdentity {
+            pg_major: 17,
+            system_id: "test".into(),
+            timeline: 1,
+            db_oid,
+            wal_seg_size: 16 * 1024 * 1024,
+        },
+    )
+    .await
+    .expect("open desc log");
+    let entries = descs
+        .into_iter()
+        .map(|d| {
+            Arc::new(LogEntry {
+                valid_from: 0,
+                oid: d.oid,
+                rfn: d.rfn,
+                value: LogValue::Present(Arc::new(d)),
+            })
+        })
+        .collect();
+    log.seed(
+        BatchRecord {
+            captured_at: 1,
+            entries,
+        },
+        1,
+    )
+    .await
+    .expect("seed desc log");
+    log
+}
+
 /// Pipeline-path drain: `drain_committed` → `into_walk` → `detoast_heap`
 /// per heap step, collecting [`CommittedTuple`]s in walk order.
 async fn drain_all(
     b: &mut XactBuffer,
-    cat: &Arc<Mutex<ShadowCatalog>>,
+    log: &DescriptorLog,
     resolver: &ToastResolver,
     xid: u32,
     commit_ts: i64,
@@ -177,7 +220,7 @@ async fn drain_all(
         let spool = walk.chunks.iter().find_map(|g| g.spool());
         for step in walk.steps {
             if let WalkStep::Heap(mut heap) = step {
-                detoast_heap(&mut heap, spool, &ref_maps, cat, false, resolver).await?;
+                detoast_heap(&mut heap, spool, &ref_maps, log, resolver).await?;
                 out.push(CommittedTuple {
                     decoded: heap,
                     commit_ts: drain.commit_ts,
@@ -240,7 +283,8 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, one_col(3)))
         .await
         .unwrap();
-    let seen = drain_all(&mut b, &cat, &ToastResolver::disabled(), 7, 12345, 300, &[])
+    let log = log_from_catalog(&cat, tmp.path()).await;
+    let seen = drain_all(&mut b, &log, &ToastResolver::disabled(), 7, 12345, 300, &[])
         .await
         .unwrap();
     assert_eq!(seen.len(), 2);
@@ -310,7 +354,8 @@ async fn commit_drains_spilled_then_in_memory_entries() {
             .await
             .unwrap();
     }
-    let seen = drain_all(&mut b, &cat, &ToastResolver::disabled(), 5, 0, 250, &[])
+    let log = log_from_catalog(&cat, tmp.path()).await;
+    let seen = drain_all(&mut b, &log, &ToastResolver::disabled(), 5, 0, 250, &[])
         .await
         .unwrap();
     assert_eq!(seen.len(), 5);
@@ -356,9 +401,10 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
     b.on_heap(heap(rfn, 7, 200, HeapOp::Insert, col(3)))
         .await
         .unwrap();
+    let log = log_from_catalog(&cat, tmp.path()).await;
     let seen = drain_all(
         &mut b,
-        &cat,
+        &log,
         &ToastResolver::disabled(),
         7,
         12345,
@@ -419,9 +465,10 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     b.on_heap(heap(rfn, 33, 0, HeapOp::Insert, vec![id_col, body_ptr]))
         .await
         .unwrap();
+    let log = log_from_catalog(&cat, tmp.path()).await;
     let seen = drain_all(
         &mut b,
-        &cat,
+        &log,
         &ToastResolver::disabled(),
         33,
         12345,
@@ -485,7 +532,8 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         Arc::new(MemChunkStore::new()),
         Arc::new(EmitterStats::default()),
     );
-    let err = drain_all(&mut b, &cat, &resolver, 42, 0, 200, &[])
+    let log = log_from_catalog(&cat, tmp.path()).await;
+    let err = drain_all(&mut b, &log, &resolver, 42, 0, 200, &[])
         .await
         .expect_err("missing chunk surfaces");
     match err {

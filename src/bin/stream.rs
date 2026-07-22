@@ -957,21 +957,6 @@ async fn run_session(
         "shadow connected",
     );
 
-    // Descriptor-cache invalidation epoch: decoder worker bumps off each
-    // record's tracker verdict (`with_catalog_signals` below), catalog
-    // folds the delta into `invalidate` before each relation lookup's
-    // cache check. Mapping writes + SIGHUP reload bump out-of-band.
-    let invalidation_epoch = Arc::new(AtomicU64::new(0));
-    // DROP-sweep arming, keyed by xid: decoder worker arms at pg_class
-    // heap_delete records (never ADD COLUMN / CREATE INDEX noise), commit
-    // sink consumes only at the arming xact's own commit so the replay
-    // gate makes the drop visible before sweep_dropped probes shadow.
-    let pending_sweeps = walshadow::catalog_tracker::PendingSweeps::new();
-    catalog
-        .lock()
-        .await
-        .set_invalidation_epoch(invalidation_epoch.clone());
-
     // Create the configured slot before preflight, which requires it to exist.
     if let Some(slot) = source_slot.as_deref() {
         feed.ensure_physical_slot(slot)
@@ -1008,26 +993,6 @@ async fn run_session(
             .into_result()
             .context("pre-flight rejected daemon start")?;
         tracing::info!(target: "walshadow::preflight", "pre-flight passed");
-    }
-
-    // Seed schema-diff baseline for operator-pinned relations before
-    // START_REPLICATION so a pinned table's first post-start ALTER diffs
-    // against boot shape (→ Changed → CH ALTER) rather than cold-prev_known
-    // Added (apply_added skips pinned dests). cfg.tables.keys() is the
-    // pinned set; auto-create tables baseline on first-touch CREATE.
-    if let Some(cfg) = ch_config.as_ref() {
-        let names: Vec<RelName> = cfg.tables.keys().cloned().collect();
-        let seeded = catalog
-            .lock()
-            .await
-            .seed_baseline(&names)
-            .await
-            .context("seed schema-diff baseline for mapped relations")?;
-        tracing::info!(
-            target: "walshadow",
-            seeded,
-            "seeded schema-diff baseline for mapped relations",
-        );
     }
 
     // Oracle opens its own libpq connection so its queries don't pessimise
@@ -1101,9 +1066,111 @@ async fn run_session(
             .context("write initial resume manifest after bootstrap")?;
     }
 
-    // Shared schema-events queue (descriptor-fetch + commit-boundary
-    // `sweep_dropped`); both decoder and drain stage pull from it.
-    let schema_events = Arc::new(std::sync::Mutex::new(catalog.lock().await.subscribe()));
+    // Descriptor log: durable shape history captured at catalog boundaries,
+    // bound to this source + shadow pairing. Sole schema-event source.
+    let source_major = (feed.server_version_num() / 10000) as u32;
+    anyhow::ensure!(
+        (16..=18).contains(&source_major),
+        "source PG major {source_major} unsupported (commit-record sinval layout audited for 16-18)",
+    );
+    let shadow_db_oid = catalog
+        .lock()
+        .await
+        .current_database_oid()
+        .await
+        .context("shadow database oid")?;
+    stream.filter_mut().set_inval_db(shadow_db_oid);
+    let smgr_markers = stream.filter_mut().smgr_markers();
+    // A resumed manifest implies prior progress whose records the log must
+    // cover; an empty/missing log there means it was lost — decode would
+    // read uncovered intervals. `--ignore-cursor` discards both.
+    let log_files_present = args.spill_dir.join(walshadow::desc_log::TAIL_FILE).exists()
+        || args.spill_dir.join(walshadow::desc_log::CKPT_FILE).exists();
+    anyhow::ensure!(
+        manifest_at_boot.is_none() || log_files_present || args.ignore_cursor,
+        "manifest present but descriptor log missing in {}; \
+         re-bootstrap or pass --ignore-cursor",
+        args.spill_dir.display(),
+    );
+    if args.ignore_cursor {
+        for f in [
+            walshadow::desc_log::CKPT_FILE,
+            walshadow::desc_log::TAIL_FILE,
+        ] {
+            let _ = tokio::fs::remove_file(args.spill_dir.join(f)).await;
+        }
+    }
+    let desc_log = Arc::new(
+        walshadow::desc_log::DescriptorLog::open(
+            &args.spill_dir,
+            walshadow::desc_log::DescLogIdentity {
+                pg_major: source_major,
+                system_id: ident.sysid.clone(),
+                timeline: ident.timeline,
+                db_oid: shadow_db_oid,
+                wal_seg_size: WAL_SEG_SIZE as u32,
+            },
+        )
+        .await
+        .context("open descriptor log")?,
+    );
+    if let Some(lsn) = start_lsn_override {
+        anyhow::ensure!(
+            lsn >= desc_log.floor_at_write(),
+            "--start-lsn {} below descriptor log floor {}; no shape history \
+             survives there — --ignore-cursor or re-bootstrap",
+            format_pg_lsn(lsn),
+            format_pg_lsn(desc_log.floor_at_write()),
+        );
+        let head = desc_log.head();
+        anyhow::ensure!(
+            head == 0 || lsn <= head,
+            "--start-lsn {} beyond descriptor log head {}; boundaries in \
+             between were never captured — --ignore-cursor re-baselines",
+            format_pg_lsn(lsn),
+            format_pg_lsn(head),
+        );
+    }
+    if desc_log.is_empty() {
+        // Baseline snapshot: every eligible rel as of shadow's position,
+        // valid from the aligned start so the prefix re-read decodes
+        // (newest-shape reader of older tuples — the safe bias direction).
+        // Boundaries at or below covered_through are baked in and skip.
+        let (replay_lsn, descs) = catalog
+            .lock()
+            .await
+            .fetch_all_descriptors()
+            .await
+            .context("descriptor log boot seed")?;
+        let covered_through = raw_start.max(replay_lsn);
+        let entries = descs
+            .into_iter()
+            .map(|d| {
+                Arc::new(walshadow::desc_log::LogEntry {
+                    valid_from: aligned,
+                    oid: d.oid,
+                    rfn: d.rfn,
+                    value: walshadow::desc_log::LogValue::Present(Arc::new(d)),
+                })
+            })
+            .collect();
+        desc_log
+            .seed(
+                walshadow::desc_log::BatchRecord {
+                    captured_at: covered_through,
+                    entries,
+                },
+                covered_through,
+            )
+            .await
+            .context("seed descriptor log")?;
+        tracing::info!(
+            target: "walshadow::desc_log",
+            covered_through = format_pg_lsn(covered_through).to_string(),
+            "descriptor log seeded",
+        );
+    }
+
     // Txn-span registry, shared by pump + decoder; `Some` only with OTLP on.
     let span_registry =
         if args.otlp_endpoint.is_some() || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
@@ -1111,13 +1178,7 @@ async fn run_session(
         } else {
             None
         };
-    let mut decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
-        .with_schema_events(schema_events.clone())
-        // Bump / arm at worker position off each record's tracker verdict:
-        // the queueing sink below decouples the decoder from the pump, so
-        // a pump-position bump would be consumable before pre-DDL records
-        // finish decoding
-        .with_catalog_signals(invalidation_epoch.clone(), Some(pending_sweeps.clone()));
+    let mut decoder = BufferingDecoderSink::new(desc_log.clone(), xact_buffer.clone());
     if let Some(schema) = ch_config
         .as_ref()
         .and_then(|c| c.runtime_config_schema.as_deref())
@@ -1180,7 +1241,6 @@ async fn run_session(
             args.ch_config.clone(),
             cli_source_base(args),
             mapping.clone(),
-            invalidation_epoch.clone(),
         );
         reloader.set_resolver(Some(resolver.clone())).await;
         spawn_mapping_refresher(config_rx.clone(), mapping.clone());
@@ -1227,7 +1287,6 @@ async fn run_session(
         )
         .await
         .context("init DDL applicator")?
-        .with_invalidation_epoch(invalidation_epoch.clone())
         .with_resolver(resolver.clone());
         let stats = Arc::new(EmitterStats::default());
         emitter_stats_handle = Some(stats.clone());
@@ -1257,6 +1316,7 @@ async fn run_session(
                     mapping.clone(),
                     stats.clone(),
                     catalog.clone(),
+                    desc_log.clone(),
                     &args.spill_dir,
                     Some(config_rx.clone()),
                     Some(pipeline_budget.clone()),
@@ -1366,8 +1426,7 @@ async fn run_session(
             tail: TailKind::ClickHouse,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-            schema_events: Some(schema_events.clone()),
-            pending_sweeps: Some(pending_sweeps.clone()),
+            log: desc_log.clone(),
             stats: stats.clone(),
             span_registry: span_registry.clone(),
             config_resolver: config_resolver.clone(),
@@ -1399,8 +1458,7 @@ async fn run_session(
             tail: TailKind::Null,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-            schema_events: Some(schema_events.clone()),
-            pending_sweeps: Some(pending_sweeps.clone()),
+            log: desc_log.clone(),
             stats: Arc::new(EmitterStats::default()),
             span_registry: span_registry.clone(),
             config_resolver: None,
@@ -1418,6 +1476,10 @@ async fn run_session(
         .flush_due_retires()
         .await
         .context("boot flush of due toast-mirror retires")?;
+    reorder_sink
+        .apply_boot_events(desc_log.active_present_at(raw_start), raw_start)
+        .await
+        .context("boot Added pass over descriptor log")?;
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -1435,7 +1497,14 @@ async fn run_session(
         },
     );
     let boundary_hold_stats = boundary_gate.stats.clone();
-    let decoder_xact = BoundaryHoldSink::new(decoder_xact, boundary_gate);
+    let capture = walshadow::catalog_capture::CatalogCapture::new(
+        desc_log.clone(),
+        catalog.clone(),
+        xact_buffer.clone(),
+        smgr_markers,
+    );
+    let capture_stats = capture.stats_handle();
+    let decoder_xact = BoundaryHoldSink::new(decoder_xact, boundary_gate).with_capture(capture);
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder_xact,
@@ -1610,6 +1679,11 @@ async fn run_session(
             // Publish only after persist: pruners cut against what a
             // crash-now restart actually resumes from.
             resume_floor.store(cur.floor.0, Ordering::Release);
+            // Descriptor log prunes against the same floor
+            desc_log
+                .maybe_gc(cur.floor.0)
+                .await
+                .context("descriptor log gc")?;
         }
         // flush caps physical slot's restart_lsn.
         // Manifest writes are cadence-gated above while keepalive replies inside
@@ -1737,6 +1811,8 @@ async fn run_session(
                 dropped_total: shadow_agg.dropped_total,
             },
             &boundary_hold_stats,
+            &capture_stats,
+            &desc_log,
             metrics_resolver.as_deref(),
             metrics_backfiller.as_deref(),
         )
@@ -2286,12 +2362,16 @@ async fn populate_metrics(
     uptime_secs: u64,
     shadow_view: ShadowMetricsView,
     boundary_hold: &BoundaryHoldStats,
+    capture: &walshadow::catalog_capture::CaptureStats,
+    desc_log: &walshadow::desc_log::DescriptorLog,
     config_resolver: Option<&ConfigResolver>,
     backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
 ) {
     use std::collections::BTreeMap;
     use walshadow::record::rmgr_label;
     let (proc_cpu, proc_rss) = read_process_stats();
+    let desc_log_gauges = desc_log.gauges();
+    let log_stats = desc_log.stats_handle();
     let mut by_rm = BTreeMap::new();
     for ((rm, route), n) in &rec_metrics.by_rm_route {
         let key = (
@@ -2421,6 +2501,25 @@ async fn populate_metrics(
         catalog_boundary_holds_total: boundary_hold.holds.load(Ordering::Relaxed),
         catalog_boundary_hold_failures_total: boundary_hold.failures.load(Ordering::Relaxed),
         catalog_boundary_hold_seconds_total: boundary_hold.hold_seconds_total(),
+        desc_capture_sql_total: capture.sql_captures.load(Ordering::Relaxed),
+        desc_capture_log_replay_total: capture.log_replays.load(Ordering::Relaxed),
+        desc_capture_skipped_covered_total: capture.skipped_covered.load(Ordering::Relaxed),
+        desc_capture_all_total: capture.capture_all_runs.load(Ordering::Relaxed),
+        desc_capture_rels_total: capture.rels_captured.load(Ordering::Relaxed),
+        desc_capture_seconds_total: capture.capture_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+        desc_events_added_total: capture.events_added.load(Ordering::Relaxed),
+        desc_events_changed_total: capture.events_changed.load(Ordering::Relaxed),
+        desc_events_dropped_total: capture.events_dropped.load(Ordering::Relaxed),
+        desc_log_entries: desc_log_gauges.0,
+        desc_log_tail_bytes: desc_log_gauges.1,
+        desc_log_batches: desc_log_gauges.2,
+        desc_log_gc_total: log_stats.gc_runs.load(Ordering::Relaxed),
+        desc_log_gc_dropped_entries_total: log_stats.gc_dropped_entries.load(Ordering::Relaxed),
+        desc_lookups_present_total: log_stats.lookups_present.load(Ordering::Relaxed),
+        desc_lookups_dropped_total: log_stats.lookups_dropped.load(Ordering::Relaxed),
+        desc_lookups_retired_total: log_stats.lookups_retired.load(Ordering::Relaxed),
+        desc_lookups_not_covered_total: log_stats.lookups_not_covered.load(Ordering::Relaxed),
+        desc_lookups_foreign_db_total: log_stats.lookups_foreign_db.load(Ordering::Relaxed),
         config_pending_decl_rels: config_resolver.map(|r| r.pending_decl_count()).unwrap_or(0),
         config_replicate_opt_in_total: config_resolver.map(|r| r.opt_in_total()).unwrap_or(0),
         config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),

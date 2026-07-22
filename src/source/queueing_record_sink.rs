@@ -345,8 +345,8 @@ impl RecordSink for QueueingRecordSink {
                 next_lsn: record.next_lsn,
                 page_magic: record.page_magic,
                 route: record.route,
-                catalog_signal: record.catalog_signal,
                 catalog_boundary: record.catalog_boundary,
+                boundary_info: record.boundary_info.clone(),
             });
             if self.buf.len() >= self.batch_size {
                 self.flush_buf().await?;
@@ -371,14 +371,14 @@ mod tests {
         }
     }
 
-    struct CaptureLsn(Arc<StdMutex<Vec<(u64, crate::record::CatalogSignal)>>>);
+    struct CaptureLsn(Arc<StdMutex<Vec<(u64, bool)>>>);
     impl RecordSink for CaptureLsn {
         fn on_record<'a>(
             &'a mut self,
             r: &'a Record<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
             let sink = self.0.clone();
-            let item = (r.source_lsn, r.catalog_signal);
+            let item = (r.source_lsn, r.boundary_info.is_some());
             Box::pin(async move {
                 sink.lock().unwrap().push(item);
                 Ok(())
@@ -388,26 +388,25 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_records_in_order() {
-        use crate::record::CatalogSignal;
         let collected = Arc::new(StdMutex::new(Vec::new()));
         let mut q = QueueingRecordSink::spawn(CaptureLsn(collected.clone()), 2, 8, None);
         for lsn in [10, 20, 30, 40] {
             q.on_record(&synth(lsn)).await.expect("send");
         }
-        // `catalog_signal` must survive the clone-to-owned hop: the worker's
-        // decoder bumps epochs off it (see `catalog_tracker` module doc)
+        // `boundary_info` must survive the clone-to-owned hop: the worker's
+        // drain reads it
         let mut ddl = synth(50);
-        ddl.catalog_signal = CatalogSignal::Invalidate;
+        ddl.boundary_info = Some(std::sync::Arc::new(crate::record::BoundaryInfo::default()));
         q.on_record(&ddl).await.expect("send");
         q.close().await.expect("close");
         assert_eq!(
             collected.lock().unwrap().as_slice(),
             &[
-                (10, CatalogSignal::None),
-                (20, CatalogSignal::None),
-                (30, CatalogSignal::None),
-                (40, CatalogSignal::None),
-                (50, CatalogSignal::Invalidate),
+                (10, false),
+                (20, false),
+                (30, false),
+                (40, false),
+                (50, true),
             ],
         );
     }

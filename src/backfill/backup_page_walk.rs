@@ -678,6 +678,7 @@ pub(crate) fn make_rel() -> RelDescriptor {
             rel_node: 16400,
         },
         oid: 16400,
+        toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", "t"),
         kind: 'r',

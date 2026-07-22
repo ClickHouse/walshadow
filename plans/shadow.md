@@ -14,9 +14,10 @@ Two surfaces:
   restore, recovery startup, supervision. `Shadow` in
   `src/catalog/shadow.rs` provides operations. Daemon owns full
   lifecycle whenever `--bootstrap-shadow-data-dir` is set
-- **catalog API** — async libpq client + LRU + replay-LSN gate +
-  schema-event channel. Owned by `ShadowCatalog` in
-  `src/shadow_catalog.rs`. Consumed by heap decoder & CH DDL applicator
+- **catalog API** — async libpq client: batched descriptor fetches for
+  capture ([desc_log.md](desc_log.md)), name-keyed resolution for opt-in
+  and backfill standup, replay-LSN gate. Owned by `ShadowCatalog` in
+  `src/shadow_catalog.rs`. Decode never queries it
 
 Lifecycle code is sync, shells out to PG binaries; catalog code is
 async, drives `tokio-postgres`. They share data dir & port but
@@ -101,9 +102,9 @@ See [architecture/shadow_communication.dot](../architecture/shadow_communication
 for rendered diagram:
 
 1. **libpq catalog queries** — `ShadowCatalog`'s tokio-postgres client.
-   One long-lived connection over unix socket for `relation_at` /
-   `relation_by_oid` / `wait_for_replay` / `sweep_dropped`. Hot path
-   for decoder
+   One long-lived connection over unix socket for descriptor capture's
+   batched fetches, name-keyed resolution, and `wait_for_replay`.
+   Boundary-rate, never per record: decode reads the descriptor log
 2. **walsender wire** — `ShadowStreamSink` framing filtered-record
    bytes as `'w'` `XLogData` CopyData frames, listener accepts shadow's
    walreceiver (`primary_conninfo` in shadow's conf). Record-cadence
@@ -125,63 +126,35 @@ error or end-of-WAL. Both feed shadow's startup recovery which advances
 Async libpq client over shadow's unix socket. Key surfaces:
 
 ```rust
-pub async fn relation_at(&mut self, rfn: RelFileNode, at_lsn: u64)
-    -> Result<Arc<RelDescriptor>>;
-pub async fn relation_by_oid(&mut self, oid: Oid)
-    -> Result<Arc<RelDescriptor>>;
+pub async fn fetch_descriptors_batch(&mut self, oids: &[Oid])
+    -> Result<(u64, Vec<RelDescriptor>)>;   // + replay position
+pub async fn fetch_all_descriptors(&mut self)
+    -> Result<(u64, Vec<RelDescriptor>)>;   // capture-all / boot seed
+pub async fn descriptor_by_name(&mut self, rel: &RelName)
+    -> Result<Option<Arc<RelDescriptor>>>;  // opt-in dispatch
 pub async fn wait_for_replay(&mut self, target: u64) -> Result<u64>;
-pub fn invalidate(&mut self) -> u64;       // bump generation
-pub fn subscribe(&mut self) -> mpsc::UnboundedReceiver<SchemaEvent>;
 ```
 
 ![shadow](../architecture/shadow.svg)
 
-Cache: `by_filenode` + `by_oid` HashMaps over
-`CacheEntry { generation, desc }`, capped at `max_entries` (default
-4096), FIFO-evicted via `EvictionIndex` BTreeMap (O(log n) victim
-select via `BTreeMap::pop_first`). Hits short-circuit before any I/O;
-misses go through one SQL fan-out (`pg_class` + `pg_namespace` +
-`pg_index` for replident + `pg_attribute` + `pg_type`). Filenode
-resolution goes through `pg_relation_filenode(oid)` so mapped catalogs
-(`pg_class`, `pg_attribute`, shared catalogs in `global/`) & regular
-tables resolve uniformly. `at_lsn = 0` skips replay gate — used when
-caller proved freshness or cache is driven from non-WAL source
-(bootstrap seed, tests). Post-`wait_for_replay` re-drain is
-load-bearing: DDL observed concurrently during the yield can have
-bumped the epoch
+The batched fetch is one round trip: pg_class ⋈ pg_namespace, lateral
+pg_index (pk + replident), lateral pg_attribute aggregation with
+physical columns read directly (`attbyval/attlen/attalign/attstorage` —
+`DROP COLUMN` zeroes `atttypid` but preserves those, so pg_type joins
+LEFT and supplies typname only; dropped slots stay in `attributes`,
+keeping attnum-1 indexing exact), plus `pg_last_wal_replay_lsn()` off
+the same connection. Filenode resolution goes through
+`pg_relation_filenode(oid)` so mapped catalogs and regular tables
+resolve uniformly.
 
-Foreign-DB filenodes are rejected before the SQL fan-out:
-`fetch_by_filenode` returns `CatalogError::ForeignDatabase` when
-`rfn.db_node` is neither the connected shadow DB nor `0` (shared
-catalog). Physical replication ships the whole cluster's WAL, and
-relfilenodes are unique only within a database — a foreign `db_node`'s
-`rel_node` can collide with a real local relation and resolve to the
-wrong descriptor (`spc_node` need not match). The connected DB OID is
-memoized in `current_db_oid` (fixed by `conninfo`, survives reconnect);
-`foreign_db_skips` counts the rejections. Emitter folds the error into
-a row skip (see [emitter.md](emitter.md))
-
-## Catalog invalidation
-
-Single `u64` generation counter; lazy eviction keeps `invalidate()`
-O(1) regardless of cache size. Coarse-fire by design — see project
-memory note on PG version WAL skew: any `pg_class` write triggers
-invalidation, including hint-bit writes & autovacuum noise that don't
-change schema. Decoder fidelity does not imply cache freshness; coarse
-predicate over-invalidates but cannot under-invalidate. Fast-path
-`rfn-may-be-stale` predicate deferred — streaming-fed shadow makes
-post-bump refetch ms-cadence (see
-[future/risks.md](future/risks.md))
-
-DROP discovery is xid-keyed, not counter-keyed
-(`catalog_tracker::PendingSweeps`): the decoder worker arms the xid of
-each pg_class heap_delete record, commit sinks disarm + run
-`sweep_dropped` only at that xact's own commit. A counter consumed at
-whatever commit drained first swept while the dying tuple was still
-MVCC-alive in shadow (interleaved commit before the DROP's commit
-replayed) and lost the `Dropped` event. ADD COLUMN / CREATE INDEX
-never arm, so pgbench-rate commits skip the SQL probe entirely;
-aborts disarm without sweeping
+No cache, no invalidation, no event channel: descriptor history lives
+in the durable log ([desc_log.md](desc_log.md)); capture calls these
+fetchers only at catalog boundaries with shadow already applied through
+the boundary's `next_lsn`, so the snapshot is exactly the commit's
+state. Foreign-db rejection likewise moved to the log's lookup surface
+(`LookupResult::ForeignDb`). DROP discovery is capture-native: an oid
+absent from a boundary's fetch with a Present predecessor tombstones +
+emits `Dropped` — no polling sweep
 
 ## Reconnect resilience
 
@@ -263,33 +236,26 @@ Segment cadence preserved on top of record cadence: `DirSegmentSink`
 still writes one 16 MiB segment + manifest per boundary. Wire is hot
 path, segments are archive fallback + durable artifact
 
-## SchemaEvent channel
+## SchemaEvents
 
-`ShadowCatalog::subscribe() -> mpsc::UnboundedReceiver<SchemaEvent>`.
-Variants (see diagram legend for trigger → DDL mapping):
+Produced solely by descriptor capture as log diffs
+([desc_log.md](desc_log.md)); they enter the xact buffer as drain
+entries keyed `(drain_xid, valid_from)` and apply inside the reorder
+barrier. Variants (see diagram legend for trigger → DDL mapping):
 
-- `Added { desc }` — first sight of oid
+- `Added { desc }` — no log predecessor (CREATE, or a rel entering an
+  existing log via capture-all discovery); boot re-applies `Added` for
+  the active Present set each start (idempotent CH DDL)
 - `Changed { old, new, diff: SchemaDiff }` — `SchemaDiff` carries
   `added_columns`, `dropped_columns`, `renamed_columns`, `type_changes`.
   Renames detected by attnum-match + name-diff heuristic; PG's `RENAME
   COLUMN` keeps attnum intact, natural case lands here
-- `Dropped { oid, rel_name }` — `emit_dropped(oid)` from
-  `pg_class_decoder` heap_delete branch, or `sweep_dropped` poll (at
-  the dropping xact's commit, `PendingSweeps`-gated) for catalogs with
-  `relreplident = 'n'` where heap_delete carries no old tuple to
-  extract oid from
-
-`prev_known: HashMap<Oid, Arc<RelDescriptor>>` retains last-seen
-descriptors across generation bumps so diff source-of-truth survives
-invalidation. Channel consumed by CH DDL applicator inside worker task
-— see [emitter.md](emitter.md)
+- `Dropped { oid, rel_name }` — oid absent from a boundary's capture
+  with a Present predecessor; works for `relreplident = 'n'` catalogs
+  too (no old-tuple decode needed — enumeration comes from commit-record
+  relcache invals)
 
 ## Namespace mapping gaps
-
-Channel is **unbounded** (`mpsc::unbounded_channel`): the applicator runs in
-the same worker task as the decoder, so back-pressure surfaces naturally as
-task-local await depth rather than channel saturation, and a bounded
-`mpsc::channel(64)` would buy nothing.
 
 `NamespaceMapping` ([src/ch_emitter.rs](../src/ch_emitter.rs)) carries
 `auto_create`, `target_database`, and `drop_table_strategy` (the latter two
@@ -345,7 +311,7 @@ backfill, net-new knobs) is
 
 - [bootstrap.md](bootstrap.md) — initdb vs `BASE_BACKUP`,
   `apply_schema_dump` consumer, `seed_from_source` bootstrap fan-out
-- [decoder.md](decoder.md) — `relation_at` consumer, heap-tuple decode
+- [decoder.md](decoder.md) — descriptor-log consumer, heap-tuple decode
   against `RelDescriptor`
 - [emitter.md](emitter.md) — `SchemaEvent` channel consumer
   (`ch_ddl::DdlApplicator`), barrier-fence ordering

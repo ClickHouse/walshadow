@@ -46,9 +46,9 @@ Single-threaded commit-order boundary. Runs as inner sink of the
 daemon's `QueueingRecordSink` (off the WAL pump task, so replay gates
 never pace wire delivery). Only `RM_XACT_ID` records reach its match:
 
-- COMMIT — poll-based DROP sweep (only when this commit's xid set was
-  armed by a pg_class heap_delete, `PendingSweeps`),
-  `XactBuffer::drain_committed`, then assign one dense `seq`,
+- COMMIT — stash resolution against the descriptor log at the commit's
+  `next_lsn`, `XactBuffer::drain_committed` under the drain xid
+  (prepared xid for COMMIT PREPARED), then assign one dense `seq`,
   `ack.register(seq, commit_lsn)`, dispatch a `DecodeJob` to the
   decode pool. Empty commits register a rows=0 seq so the contiguous
   watermark never gaps
@@ -411,11 +411,10 @@ the source-PG-driven work (signals, opt-in + backfill, net-new knobs)
 ## DdlApplicator
 
 `ch_ddl.rs::DdlApplicator`, owned by the reorder coordinator. Events
-originate at `ShadowCatalog::subscribe`
-(`mpsc::UnboundedReceiver<SchemaEvent>` — unbounded so a stalled
-consumer never back-pressures the catalog producer), ride the xact
-buffer keyed on `(xid, source_lsn)`, and surface in `drain_committed`'s
-`ordered_events`; the barrier applies each in source-LSN order.
+originate at descriptor capture ([desc_log.md](desc_log.md)) as log
+diffs, ride the xact buffer keyed `(drain_xid, valid_from)`, and
+surface in `drain_committed`'s `ordered_events`; the barrier applies
+each in LSN order.
 `DrainEntry::ToastBarrier` rides the same loop at commit LSN: the
 put-cursor flushes the generation's births first, then the barrier runs
 the store-side residual insert-select ([TOAST.md](TOAST.md)). Apply
@@ -448,45 +447,26 @@ DDL has no retry: an applicator error trips fatal so the operator sees
 it directly. Runtime-config-from-PG work may add bounded reconnect for
 the DDL connection
 
-### Baseline seeding (the `Added`-vs-`Changed` discriminator)
+### Baseline (the `Added`-vs-`Changed` discriminator)
 
-Whether a relation's first post-start descriptor fetch surfaces as
-`Added` or `Changed` keys on whether `ShadowCatalog::prev_known` already
-holds its oid. `prev_known` is the *baseline ledger* (last source shape
-CH and source agreed on), not the descriptor cache — cold at every boot,
-never reconstructed on a miss. Left cold, a pinned table that sees no DML
-before its first `ALTER` records the post-ALTER shape as `Added`, which
-`apply_added` skips for pinned dests (operator-managed CH) → CH stays a
-column behind.
+Whether a relation's first post-start DDL surfaces as `Added` or
+`Changed` keys on the descriptor log's predecessor for its oid
+([desc_log.md](desc_log.md)) — durable across restarts, seeded at first
+attach with every eligible rel's boot shape. A pinned table's first
+post-start `ALTER` therefore always diffs against a real baseline →
+`Changed` → the `apply_changed` path above runs the CH ALTER; no warm-up
+step exists to forget.
 
-`ShadowCatalog::seed_baseline(rel_names)` warms `prev_known` for
-every pinned relation before `subscribe()` so the cache never decides the
-branch: `bin/stream.rs` calls it after preflight / before
-`START_REPLICATION` over `cfg.tables.keys()` (the inproc harness mirrors
-it before its own `subscribe`). Pre-subscribe, `send_event` is a no-op,
-so seeding emits nothing and does zero CH work. The first post-boot
-`ALTER` then diffs the evolved descriptor against the seeded boot shape →
-`Changed` → the `apply_changed` path above runs the CH ALTER.
-
-Seeds the *full source* descriptor, never the mapping: a pinned subset's
-unmapped columns sit in the baseline and read as "operator-excluded", so
-a later `ALTER` adds only genuinely-new columns, never re-adds an
-excluded one. Auto-create tables need no seeding — their first-touch
-`Added` → `CREATE TABLE` already records a baseline.
-
-`config_table` opt-ins warm the same ledger through the opt-in dispatch
-(`src/opt_in.rs`): the descriptor resolve inside `apply_table_opt_in`
-records the baseline via `record_descriptor` — at the config row's
-commit LSN on a live opt-in, at boot on the re-run over seeded rows. So
-a post-opt-in `ALTER` diffs against the opt-in shape, never trips the
-cold-`prev_known` → `Added` path. The boot re-run fires post-`subscribe`
-so each opted-in rel enqueues one `Added`; benign — `apply_added` skips
-mapped rels (under strategy = drop it re-issues a `CREATE IF NOT EXISTS`
-the standing dest no-ops). Together the resolved scope, not just
-`cfg.tables`, is warm
-for one daemon lifetime. Open: boot-time drift (column added while the
-daemon is down folds silently into the seeded baseline) — see
-`plans/future/pinned_ddl_baseline.md`.
+The baseline is the *full source* descriptor, never the mapping: a
+pinned subset's unmapped columns sit in the log and read as
+"operator-excluded", so a later `ALTER` adds only genuinely-new columns,
+never re-adds an excluded one. Auto-create tables and opted-in rels get
+an idempotent boot `Added` pass over the log's active Present set each
+start (`CREATE TABLE IF NOT EXISTS` no-ops standing dests), so newly
+enabled config picks up existing rels at the next boot. Boot-time drift
+(column added while the daemon is down) lands as `Changed` at the next
+boundary touching the rel — the descriptor log diffs against the stored
+shape, not a freshly fetched one.
 
 ### Barrier fence (ordering data around DDL)
 

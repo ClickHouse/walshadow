@@ -297,6 +297,7 @@ fn rel_descriptor() -> RelDescriptor {
     RelDescriptor {
         rfn: RFN,
         oid: 16385,
+        toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", "things"),
         kind: 'r',

@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::record::{Record, RecordSink, SinkError};
+use crate::source::catalog_capture::CatalogCapture;
 use crate::source::queueing_record_sink::QueueingRecordSink;
 use crate::source::shadow_stream::ShadowStreamState;
 
@@ -145,19 +146,32 @@ impl CatalogBoundaryGate {
     }
 }
 
-/// [`QueueingRecordSink`] wrapper enacting the hold. Forwards every record,
-/// then at a catalog boundary force-flushes the pump-side batch (the commit
-/// must not strand in the accumulator while the pump parks — and the flush
-/// surfaces any parked worker error first) and parks in
-/// [`CatalogBoundaryGate::hold`].
+/// [`QueueingRecordSink`] wrapper enacting the hold. At a catalog boundary:
+/// force-flush the pump-side batch (predecessors must not strand in the
+/// accumulator while the pump parks — and the flush surfaces any parked
+/// worker error first), park in [`CatalogBoundaryGate::hold`], capture
+/// descriptors against the caught-up shadow, then forward the commit record
+/// — so by the time the worker drains the xact, its schema events are
+/// already attached and the log batch is durable.
 pub struct BoundaryHoldSink {
     pub inner: QueueingRecordSink,
     pub gate: CatalogBoundaryGate,
+    /// `None` = hold-only (tests / capture-less harnesses)
+    pub capture: Option<CatalogCapture>,
 }
 
 impl BoundaryHoldSink {
     pub fn new(inner: QueueingRecordSink, gate: CatalogBoundaryGate) -> Self {
-        Self { inner, gate }
+        Self {
+            inner,
+            gate,
+            capture: None,
+        }
+    }
+
+    pub fn with_capture(mut self, capture: CatalogCapture) -> Self {
+        self.capture = Some(capture);
+        self
     }
 
     pub fn in_flight(&self) -> u64 {
@@ -183,10 +197,12 @@ impl RecordSink for BoundaryHoldSink {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            self.inner.on_record(record).await?;
             if !record.catalog_boundary {
-                return Ok(());
+                return self.inner.on_record(record).await;
             }
+            // Ship + flush the xact's predecessors before parking; the
+            // commit itself forwards only after capture so the worker's
+            // drain finds events already attached
             self.inner.flush().await?;
             let inner = &self.inner;
             if let Err(hold_err) = self
@@ -199,7 +215,15 @@ impl RecordSink for BoundaryHoldSink {
                 self.inner.flush().await?;
                 return Err(hold_err);
             }
-            Ok(())
+            if let (Some(capture), Some(info)) = (&self.capture, &record.boundary_info) {
+                capture
+                    .capture_boundary(info, record.source_lsn, record.next_lsn)
+                    .await?;
+            }
+            self.inner.on_record(record).await?;
+            // Ship the commit immediately: the drain (and its CH effects)
+            // must not wait out the accumulator
+            self.inner.flush().await
         })
     }
 
@@ -435,14 +459,21 @@ mod tests {
         let q = QueueingRecordSink::spawn(Fail, 1, 4, None);
         let gate = gate_with(s, Duration::from_secs(30));
         let mut sink = BoundaryHoldSink::new(q, gate);
+        // Predecessor record ships (batch_size 1) and kills the worker;
+        // the boundary's pre-hold flush (or the hold's worker_alive wake)
+        // must surface that root cause, never the generic hold error
+        let dml = Record {
+            source_lsn: 0x1E00,
+            next_lsn: 0x1F00,
+            ..Default::default()
+        };
+        let _ = sink.on_record(&dml).await;
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
             catalog_boundary: true,
             ..Default::default()
         };
-        // Worker fails on the shipped commit; hold's worker_alive check
-        // wakes with Err and the parked root cause wins
         let err = sink.on_record(&rec).await.expect_err("must fail");
         assert!(err.to_string().contains("boom"), "{err}");
     }
