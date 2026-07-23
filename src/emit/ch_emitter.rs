@@ -63,6 +63,7 @@ pub(crate) const DEFAULT_BYTE_BUDGET: usize = 1 << 20; // 1 MiB
 /// it stay within the ingest budget.
 pub(crate) const DEFAULT_DRAIN_BATCH_ROWS: usize = 65_536;
 pub(crate) const DEFAULT_DRAIN_BATCH_BYTES: usize = 32 << 20; // 32 MiB
+pub(crate) const DEFAULT_PLAN_DISK_MAX: u64 = 8 << 30; // 8 GiB
 
 /// Default flush timeout (ms). `0` keeps serial emitter's
 /// close-INSERT-on-every-xact-end behaviour (bootstrap backfill only);
@@ -148,6 +149,9 @@ pub struct EmitterConfig {
     /// generations stay per-xact.
     pub drain_batch_rows: usize,
     pub drain_batch_bytes: usize,
+    /// `[clickhouse] plan_disk_max`: byte cap per transaction plan spool
+    /// file; a larger transaction fails planning instead of filling disk
+    pub plan_disk_max: u64,
     /// `[runtime_config] schema`: source-PG schema housing the `config_*`
     /// overlay tables. `None` (field empty or omitted) disables the whole
     /// overlay subsystem — no boot seed, no config_decoder, pure TOML+CLI.
@@ -223,6 +227,7 @@ impl Default for EmitterConfig {
             decode_chunk_rows: DEFAULT_DECODE_CHUNK_ROWS,
             drain_batch_rows: DEFAULT_DRAIN_BATCH_ROWS,
             drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
+            plan_disk_max: DEFAULT_PLAN_DISK_MAX,
             runtime_config_schema: None,
             source_slot: None,
             resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
@@ -464,6 +469,9 @@ impl EmitterConfig {
             }
             if let Some(v) = ch.get("drain_batch_bytes").and_then(Value::as_integer) {
                 out.drain_batch_bytes = usize::try_from(v).unwrap_or(DEFAULT_DRAIN_BATCH_BYTES);
+            }
+            if let Some(v) = ch.get("plan_disk_max").and_then(Value::as_integer) {
+                out.plan_disk_max = u64::try_from(v).unwrap_or(DEFAULT_PLAN_DISK_MAX);
             }
             if let Some(v) = ch.get("flush_timeout_ms").and_then(Value::as_integer)
                 && let Ok(ms) = u64::try_from(v)
@@ -1489,9 +1497,9 @@ fn encode_value(
             target_column: String::new(),
             kind: "unresolved TOAST pointer (xact buffer should have reassembled)",
         }),
-        // PgPending normally resolves to text earlier (BufferingDecoderSink
-        // via the oracle extension). Still set here means extension absent;
-        // fall back to raw on-disk bytes so CH still gets the value
+        // PgPending normally resolves to text earlier (decode pool via the
+        // oracle extension). Still set here means extension absent or
+        // resolve fell through; best effort ships raw on-disk bytes
         ColumnValue::PgPending { raw, .. } => buf.append_string_bytes(raw),
         ColumnValue::Unsupported { .. } => Err(EmitterError::UnsupportedValue {
             target_column: String::new(),
@@ -1508,9 +1516,6 @@ crate::atomic_stats! {
         pub blocks_sent,
         pub xacts_committed,
         pub unsupported_relations,
-        /// Rows whose filenode resolved to a foreign database (physical
-        /// WAL carries the whole cluster). Skipped, not an error.
-        pub foreign_db_rows_skipped,
         pub unsupported_values,
         /// `retries_attempted` counts one per failing operation, not per
         /// attempt (one op needing 3 retries adds 3)
@@ -1544,9 +1549,34 @@ crate::atomic_stats! {
         /// Stashed records discarded: filenode unresolvable post-commit
         /// (dropped or rotated away), end-state-neutral by AEL supersession
         pub toast_stash_discarded,
-        /// Stashed records resolved to a non-toast heap; ordinary-heap decode
-        /// stays fenced off until a shadow replay fence exists
-        pub toast_stash_skipped,
+        /// Stashed filenodes resolved to a foreign database at commit,
+        /// cluster-level skip counted once per filenode
+        pub stash_foreign_db_skipped,
+        /// Routed heaps sealed into transaction plans (unmapped discards
+        /// excluded)
+        pub plan_rows,
+        /// Sealed plan bytes by final backing
+        pub plan_bytes_mem,
+        pub plan_bytes_file,
+        /// Planning-stage failures by reason; a failed plan means the whole
+        /// transaction emits nothing
+        pub plan_failures_spool,
+        pub plan_failures_fail_closed,
+        pub plan_failures_detoast,
+        pub plan_failures_partial_update,
+        pub plan_failures_view,
+        pub plan_failures_drain,
+        /// Plan-time route resolutions, one per relation per transaction
+        /// (memoised)
+        pub route_snapshots_mapped,
+        pub route_snapshots_unmapped,
+        /// Commit-resolve raw decode: records by verdict kind, per op
+        /// (`raw_decode_records_total{kind,op}`)
+        pub raw_decode_toast_ops: crate::decode::heap_decoder::OpCounters,
+        pub raw_decode_ordinary_ops: crate::decode::heap_decoder::OpCounters,
+        /// Rows fanned out of decoded raw records per op
+        /// (`raw_decode_rows_total{op}`); MULTI_INSERT yields many per record
+        pub raw_decode_rows_ops: crate::decode::heap_decoder::OpCounters,
         // Pipeline-flow counters; `_out`/`_in` pairs give channel depth. See
         // `metrics::render`.
         pub queue_jobs_out,
@@ -1730,6 +1760,7 @@ mod tests {
                 rel_node: 16385,
             },
             oid: 16385,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "foo"),
             kind: 'r',

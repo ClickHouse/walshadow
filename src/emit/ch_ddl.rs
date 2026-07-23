@@ -22,7 +22,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use clickhouse_c::AsyncClient;
@@ -131,7 +130,6 @@ pub struct DdlApplicator {
     /// barrier mutates the mapping here. Bump again on every mapping write
     /// so a worker whose refresh consumed the record-time bump drops its
     /// pre-apply snapshot
-    invalidation_epoch: Option<Arc<AtomicU64>>,
     /// Owner of runtime-derived mapping state. Set: auto-created mappings,
     /// diff folds, and DROP forgets record into the resolver so the
     /// republish full-swap preserves them. Unset (bootstrap drain, tests
@@ -170,18 +168,10 @@ impl DdlApplicator {
             retry: emitter_cfg.retry.clone(),
             query_timeout: emitter_cfg.insert_timeout,
             last_used: std::time::Instant::now(),
-            invalidation_epoch: None,
             resolver: None,
             ensured_databases: HashSet::new(),
             stats: DdlStats::default(),
         })
-    }
-
-    /// Same handle as `CatalogTracker::set_invalidation_epoch`. Unset skips
-    /// bumps (bootstrap drain, tests without a decode pool)
-    pub fn with_invalidation_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
-        self.invalidation_epoch = Some(epoch);
-        self
     }
 
     /// Route mapping writes through the resolver so they survive its
@@ -493,15 +483,70 @@ impl DdlApplicator {
     }
 
     /// Mapping writes route per `resolver` field: resolver-owned entries
-    /// survive the republish full-swap (republish writes the live handle +
-    /// bumps the epoch); resolver-less path mutates the live handle and
-    /// bumps directly
+    /// survive the republish full-swap; resolver-less path mutates the live
+    /// handle directly. Decode workers memoise per job and mapping writes
+    /// land inside the barrier fence, between jobs — no epoch needed
     async fn register_mapping(&mut self, rel: &RelName, mapping: TableMapping) {
         if let Some(r) = &self.resolver {
             r.register_derived_mapping(rel, mapping).await;
         } else {
-            self.mapping.write().await.insert(rel.clone(), mapping);
-            bump_mapping_epoch(self.invalidation_epoch.as_ref());
+            Arc::make_mut(&mut *self.mapping.write().await).insert(rel.clone(), mapping);
+        }
+    }
+
+    /// Predict `apply(event)`'s routing-map effect without executing DDL or
+    /// touching shared state, for plan-time route resolution: `None` = map
+    /// unchanged, `Some((rel, Some(m)))` = insert/replace, `Some((rel,
+    /// None))` = remove. Mirrors the apply_added / apply_changed /
+    /// apply_dropped gates; the executor later applies the real effects
+    pub async fn predict_route_mapping(
+        &mut self,
+        event: &SchemaEvent,
+    ) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
+        self.refresh_config().await?;
+        match event {
+            SchemaEvent::Added { desc } => {
+                if self.mapping_for(&desc.rel_name).await.is_some()
+                    || self.is_excluded(&desc.rel_name).await
+                    || !self
+                        .config
+                        .auto_create_namespaces
+                        .contains(&*desc.rel_name.namespace)
+                {
+                    return Ok(None);
+                }
+                let target_db = self
+                    .config
+                    .target_database_for(&desc.rel_name.namespace)
+                    .to_owned();
+                if render_create_table(desc, &target_db, self.config.soft_delete)?.is_none() {
+                    return Ok(None);
+                }
+                let target = TableTarget::new(&target_db, &desc.rel_name.name);
+                let columns = derive_columns_for_mapping(desc);
+                Ok(Some((
+                    desc.rel_name.clone(),
+                    Some(TableMapping { target, columns }),
+                )))
+            }
+            SchemaEvent::Changed { new, diff, .. } => {
+                let Some(mut m) = self.mapping_for(&new.rel_name).await else {
+                    return Ok(None);
+                };
+                fold_diff_into_mapping(&mut m, new, diff);
+                Ok(Some((new.rel_name.clone(), Some(m))))
+            }
+            SchemaEvent::Dropped { rel_name, .. } => {
+                if self.mapping_target(rel_name).await.is_none()
+                    || !matches!(
+                        self.config.drop_strategy_for(&rel_name.namespace),
+                        DropTableStrategy::Drop
+                    )
+                {
+                    return Ok(None);
+                }
+                Ok(Some((rel_name.clone(), None)))
+            }
         }
     }
 
@@ -509,8 +554,7 @@ impl DdlApplicator {
         if let Some(r) = &self.resolver {
             r.apply_schema_diff(new, diff).await;
         } else {
-            mutate_mapping_for_diff(&self.mapping, self.invalidation_epoch.as_ref(), new, diff)
-                .await;
+            mutate_mapping_for_diff(&self.mapping, new, diff).await;
         }
     }
 
@@ -518,8 +562,7 @@ impl DdlApplicator {
         if let Some(r) = &self.resolver {
             r.forget_derived_mapping(rel).await;
         } else {
-            self.mapping.write().await.remove(rel);
-            bump_mapping_epoch(self.invalidation_epoch.as_ref());
+            Arc::make_mut(&mut *self.mapping.write().await).remove(rel);
         }
     }
 
@@ -567,35 +610,16 @@ impl DdlApplicator {
     }
 }
 
-/// Flush decode-pool `RelCache` mapping snapshots after a mapping write.
-/// Call only after the write guard drops: bump-before-write would let a
-/// racing `RelCache::refresh` cache the pre-write map under the post-bump
-/// epoch, going permanently stale
-pub fn bump_mapping_epoch(epoch: Option<&Arc<AtomicU64>>) {
-    if let Some(e) = epoch {
-        e.fetch_add(1, Ordering::Release);
-    }
-}
-
-/// Fold a `Changed` diff into the live mapping, then bump the epoch so
-/// decode-pool workers holding a pre-diff snapshot re-resolve. Renames touch
-/// only entries whose `target_name` still equals the OLD source name; an
-/// operator-pinned different name is left alone (CH runs no ALTER for it
-/// either, see `apply_changed`)
-async fn mutate_mapping_for_diff(
-    mapping: &MappingHandle,
-    epoch: Option<&Arc<AtomicU64>>,
-    new: &RelDescriptor,
-    diff: &SchemaDiff,
-) {
-    {
-        let mut m = mapping.write().await;
-        let Some(target_mapping) = m.get_mut(&new.rel_name) else {
-            return;
-        };
-        fold_diff_into_mapping(target_mapping, new, diff);
-    }
-    bump_mapping_epoch(epoch);
+/// Fold a `Changed` diff into the live mapping. Renames touch only entries
+/// whose `target_name` still equals the OLD source name; an operator-pinned
+/// different name is left alone (CH runs no ALTER for it either, see
+/// `apply_changed`)
+async fn mutate_mapping_for_diff(mapping: &MappingHandle, new: &RelDescriptor, diff: &SchemaDiff) {
+    let mut m = mapping.write().await;
+    let Some(target_mapping) = Arc::make_mut(&mut *m).get_mut(&new.rel_name) else {
+        return;
+    };
+    fold_diff_into_mapping(target_mapping, new, diff);
 }
 
 /// The fold itself, shared with `ConfigResolver::apply_schema_diff` (the
@@ -724,7 +748,6 @@ mod tests {
     use crate::mapping::{ColumnMapping, TableMapping};
     use crate::schema::{INT4OID, TEXTOID, TIMESTAMPTZOID};
     use crate::schema::{RelAttr, RelDescriptor, ReplIdent, SchemaDiff};
-    use std::sync::Arc;
 
     #[test]
     fn per_namespace_target_and_drop_override_global() {
@@ -810,6 +833,7 @@ mod tests {
                 rel_node: 16400,
             },
             oid: 16400,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", name),
             kind: 'r',
@@ -1087,7 +1111,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let handle: MappingHandle = Arc::new(tokio::sync::RwLock::new(map));
+        let handle = crate::mapping::mapping_handle(map);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -1114,8 +1138,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let handle: MappingHandle = Arc::new(tokio::sync::RwLock::new(map));
-        let epoch = Arc::new(AtomicU64::new(7));
+        let handle = crate::mapping::mapping_handle(map);
         let new = desc(
             "orders",
             vec![
@@ -1134,9 +1157,8 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            // Mapped relation: column folded in, epoch bumped so decode-pool
-            // RelCaches drop pre-diff mapping snapshots
-            mutate_mapping_for_diff(&handle, Some(&epoch), &new, &diff).await;
+            // Mapped relation: column folded in
+            mutate_mapping_for_diff(&handle, &new, &diff).await;
             let m = handle.read().await;
             let cols = &m.get(&RelName::new("public", "orders")).unwrap().columns;
             assert!(
@@ -1144,16 +1166,9 @@ mod tests {
                     .any(|c| c.src_attnum == 2 && c.target_name == "c")
             );
         });
-        assert_eq!(epoch.load(Ordering::Acquire), 8);
 
-        // Unmapped relation: early return, no spurious bump
+        // Unmapped relation: early return
         let ghost = desc("ghost", vec![att(1, "id", INT4OID, true, None)], None);
-        rt.block_on(mutate_mapping_for_diff(
-            &handle,
-            Some(&epoch),
-            &ghost,
-            &diff,
-        ));
-        assert_eq!(epoch.load(Ordering::Acquire), 8);
+        rt.block_on(mutate_mapping_for_diff(&handle, &ghost, &diff));
     }
 }

@@ -1,4 +1,4 @@
-# oracle — differential decode oracle for Tier 3 types
+# oracle — PgPending resolver for Tier 3 types
 
 [`src/oracle.rs`](../src/oracle.rs) plus [`pgext/`](../pgext/)
 
@@ -13,10 +13,12 @@ doesn't reimplement. Ship known-stable types in-tree, route everything
 else through shadow-PG bridge calling same `typoutput` PG itself would
 call
 
-Validation half is symmetric. Take walshadow's locally-decoded text,
-hand raw on-disk bytes to shadow PG via same bridge, diff. Mismatch
-surfaces decoder regression on first sampled row of that type, not
-after bad data has settled in CH
+Resolution is best-effort by policy: the oracle resolves post-plan, so
+its answer reflects shadow's catalog state at resolve time, which may
+lag the row's own catalog interval in DDL edge cases — accepted in
+exchange for mostly supporting unknown types. Unresolved `PgPending`
+ships raw on-disk bytes; unresolved `Unsupported` stays the
+fail-closed backstop at encode
 
 ## In-tree Tier 3
 
@@ -81,48 +83,18 @@ Installed into **shadow PG**; stays shadow-only.
 Resolver short-circuits `Ok(None)` when `probe_extension` returned
 false at connect (or reconnect). `stats.fallback_raw` bumps, `PgPending`
 stays put, emitter's `encode_value` calls `append_string_bytes(raw)`
-so on-disk body lands verbatim in CH with `unsupported_values++`. No
+so on-disk body lands verbatim in CH. No
 failure, no operator action. `CREATE EXTENSION walshadow` on shadow
 followed by daemon reconnect flips `has_extension=true` and text
-rendering resumes
-
-## --validate <N> sampling
-
-Off by default (`rate == 0` short-circuits before any atomic op).
-`walshadow-stream --validate <N>` probes 1-in-N tuples through
-[`Sampler::pick`](../src/oracle.rs) via `AtomicU64::fetch_add(Relaxed)`
-— lock-free, multi-worker safe
-
-Symmetric probe shape:
-
-1. reuse on-disk raw bytes for `PgPending` (in-tree Tier 3 values —
-   `Numeric`, `Inet` — discard raw bytes at decode, so today only
-   `PgPending` columns probe; full symmetric re-encode is open work)
-2. `SELECT walshadow_decode_disk($1::oid, $2::bytea)` on shadow
-3. compare returned text to `local_text` — empty for `PgPending`
-   (no local rendering exists), so the probe degrades to "did the
-   extension call succeed + return text"
-4. bump `OracleStats.{probes, matches, mismatches, errors}`
-
-Mismatch is watchdog signal, not gate — row still ships to CH. First
-sampled bad row of a regressed type surfaces in status line via
-`OracleStats::summary`
-
-Making the probe genuinely differential needs `ColumnValue` Tier 3
-variants to retain source bytes alongside decoded form (or a
-re-encoder per Tier 3 codec) — until then "validator caught a planted
-regression" holds for `PgPending`-routed types, not in-tree Tier 3
-
-Operator policy: `--validate 1000` is ~0.1% sampling, invisible against
-shadow's existing catalog query load
+rendering resumes. Stats surface as `walshadow_decode_{resolved,
+fallback_raw,errors}_total`
 
 ## Pinning shadow locale
 
 `lc_numeric` and `lc_time` pinned at shadow bootstrap. Without this,
 `typoutput` on `numeric` and `interval` would diff against walshadow's
-locale-independent rendering and validator would noise on deployments
-running non-`C` locales. See [shadow.md](shadow.md) for bootstrap
-surface
+locale-independent rendering on deployments running non-`C` locales.
+See [shadow.md](shadow.md) for bootstrap surface
 
 ## Cross-links
 

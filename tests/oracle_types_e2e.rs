@@ -9,8 +9,9 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
+use fx::spawn_txn;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,45 +95,6 @@ fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
     }
 }
 
-fn spawn_txn(source: &Shadow, body: &str) -> std::thread::JoinHandle<()> {
-    let sock = source.config().socket_dir.clone();
-    let port = source.config().port;
-    let sql = body.to_owned();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        let mut child = Command::new("psql")
-            .args([
-                "-h",
-                sock.to_str().unwrap(),
-                "-p",
-                &port.to_string(),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-f",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn psql");
-        {
-            use std::io::Write as _;
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin piped")
-                .write_all(sql.as_bytes())
-                .unwrap();
-        }
-        let _ = child.wait();
-    })
-}
-
 async fn run_oracle(
     slot: PortSlot,
     app_name: &str,
@@ -163,7 +125,7 @@ async fn run_oracle(
         "postgres",
         "postgres",
     );
-    let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
+    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
     assert!(
         oracle.has_extension(),
         "shadow must expose walshadow_decode_disk",

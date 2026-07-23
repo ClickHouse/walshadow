@@ -10,37 +10,50 @@ that one is a forward-looking emitter rearchitecture. §3 below is the
 only seam — it exposes the tablespace attribute destination routing
 consumes as one (weak) key.
 
-## 0. What already works, and why
+## 0. Physical identity
 
 In PG a relation's physical identity is the `RelFileLocator`
-`(spcNode, dbNode, relNode)` (`walrus::pg::walparser::types`).
-walshadow keys every relation on `(db_node, rel_node)` and discards
-`spc_node` for identity:
+`(spcNode, dbNode, relNode)` (`walrus::pg::walparser::types`), and all
+three components are load-bearing. `GetNewRelFileNumber`
+(`postgresql/src/backend/catalog/catalog.c`) guarantees relfilenumber
+uniqueness only *within one database of one tablespace*: its pg_class
+probe checks `pg_class.oid` (CREATE path only, where filenumber doubles
+as the oid), and the on-disk collision probe builds its path from the
+target tablespace. The rewrite / `SET TABLESPACE` path passes no
+pg_class at all, and `tablecmds.c` states the consequence outright:
+*relfilenumbers are not unique in databases across tablespaces*. After
+OID wraparound, two live relations in one database can share `relNode`
+under different tablespaces, so `(db_node, rel_node)` is not an
+identity.
 
-- catalog whitelist: `CatalogTracker.nodes: HashSet<(u32,u32)>`
-  (`src/catalog_tracker.rs:62`)
-- resolver: bootstrap drain calls
-  `CatalogMap::get(rfn.db_node, rfn.rel_node)`;
-  `CatalogMap.by_filenode` is `HashMap<(Oid,Oid), _>`
-  (`src/backup_page_walk.rs`)
-- the design comment spelling out why lives at
-  `src/shadow_catalog.rs:939`: *relfilenode is unique per database
-  regardless of tablespace*
+Surfaces keying the full physical rfn:
 
-That assumption is sound on supported versions (PG 16+).
-`GetNewRelFileNumber` (`postgresql/src/backend/catalog/catalog.c:542`)
-draws the relfilenumber from the cluster-wide OID counter and, on the
-CREATE path, checks it unused in the database's `pg_class`; the rewrite
-path additionally rejects a colliding on-disk file. So within one
-database no two live relations share a `relNode`, across tablespaces or
-not. `spc_node` is redundant for identity, and the heap decoder never
-needs it — tuple layout doesn't depend on tablespace.
+- descriptor log chains + lookups (`src/catalog/desc_log.rs`); capture
+  resolves the `pg_class.reltablespace` 0 sentinel to `dattablespace`
+  in the descriptor SQL (shadow + source), so stored rfns match WAL
+  locators' concrete spcOid
+- `XLOG_SMGR_CREATE` markers, pump side (`SmgrMarkers`,
+  `src/filter/engine.rs`) and worker side (`XactBuffer.markers`,
+  `src/xact/xact_buffer.rs`)
+- decode-path descriptor lookups and the per-job memo
+  (`src/emit/pipeline/decode.rs`)
 
-**Consequence:** steady-state streaming of a table sitting in a
-non-default tablespace already works. The heap WAL record carries the
-concrete physical `spcOid`, the filter ignores it, the decoder emits
-rows. No code change needed for the decode path. *Verify, don't assume*
-— there is no test pinning this; see §4.
+Surfaces still keying `(db_node, rel_node)`, exposed only when
+wraparound mints a colliding relfilenumber:
+
+- catalog whitelist `CatalogTracker.nodes`
+  (`src/filter/catalog_tracker.rs`) — a user rel aliasing a catalog
+  filenode misroutes its records to shadow and fabricates boundaries;
+  no misdecode, but noisy and unbounded shadow growth
+- bootstrap `CatalogMap.by_filenode` + page-walk classifier
+  (`src/backfill/backup_page_walk.rs`) — moot until §1 lands, since
+  non-default tablespace files never reach the classifier today
+
+Tuple layout doesn't depend on tablespace, so steady-state streaming of
+a table in a non-default tablespace works: heap WAL carries the concrete
+physical `spcOid`, descriptors carry the resolved tablespace, decode
+matches on full rfn. *Verify, don't assume* — there is no test pinning
+this end to end; see §4.
 
 `RM_TBLSPC_ID` and `RM_SMGR_ID` records pass the filter verbatim
 (`src/classify.rs:39`, `rmgr_is_special`), and `pg_tablespace` (shared
@@ -67,12 +80,11 @@ in walshadow today (every non-test caller ignores it; tests pass
 
 Fix:
 
-1. Teach the path classifier the `pg_tblspc/...` shape. Parse `dbOid`
-   and `relNode` out of the deeper path, ignore `spcOid` and the
-   version dir for keying (consistent with `(db,rel)` identity).
-   Catalog lookup (`self.catalog.get(db, rel)`) is unchanged because
-   the catalog seed already records the right `(db,rel)` for these
-   relations
+1. Teach the path classifier the `pg_tblspc/...` shape. Parse `spcOid`,
+   `dbOid` and `relNode` out of the deeper path (version dir skipped)
+   and key the `CatalogMap` on the full rfn per §0 — the catalog seed
+   already records resolved physical tablespaces, so lookups compare
+   directly
 2. Confirm the BASE_BACKUP actually ships non-default tablespace
    contents in the stream walshadow consumes. In `BASE_BACKUP`,
    each tablespace is a separate tar with its own root; the source
@@ -138,16 +150,15 @@ covered by the catalog generation bump (overview pitfall 5,
 ## 3. Tablespace as an emitter-visible attribute
 
 [DESTINATIONS.md](DESTINATIONS.md) wants the tablespace of a relation
-at route time. The `RelDescriptor.rfn.spc_node` built from the catalog
-(`src/shadow_catalog.rs:1007`, `src/backfill_bootstrap.rs:312`) carries
-`pg_class.reltablespace`, which is **`0` for the database-default
-tablespace** and the real OID otherwise — distinct from the *physical*
-`spcOid` in heap WAL (always concrete). `0` is a convenient "default"
-sentinel for routing predicates. Mapping `spcOid -> spcname` for
-human-readable config uses `pg_tablespace` (already on shadow);
-`reltablespace = 0` resolves to the database's `dattablespace`. This
-resolution is the only catalog read destination routing needs;
-cache it on the `RelDescriptor` (rare-change), do not query per row.
+at route time. `RelDescriptor.rfn.spc_node` carries the *resolved
+physical* tablespace OID — the descriptor SQL
+(`src/catalog/shadow_catalog.rs`, `src/backfill/backfill_bootstrap.rs`)
+maps the `pg_class.reltablespace` 0 sentinel to the database's
+`dattablespace`, matching the concrete `spcOid` in heap WAL. A routing
+predicate wanting "is in the default tablespace" compares against
+`dattablespace` rather than testing for 0. Mapping `spcOid -> spcname`
+for human-readable config uses `pg_tablespace` (already on shadow); do
+not query per row.
 
 ## 4. Tests (this is unshippable without these)
 
@@ -161,6 +172,21 @@ cache it on the `RelDescriptor` (rare-change), do not query per row.
   shadow, assert recovery resumes (guards §2)
 - gate all three on `initdb`/`clickhouse` presence, runtime-skip
   pattern per `[[test-timeouts-stay-short]]`
+
+## 4b. Descriptor-log invariant
+
+The durable descriptor log (`src/catalog/desc_log.rs`) keys chains by
+the full physical `RelFileNode` per §0. The invariant making that
+comparison sound: every captured descriptor's `rfn.spc_node` is the
+*resolved physical* tablespace OID — the descriptor SQL maps
+`reltablespace = 0` through `pg_database.dattablespace`, and shared
+relations carry explicit `pg_global` (1664) in `pg_class` — so log keys
+and WAL locators live in the same namespace. Any new descriptor
+construction site must preserve this resolution or its entries silently
+miss every lookup. Rotation detection (`src/source/catalog_capture.rs`)
+compares full rfn for the same reason. Unit coverage: two relations
+sharing `(db, rel)` under distinct tablespaces resolve independently
+(`same_db_rel_across_tablespaces_stay_distinct`).
 
 ## 5. Multi-database adjacency (out of scope, flagged)
 
@@ -195,3 +221,10 @@ covered here.
   `XLOG_TBLSPC_CREATE` payload layout and `TABLESPACE_VERSION_DIR` differ
   by major. §2's rewriter must be version-aware, same discipline as the
   rest of the WAL parser
+- **`ALTER DATABASE ... SET TABLESPACE`** relocates every
+  `reltablespace = 0` relation, preserving relfilenumbers, with no
+  pg_class writes. Post-move WAL locators carry the new spcOid while
+  descriptor chains keep the old physical key: DML fails closed
+  (`NotCovered`), never misdecodes. Detecting a
+  `pg_database.dattablespace` change and forcing capture-all would make
+  it survivable without re-bootstrap

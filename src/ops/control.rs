@@ -26,7 +26,20 @@ pub struct Reloader {
 
 impl Reloader {
     pub async fn set_resolver(&self, r: Option<Arc<crate::config::ConfigResolver>>) {
-        *self.resolver.lock().await = r;
+        *self.resolver.lock().await = r.clone();
+        // Control socket serves before the session wires a resolver;
+        // apply/reload in that window persist fragments but republish
+        // nothing (reload() below no-ops on None). Sweep once at wiring so
+        // file state and published config converge
+        if let Some(r) = r
+            && let Err(e) = r.reload().await
+        {
+            tracing::warn!(
+                target: "walshadow::control",
+                error = %e,
+                "config sweep at resolver wiring failed",
+            );
+        }
     }
 
     /// Live reconfigure: re-read the merged config + republish. No restart.

@@ -19,7 +19,7 @@
 //!
 //! Detoast needs the column's type OID to pick `Bytea` vs `Text`. Drain
 //! calls
-//! [`ShadowCatalog::relation_at`](crate::catalog::shadow_catalog::ShadowCatalog::relation_at)
+//! [`DescriptorLog::descriptor_at`](crate::catalog::desc_log::DescriptorLog::descriptor_at)
 //! per heap needing detoast; the catalog's LRU covers repeat lookups so
 //! a buffer-internal cache would duplicate it.
 //!
@@ -37,7 +37,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -46,10 +46,10 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 use walrus::pg::walparser::{RelFileNode, RmId};
 
-use crate::catalog::shadow_catalog::{CatalogError, ShadowCatalog};
+use crate::catalog::desc_log::{DescriptorLog, LookupResult};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats};
 use crate::decode::heap_decoder::{
-    ColumnValue, DecodedHeap, HeapOp, ToastPointer, decode_heap_record,
+    ColumnValue, DecodedHeap, DescribedHeap, HeapOp, ToastPointer, decode_heap_record,
 };
 #[cfg(test)]
 use crate::decode::wal_xact::{
@@ -60,7 +60,7 @@ use crate::emit::ch_emitter::EmitterStats;
 use crate::ops::trace::{InflightSnapshotEntry, TxnSpanRegistry, new_txn_span};
 use crate::record::{Record, RecordSink, Route, SinkError};
 use crate::runtime_config::{ConfigEvent, ConfigTableKind};
-use crate::schema::{RelDescriptor, SchemaEvent, SchemaEventRx};
+use crate::schema::{RelDescriptor, SchemaEvent};
 use crate::toast::{
     Body, ChunkRefMap, FetchedValue, ToastResolver, ToastRowRef, ToastValueError, ValueRef,
     check_value_caps, detoasted_value, finish_value, pointer_extsize,
@@ -71,56 +71,6 @@ use crate::xact::spill::{
 };
 
 use std::pin::Pin;
-
-/// Epoch-invalidated `RelFileNode` memo shared by drain and decode paths
-pub struct RelCache<V> {
-    epoch: Option<Arc<AtomicU64>>,
-    seen_epoch: u64,
-    map: HashMap<RelFileNode, V>,
-}
-
-impl<V> RelCache<V> {
-    pub fn new(epoch: Option<Arc<AtomicU64>>) -> Self {
-        let seen_epoch = epoch
-            .as_ref()
-            .map(|e| e.load(Ordering::Acquire))
-            .unwrap_or(0);
-        Self {
-            epoch,
-            seen_epoch,
-            map: HashMap::new(),
-        }
-    }
-
-    pub fn refresh(&mut self) {
-        if let Some(e) = &self.epoch {
-            let cur = e.load(Ordering::Acquire);
-            if cur != self.seen_epoch {
-                self.seen_epoch = cur;
-                self.map.clear();
-            }
-        }
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.epoch.is_some()
-    }
-
-    pub fn get(&self, rfn: RelFileNode) -> Option<&V> {
-        self.map.get(&rfn)
-    }
-
-    pub fn entry(
-        &mut self,
-        rfn: RelFileNode,
-    ) -> std::collections::hash_map::Entry<'_, RelFileNode, V> {
-        self.map.entry(rfn)
-    }
-
-    pub fn insert(&mut self, rfn: RelFileNode, value: V) {
-        self.map.insert(rfn, value);
-    }
-}
 
 /// Matches PG `logical_decoding_work_mem` default 64 MiB
 /// (`src/backend/utils/misc/guc_tables.c`)
@@ -192,7 +142,7 @@ impl SubxactTracker {
 /// `source_lsn` is the WAL LSN stamped at decode; merge-drain orders by it
 fn entry_lsn(e: &SpillEntry) -> u64 {
     match e {
-        SpillEntry::Heap(h) => h.source_lsn,
+        SpillEntry::Heap(h) => h.decoded.source_lsn,
         SpillEntry::Chunk(c) => c.source_lsn,
         SpillEntry::ToastDelete(d) => d.source_lsn,
         SpillEntry::Raw(r) => r.source_lsn,
@@ -240,10 +190,16 @@ impl XactBufferConfig {
 pub enum XactBufferError {
     #[error("spill: {0}")]
     Spill(#[from] SpillError),
-    #[error("catalog: {0}")]
-    Catalog(#[from] CatalogError),
     #[error("observer: {0}")]
     Observer(String),
+    /// Descriptor log answered anything but Present for a heap that already
+    /// decoded once against a covered descriptor — coverage bug, fail closed
+    #[error("descriptor for {rfn:?} at {lsn:#X} not covered: {got}")]
+    DescriptorNotCovered {
+        rfn: RelFileNode,
+        lsn: u64,
+        got: String,
+    },
     #[error("toast chunk for value_id={value_id} on rel={toast_relid} missing seq {missing}")]
     MissingToastChunk {
         toast_relid: u32,
@@ -268,6 +224,63 @@ pub enum XactBufferError {
         "toast generation for rel {relid} observed without XLOG_SMGR_CREATE marker; fresh snapshot required"
     )]
     IncompleteToastGeneration { relid: u32 },
+    /// Ordinary stash record refused decode (operation policy). Fatal at
+    /// drain: dropping it would lose user rows, the exact class raw decode
+    /// exists to kill
+    #[error("ordinary raw decode for rel {relid} at {lsn:#X} failed closed: {reason}")]
+    OrdinaryFailClosed {
+        relid: u32,
+        lsn: u64,
+        reason: FailClosedReason,
+    },
+    /// Stashed filenode resolved inside a recorded ambiguity interval: no
+    /// descriptor proven safe for its rows, neither decode nor discard is
+    /// sound. Fail closed; operator takes a fresh snapshot
+    #[error("stash for filenode {rel_node} ambiguous at {lsn:#X}: {reason:?}")]
+    StashAmbiguous {
+        rel_node: u32,
+        lsn: u64,
+        reason: crate::catalog::desc_log::AmbiguityReason,
+    },
+    /// Merged entry carries a writer xid outside the owning xact +
+    /// subxacts: spill corruption or buffer-key drift. Fail closed before
+    /// a foreign row can emit under this commit
+    #[error("drained heap xid {xid} outside owning xact {top}")]
+    ForeignXid { xid: u32, top: u32 },
+}
+
+/// Operation-policy verdict for ordinary raw decode
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailClosedReason {
+    /// Tuple bytes live only in the block image: FPI without block data, or
+    /// MULTI_INSERT lacking `XLH_INSERT_CONTAINS_NEW_TUPLE`. wal_level=logical
+    /// retains registered data through FPIs (`REGBUF_KEEP_DATA`), so logical
+    /// COPY never lands here regardless of checkpoint timing
+    ImageOnly,
+    /// Byte-level decode failure, carries decoder detail
+    Malformed(String),
+    /// Operation mutates user rows with no supported decode shape; unknown
+    /// resource managers land here too
+    UnsupportedOperation,
+    /// UPDATE new-tuple prefix/suffix elision references a predecessor image
+    /// raw decode cannot reconstruct; PG only elides below wal_level=logical
+    /// (`log_heap_update`, PG src/backend/access/heap/heapam.c)
+    PartialUpdate,
+}
+
+impl std::fmt::Display for FailClosedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ImageOnly => f.write_str("image-only operation"),
+            Self::Malformed(detail) => write!(f, "malformed payload: {detail}"),
+            Self::UnsupportedOperation => {
+                f.write_str("unsupported operation with user-row effects")
+            }
+            Self::PartialUpdate => {
+                f.write_str("partial update without reconstructable predecessor")
+            }
+        }
+    }
 }
 
 impl From<ToastValueError> for XactBufferError {
@@ -314,6 +327,10 @@ pub struct XactBufferStats {
     /// manifest `drain` role, monotonic. The durable-ack sibling lives in
     /// the pipeline ack collector, not here
     pub drain_lsn: u64,
+    /// Cumulative raw-stash payload bytes by first landing; eviction moving
+    /// a memory-resident entry to spill does not re-count
+    pub raw_stash_bytes_mem: u64,
+    pub raw_stash_bytes_spill: u64,
 }
 
 impl XactBufferStats {
@@ -413,11 +430,13 @@ impl XactState {
 fn approximate_size(entry: &SpillEntry) -> usize {
     match entry {
         SpillEntry::Heap(h) => {
-            let mut sz = std::mem::size_of::<DecodedHeap>();
-            if let Some(t) = &h.new {
+            // size_of::<DescribedHeap> counts the retained descriptor Arc +
+            // span key (contents shared, not per-row)
+            let mut sz = std::mem::size_of::<DescribedHeap>();
+            if let Some(t) = &h.decoded.new {
                 sz += tuple_size(t);
             }
-            if let Some(t) = &h.old {
+            if let Some(t) = &h.decoded.old {
                 sz += tuple_size(t);
             }
             sz
@@ -491,9 +510,10 @@ const MARKER_CAP: usize = 65536;
 pub enum StashOutcome {
     /// Resolved toast heap: decode stashed records at drain
     Toast(Arc<RelDescriptor>),
-    /// Resolved ordinary heap/index: decode stays fenced off (lower-bound
-    /// `relation_at` can return a later same-filenode shape), counted
-    Skip,
+    /// Resolved ordinary heap: decode stashed records to rows at drain via
+    /// the merge's pending queue. Carries commit-resolution descriptor +
+    /// its interval's valid_from
+    Ordinary(Arc<RelDescriptor>, u64),
 }
 
 /// Resolution map for a finishing tree; filenodes absent from `outcomes`
@@ -504,19 +524,18 @@ pub struct StashResolution {
     stats: Option<Arc<EmitterStats>>,
 }
 
-/// Resolve the finishing tree's stashed filenodes with
-/// `relation_at(rfn, commit_lsn)` (replay-gated so shadow reflects the
-/// commit), install outcomes for the imminent drain, and queue `O - B`
-/// barriers for marker-proven toast generations. A toast heap without its
-/// marker fails closed ([`XactBufferError::IncompleteToastGeneration`]).
-/// Callers drain the catalog's schema-event channel afterwards:
-/// resolution can surface `Added` for newly visible rels.
+/// Resolve the finishing tree's stashed filenodes against the descriptor
+/// log at the commit's `next_lsn` (capture ran inside the boundary hold, so
+/// same-xact CREATE/rewrite descriptors are already covered), install
+/// outcomes for the imminent drain, and queue `O - B` barriers for
+/// marker-proven toast generations. A toast heap without its marker fails
+/// closed ([`XactBufferError::IncompleteToastGeneration`]).
 pub async fn resolve_stash(
     buffer: &Arc<Mutex<XactBuffer>>,
-    catalog: &Arc<Mutex<ShadowCatalog>>,
+    log: &DescriptorLog,
     top_xid: u32,
     subxids: &[u32],
-    commit_lsn: u64,
+    next_lsn: u64,
     stats: Arc<EmitterStats>,
 ) -> std::result::Result<(), XactBufferError> {
     let rfns = {
@@ -532,12 +551,8 @@ pub async fn resolve_stash(
     let mut outcomes: HashMap<RelFileNode, StashOutcome> = HashMap::new();
     let mut barriers: Vec<(u32, u64)> = Vec::new();
     for rfn in &rfns {
-        let resolved = {
-            let mut cat = catalog.lock().await;
-            cat.relation_at(*rfn, commit_lsn).await
-        };
-        match resolved {
-            Ok(rel) if rel.kind == 't' => {
+        match log.descriptor_at_spanned(*rfn, next_lsn) {
+            Ok((rel, _)) if rel.kind == 't' => {
                 let marker = buffer.lock().await.marker_lsn(*rfn);
                 let Some(marker_lsn) = marker else {
                     return Err(XactBufferError::IncompleteToastGeneration { relid: rel.oid });
@@ -545,18 +560,37 @@ pub async fn resolve_stash(
                 barriers.push((rel.oid, marker_lsn));
                 outcomes.insert(*rfn, StashOutcome::Toast(rel));
             }
-            Ok(_) => {
-                outcomes.insert(*rfn, StashOutcome::Skip);
+            Ok((rel, valid_from)) => {
+                outcomes.insert(*rfn, StashOutcome::Ordinary(rel, valid_from));
             }
-            // Dropped or rotated away by this xid or a later commit already
-            // replayed; AEL supersession makes the discard end-state-neutral
-            Err(CatalogError::NotFoundByFilenode(_)) | Err(CatalogError::ForeignDatabase(_)) => {}
-            Err(e) => return Err(e.into()),
+            // No descriptor proven safe for the stashed rows; dropping them
+            // would be silent row loss, decoding them a corruption risk
+            Err(LookupResult::Ambiguous(a)) => {
+                return Err(XactBufferError::StashAmbiguous {
+                    rel_node: rfn.rel_node,
+                    lsn: next_lsn,
+                    reason: a.reason,
+                });
+            }
+            // Dropped / rotated away by this xid or a later covered commit;
+            // AEL supersession makes the discard end-state-neutral.
+            // NotCovered = rel never reached the log: born + gone inside
+            // this xact's family (capture tombstones only predecessors, a
+            // commit-time survivor would be Present), so no surviving rows
+            Err(LookupResult::Dropped | LookupResult::Retired | LookupResult::NotCovered) => {}
+            // Foreign db never stashes rows worth keeping; counted
+            // cluster-level, once per filenode
+            Err(LookupResult::ForeignDb) => {
+                stats
+                    .stash_foreign_db_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(LookupResult::Present(_)) => unreachable!("spanned lookup returns Present as Ok"),
         }
     }
     let mut buf = buffer.lock().await;
     for (toast_relid, marker_lsn) in barriers {
-        buf.on_toast_barrier(top_xid, commit_lsn, toast_relid, marker_lsn);
+        buf.on_toast_barrier(top_xid, next_lsn, toast_relid, marker_lsn);
     }
     buf.forget_markers(&rfns);
     buf.install_stash_resolution(
@@ -612,6 +646,10 @@ pub struct XactBuffer {
     drain_row_resident: Arc<AtomicU64>,
     /// Bytes in transaction body spool files (disk, not resident)
     toast_spool_bytes: Arc<AtomicU64>,
+    /// Raw-decoded heaps queued for pending-first yield
+    /// (`raw_pending_rows` / `raw_pending_bytes` gauges)
+    raw_pending_rows: Arc<AtomicU64>,
+    raw_pending_bytes: Arc<AtomicU64>,
 }
 
 impl XactBuffer {
@@ -634,6 +672,8 @@ impl XactBuffer {
             drain_chunk_resident: Arc::new(AtomicU64::new(0)),
             drain_row_resident: Arc::new(AtomicU64::new(0)),
             toast_spool_bytes: Arc::new(AtomicU64::new(0)),
+            raw_pending_rows: Arc::new(AtomicU64::new(0)),
+            raw_pending_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -661,6 +701,15 @@ impl XactBuffer {
         self.toast_spool_bytes.load(Ordering::Relaxed)
     }
 
+    /// Raw-decoded heaps awaiting pending-first yield; `0` outside a drain
+    pub fn raw_pending_rows(&self) -> u64 {
+        self.raw_pending_rows.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_pending_bytes(&self) -> u64 {
+        self.raw_pending_bytes.load(Ordering::Relaxed)
+    }
+
     /// Monotonic high-water mark of [`Self::drain_resident_bytes`]. For a
     /// spilled xact this stays near merge-heads + chunk bytes, far below the
     /// xact's decoded size — the drain-streaming bound.
@@ -677,10 +726,18 @@ impl XactBuffer {
     /// Clear leftover spill files from a prior crash. Cursor file
     /// guarantees on-disk state was either drained-to-CH or
     /// replayable from `decoder_lsn`, so the spill dir is always
-    /// safe to wipe at startup. Caller invokes once before any `on_*`.
+    /// safe to wipe at startup. Plan-spool leftovers share the dir and the
+    /// same replayability argument. Caller invokes once before any `on_*`.
     pub async fn clear_spill_dir(&self) -> std::result::Result<(), XactBufferError> {
         self.store.clear().await?;
+        crate::emit::pipeline::plan_spool::clean_plan_files(self.store.dir())
+            .map_err(SpillError::from)?;
         Ok(())
+    }
+
+    /// Transient-state directory shared by spill and plan files
+    pub fn spill_dir(&self) -> &Path {
+        self.store.dir()
     }
 
     pub fn stats(&self) -> &XactBufferStats {
@@ -703,8 +760,8 @@ impl XactBuffer {
                     match e {
                         SpillEntry::Heap(h) => {
                             heap_count += 1;
-                            last_lsn = last_lsn.max(h.source_lsn);
-                            rels.insert((h.rfn.db_node, h.rfn.rel_node));
+                            last_lsn = last_lsn.max(h.decoded.source_lsn);
+                            rels.insert((h.decoded.rfn.db_node, h.decoded.rfn.rel_node));
                         }
                         SpillEntry::Chunk(c) => {
                             chunk_count += 1;
@@ -750,15 +807,15 @@ impl XactBuffer {
         out
     }
 
-    /// Detoast descriptor is fetched in [`detoast_heap`] after drain:
-    /// no per-xact rel cache here, catalog's LRU covers repeat lookups
+    /// Envelope retains the decode-time descriptor through buffer/spill;
+    /// detoast and routing read it attached, never a live lookup
     pub async fn on_heap(
         &mut self,
-        decoded: DecodedHeap,
+        described: DescribedHeap,
     ) -> std::result::Result<(), XactBufferError> {
-        let xid = decoded.xid;
-        let first_lsn = decoded.source_lsn;
-        let entry = SpillEntry::Heap(Box::new(decoded));
+        let xid = described.decoded.xid;
+        let first_lsn = described.decoded.source_lsn;
+        let entry = SpillEntry::Heap(Box::new(described));
         self.absorb(xid, first_lsn, entry).await
     }
 
@@ -934,6 +991,7 @@ impl XactBuffer {
         entry: SpillEntry,
     ) -> std::result::Result<(), XactBufferError> {
         let sz = approximate_size(&entry);
+        let raw_sz = matches!(&entry, SpillEntry::Raw(_)).then_some(sz as u64);
         let st = self.state_for(xid, first_lsn);
         if let Some(spill) = st.spill.as_mut() {
             // Already spilling: append straight to disk
@@ -941,10 +999,12 @@ impl XactBuffer {
             let bc = spill.byte_count();
             let prev = std::mem::replace(&mut st.spill_bytes, bc);
             self.stats.spill_bytes_active += bc - prev;
+            self.stats.raw_stash_bytes_spill += raw_sz.unwrap_or(0);
         } else {
             st.in_mem.push(entry);
             st.in_mem_bytes += sz;
             self.bytes_in_memory += sz;
+            self.stats.raw_stash_bytes_mem += raw_sz.unwrap_or(0);
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
         self.maybe_evict().await?;
@@ -1007,6 +1067,7 @@ impl XactBuffer {
         // created once memory-held chunk bytes cross `toast_body_mem_max`
         top_xid: u32,
         commit_lsn: u64,
+        allowed_xids: std::collections::HashSet<u32>,
     ) -> std::result::Result<MergedDrain, XactBufferError> {
         let mut gauge = self.drain_gauge(&self.drain_head_resident);
         let mut sources = Vec::with_capacity(states.len());
@@ -1024,13 +1085,19 @@ impl XactBuffer {
             };
             let in_mem = std::mem::take(&mut st.in_mem);
             sources.push(MergeSource::open(reader, in_mem, &mut gauge).await?);
-            // Arrival order == WAL order: decoder sink pushes on observe,
-            // so the Vec is already source_lsn ASC
-            events.push(std::mem::take(&mut st.events).into());
+            // Two producers push events: the worker at observe order and
+            // the pump at capture time keyed bias-early valid_from — LSN
+            // order is not arrival order. Stable sort keeps same-LSN
+            // arrival order (Added before dependent Changed)
+            let mut evs = std::mem::take(&mut st.events);
+            evs.sort_by_key(|(lsn, _)| *lsn);
+            events.push(evs.into());
         }
         Ok(MergedDrain {
             sources,
             events,
+            allowed_xids,
+            pending_heaps: VecDeque::new(),
             chunks: ChunkRefMap::new(),
             chunk_bytes: 0,
             collect_rows,
@@ -1040,6 +1107,12 @@ impl XactBuffer {
             gauge,
             chunk_gauge: self.drain_gauge(&self.drain_chunk_resident),
             row_gauge: self.drain_gauge(&self.drain_row_resident),
+            pending_gauge: PendingGauge {
+                rows: self.raw_pending_rows.clone(),
+                bytes: self.raw_pending_bytes.clone(),
+                held_rows: 0,
+                held_bytes: 0,
+            },
             spool: None,
             spool_dir: self.store.dir().to_path_buf(),
             spool_xid: top_xid,
@@ -1107,8 +1180,16 @@ impl XactBuffer {
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
         let stash = self.pending_stash.remove(&top_xid).unwrap_or_default();
+        let allowed_xids = xids.iter().copied().collect();
         let merged = self
-            .open_drain(states, collect_rows, stash, top_xid, commit_lsn)
+            .open_drain(
+                states,
+                collect_rows,
+                stash,
+                top_xid,
+                commit_lsn,
+                allowed_xids,
+            )
             .await?;
         self.stats.committed_xacts_total += 1;
         Ok(CommittedDrain {
@@ -1254,6 +1335,39 @@ impl Drop for ResidentGauge {
     }
 }
 
+/// Pending-queue share of the raw fanout gauges; drop releases whatever
+/// an abandoned drain still held
+struct PendingGauge {
+    rows: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+    held_rows: u64,
+    held_bytes: u64,
+}
+
+impl PendingGauge {
+    fn add(&mut self, bytes: usize) {
+        self.held_rows += 1;
+        self.held_bytes += bytes as u64;
+        self.rows.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn sub(&mut self, bytes: usize) {
+        let bytes = (bytes as u64).min(self.held_bytes);
+        self.held_rows = self.held_rows.saturating_sub(1);
+        self.held_bytes -= bytes;
+        self.rows.fetch_sub(1, Ordering::Relaxed);
+        self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for PendingGauge {
+    fn drop(&mut self) {
+        self.rows.fetch_sub(self.held_rows, Ordering::Relaxed);
+        self.bytes.fetch_sub(self.held_bytes, Ordering::Relaxed);
+    }
+}
+
 /// Lazy merge source for one xid: spill-reader head (older in WAL order)
 /// chained with the in-mem tail, one decoded entry resident. `pop` refills
 /// from the reader until EOF, then drains `in_mem`. The EOF reader parks in
@@ -1320,7 +1434,7 @@ impl MergeSource {
 }
 
 enum MergeItem {
-    Heap(Box<DecodedHeap>),
+    Heap(Box<DescribedHeap>),
     Event(DrainEntry),
 }
 
@@ -1349,6 +1463,12 @@ enum MergeItem {
 struct MergedDrain {
     sources: Vec<MergeSource>,
     events: Vec<VecDeque<(u64, DrainEntry)>>,
+    /// Heaps decoded from one raw record (MULTI_INSERT fans one record out
+    /// to N tuples), yielded in tuple order before the merge advances past
+    /// the record's LSN. Event-first tie break is preserved: every event at
+    /// `lsn <= L` drained before the raw at `L` was popped. Queued bytes
+    /// charge `gauge`, released as each heap yields
+    pending_heaps: VecDeque<Box<DescribedHeap>>,
     /// Live (unsealed) generation
     chunks: ChunkRefMap,
     chunk_bytes: usize,
@@ -1358,6 +1478,10 @@ struct MergedDrain {
     row_bytes: usize,
     /// Commit-time verdicts for stashed filenodes; empty when nothing stashed
     stash: StashResolution,
+    /// Owning xact + subxacts: every yielded heap's writer xid must be a
+    /// member (spec validation "decoded xid matches owning xact/subxact");
+    /// a stranger means spill corruption or buffer-key drift, fail closed
+    allowed_xids: std::collections::HashSet<u32>,
     /// Merge heads + in-mem tail
     gauge: ResidentGauge,
     /// Unsealed chunk map (memory bodies + ref metadata, never file
@@ -1365,6 +1489,9 @@ struct MergedDrain {
     chunk_gauge: ResidentGauge,
     /// Collected mirror rows; shares split off with each taken batch
     row_gauge: ResidentGauge,
+    /// Pending-queue view for the `raw_pending_*` gauges; queued bytes
+    /// still charge `gauge` for resident accounting
+    pending_gauge: PendingGauge,
     /// Lazily created at threshold crossing; None while memory-resident
     spool: Option<BodySpoolWriter>,
     spool_dir: PathBuf,
@@ -1384,6 +1511,15 @@ struct MergedDrain {
 impl MergedDrain {
     async fn next(&mut self) -> std::result::Result<Option<MergeItem>, XactBufferError> {
         loop {
+            // Pending head first: a raw record's fanned-out tuples all yield
+            // before any source or event past its LSN is considered
+            if let Some(h) = self.pending_heaps.pop_front() {
+                let sz = h.approx_bytes();
+                self.gauge.sub(sz);
+                self.pending_gauge.sub(sz);
+                self.check_owned(h.decoded.xid)?;
+                return Ok(Some(MergeItem::Heap(h)));
+            }
             enum Pick {
                 Data(usize),
                 Event(usize),
@@ -1417,7 +1553,10 @@ impl MergedDrain {
                         .await?
                         .expect("just peeked head");
                     match entry {
-                        SpillEntry::Heap(h) => return Ok(Some(MergeItem::Heap(h))),
+                        SpillEntry::Heap(h) => {
+                            self.check_owned(h.decoded.xid)?;
+                            return Ok(Some(MergeItem::Heap(h)));
+                        }
                         SpillEntry::Chunk(c) => self.fold_chunk(c)?,
                         SpillEntry::ToastDelete(d) => self.fold_delete(d)?,
                         SpillEntry::Raw(raw) => self.fold_raw(&raw)?,
@@ -1425,6 +1564,16 @@ impl MergedDrain {
                 }
             }
         }
+    }
+
+    fn check_owned(&self, xid: u32) -> std::result::Result<(), XactBufferError> {
+        if self.allowed_xids.contains(&xid) {
+            return Ok(());
+        }
+        Err(XactBufferError::ForeignXid {
+            xid,
+            top: self.spool_xid,
+        })
     }
 
     /// Cap resident ref metadata before allocating more; typed
@@ -1504,8 +1653,9 @@ impl MergedDrain {
 
     /// Decode a stashed record against its commit-time verdict: toast heaps
     /// fold chunks/tombstones into the same maps as live-path entries (so
-    /// same-xact referrers detoast and mirror rows flow), fenced heaps and
-    /// unresolvable filenodes count and drop
+    /// same-xact referrers detoast and mirror rows flow), ordinary heaps
+    /// fan out rows through the pending queue, unresolvable filenodes
+    /// (end-state-neutral verdicts only) count and drop
     fn fold_raw(&mut self, raw: &RawRecord) -> std::result::Result<(), XactBufferError> {
         let Some(rfn) = raw.rfn() else {
             return Ok(());
@@ -1517,9 +1667,9 @@ impl MergedDrain {
         };
         let rel = match self.stash.outcomes.get(&rfn) {
             Some(StashOutcome::Toast(rel)) => rel.clone(),
-            Some(StashOutcome::Skip) => {
-                bump(&|s| &s.toast_stash_skipped);
-                return Ok(());
+            Some(StashOutcome::Ordinary(rel, valid_from)) => {
+                let (rel, valid_from) = (rel.clone(), *valid_from);
+                return self.fold_raw_ordinary(raw, rel, valid_from);
             }
             None => {
                 bump(&|s| &s.toast_stash_discarded);
@@ -1527,11 +1677,111 @@ impl MergedDrain {
             }
         };
         bump(&|s| &s.toast_stash_decoded);
-        for op in decode_stashed_toast(raw, &rel)? {
+        let ops = decode_stashed_toast(raw, &rel)?;
+        if let Some(s) = &self.stash.stats {
+            s.raw_decode_toast_ops.bump(raw.rm, raw.info);
+            s.raw_decode_rows_ops
+                .add(raw.rm, raw.info, ops.len() as u64);
+        }
+        for op in ops {
             match op {
                 StashedToastOp::Chunk(c) => self.fold_chunk(c)?,
                 StashedToastOp::Delete(d) => self.fold_delete(d)?,
             }
+        }
+        Ok(())
+    }
+
+    /// Decode one ordinary raw record to zero or more heaps in tuple order,
+    /// queued for pending-first yield so a MULTI_INSERT's whole fanout
+    /// precedes anything past the record's LSN. Rebuilt header carries the
+    /// writer xid, so decoded heaps keep the source `_xid`.
+    ///
+    /// Operation policy: admit only shapes whose logical content is provably
+    /// whole in the record, skip page maintenance, fail closed on anything
+    /// else — silent skip here is the row-loss class raw decode exists to
+    /// kill
+    fn fold_raw_ordinary(
+        &mut self,
+        raw: &RawRecord,
+        rel: Arc<RelDescriptor>,
+        valid_from: u64,
+    ) -> std::result::Result<(), XactBufferError> {
+        use crate::decode::heap_decoder::{
+            XLH_INSERT_CONTAINS_NEW_TUPLE, XLOG_HEAP_CONFIRM, XLOG_HEAP_DELETE,
+            XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT, XLOG_HEAP_LOCK, XLOG_HEAP_OPMASK,
+            XLOG_HEAP_UPDATE, XLOG_HEAP2_MULTI_INSERT,
+        };
+        let fail = |reason: FailClosedReason| XactBufferError::OrdinaryFailClosed {
+            relid: rel.oid,
+            lsn: raw.source_lsn,
+            reason,
+        };
+        let rec = raw.to_xlog_record();
+        // FPI consumed the registered tuple data; wal_level=logical retains
+        // it (REGBUF_KEEP_DATA), so this means a non-logical writer
+        let image_only = rec
+            .blocks
+            .first()
+            .is_some_and(|b| b.header.has_image() && !b.header.has_data());
+        let op = raw.info & XLOG_HEAP_OPMASK;
+        if raw.rm == RmId::Heap as u8 {
+            match op {
+                XLOG_HEAP_INSERT | XLOG_HEAP_UPDATE | XLOG_HEAP_HOT_UPDATE if image_only => {
+                    return Err(fail(FailClosedReason::ImageOnly));
+                }
+                // DELETE carries its whole payload in main_data
+                XLOG_HEAP_INSERT | XLOG_HEAP_UPDATE | XLOG_HEAP_HOT_UPDATE | XLOG_HEAP_DELETE => {}
+                // LOCK changes no row; CONFIRM finalizes a speculative
+                // insert whose tuple decoded from its own record
+                XLOG_HEAP_LOCK | XLOG_HEAP_CONFIRM => return Ok(()),
+                // TRUNCATE intercepts at the sink, INPLACE never targets
+                // ordinary heaps: reaching either breaks the verdict
+                _ => return Err(fail(FailClosedReason::UnsupportedOperation)),
+            }
+        } else if raw.rm == RmId::Heap2 as u8 {
+            if op != XLOG_HEAP2_MULTI_INSERT {
+                // PRUNE/VACUUM/FREEZE/VISIBLE/LOCK_UPDATED/NEW_CID/REWRITE:
+                // page maintenance, no logical row change
+                return Ok(());
+            }
+            // Absent flag means a sub-logical wal_level wrote the record and
+            // an FPI may have consumed its tuple data
+            if image_only
+                || rec
+                    .main_data
+                    .first()
+                    .is_some_and(|f| f & XLH_INSERT_CONTAINS_NEW_TUPLE == 0)
+            {
+                return Err(fail(FailClosedReason::ImageOnly));
+            }
+        } else {
+            // Sink stashes heap/heap2 only; anything else broke that invariant
+            return Err(fail(FailClosedReason::UnsupportedOperation));
+        }
+        let decoded_set = decode_heap_record(&rec, raw.source_lsn, &rel)
+            .map_err(|e| fail(FailClosedReason::Malformed(e.to_string())))?;
+        if let Some(s) = &self.stash.stats {
+            s.raw_decode_ordinary_ops.bump(raw.rm, raw.info);
+            s.raw_decode_rows_ops
+                .add(raw.rm, raw.info, decoded_set.len() as u64);
+        }
+        for decoded in decoded_set {
+            // New-tuple prefix/suffix elision references a same-page
+            // predecessor image this path cannot reconstruct. Replident-shaped
+            // old keys keep live-path semantics
+            if decoded.new.as_ref().is_some_and(|t| t.partial) {
+                return Err(fail(FailClosedReason::PartialUpdate));
+            }
+            let heap = DescribedHeap {
+                decoded,
+                descriptor: rel.clone(),
+                descriptor_valid_from: valid_from,
+            };
+            let sz = heap.approx_bytes();
+            self.gauge.add(sz);
+            self.pending_gauge.add(sz);
+            self.pending_heaps.push_back(Box::new(heap));
         }
         Ok(())
     }
@@ -1680,7 +1930,7 @@ pub struct OrderedEvent {
 /// slice a barrier the reorder coordinator serializes against ClickHouse.
 pub struct DrainedBatch {
     /// `source_lsn` ASC within the slice; later slices strictly follow.
-    pub heaps: Vec<DecodedHeap>,
+    pub heaps: Vec<DescribedHeap>,
     pub ordered_events: Vec<OrderedEvent>,
     /// Chunk generations sealed so far, oldest first. A chunk's WAL position
     /// precedes its referrer, so every heap's value lives in exactly one
@@ -1706,8 +1956,8 @@ pub enum WalkStep {
         upto: usize,
     },
     Event(DrainEntry),
-    Truncate(DecodedHeap),
-    Heap(DecodedHeap),
+    Truncate(DescribedHeap),
+    Heap(DescribedHeap),
 }
 
 /// [`DrainedBatch`] decomposed into its apply plan plus the payload fields
@@ -1743,7 +1993,7 @@ impl DrainedBatch {
                 steps.push(WalkStep::Rows { upto: e.row_idx });
                 steps.push(WalkStep::Event(e.event));
             }
-            if matches!(heap.op, HeapOp::Truncate) {
+            if matches!(heap.decoded.op, HeapOp::Truncate) {
                 let upto = trunc
                     .next()
                     .expect("truncate_rows cursor per Truncate heap");
@@ -1795,7 +2045,7 @@ impl CommittedDrain {
         let Some(m) = self.merged.as_mut() else {
             return Ok(None);
         };
-        let mut heaps: Vec<DecodedHeap> = Vec::new();
+        let mut heaps: Vec<DescribedHeap> = Vec::new();
         let mut ordered_events: Vec<OrderedEvent> = Vec::new();
         let mut truncate_rows: Vec<usize> = Vec::new();
         let mut bytes = 0usize;
@@ -1808,7 +2058,7 @@ impl CommittedDrain {
                     event,
                 }),
                 Some(MergeItem::Heap(h)) => {
-                    if h.op == HeapOp::Truncate {
+                    if h.decoded.op == HeapOp::Truncate {
                         truncate_rows.push(m.rows.len());
                     }
                     bytes += h.approx_bytes();
@@ -1856,24 +2106,18 @@ impl CommittedDrain {
 /// this call. `None` without budget or external values.
 /// Pub for the decode pool, gap replay, and tests.
 pub async fn detoast_heap(
-    heap: &mut DecodedHeap,
+    heap: &mut DescribedHeap,
     // Xact body spool backing `File` refs; None while memory-resident
     spool: Option<&BodySpoolFile>,
     // Ref-map generations, oldest first; a value lives in exactly one
     // (live map on the serial path, sealed drain-batch generations on the
     // parallel path)
     chunk_maps: &[&ChunkRefMap],
-    catalog: &Arc<Mutex<ShadowCatalog>>,
-    // Async decode pool can lag past a DDL and re-resolve an older heap,
-    // so it reuses the inline cached descriptor without mutating cache or
-    // emitting events (`ShadowCatalog::relation_at_pooled`). WAL-ordered
-    // observer drain passes `false` for the normal cache-populating path.
-    pooled: bool,
     resolver: &ToastResolver,
 ) -> std::result::Result<Option<crate::budget::MemoryPermit>, XactBufferError> {
     let mut pointers: Vec<ToastPointer> = Vec::new();
-    collect_toast_pointers(heap.new.as_ref(), &mut pointers);
-    collect_toast_pointers(heap.old.as_ref(), &mut pointers);
+    collect_toast_pointers(heap.decoded.new.as_ref(), &mut pointers);
+    collect_toast_pointers(heap.decoded.old.as_ref(), &mut pointers);
     if pointers.is_empty() {
         return Ok(None);
     }
@@ -1885,14 +2129,9 @@ pub async fn detoast_heap(
         Some(b) => Some(b.acquire(leaf_need).await),
         None => None,
     };
-    let rel: Arc<RelDescriptor> = {
-        let mut cat = catalog.lock().await;
-        if pooled {
-            cat.relation_at_pooled(heap.rfn, heap.source_lsn).await?
-        } else {
-            cat.relation_at(heap.rfn, heap.source_lsn).await?
-        }
-    };
+    // Attached at decode: same descriptor interpretation from decode to
+    // detoast regardless of captures landing in between
+    let rel = heap.descriptor.clone();
     let mut uses: HashMap<(u32, u32), u32> = HashMap::new();
     for p in &pointers {
         *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
@@ -1901,15 +2140,15 @@ pub async fn detoast_heap(
         spool,
         xact_maps: chunk_maps,
         resolver,
-        source_lsn: heap.source_lsn,
+        source_lsn: heap.decoded.source_lsn,
         uses,
         cache: HashMap::new(),
         retained: 0,
     };
-    if let Some(t) = heap.new.as_mut() {
+    if let Some(t) = heap.decoded.new.as_mut() {
         res.resolve_tuple(t, &rel).await?;
     }
-    if let Some(t) = heap.old.as_mut() {
+    if let Some(t) = heap.decoded.old.as_mut() {
         res.resolve_tuple(t, &rel).await?;
     }
     if let Some(p) = leaf.as_mut() {
@@ -2143,71 +2382,28 @@ pub(crate) fn reassemble_value_ref(
 /// [`ToastChunk`]; semantic errors absorb into [`DecoderStats`] rather
 /// than poison the stream.
 pub struct BufferingDecoderSink {
-    catalog: Arc<Mutex<ShadowCatalog>>,
+    log: Arc<DescriptorLog>,
     buffer: Arc<Mutex<XactBuffer>>,
     stats: Arc<DecoderStats>,
-    /// `None` keeps the sink schema-unaware (greenfield bootstrap, tests)
-    schema_events: Option<SchemaEventRx>,
     /// `txn` span registry. When set (tracing on), the decoder parents its
-    /// per-record `catalog.gate`/`decode` spans under the xact's `txn` span
-    /// (via `decode_parent`, set only for the first record), so the
-    /// shadow-replay gate shows up nested inside the transaction's span.
-    /// `None` ⇒ those spans are skipped (no parent to attach to).
+    /// per-record `decode` spans under the xact's `txn` span (via
+    /// `decode_parent`, set only for the first record). `None` ⇒ those
+    /// spans are skipped (no parent to attach to).
     span_registry: Option<TxnSpanRegistry>,
-    /// Per-`rfn` descriptor memo (see [`RelCache`]). Lazily created on the
-    /// first lookup, since `new` can't take the async catalog lock.
-    rel_cache: Option<RelCache<Arc<RelDescriptor>>>,
-    /// Bump target for [`Record::catalog_signal`], the sole record-ordered
-    /// bump site (mapping writes + SIGHUP reload bump out-of-band). This
-    /// sink runs on the queueing worker, which can lag the pump by
-    /// thousands of records; an observe-time bump would be consumable by a
-    /// pre-DDL record's lookup, which fetches from a shadow that hasn't
-    /// replayed the DDL's commit and caches the pre-DDL descriptor as
-    /// fresh with no later bump to flush it. Bumping when the DDL record
-    /// itself passes through keeps consumption in-order: any later lookup
-    /// of the altered relation is triggered by a record past the DDL's
-    /// commit (AccessExclusive excludes interleaved rows), so its replay
-    /// gate guarantees a fresh fetch. `None` (bootstrap, tests without an
-    /// epoch) skips the bump
-    invalidation_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// [`CatalogSignal::InvalidateSweep`](crate::record::CatalogSignal::InvalidateSweep)
-    /// sibling of `invalidation_epoch`: arms `ShadowCatalog::sweep_dropped`
-    /// at worker position, keyed by the record's xid so the commit sink
-    /// consumes it only at that xact's own commit
-    pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
     /// Source-PG schema holding the `config_*` overlay tables. `Some` diverts
     /// their heap writes to `on_config_event` (never CH); `None` = overlay off.
     config_schema: Option<Arc<str>>,
 }
 
 impl BufferingDecoderSink {
-    pub fn new(catalog: Arc<Mutex<ShadowCatalog>>, buffer: Arc<Mutex<XactBuffer>>) -> Self {
+    pub fn new(log: Arc<DescriptorLog>, buffer: Arc<Mutex<XactBuffer>>) -> Self {
         Self {
-            catalog,
+            log,
             buffer,
             stats: Arc::new(DecoderStats::default()),
-            schema_events: None,
             span_registry: None,
-            rel_cache: None,
-            invalidation_epoch: None,
-            pending_sweeps: None,
             config_schema: None,
         }
-    }
-
-    /// Wire [`Record::catalog_signal`] targets: the invalidation-epoch
-    /// bump (same `Arc` as `ShadowCatalog::set_invalidation_epoch`)
-    /// and the DROP-sweep armer (same handle as the commit sink's
-    /// `with_pending_sweeps`). Production must set these whenever the
-    /// sink runs behind a `QueueingRecordSink`.
-    pub fn with_catalog_signals(
-        mut self,
-        invalidation: Arc<std::sync::atomic::AtomicU64>,
-        pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
-    ) -> Self {
-        self.invalidation_epoch = Some(invalidation);
-        self.pending_sweeps = pending_sweeps;
-        self
     }
 
     /// Names the source-PG schema whose `config_*` tables carry the runtime
@@ -2227,49 +2423,12 @@ impl BufferingDecoderSink {
         self
     }
 
-    /// Share the same `rx` with the reorder coordinator: channel drains
-    /// from both sides (decoder for Added/Changed at fetch time, reorder
-    /// for Dropped at commit via `sweep_dropped`).
-    pub fn with_schema_events(mut self, rx: SchemaEventRx) -> Self {
-        self.schema_events = Some(rx);
-        self
-    }
-
     pub fn stats(&self) -> &DecoderStats {
         &self.stats
     }
 
     pub fn stats_handle(&self) -> Arc<DecoderStats> {
         self.stats.clone()
-    }
-
-    /// Route catalog-fetch [`SchemaEvent`]s into the buffer stamped
-    /// `(xid, source_lsn)` so the commit drain sorts them with the heap
-    /// writes that triggered the refetch.
-    async fn drain_schema_events(
-        &mut self,
-        xid: u32,
-        source_lsn: u64,
-    ) -> std::result::Result<(), SinkError> {
-        let Some(rx) = self.schema_events.as_ref() else {
-            return Ok(());
-        };
-        // Heap2 VACUUM / FREEZE carry xact_id=0 (non-transactional) but
-        // still drive `relation_at`. Buffering under xid=0 creates an
-        // inflight entry that never commits, pinning `emitter_ack_lsn`
-        // behind a phantom xact; leave events for the next real-xid drain.
-        if xid == 0 {
-            return Ok(());
-        }
-        let pending = drain_pending_schema_events(rx);
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let mut buf = self.buffer.lock().await;
-        for ev in pending {
-            buf.on_schema_event(xid, source_lsn, ev);
-        }
-        Ok(())
     }
 
     /// Stash raw inputs for a record whose filenode is invisible at record
@@ -2289,10 +2448,12 @@ impl BufferingDecoderSink {
                 record.source_lsn,
                 record.page_magic,
             );
+            let (rm, info) = (raw.rm, raw.info);
             buf.stash_raw(xid, raw).await.map_err(SinkError::from)?;
             self.stats
                 .toast_stash_buffered
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.stats.raw_stash_marker_ops.bump(rm, info);
         } else {
             buf.track_unresolvable(xid, record.source_lsn, rfn);
             self.stats
@@ -2304,7 +2465,7 @@ impl BufferingDecoderSink {
 
     /// Push one `HeapOp::Truncate` per relation. TRUNCATE uniquely
     /// carries pg_class OIDs (not relfilenodes) and no block ref, so the
-    /// standard `relation_at(rfn)` path doesn't fit.
+    /// standard by-rfn lookup doesn't fit.
     async fn handle_truncate(&mut self, record: &Record<'_>) -> std::result::Result<(), SinkError> {
         let Some(parsed) =
             crate::filter::main_data::parse_xl_heap_truncate(&record.parsed.main_data)
@@ -2316,30 +2477,16 @@ impl BufferingDecoderSink {
         };
         let xid = record.parsed.header.xact_id;
         let source_lsn = record.source_lsn;
-        // Gate on shadow replaying past source_lsn so each relid's
-        // pg_class entry is fresh
-        if source_lsn > 0 {
-            let mut cat = self.catalog.lock().await;
-            cat.wait_for_replay(source_lsn)
-                .await
-                .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
-        }
         for relid in parsed.relids {
-            let rel = {
-                let mut cat = self.catalog.lock().await;
-                match cat.relation_by_oid(relid).await {
-                    Ok(r) => r,
-                    Err(CatalogError::NotFoundByOid(_)) => {
-                        self.stats
-                            .catalog_not_found
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    Err(e) => return Err(DecoderSinkError::from(e).into()),
-                }
+            // Same-xact CREATE + TRUNCATE: the rel's Added has no batch yet
+            // (capture runs at commit) → NotCovered, nothing lives to wipe
+            let Ok((rel, valid_from)) = self.log.descriptor_by_oid_at_spanned(relid, source_lsn)
+            else {
+                self.stats
+                    .catalog_not_found
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
             };
-            // relation_by_oid may emit Added/Changed if the rel rotated
-            self.drain_schema_events(xid, source_lsn).await?;
             // CH has no per-table internal toast; only user heap
             // ('r'/'p') TRUNCATE propagates
             if rel.kind != 'r' && rel.kind != 'p' {
@@ -2355,7 +2502,13 @@ impl BufferingDecoderSink {
             };
             self.stats.record(&decoded);
             let mut buf = self.buffer.lock().await;
-            buf.on_heap(decoded).await.map_err(SinkError::from)?;
+            buf.on_heap(DescribedHeap {
+                decoded,
+                descriptor: rel,
+                descriptor_valid_from: valid_from,
+            })
+            .await
+            .map_err(SinkError::from)?;
         }
         Ok(())
     }
@@ -2368,19 +2521,6 @@ impl RecordSink for BufferingDecoderSink {
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
-            // Bump before anything else so subsequent records' lookups
-            // (this record routes ToShadow, no lookups of its own) see the
-            // signal in stream order (see `invalidation_epoch` field doc)
-            if record.catalog_signal != crate::record::CatalogSignal::None {
-                if let Some(e) = &self.invalidation_epoch {
-                    e.fetch_add(1, std::sync::atomic::Ordering::Release);
-                }
-                if record.catalog_signal == crate::record::CatalogSignal::InvalidateSweep
-                    && let Some(p) = &self.pending_sweeps
-                {
-                    p.arm(record.parsed.header.xact_id);
-                }
-            }
             let rm = record.parsed.header.resource_manager_id;
             // TRUNCATE rides Route::ToShadow (shadow replays it) but the
             // decoder still fans out per-relid HeapOp::Truncate for CH.
@@ -2420,12 +2560,29 @@ impl RecordSink for BufferingDecoderSink {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(());
             };
-            // `decode_parent` set only for the first record (holds the replay
-            // gate): `catalog.gate` wraps `relation_at`, `decode` the parse.
             let txn_xid = record.parsed.header.xact_id;
+            // Catalog-dirty tree: hold raw for commit-time resolution.
+            // Unlike marker-gated stash admission below, payload is always
+            // retained — a Present predecessor descriptor doesn't prove
+            // decodability inside the dirty interval
+            if record.defer_catalog_decode && txn_xid != 0 {
+                let raw = crate::xact::spill::RawRecord::from_parsed(
+                    &record.parsed,
+                    record.source_lsn,
+                    record.page_magic,
+                );
+                let (rm, info) = (raw.rm, raw.info);
+                let mut buf = self.buffer.lock().await;
+                buf.stash_raw(txn_xid, raw).await.map_err(SinkError::from)?;
+                self.stats
+                    .raw_stash_deferred
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.stats.raw_stash_dirty_ops.bump(rm, info);
+                return Ok(());
+            }
             // Known-invisible filenode for this xact (already stashed or
             // marker-registered): its pg_class row stays MVCC-invisible
-            // until commit, so skip the replay-gated lookup per record
+            // until commit, so the log has no entry yet either
             if txn_xid != 0 && self.buffer.lock().await.is_stash_candidate(txn_xid, rfn) {
                 return self.stash_invisible(record, rfn).await;
             }
@@ -2437,72 +2594,52 @@ impl RecordSink for BufferingDecoderSink {
                 .span_registry
                 .as_ref()
                 .and_then(|r| r.decode_parent(txn_xid));
-            // A hit skips the catalog lock + `relation_at` replay gate; safe
-            // because an unchanged epoch means no DDL invalidated the descriptor.
-            let cached = self.rel_cache.as_mut().and_then(|c| {
-                c.refresh();
-                c.get(rfn).cloned()
-            });
-            let rel = if let Some(desc) = cached {
-                desc
-            } else {
-                let gate_span = decode_parent
-                    .as_ref()
-                    .map(|p| {
-                        tracing::info_span!(
-                            target: "walshadow::trace",
-                            parent: p,
-                            "catalog.gate",
-                            lsn = record.source_lsn,
-                        )
-                    })
-                    .unwrap_or_else(tracing::Span::none);
-                // Per-record sibling of `catalog.gate` for the batch view.
-                let catalog_span = trace_span!(sampled, "catalog", lsn = record.source_lsn);
-                let resolved = {
-                    let mut cat = self.catalog.lock().await;
-                    if self.rel_cache.is_none() {
-                        self.rel_cache = Some(RelCache::new(cat.invalidation_epoch_handle()));
-                    }
-                    match cat
-                        .relation_at(rfn, record.source_lsn)
-                        .instrument(gate_span)
-                        .instrument(catalog_span)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(CatalogError::NotFoundByFilenode(_)) => {
-                            // Filenode invisible at record LSN: created by
-                            // this still-open xact (same-xact CREATE /
-                            // TRUNCATE / rewrite generation) or gone
-                            drop(cat);
-                            if txn_xid == 0 {
-                                self.stats
-                                    .catalog_not_found
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                return Ok(());
-                            }
-                            return self.stash_invisible(record, rfn).await;
-                        }
-                        Err(e) => {
-                            // ReplayTimeout means shadow stalled or the wire
-                            // froze; silent skip would shed user-heap writes
-                            // invisibly. Poison the stream so the daemon exits
-                            // and the cursor resumes on next boot.
-                            return Err(DecoderSinkError::from(e).into());
-                        }
-                    }
-                };
-                if let Some(c) = self.rel_cache.as_mut()
-                    && c.enabled()
-                {
-                    c.insert(rfn, resolved.clone());
+            let _ = sampled;
+            // Wait-free interval lookup: every record reaching this worker
+            // already has log coverage (capture runs inside the boundary
+            // hold, before successor bytes publish)
+            let (rel, rel_valid_from) = match self.log.descriptor_at_spanned(rfn, record.source_lsn)
+            {
+                Ok(pair) => pair,
+                Err(LookupResult::Present(_)) => {
+                    unreachable!("spanned lookup returns Present via Ok")
                 }
-                resolved
+                // Foreign db / rel that died before the coverage horizon:
+                // counted row skip, never a stash or a fatal
+                Err(LookupResult::ForeignDb) => {
+                    self.stats
+                        .catalog_not_found
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(LookupResult::NotCovered)
+                    if record.source_lsn <= self.log.covered_through() || txn_xid == 0 =>
+                {
+                    self.stats
+                        .catalog_not_found
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+                // Filenode invisible at record LSN: created by this
+                // still-open xact (same-xact CREATE / TRUNCATE / rewrite
+                // generation) or already superseded — resolve at commit.
+                // Ambiguous defers the same way: commit-time resolution
+                // decides under the post-boundary descriptor state
+                Err(
+                    LookupResult::NotCovered | LookupResult::Dropped | LookupResult::Ambiguous(_),
+                ) => {
+                    return self.stash_invisible(record, rfn).await;
+                }
+                // Rotated away: every record on this rfn precedes the
+                // rotation (AccessExclusiveLock), so a Retired answer means
+                // the row never outlives the commit — skip
+                Err(LookupResult::Retired) => {
+                    self.stats
+                        .catalog_not_found
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
             };
-            // Empty in steady state
-            self.drain_schema_events(record.parsed.header.xact_id, record.source_lsn)
-                .await?;
             let decoded_set = {
                 let _decode = decode_parent.as_ref().map(|p| {
                     tracing::info_span!(target: "walshadow::trace", parent: p, "decode").entered()
@@ -2607,7 +2744,13 @@ impl RecordSink for BufferingDecoderSink {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     } else {
-                        buf.on_heap(decoded).await.map_err(SinkError::from)?;
+                        buf.on_heap(DescribedHeap {
+                            decoded,
+                            descriptor: rel.clone(),
+                            descriptor_valid_from: rel_valid_from,
+                        })
+                        .await
+                        .map_err(SinkError::from)?;
                     }
                 }
                 Ok::<(), SinkError>(())
@@ -2638,16 +2781,6 @@ fn toast_record_tid(record: &walrus::pg::walparser::XLogRecord) -> Option<(u32, 
     let offnum = u16::from_le_bytes(md.get(off..off + 2)?.try_into().ok()?);
     let blkno = record.blocks.first()?.header.location.block_no;
     Some((blkno, offnum))
-}
-
-/// Drain queued [`SchemaEvent`]s; channel is unbounded + same-task
-pub(crate) fn drain_pending_schema_events(rx: &SchemaEventRx) -> Vec<SchemaEvent> {
-    let mut out = Vec::new();
-    let mut guard = rx.lock().expect("schema event rx mutex poisoned");
-    while let Ok(ev) = guard.try_recv() {
-        out.push(ev);
-    }
-    out
 }
 
 enum StashedToastOp {
@@ -2793,6 +2926,110 @@ fn toast_chunk_from_decoded(
     })
 }
 
+/// Raw-record fixtures shared with planner preflight tests: crafted WAL
+/// bytes + direct `Ordinary` verdict injection ahead of the enable flip
+#[cfg(test)]
+pub(crate) mod raw_fixtures {
+    use super::*;
+
+    pub(crate) fn int4_descriptor(rel_node: u32) -> Arc<crate::schema::RelDescriptor> {
+        Arc::new(crate::schema::RelDescriptor {
+            rfn: RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node,
+            },
+            oid: rel_node,
+            toast_oid: 0,
+            namespace_oid: 2200,
+            rel_name: crate::schema::RelName::new("public", "copy_t"),
+            kind: 'r',
+            persistence: 'p',
+            replident: crate::schema::ReplIdent::Full { pk_attnums: None },
+            attributes: vec![crate::schema::RelAttr {
+                attnum: 1,
+                name: "id".into(),
+                type_oid: crate::schema::INT4OID,
+                typmod: -1,
+                not_null: false,
+                dropped: false,
+                type_name: "int4".into(),
+                type_byval: true,
+                type_len: 4,
+                type_align: 'i',
+                type_storage: 'p',
+                missing_text: None,
+            }],
+        })
+    }
+
+    /// Heap2 MULTI_INSERT raw record, byte layout per PG
+    /// `heap_xlog_multi_insert` (mirrors the heap_decoder unit fixture)
+    pub(crate) fn multi_insert_raw(xid: u32, lsn: u64, rel_node: u32, values: &[i32]) -> RawRecord {
+        use crate::decode::heap_decoder::{XLH_INSERT_CONTAINS_NEW_TUPLE, XLOG_HEAP2_MULTI_INSERT};
+        use crate::xact::spill::RawBlock;
+        let mut main_data = vec![XLH_INSERT_CONTAINS_NEW_TUPLE, 0];
+        main_data.extend_from_slice(&(values.len() as u16).to_le_bytes());
+        for off in 1..=values.len() as u16 {
+            main_data.extend_from_slice(&off.to_le_bytes());
+        }
+        let mut data = Vec::new();
+        for v in values {
+            data.extend_from_slice(&5u16.to_le_bytes()); // datalen: pad + int4
+            data.extend_from_slice(&1u16.to_le_bytes()); // t_infomask2 = natts
+            data.extend_from_slice(&0u16.to_le_bytes()); // t_infomask
+            data.push(24); // t_hoff
+            data.push(0); // bitmap pad
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        RawRecord {
+            xid,
+            rm: RmId::Heap2 as u8,
+            info: XLOG_HEAP2_MULTI_INSERT,
+            source_lsn: lsn,
+            page_magic: 0xD114,
+            main_data,
+            blocks: vec![RawBlock {
+                block_id: 0,
+                fork_flags: 0x20,
+                data_length: data.len() as u16,
+                image_length: 0,
+                hole_offset: 0,
+                hole_length: 0,
+                bimg_info: 0,
+                spc_node: 1663,
+                db_node: 5,
+                rel_node,
+                block_no: 0,
+                image: Vec::new(),
+                data,
+            }],
+        }
+    }
+
+    /// `Ordinary` verdict for top xid 1, injected directly (no descriptor
+    /// log in these fixtures)
+    pub(crate) fn inject_ordinary(
+        b: &mut XactBuffer,
+        rfn: RelFileNode,
+        rel: Arc<crate::schema::RelDescriptor>,
+    ) {
+        inject_ordinary_with_stats(b, rfn, rel, None);
+    }
+
+    pub(crate) fn inject_ordinary_with_stats(
+        b: &mut XactBuffer,
+        rfn: RelFileNode,
+        rel: Arc<crate::schema::RelDescriptor>,
+        stats: Option<Arc<EmitterStats>>,
+    ) {
+        let mut outcomes = HashMap::new();
+        outcomes.insert(rfn, StashOutcome::Ordinary(rel, 0x50));
+        b.pending_stash
+            .insert(1, StashResolution { outcomes, stats });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Catalog-free paths only. Commit-drain + detoast +
@@ -2800,6 +3037,7 @@ mod tests {
     //! real shadow PG: they need `ShadowCatalog::relation_at`, and a
     //! unit-test stub catalog would duplicate the production cache.
 
+    use super::raw_fixtures::*;
     use super::*;
     use crate::decode::heap_decoder::{DecodedTuple, HeapOp, VARLENA_EXTSIZE_BITS};
     use tempfile::tempdir;
@@ -2857,21 +3095,78 @@ mod tests {
         }
     }
 
-    fn heap_with_value(xid: u32, lsn: u64, payload_size: usize) -> DecodedHeap {
-        DecodedHeap {
+    fn heap_with_value(xid: u32, lsn: u64, payload_size: usize) -> DescribedHeap {
+        DescribedHeap {
+            decoded: DecodedHeap {
+                rfn: RelFileNode {
+                    spc_node: 1663,
+                    db_node: 5,
+                    rel_node: 16385,
+                },
+                xid,
+                source_lsn: lsn,
+                op: HeapOp::Insert,
+                new: Some(DecodedTuple {
+                    columns: vec![Some(ColumnValue::Bytea(vec![0u8; payload_size]))],
+                    partial: false,
+                }),
+                old: None,
+            },
+            descriptor: fixture_descriptor(16385),
+            descriptor_valid_from: 0x40,
+        }
+    }
+
+    fn fixture_descriptor(rel_node: u32) -> Arc<crate::schema::RelDescriptor> {
+        Arc::new(crate::schema::RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
                 db_node: 5,
-                rel_node: 16385,
+                rel_node,
             },
+            oid: rel_node,
+            toast_oid: 0,
+            namespace_oid: 2200,
+            rel_name: crate::schema::RelName::new("public", "buf_t"),
+            kind: 'r',
+            persistence: 'p',
+            replident: crate::schema::ReplIdent::Full { pk_attnums: None },
+            attributes: vec![],
+        })
+    }
+
+    /// Heap UPDATE raw record, full new tuple (no prefix/suffix elision)
+    fn update_raw(xid: u32, lsn: u64, rel_node: u32, value: i32) -> RawRecord {
+        use crate::decode::heap_decoder::{SIZE_OF_HEAP_UPDATE, XLOG_HEAP_UPDATE};
+        use crate::xact::spill::RawBlock;
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u16.to_le_bytes()); // natts
+        data.extend_from_slice(&0u16.to_le_bytes()); // infomask
+        data.push(24); // t_hoff
+        data.push(0); // bitmap pad
+        data.extend_from_slice(&value.to_le_bytes());
+        RawRecord {
             xid,
+            rm: RmId::Heap as u8,
+            info: XLOG_HEAP_UPDATE,
             source_lsn: lsn,
-            op: HeapOp::Insert,
-            new: Some(DecodedTuple {
-                columns: vec![Some(ColumnValue::Bytea(vec![0u8; payload_size]))],
-                partial: false,
-            }),
-            old: None,
+            page_magic: 0xD114,
+            main_data: vec![0u8; SIZE_OF_HEAP_UPDATE],
+            blocks: vec![RawBlock {
+                block_id: 0,
+                fork_flags: 0x20,
+                data_length: data.len() as u16,
+                image_length: 0,
+                hole_offset: 0,
+                hole_length: 0,
+                bimg_info: 0,
+                spc_node: 1663,
+                db_node: 5,
+                rel_node,
+                block_no: 0,
+                image: Vec::new(),
+                data,
+            }],
         }
     }
 
@@ -3100,6 +3395,7 @@ mod tests {
                 rel_node: 16400,
             },
             oid: 99,
+            toast_oid: 0,
             namespace_oid: 99,
             rel_name: RelName::new("pg_toast", "pg_toast_16385"),
             kind: 't',
@@ -3209,6 +3505,7 @@ mod tests {
                 rel_node: 16400,
             },
             oid: 16400,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "t"),
             kind: 'r',
@@ -3567,7 +3864,7 @@ mod tests {
         // No HAS_INFO: body is just the 8-byte timestamp
         let ts = 0x0123_4567_89AB_CDEFi64;
         let body = ts.to_le_bytes();
-        let p = parse_xact_payload(0x00, &body);
+        let p = parse_xact_payload(0x00, &body, 0xD116).unwrap();
         assert_eq!(p.xact_time, ts);
         assert!(p.subxacts.is_empty());
     }
@@ -3585,7 +3882,7 @@ mod tests {
         body.extend_from_slice(&0xAAu32.to_le_bytes());
         body.extend_from_slice(&0xBBu32.to_le_bytes());
         body.extend_from_slice(&0xCCu32.to_le_bytes());
-        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &body);
+        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &body, 0xD116).unwrap();
         assert_eq!(p.xact_time, 42);
         assert_eq!(p.subxacts, vec![0xAA, 0xBB, 0xCC]);
     }
@@ -3595,17 +3892,14 @@ mod tests {
         // HAS_INFO unset: parser must not consume bytes past the timestamp
         let mut body = 7i64.to_le_bytes().to_vec();
         body.extend_from_slice(&[0xFF; 16]);
-        let p = parse_xact_payload(0x00, &body);
+        let p = parse_xact_payload(0x00, &body, 0xD116).unwrap();
         assert_eq!(p.xact_time, 7);
         assert!(p.subxacts.is_empty());
     }
 
     #[test]
-    fn parse_xact_payload_short_main_data_returns_default() {
-        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &[1, 2, 3, 4]);
-        assert_eq!(p.xact_time, 0);
-        assert!(p.subxacts.is_empty());
-        assert_eq!(p.twophase_xid, None);
+    fn parse_xact_payload_short_main_data_errors() {
+        assert!(parse_xact_payload(XLOG_XACT_HAS_INFO, &[1, 2, 3, 4], 0xD116).is_err());
     }
 
     #[test]
@@ -3622,7 +3916,7 @@ mod tests {
         body.extend_from_slice(&[0u8; 16]); // SharedInvalidationMessage
         body.extend_from_slice(&0x1234u32.to_le_bytes()); // xl_xact_twophase
         body.extend_from_slice(b"gid\0");
-        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &body);
+        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &body, 0xD116).unwrap();
         assert_eq!(p.twophase_xid, Some(0x1234));
     }
 
@@ -3675,13 +3969,379 @@ mod tests {
                 out.push(label(&batch.ordered_events[ev].event));
                 ev += 1;
             }
-            out.push(format!("h{}", h.source_lsn));
+            out.push(format!("h{}", h.decoded.source_lsn));
         }
         while ev < batch.ordered_events.len() {
             out.push(label(&batch.ordered_events[ev].event));
             ev += 1;
         }
         out
+    }
+
+    /// Events pushed out of LSN order (pump-side capture keys bias-early
+    /// valid_from, worker pushes at observe order) still drain LSN ASC.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_sorts_out_of_order_event_pushes() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        b.on_heap(heap_with_value(1, 120, 16)).await.unwrap();
+        // Arrival order 150, 100: 100 must still precede the heap@120
+        b.on_schema_event(1, 150, dropped_event(9));
+        b.on_schema_event(1, 100, dropped_event(7));
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut order: Vec<String> = Vec::new();
+        while let Some(batch) = drain.next_batch(8, usize::MAX, None).await.unwrap() {
+            order.extend(flatten_batch(&batch));
+            if batch.is_final {
+                break;
+            }
+        }
+        assert_eq!(order, vec!["e7", "h120", "e9"]);
+        drain.finish().await.unwrap();
+    }
+
+    /// One raw MULTI_INSERT (stashed under a subxact) fans out to every
+    /// tuple in order — each carrying the WRITER xid through the merge —
+    /// before anything past its LSN yields; an event at the same LSN keeps
+    /// the event-first tie break; a later heap follows the whole fanout.
+    /// `Ordinary` verdict injected directly (no descriptor log here)
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_multi_insert_fanout_orders_and_keeps_xid() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16410);
+        let rfn = rel.rfn;
+        b.stash_raw(8, multi_insert_raw(8, 100, 16410, &[100, 200, 300]))
+            .await
+            .unwrap();
+        b.on_heap(heap_with_value(1, 200, 16)).await.unwrap();
+        b.on_schema_event(1, 100, dropped_event(7));
+        inject_ordinary(&mut b, rfn, rel);
+
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[8], false).await.unwrap();
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("one slice");
+        assert!(batch.is_final);
+        assert_eq!(batch.ordered_events.len(), 1);
+        assert_eq!(
+            batch.ordered_events[0].heap_idx, 0,
+            "same-LSN event precedes the fanout"
+        );
+        assert_eq!(batch.heaps.len(), 4, "3 fanned-out tuples + later heap");
+        for (i, expected) in [100i32, 200, 300].iter().enumerate() {
+            let h = &batch.heaps[i];
+            assert_eq!(h.decoded.source_lsn, 100);
+            assert_eq!(h.decoded.xid, 8, "writer xid survives subxact merge");
+            assert_eq!(h.descriptor_valid_from, 0x50);
+            let new = h.decoded.new.as_ref().unwrap();
+            assert_eq!(new.columns[0], Some(ColumnValue::Int4(*expected)));
+        }
+        assert_eq!(batch.heaps[3].decoded.source_lsn, 200, "fanout first");
+        drain.finish().await.unwrap();
+    }
+
+    /// Decode counters label the record's op; pending gauges track the
+    /// fanout queue and return to zero once every tuple yields
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_fanout_counts_decode_and_pending_gauges() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16415);
+        let rfn = rel.rfn;
+        b.stash_raw(1, multi_insert_raw(1, 100, 16415, &[1, 2, 3]))
+            .await
+            .unwrap();
+        let stats = Arc::new(EmitterStats::default());
+        inject_ordinary_with_stats(&mut b, rfn, rel, Some(stats.clone()));
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let batch = drain
+            .next_batch(2, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("first slice");
+        assert_eq!(batch.heaps.len(), 2);
+        assert_eq!(b.raw_pending_rows(), 1, "third fanned tuple still queued");
+        assert!(b.raw_pending_bytes() > 0);
+        let ops = stats.raw_decode_ordinary_ops.load();
+        assert_eq!(ops[5], 1, "one multi_insert record decoded");
+        assert_eq!(stats.raw_decode_rows_ops.load()[5], 3, "three rows fanned");
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("final slice");
+        assert!(batch.is_final);
+        assert_eq!(batch.heaps.len(), 1);
+        assert_eq!(b.raw_pending_rows(), 0);
+        assert_eq!(b.raw_pending_bytes(), 0);
+        drain.finish().await.unwrap();
+    }
+
+    /// MULTI_INSERT lacking `XLH_INSERT_CONTAINS_NEW_TUPLE` cannot prove its
+    /// tuple data survived FPIs: typed ImageOnly, drain halts
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_image_only_fails_closed() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16411);
+        let rfn = rel.rfn;
+        let mut raw = multi_insert_raw(1, 100, 16411, &[1]);
+        raw.main_data[0] = 0;
+        b.stash_raw(1, raw).await.unwrap();
+        inject_ordinary(&mut b, rfn, rel);
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
+            panic!("expected fail-closed error");
+        };
+        assert!(
+            matches!(
+                err,
+                XactBufferError::OrdinaryFailClosed {
+                    reason: FailClosedReason::ImageOnly,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// INPLACE mutates tuple bytes with no decode shape: typed reject, not
+    /// a silent skip
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_unsupported_op_fails_closed() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16412);
+        let rfn = rel.rfn;
+        let mut raw = multi_insert_raw(1, 100, 16412, &[1]);
+        raw.rm = RmId::Heap as u8;
+        raw.info = crate::decode::heap_decoder::XLOG_HEAP_INPLACE;
+        b.stash_raw(1, raw).await.unwrap();
+        inject_ordinary(&mut b, rfn, rel);
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
+            panic!("expected fail-closed error");
+        };
+        assert!(
+            matches!(
+                err,
+                XactBufferError::OrdinaryFailClosed {
+                    reason: FailClosedReason::UnsupportedOperation,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// Raw record whose writer xid is outside the owning xact + subxacts
+    /// (spill corruption / buffer-key drift shape): merge ownership check
+    /// fails the drain before the foreign row can emit
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_foreign_xid_fails_closed() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16417);
+        let rfn = rel.rfn;
+        b.stash_raw(1, multi_insert_raw(99, 100, 16417, &[5]))
+            .await
+            .unwrap();
+        inject_ordinary(&mut b, rfn, rel);
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
+            panic!("expected foreign-xid error");
+        };
+        assert!(
+            matches!(err, XactBufferError::ForeignXid { xid: 99, top: 1 }),
+            "{err}"
+        );
+    }
+
+    /// Page maintenance stashed alongside user rows (heap2 PRUNE, heap LOCK)
+    /// skips without failing the drain; the user row still lands
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_maintenance_ops_skip() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16413);
+        let rfn = rel.rfn;
+        let mut prune = multi_insert_raw(1, 90, 16413, &[1]);
+        prune.info = 0x10; // XLOG_HEAP2_PRUNE*
+        let mut lock = multi_insert_raw(1, 95, 16413, &[1]);
+        lock.rm = RmId::Heap as u8;
+        lock.info = crate::decode::heap_decoder::XLOG_HEAP_LOCK;
+        b.stash_raw(1, prune).await.unwrap();
+        b.stash_raw(1, lock).await.unwrap();
+        b.stash_raw(1, multi_insert_raw(1, 100, 16413, &[7]))
+            .await
+            .unwrap();
+        inject_ordinary(&mut b, rfn, rel);
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("one slice");
+        assert!(batch.is_final);
+        assert_eq!(batch.heaps.len(), 1, "maintenance skipped, row kept");
+        let new = batch.heaps[0].decoded.new.as_ref().unwrap();
+        assert_eq!(new.columns[0], Some(ColumnValue::Int4(7)));
+        drain.finish().await.unwrap();
+    }
+
+    /// Prefix-elided UPDATE needs a predecessor image raw decode lacks:
+    /// typed PartialUpdate. PG only elides below wal_level=logical
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_partial_update_fails_closed() {
+        use crate::decode::heap_decoder::{
+            SIZE_OF_HEAP_UPDATE, XLH_UPDATE_PREFIX_FROM_OLD, XLOG_HEAP_UPDATE,
+        };
+        use crate::xact::spill::RawBlock;
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16414);
+        let rfn = rel.rfn;
+        let mut main_data = vec![0u8; SIZE_OF_HEAP_UPDATE];
+        main_data[7] = XLH_UPDATE_PREFIX_FROM_OLD;
+        // block 0: [prefixlen=4 covers the whole int4][xl_heap_header][pad]
+        let mut data = Vec::new();
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes()); // natts
+        data.extend_from_slice(&0u16.to_le_bytes()); // infomask
+        data.push(24); // t_hoff
+        data.push(0); // bitmap pad
+        let raw = RawRecord {
+            xid: 1,
+            rm: RmId::Heap as u8,
+            info: XLOG_HEAP_UPDATE,
+            source_lsn: 100,
+            page_magic: 0xD114,
+            main_data,
+            blocks: vec![RawBlock {
+                block_id: 0,
+                fork_flags: 0x20,
+                data_length: data.len() as u16,
+                image_length: 0,
+                hole_offset: 0,
+                hole_length: 0,
+                bimg_info: 0,
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 16414,
+                block_no: 0,
+                image: Vec::new(),
+                data,
+            }],
+        };
+        b.stash_raw(1, raw).await.unwrap();
+        inject_ordinary(&mut b, rfn, rel);
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
+            panic!("expected fail-closed error");
+        };
+        assert!(
+            matches!(
+                err,
+                XactBufferError::OrdinaryFailClosed {
+                    reason: FailClosedReason::PartialUpdate,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// COPY fanout precedes a later UPDATE raw: LSN order holds across the
+    /// pending-queue / merge-source boundary
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_multi_insert_then_update_lsn_order() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16415);
+        let rfn = rel.rfn;
+        b.stash_raw(1, multi_insert_raw(1, 100, 16415, &[1, 2, 3]))
+            .await
+            .unwrap();
+        b.stash_raw(1, update_raw(1, 150, 16415, 9)).await.unwrap();
+        inject_ordinary(&mut b, rfn, rel);
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("one slice");
+        assert!(batch.is_final);
+        let ops: Vec<_> = batch
+            .heaps
+            .iter()
+            .map(|h| (h.decoded.source_lsn, h.decoded.op))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                (100, HeapOp::Insert),
+                (100, HeapOp::Insert),
+                (100, HeapOp::Insert),
+                (150, HeapOp::Update),
+            ],
+        );
+        assert_eq!(
+            batch.heaps[3].decoded.new.as_ref().unwrap().columns[0],
+            Some(ColumnValue::Int4(9)),
+        );
+        drain.finish().await.unwrap();
+    }
+
+    /// Writer xid reaches fanned-out heaps identically whether the raw
+    /// stash drained from memory or from spill (v6 keeps xid on disk), and
+    /// the pending queue's resident accounting fully releases
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_xid_survives_memory_and_spill() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let rel = int4_descriptor(16416);
+        let rfn = rel.rfn;
+        // ~3.6 KiB of tuple data blows the 1 KiB budget: subxact 8 spills
+        let big: Vec<i32> = (0..300).collect();
+        b.stash_raw(8, multi_insert_raw(8, 100, 16416, &big))
+            .await
+            .unwrap();
+        b.stash_raw(9, multi_insert_raw(9, 200, 16416, &[7]))
+            .await
+            .unwrap();
+        let spilled: Vec<(u32, bool)> = b
+            .inflight_snapshot()
+            .iter()
+            .map(|e| (e.xid, e.spilled))
+            .collect();
+        assert!(spilled.contains(&(8, true)), "{spilled:?}");
+        assert!(spilled.contains(&(9, false)), "{spilled:?}");
+        inject_ordinary(&mut b, rfn, rel);
+        let mut drain = b
+            .drain_committed(1, 42, 0x2000, &[8, 9], false)
+            .await
+            .unwrap();
+        let mut heaps = Vec::new();
+        while let Some(batch) = drain.next_batch(64, usize::MAX, None).await.unwrap() {
+            heaps.extend(
+                batch
+                    .heaps
+                    .iter()
+                    .map(|h| (h.decoded.source_lsn, h.decoded.xid)),
+            );
+            if batch.is_final {
+                break;
+            }
+        }
+        assert_eq!(heaps.len(), 301);
+        assert!(heaps[..300].iter().all(|&(l, x)| l == 100 && x == 8));
+        assert_eq!(heaps[300], (200, 9));
+        assert!(b.drain_resident_peak() > 0, "fanout charged the gauge");
+        drain.finish().await.unwrap();
+        assert_eq!(b.drain_resident_bytes(), 0, "pending accounting released");
     }
 
     /// Batched drain must reproduce the serial merge order: spilled + in-mem
@@ -3806,8 +4466,8 @@ mod tests {
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         b.on_toast_chunk(chunk(55, 0, 100, b"ab"), 9).await.unwrap();
         let mut trunc = heap_with_value(9, 110, 16);
-        trunc.op = HeapOp::Truncate;
-        trunc.new = None;
+        trunc.decoded.op = HeapOp::Truncate;
+        trunc.decoded.new = None;
         b.on_heap(trunc).await.unwrap();
         b.on_toast_chunk(chunk(56, 0, 120, b"cd"), 9).await.unwrap();
         b.on_schema_event(9, 130, dropped_event(7));

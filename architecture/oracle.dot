@@ -1,11 +1,11 @@
-// walshadow — differential decode oracle
-// PgPending resolver path + Tier 3 sampling validator path,
-// both fronted by libpq into shadow PG. Extension surface (pgext/)
-// shown as a side branch with absence-fallback semantics.
+// walshadow — PgPending decode oracle
+// PgPending resolver path fronted by libpq into shadow PG. Extension
+// surface (pgext/) shown as a side branch with absence-fallback
+// semantics.
 //
 // regeneration spec:
-// sources of truth: plans/oracle.md · pgext/ · src/ oracle-path module (grep src/ for oracle|valid|pending)
-// subsumes: plans/oracle.md § differential decode flow + extension surface + --validate sampling
+// sources of truth: plans/oracle.md · pgext/ · src/ oracle-path module (grep src/ for oracle|pending)
+// subsumes: plans/oracle.md § resolver flow + extension surface + absence semantics
 // quality bar:
 //   - two-way branch on extension availability legible (not a tangle)
 //   - libpq round-trip reads as one canonical orange edge in/out of shadow
@@ -14,7 +14,7 @@
 digraph oracle {
   rankdir=TB;
   compound=true;
-  graph [fontname="Helvetica", labelloc="t", label="walshadow oracle — differential decode bridge + 1-in-N validator", fontsize=14, splines=spline, nodesep=0.35, ranksep=0.9, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="walshadow oracle — PgPending decode bridge", fontsize=14, splines=spline, nodesep=0.35, ranksep=0.9, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
 
@@ -24,15 +24,14 @@ digraph oracle {
     tier12 [label="ColumnValue::Tier 1/2\nfixed-width / varlena\nlocally rendered\n(no raw bytes kept)", fillcolor="#4D4128"];
     tier3  [label="ColumnValue::Tier 3\nnumeric / inet / cidr /\ninterval (codecs.rs)\nlocal decode only\n(raw bytes discarded)", fillcolor="#4D4128"];
     pend   [label="ColumnValue::PgPending\n{ type_oid, raw }\njsonb / array / range /\ntsvector / domain / vendor", fillcolor="#5D3F40"];
+    unsup  [label="ColumnValue::Unsupported\n{ type_oid, raw }\nfail-closed backstop\nunless oracle resolves", fillcolor="#5D3F40"];
   }
 
   // ════════ ② oracle decode path ════════
   subgraph cluster_oracle {
-    label="② oracle path — ClickHouse decode workers call directly; metrics-only runs skip it"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    resolve  [label="resolve_pending_tuple\nwalk columns,\nPgPending → resolve_pending\nswap to Text on Ok(Some)", fillcolor="#5D3F40"];
-    sampler  [label="Sampler::pick\nAtomicU64::fetch_add(Relaxed)\nrate == 0 short-circuits\nelse 1-in-N hit", fillcolor="#5D3F40", shape=parallelogram];
-    validate [label="validate(type_oid, raw, local_text)\nPgPending only (raw present;\n local_text empty) —\nprobe = extension call succeeds\n+ returns text", fillcolor="#5D3F40"];
-    stats    [label="OracleStats\nresolved / fallback_raw /\nprobes / matches /\nmismatches / errors", fillcolor="#5D3F40", shape=note];
+    label="② oracle path — post-plan, decode workers call directly; metrics-only runs skip it"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    resolve  [label="resolve_pending_tuple\nwalk columns,\nPgPending | Unsupported\n→ resolve_pending\nswap to Text on Ok(Some)\nbest effort: shadow may lag\nrow's catalog interval", fillcolor="#5D3F40"];
+    stats    [label="OracleStats\nresolved / fallback_raw /\nerrors", fillcolor="#5D3F40", shape=note];
   }
 
   // ════════ ③ libpq client (own pool, not catalog's) ════════
@@ -56,27 +55,19 @@ digraph oracle {
   subgraph cluster_emit {
     label="⑥ downstream — emit-time disposition"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     emit_text [label="ColumnValue::Text\n→ CH String\n(encode_value)", fillcolor="#5D4628"];
-    emit_raw  [label="PgPending raw bytes\n→ append_string_bytes(raw)\nunsupported_values++\nplaceholder <oid:N>", fillcolor="#5D4628"];
-    alarm     [label="mismatch alarm\nlog + stats.mismatches++\nrow STILL ships\n(watchdog, not gate)", fillcolor="#5D4628", shape=note];
+    emit_raw  [label="PgPending raw bytes\n→ append_string_bytes(raw)\nbest-effort verbatim body", fillcolor="#5D4628"];
+    emit_fail [label="Unsupported unresolved\n→ EmitterError::\nUnsupportedValue (fatal)", fillcolor="#5D4628", shape=note];
   }
-
-  // ════════ ⑦ CLI gate ════════
-  cli [label="walshadow-stream\n--validate <N>\n(0 = off,\n default)", fillcolor="#3D3D54", shape=parallelogram];
 
   // ─── main flow edges (LR spine, high weight) ───
   pend    -> resolve  [color="#A1A9CC", penwidth=2, label="always", weight=10];
-  resolve -> client   [color="#CBA85E", penwidth=2, label="resolve_pending\nper PgPending col", weight=10];
+  unsup   -> resolve  [color="#A1A9CC", style=dashed, label="always", weight=5];
+  resolve -> client   [color="#CBA85E", penwidth=2, label="resolve_pending\nper pending col", weight=10];
   client  -> ext      [color="#CBA85E", penwidth=2, dir=both, arrowtail=open, lhead=cluster_shadow, label="libpq SELECT\ntokio_postgres pool\n(separate from\n ShadowCatalog)", weight=10];
 
-  // ─── validator branch (parallel rail) ───
-  pend    -> sampler  [color="#b380b0", style=dashed];
-  tier3   -> sampler  [color="#b380b0", style=dotted, label="skipped\n(raw bytes\n discarded)"];
-  tier12  -> sampler  [color="#b380b0", style=dotted, label="skipped\n(no raw\n bytes)"];
-  sampler -> validate [color="#b380b0", label="1-in-N hit"];
-  validate -> client  [color="#CBA85E", label="probe SQL"];
-
-  // ─── CLI rate annotation (side input to sampler) ───
-  cli -> sampler [color="#b380b0", style=dotted, label="rate N"];
+  // ─── local tiers never reach the oracle ───
+  tier12 -> emit_text [color="#BF8C5F", style=dotted, constraint=false, label="local render"];
+  tier3  -> emit_text [color="#BF8C5F", style=dotted, constraint=false, label="local render"];
 
   // ─── shadow internal: extension uses pinned locale via typoutput ───
   ext -> lc    [style=dashed, color="#6E6963", constraint=false];
@@ -86,35 +77,30 @@ digraph oracle {
   artifact -> ext [style=dashed, color="#6E6963", lhead=cluster_shadow, ltail=cluster_pgext, label="install:\n$libdir +\nextension dir;\nCREATE EXTENSION\nwalshadow"];
 
   // ─── stats fan-in (off-axis, constraint=false) ───
-  resolve  -> stats [style=dashed, color="#CBA85E", constraint=false, label="resolved++ /\nfallback_raw++"];
-  validate -> stats [style=dashed, color="#CBA85E", constraint=false, label="probes++ /\nmatches /\nmismatches++"];
+  resolve  -> stats [style=dashed, color="#CBA85E", constraint=false, label="resolved++ /\nfallback_raw++ /\nerrors++"];
 
   // ─── emit disposition (off-axis fan-out from oracle) ───
-  resolve  -> emit_text [color="#BF8C5F", penwidth=2, constraint=false, label="Ok(Some)\nPgPending\n→ Text"];
-  resolve  -> emit_raw  [color="#BF8C5F", style=dashed, constraint=false, label="Ok(None)\next absent /\nNULL / error"];
-  validate -> alarm     [color="#BF8C5F", style=dashed, constraint=false, label="probe error /\ntext mismatch"];
+  resolve  -> emit_text [color="#BF8C5F", penwidth=2, constraint=false, label="Ok(Some)\npending\n→ Text"];
+  resolve  -> emit_raw  [color="#BF8C5F", style=dashed, constraint=false, label="Ok(None)\next absent /\nNULL / error\n(PgPending)"];
+  resolve  -> emit_fail [color="#BF8C5F", style=dotted, constraint=false, label="Ok(None)\n(Unsupported)"];
 
   // ─── Legend ───
   legend [shape=plaintext, label=<
     <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill</B></TD></TR>
-      <TR><TD BGCOLOR="#3D3D54" WIDTH="20"></TD><TD>CLI gate</TD></TR>
-      <TR><TD BGCOLOR="#4D4128"></TD><TD>decoder ColumnValue</TD></TR>
+      <TR><TD BGCOLOR="#4D4128" WIDTH="20"></TD><TD>decoder ColumnValue</TD></TR>
       <TR><TD BGCOLOR="#5D3F40"></TD><TD>oracle (src/ops/oracle.rs)</TD></TR>
       <TR><TD BGCOLOR="#4D4D28"></TD><TD>libpq client (own pool)</TD></TR>
       <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow PG / extension</TD></TR>
       <TR><TD BGCOLOR="#4D3850"></TD><TD>pgext/ build artifact</TD></TR>
-      <TR><TD BGCOLOR="#5D4628"></TD><TD>emit sink / alarm</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>emit sink</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
-      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>PgPending → resolver (always)</TD></TR>
-      <TR><TD><FONT COLOR="#b380b0"><B>┄┄</B></FONT></TD><TD>sampler gate (--validate N)</TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>pending → resolver (always)</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq SELECT (MAIN wire)</TD></TR>
       <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>emit-time disposition</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>pgext install (filesystem)</TD></TR>
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>trigger sources</B></TD></TR>
-      <TR><TD><B>PgPending resolve</B></TD><TD>always — once per col</TD></TR>
-      <TR><TD><B>PgPending probe</B></TD><TD>--validate N, sampler-gated</TD></TR>
-      <TR><TD><B>Tier 1/2/3</B></TD><TD>not validated (raw bytes not retained)</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>policy</B></TD></TR>
+      <TR><TD COLSPAN="2" ALIGN="LEFT">Best effort: resolution runs post-plan;<BR ALIGN="LEFT"/>shadow's catalog may lag the row's<BR ALIGN="LEFT"/>interval in DDL edge cases — accepted<BR ALIGN="LEFT"/>to mostly support unknown types.</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>extension-absence</B></TD></TR>
       <TR><TD COLSPAN="2" ALIGN="LEFT">probe_extension at connect →<BR ALIGN="LEFT"/>has_extension=false →<BR ALIGN="LEFT"/>resolve_pending Ok(None) →<BR ALIGN="LEFT"/>stats.fallback_raw++ →<BR ALIGN="LEFT"/>emitter writes raw bytes.<BR ALIGN="LEFT"/>No failure. CREATE EXTENSION<BR ALIGN="LEFT"/>+ reconnect re-enables.</TD></TR>
     </TABLE>

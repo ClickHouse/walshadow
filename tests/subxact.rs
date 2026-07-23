@@ -20,7 +20,7 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
-use std::process::{Command, Stdio};
+use fx::spawn_txn;
 use std::time::Duration;
 
 use walshadow::mapping::TableTarget;
@@ -133,44 +133,6 @@ fn create_ch_dest(ch: &fx::ChServer) {
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest table");
-}
-
-/// Drive a single explicit transaction containing multi-line SQL.
-/// Unlike `fx::spawn_workload` (which uses per-statement `-c` autocommit),
-/// this routes through `-f -` piping so SAVEPOINT lineage survives.
-fn spawn_txn(source: &Shadow, body: &str) -> std::thread::JoinHandle<()> {
-    let sock = source.config().socket_dir.clone();
-    let port = source.config().port;
-    let sql = body.to_owned();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        let mut child = Command::new("psql")
-            .args([
-                "-h",
-                sock.to_str().unwrap(),
-                "-p",
-                &port.to_string(),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-f",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn psql");
-        {
-            use std::io::Write as _;
-            let stdin = child.stdin.as_mut().expect("stdin piped");
-            stdin.write_all(sql.as_bytes()).unwrap();
-        }
-        let _ = child.wait();
-    })
 }
 
 /// Shared drill — bootstrap clusters, pump the workload, then return

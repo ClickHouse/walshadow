@@ -3,13 +3,14 @@
 CH-side ingest is a parallel decode+insert pipeline (`src/pipeline/`):
 
 ```text
-pump -> QueueingRecordSink -> reorder -> [decode x M] -> InsertBatcher
-           -> [inserter x N] -> ClickHouse
+pump -> QueueingRecordSink -> reorder (plan -> execute) -> [decode x M]
+           -> InsertBatcher -> [inserter x N] -> ClickHouse
                              \-> ack collector -> emitter_ack_lsn
 ```
 
-Pipeline stages live in `src/pipeline/{reorder,decode,batcher,inserter,
-ack,tail,mod}.rs`; encoding primitives (`EmitterConfig`, `TableEncoder`,
+Pipeline stages live in `src/pipeline/{reorder,planner,plan_spool,
+decode,batcher,inserter,ack,tail,mod}.rs`; encoding primitives
+(`EmitterConfig`, `TableEncoder`,
 `TablePlan`, `ColumnBuf`, value encode, `EmitterStats`) in
 `src/ch_emitter.rs`; DDL in `src/ch_ddl.rs`; PG → CH type mapping in
 `src/type_bridge.rs`. Pool sizes M/N come from `--decoder-pool-size` /
@@ -21,9 +22,8 @@ Metrics-only runs (no `--ch-config`) stand up the same pipeline in its
 degenerate configuration: `TailKind::Null` swaps batcher + inserters
 for a swallow task that acks rows at receipt (zero CH connections), no
 `DdlApplicator` (schema events observed, never applied), empty mapping
-so the decode pool routes nothing and seqs complete at placement —
-watermark, idle advance, and slot semantics identical to a CH run.
-Oracle `--validate` sampling runs in the decode pool either way
+so planning routes nothing and seqs complete at placement —
+watermark, idle advance, and slot semantics identical to a CH run
 
 ## Purpose
 
@@ -46,12 +46,16 @@ Single-threaded commit-order boundary. Runs as inner sink of the
 daemon's `QueueingRecordSink` (off the WAL pump task, so replay gates
 never pace wire delivery). Only `RM_XACT_ID` records reach its match:
 
-- COMMIT — poll-based DROP sweep (only when this commit's xid set was
-  armed by a pg_class heap_delete, `PendingSweeps`),
-  `XactBuffer::drain_committed`, then assign one dense `seq`,
-  `ack.register(seq, commit_lsn)`, dispatch a `DecodeJob` to the
-  decode pool. Empty commits register a rows=0 seq so the contiguous
-  watermark never gaps
+- COMMIT — stash resolution against the descriptor log at the commit's
+  `next_lsn`, then plan-then-execute:
+  `XactBuffer::drain_committed` under the drain xid (prepared xid for
+  COMMIT PREPARED) streams through the transaction planner into a
+  sealed plan (side-effect-free, see Planner below); `execute_plan`
+  replays it — heap segments dispatch as `DecodeJob` seqs after
+  `ack.register(seq, commit_lsn)`, control entries fence and apply at
+  their pinned positions. A plan error abandons the transaction before
+  any side effect. Empty commits register a rows=0 seq so the
+  contiguous watermark never gaps
 - ABORT — drop buffer state, register + place a rows=0 seq (never a
   direct ack bump; everything moves through the gate)
 - ASSIGNMENT — feed `SubxactTracker`
@@ -82,12 +86,60 @@ coarseness is deliberate; DDL and TRUNCATE are rare. Trailing data
 after the last event flows async, already encoding against the
 post-DDL shape
 
+### Transaction planner — `pipeline/planner.rs` + `pipeline/plan_spool.rs`
+
+Side-effect-free planning stage between drain and execution. Consumes
+committed-drain batches in walk order and streams them into one plan
+per transaction: heaps detoast and route at planning so the executor
+never re-resolves, raw stashed records decode under their commit
+verdict descriptors ([xact.md](xact.md) Commit-time stash), control
+entries pin their walk positions, mirror-row refs and truncate fences
+carry through re-based to plan-global indices. Every input-derived
+failure — descriptor, decode, toast, route — surfaces before the first
+transaction side effect; a plan error drops the writer, the file
+unlinks, the transaction emits nothing
+
+Forbidden side effects are unrepresentable, not merely avoided: the
+planner holds no ack handle, no batcher channel, no CH client, no
+config applicator. Route state folds into a `PlanRouteView` resolving
+from frozen versions; in-walk control entries fold into the LOCAL view
+only — global mapping/config/CH changes belong to the executor at
+replay. This is what makes config changes whole-transaction-granular:
+a transaction plans entirely under one route state, never mixes
+versions ([config.md](config.md)). `route_for` returning `None` is the
+deterministic unmapped discard, counted, planned as `route_id =
+u32::MAX` — it skips detoast and codec work entirely
+
+The plan itself is a transient validated spool (`plan_spool.rs`):
+plans at or below `DEFAULT_PLAN_MEM_MAX` (1 MiB) stay memory-resident
+so the common single-statement commit never touches the filesystem;
+larger plans stream to a `.plan` file. Frame layout after the `WP`
+magic + version header: `[len:u32][crc32c:u32][body]`, body tag 0 =
+heap (`dict_id + route_id + heap bytes`, spill codec), tag 1 = seal
+(`heap_count`). Bounded metadata — descriptor dictionary, route table,
+control entries, row batches — stays resident in the plan header. A
+missing seal means planning never finished; trailing bytes mean
+corruption; file-backed plans checksum-verify fully before the first
+side effect. Files are never durable: source-WAL reconstructible,
+unlinked on success and failure alike, swept at startup by
+`clean_plan_files` via the spill-dir clear
+
+Validation coverage, one enforcement point per plan-success guarantee:
+descriptor Present + unambiguous (stash verdicts at drain), operation
+supported with logical tuple data (raw operation policy), decoded xid
+owned by the xact family (`ForeignXid`), partial update fails the plan
+(`PlanError::PartialUpdate`; no reconstruction path exists), needed
+toast values resolve at planning, route snapshot complete by
+construction, planned schema transitions carry old + new descriptors
+into replay verbatim
+
 ### Decode pool — `pipeline/decode.rs`, ×M
 
-Each worker pulls a `DecodeJob` and per heap: `detoast_heap`, resolve
-descriptor via `shadow_catalog::resolve_at_pooled` (read-only pooled
-resolve, replay-LSN-gated), mapping lookup, oracle `PgPending`
-resolution + sampled validation, then routes `RoutedRow`s to the
+Each worker pulls a `DecodeJob` of planned `RoutedHeap` envelopes —
+descriptor and route ride each envelope, nothing here resolves catalog
+or mapping state. Per heap: `detoast_heap` (values already resolved at
+planning, chunks ride empty), oracle `PgPending`
+resolution, then routes `RoutedRow`s to the
 batcher in chunks (`DECODE_CHUNK_ROWS = 1024` / `DECODE_CHUNK_BYTES =
 4 MiB`, amortizing the channel hop). After the xact's last row it
 reports `Placed { seq, rows }`. Decode errors are fatal — a
@@ -354,12 +406,14 @@ columns = [
 ```
 
 `MappingHandle = Arc<tokio::sync::RwLock<HashMap<RelName, TableMapping>>>`
-is the live handle the decode pool consults per row. Handle is
-cloneable; daemon's SIGHUP task swaps whole inner `HashMap`. Routing
-picks up the swap immediately; the batcher's cached `TableEncoder`
-keeps its old `TablePlan` until the next barrier `FlushAll` (or
-restart) rebuilds it — a SIGHUP retarget therefore fully applies only
-at the next DDL/TRUNCATE boundary
+is the live handle the planner's route view resolves from. Handle is
+cloneable; daemon's SIGHUP task swaps whole inner `HashMap`. Routes
+freeze into each transaction's plan as `RouteSnapshot`s — a mapping
+write after planning can never alter a planned row, and the swap takes
+effect at the next transaction's plan. The batcher's cached
+`TableEncoder` keeps its old `TablePlan` until the next barrier
+`FlushAll` (or restart) rebuilds it — a SIGHUP retarget therefore
+fully applies only at the next DDL/TRUNCATE boundary
 
 ### NamespaceMapping (partial)
 
@@ -394,9 +448,9 @@ database
 the resolver substrate ([config.md](config.md)): `ResolvedConfig`
 (`tables` + `namespaces` + `columns` type-override table) published on a
 `watch::Receiver<Arc<ResolvedConfig>>`, CLI > PG-row > TOML merge, SIGHUP
-republish. The decode pool reads `Arc<RwLock<HashMap>>` for the per-row hot
-path; a refresher bridges the watch snapshot into it. The richer namespace
-surface is not covered:
+republish. The planner's route view reads `Arc<RwLock<HashMap>>` when
+freezing routes; a refresher bridges the watch snapshot into it. The
+richer namespace surface is not covered:
 
 - `NamespaceMapping.order_by_default`: `render_create_table` hard-codes
   `ORDER BY (_lsn)` fallback when no PK exists
@@ -411,11 +465,10 @@ the source-PG-driven work (signals, opt-in + backfill, net-new knobs)
 ## DdlApplicator
 
 `ch_ddl.rs::DdlApplicator`, owned by the reorder coordinator. Events
-originate at `ShadowCatalog::subscribe`
-(`mpsc::UnboundedReceiver<SchemaEvent>` — unbounded so a stalled
-consumer never back-pressures the catalog producer), ride the xact
-buffer keyed on `(xid, source_lsn)`, and surface in `drain_committed`'s
-`ordered_events`; the barrier applies each in source-LSN order.
+originate at descriptor capture ([desc_log.md](desc_log.md)) as log
+diffs, ride the xact buffer keyed `(drain_xid, valid_from)`, and
+surface in `drain_committed`'s `ordered_events`; the barrier applies
+each in LSN order.
 `DrainEntry::ToastBarrier` rides the same loop at commit LSN: the
 put-cursor flushes the generation's births first, then the barrier runs
 the store-side residual insert-select ([TOAST.md](TOAST.md)). Apply
@@ -448,45 +501,26 @@ DDL has no retry: an applicator error trips fatal so the operator sees
 it directly. Runtime-config-from-PG work may add bounded reconnect for
 the DDL connection
 
-### Baseline seeding (the `Added`-vs-`Changed` discriminator)
+### Baseline (the `Added`-vs-`Changed` discriminator)
 
-Whether a relation's first post-start descriptor fetch surfaces as
-`Added` or `Changed` keys on whether `ShadowCatalog::prev_known` already
-holds its oid. `prev_known` is the *baseline ledger* (last source shape
-CH and source agreed on), not the descriptor cache — cold at every boot,
-never reconstructed on a miss. Left cold, a pinned table that sees no DML
-before its first `ALTER` records the post-ALTER shape as `Added`, which
-`apply_added` skips for pinned dests (operator-managed CH) → CH stays a
-column behind.
+Whether a relation's first post-start DDL surfaces as `Added` or
+`Changed` keys on the descriptor log's predecessor for its oid
+([desc_log.md](desc_log.md)) — durable across restarts, seeded at first
+attach with every eligible rel's boot shape. A pinned table's first
+post-start `ALTER` therefore always diffs against a real baseline →
+`Changed` → the `apply_changed` path above runs the CH ALTER; no warm-up
+step exists to forget.
 
-`ShadowCatalog::seed_baseline(rel_names)` warms `prev_known` for
-every pinned relation before `subscribe()` so the cache never decides the
-branch: `bin/stream.rs` calls it after preflight / before
-`START_REPLICATION` over `cfg.tables.keys()` (the inproc harness mirrors
-it before its own `subscribe`). Pre-subscribe, `send_event` is a no-op,
-so seeding emits nothing and does zero CH work. The first post-boot
-`ALTER` then diffs the evolved descriptor against the seeded boot shape →
-`Changed` → the `apply_changed` path above runs the CH ALTER.
-
-Seeds the *full source* descriptor, never the mapping: a pinned subset's
-unmapped columns sit in the baseline and read as "operator-excluded", so
-a later `ALTER` adds only genuinely-new columns, never re-adds an
-excluded one. Auto-create tables need no seeding — their first-touch
-`Added` → `CREATE TABLE` already records a baseline.
-
-`config_table` opt-ins warm the same ledger through the opt-in dispatch
-(`src/opt_in.rs`): the descriptor resolve inside `apply_table_opt_in`
-records the baseline via `record_descriptor` — at the config row's
-commit LSN on a live opt-in, at boot on the re-run over seeded rows. So
-a post-opt-in `ALTER` diffs against the opt-in shape, never trips the
-cold-`prev_known` → `Added` path. The boot re-run fires post-`subscribe`
-so each opted-in rel enqueues one `Added`; benign — `apply_added` skips
-mapped rels (under strategy = drop it re-issues a `CREATE IF NOT EXISTS`
-the standing dest no-ops). Together the resolved scope, not just
-`cfg.tables`, is warm
-for one daemon lifetime. Open: boot-time drift (column added while the
-daemon is down folds silently into the seeded baseline) — see
-`plans/future/pinned_ddl_baseline.md`.
+The baseline is the *full source* descriptor, never the mapping: a
+pinned subset's unmapped columns sit in the log and read as
+"operator-excluded", so a later `ALTER` adds only genuinely-new columns,
+never re-adds an excluded one. Auto-create tables and opted-in rels get
+an idempotent boot `Added` pass over the log's active Present set each
+start (`CREATE TABLE IF NOT EXISTS` no-ops standing dests), so newly
+enabled config picks up existing rels at the next boot. Boot-time drift
+(column added while the daemon is down) lands as `Changed` at the next
+boundary touching the rel — the descriptor log diffs against the stored
+shape, not a freshly fetched one.
 
 ### Barrier fence (ordering data around DDL)
 
@@ -524,13 +558,15 @@ but doesn't propagate through `DecodedHeap`
 
 ## Foreign-DB row skip
 
-Physical replication ships the whole cluster's WAL, so the decode pool
-sees heap records for relations in other databases. `resolve_at_pooled`
-rejects those with `CatalogError::ForeignDatabase` (filenode resolved
-to a `db_node` that's neither the shadow DB nor a shared catalog — see
-[shadow.md](shadow.md)). Worker skips the row: no route, no poison,
-bump `stats.foreign_db_rows_skipped`; the seq's placed count simply
-excludes it so the ack advances past it
+Physical replication ships the whole cluster's WAL, so heap records
+for relations in other databases reach the decoder sink. The
+record-time spanned lookup answers `ForeignDb` (filenode's `db_node`
+is neither the shadow DB nor a shared catalog — see
+[shadow.md](shadow.md)) and the sink skips the record as a counted
+`catalog_not_found`; a foreign filenode that reached the commit-time
+stash instead resolves `ForeignDb` at `resolve_stash` and counts
+`stash_foreign_db_skipped` once per filenode ([xact.md](xact.md)).
+Nothing foreign survives to planning or the decode pool
 
 ## Read-time defaults integration
 

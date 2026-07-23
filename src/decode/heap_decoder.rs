@@ -100,10 +100,60 @@ pub const XLOG_HEAP_DELETE: u8 = 0x10;
 pub const XLOG_HEAP_UPDATE: u8 = 0x20;
 pub const XLOG_HEAP_TRUNCATE: u8 = 0x30;
 pub const XLOG_HEAP_HOT_UPDATE: u8 = 0x40;
+pub const XLOG_HEAP_CONFIRM: u8 = 0x50;
 pub const XLOG_HEAP_LOCK: u8 = 0x60;
 pub const XLOG_HEAP_INPLACE: u8 = 0x70;
 
 pub const XLOG_HEAP2_MULTI_INSERT: u8 = 0x50;
+
+/// `op=` label vocabulary for raw stash/decode counters, index-aligned
+/// with [`OpCounters`]
+pub const HEAP_OP_LABELS: [&str; 7] = [
+    "insert",
+    "delete",
+    "update",
+    "truncate",
+    "hot_update",
+    "multi_insert",
+    "other",
+];
+
+pub fn heap_op_index(rm: u8, info: u8) -> usize {
+    use walrus::pg::walparser::RmId;
+    let op = info & XLOG_HEAP_OPMASK;
+    if rm == RmId::Heap as u8 {
+        match op {
+            XLOG_HEAP_INSERT => 0,
+            XLOG_HEAP_DELETE => 1,
+            XLOG_HEAP_UPDATE => 2,
+            XLOG_HEAP_TRUNCATE => 3,
+            XLOG_HEAP_HOT_UPDATE => 4,
+            _ => 6,
+        }
+    } else if rm == RmId::Heap2 as u8 && op == XLOG_HEAP2_MULTI_INSERT {
+        5
+    } else {
+        6
+    }
+}
+
+/// Per-op atomic counters, index-aligned with [`HEAP_OP_LABELS`]
+#[derive(Debug, Default)]
+pub struct OpCounters([std::sync::atomic::AtomicU64; 7]);
+
+impl OpCounters {
+    pub fn add(&self, rm: u8, info: u8, n: u64) {
+        self.0[heap_op_index(rm, info)].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn bump(&self, rm: u8, info: u8) {
+        self.add(rm, info, 1);
+    }
+
+    pub fn load(&self) -> [u64; 7] {
+        std::array::from_fn(|i| self.0[i].load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
 
 // xl_heap_update.flags bit positions (heapam_xlog.h).
 pub const XLH_UPDATE_CONTAINS_OLD_TUPLE: u8 = 1 << 2;
@@ -192,10 +242,11 @@ pub enum ColumnValue {
     /// `json` Tier 3, varlena text on disk, passed through unchanged.
     Json(String),
     /// Tier 3 deferred (not numeric/inet/interval/json). Carries raw
-    /// on-disk body; resolved to text at emit via
+    /// on-disk body; resolved to text post-plan via
     /// `walshadow_decode_disk(oid, bytea) -> text` against shadow PG
-    /// (`walshadow` extension). Absent extension: emitter writes `<oid:N>`,
-    /// bumps `unsupported_values`.
+    /// (`walshadow` extension), best effort: shadow may lag row's catalog
+    /// state. Unresolved (extension absent / NULL result, counted
+    /// `fallback_raw`): emitter appends raw on-disk bytes.
     PgPending {
         type_oid: u32,
         raw: Vec<u8>,
@@ -281,6 +332,30 @@ impl DecodedHeap {
     }
 }
 
+/// Decoded heap frozen to the descriptor it decoded against. Downstream
+/// (detoast, replica identity, routing, truncate apply) reads the attached
+/// descriptor; no `descriptor_at` after construction, so a capture landing
+/// between decode and drain can't reinterpret the row. Spill serializes
+/// `descriptor_valid_from` instead of the `Arc`; rehydrate re-obtains the
+/// descriptor by key and fails closed on span mismatch
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribedHeap {
+    pub decoded: DecodedHeap,
+    pub descriptor: std::sync::Arc<crate::schema::RelDescriptor>,
+    /// Log entry `valid_from` of `descriptor` at attach
+    pub descriptor_valid_from: u64,
+}
+
+impl DescribedHeap {
+    /// Resident accounting counts the retained `Arc` reference (contents
+    /// shared, not per-row) plus the span key
+    pub fn approx_bytes(&self) -> usize {
+        self.decoded.approx_bytes()
+            + std::mem::size_of::<std::sync::Arc<crate::schema::RelDescriptor>>()
+            + std::mem::size_of::<u64>()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeapOp {
     Insert,
@@ -330,7 +405,7 @@ pub struct DecodedTuple {
 /// Unrecognised op codes skip silently; only malformed bytes return `Err`.
 ///
 /// `rel` must describe `record.blocks[0].header.location.rel`, fetched via
-/// [`ShadowCatalog::relation_at`](crate::catalog::shadow_catalog::ShadowCatalog::relation_at).
+/// [`DescriptorLog::descriptor_at`](crate::catalog::desc_log::DescriptorLog::descriptor_at).
 pub fn decode_heap_record(
     record: &XLogRecord,
     source_lsn: u64,
@@ -1311,6 +1386,7 @@ mod tests {
                 rel_node: rel,
             },
             oid: 16384,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "t"),
             kind: 'r',

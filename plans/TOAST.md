@@ -148,7 +148,8 @@ logically-logged rels, never toast):
   truncating xact commits — they stash and decode at commit (see Rewrite
   generations), their births ordering past the wipe by record LSN.
 - **DROP** (owner DROP, or a rewrite retiring its old toast rel) surfaces
-  the toast rel's `Dropped` via `sweep_dropped`; reorder queues the retire
+  the toast rel's `Dropped` via descriptor capture (absent from the
+  boundary's fetch with a Present predecessor); reorder queues the retire
   and executes it — emptied, table kept, counted `toast_mirror_retires` —
   only once the persisted resolved floor passes the dropping
   commit. Deferral is what makes the wipe replay-safe: durability of
@@ -176,12 +177,10 @@ logically-logged rels, never toast):
   are the operator-drop lever once the slot passes the dropping commit.
   Owner TRUNCATE's wipe needs no deferral: a replayed pre-truncate
   referrer may fill, but the destination TRUNCATE re-applies after it in
-  the same replayed barrier order. Sweep
-  only surfaces oids in `prev_known`: baseline seeding resolves pinned
-  owners' toast rels at boot, so a pinned owner's DROP retires the mirror
-  with no post-restart chunk decode; an auto-create rel dropped before any
-  post-restart touch keeps its stale mirror (storage-only, the rewrite
-  posture below).
+  the same replayed barrier order. Capture covers toast rels alongside
+  their owners (the boot seed and every boundary's inval set include
+  them), so a pinned owner's DROP retires the mirror with no
+  post-restart chunk decode.
 - **Rewrite generations** (VACUUM FULL / CLUSTER / rewriting ALTER, and
   the same-xact CREATE/TRUNCATE + INSERT siblings): the new toast heap
   fills through ordinary `XLOG_HEAP_INSERT`s on a filenode whose pg_class
@@ -190,8 +189,8 @@ logically-logged rels, never toast):
   stashes those records raw in the xact spill (`SpillEntry::Raw`) —
   admission gated on having seen the filenode's `XLOG_SMGR_CREATE` marker,
   which doubles as completeness proof (records cannot precede creation).
-  At commit, `resolve_stash` looks each filenode up via
-  `relation_at(rfn, commit_lsn)`: content swap resolves to the original
+  At commit, `resolve_stash` looks each filenode up in the descriptor
+  log at the commit's `next_lsn`: content swap resolves to the original
   toast oid with value ids preserved (`rd_toastoid`), link swap to the
   surviving transient toast oid with fresh ids and the old mirror retiring
   via the DROP path above. Resolved toast records decode in the drain
@@ -206,10 +205,10 @@ logically-logged rels, never toast):
   fetchable. Filenodes unresolvable post-commit (created-and-dropped in
   one xact, or rotated by a later replayed commit) discard their records
   (`toast_stash_discarded`) — access-exclusive supersession makes that
-  end-state-neutral. Records resolving to ordinary heaps stay fenced off
-  (`toast_stash_skipped`): lower-bound `relation_at` could return a later
-  same-filenode schema, so main-tuple decode waits on a shadow replay
-  fence. A toast resolution without its marker (observation began
+  end-state-neutral. Records resolving to ordinary heaps decode at drain
+  under their commit-resolution descriptor ([xact.md](xact.md)
+  Commit-time stash). A toast
+  resolution without its marker (observation began
   mid-xact) fails closed — fresh snapshot — rather than emitting an
   unauditable partial generation. Physical copies (SET TABLESPACE / SET
   LOGGED) FPI the toast heap verbatim with TIDs, bytes, and value ids

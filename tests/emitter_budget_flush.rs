@@ -43,6 +43,7 @@ fn rel_descriptor() -> Arc<RelDescriptor> {
     Arc::new(RelDescriptor {
         rfn: RFN,
         oid: 16385,
+        toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", "foo"),
         kind: 'r',
@@ -162,7 +163,7 @@ async fn budget_trips_seal_complete_inserts() {
             .expect("spawn tail");
 
     let rel = rel_descriptor();
-    let mapping = mapping();
+    let route = walshadow::emit::route::RouteSnapshot::freeze(mapping(), Arc::default(), false);
     const N: i32 = 5;
     let commit_lsn = 0xC0FFEE;
     ack.register(0, commit_lsn);
@@ -171,7 +172,7 @@ async fn budget_trips_seal_complete_inserts() {
             .send(BatcherMsg::Row(RoutedRow {
                 seq: 0,
                 rel: rel.clone(),
-                mapping: mapping.clone(),
+                route: route.clone(),
                 committed: tuple(i, 0x1000 + i as u64, commit_lsn),
                 permit: None,
                 value_permit: None,

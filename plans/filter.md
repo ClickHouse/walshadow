@@ -75,17 +75,56 @@ Inputs:
   Closes the "long-running source already rotated a mapped catalog
   before walshadow attached" hole. Shared catalogs seed under
   `db_node = 0`, per-db under `current_database()` oid
-- DROP TABLE coarse signal — `heap_delete` against current `pg_class`
-  filenode signals `InvalidateSweep` so ShadowCatalog drops cached
-  descriptors. No tuple decode (system catalogs default to
-  `relreplident = 'n'`, WAL omits dying tuple)
+- DROP TABLE — `heap_delete` against current `pg_class` filenode marks
+  the xid catalog-dirty like any other pg_class write. No tuple decode
+  (system catalogs default to `relreplident = 'n'`, WAL omits the dying
+  tuple); the dropped oid comes from the commit record's relcache
+  invalidations at the boundary
 
-`observe` returns a `CatalogSignal` verdict stamped on the record; the
-decoder worker bumps the shared `Arc<AtomicU64>` invalidation epoch at
-its own stream position (a pump-position bump would be consumable
-before pre-DDL records finish decoding). `InvalidateSweep` also arms
-`PendingSweeps` with the record's xid — the sweep must run at the
-dropping xact's own commit (see [shadow.md](shadow.md))
+`observe` returns an `Observation`: whether the record mutated a tracked
+catalog (drives dirty-xid marking, incl the `Special`-class relmap path)
+plus a decoded user-rel pg_class oid when block 0 carried one — the
+per-oid first-touch source for `BoundaryInfo`. At a dirty xact's commit
+the filter builds `BoundaryInfo` (drain xid, affected oids from decodes
+∪ relcache invals, tree first-touch, capture-all flag) and stamps it on
+the record for descriptor capture ([desc_log.md](desc_log.md)). The
+filter also keeps a pump-side `XLOG_SMGR_CREATE` marker map — the
+bias-early valid_from source for rotated filenodes
+
+## Dirty tree
+
+`src/filter/dirty_tree.rs`: pump-side catalog-dirty transaction tree
+behind the `defer_catalog_decode` stamp. Once a xact family touches the
+catalog, every subsequent decoder-routed record in that family carries
+the flag and the decoder sink stashes it raw for commit-time resolution
+([xact.md](xact.md) Commit-time stash) — a Present predecessor
+descriptor doesn't prove decodability inside the dirty interval. State
+stays keyed by writing xid, never merged eagerly into the top: subxact
+abort drops exactly its subtree's observations while sibling and top
+dirt survive. Tree links (subxid → top) arrive from record-inline
+toplevel xids (`XLR_BLOCK_ID_TOPLEVEL_XID`) and batched
+`XLOG_XACT_ASSIGNMENT` records; both name the top directly so links
+never chain. Admission asks "is this record's tree dirty" via a
+per-root dirty-member count; a subxid whose top is still unknown counts
+as its own root — only its own later records defer until a link lands
+(prefer excess raw buffering over predecessor decode). Interleaved
+clean xacts are untouched; commit/abort clears the family's dirt
+
+Boundary classification is restart-safe off the commit record alone: its
+inval set covers the whole xact tree, so relcache invals enumerate
+affected rels and pg_namespace catcache / whole-catalog invals force
+capture-all even when the resume floor sits past every catalog record
+the xact wrote (dirty tracker never saw them). Catcache messages carry a
+syscache id + hash, not oids — only "which catalog" is recoverable, and
+`SysCacheIdentifier` values are keyed per WAL page magic (name-sorted
+generation shifts ids across majors; each new major needs the id table
+audited). Mid-xact `XLOG_XACT_INVALIDATIONS` records (command
+boundaries, wal_level=logical) walk the same classification and re-dirty
+the writing xid — sharper first-touch than the commit-LSN fallback when
+the floor splits an open xact, merged across subxacts at commit like any
+dirty entry; aborts drain them without holding. Only descriptor-relevant
+messages dirty (namespace hit, whole-relcache flush, user-rel relcache
+inval): ANALYZE-rate catcache churn must not hold publication at commit
 
 ## Rewrite path
 

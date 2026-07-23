@@ -30,15 +30,15 @@ use crate::emit::ch_emitter::{
     ColumnBuf, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TablePlan,
 };
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
-use crate::mapping::TableMapping;
+use crate::emit::route::RouteSnapshot;
 use crate::schema::{RelDescriptor, RelName};
 
-/// One decoded row routed to its destination. `mapping`/`rel` are `Arc`
+/// One decoded row routed to its destination. `route`/`rel` are `Arc`
 /// clones a decoder resolves once per xact/table.
 pub struct RoutedRow {
     pub seq: u64,
     pub rel: Arc<RelDescriptor>,
-    pub mapping: Arc<TableMapping>,
+    pub route: Arc<RouteSnapshot>,
     pub committed: CommittedTuple,
     /// Admission permit share riding the row into batcher slabs and the
     /// in-flight insert block; released post-insert-ack when the covering
@@ -150,9 +150,6 @@ struct RowCtx<'a> {
     out: &'a async_channel::Sender<InsertBatch>,
     alloc: Allocator,
     epoch: u64,
-    /// Live snapshot for `config_column` overrides at plan build; `None`
-    /// when the overlay is off.
-    resolved: Option<&'a ResolvedConfig>,
     stats: &'a EmitterStats,
 }
 
@@ -170,8 +167,7 @@ pub(crate) fn spawn(
     tokio::spawn(async move {
         let mut tables: HashMap<RelName, Table> = HashMap::new();
         let mut epoch: u64 = 0;
-        let mut snap = snapshot(config_rx.as_ref());
-        let mut live = effective_cfg(&cfg, snap.as_deref());
+        let mut live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
         let mut ticker = tokio::time::interval(live.flush_timeout);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let stats = stats.as_ref();
@@ -179,18 +175,16 @@ pub(crate) fn spawn(
             tokio::select! {
                 msg = msg_rx.recv() => match msg {
                     Some(BatcherMsg::Row(r)) => {
-                        snap = snapshot(config_rx.as_ref());
-                        live = effective_cfg(&cfg, snap.as_deref());
-                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, resolved: snap.as_deref(), stats };
+                        live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
                         if let Err(e) = handle_row(&mut tables, &ctx, r).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
                     }
                     Some(BatcherMsg::Rows(rows)) => {
-                        snap = snapshot(config_rx.as_ref());
-                        live = effective_cfg(&cfg, snap.as_deref());
-                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, resolved: snap.as_deref(), stats };
+                        live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
                         if let Err(e) = handle_rows(&mut tables, &ctx, rows).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
@@ -220,8 +214,7 @@ pub(crate) fn spawn(
                 // Live emitter-knob change: re-arm the deadline ticker to the
                 // new flush_timeout. Budgets are re-read per message below.
                 _ = config_changed(&mut config_rx) => {
-                    snap = snapshot(config_rx.as_ref());
-                    live = effective_cfg(&cfg, snap.as_deref());
+                    live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                     ticker = tokio::time::interval(live.flush_timeout);
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 }
@@ -231,8 +224,7 @@ pub(crate) fn spawn(
 }
 
 /// Latest resolved snapshot off the watch, `None` when the overlay is off.
-/// One `Arc` clone per message; also feeds the per-table column overrides at
-/// plan build.
+/// Feeds live batch knobs only; column overrides ride the route snapshot.
 fn snapshot(rx: Option<&watch::Receiver<Arc<ResolvedConfig>>>) -> Option<Arc<ResolvedConfig>> {
     rx.map(|rx| rx.borrow().clone())
 }
@@ -289,12 +281,16 @@ async fn handle_row(
         .fetch_add(1, Ordering::Relaxed);
     let key = &row.rel.rel_name;
     if !tables.contains_key(key) {
-        // Column-type overrides re-read per plan build; a `Column*` config
+        // Overrides ride the route frozen at planning; a `Column*` config
         // event applies under the barrier fence, whose FlushAll cleared this
-        // plan cache, so post-apply rows rebuild against the new snapshot
-        let overrides = ctx.resolved.and_then(|rc| rc.columns.get(key));
-        let plan = TablePlan::build(ctx.alloc, &row.rel, &row.mapping, overrides)
-            .map_err(|e| e.to_string())?;
+        // plan cache, so post-apply rows rebuild from post-apply routes
+        let plan = TablePlan::build(
+            ctx.alloc,
+            &row.rel,
+            &row.route.mapping,
+            Some(&row.route.column_overrides),
+        )
+        .map_err(|e| e.to_string())?;
         let meta = Arc::new(BatchMeta::from_plan(&plan, key.clone(), ctx.epoch));
         let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
         tables.insert(
@@ -326,7 +322,7 @@ async fn handle_row(
         HeapOp::Truncate => return Err("TRUNCATE routed to batcher".into()),
     };
     t.enc
-        .append_row(&row.committed, &row.mapping, op)
+        .append_row(&row.committed, &row.route.mapping, op)
         .map_err(|e| e.to_string())?;
     match t.seq_counts.last_mut() {
         Some((s, c)) if *s == row.seq => *c += 1,
@@ -413,7 +409,7 @@ async fn flush_all(
 mod tests {
     use super::*;
     use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
-    use crate::mapping::{ColumnMapping, TableTarget};
+    use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use tokio::sync::oneshot;
     use walrus::pg::walparser::RelFileNode;
@@ -426,6 +422,7 @@ mod tests {
                 rel_node: 16385,
             },
             oid: 16385,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "t"),
             kind: 'r',
@@ -448,22 +445,26 @@ mod tests {
         })
     }
 
-    fn mapping() -> Arc<TableMapping> {
-        Arc::new(TableMapping {
-            target: TableTarget::new("default", "t"),
-            columns: vec![ColumnMapping {
-                src_attnum: 1,
-                target_name: "id".into(),
-                target_type: "Int32".into(),
-            }],
-        })
+    fn route() -> Arc<RouteSnapshot> {
+        RouteSnapshot::freeze(
+            Arc::new(TableMapping {
+                target: TableTarget::new("default", "t"),
+                columns: vec![ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: "Int32".into(),
+                }],
+            }),
+            Arc::default(),
+            false,
+        )
     }
 
     fn row(seq: u64, id: i32) -> RoutedRow {
         RoutedRow {
             seq,
             rel: rel(),
-            mapping: mapping(),
+            route: route(),
             committed: CommittedTuple {
                 decoded: DecodedHeap {
                     rfn: RelFileNode {
@@ -585,6 +586,54 @@ mod tests {
         assert_eq!(s0, 3, "seq 0 rows");
         assert_eq!(s1, 2, "seq 1 rows");
         assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
+    }
+
+    /// Route-carried `config_column` override reaches the encoder plan
+    /// unchanged with no config watch wired — the snapshot is the only
+    /// override source (spec §Tests / Route and config)
+    #[tokio::test]
+    async fn route_override_snapshot_reaches_plan() {
+        let (msg_tx, msg_rx) = mpsc::channel(8);
+        let (batches_tx, batches_rx) = async_channel::bounded(8);
+        let fatal = Fatal::new();
+        let handle = spawn(
+            msg_rx,
+            batches_tx,
+            BatcherConfig {
+                row_budget: 1,
+                byte_budget: 1 << 30,
+                flush_timeout: Duration::from_secs(3600),
+            },
+            Allocator::stdlib(),
+            fatal.clone(),
+            Arc::new(EmitterStats::default()),
+            None,
+        );
+        // Int32 → UInt32 is wire-compatible (same fixed width), admissible
+        let overrides = HashMap::from([(String::from("id"), String::from("UInt32"))]);
+        let mut r = row(0, 1);
+        r.route = RouteSnapshot::freeze(
+            Arc::new(TableMapping {
+                target: TableTarget::new("default", "t"),
+                columns: vec![ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: "Int32".into(),
+                }],
+            }),
+            Arc::new(overrides),
+            false,
+        );
+        msg_tx.send(BatcherMsg::Row(r)).await.expect("send row");
+        drop(msg_tx);
+        let batch = batches_rx.recv().await.expect("one batch");
+        assert_eq!(batch.meta.columns[0].name, "id");
+        assert_eq!(
+            batch.meta.columns[0].type_repr, "UInt32",
+            "override rode the route snapshot into the plan"
+        );
+        handle.await.expect("batcher task");
+        assert!(fatal.message().is_none());
     }
 
     /// FlushAll seals everything sent before it and replies, even below budget

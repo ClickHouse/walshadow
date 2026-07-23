@@ -23,44 +23,42 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
 
-use crate::catalog::shadow_catalog::{CatalogError, ShadowCatalog};
-use crate::decode::decoder_sink::DecoderSinkError;
-use crate::decode::heap_decoder::{DecodedHeap, HeapOp};
+use crate::catalog::desc_log::DescriptorLog;
+use crate::catalog::shadow_catalog::ShadowCatalog;
+use crate::decode::heap_decoder::{DescribedHeap, HeapOp};
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
-use crate::schema::{RelName, SchemaEvent, SchemaEventRx};
+use crate::schema::{RelDescriptor, RelName, SchemaEvent};
 use tracing::Instrument;
 
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
-    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, XactCommitPayload, parse_xact_assignment,
-    parse_xact_payload,
+    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
 };
 use crate::ops::trace::TxnSpanRegistry;
-use crate::xact::xact_buffer::{
-    ChunkGeneration, DrainEntry, DrainedBatch, SubxactTracker, ToastRowBatch, WalkStep, XactBuffer,
-    drain_pending_schema_events,
-};
+use crate::xact::xact_buffer::{DrainEntry, SubxactTracker, XactBuffer};
 
 use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::decode::DecodeJob;
+use crate::emit::pipeline::plan_spool::{PlanItem, SealedPlan};
+use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
+use crate::emit::route::{RouteSnapshot, RoutedHeap};
+use crate::mapping::{MappingHandle, MappingSnapshot, TableMapping};
 use crate::runtime_config::{ConfigEvent, TableRow};
 use crate::toast::ToastResolver;
 use crate::toast::toast_retire::RetireLedger;
 
 pub struct ReorderSink {
     buffer: Arc<Mutex<XactBuffer>>,
+    /// Interval-scoped descriptor oracle: stash resolution + truncate
+    log: Arc<DescriptorLog>,
+    /// Opt-in dispatch still resolves by name against live shadow
     catalog: Arc<Mutex<ShadowCatalog>>,
     subxact_tracker: Arc<Mutex<SubxactTracker>>,
-    schema_events: Option<SchemaEventRx>,
-    /// Armed by the decoder at pg_class heap_delete records, consumed
-    /// only at the arming xact's own commit (see
-    /// [`PendingSweeps`](crate::filter::catalog_tracker::PendingSweeps))
-    pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
     /// `None` on the metrics-only (null-tail) configuration: schema events
     /// and truncates are observed, never applied to CH
     applicator: Option<DdlApplicator>,
@@ -115,16 +113,33 @@ pub struct ReorderSink {
     /// the shadow. Retried each commit until it resolves, then created +
     /// backfilled (moves to `applied_opt_ins`).
     pending_opt_ins: HashMap<RelName, TableRow>,
+    /// Shared routing map, snapshotted into `route_mapping` at route-state
+    /// resets (this coordinator's own event applies are the fenced writers).
+    mapping: MappingHandle,
+    /// Boot-only delete-retention policy, frozen into route snapshots.
+    soft_delete: bool,
+    /// Byte cap per transaction plan spool file
+    plan_disk_max: u64,
+    /// Plan spool directory (the xact spill dir), cached at spawn so the
+    /// per-commit path needs no buffer lock
+    plan_dir: std::path::PathBuf,
+    /// Mapping version frozen with the memo reset: one transaction plans
+    /// against one mapping version, a concurrent republish (SIGHUP /
+    /// control-socket, no WAL position) can't split its rows. In-walk event
+    /// applies re-snapshot so trailing heaps see the event's own effect.
+    route_mapping: Option<MappingSnapshot>,
+    /// Resolved-config snapshot taken with the memo reset; every override in
+    /// one interval comes from one snapshot, never a mid-interval republish.
+    route_config: Option<Arc<ResolvedConfig>>,
 }
 
 impl ReorderSink {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer: Arc<Mutex<XactBuffer>>,
+        log: Arc<DescriptorLog>,
         catalog: Arc<Mutex<ShadowCatalog>>,
         subxact_tracker: Arc<Mutex<SubxactTracker>>,
-        schema_events: Option<SchemaEventRx>,
-        pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
         applicator: Option<DdlApplicator>,
         ack: AckHandle,
         jobs_tx: async_channel::Sender<DecodeJob>,
@@ -137,28 +152,31 @@ impl ReorderSink {
         span_registry: Option<TxnSpanRegistry>,
         batch_rows: usize,
         batch_bytes: usize,
+        plan_disk_max: u64,
+        plan_dir: std::path::PathBuf,
         budget: Option<crate::budget::MemoryBudget>,
         retires: RetireLedger,
         resume_floor: Arc<AtomicU64>,
+        mapping: MappingHandle,
+        soft_delete: bool,
     ) -> Self {
-        let reload_rx = config_resolver.as_ref().map(|r| r.subscribe());
-        let applied_opt_ins = reload_rx
-            .as_ref()
-            .map(|rx| {
-                rx.borrow()
-                    .table_opt_ins
-                    .iter()
-                    .filter(|(_, row)| row.replicate == Some(true))
-                    .map(|(rel, _)| rel.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // subscribe() marks the current value seen, so a `ctl reload`
+        // racing pipeline spawn would stay invisible to has_changed —
+        // and seeding the applied set from that raced value would record
+        // its opt-ins as done without ever applying them. Start empty and
+        // force the first commit to diff from scratch: re-applying
+        // boot-seeded opt-ins is the designed-idempotent restart path
+        // (CH table persists, backfill ledger dedups)
+        let reload_rx = config_resolver.as_ref().map(|r| {
+            let mut rx = r.subscribe();
+            rx.mark_changed();
+            rx
+        });
         Self {
             buffer,
+            log,
             catalog,
             subxact_tracker,
-            schema_events,
-            pending_sweeps,
             applicator,
             ack,
             jobs_tx,
@@ -171,14 +189,31 @@ impl ReorderSink {
             next_seq: 0,
             batch_rows,
             batch_bytes,
+            plan_disk_max,
+            plan_dir,
             budget,
             span_registry,
             retires,
             resume_floor,
             reload_rx,
-            applied_opt_ins,
+            applied_opt_ins: HashSet::new(),
             pending_opt_ins: HashMap::new(),
+            mapping,
+            soft_delete,
+
+            route_mapping: None,
+            route_config: None,
         }
+    }
+
+    /// Route-point steps 1–2 close out here: preceding schema/config state is
+    /// applied, so drop memoized routes and freeze mapping + resolved-config
+    /// versions for the next interval. Per commit this is the
+    /// whole-transaction snapshot; a non-WAL-positioned republish landing
+    /// mid-plan can't reroute rows already planned or split the transaction.
+    async fn reset_route_state(&mut self) {
+        self.route_mapping = Some(self.mapping.read().await.clone());
+        self.route_config = self.reload_rx.as_ref().map(|rx| rx.borrow().clone());
     }
 
     /// Apply a live config reload's table opt-in/opt-out diff at a commit
@@ -229,6 +264,12 @@ impl ReorderSink {
                     self.pending_opt_ins.insert(rel, row);
                 }
             }
+            tracing::info!(
+                target: "walshadow::config",
+                pending = self.pending_opt_ins.len(),
+                applied = self.applied_opt_ins.len(),
+                "reload diff applied",
+            );
         }
         // Each commit, apply any pending opt-in the shadow catalog can now
         // resolve — a table created just before `select` races the CREATE's
@@ -256,6 +297,11 @@ impl ReorderSink {
                 .map_err(|e| SinkError::Other(format!("opt-in descriptor lookup: {e}")))?
                 .is_some();
             if !known {
+                tracing::debug!(
+                    target: "walshadow::config",
+                    qname = %rel,
+                    "opt-in retry: descriptor unknown",
+                );
                 continue;
             }
             crate::backfill::opt_in::apply_table_opt_in(
@@ -339,64 +385,6 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Drain pending DROP events (post-`sweep_dropped`) into the buffer keyed
-    /// on `(xid, source_lsn)`. Mirrors
-    /// `XactRecordSink::route_pending_schema_events`.
-    async fn route_pending_schema_events(
-        &mut self,
-        xid: u32,
-        source_lsn: u64,
-    ) -> Result<(), SinkError> {
-        let Some(rx) = self.schema_events.as_ref() else {
-            return Ok(());
-        };
-        let pending = drain_pending_schema_events(rx);
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let mut buf = self.buffer.lock().await;
-        for ev in pending {
-            buf.on_schema_event(xid, source_lsn, ev);
-        }
-        Ok(())
-    }
-
-    /// Poll-based DROP discovery, run only at the commit of an xact that
-    /// wrote pg_class heap_delete (ADD COLUMN / VACUUM noise never arms)
-    /// so the replay gate makes the drop visible in shadow. Same as
-    /// `XactRecordSink`'s commit branch.
-    async fn maybe_sweep_dropped(
-        &mut self,
-        xid: u32,
-        payload: &XactCommitPayload,
-        source_lsn: u64,
-    ) -> Result<(), SinkError> {
-        if self.schema_events.is_none() {
-            return Ok(());
-        }
-        let Some(pending) = &self.pending_sweeps else {
-            return Ok(());
-        };
-        if !pending.disarm(xid, payload.twophase_xid, &payload.subxacts) {
-            return Ok(());
-        }
-        let dropped = {
-            let mut cat = self.catalog.lock().await;
-            if source_lsn > 0 {
-                cat.wait_for_replay(source_lsn)
-                    .await
-                    .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?;
-            }
-            cat.sweep_dropped()
-                .await
-                .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?
-        };
-        if dropped > 0 {
-            self.route_pending_schema_events(xid, source_lsn).await?;
-        }
-        Ok(())
-    }
-
     // Helpers take `&mut self` so the borrow across awaits is `&mut Self`
     // (Send): owned `DdlApplicator`/`AsyncClient` is Send but not Sync, so a
     // shared `&Self` across an await wouldn't be Send.
@@ -451,34 +439,6 @@ impl ReorderSink {
         self.wait_all_durable().await
     }
 
-    /// Dispatch accumulated barrier data rows as their own seq. No-op when
-    /// empty. Always a non-final slice: the commit's trailing rows=0 marker
-    /// carries the LSN publication, so a durable segment can't claim the
-    /// whole commit while later segments are in flight.
-    async fn dispatch_segment(
-        &mut self,
-        pending: &mut Vec<DecodedHeap>,
-        commit_ts: i64,
-        commit_lsn: u64,
-        chunks: &[Arc<ChunkGeneration>],
-        permit: &Option<Arc<crate::budget::MemoryPermit>>,
-    ) -> Result<(), SinkError> {
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let seq = self.alloc_seq();
-        self.ack.register_partial(seq, commit_lsn);
-        let job = DecodeJob {
-            seq,
-            commit_ts,
-            commit_lsn,
-            heaps: std::mem::take(pending),
-            chunks: chunks.to_vec(),
-            permit: permit.clone(),
-        };
-        self.dispatch_job(job).await
-    }
-
     async fn apply_event(&mut self, event: &SchemaEvent, commit_lsn: u64) -> Result<(), SinkError> {
         let Some(applicator) = self.applicator.as_mut() else {
             return Ok(());
@@ -518,6 +478,27 @@ impl ReorderSink {
     /// their drop never replays, so no commit re-triggers this flush.
     /// Ledger removal persists after each wipe; a crash between re-runs
     /// an idempotent `TRUNCATE` on the emptied mirror
+    /// Boot Added pass: every relation `Present` in the descriptor log at
+    /// resume gets an `Added` apply (idempotent `CREATE TABLE IF NOT
+    /// EXISTS` + forward-declaration materialise). Runs pre-pump every
+    /// boot, like [`Self::flush_due_retires`] — brownfield auto-create
+    /// tables exist at attach instead of first write, and newly enabled
+    /// auto-create/mapping picks up existing rels without log mutation.
+    pub async fn apply_boot_events(
+        &mut self,
+        descs: Vec<Arc<RelDescriptor>>,
+        resume_lsn: u64,
+    ) -> Result<(), SinkError> {
+        for desc in descs {
+            if desc.kind == 't' {
+                continue;
+            }
+            self.apply_event(&SchemaEvent::Added { desc }, resume_lsn)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn flush_due_retires(&mut self) -> Result<(), SinkError> {
         // Disabled resolver no-ops retire_mirror: flushing would drop ledger
         // entries without wiping mirrors, leaking them for a later CH run
@@ -571,108 +552,178 @@ impl ReorderSink {
         }
     }
 
-    async fn apply_truncate(&mut self, heap: &DecodedHeap) -> Result<(), SinkError> {
+    async fn apply_truncate(&mut self, heap: &DescribedHeap) -> Result<(), SinkError> {
         let Some(applicator) = self.applicator.as_mut() else {
             return Ok(());
         };
-        let rel = match crate::catalog::shadow_catalog::resolve_at(
-            &self.catalog,
-            heap.rfn,
-            heap.source_lsn,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(CatalogError::ForeignDatabase(_)) => return Ok(()),
-            Err(e) => return Err(SinkError::from(DecoderSinkError::from(e))),
-        };
+        // Attached at truncate fan-out (record time = pre-capture Present),
+        // so the rotation's drain-time Retired answer no longer needs a
+        // predecessor walk here
+        let rel = &heap.descriptor;
         applicator
             .truncate(&rel.rel_name)
             .await
             .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
-        // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`
-        if self.resolver.stores_chunks() {
-            let toast = {
-                let mut cat = self.catalog.lock().await;
-                cat.toast_descriptor_for(rel.oid)
-                    .await
-                    .map_err(|e| SinkError::from(DecoderSinkError::from(e)))?
-            };
-            if let Some(t) = toast {
-                self.resolver
-                    .truncate_mirror(t.oid)
-                    .await
-                    .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
-            }
+        // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`;
+        // the descriptor carries the owner's toast oid
+        if self.resolver.stores_chunks() && rel.toast_oid != 0 {
+            self.resolver
+                .truncate_mirror(rel.toast_oid)
+                .await
+                .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
         }
         Ok(())
     }
 
-    /// Bounded just-in-time materialization from the batch's body spool
-    async fn put_rows_to(
+    /// Materialize plan mirror rows `[cursor..end)` just in time; global
+    /// indices span the plan's carried row batches in order
+    async fn put_plan_rows(
         &mut self,
-        rows: &ToastRowBatch,
+        plan: &SealedPlan,
         cursor: &mut usize,
         end: usize,
     ) -> Result<(), SinkError> {
-        if end > *cursor {
-            self.resolver
-                .put_row_refs(rows.spool(), &rows[*cursor..end])
-                .await
-                .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
-            *cursor = end;
+        let mut base = 0usize;
+        for rb in &plan.row_batches {
+            let (lo, hi) = ((*cursor).max(base), end.min(base + rb.len()));
+            if lo < hi {
+                self.resolver
+                    .put_row_refs(rb.spool(), &rb[lo - base..hi - base])
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+            }
+            base += rb.len();
         }
+        *cursor = (*cursor).max(end);
         Ok(())
     }
 
-    /// Fence each apply after preceding data; step order owned by
-    /// [`DrainedBatch::into_walk`]
-    async fn run_barrier_batch(
+    /// Dispatch accumulated planned heaps as one seq under a fresh
+    /// admission permit. Chunks ride empty: values detoasted at planning.
+    /// `publish` marks the commit's final data segment so its seq carries
+    /// the LSN publication (no trailing marker needed)
+    async fn dispatch_planned(
         &mut self,
-        batch: DrainedBatch,
+        pending: &mut Vec<RoutedHeap>,
+        pending_bytes: &mut usize,
         commit_ts: i64,
         commit_lsn: u64,
-        permit: Option<Arc<crate::budget::MemoryPermit>>,
+        publish: bool,
     ) -> Result<(), SinkError> {
-        let walk = batch.into_walk();
-        let mut pending: Vec<DecodedHeap> = Vec::new();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let heaps = std::mem::take(pending);
+        let bytes = std::mem::take(pending_bytes);
+        let permit = match &self.budget {
+            Some(b) => Some(Arc::new(b.admit(bytes).await)),
+            None => None,
+        };
+        let seq = self.alloc_seq();
+        if publish {
+            self.ack.register(seq, commit_lsn);
+        } else {
+            self.ack.register_partial(seq, commit_lsn);
+        }
+        let job = DecodeJob {
+            seq,
+            commit_ts,
+            commit_lsn,
+            heaps,
+            chunks: Vec::new(),
+            permit,
+        };
+        self.dispatch_job(job).await
+    }
+
+    /// Replay one sealed plan through the existing barrier ordering. Routes
+    /// ride the plan — nothing re-resolves. Heap segments slice at the
+    /// batch budget; controls fence then apply their real side effects at
+    /// their pinned positions; mirror rows put just in time; truncates
+    /// fence per their carried cursor. The final data segment publishes the
+    /// commit LSN when nothing follows it; otherwise the caller's trailing
+    /// rows=0 marker does. Returns dispatched rows + whether it published
+    pub async fn execute_plan(&mut self, plan: &SealedPlan) -> Result<(u64, bool), SinkError> {
+        let (commit_ts, commit_lsn) = (plan.commit_ts, plan.commit_lsn);
+        // Mem-resident plans hold the bytes validated at write; file-backed
+        // plans re-read from disk, checksum-verify fully before the first
+        // side effect so corruption fails the whole transaction
+        if plan.path().is_some() {
+            plan.verify()
+                .map_err(|e| SinkError::Other(format!("plan verify: {e}")))?;
+        }
+        let mut rd = plan
+            .replay()
+            .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?;
+        let mut pending: Vec<RoutedHeap> = Vec::new();
+        let mut pending_bytes = 0usize;
         let mut rows_cursor = 0usize;
-        for step in walk.steps {
-            match step {
-                WalkStep::Rows { upto } => {
-                    self.put_rows_to(&walk.new_rows, &mut rows_cursor, upto)
+        let mut trunc = plan.truncate_rows.iter().copied();
+        let total_rows: usize = plan.row_batches.iter().map(|rb| rb.len()).sum();
+        let mut rows_total = 0u64;
+        while let Some(item) = rd
+            .next_item()
+            .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?
+        {
+            match item {
+                PlanItem::Control(c) => {
+                    self.put_plan_rows(plan, &mut rows_cursor, c.row_idx)
                         .await?;
-                }
-                WalkStep::Event(entry) => {
-                    self.dispatch_segment(
+                    self.dispatch_planned(
                         &mut pending,
+                        &mut pending_bytes,
                         commit_ts,
                         commit_lsn,
-                        &walk.chunks,
-                        &permit,
+                        false,
                     )
                     .await?;
                     self.barrier_fence().await?;
-                    self.apply_drain_entry(&entry, commit_lsn).await?;
+                    self.apply_drain_entry(&c.event, commit_lsn).await?;
                 }
-                WalkStep::Truncate(heap) => {
-                    self.dispatch_segment(
+                PlanItem::Heap(h) if matches!(h.described.decoded.op, HeapOp::Truncate) => {
+                    let upto = trunc.next().unwrap_or(rows_cursor);
+                    self.put_plan_rows(plan, &mut rows_cursor, upto).await?;
+                    self.dispatch_planned(
                         &mut pending,
+                        &mut pending_bytes,
                         commit_ts,
                         commit_lsn,
-                        &walk.chunks,
-                        &permit,
+                        false,
                     )
                     .await?;
                     self.barrier_fence().await?;
-                    self.apply_truncate(&heap).await?;
+                    self.apply_truncate(&h.described).await?;
                 }
-                WalkStep::Heap(heap) => pending.push(heap),
+                PlanItem::Heap(h) => {
+                    rows_total += 1;
+                    pending_bytes += h.described.approx_bytes();
+                    pending.push(h);
+                    if pending.len() >= self.batch_rows || pending_bytes >= self.batch_bytes {
+                        self.dispatch_planned(
+                            &mut pending,
+                            &mut pending_bytes,
+                            commit_ts,
+                            commit_lsn,
+                            false,
+                        )
+                        .await?;
+                    }
+                }
             }
         }
-        self.dispatch_segment(&mut pending, commit_ts, commit_lsn, &walk.chunks, &permit)
-            .await
+        self.put_plan_rows(plan, &mut rows_cursor, total_rows)
+            .await?;
+        let publish = !pending.is_empty();
+        self.dispatch_planned(
+            &mut pending,
+            &mut pending_bytes,
+            commit_ts,
+            commit_lsn,
+            publish,
+        )
+        .await?;
+        Ok((rows_total, publish))
     }
 
     async fn on_commit(
@@ -682,7 +733,12 @@ impl ReorderSink {
         record: &Record<'_>,
     ) -> Result<(), SinkError> {
         self.flush_due_retires().await?;
-        let payload = parse_xact_payload(info, &record.parsed.main_data);
+        let payload = parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+            .unwrap_or_default();
+        // COMMIT PREPARED: header xid is the finishing backend's (0-ish),
+        // the buffered work lives under the prepared xid — drain there, or
+        // capture-keyed events would never leave the buffer
+        let xid = payload.twophase_xid.unwrap_or(xid);
         // Parent for this commit's spans; held until on_commit returns so it
         // outlives the prune below. No-op span when tracing off/unsampled.
         let txn = self
@@ -690,21 +746,16 @@ impl ReorderSink {
             .as_ref()
             .and_then(|r| r.txn_span(xid))
             .unwrap_or_else(tracing::Span::none);
-        self.maybe_sweep_dropped(xid, &payload, record.source_lsn)
-            .await?;
         crate::xact::xact_buffer::resolve_stash(
             &self.buffer,
-            &self.catalog,
+            &self.log,
             xid,
             &payload.subxacts,
-            record.source_lsn,
+            record.next_lsn,
             self.stats.clone(),
         )
         .await
         .map_err(SinkError::from)?;
-        // Resolution can surface Added events for newly visible rels
-        self.route_pending_schema_events(xid, record.source_lsn)
-            .await?;
         let drain_span = trace_span!(
             !txn.is_none(),
             parent: &txn,
@@ -745,95 +796,95 @@ impl ReorderSink {
             r.prune(&xids);
         }
 
-        // Pull bounded slices from the lazy merge: the decode pool works one
-        // while the next loads, so a spilled xact never rematerializes whole.
+        // Plan the whole transaction side-effect-free, then execute the
+        // sealed plan: every input-derived failure surfaces before the first
+        // side effect. A planning error abandons the plan file (writer drop
+        // unlinks) and the transaction emits nothing.
         let commit_ts = drain.commit_ts;
         let commit_lsn = drain.commit_lsn;
         // Apply any pending live-reload opt-in/opt-out diff before this commit's
         // rows so newly-selected tables are in scope + created for it.
         self.maybe_apply_reload(commit_lsn).await?;
+        // One route state per transaction: a mid-commit config republish
+        // can't split this xact's rows across two route versions. In-walk
+        // catalog events fold into the plan-time view, not shared state.
+        self.reset_route_state().await;
         let mut rows_total: u64 = 0;
-        // Set once a slice's seq registered as publishing (final data slice);
-        // otherwise the trailing rows=0 marker publishes.
         let mut published = false;
-        loop {
-            let Some(batch) = drain
-                .next_batch(self.batch_rows, self.batch_bytes, self.budget.as_ref())
-                .instrument(drain_span.clone())
-                .await
-                .map_err(SinkError::from)?
-            else {
-                break;
-            };
-            rows_total += batch.heaps.len() as u64;
-            // Admission before dispatch keeps backpressure here. Sealed
-            // generations already carry permits acquired by `next_batch`;
-            // slice permit covers decoded heap bytes + row metadata
-            let permit = match &self.budget {
-                Some(b) => {
-                    let bytes = batch.heaps.iter().map(|h| h.approx_bytes()).sum::<usize>()
-                        + batch.new_rows.resident_bytes();
-                    Some(Arc::new(b.admit(bytes).await))
+        if drain.had_states {
+            let plan_path = self.plan_dir.join(format!("xact-{xid}-{commit_lsn}.plan"));
+            let plan = {
+                let mut view = ReorderRouteView::new(
+                    self.route_mapping.clone(),
+                    self.route_config.clone(),
+                    self.soft_delete,
+                    self.applicator.as_mut(),
+                    self.stats.clone(),
+                );
+                let resolver = self.resolver.clone();
+                let (batch_rows, batch_bytes) = (self.batch_rows, self.batch_bytes);
+                let budget = self.budget.clone();
+                let stats = self.stats.clone();
+                let mut planner =
+                    Planner::create(plan_path, self.plan_disk_max, &mut view, &resolver).map_err(
+                        |e| {
+                            bump_plan_failure(&stats, e.reason());
+                            SinkError::Other(format!("plan open: {e}"))
+                        },
+                    )?;
+                loop {
+                    let Some(batch) = drain
+                        .next_batch(batch_rows, batch_bytes, budget.as_ref())
+                        .instrument(drain_span.clone())
+                        .await
+                        .map_err(|e| {
+                            bump_plan_failure(&stats, drain_reason(&e));
+                            SinkError::from(e)
+                        })?
+                    else {
+                        break;
+                    };
+                    let is_final = batch.is_final;
+                    planner.plan_batch(batch).await.map_err(|e| {
+                        bump_plan_failure(&stats, e.reason());
+                        SinkError::Other(format!("plan: {e}"))
+                    })?;
+                    if is_final {
+                        break;
+                    }
                 }
-                None => None,
+                planner.seal(commit_lsn, commit_ts).map_err(|e| {
+                    bump_plan_failure(&stats, e.reason());
+                    SinkError::Other(format!("plan seal: {e}"))
+                })?
             };
-            let is_barrier = !batch.ordered_events.is_empty()
-                || batch.heaps.iter().any(|h| matches!(h.op, HeapOp::Truncate));
-            let is_final = batch.is_final;
-            // Store rows must precede publishing marker; refs materialize
-            // just in time per sealed slice
-            if !is_barrier && !batch.new_rows.is_empty() {
-                self.resolver
-                    .put_row_refs(batch.new_rows.spool(), &batch.new_rows)
-                    .await
-                    .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
-            }
-            if is_barrier {
-                self.run_barrier_batch(batch, commit_ts, commit_lsn, permit)
-                    .instrument(trace_span!(
-                        !txn.is_none(),
-                        parent: &txn,
-                        "commit.barrier",
-                    ))
-                    .await?;
-            } else if !batch.heaps.is_empty() {
-                let seq = self.alloc_seq();
-                if is_final {
-                    self.ack.register(seq, commit_lsn);
-                    published = true;
-                } else {
-                    self.ack.register_partial(seq, commit_lsn);
-                }
-                let job = DecodeJob {
-                    seq,
-                    commit_ts,
-                    commit_lsn,
-                    heaps: batch.heaps,
-                    chunks: batch.chunks,
-                    permit,
-                };
-                self.dispatch_job(job)
-                    .instrument(trace_span!(
-                        !txn.is_none(),
-                        parent: &txn,
-                        "dispatch",
-                        seq = seq,
-                    ))
-                    .await?;
-            }
-            if is_final {
-                break;
-            }
+            self.stats
+                .plan_rows
+                .fetch_add(plan.routed_count, Ordering::Relaxed);
+            let plan_bytes = if plan.path().is_some() {
+                &self.stats.plan_bytes_file
+            } else {
+                &self.stats.plan_bytes_mem
+            };
+            plan_bytes.fetch_add(plan.size_bytes, Ordering::Relaxed);
+            (rows_total, published) = self
+                .execute_plan(&plan)
+                .instrument(trace_span!(
+                    !txn.is_none(),
+                    parent: &txn,
+                    "commit.execute",
+                ))
+                .await?;
         }
-        // Unlink spill files now that every slice dispatched; an error above
+        // Unlink spill files now that every segment dispatched; an error above
         // drops the drain instead, leaving files for inspection.
         drain.finish().await.map_err(SinkError::from)?;
         txn.record("rows", rows_total);
         txn.record("outcome", "committed");
         if !published {
-            // rows=0 marker: publishes commit_lsn once every earlier slice
-            // is durable. Covers empty / read-only commits and barrier
-            // slices (whose segments all register partial).
+            // rows=0 marker: publishes commit_lsn once every earlier partial
+            // segment is durable. Covers empty / read-only commits and plans
+            // whose tail is a control or truncate.
             let seq = self.alloc_seq();
             self.ack.register(seq, commit_lsn);
             self.ack.placed(seq, 0);
@@ -844,11 +895,10 @@ impl ReorderSink {
     /// ABORT: drop the buffer, emit a rows=0 seq through the gate (never a
     /// direct ack bump).
     async fn on_abort(&mut self, xid: u32, info: u8, record: &Record<'_>) -> Result<(), SinkError> {
-        let payload = parse_xact_payload(info, &record.parsed.main_data);
-        // Rolled-back pg_class heap_delete resurrects the row; drop the arm
-        if let Some(pending) = &self.pending_sweeps {
-            pending.disarm(xid, payload.twophase_xid, &payload.subxacts);
-        }
+        let payload = parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+            .unwrap_or_default();
+        // ABORT PREPARED: buffered state keys off the prepared xid
+        let xid = payload.twophase_xid.unwrap_or(xid);
         let seq = self.alloc_seq();
         self.ack.register(seq, record.source_lsn);
         {
@@ -859,6 +909,112 @@ impl ReorderSink {
         }
         self.ack.placed(seq, 0);
         self.subxact_tracker.lock().await.forget_tree(xid);
+        Ok(())
+    }
+}
+
+/// Route a plan-failure reason label onto its counter
+fn bump_plan_failure(stats: &EmitterStats, reason: &'static str) {
+    let counter = match reason {
+        "spool" => &stats.plan_failures_spool,
+        "fail_closed" => &stats.plan_failures_fail_closed,
+        "detoast" => &stats.plan_failures_detoast,
+        "partial_update" => &stats.plan_failures_partial_update,
+        "view" => &stats.plan_failures_view,
+        _ => &stats.plan_failures_drain,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Plan-time route state for one transaction: frozen mapping + config
+/// versions plus a local fold of in-walk catalog entries. The applicator
+/// predicts what executing each event will leave in the routing map
+/// ([`DdlApplicator::predict_route_mapping`]) so post-event rows plan under
+/// post-event routes while the real side effects wait for the executor.
+/// Config-table events are not folded: a same-xact config write followed
+/// by rows plans under the frozen version (whole-transaction granularity;
+/// the in-xact interval refinement lands with the config fold)
+pub struct ReorderRouteView<'a> {
+    mapping: Option<MappingSnapshot>,
+    config: Option<Arc<ResolvedConfig>>,
+    /// Catalog fold above `mapping`; `None` value = locally dropped
+    overlay: HashMap<RelName, Option<TableMapping>>,
+    memo: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
+    soft_delete: bool,
+    applicator: Option<&'a mut DdlApplicator>,
+    stats: Arc<EmitterStats>,
+}
+
+impl<'a> ReorderRouteView<'a> {
+    pub fn new(
+        mapping: Option<MappingSnapshot>,
+        config: Option<Arc<ResolvedConfig>>,
+        soft_delete: bool,
+        applicator: Option<&'a mut DdlApplicator>,
+        stats: Arc<EmitterStats>,
+    ) -> Self {
+        Self {
+            mapping,
+            config,
+            overlay: HashMap::new(),
+            memo: HashMap::new(),
+            soft_delete,
+            applicator,
+            stats,
+        }
+    }
+}
+
+impl PlanRouteView for ReorderRouteView<'_> {
+    fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>> {
+        let rel_name = &heap.descriptor.rel_name;
+        if let Some(r) = self.memo.get(rel_name) {
+            return r.clone();
+        }
+        let mapped = match self.overlay.get(rel_name) {
+            Some(o) => o.clone(),
+            None => self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned(),
+        };
+        let route = mapped.map(|m| {
+            let overrides = self
+                .config
+                .as_ref()
+                .and_then(|rc| rc.columns.get(rel_name))
+                .cloned()
+                .map(Arc::new)
+                .unwrap_or_default();
+            RouteSnapshot::freeze(Arc::new(m), overrides, self.soft_delete)
+        });
+        let result = if route.is_none() {
+            self.stats
+                .unsupported_relations
+                .fetch_add(1, Ordering::Relaxed);
+            &self.stats.route_snapshots_unmapped
+        } else {
+            &self.stats.route_snapshots_mapped
+        };
+        result.fetch_add(1, Ordering::Relaxed);
+        self.memo.insert(rel_name.clone(), route.clone());
+        route
+    }
+
+    async fn apply(&mut self, entry: &DrainEntry) -> Result<(), String> {
+        let DrainEntry::Catalog(ev) = entry else {
+            // Config: frozen-version planning (doc above); ToastBarrier:
+            // no route effect
+            return Ok(());
+        };
+        let Some(app) = self.applicator.as_deref_mut() else {
+            return Ok(());
+        };
+        if let Some((rel, m)) = app
+            .predict_route_mapping(ev)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            self.memo.remove(&rel);
+            self.overlay.insert(rel, m);
+        }
         Ok(())
     }
 }

@@ -15,6 +15,8 @@ pub mod batcher;
 pub mod bootstrap;
 pub mod decode;
 pub mod inserter;
+pub mod plan_spool;
+pub mod planner;
 pub mod reorder;
 pub mod tail;
 
@@ -29,10 +31,9 @@ use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::ch::EmitterError;
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
-use crate::mapping::{MappingHandle, TableMapping};
+use crate::mapping::MappingHandle;
 use crate::ops::oracle::Oracle;
 use crate::ops::trace::TxnSpanRegistry;
-use crate::schema::{RelName, SchemaEventRx};
 use crate::xact::xact_buffer::{SubxactTracker, XactBuffer};
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls
@@ -91,24 +92,6 @@ impl Fatal {
 /// without it a cold table's rows pin the watermark indefinitely.
 const DEFAULT_PIPELINE_FLUSH: Duration = Duration::from_millis(100);
 
-/// Resolve a relation's destination mapping. Bumps `unsupported_relations`
-/// and returns None when the relation maps to no destination
-pub(crate) async fn lookup_mapping(
-    mapping: &MappingHandle,
-    rel: &RelName,
-    stats: &EmitterStats,
-) -> Option<Arc<TableMapping>> {
-    match mapping.read().await.get(rel) {
-        Some(v) => Some(Arc::new(v.clone())),
-        None => {
-            stats
-                .unsupported_relations
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            None
-        }
-    }
-}
-
 /// Tail selection: `ClickHouse` ships sealed blocks over N connections;
 /// `Null` acks at swallow — metrics-only runs, zero CH connections.
 pub enum TailKind {
@@ -130,10 +113,9 @@ pub struct PipelineConfig {
     pub tail: TailKind,
     pub buffer: Arc<Mutex<XactBuffer>>,
     pub subxact_tracker: Arc<Mutex<SubxactTracker>>,
-    pub schema_events: Option<SchemaEventRx>,
-    /// Same handle as the decoder's `with_catalog_signals` armer; reorder
-    /// consumes at the arming xact's commit
-    pub pending_sweeps: Option<crate::filter::catalog_tracker::PendingSweeps>,
+    /// Durable descriptor log: decode pool + reorder read interval-scoped
+    /// descriptors from it
+    pub log: Arc<crate::catalog::desc_log::DescriptorLog>,
     pub stats: Arc<EmitterStats>,
     /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
     /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
@@ -208,8 +190,7 @@ impl PipelineConfig {
             tail,
             buffer,
             subxact_tracker,
-            schema_events,
-            pending_sweeps,
+            log,
             stats,
             span_registry,
             config_resolver,
@@ -256,8 +237,6 @@ impl PipelineConfig {
         let (jobs_tx, jobs_rx) = async_channel::bounded::<decode::DecodeJob>((m * 4).max(8));
 
         let ctx = decode::DecodeCtx {
-            catalog: catalog.clone(),
-            mapping,
             oracle,
             msg_tx: msg_tx.clone(),
             stats: stats.clone(),
@@ -266,12 +245,12 @@ impl PipelineConfig {
         };
         let decoders = decode::spawn_pool(m, ctx, jobs_rx, ack.clone(), fatal.clone());
 
+        let plan_dir = buffer.lock().await.spill_dir().to_path_buf();
         let reorder = reorder::ReorderSink::new(
             buffer,
+            log,
             catalog,
             subxact_tracker,
-            schema_events,
-            pending_sweeps,
             applicator,
             ack,
             jobs_tx,
@@ -284,9 +263,13 @@ impl PipelineConfig {
             span_registry,
             emitter.drain_batch_rows,
             emitter.drain_batch_bytes,
+            emitter.plan_disk_max,
+            plan_dir,
             Some(budget.clone()),
             retires,
             resume_floor,
+            mapping,
+            emitter.soft_delete,
         );
 
         Ok((

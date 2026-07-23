@@ -48,6 +48,9 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
+use walshadow::boundary_hold::{
+    BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
+};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig};
 use walshadow::decoder_sink::MetricsTupleObserver;
@@ -146,7 +149,11 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
 /// couple wire pacing to decode.
 struct DaemonSinks {
     metrics: MetricsRecordSink,
-    decoder_xact: QueueingRecordSink,
+    /// Queueing sink wrapped with the catalog-boundary publication hold:
+    /// at a catalog-mutating commit the pump parks here until shadow
+    /// replays through the commit's `next_lsn`, so successor bytes reach
+    /// neither the shadow wire nor the archive while held.
+    decoder_xact: BoundaryHoldSink,
     /// Shared with the `BufferingDecoderSink` on the queueing worker;
     /// status loop polls without contending on the worker.
     decoder_stats: Arc<walshadow::decoder_sink::DecoderStats>,
@@ -272,13 +279,21 @@ struct Args {
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     walsender_slow_threshold: usize,
     /// Seconds the pump waits for shadow's walreceiver to attach before
-    /// processing records. `0` disables the barrier (shadow driven purely
-    /// via `restore_command`). `ShadowStreamSink` drops bytes pushed
-    /// before a connection registers; without the barrier the pump can
-    /// race past shadow's `START_REPLICATION` LSN and leave the catalog
-    /// gate timed out against an apply LSN that never advances.
+    /// processing records. Must be positive; no attachment within it fails
+    /// startup. Catalog-boundary holds require a live wire: whole archive
+    /// segments can't stop publication at a mid-segment commit, so
+    /// archive-only operation (the old `0` escape hatch) is rejected.
+    /// `ShadowStreamSink` also drops bytes pushed before a connection
+    /// registers; a pump racing past shadow's `START_REPLICATION` LSN
+    /// leaves an apply LSN that never advances.
     #[arg(long, default_value_t = 60)]
     walsender_connect_timeout: u64,
+    /// Seconds a catalog-boundary publication hold may wait for shadow to
+    /// replay through a catalog-mutating commit before failing the daemon.
+    /// Keep well under source's `wal_sender_timeout` (default 60s): the
+    /// pump answers no source keepalives while parked.
+    #[arg(long, default_value_t = 30)]
+    catalog_hold_timeout: u64,
     /// Soft cap on in-flight records for the `QueueingRecordSink` feeding
     /// the decoder / xact-drain worker. Past this watermark the pump
     /// yields to let the worker drain; a stuck worker still surfaces via
@@ -330,14 +345,6 @@ struct Args {
     /// the command line without editing TOML. Absent defers to TOML.
     #[arg(long)]
     drop_table_strategy: Option<String>,
-    /// Differential decode oracle: probe 1-in-`<N>` rows through shadow
-    /// PG's `walshadow_decode_disk(oid, bytea)` extension function and
-    /// assert the local decoder matches. `0` disables. Requires the
-    /// `walshadow` extension on shadow PG; absent extension surfaces as
-    /// `oracle fallback=N` and the daemon ships raw on-disk bytes for
-    /// `PgPending` types.
-    #[arg(long, default_value_t = 0)]
-    validate: u32,
     /// HTTP/Prometheus metrics bind address. Disabled when absent.
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
@@ -589,12 +596,28 @@ fn spawn_sighup_reload(
     })
 }
 
+/// Enforce capability, not flag value: catalog-boundary holds need an
+/// active walreceiver, so archive-only operation is not startable.
+fn validate_transport_args(args: &Args) -> Result<()> {
+    anyhow::ensure!(
+        args.walsender_connect_timeout > 0,
+        "--walsender-connect-timeout 0 (archive-only shadow) is unsupported: \
+         catalog-boundary publication holds require an attached walreceiver",
+    );
+    anyhow::ensure!(
+        args.catalog_hold_timeout > 0,
+        "--catalog-hold-timeout must be positive",
+    );
+    Ok(())
+}
+
 /// Process-lifetime entry: bind metrics + control socket + SIGHUP, then stream
 /// one session. Every reconfigure (socket / SIGHUP) is a live reload — no
 /// restart. Ctrl-C breaks the pump loop and drains gracefully.
 async fn run(args: Args) -> Result<()> {
     use walshadow::control::{Reloader, SharedCtx};
 
+    validate_transport_args(&args)?;
     let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .inspect_err(|e| {
             tracing::warn!(
@@ -926,21 +949,6 @@ async fn run_session(
         "shadow connected",
     );
 
-    // Descriptor-cache invalidation epoch: decoder worker bumps off each
-    // record's tracker verdict (`with_catalog_signals` below), catalog
-    // folds the delta into `invalidate` before each relation lookup's
-    // cache check. Mapping writes + SIGHUP reload bump out-of-band.
-    let invalidation_epoch = Arc::new(AtomicU64::new(0));
-    // DROP-sweep arming, keyed by xid: decoder worker arms at pg_class
-    // heap_delete records (never ADD COLUMN / CREATE INDEX noise), commit
-    // sink consumes only at the arming xact's own commit so the replay
-    // gate makes the drop visible before sweep_dropped probes shadow.
-    let pending_sweeps = walshadow::catalog_tracker::PendingSweeps::new();
-    catalog
-        .lock()
-        .await
-        .set_invalidation_epoch(invalidation_epoch.clone());
-
     // Create the configured slot before preflight, which requires it to exist.
     if let Some(slot) = source_slot.as_deref() {
         feed.ensure_physical_slot(slot)
@@ -979,52 +987,25 @@ async fn run_session(
         tracing::info!(target: "walshadow::preflight", "pre-flight passed");
     }
 
-    // Seed schema-diff baseline for operator-pinned relations before
-    // START_REPLICATION so a pinned table's first post-start ALTER diffs
-    // against boot shape (→ Changed → CH ALTER) rather than cold-prev_known
-    // Added (apply_added skips pinned dests). cfg.tables.keys() is the
-    // pinned set; auto-create tables baseline on first-touch CREATE.
-    if let Some(cfg) = ch_config.as_ref() {
-        let names: Vec<RelName> = cfg.tables.keys().cloned().collect();
-        let seeded = catalog
-            .lock()
-            .await
-            .seed_baseline(&names)
-            .await
-            .context("seed schema-diff baseline for mapped relations")?;
-        tracing::info!(
-            target: "walshadow",
-            seeded,
-            "seeded schema-diff baseline for mapped relations",
-        );
-    }
-
     // Oracle opens its own libpq connection so its queries don't pessimise
     // the catalog's query-one path. Best-effort: connect failure disables
     // the oracle, daemon keeps running with the raw-bytes fallback.
-    let oracle = match walshadow::oracle::connect_with_budget(
-        &shadow_conninfo,
-        args.validate,
-        connect_budget,
-    )
-    .await
-    {
-        Ok(o) => {
-            let ext = o.has_extension();
-            tracing::info!(
-                target: "walshadow::oracle",
-                validate = args.validate > 0,
-                sample_rate = args.validate.max(1),
-                extension = if ext { "present" } else { "absent" },
-                "oracle connected",
-            );
-            Some(Arc::new(o))
-        }
-        Err(e) => {
-            tracing::warn!(target: "walshadow::oracle", error = %e, "oracle disabled");
-            None
-        }
-    };
+    let oracle =
+        match walshadow::oracle::connect_with_budget(&shadow_conninfo, connect_budget).await {
+            Ok(o) => {
+                let ext = o.has_extension();
+                tracing::info!(
+                    target: "walshadow::oracle",
+                    extension = if ext { "present" } else { "absent" },
+                    "oracle connected",
+                );
+                Some(Arc::new(o))
+            }
+            Err(e) => {
+                tracing::warn!(target: "walshadow::oracle", error = %e, "oracle disabled");
+                None
+            }
+        };
 
     // START_REPLICATION runs after sinks are built so archive fallback can
     // advance identical filter and decode paths.
@@ -1070,9 +1051,114 @@ async fn run_session(
             .context("write initial resume manifest after bootstrap")?;
     }
 
-    // Shared schema-events queue (descriptor-fetch + commit-boundary
-    // `sweep_dropped`); both decoder and drain stage pull from it.
-    let schema_events = Arc::new(std::sync::Mutex::new(catalog.lock().await.subscribe()));
+    // Descriptor log: durable shape history captured at catalog boundaries,
+    // bound to this source + shadow pairing. Sole schema-event source.
+    let source_major = (feed.server_version_num() / 10000) as u32;
+    anyhow::ensure!(
+        (16..=18).contains(&source_major),
+        "source PG major {source_major} unsupported (commit-record sinval layout audited for 16-18)",
+    );
+    let shadow_db_oid = catalog
+        .lock()
+        .await
+        .current_database_oid()
+        .await
+        .context("shadow database oid")?;
+    stream.filter_mut().set_inval_db(shadow_db_oid);
+    let smgr_markers = stream.filter_mut().smgr_markers();
+    // A resumed manifest implies prior progress whose records the log must
+    // cover; an empty/missing log there means it was lost — decode would
+    // read uncovered intervals. `--ignore-cursor` discards both.
+    let log_files_present = args.spill_dir.join(walshadow::desc_log::TAIL_FILE).exists()
+        || args.spill_dir.join(walshadow::desc_log::CKPT_FILE).exists();
+    anyhow::ensure!(
+        manifest_at_boot.is_none() || log_files_present || args.ignore_cursor,
+        "manifest present but descriptor log missing in {}; \
+         re-bootstrap or pass --ignore-cursor",
+        args.spill_dir.display(),
+    );
+    if args.ignore_cursor {
+        for f in [
+            walshadow::desc_log::CKPT_FILE,
+            walshadow::desc_log::TAIL_FILE,
+        ] {
+            let _ = tokio::fs::remove_file(args.spill_dir.join(f)).await;
+        }
+    }
+    let desc_log = Arc::new(
+        walshadow::desc_log::DescriptorLog::open(
+            &args.spill_dir,
+            walshadow::desc_log::DescLogIdentity {
+                pg_major: source_major,
+                system_id: ident.sysid.clone(),
+                timeline: ident.timeline,
+                db_oid: shadow_db_oid,
+                wal_seg_size: WAL_SEG_SIZE as u32,
+            },
+        )
+        .await
+        .context("open descriptor log")?,
+    );
+    if let Some(lsn) = start_lsn_override {
+        anyhow::ensure!(
+            lsn >= desc_log.floor_at_write(),
+            "--start-lsn {} below descriptor log floor {}; no shape history \
+             survives there — --ignore-cursor or re-bootstrap",
+            format_pg_lsn(lsn),
+            format_pg_lsn(desc_log.floor_at_write()),
+        );
+        let head = desc_log.head();
+        anyhow::ensure!(
+            head == 0 || lsn <= head,
+            "--start-lsn {} beyond descriptor log head {}; boundaries in \
+             between were never captured — --ignore-cursor re-baselines",
+            format_pg_lsn(lsn),
+            format_pg_lsn(head),
+        );
+    }
+    if desc_log.is_empty() {
+        // Baseline snapshot: every eligible rel as of shadow's position,
+        // valid from the aligned start so the prefix re-read decodes
+        // (newest-shape reader of older tuples — the safe bias direction).
+        // Boundaries at or below covered_through are baked in and skip.
+        let (replay_lsn, descs) = catalog
+            .lock()
+            .await
+            .fetch_all_descriptors()
+            .await
+            .context("descriptor log boot seed")?;
+        let covered_through = raw_start.max(replay_lsn);
+        let entries = descs
+            .into_iter()
+            .map(|d| {
+                Arc::new(walshadow::desc_log::LogEntry {
+                    valid_from: aligned,
+                    oid: d.oid,
+                    rfn: d.rfn,
+                    value: walshadow::desc_log::LogValue::Present(Arc::new(d)),
+                })
+            })
+            .collect();
+        desc_log
+            .seed(
+                walshadow::desc_log::BatchRecord {
+                    captured_at: covered_through,
+                    commit_lsn: 0,
+                    observations: Vec::new(),
+                    ambiguities: Vec::new(),
+                    entries,
+                },
+                covered_through,
+            )
+            .await
+            .context("seed descriptor log")?;
+        tracing::info!(
+            target: "walshadow::desc_log",
+            covered_through = format_pg_lsn(covered_through).to_string(),
+            "descriptor log seeded",
+        );
+    }
+
     // Txn-span registry, shared by pump + decoder; `Some` only with OTLP on.
     let span_registry =
         if args.otlp_endpoint.is_some() || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
@@ -1080,13 +1166,7 @@ async fn run_session(
         } else {
             None
         };
-    let mut decoder = BufferingDecoderSink::new(catalog.clone(), xact_buffer.clone())
-        .with_schema_events(schema_events.clone())
-        // Bump / arm at worker position off each record's tracker verdict:
-        // the queueing sink below decouples the decoder from the pump, so
-        // a pump-position bump would be consumable before pre-DDL records
-        // finish decoding
-        .with_catalog_signals(invalidation_epoch.clone(), Some(pending_sweeps.clone()));
+    let mut decoder = BufferingDecoderSink::new(desc_log.clone(), xact_buffer.clone());
     if let Some(schema) = ch_config
         .as_ref()
         .and_then(|c| c.runtime_config_schema.as_deref())
@@ -1131,9 +1211,9 @@ async fn run_session(
 
     let pcfg = if let Some(mut emitter_cfg) = ch_config {
         let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-        // Live routing map shared by DDL applicator + decode pool. The
+        // Live routing map shared by DDL applicator + route planning. The
         // refresher below rewrites it on every republished snapshot.
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+        let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
         // Resolver merges CLI over TOML and publishes ResolvedConfig on
         // the watch substrate; SIGHUP re-reads TOML and republishes. The
         // mapping refresher + DDL applicator subscribe.
@@ -1149,7 +1229,6 @@ async fn run_session(
             args.ch_config.clone(),
             cli_source_base(args),
             mapping.clone(),
-            invalidation_epoch.clone(),
         );
         reloader.set_resolver(Some(resolver.clone())).await;
         spawn_mapping_refresher(config_rx.clone(), mapping.clone());
@@ -1196,7 +1275,6 @@ async fn run_session(
         )
         .await
         .context("init DDL applicator")?
-        .with_invalidation_epoch(invalidation_epoch.clone())
         .with_resolver(resolver.clone());
         let stats = Arc::new(EmitterStats::default());
         emitter_stats_handle = Some(stats.clone());
@@ -1226,6 +1304,7 @@ async fn run_session(
                     mapping.clone(),
                     stats.clone(),
                     catalog.clone(),
+                    desc_log.clone(),
                     &args.spill_dir,
                     Some(config_rx.clone()),
                     Some(pipeline_budget.clone()),
@@ -1335,8 +1414,7 @@ async fn run_session(
             tail: TailKind::ClickHouse,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-            schema_events: Some(schema_events.clone()),
-            pending_sweeps: Some(pending_sweeps.clone()),
+            log: desc_log.clone(),
             stats: stats.clone(),
             span_registry: span_registry.clone(),
             config_resolver: config_resolver.clone(),
@@ -1368,8 +1446,7 @@ async fn run_session(
             tail: TailKind::Null,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-            schema_events: Some(schema_events.clone()),
-            pending_sweeps: Some(pending_sweeps.clone()),
+            log: desc_log.clone(),
             stats: Arc::new(EmitterStats::default()),
             span_registry: span_registry.clone(),
             config_resolver: None,
@@ -1387,6 +1464,10 @@ async fn run_session(
         .flush_due_retires()
         .await
         .context("boot flush of due toast-mirror retires")?;
+    reorder_sink
+        .apply_boot_events(desc_log.active_present_at(raw_start), raw_start)
+        .await
+        .context("boot Added pass over descriptor log")?;
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -1396,6 +1477,22 @@ async fn run_session(
         args.decoder_queue_capacity,
         span_registry.clone(),
     );
+    let boundary_gate = CatalogBoundaryGate::new(
+        shadow_state.clone(),
+        BoundaryGateConfig {
+            hold_timeout: Duration::from_secs(args.catalog_hold_timeout),
+            ..BoundaryGateConfig::default()
+        },
+    );
+    let boundary_hold_stats = boundary_gate.stats.clone();
+    let capture = walshadow::catalog_capture::CatalogCapture::new(
+        desc_log.clone(),
+        catalog.clone(),
+        xact_buffer.clone(),
+        smgr_markers,
+    );
+    let capture_stats = capture.stats_handle();
+    let decoder_xact = BoundaryHoldSink::new(decoder_xact, boundary_gate).with_capture(capture);
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder_xact,
@@ -1454,36 +1551,31 @@ async fn run_session(
     // racing past `START_REPLICATION`'s LSN before walreceiver arrives
     // leaves an unrecoverable gap: post-conn frames carry LSNs past
     // walreceiver's expected continuity, shadow's apply stalls, the catalog
-    // gate times out (pgbench_acceptance / kill_restart failure mode). Cap
-    // the wait so operators without a streaming shadow still boot via the
-    // restore_command archive path.
-    if args.walsender_connect_timeout > 0 {
+    // gate times out (pgbench_acceptance / kill_restart failure mode). No
+    // attachment fails startup: catalog-boundary holds require a live wire,
+    // and archive-only operation can't stop publication at a mid-segment
+    // commit (restore_command must never observe unreleased bytes).
+    {
         let timeout = Duration::from_secs(args.walsender_connect_timeout);
         let start = Instant::now();
-        let mut attached = false;
         loop {
             if shadow_state.lock().await.aggregate().active_connections > 0 {
-                attached = true;
                 break;
             }
-            if start.elapsed() >= timeout {
-                break;
-            }
+            anyhow::ensure!(
+                start.elapsed() < timeout,
+                "no walreceiver attached to walsender {walsender_addr} within \
+                 {}s; catalog-boundary holds require a live wire — point \
+                 shadow's primary_conninfo here or raise --walsender-connect-timeout",
+                args.walsender_connect_timeout,
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if attached {
-            tracing::info!(
-                target: "walshadow",
-                wait = ?start.elapsed(),
-                "walsender connected — starting pump",
-            );
-        } else {
-            tracing::warn!(
-                target: "walshadow",
-                timeout_secs = args.walsender_connect_timeout,
-                "no walsender connection within boot barrier — proceeding (shadow on restore_command path)",
-            );
-        }
+        tracing::info!(
+            target: "walshadow",
+            wait = ?start.elapsed(),
+            "walsender connected — starting pump",
+        );
     }
 
     let source_recovery = SourceRecovery {
@@ -1575,6 +1667,11 @@ async fn run_session(
             // Publish only after persist: pruners cut against what a
             // crash-now restart actually resumes from.
             resume_floor.store(cur.floor.0, Ordering::Release);
+            // Descriptor log prunes against the same floor
+            desc_log
+                .maybe_gc(cur.floor.0)
+                .await
+                .context("descriptor log gc")?;
         }
         // flush caps physical slot's restart_lsn.
         // Manifest writes are cadence-gated above while keepalive replies inside
@@ -1659,6 +1756,8 @@ async fn run_session(
                 chunks: b.drain_chunk_resident_bytes(),
                 rows: b.drain_row_resident_bytes(),
                 spool: b.toast_spool_bytes(),
+                raw_pending_rows: b.raw_pending_rows(),
+                raw_pending_bytes: b.raw_pending_bytes(),
             };
             (stats, resident, line)
         };
@@ -1701,6 +1800,9 @@ async fn run_session(
                 active_connections: shadow_agg.active_connections as u64,
                 dropped_total: shadow_agg.dropped_total,
             },
+            &boundary_hold_stats,
+            &capture_stats,
+            &desc_log,
             metrics_resolver.as_deref(),
             metrics_backfiller.as_deref(),
         )
@@ -2030,7 +2132,7 @@ fn spawn_mapping_refresher(
         // Boot value already seeded into `mapping`; react to republishes.
         while config_rx.changed().await.is_ok() {
             let tables = config_rx.borrow_and_update().tables.clone();
-            *mapping.write().await = tables;
+            *mapping.write().await = Arc::new(tables);
             tracing::info!(
                 target: "walshadow::config",
                 "routing map refreshed from resolved config",
@@ -2228,6 +2330,8 @@ struct DrainResident {
     chunks: u64,
     rows: u64,
     spool: u64,
+    raw_pending_rows: u64,
+    raw_pending_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2249,12 +2353,17 @@ async fn populate_metrics(
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
     uptime_secs: u64,
     shadow_view: ShadowMetricsView,
+    boundary_hold: &BoundaryHoldStats,
+    capture: &walshadow::catalog_capture::CaptureStats,
+    desc_log: &walshadow::desc_log::DescriptorLog,
     config_resolver: Option<&ConfigResolver>,
     backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
 ) {
     use std::collections::BTreeMap;
     use walshadow::record::rmgr_label;
     let (proc_cpu, proc_rss) = read_process_stats();
+    let desc_log_gauges = desc_log.gauges();
+    let log_stats = desc_log.stats_handle();
     let mut by_rm = BTreeMap::new();
     for ((rm, route), n) in &rec_metrics.by_rm_route {
         let key = (
@@ -2318,15 +2427,79 @@ async fn populate_metrics(
             .map(|s| s.toast_rewrite_barriers.load(Ordering::Relaxed))
             .unwrap_or(0),
         toast_stash_buffered_total: decoder_stats.toast_stash_buffered.load(Ordering::Relaxed),
+        raw_stash_deferred_total: decoder_stats.raw_stash_deferred.load(Ordering::Relaxed),
         toast_stash_decoded_total: emitter_stats
             .map(|s| s.toast_stash_decoded.load(Ordering::Relaxed))
             .unwrap_or(0),
         toast_stash_discarded_total: emitter_stats
             .map(|s| s.toast_stash_discarded.load(Ordering::Relaxed))
             .unwrap_or(0),
-        toast_stash_skipped_total: emitter_stats
-            .map(|s| s.toast_stash_skipped.load(Ordering::Relaxed))
+        stash_foreign_db_skipped_total: emitter_stats
+            .map(|s| s.stash_foreign_db_skipped.load(Ordering::Relaxed))
             .unwrap_or(0),
+        xact_plan_rows: emitter_stats
+            .map(|s| s.plan_rows.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        xact_plan_bytes_by_storage: emitter_stats
+            .map(|s| {
+                [
+                    s.plan_bytes_mem.load(Ordering::Relaxed),
+                    s.plan_bytes_file.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        xact_plan_failures_by_reason: emitter_stats
+            .map(|s| {
+                [
+                    s.plan_failures_spool.load(Ordering::Relaxed),
+                    s.plan_failures_fail_closed.load(Ordering::Relaxed),
+                    s.plan_failures_detoast.load(Ordering::Relaxed),
+                    s.plan_failures_partial_update.load(Ordering::Relaxed),
+                    s.plan_failures_view.load(Ordering::Relaxed),
+                    s.plan_failures_drain.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        route_snapshots_by_result: emitter_stats
+            .map(|s| {
+                [
+                    s.route_snapshots_mapped.load(Ordering::Relaxed),
+                    s.route_snapshots_unmapped.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        raw_stash_records_by_kind_op: [
+            decoder_stats.raw_stash_dirty_ops.load(),
+            decoder_stats.raw_stash_marker_ops.load(),
+        ],
+        raw_stash_bytes_by_storage: [
+            xact_stats.raw_stash_bytes_mem,
+            xact_stats.raw_stash_bytes_spill,
+        ],
+        raw_decode_records_by_kind_op: emitter_stats
+            .map(|s| {
+                [
+                    s.raw_decode_toast_ops.load(),
+                    s.raw_decode_ordinary_ops.load(),
+                ]
+            })
+            .unwrap_or_default(),
+        raw_decode_rows_by_op: emitter_stats
+            .map(|s| s.raw_decode_rows_ops.load())
+            .unwrap_or_default(),
+        raw_pending_rows: drain_resident.raw_pending_rows,
+        raw_pending_bytes: drain_resident.raw_pending_bytes,
+        descriptor_ambiguous_by_reason: [
+            log_stats.ambiguous_unknown_relation.load(Ordering::Relaxed),
+            log_stats.ambiguous_unknown_position.load(Ordering::Relaxed),
+            log_stats
+                .ambiguous_incompatible_layouts
+                .load(Ordering::Relaxed),
+            log_stats.ambiguous_never_visible.load(Ordering::Relaxed),
+            log_stats
+                .ambiguous_incomplete_invalidation
+                .load(Ordering::Relaxed),
+        ],
         emitter_rows_total: emitter_stats
             .map(|s| s.rows_emitted.load(Ordering::Relaxed))
             .unwrap_or(0),
@@ -2367,12 +2540,6 @@ async fn populate_metrics(
         oracle_fallback_raw_total: oracle_stats
             .map(|s| s.fallback_raw.load(Ordering::Relaxed))
             .unwrap_or(0),
-        oracle_validate_sampled_total: oracle_stats
-            .map(|s| s.probes.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        oracle_validate_mismatches_total: oracle_stats
-            .map(|s| s.mismatches.load(Ordering::Relaxed))
-            .unwrap_or(0),
         oracle_errors_total: oracle_stats
             .map(|s| s.errors.load(Ordering::Relaxed))
             .unwrap_or(0),
@@ -2381,6 +2548,30 @@ async fn populate_metrics(
         shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
         shadow_stream_dropped_connections_total: shadow_view.dropped_total,
+        catalog_boundary_holds_total: boundary_hold.holds.load(Ordering::Relaxed),
+        catalog_boundary_hold_failures_total: boundary_hold.failures.load(Ordering::Relaxed),
+        catalog_boundary_hold_seconds_total: boundary_hold.hold_seconds_total(),
+        desc_capture_sql_total: capture.sql_captures.load(Ordering::Relaxed),
+        desc_capture_log_replay_total: capture.log_replays.load(Ordering::Relaxed),
+        desc_capture_skipped_covered_total: capture.skipped_covered.load(Ordering::Relaxed),
+        desc_capture_all_total: capture.capture_all_runs.load(Ordering::Relaxed),
+        desc_capture_rels_total: capture.rels_captured.load(Ordering::Relaxed),
+        desc_capture_seconds_total: capture.capture_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+        desc_events_added_total: capture.events_added.load(Ordering::Relaxed),
+        desc_events_changed_total: capture.events_changed.load(Ordering::Relaxed),
+        desc_events_dropped_total: capture.events_dropped.load(Ordering::Relaxed),
+        descriptor_ambiguous_total: capture.ambiguities_published.load(Ordering::Relaxed),
+        desc_log_entries: desc_log_gauges.0,
+        desc_log_tail_bytes: desc_log_gauges.1,
+        desc_log_batches: desc_log_gauges.2,
+        desc_log_gc_total: log_stats.gc_runs.load(Ordering::Relaxed),
+        desc_log_gc_dropped_entries_total: log_stats.gc_dropped_entries.load(Ordering::Relaxed),
+        desc_lookups_present_total: log_stats.lookups_present.load(Ordering::Relaxed),
+        desc_lookups_dropped_total: log_stats.lookups_dropped.load(Ordering::Relaxed),
+        desc_lookups_retired_total: log_stats.lookups_retired.load(Ordering::Relaxed),
+        desc_lookups_ambiguous_total: log_stats.lookups_ambiguous.load(Ordering::Relaxed),
+        desc_lookups_not_covered_total: log_stats.lookups_not_covered.load(Ordering::Relaxed),
+        desc_lookups_foreign_db_total: log_stats.lookups_foreign_db.load(Ordering::Relaxed),
         config_pending_decl_rels: config_resolver.map(|r| r.pending_decl_count()).unwrap_or(0),
         config_replicate_opt_in_total: config_resolver.map(|r| r.opt_in_total()).unwrap_or(0),
         config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),
@@ -2699,7 +2890,7 @@ async fn run_bootstrap(
         .await
         .context("bootstrap: spawn insert tail")?;
         // Static [table.*] mapping (no SIGHUP, no shadow PG during bootstrap).
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+        let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
         tracing::info!(
             target: "walshadow::bootstrap",
             addr = %addr,
@@ -2721,6 +2912,9 @@ async fn run_bootstrap(
                 deferred_path,
                 walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
             ),
+            emitter_cfg.soft_delete,
+            // Static mapping above: no overlay during greenfield bootstrap
+            None,
         ));
         let (drain_res, pump_res) = tokio::join!(drain, pump);
         let drain_outcome = drain_res
@@ -3395,6 +3589,16 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn transport_args_reject_archive_only_and_zero_hold_timeout() {
+        assert!(validate_transport_args(&args_from(&[])).is_ok());
+        assert!(
+            validate_transport_args(&args_from(&["--walsender-connect-timeout", "0"])).is_err(),
+            "archive-only escape hatch must fail startup",
+        );
+        assert!(validate_transport_args(&args_from(&["--catalog-hold-timeout", "0"])).is_err());
     }
 
     #[test]

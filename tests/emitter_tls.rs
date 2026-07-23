@@ -297,6 +297,7 @@ fn rel_descriptor() -> RelDescriptor {
     RelDescriptor {
         rfn: RFN,
         oid: 16385,
+        toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", "things"),
         kind: 'r',
@@ -390,7 +391,7 @@ async fn emitter_tls_round_trip() {
         .send(BatcherMsg::Row(RoutedRow {
             seq: 0,
             rel,
-            mapping,
+            route: walshadow::emit::route::RouteSnapshot::freeze(mapping, Arc::default(), false),
             committed: tuple,
             permit: None,
             value_permit: None,

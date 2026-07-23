@@ -10,8 +10,7 @@
 //!
 //! Each decoder takes the varlena *body* (or raw fixed-width bytes for
 //! `interval`) and produces a tagged value whose `text` matches PG
-//! `typoutput`. Differential oracle ([`crate::ops::oracle`]) cross-checks that
-//! text equality against shadow PG with 1-in-N sampling.
+//! `typoutput`.
 
 use thiserror::Error;
 

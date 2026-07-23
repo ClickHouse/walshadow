@@ -61,7 +61,7 @@ use crate::backfill::backup_source::{BackupSink, BackupSource};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
-use crate::catalog::shadow_catalog::ShadowCatalog;
+use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{CommittedTuple, XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
 use crate::decode::visibility::{
     PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView, Visibility, tuple_visibility,
@@ -77,7 +77,7 @@ use crate::filter::manifest::Manifest;
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap,
 };
-use crate::mapping::MappingHandle;
+use crate::mapping::MappingSnapshot;
 use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
@@ -324,6 +324,8 @@ async fn walk_and_ship(
         ctx.stats.clone(),
         resolver.clone(),
         DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX),
+        ctx.emitter.soft_delete,
+        ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
     ));
 
     // Success signal before the joins: gate resolves deferred tuples only
@@ -692,11 +694,15 @@ impl PrescanSink {
             let xid = record.parsed.header.xact_id;
             match info & XLOG_XACT_OPMASK {
                 XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
-                    let payload = parse_xact_payload(info, &record.parsed.main_data);
+                    let payload =
+                        parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+                            .unwrap_or_default();
                     self.patch.commit(xid, &payload.subxacts);
                 }
                 XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
-                    let payload = parse_xact_payload(info, &record.parsed.main_data);
+                    let payload =
+                        parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+                            .unwrap_or_default();
                     self.patch.abort(xid, &payload.subxacts);
                 }
                 _ => {}
@@ -841,17 +847,19 @@ async fn replay_gap(
     }
 
     let mut sink = ReplaySink {
-        decoder: BufferingDecoderSink::new(ctx.catalog.clone(), buffer.clone()),
+        decoder: BufferingDecoderSink::new(ctx.log.clone(), buffer.clone()),
         buffer,
-        catalog: ctx.catalog.clone(),
+        log: ctx.log.clone(),
         subxact_tracker: SubxactTracker::new(),
         resolver,
         filter_rfns,
         targets,
         b_redo,
-        mapping: ctx.mapping.clone(),
+        mapping: ctx.mapping.read().await.clone(),
         stats: ctx.stats.clone(),
         budget: ctx.budget.clone(),
+        soft_delete: ctx.emitter.soft_delete,
+        config: ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         batch_rows: ctx.emitter.drain_batch_rows,
         batch_bytes: ctx.emitter.drain_batch_bytes,
         msg_tx,
@@ -880,15 +888,24 @@ async fn replay_gap(
 struct ReplaySink {
     decoder: BufferingDecoderSink,
     buffer: Arc<Mutex<XactBuffer>>,
-    catalog: Arc<Mutex<ShadowCatalog>>,
+    log: Arc<crate::catalog::desc_log::DescriptorLog>,
     subxact_tracker: SubxactTracker,
     resolver: ToastResolver,
     filter_rfns: HashSet<(Oid, Oid)>,
     targets: HashMap<(Oid, Oid), (Arc<RelDescriptor>, u64)>,
     b_redo: u64,
-    mapping: MappingHandle,
+    /// Mapping version frozen at replay start: gap replay re-seeds route
+    /// state from current config, and no config event applies mid-replay
+    /// (catalog/config drain entries are ignored here), so one snapshot
+    /// covers the whole replay
+    mapping: MappingSnapshot,
     stats: Arc<EmitterStats>,
     budget: Option<crate::budget::MemoryBudget>,
+    /// Boot-only delete-retention policy, frozen into route snapshots
+    soft_delete: bool,
+    /// Config snapshot for route freezes: gap replay re-seeds from current
+    /// config, not history (route history has no WAL position)
+    config: Option<Arc<ResolvedConfig>>,
     /// Drain-slice budget, same knobs as the pipeline reorder
     batch_rows: usize,
     batch_bytes: usize,
@@ -909,15 +926,16 @@ impl ReplaySink {
         info: u8,
         record: &Record<'_>,
     ) -> std::result::Result<(), SinkError> {
-        let payload = parse_xact_payload(info, &record.parsed.main_data);
+        let payload = parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+            .unwrap_or_default();
         // Deferred resolution for filenodes invisible at record time;
         // installs decode verdicts + `O - B` barriers ahead of the drain
         resolve_stash(
             &self.buffer,
-            &self.catalog,
+            &self.log,
             xid,
             &payload.subxacts,
-            record.source_lsn,
+            record.next_lsn,
             self.resolver.stats_handle(),
         )
         .await
@@ -991,7 +1009,7 @@ impl ReplaySink {
                     debug_assert!(false, "TRUNCATE heap in gap replay");
                 }
                 WalkStep::Heap(mut heap) => {
-                    let rfn = heap.rfn;
+                    let rfn = heap.decoded.rfn;
                     let Some((rel, s_cap)) = self.targets.get(&(rfn.db_node, rfn.rel_node)) else {
                         continue;
                     };
@@ -1005,25 +1023,28 @@ impl ReplaySink {
                         continue;
                     }
                     let rel = rel.clone();
-                    let value_permit = detoast_heap(
-                        &mut heap,
-                        spool,
-                        &ref_maps,
-                        &self.catalog,
-                        false,
-                        &self.resolver,
-                    )
-                    .await
-                    .map_err(SinkError::from)?;
-                    let Some(mapping) = crate::emit::pipeline::lookup_mapping(
-                        &self.mapping,
-                        &rel.rel_name,
-                        &self.stats,
-                    )
-                    .await
-                    else {
+                    let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
+                        .await
+                        .map_err(SinkError::from)?;
+                    let Some(mapping) = self.mapping.get(&rel.rel_name) else {
+                        self.stats
+                            .unsupported_relations
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     };
+                    let mapping = Arc::new(mapping.clone());
+                    let overrides = self
+                        .config
+                        .as_ref()
+                        .and_then(|rc| rc.columns.get(&rel.rel_name))
+                        .cloned()
+                        .map(Arc::new)
+                        .unwrap_or_default();
+                    let route = crate::emit::route::RouteSnapshot::freeze(
+                        mapping,
+                        overrides,
+                        self.soft_delete,
+                    );
                     let seq = if let Some((seq, rows)) = &mut self.open {
                         *rows += 1;
                         *seq
@@ -1038,9 +1059,9 @@ impl ReplaySink {
                         .send(BatcherMsg::Row(RoutedRow {
                             seq,
                             rel,
-                            mapping,
+                            route,
                             committed: CommittedTuple {
-                                decoded: heap,
+                                decoded: heap.decoded,
                                 commit_ts,
                                 commit_lsn,
                             },
@@ -1082,7 +1103,9 @@ impl RecordSink for ReplaySink {
                         self.on_commit(xid, info, record).await?;
                     }
                     XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
-                        let payload = parse_xact_payload(info, &record.parsed.main_data);
+                        let payload =
+                            parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
+                                .unwrap_or_default();
                         self.buffer
                             .lock()
                             .await
@@ -1154,9 +1177,8 @@ mod tests {
                 ..Default::default()
             },
             source_lsn: 0x5000,
-            page_magic: 0,
             route: Route::ToShadow,
-            catalog_signal: crate::record::CatalogSignal::None,
+            ..Default::default()
         }
     }
 

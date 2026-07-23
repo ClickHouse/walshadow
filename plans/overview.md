@@ -80,9 +80,9 @@ Component docs live alongside this overview:
   `WalStream` page walker, `streaming_walker`, `QueueingRecordSink`
   decoupling pump from decoder, `decoder_sink`
 - [shadow.md](shadow.md) — shadow PG lifecycle (`materialize_conf`,
-  `standby.signal`, supervision), `ShadowCatalog` libpq cache with
-  generation counter + `relation_at` replay-LSN gate, per-relation
-  `SchemaEvent` channel feeding CH DDL applicator
+  `standby.signal`, supervision), `ShadowCatalog` libpq client feeding
+  descriptor capture ([desc_log.md](desc_log.md)) + name-keyed opt-in
+  resolution
 - [decoder.md](decoder.md) — `heap_decoder` Tier 1/2 type matrix,
   `MULTI_INSERT` fan-out, FPI decompression, `main_data` parsing,
   `pg_class_decoder` driving `CatalogTracker`
@@ -96,7 +96,8 @@ Component docs live alongside this overview:
 - [config.md](config.md) + [add_table.md](add_table.md) — layered live
   config, source-PG overlay, per-table opt-in, and initial-load modes
 - [emitter.md](emitter.md) — parallel decode+insert pipeline
-  (`src/pipeline/`): reorder coordinator → decode pool ×M →
+  (`src/pipeline/`): reorder coordinator (side-effect-free transaction
+  plan, then execute) → decode pool ×M →
   `InsertBatcher` (seal complete INSERTs on deadline / row / byte
   budget) → inserter pool ×N → contiguous-done ack watermark;
   resident-payload permit pool bounding payload bytes across stages;
@@ -112,10 +113,9 @@ Component docs live alongside this overview:
   `manifest.toml` (six LSNs + resolved floor + source identity),
   durable TOAST retirement ledger, per-xact `commit_lsn` carrier, slot
   advance on `min(shadow_replay, emitter_ack)`
-- [oracle.md](oracle.md) — differential decode oracle: re-encode +
-  `SELECT $1::bytea::<typ>::text` round-trip against shadow,
-  `--validate <N>` sampling, walshadow PG extension (`pgext/`) exposing
-  `walshadow_decode_disk(oid, bytea) -> text` for Tier 3 types
+- [oracle.md](oracle.md) — PgPending resolver: walshadow PG extension
+  (`pgext/`) exposing `walshadow_decode_disk(oid, bytea) -> text` for
+  Tier 3 types, best-effort resolution at the decode pool
 - [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
   — clickhouse-c-rs unsafe surface (audited 2026-05-17 at `b5af579`):
   `Client` ownership of `PosixIo`/`Codec`, `&[u8]` over
@@ -141,12 +141,13 @@ Component docs live alongside this overview:
    replica-identity key (PRIMARY KEY, `USING INDEX`, or `FULL`) on every
    replicated table, both preflighted. DELETE only needs the key to mark
    the row; `FULL` is accepted, not required
-5. **Source DDL that rewrites a user table.** Ordering invariant:
-   shadow replay LSN ≥ decoder read LSN. `ShadowCatalog::relation_at`
-   blocks until `pg_last_wal_replay_lsn() >= commit_lsn` so decoder
-   reads post-DDL catalog for heap records. Fast-path `ADD COLUMN`
-   skips rewrite; read-time defaults via `attmissingval` cover
-   bootstrap-then-ALTER skew
+5. **Source DDL that rewrites a user table.** Descriptor capture runs
+   inside the catalog-boundary hold with shadow applied exactly through
+   the commit's `next_lsn`; decode reads interval-scoped answers from
+   the durable descriptor log ([desc_log.md](desc_log.md)), so a record
+   always decodes against the shape that produced it. Fast-path
+   `ADD COLUMN` skips rewrite; read-time defaults via `attmissingval`
+   cover bootstrap-then-ALTER skew
 6. **Shadow PG version skew.** Same major as source. Daemon refuses to
    start on mismatch or PG < 16
 7. **Catalog cache invalidation granularity.** Single generation bumps
@@ -187,10 +188,9 @@ Source pinned at `wal_level=logical` + a usable replica-identity key
 
 ### v1.1
 
-4. `--validate` catches a planted decoder regression on the first
-   sampled row of the bad type. **Live** via differential oracle +
-   `pgext/`; absent extension surfaces as `oracle fallback=N` and
-   raw-bytes pass-through for `PgPending`
+4. Tier 3 types outside the local codec matrix reach CH as PG-rendered
+   text. **Live** via oracle + `pgext/`; absent extension surfaces as
+   `oracle fallback=N` and raw-bytes pass-through for `PgPending`
 5. `kill -9` of walshadow mid-workload, restart, CH end-state matches
    non-interrupted run modulo merge transients. **Code-complete.**
    `tests/kill_restart.rs` exercises three kill strategies × five

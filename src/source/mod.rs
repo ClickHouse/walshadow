@@ -1,3 +1,5 @@
+pub mod boundary_hold;
+pub mod catalog_capture;
 pub mod manifest;
 pub mod queueing_record_sink;
 pub(super) mod segment;

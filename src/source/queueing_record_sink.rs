@@ -234,6 +234,13 @@ impl QueueingRecordSink {
         self.processed.load(Ordering::Relaxed)
     }
 
+    /// False once the worker task ended: fatal-error drain closes the
+    /// channel, a panic drops the receiver. Lets a publication hold detect
+    /// worker death without shipping a record.
+    pub fn worker_alive(&self) -> bool {
+        self.tx.as_ref().is_some_and(|tx| !tx.is_closed())
+    }
+
     /// Ship the accumulated buffer without waiting for `batch_size`.
     /// Pump calls this after each chunk so a quiescent source can't
     /// strand commits in the pump-side buffer.
@@ -335,9 +342,12 @@ impl RecordSink for QueueingRecordSink {
             self.buf.push(Record {
                 parsed: record.parsed.clone().into_owned(),
                 source_lsn: record.source_lsn,
+                next_lsn: record.next_lsn,
                 page_magic: record.page_magic,
                 route: record.route,
-                catalog_signal: record.catalog_signal,
+                catalog_boundary: record.catalog_boundary,
+                boundary_info: record.boundary_info.clone(),
+                defer_catalog_decode: record.defer_catalog_decode,
             });
             if self.buf.len() >= self.batch_size {
                 self.flush_buf().await?;
@@ -357,20 +367,19 @@ mod tests {
         Record {
             parsed: XLogRecord::default(),
             source_lsn,
-            page_magic: 0,
             route: crate::record::Route::ToShadow,
-            catalog_signal: crate::record::CatalogSignal::None,
+            ..Default::default()
         }
     }
 
-    struct CaptureLsn(Arc<StdMutex<Vec<(u64, crate::record::CatalogSignal)>>>);
+    struct CaptureLsn(Arc<StdMutex<Vec<(u64, bool)>>>);
     impl RecordSink for CaptureLsn {
         fn on_record<'a>(
             &'a mut self,
             r: &'a Record<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
             let sink = self.0.clone();
-            let item = (r.source_lsn, r.catalog_signal);
+            let item = (r.source_lsn, r.boundary_info.is_some());
             Box::pin(async move {
                 sink.lock().unwrap().push(item);
                 Ok(())
@@ -380,26 +389,25 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_records_in_order() {
-        use crate::record::CatalogSignal;
         let collected = Arc::new(StdMutex::new(Vec::new()));
         let mut q = QueueingRecordSink::spawn(CaptureLsn(collected.clone()), 2, 8, None);
         for lsn in [10, 20, 30, 40] {
             q.on_record(&synth(lsn)).await.expect("send");
         }
-        // `catalog_signal` must survive the clone-to-owned hop: the worker's
-        // decoder bumps epochs off it (see `catalog_tracker` module doc)
+        // `boundary_info` must survive the clone-to-owned hop: the worker's
+        // drain reads it
         let mut ddl = synth(50);
-        ddl.catalog_signal = CatalogSignal::Invalidate;
+        ddl.boundary_info = Some(std::sync::Arc::new(crate::record::BoundaryInfo::default()));
         q.on_record(&ddl).await.expect("send");
         q.close().await.expect("close");
         assert_eq!(
             collected.lock().unwrap().as_slice(),
             &[
-                (10, CatalogSignal::None),
-                (20, CatalogSignal::None),
-                (30, CatalogSignal::None),
-                (40, CatalogSignal::None),
-                (50, CatalogSignal::Invalidate),
+                (10, false),
+                (20, false),
+                (30, false),
+                (40, false),
+                (50, true),
             ],
         );
     }
@@ -430,6 +438,31 @@ mod tests {
             .await
             .expect_err("error must surface");
         assert!(matches!(err, SinkError::Other(s) if s.contains("boom")));
+    }
+
+    #[tokio::test]
+    async fn worker_alive_false_after_worker_error() {
+        struct Fail;
+        impl RecordSink for Fail {
+            fn on_record<'a>(
+                &'a mut self,
+                _r: &'a Record<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                Box::pin(async move { Err(SinkError::Other("boom".into())) })
+            }
+        }
+        let mut q = QueueingRecordSink::spawn(Fail, 1, 4, None);
+        assert!(q.worker_alive());
+        let _ = q.on_record(&synth(1)).await;
+        // Fatal path closes the channel; a boundary hold polls this
+        // without shipping a record
+        for _ in 0..500 {
+            if !q.worker_alive() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("worker_alive stayed true after fatal worker error");
     }
 
     #[tokio::test]

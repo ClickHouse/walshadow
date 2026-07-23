@@ -35,9 +35,7 @@ use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::mapping::{
-    ColumnMapping, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
-};
+use walshadow::mapping::{ColumnMapping, NamespaceMapping, TableMapping, TableTarget};
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle, TailKind};
@@ -109,6 +107,8 @@ pub fn append_source_conf(sh: &Shadow) {
     writeln!(f, "\n# walshadow inproc source overrides").unwrap();
     writeln!(f, "wal_level = logical").unwrap();
     writeln!(f, "max_wal_senders = 4").unwrap();
+    // 2PC coverage (COMMIT PREPARED drains under the prepared xid)
+    writeln!(f, "max_prepared_transactions = 4").unwrap();
 }
 
 pub struct StopOnDrop<'a> {
@@ -483,6 +483,12 @@ pub struct PipelineSinks {
     pub metrics: MetricsRecordSink,
     pub decoder: BufferingDecoderSink,
     pub reorder: ReorderSink,
+    /// Descriptor capture at catalog boundaries. The daemon runs it inside
+    /// the boundary hold; the synchronous harness has no gate, so
+    /// `wait_for_replay` stands in before capturing (nothing past the
+    /// commit has been pumped yet — serial record cadence)
+    pub capture: Option<walshadow::catalog_capture::CatalogCapture>,
+    pub catalog: Arc<Mutex<ShadowCatalog>>,
 }
 
 impl RecordSink for PipelineSinks {
@@ -493,6 +499,17 @@ impl RecordSink for PipelineSinks {
         Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if let (Some(capture), Some(info)) = (&self.capture, &record.boundary_info) {
+                self.catalog
+                    .lock()
+                    .await
+                    .wait_for_replay(record.next_lsn)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
+                capture
+                    .capture_boundary(info, record.source_lsn, record.next_lsn)
+                    .await?;
+            }
             self.metrics.on_record(record).await?;
             self.decoder.on_record(record).await?;
             self.reorder.on_record(record).await?;
@@ -518,6 +535,9 @@ pub struct Pipeline {
     /// Same `EmitterStats` Arc the daemon exports to Prometheus; lets tests
     /// assert the parallel path keeps the emitter counters live.
     pub stats: Arc<EmitterStats>,
+    /// Live descriptor-log handle: interval-semantics assertions against
+    /// real captured history.
+    pub desc_log: Arc<walshadow::desc_log::DescriptorLog>,
 }
 
 impl Pipeline {
@@ -620,17 +640,6 @@ async fn build_pipeline_inner(
         .expect("connect shadow catalog");
     let catalog = Arc::new(Mutex::new(catalog));
 
-    let inv_epoch = Arc::new(AtomicU64::new(0));
-    catalog
-        .lock()
-        .await
-        .set_invalidation_epoch(inv_epoch.clone());
-
-    // Xid-keyed DROP-sweep arming for the reorder coordinator's
-    // commit-boundary sweep. Only the DDL path needs it (mirrors
-    // bin/stream.rs).
-    let pending_sweeps = walshadow::catalog_tracker::PendingSweeps::new();
-
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await
         .expect("START_REPLICATION");
@@ -658,33 +667,79 @@ async fn build_pipeline_inner(
         );
     }
 
-    // DDL wiring (mirrors bin/stream.rs --ch-config). Fold namespace /
+    // DDL wiring (mirrors bin/stream.rs --ch-config): fold namespace /
     // drop-strategy overrides into the emitter config *before* the
-    // applicator reads it, seed the schema-diff baseline for mapped
-    // relations so a pinned table's first ALTER surfaces as Changed, and
-    // subscribe the decoder to the catalog's schema-event channel so
-    // ALTER/CREATE/DROP reach the reorder coordinator as `ordered_events`.
-    let mut schema_events: Option<walshadow::schema::SchemaEventRx> = None;
+    // applicator reads it. Schema events come solely from descriptor
+    // capture at catalog boundaries.
     if let Some(d) = ddl.as_ref() {
         emitter_cfg.namespaces = d.namespaces.clone();
         if let Some(s) = &d.drop_table_strategy {
             emitter_cfg.drop_table_strategy = s.clone();
         }
-        let names: Vec<RelName> = emitter_cfg.tables.keys().cloned().collect();
-        catalog
+    }
+
+    // Descriptor log + capture (mirrors bin/stream.rs): seed the baseline
+    // snapshot at the boot head, capture at boundaries thereafter.
+    let shadow_db_oid = catalog
+        .lock()
+        .await
+        .current_database_oid()
+        .await
+        .expect("shadow db oid");
+    stream.filter_mut().set_inval_db(shadow_db_oid);
+    let smgr_markers = stream.filter_mut().smgr_markers();
+    let desc_log = Arc::new(
+        walshadow::desc_log::DescriptorLog::open(
+            &spill_dir,
+            walshadow::desc_log::DescLogIdentity {
+                pg_major: (feed.server_version_num() / 10000) as u32,
+                system_id: ident.sysid.clone(),
+                timeline: ident.timeline,
+                db_oid: shadow_db_oid,
+                wal_seg_size: WAL_SEG_SIZE as u32,
+            },
+        )
+        .await
+        .expect("open descriptor log"),
+    );
+    if desc_log.is_empty() {
+        let (replay_lsn, descs) = catalog
             .lock()
             .await
-            .seed_baseline(&names)
+            .fetch_all_descriptors()
             .await
-            .expect("seed schema-diff baseline");
-        let rx = catalog.lock().await.subscribe();
-        schema_events = Some(Arc::new(std::sync::Mutex::new(rx)));
+            .expect("descriptor log boot seed");
+        let covered_through = ident.xlogpos.max(replay_lsn);
+        let entries = descs
+            .into_iter()
+            .map(|d| {
+                Arc::new(walshadow::desc_log::LogEntry {
+                    valid_from: aligned,
+                    oid: d.oid,
+                    rfn: d.rfn,
+                    value: walshadow::desc_log::LogValue::Present(Arc::new(d)),
+                })
+            })
+            .collect();
+        desc_log
+            .seed(
+                walshadow::desc_log::BatchRecord {
+                    captured_at: covered_through,
+                    commit_lsn: 0,
+                    observations: Vec::new(),
+                    ambiguities: Vec::new(),
+                    entries,
+                },
+                covered_through,
+            )
+            .await
+            .expect("seed descriptor log");
     }
 
     tune(&mut emitter_cfg);
 
     // SIGHUP-reloadable mapping shared by the DDL applicator + decode pool.
-    let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+    let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
     // Resolver seeds the DDL applicator's live config layers and takes the
     // runtime-config WAL apply (harness injects no config writes, so it stays
     // at the boot snapshot). No SIGHUP task here.
@@ -694,7 +749,6 @@ async fn build_pipeline_inner(
         None,
         toml::Table::new(),
         mapping.clone(),
-        inv_epoch.clone(),
     );
     let ddl_cfg = DdlConfig::from_resolved(
         &config_rx.borrow(),
@@ -704,7 +758,6 @@ async fn build_pipeline_inner(
     let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone(), config_rx.clone())
         .await
         .expect("ddl applicator init")
-        .with_invalidation_epoch(inv_epoch.clone())
         .with_resolver(config_resolver.clone());
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
@@ -732,6 +785,7 @@ async fn build_pipeline_inner(
                     mapping.clone(),
                     stats.clone(),
                     catalog.clone(),
+                    desc_log.clone(),
                     &spill_dir,
                     Some(config_rx.clone()),
                     None,
@@ -752,8 +806,7 @@ async fn build_pipeline_inner(
         tail: TailKind::ClickHouse,
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-        schema_events: schema_events.clone(),
-        pending_sweeps: ddl.as_ref().map(|_| pending_sweeps.clone()),
+        log: desc_log.clone(),
         stats: stats.clone(),
         span_registry: None,
         config_resolver: Some(config_resolver.clone()),
@@ -772,19 +825,27 @@ async fn build_pipeline_inner(
         .flush_due_retires()
         .await
         .expect("boot flush of due toast-mirror retires");
+    reorder
+        .apply_boot_events(desc_log.active_present_at(ident.xlogpos), ident.xlogpos)
+        .await
+        .expect("boot Added pass over descriptor log");
 
-    let mut decoder = BufferingDecoderSink::new(catalog, xact_buffer.clone())
-        .with_catalog_signals(inv_epoch, ddl.as_ref().map(|_| pending_sweeps.clone()));
-    if let Some(rx) = &schema_events {
-        decoder = decoder.with_schema_events(rx.clone());
-    }
+    let mut decoder = BufferingDecoderSink::new(desc_log.clone(), xact_buffer.clone());
     if let Some(schema) = ddl.as_ref().and_then(|d| d.config_schema.as_deref()) {
         decoder = decoder.with_config_schema(Arc::from(schema));
     }
+    let capture = walshadow::catalog_capture::CatalogCapture::new(
+        desc_log.clone(),
+        catalog.clone(),
+        xact_buffer.clone(),
+        smgr_markers,
+    );
     let sinks = PipelineSinks {
         metrics: MetricsRecordSink::default(),
         decoder,
         reorder,
+        capture: Some(capture),
+        catalog,
     };
     let segment_sink =
         DirSegmentSink::new(shadow_filter_dir.to_path_buf()).expect("open shadow filter dir");
@@ -801,6 +862,7 @@ async fn build_pipeline_inner(
         ack: emitter_ack,
         resume_floor,
         stats,
+        desc_log,
     }
 }
 
@@ -880,6 +942,43 @@ pub async fn wait_query(ch: &ChServer, sql: &str, want: &str, what: &str) {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Pipe multi-line SQL through one delayed psql session, preserving explicit transactions
+pub fn spawn_txn(source: &Shadow, body: &str) -> std::thread::JoinHandle<()> {
+    let sock = source.config().socket_dir.clone();
+    let port = source.config().port;
+    let sql = body.to_owned();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let mut child = Command::new("psql")
+            .args([
+                "-h",
+                sock.to_str().unwrap(),
+                "-p",
+                &port.to_string(),
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-f",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn psql");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(sql.as_bytes())
+            .unwrap();
+        let _ = child.wait();
+    })
 }
 
 /// Driver thread that fires a sequence of `-c` statements at the source

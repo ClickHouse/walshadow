@@ -168,10 +168,6 @@ pub struct ConfigResolver {
     /// the applying xact route against the post-config mapping, not waiting on
     /// the async watch refresher.
     mapping: MappingHandle,
-    /// Decode-pool cache generation. Bumped inside a shape-changing apply and
-    /// on every inclusion add/remove so the decode pool re-resolves the
-    /// `rfn→mapping` entry it caches.
-    invalidation_epoch: Arc<AtomicU64>,
     /// Count of overlay values currently rejected at merge (Regime A).
     rejections: AtomicU64,
     /// Forward-declared opt-in rels awaiting their `CREATE TABLE` (gauge).
@@ -193,7 +189,6 @@ impl ConfigResolver {
         toml_path: Option<PathBuf>,
         cli_source_base: toml::Table,
         mapping: MappingHandle,
-        invalidation_epoch: Arc<AtomicU64>,
     ) -> (Arc<Self>, watch::Receiver<Arc<ResolvedConfig>>) {
         let overlay = ConfigOverlay::default();
         let opt_in = OptInState::default();
@@ -210,7 +205,6 @@ impl ConfigResolver {
             }),
             tx,
             mapping,
-            invalidation_epoch,
             rejections: AtomicU64::new(0),
             pending_decl: AtomicU64::new(0),
             opt_in_total: AtomicU64::new(0),
@@ -252,26 +246,20 @@ impl ConfigResolver {
     }
 
     /// Apply one WAL-driven config event at its commit LSN (§6). Mutates the
-    /// overlay, writes the routing map under the fence, bumps the cache
-    /// generation for shape-changing events, then republishes. Called from the
-    /// reorder coordinator's barrier apply, so it runs after earlier data in
-    /// the xact is durable and before the trailing segment dispatches.
+    /// overlay, writes the routing map under the fence, then republishes.
+    /// Called from the reorder coordinator's barrier apply, so it runs after
+    /// earlier data in the xact is durable and before the trailing segment
+    /// dispatches (decode memoises per job — nothing holds a stale mapping
+    /// across the fence).
     pub async fn apply_config_event(&self, event: ConfigEvent) {
-        let shape_change = matches!(
-            event,
-            ConfigEvent::ColumnUpserted { .. } | ConfigEvent::ColumnRemoved { .. }
-        );
         let mut inner = self.inner.lock().await;
         inner.overlay.apply(event);
-        if shape_change {
-            self.invalidation_epoch.fetch_add(1, Ordering::Release);
-        }
         self.republish(&inner).await;
     }
 
     /// Bring `desc` into scope (`replicate=true`, rel known): derive a mapping
     /// from the descriptor, store it so it survives republish, drop any
-    /// pending / excluded state, bump the cache epoch, republish. Idempotent —
+    /// pending / excluded state, republish. Idempotent —
     /// a re-apply overwrites with an identical mapping. The caller must ensure
     /// the CH table exists first (see `DdlApplicator::ensure_ch_table`).
     pub async fn materialize_opt_in(
@@ -297,15 +285,14 @@ impl ConfigResolver {
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         self.opt_in_total.fetch_add(1, Ordering::Relaxed);
-        self.invalidation_epoch.fetch_add(1, Ordering::Release);
         self.republish(&inner).await;
     }
 
     /// Take a rel out of scope (`replicate=false` / `TableRemoved`): drop its
     /// mapping + any pending decl, record the exclusion so republish keeps it
-    /// out even when TOML-mapped, bump the cache epoch, republish. In-flight
-    /// rows already dispatched still drain; further rows drop at
-    /// `lookup_mapping`.
+    /// out even when TOML-mapped, republish. In-flight
+    /// rows already dispatched still drain; later transactions plan
+    /// `route = None` discards.
     pub async fn exclude_table(&self, rel: &RelName) {
         let mut inner = self.inner.lock().await;
         inner.opt_in.mappings.remove(rel);
@@ -315,7 +302,6 @@ impl ConfigResolver {
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         self.opt_out_total.fetch_add(1, Ordering::Relaxed);
-        self.invalidation_epoch.fetch_add(1, Ordering::Release);
         self.republish(&inner).await;
     }
 
@@ -431,11 +417,15 @@ impl ConfigResolver {
             &prev.columns,
         );
         self.rejections.store(rejections, Ordering::Relaxed);
-        *self.mapping.write().await = resolved.tables.clone();
-        // Decode workers cache rfn→(descriptor, mapping) per epoch, cache
+        *self.mapping.write().await = Arc::new(resolved.tables.clone());
+        tracing::info!(
+            target: "walshadow::config",
+            opt_ins = resolved.table_opt_ins.len(),
+            tables = resolved.tables.len(),
+            "republish",
+        );
         // hits skip the mapping read; bump after every swap so no worker
         // routes against the pre-publish map
-        self.invalidation_epoch.fetch_add(1, Ordering::Release);
         // Err only when every receiver dropped (daemon tearing down); ignore
         let _ = self.tx.send(Arc::new(resolved));
     }
@@ -618,8 +608,8 @@ impl ConfigResolver {
         }
 
         // Opt-out (last, so exclusion wins over any TOML/overlay mapping):
-        // a `replicate=false` rel leaves the routing map, so `lookup_mapping`
-        // returns None and the decode pool drops its rows mid-stream.
+        // a `replicate=false` rel leaves the routing map, so route planning
+        // resolves None and its rows discard mid-stream.
         for rel in &opt_in.excluded {
             rc.tables.remove(rel);
         }
@@ -664,11 +654,8 @@ mod tests {
         .unwrap()
     }
 
-    fn dummy_handles() -> (MappingHandle, Arc<AtomicU64>) {
-        (
-            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            Arc::new(AtomicU64::new(0)),
-        )
+    fn dummy_handles() -> MappingHandle {
+        crate::mapping::mapping_handle(HashMap::new())
     }
 
     #[test]
@@ -914,6 +901,7 @@ mod tests {
                 rel_node: 30000,
             },
             oid: 30000,
+            toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new(namespace, name),
             kind: 'r',
@@ -973,16 +961,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_opt_in_derives_maps_and_bumps_epoch() {
+    async fn materialize_opt_in_derives_maps() {
         let base = base_with("retain");
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, mut rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping.clone(),
-            epoch.clone(),
         );
         resolver
             .materialize_opt_in(&rel_desc("public", "events"), None, None)
@@ -993,9 +980,8 @@ mod tests {
         let t = snap.tables.get(&rel).expect("mapping present");
         assert_eq!(t.target.table, "events", "target derived from descriptor");
         assert!(!t.columns.is_empty(), "columns derived from descriptor");
-        // Fenced routing map written + cache epoch bumped for the decode pool.
+        // Fenced routing map written for the decode pool.
         assert!(mapping.read().await.contains_key(&rel));
-        assert!(epoch.load(Ordering::Relaxed) >= 1);
         assert_eq!(resolver.opt_in_total(), 1);
     }
 
@@ -1006,14 +992,13 @@ mod tests {
              columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n",
         )
         .unwrap();
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, mut rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping.clone(),
-            epoch,
         );
         let rel = RelName::new("public", "events");
         assert!(rx.borrow().tables.contains_key(&rel));
@@ -1030,14 +1015,13 @@ mod tests {
     #[tokio::test]
     async fn derived_mapping_survives_republish() {
         let base = base_with("retain");
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, mut rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping.clone(),
-            epoch,
         );
         let rel = RelName::new("public", "auto");
         resolver
@@ -1070,14 +1054,13 @@ mod tests {
     #[tokio::test]
     async fn forget_reparks_opt_in_row_as_pending_decl() {
         let base = base_with("drop");
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, _rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping.clone(),
-            epoch,
         );
         let rel = RelName::new("public", "events");
         resolver
@@ -1112,14 +1095,13 @@ mod tests {
              columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n",
         )
         .unwrap();
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, _rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping.clone(),
-            epoch,
         );
         let mut desc = rel_desc("public", "events");
         desc.attributes.push(RelAttr {
@@ -1249,14 +1231,13 @@ mod tests {
     async fn column_override_survives_malformed_update_until_removed() {
         use crate::runtime_config::ColumnRow;
         let base = base_with("retain");
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, mut rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping,
-            epoch,
         );
         let upsert = |ty: &str| ConfigEvent::ColumnUpserted {
             rel: RelName::new("public", "t"),
@@ -1298,14 +1279,13 @@ mod tests {
     #[tokio::test]
     async fn pending_decl_parks_and_takes() {
         let base = base_with("retain");
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, _rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping,
-            epoch,
         );
         let rel = RelName::new("app", "later");
         resolver
@@ -1320,14 +1300,13 @@ mod tests {
     #[tokio::test]
     async fn seed_and_apply_republish() {
         let base = base_with("retain");
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, mut rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping,
-            epoch,
         );
         assert_eq!(rx.borrow().drop_table_strategy, "retain");
 
@@ -1352,14 +1331,13 @@ mod tests {
     #[tokio::test]
     async fn reload_without_path_is_noop() {
         let base = base_with("retain");
-        let (mapping, epoch) = dummy_handles();
+        let mapping = dummy_handles();
         let (resolver, rx) = ConfigResolver::new(
             &base,
             CliOverrides::default(),
             None,
             toml::Table::new(),
             mapping,
-            epoch,
         );
         resolver.reload().await.unwrap();
         assert_eq!(rx.borrow().drop_table_strategy, "retain");
