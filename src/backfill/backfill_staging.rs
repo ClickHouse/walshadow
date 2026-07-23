@@ -17,7 +17,6 @@
 //! differs) from "already copied back" (staging name gone).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -115,7 +114,7 @@ pub async fn prepare(
         rels.push(rel);
     }
     Ok(StagingPlan {
-        mapping: Arc::new(tokio::sync::RwLock::new(staged)),
+        mapping: crate::mapping::mapping_handle(staged),
         rels,
     })
 }

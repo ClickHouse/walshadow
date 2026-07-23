@@ -327,6 +327,7 @@ impl WalStream {
                 route,
                 catalog_boundary: verdict.catalog_boundary,
                 boundary_info: verdict.boundary,
+                defer_catalog_decode: verdict.defer_catalog_decode,
             };
             if let Some(sink) = record_sink.as_deref_mut() {
                 sink.on_record(&record).await?;

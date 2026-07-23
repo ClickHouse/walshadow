@@ -91,6 +91,25 @@ the record for descriptor capture ([desc_log.md](desc_log.md)). The
 filter also keeps a pump-side `XLOG_SMGR_CREATE` marker map — the
 bias-early valid_from source for rotated filenodes
 
+## Dirty tree
+
+`src/filter/dirty_tree.rs`: pump-side catalog-dirty transaction tree
+behind the `defer_catalog_decode` stamp. Once a xact family touches the
+catalog, every subsequent decoder-routed record in that family carries
+the flag and the decoder sink stashes it raw for commit-time resolution
+([xact.md](xact.md) Commit-time stash) — a Present predecessor
+descriptor doesn't prove decodability inside the dirty interval. State
+stays keyed by writing xid, never merged eagerly into the top: subxact
+abort drops exactly its subtree's observations while sibling and top
+dirt survive. Tree links (subxid → top) arrive from record-inline
+toplevel xids (`XLR_BLOCK_ID_TOPLEVEL_XID`) and batched
+`XLOG_XACT_ASSIGNMENT` records; both name the top directly so links
+never chain. Admission asks "is this record's tree dirty" via a
+per-root dirty-member count; a subxid whose top is still unknown counts
+as its own root — only its own later records defer until a link lands
+(prefer excess raw buffering over predecessor decode). Interleaved
+clean xacts are untouched; commit/abort clears the family's dirt
+
 Boundary classification is restart-safe off the commit record alone: its
 inval set covers the whole xact tree, so relcache invals enumerate
 affected rels and pg_namespace catcache / whole-catalog invals force

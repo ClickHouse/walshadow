@@ -63,8 +63,8 @@ digraph internals {
     label="⑤ decode + xact buffer (worker task — gated on shadow apply)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     catgate [label="BufferingDecoderSink\nrelation_at(rfn, lsn)\nwait_for_replay(at_lsn)", fillcolor="#4D4128"];
     decoder [label="heap_decoder\nINSERT / DELETE /\nUPDATE / HOT / TRUNCATE\nTier-1 fixed-width\nTier-2 length-prefixed\nReplica-identity matrix", fillcolor="#4D4128"];
-    xactbuf [label="XactBuffer + spill v4\nHeap / Chunk / ToastDelete / Raw\nSMGR markers + commit stash\nSubxactTracker\nbudget = work_mem", fillcolor="#4D4128"];
-    drain   [label="transaction reorder\nwalk committed rows + changes in WAL order\nwait for earlier data before table changes", fillcolor="#4D4128"];
+    xactbuf [label="XactBuffer + spill v6\nHeap / Chunk / ToastDelete / Raw / dict\ndirty tree + SMGR markers + commit stash\nSubxactTracker\nbudget = work_mem", fillcolor="#4D4128"];
+    drain   [label="transaction reorder\nplan (side-effect-free: detoast + route +\nraw decode) then execute sealed plan\nwait for earlier data before table changes", fillcolor="#4D4128"];
     catgate -> decoder -> xactbuf -> drain;
   }
   qwrk -> catgate [lhead=cluster_decode];
@@ -72,7 +72,7 @@ digraph internals {
   // ════════ ⑥ emitter pipeline ════════
   subgraph cluster_ch {
     label="⑥ emitter pipeline — shared path for ClickHouse and metrics-only runs"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    cdecode  [label="decode pool ×M\ndetoast via ChunkMap / store as-of fetch\nresolve_at_pooled + mapping + oracle\nchunk 1024 rows / 4 MiB", fillcolor="#5D4628"];
+    cdecode  [label="decode pool ×M\nplanned envelopes (descriptor + route ride)\noracle PgPending resolve\nchunk 1024 rows / 4 MiB", fillcolor="#5D4628"];
     tableenc [label="InsertBatcher\nTableEncoder per table\nNative columns +\n_lsn / _xid / _commit_ts / _is_deleted\nrow/byte budget + deadline seal", fillcolor="#5D4628"];
     chwire   [label="inserter pool ×N\nBlockBuilder over sealed batch\none complete INSERT each\nsend_with_retry + reconnect", fillcolor="#5D4628"];
     nulltail [label="metrics-only tail\nno ClickHouse connection\nacknowledge immediately", fillcolor="#4D3A28", shape=note];

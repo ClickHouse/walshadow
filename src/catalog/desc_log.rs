@@ -39,6 +39,16 @@
 //! AccessExclusiveLock so no decode query lands past it — the entry exists so
 //! GC can drop rotated-away chains and buggy callers fail closed, not open.
 //!
+//! ## Ambiguity intervals
+//!
+//! A boundary whose shape change cannot be proven safe for one descriptor
+//! records an [`Ambiguity`]: a `[from_lsn, through_lsn)` interval scoped to
+//! an rfn, oid, or whole database. Lookup consults ambiguity intervals
+//! before the descriptor chain — a covered LSN answers
+//! [`LookupResult::Ambiguous`] even when a chain entry exists, so callers
+//! fail closed instead of decoding under an unproven layout. The final
+//! post-commit `Present` entry stays usable past `through_lsn`
+//!
 //! Identity keys the full physical `RelFileNode`: PG guarantees
 //! relfilenumber uniqueness only per database of one tablespace
 //! (`GetNewRelFileNumber`, PG `src/backend/catalog/catalog.c`), so
@@ -68,7 +78,7 @@ pub const CKPT_FILE: &str = "desc_log.ckpt";
 pub const TAIL_FILE: &str = "desc_log.tail";
 
 const MAGIC: &[u8; 2] = b"WL";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 /// Reject frames past this before allocating: no realistic batch (thousands
 /// of descriptors) approaches it, garbage lengths do
 const MAX_FRAME: u32 = 256 * 1024 * 1024;
@@ -134,13 +144,76 @@ pub struct LogEntry {
     pub value: LogValue,
 }
 
+/// Interval `[from_lsn, through_lsn)` where no single descriptor provably
+/// decodes rows in `scope`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ambiguity {
+    pub scope: AmbiguityScope,
+    pub from_lsn: u64,
+    pub through_lsn: u64,
+    pub reason: AmbiguityReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguityScope {
+    Rfn(RelFileNode),
+    Oid(Oid),
+    /// Conservative fallback when affected relations cannot be enumerated
+    Database(Oid),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguityReason {
+    UnknownAffectedRelation,
+    UnknownMutationPosition,
+    MultipleIncompatibleLayouts,
+    NeverVisibleGeneration,
+    IncompleteInvalidation,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchRecord {
     /// Boundary commit EndRecPtr (or seed LSN); the replay-from-log key
     pub captured_at: u64,
+    /// Commit record start LSN; 0 for seed batches
+    pub commit_lsn: u64,
+    /// Evidence the boundary verdict derives from, kept so replay
+    /// reproduces the verdict instead of reinferring it from current
+    /// catalog. Deterministic order (capture sorts)
+    pub observations: Vec<RelationObservation>,
+    /// Intervals this boundary could not prove decodable under one
+    /// descriptor
+    pub ambiguities: Vec<Arc<Ambiguity>>,
     /// Empty = stub: boundary produced no shape change, recorded so boot
     /// replay distinguishes "captured, nothing changed" from "never captured"
     pub entries: Vec<Arc<LogEntry>>,
+}
+
+impl BatchRecord {
+    /// Digest over the deterministic encoding; divergence diagnostics
+    pub fn digest(&self) -> u32 {
+        crc32c::crc32c(&encode_batch(self))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelationObservation {
+    pub oid: Option<Oid>,
+    pub rfn: Option<RelFileNode>,
+    pub first_touch_lsn: u64,
+    /// Main-fork smgr create marker: new generation lower bound
+    pub smgr_create_lsn: Option<u64>,
+    pub kind: ObservationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationKind {
+    /// Dirty-tracker pg_class decode or commit relcache inval named the oid
+    AffectedOid,
+    /// Smgr create marker registered for the filenode
+    SmgrCreate,
+    /// Enumeration incomplete, capture fell back to full catalog scan
+    FullScan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +221,9 @@ pub enum LookupResult {
     Present(Arc<RelDescriptor>),
     Dropped,
     Retired,
+    /// LSN falls inside a recorded ambiguity interval: no descriptor is
+    /// proven safe, callers fail closed
+    Ambiguous(Arc<Ambiguity>),
     NotCovered,
     /// Foreign `db_node`: preserves the `ForeignDatabase` row-skip control
     /// flow — never a stash or a fatal
@@ -167,6 +243,9 @@ struct Slot {
 struct Index {
     by_rfn: HashMap<RelFileNode, Vec<Slot>>,
     by_oid: HashMap<Oid, Vec<Slot>>,
+    amb_rfn: HashMap<RelFileNode, Vec<Arc<Ambiguity>>>,
+    amb_oid: HashMap<Oid, Vec<Arc<Ambiguity>>>,
+    amb_db: HashMap<Oid, Vec<Arc<Ambiguity>>>,
     batches: BTreeMap<u64, Arc<BatchRecord>>,
     covered_through: u64,
     floor_at_write: u64,
@@ -175,6 +254,16 @@ struct Index {
 
 impl Index {
     fn insert_batch(&mut self, batch: Arc<BatchRecord>) {
+        for amb in &batch.ambiguities {
+            let list = match amb.scope {
+                AmbiguityScope::Rfn(rfn) => self.amb_rfn.entry(rfn).or_default(),
+                AmbiguityScope::Oid(oid) => self.amb_oid.entry(oid).or_default(),
+                AmbiguityScope::Database(db) => self.amb_db.entry(db).or_default(),
+            };
+            let key = (amb.from_lsn, amb.through_lsn);
+            let pos = list.partition_point(|a| (a.from_lsn, a.through_lsn) <= key);
+            list.insert(pos, amb.clone());
+        }
         for entry in &batch.entries {
             let slot = Slot {
                 valid_from: entry.valid_from,
@@ -218,11 +307,18 @@ crate::atomic_stats! {
         pub lookups_present,
         pub lookups_dropped,
         pub lookups_retired,
+        pub lookups_ambiguous,
         pub lookups_not_covered,
         pub lookups_foreign_db,
         pub batches_appended,
         pub gc_runs,
         pub gc_dropped_entries,
+        /// `descriptor_ambiguous_total{reason}` split of `lookups_ambiguous`
+        pub ambiguous_unknown_relation,
+        pub ambiguous_unknown_position,
+        pub ambiguous_incompatible_layouts,
+        pub ambiguous_never_visible,
+        pub ambiguous_incomplete_invalidation,
     }
 }
 
@@ -319,22 +415,71 @@ impl DescriptorLog {
     }
 
     pub fn descriptor_at(&self, rfn: RelFileNode, lsn: u64) -> LookupResult {
+        match self.descriptor_at_spanned(rfn, lsn) {
+            Ok((rel, _)) => LookupResult::Present(rel),
+            Err(other) => other,
+        }
+    }
+
+    /// `Present` descriptor plus its entry's `valid_from` under one index
+    /// read (two reads could interleave with a bias-early capture append
+    /// and pair a stale descriptor with a fresh span). Non-Present outcomes
+    /// return the plain lookup for the caller's arms
+    pub fn descriptor_at_spanned(
+        &self,
+        rfn: RelFileNode,
+        lsn: u64,
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
         use std::sync::atomic::Ordering::Relaxed;
         if rfn.db_node != 0 && rfn.db_node != self.identity.db_oid {
             self.stats.lookups_foreign_db.fetch_add(1, Relaxed);
-            return LookupResult::ForeignDb;
+            return Err(LookupResult::ForeignDb);
         }
         let idx = self.index.read().unwrap();
-        let result = lookup(idx.by_rfn.get(&rfn), lsn);
-        self.count(&result);
+        // Ambiguity precedes the chain: a chain entry inside an ambiguous
+        // interval is not proven safe for rows there
+        let result = ambiguity_covering(idx.amb_rfn.get(&rfn), lsn)
+            .or_else(|| ambiguity_covering(idx.amb_db.get(&rfn.db_node), lsn))
+            .map_or_else(
+                || lookup_spanned(idx.by_rfn.get(&rfn), lsn),
+                |a| Err(LookupResult::Ambiguous(a)),
+            );
+        self.count_spanned(&result);
         result
     }
 
     pub fn descriptor_by_oid_at(&self, oid: Oid, lsn: u64) -> LookupResult {
+        match self.descriptor_by_oid_at_spanned(oid, lsn) {
+            Ok((rel, _)) => LookupResult::Present(rel),
+            Err(other) => other,
+        }
+    }
+
+    /// Oid-keyed twin of [`Self::descriptor_at_spanned`]
+    pub fn descriptor_by_oid_at_spanned(
+        &self,
+        oid: Oid,
+        lsn: u64,
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
         let idx = self.index.read().unwrap();
-        let result = lookup(idx.by_oid.get(&oid), lsn);
-        self.count(&result);
+        let result = ambiguity_covering(idx.amb_oid.get(&oid), lsn)
+            .or_else(|| ambiguity_covering(idx.amb_db.get(&self.identity.db_oid), lsn))
+            .map_or_else(
+                || lookup_spanned(idx.by_oid.get(&oid), lsn),
+                |a| Err(LookupResult::Ambiguous(a)),
+            );
+        self.count_spanned(&result);
         result
+    }
+
+    fn count_spanned(&self, result: &std::result::Result<(Arc<RelDescriptor>, u64), LookupResult>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match result {
+            Ok(_) => {
+                self.stats.lookups_present.fetch_add(1, Relaxed);
+            }
+            Err(other) => self.count(other),
+        }
     }
 
     fn count(&self, result: &LookupResult) {
@@ -343,6 +488,25 @@ impl DescriptorLog {
             LookupResult::Present(_) => self.stats.lookups_present.fetch_add(1, Relaxed),
             LookupResult::Dropped => self.stats.lookups_dropped.fetch_add(1, Relaxed),
             LookupResult::Retired => self.stats.lookups_retired.fetch_add(1, Relaxed),
+            LookupResult::Ambiguous(a) => {
+                self.stats.lookups_ambiguous.fetch_add(1, Relaxed);
+                let by_reason = match a.reason {
+                    AmbiguityReason::UnknownAffectedRelation => {
+                        &self.stats.ambiguous_unknown_relation
+                    }
+                    AmbiguityReason::UnknownMutationPosition => {
+                        &self.stats.ambiguous_unknown_position
+                    }
+                    AmbiguityReason::MultipleIncompatibleLayouts => {
+                        &self.stats.ambiguous_incompatible_layouts
+                    }
+                    AmbiguityReason::NeverVisibleGeneration => &self.stats.ambiguous_never_visible,
+                    AmbiguityReason::IncompleteInvalidation => {
+                        &self.stats.ambiguous_incomplete_invalidation
+                    }
+                };
+                by_reason.fetch_add(1, Relaxed)
+            }
             LookupResult::NotCovered => self.stats.lookups_not_covered.fetch_add(1, Relaxed),
             LookupResult::ForeignDb => self.stats.lookups_foreign_db.fetch_add(1, Relaxed),
         };
@@ -386,6 +550,13 @@ impl DescriptorLog {
         pos.checked_sub(1).map(|i| chain[i].entry.clone())
     }
 
+    /// Ambiguity intervals recorded for an rfn, `(from_lsn, through_lsn)`
+    /// ascending — introspection for diagnostics and tests
+    pub fn rfn_ambiguities(&self, rfn: RelFileNode) -> Vec<Arc<Ambiguity>> {
+        let idx = self.index.read().unwrap();
+        idx.amb_rfn.get(&rfn).cloned().unwrap_or_default()
+    }
+
     /// Oids whose newest entry is `Present` — capture-all diffs its SQL
     /// enumeration against this to tombstone vanished relations
     pub fn present_oids(&self) -> Vec<Oid> {
@@ -407,10 +578,7 @@ impl DescriptorLog {
         let idx = self.index.read().unwrap();
         idx.by_oid
             .values()
-            .filter_map(|chain| match lookup(Some(chain), lsn) {
-                LookupResult::Present(d) => Some(d),
-                _ => None,
-            })
+            .filter_map(|chain| Some(lookup_spanned(Some(chain), lsn).ok()?.0))
             .collect()
     }
 
@@ -456,8 +624,11 @@ impl DescriptorLog {
                     file: TAIL_FILE,
                     offset: w.tail_len,
                     detail: format!(
-                        "append at captured_at {:#x} diverges from stored batch",
+                        "append at captured_at {:#x} diverges from stored batch \
+                         (digest {:#010x} vs stored {:#010x})",
                         batch.captured_at,
+                        batch.digest(),
+                        existing.digest(),
                     ),
                 });
             }
@@ -475,8 +646,8 @@ impl DescriptorLog {
         Ok(())
     }
 
-    /// Compact when the tail outgrew [`GC_TAIL_BYTES`] or at least
-    /// [`GC_DEAD_ENTRIES`] entries are droppable below `floor`. Retention
+    /// Compact when the tail outgrew `GC_TAIL_BYTES` or at least
+    /// `GC_DEAD_ENTRIES` entries are droppable below `floor`. Retention
     /// keeps, per key, the state active at the floor: the last entry at or
     /// below it when `Present`; a `Dropped`/`Retired` there drops the whole
     /// at-or-below history (nothing above can reference it — records
@@ -557,18 +728,30 @@ impl DescriptorLog {
     }
 }
 
-fn lookup(chain: Option<&Vec<Slot>>, lsn: u64) -> LookupResult {
+/// First interval covering `lsn` under `[from_lsn, through_lsn)`; lists stay
+/// `(from_lsn, through_lsn)`-sorted so overlap resolution is deterministic
+fn ambiguity_covering(list: Option<&Vec<Arc<Ambiguity>>>, lsn: u64) -> Option<Arc<Ambiguity>> {
+    list?
+        .iter()
+        .find(|a| a.from_lsn <= lsn && lsn < a.through_lsn)
+        .cloned()
+}
+
+fn lookup_spanned(
+    chain: Option<&Vec<Slot>>,
+    lsn: u64,
+) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
     let Some(chain) = chain else {
-        return LookupResult::NotCovered;
+        return Err(LookupResult::NotCovered);
     };
     let pos = chain.partition_point(|s| s.valid_from <= lsn);
     let Some(slot) = pos.checked_sub(1).map(|i| &chain[i]) else {
-        return LookupResult::NotCovered;
+        return Err(LookupResult::NotCovered);
     };
     match &slot.entry.value {
-        LogValue::Present(d) => LookupResult::Present(d.clone()),
-        LogValue::Dropped => LookupResult::Dropped,
-        LogValue::Retired => LookupResult::Retired,
+        LogValue::Present(d) => Ok((d.clone(), slot.valid_from)),
+        LogValue::Dropped => Err(LookupResult::Dropped),
+        LogValue::Retired => Err(LookupResult::Retired),
     }
 }
 
@@ -600,9 +783,20 @@ fn compute_retained(idx: &Index, floor: u64) -> Index {
             .filter(|e| e.valid_from > floor || keep.contains(&Arc::as_ptr(e)))
             .cloned()
             .collect();
-        if !entries.is_empty() {
+        // Half-open interval: through_lsn == floor covers nothing at or
+        // above the floor
+        let ambiguities: Vec<Arc<Ambiguity>> = batch
+            .ambiguities
+            .iter()
+            .filter(|a| a.through_lsn > floor)
+            .cloned()
+            .collect();
+        if !entries.is_empty() || !ambiguities.is_empty() {
             out.insert_batch(Arc::new(BatchRecord {
                 captured_at,
+                commit_lsn: batch.commit_lsn,
+                observations: batch.observations.clone(),
+                ambiguities,
                 entries,
             }));
         }
@@ -666,6 +860,7 @@ fn encode_meta(covered_through: u64, floor_at_write: u64) -> Vec<u8> {
 fn encode_batch(batch: &BatchRecord) -> Vec<u8> {
     let mut out = vec![TAG_BATCH];
     push_u64(&mut out, batch.captured_at);
+    push_u64(&mut out, batch.commit_lsn);
     push_u32(&mut out, batch.entries.len() as u32);
     for entry in &batch.entries {
         push_u64(&mut out, entry.valid_from);
@@ -681,6 +876,56 @@ fn encode_batch(batch: &BatchRecord) -> Vec<u8> {
             LogValue::Dropped => push_u8(&mut out, 1),
             LogValue::Retired => push_u8(&mut out, 2),
         }
+    }
+    push_u32(&mut out, batch.ambiguities.len() as u32);
+    for amb in &batch.ambiguities {
+        match amb.scope {
+            AmbiguityScope::Rfn(rfn) => {
+                push_u8(&mut out, 0);
+                push_u32(&mut out, rfn.spc_node);
+                push_u32(&mut out, rfn.db_node);
+                push_u32(&mut out, rfn.rel_node);
+            }
+            AmbiguityScope::Oid(oid) => {
+                push_u8(&mut out, 1);
+                push_u32(&mut out, oid);
+            }
+            AmbiguityScope::Database(db) => {
+                push_u8(&mut out, 2);
+                push_u32(&mut out, db);
+            }
+        }
+        push_u64(&mut out, amb.from_lsn);
+        push_u64(&mut out, amb.through_lsn);
+        push_u8(&mut out, amb.reason as u8);
+    }
+    push_u32(&mut out, batch.observations.len() as u32);
+    for obs in &batch.observations {
+        match obs.oid {
+            None => push_u8(&mut out, 0),
+            Some(oid) => {
+                push_u8(&mut out, 1);
+                push_u32(&mut out, oid);
+            }
+        }
+        match obs.rfn {
+            None => push_u8(&mut out, 0),
+            Some(rfn) => {
+                push_u8(&mut out, 1);
+                push_u32(&mut out, rfn.spc_node);
+                push_u32(&mut out, rfn.db_node);
+                push_u32(&mut out, rfn.rel_node);
+            }
+        }
+        push_u64(&mut out, obs.first_touch_lsn);
+        match obs.smgr_create_lsn {
+            None => push_u8(&mut out, 0),
+            Some(lsn) => {
+                push_u8(&mut out, 1);
+                push_u64(&mut out, lsn);
+            }
+        }
+        push_u8(&mut out, obs.kind as u8);
     }
     out
 }
@@ -730,6 +975,20 @@ fn encode_descriptor(out: &mut Vec<u8>, d: &RelDescriptor) {
         push_u8(out, a.type_storage as u8);
         push_opt_str(out, a.missing_text.as_deref());
     }
+}
+
+/// Spill descriptor-dictionary reuse: same codec, byte-slice framing
+pub(crate) fn encode_descriptor_bytes(out: &mut Vec<u8>, d: &RelDescriptor) {
+    encode_descriptor(out, d);
+}
+
+/// Returns decoded descriptor + consumed byte count
+pub(crate) fn decode_descriptor_bytes(
+    buf: &[u8],
+) -> std::result::Result<(RelDescriptor, usize), String> {
+    let mut cur = Cur::new(buf, "spill", 0);
+    let d = decode_descriptor(&mut cur).map_err(|e| e.to_string())?;
+    Ok((d, cur.pos))
 }
 
 fn encode_opt_attnums(out: &mut Vec<u8>, nums: Option<&[i16]>) {
@@ -915,13 +1174,16 @@ fn load_frames(
                     // ckpt/tail overlap from a crash between GC's ckpt
                     // write and tail truncate
                     Some(existing) if **existing == batch => {}
-                    Some(_) => {
+                    Some(existing) => {
                         return Err(DescLogError::Corrupt {
                             file,
                             offset: frame_start as u64,
                             detail: format!(
-                                "batch at captured_at {:#x} diverges from earlier copy",
+                                "batch at captured_at {:#x} diverges from earlier copy \
+                                 (digest {:#010x} vs {:#010x})",
                                 batch.captured_at,
+                                batch.digest(),
+                                existing.digest(),
                             ),
                         });
                     }
@@ -985,6 +1247,7 @@ fn check_identity(cur: &mut Cur<'_>, ours: &DescLogIdentity) -> Result<()> {
 
 fn decode_batch(cur: &mut Cur<'_>) -> Result<BatchRecord> {
     let captured_at = cur.u64()?;
+    let commit_lsn = cur.u64()?;
     let n = cur.u32()? as usize;
     let mut entries = Vec::with_capacity(n);
     for _ in 0..n {
@@ -1008,8 +1271,75 @@ fn decode_batch(cur: &mut Cur<'_>) -> Result<BatchRecord> {
             value,
         }));
     }
+    let n = cur.u32()? as usize;
+    let mut ambiguities = Vec::with_capacity(n);
+    for _ in 0..n {
+        let scope = match cur.u8()? {
+            0 => AmbiguityScope::Rfn(RelFileNode {
+                spc_node: cur.u32()?,
+                db_node: cur.u32()?,
+                rel_node: cur.u32()?,
+            }),
+            1 => AmbiguityScope::Oid(cur.u32()?),
+            2 => AmbiguityScope::Database(cur.u32()?),
+            other => return Err(cur.corrupt(format!("unknown ambiguity scope {other}"))),
+        };
+        let from_lsn = cur.u64()?;
+        let through_lsn = cur.u64()?;
+        let reason = match cur.u8()? {
+            0 => AmbiguityReason::UnknownAffectedRelation,
+            1 => AmbiguityReason::UnknownMutationPosition,
+            2 => AmbiguityReason::MultipleIncompatibleLayouts,
+            3 => AmbiguityReason::NeverVisibleGeneration,
+            4 => AmbiguityReason::IncompleteInvalidation,
+            other => return Err(cur.corrupt(format!("unknown ambiguity reason {other}"))),
+        };
+        ambiguities.push(Arc::new(Ambiguity {
+            scope,
+            from_lsn,
+            through_lsn,
+            reason,
+        }));
+    }
+    let n = cur.u32()? as usize;
+    let mut observations = Vec::with_capacity(n);
+    for _ in 0..n {
+        let oid = match cur.u8()? {
+            0 => None,
+            _ => Some(cur.u32()?),
+        };
+        let rfn = match cur.u8()? {
+            0 => None,
+            _ => Some(RelFileNode {
+                spc_node: cur.u32()?,
+                db_node: cur.u32()?,
+                rel_node: cur.u32()?,
+            }),
+        };
+        let first_touch_lsn = cur.u64()?;
+        let smgr_create_lsn = match cur.u8()? {
+            0 => None,
+            _ => Some(cur.u64()?),
+        };
+        let kind = match cur.u8()? {
+            0 => ObservationKind::AffectedOid,
+            1 => ObservationKind::SmgrCreate,
+            2 => ObservationKind::FullScan,
+            other => return Err(cur.corrupt(format!("unknown observation kind {other}"))),
+        };
+        observations.push(RelationObservation {
+            oid,
+            rfn,
+            first_touch_lsn,
+            smgr_create_lsn,
+            kind,
+        });
+    }
     Ok(BatchRecord {
         captured_at,
+        commit_lsn,
+        observations,
+        ambiguities,
         entries,
     })
 }
@@ -1201,8 +1531,20 @@ mod tests {
     fn batch(captured_at: u64, entries: Vec<Arc<LogEntry>>) -> BatchRecord {
         BatchRecord {
             captured_at,
+            commit_lsn: 0,
+            observations: Vec::new(),
+            ambiguities: Vec::new(),
             entries,
         }
+    }
+
+    fn amb(scope: AmbiguityScope, from_lsn: u64, through_lsn: u64) -> Arc<Ambiguity> {
+        Arc::new(Ambiguity {
+            scope,
+            from_lsn,
+            through_lsn,
+            reason: AmbiguityReason::UnknownMutationPosition,
+        })
     }
 
     async fn open(dir: &Path) -> DescriptorLog {
@@ -1701,5 +2043,229 @@ mod tests {
         assert_eq!(oids, vec![88]);
         assert_eq!(log.active_present_at(150).len(), 2);
         assert_eq!(log.active_present_at(250).len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambiguity_precedes_chain_half_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d1 = desc(90, 9200, false);
+        let d2 = desc(90, 9200, true);
+        let log = open(tmp.path()).await;
+        log.append_batch(batch(100, vec![present(90, &d1)]))
+            .await
+            .unwrap();
+        // Uncertain in-place change over [200, 300): final version Present
+        // at commit next_lsn for future rows
+        let mut b = batch(300, vec![present(300, &d2)]);
+        b.ambiguities
+            .push(amb(AmbiguityScope::Rfn(rfn(9200)), 200, 300));
+        log.append_batch(b).await.unwrap();
+        match log.descriptor_at(rfn(9200), 199) {
+            LookupResult::Present(d) => assert_eq!(d, d1),
+            other => panic!("expected d1 before interval, got {other:?}"),
+        }
+        // [from, through): from covered, through not
+        assert!(matches!(
+            log.descriptor_at(rfn(9200), 200),
+            LookupResult::Ambiguous(_)
+        ));
+        assert!(matches!(
+            log.descriptor_at(rfn(9200), 299),
+            LookupResult::Ambiguous(_)
+        ));
+        match log.descriptor_at(rfn(9200), 300) {
+            LookupResult::Present(d) => assert_eq!(d, d2),
+            other => panic!("expected d2 at through_lsn, got {other:?}"),
+        }
+        // Chain entry inside the interval stays shadowed even though it
+        // exists: ambiguity wins over Present
+        assert!(matches!(
+            log.descriptor_at(rfn(9200), 250),
+            LookupResult::Ambiguous(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambiguity_scopes_oid_and_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(91, 9300, false);
+        let log = open(tmp.path()).await;
+        let mut b = batch(100, vec![present(90, &d)]);
+        b.ambiguities.push(amb(AmbiguityScope::Oid(91), 200, 250));
+        b.ambiguities
+            .push(amb(AmbiguityScope::Database(5), 400, 450));
+        log.append_batch(b).await.unwrap();
+        // Oid scope hits by-oid lookup only
+        assert!(matches!(
+            log.descriptor_by_oid_at(91, 220),
+            LookupResult::Ambiguous(_)
+        ));
+        assert!(matches!(
+            log.descriptor_at(rfn(9300), 220),
+            LookupResult::Present(_)
+        ));
+        // Database scope hits both
+        assert!(matches!(
+            log.descriptor_at(rfn(9300), 420),
+            LookupResult::Ambiguous(_)
+        ));
+        assert!(matches!(
+            log.descriptor_by_oid_at(91, 420),
+            LookupResult::Ambiguous(_)
+        ));
+        // Shared-catalog db_node 0 skips database-scoped ambiguity
+        let shared = RelFileNode {
+            spc_node: 1664,
+            db_node: 0,
+            rel_node: 9300,
+        };
+        assert_eq!(log.descriptor_at(shared, 420), LookupResult::NotCovered);
+        // Foreign db answers before ambiguity
+        let foreign = RelFileNode {
+            spc_node: 1663,
+            db_node: 999,
+            rel_node: 9300,
+        };
+        assert_eq!(log.descriptor_at(foreign, 420), LookupResult::ForeignDb);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambiguity_round_trip_and_idempotent_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(92, 9400, false);
+        let mut b = batch(100, vec![present(90, &d)]);
+        b.ambiguities
+            .push(amb(AmbiguityScope::Rfn(rfn(9400)), 50, 100));
+        {
+            let log = open(tmp.path()).await;
+            log.append_batch(b.clone()).await.unwrap();
+            // Byte-identical replay no-ops
+            log.append_batch(b.clone()).await.unwrap();
+            // Same entries, divergent ambiguities fail closed
+            let mut divergent = b.clone();
+            divergent.ambiguities = vec![amb(AmbiguityScope::Rfn(rfn(9400)), 50, 120)];
+            let err = log.append_batch(divergent).await.unwrap_err();
+            assert!(matches!(err, DescLogError::Corrupt { .. }));
+        }
+        let log = open(tmp.path()).await;
+        assert!(matches!(
+            log.descriptor_at(rfn(9400), 60),
+            LookupResult::Ambiguous(a) if a.through_lsn == 100
+        ));
+        assert_eq!(
+            log.stats_handle()
+                .ambiguous_unknown_position
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "reason-labelled counter",
+        );
+        assert!(matches!(
+            log.descriptor_at(rfn(9400), 100),
+            LookupResult::Present(_)
+        ));
+        assert_eq!(log.batch_at(100).unwrap().ambiguities.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gc_keeps_ambiguity_spanning_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(93, 9500, false);
+        let log = open(tmp.path()).await;
+        let mut b = batch(60, vec![present(10, &d)]);
+        // Wholly below floor: dead, no lookup lands under it
+        b.ambiguities
+            .push(amb(AmbiguityScope::Rfn(rfn(9500)), 20, 40));
+        // Spans floor: still answers lookups at/above it
+        b.ambiguities
+            .push(amb(AmbiguityScope::Rfn(rfn(9500)), 80, 150));
+        log.append_batch(b).await.unwrap();
+        log.force_gc(100).await.unwrap();
+        assert!(matches!(
+            log.descriptor_at(rfn(9500), 120),
+            LookupResult::Ambiguous(a) if a.from_lsn == 80
+        ));
+        assert_eq!(log.batch_at(60).unwrap().ambiguities.len(), 1);
+        drop(log);
+        let log = open(tmp.path()).await;
+        assert!(matches!(
+            log.descriptor_at(rfn(9500), 120),
+            LookupResult::Ambiguous(_)
+        ));
+        match log.descriptor_at(rfn(9500), 160) {
+            LookupResult::Present(d2) => assert_eq!(d2, d),
+            other => panic!("expected retained Present past interval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_format_rejected_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(95, 9700, false);
+        {
+            let log = open(tmp.path()).await;
+            log.append_batch(batch(100, vec![present(90, &d)]))
+                .await
+                .unwrap();
+            log.force_gc(0).await.unwrap();
+        }
+        // Pre-ambiguity v1 dir rejects at open, ckpt or tail alike; the
+        // explicit epoch reset (--ignore-cursor / re-bootstrap) is the only
+        // way forward, never silent translation
+        for file in [TAIL_FILE, CKPT_FILE] {
+            let path = tmp.path().join(file);
+            let orig = std::fs::read(&path).unwrap();
+            let mut bytes = orig.clone();
+            bytes[2] = 1; // version u16 LE low byte
+            std::fs::write(&path, &bytes).unwrap();
+            let err = DescriptorLog::open(tmp.path(), ident()).await.unwrap_err();
+            assert!(matches!(err, DescLogError::Version(1)), "{file}");
+            std::fs::write(&path, &orig).unwrap();
+        }
+        let log = open(tmp.path()).await;
+        assert!(!log.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn evidence_round_trip_divergence_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(94, 9600, false);
+        let mut b = batch(200, vec![present(190, &d)]);
+        b.commit_lsn = 180;
+        b.observations = vec![
+            RelationObservation {
+                oid: Some(94),
+                rfn: None,
+                first_touch_lsn: 185,
+                smgr_create_lsn: None,
+                kind: ObservationKind::AffectedOid,
+            },
+            RelationObservation {
+                oid: None,
+                rfn: Some(rfn(9600)),
+                first_touch_lsn: 185,
+                smgr_create_lsn: Some(186),
+                kind: ObservationKind::SmgrCreate,
+            },
+        ];
+        {
+            let log = open(tmp.path()).await;
+            log.append_batch(b.clone()).await.unwrap();
+            // Identical evidence no-ops
+            log.append_batch(b.clone()).await.unwrap();
+        }
+        let log = open(tmp.path()).await;
+        let stored = log.batch_at(200).unwrap();
+        assert_eq!(*stored, b);
+        assert_eq!(stored.digest(), b.digest());
+        // Same final entries, divergent evidence fails closed
+        let mut divergent = b.clone();
+        divergent.observations[0].first_touch_lsn = 184;
+        assert_ne!(divergent.digest(), b.digest());
+        let err = log.append_batch(divergent).await.unwrap_err();
+        assert!(matches!(err, DescLogError::Corrupt { .. }));
+        let mut divergent = b.clone();
+        divergent.commit_lsn = 181;
+        let err = log.append_batch(divergent).await.unwrap_err();
+        assert!(matches!(err, DescLogError::Corrupt { .. }));
     }
 }

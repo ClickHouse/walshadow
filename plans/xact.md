@@ -107,23 +107,55 @@ status line
 
 ## Commit-time stash
 
-Records on a filenode the descriptor log cannot resolve at record time
-(the creating xact's boundary hasn't captured yet: rewrite generations,
-same-xact CREATE/TRUNCATE + INSERT) ride the same per-xid spill as
-`SpillEntry::Raw` — raw rmgr/info + main data + blocks with images +
-record LSN — so subxact merge ordering and abort discard come for free.
-Admission is gated on the filenode's `XLOG_SMGR_CREATE` marker (observed
-pre-route-gate, global by filenode since the record can precede xid
-assignment); once a filenode is a stash candidate the per-record lookup
-is skipped — the xact's own records can never resolve. At commit
-`resolve_stash` resolves each candidate against the log at the commit's
-`next_lsn` (capture ran inside the boundary hold, so the batch is
-already indexed), installs per-filenode verdicts the drain merge
-consumes (toast → decode like live chunks, ordinary heap → fenced skip,
-tombstoned/uncovered → counted discard), and queues a
-`DrainEntry::ToastBarrier` at commit LSN per marker-proven toast
-generation ([TOAST.md](TOAST.md)). Lifting the ordinary-heap fence:
-[future/xact_stash.md](future/xact_stash.md)
+Records the decoder cannot safely decode at record time ride the same
+per-xid spill as `SpillEntry::Raw` — raw rmgr/info + main data + blocks
+with images + writer xid + record LSN — so subxact merge ordering and
+abort discard come for free. Three admission gates, in order:
+
+- `defer_catalog_decode` from the filter's dirty tree
+  ([filter.md](filter.md)): once a xact family touches the catalog,
+  every subsequent ordinary heap record in that family stashes raw —
+  a Present predecessor descriptor doesn't prove decodability inside
+  the dirty interval
+- known-invisible filenode: `XLOG_SMGR_CREATE` marker (observed
+  pre-route-gate, global by filenode since the record can precede xid
+  assignment) or a prior stash on the same rfn; the xact's own records
+  can never resolve, so the per-record lookup is skipped
+- spanned lookup miss: `descriptor_at_spanned(rfn, lsn)` answering
+  NotCovered past the coverage horizon, Dropped, or Ambiguous defers
+  to commit-time resolution; ForeignDb / pre-horizon NotCovered /
+  Retired are counted skips (rows can't outlive the commit)
+
+At commit `resolve_stash` resolves each candidate against the log at
+the commit's `next_lsn` (capture ran inside the boundary hold, so the
+batch is already indexed) and installs per-filenode `StashOutcome`
+verdicts the drain merge consumes:
+
+- Present toast → `Toast(rel)`: decode stashed chunks like live ones;
+  marker-proven generation without its chunks fails closed
+  (`IncompleteToastGeneration`), and each proven generation queues a
+  `DrainEntry::ToastBarrier` at commit LSN ([TOAST.md](TOAST.md))
+- Present ordinary → `Ordinary(rel, valid_from)`: raw records re-run
+  the heap decoder at drain under the commit-resolution descriptor,
+  fanning rows out through the merge's pending queue (MULTI_INSERT
+  yields per-tuple rows in tuple order, same-LSN events order before
+  the fanout); this is what delivers `BEGIN; CREATE TABLE; COPY;
+  COMMIT` rows
+- Ambiguous → fatal `XactBufferError::StashAmbiguous`: no descriptor
+  proven safe, neither decode nor discard is sound; operator takes a
+  fresh snapshot
+- Dropped / Retired / NotCovered → discard, end-state-neutral.
+  NotCovered with a marker means born + gone inside the xact family
+  (capture tombstones only predecessors; a commit-time survivor is
+  always Present), so no surviving rows
+- ForeignDb → counted once per filenode
+  (`stash_foreign_db_skipped`)
+
+Raw decode at drain is bounded and deterministic: operation policy
+rejects image-only INSERT/UPDATE (`FailClosedReason::ImageOnly`) and
+unknown heap ops; DELETE decodes, LOCK/CONFIRM and Heap2 page
+maintenance no-op. Per-op counters split live vs raw decode
+(`raw_decode_{toast,ordinary,rows}_ops`, [ops.md](ops.md))
 
 ## Subxact tracker
 
@@ -184,16 +216,23 @@ File layout:
 
 ```text
 [2 bytes "WS" magic = SPILL_MAGIC]
-[u16 LE version = SPILL_VERSION = 4]
+[u16 LE version = SPILL_VERSION = 6]
 repeating:
   [u8 tag]
   [u32 LE inner_len]
   [body of inner_len bytes]
-    tag=0 → SpillEntry::Heap        (encoded DecodedHeap)
+    tag=0 → SpillEntry::Heap        (u32 dict id + encoded DecodedHeap)
     tag=1 → SpillEntry::Chunk       (encoded ToastChunk, TID + record LSN)
     tag=2 → SpillEntry::ToastDelete (TID-keyed, a store tombstone at drain)
-    tag=3 → SpillEntry::Raw         (rmgr/info/main data/blocks + images)
+    tag=3 → SpillEntry::Raw         (rmgr/info/main data/blocks + images + xid)
+    tag=4 → descriptor dictionary   (u64 valid_from + descriptor)
 ```
+
+Heap bodies reference their descriptor by dictionary id; the writer
+assigns ids in first-use order keyed on `(rfn, valid_from)` log
+identity, the reader folds tag-4 records back into descriptors in
+write order (they never surface as entries). One descriptor encodes
+once per file however many heaps share it
 
 `SpillReader::check_header()` runs lazily on first `next()`: rejects
 wrong magic with `SpillError::Format { offset: 0, detail: "bad
@@ -204,7 +243,9 @@ unrecoverable anyway
 
 `HeapOp` encodes as `0=Insert, 1=Update, 2=HotUpdate, 3=Delete,
 4=Truncate`. v2 added `Truncate`; v3 added chunk TIDs + `ToastDelete`;
-v4 added raw stashed records.
+v4 added raw stashed records; v5 added the descriptor dictionary; v6
+added writer xid to heap + raw bodies (raw fanout stamps `_xid` from
+the stashing subxact, not the draining top).
 Version mismatch is near-academic anyway: resume contract wipes spill
 dir on startup
 ([`SpillStore::clear`]) and manifest guarantees on-disk state is
@@ -237,8 +278,11 @@ fresh config-surface decision
 
 One consumer exists for commit drain: the pipeline's reorder
 coordinator (`pipeline/reorder.rs`) pulls bounded `DrainedBatch` slices
-from `CommittedDrain`, dispatching heaps to decode pool while applying
-store rows and ordered barriers; ack collector tracks durability (see
+from `CommittedDrain` and feeds them through the transaction planner —
+plan first (side-effect-free: detoast, route, raw decode, all
+input-derived failures surface here), then `execute_plan` replays the
+sealed plan through barrier ordering to the decode pool and DDL
+applicator; ack collector tracks durability (see
 [emitter.md](emitter.md)). Metrics-only runs use the same coordinator
 over a null tail; backup gap replay drives `drain_committed` through
 its own serial `ReplaySink`. Every consumer walks a slice via

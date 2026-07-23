@@ -345,14 +345,6 @@ struct Args {
     /// the command line without editing TOML. Absent defers to TOML.
     #[arg(long)]
     drop_table_strategy: Option<String>,
-    /// Differential decode oracle: probe 1-in-`<N>` rows through shadow
-    /// PG's `walshadow_decode_disk(oid, bytea)` extension function and
-    /// assert the local decoder matches. `0` disables. Requires the
-    /// `walshadow` extension on shadow PG; absent extension surfaces as
-    /// `oracle fallback=N` and the daemon ships raw on-disk bytes for
-    /// `PgPending` types.
-    #[arg(long, default_value_t = 0)]
-    validate: u32,
     /// HTTP/Prometheus metrics bind address. Disabled when absent.
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
@@ -998,29 +990,22 @@ async fn run_session(
     // Oracle opens its own libpq connection so its queries don't pessimise
     // the catalog's query-one path. Best-effort: connect failure disables
     // the oracle, daemon keeps running with the raw-bytes fallback.
-    let oracle = match walshadow::oracle::connect_with_budget(
-        &shadow_conninfo,
-        args.validate,
-        connect_budget,
-    )
-    .await
-    {
-        Ok(o) => {
-            let ext = o.has_extension();
-            tracing::info!(
-                target: "walshadow::oracle",
-                validate = args.validate > 0,
-                sample_rate = args.validate.max(1),
-                extension = if ext { "present" } else { "absent" },
-                "oracle connected",
-            );
-            Some(Arc::new(o))
-        }
-        Err(e) => {
-            tracing::warn!(target: "walshadow::oracle", error = %e, "oracle disabled");
-            None
-        }
-    };
+    let oracle =
+        match walshadow::oracle::connect_with_budget(&shadow_conninfo, connect_budget).await {
+            Ok(o) => {
+                let ext = o.has_extension();
+                tracing::info!(
+                    target: "walshadow::oracle",
+                    extension = if ext { "present" } else { "absent" },
+                    "oracle connected",
+                );
+                Some(Arc::new(o))
+            }
+            Err(e) => {
+                tracing::warn!(target: "walshadow::oracle", error = %e, "oracle disabled");
+                None
+            }
+        };
 
     // START_REPLICATION runs after sinks are built so archive fallback can
     // advance identical filter and decode paths.
@@ -1158,6 +1143,9 @@ async fn run_session(
             .seed(
                 walshadow::desc_log::BatchRecord {
                     captured_at: covered_through,
+                    commit_lsn: 0,
+                    observations: Vec::new(),
+                    ambiguities: Vec::new(),
                     entries,
                 },
                 covered_through,
@@ -1223,9 +1211,9 @@ async fn run_session(
 
     let pcfg = if let Some(mut emitter_cfg) = ch_config {
         let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-        // Live routing map shared by DDL applicator + decode pool. The
+        // Live routing map shared by DDL applicator + route planning. The
         // refresher below rewrites it on every republished snapshot.
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+        let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
         // Resolver merges CLI over TOML and publishes ResolvedConfig on
         // the watch substrate; SIGHUP re-reads TOML and republishes. The
         // mapping refresher + DDL applicator subscribe.
@@ -1768,6 +1756,8 @@ async fn run_session(
                 chunks: b.drain_chunk_resident_bytes(),
                 rows: b.drain_row_resident_bytes(),
                 spool: b.toast_spool_bytes(),
+                raw_pending_rows: b.raw_pending_rows(),
+                raw_pending_bytes: b.raw_pending_bytes(),
             };
             (stats, resident, line)
         };
@@ -2142,7 +2132,7 @@ fn spawn_mapping_refresher(
         // Boot value already seeded into `mapping`; react to republishes.
         while config_rx.changed().await.is_ok() {
             let tables = config_rx.borrow_and_update().tables.clone();
-            *mapping.write().await = tables;
+            *mapping.write().await = Arc::new(tables);
             tracing::info!(
                 target: "walshadow::config",
                 "routing map refreshed from resolved config",
@@ -2340,6 +2330,8 @@ struct DrainResident {
     chunks: u64,
     rows: u64,
     spool: u64,
+    raw_pending_rows: u64,
+    raw_pending_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2435,15 +2427,79 @@ async fn populate_metrics(
             .map(|s| s.toast_rewrite_barriers.load(Ordering::Relaxed))
             .unwrap_or(0),
         toast_stash_buffered_total: decoder_stats.toast_stash_buffered.load(Ordering::Relaxed),
+        raw_stash_deferred_total: decoder_stats.raw_stash_deferred.load(Ordering::Relaxed),
         toast_stash_decoded_total: emitter_stats
             .map(|s| s.toast_stash_decoded.load(Ordering::Relaxed))
             .unwrap_or(0),
         toast_stash_discarded_total: emitter_stats
             .map(|s| s.toast_stash_discarded.load(Ordering::Relaxed))
             .unwrap_or(0),
-        toast_stash_skipped_total: emitter_stats
-            .map(|s| s.toast_stash_skipped.load(Ordering::Relaxed))
+        stash_foreign_db_skipped_total: emitter_stats
+            .map(|s| s.stash_foreign_db_skipped.load(Ordering::Relaxed))
             .unwrap_or(0),
+        xact_plan_rows: emitter_stats
+            .map(|s| s.plan_rows.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        xact_plan_bytes_by_storage: emitter_stats
+            .map(|s| {
+                [
+                    s.plan_bytes_mem.load(Ordering::Relaxed),
+                    s.plan_bytes_file.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        xact_plan_failures_by_reason: emitter_stats
+            .map(|s| {
+                [
+                    s.plan_failures_spool.load(Ordering::Relaxed),
+                    s.plan_failures_fail_closed.load(Ordering::Relaxed),
+                    s.plan_failures_detoast.load(Ordering::Relaxed),
+                    s.plan_failures_partial_update.load(Ordering::Relaxed),
+                    s.plan_failures_view.load(Ordering::Relaxed),
+                    s.plan_failures_drain.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        route_snapshots_by_result: emitter_stats
+            .map(|s| {
+                [
+                    s.route_snapshots_mapped.load(Ordering::Relaxed),
+                    s.route_snapshots_unmapped.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        raw_stash_records_by_kind_op: [
+            decoder_stats.raw_stash_dirty_ops.load(),
+            decoder_stats.raw_stash_marker_ops.load(),
+        ],
+        raw_stash_bytes_by_storage: [
+            xact_stats.raw_stash_bytes_mem,
+            xact_stats.raw_stash_bytes_spill,
+        ],
+        raw_decode_records_by_kind_op: emitter_stats
+            .map(|s| {
+                [
+                    s.raw_decode_toast_ops.load(),
+                    s.raw_decode_ordinary_ops.load(),
+                ]
+            })
+            .unwrap_or_default(),
+        raw_decode_rows_by_op: emitter_stats
+            .map(|s| s.raw_decode_rows_ops.load())
+            .unwrap_or_default(),
+        raw_pending_rows: drain_resident.raw_pending_rows,
+        raw_pending_bytes: drain_resident.raw_pending_bytes,
+        descriptor_ambiguous_by_reason: [
+            log_stats.ambiguous_unknown_relation.load(Ordering::Relaxed),
+            log_stats.ambiguous_unknown_position.load(Ordering::Relaxed),
+            log_stats
+                .ambiguous_incompatible_layouts
+                .load(Ordering::Relaxed),
+            log_stats.ambiguous_never_visible.load(Ordering::Relaxed),
+            log_stats
+                .ambiguous_incomplete_invalidation
+                .load(Ordering::Relaxed),
+        ],
         emitter_rows_total: emitter_stats
             .map(|s| s.rows_emitted.load(Ordering::Relaxed))
             .unwrap_or(0),
@@ -2484,12 +2540,6 @@ async fn populate_metrics(
         oracle_fallback_raw_total: oracle_stats
             .map(|s| s.fallback_raw.load(Ordering::Relaxed))
             .unwrap_or(0),
-        oracle_validate_sampled_total: oracle_stats
-            .map(|s| s.probes.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        oracle_validate_mismatches_total: oracle_stats
-            .map(|s| s.mismatches.load(Ordering::Relaxed))
-            .unwrap_or(0),
         oracle_errors_total: oracle_stats
             .map(|s| s.errors.load(Ordering::Relaxed))
             .unwrap_or(0),
@@ -2510,6 +2560,7 @@ async fn populate_metrics(
         desc_events_added_total: capture.events_added.load(Ordering::Relaxed),
         desc_events_changed_total: capture.events_changed.load(Ordering::Relaxed),
         desc_events_dropped_total: capture.events_dropped.load(Ordering::Relaxed),
+        descriptor_ambiguous_total: capture.ambiguities_published.load(Ordering::Relaxed),
         desc_log_entries: desc_log_gauges.0,
         desc_log_tail_bytes: desc_log_gauges.1,
         desc_log_batches: desc_log_gauges.2,
@@ -2518,6 +2569,7 @@ async fn populate_metrics(
         desc_lookups_present_total: log_stats.lookups_present.load(Ordering::Relaxed),
         desc_lookups_dropped_total: log_stats.lookups_dropped.load(Ordering::Relaxed),
         desc_lookups_retired_total: log_stats.lookups_retired.load(Ordering::Relaxed),
+        desc_lookups_ambiguous_total: log_stats.lookups_ambiguous.load(Ordering::Relaxed),
         desc_lookups_not_covered_total: log_stats.lookups_not_covered.load(Ordering::Relaxed),
         desc_lookups_foreign_db_total: log_stats.lookups_foreign_db.load(Ordering::Relaxed),
         config_pending_decl_rels: config_resolver.map(|r| r.pending_decl_count()).unwrap_or(0),
@@ -2838,7 +2890,7 @@ async fn run_bootstrap(
         .await
         .context("bootstrap: spawn insert tail")?;
         // Static [table.*] mapping (no SIGHUP, no shadow PG during bootstrap).
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+        let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
         tracing::info!(
             target: "walshadow::bootstrap",
             addr = %addr,
@@ -2860,6 +2912,9 @@ async fn run_bootstrap(
                 deferred_path,
                 walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
             ),
+            emitter_cfg.soft_delete,
+            // Static mapping above: no overlay during greenfield bootstrap
+            None,
         ));
         let (drain_res, pump_res) = tokio::join!(drain, pump);
         let drain_outcome = drain_res

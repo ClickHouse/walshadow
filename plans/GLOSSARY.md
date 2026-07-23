@@ -107,6 +107,15 @@ cluster-sized pass per mode inside fixed 1 s window
 variants, Tier 2 varlena (`Bytea`/`Text`/`Json`), `ExternalToast`,
 `PgPending`, `Null`, `Unsupported` ([decoder.md](decoder.md))
 
+**commit-time stash** — raw decode inputs (`SpillEntry::Raw`) of records
+undecodable at record time (rewrite generation, same-xact
+CREATE/TRUNCATE + INSERT, catalog-dirty xact family), admitted by
+generation marker / dirty tree / lookup miss, resolved at commit
+against the descriptor log at the commit's `next_lsn` and decoded in
+the drain merge; toast and ordinary heaps decode under their commit
+verdict, ambiguous fails closed, tombstoned/uncovered discard counted
+([xact.md](xact.md), [TOAST.md](TOAST.md))
+
 **config precedence** — three-layer merge, highest wins:
 CLI > PG row > TOML; snapshot rebuilt whole per republish so it never
 tears ([config.md](config.md))
@@ -324,10 +333,10 @@ whole overlay subsystem; `config_table.replicate` opts one table into
 replication, triggering backfill per `initial_load`
 ([config.md](config.md), [add_table.md](add_table.md))
 
-**oracle** — differential decode oracle: shadow re-decodes on-disk bytes
-via `walshadow_decode_disk` (same `typoutput` PG would call), diffed
-against local decode. `--validate N` samples 1-in-N; mismatch is a
-watchdog signal, row still ships ([oracle.md](oracle.md))
+**oracle** — PgPending resolver: shadow decodes on-disk bytes
+via `walshadow_decode_disk` (same `typoutput` PG would call) into text
+post-plan; best-effort, unresolved values ship raw bytes
+([oracle.md](oracle.md))
 
 **ordered_events** — `DrainedBatch` catalog/config/toast-barrier positions
 interleaved with heaps and TOAST-row cursors; pipeline walks them as
@@ -553,14 +562,6 @@ original. Queue persists in the `toast_retires.toml` ledger (fsynced at
 enqueue, before the dropping commit's ack) so a stop inside the wait
 window can't orphan the wipe: pipeline standup flushes entries whose
 drop resume never replays; counted `toast_mirror_retires` at execution
-([TOAST.md](TOAST.md))
-
-**toast stash** — raw decode inputs (`SpillEntry::Raw`) of records
-whose filenode is unresolvable at record time (rewrite generation,
-same-xact CREATE/TRUNCATE + INSERT), admitted by generation marker,
-resolved at commit against the descriptor log at the commit's
-`next_lsn` and decoded in the drain merge; tombstoned/uncovered →
-discarded counted, ordinary heap → fenced skipped
 ([TOAST.md](TOAST.md))
 
 **toast tombstone** — store row `(blkno, offnum, 0, 0, '',

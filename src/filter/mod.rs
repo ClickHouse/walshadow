@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod pg_class_decoder;
 pub mod rewrite;
 
+mod dirty_tree;
 mod engine;
 
 #[doc(hidden)]

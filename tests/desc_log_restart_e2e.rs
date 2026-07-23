@@ -11,6 +11,7 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
+use fx::spawn_txn;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -106,45 +107,6 @@ fn wait_idle_in_txn(source: &Shadow) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-fn spawn_txn(source: &Shadow, body: &str) -> std::thread::JoinHandle<()> {
-    let sock = source.config().socket_dir.clone();
-    let port = source.config().port;
-    let sql = body.to_owned();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        let mut child = Command::new("psql")
-            .args([
-                "-h",
-                sock.to_str().unwrap(),
-                "-p",
-                &port.to_string(),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-f",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn psql");
-        {
-            use std::io::Write as _;
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin piped")
-                .write_all(sql.as_bytes())
-                .unwrap();
-        }
-        let _ = child.wait();
-    })
 }
 
 fn create_dest_table(ch: &fx::ChServer, table: &str) {

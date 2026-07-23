@@ -165,7 +165,7 @@ async fn native_numeric_time_timetz_round_trip() {
         .send(BatcherMsg::Row(RoutedRow {
             seq: 0,
             rel,
-            mapping,
+            route: walshadow::emit::route::RouteSnapshot::freeze(mapping, Arc::default(), false),
             committed: tuple,
             permit: None,
             value_permit: None,

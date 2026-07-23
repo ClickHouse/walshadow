@@ -23,7 +23,7 @@ digraph xact {
   // (feeds subt + abort + merge, all aligned beneath it)
   { rank=same;
     catevt  [label="ShadowCatalog\nschema_event_tx\nAdded / Changed / Dropped", fillcolor="#4D4D28"];
-    decoder [label="BufferingDecoderSink\nheap + TOAST birth/death reshape\nSMGR marker + invisible-record stash\nstamps source_lsn, xid", fillcolor="#4D4128"];
+    decoder [label="BufferingDecoderSink\nheap + TOAST birth/death reshape\nraw stash: dirty tree · SMGR marker ·\nspanned-lookup miss (NotCovered /\nDropped / Ambiguous)\nstamps source_lsn, xid", fillcolor="#4D4128"];
     xaclog  [label="XLOG_XACT_*\nASSIGNMENT 0x50 (hint)\nCOMMIT 0x00 / _PREPARED 0x30\nABORT  0x20 / _PREPARED  0x40", fillcolor="#3D3D54"];
   }
 
@@ -60,7 +60,7 @@ digraph xact {
   // ════════ Rank 2: evict + spill (sidecar pair under buf) ════════
   { rank=same;
     evict [label="maybe_evict\nbytes_in_memory > xact_buffer_max (64 MiB)\npick largest in-mem xact\n(mirrors PG ReorderBufferLargestTXN)\n→ evict_xact: lazy-open SpillWriter,\ndrain in_mem → write(entry), zero bytes\nDrainEntry events stay in memory", fillcolor="#4D3A28"];
-    spill [label="{spill}/xid-{xid:010}-{first_lsn:016X}.bin\n[\"WS\" magic | u16 ver=4]\n[tag u8 | u32 LE inner_len | body]*\n0 Heap · 1 Chunk · 2 ToastDelete · 3 Raw\nappend-only, fsync on finish", fillcolor="#4D3850", shape=note];
+    spill [label="{spill}/xid-{xid:010}-{first_lsn:016X}.bin\n[\"WS\" magic | u16 ver=6]\n[tag u8 | u32 LE inner_len | body]*\n0 Heap · 1 Chunk · 2 ToastDelete ·\n3 Raw · 4 descriptor dict\nappend-only, fsync on finish", fillcolor="#4D3850", shape=note];
   }
   buf   -> evict [label="after every absorb\nwhile over budget"];
   evict -> spill [color="#6E6963", style=dashed, label="SpillWriter::write"];
@@ -70,7 +70,7 @@ digraph xact {
   subgraph cluster_drain {
     label="commit drain — merge transaction family, preserve WAL order"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    merge [label="pull (top + subxids) from inflight\nper xid: SpillReader + in_mem + events\n→ source_lsn k-way merge\nChunk → ChunkMap + ToastRow birth\nToastDelete → tombstone row\nRaw → commit-resolved toast op\nTIE: control event BEFORE heap", fillcolor="#4D4128"];
+    merge [label="pull (top + subxids) from inflight\nper xid: SpillReader + in_mem + events\n→ source_lsn k-way merge\nChunk → ChunkMap + ToastRow birth\nToastDelete → tombstone row\nRaw → resolve_stash verdict at commit next_lsn:\n  Toast → chunk decode · Ordinary → row fanout\n  Ambiguous → fatal · tombstoned/uncovered → discard\nTIE: control event BEFORE heap", fillcolor="#4D4128"];
 
     dispatch [label="bounded committed batches\none shared walk keeps rows, TOAST,\nand table changes in WAL order", fillcolor="#4D4128"];
 

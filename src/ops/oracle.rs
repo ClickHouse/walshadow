@@ -1,14 +1,10 @@
-//! Differential decode oracle backed by shadow PG.
+//! PgPending resolver backed by shadow PG.
 //!
-//! 1. PgPending resolver: for varlena types outside walshadow's local matrix
-//!    (`jsonb`, arrays, `tsvector`, ranges, custom domains, ...),
-//!    [`Oracle::resolve_pending`] runs `walshadow_decode_disk(oid, bytea) -> text`
-//!    on shadow PG, replacing PgPending with [`ColumnValue::Text`]. Extension is
-//!    optional: when absent resolver returns `Ok(None)` and emitter ships raw
-//!    on-disk bytes.
-//! 2. 1-in-N validator: sampled Tier 3 codec values (`numeric`/`inet`/`interval`)
-//!    cross-checked against shadow PG's typoutput. Mismatches counted + logged,
-//!    row still ships (watchdog, not gate). Off by default, `--validate <N>`.
+//! For varlena types outside walshadow's local matrix (`jsonb`, arrays,
+//! `tsvector`, ranges, custom domains, ...), [`Oracle::resolve_pending`] runs
+//! `walshadow_decode_disk(oid, bytea) -> text` on shadow PG, replacing
+//! PgPending with [`ColumnValue::Text`]. Extension is optional: when absent
+//! resolver returns `Ok(None)` and emitter ships raw on-disk bytes.
 //!
 //! Separate `Client` from [`ShadowCatalog`](crate::catalog::shadow_catalog::ShadowCatalog):
 //! oracle queries don't observe replay-LSN gating and mustn't pessimise the
@@ -23,7 +19,6 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 
-use crate::decode::codecs::NumericKind;
 use crate::decode::heap_decoder::ColumnValue;
 
 #[derive(Debug, Error)]
@@ -40,38 +35,8 @@ crate::atomic_stats! {
         pub resolved,
         /// `walshadow_decode_disk` calls returning NULL or absent-extension
         pub fallback_raw,
-        pub probes,
-        pub matches,
-        /// local decoder text != shadow PG text
-        pub mismatches,
         /// SQL / connection errors, single bucket
         pub errors,
-    }
-}
-
-/// 1-in-N selection. Lock-free counter so decoder workers share one `Oracle`
-/// without serialising.
-#[derive(Debug)]
-pub struct Sampler {
-    rate: u32,
-    counter: AtomicU64,
-}
-
-impl Sampler {
-    pub fn new(rate: u32) -> Self {
-        Self {
-            rate,
-            counter: AtomicU64::new(0),
-        }
-    }
-
-    /// `rate == 0` disables sampling
-    pub fn pick(&self) -> bool {
-        if self.rate == 0 {
-            return false;
-        }
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        n.is_multiple_of(self.rate as u64)
     }
 }
 
@@ -80,13 +45,12 @@ pub struct Oracle {
     conninfo: String,
     has_extension: AtomicBool,
     pub stats: Arc<OracleStats>,
-    pub sampler: Sampler,
 }
 
 impl Oracle {
     /// Connect to shadow PG, probe for `walshadow` extension. Absence not a
     /// failure: resolver returns `Ok(None)` thereafter (fall back to raw bytes).
-    pub async fn connect(conninfo: &str, sample_rate: u32) -> Result<Self, OracleError> {
+    pub async fn connect(conninfo: &str) -> Result<Self, OracleError> {
         let (client, connection) = tokio_postgres::connect(conninfo, NoTls)
             .await
             .map_err(OracleError::Connect)?;
@@ -99,7 +63,6 @@ impl Oracle {
             conninfo: conninfo.to_owned(),
             has_extension: AtomicBool::new(has_ext),
             stats: Arc::new(OracleStats::default()),
-            sampler: Sampler::new(sample_rate),
         })
     }
 
@@ -167,59 +130,6 @@ impl Oracle {
             }
         }
     }
-
-    /// Cross-check a locally-decoded Tier 3 value against shadow PG's
-    /// `typoutput`. Fires only on a sampler hit. Return value informational.
-    pub async fn validate(&self, type_oid: u32, raw: &[u8], local_text: &str) -> bool {
-        if !self.sampler.pick() {
-            return false;
-        }
-        let sql = match type_oid {
-            crate::schema::NUMERICOID
-            | crate::schema::INETOID
-            | crate::schema::CIDROID
-            | crate::schema::INTERVALOID
-                if self.has_extension() =>
-            {
-                // walshadow_decode_disk reconstructs the Datum then calls
-                // typoutput, same path the resolver uses
-                "SELECT walshadow_decode_disk($1::oid, $2::bytea)"
-            }
-            _ => return false,
-        };
-        let typoid_param: u32 = type_oid;
-        let mut attempt = 0u8;
-        let res = loop {
-            let row = {
-                let mut guard = self.client.lock().await;
-                let Some(client) = guard.as_mut() else {
-                    return false;
-                };
-                client.query_one(sql, &[&typoid_param, &raw]).await
-            };
-            match row {
-                Ok(r) => break Some(r),
-                Err(e) if attempt == 0 && e.is_closed() => {
-                    attempt = 1;
-                    let _ = self.reconnect().await;
-                }
-                Err(_) => break None,
-            }
-        };
-        self.stats.probes.fetch_add(1, Ordering::Relaxed);
-        let Some(r) = res else {
-            self.stats.errors.fetch_add(1, Ordering::Relaxed);
-            return true;
-        };
-        let pg_text: Option<String> = r.try_get(0).ok();
-        let matched = pg_text.as_deref() == Some(local_text);
-        if matched {
-            self.stats.matches.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.stats.mismatches.fetch_add(1, Ordering::Relaxed);
-        }
-        true
-    }
 }
 
 async fn probe_extension(client: &Client) -> Result<bool, OracleError> {
@@ -249,38 +159,13 @@ pub async fn resolve_pending_tuple(oracle: &Oracle, columns: &mut [Option<Column
     }
 }
 
-pub async fn maybe_validate_tuple(oracle: &Oracle, columns: &[Option<ColumnValue>]) {
-    for col in columns.iter().flatten() {
-        match col {
-            ColumnValue::Numeric(k) => {
-                let local = match k {
-                    NumericKind::Finite(s) => s.clone(),
-                    NumericKind::NaN => "NaN".into(),
-                    NumericKind::PInf => "Infinity".into(),
-                    NumericKind::NInf => "-Infinity".into(),
-                };
-                // No raw bytes here, validator needs them; skip. Its primary
-                // value is jsonb/array (PgPending), where raw bytes are present
-                let _ = local;
-            }
-            ColumnValue::PgPending { type_oid, raw } => {
-                let _ = oracle.validate(*type_oid, raw, "").await;
-            }
-            _ => {}
-        }
-    }
-}
-
 impl OracleStats {
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = format!("oracle resolved={}", ld(&self.resolved));
-        let pairs: [(&str, u64); 5] = [
+        let pairs: [(&str, u64); 2] = [
             ("fallback", ld(&self.fallback_raw)),
-            ("probes", ld(&self.probes)),
-            ("match", ld(&self.matches)),
-            ("mismatch", ld(&self.mismatches)),
             ("err", ld(&self.errors)),
         ];
         for (label, n) in pairs {
@@ -295,13 +180,9 @@ impl OracleStats {
 /// Connect with a timeout budget so a still-warming shadow doesn't pin the
 /// daemon at boot. Matches the catalog's
 /// [`with_transient_retry`](crate::catalog::shadow_catalog::with_transient_retry) shape.
-pub async fn connect_with_budget(
-    conninfo: &str,
-    sample_rate: u32,
-    budget: Duration,
-) -> Result<Oracle, OracleError> {
+pub async fn connect_with_budget(conninfo: &str, budget: Duration) -> Result<Oracle, OracleError> {
     let deadline = tokio::time::Instant::now() + budget;
-    (|| Oracle::connect(conninfo, sample_rate))
+    (|| Oracle::connect(conninfo))
         .retry(
             ExponentialBuilder::default()
                 .with_min_delay(Duration::from_millis(100))
@@ -317,37 +198,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sampler_off_when_rate_zero() {
-        let s = Sampler::new(0);
-        for _ in 0..1000 {
-            assert!(!s.pick());
-        }
-    }
-
-    #[test]
-    fn sampler_picks_one_in_n() {
-        let s = Sampler::new(5);
-        let mut hits = 0;
-        for _ in 0..100 {
-            if s.pick() {
-                hits += 1;
-            }
-        }
-        assert_eq!(hits, 20);
-    }
-
-    #[test]
     fn stats_summary_skips_zero_buckets() {
         let s = OracleStats::default();
         s.resolved.store(4, Ordering::Relaxed);
-        s.probes.store(2, Ordering::Relaxed);
-        s.matches.store(2, Ordering::Relaxed);
+        s.errors.store(2, Ordering::Relaxed);
         let out = s.summary();
         assert!(out.contains("resolved=4"));
-        assert!(out.contains("probes=2"));
-        assert!(out.contains("match=2"));
+        assert!(out.contains("err=2"));
         assert!(!out.contains("fallback"));
-        assert!(!out.contains("mismatch"));
-        assert!(!out.contains("err"));
     }
 }

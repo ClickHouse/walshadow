@@ -291,8 +291,8 @@ impl ConfigResolver {
     /// Take a rel out of scope (`replicate=false` / `TableRemoved`): drop its
     /// mapping + any pending decl, record the exclusion so republish keeps it
     /// out even when TOML-mapped, republish. In-flight
-    /// rows already dispatched still drain; further rows drop at
-    /// `lookup_mapping`.
+    /// rows already dispatched still drain; later transactions plan
+    /// `route = None` discards.
     pub async fn exclude_table(&self, rel: &RelName) {
         let mut inner = self.inner.lock().await;
         inner.opt_in.mappings.remove(rel);
@@ -417,7 +417,13 @@ impl ConfigResolver {
             &prev.columns,
         );
         self.rejections.store(rejections, Ordering::Relaxed);
-        *self.mapping.write().await = resolved.tables.clone();
+        *self.mapping.write().await = Arc::new(resolved.tables.clone());
+        tracing::info!(
+            target: "walshadow::config",
+            opt_ins = resolved.table_opt_ins.len(),
+            tables = resolved.tables.len(),
+            "republish",
+        );
         // hits skip the mapping read; bump after every swap so no worker
         // routes against the pre-publish map
         // Err only when every receiver dropped (daemon tearing down); ignore
@@ -602,8 +608,8 @@ impl ConfigResolver {
         }
 
         // Opt-out (last, so exclusion wins over any TOML/overlay mapping):
-        // a `replicate=false` rel leaves the routing map, so `lookup_mapping`
-        // returns None and the decode pool drops its rows mid-stream.
+        // a `replicate=false` rel leaves the routing map, so route planning
+        // resolves None and its rows discard mid-stream.
         for rel in &opt_in.excluded {
             rc.tables.remove(rel);
         }
@@ -649,7 +655,7 @@ mod tests {
     }
 
     fn dummy_handles() -> MappingHandle {
-        Arc::new(tokio::sync::RwLock::new(HashMap::new()))
+        crate::mapping::mapping_handle(HashMap::new())
     }
 
     #[test]

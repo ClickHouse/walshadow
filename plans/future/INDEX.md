@@ -11,7 +11,6 @@ surface; promote into `plans/` once built
 * [shadow_toast.md](shadow_toast.md) — shadow-backed TOAST chunk store with WAL replay and crash-safe reclamation fencing
 * [sync_commit_witness.md](sync_commit_witness.md) — walshadow as RPO=0 durability standby
 * [two_phase_commit.md](two_phase_commit.md) — `XLOG_XACT_PREPARE` handling and gxid-keyed buffer
-* [xact_stash.md](xact_stash.md) — generic commit-time raw-record decode: ordinary-heap CREATE/TRUNCATE + INSERT via shadow publication fence + durable descriptor snapshots
 * [ch_bounce_recovery.md](ch_bounce_recovery.md) — deeper re-emit-from-spill on retry-budget exhaustion
 * [pinned_ddl_baseline.md](pinned_ddl_baseline.md) — schema-event outcome must be a function of config + baseline, not cache warmth: CH-existence / persisted-baseline options for cross-restart consistency, drop detection across downtime, opt-in mapping vs republish
 * [coverage100.md](coverage100.md) — drive `cargo llvm-cov` line coverage toward 100%: tiered work list (pure units → fixtures → live e2e → hard tail)

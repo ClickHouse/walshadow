@@ -24,7 +24,7 @@ use walrus::pg::walparser::RelFileNode;
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use walshadow::heap_decoder::{
-    ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
+    ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
 };
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -144,6 +144,18 @@ fn heap(
     }
 }
 
+/// Attach descriptor the decoder way: spanned lookup at record LSN
+fn described(log: &DescriptorLog, decoded: DecodedHeap) -> DescribedHeap {
+    let (descriptor, valid_from) = log
+        .descriptor_at_spanned(decoded.rfn, decoded.source_lsn)
+        .expect("fixture rfn covered by seeded log");
+    DescribedHeap {
+        decoded,
+        descriptor,
+        descriptor_valid_from: valid_from,
+    }
+}
+
 fn cfg(spill_dir: std::path::PathBuf, budget: usize) -> XactBufferConfig {
     XactBufferConfig {
         xact_buffer_max: budget,
@@ -184,6 +196,9 @@ async fn log_from_catalog(cat: &Arc<Mutex<ShadowCatalog>>, dir: &std::path::Path
     log.seed(
         BatchRecord {
             captured_at: 1,
+            commit_lsn: 0,
+            observations: Vec::new(),
+            ambiguities: Vec::new(),
             entries,
         },
         1,
@@ -197,7 +212,6 @@ async fn log_from_catalog(cat: &Arc<Mutex<ShadowCatalog>>, dir: &std::path::Path
 /// per heap step, collecting [`CommittedTuple`]s in walk order.
 async fn drain_all(
     b: &mut XactBuffer,
-    log: &DescriptorLog,
     resolver: &ToastResolver,
     xid: u32,
     commit_ts: i64,
@@ -220,9 +234,9 @@ async fn drain_all(
         let spool = walk.chunks.iter().find_map(|g| g.spool());
         for step in walk.steps {
             if let WalkStep::Heap(mut heap) = step {
-                detoast_heap(&mut heap, spool, &ref_maps, log, resolver).await?;
+                detoast_heap(&mut heap, spool, &ref_maps, resolver).await?;
                 out.push(CommittedTuple {
-                    decoded: heap,
+                    decoded: heap.decoded,
                     commit_ts: drain.commit_ts,
                     commit_lsn: drain.commit_lsn,
                 });
@@ -274,17 +288,26 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
             Some(ColumnValue::Text("x".into())),
         ]
     };
-    b.on_heap(heap(rfn, 7, 100, HeapOp::Insert, one_col(1)))
-        .await
-        .unwrap();
-    b.on_heap(heap(rfn, 7, 200, HeapOp::Update, one_col(2)))
-        .await
-        .unwrap();
-    b.on_heap(heap(rfn, 8, 110, HeapOp::Insert, one_col(3)))
-        .await
-        .unwrap();
     let log = log_from_catalog(&cat, tmp.path()).await;
-    let seen = drain_all(&mut b, &log, &ToastResolver::disabled(), 7, 12345, 300, &[])
+    b.on_heap(described(
+        &log,
+        heap(rfn, 7, 100, HeapOp::Insert, one_col(1)),
+    ))
+    .await
+    .unwrap();
+    b.on_heap(described(
+        &log,
+        heap(rfn, 7, 200, HeapOp::Update, one_col(2)),
+    ))
+    .await
+    .unwrap();
+    b.on_heap(described(
+        &log,
+        heap(rfn, 8, 110, HeapOp::Insert, one_col(3)),
+    ))
+    .await
+    .unwrap();
+    let seen = drain_all(&mut b, &ToastResolver::disabled(), 7, 12345, 300, &[])
         .await
         .unwrap();
     assert_eq!(seen.len(), 2);
@@ -298,6 +321,87 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     assert_eq!(seen[1].commit_lsn, 300);
     assert_eq!(b.stats().committed_xacts_total, 1);
     assert_eq!(b.stats().drain_lsn, 300);
+}
+
+/// Admission: a user record flagged `defer_catalog_decode` enters raw
+/// spill without touching descriptors; commit resolution yields Ordinary
+/// and the payload-less synthetic record fails closed at decode — never a
+/// silent skip
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
+    use walrus::pg::walparser::{
+        BlockLocation, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
+    };
+    use walshadow::record::{Record, RecordSink, Route};
+    use walshadow::xact_buffer::{BufferingDecoderSink, resolve_stash};
+
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55709).await else {
+        return;
+    };
+    let _stop = stop_on_drop(&shadow);
+    let cat = Arc::new(Mutex::new(cat));
+    let log = Arc::new(log_from_catalog(&cat, tmp.path()).await);
+    let buffer = Arc::new(Mutex::new(
+        XactBuffer::new(cfg(tmp.path().join("spill"), 1024)).unwrap(),
+    ));
+    let mut sink = BufferingDecoderSink::new(log.clone(), buffer.clone());
+    let record = Record {
+        parsed: XLogRecord {
+            header: XLogRecordHeader {
+                resource_manager_id: RmId::Heap as u8,
+                xact_id: 77,
+                total_record_length: 64,
+                ..Default::default()
+            },
+            blocks: vec![XLogRecordBlock {
+                header: XLogRecordBlockHeader {
+                    location: BlockLocation {
+                        rel: rfn,
+                        block_no: 0,
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        source_lsn: 150,
+        next_lsn: 160,
+        page_magic: 0xD116,
+        route: Route::ToDecoder,
+        catalog_boundary: false,
+        boundary_info: None,
+        defer_catalog_decode: true,
+    };
+    sink.on_record(&record).await.unwrap();
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(load(&sink.stats().raw_stash_deferred), 1);
+    assert_eq!(
+        sink.stats().raw_stash_dirty_ops.load()[0],
+        1,
+        "insert-op labelled",
+    );
+    assert_eq!(load(&sink.stats().decoded), 0, "no inline decode");
+    assert_eq!(
+        load(&sink.stats().toast_stash_buffered),
+        0,
+        "defer path, not marker path"
+    );
+    let stats = Arc::new(EmitterStats::default());
+    resolve_stash(&buffer, &log, 77, &[], 1000, stats.clone())
+        .await
+        .unwrap();
+    let mut b = buffer.lock().await;
+    let err = drain_all(&mut b, &ToastResolver::disabled(), 77, 0, 1000, &[])
+        .await
+        .expect_err("payload-less raw record must fail closed, not skip");
+    assert!(
+        matches!(
+            &err,
+            walshadow::xact_buffer::XactBufferError::OrdinaryFailClosed { lsn: 150, .. }
+        ),
+        "unexpected drain error: {err:?}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -342,20 +446,26 @@ async fn commit_drains_spilled_then_in_memory_entries() {
         Some(ColumnValue::Int4(0)),
         Some(ColumnValue::Text("z".into())),
     ];
+    let log = log_from_catalog(&cat, tmp.path()).await;
     // Three big tuples first — spill engages after the second.
     for i in 0..3 {
-        b.on_heap(heap(rfn, 5, 100 + i, HeapOp::Insert, fat_col.clone()))
-            .await
-            .unwrap();
+        b.on_heap(described(
+            &log,
+            heap(rfn, 5, 100 + i, HeapOp::Insert, fat_col.clone()),
+        ))
+        .await
+        .unwrap();
     }
     // Then small ones that stay in memory.
     for i in 0..2 {
-        b.on_heap(heap(rfn, 5, 200 + i, HeapOp::Update, small_col.clone()))
-            .await
-            .unwrap();
+        b.on_heap(described(
+            &log,
+            heap(rfn, 5, 200 + i, HeapOp::Update, small_col.clone()),
+        ))
+        .await
+        .unwrap();
     }
-    let log = log_from_catalog(&cat, tmp.path()).await;
-    let seen = drain_all(&mut b, &log, &ToastResolver::disabled(), 5, 0, 250, &[])
+    let seen = drain_all(&mut b, &ToastResolver::disabled(), 5, 0, 250, &[])
         .await
         .unwrap();
     assert_eq!(seen.len(), 5);
@@ -392,27 +502,19 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
             Some(ColumnValue::Text("m".into())),
         ]
     };
-    b.on_heap(heap(rfn, 7, 100, HeapOp::Insert, col(1)))
-        .await
-        .unwrap();
-    b.on_heap(heap(rfn, 8, 150, HeapOp::Insert, col(2)))
-        .await
-        .unwrap();
-    b.on_heap(heap(rfn, 7, 200, HeapOp::Insert, col(3)))
-        .await
-        .unwrap();
     let log = log_from_catalog(&cat, tmp.path()).await;
-    let seen = drain_all(
-        &mut b,
-        &log,
-        &ToastResolver::disabled(),
-        7,
-        12345,
-        300,
-        &[8],
-    )
-    .await
-    .unwrap();
+    b.on_heap(described(&log, heap(rfn, 7, 100, HeapOp::Insert, col(1))))
+        .await
+        .unwrap();
+    b.on_heap(described(&log, heap(rfn, 8, 150, HeapOp::Insert, col(2))))
+        .await
+        .unwrap();
+    b.on_heap(described(&log, heap(rfn, 7, 200, HeapOp::Insert, col(3))))
+        .await
+        .unwrap();
+    let seen = drain_all(&mut b, &ToastResolver::disabled(), 7, 12345, 300, &[8])
+        .await
+        .unwrap();
     let lsns: Vec<u64> = seen.iter().map(|c| c.decoded.source_lsn).collect();
     assert_eq!(lsns, vec![100, 150, 200]);
     // Per-top accounting: one bump, regardless of subxact count.
@@ -462,21 +564,16 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     // this test (no `standby.signal`), so `pg_last_wal_replay_lsn()`
     // returns NULL and would otherwise time out. Matches the
     // convention in `tests/shadow_catalog.rs`.
-    b.on_heap(heap(rfn, 33, 0, HeapOp::Insert, vec![id_col, body_ptr]))
-        .await
-        .unwrap();
     let log = log_from_catalog(&cat, tmp.path()).await;
-    let seen = drain_all(
-        &mut b,
+    b.on_heap(described(
         &log,
-        &ToastResolver::disabled(),
-        33,
-        12345,
-        300,
-        &[],
-    )
+        heap(rfn, 33, 0, HeapOp::Insert, vec![id_col, body_ptr]),
+    ))
     .await
     .unwrap();
+    let seen = drain_all(&mut b, &ToastResolver::disabled(), 33, 12345, 300, &[])
+        .await
+        .unwrap();
     assert_eq!(seen.len(), 1);
     let body_col = &seen[0].decoded.new.as_ref().unwrap().columns[1];
     match body_col {
@@ -522,9 +619,13 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
     }
     // source_lsn=0 to bypass the shadow-replay gate; see sibling test
     // for the rationale.
-    b.on_heap(heap(rfn, 42, 0, HeapOp::Insert, vec![id_col, body_ptr]))
-        .await
-        .unwrap();
+    let log = log_from_catalog(&cat, tmp.path()).await;
+    b.on_heap(described(
+        &log,
+        heap(rfn, 42, 0, HeapOp::Insert, vec![id_col, body_ptr]),
+    ))
+    .await
+    .unwrap();
     // In-xact gap stays a hard error even with an active store (disabled
     // mode NULL-fills): the value's key is present in the xact's chunk map,
     // so the gap is a decode bug, never a merge-collapsed store miss
@@ -532,8 +633,7 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         Arc::new(MemChunkStore::new()),
         Arc::new(EmitterStats::default()),
     );
-    let log = log_from_catalog(&cat, tmp.path()).await;
-    let err = drain_all(&mut b, &log, &resolver, 42, 0, 200, &[])
+    let err = drain_all(&mut b, &resolver, 42, 0, 200, &[])
         .await
         .expect_err("missing chunk surfaces");
     match err {
@@ -552,10 +652,12 @@ async fn abort_drops_xact_and_unlinks_spill_against_real_shadow() {
     // Same shape as the unit test, but reachable via the production
     // catalog handle so the integration suite covers the bin's
     // dispatch chain in one place.
-    let Some((tmp, shadow, _cat, rfn)) = fixture_shadow_with_things(55707).await else {
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55707).await else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
+    let cat = Arc::new(Mutex::new(cat));
+    let log = log_from_catalog(&cat, tmp.path()).await;
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir.clone(), 1024)).unwrap();
     let fat_col = vec![
@@ -563,9 +665,12 @@ async fn abort_drops_xact_and_unlinks_spill_against_real_shadow() {
         Some(ColumnValue::Bytea(vec![0u8; 256])),
     ];
     for i in 0..10 {
-        b.on_heap(heap(rfn, 11, 100 + i, HeapOp::Insert, fat_col.clone()))
-            .await
-            .unwrap();
+        b.on_heap(described(
+            &log,
+            heap(rfn, 11, 100 + i, HeapOp::Insert, fat_col.clone()),
+        ))
+        .await
+        .unwrap();
     }
     assert!(b.stats().spill_xacts_active >= 1);
     b.abort(11, 200, &[]).await.unwrap();

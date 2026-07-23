@@ -318,8 +318,9 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
 
     // Same-xact TRUNCATE + toasted INSERT (single psql -c = one xact):
     // post-truncate chunks ride the toast rel's new filenode, stash, and
-    // decode at commit past the mirror wipe. Main tuples stay fenced.
-    let skipped_before = stats.toast_stash_skipped.load(Ordering::Relaxed);
+    // decode at commit past the mirror wipe. Main tuple decodes raw and
+    // lands after the dest truncate.
+    let decoded_before: u64 = stats.raw_decode_ordinary_ops.load().iter().sum();
     let driver = fx::spawn_workload(
         &source,
         vec![
@@ -345,16 +346,17 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
     .await;
     assert_eq!(stats.toast_mirror_truncates.load(Ordering::Relaxed), 1);
     assert!(
-        stats.toast_stash_skipped.load(Ordering::Relaxed) > skipped_before,
-        "fenced main tuples counted as skipped"
+        stats.raw_decode_ordinary_ops.load().iter().sum::<u64>() > decoded_before,
+        "post-truncate main tuple decodes from the raw stash"
     );
-    // Destination truncate applied; the post-truncate main row stays fenced
-    // until a replay fence exists.
+    // Destination truncate applied, then the same-xact row lands after it
+    // (event-before-heap tie break).
     fx::wait_query(
         &ch,
-        "SELECT count() FROM walshadow_test.doc",
-        "0",
-        "dest table should be empty after the truncate barrier",
+        "SELECT concat(toString(count()), '/', sum(length(body))) \
+         FROM walshadow_test.doc WHERE _is_deleted = 0",
+        &format!("1/{BODY_D_LEN}"),
+        "post-truncate row is the only survivor, body rehydrated whole",
     )
     .await;
 
@@ -444,7 +446,11 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
     let decoder_stats = pipeline.sinks.decoder.stats_handle();
     pipeline.shutdown().await.expect("pipeline drains clean");
 
-    assert!(decoder_stats.toast_stash_buffered.load(Ordering::Relaxed) > 0);
+    // Same-xact stash admission now rides the catalog-dirty defer branch
+    // (the CREATE/rewrite xact is dirty at its own writes), counted under
+    // raw_stash_deferred; toast_stash_buffered covers only non-dirty
+    // marker-proven admissions
+    assert!(decoder_stats.raw_stash_deferred.load(Ordering::Relaxed) > 0);
     assert_eq!(
         decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
         0
@@ -580,8 +586,8 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     assert_eq!(stats.toast_rewrite_barriers.load(Ordering::Relaxed), 1);
     assert!(stats.toast_stash_decoded.load(Ordering::Relaxed) > 0);
     assert!(
-        stats.toast_stash_skipped.load(Ordering::Relaxed) > 0,
-        "rewritten main tuples stay fenced"
+        stats.raw_decode_ordinary_ops.load().iter().sum::<u64>() > 0,
+        "rewritten main tuples decode raw; unmapped rows discard at plan"
     );
     assert_eq!(stats.toast_stash_discarded.load(Ordering::Relaxed), 0);
 

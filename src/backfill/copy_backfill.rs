@@ -1130,6 +1130,8 @@ impl CopyBackfiller {
                 self.spill_dir.join("copy_deferred.bin"),
                 crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX,
             ),
+            self.emitter.soft_delete,
+            self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         ));
 
         let (select_list, plan, natts) = column_plan(desc);

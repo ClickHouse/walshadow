@@ -12,10 +12,12 @@ use tokio::sync::mpsc;
 
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
 use crate::backfill::spool::DeferredSpool;
+use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
+use crate::emit::route::RouteSnapshot;
 use crate::mapping::{MappingHandle, TableMapping};
 use crate::schema::RelDescriptor;
 use crate::toast::{
@@ -44,12 +46,26 @@ pub async fn drain(
     stats: Arc<EmitterStats>,
     resolver: ToastResolver,
     mut deferred: DeferredSpool,
+    soft_delete: bool,
+    config: Option<Arc<ResolvedConfig>>,
 ) -> Result<BootstrapDrainOutcome, String> {
-    let mappings: HashMap<_, _> = mapping_handle
+    // Routes frozen once per pass from the caller's config snapshot
+    let routes: HashMap<_, _> = mapping_handle
         .read()
         .await
         .iter()
-        .map(|(name, mapping)| (name.clone(), Arc::new(mapping.clone())))
+        .map(|(name, mapping)| {
+            let overrides = config
+                .as_ref()
+                .and_then(|rc| rc.columns.get(name))
+                .cloned()
+                .map(Arc::new)
+                .unwrap_or_default();
+            (
+                name.clone(),
+                RouteSnapshot::freeze(Arc::new(mapping.clone()), overrides, soft_delete),
+            )
+        })
         .collect();
     let mut next_seq = 0u64;
     let mut rows_routed = 0u64;
@@ -93,12 +109,12 @@ pub async fn drain(
             continue;
         }
 
-        let Some(mapping) = mappings.get(&rel.rel_name).cloned() else {
+        let Some(route) = routes.get(&rel.rel_name).cloned() else {
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
 
-        if has_mapped_external_toast(&tuple, &mapping) {
+        if has_mapped_external_toast(&tuple, &route.mapping) {
             if resolver.stores_chunks() {
                 deferred
                     .push(tuple)
@@ -113,13 +129,13 @@ pub async fn drain(
                 continue;
             }
             let mut tuple = tuple;
-            let permit = resolve_or_fill_toast(&mut tuple, &rel, &mapping, &resolver).await?;
-            route_row(&msg_tx, seq, rel, mapping, tuple, permit).await?;
+            let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
+            route_row(&msg_tx, seq, rel, route, tuple, permit).await?;
             bump(&mut open, &mut rows_routed);
             continue;
         }
 
-        route_row(&msg_tx, seq, rel, mapping, tuple, None).await?;
+        route_row(&msg_tx, seq, rel, route, tuple, None).await?;
         bump(&mut open, &mut rows_routed);
     }
 
@@ -155,12 +171,12 @@ pub async fn drain(
                 stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            let Some(mapping) = mappings.get(&rel.rel_name).cloned() else {
+            let Some(route) = routes.get(&rel.rel_name).cloned() else {
                 stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            let permit = resolve_or_fill_toast(&mut tuple, &rel, &mapping, &resolver).await?;
-            route_row(&msg_tx, seq, rel, mapping, tuple, permit).await?;
+            let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
+            route_row(&msg_tx, seq, rel, route, tuple, permit).await?;
             placed += 1;
             rows_routed += 1;
         }
@@ -192,7 +208,7 @@ async fn route_row(
     msg_tx: &mpsc::Sender<BatcherMsg>,
     seq: u64,
     rel: Arc<RelDescriptor>,
-    mapping: Arc<TableMapping>,
+    route: Arc<RouteSnapshot>,
     tuple: BackfillTuple,
     value_permit: Option<crate::budget::MemoryPermit>,
 ) -> Result<(), String> {
@@ -201,7 +217,7 @@ async fn route_row(
         .send(BatcherMsg::Row(RoutedRow {
             seq,
             rel,
-            mapping,
+            route,
             committed,
             permit: None,
             value_permit: value_permit.map(Arc::new),
@@ -529,7 +545,7 @@ mod tests {
         let mut tables = HashMap::new();
         tables.insert(RelName::new("public", "t16400"), mapping_for(16400));
         tables.insert(RelName::new("public", "t16401"), mapping_for(16401));
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
+        let mapping = crate::mapping::mapping_handle(tables);
 
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
@@ -554,6 +570,8 @@ mod tests {
             stats.clone(),
             ToastResolver::disabled(),
             mem_spool(),
+            false,
+            None,
         ));
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
@@ -581,7 +599,7 @@ mod tests {
         catalog.insert(rel(16401)); // resolvable but unmapped
         let mut tables = HashMap::new();
         tables.insert(RelName::new("public", "t16400"), mapping_for(16400));
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
+        let mapping = crate::mapping::mapping_handle(tables);
 
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
@@ -604,6 +622,8 @@ mod tests {
             stats.clone(),
             ToastResolver::disabled(),
             mem_spool(),
+            false,
+            None,
         ));
 
         let mut seqs: Vec<u64> = Vec::new();
@@ -627,7 +647,7 @@ mod tests {
         catalog.insert(bytea_rel(16400));
         let mut tables = HashMap::new();
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
+        let mapping = crate::mapping::mapping_handle(tables);
 
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
@@ -652,6 +672,8 @@ mod tests {
             stats.clone(),
             resolver,
             mem_spool(),
+            false,
+            None,
         ));
 
         let mut rows = Vec::new();
@@ -684,7 +706,7 @@ mod tests {
         catalog.insert(toast_rel(16500));
         let mut tables = HashMap::new();
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
+        let mapping = crate::mapping::mapping_handle(tables);
 
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
@@ -715,6 +737,8 @@ mod tests {
             ToastResolver::with_store(store, stats.clone()),
             // Threshold 0: deferred referrer rides a real spool file
             DeferredSpool::new(spool_tmp.path().join("bootstrap_deferred.bin"), 0),
+            false,
+            None,
         ));
 
         let mut rows = Vec::new();
@@ -744,7 +768,7 @@ mod tests {
         catalog.insert(toast_rel(16500));
         let mut tables = HashMap::new();
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
-        let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(tables));
+        let mapping = crate::mapping::mapping_handle(tables);
 
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
@@ -771,12 +795,14 @@ mod tests {
             stats.clone(),
             ToastResolver::with_store(store, stats.clone()),
             mem_spool(),
+            false,
+            None,
         ));
         // Wait for the referrer to defer, then unmap before walk EOF
         while stats.bootstrap_deferred_bytes.load(Ordering::Relaxed) == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        mapping.write().await.clear();
+        Arc::make_mut(&mut *mapping.write().await).clear();
         drop(tup_tx);
 
         let mut rows = Vec::new();

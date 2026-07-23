@@ -16,12 +16,13 @@ use std::sync::{Arc, Mutex};
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordBlock};
 
 use crate::decode::wal_xact::{
-    XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
-    XLOG_XACT_INVALIDATIONS, XLOG_XACT_OPMASK, XactPayloadError, parse_xact_invalidations,
-    parse_xact_payload,
+    XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
+    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_INVALIDATIONS, XLOG_XACT_OPMASK, XactPayloadError,
+    parse_xact_assignment, parse_xact_invalidations, parse_xact_payload,
 };
 use crate::filter::catalog_tracker::{CatalogTracker, CatalogTrackerStats};
 use crate::filter::classify::{Class, classify};
+use crate::filter::dirty_tree::{DirtyState, DirtyTree};
 use crate::filter::main_data;
 use crate::filter::manifest::ManifestStats;
 use crate::record::{AffectedOid, BoundaryInfo, Route, rmgr_label};
@@ -110,18 +111,10 @@ pub struct Verdict {
     pub catalog_boundary: bool,
     /// Capture input; `Some` iff `catalog_boundary`
     pub boundary: Option<Arc<BoundaryInfo>>,
-}
-
-/// One catalog-dirty xact's accumulated capture inputs, keyed by the
-/// writing xid (top or sub); merged across the tree at its commit.
-#[derive(Debug)]
-struct DirtyXact {
-    /// First catalog-touching record LSN under this xid
-    first_touch: u64,
-    /// User oid → first pg_class touch LSN under this xid
-    oids: HashMap<u32, u64>,
-    /// Wrote a capture-all catalog (pg_namespace)
-    unenumerated: bool,
+    /// User-route record whose xact tree wrote catalog state earlier in
+    /// the stream: decoder must not decode with live descriptors, hold raw
+    /// until commit-time capture publishes the final layout
+    pub defer_catalog_decode: bool,
 }
 
 /// Pump-side `XLOG_SMGR_CREATE` main-fork markers: physical rfn → creation
@@ -165,11 +158,11 @@ impl SmgrMarkers {
 pub struct Filter {
     tracker: CatalogTracker,
     stats: FilterStats,
-    /// Xids (top or sub) that wrote a catalog-touching record or logged a
-    /// descriptor-relevant `XLOG_XACT_INVALIDATIONS` set; drained at their
-    /// commit / abort. Crash-orphaned xids linger, bounded by workload (no
-    /// commit ever arrives to hold on)
-    catalog_dirty: HashMap<u32, DirtyXact>,
+    /// Catalog-dirty transaction trees: xids (top or sub) that wrote a
+    /// catalog-touching record or logged a descriptor-relevant
+    /// `XLOG_XACT_INVALIDATIONS` set, plus subxid → top links; drained at
+    /// commit / abort
+    dirty: DirtyTree,
     smgr_markers: Arc<Mutex<SmgrMarkers>>,
     /// Relcache-inval scope: accept db in {0, this}; `None` (unwired)
     /// accepts any db
@@ -181,7 +174,7 @@ impl Filter {
         Self {
             tracker: CatalogTracker::new(),
             stats: FilterStats::default(),
-            catalog_dirty: HashMap::new(),
+            dirty: DirtyTree::default(),
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             inval_db_oid: None,
         }
@@ -252,13 +245,13 @@ impl Filter {
         // catalog relation was written qualify. `Empty`'s None → ToShadow
         // safe default must not dirty (would hold at unrelated commits)
         let (route, catalog_touch) = match class {
-            Class::Catalog => (Route::ToShadow, true),
+            Class::Catalog => (Route::ToShadow, catalog_mutation(record)),
             // Relmap update (VACUUM FULL mapped catalog) is Special-class
             Class::Special => (Route::ToShadow, obs.catalog_write),
             Class::User => {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
                     // tracker has filenodes the bootstrap classify rule misses
-                    (Route::ToShadow, true)
+                    (Route::ToShadow, catalog_mutation(record))
                 } else {
                     (Route::ToDecoder, false)
                 }
@@ -285,12 +278,12 @@ impl Filter {
                 .insert(rfn, source_lsn);
         }
         let xid = record.header.xact_id;
+        // Subxid → top link rides the subxact's first record at
+        // wal_level=logical (`XLR_BLOCK_ID_TOPLEVEL_XID`); learn before
+        // touch and admission so both resolve the true root
+        self.dirty.link(xid, record.toplevel_xid);
         if catalog_touch && xid != 0 {
-            let dirty = self.catalog_dirty.entry(xid).or_insert_with(|| DirtyXact {
-                first_touch: source_lsn,
-                oids: HashMap::new(),
-                unenumerated: false,
-            });
+            let dirty = self.dirty.touch(xid, source_lsn);
             if let Some(oid) = obs.pg_class_user_oid {
                 dirty.oids.entry(oid).or_insert(source_lsn);
             }
@@ -301,6 +294,7 @@ impl Filter {
                 dirty.unenumerated = true;
             }
         }
+        let defer_catalog_decode = route == Route::ToDecoder && self.dirty.is_dirty(xid);
         let boundary = self.observe_xact_end(record, source_lsn, page_magic)?;
         self.stats
             .record(class, route, record.header.total_record_length as u64);
@@ -308,6 +302,7 @@ impl Filter {
             route,
             catalog_boundary: boundary.is_some(),
             boundary,
+            defer_catalog_decode,
         })
     }
 
@@ -315,7 +310,8 @@ impl Filter {
     /// listed subxact, or prepared xid) is a catalog boundary; abort clears
     /// without holding — rolled-back catalog changes never become visible
     /// in shadow. Commit records carry the full committed-subxact list
-    /// (`xactGetCommittedChildren`), so no ASSIGNMENT tracking is needed.
+    /// (`xactGetCommittedChildren`), the authoritative boundary merge;
+    /// ASSIGNMENT / inline-toplevel links only sharpen mid-xact admission.
     /// Defense: a commit carrying local relcache invals is a boundary even
     /// when the dirty tracker missed every write.
     fn observe_xact_end(
@@ -333,6 +329,17 @@ impl Filter {
             self.observe_xact_invals(record, source_lsn, page_magic)?;
             return Ok(None);
         }
+        if op == XLOG_XACT_ASSIGNMENT {
+            // Batched subxid → top links (every PGPROC_MAX_CACHED_SUBXIDS
+            // assignments). Silent loss would leave later child records
+            // undeferred, so malformation poisons like commit payloads
+            let (top, subs) = parse_xact_assignment(&record.main_data)
+                .ok_or_else(|| XactPayloadError::new("xact assignment"))?;
+            for sub in subs {
+                self.dirty.link(sub, top);
+            }
+            return Ok(None);
+        }
         let is_commit = op == XLOG_XACT_COMMIT || op == XLOG_XACT_COMMIT_PREPARED;
         let is_abort = op == XLOG_XACT_ABORT || op == XLOG_XACT_ABORT_PREPARED;
         if !is_commit && !is_abort {
@@ -340,30 +347,9 @@ impl Filter {
         }
         let payload = parse_xact_payload(info, &record.main_data, page_magic)?;
         let header_xid = record.header.xact_id;
-        let mut merged: Option<DirtyXact> = None;
-        let mut absorb = |dirty: Option<DirtyXact>| {
-            let Some(dirty) = dirty else { return };
-            match &mut merged {
-                None => merged = Some(dirty),
-                Some(m) => {
-                    m.first_touch = m.first_touch.min(dirty.first_touch);
-                    m.unenumerated |= dirty.unenumerated;
-                    for (oid, lsn) in dirty.oids {
-                        m.oids
-                            .entry(oid)
-                            .and_modify(|l| *l = (*l).min(lsn))
-                            .or_insert(lsn);
-                    }
-                }
-            }
-        };
-        absorb(self.catalog_dirty.remove(&header_xid));
-        if let Some(x) = payload.twophase_xid {
-            absorb(self.catalog_dirty.remove(&x));
-        }
-        for x in &payload.subxacts {
-            absorb(self.catalog_dirty.remove(x));
-        }
+        let merged = self
+            .dirty
+            .drain_tree(header_xid, payload.twophase_xid, &payload.subxacts);
         if !is_commit {
             return Ok(None);
         }
@@ -393,15 +379,11 @@ impl Filter {
         if !dirty_hit && inval_oids.is_empty() && !capture_all {
             return Ok(None);
         }
-        let mut merged = merged.unwrap_or_else(|| DirtyXact {
-            // Inval-only boundary (dirty tracker missed the writes): the
-            // commit record itself is the only LSN at hand. Later than any
-            // of the xact's rows, so its events order after them — safe for
-            // descriptor bias (newer reader reads older tuples)
-            first_touch: source_lsn,
-            oids: HashMap::new(),
-            unenumerated: false,
-        });
+        // Inval-only boundary (dirty tracker missed the writes): the
+        // commit record itself is the only LSN at hand. Later than any
+        // of the xact's rows, so its events order after them — safe for
+        // descriptor bias (newer reader reads older tuples)
+        let mut merged = merged.unwrap_or_else(|| DirtyState::new(source_lsn));
         for oid in inval_oids {
             merged.oids.entry(oid).or_default();
         }
@@ -455,11 +437,7 @@ impl Filter {
         if !namespace_hit && !flush && oids.is_empty() {
             return Ok(());
         }
-        let dirty = self.catalog_dirty.entry(xid).or_insert_with(|| DirtyXact {
-            first_touch: source_lsn,
-            oids: HashMap::new(),
-            unenumerated: false,
-        });
+        let dirty = self.dirty.touch(xid, source_lsn);
         dirty.unenumerated |= namespace_hit || flush;
         for oid in oids {
             // Inval record LSN sits at command end: after the command's
@@ -493,6 +471,31 @@ fn any_block_is_catalog(tracker: &CatalogTracker, blocks: &[XLogRecordBlock]) ->
         let r = b.header.location.rel;
         tracker.is_catalog(r.db_node, r.rel_node)
     })
+}
+
+/// Catalog pages take physical writes from any backend — opportunistic
+/// prune during a scan (PG `src/backend/access/heap/pruneheap.c`), tuple
+/// locks, vacuum inplace stats — all stamped with the writer's xid and none
+/// a logical catalog change. Only row mutations prove DDL; everything else
+/// still routes ToShadow but must not dirty the writer's tree (a user xact
+/// pruning a pg_class page would fence its own rows). Non-heap rmgrs
+/// (catalog index writes) never dirty: their logical counterpart is the
+/// heap record beside them
+fn catalog_mutation(record: &XLogRecord) -> bool {
+    use crate::decode::heap_decoder::{
+        XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT, XLOG_HEAP_OPMASK,
+        XLOG_HEAP_UPDATE, XLOG_HEAP2_MULTI_INSERT,
+    };
+    let op = record.header.info & XLOG_HEAP_OPMASK;
+    let rm = record.header.resource_manager_id;
+    if rm == RmId::Heap as u8 {
+        matches!(
+            op,
+            XLOG_HEAP_INSERT | XLOG_HEAP_DELETE | XLOG_HEAP_UPDATE | XLOG_HEAP_HOT_UPDATE
+        )
+    } else {
+        rm == RmId::Heap2 as u8 && op == XLOG_HEAP2_MULTI_INSERT
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +739,137 @@ mod tests {
             )
             .unwrap();
         assert!(v.catalog_boundary);
+    }
+
+    #[test]
+    fn defer_flag_tracks_dirty_tree() {
+        let mut f = Filter::new();
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 7), 100, 0xD116)
+            .unwrap();
+        let user = |f: &mut Filter, xid| {
+            f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 20000)], xid), 110, 0xD116)
+                .unwrap()
+        };
+        assert!(user(&mut f, 7).defer_catalog_decode, "post-touch user row");
+        assert!(!user(&mut f, 8).defer_catalog_decode, "interleaved xid");
+        f.decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 200, 0xD116)
+            .unwrap();
+        assert!(!user(&mut f, 7).defer_catalog_decode, "commit clears");
+    }
+
+    #[test]
+    fn inline_toplevel_defers_whole_tree_until_subxact_abort() {
+        let mut f = Filter::new();
+        // Subxact's catalog write carries its top inline (logical WAL)
+        let mut ddl = rec_with_xid(RmId::Heap, &[(5, 1259)], 101);
+        ddl.toplevel_xid = 100;
+        f.decide_record(&ddl, 100, 0xD116).unwrap();
+        let user = |f: &mut Filter, xid| {
+            f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 20000)], xid), 110, 0xD116)
+                .unwrap()
+                .defer_catalog_decode
+        };
+        assert!(user(&mut f, 100), "top defers via dirty child");
+        assert!(user(&mut f, 101));
+        // ROLLBACK TO SAVEPOINT drops the child's dirt, top runs clean
+        f.decide_record(&xact_end(XLOG_XACT_ABORT, 101, &[], None), 150, 0xD116)
+            .unwrap();
+        assert!(!user(&mut f, 100), "subxact abort clears its subtree");
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 100, &[], None), 200, 0xD116)
+            .unwrap();
+        assert!(!v.catalog_boundary, "aborted child never bounds");
+    }
+
+    #[test]
+    fn catalog_page_maintenance_never_dirties() {
+        use crate::decode::heap_decoder::{XLOG_HEAP_INPLACE, XLOG_HEAP_LOCK};
+        let mut f = Filter::new();
+        let user = |f: &mut Filter, xid| {
+            f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 20000)], xid), 110, 0xD116)
+                .unwrap()
+        };
+        // Opportunistic prune on a pg_class page carries the scanning
+        // xact's xid (PRUNE_ON_ACCESS = 0x10 on PG 17)
+        let mut prune = rec_with_xid(RmId::Heap2, &[(5, 1259)], 7);
+        prune.header.info = 0x10;
+        assert_eq!(
+            f.decide_record(&prune, 100, 0xD116).unwrap().route,
+            Route::ToShadow,
+            "maintenance still routes to shadow"
+        );
+        assert!(
+            !user(&mut f, 7).defer_catalog_decode,
+            "prune must not fence the pruner's own rows"
+        );
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 200, 0xD116)
+            .unwrap();
+        assert!(!v.catalog_boundary, "prune-only commit never bounds");
+        // Tuple lock and vacuum inplace stats: same treatment
+        for info in [XLOG_HEAP_LOCK, XLOG_HEAP_INPLACE] {
+            let mut r = rec_with_xid(RmId::Heap, &[(5, 1259)], 8);
+            r.header.info = info;
+            f.decide_record(&r, 300, 0xD116).unwrap();
+        }
+        assert!(!user(&mut f, 8).defer_catalog_decode);
+        // Real mutation still dirties
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 9), 400, 0xD116)
+            .unwrap();
+        assert!(user(&mut f, 9).defer_catalog_decode);
+    }
+
+    /// `xl_xact_assignment`: `(u32 xtop, i32 nsubxacts, subxids…)`
+    fn xact_assignment(top: u32, subs: &[u32]) -> XLogRecord<'static> {
+        let mut md = top.to_le_bytes().to_vec();
+        md.extend_from_slice(&(subs.len() as i32).to_le_bytes());
+        for s in subs {
+            md.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut r = rec_with_xid(RmId::Xact, &[], subs.first().copied().unwrap_or(0));
+        r.header.info = XLOG_XACT_ASSIGNMENT;
+        r.main_data = std::borrow::Cow::Owned(md);
+        r
+    }
+
+    #[test]
+    fn assignment_merges_retained_child_state() {
+        let mut f = Filter::new();
+        // Child dirties without inline toplevel (replica-level WAL shape)
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 101), 100, 0xD116)
+            .unwrap();
+        let user = |f: &mut Filter, xid| {
+            f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 20000)], xid), 110, 0xD116)
+                .unwrap()
+                .defer_catalog_decode
+        };
+        assert!(user(&mut f, 101), "child defers after own touch");
+        assert!(!user(&mut f, 100), "top unknown until assignment");
+        f.decide_record(&xact_assignment(100, &[101, 102]), 120, 0xD116)
+            .unwrap();
+        assert!(user(&mut f, 100), "assignment merges retained state");
+        assert!(user(&mut f, 102), "assigned sibling shares the tree");
+        let v = f
+            .decide_record(
+                &xact_end(XLOG_XACT_COMMIT, 100, &[101, 102], None),
+                200,
+                0xD116,
+            )
+            .unwrap();
+        assert!(v.catalog_boundary);
+        assert!(!user(&mut f, 100), "commit clears the tree");
+    }
+
+    #[test]
+    fn malformed_assignment_poisons() {
+        let mut f = Filter::new();
+        let mut r = xact_assignment(100, &[101]);
+        // Claim two subxids, carry one
+        match &mut r.main_data {
+            std::borrow::Cow::Owned(md) => md[4..8].copy_from_slice(&2i32.to_le_bytes()),
+            _ => unreachable!(),
+        }
+        assert!(f.decide_record(&r, 150, 0xD116).is_err());
     }
 
     #[test]

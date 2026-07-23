@@ -10,9 +10,10 @@
 //!
 //! 2. `opt_out_mid_stream_drains_and_halts`
 //!    * `app.orders` TOML-mapped and replicating.
-//!    * Operator inserts `config_table (replicate=false)` between two INSERTs.
-//!    * Expect: rows committed before the opt-out drain to CH, rows after
-//!      never emit, CH target retained.
+//!    * Operator inserts `config_table (replicate=false)` between two
+//!      multi-row INSERTs.
+//!    * Expect: the xact committed before the opt-out drains whole, the one
+//!      after never emits (no partial xact either side), CH target retained.
 //!
 //! 3. `forward_decl_materializes_on_create_table`
 //!    * Operator inserts `config_table (replicate=true)` for a table that
@@ -52,6 +53,13 @@
 //!    * Source `CREATE TABLE` in the namespace + INSERT.
 //!    * Expect: the namespace flag alone auto-creates the CH table and the
 //!      row lands.
+//!
+//! 8. `pre_opt_in_xact_discards_post_opt_in_routes`
+//!    * No TOML mapping, no `initial_load`: a row committed before the
+//!      `config_table` opt-in plans against no route (counted discard),
+//!      a row committed after routes and lands.
+//!    * Route snapshots attach at planning: a transaction planned before
+//!      the opt-in never re-routes, one planned after routes whole.
 //!
 //! Source-side `config_*` install runs the real `sql/runtime_config_install.sql`
 //! inside the bootstrap schema dump, so the drills double as install-script
@@ -250,14 +258,20 @@ async fn opt_out_mid_stream_drains_and_halts() {
     // Commit order fixes semantics: id=1 precedes the opt-out (drains to CH),
     // id=2 follows it (never emits). The opt-out applies inside the barrier
     // fence, after id=1 is durable.
+    // Multi-row xacts on both sides of the boundary: whole-transaction route
+    // granularity means each side lands or discards as a unit, never partial.
     let driver = fx::spawn_workload(
         &source,
         vec![
-            "INSERT INTO app.orders (id, note) VALUES (1, 'before opt-out')".into(),
+            "INSERT INTO app.orders (id, note) \
+             SELECT i, 'before opt-out' FROM generate_series(1, 5) AS i"
+                .into(),
             "INSERT INTO walshadow.config_table (namespace, relname, replicate) \
              VALUES ('app', 'orders', false)"
                 .into(),
-            "INSERT INTO app.orders (id, note) VALUES (2, 'after opt-out')".into(),
+            "INSERT INTO app.orders (id, note) \
+             SELECT i, 'after opt-out' FROM generate_series(6, 10) AS i"
+                .into(),
             "SELECT pg_switch_wal()".into(),
         ],
     );
@@ -273,17 +287,18 @@ async fn opt_out_mid_stream_drains_and_halts() {
     assert!(observed >= target);
     pipeline.shutdown().await.expect("pipeline drains clean");
 
-    // Source has both rows; CH stopped at the opt-out boundary.
+    // Source has both xacts; CH stopped at the opt-out boundary with the
+    // before-xact complete — no partial transaction on either side.
     let src = source.psql_one("SELECT count(*) FROM app.orders").unwrap();
-    assert_eq!(src, "2");
+    assert_eq!(src, "10");
     let n = ch
         .query("SELECT count() FROM walshadow_test.orders FINAL WHERE _is_deleted = 0")
         .expect("ch count");
-    assert_eq!(n, "1", "row committed after replicate=false must not emit");
+    assert_eq!(n, "5", "before-xact whole, after-xact absent");
     let ids = ch
-        .query("SELECT id FROM walshadow_test.orders FINAL WHERE _is_deleted = 0")
+        .query("SELECT max(id) FROM walshadow_test.orders FINAL WHERE _is_deleted = 0")
         .expect("ch ids");
-    assert_eq!(ids, "1", "only the pre-opt-out row reaches CH");
+    assert_eq!(ids, "5", "no row committed after replicate=false emits");
 
     // Target retained (opt-out is a routing change, not a DROP).
     let exists = ch
@@ -859,4 +874,107 @@ async fn column_target_type_override_reaches_projection() {
         amount, "123.45",
         "override must drive the encode scale (a dropped override stores 123)"
     );
+}
+
+/// Drill 8: transaction planned before the opt-in discards, one planned
+/// after routes. No TOML mapping and no `initial_load`, so the pre-opt-in
+/// row has exactly one path to CH — a route resolved at planning — and it
+/// must not take it. The post-opt-in row proves the opt-in commit preceding
+/// heap rows in WAL routes those rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_opt_in_xact_discards_post_opt_in_routes() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source_port = SOURCE_PORT + 70;
+    let shadow_port = SHADOW_PORT + 70;
+    let ch_tcp_port = CH_TCP_PORT + 70;
+    let ch_http_port = CH_HTTP_PORT + 70;
+    let walsender_port = WALSENDER_PORT + 70;
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.metrics (id bigint PRIMARY KEY, v text);\n"
+    );
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port,
+        mappings: vec![],
+        app_name: "walshadow-config-pre-opt-in-discard",
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    // Commit order fixes semantics: id=1 plans against no route (discard),
+    // the opt-in applies inside the barrier fence, id=2 plans after it.
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO app.metrics (id, v) VALUES (1, 'pre-opt-in')".into(),
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate) \
+             VALUES ('app', 'metrics', true)"
+                .into(),
+            "INSERT INTO app.metrics (id, v) VALUES (2, 'post-opt-in')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    let discarded = pipeline
+        .stats
+        .unsupported_relations
+        .load(std::sync::atomic::Ordering::Relaxed);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    assert!(discarded >= 1, "pre-opt-in xact must be a counted discard");
+
+    let n = ch
+        .query("SELECT count() FROM walshadow_test.metrics FINAL WHERE _is_deleted = 0")
+        .expect("ch count");
+    assert_eq!(n, "1", "exactly the post-opt-in row lands");
+
+    let gone = ch
+        .query("SELECT count() FROM walshadow_test.metrics WHERE id = 1")
+        .expect("ch pre-opt-in row");
+    assert_eq!(gone, "0", "pre-opt-in row must never reach CH");
+
+    let v = ch
+        .query(
+            "SELECT argMax(v, _lsn) FROM walshadow_test.metrics \
+             WHERE _is_deleted = 0 AND id = 2",
+        )
+        .expect("ch v");
+    assert_eq!(v, "post-opt-in");
 }
