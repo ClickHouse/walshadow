@@ -70,6 +70,22 @@ the oid's first pg_class touch in the xact, the tree's first catalog
 touch. Events enter the drain keyed at `valid_from`, sorted with config
 events at drain open.
 
+Bias-early is only sound when the final descriptor provably reads every
+tuple in the interval. `compatible_reader`
+([`src/catalog/compat.rs`](../src/catalog/compat.rs)) is the predicate:
+metadata-only changes (renames, defaults) and appended nullable /
+missing-value columns qualify; physical changes — type, typmod, typlen,
+alignment, attnum reuse, not-null append without a missing value — do
+not. An incompatible in-place change (same rfn, no rotation) instead
+publishes an `Ambiguity` interval `[first_touch, next_lsn)` alongside
+the final `Present`: within it no single descriptor provably decodes the
+rfn's rows. Scope is `Rfn`, `Oid`, or conservatively `Database` when
+affected relations can't be enumerated; reasons enumerate
+`UnknownAffectedRelation / UnknownMutationPosition /
+MultipleIncompatibleLayouts / NeverVisibleGeneration /
+IncompleteInvalidation`. Ambiguities are batch records like entries —
+replay-from-log reproduces the same intervals every boot.
+
 Toast rels ('t') capture entries and `Dropped` events only (the retire
 ledger consumes those); indexes are excluded entirely.
 
@@ -101,18 +117,25 @@ enabled config picks up existing rels without log mutation.
 ## Decode reads
 
 `descriptor_at(rfn, lsn)` / `descriptor_by_oid_at(oid, lsn)` return
-`Present | Dropped | Retired | NotCovered | ForeignDb`:
+`Present | Ambiguous | Dropped | Retired | NotCovered | ForeignDb`.
+Ambiguity precedes the chain — a chain entry inside an ambiguous
+interval is not proven safe for rows there, so the interval check runs
+first (rfn/oid scope, then database scope). The `_spanned` twins return
+the `Present` descriptor plus its entry's `valid_from` under one index
+read (two reads could interleave with a bias-early append and pair a
+stale descriptor with a fresh span); `present_before` serves historical
+predecessors:
 
 - worker buffering: Present decodes; ForeignDb and horizon/xid-0
-  NotCovered are counted skips; NotCovered/Dropped with a live xid stash
-  for commit-time resolution; Retired skips (rows can't outlive the
-  rotation)
+  NotCovered are counted skips; NotCovered/Dropped/Ambiguous with a
+  live xid stash for commit-time resolution ([xact.md](xact.md)
+  Commit-time stash); Retired skips (rows can't outlive the rotation)
 - stash resolution at commit `next_lsn`: Present toast → chunk decode
-  behind its marker barrier, Present ordinary → fenced (stash item 5,
-  [future/xact_stash.md](future/xact_stash.md)), tombstones discard
-- decode pool: per-job memo over the log (mapping writes land inside the
-  barrier fence, between jobs); anything but Present on a drained record
-  is fatal except ForeignDb / pre-horizon skips
+  behind its marker barrier, Present ordinary → raw decode under the
+  commit-resolution descriptor, Ambiguous → fatal fail-closed,
+  tombstones discard
+- planning: descriptors ride each heap's envelope from the buffering /
+  stash step; the planner never re-resolves ([emitter.md](emitter.md))
 - TRUNCATE fan-out resolves by oid; the barrier apply falls back to the
   rfn chain's last Present when the truncating commit itself retired the
   rfn (rotation's `Retired` lands before the truncate record)

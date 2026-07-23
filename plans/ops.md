@@ -79,8 +79,17 @@ Inventory by category:
 - `walshadow_xacts_{committed,aborted}_total`
 - `walshadow_decoder_{decoded,partial,toast_chunks,toast_malformed}_total`
 - `walshadow_emitter_{rows,blocks,xacts,unsupported_relations}_total`
-- `walshadow_decode_{resolved,fallback_raw,validate_sampled,validate_mismatches,errors}_total`
+- `walshadow_decode_{resolved,fallback_raw,errors}_total`
   (oracle path, see [shadow.md](shadow.md))
+- commit-time stash ([xact.md](xact.md)):
+  `walshadow_raw_stash_records_total{kind=dirty|marker,op}` admissions,
+  `walshadow_raw_stash_deferred_total`,
+  `walshadow_raw_stash_bytes{storage=mem|spill}`,
+  `walshadow_raw_decode_records_total{kind=toast|ordinary,op}` +
+  `walshadow_raw_decode_rows_total{op}` decode at commit resolution,
+  `walshadow_raw_pending_{rows,bytes}` fanout gauges,
+  `walshadow_stash_foreign_db_skipped_total` per-filenode foreign-db
+  discards
 - `walshadow_spill_evictions_total`, `walshadow_uptime_seconds`
 
 ### Buffer gauges

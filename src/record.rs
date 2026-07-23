@@ -106,6 +106,11 @@ pub struct Record<'a> {
     pub catalog_boundary: bool,
     /// Capture input for a catalog boundary; `Some` iff `catalog_boundary`
     pub boundary_info: Option<std::sync::Arc<BoundaryInfo>>,
+    /// Record's xact tree wrote catalog state earlier in the stream:
+    /// decoder holds raw instead of decoding with live descriptors,
+    /// commit-time capture publishes the layout this tuple was written
+    /// under
+    pub defer_catalog_decode: bool,
 }
 
 pub trait RecordSink {
@@ -194,6 +199,7 @@ impl RecordSink for CollectingRecordSink {
                 route: record.route,
                 catalog_boundary: record.catalog_boundary,
                 boundary_info: record.boundary_info.clone(),
+                defer_catalog_decode: record.defer_catalog_decode,
             });
             Ok(())
         })

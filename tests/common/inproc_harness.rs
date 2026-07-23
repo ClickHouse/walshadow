@@ -35,9 +35,7 @@ use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::mapping::{
-    ColumnMapping, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
-};
+use walshadow::mapping::{ColumnMapping, NamespaceMapping, TableMapping, TableTarget};
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle, TailKind};
@@ -537,6 +535,9 @@ pub struct Pipeline {
     /// Same `EmitterStats` Arc the daemon exports to Prometheus; lets tests
     /// assert the parallel path keeps the emitter counters live.
     pub stats: Arc<EmitterStats>,
+    /// Live descriptor-log handle: interval-semantics assertions against
+    /// real captured history.
+    pub desc_log: Arc<walshadow::desc_log::DescriptorLog>,
 }
 
 impl Pipeline {
@@ -724,6 +725,9 @@ async fn build_pipeline_inner(
             .seed(
                 walshadow::desc_log::BatchRecord {
                     captured_at: covered_through,
+                    commit_lsn: 0,
+                    observations: Vec::new(),
+                    ambiguities: Vec::new(),
                     entries,
                 },
                 covered_through,
@@ -735,7 +739,7 @@ async fn build_pipeline_inner(
     tune(&mut emitter_cfg);
 
     // SIGHUP-reloadable mapping shared by the DDL applicator + decode pool.
-    let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(emitter_cfg.tables.clone()));
+    let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
     // Resolver seeds the DDL applicator's live config layers and takes the
     // runtime-config WAL apply (harness injects no config writes, so it stays
     // at the boot snapshot). No SIGHUP task here.
@@ -831,7 +835,7 @@ async fn build_pipeline_inner(
         decoder = decoder.with_config_schema(Arc::from(schema));
     }
     let capture = walshadow::catalog_capture::CatalogCapture::new(
-        desc_log,
+        desc_log.clone(),
         catalog.clone(),
         xact_buffer.clone(),
         smgr_markers,
@@ -858,6 +862,7 @@ async fn build_pipeline_inner(
         ack: emitter_ack,
         resume_floor,
         stats,
+        desc_log,
     }
 }
 
@@ -937,6 +942,43 @@ pub async fn wait_query(ch: &ChServer, sql: &str, want: &str, what: &str) {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Pipe multi-line SQL through one delayed psql session, preserving explicit transactions
+pub fn spawn_txn(source: &Shadow, body: &str) -> std::thread::JoinHandle<()> {
+    let sock = source.config().socket_dir.clone();
+    let port = source.config().port;
+    let sql = body.to_owned();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let mut child = Command::new("psql")
+            .args([
+                "-h",
+                sock.to_str().unwrap(),
+                "-p",
+                &port.to_string(),
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-f",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn psql");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(sql.as_bytes())
+            .unwrap();
+        let _ = child.wait();
+    })
 }
 
 /// Driver thread that fires a sequence of `-c` statements at the source

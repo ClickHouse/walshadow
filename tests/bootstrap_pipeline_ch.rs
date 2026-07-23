@@ -28,7 +28,7 @@ use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::heap_decoder::ColumnValue;
-use walshadow::mapping::{ColumnMapping, MappingHandle, TableMapping, TableTarget};
+use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::BatcherMsg;
 use walshadow::pipeline::{Fatal, bootstrap, tail};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
@@ -143,7 +143,7 @@ async fn bootstrap_tail_fans_out_n2() {
     let mut catalog = CatalogMap::new();
     catalog.insert(rel(16400, "foo"));
     catalog.insert(rel(16401, "baz"));
-    let mapping: MappingHandle = Arc::new(tokio::sync::RwLock::new(cfg.tables.clone()));
+    let mapping = walshadow::mapping::mapping_handle(cfg.tables.clone());
 
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
@@ -182,6 +182,8 @@ async fn bootstrap_tail_fans_out_n2() {
             std::env::temp_dir().join("ws-bootstrap-ch-unused.bin"),
             walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
         ),
+        false,
+        None,
     ));
     let outcome = drain.await.expect("drain join").expect("drain ok");
     assert_eq!(outcome.next_seq, 2, "one seq per rfn");

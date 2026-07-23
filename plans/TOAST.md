@@ -205,9 +205,9 @@ logically-logged rels, never toast):
   fetchable. Filenodes unresolvable post-commit (created-and-dropped in
   one xact, or rotated by a later replayed commit) discard their records
   (`toast_stash_discarded`) — access-exclusive supersession makes that
-  end-state-neutral. Records resolving to ordinary heaps stay fenced off
-  (`toast_stash_skipped`); lifting the fence is
-  [future/xact_stash.md](future/xact_stash.md) scope. A toast
+  end-state-neutral. Records resolving to ordinary heaps decode at drain
+  under their commit-resolution descriptor ([xact.md](xact.md)
+  Commit-time stash). A toast
   resolution without its marker (observation began
   mid-xact) fails closed — fresh snapshot — rather than emitting an
   unauditable partial generation. Physical copies (SET TABLESPACE / SET

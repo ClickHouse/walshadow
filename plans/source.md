@@ -263,8 +263,8 @@ WAL at last COMMIT, kill-restart idle catchup never resolves
 
 [`src/boundary_hold.rs`](../src/boundary_hold.rs). At a
 `catalog_boundary` commit the pump must not publish successor bytes
-until shadow replays through the commit's `next_lsn` — the seam future
-catalog capture samples shadow at ([future/xact_stash.md](future/xact_stash.md))
+until shadow replays through the commit's `next_lsn` — the seam
+descriptor capture samples shadow at ([desc_log.md](desc_log.md))
 
 [`BoundaryHoldSink`](../src/boundary_hold.rs) wraps
 `QueueingRecordSink` in the daemon's sink chain and blocks inside

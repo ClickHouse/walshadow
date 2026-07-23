@@ -15,11 +15,18 @@
 //! ```text
 //! [2 bytes "WS" magic] [u16 LE version] then repeating:
 //! [u8 tag] [u32 len LE] [body of `len` bytes]
-//!   tag = 0 → SpillEntry::Heap        (body = encoded DecodedHeap)
+//!   tag = 0 → SpillEntry::Heap        (body = u32 dict id + encoded DecodedHeap)
 //!   tag = 1 → SpillEntry::Chunk       (body = encoded ToastChunk)
 //!   tag = 2 → SpillEntry::ToastDelete (body = encoded ToastDelete)
 //!   tag = 3 → SpillEntry::Raw         (body = encoded RawRecord)
+//!   tag = 4 → descriptor dictionary   (body = u64 valid_from + descriptor)
 //! ```
+//!
+//! Tag 4 never surfaces as an entry: each distinct `(rfn, valid_from)`
+//! descriptor writes once before its first referencing heap, so spilled
+//! [`DescribedHeap`]s rehydrate the exact attached descriptor without a
+//! live log lookup (file stays self-contained; capture landing mid-spill
+//! can't reinterpret rows)
 //!
 //! Version bumps on any body-encoding change. Files don't survive a restart
 //! (resume contract wipes the dir), so magic + version is self-check honesty:
@@ -50,13 +57,17 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use walrus::pg::walparser::RelFileNode;
 
-use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer};
+use crate::catalog::desc_log::{decode_descriptor_bytes, encode_descriptor_bytes};
+use crate::decode::heap_decoder::{
+    ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
+};
+use crate::schema::RelDescriptor;
 
 /// Heap tuples + TOAST chunks share the file: both flush at commit drain,
 /// WAL-aligned ordering keeps the drain a single linear read
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpillEntry {
-    Heap(Box<DecodedHeap>),
+    Heap(Box<DescribedHeap>),
     Chunk(ToastChunk),
     ToastDelete(ToastDelete),
     /// Undecoded record on a filenode invisible at record time (same-xact
@@ -72,6 +83,10 @@ pub enum SpillEntry {
 /// `src/backend/access/heap/heapam.c`) still decodes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawRecord {
+    /// Original writer xid from the record header — a subxact's own xid,
+    /// surviving merge into the top-level stream, so raw-decoded rows keep
+    /// the same `_xid` the live decode path would have emitted
+    pub xid: u32,
     pub rm: u8,
     pub info: u8,
     pub source_lsn: u64,
@@ -105,6 +120,7 @@ impl RawRecord {
         page_magic: u16,
     ) -> Self {
         Self {
+            xid: parsed.header.xact_id,
             rm: parsed.header.resource_manager_id,
             info: parsed.header.info,
             source_lsn,
@@ -132,8 +148,9 @@ impl RawRecord {
         }
     }
 
-    /// Rebuild a borrowed record for the shared heap decoder. `xact_id` /
-    /// CRC are irrelevant post-commit and stay zero.
+    /// Rebuild a borrowed record for the shared heap decoder. `xact_id` is
+    /// restored so decoded heaps keep the writer's `_xid`; CRC is
+    /// irrelevant post-commit and stays zero.
     pub fn to_xlog_record(&self) -> walrus::pg::walparser::XLogRecord<'_> {
         use walrus::pg::walparser::{
             BlockLocation, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
@@ -141,6 +158,7 @@ impl RawRecord {
         };
         XLogRecord {
             header: XLogRecordHeader {
+                xact_id: self.xid,
                 info: self.info,
                 resource_manager_id: self.rm,
                 ..Default::default()
@@ -238,11 +256,13 @@ pub type Result<T> = std::result::Result<T, SpillError>;
 
 /// ASCII for `xxd`-friendly debug
 pub const SPILL_MAGIC: [u8; 2] = *b"WS";
-/// v2 added `HeapOp::Truncate` tag-4 body encoding. v3 added chunk TIDs and
-/// `ToastDelete` entries. v4 added tag-3 `Raw` stashed records. `DrainEntry`
-/// events (Catalog, ToastBarrier, and Config/Signal per the runtime-config
-/// plan) are drain-time, never spilled, so they don't touch this format
-pub const SPILL_VERSION: u16 = 4;
+/// v2 added `HeapOp::Truncate` body encoding. v3 added chunk TIDs and
+/// `ToastDelete` entries. v4 added tag-3 `Raw` stashed records. v5 added
+/// tag-4 descriptor dictionary (Heap bodies reference descriptors by dict
+/// id). v6 added writer xid to heap + raw bodies. `DrainEntry` events
+/// (Catalog, ToastBarrier, Config/Signal) are drain-time, never spilled,
+/// so they don't touch this format
+pub const SPILL_VERSION: u16 = 6;
 
 pub struct SpillStore {
     dir: PathBuf,
@@ -277,6 +297,7 @@ impl SpillStore {
             file,
             path,
             byte_count: header.len() as u64,
+            dict: std::collections::HashMap::new(),
         })
     }
 
@@ -457,6 +478,8 @@ pub struct SpillWriter {
     file: File,
     path: PathBuf,
     byte_count: u64,
+    /// Descriptor dictionary ids by log identity, assigned in first-use order
+    dict: std::collections::HashMap<(RelFileNode, u64), u32>,
 }
 
 impl SpillWriter {
@@ -470,25 +493,28 @@ impl SpillWriter {
 
     pub async fn write(&mut self, entry: &SpillEntry) -> Result<()> {
         let mut body = Vec::with_capacity(128);
-        let tag: u8 = match entry {
-            SpillEntry::Heap(_) => 0,
-            SpillEntry::Chunk(_) => 1,
-            SpillEntry::ToastDelete(_) => 2,
-            SpillEntry::Raw(_) => 3,
-        };
-        body.push(tag);
-        // u32 LE length placeholder, back-patched after body appends in place
-        let len_off = body.len();
-        body.extend_from_slice(&[0u8; 4]);
-        let inner_start = body.len();
         match entry {
-            SpillEntry::Heap(h) => encode_heap_into(&mut body, h),
-            SpillEntry::Chunk(c) => encode_chunk_into(&mut body, c),
-            SpillEntry::ToastDelete(d) => encode_toast_delete_into(&mut body, d),
-            SpillEntry::Raw(r) => encode_raw_into(&mut body, r),
+            SpillEntry::Heap(h) => {
+                let key = (h.descriptor.rfn, h.descriptor_valid_from);
+                let next_id = self.dict.len() as u32;
+                let id = *self.dict.entry(key).or_insert(next_id);
+                if id == next_id {
+                    frame_into(&mut body, 4, |out| {
+                        push_u64(out, h.descriptor_valid_from);
+                        encode_descriptor_bytes(out, &h.descriptor);
+                    });
+                }
+                frame_into(&mut body, 0, |out| {
+                    push_u32(out, id);
+                    encode_heap_into(out, &h.decoded);
+                });
+            }
+            SpillEntry::Chunk(c) => frame_into(&mut body, 1, |out| encode_chunk_into(out, c)),
+            SpillEntry::ToastDelete(d) => {
+                frame_into(&mut body, 2, |out| encode_toast_delete_into(out, d))
+            }
+            SpillEntry::Raw(r) => frame_into(&mut body, 3, |out| encode_raw_into(out, r)),
         }
-        let inner_len = (body.len() - inner_start) as u32;
-        body[len_off..len_off + 4].copy_from_slice(&inner_len.to_le_bytes());
         self.file.write_all(&body).await?;
         self.byte_count += body.len() as u64;
         Ok(())
@@ -505,6 +531,7 @@ impl SpillWriter {
             file,
             path: self.path,
             header_checked: false,
+            dict: Vec::new(),
         })
     }
 
@@ -512,6 +539,17 @@ impl SpillWriter {
     pub async fn unlink(self) -> Result<()> {
         unlink_file(self.file, &self.path).await
     }
+}
+
+/// `[tag][u32 len LE][body]`, length back-patched after `f` appends in place
+fn frame_into(out: &mut Vec<u8>, tag: u8, f: impl FnOnce(&mut Vec<u8>)) {
+    out.push(tag);
+    let len_off = out.len();
+    out.extend_from_slice(&[0u8; 4]);
+    let inner_start = out.len();
+    f(out);
+    let inner_len = (out.len() - inner_start) as u32;
+    out[len_off..len_off + 4].copy_from_slice(&inner_len.to_le_bytes());
 }
 
 /// Drop `file`, remove `path`, tolerating already-gone (abort races,
@@ -531,6 +569,9 @@ pub struct SpillReader {
     /// Lazy header check: first `next()` verifies [`SPILL_MAGIC`] + version,
     /// so a stale on-disk spill fails cleanly with [`SpillError::Format`]
     header_checked: bool,
+    /// Descriptor dictionary rebuilt from tag-4 records in write order;
+    /// heap bodies reference by index
+    dict: Vec<(Arc<RelDescriptor>, u64)>,
 }
 
 impl SpillReader {
@@ -566,51 +607,74 @@ impl SpillReader {
         Ok(())
     }
 
-    /// One entry per call; `Ok(None)` at clean EOF
+    /// One entry per call; `Ok(None)` at clean EOF. Tag-4 dictionary
+    /// records fold into `dict` and never surface
     pub async fn next(&mut self) -> Result<Option<SpillEntry>> {
         if !self.header_checked {
             self.check_header().await?;
         }
-        let mut tag_buf = [0u8; 1];
-        match self.file.read_exact(&mut tag_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
+        loop {
+            let mut tag_buf = [0u8; 1];
+            match self.file.read_exact(&mut tag_buf).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+            let mut len_buf = [0u8; 4];
+            self.file.read_exact(&mut len_buf).await?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; len];
+            self.file.read_exact(&mut body).await?;
+            let mut cur = Cursor::new(&body);
+            let entry = match tag_buf[0] {
+                0 => {
+                    let dict_id = cur.u32()? as usize;
+                    let h = decode_heap(&mut cur)?;
+                    let Some((descriptor, valid_from)) = self.dict.get(dict_id).cloned() else {
+                        return Err(SpillError::Format {
+                            offset: cur.pos,
+                            detail: format!(
+                                "heap references dict id {dict_id}, only {} defined",
+                                self.dict.len(),
+                            ),
+                        });
+                    };
+                    SpillEntry::Heap(Box::new(DescribedHeap {
+                        decoded: h,
+                        descriptor,
+                        descriptor_valid_from: valid_from,
+                    }))
+                }
+                1 => SpillEntry::Chunk(decode_chunk(&mut cur)?),
+                2 => SpillEntry::ToastDelete(decode_toast_delete(&mut cur)?),
+                3 => SpillEntry::Raw(Box::new(decode_raw(&mut cur)?)),
+                4 => {
+                    let valid_from = cur.u64()?;
+                    let (d, used) =
+                        decode_descriptor_bytes(&body[cur.pos..]).map_err(|detail| {
+                            SpillError::Format {
+                                offset: cur.pos,
+                                detail,
+                            }
+                        })?;
+                    if cur.pos + used != len {
+                        return Err(SpillError::Format {
+                            offset: cur.pos + used,
+                            detail: "descriptor body length mismatch".into(),
+                        });
+                    }
+                    self.dict.push((Arc::new(d), valid_from));
+                    continue;
+                }
+                other => {
+                    return Err(SpillError::Format {
+                        offset: 0,
+                        detail: format!("unknown entry tag {other}"),
+                    });
+                }
+            };
+            return Ok(Some(entry));
         }
-        let mut len_buf = [0u8; 4];
-        self.file.read_exact(&mut len_buf).await?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut body = vec![0u8; len];
-        self.file.read_exact(&mut body).await?;
-        let entry = match tag_buf[0] {
-            0 => {
-                let mut cur = Cursor::new(&body);
-                let h = decode_heap(&mut cur)?;
-                SpillEntry::Heap(Box::new(h))
-            }
-            1 => {
-                let mut cur = Cursor::new(&body);
-                let c = decode_chunk(&mut cur)?;
-                SpillEntry::Chunk(c)
-            }
-            2 => {
-                let mut cur = Cursor::new(&body);
-                let d = decode_toast_delete(&mut cur)?;
-                SpillEntry::ToastDelete(d)
-            }
-            3 => {
-                let mut cur = Cursor::new(&body);
-                let r = decode_raw(&mut cur)?;
-                SpillEntry::Raw(Box::new(r))
-            }
-            other => {
-                return Err(SpillError::Format {
-                    offset: 0,
-                    detail: format!("unknown entry tag {other}"),
-                });
-            }
-        };
-        Ok(Some(entry))
     }
 
     pub async fn unlink(self) -> Result<()> {
@@ -646,7 +710,8 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
     push_bytes(out, s.as_bytes());
 }
 
-fn encode_heap_into(out: &mut Vec<u8>, h: &DecodedHeap) {
+/// Shared with the plan spool: one heap's frame-body bytes
+pub(crate) fn encode_heap_into(out: &mut Vec<u8>, h: &DecodedHeap) {
     push_u32(out, h.rfn.spc_node);
     push_u32(out, h.rfn.db_node);
     push_u32(out, h.rfn.rel_node);
@@ -826,6 +891,7 @@ fn encode_toast_delete_into(out: &mut Vec<u8>, d: &ToastDelete) {
 
 fn encode_raw_into(out: &mut Vec<u8>, r: &RawRecord) {
     out.reserve(32 + r.approx_bytes());
+    push_u32(out, r.xid);
     push_u8(out, r.rm);
     push_u8(out, r.info);
     push_u64(out, r.source_lsn);
@@ -859,6 +925,10 @@ pub(crate) struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
 
     fn need(&mut self, n: usize) -> Result<&'a [u8]> {
@@ -910,7 +980,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn decode_heap(c: &mut Cursor) -> Result<DecodedHeap> {
+pub(crate) fn decode_heap(c: &mut Cursor) -> Result<DecodedHeap> {
     let spc_node = c.u32()?;
     let db_node = c.u32()?;
     let rel_node = c.u32()?;
@@ -1087,6 +1157,7 @@ fn decode_toast_delete(c: &mut Cursor) -> Result<ToastDelete> {
 }
 
 fn decode_raw(c: &mut Cursor) -> Result<RawRecord> {
+    let xid = c.u32()?;
     let rm = c.u8()?;
     let info = c.u8()?;
     let source_lsn = c.u64()?;
@@ -1112,6 +1183,7 @@ fn decode_raw(c: &mut Cursor) -> Result<RawRecord> {
         });
     }
     Ok(RawRecord {
+        xid,
         rm,
         info,
         source_lsn,
@@ -1126,32 +1198,69 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn sample_heap(xid: u32, lsn: u64) -> DecodedHeap {
-        DecodedHeap {
+    fn sample_descriptor(rel_node: u32) -> Arc<RelDescriptor> {
+        Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
                 db_node: 5,
-                rel_node: 16385,
+                rel_node,
             },
-            xid,
-            source_lsn: lsn,
-            op: HeapOp::Insert,
-            new: Some(DecodedTuple {
-                columns: vec![
-                    Some(ColumnValue::Int4(7)),
-                    Some(ColumnValue::Text("hello".into())),
-                    None,
-                    Some(ColumnValue::Null),
-                    Some(ColumnValue::ExternalToast(ToastPointer {
-                        va_rawsize: 1024,
-                        va_extinfo: 0x80000200,
-                        va_valueid: 99,
-                        va_toastrelid: 16400,
-                    })),
-                ],
-                partial: false,
-            }),
-            old: None,
+            oid: rel_node,
+            toast_oid: 16400,
+            namespace_oid: 2200,
+            rel_name: crate::schema::RelName::new("public", "spill_t"),
+            kind: 'r',
+            persistence: 'p',
+            replident: crate::schema::ReplIdent::Full {
+                pk_attnums: Some(vec![1]),
+            },
+            attributes: vec![crate::schema::RelAttr {
+                attnum: 1,
+                name: "id".into(),
+                type_oid: 23,
+                typmod: -1,
+                not_null: true,
+                dropped: false,
+                type_name: "int4".into(),
+                type_byval: true,
+                type_len: 4,
+                type_align: 'i',
+                type_storage: 'p',
+                missing_text: None,
+            }],
+        })
+    }
+
+    fn sample_heap(xid: u32, lsn: u64) -> DescribedHeap {
+        DescribedHeap {
+            decoded: DecodedHeap {
+                rfn: RelFileNode {
+                    spc_node: 1663,
+                    db_node: 5,
+                    rel_node: 16385,
+                },
+                xid,
+                source_lsn: lsn,
+                op: HeapOp::Insert,
+                new: Some(DecodedTuple {
+                    columns: vec![
+                        Some(ColumnValue::Int4(7)),
+                        Some(ColumnValue::Text("hello".into())),
+                        None,
+                        Some(ColumnValue::Null),
+                        Some(ColumnValue::ExternalToast(ToastPointer {
+                            va_rawsize: 1024,
+                            va_extinfo: 0x80000200,
+                            va_valueid: 99,
+                            va_toastrelid: 16400,
+                        })),
+                    ],
+                    partial: false,
+                }),
+                old: None,
+            },
+            descriptor: sample_descriptor(16385),
+            descriptor_valid_from: 0x1000,
         }
     }
 
@@ -1183,10 +1292,12 @@ mod tests {
         let mut r = w.finish().await.unwrap();
         match r.next().await.unwrap().unwrap() {
             SpillEntry::Heap(b) => {
-                assert_eq!(b.xid, 42);
-                assert_eq!(b.source_lsn, 0x2000);
-                assert_eq!(b.new.as_ref().unwrap().columns.len(), 5);
-                let cols = &b.new.as_ref().unwrap().columns;
+                assert_eq!(b.decoded.xid, 42);
+                assert_eq!(b.decoded.source_lsn, 0x2000);
+                assert_eq!(b.descriptor_valid_from, 0x1000);
+                assert_eq!(b.descriptor, sample_descriptor(16385));
+                assert_eq!(b.decoded.new.as_ref().unwrap().columns.len(), 5);
+                let cols = &b.decoded.new.as_ref().unwrap().columns;
                 assert!(matches!(cols[0], Some(ColumnValue::Int4(7))));
                 assert!(matches!(cols[1], Some(ColumnValue::Text(ref t)) if t == "hello"));
                 assert!(cols[2].is_none());
@@ -1238,6 +1349,7 @@ mod tests {
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let mut w = store.writer(9, 0x300).await.unwrap();
         let raw = RawRecord {
+            xid: 77,
             rm: 10,
             info: 0x80,
             source_lsn: 0x4242,
@@ -1267,6 +1379,7 @@ mod tests {
             SpillEntry::Raw(got) => {
                 assert_eq!(*got, raw);
                 let rec = got.to_xlog_record();
+                assert_eq!(rec.header.xact_id, 77, "writer xid restored for _xid");
                 assert_eq!(rec.header.resource_manager_id, 10);
                 assert_eq!(rec.header.info, 0x80);
                 assert_eq!(rec.blocks.len(), 1);
@@ -1412,11 +1525,37 @@ mod tests {
             file: OpenOptions::new().read(true).open(&path).await.unwrap(),
             path,
             header_checked: false,
+            dict: Vec::new(),
         };
         let err = r.next().await.expect_err("must error on bad tag");
         match err {
             SpillError::Format { detail, .. } => {
                 assert!(detail.contains("unknown entry tag"), "{detail}");
+            }
+            other => panic!("expected Format, got {other:?}"),
+        }
+    }
+
+    /// Pre-xid spill format (v5) fails closed at open; startup wipes the
+    /// spill dir, so rejection is self-check honesty, never migration
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_version_surfaces_format_error() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("xid-0000000000-0000000000000000.bin");
+        let mut bytes = Vec::with_capacity(4);
+        bytes.extend_from_slice(&SPILL_MAGIC);
+        bytes.extend_from_slice(&5u16.to_le_bytes());
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        let mut r = SpillReader {
+            file: OpenOptions::new().read(true).open(&path).await.unwrap(),
+            path,
+            header_checked: false,
+            dict: Vec::new(),
+        };
+        let err = r.next().await.expect_err("must error on old version");
+        match err {
+            SpillError::Format { detail, .. } => {
+                assert!(detail.contains("unsupported spill version 5"), "{detail}");
             }
             other => panic!("expected Format, got {other:?}"),
         }
@@ -1433,6 +1572,7 @@ mod tests {
             file: OpenOptions::new().read(true).open(&path).await.unwrap(),
             path,
             header_checked: false,
+            dict: Vec::new(),
         };
         let err = r.next().await.expect_err("must error on missing magic");
         match err {
@@ -1537,13 +1677,13 @@ mod tests {
             HeapOp::Truncate,
         ] {
             let mut h = sample_heap(11, 0x600);
-            h.op = op;
+            h.decoded.op = op;
             if matches!(op, HeapOp::Truncate) {
                 // Truncate carries no tuple payload
-                h.new = None;
-                h.old = None;
+                h.decoded.new = None;
+                h.decoded.old = None;
             } else {
-                h.old = Some(DecodedTuple {
+                h.decoded.old = Some(DecodedTuple {
                     columns: vec![Some(ColumnValue::Int4(42))],
                     partial: false,
                 });
@@ -1555,7 +1695,7 @@ mod tests {
         let mut ops = Vec::new();
         while let Some(e) = r.next().await.unwrap() {
             if let SpillEntry::Heap(b) = e {
-                ops.push(b.op);
+                ops.push(b.decoded.op);
             }
         }
         assert_eq!(

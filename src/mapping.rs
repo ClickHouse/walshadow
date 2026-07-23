@@ -100,7 +100,17 @@ pub struct ToastConfig {
     pub mode: ToastMode,
 }
 
-pub type MappingHandle = Arc<tokio::sync::RwLock<HashMap<RelName, TableMapping>>>;
+/// Immutable routing-map version. Planners snapshot one per transaction so a
+/// concurrent republish can't split a transaction across mapping versions
+pub type MappingSnapshot = Arc<HashMap<RelName, TableMapping>>;
+
+/// Shared copy-on-write routing map: writers swap or `Arc::make_mut` the
+/// inner snapshot, held snapshots stay frozen
+pub type MappingHandle = Arc<tokio::sync::RwLock<MappingSnapshot>>;
+
+pub fn mapping_handle(tables: HashMap<RelName, TableMapping>) -> MappingHandle {
+    Arc::new(tokio::sync::RwLock::new(Arc::new(tables)))
+}
 
 pub fn derive_columns_for_mapping(desc: &RelDescriptor) -> Vec<ColumnMapping> {
     let keys = replident_key_attnums(desc);
@@ -147,4 +157,40 @@ pub fn fold_diff_into_mapping(target: &mut TableMapping, new: &RelDescriptor, di
 
 fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_table() -> (RelName, HashMap<RelName, TableMapping>) {
+        let rel = RelName::new("public", "t");
+        let map = HashMap::from([(
+            rel.clone(),
+            TableMapping {
+                target: TableTarget::new("db", "t"),
+                columns: vec![],
+            },
+        )]);
+        (rel, map)
+    }
+
+    /// Held snapshot stays frozen under both writer shapes — a planned
+    /// transaction's route state can't be altered by a later mapping write
+    #[tokio::test]
+    async fn snapshot_immune_to_later_writes() {
+        let (rel, map) = one_table();
+        let handle = mapping_handle(map);
+        // Applicator shape: make_mut clones out from under held snapshots
+        let planned: MappingSnapshot = handle.read().await.clone();
+        Arc::make_mut(&mut *handle.write().await).remove(&rel);
+        assert!(planned.contains_key(&rel), "snapshot keeps its version");
+        assert!(!handle.read().await.contains_key(&rel), "handle moved on");
+        // Republish shape: full inner-Arc swap
+        let planned = handle.read().await.clone();
+        let (rel2, map2) = one_table();
+        *handle.write().await = Arc::new(map2);
+        assert!(!planned.contains_key(&rel2), "snapshot predates the swap");
+        assert!(handle.read().await.contains_key(&rel2));
+    }
 }

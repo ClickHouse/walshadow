@@ -325,6 +325,7 @@ async fn pump_throughput_breakdown() {
                         route: r.route,
                         catalog_boundary: r.catalog_boundary,
                         boundary_info: r.boundary_info.clone(),
+                        defer_catalog_decode: r.defer_catalog_decode,
                     };
                     // Push then immediately pop to drop, so we measure
                     // clone+drop without growing memory unboundedly.

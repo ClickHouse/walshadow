@@ -147,23 +147,25 @@ enum DrainEntry {
 
 `DrainEntry::Config` events ride the same `ordered_events` interleave and barrier
 apply as `DrainEntry::Catalog`: interpreted events stamp `(xid, source_lsn)` and
-merge into the heap stream by LSN, so a config row preceding heap writes in WAL
-position applies before those writes drain. One apply site owns the enum: the
-pipeline's `run_barrier_batch` in
-[`pipeline/reorder.rs`](../src/emit/pipeline/reorder.rs), walking
-`DrainedBatch::into_walk` steps.
+merge into the heap stream by LSN. One apply site owns the enum: the executor's
+plan replay in [`pipeline/reorder.rs`](../src/emit/pipeline/reorder.rs), each
+control entry fenced and applied at its pinned walk position.
 
 `ConfigResolver::apply_config_event` mutates the overlay, **writes the live
 `MappingHandle` synchronously under the barrier fence**, bumps
 `invalidation_epoch` for shape-changing (`Column*`) events, then republishes.
-The fenced map write is what makes trailing rows in the applying xact route
-against the post-config mapping — the same discipline DDL uses writing
-`ShadowCatalog` + bumping the epoch before its trailing heaps dispatch. Routing
-through the async `watch`→refresher hop instead would let `run_barrier` dispatch
-the trailing segment before the swap took effect, and the decode worker would
-miss the mapping and silently drop the row. So WAL config apply writes the map
-directly; `watch` republish stays the mechanism only for the barrier-free
+`watch` republish stays the mechanism only for the barrier-free
 contexts (boot seed, SIGHUP) and the DDL applicator's own `DdlConfig` refresh.
+
+Granularity is whole-transaction ([emitter.md](emitter.md) Transaction
+planner): each transaction plans entirely under one frozen route state.
+The planner's route view folds in-walk **catalog** entries into its
+local view (an auto-create `Added` routes same-xact trailing rows), but
+**config** entries deliberately do not — a transaction planned before a
+config commit routes wholly under pre-config state, one planned after
+wholly under post; no transaction ever mixes route versions, and a
+config row never retroactively re-routes its own xact's rows. The real
+side effect lands once, at executor replay, under the fence.
 
 ## Boot seed
 
@@ -262,7 +264,8 @@ Consumers snapshot the receiver; the overlay feeds only the resolver merge
 point, not the consumer set. Four consumers:
 
 - **Routing map refresher** (`spawn_mapping_refresher`, `bin/stream.rs`) — on
-  each republish full-swaps the live `MappingHandle` the decode pool reads. (The
+  each republish full-swaps the live `MappingHandle` the planner's route view
+  resolves from. (The
   WAL apply path writes this handle directly under the fence; the refresher
   covers the barrier-free republishes)
 - **DDL applicator** ([`ch_ddl::DdlApplicator`](../src/ch_ddl.rs)) — folds a
@@ -328,9 +331,10 @@ observability live in
 - **Namespace flip.** TOML `auto_create = false`; operator inserts
   `config_namespace ('public', 'default', true)`. Subsequent
   `CREATE TABLE public.events(...)` materialises on CH
-- **Mapping-add ordering.** Single xact `INSERT config_table` then rows into the
-  now-mapped table. CH receives the rows under the post-config target, proving
-  the within-xact fenced-map write
+- **Mapping-add ordering.** `INSERT config_table` commits, then rows into the
+  now-mapped table commit. CH receives the rows under the post-config target;
+  a transaction planned before the opt-in commit instead discards whole
+  (whole-transaction granularity, never a mixed-route xact)
 - **Batch tunables live.** `config_global.row_budget = 1000`,
   `flush_timeout_ms = 250`; emitter flushes at the smaller trigger. Bump to 100k
   and observe larger batches — batcher picks up the resolved snapshot mid-pipeline
