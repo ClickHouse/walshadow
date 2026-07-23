@@ -96,7 +96,8 @@ Component docs live alongside this overview:
 - [config.md](config.md) + [add_table.md](add_table.md) — layered live
   config, source-PG overlay, per-table opt-in, and initial-load modes
 - [emitter.md](emitter.md) — parallel decode+insert pipeline
-  (`src/pipeline/`): reorder coordinator → decode pool ×M →
+  (`src/pipeline/`): reorder coordinator (side-effect-free transaction
+  plan, then execute) → decode pool ×M →
   `InsertBatcher` (seal complete INSERTs on deadline / row / byte
   budget) → inserter pool ×N → contiguous-done ack watermark;
   resident-payload permit pool bounding payload bytes across stages;
@@ -112,10 +113,9 @@ Component docs live alongside this overview:
   `manifest.toml` (six LSNs + resolved floor + source identity),
   durable TOAST retirement ledger, per-xact `commit_lsn` carrier, slot
   advance on `min(shadow_replay, emitter_ack)`
-- [oracle.md](oracle.md) — differential decode oracle: re-encode +
-  `SELECT $1::bytea::<typ>::text` round-trip against shadow,
-  `--validate <N>` sampling, walshadow PG extension (`pgext/`) exposing
-  `walshadow_decode_disk(oid, bytea) -> text` for Tier 3 types
+- [oracle.md](oracle.md) — PgPending resolver: walshadow PG extension
+  (`pgext/`) exposing `walshadow_decode_disk(oid, bytea) -> text` for
+  Tier 3 types, best-effort resolution at the decode pool
 - [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
   — clickhouse-c-rs unsafe surface (audited 2026-05-17 at `b5af579`):
   `Client` ownership of `PosixIo`/`Codec`, `&[u8]` over
@@ -188,10 +188,9 @@ Source pinned at `wal_level=logical` + a usable replica-identity key
 
 ### v1.1
 
-4. `--validate` catches a planted decoder regression on the first
-   sampled row of the bad type. **Live** via differential oracle +
-   `pgext/`; absent extension surfaces as `oracle fallback=N` and
-   raw-bytes pass-through for `PgPending`
+4. Tier 3 types outside the local codec matrix reach CH as PG-rendered
+   text. **Live** via oracle + `pgext/`; absent extension surfaces as
+   `oracle fallback=N` and raw-bytes pass-through for `PgPending`
 5. `kill -9` of walshadow mid-workload, restart, CH end-state matches
    non-interrupted run modulo merge transients. **Code-complete.**
    `tests/kill_restart.rs` exercises three kill strategies × five

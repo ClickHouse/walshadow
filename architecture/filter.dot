@@ -5,8 +5,8 @@
 // decision sub-table off to the side.
 //
 // regeneration spec:
-// sources of truth: plans/filter.md · src/filter.rs · src/catalog_tracker.rs · src/rewrite.rs
-// subsumes: plans/filter.md § "Filter contract" + "Rewrite over fork"
+// sources of truth: plans/filter.md · src/filter/{engine,dirty_tree}.rs · src/filter/catalog_tracker.rs · src/filter/rewrite.rs
+// subsumes: plans/filter.md § "Filter contract" + "Dirty tree" + "Rewrite over fork"
 // quality bar:
 //   - track cluster doesn't push decide off main column
 //   - noop / rewrite siblings rank-aligned so segbuf joins cleanly
@@ -82,6 +82,12 @@ digraph filter {
   }
   observe -> nodes [style=dashed, color="#CBA85E", label="tracker.observe(rec)"];
   nodes   -> iscat [style=dashed, color="#CBA85E", label="is_catalog(db, rel)"];
+
+  // ════════ dirty tree (catalog-dirty xact families) ════════
+  dirty [label="dirty tree (dirty_tree.rs)\ncatalog touch marks writing xid;\nlinks: inline toplevel xid +\nXLOG_XACT_ASSIGNMENT\nsubxact abort drops subtree only\ncommit/abort clears family", fillcolor="#4D4D28"];
+  stamp [label="Record.defer_catalog_decode\nevery decoder-routed record of a\ndirty family → raw stash at the\ndecoder sink (see xact diagram)", fillcolor="#4D3850", shape=note];
+  observe -> dirty [style=dashed, color="#CBA85E", label="catalog write\n→ mark xid dirty"];
+  dirty   -> stamp [style=dashed, color="#CBA85E", constraint=false, label="is_dirty(xid)"];
 
   // ════════ rewrite + emit ════════
   subgraph cluster_rw {

@@ -3,13 +3,14 @@
 CH-side ingest is a parallel decode+insert pipeline (`src/pipeline/`):
 
 ```text
-pump -> QueueingRecordSink -> reorder -> [decode x M] -> InsertBatcher
-           -> [inserter x N] -> ClickHouse
+pump -> QueueingRecordSink -> reorder (plan -> execute) -> [decode x M]
+           -> InsertBatcher -> [inserter x N] -> ClickHouse
                              \-> ack collector -> emitter_ack_lsn
 ```
 
-Pipeline stages live in `src/pipeline/{reorder,decode,batcher,inserter,
-ack,tail,mod}.rs`; encoding primitives (`EmitterConfig`, `TableEncoder`,
+Pipeline stages live in `src/pipeline/{reorder,planner,plan_spool,
+decode,batcher,inserter,ack,tail,mod}.rs`; encoding primitives
+(`EmitterConfig`, `TableEncoder`,
 `TablePlan`, `ColumnBuf`, value encode, `EmitterStats`) in
 `src/ch_emitter.rs`; DDL in `src/ch_ddl.rs`; PG → CH type mapping in
 `src/type_bridge.rs`. Pool sizes M/N come from `--decoder-pool-size` /
@@ -21,9 +22,8 @@ Metrics-only runs (no `--ch-config`) stand up the same pipeline in its
 degenerate configuration: `TailKind::Null` swaps batcher + inserters
 for a swallow task that acks rows at receipt (zero CH connections), no
 `DdlApplicator` (schema events observed, never applied), empty mapping
-so the decode pool routes nothing and seqs complete at placement —
-watermark, idle advance, and slot semantics identical to a CH run.
-Oracle `--validate` sampling runs in the decode pool either way
+so planning routes nothing and seqs complete at placement —
+watermark, idle advance, and slot semantics identical to a CH run
 
 ## Purpose
 
@@ -47,11 +47,15 @@ daemon's `QueueingRecordSink` (off the WAL pump task, so replay gates
 never pace wire delivery). Only `RM_XACT_ID` records reach its match:
 
 - COMMIT — stash resolution against the descriptor log at the commit's
-  `next_lsn`, `XactBuffer::drain_committed` under the drain xid
-  (prepared xid for COMMIT PREPARED), then assign one dense `seq`,
-  `ack.register(seq, commit_lsn)`, dispatch a `DecodeJob` to the
-  decode pool. Empty commits register a rows=0 seq so the contiguous
-  watermark never gaps
+  `next_lsn`, then plan-then-execute:
+  `XactBuffer::drain_committed` under the drain xid (prepared xid for
+  COMMIT PREPARED) streams through the transaction planner into a
+  sealed plan (side-effect-free, see Planner below); `execute_plan`
+  replays it — heap segments dispatch as `DecodeJob` seqs after
+  `ack.register(seq, commit_lsn)`, control entries fence and apply at
+  their pinned positions. A plan error abandons the transaction before
+  any side effect. Empty commits register a rows=0 seq so the
+  contiguous watermark never gaps
 - ABORT — drop buffer state, register + place a rows=0 seq (never a
   direct ack bump; everything moves through the gate)
 - ASSIGNMENT — feed `SubxactTracker`
@@ -82,12 +86,60 @@ coarseness is deliberate; DDL and TRUNCATE are rare. Trailing data
 after the last event flows async, already encoding against the
 post-DDL shape
 
+### Transaction planner — `pipeline/planner.rs` + `pipeline/plan_spool.rs`
+
+Side-effect-free planning stage between drain and execution. Consumes
+committed-drain batches in walk order and streams them into one plan
+per transaction: heaps detoast and route at planning so the executor
+never re-resolves, raw stashed records decode under their commit
+verdict descriptors ([xact.md](xact.md) Commit-time stash), control
+entries pin their walk positions, mirror-row refs and truncate fences
+carry through re-based to plan-global indices. Every input-derived
+failure — descriptor, decode, toast, route — surfaces before the first
+transaction side effect; a plan error drops the writer, the file
+unlinks, the transaction emits nothing
+
+Forbidden side effects are unrepresentable, not merely avoided: the
+planner holds no ack handle, no batcher channel, no CH client, no
+config applicator. Route state folds into a `PlanRouteView` resolving
+from frozen versions; in-walk control entries fold into the LOCAL view
+only — global mapping/config/CH changes belong to the executor at
+replay. This is what makes config changes whole-transaction-granular:
+a transaction plans entirely under one route state, never mixes
+versions ([config.md](config.md)). `route_for` returning `None` is the
+deterministic unmapped discard, counted, planned as `route_id =
+u32::MAX` — it skips detoast and codec work entirely
+
+The plan itself is a transient validated spool (`plan_spool.rs`):
+plans at or below `DEFAULT_PLAN_MEM_MAX` (1 MiB) stay memory-resident
+so the common single-statement commit never touches the filesystem;
+larger plans stream to a `.plan` file. Frame layout after the `WP`
+magic + version header: `[len:u32][crc32c:u32][body]`, body tag 0 =
+heap (`dict_id + route_id + heap bytes`, spill codec), tag 1 = seal
+(`heap_count`). Bounded metadata — descriptor dictionary, route table,
+control entries, row batches — stays resident in the plan header. A
+missing seal means planning never finished; trailing bytes mean
+corruption; file-backed plans checksum-verify fully before the first
+side effect. Files are never durable: source-WAL reconstructible,
+unlinked on success and failure alike, swept at startup by
+`clean_plan_files` via the spill-dir clear
+
+Validation coverage, one enforcement point per plan-success guarantee:
+descriptor Present + unambiguous (stash verdicts at drain), operation
+supported with logical tuple data (raw operation policy), decoded xid
+owned by the xact family (`ForeignXid`), partial update fails the plan
+(`PlanError::PartialUpdate`; no reconstruction path exists), needed
+toast values resolve at planning, route snapshot complete by
+construction, planned schema transitions carry old + new descriptors
+into replay verbatim
+
 ### Decode pool — `pipeline/decode.rs`, ×M
 
-Each worker pulls a `DecodeJob` and per heap: `detoast_heap`, resolve
-descriptor via `shadow_catalog::resolve_at_pooled` (read-only pooled
-resolve, replay-LSN-gated), mapping lookup, oracle `PgPending`
-resolution + sampled validation, then routes `RoutedRow`s to the
+Each worker pulls a `DecodeJob` of planned `RoutedHeap` envelopes —
+descriptor and route ride each envelope, nothing here resolves catalog
+or mapping state. Per heap: `detoast_heap` (values already resolved at
+planning, chunks ride empty), oracle `PgPending`
+resolution, then routes `RoutedRow`s to the
 batcher in chunks (`DECODE_CHUNK_ROWS = 1024` / `DECODE_CHUNK_BYTES =
 4 MiB`, amortizing the channel hop). After the xact's last row it
 reports `Placed { seq, rows }`. Decode errors are fatal — a
@@ -354,12 +406,14 @@ columns = [
 ```
 
 `MappingHandle = Arc<tokio::sync::RwLock<HashMap<RelName, TableMapping>>>`
-is the live handle the decode pool consults per row. Handle is
-cloneable; daemon's SIGHUP task swaps whole inner `HashMap`. Routing
-picks up the swap immediately; the batcher's cached `TableEncoder`
-keeps its old `TablePlan` until the next barrier `FlushAll` (or
-restart) rebuilds it — a SIGHUP retarget therefore fully applies only
-at the next DDL/TRUNCATE boundary
+is the live handle the planner's route view resolves from. Handle is
+cloneable; daemon's SIGHUP task swaps whole inner `HashMap`. Routes
+freeze into each transaction's plan as `RouteSnapshot`s — a mapping
+write after planning can never alter a planned row, and the swap takes
+effect at the next transaction's plan. The batcher's cached
+`TableEncoder` keeps its old `TablePlan` until the next barrier
+`FlushAll` (or restart) rebuilds it — a SIGHUP retarget therefore
+fully applies only at the next DDL/TRUNCATE boundary
 
 ### NamespaceMapping (partial)
 
@@ -394,9 +448,9 @@ database
 the resolver substrate ([config.md](config.md)): `ResolvedConfig`
 (`tables` + `namespaces` + `columns` type-override table) published on a
 `watch::Receiver<Arc<ResolvedConfig>>`, CLI > PG-row > TOML merge, SIGHUP
-republish. The decode pool reads `Arc<RwLock<HashMap>>` for the per-row hot
-path; a refresher bridges the watch snapshot into it. The richer namespace
-surface is not covered:
+republish. The planner's route view reads `Arc<RwLock<HashMap>>` when
+freezing routes; a refresher bridges the watch snapshot into it. The
+richer namespace surface is not covered:
 
 - `NamespaceMapping.order_by_default`: `render_create_table` hard-codes
   `ORDER BY (_lsn)` fallback when no PK exists
@@ -504,13 +558,15 @@ but doesn't propagate through `DecodedHeap`
 
 ## Foreign-DB row skip
 
-Physical replication ships the whole cluster's WAL, so the decode pool
-sees heap records for relations in other databases. `resolve_at_pooled`
-rejects those with `CatalogError::ForeignDatabase` (filenode resolved
-to a `db_node` that's neither the shadow DB nor a shared catalog — see
-[shadow.md](shadow.md)). Worker skips the row: no route, no poison,
-bump `stats.foreign_db_rows_skipped`; the seq's placed count simply
-excludes it so the ack advances past it
+Physical replication ships the whole cluster's WAL, so heap records
+for relations in other databases reach the decoder sink. The
+record-time spanned lookup answers `ForeignDb` (filenode's `db_node`
+is neither the shadow DB nor a shared catalog — see
+[shadow.md](shadow.md)) and the sink skips the record as a counted
+`catalog_not_found`; a foreign filenode that reached the commit-time
+stash instead resolves `ForeignDb` at `resolve_stash` and counts
+`stash_foreign_db_skipped` once per filenode ([xact.md](xact.md)).
+Nothing foreign survives to planning or the decode pool
 
 ## Read-time defaults integration
 

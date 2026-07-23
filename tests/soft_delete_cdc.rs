@@ -5,7 +5,7 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
-use std::process::{Command, Stdio};
+use fx::spawn_txn;
 use std::time::Duration;
 
 use walshadow::mapping::ColumnMapping;
@@ -101,45 +101,6 @@ fn create_ch_dest(ch: &fx::ChServer) {
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create dest table");
-}
-
-fn spawn_txn(source: &Shadow, body: &str) -> std::thread::JoinHandle<()> {
-    let sock = source.config().socket_dir.clone();
-    let port = source.config().port;
-    let sql = body.to_owned();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        let mut child = Command::new("psql")
-            .args([
-                "-h",
-                sock.to_str().unwrap(),
-                "-p",
-                &port.to_string(),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-f",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn psql");
-        {
-            use std::io::Write as _;
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin piped")
-                .write_all(sql.as_bytes())
-                .unwrap();
-        }
-        let _ = child.wait();
-    })
 }
 
 async fn run_drill(

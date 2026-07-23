@@ -19,6 +19,14 @@
 //! `XLOG_SMGR_CREATE` marker (before any page write); in-place change → the
 //! oid's first pg_class touch in the xact; fallback the xact tree's first
 //! catalog touch. Dropped tombstones at `next_lsn`.
+//!
+//! Bias-early holds only when the final descriptor provably reads the whole
+//! dirty interval (`catalog::compat`). An unproven in-place transition
+//! publishes an `Ambiguity` over `[first_touch, next_lsn)` instead and
+//! lands its `Present` at `next_lsn` — post-commit rows decode, interval
+//! rows fail closed. Rotations skip the check: the rewrite emits
+//! final-layout tuples and superseded-generation rows retire with the old
+//! rfn. Fresh generations have no covered predecessor to compare.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +34,10 @@ use std::sync::Arc;
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
-use crate::catalog::desc_log::{BatchRecord, DescriptorLog, LogEntry, LogValue};
+use crate::catalog::desc_log::{
+    Ambiguity, AmbiguityReason, AmbiguityScope, BatchRecord, DescriptorLog, LogEntry, LogValue,
+    ObservationKind, RelationObservation,
+};
 use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::filter::SmgrMarkers;
 use crate::record::{BoundaryInfo, SinkError};
@@ -49,6 +60,8 @@ crate::atomic_stats! {
         pub events_added,
         pub events_changed,
         pub events_dropped,
+        /// Ambiguity intervals published for unproven in-place changes
+        pub ambiguities_published,
         /// Capture duration, nanos (inside the boundary hold)
         pub capture_nanos,
     }
@@ -222,7 +235,32 @@ impl CatalogCapture {
             .filter_map(|a| a.pg_class_touch.map(|l| (a.oid, l)))
             .collect();
 
+        // Evidence: what the boundary knew, so replay reproduces the
+        // verdict without reinferring from current catalog. Sorted for
+        // deterministic encoding (info.oids order is map-derived)
+        let mut observations: Vec<RelationObservation> = info
+            .oids
+            .iter()
+            .map(|a| RelationObservation {
+                oid: Some(a.oid),
+                rfn: None,
+                first_touch_lsn: a.pg_class_touch.unwrap_or(info.tree_first_touch),
+                smgr_create_lsn: None,
+                kind: ObservationKind::AffectedOid,
+            })
+            .collect();
+        if info.capture_all {
+            observations.push(RelationObservation {
+                oid: None,
+                rfn: None,
+                first_touch_lsn: info.tree_first_touch,
+                smgr_create_lsn: None,
+                kind: ObservationKind::FullScan,
+            });
+        }
+
         let mut entries: Vec<Arc<LogEntry>> = Vec::new();
+        let mut ambiguities: Vec<Arc<Ambiguity>> = Vec::new();
         let mut events: Vec<PendingEvent> = Vec::new();
         for oid in expected {
             let pred = self.log.predecessor_before(oid, next_lsn);
@@ -237,19 +275,29 @@ impl CatalogCapture {
                     // tablespaces must not read as "same filenode"
                     let rotated = pred_desc.as_ref().is_some_and(|old| old.rfn != desc.rfn);
                     let fresh = pred_desc.is_none();
-                    let valid_from = if rotated || fresh {
+                    // New generation: rows cannot precede the smgr create,
+                    // the marker is an exact lower bound; in-place keeps
+                    // the pg_class-touch bias-early bound
+                    let marker = if rotated || fresh {
                         self.marker_for(desc.rfn)
-                            .or_else(|| pg_class_touch.get(&oid).copied())
-                            .unwrap_or(info.tree_first_touch)
                     } else {
-                        pg_class_touch
-                            .get(&oid)
-                            .copied()
-                            .unwrap_or(info.tree_first_touch)
+                        None
                     };
+                    let first_touch = marker
+                        .or_else(|| pg_class_touch.get(&oid).copied())
+                        .unwrap_or(info.tree_first_touch);
+                    if let Some(m) = marker {
+                        observations.push(RelationObservation {
+                            oid: Some(oid),
+                            rfn: Some(desc.rfn),
+                            first_touch_lsn: first_touch,
+                            smgr_create_lsn: Some(m),
+                            kind: ObservationKind::SmgrCreate,
+                        });
+                    }
                     if rotated && let Some(old) = &pred_desc {
                         entries.push(Arc::new(LogEntry {
-                            valid_from,
+                            valid_from: first_touch,
                             oid,
                             rfn: old.rfn,
                             value: LogValue::Retired,
@@ -257,6 +305,29 @@ impl CatalogCapture {
                     }
                     let changed = pred_desc.as_deref() != Some(desc);
                     if changed {
+                        // In-place transition must prove the final
+                        // descriptor reads the whole dirty interval; a
+                        // rotation's rewrite emits final-layout tuples and
+                        // a fresh generation has no covered predecessor
+                        let mut valid_from = first_touch;
+                        if !rotated && let Some(pred) = pred_desc.as_deref() {
+                            let (from, ambiguity) =
+                                in_place_verdict(pred, desc, first_touch, next_lsn);
+                            valid_from = from;
+                            if let Some((amb, why)) = ambiguity {
+                                tracing::warn!(
+                                    target: "walshadow::desc_log",
+                                    oid,
+                                    rel = %desc.rel_name,
+                                    from = format_args!("{:#X}", amb.from_lsn),
+                                    through = format_args!("{:#X}", amb.through_lsn),
+                                    why,
+                                    "in-place change not provably decodable, ambiguity published",
+                                );
+                                ambiguities.push(Arc::new(amb));
+                                self.stats.ambiguities_published.fetch_add(1, Relaxed);
+                            }
+                        }
                         let desc = Arc::new(desc.clone());
                         entries.push(Arc::new(LogEntry {
                             valid_from,
@@ -290,11 +361,22 @@ impl CatalogCapture {
                 }
             }
         }
+        observations.sort_unstable_by_key(|o| {
+            (
+                o.kind as u8,
+                o.oid,
+                o.rfn.map(|r| (r.spc_node, r.db_node, r.rel_node)),
+                o.first_touch_lsn,
+            )
+        });
         // Zero-entry stub still appends: boot replay must distinguish
         // "captured, no shape change" from "never captured"
         self.log
             .append_batch(BatchRecord {
                 captured_at: next_lsn,
+                commit_lsn,
+                observations,
+                ambiguities,
                 entries,
             })
             .await
@@ -306,6 +388,35 @@ impl CatalogCapture {
     /// physical at capture — match on full identity
     fn marker_for(&self, rfn: RelFileNode) -> Option<u64> {
         self.markers.lock().expect("smgr markers poisoned").get(rfn)
+    }
+}
+
+/// Entry LSN for an in-place final version + the ambiguity covering the
+/// dirty interval when the final descriptor is not a proven reader of it.
+/// First pg_class touch bounds the interval; exact change positions inside
+/// stay unknown (only the first touch is tracked). Half-open end: the final
+/// version answers from `next_lsn`, keeping the post-commit descriptor
+/// usable over the ambiguous interval
+fn in_place_verdict(
+    pred: &RelDescriptor,
+    fin: &RelDescriptor,
+    first_touch: u64,
+    next_lsn: u64,
+) -> (u64, Option<(Ambiguity, &'static str)>) {
+    match crate::catalog::compat::compatible_reader(pred, fin) {
+        Ok(()) => (first_touch, None),
+        Err(why) => (
+            next_lsn,
+            Some((
+                Ambiguity {
+                    scope: AmbiguityScope::Rfn(fin.rfn),
+                    from_lsn: first_touch,
+                    through_lsn: next_lsn,
+                    reason: AmbiguityReason::UnknownMutationPosition,
+                },
+                why,
+            )),
+        ),
     }
 }
 
@@ -325,5 +436,65 @@ fn diff_event(pred: Option<&RelDescriptor>, desc: &Arc<RelDescriptor>) -> Option
                 diff,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{RelAttr, RelName, ReplIdent};
+
+    fn rel(type_oid: u32, type_len: i16, name: &str) -> RelDescriptor {
+        RelDescriptor {
+            rfn: RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 7000,
+            },
+            oid: 42,
+            toast_oid: 0,
+            namespace_oid: 2200,
+            rel_name: RelName::new("public", name),
+            kind: 'r',
+            persistence: 'p',
+            replident: ReplIdent::Default { pk_attnums: None },
+            attributes: vec![RelAttr {
+                attnum: 1,
+                name: "c1".into(),
+                type_oid,
+                typmod: -1,
+                not_null: false,
+                dropped: false,
+                type_name: "t".into(),
+                type_byval: true,
+                type_len,
+                type_align: 'i',
+                type_storage: 'p',
+                missing_text: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn compatible_in_place_keeps_bias_early() {
+        let pred = rel(23, 4, "t");
+        let fin = rel(23, 4, "renamed");
+        let (from, amb) = in_place_verdict(&pred, &fin, 100, 500);
+        assert_eq!(from, 100);
+        assert!(amb.is_none());
+    }
+
+    #[test]
+    fn incompatible_in_place_publishes_interval() {
+        let pred = rel(23, 4, "t");
+        let fin = rel(20, 8, "t");
+        let (from, amb) = in_place_verdict(&pred, &fin, 100, 500);
+        assert_eq!(from, 500, "final version serves post-commit rows only");
+        let (amb, why) = amb.expect("ambiguity for type change");
+        assert_eq!(amb.scope, AmbiguityScope::Rfn(fin.rfn));
+        assert_eq!(amb.from_lsn, 100);
+        assert_eq!(amb.through_lsn, 500);
+        assert_eq!(amb.reason, AmbiguityReason::UnknownMutationPosition);
+        assert!(!why.is_empty());
     }
 }

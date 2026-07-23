@@ -125,7 +125,7 @@ async fn oracle_without_extension_falls_back_to_raw_bytes() {
         "postgres",
         "postgres",
     );
-    let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
+    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
     // Stand-alone PG without our extension. resolve_pending must
     // surface None so the emitter falls back to raw bytes.
     let out = oracle
@@ -171,7 +171,7 @@ async fn oracle_with_extension_resolves_tier3_disk_bytes() {
         "postgres",
         "postgres",
     );
-    let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
+    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
     assert!(oracle.has_extension());
 
     // numeric — 42
@@ -239,7 +239,7 @@ async fn oracle_resolves_pg_pending_to_text() {
         "postgres",
         "postgres",
     );
-    let oracle = Arc::new(Oracle::connect(&conninfo, 0).await.expect("oracle connect"));
+    let oracle = Arc::new(Oracle::connect(&conninfo).await.expect("oracle connect"));
 
     // Wire one PgPending column (numeric 42) through the decode pool's
     // resolution path.
@@ -279,46 +279,6 @@ async fn oracle_resolves_pg_pending_to_text() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oracle_validate_counts_match_and_mismatch() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let sh = make_pg(&tmp, SHADOW_PORT + 3);
-    sh.initdb().expect("initdb");
-    sh.write_base_conf().expect("write_base_conf");
-    sh.start().expect("start");
-    let _stop = StopOnDrop { sh: &sh };
-    if !matches!(sh.try_load_oracle_extension(), Ok(true)) {
-        eprintln!("skip: walshadow extension not installed on this PG");
-        return;
-    }
-    let conninfo = socket_conninfo(
-        sh.config().socket_dir.to_str().unwrap(),
-        sh.config().port,
-        "postgres",
-        "postgres",
-    );
-    let oracle = Oracle::connect(&conninfo, 1).await.expect("oracle connect");
-
-    use std::sync::atomic::Ordering;
-    use walshadow::schema::{INT4OID, NUMERICOID};
-    assert!(oracle.validate(NUMERICOID, &numeric_42_bytes(), "42").await);
-    assert!(
-        oracle
-            .validate(NUMERICOID, &numeric_42_bytes(), "not-42")
-            .await
-    );
-    assert_eq!(oracle.stats.probes.load(Ordering::Relaxed), 2);
-    assert_eq!(oracle.stats.matches.load(Ordering::Relaxed), 1);
-    assert_eq!(oracle.stats.mismatches.load(Ordering::Relaxed), 1);
-
-    assert!(!oracle.validate(INT4OID, &0i32.to_le_bytes(), "0").await);
-    assert_eq!(oracle.stats.probes.load(Ordering::Relaxed), 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oracle_resolve_reconnects_after_backend_restart() {
     if !pg_available() {
         eprintln!("skip: no initdb on PATH");
@@ -340,7 +300,7 @@ async fn oracle_resolve_reconnects_after_backend_restart() {
         "postgres",
         "postgres",
     );
-    let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
+    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
     use walshadow::schema::NUMERICOID;
     assert_eq!(
         oracle
@@ -388,7 +348,7 @@ async fn oracle_resolve_errors_when_backend_down() {
         "postgres",
         "postgres",
     );
-    let oracle = Oracle::connect(&conninfo, 0).await.expect("oracle connect");
+    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
     use std::sync::atomic::Ordering;
     use walshadow::schema::NUMERICOID;
     assert!(

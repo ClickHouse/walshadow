@@ -97,6 +97,16 @@ crate::atomic_stats! {
         /// Records on marker-proven invisible filenodes stashed raw for
         /// commit-time resolution (same-xact CREATE / TRUNCATE / rewrite)
         pub toast_stash_buffered,
+        /// Records deferred raw because their xact tree wrote catalog
+        /// state earlier in the stream; resolve at commit under
+        /// post-boundary descriptors
+        pub raw_stash_deferred,
+        /// `raw_stash_records_total{kind="dirty",op}`: per-op split of
+        /// `raw_stash_deferred`
+        pub raw_stash_dirty_ops: crate::decode::heap_decoder::OpCounters,
+        /// `raw_stash_records_total{kind="marker",op}`: per-op split of
+        /// `toast_stash_buffered`
+        pub raw_stash_marker_ops: crate::decode::heap_decoder::OpCounters,
     }
 }
 

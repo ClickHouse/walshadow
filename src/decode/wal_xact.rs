@@ -87,6 +87,12 @@ pub(crate) struct XactCommitPayload {
 #[error("xact payload: {0}")]
 pub struct XactPayloadError(String);
 
+impl XactPayloadError {
+    pub(crate) fn new(what: impl Into<String>) -> Self {
+        Self(what.into())
+    }
+}
+
 pub(crate) fn parse_xact_assignment(mut data: &[u8]) -> Option<(u32, Vec<u32>)> {
     let top = take_u32(&mut data)?;
     let count = take_count(&mut data)?;

@@ -57,6 +57,14 @@ const P3: Ports = Ports {
     metrics: 17455,
     walsender: 17456,
 };
+const P4: Ports = Ports {
+    source: 17461,
+    shadow: 17462,
+    ch_tcp: 17469,
+    ch_http: 17470,
+    metrics: 17475,
+    walsender: 17476,
+};
 
 /// Running daemon + its source PG + CH, with the paths the tests poke.
 struct Harness {
@@ -474,7 +482,6 @@ async fn pause_resume_via_ctl_and_sighup_no_restart() {
     }
 }
 
-#[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_table_opt_in_auto_creates_on_reload() {
     if !gated() {
@@ -571,6 +578,84 @@ async fn apply_preserves_previously_pinned_table() {
             .context("selecting an unrelated table opted demo.users out")?;
 
         assert!(h.alive(), "daemon exited");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// Spec operator procedure for consistent config change: pause, apply,
+/// resume — no transaction is in flight at the apply, so every transaction
+/// planned after resume (WAL backlog included) routes whole under the new
+/// config. A row planned before the pause under the old config stays
+/// discarded; the while-paused backlog row reroutes and lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_apply_resume_reroutes_backlog_whole() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&P4).await.expect("bring up harness");
+
+    let result = async {
+        // Unmapped table; id=1 plans (discards) before the pause. The users
+        // marker proves the reorder got past id=1's commit AND that the
+        // CREATE's boundary replayed into the shadow catalog (barrier order).
+        h.psql(
+            "CREATE TABLE demo.widgets (id bigint PRIMARY KEY, label text);\
+             ALTER TABLE demo.widgets REPLICA IDENTITY FULL;",
+        )?;
+        h.psql("INSERT INTO demo.widgets VALUES (1, 'pre-config')")?;
+        h.psql("UPDATE demo.users SET email = 'marker1@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "marker1@x", Duration::from_secs(15))
+            .await?;
+        assert_eq!(
+            h.ch_get("EXISTS TABLE demo.widgets")?,
+            "0",
+            "widgets must not exist on CH before opt-in",
+        );
+
+        h.ctl_body(&["apply"], "[stream]\npaused = true")?;
+        assert_eq!(h.status_field("paused")?, "true");
+        // Wait past idle tick so the next write cannot race the pause
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Backlog row frozen in WAL, unplanned; then the opt-in applies
+        // while nothing is in flight.
+        h.psql("INSERT INTO demo.widgets VALUES (2, 'while-paused')")?;
+        h.ctl_body(&["apply"], "[table.demo.widgets]\nreplicate = true")?;
+        h.ctl(&["reload"])?;
+
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        assert_eq!(h.status_field("paused")?, "false");
+
+        // Backlog xact plans after resume → routes under the new config.
+        h.wait_ch(
+            "SELECT argMax(label, _lsn) FROM demo.widgets WHERE _is_deleted = 0 AND id = 2",
+            "while-paused",
+            Duration::from_secs(30),
+        )
+        .await
+        .context("while-paused backlog row did not reroute after resume")?;
+
+        // Post-resume stream continues under the same config.
+        h.psql("INSERT INTO demo.widgets VALUES (3, 'post-resume')")?;
+        h.wait_ch(
+            "SELECT argMax(label, _lsn) FROM demo.widgets WHERE _is_deleted = 0 AND id = 3",
+            "post-resume",
+            Duration::from_secs(15),
+        )
+        .await?;
+
+        // id=1 was planned pre-pause under the old config: discarded stays
+        // discarded, no partial re-plan.
+        let n = h.ch_get("SELECT count() FROM demo.widgets FINAL WHERE _is_deleted = 0")?;
+        assert_eq!(n, "2", "exactly the backlog + post-resume rows land");
+
+        assert!(h.alive(), "daemon exited during pause/apply/resume");
         Ok::<(), anyhow::Error>(())
     }
     .await;

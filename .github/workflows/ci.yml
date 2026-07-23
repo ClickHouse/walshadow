@@ -30,6 +30,18 @@ jobs:
         pg-major: [16, 17, 18]
 
     steps:
+      # ubuntu-latest ships ~14GB free on /; `cargo --all-targets` links
+      # every integration test as its own static binary and can exhaust it
+      # mid-link. ENOSPC surfaces as an lld SIGBUS + a spurious "report to
+      # LLVM" banner. Fast `rm -rf` of the big preinstalled dirs
+      # (android/dotnet/haskell, ~21GB) buys enough room; skip large-packages
+      # (slow apt remove, minutes) and swap-storage (frees /mnt, not /).
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          large-packages: false
+          swap-storage: false
+
       - name: Checkout walshadow
         uses: actions/checkout@v7
         with:
@@ -217,6 +229,12 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          large-packages: false
+          swap-storage: false
+
       - name: Checkout walshadow
         uses: actions/checkout@v7
         with:

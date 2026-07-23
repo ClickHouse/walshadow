@@ -490,7 +490,63 @@ impl DdlApplicator {
         if let Some(r) = &self.resolver {
             r.register_derived_mapping(rel, mapping).await;
         } else {
-            self.mapping.write().await.insert(rel.clone(), mapping);
+            Arc::make_mut(&mut *self.mapping.write().await).insert(rel.clone(), mapping);
+        }
+    }
+
+    /// Predict `apply(event)`'s routing-map effect without executing DDL or
+    /// touching shared state, for plan-time route resolution: `None` = map
+    /// unchanged, `Some((rel, Some(m)))` = insert/replace, `Some((rel,
+    /// None))` = remove. Mirrors the apply_added / apply_changed /
+    /// apply_dropped gates; the executor later applies the real effects
+    pub async fn predict_route_mapping(
+        &mut self,
+        event: &SchemaEvent,
+    ) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
+        self.refresh_config().await?;
+        match event {
+            SchemaEvent::Added { desc } => {
+                if self.mapping_for(&desc.rel_name).await.is_some()
+                    || self.is_excluded(&desc.rel_name).await
+                    || !self
+                        .config
+                        .auto_create_namespaces
+                        .contains(&*desc.rel_name.namespace)
+                {
+                    return Ok(None);
+                }
+                let target_db = self
+                    .config
+                    .target_database_for(&desc.rel_name.namespace)
+                    .to_owned();
+                if render_create_table(desc, &target_db, self.config.soft_delete)?.is_none() {
+                    return Ok(None);
+                }
+                let target = TableTarget::new(&target_db, &desc.rel_name.name);
+                let columns = derive_columns_for_mapping(desc);
+                Ok(Some((
+                    desc.rel_name.clone(),
+                    Some(TableMapping { target, columns }),
+                )))
+            }
+            SchemaEvent::Changed { new, diff, .. } => {
+                let Some(mut m) = self.mapping_for(&new.rel_name).await else {
+                    return Ok(None);
+                };
+                fold_diff_into_mapping(&mut m, new, diff);
+                Ok(Some((new.rel_name.clone(), Some(m))))
+            }
+            SchemaEvent::Dropped { rel_name, .. } => {
+                if self.mapping_target(rel_name).await.is_none()
+                    || !matches!(
+                        self.config.drop_strategy_for(&rel_name.namespace),
+                        DropTableStrategy::Drop
+                    )
+                {
+                    return Ok(None);
+                }
+                Ok(Some((rel_name.clone(), None)))
+            }
         }
     }
 
@@ -506,7 +562,7 @@ impl DdlApplicator {
         if let Some(r) = &self.resolver {
             r.forget_derived_mapping(rel).await;
         } else {
-            self.mapping.write().await.remove(rel);
+            Arc::make_mut(&mut *self.mapping.write().await).remove(rel);
         }
     }
 
@@ -560,7 +616,7 @@ impl DdlApplicator {
 /// `apply_changed`)
 async fn mutate_mapping_for_diff(mapping: &MappingHandle, new: &RelDescriptor, diff: &SchemaDiff) {
     let mut m = mapping.write().await;
-    let Some(target_mapping) = m.get_mut(&new.rel_name) else {
+    let Some(target_mapping) = Arc::make_mut(&mut *m).get_mut(&new.rel_name) else {
         return;
     };
     fold_diff_into_mapping(target_mapping, new, diff);
@@ -692,7 +748,6 @@ mod tests {
     use crate::mapping::{ColumnMapping, TableMapping};
     use crate::schema::{INT4OID, TEXTOID, TIMESTAMPTZOID};
     use crate::schema::{RelAttr, RelDescriptor, ReplIdent, SchemaDiff};
-    use std::sync::Arc;
 
     #[test]
     fn per_namespace_target_and_drop_override_global() {
@@ -1056,7 +1111,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let handle: MappingHandle = Arc::new(tokio::sync::RwLock::new(map));
+        let handle = crate::mapping::mapping_handle(map);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -1083,7 +1138,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let handle: MappingHandle = Arc::new(tokio::sync::RwLock::new(map));
+        let handle = crate::mapping::mapping_handle(map);
         let new = desc(
             "orders",
             vec![

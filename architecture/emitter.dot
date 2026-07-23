@@ -1,13 +1,14 @@
 // walshadow — CH emitter component view
 // Parallel decode+insert pipeline: reorder coordinator (commit order,
-// DDL/TRUNCATE barrier) → decode pool ×M → InsertBatcher (per-table
+// side-effect-free transaction plan then execute, DDL/TRUNCATE barrier)
+// → decode pool ×M → InsertBatcher (per-table
 // TableEncoder, budget/deadline seal) → inserter pool ×N (one complete
 // INSERT per sealed batch) → ack collector (contiguous-done watermark).
 // Zoomed-in view of cluster_ch + cluster_ddl from internals.dot.
 //
 // regeneration spec:
-// sources of truth: plans/emitter.md · src/emit/pipeline/{reorder,decode,batcher,inserter,ack,tail}.rs · src/emit/{ch_emitter,ch_ddl}.rs · src/catalog/type_bridge.rs
-// subsumes: plans/emitter.md § "Stage walk" + "Barrier fence" + "Ack-LSN tracking" + "DdlApplicator"
+// sources of truth: plans/emitter.md · src/emit/pipeline/{reorder,planner,plan_spool,decode,batcher,inserter,ack,tail}.rs · src/emit/{ch_emitter,ch_ddl}.rs · src/catalog/type_bridge.rs
+// subsumes: plans/emitter.md § "Stage walk" + "Transaction planner" + "Barrier fence" + "Ack-LSN tracking" + "DdlApplicator"
 // quality bar:
 //   - decode ×M and inserter ×N read as pools (stacked node or ×M/×N label), not single tasks
 //   - barrier fence visually orders DDL strictly after earlier data durable (placed → FlushAll → durable)
@@ -27,7 +28,9 @@ digraph emitter {
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
     reorder [label="transaction reorder\nwalk rows and changes in WAL order\nempty commits and aborts still advance progress\nschema and truncate changes wait for earlier rows", fillcolor="#4D4128"];
+    plan    [label="transaction planner (planner.rs + plan_spool.rs)\nplan first, execute after: detoast + route +\nraw decode, side-effect-free; frozen route view\n(whole-xact config granularity)\nplan ≤1 MiB resident else .plan spool\n[len|crc32c|body]*, seal frame; error = abandon,\nnothing emitted", fillcolor="#4D4128"];
     cat     [label="ShadowCatalog::subscribe\nSchemaEvent\nAdded / Changed / Dropped\n(unbounded mpsc, rides xact buffer\n as ordered_events)", fillcolor="#4D4D28", shape=parallelogram];
+    reorder -> plan [label="drain walk\n(plan → seal → execute)"];
   }
 
   // ═════ decode pool ═════
@@ -35,7 +38,7 @@ digraph emitter {
     label="decode pool ×M  (emit/pipeline/decode.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    decode [label="decode worker ×M\ndetoast: ChunkMap, then store as-of fetch\nresolve_at_pooled; mapping\noracle PgPending + sampled validate\nchunk 1024 rows / 4 MiB", fillcolor="#4D4128"];
+    decode [label="decode worker ×M\nplanned envelopes: descriptor + route attached,\nvalues resolved at planning\noracle PgPending resolve\nchunk 1024 rows / 4 MiB", fillcolor="#4D4128"];
   }
 
   // ═════ batcher hub ═════
@@ -90,7 +93,7 @@ digraph emitter {
   ack [label="ack collector\nwait for every earlier commit\npublish latest durable position\nfeed manifest + source feedback", fillcolor="#4D3A28", shape=note];
 
   // ═════ row path ═════
-  reorder -> decode [color="#BF8C5F", penwidth=2, lhead=cluster_decode, label="DecodeJob\n(mpmc, bound 4M)"];
+  plan -> decode [color="#BF8C5F", penwidth=2, lhead=cluster_decode, label="execute_plan:\nDecodeJob\n(mpmc, bound 4M)"];
   decode  -> enc    [color="#BF8C5F", penwidth=2, lhead=cluster_batch, label="BatcherMsg::Rows\n(FIFO mpsc 256 —\nshared with FlushAll)"];
   seal    -> ins    [color="#BF8C5F", penwidth=2, lhead=cluster_insert, label="InsertBatch\n(mpmc)"];
   ins     -> chrows [color="#BF8C5F", penwidth=2, label="one complete INSERT\nper sealed batch"];

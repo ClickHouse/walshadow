@@ -27,13 +27,14 @@ digraph decoder {
     label="BufferingDecoderSink::on_record (xact_buffer.rs)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
     sink     [label="on_record\nSMGR CREATE?\nHeap TRUNCATE?\nother heap op?", fillcolor="#4D4128"];
     marker   [label="note_smgr_create\nmain-fork generation marker\nproves stash completeness", fillcolor="#4D4128"];
-    trunc    [label="handle_truncate\nparse_xl_heap_truncate\nwait_for_replay(source_lsn)\nfor relid in relids:\n  relation_by_oid → fan out\n  HeapOp::Truncate\n(kind in {'r','p'} only)", fillcolor="#4D4128"];
-    relat    [label="ShadowCatalog::relation_at(rfn, lsn)\nLRU + libpq fetch", fillcolor="#4D4D28"];
-    stash    [label="stash_invisible\nSpillEntry::Raw\nmain data + block data/images\ncommit: relation_at(rfn, commit_lsn)\ntoast decode | ordinary skip | discard", fillcolor="#4D4128"];
+    trunc    [label="handle_truncate\nparse_xl_heap_truncate\nfor relid in relids:\n  descriptor_by_oid_at_spanned\n  → fan out HeapOp::Truncate\n(kind in {'r','p'} only)", fillcolor="#4D4128"];
+    relat    [label="DescriptorLog::\ndescriptor_at_spanned(rfn, lsn)\nwait-free interval lookup", fillcolor="#4D4D28"];
+    stash    [label="raw stash\nSpillEntry::Raw\nmain data + block data/images + xid\ncommit: resolve_stash at next_lsn\ntoast | ordinary decode | discard\nAmbiguous = fatal", fillcolor="#4D4128"];
     sink -> marker [label="SMGR CREATE", style=dashed];
     sink -> trunc [label="0x30 TRUNCATE", style=dashed];
     sink -> relat [label="other heap ops"];
-    relat -> stash [label="NotFoundByFilenode\nor known candidate", style=dashed];
+    sink -> stash [label="dirty family\n(defer_catalog_decode)", style=dashed];
+    relat -> stash [label="NotCovered / Dropped /\nAmbiguous, or marker\ncandidate", style=dashed];
   }
   record -> sink;
 

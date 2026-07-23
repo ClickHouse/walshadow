@@ -5,13 +5,12 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
-use std::process::{Command, Stdio};
+use fx::spawn_txn;
 use std::time::Duration;
 
 use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
-use walshadow::shadow::Shadow;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
 const SLOT: PortSlot = PortSlot {
@@ -105,45 +104,6 @@ fn create_ch_dests(ch: &fx::ChServer) {
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
     )
     .expect("create w_cols dest");
-}
-
-fn spawn_txn(source: &Shadow, body: &str) -> std::thread::JoinHandle<()> {
-    let sock = source.config().socket_dir.clone();
-    let port = source.config().port;
-    let sql = body.to_owned();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        let mut child = Command::new("psql")
-            .args([
-                "-h",
-                sock.to_str().unwrap(),
-                "-p",
-                &port.to_string(),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-f",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn psql");
-        {
-            use std::io::Write as _;
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin piped")
-                .write_all(sql.as_bytes())
-                .unwrap();
-        }
-        let _ = child.wait();
-    })
 }
 
 fn skip_gate() -> bool {

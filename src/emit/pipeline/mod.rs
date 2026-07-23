@@ -15,6 +15,8 @@ pub mod batcher;
 pub mod bootstrap;
 pub mod decode;
 pub mod inserter;
+pub mod plan_spool;
+pub mod planner;
 pub mod reorder;
 pub mod tail;
 
@@ -29,10 +31,9 @@ use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::ch::EmitterError;
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
-use crate::mapping::{MappingHandle, TableMapping};
+use crate::mapping::MappingHandle;
 use crate::ops::oracle::Oracle;
 use crate::ops::trace::TxnSpanRegistry;
-use crate::schema::RelName;
 use crate::xact::xact_buffer::{SubxactTracker, XactBuffer};
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls
@@ -90,24 +91,6 @@ impl Fatal {
 /// Partial-batch flush deadline when operator left `flush_timeout` at 0;
 /// without it a cold table's rows pin the watermark indefinitely.
 const DEFAULT_PIPELINE_FLUSH: Duration = Duration::from_millis(100);
-
-/// Resolve a relation's destination mapping. Bumps `unsupported_relations`
-/// and returns None when the relation maps to no destination
-pub(crate) async fn lookup_mapping(
-    mapping: &MappingHandle,
-    rel: &RelName,
-    stats: &EmitterStats,
-) -> Option<Arc<TableMapping>> {
-    match mapping.read().await.get(rel) {
-        Some(v) => Some(Arc::new(v.clone())),
-        None => {
-            stats
-                .unsupported_relations
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            None
-        }
-    }
-}
 
 /// Tail selection: `ClickHouse` ships sealed blocks over N connections;
 /// `Null` acks at swallow — metrics-only runs, zero CH connections.
@@ -254,8 +237,6 @@ impl PipelineConfig {
         let (jobs_tx, jobs_rx) = async_channel::bounded::<decode::DecodeJob>((m * 4).max(8));
 
         let ctx = decode::DecodeCtx {
-            log: log.clone(),
-            mapping,
             oracle,
             msg_tx: msg_tx.clone(),
             stats: stats.clone(),
@@ -264,6 +245,7 @@ impl PipelineConfig {
         };
         let decoders = decode::spawn_pool(m, ctx, jobs_rx, ack.clone(), fatal.clone());
 
+        let plan_dir = buffer.lock().await.spill_dir().to_path_buf();
         let reorder = reorder::ReorderSink::new(
             buffer,
             log,
@@ -281,9 +263,13 @@ impl PipelineConfig {
             span_registry,
             emitter.drain_batch_rows,
             emitter.drain_batch_bytes,
+            emitter.plan_disk_max,
+            plan_dir,
             Some(budget.clone()),
             retires,
             resume_floor,
+            mapping,
+            emitter.soft_delete,
         );
 
         Ok((
