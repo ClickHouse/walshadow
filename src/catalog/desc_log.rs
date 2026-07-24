@@ -49,6 +49,14 @@
 //! fail closed instead of decoding under an unproven layout. The final
 //! post-commit `Present` entry stays usable past `through_lsn`
 //!
+//! Each interval files under exactly one key, and each lookup consults its
+//! own key plus the database scope, so producers publish one interval per
+//! identity key they can name — capture emits an `Rfn` and an `Oid` interval
+//! for the same verdict. Deferred records resolve at the commit's
+//! `next_lsn`, past their own interval's end, so the drain fences per record
+//! against [`DescriptorLog::ambiguities_intersecting`] rather than relying
+//! on the point lookup
+//!
 //! Identity keys the full physical `RelFileNode`: PG guarantees
 //! relfilenumber uniqueness only per database of one tablespace
 //! (`GetNewRelFileNumber`, PG `src/backend/catalog/catalog.c`), so
@@ -57,13 +65,15 @@
 //! the database's `dattablespace`, so stored rfns compare directly against
 //! WAL locators' physical spcOid. See `plans/future/TABLESPACES.md` §0.
 //!
-//! Known scope debt (closed by the ordinary-heap stash fence lift, not
-//! here): same-xact DDL+DML on an already-visible rfn stays timing-dependent
-//! exactly as with the live-oracle path.
+//! Known scope debt: an interval fences its whole span, so DML that
+//! provably postdates the layout change inside it still fails closed.
+//! Per-record fidelity needs an intra-xact descriptor timeline —
+//! `plans/future/descriptor_timeline.md`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
@@ -78,7 +88,11 @@ pub const CKPT_FILE: &str = "desc_log.ckpt";
 pub const TAIL_FILE: &str = "desc_log.tail";
 
 const MAGIC: &[u8; 2] = b"WL";
-const VERSION: u16 = 2;
+/// 3: ambiguity intervals fence per record at the drain. A v2 log's
+/// intervals were published for read-identical drift too and span past the
+/// layout change, so replaying them under the fence would fail closed on
+/// rows v2 decoded fine — reject the log instead
+const VERSION: u16 = 3;
 /// Reject frames past this before allocating: no realistic batch (thousands
 /// of descriptors) approaches it, garbage lengths do
 const MAX_FRAME: u32 = 256 * 1024 * 1024;
@@ -162,13 +176,14 @@ pub enum AmbiguityScope {
     Database(Oid),
 }
 
+/// Discriminants are the wire tags; only produced variants exist, so an
+/// operator never sees a label that cannot fire
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AmbiguityReason {
-    UnknownAffectedRelation,
-    UnknownMutationPosition,
-    MultipleIncompatibleLayouts,
-    NeverVisibleGeneration,
-    IncompleteInvalidation,
+    /// Descriptor changed in place and the dirty interval's exact mutation
+    /// position is unknown (only the first catalog touch is tracked)
+    UnknownMutationPosition = 1,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -253,6 +268,9 @@ struct Index {
 }
 
 impl Index {
+    /// Files each ambiguity under exactly the key its scope names. Producers
+    /// publish one interval per identity key so the rfn-keyed and oid-keyed
+    /// lookups see the same fence without either consulting the other's map
     fn insert_batch(&mut self, batch: Arc<BatchRecord>) {
         for amb in &batch.ambiguities {
             let list = match amb.scope {
@@ -313,12 +331,6 @@ crate::atomic_stats! {
         pub batches_appended,
         pub gc_runs,
         pub gc_dropped_entries,
-        /// `descriptor_ambiguous_total{reason}` split of `lookups_ambiguous`
-        pub ambiguous_unknown_relation,
-        pub ambiguous_unknown_position,
-        pub ambiguous_incompatible_layouts,
-        pub ambiguous_never_visible,
-        pub ambiguous_incomplete_invalidation,
     }
 }
 
@@ -327,6 +339,8 @@ pub struct DescriptorLog {
     identity: DescLogIdentity,
     index: RwLock<Index>,
     writer: tokio::sync::Mutex<Writer>,
+    /// `tail_len - header_len` mirror, readable without the writer lock
+    tail_bytes: AtomicU64,
     stats: Arc<DescLogStats>,
 }
 
@@ -379,8 +393,16 @@ impl DescriptorLog {
                 header_len: header.len() as u64,
                 dir: dir.to_path_buf(),
             }),
+            tail_bytes: AtomicU64::new(tail_len - header.len() as u64),
             stats: Arc::new(DescLogStats::default()),
         })
+    }
+
+    fn publish_tail_bytes(&self, w: &Writer) {
+        self.tail_bytes.store(
+            w.tail_len - w.header_len,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn stats_handle(&self) -> Arc<DescLogStats> {
@@ -437,7 +459,10 @@ impl DescriptorLog {
         }
         let idx = self.index.read().unwrap();
         // Ambiguity precedes the chain: a chain entry inside an ambiguous
-        // interval is not proven safe for rows there
+        // interval is not proven safe for rows there. The db scope keys on
+        // the locator's own db_node, so a shared relation (db_node 0) skips
+        // this database's Database-scoped intervals — shared catalogs carry
+        // no descriptors, so no such interval can name their rows
         let result = ambiguity_covering(idx.amb_rfn.get(&rfn), lsn)
             .or_else(|| ambiguity_covering(idx.amb_db.get(&rfn.db_node), lsn))
             .map_or_else(
@@ -488,35 +513,57 @@ impl DescriptorLog {
             LookupResult::Present(_) => self.stats.lookups_present.fetch_add(1, Relaxed),
             LookupResult::Dropped => self.stats.lookups_dropped.fetch_add(1, Relaxed),
             LookupResult::Retired => self.stats.lookups_retired.fetch_add(1, Relaxed),
-            LookupResult::Ambiguous(a) => {
-                self.stats.lookups_ambiguous.fetch_add(1, Relaxed);
-                let by_reason = match a.reason {
-                    AmbiguityReason::UnknownAffectedRelation => {
-                        &self.stats.ambiguous_unknown_relation
-                    }
-                    AmbiguityReason::UnknownMutationPosition => {
-                        &self.stats.ambiguous_unknown_position
-                    }
-                    AmbiguityReason::MultipleIncompatibleLayouts => {
-                        &self.stats.ambiguous_incompatible_layouts
-                    }
-                    AmbiguityReason::NeverVisibleGeneration => &self.stats.ambiguous_never_visible,
-                    AmbiguityReason::IncompleteInvalidation => {
-                        &self.stats.ambiguous_incomplete_invalidation
-                    }
-                };
-                by_reason.fetch_add(1, Relaxed)
-            }
+            LookupResult::Ambiguous(_) => self.stats.lookups_ambiguous.fetch_add(1, Relaxed),
             LookupResult::NotCovered => self.stats.lookups_not_covered.fetch_add(1, Relaxed),
             LookupResult::ForeignDb => self.stats.lookups_foreign_db.fetch_add(1, Relaxed),
         };
+    }
+
+    /// Intervals overlapping `[from, through)` for a relation, under every
+    /// key that can name it. The drain's per-record fence: a stashed record
+    /// resolves at the commit's `next_lsn`, past its own interval's
+    /// `through_lsn`, so the point lookups above cannot see the fence that
+    /// covers it.
+    ///
+    /// Overlap, not containment — an interval opening below `from` still
+    /// covers records inside the range, and the caller narrows per record
+    pub fn ambiguities_intersecting(
+        &self,
+        rfn: RelFileNode,
+        oid: Option<Oid>,
+        from: u64,
+        through: u64,
+    ) -> Vec<Arc<Ambiguity>> {
+        if rfn.db_node != 0 && rfn.db_node != self.identity.db_oid {
+            return Vec::new();
+        }
+        let idx = self.index.read().unwrap();
+        let mut out: Vec<Arc<Ambiguity>> = Vec::new();
+        let lists = [
+            idx.amb_rfn.get(&rfn),
+            oid.and_then(|o| idx.amb_oid.get(&o)),
+            idx.amb_db.get(&rfn.db_node),
+        ];
+        for amb in lists.into_iter().flatten().flatten() {
+            // Siblings of one verdict are distinct allocations; the same Arc
+            // reaches here only when two keys index it
+            if amb.from_lsn < through
+                && from < amb.through_lsn
+                && !out.iter().any(|k| Arc::ptr_eq(k, amb))
+            {
+                out.push(amb.clone());
+            }
+        }
+        out.sort_unstable_by_key(|a| (a.from_lsn, a.through_lsn));
+        out
     }
 
     /// Newest `Present` at or below `lsn` on the rfn chain, skipping
     /// tombstones. Truncate apply resolves the relation an rfn named even
     /// after its own commit retired it: rotation records `Retired` at the
     /// new generation's bias-early valid_from, which precedes the truncate
-    /// record itself.
+    /// record itself. Bypasses the ambiguity fence: the caller is applying a
+    /// TRUNCATE, which needs the relation's identity, not its tuple layout.
     pub fn present_before(&self, rfn: RelFileNode, lsn: u64) -> Option<Arc<RelDescriptor>> {
         let idx = self.index.read().unwrap();
         let chain = idx.by_rfn.get(&rfn)?;
@@ -542,7 +589,9 @@ impl DescriptorLog {
 
     /// The oid's entry preceding the batch at `captured_at` in history
     /// order — replay derives events against this, never the loaded head
-    /// (boot loads the full log before the WAL re-read)
+    /// (boot loads the full log before the WAL re-read). Bypasses the
+    /// ambiguity fence by construction: capture compares descriptors here,
+    /// it does not read tuples
     pub fn predecessor_before(&self, oid: Oid, captured_at: u64) -> Option<Arc<LogEntry>> {
         let idx = self.index.read().unwrap();
         let chain = idx.by_oid.get(&oid)?;
@@ -555,6 +604,13 @@ impl DescriptorLog {
     pub fn rfn_ambiguities(&self, rfn: RelFileNode) -> Vec<Arc<Ambiguity>> {
         let idx = self.index.read().unwrap();
         idx.amb_rfn.get(&rfn).cloned().unwrap_or_default()
+    }
+
+    /// Oid-keyed twin of [`Self::rfn_ambiguities`]: the sibling interval a
+    /// physical in-place verdict files for the same event
+    pub fn oid_ambiguities(&self, oid: Oid) -> Vec<Arc<Ambiguity>> {
+        let idx = self.index.read().unwrap();
+        idx.amb_oid.get(&oid).cloned().unwrap_or_default()
     }
 
     /// Oids whose newest entry is `Present` — capture-all diffs its SQL
@@ -573,7 +629,10 @@ impl DescriptorLog {
             .collect()
     }
 
-    /// Descriptors `Present` at `lsn` — boot Added enumeration
+    /// Descriptors `Present` at `lsn` — boot Added enumeration. Bypasses the
+    /// ambiguity fence: an ambiguous interval says nothing about whether the
+    /// relation exists, and the consumer only emits idempotent
+    /// `CREATE TABLE IF NOT EXISTS`, never reads a tuple
     pub fn active_present_at(&self, lsn: u64) -> Vec<Arc<RelDescriptor>> {
         let idx = self.index.read().unwrap();
         idx.by_oid
@@ -639,6 +698,7 @@ impl DescriptorLog {
         w.tail.write_all(&frame).await?;
         w.tail.sync_data().await?;
         w.tail_len += frame.len() as u64;
+        self.publish_tail_bytes(&w);
         self.stats
             .batches_appended
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -706,6 +766,7 @@ impl DescriptorLog {
         w.tail.seek(SeekFrom::Start(header_len)).await?;
         w.tail.sync_data().await?;
         w.tail_len = w.header_len;
+        self.publish_tail_bytes(&w);
         *self.index.write().unwrap() = retained;
         self.stats.gc_runs.fetch_add(1, Relaxed);
         self.stats
@@ -714,27 +775,34 @@ impl DescriptorLog {
         Ok(())
     }
 
-    /// (entries, bytes-in-tail, batches) gauges
+    /// (entries, bytes-in-tail, batches) gauges. Tail bytes come from the
+    /// mirror, not the writer: GC runs off the pump task and would otherwise
+    /// dip the gauge to 0 for the length of a compaction
     pub fn gauges(&self) -> (u64, u64, u64) {
         let idx = self.index.read().unwrap();
         let entries = idx.entries_total as u64;
         let batches = idx.batches.len() as u64;
         drop(idx);
-        let tail = self
-            .writer
-            .try_lock()
-            .map(|w| w.tail_len - w.header_len)
-            .unwrap_or(0);
-        (entries, tail, batches)
+        (
+            entries,
+            self.tail_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            batches,
+        )
     }
 }
 
-/// First interval covering `lsn` under `[from_lsn, through_lsn)`; lists stay
-/// `(from_lsn, through_lsn)`-sorted so overlap resolution is deterministic
+/// Newest interval covering `lsn` under `[from_lsn, through_lsn)`. Lists are
+/// `(from_lsn, through_lsn)`-sorted, so `partition_point` bounds the search
+/// to intervals that opened at or below `lsn` and the reverse walk answers
+/// from the newest — GC only drops intervals below the floor, so the list
+/// tracks floor lag rather than workload and the prefix skip matters
 fn ambiguity_covering(list: Option<&Vec<Arc<Ambiguity>>>, lsn: u64) -> Option<Arc<Ambiguity>> {
-    list?
+    let list = list?;
+    let opened = list.partition_point(|a| a.from_lsn <= lsn);
+    list[..opened]
         .iter()
-        .find(|a| a.from_lsn <= lsn && lsn < a.through_lsn)
+        .rev()
+        .find(|a| lsn < a.through_lsn)
         .cloned()
 }
 
@@ -1305,11 +1373,7 @@ fn decode_batch(cur: &mut Cur<'_>) -> Result<BatchRecord> {
         let from_lsn = cur.u64()?;
         let through_lsn = cur.u64()?;
         let reason = match cur.u8()? {
-            0 => AmbiguityReason::UnknownAffectedRelation,
             1 => AmbiguityReason::UnknownMutationPosition,
-            2 => AmbiguityReason::MultipleIncompatibleLayouts,
-            3 => AmbiguityReason::NeverVisibleGeneration,
-            4 => AmbiguityReason::IncompleteInvalidation,
             other => return Err(cur.corrupt(format!("unknown ambiguity reason {other}"))),
         };
         ambiguities.push(Arc::new(Ambiguity {
@@ -2208,10 +2272,9 @@ mod tests {
         ));
         assert_eq!(
             log.stats_handle()
-                .ambiguous_unknown_position
+                .lookups_ambiguous
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
-            "reason-labelled counter",
         );
         assert!(matches!(
             log.descriptor_at(rfn(9400), 100),
@@ -2252,6 +2315,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn intersecting_is_overlap_under_every_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(96, 9800, false);
+        let log = open(tmp.path()).await;
+        let mut b = batch(400, vec![present(400, &d)]);
+        // Sibling pair one physical verdict publishes
+        b.ambiguities
+            .push(amb(AmbiguityScope::Rfn(rfn(9800)), 200, 400));
+        b.ambiguities.push(amb(AmbiguityScope::Oid(96), 200, 400));
+        b.ambiguities
+            .push(amb(AmbiguityScope::Database(5), 900, 950));
+        log.append_batch(b).await.unwrap();
+        let hits = |from, through| {
+            log.ambiguities_intersecting(rfn(9800), Some(96), from, through)
+                .len()
+        };
+        // Both keys answer; the caller narrows per record
+        assert_eq!(hits(250, 500), 2, "rfn + oid siblings");
+        assert_eq!(
+            log.ambiguities_intersecting(rfn(9800), None, 250, 500)
+                .len(),
+            1,
+            "oid omitted: rfn key only",
+        );
+        // Interval opening below the range still covers records inside it
+        assert_eq!(hits(300, 500), 2);
+        // Half-open both sides: touching at an endpoint is not overlap
+        assert_eq!(hits(400, 500), 0, "range starts at through_lsn");
+        assert_eq!(hits(100, 200), 0, "range ends at from_lsn");
+        assert_eq!(hits(900, 910), 1, "database scope reaches the rfn path");
+        // Foreign db never fences
+        let foreign = RelFileNode {
+            spc_node: 1663,
+            db_node: 999,
+            rel_node: 9800,
+        };
+        assert!(
+            log.ambiguities_intersecting(foreign, Some(96), 0, u64::MAX)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sibling_scopes_survive_gc_and_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(97, 9900, false);
+        {
+            let log = open(tmp.path()).await;
+            let mut b = batch(300, vec![present(300, &d)]);
+            b.ambiguities
+                .push(amb(AmbiguityScope::Rfn(rfn(9900)), 100, 300));
+            b.ambiguities.push(amb(AmbiguityScope::Oid(97), 100, 300));
+            log.append_batch(b).await.unwrap();
+            log.force_gc(200).await.unwrap();
+            assert_eq!(log.rfn_ambiguities(rfn(9900)).len(), 1);
+            assert_eq!(log.oid_ambiguities(97).len(), 1);
+        }
+        let log = open(tmp.path()).await;
+        assert!(matches!(
+            log.descriptor_at(rfn(9900), 250),
+            LookupResult::Ambiguous(_)
+        ));
+        assert!(matches!(
+            log.descriptor_by_oid_at(97, 250),
+            LookupResult::Ambiguous(_)
+        ));
+        assert_eq!(log.batch_at(300).unwrap().ambiguities.len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn covering_scan_answers_past_stale_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(98, 10000, false);
+        let log = open(tmp.path()).await;
+        let mut b = batch(5000, vec![present(5000, &d)]);
+        // Long run of intervals that closed before the query point
+        for i in 0..64u64 {
+            b.ambiguities.push(amb(
+                AmbiguityScope::Rfn(rfn(10000)),
+                100 + i * 10,
+                105 + i * 10,
+            ));
+        }
+        b.ambiguities
+            .push(amb(AmbiguityScope::Rfn(rfn(10000)), 2000, 3000));
+        // Opens after the query point: prefix bound must exclude it
+        b.ambiguities
+            .push(amb(AmbiguityScope::Rfn(rfn(10000)), 4000, 4500));
+        log.append_batch(b).await.unwrap();
+        assert!(matches!(
+            log.descriptor_at(rfn(10000), 2500),
+            LookupResult::Ambiguous(a) if a.from_lsn == 2000
+        ));
+        assert_eq!(
+            log.descriptor_at(rfn(10000), 3500),
+            LookupResult::NotCovered
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn old_format_rejected_both_files() {
         let tmp = tempfile::tempdir().unwrap();
         let d = desc(95, 9700, false);
@@ -2262,17 +2425,24 @@ mod tests {
                 .unwrap();
             log.force_gc(0).await.unwrap();
         }
-        // Pre-ambiguity v1 dir rejects at open, ckpt or tail alike; the
-        // explicit epoch reset (--ignore-cursor / re-bootstrap) is the only
-        // way forward, never silent translation
+        // Pre-ambiguity v1 and pre-fence v2 dirs both reject at open, ckpt or
+        // tail alike; the explicit epoch reset (--ignore-cursor /
+        // re-bootstrap) is the only way forward, never silent translation —
+        // a v2 interval was published for read-identical drift too and would
+        // fence rows v2 decoded fine
         for file in [TAIL_FILE, CKPT_FILE] {
             let path = tmp.path().join(file);
             let orig = std::fs::read(&path).unwrap();
-            let mut bytes = orig.clone();
-            bytes[2] = 1; // version u16 LE low byte
-            std::fs::write(&path, &bytes).unwrap();
-            let err = DescriptorLog::open(tmp.path(), ident()).await.unwrap_err();
-            assert!(matches!(err, DescLogError::Version(1)), "{file}");
+            for stale in [1u8, 2] {
+                let mut bytes = orig.clone();
+                bytes[2] = stale; // version u16 LE low byte
+                std::fs::write(&path, &bytes).unwrap();
+                let err = DescriptorLog::open(tmp.path(), ident()).await.unwrap_err();
+                assert!(
+                    matches!(err, DescLogError::Version(v) if v == u16::from(stale)),
+                    "{file} v{stale}"
+                );
+            }
             std::fs::write(&path, &orig).unwrap();
         }
         let log = open(tmp.path()).await;

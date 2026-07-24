@@ -1,12 +1,18 @@
 //! Physical compatibility predicate: can the final committed descriptor
 //! decode tuples written earlier in the same dirty interval?
 //!
-//! Bias rejects: capture publishes an ambiguity interval on any transition
-//! not on the proven-safe list, never guesses. Compared fields are what
-//! tuple walking + value interpretation read: attnum sequence, dropped
-//! slots, attlen/attalign/attbyval, type oid + typmod + storage,
+//! Compared fields are what tuple walking + value interpretation read:
+//! attnum sequence, dropped slots, attlen/attalign/attbyval, type oid,
 //! missing-value semantics. Rename, replica identity, and not-null are
 //! metadata for decode purposes
+//!
+//! Rejects split by physical consequence ([`Incompat`]). A `Physical`
+//! reject means no descriptor reads both formats, so capture fences the
+//! interval; a `Benign` one means the declared shape drifted while every
+//! byte reads the same, so bias-early history stays sound. The split is
+//! what keeps the fence off the shapes PG actually produces in place —
+//! layout-moving ALTERs rewrite the relation into a fresh filenode, and a
+//! rotation never reaches this predicate
 //!
 //! Dropped slots keep physical walk fields: PG `RemoveAttributeById`
 //! (`src/backend/catalog/heap.c`) preserves attlen/attalign/attbyval and
@@ -14,70 +20,113 @@
 
 use crate::schema::{RelAttr, RelDescriptor};
 
+/// Why `new` isn't a proven reader of tuples formatted under `old`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Incompat {
+    /// Physical read is identical; only the declared shape drifts
+    Benign(&'static str),
+    /// Walk fields or datum identity differ; no descriptor reads both
+    Physical(&'static str),
+}
+
+impl Incompat {
+    /// Failing check's name, for logs and ambiguity diagnostics
+    pub fn why(&self) -> &'static str {
+        match self {
+            Self::Benign(why) | Self::Physical(why) => why,
+        }
+    }
+
+    pub fn is_physical(&self) -> bool {
+        matches!(self, Self::Physical(_))
+    }
+}
+
 /// `Ok(())` when `new` provably decodes tuples formatted under `old`;
-/// `Err` names the first failing check
-pub fn compatible_reader(old: &RelDescriptor, new: &RelDescriptor) -> Result<(), &'static str> {
+/// `Err` names the first failing check, with `Physical` winning over
+/// `Benign` wherever both apply
+pub fn compatible_reader(old: &RelDescriptor, new: &RelDescriptor) -> Result<(), Incompat> {
     if old.oid != new.oid {
-        return Err("oid mismatch");
+        return Err(Incompat::Physical("oid mismatch"));
     }
     if old.rfn != new.rfn {
-        return Err("filenode rotated");
+        return Err(Incompat::Physical("filenode rotated"));
     }
     if old.kind != new.kind {
-        return Err("relkind change");
+        return Err(Incompat::Physical("relkind change"));
     }
     if old.persistence != new.persistence {
-        return Err("persistence change");
+        return Err(Incompat::Physical("persistence change"));
     }
     // Old rows' external pointers resolve against the toast relation they
     // were written under; 0 -> oid is toast creation, old rows predate it
     if old.toast_oid != 0 && old.toast_oid != new.toast_oid {
-        return Err("toast relation change");
+        return Err(Incompat::Physical("toast relation change"));
     }
     if new.attributes.len() < old.attributes.len() {
-        return Err("attribute truncation");
+        return Err(Incompat::Physical("attribute truncation"));
     }
+    let mut benign: Option<&'static str> = None;
     for (o, n) in old.attributes.iter().zip(&new.attributes) {
-        slot_compatible(o, n)?;
+        if let Err(e) = slot_compatible(o, n) {
+            let Incompat::Benign(why) = e else {
+                return Err(e);
+            };
+            benign = benign.or(Some(why));
+        }
     }
     // Appended columns: old tuples read the stored missing value, or NULL.
     // NOT NULL without a missing value implies the rewrite path, which this
     // predicate must not bless for in-place history
     for n in &new.attributes[old.attributes.len()..] {
         if !n.dropped && n.not_null && n.missing_text.is_none() {
-            return Err("appended not-null column without missing value");
+            return Err(Incompat::Physical(
+                "appended not-null column without missing value",
+            ));
         }
     }
-    Ok(())
+    benign.map_or(Ok(()), |why| Err(Incompat::Benign(why)))
 }
 
-fn slot_compatible(o: &RelAttr, n: &RelAttr) -> Result<(), &'static str> {
+fn slot_compatible(o: &RelAttr, n: &RelAttr) -> Result<(), Incompat> {
     if o.attnum != n.attnum {
-        return Err("attnum sequence change");
+        return Err(Incompat::Physical("attnum sequence change"));
     }
     // Walk fields are read regardless of dropped state
     if o.type_len != n.type_len || o.type_align != n.type_align || o.type_byval != n.type_byval {
-        return Err("physical walk fields change");
+        return Err(Incompat::Physical("physical walk fields change"));
     }
     if o.dropped && !n.dropped {
         // PG re-adds at a fresh attnum, never resurrects a dropped slot
-        return Err("dropped slot resurrected");
+        return Err(Incompat::Physical("dropped slot resurrected"));
     }
     if n.dropped {
         // Present -> dropped inside the interval: value discarded either
         // way; atttypid/attmissingval zeroed on drop, walk fields checked
         return Ok(());
     }
-    if o.type_oid != n.type_oid || o.typmod != n.typmod {
-        return Err("type or typmod change");
-    }
-    if o.type_storage != n.type_storage {
-        return Err("storage change");
+    // Same width can still reinterpret: int4 vs date both walk 4 bytes
+    if o.type_oid != n.type_oid {
+        return Err(Incompat::Physical("type change"));
     }
     // Tuples shorter than attnum read the missing value; a different one
     // reinterprets history
     if o.missing_text != n.missing_text {
-        return Err("missing value change");
+        return Err(Incompat::Physical("missing value change"));
+    }
+    // Below: no reader consults these. The walk reads attlen/attalign/
+    // attbyval only (PG `src/backend/access/common/heaptuple.c`) and
+    // numeric/varlena datums carry their own scale and length, so a widened
+    // typmod reinterprets nothing
+    if o.typmod != n.typmod {
+        return Err(Incompat::Benign("typmod change"));
+    }
+    // attstorage drives writer-side toasting choices (PG
+    // `src/backend/access/table/toast_helper.c`); the reader detects
+    // external/compressed per datum from the varlena header (PG
+    // `src/include/varatt.h`)
+    if o.type_storage != n.type_storage {
+        return Err(Incompat::Benign("storage change"));
     }
     Ok(())
 }
@@ -173,20 +222,59 @@ mod tests {
     fn physical_changes_rejected() {
         let old = rel(vec![attr(1, 23, 4)]);
         let type_change = rel(vec![attr(1, 20, 8)]);
-        assert!(compatible_reader(&old, &type_change).is_err());
-        let mut typmod = rel(vec![attr(1, 23, 4)]);
-        typmod.attributes[0].typmod = 12;
-        assert!(compatible_reader(&old, &typmod).is_err());
-        let mut storage = rel(vec![attr(1, 23, 4)]);
-        storage.attributes[0].type_storage = 'e';
-        assert!(compatible_reader(&old, &storage).is_err());
+        assert!(
+            compatible_reader(&old, &type_change)
+                .unwrap_err()
+                .is_physical()
+        );
+        // Same width, different type: walk matches, values reinterpret
+        let mut same_width = rel(vec![attr(1, 23, 4)]);
+        same_width.attributes[0].type_oid = 1082; // date
+        assert_eq!(
+            compatible_reader(&old, &same_width),
+            Err(Incompat::Physical("type change"))
+        );
         let mut missing = rel(vec![attr(1, 23, 4)]);
         missing.attributes[0].missing_text = Some("1".into());
-        assert!(compatible_reader(&old, &missing).is_err());
+        assert_eq!(
+            compatible_reader(&old, &missing),
+            Err(Incompat::Physical("missing value change"))
+        );
         let truncated = rel(vec![]);
-        assert!(compatible_reader(&old, &truncated).is_err());
+        assert!(
+            compatible_reader(&old, &truncated)
+                .unwrap_err()
+                .is_physical()
+        );
         let reorder = rel(vec![attr(2, 23, 4)]);
-        assert!(compatible_reader(&old, &reorder).is_err());
+        assert!(compatible_reader(&old, &reorder).unwrap_err().is_physical());
+    }
+
+    #[test]
+    fn declared_shape_drift_is_benign() {
+        let old = rel(vec![attr(1, 1043, -1)]);
+        // varchar(10) -> varchar(20): varlena carries its own length
+        let mut typmod = rel(vec![attr(1, 1043, -1)]);
+        typmod.attributes[0].typmod = 24;
+        assert_eq!(
+            compatible_reader(&old, &typmod),
+            Err(Incompat::Benign("typmod change"))
+        );
+        let mut storage = rel(vec![attr(1, 1043, -1)]);
+        storage.attributes[0].type_storage = 'e';
+        assert_eq!(
+            compatible_reader(&old, &storage),
+            Err(Incompat::Benign("storage change"))
+        );
+        // Physical wins wherever both apply, whatever the slot order
+        let mut both = rel(vec![attr(1, 1043, -1), attr(2, 23, 4)]);
+        both.attributes[0].typmod = 24;
+        both.attributes[1].missing_text = Some("1".into());
+        let old_two = rel(vec![attr(1, 1043, -1), attr(2, 23, 4)]);
+        assert_eq!(
+            compatible_reader(&old_two, &both),
+            Err(Incompat::Physical("missing value change"))
+        );
     }
 
     #[test]

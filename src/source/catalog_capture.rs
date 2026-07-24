@@ -20,13 +20,17 @@
 //! oid's first pg_class touch in the xact; fallback the xact tree's first
 //! catalog touch. Dropped tombstones at `next_lsn`.
 //!
-//! Bias-early holds only when the final descriptor provably reads the whole
-//! dirty interval (`catalog::compat`). An unproven in-place transition
-//! publishes an `Ambiguity` over `[first_touch, next_lsn)` instead and
-//! lands its `Present` at `next_lsn` — post-commit rows decode, interval
-//! rows fail closed. Rotations skip the check: the rewrite emits
-//! final-layout tuples and superseded-generation rows retire with the old
-//! rfn. Fresh generations have no covered predecessor to compare.
+//! Bias-early holds when the final descriptor provably reads the whole
+//! dirty interval, and when the only drift is one `catalog::compat` calls
+//! benign — declared shape changed, every byte reads the same. A physically
+//! unproven in-place transition publishes an `Ambiguity` over
+//! `[first_touch, next_lsn)` instead and lands its `Present` at `next_lsn`:
+//! post-commit rows decode, interval rows fail closed per record at the
+//! drain ([`crate::xact::xact_buffer::resolve_stash`]). One interval per
+//! identity key (rfn, oid) so both lookup paths see the same fence.
+//! Rotations skip the check: the rewrite emits final-layout tuples and
+//! superseded-generation rows retire with the old rfn. Fresh generations
+//! have no covered predecessor to compare.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +38,7 @@ use std::sync::Arc;
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
+use crate::catalog::compat::Incompat;
 use crate::catalog::desc_log::{
     Ambiguity, AmbiguityReason, AmbiguityScope, BatchRecord, DescriptorLog, LogEntry, LogValue,
     ObservationKind, RelationObservation,
@@ -311,21 +316,32 @@ impl CatalogCapture {
                         // a fresh generation has no covered predecessor
                         let mut valid_from = first_touch;
                         if !rotated && let Some(pred) = pred_desc.as_deref() {
-                            let (from, ambiguity) =
-                                in_place_verdict(pred, desc, first_touch, next_lsn);
+                            let (from, published, incompat) =
+                                in_place_verdict(pred, desc, oid, first_touch, next_lsn);
                             valid_from = from;
-                            if let Some((amb, why)) = ambiguity {
+                            if let Some(why) = incompat.filter(|i| !i.is_physical()) {
+                                tracing::debug!(
+                                    target: "walshadow::desc_log",
+                                    oid,
+                                    rel = %desc.rel_name,
+                                    why = why.why(),
+                                    "in-place change reads identically, bias-early kept",
+                                );
+                            }
+                            if !published.is_empty() {
                                 tracing::warn!(
                                     target: "walshadow::desc_log",
                                     oid,
                                     rel = %desc.rel_name,
-                                    from = format_args!("{:#X}", amb.from_lsn),
-                                    through = format_args!("{:#X}", amb.through_lsn),
-                                    why,
+                                    from = format_args!("{first_touch:#X}"),
+                                    through = format_args!("{next_lsn:#X}"),
+                                    why = incompat.map_or("", |i| i.why()),
                                     "in-place change not provably decodable, ambiguity published",
                                 );
-                                ambiguities.push(Arc::new(amb));
+                                // One verdict, one count: siblings name the
+                                // same event under different keys
                                 self.stats.ambiguities_published.fetch_add(1, Relaxed);
+                                ambiguities.extend(published.into_iter().map(Arc::new));
                             }
                         }
                         let desc = Arc::new(desc.clone());
@@ -391,33 +407,45 @@ impl CatalogCapture {
     }
 }
 
-/// Entry LSN for an in-place final version + the ambiguity covering the
+/// Entry LSN for an in-place final version + the ambiguities covering the
 /// dirty interval when the final descriptor is not a proven reader of it.
 /// First pg_class touch bounds the interval; exact change positions inside
 /// stay unknown (only the first touch is tracked). Half-open end: the final
 /// version answers from `next_lsn`, keeping the post-commit descriptor
-/// usable over the ambiguous interval
+/// usable over the ambiguous interval.
+///
+/// A benign reject (declared shape drifted, every byte reads the same)
+/// keeps bias-early and publishes nothing. A physical one publishes one
+/// interval per identity key so the rfn-keyed decode path and the oid-keyed
+/// truncate path agree; order is fixed, batch equality and digest are
+/// order-sensitive
 fn in_place_verdict(
     pred: &RelDescriptor,
     fin: &RelDescriptor,
+    oid: Oid,
     first_touch: u64,
     next_lsn: u64,
-) -> (u64, Option<(Ambiguity, &'static str)>) {
-    match crate::catalog::compat::compatible_reader(pred, fin) {
-        Ok(()) => (first_touch, None),
-        Err(why) => (
-            next_lsn,
-            Some((
-                Ambiguity {
-                    scope: AmbiguityScope::Rfn(fin.rfn),
-                    from_lsn: first_touch,
-                    through_lsn: next_lsn,
-                    reason: AmbiguityReason::UnknownMutationPosition,
-                },
-                why,
-            )),
-        ),
+) -> (u64, Vec<Ambiguity>, Option<Incompat>) {
+    let Err(incompat) = crate::catalog::compat::compatible_reader(pred, fin) else {
+        return (first_touch, Vec::new(), None);
+    };
+    if !incompat.is_physical() {
+        return (first_touch, Vec::new(), Some(incompat));
     }
+    let interval = |scope| Ambiguity {
+        scope,
+        from_lsn: first_touch,
+        through_lsn: next_lsn,
+        reason: AmbiguityReason::UnknownMutationPosition,
+    };
+    (
+        next_lsn,
+        vec![
+            interval(AmbiguityScope::Rfn(fin.rfn)),
+            interval(AmbiguityScope::Oid(oid)),
+        ],
+        Some(incompat),
+    )
 }
 
 /// Added / Changed for heap kinds; toast shape changes are internal (chunk
@@ -479,22 +507,40 @@ mod tests {
     fn compatible_in_place_keeps_bias_early() {
         let pred = rel(23, 4, "t");
         let fin = rel(23, 4, "renamed");
-        let (from, amb) = in_place_verdict(&pred, &fin, 100, 500);
+        let (from, published, incompat) = in_place_verdict(&pred, &fin, 42, 100, 500);
         assert_eq!(from, 100);
-        assert!(amb.is_none());
+        assert!(published.is_empty());
+        assert_eq!(incompat, None);
     }
 
     #[test]
-    fn incompatible_in_place_publishes_interval() {
+    fn benign_in_place_keeps_bias_early() {
+        let pred = rel(1043, -1, "t");
+        let mut fin = rel(1043, -1, "t");
+        fin.attributes[0].typmod = 24;
+        let (from, published, incompat) = in_place_verdict(&pred, &fin, 42, 100, 500);
+        assert_eq!(from, 100, "read-identical drift keeps bias-early");
+        assert!(published.is_empty(), "no fence for a benign reject");
+        assert_eq!(incompat, Some(Incompat::Benign("typmod change")));
+    }
+
+    #[test]
+    fn physical_in_place_publishes_rfn_and_oid_siblings() {
         let pred = rel(23, 4, "t");
         let fin = rel(20, 8, "t");
-        let (from, amb) = in_place_verdict(&pred, &fin, 100, 500);
+        let (from, published, incompat) = in_place_verdict(&pred, &fin, 42, 100, 500);
         assert_eq!(from, 500, "final version serves post-commit rows only");
-        let (amb, why) = amb.expect("ambiguity for type change");
-        assert_eq!(amb.scope, AmbiguityScope::Rfn(fin.rfn));
-        assert_eq!(amb.from_lsn, 100);
-        assert_eq!(amb.through_lsn, 500);
-        assert_eq!(amb.reason, AmbiguityReason::UnknownMutationPosition);
-        assert!(!why.is_empty());
+        assert!(incompat.is_some_and(|i| i.is_physical()));
+        // Fixed order: batch equality and digest gate append idempotency
+        let scopes: Vec<AmbiguityScope> = published.iter().map(|a| a.scope).collect();
+        assert_eq!(
+            scopes,
+            vec![AmbiguityScope::Rfn(fin.rfn), AmbiguityScope::Oid(42)]
+        );
+        for amb in &published {
+            assert_eq!(amb.from_lsn, 100);
+            assert_eq!(amb.through_lsn, 500);
+            assert_eq!(amb.reason, AmbiguityReason::UnknownMutationPosition);
+        }
     }
 }

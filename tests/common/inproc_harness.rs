@@ -879,6 +879,31 @@ pub async fn pump_until<S: RecordSink + Send>(
     segments_needed: u64,
     deadline: Duration,
 ) -> u64 {
+    pump_until_res(
+        feed,
+        stream,
+        record_sink,
+        segment_sink,
+        chunk_buf,
+        segments_needed,
+        deadline,
+    )
+    .await
+    .expect("push")
+}
+
+/// `pump_until` surfacing a sink error instead of panicking, for drills
+/// asserting a fail-closed path (fence, unmodelled op)
+#[allow(clippy::too_many_arguments)]
+pub async fn pump_until_res<S: RecordSink + Send>(
+    feed: &mut SourceFeed,
+    stream: &mut WalStream,
+    record_sink: &mut S,
+    segment_sink: &mut DirSegmentSink,
+    chunk_buf: &mut Vec<u8>,
+    segments_needed: u64,
+    deadline: Duration,
+) -> std::result::Result<u64, String> {
     let end = Instant::now() + deadline;
     let mut segments_shipped = 0u64;
     let mut prev = stream.dispatched_lsn();
@@ -898,14 +923,14 @@ pub async fn pump_until<S: RecordSink + Send>(
         stream
             .push(chunk.start_lsn, chunk.data, record_sink, segment_sink)
             .await
-            .expect("push");
+            .map_err(|e| format!("{e:#}"))?;
         let now = stream.dispatched_lsn();
         if now != prev {
             segments_shipped += (now - prev) / WAL_SEG_SIZE;
             prev = now;
         }
     }
-    segments_shipped
+    Ok(segments_shipped)
 }
 
 /// Drive the WAL pump until `segments_needed` segments have shipped or
@@ -916,6 +941,24 @@ pub async fn pump_segments(
     deadline: Duration,
 ) -> u64 {
     pump_until(
+        &mut pipeline.feed,
+        &mut pipeline.stream,
+        &mut pipeline.sinks,
+        &mut pipeline.segment_sink,
+        &mut pipeline.chunk_buf,
+        segments_needed,
+        deadline,
+    )
+    .await
+}
+
+/// `pump_segments` surfacing the sink error a fail-closed path raises
+pub async fn pump_segments_res(
+    pipeline: &mut Pipeline,
+    segments_needed: u64,
+    deadline: Duration,
+) -> std::result::Result<u64, String> {
+    pump_until_res(
         &mut pipeline.feed,
         &mut pipeline.stream,
         &mut pipeline.sinks,

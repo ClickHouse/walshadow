@@ -47,6 +47,15 @@ fire constantly and reduce the enumerated path to dead code.
 
 ## Residual gaps
 
+- **Payload-free stash resolving decodable.** A record whose filenode was
+  invisible at record time *and* had no `XLOG_SMGR_CREATE` marker is tracked
+  without payload (`track_unresolvable`), because the set cannot prove
+  completeness. If that filenode later resolves `Ordinary` at commit, those
+  rows are gone; `resolve_stash` warns rather than failing closed, since the
+  common markerless shapes (born and gone inside the xact family) resolve to
+  a tombstone and discard legitimately. Closing it needs the marker set to
+  be complete, or per-record tracking that distinguishes "no marker yet"
+  from "never observable".
 - **`type_name` staleness after `ALTER TYPE ... RENAME`.** Bounded: decode
   never reads `type_name` (physical layout comes from
   attlen/attalign/attbyval), and every SQL capture re-reads live typname —

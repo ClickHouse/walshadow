@@ -97,7 +97,7 @@ pub struct MetricsSnapshot {
     pub xact_plan_bytes_by_storage: [u64; 2],
     /// Planning failures `[spool, fail_closed, detoast, partial_update,
     /// view, drain]`, rendered `reason=` labelled
-    pub xact_plan_failures_by_reason: [u64; 6],
+    pub xact_plan_failures_by_reason: [u64; 11],
     /// Plan-time route resolutions `[mapped, unmapped]`, rendered
     /// `result=` labelled
     pub route_snapshots_by_result: [u64; 2],
@@ -115,11 +115,6 @@ pub struct MetricsSnapshot {
     /// Gauges: raw-decoded heaps queued for pending-first yield
     pub raw_pending_rows: u64,
     pub raw_pending_bytes: u64,
-    /// Ambiguous descriptor lookups by [`crate::catalog::desc_log::AmbiguityReason`]
-    /// order `[unknown_affected_relation, unknown_mutation_position,
-    /// multiple_incompatible_layouts, never_visible_generation,
-    /// incomplete_invalidation]`, rendered `reason=` labelled
-    pub descriptor_ambiguous_by_reason: [u64; 5],
     pub emitter_rows_total: u64,
     pub emitter_blocks_total: u64,
     pub emitter_xacts_total: u64,
@@ -284,24 +279,20 @@ impl Default for RateEstimator {
 
 /// Prometheus text-format. Each metric gets `# HELP` + `# TYPE`; counters use
 /// the `_total` suffix per Prom convention.
-/// `reason=` label order of `MetricsSnapshot::xact_plan_failures_by_reason`
-const PLAN_FAILURE_REASONS: [&str; 6] = [
+/// `reason=` label order of `MetricsSnapshot::xact_plan_failures_by_reason`,
+/// matching [`crate::emit::pipeline::planner::drain_reason`]
+const PLAN_FAILURE_REASONS: [&str; 11] = [
     "spool",
-    "fail_closed",
+    "fail_closed_image_only",
+    "fail_closed_malformed",
+    "fail_closed_unsupported_op",
+    "stash_ambiguous",
+    "incomplete_toast",
+    "missing_stash_resolution",
     "detoast",
     "partial_update",
     "view",
     "drain",
-];
-
-/// `reason=` label order of `MetricsSnapshot::descriptor_ambiguous_by_reason`,
-/// matching [`crate::catalog::desc_log::AmbiguityReason`] variant order
-const AMBIGUITY_REASONS: [&str; 5] = [
-    "unknown_affected_relation",
-    "unknown_mutation_position",
-    "multiple_incompatible_layouts",
-    "never_visible_generation",
-    "incomplete_invalidation",
 ];
 
 pub fn render(snap: &MetricsSnapshot) -> String {
@@ -945,19 +936,6 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         writeln!(s, "# HELP {name} Bytes held by the pending raw fanout.").unwrap();
         writeln!(s, "# TYPE {name} gauge").unwrap();
         writeln!(s, "{name} {}", snap.raw_pending_bytes).unwrap();
-        let name = "walshadow_descriptor_ambiguous_total";
-        writeln!(
-            s,
-            "# HELP {name} Descriptor lookups landing in an ambiguity interval."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (reason, v) in AMBIGUITY_REASONS
-            .iter()
-            .zip(snap.descriptor_ambiguous_by_reason)
-        {
-            writeln!(s, "{name}{{reason=\"{reason}\"}} {v}").unwrap();
-        }
     }
 
     // Umbrella count bare + per-mode labelled series in one family
@@ -1121,7 +1099,7 @@ mod tests {
         let snap = MetricsSnapshot {
             xact_plan_rows: 9,
             xact_plan_bytes_by_storage: [100, 200],
-            xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6],
+            xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             route_snapshots_by_result: [7, 8],
             ..MetricsSnapshot::default()
         };
@@ -1130,14 +1108,38 @@ mod tests {
         assert!(body.contains("walshadow_xact_plan_bytes{storage=\"mem\"} 100"));
         assert!(body.contains("walshadow_xact_plan_bytes{storage=\"file\"} 200"));
         assert!(body.contains("walshadow_xact_plan_rows 9"));
-        assert!(body.contains("walshadow_xact_plan_failures_total{reason=\"spool\"} 1"));
-        assert!(body.contains("walshadow_xact_plan_failures_total{reason=\"fail_closed\"} 2"));
-        assert!(body.contains("walshadow_xact_plan_failures_total{reason=\"detoast\"} 3"));
-        assert!(body.contains("walshadow_xact_plan_failures_total{reason=\"partial_update\"} 4"));
-        assert!(body.contains("walshadow_xact_plan_failures_total{reason=\"view\"} 5"));
-        assert!(body.contains("walshadow_xact_plan_failures_total{reason=\"drain\"} 6"));
+        for (i, reason) in PLAN_FAILURE_REASONS.iter().enumerate() {
+            let want = format!(
+                "walshadow_xact_plan_failures_total{{reason=\"{reason}\"}} {}",
+                i + 1
+            );
+            assert!(body.contains(&want), "{want}");
+        }
         assert!(body.contains("walshadow_route_snapshots_total{result=\"mapped\"} 7"));
         assert!(body.contains("walshadow_route_snapshots_total{result=\"unmapped\"} 8"));
+    }
+
+    /// Prometheus rejects a family declared twice; `descriptor_ambiguous_total`
+    /// was emitted bare and labelled with contradicting HELP text
+    #[test]
+    fn render_declares_each_family_once() {
+        let body = render(&MetricsSnapshot::default());
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ")
+                && let Some(name) = rest.split_whitespace().next()
+            {
+                *seen.entry(name).or_default() += 1;
+            }
+        }
+        let dupes: Vec<&&str> = seen
+            .iter()
+            .filter(|(_, n)| **n > 1)
+            .map(|(name, _)| name)
+            .collect();
+        assert!(dupes.is_empty(), "families declared twice: {dupes:?}");
+        let helps = body.lines().filter(|l| l.starts_with("# HELP ")).count();
+        assert_eq!(helps, seen.len(), "one HELP per TYPE");
     }
 
     #[test]
@@ -1147,7 +1149,8 @@ mod tests {
             raw_decode_rows_by_op: [1, 2, 3, 4, 5, 6, 7],
             raw_pending_rows: 13,
             raw_pending_bytes: 14,
-            descriptor_ambiguous_by_reason: [21, 22, 23, 24, 25],
+            descriptor_ambiguous_total: 21,
+            desc_lookups_ambiguous_total: 22,
             ..MetricsSnapshot::default()
         };
         snap.raw_stash_records_by_kind_op[0][0] = 31; // dirty insert
@@ -1174,12 +1177,10 @@ mod tests {
         assert!(body.contains("walshadow_raw_decode_rows_total{op=\"multi_insert\"} 6"));
         assert!(body.contains("walshadow_raw_pending_rows 13"));
         assert!(body.contains("walshadow_raw_pending_bytes 14"));
-        assert!(body.contains(
-            "walshadow_descriptor_ambiguous_total{reason=\"unknown_affected_relation\"} 21"
-        ));
-        assert!(body.contains(
-            "walshadow_descriptor_ambiguous_total{reason=\"incomplete_invalidation\"} 25"
-        ));
+        // Published intervals and lookups landing in one stay distinct
+        // families, each bare
+        assert!(body.contains("walshadow_descriptor_ambiguous_total 21"));
+        assert!(body.contains("walshadow_desc_lookups_ambiguous_total 22"));
     }
 
     #[tokio::test(flavor = "current_thread")]

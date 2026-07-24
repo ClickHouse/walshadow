@@ -917,7 +917,12 @@ impl ReorderSink {
 fn bump_plan_failure(stats: &EmitterStats, reason: &'static str) {
     let counter = match reason {
         "spool" => &stats.plan_failures_spool,
-        "fail_closed" => &stats.plan_failures_fail_closed,
+        "fail_closed_image_only" => &stats.plan_failures_fail_closed_image_only,
+        "fail_closed_malformed" => &stats.plan_failures_fail_closed_malformed,
+        "fail_closed_unsupported_op" => &stats.plan_failures_fail_closed_unsupported_op,
+        "stash_ambiguous" => &stats.plan_failures_stash_ambiguous,
+        "incomplete_toast" => &stats.plan_failures_incomplete_toast,
+        "missing_stash_resolution" => &stats.plan_failures_missing_stash_resolution,
         "detoast" => &stats.plan_failures_detoast,
         "partial_update" => &stats.plan_failures_partial_update,
         "view" => &stats.plan_failures_view,

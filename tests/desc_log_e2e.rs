@@ -289,7 +289,8 @@ async fn in_place_intervals_compatible_and_ambiguous() {
         &tmp,
         "CREATE SCHEMA iv;\n\
          CREATE TABLE iv.t_ren (id bigint PRIMARY KEY, v text);\n\
-         CREATE TABLE iv.t_wid (id bigint PRIMARY KEY, v varchar(10));\n",
+         CREATE TABLE iv.t_wid (id bigint PRIMARY KEY, v varchar(10));\n\
+         CREATE TABLE iv.t_typ (id bigint PRIMARY KEY, v varchar(10));\n",
         slot.source,
         slot.shadow,
         slot.walsender,
@@ -323,6 +324,7 @@ async fn in_place_intervals_compatible_and_ambiguous() {
     };
     let (oid_ren, rfn_ren) = rfn_of("t_ren");
     let (_oid_wid, rfn_wid) = rfn_of("t_wid");
+    let (oid_typ, rfn_typ) = rfn_of("t_typ");
 
     let ch_tmp = tempfile::tempdir().unwrap();
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
@@ -353,6 +355,7 @@ async fn in_place_intervals_compatible_and_ambiguous() {
          INSERT INTO iv.t_wid (id, v) VALUES (1, 'aaaa');\n\
          ALTER TABLE iv.t_wid ALTER COLUMN v TYPE varchar(20);\n\
          COMMIT;\n\
+         ALTER TABLE iv.t_typ ALTER COLUMN v TYPE text;\n\
          SELECT pg_switch_wal();\n",
     );
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(60)).await;
@@ -369,30 +372,59 @@ async fn in_place_intervals_compatible_and_ambiguous() {
     let _ = shadow.stop();
     let _ = source.stop();
 
-    // Unproven widen: one rfn-scoped interval, Ambiguous inside, final
-    // version at through_lsn (= boundary next_lsn), predecessor before
-    let ambs = log.rfn_ambiguities(rfn_wid);
-    assert_eq!(ambs.len(), 1, "widen publishes one ambiguity: {ambs:?}");
+    // Widen is benign: typmod never reaches the reader, so bias-early holds
+    // and no fence is published. varchar(20) typmod = 24
+    assert!(
+        log.rfn_ambiguities(rfn_wid).is_empty(),
+        "typmod widen reads identically: {:?}",
+        log.rfn_ambiguities(rfn_wid),
+    );
+    match log.descriptor_at(rfn_wid, log.head()) {
+        LookupResult::Present(d) => assert_eq!(d.attributes[1].typmod, 24),
+        other => panic!("expected widened Present, got {other:?}"),
+    }
+
+    // varchar(10) -> text is binary coercible, so PG changes atttypid in
+    // place: no descriptor reads both, one interval per identity key
+    let ambs = log.rfn_ambiguities(rfn_typ);
+    assert_eq!(ambs.len(), 1, "type change publishes one rfn interval");
+    let siblings = log.oid_ambiguities(oid_typ);
+    assert_eq!(siblings.len(), 1, "and its oid-keyed sibling");
     let amb = &ambs[0];
     assert_eq!(amb.reason, AmbiguityReason::UnknownMutationPosition);
+    assert_eq!(
+        (siblings[0].from_lsn, siblings[0].through_lsn),
+        (amb.from_lsn, amb.through_lsn),
+        "siblings name the same span",
+    );
     assert!(amb.from_lsn < amb.through_lsn);
-    assert!(matches!(
-        log.descriptor_at(rfn_wid, amb.from_lsn),
-        LookupResult::Ambiguous(_)
-    ));
-    assert!(matches!(
-        log.descriptor_at(rfn_wid, amb.through_lsn - 1),
-        LookupResult::Ambiguous(_)
-    ));
-    match log.descriptor_at(rfn_wid, amb.through_lsn) {
-        // varchar(20) typmod = 24
-        LookupResult::Present(d) => assert_eq!(d.attributes[1].typmod, 24),
+    for lsn in [amb.from_lsn, amb.through_lsn - 1] {
+        assert!(matches!(
+            log.descriptor_at(rfn_typ, lsn),
+            LookupResult::Ambiguous(_)
+        ));
+        assert!(matches!(
+            log.descriptor_by_oid_at(oid_typ, lsn),
+            LookupResult::Ambiguous(_)
+        ));
+    }
+    // Records stashed inside the span fence per record at the drain; the
+    // interval overlaps any range touching it
+    assert_eq!(
+        log.ambiguities_intersecting(rfn_typ, Some(oid_typ), amb.from_lsn, amb.through_lsn)
+            .len(),
+        2,
+        "both keys answer the drain's fence query",
+    );
+    match log.descriptor_at(rfn_typ, amb.through_lsn) {
+        // text
+        LookupResult::Present(d) => assert_eq!(d.attributes[1].type_oid, 25),
         other => panic!("expected final Present at through_lsn, got {other:?}"),
     }
     let pred = log
-        .present_before(rfn_wid, amb.from_lsn)
+        .present_before(rfn_typ, amb.from_lsn)
         .expect("durable predecessor");
-    assert_eq!(pred.attributes[1].typmod, 14, "varchar(10) predecessor");
+    assert_eq!(pred.attributes[1].type_oid, 1043, "varchar predecessor");
 
     // Compatible rename: no ambiguity, bias-early Present answers across
     // the interval with the final attribute name
