@@ -1561,7 +1561,12 @@ crate::atomic_stats! {
         /// Planning-stage failures by reason; a failed plan means the whole
         /// transaction emits nothing
         pub plan_failures_spool,
-        pub plan_failures_fail_closed,
+        pub plan_failures_fail_closed_image_only,
+        pub plan_failures_fail_closed_malformed,
+        pub plan_failures_fail_closed_unsupported_op,
+        pub plan_failures_stash_ambiguous,
+        pub plan_failures_incomplete_toast,
+        pub plan_failures_missing_stash_resolution,
         pub plan_failures_detoast,
         pub plan_failures_partial_update,
         pub plan_failures_view,

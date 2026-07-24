@@ -263,7 +263,15 @@ impl CatalogTracker {
     }
 
     /// True when `(db, rel)` is pg_namespace's current heap — the
-    /// capture-all trigger set
+    /// capture-all trigger set.
+    ///
+    /// pg_type stays out by choice, though its writes are equally
+    /// unenumerated by relcache invals: CREATE TABLE writes pg_type on every
+    /// run (composite + array rows), so triggering on it would fire
+    /// capture-all constantly and leave the enumerated path dead. The cost
+    /// is a stale `RelAttr.type_name` after `ALTER TYPE … RENAME`, which no
+    /// decode path reads — accepted, with remediation options in
+    /// `plans/future/catalog_capture_completeness.md`
     pub fn is_capture_all_catalog(&self, db: u32, rel: u32) -> bool {
         match self.pg_namespace_filenode.get(&db) {
             Some(&fnum) => fnum == rel,

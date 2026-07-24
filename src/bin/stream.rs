@@ -1514,6 +1514,12 @@ async fn run_session(
     let mut segment_sink =
         DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx)
             .context("open out-dir")?;
+    // Descriptor-log GC off the pump task: the pump publishes each persisted
+    // floor, the task compacts. Coalesces by construction — a watch holds
+    // only the latest floor.
+    let gc_fatal = walshadow::pipeline::Fatal::new();
+    let (gc_floor_tx, gc_floor_rx) = tokio::sync::watch::channel(0u64);
+    let gc_task = spawn_desc_log_gc(desc_log.clone(), gc_floor_rx, gc_fatal.clone());
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     // Metrics endpoint + control socket + SIGHUP are process-lifetime (bound in
@@ -1667,11 +1673,10 @@ async fn run_session(
             // Publish only after persist: pruners cut against what a
             // crash-now restart actually resumes from.
             resume_floor.store(cur.floor.0, Ordering::Release);
-            // Descriptor log prunes against the same floor
-            desc_log
-                .maybe_gc(cur.floor.0)
-                .await
-                .context("descriptor log gc")?;
+            // Descriptor log prunes against the same floor, off this task: a
+            // compaction rewrites the whole ckpt inline and would stall WAL
+            // consumption past the source's wal_sender_timeout
+            gc_floor_tx.send_replace(cur.floor.0);
         }
         // flush caps physical slot's restart_lsn.
         // Manifest writes are cadence-gated above while keepalive replies inside
@@ -1744,6 +1749,9 @@ async fn run_session(
         }
         if let Some(msg) = fsync_fatal.message() {
             anyhow::bail!("segment fsync failed: {msg}");
+        }
+        if let Some(msg) = gc_fatal.message() {
+            anyhow::bail!("{msg}");
         }
         let now_dispatched = stream.dispatched_lsn();
         let advanced = now_dispatched != prev_dispatched;
@@ -1899,6 +1907,13 @@ async fn run_session(
     fsync_task.await.ok();
     if let Some(msg) = fsync_fatal.message() {
         anyhow::bail!("segment fsync failed: {msg}");
+    }
+    // Close the floor channel and join: nothing else may own desc_log.ckpt
+    // after the session returns
+    drop(gc_floor_tx);
+    gc_task.await.ok();
+    if let Some(msg) = gc_fatal.message() {
+        anyhow::bail!("{msg}");
     }
     // Drain queueing worker so enqueued-but-undispatched records run
     // through decoder + xact_drain before exit; surfaces worker-parked errors.
@@ -2201,6 +2216,28 @@ fn spawn_segment_fsync(
     })
 }
 
+/// Compact the descriptor log against each published resume floor, off the
+/// pump task. A compaction rewrites the whole ckpt inline; on the pump that
+/// stalls WAL consumption while `wal_sender_timeout` runs with no keepalive
+/// answered. Boundary capture still shares the log's writer mutex, so a
+/// boundary landing mid-compaction blocks its hold — this removes the stall
+/// for boundary-free stretches, which is the common case.
+fn spawn_desc_log_gc(
+    desc_log: Arc<walshadow::desc_log::DescriptorLog>,
+    mut floor_rx: tokio::sync::watch::Receiver<u64>,
+    fatal: walshadow::pipeline::Fatal,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while floor_rx.changed().await.is_ok() {
+            let floor = *floor_rx.borrow_and_update();
+            if let Err(e) = desc_log.maybe_gc(floor).await {
+                fatal.set(format!("descriptor log gc at {floor:#X}: {e}"));
+                return;
+            }
+        }
+    })
+}
+
 /// Every [`DEFAULT_TRIM_INTERVAL`], read shadow replay LSN and last
 /// restartpoint REDO LSN, then trim below
 /// `min(replay_lsn - retention_bytes, redo)`
@@ -2452,7 +2489,16 @@ async fn populate_metrics(
             .map(|s| {
                 [
                     s.plan_failures_spool.load(Ordering::Relaxed),
-                    s.plan_failures_fail_closed.load(Ordering::Relaxed),
+                    s.plan_failures_fail_closed_image_only
+                        .load(Ordering::Relaxed),
+                    s.plan_failures_fail_closed_malformed
+                        .load(Ordering::Relaxed),
+                    s.plan_failures_fail_closed_unsupported_op
+                        .load(Ordering::Relaxed),
+                    s.plan_failures_stash_ambiguous.load(Ordering::Relaxed),
+                    s.plan_failures_incomplete_toast.load(Ordering::Relaxed),
+                    s.plan_failures_missing_stash_resolution
+                        .load(Ordering::Relaxed),
                     s.plan_failures_detoast.load(Ordering::Relaxed),
                     s.plan_failures_partial_update.load(Ordering::Relaxed),
                     s.plan_failures_view.load(Ordering::Relaxed),
@@ -2489,17 +2535,6 @@ async fn populate_metrics(
             .unwrap_or_default(),
         raw_pending_rows: drain_resident.raw_pending_rows,
         raw_pending_bytes: drain_resident.raw_pending_bytes,
-        descriptor_ambiguous_by_reason: [
-            log_stats.ambiguous_unknown_relation.load(Ordering::Relaxed),
-            log_stats.ambiguous_unknown_position.load(Ordering::Relaxed),
-            log_stats
-                .ambiguous_incompatible_layouts
-                .load(Ordering::Relaxed),
-            log_stats.ambiguous_never_visible.load(Ordering::Relaxed),
-            log_stats
-                .ambiguous_incomplete_invalidation
-                .load(Ordering::Relaxed),
-        ],
         emitter_rows_total: emitter_stats
             .map(|s| s.rows_emitted.load(Ordering::Relaxed))
             .unwrap_or(0),

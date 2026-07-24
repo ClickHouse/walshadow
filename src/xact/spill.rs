@@ -197,6 +197,27 @@ impl RawRecord {
         }
     }
 
+    /// Drop block images that decode can never read: a block carrying its
+    /// own data decodes from that data, and the FPI-restore path
+    /// (`decode_image_insert`, toast rewrite) only ever runs for a block
+    /// with an image and no data. Clearing the flag too keeps the record
+    /// self-consistent, so operation policy still reads it as data-carrying.
+    /// Images are up to 8 KiB each; a dirty xact's COPY otherwise spills its
+    /// whole WAL volume
+    pub fn drop_redundant_images(&mut self) {
+        for b in &mut self.blocks {
+            if b.data_length == 0 || b.image_length == 0 {
+                continue;
+            }
+            b.fork_flags &= !walrus::pg::walparser::BKP_BLOCK_HAS_IMAGE;
+            b.image_length = 0;
+            b.hole_offset = 0;
+            b.hole_length = 0;
+            b.bimg_info = 0;
+            b.image = Vec::new();
+        }
+    }
+
     /// Target filenode: block 0's relation, matching decoder convention
     pub fn rfn(&self) -> Option<RelFileNode> {
         self.blocks.first().map(|b| RelFileNode {
@@ -1399,6 +1420,52 @@ mod tests {
         }
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
+    }
+
+    #[test]
+    fn drop_redundant_images_keeps_image_only_block() {
+        let block = |data_length: u16, image_length: u16| RawBlock {
+            block_id: 0,
+            fork_flags: 0x10 | 0x20,
+            data_length,
+            image_length,
+            hole_offset: 24,
+            hole_length: 7000,
+            bimg_info: 0x05,
+            spc_node: 1663,
+            db_node: 5,
+            rel_node: 24681,
+            block_no: 0,
+            image: vec![0xAB; image_length as usize],
+            data: vec![7; data_length as usize],
+        };
+        let mut raw = RawRecord {
+            xid: 5,
+            rm: 10,
+            info: 0,
+            source_lsn: 0x50,
+            page_magic: 0xD114,
+            main_data: vec![8],
+            // block 0 carries both, block 1 image only (rewrite toast chunk)
+            blocks: vec![block(4, 100), block(0, 100)],
+        };
+        let before = raw.approx_bytes();
+        raw.drop_redundant_images();
+        assert!(raw.blocks[0].image.is_empty(), "unread image dropped");
+        assert_eq!(raw.blocks[0].image_length, 0);
+        assert_eq!(raw.blocks[0].fork_flags & 0x10, 0, "HAS_IMAGE cleared");
+        assert_eq!(raw.blocks[0].data, vec![7; 4], "decode input kept");
+        assert_eq!(
+            raw.blocks[1].image.len(),
+            100,
+            "image-only block is the FPI-restore path's only input",
+        );
+        assert!(raw.approx_bytes() < before);
+        // Rebuilt record agrees: block 0 reads as data-carrying, block 1 not
+        let rec = raw.to_xlog_record();
+        assert!(!rec.blocks[0].header.has_image());
+        assert!(rec.blocks[0].header.has_data());
+        assert!(rec.blocks[1].header.has_image());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -42,7 +42,7 @@ XactState {
     spill: Option<SpillWriter>,             // None until first eviction
     spill_bytes,                            // mirrors writer.byte_count()
     events: Vec<(u64, DrainEntry)>,          // catalog/config/toast barriers
-    stash_rfns: HashSet<RelFileNode>,        // commit-time resolution set
+    stash_rfns: HashMap<RelFileNode, StashMark>, // commit-time resolution set
 }
 ```
 
@@ -116,15 +116,23 @@ abort discard come for free. Three admission gates, in order:
   ([filter.md](filter.md)): once a xact family touches the catalog,
   every subsequent ordinary heap record in that family stashes raw —
   a Present predecessor descriptor doesn't prove decodability inside
-  the dirty interval
+  the dirty interval. Blocks that carry their own data drop their block
+  image here: ordinary raw decode reads data only, and the FPI-restore
+  path (rewrite-path toast chunks) needs an image *without* data, so
+  keeping both would spill a dirty COPY's whole WAL volume
 - known-invisible filenode: `XLOG_SMGR_CREATE` marker (observed
   pre-route-gate, global by filenode since the record can precede xid
   assignment) or a prior stash on the same rfn; the xact's own records
   can never resolve, so the per-record lookup is skipped
 - spanned lookup miss: `descriptor_at_spanned(rfn, lsn)` answering
-  NotCovered past the coverage horizon, Dropped, or Ambiguous defers
-  to commit-time resolution; ForeignDb / pre-horizon NotCovered /
-  Retired are counted skips (rows can't outlive the commit)
+  NotCovered past the coverage horizon or Dropped defers to commit-time
+  resolution; ForeignDb / pre-horizon NotCovered / Retired are counted
+  skips (rows can't outlive the commit). Ambiguous is reachable only on a
+  re-read starting past the dirty tree's first touch — marker-proven
+  filenodes defer, markerless ones fail closed rather than drop payload
+
+`StashMark` carries the filenode's lowest stashed LSN (the fence query's
+lower bound) and whether any record on it was tracked payload-free.
 
 At commit `resolve_stash` resolves each candidate against the log at
 the commit's `next_lsn` (capture ran inside the boundary hold, so the
@@ -135,15 +143,23 @@ verdicts the drain merge consumes:
   marker-proven generation without its chunks fails closed
   (`IncompleteToastGeneration`), and each proven generation queues a
   `DrainEntry::ToastBarrier` at commit LSN ([TOAST.md](TOAST.md))
-- Present ordinary → `Ordinary(rel, valid_from)`: raw records re-run
-  the heap decoder at drain under the commit-resolution descriptor,
+- Present ordinary → `Ordinary { rel, valid_from, fence }`: raw records
+  re-run the heap decoder at drain under the commit-resolution descriptor,
   fanning rows out through the merge's pending queue (MULTI_INSERT
   yields per-tuple rows in tuple order, same-LSN events order before
   the fanout); this is what delivers `BEGIN; CREATE TABLE; COPY;
   COMMIT` rows
-- Ambiguous → fatal `XactBufferError::StashAmbiguous`: no descriptor
-  proven safe, neither decode nor discard is sound; operator takes a
-  fresh snapshot
+- `fence` is the filenode's ambiguity intervals overlapping
+  `[first stashed lsn, next_lsn)`. Resolution asks the log at `next_lsn`,
+  past every interval this commit published, so the verdict carries the
+  intervals and the drain fails closed per record whose own `source_lsn`
+  falls inside one (`XactBufferError::StashAmbiguous`): no descriptor
+  proven safe, neither decode nor discard is sound, operator takes a
+  fresh snapshot. A toast filenode with any overlap fails closed at
+  resolution — chunk layout is fixed, so an interval there is unmodelled
+- draining stashed raws with no verdict installed fails closed
+  (`MissingStashResolution`); an aborted tree drops any verdict it had, so
+  a xid reused later never folds under a foreign descriptor
 - Dropped / Retired / NotCovered → discard, end-state-neutral.
   NotCovered with a marker means born + gone inside the xact family
   (capture tombstones only predecessors; a commit-time survivor is

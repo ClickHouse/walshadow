@@ -17,9 +17,12 @@
 //!
 //! Validation coverage, one enforcement point per plan-success guarantee:
 //! - descriptor Present and unambiguous → commit-time stash verdicts at
-//!   the drain (ambiguous / never-visible generations fail closed)
+//!   the drain, fenced per record against the resolved filenode's ambiguity
+//!   intervals (`XactBufferError::StashAmbiguous`); a tree that stashed and
+//!   reached the drain with no verdict installed fails closed too
+//!   (`MissingStashResolution`)
 //! - operation supported with logical tuple data → raw operation policy
-//!   ([`FailClosedReason`](crate::xact::xact_buffer::FailClosedReason))
+//!   ([`FailClosedReason`])
 //! - decoded xid matches owning xact/subxact → merge ownership check
 //!   (`XactBufferError::ForeignXid`)
 //! - partial update reconstructs → [`PlanError::PartialUpdate`] here; no
@@ -44,7 +47,7 @@ use crate::emit::pipeline::plan_spool::{
 use crate::emit::route::RouteSnapshot;
 use crate::toast::{ChunkRefMap, ToastResolver};
 use crate::xact::xact_buffer::{
-    DrainEntry, DrainWalk, DrainedBatch, WalkStep, XactBufferError, detoast_heap,
+    DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError, detoast_heap,
 };
 
 /// Planner's window onto route state. Implementations resolve from frozen
@@ -88,10 +91,22 @@ impl PlanError {
     }
 }
 
-/// `reason=` label for drain-side errors aborting a plan
+/// `reason=` label for drain-side errors aborting a plan. Fail-closed
+/// verdicts split by cause and the intentional sentinels get their own
+/// labels: collapsing them into one bucket left an operator unable to tell
+/// an unmodelled WAL op from a spill I/O error
 pub fn drain_reason(e: &XactBufferError) -> &'static str {
     match e {
-        XactBufferError::OrdinaryFailClosed { .. } => "fail_closed",
+        XactBufferError::OrdinaryFailClosed { reason, .. } => match reason {
+            FailClosedReason::ImageOnly => "fail_closed_image_only",
+            FailClosedReason::Malformed(_) => "fail_closed_malformed",
+            FailClosedReason::UnsupportedOperation => "fail_closed_unsupported_op",
+            // Same class as PlanError::PartialUpdate, different stage
+            FailClosedReason::PartialUpdate => "partial_update",
+        },
+        XactBufferError::StashAmbiguous { .. } => "stash_ambiguous",
+        XactBufferError::IncompleteToastGeneration { .. } => "incomplete_toast",
+        XactBufferError::MissingStashResolution { .. } => "missing_stash_resolution",
         XactBufferError::Detoast(_) | XactBufferError::ValueTooLarge { .. } => "detoast",
         _ => "drain",
     }
@@ -202,12 +217,51 @@ mod tests {
             "partial_update"
         );
         assert_eq!(PlanError::View("x".into()).reason(), "view");
-        let fail_closed = XactBufferError::OrdinaryFailClosed {
+        let fail_closed = |reason| XactBufferError::OrdinaryFailClosed {
             relid: 1,
             lsn: 2,
-            reason: FailClosedReason::ImageOnly,
+            rm: 10,
+            info: 0,
+            reason,
         };
-        assert_eq!(drain_reason(&fail_closed), "fail_closed");
+        assert_eq!(
+            drain_reason(&fail_closed(FailClosedReason::ImageOnly)),
+            "fail_closed_image_only"
+        );
+        assert_eq!(
+            drain_reason(&fail_closed(FailClosedReason::Malformed("x".into()))),
+            "fail_closed_malformed"
+        );
+        assert_eq!(
+            drain_reason(&fail_closed(FailClosedReason::UnsupportedOperation)),
+            "fail_closed_unsupported_op"
+        );
+        // Drain-side partial update shares the planner's label
+        assert_eq!(
+            drain_reason(&fail_closed(FailClosedReason::PartialUpdate)),
+            "partial_update"
+        );
+        assert_eq!(
+            drain_reason(&XactBufferError::StashAmbiguous {
+                rel_node: 1,
+                lsn: 2,
+                from_lsn: 1,
+                through_lsn: 3,
+            }),
+            "stash_ambiguous"
+        );
+        assert_eq!(
+            drain_reason(&XactBufferError::IncompleteToastGeneration { relid: 1 }),
+            "incomplete_toast"
+        );
+        assert_eq!(
+            drain_reason(&XactBufferError::MissingStashResolution { top_xid: 7 }),
+            "missing_stash_resolution"
+        );
+        assert_eq!(
+            drain_reason(&XactBufferError::ForeignXid { xid: 1, top: 2 }),
+            "drain"
+        );
         assert_eq!(
             PlanError::Detoast(XactBufferError::Detoast("x".into())).reason(),
             "detoast"

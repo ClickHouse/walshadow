@@ -72,19 +72,36 @@ events at drain open.
 
 Bias-early is only sound when the final descriptor provably reads every
 tuple in the interval. `compatible_reader`
-([`src/catalog/compat.rs`](../src/catalog/compat.rs)) is the predicate:
-metadata-only changes (renames, defaults) and appended nullable /
-missing-value columns qualify; physical changes — type, typmod, typlen,
-alignment, attnum reuse, not-null append without a missing value — do
-not. An incompatible in-place change (same rfn, no rotation) instead
-publishes an `Ambiguity` interval `[first_touch, next_lsn)` alongside
-the final `Present`: within it no single descriptor provably decodes the
-rfn's rows. Scope is `Rfn`, `Oid`, or conservatively `Database` when
-affected relations can't be enumerated; reasons enumerate
-`UnknownAffectedRelation / UnknownMutationPosition /
-MultipleIncompatibleLayouts / NeverVisibleGeneration /
-IncompleteInvalidation`. Ambiguities are batch records like entries —
+([`src/catalog/compat.rs`](../src/catalog/compat.rs)) is the predicate,
+and it classifies rejects by physical consequence:
+
+- proven: metadata-only changes (renames, defaults) and appended nullable
+  / missing-value columns
+- `Benign` — declared shape drifts, every byte reads the same: typmod, and
+  attstorage. The walk reads attlen/attalign/attbyval only and varlena /
+  numeric datums are self-describing, so bias-early still holds and
+  nothing is published
+- `Physical` — no descriptor reads both formats: type oid, typlen,
+  alignment, attnum reuse, missing-value edit, not-null append without a
+  missing value, relkind / persistence / toast-relation change
+
+A physical in-place change (same rfn, no rotation) publishes an
+`Ambiguity` interval `[first_touch, next_lsn)` alongside the final
+`Present`, which lands at `next_lsn`: within the interval no single
+descriptor provably decodes the rfn's rows. One interval per identity key
+the verdict can name — `Rfn` then `Oid`, fixed order since batch equality
+and digest gate append idempotency — so the rfn-keyed decode path and the
+oid-keyed truncate path see the same fence without either consulting the
+other's map. `Database` scope stays the conservative fallback for
+unenumerable relations. Reason is `UnknownMutationPosition`: only the
+first catalog touch is tracked, so the mutation's exact position inside
+the interval is unknown. Ambiguities are batch records like entries —
 replay-from-log reproduces the same intervals every boot.
+
+PG rewrites for every ALTER that moves tuple layout, and a rotation skips
+the predicate, so a physical in-place verdict describes shapes PG does not
+currently produce. The fence is a guard against unmodelled ones, not a
+routine path.
 
 Toast rels ('t') capture entries and `Dropped` events only (the retire
 ledger consumes those); indexes are excluded entirely.
@@ -127,13 +144,21 @@ stale descriptor with a fresh span); `present_before` serves historical
 predecessors:
 
 - worker buffering: Present decodes; ForeignDb and horizon/xid-0
-  NotCovered are counted skips; NotCovered/Dropped/Ambiguous with a
-  live xid stash for commit-time resolution ([xact.md](xact.md)
-  Commit-time stash); Retired skips (rows can't outlive the rotation)
+  NotCovered are counted skips; NotCovered/Dropped with a live xid stash
+  for commit-time resolution ([xact.md](xact.md) Commit-time stash);
+  Ambiguous stashes when the filenode is marker-proven and fails closed
+  when it is not (a markerless stash keeps no payload, so discarding
+  would be silent row loss); Retired skips (rows can't outlive the
+  rotation)
 - stash resolution at commit `next_lsn`: Present toast → chunk decode
   behind its marker barrier, Present ordinary → raw decode under the
-  commit-resolution descriptor, Ambiguous → fatal fail-closed,
-  tombstones discard
+  commit-resolution descriptor. Resolution asks at `next_lsn`, which sits
+  past every interval the commit published, so the fence is a separate
+  query — `ambiguities_intersecting(rfn, oid, first stashed lsn,
+  next_lsn)` rides the verdict and the drain fails closed per record whose
+  own `source_lsn` lands inside one. Tombstones discard: under
+  AccessExclusiveLock no row on a dropped or rotated filenode outlives the
+  commit
 - planning: descriptors ride each heap's envelope from the buffering /
   stash step; the planner never re-resolves ([emitter.md](emitter.md))
 - TRUNCATE fan-out resolves by oid; the barrier apply falls back to the
@@ -152,12 +177,17 @@ truncates durably at load; interior CRC failure is fatal. One writer
 mutex serialises append and GC; readers take an RwLock'd index snapshot
 published only after fsync.
 
-GC runs after each manifest persist against the same resolved floor
-([ops.md](ops.md)): per key the entry active at the floor survives when
-Present; a Dropped/Retired there drops the whole at-or-below chain
-(nothing above can reference it — records predate the drop and the floor
-never exceeds the re-read start); batches above the floor survive whole,
-stubs included. Thresholds: ≥512 droppable entries or an 8 MiB tail.
+GC runs off the pump task, fed each persisted floor over a watch channel
+([ops.md](ops.md)) so a ckpt rewrite never stalls WAL consumption into the
+source's `wal_sender_timeout`; failures set a fatal the pump surfaces on
+its next turn. Boundary capture still shares the writer mutex, so a
+boundary landing mid-compaction blocks its hold. Retention: per key the
+entry active at the floor survives when Present; a Dropped/Retired there
+drops the whole at-or-below chain (nothing above can reference it —
+records predate the drop and the floor never exceeds the re-read start);
+batches above the floor survive whole, stubs included, and an interval
+survives while `through_lsn` is above the floor. Thresholds: ≥512
+droppable entries or an 8 MiB tail.
 
 Identity keys the full physical `RelFileNode`: relfilenumbers are unique
 only per database of one tablespace

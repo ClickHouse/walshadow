@@ -55,6 +55,20 @@ const SLOT_CREATE_COPY: PortSlot = PortSlot {
     ch_http: 18073,
     walsender: 18077,
 };
+const SLOT_BENIGN: PortSlot = PortSlot {
+    source: 18080,
+    shadow: 18081,
+    ch_tcp: 18082,
+    ch_http: 18083,
+    walsender: 18087,
+};
+const SLOT_FENCE: PortSlot = PortSlot {
+    source: 18090,
+    shadow: 18091,
+    ch_tcp: 18092,
+    ch_http: 18093,
+    walsender: 18097,
+};
 
 struct PortSlot {
     source: u16,
@@ -444,6 +458,114 @@ async fn create_table_and_copy_same_xact_delivers() {
         emitter_stats.raw_decode_rows_ops.load().iter().sum::<u64>(),
         3,
         "COPY fans out three rows at commit resolution",
+    );
+}
+
+/// Read-identical in-place drift (typmod, attstorage) publishes no fence,
+/// so post-ALTER rows in the same transaction still deliver. This is the
+/// shape the benign/physical compat split protects: fencing it would make
+/// `BEGIN; ALTER COLUMN TYPE varchar(n); INSERT; COMMIT;` permanently fatal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn benign_in_place_alter_then_dml_delivers() {
+    if skip_gate() {
+        return;
+    }
+    let mut drill = build_drill(
+        SLOT_BENIGN,
+        "CREATE SCHEMA dab;\n\
+         CREATE TABLE dab.t (id bigint PRIMARY KEY, v varchar(10));\n",
+        "dab",
+        "walshadow-dirty-benign",
+    )
+    .await;
+    let capture_stats = drill
+        .pipeline
+        .sinks
+        .capture
+        .as_ref()
+        .expect("capture wired")
+        .stats_handle();
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE dab.t ALTER COLUMN v TYPE varchar(40);\n\
+         ALTER TABLE dab.t ALTER COLUMN v SET STORAGE EXTERNAL;\n\
+         INSERT INTO dab.t (id, v) VALUES (1, 'post');\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    let decoder_stats = drill.pipeline.sinks.decoder.stats_handle();
+    let log_stats = drill.pipeline.desc_log.stats_handle();
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+    let ch = &drill.ch;
+
+    fx::wait_query(
+        ch,
+        "SELECT argMax(v, _lsn) FROM walshadow_test.t WHERE id = 1",
+        "post",
+        "post-ALTER row decodes under the commit-time descriptor",
+    )
+    .await;
+    assert!(
+        decoder_stats.raw_stash_deferred.load(Ordering::Relaxed) >= 1,
+        "post-touch row still defers",
+    );
+    assert_eq!(
+        capture_stats.ambiguities_published.load(Ordering::Relaxed),
+        0,
+        "typmod + storage drift publishes no fence",
+    );
+    assert_eq!(
+        log_stats.lookups_ambiguous.load(Ordering::Relaxed),
+        0,
+        "and no lookup lands in one",
+    );
+}
+
+/// A physically unproven in-place change (varchar -> text is binary
+/// coercible, so PG rewrites atttypid without rotating the filenode) fences
+/// the records stashed inside its interval. Neither decoding under the
+/// post-commit descriptor nor discarding is sound, so the stream stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn physical_in_place_alter_fences_deferred_rows() {
+    if skip_gate() {
+        return;
+    }
+    let mut drill = build_drill(
+        SLOT_FENCE,
+        "CREATE SCHEMA daf;\n\
+         CREATE TABLE daf.t (id bigint PRIMARY KEY, v varchar(10));\n",
+        "daf",
+        "walshadow-dirty-fence",
+    )
+    .await;
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE daf.t ALTER COLUMN v TYPE text;\n\
+         INSERT INTO daf.t (id, v) VALUES (1, 'fenced');\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    let err = fx::pump_segments_res(&mut drill.pipeline, 1, Duration::from_secs(45))
+        .await
+        .expect_err("fenced record must stop the stream");
+    let _ = driver.join();
+    // Close the replication connection before stopping the clusters: pg_ctl
+    // waits out its whole timeout on a live walsender
+    let _ = drill.pipeline.shutdown().await;
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+    assert!(
+        err.contains("inside ambiguity"),
+        "expected the fence to name its interval, got {err}",
     );
 }
 
