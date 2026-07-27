@@ -7,6 +7,7 @@
 #                walshadow PG extension. Boots an in-container shadow
 #                PG via --bootstrap-mode=direct on empty volume, resumes it
 #                on later starts, then streams source WAL into clickhouse
+#   ctl-ui     — tools/ctl-ui.py against walshadow's control socket
 #
 # Quick start (from repo root):
 #   git submodule update --init --recursive
@@ -102,10 +103,35 @@ services:
     volumes:
       - ./ch-config.toml:/etc/walshadow/ch-config.toml:ro
       - walshadow-data:/var/lib/walshadow
+      - walshadow-run:/var/run/walshadow
     ports:
       - "9484:9484"
+
+  # Browser UI over the control socket — http://localhost:8087.
+  # The daemon binds control.sock 0600 as uid 70, so this shares the socket
+  # volume and runs as the same uid rather than exposing the socket to the host
+  # (a host bind-mount would be unreadable to any other uid).
+  ctl-ui:
+    image: python:3.13-alpine
+    user: "70:70"
+    depends_on:
+      walshadow:
+        condition: service_started
+    command:
+      - python3
+      - /opt/ctl-ui.py
+      - --socket
+      - /var/run/walshadow/control.sock
+      - --bind
+      - 0.0.0.0:8087
+    volumes:
+      - ../tools/ctl-ui.py:/opt/ctl-ui.py:ro
+      - walshadow-run:/var/run/walshadow
+    ports:
+      - "8087:8087"
 
 volumes:
   source-data:
   clickhouse-data:
   walshadow-data:
+  walshadow-run:

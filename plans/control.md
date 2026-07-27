@@ -161,6 +161,11 @@ read-only mount.
   `reload` via `load_effective`, `ConfigResolver.cli_source_base`.
 - `src/emit/pipeline/inserter.rs`, `src/emit/ch_ddl.rs` — live CH reconnect.
 - `src/emit/pipeline/reorder.rs` — `maybe_apply_reload` opt-in diff at commit.
+- `tools/ctl-ui.py` — stdlib-only browser UI over the socket (status, `[source]`/
+  `[ch]`/`[stream]` forms, table opt-in), diffing against `show` and writing via
+  `apply`/`unset`. Wired as the `ctl-ui` service in `docker/docker-compose.yml`
+  (http://localhost:8087); it runs as uid 70 off a shared socket volume because
+  `control.sock` is 0600.
 
 ## Status / open edges
 - e2e-verified live: pause/resume + table add (auto-create) via `ctl apply`
