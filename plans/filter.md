@@ -126,6 +126,16 @@ dirty entry; aborts drain them without holding. Only descriptor-relevant
 messages dirty (namespace hit, whole-relcache flush, user-rel relcache
 inval): ANALYZE-rate catcache churn must not hold publication at commit
 
+Same record also bounds: a `BoundaryKind::Command` verdict scoped to that
+command's own relcache invals, since a relation the set leaves out did
+not change shape there. Its `drain_xid` is the tree root as known at that
+point, which for a subxact whose assignment has not arrived is the subxid —
+the commit's member list is what folds those keys together
+([desc_log.md](desc_log.md) Pending capture). Abort verdicts carry the
+drained members for the same reason: the speculative shapes keyed to them
+have to die with the tree, on the pump, before a later boundary promotes
+them
+
 ## Rewrite path
 
 `src/rewrite.rs::noop_replace` takes complete record buffer (header +

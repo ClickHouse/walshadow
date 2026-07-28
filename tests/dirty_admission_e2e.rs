@@ -96,6 +96,16 @@ struct Drill {
 
 /// Bootstrap clusters + CH + auto-create pipeline for one namespace.
 async fn build_drill(slot: PortSlot, schema_sql: &str, namespace: &str, app_name: &str) -> Drill {
+    build_drill_with(slot, schema_sql, namespace, app_name, |_| {}).await
+}
+
+async fn build_drill_with(
+    slot: PortSlot,
+    schema_sql: &str,
+    namespace: &str,
+    app_name: &str,
+    tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
+) -> Drill {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -121,18 +131,21 @@ async fn build_drill(slot: PortSlot, schema_sql: &str, namespace: &str, app_name
         },
     );
 
-    let pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
-        tmp: &tmp,
-        source: &source,
-        shadow: &shadow,
-        shadow_filter_dir: &shadow_filter_dir,
-        shadow_stream_state,
-        ch_database: "walshadow_test",
-        ch_tcp_port: slot.ch_tcp,
-        mappings: vec![],
-        app_name,
-        ddl: Some(ddl_args),
-    })
+    let pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name,
+            ddl: Some(ddl_args),
+        },
+        tune,
+    )
     .await;
 
     Drill {
@@ -532,17 +545,25 @@ async fn benign_in_place_alter_then_dml_delivers() {
 /// coercible, so PG rewrites atttypid without rotating the filenode) fences
 /// the records stashed inside its interval. Neither decoding under the
 /// post-commit descriptor nor discarding is sound, so the stream stops.
+///
+/// Pending capture off (`pending_max_boundaries_per_xact = 0` degrades every
+/// transaction at its first command boundary), so the fence spans the whole
+/// dirty interval, the conservative fallback.
+/// `pending_capture_e2e::pending_timeline_decodes_the_post_ddl_row` is the
+/// same shape with the timeline on, where the fence shrinks to the run before
+/// the first boundary and the row lands
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn physical_in_place_alter_fences_deferred_rows() {
     if skip_gate() {
         return;
     }
-    let mut drill = build_drill(
+    let mut drill = build_drill_with(
         SLOT_FENCE,
         "CREATE SCHEMA daf;\n\
          CREATE TABLE daf.t (id bigint PRIMARY KEY, v varchar(10));\n",
         "daf",
         "walshadow-dirty-fence",
+        |cfg| cfg.pending_capture.max_boundaries_per_xact = 0,
     )
     .await;
 

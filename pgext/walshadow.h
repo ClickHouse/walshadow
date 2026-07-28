@@ -17,9 +17,8 @@
 #include "lib/stringinfo.h"
 
 /* Bumped when a request or response layout changes, or when an op's reading
- * of an unchanged layout changes: 2 gave SCAN an invalid top xid (committed
- * view) and an empty oid list (whole catalog) on every catalog */
-#define WS_PROTO_VERSION		2
+ * of an unchanged layout changes */
+#define WS_PROTO_VERSION		1
 /* Bumped when any catalog projection changes shape */
 #define WS_PROJECTION_VERSION	1
 

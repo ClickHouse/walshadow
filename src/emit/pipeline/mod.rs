@@ -116,6 +116,9 @@ pub struct PipelineConfig {
     /// Durable descriptor log: decode pool + reorder read interval-scoped
     /// descriptors from it
     pub log: Arc<crate::catalog::desc_log::DescriptorLog>,
+    /// Speculative per-transaction catalog state shared with capture; empty
+    /// unless pending capture is on
+    pub pending: Arc<crate::catalog::pending::PendingCatalog>,
     pub stats: Arc<EmitterStats>,
     /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
     /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
@@ -191,6 +194,7 @@ impl PipelineConfig {
             buffer,
             subxact_tracker,
             log,
+            pending,
             stats,
             span_registry,
             config_resolver,
@@ -249,6 +253,7 @@ impl PipelineConfig {
         let reorder = reorder::ReorderSink::new(
             buffer,
             log,
+            pending,
             catalog,
             subxact_tracker,
             applicator,

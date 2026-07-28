@@ -33,9 +33,11 @@ fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     cfg.ctl_timeout = Duration::from_secs(30);
     let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
     let build_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
-    if build_dir.join("walshadow.so").is_file() {
-        bridge.library_dir = Some(build_dir);
-    }
+    assert!(
+        build_dir.join("walshadow.so").is_file(),
+        "pgext/walshadow.so missing, run `make -C pgext`"
+    );
+    bridge.library_dir = Some(build_dir);
     cfg.bridge = Some(bridge);
     std::fs::create_dir_all(&cfg.filter_out_dir).unwrap();
     std::fs::create_dir_all(&cfg.socket_dir).unwrap();

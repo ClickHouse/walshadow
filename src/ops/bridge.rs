@@ -24,7 +24,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 1;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 1;
 
@@ -402,7 +402,7 @@ impl Bridge {
     async fn dial(&self) -> Result<UnixStream, BridgeError> {
         let mut stream = UnixStream::connect(&self.path).await?;
         let started = Instant::now();
-        let res = round_trip(&mut stream, Op::Hello, &PROTO_VERSION.to_be_bytes()).await;
+        let res = round_trip(&mut stream, Op::Hello, &[]).await;
         self.record(Op::Hello, started, &res);
         let body = res?;
 

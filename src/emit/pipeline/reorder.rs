@@ -24,6 +24,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
 
 use crate::catalog::desc_log::DescriptorLog;
+use crate::catalog::pending::PendingCatalog;
 use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::decode::heap_decoder::{DescribedHeap, HeapOp};
 use crate::emit::ch_ddl::DdlApplicator;
@@ -56,6 +57,10 @@ pub struct ReorderSink {
     buffer: Arc<Mutex<XactBuffer>>,
     /// Interval-scoped descriptor oracle: stash resolution + truncate
     log: Arc<DescriptorLog>,
+    /// Speculative catalog state per in-flight xact, written by capture at
+    /// command boundaries. Read at stash resolution, dropped once the
+    /// commit's drain has consumed it
+    pending: Arc<PendingCatalog>,
     /// Opt-in dispatch still resolves by name against live shadow
     catalog: Arc<Mutex<ShadowCatalog>>,
     subxact_tracker: Arc<Mutex<SubxactTracker>>,
@@ -138,6 +143,7 @@ impl ReorderSink {
     pub fn new(
         buffer: Arc<Mutex<XactBuffer>>,
         log: Arc<DescriptorLog>,
+        pending: Arc<PendingCatalog>,
         catalog: Arc<Mutex<ShadowCatalog>>,
         subxact_tracker: Arc<Mutex<SubxactTracker>>,
         applicator: Option<DdlApplicator>,
@@ -175,6 +181,7 @@ impl ReorderSink {
         Self {
             buffer,
             log,
+            pending,
             catalog,
             subxact_tracker,
             applicator,
@@ -749,6 +756,7 @@ impl ReorderSink {
         crate::xact::xact_buffer::resolve_stash(
             &self.buffer,
             &self.log,
+            &self.pending,
             xid,
             &payload.subxacts,
             record.next_lsn,
@@ -785,6 +793,9 @@ impl ReorderSink {
             .map_err(SinkError::from)?
         };
         self.subxact_tracker.lock().await.forget_tree(xid);
+        // Timeline outlived its use: resolution above already folded it
+        // into the outcomes this drain reads
+        self.pending.forget_tree(xid);
         // One per drained commit, incl. empty / unmapped-only
         self.stats.xacts_committed.fetch_add(1, Ordering::Relaxed);
         // Prune the committed tree's span handles (else the map grows
@@ -909,6 +920,7 @@ impl ReorderSink {
         }
         self.ack.placed(seq, 0);
         self.subxact_tracker.lock().await.forget_tree(xid);
+        self.pending.forget_tree(xid);
         Ok(())
     }
 }

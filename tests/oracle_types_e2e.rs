@@ -1,6 +1,6 @@
 //! Oracle-path types (arrays/enums/geometric/pgvector), end-to-end: they decode
 //! to `PgPending`/`Unsupported` and resolve through the bridge worker preloaded
-//! into the shadow standby. Skipped unless `pgext` is built (`make -C pgext`);
+//! into the shadow standby, so `pgext` must be built (`make -C pgext`);
 //! pgvector also needs `vector` installed on source. Resolved text matches PG
 //! `typoutput`.
 
@@ -68,10 +68,6 @@ const SLOT_RIF: PortSlot = PortSlot {
 fn skip_gate() -> bool {
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
-        return true;
-    }
-    if fx::pgext_dir().is_none() {
-        eprintln!("skip: pgext not built (run `make -C pgext`)");
         return true;
     }
     false

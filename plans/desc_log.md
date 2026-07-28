@@ -106,6 +106,51 @@ routine path.
 Toast rels ('t') capture entries and `Dropped` events only (the retire
 ledger consumes those); indexes are excluded entirely.
 
+## Pending capture
+
+Pending capture samples the same relations mid-transaction. At
+`wal_level=logical` PG logs `XLOG_XACT_INVALIDATIONS` from every
+`CommandCounterIncrement`, and a relation's layout cannot move except at
+one, so those records are exactly the sample points. Inside a dirty xact
+each becomes a `BoundaryKind::Command` boundary, holding publication the
+same way a commit does; capture reads the relations that command's invals
+name off the bridge worker's `SCAN` at the parked position, where the
+transaction's own catalog rows sit on-page uncommitted
+([shadow.md](shadow.md) Bridge worker). Shapes land in `PendingCatalog`
+(`src/catalog/pending.rs`), keyed by the tree root the pump knew at
+capture, `valid_from` at the boundary or at the generation's smgr marker
+when the relation was born in this xact.
+
+**A pending descriptor is visible only to records of the transaction that
+wrote it, and becomes durable only at that transaction's commit.** Nothing
+speculative reaches the log, so abort is a map removal: the abort record
+names every member the filter drained and their slots die on the pump,
+ahead of any later boundary that could promote them. A subxact abort drops
+the slots its own xid wrote and leaves the parent's.
+
+At the commit, the member keys fold under the top and the slots enter the
+batch as `Present` entries at their own positions, ahead of the commit
+shape — one entry per (relation, command boundary) instead of one per
+relation. That is what shrinks the fence: an unproven in-place change
+whose relation the timeline covers publishes its `Ambiguity` only over
+`[first_touch, first boundary)`, because rows past that boundary have an
+exact shape recorded and rows before it predate the transaction's first
+`CommandCounterIncrement` — a command sees the catalog as of its own
+start, so the predecessor reads them. The stash resolution folds the same
+chain per record, so a record inside a covered run decodes under the shape
+that run saw rather than the commit-time descriptor.
+
+Every failure degrades the transaction to commit-time capture, which is
+sound: `CaptureAll` (whole-relcache flush or namespace catcache — a full
+catalog scan per command is the shape that makes holds expensive),
+`CapExceeded` (`pending_max_boundaries_per_xact`), `HoldBudget`
+(`pending_max_hold_ms` cumulative), `ReplayMismatch` (shadow was not
+parked where the boundary said — unrecoverable, replay cannot rewind),
+`QueryError`. A degraded transaction's slots still promote, since each is
+an exact shape at an exact position; what degradation costs is the
+coverage claim, so its fence stands. A boundary whose inval set names no
+user relation skips the hold entirely.
+
 ## Replay-from-log
 
 Every boundary appends a batch keyed `captured_at = next_lsn` — a
@@ -202,3 +247,15 @@ making stored rfns directly comparable to WAL locators' physical spcOid.
 capture_all / rels / seconds), `walshadow_desc_events_*`,
 `walshadow_desc_log_*` gauges + GC counters, `walshadow_desc_lookups_*`
 by result. Capture time counts inside the boundary-hold duration.
+
+Pending capture adds `walshadow_pending_captures_total`,
+`walshadow_pending_rels_total`, `walshadow_pending_holds_total`,
+`walshadow_pending_hold_seconds_total`,
+`walshadow_pending_entries_promoted_total`,
+`walshadow_pending_entries_dropped_abort_total`,
+`walshadow_pending_ambiguities_suppressed_total` and
+`walshadow_pending_degraded_total{reason}`. Overlay-scan cost and its
+unresolvable-parentage count sit on the bridge families
+(`walshadow_bridge_scan_*`), which only pending scans populate — a
+committed read passes no transaction, so nothing is left to
+misattribute.

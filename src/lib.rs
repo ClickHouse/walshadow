@@ -44,7 +44,7 @@ pub use backfill::{
     copy_backfill, opt_in, pg_path, spool,
 };
 #[doc(hidden)]
-pub use catalog::{desc_log, shadow, shadow_catalog, type_bridge};
+pub use catalog::{desc_log, pending, shadow, shadow_catalog, type_bridge};
 #[doc(hidden)]
 pub use decode::{codecs, decoder_sink, fpi, heap_decoder, visibility, wal_xact};
 #[doc(hidden)]

@@ -450,6 +450,10 @@ async fn run_drill() -> Result<()> {
     fs::create_dir_all(&shadow_sock)?;
     rewrite_for_shadow(&shadow_data, SHADOW_PORT, &shadow_sock).context("retarget shadow")?;
     enable_recovery(&shadow_data, &shadow_filter_dir, WALSENDER_PORT).context("recovery conf")?;
+    // Bridge worker outlives every daemon cycle: the daemon dials it at boot,
+    // so each restart reconnects to the same preloaded worker
+    fx::append_bridge_conf(&shadow_data, &shadow_sock, "postgres", fx::pgext_dir())
+        .context("preload bridge worker")?;
 
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
     shadow_cfg.port = SHADOW_PORT;

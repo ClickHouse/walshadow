@@ -131,12 +131,15 @@ params stay boot-only
 ## Testing
 
 ```
+make -C pgext
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
 Integration tests under `tests/` need `initdb` + `pg_ctl` on `PATH`
-and spin a transient shadow PG per case. Walshadow-side timeouts are
+and spin a transient shadow PG per case. Every shadow preloads the
+module out of `pgext/`, so build it first: tests fail rather than skip
+without it. Walshadow-side timeouts are
 seconds-scale by design — long timeouts mask stalls rather than
 surface them
 

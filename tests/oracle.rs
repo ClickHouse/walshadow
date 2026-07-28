@@ -2,8 +2,8 @@
 //!
 //! Four drills, each against a PG started with the bridge worker preloaded
 //! (`dynamic_library_path` points at the `pgext` build tree, so no
-//! `make install` is needed). Skipped silently when `initdb` isn't on PATH or
-//! `pgext` hasn't been built:
+//! `make install` is needed). Skipped silently when `initdb` isn't on PATH;
+//! fails when `pgext` hasn't been built:
 //!
 //! 1. `oracle_resolves_tier3_disk_bytes` — for each of `numeric` / `inet` /
 //!    `interval` / `int4[]`, synthesize on-disk bytes and assert the resolved
@@ -45,10 +45,15 @@ fn pg_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`
-fn pgext_dir() -> Option<PathBuf> {
+/// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`.
+/// Module is not optional, so an unbuilt tree fails rather than skips
+fn pgext_dir() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
-    dir.join("walshadow.so").is_file().then_some(dir)
+    assert!(
+        dir.join("walshadow.so").is_file(),
+        "pgext/walshadow.so missing, run `make -C pgext`"
+    );
+    dir
 }
 
 struct StopOnDrop {
@@ -61,22 +66,18 @@ impl Drop for StopOnDrop {
     }
 }
 
-/// `None` skips the caller: no PG, or pgext unbuilt
+/// `None` skips the caller: no PG
 fn start_pg(tmp: &tempfile::TempDir, port: u16) -> Option<StopOnDrop> {
     if !pg_available() {
         eprintln!("skip: no initdb on PATH");
         return None;
     }
-    let Some(lib_dir) = pgext_dir() else {
-        eprintln!("skip: pgext not built (run `make -C pgext`)");
-        return None;
-    };
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
     cfg.port = port;
     cfg.socket_dir = tmp.path().join("sock");
     cfg.ctl_timeout = Duration::from_secs(60);
     let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
-    bridge.library_dir = Some(lib_dir);
+    bridge.library_dir = Some(pgext_dir());
     cfg.bridge = Some(bridge);
     fs::create_dir_all(&cfg.filter_out_dir).unwrap();
     fs::create_dir_all(&cfg.socket_dir).unwrap();
