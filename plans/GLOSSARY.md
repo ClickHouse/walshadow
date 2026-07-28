@@ -67,6 +67,10 @@ config writes. Shared by hot path and gap replay
 bootstrap but never settle on shadow's data dir; keeps shadow MiB-scale
 by construction ([bootstrap.md](bootstrap.md))
 
+**catalog projection** — the column plan `SCAN` returns per catalog, and
+the single input to descriptor assembly. Required worker emits identical
+projection forms for committed and overlay reads ([shadow.md](shadow.md))
+
 **catalog replay** — shadow PG applying filtered catalog WAL, so
 `pg_catalog` tracks source DDL and relfilenode rewrites with zero
 operator coordination ([overview.md](overview.md))
@@ -333,8 +337,8 @@ whole overlay subsystem; `config_table.replicate` opts one table into
 replication, triggering backfill per `initial_load`
 ([config.md](config.md), [add_table.md](add_table.md))
 
-**oracle** — PgPending resolver: shadow decodes on-disk bytes
-via `walshadow_decode_disk` (same `typoutput` PG would call) into text
+**oracle** — PgPending resolver: shadow decodes on-disk bytes through
+the bridge worker's `DECODE` op (same `typoutput` PG would call) into text
 post-plan; best-effort, unresolved values ship raw bytes
 ([oracle.md](oracle.md))
 
@@ -347,6 +351,13 @@ barrier segments
 PG, replicated through WAL, applied at each row's commit LSN
 ([config.md](config.md))
 
+**overlay scan** — unrelated to the config overlay: the bridge worker's
+`SCAN` op reading one uncommitted transaction's own catalog rows off
+shadow's pages under `SnapshotAny`, with replay parked at the caller's
+boundary; `fetch_overlay_descriptors` assembles them into descriptors.
+Top xid `0` asks the same scan for the committed view instead
+([oracle.md](oracle.md), [shadow.md](shadow.md))
+
 **PageWalkSink** — Tap sink walking user-heap backup pages 8 KiB at a
 time, decoding `LP_NORMAL` slots through shared heap decoder, emitting
 BackfillTuples with per-rel `_lsn` overrides
@@ -358,12 +369,13 @@ rows) between source and CH proving replication fidelity
 
 **PgPending** — ColumnValue fallback `{type_oid, raw}` for types without
 in-tree codec (jsonb, ranges, arrays, tsvector, vendor types); resolved
-at emit via oracle bridge, raw bytes pass through when extension absent
-([decoder.md](decoder.md), [oracle.md](oracle.md))
+at emit via required oracle bridge; per-item `typoutput` errors preserve raw
+bytes ([decoder.md](decoder.md), [oracle.md](oracle.md))
 
-**pgext** — walshadow PG extension (PGXS, shadow-only) exposing
-`walshadow_decode_disk(oid, bytea) -> text`
-([oracle.md](oracle.md))
+**pgext** — walshadow PG module (PGXS, shadow-only), loaded through
+`shared_preload_libraries` rather than `CREATE EXTENSION`; serves catalog
+reads and on-disk decode over a unix socket
+([oracle.md](oracle.md), [`pgext/walshadow.h`](../pgext/walshadow.h))
 
 **PgXactAccum / PgXactPatch** — backup-era `pg_xact` accumulated from
 backup files, patched with commit/abort records harvested from gap-WAL

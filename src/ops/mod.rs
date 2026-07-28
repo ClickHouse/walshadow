@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod control;
 pub mod metrics;
 pub mod oracle;

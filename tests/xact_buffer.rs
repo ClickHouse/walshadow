@@ -27,7 +27,7 @@ use walshadow::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
 };
 use walshadow::pg::socket_conninfo;
-use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 use walshadow::spill::ToastChunk;
 use walshadow::toast::{ChunkRefMap, MemChunkStore, ToastResolver};
@@ -48,6 +48,12 @@ fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     cfg.port = port;
     cfg.socket_dir = tmp.path().join("sock");
     cfg.ctl_timeout = Duration::from_secs(30);
+    let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
+    let build_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
+    if build_dir.join("walshadow.so").is_file() {
+        bridge.library_dir = Some(build_dir);
+    }
+    cfg.bridge = Some(bridge);
     std::fs::create_dir_all(&cfg.filter_out_dir).unwrap();
     std::fs::create_dir_all(&cfg.socket_dir).unwrap();
     Shadow::new(cfg)
@@ -80,7 +86,15 @@ async fn open_catalog(shadow: &Shadow) -> ShadowCatalog {
         replay_poll: Duration::from_millis(20),
         ..Default::default()
     };
-    ShadowCatalog::connect(&conninfo, cat_cfg)
+    let bridge = Arc::new(
+        walshadow::bridge::connect_with_budget(
+            shadow.bridge_socket().expect("bridge configured"),
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("bridge connect"),
+    );
+    ShadowCatalog::connect(&conninfo, cat_cfg, bridge)
         .await
         .expect("catalog connect")
 }

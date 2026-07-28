@@ -81,6 +81,18 @@ Inventory by category:
 - `walshadow_emitter_{rows,blocks,xacts,unsupported_relations}_total`
 - `walshadow_decode_{resolved,fallback_raw,errors}_total`
   (oracle path, see [shadow.md](shadow.md))
+- bridge worker ([oracle.md](oracle.md)): `walshadow_bridge_up` gauge,
+  1 while its last transport attempt answered and 0 after failure;
+  `walshadow_bridge_{requests,errors}_total{op}` and
+  `walshadow_bridge_request_seconds_total{op}` over
+  `op=hello|decode|scan|replay_lsn`;
+  `walshadow_bridge_reconnects_total` redials after a worker exit;
+  `walshadow_bridge_scan_{rows,subtrans_mismatch,replay_moved}_total`
+  over catalog scans, where `replay_moved` counts reads that found
+  shadow replay off the position they pinned — nonzero away from a
+  boundary hold is expected and answers off SQL, nonzero during capture
+  is not; `walshadow_bridge_decode_item{s,_errors}_total` columns sent
+  for `typoutput` rendering and the ones that raised
 - commit-time stash ([xact.md](xact.md)):
   `walshadow_raw_stash_records_total{kind=dirty|marker,op}` admissions,
   `walshadow_raw_stash_deferred_total`,

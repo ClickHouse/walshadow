@@ -334,12 +334,65 @@ pub struct BootstrappedClusters {
     pub shadow_filter_dir: PathBuf,
 }
 
+/// Build tree holding `walshadow.so`, `None` when pgext hasn't been built.
+/// Tests needing the decode oracle skip on `None` rather than fail; nothing
+/// installs the module system-wide.
+pub fn pgext_dir() -> Option<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
+    dir.join("walshadow.so").is_file().then_some(dir)
+}
+
 pub async fn bootstrap_clusters(
     tmp: &tempfile::TempDir,
     schema_sql: &str,
     source_port: u16,
     shadow_port: u16,
     walsender_port: u16,
+) -> (
+    BootstrappedClusters,
+    Arc<Mutex<walshadow::shadow_stream::ShadowStreamState>>,
+) {
+    bootstrap_clusters_inner(
+        tmp,
+        schema_sql,
+        source_port,
+        shadow_port,
+        walsender_port,
+        true,
+    )
+    .await
+}
+
+/// Same, plus the preloaded bridge worker on shadow. Reach its socket through
+/// [`Shadow::bridge_socket`]. Callers must have checked [`pgext_dir`].
+pub async fn bootstrap_clusters_with_bridge(
+    tmp: &tempfile::TempDir,
+    schema_sql: &str,
+    source_port: u16,
+    shadow_port: u16,
+    walsender_port: u16,
+) -> (
+    BootstrappedClusters,
+    Arc<Mutex<walshadow::shadow_stream::ShadowStreamState>>,
+) {
+    bootstrap_clusters_inner(
+        tmp,
+        schema_sql,
+        source_port,
+        shadow_port,
+        walsender_port,
+        true,
+    )
+    .await
+}
+
+async fn bootstrap_clusters_inner(
+    tmp: &tempfile::TempDir,
+    schema_sql: &str,
+    source_port: u16,
+    shadow_port: u16,
+    walsender_port: u16,
+    with_bridge: bool,
 ) -> (
     BootstrappedClusters,
     Arc<Mutex<walshadow::shadow_stream::ShadowStreamState>>,
@@ -391,8 +444,21 @@ pub async fn bootstrap_clusters(
 
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
     shadow_cfg.port = shadow_port;
-    shadow_cfg.socket_dir = shadow_sock;
+    shadow_cfg.socket_dir = shadow_sock.clone();
     shadow_cfg.ctl_timeout = Duration::from_secs(60);
+    if with_bridge {
+        let mut bridge = walshadow::shadow::BridgeConf::in_dir(&shadow_sock);
+        bridge.library_dir = pgext_dir();
+        // basebackup-cloned conf, so append rather than materialize
+        let conf = shadow_data.join("postgresql.conf");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&conf)
+            .expect("open shadow conf")
+            .write_all(bridge.conf_text(&shadow_cfg.dbname).as_bytes())
+            .expect("append bridge conf");
+        shadow_cfg.bridge = Some(bridge);
+    }
     let shadow = Shadow::new(shadow_cfg);
     if let Err(e) = shadow.start() {
         let log = fs::read_to_string(shadow_data.join("startup.log"))
@@ -635,7 +701,13 @@ async fn build_pipeline_inner(
         replay_poll: Duration::from_millis(50),
         ..Default::default()
     };
-    let catalog = ShadowCatalog::connect(&shadow_conninfo, cat_cfg)
+    let bridge_path = shadow.bridge_socket().expect("bridge configured");
+    let bridge = Arc::new(
+        walshadow::bridge::connect_with_budget(bridge_path, Duration::from_secs(60))
+            .await
+            .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", bridge_path.display())),
+    );
+    let catalog = ShadowCatalog::connect(&shadow_conninfo, cat_cfg, bridge)
         .await
         .expect("connect shadow catalog");
     let catalog = Arc::new(Mutex::new(catalog));

@@ -1498,8 +1498,8 @@ fn encode_value(
             kind: "unresolved TOAST pointer (xact buffer should have reassembled)",
         }),
         // PgPending normally resolves to text earlier (decode pool via the
-        // oracle extension). Still set here means extension absent or
-        // resolve fell through; best effort ships raw on-disk bytes
+        // bridge worker). Still set here means resolution failed
+        // through; best effort ships raw on-disk bytes
         ColumnValue::PgPending { raw, .. } => buf.append_string_bytes(raw),
         ColumnValue::Unsupported { .. } => Err(EmitterError::UnsupportedValue {
             target_column: String::new(),
@@ -1516,7 +1516,6 @@ crate::atomic_stats! {
         pub blocks_sent,
         pub xacts_committed,
         pub unsupported_relations,
-        pub unsupported_values,
         /// `retries_attempted` counts one per failing operation, not per
         /// attempt (one op needing 3 retries adds 3)
         pub reconnects,

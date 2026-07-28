@@ -1,120 +1,100 @@
-// walshadow — ShadowCatalog internal state + schema-event emission
-// Internal-state companion to shadow_communication.dot (channels). Here:
-// LRU shape + generation counter + invalidation-epoch fold + reconnect
-// resilience (folded into libpq node) + xid-armed DROP sweep +
-// SchemaEvent fan-out to DdlApplicator / XactBuffer.
+// walshadow, ShadowCatalog descriptor assembly from bridge projections
 //
 // regeneration spec:
-// sources of truth: plans/shadow.md · src/shadow_catalog.rs
-// subsumes: plans/shadow.md § ShadowCatalog cache + invalidation + SchemaEvent emission
-// differentiates: shadow_communication.dot draws the three CHANNELS (libpq, walsender, restore_command); this draws ShadowCatalog INTERNAL state — don't duplicate
+// sources of truth: plans/shadow.md · src/catalog/shadow_catalog.rs · src/ops/bridge.rs · pgext/overlay.c
+// subsumes: plans/shadow.md § ShadowCatalog + One descriptor definition + Uncommitted DDL + Reconnect resilience
+// differentiates: shadow_communication.dot draws transport channels; this draws descriptor read and assembly paths
 // quality bar:
-//   - gen → LRU invalidation edge clearly dashed, doesn't fight populate edges
-//   - reconnect cluster off to the side, doesn't deform main flow
-//   - shadow PG cylinder appears once (libpq + apply_lsn gate both touch it)
+//   - committed and overlay bridge paths stay visible
+//   - replay movement fails closed
+//   - replay pin spans every worker scan and oid chunk
 // shared style: palette.md
 digraph shadow_catalog {
   rankdir=TB;
   compound=true;
-  graph [fontname="Helvetica", labelloc="t", label="ShadowCatalog — LRU + generation invalidation + SchemaEvent emission (plans/shadow.md)", fontsize=14, splines=spline, nodesep=0.4, ranksep=0.6, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="ShadowCatalog, pinned catalog projections → one descriptor definition", fontsize=14, splines=spline, nodesep=0.45, ranksep=0.65, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
 
-  // ──────── Top rank: external producer + consumer ────────
-  { rank=same;
-    tracker [label="CatalogTracker\n(filter pipeline, sync)\ncatalog WAL writes →\nepoch bump (Release-store)\n+ CatalogSignal verdict on Record", fillcolor="#4D3A28"];
-    caller  [label="BufferingDecoderSink\nrelation_at(rfn, at_lsn)\n(decoder worker task)", fillcolor="#4D4128"];
-  }
-
-  // ──────── Shared cross-pipeline state ────────
-  atomics [label="invalidation_epoch\nArc<AtomicU64>\n(any catalog WAL write)", fillcolor="#4D4D28", shape=ellipse];
-  psweeps [label="PendingSweeps\nMutex<HashSet<xid>>\narmed per pg_class heap_delete", fillcolor="#4D4D28", shape=ellipse];
-  tracker -> atomics [label="bump at\npump position", style=dashed, color="#CBA85E"];
-  tracker -> caller  [label="CatalogSignal\nrides Record", style=dashed, color="#CBA85E"];
-  caller  -> atomics [label="re-bump at\nworker position", style=dashed, color="#CBA85E"];
-  caller  -> psweeps [label="arm(xid) on\nInvalidateSweep", style=dashed, color="#CBA85E"];
-
-  // ──────── ShadowCatalog cluster — full internal state ────────
-  subgraph cluster_cat {
-    label="ShadowCatalog (src/shadow_catalog.rs)";
+  subgraph cluster_catalog {
+    label="ShadowCatalog (src/catalog/shadow_catalog.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    gate    [label="relation_at orchestration\n① drain_invalidations (Acquire epoch)\n② wait_for_replay(at_lsn)\n③ drain_invalidations\n④ cache lookup", fillcolor="#4D4D28"];
+    { rank=same;
+      committed [label="committed APIs\nfetch_descriptors_batch(oids)\nfetch_all_descriptors()\ndescriptor_by_name / toast\nscope = oids | eligible", fillcolor="#4D4D28"];
+      overlay [label="overlay API\nfetch_overlay_descriptors\noids + top_xid + boundary\nbridge required", fillcolor="#4D4D28"];
+      replay [label="replay gate API\nwait_for_replay(target)\nmonotone last observed LSN\npoll until target or timeout", fillcolor="#4D4D28"];
+    }
 
-    gencnt  [label="generation: u64\nentry hit iff gen == self.gen\nbumped by:\n  • epoch advance (drain)\n  • reconnect\n  • DROP sweep", fillcolor="#4D4D28", shape=ellipse];
+    scan [label="scan_rows, worker source\ntop_xid = 0: committed view\ntop_xid ≠ 0: own-xid overlay\npg_class → pg_attribute → pg_index\nnamespace + type name maps", fillcolor="#4D4D28"];
 
-    lru     [label="by_filenode + by_oid\nHashMap + EvictionIndex (FIFO)\ncap = 4096", fillcolor="#4D4D28"];
+    pin [label="scan_pinned invariant\nfirst SCAN fixes replay LSN\nor caller supplies boundary\nevery catalog + oid chunk\nmust start and end at same LSN", fillcolor="#4D4D28", shape=note];
 
-    fetch   [label="fetch_by_filenode / fetch_by_oid\nSELECT pg_class + pg_namespace +\npg_index (replident) +\npg_attribute + pg_type\n(one SQL fan-out per miss)", fillcolor="#4D4D28"];
+    libpq [label="tokio-postgres client\nunix socket, long-lived\nensure_open + one reconnect retry\nreset last_replay_lsn on reconnect", fillcolor="#4D4D28"];
 
-    libpq   [label="tokio_postgres::Client\nunix socket, long-lived\nensure_open → with_transient_retry\n→ reconnect on is_closed:\n  rebuild Client (conninfo stashed),\n  bump gen, reset last_replay_lsn", fillcolor="#4D4D28"];
+    rows [label="DescriptorRows\nclass / attrs / indexes\nnamespace + type maps\nreplay_lsn", fillcolor="#4D4D28", shape=folder];
 
-    rec     [label="record_descriptor\ndiff(new, prev_known[oid])\n→ Added | Changed{diff} |\nno-op (Arc::ptr_eq)", fillcolor="#4D4D28"];
+    assemble [label="DescriptorRows::assemble\nreject duplicate oid or attnum\npreserve dropped attribute slots\nchoose PK + replica identity\nresolve reltablespace 0\nuse raw relfilenode", fillcolor="#4D4D28"];
 
-    prev    [label="prev_known\nHashMap<Oid, Arc<RelDescriptor>>\nlast-seen shape per oid", fillcolor="#4D4D28", shape=folder];
+    result [label="RelDescriptor\nrfn + oid + toast oid\nname + kind + persistence\nreplident + attributes\n\ncommitted: replay_lsn + Vec\noverlay: Vec", fillcolor="#4D4D28", shape=parallelogram];
 
-    sweep   [label="sweep_dropped\npoll pg_class for known oids;\nmissing → emit Dropped\nno internal throttle", fillcolor="#4D4D28"];
+    committed -> scan [label="top_xid = 0", color="#CBA85E", penwidth=2];
+    overlay -> scan [label="top_xid + boundary", color="#CBA85E", penwidth=2];
+    replay -> libpq [label="pg_last_wal_replay_lsn()", color="#CBA85E"];
+    scan -> pin [style=dashed, color="#B58B86", constraint=false];
+    scan -> libpq [label="committed namespace/type names\nDB oid + default tablespace", color="#CBA85E", dir=both, arrowtail=open];
+    scan -> rows [label="parsed SCAN rows", color="#CBA85E"];
+    rows -> assemble [color="#CBA85E", penwidth=2];
+    assemble -> result [color="#CBA85E", penwidth=2];
   }
 
-  // ──────── Shadow PG (consolidated endpoint) ────────
-  shd [label="shadow PG\npg_class / pg_attribute /\npg_type / pg_index /\npg_last_wal_replay_lsn()", fillcolor="#3D4128", shape=cylinder];
+  bridge [label="Bridge\nframed unix socket\nSCAN request\nchunk at MAX_SCAN_OIDS", fillcolor="#4D4D28"];
 
-  // ──────── SchemaEvent fan-out ────────
-  evtx [label="schema_event_tx\nmpsc::unbounded\n(single subscriber)", fillcolor="#4D4D28", shape=parallelogram];
-  { rank=same;
-    xbuf   [label="XactBuffer\nstamps SchemaEvent on xid;\ndrain-time interleave with tuples", fillcolor="#4D4128"];
-    ddlapp [label="DdlApplicator\nch_ddl.rs (own CH TCP)\ndrains at commit boundary", fillcolor="#5D4628"];
+  subgraph cluster_shadow {
+    label="shadow PG";
+    style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+
+    worker [label="walshadow worker\nSCAN under SnapshotAny\nown-xid visibility\nreplay LSN before + after", fillcolor="#3D4128"];
+
+    catalogs [label="pg_class / pg_attribute /\npg_index / pg_namespace /\npg_type / pg_database\n+ replay position", fillcolor="#3D4128", shape=cylinder];
+
+    worker -> catalogs [label="direct catalog rows", color="#6E6963", dir=both, arrowtail=open];
   }
 
-  // ──────── Hot lookup path (solid) ────────
-  caller -> gate  [label="rfn, at_lsn", color="#CBA85E"];
-  gate   -> lru   [label="check\n(gen, rfn|oid)", color="#CBA85E"];
-  lru    -> fetch [label="miss", style=dashed, color="#CBA85E"];
-  fetch  -> libpq;
-  fetch  -> rec   [label="Arc<RelDescriptor>"];
-  fetch  -> lru   [label="insert\nEvictionIndex\nevict over cap", style=dashed, color="#CBA85E"];
-  rec    -> prev  [label="upsert", style=dashed, color="#CBA85E"];
-  rec    -> evtx  [label="Added | Changed{diff}", color="#CBA85E", penwidth=2];
+  scan -> bridge [label="one SCAN per catalog / chunk", color="#CBA85E", penwidth=2, dir=both, arrowtail=open];
+  bridge -> worker [label="worker protocol", color="#CBA85E", penwidth=2, dir=both, arrowtail=open, lhead=cluster_shadow];
+  libpq -> catalogs [label="SQL + pg_last_wal_replay_lsn()", color="#CBA85E", penwidth=2, dir=both, arrowtail=open, lhead=cluster_shadow];
 
-  // ──────── libpq endpoint (only path to shadow PG) ────────
-  libpq -> shd [label="SELECT pg_class / pg_attribute /\npg_type / pg_index +\npg_last_wal_replay_lsn()\nport=55434, unix sock", color="#CBA85E", dir=both, arrowtail=open, penwidth=2];
+  capture [label="CatalogCapture\nboundary hold requires\nreturned LSN == next_lsn\ndiff historical predecessor\nderive SchemaEvent", fillcolor="#4D4128"];
 
-  // ──────── Generation-bump feedback (dashed) ────────
-  atomics -> gate   [label="Acquire-load\nper lookup", style=dashed, color="#CBA85E"];
-  gate    -> gencnt [label="bump on advance", style=dashed, color="#CBA85E"];
-  gencnt  -> lru    [label="gen mismatch ⇒ miss", style=dashed, color="#CBA85E"];
+  direct [label="direct consumers\nboot seed / opt-in dispatch /\nbackup TOAST lookup", fillcolor="#4D4128"];
 
-  // ──────── DROP sweep path ────────
-  psweeps -> sweep  [label="disarm at armed xact's commit ⇒\nwait_for_replay(commit lsn), sweep\n(abort disarms, no sweep)", style=dashed, color="#CBA85E"];
-  sweep   -> libpq  [label="SELECT oid = ANY($1)\nFROM pg_class", style=dashed, color="#CBA85E"];
-  sweep   -> prev   [label="remove missing", style=dashed, color="#CBA85E"];
-  sweep   -> evtx   [label="Dropped { oid, qname }", color="#CBA85E"];
-  sweep   -> gencnt [label="bump on DROP", style=dashed, color="#CBA85E"];
+  log [label="DescriptorLog\nappend durable batch\nown descriptor history", fillcolor="#4D3850", shape=note];
 
-  // ──────── Downstream emission ────────
-  evtx -> xbuf   [label="stamp on xid\n(lsn-ordered drain)", style=dashed, color="#CBA85E"];
-  evtx -> ddlapp [label="drain at commit", color="#BF8C5F", penwidth=2];
+  xbuf [label="XactBuffer\nstamp SchemaEvent on xid\ncommit-order drain", fillcolor="#4D4128"];
 
-  // ──────── Legend ────────
+  result -> capture [label="boundary fetch", color="#CBA85E", penwidth=2];
+  result -> direct [label="non-boundary fetch", color="#CBA85E"];
+  capture -> log [label="batch", color="#b380b0", style=dotted, penwidth=2];
+  capture -> xbuf [label="Added | Changed | Dropped", color="#b380b0", style=dotted];
+
   legend [shape=plaintext, label=<
     <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill — role</B></TD></TR>
-      <TR><TD BGCOLOR="#4D4D28" WIDTH="28"></TD><TD>ShadowCatalog internal (cache, gates, epochs)</TD></TR>
-      <TR><TD BGCOLOR="#4D4128"></TD><TD>decoder / XactBuffer (consumer)</TD></TR>
-      <TR><TD BGCOLOR="#4D3A28"></TD><TD>CatalogTracker (filter, producer of bumps)</TD></TR>
-      <TR><TD BGCOLOR="#5D4628"></TD><TD>DdlApplicator (CH DDL, own TCP)</TD></TR>
-      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow Postgres</TD></TR>
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge style</B></TD></TR>
-      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq query / SchemaEvent flow (solid = forward path)</TD></TR>
-      <TR><TD><FONT COLOR="#CBA85E"><B>┄┄</B></FONT></TD><TD>invalidation / cache feedback (dashed)</TD></TR>
-      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>CH Native DDL (off hot path, separate TCP)</TD></TR>
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>SchemaEvent variants</B></TD></TR>
-      <TR><TD><B>Added</B></TD><TD>first sight of oid → CREATE TABLE (post-DROP re-create, seed_from_source)</TD></TR>
-      <TR><TD><B>Changed</B></TD><TD>refetched shape ≠ prev_known: ADD/DROP/RENAME COLUMN, type widen (rejected for now)</TD></TR>
-      <TR><TD><B>Dropped</B></TD><TD>sweep at armed commit → configured dest action; pg_toast → durable deferred mirror retire</TD></TR>
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>generation invariant</B></TD></TR>
-      <TR><TD COLSPAN="2">one DDL → one bump → every cache entry stale on next access. Coarse-fire over-invalidates (hint-bit / autovac noise count) but never under-invalidates — schema correctness is the floor, refetch cost the negotiable.</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill, role</B></TD></TR>
+      <TR><TD BGCOLOR="#4D4D28" WIDTH="28"></TD><TD>ShadowCatalog + bridge client</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow PG worker + catalogs</TD></TR>
+      <TR><TD BGCOLOR="#4D4128"></TD><TD>capture and descriptor consumers</TD></TR>
+      <TR><TD BGCOLOR="#4D3850"></TD><TD>durable descriptor log</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge color</B></TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>descriptor query + assembly path</TD></TR>
+      <TR><TD><FONT COLOR="#B58B86"><B>┄┄</B></FONT></TD><TD>replay-pin invariant</TD></TR>
+      <TR><TD><FONT COLOR="#b380b0"><B>┈┈</B></FONT></TD><TD>descriptor durability + schema-event handoff</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>source policy</B></TD></TR>
+      <TR><TD><B>committed</B></TD><TD>worker only; ReplayMismatch fails read</TD></TR>
+      <TR><TD><B>overlay</B></TD><TD>worker only; ReplayMismatch fails read</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>ownership</B></TD></TR>
+      <TR><TD COLSPAN="2">ShadowCatalog has no cache, invalidation state, or event channel. DescriptorLog owns history; CatalogCapture derives events.</TD></TR>
     </TABLE>
   >];
-  ddlapp -> legend [style=invis];
+  log -> legend [style=invis];
 }

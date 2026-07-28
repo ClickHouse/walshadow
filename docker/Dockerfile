@@ -1,11 +1,11 @@
 # walshadow demo image. Multi-stage on alpine/musl:
 #   1. rust:1-alpine        -> static-ish walshadow-stream binary. alpine 3.23
 #      ships gcc 15, so clickhouse-c-rs builds under -std=c23.
-#   2. postgres:N-alpine     -> walshadow PG extension, compiled against the
+#   2. postgres:N-alpine     -> walshadow PG module, compiled against the
 #      exact runtime PG (same image) so PG_MODULE_MAGIC matches. The stream
 #      binary itself links no PG, so it builds separately.
-#   3. postgres:N-alpine runtime carries both, so daemon-owned shadow PG can
-#      `CREATE EXTENSION walshadow` against its own $libdir.
+#   3. postgres:N-alpine runtime carries both, so daemon-owned shadow PG
+#      resolves `shared_preload_libraries = 'walshadow'` from its own $libdir.
 
 ARG PG_MAJOR=18
 
@@ -51,10 +51,6 @@ RUN apk add --no-cache bash ca-certificates
 COPY --from=rust-builder /usr/local/bin/walshadow-stream /usr/local/bin/walshadow-stream
 COPY --from=ext-builder /src/pgext/walshadow.so \
         /usr/local/lib/postgresql/walshadow.so
-COPY --from=ext-builder /src/pgext/walshadow.control \
-        /usr/local/share/postgresql/extension/walshadow.control
-COPY --from=ext-builder /src/pgext/walshadow--0.1.sql \
-        /usr/local/share/postgresql/extension/walshadow--0.1.sql
 
 COPY docker/entrypoint.sh /usr/local/bin/walshadow-entrypoint
 RUN chmod +x /usr/local/bin/walshadow-entrypoint \

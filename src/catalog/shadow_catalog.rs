@@ -1,4 +1,4 @@
-//! Shadow PG SQL client for descriptor capture + name-keyed resolution.
+//! Shadow PG descriptor capture + name-keyed resolution.
 //!
 //! Decode never reads this: interval-scoped answers come from the durable
 //! [`DescriptorLog`](crate::catalog::desc_log::DescriptorLog), which capture
@@ -8,10 +8,16 @@
 //! ([`ShadowCatalog::descriptor_by_name`], toast resolution) serve opt-in
 //! dispatch, backfill standup, and preflight.
 //!
-//! Single-database model: instance bound to one DB. Shared catalogs
-//! (`db_node == 0`) resolve from any connection via `pg_relation_filenode`.
+//! One descriptor definition, `descriptor_from_rows`, over projections
+//! `pgext/overlay.c` names. Bridge worker's `SCAN` supplies committed and
+//! uncommitted catalog rows; one mirroring statement emits the same
+//! projections off one MVCC snapshot, for committed reads the worker cannot
+//! answer for a single replay position.
+//!
+//! Single-database model: instance bound to one DB.
 
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use backon::{ExponentialBuilder, RetryableWithContext};
@@ -20,14 +26,22 @@ use tokio_postgres::types::{Oid, PgLsn, ToSql};
 use tokio_postgres::{Client, NoTls, Row};
 use walrus::pg::walparser::RelFileNode;
 
+use crate::ops::bridge::{
+    AttributeRow, Bridge, BridgeError, Catalog, ClassRow, IndexRow, MAX_SCAN_OIDS, NamespaceRow,
+    ScanRow, TypeRow,
+};
 #[cfg(test)]
 use crate::pg::socket_conninfo;
-use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
+use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor, RelName, ReplIdent};
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
     #[error("pg: {0}")]
     Pg(#[from] tokio_postgres::Error),
+    /// The bridge owns its own redial, so a failure that reaches here is not
+    /// worth another catalog-level retry
+    #[error("bridge: {0}")]
+    Bridge(#[from] BridgeError),
     #[error("relation not found by filenode {0:?}")]
     NotFoundByFilenode(RelFileNode),
     #[error("relation in foreign database {0:?} (not the shadow DB)")]
@@ -75,6 +89,8 @@ impl Default for ShadowCatalogConfig {
 #[derive(Debug, Default, Clone)]
 pub struct ShadowCatalogStats {
     pub fetches: u64,
+    /// Committed reads answered off the mirroring statement, not the worker
+    pub mirror_fetches: u64,
     pub replay_waits: u64,
     pub reconnects: u64,
 }
@@ -87,6 +103,9 @@ pub struct ShadowCatalog {
     /// DB oid this client is connected to; survives `reconnect` since
     /// `conninfo` pins the DB
     current_db_oid: Option<Oid>,
+    /// `pg_database.dattablespace`, memoized for the same reason
+    default_tablespace: Option<Oid>,
+    bridge: Arc<Bridge>,
     stats: ShadowCatalogStats,
 }
 
@@ -114,7 +133,11 @@ impl ShadowCatalog {
     /// Connect over a libpq key=value conninfo. One-shot; wrap in
     /// [`with_transient_retry`] for retry-on-PG-coming-up. `conninfo` is stashed
     /// so the client can be rebuilt when shadow PG bounces.
-    pub async fn connect(conninfo: &str, config: ShadowCatalogConfig) -> Result<Self> {
+    pub async fn connect(
+        conninfo: &str,
+        config: ShadowCatalogConfig,
+        bridge: Arc<Bridge>,
+    ) -> Result<Self> {
         let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
         tokio::spawn(async move {
             let _ = conn.await;
@@ -125,6 +148,8 @@ impl ShadowCatalog {
             config,
             last_replay_lsn: None,
             current_db_oid: None,
+            default_tablespace: None,
+            bridge,
             stats: ShadowCatalogStats::default(),
         })
     }
@@ -153,7 +178,12 @@ impl ShadowCatalog {
         let Some(oid) = self.oid_by_name(rel).await? else {
             return Ok(None);
         };
-        Ok(self.fetch_by_oid(oid).await?.map(Arc::new))
+        Ok(self.fetch_one(oid).await?.map(Arc::new))
+    }
+
+    async fn fetch_one(&mut self, oid: Oid) -> Result<Option<RelDescriptor>> {
+        let (_, descs) = self.fetch_descriptors_batch(&[oid]).await?;
+        Ok(descs.into_iter().next())
     }
 
     /// Resolve a table's TOAST relation descriptor (`pg_class.reltoastrelid`
@@ -171,7 +201,7 @@ impl ShadowCatalog {
         if toast_oid == 0 {
             return Ok(None);
         }
-        Ok(self.fetch_by_oid(toast_oid).await?.map(Arc::new))
+        Ok(self.fetch_one(toast_oid).await?.map(Arc::new))
     }
 
     pub fn stats(&self) -> &ShadowCatalogStats {
@@ -263,183 +293,205 @@ impl ShadowCatalog {
         }
     }
 
-    async fn fetch_by_oid(&mut self, oid: Oid) -> Result<Option<RelDescriptor>> {
-        self.stats.fetches += 1;
-        let row = self
-            .query_opt_retry(
-                "SELECT \
-                    c.oid::oid, \
-                    c.relnamespace::oid, \
-                    n.nspname::text, \
-                    c.relname::text, \
-                    c.relkind::text, \
-                    c.relpersistence::text, \
-                    c.relreplident::text, \
-                    c.reltoastrelid::oid, \
-                    coalesce(nullif(c.reltablespace, 0), \
-                             (SELECT dattablespace FROM pg_database \
-                              WHERE datname = current_database()))::oid, \
-                    coalesce(pg_relation_filenode(c.oid), 0)::oid \
-                 FROM pg_class c \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE c.oid = $1",
-                &[&oid],
-            )
-            .await?;
-        let Some(row) = row else { return Ok(None) };
-        let spc_node: Oid = row.get(8);
-        let rel_node: Oid = row.get(9);
-        let db_node = self.current_database_oid().await?;
-        let rfn = RelFileNode {
-            spc_node,
-            db_node,
-            rel_node,
-        };
-        Ok(Some(self.descriptor_from_row(&row, rfn).await?))
-    }
-
-    /// Build from a pg_class⋈pg_namespace row whose first 8 columns are
-    /// (oid, relnamespace, nspname, relname, relkind, relpersistence,
-    /// relreplident, reltoastrelid), paired with a resolved `rfn`.
-    async fn descriptor_from_row(&mut self, row: &Row, rfn: RelFileNode) -> Result<RelDescriptor> {
-        let oid: Oid = row.get(0);
-        let namespace_oid: Oid = row.get(1);
-        let namespace_name: String = row.get(2);
-        let name: String = row.get(3);
-        let kind = one_char(row.get::<_, String>(4), "relkind")?;
-        let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
-        let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
-        let toast_oid: Oid = row.get(7);
-        let replident = self.fetch_replident(replident_char, oid).await?;
-        let attributes = self.fetch_attributes(oid).await?;
-        Ok(RelDescriptor {
-            rfn,
-            oid,
-            toast_oid,
-            namespace_oid,
-            rel_name: RelName::new(&namespace_name, &name),
-            kind,
-            persistence,
-            replident,
-            attributes,
-        })
-    }
-
-    /// Batched descriptor fetch: one round trip for N oids plus the shadow's
-    /// replay position off the same connection. Oids absent from pg_class are
-    /// absent from the result (dropped rels). Zero-column rels yield empty
-    /// attribute vecs.
+    /// Batched descriptor fetch: N oids plus the shadow's replay position.
+    /// Oids absent from pg_class are absent from the result (dropped rels).
+    /// Zero-column rels yield empty attribute vecs.
     pub async fn fetch_descriptors_batch(
         &mut self,
         oids: &[Oid],
     ) -> Result<(u64, Vec<RelDescriptor>)> {
-        let oids: Vec<Oid> = oids.to_vec();
-        self.fetch_descriptor_rows(DESCRIPTOR_BATCH_SQL, &[&oids])
-            .await
+        self.fetch_committed(Scope::Oids(oids)).await
     }
 
     /// Every eligible user relation: capture-all + descriptor-log boot seed.
     pub async fn fetch_all_descriptors(&mut self) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_descriptor_rows(&DESCRIPTOR_ALL_SQL, &[]).await
+        self.fetch_committed(Scope::Eligible).await
     }
 
-    async fn fetch_descriptor_rows(
-        &mut self,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<(u64, Vec<RelDescriptor>)> {
+    /// Committed catalog at one replay position.
+    async fn fetch_committed(&mut self, scope: Scope<'_>) -> Result<(u64, Vec<RelDescriptor>)> {
+        self.stats.fetches += 1;
+        let rows = self.committed_rows(scope).await?;
+        let replay_lsn = rows.replay_lsn;
         let db_node = self.current_db_oid().await?;
-        let rows = self.query_retry(sql, params).await?;
-        let mut replay_lsn = 0u64;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            replay_lsn = row.get::<_, Option<PgLsn>>(25).map(u64::from).unwrap_or(0);
-            out.push(descriptor_from_batch_row(row, db_node)?);
-        }
-        if out.is_empty() {
-            let row = self
-                .query_one_retry("SELECT pg_last_wal_replay_lsn()", &[])
-                .await?;
-            replay_lsn = row.get::<_, Option<PgLsn>>(0).map(u64::from).unwrap_or(0);
-        }
-        Ok((replay_lsn, out))
+        let default_tablespace = self.default_tablespace_oid().await?;
+        Ok((replay_lsn, rows.assemble(db_node, default_tablespace)?))
     }
 
-    async fn fetch_replident(&mut self, c: char, rel_oid: Oid) -> Result<ReplIdent> {
-        match c {
-            'd' => {
-                // indkey is int2vector; cast to int2[] for tokio-postgres'
-                // Kind::Array(int2) decode. Missing row → no PK → old = None.
-                let row = self
-                    .query_opt_retry(
-                        "SELECT indkey::int2[] \
-                         FROM pg_index \
-                         WHERE indrelid = $1 AND indisprimary = true \
-                         LIMIT 1",
-                        &[&rel_oid],
-                    )
-                    .await?;
-                let pk_attnums = row.map(|r| r.get::<_, Vec<i16>>(0));
-                Ok(ReplIdent::Default { pk_attnums })
-            }
-            'n' => Ok(ReplIdent::Nothing),
-            'f' => {
-                // FULL logs all columns but names no key index; still capture
-                // the PK so the CH ORDER BY uses it instead of `_lsn`.
-                let row = self
-                    .query_opt_retry(
-                        "SELECT indkey::int2[] \
-                         FROM pg_index \
-                         WHERE indrelid = $1 AND indisprimary = true \
-                         LIMIT 1",
-                        &[&rel_oid],
-                    )
-                    .await?;
-                let pk_attnums = row.map(|r| r.get::<_, Vec<i16>>(0));
-                Ok(ReplIdent::Full { pk_attnums })
-            }
-            'i' => {
-                // indkey is int2vector; cast to int2[] for tokio-postgres'
-                // Kind::Array(int2) → Vec<i16> decode
-                let row = self
-                    .query_opt_retry(
-                        "SELECT indexrelid::oid, indkey::int2[] \
-                         FROM pg_index \
-                         WHERE indrelid = $1 AND indisreplident = true \
-                         LIMIT 1",
-                        &[&rel_oid],
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        CatalogError::Parse(format!(
-                            "relreplident='i' but no pg_index row with indisreplident=true for relation {rel_oid}",
-                        ))
-                    })?;
-                let index_oid: Oid = row.get(0);
-                let key_attnums: Vec<i16> = row.get(1);
-                Ok(ReplIdent::UsingIndex {
-                    index_oid,
-                    key_attnums,
-                })
-            }
-            other => Err(CatalogError::Parse(format!(
-                "unknown relreplident {other:?} (expected one of d/n/f/i)",
-            ))),
+    /// Worker while it can answer for one replay position, the mirroring
+    /// statement otherwise. Replay only sits still inside the publication
+    /// hold; away from one it moves between requests, so no sequence of scans
+    /// answers for a single position and the statement's one snapshot always
+    /// does.
+    async fn committed_rows(&mut self, scope: Scope<'_>) -> Result<DescriptorRows> {
+        let bridge = self.bridge.clone();
+        match self.scan_rows(&bridge, scope, 0, None).await {
+            Err(e) if worker_cannot_answer(&e) => self.mirror_rows(scope).await,
+            other => other,
         }
     }
 
-    async fn fetch_attributes(&mut self, rel_oid: Oid) -> Result<Vec<RelAttr>> {
-        // `attmissingval` is `anyarray` (no subscript or unnest); `::text` casts
-        // to PG's array_out literal `{val}`, which parse_array_one_element
-        // strips back to the typoutput text form for getmissingattr
-        let rows = self.query_retry(crate::pg::ATTR_SQL, &[&rel_oid]).await?;
-        rows.iter()
-            .map(|row| {
-                crate::pg::RawAttr::from_row(row)
-                    .build()
-                    .map_err(CatalogError::Parse)
-            })
-            .collect()
+    /// Descriptors as transaction `top_xid` sees them, read off shadow's pages
+    /// at `boundary` — the LSN the caller parked replay at. Rows the
+    /// transaction wrote and has not committed are included; rows it deleted
+    /// are not.
+    ///
+    /// Oids absent from `pg_class` are absent from the result, as in
+    /// [`Self::fetch_descriptors_batch`].
+    pub async fn fetch_overlay_descriptors(
+        &mut self,
+        oids: &[Oid],
+        top_xid: u32,
+        boundary: u64,
+    ) -> Result<Vec<RelDescriptor>> {
+        let bridge = self.bridge.clone();
+        self.stats.fetches += 1;
+        let rows = self
+            .scan_rows(&bridge, Scope::Oids(oids), top_xid, Some(boundary))
+            .await?;
+        let db_node = self.current_db_oid().await?;
+        let default_tablespace = self.default_tablespace_oid().await?;
+        rows.assemble(db_node, default_tablespace)
+    }
+
+    /// Projection rows off the worker. `boundary` is the LSN the caller parked
+    /// replay at; `None` takes the first scan's position and pins the rest to
+    /// it, so a replay move mid-read fails instead of tearing the descriptor.
+    async fn scan_rows(
+        &mut self,
+        bridge: &Bridge,
+        scope: Scope<'_>,
+        top_xid: u32,
+        boundary: Option<u64>,
+    ) -> Result<DescriptorRows> {
+        // The worker runs one scan per oid, where `= ANY($1)` on the SQL path
+        // folds repeats
+        let scoped = match scope {
+            Scope::Oids(oids) => {
+                let mut scoped = oids.to_vec();
+                scoped.sort_unstable();
+                scoped.dedup();
+                scoped
+            }
+            Scope::Eligible => Vec::new(),
+        };
+        // An empty oid list is the whole catalog on the wire, never "no
+        // relations", so the caller's empty list has to stop here
+        if matches!(scope, Scope::Oids(_)) && scoped.is_empty() {
+            return Ok(DescriptorRows {
+                replay_lsn: match boundary {
+                    Some(b) => b,
+                    None => bridge.replay_lsn().await?,
+                },
+                ..Default::default()
+            });
+        }
+
+        let mut pin = boundary;
+        let mut class: Vec<ClassRow> = scan_pinned(bridge, top_xid, &scoped, &mut pin).await?;
+        if matches!(scope, Scope::Eligible) {
+            class.retain(eligible);
+        }
+        let pinned = pin.expect("the pg_class scan pins the position");
+        if class.is_empty() {
+            return Ok(DescriptorRows {
+                replay_lsn: pinned,
+                ..Default::default()
+            });
+        }
+        // Whole-catalog pg_attribute is a seqscan of the biggest catalog there
+        // is, and pg_class already named every relation worth scoping to
+        let oids: Vec<Oid> = match scope {
+            Scope::Oids(_) => scoped,
+            Scope::Eligible => class.iter().map(|c| c.oid).collect(),
+        };
+        let attrs: Vec<AttributeRow> = scan_pinned(bridge, top_xid, &oids, &mut pin).await?;
+        let indexes: Vec<IndexRow> = scan_pinned(bridge, top_xid, &oids, &mut pin).await?;
+
+        let namespaces = self
+            .resolve_names(
+                bridge,
+                "SELECT oid::oid, nspname::text FROM pg_namespace \
+                 WHERE oid = ANY($1::oid[])",
+                &class.iter().map(|c| c.relnamespace).collect(),
+                |r: NamespaceRow| (r.oid, r.nspname),
+                top_xid,
+                pinned,
+            )
+            .await?;
+        // DROP COLUMN zeroes atttypid, and no pg_type row for it is what leaves
+        // the slot's type_name empty
+        let types = self
+            .resolve_names(
+                bridge,
+                "SELECT oid::oid, typname::text FROM pg_type \
+                 WHERE oid = ANY($1::oid[])",
+                &attrs
+                    .iter()
+                    .map(|a| a.atttypid)
+                    .filter(|oid| *oid != 0)
+                    .collect(),
+                |r: TypeRow| (r.oid, r.typname),
+                top_xid,
+                pinned,
+            )
+            .await?;
+
+        Ok(DescriptorRows {
+            class,
+            attrs,
+            indexes,
+            namespaces,
+            types,
+            replay_lsn: pinned,
+        })
+    }
+
+    /// The same projections off one MVCC snapshot. Committed rows only, which
+    /// is all the statement can see and all this path is asked for.
+    async fn mirror_rows(&mut self, scope: Scope<'_>) -> Result<DescriptorRows> {
+        self.stats.mirror_fetches += 1;
+        let rows = match scope {
+            Scope::Oids(oids) => self.query_retry(&MIRROR_BATCH_SQL, &[&oids]).await?,
+            Scope::Eligible => self.query_retry(&MIRROR_ALL_SQL, &[]).await?,
+        };
+        DescriptorRows::from_mirror(&rows)
+    }
+
+    /// Oid → name for one whole-catalog projection, committed read first and
+    /// the overlay only for what it missed.
+    ///
+    /// The overlay scan behind it has no oid list and so no lock argument, and
+    /// refuses to answer while any foreign writer is mid-DDL. Running it only
+    /// for what the committed read lacks keeps that exposure to names the
+    /// requesting transaction created itself; a committed read never gets
+    /// there at all.
+    async fn resolve_names<R: ScanRow>(
+        &mut self,
+        bridge: &Bridge,
+        sql: &str,
+        wanted: &BTreeSet<Oid>,
+        name_of: fn(R) -> (Oid, String),
+        top_xid: u32,
+        boundary: u64,
+    ) -> Result<HashMap<Oid, String>> {
+        if wanted.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let list: Vec<Oid> = wanted.iter().copied().collect();
+        let rows = self.query_retry(sql, &[&list]).await?;
+        let mut names: HashMap<Oid, String> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+        if names.len() == wanted.len() {
+            return Ok(names);
+        }
+        let scan = bridge.scan_at(R::CATALOG, top_xid, &[], boundary).await?;
+        for row in scan.parse::<R>()? {
+            let (oid, name) = name_of(row);
+            if wanted.contains(&oid) {
+                names.insert(oid, name);
+            }
+        }
+        Ok(names)
     }
 
     pub async fn current_database_oid(&mut self) -> Result<Oid> {
@@ -462,15 +514,22 @@ impl ShadowCatalog {
         self.current_db_oid = Some(oid);
         Ok(oid)
     }
-}
 
-fn one_char(s: String, what: &str) -> Result<char> {
-    let mut chars = s.chars();
-    match (chars.next(), chars.next()) {
-        (Some(c), None) => Ok(c),
-        _ => Err(CatalogError::Parse(format!(
-            "expected single-char {what}, got {s:?}"
-        ))),
+    /// What `pg_class.reltablespace = 0` means, and what WAL locators carry.
+    /// Memoized alongside [`Self::current_db_oid`].
+    async fn default_tablespace_oid(&mut self) -> Result<Oid> {
+        if let Some(oid) = self.default_tablespace {
+            return Ok(oid);
+        }
+        let row = self
+            .query_one_retry(
+                "SELECT dattablespace::oid FROM pg_database WHERE datname = current_database()",
+                &[],
+            )
+            .await?;
+        let oid = row.get(0);
+        self.default_tablespace = Some(oid);
+        Ok(oid)
     }
 }
 
@@ -514,110 +573,305 @@ fn is_transient(err: &CatalogError) -> bool {
     matches!(err, CatalogError::Pg(_))
 }
 
-/// One row per live oid. Columns:
-/// 0-7 pg_class scalars as in [`ShadowCatalog::descriptor_from_row`]
-/// (oid, relnamespace, nspname, relname, relkind, relpersistence,
-/// relreplident, reltoastrelid); 8 physical tablespace (reltablespace with
-/// the 0 = database-default sentinel resolved to `dattablespace`, matching
-/// WAL locators' spcOid);
-/// 9 filenode (0 = no storage); 10 pk indkey; 11-12 replident index
-/// (indexrelid, indkey); 13-24 pg_attribute arrays parallel by attnum,
-/// physical cols direct + LEFT JOIN pg_type per [`crate::pg::ATTR_SQL`];
-/// 25 `pg_last_wal_replay_lsn()`.
-const DESCRIPTOR_BATCH_SQL: &str = "SELECT \
-        c.oid::oid, \
-        c.relnamespace::oid, \
-        n.nspname::text, \
-        c.relname::text, \
-        c.relkind::text, \
-        c.relpersistence::text, \
-        c.relreplident::text, \
-        c.reltoastrelid::oid, \
-        coalesce(nullif(c.reltablespace, 0), \
-                 (SELECT dattablespace FROM pg_database \
-                  WHERE datname = current_database()))::oid, \
-        coalesce(pg_relation_filenode(c.oid), 0)::oid, \
-        pk.attnums, \
-        ri.index_oid, \
-        ri.attnums, \
-        att.attnums, att.names, att.type_oids, att.typmods, att.not_nulls, \
-        att.droppeds, att.type_names, att.byvals, att.lens, att.aligns, \
-        att.storages, att.missings, \
-        pg_last_wal_replay_lsn() \
-     FROM pg_class c \
-     JOIN pg_namespace n ON n.oid = c.relnamespace \
-     LEFT JOIN LATERAL ( \
-        SELECT indkey::int2[] AS attnums FROM pg_index \
-        WHERE indrelid = c.oid AND indisprimary LIMIT 1) pk ON true \
-     LEFT JOIN LATERAL ( \
-        SELECT indexrelid::oid AS index_oid, indkey::int2[] AS attnums \
-        FROM pg_index \
-        WHERE indrelid = c.oid AND indisreplident LIMIT 1) ri ON true \
-     LEFT JOIN LATERAL ( \
-        SELECT \
-            array_agg(a.attnum ORDER BY a.attnum) AS attnums, \
-            array_agg(a.attname::text ORDER BY a.attnum) AS names, \
-            array_agg(a.atttypid ORDER BY a.attnum) AS type_oids, \
-            array_agg(a.atttypmod ORDER BY a.attnum) AS typmods, \
-            array_agg(a.attnotnull ORDER BY a.attnum) AS not_nulls, \
-            array_agg(a.attisdropped ORDER BY a.attnum) AS droppeds, \
-            array_agg(t.typname::text ORDER BY a.attnum) AS type_names, \
-            array_agg(a.attbyval ORDER BY a.attnum) AS byvals, \
-            array_agg(a.attlen ORDER BY a.attnum) AS lens, \
-            array_agg(a.attalign::text ORDER BY a.attnum) AS aligns, \
-            array_agg(a.attstorage::text ORDER BY a.attnum) AS storages, \
-            array_agg(CASE WHEN a.atthasmissing THEN a.attmissingval::text END \
-                      ORDER BY a.attnum) AS missings \
-        FROM pg_attribute a \
-        LEFT JOIN pg_type t ON t.oid = a.atttypid \
-        WHERE a.attrelid = c.oid AND a.attnum >= 1) att ON true \
-     WHERE c.oid = ANY($1::oid[])";
+/// Committed reads the worker cannot answer, so the statement does instead.
+/// A worker that answered and said no is not here: that error is the caller's.
+fn worker_cannot_answer(err: &CatalogError) -> bool {
+    matches!(
+        err,
+        CatalogError::Bridge(
+            BridgeError::ReplayMismatch { .. } | BridgeError::Io(_) | BridgeError::Protocol(_)
+        )
+    )
+}
 
-/// [`DESCRIPTOR_BATCH_SQL`] over every eligible user relation instead of an
-/// oid list: capture-all fallback + descriptor-log boot seed. Kinds match
-/// the decodable set (heap 'r', partitioned parent 'p', matview 'm', toast
-/// 't'); indexes/sequences/views never decode.
-static DESCRIPTOR_ALL_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let base = DESCRIPTOR_BATCH_SQL
-        .strip_suffix("WHERE c.oid = ANY($1::oid[])")
-        .expect("batch SQL suffix");
-    format!("{base}WHERE c.oid >= 16384 AND c.relkind IN ('r', 'p', 'm', 't')")
+/// Not a catalog: the read's replay position, and the one row every mirror
+/// read carries whether or not the projections matched anything.
+const MIRROR_POSITION: i32 = 0;
+
+/// `pg_last_wal_replay_lsn()` is null off a standby, where the worker reports
+/// `0` for the same reason.
+const NO_REPLAY: &str = "0/0";
+
+/// The projections `pgext/overlay.c` emits, in the text output forms it uses,
+/// as `(catalog id, text[])` rows so both sources reach the same [`ScanRow`]
+/// parsers. One statement, so one snapshot covers every projection.
+///
+/// `format('%s', v)` renders through the type's own output function: a
+/// `::text` cast says `true` where `boolout` says `t`, and would take
+/// `int2vector` out of the space-separated form the worker sends. `attnum >=
+/// 1` drops the system columns the descriptor never wants; `attmissingval`
+/// carries `anyarray_out` form only when `atthasmissing`.
+///
+/// Position branch is first so its `pg_last_wal_replay_lsn()` is read as close
+/// to snapshot acquisition as one statement allows.
+fn mirror_sql(scope_pred: &str) -> String {
+    format!(
+        "WITH scoped AS MATERIALIZED (\
+             SELECT c.* FROM pg_class c WHERE {scope_pred}\
+         ), att AS MATERIALIZED (\
+             SELECT a.* FROM pg_attribute a JOIN scoped s ON s.oid = a.attrelid \
+             WHERE a.attnum >= 1\
+         ) \
+         SELECT {position}, ARRAY[coalesce(pg_last_wal_replay_lsn()::text, '{no_replay}')] \
+         UNION ALL SELECT {class}, ARRAY[\
+             format('%s', c.oid), format('%s', c.relnamespace), format('%s', c.relname), \
+             format('%s', c.relkind), format('%s', c.relpersistence), \
+             format('%s', c.relreplident), format('%s', c.reltoastrelid), \
+             format('%s', c.reltablespace), format('%s', c.relfilenode)] \
+           FROM scoped c \
+         UNION ALL SELECT {attribute}, ARRAY[\
+             format('%s', a.attrelid), format('%s', a.attnum), format('%s', a.attname), \
+             format('%s', a.atttypid), format('%s', a.atttypmod), format('%s', a.attnotnull), \
+             format('%s', a.attisdropped), format('%s', a.attbyval), format('%s', a.attlen), \
+             format('%s', a.attalign), format('%s', a.attstorage), \
+             CASE WHEN a.atthasmissing THEN a.attmissingval::text END] \
+           FROM att a \
+         UNION ALL SELECT {index}, ARRAY[\
+             format('%s', i.indexrelid), format('%s', i.indrelid), \
+             format('%s', i.indisprimary), format('%s', i.indisreplident), \
+             format('%s', i.indkey)] \
+           FROM pg_index i JOIN scoped s ON s.oid = i.indrelid \
+         UNION ALL SELECT {namespace}, ARRAY[format('%s', n.oid), format('%s', n.nspname)] \
+           FROM pg_namespace n WHERE n.oid IN (SELECT relnamespace FROM scoped) \
+         UNION ALL SELECT {typ}, ARRAY[format('%s', t.oid), format('%s', t.typname)] \
+           FROM pg_type t WHERE t.oid IN (SELECT atttypid FROM att)",
+        position = MIRROR_POSITION,
+        no_replay = NO_REPLAY,
+        class = Catalog::Class as u8,
+        attribute = Catalog::Attribute as u8,
+        index = Catalog::Index as u8,
+        namespace = Catalog::Namespace as u8,
+        typ = Catalog::Type as u8,
+    )
+}
+
+static MIRROR_BATCH_SQL: LazyLock<String> = LazyLock::new(|| mirror_sql("c.oid = ANY($1::oid[])"));
+
+/// [`MIRROR_BATCH_SQL`] over every eligible user relation. Predicate is
+/// [`eligible`] in SQL, which the scan path applies to whole-catalog rows
+/// instead: scoping there is what keeps `pg_attribute` off every system rel.
+static MIRROR_ALL_SQL: LazyLock<String> = LazyLock::new(|| {
+    mirror_sql(&format!(
+        "c.oid >= {FIRST_NORMAL_OBJECT_ID} AND c.relkind IN ('r', 'p', 'm', 't')"
+    ))
 });
 
-/// See [`DESCRIPTOR_BATCH_SQL`] for the column plan.
-fn descriptor_from_batch_row(row: &Row, db_node: Oid) -> Result<RelDescriptor> {
-    let oid: Oid = row.get(0);
-    let namespace_oid: Oid = row.get(1);
-    let namespace_name: String = row.get(2);
-    let name: String = row.get(3);
-    let kind = one_char(row.get::<_, String>(4), "relkind")?;
-    let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
-    let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
-    let toast_oid: Oid = row.get(7);
-    let spc_node: Oid = row.get(8);
-    let rel_node: Oid = row.get(9);
-    let pk_attnums: Option<Vec<i16>> = row.get(10);
-    let ri_index_oid: Option<Oid> = row.get(11);
-    let ri_attnums: Option<Vec<i16>> = row.get(12);
+/// Which relations one descriptor read covers.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    Oids(&'a [Oid]),
+    /// Capture-all fallback + descriptor-log boot seed
+    Eligible,
+}
+
+/// Relations decode can use: user oids, and the kinds that carry heap tuples
+/// (heap, partitioned parent, matview, toast). Indexes, sequences and views
+/// never decode.
+fn eligible(class: &ClassRow) -> bool {
+    class.oid >= FIRST_NORMAL_OBJECT_ID && matches!(class.relkind, 'r' | 'p' | 'm' | 't')
+}
+
+/// One catalog's projection rows off the worker. First scan of a read fixes
+/// the replay position when the caller has none of its own; every later scan
+/// asserts against it.
+///
+/// Chunked at [`MAX_SCAN_OIDS`]: a capture-all over a partition-heavy schema
+/// names more relations than one request may carry, and every chunk shares the
+/// one position anyway.
+async fn scan_pinned<R: ScanRow>(
+    bridge: &Bridge,
+    top_xid: u32,
+    oids: &[Oid],
+    pin: &mut Option<u64>,
+) -> Result<Vec<R>> {
+    // An empty list is the whole catalog on the wire, which `chunks` would
+    // skip asking for rather than ask once
+    let chunks: Vec<&[Oid]> = if oids.is_empty() {
+        vec![&[]]
+    } else {
+        oids.chunks(MAX_SCAN_OIDS).collect()
+    };
+    let mut out = Vec::new();
+    for chunk in chunks {
+        let res = match *pin {
+            Some(boundary) => bridge.scan_at(R::CATALOG, top_xid, chunk, boundary).await?,
+            None => bridge.scan_pinning(R::CATALOG, top_xid, chunk).await?,
+        };
+        *pin = Some(res.replay_lsn_end);
+        out.extend(res.parse::<R>()?);
+    }
+    Ok(out)
+}
+
+/// One descriptor read's rows, laid out as `SCAN` projections in
+/// `pgext/overlay.c`.
+#[derive(Default)]
+struct DescriptorRows {
+    class: Vec<ClassRow>,
+    attrs: Vec<AttributeRow>,
+    indexes: Vec<IndexRow>,
+    namespaces: HashMap<Oid, String>,
+    types: HashMap<Oid, String>,
+    replay_lsn: u64,
+}
+
+impl DescriptorRows {
+    /// Rows off [`mirror_sql`], keyed by the catalog ids `SCAN` requests carry
+    /// in their own header.
+    fn from_mirror(rows: &[Row]) -> Result<Self> {
+        let mut out = Self::default();
+        let mut position = None;
+        for row in rows {
+            let id: i32 = row.get(0);
+            let cols: Vec<Option<String>> = row.get(1);
+            if id == MIRROR_POSITION {
+                let text = cols.first().and_then(Option::as_deref).unwrap_or(NO_REPLAY);
+                let lsn: PgLsn = text
+                    .parse()
+                    .map_err(|_| CatalogError::Parse(format!("mirror replay position {text:?}")))?;
+                position = Some(u64::from(lsn));
+                continue;
+            }
+            let catalog = u8::try_from(id)
+                .ok()
+                .and_then(Catalog::from_id)
+                .ok_or_else(|| CatalogError::Parse(format!("mirror catalog id {id}")))?;
+            match catalog {
+                Catalog::Class => out.class.push(ClassRow::parse(&cols)?),
+                Catalog::Attribute => out.attrs.push(AttributeRow::parse(&cols)?),
+                Catalog::Index => out.indexes.push(IndexRow::parse(&cols)?),
+                Catalog::Namespace => {
+                    let row = NamespaceRow::parse(&cols)?;
+                    out.namespaces.insert(row.oid, row.nspname);
+                }
+                Catalog::Type => {
+                    let row = TypeRow::parse(&cols)?;
+                    out.types.insert(row.oid, row.typname);
+                }
+            }
+        }
+        out.replay_lsn = position
+            .ok_or_else(|| CatalogError::Parse("mirror read carried no position".into()))?;
+        Ok(out)
+    }
+
+    fn assemble(self, db_node: Oid, default_tablespace: Oid) -> Result<Vec<RelDescriptor>> {
+        let mut attrs_by_rel: HashMap<Oid, Vec<AttributeRow>> = HashMap::new();
+        for attr in self.attrs {
+            attrs_by_rel.entry(attr.attrelid).or_default().push(attr);
+        }
+        let mut indexes_by_rel: HashMap<Oid, Vec<IndexRow>> = HashMap::new();
+        for index in self.indexes {
+            indexes_by_rel
+                .entry(index.indrelid)
+                .or_default()
+                .push(index);
+        }
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::with_capacity(self.class.len());
+        for row in &self.class {
+            // Two rows for one oid is the overlay's visibility predicate
+            // failing to apply the transaction's own delete, ie a descriptor
+            // built from a superseded pg_class version
+            if !seen.insert(row.oid) {
+                return Err(CatalogError::Parse(format!(
+                    "two pg_class rows for oid {}",
+                    row.oid
+                )));
+            }
+            out.push(descriptor_from_rows(
+                row,
+                attrs_by_rel.get(&row.oid).map_or(&[][..], Vec::as_slice),
+                indexes_by_rel.get(&row.oid).map_or(&[][..], Vec::as_slice),
+                &self.namespaces,
+                &self.types,
+                db_node,
+                default_tablespace,
+            )?);
+        }
+        Ok(out)
+    }
+}
+
+/// One descriptor out of projection rows already scoped to `class.oid`. The
+/// single definition of the shape, so a committed read and an overlay read of
+/// an unchanged relation are equal.
+fn descriptor_from_rows(
+    class: &ClassRow,
+    attrs: &[AttributeRow],
+    indexes: &[IndexRow],
+    namespaces: &HashMap<Oid, String>,
+    types: &HashMap<Oid, String>,
+    db_node: Oid,
+    default_tablespace: Oid,
+) -> Result<RelDescriptor> {
+    let namespace_name = namespaces.get(&class.relnamespace).ok_or_else(|| {
+        CatalogError::Parse(format!(
+            "no pg_namespace row for relnamespace {} of relation {}",
+            class.relnamespace, class.oid
+        ))
+    })?;
     let replident = replident_from_parts(
-        replident_char,
-        oid,
-        pk_attnums,
-        ri_index_oid.zip(ri_attnums),
+        class.relreplident,
+        class.oid,
+        indexes
+            .iter()
+            .find(|i| i.indisprimary)
+            .map(|i| i.indkey.clone()),
+        indexes
+            .iter()
+            .find(|i| i.indisreplident)
+            .map(|i| (i.indexrelid, i.indkey.clone())),
     )?;
-    let attributes = attrs_from_arrays(row)?;
+
+    let mut ordered: Vec<&AttributeRow> = attrs.iter().collect();
+    ordered.sort_unstable_by_key(|a| a.attnum);
+    let mut attributes = Vec::with_capacity(ordered.len());
+    for (i, attr) in ordered.iter().enumerate() {
+        // Two rows for one attnum is an ALTER's superseded version surviving
+        // the overlay's visibility predicate, which would shift every later
+        // column
+        if i > 0 && ordered[i - 1].attnum == attr.attnum {
+            return Err(CatalogError::Parse(format!(
+                "two pg_attribute rows for relation {} attnum {}",
+                class.oid, attr.attnum
+            )));
+        }
+        let raw = crate::pg::RawAttr {
+            attnum: attr.attnum,
+            name: attr.attname.clone(),
+            type_oid: attr.atttypid,
+            typmod: attr.atttypmod,
+            not_null: attr.attnotnull,
+            dropped: attr.attisdropped,
+            type_name: types.get(&attr.atttypid).cloned(),
+            type_byval: attr.attbyval,
+            type_len: attr.attlen,
+            type_align: attr.attalign.to_string(),
+            type_storage: attr.attstorage.to_string(),
+            missing: attr.attmissingval.clone(),
+        };
+        attributes.push(raw.build().map_err(CatalogError::Parse)?);
+    }
+
     Ok(RelDescriptor {
         rfn: RelFileNode {
-            spc_node,
+            // 0 is the database-default sentinel; WAL locators carry the
+            // resolved tablespace
+            spc_node: if class.reltablespace == 0 {
+                default_tablespace
+            } else {
+                class.reltablespace
+            },
             db_node,
-            rel_node,
+            rel_node: class.relfilenode,
         },
-        oid,
-        toast_oid,
-        namespace_oid,
-        rel_name: RelName::new(&namespace_name, &name),
-        kind,
-        persistence,
+        oid: class.oid,
+        toast_oid: class.reltoastrelid,
+        namespace_oid: class.relnamespace,
+        rel_name: RelName::new(namespace_name, &class.relname),
+        kind: class.relkind,
+        persistence: class.relpersistence,
         replident,
         attributes,
     })
@@ -650,82 +904,12 @@ fn replident_from_parts(
     }
 }
 
-/// Zip [`DESCRIPTOR_BATCH_SQL`] columns 13-24 into attrs.
-fn attrs_from_arrays(row: &Row) -> Result<Vec<RelAttr>> {
-    let Some(attnums) = row.get::<_, Option<Vec<i16>>>(13) else {
-        return Ok(Vec::new());
-    };
-    let names: Vec<String> = row.get(14);
-    let type_oids: Vec<Oid> = row.get(15);
-    let typmods: Vec<i32> = row.get(16);
-    let not_nulls: Vec<bool> = row.get(17);
-    let droppeds: Vec<bool> = row.get(18);
-    let type_names: Vec<Option<String>> = row.get(19);
-    let byvals: Vec<bool> = row.get(20);
-    let lens: Vec<i16> = row.get(21);
-    let aligns: Vec<String> = row.get(22);
-    let storages: Vec<String> = row.get(23);
-    let missings: Vec<Option<String>> = row.get(24);
-    let n = attnums.len();
-    let lens_match = [
-        names.len(),
-        type_oids.len(),
-        typmods.len(),
-        not_nulls.len(),
-        droppeds.len(),
-        type_names.len(),
-        byvals.len(),
-        lens.len(),
-        aligns.len(),
-        storages.len(),
-        missings.len(),
-    ]
-    .iter()
-    .all(|&l| l == n);
-    if !lens_match {
-        return Err(CatalogError::Parse(
-            "descriptor batch: attribute array length mismatch".into(),
-        ));
-    }
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let raw = crate::pg::RawAttr {
-            attnum: attnums[i],
-            name: names[i].clone(),
-            type_oid: type_oids[i],
-            typmod: typmods[i],
-            not_null: not_nulls[i],
-            dropped: droppeds[i],
-            type_name: type_names[i].clone(),
-            type_byval: byvals[i],
-            type_len: lens[i],
-            type_align: aligns[i].clone(),
-            type_storage: storages[i].clone(),
-            missing: missings[i].clone(),
-        };
-        out.push(raw.build().map_err(CatalogError::Parse)?);
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-
-    #[test]
-    fn one_char_accepts_single() {
-        assert_eq!(one_char("r".into(), "relkind").unwrap(), 'r');
-        assert_eq!(one_char("p".into(), "relpersistence").unwrap(), 'p');
-    }
-
-    #[test]
-    fn one_char_rejects_multi_or_empty() {
-        assert!(one_char("".into(), "x").is_err());
-        assert!(one_char("rr".into(), "x").is_err());
-    }
 
     #[test]
     fn socket_conninfo_includes_all_fields() {
@@ -741,6 +925,183 @@ mod tests {
         let c = ShadowCatalogConfig::default();
         assert!(c.replay_poll < c.replay_timeout);
         assert!(c.reconnect_backoff_initial < c.reconnect_backoff_max);
+    }
+
+    #[test]
+    fn eligible_takes_user_oids_of_heap_bearing_kinds() {
+        let user = |kind| ClassRow {
+            relkind: kind,
+            ..class_row()
+        };
+        for kind in ['r', 'p', 'm', 't'] {
+            assert!(eligible(&user(kind)), "{kind}");
+        }
+        for kind in ['i', 'S', 'v', 'c'] {
+            assert!(!eligible(&user(kind)), "{kind}");
+        }
+        assert!(!eligible(&ClassRow {
+            oid: FIRST_NORMAL_OBJECT_ID - 1,
+            ..class_row()
+        }));
+    }
+
+    /// pg_default, the `reltablespace = 0` sentinel's usual resolution
+    const DEFAULT_TABLESPACE: Oid = 1663;
+
+    fn class_row() -> ClassRow {
+        ClassRow {
+            oid: 16384,
+            relnamespace: 2200,
+            relname: "t".into(),
+            relkind: 'r',
+            relpersistence: 'p',
+            relreplident: 'd',
+            reltoastrelid: 16387,
+            reltablespace: 0,
+            relfilenode: 16384,
+        }
+    }
+
+    fn attr_row(attnum: i16, name: &str, type_oid: Oid) -> AttributeRow {
+        AttributeRow {
+            attrelid: 16384,
+            attnum,
+            attname: name.into(),
+            atttypid: type_oid,
+            atttypmod: -1,
+            attnotnull: false,
+            attisdropped: type_oid == 0,
+            attbyval: type_oid == 23,
+            attlen: if type_oid == 23 { 4 } else { -1 },
+            attalign: 'i',
+            attstorage: if type_oid == 23 { 'p' } else { 'x' },
+            attmissingval: None,
+        }
+    }
+
+    fn names(pairs: &[(Oid, &str)]) -> HashMap<Oid, String> {
+        pairs.iter().map(|(o, n)| (*o, (*n).to_owned())).collect()
+    }
+
+    fn overlay(
+        class: &ClassRow,
+        attrs: &[AttributeRow],
+        indexes: &[IndexRow],
+        namespaces: &HashMap<Oid, String>,
+    ) -> Result<RelDescriptor> {
+        descriptor_from_rows(
+            class,
+            attrs,
+            indexes,
+            namespaces,
+            &names(&[(23, "int4"), (25, "text")]),
+            5,
+            DEFAULT_TABLESPACE,
+        )
+    }
+
+    #[test]
+    fn overlay_descriptor_resolves_sentinels_and_keys() {
+        let attrs = [
+            attr_row(2, "a", 25),
+            attr_row(1, "id", 23),
+            AttributeRow {
+                attmissingval: Some("{7}".into()),
+                ..attr_row(3, "c", 23)
+            },
+        ];
+        let indexes = [IndexRow {
+            indexrelid: 16390,
+            indrelid: 16384,
+            indisprimary: true,
+            indisreplident: false,
+            indkey: vec![1],
+        }];
+        let desc = overlay(&class_row(), &attrs, &indexes, &names(&[(2200, "public")])).unwrap();
+
+        assert_eq!(desc.rfn.spc_node, DEFAULT_TABLESPACE);
+        assert_eq!(desc.rfn.db_node, 5);
+        assert_eq!(desc.rfn.rel_node, 16384);
+        assert_eq!(desc.rel_name, RelName::new("public", "t"));
+        assert_eq!(
+            desc.replident,
+            ReplIdent::Default {
+                pk_attnums: Some(vec![1]),
+            }
+        );
+        // Scan order is not the descriptor's order
+        let cols: Vec<&str> = desc.attributes.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(cols, ["id", "a", "c"]);
+        assert_eq!(desc.attributes[1].type_name, "text");
+        assert_eq!(desc.attributes[2].missing_text.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn overlay_descriptor_keeps_dropped_slot_layout() {
+        let attrs = [attr_row(1, "id", 23), attr_row(2, "gone", 0)];
+        let desc = overlay(&class_row(), &attrs, &[], &names(&[(2200, "public")])).unwrap();
+        let slot = &desc.attributes[1];
+        assert!(slot.dropped);
+        assert_eq!(slot.type_name, "", "no pg_type row for a zeroed atttypid");
+        assert_eq!(slot.type_len, -1);
+        assert_eq!(slot.type_storage, 'x');
+    }
+
+    #[test]
+    fn overlay_descriptor_picks_replident_index() {
+        let class = ClassRow {
+            relreplident: 'i',
+            ..class_row()
+        };
+        let indexes = [
+            IndexRow {
+                indexrelid: 16390,
+                indrelid: 16384,
+                indisprimary: true,
+                indisreplident: false,
+                indkey: vec![1],
+            },
+            IndexRow {
+                indexrelid: 16392,
+                indrelid: 16384,
+                indisprimary: false,
+                indisreplident: true,
+                indkey: vec![2, 3],
+            },
+        ];
+        let desc = overlay(
+            &class,
+            &[attr_row(1, "id", 23)],
+            &indexes,
+            &names(&[(2200, "public")]),
+        )
+        .unwrap();
+        assert_eq!(
+            desc.replident,
+            ReplIdent::UsingIndex {
+                index_oid: 16392,
+                key_attnums: vec![2, 3],
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_descriptor_rejects_superseded_attribute() {
+        let attrs = [attr_row(1, "id", 23), attr_row(1, "id", 25)];
+        let err = overlay(&class_row(), &attrs, &[], &names(&[(2200, "public")])).unwrap_err();
+        assert!(
+            matches!(&err, CatalogError::Parse(m) if m.contains("attnum 1")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn overlay_descriptor_needs_its_namespace_name() {
+        let err = overlay(&class_row(), &[], &[], &HashMap::new()).unwrap_err();
+        assert!(
+            matches!(&err, CatalogError::Parse(m) if m.contains("pg_namespace")),
+            "{err}"
+        );
     }
 
     #[test]

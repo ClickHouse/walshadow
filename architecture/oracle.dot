@@ -1,20 +1,19 @@
-// walshadow — PgPending decode oracle
-// PgPending resolver path fronted by libpq into shadow PG. Extension
-// surface (pgext/) shown as a side branch with absence-fallback
-// semantics.
+// walshadow, PgPending decode oracle
+// PgPending resolver path over a unix socket into shadow PG's preloaded
+// worker. Per-item and transport fallback stay visible.
 //
 // regeneration spec:
 // sources of truth: plans/oracle.md · pgext/ · src/ oracle-path module (grep src/ for oracle|pending)
-// subsumes: plans/oracle.md § resolver flow + extension surface + absence semantics
+// subsumes: plans/oracle.md § resolver flow + worker surface + failure semantics
 // quality bar:
-//   - two-way branch on extension availability legible (not a tangle)
-//   - libpq round-trip reads as one canonical orange edge in/out of shadow
+//   - required bridge path stays legible
+//   - batched socket round-trip reads as one canonical orange edge
 //   - fallback path visually distinct from main path
 // shared style: palette.md
 digraph oracle {
   rankdir=TB;
   compound=true;
-  graph [fontname="Helvetica", labelloc="t", label="walshadow oracle — PgPending decode bridge", fontsize=14, splines=spline, nodesep=0.35, ranksep=0.9, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="walshadow oracle, PgPending decode bridge", fontsize=14, splines=spline, nodesep=0.35, ranksep=0.9, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
 
@@ -29,26 +28,26 @@ digraph oracle {
 
   // ════════ ② oracle decode path ════════
   subgraph cluster_oracle {
-    label="② oracle path — post-plan, decode workers call directly; metrics-only runs skip it"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    resolve  [label="resolve_pending_tuple\nwalk columns,\nPgPending | Unsupported\n→ resolve_pending\nswap to Text on Ok(Some)\nbest effort: shadow may lag\nrow's catalog interval", fillcolor="#5D3F40"];
-    stats    [label="OracleStats\nresolved / fallback_raw /\nerrors", fillcolor="#5D3F40", shape=note];
+    label="② oracle path, post-plan; metrics-only runs skip it"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    resolve  [label="resolve_pending_tuple\ncollect PgPending | Unsupported\none DECODE batch per tuple\nswap each text answer to Text\nbest effort: shadow may lag\nrow's catalog interval", fillcolor="#5D3F40"];
+    stats    [label="OracleStats\nresolved / fallback_raw / errors\n\nBridgeStats\nup / requests / errors /\nlatency / reconnects / items", fillcolor="#5D3F40", shape=note];
   }
 
-  // ════════ ③ libpq client (own pool, not catalog's) ════════
-  client [label="Oracle::client\ntokio_postgres::Client\nSELECT walshadow_decode_disk(\n  $1::oid, $2::bytea)\nreconnect-once on is_closed", fillcolor="#4D4D28"];
+  // ════════ ③ bridge client ════════
+  client [label="Bridge\ntokio::net::UnixStream\nHELLO version gate\nframed DECODE request\nreconnect + retry on\ntransport failure", fillcolor="#4D4D28"];
 
-  // ════════ ④ shadow PG + extension ════════
+  // ════════ ④ shadow PG + preloaded worker ════════
   subgraph cluster_shadow {
     label="④ shadow PG"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    ext  [label="walshadow extension\n(pgext/walshadow.c)\nSearchSysCache1(TYPEOID)\nDatum reconstruct ×4 branches:\n  typlen=−1 varlena\n  typlen=−2 cstring\n  typbyval fixed (memcpy)\n  fixed by-ref (palloc)\nOidOutputFunctionCall(typoutput)", fillcolor="#3D4128"];
-    probe [label="probe_extension\nSELECT EXISTS\n(pg_proc.proname =\n 'walshadow_decode_disk')\nat connect + reconnect", fillcolor="#3D4128", shape=note];
-    lc    [label="pinned locale\nlc_numeric / lc_time = C\n(shadow bootstrap)", fillcolor="#3D4128", shape=note];
+    worker [label="walshadow background worker\n(pgext/worker.c)\nunix socket, mode 0600\none transaction per request\none subtransaction per item\nerror frame or connection close", fillcolor="#3D4128"];
+    decode [label="ws_decode_datum_text\n(pgext/decode.c)\nSearchSysCache1(TYPEOID)\nDatum reconstruct ×4 branches:\n  typlen=−1 varlena\n  typlen=−2 cstring\n  typbyval fixed (memcpy)\n  fixed by-ref (palloc)\nOidOutputFunctionCall(typoutput)", fillcolor="#3D4128"];
+    env    [label="pinned output environment\nTimeZone = UTC\nDateStyle = ISO, MDY\nIntervalStyle = postgres\nextra_float_digits = 1\nbytea_output = hex", fillcolor="#3D4128", shape=note];
   }
 
   // ════════ ⑤ pgext build artifact ════════
   subgraph cluster_pgext {
     label="⑤ pgext/ (PGXS build)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    artifact [label="walshadow.so\nwalshadow.control\nwalshadow--0.1.sql\nCREATE FUNCTION\n  STRICT IMMUTABLE", fillcolor="#4D3850", shape=note];
+    artifact [label="walshadow.so\ndecode.o + overlay.o + worker.o\nno control file\nno SQL script\nno pg_proc row", fillcolor="#4D3850", shape=note];
   }
 
   // ════════ ⑥ emit sinks (downstream branch off oracle) ════════
@@ -60,29 +59,30 @@ digraph oracle {
   }
 
   // ─── main flow edges (LR spine, high weight) ───
-  pend    -> resolve  [color="#A1A9CC", penwidth=2, label="always", weight=10];
-  unsup   -> resolve  [color="#A1A9CC", style=dashed, label="always", weight=5];
-  resolve -> client   [color="#CBA85E", penwidth=2, label="resolve_pending\nper pending col", weight=10];
-  client  -> ext      [color="#CBA85E", penwidth=2, dir=both, arrowtail=open, lhead=cluster_shadow, label="libpq SELECT\ntokio_postgres pool\n(separate from\n ShadowCatalog)", weight=10];
+  pend    -> resolve  [color="#A1A9CC", penwidth=2, label="required bridge", weight=10];
+  unsup   -> resolve  [color="#A1A9CC", style=dashed, label="required bridge", weight=5];
+  resolve -> client   [color="#CBA85E", penwidth=2, label="one DECODE batch\nper tuple", weight=10];
+  client  -> worker   [color="#CBA85E", penwidth=2, dir=both, arrowtail=open, lhead=cluster_shadow, label="framed unix\nsocket request", weight=10];
 
   // ─── local tiers never reach the oracle ───
   tier12 -> emit_text [color="#BF8C5F", style=dotted, constraint=false, label="local render"];
   tier3  -> emit_text [color="#BF8C5F", style=dotted, constraint=false, label="local render"];
 
-  // ─── shadow internal: extension uses pinned locale via typoutput ───
-  ext -> lc    [style=dashed, color="#6E6963", constraint=false];
-  client -> probe [style=dashed, color="#CBA85E", constraint=false, label="connect /\nreconnect:\nprobe pg_proc"];
+  // ─── shadow internal: worker calls decode under pinned output GUCs ───
+  worker -> decode [color="#6E6963", label="each item"];
+  decode -> env    [style=dashed, color="#6E6963", constraint=false];
 
-  // ─── pgext install edge ───
-  artifact -> ext [style=dashed, color="#6E6963", lhead=cluster_shadow, ltail=cluster_pgext, label="install:\n$libdir +\nextension dir;\nCREATE EXTENSION\nwalshadow"];
+  // ─── pgext preload edge ───
+  artifact -> worker [style=dashed, color="#6E6963", lhead=cluster_shadow, ltail=cluster_pgext, label="$libdir or build tree\nshared_preload_libraries\n+ walshadow.* GUCs"];
 
   // ─── stats fan-in (off-axis, constraint=false) ───
   resolve  -> stats [style=dashed, color="#CBA85E", constraint=false, label="resolved++ /\nfallback_raw++ /\nerrors++"];
+  client   -> stats [style=dashed, color="#CBA85E", constraint=false, label="request /\ntransport counters"];
 
   // ─── emit disposition (off-axis fan-out from oracle) ───
-  resolve  -> emit_text [color="#BF8C5F", penwidth=2, constraint=false, label="Ok(Some)\npending\n→ Text"];
-  resolve  -> emit_raw  [color="#BF8C5F", style=dashed, constraint=false, label="Ok(None)\next absent /\nNULL / error\n(PgPending)"];
-  resolve  -> emit_fail [color="#BF8C5F", style=dotted, constraint=false, label="Ok(None)\n(Unsupported)"];
+  resolve  -> emit_text [color="#BF8C5F", penwidth=2, constraint=false, label="text item\n→ Text"];
+  resolve  -> emit_raw  [color="#BF8C5F", style=dashed, constraint=false, label="item or transport error\n(PgPending)"];
+  resolve  -> emit_fail [color="#BF8C5F", style=dotted, constraint=false, label="item or transport error\n(Unsupported)"];
 
   // ─── Legend ───
   legend [shape=plaintext, label=<
@@ -90,20 +90,20 @@ digraph oracle {
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill</B></TD></TR>
       <TR><TD BGCOLOR="#4D4128" WIDTH="20"></TD><TD>decoder ColumnValue</TD></TR>
       <TR><TD BGCOLOR="#5D3F40"></TD><TD>oracle (src/ops/oracle.rs)</TD></TR>
-      <TR><TD BGCOLOR="#4D4D28"></TD><TD>libpq client (own pool)</TD></TR>
-      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow PG / extension</TD></TR>
+      <TR><TD BGCOLOR="#4D4D28"></TD><TD>bridge client</TD></TR>
+      <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow PG worker</TD></TR>
       <TR><TD BGCOLOR="#4D3850"></TD><TD>pgext/ build artifact</TD></TR>
       <TR><TD BGCOLOR="#5D4628"></TD><TD>emit sink</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
-      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>pending → resolver (always)</TD></TR>
-      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>libpq SELECT (MAIN wire)</TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>pending → resolver</TD></TR>
+      <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>unix socket (MAIN wire)</TD></TR>
       <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>emit-time disposition</TD></TR>
-      <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>pgext install (filesystem)</TD></TR>
+      <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>pgext preload (filesystem)</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>policy</B></TD></TR>
       <TR><TD COLSPAN="2" ALIGN="LEFT">Best effort: resolution runs post-plan;<BR ALIGN="LEFT"/>shadow's catalog may lag the row's<BR ALIGN="LEFT"/>interval in DDL edge cases — accepted<BR ALIGN="LEFT"/>to mostly support unknown types.</TD></TR>
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>extension-absence</B></TD></TR>
-      <TR><TD COLSPAN="2" ALIGN="LEFT">probe_extension at connect →<BR ALIGN="LEFT"/>has_extension=false →<BR ALIGN="LEFT"/>resolve_pending Ok(None) →<BR ALIGN="LEFT"/>stats.fallback_raw++ →<BR ALIGN="LEFT"/>emitter writes raw bytes.<BR ALIGN="LEFT"/>No failure. CREATE EXTENSION<BR ALIGN="LEFT"/>+ reconnect re-enables.</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>bridge absence</B></TD></TR>
+      <TR><TD COLSPAN="2" ALIGN="LEFT">Unset socket or boot connect failure<BR ALIGN="LEFT"/>means no Oracle. PgPending reaches<BR ALIGN="LEFT"/>emitter unchanged and writes raw<BR ALIGN="LEFT"/>bytes. Unsupported remains fatal.<BR ALIGN="LEFT"/>Runtime transport failure retries<BR ALIGN="LEFT"/>once, then uses same disposition.</TD></TR>
     </TABLE>
   >];
-  ext -> legend [style=invis];
+  worker -> legend [style=invis];
 }

@@ -66,16 +66,19 @@ Binaries land under `target/release/`:
 - `walshadow-filter`, segment-level filter for offline WAL files
 - `walshadow-classify`, record-level classifier for diagnostics
 
-The PG extension under `pgext/` is built separately via PGXS, only
-needed for the decode oracle:
+The PG module under `pgext/` is built separately via PGXS. It backs the
+decode oracle and the catalog overlay reads:
 
 ```
 make -C pgext install
 ```
 
-Loaded on shadow PG with `CREATE EXTENSION walshadow`. Absent extension
-surfaces as `oracle fallback=N` on the status line; the daemon ships
-raw on-disk bytes for `PgPending` types without it
+Not an SQL extension: shadow's catalog is a read-only physical copy of
+source's, so there is nowhere to run `CREATE EXTENSION`. Module must be
+installed in shadow PG and loaded through `shared_preload_libraries`. Daemon
+writes preload and `walshadow.*` settings for shadows it owns, then requires
+worker socket. `--bridge-socket` defaults to
+`<shadow-socket-dir>/walshadow-bridge.sock`
 
 ## Running standalone
 
@@ -143,7 +146,7 @@ surface them
 src/                walshadow daemon + library
 src/bin/            CLI entry points (stream, filter, classify)
 clickhouse-c-rs/    CH-Native client, separate submodule
-pgext/              walshadow decode-bridge extension (PGXS)
+pgext/              walshadow decode-bridge PG module (PGXS)
 architecture/       overview + internals diagrams
 plans/              component design docs (overview.md is the baseline)
 docker/             docker-compose demo + Dockerfile

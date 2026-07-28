@@ -2,11 +2,11 @@
 //!
 //! - **Local**: `numeric`, `inet` / `cidr`, `interval`. Stable layout,
 //!   mechanical decoders, per-row hot-path latency would dominate over libpq.
-//! - **Deferred to the shadow extension** (`walshadow`): `jsonb`, arrays,
-//!   `tsvector`, every other Tier 3 type. Surfaced as
+//! - **Deferred to the shadow bridge worker**: `jsonb`, arrays, `tsvector`,
+//!   every other Tier 3 type. Surfaced as
 //!   [`crate::decode::heap_decoder::ColumnValue::PgPending`] carrying raw on-disk
-//!   bytes; resolved at emit time via `walshadow_decode_disk(oid, bytea) ->
-//!   text` against shadow PG. One source of truth, no codec drift.
+//!   bytes; resolved at emit time by shadow PG's own `typoutput`, reached over
+//!   the bridge socket. One source of truth, no codec drift.
 //!
 //! Each decoder takes the varlena *body* (or raw fixed-width bytes for
 //! `interval`) and produces a tagged value whose `text` matches PG

@@ -146,6 +146,20 @@ pub struct MetricsSnapshot {
     pub oracle_resolved_total: u64,
     pub oracle_fallback_raw_total: u64,
     pub oracle_errors_total: u64,
+    /// 1 while the pgext bridge worker's last transport attempt succeeded,
+    /// 0 after failure.
+    pub bridge_up: u64,
+    /// Per-op, rendered `op=` labelled; order matches
+    /// [`OP_LABELS`](crate::ops::bridge::OP_LABELS).
+    pub bridge_requests_by_op: [u64; 4],
+    pub bridge_errors_by_op: [u64; 4],
+    pub bridge_request_nanos_by_op: [u64; 4],
+    pub bridge_reconnects_total: u64,
+    pub bridge_scan_rows_total: u64,
+    pub bridge_scan_subtrans_mismatch_total: u64,
+    pub bridge_scan_replay_moved_total: u64,
+    pub bridge_decode_items_total: u64,
+    pub bridge_decode_item_errors_total: u64,
     pub uptime_secs: u64,
     /// `source_received_lsn - min_apply_lsn` across active shadow walreceivers.
     /// Caller saturates to 0 when shadow is ahead; passes `source_received_lsn`
@@ -647,6 +661,48 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             snap.oracle_errors_total,
         ),
         (
+            "walshadow_bridge_up",
+            "1 while the pgext bridge worker answered the last request over its socket.",
+            "gauge",
+            snap.bridge_up,
+        ),
+        (
+            "walshadow_bridge_reconnects_total",
+            "Bridge sockets redialled after a worker exit or transport error.",
+            "counter",
+            snap.bridge_reconnects_total,
+        ),
+        (
+            "walshadow_bridge_scan_rows_total",
+            "Catalog rows the bridge's overlay scans returned.",
+            "counter",
+            snap.bridge_scan_rows_total,
+        ),
+        (
+            "walshadow_bridge_scan_subtrans_mismatch_total",
+            "Overlay tuples whose writer did not resolve to the requested top xid; trusted as ours only on rel-scoped catalogs.",
+            "counter",
+            snap.bridge_scan_subtrans_mismatch_total,
+        ),
+        (
+            "walshadow_bridge_scan_replay_moved_total",
+            "Bridge scans that found shadow replay off the position their read pinned; committed reads answer these off SQL instead.",
+            "counter",
+            snap.bridge_scan_replay_moved_total,
+        ),
+        (
+            "walshadow_bridge_decode_items_total",
+            "Columns sent to the bridge for typoutput rendering.",
+            "counter",
+            snap.bridge_decode_items_total,
+        ),
+        (
+            "walshadow_bridge_decode_item_errors_total",
+            "Bridge decode items that raised, leaving that column on the raw-bytes path.",
+            "counter",
+            snap.bridge_decode_item_errors_total,
+        ),
+        (
             "walshadow_uptime_seconds",
             "Seconds since the daemon began its status loop.",
             "counter",
@@ -953,6 +1009,34 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             .zip(snap.config_backfills_pending_by_mode)
         {
             writeln!(s, "{name}{{mode=\"{mode}\"}} {v}").unwrap();
+        }
+    }
+
+    // Bridge families, `op=` labelled
+    {
+        use crate::ops::bridge::OP_LABELS;
+        let name = "walshadow_bridge_requests_total";
+        writeln!(s, "# HELP {name} Requests sent to the pgext bridge worker.").unwrap();
+        writeln!(s, "# TYPE {name} counter").unwrap();
+        for (op, v) in OP_LABELS.iter().zip(snap.bridge_requests_by_op) {
+            writeln!(s, "{name}{{op=\"{op}\"}} {v}").unwrap();
+        }
+        let name = "walshadow_bridge_errors_total";
+        writeln!(
+            s,
+            "# HELP {name} Bridge requests that failed, transport or worker-side."
+        )
+        .unwrap();
+        writeln!(s, "# TYPE {name} counter").unwrap();
+        for (op, v) in OP_LABELS.iter().zip(snap.bridge_errors_by_op) {
+            writeln!(s, "{name}{{op=\"{op}\"}} {v}").unwrap();
+        }
+        let name = "walshadow_bridge_request_seconds_total";
+        writeln!(s, "# HELP {name} Wall time spent in bridge round trips.").unwrap();
+        writeln!(s, "# TYPE {name} counter").unwrap();
+        for (op, v) in OP_LABELS.iter().zip(snap.bridge_request_nanos_by_op) {
+            let secs = v as f64 / 1e9;
+            writeln!(s, "{name}{{op=\"{op}\"}} {secs}").unwrap();
         }
     }
 
