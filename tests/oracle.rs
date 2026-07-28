@@ -1,36 +1,39 @@
 //! Differential decode oracle.
 //!
-//! Three drills:
+//! Four drills, each against a PG started with the bridge worker preloaded
+//! (`dynamic_library_path` points at the `pgext` build tree, so no
+//! `make install` is needed). Skipped silently when `initdb` isn't on PATH or
+//! `pgext` hasn't been built:
 //!
-//! 1. `oracle_without_extension_falls_back_to_raw_bytes` — spawn a
-//!    plain PG without loading the `walshadow` extension,
-//!    confirm `Oracle::resolve_pending` returns `Ok(None)` and the
-//!    `fallback_raw` stat increments. Skipped silently when `initdb`
-//!    isn't on PATH.
-//! 2. `oracle_with_extension_resolves_tier3_disk_bytes` — same setup
-//!    plus `CREATE EXTENSION walshadow`. For each of
-//!    `numeric` / `inet` / `interval` / `jsonb` / `int4[]`, synthesize
-//!    on-disk bytes, call `walshadow_decode_disk(oid, bytea)`, assert
-//!    the returned text matches PG's `typoutput`. Skipped silently
-//!    when the extension isn't installed (the harness probes
-//!    `walshadow_decode_disk` in `pg_proc` and returns a skip).
+//! 1. `oracle_resolves_tier3_disk_bytes` — for each of `numeric` / `inet` /
+//!    `interval` / `int4[]`, synthesize on-disk bytes and assert the resolved
+//!    text matches PG's `typoutput`.
+//! 2. `oracle_falls_back_on_undecodable_bytes` — a body `typoutput` rejects
+//!    leaves the column unresolved and counts `fallback_raw`, with the oracle
+//!    still serving afterwards.
 //! 3. `oracle_resolves_pg_pending_to_text` — runs the decode pool's
-//!    `resolve_pending_tuple` over a `PgPending` column, asserts the
-//!    resolved tuple carries a `Text` value matching PG's representation.
+//!    `resolve_pending_tuple` over a `PgPending` column, asserts the resolved
+//!    tuple carries a `Text` value matching PG's representation.
+//! 4. `oracle_recovers_after_cluster_restart` — resolution fails while the
+//!    cluster is down (counted `errors`), recovers once it is back.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::codecs;
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::oracle::{Oracle, resolve_pending_tuple};
-use walshadow::pg::socket_conninfo;
-use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::schema::{INETOID, INTERVALOID, NUMERICOID};
+use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 
 const SHADOW_PORT: u16 = 56301;
+/// int4 array, ie `INT4ARRAYOID`
+const INT4ARRAYOID: u32 = 1007;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -42,24 +45,55 @@ fn pg_available() -> bool {
         .unwrap_or(false)
 }
 
-fn make_pg(tmp: &tempfile::TempDir, port: u16) -> Shadow {
+/// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`
+fn pgext_dir() -> Option<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
+    dir.join("walshadow.so").is_file().then_some(dir)
+}
+
+struct StopOnDrop {
+    sh: Shadow,
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = self.sh.stop();
+    }
+}
+
+/// `None` skips the caller: no PG, or pgext unbuilt
+fn start_pg(tmp: &tempfile::TempDir, port: u16) -> Option<StopOnDrop> {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return None;
+    }
+    let Some(lib_dir) = pgext_dir() else {
+        eprintln!("skip: pgext not built (run `make -C pgext`)");
+        return None;
+    };
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
     cfg.port = port;
     cfg.socket_dir = tmp.path().join("sock");
     cfg.ctl_timeout = Duration::from_secs(60);
+    let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
+    bridge.library_dir = Some(lib_dir);
+    cfg.bridge = Some(bridge);
     fs::create_dir_all(&cfg.filter_out_dir).unwrap();
     fs::create_dir_all(&cfg.socket_dir).unwrap();
-    Shadow::new(cfg)
+
+    let sh = Shadow::new(cfg);
+    sh.initdb().expect("initdb");
+    sh.write_base_conf().expect("write_base_conf");
+    sh.start().expect("start");
+    Some(StopOnDrop { sh })
 }
 
-struct StopOnDrop<'a> {
-    sh: &'a Shadow,
-}
-
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        let _ = self.sh.stop();
-    }
+async fn oracle_on(sh: &Shadow) -> Oracle {
+    let path = sh.bridge_socket().expect("bridge configured");
+    let bridge = walshadow::bridge::connect_with_budget(path, Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", path.display()));
+    Oracle::new(Arc::new(bridge))
 }
 
 /// Build short-form numeric for `42`: header 0x8000 (NUMERIC_SHORT,
@@ -107,142 +141,70 @@ fn array_int4_1_2_3_bytes() -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_without_extension_falls_back_to_raw_bytes() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
+async fn oracle_resolves_tier3_disk_bytes() {
     let tmp = tempfile::tempdir().unwrap();
-    let sh = make_pg(&tmp, SHADOW_PORT);
-    sh.initdb().expect("initdb");
-    sh.write_base_conf().expect("write_base_conf");
-    sh.start().expect("start");
-    let _stop = StopOnDrop { sh: &sh };
-
-    let conninfo = socket_conninfo(
-        sh.config().socket_dir.to_str().unwrap(),
-        sh.config().port,
-        "postgres",
-        "postgres",
-    );
-    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
-    // Stand-alone PG without our extension. resolve_pending must
-    // surface None so the emitter falls back to raw bytes.
-    let out = oracle
-        .resolve_pending(3802, b"\x01opaque")
-        .await
-        .expect("resolve_pending");
-    assert!(out.is_none(), "expected fallback, got {out:?}");
-    use std::sync::atomic::Ordering;
-    assert_eq!(oracle.stats.fallback_raw.load(Ordering::Relaxed), 1);
-    assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 0);
-    assert!(!oracle.has_extension());
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn oracle_with_extension_resolves_tier3_disk_bytes() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    let Some(guard) = start_pg(&tmp, SHADOW_PORT) else {
         return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let sh = make_pg(&tmp, SHADOW_PORT + 1);
-    sh.initdb().expect("initdb");
-    sh.write_base_conf().expect("write_base_conf");
-    sh.start().expect("start");
-    let _stop = StopOnDrop { sh: &sh };
+    };
+    let oracle = oracle_on(&guard.sh).await;
 
-    // Optional extension load; skip cleanly if not installed system-wide.
-    match sh.try_load_oracle_extension() {
-        Ok(true) => {}
-        Ok(false) => {
-            eprintln!(
-                "skip: walshadow extension not installed on this PG \
-                 (run `cd pgext && sudo make install`)"
-            );
-            return;
-        }
-        Err(e) => panic!("loading extension: {e}"),
+    let cases: [(u32, Vec<u8>, &str); 4] = [
+        (NUMERICOID, numeric_42_bytes(), "42"),
+        (INETOID, inet_192_168_0_1_bytes(), "192.168.0.1"),
+        (
+            INTERVALOID,
+            interval_1mon_2day_3us_bytes(),
+            // PG renders as "1 mon 2 days 00:00:00.000003"
+            "1 mon 2 days 00:00:00.000003",
+        ),
+        (INT4ARRAYOID, array_int4_1_2_3_bytes(), "{1,2,3}"),
+    ];
+    for (oid, raw, want) in &cases {
+        let got = oracle.resolve_pending(*oid, raw).await;
+        assert_eq!(got.as_deref(), Some(*want), "oid {oid}");
     }
 
-    let conninfo = socket_conninfo(
-        sh.config().socket_dir.to_str().unwrap(),
-        sh.config().port,
-        "postgres",
-        "postgres",
-    );
-    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
-    assert!(oracle.has_extension());
-
-    // numeric — 42
-    let txt = oracle
-        .resolve_pending(walshadow::schema::NUMERICOID, &numeric_42_bytes())
-        .await
-        .expect("resolve numeric")
-        .expect("resolved Some");
-    assert_eq!(txt, "42");
-
-    // inet — 192.168.0.1
-    let txt = oracle
-        .resolve_pending(walshadow::schema::INETOID, &inet_192_168_0_1_bytes())
-        .await
-        .expect("resolve inet")
-        .expect("resolved Some");
-    assert_eq!(txt, "192.168.0.1");
-
-    // interval — 1 month 2 days 3 microseconds
-    let txt = oracle
-        .resolve_pending(
-            walshadow::schema::INTERVALOID,
-            &interval_1mon_2day_3us_bytes(),
-        )
-        .await
-        .expect("resolve interval")
-        .expect("resolved Some");
-    // PG renders as "1 mon 2 days 00:00:00.000003"
-    assert_eq!(txt, "1 mon 2 days 00:00:00.000003");
-
-    // int4[] — [1, 2, 3]. typoid 1007 = INT4ARRAYOID.
-    let txt = oracle
-        .resolve_pending(1007, &array_int4_1_2_3_bytes())
-        .await
-        .expect("resolve int4[]")
-        .expect("resolved Some");
-    assert_eq!(txt, "{1,2,3}");
-
-    use std::sync::atomic::Ordering;
     assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 4);
     assert_eq!(oracle.stats.fallback_raw.load(Ordering::Relaxed), 0);
     assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_resolves_pg_pending_to_text() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
+async fn oracle_falls_back_on_undecodable_bytes() {
     let tmp = tempfile::tempdir().unwrap();
-    let sh = make_pg(&tmp, SHADOW_PORT + 2);
-    sh.initdb().expect("initdb");
-    sh.write_base_conf().expect("write_base_conf");
-    sh.start().expect("start");
-    let _stop = StopOnDrop { sh: &sh };
-    if !matches!(sh.try_load_oracle_extension(), Ok(true)) {
-        eprintln!("skip: walshadow extension not installed on this PG");
+    let Some(guard) = start_pg(&tmp, SHADOW_PORT + 1) else {
         return;
-    }
+    };
+    let oracle = oracle_on(&guard.sh).await;
 
-    let conninfo = socket_conninfo(
-        sh.config().socket_dir.to_str().unwrap(),
-        sh.config().port,
-        "postgres",
-        "postgres",
+    // int4 body shorter than typlen: the worker raises per item rather than
+    // failing the request
+    assert!(oracle.resolve_pending(23, b"\x00").await.is_none());
+    // Type oid with no pg_type row
+    assert!(oracle.resolve_pending(2147483647, b"\x00").await.is_none());
+    assert_eq!(oracle.stats.fallback_raw.load(Ordering::Relaxed), 2);
+    assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
+
+    // Item errors are per item, so the oracle still serves
+    assert_eq!(
+        oracle
+            .resolve_pending(NUMERICOID, &numeric_42_bytes())
+            .await
+            .as_deref(),
+        Some("42"),
     );
-    let oracle = Arc::new(Oracle::connect(&conninfo).await.expect("oracle connect"));
+}
 
-    // Wire one PgPending column (numeric 42) through the decode pool's
-    // resolution path.
+#[tokio::test(flavor = "current_thread")]
+async fn oracle_resolves_pg_pending_to_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, SHADOW_PORT + 2) else {
+        return;
+    };
+    let oracle = oracle_on(&guard.sh).await;
+
+    // Wire two PgPending columns through the decode pool's resolution path;
+    // one request must cover the whole tuple.
     let mut committed = CommittedTuple {
         decoded: DecodedHeap {
             rfn: RelFileNode {
@@ -254,10 +216,17 @@ async fn oracle_resolves_pg_pending_to_text() {
             source_lsn: 0xDEADBEEF,
             op: HeapOp::Insert,
             new: Some(DecodedTuple {
-                columns: vec![Some(ColumnValue::PgPending {
-                    type_oid: walshadow::schema::NUMERICOID,
-                    raw: numeric_42_bytes(),
-                })],
+                columns: vec![
+                    Some(ColumnValue::PgPending {
+                        type_oid: NUMERICOID,
+                        raw: numeric_42_bytes(),
+                    }),
+                    Some(ColumnValue::Int4(7)),
+                    Some(ColumnValue::Unsupported {
+                        type_oid: INT4ARRAYOID,
+                        raw: array_int4_1_2_3_bytes(),
+                    }),
+                ],
                 partial: false,
             }),
             old: None,
@@ -270,102 +239,59 @@ async fn oracle_resolves_pg_pending_to_text() {
     }
 
     let new = committed.decoded.new.as_ref().unwrap();
-    match &new.columns[0] {
-        Some(ColumnValue::Text(s)) => assert_eq!(s, "42"),
-        other => panic!("expected Text(\"42\"), got {other:?}"),
-    }
-    use std::sync::atomic::Ordering;
-    assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 1);
+    assert!(
+        matches!(&new.columns[0], Some(ColumnValue::Text(s)) if s == "42"),
+        "got {:?}",
+        new.columns[0],
+    );
+    assert!(matches!(&new.columns[1], Some(ColumnValue::Int4(7))));
+    assert!(
+        matches!(&new.columns[2], Some(ColumnValue::Text(s)) if s == "{1,2,3}"),
+        "got {:?}",
+        new.columns[2],
+    );
+    assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oracle_resolve_reconnects_after_backend_restart() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
+async fn oracle_recovers_after_cluster_restart() {
     let tmp = tempfile::tempdir().unwrap();
-    let sh = make_pg(&tmp, SHADOW_PORT + 4);
-    sh.initdb().expect("initdb");
-    sh.write_base_conf().expect("write_base_conf");
-    sh.start().expect("start");
-    let _stop = StopOnDrop { sh: &sh };
-    if !matches!(sh.try_load_oracle_extension(), Ok(true)) {
-        eprintln!("skip: walshadow extension not installed on this PG");
+    let Some(guard) = start_pg(&tmp, SHADOW_PORT + 3) else {
         return;
-    }
-    let conninfo = socket_conninfo(
-        sh.config().socket_dir.to_str().unwrap(),
-        sh.config().port,
-        "postgres",
-        "postgres",
-    );
-    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
-    use walshadow::schema::NUMERICOID;
+    };
+    let oracle = oracle_on(&guard.sh).await;
     assert_eq!(
         oracle
             .resolve_pending(NUMERICOID, &numeric_42_bytes())
             .await
-            .unwrap()
             .as_deref(),
         Some("42"),
     );
 
-    sh.stop().expect("stop");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    sh.start().expect("restart");
-
-    assert_eq!(
-        oracle
-            .resolve_pending(NUMERICOID, &numeric_42_bytes())
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("42"),
-        "resolve recovers after reconnect",
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oracle_resolve_errors_when_backend_down() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let sh = make_pg(&tmp, SHADOW_PORT + 5);
-    sh.initdb().expect("initdb");
-    sh.write_base_conf().expect("write_base_conf");
-    sh.start().expect("start");
-    let _stop = StopOnDrop { sh: &sh };
-    if !matches!(sh.try_load_oracle_extension(), Ok(true)) {
-        eprintln!("skip: walshadow extension not installed on this PG");
-        return;
-    }
-    let conninfo = socket_conninfo(
-        sh.config().socket_dir.to_str().unwrap(),
-        sh.config().port,
-        "postgres",
-        "postgres",
-    );
-    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
-    use std::sync::atomic::Ordering;
-    use walshadow::schema::NUMERICOID;
+    guard.sh.stop().expect("stop");
     assert!(
         oracle
             .resolve_pending(NUMERICOID, &numeric_42_bytes())
             .await
-            .unwrap()
-            .is_some(),
+            .is_none(),
+        "no resolution while the cluster is down",
     );
-
-    sh.stop().expect("stop");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let got = oracle
-        .resolve_pending(NUMERICOID, &numeric_42_bytes())
-        .await
-        .unwrap();
-    assert!(got.is_none(), "no resolution when backend down");
     assert!(oracle.stats.errors.load(Ordering::Relaxed) >= 1);
+
+    guard.sh.start().expect("restart");
+    // Postmaster is up before the worker has re-bound its socket
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let got = oracle
+            .resolve_pending(NUMERICOID, &numeric_42_bytes())
+            .await;
+        if got.as_deref() == Some("42") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "oracle never recovered after restart",
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }

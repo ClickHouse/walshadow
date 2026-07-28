@@ -53,6 +53,63 @@ pub enum ShadowError {
 
 pub type Result<T> = std::result::Result<T, ShadowError>;
 
+/// pgext bridge worker settings, written into shadow's `postgresql.conf`.
+///
+/// Shadow's catalog is a read-only physical copy of source's, so
+/// `CREATE EXTENSION` cannot run there. `shared_preload_libraries` is the one
+/// hook walshadow owns on a shadow it started, which is what makes the worker
+/// deliverable where the SQL function is not
+#[derive(Debug, Clone)]
+pub struct BridgeConf {
+    /// `walshadow.socket_path`. Also what the daemon dials
+    pub socket_path: PathBuf,
+    /// Prepended to `dynamic_library_path` when `walshadow.so` lives outside
+    /// `$libdir`, ie a build tree rather than `make install`
+    pub library_dir: Option<PathBuf>,
+    pub io_timeout: Duration,
+    /// Bounds a catalog lock the worker cannot get, which would otherwise hang
+    /// against recovery
+    pub lock_timeout: Duration,
+}
+
+impl BridgeConf {
+    /// Socket beside shadow's own, so one directory covers both
+    pub fn in_dir(socket_dir: &Path) -> Self {
+        Self {
+            socket_path: socket_dir.join("walshadow-bridge.sock"),
+            library_dir: None,
+            io_timeout: Duration::from_secs(30),
+            lock_timeout: Duration::from_secs(1),
+        }
+    }
+
+    /// `postgresql.conf` lines that start the worker. `dbname` is the database
+    /// it connects to for catalog reads.
+    pub fn conf_text(&self, dbname: &str) -> String {
+        let quote = |s: &str| s.replace('\'', "''");
+        let quote_path = |p: &Path| quote(&p.to_string_lossy());
+        let mut out = String::from("\n# walshadow bridge worker\n");
+        if let Some(dir) = &self.library_dir {
+            out.push_str(&format!(
+                "dynamic_library_path = '{}:$libdir'\n",
+                quote_path(dir)
+            ));
+        }
+        out.push_str("shared_preload_libraries = 'walshadow'\n");
+        out.push_str(&format!(
+            "walshadow.socket_path = '{}'\n\
+             walshadow.database = '{}'\n\
+             walshadow.io_timeout_ms = {}\n\
+             walshadow.lock_timeout_ms = {}\n",
+            quote_path(&self.socket_path),
+            quote(dbname),
+            self.io_timeout.as_millis(),
+            self.lock_timeout.as_millis(),
+        ));
+        out
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShadowConfig {
     /// `-D` to all binaries.
@@ -74,6 +131,10 @@ pub struct ShadowConfig {
     pub user: String,
     /// `-d` for all probe connections.
     pub dbname: String,
+    /// `None` leaves `shared_preload_libraries` unset, so a postmaster whose
+    /// `walshadow.so` is missing still starts. Preloading a library PG cannot
+    /// resolve is a startup failure, not a warning
+    pub bridge: Option<BridgeConf>,
 }
 
 impl ShadowConfig {
@@ -92,6 +153,7 @@ impl ShadowConfig {
             wait_poll: Duration::from_millis(200),
             user: "postgres".to_string(),
             dbname: "postgres".to_string(),
+            bridge: None,
         }
     }
 
@@ -108,6 +170,15 @@ impl ShadowConfig {
 
     fn socket_str(&self) -> &str {
         self.socket_dir.to_str().expect("non-utf8 socket_dir")
+    }
+
+    /// `postgresql.conf` lines that start the bridge worker, empty when no
+    /// bridge is configured
+    fn bridge_conf(&self) -> String {
+        self.bridge
+            .as_ref()
+            .map(|b| b.conf_text(&self.dbname))
+            .unwrap_or_default()
     }
 }
 
@@ -188,6 +259,11 @@ impl Shadow {
         &self.config
     }
 
+    /// Socket the preloaded bridge worker listens on, `None` when unconfigured
+    pub fn bridge_socket(&self) -> Option<&Path> {
+        self.config.bridge.as_ref().map(|b| b.socket_path.as_path())
+    }
+
     // ----- lifecycle steps -------------------------------------------
 
     pub fn initdb(&self) -> Result<()> {
@@ -232,6 +308,7 @@ impl Shadow {
         );
         let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
         f.write_all(body.as_bytes())?;
+        f.write_all(self.config.bridge_conf().as_bytes())?;
         Ok(())
     }
 
@@ -273,7 +350,10 @@ impl Shadow {
             sock = self.config.socket_str(),
             port = self.config.port,
             max_connections = floor.max_connections,
-            max_worker_processes = floor.max_worker_processes,
+            // Bridge takes a slot. Over the floor rather than under it: PG only
+            // LOGs "too many background workers" and drops the registration
+            max_worker_processes =
+                floor.max_worker_processes + u32::from(self.config.bridge.is_some()),
             max_wal_senders = floor.max_wal_senders,
             max_prepared_transactions = floor.max_prepared_transactions,
             max_locks_per_transaction = floor.max_locks_per_transaction,
@@ -283,6 +363,7 @@ impl Shadow {
             let escaped = conninfo.replace('\'', "''");
             conf.push_str(&format!("primary_conninfo = '{escaped}'\n"));
         }
+        conf.push_str(&self.config.bridge_conf());
         let d = &self.config.data_dir;
         fs::write(d.join("postgresql.conf"), conf)?;
         fs::write(
@@ -443,22 +524,6 @@ impl Shadow {
             .output()?;
         // pg_ctl status: 0 running, 3 stopped, 4 no data dir
         Ok(out.status.code() == Some(0))
-    }
-
-    /// Load the `walshadow` extension if installed system-wide
-    /// (operators run `(cd pgext && sudo make install)`). `true` iff
-    /// now present; absence is tolerated, daemon falls back to raw
-    /// on-disk bytes for Tier 3 types outside the local matrix.
-    pub fn try_load_oracle_extension(&self) -> Result<bool> {
-        // Absence raises `extension "walshadow" is not available`;
-        // surface as clean false rather than failing bootstrap.
-        match self.psql_one("CREATE EXTENSION IF NOT EXISTS walshadow") {
-            Ok(_) => Ok(true),
-            Err(ShadowError::Process { stderr, .. }) if stderr.contains("not available") => {
-                Ok(false)
-            }
-            Err(e) => Err(e),
-        }
     }
 
     /// Feed a SQL payload to `psql -f -` (eg `pg_dump --schema-only`).

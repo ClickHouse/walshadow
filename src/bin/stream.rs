@@ -259,6 +259,17 @@ struct Args {
     /// doesn't fail the daemon on first boot.
     #[arg(long, default_value_t = 30)]
     shadow_connect_timeout: u64,
+    /// Unix socket of the pgext bridge worker. On a daemon-owned shadow
+    /// this also writes `shared_preload_libraries` and the
+    /// `walshadow.*` GUCs into shadow's conf, so the worker starts.
+    /// Defaults to `<shadow-socket-dir>/walshadow-bridge.sock`.
+    #[arg(long)]
+    bridge_socket: Option<PathBuf>,
+    /// Directory holding `walshadow.so` when it isn't in PG's `$libdir`,
+    /// ie a build tree instead of `make install`. Written as
+    /// `dynamic_library_path`.
+    #[arg(long)]
+    bridge_lib_dir: Option<PathBuf>,
     /// Walsender bind address. `127.0.0.1:0` lets the kernel pick a free
     /// port, valid only for externally managed shadow (no
     /// `--bootstrap-shadow-data-dir`): operator reads
@@ -408,6 +419,14 @@ struct Args {
     /// Abort daemon when timeout expires
     #[arg(long, default_value_t = 300)]
     bootstrap_shadow_replay_timeout: u64,
+}
+
+impl Args {
+    fn bridge_socket_path(&self) -> PathBuf {
+        self.bridge_socket
+            .clone()
+            .unwrap_or_else(|| self.shadow_socket_dir.join("walshadow-bridge.sock"))
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -919,9 +938,8 @@ async fn run_session(
         );
     }
 
-    // Connect shadow catalog before START_REPLICATION so the tracker→drain
-    // wire is hot from the first record. with_transient_retry tolerates a
-    // still-warming shadow on boot.
+    // Connect bridge and shadow catalog before START_REPLICATION so the
+    // tracker→drain wire is hot from the first record.
     let shadow_conninfo = socket_conninfo(
         args.shadow_socket_dir
             .to_str()
@@ -931,11 +949,25 @@ async fn run_session(
         &args.shadow_dbname,
     );
     let connect_budget = Duration::from_secs(args.shadow_connect_timeout);
+    let bridge_path = args.bridge_socket_path();
+    let bridge = Arc::new(
+        walshadow::bridge::connect_with_budget(&bridge_path, connect_budget)
+            .await
+            .with_context(|| format!("connect bridge at {}", bridge_path.display()))?,
+    );
+    let info = bridge.info();
+    tracing::info!(
+        target: "walshadow::bridge",
+        socket = %bridge_path.display(),
+        pg_version = info.map(|i| i.pg_version_num).unwrap_or(0),
+        in_recovery = info.map(|i| i.in_recovery).unwrap_or(false),
+        "bridge connected",
+    );
     let cat_cfg = ShadowCatalogConfig::default();
     let backoff_initial = cat_cfg.reconnect_backoff_initial;
     let backoff_max = cat_cfg.reconnect_backoff_max;
     let catalog = with_transient_retry(connect_budget, backoff_initial, backoff_max, async || {
-        ShadowCatalog::connect(&shadow_conninfo, cat_cfg.clone()).await
+        ShadowCatalog::connect(&shadow_conninfo, cat_cfg.clone(), bridge.clone()).await
     })
     .await
     .context("connect to shadow PG")?;
@@ -987,25 +1019,7 @@ async fn run_session(
         tracing::info!(target: "walshadow::preflight", "pre-flight passed");
     }
 
-    // Oracle opens its own libpq connection so its queries don't pessimise
-    // the catalog's query-one path. Best-effort: connect failure disables
-    // the oracle, daemon keeps running with the raw-bytes fallback.
-    let oracle =
-        match walshadow::oracle::connect_with_budget(&shadow_conninfo, connect_budget).await {
-            Ok(o) => {
-                let ext = o.has_extension();
-                tracing::info!(
-                    target: "walshadow::oracle",
-                    extension = if ext { "present" } else { "absent" },
-                    "oracle connected",
-                );
-                Some(Arc::new(o))
-            }
-            Err(e) => {
-                tracing::warn!(target: "walshadow::oracle", error = %e, "oracle disabled");
-                None
-            }
-        };
+    let oracle = Some(Arc::new(walshadow::oracle::Oracle::new(bridge.clone())));
 
     // START_REPLICATION runs after sinks are built so archive fallback can
     // advance identical filter and decode paths.
@@ -1774,6 +1788,8 @@ async fn run_session(
             .map(|o| o.stats.summary())
             .unwrap_or_default();
         let oracle_stats = oracle.as_ref().map(|o| o.stats.as_ref());
+        let bridge_line = bridge.stats.summary();
+        let bridge_stats = Some(bridge.stats.as_ref());
         let decoder_stats: &walshadow::decoder_sink::DecoderStats = &record_sink.decoder_stats;
         let emitter_stats: Option<&walshadow::ch_emitter::EmitterStats> =
             record_sink.emitter_stats.as_deref();
@@ -1801,6 +1817,7 @@ async fn run_session(
             decoder_stats,
             emitter_stats,
             oracle_stats,
+            bridge_stats,
             start_instant.elapsed().as_secs(),
             ShadowMetricsView {
                 apply_lag_bytes: lag_bytes,
@@ -1838,6 +1855,7 @@ async fn run_session(
                 decoder = %decoder_stats.summary(),
                 xact_buffer = %xact_line,
                 oracle = %oracle_line,
+                bridge = %bridge_line,
                 "status",
             );
             if args.max_segments != 0 && segments_shipped >= args.max_segments {
@@ -2388,6 +2406,7 @@ async fn populate_metrics(
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
     emitter_stats: Option<&walshadow::ch_emitter::EmitterStats>,
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
+    bridge_stats: Option<&walshadow::bridge::BridgeStats>,
     uptime_secs: u64,
     shadow_view: ShadowMetricsView,
     boundary_hold: &BoundaryHoldStats,
@@ -2612,8 +2631,36 @@ async fn populate_metrics(
         config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),
         config_backfills_pending: backfiller.map(|b| b.pending_count()).unwrap_or(0),
         config_backfills_pending_by_mode: backfiller.map(|b| b.pending_by_mode()).unwrap_or([0; 3]),
+        bridge_up: bridge_gauge(bridge_stats, |b| &b.up),
+        bridge_requests_by_op: bridge_ops(bridge_stats.map(|b| &b.requests)),
+        bridge_errors_by_op: bridge_ops(bridge_stats.map(|b| &b.errors)),
+        bridge_request_nanos_by_op: bridge_ops(bridge_stats.map(|b| &b.request_nanos)),
+        bridge_reconnects_total: bridge_gauge(bridge_stats, |b| &b.reconnects),
+        bridge_scan_rows_total: bridge_gauge(bridge_stats, |b| &b.scan_rows),
+        bridge_scan_replay_moved_total: bridge_gauge(bridge_stats, |b| &b.scan_replay_moved),
+        bridge_scan_subtrans_mismatch_total: bridge_gauge(bridge_stats, |b| {
+            &b.scan_subtrans_mismatch
+        }),
+        bridge_decode_items_total: bridge_gauge(bridge_stats, |b| &b.decode_items),
+        bridge_decode_item_errors_total: bridge_gauge(bridge_stats, |b| &b.decode_item_errors),
     };
     registry.set(snap).await;
+}
+
+/// Zero when bridge stats are unavailable, so series stays present
+fn bridge_gauge(
+    stats: Option<&walshadow::bridge::BridgeStats>,
+    pick: fn(&walshadow::bridge::BridgeStats) -> &AtomicU64,
+) -> u64 {
+    stats.map(|b| pick(b).load(Ordering::Relaxed)).unwrap_or(0)
+}
+
+fn bridge_ops(
+    counters: Option<&[AtomicU64; walshadow::bridge::OP_COUNT]>,
+) -> [u64; walshadow::bridge::OP_COUNT] {
+    counters
+        .map(|a| std::array::from_fn(|i| a[i].load(Ordering::Relaxed)))
+        .unwrap_or_default()
 }
 
 /// Retry transient source failures, stop when source reports missing WAL.
@@ -3129,6 +3176,12 @@ fn build_owned_shadow(args: &Args, data_dir: PathBuf) -> Shadow {
     cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
     cfg.user = args.shadow_user.clone();
     cfg.dbname = args.shadow_dbname.clone();
+    // Only a shadow walshadow started can be given a preload line; External
+    // clusters are the operator's to configure
+    let mut bridge = walshadow::shadow::BridgeConf::in_dir(&cfg.socket_dir);
+    bridge.socket_path = args.bridge_socket_path();
+    bridge.library_dir = args.bridge_lib_dir.clone();
+    cfg.bridge = Some(bridge);
     Shadow::new(cfg)
 }
 
@@ -3538,6 +3591,18 @@ mod tests {
             ShadowStart::External
         ));
         assert!(resolve_shadow_start(&args_from(&["--bootstrap-mode", "direct"])).is_err());
+    }
+
+    #[test]
+    fn bridge_socket_defaults_beside_shadow_socket() {
+        assert_eq!(
+            args_from(&[]).bridge_socket_path(),
+            PathBuf::from("/tmp/sock/walshadow-bridge.sock")
+        );
+        assert_eq!(
+            args_from(&["--bridge-socket", "/tmp/custom.sock"]).bridge_socket_path(),
+            PathBuf::from("/tmp/custom.sock")
+        );
     }
 
     #[test]

@@ -113,9 +113,9 @@ Component docs live alongside this overview:
   `manifest.toml` (six LSNs + resolved floor + source identity),
   durable TOAST retirement ledger, per-xact `commit_lsn` carrier, slot
   advance on `min(shadow_replay, emitter_ack)`
-- [oracle.md](oracle.md) — PgPending resolver: walshadow PG extension
-  (`pgext/`) exposing `walshadow_decode_disk(oid, bytea) -> text` for
-  Tier 3 types, best-effort resolution at the decode pool
+- [oracle.md](oracle.md) — PgPending resolver: walshadow PG module
+  (`pgext/`) preloaded into shadow, serving on-disk decode over a unix
+  socket for Tier 3 types, best-effort resolution at the decode pool
 - [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
   — clickhouse-c-rs unsafe surface (audited 2026-05-17 at `b5af579`):
   `Client` ownership of `PosixIo`/`Codec`, `&[u8]` over

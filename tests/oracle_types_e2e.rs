@@ -1,8 +1,8 @@
 //! Oracle-path types (arrays/enums/geometric/pgvector), end-to-end: they decode
-//! to `PgPending`/`Unsupported` and resolve via the shadow's `walshadow`
-//! extension, created on the source pre-basebackup. Skipped unless `walshadow`
-//! is installed (`cd pgext && sudo make install`); pgvector also needs
-//! `vector`. Resolved text matches PG `typoutput`.
+//! to `PgPending`/`Unsupported` and resolve through the bridge worker preloaded
+//! into the shadow standby. Skipped unless `pgext` is built (`make -C pgext`);
+//! pgvector also needs `vector` installed on source. Resolved text matches PG
+//! `typoutput`.
 
 #![cfg(target_os = "linux")]
 
@@ -18,7 +18,6 @@ use std::time::Duration;
 use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::oracle::Oracle;
-use walshadow::pg::socket_conninfo;
 use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
@@ -71,6 +70,10 @@ fn skip_gate() -> bool {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
         return true;
     }
+    if fx::pgext_dir().is_none() {
+        eprintln!("skip: pgext not built (run `make -C pgext`)");
+        return true;
+    }
     false
 }
 
@@ -111,7 +114,14 @@ async fn run_oracle(
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, schema_sql, slot.source, slot.shadow, slot.walsender).await;
+    ) = fx::bootstrap_clusters_with_bridge(
+        &tmp,
+        schema_sql,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
+    )
+    .await;
 
     let ch_tmp = tempfile::tempdir().unwrap();
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
@@ -119,17 +129,16 @@ async fn run_oracle(
         .expect("create db");
     ch.query(ch_create_sql).expect("create dest table");
 
-    let conninfo = socket_conninfo(
-        shadow.config().socket_dir.to_str().unwrap(),
-        shadow.config().port,
-        "postgres",
-        "postgres",
-    );
-    let oracle = Oracle::connect(&conninfo).await.expect("oracle connect");
+    // Worker binds only once recovery reaches consistency, so budget the dial
+    let socket = shadow.bridge_socket().expect("bridge configured");
+    let bridge = walshadow::bridge::connect_with_budget(socket, Duration::from_secs(30))
+        .await
+        .expect("bridge connect");
     assert!(
-        oracle.has_extension(),
-        "shadow must expose walshadow_decode_disk",
+        bridge.info().expect("hello").in_recovery,
+        "shadow must serve decode while in recovery",
     );
+    let oracle = Oracle::new(Arc::new(bridge));
 
     let mut pipeline = fx::build_pipeline_with_oracle(
         fx::BuildPipelineArgs {
@@ -166,15 +175,13 @@ async fn run_oracle(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn arrays_resolve_via_oracle() {
-    if skip_gate() || !extension_available("walshadow") {
-        eprintln!("skip: walshadow extension not installed");
+    if skip_gate() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
         SLOT_ARR,
         "walshadow-oracle-arrays",
-        "CREATE EXTENSION walshadow;\n\
-         CREATE TABLE public.arr (id int PRIMARY KEY, ints int[], texts text[], nums numeric[]);\n",
+        "CREATE TABLE public.arr (id int PRIMARY KEY, ints int[], texts text[], nums numeric[]);\n",
         "CREATE OR REPLACE TABLE walshadow_test.arr (\
             id Int32, ints Nullable(String), texts Nullable(String), nums Nullable(String),\
             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
@@ -219,15 +226,13 @@ async fn arrays_resolve_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enums_resolve_via_oracle() {
-    if skip_gate() || !extension_available("walshadow") {
-        eprintln!("skip: walshadow extension not installed");
+    if skip_gate() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
         SLOT_ENUM,
         "walshadow-oracle-enums",
-        "CREATE EXTENSION walshadow;\n\
-         CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');\n\
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');\n\
          CREATE TABLE public.en (id int PRIMARY KEY, m mood, ms mood[]);\n",
         "CREATE OR REPLACE TABLE walshadow_test.en (\
             id Int32, m Nullable(String), ms Nullable(String),\
@@ -266,15 +271,13 @@ async fn enums_resolve_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn geometric_types_resolve_via_oracle() {
-    if skip_gate() || !extension_available("walshadow") {
-        eprintln!("skip: walshadow extension not installed");
+    if skip_gate() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
         SLOT_GEO,
         "walshadow-oracle-geo",
-        "CREATE EXTENSION walshadow;\n\
-         CREATE TABLE public.geo (\
+        "CREATE TABLE public.geo (\
             id int PRIMARY KEY, p point, ln line, ls lseg, bx box, \
             pth path, poly polygon, c circle);\n",
         "CREATE OR REPLACE TABLE walshadow_test.geo (\
@@ -318,15 +321,14 @@ async fn geometric_types_resolve_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgvector_resolves_via_oracle() {
-    if skip_gate() || !extension_available("walshadow") || !extension_available("vector") {
-        eprintln!("skip: walshadow or vector extension not installed");
+    if skip_gate() || !extension_available("vector") {
+        eprintln!("skip: vector extension not installed");
         return;
     }
     let (source, ch, _tmp) = run_oracle(
         SLOT_VEC,
         "walshadow-oracle-vector",
-        "CREATE EXTENSION walshadow;\n\
-         CREATE EXTENSION vector;\n\
+        "CREATE EXTENSION vector;\n\
          CREATE TABLE public.vec (\
             id int PRIMARY KEY, v vector(3), hv halfvec(3), sv sparsevec(5));\n",
         "CREATE OR REPLACE TABLE walshadow_test.vec (\
@@ -358,15 +360,13 @@ async fn pgvector_resolves_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn array_update_under_rif_resolves_old_tuple() {
-    if skip_gate() || !extension_available("walshadow") {
-        eprintln!("skip: walshadow extension not installed");
+    if skip_gate() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
         SLOT_RIF,
         "walshadow-oracle-rif",
-        "CREATE EXTENSION walshadow;\n\
-         CREATE TABLE public.arr (id int PRIMARY KEY, ints int[]);\n\
+        "CREATE TABLE public.arr (id int PRIMARY KEY, ints int[]);\n\
          ALTER TABLE public.arr REPLICA IDENTITY FULL;\n",
         "CREATE OR REPLACE TABLE walshadow_test.arr (\
             id Int32, ints Nullable(String),\

@@ -133,19 +133,12 @@ pub async fn fetch_all_descriptors(&mut self)
 pub async fn descriptor_by_name(&mut self, rel: &RelName)
     -> Result<Option<Arc<RelDescriptor>>>;  // opt-in dispatch
 pub async fn wait_for_replay(&mut self, target: u64) -> Result<u64>;
+pub async fn fetch_overlay_descriptors(&mut self,
+    oids: &[Oid], top_xid: u32, boundary: u64)
+    -> Result<Vec<RelDescriptor>>;          // uncommitted DDL, see below
 ```
 
 ![shadow](../architecture/shadow.svg)
-
-The batched fetch is one round trip: pg_class ⋈ pg_namespace, lateral
-pg_index (pk + replident), lateral pg_attribute aggregation with
-physical columns read directly (`attbyval/attlen/attalign/attstorage` —
-`DROP COLUMN` zeroes `atttypid` but preserves those, so pg_type joins
-LEFT and supplies typname only; dropped slots stay in `attributes`,
-keeping attnum-1 indexing exact), plus `pg_last_wal_replay_lsn()` off
-the same connection. Filenode resolution goes through
-`pg_relation_filenode(oid)` so mapped catalogs and regular tables
-resolve uniformly.
 
 No cache, no invalidation, no event channel: descriptor history lives
 in the durable log ([desc_log.md](desc_log.md)); capture calls these
@@ -155,6 +148,69 @@ state. Foreign-db rejection likewise moved to the log's lookup surface
 (`LookupResult::ForeignDb`). DROP discovery is capture-native: an oid
 absent from a boundary's fetch with a Present predecessor tombstones +
 emits `Dropped` — no polling sweep
+
+## One descriptor definition
+
+Every fetch above assembles its `RelDescriptor` in Rust from the catalog
+projections bridge worker's `SCAN` op names ([oracle.md](oracle.md)):
+`pg_class`, `pg_attribute`, `pg_index`, plus oid → name maps for
+`pg_namespace` and `pg_type`. Committed reads pass top xid `0`, which owns no
+transaction, so visibility predicate degenerates to committed view;
+`fetch_all_descriptors` passes no oid list, which reads whole `pg_class` and
+scopes remaining projections to returned relations. Oid lists longer than one
+request may carry are chunked, every chunk pinned to one position
+
+Committed reads have a second source: one SQL statement mirroring those
+projections, carried as `(catalog id, text[])` rows so both reach the same
+parsers, and one statement so one snapshot covers every projection. Values are
+each type's text output form, which is `format('%s', v)` and not a `::text`
+cast — the cast renders a boolean `true` where `boolout` says `t`, and takes
+`int2vector` out of its space-separated form. It answers whenever the worker
+cannot hold one replay position across a read
+
+Physical columns come straight off `pg_attribute`
+(`attbyval/attlen/attalign/attstorage`): `DROP COLUMN` zeroes `atttypid` but
+preserves those, so a dropped slot keeps its layout and its `type_name` goes
+empty for want of a `pg_type` row. Dropped slots stay in `attributes`, keeping
+attnum-1 indexing exact. `reltablespace` arrives raw and the `0` =
+database-default sentinel resolves against a memoized
+`pg_database.dattablespace`. `relfilenode` is the column, not
+`pg_relation_filenode()`, which reads through relcache and cannot see an
+overlay; mapped relations therefore report `0`, and no user relation is ever
+mapped. All `pg_index` rows for a relation come back and picking the primary
+and replident rows is this side's.
+
+### Uncommitted DDL
+
+SQL sees committed rows only, so a transaction whose DDL is still open is
+invisible to it. `fetch_overlay_descriptors` asks the worker for the same
+projections under the requesting transaction's own view: its inserts present,
+its deletes applied.
+
+Caller parks replay at a boundary LSN and passes it; both replay positions the
+worker samples must equal it, or the read fails rather than describing a
+different point in WAL. A committed read has no boundary of its own and takes
+the first scan's position, pinning the rest to it — a replay move mid-read
+would otherwise tear the descriptor across two points in WAL, since
+`SnapshotAny` gives the worker nothing to hold still against.
+
+Replay only sits still inside the publication hold; away from one it moves
+between requests and no sequence of scans answers for a single position, so a
+committed read redoes itself on the mirroring statement. An overlay read fails
+instead: the caller holds the boundary the question is about, and an MVCC
+snapshot cannot see the rows it asks for. Movement increments
+`walshadow_bridge_scan_replay_moved_total`, which reads two ways — expected off
+a boundary, a boundary-hold bug during capture
+
+Namespace and type names resolve against the committed catalog first. The
+whole-catalog scan behind them has no oid list and so no relation-lock
+argument, and refuses to answer while any foreign writer is mid-DDL, so it runs
+only for oids the committed read did not have, ie ones this transaction
+created.
+
+Two rows for one oid, or for one `(attrelid, attnum)`, fail the read: that is a
+superseded row version surviving the worker's visibility predicate, which would
+shift every later column.
 
 ## Reconnect resilience
 
@@ -315,6 +371,8 @@ backfill, net-new knobs) is
   against `RelDescriptor`
 - [emitter.md](emitter.md) — `SchemaEvent` channel consumer
   (`ch_ddl::DdlApplicator`), barrier-fence ordering
+- [oracle.md](oracle.md) — bridge worker behind the overlay read: socket,
+  framing, and the `SnapshotAny` projections `SCAN` returns
 - [source.md](source.md) — walsender walshadow consumes from source;
   symmetry with walsender walshadow exposes to shadow
 - [future/risks.md](future/risks.md) — coarse-fire generation

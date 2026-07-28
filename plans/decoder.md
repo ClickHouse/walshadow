@@ -222,11 +222,11 @@ In-tree decoders ([`src/codecs.rs`](../src/codecs.rs)):
 Everything else — `jsonb`, range types, arrays (`typcategory='A'`),
 `tsvector`, vendor types — routes through
 `ColumnValue::PgPending { type_oid, raw }` carrying on-disk varlena
-body. Emitter resolves text form at emit time via
-`walshadow_decode_disk(oid, bytea) -> text` SQL call against shadow PG
-(`walshadow` extension); falls back to `<oid:N>` placeholder +
-`unsupported_values` bump when extension absent. One source of truth
-lives on shadow, no per-type codec drift to chase in walshadow itself
+body. Emitter resolves text form at emit time through shadow PG's own
+`typoutput`, reached over required bridge worker socket. Per-item
+`typoutput` errors leave `PgPending` unresolved and preserve on-disk body
+(see [oracle.md](oracle.md) § Failure semantics). One source of truth lives
+on shadow, no per-type codec drift to chase in walshadow itself
 
 ## Replica identity
 

@@ -242,10 +242,9 @@ pub enum ColumnValue {
     /// `json` Tier 3, varlena text on disk, passed through unchanged.
     Json(String),
     /// Tier 3 deferred (not numeric/inet/interval/json). Carries raw
-    /// on-disk body; resolved to text post-plan via
-    /// `walshadow_decode_disk(oid, bytea) -> text` against shadow PG
-    /// (`walshadow` extension), best effort: shadow may lag row's catalog
-    /// state. Unresolved (extension absent / NULL result, counted
+    /// on-disk body; resolved to text post-plan by shadow PG's `typoutput`
+    /// over the bridge socket, best effort: shadow may lag row's catalog
+    /// state. Unresolved (bridge transport failed or `typoutput` raised, counted
     /// `fallback_raw`): emitter appends raw on-disk bytes.
     PgPending {
         type_oid: u32,

@@ -138,9 +138,10 @@ jobs:
           fixtures/wal/xlog_switch/capture.sh
           fixtures/wal/vacuum_full_pg_depend/capture.sh
 
-      # Install the walshadow extension before the e2e suite so each shadow PG
-      # can CREATE EXTENSION walshadow for the oracle decode path.
-      - name: Build + install walshadow extension (e2e oracle path)
+      # Build walshadow.so before the e2e suite: the bridge tests point
+      # dynamic_library_path at the build tree, so `make` alone is what they
+      # need. `make install` additionally proves the target docker relies on.
+      - name: Build + install walshadow PG module (e2e oracle path)
         working-directory: walshadow/pgext
         run: |
           PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg-major }}/bin/pg_config
@@ -183,35 +184,6 @@ jobs:
           path: ${{ github.workspace }}/test-artifacts
           if-no-files-found: ignore
           retention-days: 7
-
-      # walshadow extension is a separate PGXS module (shipped to shadow PG).
-      # Build it against the matrix PG, install into that major's $libdir /
-      # share/extension, then run pg_regress under a private --temp-instance
-      # so we don't need an external server. Covers the C bridge function's
-      # varlena, fixed-width by-val, by-ref, NULL, and ereport paths.
-      - name: walshadow extension (build + pg_regress)
-        working-directory: walshadow/pgext
-        run: |
-          PG_BIN=/usr/lib/postgresql/${{ matrix.pg-major }}/bin
-          PG_CONFIG=$PG_BIN/pg_config
-          make PG_CONFIG=$PG_CONFIG
-          sudo make PG_CONFIG=$PG_CONFIG install
-          PG_REGRESS=/usr/lib/postgresql/${{ matrix.pg-major }}/lib/pgxs/src/test/regress/pg_regress
-          rm -rf /tmp/walshadow_pgext_tmpinst
-          "$PG_REGRESS" \
-            --inputdir=./ --outputdir=./ \
-            --bindir="$PG_BIN" \
-            --temp-instance=/tmp/walshadow_pgext_tmpinst \
-            --port=54329 \
-            walshadow
-
-      - name: walshadow extension regression diffs on failure
-        if: failure()
-        working-directory: walshadow/pgext
-        run: |
-          test -f regression.diffs && cat regression.diffs || true
-          test -d /tmp/walshadow_pgext_tmpinst/log && \
-            sudo tail -n 200 /tmp/walshadow_pgext_tmpinst/log/postmaster.log || true
 
       - name: ClickHouse server logs on failure
         if: failure()

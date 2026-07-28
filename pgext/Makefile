@@ -1,4 +1,9 @@
-# walshadow — PG extension. PGXS-driven build.
+# walshadow — PG loadable module. PGXS-driven build.
+#
+# Not an extension: no control file, no SQL script. The only consumer is a
+# shadow standby whose catalog is a read-only physical copy of source's, so
+# `CREATE EXTENSION` can never run there. `shared_preload_libraries` is the
+# sole entry point, and decode coverage lives in the daemon's tests/bridge.rs.
 #
 # Build (against the pg_config on PATH):
 #   make
@@ -11,16 +16,12 @@
 #   make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
 
 MODULE_big = walshadow
-OBJS = walshadow.o
-
-EXTENSION = walshadow
-DATA = walshadow--0.1.sql
-
-# `make installcheck` runs pg_regress against the *running* server pointed
-# at by pg_config. pg_regress creates `contrib_regression`, CREATEs the
-# extension, runs sql/<name>.sql, and diffs against expected/<name>.out.
-REGRESS = walshadow
+OBJS = decode.o overlay.o worker.o
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# PGXS tracks no header deps, and a stale object against a bumped
+# WS_PROTO_VERSION links a worker the daemon then refuses
+$(OBJS): walshadow.h
