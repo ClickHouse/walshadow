@@ -16,13 +16,13 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 
 // Reserved port slot for this test binary — 56170-range, distinct
 // from pipeline_e2e (56100) / bootstrap_*_e2e (56140) so concurrent `cargo test`
@@ -50,6 +50,31 @@ fn pg_basebackup_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`.
+/// Daemon dials the bridge worker at boot, so an unbuilt module is a failure,
+/// not a reason to skip
+fn pgext_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
+    assert!(
+        dir.join("walshadow.so").is_file(),
+        "pgext/walshadow.so missing, run `make -C pgext`"
+    );
+    dir
+}
+
+/// Preload the bridge worker on this test's own shadow, listening where the
+/// daemon dials by default (`<shadow-socket-dir>/walshadow-bridge.sock`)
+fn append_bridge_conf(data_dir: &Path, socket_dir: &Path, lib_dir: PathBuf) -> Result<()> {
+    let mut bridge = BridgeConf::in_dir(socket_dir);
+    bridge.library_dir = Some(lib_dir);
+    let conf = data_dir.join("postgresql.conf");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&conf)?
+        .write_all(bridge.conf_text("postgres").as_bytes())?;
+    Ok(())
 }
 
 fn make_pg(tmp: &tempfile::TempDir, name: &str, port: u16) -> Shadow {
@@ -207,6 +232,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         eprintln!("skip: no pg_basebackup on PATH");
         return;
     }
+    let bridge_lib_dir = pgext_dir();
 
     let tmp = tempfile::tempdir().unwrap();
 
@@ -241,6 +267,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     rewrite_for_shadow(&shadow_data, SHADOW_PORT, &shadow_sock).expect("retarget shadow conf");
     enable_recovery(&shadow_data, &shadow_filter_dir, WALSENDER_PORT)
         .expect("enable shadow recovery");
+    append_bridge_conf(&shadow_data, &shadow_sock, bridge_lib_dir).expect("preload bridge worker");
 
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
     shadow_cfg.port = SHADOW_PORT;
@@ -596,6 +623,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
         eprintln!("skip: PG binaries not on PATH");
         return;
     }
+    let bridge_lib_dir = pgext_dir();
 
     let tmp = tempfile::tempdir().unwrap();
     let source = make_pg(&tmp, "wd-source", WD_SOURCE_PORT);
@@ -622,6 +650,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     fs::create_dir_all(&shadow_sock).unwrap();
     rewrite_for_shadow(&shadow_data, WD_SHADOW_PORT, &shadow_sock).expect("retarget shadow");
     enable_recovery(&shadow_data, &filter_dir, WD_WALSENDER_PORT).expect("enable recovery");
+    append_bridge_conf(&shadow_data, &shadow_sock, bridge_lib_dir).expect("preload bridge worker");
     // Slow the walreceiver restart so killing it leaves a multi-second window in
     // which the writer advances the head — guaranteeing the reconnect lands
     // behind it (the gap). Overrides the 100ms from rewrite_for_shadow.

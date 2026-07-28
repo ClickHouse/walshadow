@@ -168,6 +168,9 @@ impl Harness {
         // Long-lived daemon: no --max-segments, so run_session streams
         // forever and the tests drive it live.
         let bin = env!("CARGO_BIN_EXE_walshadow-stream").to_string();
+        // Shadow is daemon-owned, so the daemon writes the preload line itself
+        // and only needs to be told where the un-installed module sits
+        let pgext_dir = fx::pgext_dir();
         let stderr_path = tmp.path().join("daemon.stderr.log");
         let stderr_file = fs::File::create(&stderr_path).context("open daemon stderr")?;
         let metrics_addr: SocketAddr = format!("127.0.0.1:{}", ports.metrics).parse().unwrap();
@@ -213,6 +216,8 @@ impl Harness {
                 shadow_data.to_str().unwrap(),
                 "--bootstrap-shadow-replay-timeout",
                 "120",
+                "--bridge-lib-dir",
+                pgext_dir.to_str().unwrap(),
             ])
             .env("RUST_LOG", "warn,walshadow=info")
             .stdout(Stdio::null())

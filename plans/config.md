@@ -51,7 +51,10 @@ matches steady state.
 
 Bootstrap fixed points stay on `EmitterConfig`, boot-only, never republished:
 connection params (`[ch] host/port/user/password/database/secure`), toast store,
-`soft_delete`, `[memory] resident_payload_max` / `inline_value_max` (resident
+`soft_delete`, pending capture cost controls (`[stream]
+pending_max_boundaries_per_xact`, `pending_max_hold_ms`;
+[desc_log.md](desc_log.md) Pending capture), `[memory]
+resident_payload_max` / `inline_value_max` (resident
 budget pool + leaf reserve sized at pipeline spawn — [emitter.md](emitter.md)
 Memory budget; `spill.dir` stays the `--spill-dir` CLI arg), and the source
 physical replication slot (`[source] slot` →

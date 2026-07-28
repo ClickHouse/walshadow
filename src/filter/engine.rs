@@ -25,7 +25,7 @@ use crate::filter::classify::{Class, classify};
 use crate::filter::dirty_tree::{DirtyState, DirtyTree};
 use crate::filter::main_data;
 use crate::filter::manifest::ManifestStats;
-use crate::record::{AffectedOid, BoundaryInfo, Route, rmgr_label};
+use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -106,15 +106,25 @@ pub(crate) struct FilterSnapshot {
 pub struct Verdict {
     pub route: Route,
     /// Commit record of a catalog-mutating xact (top, subxact, or prepared
-    /// xid wrote a catalog-touching record). Pump holds shadow publication
-    /// here until replay passes the commit's `next_lsn`
+    /// xid wrote a catalog-touching record), or a command boundary inside
+    /// one. Pump holds shadow publication here
+    /// until replay passes the record's `next_lsn`
     pub catalog_boundary: bool,
     /// Capture input; `Some` iff `catalog_boundary`
     pub boundary: Option<Arc<BoundaryInfo>>,
+    /// Members of a catalog-dirty tree this record aborted
+    pub aborted_tree: Option<Arc<Vec<u32>>>,
     /// User-route record whose xact tree wrote catalog state earlier in
     /// the stream: decoder must not decode with live descriptors, hold raw
     /// until commit-time capture publishes the final layout
     pub defer_catalog_decode: bool,
+}
+
+/// What one `Xact` rmgr record did to the dirty tree
+#[derive(Debug, Default)]
+struct XactEnd {
+    boundary: Option<Arc<BoundaryInfo>>,
+    aborted_tree: Option<Arc<Vec<u32>>>,
 }
 
 /// Pump-side `XLOG_SMGR_CREATE` main-fork markers: physical rfn → creation
@@ -295,13 +305,14 @@ impl Filter {
             }
         }
         let defer_catalog_decode = route == Route::ToDecoder && self.dirty.is_dirty(xid);
-        let boundary = self.observe_xact_end(record, source_lsn, page_magic)?;
+        let end = self.observe_xact_end(record, source_lsn, page_magic)?;
         self.stats
             .record(class, route, record.header.total_record_length as u64);
         Ok(Verdict {
             route,
-            catalog_boundary: boundary.is_some(),
-            boundary,
+            catalog_boundary: end.boundary.is_some(),
+            boundary: end.boundary,
+            aborted_tree: end.aborted_tree,
             defer_catalog_decode,
         })
     }
@@ -319,15 +330,17 @@ impl Filter {
         record: &XLogRecord,
         source_lsn: u64,
         page_magic: u16,
-    ) -> Result<Option<Arc<BoundaryInfo>>, XactPayloadError> {
+    ) -> Result<XactEnd, XactPayloadError> {
         if record.header.resource_manager_id != RmId::Xact as u8 {
-            return Ok(None);
+            return Ok(XactEnd::default());
         }
         let info = record.header.info;
         let op = info & XLOG_XACT_OPMASK;
         if op == XLOG_XACT_INVALIDATIONS {
-            self.observe_xact_invals(record, source_lsn, page_magic)?;
-            return Ok(None);
+            return Ok(XactEnd {
+                boundary: self.observe_xact_invals(record, source_lsn, page_magic)?,
+                aborted_tree: None,
+            });
         }
         if op == XLOG_XACT_ASSIGNMENT {
             // Batched subxid → top links (every PGPROC_MAX_CACHED_SUBXIDS
@@ -338,20 +351,26 @@ impl Filter {
             for sub in subs {
                 self.dirty.link(sub, top);
             }
-            return Ok(None);
+            return Ok(XactEnd::default());
         }
         let is_commit = op == XLOG_XACT_COMMIT || op == XLOG_XACT_COMMIT_PREPARED;
         let is_abort = op == XLOG_XACT_ABORT || op == XLOG_XACT_ABORT_PREPARED;
         if !is_commit && !is_abort {
-            return Ok(None);
+            return Ok(XactEnd::default());
         }
         let payload = parse_xact_payload(info, &record.main_data, page_magic)?;
         let header_xid = record.header.xact_id;
-        let merged = self
-            .dirty
-            .drain_tree(header_xid, payload.twophase_xid, &payload.subxacts);
+        let (merged, members) =
+            self.dirty
+                .drain_tree(header_xid, payload.twophase_xid, &payload.subxacts);
         if !is_commit {
-            return Ok(None);
+            // Speculative catalog state the tree wrote dies with it. Named
+            // on the record so the drop lands on the pump, ahead of any
+            // later boundary that would promote it
+            return Ok(XactEnd {
+                boundary: None,
+                aborted_tree: merged.is_some().then(|| Arc::new(members)),
+            });
         }
         // Local relcache invals: second oid source + capture-all trigger.
         // db 0 = shared relation; user rels there are impossible, kept for
@@ -377,7 +396,7 @@ impl Filter {
         }
         let dirty_hit = merged.is_some();
         if !dirty_hit && inval_oids.is_empty() && !capture_all {
-            return Ok(None);
+            return Ok(XactEnd::default());
         }
         // Inval-only boundary (dirty tracker missed the writes): the
         // commit record itself is the only LSN at hand. Later than any
@@ -396,29 +415,40 @@ impl Filter {
             })
             .collect();
         oids.sort_unstable_by_key(|a| a.oid);
-        Ok(Some(Arc::new(BoundaryInfo {
-            drain_xid: payload.twophase_xid.unwrap_or(header_xid),
-            tree_first_touch: merged.first_touch,
-            oids,
-            capture_all: capture_all || merged.unenumerated,
-        })))
+        Ok(XactEnd {
+            boundary: Some(Arc::new(BoundaryInfo {
+                drain_xid: payload.twophase_xid.unwrap_or(header_xid),
+                tree_first_touch: merged.first_touch,
+                oids,
+                capture_all: capture_all || merged.unenumerated,
+                kind: BoundaryKind::Commit,
+                members,
+            })),
+            aborted_tree: None,
+        })
     }
 
     /// `XLOG_XACT_INVALIDATIONS`: command-boundary inval set logged
-    /// mid-xact at `wal_level=logical`. Re-dirties the writing xid so
-    /// boundary classification survives a restart whose resume floor sits
-    /// past the xact's catalog records. Only descriptor-relevant messages
-    /// dirty — an entry with nothing to capture would hold publication at
-    /// commit for nothing
+    /// mid-xact at `wal_level=logical`, i.e. at every
+    /// `CommandCounterIncrement`. Re-dirties the writing xid so boundary
+    /// classification survives a restart whose resume floor sits past the
+    /// xact's catalog records. Only descriptor-relevant messages dirty — an
+    /// entry with nothing to capture would hold publication at commit for
+    /// nothing.
+    ///
+    /// Same set bounds record: a relation absent from it did not change shape
+    /// at this command, so scan stays scoped to named relations. A capture-all
+    /// set still bounds nothing, capture degrades xact rather than scan whole
+    /// catalog per command
     fn observe_xact_invals(
         &mut self,
         record: &XLogRecord,
         source_lsn: u64,
         page_magic: u16,
-    ) -> Result<(), XactPayloadError> {
+    ) -> Result<Option<Arc<BoundaryInfo>>, XactPayloadError> {
         let xid = record.header.xact_id;
         if xid == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let invals = parse_xact_invalidations(&record.main_data, page_magic)?;
         let namespace_hit = invals.namespace.hits(|db| self.is_local_db(db));
@@ -435,17 +465,38 @@ impl Filter {
             }
         }
         if !namespace_hit && !flush && oids.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
+        let root = self.dirty.root(xid);
         let dirty = self.dirty.touch(xid, source_lsn);
         dirty.unenumerated |= namespace_hit || flush;
-        for oid in oids {
+        for oid in &oids {
             // Inval record LSN sits at command end: after the command's
             // catalog writes, before commit — a live pg_class decode's
             // earlier touch wins via or_insert
-            dirty.oids.entry(oid).or_insert(source_lsn);
+            dirty.oids.entry(*oid).or_insert(source_lsn);
         }
-        Ok(())
+        let tree_first_touch = dirty.first_touch;
+        let touches: Vec<AffectedOid> = {
+            let mut touches: Vec<AffectedOid> = oids
+                .iter()
+                .map(|oid| AffectedOid {
+                    oid: *oid,
+                    pg_class_touch: dirty.oids.get(oid).copied(),
+                })
+                .collect();
+            touches.sort_unstable_by_key(|a| a.oid);
+            touches.dedup_by_key(|a| a.oid);
+            touches
+        };
+        Ok(Some(Arc::new(BoundaryInfo {
+            drain_xid: root,
+            tree_first_touch,
+            oids: touches,
+            capture_all: namespace_hit || flush,
+            kind: BoundaryKind::Command { writer_xid: xid },
+            members: Vec::new(),
+        })))
     }
 
     /// Inval scope: accept db in {0, followed}; `None` (unwired) accepts any
@@ -1183,6 +1234,74 @@ mod tests {
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 100, &[101], None), 200, 0xD116)
             .unwrap();
         assert_eq!(v.boundary.expect("boundary").oids[0].oid, 16400);
+    }
+
+    #[test]
+    fn command_boundary_is_always_on_and_scopes_to_this_command_invals() {
+        let mut f = Filter::new();
+        // Earlier command touched 16400; this one names 16500 only
+        f.decide_record(&xact_invals_rec(7, &[(-2, 5, 16400)]), 150, 0xD116)
+            .unwrap();
+        let v = f
+            .decide_record(&xact_invals_rec(7, &[(-2, 5, 16500)]), 250, 0xD116)
+            .unwrap();
+        let b = v.boundary.expect("command boundary");
+        assert_eq!(b.kind, BoundaryKind::Command { writer_xid: 7 });
+        assert_eq!(b.drain_xid, 7);
+        assert_eq!(b.tree_first_touch, 150);
+        let oids: Vec<u32> = b.oids.iter().map(|a| a.oid).collect();
+        assert_eq!(oids, vec![16500], "a relation this command left alone");
+        assert!(b.members.is_empty());
+        // Commit still bounds, over the whole tree's oids
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
+            .unwrap();
+        let b = v.boundary.expect("commit boundary");
+        assert_eq!(b.kind, BoundaryKind::Commit);
+        assert_eq!(b.members, vec![7]);
+        let oids: Vec<u32> = b.oids.iter().map(|a| a.oid).collect();
+        assert_eq!(oids, vec![16400, 16500]);
+    }
+
+    #[test]
+    fn command_boundary_under_subxact_names_the_known_root() {
+        let mut f = Filter::new();
+        let mut sub = xact_invals_rec(101, &[(-2, 5, 16400)]);
+        sub.toplevel_xid = 100;
+        let v = f.decide_record(&sub, 150, 0xD116).unwrap();
+        let b = v.boundary.expect("command boundary");
+        assert_eq!(b.drain_xid, 100, "slots key under the tree root");
+        assert_eq!(b.kind, BoundaryKind::Command { writer_xid: 101 });
+    }
+
+    #[test]
+    fn capture_all_command_boundary_carries_the_flag() {
+        let mut f = Filter::new();
+        let v = f
+            .decide_record(&xact_invals_rec(7, &[(-2, 5, 0)]), 150, 0xD116)
+            .unwrap();
+        let b = v.boundary.expect("command boundary");
+        assert!(b.capture_all, "whole-relcache flush names no relations");
+        assert!(b.oids.is_empty());
+    }
+
+    #[test]
+    fn abort_names_the_dirty_tree_for_pending_drop() {
+        let mut f = Filter::new();
+        let mut sub = xact_invals_rec(101, &[(-2, 5, 16400)]);
+        sub.toplevel_xid = 100;
+        f.decide_record(&sub, 150, 0xD116).unwrap();
+        // ROLLBACK TO SAVEPOINT: the subxact alone
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_ABORT, 101, &[], None), 200, 0xD116)
+            .unwrap();
+        let members = v.aborted_tree.expect("aborted members");
+        assert_eq!(*members, vec![101]);
+        // Clean tree: nothing speculative to drop
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_ABORT, 900, &[], None), 300, 0xD116)
+            .unwrap();
+        assert!(v.aborted_tree.is_none());
     }
 
     #[test]

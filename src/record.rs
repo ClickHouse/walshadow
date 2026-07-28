@@ -52,24 +52,50 @@ pub enum Route {
     ToDecoder,
 }
 
-/// One catalog-mutating commit: what descriptor capture needs to enumerate
-/// the affected relations. Built by the filter at the commit record.
+/// Which sample point a boundary is. Both park publication until shadow
+/// replays through `next_lsn`; what capture reads there differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoundaryKind {
+    /// Commit of a catalog-mutating xact: the committed shape, durable
+    #[default]
+    Commit,
+    /// `XLOG_XACT_INVALIDATIONS` inside a dirty xact, i.e. a
+    /// `CommandCounterIncrement`. A relation's layout cannot move except at
+    /// one, so these are exactly the sample points a mid-xact descriptor
+    /// needs. What capture reads is the writing transaction's own
+    /// uncommitted rows: xid-scoped and speculative until its commit
+    Command {
+        /// (Sub)xid that logged the invalidations
+        writer_xid: u32,
+    },
+}
+
+/// One catalog boundary: what descriptor capture needs to enumerate the
+/// affected relations. Built by the filter at the commit record, or at a
+/// command boundary inside a catalog-dirty xact.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BoundaryInfo {
     /// Xid the xact's buffered work drains under: prepared xid for
-    /// COMMIT/ABORT PREPARED (header xid is 0 there), else header xid
+    /// COMMIT/ABORT PREPARED (header xid is 0 there), else header xid. At a
+    /// command boundary, the dirty tree's root as the pump knows it
     pub drain_xid: u32,
     /// First catalog-touching record LSN across the xact tree; valid_from
     /// fallback when no per-oid source is sharper
     pub tree_first_touch: u64,
     /// Dirty-tracker pg_class decodes ∪ commit relcache invals (local db,
-    /// user oids)
+    /// user oids). At a command boundary, that command's relcache invals:
+    /// a relation absent from them did not change shape at this boundary
     pub oids: Vec<AffectedOid>,
     /// relId==0 whole-relcache inval, or a write to a descriptor-feeding
     /// catalog whose changes relcache invals don't enumerate (pg_namespace:
     /// namespace rename changes every embedded namespace text with zero
     /// per-relation invals)
     pub capture_all: bool,
+    pub kind: BoundaryKind,
+    /// Tree members the filter drained at this commit, so promotion finds
+    /// pending state a late `XLOG_XACT_ASSIGNMENT` left keyed under a
+    /// subxid. Empty at a command boundary
+    pub members: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +132,10 @@ pub struct Record<'a> {
     pub catalog_boundary: bool,
     /// Capture input for a catalog boundary; `Some` iff `catalog_boundary`
     pub boundary_info: Option<std::sync::Arc<BoundaryInfo>>,
+    /// Abort of a catalog-dirty tree: every member the filter drained.
+    /// Pending catalog slots those xids wrote drop here, on the pump, ahead
+    /// of any later boundary that would promote them into the durable log
+    pub aborted_tree: Option<std::sync::Arc<Vec<u32>>>,
     /// Record's xact tree wrote catalog state earlier in the stream:
     /// decoder holds raw instead of decoding with live descriptors,
     /// commit-time capture publishes the layout this tuple was written
@@ -199,6 +229,7 @@ impl RecordSink for CollectingRecordSink {
                 route: record.route,
                 catalog_boundary: record.catalog_boundary,
                 boundary_info: record.boundary_info.clone(),
+                aborted_tree: record.aborted_tree.clone(),
                 defer_catalog_decode: record.defer_catalog_decode,
             });
             Ok(())

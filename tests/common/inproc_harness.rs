@@ -334,12 +334,16 @@ pub struct BootstrappedClusters {
     pub shadow_filter_dir: PathBuf,
 }
 
-/// Build tree holding `walshadow.so`, `None` when pgext hasn't been built.
-/// Tests needing the decode oracle skip on `None` rather than fail; nothing
-/// installs the module system-wide.
-pub fn pgext_dir() -> Option<PathBuf> {
+/// Build tree holding `walshadow.so`, fed to shadow as `dynamic_library_path`.
+/// Shadow preloads the bridge worker, so an unbuilt module is a failure, not a
+/// reason to skip
+pub fn pgext_dir() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
-    dir.join("walshadow.so").is_file().then_some(dir)
+    assert!(
+        dir.join("walshadow.so").is_file(),
+        "pgext/walshadow.so missing, run `make -C pgext`"
+    );
+    dir
 }
 
 pub async fn bootstrap_clusters(
@@ -364,7 +368,7 @@ pub async fn bootstrap_clusters(
 }
 
 /// Same, plus the preloaded bridge worker on shadow. Reach its socket through
-/// [`Shadow::bridge_socket`]. Callers must have checked [`pgext_dir`].
+/// [`Shadow::bridge_socket`].
 pub async fn bootstrap_clusters_with_bridge(
     tmp: &tempfile::TempDir,
     schema_sql: &str,
@@ -448,7 +452,7 @@ async fn bootstrap_clusters_inner(
     shadow_cfg.ctl_timeout = Duration::from_secs(60);
     if with_bridge {
         let mut bridge = walshadow::shadow::BridgeConf::in_dir(&shadow_sock);
-        bridge.library_dir = pgext_dir();
+        bridge.library_dir = Some(pgext_dir());
         // basebackup-cloned conf, so append rather than materialize
         let conf = shadow_data.join("postgresql.conf");
         fs::OpenOptions::new()
@@ -565,13 +569,19 @@ impl RecordSink for PipelineSinks {
         Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if let (Some(capture), Some(info)) = (&self.capture, &record.boundary_info) {
+            if let (Some(capture), Some(members)) = (&self.capture, &record.aborted_tree) {
+                capture.forget_aborted(members);
+            }
+            if let (Some(capture), Some(info)) = (&self.capture, &record.boundary_info)
+                && capture.admits(info, record.next_lsn)
+            {
                 self.catalog
                     .lock()
                     .await
                     .wait_for_replay(record.next_lsn)
                     .await
                     .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
+                capture.charge_hold(info, std::time::Duration::ZERO);
                 capture
                     .capture_boundary(info, record.source_lsn, record.next_lsn)
                     .await?;
@@ -809,6 +819,8 @@ async fn build_pipeline_inner(
     }
 
     tune(&mut emitter_cfg);
+    let pending_cfg = emitter_cfg.pending_capture;
+    let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
 
     // SIGHUP-reloadable mapping shared by the DDL applicator + decode pool.
     let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
@@ -879,6 +891,7 @@ async fn build_pipeline_inner(
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
         log: desc_log.clone(),
+        pending: pending_catalog.clone(),
         stats: stats.clone(),
         span_registry: None,
         config_resolver: Some(config_resolver.clone()),
@@ -911,6 +924,8 @@ async fn build_pipeline_inner(
         catalog.clone(),
         xact_buffer.clone(),
         smgr_markers,
+        pending_catalog.clone(),
+        pending_cfg,
     );
     let sinks = PipelineSinks {
         metrics: MetricsRecordSink::default(),

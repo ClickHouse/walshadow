@@ -11,6 +11,7 @@ surface; promote into `plans/` once built
 * [runtime_config_from_pg.md](runtime_config_from_pg.md) — source-PG runtime config: signal channel, net-new knobs, degraded-mode fallback, resolver observability (resolver substrate + per-table opt-in + column overrides in [config.md](../config.md))
 * [shadow_schema_export.md](shadow_schema_export.md) — shadow PG as schema-only catalog donor to third-party clusters
 * [shadow_toast.md](shadow_toast.md) — shadow-backed TOAST chunk store with WAL replay and crash-safe reclamation fencing
+* [failover.md](failover.md) — lossless source continuation across descendant PostgreSQL timelines: historic WAL drain, fork-segment verification, shadow handoff, lineage-aware restart
 * [sync_commit_witness.md](sync_commit_witness.md) — walshadow as RPO=0 durability standby
 * [two_phase_commit.md](two_phase_commit.md) — `XLOG_XACT_PREPARE` handling and gxid-keyed buffer
 * [ch_bounce_recovery.md](ch_bounce_recovery.md) — deeper re-emit-from-spill on retry-budget exhaustion

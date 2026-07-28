@@ -474,8 +474,6 @@ fallback remains continuously exercised
 
 ## Promotion criteria
 
-Do not leave phase open-ended. Promote from future plan when:
-
 1. pending command-boundary capture and commit promotion are landed
 2. byte-hold path has production metrics establishing boundary frequency and
    stall cost

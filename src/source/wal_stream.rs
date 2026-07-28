@@ -327,6 +327,7 @@ impl WalStream {
                 route,
                 catalog_boundary: verdict.catalog_boundary,
                 boundary_info: verdict.boundary,
+                aborted_tree: verdict.aborted_tree,
                 defer_catalog_decode: verdict.defer_catalog_decode,
             };
             if let Some(sink) = record_sink.as_deref_mut() {

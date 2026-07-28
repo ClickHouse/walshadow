@@ -19,14 +19,14 @@ use std::fs;
 use std::io::Write;
 use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
-use walshadow::shadow::Shadow;
+use walshadow::shadow::{BridgeConf, Shadow};
 
 /// ClickHouse server subprocess wrapper shared by the pipeline DDL
 /// drill, both bootstrap-to-CH drills, and the
@@ -177,6 +177,40 @@ pub fn pg_basebackup_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`.
+/// Daemon dials the bridge worker at boot, so an unbuilt module is a failure,
+/// not a reason to skip
+pub fn pgext_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
+    assert!(
+        dir.join("walshadow.so").is_file(),
+        "pgext/walshadow.so missing, run `make -C pgext`"
+    );
+    dir
+}
+
+/// Preload the bridge worker on a test-owned shadow, listening where the
+/// daemon dials by default (`<shadow-socket-dir>/walshadow-bridge.sock`).
+/// Appends, so it stacks on the retargeting each drill already did.
+/// Daemon-owned shadows need `--bridge-lib-dir` instead, the daemon writes
+/// its own conf
+pub fn append_bridge_conf(
+    data_dir: &Path,
+    socket_dir: &Path,
+    dbname: &str,
+    lib_dir: PathBuf,
+) -> Result<()> {
+    let mut bridge = BridgeConf::in_dir(socket_dir);
+    bridge.library_dir = Some(lib_dir);
+    let conf = data_dir.join("postgresql.conf");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&conf)
+        .with_context(|| format!("open {}", conf.display()))?
+        .write_all(bridge.conf_text(dbname).as_bytes())?;
+    Ok(())
 }
 
 /// Write a `--ch-config` TOML mapping `<schema>.t (id int4, name text)`

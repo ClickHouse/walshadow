@@ -95,7 +95,9 @@ the operator's tolerance and parallelism doesn't close the gap
 
 Walshadow's physical slot lives on source primary. Source loss
 loses the slot; promoting source's standby loses walshadow's WAL
-position
+position. Lossless continuation across a descendant timeline is
+planned in [failover.md](failover.md); current implementation still
+requires one of options below
 
 Two operator options
 (overview.md pitfall #9):

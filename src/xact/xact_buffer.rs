@@ -47,6 +47,7 @@ use tracing::Instrument;
 use walrus::pg::walparser::{RelFileNode, RmId};
 
 use crate::catalog::desc_log::{Ambiguity, DescriptorLog, LookupResult};
+use crate::catalog::pending::{PendingCatalog, PendingSlot};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats};
 use crate::decode::heap_decoder::{
     ColumnValue, DecodedHeap, DescribedHeap, HeapOp, ToastPointer, decode_heap_record,
@@ -560,6 +561,11 @@ pub enum StashOutcome {
         /// Resolution happens at the commit's `next_lsn`, past every
         /// interval's end, so the fence is applied per record at fold
         fence: Vec<Arc<Ambiguity>>,
+        /// Shapes this xact's own command boundaries saw, ascending. A
+        /// record inside one decodes under it rather than under the
+        /// commit-time descriptor: same-xact `ALTER` then `INSERT` is two
+        /// layouts, and only the timeline separates them
+        pending: Vec<PendingSlot>,
     },
 }
 
@@ -582,9 +588,14 @@ pub struct StashResolution {
 /// `next_lsn`, which every interval published by this commit ends at, so
 /// each filenode's overlapping intervals ride the `Ordinary` outcome and
 /// the drain's `fold_raw_ordinary` fences the records actually inside one.
+///
+/// `pending` is this tree's command-boundary timeline, already consolidated
+/// under `top_xid` by capture. It rides the outcome for the same reason the
+/// fence does: one lookup at commit, one verdict per record at fold.
 pub async fn resolve_stash(
     buffer: &Arc<Mutex<XactBuffer>>,
     log: &DescriptorLog,
+    pending: &PendingCatalog,
     top_xid: u32,
     subxids: &[u32],
     next_lsn: u64,
@@ -648,6 +659,7 @@ pub async fn resolve_stash(
                         rel,
                         valid_from,
                         fence,
+                        pending: pending.chain(top_xid, rfn),
                     },
                 );
             }
@@ -1794,8 +1806,21 @@ impl MergedDrain {
                 rel,
                 valid_from,
                 fence,
+                pending,
             }) => {
-                let (rel, valid_from, fence) = (rel.clone(), *valid_from, fence.clone());
+                // Shape this record was written under: the xact's own
+                // timeline where it covers the position, the commit-time
+                // resolution otherwise (records before the xact's first
+                // command boundary were written under the pre-xact shape,
+                // which bias-early capture already lands there)
+                let (rel, valid_from) = pending
+                    .iter()
+                    .rev()
+                    .find(|s| s.valid_from <= raw.source_lsn)
+                    .map_or((rel.clone(), *valid_from), |s| {
+                        (s.desc.clone(), s.valid_from)
+                    });
+                let fence = fence.clone();
                 return self.fold_raw_ordinary(raw, rel, valid_from, &fence);
             }
             // No outcome = the filenode resolved Dropped / Retired /
@@ -3211,10 +3236,38 @@ pub(crate) mod raw_fixtures {
                 rel,
                 valid_from: 0x50,
                 fence,
+                pending: Vec::new(),
             },
         );
         b.pending_stash
             .insert(1, StashResolution { outcomes, stats });
+    }
+
+    /// `Ordinary` verdict carrying this xact's own command-boundary shapes,
+    /// as `resolve_stash` reads them off the pending catalog
+    pub(crate) fn inject_ordinary_pending(
+        b: &mut XactBuffer,
+        rfn: RelFileNode,
+        rel: Arc<crate::schema::RelDescriptor>,
+        pending: Vec<PendingSlot>,
+    ) {
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            rfn,
+            StashOutcome::Ordinary {
+                rel,
+                valid_from: 0x50,
+                fence: Vec::new(),
+                pending,
+            },
+        );
+        b.pending_stash.insert(
+            1,
+            StashResolution {
+                outcomes,
+                stats: None,
+            },
+        );
     }
 
     /// `[from, through)` interval over one filenode, the shape a physical
@@ -4404,6 +4457,7 @@ mod tests {
         resolve_stash(
             &buffer,
             &log,
+            &PendingCatalog::default(),
             1,
             &[],
             0x300,
@@ -4675,6 +4729,63 @@ mod tests {
         assert_eq!(
             batch.heaps[3].decoded.new.as_ref().unwrap().columns[0],
             Some(ColumnValue::Int4(9)),
+        );
+        drain.finish().await.unwrap();
+    }
+
+    /// Records fold under the shape their own position had: the xact's
+    /// command-boundary slot where one covers, the commit-time resolution
+    /// before the first boundary
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_records_fold_against_the_pending_timeline() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        // Commit shape has a second column the boundary shape lacks, so
+        // which descriptor decoded a record is visible in its column count
+        let boundary_shape = int4_descriptor(16417);
+        let mut commit_shape = (*boundary_shape).clone();
+        let mut extra = commit_shape.attributes[0].clone();
+        extra.attnum = 2;
+        extra.name = "added".into();
+        commit_shape.attributes.push(extra);
+        let rfn = boundary_shape.rfn;
+        b.stash_raw(1, multi_insert_raw(1, 100, 16417, &[1]))
+            .await
+            .unwrap();
+        b.stash_raw(1, multi_insert_raw(1, 300, 16417, &[2]))
+            .await
+            .unwrap();
+        inject_ordinary_pending(
+            &mut b,
+            rfn,
+            Arc::new(commit_shape),
+            vec![PendingSlot {
+                valid_from: 200,
+                writer_xid: 1,
+                desc: boundary_shape,
+            }],
+        );
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("one slice");
+        let shapes: Vec<(u64, usize, u64)> = batch
+            .heaps
+            .iter()
+            .map(|h| {
+                (
+                    h.decoded.source_lsn,
+                    h.descriptor.attributes.len(),
+                    h.descriptor_valid_from,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![(100, 2, 0x50), (300, 1, 200)],
+            "record before the first boundary keeps the commit resolution",
         );
         drain.finish().await.unwrap();
     }

@@ -1079,6 +1079,11 @@ async fn run_session(
         .await
         .context("shadow database oid")?;
     stream.filter_mut().set_inval_db(shadow_db_oid);
+    let pending_cfg = ch_config
+        .as_ref()
+        .map(|c| c.pending_capture)
+        .unwrap_or_default();
+    let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
     let smgr_markers = stream.filter_mut().smgr_markers();
     // A resumed manifest implies prior progress whose records the log must
     // cover; an empty/missing log there means it was lost — decode would
@@ -1429,6 +1434,7 @@ async fn run_session(
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             log: desc_log.clone(),
+            pending: pending_catalog.clone(),
             stats: stats.clone(),
             span_registry: span_registry.clone(),
             config_resolver: config_resolver.clone(),
@@ -1461,6 +1467,7 @@ async fn run_session(
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             log: desc_log.clone(),
+            pending: pending_catalog.clone(),
             stats: Arc::new(EmitterStats::default()),
             span_registry: span_registry.clone(),
             config_resolver: None,
@@ -1504,6 +1511,8 @@ async fn run_session(
         catalog.clone(),
         xact_buffer.clone(),
         smgr_markers,
+        pending_catalog.clone(),
+        pending_cfg,
     );
     let capture_stats = capture.stats_handle();
     let decoder_xact = BoundaryHoldSink::new(decoder_xact, boundary_gate).with_capture(capture);
@@ -2615,6 +2624,20 @@ async fn populate_metrics(
         desc_events_changed_total: capture.events_changed.load(Ordering::Relaxed),
         desc_events_dropped_total: capture.events_dropped.load(Ordering::Relaxed),
         descriptor_ambiguous_total: capture.ambiguities_published.load(Ordering::Relaxed),
+        pending_captures_total: capture.pending_captures.load(Ordering::Relaxed),
+        pending_rels_total: capture.pending_rels.load(Ordering::Relaxed),
+        pending_holds_total: capture.pending_holds.load(Ordering::Relaxed),
+        pending_hold_seconds_total: capture.pending_hold_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+        pending_entries_promoted_total: capture.pending_entries_promoted.load(Ordering::Relaxed),
+        pending_entries_dropped_abort_total: capture
+            .pending_entries_dropped_abort
+            .load(Ordering::Relaxed),
+        pending_ambiguities_suppressed_total: capture
+            .ambiguities_suppressed
+            .load(Ordering::Relaxed),
+        pending_degraded_by_reason: std::array::from_fn(|i| {
+            capture.pending_degraded[i].load(Ordering::Relaxed)
+        }),
         desc_log_entries: desc_log_gauges.0,
         desc_log_tail_bytes: desc_log_gauges.1,
         desc_log_batches: desc_log_gauges.2,

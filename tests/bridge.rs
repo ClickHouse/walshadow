@@ -1,7 +1,7 @@
 //! pgext bridge worker, end to end over its unix socket.
 //!
 //! Needs `walshadow.so` built in `pgext/` (`make -C pgext`) against the same
-//! PG major as `initdb` on PATH; skipped silently otherwise.
+//! PG major as `initdb` on PATH; fails when it isn't there.
 //!
 //! Drills cover bridge protocol and lifecycle:
 //!
@@ -70,10 +70,15 @@ fn pg_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Build tree holding `walshadow.so`, fed to shadow as `dynamic_library_path`
-fn pgext_dir() -> Option<PathBuf> {
+/// Build tree holding `walshadow.so`, fed to shadow as `dynamic_library_path`.
+/// Module is not optional, so an unbuilt tree fails rather than skips
+fn pgext_dir() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
-    dir.join("walshadow.so").is_file().then_some(dir)
+    assert!(
+        dir.join("walshadow.so").is_file(),
+        "pgext/walshadow.so missing, run `make -C pgext`"
+    );
+    dir
 }
 
 struct StopOnDrop {
@@ -86,9 +91,8 @@ impl Drop for StopOnDrop {
     }
 }
 
-/// `None` skips the caller: no PG, or no extension build
-fn start_pg(tmp: &tempfile::TempDir, port: u16) -> Option<StopOnDrop> {
-    let lib_dir = pgext_dir()?;
+fn start_pg(tmp: &tempfile::TempDir, port: u16) -> StopOnDrop {
+    let lib_dir = pgext_dir();
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
     cfg.port = port;
     cfg.socket_dir = tmp.path().join("sock");
@@ -103,7 +107,7 @@ fn start_pg(tmp: &tempfile::TempDir, port: u16) -> Option<StopOnDrop> {
     sh.initdb().expect("initdb");
     sh.write_base_conf().expect("write_base_conf");
     sh.start().expect("start");
-    Some(StopOnDrop { sh })
+    StopOnDrop { sh }
 }
 
 async fn dial(sh: &Shadow) -> Bridge {
@@ -216,10 +220,7 @@ async fn bridge_hello_and_decode_batch() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, BASE_PORT) else {
-        eprintln!("skip: pgext/walshadow.so not built");
-        return;
-    };
+    let guard = start_pg(&tmp, BASE_PORT);
     let bridge = dial(&guard.sh).await;
 
     let info = bridge.info().expect("hello");
@@ -272,10 +273,7 @@ async fn bridge_decode_matches_typoutput() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, BASE_PORT + 5) else {
-        eprintln!("skip: pgext/walshadow.so not built");
-        return;
-    };
+    let guard = start_pg(&tmp, BASE_PORT + 5);
     let bridge = dial(&guard.sh).await;
     let sql = connect_sql(&guard.sh).await;
 
@@ -373,10 +371,7 @@ async fn bridge_scans_uncommitted_ddl() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, BASE_PORT + 1) else {
-        eprintln!("skip: pgext/walshadow.so not built");
-        return;
-    };
+    let guard = start_pg(&tmp, BASE_PORT + 1);
     let bridge = dial(&guard.sh).await;
 
     let setup = connect_sql(&guard.sh).await;
@@ -574,10 +569,7 @@ async fn bridge_reconnects_after_worker_exit() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, BASE_PORT + 2) else {
-        eprintln!("skip: pgext/walshadow.so not built");
-        return;
-    };
+    let guard = start_pg(&tmp, BASE_PORT + 2);
     let bridge = dial(&guard.sh).await;
     assert_eq!(bridge.replay_lsn().await.expect("before"), 0);
 
@@ -657,10 +649,7 @@ async fn bridge_drops_bad_frames_per_connection() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, BASE_PORT + 3) else {
-        eprintln!("skip: pgext/walshadow.so not built");
-        return;
-    };
+    let guard = start_pg(&tmp, BASE_PORT + 3);
     let bridge = dial(&guard.sh).await;
     let path = guard.sh.bridge_socket().unwrap().to_path_buf();
 
@@ -701,10 +690,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, BASE_PORT + 6) else {
-        eprintln!("skip: pgext/walshadow.so not built");
-        return;
-    };
+    let guard = start_pg(&tmp, BASE_PORT + 6);
     let bridge = Arc::new(dial(&guard.sh).await);
     let mut cat = open_catalog(&guard.sh, bridge).await;
     let (_stand_in, mut mirror) =
@@ -863,10 +849,7 @@ async fn bridge_error_frames_stay_parseable() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, BASE_PORT + 4) else {
-        eprintln!("skip: pgext/walshadow.so not built");
-        return;
-    };
+    let guard = start_pg(&tmp, BASE_PORT + 4);
     let bridge = dial(&guard.sh).await;
     let path = guard.sh.bridge_socket().unwrap().to_path_buf();
     let mut raw = UnixStream::connect(&path).expect("raw connect");
@@ -879,9 +862,8 @@ async fn bridge_error_frames_stay_parseable() {
     assert!(msg.contains("opcode"), "{msg}");
 
     // Trailing request bytes mean the peer framed a different request
-    let mut hello = 5u32.to_be_bytes().to_vec();
+    let mut hello = 1u32.to_be_bytes().to_vec();
     hello.push(0x01);
-    hello.extend_from_slice(&PROTO_VERSION.to_be_bytes());
     raw.write_all(&hello).expect("write hello");
     let body = read_frame(&mut raw);
     assert_eq!(body[0], 0, "clean hello answers ok: {body:?}");
@@ -961,10 +943,7 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, BASE_PORT + 7) else {
-        eprintln!("skip: pgext/walshadow.so not built");
-        return;
-    };
+    let guard = start_pg(&tmp, BASE_PORT + 7);
     let setup = connect_sql(&guard.sh).await;
     setup
         .batch_execute("CREATE TABLE t (id int PRIMARY KEY, a text)")

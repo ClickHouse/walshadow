@@ -62,7 +62,7 @@ pub(crate) struct DirtyTree {
 }
 
 impl DirtyTree {
-    fn root(&self, xid: u32) -> u32 {
+    pub(crate) fn root(&self, xid: u32) -> u32 {
         self.top_by_xid.get(&xid).copied().unwrap_or(xid)
     }
 
@@ -100,21 +100,22 @@ impl DirtyTree {
     }
 
     /// Xact end for `header_xid`'s tree: drop every known member's state
-    /// and link, return the merge (commit boundary input; abort discards).
-    /// Commit records list all committed children
-    /// (`xactGetCommittedChildren`); aborted children already dropped their
-    /// own state at their abort records. Linked-member sweep clears links
-    /// the payload cannot name
+    /// and link, return the merge plus the members it covered (commit
+    /// boundary input; abort discards the state but still names the members,
+    /// whose speculative catalog slots drop with them). Commit records list
+    /// all committed children (`xactGetCommittedChildren`); aborted children
+    /// already dropped their own state at their abort records.
+    /// Linked-member sweep clears links the payload cannot name
     pub(crate) fn drain_tree(
         &mut self,
         header_xid: u32,
         twophase_xid: Option<u32>,
         subxacts: &[u32],
-    ) -> Option<DirtyState> {
+    ) -> (Option<DirtyState>, Vec<u32>) {
         // Every commit/abort record lands here; clean streams keep both maps
         // empty, so skip the member walk entirely
         if self.state_by_xid.is_empty() && self.top_by_xid.is_empty() {
-            return None;
+            return (None, Vec::new());
         }
         let roots = [Some(header_xid), twophase_xid];
         let mut members: Vec<u32> = roots
@@ -130,7 +131,12 @@ impl DirtyTree {
                 .map(|(x, _)| *x),
         );
         let mut merged: Option<DirtyState> = None;
+        let mut drained: Vec<u32> = Vec::new();
         for x in members {
+            if drained.contains(&x) {
+                continue;
+            }
+            drained.push(x);
             let Some(state) = self.state_by_xid.remove(&x) else {
                 self.top_by_xid.remove(&x);
                 continue;
@@ -143,7 +149,7 @@ impl DirtyTree {
                 Some(m) => m.absorb(state),
             }
         }
-        merged
+        (merged, drained)
     }
 }
 
@@ -207,11 +213,12 @@ mod tests {
         t.touch(102, 20);
         t.touch(100, 30);
         // ROLLBACK TO SAVEPOINT: abort record for 101 alone
-        let dropped = t.drain_tree(101, None, &[]);
+        let (dropped, members) = t.drain_tree(101, None, &[]);
         assert_eq!(dropped.expect("state").first_touch, 10);
+        assert_eq!(members, vec![101]);
         assert!(t.is_dirty(100), "sibling + top dirt survives");
         assert!(!t.is_dirty(101), "aborted child link cleared");
-        let merged = t.drain_tree(100, None, &[102]).expect("merge");
+        let merged = t.drain_tree(100, None, &[102]).0.expect("merge");
         assert_eq!(merged.first_touch, 20);
         assert!(!t.is_dirty(100));
         assert!(!t.is_dirty(102));
@@ -225,7 +232,7 @@ mod tests {
         s.oids.insert(16400, 50);
         s.oids.insert(16500, 60);
         s.unenumerated = true;
-        let m = t.drain_tree(7, None, &[101]).expect("merge");
+        let m = t.drain_tree(7, None, &[101]).0.expect("merge");
         assert_eq!(m.first_touch, 50);
         assert!(m.unenumerated);
         assert_eq!(m.oids[&16400], 50, "min lsn wins");
@@ -238,7 +245,9 @@ mod tests {
         t.link(101, 100);
         t.touch(101, 10);
         // Payload names no children; linked sweep still clears the tree
-        let m = t.drain_tree(100, None, &[]).expect("swept state");
+        let (m, members) = t.drain_tree(100, None, &[]);
+        let m = m.expect("swept state");
+        assert_eq!(members, vec![100, 101], "linked sweep names the member");
         assert_eq!(m.first_touch, 10);
         assert!(!t.is_dirty(101));
         assert!(t.top_by_xid.is_empty(), "link table drained");
@@ -250,7 +259,7 @@ mod tests {
         t.link(301, 300);
         t.touch(301, 10);
         // COMMIT PREPARED: header xid differs from prepared tree root
-        let m = t.drain_tree(0, Some(300), &[]).expect("prepared tree");
+        let m = t.drain_tree(0, Some(300), &[]).0.expect("prepared tree");
         assert_eq!(m.first_touch, 10);
         assert!(!t.is_dirty(300));
         assert!(!t.is_dirty(301));

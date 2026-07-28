@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use crate::record::{Record, RecordSink, SinkError};
+use crate::record::{BoundaryKind, Record, RecordSink, SinkError};
 use crate::source::catalog_capture::CatalogCapture;
 use crate::source::queueing_record_sink::QueueingRecordSink;
 use crate::source::shadow_stream::ShadowStreamState;
@@ -153,6 +153,17 @@ impl CatalogBoundaryGate {
 /// descriptors against the caught-up shadow, then forward the commit record
 /// — so by the time the worker drains the xact, its schema events are
 /// already attached and the log batch is durable.
+///
+/// A command boundary
+/// ([`BoundaryKind::Command`]) reuses
+/// that sequence unchanged, and capture reads the transaction's own
+/// uncommitted rows there. Capture declines the ones its cost controls rule
+/// out, before the park — a boundary nothing will read is a stall for
+/// nothing.
+///
+/// Aborts drop their speculative slots here rather than at the drain: the
+/// pump runs ahead of the decoder, so a later commit could otherwise promote
+/// a rolled-back subtree's shapes into the durable log.
 pub struct BoundaryHoldSink {
     pub inner: QueueingRecordSink,
     pub gate: CatalogBoundaryGate,
@@ -197,7 +208,21 @@ impl RecordSink for BoundaryHoldSink {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
+            if let (Some(capture), Some(members)) = (&self.capture, &record.aborted_tree) {
+                capture.forget_aborted(members);
+            }
             if !record.catalog_boundary {
+                return self.inner.on_record(record).await;
+            }
+            let boundary = record.boundary_info.clone();
+            let park = match (&self.capture, &boundary) {
+                (Some(capture), Some(info)) => capture.admits(info, record.next_lsn),
+                // Hold-only harness: a command boundary nobody reads is a
+                // stall for nothing
+                (None, Some(info)) => matches!(info.kind, BoundaryKind::Commit),
+                _ => true,
+            };
+            if !park {
                 return self.inner.on_record(record).await;
             }
             // Ship + flush the xact's predecessors before parking; the
@@ -205,6 +230,7 @@ impl RecordSink for BoundaryHoldSink {
             // drain finds events already attached
             self.inner.flush().await?;
             let inner = &self.inner;
+            let parked = Instant::now();
             if let Err(hold_err) = self
                 .gate
                 .hold(record.source_lsn, record.next_lsn, || inner.worker_alive())
@@ -215,7 +241,8 @@ impl RecordSink for BoundaryHoldSink {
                 self.inner.flush().await?;
                 return Err(hold_err);
             }
-            if let (Some(capture), Some(info)) = (&self.capture, &record.boundary_info) {
+            if let (Some(capture), Some(info)) = (&self.capture, &boundary) {
+                capture.charge_hold(info, parked.elapsed());
                 capture
                     .capture_boundary(info, record.source_lsn, record.next_lsn)
                     .await?;
@@ -391,6 +418,29 @@ mod tests {
         for _ in 0..8 {
             sink.on_record(&rec).await.expect("no park");
         }
+        sink.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn sink_never_parks_at_a_command_boundary_nobody_captures() {
+        // Hold-only harness: the pending timeline is what a command
+        // boundary exists for, so with no capture there is nothing to wait
+        // on. No walreceiver here, so a park would time out
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
+        let gate = gate_with(state(), Duration::from_millis(10));
+        let mut sink = BoundaryHoldSink::new(q, gate);
+        let rec = Record {
+            source_lsn: 0x1F00,
+            next_lsn: 0x2000,
+            catalog_boundary: true,
+            boundary_info: Some(Arc::new(crate::record::BoundaryInfo {
+                kind: BoundaryKind::Command { writer_xid: 7 },
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        sink.on_record(&rec).await.expect("no park");
+        assert_eq!(sink.gate.stats.failures.load(Ordering::Relaxed), 0);
         sink.close().await.expect("close");
     }
 

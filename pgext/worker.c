@@ -27,6 +27,7 @@
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bswap.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
@@ -445,7 +446,6 @@ ws_dispatch(StringInfo req, StringInfo resp)
 		switch (op)
 		{
 			case WS_OP_HELLO:
-				(void) pq_getmsgint(req, 4);	/* client proto, advisory */
 				pq_sendbyte(resp, WS_STATUS_OK);
 				pq_sendint32(resp, WS_PROTO_VERSION);
 				pq_sendint32(resp, WS_PROJECTION_VERSION);
@@ -507,7 +507,7 @@ ws_dispatch(StringInfo req, StringInfo resp)
 static bool
 ws_serve_request(pgsocket fd)
 {
-	char		hdr[4];
+	uint32		hdr;
 	uint32		len;
 	/* enlargeStringInfo ERRORs at MaxAllocSize, and that would happen outside
 	 * the request catch; reject before allocating */
@@ -517,12 +517,9 @@ ws_serve_request(pgsocket fd)
 	MemoryContext oldctx;
 	bool		ok = false;
 
-	if (!ws_read_exact(fd, hdr, sizeof(hdr)))
+	if (!ws_read_exact(fd, (char *) &hdr, sizeof(hdr)))
 		return false;
-	len = ((uint32) (unsigned char) hdr[0] << 24) |
-		((uint32) (unsigned char) hdr[1] << 16) |
-		((uint32) (unsigned char) hdr[2] << 8) |
-		((uint32) (unsigned char) hdr[3]);
+	len = pg_ntoh32(hdr);
 
 	if (len < 1 || (Size) len > max_len)
 	{
@@ -545,11 +542,8 @@ ws_serve_request(pgsocket fd)
 		initStringInfo(&resp);
 		ws_dispatch(&req, &resp);
 
-		hdr[0] = (char) ((uint32) resp.len >> 24);
-		hdr[1] = (char) ((uint32) resp.len >> 16);
-		hdr[2] = (char) ((uint32) resp.len >> 8);
-		hdr[3] = (char) resp.len;
-		ok = ws_write_all(fd, hdr, sizeof(hdr)) &&
+		hdr = pg_hton32((uint32) resp.len);
+		ok = ws_write_all(fd, (char *) &hdr, sizeof(hdr)) &&
 			ws_write_all(fd, resp.data, (size_t) resp.len);
 	}
 
@@ -622,8 +616,7 @@ static void
 ws_drop_conn(pgsocket *conns, int *nconns, int idx)
 {
 	closesocket(conns[idx]);
-	conns[idx] = conns[*nconns - 1];
-	(*nconns)--;
+	conns[idx] = conns[--*nconns];
 }
 
 static void

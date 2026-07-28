@@ -50,9 +50,11 @@ fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     cfg.ctl_timeout = Duration::from_secs(30);
     let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
     let build_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
-    if build_dir.join("walshadow.so").is_file() {
-        bridge.library_dir = Some(build_dir);
-    }
+    assert!(
+        build_dir.join("walshadow.so").is_file(),
+        "pgext/walshadow.so missing, run `make -C pgext`"
+    );
+    bridge.library_dir = Some(build_dir);
     cfg.bridge = Some(bridge);
     std::fs::create_dir_all(&cfg.filter_out_dir).unwrap();
     std::fs::create_dir_all(&cfg.socket_dir).unwrap();
@@ -385,6 +387,7 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
         route: Route::ToDecoder,
         catalog_boundary: false,
         boundary_info: None,
+        aborted_tree: None,
         defer_catalog_decode: true,
     };
     sink.on_record(&record).await.unwrap();
@@ -402,9 +405,17 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
         "defer path, not marker path"
     );
     let stats = Arc::new(EmitterStats::default());
-    resolve_stash(&buffer, &log, 77, &[], 1000, stats.clone())
-        .await
-        .unwrap();
+    resolve_stash(
+        &buffer,
+        &log,
+        &Default::default(),
+        77,
+        &[],
+        1000,
+        stats.clone(),
+    )
+    .await
+    .unwrap();
     let mut b = buffer.lock().await;
     let err = drain_all(&mut b, &ToastResolver::disabled(), 77, 0, 1000, &[])
         .await

@@ -192,6 +192,23 @@ pub struct MetricsSnapshot {
     pub desc_events_added_total: u64,
     pub desc_events_changed_total: u64,
     pub desc_events_dropped_total: u64,
+    /// Command boundaries read into the pending timeline
+    pub pending_captures_total: u64,
+    /// Descriptors read across those boundaries
+    pub pending_rels_total: u64,
+    /// Publication holds taken for a command boundary
+    pub pending_holds_total: u64,
+    /// Cumulative seconds parked in command-boundary holds
+    pub pending_hold_seconds_total: f64,
+    /// Pending slots folded into a commit batch
+    pub pending_entries_promoted_total: u64,
+    /// Pending slots dropped with an aborted tree
+    pub pending_entries_dropped_abort_total: u64,
+    /// Ambiguity intervals the timeline covered end to end
+    pub pending_ambiguities_suppressed_total: u64,
+    /// Transactions degraded to commit-time capture, by
+    /// [`DegradeReason::ALL`](crate::catalog::pending::DegradeReason::ALL)
+    pub pending_degraded_by_reason: [u64; 5],
     /// Descriptor-log index entries / tail bytes / batches
     pub desc_log_entries: u64,
     pub desc_log_tail_bytes: u64,
@@ -787,6 +804,42 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             snap.desc_events_dropped_total,
         ),
         (
+            "walshadow_pending_captures_total",
+            "Command boundaries read into the pending catalog timeline.",
+            "counter",
+            snap.pending_captures_total,
+        ),
+        (
+            "walshadow_pending_rels_total",
+            "Descriptors read across command boundaries.",
+            "counter",
+            snap.pending_rels_total,
+        ),
+        (
+            "walshadow_pending_holds_total",
+            "Publication holds taken for a command boundary.",
+            "counter",
+            snap.pending_holds_total,
+        ),
+        (
+            "walshadow_pending_entries_promoted_total",
+            "Pending slots folded into a commit's descriptor-log batch.",
+            "counter",
+            snap.pending_entries_promoted_total,
+        ),
+        (
+            "walshadow_pending_entries_dropped_abort_total",
+            "Pending slots dropped with an aborted transaction tree.",
+            "counter",
+            snap.pending_entries_dropped_abort_total,
+        ),
+        (
+            "walshadow_pending_ambiguities_suppressed_total",
+            "Ambiguity intervals the pending timeline covered end to end.",
+            "counter",
+            snap.pending_ambiguities_suppressed_total,
+        ),
+        (
             "walshadow_desc_log_entries",
             "Descriptor-log index entries resident.",
             "gauge",
@@ -1062,6 +1115,27 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     .unwrap();
     writeln!(s, "# TYPE {name} counter").unwrap();
     writeln!(s, "{name} {:.3}", snap.catalog_boundary_hold_seconds_total).unwrap();
+    let name = "walshadow_pending_hold_seconds_total";
+    writeln!(
+        s,
+        "# HELP {name} Cumulative seconds the pump parked in command-boundary holds.",
+    )
+    .unwrap();
+    writeln!(s, "# TYPE {name} counter").unwrap();
+    writeln!(s, "{name} {:.3}", snap.pending_hold_seconds_total).unwrap();
+    let name = "walshadow_pending_degraded_total";
+    writeln!(
+        s,
+        "# HELP {name} Transactions degraded to commit-time capture, by reason.",
+    )
+    .unwrap();
+    writeln!(s, "# TYPE {name} counter").unwrap();
+    for (reason, v) in crate::catalog::pending::DegradeReason::ALL
+        .iter()
+        .zip(snap.pending_degraded_by_reason)
+    {
+        writeln!(s, "{name}{{reason=\"{}\"}} {v}", reason.label()).unwrap();
+    }
     let name = "walshadow_desc_capture_seconds_total";
     writeln!(
         s,

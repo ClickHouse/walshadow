@@ -115,6 +115,8 @@ pub struct EmitterConfig {
     /// `[stream] paused`: pump idles (stops consuming source WAL) when true.
     /// Live via reload.
     pub paused: bool,
+    /// Pending capture cost controls, boot-only
+    pub pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
     /// Per-namespace defaults keyed on PG schema name; per-table
     /// entries in `tables` win for the relation they name
     pub namespaces: HashMap<String, NamespaceMapping>,
@@ -217,6 +219,7 @@ impl Default for EmitterConfig {
             table_initial_loads: HashMap::new(),
             table_opt_ins: HashMap::new(),
             paused: false,
+            pending_capture: Default::default(),
             namespaces: HashMap::new(),
             drop_table_strategy: "retain".into(),
             retry: RetryConfig::default(),
@@ -521,13 +524,20 @@ impl EmitterConfig {
             // Empty string == omitted == overlay disabled.
             out.runtime_config_schema = Some(schema.into());
         }
-        if let Some(v) = root
-            .get("stream")
-            .and_then(Value::as_table)
-            .and_then(|t| t.get("paused"))
-            .and_then(Value::as_bool)
-        {
-            out.paused = v;
+        if let Some(st) = root.get("stream").and_then(Value::as_table) {
+            if let Some(v) = st.get("paused").and_then(Value::as_bool) {
+                out.paused = v;
+            }
+            if let Some(v) = st
+                .get("pending_max_boundaries_per_xact")
+                .and_then(Value::as_integer)
+            {
+                out.pending_capture.max_boundaries_per_xact = u32::try_from(v).unwrap_or(u32::MAX);
+            }
+            if let Some(v) = st.get("pending_max_hold_ms").and_then(Value::as_integer) {
+                out.pending_capture.max_hold_per_xact =
+                    Duration::from_millis(u64::try_from(v).unwrap_or(0));
+            }
         }
         if let Some(src) = root.get("source").and_then(Value::as_table)
             && let Some(slot) = src.get("slot").and_then(Value::as_str)

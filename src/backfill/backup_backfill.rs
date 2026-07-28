@@ -850,6 +850,7 @@ async fn replay_gap(
         decoder: BufferingDecoderSink::new(ctx.log.clone(), buffer.clone()),
         buffer,
         log: ctx.log.clone(),
+        pending: Default::default(),
         subxact_tracker: SubxactTracker::new(),
         resolver,
         filter_rfns,
@@ -889,6 +890,9 @@ struct ReplaySink {
     decoder: BufferingDecoderSink,
     buffer: Arc<Mutex<XactBuffer>>,
     log: Arc<crate::catalog::desc_log::DescriptorLog>,
+    /// Always empty: gap replay reads committed history, where no
+    /// transaction is in flight to have speculative catalog state
+    pending: crate::catalog::pending::PendingCatalog,
     subxact_tracker: SubxactTracker,
     resolver: ToastResolver,
     filter_rfns: HashSet<(Oid, Oid)>,
@@ -933,6 +937,7 @@ impl ReplaySink {
         resolve_stash(
             &self.buffer,
             &self.log,
+            &self.pending,
             xid,
             &payload.subxacts,
             record.next_lsn,

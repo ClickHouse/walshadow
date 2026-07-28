@@ -287,6 +287,9 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
         tracing::warn!("skip: no pgbench binary on PATH");
         return;
     }
+    // Shadow is daemon-owned, so the daemon writes the preload line itself and
+    // only needs to be told where the un-installed module sits
+    let pgext_dir = fx::pgext_dir();
 
     let tmp = tempfile::tempdir().unwrap();
 
@@ -399,6 +402,8 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
             &decoder_pool_arg,
             "--inserter-pool-size",
             &inserter_pool_arg,
+            "--bridge-lib-dir",
+            pgext_dir.to_str().unwrap(),
         ])
         // CI sets `WALSHADOW_ARTIFACT_DIR`; bump the daemon to trace
         // for `xact_buffer` so a stalled commit pipeline can be read
