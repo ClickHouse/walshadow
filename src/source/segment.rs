@@ -6,6 +6,8 @@
 //! record (header + body, no page-header interruptions); `byte_ranges` is where
 //! to write it back.
 
+use std::borrow::Cow;
+
 use smallvec::{SmallVec, smallvec};
 use walrus::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 
@@ -18,9 +20,10 @@ use crate::source::wal_page::{PAGE_SIZE, PageHeaderParse, align_up, parse_page_h
 pub type ByteRanges = SmallVec<[(usize, usize); 1]>;
 
 #[derive(Debug, Clone)]
-pub struct WalkedRecord {
-    /// Header + body, exactly `xl_tot_len` long
-    pub logical_bytes: Vec<u8>,
+pub struct WalkedRecord<'a> {
+    /// Header + body, exactly `xl_tot_len` long. Borrowed from the segment
+    /// unless the record straddles a page boundary, where the stitch owns
+    pub logical_bytes: Cow<'a, [u8]>,
     /// In-order file offset/length pairs the logical bytes occupy.
     /// `byte_ranges.iter().map(|(_, l)| l).sum() == logical_bytes.len()`
     pub byte_ranges: ByteRanges,
@@ -145,7 +148,7 @@ impl<'a> SegmentWalker<'a> {
     }
 
     /// `None` when the page remainder is zeros (end-of-valid-data marker).
-    fn try_read_record_on_page(&mut self) -> Result<Option<WalkedRecord>, WalkError> {
+    fn try_read_record_on_page(&mut self) -> Result<Option<WalkedRecord<'a>>, WalkError> {
         let page_end = self.page_start + PAGE_SIZE;
         self.cursor = align_up(self.cursor, X_LOG_RECORD_ALIGNMENT);
         if self.cursor >= page_end {
@@ -192,20 +195,21 @@ impl<'a> SegmentWalker<'a> {
 
         let take_this_page = total.min(avail);
         let range = (self.cursor, take_this_page);
-        let mut accumulated = Vec::with_capacity(total);
-        accumulated.extend_from_slice(&self.bytes[self.cursor..self.cursor + take_this_page]);
+        let on_page = &self.bytes[self.cursor..self.cursor + take_this_page];
 
         if take_this_page == total {
             self.cursor += take_this_page;
             return Ok(Some(WalkedRecord {
-                logical_bytes: accumulated,
+                logical_bytes: Cow::Borrowed(on_page),
                 byte_ranges: smallvec![range],
                 start_offset: range.0,
                 page_magic: self.page_magic,
             }));
         }
 
-        // Record continues onto next page
+        // Record continues onto next page: stitch owns across the boundary
+        let mut accumulated = Vec::with_capacity(total);
+        accumulated.extend_from_slice(on_page);
         self.pending = Some(Pending {
             start_offset: self.cursor,
             total_len: Some(xl_tot_len),
@@ -219,7 +223,7 @@ impl<'a> SegmentWalker<'a> {
 }
 
 impl<'a> Iterator for SegmentWalker<'a> {
-    type Item = Result<WalkedRecord, WalkError>;
+    type Item = Result<WalkedRecord<'a>, WalkError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -249,7 +253,7 @@ impl<'a> Iterator for SegmentWalker<'a> {
                 {
                     let p = self.pending.take().unwrap();
                     return Some(Ok(WalkedRecord {
-                        logical_bytes: p.accumulated,
+                        logical_bytes: Cow::Owned(p.accumulated),
                         byte_ranges: p.byte_ranges,
                         start_offset: p.start_offset,
                         page_magic: p.page_magic,

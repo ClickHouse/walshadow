@@ -219,7 +219,6 @@ async fn route_row(
             rel,
             route,
             committed,
-            permit: None,
             value_permit: value_permit.map(Arc::new),
         }))
         .await

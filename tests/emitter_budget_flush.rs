@@ -174,7 +174,6 @@ async fn budget_trips_seal_complete_inserts() {
                 rel: rel.clone(),
                 route: route.clone(),
                 committed: tuple(i, 0x1000 + i as u64, commit_lsn),
-                permit: None,
                 value_permit: None,
             }))
             .await

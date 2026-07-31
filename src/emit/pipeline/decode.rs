@@ -21,7 +21,7 @@ use crate::decode::heap_decoder::CommittedTuple;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
-use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
+use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
 use crate::emit::route::RoutedHeap;
 use crate::ops::oracle::{Oracle, resolve_pending_tuple};
 use crate::toast::{ChunkRefMap, ToastResolver};
@@ -39,7 +39,7 @@ pub struct DecodeJob {
     pub commit_lsn: u64,
     pub heaps: Vec<RoutedHeap>,
     pub chunks: Vec<Arc<ChunkGeneration>>,
-    /// Slice admission permit; shares ride every routed row through the
+    /// Slice admission permit; a share rides each routed chunk through the
     /// batcher to the in-flight insert, releasing post-insert-ack
     pub permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
@@ -72,9 +72,10 @@ pub const DECODE_CHUNK_BYTES: usize = 4 << 20;
 async fn route_chunk(
     msg_tx: &mpsc::Sender<BatcherMsg>,
     rows: Vec<RoutedRow>,
+    permit: Option<Arc<crate::budget::MemoryPermit>>,
 ) -> Result<(), String> {
     msg_tx
-        .send(BatcherMsg::Rows(rows))
+        .send(BatcherMsg::Rows(RowChunk { rows, permit }))
         .await
         .map_err(|_| "batcher channel closed".to_string())
 }
@@ -134,17 +135,16 @@ pub async fn decode_and_route(
             rel,
             route,
             committed,
-            permit: permit.clone(),
             value_permit,
         });
         routed += 1;
         if buf.len() >= ctx.chunk_rows || buf_bytes >= DECODE_CHUNK_BYTES {
-            route_chunk(&ctx.msg_tx, std::mem::take(&mut buf)).await?;
+            route_chunk(&ctx.msg_tx, std::mem::take(&mut buf), permit.clone()).await?;
             buf_bytes = 0;
         }
     }
     if !buf.is_empty() {
-        route_chunk(&ctx.msg_tx, buf).await?;
+        route_chunk(&ctx.msg_tx, buf, permit).await?;
     }
     ctx.stats
         .decode_rows_out

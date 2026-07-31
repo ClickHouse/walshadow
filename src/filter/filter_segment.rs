@@ -55,10 +55,9 @@ pub fn filter_segment(
     let mut entries = Vec::new();
     let mut parsed_records = Vec::new();
 
-    // Collect first: can't borrow `out` mutably while walking it immutably.
-    let walked: Vec<_> = SegmentWalker::new(source_bytes).collect::<Result<Vec<_>, _>>()?;
-
-    for record in walked {
+    // Walk reads `source_bytes`, rewrite targets `out`: disjoint buffers
+    for record in SegmentWalker::new(source_bytes) {
+        let record = record?;
         let parsed =
             parse_record_from_bytes(&record.logical_bytes, record.page_magic).map_err(|e| {
                 FilterSegmentError::Parse {
@@ -84,7 +83,7 @@ pub fn filter_segment(
             } else {
                 // Cross-page: page-fragmented in `out`; NOOP contiguous
                 // logical copy then scatter back.
-                let mut buf = record.logical_bytes.clone();
+                let mut buf = record.logical_bytes.to_vec();
                 noop_replace(&mut buf).map_err(|e| FilterSegmentError::Rewrite {
                     offset: record.start_offset,
                     source: e,
