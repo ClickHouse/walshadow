@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
@@ -138,17 +139,17 @@ impl ShadowStreamState {
     }
 
     pub fn aggregate(&self) -> AggregateLsn {
-        let active: Vec<&ConnState> = self.connections.values().filter(|c| !c.closing).collect();
-        if active.is_empty() {
-            return AggregateLsn {
-                dropped_total: self.dropped_total,
-                ..AggregateLsn::default()
-            };
-        }
+        let (active, min_flush, min_apply) = self
+            .connections
+            .values()
+            .filter(|c| !c.closing)
+            .fold((0usize, u64::MAX, u64::MAX), |(n, flush, apply), c| {
+                (n + 1, flush.min(c.flush_lsn), apply.min(c.apply_lsn))
+            });
         AggregateLsn {
-            min_flush_lsn: active.iter().map(|c| c.flush_lsn).min(),
-            min_apply_lsn: active.iter().map(|c| c.apply_lsn).min(),
-            active_connections: active.len(),
+            min_flush_lsn: (active > 0).then_some(min_flush),
+            min_apply_lsn: (active > 0).then_some(min_apply),
+            active_connections: active,
             dropped_total: self.dropped_total,
         }
     }
@@ -195,16 +196,14 @@ impl ShadowStreamState {
         self.server_wal_end = self.server_wal_end.max(end_lsn);
         self.retain_wire(start_lsn, bytes);
         let server_wal_end = self.server_wal_end;
-        let ids: Vec<u64> = self.connections.keys().copied().collect();
-        for id in ids {
-            let conn_offset = self
-                .connections
-                .get(&id)
-                .map(|c| c.dispatched_lsn)
-                .unwrap_or(start_lsn);
-            if end_lsn <= conn_offset {
-                continue;
-            }
+        // Snapshot: enqueue below takes `&mut self`, so the map can't stay borrowed
+        let targets: SmallVec<[(u64, u64); 4]> = self
+            .connections
+            .iter()
+            .filter(|(_, c)| c.dispatched_lsn < end_lsn)
+            .map(|(id, c)| (*id, c.dispatched_lsn))
+            .collect();
+        for (id, conn_offset) in targets {
             let skip = conn_offset.saturating_sub(start_lsn) as usize;
             let to_send = &bytes[skip.min(bytes.len())..];
             if to_send.is_empty() {

@@ -393,7 +393,6 @@ async fn emitter_tls_round_trip() {
             rel,
             route: walshadow::emit::route::RouteSnapshot::freeze(mapping, Arc::default(), false),
             committed: tuple,
-            permit: None,
             value_permit: None,
         }))
         .await

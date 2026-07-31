@@ -16,6 +16,7 @@
 //! carries the `(seq, rows)` counts the ack collector needs.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -40,14 +41,19 @@ pub struct RoutedRow {
     pub rel: Arc<RelDescriptor>,
     pub route: Arc<RouteSnapshot>,
     pub committed: CommittedTuple,
-    /// Admission permit share riding the row into batcher slabs and the
-    /// in-flight insert block; released post-insert-ack when the covering
-    /// `InsertBatch` drops
-    pub permit: Option<Arc<crate::budget::MemoryPermit>>,
-    /// Detoast leaf permit shrunk to this row's decoded TOAST bytes;
-    /// rides like `permit` so decoded values and their encoder slab copy
-    /// stay covered to insert ack
+    /// Detoast leaf permit shrunk to this row's decoded TOAST bytes, so
+    /// decoded values and their encoder slab copy stay covered to insert
+    /// ack. Per row, unlike the slice permit on [`RowChunk`]
     pub value_permit: Option<Arc<crate::budget::MemoryPermit>>,
+}
+
+/// One decode slice's rows under the admission permit covering them.
+/// Registers once per table the chunk touches, so neither the permit's
+/// refcount nor the holder list scales with row count.
+pub struct RowChunk {
+    pub rows: Vec<RoutedRow>,
+    /// Released post-insert-ack, when every covering `InsertBatch` drops
+    pub permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
 
 /// Per-column name + CH type string. Inserter parses `type_repr` into its
@@ -120,7 +126,7 @@ pub enum BatcherMsg {
     /// amortizing the per-row channel-send + cross-thread wakeup — the
     /// dominant coordination cost under sustained load. Rows may carry
     /// different `seq`s; batcher routes each independently.
-    Rows(Vec<RoutedRow>),
+    Rows(RowChunk),
     /// Seal every open table, push to inserters, reply. Barrier (drain before
     /// DDL/TRUNCATE) and shutdown.
     FlushAll(oneshot::Sender<()>),
@@ -177,15 +183,15 @@ pub(crate) fn spawn(
                     Some(BatcherMsg::Row(r)) => {
                         live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
-                        if let Err(e) = handle_row(&mut tables, &ctx, r).await {
+                        if let Err(e) = handle_row(&mut tables, &ctx, r, None).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
                     }
-                    Some(BatcherMsg::Rows(rows)) => {
+                    Some(BatcherMsg::Rows(chunk)) => {
                         live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
-                        if let Err(e) = handle_rows(&mut tables, &ctx, rows).await {
+                        if let Err(e) = handle_rows(&mut tables, &ctx, chunk).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }
@@ -263,10 +269,10 @@ async fn config_changed(rx: &mut Option<watch::Receiver<Arc<ResolvedConfig>>>) {
 async fn handle_rows(
     tables: &mut HashMap<RelName, Table>,
     ctx: &RowCtx<'_>,
-    rows: Vec<RoutedRow>,
+    chunk: RowChunk,
 ) -> Result<(), String> {
-    for row in rows {
-        handle_row(tables, ctx, row).await?;
+    for row in chunk.rows {
+        handle_row(tables, ctx, row, chunk.permit.as_ref()).await?;
     }
     Ok(())
 }
@@ -275,41 +281,46 @@ async fn handle_row(
     tables: &mut HashMap<RelName, Table>,
     ctx: &RowCtx<'_>,
     row: RoutedRow,
+    slice_permit: Option<&Arc<crate::budget::MemoryPermit>>,
 ) -> Result<(), String> {
     ctx.stats
         .insertbatch_rows_in
         .fetch_add(1, Ordering::Relaxed);
-    let key = &row.rel.rel_name;
-    if !tables.contains_key(key) {
-        // Overrides ride the route frozen at planning; a `Column*` config
-        // event applies under the barrier fence, whose FlushAll cleared this
-        // plan cache, so post-apply rows rebuild from post-apply routes
-        let plan = TablePlan::build(
-            ctx.alloc,
-            &row.rel,
-            &row.route.mapping,
-            Some(&row.route.column_overrides),
-        )
-        .map_err(|e| e.to_string())?;
-        let meta = Arc::new(BatchMeta::from_plan(&plan, key.clone(), ctx.epoch));
-        let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
-        tables.insert(
-            key.clone(),
-            Table {
+    // Key clone is two Arc bumps, cheaper than a second `RelName` hash
+    let t = match tables.entry(row.rel.rel_name.clone()) {
+        Entry::Occupied(e) => e.into_mut(),
+        Entry::Vacant(e) => {
+            // Overrides ride the route frozen at planning; a `Column*` config
+            // event applies under the barrier fence, whose FlushAll cleared this
+            // plan cache, so post-apply rows rebuild from post-apply routes
+            let plan = TablePlan::build(
+                ctx.alloc,
+                &row.rel,
+                &row.route.mapping,
+                Some(&row.route.column_overrides),
+            )
+            .map_err(|e| e.to_string())?;
+            let meta = Arc::new(BatchMeta::from_plan(&plan, e.key().clone(), ctx.epoch));
+            let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
+            e.insert(Table {
                 enc,
                 meta,
                 seq_counts: Vec::new(),
                 slice_permits: Vec::new(),
                 value_permits: Vec::new(),
                 deadline: None,
-            },
-        );
-    }
-    let t = tables.get_mut(&row.rel.rel_name).expect("just inserted");
-    if let Some(p) = row.permit
-        && !t.slice_permits.iter().any(|held| Arc::ptr_eq(held, &p))
+            })
+        }
+    };
+    // Every row of a chunk shares one permit, so the tail entry settles it:
+    // pushes for this table come only from this table's rows, and a seal
+    // clears the list so the next batch takes its own hold
+    if let Some(p) = slice_permit
+        && t.slice_permits
+            .last()
+            .is_none_or(|held| !Arc::ptr_eq(held, p))
     {
-        t.slice_permits.push(p);
+        t.slice_permits.push(p.clone());
     }
     if let Some(p) = row.value_permit {
         t.value_permits.push(p);
@@ -484,7 +495,6 @@ mod tests {
                 commit_ts: 0,
                 commit_lsn: (seq + 1) * 100,
             },
-            permit: None,
             value_permit: None,
         }
     }
@@ -563,7 +573,10 @@ mod tests {
             Arc::new(EmitterStats::default()),
             None,
         );
-        let chunk = vec![row(0, 0), row(0, 1), row(0, 2), row(1, 0), row(1, 1)];
+        let chunk = RowChunk {
+            rows: vec![row(0, 0), row(0, 1), row(0, 2), row(1, 0), row(1, 1)],
+            permit: None,
+        };
         msg_tx
             .send(BatcherMsg::Rows(chunk))
             .await

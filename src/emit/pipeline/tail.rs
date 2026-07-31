@@ -112,10 +112,10 @@ pub fn spawn_null(emitter_ack: Arc<AtomicU64>) -> (mpsc::Sender<BatcherMsg>, Ack
         while let Some(msg) = msg_rx.recv().await {
             match msg {
                 BatcherMsg::Row(r) => swallow_ack.acked(vec![(r.seq, 1)]),
-                BatcherMsg::Rows(rows) => {
+                BatcherMsg::Rows(chunk) => {
                     let mut counts: std::collections::HashMap<u64, u64> =
                         std::collections::HashMap::new();
-                    for r in &rows {
+                    for r in &chunk.rows {
                         *counts.entry(r.seq).or_insert(0) += 1;
                     }
                     swallow_ack.acked(counts.into_iter().collect());

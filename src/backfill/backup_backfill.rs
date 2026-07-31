@@ -1070,7 +1070,6 @@ impl ReplaySink {
                                 commit_ts,
                                 commit_lsn,
                             },
-                            permit: None,
                             value_permit: value_permit.map(Arc::new),
                         }))
                         .await
