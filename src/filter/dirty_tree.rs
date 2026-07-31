@@ -24,6 +24,11 @@ pub(crate) struct DirtyState {
     pub(crate) oids: HashMap<u32, u64>,
     /// Wrote a capture-all catalog (pg_namespace)
     pub(crate) unenumerated: bool,
+    /// Dirt came from a catalog record whose own locator proved the
+    /// followed database, not from an invalidation message (which may
+    /// carry shared `dbId == 0` scope). Lets the commit fail closed when
+    /// its `xl_xact_dbinfo.dbId` contradicts that proof
+    pub(crate) direct_write: bool,
 }
 
 impl DirtyState {
@@ -32,12 +37,14 @@ impl DirtyState {
             first_touch,
             oids: HashMap::new(),
             unenumerated: false,
+            direct_write: false,
         }
     }
 
     fn absorb(&mut self, other: Self) {
         self.first_touch = self.first_touch.min(other.first_touch);
         self.unenumerated |= other.unenumerated;
+        self.direct_write |= other.direct_write;
         for (oid, lsn) in other.oids {
             self.oids
                 .entry(oid)
@@ -232,9 +239,11 @@ mod tests {
         s.oids.insert(16400, 50);
         s.oids.insert(16500, 60);
         s.unenumerated = true;
+        s.direct_write = true;
         let m = t.drain_tree(7, None, &[101]).0.expect("merge");
         assert_eq!(m.first_touch, 50);
         assert!(m.unenumerated);
+        assert!(m.direct_write, "one member's proof covers the tree");
         assert_eq!(m.oids[&16400], 50, "min lsn wins");
         assert_eq!(m.oids[&16500], 60);
     }

@@ -174,9 +174,11 @@ pub struct Filter {
     /// commit / abort
     dirty: DirtyTree,
     smgr_markers: Arc<Mutex<SmgrMarkers>>,
-    /// Relcache-inval scope: accept db in {0, this}; `None` (unwired)
-    /// accepts any db
-    inval_db_oid: Option<u32>,
+    /// Followed database. Routing and catalog-filenode tracking stay
+    /// cluster-wide; this scopes descriptor-capture input only. `None`
+    /// (offline segment filter, no capture consumer) proves no record's
+    /// database, so no record dirties
+    target_db_oid: Option<u32>,
 }
 
 impl Filter {
@@ -186,13 +188,14 @@ impl Filter {
             stats: FilterStats::default(),
             dirty: DirtyTree::default(),
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
-            inval_db_oid: None,
+            target_db_oid: None,
         }
     }
 
-    /// Scope relcache-inval extraction to the followed database
-    pub fn set_inval_db(&mut self, db_oid: u32) {
-        self.inval_db_oid = Some(db_oid);
+    /// Scope descriptor-capture input to the followed database. Live
+    /// streams set this before the first record
+    pub fn set_target_db(&mut self, db_oid: u32) {
+        self.target_db_oid = Some(db_oid);
     }
 
     /// Capture reads rotation markers through this handle
@@ -251,30 +254,33 @@ impl Filter {
     ) -> Result<Verdict, XactPayloadError> {
         let obs = self.tracker.observe(record);
         let class = classify(record);
-        // `catalog_touch` marks the record's xid dirty: only paths proving a
-        // catalog relation was written qualify. `Empty`'s None → ToShadow
-        // safe default must not dirty (would hold at unrelated commits)
-        let (route, catalog_touch) = match class {
-            Class::Catalog => (Route::ToShadow, catalog_mutation(record)),
-            // Relmap update (VACUUM FULL mapped catalog) is Special-class
-            Class::Special => (Route::ToShadow, obs.catalog_write),
+        // `catalog_touch_db` names the database whose catalog this record
+        // wrote: only paths proving a catalog relation was written yield
+        // `Some`. `Empty`'s None → ToShadow safe default must not dirty
+        // (would hold at unrelated commits). Route is database-blind:
+        // foreign catalog records still replay on shadow
+        let (route, catalog_touch_db) = match class {
+            Class::Catalog => (Route::ToShadow, catalog_write_db(record)),
+            // Relmap update (VACUUM FULL mapped catalog) is Special-class,
+            // and carries its database in main_data
+            Class::Special => (Route::ToShadow, obs.catalog_db_oid),
             Class::User => {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
                     // tracker has filenodes the bootstrap classify rule misses
-                    (Route::ToShadow, catalog_mutation(record))
+                    (Route::ToShadow, catalog_write_db(record))
                 } else {
-                    (Route::ToDecoder, false)
+                    (Route::ToDecoder, None)
                 }
             }
             Class::Empty => match main_data::relation_for_empty(record) {
                 Some(rel) => {
                     if self.tracker.is_catalog(rel.db_node, rel.rel_node) {
-                        (Route::ToShadow, true)
+                        (Route::ToShadow, Some(rel.db_node))
                     } else {
-                        (Route::ToDecoder, false)
+                        (Route::ToDecoder, None)
                     }
                 }
-                None => (Route::ToShadow, false), // safe default
+                None => (Route::ToShadow, None), // safe default
             },
         };
         if record.header.resource_manager_id == RmId::Smgr as u8
@@ -292,8 +298,12 @@ impl Filter {
         // wal_level=logical (`XLR_BLOCK_ID_TOPLEVEL_XID`); learn before
         // touch and admission so both resolve the true root
         self.dirty.link(xid, record.toplevel_xid);
-        if catalog_touch && xid != 0 {
+        // Foreign and shared catalog writes route to shadow and update the
+        // cluster-wide tracker above, but feed no descriptor of the
+        // followed database, so they must not dirty its capture tree
+        if xid != 0 && catalog_touch_db.is_some_and(|db| self.is_target_db(db)) {
             let dirty = self.dirty.touch(xid, source_lsn);
+            dirty.direct_write = true;
             if let Some(oid) = obs.pg_class_user_oid {
                 dirty.oids.entry(oid).or_insert(source_lsn);
             }
@@ -372,13 +382,24 @@ impl Filter {
                 aborted_tree: merged.is_some().then(|| Arc::new(members)),
             });
         }
-        // Local relcache invals: second oid source + capture-all trigger.
+        // Scope contradiction: the tree holds writes admitted as this
+        // database's, yet the committing backend names another. One of the
+        // two scopes is wrong, so no boundary built here is trustworthy.
+        // Checked after the drain — state leaves with the xact either way
+        if let Some(target) = self.target_db_oid
+            && let Some(db_id) = payload.db_id
+            && db_id != target
+            && merged.as_ref().is_some_and(|state| state.direct_write)
+        {
+            return Err(XactPayloadError::ForeignScope { db_id, target });
+        }
+        // Target relcache invals: second oid source + capture-all trigger.
         // db 0 = shared relation; user rels there are impossible, kept for
-        // symmetry with is_local_db
+        // symmetry with is_target_or_shared
         let mut capture_all = false;
         let mut inval_oids: Vec<u32> = Vec::new();
         for inval in &payload.invals.relcache {
-            if !self.is_local_db(inval.db_id) {
+            if !self.is_target_or_shared(inval.db_id) {
                 continue;
             }
             if inval.rel_id == 0 {
@@ -391,7 +412,11 @@ impl Filter {
         // trigger. Commit records carry the xact tree's full inval set, so
         // classification holds even when the resume floor passed the
         // pg_namespace writes and the dirty tracker never saw them
-        if payload.invals.namespace.hits(|db| self.is_local_db(db)) {
+        if payload
+            .invals
+            .namespace
+            .hits(|db| self.is_target_or_shared(db))
+        {
             capture_all = true;
         }
         let dirty_hit = merged.is_some();
@@ -451,11 +476,11 @@ impl Filter {
             return Ok(None);
         }
         let invals = parse_xact_invalidations(&record.main_data, page_magic)?;
-        let namespace_hit = invals.namespace.hits(|db| self.is_local_db(db));
+        let namespace_hit = invals.namespace.hits(|db| self.is_target_or_shared(db));
         let mut flush = false;
         let mut oids: Vec<u32> = Vec::new();
         for inval in &invals.relcache {
-            if !self.is_local_db(inval.db_id) {
+            if !self.is_target_or_shared(inval.db_id) {
                 continue;
             }
             if inval.rel_id == 0 {
@@ -499,11 +524,20 @@ impl Filter {
         })))
     }
 
-    /// Inval scope: accept db in {0, followed}; `None` (unwired) accepts any
-    fn is_local_db(&self, db: u32) -> bool {
-        !self
-            .inval_db_oid
-            .is_some_and(|local| db != 0 && db != local)
+    /// Per-database relation / catalog scope: the record's database is
+    /// provably the followed one. An unwired filter proves nothing
+    fn is_target_db(&self, db: u32) -> bool {
+        self.target_db_oid == Some(db)
+    }
+
+    /// Invalidation-message scope: accept db in {0, followed}. PG uses
+    /// `dbId == 0` for shared relations and whole-relcache scope
+    /// (`src/include/storage/sinval.h`). An unwired filter proves nothing,
+    /// so it admits nothing: shared scope is only shared relative to a
+    /// followed database
+    fn is_target_or_shared(&self, db: u32) -> bool {
+        self.target_db_oid
+            .is_some_and(|target| db == 0 || db == target)
     }
 
     pub fn rmgr_label(record: &XLogRecord) -> String {
@@ -532,6 +566,16 @@ fn any_block_is_catalog(tracker: &CatalogTracker, blocks: &[XLogRecordBlock]) ->
 /// pruning a pg_class page would fence its own rows). Non-heap rmgrs
 /// (catalog index writes) never dirty: their logical counterpart is the
 /// heap record beside them
+/// Database of a direct catalog write: block 0's locator, which PG stamps
+/// with the writing backend's database (`0` for shared catalogs). A record
+/// with no block reference proves no database and never dirties
+fn catalog_write_db(record: &XLogRecord) -> Option<u32> {
+    if !catalog_mutation(record) {
+        return None;
+    }
+    Some(record.blocks.first()?.header.location.rel.db_node)
+}
+
 fn catalog_mutation(record: &XLogRecord) -> bool {
     use crate::decode::heap_decoder::{
         XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT, XLOG_HEAP_OPMASK,
@@ -555,6 +599,16 @@ mod tests {
     use walrus::pg::walparser::{
         BlockLocation, RelFileNode, RmId, XLogRecordBlockHeader, XLogRecordHeader,
     };
+
+    /// Followed database in these tests; 6 is the foreign one
+    const TARGET_DB: u32 = 5;
+
+    /// Live wiring: the followed database is set before the first record
+    fn target_filter() -> Filter {
+        let mut f = Filter::new();
+        f.set_target_db(TARGET_DB);
+        f
+    }
 
     fn rec(rm: RmId, rels: &[(u32, u32)]) -> XLogRecord<'static> {
         XLogRecord {
@@ -586,35 +640,35 @@ mod tests {
 
     #[test]
     fn catalog_record_is_kept() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let r = rec(RmId::Heap, &[(5, 1259)]);
         assert_eq!(f.decide(&r), Route::ToShadow);
     }
 
     #[test]
     fn user_record_is_dropped() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let r = rec(RmId::Heap, &[(5, 20000)]);
         assert_eq!(f.decide(&r), Route::ToDecoder);
     }
 
     #[test]
     fn special_rmgr_is_kept() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let r = rec(RmId::Xact, &[]);
         assert_eq!(f.decide(&r), Route::ToShadow);
     }
 
     #[test]
     fn empty_unknown_is_kept_safe_default() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let r = rec(RmId::Heap, &[]);
         assert_eq!(f.decide(&r), Route::ToShadow);
     }
 
     #[test]
     fn tracker_promotes_user_to_catalog_post_relmap() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Learned mapping: catalog on db 5 rewritten to filenode 50000.
         f.tracker.add(5, 50000);
         let r = rec(RmId::Heap, &[(5, 50000)]);
@@ -650,7 +704,7 @@ mod tests {
                 ..Default::default()
             }
         }
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // catalog filenode (1259 = pg_class) → Keep
         assert_eq!(f.decide(&new_cid_record(5, 1259)), Route::ToShadow);
         // user filenode → Drop
@@ -667,7 +721,7 @@ mod tests {
 
     #[test]
     fn stats_track_kept_dropped() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide(&rec(RmId::Heap, &[(5, 1259)]));
         f.decide(&rec(RmId::Heap, &[(5, 20000)]));
         f.decide(&rec(RmId::Heap, &[(5, 20001)]));
@@ -740,7 +794,7 @@ mod tests {
 
     #[test]
     fn catalog_commit_is_boundary_dml_commit_is_not() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 7), 0, 0xD116)
             .unwrap();
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 20000)], 8), 0, 0xD116)
@@ -763,7 +817,7 @@ mod tests {
 
     #[test]
     fn abort_clears_dirty_without_boundary() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 7), 0, 0xD116)
             .unwrap();
         let v = f
@@ -778,7 +832,7 @@ mod tests {
 
     #[test]
     fn subxact_catalog_write_marks_top_commit() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // DDL under savepoint: catalog record carries subxid 101
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 101), 0, 0xD116)
             .unwrap();
@@ -794,7 +848,7 @@ mod tests {
 
     #[test]
     fn defer_flag_tracks_dirty_tree() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 7), 100, 0xD116)
             .unwrap();
         let user = |f: &mut Filter, xid| {
@@ -810,7 +864,7 @@ mod tests {
 
     #[test]
     fn inline_toplevel_defers_whole_tree_until_subxact_abort() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Subxact's catalog write carries its top inline (logical WAL)
         let mut ddl = rec_with_xid(RmId::Heap, &[(5, 1259)], 101);
         ddl.toplevel_xid = 100;
@@ -835,7 +889,7 @@ mod tests {
     #[test]
     fn catalog_page_maintenance_never_dirties() {
         use crate::decode::heap_decoder::{XLOG_HEAP_INPLACE, XLOG_HEAP_LOCK};
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let user = |f: &mut Filter, xid| {
             f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 20000)], xid), 110, 0xD116)
                 .unwrap()
@@ -885,7 +939,7 @@ mod tests {
 
     #[test]
     fn assignment_merges_retained_child_state() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Child dirties without inline toplevel (replica-level WAL shape)
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 101), 100, 0xD116)
             .unwrap();
@@ -913,7 +967,7 @@ mod tests {
 
     #[test]
     fn malformed_assignment_poisons() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let mut r = xact_assignment(100, &[101]);
         // Claim two subxids, carry one
         match &mut r.main_data {
@@ -925,7 +979,7 @@ mod tests {
 
     #[test]
     fn commit_prepared_matches_prepared_xid() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 300), 0, 0xD116)
             .unwrap();
         // COMMIT PREPARED: header xid differs, prepared xid in payload
@@ -942,7 +996,7 @@ mod tests {
     #[test]
     fn relmap_update_marks_writing_xid() {
         use crate::filter::catalog_tracker::test_relmap_record as relmap;
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let mut r = relmap(5, &[(1259, 50000)]);
         r.header.xact_id = 9;
         f.decide_record(&r, 0, 0xD116).unwrap();
@@ -957,7 +1011,7 @@ mod tests {
 
     #[test]
     fn empty_safe_default_route_does_not_dirty() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Class::Empty, unrecognised main_data → ToShadow safe default
         let r = rec_with_xid(RmId::Heap, &[], 7);
         assert_eq!(
@@ -975,7 +1029,7 @@ mod tests {
 
     #[test]
     fn tracker_promoted_user_record_dirties() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.tracker.add(5, 50000); // rotated mapped catalog above 16384
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 50000)], 7), 0, 0xD116)
             .unwrap();
@@ -987,7 +1041,7 @@ mod tests {
 
     #[test]
     fn boundary_merges_inval_oids_and_first_touch() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 7), 100, 0xD116)
             .unwrap();
         // Commit carries relcache invals: local user rel + skippable ids
@@ -1016,7 +1070,7 @@ mod tests {
 
     #[test]
     fn inval_only_commit_is_boundary_defense() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Dirty tracker saw nothing, but the commit proves catalog effects
         let commit = xact_end_full(XLOG_XACT_COMMIT, 9, &[], &[(-2, 5, 16500)], None);
         let v = f.decide_record(&commit, 300, 0xD116).unwrap();
@@ -1027,7 +1081,7 @@ mod tests {
 
     #[test]
     fn whole_relcache_inval_forces_capture_all() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let commit = xact_end_full(XLOG_XACT_COMMIT, 9, &[], &[(-2, 5, 0)], None);
         let v = f.decide_record(&commit, 300, 0xD116).unwrap();
         assert!(v.boundary.expect("boundary").capture_all);
@@ -1035,7 +1089,7 @@ mod tests {
 
     #[test]
     fn pg_namespace_write_forces_capture_all() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Namespace rename: pg_namespace heap write, zero relcache oids
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 2615)], 7), 100, 0xD116)
             .unwrap();
@@ -1066,7 +1120,7 @@ mod tests {
 
     #[test]
     fn namespace_catcache_commit_is_capture_all_boundary() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // ALTER SCHEMA RENAME whose pg_namespace writes precede the resume
         // floor: commit carries only catcache invals (NAMESPACENAME = 35 on
         // PG 16-17)
@@ -1080,7 +1134,7 @@ mod tests {
 
     #[test]
     fn namespace_catcache_ids_keyed_per_major() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // 35 is a different syscache on PG 18 (namespace ids shift to 37/38)
         let commit = xact_end_full(XLOG_XACT_COMMIT, 9, &[], &[(35, 5, 0)], None);
         assert!(
@@ -1096,7 +1150,7 @@ mod tests {
 
     #[test]
     fn irrelevant_catcache_commit_is_not_boundary() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // STATRELATTINH (63): ANALYZE-rate churn must not bound
         let commit = xact_end_full(XLOG_XACT_COMMIT, 9, &[], &[(63, 5, 0xBEEF)], None);
         assert!(
@@ -1108,9 +1162,26 @@ mod tests {
     }
 
     #[test]
-    fn namespace_catcache_foreign_db_filtered() {
+    fn unwired_filter_captures_nothing() {
         let mut f = Filter::new();
-        f.set_inval_db(5);
+        // Mid-xact set mixing per-database, shared and whole-relcache scope
+        let v = f
+            .decide_record(
+                &xact_invals_rec(7, &[(-2, 5, 16400), (-2, 0, 0), (35, 0, 0)]),
+                150,
+                0xD116,
+            )
+            .unwrap();
+        assert!(v.boundary.is_none(), "no followed database to be in scope");
+        let commit = xact_end_full(XLOG_XACT_COMMIT, 7, &[], &[(-2, 5, 16400)], None);
+        let v = f.decide_record(&commit, 200, 0xD116).unwrap();
+        assert!(v.boundary.is_none(), "unwired filter stays route-only");
+        assert_eq!(v.route, Route::ToShadow, "routing stays database-blind");
+    }
+
+    #[test]
+    fn namespace_catcache_foreign_db_filtered() {
+        let mut f = target_filter();
         let commit = xact_end_full(XLOG_XACT_COMMIT, 9, &[], &[(35, 6, 0)], None);
         assert!(
             f.decide_record(&commit, 300, 0xD116)
@@ -1122,7 +1193,7 @@ mod tests {
 
     #[test]
     fn catalog_inval_on_pg_namespace_forces_capture_all() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // VACUUM FULL pg_namespace: whole-catalog msg names catId directly
         let commit = xact_end_full(XLOG_XACT_COMMIT, 9, &[], &[(-1, 5, 2615)], None);
         let v = f.decide_record(&commit, 300, 0xD116).unwrap();
@@ -1138,7 +1209,7 @@ mod tests {
 
     #[test]
     fn midxact_invals_dirty_xid() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Restart lost the pg_class write; command-end inval set re-dirties
         f.decide_record(&xact_invals_rec(7, &[(-2, 5, 16400)]), 150, 0xD116)
             .unwrap();
@@ -1155,7 +1226,7 @@ mod tests {
 
     #[test]
     fn midxact_namespace_inval_forces_capture_all() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&xact_invals_rec(7, &[(35, 5, 0xAB)]), 150, 0xD116)
             .unwrap();
         let v = f
@@ -1168,7 +1239,7 @@ mod tests {
 
     #[test]
     fn midxact_whole_relcache_flush_forces_capture_all() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&xact_invals_rec(7, &[(-2, 5, 0)]), 150, 0xD116)
             .unwrap();
         let v = f
@@ -1179,7 +1250,7 @@ mod tests {
 
     #[test]
     fn midxact_irrelevant_invals_do_not_dirty() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Non-namespace catcache + relcache on a catalog oid: nothing to
         // capture, an entry would hold publication at commit for nothing
         f.decide_record(
@@ -1196,8 +1267,7 @@ mod tests {
 
     #[test]
     fn midxact_inval_foreign_db_filtered() {
-        let mut f = Filter::new();
-        f.set_inval_db(5);
+        let mut f = target_filter();
         f.decide_record(
             &xact_invals_rec(7, &[(-2, 6, 16400), (35, 6, 0)]),
             150,
@@ -1212,7 +1282,7 @@ mod tests {
 
     #[test]
     fn midxact_inval_abort_clears() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&xact_invals_rec(7, &[(-2, 5, 16400)]), 150, 0xD116)
             .unwrap();
         let v = f
@@ -1227,7 +1297,7 @@ mod tests {
 
     #[test]
     fn midxact_inval_under_subxact_merges_at_top_commit() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&xact_invals_rec(101, &[(-2, 5, 16400)]), 150, 0xD116)
             .unwrap();
         let v = f
@@ -1238,7 +1308,7 @@ mod tests {
 
     #[test]
     fn command_boundary_is_always_on_and_scopes_to_this_command_invals() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         // Earlier command touched 16400; this one names 16500 only
         f.decide_record(&xact_invals_rec(7, &[(-2, 5, 16400)]), 150, 0xD116)
             .unwrap();
@@ -1265,7 +1335,7 @@ mod tests {
 
     #[test]
     fn command_boundary_under_subxact_names_the_known_root() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let mut sub = xact_invals_rec(101, &[(-2, 5, 16400)]);
         sub.toplevel_xid = 100;
         let v = f.decide_record(&sub, 150, 0xD116).unwrap();
@@ -1276,7 +1346,7 @@ mod tests {
 
     #[test]
     fn capture_all_command_boundary_carries_the_flag() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let v = f
             .decide_record(&xact_invals_rec(7, &[(-2, 5, 0)]), 150, 0xD116)
             .unwrap();
@@ -1287,7 +1357,7 @@ mod tests {
 
     #[test]
     fn abort_names_the_dirty_tree_for_pending_drop() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let mut sub = xact_invals_rec(101, &[(-2, 5, 16400)]);
         sub.toplevel_xid = 100;
         f.decide_record(&sub, 150, 0xD116).unwrap();
@@ -1306,7 +1376,7 @@ mod tests {
 
     #[test]
     fn malformed_midxact_inval_record_poisons() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let mut r = xact_invals_rec(7, &[(-2, 5, 16400)]);
         // Claim two messages, carry one
         match &mut r.main_data {
@@ -1318,8 +1388,7 @@ mod tests {
 
     #[test]
     fn inval_db_scope_filters_foreign_db() {
-        let mut f = Filter::new();
-        f.set_inval_db(5);
+        let mut f = target_filter();
         let commit = xact_end_full(XLOG_XACT_COMMIT, 9, &[], &[(-2, 6, 16500)], None);
         let v = f.decide_record(&commit, 300, 0xD116).unwrap();
         assert!(v.boundary.is_none(), "foreign-db inval must not bound");
@@ -1327,7 +1396,7 @@ mod tests {
 
     #[test]
     fn prepared_commit_boundary_drains_under_prepared_xid() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1259)], 300), 100, 0xD116)
             .unwrap();
         let v = f
@@ -1342,7 +1411,7 @@ mod tests {
 
     #[test]
     fn unknown_sinval_id_poisons() {
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let commit = xact_end_full(XLOG_XACT_COMMIT, 9, &[], &[(-7, 5, 16500)], None);
         assert!(f.decide_record(&commit, 300, 0xD116).is_err());
     }
@@ -1350,7 +1419,7 @@ mod tests {
     #[test]
     fn smgr_create_records_pump_marker() {
         use crate::filter::main_data::XLOG_SMGR_CREATE;
-        let mut f = Filter::new();
+        let mut f = target_filter();
         let mut md = Vec::new();
         md.extend_from_slice(&1663u32.to_le_bytes());
         md.extend_from_slice(&5u32.to_le_bytes());
@@ -1374,5 +1443,224 @@ mod tests {
             }),
             None
         );
+    }
+
+    const FOREIGN_DB: u32 = 6;
+
+    /// Heap insert into `db`'s pg_class carrying a decodable row for `oid`
+    fn pg_class_write(db: u32, xid: u32, oid: u32) -> XLogRecord<'static> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&33u16.to_le_bytes()); // t_infomask2
+        data.extend_from_slice(&0u16.to_le_bytes()); // t_infomask
+        data.push(24); // t_hoff
+        data.push(0); // MAXALIGN pad, offset 23 -> 24
+        data.extend_from_slice(&oid.to_le_bytes());
+        data.extend_from_slice(&[0u8; 84]); // relname + cols 3..7
+        data.extend_from_slice(&(oid + 1).to_le_bytes()); // relfilenode
+        let mut r = rec_with_xid(RmId::Heap, &[(db, 1259)], xid);
+        r.blocks[0].data = std::borrow::Cow::Owned(data);
+        r
+    }
+
+    /// Commit / abort carrying `xl_xact_dbinfo` (`Oid dbId; Oid tsId`), the
+    /// committing backend's database
+    fn xact_end_dbinfo(
+        op: u8,
+        xid: u32,
+        db_id: u32,
+        invals: &[(i8, u32, u32)],
+    ) -> XLogRecord<'static> {
+        use crate::decode::wal_xact::{XACT_XINFO_HAS_DBINFO, XACT_XINFO_HAS_INVALS};
+        let mut md: Vec<u8> = 0i64.to_le_bytes().to_vec();
+        let mut xinfo = XACT_XINFO_HAS_DBINFO;
+        if !invals.is_empty() {
+            xinfo |= XACT_XINFO_HAS_INVALS;
+        }
+        md.extend_from_slice(&xinfo.to_le_bytes());
+        md.extend_from_slice(&db_id.to_le_bytes());
+        md.extend_from_slice(&1663u32.to_le_bytes()); // tsId
+        if !invals.is_empty() {
+            md.extend_from_slice(&(invals.len() as i32).to_le_bytes());
+            for &(id, db, rel) in invals {
+                let mut msg = [0u8; 16];
+                msg[0] = id as u8;
+                msg[4..8].copy_from_slice(&db.to_le_bytes());
+                msg[8..12].copy_from_slice(&rel.to_le_bytes());
+                md.extend_from_slice(&msg);
+            }
+        }
+        let mut r = rec_with_xid(RmId::Xact, &[], xid);
+        r.header.info = op | XLOG_XACT_HAS_INFO;
+        r.main_data = std::borrow::Cow::Owned(md);
+        r
+    }
+
+    #[test]
+    fn foreign_pg_class_write_never_dirties_target_capture() {
+        let mut f = target_filter();
+        // DDL in another database: still routes to shadow, but its oids
+        // belong to a descriptor log this filter does not feed
+        let v = f
+            .decide_record(&pg_class_write(FOREIGN_DB, 7, 16400), 100, 0xD116)
+            .unwrap();
+        assert_eq!(v.route, Route::ToShadow);
+        let user = f
+            .decide_record(
+                &rec_with_xid(RmId::Heap, &[(FOREIGN_DB, 20000)], 7),
+                110,
+                0xD116,
+            )
+            .unwrap();
+        assert!(
+            !user.defer_catalog_decode,
+            "foreign DDL must not fence later rows"
+        );
+        let v = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                200,
+                0xD116,
+            )
+            .unwrap();
+        assert!(!v.catalog_boundary, "foreign commit bounds nothing local");
+
+        // Same oid in the followed database: dirt, fence, boundary, and a
+        // first touch that owes nothing to the foreign write
+        f.decide_record(&pg_class_write(TARGET_DB, 8, 16400), 300, 0xD116)
+            .unwrap();
+        let user = f
+            .decide_record(
+                &rec_with_xid(RmId::Heap, &[(TARGET_DB, 20000)], 8),
+                310,
+                0xD116,
+            )
+            .unwrap();
+        assert!(user.defer_catalog_decode, "target DDL fences its own rows");
+        let b = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 8, TARGET_DB, &[]),
+                400,
+                0xD116,
+            )
+            .unwrap()
+            .boundary
+            .expect("target boundary");
+        assert_eq!(b.oids.len(), 1);
+        assert_eq!(b.oids[0].oid, 16400);
+        assert_eq!(b.oids[0].pg_class_touch, Some(300), "target write's lsn");
+    }
+
+    #[test]
+    fn foreign_pg_namespace_write_does_not_force_target_capture_all() {
+        let mut f = target_filter();
+        // Namespace rename in another database enumerates no relations
+        // anywhere; capture-all here would rescan the followed catalog
+        f.decide_record(
+            &rec_with_xid(RmId::Heap, &[(FOREIGN_DB, 2615)], 7),
+            100,
+            0xD116,
+        )
+        .unwrap();
+        let v = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                200,
+                0xD116,
+            )
+            .unwrap();
+        assert!(v.boundary.is_none());
+    }
+
+    #[test]
+    fn foreign_and_shared_relmap_track_without_dirtying_target() {
+        use crate::filter::catalog_tracker::test_relmap_record as relmap;
+        let mut f = target_filter();
+        for (db, xid, filenode) in [(FOREIGN_DB, 9, 50000), (0, 10, 60000)] {
+            let mut r = relmap(db, &[(1259, filenode)]);
+            r.header.xact_id = xid;
+            let v = f.decide_record(&r, 100, 0xD116).unwrap();
+            assert_eq!(v.route, Route::ToShadow, "shadow replays every relmap");
+            assert!(
+                f.tracker().is_catalog(db, filenode),
+                "filenode tracking stays cluster-wide"
+            );
+            let v = f
+                .decide_record(
+                    &xact_end_dbinfo(XLOG_XACT_COMMIT, xid, db, &[]),
+                    200,
+                    0xD116,
+                )
+                .unwrap();
+            assert!(!v.catalog_boundary, "db {db} relmap is not target dirt");
+        }
+    }
+
+    #[test]
+    fn shared_inval_bounds_and_drains_under_a_foreign_commit() {
+        let mut f = target_filter();
+        // dbId 0 = shared / whole-relcache scope, which does reach the
+        // followed database
+        f.decide_record(&xact_invals_rec(7, &[(-2, 0, 0)]), 150, 0xD116)
+            .unwrap();
+        let v = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                200,
+                0xD116,
+            )
+            .unwrap();
+        assert!(
+            v.boundary.expect("shared inval boundary").capture_all,
+            "foreign dbId must not blanket-drop shared invalidations"
+        );
+        let v = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                300,
+                0xD116,
+            )
+            .unwrap();
+        assert!(!v.catalog_boundary, "commit drained the tree");
+    }
+
+    #[test]
+    fn foreign_dbinfo_contradicting_target_dirt_poisons() {
+        let mut f = target_filter();
+        f.decide_record(&pg_class_write(TARGET_DB, 7, 16400), 100, 0xD116)
+            .unwrap();
+        let err = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                200,
+                0xD116,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                XactPayloadError::ForeignScope {
+                    db_id: FOREIGN_DB,
+                    target: TARGET_DB
+                }
+            ),
+            "{err}"
+        );
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
+            .unwrap();
+        assert!(!v.catalog_boundary, "drain ran before the scope check");
+    }
+
+    #[test]
+    fn absent_dbinfo_leaves_record_scope_in_charge() {
+        let mut f = target_filter();
+        f.decide_record(&pg_class_write(TARGET_DB, 7, 16400), 100, 0xD116)
+            .unwrap();
+        let b = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 200, 0xD116)
+            .unwrap()
+            .boundary
+            .expect("boundary");
+        assert_eq!(b.oids[0].oid, 16400);
     }
 }

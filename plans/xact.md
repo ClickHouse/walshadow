@@ -192,7 +192,8 @@ matching `xactdesc.c::ParseCommitRecord` / `ParseAbortRecord`:
 ```text
 xact_time (i64)
 [xinfo (u32) if info & XLOG_XACT_HAS_INFO]      // 0x80
-dbinfo  (8 bytes)   if xinfo & HAS_DBINFO       // 1<<0
+dbinfo  (Oid dbId, Oid tsId)
+                    if xinfo & HAS_DBINFO       // 1<<0
 subxacts (i32 n + n×u32)
                     if xinfo & HAS_SUBXACTS     // 1<<1
 relfilelocators (i32 n + n×12)
@@ -204,6 +205,13 @@ twophase (u32 xid)  if xinfo & HAS_TWOPHASE        // 1<<4
 gid (cstr, NUL term) if xinfo & HAS_GID            // 1<<7
 origin (8+8)        if xinfo & HAS_ORIGIN          // 1<<5
 ```
+
+`dbinfo` is parsed scope, not cursor padding: `dbId` is the committing
+backend's database, kept as `XactCommitPayload::db_id`. Absent dbinfo is
+unknown scope (`None`), never the followed database. The filter uses it
+as a commit-time defense — a commit naming another database while its
+tree holds catalog dirt admitted as the followed database's contradicts
+itself and poisons ([filter.md](filter.md) Database scope)
 
 Short-read at any tail position is a typed `XactPayloadError`. Filter
 classification poisons on it (a silent partial parse could drop the

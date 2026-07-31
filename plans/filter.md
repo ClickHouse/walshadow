@@ -91,6 +91,58 @@ the record for descriptor capture ([desc_log.md](desc_log.md)). The
 filter also keeps a pump-side `XLOG_SMGR_CREATE` marker map — the
 bias-early valid_from source for rotated filenodes
 
+## Database scope
+
+WAL is cluster-wide, walshadow follows one database. Routing, catalog
+filenode tracking and shadow replay stay cluster-wide — shadow replays
+every database's records — while descriptor capture cannot: relation
+oids, catalog oids and mapped-catalog filenodes repeat in every database,
+so a foreign record matched against local oids resolves the wrong
+relation.
+
+The filter holds the followed database (`set_target_db`, wired before the
+first record; the offline segment filter leaves it unset and so proves no
+record's database). Two predicates, never one name for both:
+
+- `is_target_db(db)` — per-database relation and catalog work
+- `is_target_or_shared(db)` — invalidation messages, where PG's
+  `dbId == 0` means shared relation or whole-relcache scope
+  (`src/include/storage/sinval.h`)
+
+Each record yields `(route, catalog_touch_db)`. Route ignores the
+database; `catalog_touch_db` names the database whose catalog the record
+wrote — block 0's `db_node` for heap / heap2 mutations, the extracted
+locator for a reclassified `Empty` record, `xl_relmap_update.dbid` for
+relmap (`Observation.catalog_db_oid`). Only a match calls
+`DirtyTree::touch`. Foreign and shared-catalog writes keep their route
+and still teach the tracker their filenodes; they just feed no descriptor
+of the followed database. Direct shared writes (`db_node == 0`) do not
+dirty either — pg_class, pg_attribute and pg_namespace of the followed
+database are per-db relations
+
+Ownership transition:
+
+```text
+cluster WAL -> scoped filter gate -> target-only DirtyTree
+            -> target-only BoundaryInfo -> database-owned DescriptorLog
+```
+
+Below the gate no database dimension exists: `AffectedOid`, pending
+capture and descriptor-log entries stay bare oids because scope is
+already proven
+
+Commit re-checks. `xl_xact_dbinfo.dbId` is the committing backend's
+database ([xact.md](xact.md)); present and foreign while the drained tree
+holds dirt from a record-level target write, the two scopes contradict
+and the record poisons (`XactPayloadError::ForeignScope`) instead of
+publishing a boundary over another database's oids. `DirtyState` carries
+one bit for that distinction — dirt from a proven-target record vs dirt
+from an invalidation message, whose scope may be shared. Absent dbinfo is
+unknown scope, not target scope: record-level and message-level gates
+stand alone. A foreign `dbId` never short-circuits the record — its
+shared invalidations still classify — and abort drains its tree whatever
+database it names
+
 ## Dirty tree
 
 `src/filter/dirty_tree.rs`: pump-side catalog-dirty transaction tree

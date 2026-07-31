@@ -1078,7 +1078,7 @@ async fn run_session(
         .current_database_oid()
         .await
         .context("shadow database oid")?;
-    stream.filter_mut().set_inval_db(shadow_db_oid);
+    stream.filter_mut().set_target_db(shadow_db_oid);
     let pending_cfg = ch_config
         .as_ref()
         .map(|c| c.pending_capture)

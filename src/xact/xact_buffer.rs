@@ -2657,13 +2657,22 @@ impl BufferingDecoderSink {
             // LSN is unreachable anyway — TRUNCATE rotates the filenode (so
             // its own commit publishes no in-place verdict) and a concurrent
             // xact cannot hold this rel's AccessExclusiveLock
-            let Ok((rel, valid_from)) = self.log.descriptor_by_oid_at_spanned(relid, source_lsn)
-            else {
-                self.stats
-                    .catalog_not_found
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                continue;
-            };
+            let (rel, valid_from) =
+                match self
+                    .log
+                    .descriptor_by_oid_in_db_at_spanned(parsed.db_oid, relid, source_lsn)
+                {
+                    Ok(found) => found,
+                    // Record's whole relid array belongs to another database:
+                    // its OIDs name nothing here, whatever they collide with
+                    Err(LookupResult::ForeignDb) => break,
+                    Err(_) => {
+                        self.stats
+                            .catalog_not_found
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                };
             // CH has no per-table internal toast; only user heap
             // ('r'/'p') TRUNCATE propagates
             if rel.kind != 'r' && rel.kind != 'p' {
@@ -4482,6 +4491,90 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// Relation OIDs can match across databases. Verify TRUNCATE records only
+    /// affect relations in configured database
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncate_of_foreign_db_never_fans_out() {
+        use crate::catalog::desc_log::{BatchRecord, DescLogIdentity, LogEntry, LogValue};
+        use crate::record::Route;
+        use walrus::pg::walparser::{XLogRecord, XLogRecordHeader};
+
+        let log_dir = tempdir().unwrap();
+        let log = Arc::new(
+            DescriptorLog::open(
+                log_dir.path(),
+                DescLogIdentity {
+                    pg_major: 17,
+                    system_id: "7".into(),
+                    timeline: 1,
+                    db_oid: 5,
+                    wal_seg_size: 16 * 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let rel = int4_descriptor(16440);
+        log.append_batch(BatchRecord {
+            captured_at: 0x100,
+            commit_lsn: 0xF0,
+            observations: Vec::new(),
+            ambiguities: Vec::new(),
+            entries: vec![Arc::new(LogEntry {
+                valid_from: 0x100,
+                oid: rel.oid,
+                rfn: rel.rfn,
+                value: LogValue::Present(rel.clone()),
+            })],
+        })
+        .await
+        .unwrap();
+
+        let truncate_record = |db_oid: u32| {
+            let mut md = db_oid.to_le_bytes().to_vec();
+            md.extend_from_slice(&1u32.to_le_bytes());
+            md.extend_from_slice(&[0u8; 4]); // Flags and alignment padding
+            md.extend_from_slice(&rel.oid.to_le_bytes());
+            Record {
+                parsed: XLogRecord {
+                    header: XLogRecordHeader {
+                        resource_manager_id: RmId::Heap as u8,
+                        info: crate::decode::heap_decoder::XLOG_HEAP_TRUNCATE,
+                        xact_id: 7,
+                        ..Default::default()
+                    },
+                    main_data: std::borrow::Cow::Owned(md),
+                    ..Default::default()
+                },
+                source_lsn: 0x200,
+                route: Route::ToShadow,
+                ..Default::default()
+            }
+        };
+
+        let spill_dir = tempdir().unwrap();
+        let buffer = Arc::new(Mutex::new(
+            XactBuffer::new(cfg(spill_dir.path().to_path_buf())).unwrap(),
+        ));
+        let mut sink = BufferingDecoderSink::new(log.clone(), buffer);
+
+        sink.on_record(&truncate_record(6)).await.unwrap();
+        assert_eq!(
+            sink.stats().truncates.load(Ordering::Relaxed),
+            0,
+            "foreign-db TRUNCATE must not reach a local oid"
+        );
+        assert_eq!(
+            log.stats_handle()
+                .lookups_foreign_db
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        sink.on_record(&truncate_record(5)).await.unwrap();
+        assert_eq!(sink.stats().truncates.load(Ordering::Relaxed), 1);
     }
 
     /// Half-open: `through_lsn` is the first LSN the final descriptor proves,

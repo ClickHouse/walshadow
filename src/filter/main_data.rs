@@ -97,6 +97,30 @@ pub fn parse_xl_heap_truncate(md: &[u8]) -> Option<HeapTruncate> {
     })
 }
 
+/// `xl_relmap_update` header (PG `src/include/utils/relmapper.h`):
+/// `Oid dbid; Oid tsid; int32 nbytes; char data[FLEXIBLE_ARRAY_MEMBER]`.
+/// `dbid == 0` is the shared map (`global/pg_filenode.map`)
+pub const XL_RELMAP_UPDATE_HEADER_SIZE: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelmapUpdate {
+    pub dbid: u32,
+    pub tsid: u32,
+    /// Declared `RelMapFile` body length; the body follows the header
+    pub nbytes: usize,
+}
+
+pub fn parse_xl_relmap_update(md: &[u8]) -> Option<RelmapUpdate> {
+    if md.len() < XL_RELMAP_UPDATE_HEADER_SIZE {
+        return None;
+    }
+    Some(RelmapUpdate {
+        dbid: u32::from_le_bytes(md[0..4].try_into().unwrap()),
+        tsid: u32::from_le_bytes(md[4..8].try_into().unwrap()),
+        nbytes: usize::try_from(i32::from_le_bytes(md[8..12].try_into().unwrap())).ok()?,
+    })
+}
+
 fn read_locator(md: &[u8], off: usize) -> RelFileNode {
     RelFileNode {
         spc_node: u32::from_le_bytes(md[off..off + 4].try_into().unwrap()),

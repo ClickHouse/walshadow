@@ -157,7 +157,18 @@ nothing replays `[start_lsn, end_lsn]`.
    row is emitted: the walk would decode with the wrong shape, and a rewrite
    in the gap means the backup's filenode isn't the current rfn at all. Error
    names the remedies — fresher backup, or `'copy'`. A timeline switch or
-   archive gap surfaces as a fetch failure with the same remedies
+   archive gap surfaces as a fetch failure with the same remedies.
+
+   Skew is a per-database question: every database repeats the catalog
+   OIDs, mapped-catalog filenodes, and relation OIDs a check compares
+   against. One pass covers one database (`BackupRequest.desc.rfn.db_node`,
+   verified identical and nonzero across the request set), so each check
+   first proves the record's own database — block 0 `db_node` for
+   `pg_class`/`pg_attribute`, `xl_heap_truncate.dbId`, `xl_relmap_update.dbid`
+   (`0` = shared map, no per-database catalog) — and ignores foreign
+   records. A scope-bearing record that will not parse fails closed as
+   skew. The pg_xact harvest stays cluster-wide: XIDs are, and backup pages
+   hold tuples written by every database
 3. **Filtered walk.** Tar parts stream through `PageWalkSink` with the filter
    set; rows tag `_lsn = min(B_redo, S)` per rel; the gate resolves deferred
    tuples against backup pg_xact + patch at successful walk EOF

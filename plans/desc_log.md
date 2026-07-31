@@ -179,7 +179,17 @@ enabled config picks up existing rels without log mutation.
 ## Decode reads
 
 `descriptor_at(rfn, lsn)` / `descriptor_by_oid_at(oid, lsn)` return
-`Present | Ambiguous | Dropped | Retired | NotCovered | ForeignDb`.
+`Present | Ambiguous | Dropped | Retired | NotCovered | ForeignDb`. The
+rfn key carries its own database, so the rfn lookups scope themselves
+(`db_node == 0` shared locators pass — shared catalogs hold no
+descriptors). A bare oid does not: oids repeat across databases, so
+production oid callers take
+`descriptor_by_oid_in_db_at_spanned(db_oid, oid, lsn)`, which compares the
+supplied database with the log's identity and counts
+`lookups_foreign_db` before any chain read. `XLOG_HEAP_TRUNCATE` apply is
+the caller — it names oids and its own `dbId`
+([xact.md](xact.md)). Unscoped `descriptor_by_oid_at` remains for callers
+that already hold the log's own database, i.e. tests.
 Ambiguity precedes the chain — a chain entry inside an ambiguous
 interval is not proven safe for rows there, so the interval check runs
 first (rfn/oid scope, then database scope). The `_spanned` twins return
