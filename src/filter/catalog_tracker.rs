@@ -26,6 +26,7 @@ use tokio_postgres::Client;
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::{RmId, XLogRecord};
 
+use crate::filter::main_data::{XL_RELMAP_UPDATE_HEADER_SIZE, parse_xl_relmap_update};
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap, info_carries_new_tuple_heap2,
 };
@@ -112,19 +113,28 @@ pub enum SeedError {
 }
 
 /// [`CatalogTracker::observe`] verdict: whether the record mutated a
-/// tracked catalog plus, when block 0 decoded a user relation's pg_class
-/// row, that oid — the filter's per-oid first-touch source for boundary
-/// capture.
+/// tracked catalog, which database owns that catalog, plus — when block 0
+/// decoded a user relation's pg_class row — that oid, the filter's per-oid
+/// first-touch source for boundary capture.
+///
+/// The tracker itself stays cluster-wide: every database's catalog
+/// filenodes must classify for shadow routing. `catalog_db_oid` is what
+/// lets the filter admit only the followed database's writes into
+/// descriptor capture.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Observation {
     pub catalog_write: bool,
+    /// Database owning the written catalog: block 0 `db_node` for pg_class
+    /// writes, `xl_relmap_update.dbid` for relmap. `0` = shared catalog
+    pub catalog_db_oid: Option<u32>,
     pub pg_class_user_oid: Option<u32>,
 }
 
 impl Observation {
-    fn write(catalog_write: bool) -> Self {
+    fn catalog(db_oid: u32) -> Self {
         Self {
-            catalog_write,
+            catalog_write: true,
+            catalog_db_oid: Some(db_oid),
             pg_class_user_oid: None,
         }
     }
@@ -175,7 +185,10 @@ impl CatalogTracker {
         let info_high = record.header.info & 0xF0;
 
         if rm == RmId::RelMap as u8 && info_high == XLOG_RELMAP_UPDATE {
-            return Observation::write(self.handle_relmap_update(record));
+            return self
+                .handle_relmap_update(record)
+                .map(Observation::catalog)
+                .unwrap_or_default();
         }
 
         let heap_new_tuple = rm == RmId::Heap as u8 && info_carries_new_tuple_heap(info_high);
@@ -192,7 +205,10 @@ impl CatalogTracker {
             let info_op = info_high & 0x70;
             if info_op == 0x10 {
                 // HEAP_DELETE
-                return Observation::write(self.signal_pg_class_touch(record));
+                return self
+                    .signal_pg_class_touch(record)
+                    .map(Observation::catalog)
+                    .unwrap_or_default();
             }
         }
         Observation::default()
@@ -201,13 +217,12 @@ impl CatalogTracker {
     /// Coarse-fire (no row decode) when a record hits the current
     /// pg_class filenode, for ops the harvest path skips (DELETE). The
     /// `InvalidateSweep` verdict arms the DROP sweep at the worker
-    /// ([`PendingSweeps`], keyed by the record's xid).
-    fn signal_pg_class_touch(&mut self, record: &XLogRecord) -> bool {
-        if self.pg_class_block(record).is_none() {
-            return false;
-        }
+    /// ([`PendingSweeps`], keyed by the record's xid). Returns the written
+    /// pg_class's database
+    fn signal_pg_class_touch(&mut self, record: &XLogRecord) -> Option<u32> {
+        let (db, _rel) = self.pg_class_block(record)?;
         self.invalidation_signals_sent += 1;
-        true
+        Some(db)
     }
 
     /// First block's `(db_node, rel_node)` iff it targets the current
@@ -257,8 +272,8 @@ impl CatalogTracker {
         // refetch), under-invalidation silently masks DDL.
         self.invalidation_signals_sent += 1;
         Observation {
-            catalog_write: true,
             pg_class_user_oid: user_oid,
+            ..Observation::catalog(db)
         }
     }
 
@@ -288,27 +303,27 @@ impl CatalogTracker {
         }
     }
 
-    fn handle_relmap_update(&mut self, record: &XLogRecord) -> bool {
+    /// `Some(dbid)` once the mapping body applied; `None` for malformed
+    /// bodies, which apply nothing
+    fn handle_relmap_update(&mut self, record: &XLogRecord) -> Option<u32> {
         self.relmap_updates += 1;
         let md = &record.main_data;
-        // xl_relmap_update header: dbid(4) + tsid(4) + nbytes(4) = 12
-        if md.len() < 12 + REL_MAP_FILE_SIZE {
-            return false;
+        let header = parse_xl_relmap_update(md)?;
+        if md.len() < XL_RELMAP_UPDATE_HEADER_SIZE + REL_MAP_FILE_SIZE
+            || header.nbytes != REL_MAP_FILE_SIZE
+        {
+            return None;
         }
-        let dbid = u32::from_le_bytes(md[0..4].try_into().unwrap());
-        let _tsid = u32::from_le_bytes(md[4..8].try_into().unwrap());
-        let nbytes = i32::from_le_bytes(md[8..12].try_into().unwrap()) as usize;
-        if nbytes != REL_MAP_FILE_SIZE {
-            return false;
-        }
-        let map = &md[12..12 + REL_MAP_FILE_SIZE];
+        let dbid = header.dbid;
+        let map =
+            &md[XL_RELMAP_UPDATE_HEADER_SIZE..XL_RELMAP_UPDATE_HEADER_SIZE + REL_MAP_FILE_SIZE];
         let magic = i32::from_le_bytes(map[0..4].try_into().unwrap());
         if magic != RELMAPPER_FILEMAGIC {
-            return false;
+            return None;
         }
         let num_mappings = i32::from_le_bytes(map[4..8].try_into().unwrap()) as usize;
         if num_mappings > MAX_MAPPINGS {
-            return false;
+            return None;
         }
         let mappings = &map[8..8 + MAX_MAPPINGS * 8];
         for i in 0..num_mappings {
@@ -323,7 +338,7 @@ impl CatalogTracker {
             }
         }
         self.invalidation_signals_sent += 1;
-        true
+        Some(dbid)
     }
 
     /// Query source `pg_class` for every catalog relation (oid < 16384).
@@ -729,6 +744,47 @@ mod tests {
         let mut r = relmap_record(5, &[(1247, 70000)]);
         r.main_data.to_mut().truncate(8);
         assert!(!t.observe(&r).catalog_write);
+    }
+
+    /// Filter admits capture input only for the followed database, so every
+    /// catalog signal has to name the database it came from
+    #[test]
+    fn observation_carries_source_database() {
+        let mut t = CatalogTracker::new();
+        assert_eq!(
+            t.observe(&relmap_record(6, &[(1259, 50000)]))
+                .catalog_db_oid,
+            Some(6)
+        );
+        assert!(t.is_catalog(6, 50000), "foreign mapping still installed");
+        assert_eq!(
+            t.observe(&relmap_record(0, &[(1262, 60000)]))
+                .catalog_db_oid,
+            Some(0),
+            "shared map keeps PG's dbid 0"
+        );
+        // db 6's pg_class now lives at 50000
+        let data = pg_class_block_data(2615, 30000);
+        let obs = t.observe(&heap_block_record(RmId::Heap, 0x00, 6, 50000, data));
+        assert_eq!(obs.catalog_db_oid, Some(6));
+        assert_eq!(
+            t.observe(&heap_block_record(RmId::Heap, 0x10, 6, 50000, vec![]))
+                .catalog_db_oid,
+            Some(6),
+            "DROP-shaped delete names its database too"
+        );
+        assert_eq!(
+            t.observe(&heap_block_record(
+                RmId::Heap,
+                0x00,
+                6,
+                70000,
+                vec![0u8; 16]
+            ))
+            .catalog_db_oid,
+            None,
+            "user write is no catalog signal"
+        );
     }
 
     #[test]

@@ -409,6 +409,11 @@ impl DescriptorLog {
         self.stats.clone()
     }
 
+    /// Database this log describes; every entry's oid is scoped to it
+    pub fn db_oid(&self) -> Oid {
+        self.identity.db_oid
+    }
+
     pub fn covered_through(&self) -> u64 {
         self.index.read().unwrap().covered_through
     }
@@ -473,6 +478,10 @@ impl DescriptorLog {
         result
     }
 
+    /// Oid lookup for a caller that already proved the oid belongs to this
+    /// log's database. Production callers take
+    /// [`Self::descriptor_by_oid_in_db_at_spanned`] instead, which cannot
+    /// be used without supplying a database
     pub fn descriptor_by_oid_at(&self, oid: Oid, lsn: u64) -> LookupResult {
         match self.descriptor_by_oid_at_spanned(oid, lsn) {
             Ok((rel, _)) => LookupResult::Present(rel),
@@ -480,8 +489,27 @@ impl DescriptorLog {
         }
     }
 
-    /// Oid-keyed twin of [`Self::descriptor_at_spanned`]
-    pub fn descriptor_by_oid_at_spanned(
+    /// Oid-keyed twin of [`Self::descriptor_at_spanned`], scoped in one
+    /// step. Relation OIDs are unique only within one database, and WAL
+    /// carrying bare OIDs (`xl_heap_truncate`) names its own: comparing it
+    /// with this log's identity before the OID chain is read keeps a
+    /// foreign record from resolving a local relation
+    pub fn descriptor_by_oid_in_db_at_spanned(
+        &self,
+        db_oid: Oid,
+        oid: Oid,
+        lsn: u64,
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
+        if db_oid != self.identity.db_oid {
+            self.stats
+                .lookups_foreign_db
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(LookupResult::ForeignDb);
+        }
+        self.descriptor_by_oid_at_spanned(oid, lsn)
+    }
+
+    fn descriptor_by_oid_at_spanned(
         &self,
         oid: Oid,
         lsn: u64,
@@ -1741,6 +1769,41 @@ mod tests {
             rel_node: 8000,
         };
         assert_eq!(log.descriptor_at(shared, 150), LookupResult::NotCovered);
+    }
+
+    /// WAL naming a bare relation OID (`xl_heap_truncate`) carries its own
+    /// database; the same OID exists in every database
+    #[tokio::test(flavor = "current_thread")]
+    async fn scoped_oid_lookup_rejects_foreign_db_before_the_chain() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = desc(101, 6001, false);
+        let log = open(tmp.path()).await;
+        log.seed(batch(100, vec![present(90, &d)]), 100)
+            .await
+            .unwrap();
+        let stats = log.stats_handle();
+        assert!(matches!(
+            log.descriptor_by_oid_in_db_at_spanned(5, 101, 200),
+            Ok((found, 90)) if found == d
+        ));
+        assert_eq!(stats.lookups_foreign_db.load(Relaxed), 0);
+        assert_eq!(
+            log.descriptor_by_oid_in_db_at_spanned(6, 101, 200),
+            Err(LookupResult::ForeignDb)
+        );
+        assert_eq!(stats.lookups_foreign_db.load(Relaxed), 1);
+        assert_eq!(
+            stats.lookups_present.load(Relaxed),
+            1,
+            "foreign db never reached the oid chain"
+        );
+        // Shared-catalog dbid 0 names no per-database relation either
+        assert_eq!(
+            log.descriptor_by_oid_in_db_at_spanned(0, 101, 200),
+            Err(LookupResult::ForeignDb)
+        );
+        assert_eq!(stats.lookups_foreign_db.load(Relaxed), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

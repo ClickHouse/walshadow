@@ -768,7 +768,7 @@ async fn build_pipeline_inner(
         .current_database_oid()
         .await
         .expect("shadow db oid");
-    stream.filter_mut().set_inval_db(shadow_db_oid);
+    stream.filter_mut().set_target_db(shadow_db_oid);
     let smgr_markers = stream.filter_mut().smgr_markers();
     let desc_log = Arc::new(
         walshadow::desc_log::DescriptorLog::open(
@@ -1119,8 +1119,19 @@ pub fn spawn_txn(source: &Shadow, body: &str) -> std::thread::JoinHandle<()> {
 /// autocommit xact, ensuring the COMMIT record lands in the same
 /// segment as its heap records.
 pub fn spawn_workload(source: &Shadow, statements: Vec<String>) -> std::thread::JoinHandle<()> {
+    spawn_workload_in_db(source, "postgres", statements)
+}
+
+/// [`spawn_workload`] against another database on the same cluster: WAL is
+/// cluster-wide, so these records ride the followed database's stream
+pub fn spawn_workload_in_db(
+    source: &Shadow,
+    dbname: &str,
+    statements: Vec<String>,
+) -> std::thread::JoinHandle<()> {
     let sock = source.config().socket_dir.clone();
     let port = source.config().port;
+    let dbname = dbname.to_owned();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
         let mut args: Vec<String> = vec![
@@ -1131,7 +1142,7 @@ pub fn spawn_workload(source: &Shadow, statements: Vec<String>) -> std::thread::
             "-U".into(),
             "postgres".into(),
             "-d".into(),
-            "postgres".into(),
+            dbname,
             "-v".into(),
             "ON_ERROR_STOP=1".into(),
         ];

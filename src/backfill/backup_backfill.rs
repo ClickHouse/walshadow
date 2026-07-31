@@ -73,6 +73,7 @@ use crate::decode::wal_xact::{
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::emit::pipeline::{Fatal, ack::AckHandle, bootstrap, tail};
+use crate::filter::main_data::{parse_xl_heap_truncate, parse_xl_relmap_update};
 use crate::filter::manifest::Manifest;
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap,
@@ -129,7 +130,30 @@ async fn run_base_backup_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Resu
     Ok(outcome)
 }
 
+/// One pass covers relations of one database: the followed one. Catalog
+/// skew is a per-database question, so the prescan needs that oid before it
+/// compares any WAL OID with a request's
+fn target_db_oid(reqs: &[BackupRequest]) -> Result<Oid> {
+    let db_oid = reqs
+        .first()
+        .context("backup_backfill: empty request set")?
+        .desc
+        .rfn
+        .db_node;
+    if db_oid == 0 {
+        bail!("backup_backfill: request carries no database oid");
+    }
+    if let Some(other) = reqs.iter().find(|r| r.desc.rfn.db_node != db_oid) {
+        bail!(
+            "backup_backfill: requests span databases {db_oid} and {}",
+            other.desc.rfn.db_node
+        );
+    }
+    Ok(db_oid)
+}
+
 async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Result<PassOutcome> {
+    let target_db = target_db_oid(reqs)?;
     // Archive from the `[backup]` config, never the source-PG overlay:
     // credentials in a source table is the wrong trust direction
     // (plans/add_table.md §Anti-goals)
@@ -183,6 +207,7 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
         let patch = prescan_gap(
             &segments,
             start.timeline,
+            target_db,
             &filter_oids,
             &current_rfns,
             s_max,
@@ -604,10 +629,13 @@ impl SegmentSink for DropSegments {
     }
 }
 
-/// Drive fetched segments through a `RecordSink` in LSN order.
+/// Drive fetched segments through a `RecordSink` in LSN order. Scoped to
+/// the pass's database like the live stream, so replayed records defer
+/// decode against the same catalog-dirty trees the hot path would build
 async fn pump_segments_through(
     segments: &[(SegmentName, PathBuf)],
     timeline: u32,
+    target_db_oid: Oid,
     sink: &mut (dyn RecordSink + Send),
 ) -> Result<()> {
     let Some((first, _)) = segments.first() else {
@@ -615,6 +643,7 @@ async fn pump_segments_through(
     };
     let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
         .map_err(|e| anyhow::anyhow!("backup_backfill: WalStream: {e}"))?;
+    stream.filter_mut().set_target_db(target_db_oid);
     let mut seg_sink = DropSegments;
     for (seg, path) in segments {
         let bytes = tokio::fs::read(path)
@@ -645,18 +674,20 @@ async fn pump_segments_through(
 async fn prescan_gap(
     segments: &[(SegmentName, PathBuf)],
     timeline: u32,
+    target_db_oid: Oid,
     filter_oids: &HashSet<u32>,
     current_rfns: &HashMap<u32, u32>,
     s_max: u64,
 ) -> Result<PgXactPatch> {
     let mut sink = PrescanSink {
+        target_db_oid,
         filter_oids: filter_oids.clone(),
         current_rfns: current_rfns.clone(),
         patch: PgXactPatch::new(),
         skew: None,
         s_max,
     };
-    pump_segments_through(segments, timeline, &mut sink).await?;
+    pump_segments_through(segments, timeline, target_db_oid, &mut sink).await?;
     if let Some(reason) = sink.skew {
         bail!(
             "backup_backfill: catalog skew in the backup→opt-in gap ({reason}); the walk \
@@ -671,11 +702,12 @@ async fn prescan_gap(
 /// mapped catalogs themselves surfaces as `RM_RELMAP`, which aborts.
 const PG_CLASS_RELNODE: u32 = 1259;
 const PG_ATTRIBUTE_RELNODE: u32 = 1249;
-/// `SizeOfHeapTruncate = offsetof(xl_heap_truncate, relids)`:
-/// dbId(4) + nrelids(4) + flags(1) + align pad(3)
-const SIZE_OF_HEAP_TRUNCATE: usize = 12;
 
 struct PrescanSink {
+    /// Database the requests live in. Catalog OIDs and mapped-catalog
+    /// filenodes repeat in every database, so skew checks compare only
+    /// after the record's own database matches
+    target_db_oid: Oid,
     filter_oids: HashSet<u32>,
     /// oid → current main-fork rel_node; a decoded pg_class row for a
     /// filtered oid carrying a different filenode is a rewrite in the gap
@@ -713,7 +745,15 @@ impl PrescanSink {
             return;
         }
         if rm == RmId::RelMap as u8 {
-            self.skew = Some("relmap update (mapped-catalog rewrite)".into());
+            // Header names the map's database; dbid 0 is the shared map,
+            // which holds no pg_class / pg_attribute of any database
+            match parse_xl_relmap_update(&record.parsed.main_data) {
+                Some(map) if map.dbid == self.target_db_oid => {
+                    self.skew = Some("relmap update (mapped-catalog rewrite)".into());
+                }
+                Some(_) => {}
+                None => self.skew = Some("malformed relmap update".into()),
+            }
             return;
         }
         if rm != RmId::Heap as u8 {
@@ -721,18 +761,32 @@ impl PrescanSink {
         }
         let info = record.parsed.header.info;
         if info & XLOG_HEAP_OPMASK == XLOG_HEAP_TRUNCATE {
-            for oid in truncate_relids(&record.parsed.main_data) {
-                if self.filter_oids.contains(&oid) {
-                    self.skew = Some(format!("TRUNCATE of oid {oid}"));
-                    return;
-                }
+            // OIDs are unique per database, so the record's own dbId
+            // decides whether they can name a filtered rel at all
+            let Some(truncate) = parse_xl_heap_truncate(&record.parsed.main_data) else {
+                self.skew = Some("malformed TRUNCATE".into());
+                return;
+            };
+            if truncate.db_oid != self.target_db_oid {
+                return;
+            }
+            if let Some(oid) = truncate
+                .relids
+                .iter()
+                .find(|oid| self.filter_oids.contains(oid))
+            {
+                self.skew = Some(format!("TRUNCATE of oid {oid}"));
             }
             return;
         }
         let Some(block) = record.parsed.blocks.first() else {
             return;
         };
-        let rel_node = block.header.location.rel.rel_node;
+        let locator = block.header.location.rel;
+        if locator.db_node != self.target_db_oid {
+            return;
+        }
+        let rel_node = locator.rel_node;
         if rel_node != PG_CLASS_RELNODE && rel_node != PG_ATTRIBUTE_RELNODE {
             return;
         }
@@ -769,19 +823,6 @@ impl PrescanSink {
             }
         }
     }
-}
-
-/// `xl_heap_truncate.relids` (PG `heapam_xlog.h`).
-fn truncate_relids(main_data: &[u8]) -> Vec<u32> {
-    if main_data.len() < SIZE_OF_HEAP_TRUNCATE {
-        return Vec::new();
-    }
-    let nrelids = u32::from_le_bytes(main_data[4..8].try_into().unwrap()) as usize;
-    main_data[SIZE_OF_HEAP_TRUNCATE..]
-        .chunks_exact(4)
-        .take(nrelids)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
 }
 
 impl RecordSink for PrescanSink {
@@ -870,7 +911,7 @@ async fn replay_gap(
         rows_replayed: 0,
         commits_past_s: 0,
     };
-    pump_segments_through(segments, timeline, &mut sink).await?;
+    pump_segments_through(segments, timeline, ctx.log.db_oid(), &mut sink).await?;
 
     Ok(ReplayStats {
         next_seq: sink.next_seq,
@@ -1186,10 +1227,18 @@ mod tests {
         }
     }
 
+    /// Requests live in database 5; 6 is another database on the cluster
+    const TARGET_DB: Oid = 5;
+    const FOREIGN_DB: Oid = 6;
+
     fn catalog_rfn(rel_node: u32) -> RelFileNode {
+        db_rfn(TARGET_DB, rel_node)
+    }
+
+    fn db_rfn(db_node: Oid, rel_node: u32) -> RelFileNode {
         RelFileNode {
             spc_node: 1663,
-            db_node: 5,
+            db_node,
             rel_node,
         }
     }
@@ -1210,12 +1259,33 @@ mod tests {
 
     fn prescan(filter_oid: u32, current_rfn: u32) -> PrescanSink {
         PrescanSink {
+            target_db_oid: TARGET_DB,
             filter_oids: HashSet::from([filter_oid]),
             current_rfns: HashMap::from([(filter_oid, current_rfn)]),
             patch: PgXactPatch::new(),
             skew: None,
             s_max: u64::MAX,
         }
+    }
+
+    /// `xl_heap_truncate`: `dbId, nrelids, flags + align pad, relids[]`
+    fn truncate_main_data(db_oid: Oid, relids: &[u32]) -> Vec<u8> {
+        let mut md = Vec::new();
+        md.extend_from_slice(&db_oid.to_le_bytes());
+        md.extend_from_slice(&(relids.len() as u32).to_le_bytes());
+        md.extend_from_slice(&[0u8; 4]); // flags + align pad
+        for oid in relids {
+            md.extend_from_slice(&oid.to_le_bytes());
+        }
+        md
+    }
+
+    /// `xl_relmap_update` header; body is irrelevant to the skew verdict
+    fn relmap_main_data(dbid: Oid) -> Vec<u8> {
+        let mut md = dbid.to_le_bytes().to_vec();
+        md.extend_from_slice(&1663u32.to_le_bytes()); // tsid
+        md.extend_from_slice(&512i32.to_le_bytes()); // nbytes
+        md
     }
 
     #[test]
@@ -1309,17 +1379,17 @@ mod tests {
     #[test]
     fn prescan_aborts_on_relmap_and_filtered_truncate() {
         let mut s = prescan(16400, 16400);
-        s.observe(&record(RmId::RelMap, 0x00, 0, Vec::new(), None));
+        s.observe(&record(
+            RmId::RelMap,
+            0x00,
+            0,
+            relmap_main_data(TARGET_DB),
+            None,
+        ));
         assert!(s.skew.is_some());
 
+        let md = truncate_main_data(TARGET_DB, &[777, 16400]);
         let mut s = prescan(16400, 16400);
-        // xl_heap_truncate: dbId, nrelids=2, flags, pad, relids
-        let mut md = Vec::new();
-        md.extend_from_slice(&5u32.to_le_bytes());
-        md.extend_from_slice(&2u32.to_le_bytes());
-        md.extend_from_slice(&[0u8; 4]); // flags + align pad
-        md.extend_from_slice(&777u32.to_le_bytes());
-        md.extend_from_slice(&16400u32.to_le_bytes());
         s.observe(&record(
             RmId::Heap,
             XLOG_HEAP_TRUNCATE,
@@ -1332,6 +1402,90 @@ mod tests {
         let mut s = prescan(16401, 16401);
         s.observe(&record(RmId::Heap, XLOG_HEAP_TRUNCATE, 12, md, None));
         assert!(s.skew.is_none(), "TRUNCATE of other rels ignored");
+    }
+
+    /// Relation OIDs, mapped-catalog filenodes and pg_class rows all repeat
+    /// per database: only the record's own database decides skew
+    #[test]
+    fn prescan_ignores_foreign_database_catalog_activity() {
+        // Same oid, other database's TRUNCATE
+        let mut s = prescan(16400, 16400);
+        s.observe(&record(
+            RmId::Heap,
+            XLOG_HEAP_TRUNCATE,
+            12,
+            truncate_main_data(FOREIGN_DB, &[16400]),
+            None,
+        ));
+        assert!(s.skew.is_none(), "foreign TRUNCATE cannot name our rel");
+
+        // Malformed TRUNCATE proves no database: fail closed
+        let mut s = prescan(16400, 16400);
+        s.observe(&record(
+            RmId::Heap,
+            XLOG_HEAP_TRUNCATE,
+            12,
+            vec![0u8; 4],
+            None,
+        ));
+        assert!(s.skew.is_some(), "malformed TRUNCATE fails closed");
+
+        // Relmap of another database, and of the shared map
+        for dbid in [FOREIGN_DB, 0] {
+            let mut s = prescan(16400, 16400);
+            s.observe(&record(RmId::RelMap, 0x00, 0, relmap_main_data(dbid), None));
+            assert!(s.skew.is_none(), "relmap dbid {dbid} is not our skew");
+        }
+        let mut s = prescan(16400, 16400);
+        s.observe(&record(RmId::RelMap, 0x00, 0, vec![0u8; 4], None));
+        assert!(s.skew.is_some(), "malformed relmap fails closed");
+
+        // pg_class / pg_attribute writes for a colliding oid elsewhere,
+        // plus one this walk could not decode at all
+        for rel_node in [PG_CLASS_RELNODE, PG_ATTRIBUTE_RELNODE] {
+            let mut s = prescan(16400, 16400);
+            s.observe(&record(
+                RmId::Heap,
+                0x00,
+                10,
+                Vec::new(),
+                Some((
+                    db_rfn(FOREIGN_DB, rel_node),
+                    pg_class_insert_block(16400, 99999),
+                )),
+            ));
+            assert!(s.skew.is_none(), "foreign relnode {rel_node} write ignored");
+        }
+        let mut s = prescan(16400, 16400);
+        s.observe(&record(
+            RmId::Heap,
+            0x00,
+            10,
+            Vec::new(),
+            Some((db_rfn(FOREIGN_DB, PG_CLASS_RELNODE), vec![0u8; 3])),
+        ));
+        assert!(
+            s.skew.is_none(),
+            "undecodable foreign catalog write is not our skew"
+        );
+
+        // Commit harvest stays cluster-wide: backup pages hold XIDs from
+        // every database
+        s.observe(&record(
+            RmId::Xact,
+            XLOG_XACT_COMMIT,
+            700,
+            7i64.to_le_bytes().to_vec(),
+            None,
+        ));
+        s.observe(&record(
+            RmId::Xact,
+            XLOG_XACT_ABORT,
+            701,
+            7i64.to_le_bytes().to_vec(),
+            None,
+        ));
+        assert_eq!(s.patch.len(), 2);
     }
 
     #[test]
@@ -1376,16 +1530,19 @@ mod tests {
     }
 
     #[test]
-    fn truncate_relids_parses_flexible_array() {
-        let mut md = Vec::new();
-        md.extend_from_slice(&5u32.to_le_bytes());
-        md.extend_from_slice(&3u32.to_le_bytes());
-        md.extend_from_slice(&[0u8; 4]);
-        for oid in [1u32, 2, 3] {
-            md.extend_from_slice(&oid.to_le_bytes());
-        }
-        assert_eq!(truncate_relids(&md), vec![1, 2, 3]);
-        assert!(truncate_relids(&[0u8; 4]).is_empty());
+    fn target_db_oid_rejects_empty_and_mixed_request_sets() {
+        let req = |db_node: Oid| {
+            let mut desc = crate::backfill::backup_page_walk::make_rel();
+            desc.rfn.db_node = db_node;
+            BackupRequest {
+                desc: Arc::new(desc),
+                s_lsn: 0x1000,
+            }
+        };
+        assert!(target_db_oid(&[]).is_err(), "nothing to scope the prescan");
+        assert_eq!(target_db_oid(&[req(TARGET_DB), req(TARGET_DB)]).unwrap(), 5);
+        assert!(target_db_oid(&[req(TARGET_DB), req(FOREIGN_DB)]).is_err());
+        assert!(target_db_oid(&[req(0)]).is_err(), "no database oid");
     }
 
     fn tuple(rel_node: u32, xmin: u32, xmax: u32, infomask: u16) -> BackfillTuple {

@@ -1152,6 +1152,8 @@ mod tests {
         }
 
         let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        // Live wiring: catalog dirt is admitted only for the followed db
+        ws.filter_mut().set_target_db(5);
         ws.set_bytes_sink(Box::new(SpanLog(chunks.clone())));
         let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 64, 1024, None);
         let gate = CatalogBoundaryGate::new(
