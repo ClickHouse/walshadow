@@ -13,21 +13,6 @@ use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
-const SLOT: PortSlot = PortSlot {
-    source: 17750,
-    shadow: 17751,
-    ch_tcp: 17752,
-    ch_http: 17753,
-    walsender: 17757,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
 
 const SCHEMA_SQL: &str = "CREATE SCHEMA w;\n\
     CREATE TABLE w.\"table\" (id int PRIMARY KEY, val text);\n\
@@ -119,6 +104,7 @@ async fn weird_table_and_column_names_replicate() {
     if skip_gate() {
         return;
     }
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -127,12 +113,12 @@ async fn weird_table_and_column_names_replicate() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, SCHEMA_SQL, SLOT.source, SLOT.shadow, SLOT.walsender).await;
+    ) = fx::bootstrap_clusters(&tmp, SCHEMA_SQL, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, SLOT.ch_tcp, SLOT.ch_http).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_ch_dests(&ch);
 
     let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
@@ -142,7 +128,7 @@ async fn weird_table_and_column_names_replicate() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: SLOT.ch_tcp,
+        ch_tcp_port: slot.ch_tcp,
         mappings: mappings(),
         app_name: "walshadow-weird-idents",
         ddl: None,

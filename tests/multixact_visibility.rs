@@ -9,6 +9,9 @@
 //!
 //! Skipped silently when `initdb` is not on `$PATH`.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::process::Command;
 use std::time::Duration;
 
@@ -53,7 +56,7 @@ fn multixact_updater_matches_live_pg() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let sh = make_cluster(&tmp, 55731);
+    let sh = make_cluster(&tmp, ports::PG_SOURCE_PORT);
     sh.initdb().expect("initdb");
     sh.write_base_conf().expect("conf");
     sh.start().expect("start");

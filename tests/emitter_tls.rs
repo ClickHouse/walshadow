@@ -18,8 +18,11 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::io;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -159,23 +162,6 @@ fn make_cert(dir: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
     (p("cert.pem"), p("key.pem"), der)
 }
 
-fn pick_ports() -> (u16, u16, u16, u16) {
-    let socks = [
-        TcpListener::bind(("127.0.0.1", 0)).unwrap(),
-        TcpListener::bind(("127.0.0.1", 0)).unwrap(),
-        TcpListener::bind(("127.0.0.1", 0)).unwrap(),
-        TcpListener::bind(("127.0.0.1", 0)).unwrap(),
-    ];
-    let ports = (
-        socks[0].local_addr().unwrap().port(),
-        socks[1].local_addr().unwrap().port(),
-        socks[2].local_addr().unwrap().port(),
-        socks[3].local_addr().unwrap().port(),
-    );
-    drop(socks);
-    ports
-}
-
 /// Spawned `clickhouse server` with a plaintext native port (readiness +
 /// verifying queries) and a TLS native port (the emitter's path).
 struct TlsChServer {
@@ -195,7 +181,10 @@ impl TlsChServer {
         std::fs::create_dir_all(&log_dir).unwrap();
 
         let (cert_pem, key_pem, ca_der) = make_cert(tmp.path());
-        let (plain_port, secure_port, http_port, interserver_port) = pick_ports();
+        let plain_port = ports::reserve_port();
+        let secure_port = ports::reserve_port();
+        let http_port = ports::reserve_port();
+        let interserver_port = ports::reserve_port();
 
         let child = Command::new("clickhouse")
             .args([

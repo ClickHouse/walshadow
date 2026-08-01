@@ -17,6 +17,9 @@
 //! 4. `oracle_recovers_after_cluster_restart` — resolution fails while the
 //!    cluster is down (counted `errors`), recovers once it is back.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,7 +34,6 @@ use walshadow::oracle::{Oracle, resolve_pending_tuple};
 use walshadow::schema::{INETOID, INTERVALOID, NUMERICOID};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 
-const SHADOW_PORT: u16 = 56301;
 /// int4 array, ie `INT4ARRAYOID`
 const INT4ARRAYOID: u32 = 1007;
 
@@ -144,7 +146,7 @@ fn array_int4_1_2_3_bytes() -> Vec<u8> {
 #[tokio::test(flavor = "current_thread")]
 async fn oracle_resolves_tier3_disk_bytes() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, SHADOW_PORT) else {
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
         return;
     };
     let oracle = oracle_on(&guard.sh).await;
@@ -173,7 +175,7 @@ async fn oracle_resolves_tier3_disk_bytes() {
 #[tokio::test(flavor = "current_thread")]
 async fn oracle_falls_back_on_undecodable_bytes() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, SHADOW_PORT + 1) else {
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
         return;
     };
     let oracle = oracle_on(&guard.sh).await;
@@ -199,7 +201,7 @@ async fn oracle_falls_back_on_undecodable_bytes() {
 #[tokio::test(flavor = "current_thread")]
 async fn oracle_resolves_pg_pending_to_text() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, SHADOW_PORT + 2) else {
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
         return;
     };
     let oracle = oracle_on(&guard.sh).await;
@@ -257,7 +259,7 @@ async fn oracle_resolves_pg_pending_to_text() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oracle_recovers_after_cluster_restart() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, SHADOW_PORT + 3) else {
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
         return;
     };
     let oracle = oracle_on(&guard.sh).await;

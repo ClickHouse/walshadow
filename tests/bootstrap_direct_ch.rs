@@ -43,18 +43,6 @@ use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
-// Reserved port slot — 17300-range. Kept below the Linux ephemeral
-// port range (32768-60999) so an outbound TCP connect from the daemon
-// (to CH / shadow PG) can't land on a port we're about to bind for the
-// metrics / walsender listener. CH's `interserver_http_port` defaults
-// to `http_port + 1`, so METRICS / WALSENDER must dodge that slot too.
-const SOURCE_PORT: u16 = 17301;
-const SHADOW_PORT: u16 = 17302;
-const CH_TCP_PORT: u16 = 17309;
-const CH_HTTP_PORT: u16 = 17310;
-const METRICS_PORT: u16 = 17315;
-const WALSENDER_PORT: u16 = 17316;
-
 const N_ROWS: i32 = 64;
 
 fn make_source(tmp: &tempfile::TempDir) -> Shadow {
@@ -62,7 +50,7 @@ fn make_source(tmp: &tempfile::TempDir) -> Shadow {
         tmp.path().join("source-data"),
         tmp.path().join("source-filtered"),
     );
-    cfg.port = SOURCE_PORT;
+    cfg.port = fx::PG_SOURCE_PORT;
     cfg.socket_dir = tmp.path().join("source-sock");
     cfg.ctl_timeout = Duration::from_secs(60);
     fs::create_dir_all(&cfg.filter_out_dir).unwrap();
@@ -85,6 +73,7 @@ async fn direct_bootstrap_ch_end_to_end() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
 
     // 1. Source PG.
@@ -100,7 +89,7 @@ async fn direct_bootstrap_ch_end_to_end() {
 
     // 3. CH server + dest table.
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     fx::create_ch_dest_table(&ch, "default", "t").expect("create ch table");
 
     // 4. CH-config TOML.
@@ -108,7 +97,7 @@ async fn direct_bootstrap_ch_end_to_end() {
     fx::write_ch_config_toml(
         &ch_config_path,
         "127.0.0.1",
-        CH_TCP_PORT,
+        slot.ch_tcp,
         "default",
         &RelName::new("s14", "t"),
         &TableTarget::new("default", "t"),
@@ -136,13 +125,13 @@ async fn direct_bootstrap_ch_end_to_end() {
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");
     let stderr_path = tmp.path().join("daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{METRICS_PORT}").parse().unwrap();
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{}", slot.metrics).parse().unwrap();
     let child = Command::new(bin)
         .args([
             "--host",
             source.config().socket_dir.to_str().unwrap(),
             "--port",
-            &SOURCE_PORT.to_string(),
+            &fx::PG_SOURCE_PORT.to_string(),
             "--user",
             "postgres",
             "--dbname",
@@ -154,7 +143,7 @@ async fn direct_bootstrap_ch_end_to_end() {
             "--shadow-socket-dir",
             shadow_sock.to_str().unwrap(),
             "--shadow-port",
-            &SHADOW_PORT.to_string(),
+            &fx::PG_SHADOW_PORT.to_string(),
             "--shadow-user",
             "postgres",
             "--shadow-dbname",
@@ -166,7 +155,7 @@ async fn direct_bootstrap_ch_end_to_end() {
             "--metrics-bind",
             &metrics_addr.to_string(),
             "--walsender-bind",
-            &format!("127.0.0.1:{WALSENDER_PORT}"),
+            &format!("127.0.0.1:{}", slot.walsender),
             "--retention-bytes",
             "0",
             "--ch-config",
@@ -230,7 +219,7 @@ async fn direct_bootstrap_ch_end_to_end() {
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());
-        shadow_cfg.port = SHADOW_PORT;
+        shadow_cfg.port = fx::PG_SHADOW_PORT;
         shadow_cfg.socket_dir = shadow_sock.clone();
         shadow_cfg.ctl_timeout = Duration::from_secs(60);
         let shadow = Shadow::new(shadow_cfg);

@@ -43,6 +43,9 @@
 //! oracle if ever wanted; bootstrap doesn't depend on it. This test runs
 //! purely off `walshadow` + `walrus` crates.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
@@ -65,10 +68,6 @@ use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::heap_decoder::{ColumnValue, HeapOp};
 use walshadow::shadow::{Shadow, ShadowConfig};
 
-/// Port slot reserved for the bootstrap object-store drill (56140-range). Single source-PG per
-/// test binary so the env-var rendezvous below stays single-writer.
-const SOURCE_PORT: u16 = 56141;
-
 /// Row count loaded into the user table before push runs. Must be >0
 /// and small enough that one heap page fits the lot — at one
 /// ~32-byte tuple per row, 8 KiB holds ~250 rows, so 64 is safely on
@@ -88,7 +87,7 @@ fn make_source(tmp: &tempfile::TempDir) -> Shadow {
         tmp.path().join("source-data"),
         tmp.path().join("source-filtered"),
     );
-    cfg.port = SOURCE_PORT;
+    cfg.port = ports::PG_SOURCE_PORT;
     cfg.socket_dir = tmp.path().join("source-sock");
     cfg.ctl_timeout = Duration::from_secs(60);
     fs::create_dir_all(&cfg.filter_out_dir).unwrap();

@@ -26,13 +26,6 @@ use walshadow::mapping::TableTarget;
 use walshadow::mapping::ToastMode;
 use walshadow::schema::RelName;
 
-const SOURCE_PORT: u16 = 17591;
-const SHADOW_PORT: u16 = 17592;
-const CH_TCP_PORT: u16 = 17593;
-const CH_HTTP_PORT: u16 = 17594;
-// 17595 reserved: ChServer interserver port = http + 1
-const WALSENDER_PORT: u16 = 17596;
-
 /// 16 bytes * 512 = 8192, comfortably past the ~2KB toast threshold and
 /// spanning multiple ~2KB toast chunks.
 const BODY_SQL: &str = "repeat('walshadow-toast-', 512)";
@@ -48,6 +41,7 @@ async fn replident_full_unchanged_toast_update() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -63,16 +57,16 @@ async fn replident_full_unchanged_toast_update() {
         "CREATE TABLE public.doc (id int PRIMARY KEY, meta text, body text);\n\
          ALTER TABLE public.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n\
          ALTER TABLE public.doc REPLICA IDENTITY FULL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -117,7 +111,7 @@ async fn replident_full_unchanged_toast_update() {
             shadow_filter_dir: &shadow_filter_dir,
             shadow_stream_state,
             ch_database: "walshadow_test",
-            ch_tcp_port: CH_TCP_PORT,
+            ch_tcp_port: slot.ch_tcp,
             mappings,
             app_name: "walshadow-toast-rif",
             ddl: None,

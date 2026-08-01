@@ -29,14 +29,15 @@ async fn tail_finish_flushes_and_drains_clean() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, 17960, 17961).expect("spawn ch");
+    let ch_tcp = fx::reserve_port();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp, fx::reserve_span(2)).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
-    let (msg_tx, ack, parts) = tail::spawn(&emitter(17960), 2, stats, emitter_ack, fatal.clone())
+    let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
         .await
         .expect("spawn tail");
 
@@ -53,14 +54,15 @@ async fn tail_finish_returns_fatal_message() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, 17970, 17971).expect("spawn ch");
+    let ch_tcp = fx::reserve_port();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp, fx::reserve_span(2)).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
-    let (msg_tx, ack, parts) = tail::spawn(&emitter(17970), 2, stats, emitter_ack, fatal.clone())
+    let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
         .await
         .expect("spawn tail");
 
@@ -79,14 +81,15 @@ async fn tail_finish_fatal_during_drain() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, 17980, 17981).expect("spawn ch");
+    let ch_tcp = fx::reserve_port();
+    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp, fx::reserve_span(2)).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(AtomicU64::new(0));
-    let (msg_tx, ack, parts) = tail::spawn(&emitter(17980), 2, stats, emitter_ack, fatal.clone())
+    let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
         .await
         .expect("spawn tail");
 

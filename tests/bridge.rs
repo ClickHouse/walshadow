@@ -40,6 +40,9 @@
 //! xids, not recovery, so an open transaction exercises the same code a
 //! standby's replaying transaction does.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -57,8 +60,6 @@ use walshadow::pg::socket_conninfo;
 use walshadow::schema::ReplIdent;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{CatalogError, ShadowCatalog, ShadowCatalogConfig};
-
-const BASE_PORT: u16 = 56401;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -220,7 +221,7 @@ async fn bridge_hello_and_decode_batch() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let guard = start_pg(&tmp, BASE_PORT);
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = dial(&guard.sh).await;
 
     let info = bridge.info().expect("hello");
@@ -273,7 +274,7 @@ async fn bridge_decode_matches_typoutput() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let guard = start_pg(&tmp, BASE_PORT + 5);
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = dial(&guard.sh).await;
     let sql = connect_sql(&guard.sh).await;
 
@@ -371,7 +372,7 @@ async fn bridge_scans_uncommitted_ddl() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let guard = start_pg(&tmp, BASE_PORT + 1);
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = dial(&guard.sh).await;
 
     let setup = connect_sql(&guard.sh).await;
@@ -569,7 +570,7 @@ async fn bridge_reconnects_after_worker_exit() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let guard = start_pg(&tmp, BASE_PORT + 2);
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = dial(&guard.sh).await;
     assert_eq!(bridge.replay_lsn().await.expect("before"), 0);
 
@@ -649,7 +650,7 @@ async fn bridge_drops_bad_frames_per_connection() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let guard = start_pg(&tmp, BASE_PORT + 3);
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = dial(&guard.sh).await;
     let path = guard.sh.bridge_socket().unwrap().to_path_buf();
 
@@ -690,7 +691,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let guard = start_pg(&tmp, BASE_PORT + 6);
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = Arc::new(dial(&guard.sh).await);
     let mut cat = open_catalog(&guard.sh, bridge).await;
     let (_stand_in, mut mirror) =
@@ -849,7 +850,7 @@ async fn bridge_error_frames_stay_parseable() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let guard = start_pg(&tmp, BASE_PORT + 4);
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = dial(&guard.sh).await;
     let path = guard.sh.bridge_socket().unwrap().to_path_buf();
     let mut raw = UnixStream::connect(&path).expect("raw connect");
@@ -943,7 +944,7 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let guard = start_pg(&tmp, BASE_PORT + 7);
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let setup = connect_sql(&guard.sh).await;
     setup
         .batch_execute("CREATE TABLE t (id int PRIMARY KEY, a text)")

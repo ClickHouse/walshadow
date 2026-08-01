@@ -34,9 +34,6 @@ use walshadow::pipeline::{Fatal, bootstrap, tail};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 use walshadow::toast::ToastResolver;
 
-const CH_TCP_PORT: u16 = 17571;
-const CH_HTTP_PORT: u16 = 17572;
-
 const START_LSN: u64 = 0x5000_0000;
 const ROWS_PER_TABLE: i32 = 30;
 const INSERTERS: usize = 2;
@@ -108,8 +105,9 @@ async fn bootstrap_tail_fans_out_n2() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     for t in ["foo", "baz"] {
@@ -128,7 +126,7 @@ async fn bootstrap_tail_fans_out_n2() {
     // fan across the two inserter connections and ack out of order.
     let mut cfg = EmitterConfig {
         host: "127.0.0.1".into(),
-        port: CH_TCP_PORT,
+        port: slot.ch_tcp,
         database: "walshadow_test".into(),
         compression: CompressionChoice::None,
         row_budget: 4,

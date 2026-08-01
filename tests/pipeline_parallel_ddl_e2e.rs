@@ -35,11 +35,7 @@ use walshadow::schema::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_schema_evolution_orders_after_data() {
-    const SOURCE_PORT: u16 = 17561;
-    const SHADOW_PORT: u16 = 17562;
-    const CH_TCP_PORT: u16 = 17563;
-    const CH_HTTP_PORT: u16 = 17564;
-    const WALSENDER_PORT: u16 = 17568;
+    let slot = fx::Ports::alloc();
 
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
@@ -59,16 +55,16 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
         "CREATE SCHEMA s19;\n\
          CREATE TABLE s19.orders (id bigint PRIMARY KEY, payload text);\n\
          ALTER TABLE s19.orders REPLICA IDENTITY FULL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     // Pre-create the CH dest with only the original two columns — the
@@ -110,7 +106,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-parallel-ddl-alter",
         ddl: Some(fx::DdlPipelineArgs::default()),
@@ -205,11 +201,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_truncate_orders_after_data() {
-    const SOURCE_PORT: u16 = 17571;
-    const SHADOW_PORT: u16 = 17572;
-    const CH_TCP_PORT: u16 = 17573;
-    const CH_HTTP_PORT: u16 = 17574;
-    const WALSENDER_PORT: u16 = 17578;
+    let slot = fx::Ports::alloc();
 
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
@@ -229,16 +221,16 @@ async fn parallel_pipeline_truncate_orders_after_data() {
         "CREATE SCHEMA s19t;\n\
          CREATE TABLE s19t.t (id bigint PRIMARY KEY, payload text);\n\
          ALTER TABLE s19t.t REPLICA IDENTITY FULL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -278,7 +270,7 @@ async fn parallel_pipeline_truncate_orders_after_data() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-parallel-truncate",
         ddl: None,

@@ -132,7 +132,7 @@ params stay boot-only
 
 ```
 make -C pgext
-cargo test
+cargo nextest run --workspace --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -142,6 +142,13 @@ module out of `pgext/`, so build it first: tests fail rather than skip
 without it. Walshadow-side timeouts are
 seconds-scale by design — long timeouts mask stalls rather than
 surface them
+
+CI runs the suite through [cargo-nextest](https://nexte.st), which
+schedules across test binaries; `cargo test` still works but runs
+binaries one at a time. Concurrency limits live in
+`.config/nextest.toml`. Tests reserve TCP ports through
+`tests/common/ports.rs`, so parallel runs — including several at once on
+one machine — do not collide
 
 ## Repository layout
 

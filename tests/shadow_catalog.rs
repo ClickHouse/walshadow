@@ -3,8 +3,10 @@
 //! that feeds descriptor-log capture.
 //!
 //! Skipped silently if `initdb` is not on `$PATH`. Each test spins up a
-//! fresh data directory under a tempdir; tests pick non-overlapping
-//! ports so cargo's parallel runner doesn't collide them.
+//! fresh data directory under a tempdir.
+
+#[path = "common/ports.rs"]
+mod ports;
 
 use std::process::Command;
 use std::sync::Arc;
@@ -118,7 +120,7 @@ async fn user_relation_lookup_by_name() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55602);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
     shadow.start().expect("start");
@@ -170,7 +172,7 @@ async fn replay_lsn_gate_times_out_when_not_in_recovery() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55603);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
     shadow.start().expect("start");
@@ -199,7 +201,7 @@ async fn catalog_reconnects_after_pg_restart() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55605);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
     shadow.start().expect("start");
@@ -239,7 +241,7 @@ async fn with_transient_retry_outlasts_a_pg_restart() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55606);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
     shadow.start().expect("start");
@@ -315,7 +317,7 @@ async fn dropped_column_keeps_physical_slot() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55613);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
     shadow.start().expect("start");
@@ -385,7 +387,7 @@ async fn replident_matrix_default_nothing_full_index() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55609);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
     shadow.start().expect("start");
@@ -489,7 +491,7 @@ async fn fetch_all_descriptors_covers_eligible_kinds() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55601);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
     shadow.start().expect("start");

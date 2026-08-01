@@ -20,29 +20,6 @@ use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
-const SLOT_COMMIT: PortSlot = PortSlot {
-    source: 17980,
-    shadow: 17981,
-    ch_tcp: 17982,
-    ch_http: 17983,
-    walsender: 17987,
-};
-const SLOT_PREPARED: PortSlot = PortSlot {
-    source: 17990,
-    shadow: 17991,
-    ch_tcp: 17992,
-    ch_http: 17993,
-    walsender: 17997,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
-
 /// psql session holding a transaction open across a pipeline restart;
 /// statements execute as lines arrive on stdin
 struct TxnSession {
@@ -153,7 +130,7 @@ async fn rename_commit_after_restart_reroutes() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
         return;
     }
-    let slot = SLOT_COMMIT;
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -251,7 +228,7 @@ async fn prepared_rename_commit_after_restart_reroutes() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
         return;
     }
-    let slot = SLOT_PREPARED;
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {

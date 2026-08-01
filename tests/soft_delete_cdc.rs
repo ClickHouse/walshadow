@@ -14,56 +14,6 @@ use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
-const SLOT_IUD: PortSlot = PortSlot {
-    source: 17720,
-    shadow: 17721,
-    ch_tcp: 17722,
-    ch_http: 17723,
-    walsender: 17727,
-};
-const SLOT_UD: PortSlot = PortSlot {
-    source: 17730,
-    shadow: 17731,
-    ch_tcp: 17732,
-    ch_http: 17733,
-    walsender: 17737,
-};
-const SLOT_RESURRECT: PortSlot = PortSlot {
-    source: 17740,
-    shadow: 17741,
-    ch_tcp: 17742,
-    ch_http: 17743,
-    walsender: 17747,
-};
-const SLOT_BIGXACT: PortSlot = PortSlot {
-    source: 18000,
-    shadow: 18001,
-    ch_tcp: 18002,
-    ch_http: 18003,
-    walsender: 18007,
-};
-const SLOT_BASIC: PortSlot = PortSlot {
-    source: 17800,
-    shadow: 17801,
-    ch_tcp: 17802,
-    ch_http: 17803,
-    walsender: 17807,
-};
-const SLOT_META: PortSlot = PortSlot {
-    source: 17810,
-    shadow: 17811,
-    ch_tcp: 17812,
-    ch_http: 17813,
-    walsender: 17817,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
 
 const SCHEMA_SQL: &str = "CREATE SCHEMA sd;\n\
     CREATE TABLE sd.t (id int PRIMARY KEY, val text);\n\
@@ -104,7 +54,7 @@ fn create_ch_dest(ch: &fx::ChServer) {
 }
 
 async fn run_drill(
-    slot: PortSlot,
+    slot: fx::Ports,
     app_name: &str,
     workload: &str,
 ) -> (Shadow, fx::ChServer, tempfile::TempDir) {
@@ -112,7 +62,7 @@ async fn run_drill(
 }
 
 async fn run_drill_with(
-    slot: PortSlot,
+    slot: fx::Ports,
     app_name: &str,
     workload: &str,
     tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
@@ -195,7 +145,7 @@ async fn iud_same_batch_collapses_to_tombstone() {
         DELETE FROM sd.t WHERE id = 1;\n\
         COMMIT;\n\
         SELECT pg_switch_wal();\n";
-    let (source, ch, _tmp) = run_drill(SLOT_IUD, "walshadow-sd-iud", workload).await;
+    let (source, ch, _tmp) = run_drill(fx::Ports::alloc(), "walshadow-sd-iud", workload).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(source.psql_one("SELECT count(*) FROM sd.t").unwrap(), "0");
@@ -215,7 +165,7 @@ async fn ud_same_batch_collapses_to_tombstone() {
         DELETE FROM sd.t WHERE id = 1;\n\
         COMMIT;\n\
         SELECT pg_switch_wal();\n";
-    let (source, ch, _tmp) = run_drill(SLOT_UD, "walshadow-sd-ud", workload).await;
+    let (source, ch, _tmp) = run_drill(fx::Ports::alloc(), "walshadow-sd-ud", workload).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(source.psql_one("SELECT count(*) FROM sd.t").unwrap(), "0");
@@ -232,7 +182,8 @@ async fn insert_after_delete_resurrects_key() {
         DELETE FROM sd.t WHERE id = 1;\n\
         INSERT INTO sd.t VALUES (1, 'z');\n\
         SELECT pg_switch_wal();\n";
-    let (source, ch, _tmp) = run_drill(SLOT_RESURRECT, "walshadow-sd-resurrect", workload).await;
+    let (source, ch, _tmp) =
+        run_drill(fx::Ports::alloc(), "walshadow-sd-resurrect", workload).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(source.psql_one("SELECT count(*) FROM sd.t").unwrap(), "1");
@@ -258,7 +209,7 @@ async fn basic_insert_update_delete_ends_as_tombstone() {
         UPDATE sd.t SET val = 'b' WHERE id = 1;\n\
         DELETE FROM sd.t WHERE id = 1;\n\
         SELECT pg_switch_wal();\n";
-    let (source, ch, _tmp) = run_drill(SLOT_BASIC, "walshadow-sd-basic", workload).await;
+    let (source, ch, _tmp) = run_drill(fx::Ports::alloc(), "walshadow-sd-basic", workload).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(source.psql_one("SELECT count(*) FROM sd.t").unwrap(), "0");
@@ -281,11 +232,15 @@ async fn large_single_xact_triggers_mid_loop_chunk_flush() {
         INSERT INTO sd.t (id, val) SELECT g, 'v' FROM generate_series(1, 40) AS g;\n\
         COMMIT;\n\
         SELECT pg_switch_wal();\n";
-    let (source, ch, _tmp) =
-        run_drill_with(SLOT_BIGXACT, "walshadow-sd-bigxact", workload, |cfg| {
+    let (source, ch, _tmp) = run_drill_with(
+        fx::Ports::alloc(),
+        "walshadow-sd-bigxact",
+        workload,
+        |cfg| {
             cfg.decode_chunk_rows = 16;
-        })
-        .await;
+        },
+    )
+    .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(source.psql_one("SELECT count(*) FROM sd.t").unwrap(), "40");
@@ -305,7 +260,7 @@ async fn metadata_columns_are_populated() {
         DELETE FROM sd.t WHERE id = 1;\n\
         INSERT INTO sd.t VALUES (2, 'b');\n\
         SELECT pg_switch_wal();\n";
-    let (source, ch, _tmp) = run_drill(SLOT_META, "walshadow-sd-meta", workload).await;
+    let (source, ch, _tmp) = run_drill(fx::Ports::alloc(), "walshadow-sd-meta", workload).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(winning_flag(&ch, 1), "true", "deleted key is a tombstone");

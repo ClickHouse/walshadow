@@ -15,8 +15,8 @@ is to make long-running daemon survivable, observable, resumable
   debug window, drop older ones to bound disk
 - Persist resume state (six LSNs + resolved floor + source identity)
   across `kill -9` so daemon restart hands source's slot byte-identical
-  write/flush/apply triple, and `cargo test --test kill_restart` proves
-  end-state parity over 15 seeded kill/restart cycles
+  write/flush/apply triple, and `cargo nextest run -E 'test(kill_restart)'`
+  proves end-state parity over 15 seeded kill/restart cycles
 
 ## Preflight validators
 
@@ -390,9 +390,10 @@ persist between kill and restart
 ## Kill-restart drill
 
 [`tests/kill_restart.rs`](../tests/kill_restart.rs). Three cutoff
-strategies × five seeded windows = 15 daemon spawn/kill/restart cycles
-per CI invocation. Source PG + CH server + basebackup-cloned shadow
-stand up once, daemon cycles inside
+strategies, one test each, five seeded windows per test = 15 daemon
+spawn/kill/restart cycles per CI invocation. Each test stands up its own
+source PG + CH server + basebackup-cloned shadow, daemon cycles inside,
+so the three run concurrently
 
 Strategies:
 
@@ -418,15 +419,16 @@ assert CH `count + sum(id) + md5(string_agg(name, ',' ORDER BY id))`
 matches source
 
 `WALSHADOW_KILL_SEED` env (default `0xC11AC11A`) seeds inline
-splitmix-style LCG so CI is reproducible. Per-(strategy, run) seed
-derivative shifts 250-750 ms kill window within each strategy. Nightly
-rotation across seeds surfaces rare-window bugs
+splitmix-style LCG so CI is reproducible. Strategy is folded into the
+base seed and the per-run derivative shifts the 250-750 ms kill window,
+so the three strategies walk different windows. Nightly rotation across
+seeds surfaces rare-window bugs
 
 Test is NOT `#[ignore]`. Uses runtime skip-gates checking
 `fx::pg_available()` / `fx::pg_basebackup_available()` /
 `fx::clickhouse_available()` — silently `return` when binaries are
 absent, panics on actual failure when present (switched away from
-`#[ignore]` so default `cargo test` exercises drill on any dev box with
+`#[ignore]` so a default test run exercises drill on any dev box with
 PG + CH on PATH)
 
 Source pins `wal_keep_size = '128MB'` so 250-750 ms of WAL stays

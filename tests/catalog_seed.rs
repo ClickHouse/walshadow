@@ -11,6 +11,9 @@
 //! — this stands in for the upstream "source PG", not shadow PG. The
 //! same binary serves both roles.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::process::Command;
 use std::time::Duration;
 
@@ -92,7 +95,7 @@ async fn seed_picks_up_initial_mapped_catalog_filenodes() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let sh = make_cluster(&tmp, 55701);
+    let sh = make_cluster(&tmp, ports::PG_SOURCE_PORT);
     sh.initdb().expect("initdb");
     sh.write_base_conf().expect("conf");
     sh.start().expect("start");
@@ -147,7 +150,7 @@ async fn seed_closes_pre_attach_pg_class_rotation_hole() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let sh = make_cluster(&tmp, 55702);
+    let sh = make_cluster(&tmp, ports::PG_SOURCE_PORT);
     sh.initdb().expect("initdb");
     sh.write_base_conf().expect("conf");
     sh.start().expect("start");
@@ -216,7 +219,7 @@ async fn seed_skips_user_tables() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let sh = make_cluster(&tmp, 55703);
+    let sh = make_cluster(&tmp, ports::PG_SOURCE_PORT);
     sh.initdb().expect("initdb");
     sh.write_base_conf().expect("conf");
     sh.start().expect("start");

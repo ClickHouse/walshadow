@@ -14,28 +14,6 @@ use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
-const SLOT_BASIC: PortSlot = PortSlot {
-    source: 17700,
-    shadow: 17701,
-    ch_tcp: 17702,
-    ch_http: 17703,
-    walsender: 17707,
-};
-const SLOT_TOAST: PortSlot = PortSlot {
-    source: 17710,
-    shadow: 17711,
-    ch_tcp: 17712,
-    ch_http: 17713,
-    walsender: 17717,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
 
 const SCHEMA_SQL: &str = "CREATE SCHEMA ck;\n\
     CREATE TABLE ck.t (a int, b int, val text, PRIMARY KEY (a, b));\n\
@@ -82,7 +60,7 @@ fn create_ch_dest(ch: &fx::ChServer) {
 }
 
 async fn run_drill(
-    slot: PortSlot,
+    slot: fx::Ports,
     app_name: &str,
     workload: &str,
 ) -> (Shadow, fx::ChServer, tempfile::TempDir) {
@@ -163,7 +141,8 @@ async fn composite_pk_dedup_keys_on_full_tuple() {
         DELETE FROM ck.t WHERE a = 2 AND b = 1;\n\
         COMMIT;\n\
         SELECT pg_switch_wal();\n";
-    let (source, ch, _tmp) = run_drill(SLOT_BASIC, "walshadow-composite-pk-basic", workload).await;
+    let (source, ch, _tmp) =
+        run_drill(fx::Ports::alloc(), "walshadow-composite-pk-basic", workload).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(
@@ -197,7 +176,8 @@ async fn composite_pk_with_toast_value() {
         UPDATE ck.t SET val = repeat('z', 11000) WHERE a = 1 AND b = 2;\n\
         DELETE FROM ck.t WHERE a = 1 AND b = 1;\n\
         SELECT pg_switch_wal();\n";
-    let (source, ch, _tmp) = run_drill(SLOT_TOAST, "walshadow-composite-pk-toast", workload).await;
+    let (source, ch, _tmp) =
+        run_drill(fx::Ports::alloc(), "walshadow-composite-pk-toast", workload).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(

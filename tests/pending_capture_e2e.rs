@@ -33,36 +33,6 @@ use std::time::Duration;
 use walshadow::mapping::NamespaceMapping;
 use walshadow::shadow::Shadow;
 
-const SLOT_COVERED: PortSlot = PortSlot {
-    source: 18100,
-    shadow: 18101,
-    ch_tcp: 18102,
-    ch_http: 18103,
-    walsender: 18107,
-};
-const SLOT_SAVEPOINT: PortSlot = PortSlot {
-    source: 18110,
-    shadow: 18111,
-    ch_tcp: 18112,
-    ch_http: 18113,
-    walsender: 18117,
-};
-const SLOT_BORN: PortSlot = PortSlot {
-    source: 18120,
-    shadow: 18121,
-    ch_tcp: 18122,
-    ch_http: 18123,
-    walsender: 18127,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
-
 fn skip_gate() -> bool {
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
@@ -79,7 +49,7 @@ struct Drill {
     _tmp: tempfile::TempDir,
 }
 
-async fn build_drill(slot: PortSlot, schema_sql: &str, app_name: &str) -> Drill {
+async fn build_drill(slot: fx::Ports, schema_sql: &str, app_name: &str) -> Drill {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -169,7 +139,7 @@ async fn pending_timeline_decodes_the_post_ddl_row() {
         return;
     }
     let mut drill = build_drill(
-        SLOT_COVERED,
+        fx::Ports::alloc(),
         "CREATE SCHEMA pc;\n\
          CREATE TABLE pc.t (id bigint PRIMARY KEY, v varchar(10));\n",
         "walshadow-pending-covered",
@@ -235,7 +205,12 @@ async fn relation_born_in_xact_keeps_a_slot_per_boundary() {
     if skip_gate() {
         return;
     }
-    let mut drill = build_drill(SLOT_BORN, "CREATE SCHEMA pc;\n", "walshadow-pending-born").await;
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n",
+        "walshadow-pending-born",
+    )
+    .await;
     let capture = capture_stats(&drill);
 
     let driver = spawn_txn(
@@ -287,7 +262,7 @@ async fn savepoint_rollback_drops_its_pending_slots() {
         return;
     }
     let mut drill = build_drill(
-        SLOT_SAVEPOINT,
+        fx::Ports::alloc(),
         "CREATE SCHEMA pc;\n\
          CREATE TABLE pc.t (id bigint PRIMARY KEY, v text);\n",
         "walshadow-pending-savepoint",

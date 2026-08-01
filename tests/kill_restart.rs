@@ -1,8 +1,8 @@
 //! `kill -9` mid-stream + restart drill (v1.0 acceptance §5).
 //!
-//! Spawns a source PG + ClickHouse server once, then loops three cutoff
-//! strategies × five seeded kill windows = 15 daemon spawn/kill/restart
-//! cycles. Each cycle:
+//! One test per cutoff strategy, each spawning its own source PG +
+//! ClickHouse server once and looping five seeded kill windows = 15
+//! daemon spawn/kill/restart cycles across the three. Each cycle:
 //!
 //!   1. spawn `walshadow-stream` (basebackup-cloned shadow PG already
 //!      wired in by `bootstrap_clusters_for_kill`)
@@ -20,8 +20,8 @@
 //!      id)) matches source's
 //!
 //! `WALSHADOW_KILL_SEED` env seeds the LCG; unset → fixed 0xC11AC11A so
-//! CI is reproducible. Per-(strategy, run) seed derivative shifts the
-//! 250-750 ms kill window inside each strategy.
+//! CI is reproducible. Strategy folds into the base seed and the per-run
+//! derivative shifts the 250-750 ms kill window.
 //!
 //! Skipped silently when `initdb`, `pg_basebackup`, or the `clickhouse`
 //! multitool is absent. Linux-only — `Shadow` fixture is POSIX-style.
@@ -48,33 +48,17 @@ use walshadow::pg::parse_pg_lsn;
 use walshadow::schema::RelName;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
-// 17360-range — below the Linux ephemeral port range so outbound
-// connects can't grab a port we're about to bind. CH's
-// `interserver_http_port = http_port + 1` must dodge METRICS / WALSENDER.
-const SOURCE_PORT: u16 = 17361;
-const SHADOW_PORT: u16 = 17362;
-const CH_TCP_PORT: u16 = 17369;
-const CH_HTTP_PORT: u16 = 17370;
-const METRICS_PORT: u16 = 17375;
-const WALSENDER_PORT: u16 = 17376;
-
 /// Fixed seed for CI reproducibility. Operators rotate locally via
 /// `WALSHADOW_KILL_SEED=...` to widen coverage.
 const DEFAULT_SEED: u64 = 0xC11AC11A;
 
-/// Cutoff strategies — 5 seeded runs each.
+/// Cutoff strategies — one test each, 5 seeded runs per test.
 #[derive(Clone, Copy, Debug)]
 enum Strategy {
     MidSegment,
     MidXact,
     PostCommit,
 }
-
-const STRATEGIES: &[Strategy] = &[
-    Strategy::MidSegment,
-    Strategy::MidXact,
-    Strategy::PostCommit,
-];
 
 const RUNS_PER_STRATEGY: u32 = 5;
 
@@ -192,7 +176,7 @@ impl DaemonFlags {
             "--host".into(),
             self.source_sock.to_string_lossy().into_owned(),
             "--port".into(),
-            SOURCE_PORT.to_string(),
+            fx::PG_SOURCE_PORT.to_string(),
             "--user".into(),
             "postgres".into(),
             "--dbname".into(),
@@ -204,7 +188,7 @@ impl DaemonFlags {
             "--shadow-socket-dir".into(),
             self.shadow_sock.to_string_lossy().into_owned(),
             "--shadow-port".into(),
-            SHADOW_PORT.to_string(),
+            fx::PG_SHADOW_PORT.to_string(),
             "--shadow-user".into(),
             "postgres".into(),
             "--shadow-dbname".into(),
@@ -268,7 +252,7 @@ async fn small_insert_loop(
                     "-h",
                     sock.to_str().unwrap(),
                     "-p",
-                    &SOURCE_PORT.to_string(),
+                    &fx::PG_SOURCE_PORT.to_string(),
                     "-U",
                     "postgres",
                     "-d",
@@ -304,7 +288,7 @@ async fn large_xact(source_sock: PathBuf, start_id: i64) {
                 "-h",
                 source_sock.to_str().unwrap(),
                 "-p",
-                &SOURCE_PORT.to_string(),
+                &fx::PG_SOURCE_PORT.to_string(),
                 "-U",
                 "postgres",
                 "-d",
@@ -378,11 +362,11 @@ async fn wait_for_ack_catchup(
     bail!("emitter_ack_lsn never reached {target:X} in {deadline:?}");
 }
 
-fn write_ch_config(ch_config_path: &Path) -> Result<()> {
+fn write_ch_config(ch_config_path: &Path, ch_tcp_port: u16) -> Result<()> {
     fx::write_ch_config_toml(
         ch_config_path,
         "127.0.0.1",
-        CH_TCP_PORT,
+        ch_tcp_port,
         "default",
         &RelName::new("kr", "t"),
         &TableTarget::new("default", "kr_t"),
@@ -390,7 +374,21 @@ fn write_ch_config(ch_config_path: &Path) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kill_restart_preserves_end_state() {
+async fn kill_restart_mid_segment_preserves_end_state() {
+    drill(Strategy::MidSegment).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_restart_mid_xact_preserves_end_state() {
+    drill(Strategy::MidXact).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_restart_post_commit_preserves_end_state() {
+    drill(Strategy::PostCommit).await;
+}
+
+async fn drill(strategy: Strategy) {
     if !fx::pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
@@ -404,21 +402,25 @@ async fn kill_restart_preserves_end_state() {
         return;
     }
 
-    if let Err(e) = run_drill().await {
+    if let Err(e) = run_drill(strategy).await {
         panic!("kill-restart drill failed: {e:#}");
     }
 }
 
-async fn run_drill() -> Result<()> {
+async fn run_drill(strategy: Strategy) -> Result<()> {
+    // Strategy folded into the seed so the three tests walk different kill
+    // windows off one base seed.
     let seed_env = std::env::var("WALSHADOW_KILL_SEED")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SEED);
+        .unwrap_or(DEFAULT_SEED)
+        ^ (strategy as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir()?;
 
     // 1. Source PG.
-    let source = make_pg(&tmp, "source", SOURCE_PORT);
+    let source = make_pg(&tmp, "source", fx::PG_SOURCE_PORT);
     source.initdb().context("initdb source")?;
     source.write_base_conf().context("source base conf")?;
     append_source_conf(&source).context("append source conf")?;
@@ -448,24 +450,25 @@ async fn run_drill() -> Result<()> {
     fs::create_dir_all(&shadow_filter_dir)?;
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock)?;
-    rewrite_for_shadow(&shadow_data, SHADOW_PORT, &shadow_sock).context("retarget shadow")?;
-    enable_recovery(&shadow_data, &shadow_filter_dir, WALSENDER_PORT).context("recovery conf")?;
+    rewrite_for_shadow(&shadow_data, fx::PG_SHADOW_PORT, &shadow_sock)
+        .context("retarget shadow")?;
+    enable_recovery(&shadow_data, &shadow_filter_dir, slot.walsender).context("recovery conf")?;
     // Bridge worker outlives every daemon cycle: the daemon dials it at boot,
     // so each restart reconnects to the same preloaded worker
     fx::append_bridge_conf(&shadow_data, &shadow_sock, "postgres", fx::pgext_dir())
         .context("preload bridge worker")?;
 
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
-    shadow_cfg.port = SHADOW_PORT;
+    shadow_cfg.port = fx::PG_SHADOW_PORT;
     shadow_cfg.socket_dir = shadow_sock.clone();
     shadow_cfg.ctl_timeout = Duration::from_secs(60);
     let shadow = Shadow::new(shadow_cfg);
     shadow.start().context("start shadow standby")?;
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
-    // 3. CH server + dest table (alive across all 15 daemon cycles).
+    // 3. CH server + dest table (alive across all 5 daemon cycles).
     let ch_tmp = tempfile::tempdir()?;
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).context("spawn ch")?;
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).context("spawn ch")?;
     fx::create_ch_dest_table(&ch, "default", "kr_t").context("create ch dest table")?;
 
     // 4. Daemon flags — identical across every spawn so kill / restart
@@ -473,14 +476,14 @@ async fn run_drill() -> Result<()> {
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir)?;
     let ch_config_path = tmp.path().join("ch-config.toml");
-    write_ch_config(&ch_config_path).context("write ch-config")?;
+    write_ch_config(&ch_config_path, slot.ch_tcp).context("write ch-config")?;
     let flags = DaemonFlags {
         source_sock: source.config().socket_dir.clone(),
         shadow_sock: shadow_sock.clone(),
         filter_dir: shadow_filter_dir.clone(),
         spill_dir: spill_dir.clone(),
-        metrics_addr: format!("127.0.0.1:{METRICS_PORT}").parse().unwrap(),
-        walsender_bind: format!("127.0.0.1:{WALSENDER_PORT}").parse().unwrap(),
+        metrics_addr: format!("127.0.0.1:{}", slot.metrics).parse().unwrap(),
+        walsender_bind: format!("127.0.0.1:{}", slot.walsender).parse().unwrap(),
         ch_config: ch_config_path.clone(),
     };
 
@@ -488,35 +491,33 @@ async fn run_drill() -> Result<()> {
     // window so concurrent inserts don't collide on the PK.
     let next_id = Arc::new(std::sync::atomic::AtomicI64::new(1));
 
-    // 5. Drill loop: each (strategy, run) is one kill/restart cycle.
+    // 5. Drill loop: each run is one kill/restart cycle.
     let mut seed = seed_env;
-    for strategy in STRATEGIES {
-        for run in 0..RUNS_PER_STRATEGY {
-            let cycle_seed = next_seeded(&mut seed);
-            let kill_delay_ms = 250 + (cycle_seed % 500);
-            let stderr_path = tmp
-                .path()
-                .join(format!("daemon.{strategy:?}.{run}.stderr.log"));
+    for run in 0..RUNS_PER_STRATEGY {
+        let cycle_seed = next_seeded(&mut seed);
+        let kill_delay_ms = 250 + (cycle_seed % 500);
+        let stderr_path = tmp
+            .path()
+            .join(format!("daemon.{strategy:?}.{run}.stderr.log"));
 
-            let outcome = run_cycle(
-                *strategy,
-                run,
-                kill_delay_ms,
-                &source,
-                &ch,
-                &flags,
-                &stderr_path,
-                next_id.clone(),
-            )
-            .await;
+        let outcome = run_cycle(
+            strategy,
+            run,
+            kill_delay_ms,
+            &source,
+            &ch,
+            &flags,
+            &stderr_path,
+            next_id.clone(),
+        )
+        .await;
 
-            if let Err(e) = outcome {
-                let stderr_blob = fs::read_to_string(&stderr_path).unwrap_or_default();
-                bail!(
-                    "cycle {strategy:?}#{run} (seed={cycle_seed:#x}, kill_delay={kill_delay_ms}ms): {e:#}\n\
-                     --- daemon stderr ---\n{stderr_blob}",
-                );
-            }
+        if let Err(e) = outcome {
+            let stderr_blob = fs::read_to_string(&stderr_path).unwrap_or_default();
+            bail!(
+                "cycle {strategy:?}#{run} (seed={cycle_seed:#x}, kill_delay={kill_delay_ms}ms): {e:#}\n\
+                 --- daemon stderr ---\n{stderr_blob}",
+            );
         }
     }
 

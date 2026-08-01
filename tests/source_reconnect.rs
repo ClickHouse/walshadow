@@ -4,6 +4,9 @@
 //!
 //! Skipped silently when `initdb`/`psql` are absent.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::fs;
 use std::io::Write as _;
 use std::process::Command;
@@ -96,7 +99,7 @@ async fn reconnect_resumes_after_walsender_terminated() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_source(&tmp, 55731);
+    let source = make_source(&tmp, ports::PG_SOURCE_PORT);
     source.initdb().unwrap();
     source.write_base_conf().unwrap();
     append_conf(&source, &[]);
@@ -152,7 +155,7 @@ async fn recycled_segment_surfaces_58p01() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_source(&tmp, 55732);
+    let source = make_source(&tmp, ports::PG_SOURCE_PORT);
     source.initdb().unwrap();
     source.write_base_conf().unwrap();
     append_conf(
@@ -214,7 +217,7 @@ async fn slot_prevents_segment_recycle() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_source(&tmp, 55733);
+    let source = make_source(&tmp, ports::PG_SOURCE_PORT);
     source.initdb().unwrap();
     source.write_base_conf().unwrap();
     append_conf(

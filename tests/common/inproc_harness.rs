@@ -17,6 +17,11 @@
 
 #![allow(dead_code)]
 
+#[path = "ports.rs"]
+mod ports;
+#[allow(unused_imports)]
+pub use ports::{PG_SHADOW_PORT, PG_SOURCE_PORT, Ports, reserve_port, reserve_span};
+
 use std::fs;
 use std::io::Write as _;
 use std::net::TcpStream;

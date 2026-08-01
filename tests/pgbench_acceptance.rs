@@ -36,38 +36,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use walshadow::shadow::{Shadow, ShadowConfig};
 
-// Port slots in the 17340 / 17360 ranges. Below the Linux ephemeral range
-// so outbound connects can't grab a port we're about to bind. CH's
-// `interserver_http_port = http_port + 1` must dodge metrics / walsender.
-// Two disjoint sets so the 1/1 and 2/2 pool variants run concurrently.
-#[derive(Clone, Copy)]
-struct Ports {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    metrics: u16,
-    walsender: u16,
-}
-
-const SERIAL_PORTS: Ports = Ports {
-    source: 17341,
-    shadow: 17342,
-    ch_tcp: 17349,
-    ch_http: 17350,
-    metrics: 17355,
-    walsender: 17356,
-};
-
-const POOLED_PORTS: Ports = Ports {
-    source: 17361,
-    shadow: 17362,
-    ch_tcp: 17369,
-    ch_http: 17370,
-    metrics: 17375,
-    walsender: 17376,
-};
-
 fn pgbench_available() -> bool {
     Command::new("pgbench")
         .arg("--version")
@@ -270,7 +238,12 @@ fn pgbench_init(source: &Shadow, scale: u32) -> Result<()> {
 /// concurrent `AsyncClient`s for both bootstrap and WAL under the DDL
 /// barrier, asserting out-of-order INSERTs across connections stay
 /// `_lsn`-correct (the parity oracle at the end).
-async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usize, label: &str) {
+async fn run_ddl_intermix(
+    ports: fx::Ports,
+    decoder_pool: usize,
+    inserter_pool: usize,
+    label: &str,
+) {
     if !fx::pg_available() {
         tracing::warn!("skip: no initdb on PATH");
         return;
@@ -645,7 +618,7 @@ async fn run_ddl_intermix(ports: Ports, decoder_pool: usize, inserter_pool: usiz
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgbench_acceptance_ddl_intermix() {
-    run_ddl_intermix(SERIAL_PORTS, 1, 1, "pgbench_acceptance_ddl_intermix").await;
+    run_ddl_intermix(fx::Ports::alloc(), 1, 1, "pgbench_acceptance_ddl_intermix").await;
 }
 
 /// Same drill at decoder/inserter pool 2/2 — the live daemon coverage for
@@ -653,7 +626,13 @@ async fn pgbench_acceptance_ddl_intermix() {
 /// `pipeline_parallel_{e2e,ddl_e2e}` tests can't provide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgbench_acceptance_ddl_intermix_pooled() {
-    run_ddl_intermix(POOLED_PORTS, 2, 2, "pgbench_acceptance_ddl_intermix_pooled").await;
+    run_ddl_intermix(
+        fx::Ports::alloc(),
+        2,
+        2,
+        "pgbench_acceptance_ddl_intermix_pooled",
+    )
+    .await;
 }
 
 /// Poll a `std::process::Child` until exit or timeout. Mirrors

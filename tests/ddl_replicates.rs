@@ -35,12 +35,7 @@ use walshadow::schema::RelName;
 
 // Each test shifts these by +0 / +10 / +20. The CH server's
 // `interserver_http_port = http_port + 1` so leave a 5-port gap
-// between CH_HTTP_PORT and WALSENDER_PORT to avoid collision.
-const SOURCE_PORT: u16 = 17461;
-const SHADOW_PORT: u16 = 17462;
-const CH_TCP_PORT: u16 = 17463;
-const CH_HTTP_PORT: u16 = 17464;
-const WALSENDER_PORT: u16 = 17468;
+// between slot.ch_http and slot.walsender to avoid collision.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alter_add_column_replicates_without_toml_edit() {
@@ -57,6 +52,7 @@ async fn alter_add_column_replicates_without_toml_edit() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -70,16 +66,16 @@ async fn alter_add_column_replicates_without_toml_edit() {
         "CREATE SCHEMA s15;\n\
          CREATE TABLE s15.orders (id bigint PRIMARY KEY, payload text);\n\
          ALTER TABLE s15.orders REPLICA IDENTITY FULL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     // Pre-create CH dest with only the original two columns. Note: the
@@ -121,7 +117,7 @@ async fn alter_add_column_replicates_without_toml_edit() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-ddl-alter-add",
         ddl: Some(fx::DdlPipelineArgs::default()),
@@ -195,12 +191,8 @@ async fn create_table_auto_replicates_in_namespace() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 10;
-    let shadow_port = SHADOW_PORT + 10;
-    let ch_tcp_port = CH_TCP_PORT + 10;
-    let ch_http_port = CH_HTTP_PORT + 10;
-    let walsender_port = WALSENDER_PORT + 10;
     let (
         fx::BootstrappedClusters {
             source,
@@ -211,16 +203,16 @@ async fn create_table_auto_replicates_in_namespace() {
     ) = fx::bootstrap_clusters(
         &tmp,
         "CREATE SCHEMA s15ns;\n",
-        source_port,
-        shadow_port,
-        walsender_port,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -242,7 +234,7 @@ async fn create_table_auto_replicates_in_namespace() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-ddl-create-auto",
         ddl: Some(ddl_args),
@@ -298,12 +290,8 @@ async fn drop_table_strategy_drop_removes_dest() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 20;
-    let shadow_port = SHADOW_PORT + 20;
-    let ch_tcp_port = CH_TCP_PORT + 20;
-    let ch_http_port = CH_HTTP_PORT + 20;
-    let walsender_port = WALSENDER_PORT + 20;
     let (
         fx::BootstrappedClusters {
             source,
@@ -314,16 +302,16 @@ async fn drop_table_strategy_drop_removes_dest() {
     ) = fx::bootstrap_clusters(
         &tmp,
         "CREATE SCHEMA s15drop;\n",
-        source_port,
-        shadow_port,
-        walsender_port,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -345,7 +333,7 @@ async fn drop_table_strategy_drop_removes_dest() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-ddl-drop",
         ddl: Some(ddl_args),
@@ -400,13 +388,9 @@ async fn pinned_mapping_create_drop_create_recreates_dest() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     // +50, not +40: 1750x belongs to pipeline_parallel_e2e
-    let source_port = SOURCE_PORT + 50;
-    let shadow_port = SHADOW_PORT + 50;
-    let ch_tcp_port = CH_TCP_PORT + 50;
-    let ch_http_port = CH_HTTP_PORT + 50;
-    let walsender_port = WALSENDER_PORT + 50;
     let (
         fx::BootstrappedClusters {
             source,
@@ -418,16 +402,16 @@ async fn pinned_mapping_create_drop_create_recreates_dest() {
         &tmp,
         "CREATE SCHEMA s15pin;\n\
          CREATE TABLE s15pin.t (id bigint PRIMARY KEY, body text);\n",
-        source_port,
-        shadow_port,
-        walsender_port,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     // Operator-managed dest for the pinned mapping (custom table name so
@@ -472,7 +456,7 @@ async fn pinned_mapping_create_drop_create_recreates_dest() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-ddl-pinned-recreate",
         ddl: Some(ddl_args),
@@ -540,12 +524,8 @@ async fn auto_create_honors_per_namespace_target_database() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 30;
-    let shadow_port = SHADOW_PORT + 30;
-    let ch_tcp_port = CH_TCP_PORT + 30;
-    let ch_http_port = CH_HTTP_PORT + 30;
-    let walsender_port = WALSENDER_PORT + 30;
     let (
         fx::BootstrappedClusters {
             source,
@@ -556,16 +536,16 @@ async fn auto_create_honors_per_namespace_target_database() {
     ) = fx::bootstrap_clusters(
         &tmp,
         "CREATE SCHEMA s15warehouse;\n",
-        source_port,
-        shadow_port,
-        walsender_port,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     // Global DB and the namespace's override DB both exist; the table
     // must land in the override, "warehouse".
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
@@ -590,7 +570,7 @@ async fn auto_create_honors_per_namespace_target_database() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test", // global differs from the override
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-ddl-ns-target",
         ddl: Some(ddl_args),
@@ -647,12 +627,8 @@ async fn create_table_auto_replicates_from_toml_namespace() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 60;
-    let shadow_port = SHADOW_PORT + 60;
-    let ch_tcp_port = CH_TCP_PORT + 60;
-    let ch_http_port = CH_HTTP_PORT + 60;
-    let walsender_port = WALSENDER_PORT + 60;
     let (
         fx::BootstrappedClusters {
             source,
@@ -663,16 +639,16 @@ async fn create_table_auto_replicates_from_toml_namespace() {
     ) = fx::bootstrap_clusters(
         &tmp,
         "CREATE SCHEMA s15toml;\n",
-        source_port,
-        shadow_port,
-        walsender_port,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -686,7 +662,7 @@ async fn create_table_auto_replicates_from_toml_namespace() {
             shadow_filter_dir: &shadow_filter_dir,
             shadow_stream_state,
             ch_database: "walshadow_test",
-            ch_tcp_port,
+            ch_tcp_port: slot.ch_tcp,
             mappings: vec![],
             app_name: "walshadow-ddl-create-auto-toml",
             ddl: Some(fx::DdlPipelineArgs::default()),

@@ -78,14 +78,6 @@ use walshadow::schema::RelName;
 
 const INSTALL_SQL: &str = include_str!("../sql/runtime_config_install.sql");
 
-// Each test shifts these by +0 / +10 / +20. CH `interserver_http_port =
-// http_port + 1`, keep a gap before WALSENDER_PORT.
-const SOURCE_PORT: u16 = 17701;
-const SHADOW_PORT: u16 = 17702;
-const CH_TCP_PORT: u16 = 17703;
-const CH_HTTP_PORT: u16 = 17704;
-const WALSENDER_PORT: u16 = 17708;
-
 fn overlay_ddl_args() -> fx::DdlPipelineArgs {
     fx::DdlPipelineArgs {
         config_schema: Some("walshadow".into()),
@@ -100,6 +92,7 @@ async fn opt_in_via_config_table_replicates_new_table() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let schema_sql = format!(
         "{INSTALL_SQL}\n\
@@ -113,12 +106,12 @@ async fn opt_in_via_config_table_replicates_new_table() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, SOURCE_PORT, SHADOW_PORT, WALSENDER_PORT).await;
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -130,7 +123,7 @@ async fn opt_in_via_config_table_replicates_new_table() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-config-opt-in",
         ddl: Some(overlay_ddl_args()),
@@ -187,12 +180,8 @@ async fn opt_out_mid_stream_drains_and_halts() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 10;
-    let shadow_port = SHADOW_PORT + 10;
-    let ch_tcp_port = CH_TCP_PORT + 10;
-    let ch_http_port = CH_HTTP_PORT + 10;
-    let walsender_port = WALSENDER_PORT + 10;
     let schema_sql = format!(
         "{INSTALL_SQL}\n\
          CREATE SCHEMA app;\n\
@@ -205,12 +194,12 @@ async fn opt_out_mid_stream_drains_and_halts() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -248,7 +237,7 @@ async fn opt_out_mid_stream_drains_and_halts() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-config-opt-out",
         ddl: Some(overlay_ddl_args()),
@@ -316,12 +305,8 @@ async fn forward_decl_materializes_on_create_table() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 20;
-    let shadow_port = SHADOW_PORT + 20;
-    let ch_tcp_port = CH_TCP_PORT + 20;
-    let ch_http_port = CH_HTTP_PORT + 20;
-    let walsender_port = WALSENDER_PORT + 20;
     let schema_sql = format!("{INSTALL_SQL}\nCREATE SCHEMA app;\n");
     let (
         fx::BootstrappedClusters {
@@ -330,12 +315,12 @@ async fn forward_decl_materializes_on_create_table() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -346,7 +331,7 @@ async fn forward_decl_materializes_on_create_table() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-config-fwd-decl",
         ddl: Some(overlay_ddl_args()),
@@ -423,12 +408,8 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 30;
-    let shadow_port = SHADOW_PORT + 30;
-    let ch_tcp_port = CH_TCP_PORT + 30;
-    let ch_http_port = CH_HTTP_PORT + 30;
-    let walsender_port = WALSENDER_PORT + 30;
     // Rows land before the WAL stream ever starts, so COPY is the only path
     // that can carry them to CH. Column mix drives all three wire-decode
     // paths: int8/text/timestamptz native, numeric via ::text, jsonb cast.
@@ -453,12 +434,12 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -469,7 +450,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-config-backfill",
         ddl: Some(overlay_ddl_args()),
@@ -565,12 +546,8 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 40;
-    let shadow_port = SHADOW_PORT + 40;
-    let ch_tcp_port = CH_TCP_PORT + 40;
-    let ch_http_port = CH_HTTP_PORT + 40;
-    let walsender_port = WALSENDER_PORT + 40;
     let schema_sql = format!(
         "{INSTALL_SQL}\n\
          CREATE SCHEMA app;\n\
@@ -583,12 +560,12 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -600,7 +577,7 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-config-opt-in-alter",
         ddl: Some(overlay_ddl_args()),
@@ -675,12 +652,8 @@ async fn auto_create_namespace_via_config_namespace() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 60;
-    let shadow_port = SHADOW_PORT + 60;
-    let ch_tcp_port = CH_TCP_PORT + 60;
-    let ch_http_port = CH_HTTP_PORT + 60;
-    let walsender_port = WALSENDER_PORT + 60;
     let schema_sql = format!("{INSTALL_SQL}\nCREATE SCHEMA app;\n");
     let (
         fx::BootstrappedClusters {
@@ -689,12 +662,12 @@ async fn auto_create_namespace_via_config_namespace() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -706,7 +679,7 @@ async fn auto_create_namespace_via_config_namespace() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-config-ns-auto-create",
         ddl: Some(overlay_ddl_args()),
@@ -770,12 +743,8 @@ async fn column_target_type_override_reaches_projection() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 50;
-    let shadow_port = SHADOW_PORT + 50;
-    let ch_tcp_port = CH_TCP_PORT + 50;
-    let ch_http_port = CH_HTTP_PORT + 50;
-    let walsender_port = WALSENDER_PORT + 50;
     let schema_sql = format!(
         "{INSTALL_SQL}\n\
          CREATE SCHEMA app;\n\
@@ -788,12 +757,12 @@ async fn column_target_type_override_reaches_projection() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     // Operator-migrated dest type; the override is what makes the
@@ -833,7 +802,7 @@ async fn column_target_type_override_reaches_projection() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-config-column-override",
         ddl: Some(overlay_ddl_args()),
@@ -888,12 +857,8 @@ async fn pre_opt_in_xact_discards_post_opt_in_routes() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 70;
-    let shadow_port = SHADOW_PORT + 70;
-    let ch_tcp_port = CH_TCP_PORT + 70;
-    let ch_http_port = CH_HTTP_PORT + 70;
-    let walsender_port = WALSENDER_PORT + 70;
     let schema_sql = format!(
         "{INSTALL_SQL}\n\
          CREATE SCHEMA app;\n\
@@ -906,12 +871,12 @@ async fn pre_opt_in_xact_discards_post_opt_in_routes() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, source_port, shadow_port, walsender_port).await;
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -922,7 +887,7 @@ async fn pre_opt_in_xact_discards_post_opt_in_routes() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-config-pre-opt-in-discard",
         ddl: Some(overlay_ddl_args()),

@@ -28,74 +28,6 @@ use walshadow::mapping::{ColumnMapping, NamespaceMapping};
 use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
-// Each test owns a disjoint port slot. Cargo's default test runner
-// parallelises tests within a binary, so reusing slots would collide
-// on the source PG / shadow PG / CH listener.
-const SLOT_ROLLBACK: PortSlot = PortSlot {
-    source: 17430,
-    shadow: 17431,
-    ch_tcp: 17432,
-    ch_http: 17433,
-    walsender: 17460,
-};
-const SLOT_RELEASE: PortSlot = PortSlot {
-    source: 17434,
-    shadow: 17435,
-    ch_tcp: 17436,
-    ch_http: 17437,
-    walsender: 17461,
-};
-const SLOT_NESTED: PortSlot = PortSlot {
-    source: 17438,
-    shadow: 17439,
-    ch_tcp: 17440,
-    ch_http: 17441,
-    walsender: 17462,
-};
-const SLOT_TOP_ABORT: PortSlot = PortSlot {
-    source: 17442,
-    shadow: 17443,
-    ch_tcp: 17444,
-    ch_http: 17445,
-    walsender: 17463,
-};
-const SLOT_TOAST_ROLLBACK: PortSlot = PortSlot {
-    source: 17780,
-    shadow: 17781,
-    ch_tcp: 17782,
-    ch_http: 17783,
-    walsender: 17787,
-};
-const SLOT_IUD_ABORT: PortSlot = PortSlot {
-    source: 17790,
-    shadow: 17791,
-    ch_tcp: 17792,
-    ch_http: 17793,
-    walsender: 17797,
-};
-const SLOT_SP_DDL: PortSlot = PortSlot {
-    source: 17870,
-    shadow: 17871,
-    ch_tcp: 17872,
-    ch_http: 17873,
-    walsender: 17877,
-};
-const SLOT_ASSIGN: PortSlot = PortSlot {
-    source: 17880,
-    shadow: 17881,
-    ch_tcp: 17882,
-    ch_http: 17883,
-    walsender: 17887,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
-
 /// Single mapping shape every subxact test reuses.
 fn mapping() -> Vec<fx::TableMappingSpec> {
     vec![fx::TableMappingSpec {
@@ -138,7 +70,7 @@ fn create_ch_dest(ch: &fx::ChServer) {
 /// Shared drill — bootstrap clusters, pump the workload, then return
 /// the (source, ch) handles to the caller for assertions.
 async fn run_drill<F: FnOnce(&Shadow) -> std::thread::JoinHandle<()>>(
-    slot: PortSlot,
+    slot: fx::Ports,
     app_name: &str,
     spawn_driver: F,
 ) -> (Shadow, fx::ChServer, tempfile::TempDir, tempfile::TempDir) {
@@ -244,7 +176,7 @@ async fn savepoint_rollback_discards_subxact_writes() {
         )
     };
     let (source, ch, _tmp1, _tmp2) =
-        run_drill(SLOT_ROLLBACK, "walshadow-subxact-rollback", driver).await;
+        run_drill(fx::Ports::alloc(), "walshadow-subxact-rollback", driver).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     let src_count = source
@@ -272,7 +204,7 @@ async fn savepoint_release_commits_subxact_writes() {
         )
     };
     let (source, ch, _tmp1, _tmp2) =
-        run_drill(SLOT_RELEASE, "walshadow-subxact-release", driver).await;
+        run_drill(fx::Ports::alloc(), "walshadow-subxact-release", driver).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     let src_count = source
@@ -304,7 +236,7 @@ async fn orm_nested_savepoints_only_post_savepoint_writes_survive() {
         )
     };
     let (source, ch, _tmp1, _tmp2) =
-        run_drill(SLOT_NESTED, "walshadow-subxact-nested", driver).await;
+        run_drill(fx::Ports::alloc(), "walshadow-subxact-nested", driver).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     let src_count = source
@@ -339,7 +271,7 @@ async fn top_abort_with_subxacts_discards_everything() {
         )
     };
     let (source, ch, _tmp1, _tmp2) =
-        run_drill(SLOT_TOP_ABORT, "walshadow-subxact-top-abort", driver).await;
+        run_drill(fx::Ports::alloc(), "walshadow-subxact-top-abort", driver).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     let src_count = source
@@ -370,7 +302,7 @@ async fn toast_value_in_rolled_back_subxact_is_discarded() {
         )
     };
     let (source, ch, _tmp1, _tmp2) =
-        run_drill(SLOT_TOAST_ROLLBACK, "walshadow-subxact-toast", driver).await;
+        run_drill(fx::Ports::alloc(), "walshadow-subxact-toast", driver).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(
@@ -421,7 +353,7 @@ async fn iud_in_aborted_top_xact_leaves_rows_untouched() {
         )
     };
     let (source, ch, _tmp1, _tmp2) =
-        run_drill(SLOT_IUD_ABORT, "walshadow-subxact-iud-abort", driver).await;
+        run_drill(fx::Ports::alloc(), "walshadow-subxact-iud-abort", driver).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(
@@ -442,7 +374,7 @@ async fn savepoint_after_ddl_rollback_discards_column_and_rows() {
     if skip_gate() {
         return;
     }
-    let slot = SLOT_SP_DDL;
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -554,7 +486,8 @@ async fn many_subxacts_emit_assignment_record() {
     sql.push_str("COMMIT;\nSELECT pg_switch_wal();\n");
 
     let driver = |source: &Shadow| spawn_txn(source, &sql);
-    let (source, ch, _t1, _t2) = run_drill(SLOT_ASSIGN, "walshadow-subxact-assign", driver).await;
+    let (source, ch, _t1, _t2) =
+        run_drill(fx::Ports::alloc(), "walshadow-subxact-assign", driver).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     assert_eq!(

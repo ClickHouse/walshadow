@@ -39,14 +39,6 @@ use walshadow::mapping::ToastMode;
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
-const SOURCE_PORT: u16 = 17731;
-const SHADOW_PORT: u16 = 17732;
-const CH_TCP_PORT: u16 = 17733;
-const CH_HTTP_PORT: u16 = 17734;
-// 17735 reserved: ChServer interserver port = http + 1
-const WALSENDER_PORT: u16 = 17736;
-// alter_rewrite_link_swap_retires_old_mirror shifts every port +10
-
 /// Distinct byte sums identify values in the mirror (EXTERNAL storage keeps
 /// them uncompressed, so mirror bytes == raw length).
 const BODY_A_SQL: &str = "repeat('a-value-dies-first!!', 512)"; // 10240
@@ -88,6 +80,7 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -100,16 +93,16 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
         &tmp,
         "CREATE TABLE public.doc (id int PRIMARY KEY, meta text, body text);\n\
          ALTER TABLE public.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     let toast_relid = source
@@ -171,7 +164,7 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
             shadow_filter_dir: &shadow_filter_dir,
             shadow_stream_state,
             ch_database: "walshadow_test",
-            ch_tcp_port: CH_TCP_PORT,
+            ch_tcp_port: slot.ch_tcp,
             mappings,
             app_name: "walshadow-toast-rewrite",
             ddl: Some(fx::DdlPipelineArgs::default()),
@@ -479,6 +472,7 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -491,16 +485,16 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
         &tmp,
         "CREATE TABLE public.doc (id int PRIMARY KEY, body text);\n\
          ALTER TABLE public.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n",
-        SOURCE_PORT + 10,
-        SHADOW_PORT + 10,
-        WALSENDER_PORT + 10,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT + 10, CH_HTTP_PORT + 10).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -520,7 +514,7 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
             shadow_filter_dir: &shadow_filter_dir,
             shadow_stream_state,
             ch_database: "walshadow_test",
-            ch_tcp_port: CH_TCP_PORT + 10,
+            ch_tcp_port: slot.ch_tcp,
             mappings: vec![],
             app_name: "walshadow-toast-alter-rewrite",
             ddl: Some(fx::DdlPipelineArgs::default()),

@@ -1,0 +1,32 @@
+# cargo-nextest runs one process per test and schedules across test
+# binaries, so the suite is no longer serialized behind the slowest
+# binary. Ports come from `tests/common/ports.rs`, which reserves them
+# across processes.
+
+[profile.default]
+# Unit tests are cheap and numerous; the cap that matters is on the
+# cluster group below.
+test-threads = "num-cpus"
+# Warn while a test drags, kill only what is clearly wedged. The
+# longest drill (kill_restart, 5 spawn/kill/restart cycles) runs ~100s
+# unloaded.
+slow-timeout = { period = "45s", terminate-after = 8 }
+failure-output = "immediate-final"
+final-status-level = "slow"
+
+# Every integration test stages one or two PostgreSQL clusters plus a
+# ClickHouse server, so their concurrency is bounded by RAM and disk,
+# not by cores.
+[test-groups.clusters]
+max-threads = 4
+
+[[profile.default.overrides]]
+filter = 'kind(test)'
+test-group = 'clusters'
+
+# Longest pole by far (~90s: 5 seeded spawn/kill/restart cycles each).
+# Started last it sets the wall clock on its own; started first it hides
+# under everything else.
+[[profile.default.overrides]]
+filter = 'binary(kill_restart)'
+priority = 50

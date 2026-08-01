@@ -25,12 +25,6 @@ use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
-const SOURCE_PORT: u16 = 17411;
-const SHADOW_PORT: u16 = 17412;
-const CH_TCP_PORT: u16 = 17413;
-const CH_HTTP_PORT: u16 = 17414;
-const WALSENDER_PORT: u16 = 17451;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn truncate_removes_ch_rows() {
     if !fx::pg_available() {
@@ -46,6 +40,7 @@ async fn truncate_removes_ch_rows() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -59,16 +54,16 @@ async fn truncate_removes_ch_rows() {
         "CREATE SCHEMA s14;\n\
          CREATE TABLE s14.truncate_t (id bigint PRIMARY KEY, payload text);\n\
          ALTER TABLE s14.truncate_t REPLICA IDENTITY FULL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -106,7 +101,7 @@ async fn truncate_removes_ch_rows() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-truncate",
         ddl: None,
