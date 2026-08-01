@@ -20,6 +20,9 @@
 //!
 //! Skipped silently when `initdb` is not on `$PATH`.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
@@ -35,10 +38,6 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::heap_decoder::{ColumnValue, HeapOp};
 use walshadow::shadow::{Shadow, ShadowConfig};
-
-/// Reserved port slot — 56145 sits between `bootstrap_object_store_e2e`
-/// (56141) and other test binaries' 56170/56300 slots.
-const SOURCE_PORT: u16 = 56145;
 
 /// Same row budget as the object-store sibling: one heap page worth so
 /// the page walker has guaranteed bytes without a multi-page sweep.
@@ -57,7 +56,7 @@ fn make_source(tmp: &tempfile::TempDir) -> Shadow {
         tmp.path().join("source-data"),
         tmp.path().join("source-filtered"),
     );
-    cfg.port = SOURCE_PORT;
+    cfg.port = ports::PG_SOURCE_PORT;
     cfg.socket_dir = tmp.path().join("source-sock");
     cfg.ctl_timeout = Duration::from_secs(60);
     fs::create_dir_all(&cfg.filter_out_dir).unwrap();

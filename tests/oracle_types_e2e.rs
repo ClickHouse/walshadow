@@ -21,50 +21,6 @@ use walshadow::oracle::Oracle;
 use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
-
-const SLOT_ARR: PortSlot = PortSlot {
-    source: 17910,
-    shadow: 17911,
-    ch_tcp: 17912,
-    ch_http: 17913,
-    walsender: 17917,
-};
-const SLOT_ENUM: PortSlot = PortSlot {
-    source: 17920,
-    shadow: 17921,
-    ch_tcp: 17922,
-    ch_http: 17923,
-    walsender: 17927,
-};
-const SLOT_GEO: PortSlot = PortSlot {
-    source: 17930,
-    shadow: 17931,
-    ch_tcp: 17932,
-    ch_http: 17933,
-    walsender: 17937,
-};
-const SLOT_VEC: PortSlot = PortSlot {
-    source: 17940,
-    shadow: 17941,
-    ch_tcp: 17942,
-    ch_http: 17943,
-    walsender: 17947,
-};
-const SLOT_RIF: PortSlot = PortSlot {
-    source: 17950,
-    shadow: 17951,
-    ch_tcp: 17952,
-    ch_http: 17953,
-    walsender: 17957,
-};
-
 fn skip_gate() -> bool {
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
@@ -95,7 +51,7 @@ fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
 }
 
 async fn run_oracle(
-    slot: PortSlot,
+    slot: fx::Ports,
     app_name: &str,
     schema_sql: &str,
     ch_create_sql: &str,
@@ -175,7 +131,7 @@ async fn arrays_resolve_via_oracle() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
-        SLOT_ARR,
+        fx::Ports::alloc(),
         "walshadow-oracle-arrays",
         "CREATE TABLE public.arr (id int PRIMARY KEY, ints int[], texts text[], nums numeric[]);\n",
         "CREATE OR REPLACE TABLE walshadow_test.arr (\
@@ -226,7 +182,7 @@ async fn enums_resolve_via_oracle() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
-        SLOT_ENUM,
+        fx::Ports::alloc(),
         "walshadow-oracle-enums",
         "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');\n\
          CREATE TABLE public.en (id int PRIMARY KEY, m mood, ms mood[]);\n",
@@ -271,7 +227,7 @@ async fn geometric_types_resolve_via_oracle() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
-        SLOT_GEO,
+        fx::Ports::alloc(),
         "walshadow-oracle-geo",
         "CREATE TABLE public.geo (\
             id int PRIMARY KEY, p point, ln line, ls lseg, bx box, \
@@ -322,7 +278,7 @@ async fn pgvector_resolves_via_oracle() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
-        SLOT_VEC,
+        fx::Ports::alloc(),
         "walshadow-oracle-vector",
         "CREATE EXTENSION vector;\n\
          CREATE TABLE public.vec (\
@@ -360,7 +316,7 @@ async fn array_update_under_rif_resolves_old_tuple() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
-        SLOT_RIF,
+        fx::Ports::alloc(),
         "walshadow-oracle-rif",
         "CREATE TABLE public.arr (id int PRIMARY KEY, ints int[]);\n\
          ALTER TABLE public.arr REPLICA IDENTITY FULL;\n",

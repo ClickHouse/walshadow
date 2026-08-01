@@ -12,6 +12,9 @@
 //!
 //! Skipped silently when `initdb` or `pg_basebackup` aren't on `$PATH`.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -23,14 +26,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-
-// Reserved port slot for this test binary — 56170-range, distinct
-// from pipeline_e2e (56100) / bootstrap_*_e2e (56140) so concurrent `cargo test`
-// invocations don't trip over each other.
-const SOURCE_PORT: u16 = 26171;
-const SHADOW_PORT: u16 = 26172;
-const METRICS_PORT: u16 = 26173;
-const WALSENDER_PORT: u16 = 26174;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -206,6 +201,34 @@ fn metric_u64(body: &str, name: &str) -> Result<u64> {
         .with_context(|| format!("{name} not in metrics body"))
 }
 
+/// Run statements against the source, one autocommit `-c` each.
+fn psql_exec(socket_dir: &Path, stmts: &[&str]) -> Result<()> {
+    let mut cmd = Command::new("psql");
+    cmd.args([
+        "-h",
+        socket_dir.to_str().context("source sock not utf8")?,
+        "-p",
+        &ports::PG_SOURCE_PORT.to_string(),
+        "-U",
+        "postgres",
+        "-d",
+        "postgres",
+        "-v",
+        "ON_ERROR_STOP=1",
+    ]);
+    for stmt in stmts {
+        cmd.args(["-c", stmt]);
+    }
+    let out = cmd.output().context("spawn workload psql")?;
+    if !out.status.success() {
+        bail!(
+            "workload psql failed: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+    Ok(())
+}
+
 /// Wait for a child to exit, polling every 100 ms up to `deadline`.
 /// Returns the exit status on success; kills + reaps the child on
 /// timeout so a stuck daemon doesn't outlive the test.
@@ -234,11 +257,13 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     }
     let bridge_lib_dir = pgext_dir();
 
+    let metrics_port = ports::reserve_port();
+    let walsender_port = ports::reserve_port();
     let tmp = tempfile::tempdir().unwrap();
 
     // 1. Source PG, schema before basebackup so shadow inherits the
     //    same oids/filenodes the daemon's tracker seeds against.
-    let source = make_pg(&tmp, "source", SOURCE_PORT);
+    let source = make_pg(&tmp, "source", ports::PG_SOURCE_PORT);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
     append_source_conf(&source);
@@ -264,13 +289,14 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     fs::create_dir_all(&shadow_filter_dir).unwrap();
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
-    rewrite_for_shadow(&shadow_data, SHADOW_PORT, &shadow_sock).expect("retarget shadow conf");
-    enable_recovery(&shadow_data, &shadow_filter_dir, WALSENDER_PORT)
+    rewrite_for_shadow(&shadow_data, ports::PG_SHADOW_PORT, &shadow_sock)
+        .expect("retarget shadow conf");
+    enable_recovery(&shadow_data, &shadow_filter_dir, walsender_port)
         .expect("enable shadow recovery");
     append_bridge_conf(&shadow_data, &shadow_sock, bridge_lib_dir).expect("preload bridge worker");
 
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
-    shadow_cfg.port = SHADOW_PORT;
+    shadow_cfg.port = ports::PG_SHADOW_PORT;
     shadow_cfg.socket_dir = shadow_sock.clone();
     shadow_cfg.ctl_timeout = Duration::from_secs(60);
     let shadow = Shadow::new(shadow_cfg);
@@ -293,13 +319,13 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");
     let stderr_path = tmp.path().join("daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{METRICS_PORT}").parse().unwrap();
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
     let mut child = Command::new(bin)
         .args([
             "--host",
             source.config().socket_dir.to_str().unwrap(),
             "--port",
-            &SOURCE_PORT.to_string(),
+            &ports::PG_SOURCE_PORT.to_string(),
             "--user",
             "postgres",
             "--dbname",
@@ -311,7 +337,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             "--shadow-socket-dir",
             shadow_sock.to_str().unwrap(),
             "--shadow-port",
-            &SHADOW_PORT.to_string(),
+            &ports::PG_SHADOW_PORT.to_string(),
             "--shadow-user",
             "postgres",
             "--shadow-dbname",
@@ -325,7 +351,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             "--metrics-bind",
             &metrics_addr.to_string(),
             "--walsender-bind",
-            &format!("127.0.0.1:{WALSENDER_PORT}"),
+            &format!("127.0.0.1:{walsender_port}"),
             // Retention disabled — no shadow_replay sweeper churn
             // racing the test's max-segments exit. Default would
             // poll shadow on a 60s cadence; we'd never observe it.
@@ -377,35 +403,15 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         //    replay, while bs.t's INSERTs stay invisible there (their
         //    destination is the CH emitter, exercised by pipeline_e2e).
         //    Autocommit per `-c` keeps each commit in the same segment
-        //    as its records; pg_switch_wal seals the work.
+        //    as its records.
         let driver_sock = source.config().socket_dir.clone();
-        let out = Command::new("psql")
-            .args([
-                "-h",
-                driver_sock.to_str().unwrap(),
-                "-p",
-                &SOURCE_PORT.to_string(),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
+        psql_exec(
+            &driver_sock,
+            &[
                 "CREATE TABLE bs.t2 (id int PRIMARY KEY, payload text)",
-                "-c",
                 "INSERT INTO bs.t SELECT g, repeat('x', g)::text FROM generate_series(1, 5) g",
-                "-c",
-                "SELECT pg_switch_wal()",
-            ])
-            .output()
-            .context("spawn workload psql")?;
-        if !out.status.success() {
-            bail!(
-                "workload psql failed: {}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-        }
+            ],
+        )?;
 
         // 6b. Null-tail watermark: the metrics-only pipeline's contiguous
         //     ack must advance past the workload's commits — routed-nothing
@@ -424,6 +430,12 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
+
+        // 6c. Seal the workload's segment only once the scrapes are done:
+        //     pg_switch_wal trips `--max-segments=1` and the metrics
+        //     endpoint dies with the daemon, so a scrape racing that exit
+        //     reads a broken pipe.
+        psql_exec(&driver_sock, &["SELECT pg_switch_wal()"])?;
 
         // 7. Wait for the daemon to hit `--max-segments=1` and exit
         //    cleanly. 60s budget covers basebackup retry + status-tick
@@ -541,12 +553,6 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     }
 }
 
-// Distinct port slot for the wire-drop test so it can run concurrently.
-const WD_SOURCE_PORT: u16 = 26181;
-const WD_SHADOW_PORT: u16 = 26182;
-const WD_METRICS_PORT: u16 = 26183;
-const WD_WALSENDER_PORT: u16 = 26184;
-
 /// `kill -<sig> -<pgid>` on the shadow cluster's process group, read from
 /// `postmaster.pid` + `/proc/<pid>/stat` (field 5 = pgrp). Pausing the *group*
 /// (not just the postmaster) stops the walreceiver child too, so it stops
@@ -585,7 +591,7 @@ fn spawn_writer(socket_dir: &Path) -> Result<Child> {
          -c \"INSERT INTO bs.load SELECT repeat('x',100) FROM generate_series(1,200)\" \
          >/dev/null 2>&1; sleep 0.2; done",
         socket_dir.display(),
-        WD_SOURCE_PORT,
+        ports::PG_SOURCE_PORT,
     );
     Command::new("bash")
         .arg("-c")
@@ -625,8 +631,10 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     }
     let bridge_lib_dir = pgext_dir();
 
+    let metrics_port = ports::reserve_port();
+    let walsender_port = ports::reserve_port();
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_pg(&tmp, "wd-source", WD_SOURCE_PORT);
+    let source = make_pg(&tmp, "wd-source", ports::PG_SOURCE_PORT);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
     append_source_conf(&source);
@@ -648,8 +656,8 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     fs::create_dir_all(&filter_dir).unwrap();
     let shadow_sock = tmp.path().join("wd-shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
-    rewrite_for_shadow(&shadow_data, WD_SHADOW_PORT, &shadow_sock).expect("retarget shadow");
-    enable_recovery(&shadow_data, &filter_dir, WD_WALSENDER_PORT).expect("enable recovery");
+    rewrite_for_shadow(&shadow_data, ports::PG_SHADOW_PORT, &shadow_sock).expect("retarget shadow");
+    enable_recovery(&shadow_data, &filter_dir, walsender_port).expect("enable recovery");
     append_bridge_conf(&shadow_data, &shadow_sock, bridge_lib_dir).expect("preload bridge worker");
     // Slow the walreceiver restart so killing it leaves a multi-second window in
     // which the writer advances the head — guaranteeing the reconnect lands
@@ -661,7 +669,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     }
 
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), filter_dir.clone());
-    shadow_cfg.port = WD_SHADOW_PORT;
+    shadow_cfg.port = ports::PG_SHADOW_PORT;
     shadow_cfg.socket_dir = shadow_sock.clone();
     shadow_cfg.ctl_timeout = Duration::from_secs(60);
     let shadow = Shadow::new(shadow_cfg);
@@ -673,13 +681,13 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");
     let stderr_path = tmp.path().join("wd-daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).unwrap();
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{WD_METRICS_PORT}").parse().unwrap();
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
     let mut child = Command::new(bin)
         .args([
             "--host",
             source.config().socket_dir.to_str().unwrap(),
             "--port",
-            &WD_SOURCE_PORT.to_string(),
+            &ports::PG_SOURCE_PORT.to_string(),
             "--user",
             "postgres",
             "--dbname",
@@ -691,7 +699,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
             "--shadow-socket-dir",
             shadow_sock.to_str().unwrap(),
             "--shadow-port",
-            &WD_SHADOW_PORT.to_string(),
+            &ports::PG_SHADOW_PORT.to_string(),
             "--shadow-user",
             "postgres",
             "--shadow-dbname",
@@ -703,7 +711,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
             "--metrics-bind",
             &metrics_addr.to_string(),
             "--walsender-bind",
-            &format!("127.0.0.1:{WD_WALSENDER_PORT}"),
+            &format!("127.0.0.1:{walsender_port}"),
             // Default (large) threshold: we force the disconnect by killing the
             // walreceiver, not by overflowing the queue — so baseline streaming
             // never trips a spurious drop.

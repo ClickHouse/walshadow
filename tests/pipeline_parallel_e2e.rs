@@ -24,18 +24,6 @@ use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
-const SOURCE_PORT: u16 = 17501;
-const SHADOW_PORT: u16 = 17502;
-const CH_TCP_PORT: u16 = 17503;
-const CH_HTTP_PORT: u16 = 17504;
-const WALSENDER_PORT: u16 = 17552;
-
-const SLICE_SOURCE_PORT: u16 = 17505;
-const SLICE_SHADOW_PORT: u16 = 17506;
-const SLICE_CH_TCP_PORT: u16 = 17507;
-const SLICE_CH_HTTP_PORT: u16 = 17508;
-const SLICE_WALSENDER_PORT: u16 = 17553;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_replicates_dml() {
     if !fx::pg_available() {
@@ -51,6 +39,7 @@ async fn parallel_pipeline_replicates_dml() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -67,16 +56,16 @@ async fn parallel_pipeline_replicates_dml() {
         // exercise the decode pool's unmapped-relation skip counter.
         "CREATE TABLE public.foo (id int PRIMARY KEY, val text);\n\
          CREATE TABLE public.bar (id int);\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -115,7 +104,7 @@ async fn parallel_pipeline_replicates_dml() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-pipeline-parallel",
         ddl: None,
@@ -292,6 +281,7 @@ async fn parallel_pipeline_slices_multi_batch_commit() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -304,16 +294,16 @@ async fn parallel_pipeline_slices_multi_batch_commit() {
         &tmp,
         "CREATE TABLE public.slices (id int PRIMARY KEY, val text, meta text);\n\
          ALTER TABLE public.slices ALTER COLUMN val SET STORAGE EXTERNAL;\n",
-        SLICE_SOURCE_PORT,
-        SLICE_SHADOW_PORT,
-        SLICE_WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, SLICE_CH_TCP_PORT, SLICE_CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -358,7 +348,7 @@ async fn parallel_pipeline_slices_multi_batch_commit() {
             shadow_filter_dir: &shadow_filter_dir,
             shadow_stream_state,
             ch_database: "walshadow_test",
-            ch_tcp_port: SLICE_CH_TCP_PORT,
+            ch_tcp_port: slot.ch_tcp,
             mappings,
             app_name: "walshadow-pipeline-slices",
             ddl: None,

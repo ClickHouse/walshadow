@@ -14,12 +14,6 @@ use std::time::Duration;
 
 use walshadow::mapping::NamespaceMapping;
 
-const SOURCE_PORT: u16 = 17561;
-const SHADOW_PORT: u16 = 17562;
-const CH_TCP_PORT: u16 = 17563;
-const CH_HTTP_PORT: u16 = 17564;
-const WALSENDER_PORT: u16 = 17568;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreign_database_ddl_and_dml_never_reach_the_followed_output() {
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
@@ -27,6 +21,7 @@ async fn foreign_database_ddl_and_dml_never_reach_the_followed_output() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -39,16 +34,16 @@ async fn foreign_database_ddl_and_dml_never_reach_the_followed_output() {
         &tmp,
         "CREATE SCHEMA fdb;\n\
          CREATE TABLE fdb.t (id bigint PRIMARY KEY, v text);\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
@@ -68,7 +63,7 @@ async fn foreign_database_ddl_and_dml_never_reach_the_followed_output() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings: vec![],
         app_name: "walshadow-foreign-db",
         ddl: Some(ddl_args),

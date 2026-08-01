@@ -30,9 +30,6 @@ use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 
-const CH_TCP_PORT: u16 = 17619;
-const CH_HTTP_PORT: u16 = 17620;
-
 const RFN: RelFileNode = RelFileNode {
     spc_node: 1663,
     db_node: 5,
@@ -128,8 +125,9 @@ async fn budget_trips_seal_complete_inserts() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -147,7 +145,7 @@ async fn budget_trips_seal_complete_inserts() {
     // (2 budget trips + the final FlushAll).
     let cfg = EmitterConfig {
         host: "127.0.0.1".into(),
-        port: CH_TCP_PORT,
+        port: slot.ch_tcp,
         database: "walshadow_test".into(),
         compression: CompressionChoice::Lz4,
         row_budget: 2,

@@ -15,6 +15,9 @@
 //! `retention::tests::*`); their HTTP/file-system surfaces don't need a
 //! live PG to validate.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::fs;
 use std::io::Write;
 use std::process::Command;
@@ -26,15 +29,6 @@ use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::preflight::{Inputs, PreflightError};
 use walshadow::schema::RelName;
 use walshadow::shadow::{Shadow, ShadowConfig};
-
-// Non-overlapping ports so a leftover from an earlier failed run doesn't
-// shadow the next start.
-const SOURCE_PORT_A: u16 = 56301;
-const SHADOW_PORT_A: u16 = 56302;
-const SOURCE_PORT_B: u16 = 56303;
-const SHADOW_PORT_B: u16 = 56304;
-const SOURCE_PORT_C: u16 = 56305;
-const SHADOW_PORT_C: u16 = 56306;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -113,7 +107,7 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_pg(&tmp, "src-bad", SOURCE_PORT_A);
+    let source = make_pg(&tmp, "src-bad", ports::PG_SOURCE_PORT);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
     // wal_level=replica + keyless relations so both validators trip on
@@ -131,16 +125,16 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
         )
         .expect("schema");
 
-    let shadow = make_pg(&tmp, "shd-bad", SHADOW_PORT_A);
+    let shadow = make_pg(&tmp, "shd-bad", ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb shadow");
     shadow.write_base_conf().expect("shadow base conf");
     shadow.start().expect("start shadow");
     let _shd_stop = StopOnDrop { sh: &shadow };
 
-    let src_sql = connect_sql(&source.config().socket_dir, SOURCE_PORT_A)
+    let src_sql = connect_sql(&source.config().socket_dir, ports::PG_SOURCE_PORT)
         .await
         .expect("source sql");
-    let shd_sql = connect_sql(&shadow.config().socket_dir, SHADOW_PORT_A)
+    let shd_sql = connect_sql(&shadow.config().socket_dir, ports::PG_SHADOW_PORT)
         .await
         .expect("shadow sql");
 
@@ -198,23 +192,23 @@ async fn preflight_rejects_old_version_missing_slot_and_unknown_rel() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_pg(&tmp, "src-old", SOURCE_PORT_C);
+    let source = make_pg(&tmp, "src-old", ports::PG_SOURCE_PORT);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
     append_conf(&source, "logical");
     source.start().expect("start source");
     let _src_stop = StopOnDrop { sh: &source };
 
-    let shadow = make_pg(&tmp, "shd-old", SHADOW_PORT_C);
+    let shadow = make_pg(&tmp, "shd-old", ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb shadow");
     shadow.write_base_conf().expect("shadow base conf");
     shadow.start().expect("start shadow");
     let _shd_stop = StopOnDrop { sh: &shadow };
 
-    let src_sql = connect_sql(&source.config().socket_dir, SOURCE_PORT_C)
+    let src_sql = connect_sql(&source.config().socket_dir, ports::PG_SOURCE_PORT)
         .await
         .expect("source sql");
-    let shd_sql = connect_sql(&shadow.config().socket_dir, SHADOW_PORT_C)
+    let shd_sql = connect_sql(&shadow.config().socket_dir, ports::PG_SHADOW_PORT)
         .await
         .expect("shadow sql");
 
@@ -264,7 +258,7 @@ async fn preflight_passes_once_source_is_logical_and_relations_keyed() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_pg(&tmp, "src-ok", SOURCE_PORT_B);
+    let source = make_pg(&tmp, "src-ok", ports::PG_SOURCE_PORT);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
     append_conf(&source, "logical");
@@ -284,16 +278,16 @@ async fn preflight_passes_once_source_is_logical_and_relations_keyed() {
         )
         .expect("schema");
 
-    let shadow = make_pg(&tmp, "shd-ok", SHADOW_PORT_B);
+    let shadow = make_pg(&tmp, "shd-ok", ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb shadow");
     shadow.write_base_conf().expect("shadow base conf");
     shadow.start().expect("start shadow");
     let _shd_stop = StopOnDrop { sh: &shadow };
 
-    let src_sql = connect_sql(&source.config().socket_dir, SOURCE_PORT_B)
+    let src_sql = connect_sql(&source.config().socket_dir, ports::PG_SOURCE_PORT)
         .await
         .expect("source sql");
-    let shd_sql = connect_sql(&shadow.config().socket_dir, SHADOW_PORT_B)
+    let shd_sql = connect_sql(&shadow.config().socket_dir, ports::PG_SHADOW_PORT)
         .await
         .expect("shadow sql");
 

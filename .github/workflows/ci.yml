@@ -30,18 +30,6 @@ jobs:
         pg-major: [16, 17, 18]
 
     steps:
-      # ubuntu-latest ships ~14GB free on /; `cargo --all-targets` links
-      # every integration test as its own static binary and can exhaust it
-      # mid-link. ENOSPC surfaces as an lld SIGBUS + a spurious "report to
-      # LLVM" banner. Fast `rm -rf` of the big preinstalled dirs
-      # (android/dotnet/haskell, ~21GB) buys enough room; skip large-packages
-      # (slow apt remove, minutes) and swap-storage (frees /mnt, not /).
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          large-packages: false
-          swap-storage: false
-
       - name: Checkout walshadow
         uses: actions/checkout@v7
         with:
@@ -52,6 +40,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      # nextest runs one process per test and schedules across test
+      # binaries; `cargo test` runs binaries one at a time.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -164,17 +159,18 @@ jobs:
       # + wal_stream_chunk_boundary (use the freshly regenerated fixtures),
       # clickhouse-c-rs clickhouse_local + readme_quickstarts (need
       # clickhouse binary + server on :9000).
-      - name: Test (workspace, single-threaded — each test owns a PG cluster)
+      #
+      # Concurrency comes from `.config/nextest.toml`: unit tests run
+      # `num-cpus` wide, cluster drills are capped by the `clusters`
+      # test group. No `--no-capture`, it would force one thread.
+      - name: Test (workspace)
         working-directory: walshadow
         env:
-          # Tests pick non-overlapping ports but PG cluster startup is heavy;
-          # avoid thrashing the runner by serializing.
-          RUST_TEST_THREADS: "1"
           # Opts tests with `fx::dump_artifacts` into copying their tempdir
           # here on failure. Empty on success; uploaded as a job artifact
           # by the next step when present.
           WALSHADOW_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
-        run: cargo test --workspace --all-targets --locked -- --nocapture
+        run: cargo nextest run --workspace --all-targets --locked --no-fail-fast
 
       - name: Upload test artifacts on failure
         if: failure()
@@ -201,6 +197,12 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      # Coverage-only: instrumented binaries carry a counter table per
+      # test target and every test process drops its own `.profraw`, so
+      # this job's disk draw dwarfs the matrix jobs' (which run without
+      # any cleanup). Frees android/dotnet/haskell (~20GB); skip
+      # large-packages (slow apt remove, minutes) and swap-storage
+      # (frees /mnt, not /).
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
@@ -220,10 +222,10 @@ jobs:
           # this component.
           components: llvm-tools-preview
 
-      - name: Install cargo-llvm-cov
+      - name: Install cargo-llvm-cov + cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov,cargo-nextest
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -311,12 +313,11 @@ jobs:
       - name: Run instrumented test suite (cargo llvm-cov)
         working-directory: walshadow
         env:
-          RUST_TEST_THREADS: "1"
           WALSHADOW_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --all-targets --locked --no-report \
-            -- --nocapture
+          cargo llvm-cov nextest --workspace --all-targets --locked \
+            --no-report --no-fail-fast
 
       - name: Upload test artifacts on failure
         if: failure()

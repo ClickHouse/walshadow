@@ -20,64 +20,6 @@ use std::time::Duration;
 use walshadow::mapping::NamespaceMapping;
 use walshadow::shadow::Shadow;
 
-const SLOT_INTERLEAVE: PortSlot = PortSlot {
-    source: 18030,
-    shadow: 18031,
-    ch_tcp: 18032,
-    ch_http: 18033,
-    walsender: 18037,
-};
-const SLOT_SUBXACT: PortSlot = PortSlot {
-    source: 18040,
-    shadow: 18041,
-    ch_tcp: 18042,
-    ch_http: 18043,
-    walsender: 18047,
-};
-const SLOT_TOP_ABORT: PortSlot = PortSlot {
-    source: 18050,
-    shadow: 18051,
-    ch_tcp: 18052,
-    ch_http: 18053,
-    walsender: 18057,
-};
-const SLOT_GATE: PortSlot = PortSlot {
-    source: 18060,
-    shadow: 18061,
-    ch_tcp: 18062,
-    ch_http: 18063,
-    walsender: 18067,
-};
-const SLOT_CREATE_COPY: PortSlot = PortSlot {
-    source: 18070,
-    shadow: 18071,
-    ch_tcp: 18072,
-    ch_http: 18073,
-    walsender: 18077,
-};
-const SLOT_BENIGN: PortSlot = PortSlot {
-    source: 18080,
-    shadow: 18081,
-    ch_tcp: 18082,
-    ch_http: 18083,
-    walsender: 18087,
-};
-const SLOT_FENCE: PortSlot = PortSlot {
-    source: 18090,
-    shadow: 18091,
-    ch_tcp: 18092,
-    ch_http: 18093,
-    walsender: 18097,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
-
 fn skip_gate() -> bool {
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
@@ -95,12 +37,12 @@ struct Drill {
 }
 
 /// Bootstrap clusters + CH + auto-create pipeline for one namespace.
-async fn build_drill(slot: PortSlot, schema_sql: &str, namespace: &str, app_name: &str) -> Drill {
+async fn build_drill(slot: fx::Ports, schema_sql: &str, namespace: &str, app_name: &str) -> Drill {
     build_drill_with(slot, schema_sql, namespace, app_name, |_| {}).await
 }
 
 async fn build_drill_with(
-    slot: PortSlot,
+    slot: fx::Ports,
     schema_sql: &str,
     namespace: &str,
     app_name: &str,
@@ -179,7 +121,7 @@ async fn interleaved_clean_xact_unaffected_by_dirty_tree() {
         return;
     }
     let mut drill = build_drill(
-        SLOT_INTERLEAVE,
+        fx::Ports::alloc(),
         "CREATE SCHEMA dai;\n\
          CREATE TABLE dai.dirty_t (id bigint PRIMARY KEY, v text);\n\
          CREATE TABLE dai.clean_t (id bigint PRIMARY KEY, v text);\n",
@@ -264,7 +206,7 @@ async fn subxact_catalog_touch_defers_top_and_child_rows() {
         return;
     }
     let mut drill = build_drill(
-        SLOT_SUBXACT,
+        fx::Ports::alloc(),
         "CREATE SCHEMA das;\n\
          CREATE TABLE das.t (id bigint PRIMARY KEY, v text);\n",
         "das",
@@ -334,7 +276,7 @@ async fn phase_gate_every_post_touch_record_defers_and_fences() {
         return;
     }
     let mut drill = build_drill(
-        SLOT_GATE,
+        fx::Ports::alloc(),
         "CREATE SCHEMA dag;\n\
          CREATE TABLE dag.t (id bigint PRIMARY KEY, v text);\n\
          ALTER TABLE dag.t REPLICA IDENTITY FULL;\n",
@@ -425,7 +367,7 @@ async fn create_table_and_copy_same_xact_delivers() {
         return;
     }
     let mut drill = build_drill(
-        SLOT_CREATE_COPY,
+        fx::Ports::alloc(),
         "CREATE SCHEMA dac;\n",
         "dac",
         "walshadow-dirty-create-copy",
@@ -484,7 +426,7 @@ async fn benign_in_place_alter_then_dml_delivers() {
         return;
     }
     let mut drill = build_drill(
-        SLOT_BENIGN,
+        fx::Ports::alloc(),
         "CREATE SCHEMA dab;\n\
          CREATE TABLE dab.t (id bigint PRIMARY KEY, v varchar(10));\n",
         "dab",
@@ -558,7 +500,7 @@ async fn physical_in_place_alter_fences_deferred_rows() {
         return;
     }
     let mut drill = build_drill_with(
-        SLOT_FENCE,
+        fx::Ports::alloc(),
         "CREATE SCHEMA daf;\n\
          CREATE TABLE daf.t (id bigint PRIMARY KEY, v varchar(10));\n",
         "daf",
@@ -599,7 +541,7 @@ async fn top_abort_with_ddl_appends_no_metadata_and_emits_no_rows() {
         return;
     }
     let mut drill = build_drill(
-        SLOT_TOP_ABORT,
+        fx::Ports::alloc(),
         "CREATE SCHEMA daa;\n\
          CREATE TABLE daa.t (id bigint PRIMARY KEY, v text);\n",
         "daa",

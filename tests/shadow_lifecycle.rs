@@ -11,6 +11,9 @@
 //!    enable standby recovery → start → wait for replay LSN to exist
 //!    → probe in-recovery true → stop.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::process::Command;
 use std::time::Duration;
 
@@ -41,7 +44,7 @@ fn normal_mode_lifecycle() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55501);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
 
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("write conf");
@@ -74,7 +77,7 @@ fn standby_mode_lifecycle() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55502);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
 
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("write conf");
@@ -140,7 +143,7 @@ fn restore_command_filename_is_segment_relative() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, 55503);
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("conf");
     shadow

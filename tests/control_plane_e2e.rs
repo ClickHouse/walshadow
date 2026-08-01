@@ -21,51 +21,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use walshadow::shadow::{Shadow, ShadowConfig};
 
-struct Ports {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    metrics: u16,
-    walsender: u16,
-}
-
-// 17400-range: below the ephemeral range, clear of bootstrap_direct_ch
-// (17300) and runtime_config_e2e (17700). CH's interserver port is
-// ch_http + 1, so metrics/walsender dodge that slot.
-const P1: Ports = Ports {
-    source: 17401,
-    shadow: 17402,
-    ch_tcp: 17409,
-    ch_http: 17410,
-    metrics: 17415,
-    walsender: 17416,
-};
-const P2: Ports = Ports {
-    source: 17421,
-    shadow: 17422,
-    ch_tcp: 17429,
-    ch_http: 17430,
-    metrics: 17435,
-    walsender: 17436,
-};
-const P3: Ports = Ports {
-    source: 17441,
-    shadow: 17442,
-    ch_tcp: 17449,
-    ch_http: 17450,
-    metrics: 17455,
-    walsender: 17456,
-};
-const P4: Ports = Ports {
-    source: 17461,
-    shadow: 17462,
-    ch_tcp: 17469,
-    ch_http: 17470,
-    metrics: 17475,
-    walsender: 17476,
-};
-
 /// Running daemon + its source PG + CH, with the paths the tests poke.
 struct Harness {
     _tmp: tempfile::TempDir,
@@ -87,7 +42,7 @@ impl Harness {
     /// Bootstrap source + CH + daemon and block until the daemon's
     /// metrics port is up (bootstrap done, shadow serving, WAL pump in
     /// its main loop) and the seed row has drained to CH.
-    async fn up(ports: &Ports) -> Result<Self> {
+    async fn up(ports: &fx::Ports) -> Result<Self> {
         let tmp = tempfile::tempdir().unwrap();
 
         // Source PG + schema. demo.users is pinned by the base config,
@@ -418,7 +373,9 @@ async fn pause_resume_via_ctl_and_sighup_no_restart() {
     if !gated() {
         return;
     }
-    let mut h = Harness::up(&P1).await.expect("bring up harness");
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
 
     let result = async {
         // Baseline: a WAL update flows to CH.
@@ -492,7 +449,9 @@ async fn live_table_opt_in_auto_creates_on_reload() {
     if !gated() {
         return;
     }
-    let mut h = Harness::up(&P2).await.expect("bring up harness");
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
 
     let result = async {
         // An existing table with a pre-opt-in row, absent from CH.
@@ -562,7 +521,9 @@ async fn apply_preserves_previously_pinned_table() {
     if !gated() {
         return;
     }
-    let mut h = Harness::up(&P3).await.expect("bring up harness");
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
 
     let result = async {
         h.psql("UPDATE demo.users SET email = 'before-select@x' WHERE id = 1")?;
@@ -603,7 +564,9 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
     if !gated() {
         return;
     }
-    let mut h = Harness::up(&P4).await.expect("bring up harness");
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
 
     let result = async {
         // Unmapped table; id=1 plans (discards) before the pause. The users

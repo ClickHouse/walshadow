@@ -46,13 +46,6 @@ use walshadow::mapping::ToastMode;
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
-const SOURCE_PORT: u16 = 17661;
-const SHADOW_PORT: u16 = 17662;
-const CH_TCP_PORT: u16 = 17663;
-const CH_HTTP_PORT: u16 = 17664;
-// 17665 reserved: ChServer interserver port = http + 1
-const WALSENDER_PORT: u16 = 17666;
-
 /// Distinct byte sums identify values in the mirror.
 const BODY_A_SQL: &str = "repeat('walshadow-toast-', 512)"; // 8192
 const BODY_A_LEN: u64 = 8192;
@@ -90,6 +83,7 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -102,16 +96,16 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
         &tmp,
         "CREATE TABLE public.doc (id int PRIMARY KEY, meta text, body text);\n\
          ALTER TABLE public.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     // Pre-create the mirror (the store's CREATE IF NOT EXISTS no-ops on it)
@@ -178,7 +172,7 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
             shadow_filter_dir: &shadow_filter_dir,
             shadow_stream_state,
             ch_database: "walshadow_test",
-            ch_tcp_port: CH_TCP_PORT,
+            ch_tcp_port: slot.ch_tcp,
             mappings,
             app_name: "walshadow-toast-tombstone",
             ddl: Some(fx::DdlPipelineArgs::default()),

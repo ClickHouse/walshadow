@@ -28,15 +28,6 @@ use walshadow::mapping::ToastMode;
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
-const SOURCE_PORT: u16 = 17671;
-const SHADOW_PORT: u16 = 17672;
-const CH_TCP_PORT: u16 = 17673;
-const CH_HTTP_PORT: u16 = 17674;
-// 17675 reserved: ChServer interserver port = http + 1
-const WALSENDER_PORT: u16 = 17676;
-// drop_crash_replay_keeps_referrer_bytes shifts every port +10
-// drop_retire_survives_restart_from_ledger shifts every port +20
-
 const BODY_SQL: &str = "repeat('dies-with-owner-drop', 512)"; // 10240
 
 const DOC_SCHEMA_SQL: &str = "CREATE TABLE public.doc (id int PRIMARY KEY, meta text, body text);\n\
@@ -94,6 +85,7 @@ async fn cold_restart_drop_retires_mirror() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -105,16 +97,16 @@ async fn cold_restart_drop_retires_mirror() {
     ) = fx::bootstrap_clusters(
         &tmp,
         DOC_SCHEMA_SQL,
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
     let toast_relid = source
@@ -133,7 +125,7 @@ async fn cold_restart_drop_retires_mirror() {
             shadow_filter_dir: &shadow_filter_dir,
             shadow_stream_state: shadow_stream_state.clone(),
             ch_database: "walshadow_test",
-            ch_tcp_port: CH_TCP_PORT,
+            ch_tcp_port: slot.ch_tcp,
             mappings: doc_mappings(),
             app_name: "walshadow-toast-cold-restart-1",
             ddl: Some(fx::DdlPipelineArgs::default()),
@@ -176,7 +168,7 @@ async fn cold_restart_drop_retires_mirror() {
             shadow_filter_dir: &shadow_filter_dir,
             shadow_stream_state,
             ch_database: "walshadow_test",
-            ch_tcp_port: CH_TCP_PORT,
+            ch_tcp_port: slot.ch_tcp,
             mappings: doc_mappings(),
             app_name: "walshadow-toast-cold-restart-2",
             ddl: Some(fx::DdlPipelineArgs::default()),
@@ -255,6 +247,7 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -266,16 +259,16 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
     ) = fx::bootstrap_clusters(
         &tmp,
         DOC_SCHEMA_SQL,
-        SOURCE_PORT + 10,
-        SHADOW_PORT + 10,
-        WALSENDER_PORT + 10,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT + 10, CH_HTTP_PORT + 10).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
     let toast_relid = source
@@ -298,7 +291,7 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
                 shadow_filter_dir: &shadow_filter_dir,
                 shadow_stream_state: state,
                 ch_database: "walshadow_test",
-                ch_tcp_port: CH_TCP_PORT + 10,
+                ch_tcp_port: slot.ch_tcp,
                 mappings: doc_mappings(),
                 app_name: "walshadow-toast-crash-replay",
                 ddl: Some(fx::DdlPipelineArgs::default()),
@@ -421,6 +414,7 @@ async fn drop_retire_survives_restart_from_ledger() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -432,16 +426,16 @@ async fn drop_retire_survives_restart_from_ledger() {
     ) = fx::bootstrap_clusters(
         &tmp,
         DOC_SCHEMA_SQL,
-        SOURCE_PORT + 20,
-        SHADOW_PORT + 20,
-        WALSENDER_PORT + 20,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT + 20, CH_HTTP_PORT + 20).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
     let toast_relid = source
@@ -459,7 +453,7 @@ async fn drop_retire_survives_restart_from_ledger() {
                 shadow_filter_dir: &shadow_filter_dir,
                 shadow_stream_state: state,
                 ch_database: "walshadow_test",
-                ch_tcp_port: CH_TCP_PORT + 20,
+                ch_tcp_port: slot.ch_tcp,
                 mappings: doc_mappings(),
                 app_name,
                 ddl: Some(fx::DdlPipelineArgs::default()),

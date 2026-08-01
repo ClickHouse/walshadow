@@ -11,43 +11,6 @@ use std::time::Duration;
 use walshadow::mapping::NamespaceMapping;
 use walshadow::shadow::Shadow;
 
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
-
-const SLOT_LOST: PortSlot = PortSlot {
-    source: 17820,
-    shadow: 17821,
-    ch_tcp: 17822,
-    ch_http: 17823,
-    walsender: 17827,
-};
-const SLOT_CUTOFF: PortSlot = PortSlot {
-    source: 17840,
-    shadow: 17841,
-    ch_tcp: 17842,
-    ch_http: 17843,
-    walsender: 17847,
-};
-const SLOT_NULLABLE: PortSlot = PortSlot {
-    source: 17850,
-    shadow: 17851,
-    ch_tcp: 17852,
-    ch_http: 17853,
-    walsender: 17857,
-};
-const SLOT_NULLABLE_IDX: PortSlot = PortSlot {
-    source: 17860,
-    shadow: 17861,
-    ch_tcp: 17862,
-    ch_http: 17863,
-    walsender: 17867,
-};
-
 fn skip_gate() -> bool {
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
@@ -57,7 +20,7 @@ fn skip_gate() -> bool {
 }
 
 async fn run(
-    slot: PortSlot,
+    slot: fx::Ports,
     ns: &str,
     app_name: &str,
     schema_sql: &str,
@@ -136,7 +99,7 @@ async fn added_column_without_dml_visible_next_batch() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
-        SLOT_LOST,
+        fx::Ports::alloc(),
         "se_lost",
         "walshadow-se-lost",
         "CREATE SCHEMA se_lost;\n",
@@ -169,7 +132,7 @@ async fn schema_change_on_one_table_spares_sibling() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
-        SLOT_CUTOFF,
+        fx::Ports::alloc(),
         "se_cut",
         "walshadow-se-cutoff",
         "CREATE SCHEMA se_cut;\n",
@@ -210,7 +173,7 @@ async fn nullable_add_column_under_replident_full() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
-        SLOT_NULLABLE,
+        fx::Ports::alloc(),
         "se_null",
         "walshadow-se-nullable",
         "CREATE SCHEMA se_null;\n",
@@ -262,7 +225,7 @@ async fn nullable_add_column_under_replident_index() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
-        SLOT_NULLABLE_IDX,
+        fx::Ports::alloc(),
         "se_idx",
         "walshadow-se-nullable-idx",
         "CREATE SCHEMA se_idx;\n",

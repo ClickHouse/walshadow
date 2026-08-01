@@ -13,51 +13,6 @@ use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
-// walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
-const SLOT_BROAD: PortSlot = PortSlot {
-    source: 17760,
-    shadow: 17761,
-    ch_tcp: 17762,
-    ch_http: 17763,
-    walsender: 17767,
-};
-const SLOT_NANINF: PortSlot = PortSlot {
-    source: 17770,
-    shadow: 17771,
-    ch_tcp: 17772,
-    ch_http: 17773,
-    walsender: 17777,
-};
-const SLOT_TIME: PortSlot = PortSlot {
-    source: 17780,
-    shadow: 17781,
-    ch_tcp: 17782,
-    ch_http: 17783,
-    walsender: 17787,
-};
-const SLOT_NUM: PortSlot = PortSlot {
-    source: 17790,
-    shadow: 17791,
-    ch_tcp: 17792,
-    ch_http: 17793,
-    walsender: 17797,
-};
-const SLOT_JSON: PortSlot = PortSlot {
-    source: 17900,
-    shadow: 17901,
-    ch_tcp: 17902,
-    ch_http: 17903,
-    walsender: 17907,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
-
 fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
     ColumnMapping {
         src_attnum: attnum,
@@ -91,6 +46,7 @@ async fn broad_type_fidelity() {
         ts timestamp, tstz timestamptz,\
         u uuid, ip inet, j json, iv interval);\n";
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -99,19 +55,12 @@ async fn broad_type_fidelity() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(
-        &tmp,
-        schema,
-        SLOT_BROAD.source,
-        SLOT_BROAD.shadow,
-        SLOT_BROAD.walsender,
-    )
-    .await;
+    ) = fx::bootstrap_clusters(&tmp, schema, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, SLOT_BROAD.ch_tcp, SLOT_BROAD.ch_http).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -168,7 +117,7 @@ async fn broad_type_fidelity() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: SLOT_BROAD.ch_tcp,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-types-sweep",
         ddl: None,
@@ -263,6 +212,7 @@ async fn nan_and_infinity() {
     let schema = "CREATE TABLE public.ni (\
         id int PRIMARY KEY, f4 real, f8 double precision, ntext numeric);\n";
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -271,20 +221,12 @@ async fn nan_and_infinity() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(
-        &tmp,
-        schema,
-        SLOT_NANINF.source,
-        SLOT_NANINF.shadow,
-        SLOT_NANINF.walsender,
-    )
-    .await;
+    ) = fx::bootstrap_clusters(&tmp, schema, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch =
-        fx::ChServer::spawn(ch_tmp, SLOT_NANINF.ch_tcp, SLOT_NANINF.ch_http).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     // numeric NaN can't live in Decimal, so ntext maps to String.
@@ -315,7 +257,7 @@ async fn nan_and_infinity() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: SLOT_NANINF.ch_tcp,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-nan-inf",
         ddl: None,
@@ -363,6 +305,7 @@ async fn time_precision() {
     }
     let schema = "CREATE TABLE public.tp (id int PRIMARY KEY, t time, tz timetz);\n";
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -371,19 +314,12 @@ async fn time_precision() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(
-        &tmp,
-        schema,
-        SLOT_TIME.source,
-        SLOT_TIME.shadow,
-        SLOT_TIME.walsender,
-    )
-    .await;
+    ) = fx::bootstrap_clusters(&tmp, schema, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, SLOT_TIME.ch_tcp, SLOT_TIME.ch_http).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -412,7 +348,7 @@ async fn time_precision() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: SLOT_TIME.ch_tcp,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-time-precision",
         ddl: None,
@@ -468,6 +404,7 @@ async fn large_numeric() {
     }
     let schema = "CREATE TABLE public.ln (id int PRIMARY KEY, d numeric(38,4), huge numeric, neg numeric);\n";
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -476,19 +413,12 @@ async fn large_numeric() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(
-        &tmp,
-        schema,
-        SLOT_NUM.source,
-        SLOT_NUM.shadow,
-        SLOT_NUM.walsender,
-    )
-    .await;
+    ) = fx::bootstrap_clusters(&tmp, schema, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, SLOT_NUM.ch_tcp, SLOT_NUM.ch_http).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -518,7 +448,7 @@ async fn large_numeric() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: SLOT_NUM.ch_tcp,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-large-numeric",
         ddl: None,
@@ -576,6 +506,7 @@ async fn json_null_vs_sql_null() {
     }
     let schema = "CREATE TABLE public.jn (id int PRIMARY KEY, j json);\n";
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -584,19 +515,12 @@ async fn json_null_vs_sql_null() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(
-        &tmp,
-        schema,
-        SLOT_JSON.source,
-        SLOT_JSON.shadow,
-        SLOT_JSON.walsender,
-    )
-    .await;
+    ) = fx::bootstrap_clusters(&tmp, schema, slot.source, slot.shadow, slot.walsender).await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, SLOT_JSON.ch_tcp, SLOT_JSON.ch_http).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -621,7 +545,7 @@ async fn json_null_vs_sql_null() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: SLOT_JSON.ch_tcp,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-json-null",
         ddl: None,

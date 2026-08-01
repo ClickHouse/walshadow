@@ -13,36 +13,6 @@ use std::time::Duration;
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
-const SLOT_PREPARED: PortSlot = PortSlot {
-    source: 17960,
-    shadow: 17961,
-    ch_tcp: 17962,
-    ch_http: 17963,
-    walsender: 17967,
-};
-const SLOT_RENAME: PortSlot = PortSlot {
-    source: 17970,
-    shadow: 17971,
-    ch_tcp: 17972,
-    ch_http: 17973,
-    walsender: 17977,
-};
-const SLOT_INTERVAL: PortSlot = PortSlot {
-    source: 18020,
-    shadow: 18021,
-    ch_tcp: 18022,
-    ch_http: 18023,
-    walsender: 18027,
-};
-
-struct PortSlot {
-    source: u16,
-    shadow: u16,
-    ch_tcp: u16,
-    ch_http: u16,
-    walsender: u16,
-}
-
 /// Live 2PC: DDL inside a prepared xact reaches CH at COMMIT PREPARED.
 /// The commit record's header xid is the finishing backend's; the
 /// capture-keyed events live under the prepared xid (B2) — pre-fix the
@@ -57,7 +27,7 @@ async fn prepared_ddl_drains_at_commit_prepared() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
         return;
     }
-    let slot = SLOT_PREPARED;
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -164,7 +134,7 @@ async fn schema_rename_reroutes_under_new_namespace() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
         return;
     }
-    let slot = SLOT_RENAME;
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -276,7 +246,7 @@ async fn in_place_intervals_compatible_and_ambiguous() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
         return;
     }
-    let slot = SLOT_INTERVAL;
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {

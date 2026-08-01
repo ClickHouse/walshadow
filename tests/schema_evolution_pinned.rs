@@ -35,14 +35,6 @@ use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
-// +0 / +10 shift per test. CH interserver_http_port = http_port + 1, so
-// leave a 5-port gap between CH_HTTP_PORT and WALSENDER_PORT.
-const SOURCE_PORT: u16 = 17541;
-const SHADOW_PORT: u16 = 17542;
-const CH_TCP_PORT: u16 = 17543;
-const CH_HTTP_PORT: u16 = 17544;
-const WALSENDER_PORT: u16 = 17548;
-
 fn skip_if_missing() -> bool {
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
@@ -83,6 +75,7 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -100,16 +93,16 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
             email text\n\
          );\n\
          ALTER TABLE demo.users REPLICA IDENTITY FULL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     // Pinned dest holds only id/name/email — signup_ts does NOT exist
@@ -137,7 +130,7 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-pinned-ddl",
         ddl: Some(fx::DdlPipelineArgs::default()),
@@ -201,12 +194,8 @@ async fn pinned_subset_alter_adds_only_new_column() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
-    let source_port = SOURCE_PORT + 10;
-    let shadow_port = SHADOW_PORT + 10;
-    let ch_tcp_port = CH_TCP_PORT + 10;
-    let ch_http_port = CH_HTTP_PORT + 10;
-    let walsender_port = WALSENDER_PORT + 10;
     let (
         fx::BootstrappedClusters {
             source,
@@ -225,16 +214,16 @@ async fn pinned_subset_alter_adds_only_new_column() {
             internal_notes text\n\
          );\n\
          ALTER TABLE demo.users REPLICA IDENTITY FULL;\n",
-        source_port,
-        shadow_port,
-        walsender_port,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, ch_tcp_port, ch_http_port).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     // Dest deliberately omits `internal_notes`. The diff against the
@@ -264,7 +253,7 @@ async fn pinned_subset_alter_adds_only_new_column() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-pinned-subset",
         ddl: Some(fx::DdlPipelineArgs::default()),

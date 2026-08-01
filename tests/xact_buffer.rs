@@ -13,7 +13,10 @@
 //! filenodes via psql, and drive the buffer directly with
 //! synthetic `DecodedHeap` records keyed on those filenodes.
 //!
-//! Tests parallel-safe via non-overlapping ports (`55700+`).
+//! Clusters are socket-only, so tests are parallel-safe.
+
+#[path = "common/ports.rs"]
+mod ports;
 
 use std::process::Command;
 use std::sync::Arc;
@@ -291,7 +294,8 @@ async fn fixture_shadow_with_things(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_drains_in_arrival_order_and_clears_state() {
-    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55701).await else {
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(ports::PG_SHADOW_PORT).await
+    else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
@@ -351,7 +355,8 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
     use walshadow::record::{Record, RecordSink, Route};
     use walshadow::xact_buffer::{BufferingDecoderSink, resolve_stash};
 
-    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55709).await else {
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(ports::PG_SHADOW_PORT).await
+    else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
@@ -431,7 +436,8 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_unknown_xid_no_ops() {
-    let Some((tmp, shadow, _cat, _rfn)) = fixture_shadow_with_things(55702).await else {
+    let Some((tmp, shadow, _cat, _rfn)) = fixture_shadow_with_things(ports::PG_SHADOW_PORT).await
+    else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
@@ -456,7 +462,8 @@ async fn commit_unknown_xid_no_ops() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_drains_spilled_then_in_memory_entries() {
-    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55703).await else {
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(ports::PG_SHADOW_PORT).await
+    else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
@@ -514,7 +521,8 @@ async fn commit_drains_spilled_then_in_memory_entries() {
 /// CDC consumer's "row materialised before its predecessor" race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_merges_top_and_subxact_in_source_lsn_order() {
-    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55708).await else {
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(ports::PG_SHADOW_PORT).await
+    else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
@@ -548,7 +556,8 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detoast_concatenates_uncompressed_chunks_into_text() {
-    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55704).await else {
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(ports::PG_SHADOW_PORT).await
+    else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
@@ -609,7 +618,8 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detoast_missing_chunk_seq_errors_clearly() {
-    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55705).await else {
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(ports::PG_SHADOW_PORT).await
+    else {
         return;
     };
     let _stop = stop_on_drop(&shadow);
@@ -677,7 +687,8 @@ async fn abort_drops_xact_and_unlinks_spill_against_real_shadow() {
     // Same shape as the unit test, but reachable via the production
     // catalog handle so the integration suite covers the bin's
     // dispatch chain in one place.
-    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(55707).await else {
+    let Some((tmp, shadow, cat, rfn)) = fixture_shadow_with_things(ports::PG_SHADOW_PORT).await
+    else {
         return;
     };
     let _stop = stop_on_drop(&shadow);

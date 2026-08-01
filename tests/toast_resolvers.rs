@@ -35,8 +35,6 @@ fn assembled(body: &[u8]) -> FetchedValue {
     FetchedValue::Assembled(body.to_vec())
 }
 
-const CH_TCP_PORT: u16 = 17639;
-const CH_HTTP_PORT: u16 = 17640;
 const DB: &str = "walshadow_toast_test";
 
 fn row(relid: u32, value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
@@ -107,8 +105,9 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         eprintln!("skip: no clickhouse binary on PATH");
         return;
     }
+    let slot = fx::Ports::alloc();
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
         .expect("create db");
 
@@ -370,9 +369,9 @@ async fn ch_chunk_store_rewrite_barrier_residuals() {
         eprintln!("skip: no clickhouse binary on PATH");
         return;
     }
+    let slot = fx::Ports::alloc();
     let ch_tmp = tempfile::tempdir().unwrap();
-    // +8: sibling tests' interserver ports are their http_port + 1
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT + 8, CH_HTTP_PORT + 8).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
         .expect("create db");
 
@@ -450,9 +449,9 @@ async fn ch_resolver_put_rows_then_fetch_into() {
         eprintln!("skip: no clickhouse binary on PATH");
         return;
     }
+    let slot = fx::Ports::alloc();
     let ch_tmp = tempfile::tempdir().unwrap();
-    // +4: sibling test's interserver port is its http_port + 1, so +2 collides
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT + 4, CH_HTTP_PORT + 4).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
         .expect("create db");
 

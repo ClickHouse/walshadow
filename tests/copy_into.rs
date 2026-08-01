@@ -24,11 +24,6 @@ use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
-const SOURCE_PORT: u16 = 17421;
-const SHADOW_PORT: u16 = 17422;
-const CH_TCP_PORT: u16 = 17423;
-const CH_HTTP_PORT: u16 = 17424;
-const WALSENDER_PORT: u16 = 17452;
 const N_ROWS: u32 = 500;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -46,6 +41,7 @@ async fn copy_into_multi_insert_replicates() {
         return;
     }
 
+    let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -59,16 +55,16 @@ async fn copy_into_multi_insert_replicates() {
         "CREATE SCHEMA s14;\n\
          CREATE TABLE s14.copy_t (id bigint PRIMARY KEY, name text NOT NULL);\n\
          ALTER TABLE s14.copy_t REPLICA IDENTITY FULL;\n",
-        SOURCE_PORT,
-        SHADOW_PORT,
-        WALSENDER_PORT,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
     )
     .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, CH_TCP_PORT, CH_HTTP_PORT).expect("spawn ch");
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
     ch.query(
@@ -106,7 +102,7 @@ async fn copy_into_multi_insert_replicates() {
         shadow_filter_dir: &shadow_filter_dir,
         shadow_stream_state,
         ch_database: "walshadow_test",
-        ch_tcp_port: CH_TCP_PORT,
+        ch_tcp_port: slot.ch_tcp,
         mappings,
         app_name: "walshadow-copy-into",
         ddl: None,

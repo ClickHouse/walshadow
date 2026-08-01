@@ -14,6 +14,9 @@
 //! `WalParser` and asserts the manifest agrees with the parser's
 //! record count.
 
+#[path = "common/ports.rs"]
+mod ports;
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -77,7 +80,7 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_source(&tmp, 55801);
+    let source = make_source(&tmp, ports::PG_SOURCE_PORT);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("base conf");
     append_replication_conf(&source);
@@ -321,7 +324,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_source(&tmp, 55802);
+    let source = make_source(&tmp, ports::PG_SOURCE_PORT);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("base conf");
     append_replication_conf(&source);
@@ -578,7 +581,9 @@ async fn sidecar_sql_client_negotiates_tls_over_tcp() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_source(&tmp, 55803);
+    // Only cluster here that listens on TCP, so it needs a reserved port
+    // rather than the shared socket-only one.
+    let source = make_source(&tmp, ports::reserve_port());
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("base conf");
     append_replication_conf(&source);
@@ -648,7 +653,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let source = make_source(&tmp, 55804);
+    let source = make_source(&tmp, ports::PG_SOURCE_PORT);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("base conf");
     append_replication_conf(&source);
