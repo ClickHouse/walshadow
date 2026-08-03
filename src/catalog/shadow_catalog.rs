@@ -16,7 +16,7 @@
 //!
 //! Single-database model: instance bound to one DB.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,7 @@ use crate::ops::bridge::{
 #[cfg(test)]
 use crate::pg::socket_conninfo;
 use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor, RelName, ReplIdent};
+use ahash::{HashMap, HashMapExt};
 
 #[derive(Debug, Error)]
 pub enum CatalogError {

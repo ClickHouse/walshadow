@@ -23,12 +23,12 @@
 #[path = "common/ports.rs"]
 mod ports;
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
 
+use ahash::{HashSet, HashSetExt};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};

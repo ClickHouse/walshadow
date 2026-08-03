@@ -1,10 +1,10 @@
 //! ClickHouse destination mapping vocabulary
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::catalog::type_bridge;
 use crate::schema::{RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
+use ahash::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct TableMapping {
@@ -165,7 +165,7 @@ mod tests {
 
     fn one_table() -> (RelName, HashMap<RelName, TableMapping>) {
         let rel = RelName::new("public", "t");
-        let map = HashMap::from([(
+        let map = HashMap::from_iter([(
             rel.clone(),
             TableMapping {
                 target: TableTarget::new("db", "t"),

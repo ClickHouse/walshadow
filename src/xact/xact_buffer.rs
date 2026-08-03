@@ -36,7 +36,7 @@
 //! Spill-to-ClickHouse (Option B) is deferred; v1 is local-disk-only.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +70,7 @@ use crate::xact::spill::{
     BodySpoolFile, BodySpoolWriter, RawRecord, SpillEntry, SpillError, SpillReader, SpillStore,
     SpillWriter, ToastChunk, ToastDelete,
 };
+use ahash::{HashMap, HashMapExt};
 
 use std::pin::Pin;
 
@@ -1190,7 +1191,7 @@ impl XactBuffer {
         // created once memory-held chunk bytes cross `toast_body_mem_max`
         top_xid: u32,
         commit_lsn: u64,
-        allowed_xids: std::collections::HashSet<u32>,
+        allowed_xids: ahash::HashSet<u32>,
     ) -> std::result::Result<MergedDrain, XactBufferError> {
         let mut gauge = self.drain_gauge(&self.drain_head_resident);
         let mut sources = Vec::with_capacity(states.len());
@@ -1616,7 +1617,7 @@ struct MergedDrain {
     /// Owning xact + subxacts: every yielded heap's writer xid must be a
     /// member (spec validation "decoded xid matches owning xact/subxact");
     /// a stranger means spill corruption or buffer-key drift, fail closed
-    allowed_xids: std::collections::HashSet<u32>,
+    allowed_xids: ahash::HashSet<u32>,
     /// Merge heads + in-mem tail
     gauge: ResidentGauge,
     /// Unsealed chunk map (memory bodies + ref metadata, never file
@@ -3892,7 +3893,7 @@ mod tests {
             xact_maps,
             resolver,
             source_lsn: 0,
-            uses: HashMap::from([((16500u32, 55u32), 1)]),
+            uses: HashMap::from_iter([((16500u32, 55u32), 1)]),
             cache,
             retained: 0,
         }
@@ -3913,7 +3914,7 @@ mod tests {
 
         // Store miss: no xact map holds the key → superseded fill
         let mut t = toast_ptr_tuple(55);
-        let cache = HashMap::from([(key, CachedValue::Missing)]);
+        let cache = HashMap::from_iter([(key, CachedValue::Missing)]);
         let mut r = seeded(&store_resolver, None, &[], cache);
         r.resolve_tuple(&mut t, &rel).await.unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Null));
@@ -3970,7 +3971,7 @@ mod tests {
 
         // Store-resolved hit lands assembled bytes
         let mut t = toast_ptr_tuple(55);
-        let cache = HashMap::from([(key, CachedValue::Decoded(b"abcd".to_vec()))]);
+        let cache = HashMap::from_iter([(key, CachedValue::Decoded(b"abcd".to_vec()))]);
         let mut r = seeded(&store_resolver, None, &[], cache);
         r.resolve_tuple(&mut t, &rel).await.unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
@@ -3980,7 +3981,7 @@ mod tests {
         // Store-side run deviation (partial merge collapse): fills,
         // counted mismatch — not superseded, not a hard error
         let mut t = toast_ptr_tuple(55);
-        let cache = HashMap::from([(key, CachedValue::Mismatch)]);
+        let cache = HashMap::from_iter([(key, CachedValue::Mismatch)]);
         seeded(&store_resolver, None, &[], cache)
             .resolve_tuple(&mut t, &rel)
             .await
@@ -4052,7 +4053,7 @@ mod tests {
             xact_maps: &[],
             resolver: &resolver,
             source_lsn: 10,
-            uses: HashMap::from([((16500u32, 55u32), 2)]),
+            uses: HashMap::from_iter([((16500u32, 55u32), 2)]),
             cache: HashMap::new(),
             retained: 0,
         };

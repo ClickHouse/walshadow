@@ -47,7 +47,6 @@
 //! reported once WAL apply passes `P_hi = pg_current_wal_lsn()` read at COPY
 //! EOF; nothing is gated on it.
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,6 +79,7 @@ use crate::schema::{
 };
 use crate::source::source_feed::open_sql_client;
 use crate::toast::ToastResolver;
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
 const LEDGER_VERSION: u32 = 1;

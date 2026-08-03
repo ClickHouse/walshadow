@@ -17,13 +17,13 @@
 //! [`PendingCatalog::consolidate`] folds those keys into the top at the
 //! commit, where the filter's drained member list names them all.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::schema::RelDescriptor;
+use ahash::HashMap;
 
 /// Why one transaction's pending coverage stopped being trustworthy. Every
 /// reason falls back to commit-time capture, which is sound

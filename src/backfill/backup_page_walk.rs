@@ -12,7 +12,6 @@
 //! - With chunk storage enabled, walk `pg_toast_<relid>` pages and let
 //!   bootstrap drain resolve deferred referrers
 
-use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
@@ -29,6 +28,7 @@ use crate::decode::heap_decoder::{
     ColumnValue, CommittedTuple, DecodeError, DecodedHeap, DecodedTuple, HeapOp, decode_block_data,
 };
 use crate::schema::RelDescriptor;
+use ahash::{HashMap, HashMapExt};
 
 /// Heap page size, PG compile-time, identical to wal-rus `BLOCK_SIZE`
 pub const PAGE_BYTES: usize = 8192;

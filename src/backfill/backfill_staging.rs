@@ -16,7 +16,6 @@
 //! swapped" (uuid unchanged under the staging name) from "swapped" (uuid
 //! differs) from "already copied back" (staging name gone).
 
-use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -29,6 +28,7 @@ use crate::ch::{
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
 use crate::mapping::{MappingHandle, TableMapping, TableTarget};
 use crate::schema::RelName;
+use ahash::{HashMap, HashMapExt, HashSet};
 
 /// `orders` loads into `orders__wsstg`; deterministic so a retry or boot
 /// recovery finds the prior attempt's table

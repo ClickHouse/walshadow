@@ -22,7 +22,6 @@
 //! source LSN so `ReplacingMergeTree` dedup keys on the right value;
 //! WAL ordering within a single dest table is preserved
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +38,7 @@ use crate::mapping::{
 };
 use crate::runtime_config::TableRow;
 use crate::schema::{RelDescriptor, RelName};
+use ahash::{HashMap, HashMapExt};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
 /// epoch. CH `DateTime64(6)` is Unix microseconds; PG commit-record
@@ -2117,7 +2117,7 @@ mod tests {
         let mut m = mk_mapping();
         // numeric-shaped default: the plan drill `numeric(38,0)` → `Int128`
         m.columns[0].target_type = "Decimal(38, 0)".into();
-        let overrides: HashMap<String, String> = [("id".to_string(), "Int128".to_string())].into();
+        let overrides = HashMap::from_iter([("id".to_string(), "Int128".to_string())]);
         let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
         assert_eq!(plan.columns[0].type_repr, "Int128");
         // scale-0 decimal wire keeps the numeric text→scaled encode path
@@ -2138,8 +2138,7 @@ mod tests {
         let mut m = mk_mapping();
         // Operator-renamed CH column: override still keys on source attname
         m.columns[1].target_name = "label".into();
-        let overrides: HashMap<String, String> =
-            [("name".to_string(), "String".to_string())].into();
+        let overrides = HashMap::from_iter([("name".to_string(), "String".to_string())]);
         let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
         assert_eq!(plan.columns[1].name, "label");
         assert_eq!(plan.columns[1].type_repr, "String");
@@ -2152,7 +2151,7 @@ mod tests {
         let m = mk_mapping();
         // encode_value writes int4 as 4 LE bytes; no textualization exists,
         // so Int32 → String must fall back rather than poison the batcher
-        let overrides: HashMap<String, String> = [("id".to_string(), "String".to_string())].into();
+        let overrides = HashMap::from_iter([("id".to_string(), "String".to_string())]);
         let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
         assert_eq!(plan.columns[0].type_repr, "Int32");
     }

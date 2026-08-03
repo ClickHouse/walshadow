@@ -18,7 +18,6 @@
 //! trailing bytes after it mean corruption. `route_id == u32::MAX` is the
 //! deterministically unmapped row (planned counted discard).
 
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +30,7 @@ use crate::emit::route::{RouteSnapshot, RoutedHeap};
 use crate::schema::RelDescriptor;
 use crate::xact::spill::{self, Cursor, SpillError};
 use crate::xact::xact_buffer::{DrainEntry, OrderedEvent, ToastRowBatch};
+use ahash::{HashMap, HashMapExt};
 
 /// ASCII for `xxd`-friendly debug
 pub const PLAN_MAGIC: [u8; 2] = *b"WP";

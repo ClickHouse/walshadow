@@ -20,7 +20,6 @@
 //! then applies the schema change, then resumes. Post-DDL rows encode
 //! against the new shape.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +38,7 @@ use crate::mapping::{
     derive_columns_for_mapping, fold_diff_into_mapping,
 };
 use crate::schema::{RelDescriptor, RelName, SchemaDiff, SchemaEvent, replident_key_attnums};
+use ahash::{HashMap, HashSet, HashSetExt};
 
 /// Knobs that don't ride the INSERT pump. [`DdlApplicator`] rebuilds them
 /// from a republished [`ResolvedConfig`] snapshot at each apply, so SIGHUP
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn per_namespace_target_and_drop_override_global() {
         use crate::mapping::NamespaceMapping;
-        use std::collections::HashMap;
+        use ahash::{HashMap, HashMapExt};
         let mut namespaces = HashMap::new();
         namespaces.insert(
             "analytics".to_string(),
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn with_drop_strategy_overrides_global_default() {
-        use std::collections::HashMap;
+        use ahash::{HashMap, HashMapExt};
         let cfg = DdlConfig {
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
@@ -1098,7 +1098,7 @@ mod tests {
 
     #[test]
     fn mapping_target_returns_pinned_table() {
-        let map: std::collections::HashMap<RelName, TableMapping> = [(
+        let map: ahash::HashMap<RelName, TableMapping> = [(
             RelName::new("public", "orders"),
             TableMapping {
                 target: TableTarget::new("default", "orders"),
@@ -1125,7 +1125,7 @@ mod tests {
 
     #[test]
     fn mapping_mutation_bumps_invalidation_epoch() {
-        let map: std::collections::HashMap<RelName, TableMapping> = [(
+        let map: ahash::HashMap<RelName, TableMapping> = [(
             RelName::new("public", "orders"),
             TableMapping {
                 target: TableTarget::new("default", "orders"),

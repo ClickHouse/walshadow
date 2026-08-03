@@ -19,8 +19,6 @@
 //!   in pre-attach WAL the bootstrap rule never sees.
 //!
 
-use std::collections::{HashMap, HashSet};
-
 use thiserror::Error;
 use tokio_postgres::Client;
 use tokio_postgres::types::Oid;
@@ -31,6 +29,7 @@ use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap, info_carries_new_tuple_heap2,
 };
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
+use ahash::{HashMap, HashSet};
 
 /// XLOG_RELMAP_UPDATE info byte (`xl_info & XLR_RMGR_INFO_MASK`).
 const XLOG_RELMAP_UPDATE: u8 = 0x00;

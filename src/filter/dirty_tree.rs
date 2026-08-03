@@ -12,8 +12,9 @@
 //! records defer, tree-wide dirt applies once a link lands (spec: prefer
 //! excess raw buffering over predecessor decode)
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+
+use ahash::{HashMap, HashMapExt};
 
 /// One catalog-dirty xid's accumulated capture inputs
 #[derive(Debug)]

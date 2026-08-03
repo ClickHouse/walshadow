@@ -3,7 +3,7 @@
 //! ClickHouse mirrors line-pointer occupancy by heap TID, versioned by WAL
 //! record LSN. `ReplacingMergeTree` reclaims tombstoned chunk bodies
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +26,7 @@ use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::mapping::ToastConfig;
 use crate::mapping::ToastMode;
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 /// `(toast_relid, value_id) -> chunk_seq -> bytes`; bodies shared with
 /// mirror rows via `Bytes`

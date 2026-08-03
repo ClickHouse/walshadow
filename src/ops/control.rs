@@ -273,8 +273,7 @@ async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
         client.query(&format!("{base} ORDER BY 1,2"), &[]).await
     }
     .context("list tables")?;
-    let selected: std::collections::HashSet<(String, String)> =
-        selected_tables(&root).into_iter().collect();
+    let selected: ahash::HashSet<(String, String)> = selected_tables(&root).into_iter().collect();
     let mut arr = Vec::with_capacity(rows.len());
     for r in rows {
         let ns: String = r.get(0);

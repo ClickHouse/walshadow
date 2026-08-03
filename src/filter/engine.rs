@@ -10,7 +10,7 @@
 //!   `CatalogTracker`. Unrecognised → ToShadow: correctness over bytes,
 //!   wrongly suppressing a catalog record breaks shadow.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordBlock};
@@ -27,6 +27,7 @@ use crate::filter::main_data;
 use crate::filter::manifest::ManifestStats;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
+use ahash::HashMap;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FilterStats {

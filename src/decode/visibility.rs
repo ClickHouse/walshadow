@@ -29,7 +29,7 @@
 //! risks resurrecting a pre-coverage dead version, skipping risks dropping
 //! a live row, so the pass aborts.
 
-use std::collections::{HashMap, HashSet};
+use ahash::{HashMap, HashSet};
 
 // t_infomask bits, PG src/include/access/htup_details.h
 pub const HEAP_XMAX_KEYSHR_LOCK: u16 = 0x0010;
@@ -710,7 +710,7 @@ mod tests {
         assert_eq!(m.updater(5), MultiXactUpdater::Unresolvable);
         // Members segment truncated while offsets resolve
         let mut m = mx_accum(&[(10, 100), (11, 101)], &[]);
-        m.members = HashMap::from([(2, vec![0u8; 8192])]);
+        m.members = HashMap::from_iter([(2, vec![0u8; 8192])]);
         assert_eq!(m.updater(10), MultiXactUpdater::Unresolvable);
     }
 

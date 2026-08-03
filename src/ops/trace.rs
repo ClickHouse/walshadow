@@ -1,9 +1,10 @@
 //! Process-global tracing knobs, set once at startup.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+use ahash::HashMap;
 
 // f64 bits so it can be a plain static (0x3FF... == 1.0).
 static SAMPLE_RATIO: AtomicU64 = AtomicU64::new(0x3FF0_0000_0000_0000);
