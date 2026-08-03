@@ -301,7 +301,8 @@ decoder, exercised from two callers
 
 `PageWalker::walk_page`:
 
-- pd_lower / pd_upper bounds-check; empty-page fast path
+- all-zero `PageIsNew` fast path (`pd_upper == 0` plus full-page zero check)
+- pd_lower / pd_upper bounds-check; initialized-empty fast path
   (`pd_lower == 24 && pd_upper == 8192`)
 - iterate `(pd_lower - 24) / 4` `ItemIdData` slots
 - `LP_NORMAL` slots dispatch `decode_on_page_tuple`; other lp_flags

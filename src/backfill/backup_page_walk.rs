@@ -202,6 +202,10 @@ impl<'a> PageWalker<'a> {
         //   pd_pagesize 18..20  pd_prune 20..24
         let pd_lower = u16::from_le_bytes(page[12..14].try_into().unwrap());
         let pd_upper = u16::from_le_bytes(page[14..16].try_into().unwrap());
+        if pd_upper == 0 && page.iter().all(|&byte| byte == 0) {
+            stats.pages_walked += 1;
+            return Ok(());
+        }
         if pd_lower as usize == SIZE_OF_PAGE_HEADER && pd_upper as usize == PAGE_BYTES {
             // Fresh / empty page
             stats.pages_walked += 1;
@@ -774,6 +778,20 @@ mod tests {
         let mut out = Vec::new();
         let mut stats = PageWalkStats::default();
         walker.walk_page(&page, 0, &mut out, &mut stats).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(stats.pages_walked, 1);
+        assert_eq!(stats.slots_seen, 0);
+    }
+
+    #[test]
+    fn page_walker_handles_zero_page() {
+        let rel = make_rel();
+        let walker = PageWalker::new(&rel, 0);
+        let mut out = Vec::new();
+        let mut stats = PageWalkStats::default();
+        walker
+            .walk_page(&[0; PAGE_BYTES], 0, &mut out, &mut stats)
+            .unwrap();
         assert!(out.is_empty());
         assert_eq!(stats.pages_walked, 1);
         assert_eq!(stats.slots_seen, 0);
