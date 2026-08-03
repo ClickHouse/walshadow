@@ -97,6 +97,23 @@ pub fn parse_xl_heap_truncate(md: &[u8]) -> Option<HeapTruncate> {
     })
 }
 
+/// Info byte for running-xacts records
+pub const XLOG_RUNNING_XACTS: u8 = 0x10;
+
+/// Offset of next xid in running-xacts payload
+const RUNNING_XACTS_NEXT_XID_OFFSET: usize = 12;
+/// Minimum running-xacts payload size
+const MIN_SIZE_OF_XACT_RUNNING_XACTS: usize = 24;
+
+/// Read next xid from a running-xacts payload
+pub fn parse_running_xacts_next_xid(md: &[u8]) -> Option<u32> {
+    if md.len() < MIN_SIZE_OF_XACT_RUNNING_XACTS {
+        return None;
+    }
+    let at = RUNNING_XACTS_NEXT_XID_OFFSET;
+    Some(u32::from_le_bytes(md[at..at + 4].try_into().unwrap()))
+}
+
 /// `xl_relmap_update` header (PG `src/include/utils/relmapper.h`):
 /// `Oid dbid; Oid tsid; int32 nbytes; char data[FLEXIBLE_ARRAY_MEMBER]`.
 /// `dbid == 0` is the shared map (`global/pg_filenode.map`)

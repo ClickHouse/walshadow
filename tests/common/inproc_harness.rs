@@ -703,6 +703,11 @@ async fn build_pipeline_inner(
             .seed_from_source(sql_client)
             .await
             .expect("seed_from_source");
+        stream
+            .filter_mut()
+            .seed_observed_from_source(sql_client)
+            .await
+            .expect("seed observed-from xid");
     }
 
     let shadow_conninfo = socket_conninfo(

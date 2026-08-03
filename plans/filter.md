@@ -51,6 +51,8 @@ State:
 - `pg_class_filenode: HashMap<u32, u32>` — current `pg_class` filenode
   per database. Empty bootstrap falls through to `rel == 1259` (initial
   mapped relfilenode)
+- `opaque_filenodes` + `opaque_filenode_by_oid` — track statistics catalog
+  filenodes across rewrites
 - `relmap_updates`, `pg_class_writes_{decoded,undecoded,oid_in_prefix}`,
   `seeded_from_source` — diagnostic counters in the manifest
 
@@ -187,6 +189,15 @@ the commit's member list is what folds those keys together
 drained members for the same reason: the speculative shapes keyed to them
 have to die with the tree, on the pump, before a later boundary promotes
 them
+
+## Statistics traffic
+
+- Track statistics catalogs separately from catalogs that describe relation
+  shape
+- Ignore statistics-only writes when deciding whether a transaction needs a
+  boundary
+- Keep boundaries for mixed or incompletely observed transactions
+- Verify behavior with maintenance workloads and existing DDL cases
 
 ## Rewrite path
 

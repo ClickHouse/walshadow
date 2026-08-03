@@ -931,6 +931,16 @@ async fn run_session(
             .seed_from_source(sql_client)
             .await
             .context("seed_from_source")?;
+        let observed_from = stream
+            .filter_mut()
+            .seed_observed_from_source(sql_client)
+            .await
+            .context("seed observed-from xid")?;
+        tracing::info!(
+            target: "walshadow",
+            observed_from,
+            "transactions from this xid on are observed whole",
+        );
         tracing::info!(
             target: "walshadow",
             added,

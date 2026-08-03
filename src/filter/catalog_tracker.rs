@@ -40,6 +40,18 @@ const REL_MAP_FILE_SIZE: usize = 4 + 4 + MAX_MAPPINGS * 8 + 4; // magic + n + ma
 
 /// `pg_class.oid`, fixed PG catalog OID
 pub const PG_CLASS_OID: u32 = 1259;
+/// Catalogs that store statistics, including indexes and toast heaps
+/// Keep `pg_statistic_ext` outside this list because DDL writes its definition
+const OPAQUE_CATALOG_OIDS: &[u32] = &[
+    2619, // pg_statistic
+    2696, // pg_statistic_relid_att_inh_index
+    2840, // pg_toast_2619
+    2841, // pg_toast_2619_index
+    3429, // pg_statistic_ext_data
+    3430, // pg_toast_3429
+    3431, // pg_toast_3429_index
+    3433, // pg_statistic_ext_data_stxoid_inh_index
+];
 /// `pg_namespace.oid`; writes to it force capture-all (relcache invals
 /// enumerate rels only for pg_class/pg_attribute/pg_index/pg_constraint
 /// changes — PG `src/backend/utils/cache/inval.c` — while namespace rename
@@ -59,6 +71,10 @@ pub struct CatalogTracker {
     /// PG_NAMESPACE_OID`. Unmapped catalog: VACUUM FULL relocates it via
     /// its own pg_class row, harvested below.
     pg_namespace_filenode: HashMap<u32, u32>,
+    /// Current statistics catalog filenodes by database
+    opaque_filenodes: HashSet<(u32, u32)>,
+    /// Current filenode for each statistics catalog oid
+    opaque_filenode_by_oid: HashMap<(u32, u32), u32>,
     relmap_updates: u64,
     /// pg_class heap writes the decoder couldn't reconstruct (truncated /
     /// malformed `t_hoff`). OID-prefix-compressed records count in
@@ -251,6 +267,9 @@ impl CatalogTracker {
                     if row.oid == PG_NAMESPACE_OID {
                         self.pg_namespace_filenode.insert(db, row.relfilenode);
                     }
+                    if OPAQUE_CATALOG_OIDS.contains(&row.oid) {
+                        self.learn_opaque(db, row.oid, row.relfilenode);
+                    }
                 }
                 if row.oid >= FIRST_NORMAL_OBJECT_ID {
                     user_oid = Some(row.oid);
@@ -274,6 +293,23 @@ impl CatalogTracker {
             pg_class_user_oid: user_oid,
             ..Observation::catalog(db)
         }
+    }
+
+    /// Return true for a statistics catalog filenode
+    pub fn is_opaque_catalog(&self, db: u32, rel: u32) -> bool {
+        if self.opaque_filenodes.contains(&(db, rel)) {
+            return true;
+        }
+        OPAQUE_CATALOG_OIDS.contains(&rel) && !self.opaque_filenode_by_oid.contains_key(&(db, rel))
+    }
+
+    fn learn_opaque(&mut self, db: u32, oid: u32, filenode: u32) {
+        if let Some(prev) = self.opaque_filenode_by_oid.insert((db, oid), filenode)
+            && prev != filenode
+        {
+            self.opaque_filenodes.remove(&(db, prev));
+        }
+        self.opaque_filenodes.insert((db, filenode));
     }
 
     /// True when `(db, rel)` is pg_namespace's current heap — the
@@ -377,6 +413,9 @@ impl CatalogTracker {
             }
             if catalog_oid == PG_NAMESPACE_OID {
                 self.pg_namespace_filenode.insert(db_node, filenode);
+            }
+            if OPAQUE_CATALOG_OIDS.contains(&catalog_oid) {
+                self.learn_opaque(db_node, catalog_oid, filenode);
             }
         }
         self.seeded_from_source += added as u64;
@@ -521,6 +560,38 @@ mod tests {
         assert!(t.is_catalog(5, 16383));
         assert!(!t.is_catalog(5, 16384));
         assert!(!t.is_catalog(5, 0));
+    }
+
+    #[test]
+    fn statistics_catalogs_are_opaque_at_their_bootstrap_filenode() {
+        let t = CatalogTracker::new();
+        assert!(t.is_opaque_catalog(5, 2619)); // pg_statistic
+        assert!(t.is_opaque_catalog(5, 2696)); // its index
+        assert!(t.is_opaque_catalog(5, 2840)); // its toast heap
+        assert!(!t.is_opaque_catalog(5, 1259)); // pg_class
+        assert!(!t.is_opaque_catalog(5, 16400)); // user rel
+    }
+
+    #[test]
+    fn vacuum_full_moves_the_opaque_filenode() {
+        let mut t = CatalogTracker::new();
+        // Simulate VACUUM FULL moving pg_statistic
+        let data = pg_class_block_data(2619, 40000);
+        let rec = heap_block_record_with_main(
+            RmId::Heap,
+            0x20,
+            5,
+            1259,
+            data,
+            xl_heap_update_no_compression(),
+        );
+        t.observe(&rec);
+        assert!(t.is_opaque_catalog(5, 40000));
+        assert!(!t.is_opaque_catalog(5, 2619), "old filenode may be reused",);
+        assert!(
+            t.is_opaque_catalog(6, 2619),
+            "filenode tracking is per database",
+        );
     }
 
     #[test]

@@ -15,19 +15,22 @@ use std::sync::{Arc, Mutex};
 
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordBlock};
 
+use crate::decode::heap_decoder::{XLOG_HEAP_INPLACE, XLOG_HEAP_OPMASK};
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
     XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_INVALIDATIONS, XLOG_XACT_OPMASK, XactPayloadError,
     parse_xact_assignment, parse_xact_invalidations, parse_xact_payload,
 };
-use crate::filter::catalog_tracker::{CatalogTracker, CatalogTrackerStats};
+use tokio_postgres::Client;
+
+use crate::filter::catalog_tracker::{CatalogTracker, CatalogTrackerStats, SeedError};
 use crate::filter::classify::{Class, classify};
 use crate::filter::dirty_tree::{DirtyState, DirtyTree};
 use crate::filter::main_data;
 use crate::filter::manifest::ManifestStats;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
-use ahash::HashMap;
+use ahash::{HashMap, HashSet, HashSetExt};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FilterStats {
@@ -174,6 +177,10 @@ pub struct Filter {
     /// `XLOG_XACT_INVALIDATIONS` set, plus subxid → top links; drained at
     /// commit / abort
     dirty: DirtyTree,
+    /// Transactions that wrote only statistics
+    stats_writers: HashSet<u32>,
+    /// First xid known to be fully visible to this run
+    observed_from_xid: Option<u32>,
     smgr_markers: Arc<Mutex<SmgrMarkers>>,
     /// Followed database. Routing and catalog-filenode tracking stay
     /// cluster-wide; this scopes descriptor-capture input only. `None`
@@ -188,6 +195,8 @@ impl Filter {
             tracker: CatalogTracker::new(),
             stats: FilterStats::default(),
             dirty: DirtyTree::default(),
+            stats_writers: HashSet::new(),
+            observed_from_xid: None,
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             target_db_oid: None,
         }
@@ -202,6 +211,30 @@ impl Filter {
     /// Capture reads rotation markers through this handle
     pub fn smgr_markers(&self) -> Arc<Mutex<SmgrMarkers>> {
         self.smgr_markers.clone()
+    }
+
+    /// Record an xid after which transactions are fully observed
+    pub fn observe_from_xid(&mut self, xid: u32) {
+        let earlier = match self.observed_from_xid {
+            Some(have) if (have.wrapping_sub(xid) as i32) <= 0 => have,
+            _ => xid,
+        };
+        self.observed_from_xid = Some(earlier);
+    }
+
+    /// Seed observation state from source snapshot
+    pub async fn seed_observed_from_source(&mut self, client: &Client) -> Result<u32, SeedError> {
+        let row = client
+            .query_one(
+                "SELECT (pg_snapshot_xmax(pg_current_snapshot())::text::numeric \
+                 % 4294967296)::bigint",
+                &[],
+            )
+            .await?;
+        let next_xid: i64 = row.get(0);
+        let next_xid = next_xid as u32;
+        self.observe_from_xid(next_xid);
+        Ok(next_xid)
     }
 
     pub fn decide(&mut self, record: &XLogRecord) -> Route {
@@ -261,14 +294,14 @@ impl Filter {
         // (would hold at unrelated commits). Route is database-blind:
         // foreign catalog records still replay on shadow
         let (route, catalog_touch_db) = match class {
-            Class::Catalog => (Route::ToShadow, catalog_write_db(record)),
+            Class::Catalog => (Route::ToShadow, self.descriptor_touch_db(record)),
             // Relmap update (VACUUM FULL mapped catalog) is Special-class,
             // and carries its database in main_data
             Class::Special => (Route::ToShadow, obs.catalog_db_oid),
             Class::User => {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
                     // tracker has filenodes the bootstrap classify rule misses
-                    (Route::ToShadow, catalog_write_db(record))
+                    (Route::ToShadow, self.descriptor_touch_db(record))
                 } else {
                     (Route::ToDecoder, None)
                 }
@@ -276,7 +309,8 @@ impl Filter {
             Class::Empty => match main_data::relation_for_empty(record) {
                 Some(rel) => {
                     if self.tracker.is_catalog(rel.db_node, rel.rel_node) {
-                        (Route::ToShadow, Some(rel.db_node))
+                        let opaque = self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node);
+                        (Route::ToShadow, (!opaque).then_some(rel.db_node))
                     } else {
                         (Route::ToDecoder, None)
                     }
@@ -294,11 +328,21 @@ impl Filter {
                 .expect("smgr markers poisoned")
                 .insert(rfn, source_lsn);
         }
+        // Running-xacts records provide observation points during streaming
+        if record.header.resource_manager_id == RmId::Standby as u8
+            && record.header.info & 0xF0 == main_data::XLOG_RUNNING_XACTS
+            && let Some(next_xid) = main_data::parse_running_xacts_next_xid(&record.main_data)
+        {
+            self.observe_from_xid(next_xid);
+        }
         let xid = record.header.xact_id;
         // Subxid → top link rides the subxact's first record at
         // wal_level=logical (`XLR_BLOCK_ID_TOPLEVEL_XID`); learn before
         // touch and admission so both resolve the true root
         self.dirty.link(xid, record.toplevel_xid);
+        if xid != 0 && self.is_stats_write(record) {
+            self.stats_writers.insert(xid);
+        }
         // Foreign and shared catalog writes route to shadow and update the
         // cluster-wide tracker above, but feed no descriptor of the
         // followed database, so they must not dirty its capture tree
@@ -374,6 +418,12 @@ impl Filter {
         let (merged, members) =
             self.dirty
                 .drain_tree(header_xid, payload.twophase_xid, &payload.subxacts);
+        let root = payload.twophase_xid.unwrap_or(header_xid);
+        let stats_only = self.stats_only_tree(root, &members, merged.is_some());
+        // Remove statistics markers for all transaction members
+        self.forget_stats_writers(&members);
+        self.forget_stats_writers(&[header_xid, root]);
+        self.forget_stats_writers(&payload.subxacts);
         if !is_commit {
             // Speculative catalog state the tree wrote dies with it. Named
             // on the record so the drop lands on the pump, ahead of any
@@ -421,6 +471,10 @@ impl Filter {
             capture_all = true;
         }
         let dirty_hit = merged.is_some();
+        // Statistics-only transactions do not need invalidation recapture
+        if stats_only && !capture_all {
+            inval_oids.clear();
+        }
         if !dirty_hit && inval_oids.is_empty() && !capture_all {
             return Ok(XactEnd::default());
         }
@@ -494,6 +548,11 @@ impl Filter {
             return Ok(None);
         }
         let root = self.dirty.root(xid);
+        // Skip invalidation-only work for statistics-only transactions
+        if !namespace_hit && !flush && self.stats_only_tree(root, &[xid], self.dirty.is_dirty(xid))
+        {
+            return Ok(None);
+        }
         let dirty = self.dirty.touch(xid, source_lsn);
         dirty.unenumerated |= namespace_hit || flush;
         for oid in &oids {
@@ -523,6 +582,50 @@ impl Filter {
             kind: BoundaryKind::Command { writer_xid: xid },
             members: Vec::new(),
         })))
+    }
+
+    /// Return true for a statistics write in followed database
+    fn is_stats_write(&self, record: &XLogRecord) -> bool {
+        let Some(rel) = record.blocks.first().map(|b| b.header.location.rel) else {
+            return false;
+        };
+        if !self.is_target_db(rel.db_node) {
+            return false;
+        }
+        if self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node) {
+            return true;
+        }
+        record.header.resource_manager_id == RmId::Heap as u8
+            && record.header.info & XLOG_HEAP_OPMASK == XLOG_HEAP_INPLACE
+            && self.tracker.is_catalog(rel.db_node, rel.rel_node)
+    }
+
+    /// Return true when transaction history is fully observed
+    fn fully_observed(&self, xid: u32) -> bool {
+        // Compare transaction IDs with wraparound
+        self.observed_from_xid
+            .is_some_and(|from| (xid.wrapping_sub(from) as i32) >= 0)
+    }
+
+    /// Return true when tree contains only fully observed statistics writes
+    fn stats_only_tree(&self, root: u32, members: &[u32], dirty_hit: bool) -> bool {
+        !dirty_hit
+            && self.fully_observed(root)
+            && (self.stats_writers.contains(&root)
+                || members.iter().any(|m| self.stats_writers.contains(m)))
+    }
+
+    fn forget_stats_writers(&mut self, members: &[u32]) {
+        for m in members {
+            self.stats_writers.remove(m);
+        }
+    }
+
+    /// Return database for catalog writes that affect descriptors
+    fn descriptor_touch_db(&self, record: &XLogRecord) -> Option<u32> {
+        let db = catalog_write_db(record)?;
+        let rel = record.blocks.first()?.header.location.rel;
+        (!self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node)).then_some(db)
     }
 
     /// Per-database relation / catalog scope: the record's database is
@@ -1067,6 +1170,114 @@ mod tests {
         assert_eq!(b.oids.len(), 1);
         assert_eq!(b.oids[0].oid, 16400);
         assert_eq!(b.oids[0].pg_class_touch, None, "inval-sourced oid");
+    }
+
+    /// Build a running-xacts record
+    fn running_xacts_rec(next_xid: u32) -> XLogRecord<'static> {
+        let mut md = vec![0u8; 24];
+        md[12..16].copy_from_slice(&next_xid.to_le_bytes());
+        let mut r = rec(RmId::Standby, &[]);
+        r.header.info = main_data::XLOG_RUNNING_XACTS;
+        r.main_data = std::borrow::Cow::Owned(md);
+        r
+    }
+
+    /// Build an in-place pg_class statistics write
+    fn pg_class_inplace(xid: u32) -> XLogRecord<'static> {
+        let mut r = rec_with_xid(RmId::Heap, &[(5, 1259)], xid);
+        r.header.info = XLOG_HEAP_INPLACE;
+        r
+    }
+
+    /// Statistics writes and their invalidations do not need a boundary
+    #[test]
+    fn analyze_commit_raises_no_boundary() {
+        let mut f = target_filter();
+        f.decide_record(&running_xacts_rec(700), 10, 0xD116)
+            .unwrap();
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 2619)], 746), 100, 0xD116)
+            .unwrap();
+        f.decide_record(&pg_class_inplace(746), 110, 0xD116)
+            .unwrap();
+        let invals = xact_invals_rec(746, &[(-2, 5, 16384), (-2, 5, 16389)]);
+        assert!(
+            f.decide_record(&invals, 120, 0xD116)
+                .unwrap()
+                .boundary
+                .is_none(),
+            "command boundary for a statistics-only transaction",
+        );
+        let commit = xact_end_full(
+            XLOG_XACT_COMMIT,
+            746,
+            &[],
+            &[(-2, 5, 16384), (-2, 5, 16389)],
+            None,
+        );
+        assert!(
+            f.decide_record(&commit, 130, 0xD116)
+                .unwrap()
+                .boundary
+                .is_none(),
+            "commit boundary for a statistics-only transaction",
+        );
+    }
+
+    #[test]
+    fn analyze_before_the_running_xacts_watermark_keeps_its_boundary() {
+        let mut f = target_filter();
+        // Older transaction may have records before stream start
+        f.decide_record(&running_xacts_rec(900), 10, 0xD116)
+            .unwrap();
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 2619)], 746), 100, 0xD116)
+            .unwrap();
+        f.decide_record(&pg_class_inplace(746), 110, 0xD116)
+            .unwrap();
+        let commit = xact_end_full(XLOG_XACT_COMMIT, 746, &[], &[(-2, 5, 16384)], None);
+        let b = f
+            .decide_record(&commit, 130, 0xD116)
+            .unwrap()
+            .boundary
+            .expect("boundary");
+        assert_eq!(b.oids[0].oid, 16384);
+    }
+
+    #[test]
+    fn ddl_alongside_analyze_keeps_its_boundary() {
+        let mut f = target_filter();
+        f.decide_record(&running_xacts_rec(700), 10, 0xD116)
+            .unwrap();
+        // Keep boundary when DDL and ANALYZE share a transaction
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 1249)], 746), 100, 0xD116)
+            .unwrap();
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 2619)], 746), 110, 0xD116)
+            .unwrap();
+        let commit = xact_end_full(XLOG_XACT_COMMIT, 746, &[], &[(-2, 5, 16384)], None);
+        let b = f
+            .decide_record(&commit, 130, 0xD116)
+            .unwrap()
+            .boundary
+            .expect("boundary");
+        assert_eq!(b.tree_first_touch, 100, "pg_attribute write dirtied first");
+        assert_eq!(b.oids[0].oid, 16384);
+    }
+
+    #[test]
+    fn statistics_writes_alone_never_dirty() {
+        let mut f = target_filter();
+        let stats = rec_with_xid(RmId::Heap, &[(5, 2619)], 7);
+        assert_eq!(
+            f.decide_record(&stats, 100, 0xD116).unwrap().route,
+            Route::ToShadow,
+            "statistics still replay on shadow",
+        );
+        let commit = xact_end(XLOG_XACT_COMMIT, 7, &[], None);
+        assert!(
+            f.decide_record(&commit, 200, 0xD116)
+                .unwrap()
+                .boundary
+                .is_none(),
+        );
     }
 
     #[test]
