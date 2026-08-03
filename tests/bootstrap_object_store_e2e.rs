@@ -46,7 +46,6 @@
 #[path = "common/ports.rs"]
 mod ports;
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -54,6 +53,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahash::{HashSet, HashSetExt};
 use walrus::compression;
 use walrus::config::{Settings, StorageSettings, Vars};
 use walrus::pg::backup::list;

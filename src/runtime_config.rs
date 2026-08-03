@@ -19,10 +19,9 @@
 //! typed rows and [`ConfigOverlay::apply`] just replaces the entry. Values are
 //! validated late, at resolver merge time, not here.
 
-use std::collections::HashMap;
-
 use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
 use crate::schema::{RelDescriptor, RelName};
+use ahash::HashMap;
 
 pub const CONFIG_GLOBAL: &str = "config_global";
 pub const CONFIG_NAMESPACE: &str = "config_namespace";

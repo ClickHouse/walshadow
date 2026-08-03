@@ -70,7 +70,7 @@
 //! Per-record fidelity needs an intra-xact descriptor timeline —
 //! `plans/future/descriptor_timeline.md`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -83,6 +83,7 @@ use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
+use ahash::{HashMap, HashSet, HashSetExt};
 
 pub const CKPT_FILE: &str = "desc_log.ckpt";
 pub const TAIL_FILE: &str = "desc_log.tail";

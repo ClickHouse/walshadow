@@ -25,6 +25,7 @@ use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::emit::pipeline::inserter;
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
+use ahash::{HashMap, HashMapExt};
 
 /// Spawned tail stages; holding this keeps the tasks owned by the caller.
 pub struct TailParts {
@@ -113,8 +114,7 @@ pub fn spawn_null(emitter_ack: Arc<AtomicU64>) -> (mpsc::Sender<BatcherMsg>, Ack
             match msg {
                 BatcherMsg::Row(r) => swallow_ack.acked(vec![(r.seq, 1)]),
                 BatcherMsg::Rows(chunk) => {
-                    let mut counts: std::collections::HashMap<u64, u64> =
-                        std::collections::HashMap::new();
+                    let mut counts: HashMap<u64, u64> = HashMap::new();
                     for r in &chunk.rows {
                         *counts.entry(r.seq).or_insert(0) += 1;
                     }

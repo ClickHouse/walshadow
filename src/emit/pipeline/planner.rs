@@ -205,7 +205,7 @@ mod tests {
         inject_ordinary, int4_descriptor, multi_insert_raw,
     };
     use crate::xact::xact_buffer::{FailClosedReason, XactBuffer, XactBufferConfig};
-    use std::collections::{HashMap, HashSet};
+    use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
     /// Pins the `reason=` vocabulary `bump_plan_failure` and the metrics
@@ -391,7 +391,7 @@ mod tests {
             .unwrap();
 
         let mut view = MapView {
-            routes: HashMap::from([(rel.rel_name.clone(), route())]),
+            routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
         };
@@ -457,7 +457,7 @@ mod tests {
         .unwrap();
 
         let mut view = MapView {
-            routes: HashMap::from([(rel.rel_name.clone(), route())]),
+            routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
         };
@@ -507,7 +507,7 @@ mod tests {
         inject_ordinary(&mut b, rfn, rel.clone());
 
         let mut view = MapView {
-            routes: HashMap::from([(rel.rel_name.clone(), route())]),
+            routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
         };
@@ -559,7 +559,7 @@ mod tests {
         }
 
         let mut view = MapView {
-            routes: HashMap::from([(rel.rel_name.clone(), route())]),
+            routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
         };
@@ -636,7 +636,7 @@ mod tests {
         b.on_heap(truncate).await.unwrap();
 
         let mut view = MapView {
-            routes: HashMap::from([(rel.rel_name.clone(), route())]),
+            routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
         };
@@ -684,7 +684,7 @@ mod tests {
 
             let mut view = MapView {
                 routes: if routed {
-                    HashMap::from([(rel.rel_name.clone(), route())])
+                    HashMap::from_iter([(rel.rel_name.clone(), route())])
                 } else {
                     HashMap::new()
                 },

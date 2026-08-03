@@ -19,7 +19,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use std::collections::{HashMap, HashSet};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
 
@@ -31,6 +30,7 @@ use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
 use crate::schema::{RelDescriptor, RelName, SchemaEvent};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use tracing::Instrument;
 
 use crate::decode::wal_xact::{

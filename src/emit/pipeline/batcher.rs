@@ -15,7 +15,6 @@
 //! flush-all from the DDL/TRUNCATE barrier or shutdown. Each `InsertBatch`
 //! carries the `(seq, rows)` counts the ack collector needs.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -33,6 +32,7 @@ use crate::emit::ch_emitter::{
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
 use crate::schema::{RelDescriptor, RelName};
+use ahash::{HashMap, HashMapExt};
 
 /// One decoded row routed to its destination. `route`/`rel` are `Arc`
 /// clones a decoder resolves once per xact/table.
@@ -623,7 +623,7 @@ mod tests {
             None,
         );
         // Int32 → UInt32 is wire-compatible (same fixed width), admissible
-        let overrides = HashMap::from([(String::from("id"), String::from("UInt32"))]);
+        let overrides = HashMap::from_iter([(String::from("id"), String::from("UInt32"))]);
         let mut r = row(0, 1);
         r.route = RouteSnapshot::freeze(
             Arc::new(TableMapping {

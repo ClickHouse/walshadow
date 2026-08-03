@@ -39,7 +39,6 @@
 //! pg_class filenode tracking would go stale), or a TRUNCATE naming a
 //! filtered rel. Error names the remedies: fresher backup, or `'copy'`.
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -88,6 +87,7 @@ use crate::xact::xact_buffer::{
     BufferingDecoderSink, DrainEntry, DrainedBatch, SubxactTracker, WalkStep, XactBuffer,
     XactBufferConfig, detoast_heap, resolve_stash,
 };
+use ahash::{HashMap, HashSet};
 
 /// Run one coalesced backup pass for `reqs` (all sharing `mode`).
 pub async fn run_pass(
@@ -1260,8 +1260,8 @@ mod tests {
     fn prescan(filter_oid: u32, current_rfn: u32) -> PrescanSink {
         PrescanSink {
             target_db_oid: TARGET_DB,
-            filter_oids: HashSet::from([filter_oid]),
-            current_rfns: HashMap::from([(filter_oid, current_rfn)]),
+            filter_oids: HashSet::from_iter([filter_oid]),
+            current_rfns: HashMap::from_iter([(filter_oid, current_rfn)]),
             patch: PgXactPatch::new(),
             skew: None,
             s_max: u64::MAX,

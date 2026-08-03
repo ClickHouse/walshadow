@@ -12,8 +12,6 @@
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
-use std::collections::HashMap;
-
 use clickhouse_c::{Allocator, AsyncClient, BlockBuilder, TypeAst};
 use tokio::task::JoinHandle;
 
@@ -27,6 +25,7 @@ use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatchMeta, InsertBatch};
 use crate::schema::RelName;
+use ahash::{HashMap, HashMapExt};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::watch;

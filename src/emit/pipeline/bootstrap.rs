@@ -4,7 +4,6 @@
 //! referrers. Caller waits through synthetic sequence frontier before advancing
 //! resume LSN to backup end
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -24,6 +23,7 @@ use crate::toast::{
     CHUNK_PUT_BATCH, CHUNK_PUT_BYTES, FetchedValue, ToastResolver, ToastRow, check_value_caps,
     detoasted_value, finish_value, pointer_extsize,
 };
+use ahash::HashMap;
 
 /// Completion frontier for `FlushAll` and resume advance
 #[derive(Debug, Clone, Copy, Default)]
@@ -356,7 +356,7 @@ mod tests {
     use crate::emit::pipeline::batcher::BatcherMsg;
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use crate::toast::MemChunkStore;
-    use std::collections::HashMap;
+    use ahash::{HashMap, HashMapExt};
     use std::sync::atomic::AtomicU64;
     use walrus::pg::walparser::RelFileNode;
 

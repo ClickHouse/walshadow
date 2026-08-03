@@ -21,7 +21,6 @@
 //! resolver rebuilds `ResolvedConfig` whole per apply, so a subscriber snapshot
 //! never tears.
 
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +38,7 @@ use crate::mapping::{
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
+use ahash::{HashMap, HashMapExt, HashSet};
 
 /// Pre-materialised resolved config, snapshotted by subscribers via
 /// `watch::Receiver<Arc<ResolvedConfig>>`. Rebuilt whole on every reload,
@@ -805,10 +805,7 @@ mod tests {
         );
     }
 
-    fn auto_create_set(
-        base: &EmitterConfig,
-        overlay: &ConfigOverlay,
-    ) -> std::collections::HashSet<String> {
+    fn auto_create_set(base: &EmitterConfig, overlay: &ConfigOverlay) -> ahash::HashSet<String> {
         use crate::emit::ch_ddl::DdlConfig;
         let (r, _) = ConfigResolver::resolve(
             base,

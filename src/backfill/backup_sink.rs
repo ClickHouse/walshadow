@@ -10,7 +10,6 @@
 //! heap; the whitelist covers the rotated-catalog case, seeded from
 //! `CatalogTracker::seed_from_source`.
 
-use std::collections::HashSet;
 use std::io;
 
 use async_trait::async_trait;
@@ -20,6 +19,7 @@ use crate::backfill::backup_source::{
 };
 use crate::backfill::pg_path::{is_system_dir, parse_base_path};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
+use ahash::{HashSet, HashSetExt};
 
 /// `relfilenode < 16384` is always bootstrap catalog. Rotated-catalog
 /// filenodes (`VACUUM FULL` / `REINDEX` on a catalog) land in `whitelist`.

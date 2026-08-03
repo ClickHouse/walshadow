@@ -38,6 +38,9 @@ zstd = ["clickhouse-c-rs/zstd"]
 [dependencies]
 wal-rus = "0.2"
 clickhouse-c-rs = { path = "clickhouse-c-rs", default-features = false, features = ["tokio", "tls"] }
+# hash keys are internal (relfilenodes, oids, xids, names), never network
+# input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
+ahash = "0.8"
 anyhow = "1"
 astral-tokio-tar = { version = "0.6", default-features = false }
 async-channel = "2.5"

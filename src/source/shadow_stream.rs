@@ -14,7 +14,6 @@
 //! the archive (`restore_command`); only the in-progress segment — which the
 //! archive lacks — must come over the wire.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -31,6 +30,7 @@ use walrus::pg::replication::server::{self, ServerError, WalSenderConn, decode_s
 use walrus::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 
 use crate::record::{RecordBytesSink, SinkError};
+use ahash::{HashMap, HashMapExt};
 
 /// Per-connection state for one WAL-consuming client (typically
 /// shadow PG).

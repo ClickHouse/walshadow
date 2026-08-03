@@ -19,11 +19,12 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+use ahash::{HashSet, HashSetExt};
 
 /// Socket-only cluster ports. Distinct per role so a test that puts source and
 /// shadow in one socket dir still gets distinct socket files.

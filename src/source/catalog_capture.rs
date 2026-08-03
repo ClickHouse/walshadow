@@ -41,7 +41,6 @@
 //! are exact shapes at exact positions, so the ambiguity survives only over
 //! the run before the first of them, and rows past it decode.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,6 +59,7 @@ use crate::ops::bridge::BridgeError;
 use crate::record::{BoundaryInfo, BoundaryKind, SinkError};
 use crate::schema::{RelDescriptor, SchemaEvent, compute_schema_diff};
 use crate::xact::xact_buffer::XactBuffer;
+use ahash::{HashMap, HashMapExt};
 
 crate::atomic_stats! {
     pub struct CaptureStats {

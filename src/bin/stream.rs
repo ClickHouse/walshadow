@@ -23,13 +23,13 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use ahash::HashSet;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::fs;
@@ -2121,7 +2121,7 @@ async fn seed_runtime_config(
 async fn apply_toml_initial_loads(
     catalog: &Arc<Mutex<ShadowCatalog>>,
     backfiller: Option<&Arc<walshadow::copy_backfill::CopyBackfiller>>,
-    table_initial_loads: &std::collections::HashMap<RelName, String>,
+    table_initial_loads: &ahash::HashMap<RelName, String>,
     active_tables: &HashSet<RelName>,
     sql_scoped_tables: &HashSet<RelName>,
     raw_start: u64,

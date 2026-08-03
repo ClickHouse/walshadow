@@ -62,6 +62,7 @@ use crate::decode::heap_decoder::{
     ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
 };
 use crate::schema::RelDescriptor;
+use ahash::{HashMap, HashMapExt};
 
 /// Heap tuples + TOAST chunks share the file: both flush at commit drain,
 /// WAL-aligned ordering keeps the drain a single linear read
@@ -318,7 +319,7 @@ impl SpillStore {
             file,
             path,
             byte_count: header.len() as u64,
-            dict: std::collections::HashMap::new(),
+            dict: HashMap::new(),
         })
     }
 
@@ -500,7 +501,7 @@ pub struct SpillWriter {
     path: PathBuf,
     byte_count: u64,
     /// Descriptor dictionary ids by log identity, assigned in first-use order
-    dict: std::collections::HashMap<(RelFileNode, u64), u32>,
+    dict: HashMap<(RelFileNode, u64), u32>,
 }
 
 impl SpillWriter {

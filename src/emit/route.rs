@@ -5,11 +5,11 @@
 //! encoding policy. Rows carry the snapshot to the batcher so a mapping or
 //! config change never reinterprets rows already routed.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::decode::heap_decoder::DescribedHeap;
 use crate::mapping::{TableMapping, TableTarget};
+use ahash::HashMap;
 
 /// `config_column` overlay slice for one relation: source attname → CH type
 pub type ColumnOverrides = HashMap<String, String>;
