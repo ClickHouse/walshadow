@@ -105,6 +105,9 @@ impl CatalogBoundaryGate {
         worker_alive: impl Fn() -> bool,
     ) -> Result<(), SinkError> {
         let start = Instant::now();
+        // Subscribed before the first read, so a status landing mid-check
+        // wakes the wait rather than being missed
+        let mut applied = self.state.lock().await.applied_rx();
         loop {
             let agg = self.state.lock().await.aggregate();
             if agg.min_apply_lsn.is_some_and(|apply| apply >= next_lsn) {
@@ -136,7 +139,11 @@ impl CatalogBoundaryGate {
                 ));
             }
             self.state.lock().await.request_status();
-            tokio::time::sleep(self.config.poll_interval).await;
+            // Shadow's reply wakes this; `poll_interval` is the backstop
+            // that keeps a lost wake — or a walreceiver that never answers
+            // — degrading to the old cadence instead of hanging, and paces
+            // the `worker_alive` / deadline checks above
+            let _ = tokio::time::timeout(self.config.poll_interval, applied.changed()).await;
         }
     }
 
@@ -319,6 +326,36 @@ mod tests {
         waiter.await.unwrap();
         assert_eq!(gate.stats.holds.load(Ordering::Relaxed), 1);
         assert_eq!(gate.stats.failures.load(Ordering::Relaxed), 0);
+    }
+
+    /// Release rides the status wake, not the poll: with the backstop set
+    /// far past the status, only the wake can release inside the timeout
+    #[tokio::test]
+    async fn hold_releases_on_the_status_wake_not_the_poll() {
+        let s = state();
+        let id = s.lock().await.register_connection(0x1000);
+        let gate = CatalogBoundaryGate::new(
+            s.clone(),
+            BoundaryGateConfig {
+                hold_timeout: Duration::from_secs(5),
+                poll_interval: Duration::from_secs(4),
+            },
+        );
+        let waiter = tokio::spawn({
+            let s = s.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                s.lock().await.observe_status(id, 0x2000, 0x2000, 0x2000);
+            }
+        });
+        let started = Instant::now();
+        gate.hold(0x1F00, 0x2000, || true).await.expect("released");
+        waiter.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?}, so the poll released it, not the wake",
+            started.elapsed(),
+        );
     }
 
     #[tokio::test]
