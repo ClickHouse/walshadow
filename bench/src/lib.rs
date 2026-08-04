@@ -14,6 +14,8 @@
 //! [`run`] is the high-level entry point; the binaries are thin CLIs that build
 //! a [`PgConfig`] + [`DestSpec`] + params and call [`dispatch`].
 
+pub mod suite;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -142,9 +144,10 @@ pub trait Destination: Send + Sync {
 /// stack, state.env lookup for the EC2 deployment).
 #[derive(Args, Debug)]
 pub struct CommonArgs {
-    /// Which benchmark to run.
+    /// Which benchmark to run. Required unless the binary offers a whole-suite
+    /// mode (see `ec2_bench`'s `--suite`).
     #[arg(long, value_enum)]
-    pub bench: Bench,
+    pub bench: Option<Bench>,
 
     /// Destination kind to poll for visibility.
     #[arg(long, value_enum, default_value_t = DestKind::Clickhouse)]
@@ -240,6 +243,7 @@ pub struct CommonArgs {
 /// Assemble configs/params from parsed [`CommonArgs`] (source + destination
 /// hosts already resolved by the caller) and run the selected benchmark.
 pub async fn dispatch(c: &CommonArgs, pg_host: String, dest_host: String) -> Result<()> {
+    let which = c.bench.context("--bench is required")?;
     let pg_cfg = PgConfig {
         host: pg_host,
         port: c.pg_port,
@@ -290,15 +294,7 @@ pub async fn dispatch(c: &CommonArgs, pg_host: String, dest_host: String) -> Res
         row_timeout_ms: c.row_timeout_ms,
         id_base: c.id_base,
     };
-    run(
-        &pg_cfg,
-        dest_spec,
-        c.bench,
-        &single,
-        &sustained,
-        &interleaved,
-    )
-    .await
+    run(&pg_cfg, dest_spec, which, &single, &sustained, &interleaved).await
 }
 
 /// Connect, preflight the destination, clear both sides, print a header, then

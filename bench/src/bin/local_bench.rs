@@ -11,14 +11,17 @@
 //!   cargo run --release --bin walshadow-local-bench -- --bench interleaved --xact-secs 150
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 use walshadow_bench::CommonArgs;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "walshadow-local-bench",
-    about = "Measure source-Postgres → ClickHouse replication latency (local compose stack)"
+    about = "Measure source-Postgres → ClickHouse replication latency (local compose stack)",
+    // CommonArgs leaves --bench optional for ec2_bench's whole-suite mode; this
+    // binary has no suite, so demand it at parse time.
+    group(ArgGroup::new("what").args(["bench"]).required(true)),
 )]
 struct Args {
     #[command(flatten)]
@@ -62,7 +65,7 @@ mod tests {
     fn args_parse_single_row_defaults() {
         let args = Args::try_parse_from(["bench", "--bench", "single-row"]).unwrap();
 
-        assert_eq!(args.common.bench, Bench::SingleRow);
+        assert_eq!(args.common.bench, Some(Bench::SingleRow));
         assert_eq!(args.common.pg_host, None);
         assert_eq!(args.common.pg_port, 5432);
         assert_eq!(args.common.pg_user, "postgres");
@@ -95,7 +98,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.common.bench, Bench::Sustained);
+        assert_eq!(args.common.bench, Some(Bench::Sustained));
         assert_eq!(args.common.rate, 500);
         assert_eq!(args.common.duration_secs, 7);
         assert_eq!(args.common.probe_every, 3);

@@ -12,14 +12,18 @@
 //!
 //! Explicit `--pg-host` / `--ch-host` override the lookup.
 //!
+//! `--suite <name>` runs the four standard shapes instead of one bench, into
+//! `<results-dir>/<name>/` (see [`walshadow_bench::suite`]).
+//!
 //! Examples:
 //!   cargo run --release --bin walshadow-ec2-bench -- --bench single-row
 //!   cargo run --release --bin walshadow-ec2-bench -- --bench interleaved --xact-secs 150
+//!   cargo run --release --bin walshadow-ec2-bench -- --suite walshadow-run
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::{ArgGroup, Parser, ValueEnum};
 
 use walshadow_bench::{CommonArgs, DestKind};
 
@@ -34,7 +38,9 @@ enum Network {
 #[derive(Parser, Debug)]
 #[command(
     name = "walshadow-ec2-bench",
-    about = "Measure source-Postgres → ClickHouse replication latency (EC2 deployment)"
+    about = "Measure source-Postgres → ClickHouse replication latency (EC2 deployment)",
+    // Exactly one of a single bench or the whole suite.
+    group(ArgGroup::new("what").args(["bench", "suite"]).required(true)),
 )]
 struct Args {
     #[command(flatten)]
@@ -48,6 +54,34 @@ struct Args {
     /// Default assumes the current dir is the repo root.
     #[arg(long, default_value = "bench/ec2")]
     state_dir: PathBuf,
+
+    /// Run the four standard benchmark shapes into `<results-dir>/<name>/`
+    /// instead of the single `--bench`. Refuses an existing folder.
+    #[arg(long, value_name = "NAME")]
+    suite: Option<String>,
+
+    /// Where `--suite` writes its run folders.
+    #[arg(long, default_value = "bench/results")]
+    results_dir: PathBuf,
+
+    /// Load duration for the suite's `sustained` + `interleaved` runs. Unset
+    /// keeps the quick-pass durations; `interleaved-long` always runs 10 × 30s.
+    #[arg(long)]
+    run_secs: Option<u64>,
+}
+
+impl Args {
+    /// `--run-secs` belongs to the suite. A clap `requires = "suite"` would not
+    /// catch this: `suite` shares a group with `bench`, so clap counts the
+    /// requirement as met whenever either is present.
+    fn validate(&self) -> Result<()> {
+        if self.run_secs.is_some() && self.suite.is_none() {
+            bail!(
+                "--run-secs applies to --suite only (a single --bench takes --duration-secs / --xact-secs)"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Read `KEY=value` from a shell-style state.env file.
@@ -87,6 +121,7 @@ fn resolve_host(
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    args.validate()?;
     let src_state = args.state_dir.join("ec2-source-pg/state.env");
     // source-pg records its private IP under SOURCE_PRIVATE_IP.
     let pg_host = resolve_host(
@@ -107,7 +142,47 @@ async fn main() -> Result<()> {
         args.network,
         "PRIVATE_IP",
     )?;
+
+    if let Some(name) = &args.suite {
+        // Children get the already-resolved hosts, so the whole suite keeps the
+        // endpoints this run started with and each result file records them.
+        let common = suite_child_flags(&args.common, &pg_host, &dest_host);
+        let failed = walshadow_bench::suite::run(name, &args.results_dir, &common, args.run_secs)?;
+        if !failed.is_empty() {
+            bail!("failed: {}", failed.join(", "));
+        }
+        return Ok(());
+    }
     walshadow_bench::dispatch(&args.common, pg_host, dest_host).await
+}
+
+/// Flags every suite child inherits: the destination kind, the resolved
+/// endpoints and the table identity. Bench shapes come from the suite itself.
+/// `--pg-password` is not forwarded — the harness's source Postgres uses `trust`
+/// auth and the ClickHouse HTTP probe is unauthenticated.
+fn suite_child_flags(c: &CommonArgs, pg_host: &str, dest_host: &str) -> Vec<String> {
+    [
+        (
+            "--dest",
+            c.dest
+                .to_possible_value()
+                .expect("dest has no skipped variants")
+                .get_name()
+                .to_string(),
+        ),
+        ("--pg-host", pg_host.to_string()),
+        ("--pg-port", c.pg_port.to_string()),
+        ("--pg-user", c.pg_user.clone()),
+        ("--pg-dbname", c.pg_dbname.clone()),
+        ("--table", c.table.clone()),
+        ("--ch-host", dest_host.to_string()),
+        ("--ch-http-port", c.ch_http_port.to_string()),
+        ("--ch-table", c.ch_table.clone()),
+        ("--dest-pg-port", c.dest_pg_port.to_string()),
+    ]
+    .into_iter()
+    .flat_map(|(flag, value)| [flag.to_string(), value])
+    .collect()
 }
 
 #[cfg(test)]
@@ -191,6 +266,47 @@ mod tests {
         );
 
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn args_demand_exactly_one_of_bench_or_suite() {
+        assert!(Args::try_parse_from(["bench"]).is_err());
+        assert!(
+            Args::try_parse_from(["bench", "--bench", "single-row", "--suite", "x"]).is_err(),
+            "--bench and --suite must not combine"
+        );
+        let suite = Args::try_parse_from(["bench", "--suite", "myrun"]).unwrap();
+        assert_eq!(suite.suite.as_deref(), Some("myrun"));
+        assert_eq!(suite.common.bench, None);
+        assert_eq!(suite.results_dir, PathBuf::from("bench/results"));
+    }
+
+    #[test]
+    fn run_secs_only_applies_to_the_suite() {
+        let single =
+            Args::try_parse_from(["bench", "--bench", "sustained", "--run-secs", "300"]).unwrap();
+        let err = single.validate().unwrap_err().to_string();
+        assert!(err.contains("--run-secs applies to --suite"), "{err}");
+
+        let args = Args::try_parse_from(["bench", "--suite", "r", "--run-secs", "300"]).unwrap();
+        args.validate().unwrap();
+        assert_eq!(args.run_secs, Some(300));
+    }
+
+    #[test]
+    fn suite_child_flags_carry_dest_and_resolved_endpoints() {
+        let args = Args::try_parse_from(["bench", "--suite", "r", "--dest", "postgres"]).unwrap();
+        let flags = suite_child_flags(&args.common, "10.0.0.9", "10.0.0.5");
+        let joined = flags.join(" ");
+
+        assert!(joined.contains("--dest postgres"), "{joined}");
+        assert!(joined.contains("--pg-host 10.0.0.9"), "{joined}");
+        assert!(joined.contains("--ch-host 10.0.0.5"), "{joined}");
+        assert!(joined.contains("--table demo.users"), "{joined}");
+        // No bench shape: the suite supplies that per run.
+        assert!(!joined.contains("--bench"), "{joined}");
+        // Children must not need the state.env files again.
+        assert!(!joined.contains("--state-dir"), "{joined}");
     }
 
     #[test]

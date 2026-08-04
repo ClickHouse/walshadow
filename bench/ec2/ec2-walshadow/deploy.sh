@@ -44,19 +44,13 @@ TRACE_SAMPLE_RATIO="${TRACE_SAMPLE_RATIO:-0.01}"
 XACT_BUFFER_MAX="${XACT_BUFFER_MAX:-1073741824}"
 node_ssh_setup
 
-SRC_PRIV="${SOURCE_PRIVATE_IP:-$(read_state_var ../ec2-source-pg/state.env SOURCE_PRIVATE_IP)}"
+SRC_PRIV="${SOURCE_PRIVATE_IP:-$(require_state_ip ec2-source-pg SOURCE_PRIVATE_IP)}"
 # CH host: explicit CH_HOST (e.g. Cloud endpoint) wins, else legacy
 # CH_PRIVATE_IP, else the in-VPC ec2-clickhouse node.
-CH_HOST="${CH_HOST:-${CH_PRIVATE_IP:-$(read_state_var ../ec2-clickhouse/state.env PRIVATE_IP)}}"
-[ -n "$SRC_PRIV" ] || { echo "source PG private IP unknown (provision ec2-source-pg first)" >&2; exit 1; }
-[ -n "$CH_HOST" ]  || { echo "CH host unknown (set CH_HOST=… or provision ec2-clickhouse first)" >&2; exit 1; }
+CH_HOST="${CH_HOST:-${CH_PRIVATE_IP:-$(require_state_ip ec2-clickhouse PRIVATE_IP)}}"
 echo "source PG: $SRC_PRIV:5432   clickhouse: $CH_HOST:$CH_PORT (secure=$CH_SECURE, db=$CH_DATABASE)"
 
-echo "waiting for Docker on the host (cloud-init may still be running)..."
-for i in $(seq 1 30); do
-  "${SSH[@]}" 'command -v docker >/dev/null && sudo docker info >/dev/null 2>&1' 2>/dev/null && break
-  sleep 10
-done
+wait_cloud_init
 
 # Ship the image unless it's already present on the host (use FORCE=1 to resend).
 REMOTE_IMAGE="$(remote_image_tag "$IMAGE")"
@@ -131,12 +125,11 @@ EOF
 if [ "${FORCE_METRICS:-0}" = "1" ]; then
   GRAFANA_IMAGE="${GRAFANA_IMAGE:-grafana/grafana:13.0.2}"
   PROM_IMAGE="${PROM_IMAGE:-prom/prometheus:v3.12.0}"
-  REPO_ROOT="$(cd ../../.. && pwd)"
 
   "${SSH[@]}" "sudo docker network inspect walshadow-net >/dev/null 2>&1 || sudo docker network create walshadow-net"
   "${SSH[@]}" "sudo docker network connect walshadow-net walshadow 2>/dev/null || true"
 
-  tar -C "$REPO_ROOT/docker" -czf - grafana prometheus \
+  tar -C "$(repo_root)/docker" -czf - grafana prometheus \
     | "${SSH[@]}" "sudo install -d /opt/walshadow/obs && sudo tar -C /opt/walshadow/obs -xzf -"
   # compose hostname 'clickhouse' -> private IP
   "${SSH[@]}" "sudo grep -rl clickhouse /opt/walshadow/obs 2>/dev/null | sudo xargs -r sed -i 's/clickhouse:/$CH_HOST:/g; s#//clickhouse#//$CH_HOST#g'"
