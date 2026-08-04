@@ -20,9 +20,9 @@ into each node folder for `deploy.sh` / `profile.sh` / the bench to read. The
 desired node set (streamer, clickhouse, bench runner) persists in
 `terraform/setup.auto.tfvars`, written by `stack.sh`. Post-boot setup stays
 shell: node folders keep `cloud-init.yaml` and, where needed, `deploy.sh` /
-`profile.sh` / `pre_down.sh`. Shared script helpers live in `aws-env.sh`
-(creds) and `lib.sh` (ssh/state.env). `*.pem`, `state.env` and terraform state
-are gitignored.
+`pre_down.sh`. Shared scripts sit alongside `stack.sh`: `aws-env.sh` (creds),
+`lib.sh` (ssh, state.env, readiness waits) and `profile.sh` (on-CPU capture for
+any streamer). `*.pem`, `state.env` and terraform state are gitignored.
 
 Record account and profile in `aws.local.env`, which stays gitignored and is
 required by `aws-env.sh`. Account check aborts when credentials resolve to a
@@ -54,7 +54,9 @@ cd bench/ec2
 `terraform apply` is interactive — review the plan before confirming,
 especially on setup swaps (e.g. walshadow→pg destroys the ClickHouse node).
 Before a streamer node is destroyed or swapped, `stack.sh` copies any on-CPU
-profiles off it and runs its `pre_down.sh` hook. Terraform can also be driven
+profiles off it and runs its `pre_down.sh` hook. Start a capture with
+`./profile.sh <walshadow|peerdb|pg-standby> [secs]` just before a benchmark; it
+returns immediately and teardown copies the result into the node folder. Terraform can also be driven
 directly: `source aws-env.sh && terraform -chdir=terraform plan`. Knobs like
 `instance_type` / `az` / `my_ip` are variables (see `terraform/variables.tf`);
 `instance_type` is global — the AZ is picked from its offerings.
@@ -101,17 +103,24 @@ a read-only hot standby that streams WAL. Re-running takes a fresh base backup.
 
 ## Benchmark a setup
 
-`walshadow-ec2-bench` reads endpoints from the relevant `state.env`. Use
-`run_bench_suite.sh <name>` (at the bench crate root) to run all four benches into
-`bench/results/<name>/` (a gitignored dir, created on demand):
+`walshadow-ec2-bench` reads endpoints from the relevant `state.env`. `--suite
+<name>` runs all four benches into `bench/results/<name>/` (a gitignored dir,
+created on demand; an existing name is refused). Run it from the repository
+root, where the `--state-dir` and `--results-dir` defaults resolve:
 ```bash
+B="cargo run --release --bin walshadow-ec2-bench --"
 # CDC engines (walshadow / peerdb) → ClickHouse:
-../run_bench_suite.sh walshadow-run            # DEST defaults to clickhouse
+$B --suite walshadow-run                       # --dest defaults to clickhouse
 # physical standby:
-DEST=postgres ../run_bench_suite.sh pg-run     # reads ec2-pg-standby
-# Run sustained and interleaved loads for five minutes; long run already uses 10 30-second rounds
-RUN_SECS=300 ../run_bench_suite.sh walshadow-5min
+$B --suite pg-run --dest postgres              # reads ec2-pg-standby
+# Run sustained and interleaved loads for five minutes; interleaved-long always runs 10 30-second rounds
+$B --suite walshadow-5min --run-secs 300
+# one bench on its own, with its own knobs:
+$B --bench interleaved --xact-secs 150
 ```
+Each shape runs as a child process, so one failure does not end the pass: its
+output is teed to `<shape>.txt` with a `# FAILED` footer and the suite exits
+non-zero listing what failed.
 
 ## Notes
 - `c8i.2xlarge`s bill while running (~8× a t2.small) — `down` (or `down --all`) when idle.

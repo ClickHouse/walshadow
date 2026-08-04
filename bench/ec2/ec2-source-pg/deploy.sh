@@ -22,18 +22,15 @@ cd "$(dirname "$0")"
 source ./state.env   # PUBLIC_IP, PEM, ...
 source ../lib.sh
 
-REPO_ROOT="$(cd ../../.. && pwd)"
-INSTALL_SQL="$REPO_ROOT/sql/runtime_config_install.sql"
+INSTALL_SQL="$(repo_root)/sql/runtime_config_install.sql"
 [ -f "$INSTALL_SQL" ] || { echo "missing $INSTALL_SQL" >&2; exit 1; }
 node_ssh_setup
 
 PSQL=(sudo docker exec -i source psql -v ON_ERROR_STOP=1 -U postgres -d postgres)
 
-echo "waiting for the source Postgres container to accept connections..."
-for i in $(seq 1 30); do
-  "${SSH[@]}" 'command -v docker >/dev/null && sudo docker exec source pg_isready -U postgres >/dev/null 2>&1' 2>/dev/null && break
-  sleep 10
-done
+wait_cloud_init
+retry_remote 30 10 "the source Postgres container to accept connections" \
+  'sudo docker exec source pg_isready -U postgres >/dev/null 2>&1'
 
 echo "installing walshadow.config_* overlay from sql/runtime_config_install.sql..."
 "${SSH[@]}" "${PSQL[*]}" < "$INSTALL_SQL"

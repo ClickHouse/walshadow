@@ -18,21 +18,12 @@ source ../lib.sh
 
 node_ssh_setup
 
-SRC_PRIV="${SOURCE_PRIVATE_IP:-$(read_state_var ../ec2-source-pg/state.env SOURCE_PRIVATE_IP)}"
-CH_PRIV="${CH_PRIVATE_IP:-$(read_state_var ../ec2-clickhouse/state.env PRIVATE_IP)}"
-[ -n "$SRC_PRIV" ] || { echo "source PG private IP unknown (provision ec2-source-pg first)" >&2; exit 1; }
-[ -n "$CH_PRIV" ]  || { echo "clickhouse private IP unknown (provision ec2-clickhouse first)" >&2; exit 1; }
+SRC_PRIV="${SOURCE_PRIVATE_IP:-$(require_state_ip ec2-source-pg SOURCE_PRIVATE_IP)}"
+CH_PRIV="${CH_PRIVATE_IP:-$(require_state_ip ec2-clickhouse PRIVATE_IP)}"
 echo "source PG: $SRC_PRIV:5432   clickhouse: $CH_PRIV:9000"
 
-echo "waiting for SSH on the host…"
-ssh_ok=0
-for i in $(seq 1 30); do "${SSH[@]}" true 2>/dev/null && { ssh_ok=1; break; }; sleep 10; done
-[ "$ssh_ok" = 1 ] || { echo "host not reachable over SSH after ~300s" >&2; exit 1; }
-
-# Block until cloud-init has actually finished (Docker install + PeerDB clone),
-# rather than racing it. --wait returns non-zero if cloud-init errored.
-echo "waiting for cloud-init to finish (Docker install + PeerDB clone)…"
-"${SSH[@]}" 'sudo cloud-init status --wait' || { echo "cloud-init did not complete cleanly on the host" >&2; exit 1; }
+# cloud-init installs Docker and clones PeerDB
+wait_cloud_init
 "${SSH[@]}" 'command -v docker >/dev/null && [ -d /opt/peerdb ]' \
   || { echo "host missing docker or /opt/peerdb after cloud-init" >&2; exit 1; }
 
@@ -51,13 +42,7 @@ echo "bringing up the PeerDB stack (docker compose up -d; first run pulls severa
 # PeerDB SQL server (Postgres wire) on :9900.
 PSQL='sudo docker run --rm -i --network host postgres:17-alpine psql "host=127.0.0.1 port=9900 user=peerdb password=peerdb dbname=peerdb sslmode=disable"'
 
-echo "waiting for the PeerDB SQL server on :9900…"
-sql_ok=0
-for i in $(seq 1 40); do
-  "${SSH[@]}" "$PSQL -tAc 'select 1'" 2>/dev/null | grep -q 1 && { sql_ok=1; break; }
-  sleep 10
-done
-[ "$sql_ok" = 1 ] || { echo "PeerDB SQL server not reachable on :9900 after ~400s" >&2; exit 1; }
+retry_remote 40 10 "the PeerDB SQL server on :9900" "$PSQL -tAc 'select 1' | grep -q 1"
 echo "peerdb-server up"
 
 # The PeerDB quickstart runs one-shot inits that race their dependencies on a
@@ -67,11 +52,8 @@ echo "peerdb-server up"
 # Re-assert both, idempotently, before configuring anything.
 echo "ensuring MinIO staging bucket 'peerdbbucket' exists…"
 "${SSH[@]}" "cd /opt/peerdb && sudo docker compose exec -T minio sh -c 'mc alias set m http://localhost:9000 _peerdb_minioadmin _peerdb_minioadmin >/dev/null 2>&1; mc mb -p m/peerdbbucket' 2>&1 | tail -1" || true
-echo "ensuring Temporal search attribute 'MirrorName' is registered…"
-for i in $(seq 1 6); do
-  "${SSH[@]}" "cd /opt/peerdb && sudo docker compose exec -T temporal-admin-tools temporal operator search-attribute create --namespace default --name MirrorName --type Keyword --address temporal:7233" 2>/dev/null && break
-  sleep 10
-done
+retry_remote 6 10 "Temporal search attribute 'MirrorName'" \
+  "cd /opt/peerdb && sudo docker compose exec -T temporal-admin-tools temporal operator search-attribute create --namespace default --name MirrorName --type Keyword --address temporal:7233" || true
 
 if [ "${CONFIGURE_MIRROR:-1}" = "1" ]; then
   # Drop an existing mirror first so re-running deploy.sh actually re-applies
@@ -119,4 +101,4 @@ echo "=== deployed ==="
 echo "PeerDB UI:  http://$PUBLIC_IP:3000"
 echo "PeerDB SQL: psql 'host=$PUBLIC_IP port=9900 user=peerdb password=peerdb dbname=peerdb'"
 echo "logs:       ssh -i $PEM ubuntu@$PUBLIC_IP 'cd /opt/peerdb && sudo docker compose logs -f'"
-echo "profile:    ./profile.sh [secs]   # start an on-CPU capture before the bench; teardown copies it back"
+echo "profile:    ../profile.sh peerdb [secs]   # start an on-CPU capture before the bench; teardown copies it back"

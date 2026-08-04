@@ -17,15 +17,10 @@ source ../lib.sh
 PG_IMAGE="${PG_IMAGE:-postgres:17-bookworm}"
 node_ssh_setup
 
-SRC_PRIV="${SOURCE_PRIVATE_IP:-$(read_state_var ../ec2-source-pg/state.env SOURCE_PRIVATE_IP)}"
-[ -n "$SRC_PRIV" ] || { echo "source PG private IP unknown (provision ec2-source-pg first)" >&2; exit 1; }
+SRC_PRIV="${SOURCE_PRIVATE_IP:-$(require_state_ip ec2-source-pg SOURCE_PRIVATE_IP)}"
 echo "primary: $SRC_PRIV:5432   standby image: $PG_IMAGE"
 
-echo "waiting for SSH + cloud-init…"
-ssh_ok=0
-for i in $(seq 1 30); do "${SSH[@]}" true 2>/dev/null && { ssh_ok=1; break; }; sleep 10; done
-[ "$ssh_ok" = 1 ] || { echo "host not reachable over SSH after ~300s" >&2; exit 1; }
-"${SSH[@]}" 'sudo cloud-init status --wait' || { echo "cloud-init did not finish cleanly" >&2; exit 1; }
+wait_cloud_init
 
 # Fresh base backup each deploy: stop any old standby, recreate the data volume,
 # then pg_basebackup -R as the postgres user (so the data dir ownership is right

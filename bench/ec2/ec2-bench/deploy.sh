@@ -5,16 +5,16 @@
 #
 # After this: ssh to the box and run, e.g.
 #   walshadow-ec2-bench --network private --dest clickhouse --bench single-row --state-dir /opt/bench/ec2
-#   # or all four via the shipped runner:
-#   BIN=walshadow-ec2-bench STATE_DIR=/opt/bench/ec2 NETWORK=private DEST=clickhouse \
-#     SKIP_BUILD=1 /opt/bench/run_bench_suite.sh myrun
+#   # or the whole four-bench suite:
+#   walshadow-ec2-bench --network private --dest clickhouse --suite myrun \
+#     --state-dir /opt/bench/ec2 --results-dir /opt/bench/results
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./state.env   # PUBLIC_IP, PEM, ...
 source ../lib.sh
 
 IMAGE="${IMAGE:-walshadow-bench:local}"
-REPO_ROOT="$(cd ../../.. && pwd)"
+REPO_ROOT="$(repo_root)"
 node_ssh_setup
 
 echo "building $IMAGE (from docker/Dockerfile.bench)…"
@@ -35,9 +35,9 @@ fi
 # Ship the sibling state.env files so --network private can resolve endpoints.
 echo "shipping endpoint state.env files…"
 # List every level explicitly so /opt/bench and /opt/bench/ec2 are also
-# ubuntu-owned (install -d only reliably applies -o to the leaf dirs) — needed
-# so we can scp run_bench_suite.sh there and the runner can write results.
-"${SSH[@]}" 'sudo install -d -o ubuntu /opt/bench /opt/bench/ec2 /opt/bench/ec2/ec2-source-pg /opt/bench/ec2/ec2-clickhouse /opt/bench/ec2/ec2-pg-standby'
+# ubuntu-owned (install -d only reliably applies -o to the leaf dirs) — the scp
+# below writes as ubuntu, and results stay readable without sudo.
+"${SSH[@]}" 'sudo install -d -o ubuntu /opt/bench /opt/bench/results /opt/bench/ec2 /opt/bench/ec2/ec2-source-pg /opt/bench/ec2/ec2-clickhouse /opt/bench/ec2/ec2-pg-standby'
 for n in ec2-source-pg ec2-clickhouse ec2-pg-standby; do
   if [ -f "../$n/state.env" ]; then
     "${SCP[@]}" "../$n/state.env" "ubuntu@$PUBLIC_IP:/opt/bench/ec2/$n/state.env"
@@ -46,16 +46,13 @@ for n in ec2-source-pg ec2-clickhouse ec2-pg-standby; do
 done
 
 # Install a wrapper: `walshadow-ec2-bench …` → runs the image with host
-# networking and /opt/bench/ec2 mounted at the same path (so --state-dir works).
+# networking and /opt/bench mounted at the same path, so --state-dir reads the
+# shipped state.env files and --suite writes results back to the host.
 echo "installing walshadow-ec2-bench wrapper…"
 "${SSH[@]}" "cat | sudo tee /usr/local/bin/walshadow-ec2-bench >/dev/null && sudo chmod +x /usr/local/bin/walshadow-ec2-bench" <<WRAP
 #!/usr/bin/env bash
-exec sudo docker run --rm --network host -v /opt/bench/ec2:/opt/bench/ec2 $REMOTE_IMAGE "\$@"
+exec sudo docker run --rm --network host -v /opt/bench:/opt/bench $REMOTE_IMAGE "\$@"
 WRAP
-
-# Ship run_bench_suite.sh for the all-four pass (BIN/STATE_DIR overridable).
-"${SCP[@]}" "$REPO_ROOT/bench/run_bench_suite.sh" "ubuntu@$PUBLIC_IP:/opt/bench/run_bench_suite.sh"
-"${SSH[@]}" 'chmod +x /opt/bench/run_bench_suite.sh'
 
 echo
 echo "=== ready ==="
@@ -63,5 +60,5 @@ echo "ssh -i $PEM ubuntu@$PUBLIC_IP"
 echo "then, in-VPC (private IPs):"
 echo "  walshadow-ec2-bench --network private --dest clickhouse --bench single-row --state-dir /opt/bench/ec2"
 echo "  # all four into /opt/bench/results/<name>:"
-echo "  BIN=walshadow-ec2-bench STATE_DIR=/opt/bench/ec2 NETWORK=private DEST=clickhouse SKIP_BUILD=1 /opt/bench/run_bench_suite.sh myrun"
-echo "  # for the pg standby:  DEST=postgres …"
+echo "  walshadow-ec2-bench --network private --dest clickhouse --suite myrun --state-dir /opt/bench/ec2 --results-dir /opt/bench/results"
+echo "  # for the pg standby:  --dest postgres …"
