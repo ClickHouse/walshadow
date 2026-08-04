@@ -25,7 +25,7 @@ use std::time::Duration;
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use walrus::pg::replication::server::{self, ServerError, WalSenderConn, decode_standby_status};
 use walrus::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 
@@ -112,6 +112,13 @@ pub struct ShadowStreamState {
     /// gap and strands at segment boundaries). Reset per segment.
     wire_buf: Vec<u8>,
     wire_buf_start: u64,
+    /// Wakes the listener to write now rather than on its batching tick;
+    /// bumped by `request_status`, the one caller whose bytes a hold is
+    /// waiting behind
+    queued: watch::Sender<u64>,
+    /// Bumped when a client's apply LSN advances: wakes a publication hold
+    /// on the standby status that releases it
+    applied: watch::Sender<u64>,
 }
 
 impl ShadowStreamState {
@@ -135,7 +142,28 @@ impl ShadowStreamState {
             dropped_total: 0,
             wire_buf: Vec::new(),
             wire_buf_start: current_lsn,
+            queued: watch::Sender::new(0),
+            applied: watch::Sender::new(0),
         }
+    }
+
+    /// Wakes the listener out of its batching tick, for the paths that
+    /// cannot wait one out ([`request_status`](Self::request_status)).
+    /// `watch` latches, so a wake landing while the listener is mid-write
+    /// still arms its next wait — and a drain takes the whole queue, so one
+    /// wake covers every byte enqueued before it
+    pub fn queued_rx(&self) -> watch::Receiver<u64> {
+        self.queued.subscribe()
+    }
+
+    /// Wakes when any client's apply LSN advances; the waiter re-reads
+    /// [`aggregate`](Self::aggregate), which stays the release authority
+    pub fn applied_rx(&self) -> watch::Receiver<u64> {
+        self.applied.subscribe()
+    }
+
+    fn wake_listener(&self) {
+        self.queued.send_modify(|n| *n += 1);
     }
 
     pub fn aggregate(&self) -> AggregateLsn {
@@ -256,7 +284,11 @@ impl ShadowStreamState {
         let _ = write_lsn;
         if let Some(c) = self.connections.get_mut(&id) {
             c.flush_lsn = c.flush_lsn.max(flush_lsn);
+            let advanced = apply_lsn > c.apply_lsn;
             c.apply_lsn = c.apply_lsn.max(apply_lsn);
+            if advanced {
+                self.applied.send_modify(|n| *n += 1);
+            }
         }
     }
 
@@ -336,10 +368,17 @@ impl ShadowStreamState {
     }
 
     /// Enqueue a reply-requested `'k'` keepalive on every active
-    /// connection. Shadow's walreceiver answers immediately with fresh
-    /// flush/apply LSNs — non-forced replies otherwise fire only when the
-    /// flush position advances or `wal_receiver_status_interval` elapses,
-    /// so a publication hold waiting on apply progress prods through this.
+    /// connection and wake the listener to write it now. Shadow's
+    /// walreceiver answers immediately with fresh flush/apply LSNs —
+    /// non-forced replies otherwise fire only when the flush position
+    /// advances or `wal_receiver_status_interval` elapses, so a publication
+    /// hold waiting on apply progress prods through this.
+    ///
+    /// The wake carries the queue's WAL bytes out with the keepalive: a
+    /// hold waits on replay of records shadow cannot apply before it
+    /// receives them, and the listener's tick is a batching timer sized for
+    /// bulk streaming, not for this. Bulk traffic keeps that batching —
+    /// only the prod jumps the queue
     pub fn request_status(&mut self) {
         let server_wal_end = self.server_wal_end;
         let ids: Vec<u64> = self
@@ -353,6 +392,7 @@ impl ShadowStreamState {
                 encode_keepalive_frame_into(out, server_wal_end, true);
             });
         }
+        self.wake_listener();
     }
 }
 
@@ -571,8 +611,25 @@ where
     let mut last_write = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(flush_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Writes ride the enqueue wake; the ticker is the idle-keepalive timer
+    // and the backstop for a wake the queue raced. Batching survives: a
+    // wake drains everything queued, and bytes enqueued during a write
+    // land in the next drain
+    let mut queued = state.lock().await.queued_rx();
+    // Registration backfilled this connection before the subscribe, so the
+    // first wait must not swallow bytes already queued
+    queued.mark_changed();
     loop {
         tokio::select! {
+            _ = queued.changed() => {
+                let pending = state.lock().await.drain_send_queue(id);
+                if let Some(bytes) = pending
+                    && !bytes.is_empty()
+                {
+                    conn.write_framed(&bytes).await?;
+                    last_write = tokio::time::Instant::now();
+                }
+            }
             _ = ticker.tick() => {
                 let pending = {
                     let mut s = state.lock().await;
@@ -624,6 +681,45 @@ mod tests {
 
     fn fresh_state() -> ShadowStreamState {
         ShadowStreamState::new(1, "12345".into(), 0x1000, 1024 * 1024)
+    }
+
+    #[test]
+    fn status_request_wakes_the_listener_with_the_queued_wal() {
+        let mut s = fresh_state();
+        let id = s.register_connection(0x1000);
+        let rx = s.queued_rx();
+        s.enqueue(id, vec![b'd', 0, 0, 0, 4]);
+        assert!(
+            !rx.has_changed().expect("sender alive"),
+            "bulk WAL keeps the listener's batching tick",
+        );
+        s.request_status();
+        assert!(rx.has_changed().expect("sender alive"));
+        let queued = s.drain_send_queue(id).expect("queue");
+        assert!(
+            queued.len() > 5,
+            "the wake carries the queued WAL out with the keepalive",
+        );
+    }
+
+    #[test]
+    fn only_apply_progress_wakes_a_hold() {
+        let mut s = fresh_state();
+        let id = s.register_connection(0x1000);
+        let mut rx = s.applied_rx();
+        s.observe_status(id, 0x2000, 0x2000, 0x1000);
+        assert!(
+            !rx.has_changed().expect("sender alive"),
+            "flush progress alone releases nothing",
+        );
+        s.observe_status(id, 0x2000, 0x2000, 0x1800);
+        assert!(rx.has_changed().expect("sender alive"));
+        rx.mark_unchanged();
+        s.observe_status(id, 0x2000, 0x2000, 0x1800);
+        assert!(
+            !rx.has_changed().expect("sender alive"),
+            "a repeated status is not progress",
+        );
     }
 
     #[test]

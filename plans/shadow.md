@@ -279,6 +279,11 @@ Aggregate view (`ShadowStreamState::aggregate() → AggregateLsn`)
 exposes `min_flush_lsn`, `min_apply_lsn`, `active_connections`,
 `dropped_total` for status loop + metrics
 
+Writes ride a batching tick, with `request_status` waking the listener
+for the one path that cannot wait one out — the publication hold, which
+needs its queued WAL at shadow before the reply it prods for can mean
+anything ([source.md](source.md))
+
 Backpressure: per-connection send queue caps at `slow_threshold` bytes;
 overflow drops socket & lets shadow reconnect — completed segments via
 archive (`restore_command`), in-progress segment via `wire_buf`

@@ -281,9 +281,20 @@ commits never park; hold cost is DDL-rate
 Shadow keeps applying while the pump parks: the walsender listener
 flushes already-queued frames on its own task. Walreceivers report
 apply progress only when flush advances or on
-`wal_receiver_status_interval`, so the gate prods each poll tick with a
-reply-requested `'k'` keepalive (`ShadowStreamState::request_status`)
-and observes apply at poll cadence (ms). Waiter is result-bearing:
+`wal_receiver_status_interval`, so the gate prods with a reply-requested
+`'k'` keepalive (`ShadowStreamState::request_status`).
+
+Neither direction waits out a timer. `request_status` wakes the listener
+so the prod — and the queued WAL behind it, which shadow cannot apply
+before it receives — goes out now instead of on the listener's next
+batching tick; the reply lands in `observe_status`, which wakes the gate
+when apply advances. Bulk WAL keeps the batching tick: waking per enqueue
+costs more in listener/pump lock traffic than the latency is worth, and
+only a hold needs bytes out early. `poll_interval` stays as the backstop
+that paces the deadline and worker-liveness checks, so a lost wake
+degrades to the old cadence rather than hanging. What remains is shadow's
+own replay — sub-millisecond warm, ~10ms for the first catalog record
+after an idle period. Waiter is result-bearing:
 decoder-worker death (`QueueingRecordSink::worker_alive`, channel
 closed on fatal error or panic; parked root cause preferred over the
 generic hold error), walreceiver loss past the deadline, and

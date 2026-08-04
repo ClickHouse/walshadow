@@ -589,7 +589,7 @@ async fn maintenance_traffic_parks_the_pump_for_nothing() {
         &mut segs,
         &mut buf,
         &mut sink,
-        "ALTER TABLE churn ADD COLUMN c int;\n",
+        "ALTER TABLE churn ADD COLUMN c int;\nALTER TABLE churn ADD COLUMN d int;\nALTER TABLE churn ADD COLUMN e int;\n",
     )
     .await;
     let (ddl_holds, ddl_held) = report("add column", &mut sink, elapsed);
