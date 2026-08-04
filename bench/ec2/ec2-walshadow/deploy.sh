@@ -3,9 +3,10 @@
 # ch-config.toml pointed at the ClickHouse private IP, and (re)starts the
 # container streaming from the source PG private IP into ClickHouse.
 #
-# Prereqs: stack.sh has applied terraform (state.env exists, source-pg and
-# clickhouse nodes up) and `walshadow:local` exists locally
-#   (docker build -f docker/Dockerfile -t walshadow:local <repo-root>).
+# Require stack.sh setup and local `walshadow:local` image,
+# built for source PostgreSQL major version:
+#   docker build -f docker/Dockerfile --build-arg PG_MAJOR=17 -t walshadow:local <repo-root>
+# Reject incompatible image versions below
 #
 # Endpoint IPs are read from the sibling state.env files; override with
 #   SOURCE_PRIVATE_IP=... CH_HOST=... ./deploy.sh
@@ -58,11 +59,28 @@ for i in $(seq 1 30); do
 done
 
 # Ship the image unless it's already present on the host (use FORCE=1 to resend).
-if [ "${FORCE:-0}" != "1" ] && "${SSH[@]}" "sudo docker image inspect $IMAGE >/dev/null 2>&1"; then
-  echo "image $IMAGE already on host (FORCE=1 to resend)"
+REMOTE_IMAGE="$(remote_image_tag "$IMAGE")"
+if [ "${FORCE:-0}" != "1" ] && [ -n "$REMOTE_IMAGE" ]; then
+  echo "image $REMOTE_IMAGE already on host (FORCE=1 to resend)"
 else
   echo "shipping $IMAGE (docker save | ssh | docker load)..."
   docker save "$IMAGE" | gzip | "${SSH[@]}" 'gunzip | sudo docker load'
+  REMOTE_IMAGE="$(remote_image_tag "$IMAGE")"
+  [ -n "$REMOTE_IMAGE" ] || { echo "$IMAGE missing on host after load" >&2; exit 1; }
+fi
+
+# Backup data requires matching PostgreSQL major versions
+IMG_MAJOR="$("${SSH[@]}" "sudo docker run --rm --entrypoint postgres $REMOTE_IMAGE -V" | grep -oE '[0-9]+' | head -1)"
+SRC_VERSION_NUM="$("${SSH[@]}" "sudo docker run --rm --entrypoint psql $REMOTE_IMAGE -h '$SRC_PRIV' -U postgres -tAc 'SHOW server_version_num'" | tr -dc '0-9')"
+if [ -z "$IMG_MAJOR" ] || [ -z "$SRC_VERSION_NUM" ]; then
+  echo "could not read PG majors (image $REMOTE_IMAGE, source $SRC_PRIV)" >&2
+  exit 1
+fi
+SRC_MAJOR=$((SRC_VERSION_NUM / 10000))
+if [ "$IMG_MAJOR" != "$SRC_MAJOR" ]; then
+  echo "PG major mismatch: image is PG $IMG_MAJOR, source is PG $SRC_MAJOR" >&2
+  echo "  rebuild: docker build -f docker/Dockerfile --build-arg PG_MAJOR=$SRC_MAJOR -t $IMAGE <repo-root>" >&2
+  exit 1
 fi
 
 # ch-config.toml: the repo config with the CH host swapped to the private IP.
@@ -107,7 +125,7 @@ EOF
   -v /opt/walshadow/ch-config.toml:/etc/walshadow/ch-config.toml:ro \
   -v walshadow-data:/var/lib/walshadow \
   -p 9484:9484 \
-  $IMAGE --trace-sample-ratio '$TRACE_SAMPLE_RATIO' >/dev/null && echo started"
+  $REMOTE_IMAGE --trace-sample-ratio '$TRACE_SAMPLE_RATIO' >/dev/null && echo started"
 
 # Grafana + Prometheus: only uploaded/recreated when FORCE_METRICS=1.
 if [ "${FORCE_METRICS:-0}" = "1" ]; then

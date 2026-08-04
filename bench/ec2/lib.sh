@@ -15,6 +15,17 @@ node_ssh_setup() {
   SCP=(scp -i "$PEM" -o StrictHostKeyChecking=accept-new)
 }
 
+# Print matching remote image tag, including Podman's localhost prefix
+remote_image_tag() {
+  local ref
+  for ref in "$1" "localhost/$1"; do
+    if "${SSH[@]}" "sudo docker image inspect '$ref' >/dev/null 2>&1"; then
+      echo "$ref"
+      return
+    fi
+  done
+}
+
 # Block until cloud-init has finished on the node (SSH must be set up).
 wait_cloud_init() {
   echo "waiting for SSH + cloud-init…"

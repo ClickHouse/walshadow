@@ -12,8 +12,8 @@
 # Pick the destination with DEST:
 #   DEST=clickhouse (default) — walshadow / peerdb pipelines (reads ec2-clickhouse)
 #   DEST=postgres             — PG→PG physical standby (reads ec2-pg-standby)
-# Override any bench's flags via the *_ARGS env vars below, the target with
-# NETWORK=private, or skip the rebuild with SKIP_BUILD=1.
+# Override flags with *_ARGS, load duration with RUN_SECS, target with NETWORK,
+# or skip rebuild with SKIP_BUILD=1
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -34,10 +34,13 @@ OUT="$RESULTS_DIR/$NAME"
 [ -e "$OUT" ] && { echo "error: $OUT already exists — choose a different name" >&2; exit 1; }
 
 # Per-bench flags — override via env, e.g. SUSTAINED_ARGS="--bench sustained --rate 1000".
-# Durations are kept modest for a quick pass; bump --xact-secs / --duration-secs for longer runs.
+# Set RUN_SECS to override sustained and interleaved load duration
+# Leave unset for short runs; interleaved-long always runs 10 rounds of 30 seconds
+SUSTAINED_SECS="${RUN_SECS:-20}"
+INTERLEAVED_SECS="${RUN_SECS:-30}"
 SINGLE_ARGS="${SINGLE_ARGS:---bench single-row --iterations 100 --warmup 10}"
-SUSTAINED_ARGS="${SUSTAINED_ARGS:---bench sustained --rate 30000 --duration-secs 20 --concurrency 90}"
-INTERLEAVED_ARGS="${INTERLEAVED_ARGS:---bench interleaved --xact-threads 90 --rounds 1 --xact-secs 30}"
+SUSTAINED_ARGS="${SUSTAINED_ARGS:---bench sustained --rate 30000 --duration-secs $SUSTAINED_SECS --concurrency 90}"
+INTERLEAVED_ARGS="${INTERLEAVED_ARGS:---bench interleaved --xact-threads 90 --rounds 1 --xact-secs $INTERLEAVED_SECS}"
 LONG_THROUGHPUT="${LONG_THROUGHPUT:---bench interleaved --xact-threads 1 --rounds 10 --xact-secs 30}"
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then

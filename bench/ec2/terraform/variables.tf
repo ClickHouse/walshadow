@@ -3,6 +3,11 @@ variable "region" {
   default = "ap-south-1"
 }
 
+# Restrict provider to expected account
+variable "account_id" {
+  type = string
+}
+
 # "none" keeps just the base up
 variable "streamer" {
   type    = string

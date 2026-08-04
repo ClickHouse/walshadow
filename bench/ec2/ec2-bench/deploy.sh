@@ -22,11 +22,14 @@ docker build -f "$REPO_ROOT/docker/Dockerfile.bench" -t "$IMAGE" "$REPO_ROOT"
 
 wait_cloud_init
 
-if [ "${FORCE:-0}" != "1" ] && "${SSH[@]}" "sudo docker image inspect $IMAGE >/dev/null 2>&1"; then
-  echo "image $IMAGE already on host (FORCE=1 to resend)"
+REMOTE_IMAGE="$(remote_image_tag "$IMAGE")"
+if [ "${FORCE:-0}" != "1" ] && [ -n "$REMOTE_IMAGE" ]; then
+  echo "image $REMOTE_IMAGE already on host (FORCE=1 to resend)"
 else
   echo "shipping $IMAGE (docker save | ssh | docker load)…"
   docker save "$IMAGE" | gzip | "${SSH[@]}" 'gunzip | sudo docker load'
+  REMOTE_IMAGE="$(remote_image_tag "$IMAGE")"
+  [ -n "$REMOTE_IMAGE" ] || { echo "$IMAGE missing on host after load" >&2; exit 1; }
 fi
 
 # Ship the sibling state.env files so --network private can resolve endpoints.
@@ -47,7 +50,7 @@ done
 echo "installing walshadow-ec2-bench wrapper…"
 "${SSH[@]}" "cat | sudo tee /usr/local/bin/walshadow-ec2-bench >/dev/null && sudo chmod +x /usr/local/bin/walshadow-ec2-bench" <<WRAP
 #!/usr/bin/env bash
-exec sudo docker run --rm --network host -v /opt/bench/ec2:/opt/bench/ec2 $IMAGE "\$@"
+exec sudo docker run --rm --network host -v /opt/bench/ec2:/opt/bench/ec2 $REMOTE_IMAGE "\$@"
 WRAP
 
 # Ship run_bench_suite.sh for the all-four pass (BIN/STATE_DIR overridable).

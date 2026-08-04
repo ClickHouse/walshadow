@@ -2,6 +2,9 @@
 *.pem
 state.env
 
+# Local AWS profile settings
+aws.local.env
+
 # copied-back perf/eBPF profiles (large)
 profiles/
 

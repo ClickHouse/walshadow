@@ -24,6 +24,22 @@ shell: node folders keep `cloud-init.yaml` and, where needed, `deploy.sh` /
 (creds) and `lib.sh` (ssh/state.env). `*.pem`, `state.env` and terraform state
 are gitignored.
 
+Record account and profile in `aws.local.env`, which stays gitignored and is
+required by `aws-env.sh`. Account check aborts when credentials resolve to a
+different account, then Terraform checks same account through
+`allowed_account_ids`:
+
+```bash
+echo 'BENCH_AWS_ACCOUNT=<account-id>' > aws.local.env
+echo 'BENCH_AWS_PROFILE=<p>' >> aws.local.env
+aws sso login --profile=<p>     # renew expired session
+```
+
+After the account check, `aws-env.sh` resolves that profile to session keys
+(`aws configure export-credentials`) and exports them, so terraform runs on
+exactly the creds the check validated — its Go SDK rejects a stale SSO token
+that the CLI would still serve from cache.
+
 ## stack.sh — the main interface
 
 ```bash
@@ -50,12 +66,18 @@ the source table at startup — so a second setup's run would disturb the first.
 ## Per-setup
 
 ### walshadow
-Build the image first (the deploy ships a locally-built image rather than building on the box):
+Build the image first (the deploy ships a locally-built image rather than building on the box).
+`PG_MAJOR` must match `ec2-source-pg` (`postgres:17`) — the shadow data dir comes
+from a BASE_BACKUP of the source, so PG 18 binaries cannot open it; `deploy.sh`
+compares the two and refuses to start on a mismatch:
 ```bash
-docker build -f docker/Dockerfile -t walshadow:local .   # from repo root
+docker build -f docker/Dockerfile --build-arg PG_MAJOR=17 -t walshadow:local .   # run from repository root
 ./stack.sh up walshadow                                   # source-pg + clickhouse + daemon
 ./stack.sh down                                           # daemon only (base kept)
 ```
+Building with podman works: it tags locally-built images `localhost/walshadow:local`,
+and `docker load` on the node keeps that prefix, so the deploys resolve whichever
+tag actually landed (`remote_image_tag` in `lib.sh`) instead of assuming `$IMAGE`.
 `deploy.sh` ships `walshadow:local` (`docker save | ssh | docker load`), writes
 `ch-config.toml` (ClickHouse private IP, `flush_timeout_ms`), and runs the daemon.
 
@@ -87,6 +109,8 @@ a read-only hot standby that streams WAL. Re-running takes a fresh base backup.
 ../run_bench_suite.sh walshadow-run            # DEST defaults to clickhouse
 # physical standby:
 DEST=postgres ../run_bench_suite.sh pg-run     # reads ec2-pg-standby
+# Run sustained and interleaved loads for five minutes; long run already uses 10 30-second rounds
+RUN_SECS=300 ../run_bench_suite.sh walshadow-5min
 ```
 
 ## Notes
