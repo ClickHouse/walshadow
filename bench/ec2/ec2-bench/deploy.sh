@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # Build the bench image, ship it + the current state.env files to the runner
 # box, and install a `walshadow-ec2-bench` wrapper that runs the bench in a
-# host-network container. Then benches run IN the VPC (private IPs, no WAN RTT).
+# host-network container, with the on-box paths already filled in. Benches then
+# run IN the VPC (private IPs, no WAN round trip in the numbers).
 #
-# After this: ssh to the box and run, e.g.
-#   walshadow-ec2-bench --network private --dest clickhouse --bench single-row --state-dir /opt/bench/ec2
-#   # or the whole four-bench suite:
-#   walshadow-ec2-bench --network private --dest clickhouse --suite myrun \
-#     --state-dir /opt/bench/ec2 --results-dir /opt/bench/results
+# `../stack.sh bench run <name>` drives this end to end. By hand, on the box:
+#   walshadow-ec2-bench --bench single-row
+#   walshadow-ec2-bench --suite myrun          # all four shapes
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./state.env   # PUBLIC_IP, PEM, ...
@@ -46,19 +45,20 @@ for n in ec2-source-pg ec2-clickhouse ec2-pg-standby; do
 done
 
 # Install a wrapper: `walshadow-ec2-bench …` → runs the image with host
-# networking and /opt/bench mounted at the same path, so --state-dir reads the
-# shipped state.env files and --suite writes results back to the host.
+# networking and /opt/bench mounted at the same path, carrying the on-box
+# state.env and results locations. Later flags override these (clap keeps the
+# last occurrence), so `--network public` or another dir still works.
 echo "installing walshadow-ec2-bench wrapper…"
 "${SSH[@]}" "cat | sudo tee /usr/local/bin/walshadow-ec2-bench >/dev/null && sudo chmod +x /usr/local/bin/walshadow-ec2-bench" <<WRAP
 #!/usr/bin/env bash
-exec sudo docker run --rm --network host -v /opt/bench:/opt/bench $REMOTE_IMAGE "\$@"
+exec sudo docker run --rm --network host -v /opt/bench:/opt/bench $REMOTE_IMAGE \\
+  --state-dir /opt/bench/ec2 --results-dir /opt/bench/results "\$@"
 WRAP
 
 echo
 echo "=== ready ==="
-echo "ssh -i $PEM ubuntu@$PUBLIC_IP"
-echo "then, in-VPC (private IPs):"
-echo "  walshadow-ec2-bench --network private --dest clickhouse --bench single-row --state-dir /opt/bench/ec2"
-echo "  # all four into /opt/bench/results/<name>:"
-echo "  walshadow-ec2-bench --network private --dest clickhouse --suite myrun --state-dir /opt/bench/ec2 --results-dir /opt/bench/results"
+echo "usual path:  ../stack.sh bench run <name>   # runs here, results land in bench/results/<name>"
+echo "by hand:     ssh -i $PEM ubuntu@$PUBLIC_IP"
+echo "  walshadow-ec2-bench --bench single-row"
+echo "  walshadow-ec2-bench --suite myrun         # all four shapes"
 echo "  # for the pg standby:  --dest postgres …"

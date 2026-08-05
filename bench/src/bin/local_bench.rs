@@ -57,7 +57,9 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
 
-    use walshadow_bench::{Bench, ChHttp, Destination, Summary, wait_visible};
+    use walshadow_bench::{
+        Bench, ChHttp, Destination, Summary, Throughput, wait_dest_empty, wait_visible,
+    };
 
     const OK: &str = "HTTP/1.0 200 OK";
 
@@ -89,8 +91,10 @@ mod tests {
             "500",
             "--duration-secs",
             "7",
-            "--probe-every",
-            "3",
+            "--probe-interval-ms",
+            "30",
+            "--count-interval-ms",
+            "100",
             "--concurrency",
             "4",
             "--pg-password",
@@ -101,9 +105,23 @@ mod tests {
         assert_eq!(args.common.bench, Some(Bench::Sustained));
         assert_eq!(args.common.rate, 500);
         assert_eq!(args.common.duration_secs, 7);
-        assert_eq!(args.common.probe_every, 3);
+        assert_eq!(args.common.probe_interval_ms, 30);
+        assert_eq!(args.common.count_interval_ms, 100);
         assert_eq!(args.common.concurrency, 4);
         assert_eq!(args.common.pg_password.as_deref(), Some("secret"));
+    }
+
+    /// Probe cadence must not be keyed to row count: probe traffic would then
+    /// scale with the throughput under test.
+    #[test]
+    fn sustained_probe_defaults_are_time_keyed() {
+        let args = Args::try_parse_from(["bench", "--bench", "sustained"]).unwrap();
+
+        assert_eq!(args.common.probe_interval_ms, 50);
+        assert_eq!(args.common.count_interval_ms, 250);
+        assert!(
+            Args::try_parse_from(["bench", "--bench", "sustained", "--probe-every", "3"]).is_err()
+        );
     }
 
     #[test]
@@ -138,6 +156,53 @@ mod tests {
         assert_eq!(summary.p99, 100.0);
         assert_eq!(summary.max, 100.0);
         assert_eq!(summary.mean, 33.2);
+    }
+
+    /// A pipeline that keeps up: completion lands just past the insert window.
+    #[test]
+    fn throughput_reads_completion_off_the_count_curve() {
+        // 1000 rows over 1s, destination trailing by ~100 rows, done at 1.1s.
+        let curve = vec![(0.0, 0), (0.5, 400), (1.0, 900), (1.1, 1000), (1.2, 1000)];
+        let tput = Throughput::from_curve(&curve, 1000, 1.0, 1000.0);
+
+        assert_eq!(tput.dest_rows, 1000);
+        assert_eq!(tput.all_visible_at, Some(1.1));
+        assert!((tput.max_backlog - 100.0).abs() < 1e-9, "{tput:?}");
+        // 500 rows across the 0.5s..1.0s window is the best sampled interval.
+        assert!((tput.peak_rate - 1000.0).abs() < 1e-6, "{tput:?}");
+    }
+
+    /// An incomplete run must not yield a completion instant — the rates would
+    /// be lower bounds presented as measurements.
+    #[test]
+    fn throughput_withholds_completion_when_rows_are_missing() {
+        let curve = vec![(0.0, 0), (1.0, 600), (2.0, 900)];
+        let tput = Throughput::from_curve(&curve, 1000, 1.0, 1000.0);
+
+        assert_eq!(tput.all_visible_at, None);
+        assert_eq!(tput.dest_rows, 900);
+        assert!((tput.max_backlog - 400.0).abs() < 1e-9, "{tput:?}");
+    }
+
+    /// A destination that was never cleared would read as complete at t=0.
+    #[test]
+    fn throughput_ignores_a_zero_instant_completion() {
+        let curve = vec![(0.0, 1000)];
+
+        assert_eq!(
+            Throughput::from_curve(&curve, 1000, 1.0, 1000.0).all_visible_at,
+            None
+        );
+    }
+
+    #[test]
+    fn throughput_handles_an_empty_curve() {
+        let tput = Throughput::from_curve(&[], 1000, 1.0, 1000.0);
+
+        assert_eq!(tput.dest_rows, 0);
+        assert_eq!(tput.all_visible_at, None);
+        assert_eq!(tput.peak_rate, 0.0);
+        assert_eq!(tput.max_backlog, 0.0);
     }
 
     #[test]
@@ -191,6 +256,39 @@ mod tests {
         assert_eq!(count, 2);
         let request = recv_request(&mut requests).await;
         assert!(request.ends_with("SELECT count() FROM demo.users WHERE id = 42"));
+    }
+
+    #[tokio::test]
+    async fn count_all_counts_the_whole_table() {
+        let (ch, mut requests) = ch_with_responses(vec![(OK, "600031\n")]).await;
+
+        let count = ch.count_all().await.unwrap();
+
+        assert_eq!(count, 600031);
+        let request = recv_request(&mut requests).await;
+        assert!(request.ends_with("SELECT count() FROM demo.users"));
+    }
+
+    #[tokio::test]
+    async fn wait_dest_empty_returns_once_the_count_reaches_zero() {
+        let (ch, _requests) = ch_with_responses(vec![(OK, "5\n"), (OK, "0\n")]).await;
+
+        wait_dest_empty(&ch, Duration::from_secs(5)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_dest_empty_gives_up_on_a_stuck_destination() {
+        let (ch, _requests) = ch_with_responses(vec![(OK, "5\n"), (OK, "5\n")]).await;
+
+        let err = wait_dest_empty(&ch, Duration::from_millis(1))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("still holds 5 rows"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
