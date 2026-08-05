@@ -75,4 +75,6 @@ mimalloc = "0.1.52"
 
 [dev-dependencies]
 tempfile = "3"
+# Enable paused time for batch deadline tests
+tokio = { version = "1", features = ["test-util"] }
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }

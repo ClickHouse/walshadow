@@ -275,9 +275,10 @@ point, not the consumer set. Four consumers:
   republished snapshot into its `DdlConfig` (namespaces + drop strategy) via
   `refresh_config` at the top of each `apply`
 - **Batcher** ([`pipeline/batcher.rs`](../src/pipeline/batcher.rs)) — reads
-  `row_budget`/`byte_budget`/`flush_timeout` off the watch per seal decision;
-  re-arms the idle-flush ticker when `flush_timeout` changes; feeds
-  `ResolvedConfig::columns` to each `TablePlan` build (§column overrides)
+  `row_budget`/`byte_budget`/`flush_timeout` off the watch per seal decision; a
+  new `flush_timeout` applies to blocks armed after the change, open blocks keep
+  the deadline they armed; feeds `ResolvedConfig::columns` to each `TablePlan`
+  build (§column overrides)
 - **Inserter** ([`pipeline/inserter.rs`](../src/pipeline/inserter.rs)) — reads
   `retry_max_attempts` per attempt loop and `compression` at each batch boundary,
   reconnecting when the codec changes
