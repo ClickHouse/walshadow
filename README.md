@@ -42,6 +42,59 @@ services that walshadow waits on, so switching between the lean and demo
 stacks needs no volume reset. To rebootstrap from scratch anyway:
 `docker compose -f docker/docker-compose.yml -f docker/docker-compose.demo.yml down -v`
 
+## Simplified demo (browser UI)
+
+The click-to-drive surface: three buttons against `demo.users` on the
+source, and the downstream effect on ClickHouse next to them. No psql, no
+Grafana queries, no login.
+
+```
+git submodule update --init --recursive
+
+dc="docker compose -f docker/docker-compose.yml -f docker/docker-compose.demo.yml"
+$dc up --build -d
+```
+
+First build is heavy (Rust release + PGXS shared object); later `up`s
+reuse layers. Then open **http://localhost:8088**.
+
+The page paints immediately — it gates on `service_started`, not on
+walshadow's metrics port. Until bootstrap finishes, the walshadow tiles
+read `—` and the status line says `walshadow bootstrapping — /metrics not
+open yet`; the controls and the parity panel are live already, since they
+only need source PG and ClickHouse. To watch bootstrap land:
+
+```
+$dc logs -f walshadow      # wait for: shadow caught up to bootstrap end_lsn
+```
+
+Three controls, all writing to `demo.users` on the source:
+
+| control | what it does |
+|---|---|
+| **INSERT N ROWS** | one server-side `INSERT … SELECT … FROM generate_series(…)`, chunked at 250k. Source rows step up; ClickHouse chases. |
+| **ADD COLUMN signup_ts** | live DDL — walshadow runs the `ALTER` on ClickHouse and auto-extends the column mapping, no config edit or restart. Bounded to 100 rows of `signup_ts = now()`. Disables itself once the column exists. |
+| **DROP COLUMN** | `DROP COLUMN IF EXISTS signup_ts`, replicated too, so the schema beat repeats without a `down -v`. |
+
+Below the controls: apply lag and bytes-behind-ClickHouse from
+`/metrics`, rowcount parity (source vs `count() FINAL WHERE _is_deleted =
+0`) with a delta pill, the source and ClickHouse schemas side by side, and
+the newest row versions by `_lsn` — no `FINAL`, so every CDC version
+shows.
+
+pgbench hammers the source the whole time, so the throughput numbers are
+whole-pipeline. The number that responds to *your* click is `demo.users`
+versions /s on the parity card. For a quiet demo, silence the hammer with
+`$dc stop pgbench` (and `$dc start pgbench` to bring it back).
+
+Grafana on http://localhost:3000 is the time-series view of the same
+stack. Full walkthrough, plus the CLI form of every button, in
+[docker/DEMO.md](docker/DEMO.md).
+
+Iterating on the UI itself: `docker/ui/app.py` and `docker/ui/index.html`
+are bind-mounted, so `$dc restart ui` picks up edits without a rebuild.
+Teardown: `$dc down -v --remove-orphans`.
+
 ## Source PG requirements
 
 Enforced at daemon boot by `src/preflight.rs`. Daemon refuses to start
