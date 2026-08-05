@@ -18,10 +18,10 @@
 # (CH_DATABASE must already exist on the target — walshadow creates tables,
 # not databases.)
 #
-# FLUSH_TIMEOUT_MS sets the CH emitter's [ch] flush_timeout_ms: rows are held
-# at most this long before the INSERT block is flushed, batching multiple
-# xacts into one MergeTree part instead of one-part-per-xact. 0 = legacy
-# emit-per-commit (lowest latency, most parts).
+# FLUSH_TIMEOUT_MS sets the CH emitter's [ch] flush_timeout_ms: a partial block
+# is held at most this long before the INSERT flushes, batching multiple xacts
+# into one MergeTree part instead of one-part-per-xact. 0 takes the pipeline's
+# 100 ms default (lowest latency, most parts), not per-commit emits.
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./state.env   # PUBLIC_IP, PEM, ...

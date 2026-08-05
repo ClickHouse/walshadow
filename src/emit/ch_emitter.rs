@@ -99,13 +99,15 @@ pub struct EmitterConfig {
     pub compression: CompressionChoice,
     pub row_budget: usize,
     pub byte_budget: usize,
-    /// Hold INSERTs open across xacts. Timer starts at first row of a
-    /// fresh INSERT, trips at `now + flush_timeout`; on trip emitter
-    /// closes every still-open INSERT and advances its durable-LSN
-    /// horizon. `Duration::ZERO` (default): every xact closes its own
-    /// INSERTs, ack tracks `drain_lsn` exactly. Latency cap: a buffered
-    /// row is at most `flush_timeout` from durable. Throughput: small
-    /// commits coalesce into one MergeTree part per flush window.
+    /// Hold INSERTs open across xacts. Deadline arms at the first row of a
+    /// fresh INSERT and trips at `now + flush_timeout`; on trip the batcher
+    /// seals that block, which advances the durable-LSN horizon once the
+    /// insert acks. `Duration::ZERO` (default) takes the pipeline's
+    /// `DEFAULT_PIPELINE_FLUSH` (100 ms), not per-xact INSERTs. Latency
+    /// cap: a buffered row is at most `flush_timeout` from
+    /// sealed, since the batcher sleeps to the nearest deadline rather than
+    /// scanning on a `flush_timeout` period. Throughput: small commits
+    /// coalesce into one MergeTree part per flush window.
     pub flush_timeout: Duration,
     pub tables: HashMap<RelName, TableMapping>,
     /// Per-table initial-load mode from TOML `[table.*]` blocks. Applies at

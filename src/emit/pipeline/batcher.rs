@@ -14,15 +14,20 @@
 //! `flush_timeout`, else the watermark pins behind them), and explicit
 //! flush-all from the DDL/TRUNCATE barrier or shutdown. Each `InsertBatch`
 //! carries the `(seq, rows)` counts the ack collector needs.
+//!
+//! Sleep until earliest table deadline. Checking once per `flush_timeout` can
+//! delay a flush by almost twice configured timeout
 
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clickhouse_c::Allocator;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+// Use Tokio clock so tests can pause time
+use tokio::time::Instant;
 
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
@@ -173,15 +178,25 @@ pub(crate) fn spawn(
     tokio::spawn(async move {
         let mut tables: HashMap<RelName, Table> = HashMap::new();
         let mut epoch: u64 = 0;
-        let mut live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
-        let mut ticker = tokio::time::interval(live.flush_timeout);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let stats = stats.as_ref();
+        // Reuse one timer for earliest table deadline and reset it only when
+        // that deadline changes. Timer starts ready, but select branch remains
+        // disabled until a table has a deadline
+        let deadline = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(deadline);
+        let mut armed: Option<Instant> = None;
         loop {
+            let next = tables.values().filter_map(|t| t.deadline).min();
+            if next != armed {
+                armed = next;
+                if let Some(at) = next {
+                    deadline.as_mut().reset(at);
+                }
+            }
             tokio::select! {
                 msg = msg_rx.recv() => match msg {
                     Some(BatcherMsg::Row(r)) => {
-                        live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
                         if let Err(e) = handle_row(&mut tables, &ctx, r, None).await {
                             fatal.set(format!("batcher: {e}"));
@@ -189,7 +204,7 @@ pub(crate) fn spawn(
                         }
                     }
                     Some(BatcherMsg::Rows(chunk)) => {
-                        live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
                         if let Err(e) = handle_rows(&mut tables, &ctx, chunk).await {
                             fatal.set(format!("batcher: {e}"));
@@ -211,19 +226,15 @@ pub(crate) fn spawn(
                         break;
                     }
                 },
-                _ = ticker.tick() => {
+                () = &mut deadline, if armed.is_some() => {
                     if let Err(e) = flush_due(&mut tables, &out, Instant::now(), stats).await {
                         fatal.set(format!("batcher deadline flush: {e}"));
                         break;
                     }
                 }
-                // Live emitter-knob change: re-arm the deadline ticker to the
-                // new flush_timeout. Budgets are re-read per message below.
-                _ = config_changed(&mut config_rx) => {
-                    live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
-                    ticker = tokio::time::interval(live.flush_timeout);
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                }
+                // Apply changed limits to next message. Tables that already
+                // contain rows keep their current deadlines
+                _ = config_changed(&mut config_rx) => {}
             }
         }
     })
@@ -384,6 +395,8 @@ async fn emit_batch(
     Ok(())
 }
 
+/// Flush tables whose deadlines have passed. `emit_batch` clears each deadline,
+/// including when encoder is empty
 async fn flush_due(
     tables: &mut HashMap<RelName, Table>,
     out: &async_channel::Sender<InsertBatch>,
@@ -391,7 +404,7 @@ async fn flush_due(
     stats: &EmitterStats,
 ) -> Result<(), String> {
     for t in tables.values_mut() {
-        if t.enc.rows > 0 && t.deadline.is_some_and(|d| now >= d) {
+        if t.deadline.is_some_and(|d| now >= d) {
             emit_batch(t, out, stats).await?;
         }
     }
@@ -425,7 +438,7 @@ mod tests {
     use tokio::sync::oneshot;
     use walrus::pg::walparser::RelFileNode;
 
-    fn rel() -> Arc<RelDescriptor> {
+    fn rel_named(table: &str) -> Arc<RelDescriptor> {
         Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -435,7 +448,7 @@ mod tests {
             oid: 16385,
             toast_oid: 0,
             namespace_oid: 2200,
-            rel_name: RelName::new("public", "t"),
+            rel_name: RelName::new("public", table),
             kind: 'r',
             persistence: 'p',
             replident: ReplIdent::Default { pk_attnums: None },
@@ -456,10 +469,10 @@ mod tests {
         })
     }
 
-    fn route() -> Arc<RouteSnapshot> {
+    fn route_named(table: &str) -> Arc<RouteSnapshot> {
         RouteSnapshot::freeze(
             Arc::new(TableMapping {
-                target: TableTarget::new("default", "t"),
+                target: TableTarget::new("default", table),
                 columns: vec![ColumnMapping {
                     src_attnum: 1,
                     target_name: "id".into(),
@@ -472,10 +485,14 @@ mod tests {
     }
 
     fn row(seq: u64, id: i32) -> RoutedRow {
+        row_for("t", seq, id)
+    }
+
+    fn row_for(table: &str, seq: u64, id: i32) -> RoutedRow {
         RoutedRow {
             seq,
-            rel: rel(),
-            route: route(),
+            rel: rel_named(table),
+            route: route_named(table),
             committed: CommittedTuple {
                 decoded: DecodedHeap {
                     rfn: RelFileNode {
@@ -687,5 +704,238 @@ mod tests {
         drop(msg_tx);
         handle.await.expect("batcher task");
         assert!(fatal.message().is_none());
+    }
+
+    /// Batcher under a paused clock; `flush_timeout` is the only deadline knob,
+    /// budgets stay out of reach unless a test lowers them.
+    fn spawn_deadline_batcher(
+        cfg: BatcherConfig,
+        config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    ) -> (
+        mpsc::Sender<BatcherMsg>,
+        async_channel::Receiver<InsertBatch>,
+        Fatal,
+        JoinHandle<()>,
+    ) {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (batches_tx, batches_rx) = async_channel::bounded(64);
+        let fatal = Fatal::new();
+        let handle = spawn(
+            msg_rx,
+            batches_tx,
+            cfg,
+            Allocator::stdlib(),
+            fatal.clone(),
+            Arc::new(EmitterStats::default()),
+            config_rx,
+        );
+        (msg_tx, batches_rx, fatal, handle)
+    }
+
+    fn partial_block_cfg(flush_timeout: Duration) -> BatcherConfig {
+        BatcherConfig {
+            row_budget: 1_000,
+            byte_budget: 1 << 30,
+            flush_timeout,
+        }
+    }
+
+    /// `flush_timeout` is an upper bound, not a ticker period: a row arriving
+    /// mid-period still flushes one timeout later. The old
+    /// `interval(flush_timeout)` scan waited for the next tick at or after the
+    /// deadline, landing anywhere in `[timeout, 2 * timeout)` — 1.4 s here.
+    #[tokio::test(start_paused = true)]
+    async fn deadline_bounds_flush_at_one_timeout() {
+        let (msg_tx, batches_rx, fatal, handle) =
+            spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), None);
+        // Offset the row from batcher start so a period-aligned ticker is out
+        // of phase with the deadline
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let sent = Instant::now();
+        msg_tx
+            .send(BatcherMsg::Row(row(0, 1)))
+            .await
+            .expect("send row");
+        let batch = batches_rx.recv().await.expect("deadline batch");
+        let waited = sent.elapsed();
+        assert_eq!(batch.n_rows, 1);
+        assert!(
+            (Duration::from_secs(1)..Duration::from_millis(1100)).contains(&waited),
+            "flushed after {waited:?}, want one configured timeout"
+        );
+        drop(msg_tx);
+        handle.await.expect("batcher task");
+        assert!(fatal.message().is_none());
+    }
+
+    /// Each table's deadline is armed by its own first row, so a later table
+    /// flushes later — no shared phase collapses them onto one tick.
+    #[tokio::test(start_paused = true)]
+    async fn tables_flush_at_independent_deadlines() {
+        let (msg_tx, batches_rx, fatal, handle) =
+            spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), None);
+        let start = Instant::now();
+        msg_tx
+            .send(BatcherMsg::Row(row_for("a", 0, 1)))
+            .await
+            .expect("send a");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        msg_tx
+            .send(BatcherMsg::Row(row_for("b", 0, 2)))
+            .await
+            .expect("send b");
+
+        let first = batches_rx.recv().await.expect("first batch");
+        let first_at = start.elapsed();
+        let second = batches_rx.recv().await.expect("second batch");
+        let second_at = start.elapsed();
+        assert_eq!(first.meta.table_key, RelName::new("public", "a"));
+        assert_eq!(second.meta.table_key, RelName::new("public", "b"));
+        assert!(
+            (Duration::from_secs(1)..Duration::from_millis(1100)).contains(&first_at),
+            "table a flushed at {first_at:?}"
+        );
+        assert!(
+            (Duration::from_millis(1400)..Duration::from_millis(1500)).contains(&second_at),
+            "table b flushed at {second_at:?}"
+        );
+        drop(msg_tx);
+        handle.await.expect("batcher task");
+        assert!(fatal.message().is_none());
+    }
+
+    /// Deadline belongs to the block, not the last row: rows landing inside an
+    /// open block coalesce without pushing the seal out.
+    #[tokio::test(start_paused = true)]
+    async fn extra_rows_do_not_extend_deadline() {
+        let (msg_tx, batches_rx, fatal, handle) =
+            spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), None);
+        let start = Instant::now();
+        msg_tx
+            .send(BatcherMsg::Row(row(0, 1)))
+            .await
+            .expect("send first");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        msg_tx
+            .send(BatcherMsg::Row(row(0, 2)))
+            .await
+            .expect("send second");
+        let batch = batches_rx.recv().await.expect("deadline batch");
+        let waited = start.elapsed();
+        assert_eq!(batch.n_rows, 2, "both rows in one block");
+        assert!(
+            (Duration::from_secs(1)..Duration::from_millis(1100)).contains(&waited),
+            "flushed after {waited:?}, deadline stayed on the first row"
+        );
+        drop(msg_tx);
+        handle.await.expect("batcher task");
+        assert!(fatal.message().is_none());
+    }
+
+    /// Byte budget wins over an unreached deadline: no clock time passes.
+    #[tokio::test(start_paused = true)]
+    async fn byte_budget_flushes_before_deadline() {
+        let (msg_tx, batches_rx, fatal, handle) = spawn_deadline_batcher(
+            BatcherConfig {
+                row_budget: 1_000,
+                byte_budget: 1,
+                flush_timeout: Duration::from_secs(1),
+            },
+            None,
+        );
+        let start = Instant::now();
+        msg_tx
+            .send(BatcherMsg::Row(row(0, 1)))
+            .await
+            .expect("send row");
+        let batch = batches_rx.recv().await.expect("budget batch");
+        assert_eq!(batch.n_rows, 1);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "byte budget sealed at {:?}, not the deadline",
+            start.elapsed()
+        );
+        drop(msg_tx);
+        handle.await.expect("batcher task");
+        assert!(fatal.message().is_none());
+    }
+
+    /// No armed deadline means no timer branch: an elapsed sleep left pollable
+    /// would spin the task and starve this test of its own clock advance.
+    #[tokio::test(start_paused = true)]
+    async fn idle_batcher_arms_no_timer() {
+        let (msg_tx, batches_rx, fatal, handle) =
+            spawn_deadline_batcher(partial_block_cfg(Duration::from_millis(100)), None);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(batches_rx.try_recv().is_err(), "no rows, no batches");
+        drop(msg_tx);
+        handle.await.expect("batcher task");
+        assert!(fatal.message().is_none());
+    }
+
+    /// Lowering `flush_timeout` live: the open block keeps the deadline it
+    /// armed, and the newly armed shorter deadline re-arms the timer ahead of
+    /// it instead of waiting behind the old target.
+    #[tokio::test(start_paused = true)]
+    async fn config_change_keeps_open_deadline_and_rearms_earlier() {
+        let (cfg_tx, cfg_rx) = watch::channel(Arc::new(ResolvedConfig {
+            flush_timeout: Duration::from_secs(1),
+            ..Default::default()
+        }));
+        let (msg_tx, batches_rx, fatal, handle) =
+            spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), Some(cfg_rx));
+        let start = Instant::now();
+        msg_tx
+            .send(BatcherMsg::Row(row_for("a", 0, 1)))
+            .await
+            .expect("send a");
+        // Let the batcher arm table a under the 1 s timeout
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cfg_tx.send_replace(Arc::new(ResolvedConfig {
+            flush_timeout: Duration::from_millis(200),
+            ..Default::default()
+        }));
+        msg_tx
+            .send(BatcherMsg::Row(row_for("b", 0, 2)))
+            .await
+            .expect("send b");
+
+        let first = batches_rx.recv().await.expect("first batch");
+        let first_at = start.elapsed();
+        let second = batches_rx.recv().await.expect("second batch");
+        let second_at = start.elapsed();
+        assert_eq!(
+            first.meta.table_key,
+            RelName::new("public", "b"),
+            "shorter new deadline flushes first"
+        );
+        assert_eq!(second.meta.table_key, RelName::new("public", "a"));
+        assert!(
+            (Duration::from_millis(300)..Duration::from_millis(400)).contains(&first_at),
+            "table b flushed at {first_at:?}, want 200 ms after its row"
+        );
+        assert!(
+            (Duration::from_secs(1)..Duration::from_millis(1200)).contains(&second_at),
+            "table a flushed at {second_at:?}, want its original 1 s deadline"
+        );
+        drop(msg_tx);
+        handle.await.expect("batcher task");
+        assert!(fatal.message().is_none());
+    }
+
+    /// Zero live `flush_timeout` takes the documented pipeline fallback, so a
+    /// cold table can never pin the watermark.
+    #[test]
+    fn zero_live_timeout_takes_pipeline_fallback() {
+        let boot = partial_block_cfg(Duration::from_secs(5));
+        let resolved = ResolvedConfig {
+            flush_timeout: Duration::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_cfg(&boot, Some(&resolved)).flush_timeout,
+            DEFAULT_PIPELINE_FLUSH
+        );
+        assert_eq!(effective_cfg(&boot, None).flush_timeout, boot.flush_timeout);
     }
 }

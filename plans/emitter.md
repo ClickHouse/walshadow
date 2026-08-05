@@ -172,7 +172,12 @@ the rows' admission/value permits, dropped post-insert-ack):
 - per-table deadline armed on first buffered row (`flush_timeout`;
   operator `0` is substituted with a 100 ms pipeline default —
   `DEFAULT_PIPELINE_FLUSH` — else a cold table's rows pin the
-  watermark indefinitely)
+  watermark indefinitely). Batcher sleeps to the nearest armed
+  deadline, so `flush_timeout` is an upper bound on partial-block
+  hold time; a `flush_timeout`-period ticker instead put real hold
+  time in `[flush_timeout, 2 * flush_timeout)`. Rows joining an open
+  block do not extend its deadline, and a live `flush_timeout` change
+  only affects blocks armed after it
 - `FlushAll` from the DDL/TRUNCATE barrier or shutdown — seals every
   table, drops all encoders, bumps `schema_epoch` so next rows rebuild
   plans against post-DDL descriptors and inserters re-parse cached
