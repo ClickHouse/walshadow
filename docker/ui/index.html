@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>walshadow — live CDC, click to drive</title>
+<!--
+  Design tokens, header treatment, KPI tiles, buttons, inputs and the pulsing
+  live dot are lifted from the ch-real-time-demo dashboard so the two demos read
+  as one family. Deliberately no build step, no framework, and no CDN script:
+  the only external resource is the Google Fonts stylesheet below, and without
+  internet the page falls back to system-ui / ui-monospace and stays legible.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --ch-yellow: #FAFF69;
+    --ch-yellow-deep: #FFE600;
+    --ch-ink: #1E1E2E;
+    --ch-ink-soft: #4B4B5C;
+    --ch-red: #FF3C00;
+    --ch-bg: #FAFAF7;
+    --ch-card: #FFFFFF;
+    --ch-line: #E6E6DE;
+    --ch-muted: #8E8E9C;
+    --ch-green: #00C66E;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background: var(--ch-bg);
+    color: var(--ch-ink);
+    min-height: 100vh;
+  }
+
+  header {
+    background: var(--ch-yellow);
+    border-bottom: 3px solid var(--ch-ink);
+    padding: 14px 28px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+  .header-row { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+  .logo { display: flex; align-items: center; gap: 14px; }
+  .logo-mark { width: 42px; height: 42px; }
+  .logo-text { font-weight: 800; font-size: 20px; letter-spacing: -0.5px; color: var(--ch-ink); }
+  .logo-text small {
+    display: block; font-weight: 500; font-size: 12px; color: var(--ch-ink-soft);
+    letter-spacing: 0.4px; text-transform: uppercase; margin-top: 2px;
+  }
+  .header-spacer { flex: 1; }
+  .header-stat { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.15; }
+  .header-stat .label {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    color: var(--ch-ink-soft); letter-spacing: 0.6px;
+  }
+  .header-stat .value {
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 22px;
+    font-weight: 600; color: var(--ch-ink);
+  }
+  .conn { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--ch-ink); }
+  .conn-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--ch-muted); flex: none; }
+  .conn-dot.live { background: var(--ch-green); animation: pulse 1.5s ease-in-out infinite; }
+  .conn-dot.err { background: var(--ch-red); }
+  @keyframes pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(0,198,110,0.5); }
+    50% { box-shadow: 0 0 0 8px rgba(0,198,110,0); }
+  }
+
+  main { width: 100%; }
+  .stage-section { padding: 22px 28px 4px; max-width: 1600px; margin: 0 auto; }
+  .stage-label {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+    font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--ch-ink);
+  }
+  .stage-label .n {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; border-radius: 50%; background: var(--ch-ink); color: var(--ch-yellow);
+    font-size: 11px; font-family: 'JetBrains Mono', monospace; flex: none;
+  }
+  .stage-label::after { content: ''; flex: 1; height: 1px; background: var(--ch-line); }
+  .stage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding-bottom: 20px; }
+
+  .card {
+    background: var(--ch-card); border: 1px solid var(--ch-line); border-radius: 10px;
+    padding: 16px 18px 12px; display: flex; flex-direction: column;
+  }
+  .card.accent { border-top: 3px solid var(--ch-ink); }
+  .card-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; gap: 12px; }
+  .card-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--ch-ink); }
+  .card-sub {
+    font-size: 11px; color: var(--ch-muted); font-weight: 500; text-align: right;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 18px 20px; }
+  .kpi { display: flex; flex-direction: column; }
+  .kpi .v { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 20px; font-weight: 700; color: var(--ch-ink); line-height: 1.1; }
+  .kpi .l { font-size: 10px; color: var(--ch-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+  .kpi .v.dim { color: var(--ch-muted); }
+
+  .btn {
+    padding: 10px 24px; font-size: 12px; font-weight: 700; font-family: 'JetBrains Mono', monospace;
+    background: var(--ch-yellow); color: var(--ch-ink); border: 2px solid var(--ch-ink); border-radius: 6px;
+    cursor: pointer; transition: background 0.15s; width: fit-content;
+  }
+  .btn:hover:enabled { background: rgba(250,255,105,0.6); }
+  .btn.ghost { background: transparent; }
+  .btn.ghost:hover:enabled { background: rgba(0,0,0,0.07); }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+
+  .ctrl-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .ctrl-row + .ctrl-row { margin-top: 12px; }
+  .ctrl-group {
+    display: flex; align-items: center; gap: 12px; padding: 4px 10px;
+    border: 1.5px solid var(--ch-ink); border-radius: 6px;
+  }
+  .ctrl-group-label {
+    font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
+    color: var(--ch-ink-soft); writing-mode: vertical-lr; transform: rotate(180deg); white-space: nowrap;
+  }
+  .rate-control { display: flex; align-items: center; gap: 8px; }
+  .rate-control label {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.6px; color: var(--ch-ink-soft);
+  }
+  .rate-control input[type=number] {
+    width: 120px; padding: 4px 8px; border: 2px solid var(--ch-ink); border-radius: 6px;
+    font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600;
+    background: var(--ch-yellow); color: var(--ch-ink); text-align: right;
+  }
+  .rate-control input:focus { outline: none; border-color: var(--ch-red); }
+  .rate-control .rate-unit { font-size: 11px; font-weight: 600; color: var(--ch-ink-soft); }
+
+  .action-current {
+    margin-top: 14px; padding: 8px 12px; border-radius: 6px; background: #F3F3EB;
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: var(--ch-ink-soft);
+    min-height: 30px; display: flex; align-items: center; gap: 8px;
+  }
+  .action-current.busy { background: var(--ch-yellow); color: var(--ch-ink); }
+  .action-current.bad { background: rgba(255,60,0,0.12); color: var(--ch-red); }
+  .action-log { list-style: none; margin: 10px 0 0; padding: 0; }
+  .action-log li {
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px;
+    color: var(--ch-muted); padding: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .action-log li .bad { color: var(--ch-red); }
+  .action-log li .ok { color: var(--ch-green); }
+
+  /* Dense mono data table — the rows feed and both schema tables. */
+  .dtable-wrap { overflow-x: auto; }
+  .dtable {
+    width: 100%; border-collapse: collapse;
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px;
+  }
+  .dtable th {
+    text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--ch-line);
+    font-family: 'Inter', sans-serif; font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.6px; color: var(--ch-muted); white-space: nowrap;
+  }
+  .dtable td { padding: 5px 10px 5px 0; border-bottom: 1px solid #F3F3EB; white-space: nowrap; }
+  .dtable td.trailer, .dtable th.trailer { color: var(--ch-muted); }
+  .dtable tr.fresh { background: rgba(250,255,105,0.45); }
+  .col-new { background: var(--ch-yellow); border-radius: 4px; padding: 0 4px; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 6px;
+    border: 2px solid var(--ch-ink); font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; font-weight: 700;
+  }
+  .pill.sync { background: var(--ch-green); color: #fff; border-color: var(--ch-green); }
+  .pill.behind { background: var(--ch-yellow-deep); }
+  .pill.err { background: var(--ch-red); color: #fff; border-color: var(--ch-red); }
+
+  .empty {
+    padding: 18px 0; text-align: center; color: var(--ch-muted);
+    font-size: 12px; font-family: 'Inter', sans-serif;
+  }
+
+  footer { text-align: center; padding: 18px 12px 28px; font-size: 11px; color: var(--ch-muted); }
+  footer code { background: #F3F3EB; padding: 1px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; }
+</style>
+</head>
+<body>
+<header>
+  <div class="header-row">
+    <div class="logo">
+      <svg class="logo-mark" viewBox="0 0 42 42" xmlns="http://www.w3.org/2000/svg" aria-label="ClickHouse">
+        <rect x="2"  y="2" width="6" height="38" fill="#1E1E2E"/>
+        <rect x="10" y="2" width="6" height="38" fill="#1E1E2E"/>
+        <rect x="18" y="2" width="6" height="38" fill="#1E1E2E"/>
+        <rect x="26" y="2" width="6" height="38" fill="#1E1E2E"/>
+        <rect x="34" y="18" width="6" height="6" fill="#1E1E2E"/>
+      </svg>
+      <div class="logo-text">
+        walshadow
+        <small>PostgreSQL WAL → ClickHouse · live</small>
+      </div>
+    </div>
+    <div class="header-spacer"></div>
+    <div class="header-stat">
+      <span class="label">Apply lag</span>
+      <span class="value" id="hdr-lag">—</span>
+    </div>
+    <div class="header-stat">
+      <span class="label">Rows → CH /s</span>
+      <span class="value" id="hdr-rows-sec">—</span>
+    </div>
+    <div class="conn">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span id="conn-text">connecting…</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- ① drive the source -->
+  <section class="stage-section">
+    <div class="stage-label"><span class="n">1</span> Drive the source</div>
+    <div class="card accent" id="card-controls">
+      <div class="card-head">
+        <span class="card-title">Write to PostgreSQL <code id="cfg-pg-table">demo.users</code></span>
+        <span class="card-sub" id="controls-sub">every change rides the physical WAL into ClickHouse</span>
+      </div>
+      <div class="ctrl-row">
+        <div class="ctrl-group">
+          <span class="ctrl-group-label">Insert</span>
+          <div class="rate-control">
+            <label>Rows</label>
+            <input type="number" id="insert-rows" min="1" max="5000000" step="1000" value="10000" />
+            <span class="rate-unit">rows</span>
+          </div>
+          <button class="btn" id="btn-insert">INSERT N ROWS</button>
+        </div>
+        <button class="btn" id="btn-update">UPDATE RANDOM ROW</button>
+      </div>
+      <div class="ctrl-row">
+        <div class="ctrl-group">
+          <span class="ctrl-group-label">Schema</span>
+          <button class="btn" id="btn-evolve">ADD COLUMN signup_ts</button>
+          <button class="btn ghost" id="btn-reset">DROP COLUMN</button>
+        </div>
+        <span class="card-sub" id="evolve-hint">walshadow replicates the DDL to ClickHouse — no config edit, no restart</span>
+      </div>
+      <div class="action-current" id="action-current">idle</div>
+      <ul class="action-log" id="action-log"></ul>
+    </div>
+  </section>
+
+  <!-- ② pipeline -->
+  <section class="stage-section">
+    <div class="stage-label"><span class="n">2</span> Pipeline</div>
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">walshadow /metrics</span>
+        <span class="card-sub" id="pipeline-sub">port 9484 · Prometheus text</span>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi"><span class="v" id="kpi-lag-seconds">—</span><span class="l">Apply lag · source → shadow</span></div>
+        <div class="kpi"><span class="v" id="kpi-lag-bytes-ch">—</span><span class="l">Bytes behind ClickHouse</span></div>
+        <div class="kpi"><span class="v" id="kpi-rows-sec">—</span><span class="l">Rows → CH /s · all tables</span></div>
+        <div class="kpi"><span class="v" id="kpi-xacts-sec">—</span><span class="l">Xacts /s · all tables</span></div>
+        <div class="kpi"><span class="v" id="kpi-xact-active">—</span><span class="l">Xacts buffering</span></div>
+        <div class="kpi"><span class="v" id="kpi-uptime">—</span><span class="l">Daemon uptime</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ③ rowcount parity -->
+  <section class="stage-section">
+    <div class="stage-label"><span class="n">3</span> Rowcount parity · <span id="cfg-parity-table">demo.users</span></div>
+    <div class="card" id="card-parity">
+      <div class="card-head">
+        <span class="card-title">Source vs ClickHouse</span>
+        <span class="card-sub" id="parity-sub">count() FINAL WHERE _is_deleted = 0</span>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi"><span class="v" id="kpi-src-rows">—</span><span class="l">Source rows</span></div>
+        <div class="kpi"><span class="v" id="kpi-ch-rows">—</span><span class="l">ClickHouse rows · FINAL</span></div>
+        <div class="kpi">
+          <span class="v" id="kpi-delta">—</span>
+          <span class="l">Delta <span class="pill" id="parity-pill" style="display:none"></span></span>
+        </div>
+        <div class="kpi"><span class="v" id="kpi-versions">—</span><span class="l">Row versions landed</span></div>
+        <div class="kpi"><span class="v" id="kpi-staleness">—</span><span class="l">Age of last change</span></div>
+        <div class="kpi"><span class="v" id="kpi-users-sec">—</span><span class="l" id="l-users-sec">demo.users versions /s</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ④ schema -->
+  <section class="stage-section">
+    <div class="stage-label"><span class="n">4</span> Schema</div>
+    <div class="stage-grid">
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">Source · <span id="cfg-src-schema-table">demo.users</span></span>
+          <span class="card-sub">pg_attribute</span>
+        </div>
+        <div class="dtable-wrap"><table class="dtable" id="tbl-src-schema"></table></div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">ClickHouse · DESCRIBE TABLE</span>
+          <span class="card-sub" id="cfg-ch-schema-table">demo.users</span>
+        </div>
+        <div class="dtable-wrap"><table class="dtable" id="tbl-ch-schema"></table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ⑤ recent rows -->
+  <section class="stage-section">
+    <div class="stage-label"><span class="n">5</span> Recent rows in ClickHouse</div>
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">Newest versions by _lsn</span>
+        <span class="card-sub" id="recent-sub">ORDER BY _lsn DESC — no FINAL, so every CDC version shows</span>
+      </div>
+      <div class="dtable-wrap"><table class="dtable" id="tbl-recent"></table></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  walshadow <code>/metrics</code> + source PostgreSQL + ClickHouse HTTP · polled every
+  <span id="foot-poll">1</span>s, pushed over WebSocket · Grafana time series at
+  <code>:3000</code>
+</footer>
+
+<script>
+'use strict';
+
+// ------------------------------------------------------------- formatters
+const EM = '—';
+const fmt = n => n == null ? EM : Number(n).toLocaleString();
+const fmtSI = n => {
+  if (n == null) return EM;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return Math.round(n).toString();
+};
+const fmtBytes = n => {
+  if (n == null) return EM;
+  if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GiB';
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MiB';
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + ' KiB';
+  return n + ' B';
+};
+const fmtMs = ms => {
+  if (ms == null) return EM;
+  if (ms < 1000) return Math.round(ms) + ' ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + ' s';
+  const m = Math.floor(ms / 60000);
+  if (m < 60) return m + 'm ' + Math.floor((ms % 60000) / 1000) + 's';
+  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+};
+const fmtSecs = s => s == null ? EM : fmtMs(s * 1000);
+const fmtDelta = d => d == null ? EM : (d > 0 ? '+' + fmt(d) : fmt(d));
+
+const $ = id => document.getElementById(id);
+const TRAILER = new Set(['_lsn', '_xid', '_commit_ts', '_is_deleted']);
+
+let ddlColumn = 'signup_ts';
+let prevMaxLsn = null;   // for the .fresh row wash
+
+// ---------------------------------------------------------------- helpers
+function setText(id, v) { const el = $(id); if (el) el.textContent = v; }
+
+function setConn(cls, text) {
+  const dot = $('conn-dot');
+  dot.className = 'conn-dot' + (cls ? ' ' + cls : '');
+  setText('conn-text', text);
+}
+
+function colName(name) {
+  // The new column is the payoff of the schema beat — make it impossible to miss.
+  return name === ddlColumn ? '<span class="col-new">' + name + '</span>' : name;
+}
+
+function renderSchemaTable(el, cols, missingMsg) {
+  if (!cols || !cols.length) {
+    el.innerHTML = '<tr><td class="empty" colspan="99">' + missingMsg + '</td></tr>';
+    return;
+  }
+  let html = '<tr><th>Column</th><th>Type</th></tr>';
+  for (const c of cols) {
+    const cls = TRAILER.has(c.name) ? ' class="trailer"' : '';
+    html += '<tr><td' + cls + '>' + colName(c.name) + '</td><td' + cls + '>' + c.type + '</td></tr>';
+  }
+  el.innerHTML = html;
+}
+
+function renderRecent(el, recent, missingMsg) {
+  if (!recent || !recent.rows || !recent.rows.length) {
+    el.innerHTML = '<tr><td class="empty" colspan="99">' + missingMsg + '</td></tr>';
+    return;
+  }
+  const cols = recent.columns;
+  const lsnIdx = cols.indexOf('_lsn');
+  let html = '<tr>';
+  for (const c of cols) {
+    html += '<th' + (TRAILER.has(c) ? ' class="trailer"' : '') + '>' + colName(c) + '</th>';
+  }
+  html += '</tr>';
+  for (const row of recent.rows) {
+    // Anything above the previous tick's high-water _lsn arrived since the
+    // last render — wash it yellow for exactly one frame.
+    const lsn = lsnIdx >= 0 ? Number(row[lsnIdx]) : null;
+    const fresh = prevMaxLsn != null && lsn != null && lsn > prevMaxLsn;
+    html += '<tr' + (fresh ? ' class="fresh"' : '') + '>';
+    row.forEach((v, i) => {
+      const cls = TRAILER.has(cols[i]) ? ' class="trailer"' : '';
+      const txt = v == null ? '∅' : String(v);
+      html += '<td' + cls + '>' + txt.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</td>';
+    });
+    html += '</tr>';
+  }
+  el.innerHTML = html;
+  if (lsnIdx >= 0) {
+    const max = Math.max(...recent.rows.map(r => Number(r[lsnIdx]) || 0));
+    if (prevMaxLsn == null || max > prevMaxLsn) prevMaxLsn = max;
+  }
+}
+
+// ------------------------------------------------------------------ render
+function render(snap) {
+  if (snap.error && !snap.walshadow) {
+    setConn('err', 'server error: ' + snap.error);
+    return;
+  }
+
+  const cfg = snap.config || {};
+  if (cfg.ddl_column) ddlColumn = cfg.ddl_column;
+  const ws = snap.walshadow || {};
+  const src = snap.source || {};
+  const ch = snap.clickhouse || {};
+  const par = snap.parity || {};
+  const act = snap.action || {};
+
+  // ---- connection state. walshadow's :9484 opens only after preflight +
+  // bootstrap, so "PG and CH fine, walshadow not yet" is a normal first-run
+  // state and gets its own copy rather than looking like a failure.
+  if (!ws.up) {
+    setConn('', 'walshadow bootstrapping — /metrics not open yet');
+  } else if (!src.up || !ch.up) {
+    setConn('err', (!src.up ? 'source PostgreSQL' : 'ClickHouse') + ' unreachable');
+  } else if (ch.stale) {
+    setConn('', 'ClickHouse read stalled — values ' + fmtMs(ch.stale_ms) + ' old');
+  } else {
+    setConn('live', 'live · poll ' + snap.poll_ms + 'ms');
+  }
+
+  // ---- static config echoes
+  setText('cfg-pg-table', cfg.pg_table || 'demo.users');
+  setText('cfg-parity-table', cfg.pg_table || 'demo.users');
+  setText('cfg-src-schema-table', cfg.pg_table || 'demo.users');
+  setText('cfg-ch-schema-table', cfg.ch_table || 'demo.users');
+  setText('l-users-sec', (cfg.ch_table || 'demo.users') + ' versions /s');
+  setText('recent-sub', 'SELECT * FROM ' + (cfg.ch_table || 'demo.users') +
+    ' ORDER BY _lsn DESC LIMIT ' + (cfg.recent_rows || 12) + ' — no FINAL');
+  // A stale reading means the ClickHouse poll timed out — usually a merge
+  // burst just after a big insert. Say so rather than letting frozen numbers
+  // read as live ones.
+  setText('parity-sub', ch.stale
+    ? 'ClickHouse read stalled — showing values from ' + fmtMs(ch.stale_ms) + ' ago'
+    : 'count() FROM ' + (cfg.ch_table || 'demo.users') + ' FINAL WHERE _is_deleted = 0' +
+      (src.query_ms != null ? '  ·  pg ' + src.query_ms + 'ms' : ''));
+  if (cfg.max_insert_rows) $('insert-rows').max = cfg.max_insert_rows;
+  if (cfg.ddl_column) {
+    $('btn-evolve').dataset.base = 'ADD COLUMN ' + cfg.ddl_column;
+    setText('evolve-hint', 'ADD COLUMN ' + cfg.ddl_column + ' ' + (cfg.ddl_column_type || '') +
+      ', then set now() on ' + fmt(cfg.ddl_update_rows) + ' rows — walshadow replicates the DDL to ClickHouse');
+  }
+  setText('foot-poll', '1');
+
+  // ---- ② pipeline
+  const rates = ws.rates || {};
+  const lagTxt = ws.lag_seconds_unknown ? EM : fmtSecs(ws.lag_seconds);
+  setText('hdr-lag', lagTxt);
+  setText('kpi-lag-seconds', lagTxt);
+  setText('pipeline-sub', ws.up
+    ? ('port 9484 · Prometheus text' + (ws.lag_seconds_unknown ? ' · lag in seconds needs a WAL byte rate' : ''))
+    : (ws.error || 'unreachable'));
+  setText('kpi-lag-bytes-ch', fmtBytes(ws.lag_bytes_ch));
+  setText('hdr-rows-sec', fmtSI(rates.emitter_rows_per_sec));
+  setText('kpi-rows-sec', fmtSI(rates.emitter_rows_per_sec));
+  setText('kpi-xacts-sec', fmtSI(rates.xacts_per_sec));
+  setText('kpi-xact-active', fmt(ws.xact_active));
+  setText('kpi-uptime', ws.uptime_seconds == null ? EM : fmtSecs(ws.uptime_seconds));
+
+  // ---- ③ parity
+  setText('kpi-src-rows', fmt(par.source_rows));
+  setText('kpi-ch-rows', fmt(par.ch_rows));
+  setText('kpi-delta', fmtDelta(par.delta));
+  setText('kpi-versions', fmt(ch.versions));
+  setText('kpi-staleness', fmtMs(ch.staleness_ms));
+  setText('kpi-users-sec', fmtSI((ch.rates || {}).versions_per_sec));
+
+  const pill = $('parity-pill');
+  if (par.delta == null) {
+    pill.style.display = 'inline-flex';
+    pill.className = 'pill err';
+    pill.textContent = ch.table_missing ? 'NO CH TABLE' : 'NO DATA';
+  } else if (par.delta === 0) {
+    pill.style.display = 'inline-flex';
+    pill.className = 'pill sync';
+    pill.textContent = 'IN SYNC';
+  } else if (par.delta < 0) {
+    pill.style.display = 'inline-flex';
+    pill.className = 'pill behind';
+    pill.textContent = fmt(-par.delta) + ' BEHIND';
+  } else {
+    // ClickHouse ahead is read skew — the PG and CH reads land milliseconds
+    // apart, so a commit between them shows up here. Never red.
+    pill.style.display = 'inline-flex';
+    pill.className = 'pill behind';
+    pill.textContent = 'SETTLING';
+  }
+
+  // ---- ④ / ⑤ schema and rows
+  const chMissing = ch.table_missing
+    ? (cfg.ch_table || 'demo.users') + ' not created on ClickHouse yet — ch-init may still be running'
+    : (ch.error || 'no rows yet');
+  renderSchemaTable($('tbl-src-schema'), src.columns, src.error || 'source unreachable');
+  renderSchemaTable($('tbl-ch-schema'), ch.columns, chMissing);
+  renderRecent($('tbl-recent'), ch.recent, chMissing);
+
+  // ---- ① controls
+  const busy = !!act.busy;
+  const cur = act.current;
+  const ac = $('action-current');
+  if (cur) {
+    let line = cur.label + '  ·  ' + cur.status + '  ·  ' + fmtMs(cur.elapsed_ms);
+    if (cur.progress && cur.progress.total > cur.progress.done) {
+      line += '  ·  ' + fmt(cur.progress.done) + ' / ' + fmt(cur.progress.total);
+    }
+    ac.className = 'action-current busy';
+    ac.textContent = line;
+  } else if (!ac.dataset.sticky) {
+    ac.className = 'action-current';
+    ac.textContent = 'idle';
+  }
+
+  const log = $('action-log');
+  log.innerHTML = (act.history || []).map(h =>
+    '<li><span class="' + (h.status === 'ok' ? 'ok' : 'bad') + '">' +
+    (h.status === 'ok' ? '✓' : '✗') + '</span> ' +
+    h.label + '  ·  ' + fmtMs(h.duration_ms) +
+    (h.detail ? '  ·  ' + h.detail.replace(/&/g, '&amp;').replace(/</g, '&lt;') : '') +
+    '</li>').join('');
+
+  $('btn-insert').disabled = busy;
+  $('btn-update').disabled = busy;
+  const evolve = $('btn-evolve');
+  const base = evolve.dataset.base || 'ADD COLUMN signup_ts';
+  evolve.disabled = busy || !!src.has_signup_ts;
+  evolve.textContent = src.has_signup_ts ? ddlColumn.toUpperCase() + ' PRESENT' : base;
+  $('btn-reset').disabled = busy || !src.has_signup_ts;
+}
+
+// ----------------------------------------------------------------- actions
+function note(text, bad) {
+  const ac = $('action-current');
+  ac.className = 'action-current' + (bad ? ' bad' : '');
+  ac.textContent = text;
+  // Keep a rejection on screen for a beat; the next tick with a live action
+  // takes over regardless.
+  ac.dataset.sticky = '1';
+  setTimeout(() => { delete ac.dataset.sticky; }, 4000);
+}
+
+async function post(path) {
+  try {
+    const r = await fetch(path, { method: 'POST' });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) note(body.error || ('HTTP ' + r.status), true);
+  } catch (e) {
+    note(String(e), true);
+  }
+}
+
+$('btn-insert').addEventListener('click', () => {
+  const v = parseInt($('insert-rows').value, 10);
+  if (!v || v < 1) { note('enter a row count of 1 or more', true); return; }
+  post('/api/insert/' + v);
+});
+$('btn-update').addEventListener('click', () => post('/api/update-random'));
+$('btn-evolve').addEventListener('click', () => post('/api/schema-evolve'));
+$('btn-reset').addEventListener('click', () => post('/api/schema-reset'));
+
+// --------------------------------------------------------------- websocket
+let ws = null;
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto + '://' + location.host + '/ws');
+  ws.onopen = () => setConn('live', 'live');
+  ws.onmessage = ev => { try { render(JSON.parse(ev.data)); } catch (e) { console.error(e); } };
+  ws.onclose = () => { setConn('err', 'disconnected — retrying…'); setTimeout(connect, 1500); };
+  ws.onerror = () => { try { ws.close(); } catch (e) { /* already closing */ } };
+}
+connect();
+// App-level ping so idle proxies don't drop the socket.
+setInterval(() => {
+  if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send('ping'); } catch (e) { /* noop */ } }
+}, 25000);
+</script>
+</body>
+</html>

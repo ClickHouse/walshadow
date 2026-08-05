@@ -5,6 +5,11 @@ and **Grafana dashboards** showing throughput, replication lag, and rows
 landing in ClickHouse in near-real-time — then an operator evolving the
 schema live and watching the column appear downstream.
 
+Two browser surfaces: **Grafana** on :3000 for the time series, and the
+**driving UI** on :8088 for clicking the demo — insert rows, update a row,
+evolve the schema — and watching rowcount parity and the ClickHouse schema
+converge.
+
 Five services from the base stack plus a demo tier:
 
 | service | role |
@@ -16,6 +21,7 @@ Five services from the base stack plus a demo tier:
 | `postgres-exporter` | source PG stats (TPS, tuple rates) → Prometheus |
 | `prometheus` | scrapes walshadow + postgres-exporter |
 | `grafana` | the dashboards — http://localhost:3000 |
+| `ui` | the driving UI — http://localhost:8088 · write controls, rowcount parity, live schema |
 
 > The demo tier lives in an overlay file. Everything below uses both
 > compose files. Set a shell alias once and reuse it:
@@ -100,7 +106,58 @@ Direct link to the dashboard: http://localhost:3000/d/walshadow-live
 Let it run a minute. The CH "rows landed /s" bars should track the
 source TPS line with the lag shown in section 3.
 
-## 4. Drive a row change, then evolve the schema (live)
+## 3b. Drive it from the browser
+
+Browse to **http://localhost:8088**. One page, no login, no psql. It polls
+walshadow's `/metrics`, source Postgres, and ClickHouse once a second and
+pushes a snapshot to the browser over a WebSocket.
+
+It comes up *before* walshadow finishes bootstrapping — the walshadow tiles
+read `—` and the status line says `walshadow bootstrapping — /metrics not
+open yet`, while the controls and the parity panel are already live (they
+only need source PG and ClickHouse).
+
+Four controls, all against `demo.users` on the source:
+
+| control | what it does |
+|---|---|
+| **INSERT N ROWS** | one server-side `INSERT … SELECT … FROM generate_series(…)`, chunked at 250k. Watch source rows step up and ClickHouse chase it. |
+| **UPDATE RANDOM ROW** | picks an existing id by index range scan and rewrites its email. The row reappears at the top of the rows feed with a higher `_lsn`; the *older* version is still there further down — that's what CDC actually writes. |
+| **ADD COLUMN signup_ts** | the schema beat, §4 below in one click. Bounded to 100 rows of `signup_ts = now()`. Disables itself once the column exists. |
+| **DROP COLUMN** | `DROP COLUMN IF EXISTS signup_ts`, replicated to ClickHouse too — so the beat is repeatable without a `down -v`. |
+
+Five panels, top to bottom: the controls plus an action log; walshadow
+pipeline tiles (lag, throughput, buffering xacts, uptime); rowcount parity
+(source vs `count() FINAL WHERE _is_deleted = 0`, with a delta pill); source
+and ClickHouse schema side by side; and the newest rows in ClickHouse by
+`_lsn`.
+
+Two things worth knowing when you read the numbers:
+
+- **The throughput tiles are whole-pipeline, pgbench included.**
+  `walshadow_emitter_rows_total` carries no table label, so "rows → CH /s"
+  counts the TPC-B hammer too. The number that responds to *your* click is
+  **`demo.users` versions /s** on the parity card, derived by differencing the
+  ClickHouse count. For a quiet demo, silence the hammer:
+  `$dc stop pgbench` (and `$dc start pgbench` to bring the roar back).
+- **"ClickHouse rows · FINAL" and "row versions landed" are different
+  numbers, deliberately.** The first dedupes to the winning version per id;
+  the second is every version ever landed. Grafana's `demo.users` rowcount
+  panel is a bare `count()`, so it matches the second, not the first.
+
+To iterate on the UI itself, edit `docker/ui/app.py` or
+`docker/ui/index.html` and `$dc restart ui` — both files are bind-mounted, so
+no rebuild. (On a Linux host you can add `--reload` to the uvicorn command;
+inotify over Docker Desktop's virtiofs on macOS is unreliable enough that it
+isn't the default.)
+
+## 4. Drive a row change, then evolve the schema (live) — from the CLI
+
+Both beats below have a button in the UI at :8088. The CLI form is here for
+scripting, and for seeing exactly what the buttons do. One divergence: the
+UI's `signup_ts` update is bounded to 100 rows, while the unbounded form
+below sweeps the whole table — fine at three rows, a very long pause after
+you've clicked **INSERT N ROWS** a few times.
 
 `demo.users` is tiny, pinned in the emitter config to exactly `id` /
 `name` / `email`, and untouched by pgbench — so it's the clean stage for

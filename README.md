@@ -31,8 +31,16 @@ For pgbench with Grafana dashboards plus live schema-change propagation:
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.demo.yml up --build -d
 ```
 
-then open http://localhost:3000. Walkthrough in
-[docker/DEMO.md](docker/DEMO.md)
+then open http://localhost:3000 for the Grafana dashboards, or
+http://localhost:8088 for the click-to-drive UI — insert rows, update a row,
+evolve the schema, and watch rowcount parity and the ClickHouse schema
+converge. Walkthrough in [docker/DEMO.md](docker/DEMO.md)
+
+The demo overlay seeds the pgbench TPC-B schema on source and its
+destination tables on CH through one-shot `source-init` / `ch-init`
+services that walshadow waits on, so switching between the lean and demo
+stacks needs no volume reset. To rebootstrap from scratch anyway:
+`docker compose -f docker/docker-compose.yml -f docker/docker-compose.demo.yml down -v`
 
 ## Source PG requirements
 
