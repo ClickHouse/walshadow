@@ -238,7 +238,6 @@
           </div>
           <button class="btn" id="btn-insert">INSERT N ROWS</button>
         </div>
-        <button class="btn" id="btn-update">UPDATE RANDOM ROW</button>
       </div>
       <div class="ctrl-row">
         <div class="ctrl-group">
@@ -264,10 +263,6 @@
       <div class="kpi-grid">
         <div class="kpi"><span class="v" id="kpi-lag-seconds">—</span><span class="l">Apply lag · source → shadow</span></div>
         <div class="kpi"><span class="v" id="kpi-lag-bytes-ch">—</span><span class="l">Bytes behind ClickHouse</span></div>
-        <div class="kpi"><span class="v" id="kpi-rows-sec">—</span><span class="l">Rows → CH /s · all tables</span></div>
-        <div class="kpi"><span class="v" id="kpi-xacts-sec">—</span><span class="l">Xacts /s · all tables</span></div>
-        <div class="kpi"><span class="v" id="kpi-xact-active">—</span><span class="l">Xacts buffering</span></div>
-        <div class="kpi"><span class="v" id="kpi-uptime">—</span><span class="l">Daemon uptime</span></div>
       </div>
     </div>
   </section>
@@ -491,10 +486,6 @@ function render(snap) {
     : (ws.error || 'unreachable'));
   setText('kpi-lag-bytes-ch', fmtBytes(ws.lag_bytes_ch));
   setText('hdr-rows-sec', fmtSI(rates.emitter_rows_per_sec));
-  setText('kpi-rows-sec', fmtSI(rates.emitter_rows_per_sec));
-  setText('kpi-xacts-sec', fmtSI(rates.xacts_per_sec));
-  setText('kpi-xact-active', fmt(ws.xact_active));
-  setText('kpi-uptime', ws.uptime_seconds == null ? EM : fmtSecs(ws.uptime_seconds));
 
   // ---- ③ parity
   setText('kpi-src-rows', fmt(par.source_rows));
@@ -592,7 +583,6 @@ $('btn-insert').addEventListener('click', () => {
   if (!v || v < 1) { note('enter a row count of 1 or more', true); return; }
   post('/api/insert/' + v);
 });
-$('btn-update').addEventListener('click', () => post('/api/update-random'));
 $('btn-evolve').addEventListener('click', () => post('/api/schema-evolve'));
 $('btn-reset').addEventListener('click', () => post('/api/schema-reset'));
 
