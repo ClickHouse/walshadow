@@ -226,7 +226,7 @@ mod tests {
         ledger.push(1, 0x1000).await.unwrap();
         ledger.push(2, 0x2000).await.unwrap();
         ledger.push(3, 0x3000).await.unwrap();
-        assert_eq!(ledger.due(0x2000), vec![(1, 0x1000)]);
+        assert_eq!(ledger.due(0x2000), [(1, 0x1000)]);
         assert_eq!(ledger.due(u64::MAX).len(), 3);
         assert!(ledger.due(0).is_empty());
     }

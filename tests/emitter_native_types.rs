@@ -191,7 +191,7 @@ async fn native_numeric_time_timetz_round_trip() {
     let cols: Vec<&str> = row.trim().split('\t').collect();
     // CH's toString(Decimal) trims trailing zeros, so 1.50 → "1.5"
     // (confirms the scaled integer is 150, not 15 or 1500).
-    assert_eq!(cols, vec!["1.5", "12:34:56.000000", "12:34:56+02"]);
+    assert_eq!(cols, ["1.5", "12:34:56.000000", "12:34:56+02"]);
 
     let row = ch
         .query(

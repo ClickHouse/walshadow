@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn rejects_truncated_block_data() {
-        let cases: Vec<Vec<u8>> = vec![vec![], vec![0u8; 4]];
+        let cases = [Vec::new(), vec![0u8; 4]];
         for data in cases {
             let rec = record(RmId::Heap, HEAP_INSERT_OP, Vec::new(), data);
             assert!(matches!(

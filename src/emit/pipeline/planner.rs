@@ -409,7 +409,7 @@ mod tests {
         }
         drain.finish().await.unwrap();
         let plan = planner.seal(0x2000, 42).unwrap();
-        assert_eq!(view.applied, vec![16600], "event folded into local view");
+        assert_eq!(view.applied, [16600], "event folded into local view");
         assert_eq!((plan.commit_lsn, plan.commit_ts), (0x2000, 42));
 
         let mut rd = plan.replay().unwrap();

@@ -185,7 +185,7 @@ mod tests {
     fn run_shape_tees_both_streams_and_reports_failure() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("out.txt");
-        let script = vec![
+        let script = [
             "-c".to_string(),
             "echo from-stdout; echo from-stderr >&2; exit 3".to_string(),
         ];
@@ -205,7 +205,7 @@ mod tests {
     fn run_shape_marks_a_clean_run_ok() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("out.txt");
-        let script = vec!["-c".to_string(), "true".to_string()];
+        let script = ["-c".to_string(), "true".to_string()];
 
         run_shape(Path::new("/bin/sh"), &file, &script, &[]).unwrap();
 

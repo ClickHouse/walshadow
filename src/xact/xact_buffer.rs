@@ -4103,7 +4103,7 @@ mod tests {
         t.assign(30, &[20]);
         assert_eq!(t.top_for(20), 30);
         assert!(t.subxids_of(10).is_empty());
-        assert_eq!(t.subxids_of(30), vec![20]);
+        assert_eq!(t.subxids_of(30), [20]);
     }
 
     #[test]
@@ -4116,7 +4116,7 @@ mod tests {
         buf.extend_from_slice(&0x66u32.to_le_bytes());
         let (xtop, subs) = parse_xact_assignment(&buf).expect("parses");
         assert_eq!(xtop, 0x11223344);
-        assert_eq!(subs, vec![0x55, 0x66]);
+        assert_eq!(subs, [0x55, 0x66]);
         // Short main_data → None
         assert!(parse_xact_assignment(&buf[..6]).is_none());
         // Negative nsub → reject
@@ -4151,7 +4151,7 @@ mod tests {
         body.extend_from_slice(&0xCCu32.to_le_bytes());
         let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &body, 0xD116).unwrap();
         assert_eq!(p.xact_time, 42);
-        assert_eq!(p.subxacts, vec![0xAA, 0xBB, 0xCC]);
+        assert_eq!(p.subxacts, [0xAA, 0xBB, 0xCC]);
     }
 
     #[test]
@@ -4263,7 +4263,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(order, vec!["e7", "h120", "e9"]);
+        assert_eq!(order, ["e7", "h120", "e9"]);
         drain.finish().await.unwrap();
     }
 
@@ -5071,7 +5071,7 @@ mod tests {
             .unwrap();
         assert!(batch.is_final);
         assert_eq!(batch.new_rows.len(), 3);
-        assert_eq!(batch.truncate_rows, vec![1]);
+        assert_eq!(batch.truncate_rows, [1]);
         assert_eq!(batch.ordered_events.len(), 1);
         let ev = &batch.ordered_events[0];
         assert_eq!((ev.heap_idx, ev.row_idx), (1, 2));

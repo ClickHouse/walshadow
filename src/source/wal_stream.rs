@@ -543,7 +543,7 @@ mod tests {
         let mut ws = WalStream::new(1, SEG, 0).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = ErrSegmentSink;
-        let bytes = vec![0u8; SEG as usize];
+        let bytes = [0u8; SEG as usize];
         let err = ws
             .push(0, &bytes, &mut rec, &mut seg)
             .await
@@ -649,7 +649,7 @@ mod tests {
         for r in &recs {
             comp.on_record(r).await.unwrap();
         }
-        let expected = vec![RmId::Heap as u8, RmId::Xact as u8, RmId::RelMap as u8];
+        let expected = [RmId::Heap as u8, RmId::Xact as u8, RmId::RelMap as u8];
         assert_eq!(*log_a.lock().unwrap(), expected);
         assert_eq!(*log_b.lock().unwrap(), expected);
     }
@@ -711,7 +711,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut sink = DirSegmentSink::new(tmp.path().to_path_buf()).unwrap();
         let seg = SegmentName::parse("000000010000000000000003").unwrap();
-        let bytes = vec![0xAAu8; 64];
+        let bytes = [0xAAu8; 64];
         let mani = dummy_manifest();
         sink.on_segment(seg, &bytes, &mani).await.unwrap();
         let seg_path = tmp.path().join(seg.format());
@@ -732,7 +732,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut sink = DirSegmentSink::new(tmp.path().to_path_buf()).unwrap();
         let seg = SegmentName::parse("000000010000000000000004").unwrap();
-        let bytes = vec![0x77u8; 64];
+        let bytes = [0x77u8; 64];
         let mani = dummy_manifest();
         sink.on_partial_segment(seg, &bytes, &mani).await.unwrap();
         let name = seg.format();
@@ -761,7 +761,7 @@ mod tests {
         let mut sink =
             DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx).unwrap();
         let seg = SegmentName::parse("000000010000000000000003").unwrap();
-        let bytes = vec![0xAAu8; 64];
+        let bytes = [0xAAu8; 64];
         sink.on_segment(seg, &bytes, &dummy_manifest())
             .await
             .unwrap();

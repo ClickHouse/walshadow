@@ -76,7 +76,7 @@ fn quickstart_decode_clickhouse_local() -> Result<(), Box<dyn std::error::Error>
     // --- README snippet ends ---
 
     assert_eq!(total_rows, 5);
-    assert_eq!(saw_values, vec![0, 1, 2, 3, 4]);
+    assert_eq!(saw_values, [0, 1, 2, 3, 4]);
     Ok(())
 }
 

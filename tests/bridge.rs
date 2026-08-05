@@ -237,7 +237,7 @@ async fn bridge_hello_and_decode_batch() {
     let bpchar = body(b"pad ");
     let numeric = numeric_42();
     let array = array_int4_1_2_3();
-    let items: Vec<(u32, &[u8])> = vec![
+    let items: [(u32, &[u8]); _] = [
         (23, &[42, 0, 0, 0]), // int4
         (16, &[1]),           // bool
         (25, &text),          // text
@@ -281,7 +281,7 @@ async fn bridge_decode_matches_typoutput() {
     let long_text = "a".repeat(1024);
     let uuid = (0u8..16).map(|i| i * 17).collect::<Vec<_>>();
     // (type name, on-disk body, SQL literal PG renders for comparison)
-    let cases: Vec<(&str, Vec<u8>, String)> = vec![
+    let cases: [(&str, Vec<u8>, String); _] = [
         // varlena: body reused as the datum, no header rebuild
         ("text", b"hello".to_vec(), "'hello'".into()),
         (
@@ -353,7 +353,7 @@ async fn bridge_decode_matches_typoutput() {
     // are per-item errors
     let empty: &[u8] = &[];
     let short_uuid: &[u8] = &[0x00, 0x11];
-    let bad: Vec<(u32, &[u8])> = vec![
+    let bad: [(u32, &[u8]); _] = [
         (oid_of_type(&sql, "int4").await, empty),
         (oid_of_type(&sql, "uuid").await, short_uuid),
         (2_147_483_647, &[0x00]),
@@ -481,7 +481,7 @@ async fn bridge_scans_uncommitted_ddl() {
         .parse::<IndexRow>()
         .expect("index rows");
     let pkey = indexes.iter().find(|i| i.indisprimary).expect("pkey row");
-    assert_eq!(pkey.indkey, vec![1]);
+    assert_eq!(pkey.indkey, [1]);
     assert_eq!(pkey.indrelid, oid_t);
 
     // Whole-catalog scans have no lock argument, and a foreign in-progress
@@ -625,7 +625,7 @@ async fn bridge_reconnects_after_worker_exit() {
         b.extend_from_slice(&0i32.to_le_bytes()); // months
         b
     };
-    let items: Vec<(u32, &[u8])> = vec![
+    let items: [(u32, &[u8]); _] = [
         (1184, &[0; 8]),       // timestamptz, µs since 2000-01-01 UTC
         (1082, &[0; 4]),       // date, days since 2000-01-01
         (1186, &interval_90s), // interval

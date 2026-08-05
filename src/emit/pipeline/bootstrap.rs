@@ -632,7 +632,7 @@ mod tests {
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.next_seq, 3, "three distinct rfn runs");
         assert_eq!(outcome.rows_routed, 2, "unmapped rel routed nothing");
-        assert_eq!(seqs, vec![0, 2], "seq 1 (unmapped) routed no rows");
+        assert_eq!(seqs, [0, 2], "seq 1 (unmapped) routed no rows");
         assert_eq!(stats.unsupported_relations.load(Ordering::Relaxed), 1);
         drop(ack);
         collector.await.unwrap();

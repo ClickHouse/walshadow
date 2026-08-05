@@ -2205,7 +2205,7 @@ mod tests {
         match &enc.buffers[last] {
             ColumnBuf::Fixed { bytes, width } => {
                 assert_eq!(*width, 1);
-                assert_eq!(bytes, &vec![0u8, 1]);
+                assert_eq!(bytes, &[0u8, 1]);
             }
             other => panic!("_is_deleted expected Fixed(1), got {other:?}"),
         }
@@ -2249,7 +2249,7 @@ mod tests {
         enc.append_row(&committed(4, None), &m, OP_INSERT).unwrap();
         match &enc.buffers[1] {
             ColumnBuf::String { offsets, data } => {
-                assert_eq!(offsets, &vec![0u64, 0]);
+                assert_eq!(offsets, &[0u64, 0]);
                 assert!(data.is_empty());
             }
             other => panic!("name expected String, got {other:?}"),
@@ -2265,7 +2265,7 @@ mod tests {
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
         match &enc.buffers[1] {
-            ColumnBuf::NullableString { null_map, .. } => assert_eq!(null_map, &vec![1u8]),
+            ColumnBuf::NullableString { null_map, .. } => assert_eq!(null_map, &[1u8]),
             other => panic!("name expected NullableString, got {other:?}"),
         }
     }
@@ -2299,8 +2299,8 @@ mod tests {
                 data,
                 null_map,
             } => {
-                assert_eq!(null_map, &vec![0u8, 1, 0]);
-                assert_eq!(offsets, &vec![5u64, 5, 9]);
+                assert_eq!(null_map, &[0u8, 1, 0]);
+                assert_eq!(offsets, &[5u64, 5, 9]);
                 assert_eq!(&data[..], b"sevennine");
             }
             other => panic!("col 1 expected NullableString, got {other:?} variant tag"),
@@ -2316,7 +2316,7 @@ mod tests {
         match &enc.buffers[off + 3] {
             ColumnBuf::Fixed { bytes, width } => {
                 assert_eq!(*width, 1);
-                assert_eq!(bytes, &vec![0u8, 0, 0]);
+                assert_eq!(bytes, &[0u8, 0, 0]);
             }
             _ => panic!("_is_deleted expected Fixed"),
         }

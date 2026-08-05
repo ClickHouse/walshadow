@@ -339,7 +339,7 @@ mod tests {
         let md = commit_payload(Some(5), &[101, 102], &[], &[(-2, 5, 16400)], 12);
         let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &md, PG17_MAGIC).expect("parse");
         assert_eq!(p.db_id, Some(5));
-        assert_eq!(p.subxacts, vec![101, 102]);
+        assert_eq!(p.subxacts, [101, 102]);
         assert_eq!(
             p.invals.relcache,
             vec![RelcacheInval {
@@ -354,7 +354,7 @@ mod tests {
         let md = commit_payload(None, &[101], &[], &[], 12);
         let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &md, PG17_MAGIC).expect("parse");
         assert_eq!(p.db_id, None);
-        assert_eq!(p.subxacts, vec![101]);
+        assert_eq!(p.subxacts, [101]);
         // No xinfo at all: same unknown scope
         let md = 0i64.to_le_bytes().to_vec();
         assert_eq!(parse_xact_payload(0, &md, PG17_MAGIC).unwrap().db_id, None);

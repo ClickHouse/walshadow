@@ -655,7 +655,7 @@ mod tests {
         let r = walker.try_next().unwrap().unwrap();
         let byte_ranges = r.byte_ranges.clone();
         drop(r);
-        let new_logical = vec![0xCCu8; 40];
+        let new_logical = [0xCCu8; 40];
         walker.rewrite_record(&byte_ranges, &new_logical);
         assert!(walker.buffer()[40..80].iter().all(|&b| b == 0xCC));
         assert_eq!(&walker.buffer()[0..2], &XLP_PAGE_MAGIC_PG15.to_le_bytes(),);

@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn numeric_truncated_returns_error() {
-        let one_byte = vec![0u8];
+        let one_byte = [0u8];
         assert!(matches!(
             decode_numeric(&one_byte),
             Err(CodecError::Truncated { .. })
@@ -633,18 +633,18 @@ mod tests {
 
     #[test]
     fn inet_ipv4_simple() {
-        let body = vec![PGSQL_AF_INET, 32, 192, 168, 0, 1];
+        let body = [PGSQL_AF_INET, 32, 192, 168, 0, 1];
         let v = decode_inet(&body, false).unwrap();
         assert_eq!(v.family, PGSQL_AF_INET);
         assert_eq!(v.bits, 32);
         assert!(!v.is_cidr);
-        assert_eq!(v.addr, vec![192, 168, 0, 1]);
+        assert_eq!(v.addr, [192, 168, 0, 1]);
         assert_eq!(v.to_text(), "192.168.0.1");
     }
 
     #[test]
     fn inet_ipv4_cidr() {
-        let body = vec![PGSQL_AF_INET, 24, 10, 0, 0, 0];
+        let body = [PGSQL_AF_INET, 24, 10, 0, 0, 0];
         let v = decode_inet(&body, true).unwrap();
         assert!(v.is_cidr);
         assert_eq!(v.to_text(), "10.0.0.0/24");
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn inet_ipv4_with_short_mask() {
         // non-cidr but bits != max, suffix appears
-        let body = vec![PGSQL_AF_INET, 24, 192, 168, 0, 1];
+        let body = [PGSQL_AF_INET, 24, 192, 168, 0, 1];
         let v = decode_inet(&body, false).unwrap();
         assert_eq!(v.to_text(), "192.168.0.1/24");
     }
@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn inet_rejects_unknown_family() {
-        let body = vec![99u8, 32, 1, 2, 3, 4];
+        let body = [99u8, 32, 1, 2, 3, 4];
         assert!(matches!(
             decode_inet(&body, false),
             Err(CodecError::BadInet { .. })
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn interval_zero() {
-        let body = vec![0u8; 16];
+        let body = [0u8; 16];
         let v = decode_interval(&body).unwrap();
         assert_eq!(v.to_text(), "00:00:00");
     }
@@ -784,7 +784,7 @@ mod tests {
     #[test]
     fn inet_ipv4_truncated_addr() {
         // AF_INET expects 4 addr bytes, only 2 supplied
-        let body = vec![PGSQL_AF_INET, 32, 1, 2];
+        let body = [PGSQL_AF_INET, 32, 1, 2];
         assert!(matches!(
             decode_inet(&body, false),
             Err(CodecError::Truncated { offset: 2, .. })
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn inet_truncated_header() {
-        let body = vec![PGSQL_AF_INET];
+        let body = [PGSQL_AF_INET];
         assert!(matches!(
             decode_inet(&body, false),
             Err(CodecError::Truncated { offset: 0, .. })
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn interval_truncated_body() {
-        let body = vec![0u8; 10];
+        let body = [0u8; 10];
         assert!(matches!(
             decode_interval(&body),
             Err(CodecError::Truncated { .. })

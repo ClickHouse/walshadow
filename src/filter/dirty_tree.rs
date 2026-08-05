@@ -223,7 +223,7 @@ mod tests {
         // ROLLBACK TO SAVEPOINT: abort record for 101 alone
         let (dropped, members) = t.drain_tree(101, None, &[]);
         assert_eq!(dropped.expect("state").first_touch, 10);
-        assert_eq!(members, vec![101]);
+        assert_eq!(members, [101]);
         assert!(t.is_dirty(100), "sibling + top dirt survives");
         assert!(!t.is_dirty(101), "aborted child link cleared");
         let merged = t.drain_tree(100, None, &[102]).0.expect("merge");
@@ -257,7 +257,7 @@ mod tests {
         // Payload names no children; linked sweep still clears the tree
         let (m, members) = t.drain_tree(100, None, &[]);
         let m = m.expect("swept state");
-        assert_eq!(members, vec![100, 101], "linked sweep names the member");
+        assert_eq!(members, [100, 101], "linked sweep names the member");
         assert_eq!(m.first_touch, 10);
         assert!(!t.is_dirty(101));
         assert!(t.top_by_xid.is_empty(), "link table drained");

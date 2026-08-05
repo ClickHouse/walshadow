@@ -862,7 +862,7 @@ mod tests {
             .map(|s| Some((*s).to_string()))
             .collect();
         let parsed = IndexRow::parse(&row).unwrap();
-        assert_eq!(parsed.indkey, vec![1, 3]);
+        assert_eq!(parsed.indkey, [1, 3]);
         assert!(parsed.indisprimary && !parsed.indisreplident);
     }
 

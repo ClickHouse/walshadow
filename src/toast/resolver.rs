@@ -1382,7 +1382,7 @@ mod tests {
             lsn: 0x1000,
         }];
         for seq in 1..3u32 {
-            let body = vec![b'a' + seq as u8; 4];
+            let body = [b'a' + seq as u8; 4];
             refs.push(ToastRowRef {
                 toast_relid: 16500,
                 blkno: 1,
@@ -1432,7 +1432,7 @@ mod tests {
         r.put_row_refs(None, &refs).await.unwrap();
         assert_eq!(
             store.fetch(16500, 7, u64::MAX, 2 << 10).await.unwrap(),
-            assembled(&vec![0u8; 2 << 10])
+            assembled(&[0u8; 2 << 10])
         );
         assert_eq!(budget.overshoots_total(), 1);
         assert_eq!(budget.resident_bytes(), 0, "nothing leaked");

@@ -1532,7 +1532,7 @@ mod tests {
         assert_eq!(b.drain_xid, 7);
         assert_eq!(b.tree_first_touch, 150);
         let oids: Vec<u32> = b.oids.iter().map(|a| a.oid).collect();
-        assert_eq!(oids, vec![16500], "a relation this command left alone");
+        assert_eq!(oids, [16500], "a relation this command left alone");
         assert!(b.members.is_empty());
         // Commit still bounds, over the whole tree's oids
         let v = f
@@ -1540,9 +1540,9 @@ mod tests {
             .unwrap();
         let b = v.boundary.expect("commit boundary");
         assert_eq!(b.kind, BoundaryKind::Commit);
-        assert_eq!(b.members, vec![7]);
+        assert_eq!(b.members, [7]);
         let oids: Vec<u32> = b.oids.iter().map(|a| a.oid).collect();
-        assert_eq!(oids, vec![16400, 16500]);
+        assert_eq!(oids, [16400, 16500]);
     }
 
     #[test]
@@ -1578,7 +1578,7 @@ mod tests {
             .decide_record(&xact_end(XLOG_XACT_ABORT, 101, &[], None), 200, 0xD116)
             .unwrap();
         let members = v.aborted_tree.expect("aborted members");
-        assert_eq!(*members, vec![101]);
+        assert_eq!(*members, [101]);
         // Clean tree: nothing speculative to drop
         let v = f
             .decide_record(&xact_end(XLOG_XACT_ABORT, 900, &[], None), 300, 0xD116)
