@@ -4,21 +4,26 @@
 //! only difference is that endpoints are resolved from the terraform-written
 //! `state.env` files instead of defaulting to localhost.
 //!
+//! This runs on the in-VPC runner box, not on a workstation: every sample
+//! carries the driver→stack round trip and the insert loop is capped by it, so a
+//! run from outside the region reports the operator's link. `bench/ec2/stack.sh
+//! bench run <name>` is the entry point — it runs the suite on that box and
+//! copies the results back.
+//!
 //! `--network` picks which IP to read:
-//!   * `public`  — instances' public IPs (run from your workstation; note the
-//!     workstation↔region RTT is included in commit→visible).
-//!   * `private` — VPC-internal IPs (for when this binary is shipped onto a
-//!     host in the same VPC; measures pipeline-internal latency).
+//!   * `private` (default) — VPC-internal IPs, as seen from the runner box.
+//!   * `public`  — instances' public IPs, for reaching them from outside the
+//!     VPC. Smoke tests only; the WAN round trip lands in every number.
 //!
 //! Explicit `--pg-host` / `--ch-host` override the lookup.
 //!
 //! `--suite <name>` runs the four standard shapes instead of one bench, into
 //! `<results-dir>/<name>/` (see [`walshadow_bench::suite`]).
 //!
-//! Examples:
-//!   cargo run --release --bin walshadow-ec2-bench -- --bench single-row
-//!   cargo run --release --bin walshadow-ec2-bench -- --bench interleaved --xact-secs 150
-//!   cargo run --release --bin walshadow-ec2-bench -- --suite walshadow-run
+//! Examples (on the runner box, where the wrapper supplies the paths):
+//!   walshadow-ec2-bench --bench single-row
+//!   walshadow-ec2-bench --bench interleaved --xact-secs 150
+//!   walshadow-ec2-bench --suite walshadow-run
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +34,7 @@ use walshadow_bench::{CommonArgs, DestKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Network {
-    /// Instances' public IPs — run from a workstation outside the VPC.
+    /// Instances' public IPs — reaches them from outside the VPC.
     Public,
     /// VPC-internal IPs — run from a host inside the VPC.
     Private,
@@ -46,8 +51,9 @@ struct Args {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Which IP family to read from the state.env files.
-    #[arg(long, value_enum, default_value_t = Network::Public)]
+    /// Which IP family to read from the state.env files. Private by default:
+    /// the bench is meant to run inside the VPC.
+    #[arg(long, value_enum, default_value_t = Network::Private)]
     network: Network,
 
     /// Directory holding the per-node folders (each with a `state.env`).
@@ -279,6 +285,13 @@ mod tests {
         assert_eq!(suite.suite.as_deref(), Some("myrun"));
         assert_eq!(suite.common.bench, None);
         assert_eq!(suite.results_dir, PathBuf::from("bench/results"));
+    }
+
+    #[test]
+    fn network_defaults_to_the_vpc_interior() {
+        let args = Args::try_parse_from(["bench", "--suite", "myrun"]).unwrap();
+
+        assert_eq!(args.network, Network::Private);
     }
 
     #[test]

@@ -2,6 +2,11 @@ output "az" {
   value = local.az
 }
 
+# recorded in each run's provenance.txt — results only compare across like hardware
+output "instance_type" {
+  value = var.instance_type
+}
+
 output "nodes" {
   value = {
     for k, n in local.nodes : k => {

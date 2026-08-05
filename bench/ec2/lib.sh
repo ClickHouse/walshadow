@@ -20,10 +20,12 @@ require_state_ip() {
 repo_root() { (cd ../../.. && pwd); }
 
 # deploy.sh preamble helper: set SSH/SCP arrays from the sourced state.env
-# (PEM, PUBLIC_IP). Populates globals SSH, SCP.
+# (PEM, PUBLIC_IP). Populates globals SSH, SCP. Keepalives hold the session open
+# through a bench run's quiet stretches, which outlast NAT idle timeouts.
 node_ssh_setup() {
   : "${PEM:?state.env must set PEM}"
-  SSH=(ssh -i "$PEM" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "ubuntu@$PUBLIC_IP")
+  SSH=(ssh -i "$PEM" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "ubuntu@$PUBLIC_IP")
   SCP=(scp -i "$PEM" -o StrictHostKeyChecking=accept-new)
 }
 

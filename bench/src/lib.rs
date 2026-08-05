@@ -7,8 +7,15 @@
 //! walshadow / PeerDB CDC pipelines) or a **standby Postgres** (PG→PG physical
 //! streaming replication). All timing uses one host-side monotonic clock
 //! (`Instant`): both the "committed" and the "visible" instants are taken on
-//! the machine running the bench, so there's no cross-host clock skew. (When
-//! that machine is remote, its round-trip is included — run close to the stack.)
+//! the machine running the bench, so there's no cross-host clock skew. Every
+//! sample carries the driver→stack round trip and the insert loop is capped by
+//! it, so the driver belongs beside the stack — for the EC2 harness that is the
+//! in-VPC runner box (`bench/ec2/stack.sh bench run <name>`).
+//!
+//! Throughput and latency are separate instruments and must stay that way:
+//! [`Destination::count_all`] sampled on a cadence measures throughput, while
+//! [`Destination::count_id`] probes measure latency. Deriving one from the other
+//! reports the observer's own drain time as the destination's ingest time.
 //!
 //! Benchmarks: [`run_single_row`], [`run_sustained`], [`run_interleaved`].
 //! [`run`] is the high-level entry point; the binaries are thin CLIs that build
@@ -17,6 +24,7 @@
 pub mod suite;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -88,7 +96,11 @@ pub struct SingleRowParams {
 pub struct SustainedParams {
     pub rate: u64,
     pub duration_secs: u64,
-    pub probe_every: u64,
+    /// Latency-probe cadence. Time-clocked, so probe traffic stays independent
+    /// of the throughput under test.
+    pub probe_interval_ms: u64,
+    /// Destination row-count cadence — the throughput instrument.
+    pub count_interval_ms: u64,
     pub concurrency: u64,
     /// Rows per multi-row INSERT/COMMIT; 0 or 1 = single-row commits.
     pub rows_per_xact: u64,
@@ -130,6 +142,9 @@ pub trait Destination: Send + Sync {
     async fn clear(&self) -> Result<()>;
     /// Count rows carrying this id — the visibility probe.
     async fn count_id(&self, id: i64) -> Result<u64>;
+    /// Count every row in the destination table — the throughput instrument.
+    /// Sampled on a fixed cadence, so its cost stays independent of load.
+    async fn count_all(&self) -> Result<u64>;
     /// Human-readable endpoint for the header line.
     fn endpoint(&self) -> String;
 }
@@ -204,9 +219,16 @@ pub struct CommonArgs {
     pub rate: u64,
     #[arg(long, default_value_t = 20)]
     pub duration_secs: u64,
-    /// Tag every Nth row as a latency probe.
-    #[arg(long, default_value_t = 25)]
-    pub probe_every: u64,
+    /// Latency-probe cadence. Probes are clocked on time, not row count, so
+    /// probe traffic doesn't scale with the throughput being measured. Only one
+    /// probe is outstanding at a time, making this a ceiling on the probe rate
+    /// rather than the rate itself.
+    #[arg(long, default_value_t = 50)]
+    pub probe_interval_ms: u64,
+    /// Destination row-count cadence — the throughput instrument, independent
+    /// of the latency probes.
+    #[arg(long, default_value_t = 250)]
+    pub count_interval_ms: u64,
     /// Parallel insert connections (sustained). >1 fans the target rate across
     /// N Postgres connections — a single connection serialises on the wire.
     #[arg(long, default_value_t = 1)]
@@ -277,7 +299,8 @@ pub async fn dispatch(c: &CommonArgs, pg_host: String, dest_host: String) -> Res
     let sustained = SustainedParams {
         rate: c.rate,
         duration_secs: c.duration_secs,
-        probe_every: c.probe_every,
+        probe_interval_ms: c.probe_interval_ms,
+        count_interval_ms: c.count_interval_ms,
         concurrency: c.concurrency,
         rows_per_xact: c.rows_per_xact,
         poll_interval_ms: c.poll_interval_ms,
@@ -339,6 +362,12 @@ pub async fn run(
     pg.truncate().await.context("clear source table")?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     dest.clear().await.context("clear destination")?;
+    // Verify rather than assume: a PG standby's `clear` is a no-op, so an empty
+    // destination there means the replicated TRUNCATE has landed. Completion
+    // measurement counts rows, so a non-empty start would silently pass.
+    wait_dest_empty(dest.as_ref(), Duration::from_secs(60))
+        .await
+        .context("destination did not reach zero rows before the run")?;
 
     println!(
         "replication-latency bench — source {}:{}  →  {}",
@@ -352,7 +381,7 @@ pub async fn run(
 
     match which {
         Bench::SingleRow => run_single_row(&pg, dest.as_ref(), single).await?,
-        Bench::Sustained => run_sustained(pg_cfg, pg.clone(), dest.as_ref(), sustained).await?,
+        Bench::Sustained => run_sustained(pg_cfg, pg.clone(), dest.clone(), sustained).await?,
         Bench::Interleaved => run_interleaved(pg_cfg, dest.clone(), interleaved).await?,
     }
     Ok(())
@@ -412,21 +441,45 @@ pub async fn run_single_row(
 // Benchmark: sustained-load latency
 // ---------------------------------------------------------------------------
 
+/// Probe slot: IDLE → ARMED by the clock, ARMED → BUSY by the committing
+/// worker, BUSY → IDLE by the observer once the row is visible or times out.
+const SLOT_IDLE: u8 = 0;
+const SLOT_ARMED: u8 = 1;
+const SLOT_BUSY: u8 = 2;
+
+/// Throughput and latency are measured by two independent instruments.
+///
+/// Throughput comes from [`Destination::count_all`] sampled on a fixed cadence,
+/// never from the probes — deriving it from the last probe observation reports
+/// observer drain time as ingest time.
+///
+/// Latency uses a single probe slot: one commit→visible observation outstanding
+/// at a time, armed by a clock at `probe_interval_ms`. Nothing queues, so no
+/// sample can carry observer wait time. The slot bounds the probe rate at
+/// `1 / latency`, which biases the sample toward the fast intervals — ticks that
+/// find the slot busy are counted, and the reported sampled fraction is what
+/// says how much of the run the distribution actually covers.
 pub async fn run_sustained(
     pg_cfg: &PgConfig,
     pg0: Arc<PgClient>,
-    dest: &dyn Destination,
+    dest: Arc<dyn Destination>,
     p: &SustainedParams,
 ) -> Result<()> {
     let base = p.id_base + 1_000_000;
     let concurrency: i64 = p.concurrency.max(1) as i64;
+    let probe_interval = Duration::from_millis(p.probe_interval_ms.max(1));
+    let count_interval = Duration::from_millis(p.count_interval_ms.max(1));
     println!(
-        "── sustained load: target {} rows/s for {}s across {} conn(s), {} row(s)/txn (probe every {} rows) ──",
+        "── sustained load: target {} rows/s for {}s across {} conn(s), {} row(s)/txn ──",
         p.rate,
         p.duration_secs,
         concurrency,
         p.rows_per_xact.max(1),
-        p.probe_every
+    );
+    println!(
+        "  throughput: destination row count every {}ms; latency: 1 probe at a time, armed every {}ms",
+        count_interval.as_millis(),
+        probe_interval.as_millis(),
     );
 
     // One Postgres connection per inserter worker so inserts run in parallel —
@@ -442,17 +495,92 @@ pub async fn run_sustained(
         ));
     }
 
-    // Probe channel: inserters → poller. Each probe is (id, commit instant).
+    // Probe channel: inserters → observer. The slot admits one probe at a time,
+    // so this never holds more than one message and the observer never queues.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(i64, Instant)>();
-    let wall_start = Instant::now();
+    let slot = Arc::new(AtomicU8::new(SLOT_IDLE));
+    // u64::MAX until the producers report their committed total, so the count
+    // sampler cannot decide the run is complete while load is still running.
+    let expected_rows = Arc::new(AtomicU64::new(u64::MAX));
 
     let duration = Duration::from_secs(p.duration_secs);
-    let probe_every: i64 = p.probe_every.max(1) as i64;
+    let poll = Duration::from_millis(p.poll_interval_ms);
+    let row_timeout = Duration::from_millis(p.row_timeout_ms);
     let per_worker_rate = (p.rate.max(1) as f64 / concurrency as f64).max(f64::MIN_POSITIVE);
     let rows_per_txn: i64 = p.rows_per_xact.max(1) as i64;
+    let load_started_at = Instant::now();
+
+    // Throughput instrument. Samples until the destination holds every
+    // committed row, or until the drain allowance runs out.
+    let sampler = {
+        let dest = dest.clone();
+        let expected_rows = expected_rows.clone();
+        let hard_stop = load_started_at + duration + row_timeout;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(count_interval);
+            // Cadence is a floor, not a quota: a count slower than the interval
+            // must not make the next ticks fire back-to-back to catch up.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut curve: Vec<(f64, u64)> = Vec::new();
+            let mut errors: u64 = 0;
+            let mut announced = Duration::ZERO;
+            loop {
+                tick.tick().await;
+                if Instant::now() >= hard_stop {
+                    break;
+                }
+                let Ok(rows) = dest.count_all().await else {
+                    errors += 1;
+                    continue;
+                };
+                let at = load_started_at.elapsed();
+                curve.push((at.as_secs_f64(), rows));
+                if at.saturating_sub(announced) >= Duration::from_secs(2) {
+                    announced = at;
+                    println!("  … t={:.1}s  destination {rows} rows", at.as_secs_f64());
+                }
+                if rows >= expected_rows.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            (curve, errors)
+        })
+    };
+
+    // Probe clock. Arms the slot on cadence; a tick landing on an outstanding
+    // probe is a recorded skip. A tick landing on an already-armed slot is not —
+    // that only means no commit has claimed it yet.
+    let clock = {
+        let slot = slot.clone();
+        let stop_at = load_started_at + duration;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(probe_interval);
+            // A starved clock must not burst a backlog of ticks and record them
+            // all as skips.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut ticks: u64 = 0;
+            let mut skipped: u64 = 0;
+            loop {
+                tick.tick().await;
+                if Instant::now() >= stop_at {
+                    break;
+                }
+                ticks += 1;
+                if slot
+                    .compare_exchange(SLOT_IDLE, SLOT_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err_and(|state| state == SLOT_BUSY)
+                {
+                    skipped += 1;
+                }
+            }
+            (ticks, skipped)
+        })
+    };
+
     let mut handles = Vec::with_capacity(concurrency as usize);
     for (w, conn) in (0i64..).zip(conns) {
         let tx = tx.clone();
+        let slot = slot.clone();
         let handle = tokio::spawn(async move {
             // Tick once per transaction; each inserts `rows_per_txn` rows, so
             // the row rate stays `rate` and the txn rate is rate/rows_per_txn.
@@ -461,8 +589,6 @@ pub async fn run_sustained(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
             let start = Instant::now();
             let mut k: i64 = 0;
-            let mut last_id: Option<i64> = None;
-            let mut rows_since_probe: i64 = 0;
             while start.elapsed() < duration {
                 tick.tick().await;
                 let mut ids = Vec::with_capacity(rows_per_txn as usize);
@@ -473,50 +599,37 @@ pub async fn run_sustained(
                 conn.insert_txn(&ids).await.with_context(|| {
                     format!("sustained insert txn ending id={}", ids.last().unwrap())
                 })?;
-                let commit_at = Instant::now();
-                let id = *ids.last().expect("rows_per_xact >= 1");
-                last_id = Some(id);
-                rows_since_probe += rows_per_txn;
-                // One probe per ~probe_every rows; all rows in this txn share
-                // its commit, so the last id stands in for the txn.
-                if rows_since_probe >= probe_every {
-                    let _ = tx.send((id, commit_at));
-                    rows_since_probe = 0;
+                // Claim an armed slot, if there is one. One atomic on the commit
+                // path, and never a blocking claim — waiting for the observer
+                // would throttle offered load and change the workload measured.
+                // All rows in this txn share its commit, so the last id stands
+                // in for the txn.
+                if slot
+                    .compare_exchange(SLOT_ARMED, SLOT_BUSY, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let id = *ids.last().expect("rows_per_xact >= 1");
+                    let _ = tx.send((id, Instant::now()));
                 }
-            }
-            // Probe this worker's final txn so the drain tail shows.
-            if let Some(id) = last_id
-                && rows_since_probe != 0
-            {
-                let _ = tx.send((id, Instant::now()));
             }
             Ok::<(i64, Duration), anyhow::Error>((k, start.elapsed()))
         });
         handles.push(handle);
     }
-    drop(tx); // workers hold their own clones; poller exits when all close
+    drop(tx); // workers hold their own clones; observer exits when all close
 
-    // Poller: pull each probe, wait until visible, record latency.
-    let poll = Duration::from_millis(p.poll_interval_ms);
-    let timeout = Duration::from_millis(p.row_timeout_ms);
+    // Observer. Serial by construction: the slot stays BUSY until this releases
+    // it, so at most one probe is ever outstanding and nothing waits in line.
     let mut samples_ms: Vec<f64> = Vec::new();
     let mut timeouts = 0u64;
-    let mut last_visible: Option<Instant> = None;
-    let mut processed: u64 = 0;
-    while let Some((id, t_commit)) = rx.recv().await {
-        match wait_visible(dest, id, poll, timeout).await? {
-            Some(seen_at) => {
-                samples_ms.push(t_commit.elapsed().as_secs_f64() * 1000.0);
-                last_visible = Some(seen_at);
+    while let Some((id, committed_at)) = rx.recv().await {
+        let seen = wait_visible(dest.as_ref(), id, poll, row_timeout).await?;
+        slot.store(SLOT_IDLE, Ordering::Release);
+        match seen {
+            Some(at) => {
+                samples_ms.push(at.saturating_duration_since(committed_at).as_secs_f64() * 1000.0)
             }
             None => timeouts += 1,
-        }
-        processed += 1;
-        if processed.is_multiple_of(500) {
-            println!(
-                "  … drained {processed} probes (last latency {:.0}ms)",
-                samples_ms.last().copied().unwrap_or(0.0)
-            );
         }
     }
 
@@ -527,33 +640,72 @@ pub async fn run_sustained(
         rows_inserted += c;
         insert_elapsed = insert_elapsed.max(e);
     }
+    let expected = rows_inserted.max(0) as u64;
+    expected_rows.store(expected, Ordering::Relaxed);
+    let (curve, count_errors) = sampler.await.context("count sampler join")?;
+    let (probe_ticks, skipped_probes) = clock.await.context("probe clock join")?;
+
     let insert_secs = insert_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     let achieved_rate = rows_inserted as f64 / insert_secs;
-    // End-to-end span: first insert (wall_start) → last probed row visible in
-    // CH. rows / that = the rate rows actually reached ClickHouse, including
-    // any drain past the insert window. If the daemon keeps up it ≈ the insert
-    // rate; if it falls behind, it's lower (the drain tail stretches the span).
-    let ch_secs = last_visible.map(|seen| seen.saturating_duration_since(wall_start).as_secs_f64());
-    let drain_ms = ch_secs.map(|s| s * 1000.0);
+    let tput = Throughput::from_curve(&curve, expected, insert_secs, achieved_rate);
+    let Throughput {
+        dest_rows,
+        all_visible_at,
+        peak_rate,
+        max_backlog,
+    } = tput;
 
-    println!("  rows inserted:        {rows_inserted}");
-    println!("  insert window:        {insert_secs:.1}s");
-    println!("  target insert rate:   {} rows/s", p.rate);
-    println!("  achieved insert rate: {achieved_rate:.0} rows/s");
-    if let Some(s) = ch_secs.filter(|s| *s > 0.0) {
+    println!();
+    println!("source load:");
+    println!("  rows committed:        {rows_inserted}");
+    println!("  insert window:         {insert_secs:.1}s");
+    println!("  target rate:           {} rows/s", p.rate);
+    println!("  achieved rate:         {achieved_rate:.0} rows/s");
+    println!();
+    println!("destination throughput:");
+    println!("  rows visible:          {dest_rows} / {expected}");
+    match all_visible_at {
+        Some(at) => {
+            println!("  all rows visible at:   {at:.1}s into the run");
+            println!(
+                "  drain after source:    {:.1}s",
+                (at - insert_secs).max(0.0)
+            );
+            println!(
+                "  completion rate:       {:.0} rows/s",
+                expected as f64 / at
+            );
+        }
+        None => println!("  all rows visible at:   NOT REACHED within the drain allowance"),
+    }
+    println!("  peak sampled rate:     {peak_rate:.0} rows/s");
+    println!("  max backlog:           {max_backlog:.0} rows");
+    println!(
+        "  count samples:         {} ({count_errors} query errors)",
+        curve.len()
+    );
+    println!();
+    Summary::from(&mut samples_ms).print("sampled commit→visible latency (ms)");
+    if timeouts > 0 {
+        println!("  probe timeouts: {timeouts}");
+    }
+    // One probe at a time means the probe rate falls as latency rises, so the
+    // slow intervals are the under-sampled ones. State the coverage rather than
+    // let the percentiles imply the whole run.
+    if probe_ticks > 0 {
         println!(
-            "  ClickHouse ingest:    {:.0} rows/s ({rows_inserted} rows in {s:.1}s end-to-end)",
-            rows_inserted as f64 / s
+            "  probe coverage: {skipped_probes} of {probe_ticks} ticks found the slot busy \
+             ({:.0}% sampled) — quantiles under-weight the slow intervals",
+            100.0 * (probe_ticks - skipped_probes) as f64 / probe_ticks as f64
         );
     }
-    Summary::from(&mut samples_ms).print("under-load latency (ms)");
-    if let Some(d) = drain_ms {
-        println!("  last-probe visible at: {d:.0}ms into the run");
-    }
-    if timeouts > 0 {
-        println!("  timeouts: {timeouts}");
-    }
     println!();
+
+    if all_visible_at.is_none() {
+        bail!(
+            "destination reached {dest_rows} of {expected} rows — throughput result is a lower bound, not a measurement"
+        );
+    }
     Ok(())
 }
 
@@ -694,6 +846,23 @@ pub async fn run_interleaved(
     Ok(())
 }
 
+/// Poll until the destination table is empty. A ClickHouse `clear` truncates
+/// directly so this returns on the first check; a PG standby only empties once
+/// the primary's TRUNCATE replicates in.
+pub async fn wait_dest_empty(dest: &dyn Destination, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let rows = dest.count_all().await?;
+        if rows == 0 {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            bail!("destination still holds {rows} rows after {:?}", timeout);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Poll the destination for `id` until present or `timeout` elapses. Returns the
 /// `Instant` it was first observed, or `None` on timeout. A transient query
 /// error is treated as "not yet visible" so a momentary hiccup doesn't abort
@@ -829,16 +998,24 @@ async fn pg_connect(cfg: &PgConfig) -> Result<tokio_postgres::Client> {
 
 pub struct PgDest {
     client: tokio_postgres::Client,
+    /// Own connection for the throughput instrument. A backend serves one query
+    /// at a time, so sharing would put a full-table count ahead of the probes
+    /// and charge its scan to measured latency.
+    counter: tokio_postgres::Client,
     count_sql: String,
+    count_all_sql: String,
     endpoint: String,
 }
 
 impl PgDest {
     pub async fn connect(cfg: &PgConfig) -> Result<Self> {
         let client = pg_connect(cfg).await?;
+        let counter = pg_connect(cfg).await?;
         Ok(Self {
             client,
+            counter,
             count_sql: format!("SELECT count(*) FROM {} WHERE id = $1", cfg.table),
+            count_all_sql: format!("SELECT count(*) FROM {}", cfg.table),
             endpoint: format!("postgres standby {}:{}", cfg.host, cfg.port),
         })
     }
@@ -867,6 +1044,12 @@ impl Destination for PgDest {
 
     async fn count_id(&self, id: i64) -> Result<u64> {
         let row = self.client.query_one(&self.count_sql, &[&id]).await?;
+        let n: i64 = row.get(0);
+        Ok(n.max(0) as u64)
+    }
+
+    async fn count_all(&self) -> Result<u64> {
+        let row = self.counter.query_one(&self.count_all_sql, &[]).await?;
         let n: i64 = row.get(0);
         Ok(n.max(0) as u64)
     }
@@ -948,6 +1131,17 @@ impl Destination for ChHttp {
             .with_context(|| format!("parse count() response {body:?}"))
     }
 
+    /// No FINAL: this counts row versions, so at-least-once redelivery shows up
+    /// as an overshoot past the committed total rather than being hidden.
+    async fn count_all(&self) -> Result<u64> {
+        let body = self
+            .query(&format!("SELECT count() FROM {}", self.table))
+            .await?;
+        body.trim()
+            .parse::<u64>()
+            .with_context(|| format!("parse count() response {body:?}"))
+    }
+
     fn endpoint(&self) -> String {
         format!("clickhouse {}:{}", self.host, self.port)
     }
@@ -956,6 +1150,56 @@ impl Destination for ChHttp {
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
+
+/// Destination throughput, derived from a row-count curve rather than from any
+/// probe observation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Throughput {
+    /// Last sampled destination count.
+    pub dest_rows: u64,
+    /// When the destination first held every committed row, in seconds into the
+    /// run. `None` means the run never completed and the rates are lower bounds.
+    pub all_visible_at: Option<f64>,
+    /// Best rate the destination sustained across one sampling interval.
+    pub peak_rate: f64,
+    /// Largest gap between committed and visible rows over the run.
+    pub max_backlog: f64,
+}
+
+impl Throughput {
+    /// `curve` is `(seconds into the run, destination row count)` in sample
+    /// order. `achieved_rate` describes the source: producers are interval
+    /// driven, so source progress is linear across `insert_secs`, which is what
+    /// makes a per-sample backlog computable without a second instrument.
+    pub fn from_curve(
+        curve: &[(f64, u64)],
+        expected: u64,
+        insert_secs: f64,
+        achieved_rate: f64,
+    ) -> Self {
+        Self {
+            dest_rows: curve.last().map(|(_, rows)| *rows).unwrap_or(0),
+            all_visible_at: curve
+                .iter()
+                .find(|(_, rows)| *rows >= expected)
+                .map(|(at, _)| *at)
+                .filter(|at| *at > 0.0),
+            peak_rate: curve
+                .windows(2)
+                .filter_map(|w| {
+                    let dt = w[1].0 - w[0].0;
+                    (dt > 0.0).then(|| w[1].1.saturating_sub(w[0].1) as f64 / dt)
+                })
+                .fold(0.0, f64::max),
+            max_backlog: curve
+                .iter()
+                .map(|(at, rows)| {
+                    (achieved_rate * at.min(insert_secs)).min(expected as f64) - *rows as f64
+                })
+                .fold(0.0, f64::max),
+        }
+    }
+}
 
 pub struct Summary {
     pub n: usize,

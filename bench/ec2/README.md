@@ -5,7 +5,9 @@ EC2 harness for comparing PG→destination replication engines, all `c8i.2xlarge
 cross-AZ latency. A **setup** =
 a base (always the source Postgres primary; plus ClickHouse for the CDC
 engines) + one **streamer** node that does the replication. The base is shared,
-so you swap the streamer while keeping the same source data.
+so you swap the streamer while keeping the same source data. The `ec2-bench`
+node that drives the load is part of every setup — see
+[Benchmark a setup](#benchmark-a-setup).
 
 | setup | streamer node | base | destination | notes |
 |-------|---------------|------|-------------|-------|
@@ -44,10 +46,12 @@ that the CLI would still serve from cache.
 
 ```bash
 cd bench/ec2
-./stack.sh up <setup>        # terraform apply (base + streamer), then deploy the streamer
-./stack.sh down              # tear down current streamer (base kept)
+./stack.sh up <setup>        # terraform apply (base + streamer + bench runner), then deploy
+./stack.sh down              # tear down current streamer (base + runner kept)
 ./stack.sh down --all        # terraform destroy (everything)
-./stack.sh bench up|down     # optional in-VPC bench-runner box (+ deploy)
+./stack.sh bench run <name>   # run the suite on the in-VPC runner → bench/results/<name>
+./stack.sh bench fetch <name> # re-copy a run's results off the runner
+./stack.sh bench up|down      # add/remove the runner box on its own
 ./stack.sh status            # list running project instances
 ```
 
@@ -103,27 +107,45 @@ a read-only hot standby that streams WAL. Re-running takes a fresh base backup.
 
 ## Benchmark a setup
 
-`walshadow-ec2-bench` reads endpoints from the relevant `state.env`. `--suite
-<name>` runs all four benches into `bench/results/<name>/` (a gitignored dir,
-created on demand; an existing name is refused). Run it from the repository
-root, where the `--state-dir` and `--results-dir` defaults resolve:
+The bench driver runs on `ec2-bench`, an in-VPC node that comes up with every
+setup. That is not a convenience: the driver's round trip lands in every
+commit→visible sample and caps the insert loop, so a workstation-driven run
+reports the operator's link. From `~250ms` away, `sustained` reached 176 rows/s
+of a 30000 rows/s target and `single-row` read `p50 1.55s` — all link.
+
+`bench run` does the whole pass on the runner and copies the results into
+`bench/results/<name>/` (gitignored, created on demand; an existing name is
+refused). It brings the runner up and redeploys it first, so it works straight
+after `up`:
 ```bash
-B="cargo run --release --bin walshadow-ec2-bench --"
-# CDC engines (walshadow / peerdb) → ClickHouse:
-$B --suite walshadow-run                       # --dest defaults to clickhouse
-# physical standby:
-$B --suite pg-run --dest postgres              # reads ec2-pg-standby
-# Run sustained and interleaved loads for five minutes; interleaved-long always runs 10 30-second rounds
-$B --suite walshadow-5min --run-secs 300
-# one bench on its own, with its own knobs:
-$B --bench interleaved --xact-secs 150
+cd bench/ec2
+./stack.sh bench run walshadow-run                  # --dest defaults to clickhouse
+./stack.sh bench run pg-run --dest postgres         # physical standby (ec2-pg-standby)
+# sustained + interleaved for five minutes; interleaved-long is always 10 × 30s
+./stack.sh bench run walshadow-5min --run-secs 300
+./stack.sh bench fetch walshadow-5min               # re-copy after a dropped session
 ```
-Each shape runs as a child process, so one failure does not end the pass: its
-output is teed to `<shape>.txt` with a `# FAILED` footer and the suite exits
-non-zero listing what failed.
+Extra flags pass through to `walshadow-ec2-bench`. Each shape runs as a child
+process, so one failure does not end the pass: its output is teed to
+`<shape>.txt` on the box with a `# FAILED` footer, and the suite exits non-zero
+listing what failed. `bench run` still fetches what landed. Every fetched run
+carries a `provenance.txt` (setup, instance type, AZ, repo commit).
+
+`--network` defaults to `private` and the on-box wrapper supplies `--state-dir`
+and `--results-dir`, so a single shape by hand is just:
+```bash
+ssh -i terraform/walshadow-bench.pem ubuntu@<ec2-bench public ip>
+walshadow-ec2-bench --bench interleaved --xact-secs 150
+```
+Running the binary from a workstation (`cargo run --release --bin
+walshadow-ec2-bench -- --network public …`) reaches the instances over the
+internet. Keep those runs for smoke tests — the numbers are not comparable with
+in-VPC ones.
 
 ## Notes
 - `c8i.2xlarge`s bill while running (~8× a t2.small) — `down` (or `down --all`) when idle.
+  A CDC setup is four of them: source-pg, clickhouse, streamer, bench runner.
+  `bench down` drops the runner alone, but any `up` brings it back.
 - SSH/Postgres/ClickHouse are open to the operator IP + VPC CIDR only; Postgres
   uses `trust` auth, so keep 5432 off `0.0.0.0/0`. The operator IP is captured
   at apply time — if yours changes, re-run `terraform apply` (or any `stack.sh`

@@ -17,11 +17,18 @@
 # (profile copy-off, engine cleanup) → terraform apply → the streamer's
 # deploy.sh. Apply is interactive — review the plan, especially on swaps.
 #
+# The bench driver runs on its own in-VPC node, brought up with every setup: its
+# round trip lands in every latency sample and caps the insert loop, so driving
+# the load from a workstation measures the operator's link instead of the
+# pipeline. `bench run` does the whole pass there and copies results back.
+#
 # Usage:
-#   ./stack.sh up <setup>       provision base + streamer, then deploy streamer
+#   ./stack.sh up <setup>       provision base + streamer + bench runner, then deploy
 #   ./stack.sh down             tear down current streamer (shared base kept)
 #   ./stack.sh down --all       tear down everything (terraform destroy)
-#   ./stack.sh bench up|down    optional in-VPC bench-runner box (+ deploy)
+#   ./stack.sh bench run <name> [flags]   run the suite on the runner → bench/results/<name>
+#   ./stack.sh bench fetch <name>         re-copy a run's results off the runner
+#   ./stack.sh bench up|down    add/remove the bench-runner box on its own
 #   ./stack.sh status           list running project instances
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -82,12 +89,13 @@ up() {
   if [ "$(tfvar streamer none)" != "$setup" ]; then pre_down; fi
   [ "$setup" = pg ] && ch=false
   echo "▲ bringing up '$setup' (streamer: $dir)"
-  apply_setup "$setup" "$ch" "$(tfvar bench_runner false)"
+  apply_setup "$setup" "$ch" true
   # Base source-PG post-boot setup (runtime-config overlay + replicate-all seed);
   # idempotent, runs before the streamer's deploy so the daemon seeds from it.
   if [ -x ec2-source-pg/deploy.sh ]; then ( cd ec2-source-pg && ./deploy.sh ); fi
   if [ -x "$dir/deploy.sh" ]; then ( cd "$dir" && ./deploy.sh ); fi
-  echo "✅ '$setup' up"
+  ( cd ec2-bench && ./deploy.sh )
+  echo "✅ '$setup' up — benchmark it with: ./stack.sh bench run <name>"
 }
 
 down() {
@@ -99,13 +107,15 @@ down() {
     rm -f "$TFVARS"
     echo "✅ everything down"
   else
-    apply_setup none "$(tfvar clickhouse true)" "$(tfvar bench_runner false)"
+    apply_setup none "$(tfvar clickhouse true)" "$(tfvar bench_runner true)"
     echo "✅ streamer down; shared base left running (pass --all to remove it too)"
   fi
 }
 
 bench() {
-  case "${1:-}" in
+  local verb="${1:-}"
+  shift || true
+  case "$verb" in
     up)
       apply_setup "$(tfvar streamer none)" "$(tfvar clickhouse true)" true
       ( cd ec2-bench && ./deploy.sh )
@@ -113,8 +123,75 @@ bench() {
     down)
       apply_setup "$(tfvar streamer none)" "$(tfvar clickhouse true)" false
       ;;
+    run)   bench_run "$@" ;;
+    fetch) bench_fetch "${1:-}" ;;
     *) usage; exit 1 ;;
   esac
+}
+
+# Local landing zone for fetched results (bench/results), matching
+# walshadow-ec2-bench's own --results-dir default.
+results_root() { echo "$(cd .. && pwd)/results"; }
+
+# Run the standard suite on the in-VPC runner, then copy the results back.
+# $1 = run name, rest are extra walshadow-ec2-bench flags (--run-secs, --dest, …).
+bench_run() {
+  local name="${1:-}" rc=0
+  shift || true
+  [ -n "$name" ] || { echo "usage: ./stack.sh bench run <name> [bench flags]" >&2; exit 1; }
+  [ -e "$(results_root)/$name" ] && { echo "$(results_root)/$name exists — choose another name" >&2; exit 1; }
+  [ "$(tfvar streamer none)" != none ] || { echo "no streamer up — ./stack.sh up <setup> first" >&2; exit 1; }
+
+  apply_setup "$(tfvar streamer none)" "$(tfvar clickhouse true)" true
+  ( cd ec2-bench && ./deploy.sh )
+
+  # The suite tees each shape into its own file on the box as it goes, so a
+  # dropped SSH session loses the tail, not the results already written; `bench
+  # fetch <name>` collects whatever landed.
+  (
+    cd ec2-bench && source ./state.env && source ../lib.sh && node_ssh_setup
+    echo "▶ suite '$name' on the runner ($PUBLIC_IP), against the VPC-internal endpoints"
+    "${SSH[@]}" "walshadow-ec2-bench --suite '$name' $*"
+  ) || rc=$?
+  bench_fetch "$name" || true
+  [ "$rc" -eq 0 ] || { echo "suite failed (exit $rc)" >&2; exit "$rc"; }
+}
+
+# Copy /opt/bench/results/<name> off the runner into bench/results/<name>, with
+# a provenance file recording what produced it.
+bench_fetch() {
+  local name="${1:-}" out
+  [ -n "$name" ] || { echo "usage: ./stack.sh bench fetch <name>" >&2; exit 1; }
+  out="$(results_root)/$name"
+  (
+    cd ec2-bench && source ./state.env && source ../lib.sh && node_ssh_setup
+    mkdir -p "$(dirname "$out")"
+    "${SCP[@]}" -r "ubuntu@$PUBLIC_IP:/opt/bench/results/$name" "$(dirname "$out")/" \
+      || { echo "nothing to copy for '$name'" >&2; exit 1; }
+  )
+  write_provenance "$name" "$out"
+  echo "✅ results → $out"
+}
+
+# What a reader needs to compare this run against another: which setup, on what
+# hardware, from which tree.
+write_provenance() {
+  local name="$1" out="$2" root head
+  root="$(cd ../.. && pwd)"
+  if head="$(git -C "$root" rev-parse --short HEAD 2>/dev/null)"; then
+    git -C "$root" diff --quiet 2>/dev/null || head="$head-dirty"
+  else
+    head=unknown
+  fi
+  {
+    echo "run:           $name"
+    echo "fetched:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "setup:         $(tfvar streamer none)"
+    echo "instance_type: $(tf output -raw instance_type 2>/dev/null || echo unknown)"
+    echo "az:            $(tf output -raw az 2>/dev/null || echo unknown)"
+    echo "driver:        in-VPC bench runner (ec2-bench)"
+    echo "repo:          $head"
+  } > "$out/provenance.txt"
 }
 
 status() {
@@ -129,7 +206,7 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   up)     [ $# -ge 1 ] || { usage; exit 1; }; up "$1" ;;
   down)   down "$@" ;;
-  bench)  bench "${1:-}" ;;
+  bench)  bench "$@" ;;
   status) status ;;
   *)      usage; exit 1 ;;
 esac
