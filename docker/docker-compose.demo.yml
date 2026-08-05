@@ -5,7 +5,9 @@
 #
 # Adds the observability + load-generation tier on top of the lean
 # source→walshadow→clickhouse base:
-#   pgbench           — hammers source with the TPC-B workload
+#   pgbench           — hammers source with the TPC-B workload. NOT started by
+#                       default (profile `load`); the UI's START WRITE LOAD
+#                       button runs the same workload on demand instead
 #   postgres-exporter — source PG stats (TPS, tuple write rates) → Prom
 #   prometheus        — scrapes walshadow:9484 + postgres-exporter:9187
 #   grafana           — http://localhost:3000, anonymous-admin, lands on
@@ -93,7 +95,16 @@ services:
     volumes:
       - ./ch-config.demo.toml:/etc/walshadow/ch-config.demo.toml:ro
 
+  # OFF by default — `profiles` keeps this out of a plain `up`, so the stack
+  # comes up quiet and the operator arms the load from the UI (which runs its
+  # own pgbench child process; see ui/app.py PgbenchLoad). Still available as a
+  # standalone hammer that starts with the stack and needs no browser:
+  #
+  #   $dc --profile load up -d          # or: $dc --profile load up -d pgbench
+  #
+  # Running both at once is legal but the two loads simply add up.
   pgbench:
+    profiles: ["load"]
     image: postgres:18-bookworm
     depends_on:
       source:
@@ -179,6 +190,13 @@ services:
       # just as well. See the app.py docstring.
       WALSHADOW_UI_DDL_UPDATE_ROWS: "100"
       WALSHADOW_UI_RECENT_ROWS: "12"
+      # START WRITE LOAD spawns `pgbench` in this container against source.
+      # Same knobs as the (now profile-gated) pgbench service, so a demo tuned
+      # with PGBENCH_CLIENTS on the CLI behaves identically from the button.
+      WALSHADOW_UI_PGBENCH_HOST: source
+      WALSHADOW_UI_PGBENCH_CLIENTS: "${PGBENCH_CLIENTS:-4}"
+      WALSHADOW_UI_PGBENCH_THREADS: "${PGBENCH_THREADS:-2}"
+      WALSHADOW_UI_PGBENCH_DURATION: "${PGBENCH_DURATION:-86400}"
     volumes:
       # COPYed into the image too; these mounts make editing a `restart`
       # rather than a rebuild.

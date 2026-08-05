@@ -32,9 +32,11 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.demo.yml up
 ```
 
 then open http://localhost:3000 for the Grafana dashboards, or
-http://localhost:8088 for the click-to-drive UI — insert rows, update a row,
-evolve the schema, and watch rowcount parity and the ClickHouse schema
-converge. Walkthrough in [docker/DEMO.md](docker/DEMO.md)
+http://localhost:8088 for the click-to-drive UI — start the pgbench load,
+insert rows, evolve the schema, and watch rowcount parity and the ClickHouse
+schema converge. The stack comes up quiet; the load starts from the UI (or
+add `--profile load` to the command above to start the standalone hammer with
+the stack). Walkthrough in [docker/DEMO.md](docker/DEMO.md)
 
 The demo overlay seeds the pgbench TPC-B schema on source and its
 destination tables on CH through one-shot `source-init` / `ch-init`
@@ -44,9 +46,9 @@ stacks needs no volume reset. To rebootstrap from scratch anyway:
 
 ## Simplified demo (browser UI)
 
-The click-to-drive surface: three buttons against `demo.users` on the
-source, and the downstream effect on ClickHouse next to them. No psql, no
-Grafana queries, no login.
+The click-to-drive surface: a row of buttons that write to `demo.users` on
+the source and arm the pgbench load, with the downstream effect on
+ClickHouse next to them. No psql, no Grafana queries, no login.
 
 ```
 git submodule update --init --recursive
@@ -68,24 +70,33 @@ only need source PG and ClickHouse. To watch bootstrap land:
 $dc logs -f walshadow      # wait for: shadow caught up to bootstrap end_lsn
 ```
 
-Three controls, all writing to `demo.users` on the source:
+Six controls in one row — insert · rows · load · schema:
 
 | control | what it does |
 |---|---|
-| **INSERT N ROWS** | one server-side `INSERT … SELECT … FROM generate_series(…)`, chunked at 250k. Source rows step up; ClickHouse chases. |
+| **INSERT N ROWS** | `demo.users`: one server-side `INSERT … SELECT … FROM generate_series(…)`, chunked at 250k. Source rows step up; ClickHouse chases. |
+| **UPDATE RANDOM ROW** | rewrites one existing row's email, picked by index range scan. The new version tops the rows feed; the older one is still below it — what CDC actually writes. |
+| **DELETE RANDOM ROW** | deletes one existing row. The ClickHouse count drops by one while versions landed rises by one — the tombstone is itself a version, hidden by `FINAL WHERE _is_deleted = 0`. |
+| **START / STOP WRITE LOAD** | arms the pgbench TPC-B hammer against the source (`-c 4 -j 2` by default), with live tps / latency under the button. Off until you press it. |
 | **ADD COLUMN signup_ts** | live DDL — walshadow runs the `ALTER` on ClickHouse and auto-extends the column mapping, no config edit or restart. Bounded to 100 rows of `signup_ts = now()`. Disables itself once the column exists. |
 | **DROP COLUMN** | `DROP COLUMN IF EXISTS signup_ts`, replicated too, so the schema beat repeats without a `down -v`. |
 
-Below the controls: apply lag and bytes-behind-ClickHouse from
-`/metrics`, rowcount parity (source vs `count() FINAL WHERE _is_deleted =
-0`) with a delta pill, the source and ClickHouse schemas side by side, and
-the newest row versions by `_lsn` — no `FINAL`, so every CDC version
-shows.
+Below the controls: rowcount parity with one row per replicated table —
+`demo.users` and the four pgbench TPC-B tables — each showing source rows vs
+`count() FINAL WHERE _is_deleted = 0` on ClickHouse, the delta with a pill,
+versions landed and the age of the last change. The counts are deduplicated so
+they compare like with like against the source; the page's labels say what the
+numbers mean rather than naming `FINAL`. Then the source and ClickHouse schemas
+side by side, and the newest row versions by `_lsn` — undeduplicated, so every
+CDC version shows. Apply lag and rows → CH /s ride in the header; the rest of
+`/metrics` is Grafana's job.
 
-pgbench hammers the source the whole time, so the throughput numbers are
-whole-pipeline. The number that responds to *your* click is `demo.users`
-versions /s on the parity card. For a quiet demo, silence the hammer with
-`$dc stop pgbench` (and `$dc start pgbench` to bring it back).
+With the write load armed, the throughput numbers are whole-pipeline —
+pgbench included. What responds to *your* click is the `demo.users` parity
+row, and `pgbench_history` is the row where a live delta shows up under load. For a quiet demo leave the load off, or press
+STOP WRITE LOAD. (The standalone `pgbench` service still exists for a
+browser-free run: `$dc --profile load up -d`, then `$dc stop pgbench` /
+`$dc start pgbench`.)
 
 Grafana on http://localhost:3000 is the time-series view of the same
 stack. Full walkthrough, plus the CLI form of every button, in

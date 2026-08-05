@@ -16,6 +16,28 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
+# `pgbench` for the START WRITE LOAD button (app.py runs it as a child process).
+#
+# Debian ships pgbench inside the postgresql-17 *server* package, and
+# `apt-get install postgresql-client` gives you only the pg_wrapper shim, which
+# then dies with "pgbench was not found in /usr/lib/postgresql/17/bin". So pull
+# the .deb and extract the one 260 KB binary instead of dragging in the server
+# (libllvm19, perl, icu — several hundred MB for a demo UI). libpq5 is the only
+# runtime dep it needs beyond libc.
+#
+# Client 17 against the PG 18 source is fine: the built-in tpcb-like script is
+# plain SQL over a stable wire protocol. `pgbench -i` is never run from here —
+# the source-init one-shot still owns schema seeding.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpq5 \
+ && apt-get download postgresql-17 \
+ && dpkg-deb --fsys-tarfile postgresql-17_*.deb \
+      | tar -x -C / ./usr/lib/postgresql/17/bin/pgbench \
+ && ln -s /usr/lib/postgresql/17/bin/pgbench /usr/local/bin/pgbench \
+ && rm -f postgresql-17_*.deb \
+ && rm -rf /var/lib/apt/lists/* \
+ && pgbench --version
+
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt

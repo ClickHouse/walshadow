@@ -5,6 +5,10 @@ and **Grafana dashboards** showing throughput, replication lag, and rows
 landing in ClickHouse in near-real-time — then an operator evolving the
 schema live and watching the column appear downstream.
 
+The stack now comes up **quiet**: the hammer is off until you press
+**START WRITE LOAD** in the UI at :8088 (or bring up the standalone
+`pgbench` service with `--profile load`). See §3b.
+
 Two browser surfaces: **Grafana** on :3000 for the time series, and the
 **driving UI** on :8088 for clicking the demo — insert rows, update a row,
 evolve the schema — and watching rowcount parity and the ClickHouse schema
@@ -17,7 +21,7 @@ Five services from the base stack plus a demo tier:
 | `source` | postgres:18, `wal_level=logical`, seeds `demo.users` + pgbench TPC-B schema (`REPLICA IDENTITY FULL`) |
 | `walshadow` | daemon: in-container daemon-owned shadow PG + WAL→CH stream, `/metrics` on :9484 |
 | `clickhouse` | destination, `demo.*` tables pre-created |
-| `pgbench` | hammers `source` with the TPC-B workload |
+| `pgbench` | hammers `source` with the TPC-B workload — **not started by default**, behind the `load` profile; the UI's START WRITE LOAD button runs the same workload on demand |
 | `postgres-exporter` | source PG stats (TPS, tuple rates) → Prometheus |
 | `prometheus` | scrapes walshadow + postgres-exporter |
 | `grafana` | the dashboards — http://localhost:3000 |
@@ -53,7 +57,16 @@ PGBENCH_SCALE=1 PGBENCH_CLIENTS=4 PGBENCH_THREADS=2 $dc up --build -d
 ```
 
 `PGBENCH_SCALE=1` is ~100k accounts; bump it for a bigger backfill and a
-heavier hammer.
+heavier hammer. `CLIENTS` / `THREADS` are the `-c` / `-j` the UI's START
+WRITE LOAD button uses, so a stack brought up with these behaves the same
+whether you drive the load from the button or the `pgbench` service.
+
+The schema is always seeded; only the *load* is off by default. To have the
+hammer start with the stack instead of from the button:
+
+```
+$dc --profile load up --build -d
+```
 
 ## 2. Watch bootstrap land
 
@@ -67,13 +80,17 @@ Wait for the four bootstrap phase lines, ending with:
 walshadow::bootstrap: shadow caught up to bootstrap end_lsn
 ```
 
-The `pgbench` service is gated on walshadow's metrics port, which opens
-only *after* bootstrap — so the hammer starts swinging the moment the
-backfill is durable. Confirm it's swinging:
+Nothing is writing to the source yet — start the load from the UI (§3b) or,
+if you brought the stack up with `--profile load`, the service is gated on
+walshadow's metrics port (which opens only *after* bootstrap) so the hammer
+starts swinging the moment the backfill is durable. Confirm it's swinging:
 
 ```
 $dc logs -f pgbench      # progress lines every 5s: tps, latency
 ```
+
+Started from the button instead, the same progress lines go to `$dc logs ui`
+and the last few show live on the page.
 
 ## 3. Open the dashboards
 
@@ -117,37 +134,60 @@ read `—` and the status line says `walshadow bootstrapping — /metrics not
 open yet`, while the controls and the parity panel are already live (they
 only need source PG and ClickHouse).
 
-Four controls, all against `demo.users` on the source:
+Six buttons in one row — insert · rows · load · schema:
 
 | control | what it does |
 |---|---|
-| **INSERT N ROWS** | one server-side `INSERT … SELECT … FROM generate_series(…)`, chunked at 250k. Watch source rows step up and ClickHouse chase it. |
-| **UPDATE RANDOM ROW** | picks an existing id by index range scan and rewrites its email. The row reappears at the top of the rows feed with a higher `_lsn`; the *older* version is still there further down — that's what CDC actually writes. |
+| **INSERT N ROWS** | `demo.users`: one server-side `INSERT … SELECT … FROM generate_series(…)`, chunked at 250k. Watch source rows step up and ClickHouse chase it. |
+| **UPDATE RANDOM ROW** | picks an existing `demo.users` id by index range scan and rewrites its email. The row reappears at the top of the rows feed with a higher `_lsn`; the *older* version is still there further down — that's what CDC actually writes. |
+| **DELETE RANDOM ROW** | deletes one existing row. The payoff is on the parity card: the ClickHouse count drops by one while row versions landed goes *up* by one — the tombstone (`_is_deleted = 1`) is itself a row version, and `FINAL WHERE _is_deleted = 0` is what hides it. |
+| **START / STOP WRITE LOAD** | the pgbench TPC-B hammer against the source's `pgbench_*` tables, `-c 4 -j 2` by default. Runs as a child process of the `ui` container, so it needs no docker socket and dies with the container. Live tps / latency and the run timer show under the button; the hint line reports the exit code if it fails. |
 | **ADD COLUMN signup_ts** | the schema beat, §4 below in one click. Bounded to 100 rows of `signup_ts = now()`. Disables itself once the column exists. |
 | **DROP COLUMN** | `DROP COLUMN IF EXISTS signup_ts`, replicated to ClickHouse too — so the beat is repeatable without a `down -v`. |
 
-Five panels, top to bottom: the controls plus an action log; walshadow
-pipeline tiles (lag, throughput, buffering xacts, uptime); rowcount parity
-(source vs `count() FINAL WHERE _is_deleted = 0`, with a delta pill); source
-and ClickHouse schema side by side; and the newest rows in ClickHouse by
-`_lsn`.
+The insert, update, delete and schema beats take turns (one action at a time,
+shown in the action log); the write load is independent and meant to run
+*underneath* them.
+
+Four panels, top to bottom: the controls plus an action log; rowcount parity;
+source and ClickHouse schema side by side; and the newest rows in ClickHouse
+by `_lsn`. The walshadow `/metrics` numbers are down to the two header tiles —
+apply lag and rows → CH /s; Grafana on :3000 is the place for the rest.
+
+The parity panel carries **one row per table the demo replicates** —
+`demo.users` plus the four pgbench TPC-B tables — each with source rows,
+`count() FINAL WHERE _is_deleted = 0` on ClickHouse, the delta with a pill,
+row versions landed, and the age of the last change. Under load
+`pgbench_history` is where you see a live delta: it takes the most writes, so
+its row goes `N BEHIND` and snaps back to `IN SYNC`. Override the table list
+with `WALSHADOW_UI_PARITY_TABLES` (`source=destination` pairs, comma
+separated) if you point the demo at your own schema.
+
+The ClickHouse counts are deduplicated (`FINAL`) so they compare like with
+like against the source, but the page never says `FINAL` in a label — the
+panel describes what a number *means* ("deduplicated rowcount, tombstones
+excluded"), not which keyword produced it. Keep that split if you edit either
+side: query wording in `app.py`, meaning-first wording in `index.html`.
 
 Two things worth knowing when you read the numbers:
 
-- **The throughput tiles are whole-pipeline, pgbench included.**
+- **The header tiles are whole-pipeline, pgbench included.**
   `walshadow_emitter_rows_total` carries no table label, so "rows → CH /s"
-  counts the TPC-B hammer too. The number that responds to *your* click is
-  **`demo.users` versions /s** on the parity card, derived by differencing the
-  ClickHouse count. For a quiet demo, silence the hammer:
-  `$dc stop pgbench` (and `$dc start pgbench` to bring the roar back).
-- **"ClickHouse rows · FINAL" and "row versions landed" are different
-  numbers, deliberately.** The first dedupes to the winning version per id;
-  the second is every version ever landed. Grafana's `demo.users` rowcount
-  panel is a bare `count()`, so it matches the second, not the first.
+  counts the TPC-B hammer too. What responds to *your* click is the
+  `demo.users` parity row — its counts move on every button press. For a quiet
+  demo just leave the load off (it is off until you press START WRITE LOAD) —
+  or press STOP WRITE LOAD mid-demo. If you started the standalone service
+  with `--profile load` instead, that one is `$dc stop pgbench` /
+  `$dc start pgbench`.
+- **"ClickHouse rows" and "row versions landed" are different numbers,
+  deliberately.** The first dedupes to the winning version per row and drops
+  tombstones; the second is every version ever landed. Grafana's `demo.users`
+  rowcount panel is a bare `count()`, so it matches the second, not the first.
 
 To iterate on the UI itself, edit `docker/ui/app.py` or
 `docker/ui/index.html` and `$dc restart ui` — both files are bind-mounted, so
-no rebuild. (On a Linux host you can add `--reload` to the uvicorn command;
+no rebuild. (A restart *does* kill a running write load; the image itself only
+needs rebuilding for dependency changes, `pgbench` among them.) (On a Linux host you can add `--reload` to the uvicorn command;
 inotify over Docker Desktop's virtiofs on macOS is unreliable enough that it
 isn't the default.)
 

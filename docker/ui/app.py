@@ -5,8 +5,8 @@ connected browser over a WebSocket:
 
   * source PostgreSQL  — rowcount, max(id), whether `signup_ts` exists yet,
                          and the live column list. Also the write target for
-                         all four operator actions.
-  * ClickHouse (:8123) — rowcount FINAL, raw version count, max(_lsn), age of
+                         every operator action.
+  * ClickHouse (:8123) — live rowcount, raw version count, max(_lsn), age of
                          the newest change, DESCRIBE TABLE, recent rows.
   * walshadow (:9484)  — the Prometheus text endpoint, for lag and throughput.
 
@@ -17,6 +17,12 @@ Design notes worth knowing before editing:
   needs a new named volume in the *base* compose file plus a uid match against
   the daemon image's `postgres` user. Everything the panels need is already in
   /metrics, so this talks HTTP only.
+
+* The pgbench write load is a child process of THIS container, not the sibling
+  `pgbench` compose service (which now sits behind the `load` profile and does
+  not start with the stack). See PgbenchLoad for why. Consequence: the UI image
+  needs the `pgbench` binary — installed in ui/Dockerfile — and the load stops
+  when the UI container stops or restarts.
 
 * The DDL beat's UPDATE is bounded (WALSHADOW_UI_DDL_UPDATE_ROWS, default 100).
   DEMO.md's CLI form has no WHERE clause, which is safe there because the table
@@ -38,9 +44,18 @@ Design notes worth knowing before editing:
   makes the browser's JSON.parse throw, killing render() for the whole stream
   rather than one tile.
 
-* Rowcount parity uses `FINAL WHERE _is_deleted = 0`, not bare FINAL:
+* Rowcount parity counts `FINAL WHERE _is_deleted = 0`, not bare FINAL:
   ReplacingMergeTree(_lsn, _is_deleted) keeps the winning version even when
-  that version is a tombstone.
+  that version is a tombstone, so FINAL alone would still count deleted rows.
+  FINAL is deliberately absent from the *labels* on the page — the panel says
+  what the number means, not which keyword produced it — so keep query and
+  label wording independent when editing either.
+
+* Parity covers every table the demo replicates — demo.users plus the four
+  pgbench TPC-B tables — one row each, from collect_parity() and its own
+  connection pool. WALSHADOW_UI_PARITY_TABLES overrides the list. It reports
+  counts only; no per-table rate, since a background merge collapsing versions
+  makes a differenced rate read as a counter reset.
 """
 
 from __future__ import annotations
@@ -49,6 +64,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -89,6 +105,59 @@ RECENT_ROWS = int(os.environ.get("WALSHADOW_UI_RECENT_ROWS", "12"))
 DDL_COLUMN = os.environ.get("WALSHADOW_UI_DDL_COLUMN", "signup_ts")
 DDL_COLUMN_TYPE = os.environ.get("WALSHADOW_UI_DDL_COLUMN_TYPE", "timestamptz")
 
+# ---- pgbench background load, driven from the page (see PgbenchLoad below).
+# The compose `pgbench` service is behind the `load` profile, so the stack now
+# comes up quiet and the operator arms the roar with a button.
+PGBENCH_BIN = os.environ.get("WALSHADOW_UI_PGBENCH_BIN", "pgbench")
+PGBENCH_HOST = os.environ.get("WALSHADOW_UI_PGBENCH_HOST", "source")
+PGBENCH_PORT = os.environ.get("WALSHADOW_UI_PGBENCH_PORT", "5432")
+PGBENCH_USER = os.environ.get("WALSHADOW_UI_PGBENCH_USER", "postgres")
+PGBENCH_DB = os.environ.get("WALSHADOW_UI_PGBENCH_DB", "postgres")
+PGBENCH_CLIENTS = int(os.environ.get("WALSHADOW_UI_PGBENCH_CLIENTS", "4"))
+PGBENCH_THREADS = int(os.environ.get("WALSHADOW_UI_PGBENCH_THREADS", "2"))
+# pgbench has no "run until I say stop" mode — it needs -T or -t. So cap it a
+# day out and treat the STOP button (SIGTERM) as the normal way it ends.
+PGBENCH_DURATION_S = int(os.environ.get("WALSHADOW_UI_PGBENCH_DURATION", "86400"))
+PGBENCH_PROGRESS_S = int(os.environ.get("WALSHADOW_UI_PGBENCH_PROGRESS", "5"))
+PGBENCH_LOG_LINES = 6
+
+# ---- rowcount parity, one row per table the demo replicates: demo.users (the
+# click-driven one) plus the four pgbench TPC-B tables the write load hammers.
+# Comma-separated `source=destination` pairs; both sides must be schema
+# qualified because they differ (pgbench lives in `public` on the source and
+# lands in `demo` on ClickHouse, per ch-config.demo.toml).
+PARITY_TABLES_RAW = os.environ.get(
+    "WALSHADOW_UI_PARITY_TABLES",
+    f"{PG_TABLE}={CH_QUALIFIED},"
+    "public.pgbench_accounts=demo.pgbench_accounts,"
+    "public.pgbench_branches=demo.pgbench_branches,"
+    "public.pgbench_tellers=demo.pgbench_tellers,"
+    "public.pgbench_history=demo.pgbench_history",
+)
+
+# Both names are interpolated straight into SQL — psycopg can parameterize
+# values but not identifiers, and ClickHouse is spoken to over HTTP as text.
+# So anything that is not a plain schema.table pair is dropped, loudly enough
+# to find in the logs, rather than concatenated into a query.
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*\.[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def parse_parity_tables(raw: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for pair in (p.strip() for p in raw.split(",")):
+        if not pair:
+            continue
+        src, _, dest = pair.partition("=")
+        src, dest = src.strip(), dest.strip()
+        if not IDENT_RE.match(src) or not IDENT_RE.match(dest):
+            print(f"walshadow-ui: ignoring malformed parity table pair {pair!r}")
+            continue
+        out.append({"source": src, "ch": dest})
+    return out
+
+
+PARITY_TABLES = parse_parity_tables(PARITY_TABLES_RAW)
+
 METRICS_TIMEOUT_S = 1.5
 PG_TIMEOUT_S = 3.5
 # ClickHouse gets a wider budget than source PG: right after a big insert the
@@ -102,6 +171,11 @@ CH_MAX_EXECUTION_S = 5
 # A blank parity card is worst exactly when it matters most — the seconds after
 # an insert — so freeze the numbers and label them stale instead.
 CH_STALE_MAX_S = 20.0
+# The multi-table parity read is two round-trips per backend over five tables,
+# including `count(*)` on a pgbench_history that grows for as long as the load
+# runs. Wider than either single-backend budget, and it stale-carries the same
+# way when it blows through.
+PARITY_TIMEOUT_S = 9.0
 
 ACTION_HISTORY_MAX = 8
 
@@ -168,6 +242,8 @@ class State:
         self.last_uptime: float | None = None
         self.last_ch_ok: dict[str, Any] | None = None
         self.last_ch_ok_at: float = 0.0
+        self.last_parity_ok: dict[str, Any] | None = None
+        self.last_parity_ok_at: float = 0.0
         self.rates: dict[str, CounterRate] = {
             "emitter_rows": CounterRate(),
             "xacts": CounterRate(),
@@ -180,6 +256,164 @@ state = State()
 http_client: httpx.AsyncClient | None = None
 read_pool: AsyncConnectionPool | None = None
 write_pool: AsyncConnectionPool | None = None
+parity_pool: AsyncConnectionPool | None = None
+
+
+# ------------------------------------------------------- pgbench load control
+
+
+class PgbenchLoad:
+    """START/STOP the TPC-B hammer as a child process of this container.
+
+    Why in-process and not `docker compose start pgbench`: driving the sibling
+    container would mean mounting the docker socket into the UI (root-equivalent
+    access to the host daemon) and hard-coding the compose project name. A child
+    process needs neither, gives an exit code and stderr straight back to the
+    page, and dies with the container if the operator kills the stack mid-load.
+
+    Deliberately NOT routed through the action lock. The insert / DDL actions
+    are one-shot and mutually exclusive; the load is a long-lived background
+    condition that the whole point of the demo is to run *underneath* them.
+    """
+
+    # `progress: 5.0 s, 8214.6 tps, lat 0.485 ms stddev 0.203, 0 failed`
+    PROGRESS_RE = re.compile(
+        r"^progress:\s+([\d.]+)\s+s,\s+([\d.]+)\s+tps,\s+lat\s+([\d.]+)\s+ms"
+    )
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.proc: asyncio.subprocess.Process | None = None
+        self.reader: asyncio.Task | None = None
+        self.started_at: float | None = None
+        self.clients = PGBENCH_CLIENTS
+        self.threads = PGBENCH_THREADS
+        self.tps: float | None = None
+        self.lat_ms: float | None = None
+        self.log: deque[str] = deque(maxlen=PGBENCH_LOG_LINES)
+        self.last_exit: dict[str, Any] | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+    def argv(self) -> list[str]:
+        return [
+            PGBENCH_BIN,
+            "-h", PGBENCH_HOST,
+            "-p", PGBENCH_PORT,
+            "-U", PGBENCH_USER,
+            "-d", PGBENCH_DB,
+            # -n: never vacuum. The seeded tables are already loaded and a
+            # vacuum here would stall the first seconds of every run.
+            "-n",
+            "-c", str(self.clients),
+            "-j", str(self.threads),
+            "-T", str(PGBENCH_DURATION_S),
+            "-P", str(PGBENCH_PROGRESS_S),
+        ]
+
+    async def start(self, clients: int, threads: int) -> dict[str, Any]:
+        async with self.lock:
+            if self.running:
+                raise RuntimeError("write load is already running")
+            self.clients = clients
+            self.threads = threads
+            self.tps = self.lat_ms = None
+            self.log.clear()
+            self.last_exit = None
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    *self.argv(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    # trust auth on source, so no PGPASSWORD needed.
+                    env={**os.environ, "PGCONNECT_TIMEOUT": "5"},
+                )
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    f"{PGBENCH_BIN} not found in the UI image — rebuild it "
+                    f"(`docker compose ... build ui`)"
+                ) from e
+            self.started_at = time.time()
+            self.reader = asyncio.create_task(self._drain())
+            return {
+                "started": True,
+                "clients": self.clients,
+                "threads": self.threads,
+            }
+
+    async def stop(self) -> dict[str, Any]:
+        async with self.lock:
+            if not self.running:
+                raise RuntimeError("write load is not running")
+            proc = self.proc
+            assert proc is not None
+            # SIGTERM: pgbench stops its clients and prints the final summary,
+            # which _drain then parks in the log for the page to show.
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+            return {"stopped": True}
+
+    async def _drain(self) -> None:
+        """Consume pgbench's output until EOF, keeping the last few lines.
+
+        Draining is not optional: pgbench writes a progress line every
+        PGBENCH_PROGRESS_S seconds and would eventually block on a full pipe.
+        """
+        proc = self.proc
+        assert proc is not None and proc.stdout is not None
+        try:
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").rstrip()
+                if not line:
+                    continue
+                self.log.append(line)
+                m = self.PROGRESS_RE.match(line)
+                if m:
+                    self.tps = float(m.group(2))
+                    self.lat_ms = float(m.group(3))
+        except asyncio.CancelledError:
+            raise
+        finally:
+            code = await proc.wait()
+            self.last_exit = {
+                "code": code,
+                # SIGTERM (-15) is the STOP button, i.e. success. Anything else
+                # is a real failure and the tail of the log says why.
+                "ok": code in (0, -15),
+                "at": time.time(),
+                "ran_for_ms": int((time.time() - (self.started_at or time.time())) * 1000),
+            }
+            self.tps = self.lat_ms = None
+
+    def view(self) -> dict[str, Any]:
+        running = self.running
+        return {
+            "running": running,
+            "clients": self.clients,
+            "threads": self.threads,
+            "duration_s": PGBENCH_DURATION_S,
+            "tps": self.tps if running else None,
+            "lat_ms": self.lat_ms if running else None,
+            "elapsed_ms": (
+                int((time.time() - self.started_at) * 1000)
+                if running and self.started_at
+                else None
+            ),
+            "log": list(self.log),
+            "last_exit": self.last_exit,
+        }
+
+
+load = PgbenchLoad()
 
 
 # ------------------------------------------------------------ metrics parsing
@@ -350,7 +584,7 @@ async def collect_source() -> dict[str, Any]:
 # --------------------------------------------------------- clickhouse collector
 
 SQL_CH_STATS = f"""
-SELECT (SELECT count() FROM {CH_QUALIFIED} FINAL WHERE _is_deleted = 0) AS rows_final,
+SELECT (SELECT count() FROM {CH_QUALIFIED} FINAL WHERE _is_deleted = 0) AS rows_live,
        count()                                                         AS versions,
        toString(max(_lsn))                                             AS max_lsn,
        if(count() = 0, NULL,
@@ -450,7 +684,7 @@ async def collect_clickhouse() -> dict[str, Any]:
         "stale_ms": None,
         "table_missing": False,
         "query_ms": int((time.monotonic() - t0) * 1000),
-        "rows_final": int(d["rows_final"]),
+        "rows_live": int(d["rows_live"]),
         "versions": versions,
         "max_lsn": d["max_lsn"],
         "staleness_ms": None if staleness is None else int(staleness),
@@ -468,6 +702,140 @@ async def collect_clickhouse() -> dict[str, Any]:
     }
     state.last_ch_ok = payload
     state.last_ch_ok_at = time.monotonic()
+    return payload
+
+
+# ------------------------------------------------------- multi-table parity
+
+# Its own collector, not an extension of collect_source / collect_clickhouse,
+# for two reasons. It is the expensive read of the three — five `count() FINAL`
+# on ClickHouse plus five exact `count(*)` on the source, and pgbench_accounts /
+# pgbench_history are the tables the load makes big — so it gets its own task,
+# its own timeout and its own stale-carry. And it must not be able to take the
+# demo.users panels down with it: a timeout here leaves the schema, rows feed
+# and controls untouched.
+
+SQL_PG_EXISTS = """
+SELECT t, to_regclass(t) IS NOT NULL AS present
+FROM unnest(%(names)s::text[]) AS t
+"""
+
+# system.tables, not a probe query per table: one round-trip, and a missing
+# table is then a normal empty row rather than an exception to classify.
+CH_EXISTS_SQL = """
+SELECT concat(database, '.', name) AS t FROM system.tables
+WHERE concat(database, '.', name) IN ({names}) FORMAT JSONCompact
+"""
+
+
+def ch_parity_sql(tables: list[str]) -> str:
+    """One UNION ALL over the present tables: rows_live, versions, staleness.
+
+    `count()` without FINAL is part metadata and near-free; the FINAL count is
+    the one that costs, which is why the whole thing is a single query rather
+    than a fan-out of five.
+    """
+    parts = [
+        f"""SELECT '{t}' AS tbl,
+       (SELECT count() FROM {t} FINAL WHERE _is_deleted = 0) AS rows_live,
+       (SELECT count() FROM {t}) AS versions,
+       (SELECT if(count() = 0, NULL,
+                  dateDiff('millisecond', max(_commit_ts), now64(3))) FROM {t})
+           AS staleness_ms"""
+        for t in tables
+    ]
+    return " UNION ALL ".join(parts) + " FORMAT JSON"
+
+
+async def pg_parity_counts() -> dict[str, int]:
+    """count(*) per existing source table, skipping the ones that aren't there.
+
+    Exact counts, not reltuples: parity is the claim being made, and an
+    estimate that drifts from ClickHouse would read as replication lag.
+    """
+    assert parity_pool is not None
+    names = [t["source"] for t in PARITY_TABLES]
+    async with parity_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_PG_EXISTS, {"names": names})
+            present = [r[0] for r in await cur.fetchall() if r[1]]
+            if not present:
+                return {}
+            sql = " UNION ALL ".join(
+                f"SELECT {i} AS i, count(*) AS n FROM {t}"
+                for i, t in enumerate(present)
+            )
+            await cur.execute(f"{sql} ORDER BY i")
+            rows = await cur.fetchall()
+    return {present[r[0]]: r[1] for r in rows}
+
+
+async def ch_parity_counts() -> dict[str, dict[str, Any]]:
+    if not PARITY_TABLES:
+        return {}
+    quoted = ", ".join(f"'{t['ch']}'" for t in PARITY_TABLES)
+    found = await ch_query(CH_EXISTS_SQL.format(names=quoted))
+    present = [r[0] for r in found["data"]]
+    if not present:
+        return {}
+    stats = await ch_query(ch_parity_sql(present))
+    return {r["tbl"]: r for r in stats["data"]}
+
+
+async def collect_parity() -> dict[str, Any]:
+    t0 = time.monotonic()
+    try:
+        pg_counts, ch_counts = await asyncio.gather(
+            pg_parity_counts(), ch_parity_counts()
+        )
+    except Exception as e:  # noqa: BLE001
+        msg = f"{type(e).__name__}: {e}"
+        age = time.monotonic() - state.last_parity_ok_at
+        if state.last_parity_ok is not None and age <= CH_STALE_MAX_S:
+            return {
+                **state.last_parity_ok,
+                "stale": True,
+                "stale_ms": int(age * 1000),
+                "error": msg,
+            }
+        return {"up": False, "error": msg, "stale": False, "tables": []}
+
+    rows = []
+    for t in PARITY_TABLES:
+        src_rows = pg_counts.get(t["source"])
+        ch = ch_counts.get(t["ch"])
+        ch_rows = None if ch is None else int(ch["rows_live"])
+        versions = None if ch is None else int(ch["versions"])
+        staleness = None if ch is None else ch["staleness_ms"]
+        delta = None if src_rows is None or ch_rows is None else ch_rows - src_rows
+        rows.append(
+            {
+                "source": t["source"],
+                "ch": t["ch"],
+                "source_rows": src_rows,
+                "ch_rows": ch_rows,
+                "versions": versions,
+                "delta": delta,
+                "in_sync": delta == 0,
+                # Clamped at zero: _commit_ts comes from the source's clock and
+                # now64() from ClickHouse's, so a table that was written to
+                # milliseconds ago can otherwise show a negative age.
+                "staleness_ms": None if staleness is None else max(0, int(staleness)),
+                "pg_missing": src_rows is None,
+                "ch_missing": ch is None,
+            }
+        )
+
+    payload = {
+        "up": True,
+        "error": None,
+        "stale": False,
+        "stale_ms": None,
+        "query_ms": int((time.monotonic() - t0) * 1000),
+        "tables": rows,
+    }
+    state.last_parity_ok = payload
+    state.last_parity_ok_at = time.monotonic()
     return payload
 
 
@@ -499,10 +867,13 @@ def action_view() -> dict[str, Any]:
 
 async def collect_snapshot() -> dict[str, Any]:
     t0 = time.monotonic()
-    ws, src, ch = await asyncio.gather(
+    ws, src, ch, par_tables = await asyncio.gather(
         asyncio.wait_for(collect_walshadow(), timeout=METRICS_TIMEOUT_S + 0.5),
         asyncio.wait_for(collect_source(), timeout=PG_TIMEOUT_S),
         asyncio.wait_for(collect_clickhouse(), timeout=CH_TIMEOUT_S + 1.0),
+        # The widest budget of the four: five exact source counts plus five
+        # `count() FINAL`, against tables the write load grows.
+        asyncio.wait_for(collect_parity(), timeout=PARITY_TIMEOUT_S),
         return_exceptions=True,
     )
 
@@ -516,9 +887,12 @@ async def collect_snapshot() -> dict[str, Any]:
     # The collector swallows its own errors, so anything escaping here is the
     # outer wait_for firing. Route it through the same stale-carry path.
     ch = ch_stale_or_down(ch) if isinstance(ch, BaseException) else ch
+    par_tables = degrade(par_tables)
+    if not par_tables.get("tables"):
+        par_tables.setdefault("tables", [])
 
     src_rows = src.get("row_count") if src.get("up") else None
-    ch_rows = ch.get("rows_final") if ch.get("up") else None
+    ch_rows = ch.get("rows_live") if ch.get("up") else None
     delta = None if src_rows is None or ch_rows is None else ch_rows - src_rows
 
     state.poll_seq += 1
@@ -535,17 +909,24 @@ async def collect_snapshot() -> dict[str, Any]:
             "ddl_column": DDL_COLUMN,
             "ddl_column_type": DDL_COLUMN_TYPE,
             "recent_rows": RECENT_ROWS,
+            "pgbench_clients": PGBENCH_CLIENTS,
+            "pgbench_threads": PGBENCH_THREADS,
         },
         "walshadow": ws,
         "source": src,
         "clickhouse": ch,
+        # `parity` stays the demo.users headline, derived from the same reads
+        # the schema and rows panels use. `parity_tables` is the per-table
+        # breakdown the parity card renders, from its own collector.
         "parity": {
             "source_rows": src_rows,
             "ch_rows": ch_rows,
             "delta": delta,
             "in_sync": delta == 0,
         },
+        "parity_tables": par_tables,
         "action": action_view(),
+        "load": load.view(),
     }
 
 
@@ -600,6 +981,22 @@ pick AS (
 )
 UPDATE {PG_TABLE} u
 SET email = 'touched+' || to_char(clock_timestamp(), 'HH24MISSUS') || '@rerum.novarum'
+WHERE u.id = (SELECT id FROM pick)
+RETURNING u.id, u.email
+"""
+
+# Same dart-throw pick as the update. The DELETE is the interesting half: under
+# REPLICA IDENTITY FULL the old tuple image ships in full, walshadow emits the
+# row with _is_deleted = 1, and the deduplicated count on the parity card drops
+# by one while `row versions landed` goes *up* by one.
+SQL_DELETE_RANDOM = f"""
+WITH bounds AS (SELECT min(id) AS lo, max(id) AS hi FROM {PG_TABLE}),
+pick AS (
+    SELECT u.id FROM {PG_TABLE} u, bounds b
+    WHERE u.id >= b.lo + floor(random() * (b.hi - b.lo + 1))::bigint
+    ORDER BY u.id LIMIT 1
+)
+DELETE FROM {PG_TABLE} u
 WHERE u.id = (SELECT id FROM pick)
 RETURNING u.id, u.email
 """
@@ -682,6 +1079,17 @@ async def do_update_random(action: dict) -> str:
     return f"id={row[0]} -> {row[1]}"
 
 
+async def do_delete_random(action: dict) -> str:
+    assert write_pool is not None
+    async with write_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_DELETE_RANDOM)
+            row = await cur.fetchone()
+    if row is None:
+        return f"{PG_TABLE} is empty — nothing to delete"
+    return f"id={row[0]} ({row[1]}) — tombstone lands with _is_deleted = 1"
+
+
 async def has_ddl_column() -> bool:
     assert read_pool is not None
     async with read_pool.connection() as conn:
@@ -747,15 +1155,27 @@ async def queue_action(kind: str, label: str, factory, progress=None):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client, read_pool, write_pool
+    global http_client, read_pool, write_pool, parity_pool
     http_client = httpx.AsyncClient()
-    # Two pools so a long write can never starve the poll's read.
+    # Three pools so a long write can never starve the poll's read, and the
+    # multi-table parity counts can never starve the demo.users read.
     read_pool = AsyncConnectionPool(
         PG_DSN,
         min_size=1,
         max_size=2,
         open=False,
         kwargs={"options": "-c statement_timeout=3000"},
+    )
+    # Its own connection and a wider statement_timeout: an exact count(*) over
+    # a pgbench_history that has been growing under load for an hour is a
+    # legitimately slower query than anything the demo.users panels run, and
+    # sharing read_pool would mean one timeout for both.
+    parity_pool = AsyncConnectionPool(
+        PG_DSN,
+        min_size=1,
+        max_size=1,
+        open=False,
+        kwargs={"options": "-c statement_timeout=8000"},
     )
     write_pool = AsyncConnectionPool(
         PG_DSN,
@@ -771,13 +1191,23 @@ async def lifespan(app: FastAPI):
     # pools reconnect in the background and the page paints regardless.
     await read_pool.open(wait=False)
     await write_pool.open(wait=False)
+    await parity_pool.open(wait=False)
     poller = asyncio.create_task(poll_loop())
     try:
         yield
     finally:
         poller.cancel()
         await asyncio.gather(poller, return_exceptions=True)
+        # Never leave the hammer swinging after the server goes away: a
+        # `restart ui` would otherwise strand an orphan pgbench inside the
+        # container until the whole container died.
+        if load.running:
+            try:
+                await load.stop()
+            except Exception:  # noqa: BLE001 — shutdown path, nothing to report to
+                pass
         await read_pool.close()
+        await parity_pool.close()
         await write_pool.close()
         await http_client.aclose()
 
@@ -822,6 +1252,11 @@ async def api_update_random():
     return await queue_action("update", "update a random row", do_update_random)
 
 
+@app.post("/api/delete-random")
+async def api_delete_random():
+    return await queue_action("delete", "delete a random row", do_delete_random)
+
+
 @app.post("/api/schema-evolve")
 async def api_schema_evolve():
     try:
@@ -841,6 +1276,29 @@ async def api_schema_evolve():
 @app.post("/api/schema-reset")
 async def api_schema_reset():
     return await queue_action("reset", f"drop column {DDL_COLUMN}", do_schema_reset)
+
+
+@app.post("/api/load/start")
+async def api_load_start(clients: int | None = None, threads: int | None = None):
+    c = PGBENCH_CLIENTS if clients is None else clients
+    t = PGBENCH_THREADS if threads is None else threads
+    if not 1 <= c <= 256 or not 1 <= t <= 64 or t > c:
+        return JSONResponse(
+            {"error": "clients must be 1..256, threads 1..64 and <= clients"},
+            status_code=400,
+        )
+    try:
+        return await load.start(c, t)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+
+
+@app.post("/api/load/stop")
+async def api_load_stop():
+    try:
+        return await load.stop()
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
 
 
 @app.websocket("/ws")

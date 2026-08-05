@@ -117,6 +117,16 @@
 
   .ctrl-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
   .ctrl-row + .ctrl-row { margin-top: 12px; }
+  /* insert · rows · load · schema side by side; stretch so the bordered groups
+     share the tallest one's height (the insert group, with its number input). */
+  .ctrl-row-main { align-items: stretch; }
+  .ctrl-hints {
+    display: flex; flex-direction: column; align-items: flex-start;
+    gap: 3px; margin-top: 10px;
+    /* Holds its line while empty so starting the load doesn't shift the card. */
+    min-height: 14px;
+  }
+  .ctrl-hints .card-sub { text-align: left; }
   .ctrl-group {
     display: flex; align-items: center; gap: 12px; padding: 4px 10px;
     border: 1.5px solid var(--ch-ink); border-radius: 6px;
@@ -225,10 +235,12 @@
     <div class="stage-label"><span class="n">1</span> Drive the source</div>
     <div class="card accent" id="card-controls">
       <div class="card-head">
-        <span class="card-title">Write to PostgreSQL <code id="cfg-pg-table">demo.users</code></span>
         <span class="card-sub" id="controls-sub">every change rides the physical WAL into ClickHouse</span>
       </div>
-      <div class="ctrl-row">
+      <!-- One row, four groups: insert · rows · load · schema. The hints move
+           below the row so the buttons stay side by side instead of each hint
+           pushing its group onto its own line. -->
+      <div class="ctrl-row ctrl-row-main">
         <div class="ctrl-group">
           <span class="ctrl-group-label">Insert</span>
           <div class="rate-control">
@@ -238,60 +250,50 @@
           </div>
           <button class="btn" id="btn-insert">INSERT N ROWS</button>
         </div>
-      </div>
-      <div class="ctrl-row">
+        <div class="ctrl-group">
+          <span class="ctrl-group-label">Rows</span>
+          <button class="btn" id="btn-update">UPDATE RANDOM ROW</button>
+          <button class="btn ghost" id="btn-delete">DELETE RANDOM ROW</button>
+        </div>
+        <div class="ctrl-group">
+          <span class="ctrl-group-label">Load</span>
+          <button class="btn" id="btn-load">START WRITE LOAD</button>
+        </div>
         <div class="ctrl-group">
           <span class="ctrl-group-label">Schema</span>
           <button class="btn" id="btn-evolve">ADD COLUMN signup_ts</button>
           <button class="btn ghost" id="btn-reset">DROP COLUMN</button>
         </div>
-        <span class="card-sub" id="evolve-hint">walshadow replicates the DDL to ClickHouse — no config edit, no restart</span>
+      </div>
+      <!-- Empty until the write load is running: then it carries the live
+           tps / latency / elapsed readout, or the exit code if pgbench dies.
+           No idle caption, no DDL caption — the buttons say what they do. -->
+      <div class="ctrl-hints">
+        <span class="card-sub" id="load-hint"></span>
       </div>
       <div class="action-current" id="action-current">idle</div>
       <ul class="action-log" id="action-log"></ul>
     </div>
   </section>
 
-  <!-- ② pipeline -->
+  <!-- ② rowcount parity -->
   <section class="stage-section">
-    <div class="stage-label"><span class="n">2</span> Pipeline</div>
-    <div class="card">
-      <div class="card-head">
-        <span class="card-title">walshadow /metrics</span>
-        <span class="card-sub" id="pipeline-sub">port 9484 · Prometheus text</span>
-      </div>
-      <div class="kpi-grid">
-        <div class="kpi"><span class="v" id="kpi-lag-seconds">—</span><span class="l">Apply lag · source → shadow</span></div>
-        <div class="kpi"><span class="v" id="kpi-lag-bytes-ch">—</span><span class="l">Bytes behind ClickHouse</span></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ③ rowcount parity -->
-  <section class="stage-section">
-    <div class="stage-label"><span class="n">3</span> Rowcount parity · <span id="cfg-parity-table">demo.users</span></div>
+    <div class="stage-label"><span class="n">2</span> Rowcount parity · every replicated table</div>
     <div class="card" id="card-parity">
       <div class="card-head">
         <span class="card-title">Source vs ClickHouse</span>
-        <span class="card-sub" id="parity-sub">count() FINAL WHERE _is_deleted = 0</span>
+        <span class="card-sub" id="parity-sub">deduplicated rowcount, tombstones excluded</span>
       </div>
-      <div class="kpi-grid">
-        <div class="kpi"><span class="v" id="kpi-src-rows">—</span><span class="l">Source rows</span></div>
-        <div class="kpi"><span class="v" id="kpi-ch-rows">—</span><span class="l">ClickHouse rows · FINAL</span></div>
-        <div class="kpi">
-          <span class="v" id="kpi-delta">—</span>
-          <span class="l">Delta <span class="pill" id="parity-pill" style="display:none"></span></span>
-        </div>
-        <div class="kpi"><span class="v" id="kpi-versions">—</span><span class="l">Row versions landed</span></div>
-        <div class="kpi"><span class="v" id="kpi-staleness">—</span><span class="l">Age of last change</span></div>
-        <div class="kpi"><span class="v" id="kpi-users-sec">—</span><span class="l" id="l-users-sec">demo.users versions /s</span></div>
-      </div>
+      <!-- One row per table: demo.users (the one the buttons drive) plus the
+           four pgbench TPC-B tables the write load hammers. Same numbers that
+           used to be demo.users KPI tiles, now as columns. -->
+      <div class="dtable-wrap"><table class="dtable" id="tbl-parity"></table></div>
     </div>
   </section>
 
-  <!-- ④ schema -->
+  <!-- ③ schema -->
   <section class="stage-section">
-    <div class="stage-label"><span class="n">4</span> Schema</div>
+    <div class="stage-label"><span class="n">3</span> Schema</div>
     <div class="stage-grid">
       <div class="card">
         <div class="card-head">
@@ -310,13 +312,13 @@
     </div>
   </section>
 
-  <!-- ⑤ recent rows -->
+  <!-- ④ recent rows -->
   <section class="stage-section">
-    <div class="stage-label"><span class="n">5</span> Recent rows in ClickHouse</div>
+    <div class="stage-label"><span class="n">4</span> Recent rows in ClickHouse</div>
     <div class="card">
       <div class="card-head">
         <span class="card-title">Newest versions by _lsn</span>
-        <span class="card-sub" id="recent-sub">ORDER BY _lsn DESC — no FINAL, so every CDC version shows</span>
+        <span class="card-sub" id="recent-sub">ORDER BY _lsn DESC — undeduplicated, so every CDC version shows</span>
       </div>
       <div class="dtable-wrap"><table class="dtable" id="tbl-recent"></table></div>
     </div>
@@ -393,6 +395,44 @@ function renderSchemaTable(el, cols, missingMsg) {
   el.innerHTML = html;
 }
 
+// Delta pill for one table. The ClickHouse count is deduplicated, so it should
+// track the source exactly; *above* the source is read skew — the PG and CH
+// counts land milliseconds apart, so a commit between them shows up here — and
+// is never red. Below the source means ClickHouse is behind.
+function deltaPill(t) {
+  if (t.delta == null) {
+    const why = t.ch_missing ? 'NO CH TABLE' : (t.pg_missing ? 'NOT ON SOURCE' : 'NO DATA');
+    return '<span class="pill err">' + why + '</span>';
+  }
+  if (t.delta === 0) return '<span class="pill sync">IN SYNC</span>';
+  if (t.delta < 0) return '<span class="pill behind">' + fmt(-t.delta) + ' BEHIND</span>';
+  return '<span class="pill behind">SETTLING</span>';
+}
+
+function renderParity(el, par) {
+  const rows = par.tables || [];
+  if (!rows.length) {
+    el.innerHTML = '<tr><td class="empty" colspan="99">' +
+      (par.error || 'no replicated tables configured') + '</td></tr>';
+    return;
+  }
+  let html = '<tr><th>Source table</th><th class="trailer">ClickHouse table</th>' +
+    '<th>Source rows</th><th>ClickHouse rows</th><th>Delta</th>' +
+    '<th>Row versions landed</th><th>Age of last change</th></tr>';
+  for (const t of rows) {
+    html += '<tr>' +
+      '<td>' + t.source + '</td>' +
+      '<td class="trailer">' + t.ch + '</td>' +
+      '<td>' + fmt(t.source_rows) + '</td>' +
+      '<td>' + fmt(t.ch_rows) + '</td>' +
+      '<td>' + fmtDelta(t.delta) + ' ' + deltaPill(t) + '</td>' +
+      '<td>' + fmt(t.versions) + '</td>' +
+      '<td>' + fmtMs(t.staleness_ms) + '</td>' +
+      '</tr>';
+  }
+  el.innerHTML = html;
+}
+
 function renderRecent(el, recent, missingMsg) {
   if (!recent || !recent.rows || !recent.rows.length) {
     el.innerHTML = '<tr><td class="empty" colspan="99">' + missingMsg + '</td></tr>';
@@ -454,69 +494,33 @@ function render(snap) {
   }
 
   // ---- static config echoes
-  setText('cfg-pg-table', cfg.pg_table || 'demo.users');
-  setText('cfg-parity-table', cfg.pg_table || 'demo.users');
   setText('cfg-src-schema-table', cfg.pg_table || 'demo.users');
   setText('cfg-ch-schema-table', cfg.ch_table || 'demo.users');
-  setText('l-users-sec', (cfg.ch_table || 'demo.users') + ' versions /s');
   setText('recent-sub', 'SELECT * FROM ' + (cfg.ch_table || 'demo.users') +
-    ' ORDER BY _lsn DESC LIMIT ' + (cfg.recent_rows || 12) + ' — no FINAL');
-  // A stale reading means the ClickHouse poll timed out — usually a merge
-  // burst just after a big insert. Say so rather than letting frozen numbers
-  // read as live ones.
-  setText('parity-sub', ch.stale
-    ? 'ClickHouse read stalled — showing values from ' + fmtMs(ch.stale_ms) + ' ago'
-    : 'count() FROM ' + (cfg.ch_table || 'demo.users') + ' FINAL WHERE _is_deleted = 0' +
-      (src.query_ms != null ? '  ·  pg ' + src.query_ms + 'ms' : ''));
+    ' ORDER BY _lsn DESC LIMIT ' + (cfg.recent_rows || 12) + ' — undeduplicated');
+  // A stale reading means the parity poll timed out — usually a merge burst
+  // just after a big insert. Say so rather than letting frozen numbers read as
+  // live ones.
+  const parT = snap.parity_tables || {};
+  setText('parity-sub', parT.stale
+    ? 'parity read stalled — showing values from ' + fmtMs(parT.stale_ms) + ' ago'
+    : 'deduplicated rowcount per table, tombstones excluded' +
+      (parT.query_ms != null ? '  ·  ' + parT.query_ms + 'ms' : ''));
   if (cfg.max_insert_rows) $('insert-rows').max = cfg.max_insert_rows;
-  if (cfg.ddl_column) {
-    $('btn-evolve').dataset.base = 'ADD COLUMN ' + cfg.ddl_column;
-    setText('evolve-hint', 'ADD COLUMN ' + cfg.ddl_column + ' ' + (cfg.ddl_column_type || '') +
-      ', then set now() on ' + fmt(cfg.ddl_update_rows) + ' rows — walshadow replicates the DDL to ClickHouse');
-  }
+  // The button label is the only place the column name is echoed now.
+  if (cfg.ddl_column) $('btn-evolve').dataset.base = 'ADD COLUMN ' + cfg.ddl_column;
   setText('foot-poll', '1');
 
-  // ---- ② pipeline
+  // ---- header stats. The pipeline section that carried the rest of
+  // /metrics is gone; these two tiles are what's left of it.
   const rates = ws.rates || {};
-  const lagTxt = ws.lag_seconds_unknown ? EM : fmtSecs(ws.lag_seconds);
-  setText('hdr-lag', lagTxt);
-  setText('kpi-lag-seconds', lagTxt);
-  setText('pipeline-sub', ws.up
-    ? ('port 9484 · Prometheus text' + (ws.lag_seconds_unknown ? ' · lag in seconds needs a WAL byte rate' : ''))
-    : (ws.error || 'unreachable'));
-  setText('kpi-lag-bytes-ch', fmtBytes(ws.lag_bytes_ch));
+  setText('hdr-lag', ws.lag_seconds_unknown ? EM : fmtSecs(ws.lag_seconds));
   setText('hdr-rows-sec', fmtSI(rates.emitter_rows_per_sec));
 
-  // ---- ③ parity
-  setText('kpi-src-rows', fmt(par.source_rows));
-  setText('kpi-ch-rows', fmt(par.ch_rows));
-  setText('kpi-delta', fmtDelta(par.delta));
-  setText('kpi-versions', fmt(ch.versions));
-  setText('kpi-staleness', fmtMs(ch.staleness_ms));
-  setText('kpi-users-sec', fmtSI((ch.rates || {}).versions_per_sec));
+  // ---- ② parity, one row per replicated table
+  renderParity($('tbl-parity'), snap.parity_tables || {});
 
-  const pill = $('parity-pill');
-  if (par.delta == null) {
-    pill.style.display = 'inline-flex';
-    pill.className = 'pill err';
-    pill.textContent = ch.table_missing ? 'NO CH TABLE' : 'NO DATA';
-  } else if (par.delta === 0) {
-    pill.style.display = 'inline-flex';
-    pill.className = 'pill sync';
-    pill.textContent = 'IN SYNC';
-  } else if (par.delta < 0) {
-    pill.style.display = 'inline-flex';
-    pill.className = 'pill behind';
-    pill.textContent = fmt(-par.delta) + ' BEHIND';
-  } else {
-    // ClickHouse ahead is read skew — the PG and CH reads land milliseconds
-    // apart, so a commit between them shows up here. Never red.
-    pill.style.display = 'inline-flex';
-    pill.className = 'pill behind';
-    pill.textContent = 'SETTLING';
-  }
-
-  // ---- ④ / ⑤ schema and rows
+  // ---- ③ / ④ schema and rows
   const chMissing = ch.table_missing
     ? (cfg.ch_table || 'demo.users') + ' not created on ClickHouse yet — ch-init may still be running'
     : (ch.error || 'no rows yet');
@@ -550,11 +554,35 @@ function render(snap) {
 
   $('btn-insert').disabled = busy;
   $('btn-update').disabled = busy;
+  $('btn-delete').disabled = busy;
   const evolve = $('btn-evolve');
   const base = evolve.dataset.base || 'ADD COLUMN signup_ts';
   evolve.disabled = busy || !!src.has_signup_ts;
   evolve.textContent = src.has_signup_ts ? ddlColumn.toUpperCase() + ' PRESENT' : base;
   $('btn-reset').disabled = busy || !src.has_signup_ts;
+
+  // ---- ① write load (pgbench). Independent of `busy`: the load is meant to
+  // run underneath the insert / DDL beats, not to take turns with them.
+  const load = snap.load || {};
+  const loadBtn = $('btn-load');
+  loadBtn.textContent = load.running ? 'STOP WRITE LOAD' : 'START WRITE LOAD';
+  loadBtn.classList.toggle('ghost', !!load.running);
+  loadBtn.dataset.running = load.running ? '1' : '';
+  const clients = load.clients ?? cfg.pgbench_clients;
+  const threads = load.threads ?? cfg.pgbench_threads;
+  if (load.running) {
+    const tps = load.tps == null ? 'measuring…' : fmt(Math.round(load.tps)) + ' tps';
+    const lat = load.lat_ms == null ? '' : '  ·  lat ' + load.lat_ms.toFixed(2) + ' ms';
+    setText('load-hint',
+      'pgbench TPC-B  ·  -c ' + clients + ' -j ' + threads + '  ·  ' +
+      tps + lat + '  ·  ' + fmtMs(load.elapsed_ms));
+  } else if (load.last_exit && !load.last_exit.ok) {
+    // A failure is the one thing worth saying while the load is not running.
+    setText('load-hint', 'pgbench exited ' + load.last_exit.code + ' — ' +
+      ((load.log || []).slice(-1)[0] || 'see `docker compose logs ui`'));
+  } else {
+    setText('load-hint', '');
+  }
 }
 
 // ----------------------------------------------------------------- actions
@@ -583,6 +611,16 @@ $('btn-insert').addEventListener('click', () => {
   if (!v || v < 1) { note('enter a row count of 1 or more', true); return; }
   post('/api/insert/' + v);
 });
+$('btn-load').addEventListener('click', () => {
+  const btn = $('btn-load');
+  // The next snapshot (≤1s away) is what re-labels the button; disable it in
+  // the meantime so a double-click can't fire start-then-stop.
+  btn.disabled = true;
+  setTimeout(() => { btn.disabled = false; }, 1200);
+  post(btn.dataset.running ? '/api/load/stop' : '/api/load/start');
+});
+$('btn-update').addEventListener('click', () => post('/api/update-random'));
+$('btn-delete').addEventListener('click', () => post('/api/delete-random'));
 $('btn-evolve').addEventListener('click', () => post('/api/schema-evolve'));
 $('btn-reset').addEventListener('click', () => post('/api/schema-reset'));
 
