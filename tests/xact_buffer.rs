@@ -549,7 +549,7 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
         .await
         .unwrap();
     let lsns: Vec<u64> = seen.iter().map(|c| c.decoded.source_lsn).collect();
-    assert_eq!(lsns, vec![100, 150, 200]);
+    assert_eq!(lsns, [100, 150, 200]);
     // Per-top accounting: one bump, regardless of subxact count.
     assert_eq!(b.stats().committed_xacts_total, 1);
 }

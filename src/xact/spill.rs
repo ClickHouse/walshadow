@@ -1455,7 +1455,7 @@ mod tests {
         assert!(raw.blocks[0].image.is_empty(), "unread image dropped");
         assert_eq!(raw.blocks[0].image_length, 0);
         assert_eq!(raw.blocks[0].fork_flags & 0x10, 0, "HAS_IMAGE cleared");
-        assert_eq!(raw.blocks[0].data, vec![7; 4], "decode input kept");
+        assert_eq!(raw.blocks[0].data, [7; 4], "decode input kept");
         assert_eq!(
             raw.blocks[1].image.len(),
             100,

@@ -293,7 +293,7 @@ async fn nan_and_infinity() {
         .map(str::to_owned)
         .collect()
     };
-    assert_eq!(row(1), vec!["nan", "nan", "NaN"], "NaN row");
+    assert_eq!(row(1), ["nan", "nan", "NaN"], "NaN row");
     assert_eq!(&row(2)[0..2], &["inf", "inf"], "+Inf row");
     assert_eq!(&row(3)[0..2], &["-inf", "-inf"], "-Inf row");
 }
@@ -384,7 +384,7 @@ async fn time_precision() {
         .map(str::to_owned)
         .collect()
     };
-    assert_eq!(row(1), vec!["00:00:00.000000", "08:00:00+00"], "midnight");
+    assert_eq!(row(1), ["00:00:00.000000", "08:00:00+00"], "midnight");
     assert_eq!(
         row(2),
         vec!["12:34:56.123456", "12:34:56.5+05:30"],

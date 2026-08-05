@@ -2222,7 +2222,7 @@ mod tests {
         .unwrap();
         let mut oids = log.present_oids();
         oids.sort_unstable();
-        assert_eq!(oids, vec![88]);
+        assert_eq!(oids, [88]);
         assert_eq!(log.active_present_at(150).len(), 2);
         assert_eq!(log.active_present_at(250).len(), 1);
     }

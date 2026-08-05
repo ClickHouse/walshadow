@@ -167,8 +167,8 @@ async fn arrays_resolve_via_oracle() {
         .map(str::to_owned)
         .collect()
     };
-    assert_eq!(row(1), vec!["{1,2,3}", "{a,b,c}", "{1.5,2.25}"]);
-    assert_eq!(row(2), vec!["{}", "{}", "{}"], "empty arrays");
+    assert_eq!(row(1), ["{1,2,3}", "{a,b,c}", "{1.5,2.25}"]);
+    assert_eq!(row(2), ["{}", "{}", "{}"], "empty arrays");
     assert_eq!(
         row(3),
         vec!["{1,NULL,3}", "{x,NULL}", "<null>"],

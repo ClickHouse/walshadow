@@ -176,8 +176,8 @@ fn write_then_read_back_tuple() {
     let status = child.wait().expect("wait");
     assert!(status.success(), "clickhouse local exit: {status:?}");
 
-    assert_eq!(a_out, vec![10, 20, 30]);
-    assert_eq!(b_out, vec!["x", "yy", "zzz"]);
+    assert_eq!(a_out, [10, 20, 30]);
+    assert_eq!(b_out, ["x", "yy", "zzz"]);
 }
 
 fn string_column(values: &[&str]) -> (Vec<u64>, Vec<u8>) {

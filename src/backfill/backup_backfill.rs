@@ -1619,7 +1619,7 @@ mod tests {
         while let Some(t) = gated_rx.recv().await {
             got.push(t.xid);
         }
-        assert_eq!(got, vec![100, 500]);
+        assert_eq!(got, [100, 500]);
         assert_eq!(stats.emitted, 2);
         assert_eq!(stats.gated, 2);
         assert_eq!(stats.deferred, 2);
@@ -1676,7 +1676,7 @@ mod tests {
         while let Some(t) = gated_rx.recv().await {
             got.push(t.xid);
         }
-        assert_eq!(got, vec![100], "deferred tuple not emitted");
+        assert_eq!(got, [100], "deferred tuple not emitted");
         assert_eq!(stats.emitted, 1);
         assert_eq!(stats.deferred, 1);
         assert_eq!(stats.gated, 1, "discarded deferred counts as gated");

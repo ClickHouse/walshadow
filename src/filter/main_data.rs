@@ -298,7 +298,7 @@ mod tests {
         let r = parse_xl_heap_truncate(&md).expect("parse");
         assert_eq!(r.db_oid, 5);
         assert_eq!(r.flags, XLH_TRUNCATE_CASCADE);
-        assert_eq!(r.relids, vec![16400, 16401, 16402]);
+        assert_eq!(r.relids, [16400, 16401, 16402]);
     }
 
     #[test]

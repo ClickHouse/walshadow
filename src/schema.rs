@@ -247,7 +247,7 @@ mod tests {
         );
         let new = mk_desc(16400, vec![mk_attr(1, "id", 23, true)]);
         let d = compute_schema_diff(&old, &new);
-        assert_eq!(d.dropped_columns, vec![2]);
+        assert_eq!(d.dropped_columns, [2]);
         assert!(d.added_columns.is_empty());
     }
 

@@ -272,7 +272,7 @@ mod tests {
     fn lz4_size_mismatch_short_payload() {
         // payload < BLCKSZ but hole_length=0 => body_len == BLCKSZ, short
         // decompress trips SizeMismatch
-        let short = vec![0u8; 256];
+        let short = [0u8; 256];
         let compressed = lz4::block::compress(&short, None, false).expect("lz4 compress");
         let block = build_block(compressed, BKP_IMAGE_COMPRESS_LZ4, 0, 0);
         assert!(matches!(
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn zstd_size_mismatch_short_payload() {
-        let short = vec![0u8; 256];
+        let short = [0u8; 256];
         let compressed = zstd::bulk::compress(&short, 0).expect("zstd compress");
         let block = build_block(compressed, BKP_IMAGE_COMPRESS_ZSTD, 0, 0);
         assert!(matches!(

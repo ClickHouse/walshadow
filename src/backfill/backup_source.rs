@@ -374,7 +374,7 @@ pub(crate) mod testing {
         append_file(&mut b, "pg_replslot/0/state", b"REPLSLOT", 0o600).await;
         append_file(&mut b, "global/1213", b"global-catalog-bytes", 0o600).await;
         append_file(&mut b, "base/5/1259", b"pg_class-bytes", 0o600).await;
-        append_file(&mut b, "base/5/16400", &vec![0xAB; 8192], 0o600).await;
+        append_file(&mut b, "base/5/16400", &[0xAB; 8192], 0o600).await;
         append_file(&mut b, "pg_control", b"pg-control-bytes", 0o600).await;
         b.finish().await.unwrap();
         let mut out = b.into_inner().await.unwrap();

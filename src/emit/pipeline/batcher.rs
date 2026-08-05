@@ -700,7 +700,7 @@ mod tests {
         reply_rx.await.expect("flush-all ack");
         let batch = batches_rx.recv().await.expect("one batch");
         assert_eq!(batch.n_rows, 1);
-        assert_eq!(batch.per_seq, vec![(0, 1)]);
+        assert_eq!(batch.per_seq, [(0, 1)]);
         drop(msg_tx);
         handle.await.expect("batcher task");
         assert!(fatal.message().is_none());

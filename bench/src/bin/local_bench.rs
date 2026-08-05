@@ -148,7 +148,7 @@ mod tests {
         let mut samples = vec![100.0, 1.0, 50.0, 10.0, 5.0];
         let summary = Summary::from(&mut samples);
 
-        assert_eq!(samples, vec![1.0, 5.0, 10.0, 50.0, 100.0]);
+        assert_eq!(samples, [1.0, 5.0, 10.0, 50.0, 100.0]);
         assert_eq!(summary.n, 5);
         assert_eq!(summary.min, 1.0);
         assert_eq!(summary.p50, 10.0);
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn throughput_reads_completion_off_the_count_curve() {
         // 1000 rows over 1s, destination trailing by ~100 rows, done at 1.1s.
-        let curve = vec![(0.0, 0), (0.5, 400), (1.0, 900), (1.1, 1000), (1.2, 1000)];
+        let curve = [(0.0, 0), (0.5, 400), (1.0, 900), (1.1, 1000), (1.2, 1000)];
         let tput = Throughput::from_curve(&curve, 1000, 1.0, 1000.0);
 
         assert_eq!(tput.dest_rows, 1000);
@@ -176,7 +176,7 @@ mod tests {
     /// be lower bounds presented as measurements.
     #[test]
     fn throughput_withholds_completion_when_rows_are_missing() {
-        let curve = vec![(0.0, 0), (1.0, 600), (2.0, 900)];
+        let curve = [(0.0, 0), (1.0, 600), (2.0, 900)];
         let tput = Throughput::from_curve(&curve, 1000, 1.0, 1000.0);
 
         assert_eq!(tput.all_visible_at, None);
@@ -187,7 +187,7 @@ mod tests {
     /// A destination that was never cleared would read as complete at t=0.
     #[test]
     fn throughput_ignores_a_zero_instant_completion() {
-        let curve = vec![(0.0, 1000)];
+        let curve = [(0.0, 1000)];
 
         assert_eq!(
             Throughput::from_curve(&curve, 1000, 1.0, 1000.0).all_visible_at,
