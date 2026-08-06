@@ -9,8 +9,7 @@
 //! (`Instant`): both the "committed" and the "visible" instants are taken on
 //! the machine running the bench, so there's no cross-host clock skew. Every
 //! sample carries the driver→stack round trip and the insert loop is capped by
-//! it, so the driver belongs beside the stack — for the EC2 harness that is the
-//! in-VPC runner box (`bench/ec2/stack.sh bench run <name>`).
+//! it, so the driver belongs beside the stack.
 //!
 //! Throughput and latency are separate instruments and must stay that way:
 //! [`Destination::count_all`] sampled on a cadence measures throughput, while

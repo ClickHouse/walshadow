@@ -29,8 +29,7 @@ variable "clickhouse" {
   }
 }
 
-# The bench driver runs here, beside the stack — its round trip lands in every
-# latency sample, so a workstation run measures the operator's link instead.
+# The bench driver runs here, beside the stack, so its round trip stays in-VPC
 variable "bench_runner" {
   type    = bool
   default = true

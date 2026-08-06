@@ -292,7 +292,7 @@ when apply advances. Bulk WAL keeps the batching tick: waking per enqueue
 costs more in listener/pump lock traffic than the latency is worth, and
 only a hold needs bytes out early. `poll_interval` stays as the backstop
 that paces the deadline and worker-liveness checks, so a lost wake
-degrades to the old cadence rather than hanging. What remains is shadow's
+degrades to polling rather than hanging. What remains is shadow's
 own replay — sub-millisecond warm, ~10ms for the first catalog record
 after an idle period. Waiter is result-bearing:
 decoder-worker death (`QueueingRecordSink::worker_alive`, channel

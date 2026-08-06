@@ -108,10 +108,8 @@ a read-only hot standby that streams WAL. Re-running takes a fresh base backup.
 ## Benchmark a setup
 
 The bench driver runs on `ec2-bench`, an in-VPC node that comes up with every
-setup. That is not a convenience: the driver's round trip lands in every
-commit→visible sample and caps the insert loop, so a workstation-driven run
-reports the operator's link. From `~250ms` away, `sustained` reached 176 rows/s
-of a 30000 rows/s target and `single-row` read `p50 1.55s` — all link.
+setup. The driver's round trip lands in every commit→visible sample and caps
+the insert loop, so it has to sit next to the stack.
 
 `bench run` does the whole pass on the runner and copies the results into
 `bench/results/<name>/` (gitignored, created on demand; an existing name is

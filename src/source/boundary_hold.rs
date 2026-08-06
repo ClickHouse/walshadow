@@ -139,10 +139,9 @@ impl CatalogBoundaryGate {
                 ));
             }
             self.state.lock().await.request_status();
-            // Shadow's reply wakes this; `poll_interval` is the backstop
-            // that keeps a lost wake — or a walreceiver that never answers
-            // — degrading to the old cadence instead of hanging, and paces
-            // the `worker_alive` / deadline checks above
+            // Shadow's reply wakes this; `poll_interval` is the backstop so a
+            // lost wake — or a walreceiver that never answers — polls instead
+            // of hanging, and paces the `worker_alive` / deadline checks above
             let _ = tokio::time::timeout(self.config.poll_interval, applied.changed()).await;
         }
     }
