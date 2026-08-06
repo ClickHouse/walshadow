@@ -17,10 +17,8 @@
 # (profile copy-off, engine cleanup) → terraform apply → the streamer's
 # deploy.sh. Apply is interactive — review the plan, especially on swaps.
 #
-# The bench driver runs on its own in-VPC node, brought up with every setup: its
-# round trip lands in every latency sample and caps the insert loop, so driving
-# the load from a workstation measures the operator's link instead of the
-# pipeline. `bench run` does the whole pass there and copies results back.
+# The bench driver runs on its own in-VPC node, brought up with every setup.
+# `bench run` does the whole pass there and copies results back.
 #
 # Usage:
 #   ./stack.sh up <setup>       provision base + streamer + bench runner, then deploy

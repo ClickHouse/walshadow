@@ -4,11 +4,8 @@
 //! only difference is that endpoints are resolved from the terraform-written
 //! `state.env` files instead of defaulting to localhost.
 //!
-//! This runs on the in-VPC runner box, not on a workstation: every sample
-//! carries the driver→stack round trip and the insert loop is capped by it, so a
-//! run from outside the region reports the operator's link. `bench/ec2/stack.sh
-//! bench run <name>` is the entry point — it runs the suite on that box and
-//! copies the results back.
+//! `bench/ec2/stack.sh bench run <name>` is the entry point: it runs the suite
+//! on the in-VPC runner box and copies the results back.
 //!
 //! `--network` picks which IP to read:
 //!   * `private` (default) — VPC-internal IPs, as seen from the runner box.

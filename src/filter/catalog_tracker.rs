@@ -41,7 +41,14 @@ const REL_MAP_FILE_SIZE: usize = 4 + 4 + MAX_MAPPINGS * 8 + 4; // magic + n + ma
 /// `pg_class.oid`, fixed PG catalog OID
 pub const PG_CLASS_OID: u32 = 1259;
 /// Catalogs that store statistics, including indexes and toast heaps
-/// Keep `pg_statistic_ext` outside this list because DDL writes its definition
+///
+/// Bootstrap OIDs, declared in PG `src/include/catalog/pg_statistic.h` and
+/// `pg_statistic_ext_data.h`; identical PG 13 through 19. VACUUM FULL moves the
+/// filenodes, tracked per database in `opaque_filenode_by_oid`
+///
+/// Keep `pg_statistic_ext` outside this list because DDL writes its definition.
+/// ANALYZE also rewrites `pg_class.relpages` / `reltuples`, caught instead by
+/// the INPLACE rule since the same heap carries shape
 const OPAQUE_CATALOG_OIDS: &[u32] = &[
     2619, // pg_statistic
     2696, // pg_statistic_relid_att_inh_index

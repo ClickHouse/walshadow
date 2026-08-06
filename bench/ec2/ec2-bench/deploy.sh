@@ -13,11 +13,10 @@ source ./state.env   # PUBLIC_IP, PEM, ...
 source ../lib.sh
 
 IMAGE="${IMAGE:-walshadow-bench:local}"
-REPO_ROOT="$(repo_root)"
 node_ssh_setup
 
 echo "building $IMAGE (from docker/Dockerfile.bench)…"
-docker build -f "$REPO_ROOT/docker/Dockerfile.bench" -t "$IMAGE" "$REPO_ROOT"
+docker build -f "$(repo_root)/docker/Dockerfile.bench" -t "$IMAGE" "$(repo_root)"
 
 wait_cloud_init
 

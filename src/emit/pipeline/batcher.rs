@@ -741,9 +741,8 @@ mod tests {
     }
 
     /// `flush_timeout` is an upper bound, not a ticker period: a row arriving
-    /// mid-period still flushes one timeout later. The old
-    /// `interval(flush_timeout)` scan waited for the next tick at or after the
-    /// deadline, landing anywhere in `[timeout, 2 * timeout)` — 1.4 s here.
+    /// mid-period still flushes one timeout later, not at the next tick at or
+    /// after the deadline (which would land in `[timeout, 2 * timeout)`).
     #[tokio::test(start_paused = true)]
     async fn deadline_bounds_flush_at_one_timeout() {
         let (msg_tx, batches_rx, fatal, handle) =

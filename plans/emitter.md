@@ -174,7 +174,7 @@ the rows' admission/value permits, dropped post-insert-ack):
   `DEFAULT_PIPELINE_FLUSH` — else a cold table's rows pin the
   watermark indefinitely). Batcher sleeps to the nearest armed
   deadline, so `flush_timeout` is an upper bound on partial-block
-  hold time; a `flush_timeout`-period ticker instead put real hold
+  hold time; a `flush_timeout`-period ticker would put real hold
   time in `[flush_timeout, 2 * flush_timeout)`. Rows joining an open
   block do not extend its deadline, and a live `flush_timeout` change
   only affects blocks armed after it
