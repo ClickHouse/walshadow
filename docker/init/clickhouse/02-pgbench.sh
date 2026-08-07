@@ -5,12 +5,24 @@
 # order + synthetic _lsn/_xid/_commit_ts/_is_deleted trailer mirror the
 # emitter's TablePlan; engine ReplacingMergeTree(_lsn, _is_deleted) drops
 # deletes on FINAL. Shapes match tests/pgbench_acceptance.rs.
+#
+# Like the source-side counterpart, runs both as a clickhouse image init
+# hook (fresh volume only, local server) and standalone from the `ch-init`
+# one-shot service over TCP on every `up` — CLICKHOUSE_HOST selects which.
+# Every statement is CREATE IF NOT EXISTS, so re-running is a no-op.
 
 set -euo pipefail
 
 [ -n "${WALSHADOW_DEMO_PGBENCH:-}" ] || exit 0
 
-clickhouse-client -n --query "
+CH_HOST="${CLICKHOUSE_HOST:-localhost}"
+
+for _ in $(seq 60); do
+    clickhouse-client --host "$CH_HOST" --query "SELECT 1" >/dev/null 2>&1 && break
+    sleep 1
+done
+
+clickhouse-client --host "$CH_HOST" -n --query "
 CREATE DATABASE IF NOT EXISTS demo;
 
 CREATE TABLE IF NOT EXISTS demo.pgbench_accounts (
