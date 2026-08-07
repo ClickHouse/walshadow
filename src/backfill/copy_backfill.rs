@@ -495,8 +495,14 @@ struct Inner {
 /// coordinator (live opt-ins) and the boot seed (restart resume /
 /// pre-installed config rows / TOML-pinned loads).
 pub struct CopyBackfiller {
+    /// Boot source endpoint; [`Self::source_pg`] prefers the live one
     pg: PgConfig,
-    emitter: EmitterConfig,
+    /// Boot emitter; [`Self::dest_emitter`] overlays the live CH connection
+    emitter: Arc<EmitterConfig>,
+    /// Last [`Self::dest_emitter`] snapshot, rebuilt only when the destination
+    /// moves. The mapping tables ride along in an `EmitterConfig`, so a
+    /// per-relation rebuild would deep-copy every mapped table.
+    dest: std::sync::Mutex<Arc<EmitterConfig>>,
     mapping: MappingHandle,
     stats: Arc<EmitterStats>,
     /// Shadow catalog for backup passes: toast-rel descriptors by name
@@ -535,6 +541,7 @@ impl CopyBackfiller {
         budget: Option<crate::budget::MemoryBudget>,
     ) -> Self {
         let ledger = Ledger::load(spill_dir).await;
+        let emitter = Arc::new(emitter);
         let pending = AtomicU64::new(ledger.pending_count());
         let pending_by_mode = [
             AtomicU64::new(ledger.pending_count_for(InitialLoadMode::Copy)),
@@ -543,6 +550,7 @@ impl CopyBackfiller {
         ];
         Self {
             pg,
+            dest: std::sync::Mutex::new(emitter.clone()),
             emitter,
             mapping,
             stats,
@@ -575,6 +583,32 @@ impl CopyBackfiller {
             self.pending_by_mode[1].load(Ordering::Relaxed),
             self.pending_by_mode[2].load(Ordering::Relaxed),
         ]
+    }
+
+    /// Source endpoint for a backfill's own PG session. `[source]` is
+    /// live-reloadable, so a pass starting after a move dials the new address;
+    /// an empty live host means no resolver layer supplied one, keep boot's.
+    fn source_pg(&self) -> PgConfig {
+        let live = self.config_rx.as_ref().map(|rx| rx.borrow().source.clone());
+        match live {
+            Some(conn) if !conn.host.is_empty() => conn.to_pg_config(),
+            _ => self.pg.clone(),
+        }
+    }
+
+    /// Boot emitter carrying the live CH connection, shared by every session a
+    /// pass opens. A backfill's own tail and staging session connect eagerly,
+    /// so they take the moved destination at spawn rather than dialling boot's
+    /// address and reconnecting off the watch at the first batch.
+    fn dest_emitter(&self) -> Arc<EmitterConfig> {
+        let mut dest = self.dest.lock().expect("dest emitter poisoned");
+        let Some(rc) = self.config_rx.as_ref().map(|rx| rx.borrow().clone()) else {
+            return dest.clone();
+        };
+        if !rc.dest_conn_eq(&dest) {
+            *dest = Arc::new(rc.overlay_dest(&self.emitter));
+        }
+        dest.clone()
     }
 
     fn refresh_gauges(&self, ledger: &Ledger) {
@@ -777,12 +811,13 @@ impl CopyBackfiller {
         mode: InitialLoadMode,
         reqs: &[BackupRequest],
     ) -> anyhow::Result<PassOutcome> {
-        let staging = backfill_staging::prepare(&self.emitter, &self.mapping, reqs)
+        let dest = self.dest_emitter();
+        let staging = backfill_staging::prepare(dest.clone(), &self.mapping, reqs)
             .await
             .context("staging prepare")?;
         let ctx = PassContext {
-            pg: self.pg.clone(),
-            emitter: self.emitter.clone(),
+            pg: self.source_pg(),
+            emitter: dest,
             mapping: staging.mapping.clone(),
             stats: self.stats.clone(),
             catalog: self.catalog.clone(),
@@ -812,7 +847,7 @@ impl CopyBackfiller {
         if plan.rels.is_empty() {
             return;
         }
-        let mut sess = match StagingSession::connect(&self.emitter).await {
+        let mut sess = match StagingSession::connect(self.dest_emitter()).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(
@@ -942,7 +977,7 @@ impl CopyBackfiller {
             table: target.table,
             s_lsn: rec.s_lsn,
         };
-        let mut sess = StagingSession::connect(&self.emitter).await?;
+        let mut sess = StagingSession::connect(self.dest_emitter()).await?;
         match sess.table_uuid(&rel.database, &rel.staging_table()).await? {
             None => {
                 self.mark_done_entry(name).await;
@@ -1082,7 +1117,7 @@ impl CopyBackfiller {
             quote_ident(&desc.rel_name.namespace),
             quote_ident(&desc.rel_name.name)
         );
-        let client = open_sql_client(&self.pg)
+        let client = open_sql_client(&self.source_pg())
             .await
             .context("backfill: source sql connect")?;
 
@@ -1104,7 +1139,7 @@ impl CopyBackfiller {
         // Dedicated tail: own CH connection, own seq space, own fatal.
         let fatal = Fatal::new();
         let (msg_tx, ack, tail) = tail::spawn_with_config(
-            &self.emitter,
+            &self.dest_emitter(),
             1,
             self.stats.clone(),
             Arc::new(AtomicU64::new(0)),

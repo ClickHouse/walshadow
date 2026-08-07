@@ -41,7 +41,6 @@ use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -52,7 +51,7 @@ use walshadow::boundary_hold::{
     BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
 };
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig};
+use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig, SourceConn};
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::manifest;
 use walshadow::mapping::MappingHandle;
@@ -577,13 +576,6 @@ fn init_tracing(
     provider
 }
 
-fn tget(root: &toml::Table, section: &str, key: &str) -> Option<String> {
-    match root.get(section)?.as_table()?.get(key)? {
-        toml::Value::String(s) => Some(s.clone()),
-        v => Some(v.to_string()),
-    }
-}
-
 /// `[source]` defaults from the CLI args — the base layer under the config file
 /// for connection resolution, shared by the session and the control surface.
 fn cli_source_base(args: &Args) -> toml::Table {
@@ -708,20 +700,11 @@ async fn run_session(
             .with_context(|| format!("load config {}", p.display()))?,
         None => cli_source_base(args),
     };
-    let sslmode = SslMode::parse(&tget(&merged, "source", "sslmode").unwrap_or_default())
-        .context("--sslmode")?;
-    let cfg = PgConfig {
-        host: tget(&merged, "source", "host").unwrap_or_default(),
-        port: tget(&merged, "source", "port")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(args.port),
-        user: tget(&merged, "source", "user").unwrap_or_default(),
-        password: tget(&merged, "source", "password"),
-        database: tget(&merged, "source", "dbname").unwrap_or_default(),
-        application_name: "walshadow".into(),
-        sslmode,
-        tls: TlsParams::resolve(&walrus::config::Vars::default()),
-    };
+    // Applied source endpoint. Boot resolves it file-over-CLI; a later reload
+    // republishes it on the config watch and the pump swaps its feed.
+    let mut source_conn =
+        SourceConn::from_table(&merged).map_err(|e| anyhow::anyhow!("[source] {e}"))?;
+    let mut cfg = source_conn.to_pg_config();
     let mut feed = SourceFeed::connect(&cfg)
         .await
         .context("connect to source PG")?
@@ -1618,9 +1601,8 @@ async fn run_session(
     }
 
     let source_recovery = SourceRecovery {
-        cfg: &cfg,
         slot: source_slot.as_deref(),
-        timeline: ident.timeline,
+        identity: &live_identity,
         status_interval: Duration::from_secs(args.status_interval),
         backup: backup_settings.as_ref(),
         spill_dir: &args.spill_dir,
@@ -1630,7 +1612,7 @@ async fn run_session(
         .await
     {
         feed = source_recovery
-            .recover(e, &mut stream, &mut record_sink, &mut segment_sink)
+            .recover(e, &cfg, &mut stream, &mut record_sink, &mut segment_sink)
             .await
             .context("resume WAL source")?;
     }
@@ -1653,14 +1635,72 @@ async fn run_session(
     let mut last_emitter_ack_observed: u64 = 0;
     let mut inflight_stall_since: Option<Instant> = None;
     let mut inflight_stall_logged = false;
-    // Pump reads `paused` live off the resolver watch; when paused it idles
-    // (stops consuming source WAL) without tearing anything down.
+    // Pump reads `paused` and the source endpoint live off the resolver watch;
+    // when paused it idles (stops consuming source WAL) without tearing
+    // anything down, and a moved `[source]` swaps the feed in place.
     let pump_config_rx = config_resolver.as_ref().map(|r| r.subscribe());
+    let mut source_swap_pending = false;
+    let mut source_swap_retry_at: Option<Instant> = None;
+    let mut source_swaps_total = 0u64;
+    let mut source_swap_failures_total = 0u64;
     let shutdown_reason = loop {
         let paused = pump_config_rx
             .as_ref()
             .map(|rx| rx.borrow().paused)
             .unwrap_or(false);
+        if let Some(rx) = pump_config_rx.as_ref() {
+            let desired = rx.borrow().source.clone();
+            if desired != source_conn {
+                tracing::info!(
+                    target: "walshadow",
+                    from = source_conn.endpoint(),
+                    to = desired.endpoint(),
+                    "source endpoint changed — swapping feed",
+                );
+                source_conn = desired;
+                cfg = source_conn.to_pg_config();
+                source_swap_pending = true;
+                source_swap_retry_at = None;
+            }
+        }
+        // Swap between chunks, so the resume point is the byte-contiguous
+        // `next_lsn` and no WalStream state is rebuilt. Old feed stays up
+        // until the new endpoint proves same cluster and branch: a wrong
+        // address costs a warning, not the stream.
+        if source_swap_pending && source_swap_retry_at.is_none_or(|at| Instant::now() >= at) {
+            match resume_source_feed(
+                &cfg,
+                source_slot.as_deref(),
+                stream.next_lsn(),
+                &live_identity,
+                Duration::from_secs(args.status_interval),
+            )
+            .await
+            {
+                Ok(swapped) => {
+                    feed = swapped;
+                    source_swap_pending = false;
+                    source_swap_retry_at = None;
+                    source_swaps_total += 1;
+                    tracing::info!(
+                        target: "walshadow",
+                        endpoint = source_conn.endpoint(),
+                        resume_lsn = %format_pg_lsn(stream.next_lsn()),
+                        "source feed swapped",
+                    );
+                }
+                Err(e) => {
+                    source_swap_failures_total += 1;
+                    source_swap_retry_at = Some(Instant::now() + SOURCE_SWAP_RETRY);
+                    tracing::warn!(
+                        target: "walshadow",
+                        error = %format!("{e:#}"),
+                        endpoint = source_conn.endpoint(),
+                        "source endpoint swap failed — staying on current feed",
+                    );
+                }
+            }
+        }
         // `durable` (fsynced) lags `dispatched`; advertise it as flush/cursor.
         let dispatched = stream.dispatched_lsn();
         let durable = durable_lsn.load(Ordering::Acquire);
@@ -1744,8 +1784,11 @@ async fn run_session(
                         "source stream error — recovering",
                     );
                     feed = source_recovery
-                        .recover(e, &mut stream, &mut record_sink, &mut segment_sink)
+                        .recover(e, &cfg, &mut stream, &mut record_sink, &mut segment_sink)
                         .await?;
+                    // Recovery dialed the live endpoint, so a queued swap is done
+                    source_swap_pending = false;
+                    source_swap_retry_at = None;
                     let resumed = stream.next_lsn();
                     tracing::info!(
                         target: "walshadow",
@@ -1838,6 +1881,11 @@ async fn run_session(
             oracle_stats,
             bridge_stats,
             start_instant.elapsed().as_secs(),
+            SourceSwapView {
+                swaps: source_swaps_total,
+                failures: source_swap_failures_total,
+                pending: source_swap_pending,
+            },
             ShadowMetricsView {
                 apply_lag_bytes: lag_bytes,
                 apply_lag_seconds: lag_seconds,
@@ -2365,6 +2413,14 @@ struct ShadowMetricsView {
     dropped_total: u64,
 }
 
+/// Live `[source]` endpoint moves, from the pump's swap state.
+struct SourceSwapView {
+    swaps: u64,
+    failures: u64,
+    /// Config names an endpoint the pump has not reached yet
+    pending: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 /// CPU seconds + RSS bytes from `/proc/self`. Linux-only; `(0.0, 0)` if
 /// unreadable. Assumes `CLK_TCK` 100 (USER_HZ) and `VmRSS` in kB.
@@ -2427,6 +2483,7 @@ async fn populate_metrics(
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
     bridge_stats: Option<&walshadow::bridge::BridgeStats>,
     uptime_secs: u64,
+    source_swap: SourceSwapView,
     shadow_view: ShadowMetricsView,
     boundary_hold: &BoundaryHoldStats,
     capture: &walshadow::catalog_capture::CaptureStats,
@@ -2617,6 +2674,9 @@ async fn populate_metrics(
             .map(|s| s.errors.load(Ordering::Relaxed))
             .unwrap_or(0),
         uptime_secs,
+        source_endpoint_swaps_total: source_swap.swaps,
+        source_endpoint_swap_failures_total: source_swap.failures,
+        source_endpoint_swap_pending: u64::from(source_swap.pending),
         shadow_apply_lag_bytes: shadow_view.apply_lag_bytes,
         shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
@@ -2701,12 +2761,12 @@ async fn reconnect_source(
     cfg: &PgConfig,
     slot: Option<&str>,
     resume_lsn: u64,
-    timeline: u32,
+    identity: &manifest::SourceIdentity,
     status_interval: Duration,
 ) -> Result<SourceFeed> {
     use backon::{ExponentialBuilder, Retryable};
 
-    (|| SourceFeed::reconnect(cfg, slot, resume_lsn, timeline, status_interval))
+    (|| resume_source_feed(cfg, slot, resume_lsn, identity, status_interval))
         .retry(
             ExponentialBuilder::default()
                 .with_min_delay(Duration::from_millis(200))
@@ -2720,20 +2780,66 @@ async fn reconnect_source(
         .await
 }
 
+/// Backoff between attempts at a moved `[source]` endpoint. The old feed keeps
+/// streaming meanwhile, so this only paces retries against an endpoint that is
+/// not up yet (repointed before the target accepts connections).
+const SOURCE_SWAP_RETRY: Duration = Duration::from_secs(2);
+
+/// Dial the source and resume at `resume_lsn`, proving the server is the same
+/// cluster on the same branch first: a different `system_id` would replay a
+/// foreign cluster's WAL into these artifacts, and a newer timeline is a
+/// promotion, which needs the fork crossing in plans/future/failover.md.
+/// `[source]` is live-reloadable, so the address reached here can differ from
+/// the one boot dialed and the identity proof is what makes that safe.
+///
+/// Resume is LSN-exact, so `WalStream`, filter, and catalog state stand and no
+/// WAL is re-read.
+async fn resume_source_feed(
+    cfg: &PgConfig,
+    slot: Option<&str>,
+    resume_lsn: u64,
+    identity: &manifest::SourceIdentity,
+    status_interval: Duration,
+) -> Result<SourceFeed> {
+    let mut feed = SourceFeed::connect(cfg)
+        .await
+        .with_context(|| format!("connect source {}:{}", cfg.host, cfg.port))?
+        .with_status_interval(status_interval);
+    let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
+    let system_id: u64 = ident.sysid.parse().context("IDENTIFY_SYSTEM sysid")?;
+    anyhow::ensure!(
+        system_id == identity.system_id,
+        "source is system {system_id}, artifacts belong to {}",
+        identity.system_id,
+    );
+    anyhow::ensure!(
+        ident.timeline == identity.timeline,
+        "source is on timeline {} not {}; crossing a promotion needs failover",
+        ident.timeline,
+        identity.timeline,
+    );
+    feed.start_physical_replication(slot, resume_lsn, ident.timeline)
+        .await
+        .with_context(|| format!("START_REPLICATION at {}", format_pg_lsn(resume_lsn)))?;
+    Ok(feed)
+}
+
 struct SourceRecovery<'a> {
-    cfg: &'a PgConfig,
     slot: Option<&'a str>,
-    timeline: u32,
+    identity: &'a manifest::SourceIdentity,
     status_interval: Duration,
     backup: Option<&'a walrus::config::Settings>,
     spill_dir: &'a Path,
 }
 
 impl SourceRecovery<'_> {
-    /// Try source, replay archive gap, then return to source.
+    /// Try source, replay archive gap, then return to source. `cfg` is the
+    /// live endpoint, passed per call rather than held, so a recovery that
+    /// starts after a `[source]` reload dials the new address.
     async fn recover(
         &self,
         source_error: anyhow::Error,
+        cfg: &PgConfig,
         stream: &mut WalStream,
         record_sink: &mut (dyn RecordSink + Send),
         segment_sink: &mut (dyn walshadow::record::SegmentSink + Send),
@@ -2746,11 +2852,11 @@ impl SourceRecovery<'_> {
         // reaching for the archive. A removed-WAL (58P01) error means the
         // source genuinely can't serve it — skip straight to the archive.
         if !source_missing {
-            match SourceFeed::reconnect(
-                self.cfg,
+            match resume_source_feed(
+                cfg,
                 self.slot,
                 resume_lsn,
-                self.timeline,
+                self.identity,
                 self.status_interval,
             )
             .await
@@ -2777,7 +2883,7 @@ impl SourceRecovery<'_> {
         // backoff, a removed-WAL error surfaces the operator-action message.
         let Some(settings) = self.backup else {
             return self
-                .reconnect_or_operator(resume_lsn, "no [backup] archive configured")
+                .reconnect_or_operator(cfg, resume_lsn, "no [backup] archive configured")
                 .await;
         };
         let storage = match settings.build_storage() {
@@ -2785,6 +2891,7 @@ impl SourceRecovery<'_> {
             Err(archive_error) => {
                 return self
                     .reconnect_or_operator(
+                        cfg,
                         resume_lsn,
                         &format!("build archive storage: {archive_error:#}"),
                     )
@@ -2794,9 +2901,14 @@ impl SourceRecovery<'_> {
         let seg_dir = self.spill_dir.join("resume_wal");
 
         loop {
-            let archive_segment =
-                fetch_archive_segment(settings, &storage, &seg_dir, self.timeline, resume_lsn)
-                    .await;
+            let archive_segment = fetch_archive_segment(
+                settings,
+                &storage,
+                &seg_dir,
+                self.identity.timeline,
+                resume_lsn,
+            )
+            .await;
             let (name, bytes) = match archive_segment {
                 Ok(segment) => segment,
                 Err(archive_error) => {
@@ -2809,6 +2921,7 @@ impl SourceRecovery<'_> {
                     );
                     return self
                         .reconnect_or_operator(
+                            cfg,
                             resume_lsn,
                             &format!("archive fallback failed: {archive_error:#}"),
                         )
@@ -2831,14 +2944,15 @@ impl SourceRecovery<'_> {
 
     async fn reconnect_or_operator(
         &self,
+        cfg: &PgConfig,
         resume_lsn: u64,
         archive_error: &str,
     ) -> Result<SourceFeed> {
         reconnect_source(
-            self.cfg,
+            cfg,
             self.slot,
             resume_lsn,
-            self.timeline,
+            self.identity,
             self.status_interval,
         )
         .await

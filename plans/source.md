@@ -55,7 +55,10 @@ permanent physical slot, pins source's `pg_wal/`; None = slotless, source
 recycles on `wal_keep_size` schedule. Slot caps catch-up, slotless caps
 source disk burn. Slot name comes from config (`[source] slot` →
 `EmitterConfig.source_slot`), with a `--slot` CLI override applied at parse
-time (CLI > TOML, boot-only — same idiom as `--ch-flush-timeout-ms`).
+time (CLI > TOML, boot-only — same idiom as `--ch-flush-timeout-ms`). Slot
+name stays boot-only even though the rest of `[source]` reloads live: creating
+a slot on a newly-named endpoint reserves WAL at that server's head, which
+proves nothing about coverage of the resume floor.
 `SourceFeed::ensure_physical_slot(name)` creates it idempotently with
 immediate WAL reservation (`pg_create_physical_replication_slot(name,
 true)`), run before pre-flight (which requires the slot to exist). A
@@ -64,12 +67,17 @@ pump caps `flush_lsn` at `apply_ceiling = min(shadow_replay, emitter_ack)`
 (see [ops.md](ops.md)): the source retains WAL until CH has durably
 ingested it, not merely until walshadow fsynced its filter output.
 
-`SourceFeed::reconnect(cfg, slot, resume_lsn, timeline, interval)`
+`resume_source_feed(cfg, slot, resume_lsn, identity, interval)`
 re-establishes a dropped replication connection (e.g. source
 `wal_sender_timeout` fired during a CH-stall backpressure) and resumes at
 `resume_lsn = stream.next_lsn()` — the byte-contiguous resume point, never
 `dispatched_lsn` (which lags by any buffered in-progress record →
-misaligned push). `reconnect` is one attempt; the caller (`SourceRecovery::recover`) is
+misaligned push). `IDENTIFY_SYSTEM` must match the manifest's `system_id` and
+timeline first: `cfg` is the live `[source]` endpoint
+([control.md](control.md) §Source endpoint move), so the address reached can
+differ from the one boot dialed and the identity proof is what keeps a
+mistyped host from replaying a foreign cluster's WAL into these artifacts.
+One attempt; the caller (`SourceRecovery::recover`) is
 source-first: a plain (transient) drop retries the source once at
 `stream.next_lsn()` before touching the archive, and a recycled-segment error
 skips straight to the archive. Archive segments then replay through the same

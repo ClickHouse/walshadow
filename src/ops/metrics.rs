@@ -161,6 +161,12 @@ pub struct MetricsSnapshot {
     pub bridge_decode_items_total: u64,
     pub bridge_decode_item_errors_total: u64,
     pub uptime_secs: u64,
+    /// Feeds swapped onto a reloaded `[source]` endpoint
+    pub source_endpoint_swaps_total: u64,
+    /// Swap attempts refused or unreachable (identity proof, connect, START)
+    pub source_endpoint_swap_failures_total: u64,
+    /// 1 while config names an endpoint the pump has not reached yet
+    pub source_endpoint_swap_pending: u64,
     /// `source_received_lsn - min_apply_lsn` across active shadow walreceivers.
     /// Caller saturates to 0 when shadow is ahead; passes `source_received_lsn`
     /// when none connected (disconnect = max lag)
@@ -724,6 +730,24 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "Seconds since the daemon began its status loop.",
             "counter",
             snap.uptime_secs,
+        ),
+        (
+            "walshadow_source_endpoint_swaps_total",
+            "Source feeds swapped onto a reloaded [source] endpoint.",
+            "counter",
+            snap.source_endpoint_swaps_total,
+        ),
+        (
+            "walshadow_source_endpoint_swap_failures_total",
+            "Endpoint swap attempts refused or unreachable (identity proof, connect, START_REPLICATION).",
+            "counter",
+            snap.source_endpoint_swap_failures_total,
+        ),
+        (
+            "walshadow_source_endpoint_swap_pending",
+            "1 while config names a source endpoint the pump has not reached yet.",
+            "gauge",
+            snap.source_endpoint_swap_pending,
         ),
         (
             "walshadow_shadow_apply_lag_bytes",

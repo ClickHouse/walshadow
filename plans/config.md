@@ -41,8 +41,17 @@ untouched.
 - `compression` — per-INSERT wire codec, read live by the inserter, which
   rebuilds its codec + reconnects on change
 - `retry_max_attempts` — CH client retry budget, read live by the inserter
+- `host` / `port` / `database` / `user` / `password` / `secure` — CH
+  connection; the inserter pool and `DdlApplicator` compare the conn tuple off
+  the watch and reconnect at a batch / apply boundary
+- `source` — source PG connection (`[source]` host/port/user/password/dbname/
+  sslmode as a `SourceConn`), TOML+CLI only: the overlay rows travel over the
+  very stream this connection carries, so a source row can't move the source.
+  The pump diffs it off the watch and swaps its `SourceFeed` between chunks
+  after proving `system_id` and timeline; backfills opened later COPY from the
+  new address ([control.md](control.md) §Source endpoint move)
 
-The last five live on `ResolvedConfig` rather than boot-only on
+The last five emitter knobs live on `ResolvedConfig` rather than boot-only on
 [`EmitterConfig`](../src/ch_emitter.rs) so a `config_global` row can retune
 batching / compression / retry mid-stream. The pipeline spawns from
 `EmitterConfig`, so `bin/stream.rs` reconciles these five back onto the boot
@@ -50,20 +59,21 @@ batching / compression / retry mid-stream. The pipeline spawns from
 matches steady state.
 
 Bootstrap fixed points stay on `EmitterConfig`, boot-only, never republished:
-connection params (`[ch] host/port/user/password/database/secure`), toast store,
-`soft_delete`, pending capture cost controls (`[stream]
+toast store, `soft_delete`, pending capture cost controls (`[stream]
 pending_max_boundaries_per_xact`, `pending_max_hold_ms`;
 [desc_log.md](desc_log.md) Pending capture), `[memory]
 resident_payload_max` / `inline_value_max` (resident
 budget pool + leaf reserve sized at pipeline spawn — [emitter.md](emitter.md)
-Memory budget; `spill.dir` stays the `--spill-dir` CLI arg), and the source
+Memory budget; `spill.dir` stays the `--spill-dir` CLI arg), the source
 physical replication slot (`[source] slot` →
 `source_slot`, with a `--slot` CLI override applied at parse time à la
 `--ch-flush-timeout-ms`; created idempotently before pre-flight, streamed
 from, and resumed against on reconnect — see [source.md](source.md)), and the
-backup archive (`[backup]` → `EmitterConfig.backup`, see below). These describe
-how to reach CH/source or wire into pipeline stages at spawn; a live swap would
-mean reconnecting or rebuilding the pipeline.
+backup archive (`[backup]` → `EmitterConfig.backup`, see below). These wire
+into pipeline stages at spawn, or would reserve WAL at a position that proves
+nothing about the resume floor: a slot created on a moved endpoint reserves at
+that server's head, so the slot name is deliberately not part of the live
+endpoint.
 `target_database` and `soft_delete` thread into the DDL applicator at
 construction and carry across refreshes unchanged.
 

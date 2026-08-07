@@ -20,7 +20,9 @@ pub struct BackupRequest {
 
 pub struct PassContext {
     pub pg: PgConfig,
-    pub emitter: EmitterConfig,
+    /// Shared with the pass's staging session, so both hold one copy of the
+    /// mapping tables
+    pub emitter: Arc<EmitterConfig>,
     pub mapping: MappingHandle,
     pub stats: Arc<EmitterStats>,
     pub catalog: Arc<Mutex<ShadowCatalog>>,

@@ -160,6 +160,9 @@ pub struct EmitterConfig {
     /// overlay tables. `None` (field empty or omitted) disables the whole
     /// overlay subsystem — no boot seed, no config_decoder, pure TOML+CLI.
     pub runtime_config_schema: Option<String>,
+    /// `[source]` connection minus the slot. Live via reload: the pump swaps
+    /// its feed onto a moved endpoint, backfills COPY from the new one.
+    pub source: crate::config::SourceConn,
     /// `[source] slot`: physical replication slot to create + stream from on
     /// the source. `Some` reserves WAL so a stalled/disconnected consumer
     /// resumes without recycling; `None` runs slotless. Boot-only.
@@ -234,6 +237,7 @@ impl Default for EmitterConfig {
             drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
             plan_disk_max: DEFAULT_PLAN_DISK_MAX,
             runtime_config_schema: None,
+            source: crate::config::SourceConn::default(),
             source_slot: None,
             resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
             inline_value_max: DEFAULT_INLINE_VALUE_MAX,
@@ -541,6 +545,7 @@ impl EmitterConfig {
                     Duration::from_millis(u64::try_from(v).unwrap_or(0));
             }
         }
+        out.source = crate::config::SourceConn::from_table(root).map_err(EmitterError::Config)?;
         if let Some(src) = root.get("source").and_then(Value::as_table)
             && let Some(slot) = src.get("slot").and_then(Value::as_str)
             && !slot.is_empty()

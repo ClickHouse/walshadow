@@ -32,6 +32,9 @@ struct Harness {
     frag_path: PathBuf,
     metrics_addr: SocketAddr,
     stderr_path: PathBuf,
+    /// Second socket dir the same source cluster also listens on, so a test
+    /// can move `[source] host` to a live endpoint of the same cluster
+    source_sock_alt: PathBuf,
     shadow_data: PathBuf,
     shadow_sock: PathBuf,
     shadow_filter_dir: PathBuf,
@@ -60,6 +63,21 @@ impl Harness {
         source.initdb().context("initdb source")?;
         source.write_base_conf().context("source base conf")?;
         fx::append_source_conf(&source).context("append source conf")?;
+        // Same cluster, two socket dirs: the endpoint-move drill repoints
+        // `[source] host` at the second one. Last setting in the file wins.
+        let source_sock_alt = tmp.path().join("source-sock-alt");
+        fs::create_dir_all(&source_sock_alt).unwrap();
+        {
+            use std::io::Write as _;
+            let conf = source.config().data_dir.join("postgresql.conf");
+            let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
+            writeln!(
+                f,
+                "unix_socket_directories = '{}, {}'",
+                source.config().socket_dir.display(),
+                source_sock_alt.display(),
+            )?;
+        }
         source.start().context("start source")?;
 
         source
@@ -191,6 +209,7 @@ impl Harness {
             frag_path,
             metrics_addr,
             stderr_path,
+            source_sock_alt,
             shadow_data,
             shadow_sock,
             shadow_filter_dir,
@@ -270,6 +289,12 @@ impl Harness {
             bail!("kill -HUP {pid} failed");
         }
         Ok(())
+    }
+
+    /// One counter/gauge off the daemon's `/metrics`; 0 when absent.
+    fn metric(&self, name: &str) -> Result<u64> {
+        let body = fx::http_get(self.metrics_addr, "/metrics").context("metrics scrape")?;
+        Ok(fx::parse_metric(&body, name).unwrap_or(0))
     }
 
     fn psql(&self, sql: &str) -> Result<String> {
@@ -544,6 +569,91 @@ async fn apply_preserves_previously_pinned_table() {
             .context("selecting an unrelated table opted demo.users out")?;
 
         assert!(h.alive(), "daemon exited");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// Source endpoint moves while paused, the way a switchover repoints an HA
+/// address: pause, `apply [source] host`, resume. The pump swaps its feed
+/// onto the new address of the same cluster and continues at the same LSN —
+/// no restart, no re-bootstrap, no gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_move_source_endpoint_resume_no_restart() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+
+    let result = async {
+        h.psql("UPDATE demo.users SET email = 'before-move@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "before-move@x", Duration::from_secs(15))
+            .await?;
+        let uptime_before: u64 = h.status_field("uptime_secs")?.parse().unwrap_or(0);
+
+        h.ctl_body(&["apply"], "[stream]\npaused = true")?;
+        assert_eq!(h.status_field("paused")?, "true");
+        // Past the idle tick so the write below cannot race the pause
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        h.psql("UPDATE demo.users SET email = 'while-moved@x' WHERE id = 1")?;
+
+        // Boot's endpoint must round-trip through the resolver unchanged, or
+        // every reload would redial the feed for nothing
+        assert_eq!(
+            h.metric("walshadow_source_endpoint_swaps_total")?,
+            0,
+            "feed swapped before any [source] change",
+        );
+
+        let alt = h.source_sock_alt.to_str().unwrap().to_string();
+        h.ctl_body(&["apply"], &format!("[source]\nhost = \"{alt}\""))?;
+        // Only the API fragment carries the move
+        let frag = fs::read_to_string(&h.frag_path).context("read fragment")?;
+        assert!(frag.contains(&alt), "fragment: {frag}");
+
+        let swapped = async {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if h.metric("walshadow_source_endpoint_swaps_total")? > 0 {
+                    return Ok(true);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Ok::<bool, anyhow::Error>(false)
+        }
+        .await?;
+        assert!(swapped, "pump never swapped onto the moved endpoint");
+        assert_eq!(
+            h.metric("walshadow_source_endpoint_swap_pending")?,
+            0,
+            "swap still pending after the feed moved",
+        );
+
+        // Resume: the frozen write drains over the new endpoint
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        h.wait_ch(USER_EMAIL, "while-moved@x", Duration::from_secs(30))
+            .await
+            .context("backlog did not drain after the endpoint move")?;
+
+        // And the stream keeps flowing from the moved address
+        h.psql("UPDATE demo.users SET email = 'after-move@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-move@x", Duration::from_secs(15))
+            .await
+            .context("post-move write did not reach CH")?;
+
+        let uptime_after: u64 = h.status_field("uptime_secs")?.parse().unwrap_or(0);
+        assert!(
+            uptime_after >= uptime_before,
+            "uptime went backwards ({uptime_before} → {uptime_after}) — daemon restarted",
+        );
+        assert!(h.alive(), "daemon exited during the endpoint move");
         Ok::<(), anyhow::Error>(())
     }
     .await;
