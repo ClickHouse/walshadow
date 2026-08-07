@@ -350,19 +350,32 @@ impl DescriptorLog {
     /// tail. Creates an empty tail (header only) when absent. Never creates
     /// the ckpt — [`Self::seed`] and GC own it.
     pub async fn open(dir: &Path, identity: DescLogIdentity) -> Result<Self> {
+        Self::open_on_branch(dir, identity, &[]).await
+    }
+
+    /// [`open`](Self::open) with the branches a stored header may name: every
+    /// timeline the live chain places between the log's origin and
+    /// `identity.timeline`. A crossing moves the resume branch without moving
+    /// the log, so the header lags until the next GC rewrites it.
+    pub async fn open_on_branch(
+        dir: &Path,
+        identity: DescLogIdentity,
+        lineage: &[u32],
+    ) -> Result<Self> {
         let mut index = Index::default();
         let ckpt_path = dir.join(CKPT_FILE);
         if let Ok(bytes) = tokio::fs::read(&ckpt_path).await {
             // write_atomic guarantees complete-or-absent: any parse failure
             // here is corruption, never a torn write
-            load_frames(&bytes, CKPT_FILE, &identity, &mut index, false)?;
+            load_frames(&bytes, CKPT_FILE, &identity, lineage, &mut index, false)?;
         }
 
         let tail_path = dir.join(TAIL_FILE);
         let header = encode_header(&identity);
         let (tail, tail_len) = match tokio::fs::read(&tail_path).await {
             Ok(bytes) => {
-                let good_len = load_frames(&bytes, TAIL_FILE, &identity, &mut index, true)?;
+                let good_len =
+                    load_frames(&bytes, TAIL_FILE, &identity, lineage, &mut index, true)?;
                 let mut f = OpenOptions::new().write(true).open(&tail_path).await?;
                 if good_len < bytes.len() as u64 {
                     f.set_len(good_len).await?;
@@ -1213,6 +1226,7 @@ fn load_frames(
     bytes: &[u8],
     file: &'static str,
     identity: &DescLogIdentity,
+    lineage: &[u32],
     index: &mut Index,
     repairable: bool,
 ) -> Result<u64> {
@@ -1229,7 +1243,7 @@ fn load_frames(
     if version != VERSION {
         return Err(DescLogError::Version(version));
     }
-    check_identity(&mut cur, identity)?;
+    check_identity(&mut cur, identity, lineage)?;
     let mut good = cur.pos as u64;
     loop {
         let frame_start = cur.pos;
@@ -1319,7 +1333,7 @@ fn load_frames(
     Ok(good)
 }
 
-fn check_identity(cur: &mut Cur<'_>, ours: &DescLogIdentity) -> Result<()> {
+fn check_identity(cur: &mut Cur<'_>, ours: &DescLogIdentity, lineage: &[u32]) -> Result<()> {
     let log = DescLogIdentity {
         pg_major: cur.u32()?,
         system_id: cur.string()?,
@@ -1340,7 +1354,12 @@ fn check_identity(cur: &mut Cur<'_>, ours: &DescLogIdentity) -> Result<()> {
     if log.system_id != ours.system_id {
         return mismatch("system_id", log.system_id, ours.system_id.clone());
     }
-    if log.timeline != ours.timeline {
+    // Branch, not identity: a crossing moves the resume branch while the log
+    // stays where it is, so a header naming an ancestor the live chain places
+    // is this cluster's log. Number equality alone is both too strict (refuses
+    // that log) and too weak (two standbys promoted independently are both
+    // timeline 2), which is why the chain — switchpoints and all — decides
+    if log.timeline != ours.timeline && !lineage.contains(&log.timeline) {
         return mismatch(
             "timeline",
             log.timeline.to_string(),
@@ -1925,6 +1944,52 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let err = DescriptorLog::open(tmp.path(), ident()).await.unwrap_err();
         assert!(matches!(err, DescLogError::Version(9)));
+    }
+
+    /// A crossing moves the resume branch and leaves the log where it is, so a
+    /// header naming an ancestor the chain places is this cluster's log. A
+    /// branch the chain cannot place stays foreign — two standbys promoted
+    /// independently share a timeline number
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_header_on_an_ancestor_branch_opens_when_the_chain_places_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let log = open(tmp.path()).await;
+            log.append_batch(batch(100, vec![])).await.unwrap();
+        }
+        let crossed = DescLogIdentity {
+            timeline: ident().timeline + 1,
+            ..ident()
+        };
+        let err = DescriptorLog::open(tmp.path(), crossed.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DescLogError::ForeignLog {
+                    field: "timeline",
+                    ..
+                }
+            ),
+            "without a chain the number alone must refuse: {err:?}",
+        );
+        DescriptorLog::open_on_branch(tmp.path(), crossed.clone(), &[ident().timeline])
+            .await
+            .expect("chain places the log's own branch below the resume branch");
+        let err = DescriptorLog::open_on_branch(tmp.path(), crossed, &[99])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DescLogError::ForeignLog {
+                    field: "timeline",
+                    ..
+                }
+            ),
+            "a chain that never names the log's branch must refuse: {err:?}",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

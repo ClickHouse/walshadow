@@ -87,13 +87,38 @@ impl<'de> Deserialize<'de> for Lsn {
     }
 }
 
-/// IDENTIFY_SYSTEM identity. Gates every nonvolatile spill-dir artifact:
-/// reusing a spill dir against a different cluster must not load foreign
-/// resume LSNs, retire oids, or backfill state.
+/// Artifact ownership plus the branch the floor sits on. The system identifier
+/// gates every nonvolatile spill-dir artifact: reusing a spill dir against a
+/// different cluster must not load foreign resume LSNs, retire oids, or
+/// backfill state. Timeline is the selected branch through those artifacts, so
+/// it moves with the floor rather than with the source's live head.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceIdentity {
     pub system_id: u64,
+    /// Branch owning [`Manifest::floor`]. Restart requests this timeline at
+    /// that LSN even when the source reports a newer one; it advances only once
+    /// the floor crosses the corresponding fork.
     pub timeline: u32,
+    /// Where that branch begins, which is its ancestor's switchpoint (`0` on
+    /// the oldest one). A timeline number is not unique across branches — two
+    /// standbys of one primary, promoted independently, are both timeline 2 —
+    /// so the number alone lets a sibling pass the lineage gate. The
+    /// switchpoint is what separates them, and only a stored one carries the
+    /// chain a run proved forward to the next boot.
+    ///
+    /// `0` above timeline 1 reads as unrecorded rather than as a switchpoint:
+    /// a live identity off `IDENTIFY_SYSTEM` has parsed no history to place
+    /// itself with, and an on-disk manifest may carry no switchpoint at all.
+    #[serde(default)]
+    pub timeline_begin: Lsn,
+}
+
+/// Branch the pump is reading, which runs ahead of
+/// [`SourceIdentity::timeline`] between a fork and the floor crossing it.
+/// Diagnostic: resume reads the floor's timeline, never this.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalBranch {
+    pub stream_timeline: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +140,10 @@ pub struct Manifest {
     /// archive-clamped at write time via [`resolved_floor`].
     pub floor: Lsn,
     pub source: SourceIdentity,
+    /// Absent in manifests written before timeline crossing landed; those runs
+    /// never left the floor's branch, so the floor timeline is also the stream's
+    #[serde(default)]
+    pub wal: WalBranch,
     pub lsn: LsnSet,
 }
 
@@ -129,10 +158,10 @@ pub enum ManifestError {
     #[error("unsupported manifest schema version {0} (this build expects {MANIFEST_VERSION})")]
     Version(u32),
     #[error(
-        "spill dir belongs to another source: stored system_id={} timeline={}, \
-         live system_id={} timeline={}; wipe the spill dir for a new source, \
+        "spill dir belongs to another source: stored system_id={}, \
+         live system_id={}; wipe the spill dir for a new source, \
          or point --spill-dir at the old one",
-        stored.system_id, stored.timeline, live.system_id, live.timeline
+        stored.system_id, live.system_id
     )]
     ForeignSource {
         stored: SourceIdentity,
@@ -222,9 +251,12 @@ pub fn retention_cutoff(shadow_replay: u64, retention_bytes: u64, redo: Option<u
         .min(redo.unwrap_or(u64::MAX))
 }
 
-/// `Ok(None)` for greenfield (no manifest). `Err(ForeignSource)` when
-/// the stored identity differs from `live` — caller decides fatality
-/// (`--ignore-cursor` may adopt a timeline-only change).
+/// `Ok(None)` for greenfield (no manifest). `Err(ForeignSource)` when the
+/// stored system identifier differs from `live`, which is always fatal.
+///
+/// Timeline is deliberately not gated here: a newer live timeline is a
+/// promotion, and whether the stored branch is an ancestor of it is a question
+/// for the source's timeline history, not for string equality.
 pub async fn load(
     spill_dir: &Path,
     live: &SourceIdentity,
@@ -235,7 +267,7 @@ pub async fn load(
             if m.version != MANIFEST_VERSION {
                 return Err(ManifestError::Version(m.version));
             }
-            if m.source != *live {
+            if m.source.system_id != live.system_id {
                 return Err(ManifestError::ForeignSource {
                     stored: m.source,
                     live: live.clone(),
@@ -267,6 +299,7 @@ mod tests {
         SourceIdentity {
             system_id: 7_334_001_234_567_890_123,
             timeline: 1,
+            timeline_begin: Lsn(0),
         }
     }
 
@@ -275,6 +308,7 @@ mod tests {
             version: MANIFEST_VERSION,
             floor: Lsn(0x0123_4564_0000_0000 & !(SEG - 1)),
             source: ident(),
+            wal: WalBranch { stream_timeline: 2 },
             lsn: LsnSet {
                 source_received: Lsn(0x0123_4567_89AB_CDEF),
                 filter_durable: Lsn(0x0123_4567_0000_0000),
@@ -324,10 +358,53 @@ mod tests {
         write(tmp.path(), &sample()).await.unwrap();
         let live = SourceIdentity {
             system_id: 42,
-            timeline: 1,
+            ..ident()
         };
         let err = load(tmp.path(), &live).await.unwrap_err();
         assert!(matches!(err, ManifestError::ForeignSource { .. }));
+    }
+
+    /// A promoted source reports a newer timeline; lineage is proved against
+    /// its history, so the load itself must not refuse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_accepts_a_newer_live_timeline() {
+        let tmp = tempdir().unwrap();
+        write(tmp.path(), &sample()).await.unwrap();
+        let live = SourceIdentity {
+            timeline: 5,
+            ..ident()
+        };
+        let got = load(tmp.path(), &live).await.unwrap().expect("manifest");
+        assert_eq!(got.source.timeline, 1, "floor stays on its own branch");
+    }
+
+    /// A manifest written before the sibling check carries no switchpoint for
+    /// its branch. Zero reads as unrecorded, which is also the truth on the
+    /// oldest branch.
+    #[test]
+    fn timeline_begin_defaults_when_absent() {
+        let text = toml::to_string(&sample()).unwrap();
+        let without = text
+            .lines()
+            .filter(|l| !l.starts_with("timeline_begin"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let got: Manifest = toml::from_str(&without).expect("parse without timeline_begin");
+        assert_eq!(got.source.timeline_begin, Lsn(0));
+    }
+
+    /// Manifests predating the crossing carry no `[wal]`; the floor timeline
+    /// stands alone.
+    #[test]
+    fn stream_timeline_defaults_when_absent() {
+        let text = toml::to_string(&sample()).unwrap();
+        let without = text
+            .lines()
+            .filter(|l| !l.starts_with("[wal]") && !l.starts_with("stream_timeline"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let got: Manifest = toml::from_str(&without).expect("parse without [wal]");
+        assert_eq!(got.wal.stream_timeline, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

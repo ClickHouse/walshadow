@@ -20,7 +20,7 @@ pub struct BackupRequest {
 
 pub struct PassContext {
     pub pg: PgConfig,
-    pub emitter: EmitterConfig,
+    pub emitter: Arc<EmitterConfig>,
     pub mapping: MappingHandle,
     pub stats: Arc<EmitterStats>,
     pub catalog: Arc<Mutex<ShadowCatalog>>,

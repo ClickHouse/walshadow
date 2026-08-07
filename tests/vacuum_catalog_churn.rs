@@ -22,7 +22,7 @@ use walshadow::schema::FIRST_NORMAL_OBJECT_ID;
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_stream::ShadowStreamSink;
-use walshadow::source_feed::{SourceFeed, StandbyStatus};
+use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
 
 fn pg_available() -> bool {
@@ -307,12 +307,12 @@ async fn pump_phase<S: RecordSink + Drained + Send>(
     while sink.max_next_lsn() < target && Instant::now() < deadline {
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            feed.next_chunk(StandbyStatus::collapsed(stream.dispatched_lsn()), buf),
+            feed.next_event(StandbyStatus::collapsed(stream.dispatched_lsn()), buf),
         )
         .await;
         let chunk = match next {
-            Ok(Ok(Some(c))) => c,
-            Ok(Ok(None)) => break,
+            Ok(Ok(SourceEvent::Wal(c))) => c,
+            Ok(Ok(_)) => break, // timeline end or source shutdown
             Ok(Err(e)) => panic!("source feed: {e:#}"),
             Err(_) => continue,
         };

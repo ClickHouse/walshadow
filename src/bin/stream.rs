@@ -46,7 +46,6 @@ use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -59,7 +58,7 @@ use walshadow::boundary_hold::{
 use walshadow::ch_emitter::{
     DEFAULT_DECODER_POOL, DEFAULT_INSERTER_POOL, EmitterConfig, EmitterStats,
 };
-use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig, cli_over_toml};
+use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig, SourceConn, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::manifest;
 use walshadow::mapping::MappingHandle;
@@ -78,8 +77,13 @@ use walshadow::schema::{RelName, SchemaEvent};
 use walshadow::segment_sink::{DirSegmentSink, SegFsync};
 use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, with_transient_retry};
-use walshadow::source_feed::{SourceFeed, StandbyStatus};
+use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
+use walshadow::timeline::TimelineHistory;
 use walshadow::toast::ToastResolver;
+use walshadow::transition::{
+    CrossingState, CrossingWedge, ForkGuards, Switchover, TimelineStats, TransitionError,
+    load_boot_history, seed_shadow_branches,
+};
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
@@ -299,7 +303,8 @@ struct Args {
     #[arg(long)]
     out_dir: PathBuf,
     /// CLI override for the TOML's `[source] slot` (physical replication
-    /// slot). Unset defers to config; unset in both = slotless.
+    /// slot). Unset defers to config, which reloads live; set pins the name
+    /// for this process. Unset in both = slotless.
     #[arg(long)]
     slot: Option<String>,
     /// Start LSN in `X/Y` hex form. Defaults to source's current
@@ -657,13 +662,6 @@ fn init_tracing(
     provider
 }
 
-fn tget(root: &toml::Table, section: &str, key: &str) -> Option<String> {
-    match root.get(section)?.as_table()?.get(key)? {
-        toml::Value::String(s) => Some(s.clone()),
-        v => Some(v.to_string()),
-    }
-}
-
 /// `[source]` defaults from the CLI args — the base layer under the config file
 /// for connection resolution, shared by the session and the control surface.
 fn cli_source_base(args: &Args) -> toml::Table {
@@ -788,24 +786,15 @@ async fn run_session(
             .with_context(|| format!("load config {}", p.display()))?,
         None => cli_source_base(args),
     };
-    let sslmode = SslMode::parse(&tget(&merged, "source", "sslmode").unwrap_or_default())
-        .context("--sslmode")?;
-    let cfg = PgConfig {
-        host: tget(&merged, "source", "host").unwrap_or_default(),
-        port: tget(&merged, "source", "port")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(args.port),
-        user: tget(&merged, "source", "user").unwrap_or_default(),
-        password: tget(&merged, "source", "password"),
-        database: tget(&merged, "source", "dbname").unwrap_or_default(),
-        application_name: "walshadow".into(),
-        sslmode,
-        tls: TlsParams::resolve(&walrus::config::Vars::default()),
-    };
-    let mut feed = SourceFeed::connect(&cfg)
-        .await
-        .context("connect to source PG")?
-        .with_status_interval(Duration::from_secs(args.status_interval));
+    // Applied source endpoint. Boot resolves it file-over-CLI; a later reload
+    // republishes it on the config watch and the pump swaps its feed.
+    let mut source_conn =
+        SourceConn::from_table(&merged).map_err(|e| anyhow::anyhow!("[source] {e}"))?;
+    if args.slot.is_some() {
+        source_conn.slot = args.slot.clone();
+    }
+    let mut cfg = source_conn.to_pg_config();
+    let mut feed = connect_source_waiting(args, &mut source_conn, &mut cfg).await;
 
     let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
     tracing::info!(
@@ -824,7 +813,7 @@ async fn run_session(
         }
         // CLI override wins over TOML `[source] slot` (CLI > config).
         if args.slot.is_some() {
-            cfg.source_slot = args.slot.clone();
+            cfg.source.slot = args.slot.clone();
         }
         cfg.decoder_pool_size = positive_usize(
             "decoder_pool_size",
@@ -859,13 +848,10 @@ async fn run_session(
                 c.decoder_queue_capacity
             }),
     );
-    // Effective physical replication slot (`[source] slot` + --slot override);
-    // None = slotless.
-    let source_slot: Option<String> = ch_config.as_ref().and_then(|c| c.source_slot.clone());
     let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref())?;
     let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
     // Slot before bootstrap
-    if let Some(slot) = source_slot.as_deref() {
+    if let Some(slot) = source_conn.slot.as_deref() {
         feed.ensure_physical_slot(slot)
             .await
             .with_context(|| format!("ensure physical replication slot {slot}"))?;
@@ -925,26 +911,15 @@ async fn run_session(
     let live_identity = manifest::SourceIdentity {
         system_id: ident.sysid.parse().context("IDENTIFY_SYSTEM sysid")?,
         timeline: ident.timeline,
+        timeline_begin: manifest::Lsn(0),
     };
     // Identity gate runs before `--ignore-cursor`: the flag discards resume
     // LSNs, not artifact ownership. Foreign system_id is fatal regardless
-    // (retire/backfill ledgers would act on another cluster's state); a
-    // timeline-only change (promoted source) passes under `--ignore-cursor`,
-    // live identity persists at the next manifest write.
+    // (retire/backfill ledgers would act on another cluster's state). A newer
+    // live timeline is a promotion, proved against the source's history below.
     let manifest_at_boot: Option<manifest::Manifest> =
         match manifest::load(&args.spill_dir, &live_identity).await {
             Ok(m) => m,
-            Err(manifest::ManifestError::ForeignSource { stored, live })
-                if args.ignore_cursor && stored.system_id == live.system_id =>
-            {
-                tracing::warn!(
-                    target: "walshadow::manifest",
-                    stored_timeline = stored.timeline,
-                    live_timeline = live.timeline,
-                    "--ignore-cursor adopts new source timeline",
-                );
-                None
-            }
             Err(e @ manifest::ManifestError::ForeignSource { .. }) => {
                 anyhow::bail!("{e}");
             }
@@ -1007,19 +982,113 @@ async fn run_session(
         "start LSN",
     );
 
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned)?;
+    // Branch selection is per segment, through the source's history: a floor
+    // stored on an ancestor is served by that ancestor, whatever the live head
+    // reports, and a floor at a fork segment's start is served by the descendant
+    // whose file holds the ancestor prefix (plans/failover.md §Lineage).
+    let stored_timeline = manifest_at_boot
+        .as_ref()
+        .map(|m| m.source.timeline)
+        .unwrap_or(ident.timeline);
+    let mut history = load_boot_history(&mut feed, ident.timeline, stored_timeline).await?;
+    let start_timeline = match history.resume_branch(stored_timeline, aligned, WAL_SEG_SIZE) {
+        Some(tli) => tli,
+        None if args.ignore_cursor => {
+            let found = history.tli_of_segment(aligned, WAL_SEG_SIZE);
+            tracing::warn!(
+                target: "walshadow",
+                stored_timeline,
+                live_timeline = ident.timeline,
+                serves_start = found,
+                "--ignore-cursor adopts the live timeline without a lineage proof",
+            );
+            history = TimelineHistory::root(ident.timeline);
+            ident.timeline
+        }
+        None => anyhow::bail!(
+            "timeline_not_descendant: stored timeline {stored_timeline} does not reach \
+             {} on live timeline {}'s history (it serves {:?}); \
+             --ignore-cursor re-baselines onto the live branch",
+            format_pg_lsn(aligned),
+            ident.timeline,
+            history.tli_of_segment(aligned, WAL_SEG_SIZE),
+        ),
+    };
+    // Same number, different branch: the chain places a sibling exactly where it
+    // places a descendant, and only the switchpoint separates them. A stored
+    // begin is the chain a previous run proved, carried forward
+    // (plans/failover.md §Lineage)
+    let stored_begin = manifest_at_boot
+        .as_ref()
+        .map(|m| m.source.timeline_begin.0)
+        .unwrap_or(0);
+    let live_begin = history.begin_of(stored_timeline).unwrap_or(0);
+    match stored_begin {
+        0 if stored_timeline > 1 => tracing::warn!(
+            target: "walshadow",
+            stored_timeline,
+            live_begin = %format_pg_lsn(live_begin),
+            "manifest records no switchpoint for its branch, so a sibling sharing \
+             that number cannot be refused until the next manifest write",
+        ),
+        0 => {}
+        begin if begin != live_begin && !args.ignore_cursor => anyhow::bail!(
+            "sibling_branch: source places timeline {stored_timeline} at {}, \
+             walshadow's artifacts came off it from {}; the branch behind them is \
+             absent from this source's history",
+            format_pg_lsn(live_begin),
+            format_pg_lsn(begin),
+        ),
+        begin if begin != live_begin => tracing::warn!(
+            target: "walshadow",
+            stored_timeline,
+            stored_begin = %format_pg_lsn(begin),
+            live_begin = %format_pg_lsn(live_begin),
+            "--ignore-cursor adopts a branch that begins somewhere else",
+        ),
+        _ => {}
+    }
+    if start_timeline != ident.timeline {
+        tracing::info!(
+            target: "walshadow",
+            start_timeline,
+            live_timeline = ident.timeline,
+            switch_lsn = history
+                .switchpoint_of(start_timeline)
+                .map(|l| format_pg_lsn(l).to_string()),
+            "resuming on an ancestor timeline; the crossing follows its fork",
+        );
+    }
+    // Branches a spill-dir artifact may carry: the resume branch plus every
+    // ancestor the chain places below it. A crossing moves the resume branch
+    // while the artifacts stay where they were written
+    let lineage: Vec<u32> = history
+        .entries()
+        .iter()
+        .map(|e| e.tli)
+        .filter(|tli| *tli <= start_timeline)
+        .collect();
+
+    let mut stream = WalStream::new(start_timeline, WAL_SEG_SIZE, aligned)?;
     // Bind walsender listener BEFORE shadow's walreceiver can connect.
     // Without an active sink, the catalog gate inside `BufferingDecoderSink`
     // deadlocks: shadow's replay LSN never advances since segment-sink fires
     // after per-record dispatch in the current ordering.
-    let shadow_state = Arc::new(Mutex::new(
-        walshadow::shadow_stream::ShadowStreamState::new(
-            ident.timeline,
-            ident.sysid.clone(),
-            aligned,
-            args.walsender_slow_threshold,
-        ),
-    ));
+    let mut shadow_boot = walshadow::shadow_stream::ShadowStreamState::new(
+        history.shadow_boot_branch(stored_timeline, aligned, start_timeline),
+        ident.sysid.clone(),
+        aligned,
+        args.walsender_slow_threshold,
+    );
+    seed_shadow_branches(
+        &mut shadow_boot,
+        &mut feed,
+        &history,
+        &args.out_dir,
+        start_timeline,
+    )
+    .await?;
+    let shadow_state = Arc::new(Mutex::new(shadow_boot));
     let walsender_listener = tokio::net::TcpListener::bind(args.walsender_bind)
         .await
         .with_context(|| format!("bind walsender at {}", args.walsender_bind))?;
@@ -1141,7 +1210,7 @@ async fn run_session(
             source_version_num,
             source_sql,
             shadow_sql: &shadow_sql,
-            slot: source_slot.as_deref(),
+            slot: source_conn.slot.as_deref(),
             ch_config: ch_config.as_ref(),
         })
         .await
@@ -1184,6 +1253,9 @@ async fn run_session(
             version: manifest::MANIFEST_VERSION,
             floor: manifest::Lsn(manifest::resolved_floor(end_lsn, end_lsn)),
             source: live_identity.clone(),
+            wal: manifest::WalBranch {
+                stream_timeline: start_timeline,
+            },
             lsn: manifest::LsnSet {
                 source_received: manifest::Lsn(end_lsn),
                 filter_durable: manifest::Lsn(end_lsn),
@@ -1238,15 +1310,19 @@ async fn run_session(
         }
     }
     let desc_log = Arc::new(
-        walshadow::desc_log::DescriptorLog::open(
+        walshadow::desc_log::DescriptorLog::open_on_branch(
             &args.spill_dir,
             walshadow::desc_log::DescLogIdentity {
                 pg_major: source_major,
                 system_id: ident.sysid.clone(),
-                timeline: ident.timeline,
+                // Resume branch, which a crossing moves without moving the log:
+                // the stored header names wherever the log last rewrote itself,
+                // so `lineage` is what places it
+                timeline: start_timeline,
                 db_oid: shadow_db_oid,
                 wal_seg_size: WAL_SEG_SIZE as u32,
             },
+            &lineage,
         )
         .await
         .context("open descriptor log")?,
@@ -1374,6 +1450,7 @@ async fn run_session(
             flush_timeout: args
                 .ch_flush_timeout_ms
                 .map(std::time::Duration::from_millis),
+            source_slot: args.slot.clone(),
         };
         let (resolver, config_rx) = ConfigResolver::new(
             &emitter_cfg,
@@ -1736,15 +1813,21 @@ async fn run_session(
         let timeout = Duration::from_secs(args.walsender_connect_timeout);
         let start = Instant::now();
         loop {
-            if shadow_state.lock().await.aggregate().active_connections > 0 {
+            let agg = shadow_state.lock().await.aggregate();
+            if agg.active_connections > 0 {
                 break;
             }
+            // `accepted` separates "shadow never dialed" from "shadow dialed
+            // and stalled in the handshake" — the latter reads as the former
+            // without it, since only START_REPLICATION registers a connection
             anyhow::ensure!(
                 start.elapsed() < timeout,
-                "no walreceiver attached to walsender {walsender_addr} within \
-                 {}s; catalog-boundary holds require a live wire — point \
-                 shadow's primary_conninfo here or raise --walsender-connect-timeout",
+                "no walreceiver streaming from walsender {walsender_addr} within \
+                 {}s (accepted {}, none sent START_REPLICATION); catalog-boundary \
+                 holds require a live wire — point shadow's primary_conninfo here \
+                 or raise --walsender-connect-timeout",
                 args.walsender_connect_timeout,
+                agg.accepted_total,
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1756,19 +1839,29 @@ async fn run_session(
     }
 
     let source_recovery = SourceRecovery {
-        cfg: &cfg,
-        slot: source_slot.as_deref(),
-        timeline: ident.timeline,
         status_interval: Duration::from_secs(args.status_interval),
         backup: backup_settings.as_ref(),
         spill_dir: &args.spill_dir,
+        floor: &resume_floor,
     };
     if let Err(e) = feed
-        .start_physical_replication(source_slot.as_deref(), stream.next_lsn(), ident.timeline)
+        .start_physical_replication(
+            source_conn.slot.as_deref(),
+            stream.next_lsn(),
+            start_timeline,
+        )
         .await
     {
         feed = source_recovery
-            .recover(e, &mut stream, &mut record_sink, &mut segment_sink)
+            .recover(
+                e,
+                &cfg,
+                source_conn.slot.as_deref(),
+                stream_branch(&history, live_identity.system_id, &stream),
+                &mut stream,
+                &mut record_sink,
+                &mut segment_sink,
+            )
             .await
             .context("resume WAL source")?;
     }
@@ -1791,20 +1884,180 @@ async fn run_session(
     let mut last_emitter_ack_observed: u64 = 0;
     let mut inflight_stall_since: Option<Instant> = None;
     let mut inflight_stall_logged = false;
-    // Pump reads `paused` live off the resolver watch; when paused it idles
-    // (stops consuming source WAL) without tearing anything down.
+    // Pump reads `paused` and the source endpoint live off the resolver watch;
+    // when paused it idles (stops consuming source WAL) without tearing
+    // anything down, and a moved `[source]` swaps the feed in place.
     let pump_config_rx = config_resolver.as_ref().map(|r| r.subscribe());
+    let mut source_swap_pending = false;
+    let mut source_swap_retry_at: Option<Instant> = None;
+    let mut source_swaps_total = 0u64;
+    let mut source_swap_failures_total = 0u64;
+    // Proof the last swap attempt failed, cleared once one lands
+    let mut source_swap_blocked_on: &'static str = "";
+    // Frozen when the pump observes a pause, so a promotion decision reads a
+    // frontier that cannot move under it. Cleared on resume: a value left over
+    // from an earlier pause is as misleading as a live one
+    let mut pause_frontier: Option<(u64, u64)> = None;
+    // A restart mid-pause re-freezes both numbers, conservatively but not
+    // identically, so the pair an operator already read has to be read again
+    let mut pause_refrozen = false;
+    let mut ever_unpaused = false;
+    // Step 5's answer, refreshed while paused off the endpoint the pump holds
+    let mut promotion = PromotionGate::default();
+    let mut promotion_polled_at: Option<Instant> = None;
+    let switchover = Switchover {
+        system_id: live_identity.system_id,
+        out_dir: &args.out_dir,
+        shadow_state: &shadow_state,
+    };
+    let mut timeline_stats = TimelineStats {
+        // Off the chain, so a restart after a crossing keeps reporting the fork
+        // it resumed across instead of zero
+        switch_lsn: history.begin_of(start_timeline).unwrap_or(0),
+        ..TimelineStats::default()
+    };
+    // The ancestor ended and the descendant has not been adopted yet. Survives
+    // iterations so a source error mid-crossing retries the crossing: at the
+    // ancestor's switchpoint an ordinary reconnect has nothing to ask for
+    let mut crossing = CrossingState::default();
+    let mut barrier_logged: Option<Instant> = None;
     let shutdown_reason = loop {
         let paused = pump_config_rx
             .as_ref()
             .map(|rx| rx.borrow().paused)
             .unwrap_or(false);
+        // Slot changes require reconnect because START_REPLICATION binds slot
+        if let Some(rx) = pump_config_rx.as_ref() {
+            let desired = rx.borrow().source.clone();
+            if desired != source_conn {
+                tracing::info!(
+                    target: "walshadow",
+                    from = source_conn.endpoint(),
+                    to = desired.endpoint(),
+                    from_slot = source_conn.slot.as_deref(),
+                    to_slot = desired.slot.as_deref(),
+                    "source changed — swapping feed",
+                );
+                source_conn = desired;
+                cfg = source_conn.to_pg_config();
+                source_swap_pending = true;
+                source_swap_retry_at = None;
+            }
+        }
+        // Swap between chunks, so the resume point is the byte-contiguous
+        // `next_lsn` and no WalStream state is rebuilt. Old feed stays up
+        // until the new endpoint proves same cluster and branch, and until the
+        // named slot answers: a wrong address or a slot the target never got
+        // costs a warning, not the stream.
+        //
+        // Not while a crossing is pending: the stream sits at a switchpoint no
+        // branch resumes from, and the crossing dials the live endpoint and slot
+        // itself, so a repoint made mid-crossing lands there instead.
+        if source_swap_pending
+            && !crossing.pending()
+            && source_swap_retry_at.is_none_or(|at| Instant::now() >= at)
+        {
+            match resume_source_feed(
+                &cfg,
+                source_conn.slot.as_deref(),
+                stream.next_lsn(),
+                stream_branch(&history, live_identity.system_id, &stream),
+                resume_floor.load(Ordering::Acquire),
+                Duration::from_secs(args.status_interval),
+            )
+            .await
+            {
+                Ok(swapped) => {
+                    feed = swapped;
+                    source_swap_pending = false;
+                    source_swap_retry_at = None;
+                    source_swaps_total += 1;
+                    source_swap_blocked_on = "";
+                    tracing::info!(
+                        target: "walshadow",
+                        endpoint = source_conn.endpoint(),
+                        resume_lsn = %format_pg_lsn(stream.next_lsn()),
+                        slot = source_conn.slot.as_deref(),
+                        "source feed swapped",
+                    );
+                }
+                Err(e) => {
+                    source_swap_failures_total += 1;
+                    source_swap_retry_at = Some(Instant::now() + SOURCE_SWAP_RETRY);
+                    source_swap_blocked_on = swap_reason(&e);
+                    timeline_stats.record_reason(source_swap_blocked_on);
+                    tracing::warn!(
+                        target: "walshadow",
+                        error = %format!("{e:#}"),
+                        reason = source_swap_blocked_on,
+                        endpoint = source_conn.endpoint(),
+                        "source endpoint swap failed — staying on current feed",
+                    );
+                }
+            }
+        }
         // `durable` (fsynced) lags `dispatched`; advertise it as flush/cursor.
         let dispatched = stream.dispatched_lsn();
         let durable = durable_lsn.load(Ordering::Acquire);
         let received = feed.last_server_wal_end().max(dispatched);
+        // Two frontiers, two questions. `consumed` is where resume asks the
+        // promoted target to start; `received` is the source head last heard
+        // about, which the target must reach before promotion. Bytes cannot
+        // have been consumed without being received, so a source that has not
+        // reported a head yet reads as level with the consumed frontier
+        match (paused, pause_frontier) {
+            (true, None) => {
+                pause_frontier = Some((stream.next_lsn(), received.max(stream.next_lsn())));
+                // A pause this process never saw lifted was taken before it
+                // booted, so these two numbers replace ones an operator may
+                // already hold. Both re-freeze conservatively — consumed drops
+                // back to the floor, received re-derives from the live head —
+                // but a promotion decision has to be taken from the pair on
+                // offer now (plans/failover.md §What pause freezes)
+                pause_refrozen = !ever_unpaused;
+                let (consumed, head) = pause_frontier.expect("just frozen");
+                tracing::info!(
+                    target: "walshadow",
+                    pause_consumed_lsn = %format_pg_lsn(consumed),
+                    pause_received_lsn = %format_pg_lsn(head),
+                    refrozen = pause_refrozen,
+                    "pause observed — frontier frozen",
+                );
+            }
+            (false, Some(_)) => {
+                pause_frontier = None;
+                pause_refrozen = false;
+            }
+            _ => {}
+        }
+        ever_unpaused |= !paused;
+        // Step 5 of the protocol, answered off the connection step 4's repoint
+        // already moved onto the target: replay, receive, and recovery state
+        // beside the frozen frontier they have to reach
+        // (plans/failover.md §Operator protocol)
+        if !paused {
+            promotion = PromotionGate::blocked("not_paused");
+            promotion_polled_at = None;
+        } else if promotion_polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
+            promotion_polled_at = Some(Instant::now());
+            promotion = match tokio::time::timeout(
+                PROMOTION_POLL,
+                promotion_gate(&mut feed, pause_frontier),
+            )
+            .await
+            {
+                Ok(gate) => gate,
+                Err(_) => {
+                    feed.drop_sql_client();
+                    PromotionGate::unreachable()
+                }
+            };
+        }
         let shadow_replay = shadow_replay_lsn.load(Ordering::Acquire);
-        let shadow_agg = shadow_state.lock().await.aggregate();
+        let (shadow_agg, shadow_served_tli) = {
+            let state = shadow_state.lock().await;
+            (state.aggregate(), state.timeline)
+        };
         if let Some(flush) = shadow_agg.min_flush_lsn {
             shadow_flush_lsn.fetch_max(flush, Ordering::Release);
         }
@@ -1823,10 +2076,30 @@ async fn run_session(
             0 => emitter_ack_lsn,
             s => s.min(emitter_ack_lsn),
         };
+        // Never walks back. A crossing commits the fork segment's start, which
+        // `align_down(emitter_ack)` reaches only once descendant WAL fills that
+        // segment; the natural terms must not undo the position a restart
+        // resumes from. A rewind (`--start-lsn`, `--ignore-cursor`) lowers it by
+        // seeding `resume_floor` at the rewind point instead
+        let floor = manifest::resolved_floor(emitter_ack_lsn, durable)
+            .max(resume_floor.load(Ordering::Acquire));
+        let floor_timeline = history.floor_branch(
+            floor,
+            live_identity.timeline,
+            stream.timeline(),
+            WAL_SEG_SIZE,
+        );
         let cur = manifest::Manifest {
             version: manifest::MANIFEST_VERSION,
-            floor: manifest::Lsn(manifest::resolved_floor(emitter_ack_lsn, durable)),
-            source: live_identity.clone(),
+            floor: manifest::Lsn(floor),
+            source: manifest::SourceIdentity {
+                system_id: live_identity.system_id,
+                timeline: floor_timeline,
+                timeline_begin: manifest::Lsn(history.begin_of(floor_timeline).unwrap_or(0)),
+            },
+            wal: manifest::WalBranch {
+                stream_timeline: stream.timeline(),
+            },
             lsn: manifest::LsnSet {
                 source_received: manifest::Lsn(received),
                 filter_durable: manifest::Lsn(durable),
@@ -1851,13 +2124,15 @@ async fn run_session(
         }
         // flush caps physical slot's restart_lsn.
         // Manifest writes are cadence-gated above while keepalive replies inside
-        // next_chunk can send this status at any time.
+        // next_event can send this status at any time.
         let status = StandbyStatus {
             write_lsn: received,
             flush_lsn: apply_ceiling.min(resume_floor.load(Ordering::Acquire)),
             apply_lsn: apply_ceiling,
         };
         let dispatched_before = stream.dispatched_lsn();
+        // Set inside the select arm, acted on once the chunk borrow is released
+        let mut ancestor_ended = false;
         let chunk = tokio::select! {
             biased;
             sig = tokio::signal::ctrl_c() => {
@@ -1869,10 +2144,54 @@ async fn run_session(
             // is picked up promptly.
             _ = tokio::time::sleep(metrics_tick) => None,
             // Paused: stop consuming source WAL (idle); resume re-enables this
-            // arm and the pump continues from the same LSN.
-            res = feed.next_chunk(status, &mut chunk_buf), if !paused => match res {
-                Ok(Some(c)) => Some(c),
-                Ok(None) => break "CopyDone",
+            // arm and the pump continues from the same LSN. A pending crossing
+            // also parks it — that connection is out of COPY until the
+            // descendant is requested.
+            res = feed.next_event(status, &mut chunk_buf), if !paused && !crossing.pending() => match res {
+                Ok(SourceEvent::Wal(c)) => Some(c),
+                Ok(SourceEvent::TimelineEnd) => {
+                    ancestor_ended = true;
+                    None
+                }
+                // Dropped where the chain says the branch ends: nothing is
+                // resumable there, so this is the crossing arriving as a socket
+                // close rather than as a next-timeline result
+                Ok(SourceEvent::Shutdown) | Err(_)
+                if history.branch_exhausted(stream.timeline(), stream.next_lsn()) =>
+            {
+                    tracing::info!(
+                        target: "walshadow",
+                        switch_lsn = %format_pg_lsn(stream.next_lsn()),
+                        finished_timeline = stream.timeline(),
+                        "source stream ended where the branch does — crossing",
+                    );
+                    crossing.ancestor_ended();
+                    crossing.needs_connection();
+                    None
+                }
+                // The source stopped, this consumer did not: reconnect, which
+                // is also how a switchover's demoted primary hands over
+                Ok(SourceEvent::Shutdown) => {
+                    tracing::info!(
+                        target: "walshadow",
+                        resume_lsn = format_pg_lsn(stream.next_lsn()).to_string(),
+                        "source shut down its walsender — reconnecting",
+                    );
+                    feed = source_recovery
+                        .recover(
+                            anyhow::anyhow!("source walsender exited"),
+                            &cfg,
+                            source_conn.slot.as_deref(),
+                            stream_branch(&history, live_identity.system_id, &stream),
+                            &mut stream,
+                            &mut record_sink,
+                            &mut segment_sink,
+                        )
+                        .await?;
+                    source_swap_pending = false;
+                    source_swap_retry_at = None;
+                    None
+                }
                 Err(e) => {
                     let resume = stream.next_lsn();
                     tracing::warn!(
@@ -1882,8 +2201,19 @@ async fn run_session(
                         "source stream error — recovering",
                     );
                     feed = source_recovery
-                        .recover(e, &mut stream, &mut record_sink, &mut segment_sink)
+                        .recover(
+                            e,
+                            &cfg,
+                            source_conn.slot.as_deref(),
+                            stream_branch(&history, live_identity.system_id, &stream),
+                            &mut stream,
+                            &mut record_sink,
+                            &mut segment_sink,
+                        )
                         .await?;
+                    // Recovery dialed the live endpoint, so a queued swap is done
+                    source_swap_pending = false;
+                    source_swap_retry_at = None;
                     let resumed = stream.next_lsn();
                     tracing::info!(
                         target: "walshadow",
@@ -1905,6 +2235,214 @@ async fn run_session(
                 )
                 .await?;
         }
+        if ancestor_ended {
+            // Answer the backend's CopyDone now, leaving the connection in
+            // simple-query mode: that is the state the crossing reads history
+            // from, and the state a retry can rebuild by reconnecting
+            if let Err(e) = feed.end_historic_stream().await {
+                tracing::warn!(
+                    target: "walshadow",
+                    error = %format!("{e:#}"),
+                    "ending the historic stream failed — reconnecting to cross",
+                );
+                crossing.needs_connection();
+            }
+            crossing.ancestor_ended();
+        }
+        // Nothing left to stream on the ancestor at its own switchpoint, so
+        // only the crossing moves the stream forward. Attempts pace themselves
+        // and leave the rest of the loop publishing meanwhile
+        // A pause takes the crossing decision back from the pump, so it also
+        // clears a wedge: the operator fixes what the refusal named, then
+        // resumes and the proof runs again from the untouched ancestor
+        if paused && let Some(wedge) = crossing.unpark() {
+            tracing::info!(
+                target: "walshadow",
+                reason = wedge.reason,
+                "pause clears the parked crossing — resume re-proves the fork",
+            );
+        }
+        let crossing_due = !paused && crossing.due(Instant::now());
+        if crossing_due && crossing.awaiting_connection() {
+            match SourceFeed::connect(&cfg).await {
+                Ok(fresh) => {
+                    feed = fresh.with_status_interval(Duration::from_secs(args.status_interval));
+                    crossing.connected();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "walshadow",
+                        error = %format!("{e:#}"),
+                        endpoint = source_conn.endpoint(),
+                        "cannot reach the source to cross the fork — retrying",
+                    );
+                    crossing.retry_at(Instant::now() + SOURCE_SWAP_RETRY);
+                }
+            }
+        }
+        if crossing_due && !crossing.awaiting_connection() && !crossing.has_fork() {
+            match switchover
+                .probe(
+                    &mut feed,
+                    &stream,
+                    history.begin_of(stream.timeline()).unwrap_or(0),
+                    &mut timeline_stats,
+                )
+                .await
+            {
+                Ok(probed) => {
+                    tracing::info!(
+                        target: "walshadow",
+                        finished_timeline = probed.finished_tli,
+                        next_timeline = probed.next_tli,
+                        live_timeline = probed.live_tli,
+                        switch_lsn = %format_pg_lsn(probed.switch_lsn),
+                        "source fork proved — draining the pipeline to it",
+                    );
+                    crossing.hold_fork(probed);
+                }
+                Err(e) if e.retryable() => {
+                    tracing::warn!(
+                        target: "walshadow",
+                        error = %format!("{e:#}"),
+                        reason = e.reason(),
+                        "proving the source fork failed — retrying",
+                    );
+                    crossing.retry_from_source(Instant::now() + SOURCE_SWAP_RETRY);
+                }
+                Err(e) => crossing.park(e, stream.next_lsn(), None),
+            }
+        }
+        if crossing_due
+            && !crossing.awaiting_connection()
+            && let Some(probed) = crossing.take_fork()
+        {
+            // Both fork proofs read the decoder's view, so the pump-side queue
+            // drains first: a record still in flight answers for a frontier the
+            // decoder has not reached, which would read as a transaction left
+            // open at the fork
+            record_sink
+                .decoder_xact
+                .flush()
+                .await
+                .context("flush queueing decoder sink at the fork")?;
+            let fence_deadline = Instant::now() + FORK_FENCE_DRAIN;
+            while record_sink.decoder_xact.in_flight() > 0 && Instant::now() < fence_deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let (guards, resume_safe) = {
+                let mut b = xact_buffer.lock().await;
+                let ea = emitter_ack.load(Ordering::Acquire);
+                let resume_safe = b.resume_safe_lsn(ea);
+                let stats = b.stats();
+                (
+                    ForkGuards {
+                        drain_lsn: stats.drain_lsn,
+                        open_xacts: stats.xacts_active as usize,
+                    },
+                    resume_safe,
+                )
+            };
+            // Barrier: every consumer past the position about to be committed,
+            // so a restart from it loses nothing. The loop keeps publishing
+            // meanwhile, so a wait reads as a wait rather than a stall, and the
+            // source has stopped producing so nothing queues up behind it
+            let waiting_on = walshadow::transition::ForkBarrier {
+                resume_safe_lsn: resume_safe,
+                shadow_apply_lsn: shadow_agg.min_apply_lsn,
+                filter_durable: durable,
+                floor: resume_floor.load(Ordering::Acquire),
+            }
+            .pending(probed.switch_lsn, WAL_SEG_SIZE);
+            if let Some(wait) = waiting_on {
+                // Prod the walreceiver: non-forced replies fire only on flush
+                // progress, and the ancestor's tail may be the last thing left
+                shadow_state.lock().await.request_status();
+                if barrier_logged.is_none_or(|t| t.elapsed() >= BARRIER_LOG_INTERVAL) {
+                    tracing::info!(
+                        target: "walshadow",
+                        switch_lsn = %format_pg_lsn(probed.switch_lsn),
+                        waiting_on = wait.label(),
+                        "fork barrier: {wait}",
+                    );
+                    barrier_logged = Some(Instant::now());
+                }
+                crossing.hold_fork(probed);
+            } else {
+                barrier_logged = None;
+                let commit = async |resume: walshadow::transition::ForkResume| {
+                    commit_fork_resume(
+                        &args.spill_dir,
+                        &live_identity,
+                        resume,
+                        manifest::LsnSet {
+                            source_received: manifest::Lsn(received.max(resume.switch_lsn)),
+                            filter_durable: manifest::Lsn(durable),
+                            shadow_replay: manifest::Lsn(shadow_replay),
+                            drain: manifest::Lsn(guards.drain_lsn),
+                            emitter_ack: manifest::Lsn(resume_safe),
+                            shadow_flush: manifest::Lsn(shadow_flush_lsn.load(Ordering::Acquire)),
+                        },
+                        &resume_floor,
+                        &gc_floor_tx,
+                    )
+                    .await
+                };
+                match switchover
+                    .cross(
+                        &mut feed,
+                        source_conn.slot.as_deref(),
+                        &mut stream,
+                        &mut record_sink,
+                        &mut segment_sink,
+                        status,
+                        guards,
+                        &probed,
+                        commit,
+                        &mut timeline_stats,
+                    )
+                    .await
+                {
+                    Ok(crossed) => {
+                        tracing::info!(
+                            target: "walshadow",
+                            system_id = live_identity.system_id,
+                            finished_timeline = crossed.finished_tli,
+                            next_timeline = crossed.next_tli,
+                            live_timeline = crossed.live_tli,
+                            switch_lsn = %format_pg_lsn(crossed.switch_lsn),
+                            resume_lsn = %format_pg_lsn(stream.next_lsn()),
+                            floor_lsn = %format_pg_lsn(resume_floor.load(Ordering::Acquire)),
+                            drain_lsn = %format_pg_lsn(guards.drain_lsn),
+                            prefix_bytes_verified = crossed.prefix_bytes,
+                            slot = source_conn.slot.as_deref(),
+                            "crossed source timeline",
+                        );
+                        history = crossed.history;
+                        crossing.committed();
+                        source_swap_pending = false;
+                        source_swap_retry_at = None;
+                        source_swap_blocked_on = "";
+                    }
+                    // Lineage, prefix, and publication proofs need an operator; a
+                    // source or storage error is worth another attempt. Every
+                    // retryable failure lands before the commit, so the retry
+                    // starts from the same proof against an untouched ancestor
+                    Err(e) if e.retryable() => {
+                        tracing::warn!(
+                            target: "walshadow",
+                            error = %format!("{e:#}"),
+                            reason = e.reason(),
+                            stream_timeline = stream.timeline(),
+                            "timeline crossing failed — retrying",
+                        );
+                        crossing.retry_from_source(Instant::now() + SOURCE_SWAP_RETRY);
+                        crossing.hold_fork(probed);
+                    }
+                    Err(e) => crossing.park(e, stream.next_lsn(), Some(probed.switch_lsn)),
+                }
+            }
+        }
         // Flush pump-side accumulator so partial batches don't strand
         // commits in `decoder_xact.buf` when source goes idle (kill-restart
         // post-catchup quiescence).
@@ -1924,6 +2462,16 @@ async fn run_session(
         if let Some(msg) = gc_fatal.message() {
             anyhow::bail!("{msg}");
         }
+        // Re-read rather than reuse the top-of-iteration pair: a crossing commits
+        // a new floor and branch mid-iteration, and this is what an operator
+        // watches to know the crossing is durable
+        let published_floor = floor.max(resume_floor.load(Ordering::Acquire));
+        let published_branch = history.floor_branch(
+            published_floor,
+            live_identity.timeline,
+            stream.timeline(),
+            WAL_SEG_SIZE,
+        );
         let now_dispatched = stream.dispatched_lsn();
         let advanced = now_dispatched != prev_dispatched;
         let (xact_stats, drain_resident, xact_line) = {
@@ -1976,6 +2524,25 @@ async fn run_session(
             oracle_stats,
             bridge_stats,
             start_instant.elapsed().as_secs(),
+            SourceSwapView {
+                swaps: source_swaps_total,
+                failures: source_swap_failures_total,
+                pending: source_swap_pending,
+                blocked_on: source_swap_blocked_on,
+            },
+            TimelineView {
+                source_system_id: live_identity.system_id,
+                source_timeline: stream.timeline(),
+                floor_timeline: published_branch,
+                shadow_served_timeline: shadow_served_tli,
+                shadow_replay_timeline: shadow_agg.replay_timeline.unwrap_or(0),
+                floor_lsn: published_floor,
+                stats: timeline_stats,
+                pause_frontier,
+                pause_refrozen,
+                wedge: crossing.wedge().cloned(),
+                promotion,
+            },
             ShadowMetricsView {
                 apply_lag_bytes: lag_bytes,
                 apply_lag_seconds: lag_seconds,
@@ -2510,6 +3077,39 @@ struct ShadowMetricsView {
     dropped_total: u64,
 }
 
+/// Live `[source]` endpoint moves, from the pump's swap state.
+struct SourceSwapView {
+    swaps: u64,
+    failures: u64,
+    /// Config names an endpoint the pump has not reached yet
+    pending: bool,
+    /// Proof the last attempt failed on, empty once one lands
+    blocked_on: &'static str,
+}
+
+/// Branch selection plus the frozen pause frontier — everything a switchover
+/// decision reads (plans/failover.md §Surfaces).
+struct TimelineView {
+    source_system_id: u64,
+    /// Branch the pump is reading
+    source_timeline: u32,
+    /// Branch owning the durable floor, which restart resumes on
+    floor_timeline: u32,
+    /// Branch the shadow-facing walsender advertises
+    shadow_served_timeline: u32,
+    /// Branch the shadow is replaying
+    shadow_replay_timeline: u32,
+    floor_lsn: u64,
+    stats: TimelineStats,
+    /// `(consumed, received)` frozen when the pump observed a pause
+    pause_frontier: Option<(u64, u64)>,
+    /// That freeze re-derived a pause this process found already in effect
+    pause_refrozen: bool,
+    /// Crossing the pump parked on, waiting for an operator
+    wedge: Option<CrossingWedge>,
+    promotion: PromotionGate,
+}
+
 #[allow(clippy::too_many_arguments)]
 /// CPU seconds + RSS bytes from `/proc/self`. Linux-only; `(0.0, 0)` if
 /// unreadable. Assumes `CLK_TCK` 100 (USER_HZ) and `VmRSS` in kB.
@@ -2572,6 +3172,8 @@ async fn populate_metrics(
     oracle_stats: Option<&walshadow::oracle::OracleStats>,
     bridge_stats: Option<&walshadow::bridge::BridgeStats>,
     uptime_secs: u64,
+    source_swap: SourceSwapView,
+    timeline_view: TimelineView,
     shadow_view: ShadowMetricsView,
     boundary_hold: &BoundaryHoldStats,
     capture: &walshadow::catalog_capture::CaptureStats,
@@ -2762,6 +3364,31 @@ async fn populate_metrics(
             .map(|s| s.errors.load(Ordering::Relaxed))
             .unwrap_or(0),
         uptime_secs,
+        source_endpoint_swaps_total: source_swap.swaps,
+        source_endpoint_swap_failures_total: source_swap.failures,
+        source_endpoint_swap_pending: u64::from(source_swap.pending),
+        source_endpoint_swap_blocked_on: source_swap.blocked_on,
+        crossing_blocked_on: timeline_view.wedge.as_ref().map_or("", |w| w.reason),
+        crossing_detail: timeline_view.wedge.map(|w| w.detail).unwrap_or_default(),
+        source_system_id: timeline_view.source_system_id,
+        source_timeline: timeline_view.source_timeline,
+        floor_timeline: timeline_view.floor_timeline,
+        shadow_served_timeline: timeline_view.shadow_served_timeline,
+        shadow_replay_timeline: timeline_view.shadow_replay_timeline,
+        floor_lsn: timeline_view.floor_lsn,
+        timeline_switches_total: timeline_view.stats.switches,
+        timeline_switch_failures_by_reason: timeline_view.stats.failures_by_reason,
+        timeline_switch_lsn: timeline_view.stats.switch_lsn,
+        timeline_prefix_bytes_verified_total: timeline_view.stats.prefix_bytes_verified,
+        timeline_transition_seconds_total: timeline_view.stats.seconds_total,
+        pause_consumed_lsn: timeline_view.pause_frontier.map_or(0, |(c, _)| c),
+        pause_received_lsn: timeline_view.pause_frontier.map_or(0, |(_, r)| r),
+        pause_refrozen: timeline_view.pause_refrozen,
+        promotion_ready: timeline_view.promotion.ready,
+        promotion_blocked_on: timeline_view.promotion.blocked_on,
+        promotion_target_in_recovery: timeline_view.promotion.in_recovery,
+        promotion_target_replay_lsn: timeline_view.promotion.replay_lsn,
+        promotion_target_receive_lsn: timeline_view.promotion.receive_lsn,
         shadow_apply_lag_bytes: shadow_view.apply_lag_bytes,
         shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
@@ -2846,12 +3473,13 @@ async fn reconnect_source(
     cfg: &PgConfig,
     slot: Option<&str>,
     resume_lsn: u64,
-    timeline: u32,
+    branch: SourceBranch,
+    floor: u64,
     status_interval: Duration,
 ) -> Result<SourceFeed> {
     use backon::{ExponentialBuilder, Retryable};
 
-    (|| SourceFeed::reconnect(cfg, slot, resume_lsn, timeline, status_interval))
+    (|| resume_source_feed(cfg, slot, resume_lsn, branch, floor, status_interval))
         .retry(
             ExponentialBuilder::default()
                 .with_min_delay(Duration::from_millis(200))
@@ -2865,20 +3493,378 @@ async fn reconnect_source(
         .await
 }
 
-struct SourceRecovery<'a> {
-    cfg: &'a PgConfig,
-    slot: Option<&'a str>,
+/// How long the fork proofs wait for the pump-side queue to drain. Past it the
+/// buffer's own view answers, which reads a still-queued record as a
+/// transaction open at the fork and refuses the crossing — the fail-closed
+/// direction.
+const FORK_FENCE_DRAIN: Duration = Duration::from_secs(30);
+
+/// Branch the stream is reading, as a reconnect has to name it: number plus the
+/// switchpoint the proved chain places it at.
+fn stream_branch(history: &TimelineHistory, system_id: u64, stream: &WalStream) -> SourceBranch {
+    SourceBranch {
+        system_id,
+        timeline: stream.timeline(),
+        begin: history.begin_of(stream.timeline()).unwrap_or(0),
+    }
+}
+
+/// Step 5's gate: what the promotion target owes before it may be promoted,
+/// answered off the source connection walshadow already holds rather than a
+/// second `psql` (plans/failover.md §Operator protocol).
+#[derive(Debug, Clone, Copy, Default)]
+struct PromotionGate {
+    ready: bool,
+    /// Term that fails, empty once ready
+    blocked_on: &'static str,
+    in_recovery: bool,
+    replay_lsn: u64,
+    receive_lsn: u64,
+}
+
+impl PromotionGate {
+    fn blocked(blocked_on: &'static str) -> Self {
+        Self {
+            blocked_on,
+            ..Self::default()
+        }
+    }
+
+    fn unreachable() -> Self {
+        Self::blocked("source_unreachable")
+    }
+}
+
+/// How often the gate is re-read while paused, and how long one read may take
+/// before the endpoint counts as unreachable. The pump publishes every tick, so
+/// a target that stops answering must not stall the loop with it.
+const PROMOTION_POLL: Duration = Duration::from_secs(1);
+
+/// Read the gate off `feed`'s sidecar SQL connection. Only meaningful while
+/// paused: `pause_received` is the frozen head the target has to reach, and an
+/// unfrozen one moves under the decision.
+async fn promotion_gate(
+    feed: &mut SourceFeed,
+    pause_frontier: Option<(u64, u64)>,
+) -> PromotionGate {
+    let Some((_, pause_received)) = pause_frontier else {
+        return PromotionGate::blocked("not_paused");
+    };
+    let client = match feed.sql_client().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(target: "walshadow", error = %format!("{e:#}"), "promotion gate");
+            return PromotionGate::unreachable();
+        }
+    };
+    let row = client
+        .query_one(
+            "SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn(), pg_last_wal_receive_lsn()",
+            &[],
+        )
+        .await;
+    let row = match row {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::debug!(target: "walshadow", error = %e, "promotion gate");
+            feed.drop_sql_client();
+            return PromotionGate::unreachable();
+        }
+    };
+    let in_recovery: bool = row.get(0);
+    let replay_lsn = row.get::<_, Option<PgLsn>>(1).map(u64::from).unwrap_or(0);
+    let receive_lsn = row.get::<_, Option<PgLsn>>(2).map(u64::from).unwrap_or(0);
+    // Order names the first term to fix, not every one that fails
+    let blocked_on = if !in_recovery {
+        "not_a_standby"
+    } else if replay_lsn < pause_received {
+        "replay_below_pause_received"
+    } else if receive_lsn > replay_lsn {
+        "received_not_replayed"
+    } else {
+        ""
+    };
+    PromotionGate {
+        ready: blocked_on.is_empty(),
+        blocked_on,
+        in_recovery,
+        replay_lsn,
+        receive_lsn,
+    }
+}
+
+/// Cadence of the fork barrier's progress line. The barrier is unbounded by
+/// design — the source has stopped, so waiting costs nothing that is moving —
+/// which makes the log the only place the wait is legible.
+const BARRIER_LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Commit a crossing's resume position: the fork segment's start, on the
+/// descendant. Sound only behind the barrier, which proved nothing below the
+/// fork is still in flight — the floor's contract is that a restart from it
+/// loses nothing, not that the natural terms have caught up to it
+/// (plans/failover.md §Crossing order).
+///
+/// Publishes to the pruners only after the persist, the same order the status
+/// loop uses: a cut must never sit above what a crash-now restart replays from.
+async fn commit_fork_resume(
+    spill_dir: &Path,
+    identity: &manifest::SourceIdentity,
+    resume: walshadow::transition::ForkResume,
+    lsn: manifest::LsnSet,
+    resume_floor: &AtomicU64,
+    gc_floor_tx: &tokio::sync::watch::Sender<u64>,
+) -> Result<()> {
+    let committed = manifest::Manifest {
+        version: manifest::MANIFEST_VERSION,
+        floor: manifest::Lsn(resume.floor),
+        source: manifest::SourceIdentity {
+            system_id: identity.system_id,
+            timeline: resume.timeline,
+            // The fork is where the descendant begins, so the next boot can
+            // refuse a sibling that shares its number
+            timeline_begin: manifest::Lsn(resume.switch_lsn),
+        },
+        wal: manifest::WalBranch {
+            stream_timeline: resume.timeline,
+        },
+        lsn,
+    };
+    manifest::write(spill_dir, &committed)
+        .await
+        .context("write resume manifest at the fork")?;
+    resume_floor.store(resume.floor, Ordering::Release);
+    gc_floor_tx.send_replace(resume.floor);
+    tracing::info!(
+        target: "walshadow",
+        timeline = resume.timeline,
+        floor = %format_pg_lsn(resume.floor),
+        switch_lsn = %format_pg_lsn(resume.switch_lsn),
+        "committed the fork resume position",
+    );
+    Ok(())
+}
+
+/// Dial `[source]` until it answers, re-resolving the endpoint between
+/// attempts.
+///
+/// Exiting instead would crash-loop the window a switchover opens between
+/// stopping writes on the old primary and repointing at the target
+/// (plans/failover.md §Operator protocol): every restart there dials a server
+/// that is down. `ctl` and `/metrics` are bound before this, so the repoint
+/// that ends the wait can be applied to the daemon doing the waiting.
+async fn connect_source_waiting(
+    args: &Args,
+    source_conn: &mut SourceConn,
+    cfg: &mut PgConfig,
+) -> SourceFeed {
+    loop {
+        match SourceFeed::connect(cfg).await {
+            Ok(feed) => {
+                return feed.with_status_interval(Duration::from_secs(args.status_interval));
+            }
+            Err(e) => tracing::warn!(
+                target: "walshadow",
+                error = %format!("{e:#}"),
+                endpoint = source_conn.endpoint(),
+                "source unreachable — waiting for it, or for a repoint",
+            ),
+        }
+        tokio::time::sleep(SOURCE_SWAP_RETRY).await;
+        let Some(path) = args.ch_config.as_deref() else {
+            continue;
+        };
+        match walshadow::ch_emitter::load_effective(path, cli_source_base(args)).await {
+            Ok(table) => match SourceConn::from_table(&table).map(|mut next| {
+                // Preserve CLI slot override across reloads
+                if args.slot.is_some() {
+                    next.slot = args.slot.clone();
+                }
+                next
+            }) {
+                Ok(next) if next != *source_conn => {
+                    tracing::info!(
+                        target: "walshadow",
+                        from = source_conn.endpoint(),
+                        to = next.endpoint(),
+                        slot = next.slot.as_deref(),
+                        "source moved while waiting",
+                    );
+                    *source_conn = next;
+                    *cfg = source_conn.to_pg_config();
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(target: "walshadow", error = %e, "[source] reload"),
+            },
+            Err(e) => {
+                tracing::warn!(target: "walshadow", error = %format!("{e:#}"), "config reload")
+            }
+        }
+    }
+}
+
+/// Backoff between attempts at a moved `[source]` endpoint. The old feed keeps
+/// streaming meanwhile, so this only paces retries against an endpoint that is
+/// not up yet (repointed before the target accepts connections).
+const SOURCE_SWAP_RETRY: Duration = Duration::from_secs(2);
+
+/// Cluster plus the branch the stream is reading, what a resumed connection has
+/// to match.
+#[derive(Debug, Clone, Copy)]
+struct SourceBranch {
+    system_id: u64,
     timeline: u32,
+    /// Where that branch begins per the chain walshadow proved. A timeline
+    /// number is not unique across branches — two standbys of one primary,
+    /// promoted independently, are both timeline 2 under one system identifier
+    /// — so number equality alone accepts a sibling
+    /// (plans/failover.md §Lineage). `0` above timeline 1 means unrecorded.
+    begin: u64,
+}
+
+/// Dial the source and resume at `resume_lsn`, proving continuity first:
+///
+/// 1. same cluster, or foreign WAL replays into these artifacts
+/// 2. the live chain places the requested branch where walshadow left it,
+///    which is what separates a descendant from a sibling sharing its number
+/// 3. the requested branch still serves `resume_lsn`
+/// 4. the configured slot reaches `floor`, the position a restart asks for
+///
+/// A live timeline *newer* than the requested one is a promotion that landed
+/// under a stable endpoint, so the request stays on the requested branch: the
+/// walsender then ends it at the fork and the crossing takes over, needing no
+/// operator repoint and no daemon restart. `[source]` is live-reloadable, so
+/// the address reached here can differ from the one boot dialed and these
+/// proofs are what make that safe.
+///
+/// Resume is LSN-exact, so `WalStream`, filter, and catalog state stand and no
+/// WAL is re-read.
+async fn resume_source_feed(
+    cfg: &PgConfig,
+    slot: Option<&str>,
+    resume_lsn: u64,
+    branch: SourceBranch,
+    floor: u64,
+    status_interval: Duration,
+) -> Result<SourceFeed> {
+    let mut feed = SourceFeed::connect(cfg)
+        .await
+        .with_context(|| format!("connect source {}:{}", cfg.host, cfg.port))?
+        .with_status_interval(status_interval);
+    let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
+    let system_id: u64 = ident.sysid.parse().context("IDENTIFY_SYSTEM sysid")?;
+    anyhow::ensure!(
+        system_id == branch.system_id,
+        "source is system {system_id}, artifacts belong to {}",
+        branch.system_id,
+    );
+    anyhow::ensure!(
+        ident.timeline >= branch.timeline,
+        "source is on timeline {}, below the stream's {}; an older branch cannot \
+         serve what has already been read",
+        ident.timeline,
+        branch.timeline,
+    );
+    let raw_history = if ident.timeline > 1 {
+        feed.timeline_history(ident.timeline)
+            .await
+            .context("TIMELINE_HISTORY")?
+    } else {
+        None
+    };
+    match raw_history {
+        Some(raw) => {
+            let history = TimelineHistory::parse(ident.timeline, &raw).map_err(|source| {
+                TransitionError::HistoryMalformed {
+                    tli: ident.timeline,
+                    source,
+                }
+            })?;
+            prove_branch(&history, branch, resume_lsn)?;
+        }
+        // Timeline 1 has no history file, and a source serving none for a newer
+        // branch can place nothing; only a run that never left the branch it is
+        // asking for is provable without one
+        None if ident.timeline == branch.timeline && branch.begin == 0 => {}
+        None => Err(TransitionError::HistoryMissing {
+            tli: ident.timeline,
+        })?,
+    }
+    if let Some(name) = slot {
+        feed.prove_physical_slot(name, resume_lsn, floor)
+            .await
+            .map_err(TransitionError::from)?;
+    }
+    feed.start_physical_replication(slot, resume_lsn, branch.timeline)
+        .await
+        .with_context(|| format!("START_REPLICATION at {}", format_pg_lsn(resume_lsn)))?;
+    Ok(feed)
+}
+
+/// The live chain has to agree with the branch walshadow is reading, both about
+/// where it began and about it still owning `resume_lsn`. Typed with the
+/// crossing's own vocabulary, so a refused reconnect names the same proof a
+/// refused crossing would.
+fn prove_branch(
+    history: &TimelineHistory,
+    branch: SourceBranch,
+    resume_lsn: u64,
+) -> Result<(), TransitionError> {
+    let live_begin =
+        history
+            .begin_of(branch.timeline)
+            .ok_or_else(|| TransitionError::NotDescendant {
+                finished: branch.timeline,
+                live: history.target(),
+            })?;
+    // `0` above timeline 1 is unrecorded, not "begins at 0/0": `--ignore-cursor`
+    // adopts a live branch without a chain to read a switchpoint from
+    if branch.begin != 0 && live_begin != branch.begin {
+        return Err(TransitionError::SiblingBranch {
+            tli: branch.timeline,
+            stored_begin: branch.begin,
+            live_begin,
+        });
+    }
+    if !history.proves_ancestor(branch.timeline, resume_lsn) {
+        return Err(TransitionError::ResumePastFork {
+            next_lsn: resume_lsn,
+            switch_lsn: history.switchpoint_of(branch.timeline).unwrap_or(0),
+        });
+    }
+    Ok(())
+}
+
+/// `reason=` label for a refused reconnect. Same vocabulary as a refused
+/// crossing: an endpoint move that cannot proceed is a switchover proof
+/// failing, and "the swap failed" alone does not say which.
+fn swap_reason(err: &anyhow::Error) -> &'static str {
+    err.downcast_ref::<TransitionError>()
+        .map(TransitionError::reason)
+        .unwrap_or("source")
+}
+
+struct SourceRecovery<'a> {
     status_interval: Duration,
     backup: Option<&'a walrus::config::Settings>,
     spill_dir: &'a Path,
+    /// Published resume floor, which is what a slot on the far end has to still
+    /// reach — the reconnect's own `resume_lsn` sits above it
+    floor: &'a AtomicU64,
 }
 
 impl SourceRecovery<'_> {
-    /// Try source, replay archive gap, then return to source.
+    /// Try source, replay archive gap, then return to source. `cfg`, `slot`,
+    /// and `branch` are the live endpoint, slot name, and proved branch, passed
+    /// per call rather than held, so a recovery that starts after a `[source]`
+    /// reload or a crossing dials the new address under the new name and asks
+    /// for the descendant, with the archive read under its segment names.
+    #[allow(clippy::too_many_arguments)]
     async fn recover(
         &self,
         source_error: anyhow::Error,
+        cfg: &PgConfig,
+        slot: Option<&str>,
+        branch: SourceBranch,
         stream: &mut WalStream,
         record_sink: &mut (dyn RecordSink + Send),
         segment_sink: &mut (dyn walshadow::record::SegmentSink + Send),
@@ -2891,14 +3877,9 @@ impl SourceRecovery<'_> {
         // reaching for the archive. A removed-WAL (58P01) error means the
         // source genuinely can't serve it — skip straight to the archive.
         if !source_missing {
-            match SourceFeed::reconnect(
-                self.cfg,
-                self.slot,
-                resume_lsn,
-                self.timeline,
-                self.status_interval,
-            )
-            .await
+            let floor = self.floor.load(Ordering::Acquire);
+            match resume_source_feed(cfg, slot, resume_lsn, branch, floor, self.status_interval)
+                .await
             {
                 Ok(feed) => return Ok(feed),
                 Err(retry_error) => tracing::warn!(
@@ -2922,7 +3903,13 @@ impl SourceRecovery<'_> {
         // backoff, a removed-WAL error surfaces the operator-action message.
         let Some(settings) = self.backup else {
             return self
-                .reconnect_or_operator(resume_lsn, "no [backup] archive configured")
+                .reconnect_or_operator(
+                    cfg,
+                    slot,
+                    branch,
+                    resume_lsn,
+                    "no [backup] archive configured",
+                )
                 .await;
         };
         let storage = match settings.build_storage() {
@@ -2930,6 +3917,9 @@ impl SourceRecovery<'_> {
             Err(archive_error) => {
                 return self
                     .reconnect_or_operator(
+                        cfg,
+                        slot,
+                        branch,
                         resume_lsn,
                         &format!("build archive storage: {archive_error:#}"),
                     )
@@ -2940,7 +3930,7 @@ impl SourceRecovery<'_> {
 
         loop {
             let archive_segment =
-                fetch_archive_segment(settings, &storage, &seg_dir, self.timeline, resume_lsn)
+                fetch_archive_segment(settings, &storage, &seg_dir, branch.timeline, resume_lsn)
                     .await;
             let (name, bytes) = match archive_segment {
                 Ok(segment) => segment,
@@ -2954,6 +3944,9 @@ impl SourceRecovery<'_> {
                     );
                     return self
                         .reconnect_or_operator(
+                            cfg,
+                            slot,
+                            branch,
                             resume_lsn,
                             &format!("archive fallback failed: {archive_error:#}"),
                         )
@@ -2976,14 +3969,18 @@ impl SourceRecovery<'_> {
 
     async fn reconnect_or_operator(
         &self,
+        cfg: &PgConfig,
+        slot: Option<&str>,
+        branch: SourceBranch,
         resume_lsn: u64,
         archive_error: &str,
     ) -> Result<SourceFeed> {
         reconnect_source(
-            self.cfg,
-            self.slot,
+            cfg,
+            slot,
             resume_lsn,
-            self.timeline,
+            branch,
+            self.floor.load(Ordering::Acquire),
             self.status_interval,
         )
         .await
@@ -3273,6 +4270,7 @@ async fn bootstrap_build_mapping(
         flush_timeout: args
             .ch_flush_timeout_ms
             .map(std::time::Duration::from_millis),
+        source_slot: args.slot.clone(),
     };
     let (_resolver, config_rx) = ConfigResolver::new(
         emitter_cfg,
@@ -3961,6 +4959,78 @@ mod tests {
             "archive-only escape hatch must fail startup",
         );
         assert!(validate_transport_args(&args_from(&["--catalog-hold-timeout", "0"])).is_err());
+    }
+
+    /// Two standbys of one primary, promoted independently, are both timeline 2
+    /// under one system identifier. The chain places either one, so only where
+    /// the branch begins refuses the wrong one
+    #[test]
+    fn prove_branch_refuses_a_sibling_sharing_the_branch_number() {
+        let ours = TimelineHistory::parse(2, b"1\t0/3000000\tno recovery target\n").unwrap();
+        let sibling = TimelineHistory::parse(2, b"1\t0/5000000\tno recovery target\n").unwrap();
+        let branch = SourceBranch {
+            system_id: 7,
+            timeline: 2,
+            begin: ours.begin_of(2).unwrap(),
+        };
+        prove_branch(&ours, branch, 0x400_0000).expect("our own branch");
+        let err = prove_branch(&sibling, branch, 0x600_0000).unwrap_err();
+        assert_eq!(err.reason(), "sibling_branch", "{err}");
+    }
+
+    #[test]
+    fn prove_branch_refuses_a_position_past_the_branchs_own_fork() {
+        let history = TimelineHistory::parse(3, b"1\t0/3000000\n2\t0/5000000\n").unwrap();
+        let branch = SourceBranch {
+            system_id: 7,
+            timeline: 2,
+            begin: 0x300_0000,
+        };
+        prove_branch(&history, branch, 0x400_0000).expect("still inside timeline 2");
+        let err = prove_branch(&history, branch, 0x500_0000).unwrap_err();
+        assert_eq!(err.reason(), "resume_past_fork", "{err}");
+        let absent = SourceBranch {
+            timeline: 9,
+            ..branch
+        };
+        assert_eq!(
+            prove_branch(&history, absent, 0x100).unwrap_err().reason(),
+            "timeline_not_descendant",
+        );
+    }
+
+    #[test]
+    fn stream_branch_names_the_branch_by_its_switchpoint() {
+        let history = TimelineHistory::parse(2, b"1\t0/3000000\tno recovery target\n").unwrap();
+        let stream = WalStream::new(2, WAL_SEG_SIZE, 0x300_0000).unwrap();
+        assert_eq!(stream_branch(&history, 7, &stream).begin, 0x300_0000);
+    }
+
+    #[test]
+    fn promotion_gate_defaults_are_not_ready() {
+        assert!(!PromotionGate::default().ready);
+        assert_eq!(
+            PromotionGate::blocked("not_paused").blocked_on,
+            "not_paused"
+        );
+        assert_eq!(
+            PromotionGate::unreachable().blocked_on,
+            "source_unreachable",
+        );
+    }
+
+    #[test]
+    fn swap_reason_reads_the_refusal_out_of_the_error() {
+        let sibling = anyhow::Error::from(TransitionError::SiblingBranch {
+            tli: 2,
+            stored_begin: 1,
+            live_begin: 2,
+        });
+        assert_eq!(swap_reason(&sibling), "sibling_branch");
+        assert_eq!(
+            swap_reason(&anyhow::anyhow!("connection refused")),
+            "source"
+        );
     }
 
     #[test]

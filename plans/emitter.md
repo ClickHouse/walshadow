@@ -608,7 +608,10 @@ operational contract:
   at placement so they never pin the watermark
 - trailing non-commit WAL acks only when the xact buffer is empty and
   every seq is done — a quiescent-tick nudge can't claim rows still in
-  flight
+  flight. The collector holds the highest such position and publishes it
+  once the frontier catches up: a source that goes quiet right after its
+  last commit sends no second nudge, so a dropped one would pin
+  `emitter_ack` at that commit
 - a placed-but-never-acked batch pins the watermark forever by design
   (retry exhaustion is fatal first); the daemon's stall watchdog
   surfaces the oldest incomplete seq

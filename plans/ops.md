@@ -277,16 +277,20 @@ cross-links: [filter.md](filter.md) (`filter_durable_lsn`),
 ## Manifest
 
 [`src/source/manifest.rs`](../src/source/manifest.rs).
-`{spill_dir}/manifest.toml`, schema version 1:
+`{spill_dir}/manifest.toml`, schema version 2:
 
 ```toml
-version = 1
+version = 2
 # resume LSN = decode floor = GC cut; segment-aligned, archive-clamped
 floor = "0/6A000000"
 
 [source]           # identity gate for every spill-dir artifact
 system_id = 7334001234567890123
-timeline = 1
+timeline = 1       # branch owning `floor`; what a restart requests there
+timeline_begin = "0/0"   # where that branch begins; 0/0 above TLI 1 = unrecorded
+
+[wal]              # branch the pump reads; absent pre-crossing
+stream_timeline = 1
 
 [lsn]              # pg_lsn text form; six roles
 source_received = "0/6A2B3C4D"
@@ -307,13 +311,17 @@ after each persist: cut ≤ resume by construction, never by test. An
 operator `--start-lsn` rewind below the floor bypasses that guarantee
 (same contract as wiped spill)
 
-`[source]` gates every nonvolatile spill-dir artifact: reusing a spill
+`system_id` gates every nonvolatile spill-dir artifact: reusing a spill
 dir against a different cluster must not load foreign resume LSNs,
-retire oids, or backfill state. `system_id` mismatch is fatal (remedy:
-wipe the spill dir or point at the old one). Timeline-only mismatch is
-fatal too; `--ignore-cursor` adopts the live timeline (promoted source)
-and greenfields the LSNs, keeping the ledgers — same cluster, oids and
-LSNs stay valid
+retire oids, or backfill state. Mismatch is fatal (remedy: wipe the
+spill dir or point at the old one). `timeline` is not gated by equality:
+a newer live timeline is a promotion, and whether the stored branch is
+an ancestor is a question for the source's history, answered at boot.
+`timeline_begin` is gated by equality, because the number alone cannot
+tell the branch walshadow crossed onto from a sibling promoted out of the
+same primary ([failover.md](failover.md) §Lineage). `--ignore-cursor` re-baselines
+onto the live branch when no proof exists, greenfielding the LSNs while
+keeping the ledgers — same cluster, oids stay valid
 
 Writer is [`crate::fs::write_atomic`]: write+fsync `manifest.toml.tmp`,
 rename, fsync dir. `kill -9` mid-write leaves a stale `.tmp` no boot
@@ -386,6 +394,50 @@ restart but surface as metrics
 
 Dual-artifact contract for `kill -9` + restart: spill dir + manifest
 persist between kill and restart
+
+### What a restart rebuilds
+
+Restart is ordinary rather than an exception path because every runtime
+fact belongs to one of three classes, and boot rebuilds each the same way
+every time:
+
+1. **Re-read from the floor.** `WalStream` position, filter and walker
+   state, `XactBuffer` contents, boundary holds, pipeline batches, spill
+   and TOAST spool. The floor is `resume_safe_lsn`, so replaying
+   `[floor, head]` reproduces them and CH drops the duplicate rows by
+   `_lsn`
+2. **Owned by a durable artifact.** Floor plus the six LSNs (manifest),
+   shape history (descriptor log), sealed segments + per-segment manifests
+   + `<tli>.history` (filtered dir), retire and backfill ledgers, config
+   (base + `conf.d`). Each carries the identity gate deciding whether it
+   may be reused at all
+3. **Re-derived from a live peer at boot.** Catalog filenodes and the
+   observed-from xid (source `pg_class`), shadow replay position and GUC
+   floor (shadow `pg_control`), cluster identity (`IDENTIFY_SYSTEM`)
+
+Which class a fact belongs to is a decision, not an accident: class 1 costs
+re-read, class 2 costs an fsync and a gate, class 3 costs a query and holds
+only while the peer agrees. Counters and gauges are deliberately outside
+all three — Prometheus reads a process, not a cursor. A fact in none of
+them that something else depends on is a restart bug
+
+Class-2 gates are what make class 1 safe: replaying WAL into artifacts
+belonging to another cluster, branch, or PG major would corrupt them
+quietly, so system id, PG major, database OID, and segment size are proved
+before any byte is pushed
+
+The timeline chain is class 3 rather than class 2, and deliberately: the
+source's `TIMELINE_HISTORY` is where switchpoints come from, so walshadow
+never writes its own conclusion beside PostgreSQL's record of the same fact.
+The floor's own branch is the exception, and class 2 for the same reason the
+identifier is: a sibling answers the class-3 query with a different branch
+under the same number, so `[source] timeline_begin` carries what walshadow
+proved into the next boot. The `<tli>.history` bytes in the filtered dir are
+for the shadow's `restore_command`, not for boot. A crossing then does the one thing that
+keeps class 1 honest across a fork: it commits the branch with the floor
+before anything else moves onto the descendant, so `[source] timeline` and
+`[wal] stream_timeline` agree at every restart point
+([failover.md](failover.md) §Crossing order)
 
 ## Kill-restart drill
 

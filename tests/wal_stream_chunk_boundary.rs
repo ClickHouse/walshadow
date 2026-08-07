@@ -177,7 +177,11 @@ async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
         0,
         1024 * 1024 * 1024,
     )));
-    let conn = state.lock().await.register_connection(0);
+    let conn = state
+        .lock()
+        .await
+        .register_connection(0, 1, None)
+        .expect("current timeline");
     let sink = ShadowStreamSink::new(state.clone());
     stream.set_bytes_sink(Box::new(sink));
 

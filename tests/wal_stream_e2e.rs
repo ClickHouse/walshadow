@@ -31,7 +31,7 @@ use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
 use walshadow::record::{CollectingRecordSink, MetricsRecordSink, WAL_SEG_SIZE};
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::source_feed::{SourceFeed, StandbyStatus};
+use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
 
 fn pg_available() -> bool {
@@ -169,12 +169,12 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         let apply_lsn = stream.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut buf),
+            feed.next_event(StandbyStatus::collapsed(apply_lsn), &mut buf),
         )
         .await;
         let chunk = match next {
-            Ok(Ok(Some(c))) => c,
-            Ok(Ok(None)) => break, // CopyDone
+            Ok(Ok(SourceEvent::Wal(c))) => c,
+            Ok(Ok(_)) => break, // timeline end or source shutdown
             Ok(Err(e)) => panic!("source feed error: {e:#}"),
             Err(_) => continue, // status tick
         };
@@ -441,12 +441,12 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         let apply_lsn = stream.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut buf),
+            feed.next_event(StandbyStatus::collapsed(apply_lsn), &mut buf),
         )
         .await;
         let chunk = match next {
-            Ok(Ok(Some(c))) => c,
-            Ok(Ok(None)) => break,
+            Ok(Ok(SourceEvent::Wal(c))) => c,
+            Ok(Ok(_)) => break, // timeline end or source shutdown
             Ok(Err(e)) => panic!("source feed error: {e:#}"),
             Err(_) => continue,
         };
@@ -718,12 +718,12 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         let apply_lsn = stream.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(1),
-            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut buf),
+            feed.next_event(StandbyStatus::collapsed(apply_lsn), &mut buf),
         )
         .await;
         let chunk = match next {
-            Ok(Ok(Some(c))) => c,
-            Ok(Ok(None)) => break,
+            Ok(Ok(SourceEvent::Wal(c))) => c,
+            Ok(Ok(_)) => break, // timeline end or source shutdown
             Ok(Err(e)) => panic!("source feed error: {e:#}"),
             Err(_) => continue,
         };
@@ -853,12 +853,12 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         let apply_lsn = stream2.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            feed2.next_chunk(StandbyStatus::collapsed(apply_lsn), &mut resume_buf),
+            feed2.next_event(StandbyStatus::collapsed(apply_lsn), &mut resume_buf),
         )
         .await;
         let chunk = match next {
-            Ok(Ok(Some(c))) => c,
-            Ok(Ok(None)) => break,
+            Ok(Ok(SourceEvent::Wal(c))) => c,
+            Ok(Ok(_)) => break, // timeline end or source shutdown
             Ok(Err(e)) => panic!("resume feed error: {e:#}"),
             Err(_) => continue,
         };

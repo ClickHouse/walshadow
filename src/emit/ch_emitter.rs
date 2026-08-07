@@ -163,10 +163,8 @@ pub struct EmitterConfig {
     /// overlay tables. `None` (field empty or omitted) disables the whole
     /// overlay subsystem — no boot seed, no config_decoder, pure TOML+CLI.
     pub runtime_config_schema: Option<String>,
-    /// `[source] slot`: physical replication slot to create + stream from on
-    /// the source. `Some` reserves WAL so a stalled/disconnected consumer
-    /// resumes without recycling; `None` runs slotless. Boot-only.
-    pub source_slot: Option<String>,
+    /// Source PostgreSQL connection and slot
+    pub source: crate::config::SourceConn,
     /// `[memory] resident_payload_max`: global resident payload permit
     /// pool ([`crate::budget::MemoryBudget`])
     pub resident_payload_max: usize,
@@ -322,7 +320,7 @@ impl Default for EmitterConfig {
             drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
             plan_disk_max: DEFAULT_PLAN_DISK_MAX,
             runtime_config_schema: None,
-            source_slot: None,
+            source: crate::config::SourceConn::default(),
             resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
             inline_value_max: DEFAULT_INLINE_VALUE_MAX,
             decoder_pool_size: DEFAULT_DECODER_POOL,
@@ -648,13 +646,7 @@ impl EmitterConfig {
                     Duration::from_millis(u64::try_from(v).unwrap_or(0));
             }
         }
-        if let Some(src) = root.get("source").and_then(Value::as_table)
-            && let Some(slot) = src.get("slot").and_then(Value::as_str)
-            && !slot.is_empty()
-        {
-            // Empty string == omitted == slotless.
-            out.source_slot = Some(slot.into());
-        }
+        out.source = crate::config::SourceConn::from_table(root).map_err(EmitterError::Config)?;
         if let Some(bk) = root.get("backup").and_then(Value::as_table) {
             out.backup = Some(parse_backup(bk)?);
         }

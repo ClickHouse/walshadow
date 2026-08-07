@@ -1,620 +1,258 @@
 # Source timeline failover
 
-Keep CDC live when source endpoint moves to a promoted PostgreSQL
-primary on a descendant timeline while walshadow still reads an
-ancestor timeline. Continue from durable floor, consume remaining
-ancestor WAL through fork point, switch timelines, and resume without
-`--ignore-cursor`, rebootstrap, or skipped WAL
+Operator-driven switchover is built, restart and stable endpoints included
+([../failover.md](../failover.md)): pause below the fork, prove the
+frontier and the branch, promote, resume, and commit a resume position on
+the descendant behind a barrier. This doc covers what that leaves out —
+unplanned promotion, archive-side timeline resolution, and
+ancestor-timeline base backups
 
-This plan covers source-consumer continuity. It does not make
-walshadow an HA orchestrator or durability witness. WAL relay into a
-lagging full PostgreSQL standby remains
+Source-consumer continuity only. Walshadow is not an HA orchestrator or a
+durability witness; WAL relay into a lagging full PostgreSQL standby is
 [sync_commit_witness.md](sync_commit_witness.md)
 
-## Target scenario
-
-```
-old primary, TLI 4                    promoted primary, TLI 5
-
-        WAL through A ────────────────┐
-                                     ├── fork at F ── TLI 5 WAL ── H
-walshadow durable floor R ───────────┘
-                     R < F < H
-```
-
-Walshadow reconnects at `R` while `IDENTIFY_SYSTEM` reports timeline
-5. Timeline 4 belongs to timeline 5 history. PostgreSQL can serve
-`START_REPLICATION ... R TIMELINE 4`, stop at `F`, report timeline 5
-and its start position, then serve timeline 5
-
-Support both ways transition becomes visible:
-
-1. Existing connection serves a standby that gets promoted. Walsender
-   turns requested timeline historic, reaches fork point, then ends
-   COPY with next-timeline result
-2. Connection drops and HA endpoint resolves to promoted primary.
-   `IDENTIFY_SYSTEM` reports newer timeline before walshadow resumes
-   ancestor stream
-
-Walk more than one generation. A consumer on timeline 2 may reconnect
-to a primary on timeline 5 and cross `2 → 3 → 5` one reported
-transition at a time
-
-## Scope
-
-Automatic continuation requires all of:
-
-- unchanged PostgreSQL system identifier
-- stored timeline present in live primary's history
-- resume position on that ancestral branch, at or before its fork
-- required WAL retained by source slot, `pg_wal`, or configured archive
-- promoted primary carrying configured physical slot, when slot mode
-  is enabled
-- no externally visible walshadow publication from abandoned branch
-  beyond fork point
-
-Reject rather than guess when any proof fails
-
-Out of scope:
+Out of scope throughout:
 
 - leader election, old-primary fencing, DNS or proxy orchestration
-- switching to unrelated system identifier
-- accepting sibling timeline when stored branch is absent from live
-  history
-- compensating ClickHouse data already published from an abandoned
-  branch beyond fork point
+- switching to an unrelated system identifier, or accepting a sibling
+  timeline when the stored branch is absent from live history
+- compensating ClickHouse data already published from an abandoned branch
+  beyond the fork
 - manufacturing WAL missing from source and archive
-- promoting schema-only shadow into application primary
+- promoting the schema-only shadow into an application primary
 - preserving prepared transactions before
   [two_phase_commit.md](two_phase_commit.md) lands
 
-## Current behavior
+## Slotless pause windows
 
-Current paths fail closed, but cannot continue:
+Slot mode keeps a pause window safe with source-local WAL and proves the
+target's slot before the promotion ([../failover.md](../failover.md)
+§Slot). A slotless switchover can instead catch up from a continuous S3
+archive after `wal_keep_size` recycles the source WAL, which needs the
+archive resolution below: request ancestor WAL from the promoted primary
+while retained, fall back to timeline-aware segment names, and keep the
+current missing-WAL failure when neither covers the floor
 
-- `SourceFeed::reconnect` rejects any `IDENTIFY_SYSTEM` timeline
-  mismatch before issuing `START_REPLICATION`
-- `SourceFeed::next_chunk` maps backend `CopyDone` to `Ok(None)`;
-  daemon treats it as terminal shutdown and never reads
-  `next_tli` / `next_tli_startpos`
-- `start_physical_replication` requires CopyBoth. PostgreSQL may return
-  immediate next-timeline result when requested historic timeline
-  already ends at requested position
-- `SourceRecovery`, `WalStream`, archive lookup, segment naming,
-  `ShadowStreamState`, and manifest writer retain boot timeline
-- shadow-facing walsender exposes empty timeline history and cannot
-  finish one timeline into next
-- manifest and descriptor-log identity treat timeline change as
-  foreign source; `--ignore-cursor` adopts live timeline by discarding
-  continuity
-- no transition fence retires uncommitted xid-scoped state abandoned
-  at fork
+## Unplanned promotion
 
-Staged pending-catalog timeline work is orthogonal. Its "timeline"
-means relation descriptor versions inside one transaction, not
-PostgreSQL WAL `TimeLineID`
+The barrier carries over unchanged — it is about walshadow's own pipeline,
+not about how `F` was chosen — but it runs *after* the truncation of
+undispatched bytes past `F`, since the archive-seal condition can only be met
+once the partial record holding the segment is dropped. What stays
+failover-only is the fence and the contrecord
 
-## Correctness invariants
+### Transaction-state fence
 
-### Lineage
+Replaces the `open_xact_at_fork` refusal. A timeline transition is ordered
+record-stream control, not a mutation racing the decoder worker: add a
+control item after every complete ancestor record and wait for worker
+acknowledgment. At the fence:
 
-System identifier owns artifacts. Timeline identifies selected branch
-through those artifacts
-
-- system identifier mismatch stays fatal
-- same system identifier is necessary, not sufficient
-- live history must prove stored timeline is ancestor
-- history entry must prove resume LSN belongs to stored timeline
-- every transition must increase timeline ID and match server-reported
-  switch LSN
-- sibling branch or backward timeline report stays fatal
-
-### Byte and record continuity
-
-- feed bytes to `WalStream` exactly once in increasing branch order
-- accept repeated prefix bytes only inside transition verifier, never
-  send them through filter or decoder twice
-- emit no complete record from abandoned ancestor suffix beyond fork
-- require last dispatched record end at or below switch LSN
-- discard only partial, undispatched record bytes beyond switch LSN
-- poison stream when server reports fork behind dispatched record
-
-PostgreSQL can have `sentPtr > switch_lsn` when promotion catches a
-partially received WAL record. Such suffix cannot replay on new branch.
-Transition logic must truncate it before accepting descendant bytes
-
-### Durable progress
-
-Timeline associated with durable resume floor, not furthest byte
-received. Pipeline may already ingest timeline 5 while emitter floor
-still belongs to timeline 4
-
-- persist `(floor_tli, floor_lsn)` atomically
-- restart requests `floor_tli` at `floor_lsn`, even when live primary
-  reports newer timeline
-- advance `floor_tli` only after floor crosses corresponding fork
-- retain transition metadata until every durable floor passes it
-- keep GC cutoff at or below same floor on same branch
-
-### External publication
-
-Automatic switch is safe only while live branch fork is not behind
-externally durable publication
-
-- reject when `emitter_ack_lsn > switch_lsn` on abandoned branch
-- audit schema-event acknowledgment against same rule
-- reject when descriptor history or other durable side effects beyond
-  fork cannot be rolled back without touching ClickHouse
-- allow received but undispatched partial bytes past fork to truncate
-- allow uncommitted buffered transactions at or before fork to abandon
-
-Target lagging case has resume and publication frontiers below fork,
-so no compensation is needed
-
-### Shadow continuity
-
-- shadow sees same system identifier and selected timeline chain
-- history file content matches source history
-- shadow receives all filtered WAL through ancestor fork before
-  descendant WAL
-- fork-containing segment has correct descendant timeline identity
-- catalog boundary on descendant timeline cannot pass until shadow
-  replay follows transition
-- shadow reconnect at any point can recover from filtered archive plus
-  timeline history without byte gap
-
-## Source replication protocol
-
-### Events
-
-Replace `Option<WalChunk>` end signal with explicit protocol outcome:
-
-```rust
-enum SourceEvent<'a> {
-    Wal(WalChunk<'a>),
-    TimelineEnd {
-        finished_tli: u32,
-        next_tli: u32,
-        switch_lsn: u64,
-    },
-    Shutdown,
-}
-```
-
-Distinguish controlled server shutdown from historic-timeline end.
-`CopyDone` alone does not make distinction; finish COPY exchange and
-parse following response:
-
-- one row with `next_tli`, `next_tli_startpos` means timeline end
-- CommandComplete without row means controlled stream termination
-- malformed row, missing command completion, or protocol regression
-  poisons connection
-
-When backend sends `CopyDone`:
-
-1. send frontend `CopyDone`
-2. read RowDescription/DataRow when present
-3. validate exactly one row and at least two fields
-4. parse `next_tli` and PostgreSQL LSN text
-5. consume CommandComplete and ReadyForQuery
-6. return `TimelineEnd`
-
-`START_REPLICATION` needs matching start outcome:
-
-```rust
-enum StartOutcome {
-    Streaming,
-    TimelineEnd {
-        next_tli: u32,
-        switch_lsn: u64,
-    },
-}
-```
-
-Historic request at or after fork may skip CopyBoth and return result
-immediately. Feed this through same transition path
-
-### Reconnect
-
-Change reconnect contract from "live timeline must equal requested"
-to:
-
-1. connect and run `IDENTIFY_SYSTEM`
-2. require system identifier equality with manifest
-3. if live timeline equals requested, start normally
-4. if live timeline is newer, fetch `TIMELINE_HISTORY <live_tli>`
-5. parse history and prove requested timeline ancestry at resume LSN
-6. issue `START_REPLICATION` using requested timeline, not live timeline
-
-Let PostgreSQL walsender enforce branch membership again. Client-side
-history validation protects persistent artifacts before stream starts;
-server-side validation protects each replication request
-
-Persist exact history bytes returned by source. Do not synthesize
-history from timeline numbers
-
-### Transition coordinator
-
-Add one owner for mutable source branch state:
-
-```rust
-struct TimelineCursor {
-    system_id: String,
-    stream_tli: u32,
-    next_lsn: u64,
-    history: TimelineHistory,
-}
-```
-
-`SourceRecovery` reads cursor instead of storing boot timeline.
-Archive lookup, reconnect, status logging, manifest snapshots, and
-metrics read same owner
-
-On `TimelineEnd`:
-
-1. stop source ingestion
-2. validate `finished_tli == stream_tli`
-3. validate `next_tli > finished_tli`
-4. validate switch LSN against history and publication frontier
-5. establish ordered pipeline transition fence
-6. prepare fork segment for descendant bytes
-7. install source history and downstream shadow transition
-8. change `stream_tli`
-9. request descendant timeline
-10. resume ingestion after prefix validation
-
-Repeat until stream reaches live timeline
-
-## Fork-segment handling
-
-Always restart descendant timeline from fork segment start, matching
-PostgreSQL `pg_receivewal` behavior:
-
-```text
-segment_start = align_down(switch_lsn)
-```
-
-Do not pass repeated prefix through `WalStream`. Transition adapter:
-
-1. retain current segment prefix already consumed on ancestor
-2. truncate undispatched ancestor suffix after switch LSN
-3. request descendant from `segment_start`
-4. compare repeated `[segment_start, switch_lsn)` bytes against retained
-   prefix
-5. fail on any mismatch
-6. suppress matching prefix
-7. feed bytes from `switch_lsn` onward through normal `WalStream::push`
-
-This provides three properties:
-
-- detects corrupt or sibling branch despite matching system ID
-- avoids double classification and duplicate xid-buffer mutations
-- builds complete descendant fork segment using verified common prefix
-
-`WalStream` needs `transition_timeline(next_tli, switch_lsn)`:
-
-- require `dispatched_lsn <= switch_lsn <= next_lsn`
-- truncate only walker state beyond switch LSN
-- clear partial-record continuation state
-- keep filter state established by complete records before fork
-- change segment identity before fork segment seals
-- preserve cumulative metrics
-
-Segments fully before fork retain ancestor filename. Fork-containing
-segment seals under descendant timeline because prefix is byte-equal
-and suffix belongs to descendant. Persist source history beside
-filtered archive so PostgreSQL recovery can select it
-
-Test multiple switches inside one 16 MiB segment. Final segment name
-must use newest selected timeline while each suppressed prefix matches
-every intermediate branch
-
-## Transaction-state fence
-
-Timeline transition is ordered record-stream control, not direct
-mutation racing decoder worker. Add control item after all complete
-ancestor records and wait for worker acknowledgment
-
-At fence:
-
-- finish every commit or abort record dispatched before switch
-- abandon unresolved ordinary transactions from ancestor
-- remove their raw heap records, toast chunks, and resident/spill
-  accounting from `XactBuffer`
-- clear `PendingCatalog` speculative slots
-- clear dirty transaction tree and unresolved subtransaction mapping
-- clear smgr markers owned by abandoned transactions
+- finish every commit or abort record dispatched before the switch
+- abandon unresolved ordinary transactions from the ancestor, removing
+  their raw heap records, TOAST chunks, and resident/spill accounting from
+  `XactBuffer`
+- clear `PendingCatalog` speculative slots, the dirty transaction tree,
+  unresolved subtransaction mapping, and smgr markers owned by abandoned
+  transactions
 - reset pending boundary holds
-- audit catalog tracker for uncommitted pg_class observations; reseed
-  conservatively from new source or caught-up shadow
-- advance resume-safe accounting past discarded uncommitted records
+- audit the catalog tracker for uncommitted `pg_class` observations, and
+  reseed conservatively from the new source or a caught-up shadow
+- advance resume-safe accounting past the discarded uncommitted records
 
-No uncommitted ordinary transaction survives source promotion. Prepared
-transactions differ, PostgreSQL can preserve and later finish them on
-new primary. Keep failover unsupported when prepared state is present
-until gxid-keyed buffering from
-[two_phase_commit.md](two_phase_commit.md) defines transition behavior
+No uncommitted ordinary transaction survives a source promotion. Prepared
+transactions do — PostgreSQL can finish them on the new primary — so keep
+them an explicit refusal until gxid-keyed buffering
+([two_phase_commit.md](two_phase_commit.md)) defines the behavior, and
+distinguish `prepared_xact_present` from `open_xact_at_fork`. The
+descriptor log receives only committed shapes, so pending slots drop
+without durable compensation
 
-Descriptor log receives only committed shapes, so pending slots drop
-without durable compensation. If any durable batch lies beyond reported
-fork, reject automatic switch
+### Overwrite contrecord
 
-## Manifest and descriptor history
+Replaces the `overwrite_contrecord_at_fork` refusal. Abrupt promotion
+after a torn record moves `F` below bytes already received: end of log
+becomes `missingContrecPtr`, the descendant's fork page carries
+`XLP_FIRST_IS_OVERWRITE_CONTRECORD` (0x0008), and its first record is
+`XLOG_OVERWRITE_CONTRECORD`, which a replaying server FATALs on unless its
+own reader saw the same aborted contrecord at that LSN. Page-header
+parsing accepts flags `0x0007`, so such a page reads as corrupt rather
+than as a typed transition. Accept the flag, and reproduce the aborted
+contrecord for the shadow so its reader agrees
 
-### Manifest
+## Archive paths
 
-Bump schema. Separate ownership from branch cursor:
+- the archive fallback fetches segments at the stream's timeline, so a
+  fork inside the range reads as a missing segment. Name each segment from
+  the chain the way boot names the floor's — per segment, so the fork
+  segment resolves to the descendant and an absence below it is a real gap
+  (`tli_of_segment`, [../failover.md](../failover.md) §Lineage). Fetch and
+  validate history files from the archive first
+- never substitute `<name>.partial`. The ancestor's last partial segment
+  is archived under that name and recovery never reads it
+  (`CleanupAfterArchiveRecovery`), so neither filtered output nor archive
+  lookup may depend on it
+- the fork segment's verified prefix becomes durable only when the segment
+  seals or the daemon flushes its partial, so an archive-only shadow
+  reconnecting inside the fork segment has nothing to read until
+  descendant WAL fills it. Make the prefix durable under the descendant
+  name at the crossing, and give the wait its own state — parked at `F`
+  waiting for a seal, not generic replay lag. `archive_timeout` on the
+  source bounds it by forcing a segment switch
 
-```toml
-[source]
-system_id = 7334001234567890123
+## Ancestor-timeline base backup
 
-[wal]
-floor_timeline = 4
-stream_timeline = 5
+Every replay that starts from a base backup inherits the backup's
+timeline, and that timeline is an ancestor whenever a promotion happened
+after the backup. Same crossing, different driver: the fork sits inside a
+bounded replay range rather than arriving on a live socket
 
-[lsn]
-floor = "0/6A000000"
-source_received = "0/6B123456"
-```
+Where a fixed boot timeline appears:
 
-Exact field layout may keep current top-level `floor`; invariant is
-atomic pairing of floor LSN and floor timeline
+- object-store bootstrap and add-table backfill take the timeline from the
+  backup name (`parse_timeline_from_backup_name`) and walk `SegmentName`
+  forward with it (`fetch_gap_segments`), so a fork inside the gap range
+  aborts the pass
+- direct bootstrap takes `StartInfo.timeline` from `BASE_BACKUP`; a backup
+  served by a standby carries that standby's timeline
+- gap pre-scan and gap replay each build a `WalStream` for one timeline,
+  so both need the crossing primitive the live pump uses
+- a shadow seeded from that backup starts at its `pg_control` timeline and
+  must cross the same fork during catchup
 
-Store discovered timeline transitions or history-file references so
-restart and archive recovery can resolve `timeline_at(floor)`. Keep
-`stream_timeline` diagnostic; never use it in place of
-`floor_timeline`
+Rules: resolve the timeline through parsed history, per segment for names
+and per LSN for which branch wrote a record; fetch history files before
+segments (wal-rus's WAL fetch already routes `*.history`
+uncompressed); name the fork segment with the descendant timeline and
+treat the absent ancestor name as expected; treat the backup's start and
+stop timeline as lineage input rather than identity, rejecting a backup
+whose timeline is absent from live history
+(`backup_timeline_not_ancestor`); place history files in the filtered dir
+before the shadow needs them
 
-Boot:
+Bootstrapping directly from a standby is the interesting subcase: backup,
+first WAL, and shadow all start on the ancestor, so a promotion afterwards
+makes the crossing mandatory before the first opt-in boundary can pass
 
-1. load system ID, floor timeline, floor LSN, and known history
-2. identify live source
-3. reject system ID mismatch
-4. fetch live history when timeline differs
-5. prove floor timeline ancestry and floor membership
-6. start at persisted floor timeline and walk forward
+## Remaining protocol edges
 
-Remove `--ignore-cursor` requirement for valid descendant. Preserve
-flag as explicit rebaseline for unprovable or intentionally discarded
-state
+- `start_physical_replication` requires CopyBoth. PostgreSQL skips COPY
+  and answers with the next-timeline result when the requested historic
+  timeline already ends at the requested position. Nothing asks for that
+  position — boot resolves per segment onto the descendant, and a reconnect
+  where the chain ends the branch routes to the crossing instead
+  ([../failover.md](../failover.md) §Reconnect) — so it stays a protocol
+  error rather than a handled `StartOutcome::TimelineEnd`
+- `source_received` is the highest `server_wal_end` seen on the socket,
+  bookkeeping that gates nothing and sits above the consumed frontier by
+  whatever the source flushed but had not sent. Only its frozen pause copy
+  is a decision input
+- staged pending-catalog timeline work is orthogonal: its "timeline" means
+  relation descriptor versions inside one transaction, not WAL
+  `TimeLineID`
 
-### Descriptor log
+## Invariants the unbuilt work must hold
 
-Timeline cannot remain scalar foreign-source identity. Bind log to:
-
-- PostgreSQL major
-- system identifier
-- database OID
-- WAL segment size
-- selected lineage through each covered LSN
-
-Record timeline transitions durably in descriptor-log metadata or
-shared manifest history. On open, prove every durable descriptor batch
-belongs to live branch. Reject log whose covered head extends beyond
-fork onto sibling branch
-
-Migration from existing format can treat header timeline as lineage
-origin. Accept newer live timeline only when source history contains
-origin through log's covered range
-
-## Shadow-facing replication
-
-Extend wal-rus server surface from single timeline to supplied history:
-
-- dynamic `IDENTIFY_SYSTEM` current timeline
-- exact `TIMELINE_HISTORY <tli>` filename and bytes
-- per-connection requested timeline
-- historic stream cutoff
-- server `CopyDone`
-- next-timeline result after client `CopyDone`
-- immediate result when requested position already reaches fork
-
-Source transition coordinator publishes history before advertising new
-timeline. Existing shadow connection finishes ancestor stream at fork,
-then follows descendant using normal PostgreSQL walreceiver behavior
-
-Keep filtered bytes available for lagging shadow:
-
-- sealed ancestor segments before fork
-- descendant fork segment with verified common prefix
-- descendant segments after fork
-- history files required to select them
-
-Disconnect fallback may remain for broken clients, but normal path must
-complete PostgreSQL timeline protocol. Blind socket close risks
-walreceiver repeatedly requesting old timeline without learning next
-timeline
-
-Boundary gate remains final safety check. Do not capture descendant
-catalog state until shadow reports replay on descendant branch through
-boundary LSN
-
-## Slot and archive requirements
-
-Slot mode:
-
-- require configured slot on promoted primary
-- verify slot type is physical
-- verify slot can serve stored floor, including ancestor history
-- prefer PG 17 failover slots synchronized to standby
-- support pre-PG-17 operator-created slot only with explicit position
-  validation
-- never create missing failover slot at current head and call
-  continuation successful
-
-Slotless mode:
-
-- request ancestor WAL from promoted primary while retained
-- fall back to archive by timeline-aware segment name
-- fetch and validate history files from archive
-- retain current missing-WAL failure when neither source nor archive
-  covers floor
-
-Archive recovery must advance timeline rather than treating missing next
-ancestor segment as generic archive exhaustion. Resolve absence against
-known switchpoint:
-
-- before switchpoint, missing segment is real gap
-- at switchpoint, select descendant fork segment
-- after switchpoint, fetch descendant timeline
+- transition metadata survives until every durable floor passes it, and
+  the GC cutoff stays at or below that floor on the same branch
+- the descriptor log's covered range never claims a branch history cannot
+  place
+- the shadow sees the same identifier and the same branch chain, receives
+  all filtered WAL through the ancestor fork before any descendant WAL,
+  and can recover from filtered archive plus history without a byte gap
+- repeated prefix bytes reach the transition verifier only, never the
+  filter or decoder twice
+- a fork reported behind an already-dispatched record poisons the stream
 
 ## Failure policy
 
-Expose typed terminal reasons:
-
-- `system_id_changed`
-- `timeline_not_descendant`
-- `resume_past_fork`
-- `published_past_fork`
-- `history_missing`
-- `history_malformed`
-- `fork_prefix_mismatch`
-- `slot_missing`
-- `slot_too_new`
-- `wal_missing`
-- `shadow_transition_failed`
-- `prepared_xact_present`
-
-Keep retry only for connection and transient storage errors. Lineage,
-prefix, publication, and slot-position failures require operator action
-
-Never fall back from failed lineage proof to live head automatically
+Reasons the built crossing does not yet emit: `wal_missing`,
+`shadow_transition_failed`, `prepared_xact_present`,
+`overwrite_contrecord_at_fork`, `backup_timeline_not_ancestor`. Retry stays
+limited to connection and transient storage errors, and a terminal refusal
+parks the pump ([../failover.md](../failover.md) §Refusals)
 
 ## Observability
 
-Add:
-
-- `walshadow_source_timeline`
-- `walshadow_floor_timeline`
-- `walshadow_timeline_switches_total`
-- `walshadow_timeline_switch_failures_total{reason}`
-- `walshadow_timeline_transition_seconds`
-- `walshadow_timeline_switch_lsn` diagnostic gauge or structured log
-- `walshadow_timeline_prefix_bytes_verified_total`
-- `walshadow_timeline_abandoned_xacts_total`
-- `walshadow_timeline_abandoned_bytes_total`
-- shadow timeline and replay timeline in status snapshot
-
-Log system ID, old timeline, new timeline, switch LSN, resume LSN,
-publication frontier, slot, and history source at every transition.
-Never log credentials or full connection strings
+`walshadow_timeline_abandoned_xacts_total` and
+`walshadow_timeline_abandoned_bytes_total` arrive with the fence. An
+archive-only shadow parked at `F` waiting for a seal must read as that,
+distinct from the replay lag it looks like today
 
 ## Tests
 
-### Pure protocol
+Pure protocol:
 
-- parse historic end row after backend `CopyDone`
-- distinguish controlled shutdown without row
-- handle immediate end result without CopyBoth
-- reject missing field, malformed LSN, non-increasing timeline, and
-  missing CommandComplete
-- parse PostgreSQL history with comments, multiple ancestors, and
-  non-consecutive timeline IDs
-- prove ancestor membership at positions before, at, and after fork
+- immediate end result without CopyBoth
+- reject a missing field, malformed LSN, non-increasing timeline, and
+  missing command completion
 
-### WalStream
+`WalStream` and transition:
 
-- switch at segment boundary
-- switch mid-segment
-- discard ancestor partial record beyond fork
-- reject complete dispatched record beyond fork
-- verify repeated descendant prefix and suppress redispatch
-- reject one-byte prefix mismatch
-- walk multiple timelines inside same segment
-- seal fork segment under descendant name
-- preserve filter statistics and catalog tracker state from committed
-  prefix
+- walk multiple timelines inside one 16 MiB segment, final name using the
+  newest branch while every suppressed prefix matches its own
+- reject a complete dispatched record beyond the fork
 
-### Transaction state
+Transaction state, with the fence:
 
-- committed transaction before fork drains normally
-- ordinary uncommitted transaction at fork drops raw and toast state
-- pending descriptor slots drop
-- subxact and dirty-tree state clear
-- spill accounting returns to zero
-- xid reuse on descendant cannot see ancestor state
-- prepared transaction causes explicit unsupported failure
+- ordinary uncommitted transaction at the fork drops raw and TOAST state,
+  pending descriptor slots, subxact and dirty-tree state, spill accounting
+- xid reuse on the descendant cannot see ancestor state
+- prepared transaction refuses explicitly
 
-### Persistence
+Real PostgreSQL, primary plus streaming standby:
 
-Crash and restart at each edge:
+- two switches before walshadow catches up, floor one and two timelines
+  behind the live source
+- `-m immediate` stop: `open_xact_at_fork` until the fence lands,
+  automatic abandonment after
+- slot whose `restart_lsn` is above the resume position
+- shadow crossing through `restore_command` only, including a reconnect
+  inside the unsealed fork segment that parks at `F`, serves no
+  `.partial`, and crosses once the segment seals
+- source or archive WAL gap rejects without advancing the cursor; foreign
+  system identifier rejects
+- shadow log free of `end-of-recovery record` PANIC and
+  `mismatching overwritten LSN` FATAL throughout
 
-1. before ancestor CopyDone
-2. after next-timeline result, before transition metadata write
-3. after history persistence, before descendant request
-4. while verifying fork prefix
-5. after source stream changes timeline while durable floor remains
-   ancestor
-6. after floor crosses fork
-7. after shadow changes timeline, before next manifest cadence
+Ancestor-timeline base backup:
 
-Every restart resumes `(floor_tli, floor_lsn)` and reaches same output
-
-### Real PostgreSQL
-
-Build primary plus streaming standby fixture:
-
-- pause walshadow behind planned promotion point
-- promote standby and redirect source endpoint
-- verify old timeline drains to fork, new timeline continues, and
-  ClickHouse reaches expected rows
-- promote server serving existing connection, verify CopyDone result
-  path without endpoint change
-- switch twice before walshadow catches up
-- force fork in middle of WAL segment
-- leave ordinary transaction open across promotion
-- restart walshadow before and after fork
-- verify shadow recovery reaches descendant timeline and catalog DDL
-  after promotion applies
-- run with synchronized failover slot
-- verify missing or too-new slot fails with typed reason
-- verify same-system sibling timeline rejects
-- verify unrelated system identifier rejects
-- verify source or archive WAL gap rejects without cursor advance
-
-Assert:
-
-- no manual `--ignore-cursor`
-- no rebootstrap
-- no duplicate decoder-side state mutation
-- no committed source row skipped
-- no abandoned transaction emitted
-- manifest floor and timeline pair stay crash-safe
-- descriptor log remains usable after restart
-- filtered segment names and history files match PostgreSQL recovery
-  expectations
+- object-store bootstrap whose backup timeline is an ancestor, fork inside
+  the gap range, fork segment resolved under the descendant name and no
+  `.partial` read
+- direct bootstrap served by a standby, promoted before the pump starts
+- backup timeline absent from live history rejects
+- backup-seeded shadow crosses to the descendant during catchup
 
 ## Landing sequence
 
-1. Add history parser and source protocol outcomes, keep current
-   timeline mismatch rejection
-2. Add lineage-aware manifest and descriptor-log migration
-3. Add fork-prefix verifier and `WalStream` transition primitive
-4. Add ordered transaction-state abandonment fence
-5. Make source recovery and archive lookup timeline-aware
-6. Add shadow-facing history and end-of-timeline protocol
-7. Wire coordinator, metrics, and typed failures
-8. Enable automatic descendant continuation after real-PG crash matrix
-   passes
-9. Promote behavior into `plans/source.md`, `plans/ops.md`, and
-   `plans/shadow.md`; reduce source-primary section in `risks.md` to
-   remaining deployment constraints
+1. transaction-state abandonment fence, replacing `open_xact_at_fork`
+2. overwrite-contrecord acceptance and reproduction for the shadow
+3. timeline-aware archive resolution and fork-prefix durability
+4. timeline-aware bootstrap and backfill replay
+5. promote settled behavior into [../source.md](../source.md),
+   [../ops.md](../ops.md), and [../shadow.md](../shadow.md); reduce the
+   source-primary section in [risks.md](risks.md) to remaining deployment
+   constraints
 
-Keep existing fail-closed behavior until all source, persistence, and
-shadow pieces compose. Partial support that advances source timeline
-without moving durable floor and shadow branch is unsound
+Keep fail-closed behavior until source, persistence, and shadow pieces
+compose for the case being enabled: partial support that advances the
+source timeline without moving the durable floor and shadow branch is
+unsound
 
 ## Acceptance
 
-Feature is complete when:
+Full failover is complete when:
 
-- walshadow behind fork follows promoted descendant automatically
-- same-connection promotion and HA-endpoint reconnect both work
-- restart from ancestor floor after live source advances works
-- shadow follows identical timeline chain without catalog replay stall
-- valid descendant preserves manifest, descriptor log, and CH progress
-- missing lineage, missing WAL, unsafe slot, or publication past fork
-  fails before cursor adoption
-- full test matrix covers segment, transaction, crash, slot, and
-  multiple-timeline boundaries
+- walshadow behind a fork follows the promoted descendant automatically,
+  from both a same-connection promotion and an HA-endpoint reconnect
+- an unclean promotion abandons uncommitted ancestor state and accepts an
+  overwritten contrecord instead of refusing
+- restart from an ancestor floor works while the live source is one or
+  more timelines ahead
+- the shadow follows the identical chain without a catalog replay stall
+- a valid descendant preserves manifest, descriptor log, and ClickHouse
+  progress, while missing lineage, missing WAL, an unsafe slot, or
+  publication past the fork fails before any cursor is adopted
+- ancestor-timeline base backups replay across a fork inside their gap
+  range

@@ -14,6 +14,8 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use toml::{Table, Value};
 
+use walrus::pg::backup::format_pg_lsn;
+
 use crate::metrics::MetricsRegistry;
 
 /// Holds the running session's resolver so the control socket + SIGHUP can
@@ -393,6 +395,65 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
     );
     out.insert("lag_seconds".into(), snap.shadow_apply_lag_seconds.into());
     out.insert("uptime_secs".into(), (snap.uptime_secs as i64).into());
+    // `show` reports the configured endpoint; this reports whether the pump
+    // reached it, which is what an endpoint move waits on, and which proof
+    // stopped it when it did not
+    out.insert(
+        "source_swap_pending".into(),
+        (snap.source_endpoint_swap_pending != 0).into(),
+    );
+    out.insert(
+        "source_swap_blocked_on".into(),
+        snap.source_endpoint_swap_blocked_on.into(),
+    );
+    // Preserve unsigned 64-bit system identifier as a string
+    out.insert(
+        "source_system_id".into(),
+        snap.source_system_id.to_string().into(),
+    );
+    for (key, tli) in [
+        ("source_timeline", snap.source_timeline),
+        ("floor_timeline", snap.floor_timeline),
+        ("shadow_served_timeline", snap.shadow_served_timeline),
+        ("shadow_replay_timeline", snap.shadow_replay_timeline),
+    ] {
+        out.insert(key.into(), i64::from(tli).into());
+    }
+    // A crossing the pump parked on. The daemon stays up and readable rather
+    // than exiting into a restart that re-crosses and re-fails the same way
+    out.insert(
+        "crossing_blocked_on".into(),
+        snap.crossing_blocked_on.into(),
+    );
+    out.insert(
+        "crossing_detail".into(),
+        snap.crossing_detail.clone().into(),
+    );
+    // Step 5's gate, off the endpoint the pump holds: whether the target may be
+    // promoted, and which term says no
+    out.insert("pause_refrozen".into(), snap.pause_refrozen.into());
+    out.insert("promotion_ready".into(), snap.promotion_ready.into());
+    out.insert(
+        "promotion_blocked_on".into(),
+        snap.promotion_blocked_on.into(),
+    );
+    out.insert(
+        "target_in_recovery".into(),
+        snap.promotion_target_in_recovery.into(),
+    );
+    for (key, lsn) in [
+        ("pause_consumed_lsn", snap.pause_consumed_lsn),
+        ("pause_received_lsn", snap.pause_received_lsn),
+        ("target_replay_lsn", snap.promotion_target_replay_lsn),
+        ("target_receive_lsn", snap.promotion_target_receive_lsn),
+        ("floor", snap.floor_lsn),
+        ("source_received", snap.source_received_lsn),
+        ("drain", snap.decoder_commit_lsn),
+        ("emitter_ack", snap.emitter_ack_lsn),
+        ("shadow_replay", snap.shadow_replay_lsn),
+    ] {
+        out.insert(key.into(), format_pg_lsn(lsn).to_string().into());
+    }
     Ok(ok_toml(&out))
 }
 

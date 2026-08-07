@@ -50,8 +50,10 @@ pub enum AckEvent {
     Acked {
         counts: Vec<(u64, u64)>,
     },
-    /// Advance to `lsn` iff every registered seq done. Reorder sends only
-    /// when the xact buffer is empty.
+    /// Advance to `lsn` once every registered seq is done. Reorder sends only
+    /// when the xact buffer is empty; the seqs it already dispatched can still
+    /// be in flight, so the collector holds the position and publishes it when
+    /// the frontier catches up.
     Trailing {
         lsn: u64,
     },
@@ -81,6 +83,11 @@ pub struct AckState {
     placed_frontier: u64,
     /// Seqs registered so far (dense from 0).
     registered: u64,
+    /// Highest position the pump reported past every buffered xact, published
+    /// as soon as the frontier is all-done. Sticky: a quiescent source sends
+    /// no further records, so a dropped position would pin the watermark at
+    /// the last commit forever.
+    trailing_lsn: u64,
     emitter_ack: Arc<AtomicU64>,
     frontier_tx: watch::Sender<u64>,
     placed_tx: watch::Sender<u64>,
@@ -97,6 +104,7 @@ impl AckState {
             next_expected: 0,
             placed_frontier: 0,
             registered: 0,
+            trailing_lsn: 0,
             emitter_ack,
             frontier_tx,
             placed_tx,
@@ -150,8 +158,17 @@ impl AckState {
     }
 
     fn trailing(&mut self, lsn: u64) {
-        if self.all_done() {
-            self.emitter_ack.fetch_max(lsn, Ordering::Release);
+        self.trailing_lsn = self.trailing_lsn.max(lsn);
+        self.publish_trailing();
+    }
+
+    /// Publish the held trailing position once nothing is in flight. Every
+    /// seq registered after it carries a later `commit_lsn`, so a late
+    /// publication never claims durability the frontier hasn't reached.
+    fn publish_trailing(&mut self) {
+        if self.trailing_lsn != 0 && self.all_done() {
+            self.emitter_ack
+                .fetch_max(self.trailing_lsn, Ordering::Release);
         }
     }
 
@@ -172,6 +189,7 @@ impl AckState {
         }
         if moved {
             self.frontier_tx.send_replace(self.next_expected);
+            self.publish_trailing();
         }
         // Resume from `placed_frontier`, not `next_expected`: done implies
         // placed, so `[next_expected, placed_frontier)` is already placed and
@@ -419,6 +437,18 @@ mod tests {
         assert_eq!(ack.load(Ordering::Acquire), n * 10);
     }
 
+    /// A commit registered after the held position publishes its own
+    /// `commit_lsn`; the stale position must not pull the watermark back.
+    #[test]
+    fn trailing_never_lowers_a_later_commit() {
+        let (mut s, ack) = state();
+        s.trailing(500);
+        s.register(0, 900, true);
+        s.placed(0, 1);
+        s.acked(0, 1);
+        assert_eq!(ack.load(Ordering::Acquire), 900);
+    }
+
     /// First durable slice of a multi-slice commit must not publish the
     /// commit LSN: a restart at that point would resume past rows still in
     /// the later slices.
@@ -476,8 +506,11 @@ mod tests {
         assert_eq!(ack.load(Ordering::Acquire), 600);
     }
 
+    /// Pump reports its position past the last commit while that commit is
+    /// still in flight. A quiescent source sends no further records, so the
+    /// position has to be held and published once the frontier catches up.
     #[test]
-    fn trailing_advances_only_when_all_done() {
+    fn trailing_held_until_all_done_then_published() {
         let (mut s, ack) = state();
         s.register(0, 100, true);
         s.placed(0, 1);
@@ -485,9 +518,6 @@ mod tests {
         s.trailing(9_999);
         assert_eq!(ack.load(Ordering::Acquire), 0);
         s.acked(0, 1);
-        assert_eq!(ack.load(Ordering::Acquire), 100);
-        // Fully drained, trailing advances
-        s.trailing(9_999);
-        assert_eq!(ack.load(Ordering::Acquire), 9_999);
+        assert_eq!(ack.load(Ordering::Acquire), 9_999, "held position lands");
     }
 }

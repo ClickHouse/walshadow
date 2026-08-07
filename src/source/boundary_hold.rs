@@ -310,7 +310,11 @@ mod tests {
     #[tokio::test]
     async fn hold_releases_when_apply_reaches_exact_next_lsn() {
         let s = state();
-        let id = s.lock().await.register_connection(0x1000);
+        let id = s
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         let gate = gate_with(s.clone(), Duration::from_secs(5));
         let waiter = tokio::spawn({
             let s = s.clone();
@@ -332,7 +336,11 @@ mod tests {
     #[tokio::test]
     async fn hold_releases_on_the_status_wake_not_the_poll() {
         let s = state();
-        let id = s.lock().await.register_connection(0x1000);
+        let id = s
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         let gate = CatalogBoundaryGate::new(
             s.clone(),
             BoundaryGateConfig {
@@ -360,7 +368,11 @@ mod tests {
     #[tokio::test]
     async fn hold_prods_walreceiver_with_reply_requested_keepalive() {
         let s = state();
-        let id = s.lock().await.register_connection(0x1000);
+        let id = s
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         let gate = gate_with(s.clone(), Duration::from_secs(5));
         let prodded = tokio::spawn({
             let s = s.clone();
@@ -385,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn hold_times_out_without_apply_progress() {
         let s = state();
-        s.lock().await.register_connection(0x1000);
+        let _ = s.lock().await.register_connection(0x1000, 1, None);
         let gate = gate_with(s.clone(), Duration::from_millis(20));
         let err = gate
             .hold(0x1F00, 0x2000, || true)
@@ -417,7 +429,11 @@ mod tests {
             let s = s.clone();
             async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                let id = s.lock().await.register_connection(0x1000);
+                let id = s
+                    .lock()
+                    .await
+                    .register_connection(0x1000, 1, None)
+                    .expect("current timeline");
                 s.lock().await.observe_status(id, 0x2000, 0x2000, 0x2000);
             }
         });
@@ -428,7 +444,7 @@ mod tests {
     #[tokio::test]
     async fn dead_worker_wakes_waiter_with_err() {
         let s = state();
-        s.lock().await.register_connection(0x1000);
+        let _ = s.lock().await.register_connection(0x1000, 1, None);
         let gate = gate_with(s, Duration::from_secs(30));
         let err = gate
             .hold(0x1F00, 0x2000, || false)
@@ -485,7 +501,11 @@ mod tests {
         // batch_size 64 with one record: without the forced flush the
         // commit strands in the pump-side buffer while the pump parks
         let s = state();
-        let id = s.lock().await.register_connection(0x1000);
+        let id = s
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         let counter = Arc::new(std::sync::Mutex::new(0u64));
         struct Count(Arc<std::sync::Mutex<u64>>);
         impl RecordSink for Count {
@@ -541,7 +561,7 @@ mod tests {
             }
         }
         let s = state();
-        s.lock().await.register_connection(0x1000);
+        let _ = s.lock().await.register_connection(0x1000, 1, None);
         let q = QueueingRecordSink::spawn(Fail, 1, 4, None);
         let gate = gate_with(s, Duration::from_secs(30));
         let mut sink = BoundaryHoldSink::new(q, gate);

@@ -12,6 +12,7 @@ use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
 use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::config::SslMode as TpSslMode;
+use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use walrus::pg::backup::{format_pg_lsn, parse_pg_lsn};
 use walrus::pg::replication::conn::{
@@ -60,11 +61,64 @@ pub fn is_wal_segment_removed(err: &anyhow::Error) -> bool {
         .is_some_and(|e| e.error_code == SQLSTATE_UNDEFINED_FILE)
 }
 
+/// Why a named slot cannot carry the resume position. Walshadow creates no slot
+/// it was not booted with, so both are the operator's to fix: the promotion
+/// target owns its slot and `[source] slot` names it (plans/failover.md
+/// §Operator protocol).
+#[derive(Debug, thiserror::Error)]
+pub enum SlotError {
+    #[error("no physical replication slot {slot:?} on the source{}", match kind {
+        Some(k) => format!(" (a {k} slot has that name)"),
+        None => String::new(),
+    })]
+    Missing { slot: String, kind: Option<String> },
+    #[error(
+        "slot {slot:?} reserves write-ahead log from {}, above the {} this consumer resumes at",
+        format_pg_lsn(*restart_lsn),
+        format_pg_lsn(*resume_lsn),
+    )]
+    TooNew {
+        slot: String,
+        restart_lsn: u64,
+        resume_lsn: u64,
+    },
+    #[error("read pg_replication_slots: {0:#}")]
+    Query(#[source] anyhow::Error),
+}
+
+impl SlotError {
+    /// Metric and refusal label.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Missing { .. } => "slot_missing",
+            Self::TooNew { .. } => "slot_too_new",
+            Self::Query(_) => "source",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct WalChunk<'a> {
     pub start_lsn: u64,
     pub server_wal_end: u64,
     pub data: &'a [u8],
+}
+
+/// The three ways a physical replication stream ends, told apart by what the
+/// backend sends (`src/backend/replication/walsender.c`).
+#[derive(Debug)]
+pub enum SourceEvent<'a> {
+    Wal(WalChunk<'a>),
+    /// Backend `CopyDone`: the requested timeline is historic and reached its
+    /// switchpoint. Only this ending sends one. The connection stays in COPY
+    /// until [`end_historic_stream`](SourceFeed::end_historic_stream) answers.
+    TimelineEnd,
+    /// `WalSndDone` sends a bare `CommandComplete` from inside COPY, then
+    /// exits — no `CopyDone` before it and no `ReadyForQuery` after. A parser
+    /// that only leaves COPY on `CopyDone` reads this as a stray streaming
+    /// message and then blocks until the socket closes. It is a reconnect, not
+    /// a daemon exit: the source stopped, the consumer has not.
+    Shutdown,
 }
 
 /// Three LSNs wal-rus's `build_status_update` ships to source PG.
@@ -174,43 +228,6 @@ impl SourceFeed {
         self
     }
 
-    /// Re-establish a dropped replication connection and resume streaming at
-    /// exactly `resume_lsn` — the byte-contiguous
-    /// [`crate::source::wal_stream::WalStream::next_lsn`] resume point, never
-    /// `dispatched_lsn` (which lags by any buffered in-progress record). A
-    /// timeline change is a failover and can't resume in place; a recycled
-    /// segment surfaces to the caller (fatal, see [`is_wal_segment_removed`]).
-    ///
-    /// One attempt — the caller drives backoff/retry (`backon`) and decides
-    /// which errors are transient vs fatal (see `reconnect_or_fatal` in the
-    /// stream binary).
-    pub async fn reconnect(
-        cfg: &PgConfig,
-        slot: Option<&str>,
-        resume_lsn: u64,
-        timeline: u32,
-        status_interval: Duration,
-    ) -> Result<Self> {
-        let mut feed = SourceFeed::connect(cfg)
-            .await
-            .context("reconnect to source PG")?
-            .with_status_interval(status_interval);
-        let ident = feed
-            .identify_system()
-            .await
-            .context("IDENTIFY_SYSTEM on reconnect")?;
-        if ident.timeline != timeline {
-            bail!(
-                "source timeline changed {timeline} -> {} (failover); cannot resume in place",
-                ident.timeline
-            );
-        }
-        feed.start_physical_replication(slot, resume_lsn, timeline)
-            .await
-            .context("START_REPLICATION on reconnect")?;
-        Ok(feed)
-    }
-
     /// Ensure a physical replication slot exists, reserving WAL immediately so
     /// the source retains segments from the slot's `restart_lsn` onward — a
     /// stalled/disconnected consumer resumes without the segment being
@@ -294,17 +311,16 @@ impl SourceFeed {
         Ok(())
     }
 
-    /// `Ok(Some)` per WAL data frame, `Ok(None)` on `CopyDone` (server
-    /// shutdown), `Err` on unexpected frames; keepalives + status
+    /// One WAL data frame, or the reason the stream ended; keepalives + status
     /// updates handled internally.
     ///
     /// Pass the consumer's current `status` (write/flush/apply) each
     /// iteration so a keepalive's `reply_requested` echoes fresh values.
-    pub async fn next_chunk<'b>(
+    pub async fn next_event<'b>(
         &mut self,
         status: StandbyStatus,
         buf: &'b mut Vec<u8>,
-    ) -> Result<Option<WalChunk<'b>>> {
+    ) -> Result<SourceEvent<'b>> {
         buf.clear();
         loop {
             if self.last_status.elapsed() >= self.status_interval {
@@ -325,7 +341,7 @@ impl SourceFeed {
                         Frame::Wal(w) => {
                             buf.extend_from_slice(w.data);
                             self.last_server_wal_end = w.server_wal_end;
-                            return Ok(Some(WalChunk {
+                            return Ok(SourceEvent::Wal(WalChunk {
                                 start_lsn: w.start_lsn,
                                 server_wal_end: w.server_wal_end,
                                 data: buf.as_slice(),
@@ -339,7 +355,8 @@ impl SourceFeed {
                         }
                     }
                 }
-                Message::CopyDone => return Ok(None),
+                Message::CopyDone => return Ok(SourceEvent::TimelineEnd),
+                Message::CommandComplete(_) => return Ok(SourceEvent::Shutdown),
                 Message::ErrorResponse(e) => {
                     let (code, message) = (error_code(&e), error_message(&e));
                     if code == SQLSTATE_UNDEFINED_FILE {
@@ -366,6 +383,29 @@ impl SourceFeed {
         self.last_server_wal_end
     }
 
+    /// Answer a backend `CopyDone` with the client's own, leaving the
+    /// connection back in simple-query mode ready for the next command.
+    ///
+    /// PostgreSQL follows this with a one-row result set carrying `next_tli`
+    /// and `next_tli_startpos`; wal-rus drains it. The switchpoint is read from
+    /// `TIMELINE_HISTORY` instead, which the crossing has to parse anyway to
+    /// prove lineage and to hand the shadow a history file — a row that only
+    /// restates it saves nothing.
+    pub async fn end_historic_stream(&mut self) -> Result<()> {
+        self.conn.end_copy().await.context("end historic COPY")
+    }
+
+    /// `TIMELINE_HISTORY <tli>` → the file's exact bytes. `Ok(None)` when the
+    /// source has no history file for it (timeline 1 never does).
+    pub async fn timeline_history(&mut self, timeline: u32) -> Result<Option<Vec<u8>>> {
+        let row = self
+            .conn
+            .timeline_history(timeline)
+            .await
+            .with_context(|| format!("TIMELINE_HISTORY {timeline}"))?;
+        Ok(row.map(|(_name, content)| content))
+    }
+
     async fn send_status(&mut self, status: StandbyStatus) -> Result<()> {
         let (write, flush, apply) = clamp_status(status, &mut self.floors);
         let payload = build_status_update(write, flush, apply);
@@ -376,6 +416,86 @@ impl SourceFeed {
 
     pub fn server_version_num(&self) -> i32 {
         self.conn.server_version_num
+    }
+
+    /// Prove a pre-created physical slot can carry this consumer: it exists, it
+    /// is physical, and it reserves write-ahead log from at or below
+    /// `resume_lsn`.
+    ///
+    /// `pg_create_physical_replication_slot(name, true)` reserves at the last
+    /// checkpoint or restartpoint redo rather than at the current position
+    /// (`ReplicationSlotReserveWal`, `src/backend/replication/slot.c`), so a
+    /// slot made ahead of a switchover normally sits *behind* the target's
+    /// replay position — a lagging consumer is what inverts it, and no slot can
+    /// be created below the redo it would need. Creating the missing one here
+    /// would reserve at the target's head and call that continuation
+    /// successful, which is the failure this refuses.
+    ///
+    /// `floor` is the position a *restart* asks for, which the reserve may sit
+    /// above without breaking this connection; that is a warning, since the
+    /// first standby status pulls `restart_lsn` back down to it
+    /// (`PhysicalConfirmReceivedLocation`).
+    pub async fn prove_physical_slot(
+        &mut self,
+        slot: &str,
+        resume_lsn: u64,
+        floor: u64,
+    ) -> Result<Option<u64>, SlotError> {
+        let client = self.sql_client().await.map_err(SlotError::Query)?;
+        let row = client
+            .query_opt(
+                "SELECT slot_type, restart_lsn FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .map_err(|e| SlotError::Query(e.into()))?
+            .ok_or_else(|| SlotError::Missing {
+                slot: slot.to_string(),
+                kind: None,
+            })?;
+        let kind: String = row.get(0);
+        if kind != "physical" {
+            return Err(SlotError::Missing {
+                slot: slot.to_string(),
+                kind: Some(kind),
+            });
+        }
+        let restart_lsn: Option<u64> = row.get::<_, Option<PgLsn>>(1).map(u64::from);
+        let Some(restart_lsn) = restart_lsn else {
+            // Created without `immediately_reserve`: it pins nothing until this
+            // connection binds it, so the window before that is unprotected
+            tracing::warn!(
+                target: "walshadow",
+                slot,
+                "slot reserves no write-ahead log yet; it starts pinning at \
+                 START_REPLICATION and nothing retains what precedes that",
+            );
+            return Ok(None);
+        };
+        if restart_lsn > resume_lsn {
+            return Err(SlotError::TooNew {
+                slot: slot.to_string(),
+                restart_lsn,
+                resume_lsn,
+            });
+        }
+        if restart_lsn > floor {
+            tracing::warn!(
+                target: "walshadow",
+                slot,
+                restart_lsn = %format_pg_lsn(restart_lsn),
+                floor = %format_pg_lsn(floor),
+                "slot pins no write-ahead log back to the resume floor; a restart \
+                 before it advances would ask for segments nothing retains",
+            );
+        }
+        Ok(Some(restart_lsn))
+    }
+
+    /// Force the next [`sql_client`](Self::sql_client) to redial. A cached
+    /// client whose connection died fails every query until it is dropped.
+    pub fn drop_sql_client(&mut self) {
+        self.sql_client = None;
     }
 
     /// Lazily-opened sidecar client. Replication-mode connections only

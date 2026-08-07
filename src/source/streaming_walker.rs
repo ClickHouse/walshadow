@@ -214,6 +214,26 @@ impl StreamingWalker {
         self.done_in_segment = false;
     }
 
+    /// Drop buffered bytes at or past `len` and abandon any partial record.
+    /// A timeline fork ends the branch mid-page, so page-parse state below the
+    /// cut stays valid — the descendant continues writing into that same page,
+    /// under the header the ancestor wrote
+    /// (`src/backend/access/transam/xlog.c`, `StartupXLOG` copies the last read
+    /// page into the insertion buffer).
+    pub fn truncate_to(&mut self, len: usize) {
+        self.buf.truncate(len);
+        self.pending = None;
+        self.cursor = self.cursor.min(len);
+        self.page_cursor = self.page_cursor.min(len);
+        if self.page_start > len {
+            self.page_start = 0;
+            self.page_magic = 0;
+            self.page_data_start = 0;
+            self.page_cursor = 0;
+        }
+        self.done_in_segment = false;
+    }
+
     /// Scatter `new_logical` back into the buffer at `byte_ranges`. Its
     /// length must equal the original record length.
     pub fn rewrite_record(&mut self, byte_ranges: &ByteRanges, new_logical: &[u8]) {
