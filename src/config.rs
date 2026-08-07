@@ -11,10 +11,10 @@
 //!
 //! Everything the operator tunes lives on `ResolvedConfig` and reloads live:
 //! per-relation mapping, per-namespace defaults, drop-table strategy, the
-//! emitter batch/compression/retry knobs, the CH connection, and the
-//! columns-less table opt-ins — all read off the watch channel (batcher,
-//! inserter, DDL applicator, reorder coordinator). Only TOAST + the source
-//! connection stay boot-only.
+//! emitter batch/compression/retry knobs, both connections, and the
+//! columns-less table opt-ins — all read off the watch channel (pump, batcher,
+//! inserter, DDL applicator, reorder coordinator). TOAST and the source
+//! replication slot stay boot-only.
 //!
 //! **Storage: in-memory.** The overlay is a derived cache — re-seeded from PG
 //! then caught up by WAL replay on restart — so it holds no checkpoint. The
@@ -29,6 +29,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 
 use clickhouse_c::{Allocator, TypeAst};
+use walrus::pg::replication::conn::PgConfig;
+use walrus::pg::replication::tls::{SslMode, TlsParams};
 
 use crate::ch::{CompressionChoice, EmitterError};
 use crate::emit::ch_emitter::EmitterConfig;
@@ -39,6 +41,120 @@ use crate::mapping::{
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
 use ahash::{HashMap, HashMapExt, HashSet};
+
+/// Source PG connection, `[source]` minus `slot`. Live: a reload that moves
+/// the endpoint swaps the pump's `SourceFeed` at a chunk boundary and points
+/// later backfill COPY sessions at the new address. `slot` stays boot-only —
+/// creating a slot on a moved endpoint reserves WAL at that server's head,
+/// which proves nothing about coverage of the resume floor.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SourceConn {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: Option<String>,
+    pub dbname: String,
+    pub sslmode: SslMode,
+}
+
+impl Default for SourceConn {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 5432,
+            user: String::new(),
+            password: None,
+            dbname: String::new(),
+            // libpq default, matching `PgConfig::resolve`
+            sslmode: SslMode::Prefer,
+        }
+    }
+}
+
+/// Masks the password: `ResolvedConfig` is logged whole in places
+impl std::fmt::Debug for SourceConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceConn")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("dbname", &self.dbname)
+            .field("sslmode", &self.sslmode)
+            .finish()
+    }
+}
+
+impl SourceConn {
+    /// Parse `[source]` out of a merged config table. Absent section keeps the
+    /// defaults; a malformed port or sslmode is an error so `ctl apply`
+    /// rejects it before the daemon reloads onto an unreachable endpoint.
+    pub fn from_table(root: &toml::Table) -> Result<Self, String> {
+        let mut out = Self::default();
+        let Some(src) = root.get("source").and_then(toml::Value::as_table) else {
+            return Ok(out);
+        };
+        if let Some(v) = src.get("host") {
+            out.host = scalar_string(v).ok_or("source.host: expected a string")?;
+        }
+        if let Some(v) = src.get("port") {
+            out.port = match v {
+                toml::Value::Integer(i) => {
+                    u16::try_from(*i).map_err(|_| format!("source.port: {i} out of range"))?
+                }
+                v => scalar_string(v)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("source.port: expected a port number")?,
+            };
+        }
+        if let Some(v) = src.get("user") {
+            out.user = scalar_string(v).ok_or("source.user: expected a string")?;
+        }
+        if let Some(v) = src.get("password") {
+            out.password = Some(scalar_string(v).ok_or("source.password: expected a string")?);
+        }
+        if let Some(v) = src.get("dbname") {
+            out.dbname = scalar_string(v).ok_or("source.dbname: expected a string")?;
+        }
+        if let Some(v) = src.get("sslmode") {
+            let s = scalar_string(v).ok_or("source.sslmode: expected a string")?;
+            out.sslmode = SslMode::parse(&s).map_err(|e| format!("source.sslmode: {e}"))?;
+        }
+        Ok(out)
+    }
+
+    /// Connection for the replication socket, its sidecar SQL client, and
+    /// backfill COPY. TLS material comes from the libpq env vars
+    /// (`PGSSLROOTCERT` / `PGSSLCERT` / `PGSSLKEY`), never from TOML, so it is
+    /// resolved per connect rather than carried here.
+    pub fn to_pg_config(&self) -> PgConfig {
+        PgConfig {
+            host: self.host.clone(),
+            port: self.port,
+            user: self.user.clone(),
+            password: self.password.clone(),
+            database: self.dbname.clone(),
+            application_name: "walshadow".into(),
+            sslmode: self.sslmode,
+            tls: TlsParams::resolve(&walrus::config::Vars::default()),
+        }
+    }
+
+    /// Credential-free endpoint for logs, metrics labels, and `ctl status`
+    pub fn endpoint(&self) -> String {
+        format!("{}:{}/{}", self.host, self.port, self.dbname)
+    }
+}
+
+/// TOML scalar as a string. Tables and arrays yield `None`; the CLI `[source]`
+/// base layer writes an integer port, files write either.
+fn scalar_string(v: &toml::Value) -> Option<String> {
+    match v {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Table(_) | toml::Value::Array(_) => None,
+        v => Some(v.to_string()),
+    }
+}
 
 /// Pre-materialised resolved config, snapshotted by subscribers via
 /// `watch::Receiver<Arc<ResolvedConfig>>`. Rebuilt whole on every reload,
@@ -76,11 +192,45 @@ pub struct ResolvedConfig {
     pub user: String,
     pub password: String,
     pub secure: bool,
+    /// Source PG connection (live: pump swaps its feed, backfills open COPY
+    /// against it). TOML + CLI only — no overlay layer, since the overlay
+    /// rows arrive over the very stream this connection carries.
+    pub source: SourceConn,
     /// Columns-less `[table.*]` opt-in intents (live: reorder coordinator
     /// applies the add/remove diff at a commit barrier).
     pub table_opt_ins: HashMap<RelName, TableRow>,
     /// `[stream] paused` (live: pump idles when true).
     pub paused: bool,
+}
+
+impl ResolvedConfig {
+    /// True when `cfg` already dials this destination. Pairs with
+    /// [`Self::overlay_dest`] for callers caching the overlay: they rebuild
+    /// only once this goes false, so every field written there is read here.
+    pub fn dest_conn_eq(&self, cfg: &EmitterConfig) -> bool {
+        cfg.host == self.host
+            && cfg.port == self.port
+            && cfg.database == self.database
+            && cfg.user == self.user
+            && cfg.password == self.password
+            && cfg.secure == self.secure
+    }
+
+    /// `base` pointed at the live destination, tuning and mapping untouched.
+    /// For sessions that connect eagerly off a boot config — a backfill tail
+    /// or staging session — so they take a moved endpoint at spawn instead of
+    /// dialling the old address first.
+    pub fn overlay_dest(&self, base: &EmitterConfig) -> EmitterConfig {
+        EmitterConfig {
+            host: self.host.clone(),
+            port: self.port,
+            database: self.database.clone(),
+            user: self.user.clone(),
+            password: self.password.clone(),
+            secure: self.secure,
+            ..base.clone()
+        }
+    }
 }
 
 impl Default for ResolvedConfig {
@@ -461,6 +611,7 @@ impl ConfigResolver {
             user: base.user.clone(),
             password: base.password.clone(),
             secure: base.secure,
+            source: base.source.clone(),
             table_opt_ins: base.table_opt_ins.clone(),
             paused: base.paused,
         };
@@ -1338,5 +1489,139 @@ mod tests {
         );
         resolver.reload().await.unwrap();
         assert_eq!(rx.borrow().drop_table_strategy, "retain");
+    }
+
+    #[test]
+    fn source_conn_parses_string_and_integer_port() {
+        let root: toml::Table = toml::from_str(
+            "[source]\nhost = \"db.internal\"\nport = 5433\nuser = \"repl\"\n\
+             password = \"pw\"\ndbname = \"app\"\nsslmode = \"require\"\n",
+        )
+        .unwrap();
+        let conn = SourceConn::from_table(&root).unwrap();
+        assert_eq!(conn.host, "db.internal");
+        assert_eq!(conn.port, 5433);
+        assert_eq!(conn.user, "repl");
+        assert_eq!(conn.password.as_deref(), Some("pw"));
+        assert_eq!(conn.dbname, "app");
+        assert_eq!(conn.sslmode, SslMode::Require);
+        assert_eq!(conn.endpoint(), "db.internal:5433/app");
+        // No password in Debug, which ResolvedConfig inherits
+        assert!(!format!("{conn:?}").contains("pw"));
+
+        // The CLI base layer writes a bare integer, files may quote it
+        let quoted: toml::Table = toml::from_str("[source]\nport = \"5434\"\n").unwrap();
+        assert_eq!(SourceConn::from_table(&quoted).unwrap().port, 5434);
+    }
+
+    #[test]
+    fn source_conn_absent_section_keeps_defaults() {
+        let conn = SourceConn::from_table(&toml::Table::new()).unwrap();
+        assert_eq!(conn, SourceConn::default());
+    }
+
+    /// `ctl apply` validates through `EmitterConfig::from_table`, so a typo
+    /// here is rejected and rolled back instead of reloading the pump onto an
+    /// endpoint it cannot dial
+    #[test]
+    fn source_conn_rejects_bad_sslmode_and_port() {
+        let bad_ssl: toml::Table = toml::from_str("[source]\nsslmode = \"maybe\"\n").unwrap();
+        assert!(SourceConn::from_table(&bad_ssl).is_err());
+        assert!(EmitterConfig::from_table(&bad_ssl).is_err());
+        let bad_port: toml::Table = toml::from_str("[source]\nport = 99999\n").unwrap();
+        assert!(SourceConn::from_table(&bad_port).is_err());
+    }
+
+    /// The pump diffs `ResolvedConfig.source` to decide a feed swap, so the
+    /// endpoint has to survive the TOML → EmitterConfig → resolve path
+    #[test]
+    fn resolve_carries_source_endpoint() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\nhost = \"ch\"\n[source]\nhost = \"pg-b\"\nport = 5433\ndbname = \"app\"\n",
+        )
+        .unwrap();
+        let (r, _) = ConfigResolver::resolve(
+            &base,
+            &ConfigOverlay::default(),
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(r.source.host, "pg-b");
+        assert_eq!(r.source.port, 5433);
+        assert_ne!(r.source, SourceConn::default());
+    }
+
+    #[tokio::test]
+    async fn reload_republishes_moved_source_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-config.toml");
+        tokio::fs::write(&path, "[ch]\nhost = \"ch\"\n[source]\nhost = \"pg-a\"\n")
+            .await
+            .unwrap();
+        let base = EmitterConfig::from_toml_str("[ch]\nhost = \"ch\"\n[source]\nhost = \"pg-a\"\n")
+            .unwrap();
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+        );
+        assert_eq!(rx.borrow_and_update().source.host, "pg-a");
+
+        tokio::fs::write(&path, "[ch]\nhost = \"ch\"\n[source]\nhost = \"pg-b\"\n")
+            .await
+            .unwrap();
+        resolver.reload().await.unwrap();
+        assert_eq!(rx.borrow_and_update().source.host, "pg-b");
+    }
+
+    /// Backfill caches `overlay_dest` and rebuilds on `!dest_conn_eq`, so the
+    /// overlay has to settle in one pass — a field written but not compared
+    /// deep-copies the mapping tables on every session the pass opens.
+    #[test]
+    fn overlay_dest_moves_connection_and_keeps_tuning() {
+        let boot =
+            EmitterConfig::from_toml_str("[ch]\nhost = \"ch-a\"\nport = 9000\nrow_budget = 4321\n")
+                .unwrap();
+        let live = ResolvedConfig {
+            host: "ch-b".into(),
+            port: 9440,
+            database: "db".into(),
+            user: "u".into(),
+            password: "p".into(),
+            secure: true,
+            ..ResolvedConfig::default()
+        };
+
+        let out = live.overlay_dest(&boot);
+        assert_eq!(out.host, "ch-b");
+        assert_eq!(out.port, 9440);
+        assert!(out.secure);
+        assert_eq!(out.row_budget, boot.row_budget);
+        assert!(!live.dest_conn_eq(&boot));
+        assert!(live.dest_conn_eq(&out));
+    }
+
+    /// The reverse drift: a moved field the comparison skips never reaches the
+    /// sessions, which keep dialling the old endpoint
+    #[test]
+    fn dest_conn_eq_notices_every_overlaid_field() {
+        let live = ResolvedConfig::default();
+        let base = live.overlay_dest(&EmitterConfig::default());
+        let moves: [fn(&mut EmitterConfig); 6] = [
+            |c| c.host.push('x'),
+            |c| c.port += 1,
+            |c| c.database.push('x'),
+            |c| c.user.push('x'),
+            |c| c.password.push('x'),
+            |c| c.secure = !c.secure,
+        ];
+        for apply in moves {
+            let mut moved = base.clone();
+            apply(&mut moved);
+            assert!(!live.dest_conn_eq(&moved));
+        }
     }
 }

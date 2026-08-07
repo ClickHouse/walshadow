@@ -102,9 +102,10 @@ requires one of options below
 Two operator options
 (overview.md pitfall #9):
 
-* **Pre-create slot on the standby.** Failover-aware replication
-  slots (PG 17+) follow; pre-PG-17 needs manual operator script
-  before failover
+* **Pre-create slot on the standby.** Physical slots are never
+  synchronized to a standby, at any PostgreSQL version; PG 17 failover
+  slots cover logical slots only. An operator creates it on the
+  promotion target, under the configured slot name
 * **Re-bootstrap from new LSN.** Walshadow re-attaches against the
   newly-promoted primary at a fresh LSN; backfill bridge
   (see [bootstrap.md](../bootstrap.md)) reseeds anything between old
