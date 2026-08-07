@@ -73,6 +73,20 @@ fn status(lsn: u64) -> StandbyStatus {
     StandbyStatus::collapsed(lsn)
 }
 
+async fn start_feed(
+    cfg: &PgConfig,
+    slot: Option<&str>,
+    start_lsn: u64,
+    timeline: u32,
+) -> anyhow::Result<SourceFeed> {
+    let mut feed = SourceFeed::connect(cfg)
+        .await?
+        .with_status_interval(Duration::from_secs(1));
+    feed.start_physical_replication(slot, start_lsn, timeline)
+        .await?;
+    Ok(feed)
+}
+
 fn churn_wal(source: &Shadow) {
     source
         .psql_one("CREATE TABLE IF NOT EXISTS churn(id int, pad text)")
@@ -119,7 +133,7 @@ async fn reconnect_resumes_after_walsender_terminated() {
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(
         Duration::from_secs(5),
-        feed.next_chunk(status(ident.xlogpos), &mut buf),
+        feed.next_event(status(ident.xlogpos), &mut buf),
     )
     .await;
 
@@ -130,14 +144,7 @@ async fn reconnect_resumes_after_walsender_terminated() {
         )
         .unwrap();
 
-    let reconnected = SourceFeed::reconnect(
-        &cfg,
-        None,
-        ident.xlogpos,
-        ident.timeline,
-        Duration::from_secs(1),
-    )
-    .await;
+    let reconnected = start_feed(&cfg, None, ident.xlogpos, ident.timeline).await;
     assert!(
         reconnected.is_ok(),
         "reconnect at retained LSN should resume: {:?}",
@@ -178,15 +185,14 @@ async fn recycled_segment_surfaces_58p01() {
 
     churn_wal(&source);
 
-    let res =
-        SourceFeed::reconnect(&cfg, None, old_lsn, ident.timeline, Duration::from_secs(1)).await;
+    let res = start_feed(&cfg, None, old_lsn, ident.timeline).await;
     let err = match res {
         Err(e) => e,
         Ok(mut feed) => {
             let mut buf = Vec::new();
             match tokio::time::timeout(
                 Duration::from_secs(5),
-                feed.next_chunk(status(old_lsn), &mut buf),
+                feed.next_event(status(old_lsn), &mut buf),
             )
             .await
             {
@@ -252,22 +258,16 @@ async fn slot_prevents_segment_recycle() {
         "slot must still retain WAL, got wal_status={wal_status}"
     );
 
-    let mut resumed = SourceFeed::reconnect(
-        &cfg,
-        Some(slot),
-        old_lsn,
-        ident.timeline,
-        Duration::from_secs(1),
-    )
-    .await
-    .expect("reconnect against slot should resume at retained LSN");
+    let mut resumed = start_feed(&cfg, Some(slot), old_lsn, ident.timeline)
+        .await
+        .expect("reconnect against slot should resume at retained LSN");
     let mut buf = Vec::new();
     let chunk = tokio::time::timeout(
         Duration::from_secs(5),
-        resumed.next_chunk(status(old_lsn), &mut buf),
+        resumed.next_event(status(old_lsn), &mut buf),
     )
     .await
-    .expect("next_chunk should not time out");
+    .expect("next_event should not time out");
     assert!(
         chunk.is_ok(),
         "streaming from a slot-retained LSN must not error: {:?}",

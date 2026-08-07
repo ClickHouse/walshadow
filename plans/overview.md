@@ -158,10 +158,18 @@ Component docs live alongside this overview:
    heap pages where post-ALTER attnums don't yet exist; emitter writes
    NULL for missing-attnum mapping columns. CH-side schema must use
    `Nullable(T)` for any column likely added post-attach
-9. **Source primary failover.** Slot doesn't follow. Operator
-   pre-creates slot on standby (PG 17+ failover-aware slots) or accepts
-   re-bootstrap from new LSN. Catalog preserved on shadow across
-   re-attach via `rebind` disposition; diverged clusters need `rebuild`
+9. **Source primary promotion.** Operator-driven switchover crosses the
+   fork in place — pause below it, repoint, promote, resume
+   ([failover.md](failover.md)), or with no repoint at all behind a stable
+   endpoint. The crossing holds at a barrier until ClickHouse and the shadow
+   reach the fork, then commits its resume position, so a stalled
+   destination delays the handover rather than splitting the floor from the
+   stream. The slot never follows: physical slots are not synchronized to a
+   standby at any version, so slot mode needs it pre-created on the target,
+   which walshadow proves and never creates. Catalog preserved on shadow
+   across the crossing and across re-attach via `rebind` disposition;
+   diverged clusters need `rebuild`. Unplanned promotion fails closed
+   ([future/failover.md](future/failover.md))
 
 ## Acceptance criteria
 

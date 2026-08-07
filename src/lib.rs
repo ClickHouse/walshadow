@@ -56,7 +56,7 @@ pub use ops::{bridge, control, metrics, oracle, preflight, retention, trace};
 #[doc(hidden)]
 pub use source::{
     boundary_hold, catalog_capture, manifest, queueing_record_sink, segment_sink, shadow_stream,
-    source_feed, wal_stream,
+    source_feed, timeline, transition, wal_stream,
 };
 #[doc(hidden)]
 pub use toast::toast_retire;

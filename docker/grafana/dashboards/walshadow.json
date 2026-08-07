@@ -1709,6 +1709,285 @@
      "legendFormat": "records waiting for the worker"
     }
    ]
+  },
+  {
+   "id": 107,
+   "type": "row",
+   "title": "\u2467 switchover",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 65
+   },
+   "panels": []
+  },
+  {
+   "id": 30,
+   "type": "stat",
+   "title": "Timelines",
+   "description": "Floor trails source between a fork and the crossing that commits it; the shadow trails both until the crossing is advertised.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "walshadow-prom"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 6,
+    "x": 0,
+    "y": 66
+   },
+   "fieldConfig": {
+    "defaults": {
+     "decimals": 0,
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "none",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_source_timeline",
+     "legendFormat": "source"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_floor_timeline",
+     "legendFormat": "floor"
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_shadow_served_timeline",
+     "legendFormat": "shadow served"
+    },
+    {
+     "refId": "D",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_shadow_replay_timeline",
+     "legendFormat": "shadow replay"
+    }
+   ]
+  },
+  {
+   "id": 31,
+   "type": "timeseries",
+   "title": "Crossings & prefix bytes verified",
+   "description": "A fork on a segment boundary repeats no bytes, so zero verified prefix is valid there.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "walshadow-prom"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 6,
+    "x": 6,
+    "y": 66
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_timeline_switches_total",
+     "legendFormat": "crossings"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_timeline_prefix_bytes_verified_total",
+     "legendFormat": "prefix bytes verified"
+    }
+   ]
+  },
+  {
+   "id": 32,
+   "type": "timeseries",
+   "title": "Crossings refused, by reason",
+   "description": "A refusal the pump parked on keeps the daemon up and serving, so the wedge shows here. Fix what the reason names, then pause and resume.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "walshadow-prom"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 6,
+    "x": 12,
+    "y": 66
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_timeline_switch_failures_total",
+     "legendFormat": "{{reason}}"
+    }
+   ]
+  },
+  {
+   "id": 33,
+   "type": "stat",
+   "title": "Source cluster & endpoint swaps",
+   "description": "System identifier owns every artifact; a repoint onto a different cluster is refused.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "walshadow-prom"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 6,
+    "x": 18,
+    "y": 66
+   },
+   "fieldConfig": {
+    "defaults": {
+     "decimals": 0,
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "none",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_source_info",
+     "legendFormat": "{{system_id}}"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_source_endpoint_swap_pending",
+     "legendFormat": "swap pending"
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "walshadow-prom"
+     },
+     "expr": "walshadow_source_endpoint_swap_failures_total",
+     "legendFormat": "swap failures"
+    }
+   ]
   }
  ]
 }

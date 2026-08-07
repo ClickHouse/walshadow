@@ -26,7 +26,9 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{Mutex, watch};
-use walrus::pg::replication::server::{self, ServerError, WalSenderConn, decode_standby_status};
+use walrus::pg::replication::server::{
+    self, ServerError, TimelineSwitch, WalSenderConn, decode_standby_status,
+};
 use walrus::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 
 use crate::record::{RecordBytesSink, SinkError};
@@ -43,18 +45,27 @@ struct ConnState {
     flush_lsn: u64,
     /// Last `apply_lsn` from the client's `'r'` standby status.
     apply_lsn: u64,
+    /// Set when the client asked for a branch that has ended: the switchpoint
+    /// its stream stops at, PG's `sendTimeLineValidUpto`. `None` on the current
+    /// timeline.
+    ends_at: Option<TimelineSwitch>,
     /// Marked on a write error/overflow; listener drops the slot on
     /// the next status sweep.
     closing: bool,
+    /// Served through `ends_at`, so the stream owes the client a next-timeline
+    /// result rather than a closed socket.
+    timeline_ended: bool,
 }
 
 impl ConnState {
-    fn fresh(start_lsn: u64) -> Self {
+    fn fresh(start_lsn: u64, ends_at: Option<TimelineSwitch>) -> Self {
         Self {
             dispatched_lsn: start_lsn,
             flush_lsn: start_lsn,
             apply_lsn: start_lsn,
+            ends_at,
             closing: false,
+            timeline_ended: false,
         }
     }
 }
@@ -66,10 +77,21 @@ impl ConnState {
 pub struct AggregateLsn {
     pub min_flush_lsn: Option<u64>,
     pub min_apply_lsn: Option<u64>,
+    /// Connections past `START_REPLICATION`, the only ones carrying LSNs.
     pub active_connections: usize,
+    /// Monotonic count of sockets that entered the handshake. Above
+    /// `active_connections` means a client is connected but stalled before
+    /// `START_REPLICATION`, which reads as "nothing attached" otherwise.
+    pub accepted_total: u64,
     /// Monotonic count of connections dropped by `slow_threshold`
     /// overflow since process start.
     pub dropped_total: u64,
+    /// Oldest branch an attached client is still reading: a historic
+    /// connection is pinned to the branch its `ends_at` names, the rest to the
+    /// served one. `None` with nothing attached. Beside the apply LSN it is
+    /// what separates a shadow that followed a crossing from one that only
+    /// survived it.
+    pub replay_timeline: Option<u32>,
 }
 
 #[derive(Debug, Error)]
@@ -91,6 +113,11 @@ pub struct ShadowStreamState {
     pub system_identifier: String,
     /// `IDENTIFY_SYSTEM` `dbname` (always empty for physical replication).
     pub dbname: Option<String>,
+    /// Branches this walsender has finished, plus the history bytes placing
+    /// them. Append-only, one entry per source promotion; `IDENTIFY_SYSTEM`,
+    /// `TIMELINE_HISTORY` and end-of-timeline are answered from both
+    switches: Vec<TimelineSwitch>,
+    histories: Vec<(u32, Vec<u8>)>,
     connections: HashMap<u64, ConnState>,
     next_conn_id: u64,
     /// Bytes queued behind a slow shadow client, bounded by
@@ -103,6 +130,7 @@ pub struct ShadowStreamState {
     /// Surfaced via [`AggregateLsn::dropped_total`] for the
     /// `walshadow_shadow_stream_dropped_connections_total` gauge.
     dropped_total: u64,
+    accepted_total: u64,
     /// Current segment's wire bytes `[wire_buf_start, server_wal_end]`, used to
     /// backfill a reconnect behind the live head (else it gets an unappliable
     /// gap and strands at segment boundaries). Reset per segment.
@@ -129,12 +157,15 @@ impl ShadowStreamState {
             timeline,
             system_identifier,
             dbname: None,
+            switches: Vec::new(),
+            histories: Vec::new(),
             connections: HashMap::new(),
             next_conn_id: 1,
             send_queues: HashMap::new(),
             slow_threshold,
             server_wal_end: current_lsn,
             dropped_total: 0,
+            accepted_total: 0,
             wire_buf: Vec::new(),
             wire_buf_start: current_lsn,
             queued: watch::Sender::new(0),
@@ -162,27 +193,121 @@ impl ShadowStreamState {
     }
 
     pub fn aggregate(&self) -> AggregateLsn {
-        let (active, min_flush, min_apply) = self
-            .connections
-            .values()
-            .filter(|c| !c.closing)
-            .fold((0usize, u64::MAX, u64::MAX), |(n, flush, apply), c| {
-                (n + 1, flush.min(c.flush_lsn), apply.min(c.apply_lsn))
-            });
+        let served = self.timeline;
+        let (active, min_flush, min_apply, branch) =
+            self.connections.values().filter(|c| !c.closing).fold(
+                (0usize, u64::MAX, u64::MAX, u32::MAX),
+                |(n, flush, apply, tli), c| {
+                    (
+                        n + 1,
+                        flush.min(c.flush_lsn),
+                        apply.min(c.apply_lsn),
+                        tli.min(c.ends_at.map_or(served, |s| s.timeline)),
+                    )
+                },
+            );
         AggregateLsn {
             min_flush_lsn: (active > 0).then_some(min_flush),
             min_apply_lsn: (active > 0).then_some(min_apply),
             active_connections: active,
+            accepted_total: self.accepted_total,
             dropped_total: self.dropped_total,
+            replay_timeline: (active > 0).then_some(branch),
         }
     }
 
-    pub fn register_connection(&mut self, start_lsn: u64) -> u64 {
+    /// Count a socket entering the handshake. Deliberately not a
+    /// `register_connection`: per-connection state needs the `START_REPLICATION`
+    /// LSN, and a placeholder would feed boundary holds a fabricated apply
+    /// point.
+    pub fn note_accepted(&mut self) {
+        self.accepted_total += 1;
+    }
+
+    /// `None` refuses a `START_REPLICATION` for a branch this walsender cannot
+    /// serve — a timeline ahead of what it has, or one it never knew. Answering
+    /// with another branch's bytes would have the client write WAL its own
+    /// history rejects.
+    ///
+    /// `ends_at` comes from the handshake, which resolved the request against
+    /// [`identity`](Self::identity): a historic connection streams to that
+    /// switchpoint and then gets the next-timeline result.
+    pub fn register_connection(
+        &mut self,
+        start_lsn: u64,
+        timeline: u32,
+        ends_at: Option<TimelineSwitch>,
+    ) -> Option<u64> {
+        if ends_at.is_none() && timeline != 0 && timeline != self.timeline {
+            return None;
+        }
         let id = self.next_conn_id;
         self.next_conn_id += 1;
-        self.connections.insert(id, ConnState::fresh(start_lsn));
+        self.connections
+            .insert(id, ConnState::fresh(start_lsn, ends_at));
         self.backfill_connection(id, start_lsn);
-        id
+        // Reconnecting at or past the switchpoint: nothing left on this branch,
+        // so end it now rather than idling until the next dispatch
+        if let Some(switch) = ends_at
+            && self.connections[&id].dispatched_lsn >= switch.ends_at
+        {
+            self.end_timeline_for(id, switch);
+        }
+        Some(id)
+    }
+
+    /// What the handshake answers `IDENTIFY_SYSTEM`, `TIMELINE_HISTORY`, and a
+    /// historic `START_REPLICATION` from. Rebuilt per connection so a crossing
+    /// mid-run is visible to the next client that dials in.
+    pub fn identity(&self) -> server::Identity {
+        server::Identity {
+            system_id: self.system_identifier.clone(),
+            timeline: self.timeline,
+            // 0/0 (InvalidXLogRecPtr) skips PG's cascading-standby catch-up
+            // wait: walshadow has no flush position of its own, and a real LSN
+            // parks a walreceiver that resumes past it re-polling
+            // `IDENTIFY_SYSTEM` until `wal_receiver_timeout`
+            xlogpos: 0,
+            dbname: self.dbname.clone(),
+            switches: self.switches.clone(),
+            histories: self.histories.clone(),
+        }
+    }
+
+    /// Move the served branch to `next_tli`, forked at `switch_lsn`, with the
+    /// descendant's history bytes.
+    ///
+    /// Connections on the branch that just ended keep streaming to the
+    /// switchpoint; the listener then ends the timeline on the wire, which is
+    /// how a walreceiver learns where the branch went. History bytes go with it
+    /// because the client fetches `TIMELINE_HISTORY` for every timeline between
+    /// its own and the one `IDENTIFY_SYSTEM` reports
+    /// (`src/backend/replication/walreceiver.c`,
+    /// `WalRcvFetchTimeLineHistoryFiles`) and writes the answer into its `pg_wal`.
+    pub fn advertise_timeline(&mut self, next_tli: u32, switch_lsn: u64, history: Vec<u8>) {
+        let switch = TimelineSwitch {
+            timeline: self.timeline,
+            ends_at: switch_lsn,
+            next_timeline: next_tli,
+        };
+        self.switches.push(switch);
+        self.histories.push((next_tli, history));
+        self.timeline = next_tli;
+        let mut caught_up = SmallVec::<[u64; 4]>::new();
+        for (id, c) in self.connections.iter_mut() {
+            if c.ends_at.is_none() {
+                c.ends_at = Some(switch);
+                // Already served everything below the fork: nothing more will be
+                // dispatched to notice, and an idle source would leave it waiting
+                if c.dispatched_lsn >= switch.ends_at {
+                    caught_up.push(*id);
+                }
+            }
+        }
+        for id in caught_up {
+            self.end_timeline_for(id, switch);
+        }
+        self.wake_listener();
     }
 
     /// Append contiguous wire bytes; a non-contiguous LSN re-anchors.
@@ -220,39 +345,79 @@ impl ShadowStreamState {
         self.retain_wire(start_lsn, bytes);
         let server_wal_end = self.server_wal_end;
         // Snapshot: enqueue below takes `&mut self`, so the map can't stay borrowed
-        let targets: SmallVec<[(u64, u64); 4]> = self
+        let targets: SmallVec<[(u64, u64, Option<TimelineSwitch>); 4]> = self
             .connections
             .iter()
-            .filter(|(_, c)| c.dispatched_lsn < end_lsn)
-            .map(|(id, c)| (*id, c.dispatched_lsn))
+            // A connection already at its switchpoint is done: descendant bytes
+            // must never go down a stream the client reads as ancestor
+            .filter(|(_, c)| !c.closing && !c.timeline_ended && c.dispatched_lsn < end_lsn)
+            .map(|(id, c)| (*id, c.dispatched_lsn, c.ends_at))
             .collect();
-        for (id, conn_offset) in targets {
+        for (id, conn_offset, ends_at) in targets {
+            let cut = ends_at.map(|s| s.ends_at).filter(|v| *v < end_lsn);
+            let take = cut.unwrap_or(end_lsn).saturating_sub(start_lsn) as usize;
             let skip = conn_offset.saturating_sub(start_lsn) as usize;
-            let to_send = &bytes[skip.min(bytes.len())..];
-            if to_send.is_empty() {
-                continue;
-            }
+            let to_send = &bytes[skip.min(take)..take.min(bytes.len())];
             let frame_lsn = start_lsn + skip as u64;
-            if self.enqueue_copy_data_with(id, |out| {
-                encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
-            }) {
-                self.advance_dispatched(id, end_lsn);
+            if !to_send.is_empty()
+                && self.enqueue_copy_data_with(id, |out| {
+                    encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
+                })
+            {
+                self.advance_dispatched(id, cut.unwrap_or(end_lsn));
+            }
+            if cut.is_some() {
+                self.end_timeline_for(id, ends_at.expect("cut came from ends_at"));
             }
         }
     }
 
+    /// Mark a historic connection served through its switchpoint. The listener
+    /// picks this up and ends the timeline on the wire.
+    fn end_timeline_for(&mut self, id: u64, switch: TimelineSwitch) {
+        if let Some(c) = self.connections.get_mut(&id)
+            && !c.timeline_ended
+        {
+            c.timeline_ended = true;
+            tracing::info!(
+                target: "walshadow::shadow_stream",
+                conn_id = id,
+                timeline = switch.timeline,
+                next_timeline = switch.next_timeline,
+                switch_lsn = format!("{:#X}", switch.ends_at),
+                "historic timeline served to its switchpoint",
+            );
+        }
+        self.wake_listener();
+    }
+
+    /// `Some` once a connection has been served through its switchpoint: the
+    /// stream owes the client the next-timeline result.
+    fn timeline_ended_for(&self, id: u64) -> Option<TimelineSwitch> {
+        let conn = self.connections.get(&id)?;
+        conn.timeline_ended.then_some(conn.ends_at).flatten()
+    }
+
     /// Replay `[start_lsn, server_wal_end]` so a reconnect behind the live head
     /// gets a contiguous stream instead of a gap. Older ranges → restore_command.
+    /// A historic connection stops at its switchpoint: past it the retained
+    /// bytes belong to the descendant.
     fn backfill_connection(&mut self, id: u64, start_lsn: u64) {
-        let server_wal_end = self.server_wal_end;
+        let ends_at = self
+            .connections
+            .get(&id)
+            .and_then(|c| c.ends_at)
+            .map(|s| s.ends_at);
+        let server_wal_end = ends_at.map_or(self.server_wal_end, |v| v.min(self.server_wal_end));
         if start_lsn >= server_wal_end || start_lsn < self.wire_buf_start {
             return;
         }
         let off = (start_lsn - self.wire_buf_start) as usize;
-        if off >= self.wire_buf.len() {
+        let end = ((server_wal_end - self.wire_buf_start) as usize).min(self.wire_buf.len());
+        if off >= end {
             return;
         }
-        let backfill = self.wire_buf[off..].to_vec();
+        let backfill = self.wire_buf[off..end].to_vec();
         const FRAME: usize = 256 * 1024;
         let mut pos = 0;
         while pos < backfill.len() {
@@ -559,44 +724,67 @@ async fn drive_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    let (system_id, timeline) = {
-        let s = state.lock().await;
-        (s.system_identifier.clone(), s.timeline)
-    };
-    let identity = server::Identity {
-        system_id,
-        timeline,
-        // 0/0 (InvalidXLogRecPtr): keeps the walreceiver from gating on our
-        // advertised flush and waiting when its resume LSN sits ahead of it.
-        xlogpos: 0,
-        dbname: None,
-    };
-
-    let started = server::handshake_and_await_start(&mut sock, &identity).await?;
-    let id = {
+    let identity = {
         let mut s = state.lock().await;
-        s.register_connection(started.start_lsn)
+        s.note_accepted();
+        s.identity()
     };
-    tracing::info!(
-        target: "walshadow",
-        conn_id = id,
-        start_lsn = format!("{:#X}", started.start_lsn),
-        timeline = started.timeline,
-        "walsender START_REPLICATION accepted",
-    );
 
-    let conn = WalSenderConn::new(sock);
-    let result = run_connection_loop(conn, state.clone(), id, flush_interval).await;
-    state.lock().await.drop_connection(id);
-    result
+    let mut started = server::handshake_and_await_start(&mut sock, &identity).await?;
+    let mut conn = WalSenderConn::new(sock);
+    // One socket can carry several streams: a historic one ends at its
+    // switchpoint, and the client immediately asks for the branch that took over
+    loop {
+        let registered = {
+            let mut s = state.lock().await;
+            s.register_connection(started.start_lsn, started.timeline, started.ends_at)
+        };
+        let Some(id) = registered else {
+            tracing::warn!(
+                target: "walshadow",
+                start_lsn = format!("{:#X}", started.start_lsn),
+                requested_timeline = started.timeline,
+                served_timeline = identity.timeline,
+                "walsender refused START_REPLICATION for an unserved timeline",
+            );
+            return Ok(());
+        };
+        tracing::info!(
+            target: "walshadow",
+            conn_id = id,
+            start_lsn = format!("{:#X}", started.start_lsn),
+            timeline = started.timeline,
+            ends_at = started.ends_at.map(|s| format!("{:#X}", s.ends_at)),
+            "walsender START_REPLICATION accepted",
+        );
+        let outcome = run_connection_loop(&mut conn, state.clone(), id, flush_interval).await;
+        state.lock().await.drop_connection(id);
+        match outcome? {
+            StreamOutcome::Closed => return Ok(()),
+            StreamOutcome::TimelineEnded(switch) => {
+                conn.end_timeline(switch).await?;
+                let identity = state.lock().await.identity();
+                started = conn.await_start(&identity).await?;
+            }
+        }
+    }
+}
+
+/// How one stream on a walsender connection finished.
+enum StreamOutcome {
+    /// Client gone, or the connection dropped for slowness
+    Closed,
+    /// Served through a historic branch's switchpoint; the client is owed the
+    /// next-timeline result
+    TimelineEnded(TimelineSwitch),
 }
 
 async fn run_connection_loop<S>(
-    mut conn: WalSenderConn<S>,
+    conn: &mut WalSenderConn<S>,
     state: Arc<Mutex<ShadowStreamState>>,
     id: u64,
     flush_interval: Duration,
-) -> Result<(), ShadowStreamError>
+) -> Result<StreamOutcome, ShadowStreamError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -654,22 +842,30 @@ where
                             s.observe_status(id, status.write_lsn, status.flush_lsn, status.apply_lsn);
                         }
                     }
-                    None => break,
+                    None => return Ok(StreamOutcome::Closed),
                 }
             }
         }
-        let closing = state
-            .lock()
-            .await
-            .connections
-            .get(&id)
-            .map(|c| c.closing)
-            .unwrap_or(true);
+        let (ended, closing, tail) = {
+            let mut s = state.lock().await;
+            let ended = s.timeline_ended_for(id);
+            // Take the queue under the same lock that reported the end: bytes
+            // enqueued after a drain this loop already did would otherwise land
+            // behind the result set, or never
+            let tail = ended.and_then(|_| s.drain_send_queue(id));
+            let closing = s.connections.get(&id).is_none_or(|c| c.closing);
+            (ended, closing, tail)
+        };
+        if let Some(switch) = ended {
+            if let Some(bytes) = tail.filter(|b| !b.is_empty()) {
+                conn.write_framed(&bytes).await?;
+            }
+            return Ok(StreamOutcome::TimelineEnded(switch));
+        }
         if closing {
-            break;
+            return Ok(StreamOutcome::Closed);
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -683,7 +879,9 @@ mod tests {
     #[test]
     fn status_request_wakes_the_listener_with_the_queued_wal() {
         let mut s = fresh_state();
-        let id = s.register_connection(0x1000);
+        let id = s
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         let rx = s.queued_rx();
         s.enqueue(id, vec![b'd', 0, 0, 0, 4]);
         assert!(
@@ -702,7 +900,9 @@ mod tests {
     #[test]
     fn only_apply_progress_wakes_a_hold() {
         let mut s = fresh_state();
-        let id = s.register_connection(0x1000);
+        let id = s
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         let mut rx = s.applied_rx();
         s.observe_status(id, 0x2000, 0x2000, 0x1000);
         assert!(
@@ -728,11 +928,161 @@ mod tests {
         assert_eq!(agg.min_apply_lsn, None);
     }
 
+    const HISTORY: &[u8] = b"1\t0/1004\tno recovery target specified\n";
+
+    /// The switch is what a client is told about; until it has been served
+    /// through the switchpoint its stream stays open, and descendant bytes never
+    /// go down it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advertising_a_fork_ends_the_ancestor_stream() {
+        let state = Arc::new(Mutex::new(fresh_state()));
+        let mut sink = ShadowStreamSink::new(state.clone());
+        let id = state
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
+        state
+            .lock()
+            .await
+            .advertise_timeline(2, 0x1004, HISTORY.to_vec());
+        assert_eq!(state.lock().await.timeline, 2);
+
+        // Bytes spanning the fork: the ancestor half is served, the descendant
+        // half is not, and the stream is now owed a next-timeline result
+        sink.on_wire_chunk(0x1000, b"AAAABBBB").await.unwrap();
+        let mut s = state.lock().await;
+        let q = s.drain_send_queue(id).expect("ancestor bytes served");
+        assert_eq!(
+            &q[WIRE_HDR..],
+            b"AAAA",
+            "served to the switchpoint and no further",
+        );
+        assert_eq!(
+            s.timeline_ended_for(id),
+            Some(TimelineSwitch {
+                timeline: 1,
+                ends_at: 0x1004,
+                next_timeline: 2
+            }),
+        );
+    }
+
+    /// A reconnect behind the fork gets the ancestor tail out of the retained
+    /// wire buffer, without the fork segment ever having sealed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn historic_reconnect_is_served_from_the_fork_segment() {
+        let state = Arc::new(Mutex::new(fresh_state()));
+        let mut sink = ShadowStreamSink::new(state.clone());
+        sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap();
+        let switch = TimelineSwitch {
+            timeline: 1,
+            ends_at: 0x1004,
+            next_timeline: 2,
+        };
+        state
+            .lock()
+            .await
+            .advertise_timeline(2, 0x1004, HISTORY.to_vec());
+        sink.on_wire_chunk(0x1004, b"DDDD").await.unwrap();
+
+        let mut s = state.lock().await;
+        let id = s
+            .register_connection(0x1000, 1, Some(switch))
+            .expect("timeline 1 is known");
+        let q = s.drain_send_queue(id).expect("ancestor bytes backfilled");
+        assert_eq!(&q[WIRE_HDR..], b"AAAA", "descendant bytes withheld");
+        assert_eq!(s.timeline_ended_for(id), Some(switch));
+    }
+
+    #[test]
+    fn reconnect_at_the_switchpoint_ends_without_serving() {
+        let mut s = fresh_state();
+        let switch = TimelineSwitch {
+            timeline: 1,
+            ends_at: 0x1004,
+            next_timeline: 2,
+        };
+        s.advertise_timeline(2, 0x1004, HISTORY.to_vec());
+        let id = s
+            .register_connection(0x1004, 1, Some(switch))
+            .expect("timeline 1 is known");
+        assert!(
+            s.drain_send_queue(id).is_none(),
+            "nothing left on that branch"
+        );
+        assert_eq!(s.timeline_ended_for(id), Some(switch));
+    }
+
+    #[test]
+    fn refuses_a_timeline_this_walsender_never_served() {
+        let mut s = fresh_state();
+        assert!(
+            s.register_connection(0x1000, 7, None).is_none(),
+            "a branch the handshake could not place cannot be answered",
+        );
+        assert!(
+            s.register_connection(0x1004, 1, None).is_some(),
+            "the current branch connects",
+        );
+        assert!(
+            s.register_connection(0x1004, 0, None).is_some(),
+            "an unspecified timeline takes the current branch",
+        );
+    }
+
+    /// The handshake answers from this, so a crossing has to show up in it.
+    #[test]
+    fn identity_carries_the_chain_after_a_crossing() {
+        let mut s = fresh_state();
+        assert!(s.identity().switches.is_empty());
+        s.advertise_timeline(2, 0x1004, HISTORY.to_vec());
+        let identity = s.identity();
+        assert_eq!(identity.timeline, 2);
+        assert_eq!(
+            identity.switches,
+            [TimelineSwitch {
+                timeline: 1,
+                ends_at: 0x1004,
+                next_timeline: 2
+            }],
+        );
+        assert_eq!(identity.histories, [(2, HISTORY.to_vec())]);
+    }
+
+    #[test]
+    fn identify_system_advertises_invalid_xlogpos() {
+        assert_eq!(
+            fresh_state().identity().xlogpos,
+            0,
+            "a real LSN parks PG's walreceiver in its catch-up wait",
+        );
+    }
+
+    #[test]
+    fn accepted_counts_sockets_short_of_start_replication() {
+        let mut s = fresh_state();
+        s.note_accepted();
+        let agg = s.aggregate();
+        assert_eq!(agg.accepted_total, 1);
+        assert_eq!(agg.active_connections, 0, "handshake carries no LSN");
+        assert_eq!(agg.min_apply_lsn, None, "holds must not see a fake apply");
+        s.register_connection(0x1000, 1, None)
+            .expect("current timeline");
+        let agg = s.aggregate();
+        assert_eq!(agg.accepted_total, 1, "monotonic, not decremented");
+        assert_eq!(agg.active_connections, 1);
+    }
+
     #[test]
     fn aggregate_lsn_returns_min_across_connections() {
         let mut s = fresh_state();
-        let a = s.register_connection(0x1000);
-        let b = s.register_connection(0x1000);
+        let a = s
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
+        let b = s
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         s.observe_status(a, 0x2000, 0x2000, 0x1800);
         s.observe_status(b, 0x2200, 0x2100, 0x1900);
         let agg = s.aggregate();
@@ -741,10 +1091,37 @@ mod tests {
         assert_eq!(agg.min_apply_lsn, Some(0x1800));
     }
 
+    /// A client held on a historic branch reads as that branch, not as the one
+    /// the walsender advertises: that gap is a shadow mid-crossing.
+    #[test]
+    fn aggregate_reports_the_branch_attached_clients_read() {
+        let mut s = fresh_state();
+        assert_eq!(s.aggregate().replay_timeline, None, "nothing attached");
+        s.advertise_timeline(2, 0x2000, HISTORY.to_vec());
+        s.register_connection(
+            0x1000,
+            1,
+            Some(TimelineSwitch {
+                timeline: 1,
+                ends_at: 0x2000,
+                next_timeline: 2,
+            }),
+        )
+        .expect("historic branch the chain places");
+        assert_eq!(s.aggregate().replay_timeline, Some(1));
+        s.register_connection(0x2000, 2, None)
+            .expect("served branch");
+        assert_eq!(
+            s.aggregate().replay_timeline,
+            Some(1),
+            "the branch furthest behind is the one still crossing",
+        );
+    }
+
     #[test]
     fn enqueue_past_slow_threshold_marks_closing() {
         let mut s = ShadowStreamState::new(1, "x".into(), 0, 64);
-        let id = s.register_connection(0);
+        let id = s.register_connection(0, 1, None).expect("current timeline");
         assert!(s.enqueue(id, vec![0u8; 32]));
         assert!(s.enqueue(id, vec![0u8; 16]));
         assert!(!s.enqueue(id, vec![0u8; 64]));
@@ -756,7 +1133,7 @@ mod tests {
     #[test]
     fn dropped_total_increments_once_per_connection() {
         let mut s = ShadowStreamState::new(1, "x".into(), 0, 64);
-        let id = s.register_connection(0);
+        let id = s.register_connection(0, 1, None).expect("current timeline");
         assert!(!s.enqueue(id, vec![0u8; 128]));
         // second overflow on the closing slot must not double-count
         assert!(!s.enqueue(id, vec![0u8; 128]));
@@ -766,8 +1143,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn sink_dispatches_one_wire_chunk_per_active_connection() {
         let state = Arc::new(Mutex::new(fresh_state()));
-        let a = state.lock().await.register_connection(0x1000);
-        let b = state.lock().await.register_connection(0x1000);
+        let a = state
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
+        let b = state
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         let mut sink = ShadowStreamSink::new(state.clone());
         let bytes = b"abc";
         sink.on_wire_chunk(0x1000, bytes).await.unwrap();
@@ -795,7 +1180,9 @@ mod tests {
         // A reconnect behind the head gets the whole [reconnect_lsn, head] range
         // from the retained buffer — not just future bytes (which would gap).
         let mut s = state.lock().await;
-        let id = s.register_connection(0x1000);
+        let id = s
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         let q = s.drain_send_queue(id).expect("reconnect backfilled");
         assert_eq!(&q[WIRE_HDR..], b"AAAABBBB", "backfill must be gap-free");
     }
@@ -806,7 +1193,9 @@ mod tests {
         let mut sink = ShadowStreamSink::new(state.clone());
         sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap(); // head = 0x1004
         let mut s = state.lock().await;
-        let id = s.register_connection(0x1004); // caught up
+        let id = s
+            .register_connection(0x1004, 1, None)
+            .expect("current timeline"); // caught up
         assert!(
             s.drain_send_queue(id).is_none(),
             "nothing to backfill at head"
@@ -823,13 +1212,17 @@ mod tests {
 
         let mut s = state.lock().await;
         // Old (completed) segment is restore_command's job — not backfilled.
-        let old = s.register_connection(0x1000);
+        let old = s
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         assert!(
             s.drain_send_queue(old).is_none(),
             "completed segment not backfilled"
         );
         // Current segment is served from the buffer.
-        let cur = s.register_connection(0x1004);
+        let cur = s
+            .register_connection(0x1004, 1, None)
+            .expect("current timeline");
         let q = s.drain_send_queue(cur).expect("current-segment backfill");
         assert_eq!(&q[WIRE_HDR..], b"CCCC");
     }
@@ -849,10 +1242,14 @@ mod tests {
             4,
             "completed segment dropped, in-progress [0x1004,0x1008) kept"
         );
-        let cur = s.register_connection(0x1004);
+        let cur = s
+            .register_connection(0x1004, 1, None)
+            .expect("current timeline");
         let q = s.drain_send_queue(cur).expect("in-progress backfill kept");
         assert_eq!(&q[WIRE_HDR..], b"BBBB", "no gap after trim");
-        let old = s.register_connection(0x1000);
+        let old = s
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
         assert!(
             s.drain_send_queue(old).is_none(),
             "completed segment falls to restore_command"

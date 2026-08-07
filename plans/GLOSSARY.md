@@ -147,6 +147,12 @@ feedback advances on ([emitter.md](emitter.md))
 S. Observability only, nothing gates on it
 ([add_table.md](add_table.md))
 
+**crossing** — walking the source stream from an ancestor timeline onto a
+descendant one at the fork: drain to `F`, hold at the barrier until every
+consumer reaches it, verify the repeated fork-segment prefix, commit the
+resume position on the descendant, advertise to shadow, resume
+([failover.md](failover.md))
+
 **DdlApplicator** — applies SchemaEvents to CH in source-LSN order
 inside the barrier, own connection, no retry (error trips Fatal); also
 runs TRUNCATE and gated DROP per DropTableStrategy
@@ -194,6 +200,12 @@ Heaps merge beside control items; catalog-before-heap tie-break at equal
 durable on CH. Advertised as standby `apply_lsn`, bounds source slot
 recycling, resume point after restart
 ([emitter.md](emitter.md), [ops.md](ops.md))
+
+**fork point / switchpoint (`F`)** — LSN where a promoted primary ends the
+ancestor timeline and starts the descendant; read from parsed
+`TIMELINE_HISTORY`. A position exactly at it belongs to the descendant, and
+so does the whole segment holding it, since a fork copies the ancestor
+prefix into a descendant-named file ([failover.md](failover.md))
 
 **FileAction (Keep / Skip / Tap)** — per-backup-file sink decision: land
 body under data dir, drain unread, or stream body through `chunk()`
@@ -366,6 +378,11 @@ BackfillTuples with per-rel `_lsn` overrides
 **parity check** — end-state comparison (count + sum + md5 of aggregated
 rows) between source and CH proving replication fidelity
 ([ops.md](ops.md))
+
+**pause frontier** — consumed and received LSNs frozen when the pump
+observes `[stream] paused`; a switchover's promotion decision compares the
+target's replay against the frozen received value, and resume asks for the
+frozen consumed one ([failover.md](failover.md))
 
 **PgPending** — ColumnValue fallback `{type_oid, raw}` for types without
 in-tree codec (jsonb, ranges, arrays, tsvector, vendor types); resolved

@@ -114,7 +114,9 @@ for rendered diagram:
    completed 16 MiB segments from filter output dir. Startup recovery
    uses it after wire disconnects and while catching up after restart.
    Retention keeps segments back to shadow's last restartpoint, see
-   [ops.md](ops.md)
+   [ops.md](ops.md). `<tli>.history` files land in the same dir and are
+   never trimmed, so `recovery_target_timeline = 'latest'` discovery can
+   select a branch the source forked onto ([failover.md](failover.md))
 
 Channels (2) & (3) coexist by PG design: walreceiver tries
 `primary_conninfo` first, falls back to `restore_command` on connect

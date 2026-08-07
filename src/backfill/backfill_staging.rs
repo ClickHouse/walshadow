@@ -16,6 +16,7 @@
 //! swapped" (uuid unchanged under the staging name) from "swapped" (uuid
 //! differs) from "already copied back" (staging name gone).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -77,7 +78,7 @@ pub struct StagingPlan {
 /// Rebuild one staging table per mapped rel (`DROP` + `CREATE .. AS` clones
 /// structure and engine) and snapshot the routing map against them.
 pub async fn prepare(
-    emitter: &EmitterConfig,
+    emitter: Arc<EmitterConfig>,
     live: &MappingHandle,
     reqs: &[BackupRequest],
 ) -> Result<StagingPlan> {
@@ -123,21 +124,22 @@ pub async fn prepare(
 /// inserter pool's bounded per-attempt timeout.
 pub struct StagingSession {
     client: AsyncClient,
-    conn: EmitterConfig,
+    /// Kept whole for reconnect; shared with the pass that opened the session
+    conn: Arc<EmitterConfig>,
     retry: RetryConfig,
     timeout: Duration,
 }
 
 impl StagingSession {
-    pub async fn connect(emitter: &EmitterConfig) -> Result<Self> {
-        let client = connect_client(emitter)
+    pub async fn connect(emitter: Arc<EmitterConfig>) -> Result<Self> {
+        let client = connect_client(&*emitter)
             .await
             .map_err(|e| anyhow::anyhow!("backfill_staging: connect: {e}"))?;
         Ok(Self {
             client,
-            conn: emitter.clone(),
             retry: emitter.retry.clone(),
             timeout: emitter.insert_timeout,
+            conn: emitter,
         })
     }
 
@@ -161,7 +163,7 @@ impl StagingSession {
                     );
                     attempt += 1;
                     backoff_step(&mut backoff, self.retry.max_backoff).await;
-                    self.client = connect_client(&self.conn)
+                    self.client = connect_client(&*self.conn)
                         .await
                         .map_err(|e| anyhow::anyhow!("backfill_staging: reconnect: {e}"))?;
                 }

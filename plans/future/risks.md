@@ -91,27 +91,28 @@ mature, the rewrite is mechanical); Path B spend is permanent
 Reconsider only when Path A's measured CPU + latency cost exceeds
 the operator's tolerance and parallelism doesn't close the gap
 
-## Source primary failover
+## Source primary promotion
 
-Walshadow's physical slot lives on source primary. Source loss
-loses the slot; promoting source's standby loses walshadow's WAL
-position. Lossless continuation across a descendant timeline is
-planned in [failover.md](failover.md); current implementation still
-requires one of options below
+Operator-driven switchover continues across the fork
+([../failover.md](../failover.md)); the deployment preconditions are what
+remains a risk
 
-Two operator options
-(overview.md pitfall #9):
+* **Slot doesn't follow.** Physical slots are never synchronized to a
+  standby, at any PostgreSQL version; PG 17 failover slots cover logical
+  slots only. Slot mode needs the slot pre-created on the promotion target
+  under the configured name; walshadow proves it rather than creating one,
+  so a missing or too-new slot refuses the repoint by name
+  ([../failover.md](../failover.md) §Slot). `max_slot_wal_keep_size` on the
+  target can still invalidate a pre-created slot during a long pause, so the
+  pause window lives inside that budget
+* **Unplanned promotion.** Loss of the primary without a pause window
+  fails closed rather than continuing; the paths that convert those
+  refusals are [failover.md](failover.md)
+* **Re-bootstrap remains the escape.** Walshadow re-attaches against the
+  promoted primary at a fresh LSN; the backfill bridge
+  ([../bootstrap.md](../bootstrap.md)) reseeds anything between the old
+  slot position and the new attach LSN
 
-* **Pre-create slot on the standby.** Failover-aware replication
-  slots (PG 17+) follow; pre-PG-17 needs manual operator script
-  before failover
-* **Re-bootstrap from new LSN.** Walshadow re-attaches against the
-  newly-promoted primary at a fresh LSN; backfill bridge
-  (see [bootstrap.md](../bootstrap.md)) reseeds anything between old
-  slot position and new attach LSN
-
-Catalog on shadow is preserved across re-attach; no schema replay
-needed. Slot positioning is the failure mode, not catalog state
-
-Risk: operator doesn't pre-create slot and doesn't tolerate
-re-bootstrap window. Document as deployment precondition
+Catalog on shadow is preserved across a crossing and across re-attach; no
+schema replay needed. Slot positioning is the failure mode, not catalog
+state

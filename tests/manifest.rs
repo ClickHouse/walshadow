@@ -9,13 +9,14 @@
 //! resumes as greenfield.
 
 use walshadow::manifest::{
-    self, Lsn, LsnSet, MANIFEST_FILENAME, MANIFEST_VERSION, Manifest, SourceIdentity,
+    self, Lsn, LsnSet, MANIFEST_FILENAME, MANIFEST_VERSION, Manifest, SourceIdentity, WalBranch,
 };
 
 fn ident() -> SourceIdentity {
     SourceIdentity {
         system_id: 7_000_000_000_000_000_001,
         timeline: 3,
+        timeline_begin: Lsn(0x0400_0000),
     }
 }
 
@@ -24,6 +25,7 @@ fn sample() -> Manifest {
         version: MANIFEST_VERSION,
         floor: Lsn(0x05),
         source: ident(),
+        wal: WalBranch { stream_timeline: 3 },
         lsn: LsnSet {
             source_received: Lsn(0x10),
             filter_durable: Lsn(0x09),

@@ -38,6 +38,11 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
   shared insert tail, restart source fallback contract
 - [ops.md](ops.md) — preflight, metrics, retention, manifest (floor,
   6 LSNs), standby-status triple, kill-restart drill
+- [failover.md](failover.md) — source timeline crossing: operator
+  switchover protocol, frozen pause frontier, promotion gate, fork proofs,
+  pipeline barrier at the fork, committed resume position, fork-segment
+  prefix verification, shadow handoff order, lineage-aware resume and
+  reconnect, slot proofs, parked refusals
 - [control.md](control.md) — in-process control plane: `ctl` unix-socket
   line protocol, base+`conf.d` config merge (API writes only its
   `50-api.toml` fragment), live reload (mappings/budgets/CH-conn/table

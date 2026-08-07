@@ -20,6 +20,8 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+use crate::source::transition::SWITCH_FAILURE_REASONS;
+
 #[derive(Debug, Error)]
 pub enum MetricsError {
     #[error("io: {0}")]
@@ -39,10 +41,13 @@ pub struct MetricsSnapshot {
     pub filter_lsn: u64,
     /// Shadow PG's `pg_last_wal_replay_lsn()`, `0` until first poll
     pub shadow_replay_lsn: u64,
-    /// Stays `0`: surface fixed before durability work
+    /// Highest commit LSN drained out of the xact buffer, so above every
+    /// commit whose rows could have reached ClickHouse
     pub decoder_commit_lsn: u64,
-    /// Stays `0`, same as `decoder_commit_lsn`
+    /// Contiguous-done watermark from the insert pipeline
     pub emitter_ack_lsn: u64,
+    /// Durable resume floor: restart resumes here and every pruner cuts to it
+    pub floor_lsn: u64,
     /// `route` is `"to_shadow"` / `"to_decoder"`
     pub records_by_rm_route: BTreeMap<(String, &'static str), u64>,
     pub xact_active: u64,
@@ -161,6 +166,63 @@ pub struct MetricsSnapshot {
     pub bridge_decode_items_total: u64,
     pub bridge_decode_item_errors_total: u64,
     pub uptime_secs: u64,
+    /// Feeds swapped onto a reloaded `[source]` endpoint or slot
+    pub source_endpoint_swaps_total: u64,
+    /// Swap attempts refused or unreachable (identity proof, connect, START;
+    /// a slot the target does not have fails here)
+    pub source_endpoint_swap_failures_total: u64,
+    /// 1 while config names an endpoint or slot the pump has not reached yet
+    pub source_endpoint_swap_pending: u64,
+    /// Proof the last swap attempt failed on, from the crossing's own
+    /// vocabulary; empty once one lands
+    pub source_endpoint_swap_blocked_on: &'static str,
+    /// Refusal a crossing parked on. The pump keeps publishing rather than
+    /// exiting into a restart that re-crosses and re-fails, so this is how the
+    /// daemon says it is waiting for an operator
+    pub crossing_blocked_on: &'static str,
+    /// That refusal's own words, which name the pair behind it
+    pub crossing_detail: String,
+    /// PostgreSQL source system identifier
+    pub source_system_id: u64,
+    /// Branch the pump is reading
+    pub source_timeline: u32,
+    /// Branch owning the durable floor, which restart resumes on. Trails
+    /// `source_timeline` between a fork and the floor crossing it
+    pub floor_timeline: u32,
+    pub timeline_switches_total: u64,
+    /// Crossings refused, rendered `reason=` labelled; order matches
+    /// [`SWITCH_FAILURE_REASONS`]
+    pub timeline_switch_failures_by_reason: [u64; SWITCH_FAILURE_REASONS.len()],
+    /// Most recent fork point, diagnostic
+    pub timeline_switch_lsn: u64,
+    /// Descendant bytes compared against the retained ancestor prefix
+    pub timeline_prefix_bytes_verified_total: u64,
+    pub timeline_transition_seconds_total: f64,
+    /// `WalStream::next_lsn` frozen when the pump observed `[stream] paused`,
+    /// which resume asks the source to serve. `0` while not paused: a value
+    /// left from an earlier pause cannot be compared against a promotion
+    /// decision either
+    pub pause_consumed_lsn: u64,
+    /// Source head last heard about, frozen at the same instant. The promotion
+    /// target must reach it before it is promoted
+    pub pause_received_lsn: u64,
+    /// Both frozen numbers were re-derived by this process from a pause it
+    /// found already in effect, so a pair read before a restart is stale
+    pub pause_refrozen: bool,
+    /// Every term of the promotion gate holds, so the target may be promoted
+    pub promotion_ready: bool,
+    /// First term that does not, empty once ready
+    pub promotion_blocked_on: &'static str,
+    pub promotion_target_in_recovery: bool,
+    /// Target's `pg_last_wal_replay_lsn()`, read while paused
+    pub promotion_target_replay_lsn: u64,
+    /// Target's `pg_last_wal_receive_lsn()`, read while paused
+    pub promotion_target_receive_lsn: u64,
+    /// Branch the shadow-facing walsender advertises
+    pub shadow_served_timeline: u32,
+    /// Branch the shadow is replaying, which is how a shadow that followed the
+    /// chain reads differently from one that merely survived
+    pub shadow_replay_timeline: u32,
     /// `source_received_lsn - min_apply_lsn` across active shadow walreceivers.
     /// Caller saturates to 0 when shadow is ahead; passes `source_received_lsn`
     /// when none connected (disconnect = max lag)
@@ -348,13 +410,58 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         ),
         (
             "walshadow_decoder_commit_lsn",
-            "Highest LSN the decoder has committed downstream (currently 0).",
+            "Highest commit LSN drained out of the xact buffer.",
             snap.decoder_commit_lsn,
         ),
         (
             "walshadow_emitter_ack_lsn",
-            "Highest LSN the CH emitter has acked (currently 0).",
+            "Contiguous-done watermark from the insert pipeline.",
             snap.emitter_ack_lsn,
+        ),
+        (
+            "walshadow_floor_lsn",
+            "Durable resume floor: restart resumes here and pruners cut to it.",
+            snap.floor_lsn,
+        ),
+        (
+            "walshadow_source_timeline",
+            "Source WAL timeline the pump is reading.",
+            u64::from(snap.source_timeline),
+        ),
+        (
+            "walshadow_floor_timeline",
+            "Timeline owning the durable floor, which restart resumes on.",
+            u64::from(snap.floor_timeline),
+        ),
+        (
+            "walshadow_timeline_switch_lsn",
+            "Fork LSN of the most recent timeline crossing.",
+            snap.timeline_switch_lsn,
+        ),
+        (
+            "walshadow_pause_consumed_lsn",
+            "Consumed frontier frozen when the pump observed the pause; 0 while running.",
+            snap.pause_consumed_lsn,
+        ),
+        (
+            "walshadow_pause_received_lsn",
+            "Source head frozen when the pump observed the pause; 0 while running.",
+            snap.pause_received_lsn,
+        ),
+        (
+            "walshadow_crossing_wedged",
+            "1 while a crossing is parked on a refusal only an operator can clear.",
+            u64::from(!snap.crossing_blocked_on.is_empty()),
+        ),
+        (
+            "walshadow_shadow_served_timeline",
+            "Timeline the shadow-facing walsender advertises.",
+            u64::from(snap.shadow_served_timeline),
+        ),
+        (
+            "walshadow_shadow_replay_timeline",
+            "Timeline the shadow is replaying.",
+            u64::from(snap.shadow_replay_timeline),
         ),
     ] {
         writeln!(s, "# HELP {name} {help}").unwrap();
@@ -726,6 +833,24 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             snap.uptime_secs,
         ),
         (
+            "walshadow_source_endpoint_swaps_total",
+            "Source feeds swapped onto a reloaded [source] endpoint or slot.",
+            "counter",
+            snap.source_endpoint_swaps_total,
+        ),
+        (
+            "walshadow_source_endpoint_swap_failures_total",
+            "Swap attempts refused or unreachable (identity proof, connect, START_REPLICATION, missing slot).",
+            "counter",
+            snap.source_endpoint_swap_failures_total,
+        ),
+        (
+            "walshadow_source_endpoint_swap_pending",
+            "1 while config names a source endpoint or slot the pump has not reached yet.",
+            "gauge",
+            snap.source_endpoint_swap_pending,
+        ),
+        (
             "walshadow_shadow_apply_lag_bytes",
             "Bytes between source_received_lsn and the min apply LSN reported by active shadow walreceivers.",
             "gauge",
@@ -934,6 +1059,51 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         writeln!(s, "# HELP {name} {help}").unwrap();
         writeln!(s, "# TYPE {name} {kind}").unwrap();
         writeln!(s, "{name} {value}").unwrap();
+    }
+
+    // Label preserves 64-bit identifier beyond float64 precision
+    {
+        let name = "walshadow_source_info";
+        writeln!(s, "# HELP {name} Source cluster the pump is reading.").unwrap();
+        writeln!(s, "# TYPE {name} gauge").unwrap();
+        writeln!(s, "{name}{{system_id=\"{}\"}} 1", snap.source_system_id).unwrap();
+    }
+
+    // Timeline crossing, counters plus the labelled refusal family
+    {
+        for (name, help, value) in [
+            (
+                "walshadow_timeline_switches_total",
+                "Source timeline crossings completed.",
+                snap.timeline_switches_total,
+            ),
+            (
+                "walshadow_timeline_prefix_bytes_verified_total",
+                "Descendant bytes compared against the retained ancestor fork prefix.",
+                snap.timeline_prefix_bytes_verified_total,
+            ),
+        ] {
+            writeln!(s, "# HELP {name} {help}").unwrap();
+            writeln!(s, "# TYPE {name} counter").unwrap();
+            writeln!(s, "{name} {value}").unwrap();
+        }
+        let name = "walshadow_timeline_transition_seconds_total";
+        writeln!(s, "# HELP {name} Seconds spent inside timeline crossings.").unwrap();
+        writeln!(s, "# TYPE {name} counter").unwrap();
+        writeln!(s, "{name} {}", snap.timeline_transition_seconds_total).unwrap();
+        let name = "walshadow_timeline_switch_failures_total";
+        writeln!(
+            s,
+            "# HELP {name} Crossings refused; the stream stays on the ancestor."
+        )
+        .unwrap();
+        writeln!(s, "# TYPE {name} counter").unwrap();
+        for (reason, v) in SWITCH_FAILURE_REASONS
+            .iter()
+            .zip(snap.timeline_switch_failures_by_reason)
+        {
+            writeln!(s, "{name}{{reason=\"{reason}\"}} {v}").unwrap();
+        }
     }
 
     // Transaction-plan families, labelled series

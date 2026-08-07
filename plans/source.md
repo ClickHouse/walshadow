@@ -54,22 +54,39 @@ have not reached and let source recycle un-filtered WAL. Cadence
 permanent physical slot, pins source's `pg_wal/`; None = slotless, source
 recycles on `wal_keep_size` schedule. Slot caps catch-up, slotless caps
 source disk burn. Slot name comes from config (`[source] slot` →
-`EmitterConfig.source_slot`), with a `--slot` CLI override applied at parse
-time (CLI > TOML, boot-only — same idiom as `--ch-flush-timeout-ms`).
-`SourceFeed::ensure_physical_slot(name)` creates it idempotently with
-immediate WAL reservation (`pg_create_physical_replication_slot(name,
-true)`), run before pre-flight (which requires the slot to exist). A
+`ResolvedConfig.source.slot`), with a `--slot` CLI override pinning it for the
+process (CLI > TOML — same idiom as `--ch-flush-timeout-ms`). The name reloads
+with the rest of `[source]`, since a promotion target names its slot its own
+way; a rename reconnects, because a slot binds at `START_REPLICATION`.
+`SourceFeed::ensure_physical_slot(name)` creates the boot-named slot
+idempotently with immediate WAL reservation
+(`pg_create_physical_replication_slot(name, true)`), run before pre-flight
+(which requires the slot to exist), and is the only slot walshadow ever
+creates: one created on a renamed endpoint reserves WAL at that server's head,
+which proves nothing about coverage of the resume floor, so a name no slot
+answers to fails the swap as `slot_missing` and leaves the current feed
+streaming. A
 physical slot's `restart_lsn` tracks the reported **flush** LSN, so the
 pump caps `flush_lsn` at `apply_ceiling = min(shadow_replay, emitter_ack)`
 (see [ops.md](ops.md)): the source retains WAL until CH has durably
 ingested it, not merely until walshadow fsynced its filter output.
 
-`SourceFeed::reconnect(cfg, slot, resume_lsn, timeline, interval)`
+`resume_source_feed(cfg, slot, resume_lsn, branch, floor, interval)`
 re-establishes a dropped replication connection (e.g. source
 `wal_sender_timeout` fired during a CH-stall backpressure) and resumes at
 `resume_lsn = stream.next_lsn()` — the byte-contiguous resume point, never
 `dispatched_lsn` (which lags by any buffered in-progress record →
-misaligned push). `reconnect` is one attempt; the caller (`SourceRecovery::recover`) is
+misaligned push). It proves continuity before it asks for a byte
+([failover.md](failover.md) §Reconnect): the manifest's `system_id`, then the
+live chain placing the branch being read where walshadow's own chain does and
+still serving `resume_lsn`, then the configured slot. `cfg` is the live
+`[source]` endpoint ([control.md](control.md) §Source endpoint move), so the
+address reached can differ from the one boot dialed and those proofs are what
+keep a mistyped host, or a sibling of the same cluster, from replaying
+foreign WAL into these artifacts. A newer live timeline is a promotion, and
+the request stays on the branch being read, so the walsender ends it at the
+fork and the crossing takes over.
+One attempt; the caller (`SourceRecovery::recover`) is
 source-first: a plain (transient) drop retries the source once at
 `stream.next_lsn()` before touching the archive, and a recycled-segment error
 skips straight to the archive. Archive segments then replay through the same
@@ -254,7 +271,8 @@ last flush. `on_idle_advance(lsn)` runs after every batch carrying max
 `source_lsn`; it advances `emitter_ack_lsn` past trailing non-commit WAL
 (checkpoint, RUNNING_XACTS) when no xact is in flight. Pipeline path:
 `ReorderSink::on_idle_advance` routes through the ack collector's
-`Trailing` event, which advances only when every registered seq is done.
+`Trailing` event; the collector holds that position until every
+registered seq is done, then publishes it.
 Serial path: xact buffer caps the nudge at the observer's
 `idle_ack_ceiling(lsn)`. Without the idle advance source's slot pins
 WAL at last COMMIT, kill-restart idle catchup never resolves
@@ -421,10 +439,18 @@ LSN advances at network + apply cadence (ms), catalog gate clears in ms
 
 Surface: `StartupMessage` with `replication=true` → `AuthenticationOk` +
 ParameterStatus burst + `BackendKeyData` + `ReadyForQuery`.
-`IDENTIFY_SYSTEM` returns `(systemid, timeline, xlogpos, dbname)` row
-cached from source's reply at startup. `TIMELINE_HISTORY <tli>` returns
-single-timeline empty body. `START_REPLICATION [SLOT _] PHYSICAL <lsn>
-[TIMELINE <n>]` returns `CopyBothResponse` then `'w'` XLogData frames.
+`IDENTIFY_SYSTEM` returns `(systemid, timeline, xlogpos, dbname)`, the
+system id from source's reply at startup and the timeline rebuilt per
+connection so a crossing mid-run is visible to the next client
+(`xlogpos` answers `0/0`, see
+[`ShadowStreamState`](../src/source/shadow_stream.rs)).
+`TIMELINE_HISTORY <tli>` returns the source's own bytes for a branch this
+walsender knows, `undefined_file` otherwise. `START_REPLICATION [SLOT _]
+PHYSICAL <lsn> [TIMELINE <n>]` returns `CopyBothResponse` then `'w'`
+XLogData frames; a historic timeline streams to that branch's switchpoint,
+then backend `CopyDone` and the next-timeline result
+([failover.md](failover.md) §Shadow handoff), and an unplaceable timeline
+is refused rather than answered with another branch's bytes.
 `BASE_BACKUP` unsupported (shadow basebackup'd from source at bootstrap)
 
 `'w'` + `'k'` encoders sit in
@@ -474,9 +500,11 @@ walsender listener before shadow's walreceiver attaches; construct
 batch_size, capacity)`); open `WalStream` + `DirSegmentSink`, attach
 `ShadowStreamSink` via `set_bytes_sink`; spawn metrics endpoint, SIGHUP
 handler, retention sweeper, status loop; ensure the configured physical slot before pre-flight; wait for walsender
-connect barrier; pump loop: `feed.next_chunk()` → `stream.push(lsn,
+connect barrier; pump loop: `feed.next_event()` → `stream.push(lsn,
 bytes, &mut record_sink, &mut segment_sink)` → manifest advance → status
-update → repeat. A `next_chunk` error routes through `SourceRecovery::recover`,
+update → repeat. `SourceEvent::TimelineEnd` hands the iteration to the
+crossing and `Shutdown` to reconnect ([failover.md](failover.md)). An
+error routes through `SourceRecovery::recover`,
 source-first: retry `SourceFeed::reconnect` at `stream.next_lsn()`, then replay
 the `[backup]` archive when the source can't serve the resume LSN (`58P01`),
 then back to the source at the handoff. Missing WAL in both sources exits for

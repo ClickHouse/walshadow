@@ -49,7 +49,7 @@ use walshadow::schema::RelName;
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
-use walshadow::source_feed::{SourceFeed, StandbyStatus};
+use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
@@ -1008,12 +1008,12 @@ pub async fn pump_until_res<S: RecordSink + Send>(
         let apply_lsn = stream.dispatched_lsn();
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            feed.next_chunk(StandbyStatus::collapsed(apply_lsn), chunk_buf),
+            feed.next_event(StandbyStatus::collapsed(apply_lsn), chunk_buf),
         )
         .await;
         let chunk = match next {
-            Ok(Ok(Some(c))) => c,
-            Ok(Ok(None)) => break,
+            Ok(Ok(SourceEvent::Wal(c))) => c,
+            Ok(Ok(_)) => break, // timeline end or source shutdown
             Ok(Err(e)) => panic!("source feed: {e:#}"),
             Err(_) => continue,
         };

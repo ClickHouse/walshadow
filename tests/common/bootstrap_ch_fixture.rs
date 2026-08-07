@@ -308,7 +308,11 @@ pub fn http_get(addr: std::net::SocketAddr, path: &str) -> Result<String> {
     let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .with_context(|| format!("connect {addr}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
-    write!(sock, "GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+    // One write_all, not `write!`: the format adapter emits a syscall per
+    // piece, and the server answers off its first read then closes. A client
+    // descheduled between pieces writes the rest into a closed socket and
+    // takes EPIPE.
+    sock.write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())?;
     let mut buf = Vec::new();
     sock.read_to_end(&mut buf)?;
     let txt = String::from_utf8_lossy(&buf).into_owned();

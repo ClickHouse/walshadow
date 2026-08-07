@@ -79,6 +79,12 @@ pub enum WalStreamError {
     },
     #[error("misaligned push: expected lsn {expected:#X}, got {got:#X}")]
     Misaligned { expected: u64, got: u64 },
+    #[error("timeline {next_tli} does not follow {current_tli}")]
+    TimelineNotAbove { current_tli: u32, next_tli: u32 },
+    #[error("fork at {switch_lsn:#X} is above the consumed frontier {next_lsn:#X}")]
+    ForkAboveFrontier { switch_lsn: u64, next_lsn: u64 },
+    #[error("fork at {switch_lsn:#X} is behind bytes already dispatched through {dispatched:#X}")]
+    ForkBehindDispatched { switch_lsn: u64, dispatched: u64 },
     #[error("base lsn {0:#X} not segment-aligned")]
     UnalignedBase(u64),
     #[error("sink: {0}")]
@@ -112,7 +118,25 @@ pub struct WalStream {
     /// Segment-relative offset of the highest byte framed onto bytes_sink;
     /// reset to `0` at segment boundary.
     wire_offset: usize,
+    /// CRC32C of the raw source bytes consumed in the current segment,
+    /// `[raw_crc_from, next_lsn)`. What a fork verify compares against: the
+    /// walker buffer cannot answer, because every dropped record is rewritten
+    /// in place, and retaining the raw bytes would mean a second copy of every
+    /// segment.
+    raw_crc: u32,
+    raw_crc_from: u64,
     poisoned: bool,
+}
+
+/// Digest of the ancestor bytes a descendant repeats, from
+/// [`WalStream::fork_prefix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkPrefix {
+    /// Start of the segment the digest covers
+    pub from: u64,
+    /// One past the last byte digested
+    pub through: u64,
+    pub crc: u32,
 }
 
 impl WalStream {
@@ -132,6 +156,8 @@ impl WalStream {
             pending_entries: Vec::new(),
             bytes_sink: Box::new(NoopBytesSink),
             wire_offset: 0,
+            raw_crc: 0,
+            raw_crc_from: start_lsn,
             poisoned: false,
         })
     }
@@ -185,6 +211,7 @@ impl WalStream {
                 got: lsn,
             });
         }
+        self.digest_raw(lsn, bytes);
         let mut data = bytes;
         let mut cur_lsn = lsn;
         let chunk_cap = self.seg_size as usize;
@@ -378,6 +405,109 @@ impl WalStream {
         self.wire_offset = self.wire_offset.saturating_sub(seg_size);
         self.stats_at_segment_start = self.filter.snapshot();
         Ok(true)
+    }
+
+    /// Move the stream onto `next_tli`, forked at `switch_lsn`.
+    ///
+    /// Every complete segment still buffered seals under the ancestor name
+    /// first: the fork segment is the only one whose identity changes, matching
+    /// PostgreSQL, which copies the ancestor prefix into a descendant-named
+    /// file (`XLogInitNewTimeline`). Bytes past the fork are dropped along with
+    /// any partial record they carried — that record cannot replay on the new
+    /// branch — and filter plus `CatalogTracker` state from complete records
+    /// below the fork stands.
+    ///
+    /// Returns the fork segment's start LSN, where the descendant stream is
+    /// requested so the repeated prefix can be verified.
+    pub async fn transition_timeline(
+        &mut self,
+        next_tli: u32,
+        switch_lsn: u64,
+        segment_sink: &mut (dyn SegmentSink + Send),
+    ) -> Result<u64, WalStreamError> {
+        if self.poisoned {
+            return Err(WalStreamError::Poisoned);
+        }
+        if next_tli <= self.timeline {
+            return Err(WalStreamError::TimelineNotAbove {
+                current_tli: self.timeline,
+                next_tli,
+            });
+        }
+        if switch_lsn > self.next_lsn {
+            return Err(WalStreamError::ForkAboveFrontier {
+                switch_lsn,
+                next_lsn: self.next_lsn,
+            });
+        }
+        if switch_lsn < self.current_lsn + self.wire_offset as u64 {
+            return Err(WalStreamError::ForkBehindDispatched {
+                switch_lsn,
+                dispatched: self.current_lsn + self.wire_offset as u64,
+            });
+        }
+        self.walker
+            .truncate_to((switch_lsn - self.current_lsn) as usize);
+        self.next_lsn = switch_lsn;
+        // Dropping the partial record can unblock a segment the straddle held
+        loop {
+            match self.try_flush_first_segment(segment_sink).await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+            }
+        }
+        self.timeline = next_tli;
+        Ok(Self::align_down(switch_lsn, self.seg_size))
+    }
+
+    /// Roll raw source bytes into the current segment's digest, restarting at
+    /// every segment boundary the input crosses. Keyed off LSN rather than
+    /// flush cadence, so a record straddling a boundary cannot shift it.
+    fn digest_raw(&mut self, mut lsn: u64, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let seg_start = Self::align_down(lsn, self.seg_size);
+            if self.raw_crc_from != seg_start {
+                self.raw_crc = 0;
+                self.raw_crc_from = seg_start;
+            }
+            let room = (seg_start + self.seg_size - lsn) as usize;
+            let take = room.min(bytes.len());
+            self.raw_crc = crc32c::crc32c_append(self.raw_crc, &bytes[..take]);
+            lsn += take as u64;
+            bytes = &bytes[take..];
+        }
+        // Landing exactly on a boundary closes that segment's digest here rather
+        // than on the next push, so a fork at that LSN reports the empty segment
+        // it belongs to: PostgreSQL creates the descendant's first segment
+        // instead of copying an ancestor prefix into it
+        // (`XLogInitNewTimeline`, `src/backend/access/transam/xlog.c`).
+        if lsn.is_multiple_of(self.seg_size) {
+            self.raw_crc = 0;
+            self.raw_crc_from = lsn;
+        }
+    }
+
+    /// Digest of raw ancestor bytes in the segment the stream is filling. Empty
+    /// where the frontier sits on a segment boundary, which is the whole prefix
+    /// a fork there repeats.
+    pub fn fork_prefix(&self) -> ForkPrefix {
+        ForkPrefix {
+            from: self.raw_crc_from,
+            through: self.next_lsn,
+            crc: self.raw_crc,
+        }
+    }
+
+    pub fn timeline(&self) -> u32 {
+        self.timeline
+    }
+
+    pub fn seg_size(&self) -> u64 {
+        self.seg_size
     }
 
     fn take_manifest(&mut self, seg: &SegmentName, len: usize) -> Manifest {
@@ -1006,6 +1136,140 @@ mod tests {
         page
     }
 
+    /// The fork verify compares raw source bytes, so the digest must be taken
+    /// off the input — the walker buffer answers for the filtered stream, whose
+    /// dropped records are rewritten in place.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_prefix_digests_raw_input_not_the_filtered_segment() {
+        // Two pages per segment, so one page leaves the digest open mid-segment
+        const SEG: u64 = 2 * 8192;
+        // User heap insert in the followed db: dropped, so NOOP-rewritten
+        let user = raw_rec(RmId::Heap as u8, 0x00, 8, Some((1663, 5, 50000)), None);
+        let page = page_of(&[user], 8192);
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        ws.filter_mut().set_target_db(5);
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &page, &mut rec, &mut seg).await.unwrap();
+
+        let prefix = ws.fork_prefix();
+        assert_eq!((prefix.from, prefix.through), (0, page.len() as u64));
+        assert_eq!(prefix.crc, crc32c::crc32c(&page), "digest is of raw input");
+        assert_ne!(
+            crc32c::crc32c(&ws.walker.buffer()[..page.len()]),
+            prefix.crc,
+            "the filtered stream differs, which is why it cannot verify a fork",
+        );
+    }
+
+    /// Each segment digests on its own, keyed off LSN rather than flush
+    /// cadence: the fork verify only ever needs the segment holding the fork.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_prefix_restarts_at_every_segment() {
+        const SEG: u64 = 2 * 8192;
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        let filler = page_of(&[], 8192);
+        let second = page_of(&[raw_rec(RmId::Clog as u8, 0, 0, None, None)], 8192);
+        // One push spanning both segments: the split is the boundary, not the call
+        let mut both = filler.clone();
+        both.extend_from_slice(&filler);
+        both.extend_from_slice(&second);
+        ws.push(0, &both, &mut rec, &mut seg).await.unwrap();
+        let prefix = ws.fork_prefix();
+        assert_eq!((prefix.from, prefix.through), (SEG, SEG + 8192));
+        assert_eq!(prefix.crc, crc32c::crc32c(&second));
+    }
+
+    /// A fork on a segment boundary repeats nothing: PostgreSQL creates the
+    /// descendant's first segment there instead of copying an ancestor prefix
+    /// into it, so the crossing must ask for an empty prefix rather than the
+    /// segment that just ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_prefix_is_empty_on_a_segment_boundary() {
+        const SEG: u64 = 8192;
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &page_of(&[], SEG as usize), &mut rec, &mut seg)
+            .await
+            .unwrap();
+        assert_eq!(ws.next_lsn(), SEG);
+        assert_eq!(
+            ws.fork_prefix(),
+            ForkPrefix {
+                from: SEG,
+                through: SEG,
+                crc: 0,
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transition_drops_bytes_past_the_fork_and_renames_the_fork_segment() {
+        // Two pages per segment, so one page leaves the fork mid-segment
+        const SEG: u64 = 2 * 8192;
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
+            .await
+            .unwrap();
+        assert_eq!(ws.next_lsn(), 8192, "whole page consumed");
+        // Fork at the end of the last record, so the page's zero tail goes away
+        let switch_lsn = 104;
+        let seg_start = ws
+            .transition_timeline(2, switch_lsn, &mut seg)
+            .await
+            .unwrap();
+        assert_eq!(seg_start, 0, "fork segment starts at its own boundary");
+        assert_eq!(ws.next_lsn(), switch_lsn, "bytes past the fork dropped");
+        assert_eq!(ws.timeline(), 2);
+        assert!(
+            seg.segments.is_empty(),
+            "the fork segment has not sealed yet"
+        );
+
+        // Descendant bytes continue from the fork, and the segment seals under
+        // the descendant name
+        let tail = vec![0u8; (SEG - switch_lsn) as usize];
+        ws.push(switch_lsn, &tail, &mut rec, &mut seg)
+            .await
+            .unwrap();
+        let (name, _, _) = &seg.segments[0];
+        assert_eq!(name.timeline, 2, "fork segment carries the descendant name");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transition_refuses_a_fork_it_cannot_honour() {
+        const SEG: u64 = 8192;
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        let mut ws = WalStream::new(4, SEG, 0).unwrap();
+        ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ws.transition_timeline(4, 64, &mut seg).await,
+            Err(WalStreamError::TimelineNotAbove {
+                current_tli: 4,
+                next_tli: 4
+            }),
+        ));
+        assert!(matches!(
+            ws.transition_timeline(5, SEG + 8, &mut seg).await,
+            Err(WalStreamError::ForkAboveFrontier { .. }),
+        ));
+        // Records through offset 104 already reached the shadow wire; a fork
+        // below that would have published WAL the descendant never had
+        assert!(matches!(
+            ws.transition_timeline(5, 48, &mut seg).await,
+            Err(WalStreamError::ForkBehindDispatched { .. }),
+        ));
+        assert_eq!(ws.timeline(), 4, "a refused fork changes nothing");
+    }
+
     /// PG EndRecPtr: single-page records advance by MAXALIGN(xl_tot_len);
     /// an unaligned length (30 → 32) must not leak into `next_lsn`.
     #[tokio::test(flavor = "current_thread")]
@@ -1135,7 +1399,11 @@ mod tests {
         let (b_wire_end, b_next_lsn, c_wire_end) = (40 + 44 + 4 + 34, 128u64, 128 + 44);
 
         let state = Arc::new(Mutex::new(ShadowStreamState::new(1, "sys".into(), 0, 1024)));
-        let conn = state.lock().await.register_connection(0);
+        let conn = state
+            .lock()
+            .await
+            .register_connection(0, 1, None)
+            .expect("current timeline");
 
         type Chunks = Arc<std::sync::Mutex<Vec<(u64, usize)>>>;
         let chunks: Chunks = Arc::default();
