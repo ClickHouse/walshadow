@@ -754,6 +754,13 @@ async fn run_session(
     // None = slotless.
     let source_slot: Option<String> = ch_config.as_ref().and_then(|c| c.source_slot.clone());
     let shadow_start = resolve_shadow_start(args)?;
+    // Slot before bootstrap
+    if let Some(slot) = source_slot.as_deref() {
+        feed.ensure_physical_slot(slot)
+            .await
+            .with_context(|| format!("ensure physical replication slot {slot}"))?;
+        tracing::info!(target: "walshadow", slot, "physical replication slot ready");
+    }
     let bootstrap_end_lsn: Option<u64> = if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
         Some(
             run_bootstrap(&cfg, &mut feed, args, ch_config.clone())
@@ -990,14 +997,6 @@ async fn run_session(
         dbname = %args.shadow_dbname,
         "shadow connected",
     );
-
-    // Create the configured slot before preflight, which requires it to exist.
-    if let Some(slot) = source_slot.as_deref() {
-        feed.ensure_physical_slot(slot)
-            .await
-            .with_context(|| format!("ensure physical replication slot {slot}"))?;
-        tracing::info!(target: "walshadow", slot, "physical replication slot ready");
-    }
 
     // Pre-flight validators run after both source + shadow SQL clients
     // are up so every check has its connection.
