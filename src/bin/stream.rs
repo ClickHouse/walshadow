@@ -16,6 +16,11 @@
 //!     [--retention-bytes 268435456]
 //! ```
 
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "walshadow-stream is supported only on Linux; the PostgreSQL bridge extension may still be built separately with `make -C pgext`"
+);
+
 // The pipeline allocates rows on the decode thread(s) and frees them on the
 // batcher thread; mimalloc's per-thread caches handle that produce-here/
 // free-there pattern far better than glibc's shared arena (which serializes on
@@ -51,8 +56,10 @@ use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::boundary_hold::{
     BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
 };
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig};
+use walshadow::ch_emitter::{
+    DEFAULT_DECODER_POOL, DEFAULT_INSERTER_POOL, EmitterConfig, EmitterStats,
+};
+use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::manifest;
 use walshadow::mapping::MappingHandle;
@@ -91,7 +98,68 @@ enum BootstrapMode {
     /// wal-g-compatible BASE_BACKUP from a `DynStorage` bucket. Storage
     /// config read from `[backup]` in `--ch-config`;
     /// `--bootstrap-backup-name` selects the backup (LATEST = newest sentinel)
+    #[value(name = "object_store", alias = "object-store")]
     ObjectStore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrapPlan {
+    mode: BootstrapMode,
+    backup_name: String,
+    parallelism: Option<usize>,
+}
+
+/// `cli_over_toml` plus a ≥1 clamp for pool/batch sizes.
+fn positive_usize(name: &str, cli: Option<usize>, toml: usize) -> usize {
+    match cli_over_toml(cli, Some(toml)).unwrap_or(toml) {
+        0 => {
+            tracing::warn!(target: "walshadow::config", setting = name, "value below 1, using 1");
+            1
+        }
+        n => n,
+    }
+}
+
+fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<BootstrapPlan> {
+    let toml = ch.map(|c| &c.bootstrap);
+    let toml_mode = match toml.and_then(|b| b.mode.as_deref()) {
+        Some("direct") => Some(BootstrapMode::Direct),
+        Some("object_store") => Some(BootstrapMode::ObjectStore),
+        Some("off") => Some(BootstrapMode::Off),
+        None => None,
+        Some(other) => anyhow::bail!("[bootstrap] mode {other:?} unsupported"),
+    };
+    let mode = cli_over_toml(args.bootstrap_mode, toml_mode).unwrap_or(BootstrapMode::Off);
+    let backup_name = cli_over_toml(
+        args.bootstrap_backup_name.clone(),
+        toml.and_then(|b| b.backup_name.clone()),
+    );
+    let parallelism = cli_over_toml(
+        args.bootstrap_object_store_parallelism,
+        toml.and_then(|b| b.object_store_parallelism),
+    );
+
+    if mode != BootstrapMode::ObjectStore {
+        for (knob, set) in [
+            ("backup_name", backup_name.is_some()),
+            ("object_store_parallelism", parallelism.is_some()),
+        ] {
+            if set {
+                tracing::warn!(
+                    target: "walshadow::bootstrap",
+                    knob,
+                    ?mode,
+                    "bootstrap {knob} ignored, it applies only to --bootstrap-mode object_store",
+                );
+            }
+        }
+    }
+
+    Ok(BootstrapPlan {
+        mode,
+        backup_name: backup_name.unwrap_or_else(|| "LATEST".into()),
+        parallelism,
+    })
 }
 
 /// `decoder + xact_drain` pair as one `RecordSink` for the queueing worker.
@@ -309,24 +377,26 @@ struct Args {
     /// the decoder / xact-drain worker. Past this watermark the pump
     /// yields to let the worker drain; a stuck worker still surfaces via
     /// the catalog `wait_for_replay` timeout on the err slot.
-    #[arg(long, default_value_t = DEFAULT_QUEUEING_RECORD_SINK_CAPACITY)]
-    decoder_queue_capacity: usize,
+    /// Overrides `[ch] decoder_queue_capacity`.
+    #[arg(long)]
+    decoder_queue_capacity: Option<usize>,
     /// Pump-side batch size for the `QueueingRecordSink`. Bigger
     /// amortises per-send overhead but adds pump→worker latency (worker's
     /// `wait_for_replay` lags one batch behind).
-    #[arg(long, default_value_t = DEFAULT_QUEUEING_BATCH_SIZE)]
-    decoder_batch_size: usize,
+    /// Overrides `[ch] decoder_batch_size`.
+    #[arg(long)]
+    decoder_batch_size: Option<usize>,
     /// Decode-pool size (M): parallel decode workers (detoast, type
     /// coercion, oracle resolution). Only with `--ch-config`. `1` keeps
     /// decode serial so per-table WAL order is preserved; M>1 relaxes
     /// per-table order, relying on `_lsn` ReplacingMergeTree dedup.
-    #[arg(long, default_value_t = 1)]
-    decoder_pool_size: usize,
+    #[arg(long)]
+    decoder_pool_size: Option<usize>,
     /// Insert-pool size (N): concurrent ClickHouse INSERT connections.
     /// Cloud throughput is RTT/part-commit bound, so N>1 is the main
     /// throughput lever. Only with `--ch-config`.
-    #[arg(long, default_value_t = 1)]
-    inserter_pool_size: usize,
+    #[arg(long)]
+    inserter_pool_size: Option<usize>,
     /// Xact / TOAST buffer spill dir. Wiped every startup per the
     /// crash-recovery contract in [plans/xact.md](../../plans/xact.md).
     #[arg(long)]
@@ -393,9 +463,10 @@ struct Args {
     /// `direct` runs BASE_BACKUP over current replication connection;
     /// `object_store` reads wal-g-format backup from `[backup]` in
     /// `--ch-config`. Initialized data dir resumes without bootstrap
-    /// regardless of mode
-    #[arg(long, value_enum, default_value_t = BootstrapMode::Off)]
-    bootstrap_mode: BootstrapMode,
+    /// regardless of mode. Unset falls through to `[bootstrap] mode` in
+    /// `--ch-config`, then to `off`
+    #[arg(long, value_enum)]
+    bootstrap_mode: Option<BootstrapMode>,
     /// Shadow PG data dir. When set, daemon bootstraps or resumes shadow,
     /// writes config, starts and supervises postmaster, then stops it on
     /// exit. When unset, manage shadow externally. Required when
@@ -403,18 +474,27 @@ struct Args {
     #[arg(long)]
     bootstrap_shadow_data_dir: Option<PathBuf>,
     /// Object-store backup name. `LATEST` resolves to newest sentinel;
-    /// otherwise the literal `base_TTTTTTTTLLLLLLLLSSSSSSSS` form. Required
-    /// when `--bootstrap-mode=object_store`.
-    #[arg(long, default_value = "LATEST")]
-    bootstrap_backup_name: String,
+    /// otherwise the literal `base_TTTTTTTTLLLLLLLLSSSSSSSS` form. Unset
+    /// falls through to `[bootstrap] backup_name`, then to `LATEST`.
+    #[arg(long)]
+    bootstrap_backup_name: Option<String>,
     /// Object-store fan-out parallelism. Raise for high-bandwidth buckets.
-    #[arg(long, default_value_t = 4)]
-    bootstrap_object_store_parallelism: usize,
+    /// Unset falls through to `[bootstrap] object_store_parallelism`, then
+    /// to `ObjectStoreSource`'s own `min(4, num_cpus)` default.
+    #[arg(long)]
+    bootstrap_object_store_parallelism: Option<usize>,
     /// BASE_BACKUP fast-checkpoint flag for `direct` mode. `true` avoids
     /// waiting for source's checkpoint_timeout; flip off if checkpoint
     /// cost matters more than bootstrap latency.
     #[arg(long, default_value_t = true)]
     bootstrap_fast_checkpoint: bool,
+    /// Fetch the bootstrap WAL window from the `[backup]` bucket instead of
+    /// inside `base.tar` (`direct` mode only). Source then needn't retain or
+    /// re-ship `[start_lsn, end_lsn]`, which is what fills its disk at high
+    /// write rates. Requires `[backup]` in `--ch-config` and source
+    /// archiving to that same bucket.
+    #[arg(long, default_value_t = false)]
+    bootstrap_wal_from_archive: bool,
     /// Maximum seconds to wait for shadow replay after bootstrap
     /// Abort daemon when timeout expires
     #[arg(long, default_value_t = 300)]
@@ -746,14 +826,44 @@ async fn run_session(
         if args.slot.is_some() {
             cfg.source_slot = args.slot.clone();
         }
+        cfg.decoder_pool_size = positive_usize(
+            "decoder_pool_size",
+            args.decoder_pool_size,
+            cfg.decoder_pool_size,
+        );
+        cfg.inserter_pool_size = positive_usize(
+            "inserter_pool_size",
+            args.inserter_pool_size,
+            cfg.inserter_pool_size,
+        );
         Some(cfg)
     } else {
         None
     };
+    // QueueingRecordSink knobs feed both the CH and metrics-only pipelines,
+    // so resolve here while `ch_config` is still in scope (it is consumed
+    // into `emitter_cfg` below). CLI over `[ch]` over the built-in default.
+    let decoder_batch_size = positive_usize(
+        "decoder_batch_size",
+        args.decoder_batch_size,
+        ch_config
+            .as_ref()
+            .map_or(DEFAULT_QUEUEING_BATCH_SIZE, |c| c.decoder_batch_size),
+    );
+    let decoder_queue_capacity = positive_usize(
+        "decoder_queue_capacity",
+        args.decoder_queue_capacity,
+        ch_config
+            .as_ref()
+            .map_or(DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, |c| {
+                c.decoder_queue_capacity
+            }),
+    );
     // Effective physical replication slot (`[source] slot` + --slot override);
     // None = slotless.
     let source_slot: Option<String> = ch_config.as_ref().and_then(|c| c.source_slot.clone());
-    let shadow_start = resolve_shadow_start(args)?;
+    let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref())?;
+    let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
     // Slot before bootstrap
     if let Some(slot) = source_slot.as_deref() {
         feed.ensure_physical_slot(slot)
@@ -762,8 +872,22 @@ async fn run_session(
         tracing::info!(target: "walshadow", slot, "physical replication slot ready");
     }
     let bootstrap_end_lsn: Option<u64> = if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
+        if !args.skip_preflight {
+            let source_sql = feed
+                .sql_client()
+                .await
+                .context("source sidecar sql for bootstrap pre-flight")?;
+            walshadow::preflight::bootstrap(walshadow::preflight::BootstrapInputs {
+                source_sql,
+                wal_from_archive: args.bootstrap_wal_from_archive,
+            })
+            .await
+            .context("bootstrap pre-flight probe")?
+            .into_result()
+            .context("pre-flight rejected bootstrap")?;
+        }
         Some(
-            run_bootstrap(&cfg, &mut feed, args, ch_config.clone())
+            run_bootstrap(&cfg, &mut feed, args, &bootstrap_plan, ch_config.clone())
                 .await
                 .context("bootstrap")?,
         )
@@ -1322,7 +1446,7 @@ async fn run_session(
         // One validated resident-payload pool for the pipeline and every
         // concurrent backup pass
         let pipeline_budget =
-            walshadow::pipeline::build_budget(&emitter_cfg, args.decoder_pool_size)
+            walshadow::pipeline::build_budget(&emitter_cfg, emitter_cfg.decoder_pool_size)
                 .map_err(|e| anyhow::anyhow!("memory budget: {e}"))?;
         if emitter_cfg.runtime_config_schema.is_some() || toml_initial_load {
             copy_backfiller = Some(Arc::new(
@@ -1424,17 +1548,21 @@ async fn run_session(
                 .with_context(|| format!("ensure CH dest for pinned mapping {rel}"))?;
         }
         config_resolver = Some(resolver);
+        let (decoders, inserters) = (
+            emitter_cfg.decoder_pool_size,
+            emitter_cfg.inserter_pool_size,
+        );
         tracing::info!(
             target: "walshadow::pipeline",
             addr = %addr,
-            decoders = args.decoder_pool_size.max(1),
-            inserters = args.inserter_pool_size.max(1),
+            decoders,
+            inserters,
             "parallel decode+insert pipeline starting",
         );
         PipelineConfig {
             emitter: emitter_cfg,
-            decoder_pool_size: args.decoder_pool_size,
-            inserter_pool_size: args.inserter_pool_size,
+            decoder_pool_size: decoders,
+            inserter_pool_size: inserters,
             catalog: catalog.clone(),
             mapping,
             oracle: oracle.clone(),
@@ -1459,15 +1587,26 @@ async fn run_session(
         // complete at placement and the watermark + slot advance move as in
         // a CH run. Emitter stats stay unexported (`emitter_stats_handle`
         // None), matching the old serial surface.
+        // No `[ch]` here, so the CLI layers straight onto the constants.
+        let decoders = positive_usize(
+            "decoder_pool_size",
+            args.decoder_pool_size,
+            DEFAULT_DECODER_POOL,
+        );
+        let inserters = positive_usize(
+            "inserter_pool_size",
+            args.inserter_pool_size,
+            DEFAULT_INSERTER_POOL,
+        );
         tracing::info!(
             target: "walshadow::pipeline",
-            decoders = args.decoder_pool_size.max(1),
+            decoders,
             "metrics-only pipeline (null tail) starting",
         );
         PipelineConfig {
             emitter: EmitterConfig::default(),
-            decoder_pool_size: args.decoder_pool_size,
-            inserter_pool_size: args.inserter_pool_size,
+            decoder_pool_size: decoders,
+            inserter_pool_size: inserters,
             catalog: catalog.clone(),
             mapping: Arc::new(tokio::sync::RwLock::new(Default::default())),
             oracle: None,
@@ -1503,8 +1642,8 @@ async fn run_session(
             decoder,
             xact_drain: reorder_sink,
         },
-        args.decoder_batch_size,
-        args.decoder_queue_capacity,
+        decoder_batch_size,
+        decoder_queue_capacity,
         span_registry.clone(),
     );
     let boundary_gate = CatalogBoundaryGate::new(
@@ -2195,6 +2334,20 @@ fn spawn_mapping_refresher(
 /// Max unsynced segments queued before the pump blocks on `on_segment`;
 const SEGMENT_FSYNC_QUEUE: usize = 64;
 
+#[cfg(target_os = "linux")]
+fn sync_filesystem(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    if unsafe { libc::syncfs(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_filesystem(_fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    unreachable!("walshadow-stream is Linux-only")
+}
+
 /// Background segment durability: drain the fsync queue, then `syncfs` the
 /// filesystem holding `out_dir` once per batch — this flushes every written
 /// segment + manifest + the directory entries in one syscall, avoiding the
@@ -2228,14 +2381,7 @@ fn spawn_segment_fsync(
             while let Ok(next) = rx.try_recv() {
                 max_lsn = max_lsn.max(next.end_lsn);
             }
-            let synced = tokio::task::spawn_blocking(move || {
-                if unsafe { libc::syncfs(dirfd) } == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            })
-            .await;
+            let synced = tokio::task::spawn_blocking(move || sync_filesystem(dirfd)).await;
             match synced {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -2872,6 +3018,7 @@ async fn run_bootstrap(
     src_cfg: &PgConfig,
     feed: &mut SourceFeed,
     args: &Args,
+    plan: &BootstrapPlan,
     ch_config: Option<EmitterConfig>,
 ) -> Result<u64> {
     let shadow_data_dir = args
@@ -2908,58 +3055,61 @@ async fn run_bootstrap(
     tracing::info!(
         target: "walshadow::bootstrap",
         relations = catalog_map.len(),
-        mode = ?args.bootstrap_mode,
+        mode = ?plan.mode,
         shadow_data_dir = %shadow_data_dir.display(),
         "catalog map seeded",
     );
 
-    // Object-store mode retains `(settings, storage)` so the post-pump
-    // hydrate can pull WAL `[start_lsn, end_lsn]` from `wal_005/` into
-    // shadow's `pg_wal/`. Direct mode ships WAL inside `base.tar` via
-    // `BaseBackupOpts { wal: true }`, so no follow-up fetch.
-    type ObjectStoreHandles = (walrus::config::Settings, walrus::storage::DynStorage);
-    let (source, object_store_handles): (Box<dyn BackupSource>, Option<ObjectStoreHandles>) =
-        match args.bootstrap_mode {
-            BootstrapMode::Direct => {
-                let opts = BaseBackupOpts {
-                    label: format!(
-                        "walshadow-bootstrap-{}",
-                        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-                    ),
-                    fast_checkpoint: args.bootstrap_fast_checkpoint,
-                    no_verify_checksums: false,
-                    max_rate_kib: None,
-                    // Ship pg_wal [start_lsn, end_lsn] inside base.tar so
-                    // daemon-owned shadow reaches `minRecoveryPoint` locally.
-                    // Otherwise `pg_ctl -w start` polls `restore_command`
-                    // against empty `out/` before WAL pump starts and times out.
-                    wal: true,
-                };
-                (Box::new(DirectSource::new(src_cfg.clone(), opts)), None)
-            }
-            BootstrapMode::ObjectStore => {
-                let settings = ch_config
-                    .as_ref()
-                    .and_then(|c| c.backup.clone())
-                    .context("bootstrap: --bootstrap-mode object_store requires a [backup] section in --ch-config")?;
+    type WalHydrate = (walrus::config::Settings, walrus::storage::DynStorage);
+    let (source, wal_hydrate): (Box<dyn BackupSource>, Option<WalHydrate>) = match plan.mode {
+        BootstrapMode::Direct => {
+            let hydrate = if args.bootstrap_wal_from_archive {
+                let settings = ch_config.as_ref().and_then(|c| c.backup.clone()).context(
+                    "bootstrap: --bootstrap-wal-from-archive requires a [backup] \
+                             section in --ch-config",
+                )?;
                 let storage = settings
                     .build_storage()
                     .context("bootstrap: build archive storage")?;
-                // ObjectStoreSource canonicalises via
-                // `walrus::pg::backup::fetch::resolve_name`.
-                let name = args.bootstrap_backup_name.clone();
-                if name != "LATEST" && !name.starts_with(BACKUP_NAME_PREFIX) {
-                    anyhow::bail!(
-                        "bootstrap: --bootstrap-backup-name {name:?} must be `LATEST` \
-                         or begin with `{BACKUP_NAME_PREFIX}`"
-                    );
-                }
-                let src = ObjectStoreSource::new(settings.clone(), storage.clone(), name)
-                    .with_parallelism(args.bootstrap_object_store_parallelism);
-                (Box::new(src), Some((settings, storage)))
+                Some((settings, storage))
+            } else {
+                None
+            };
+            let opts = BaseBackupOpts {
+                label: format!(
+                    "walshadow-bootstrap-{}",
+                    chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+                ),
+                fast_checkpoint: args.bootstrap_fast_checkpoint,
+                no_verify_checksums: false,
+                max_rate_kib: None,
+                wal: hydrate.is_none(),
+            };
+            (Box::new(DirectSource::new(src_cfg.clone(), opts)), hydrate)
+        }
+        BootstrapMode::ObjectStore => {
+            let settings = ch_config
+                    .as_ref()
+                    .and_then(|c| c.backup.clone())
+                    .context("bootstrap: --bootstrap-mode object_store requires a [backup] section in --ch-config")?;
+            let storage = settings
+                .build_storage()
+                .context("bootstrap: build archive storage")?;
+            let name = plan.backup_name.clone();
+            if name != "LATEST" && !name.starts_with(BACKUP_NAME_PREFIX) {
+                anyhow::bail!(
+                    "bootstrap: backup name {name:?} must be `LATEST` or begin with \
+                         `{BACKUP_NAME_PREFIX}` (--bootstrap-backup-name / [bootstrap] backup_name)"
+                );
             }
-            BootstrapMode::Off => unreachable!("dispatch happened in run()"),
-        };
+            let mut src = ObjectStoreSource::new(settings.clone(), storage.clone(), name);
+            if let Some(n) = plan.parallelism {
+                src = src.with_parallelism(n);
+            }
+            (Box::new(src), Some((settings, storage)))
+        }
+        BootstrapMode::Off => unreachable!("dispatch happened in run()"),
+    };
 
     let cfg = BootstrapConfig::new(shadow_data_dir.clone());
     // Tail drain gets a second CatalogMap clone for rfn → descriptor
@@ -2993,7 +3143,7 @@ async fn run_bootstrap(
         // (see `run`), so uniform `commit_lsn = start_lsn` here is fine.
         let emitter_ack = Arc::new(AtomicU64::new(0));
         let fatal = Fatal::new();
-        let inserter_pool_size = args.inserter_pool_size;
+        let inserter_pool_size = emitter_cfg.inserter_pool_size;
         let (msg_tx, ack, tail) = tail::spawn(
             &emitter_cfg,
             inserter_pool_size,
@@ -3010,7 +3160,7 @@ async fn run_bootstrap(
         tracing::info!(
             target: "walshadow::bootstrap",
             addr = %addr,
-            inserters = inserter_pool_size.max(1),
+            inserters = inserter_pool_size,
             "bootstrap insert tail started",
         );
 
@@ -3077,11 +3227,7 @@ async fn run_bootstrap(
         "bootstrap landed",
     );
 
-    // Object-store mode: hydrate shadow's pg_wal/ before pg_ctl. wal-g
-    // backups keep WAL in wal_005/ separately (direct mode shipped it in
-    // base.tar). Skipping blocks shadow startup: restore_command sees empty
-    // out/ and walsender has not bound yet.
-    if let Some((settings, storage)) = object_store_handles {
+    if let Some((settings, storage)) = wal_hydrate {
         fetch_wal_into_pg_wal(
             &settings,
             storage,
@@ -3168,12 +3314,11 @@ enum ShadowStart {
     Resume(PathBuf),
 }
 
-fn resolve_shadow_start(args: &Args) -> Result<ShadowStart> {
+fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<ShadowStart> {
     let Some(dir) = &args.bootstrap_shadow_data_dir else {
         anyhow::ensure!(
-            matches!(args.bootstrap_mode, BootstrapMode::Off),
-            "--bootstrap-mode {:?} requires --bootstrap-shadow-data-dir",
-            args.bootstrap_mode,
+            matches!(mode, BootstrapMode::Off),
+            "bootstrap mode {mode:?} requires --bootstrap-shadow-data-dir",
         );
         return Ok(ShadowStart::External);
     };
@@ -3202,7 +3347,7 @@ fn resolve_shadow_start(args: &Args) -> Result<ShadowStart> {
         dir.display(),
     );
     if dir.join("PG_VERSION").exists() {
-        if !matches!(args.bootstrap_mode, BootstrapMode::Off) {
+        if !matches!(mode, BootstrapMode::Off) {
             tracing::info!(
                 target: "walshadow::bootstrap",
                 data_dir = %dir.display(),
@@ -3212,8 +3357,9 @@ fn resolve_shadow_start(args: &Args) -> Result<ShadowStart> {
         return Ok(ShadowStart::Resume(dir.clone()));
     }
     anyhow::ensure!(
-        !matches!(args.bootstrap_mode, BootstrapMode::Off),
-        "shadow data dir {} does not contain an initialized cluster; --bootstrap-mode off cannot bootstrap it, pass direct or object_store",
+        !matches!(mode, BootstrapMode::Off),
+        "shadow data dir {} does not contain an initialized cluster; bootstrap mode off cannot \
+         bootstrap it, pass direct or object_store via --bootstrap-mode or [bootstrap] mode",
         dir.display(),
     );
     Ok(ShadowStart::Bootstrap(dir.clone()))
@@ -3517,18 +3663,7 @@ async fn fetch_archive_segment(
     Ok((segment.format(), bytes[offset..].to_vec()))
 }
 
-/// Pull WAL `[start_lsn, end_lsn]` on `timeline` from wal-rus storage into
-/// `<shadow_data_dir>/pg_wal/` so daemon-owned shadow recovery reaches
-/// `minRecoveryPoint` from local WAL, depending on neither `restore_command`
-/// (filtered out-dir stays empty until WAL pump starts) nor `primary_conninfo`
-/// (walsender binds later in `run`).
-///
-/// `walrus::pg::backup::push::handle` sets `wal: false`, so object-store
-/// tars don't carry WAL; it lives in `wal_005/` (wal-push / archive_command).
-/// Direct mode inlines the same segments via `BaseBackupOpts { wal: true }`.
-///
-/// Missing segments surface as `WAL <name> not found in storage` from
-/// wal-rus's `fetch::handle` — the operator's archiving pipeline left a gap.
+/// Fetch WAL `[start_lsn, end_lsn]` from archive storage into shadow's `pg_wal/`.
 async fn fetch_wal_into_pg_wal(
     settings: &walrus::config::Settings,
     storage: walrus::storage::DynStorage,
@@ -3658,13 +3793,66 @@ mod tests {
         assert_eq!(bytes, pattern[offset as usize..]);
     }
 
+    fn shadow_start(args: &Args) -> Result<ShadowStart> {
+        resolve_shadow_start(args, resolve_bootstrap(args, None)?.mode)
+    }
+
     #[test]
     fn shadow_start_external_without_data_dir() {
         assert!(matches!(
-            resolve_shadow_start(&args_from(&[])).unwrap(),
+            shadow_start(&args_from(&[])).unwrap(),
             ShadowStart::External
         ));
-        assert!(resolve_shadow_start(&args_from(&["--bootstrap-mode", "direct"])).is_err());
+        assert!(shadow_start(&args_from(&["--bootstrap-mode", "direct"])).is_err());
+    }
+
+    #[test]
+    fn bootstrap_plan_layers_cli_over_toml() {
+        let toml = |s: &str| EmitterConfig::from_toml_str(s).unwrap();
+
+        let cfg = toml(
+            "[ch]\n[bootstrap]\nmode = \"object_store\"\nbackup_name = \"base_0000000100000000000000AA\"\nobject_store_parallelism = 8\n",
+        );
+        let plan = resolve_bootstrap(&args_from(&[]), Some(&cfg)).unwrap();
+        assert_eq!(plan.mode, BootstrapMode::ObjectStore);
+        assert_eq!(plan.backup_name, "base_0000000100000000000000AA");
+        assert_eq!(plan.parallelism, Some(8));
+
+        let plan = resolve_bootstrap(
+            &args_from(&[
+                "--bootstrap-mode",
+                "direct",
+                "--bootstrap-backup-name",
+                "LATEST",
+            ]),
+            Some(&cfg),
+        )
+        .unwrap();
+        assert_eq!(plan.mode, BootstrapMode::Direct);
+        assert_eq!(plan.backup_name, "LATEST");
+        assert_eq!(plan.parallelism, Some(8), "TOML fills what the CLI omits");
+
+        let plan = resolve_bootstrap(&args_from(&[]), Some(&toml("[ch]\n"))).unwrap();
+        assert_eq!(plan.mode, BootstrapMode::Off);
+        assert_eq!(plan.backup_name, "LATEST");
+        assert_eq!(plan.parallelism, None);
+
+        assert!(
+            EmitterConfig::from_toml_str("[ch]\n[bootstrap]\nmode = \"objectstore\"\n").is_err()
+        );
+        assert!(
+            EmitterConfig::from_toml_str("[ch]\n[bootstrap]\nobject_store_parallelism = 0\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_mode_accepts_both_object_store_spellings() {
+        for spelling in ["object_store", "object-store"] {
+            let plan =
+                resolve_bootstrap(&args_from(&["--bootstrap-mode", spelling]), None).unwrap();
+            assert_eq!(plan.mode, BootstrapMode::ObjectStore, "{spelling}");
+        }
     }
 
     #[test]
@@ -3706,26 +3894,26 @@ mod tests {
 
         // Direct bootstraps empty dir, off rejects it
         assert!(matches!(
-            resolve_shadow_start(&direct(dir_str)).unwrap(),
+            shadow_start(&direct(dir_str)).unwrap(),
             ShadowStart::Bootstrap(_)
         ));
-        assert!(resolve_shadow_start(&off(dir_str)).is_err());
+        assert!(shadow_start(&off(dir_str)).is_err());
 
         // Resume initialized dir regardless of mode
         std::fs::write(dir.join("PG_VERSION"), b"17\n").unwrap();
         assert!(matches!(
-            resolve_shadow_start(&direct(dir_str)).unwrap(),
+            shadow_start(&direct(dir_str)).unwrap(),
             ShadowStart::Resume(_)
         ));
         assert!(matches!(
-            resolve_shadow_start(&off(dir_str)).unwrap(),
+            shadow_start(&off(dir_str)).unwrap(),
             ShadowStart::Resume(_)
         ));
 
         // Incomplete bootstrap never triggers automatic rebootstrap
         std::fs::write(dir.join(BOOTSTRAP_INCOMPLETE_MARKER), b"").unwrap();
-        assert!(resolve_shadow_start(&direct(dir_str)).is_err());
-        assert!(resolve_shadow_start(&off(dir_str)).is_err());
+        assert!(shadow_start(&direct(dir_str)).is_err());
+        assert!(shadow_start(&off(dir_str)).is_err());
         assert!(dir.join("PG_VERSION").exists());
     }
 
@@ -3755,7 +3943,7 @@ mod tests {
         // Default --walsender-bind is 127.0.0.1:0 (kernel-picked); daemon
         // can't bake an unknown port into shadow's primary_conninfo.
         assert!(
-            resolve_shadow_start(&args_from(&[
+            shadow_start(&args_from(&[
                 "--bootstrap-mode",
                 "direct",
                 "--bootstrap-shadow-data-dir",

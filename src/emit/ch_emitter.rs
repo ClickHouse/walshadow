@@ -38,6 +38,9 @@ use crate::mapping::{
 };
 use crate::runtime_config::TableRow;
 use crate::schema::{RelDescriptor, RelName};
+use crate::source::queueing_record_sink::{
+    DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
+};
 use ahash::{HashMap, HashMapExt};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
@@ -172,13 +175,98 @@ pub struct EmitterConfig {
     /// (`decoder_pool * inline_value_max`) must fit half
     /// `resident_payload_max` (validated at pipeline spawn)
     pub inline_value_max: usize,
+    /// `[ch] decoder_pool_size`: decode workers (M). `> 1` relaxes
+    /// per-table WAL order, leaning on `_lsn` ReplacingMergeTree dedup
+    /// ([emitter.md](../../plans/emitter.md)). `--decoder-pool-size`
+    /// overrides. Boot-only, the pool is sized at pipeline spawn
+    pub decoder_pool_size: usize,
+    /// `[ch] inserter_pool_size`: concurrent CH INSERT connections (N).
+    /// Native is request/response with no pipelining, so N is the
+    /// throughput lever against insert RTT — the default of 1 caps a
+    /// cross-region destination at roughly one batch per round trip.
+    /// `--inserter-pool-size` overrides. Boot-only
+    pub inserter_pool_size: usize,
+    /// `[ch] decoder_batch_size`: pump-side batch size for the
+    /// `QueueingRecordSink`. Bigger amortises per-send overhead but adds
+    /// pump→worker latency. `--decoder-batch-size` overrides. Boot-only
+    pub decoder_batch_size: usize,
+    /// `[ch] decoder_queue_capacity`: soft cap on in-flight records for the
+    /// `QueueingRecordSink` feeding the decode/xact-drain worker.
+    /// `--decoder-queue-capacity` overrides. Boot-only
+    pub decoder_queue_capacity: usize,
     /// `[backup]`: archive storage for object-store bootstrap + WAL refill.
     /// `None` (section omitted) disables refill.
     pub backup: Option<walrus::config::Settings>,
+    /// `[bootstrap]`: shadow seeding source + its object-store knobs.
+    /// Boot-only; the CLI flag layers on top (CLI > TOML, per config.md)
+    pub bootstrap: BootstrapSettings,
+}
+
+/// `[bootstrap]` table. Every field is `Option` so an omitted key falls
+/// through to the CLI flag, then to the built-in default — a set key that
+/// the CLI also passes loses to the CLI.
+///
+/// `shadow_data_dir` stays CLI-only: it decides whether the daemon owns a
+/// shadow at all, and pairs with `--start-lsn` / `--ignore-cursor` as a
+/// per-invocation recovery decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BootstrapSettings {
+    /// `mode`: `off` / `direct` / `object_store`. Validated at parse so a
+    /// typo fails at startup rather than silently reading as `off`
+    pub mode: Option<String>,
+    /// `backup_name`: `LATEST` or a literal `base_…` name. The
+    /// `base_`-prefix check lives in `bin/stream.rs`, next to the
+    /// object-store dispatch that consumes it
+    pub backup_name: Option<String>,
+    /// `object_store_parallelism`: in-flight data parts. `None` leaves
+    /// [`crate::backup_source_object_store::ObjectStoreSource`]'s
+    /// `min(4, num_cpus)` clamp in place
+    pub object_store_parallelism: Option<usize>,
+}
+
+/// Accepted `[bootstrap] mode` values; mirrors `bin/stream.rs`'s
+/// `BootstrapMode` clap enum, which cannot live here (no clap in the lib).
+pub const BOOTSTRAP_MODES: [&str; 3] = ["off", "direct", "object_store"];
+
+/// `[bootstrap]` table → [`BootstrapSettings`].
+fn parse_bootstrap(tbl: &toml::value::Table) -> Result<BootstrapSettings, EmitterError> {
+    use toml::Value;
+    let mode = tbl.get("mode").and_then(Value::as_str).map(String::from);
+    if let Some(m) = &mode
+        && !BOOTSTRAP_MODES.contains(&m.as_str())
+    {
+        return Err(EmitterError::Config(format!(
+            "[bootstrap] mode {m:?} must be one of off / direct / object_store"
+        )));
+    }
+    let object_store_parallelism = match tbl.get("object_store_parallelism") {
+        Some(v) => Some(
+            v.as_integer()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    EmitterError::Config(
+                        "[bootstrap] object_store_parallelism must be a positive integer".into(),
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    Ok(BootstrapSettings {
+        mode,
+        backup_name: tbl
+            .get("backup_name")
+            .and_then(Value::as_str)
+            .map(String::from),
+        object_store_parallelism,
+    })
 }
 
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 64 << 20;
+
+pub const DEFAULT_DECODER_POOL: usize = 1;
+pub const DEFAULT_INSERTER_POOL: usize = 4;
 
 pub(crate) const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
@@ -237,7 +325,12 @@ impl Default for EmitterConfig {
             source_slot: None,
             resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
             inline_value_max: DEFAULT_INLINE_VALUE_MAX,
+            decoder_pool_size: DEFAULT_DECODER_POOL,
+            inserter_pool_size: DEFAULT_INSERTER_POOL,
+            decoder_batch_size: DEFAULT_QUEUEING_BATCH_SIZE,
+            decoder_queue_capacity: DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
             backup: None,
+            bootstrap: BootstrapSettings::default(),
         }
     }
 }
@@ -478,6 +571,20 @@ impl EmitterConfig {
             if let Some(v) = ch.get("plan_disk_max").and_then(Value::as_integer) {
                 out.plan_disk_max = u64::try_from(v).unwrap_or(DEFAULT_PLAN_DISK_MAX);
             }
+            // Negatives land on 0 so both they and a literal 0 reach the
+            // single clamp in bin/stream.rs rather than passing silently.
+            if let Some(v) = ch.get("decoder_pool_size").and_then(Value::as_integer) {
+                out.decoder_pool_size = usize::try_from(v).unwrap_or(0);
+            }
+            if let Some(v) = ch.get("inserter_pool_size").and_then(Value::as_integer) {
+                out.inserter_pool_size = usize::try_from(v).unwrap_or(0);
+            }
+            if let Some(v) = ch.get("decoder_batch_size").and_then(Value::as_integer) {
+                out.decoder_batch_size = usize::try_from(v).unwrap_or(0);
+            }
+            if let Some(v) = ch.get("decoder_queue_capacity").and_then(Value::as_integer) {
+                out.decoder_queue_capacity = usize::try_from(v).unwrap_or(0);
+            }
             if let Some(v) = ch.get("flush_timeout_ms").and_then(Value::as_integer)
                 && let Ok(ms) = u64::try_from(v)
             {
@@ -550,6 +657,9 @@ impl EmitterConfig {
         }
         if let Some(bk) = root.get("backup").and_then(Value::as_table) {
             out.backup = Some(parse_backup(bk)?);
+        }
+        if let Some(bs) = root.get("bootstrap").and_then(Value::as_table) {
+            out.bootstrap = parse_bootstrap(bs)?;
         }
         if let Some(nss) = root.get("namespace").and_then(Value::as_table) {
             for (k, v) in nss {

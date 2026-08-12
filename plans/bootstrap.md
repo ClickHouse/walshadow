@@ -185,6 +185,16 @@ Source path: replication grant on source. CPU/IO cost on source PG for
 BASE_BACKUP duration. Useful for greenfield deployments without wal-g
 object-store infra
 
+`--bootstrap-wal-from-archive` flips `BaseBackupOpts.wal` to false and
+hydrates `pg_wal/` from `wal_005/` instead, the same fetch
+BackupSourceObjectStore relies on. Source then neither retains nor
+re-ships `[start_lsn, end_lsn]`, which is what fills its disk when
+written WAL over the backup window exceeds free space — the case where
+direct mode otherwise can't be used at all. Costs the no-object-store
+property above: needs `[backup]` plus source archiving to that same
+bucket, which `preflight::bootstrap` checks as far as it can (it can see
+`archive_mode` and `archive_command`, not the destination)
+
 ### BackupSourceObjectStore
 
 `src/backup_source_object_store.rs`. Wraps wal-rus's `pg::backup::fetch`
@@ -194,8 +204,10 @@ primitives against `DynStorage` bucket (wal-g-compatible layout):
   from `BackupSentinelDtoV2`. Timeline parses out of backup name's
   first 8 hex chars via wal-rus's `parse_timeline_from_backup_name`
 - `list_tar_parts` returns part keys; data parts run `parallelism`-wide
-  (default `min(4, num_cpus)`) via `buffer_unordered`, sharing
-  `Arc<Mutex<dyn BackupSink>>`
+  (default `min(4, num_cpus)`, overridden by
+  `--bootstrap-object-store-parallelism` / `[bootstrap]
+  object_store_parallelism` when either is set) via `buffer_unordered`,
+  sharing `Arc<Mutex<dyn BackupSink>>`
 - `pg_control` parts run as hard barrier after every data part drains
   — `for key in &control_parts` single-task loop. Multiple control
   parts is unusual (wal-g emits exactly one) but loop handles it
@@ -341,11 +353,14 @@ V1 limits:
 - **No 2C CH-side COPY load.** PageWalkSink (2A) is the sole
   initial-load path; see [Why not 2C](#why-not-2c-ch-side-copy-load) below
 
-Rfn contiguity is load-bearing for ack accounting: `PageWalkSink`
+Rfn contiguity buys seq economy, not correctness: `PageWalkSink`
 emits all rows for one rfn contiguously before moving on, so
 `pipeline::bootstrap::drain` can synthesize one ack-collector seq per
 rfn — `register(seq, start_lsn)` at first row, `placed(seq, rows)` at
-the flip. Under object-store fan-out interleaved tar parts yield more
+the flip, which is the only event that seals a seq. Interleaving costs
+extra seqs, never a wrong ack; the drain holds one open `(rfn, seq,
+rows)` and opens a fresh seq whenever the rfn differs. Under
+object-store fan-out interleaved tar parts yield more
 seqs and one rfn may span several; per-seq refcount absorbs that. All
 seqs share `commit_lsn = start_lsn`, so the contiguous-done frontier
 proves durability (`wait_through(K)`) while the published watermark
@@ -368,10 +383,11 @@ different catalog sources, with no adapter trait between them:
 
 A `RelationResolver` trait abstracting the two (one vtable per row) is
 not warranted: the bootstrap drain uses a simpler direct path than the
-shared tail. Worth revisiting only if a third catalog source appears;
-`detoast_heap`'s `ShadowCatalog` dependency is the blocker noted in
+shared tail. Worth revisiting only if a third catalog source appears.
+`detoast_heap` no longer carries a `ShadowCatalog` dependency — it takes
+`resolver: &ToastResolver` — so the decode-pool blocker
 [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
-(bootstrap decode-pool Option B)
+once recorded here is gone
 
 Three buffer shapes are possible: spool to disk, in-mem buffer + sync
 block, catalog adapter. Bootstrap uses the catalog adapter because it
@@ -473,7 +489,12 @@ bootstrap-time & WAL-time decode
 
 Setting `--bootstrap-shadow-data-dir` makes daemon own shadow
 lifecycle. At startup it bootstraps an empty data dir or resumes an
-initialized cluster. `--bootstrap-mode` selects only bootstrap source.
+initialized cluster. `--bootstrap-mode` selects only bootstrap source;
+unset, it falls through to `[bootstrap] mode` in `--ch-config`, then to
+`off`. `backup_name` and `object_store_parallelism` layer the same way
+(CLI > TOML > default) and warn when set under a non-object-store mode.
+`shadow_data_dir` stays CLI-only — it decides whether the daemon owns a
+shadow at all, alongside `--start-lsn` / `--ignore-cursor`.
 Bootstrap writes `walshadow_bootstrap.incomplete` before extraction
 and removes it after backup and required WAL land. If marker survives,
 daemon fails without changing data dir. Automatic rebootstrap is not

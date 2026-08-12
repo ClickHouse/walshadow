@@ -110,6 +110,11 @@ pub struct CliOverrides {
     pub flush_timeout: Option<Duration>,
 }
 
+/// CLI value wins over TOML; caller applies any default.
+pub fn cli_over_toml<T>(cli: Option<T>, toml: Option<T>) -> Option<T> {
+    cli.or(toml)
+}
+
 /// Per-table opt-in state derived from `config_table.replicate`, kept
 /// alongside the merge inputs. Distinct from the overlay because building an
 /// opt-in `TableMapping` needs the source `RelDescriptor` (catalog state the

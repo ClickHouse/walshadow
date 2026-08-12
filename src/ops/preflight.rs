@@ -14,6 +14,9 @@
 //!   in full at `wal_level=logical` regardless of identity, so the old
 //!   values a delete tombstone clears don't matter.
 //! - `--slot` names a physical slot absent on source.
+//! - `--bootstrap-wal-from-archive` is set but source doesn't archive WAL:
+//!   the bootstrap skips the inline WAL window and reads it from the
+//!   `[backup]` bucket, so an unarchived source leaves nothing to fetch.
 
 use std::fmt;
 
@@ -63,6 +66,20 @@ pub enum PreflightError {
          but absent from pg_class)"
     )]
     MappedRelMissing { rel: RelName },
+    #[error(
+        "source archive_mode={got:?}, expected \"on\" or \"always\" \
+         (--bootstrap-wal-from-archive fetches the WAL window from the \
+         [backup] bucket, so the source must archive it there; drop the flag \
+         to ship the window inside base.tar instead)"
+    )]
+    ArchiveModeOff { got: String },
+    #[error(
+        "source archive_mode is on but archive_command and archive_library \
+         are both empty, so no WAL reaches the archive. Note walshadow can't \
+         check that the destination is the [backup] bucket — that stays an \
+         operator contract"
+    )]
+    ArchiveTargetEmpty,
     #[error("pg query: {0}")]
     Pg(#[from] tokio_postgres::Error),
     #[error("shadow_version_num could not be parsed: {0:?}")]
@@ -108,29 +125,54 @@ pub struct Inputs<'a> {
     pub ch_config: Option<&'a EmitterConfig>,
 }
 
+/// Everything reachable over the source connection alone.
+pub struct SourceInputs<'a> {
+    pub source_version_num: i32,
+    pub source_sql: &'a Client,
+    pub slot: Option<&'a str>,
+    pub ch_config: Option<&'a EmitterConfig>,
+}
+
+/// Checks needing a live shadow.
+pub struct ShadowInputs<'a> {
+    pub source_version_num: i32,
+    pub shadow_sql: &'a Client,
+}
+
+/// Checks that gate `BASE_BACKUP`, run before `run_bootstrap`.
+pub struct BootstrapInputs<'a> {
+    pub source_sql: &'a Client,
+    /// Bootstrap will set `wal: false` and hydrate shadow's `pg_wal/` from
+    /// the `[backup]` bucket instead of from `base.tar`.
+    pub wal_from_archive: bool,
+}
+
+/// Connect-time probe: [`source`] + [`shadow`] merged into one report.
 pub async fn run(input: Inputs<'_>) -> Result<PreflightReport, PreflightError> {
+    let mut report = source(SourceInputs {
+        source_version_num: input.source_version_num,
+        source_sql: input.source_sql,
+        slot: input.slot,
+        ch_config: input.ch_config,
+    })
+    .await?;
+    let shadow_report = shadow(ShadowInputs {
+        source_version_num: input.source_version_num,
+        shadow_sql: input.shadow_sql,
+    })
+    .await?;
+    report.errors.extend(shadow_report.errors);
+    Ok(report)
+}
+
+/// Source-only checks. Safe to run before shadow exists.
+pub async fn source(input: SourceInputs<'_>) -> Result<PreflightReport, PreflightError> {
     let mut report = PreflightReport { errors: Vec::new() };
 
     if input.source_version_num < MIN_SERVER_VERSION_NUM {
         report.errors.push(PreflightError::SourceVersionTooOld {
             got: input.source_version_num,
             min: MIN_SERVER_VERSION_NUM,
-        });
-    }
-
-    let shadow_num_str = scalar_text(input.shadow_sql, "SHOW server_version_num").await?;
-    let shadow_num = shadow_num_str
-        .trim()
-        .parse::<i32>()
-        .map_err(|_| PreflightError::BadShadowVersion(shadow_num_str))?;
-    let source_major = input.source_version_num / 10_000;
-    let shadow_major = shadow_num / 10_000;
-    if source_major != shadow_major {
-        report.errors.push(PreflightError::MajorMismatch {
-            source_num: input.source_version_num,
-            shadow_num,
-            source_major,
-            shadow_major,
         });
     }
 
@@ -196,6 +238,62 @@ pub async fn run(input: Inputs<'_>) -> Result<PreflightReport, PreflightError> {
     Ok(report)
 }
 
+/// Shadow/source major must match: a same-physical-WAL standby can't span
+/// majors.
+pub async fn shadow(input: ShadowInputs<'_>) -> Result<PreflightReport, PreflightError> {
+    let mut report = PreflightReport { errors: Vec::new() };
+
+    let shadow_num_str = scalar_text(input.shadow_sql, "SHOW server_version_num").await?;
+    let shadow_num = shadow_num_str
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| PreflightError::BadShadowVersion(shadow_num_str))?;
+    let source_major = input.source_version_num / 10_000;
+    let shadow_major = shadow_num / 10_000;
+    if source_major != shadow_major {
+        report.errors.push(PreflightError::MajorMismatch {
+            source_num: input.source_version_num,
+            shadow_num,
+            source_major,
+            shadow_major,
+        });
+    }
+
+    Ok(report)
+}
+
+/// Pre-`BASE_BACKUP` probe; only `wal_from_archive` needs it. PG downgrades
+/// archiving-off to a NOTICE at `pg_backup_stop`, so the gap only surfaces at
+/// hydrate.
+pub async fn bootstrap(input: BootstrapInputs<'_>) -> Result<PreflightReport, PreflightError> {
+    let mut report = PreflightReport { errors: Vec::new() };
+    if !input.wal_from_archive {
+        return Ok(report);
+    }
+
+    let mode = scalar_text(input.source_sql, "SHOW archive_mode").await?;
+    if !archive_mode_active(&mode) {
+        report
+            .errors
+            .push(PreflightError::ArchiveModeOff { got: mode });
+        return Ok(report);
+    }
+
+    let command = scalar_text(input.source_sql, "SHOW archive_command").await?;
+    let library = scalar_text(input.source_sql, "SHOW archive_library").await?;
+    if command.trim().is_empty() && library.trim().is_empty() {
+        report.errors.push(PreflightError::ArchiveTargetEmpty);
+    }
+
+    Ok(report)
+}
+
+/// `always` archives on standbys too; both values leave `XLogArchivingActive()`
+/// true, which is what `pg_backup_stop` waits on.
+fn archive_mode_active(mode: &str) -> bool {
+    matches!(mode.trim(), "on" | "always")
+}
+
 /// Replica identity gives DELETE a row key: `FULL`/`USING INDEX` always carry
 /// one, `DEFAULT` only with a primary key, `NOTHING` never. Cleared non-key
 /// values on the tombstone are fine — the key alone marks the row deleted.
@@ -250,6 +348,14 @@ mod tests {
         // NOTHING never; unknown char never
         assert!(!replica_identity_has_key('n', true));
         assert!(!replica_identity_has_key('?', true));
+    }
+
+    #[test]
+    fn archive_mode_matrix() {
+        assert!(archive_mode_active("on"));
+        assert!(archive_mode_active("always"));
+        assert!(!archive_mode_active("off"));
+        assert!(archive_mode_active(" on "));
     }
 
     #[test]
