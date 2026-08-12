@@ -89,6 +89,31 @@ bootstrap/backfill error out, and source WAL removal stops restart with an
 operator-actionable error. Daemon never substitutes a fresh base backup for
 missing archive coverage. See [bootstrap.md](bootstrap.md) restart contract.
 
+## `[bootstrap]` shadow seeding
+
+`[backup]` says where the bucket is; `[bootstrap]` says whether to seed a
+shadow from it. Parsed into `EmitterConfig.bootstrap`, boot-only, and merged
+with the matching `--bootstrap-*` flags under the usual CLI > TOML rule —
+per field, so `--bootstrap-mode direct` alone still reads `backup_name` from
+TOML.
+
+```toml
+[bootstrap]
+mode = "object_store"            # off | direct | object_store; default off
+backup_name = "LATEST"           # LATEST, or a literal base_… name
+object_store_parallelism = 8     # unset keeps min(4, num_cpus)
+```
+
+An unrecognised `mode` and a non-positive `object_store_parallelism` both
+fail at parse, so a typo cannot read as `off` and silently skip bootstrap.
+The last two keys apply only to `object_store`; set under another mode they
+log a warning and are ignored.
+
+`--bootstrap-shadow-data-dir` has no TOML surface on purpose. It decides
+whether the daemon owns a shadow lifecycle at all, which is a
+per-invocation recovery decision like `--start-lsn` and `--ignore-cursor`,
+and CLI-only keeps a stale config file from stomping it.
+
 ## `<schema>.config_*` tables
 
 DBA runs [`sql/runtime_config_install.sql`](../sql/runtime_config_install.sql)

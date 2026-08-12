@@ -58,11 +58,26 @@ Shape: `PageWalkSink::chunk` stops decoding, does only cheap framing
 `(rfn, tuple_bytes)` units into a job channel; a bootstrap decode pool
 runs `decode_block_data` + resolve + route. That job shape differs from
 WAL's `DecodeJob` (already-decoded heaps), so either a bootstrap-specific
-job variant or a shared `decode_and_route` — the latter requires
-abstracting `detoast_heap` over a resolver trait first (it takes
-`&Arc<Mutex<ShadowCatalog>>` today and needs only `relation_at`; detoast
-no-ops when `chunks` is empty). See catalog-access notes in
+job variant or a shared `decode_and_route`.
+
+The resolver-trait prerequisite this section used to name is done:
+`detoast_heap` takes `resolver: &ToastResolver`
+([xact_buffer.rs](../../src/xact/xact_buffer.rs)), and `ToastResolver`
+holds a chunk store, stats, a value cap, and a budget — no
+`ShadowCatalog`. Neither `backup_page_walk.rs` nor
+`pipeline/bootstrap.rs` reaches for one. See catalog-access notes in
 [bootstrap.md](../bootstrap.md).
+
+Two items the shape above leaves out:
+
+- **Seq assignment moves upstream.** `pipeline::bootstrap::drain` infers
+  ack-seq boundaries from rfn flips on an ordered channel; a pool removes
+  that order. Framing must assign the seq and supply the row count it
+  knows from the slot walk, and the drain stops inferring.
+- **TOAST deferral gains concurrent writers.** Whether a tuple holds an
+  external pointer is known only after decode, so the `DeferredSpool`
+  defer decision moves into the pool workers. Unsized; read the defer
+  path before committing to an estimate.
 
 Unlocks the full S3 pipeline, three stages tuned independently against
 bucket GET latency, page-walk CPU, and Cloud INSERT RTT:
