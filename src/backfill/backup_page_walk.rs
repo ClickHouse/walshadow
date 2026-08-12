@@ -136,6 +136,10 @@ impl CatalogMap {
         self.by_filenode.get(&(db_node, rel_node)).cloned()
     }
 
+    pub fn descriptors(&self) -> impl Iterator<Item = &Arc<RelDescriptor>> {
+        self.by_filenode.values()
+    }
+
     pub fn is_toast(&self, db_node: Oid, rel_node: Oid) -> bool {
         self.by_filenode
             .get(&(db_node, rel_node))
