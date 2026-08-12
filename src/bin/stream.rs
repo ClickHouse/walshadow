@@ -3003,8 +3003,10 @@ async fn run_bootstrap(
         )
         .await
         .context("bootstrap: spawn insert tail")?;
-        // Static [table.*] mapping (no SIGHUP, no shadow PG during bootstrap).
-        let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
+        // [table.*] plus auto_create-namespace tables, created on CH here.
+        let mapping = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
+            .await
+            .context("bootstrap: build mapping")?;
         tracing::info!(
             target: "walshadow::bootstrap",
             addr = %addr,
@@ -3109,6 +3111,46 @@ async fn run_bootstrap(
         .context("clear completed bootstrap marker")?;
 
     Ok(outcome.end.end_lsn)
+}
+
+/// Routing map for the bootstrap drain: explicit `[table.*]` seeded up front,
+/// then every seeded relation run through the DDL applicator's `Added` path so
+/// `auto_create` namespaces get their CH table created and mapping registered.
+async fn bootstrap_build_mapping(
+    emitter_cfg: &EmitterConfig,
+    catalog: &walshadow::backup_page_walk::CatalogMap,
+    args: &Args,
+) -> Result<MappingHandle> {
+    let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
+    let cli_overrides = CliOverrides {
+        drop_table_strategy: args.drop_table_strategy.clone(),
+        flush_timeout: args
+            .ch_flush_timeout_ms
+            .map(std::time::Duration::from_millis),
+    };
+    let (_resolver, config_rx) = ConfigResolver::new(
+        emitter_cfg,
+        cli_overrides,
+        args.ch_config.clone(),
+        cli_source_base(args),
+        mapping.clone(),
+    );
+    let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_resolved(
+        &config_rx.borrow(),
+        emitter_cfg.database.clone(),
+        emitter_cfg.soft_delete,
+    );
+    let mut applicator =
+        walshadow::ch_ddl::DdlApplicator::new(emitter_cfg, ddl_cfg, mapping.clone(), config_rx)
+            .await
+            .context("bootstrap: init DDL applicator")?;
+    for desc in catalog.descriptors() {
+        applicator
+            .apply(&SchemaEvent::Added { desc: desc.clone() })
+            .await
+            .with_context(|| format!("bootstrap: ensure CH table {}", desc.rel_name))?;
+    }
+    Ok(mapping)
 }
 
 /// Mark bootstrap before extraction, clear only after backup and required
