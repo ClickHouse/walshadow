@@ -18,7 +18,6 @@
 //! Sleep until earliest table deadline. Checking once per `flush_timeout` can
 //! delay a flush by almost twice configured timeout
 
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -297,32 +296,36 @@ async fn handle_row(
     ctx.stats
         .insertbatch_rows_in
         .fetch_add(1, Ordering::Relaxed);
-    // Key clone is two Arc bumps, cheaper than a second `RelName` hash
-    let t = match tables.entry(row.rel.rel_name.clone()) {
-        Entry::Occupied(e) => e.into_mut(),
-        Entry::Vacant(e) => {
-            // Overrides ride the route frozen at planning; a `Column*` config
-            // event applies under the barrier fence, whose FlushAll cleared this
-            // plan cache, so post-apply rows rebuild from post-apply routes
-            let plan = TablePlan::build(
-                ctx.alloc,
-                &row.rel,
-                &row.route.mapping,
-                Some(&row.route.column_overrides),
-            )
-            .map_err(|e| e.to_string())?;
-            let meta = Arc::new(BatchMeta::from_plan(&plan, e.key().clone(), ctx.epoch));
-            let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
-            e.insert(Table {
+    // TODO unmeasured: `entry` clones two Arcs per row, hits included, so
+    // this hashes twice on the miss path instead. Whether the refcount
+    // lines are contended enough for that to win is not established.
+    let key = &row.rel.rel_name;
+    if !tables.contains_key(key) {
+        // Overrides ride the route frozen at planning; a `Column*` config
+        // event applies under the barrier fence, whose FlushAll cleared this
+        // plan cache, so post-apply rows rebuild from post-apply routes
+        let plan = TablePlan::build(
+            ctx.alloc,
+            &row.rel,
+            &row.route.mapping,
+            Some(&row.route.column_overrides),
+        )
+        .map_err(|e| e.to_string())?;
+        let meta = Arc::new(BatchMeta::from_plan(&plan, key.clone(), ctx.epoch));
+        let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
+        tables.insert(
+            key.clone(),
+            Table {
                 enc,
                 meta,
                 seq_counts: Vec::new(),
                 slice_permits: Vec::new(),
                 value_permits: Vec::new(),
                 deadline: None,
-            })
-        }
-    };
+            },
+        );
+    }
+    let t = tables.get_mut(key).expect("inserted above");
     // Every row of a chunk shares one permit, so the tail entry settles it:
     // pushes for this table come only from this table's rows, and a seal
     // clears the list so the next batch takes its own hold
