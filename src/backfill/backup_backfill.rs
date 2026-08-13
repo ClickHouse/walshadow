@@ -220,8 +220,10 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     };
     outcome.pg_xact_patch_len = patch.len();
 
-    let source =
-        Box::new(ObjectStoreSource::new(settings.clone(), storage, resolved).with_parallelism(4));
+    let source = Box::new(
+        ObjectStoreSource::new(settings.clone(), storage, resolved, ctx.scratch_dir.clone())
+            .with_parallelism(4),
+    );
     // Tag min(B_redo, S) per rel: gap replay covers (B_redo, S], so walked
     // rows must lose to replayed commits; a backup newer than the opt-in
     // has no replay leg for that rel and tags S

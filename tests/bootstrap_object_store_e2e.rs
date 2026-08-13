@@ -241,7 +241,13 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
     // tuple count.
     let shadow_data = tmp.path().join("shadow-data");
     let cfg = BootstrapConfig::new(shadow_data.clone());
-    let object_source = ObjectStoreSource::new(settings, storage, backup_name).with_parallelism(2);
+    let object_source = ObjectStoreSource::new(
+        settings,
+        storage,
+        backup_name,
+        tmp.path().join("part-spool"),
+    )
+    .with_parallelism(2);
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(object_source), catalog_map, false);
 
     // RecordingObserver wraps a CollectingTupleObserver + counts
