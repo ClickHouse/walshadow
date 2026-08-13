@@ -55,16 +55,27 @@ pub struct ObjectStoreSource {
     pub storage: DynStorage,
     pub backup_name: String,
     pub parallelism: usize,
+    /// Caller's existing scratch root (`--spill-dir` for bootstrap, the
+    /// backfill's `scratch_dir`), not a directory of its own. Holds up to
+    /// `parallelism` compressed parts at once, so parallelism sets the
+    /// disk floor.
+    pub part_spool_dir: PathBuf,
 }
 
 impl ObjectStoreSource {
-    pub fn new(settings: Settings, storage: DynStorage, backup_name: String) -> Self {
+    pub fn new(
+        settings: Settings,
+        storage: DynStorage,
+        backup_name: String,
+        part_spool_dir: PathBuf,
+    ) -> Self {
         let parallelism = std::cmp::min(4, num_cpus_or(4));
         Self {
             settings,
             storage,
             backup_name,
             parallelism,
+            part_spool_dir,
         }
     }
 
@@ -86,7 +97,13 @@ impl BackupSource for ObjectStoreSource {
             storage,
             backup_name,
             parallelism,
+            part_spool_dir,
         } = *self;
+        // Bootstrap runs before `SpillStore::new` creates --spill-dir, so
+        // the scratch root is not guaranteed to exist yet.
+        tokio::fs::create_dir_all(&part_spool_dir)
+            .await
+            .with_context(|| format!("part spool dir {}", part_spool_dir.display()))?;
 
         let resolved = walrus::pg::backup::fetch::resolve_name(&storage, &backup_name)
             .await
@@ -147,8 +164,12 @@ impl BackupSource for ObjectStoreSource {
                 let data_dir = data_dir.clone();
                 let sink = sink.clone();
                 let next_entry = next_entry.clone();
+                let spool = part_spool_dir.clone();
                 async move {
-                    unpack_one_part(&settings, &storage, &key, &data_dir, sink, next_entry).await
+                    unpack_one_part(
+                        &settings, &storage, &key, &data_dir, &spool, sink, next_entry,
+                    )
+                    .await
                 }
             })
             .buffer_unordered(parallelism)
@@ -163,6 +184,7 @@ impl BackupSource for ObjectStoreSource {
                 &storage,
                 key,
                 &data_dir,
+                &part_spool_dir,
                 sink.clone(),
                 next_entry.clone(),
             )
@@ -185,6 +207,7 @@ async fn unpack_one_part(
     storage: &DynStorage,
     key: &str,
     data_dir: &std::path::Path,
+    part_spool_dir: &std::path::Path,
     sink: Arc<Mutex<dyn BackupSink>>,
     next_entry: Arc<AtomicU64>,
 ) -> Result<()> {
@@ -195,7 +218,8 @@ async fn unpack_one_part(
         .with_context(|| format!("ObjectStoreSource: get {key}"))?;
     let throttled = settings.throttle_network(body);
     let decrypted = settings.decrypt(throttled);
-    let decoded = compression::decode(method, decrypted);
+    let spooled = spool_backup_part(part_spool_dir, key, decrypted).await?;
+    let decoded = compression::decode(method, Box::pin(spooled));
 
     let mut archive = tokio_tar::Archive::new(decoded);
     pump_tar_to_sink(&mut archive, data_dir, &sink, &next_entry)
@@ -207,6 +231,48 @@ async fn unpack_one_part(
         "tar part drained"
     );
     Ok(())
+}
+
+/// Drain the part body to scratch and hand back a reader over it, so the
+/// GET completes at network speed instead of at whatever rate the sink
+/// drains. Decode against a live body ties request lifetime to the whole
+/// downstream pipeline, and walrus caps a request at 60s.
+///
+/// The file is unlinked as soon as it is written: the fd pins the blocks,
+/// so no error or panic path can leak it. Same trick as
+/// [`crate::spill::BodySpoolFile`]. Bytes are still compressed here, so
+/// scratch tracks object size rather than the unpacked tar.
+async fn spool_backup_part(
+    dir: &std::path::Path,
+    key: &str,
+    mut body: compression::AsyncReader,
+) -> Result<tokio::fs::File> {
+    use tokio::io::AsyncSeekExt;
+
+    let leaf = key.rsplit('/').next().unwrap_or("part");
+    let path = dir.join(format!("backup_part_{leaf}"));
+    let mut file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("ObjectStoreSource: open part spool {}", path.display()))?;
+    let bytes = tokio::io::copy(&mut body, &mut file)
+        .await
+        .with_context(|| format!("ObjectStoreSource: spool {key}"))?;
+    tokio::fs::remove_file(&path).await.ok();
+    file.rewind()
+        .await
+        .with_context(|| format!("ObjectStoreSource: rewind part spool {key}"))?;
+    tracing::info!(
+        target = "walshadow::backup_source_object_store",
+        key,
+        bytes,
+        "part spooled"
+    );
+    Ok(file)
 }
 
 fn method_from_key(key: &str) -> compression::Method {

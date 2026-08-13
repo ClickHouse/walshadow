@@ -3102,7 +3102,12 @@ async fn run_bootstrap(
                          `{BACKUP_NAME_PREFIX}` (--bootstrap-backup-name / [bootstrap] backup_name)"
                 );
             }
-            let mut src = ObjectStoreSource::new(settings.clone(), storage.clone(), name);
+            let mut src = ObjectStoreSource::new(
+                settings.clone(),
+                storage.clone(),
+                name,
+                args.spill_dir.clone(),
+            );
             if let Some(n) = plan.parallelism {
                 src = src.with_parallelism(n);
             }
