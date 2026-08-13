@@ -78,3 +78,8 @@ tempfile = "3"
 # Enable paused time for batch deadline tests
 tokio = { version = "1", features = ["test-util"] }
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }
+
+[profile.release]
+# Line tables so `perf annotate` / `--sort=srcline` can attribute samples in
+# the hot pipeline stages. No optimisation change, ~no runtime cost.
+debug = "line-tables-only"
