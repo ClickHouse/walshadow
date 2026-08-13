@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use walrus::compression;
 use walrus::config::Settings;
 use walrus::pg::backup::fetch::{fetch_sentinel, list_tar_parts};
@@ -138,7 +138,9 @@ impl BackupSource for ObjectStoreSource {
         let next_entry = Arc::new(AtomicU64::new(0));
 
         // Phase A: bounded fan-out of data parts via buffer_unordered
-        let data_results = futures::stream::iter(data_parts)
+        // try_collect short-circuits on the first part error. A plain
+        // collect withholds it until every other part has drained.
+        futures::stream::iter(data_parts)
             .map(|key| {
                 let storage = storage.clone();
                 let settings = settings.clone();
@@ -150,11 +152,8 @@ impl BackupSource for ObjectStoreSource {
                 }
             })
             .buffer_unordered(parallelism)
-            .collect::<Vec<_>>()
-            .await;
-        for r in data_results {
-            r?;
-        }
+            .try_collect::<Vec<_>>()
+            .await?;
 
         // Phase B: pg_control barrier, single-task. wal-g emits one
         // control part; walk in sorted order if ever more
