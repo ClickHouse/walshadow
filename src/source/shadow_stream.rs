@@ -91,10 +91,6 @@ pub struct ShadowStreamState {
     pub system_identifier: String,
     /// `IDENTIFY_SYSTEM` `dbname` (always empty for physical replication).
     pub dbname: Option<String>,
-    /// `IDENTIFY_SYSTEM` `xlogpos`, source's `pg_current_wal_lsn()`.
-    /// Advertise `current_lsn` here so shadow's walreceiver knows where
-    /// to resume.
-    pub xlogpos: u64,
     connections: HashMap<u64, ConnState>,
     next_conn_id: u64,
     /// Bytes queued behind a slow shadow client, bounded by
@@ -133,7 +129,6 @@ impl ShadowStreamState {
             timeline,
             system_identifier,
             dbname: None,
-            xlogpos: current_lsn,
             connections: HashMap::new(),
             next_conn_id: 1,
             send_queues: HashMap::new(),
@@ -564,14 +559,16 @@ async fn drive_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    let (system_id, timeline, xlogpos) = {
+    let (system_id, timeline) = {
         let s = state.lock().await;
-        (s.system_identifier.clone(), s.timeline, s.xlogpos)
+        (s.system_identifier.clone(), s.timeline)
     };
     let identity = server::Identity {
         system_id,
         timeline,
-        xlogpos,
+        // 0/0 (InvalidXLogRecPtr): keeps the walreceiver from gating on our
+        // advertised flush and waiting when its resume LSN sits ahead of it.
+        xlogpos: 0,
         dbname: None,
     };
 
