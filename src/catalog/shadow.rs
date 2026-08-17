@@ -13,8 +13,7 @@
 //! [`health`](Shadow::health),
 //! [`stop`](Shadow::stop). Test harness: [`initdb`](Shadow::initdb),
 //! [`write_base_conf`](Shadow::write_base_conf),
-//! [`apply_schema_dump`](Shadow::apply_schema_dump),
-//! [`enable_standby_recovery`](Shadow::enable_standby_recovery).
+//! [`apply_schema_dump`](Shadow::apply_schema_dump).
 //!
 //! Use `standby.signal`, not `recovery.signal`. Recovery signal ends
 //! recovery when archive runs out. Standby signal keeps recovery active
@@ -339,7 +338,9 @@ impl Shadow {
              listen_addresses = ''\n\
              unix_socket_directories = '{sock}'\n\
              port = {port}\n\
-             shared_buffers = 32MB\n\
+             shared_buffers = 256MB\n\
+             max_wal_size = 512MB\n\
+             min_wal_size = 128MB\n\
              max_connections = {max_connections}\n\
              max_worker_processes = {max_worker_processes}\n\
              max_wal_senders = {max_wal_senders}\n\
@@ -403,32 +404,6 @@ impl Shadow {
         }
     }
 
-    /// Drop `standby.signal` + append `primary_conninfo` and
-    /// `restore_command`. PG's walreceiver tries `primary_conninfo`
-    /// first, falls back to `restore_command` on connect error or
-    /// end-of-WAL.
-    pub fn enable_standby_recovery(&self, primary_conninfo: &str) -> Result<()> {
-        let signal = self.config.data_dir.join("standby.signal");
-        fs::write(&signal, b"")?;
-        let conf_path = self.config.data_dir.join("postgresql.conf");
-        let filter_dir = self
-            .config
-            .filter_out_dir
-            .to_str()
-            .expect("non-utf8 filter_out_dir");
-        // PG conf-string single-quote doubling
-        let escaped = primary_conninfo.replace('\'', "''");
-        let body = format!(
-            "\n# walshadow recovery\n\
-             primary_conninfo = '{escaped}'\n\
-             restore_command = 'cp {filter_dir}/%f %p'\n\
-             recovery_target_timeline = 'latest'\n",
-        );
-        let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
-        f.write_all(body.as_bytes())?;
-        Ok(())
-    }
-
     pub fn start(&self) -> Result<()> {
         let log = self.config.data_dir.join("startup.log");
         let res = self.run(
@@ -440,7 +415,7 @@ impl Shadow {
                 log.to_str().expect("non-utf8 log path"),
                 "-w",
                 "-t",
-                &self.config.ctl_timeout.as_secs().to_string(),
+                "86400",
                 "start",
             ],
         );
@@ -942,34 +917,5 @@ mod tests {
         assert!(!data_dir.join("postmaster.pid").exists());
         fs::write(data_dir.join("PG_VERSION"), b"17\n").unwrap();
         assert!(shadow.data_dir_initialized());
-    }
-
-    #[test]
-    fn enable_standby_recovery_writes_signal_and_conf() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let filter_dir = tmp.path().join("filtered");
-        fs::create_dir_all(&data_dir).unwrap();
-        fs::create_dir_all(&filter_dir).unwrap();
-        // append() requires the file to exist
-        fs::write(data_dir.join("postgresql.conf"), b"# base\n").unwrap();
-        let cfg = ShadowConfig::new(data_dir.clone(), filter_dir);
-        let shadow = Shadow::new(cfg);
-        shadow
-            .enable_standby_recovery(
-                "host=/tmp/sock port=55555 user=walshadow application_name=shadow",
-            )
-            .unwrap();
-        let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
-        assert!(
-            conf.contains("primary_conninfo"),
-            "no conninfo line: {conf}"
-        );
-        assert!(
-            conf.contains("restore_command"),
-            "no restore_command: {conf}"
-        );
-        assert!(conf.contains("recovery_target_timeline"));
-        assert!(data_dir.join("standby.signal").exists());
     }
 }

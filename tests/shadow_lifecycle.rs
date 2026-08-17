@@ -8,7 +8,7 @@
 //! 1. `normal_mode_lifecycle` — initdb → start (no recovery signal) →
 //!    probe in-recovery false, `pg_class` populated → stop.
 //! 2. `standby_mode_lifecycle` — initdb → start normal → stop →
-//!    enable standby recovery → start → wait for replay LSN to exist
+//!    write standby.signal → start_with_floor_retry → wait for replay LSN
 //!    → probe in-recovery true → stop.
 
 #[path = "common/ports.rs"]
@@ -101,10 +101,12 @@ fn standby_mode_lifecycle() {
     // attempt will fail and PG falls back to the archive
     // restore_command path (which also has no files). Standby still
     // boots cleanly into recovery.
+    shadow.write_standby_signal().expect("standby signal");
     shadow
-        .enable_standby_recovery("host=/dev/null port=1 user=walshadow application_name=test")
-        .expect("enable standby");
-    shadow.start().expect("start (standby)");
+        .start_with_floor_retry(Some(
+            "host=/dev/null port=1 user=walshadow application_name=test",
+        ))
+        .expect("start (standby)");
     let started = scopeguard_stop(&shadow);
 
     // After standby start, hot_standby should let us connect. The
@@ -136,8 +138,6 @@ fn standby_mode_lifecycle() {
 
 #[test]
 fn restore_command_filename_is_segment_relative() {
-    // No PG needed — just check that `enable_standby_recovery` writes
-    // a sane `restore_command` line into postgresql.conf.
     if !pg_available() {
         eprintln!("skip: no initdb on PATH (need to populate postgresql.conf)");
         return;
@@ -145,16 +145,17 @@ fn restore_command_filename_is_segment_relative() {
     let tmp = tempfile::tempdir().unwrap();
     let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
     shadow.initdb().expect("initdb");
-    shadow.write_base_conf().expect("conf");
+    shadow.write_standby_signal().expect("standby signal");
     shadow
-        .enable_standby_recovery(
-            "host=/var/run/postgresql port=55501 user=walshadow application_name=shadow",
+        .materialize_conf(
+            &walshadow::shadow::SourceGucFloor::default(),
+            Some("host=/var/run/postgresql port=55501 user=walshadow application_name=shadow"),
         )
-        .expect("standby");
+        .expect("standby conf");
 
     let conf = std::fs::read_to_string(tmp.path().join("data/postgresql.conf")).expect("read conf");
     assert!(
-        conf.contains("restore_command = 'cp "),
+        conf.contains("restore_command = 'ln -f ") || conf.contains("restore_command = 'cp "),
         "postgresql.conf missing restore_command line",
     );
     assert!(conf.contains("/%f %p'"));
