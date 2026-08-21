@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
@@ -49,6 +49,7 @@ use crate::emit::pipeline::plan_spool::{PlanItem, SealedPlan};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
 use crate::emit::route::{RouteSnapshot, RoutedHeap};
 use crate::mapping::{MappingHandle, MappingSnapshot, TableMapping};
+use crate::pos::{Floor, Monotone};
 use crate::runtime_config::{ConfigEvent, TableRow};
 use crate::toast::ToastResolver;
 use crate::toast::toast_retire::RetireLedger;
@@ -92,7 +93,7 @@ pub struct ReorderSink {
     /// Persisted resolved floor (aligned, archive-clamped) — the position
     /// a crash-now restart resumes from. Seeded at the resolved start,
     /// advanced only after each manifest persist.
-    resume_floor: Arc<AtomicU64>,
+    resume_floor: Arc<Monotone<Floor>>,
     /// Dense commit-order counter; one seq per dispatched data unit.
     next_seq: u64,
     /// Drain-slice budget: rows / bytes per [`DrainedBatch`] pulled from the
@@ -128,10 +129,7 @@ pub struct ReorderSink {
     /// Plan spool directory (the xact spill dir), cached at spawn so the
     /// per-commit path needs no buffer lock
     plan_dir: std::path::PathBuf,
-    /// Mapping version frozen with the memo reset: one transaction plans
-    /// against one mapping version, a concurrent republish (SIGHUP /
-    /// control-socket, no WAL position) can't split its rows. In-walk event
-    /// applies re-snapshot so trailing heaps see the event's own effect.
+    /// Frozen per transaction, with catalog events folded into local overlay
     route_mapping: Option<MappingSnapshot>,
     /// Resolved-config snapshot taken with the memo reset; every override in
     /// one interval comes from one snapshot, never a mid-interval republish.
@@ -162,7 +160,7 @@ impl ReorderSink {
         plan_dir: std::path::PathBuf,
         budget: Option<crate::budget::MemoryBudget>,
         retires: RetireLedger,
-        resume_floor: Arc<AtomicU64>,
+        resume_floor: Arc<Monotone<Floor>>,
         mapping: MappingHandle,
         soft_delete: bool,
     ) -> Self {
@@ -219,7 +217,7 @@ impl ReorderSink {
     /// whole-transaction snapshot; a non-WAL-positioned republish landing
     /// mid-plan can't reroute rows already planned or split the transaction.
     async fn reset_route_state(&mut self) {
-        self.route_mapping = Some(self.mapping.read().await.clone());
+        self.route_mapping = Some(self.mapping.snapshot().await);
         self.route_config = self.reload_rx.as_ref().map(|rx| rx.borrow().clone());
     }
 
@@ -398,8 +396,9 @@ impl ReorderSink {
     async fn dispatch_job(&mut self, job: DecodeJob) -> Result<(), SinkError> {
         self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
         tokio::select! {
-            r = self.jobs_tx.send(job) => r.map_err(|_| SinkError::Other("decode job queue closed".into())),
+            biased;
             _ = self.fatal.wait() => Err(self.fatal_err()),
+            r = self.jobs_tx.send(job) => r.map_err(|_| SinkError::Other("decode job queue closed".into())),
         }
     }
 
@@ -411,18 +410,23 @@ impl ReorderSink {
             return Err(SinkError::Other("batcher channel closed".into()));
         }
         tokio::select! {
-            r = rx => r.map_err(|_| SinkError::Other("batcher dropped flush ack".into())),
+            biased;
             _ = self.fatal.wait() => Err(self.fatal_err()),
+            r = rx => r.map_err(|_| SinkError::Other("batcher dropped flush ack".into())),
         }
     }
 
+    // Barrier waits prefer concurrent fatal over successful completion
     /// Wait until every dispatched seq is *placed* (decode pool routed all
     /// their rows onto the shared channel), so a `FlushAll` orders after them.
     async fn wait_all_placed(&mut self) -> Result<(), SinkError> {
         let through = self.next_seq;
         tokio::select! {
-            _ = self.ack.wait_placed_through(through) => Ok(()),
+            biased;
             _ = self.fatal.wait() => Err(self.fatal_err()),
+            r = self.ack.wait_placed_through(through) => r.map_err(|e| {
+                SinkError::Other(format!("placed barrier through {through}: {e}"))
+            }),
         }
     }
 
@@ -431,8 +435,11 @@ impl ReorderSink {
     async fn wait_all_durable(&mut self) -> Result<(), SinkError> {
         let through = self.next_seq;
         tokio::select! {
-            _ = self.ack.wait_through(through) => Ok(()),
+            biased;
             _ = self.fatal.wait() => Err(self.fatal_err()),
+            r = self.ack.wait_through(through) => r.map_err(|e| {
+                SinkError::Other(format!("durability barrier through {through}: {e}"))
+            }),
         }
     }
 
@@ -513,7 +520,7 @@ impl ReorderSink {
         if !self.resolver.stores_chunks() || self.retires.is_empty() {
             return Ok(());
         }
-        let cut = self.resume_floor.load(Ordering::Acquire);
+        let cut = self.resume_floor.get();
         for (oid, commit_lsn) in self.retires.due(cut) {
             self.resolver
                 .retire_mirror(oid)
@@ -943,11 +950,9 @@ fn bump_plan_failure(stats: &EmitterStats, reason: &'static str) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Plan-time route state for one transaction: frozen mapping + config
-/// versions plus a local fold of in-walk catalog entries. The applicator
-/// predicts what executing each event will leave in the routing map
-/// ([`DdlApplicator::predict_route_mapping`]) so post-event rows plan under
-/// post-event routes while the real side effects wait for the executor.
+/// Frozen route state plus transaction-local catalog changes
+///
+/// Predict route effects before executor applies matching DDL
 /// Config-table events are not folded: a same-xact config write followed
 /// by rows plans under the frozen version (whole-transaction granularity;
 /// the in-xact interval refinement lands with the config fold)
@@ -1021,11 +1026,13 @@ impl PlanRouteView for ReorderRouteView<'_> {
             // no route effect
             return Ok(());
         };
+        let mapping = self.mapping.clone().unwrap_or_default();
+        let config = self.config.clone();
         let Some(app) = self.applicator.as_deref_mut() else {
             return Ok(());
         };
         if let Some((rel, m)) = app
-            .predict_route_mapping(ev)
+            .predict_route_mapping(ev, &mapping, config.as_deref())
             .await
             .map_err(|e| e.to_string())?
         {
@@ -1086,5 +1093,69 @@ impl RecordSink for ReorderSink {
             // here so the flush doesn't wait for a later commit
             self.flush_due_retires().await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::heap_decoder::DecodedHeap;
+    use crate::mapping::TableTarget;
+    use crate::xact::xact_buffer::raw_fixtures::int4_descriptor;
+
+    fn mapping_for(rel: &RelName) -> TableMapping {
+        TableMapping {
+            target: TableTarget::new("db", &rel.name),
+            columns: Vec::new(),
+        }
+    }
+
+    fn heap_of(rel: &RelName) -> DescribedHeap {
+        let mut desc = (*int4_descriptor(16400)).clone();
+        desc.rel_name = rel.clone();
+        DescribedHeap {
+            decoded: DecodedHeap {
+                rfn: desc.rfn,
+                xid: 1,
+                source_lsn: 0x100,
+                op: HeapOp::Insert,
+                new: None,
+                old: None,
+            },
+            descriptor: Arc::new(desc),
+            descriptor_valid_from: 0x40,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_view_holds_one_mapping_version_across_a_republish() {
+        let planned = RelName::new("public", "planned");
+        let added = RelName::new("public", "added");
+        let handle = crate::mapping::mapping_handle(HashMap::from_iter([(
+            planned.clone(),
+            mapping_for(&planned),
+        )]));
+
+        let stats = Arc::new(EmitterStats::default());
+        let mut view =
+            ReorderRouteView::new(Some(handle.snapshot().await), None, false, None, stats);
+        assert!(view.route_for(&heap_of(&planned)).is_some());
+        assert!(view.route_for(&heap_of(&added)).is_none());
+
+        handle
+            .publish(Arc::new(HashMap::from_iter([(
+                added.clone(),
+                mapping_for(&added),
+            )])))
+            .await;
+
+        assert!(
+            view.route_for(&heap_of(&planned)).is_some(),
+            "republish can't unroute rows already planned"
+        );
+        assert!(
+            view.route_for(&heap_of(&added)).is_none(),
+            "republish can't route rows this transaction planned unmapped"
+        );
     }
 }

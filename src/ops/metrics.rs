@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+use crate::pos::{Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived};
 use crate::source::transition::SWITCH_FAILURE_REASONS;
 
 #[derive(Debug, Error)]
@@ -35,19 +36,19 @@ pub enum MetricsError {
 #[derive(Debug, Default, Clone)]
 pub struct MetricsSnapshot {
     /// Source PG's most recent `server_wal_end` (write LSN as PG sees it)
-    pub source_received_lsn: u64,
+    pub source_received_lsn: Pos<SourceReceived>,
     /// Last segment-boundary LSN dispatched downstream; becomes durable once
     /// segment fsync lands
-    pub filter_lsn: u64,
+    pub filter_lsn: Pos<FilterDispatched>,
     /// Shadow PG's `pg_last_wal_replay_lsn()`, `0` until first poll
-    pub shadow_replay_lsn: u64,
+    pub shadow_replay_lsn: Pos<ShadowReplay>,
     /// Highest commit LSN drained out of the xact buffer, so above every
     /// commit whose rows could have reached ClickHouse
-    pub decoder_commit_lsn: u64,
-    /// Contiguous-done watermark from the insert pipeline
-    pub emitter_ack_lsn: u64,
+    pub decoder_commit_lsn: Pos<Drain>,
+    /// Live insert watermark, unlike manifest's resume-safe `emitter_ack`
+    pub emitter_ack_lsn: Pos<EmitterAck>,
     /// Durable resume floor: restart resumes here and every pruner cuts to it
-    pub floor_lsn: u64,
+    pub floor_lsn: Pos<Floor>,
     /// `route` is `"to_shadow"` / `"to_decoder"`
     pub records_by_rm_route: BTreeMap<(String, &'static str), u64>,
     pub xact_active: u64,
@@ -396,32 +397,32 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         (
             "walshadow_source_received_lsn",
             "Source PG's most recent server_wal_end seen on the replication socket.",
-            snap.source_received_lsn,
+            snap.source_received_lsn.get(),
         ),
         (
             "walshadow_filter_lsn",
             "LSN of the last filtered WAL byte the daemon has dispatched.",
-            snap.filter_lsn,
+            snap.filter_lsn.get(),
         ),
         (
             "walshadow_shadow_replay_lsn",
             "Shadow PG's pg_last_wal_replay_lsn(), polled at status cadence.",
-            snap.shadow_replay_lsn,
+            snap.shadow_replay_lsn.get(),
         ),
         (
             "walshadow_decoder_commit_lsn",
             "Highest commit LSN drained out of the xact buffer.",
-            snap.decoder_commit_lsn,
+            snap.decoder_commit_lsn.get(),
         ),
         (
             "walshadow_emitter_ack_lsn",
             "Contiguous-done watermark from the insert pipeline.",
-            snap.emitter_ack_lsn,
+            snap.emitter_ack_lsn.get(),
         ),
         (
             "walshadow_floor_lsn",
             "Durable resume floor: restart resumes here and pruners cut to it.",
-            snap.floor_lsn,
+            snap.floor_lsn.get(),
         ),
         (
             "walshadow_source_timeline",
@@ -1401,8 +1402,8 @@ mod tests {
     #[test]
     fn render_includes_help_type_lines() {
         let mut snap = MetricsSnapshot {
-            source_received_lsn: 0xCAFE_BABE,
-            filter_lsn: 0xC0FFEE,
+            source_received_lsn: 0xCAFE_BABE.into(),
+            filter_lsn: 0xC0FFEE.into(),
             xact_active: 3,
             uptime_secs: 42,
             ..MetricsSnapshot::default()
@@ -1515,7 +1516,7 @@ mod tests {
     async fn registry_set_and_snapshot_round_trip() {
         let reg = MetricsRegistry::new();
         let snap = MetricsSnapshot {
-            filter_lsn: 7,
+            filter_lsn: 7.into(),
             xacts_committed_total: 11,
             ..MetricsSnapshot::default()
         };
@@ -1608,7 +1609,7 @@ mod tests {
     async fn http_serve_returns_text_format_body() {
         let reg = MetricsRegistry::new();
         let snap = MetricsSnapshot {
-            filter_lsn: 0xDEAD,
+            filter_lsn: 0xDEAD.into(),
             ..MetricsSnapshot::default()
         };
         reg.set(snap).await;

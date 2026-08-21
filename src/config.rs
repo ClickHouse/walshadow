@@ -572,15 +572,15 @@ impl ConfigResolver {
             &prev.columns,
         );
         self.rejections.store(rejections, Ordering::Relaxed);
-        *self.mapping.write().await = Arc::new(resolved.tables.clone());
+        self.mapping
+            .publish(Arc::new(resolved.tables.clone()))
+            .await;
         tracing::info!(
             target: "walshadow::config",
             opt_ins = resolved.table_opt_ins.len(),
             tables = resolved.tables.len(),
             "republish",
         );
-        // hits skip the mapping read; bump after every swap so no worker
-        // routes against the pre-publish map
         // Err only when every receiver dropped (daemon tearing down); ignore
         let _ = self.tx.send(Arc::new(resolved));
     }
@@ -1137,7 +1137,7 @@ mod tests {
         assert_eq!(t.target.table, "events", "target derived from descriptor");
         assert!(!t.columns.is_empty(), "columns derived from descriptor");
         // Fenced routing map written for the decode pool.
-        assert!(mapping.read().await.contains_key(&rel));
+        assert!(mapping.with(|m| m.contains_key(&rel)).await);
         assert_eq!(resolver.opt_in_total(), 1);
     }
 
@@ -1164,7 +1164,7 @@ mod tests {
             !rx.borrow_and_update().tables.contains_key(&rel),
             "opt-out drops the mapping"
         );
-        assert!(!mapping.read().await.contains_key(&rel));
+        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
         assert_eq!(resolver.opt_out_total(), 1);
     }
 
@@ -1191,7 +1191,7 @@ mod tests {
             .await;
         assert!(rx.changed().await.is_ok());
         assert!(rx.borrow_and_update().tables.contains_key(&rel));
-        assert!(mapping.read().await.contains_key(&rel));
+        assert!(mapping.with(|m| m.contains_key(&rel)).await);
         // An unrelated overlay apply full-swaps the handle; the derived
         // mapping must survive (the [config.md] "Known limitation" clobber)
         resolver
@@ -1199,10 +1199,10 @@ mod tests {
             .await;
         assert!(rx.changed().await.is_ok());
         assert!(rx.borrow_and_update().tables.contains_key(&rel));
-        assert!(mapping.read().await.contains_key(&rel));
+        assert!(mapping.with(|m| m.contains_key(&rel)).await);
         // Source DROP TABLE under strategy=Drop forgets it everywhere
         resolver.forget_derived_mapping(&rel).await;
-        assert!(!mapping.read().await.contains_key(&rel));
+        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
         assert!(rx.changed().await.is_ok());
         assert!(!rx.borrow_and_update().tables.contains_key(&rel));
     }
@@ -1231,11 +1231,11 @@ mod tests {
         resolver
             .materialize_opt_in(&rel_desc("public", "events"), None, None)
             .await;
-        assert!(mapping.read().await.contains_key(&rel));
+        assert!(mapping.with(|m| m.contains_key(&rel)).await);
         // Source DROP under strategy=Drop: mapping forgotten, opt-in row
         // re-parked so the next CREATE re-materialises it
         resolver.forget_derived_mapping(&rel).await;
-        assert!(!mapping.read().await.contains_key(&rel));
+        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
         assert_eq!(resolver.pending_decl_count(), 1);
         let row = resolver.take_pending_decl(&rel).await.expect("re-parked");
         assert_eq!(row.replicate, Some(true));
@@ -1285,12 +1285,15 @@ mod tests {
             m.get(&RelName::new("public", "events"))
                 .is_some_and(|t| t.columns.iter().any(|c| c.src_attnum == 2))
         };
-        assert!(has_note(&*mapping.read().await), "fold reaches the handle");
+        assert!(
+            mapping.with(|m| has_note(m)).await,
+            "fold reaches the handle"
+        );
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;
         assert!(
-            has_note(&*mapping.read().await),
+            mapping.with(|m| has_note(m)).await,
             "fold survives the republish full-swap"
         );
     }

@@ -82,6 +82,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
+use crate::pos::{Floor, Pos};
 use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 use ahash::{HashMap, HashSet, HashSetExt};
 
@@ -264,7 +265,7 @@ struct Index {
     amb_db: HashMap<Oid, Vec<Arc<Ambiguity>>>,
     batches: BTreeMap<u64, Arc<BatchRecord>>,
     covered_through: u64,
-    floor_at_write: u64,
+    floor_at_write: Pos<Floor>,
     entries_total: usize,
 }
 
@@ -434,7 +435,7 @@ impl DescriptorLog {
 
     /// Floor recorded by the last GC ckpt write; `--start-lsn` below it has
     /// no descriptor history
-    pub fn floor_at_write(&self) -> u64 {
+    pub fn floor_at_write(&self) -> Pos<Floor> {
         self.index.read().unwrap().floor_at_write
     }
 
@@ -756,18 +757,19 @@ impl DescriptorLog {
     /// predate the drop, and the floor never exceeds the re-read start).
     /// Batches above the floor survive whole (stubs included) for boot
     /// replay; below it they exist only as carriers of retained entries.
-    pub async fn maybe_gc(&self, floor: u64) -> Result<bool> {
+    pub async fn maybe_gc(&self, floor: impl Into<Pos<Floor>>) -> Result<bool> {
+        let floor = floor.into();
         let w = self.writer.lock().await;
         let tail_bytes = w.tail_len - w.header_len;
         let (retained, dropped_entries) = {
             let idx = self.index.read().unwrap();
             // Count before rebuilding: this runs at cursor-write cadence and
             // usually declines, while compute_retained re-sorts every chain
-            let dropped = droppable_entries(&idx, floor);
+            let dropped = droppable_entries(&idx, floor.get());
             if dropped < GC_DEAD_ENTRIES && tail_bytes < GC_TAIL_BYTES {
                 return Ok(false);
             }
-            (compute_retained(&idx, floor), dropped)
+            (compute_retained(&idx, floor.get()), dropped)
         };
         self.gc_locked(w, retained, dropped_entries as u64, floor)
             .await?;
@@ -775,11 +777,12 @@ impl DescriptorLog {
     }
 
     #[cfg(test)]
-    pub async fn force_gc(&self, floor: u64) -> Result<()> {
+    pub async fn force_gc(&self, floor: impl Into<Pos<Floor>>) -> Result<()> {
+        let floor = floor.into();
         let w = self.writer.lock().await;
         let (retained, dropped) = {
             let idx = self.index.read().unwrap();
-            let retained = compute_retained(&idx, floor);
+            let retained = compute_retained(&idx, floor.get());
             let dropped = idx.entries_total - retained.entries_total;
             (retained, dropped)
         };
@@ -791,12 +794,15 @@ impl DescriptorLog {
         mut w: tokio::sync::MutexGuard<'_, Writer>,
         mut retained: Index,
         dropped_entries: u64,
-        floor: u64,
+        floor: Pos<Floor>,
     ) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         retained.floor_at_write = floor;
         let mut bytes = encode_header(&self.identity);
-        push_frame(&mut bytes, &encode_meta(retained.covered_through, floor));
+        push_frame(
+            &mut bytes,
+            &encode_meta(retained.covered_through, floor.get()),
+        );
         for batch in retained.batches.values() {
             push_frame(&mut bytes, &encode_batch(batch));
         }
@@ -1295,7 +1301,7 @@ fn load_frames(
         match body_cur.u8()? {
             TAG_META => {
                 index.covered_through = body_cur.u64()?;
-                index.floor_at_write = body_cur.u64()?;
+                index.floor_at_write = Pos::new(body_cur.u64()?);
             }
             TAG_BATCH => {
                 let batch = decode_batch(&mut body_cur)?;

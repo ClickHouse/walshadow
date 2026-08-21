@@ -19,7 +19,7 @@
 mod fx;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
@@ -28,6 +28,7 @@ use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedT
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
+use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 
 const RFN: RelFileNode = RelFileNode {
@@ -153,7 +154,7 @@ async fn budget_trips_seal_complete_inserts() {
     };
 
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
     let fatal = Fatal::new();
     let (msg_tx, ack, tail_parts) =
         tail::spawn(&cfg, 1, stats.clone(), emitter_ack.clone(), fatal.clone())
@@ -184,7 +185,7 @@ async fn budget_trips_seal_complete_inserts() {
         .await
         .expect("send flush");
     reply_rx.await.expect("flush ack");
-    ack.wait_through(1).await;
+    ack.wait_through(1).await.expect("ack collector alive");
     drop(msg_tx);
     drop(ack);
     tail_parts.join().await;
@@ -192,7 +193,7 @@ async fn budget_trips_seal_complete_inserts() {
 
     // The contiguous-done watermark reaches the seq's commit lsn.
     assert_eq!(
-        emitter_ack.load(Ordering::Acquire),
+        emitter_ack.get(),
         commit_lsn,
         "durable horizon must reach the commit lsn",
     );

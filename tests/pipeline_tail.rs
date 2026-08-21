@@ -4,13 +4,13 @@
 mod fx;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::pipeline::Fatal;
 use walshadow::pipeline::tail;
+use walshadow::pos::{EmitterAck, Monotone};
 
 fn emitter(port: u16) -> EmitterConfig {
     EmitterConfig {
@@ -36,7 +36,7 @@ async fn tail_finish_flushes_and_drains_clean() {
 
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
     let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
         .await
         .expect("spawn tail");
@@ -61,7 +61,7 @@ async fn tail_finish_returns_fatal_message() {
 
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
     let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
         .await
         .expect("spawn tail");
@@ -88,7 +88,7 @@ async fn tail_finish_fatal_during_drain() {
 
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
     let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
         .await
         .expect("spawn tail");

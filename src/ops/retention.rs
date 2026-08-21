@@ -20,6 +20,7 @@ use std::time::Duration;
 use thiserror::Error;
 use walrus::pg::wal::segment::{SEGMENT_NAME_LEN, SegmentName};
 
+use crate::pos::{FilterDurable, Pos, ShadowReplay};
 use crate::record::WAL_SEG_SIZE;
 
 /// 256 MiB = ~16 segments at 16 MiB. Enough to replay through a typical
@@ -48,7 +49,11 @@ pub struct TrimReport {
 /// Trim segments whose *end* LSN (`start_lsn + WAL_SEG_SIZE`) is below
 /// `cutoff_lsn`. End-LSN boundary preserves the segment containing the
 /// cutoff: shadow may still be reading it.
-pub async fn trim_below_lsn(dir: &Path, cutoff_lsn: u64) -> Result<TrimReport, RetentionError> {
+pub async fn trim_below_lsn(
+    dir: &Path,
+    cutoff_lsn: impl Into<Pos<ShadowReplay>>,
+) -> Result<TrimReport, RetentionError> {
+    let cutoff_lsn = cutoff_lsn.into();
     let mut report = TrimReport::default();
     if !dir.exists() {
         return Ok(report);
@@ -65,7 +70,7 @@ pub async fn trim_below_lsn(dir: &Path, cutoff_lsn: u64) -> Result<TrimReport, R
             continue;
         };
         let end_lsn = seg.start_lsn(WAL_SEG_SIZE).saturating_add(WAL_SEG_SIZE);
-        if end_lsn > cutoff_lsn {
+        if end_lsn > cutoff_lsn.get() {
             continue;
         }
         let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
@@ -80,7 +85,7 @@ pub async fn trim_below_lsn(dir: &Path, cutoff_lsn: u64) -> Result<TrimReport, R
             target: "walshadow::retention",
             file = %name,
             end_lsn,
-            cutoff_lsn,
+            cutoff_lsn = cutoff_lsn.get(),
             "trimmed",
         );
     }
@@ -91,7 +96,7 @@ pub async fn trim_below_lsn(dir: &Path, cutoff_lsn: u64) -> Result<TrimReport, R
 /// Return `None` when no sealed segment exists
 /// Ignore `.partial` files because `restore_command` serves only sealed
 /// segments
-pub async fn max_segment_end(dir: &Path) -> Result<Option<u64>, RetentionError> {
+pub async fn max_segment_end(dir: &Path) -> Result<Option<Pos<FilterDurable>>, RetentionError> {
     let mut max_end = None;
     if !dir.exists() {
         return Ok(max_end);
@@ -108,8 +113,8 @@ pub async fn max_segment_end(dir: &Path) -> Result<Option<u64>, RetentionError> 
         let Some(seg) = seg_str.and_then(|s| SegmentName::parse(s).ok()) else {
             continue;
         };
-        let end = seg.start_lsn(WAL_SEG_SIZE).saturating_add(WAL_SEG_SIZE);
-        max_end = Some(max_end.map_or(end, |m: u64| m.max(end)));
+        let end = Pos::new(seg.start_lsn(WAL_SEG_SIZE).saturating_add(WAL_SEG_SIZE));
+        max_end = Some(max_end.map_or(end, |m: Pos<FilterDurable>| m.max(end)));
     }
     Ok(max_end)
 }
@@ -270,7 +275,7 @@ mod tests {
         }
         .start_lsn(WAL_SEG_SIZE)
             + WAL_SEG_SIZE;
-        assert_eq!(max_segment_end(dir).await.unwrap(), Some(want));
+        assert_eq!(max_segment_end(dir).await.unwrap(), Some(want.into()));
     }
 
     #[tokio::test(flavor = "current_thread")]

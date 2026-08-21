@@ -21,6 +21,8 @@ use walrus::pg::replication::conn::{
 use walrus::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use walrus::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 
+use crate::pos::{Floor, Pos, ResumeSafe, SourceReceived};
+
 /// Matches wal-rus / wal-g defaults; servers tolerate up to
 /// `wal_sender_timeout` of silence (default 60s).
 pub const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
@@ -128,23 +130,23 @@ pub enum SourceEvent<'a> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StandbyStatus {
     /// `write_lsn` PG sees: WAL pump read + committed to store locally.
-    pub write_lsn: u64,
+    pub write_lsn: Pos<SourceReceived>,
     /// `flush_lsn` PG sees: drives a physical slot's restart_lsn, so the
     /// caller caps it at its persisted resume floor — source must retain
     /// WAL a crash-now restart re-requests.
-    pub flush_lsn: u64,
+    pub flush_lsn: Pos<Floor>,
     /// `apply_lsn` PG sees: bounded by shadow replay LSN and CH emitter
     /// ack LSN, so source's slot won't recycle un-consumed WAL.
-    pub apply_lsn: u64,
+    pub apply_lsn: Pos<ResumeSafe>,
 }
 
 impl StandbyStatus {
     /// All three slots at the same value.
     pub fn collapsed(lsn: u64) -> Self {
         Self {
-            write_lsn: lsn,
-            flush_lsn: lsn,
-            apply_lsn: lsn,
+            write_lsn: lsn.into(),
+            flush_lsn: lsn.into(),
+            apply_lsn: lsn.into(),
         }
     }
 }
@@ -155,20 +157,24 @@ impl StandbyStatus {
 /// WAL).
 #[derive(Debug, Clone, Copy, Default)]
 struct StatusFloors {
-    write: u64,
-    flush: u64,
-    apply: u64,
+    write: Pos<SourceReceived>,
+    flush: Pos<Floor>,
+    apply: Pos<ResumeSafe>,
 }
 
 /// PG assigns a physical slot's restart_lsn from flush unconditionally
 /// (`PhysicalConfirmReceivedLocation`), so a stale lower value walks the
 /// slot backwards, below recycled WAL it can read as invalidatable under
 /// max_slot_wal_keep_size. Hold each field at its own high-water.
-fn clamp_status(status: StandbyStatus, floors: &mut StatusFloors) -> (u64, u64, u64) {
+fn clamp_status(status: StandbyStatus, floors: &mut StatusFloors) -> StandbyStatus {
     floors.write = status.write_lsn.max(floors.write);
     floors.flush = status.flush_lsn.max(floors.flush);
     floors.apply = status.apply_lsn.max(floors.apply);
-    (floors.write, floors.flush, floors.apply)
+    StandbyStatus {
+        write_lsn: floors.write,
+        flush_lsn: floors.flush,
+        apply_lsn: floors.apply,
+    }
 }
 
 /// Build the `START_REPLICATION` command string for a physical replication
@@ -407,8 +413,12 @@ impl SourceFeed {
     }
 
     async fn send_status(&mut self, status: StandbyStatus) -> Result<()> {
-        let (write, flush, apply) = clamp_status(status, &mut self.floors);
-        let payload = build_status_update(write, flush, apply);
+        let held = clamp_status(status, &mut self.floors);
+        let payload = build_status_update(
+            held.write_lsn.get(),
+            held.flush_lsn.get(),
+            held.apply_lsn.get(),
+        );
         self.conn.send_copy_data(&payload).await?;
         self.last_status = Instant::now();
         Ok(())
@@ -438,8 +448,8 @@ impl SourceFeed {
     pub async fn prove_physical_slot(
         &mut self,
         slot: &str,
-        resume_lsn: u64,
-        floor: u64,
+        resume_lsn: Pos<Floor>,
+        floor: Pos<Floor>,
     ) -> Result<Option<u64>, SlotError> {
         let client = self.sql_client().await.map_err(SlotError::Query)?;
         let row = client
@@ -472,19 +482,19 @@ impl SourceFeed {
             );
             return Ok(None);
         };
-        if restart_lsn > resume_lsn {
+        if restart_lsn > resume_lsn.get() {
             return Err(SlotError::TooNew {
                 slot: slot.to_string(),
                 restart_lsn,
-                resume_lsn,
+                resume_lsn: resume_lsn.get(),
             });
         }
-        if restart_lsn > floor {
+        if restart_lsn > floor.get() {
             tracing::warn!(
                 target: "walshadow",
                 slot,
                 restart_lsn = %format_pg_lsn(restart_lsn),
-                floor = %format_pg_lsn(floor),
+                floor = %floor,
                 "slot pins no write-ahead log back to the resume floor; a restart \
                  before it advances would ask for segments nothing retains",
             );
@@ -565,29 +575,33 @@ pub(crate) async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
 mod tests {
     use super::*;
 
+    fn triple(s: StandbyStatus) -> (u64, u64, u64) {
+        (s.write_lsn.get(), s.flush_lsn.get(), s.apply_lsn.get())
+    }
+
     #[test]
     fn clamp_keeps_each_field_independent() {
         let mut floors = StatusFloors::default();
         // leading write must not lift flush/apply
-        let (w, f, a) = clamp_status(
+        let held = clamp_status(
             StandbyStatus {
-                write_lsn: 3000,
-                flush_lsn: 1000,
-                apply_lsn: 800,
+                write_lsn: 3000.into(),
+                flush_lsn: 1000.into(),
+                apply_lsn: 800.into(),
             },
             &mut floors,
         );
-        assert_eq!((w, f, a), (3000, 1000, 800));
+        assert_eq!(triple(held), (3000, 1000, 800));
         // higher flush/apply, same write: each rises from its own floor
-        let (w, f, a) = clamp_status(
+        let held = clamp_status(
             StandbyStatus {
-                write_lsn: 3000,
-                flush_lsn: 1500,
-                apply_lsn: 1200,
+                write_lsn: 3000.into(),
+                flush_lsn: 1500.into(),
+                apply_lsn: 1200.into(),
             },
             &mut floors,
         );
-        assert_eq!((w, f, a), (3000, 1500, 1200));
+        assert_eq!(triple(held), (3000, 1500, 1200));
     }
 
     #[test]
@@ -595,22 +609,22 @@ mod tests {
         let mut floors = StatusFloors::default();
         clamp_status(
             StandbyStatus {
-                write_lsn: 5000,
-                flush_lsn: 4000,
-                apply_lsn: 4000,
+                write_lsn: 5000.into(),
+                flush_lsn: 4000.into(),
+                apply_lsn: 4000.into(),
             },
             &mut floors,
         );
         // stale lower values hold at prior floor
-        let (w, f, a) = clamp_status(
+        let held = clamp_status(
             StandbyStatus {
-                write_lsn: 4500,
-                flush_lsn: 3000,
-                apply_lsn: 3500,
+                write_lsn: 4500.into(),
+                flush_lsn: 3000.into(),
+                apply_lsn: 3500.into(),
             },
             &mut floors,
         );
-        assert_eq!((w, f, a), (5000, 4000, 4000));
+        assert_eq!(triple(held), (5000, 4000, 4000));
     }
 
     /// Both halves of the start LSN must be rendered in hexadecimal, matching

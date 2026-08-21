@@ -57,8 +57,7 @@ use crate::xact::xact_buffer::{
 /// discard, counted by the implementation
 pub trait PlanRouteView {
     fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>>;
-    /// Fold one in-walk control entry into the local view. Async so
-    /// implementations can read shared config, never mutate it
+    /// Fold control entry into local view without mutating shared route state
     fn apply(
         &mut self,
         entry: &DrainEntry,

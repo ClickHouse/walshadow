@@ -417,7 +417,9 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
 
     // Cursor persisted past the dropping commit (daemon status-loop
     // stand-in); the next commit executes the queued retire.
-    pipeline.resume_floor.store(u64::MAX, Ordering::Release);
+    pipeline
+        .resume_floor
+        .join(walshadow::pos::Pos::new(u64::MAX));
     let driver = fx::spawn_workload(
         &source,
         vec![

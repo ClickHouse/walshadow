@@ -9,30 +9,31 @@
 //! resumes as greenfield.
 
 use walshadow::manifest::{
-    self, Lsn, LsnSet, MANIFEST_FILENAME, MANIFEST_VERSION, Manifest, SourceIdentity, WalBranch,
+    self, LsnSet, MANIFEST_FILENAME, MANIFEST_VERSION, Manifest, SourceIdentity, WalBranch,
 };
+use walshadow::pos::Pos;
 
 fn ident() -> SourceIdentity {
     SourceIdentity {
         system_id: 7_000_000_000_000_000_001,
         timeline: 3,
-        timeline_begin: Lsn(0x0400_0000),
+        timeline_begin: Pos::new(0x0400_0000),
     }
 }
 
 fn sample() -> Manifest {
     Manifest {
         version: MANIFEST_VERSION,
-        floor: Lsn(0x05),
+        floor: Pos::new(0x05),
         source: ident(),
         wal: WalBranch { stream_timeline: 3 },
         lsn: LsnSet {
-            source_received: Lsn(0x10),
-            filter_durable: Lsn(0x09),
-            shadow_replay: Lsn(0x08),
-            drain: Lsn(0x07),
-            emitter_ack: Lsn(0x06),
-            shadow_flush: Lsn(0x05),
+            source_received: Pos::new(0x10),
+            filter_durable: Pos::new(0x09),
+            shadow_replay: Pos::new(0x08),
+            drain: Pos::new(0x07),
+            emitter_ack: Pos::new(0x06),
+            shadow_flush: Pos::new(0x05),
         },
     }
 }
@@ -58,7 +59,7 @@ async fn write_survives_simulated_crash_during_tmp_phase() {
     // The next clean write recovers — and overwrites the bogus .tmp on
     // its way.
     let mut better = good.clone();
-    better.lsn.emitter_ack = Lsn(0x100);
+    better.lsn.emitter_ack = Pos::new(0x100);
     manifest::write(dir, &better).await.unwrap();
     assert!(
         !tmp_path.exists(),

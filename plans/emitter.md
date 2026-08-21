@@ -214,18 +214,44 @@ source slot recycling) must not. Per seq track rows *placed* (decoder
 routed) and *acked* (inserter drained `EndOfStream`); a seq is done
 once `placed == acked` (rows=0 seqs done at placement). Watermark is
 highest contiguous done seq's `commit_lsn`, published into the
-`emitter_ack` atomic the status loop persists to the manifest
+`emitter_ack` value the status loop persists to the manifest
 
-`Trailing { lsn }` advances past non-commit WAL only when every
-registered seq is done and the xact buffer is empty (reorder's
-`on_idle_advance` guard). A `placed_frontier` watch channel serves the
-barrier's placed-wait. The frontier scan resumes from `placed_frontier`,
-not `next_expected` — the O(N²) re-walk variant pegged the collector
-at 100% CPU and presented as a chc recv/INSERT hang
+Event handlers only update stored state. `AckState::publish` updates the
+watermark, both progress values, and the diagnostic snapshot. `apply`
+calls it after every event. This ensures each event rechecks all
+conditions that can advance progress. Updating these values in separate
+event handlers caused a bug where `Trailing` was ignored if it arrived
+while a seq was still in flight
 
-`emitter_ack` is seeded at the WAL re-read start (`raw_start`), not 0:
-the status loop persists the atomic with no monotonic guard, and a
-zero first write would clobber a resumed manifest
+`Trailing { lsn }` reports how far the pump has read after all buffered
+transactions. Reorder sends it only when the transaction buffer is empty
+(`on_idle_advance`). Collector saves this position and publishes it after
+all registered seqs finish. `Gate<PlacedFrontier>` lets a barrier wait for
+all rows to be routed. `Gate<AckFrontier>` lets it wait for those rows to
+be durable. If collector exits, both waits return an error. Both scans
+continue from their previous stopping point. Starting over for every
+event made this work O(N²), used 100% CPU, and looked like a stuck chc
+receive or INSERT
+
+Each seq records how many rows decoder routed and how many ClickHouse
+acknowledged. Reporting routed count twice or acknowledging more rows than
+routed is an error. Collector counts error instead of leaving seq silently
+incomplete. Events below completed frontier are harmless late messages.
+Events for unknown seqs at or above frontier can leave work incomplete and
+stop watermark. Collector counts these events separately and logs first one
+while seq and frontier details are still available
+
+`AckSnapshot` shows why watermark cannot advance: oldest incomplete seq,
+reported and acknowledged row counts, saved trailing position, protocol
+error count, and late event count. Collector updates snapshot after every
+event, and daemon's stall watchdog reads it. Transaction buffer stats
+cannot diagnose this case after rows have left buffer
+
+`emitter_ack` is a `Monotone<EmitterAck>` seeded at the WAL re-read
+start (`raw_start`), not 0: the status loop persists it and a zero first
+write would overwrite progress loaded from a previous run. Updates use
+`join`, which keeps larger of current and new values, so watermark cannot
+move backward
 
 ### Fatal — `pipeline/mod.rs`
 

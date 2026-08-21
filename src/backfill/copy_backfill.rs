@@ -71,6 +71,7 @@ use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::emit::pipeline::{Fatal, bootstrap, tail};
 use crate::mapping::MappingHandle;
 use crate::pg::{current_wal_lsn, quote_ident};
+use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
@@ -104,7 +105,7 @@ struct LedgerFile {
 struct LedgerEntry {
     namespace: String,
     relname: String,
-    s_lsn: crate::source::manifest::Lsn,
+    s_lsn: Pos<Snapshot>,
     done: bool,
     /// [`InitialLoadMode`] string; absent ⇒ `copy`
     #[serde(default = "default_ledger_mode")]
@@ -129,7 +130,7 @@ fn default_ledger_mode() -> String {
 /// `!done`, or resumes the swap tail while `swapped`.
 #[derive(Debug, Clone)]
 struct LedgerRec {
-    s_lsn: u64,
+    s_lsn: Pos<Snapshot>,
     done: bool,
     mode: InitialLoadMode,
     swapped: bool,
@@ -162,7 +163,7 @@ impl Ledger {
                             (
                                 RelName::new(&e.namespace, &e.relname),
                                 LedgerRec {
-                                    s_lsn: e.s_lsn.0,
+                                    s_lsn: e.s_lsn,
                                     done: e.done,
                                     mode,
                                     swapped: e.swapped,
@@ -204,7 +205,7 @@ impl Ledger {
                 .map(|(rel, rec)| LedgerEntry {
                     namespace: rel.namespace.to_string(),
                     relname: rel.name.to_string(),
-                    s_lsn: crate::source::manifest::Lsn(rec.s_lsn),
+                    s_lsn: rec.s_lsn,
                     done: rec.done,
                     mode: rec.mode.as_str().into(),
                     swapped: rec.swapped,
@@ -653,7 +654,7 @@ impl CopyBackfiller {
                     inner.ledger.entries.insert(
                         rel.clone(),
                         LedgerRec {
-                            s_lsn: opt_in_lsn,
+                            s_lsn: opt_in_lsn.into(),
                             done: false,
                             mode,
                             swapped: false,
@@ -668,7 +669,7 @@ impl CopyBackfiller {
                             "backfill ledger persist failed; a crash before completion re-streams without backfill",
                         );
                     }
-                    (opt_in_lsn, mode)
+                    (opt_in_lsn.into(), mode)
                 }
             };
             if !inner.active.insert(rel.clone()) {
@@ -696,7 +697,7 @@ impl CopyBackfiller {
                 spawn_pass = q.is_empty();
                 q.push(BackupRequest {
                     desc: desc.clone(),
-                    s_lsn,
+                    s_lsn: s_lsn.get(),
                 });
             }
             (s_lsn, mode, spawn_pass, resume)
@@ -898,7 +899,7 @@ impl CopyBackfiller {
     /// or DDL moved the destination shape mid-pass (the loaded copy has the
     /// pre-DDL shape; entry stays pending, next boot re-loads).
     async fn swap_rel(&self, sess: &mut StagingSession, rel: &StagingRel) -> anyhow::Result<bool> {
-        if !self.mapping.read().await.contains_key(&rel.rel) {
+        if !self.mapping.with(|m| m.contains_key(&rel.rel)).await {
             sess.drop_staging(rel).await?;
             tracing::info!(
                 target: "walshadow::backfill",
@@ -966,16 +967,14 @@ impl CopyBackfiller {
     async fn resume_swap_inner(&self, name: &RelName, rec: &LedgerRec) -> anyhow::Result<()> {
         let target = self
             .mapping
-            .read()
+            .with(|m| m.get(name).map(|t| t.target.clone()))
             .await
-            .get(name)
-            .map(|m| m.target.clone())
             .with_context(|| format!("swapped entry {name} unmapped; staging table orphaned"))?;
         let rel = StagingRel {
             rel: name.clone(),
             database: target.database,
             table: target.table,
-            s_lsn: rec.s_lsn,
+            s_lsn: rec.s_lsn.get(),
         };
         let mut sess = StagingSession::connect(self.dest_emitter()).await?;
         match sess.table_uuid(&rel.database, &rel.staging_table()).await? {
@@ -1066,7 +1065,7 @@ impl CopyBackfiller {
         self.refresh_gauges(&inner.ledger);
     }
 
-    async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: u64) {
+    async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: Pos<Snapshot>) {
         let res = self.copy_once(&desc, s_lsn).await;
         let mut inner = self.inner.lock().await;
         inner.active.remove(&desc.rel_name);
@@ -1087,7 +1086,7 @@ impl CopyBackfiller {
                     target: "walshadow::backfill",
                     qname = %desc.rel_name,
                     rows = outcome.rows,
-                    s_lsn = %format_pg_lsn(s_lsn),
+                    s_lsn = %s_lsn,
                     p_hi = %format_pg_lsn(outcome.p_hi),
                     copied = !outcome.skipped_empty,
                     "backfill complete; converged once WAL apply passes p_hi",
@@ -1110,7 +1109,7 @@ impl CopyBackfiller {
     async fn copy_once(
         &self,
         desc: &Arc<RelDescriptor>,
-        s_lsn: u64,
+        s_lsn: Pos<Snapshot>,
     ) -> anyhow::Result<CopyOutcome> {
         let qtable = format!(
             "{}.{}",
@@ -1142,7 +1141,7 @@ impl CopyBackfiller {
             &self.dest_emitter(),
             1,
             self.stats.clone(),
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::pos::Monotone::new(0)),
             fatal.clone(),
             self.config_rx.clone(),
         )
@@ -1202,7 +1201,7 @@ impl CopyBackfiller {
                         xid: 0,
                         xmax: 0,
                         infomask: 0,
-                        source_lsn: s_lsn,
+                        source_lsn: s_lsn.get(),
                         // COPY text rows have no on-page TID (values arrive
                         // detoasted, no chunks flow here)
                         blkno: 0,
@@ -1413,7 +1412,7 @@ mod tests {
         ledger.entries.insert(
             RelName::new("app", "orders"),
             LedgerRec {
-                s_lsn: 0x1000,
+                s_lsn: 0x1000.into(),
                 done: false,
                 mode: InitialLoadMode::Copy,
                 swapped: false,
@@ -1423,7 +1422,7 @@ mod tests {
         ledger.entries.insert(
             RelName::new("app", "done"),
             LedgerRec {
-                s_lsn: 0x800,
+                s_lsn: 0x800.into(),
                 done: true,
                 mode: InitialLoadMode::ObjectStore,
                 swapped: false,
@@ -1433,7 +1432,7 @@ mod tests {
         ledger.entries.insert(
             RelName::new("app", "mid_swap"),
             LedgerRec {
-                s_lsn: 0x2000,
+                s_lsn: 0x2000.into(),
                 done: false,
                 mode: InitialLoadMode::ObjectStore,
                 swapped: true,
@@ -1444,11 +1443,11 @@ mod tests {
 
         let again = Ledger::load(tmp.path()).await;
         let orders = again.entries.get(&RelName::new("app", "orders")).unwrap();
-        assert_eq!((orders.s_lsn, orders.done), (0x1000, false));
+        assert_eq!((orders.s_lsn.get(), orders.done), (0x1000, false));
         assert_eq!(orders.mode, InitialLoadMode::Copy);
         assert!(!orders.swapped);
         let done = again.entries.get(&RelName::new("app", "done")).unwrap();
-        assert_eq!((done.s_lsn, done.done), (0x800, true));
+        assert_eq!((done.s_lsn.get(), done.done), (0x800, true));
         assert_eq!(done.mode, InitialLoadMode::ObjectStore, "mode round-trips");
         let mid = again.entries.get(&RelName::new("app", "mid_swap")).unwrap();
         assert!(mid.swapped, "swap phase round-trips");

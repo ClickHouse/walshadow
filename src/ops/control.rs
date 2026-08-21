@@ -446,11 +446,12 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         ("pause_received_lsn", snap.pause_received_lsn),
         ("target_replay_lsn", snap.promotion_target_replay_lsn),
         ("target_receive_lsn", snap.promotion_target_receive_lsn),
-        ("floor", snap.floor_lsn),
-        ("source_received", snap.source_received_lsn),
-        ("drain", snap.decoder_commit_lsn),
-        ("emitter_ack", snap.emitter_ack_lsn),
-        ("shadow_replay", snap.shadow_replay_lsn),
+        ("floor", snap.floor_lsn.get()),
+        ("source_received", snap.source_received_lsn.get()),
+        ("drain", snap.decoder_commit_lsn.get()),
+        // Live ack, not the manifest's floored `emitter_ack`
+        ("emitter_ack", snap.emitter_ack_lsn.get()),
+        ("shadow_replay", snap.shadow_replay_lsn.get()),
     ] {
         out.insert(key.into(), format_pg_lsn(lsn).to_string().into());
     }

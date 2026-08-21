@@ -32,7 +32,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
@@ -44,6 +43,7 @@ use walshadow::mapping::{ColumnMapping, NamespaceMapping, TableMapping, TableTar
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle, TailKind};
+use walshadow::pos::{EmitterAck, Floor, Monotone};
 use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE};
 use walshadow::schema::RelName;
 use walshadow::segment_sink::DirSegmentSink;
@@ -607,12 +607,12 @@ pub struct Pipeline {
     pub xact_buffer: Arc<Mutex<XactBuffer>>,
     pub chunk_buf: Vec<u8>,
     pub handle: PipelineHandle,
-    pub ack: Arc<AtomicU64>,
+    pub ack: Arc<Monotone<EmitterAck>>,
     /// Persisted-resolved-floor stand-in gating deferred toast-mirror
     /// retires; the daemon's status loop advances it after each manifest
-    /// persist, tests store into it directly. Seeds at the boot head, so
+    /// persist, tests advance it explicitly. Seeds at the boot head, so
     /// retires queued by this run defer until a test advances it.
-    pub resume_floor: Arc<AtomicU64>,
+    pub resume_floor: Arc<Monotone<Floor>>,
     /// Same `EmitterStats` Arc the daemon exports to Prometheus; lets tests
     /// assert the parallel path keeps the emitter counters live.
     pub stats: Arc<EmitterStats>,
@@ -854,13 +854,13 @@ async fn build_pipeline_inner(
         .expect("ddl applicator init")
         .with_resolver(config_resolver.clone());
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
     // Aligned boot head stands in for the daemon's resolved floor (a
     // rebuilt harness re-reads from the segment start, like a daemon
     // restart): retires queued by this run defer until a test advances
     // the floor; ledger entries below a prior run's segment are due and
     // retire in the boot flush below.
-    let resume_floor = Arc::new(AtomicU64::new(WalStream::align_down(
+    let resume_floor = Arc::new(Monotone::<Floor>::new(WalStream::align_down(
         ident.xlogpos,
         WAL_SEG_SIZE,
     )));

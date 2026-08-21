@@ -16,7 +16,6 @@
 mod fx;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
@@ -26,6 +25,7 @@ use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedT
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
+use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
 
 const RFN: RelFileNode = RelFileNode {
@@ -122,7 +122,7 @@ async fn native_numeric_time_timetz_round_trip() {
     });
 
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
     let fatal = Fatal::new();
     let (msg_tx, ack, tail_parts) = tail::spawn(&cfg, 1, stats, emitter_ack, fatal.clone())
         .await
@@ -176,7 +176,7 @@ async fn native_numeric_time_timetz_round_trip() {
         .await
         .expect("send flush");
     reply_rx.await.expect("flush ack");
-    ack.wait_through(1).await;
+    ack.wait_through(1).await.expect("ack collector alive");
     drop(msg_tx);
     drop(ack);
     tail_parts.join().await;

@@ -272,14 +272,7 @@ impl Filter {
         )
     }
 
-    /// Route plus the tracker's [`CatalogSignal`] verdict, stamped on the
-    /// outgoing [`Record`](crate::record::Record) so the decoder worker
-    /// bumps invalidation epochs at its own stream position (a
-    /// pump-position bump would be consumable before pre-DDL records finish
-    /// decoding; see `catalog_tracker` module doc), plus the
-    /// catalog-boundary verdict driving the pump's publication hold and
-    /// descriptor capture. `Err` = malformed commit payload: capture input
-    /// would be silently incomplete, poison the stream.
+    /// Classify route and catalog boundary, reject incomplete commit metadata
     pub fn decide_record(
         &mut self,
         record: &XLogRecord,

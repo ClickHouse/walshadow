@@ -18,7 +18,7 @@
 //!   TRUNCATE carries no `_lsn`, so only correct ordering against the
 //!   surrounding inserts yields the right surviving set.
 //!
-//! Both assert the durable watermark (ack-collector atomic) advanced, so
+//! Both assert ack collector's watermark advanced, so
 //! the barrier fence reached durable rather than hanging.
 
 #![cfg(target_os = "linux")]
@@ -194,7 +194,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
     );
 
     assert!(
-        ack.load(Ordering::Acquire) > 0,
+        ack.get() > 0,
         "durable watermark advanced through the barrier",
     );
 }
@@ -353,7 +353,7 @@ async fn parallel_pipeline_truncate_orders_after_data() {
     );
 
     assert!(
-        ack.load(Ordering::Acquire) > 0,
+        ack.get() > 0,
         "durable watermark advanced through the barrier",
     );
 }

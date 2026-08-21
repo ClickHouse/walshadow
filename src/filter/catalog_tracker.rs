@@ -95,9 +95,7 @@ pub struct CatalogTracker {
     /// non-mapped catalog (pg_depend, pg_namespace, …).
     pg_class_writes_oid_in_prefix: u64,
     seeded_from_source: u64,
-    /// Non-`None` verdicts returned by `observe`; catalog's
-    /// `generation_bumps` may lag as it collapses bumps between lookups
-    /// into one `invalidate`.
+    /// Coarse invalidations, including writes without decoded OID
     invalidation_signals_sent: u64,
 }
 
@@ -198,10 +196,7 @@ impl CatalogTracker {
         self.nodes.contains(&(db_node, rel_node)) || self.nodes.contains(&(0, rel_node))
     }
 
-    /// Filters internally on rmgr + info; safe to call unconditionally.
-    /// Returned verdict rides the record to the decoder worker, which
-    /// bumps invalidation epochs at its own stream position (see module
-    /// doc).
+    /// Observe catalog database and decoded user relation OID when present
     pub fn observe(&mut self, record: &XLogRecord) -> Observation {
         let rm = record.header.resource_manager_id;
         let info_high = record.header.info & 0xF0;
@@ -236,11 +231,7 @@ impl CatalogTracker {
         Observation::default()
     }
 
-    /// Coarse-fire (no row decode) when a record hits the current
-    /// pg_class filenode, for ops the harvest path skips (DELETE). The
-    /// `InvalidateSweep` verdict arms the DROP sweep at the worker
-    /// ([`PendingSweeps`], keyed by the record's xid). Returns the written
-    /// pg_class's database
+    /// Invalidate pg_class writes skipped by row decoder, such as DELETE
     fn signal_pg_class_touch(&mut self, record: &XLogRecord) -> Option<u32> {
         let (db, _rel) = self.pg_class_block(record)?;
         self.invalidation_signals_sent += 1;

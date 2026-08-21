@@ -310,7 +310,13 @@ when apply advances. Bulk WAL keeps the batching tick: waking per enqueue
 costs more in listener/pump lock traffic than the latency is worth, and
 only a hold needs bytes out early. `poll_interval` stays as the backstop
 that paces the deadline and worker-liveness checks, so a lost wake
-degrades to polling rather than hanging. What remains is shadow's
+degrades to polling rather than hanging. Polling is also required because
+reported progress is the lowest position across all walreceivers. Adding a
+walreceiver can lower that position, and removing one can raise it. Both
+changes now wake the waiter, but waiter must still read current minimum
+before releasing hold. Hold checks this value first, requests one status
+update before each wait, and includes progress seen by final check in timeout
+error. What remains is shadow's
 own replay — sub-millisecond warm, ~10ms for the first catalog record
 after an idle period. Waiter is result-bearing:
 decoder-worker death (`QueueingRecordSink::worker_alive`, channel

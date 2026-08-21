@@ -51,7 +51,7 @@ pub async fn drain(
 ) -> Result<BootstrapDrainOutcome, String> {
     // Routes frozen once per pass from the caller's config snapshot
     let routes: HashMap<_, _> = mapping_handle
-        .read()
+        .snapshot()
         .await
         .iter()
         .map(|(name, mapping)| {
@@ -357,7 +357,6 @@ mod tests {
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use crate::toast::MemChunkStore;
     use ahash::{HashMap, HashMapExt};
-    use std::sync::atomic::AtomicU64;
     use walrus::pg::walparser::RelFileNode;
 
     fn rel(rel_node: u32) -> Arc<RelDescriptor> {
@@ -546,7 +545,7 @@ mod tests {
         tables.insert(RelName::new("public", "t16401"), mapping_for(16401));
         let mapping = crate::mapping::mapping_handle(tables);
 
-        let emitter_ack = Arc::new(AtomicU64::new(0));
+        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
@@ -600,7 +599,7 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), mapping_for(16400));
         let mapping = crate::mapping::mapping_handle(tables);
 
-        let emitter_ack = Arc::new(AtomicU64::new(0));
+        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
@@ -648,7 +647,7 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = crate::mapping::mapping_handle(tables);
 
-        let emitter_ack = Arc::new(AtomicU64::new(0));
+        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
@@ -707,7 +706,7 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = crate::mapping::mapping_handle(tables);
 
-        let emitter_ack = Arc::new(AtomicU64::new(0));
+        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
@@ -769,7 +768,7 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = crate::mapping::mapping_handle(tables);
 
-        let emitter_ack = Arc::new(AtomicU64::new(0));
+        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
@@ -798,10 +797,12 @@ mod tests {
             None,
         ));
         // Wait for the referrer to defer, then unmap before walk EOF
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while stats.bootstrap_deferred_bytes.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline, "referrer deferred");
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        Arc::make_mut(&mut *mapping.write().await).clear();
+        mapping.mutate(|m| Arc::make_mut(m).clear()).await;
         drop(tup_tx);
 
         let mut rows = Vec::new();

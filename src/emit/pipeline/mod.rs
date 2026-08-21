@@ -21,10 +21,9 @@ pub mod reorder;
 pub mod tail;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 
 use crate::catalog::shadow_catalog::ShadowCatalog;
@@ -34,16 +33,19 @@ use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::mapping::MappingHandle;
 use crate::ops::oracle::Oracle;
 use crate::ops::trace::TxnSpanRegistry;
+use crate::pos::{EmitterAck, Floor, Monotone};
 use crate::xact::xact_buffer::{SubxactTracker, XactBuffer};
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls
 /// [`Fatal::message`] to exit with the root cause; the DDL barrier `select`s
 /// on [`Fatal::wait`] so a CH outage mid-barrier surfaces instead of hanging.
-#[derive(Clone, Default)]
-pub struct Fatal {
-    flag: Arc<AtomicBool>,
-    msg: Arc<std::sync::Mutex<Option<String>>>,
-    notify: Arc<Notify>,
+#[derive(Clone)]
+pub struct Fatal(Arc<watch::Sender<Option<String>>>);
+
+impl Default for Fatal {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(None).0))
+    }
 }
 
 impl Fatal {
@@ -54,37 +56,28 @@ impl Fatal {
     /// Record the first message (root cause) and wake every waiter; later
     /// calls keep the first.
     pub fn set(&self, msg: String) {
-        {
-            let mut slot = self.msg.lock().expect("fatal slot poisoned");
-            if slot.is_none() {
-                tracing::error!(target: "walshadow::pipeline", error = %msg, "pipeline fatal");
-                *slot = Some(msg);
+        self.0.send_if_modified(|slot| {
+            if slot.is_some() {
+                return false;
             }
-        }
-        self.flag.store(true, Ordering::Release);
-        self.notify.notify_waiters();
+            tracing::error!(target: "walshadow::pipeline", error = %msg, "pipeline fatal");
+            *slot = Some(msg);
+            true
+        });
     }
 
     pub fn is_set(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
+        self.0.borrow().is_some()
     }
 
     pub fn message(&self) -> Option<String> {
-        self.msg.lock().expect("fatal slot poisoned").clone()
+        self.0.borrow().clone()
     }
 
-    /// Resolve once the flag is set (now or later).
+    /// Resolve once the flag is set (now or later). Holding the sender keeps
+    /// the channel open, so this never resolves unset.
     pub async fn wait(&self) {
-        loop {
-            let notified = self.notify.notified();
-            if self.is_set() {
-                return;
-            }
-            notified.await;
-            if self.is_set() {
-                return;
-            }
-        }
+        let _ = self.0.subscribe().wait_for(Option::is_some).await;
     }
 }
 
@@ -135,7 +128,7 @@ pub struct PipelineConfig {
     pub retires: crate::toast::toast_retire::RetireLedger,
     /// Persisted resolved floor (aligned, archive-clamped), seeded at the
     /// resolved start; pruners cut against it verbatim
-    pub resume_floor: Arc<AtomicU64>,
+    pub resume_floor: Arc<Monotone<Floor>>,
     /// Shared resident-payload pool ([`build_budget`]); backup passes run
     /// concurrently with the pipeline and must draw from the same pool.
     /// `None` builds one at spawn
@@ -147,9 +140,10 @@ pub struct PipelineConfig {
 /// that sink drops the job queue closes and [`PipelineHandle::join`] drains
 /// the rest in order.
 pub struct PipelineHandle {
-    /// Durable watermark (contiguous-done commit_lsn). Pump advertises it as
-    /// the standby `apply_lsn` and writes it to the resume cursor.
-    pub emitter_ack: Arc<AtomicU64>,
+    /// Live contiguous-done watermark, floored before manifest persistence
+    pub emitter_ack: Arc<Monotone<EmitterAck>>,
+    /// Expose stalls after rows leave transaction buffer
+    pub ack_probe: tokio::sync::watch::Receiver<ack::AckSnapshot>,
     pub fatal: Fatal,
     pub toast: crate::toast::ToastResolver,
     /// Global resident-payload pool, exposed for the metrics loop
@@ -180,7 +174,7 @@ impl PipelineConfig {
     /// only if an inserter connection can't open.
     pub async fn spawn(
         self,
-        emitter_ack: Arc<AtomicU64>,
+        emitter_ack: Arc<Monotone<EmitterAck>>,
     ) -> Result<(reorder::ReorderSink, PipelineHandle), EmitterError> {
         let PipelineConfig {
             emitter,
@@ -247,6 +241,7 @@ impl PipelineConfig {
             resolver: resolver.clone(),
             chunk_rows: emitter.decode_chunk_rows,
         };
+        let ack_probe = ack.probe();
         let decoders = decode::spawn_pool(m, ctx, jobs_rx, ack.clone(), fatal.clone());
 
         let plan_dir = buffer.lock().await.spill_dir().to_path_buf();
@@ -281,6 +276,7 @@ impl PipelineConfig {
             reorder,
             PipelineHandle {
                 emitter_ack,
+                ack_probe,
                 fatal,
                 toast: resolver,
                 budget,

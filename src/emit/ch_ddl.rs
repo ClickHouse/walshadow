@@ -34,8 +34,8 @@ use crate::ch::{
 use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
 use crate::mapping::{
-    DropTableStrategy, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
-    derive_columns_for_mapping, fold_diff_into_mapping,
+    ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping,
+    TableMapping, TableTarget, derive_columns_for_mapping, fold_diff_into_mapping,
 };
 use crate::schema::{RelDescriptor, RelName, SchemaDiff, SchemaEvent, replident_key_attnums};
 use ahash::{HashMap, HashSet, HashSetExt};
@@ -125,11 +125,6 @@ pub struct DdlApplicator {
     /// half-open CH socket can't park the reorder barrier past this
     query_timeout: Duration,
     last_used: std::time::Instant,
-    /// Decode-pool `RelCache`s key mapping snapshots on this epoch, but it
-    /// bumps when the DDL record passes the decoder worker, before the
-    /// barrier mutates the mapping here. Bump again on every mapping write
-    /// so a worker whose refresh consumed the record-time bump drops its
-    /// pre-apply snapshot
     /// Owner of runtime-derived mapping state. Set: auto-created mappings,
     /// diff folds, and DROP forgets record into the resolver so the
     /// republish full-swap preserves them. Unset (bootstrap drain, tests
@@ -323,7 +318,7 @@ impl DdlApplicator {
         diff: &SchemaDiff,
     ) -> Result<(), EmitterError> {
         let key = new.rel_name.clone();
-        let Some(target) = self.mapping_target(&key).await else {
+        let Some((mapped_at, target)) = self.mapping_target(&key).await else {
             // No target, can't ALTER; `Added` handles the
             // not-yet-learned case
             self.stats.skipped += 1;
@@ -336,15 +331,10 @@ impl DdlApplicator {
             // Operator TOML rename makes the source rename a no-op from
             // CH's POV (TOML still maps src_attnum to the same CH name);
             // detect via whether the CH column name changed
-            let mapping_lookup = self.mapping.read().await;
-            let m = mapping_lookup
-                .get(&key)
-                .expect("just resolved via mapping_target");
-            let _ = old_name;
-            let needs_rename = m.columns.iter().any(|c| &c.target_name == new_name)
-                || !m.columns.iter().any(|c| &c.target_name == old_name);
-            drop(mapping_lookup);
-            if needs_rename {
+            let columns = mapping_columns_at(&self.mapping, &key, &mapped_at).await?;
+            let already_renamed = columns.iter().any(|c| &c.target_name == new_name)
+                || !columns.iter().any(|c| &c.target_name == old_name);
+            if already_renamed {
                 // Pre-declared TOML mapping already encodes the rename
                 continue;
             }
@@ -410,7 +400,7 @@ impl DdlApplicator {
     }
 
     async fn apply_dropped(&mut self, rel: &RelName) -> Result<(), EmitterError> {
-        let Some(target) = self.mapping_target(rel).await else {
+        let Some((_, target)) = self.mapping_target(rel).await else {
             self.stats.skipped += 1;
             return Ok(());
         };
@@ -455,20 +445,23 @@ impl DdlApplicator {
     /// durable) so the truncate orders correctly against inserts despite
     /// the otherwise out-of-order pipeline.
     pub async fn truncate(&mut self, rel: &RelName) -> Result<(), EmitterError> {
-        let Some(target) = self.mapping_target(rel).await else {
+        let Some((_, target)) = self.mapping_target(rel).await else {
             return Ok(());
         };
         self.execute(&format!("TRUNCATE TABLE {}", target.sql()))
             .await
     }
 
-    async fn mapping_target(&mut self, rel: &RelName) -> Option<TableTarget> {
-        let m = self.mapping.read().await;
-        m.get(rel).map(|t| t.target.clone())
+    /// Resolve target against a held snapshot, which later ALTER steps
+    /// re-check for displacement
+    async fn mapping_target(&mut self, rel: &RelName) -> Option<(MappingSnapshot, TableTarget)> {
+        let at = self.mapping.snapshot().await;
+        let target = at.get(rel).map(|t| t.target.clone())?;
+        Some((at, target))
     }
 
     async fn mapping_for(&mut self, rel: &RelName) -> Option<TableMapping> {
-        self.mapping.read().await.get(rel).cloned()
+        self.mapping.with(|m| m.get(rel).cloned()).await
     }
 
     /// Operator opt-out (`replicate=false`); nothing excluded without a
@@ -482,72 +475,43 @@ impl DdlApplicator {
         }
     }
 
-    /// Mapping writes route per `resolver` field: resolver-owned entries
-    /// survive the republish full-swap; resolver-less path mutates the live
-    /// handle directly. Decode workers memoise per job and mapping writes
-    /// land inside the barrier fence, between jobs — no epoch needed
+    /// Route writes through resolver so derived mappings survive republish
     async fn register_mapping(&mut self, rel: &RelName, mapping: TableMapping) {
         if let Some(r) = &self.resolver {
             r.register_derived_mapping(rel, mapping).await;
         } else {
-            Arc::make_mut(&mut *self.mapping.write().await).insert(rel.clone(), mapping);
+            self.mapping
+                .mutate(|m| Arc::make_mut(m).insert(rel.clone(), mapping))
+                .await;
         }
     }
 
-    /// Predict `apply(event)`'s routing-map effect without executing DDL or
-    /// touching shared state, for plan-time route resolution: `None` = map
-    /// unchanged, `Some((rel, Some(m)))` = insert/replace, `Some((rel,
-    /// None))` = remove. Mirrors the apply_added / apply_changed /
-    /// apply_dropped gates; the executor later applies the real effects
     pub async fn predict_route_mapping(
         &mut self,
         event: &SchemaEvent,
+        mapping: &MappingSnapshot,
+        config: Option<&ResolvedConfig>,
     ) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
-        self.refresh_config().await?;
-        match event {
-            SchemaEvent::Added { desc } => {
-                if self.mapping_for(&desc.rel_name).await.is_some()
-                    || self.is_excluded(&desc.rel_name).await
-                    || !self
-                        .config
-                        .auto_create_namespaces
-                        .contains(&*desc.rel_name.namespace)
-                {
-                    return Ok(None);
-                }
-                let target_db = self
-                    .config
-                    .target_database_for(&desc.rel_name.namespace)
-                    .to_owned();
-                if render_create_table(desc, &target_db, self.config.soft_delete)?.is_none() {
-                    return Ok(None);
-                }
-                let target = TableTarget::new(&target_db, &desc.rel_name.name);
-                let columns = derive_columns_for_mapping(desc);
-                Ok(Some((
-                    desc.rel_name.clone(),
-                    Some(TableMapping { target, columns }),
-                )))
+        // Resolver owns opt-outs, frozen routing state does not include them
+        let excluded = match event {
+            SchemaEvent::Added { desc } if !mapping.contains_key(&desc.rel_name) => {
+                self.is_excluded(&desc.rel_name).await
             }
-            SchemaEvent::Changed { new, diff, .. } => {
-                let Some(mut m) = self.mapping_for(&new.rel_name).await else {
-                    return Ok(None);
-                };
-                fold_diff_into_mapping(&mut m, new, diff);
-                Ok(Some((new.rel_name.clone(), Some(m))))
-            }
-            SchemaEvent::Dropped { rel_name, .. } => {
-                if self.mapping_target(rel_name).await.is_none()
-                    || !matches!(
-                        self.config.drop_strategy_for(&rel_name.namespace),
-                        DropTableStrategy::Drop
-                    )
-                {
-                    return Ok(None);
-                }
-                Ok(Some((rel_name.clone(), None)))
-            }
-        }
+            _ => false,
+        };
+        predict_route_effect(&self.plan_config(config), mapping, event, excluded)
+    }
+
+    fn plan_config(&self, frozen: Option<&ResolvedConfig>) -> DdlConfig {
+        frozen
+            .map(|rc| {
+                DdlConfig::from_resolved(
+                    rc,
+                    self.config.target_database.clone(),
+                    self.config.soft_delete,
+                )
+            })
+            .unwrap_or_else(|| self.config.clone())
     }
 
     async fn fold_mapping_diff(&mut self, new: &RelDescriptor, diff: &SchemaDiff) {
@@ -562,7 +526,7 @@ impl DdlApplicator {
         if let Some(r) = &self.resolver {
             r.forget_derived_mapping(rel).await;
         } else {
-            Arc::make_mut(&mut *self.mapping.write().await).remove(rel);
+            self.mapping.mutate(|m| Arc::make_mut(m).remove(rel)).await;
         }
     }
 
@@ -610,16 +574,83 @@ impl DdlApplicator {
     }
 }
 
+/// Predict mapping edit without executing DDL
+///
+/// Return `None` to keep map, `Some((rel, None))` to remove relation
+fn predict_route_effect(
+    cfg: &DdlConfig,
+    mapping: &MappingSnapshot,
+    event: &SchemaEvent,
+    excluded: bool,
+) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
+    match event {
+        SchemaEvent::Added { desc } => {
+            if mapping.contains_key(&desc.rel_name)
+                || excluded
+                || !cfg
+                    .auto_create_namespaces
+                    .contains(&*desc.rel_name.namespace)
+            {
+                return Ok(None);
+            }
+            let target_db = cfg.target_database_for(&desc.rel_name.namespace).to_owned();
+            if render_create_table(desc, &target_db, cfg.soft_delete)?.is_none() {
+                return Ok(None);
+            }
+            let target = TableTarget::new(&target_db, &desc.rel_name.name);
+            let columns = derive_columns_for_mapping(desc);
+            Ok(Some((
+                desc.rel_name.clone(),
+                Some(TableMapping { target, columns }),
+            )))
+        }
+        SchemaEvent::Changed { new, diff, .. } => {
+            let Some(mut m) = mapping.get(&new.rel_name).cloned() else {
+                return Ok(None);
+            };
+            fold_diff_into_mapping(&mut m, new, diff);
+            Ok(Some((new.rel_name.clone(), Some(m))))
+        }
+        SchemaEvent::Dropped { rel_name, .. } => {
+            if !mapping.contains_key(rel_name)
+                || !matches!(
+                    cfg.drop_strategy_for(&rel_name.namespace),
+                    DropTableStrategy::Drop
+                )
+            {
+                return Ok(None);
+            }
+            Ok(Some((rel_name.clone(), None)))
+        }
+    }
+}
+
+/// Reject ALTER continuation after concurrent route republish
+async fn mapping_columns_at(
+    mapping: &MappingHandle,
+    rel: &RelName,
+    at: &MappingSnapshot,
+) -> Result<Vec<ColumnMapping>, EmitterError> {
+    if !mapping.unmoved(at).await {
+        return Err(EmitterError::Config(format!(
+            "routing map for `{rel}` republished mid-ALTER"
+        )));
+    }
+    Ok(at.get(rel).map(|t| t.columns.clone()).unwrap_or_default())
+}
+
 /// Fold a `Changed` diff into the live mapping. Renames touch only entries
 /// whose `target_name` still equals the OLD source name; an operator-pinned
 /// different name is left alone (CH runs no ALTER for it either, see
 /// `apply_changed`)
 async fn mutate_mapping_for_diff(mapping: &MappingHandle, new: &RelDescriptor, diff: &SchemaDiff) {
-    let mut m = mapping.write().await;
-    let Some(target_mapping) = Arc::make_mut(&mut *m).get_mut(&new.rel_name) else {
-        return;
-    };
-    fold_diff_into_mapping(target_mapping, new, diff);
+    mapping
+        .mutate(|m| {
+            if let Some(target_mapping) = Arc::make_mut(m).get_mut(&new.rel_name) {
+                fold_diff_into_mapping(target_mapping, new, diff);
+            }
+        })
+        .await;
 }
 
 /// The fold itself, shared with `ConfigResolver::apply_schema_diff` (the
@@ -1096,10 +1127,10 @@ mod tests {
         assert_eq!(diff.dropped_columns[0], 2);
     }
 
-    #[test]
-    fn mapping_target_returns_pinned_table() {
-        let map: ahash::HashMap<RelName, TableMapping> = [(
-            RelName::new("public", "orders"),
+    fn orders_mapping() -> (RelName, ahash::HashMap<RelName, TableMapping>) {
+        let rel = RelName::new("public", "orders");
+        let map = [(
+            rel.clone(),
             TableMapping {
                 target: TableTarget::new("default", "orders"),
                 columns: vec![ColumnMapping {
@@ -1111,33 +1142,67 @@ mod tests {
         )]
         .into_iter()
         .collect();
+        (rel, map)
+    }
+
+    #[tokio::test]
+    async fn mapping_target_returns_pinned_table() {
+        let (rel, map) = orders_mapping();
         let handle = crate::mapping::mapping_handle(map);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let target = rt.block_on(async {
-            let m = handle.read().await;
-            m.get(&RelName::new("public", "orders"))
-                .map(|t| t.target.clone())
-        });
+        let target = handle.with(|m| m.get(&rel).map(|t| t.target.clone())).await;
         assert_eq!(target, Some(TableTarget::new("default", "orders")));
     }
 
-    #[test]
-    fn mapping_mutation_bumps_invalidation_epoch() {
-        let map: ahash::HashMap<RelName, TableMapping> = [(
-            RelName::new("public", "orders"),
-            TableMapping {
-                target: TableTarget::new("default", "orders"),
-                columns: vec![ColumnMapping {
-                    src_attnum: 1,
-                    target_name: "id".into(),
-                    target_type: "Int32".into(),
-                }],
-            },
-        )]
-        .into_iter()
-        .collect();
+    #[tokio::test]
+    async fn republish_mid_alter_fails_instead_of_panicking() {
+        let (rel, map) = orders_mapping();
+        let handle = crate::mapping::mapping_handle(map);
+        let at = handle.snapshot().await;
+        assert_eq!(
+            mapping_columns_at(&handle, &rel, &at).await.unwrap().len(),
+            1
+        );
+        handle.publish(Arc::new(ahash::HashMap::default())).await;
+        let err = mapping_columns_at(&handle, &rel, &at)
+            .await
+            .expect_err("republish invalidates the resolved target");
+        assert!(matches!(err, EmitterError::Config(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prediction_ignores_a_republish_under_the_frozen_version() {
+        let (rel, map) = orders_mapping();
+        let handle = crate::mapping::mapping_handle(map);
+        let frozen = handle.snapshot().await;
+        handle.publish(Arc::new(ahash::HashMap::default())).await;
+        let cfg = DdlConfig {
+            drop_table_strategy: DropTableStrategy::Drop,
+            auto_create_namespaces: HashSet::new(),
+            target_database: "default".into(),
+            namespaces: ahash::HashMap::default(),
+            soft_delete: false,
+        };
+        let dropped = SchemaEvent::Dropped {
+            oid: 16400,
+            rel_name: rel.clone(),
+        };
+        let predicted = predict_route_effect(&cfg, &frozen, &dropped, false).unwrap();
+        assert!(
+            matches!(predicted, Some((r, None)) if r == rel),
+            "frozen version still maps the rel"
+        );
+        let live = handle.snapshot().await;
+        assert!(
+            predict_route_effect(&cfg, &live, &dropped, false)
+                .unwrap()
+                .is_none(),
+            "live handle moved on"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_fold_adds_column_and_skips_unmapped_rel() {
+        let (_, map) = orders_mapping();
         let handle = crate::mapping::mapping_handle(map);
         let new = desc(
             "orders",
@@ -1153,22 +1218,20 @@ mod tests {
             renamed_columns: vec![],
             type_changes: vec![],
         };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            // Mapped relation: column folded in
-            mutate_mapping_for_diff(&handle, &new, &diff).await;
-            let m = handle.read().await;
-            let cols = &m.get(&RelName::new("public", "orders")).unwrap().columns;
-            assert!(
-                cols.iter()
+        mutate_mapping_for_diff(&handle, &new, &diff).await;
+        let folded = handle
+            .with(|m| {
+                m.get(&RelName::new("public", "orders"))
+                    .unwrap()
+                    .columns
+                    .iter()
                     .any(|c| c.src_attnum == 2 && c.target_name == "c")
-            );
-        });
+            })
+            .await;
+        assert!(folded);
 
         // Unmapped relation: early return
         let ghost = desc("ghost", vec![att(1, "id", INT4OID, true, None)], None);
-        rt.block_on(mutate_mapping_for_diff(&handle, &ghost, &diff));
+        mutate_mapping_for_diff(&handle, &ghost, &diff).await;
     }
 }
