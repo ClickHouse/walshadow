@@ -97,18 +97,21 @@ async fn parallel_pipeline_replicates_dml() {
         ],
     }];
 
-    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
-        tmp: &tmp,
-        source: &source,
-        shadow: &shadow,
-        shadow_filter_dir: &shadow_filter_dir,
-        shadow_stream_state,
-        ch_database: "walshadow_test",
-        ch_tcp_port: slot.ch_tcp,
-        mappings,
-        app_name: "walshadow-pipeline-parallel",
-        ddl: None,
-    })
+    let mut pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings,
+            app_name: "walshadow-pipeline-parallel",
+            ddl: None,
+        },
+        |c| c.replicate_all = false,
+    )
     .await;
 
     // Each `-c` is its own autocommit xact, so every COMMIT lands in the

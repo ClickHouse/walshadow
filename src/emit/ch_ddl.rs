@@ -50,6 +50,9 @@ pub struct DdlConfig {
     /// Namespaces whose `Added` events run `CREATE TABLE IF NOT EXISTS`
     /// automatically (`auto_create = true`)
     pub auto_create_namespaces: HashSet<String>,
+    pub replicate_all: bool,
+    /// Excluded from `replicate_all` so the overlay's `config_*` tables aren't swept in
+    pub runtime_config_schema: Option<String>,
     /// CH database DDL targets when neither per-table mapping nor source
     /// namespace overrides the destination
     pub target_database: String,
@@ -62,13 +65,15 @@ pub struct DdlConfig {
 }
 
 impl DdlConfig {
-    /// Build from a resolved snapshot. `target_database` (`[ch] database`)
-    /// and `soft_delete` are boot-only connection knobs the resolver does
-    /// not republish, so callers thread them through unchanged.
+    /// Build from a resolved snapshot. `target_database`, `soft_delete`,
+    /// `replicate_all` and `runtime_config_schema` are boot-only knobs the
+    /// resolver does not republish, so callers thread them through unchanged.
     pub fn from_resolved(
         resolved: &ResolvedConfig,
         target_database: String,
         soft_delete: bool,
+        replicate_all: bool,
+        runtime_config_schema: Option<String>,
     ) -> Self {
         let auto_create_namespaces: HashSet<String> = resolved
             .namespaces
@@ -81,6 +86,8 @@ impl DdlConfig {
         Self {
             drop_table_strategy,
             auto_create_namespaces,
+            replicate_all,
+            runtime_config_schema,
             target_database,
             namespaces: resolved.namespaces.clone(),
             soft_delete,
@@ -106,6 +113,14 @@ impl DdlConfig {
         self.drop_table_strategy = s;
         self
     }
+}
+
+fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> bool {
+    ns == "pg_catalog"
+        || ns == "information_schema"
+        || ns == "pg_toast"
+        || ns.starts_with("pg_")
+        || runtime_config_schema.is_some_and(|s| !s.is_empty() && s == ns)
 }
 
 /// CH-side DDL writer. Owns one AsyncClient over its own TCP.
@@ -199,6 +214,8 @@ impl DdlApplicator {
                 &snap,
                 self.config.target_database.clone(),
                 self.config.soft_delete,
+                self.config.replicate_all,
+                self.config.runtime_config_schema.clone(),
             );
             let conn = (
                 snap.host.clone(),
@@ -258,11 +275,11 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         }
-        if !self
-            .config
-            .auto_create_namespaces
-            .contains(&*desc.rel_name.namespace)
-        {
+        let ns = &*desc.rel_name.namespace;
+        let auto = self.config.auto_create_namespaces.contains(ns)
+            || (self.config.replicate_all
+                && !is_system_namespace(ns, self.config.runtime_config_schema.as_deref()));
+        if !auto {
             self.stats.skipped += 1;
             return Ok(());
         }
@@ -750,6 +767,18 @@ mod tests {
     use crate::schema::{RelAttr, RelDescriptor, ReplIdent, SchemaDiff};
 
     #[test]
+    fn system_namespaces_excluded_from_replicate_all() {
+        assert!(is_system_namespace("pg_catalog", None));
+        assert!(is_system_namespace("pg_toast", None));
+        assert!(is_system_namespace("information_schema", None));
+        assert!(is_system_namespace("pg_temp_3", None));
+        assert!(!is_system_namespace("public", None));
+        assert!(is_system_namespace("walshadow", Some("walshadow")));
+        assert!(!is_system_namespace("walshadow", Some("")));
+        assert!(!is_system_namespace("public", Some("walshadow")));
+    }
+
+    #[test]
     fn per_namespace_target_and_drop_override_global() {
         use crate::mapping::NamespaceMapping;
         use ahash::{HashMap, HashMapExt};
@@ -773,6 +802,8 @@ mod tests {
         let cfg = DdlConfig {
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
+            replicate_all: false,
+            runtime_config_schema: None,
             target_database: "default".into(),
             namespaces,
             soft_delete: false,
@@ -794,6 +825,8 @@ mod tests {
         let cfg = DdlConfig {
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
+            replicate_all: false,
+            runtime_config_schema: None,
             target_database: "default".into(),
             namespaces: HashMap::new(),
             soft_delete: false,

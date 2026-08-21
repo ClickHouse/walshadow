@@ -12,8 +12,30 @@ docs indexed at [plans/INDEX.md](plans/INDEX.md); for diagrams,
 
 ## Quick start (docker)
 
-End-to-end demo wiring source PG → walshadow → ClickHouse. Step-by-step
-in [docker/DEMO.md](docker/DEMO.md). Short form:
+One command against your source PG (image publishing soon):
+
+```
+docker run --rm \
+    -v walshadow-data:/var/lib/walshadow \
+    -v /etc/walshadow/ch.toml:/etc/walshadow/ch.toml:ro \
+    clickhouse/walshadow \
+    --host source.example --user replicator \
+    --out-dir                   /var/lib/walshadow/wal \
+    --spill-dir                 /var/lib/walshadow/spill \
+    --shadow-socket-dir         /var/run/postgresql \
+    --bootstrap-shadow-data-dir /var/lib/walshadow/shadow \
+    --walsender-bind            127.0.0.1:6510 \
+    --ch-config                 /etc/walshadow/ch.toml
+```
+
+`ch.toml` is just the CH connection block (see [CH emitter
+config](#ch-emitter-config)). walshadow bootstraps its own shadow PG, copies
+every table into ClickHouse, then streams live — no per-table config. See
+[Running standalone](#running-standalone) for the flags.
+
+## Try the demo locally
+
+Full source PG → walshadow → ClickHouse stack (builds from source):
 
 ```
 git submodule update --init --recursive
@@ -21,11 +43,18 @@ docker compose -f docker/docker-compose.yml up --build -d
 docker compose -f docker/docker-compose.yml logs -f walshadow
 ```
 
-Wait for the `shadow caught up to bootstrap end_lsn` line, then drive
-changes on source and read them back from CH (full sequence in
-[docker/DEMO.md](docker/DEMO.md))
+Wait for the `shadow caught up to bootstrap end_lsn` line, then drive a change
+and read it back:
 
-For pgbench with Grafana dashboards plus live schema-change propagation:
+```
+docker compose -f docker/docker-compose.yml exec source \
+    psql -U postgres -c "UPDATE demo.users SET email='new@addr' WHERE id=1"
+docker compose -f docker/docker-compose.yml exec clickhouse \
+    clickhouse-client --query "SELECT id, email FROM demo.users FINAL ORDER BY id"
+```
+
+Full sequence in [docker/DEMO.md](docker/DEMO.md). For pgbench load with
+Grafana dashboards and live schema-change propagation:
 
 ```
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.demo.yml up --build -d
@@ -44,9 +73,95 @@ when any of these fails:
 - every mapped relation has a row key for deletes: a PRIMARY KEY
   (`REPLICA IDENTITY DEFAULT`), `USING INDEX`, or `FULL`. `NOTHING` and
   keyless `DEFAULT` are rejected. `FULL` is accepted, not required
-- `--slot`, if set, names an existing physical replication slot
 
 Skip with `--skip-preflight` only for recovery drills
+
+## Recommended Configurations:
+
+In case of backlog buildup, we need either a physical replication slot or some way to get
+data from a cloud backup location. Otherwise walshadow would crash with "WAl not found error"
+ 
+- `slot`, if set, names an existing physical replication slot
+or
+- `backup`, if set, would pull data from backup location like standby pg
+
+## Running standalone
+
+The easiest path: point the daemon at source PG + an empty data dir and let
+it bootstrap its own shadow. First install the PG module so the shadow can
+preload it (`make -C pgext install`; see [Building](#building-from-source)),
+create the target CH database (walshadow makes tables, not databases), then:
+
+```
+walshadow-stream \
+    --host source.example --user replicator \
+    --out-dir                   /var/lib/walshadow/wal \
+    --spill-dir                 /var/lib/walshadow/spill \
+    --shadow-socket-dir         /var/run/postgresql \
+    --bootstrap-shadow-data-dir /var/lib/walshadow/shadow \
+    --walsender-bind            127.0.0.1:6510 \
+    --ch-config                 /etc/walshadow/ch.toml
+```
+
+with a `ch.toml` that is just the connection block:
+
+```toml
+[ch]
+host = "localhost"
+database = "analytics"
+```
+
+On first boot this base-backups source into the shadow dir, does a direct
+initial copy of **every** table into ClickHouse, then tails changes live. A
+restart resumes from the durable cursor — no re-copy. That's it; no per-table
+config and no separately-managed shadow PG.
+
+Notes:
+- `--walsender-bind` needs an explicit non-zero port for a daemon-owned shadow
+  (it is baked into shadow's `primary_conninfo`).
+- `--bootstrap-shadow-data-dir` must be a new/empty dir; an initialized one
+  resumes instead of re-bootstrapping.
+- Without `--ch-config` the daemon stays metrics-only (no CH emission). Pass
+  `--metrics-bind 127.0.0.1:9484` for a Prometheus scrape endpoint.
+- To manage shadow PG yourself, drop `--bootstrap-shadow-data-dir` (bootstrap
+  defaults to `off` then, streaming only). See `walshadow-stream --help` for
+  the full surface (bootstrap modes, walsender tuning, retention, etc.)
+
+### CH emitter config
+
+`[ch]` connection defaults: `port = 9000`, `user = "default"`, empty
+`password`, `compression = "lz4"`, `secure = false`. With `[stream]
+replicate_all` on (the default) a bare `[ch]` block replicates every user
+table into `[ch] database` with high-throughput batching. To narrow scope:
+
+```toml
+[ch]
+host = "localhost"
+database = "analytics"
+
+# Opt a table out (wins over replicate_all):
+[table."public.audit_log"]
+replicate = false
+
+# Or list explicitly — replicate only what you name:
+[stream]
+replicate_all = false
+[table."public.users"]
+replicate = true
+initial_load = "none"
+target = "users"
+columns = [
+    { attnum = 1, target = "id",    type = "UInt64" },
+    { attnum = 2, target = "name",  type = "String" },
+]
+```
+
+`replicate_all` skips system schemas (`pg_*`, `information_schema`, the
+`[runtime_config]` schema). `attnum` values match `pg_attribute.attnum`
+(1-based) on the source relation; `type` is the CH destination type walshadow
+advertises in the INSERT block. SIGHUP reloads mappings atomically;
+connection params stay boot-only.
+
 
 ## Building from source
 
@@ -80,54 +195,6 @@ writes preload and `walshadow.*` settings for shadows it owns, then requires
 worker socket. `--bridge-socket` defaults to
 `<shadow-socket-dir>/walshadow-bridge.sock`
 
-## Running standalone
-
-Minimum viable invocation against an existing source PG + shadow PG:
-
-```
-walshadow-stream \
-    --host source.example \
-    --user replicator \
-    --out-dir /var/lib/walshadow/wal \
-    --shadow-socket-dir /var/run/postgresql \
-    --spill-dir /var/lib/walshadow/spill \
-    --ch-config /etc/walshadow/ch.toml
-```
-
-Without `--ch-config` the daemon stays metrics-only (no CH emission).
-Pass `--metrics-bind 127.0.0.1:9484` for a Prometheus scrape endpoint.
-See `walshadow-stream --help` for the full surface (bootstrap modes,
-walsender tuning, retention, etc.)
-
-### CH emitter config
-
-TOML, see [docker/ch-config.toml](docker/ch-config.toml) for a minimal
-example. Shape:
-
-```toml
-[ch]
-host = "localhost"
-port = 9000
-database = "default"
-user = "default"
-password = ""
-compression = "lz4"
-
-[table."public.users"]
-replicate = true
-initial_load = "none"
-target = "users"
-columns = [
-    { attnum = 1, target = "id",    type = "UInt64" },
-    { attnum = 2, target = "name",  type = "String" },
-]
-```
-
-`attnum` values match `pg_attribute.attnum` (1-based) on the source
-relation; `type` is the CH destination type walshadow advertises in
-the INSERT block. SIGHUP reloads mappings atomically; connection
-params stay boot-only
-
 ## Testing
 
 ```
@@ -153,13 +220,15 @@ one machine — do not collide
 ## Repository layout
 
 ```
-src/                walshadow daemon + library
+src/                walshadow daemon + library (submodules: emit/ source/ backfill/ decode/ catalog/ …)
 src/bin/            CLI entry points (stream, filter, classify)
 clickhouse-c-rs/    CH-Native client, separate submodule
 pgext/              walshadow decode-bridge PG module (PGXS)
+sql/                runtime-config overlay install SQL
 architecture/       overview + internals diagrams
 plans/              component design docs (overview.md is the baseline)
 docker/             docker-compose demo + Dockerfile
+bench/              throughput / latency benchmark harnesses
 tests/              integration suite
 fixtures/wal/       golden WAL fixtures for offline tests
 ```

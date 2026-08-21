@@ -19,18 +19,22 @@ mkdir -p "$OUT_DIR" "$SPILL_DIR" "$SOCKET_DIR"
 CH_CONFIG="${WALSHADOW_CH_CONFIG:-/etc/walshadow/ch-config.toml}"
 mkdir -p "${CH_CONFIG%.toml}.d"
 
-# Pool sizes default here for the local stack, but the EC2 deploy.sh forwards
-# explicit --decoder-pool-size/--inserter-pool-size via "$@"; clap rejects a
-# flag passed twice, so only inject our defaults when the caller didn't.
+# Pool sizes fall through to the binary's compiled defaults unless overridden
+# via env. clap rejects a flag passed twice, so only inject when the caller
+# (e.g. EC2 deploy.sh via "$@") didn't already pass it.
 POOL_ARGS=()
-case " $* " in
-    *" --decoder-pool-size "*) ;;
-    *) POOL_ARGS+=(--decoder-pool-size "${WALSHADOW_DECODER_POOL:-1}") ;;
-esac
-case " $* " in
-    *" --inserter-pool-size "*) ;;
-    *) POOL_ARGS+=(--inserter-pool-size "${WALSHADOW_INSERTER_POOL:-4}") ;;
-esac
+if [ -n "${WALSHADOW_DECODER_POOL:-}" ]; then
+    case " $* " in
+        *" --decoder-pool-size "*) ;;
+        *) POOL_ARGS+=(--decoder-pool-size "$WALSHADOW_DECODER_POOL") ;;
+    esac
+fi
+if [ -n "${WALSHADOW_INSERTER_POOL:-}" ]; then
+    case " $* " in
+        *" --inserter-pool-size "*) ;;
+        *) POOL_ARGS+=(--inserter-pool-size "$WALSHADOW_INSERTER_POOL") ;;
+    esac
+fi
 case " $* " in
     *" --xact-buffer-max "*) ;;
     *) POOL_ARGS+=(--xact-buffer-max "${WALSHADOW_XACT_BUFFER_MAX:-1073741824}") ;;

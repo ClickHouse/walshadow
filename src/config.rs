@@ -973,7 +973,7 @@ mod tests {
             &OptInState::default(),
             &HashMap::new(),
         );
-        DdlConfig::from_resolved(&r, "db".into(), false).auto_create_namespaces
+        DdlConfig::from_resolved(&r, "db".into(), false, false, None).auto_create_namespaces
     }
 
     #[test]

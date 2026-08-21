@@ -133,7 +133,14 @@ fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<Bootstra
         None => None,
         Some(other) => anyhow::bail!("[bootstrap] mode {other:?} unsupported"),
     };
-    let mode = cli_over_toml(args.bootstrap_mode, toml_mode).unwrap_or(BootstrapMode::Off);
+    // External-shadow (no data dir) can't bootstrap; only default to Direct when
+    // a shadow data dir is configured.
+    let default_mode = if args.bootstrap_shadow_data_dir.is_some() {
+        BootstrapMode::Direct
+    } else {
+        BootstrapMode::Off
+    };
+    let mode = cli_over_toml(args.bootstrap_mode, toml_mode).unwrap_or(default_mode);
     let backup_name = cli_over_toml(
         args.bootstrap_backup_name.clone(),
         toml.and_then(|b| b.backup_name.clone()),
@@ -1495,6 +1502,8 @@ async fn run_session(
             &config_rx.borrow(),
             emitter_cfg.database.clone(),
             emitter_cfg.soft_delete,
+            emitter_cfg.replicate_all,
+            emitter_cfg.runtime_config_schema.clone(),
         );
         let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
             &emitter_cfg,
@@ -4288,6 +4297,8 @@ async fn bootstrap_build_mapping(
         &config_rx.borrow(),
         emitter_cfg.database.clone(),
         emitter_cfg.soft_delete,
+        emitter_cfg.replicate_all,
+        emitter_cfg.runtime_config_schema.clone(),
     );
     let mut applicator =
         walshadow::ch_ddl::DdlApplicator::new(emitter_cfg, ddl_cfg, mapping.clone(), config_rx)
@@ -4888,6 +4899,8 @@ mod tests {
         };
         let off = |d: &str| {
             args_from(&[
+                "--bootstrap-mode",
+                "off",
                 "--bootstrap-shadow-data-dir",
                 d,
                 "--walsender-bind",

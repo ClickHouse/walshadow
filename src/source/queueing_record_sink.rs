@@ -36,16 +36,15 @@ use crate::ops::trace::TxnSpanRegistry;
 use crate::record::{Record, RecordSink, SinkError, rmgr_label};
 
 /// Records batched before a channel send. Amortises per-send overhead
-/// (atomic + alloc + wakeup); 64 lands channel cost near 8ns/record
-/// over the clone-into-owned baseline.
-pub const DEFAULT_QUEUEING_BATCH_SIZE: usize = 64;
+/// (atomic + alloc + wakeup).
+pub const DEFAULT_QUEUEING_BATCH_SIZE: usize = 512;
 
 /// Hard in-flight cap (channel batches + pump buffer). The channel is bounded
 /// at `max_records / batch_size`, so past it the pump's `send` blocks — real
 /// backpressure to the source instead of unbounded RAM growth. Deadlock-safe:
 /// shadow is fed by an independent walsender task (+keepalive), so a parked
 /// pump can't starve `wait_for_replay`.
-pub const DEFAULT_QUEUEING_RECORD_SINK_CAPACITY: usize = 16_384;
+pub const DEFAULT_QUEUEING_RECORD_SINK_CAPACITY: usize = 131_072;
 
 /// Worker `on_idle` cadence. Lets CH emitter's hold-INSERT-open
 /// deadline fire shortly after `flush_timeout` without piling on

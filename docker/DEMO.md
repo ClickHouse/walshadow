@@ -11,7 +11,7 @@ Five services from the base stack plus a demo tier:
 |---|---|
 | `source` | postgres:18, `wal_level=logical`, seeds `demo.users` + pgbench TPC-B schema (`REPLICA IDENTITY FULL`) |
 | `walshadow` | daemon: in-container daemon-owned shadow PG + WAL→CH stream, `/metrics` on :9484 |
-| `clickhouse` | destination, `demo.*` tables pre-created |
+| `clickhouse` | destination; only the `demo` database is pre-created, walshadow auto-creates the tables |
 | `pgbench` | hammers `source` with the TPC-B workload |
 | `postgres-exporter` | source PG stats (TPS, tuple rates) → Prometheus |
 | `prometheus` | scrapes walshadow + postgres-exporter |
@@ -102,10 +102,10 @@ source TPS line with the lag shown in section 3.
 
 ## 4. Drive a row change, then evolve the schema (live)
 
-`demo.users` is tiny, pinned in the emitter config to exactly `id` /
-`name` / `email`, and untouched by pgbench — so it's the clean stage for
-showing CDC and live DDL replication while the hammer roars in the
-background.
+`demo.users` is tiny, has just `id` / `name` / `email`, and is untouched
+by pgbench — so it's the clean stage for showing CDC and live DDL
+replication while the hammer roars in the background. walshadow
+auto-created it and copied its rows at bootstrap (`replicate_all`).
 
 **Beat 1 — a row change rides the stream.** Update a row on the source
 and read it back from ClickHouse:
@@ -118,12 +118,7 @@ $dc exec clickhouse clickhouse-client --query \
     "SELECT id, email, _lsn FROM demo.users FINAL ORDER BY id"
 ```
 
-Row 1's email updates; its `_lsn` advances — CDC in flight. Pure
-demonstration now: walshadow seeds each pinned relation's column baseline
-at startup, so Beat 2's schema change replicates even if you skip this
-beat. (Pre-seed this row change was load-bearing — a pinned table needed
-one DML before an `ALTER` read as *column added* rather than *new table*,
-since operator-pinned tables are assumed CH-managed on first sight.)
+Row 1's email updates; its `_lsn` advances — CDC in flight.
 
 **Beat 2 — the schema evolves.** Add a column on the source and watch
 walshadow replicate the DDL to ClickHouse — no config edit, no restart:

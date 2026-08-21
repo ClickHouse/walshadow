@@ -56,9 +56,9 @@ pub(crate) const OP_INSERT: i8 = 1;
 pub(crate) const OP_UPDATE: i8 = 2;
 pub(crate) const OP_DELETE: i8 = 3;
 
-/// Default block accumulator budgets. Mirror common CH server defaults
-pub(crate) const DEFAULT_ROW_BUDGET: usize = 65_536;
-pub(crate) const DEFAULT_BYTE_BUDGET: usize = 1 << 20; // 1 MiB
+/// Default block accumulator budgets.
+pub(crate) const DEFAULT_ROW_BUDGET: usize = 4_194_304;
+pub(crate) const DEFAULT_BYTE_BUDGET: usize = 256 << 20; // 256 MiB
 
 /// Default commit-drain slice budgets
 /// ([`crate::xact::xact_buffer::CommittedDrain::next_batch`]). Bytes sized at
@@ -68,13 +68,10 @@ pub(crate) const DEFAULT_DRAIN_BATCH_ROWS: usize = 65_536;
 pub(crate) const DEFAULT_DRAIN_BATCH_BYTES: usize = 32 << 20; // 32 MiB
 pub(crate) const DEFAULT_PLAN_DISK_MAX: u64 = 8 << 30; // 8 GiB
 
-/// Default flush timeout (ms). `0` keeps serial emitter's
-/// close-INSERT-on-every-xact-end behaviour (bootstrap backfill only);
-/// live pipeline substitutes a 100ms partial-batch deadline for `0` so
-/// cold tables can't pin the watermark. Positive value holds INSERTs
-/// open across xacts, seals on a deadline armed at first row of a fresh
-/// INSERT.
-pub(crate) const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 0;
+/// Default flush timeout (ms). Holds INSERTs open across xacts, sealing on a
+/// deadline armed at the first row of a fresh INSERT. An explicit `0` keeps the
+/// serial emitter's close-on-every-xact behaviour (bootstrap backfill).
+pub(crate) const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 1000;
 
 /// Rows one decode worker coalesces before routing
 pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
@@ -120,6 +117,9 @@ pub struct EmitterConfig {
     /// `[stream] paused`: pump idles (stops consuming source WAL) when true.
     /// Live via reload.
     pub paused: bool,
+    /// `[stream] replicate_all` (default true): replicate every user table in
+    /// non-system namespaces. Per-table `replicate = false` still opts out.
+    pub replicate_all: bool,
     /// Pending capture cost controls, boot-only
     pub pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
     /// Per-namespace defaults keyed on PG schema name; per-table
@@ -263,8 +263,8 @@ fn parse_bootstrap(tbl: &toml::value::Table) -> Result<BootstrapSettings, Emitte
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 64 << 20;
 
-pub const DEFAULT_DECODER_POOL: usize = 1;
-pub const DEFAULT_INSERTER_POOL: usize = 4;
+pub const DEFAULT_DECODER_POOL: usize = 3;
+pub const DEFAULT_INSERTER_POOL: usize = 3;
 
 pub(crate) const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
@@ -307,6 +307,7 @@ impl Default for EmitterConfig {
             table_initial_loads: HashMap::new(),
             table_opt_ins: HashMap::new(),
             paused: false,
+            replicate_all: true,
             pending_capture: Default::default(),
             namespaces: HashMap::new(),
             drop_table_strategy: "retain".into(),
@@ -634,6 +635,9 @@ impl EmitterConfig {
         if let Some(st) = root.get("stream").and_then(Value::as_table) {
             if let Some(v) = st.get("paused").and_then(Value::as_bool) {
                 out.paused = v;
+            }
+            if let Some(v) = st.get("replicate_all").and_then(Value::as_bool) {
+                out.replicate_all = v;
             }
             if let Some(v) = st
                 .get("pending_max_boundaries_per_xact")
@@ -1814,6 +1818,27 @@ mod tests {
     use super::*;
     use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple};
     use walrus::pg::walparser::RelFileNode;
+
+    #[test]
+    fn defaults_match_high_throughput_profile() {
+        let c = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").expect("parses");
+        assert_eq!(c.row_budget, 4_194_304);
+        assert_eq!(c.byte_budget, 256 << 20);
+        assert_eq!(c.flush_timeout, Duration::from_millis(1000));
+        assert_eq!(c.decoder_pool_size, 3);
+        assert_eq!(c.inserter_pool_size, 3);
+        assert_eq!(c.decoder_batch_size, 512);
+        assert_eq!(c.decoder_queue_capacity, 131_072);
+        assert!(c.replicate_all);
+    }
+
+    #[test]
+    fn replicate_all_disabled_via_stream_flag() {
+        let c =
+            EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n[stream]\nreplicate_all = false\n")
+                .expect("parses");
+        assert!(!c.replicate_all);
+    }
 
     #[test]
     fn decimal_type_error_wraps_message_in_type_variant() {

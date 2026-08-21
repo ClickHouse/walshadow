@@ -1,16 +1,17 @@
 # walshadow demo. Three services:
 #   source     — postgres:18 with wal_level=logical, demo.users seeded
 #                via init script, REPLICA IDENTITY FULL set
-#   clickhouse — clickhouse-server with the demo.users destination
-#                table pre-created
-#   walshadow  — custom image carrying walshadow-stream + the
-#                walshadow PG extension. Boots an in-container shadow
-#                PG via --bootstrap-mode=direct on empty volume, resumes it
-#                on later starts, then streams source WAL into clickhouse
+#   clickhouse — clickhouse-server; only the demo database is pre-created,
+#                walshadow auto-creates the tables (replicate_all, on by default)
+#   walshadow  — custom image carrying walshadow-stream + the walshadow PG
+#                extension. Boots an in-container shadow PG on the empty volume,
+#                copies every source table into clickhouse, then streams live;
+#                resumes from the cursor on later starts
 #
 # Quick start (from repo root):
 #   git submodule update --init --recursive
 #   docker compose -f docker/docker-compose.yml up --build
+#   docker compose -f docker/docker-compose.yml logs -f walshadow   # wait for bootstrap
 #
 # Drive the pipeline:
 #   docker compose -f docker/docker-compose.yml exec source \
