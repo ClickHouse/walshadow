@@ -30,6 +30,7 @@ pub mod fs;
 pub mod mapping;
 pub mod ops;
 pub mod pg;
+pub mod pos;
 pub mod record;
 pub mod runtime_config;
 pub mod schema;

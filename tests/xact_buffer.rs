@@ -30,6 +30,7 @@ use walshadow::heap_decoder::{
     ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
 };
 use walshadow::pg::socket_conninfo;
+use walshadow::pos::Pos;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 use walshadow::spill::ToastChunk;
@@ -709,7 +710,7 @@ async fn abort_drops_xact_and_unlinks_spill_against_real_shadow() {
         .unwrap();
     }
     assert!(b.stats().spill_xacts_active >= 1);
-    b.abort(11, 200, &[]).await.unwrap();
+    b.abort(11, Pos::new(200), &[]).await.unwrap();
     let leftover: Vec<_> = std::fs::read_dir(&spill_dir)
         .unwrap()
         .filter_map(|e| e.ok())

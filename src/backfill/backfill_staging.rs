@@ -83,7 +83,8 @@ pub async fn prepare(
     reqs: &[BackupRequest],
 ) -> Result<StagingPlan> {
     let mut sess = StagingSession::connect(emitter).await?;
-    let live_map = live.read().await.clone();
+    // Freeze routing for entire staging plan
+    let live_map = live.snapshot().await;
     let mut staged: HashMap<RelName, TableMapping> = HashMap::new();
     let mut rels = Vec::new();
     for r in reqs {

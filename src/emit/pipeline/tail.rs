@@ -12,7 +12,6 @@
 //! collector exits.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use clickhouse_c::Allocator;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -25,6 +24,7 @@ use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::emit::pipeline::inserter;
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
+use crate::pos::{EmitterAck, Monotone};
 use ahash::{HashMap, HashMapExt};
 
 /// Spawned tail stages; holding this keeps the tasks owned by the caller.
@@ -63,17 +63,20 @@ impl TailParts {
                 .message()
                 .unwrap_or_else(|| "tail closed before flush".into()));
         }
+        // Prefer concurrent fatal over successful completion
         tokio::select! {
-            r = reply_rx => r.map_err(|_| "batcher dropped flush ack".to_string())?,
+            biased;
             _ = fatal.wait() => {
                 return Err(fatal.message().unwrap_or_else(|| "tail fatal during flush".into()));
             }
+            r = reply_rx => r.map_err(|_| "batcher dropped flush ack".to_string())?,
         }
         tokio::select! {
-            _ = ack.wait_through(through) => {}
+            biased;
             _ = fatal.wait() => {
                 return Err(fatal.message().unwrap_or_else(|| "tail fatal during drain".into()));
             }
+            r = ack.wait_through(through) => r.map_err(|e| format!("tail drain: {e}"))?,
         }
         drop(msg_tx);
         drop(ack);
@@ -94,7 +97,7 @@ pub async fn spawn(
     emitter: &EmitterConfig,
     inserter_pool_size: usize,
     stats: Arc<EmitterStats>,
-    emitter_ack: Arc<AtomicU64>,
+    emitter_ack: Arc<Monotone<EmitterAck>>,
     fatal: Fatal,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
     spawn_with_config(emitter, inserter_pool_size, stats, emitter_ack, fatal, None).await
@@ -105,7 +108,9 @@ pub async fn spawn(
 /// drop) so nothing can pin the watermark; `FlushAll` replies
 /// immediately — nothing buffers. Keeps the placed/acked protocol
 /// identical to the CH tail, so reorder/decode stages run unchanged.
-pub fn spawn_null(emitter_ack: Arc<AtomicU64>) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
+pub fn spawn_null(
+    emitter_ack: Arc<Monotone<EmitterAck>>,
+) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
     let (ack, collector) = ack::spawn(emitter_ack);
     let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let swallow_ack = ack.clone();
@@ -144,7 +149,7 @@ pub async fn spawn_with_config(
     emitter: &EmitterConfig,
     inserter_pool_size: usize,
     stats: Arc<EmitterStats>,
-    emitter_ack: Arc<AtomicU64>,
+    emitter_ack: Arc<Monotone<EmitterAck>>,
     fatal: Fatal,
     config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {

@@ -147,9 +147,7 @@ async fn parallel_pipeline_replicates_dml() {
         .expect("shadow replay catches up");
     assert!(observed >= target);
 
-    // The pipeline's durable watermark lives in the ack-collector atomic;
-    // capture it (and the emitter counters) before `shutdown` consumes the
-    // pipeline.
+    // Capture shared diagnostics before `shutdown` consumes pipeline
     let ack = pipeline.ack.clone();
     let stats = pipeline.stats.clone();
 
@@ -213,10 +211,7 @@ async fn parallel_pipeline_replicates_dml() {
 
     // Every dispatched seq drained, so the contiguous-done watermark
     // advanced past its initial 0.
-    assert!(
-        ack.load(std::sync::atomic::Ordering::Acquire) > 0,
-        "durable watermark advanced",
-    );
+    assert!(ack.get() > 0, "durable watermark advanced",);
 
     // Emitter Prometheus counters stay live on the parallel path (reorder
     // bumps xacts per commit; inserters bump rows/blocks post-EndOfStream).
@@ -433,7 +428,7 @@ async fn parallel_pipeline_slices_multi_batch_commit() {
         "cross-slice detoast rehydrated the unchanged-toast UPDATE",
     );
     assert!(
-        ack.load(std::sync::atomic::Ordering::Acquire) > 0,
+        ack.get() > 0,
         "final-slice publication advanced the durable watermark",
     );
 }

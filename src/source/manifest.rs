@@ -40,8 +40,8 @@
 //! * `shadow_replay`: shadow PG's `pg_last_wal_replay_lsn()`
 //! * `drain`: highest commit-record LSN drained out of the xact buffer.
 //!   Strictly higher than `emitter_ack`.
-//! * `emitter_ack`: highest commit-record LSN durably acked by the
-//!   pipeline's contiguous-done watermark. Slot-advance ceiling.
+//! * `emitter_ack`: [`ResumeSafe`], not the live ack behind
+//!   `walshadow_emitter_ack_lsn`. Slot-advance ceiling.
 //! * `shadow_flush`: min `flush_lsn` from inbound `'r'` standby status
 //!   across active shadow streaming connections. On restart, resume
 //!   position walsender hands shadow via `START_REPLICATION PHYSICAL
@@ -55,10 +55,13 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use walrus::pg::backup::{format_pg_lsn, parse_pg_lsn};
 
+use crate::pos::{
+    Drain, FilterDurable, Floor, Pos, ResumeSafe, ShadowFlush, ShadowReplay, SourceReceived,
+    Switchpoint,
+};
 use crate::record::WAL_SEG_SIZE;
 use crate::source::wal_stream::WalStream;
 
@@ -69,23 +72,6 @@ pub const MANIFEST_FILENAME: &str = "manifest.toml";
 // cannot be resumed against (decode would read uncovered intervals); the
 // version gate turns that into a deterministic upgrade failure.
 pub const MANIFEST_VERSION: u32 = 2;
-
-/// LSN persisted in postgres `pg_lsn` text form (`1A/2B3C4D5E`).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Lsn(pub u64);
-
-impl Serialize for Lsn {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(&format_pg_lsn(self.0))
-    }
-}
-
-impl<'de> Deserialize<'de> for Lsn {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        parse_pg_lsn(&s).map(Lsn).map_err(serde::de::Error::custom)
-    }
-}
 
 /// Artifact ownership plus the branch the floor sits on. The system identifier
 /// gates every nonvolatile spill-dir artifact: reusing a spill dir against a
@@ -110,7 +96,7 @@ pub struct SourceIdentity {
     /// a live identity off `IDENTIFY_SYSTEM` has parsed no history to place
     /// itself with, and an on-disk manifest may carry no switchpoint at all.
     #[serde(default)]
-    pub timeline_begin: Lsn,
+    pub timeline_begin: Pos<Switchpoint>,
 }
 
 /// Branch the pump is reading, which runs ahead of
@@ -123,12 +109,13 @@ pub struct WalBranch {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LsnSet {
-    pub source_received: Lsn,
-    pub filter_durable: Lsn,
-    pub shadow_replay: Lsn,
-    pub drain: Lsn,
-    pub emitter_ack: Lsn,
-    pub shadow_flush: Lsn,
+    pub source_received: Pos<SourceReceived>,
+    pub filter_durable: Pos<FilterDurable>,
+    pub shadow_replay: Pos<ShadowReplay>,
+    pub drain: Pos<Drain>,
+    /// Resume-safe ack, TOML key retained for compatibility
+    pub emitter_ack: Pos<ResumeSafe>,
+    pub shadow_flush: Pos<ShadowFlush>,
 }
 
 /// Scalars precede tables (TOML emit constraint): `version`/`floor`
@@ -138,7 +125,7 @@ pub struct Manifest {
     pub version: u32,
     /// Resume LSN = decode floor = GC cut. Segment-aligned,
     /// archive-clamped at write time via [`resolved_floor`].
-    pub floor: Lsn,
+    pub floor: Pos<Floor>,
     pub source: SourceIdentity,
     /// Absent in manifests written before timeline crossing landed; those runs
     /// never left the floor's branch, so the floor timeline is also the stream's
@@ -179,8 +166,14 @@ pub fn manifest_path(spill_dir: &Path) -> PathBuf {
 /// crash-durable lower bound on the sealed archive end — so the archive
 /// clamp folds in at write time. Restart resumes at this floor and every
 /// pruner cuts against it: cut ≤ resume by construction, never by test.
-pub fn resolved_floor(emitter_ack: u64, filter_durable: u64) -> u64 {
-    WalStream::align_down(emitter_ack, WAL_SEG_SIZE).min(filter_durable)
+pub fn resolved_floor(
+    emitter_ack: impl Into<Pos<ResumeSafe>>,
+    filter_durable: impl Into<Pos<FilterDurable>>,
+) -> Pos<Floor> {
+    Pos::new(
+        WalStream::align_down(emitter_ack.into().get(), WAL_SEG_SIZE)
+            .min(filter_durable.into().get()),
+    )
 }
 
 /// Stream-start selection.
@@ -195,22 +188,23 @@ pub fn resolved_floor(emitter_ack: u64, filter_durable: u64) -> u64 {
 /// live ack by up to one status interval); slot errors surface at
 /// START_REPLICATION, same exposure as the boot-scan clamp had.
 pub fn resolve_start(
-    raw_start: u64,
-    floor: Option<u64>,
+    raw_start: impl Into<Pos<Floor>>,
+    floor: Option<Pos<Floor>>,
     pinned: bool,
-    archive_end: Option<u64>,
-) -> u64 {
-    let aligned = WalStream::align_down(raw_start, WAL_SEG_SIZE);
+    archive_end: Option<Pos<FilterDurable>>,
+) -> Pos<Floor> {
+    let aligned = Pos::new(WalStream::align_down(raw_start.into().get(), WAL_SEG_SIZE));
     if pinned {
         return aligned;
     }
-    if let Some(f) = floor.filter(|f| *f != 0) {
+    if let Some(f) = floor.filter(|f| !f.is_zero()) {
         return f;
     }
-    match archive_end {
-        Some(end) if end < aligned => end,
-        _ => aligned,
-    }
+    // Archive clamp becomes restart floor
+    archive_end
+        .map(Pos::retag)
+        .filter(|end| *end < aligned)
+        .unwrap_or(aligned)
 }
 
 /// Resolve WAL resume LSN, precedence order:
@@ -221,34 +215,37 @@ pub fn resolve_start(
 ///   3. manifest's last `emitter_ack`: durable CH resume point
 ///   4. greenfield: source's current write head
 ///
-/// Pipeline ack atomic MUST seed from this SAME value, not 0: status
-/// loop persists atomic into the manifest's `emitter_ack` every interval
-/// with no monotonic guard, first write fires at boot before any
-/// re-read acks. Seeding 0 clobbers a resumed manifest's ack to 0; a
-/// crash before re-read of `[aligned, resume]` then falls through to
-/// case 4 next boot (zero ack skipped), silently dropping `[resume,
-/// head]` WAL that never reached CH.
+/// Seed the live pipeline ack from this value, not zero, so the first status
+/// write cannot discard persisted resume state before WAL re-read catches up
 pub fn resolve_resume_lsn(
-    start_lsn: Option<u64>,
-    bootstrap_end_lsn: Option<u64>,
-    manifest_ack_lsn: Option<u64>,
-    greenfield_head: u64,
-) -> u64 {
+    start_lsn: Option<Pos<Floor>>,
+    bootstrap_end_lsn: Option<Pos<Floor>>,
+    manifest_ack_lsn: Option<Pos<ResumeSafe>>,
+    greenfield_head: impl Into<Pos<SourceReceived>>,
+) -> Pos<Floor> {
     match (start_lsn, bootstrap_end_lsn, manifest_ack_lsn) {
         (Some(s), _, _) => s,
         (None, Some(l), _) => l,
-        (None, None, Some(c)) if c != 0 => c,
-        (None, None, _) => greenfield_head,
+        (None, None, Some(c)) if !c.is_zero() => c.retag(),
+        (None, None, _) => greenfield_head.into().retag(),
     }
 }
 
 /// Out-dir trim cut — shadow-recovery domain, distinct from the manifest
 /// floor. Keep `retention_bytes` behind replay, never past the last
 /// restartpoint REDO (shadow resumes recovery there).
-pub fn retention_cutoff(shadow_replay: u64, retention_bytes: u64, redo: Option<u64>) -> u64 {
-    shadow_replay
-        .saturating_sub(retention_bytes)
-        .min(redo.unwrap_or(u64::MAX))
+pub fn retention_cutoff(
+    shadow_replay: impl Into<Pos<ShadowReplay>>,
+    retention_bytes: u64,
+    redo: Option<Pos<ShadowReplay>>,
+) -> Pos<ShadowReplay> {
+    Pos::new(
+        shadow_replay
+            .into()
+            .get()
+            .saturating_sub(retention_bytes)
+            .min(redo.map_or(u64::MAX, Pos::get)),
+    )
 }
 
 /// `Ok(None)` for greenfield (no manifest). `Err(ForeignSource)` when the
@@ -299,23 +296,23 @@ mod tests {
         SourceIdentity {
             system_id: 7_334_001_234_567_890_123,
             timeline: 1,
-            timeline_begin: Lsn(0),
+            timeline_begin: Pos::ZERO,
         }
     }
 
     fn sample() -> Manifest {
         Manifest {
             version: MANIFEST_VERSION,
-            floor: Lsn(0x0123_4564_0000_0000 & !(SEG - 1)),
+            floor: (0x0123_4564_0000_0000 & !(SEG - 1)).into(),
             source: ident(),
             wal: WalBranch { stream_timeline: 2 },
             lsn: LsnSet {
-                source_received: Lsn(0x0123_4567_89AB_CDEF),
-                filter_durable: Lsn(0x0123_4567_0000_0000),
-                shadow_replay: Lsn(0x0123_4566_0000_0000),
-                drain: Lsn(0x0123_4565_0000_0000),
-                emitter_ack: Lsn(0x0123_4564_0000_0000),
-                shadow_flush: Lsn(0x0123_4563_0000_0000),
+                source_received: 0x0123_4567_89AB_CDEF.into(),
+                filter_durable: 0x0123_4567_0000_0000.into(),
+                shadow_replay: 0x0123_4566_0000_0000.into(),
+                drain: 0x0123_4565_0000_0000.into(),
+                emitter_ack: 0x0123_4564_0000_0000.into(),
+                shadow_flush: 0x0123_4563_0000_0000.into(),
             },
         }
     }
@@ -331,6 +328,34 @@ mod tests {
         );
         let got: Manifest = toml::from_str(&text).unwrap();
         assert_eq!(got, m);
+    }
+
+    /// Preserve manifest compatibility across typed-position migration
+    #[test]
+    fn on_disk_toml_is_exact() {
+        const EXPECTED: &str = "\
+version = 2
+floor = \"1234564/0\"
+
+[source]
+system_id = 7334001234567890123
+timeline = 1
+timeline_begin = \"0/0\"
+
+[wal]
+stream_timeline = 2
+
+[lsn]
+source_received = \"1234567/89ABCDEF\"
+filter_durable = \"1234567/0\"
+shadow_replay = \"1234566/0\"
+drain = \"1234565/0\"
+emitter_ack = \"1234564/0\"
+shadow_flush = \"1234563/0\"
+";
+        let text = toml::to_string(&sample()).unwrap();
+        assert_eq!(text, EXPECTED);
+        assert_eq!(toml::from_str::<Manifest>(EXPECTED).unwrap(), sample());
     }
 
     #[test]
@@ -390,7 +415,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let got: Manifest = toml::from_str(&without).expect("parse without timeline_begin");
-        assert_eq!(got.source.timeline_begin, Lsn(0));
+        assert_eq!(got.source.timeline_begin, Pos::ZERO);
     }
 
     /// Manifests predating the crossing carry no `[wal]`; the floor timeline
@@ -445,13 +470,13 @@ mod tests {
 
     #[test]
     fn floor_zero_before_first_seal() {
-        assert_eq!(resolved_floor(2 * SEG + 1, 0), 0);
+        assert!(resolved_floor(2 * SEG + 1, Pos::ZERO).is_zero());
     }
 
     #[test]
     fn start_pinned_aligns_only() {
         assert_eq!(
-            resolve_start(3 * SEG + 9, Some(SEG), true, Some(SEG)),
+            resolve_start(3 * SEG + 9, Some(SEG.into()), true, Some(SEG.into())),
             3 * SEG,
         );
     }
@@ -459,7 +484,7 @@ mod tests {
     #[test]
     fn start_floor_wins_when_nonzero() {
         assert_eq!(
-            resolve_start(3 * SEG + 9, Some(2 * SEG), false, None),
+            resolve_start(3 * SEG + 9, Some((2 * SEG).into()), false, None),
             2 * SEG
         );
     }
@@ -467,7 +492,7 @@ mod tests {
     #[test]
     fn start_zero_floor_falls_through_to_archive_clamp() {
         assert_eq!(
-            resolve_start(3 * SEG + 9, Some(0), false, Some(2 * SEG)),
+            resolve_start(3 * SEG + 9, Some(Pos::ZERO), false, Some((2 * SEG).into())),
             2 * SEG,
         );
     }
@@ -476,30 +501,44 @@ mod tests {
     fn start_greenfield_aligns_and_clamps() {
         assert_eq!(resolve_start(3 * SEG + 9, None, false, None), 3 * SEG);
         assert_eq!(
-            resolve_start(3 * SEG + 9, None, false, Some(4 * SEG)),
+            resolve_start(3 * SEG + 9, None, false, Some((4 * SEG).into())),
             3 * SEG
         );
-        assert_eq!(resolve_start(3 * SEG + 9, None, false, Some(SEG)), SEG);
+        assert_eq!(
+            resolve_start(3 * SEG + 9, None, false, Some(SEG.into())),
+            SEG
+        );
     }
 
     #[test]
     fn retention_cutoff_keeps_window_and_redo() {
         assert_eq!(retention_cutoff(10 * SEG, 2 * SEG, None), 8 * SEG);
-        assert_eq!(retention_cutoff(10 * SEG, 2 * SEG, Some(5 * SEG)), 5 * SEG);
-        assert_eq!(retention_cutoff(SEG, 2 * SEG, None), 0);
+        assert_eq!(
+            retention_cutoff(10 * SEG, 2 * SEG, Some((5 * SEG).into())),
+            5 * SEG
+        );
+        assert!(retention_cutoff(SEG, 2 * SEG, None).is_zero());
     }
 
     #[test]
     fn resume_lsn_start_override_wins() {
         assert_eq!(
-            resolve_resume_lsn(Some(0x10), Some(0x99), Some(0x88), 0xFF),
+            resolve_resume_lsn(
+                Some(0x10.into()),
+                Some(0x99.into()),
+                Some(0x88.into()),
+                0xFF
+            ),
             0x10,
         );
     }
 
     #[test]
     fn resume_lsn_bootstrap_end_outranks_manifest() {
-        assert_eq!(resolve_resume_lsn(None, Some(0x99), Some(0x88), 0xFF), 0x99);
+        assert_eq!(
+            resolve_resume_lsn(None, Some(0x99.into()), Some(0x88.into()), 0xFF),
+            0x99
+        );
     }
 
     #[test]
@@ -509,16 +548,16 @@ mod tests {
         // silently skip [ack, head] WAL)
         let ack = 0xAABB_0000u64;
         let head = 0xFFFF_0000u64;
-        let resume = resolve_resume_lsn(None, None, Some(ack), head);
+        let resume = resolve_resume_lsn(None, None, Some(ack.into()), head);
         assert_eq!(resume, ack, "must resume from durable ack");
-        assert_ne!(resume, 0, "ack seed must not regress to 0");
-        assert_ne!(resume, head, "must not skip ahead to source head");
+        assert!(!resume.is_zero(), "ack seed must not regress to 0");
+        assert_ne!(resume.get(), head, "must not skip ahead to source head");
     }
 
     #[test]
     fn resume_lsn_zero_ack_falls_through_to_greenfield() {
         // ack == 0 is greenfield-equivalent: nothing below head to ship
-        assert_eq!(resolve_resume_lsn(None, None, Some(0), 0xFF), 0xFF);
+        assert_eq!(resolve_resume_lsn(None, None, Some(Pos::ZERO), 0xFF), 0xFF);
     }
 
     #[test]
@@ -531,7 +570,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut m = sample();
         write(tmp.path(), &m).await.unwrap();
-        m.lsn.emitter_ack = Lsn(0x0DEA_DBEE_F00D_0000);
+        m.lsn.emitter_ack = 0x0DEA_DBEE_F00D_0000.into();
         write(tmp.path(), &m).await.unwrap();
         let got = load(tmp.path(), &ident()).await.unwrap().unwrap();
         assert_eq!(got, m);

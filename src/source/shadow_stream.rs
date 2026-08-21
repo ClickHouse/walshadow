@@ -25,14 +25,75 @@ use std::time::Duration;
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 use walrus::pg::replication::server::{
     self, ServerError, TimelineSwitch, WalSenderConn, decode_standby_status,
 };
 use walrus::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 
+use crate::pos::{
+    AppliedWake, Gate, Monotone, Pos, QueuedWake, ShadowDispatched, ShadowFlush, ShadowReplay,
+    SourceReceived,
+};
 use crate::record::{RecordBytesSink, SinkError};
 use ahash::{HashMap, HashMapExt};
+
+#[derive(Debug, Clone, Copy)]
+enum Phase {
+    /// Switchpoint the branch stops at, PG's `sendTimeLineValidUpto`. `None`
+    /// on the current timeline
+    Streaming(Option<TimelineSwitch>),
+    /// Client must receive next-timeline result
+    Ended(TimelineSwitch),
+    /// Teardown with optional pending timeline result
+    Closing(Option<TimelineSwitch>),
+}
+
+impl Phase {
+    fn is_streaming(self) -> bool {
+        matches!(self, Self::Streaming(_))
+    }
+
+    fn is_closing(self) -> bool {
+        matches!(self, Self::Closing(_))
+    }
+
+    /// Switchpoint this connection is pinned to, whether or not it is served
+    fn cut(self) -> Option<TimelineSwitch> {
+        match self {
+            Self::Streaming(c) | Self::Closing(c) => c,
+            Self::Ended(s) => Some(s),
+        }
+    }
+
+    fn ended(self) -> Option<TimelineSwitch> {
+        if let Self::Ended(s) | Self::Closing(Some(s)) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    fn end(&mut self, switch: TimelineSwitch) -> bool {
+        if self.ended().is_some() {
+            return false;
+        }
+        *self = if self.is_closing() {
+            Self::Closing(Some(switch))
+        } else {
+            Self::Ended(switch)
+        };
+        true
+    }
+
+    fn close(&mut self) -> bool {
+        if self.is_closing() {
+            return false;
+        }
+        *self = Self::Closing(self.ended());
+        true
+    }
+}
 
 /// Per-connection state for one WAL-consuming client (typically
 /// shadow PG).
@@ -40,32 +101,21 @@ use ahash::{HashMap, HashMapExt};
 struct ConnState {
     /// High water of bytes pushed onto the send buffer; source's
     /// `write_lsn` equivalent.
-    dispatched_lsn: u64,
+    dispatched_lsn: Pos<ShadowDispatched>,
     /// Last `flush_lsn` from the client's `'r'` standby status.
-    flush_lsn: u64,
+    flush_lsn: Pos<ShadowFlush>,
     /// Last `apply_lsn` from the client's `'r'` standby status.
-    apply_lsn: u64,
-    /// Set when the client asked for a branch that has ended: the switchpoint
-    /// its stream stops at, PG's `sendTimeLineValidUpto`. `None` on the current
-    /// timeline.
-    ends_at: Option<TimelineSwitch>,
-    /// Marked on a write error/overflow; listener drops the slot on
-    /// the next status sweep.
-    closing: bool,
-    /// Served through `ends_at`, so the stream owes the client a next-timeline
-    /// result rather than a closed socket.
-    timeline_ended: bool,
+    apply_lsn: Pos<ShadowReplay>,
+    phase: Phase,
 }
 
 impl ConnState {
     fn fresh(start_lsn: u64, ends_at: Option<TimelineSwitch>) -> Self {
         Self {
-            dispatched_lsn: start_lsn,
-            flush_lsn: start_lsn,
-            apply_lsn: start_lsn,
-            ends_at,
-            closing: false,
-            timeline_ended: false,
+            dispatched_lsn: Pos::new(start_lsn),
+            flush_lsn: Pos::new(start_lsn),
+            apply_lsn: Pos::new(start_lsn),
+            phase: Phase::Streaming(ends_at),
         }
     }
 }
@@ -75,8 +125,8 @@ impl ConnState {
 /// disk-driven polling).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AggregateLsn {
-    pub min_flush_lsn: Option<u64>,
-    pub min_apply_lsn: Option<u64>,
+    pub min_flush_lsn: Option<Pos<ShadowFlush>>,
+    pub min_apply_lsn: Option<Pos<ShadowReplay>>,
     /// Connections past `START_REPLICATION`, the only ones carrying LSNs.
     pub active_connections: usize,
     /// Monotonic count of sockets that entered the handshake. Above
@@ -126,7 +176,7 @@ pub struct ShadowStreamState {
     /// Slow-connection byte cutoff; past it the listener kills the socket.
     pub slow_threshold: usize,
     /// Populates `'w'`/`'k'` frame headers.
-    pub server_wal_end: u64,
+    pub server_wal_end: Pos<SourceReceived>,
     /// Surfaced via [`AggregateLsn::dropped_total`] for the
     /// `walshadow_shadow_stream_dropped_connections_total` gauge.
     dropped_total: u64,
@@ -139,10 +189,10 @@ pub struct ShadowStreamState {
     /// Wakes the listener to write now rather than on its batching tick;
     /// bumped by `request_status`, the one caller whose bytes a hold is
     /// waiting behind
-    queued: watch::Sender<u64>,
+    queued: Monotone<QueuedWake>,
     /// Bumped when a client's apply LSN advances: wakes a publication hold
     /// on the standby status that releases it
-    applied: watch::Sender<u64>,
+    applied: Monotone<AppliedWake>,
 }
 
 impl ShadowStreamState {
@@ -163,46 +213,46 @@ impl ShadowStreamState {
             next_conn_id: 1,
             send_queues: HashMap::new(),
             slow_threshold,
-            server_wal_end: current_lsn,
+            server_wal_end: Pos::new(current_lsn),
             dropped_total: 0,
             accepted_total: 0,
             wire_buf: Vec::new(),
             wire_buf_start: current_lsn,
-            queued: watch::Sender::new(0),
-            applied: watch::Sender::new(0),
+            queued: Monotone::default(),
+            applied: Monotone::default(),
         }
     }
 
     /// Wakes the listener out of its batching tick, for the paths that
-    /// cannot wait one out ([`request_status`](Self::request_status)).
-    /// `watch` latches, so a wake landing while the listener is mid-write
-    /// still arms its next wait — and a drain takes the whole queue, so one
-    /// wake covers every byte enqueued before it
-    pub fn queued_rx(&self) -> watch::Receiver<u64> {
-        self.queued.subscribe()
+    /// cannot wait one out ([`request_status`](Self::request_status))
+    pub fn queued(&self) -> Gate<QueuedWake> {
+        self.queued.watch()
     }
 
     /// Wakes when any client's apply LSN advances; the waiter re-reads
     /// [`aggregate`](Self::aggregate), which stays the release authority
-    pub fn applied_rx(&self) -> watch::Receiver<u64> {
-        self.applied.subscribe()
+    pub fn applied(&self) -> Gate<AppliedWake> {
+        self.applied.watch()
     }
 
     fn wake_listener(&self) {
-        self.queued.send_modify(|n| *n += 1);
+        self.queued.bump();
     }
 
     pub fn aggregate(&self) -> AggregateLsn {
         let served = self.timeline;
-        let (active, min_flush, min_apply, branch) =
-            self.connections.values().filter(|c| !c.closing).fold(
-                (0usize, u64::MAX, u64::MAX, u32::MAX),
+        let (active, min_flush, min_apply, branch) = self
+            .connections
+            .values()
+            .filter(|c| !c.phase.is_closing())
+            .fold(
+                (0usize, Pos::new(u64::MAX), Pos::new(u64::MAX), u32::MAX),
                 |(n, flush, apply, tli), c| {
                     (
                         n + 1,
                         flush.min(c.flush_lsn),
                         apply.min(c.apply_lsn),
-                        tli.min(c.ends_at.map_or(served, |s| s.timeline)),
+                        tli.min(c.phase.cut().map_or(served, |s| s.timeline)),
                     )
                 },
             );
@@ -249,10 +299,12 @@ impl ShadowStreamState {
         // Reconnecting at or past the switchpoint: nothing left on this branch,
         // so end it now rather than idling until the next dispatch
         if let Some(switch) = ends_at
-            && self.connections[&id].dispatched_lsn >= switch.ends_at
+            && self.connections[&id].dispatched_lsn.get() >= switch.ends_at
         {
             self.end_timeline_for(id, switch);
         }
+        // New connection can lower aggregate without status progress
+        self.applied.bump();
         Some(id)
     }
 
@@ -295,13 +347,14 @@ impl ShadowStreamState {
         self.timeline = next_tli;
         let mut caught_up = SmallVec::<[u64; 4]>::new();
         for (id, c) in self.connections.iter_mut() {
-            if c.ends_at.is_none() {
-                c.ends_at = Some(switch);
-                // Already served everything below the fork: nothing more will be
-                // dispatched to notice, and an idle source would leave it waiting
-                if c.dispatched_lsn >= switch.ends_at {
-                    caught_up.push(*id);
-                }
+            let Phase::Streaming(cut @ None) = &mut c.phase else {
+                continue;
+            };
+            *cut = Some(switch);
+            // Already served everything below the fork: nothing more will be
+            // dispatched to notice, and an idle source would leave it waiting
+            if c.dispatched_lsn.get() >= switch.ends_at {
+                caught_up.push(*id);
             }
         }
         for id in caught_up {
@@ -341,17 +394,17 @@ impl ShadowStreamState {
             return;
         }
         let end_lsn = start_lsn + bytes.len() as u64;
-        self.server_wal_end = self.server_wal_end.max(end_lsn);
+        self.server_wal_end = self.server_wal_end.max(end_lsn.into());
         self.retain_wire(start_lsn, bytes);
-        let server_wal_end = self.server_wal_end;
+        let server_wal_end = self.server_wal_end.get();
         // Snapshot: enqueue below takes `&mut self`, so the map can't stay borrowed
         let targets: SmallVec<[(u64, u64, Option<TimelineSwitch>); 4]> = self
             .connections
             .iter()
             // A connection already at its switchpoint is done: descendant bytes
             // must never go down a stream the client reads as ancestor
-            .filter(|(_, c)| !c.closing && !c.timeline_ended && c.dispatched_lsn < end_lsn)
-            .map(|(id, c)| (*id, c.dispatched_lsn, c.ends_at))
+            .filter(|(_, c)| c.phase.is_streaming() && c.dispatched_lsn.get() < end_lsn)
+            .map(|(id, c)| (*id, c.dispatched_lsn.get(), c.phase.cut()))
             .collect();
         for (id, conn_offset, ends_at) in targets {
             let cut = ends_at.map(|s| s.ends_at).filter(|v| *v < end_lsn);
@@ -376,9 +429,8 @@ impl ShadowStreamState {
     /// picks this up and ends the timeline on the wire.
     fn end_timeline_for(&mut self, id: u64, switch: TimelineSwitch) {
         if let Some(c) = self.connections.get_mut(&id)
-            && !c.timeline_ended
+            && c.phase.end(switch)
         {
-            c.timeline_ended = true;
             tracing::info!(
                 target: "walshadow::shadow_stream",
                 conn_id = id,
@@ -394,8 +446,7 @@ impl ShadowStreamState {
     /// `Some` once a connection has been served through its switchpoint: the
     /// stream owes the client the next-timeline result.
     fn timeline_ended_for(&self, id: u64) -> Option<TimelineSwitch> {
-        let conn = self.connections.get(&id)?;
-        conn.timeline_ended.then_some(conn.ends_at).flatten()
+        self.connections.get(&id)?.phase.ended()
     }
 
     /// Replay `[start_lsn, server_wal_end]` so a reconnect behind the live head
@@ -406,9 +457,10 @@ impl ShadowStreamState {
         let ends_at = self
             .connections
             .get(&id)
-            .and_then(|c| c.ends_at)
+            .and_then(|c| c.phase.cut())
             .map(|s| s.ends_at);
-        let server_wal_end = ends_at.map_or(self.server_wal_end, |v| v.min(self.server_wal_end));
+        let head = self.server_wal_end.get();
+        let server_wal_end = ends_at.map_or(head, |v| v.min(head));
         if start_lsn >= server_wal_end || start_lsn < self.wire_buf_start {
             return;
         }
@@ -437,17 +489,25 @@ impl ShadowStreamState {
     pub fn drop_connection(&mut self, id: u64) {
         self.connections.remove(&id);
         self.send_queues.remove(&id);
+        // Removing laggard can raise aggregate and release hold
+        self.applied.bump();
     }
 
     /// Record an inbound `'r'` standby status.
-    pub fn observe_status(&mut self, id: u64, write_lsn: u64, flush_lsn: u64, apply_lsn: u64) {
-        let _ = write_lsn;
+    pub fn observe_status(
+        &mut self,
+        id: u64,
+        _write_lsn: u64,
+        flush_lsn: impl Into<Pos<ShadowFlush>>,
+        apply_lsn: impl Into<Pos<ShadowReplay>>,
+    ) {
         if let Some(c) = self.connections.get_mut(&id) {
+            let (flush_lsn, apply_lsn) = (flush_lsn.into(), apply_lsn.into());
             c.flush_lsn = c.flush_lsn.max(flush_lsn);
             let advanced = apply_lsn > c.apply_lsn;
             c.apply_lsn = c.apply_lsn.max(apply_lsn);
             if advanced {
-                self.applied.send_modify(|n| *n += 1);
+                self.applied.bump();
             }
         }
     }
@@ -468,9 +528,8 @@ impl ShadowStreamState {
         let q = self.send_queues.entry(id).or_default();
         if q.len() + framed.len() > self.slow_threshold {
             if let Some(c) = self.connections.get_mut(&id)
-                && !c.closing
+                && c.phase.close()
             {
-                c.closing = true;
                 self.dropped_total += 1;
             }
             self.send_queues.remove(&id);
@@ -503,9 +562,8 @@ impl ShadowStreamState {
         {
             q.truncate(envelope_start);
             if let Some(c) = self.connections.get_mut(&id)
-                && !c.closing
+                && c.phase.close()
             {
-                c.closing = true;
                 self.dropped_total += 1;
             }
             self.send_queues.remove(&id);
@@ -521,7 +579,8 @@ impl ShadowStreamState {
         self.frame_copy_data(id, Some(self.slow_threshold), build_body)
     }
 
-    pub fn advance_dispatched(&mut self, id: u64, new_lsn: u64) {
+    pub fn advance_dispatched(&mut self, id: u64, new_lsn: impl Into<Pos<ShadowDispatched>>) {
+        let new_lsn = new_lsn.into();
         if let Some(c) = self.connections.get_mut(&id) {
             c.dispatched_lsn = c.dispatched_lsn.max(new_lsn);
         }
@@ -540,11 +599,11 @@ impl ShadowStreamState {
     /// bulk streaming, not for this. Bulk traffic keeps that batching —
     /// only the prod jumps the queue
     pub fn request_status(&mut self) {
-        let server_wal_end = self.server_wal_end;
+        let server_wal_end = self.server_wal_end.get();
         let ids: Vec<u64> = self
             .connections
             .iter()
-            .filter(|(_, c)| !c.closing)
+            .filter(|(_, c)| !c.phase.is_closing())
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
@@ -800,13 +859,14 @@ where
     // and the backstop for a wake the queue raced. Batching survives: a
     // wake drains everything queued, and bytes enqueued during a write
     // land in the next drain
-    let mut queued = state.lock().await.queued_rx();
-    // Registration backfilled this connection before the subscribe, so the
-    // first wait must not swallow bytes already queued
-    queued.mark_changed();
+    // Zero start: registration backfilled this connection before the
+    // subscribe, and those bytes must not be swallowed
+    let queued = state.lock().await.queued();
+    let mut woke_at = Pos::ZERO;
     loop {
         tokio::select! {
-            _ = queued.changed() => {
+            Ok(seen) = queued.advance(woke_at) => {
+                woke_at = seen;
                 let pending = state.lock().await.drain_send_queue(id);
                 if let Some(bytes) = pending
                     && !bytes.is_empty()
@@ -819,7 +879,7 @@ where
                 let pending = {
                     let mut s = state.lock().await;
                     if last_write.elapsed() >= KEEPALIVE_IDLE {
-                        let server_wal_end = s.server_wal_end;
+                        let server_wal_end = s.server_wal_end.get();
                         let _ = s.enqueue_copy_data_with(id, |out| {
                             encode_keepalive_frame_into(out, server_wal_end, false);
                         });
@@ -839,7 +899,12 @@ where
                     Some(payload) => {
                         if let Some(status) = decode_standby_status(&payload) {
                             let mut s = state.lock().await;
-                            s.observe_status(id, status.write_lsn, status.flush_lsn, status.apply_lsn);
+                            s.observe_status(
+                                id,
+                                status.write_lsn,
+                                status.flush_lsn,
+                                status.apply_lsn,
+                            );
                         }
                     }
                     None => return Ok(StreamOutcome::Closed),
@@ -853,7 +918,7 @@ where
             // enqueued after a drain this loop already did would otherwise land
             // behind the result set, or never
             let tail = ended.and_then(|_| s.drain_send_queue(id));
-            let closing = s.connections.get(&id).is_none_or(|c| c.closing);
+            let closing = s.connections.get(&id).is_none_or(|c| c.phase.is_closing());
             (ended, closing, tail)
         };
         if let Some(switch) = ended {
@@ -882,17 +947,19 @@ mod tests {
         let id = s
             .register_connection(0x1000, 1, None)
             .expect("current timeline");
-        let rx = s.queued_rx();
+        let queued = s.queued();
+        let quiet = queued.current();
         s.enqueue(id, vec![b'd', 0, 0, 0, 4]);
-        assert!(
-            !rx.has_changed().expect("sender alive"),
+        assert_eq!(
+            queued.current(),
+            quiet,
             "bulk WAL keeps the listener's batching tick",
         );
         s.request_status();
-        assert!(rx.has_changed().expect("sender alive"));
-        let queued = s.drain_send_queue(id).expect("queue");
+        assert!(queued.current() > quiet);
+        let bytes = s.drain_send_queue(id).expect("queue");
         assert!(
-            queued.len() > 5,
+            bytes.len() > 5,
             "the wake carries the queued WAL out with the keepalive",
         );
     }
@@ -903,20 +970,19 @@ mod tests {
         let id = s
             .register_connection(0x1000, 1, None)
             .expect("current timeline");
-        let mut rx = s.applied_rx();
+        let applied = s.applied();
+        let quiet = applied.current();
         s.observe_status(id, 0x2000, 0x2000, 0x1000);
-        assert!(
-            !rx.has_changed().expect("sender alive"),
+        assert_eq!(
+            applied.current(),
+            quiet,
             "flush progress alone releases nothing",
         );
         s.observe_status(id, 0x2000, 0x2000, 0x1800);
-        assert!(rx.has_changed().expect("sender alive"));
-        rx.mark_unchanged();
+        let woke = applied.current();
+        assert!(woke > quiet);
         s.observe_status(id, 0x2000, 0x2000, 0x1800);
-        assert!(
-            !rx.has_changed().expect("sender alive"),
-            "a repeated status is not progress",
-        );
+        assert_eq!(applied.current(), woke, "a repeated status is not progress");
     }
 
     #[test]
@@ -1087,8 +1153,8 @@ mod tests {
         s.observe_status(b, 0x2200, 0x2100, 0x1900);
         let agg = s.aggregate();
         assert_eq!(agg.active_connections, 2);
-        assert_eq!(agg.min_flush_lsn, Some(0x2000));
-        assert_eq!(agg.min_apply_lsn, Some(0x1800));
+        assert_eq!(agg.min_flush_lsn, Some(0x2000.into()));
+        assert_eq!(agg.min_apply_lsn, Some(0x1800.into()));
     }
 
     /// A client held on a historic branch reads as that branch, not as the one
@@ -1125,9 +1191,26 @@ mod tests {
         assert!(s.enqueue(id, vec![0u8; 32]));
         assert!(s.enqueue(id, vec![0u8; 16]));
         assert!(!s.enqueue(id, vec![0u8; 64]));
-        assert!(s.connections.get(&id).unwrap().closing);
+        assert!(s.connections[&id].phase.is_closing());
         assert!(!s.send_queues.contains_key(&id));
         assert_eq!(s.aggregate().dropped_total, 1);
+    }
+
+    #[test]
+    fn an_overflow_after_the_switchpoint_still_owes_the_timeline_end() {
+        let mut s = ShadowStreamState::new(1, "x".into(), 0, 64);
+        let switch = TimelineSwitch {
+            timeline: 1,
+            ends_at: 0,
+            next_timeline: 2,
+        };
+        let id = s
+            .register_connection(0, 1, Some(switch))
+            .expect("timeline 1 is known");
+        assert_eq!(s.timeline_ended_for(id), Some(switch));
+        assert!(!s.enqueue(id, vec![0u8; 128]));
+        assert!(s.connections[&id].phase.is_closing());
+        assert_eq!(s.timeline_ended_for(id), Some(switch));
     }
 
     #[test]

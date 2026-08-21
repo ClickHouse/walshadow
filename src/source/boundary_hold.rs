@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use crate::pos::{Pos, ShadowReplay};
 use crate::record::{BoundaryKind, Record, RecordSink, SinkError};
 use crate::source::catalog_capture::CatalogCapture;
 use crate::source::queueing_record_sink::QueueingRecordSink;
@@ -101,49 +102,50 @@ impl CatalogBoundaryGate {
     pub async fn hold(
         &self,
         commit_lsn: u64,
-        next_lsn: u64,
+        next_lsn: impl Into<Pos<ShadowReplay>>,
         worker_alive: impl Fn() -> bool,
     ) -> Result<(), SinkError> {
+        let next_lsn = next_lsn.into();
+        let applied = self.state.lock().await.applied();
         let start = Instant::now();
-        // Subscribed before the first read, so a status landing mid-check
-        // wakes the wait rather than being missed
-        let mut applied = self.state.lock().await.applied_rx();
-        loop {
+        let held = loop {
+            // Read the wake count before the probe, so a status landing
+            // between them is not parked through
+            let seen = applied.current();
             let agg = self.state.lock().await.aggregate();
             if agg.min_apply_lsn.is_some_and(|apply| apply >= next_lsn) {
-                self.stats.holds.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .hold_nanos
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                // Info: fires at DDL rate, operators read it as the
-                // hold-latency signal
-                tracing::info!(
-                    target: "walshadow::boundary_hold",
-                    commit_lsn = format_args!("{commit_lsn:#X}"),
-                    next_lsn = format_args!("{next_lsn:#X}"),
-                    held = ?start.elapsed(),
-                    "catalog boundary released",
-                );
-                return Ok(());
+                break start.elapsed();
             }
             if !worker_alive() {
                 return self.fail(format!(
                     "decoder worker terminated during catalog boundary hold at {commit_lsn:#X}"
                 ));
             }
-            if start.elapsed() >= self.config.hold_timeout {
+            let waited = start.elapsed();
+            if waited >= self.config.hold_timeout {
                 return self.fail(format!(
-                    "catalog boundary hold at {commit_lsn:#X} timed out after {:?}: \
-                     shadow apply {:?} < {next_lsn:#X} ({} walreceiver connection(s))",
-                    self.config.hold_timeout, agg.min_apply_lsn, agg.active_connections,
+                    "catalog boundary hold at {commit_lsn:#X} timed out after {waited:?}: \
+                     shadow apply {:?} < {next_lsn} ({} walreceiver connection(s))",
+                    agg.min_apply_lsn, agg.active_connections,
                 ));
             }
+            // Poll cadence also covers aggregate moves with no per-connection
+            // progress, such as a walreceiver attaching or dropping
             self.state.lock().await.request_status();
-            // Shadow's reply wakes this; `poll_interval` is the backstop so a
-            // lost wake — or a walreceiver that never answers — polls instead
-            // of hanging, and paces the `worker_alive` / deadline checks above
-            let _ = tokio::time::timeout(self.config.poll_interval, applied.changed()).await;
-        }
+            let _ = tokio::time::timeout(self.config.poll_interval, applied.advance(seen)).await;
+        };
+        self.stats.holds.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .hold_nanos
+            .fetch_add(held.as_nanos() as u64, Ordering::Relaxed);
+        tracing::info!(
+            target: "walshadow::boundary_hold",
+            commit_lsn = format_args!("{commit_lsn:#X}"),
+            next_lsn = %next_lsn,
+            held = ?held,
+            "catalog boundary released",
+        );
+        Ok(())
     }
 
     fn fail(&self, msg: String) -> Result<(), SinkError> {
@@ -239,7 +241,9 @@ impl RecordSink for BoundaryHoldSink {
             let parked = Instant::now();
             if let Err(hold_err) = self
                 .gate
-                .hold(record.source_lsn, record.next_lsn, || inner.worker_alive())
+                .hold(record.source_lsn, Pos::new(record.next_lsn), || {
+                    inner.worker_alive()
+                })
                 .await
             {
                 // Prefer the worker's parked root cause over the generic

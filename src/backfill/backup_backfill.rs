@@ -42,7 +42,6 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -303,7 +302,7 @@ async fn walk_and_ship(
         &ctx.emitter,
         1,
         ctx.stats.clone(),
-        Arc::new(AtomicU64::new(0)),
+        Arc::new(crate::pos::Monotone::new(0)),
         fatal.clone(),
         ctx.config_rx.clone(),
     )
@@ -899,7 +898,7 @@ async fn replay_gap(
         filter_rfns,
         targets,
         b_redo,
-        mapping: ctx.mapping.read().await.clone(),
+        mapping: ctx.mapping.snapshot().await,
         stats: ctx.stats.clone(),
         budget: ctx.budget.clone(),
         soft_delete: ctx.emitter.soft_delete,

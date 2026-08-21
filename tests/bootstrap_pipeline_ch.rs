@@ -20,7 +20,7 @@
 mod fx;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use walrus::pg::walparser::RelFileNode;
@@ -31,6 +31,7 @@ use walshadow::heap_decoder::ColumnValue;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::BatcherMsg;
 use walshadow::pipeline::{Fatal, bootstrap, tail};
+use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 use walshadow::toast::ToastResolver;
 
@@ -144,7 +145,7 @@ async fn bootstrap_tail_fans_out_n2() {
     let mapping = walshadow::mapping::mapping_handle(cfg.tables.clone());
 
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(AtomicU64::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
     let fatal = Fatal::new();
     let (msg_tx, ack, tail) = tail::spawn(
         &cfg,
@@ -199,11 +200,12 @@ async fn bootstrap_tail_fans_out_n2() {
     reply_rx.await.expect("flush ack");
     tokio::time::timeout(Duration::from_secs(30), ack.wait_through(outcome.next_seq))
         .await
-        .expect("wait_through(K) completed — per-seq acks reconciled across N=2");
+        .expect("wait_through(K) completed — per-seq acks reconciled across N=2")
+        .expect("ack collector alive");
 
     // Watermark saturates at start_lsn (every bootstrap commit_lsn is equal).
     assert_eq!(
-        emitter_ack.load(Ordering::Acquire),
+        emitter_ack.get(),
         START_LSN,
         "contiguous-done watermark at start_lsn",
     );

@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::source::manifest::Lsn;
+use crate::pos::{Commit, Floor, Pos};
 
 pub const RETIRE_LEDGER_FILENAME: &str = "toast_retires.toml";
 
@@ -68,7 +68,7 @@ struct RetireFile {
 #[derive(Serialize, Deserialize)]
 struct RetireEntry {
     toast_relid: u32,
-    commit_lsn: Lsn,
+    commit_lsn: Pos<Commit>,
 }
 
 /// Pending `(toast_relid, dropping commit_lsn)` retires, persisted on
@@ -76,7 +76,7 @@ struct RetireEntry {
 #[derive(Debug)]
 pub struct RetireLedger {
     dir: PathBuf,
-    entries: Vec<(u32, u64)>,
+    entries: Vec<(u32, Pos<Commit>)>,
 }
 
 impl RetireLedger {
@@ -96,7 +96,7 @@ impl RetireLedger {
                 ledger.entries = file
                     .retire
                     .into_iter()
-                    .map(|e| (e.toast_relid, e.commit_lsn.0))
+                    .map(|e| (e.toast_relid, e.commit_lsn))
                     .collect();
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -109,13 +109,14 @@ impl RetireLedger {
         self.entries.is_empty()
     }
 
-    pub fn entries(&self) -> &[(u32, u64)] {
+    pub fn entries(&self) -> &[(u32, Pos<Commit>)] {
         &self.entries
     }
 
     /// Entries whose dropping commit precedes `cut` (persisted resolved
     /// floor); snapshot so the caller can await between removals.
-    pub fn due(&self, cut: u64) -> Vec<(u32, u64)> {
+    pub fn due(&self, cut: impl Into<Pos<Floor>>) -> Vec<(u32, Pos<Commit>)> {
+        let cut = cut.into().get();
         self.entries
             .iter()
             .copied()
@@ -128,8 +129,9 @@ impl RetireLedger {
     pub async fn push(
         &mut self,
         toast_relid: u32,
-        commit_lsn: u64,
+        commit_lsn: impl Into<Pos<Commit>>,
     ) -> Result<(), RetireLedgerError> {
+        let commit_lsn = commit_lsn.into();
         if self.entries.contains(&(toast_relid, commit_lsn)) {
             return Ok(());
         }
@@ -141,8 +143,9 @@ impl RetireLedger {
     pub async fn remove(
         &mut self,
         toast_relid: u32,
-        commit_lsn: u64,
+        commit_lsn: impl Into<Pos<Commit>>,
     ) -> Result<(), RetireLedgerError> {
+        let commit_lsn = commit_lsn.into();
         let before = self.entries.len();
         self.entries.retain(|&e| e != (toast_relid, commit_lsn));
         if self.entries.len() == before {
@@ -159,7 +162,7 @@ impl RetireLedger {
                 .iter()
                 .map(|&(toast_relid, commit_lsn)| RetireEntry {
                     toast_relid,
-                    commit_lsn: Lsn(commit_lsn),
+                    commit_lsn,
                 })
                 .collect(),
         };
@@ -194,7 +197,10 @@ mod tests {
             "rename must clean up the .tmp sidecar",
         );
         let reloaded = RetireLedger::load(tmp.path()).await.unwrap();
-        assert_eq!(reloaded.entries(), &[(16500, 0x1000), (16600, 0x2000)]);
+        assert_eq!(
+            reloaded.entries(),
+            &[(16500, 0x1000.into()), (16600, 0x2000.into())]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -203,9 +209,9 @@ mod tests {
         let mut ledger = RetireLedger::load(tmp.path()).await.unwrap();
         ledger.push(16500, 0x1000).await.unwrap();
         ledger.push(16500, 0x1000).await.unwrap();
-        assert_eq!(ledger.entries(), &[(16500, 0x1000)]);
+        assert_eq!(ledger.entries(), &[(16500, 0x1000.into())]);
         let reloaded = RetireLedger::load(tmp.path()).await.unwrap();
-        assert_eq!(reloaded.entries(), &[(16500, 0x1000)]);
+        assert_eq!(reloaded.entries(), &[(16500, 0x1000.into())]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -216,7 +222,7 @@ mod tests {
         ledger.push(16600, 0x2000).await.unwrap();
         ledger.remove(16500, 0x1000).await.unwrap();
         let reloaded = RetireLedger::load(tmp.path()).await.unwrap();
-        assert_eq!(reloaded.entries(), &[(16600, 0x2000)]);
+        assert_eq!(reloaded.entries(), &[(16600, 0x2000.into())]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -226,9 +232,9 @@ mod tests {
         ledger.push(1, 0x1000).await.unwrap();
         ledger.push(2, 0x2000).await.unwrap();
         ledger.push(3, 0x3000).await.unwrap();
-        assert_eq!(ledger.due(0x2000), [(1, 0x1000)]);
+        assert_eq!(ledger.due(0x2000), [(1, 0x1000.into())]);
         assert_eq!(ledger.due(u64::MAX).len(), 3);
-        assert!(ledger.due(0).is_empty());
+        assert!(ledger.due(Pos::ZERO).is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -278,7 +284,7 @@ mod tests {
         );
         assert_eq!(
             ledger.due(resolved_floor(n + 2 * SEG + 5, n + 2 * SEG)),
-            vec![(16500, n + SEG + 42)],
+            vec![(16500, (n + SEG + 42).into())],
         );
     }
 }

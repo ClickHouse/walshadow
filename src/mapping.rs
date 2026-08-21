@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::catalog::type_bridge;
 use crate::schema::{RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
 use ahash::HashMap;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct TableMapping {
@@ -104,12 +105,44 @@ pub struct ToastConfig {
 /// concurrent republish can't split a transaction across mapping versions
 pub type MappingSnapshot = Arc<HashMap<RelName, TableMapping>>;
 
-/// Shared copy-on-write routing map: writers swap or `Arc::make_mut` the
-/// inner snapshot, held snapshots stay frozen
-pub type MappingHandle = Arc<tokio::sync::RwLock<MappingSnapshot>>;
+pub type MappingHandle = Arc<MappingCell>;
+
+/// Copy-on-write routing map. Writers `Arc::make_mut` or swap the inner
+/// snapshot, so a snapshot taken for one unit of work stays frozen
+#[derive(Debug)]
+pub struct MappingCell {
+    inner: RwLock<MappingSnapshot>,
+}
+
+impl MappingCell {
+    pub async fn with<R>(&self, f: impl FnOnce(&MappingSnapshot) -> R) -> R {
+        f(&*self.inner.read().await)
+    }
+
+    pub async fn snapshot(&self) -> MappingSnapshot {
+        self.inner.read().await.clone()
+    }
+
+    /// `false` once a fold or republish displaced `at`. Holding `at` keeps
+    /// its allocation alive and forces `Arc::make_mut` to clone, so pointer
+    /// identity answers "has the map moved since I looked?"
+    pub async fn unmoved(&self, at: &MappingSnapshot) -> bool {
+        Arc::ptr_eq(&*self.inner.read().await, at)
+    }
+
+    pub async fn mutate<R>(&self, f: impl FnOnce(&mut MappingSnapshot) -> R) -> R {
+        f(&mut *self.inner.write().await)
+    }
+
+    pub async fn publish(&self, tables: MappingSnapshot) {
+        *self.inner.write().await = tables;
+    }
+}
 
 pub fn mapping_handle(tables: HashMap<RelName, TableMapping>) -> MappingHandle {
-    Arc::new(tokio::sync::RwLock::new(Arc::new(tables)))
+    Arc::new(MappingCell {
+        inner: RwLock::new(Arc::new(tables)),
+    })
 }
 
 pub fn derive_columns_for_mapping(desc: &RelDescriptor) -> Vec<ColumnMapping> {
@@ -182,15 +215,18 @@ mod tests {
         let (rel, map) = one_table();
         let handle = mapping_handle(map);
         // Applicator shape: make_mut clones out from under held snapshots
-        let planned: MappingSnapshot = handle.read().await.clone();
-        Arc::make_mut(&mut *handle.write().await).remove(&rel);
+        let planned: MappingSnapshot = handle.snapshot().await;
+        handle.mutate(|m| Arc::make_mut(m).remove(&rel)).await;
         assert!(planned.contains_key(&rel), "snapshot keeps its version");
-        assert!(!handle.read().await.contains_key(&rel), "handle moved on");
+        assert!(
+            !handle.with(|m| m.contains_key(&rel)).await,
+            "handle moved on"
+        );
         // Republish shape: full inner-Arc swap
-        let planned = handle.read().await.clone();
+        let planned = handle.snapshot().await;
         let (rel2, map2) = one_table();
-        *handle.write().await = Arc::new(map2);
+        handle.publish(Arc::new(map2)).await;
         assert!(!planned.contains_key(&rel2), "snapshot predates the swap");
-        assert!(handle.read().await.contains_key(&rel2));
+        assert!(handle.with(|m| m.contains_key(&rel2)).await);
     }
 }

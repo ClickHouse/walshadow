@@ -216,7 +216,11 @@ impl RecordSink for HoldingCensus {
             if record.catalog_boundary {
                 let parked = Instant::now();
                 self.gate
-                    .hold(record.source_lsn, record.next_lsn, || true)
+                    .hold(
+                        record.source_lsn,
+                        walshadow::pos::Pos::new(record.next_lsn),
+                        || true,
+                    )
                     .await?;
                 self.holds += 1;
                 self.held += parked.elapsed();

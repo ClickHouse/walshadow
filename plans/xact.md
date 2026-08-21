@@ -71,7 +71,10 @@ case is a handful of control events per xact
 
 `inflight_snapshot` is the diagnostic surface for "a commit for this
 xid never arrived" investigations — heap / chunk / event / spill
-counters per xid
+counters per xid. It only describes work still in transaction buffer.
+After rows move to decode or insert pool, `xacts_active` can be zero while
+watermark remains stuck. Stall watchdog also reads ack collector's
+`AckSnapshot` ([emitter.md](emitter.md)), which identifies seq blocking it
 
 ## TOAST reassembly
 

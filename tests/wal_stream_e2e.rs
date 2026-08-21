@@ -754,7 +754,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
     assert!(
         next_at_close > dispatched_at_close,
         "current_buf must hold ≥1 byte for close() to produce a .partial \
-         (dispatched={dispatched_at_close:#X}, next={next_at_close:#X})",
+         (dispatched={dispatched_at_close:#X}, next={next_at_close})",
     );
 
     // Drive the shutdown path. Equivalent to the daemon's ctrl_c branch

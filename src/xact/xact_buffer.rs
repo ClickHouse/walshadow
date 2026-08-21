@@ -59,6 +59,7 @@ use crate::decode::wal_xact::{
 };
 use crate::emit::ch_emitter::EmitterStats;
 use crate::ops::trace::{InflightSnapshotEntry, TxnSpanRegistry, new_txn_span};
+use crate::pos::{Commit, Drain, EmitterAck, Pos, ResumeSafe, XactFirst};
 use crate::record::{Record, RecordSink, Route, SinkError};
 use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::schema::{RelDescriptor, SchemaEvent};
@@ -350,7 +351,7 @@ pub struct XactBufferStats {
     /// Highest commit-record LSN handed to a drain. Snapshot for the
     /// manifest `drain` role, monotonic. The durable-ack sibling lives in
     /// the pipeline ack collector, not here
-    pub drain_lsn: u64,
+    pub drain_lsn: Pos<Drain>,
     /// Cumulative raw-stash payload bytes by first landing; eviction moving
     /// a memory-resident entry to spill does not re-count
     pub raw_stash_bytes_mem: u64,
@@ -406,7 +407,7 @@ pub enum DrainEntry {
 struct XactState {
     /// Sticky across spill rotations; distinguishes two xids that collide
     /// after a slot rebuild
-    first_lsn: u64,
+    first_lsn: Pos<XactFirst>,
     /// WAL-order by arrival
     in_mem: Vec<SpillEntry>,
     in_mem_bytes: usize,
@@ -436,7 +437,7 @@ impl XactState {
             first_lsn = first_lsn,
         );
         Self {
-            first_lsn,
+            first_lsn: first_lsn.into(),
             in_mem: Vec::new(),
             in_mem_bytes: 0,
             spill: None,
@@ -509,8 +510,8 @@ fn value_size(v: &ColumnValue) -> usize {
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PendingDurableXact {
-    first_lsn: u64,
-    commit_lsn: u64,
+    first_lsn: Pos<XactFirst>,
+    commit_lsn: Pos<Commit>,
 }
 
 #[derive(Debug, Default)]
@@ -519,24 +520,24 @@ struct PendingDurable {
 }
 
 impl PendingDurable {
-    fn push(&mut self, first_lsn: u64, commit_lsn: u64) {
+    fn push(&mut self, first_lsn: Pos<XactFirst>, commit_lsn: Pos<Commit>) {
         self.by_first_lsn.push(Reverse(PendingDurableXact {
             first_lsn,
             commit_lsn,
         }));
     }
 
-    fn prune(&mut self, durable_ack: u64) {
+    fn prune(&mut self, durable_ack: Pos<EmitterAck>) {
         while self
             .by_first_lsn
             .peek()
-            .is_some_and(|Reverse(xact)| xact.commit_lsn <= durable_ack)
+            .is_some_and(|Reverse(xact)| xact.commit_lsn <= durable_ack.get())
         {
             self.by_first_lsn.pop();
         }
     }
 
-    fn min_first_lsn(&self) -> Option<u64> {
+    fn min_first_lsn(&self) -> Option<Pos<XactFirst>> {
         self.by_first_lsn.peek().map(|Reverse(xact)| xact.first_lsn)
     }
 }
@@ -855,7 +856,7 @@ impl XactBuffer {
             .inflight
             .iter()
             .map(|(xid, st)| {
-                let mut last_lsn = st.first_lsn;
+                let mut last_lsn = st.first_lsn.get();
                 let mut rels: std::collections::BTreeSet<(u32, u32)> =
                     std::collections::BTreeSet::new();
                 let mut heap_count = 0u64;
@@ -896,7 +897,7 @@ impl XactBuffer {
                     .join(",");
                 InflightSnapshotEntry {
                     xid: *xid,
-                    first_lsn: st.first_lsn,
+                    first_lsn: st.first_lsn.get(),
                     last_lsn,
                     heap_count,
                     chunk_count,
@@ -1157,7 +1158,7 @@ impl XactBuffer {
         let st = self.inflight.get_mut(&xid).expect("xid present");
         let first_spill = st.spill.is_none();
         if first_spill {
-            st.spill = Some(self.store.writer(xid, st.first_lsn).await?);
+            st.spill = Some(self.store.writer(xid, st.first_lsn.get()).await?);
         }
         let writer = st.spill.as_mut().unwrap();
         let drained: Vec<SpillEntry> = std::mem::take(&mut st.in_mem);
@@ -1281,7 +1282,7 @@ impl XactBuffer {
                 states.push(st);
             }
         }
-        self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn);
+        self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn.into());
         if states.is_empty() {
             // Read-only / filter-dropped: reorder coordinator still
             // registers a seq so the contiguous watermark passes commit_lsn
@@ -1296,7 +1297,7 @@ impl XactBuffer {
         }
         // Preserve floor while decoded slices remain undurable
         if let Some(first) = states.iter().map(|st| st.first_lsn).min() {
-            self.pending_durable.push(first, commit_lsn);
+            self.pending_durable.push(first, commit_lsn.into());
         }
         for st in &states {
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
@@ -1337,21 +1338,24 @@ impl XactBuffer {
     /// post-COMMIT WAL (page padding, RUNNING_XACTS, CHECKPOINT) counts as
     /// drained when quiescent. The durable ack side lives in the ack
     /// collector (`AckHandle::trailing`).
-    pub fn advance_idle(&mut self, lsn: u64) {
+    pub fn advance_idle(&mut self, lsn: impl Into<Pos<Drain>>) {
         if self.stats.xacts_active != 0 {
             return;
         }
-        self.stats.drain_lsn = self.stats.drain_lsn.max(lsn);
+        self.stats.drain_lsn = self.stats.drain_lsn.max(lsn.into());
     }
 
     /// Floor durable acknowledgment at first record of each undurable transaction
-    pub fn resume_safe_lsn(&mut self, durable_ack: u64) -> u64 {
+    pub fn resume_safe_lsn(&mut self, durable_ack: impl Into<Pos<EmitterAck>>) -> Pos<ResumeSafe> {
+        let durable_ack = durable_ack.into();
         self.pending_durable.prune(durable_ack);
-        self.inflight
-            .values()
-            .map(|st| st.first_lsn)
-            .chain(self.pending_durable.min_first_lsn())
-            .fold(durable_ack, u64::min)
+        Pos::new(
+            self.inflight
+                .values()
+                .map(|st| st.first_lsn)
+                .chain(self.pending_durable.min_first_lsn())
+                .fold(durable_ack.get(), |acc, first| acc.min(first.get())),
+        )
     }
 
     /// Discard xact `xid` + spill file. No-op if unknown. `abort_lsn` is
@@ -1361,10 +1365,10 @@ impl XactBuffer {
     pub async fn abort(
         &mut self,
         xid: u32,
-        abort_lsn: u64,
+        abort_lsn: impl Into<Pos<Drain>>,
         subxids: &[u32],
     ) -> std::result::Result<(), XactBufferError> {
-        self.stats.drain_lsn = self.stats.drain_lsn.max(abort_lsn);
+        self.stats.drain_lsn = self.stats.drain_lsn.max(abort_lsn.into());
         // `xid` is header xact_id: top abort or subxact standalone
         // rollback. Drop `xid` + every sub. For mid-xact subxact rollback
         // (PG `RecordSubTransactionAbort` writes a separate

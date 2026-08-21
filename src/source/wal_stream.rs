@@ -39,6 +39,7 @@ use walrus::pg::walparser::{
 use crate::filter::manifest::{Entry, FILTER_VERSION, Kind, Manifest};
 use crate::filter::rewrite::{RewriteError, noop_replace};
 use crate::filter::{Filter, FilterSnapshot};
+use crate::pos::{Floor, Pos};
 #[cfg(test)]
 use crate::record::{
     CollectingRecordSink, CollectingSegmentSink, CompositeRecordSink, MetricsRecordSink,
@@ -140,7 +141,12 @@ pub struct ForkPrefix {
 }
 
 impl WalStream {
-    pub fn new(timeline: u32, seg_size: u64, start_lsn: u64) -> Result<Self, WalStreamError> {
+    pub fn new(
+        timeline: u32,
+        seg_size: u64,
+        start_lsn: impl Into<Pos<Floor>>,
+    ) -> Result<Self, WalStreamError> {
+        let start_lsn = start_lsn.into().get();
         if !start_lsn.is_multiple_of(seg_size) {
             return Err(WalStreamError::UnalignedBase(start_lsn));
         }
@@ -182,11 +188,13 @@ impl WalStream {
         lsn - (lsn % seg_size)
     }
 
-    pub fn next_lsn(&self) -> u64 {
-        self.next_lsn
+    /// Read cursor: where a restart of this stream resumes
+    pub fn next_lsn(&self) -> Pos<Floor> {
+        Pos::new(self.next_lsn)
     }
 
-    /// LSN one past the end of the last `on_segment` call.
+    /// LSN one past the end of the last `on_segment` call. Raw: read as the
+    /// filter frontier, as a shadow-replay target, and as a wire offset
     pub fn dispatched_lsn(&self) -> u64 {
         self.current_lsn
     }
