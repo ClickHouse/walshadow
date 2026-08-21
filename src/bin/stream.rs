@@ -265,23 +265,61 @@ impl RecordSink for DaemonSinks {
     }
 }
 
-/// `walshadow-stream ctl <words…>`: drive a running daemon's control socket.
-/// Detected before daemon-arg parsing so `ctl` needn't supply daemon args.
+/// `walshadow-stream init`: write a config from two connection URLs, so a
+/// first run needs no TOML. Detected before daemon-arg parsing, same as `ctl`.
 #[derive(Debug, Parser)]
 #[command(
-    name = "walshadow-stream ctl",
-    about = "Control a running walshadow-stream daemon."
+    name = "walshadow-stream init",
+    about = "Probe source + destination, pick tables, write the config."
 )]
-struct CtlArgs {
+struct InitArgs {
+    /// Config to write; the daemon then runs with `--ch-config <path>`
     #[arg(
         long,
-        env = "WALSHADOW_CONTROL_SOCKET",
-        default_value = "/run/walshadow/control.sock"
+        env = "WALSHADOW_CH_CONFIG",
+        default_value = "/etc/walshadow/ch-config.toml"
     )]
-    socket: PathBuf,
-    /// Control verb, such as `status` or `apply`, read TOML body from stdin
-    #[arg(trailing_var_arg = true, required = true)]
-    request: Vec<String>,
+    config: PathBuf,
+    #[arg(long, env = walshadow::init::SOURCE_URL_ENV)]
+    source_url: Option<String>,
+    #[arg(long, env = walshadow::init::CH_URL_ENV)]
+    ch_url: Option<String>,
+    /// Replicate this table. Two words, schema then table; repeat per table
+    #[arg(long, num_args = 2, value_names = ["SCHEMA", "TABLE"])]
+    table: Vec<String>,
+    /// Replicate every table that has a row key
+    #[arg(long)]
+    all_tables: bool,
+    /// Restrict listing (and `--all-tables`) to one schema
+    #[arg(long)]
+    schema: Option<String>,
+    /// Backfill of rows that pre-date the opt-in
+    #[arg(long, default_value = "copy")]
+    initial_load: String,
+    /// Overwrite an existing config
+    #[arg(long)]
+    force: bool,
+}
+
+impl InitArgs {
+    fn into_opts(self) -> walshadow::init::InitOpts {
+        walshadow::init::InitOpts {
+            config: self.config,
+            source_url: self.source_url,
+            ch_url: self.ch_url,
+            tables: self
+                .table
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| RelName::new(&pair[0], &pair[1]))
+                .collect(),
+            all_tables: self.all_tables,
+            namespace: self.schema,
+            initial_load: self.initial_load,
+            force: self.force,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -290,6 +328,21 @@ struct CtlArgs {
     about = "Stream + filter physical WAL from source PG."
 )]
 struct Args {
+    /// Source connection as one URL, eg
+    /// `postgres://user:password@host:5432/dbname?sslmode=require`. Wins
+    /// over the discrete `--host` / `--port` / … flags, loses to
+    /// `[source]` in `--ch-config`, same as they do
+    #[arg(long, env = walshadow::init::SOURCE_URL_ENV)]
+    source_url: Option<String>,
+    /// Destination as one URL, eg
+    /// `clickhouse://user:password@host:9000/database`. Supplies `[ch]`
+    /// when no config file does, which is what turns the emitter on
+    #[arg(long, env = walshadow::init::CH_URL_ENV)]
+    ch_url: Option<String>,
+    /// `[source]` / `[ch]` decoded from the two URL flags once at startup,
+    /// then merged over the discrete flags by [`cli_base`]
+    #[arg(skip)]
+    url_base: toml::Table,
     /// Source PG host (TCP) or unix socket directory (leading `/`)
     #[arg(long, default_value = "localhost")]
     host: String,
@@ -532,8 +585,14 @@ async fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("ctl") {
         let rest = std::iter::once(format!("{} ctl", argv[0])).chain(argv.into_iter().skip(2));
-        let ctl = CtlArgs::parse_from(rest);
-        return run_ctl(ctl.socket, ctl.request).await;
+        let (socket, command) = walshadow::ctl::Cli::parse_from(rest).into_parts()?;
+        return run_ctl(&socket, command).await;
+    }
+    if argv.get(1).map(String::as_str) == Some("init") {
+        let rest = std::iter::once(format!("{} init", argv[0])).chain(argv.into_iter().skip(2));
+        let opts = InitArgs::parse_from(rest).into_opts();
+        init_tracing(None);
+        return walshadow::init::run(opts).await;
     }
     let args = Args::parse();
     walshadow::trace::set_sample_ratio(args.trace_sample_ratio);
@@ -555,20 +614,19 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run_ctl(socket: PathBuf, request: Vec<String>) -> Result<()> {
+async fn run_ctl(socket: &Path, cmd: walshadow::ctl::Command) -> Result<()> {
     use std::io::{IsTerminal, Read};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let verb = request.first().map(String::as_str).unwrap_or_default();
-    let config: toml::Table = if std::io::stdin().is_terminal() {
-        toml::Table::new()
+    let body = if cmd.reads_stdin && !std::io::stdin().is_terminal() {
+        let mut raw = String::new();
+        std::io::stdin().read_to_string(&mut raw)?;
+        raw.parse().context("parse config body as TOML")?
     } else {
-        let mut body = String::new();
-        std::io::stdin().read_to_string(&mut body)?;
-        body.parse().context("parse config body as TOML")?
+        cmd.body
     };
-    let doc = walshadow::control::encode_request(verb, config)?;
-    let mut stream = tokio::net::UnixStream::connect(&socket)
+    let doc = walshadow::control::encode_request(&cmd.verb, body)?;
+    let mut stream = tokio::net::UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect control socket {}", socket.display()))?;
     stream.write_all(doc.as_bytes()).await?;
@@ -576,20 +634,19 @@ async fn run_ctl(socket: PathBuf, request: Vec<String>) -> Result<()> {
     stream.shutdown().await.ok();
     let mut resp = String::new();
     stream.read_to_string(&mut resp).await?;
-    let first = resp.lines().next().unwrap_or("");
-    if let Some(rest) = first.strip_prefix("OK") {
-        let rest = rest.trim();
-        if !rest.is_empty() {
-            println!("{rest}");
-        }
-        for l in resp.lines().skip(1) {
-            println!("{l}");
-        }
-        Ok(())
-    } else {
+    let (head, payload) = resp.split_once('\n').unwrap_or((resp.as_str(), ""));
+    let Some(trailer) = head.strip_prefix("OK") else {
         eprint!("{resp}");
         std::process::exit(1);
+    };
+    if !trailer.trim().is_empty() {
+        println!("{}", trailer.trim());
     }
+    let rendered = walshadow::ctl::render(&cmd.verb, payload);
+    if !rendered.trim().is_empty() {
+        println!("{}", rendered.trim_end());
+    }
+    Ok(())
 }
 
 /// OTLP/gRPC batch tracer provider for `endpoint`. Must run inside the tokio
@@ -673,9 +730,11 @@ fn init_tracing(
     provider
 }
 
-/// `[source]` defaults from the CLI args — the base layer under the config file
-/// for connection resolution, shared by the session and the control surface.
-fn cli_source_base(args: &Args) -> toml::Table {
+/// `[source]` + `[ch]` defaults from the CLI args — the base layer under the
+/// config file for connection resolution, shared by the session and the
+/// control surface. A `--source-url` / `--ch-url` merges over the discrete
+/// flags, so the URL wins wherever both name a field.
+fn cli_base(args: &Args) -> toml::Table {
     let mut s = toml::Table::new();
     s.insert("host".into(), args.host.clone().into());
     s.insert("port".into(), (args.port as i64).into());
@@ -687,7 +746,30 @@ fn cli_source_base(args: &Args) -> toml::Table {
     s.insert("sslmode".into(), args.sslmode.clone().into());
     let mut root = toml::Table::new();
     root.insert("source".into(), toml::Value::Table(s));
+    walshadow::ch_emitter::merge_tables(&mut root, args.url_base.clone());
     root
+}
+
+/// Decode `--source-url` / `--ch-url` once, so every later `cli_base` is a
+/// pure merge and a malformed URL fails at startup rather than mid-reload
+fn url_base(args: &Args) -> Result<toml::Table> {
+    let mut root = toml::Table::new();
+    // An env var exported empty reads as unset, so a compose file may pass
+    // the name through unconditionally
+    let nonempty = |u: &&String| !u.trim().is_empty();
+    if let Some(url) = args.source_url.as_ref().filter(nonempty) {
+        root.insert(
+            "source".into(),
+            toml::Value::Table(walshadow::dsn::source_table(url)?),
+        );
+    }
+    if let Some(url) = args.ch_url.as_ref().filter(nonempty) {
+        root.insert(
+            "ch".into(),
+            toml::Value::Table(walshadow::dsn::ch_table(url)?),
+        );
+    }
+    Ok(root)
 }
 
 fn spawn_sighup_reload(
@@ -722,9 +804,10 @@ fn validate_transport_args(args: &Args) -> Result<()> {
 /// Process-lifetime entry: bind metrics + control socket + SIGHUP, then stream
 /// one session. Every reconfigure (socket / SIGHUP) is a live reload — no
 /// restart. Ctrl-C breaks the pump loop and drains gracefully.
-async fn run(args: Args) -> Result<()> {
+async fn run(mut args: Args) -> Result<()> {
     use walshadow::control::{Reloader, SharedCtx};
 
+    args.url_base = url_base(&args)?;
     validate_transport_args(&args)?;
     let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .inspect_err(|e| {
@@ -764,7 +847,7 @@ async fn run(args: Args) -> Result<()> {
             .context("--control-socket requires --ch-config")?;
         let ctx = SharedCtx {
             ch_config,
-            source_base: cli_source_base(&args),
+            cli_base: cli_base(&args),
             metrics: metrics.clone(),
             reloader: reloader.clone(),
             frag_lock: Arc::new(Mutex::new(())),
@@ -792,10 +875,10 @@ async fn run_session(
     let metrics = metrics.clone();
 
     let merged: toml::Table = match args.ch_config.as_deref() {
-        Some(p) => walshadow::ch_emitter::load_effective(p, cli_source_base(args))
+        Some(p) => walshadow::ch_emitter::load_effective(p, cli_base(args))
             .await
             .with_context(|| format!("load config {}", p.display()))?,
-        None => cli_source_base(args),
+        None => cli_base(args),
     };
     // Applied source endpoint. Boot resolves it file-over-CLI; a later reload
     // republishes it on the config watch and the pump swaps its feed.
@@ -840,6 +923,14 @@ async fn run_session(
     } else {
         None
     };
+    // Before anything dials CH naming that database in its handshake — the
+    // bootstrap insert tail is first, and its failure there reads as a
+    // bootstrap fault rather than a missing destination
+    if let Some(cfg) = ch_config.as_ref() {
+        walshadow::ch_ddl::ensure_boot_database(cfg)
+            .await
+            .with_context(|| format!("reach ClickHouse {}:{}", cfg.host, cfg.port))?;
+    }
     // QueueingRecordSink knobs feed both the CH and metrics-only pipelines,
     // so resolve here while `ch_config` is still in scope (it is consumed
     // into `emitter_cfg` below). CLI over `[ch]` over the built-in default.
@@ -1461,7 +1552,7 @@ async fn run_session(
             &emitter_cfg,
             cli_overrides,
             args.ch_config.clone(),
-            cli_source_base(args),
+            cli_base(args),
             mapping.clone(),
         );
         reloader.set_resolver(Some(resolver.clone())).await;
@@ -1516,44 +1607,28 @@ async fn run_session(
         emitter_stats_handle = Some(stats.clone());
         // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
         // own source session + CH tail per backfill or pass, spill-dir
-        // ledger dedups restarts.
-        let toml_initial_load = emitter_cfg
-            .table_initial_loads
-            .values()
-            .chain(
-                emitter_cfg
-                    .table_opt_ins
-                    .values()
-                    .filter_map(|r| r.initial_load.as_ref()),
-            )
-            .chain(
-                emitter_cfg
-                    .table_entries
-                    .iter()
-                    .filter_map(|(_, _, rule)| rule.initial_load.as_ref()),
-            )
-            .any(|mode| InitialLoadMode::parse(mode).is_some_and(|m| m != InitialLoadMode::None));
+        // ledger dedups restarts. Wired whenever the emitter runs, since an
+        // opt-in arriving later over the control socket or the overlay would
+        // otherwise silently skip its backfill; idle it costs one ledger read.
         // One validated resident-payload pool for the pipeline and every
         // concurrent backup pass
         let pipeline_budget =
             walshadow::pipeline::build_budget(&emitter_cfg, emitter_cfg.decoder_pool_size)
                 .map_err(|e| anyhow::anyhow!("memory budget: {e}"))?;
-        if emitter_cfg.runtime_config_schema.is_some() || toml_initial_load {
-            copy_backfiller = Some(Arc::new(
-                walshadow::copy_backfill::CopyBackfiller::new(
-                    cfg.clone(),
-                    emitter_cfg.clone(),
-                    mapping.clone(),
-                    stats.clone(),
-                    catalog.clone(),
-                    desc_log.clone(),
-                    &args.spill_dir,
-                    Some(config_rx.clone()),
-                    Some(pipeline_budget.clone()),
-                )
-                .await,
-            ));
-        }
+        copy_backfiller = Some(Arc::new(
+            walshadow::copy_backfill::CopyBackfiller::new(
+                cfg.clone(),
+                emitter_cfg.clone(),
+                mapping.clone(),
+                stats.clone(),
+                catalog.clone(),
+                desc_log.clone(),
+                &args.spill_dir,
+                Some(config_rx.clone()),
+                Some(pipeline_budget.clone()),
+            )
+            .await,
+        ));
         let backfiller_effects: Option<Arc<dyn walshadow::opt_in::Backfiller>> =
             copy_backfiller.clone().map(|backfiller| backfiller as _);
         // Re-materialise per-table opt-in scope from the seeded config_table
@@ -3747,7 +3822,7 @@ async fn connect_source_waiting(
         let Some(path) = args.ch_config.as_deref() else {
             continue;
         };
-        match walshadow::ch_emitter::load_effective(path, cli_source_base(args)).await {
+        match walshadow::ch_emitter::load_effective(path, cli_base(args)).await {
             Ok(table) => match SourceConn::from_table(&table).map(|mut next| {
                 // Preserve CLI slot override across reloads
                 if args.slot.is_some() {
@@ -4359,7 +4434,7 @@ async fn bootstrap_build_mapping(
         emitter_cfg,
         cli_overrides,
         args.ch_config.clone(),
-        cli_source_base(args),
+        cli_base(args),
         mapping.clone(),
     );
     let (ddl_cfg, merged_tables) = {

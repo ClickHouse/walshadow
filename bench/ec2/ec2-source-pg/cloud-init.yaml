@@ -1,8 +1,7 @@
 #cloud-config
 # Provisions the walshadow "source" Postgres on a fresh Ubuntu host:
 # installs Docker, then runs postgres:17-bookworm with wal_level=logical
-# and the init/source scripts (demo.users seed + replication HBA),
-# mirroring the `source` service in docker/docker-compose.yml.
+# with demo.users seed and replication HBA
 write_files:
   - path: /opt/walshadow/init/source/00-hba.sh
     permissions: '0755'

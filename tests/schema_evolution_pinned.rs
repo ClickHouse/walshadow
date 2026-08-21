@@ -1,9 +1,8 @@
 //! Pinned-table DDL baseline — `ALTER ADD COLUMN` on an operator-pinned
 //! relation propagates to ClickHouse without any priming DML.
 //!
-//! The docker-demo scenario (`docker/DEMO.md`): `demo.users` is pinned in
-//! `ch-config`, gets no traffic, then the presenter runs `ALTER TABLE
-//! demo.users ADD COLUMN signup_ts …`. Pre-fix, the very first descriptor
+//! `demo.users` is pinned in `ch-config` and gets no traffic before `ALTER TABLE
+//! demo.users ADD COLUMN signup_ts …`. Pre-fix, first descriptor
 //! fetch already carried the post-ALTER shape, `prev_known` was cold for
 //! the oid → `Added` → `apply_added` skips the pinned dest → CH never grew
 //! the column. The startup `seed_baseline` warms `prev_known` with the

@@ -1,112 +1,44 @@
-# walshadow demo. Three services:
-#   source     — postgres:18 with wal_level=logical, demo.users seeded
-#                via init script, REPLICA IDENTITY FULL set
-#   clickhouse — clickhouse-server; only the demo database is pre-created,
-#                walshadow auto-creates the tables (replicate_all, on by default)
-#   walshadow  — custom image carrying walshadow-stream + the walshadow PG
-#                extension. Boots an in-container shadow PG on the empty volume,
-#                copies every source table into clickhouse, then streams live;
-#                resumes from the cursor on later starts
+# walshadow quickstart — replicate your own Postgres into your own
+# ClickHouse. One service: the daemon, plus the shadow PG it owns inside the
+# container. Walkthrough in docker/QUICKSTART.md
 #
-# Quick start (from repo root):
-#   git submodule update --init --recursive
-#   docker compose -f docker/docker-compose.yml up --build
+#   export WALSHADOW_SOURCE_URL=postgres://user:password@host:5432/dbname
+#   export WALSHADOW_CH_URL=clickhouse://user:password@host:9000/database
+#   docker compose -f docker/docker-compose.yml run --rm walshadow init
+#   docker compose -f docker/docker-compose.yml up --build -d
 #   docker compose -f docker/docker-compose.yml logs -f walshadow   # wait for bootstrap
+#   docker compose -f docker/docker-compose.yml \
+#       -f docker/docker-compose.grafana.yml up -d                  # browser status
 #
-# Drive the pipeline:
-#   docker compose -f docker/docker-compose.yml exec source \
-#       psql -U postgres -c "UPDATE demo.users SET email='opifex@merces-digna' WHERE id=1"
-#   docker compose -f docker/docker-compose.yml exec clickhouse \
-#       clickhouse-client --query "SELECT * FROM demo.users FINAL"
+# The shadow is a physical clone of the source, so the image's PostgreSQL
+# major must equal the source's. Anything but 18:
+#
+#   PG_MAJOR=17 docker compose -f docker/docker-compose.yml up --build -d
+
+name: walshadow
 
 services:
-  source:
-    image: postgres:18-bookworm
-    environment:
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_HOST_AUTH_METHOD: trust
-    command:
-      - postgres
-      - -c
-      - wal_level=logical
-      - -c
-      - max_wal_senders=8
-      - -c
-      - max_replication_slots=8
-      - -c
-      - wal_keep_size=128MB
-      - -c
-      - wal_compression=lz4
-    volumes:
-      - ./init/source:/docker-entrypoint-initdb.d:ro
-      # PG 18+ official image stores data in a major-version subdir
-      # (/var/lib/postgresql/18/docker); mount the parent, not /data.
-      # See https://github.com/docker-library/postgres/pull/1259
-      - source-data:/var/lib/postgresql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-    ports:
-      - "5432:5432"
-
-  clickhouse:
-    image: clickhouse/clickhouse-server:26.3
-    environment:
-      CLICKHOUSE_SKIP_USER_SETUP: "1"
-    volumes:
-      - ./init/clickhouse:/docker-entrypoint-initdb.d:ro
-      - clickhouse-data:/var/lib/clickhouse
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-    ports:
-      - "8123:8123"
-      - "9000:9000"
-
-  # End-to-end trace sink. Jaeger all-in-one ingests OTLP/gRPC on 4317
-  # (COLLECTOR_OTLP_ENABLED) and serves the trace UI on 16686. Open a
-  # slow `txn` there to see its commit.drain → emit.insert waterfall.
-  jaeger:
-    image: jaegertracing/all-in-one:1.57
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-    ports:
-      - "16686:16686"
-      - "4317:4317"
-
   walshadow:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    depends_on:
-      source:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-      jaeger:
-        condition: service_started
+      args:
+        PG_MAJOR: ${PG_MAJOR:-18}
     environment:
-      RUST_LOG: warn,walshadow=info
-      WALSHADOW_SOURCE_HOST: source
-      WALSHADOW_SOURCE_PORT: "5432"
-      # Ship spans to the Jaeger sidecar. Unset this (or remove jaeger)
-      # to run with zero tracing overhead — no exporter is installed.
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
-    volumes:
-      - ./ch-config.toml:/etc/walshadow/ch-config.toml:ro
-      - walshadow-data:/var/lib/walshadow
+      - RUST_LOG=${RUST_LOG:-warn,walshadow=info}
+      # Bare names pass the shell's value through, so an unset URL stays unset
+      - WALSHADOW_SOURCE_URL
+      - WALSHADOW_CH_URL
     ports:
-      - "9484:9484"
+      - "${WALSHADOW_METRICS_PORT:-9484}:9484"
+    volumes:
+      # WAL segments, spill files, and the shadow data dir. Losing it costs a
+      # rebootstrap, not correctness
+      - walshadow-data:/var/lib/walshadow
+      # `init` writes ch-config.toml here; `ctl` writes its fragments beside it
+      - walshadow-config:/etc/walshadow
+    stop_grace_period: 30s
 
 volumes:
-  source-data:
-  clickhouse-data:
   walshadow-data:
+  walshadow-config:

@@ -11,12 +11,16 @@ use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use toml::{Table, Value};
 
 use walrus::pg::backup::format_pg_lsn;
 
+use crate::config::SourceConn;
+use crate::introspect;
 use crate::metrics::MetricsRegistry;
+use crate::schema::RelName;
+use crate::source_feed::open_sql_client;
 
 /// Holds the running session's resolver so the control socket + SIGHUP can
 /// trigger a live `reload()`. The daemon streams one session; there is no
@@ -65,9 +69,10 @@ impl Reloader {
 #[derive(Clone)]
 pub struct SharedCtx {
     pub ch_config: PathBuf,
-    /// CLI-arg `[source]` defaults; the config file overrides them, matching the
-    /// daemon's connection resolution (see `ch_emitter::load_effective`).
-    pub source_base: Table,
+    /// CLI-arg `[source]` / `[ch]` defaults; the config file overrides them,
+    /// matching the daemon's connection resolution
+    /// (see `ch_emitter::load_effective`).
+    pub cli_base: Table,
     pub metrics: MetricsRegistry,
     pub reloader: Arc<Reloader>,
     /// Prevents concurrent fragment updates from overwriting each other
@@ -256,44 +261,33 @@ fn frag_path(ch_config: &Path) -> PathBuf {
 }
 
 async fn get_config(ctx: &SharedCtx) -> Result<Table> {
-    Ok(crate::ch_emitter::load_effective(&ctx.ch_config, ctx.source_base.clone()).await?)
+    Ok(crate::ch_emitter::load_effective(&ctx.ch_config, ctx.cli_base.clone()).await?)
 }
 
 async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
     let root = get_config(ctx).await?;
     let client = pg_connect(&root).await?;
     let ns = req.config.get("namespace").and_then(Value::as_str);
-    let base = "SELECT n.nspname, c.relname, c.relreplident \
-         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema') \
-           AND n.nspname NOT LIKE 'pg\\_%'";
-    let rows = if let Some(ns) = ns {
-        client
-            .query(&format!("{base} AND n.nspname=$1 ORDER BY 1,2"), &[&ns])
-            .await
-    } else {
-        client.query(&format!("{base} ORDER BY 1,2"), &[]).await
-    }
-    .context("list tables")?;
+    let listed = introspect::tables(&client, ns)
+        .await
+        .context("list tables")?;
     let selected: ahash::HashSet<(String, String)> = selected_tables(&root).into_iter().collect();
-    let mut arr = Vec::with_capacity(rows.len());
-    for r in rows {
-        let ns: String = r.get(0);
-        let rel: String = r.get(1);
-        let ident: i8 = r.get(2);
-        let mut t = Table::new();
-        t.insert(
-            "selected".into(),
-            selected.contains(&(ns.clone(), rel.clone())).into(),
-        );
-        t.insert(
-            "replica_identity".into(),
-            Value::String((ident as u8 as char).to_string()),
-        );
-        t.insert("namespace".into(), ns.into());
-        t.insert("name".into(), rel.into());
-        arr.push(Value::Table(t));
-    }
+    let arr = listed
+        .into_iter()
+        .map(|t| {
+            let key = (t.rel.namespace.to_string(), t.rel.name.to_string());
+            let mut row = Table::new();
+            row.insert("selected".into(), selected.contains(&key).into());
+            row.insert(
+                "replica_identity".into(),
+                Value::String(t.replica_identity.to_string()),
+            );
+            row.insert("has_row_key".into(), t.has_row_key().into());
+            row.insert("namespace".into(), key.0.into());
+            row.insert("name".into(), key.1.into());
+            Value::Table(row)
+        })
+        .collect();
     let mut out = Table::new();
     out.insert("tables".into(), Value::Array(arr));
     Ok(ok_toml(&out))
@@ -302,16 +296,12 @@ async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
 async fn schemas_list(ctx: &SharedCtx) -> Result<String> {
     let root = get_config(ctx).await?;
     let client = pg_connect(&root).await?;
-    let rows = client
-        .query(
-            "SELECT nspname FROM pg_namespace \
-             WHERE nspname NOT IN ('pg_catalog','information_schema') \
-               AND nspname NOT LIKE 'pg\\_%' ORDER BY 1",
-            &[],
-        )
+    let names: Vec<Value> = introspect::schemas(&client)
         .await
-        .context("list schemas")?;
-    let names: Vec<Value> = rows.iter().map(|r| r.get::<_, String>(0).into()).collect();
+        .context("list schemas")?
+        .into_iter()
+        .map(Value::String)
+        .collect();
     let mut out = Table::new();
     out.insert("schemas".into(), Value::Array(names));
     Ok(ok_toml(&out))
@@ -326,25 +316,18 @@ async fn columns_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> 
     };
     let root = get_config(ctx).await?;
     let client = pg_connect(&root).await?;
-    let rows = client
-        .query(
-            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull \
-             FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid \
-             JOIN pg_namespace n ON n.oid=c.relnamespace \
-             WHERE n.nspname=$1 AND c.relname=$2 AND a.attnum>0 AND NOT a.attisdropped \
-             ORDER BY a.attnum",
-            &[&ns, &rel],
-        )
+    let arr = introspect::columns(&client, &RelName::new(ns, rel))
         .await
-        .context("list columns")?;
-    let mut arr = Vec::with_capacity(rows.len());
-    for r in rows {
-        let mut t = Table::new();
-        t.insert("name".into(), r.get::<_, String>(0).into());
-        t.insert("type".into(), r.get::<_, String>(1).into());
-        t.insert("notnull".into(), r.get::<_, bool>(2).into());
-        arr.push(Value::Table(t));
-    }
+        .context("list columns")?
+        .into_iter()
+        .map(|c| {
+            let mut t = Table::new();
+            t.insert("name".into(), c.name.into());
+            t.insert("type".into(), c.pg_type.into());
+            t.insert("notnull".into(), c.notnull.into());
+            Value::Table(t)
+        })
+        .collect();
     let mut out = Table::new();
     out.insert("columns".into(), Value::Array(arr));
     Ok(ok_toml(&out))
@@ -494,51 +477,18 @@ async fn save(path: &Path, root: &Table) -> Result<()> {
     Ok(())
 }
 
-fn render(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-fn str_at(root: &Table, section: &str, key: &str) -> String {
-    root.get(section)
-        .and_then(Value::as_table)
-        .and_then(|t| t.get(key))
-        .map(render)
-        .unwrap_or_default()
-}
-
-// TODO: use daemon catalog, direct NoTls connection cannot inspect TLS-only sources
+// TODO: use daemon catalog rather than a second connection per request
 async fn pg_connect(root: &Table) -> Result<Client> {
-    let host = str_at(root, "source", "host");
-    if host.is_empty() {
+    let conn = SourceConn::from_table(root).map_err(|e| anyhow::anyhow!("[source] {e}"))?;
+    if conn.host.is_empty() {
         bail!("source host not set");
     }
-    let mut cfg = tokio_postgres::Config::new();
-    cfg.host(&host)
-        .port(str_at(root, "source", "port").parse().unwrap_or(5432))
-        .dbname(nonempty(str_at(root, "source", "dbname"), "postgres"))
-        .user(nonempty(str_at(root, "source", "user"), "postgres"));
-    let pw = str_at(root, "source", "password");
-    if !pw.is_empty() {
-        cfg.password(&pw);
-    }
-    let (client, conn) = cfg
-        .connect(NoTls)
+    open_sql_client(&conn.to_pg_config())
         .await
-        .context("connect source postgres")?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    Ok(client)
+        .with_context(|| format!("connect source {}", conn.endpoint()))
 }
 
 // ---- misc -----------------------------------------------------------------
-
-fn nonempty(v: String, default: &str) -> String {
-    if v.is_empty() { default.to_string() } else { v }
-}
 fn set_mode_600(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -548,6 +498,18 @@ fn set_mode_600(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scalar at `[section] key`, for asserting fragment edits
+    fn str_at(root: &Table, section: &str, key: &str) -> String {
+        root.get(section)
+            .and_then(Value::as_table)
+            .and_then(|t| t.get(key))
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default()
+    }
 
     fn cfg(toml: &str) -> Table {
         if toml.is_empty() {
@@ -598,7 +560,7 @@ mod tests {
     fn ctx_at(dir: &Path) -> SharedCtx {
         SharedCtx {
             ch_config: dir.join("ch-config.toml"),
-            source_base: Table::new(),
+            cli_base: Table::new(),
             metrics: MetricsRegistry::new(),
             reloader: Arc::new(Reloader::default()),
             frag_lock: Arc::new(Mutex::new(())),

@@ -55,6 +55,7 @@ futures = "0.3"
 libc = "0.2"
 lz4 = "1"
 pglz = "0.1"
+percent-encoding = "2"
 postgres-protocol = "0.6"
 globset = "0.4"
 regex-automata = "0.4"
@@ -68,6 +69,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+url = "2"
 zstd = "0.13"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }

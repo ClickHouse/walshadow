@@ -12,56 +12,44 @@ docs indexed at [plans/INDEX.md](plans/INDEX.md); for diagrams,
 
 ## Quick start (docker)
 
-One command against your source PG (image publishing soon):
-
-```
-docker run --rm \
-    -v walshadow-data:/var/lib/walshadow \
-    -v /etc/walshadow/ch.toml:/etc/walshadow/ch.toml:ro \
-    clickhouse/walshadow \
-    --host source.example --user replicator \
-    --out-dir                   /var/lib/walshadow/wal \
-    --spill-dir                 /var/lib/walshadow/spill \
-    --shadow-socket-dir         /var/run/postgresql \
-    --bootstrap-shadow-data-dir /var/lib/walshadow/shadow \
-    --walsender-bind            127.0.0.1:6510 \
-    --ch-config                 /etc/walshadow/ch.toml
-```
-
-`ch.toml` is just the CH connection block (see [CH emitter
-config](#ch-emitter-config)). walshadow bootstraps its own shadow PG, copies
-every table into ClickHouse, then streams live — no per-table config. See
-[Running standalone](#running-standalone) for the flags.
-
-## Try the demo locally
-
-Full source PG → walshadow → ClickHouse stack (builds from source):
+Point walshadow at source PostgreSQL and destination ClickHouse:
 
 ```
 git submodule update --init --recursive
-docker compose -f docker/docker-compose.yml up --build -d
+
+export PG_MAJOR=17
+export WALSHADOW_SOURCE_URL='postgres://replicator:secret@db.internal:5432/app?sslmode=require'
+export WALSHADOW_CH_URL='clickhouse://default:secret@ch.internal:9000/cdc'
+
+docker compose -f docker/docker-compose.yml build
+docker compose -f docker/docker-compose.yml run --rm walshadow \
+    init --all-tables
+docker compose -f docker/docker-compose.yml up -d
 docker compose -f docker/docker-compose.yml logs -f walshadow
 ```
 
-Wait for the `shadow caught up to bootstrap end_lsn` line, then drive a change
-and read it back:
+Set `PG_MAJOR` to source PostgreSQL major. `init` validates both connections,
+creates destination database, and selects source tables with row keys. Fix any
+reported source requirements, then rerun it
+
+Wait for `shadow caught up to bootstrap end_lsn`, change a selected source row,
+then query matching ClickHouse table:
 
 ```
-docker compose -f docker/docker-compose.yml exec source \
-    psql -U postgres -c "UPDATE demo.users SET email='new@addr' WHERE id=1"
-docker compose -f docker/docker-compose.yml exec clickhouse \
-    clickhouse-client --query "SELECT id, email FROM demo.users FINAL ORDER BY id"
+clickhouse-client --host ch.internal --database cdc --query \
+    "SELECT * FROM users FINAL ORDER BY id"
 ```
 
-Full sequence in [docker/DEMO.md](docker/DEMO.md). For pgbench load with
-Grafana dashboards and live schema-change propagation:
+See [docker/QUICKSTART.md](docker/QUICKSTART.md) for table selection and
+teardown. Add browser status with provisioned Prometheus and Grafana:
 
 ```
-docker compose -f docker/docker-compose.yml -f docker/docker-compose.demo.yml up --build -d
+docker compose -f docker/docker-compose.yml \
+    -f docker/docker-compose.grafana.yml up -d
 ```
 
-then open http://localhost:3000. Walkthrough in
-[docker/DEMO.md](docker/DEMO.md)
+Open http://localhost:3000 to inspect health, lag, throughput, queues, memory,
+backfills, and source-transition state
 
 ## Source PG requirements
 
@@ -94,7 +82,8 @@ create the target CH database (walshadow makes tables, not databases), then:
 
 ```
 walshadow-stream \
-    --host source.example --user replicator \
+    --source-url postgres://replicator@source.example/app \
+    --ch-url     clickhouse://default@ch.example:9000/cdc \
     --out-dir                   /var/lib/walshadow/wal \
     --spill-dir                 /var/lib/walshadow/spill \
     --shadow-socket-dir         /var/run/postgresql \
@@ -103,7 +92,10 @@ walshadow-stream \
     --ch-config                 /etc/walshadow/ch.toml
 ```
 
-with a `ch.toml` that is just the connection block:
+Both URLs also read from `WALSHADOW_SOURCE_URL` / `WALSHADOW_CH_URL`, and both
+decompose into the discrete `--host` / `--port` / … flags. `walshadow-stream
+init` writes the config file; see [docker/QUICKSTART.md](docker/QUICKSTART.md).
+`ch.toml` is the connection block:
 
 ```toml
 [ch]
@@ -121,11 +113,32 @@ Notes:
   (it is baked into shadow's `primary_conninfo`).
 - `--bootstrap-shadow-data-dir` must be a new/empty dir; an initialized one
   resumes instead of re-bootstrapping.
-- Without `--ch-config` the daemon stays metrics-only (no CH emission). Pass
-  `--metrics-bind 127.0.0.1:9484` for a Prometheus scrape endpoint.
+- With neither `--ch-url` nor `[ch]` in `--ch-config`, the daemon stays
+  metrics-only (no CH emission). Pass `--metrics-bind 127.0.0.1:9484` for a
+  Prometheus scrape endpoint.
+- `--ch-config` names a file that need not exist yet: the control socket
+  writes its fragments into the sibling `ch-config.d/`.
 - To manage shadow PG yourself, drop `--bootstrap-shadow-data-dir` (bootstrap
   defaults to `off` then, streaming only). See `walshadow-stream --help` for
   the full surface (bootstrap modes, walsender tuning, retention, etc.)
+
+### Live control
+
+`--control-socket` opens a management socket the same binary speaks:
+
+```
+walshadow-stream ctl status                 # lag, rows synced, pause state
+walshadow-stream ctl tables                 # source tables, `*` = replicated
+walshadow-stream ctl add public users       # opt in, CH table auto-creates
+walshadow-stream ctl pause                  # freeze WAL consumption
+walshadow-stream ctl source postgres://…    # repoint the source endpoint
+walshadow-stream ctl help
+```
+
+Each verb applies to the running session, which reconfigures in place with
+no restart. Mutations land in `ch-config.d/50-api.toml`, leaving
+operator-owned config untouched. Details in
+[plans/control.md](plans/control.md)
 
 ### CH emitter config
 
@@ -146,6 +159,13 @@ replicate = false
 # Or list explicitly — replicate only what you name:
 [stream]
 replicate_all = false
+
+# Opt-in: shape comes from the source descriptor, CH table auto-creates
+[table.public.orders]
+replicate = true
+initial_load = "copy"
+
+# Pinned: exact columns, nothing outside this list replicates
 [table.public.users]
 replicate = true
 initial_load = "none"
@@ -163,8 +183,9 @@ carrying a dot or other TOML-special character quotes per key rules, e.g.
 `replicate_all` skips system schemas (`pg_*`, `information_schema`, the
 `[runtime_config]` schema). `attnum` values match `pg_attribute.attnum`
 (1-based) on the source relation; `type` is the CH destination type walshadow
-advertises in the INSERT block. SIGHUP reloads mappings atomically;
-connection params stay boot-only.
+advertises in the INSERT block. SIGHUP (or `ctl reload`) re-reads the file:
+mappings swap atomically, and a changed source or destination endpoint is
+redialled without a restart
 
 Name a set of tables instead of one, with `match`:
 
@@ -271,7 +292,7 @@ pgext/              walshadow decode-bridge PG module (PGXS)
 sql/                runtime-config overlay install SQL
 architecture/       overview + internals diagrams
 plans/              component design docs (overview.md is the baseline)
-docker/             docker-compose demo + Dockerfile
+docker/             quickstart Compose file + Dockerfile
 bench/              throughput / latency benchmark harnesses
 tests/              integration suite
 fixtures/wal/       golden WAL fixtures for offline tests

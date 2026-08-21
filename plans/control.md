@@ -15,13 +15,14 @@ modeled on `metrics::serve` + the `shadow_stream.rs` bind pattern). Absent →
 disabled. The client is the same binary: `walshadow-stream ctl <verb>` with the
 command body as a TOML fragment on stdin (`ctl apply <<TOML … TOML`); detected in
 `main` before daemon-arg parsing so it needs no daemon flags (`--socket`, env
-`WALSHADOW_CONTROL_SOCKET`, default `/run/walshadow/control.sock`).
+`WALSHADOW_CONTROL_SOCKET`, default `/run/walshadow/control.sock`). Word-list
+verbs (`add <schema> <table>`, `pause`, `source <url>`, …) build their own body
+in `src/ops/ctl.rs`, above these verbs rather than part of them.
 
 The command is a bare **verb**. The TOML body already has section headers, so
 target rides in body, not command: `apply` takes an arbitrary fragment (any mix
 of `[source]` / `[ch]` / `[table.*]` / `[stream]`) and merges it in one atomic
-reload. CLI ergonomics (friendly aliases) are a separate layer above these verbs,
-not the daemon's concern.
+reload.
 
 Wire protocol (one request per connection, `handle_conn`): a `<verb>` header
 line selects the handler; everything after the first newline is the config, a
@@ -66,12 +67,12 @@ that is *also* TOML (`show`/`status` are tables, `tables`/`columns` are
   endpoint while paused, which is the promotion target once step 4's repoint
   lands ([failover.md](failover.md) §Operator protocol).
 - `tables` (`namespace`) — enumerate source `pg_class` as an `[[tables]]` array
-  (`namespace`, `name`, `selected`, `replica_identity`), marking `selected` from
-  the merged config; `schemas` (array of strings), `columns` (`namespace`,
+  (`namespace`, `name`, `selected`, `replica_identity`, `has_row_key`), marking
+  `selected` from the merged config; `schemas` (array of strings), `columns` (`namespace`,
   `relname` → `[[columns]]` with `name`, `type`, `notnull`) — source-PG
   introspection.
 
-`SharedCtx { ch_config, source_base, metrics, reloader, frag_lock }` is handed to
+`SharedCtx { ch_config, cli_base, metrics, reloader, frag_lock }` is handed to
 the handlers; `frag_lock` serializes fragment read-modify-write so concurrent
 `apply`/`unset` can't lose an update or race a rollback. `Reloader` holds only
 the running session's `Arc<ConfigResolver>` (`set_resolver`, `reload`) — there is
@@ -83,8 +84,10 @@ Config is the daemon's own TOML, `--ch-config` **plus** every `*.toml` in the
 sibling `<ch-config>.d/` directory (e.g. `ch-config.toml` → `ch-config.d/`),
 deep-merged in lexical filename order — Postgres `include_dir` style
 (`ch_emitter::load_merged` / `merge_tables`). `load_effective(path, base)` layers
-the CLI-arg `[source]` defaults *under* the file so source connection resolves
-file-over-CLI (matches `EmitterConfig` boot).
+the CLI-arg `[source]` / `[ch]` defaults *under* the file so connections resolve
+file-over-CLI (matches `EmitterConfig` boot). That base is `cli_base(args)`: the
+discrete flags with `--source-url` / `--ch-url` merged over them, which is how a
+URL pair alone configures a daemon with no config file.
 
 The control API writes **only its own fragment**, `ch-config.d/50-api.toml`
 (`frag_path`) — sparse, only the keys `apply`/`unset` set. The operator's base
@@ -216,6 +219,9 @@ read-only mount.
 
 ## Files
 - `src/ops/control.rs` — socket, protocol, handlers, `Reloader`, `SharedCtx`.
+- `src/ops/ctl.rs` — client-side verb sugar + reply rendering.
+- `src/ops/introspect.rs` — the `tables` / `schemas` / `columns` catalog reads,
+  shared with `init`.
 - `src/bin/stream.rs` — `--control-socket`, `ctl` subcommand, `run`/`run_session`,
   `cli_source_base`, `spawn_sighup_reload`, pump `paused` gate + endpoint swap
   (`resume_source_feed`, `SOURCE_SWAP_RETRY`).
@@ -243,7 +249,9 @@ read-only mount.
   threading the watch through the store and clearing its created-table set on
   swap; off by default, so it is a known gap rather than a broken path.
 - Control still opens source-PG read connections for introspection
-  (`// TODO` on `pg_connect`) — route through the daemon's catalog later.
+  (`// TODO` on `pg_connect`) — route through the daemon's catalog later. Those
+  connections go through `SourceConn` + `source_feed::open_sql_client`, so they
+  honour `sslmode` and unix-socket hosts like the daemon's own.
 - The `walshadow-peerdb` shim's PAUSED/RUNNING map to `apply [stream] paused`;
   create-mirror maps to one `apply` carrying `[source]` + `[ch]` + `[table.*]`
   (source, dest, and tables in a single atomic reload). Repointing a live

@@ -1,6 +1,5 @@
-//! Replication-latency benchmarks against the local docker-compose stack
-//! (`docker/docker-compose.yml`, over host-exposed ports). The benchmark
-//! engine and the full CLI surface live in `../bench.rs`, shared with
+//! Replication-latency benchmarks against services on host-exposed ports
+//! Benchmark engine and full CLI surface live in `../bench.rs`, shared with
 //! `ec2_bench`; the only thing this binary does differently is default the
 //! endpoints to localhost.
 //!
@@ -18,7 +17,7 @@ use walshadow_bench::CommonArgs;
 #[derive(Parser, Debug)]
 #[command(
     name = "walshadow-local-bench",
-    about = "Measure source-Postgres → ClickHouse replication latency (local compose stack)",
+    about = "Measure source-Postgres → ClickHouse replication latency on local endpoints",
     // CommonArgs leaves --bench optional for ec2_bench's whole-suite mode; this
     // binary has no suite, so demand it at parse time.
     group(ArgGroup::new("what").args(["bench"]).required(true)),
@@ -31,7 +30,7 @@ struct Args {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    // Local stack: source + destination default to localhost unless overridden
+    // Source and destination default to localhost unless overridden
     // (--ch-host doubles as the destination-host override here).
     let pg_host = args
         .common
