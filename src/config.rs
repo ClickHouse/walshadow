@@ -311,7 +311,7 @@ pub struct ConfigResolver {
     toml_path: Option<PathBuf>,
     /// CLI-arg `[source]` base layer, merged under the file on reload (matches
     /// boot's `load_effective`).
-    cli_source_base: toml::Table,
+    cli_base: toml::Table,
     cli: CliOverrides,
     inner: Mutex<MergeInputs>,
     tx: watch::Sender<Arc<ResolvedConfig>>,
@@ -339,7 +339,7 @@ impl ConfigResolver {
         base: &EmitterConfig,
         cli: CliOverrides,
         toml_path: Option<PathBuf>,
-        cli_source_base: toml::Table,
+        cli_base: toml::Table,
         mapping: MappingHandle,
     ) -> (Arc<Self>, watch::Receiver<Arc<ResolvedConfig>>) {
         let overlay = ConfigOverlay::default();
@@ -348,7 +348,7 @@ impl ConfigResolver {
         let (tx, rx) = watch::channel(Arc::new(initial));
         let this = Arc::new(Self {
             toml_path,
-            cli_source_base,
+            cli_base,
             cli,
             inner: Mutex::new(MergeInputs {
                 base: base.clone(),
@@ -818,7 +818,7 @@ impl ConfigResolver {
         let Some(path) = &self.toml_path else {
             return Ok(());
         };
-        let merged = crate::ch_emitter::load_effective(path, self.cli_source_base.clone()).await?;
+        let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
         let base = EmitterConfig::from_table(&merged)?;
         let mut inner = self.inner.lock().await;
         inner.base = base;

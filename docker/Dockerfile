@@ -1,4 +1,5 @@
-# walshadow demo image. Multi-stage on alpine/musl:
+# walshadow image
+# Multi-stage on alpine/musl:
 #   1. rust:1-alpine        -> static-ish walshadow-stream binary. alpine 3.23
 #      ships gcc 15, so clickhouse-c-rs builds under -std=c23.
 #   2. postgres:N-alpine     -> walshadow PG module, compiled against the
@@ -6,6 +7,10 @@
 #      binary itself links no PG, so it builds separately.
 #   3. postgres:N-alpine runtime carries both, so daemon-owned shadow PG
 #      resolves `shared_preload_libraries = 'walshadow'` from its own $libdir.
+#
+# PG_MAJOR must equal the source cluster's major: the shadow is a physical
+# clone, and a basebackup cannot span majors. Build for another source with
+# `--build-arg PG_MAJOR=17`.
 
 ARG PG_MAJOR=18
 

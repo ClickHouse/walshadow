@@ -2944,6 +2944,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "percent-encoding",
  "pglz",
  "postgres-protocol",
  "regex-automata",
@@ -2959,6 +2960,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "wal-rus",
  "zstd",
 ]

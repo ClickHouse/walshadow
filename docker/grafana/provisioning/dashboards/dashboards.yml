@@ -1,4 +1,3 @@
-# Load every dashboard JSON under /var/lib/grafana/dashboards on boot.
 apiVersion: 1
 
 providers:
@@ -6,8 +5,8 @@ providers:
     orgId: 1
     folder: ""
     type: file
-    disableDeletion: false
-    allowUiUpdates: true
+    disableDeletion: true
+    allowUiUpdates: false
     options:
       path: /var/lib/grafana/dashboards
       foldersFromFilesStructure: false

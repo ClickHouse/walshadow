@@ -826,6 +826,41 @@ pub fn render_create_table(
     )))
 }
 
+/// CH `UNKNOWN_DATABASE`
+const UNKNOWN_DATABASE: i32 = 81;
+
+/// Create `[ch] database` when the server doesn't have it, over a session on
+/// `default` — every other client names it in the handshake, which CH refuses
+/// outright for an absent database, so no connected client can create its own.
+/// `Ok(false)` when it was already there. Sibling databases (per-namespace
+/// `target_database`) go through the applicator's own `ensure_database` instead
+pub async fn ensure_boot_database(cfg: &EmitterConfig) -> Result<bool, EmitterError> {
+    match connect_client(cfg).await {
+        Ok(_) => Ok(false),
+        Err(EmitterError::Client(e)) if e.server_code == UNKNOWN_DATABASE => {
+            let mut on_default = cfg.clone();
+            on_default.database = "default".into();
+            let mut client = connect_client(&on_default).await?;
+            exec_drain(
+                &mut client,
+                &format!(
+                    "CREATE DATABASE IF NOT EXISTS {}",
+                    quote_ident(&cfg.database)
+                ),
+                cfg.insert_timeout,
+            )
+            .await?;
+            tracing::info!(
+                target: "walshadow::ch_ddl",
+                database = %cfg.database,
+                "created destination database",
+            );
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// `CREATE TABLE IF NOT EXISTS` rendered from an existing mapping — the
 /// re-create path for a mapped dest dropped under strategy=drop. Columns
 /// come from the mapping (the emitter's INSERT contract), not the

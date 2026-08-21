@@ -1,5 +1,8 @@
 pub mod bridge;
 pub mod control;
+pub mod ctl;
+pub mod init;
+pub mod introspect;
 pub mod metrics;
 pub mod oracle;
 pub mod preflight;

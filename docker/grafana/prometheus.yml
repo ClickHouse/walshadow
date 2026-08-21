@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: walshadow
+    static_configs:
+      - targets: ["walshadow:9484"]
