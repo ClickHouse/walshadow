@@ -1,17 +1,5 @@
--- walshadow demo destination table. Synthetic columns (_lsn, _xid,
--- _commit_ts, _is_deleted) match the emitter's TablePlan; their types
--- are fixed by walshadow::ch_emitter::TablePlan::build.
+-- walshadow creates tables, not databases. Pre-create the target database
+-- so replicate_all can auto-create demo.users (and any other source table)
+-- into it on first boot.
 
 CREATE DATABASE IF NOT EXISTS demo;
-
-CREATE TABLE IF NOT EXISTS demo.users (
-    id          UInt64,
-    name        String,
-    email       String,
-    _lsn        UInt64,
-    _xid        UInt32,
-    _commit_ts  DateTime64(6, 'UTC'),
-    _is_deleted Bool
-)
-ENGINE = ReplacingMergeTree(_lsn, _is_deleted)
-ORDER BY id;

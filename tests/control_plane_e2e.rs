@@ -119,6 +119,9 @@ impl Harness {
                  database = \"demo\"\n\
                  compression = \"lz4\"\n\
                  \n\
+                 [stream]\n\
+                 replicate_all = false\n\
+                 \n\
                  [table.demo.users]\n\
                  columns = [\n  \
                    {{ attnum = 1, target = \"id\",    type = \"Int64\"  }},\n  \

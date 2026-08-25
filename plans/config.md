@@ -80,8 +80,12 @@ so an absent slot is the operator's to pre-create; the pump refuses the swap
 and keeps streaming from the current feed until it exists. The old slot is
 left as it stands, since its retention is what a rollback to that server
 reads.
-`target_database` and `soft_delete` thread into the DDL applicator at
-construction and carry across refreshes unchanged.
+`target_database`, `soft_delete`, `[stream] replicate_all`, and the
+`[runtime_config] schema` name thread into the DDL applicator at construction
+and carry across refreshes unchanged. `replicate_all` (default `true`)
+auto-creates and replicates every user table whose namespace is not a system
+schema (`pg_*`, `information_schema`, the runtime-config schema); an explicit
+`auto_create` namespace or a `replicate = false` opt-out still wins.
 
 ## `[backup]` archive
 
@@ -115,10 +119,14 @@ TOML.
 
 ```toml
 [bootstrap]
-mode = "object_store"            # off | direct | object_store; default off
+mode = "object_store"            # off | direct | object_store
 backup_name = "LATEST"           # LATEST, or a literal base_… name
 object_store_parallelism = 8     # unset keeps min(4, num_cpus)
 ```
+
+Default `mode` is `direct` when `--bootstrap-shadow-data-dir` is set (fresh
+boot does an initial copy, then streams), else `off`: external-shadow runs
+have nothing to seed and `resolve_shadow_start` rejects a non-`off` mode there.
 
 An unrecognised `mode` and a non-positive `object_store_parallelism` both
 fail at parse, so a typo cannot read as `off` and silently skip bootstrap.

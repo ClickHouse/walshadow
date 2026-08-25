@@ -880,18 +880,21 @@ async fn pre_opt_in_xact_discards_post_opt_in_routes() {
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
-    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
-        tmp: &tmp,
-        source: &source,
-        shadow: &shadow,
-        shadow_filter_dir: &shadow_filter_dir,
-        shadow_stream_state,
-        ch_database: "walshadow_test",
-        ch_tcp_port: slot.ch_tcp,
-        mappings: vec![],
-        app_name: "walshadow-config-pre-opt-in-discard",
-        ddl: Some(overlay_ddl_args()),
-    })
+    let mut pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name: "walshadow-config-pre-opt-in-discard",
+            ddl: Some(overlay_ddl_args()),
+        },
+        |c| c.replicate_all = false,
+    )
     .await;
 
     // Commit order fixes semantics: id=1 plans against no route (discard),
