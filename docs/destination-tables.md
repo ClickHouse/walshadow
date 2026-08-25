@@ -64,7 +64,12 @@ Common mappings include:
 | `time` | `Time64(6)` |
 | `timestamp`, `timestamptz` | `DateTime64(..., 'UTC')` |
 | `uuid` | `UUID` |
-| `json`, `jsonb`, `inet`, `cidr`, `interval`, arrays, unknown types | `String` |
+| `json`, `jsonb` | `JSON` |
+| `hstore` | `Map(String, Nullable(String))` |
+| `vector`, `halfvec` (pgvector) | `Array(Float32)` |
+| `geography`, `geometry` (PostGIS) | `String` (WKT) |
+| `<elem>[]` arrays | `Array(Nullable(<elem>))`; unknown elem → `Array(Nullable(String))` |
+| `inet`, `cidr`, `interval`, unknown types | `String` |
 
 Nullable source columns become `Nullable(...)` unless used as ClickHouse sort
 keys. ClickHouse deployments using PostgreSQL `time` columns must enable

@@ -36,13 +36,33 @@ Why these:
 disambiguation lives at type-OID level not body bytes (on-disk vs wire
 confusion surfaced here historically)
 
+## In-tree extension types
+
+PostGIS `geography`/`geometry` and pgvector `vector`/`halfvec` are rendered
+in-tree from their on-disk bytes by `render_ext_columns` (`src/ops/oracle.rs`),
+matched on `RelAttr.type_name` (dynamic OIDs). geography 2-D points →
+WKT `POINT(x y)` (`gserialized_point_to_wkt`); vector → `[a,b,c]`
+(`vector_to_text`). No bridge round-trip, so these resolve even where the
+shadow worker is unavailable (e.g. greenfield bootstrap).
+
 ## Bridge-routed Tier 3
 
-`jsonb`, arrays, `tsvector`, ranges, domains. Heap decoder emits
+`jsonb`, arrays, `hstore`, `tsvector`, ranges, domains. Heap decoder emits
 [`ColumnValue::PgPending { type_oid, raw }`](../src/heap_decoder.rs);
 [`resolve_pending_tuple`](../src/oracle.rs) collects every pending column of a
 tuple into one `DECODE` request to shadow's bridge worker, swaps `PgPending`
 for `Text` on each item that rendered
+
+## Shared resolve step
+
+`resolve_decoded_heap(oracle, attrs, decoded)` runs `render_ext_columns` then
+(if an oracle is present) `resolve_pending_tuple` over a heap's new/old tuples.
+Both the live decode pool (`emit/pipeline/decode.rs`) and the object-store /
+COPY backfill paths call it, so backfilled rows resolve identically to
+streamed ones. **Greenfield bootstrap is the exception**: it runs before the
+shadow/bridge exist, so bridge-routed types there resolve to nothing (in-tree
+types still work) — the fix is
+[future/greenfield_oracle.md](future/greenfield_oracle.md).
 
 Two alternatives considered (insert + select round-trip;
 `SELECT $1::bytea::<typ>::text`) require reconstructing wire format from

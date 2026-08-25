@@ -53,7 +53,11 @@ for rendered diagram. Five clusters top→bottom:
    [emitter.md](emitter.md)). One synthetic ack seq per rfn flip;
    `tail.finish` seals partial batches and waits all seqs durable
    before handoff. Metrics-only runs (no `--ch-config`) instead drain
-   through `drain_backfill` into a counting `TupleObserver`
+   through `drain_backfill` into a counting `TupleObserver`.
+   Bridge-routed tier-3 values (jsonb, arrays, hstore, …) can't be
+   resolved here — the shadow/bridge don't exist until after bootstrap —
+   so they currently land empty; in-tree types (geography, vector) are
+   fine. Fix in [future/greenfield_oracle.md](future/greenfield_oracle.md)
 4. **Shadow handoff** — `BootstrapOutcome { start, end }` returned;
    daemon writes `standby.signal` and calls `materialize_conf` to
    replace shadow's config files. Config includes walshadow settings,

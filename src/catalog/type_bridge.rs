@@ -24,8 +24,12 @@
 //! | `interval` | `String` | |
 //! | `uuid` | `UUID` | |
 //! | `inet` / `cidr` | `String` | |
-//! | `json` / `jsonb` | `String` | CH `JSON` opt-in via namespace config |
-//! | array / unknown | `String` | falls through to PGPending bytes |
+//! | `json` / `jsonb` | `JSON` | native CH JSON (string serialization) |
+//! | `hstore` | `Map(String, Nullable(String))` | by type name |
+//! | `vector` / `halfvec` | `Array(Float32)` | pgvector, by type name |
+//! | `geography` / `geometry` | `String` | WKT `POINT(x y)`, rendered at decode |
+//! | `<elem>[]` | `Array(Nullable(<elem>))` | 1-D supported elems, else String |
+//! | unknown | `String` | falls through to PgPending bytes |
 //!
 //! Nullability: `not_null = false` wraps inner in `Nullable(_)` unless
 //! column is in CH `ORDER BY` (PK columns must stay non-nullable; caller
@@ -70,13 +74,12 @@ pub enum BridgeError {
 /// `pk_member = true` forces non-nullable: CH refuses `Nullable` in `ORDER BY`
 pub fn map(att: &RelAttr, pk_member: bool) -> Result<ResolvedColumn, BridgeError> {
     let inner = base_type_for(att)?;
-    // CH forbids `Nullable(Array(...))` / `Nullable(Map(...))`; a NULL source
-    // array/map lands as an empty one (see the emitter).
-    let composite = inner.starts_with("Array(") || inner.starts_with("Map(");
-    let ch_type = if pk_member || att.not_null || composite {
-        inner.clone()
-    } else {
+    let nullable =
+        !pk_member && !att.not_null && !inner.starts_with("Array(") && !inner.starts_with("Map(");
+    let ch_type = if nullable {
         format!("Nullable({inner})")
+    } else {
+        inner.clone()
     };
     let default_sql = render_default(att, &inner);
     Ok(ResolvedColumn {
@@ -109,13 +112,16 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         TIMESTAMPOID | TIMESTAMPTZOID => datetime64_ch_type(att.typmod),
         UUIDOID => "UUID".into(),
         INETOID | CIDROID => "String".into(),
-        JSONOID | JSONBOID => "String".into(),
+        JSONOID | JSONBOID => "JSON".into(),
         // Extension / array types carry dynamic OIDs, so match on the type
-        // name: `hstore` → Map, `_<elem>` (PG array convention) → Array of a
-        // supported element, else the String fallback.
+        // name: `hstore` → Map, `vector` (pgvector) → Array(Float32),
+        // `_<elem>` (PG array convention) → Array of a supported element, else
+        // the String fallback (geography stays String, rendered WKT at decode).
         _ => {
             if att.type_name == "hstore" {
                 "Map(String, Nullable(String))".into()
+            } else if att.type_name == "vector" || att.type_name == "halfvec" {
+                "Array(Float32)".into()
             } else if let Some(arr) = array_ch_type(&att.type_name) {
                 arr
             } else {
@@ -140,7 +146,7 @@ fn array_ch_type(type_name: &str) -> Option<String> {
         "bool" => "Bool",
         "text" | "varchar" | "bpchar" | "name" | "citext" => "String",
         "uuid" => "UUID",
-        _ => return None,
+        _ => "String",
     };
     Some(format!("Array(Nullable({inner}))"))
 }
@@ -449,10 +455,10 @@ mod tests {
             base_type_for(&named_attr(1009, "_text", true)).unwrap(),
             "Array(Nullable(String))"
         );
-        // Unsupported element type keeps the String fallback.
+        // Unsupported element type keeps array shape with String elements.
         assert_eq!(
             base_type_for(&named_attr(1231, "_numeric", true)).unwrap(),
-            "String"
+            "Array(Nullable(String))"
         );
     }
 
@@ -465,10 +471,42 @@ mod tests {
     }
 
     #[test]
+    fn json_maps_to_ch_json() {
+        assert_eq!(
+            base_type_for(&attr(JSONOID, -1, true, None)).unwrap(),
+            "JSON"
+        );
+        assert_eq!(
+            base_type_for(&attr(JSONBOID, -1, true, None)).unwrap(),
+            "JSON"
+        );
+        assert_eq!(
+            map(&attr(JSONBOID, -1, true, None), false).unwrap().ch_type,
+            "JSON"
+        );
+        assert_eq!(
+            map(&attr(JSONBOID, -1, false, None), false)
+                .unwrap()
+                .ch_type,
+            "Nullable(JSON)"
+        );
+    }
+
+    #[test]
+    fn vector_maps_to_array_float32() {
+        assert_eq!(
+            base_type_for(&named_attr(99998, "vector", false)).unwrap(),
+            "Array(Float32)"
+        );
+    }
+
+    #[test]
     fn composite_types_never_wrapped_in_nullable() {
         // nullable source array/hstore → bare Array/Map (CH forbids Nullable)
         assert_eq!(
-            map(&named_attr(1007, "_int4", false), false).unwrap().ch_type,
+            map(&named_attr(1007, "_int4", false), false)
+                .unwrap()
+                .ch_type,
             "Array(Nullable(Int32))"
         );
         assert_eq!(

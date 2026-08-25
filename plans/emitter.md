@@ -356,7 +356,10 @@ today is `String`, anything else dies cleanly at `append`
 `pk_member = true` strips `Nullable(_)` wrap because CH refuses
 `Nullable` in `ORDER BY`. User-visible matrix lives in
 [`docs/destination-tables.md`](../docs/destination-tables.md#default-type-mapping),
-hard-coded by `base_type_for`
+hard-coded by `base_type_for`. Dynamic-OID types (hstore, pgvector, arrays,
+PostGIS) are matched on `RelAttr.type_name`, not OID; CH forbids `Nullable`
+over `Array`/`Map` so those stay bare (a NULL source value lands as an empty
+one), while `Nullable(JSON)` is allowed.
 
 `numeric` needs `1 ≤ p ≤ 76` for `Decimal`; `p = 0`, scale outside
 `0 ≤ s ≤ p`, or unconstrained `numeric` (which can carry NaN/±Inf) fall

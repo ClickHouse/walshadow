@@ -120,6 +120,14 @@ pub async fn decode_and_route(
             commit_ts,
             commit_lsn,
         };
+        // Extension types (PostGIS geography → WKT, pgvector → [..]) rendered
+        // in-tree before the bridge, which can't (or needn't) resolve them.
+        if let Some(t) = committed.decoded.new.as_mut() {
+            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+        }
+        if let Some(t) = committed.decoded.old.as_mut() {
+            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+        }
         if let Some(oracle) = &ctx.oracle {
             // Resolve PgPending via shadow PG extension
             if let Some(t) = committed.decoded.new.as_mut() {

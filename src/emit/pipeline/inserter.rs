@@ -172,12 +172,12 @@ impl Inserter {
                 .asts
                 .remove(&batch.meta.table_key)
                 .expect("ensure_asts inserted");
-            let bump = bumpalo::Bump::new();
+            let arena = bumpalo::Bump::new();
             let result = 'send: {
                 let nodes: Vec<ColumnBuilder<'_>> = match batch
                     .buffers
                     .iter()
-                    .map(|buf| build_column(buf, batch.n_rows, &bump))
+                    .map(|buf| build_column(buf, batch.n_rows, &arena))
                     .collect::<Result<_, _>>()
                 {
                     Ok(v) => v,

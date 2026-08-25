@@ -1052,6 +1052,15 @@ pub(crate) enum ColumnBuf {
         keys: Box<ColumnBuf>,
         vals: Box<ColumnBuf>,
     },
+    /// CH `JSON` (string serialization). `null_map` is `Some` for
+    /// `Nullable(JSON)`. A value that isn't valid JSON text (unresolved jsonb
+    /// on-disk bytes, non-text) can't go in — it becomes NULL (nullable) or
+    /// `{}` (non-nullable), never raw bytes CH would reject.
+    Json {
+        offsets: Vec<u64>,
+        data: Vec<u8>,
+        null_map: Option<Vec<u8>>,
+    },
 }
 
 /// Scalar CH element kind for array elements: drives parsing a PG array text
@@ -1109,9 +1118,8 @@ impl ColumnBuf {
                 } else {
                     child.kind()
                 };
-                let elem = ChScalar::from_kind(elem_kind).ok_or_else(|| {
-                    EmitterError::Type("Array element type not encodable".into())
-                })?;
+                let elem = ChScalar::from_kind(elem_kind)
+                    .ok_or_else(|| EmitterError::Type("Array element type not encodable".into()))?;
                 return Ok(Self::Array {
                     offsets: Vec::new(),
                     inner: Box::new(Self::new_for_view(child)?),
@@ -1142,6 +1150,13 @@ impl ColumnBuf {
         } else {
             (false, view)
         };
+        if inner.kind() == Some(Kind::Json) {
+            return Ok(Self::Json {
+                offsets: Vec::new(),
+                data: Vec::new(),
+                null_map: nullable.then(Vec::new),
+            });
+        }
         let elem = inner.elem_size();
         Ok(match (nullable, elem) {
             (false, 0) => Self::String {
@@ -1183,24 +1198,25 @@ impl ColumnBuf {
                 keys,
                 vals,
             } => offsets.len() * 8 + keys.approx_size() + vals.approx_size(),
+            Self::Json {
+                offsets,
+                data,
+                null_map,
+            } => offsets.len() * 8 + data.len() + null_map.as_ref().map_or(0, Vec::len),
         }
     }
 
     /// Rows appended so far (element count for the inner buffer of an Array/Map).
     fn rows(&self) -> usize {
         match self {
-            Self::Fixed { width, bytes } => {
-                if *width == 0 {
-                    0
-                } else {
-                    bytes.len() / *width
-                }
-            }
+            Self::Fixed { width, bytes } => bytes.len().checked_div(*width).unwrap_or(0),
             Self::String { offsets, .. } => offsets.len(),
             Self::NullableFixed { null_map, .. } | Self::NullableString { null_map, .. } => {
                 null_map.len()
             }
-            Self::Array { offsets, .. } | Self::Map { offsets, .. } => offsets.len(),
+            Self::Array { offsets, .. }
+            | Self::Map { offsets, .. }
+            | Self::Json { offsets, .. } => offsets.len(),
         }
     }
 
@@ -1230,10 +1246,20 @@ impl ColumnBuf {
                 offsets.push(inner.rows() as u64);
                 Ok(())
             }
-            Self::Map {
-                offsets, keys, ..
-            } => {
+            Self::Map { offsets, keys, .. } => {
                 offsets.push(keys.rows() as u64);
+                Ok(())
+            }
+            Self::Json {
+                offsets,
+                data,
+                null_map,
+            } => {
+                if let Some(nm) = null_map {
+                    nm.push(1);
+                }
+                data.extend_from_slice(b"{}");
+                offsets.push(data.len() as u64);
                 Ok(())
             }
             _ => Err(EmitterError::UnsupportedValue {
@@ -1463,6 +1489,17 @@ pub(crate) fn build_column<'b>(
             let tup = bump.alloc(ColumnBuilder::tuple(&children[..], &mut ptrs[..])?);
             tup.array(offsets, n_rows)?
         }
+        ColumnBuf::Json {
+            offsets,
+            data,
+            null_map,
+        } => match null_map {
+            Some(nm) => {
+                let leaf = bump.alloc(ColumnBuilder::string(offsets, data, n_rows)?);
+                leaf.nullable(nm)?
+            }
+            None => ColumnBuilder::string(offsets, data, n_rows)?,
+        },
     })
 }
 
@@ -1733,11 +1770,10 @@ fn encode_value(
     v: &ColumnValue,
     decimal: Option<DecimalWire>,
 ) -> Result<(), EmitterError> {
-    // Composite columns take a whole PG array/hstore text (oracle-resolved)
-    // and fan it into nested buffers, independent of the value's own kind.
     match buf {
         ColumnBuf::Array { .. } => return encode_array(buf, v),
         ColumnBuf::Map { .. } => return encode_map(buf, v),
+        ColumnBuf::Json { .. } => return encode_json(buf, v),
         _ => {}
     }
     match v {
@@ -1845,7 +1881,13 @@ fn encode_array(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError
     };
     let elem = *elem;
     if let Some(text) = composite_text(v) {
-        match parse_pg_array_1d(text) {
+        // pgvector renders `[1,2,3]`; PG arrays render `{1,2}`.
+        let parsed = if text.trim_start().starts_with('[') && text.trim_end().ends_with(']') {
+            parse_vector_list(text)
+        } else {
+            parse_pg_array_1d(text)
+        };
+        match parsed {
             Ok(elems) => {
                 for e in &elems {
                     match e {
@@ -1896,13 +1938,41 @@ fn encode_map(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> 
     Ok(())
 }
 
+fn encode_json(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> {
+    let ColumnBuf::Json {
+        offsets,
+        data,
+        null_map,
+    } = buf
+    else {
+        unreachable!("encode_json on non-Json buffer");
+    };
+    if let ColumnValue::Json(s) | ColumnValue::Text(s) | ColumnValue::Name(s) = v
+        && s.trim_start().starts_with('{')
+    {
+        if let Some(nm) = null_map {
+            nm.push(0);
+        }
+        data.extend_from_slice(s.as_bytes());
+    } else {
+        if let Some(nm) = null_map {
+            nm.push(1);
+        }
+        data.extend_from_slice(b"{}");
+    }
+    offsets.push(data.len() as u64);
+    Ok(())
+}
+
 /// Append one array element token (already unquoted) to the element buffer,
 /// parsing it per the CH element kind.
 fn append_scalar_text(buf: &mut ColumnBuf, elem: ChScalar, tok: &str) -> Result<(), EmitterError> {
     let bad = |k: &'static str| EmitterError::Type(format!("array element {k}: {tok:?}"));
     match elem {
         ChScalar::Bool => buf.append_fixed_bytes(&[u8::from(matches!(tok, "t" | "true" | "1"))]),
-        ChScalar::I8 => buf.append_fixed_bytes(&tok.parse::<i8>().map_err(|_| bad("i8"))?.to_le_bytes()),
+        ChScalar::I8 => {
+            buf.append_fixed_bytes(&tok.parse::<i8>().map_err(|_| bad("i8"))?.to_le_bytes())
+        }
         ChScalar::I16 => {
             buf.append_fixed_bytes(&tok.parse::<i16>().map_err(|_| bad("i16"))?.to_le_bytes())
         }
@@ -1977,7 +2047,10 @@ fn parse_pg_array_1d(s: &str) -> Result<Vec<Option<String>>, ()> {
     if s.starts_with('[') {
         return Err(());
     }
-    let inner = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')).ok_or(())?;
+    let inner = s
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or(())?;
     let mut out = Vec::new();
     if inner.is_empty() {
         return Ok(out);
@@ -2014,6 +2087,22 @@ fn parse_pg_array_1d(s: &str) -> Result<Vec<Option<String>>, ()> {
         return Err(());
     }
     Ok(out)
+}
+
+/// Parse a pgvector literal `[1,2,3]` into element tokens. No NULLs/quotes.
+fn parse_vector_list(s: &str) -> Result<Vec<Option<String>>, ()> {
+    let inner = s
+        .trim()
+        .strip_prefix('[')
+        .and_then(|x| x.strip_suffix(']'))
+        .ok_or(())?;
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(inner
+        .split(',')
+        .map(|t| Some(t.trim().to_string()))
+        .collect())
 }
 
 /// Parse PG's hstore output `"k"=>"v", "k2"=>NULL` into key/value pairs
@@ -2190,7 +2279,11 @@ impl std::fmt::Debug for ColumnBuf {
                 .field("offsets_len", &offsets.len())
                 .field("data_len", &data.len())
                 .finish(),
-            Self::Array { offsets, inner, elem } => f
+            Self::Array {
+                offsets,
+                inner,
+                elem,
+            } => f
                 .debug_struct("Array")
                 .field("rows", &offsets.len())
                 .field("elem", elem)
@@ -2205,6 +2298,16 @@ impl std::fmt::Debug for ColumnBuf {
                 .field("rows", &offsets.len())
                 .field("keys", keys)
                 .field("vals", vals)
+                .finish(),
+            Self::Json {
+                offsets,
+                data,
+                null_map,
+            } => f
+                .debug_struct("Json")
+                .field("rows", &offsets.len())
+                .field("data_len", &data.len())
+                .field("nullable", &null_map.is_some())
                 .finish(),
         }
     }
@@ -2537,6 +2640,8 @@ mod tests {
             ("Nullable(FixedString(7))", "NullableFixed"),
             ("Array(Nullable(Int32))", "Array"),
             ("Map(String, Nullable(String))", "Map"),
+            ("JSON", "Json"),
+            ("Nullable(JSON)", "Json"),
         ];
         for (name, tag) in cases {
             let ast = TypeAst::parse(name, alloc).expect("parses");
@@ -2548,9 +2653,40 @@ mod tests {
                 ColumnBuf::NullableString { .. } => "NullableString",
                 ColumnBuf::Array { .. } => "Array",
                 ColumnBuf::Map { .. } => "Map",
+                ColumnBuf::Json { .. } => "Json",
             };
             assert_eq!(actual, tag, "{name}");
         }
+    }
+
+    #[test]
+    fn encode_json_text_null_and_unresolved() {
+        let alloc = Allocator::stdlib();
+        let ast = TypeAst::parse("Nullable(JSON)", alloc).unwrap();
+        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
+        encode_value(&mut buf, &ColumnValue::Json("{\"a\":1}".into()), None).unwrap();
+        encode_value(&mut buf, &ColumnValue::Null, None).unwrap();
+        // unresolved jsonb (raw on-disk bytes) must not reach CH as raw → NULL
+        encode_value(
+            &mut buf,
+            &ColumnValue::PgPending {
+                type_oid: 3802,
+                raw: vec![1, 0, 0, 0],
+            },
+            None,
+        )
+        .unwrap();
+        let ColumnBuf::Json {
+            offsets,
+            data,
+            null_map,
+        } = &buf
+        else {
+            panic!("expected Json buf");
+        };
+        assert_eq!(data, &br#"{"a":1}{}{}"#[..]);
+        assert_eq!(offsets, &[7, 9, 11]);
+        assert_eq!(null_map.as_deref(), Some(&[0u8, 1, 1][..]));
     }
 
     #[test]
@@ -2559,7 +2695,10 @@ mod tests {
             parse_pg_array_1d("{1,2,3}").unwrap(),
             vec![Some("1".into()), Some("2".into()), Some("3".into())]
         );
-        assert_eq!(parse_pg_array_1d("{}").unwrap(), Vec::<Option<String>>::new());
+        assert_eq!(
+            parse_pg_array_1d("{}").unwrap(),
+            Vec::<Option<String>>::new()
+        );
         assert_eq!(
             parse_pg_array_1d("{a,NULL,\"b,c\"}").unwrap(),
             vec![Some("a".into()), None, Some("b,c".into())]
@@ -2570,6 +2709,33 @@ mod tests {
         );
         assert!(parse_pg_array_1d("{{1,2},{3,4}}").is_err());
         assert!(parse_pg_array_1d("[1:2]={1,2}").is_err());
+    }
+
+    #[test]
+    fn parse_vector_and_encode_into_array_float32() {
+        assert_eq!(
+            parse_vector_list("[1,2,3]").unwrap(),
+            vec![Some("1".into()), Some("2".into()), Some("3".into())]
+        );
+        assert_eq!(
+            parse_vector_list("[]").unwrap(),
+            Vec::<Option<String>>::new()
+        );
+        let alloc = Allocator::stdlib();
+        let ast = TypeAst::parse("Array(Float32)", alloc).unwrap();
+        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
+        encode_value(&mut buf, &ColumnValue::Text("[1.5,2.5]".into()), None).unwrap();
+        let ColumnBuf::Array {
+            offsets,
+            inner,
+            elem,
+        } = &buf
+        else {
+            panic!("expected Array buf");
+        };
+        assert_eq!(*elem, ChScalar::F32);
+        assert_eq!(offsets, &[2]);
+        assert_eq!(inner.rows(), 2);
     }
 
     #[test]
@@ -2617,7 +2783,10 @@ mod tests {
         .unwrap();
         encode_value(&mut buf, &ColumnValue::Null, None).unwrap();
         let ColumnBuf::Map {
-            offsets, keys, vals, ..
+            offsets,
+            keys,
+            vals,
+            ..
         } = &buf
         else {
             panic!("expected Map buf");

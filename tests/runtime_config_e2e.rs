@@ -515,7 +515,8 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
              FROM walshadow_test.inventory WHERE _is_deleted = 0 AND id = 2",
         )
         .expect("ch backfilled row");
-    assert_eq!(bolt, "bolt\t12.5\t2024-01-02 03:04:06.000000\t{\"b\": 2}");
+    // `meta` is CH `Nullable(JSON)` now: JSON normalizes whitespace ({"b":2}).
+    assert_eq!(bolt, "bolt\t12.5\t2024-01-02 03:04:06.000000\t{\"b\":2}");
 
     // TOAST-sized values survive COPY.
     let big = ch
