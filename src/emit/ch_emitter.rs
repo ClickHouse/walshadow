@@ -27,7 +27,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
+use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst, TypeRef};
 
 #[cfg(test)]
 use crate::ch::is_retryable;
@@ -1035,6 +1035,57 @@ pub(crate) enum ColumnBuf {
         data: Vec<u8>,
         null_map: Vec<u8>,
     },
+    /// `Array(<inner>)`: `offsets[i]` is the cumulative element count through
+    /// row `i`; elements accumulate in `inner`. `elem` drives text→wire for
+    /// each element. Not itself Nullable (CH forbids `Nullable(Array)`): a
+    /// NULL/absent source value lands as an empty array.
+    Array {
+        offsets: Vec<u64>,
+        inner: Box<ColumnBuf>,
+        elem: ChScalar,
+    },
+    /// `Map(String, <vals>)` == `Array(Tuple(keys, vals))`. `offsets[i]` is
+    /// the cumulative entry count through row `i`. Keys are non-nullable
+    /// `String`; a NULL/absent source value lands as an empty map.
+    Map {
+        offsets: Vec<u64>,
+        keys: Box<ColumnBuf>,
+        vals: Box<ColumnBuf>,
+    },
+}
+
+/// Scalar CH element kind for array elements: drives parsing a PG array text
+/// token into little-endian wire bytes (or a String element).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChScalar {
+    Bool,
+    I8,
+    I16,
+    I32,
+    I64,
+    U32,
+    F32,
+    F64,
+    Uuid,
+    Str,
+}
+
+impl ChScalar {
+    fn from_kind(kind: Option<Kind>) -> Option<Self> {
+        Some(match kind? {
+            Kind::Bool => Self::Bool,
+            Kind::Int8 => Self::I8,
+            Kind::Int16 => Self::I16,
+            Kind::Int32 => Self::I32,
+            Kind::Int64 => Self::I64,
+            Kind::UInt32 => Self::U32,
+            Kind::Float32 => Self::F32,
+            Kind::Float64 => Self::F64,
+            Kind::Uuid => Self::Uuid,
+            Kind::String => Self::Str,
+            _ => return None,
+        })
+    }
 }
 
 impl ColumnBuf {
@@ -1044,7 +1095,44 @@ impl ColumnBuf {
     /// means varlen on-wire shape; only `String` is handled, other
     /// varlens fall through to the String arms and die on first `append`.
     fn new_for_ast(ast: &TypeAst) -> Result<Self, EmitterError> {
-        let view = ast.view();
+        Self::new_for_view(ast.view())
+    }
+
+    fn new_for_view(view: TypeRef<'_>) -> Result<Self, EmitterError> {
+        match view.kind() {
+            Some(Kind::Array) => {
+                let child = view
+                    .child(0)
+                    .ok_or_else(|| EmitterError::Type("Array type with no child".into()))?;
+                let elem_kind = if child.kind() == Some(Kind::Nullable) {
+                    child.child(0).and_then(|c| c.kind())
+                } else {
+                    child.kind()
+                };
+                let elem = ChScalar::from_kind(elem_kind).ok_or_else(|| {
+                    EmitterError::Type("Array element type not encodable".into())
+                })?;
+                return Ok(Self::Array {
+                    offsets: Vec::new(),
+                    inner: Box::new(Self::new_for_view(child)?),
+                    elem,
+                });
+            }
+            Some(Kind::Map) => {
+                let k = view
+                    .child(0)
+                    .ok_or_else(|| EmitterError::Type("Map type with no key".into()))?;
+                let v = view
+                    .child(1)
+                    .ok_or_else(|| EmitterError::Type("Map type with no value".into()))?;
+                return Ok(Self::Map {
+                    offsets: Vec::new(),
+                    keys: Box::new(Self::new_for_view(k)?),
+                    vals: Box::new(Self::new_for_view(v)?),
+                });
+            }
+            _ => {}
+        }
         let (nullable, inner) = if view.kind() == Some(Kind::Nullable) {
             (
                 true,
@@ -1089,6 +1177,30 @@ impl ColumnBuf {
                 data,
                 null_map,
             } => offsets.len() * 8 + data.len() + null_map.len(),
+            Self::Array { offsets, inner, .. } => offsets.len() * 8 + inner.approx_size(),
+            Self::Map {
+                offsets,
+                keys,
+                vals,
+            } => offsets.len() * 8 + keys.approx_size() + vals.approx_size(),
+        }
+    }
+
+    /// Rows appended so far (element count for the inner buffer of an Array/Map).
+    fn rows(&self) -> usize {
+        match self {
+            Self::Fixed { width, bytes } => {
+                if *width == 0 {
+                    0
+                } else {
+                    bytes.len() / *width
+                }
+            }
+            Self::String { offsets, .. } => offsets.len(),
+            Self::NullableFixed { null_map, .. } | Self::NullableString { null_map, .. } => {
+                null_map.len()
+            }
+            Self::Array { offsets, .. } | Self::Map { offsets, .. } => offsets.len(),
         }
     }
 
@@ -1110,6 +1222,18 @@ impl ColumnBuf {
             } => {
                 null_map.push(1);
                 offsets.push(data.len() as u64);
+                Ok(())
+            }
+            // CH Array/Map can't be Nullable; a NULL source value is an empty
+            // array/map (offset repeats the running element count).
+            Self::Array { offsets, inner, .. } => {
+                offsets.push(inner.rows() as u64);
+                Ok(())
+            }
+            Self::Map {
+                offsets, keys, ..
+            } => {
+                offsets.push(keys.rows() as u64);
                 Ok(())
             }
             _ => Err(EmitterError::UnsupportedValue {
@@ -1291,46 +1415,55 @@ impl TableEncoder {
     }
 }
 
-/// Innermost leaf node per column: the `Nullable` value slab, or the whole
-/// column when not nullable. A `ColumnBuilder` node borrows its slabs and
-/// cannot move once a wrapper or the block aliases it, so the caller owns
-/// these leaves for the block's lifetime. Buffers stay immutable until
-/// `send_data` returns.
-pub(crate) fn build_leaves(
-    bufs: &[ColumnBuf],
+/// Build the root `ColumnBuilder` for one column's buffer, recursively for
+/// composite (`Array`/`Map`) shapes. A `ColumnBuilder` node borrows its slabs
+/// and any child nodes and cannot move once aliased, so every intermediate
+/// node is allocated in `bump` (stable address, one shared `'b` lifetime) and
+/// lives until `send_data` returns. `n_rows` is the row count at this level
+/// (element count for a nested inner buffer).
+pub(crate) fn build_column<'b>(
+    buf: &'b ColumnBuf,
     n_rows: usize,
-) -> Result<Vec<ColumnBuilder<'_>>, EmitterError> {
-    bufs.iter()
-        .map(|buf| match buf {
-            ColumnBuf::Fixed { width, bytes: data }
-            | ColumnBuf::NullableFixed {
-                width, inner: data, ..
-            } => ColumnBuilder::fixed(data, *width, n_rows).map_err(Into::into),
-            ColumnBuf::String { offsets, data }
-            | ColumnBuf::NullableString { offsets, data, .. } => {
-                ColumnBuilder::string(offsets, data, n_rows).map_err(Into::into)
-            }
-        })
-        .collect()
-}
-
-/// `Nullable` wrapper per column, `None` when the column is not nullable.
-/// Each wrapper aliases its leaf in `leaves`, so `leaves` must be fully built
-/// (no further pushes) and outlive the wrappers. Pair with [`build_leaves`]:
-/// the block appends `roots[i]` when `Some`, else `leaves[i]`.
-pub(crate) fn build_roots<'l, 'b: 'l>(
-    leaves: &'l [ColumnBuilder<'b>],
-    bufs: &'b [ColumnBuf],
-) -> Result<Vec<Option<ColumnBuilder<'l>>>, EmitterError> {
-    leaves
-        .iter()
-        .zip(bufs)
-        .map(|(leaf, buf)| match buf {
-            ColumnBuf::NullableFixed { null_map, .. }
-            | ColumnBuf::NullableString { null_map, .. } => Ok(Some(leaf.nullable(null_map)?)),
-            ColumnBuf::Fixed { .. } | ColumnBuf::String { .. } => Ok(None),
-        })
-        .collect()
+    bump: &'b bumpalo::Bump,
+) -> Result<ColumnBuilder<'b>, EmitterError> {
+    Ok(match buf {
+        ColumnBuf::Fixed { width, bytes } => ColumnBuilder::fixed(bytes, *width, n_rows)?,
+        ColumnBuf::String { offsets, data } => ColumnBuilder::string(offsets, data, n_rows)?,
+        ColumnBuf::NullableFixed {
+            width,
+            null_map,
+            inner,
+        } => {
+            let leaf = bump.alloc(ColumnBuilder::fixed(inner, *width, n_rows)?);
+            leaf.nullable(null_map)?
+        }
+        ColumnBuf::NullableString {
+            offsets,
+            data,
+            null_map,
+        } => {
+            let leaf = bump.alloc(ColumnBuilder::string(offsets, data, n_rows)?);
+            leaf.nullable(null_map)?
+        }
+        ColumnBuf::Array { offsets, inner, .. } => {
+            let child = bump.alloc(build_column(inner, inner.rows(), bump)?);
+            child.array(offsets, n_rows)?
+        }
+        ColumnBuf::Map {
+            offsets,
+            keys,
+            vals,
+        } => {
+            let entries = keys.rows();
+            let kb = build_column(keys, entries, bump)?;
+            let vb = build_column(vals, entries, bump)?;
+            let children = bump.alloc([kb, vb]);
+            let ptrs: &mut [*mut clickhouse_c::sys::chc_column; 2] =
+                bump.alloc([std::ptr::null_mut(); 2]);
+            let tup = bump.alloc(ColumnBuilder::tuple(&children[..], &mut ptrs[..])?);
+            tup.array(offsets, n_rows)?
+        }
+    })
 }
 
 fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
@@ -1600,6 +1733,13 @@ fn encode_value(
     v: &ColumnValue,
     decimal: Option<DecimalWire>,
 ) -> Result<(), EmitterError> {
+    // Composite columns take a whole PG array/hstore text (oracle-resolved)
+    // and fan it into nested buffers, independent of the value's own kind.
+    match buf {
+        ColumnBuf::Array { .. } => return encode_array(buf, v),
+        ColumnBuf::Map { .. } => return encode_map(buf, v),
+        _ => {}
+    }
     match v {
         ColumnValue::Null => buf.append_null(),
         ColumnValue::Bool(b) => buf.append_fixed_bytes(&[*b as u8]),
@@ -1676,6 +1816,258 @@ fn encode_value(
             kind: "unsupported PG type oid",
         }),
     }
+}
+
+/// Post-oracle text of an array/hstore value, or `None` for a NULL/absent
+/// value. Non-text (unresolved bridge) logs and yields `None` (empty).
+fn composite_text(v: &ColumnValue) -> Option<&str> {
+    match v {
+        ColumnValue::Text(s) | ColumnValue::Name(s) | ColumnValue::Json(s) => Some(s.as_str()),
+        ColumnValue::Null => None,
+        _ => {
+            tracing::warn!(
+                target: "walshadow::emitter",
+                "array/map column value not resolved to text; emitting empty",
+            );
+            None
+        }
+    }
+}
+
+fn encode_array(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> {
+    let ColumnBuf::Array {
+        offsets,
+        inner,
+        elem,
+    } = buf
+    else {
+        unreachable!("encode_array on non-Array buffer");
+    };
+    let elem = *elem;
+    if let Some(text) = composite_text(v) {
+        match parse_pg_array_1d(text) {
+            Ok(elems) => {
+                for e in &elems {
+                    match e {
+                        Some(tok) => append_scalar_text(inner, elem, tok)?,
+                        None => inner.append_null()?,
+                    }
+                }
+            }
+            Err(()) => tracing::warn!(
+                target: "walshadow::emitter",
+                value = %text,
+                "array value not 1-D/parseable; emitting empty array",
+            ),
+        }
+    }
+    offsets.push(inner.rows() as u64);
+    Ok(())
+}
+
+fn encode_map(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> {
+    let ColumnBuf::Map {
+        offsets,
+        keys,
+        vals,
+    } = buf
+    else {
+        unreachable!("encode_map on non-Map buffer");
+    };
+    if let Some(text) = composite_text(v) {
+        match parse_hstore(text) {
+            Ok(pairs) => {
+                for (k, val) in &pairs {
+                    keys.append_string_bytes(k.as_bytes())?;
+                    match val {
+                        Some(vv) => vals.append_string_bytes(vv.as_bytes())?,
+                        None => vals.append_null()?,
+                    }
+                }
+            }
+            Err(()) => tracing::warn!(
+                target: "walshadow::emitter",
+                value = %text,
+                "hstore value unparseable; emitting empty map",
+            ),
+        }
+    }
+    offsets.push(keys.rows() as u64);
+    Ok(())
+}
+
+/// Append one array element token (already unquoted) to the element buffer,
+/// parsing it per the CH element kind.
+fn append_scalar_text(buf: &mut ColumnBuf, elem: ChScalar, tok: &str) -> Result<(), EmitterError> {
+    let bad = |k: &'static str| EmitterError::Type(format!("array element {k}: {tok:?}"));
+    match elem {
+        ChScalar::Bool => buf.append_fixed_bytes(&[u8::from(matches!(tok, "t" | "true" | "1"))]),
+        ChScalar::I8 => buf.append_fixed_bytes(&tok.parse::<i8>().map_err(|_| bad("i8"))?.to_le_bytes()),
+        ChScalar::I16 => {
+            buf.append_fixed_bytes(&tok.parse::<i16>().map_err(|_| bad("i16"))?.to_le_bytes())
+        }
+        ChScalar::I32 => {
+            buf.append_fixed_bytes(&tok.parse::<i32>().map_err(|_| bad("i32"))?.to_le_bytes())
+        }
+        ChScalar::I64 => {
+            buf.append_fixed_bytes(&tok.parse::<i64>().map_err(|_| bad("i64"))?.to_le_bytes())
+        }
+        ChScalar::U32 => {
+            buf.append_fixed_bytes(&tok.parse::<u32>().map_err(|_| bad("u32"))?.to_le_bytes())
+        }
+        ChScalar::F32 => {
+            buf.append_fixed_bytes(&tok.parse::<f32>().map_err(|_| bad("f32"))?.to_le_bytes())
+        }
+        ChScalar::F64 => {
+            buf.append_fixed_bytes(&tok.parse::<f64>().map_err(|_| bad("f64"))?.to_le_bytes())
+        }
+        ChScalar::Uuid => {
+            let raw = parse_uuid_text(tok).ok_or_else(|| bad("uuid"))?;
+            buf.append_fixed_bytes(&crate::decode::codecs::uuid_to_ch_wire(&raw))
+        }
+        ChScalar::Str => buf.append_string_bytes(tok.as_bytes()),
+    }
+}
+
+fn parse_uuid_text(s: &str) -> Option<[u8; 16]> {
+    let hex: Vec<u8> = s.bytes().filter(|c| *c != b'-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let h = std::str::from_utf8(&hex[i * 2..i * 2 + 2]).ok()?;
+        *byte = u8::from_str_radix(h, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// A `"..."`-quoted token starting at `start`; returns the unescaped value and
+/// the index just past the closing quote. Only `\\` and `\"` are escapes in
+/// PG array/hstore output; raw multibyte bytes are copied verbatim.
+fn read_quoted(s: &str, start: usize) -> Result<(String, usize), ()> {
+    let b = s.as_bytes();
+    let mut i = start + 1;
+    let mut out: Vec<u8> = Vec::new();
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                i += 1;
+                if i >= b.len() {
+                    return Err(());
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            b'"' => return String::from_utf8(out).map(|v| (v, i + 1)).map_err(|_| ()),
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Err(())
+}
+
+/// Parse PG's canonical 1-D array output `{a,b,"c,d",NULL}` into elements
+/// (`None` = NULL). `Err` for multi-dimensional input (nested `{}` or a
+/// `[lo:hi]=` dimension prefix), which the caller downgrades to an empty array.
+fn parse_pg_array_1d(s: &str) -> Result<Vec<Option<String>>, ()> {
+    let s = s.trim();
+    if s.starts_with('[') {
+        return Err(());
+    }
+    let inner = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')).ok_or(())?;
+    let mut out = Vec::new();
+    if inner.is_empty() {
+        return Ok(out);
+    }
+    let b = inner.as_bytes();
+    let mut i = 0;
+    loop {
+        if b[i] == b'"' {
+            let (val, ni) = read_quoted(inner, i)?;
+            out.push(Some(val));
+            i = ni;
+        } else {
+            let start = i;
+            while i < b.len() && b[i] != b',' {
+                if b[i] == b'{' || b[i] == b'}' {
+                    return Err(());
+                }
+                i += 1;
+            }
+            let tok = &inner[start..i];
+            out.push(if tok == "NULL" {
+                None
+            } else {
+                Some(tok.to_string())
+            });
+        }
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == b',' {
+            i += 1;
+            continue;
+        }
+        return Err(());
+    }
+    Ok(out)
+}
+
+/// Parse PG's hstore output `"k"=>"v", "k2"=>NULL` into key/value pairs
+/// (`None` = NULL value). Keys are always quoted.
+fn parse_hstore(s: &str) -> Result<Vec<(String, Option<String>)>, ()> {
+    let s = s.trim();
+    let mut out = Vec::new();
+    if s.is_empty() {
+        return Ok(out);
+    }
+    let b = s.as_bytes();
+    let mut i = 0;
+    let skip_ws = |b: &[u8], mut i: usize| {
+        while i < b.len() && b[i] == b' ' {
+            i += 1;
+        }
+        i
+    };
+    loop {
+        i = skip_ws(b, i);
+        if i >= b.len() {
+            break;
+        }
+        if b[i] != b'"' {
+            return Err(());
+        }
+        let (key, ni) = read_quoted(s, i)?;
+        i = skip_ws(b, ni);
+        if i + 1 >= b.len() || b[i] != b'=' || b[i + 1] != b'>' {
+            return Err(());
+        }
+        i = skip_ws(b, i + 2);
+        let val = if i < b.len() && b[i] == b'"' {
+            let (v, ni) = read_quoted(s, i)?;
+            i = ni;
+            Some(v)
+        } else if s[i..].starts_with("NULL") {
+            i += 4;
+            None
+        } else {
+            return Err(());
+        };
+        out.push((key, val));
+        i = skip_ws(b, i);
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == b',' {
+            i += 1;
+            continue;
+        }
+        return Err(());
+    }
+    Ok(out)
 }
 
 crate::atomic_stats! {
@@ -1797,6 +2189,22 @@ impl std::fmt::Debug for ColumnBuf {
                 .field("rows", &null_map.len())
                 .field("offsets_len", &offsets.len())
                 .field("data_len", &data.len())
+                .finish(),
+            Self::Array { offsets, inner, elem } => f
+                .debug_struct("Array")
+                .field("rows", &offsets.len())
+                .field("elem", elem)
+                .field("inner", inner)
+                .finish(),
+            Self::Map {
+                offsets,
+                keys,
+                vals,
+            } => f
+                .debug_struct("Map")
+                .field("rows", &offsets.len())
+                .field("keys", keys)
+                .field("vals", vals)
                 .finish(),
         }
     }
@@ -2127,6 +2535,8 @@ mod tests {
             ("Nullable(String)", "NullableString"),
             ("FixedString(7)", "Fixed"),
             ("Nullable(FixedString(7))", "NullableFixed"),
+            ("Array(Nullable(Int32))", "Array"),
+            ("Map(String, Nullable(String))", "Map"),
         ];
         for (name, tag) in cases {
             let ast = TypeAst::parse(name, alloc).expect("parses");
@@ -2136,9 +2546,85 @@ mod tests {
                 ColumnBuf::String { .. } => "String",
                 ColumnBuf::NullableFixed { .. } => "NullableFixed",
                 ColumnBuf::NullableString { .. } => "NullableString",
+                ColumnBuf::Array { .. } => "Array",
+                ColumnBuf::Map { .. } => "Map",
             };
             assert_eq!(actual, tag, "{name}");
         }
+    }
+
+    #[test]
+    fn parse_array_handles_nulls_quotes_and_rejects_multidim() {
+        assert_eq!(
+            parse_pg_array_1d("{1,2,3}").unwrap(),
+            vec![Some("1".into()), Some("2".into()), Some("3".into())]
+        );
+        assert_eq!(parse_pg_array_1d("{}").unwrap(), Vec::<Option<String>>::new());
+        assert_eq!(
+            parse_pg_array_1d("{a,NULL,\"b,c\"}").unwrap(),
+            vec![Some("a".into()), None, Some("b,c".into())]
+        );
+        assert_eq!(
+            parse_pg_array_1d("{\"a\\\"b\"}").unwrap(),
+            vec![Some("a\"b".into())]
+        );
+        assert!(parse_pg_array_1d("{{1,2},{3,4}}").is_err());
+        assert!(parse_pg_array_1d("[1:2]={1,2}").is_err());
+    }
+
+    #[test]
+    fn parse_hstore_pairs_and_nulls() {
+        assert_eq!(
+            parse_hstore("\"k\"=>\"v\", \"x\"=>NULL").unwrap(),
+            vec![("k".into(), Some("v".into())), ("x".into(), None)]
+        );
+        assert_eq!(
+            parse_hstore("").unwrap(),
+            Vec::<(String, Option<String>)>::new()
+        );
+        assert_eq!(
+            parse_hstore("\"a=>b\"=>\"c,d\"").unwrap(),
+            vec![("a=>b".into(), Some("c,d".into()))]
+        );
+    }
+
+    #[test]
+    fn encode_array_offsets_track_elements_and_null_is_empty() {
+        let alloc = Allocator::stdlib();
+        let ast = TypeAst::parse("Array(Nullable(Int32))", alloc).unwrap();
+        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
+        encode_value(&mut buf, &ColumnValue::Text("{10,20,30}".into()), None).unwrap();
+        encode_value(&mut buf, &ColumnValue::Null, None).unwrap();
+        encode_value(&mut buf, &ColumnValue::Text("{40}".into()), None).unwrap();
+        let ColumnBuf::Array { offsets, inner, .. } = &buf else {
+            panic!("expected Array buf");
+        };
+        // cumulative element counts: 3, still 3 (empty), 4
+        assert_eq!(offsets, &[3, 3, 4]);
+        assert_eq!(inner.rows(), 4);
+    }
+
+    #[test]
+    fn encode_map_offsets_track_entries() {
+        let alloc = Allocator::stdlib();
+        let ast = TypeAst::parse("Map(String, Nullable(String))", alloc).unwrap();
+        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
+        encode_value(
+            &mut buf,
+            &ColumnValue::Text("\"a\"=>\"1\", \"b\"=>NULL".into()),
+            None,
+        )
+        .unwrap();
+        encode_value(&mut buf, &ColumnValue::Null, None).unwrap();
+        let ColumnBuf::Map {
+            offsets, keys, vals, ..
+        } = &buf
+        else {
+            panic!("expected Map buf");
+        };
+        assert_eq!(offsets, &[2, 2]);
+        assert_eq!(keys.rows(), 2);
+        assert_eq!(vals.rows(), 2);
     }
 
     #[test]

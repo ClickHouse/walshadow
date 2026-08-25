@@ -49,8 +49,9 @@ RUN make -C pgext clean \
 
 FROM postgres:${PG_MAJOR}-alpine AS runtime
 # bash: entrypoint shebang. ca-certificates: TLS to clickhouse.
-# liblz4/libzstd already present as PG deps.
-RUN apk add --no-cache bash ca-certificates
+# postgis: so the daemon-owned shadow PG can render the schema's geography
+# column via typoutput. liblz4/libzstd already present as PG deps.
+RUN apk add --no-cache bash ca-certificates postgis
 
 COPY --from=rust-builder /usr/local/bin/walshadow-stream /usr/local/bin/walshadow-stream
 COPY --from=ext-builder /src/pgext/walshadow.so \

@@ -2932,6 +2932,7 @@ dependencies = [
  "async-channel",
  "async-trait",
  "backon",
+ "bumpalo",
  "bytes",
  "chrono",
  "clap",

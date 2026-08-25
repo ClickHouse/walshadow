@@ -70,7 +70,10 @@ pub enum BridgeError {
 /// `pk_member = true` forces non-nullable: CH refuses `Nullable` in `ORDER BY`
 pub fn map(att: &RelAttr, pk_member: bool) -> Result<ResolvedColumn, BridgeError> {
     let inner = base_type_for(att)?;
-    let ch_type = if pk_member || att.not_null {
+    // CH forbids `Nullable(Array(...))` / `Nullable(Map(...))`; a NULL source
+    // array/map lands as an empty one (see the emitter).
+    let composite = inner.starts_with("Array(") || inner.starts_with("Map(");
+    let ch_type = if pk_member || att.not_null || composite {
         inner.clone()
     } else {
         format!("Nullable({inner})")
@@ -107,8 +110,39 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         UUIDOID => "UUID".into(),
         INETOID | CIDROID => "String".into(),
         JSONOID | JSONBOID => "String".into(),
-        _ => "String".into(),
+        // Extension / array types carry dynamic OIDs, so match on the type
+        // name: `hstore` → Map, `_<elem>` (PG array convention) → Array of a
+        // supported element, else the String fallback.
+        _ => {
+            if att.type_name == "hstore" {
+                "Map(String, Nullable(String))".into()
+            } else if let Some(arr) = array_ch_type(&att.type_name) {
+                arr
+            } else {
+                "String".into()
+            }
+        }
     })
+}
+
+/// PG array type name (`_int4`, `_text`, …) → `Array(Nullable(<elem>))` for
+/// supported element types; `None` (→ String fallback) for anything else,
+/// including multi-dim-only element names walshadow can't render natively.
+fn array_ch_type(type_name: &str) -> Option<String> {
+    let elem = type_name.strip_prefix('_')?;
+    let inner = match elem {
+        "int2" => "Int16",
+        "int4" => "Int32",
+        "int8" => "Int64",
+        "oid" => "UInt32",
+        "float4" => "Float32",
+        "float8" => "Float64",
+        "bool" => "Bool",
+        "text" | "varchar" | "bpchar" | "name" | "citext" => "String",
+        "uuid" => "UUID",
+        _ => return None,
+    };
+    Some(format!("Array(Nullable({inner}))"))
 }
 
 /// Render post-`DEFAULT ` fragment from `missing_text` (PG fast-path
@@ -393,6 +427,56 @@ mod tests {
         assert_eq!(render_pg_timestamp(0), "2000-01-01 00:00:00");
         // i64::MAX overflows chrono range → epoch fallback
         assert_eq!(render_pg_timestamp(i64::MAX), "1970-01-01 00:00:00");
+    }
+
+    fn named_attr(oid: u32, type_name: &str, not_null: bool) -> RelAttr {
+        let mut a = attr(oid, -1, not_null, None);
+        a.type_name = type_name.into();
+        a
+    }
+
+    #[test]
+    fn arrays_map_to_native_ch_array() {
+        assert_eq!(
+            base_type_for(&named_attr(1007, "_int4", true)).unwrap(),
+            "Array(Nullable(Int32))"
+        );
+        assert_eq!(
+            base_type_for(&named_attr(1016, "_int8", true)).unwrap(),
+            "Array(Nullable(Int64))"
+        );
+        assert_eq!(
+            base_type_for(&named_attr(1009, "_text", true)).unwrap(),
+            "Array(Nullable(String))"
+        );
+        // Unsupported element type keeps the String fallback.
+        assert_eq!(
+            base_type_for(&named_attr(1231, "_numeric", true)).unwrap(),
+            "String"
+        );
+    }
+
+    #[test]
+    fn hstore_maps_to_ch_map() {
+        assert_eq!(
+            base_type_for(&named_attr(99999, "hstore", true)).unwrap(),
+            "Map(String, Nullable(String))"
+        );
+    }
+
+    #[test]
+    fn composite_types_never_wrapped_in_nullable() {
+        // nullable source array/hstore → bare Array/Map (CH forbids Nullable)
+        assert_eq!(
+            map(&named_attr(1007, "_int4", false), false).unwrap().ch_type,
+            "Array(Nullable(Int32))"
+        );
+        assert_eq!(
+            map(&named_attr(99999, "hstore", false), false)
+                .unwrap()
+                .ch_type,
+            "Map(String, Nullable(String))"
+        );
     }
 
     #[test]

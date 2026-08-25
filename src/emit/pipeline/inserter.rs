@@ -12,7 +12,7 @@
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
-use clickhouse_c::{Allocator, BlockBuilder, BoxedAsyncClient, TypeAst};
+use clickhouse_c::{Allocator, BlockBuilder, BoxedAsyncClient, ColumnBuilder, TypeAst};
 use tokio::task::JoinHandle;
 
 use crate::ch::{
@@ -20,7 +20,7 @@ use crate::ch::{
     reconnect_if_idle, with_timeout,
 };
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, build_leaves, build_roots};
+use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, build_column};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatchMeta, InsertBatch};
@@ -172,12 +172,14 @@ impl Inserter {
                 .asts
                 .remove(&batch.meta.table_key)
                 .expect("ensure_asts inserted");
+            let bump = bumpalo::Bump::new();
             let result = 'send: {
-                let leaves = match build_leaves(&batch.buffers, batch.n_rows) {
-                    Ok(v) => v,
-                    Err(e) => break 'send Err(e),
-                };
-                let roots = match build_roots(&leaves, &batch.buffers) {
+                let nodes: Vec<ColumnBuilder<'_>> = match batch
+                    .buffers
+                    .iter()
+                    .map(|buf| build_column(buf, batch.n_rows, &bump))
+                    .collect::<Result<_, _>>()
+                {
                     Ok(v) => v,
                     Err(e) => break 'send Err(e),
                 };
@@ -188,8 +190,7 @@ impl Inserter {
                     .iter()
                     .enumerate()
                     .try_for_each(|(i, col)| {
-                        let node = roots[i].as_ref().unwrap_or(&leaves[i]);
-                        bb.append(&col.name, asts[i].view(), node)
+                        bb.append(&col.name, asts[i].view(), &nodes[i])
                             .map_err(Into::into)
                     });
                 match appended {
