@@ -526,6 +526,8 @@ impl DdlApplicator {
                     rc,
                     self.config.target_database.clone(),
                     self.config.soft_delete,
+                    self.config.replicate_all,
+                    self.config.runtime_config_schema.clone(),
                 )
             })
             .unwrap_or_else(|| self.config.clone())
@@ -1211,6 +1213,8 @@ mod tests {
         let cfg = DdlConfig {
             drop_table_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
+            replicate_all: false,
+            runtime_config_schema: None,
             target_database: "default".into(),
             namespaces: ahash::HashMap::default(),
             soft_delete: false,
