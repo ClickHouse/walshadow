@@ -850,6 +850,7 @@ async fn build_pipeline_inner(
         &config_rx.borrow(),
         emitter_cfg.database.clone(),
         emitter_cfg.soft_delete,
+        emitter_cfg.system_columns.clone(),
         emitter_cfg.replicate_all,
         emitter_cfg.runtime_config_schema.clone(),
     );

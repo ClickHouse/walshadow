@@ -230,6 +230,33 @@ one CH name), and the whole array pins nothing — scope still comes from
 `replicate` / `auto_create`. `config_column` rows take `match` the same way,
 over the whole `(namespace, relname, attname)` key.
 
+Destination shape — walshadow appends `_lsn`, `_xid`, `_commit_ts`,
+`_is_deleted` to every table and keys on replica identity. Rename or drop the
+appended columns, and pin the sort key:
+
+```toml
+[system_columns]                    # cluster-wide default
+lsn = "_peerdb_version"
+commit_ts = "_peerdb_synced_at"
+is_deleted = "_peerdb_is_deleted"   # false drops the column, and DELETE rows
+
+[table.public.events]
+order_by = ["tenant_id", "id"]      # else replica identity
+primary_key = ["tenant_id"]         # CH index prefix, must prefix order_by
+lsn = "_version"                    # same four keys, this relation only
+
+[table.app."events_*"]
+match = "glob"
+is_deleted = false
+order_by = ["tenant_id", "id"]
+```
+
+`[system_columns]` is boot-only and cluster-wide; a `[table.*]` block or a
+`config_table` row renames per relation, and takes `match` like any other rule
+— walshadow never renames or rekeys a table CH already holds, so shape has to
+land before the first CREATE. See
+[destination tables](docs/destination-tables.md)
+
 
 ## Building from source
 

@@ -1,8 +1,11 @@
 //! Resolves table settings from TOML and runtime config
 
+use std::sync::Arc;
+
 use globset::{Glob, GlobMatcher};
 use regex_automata::meta::Regex;
 
+use crate::mapping::{SystemColumnNames, SystemColumns};
 use crate::runtime_config::TableRow;
 use crate::schema::RelName;
 
@@ -78,27 +81,52 @@ impl NamePattern {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableRule {
+    /// Per-relation renames of the columns walshadow appends, layered over
+    /// `[system_columns]` at `CREATE TABLE` and at every route freeze
+    pub system: SystemColumnNames,
     pub target_database: Option<String>,
     pub target_table: Option<String>,
     pub replicate: Option<bool>,
     pub initial_load: Option<String>,
+    /// CH `ORDER BY` at `CREATE TABLE`, destination column names. An empty
+    /// list derives the key from replica identity
+    pub order_by: Option<Vec<String>>,
+    /// CH `PRIMARY KEY`: the sparse-index prefix CH indexes, not a uniqueness
+    /// constraint. CH requires a prefix of the effective `ORDER BY`
+    pub primary_key: Option<Vec<String>>,
 }
 
 impl TableRule {
     pub fn from_row(row: &TableRow) -> Self {
         Self {
+            system: row.system.clone(),
             target_database: row.target_database.clone(),
             target_table: row.target_table.clone(),
             replicate: row.replicate,
             initial_load: row.initial_load.clone(),
+            order_by: row.order_by.clone(),
+            primary_key: row.primary_key.clone(),
         }
     }
 
+    /// System columns this rule resolves to, `default` renamed where the rule
+    /// names something. An untouched rule hands back the cluster-wide set, so
+    /// a route freeze costs an `Arc` clone rather than a copy
+    pub fn system_columns(&self, default: &Arc<SystemColumns>) -> Arc<SystemColumns> {
+        if self.system.is_empty() {
+            return default.clone();
+        }
+        Arc::new(default.renamed(&self.system))
+    }
+
     pub fn overlay(&mut self, other: &Self) {
+        self.system.overlay(&other.system);
         set_if(&mut self.target_database, &other.target_database);
         set_if(&mut self.target_table, &other.target_table);
         set_if(&mut self.replicate, &other.replicate);
         set_if(&mut self.initial_load, &other.initial_load);
+        set_if(&mut self.order_by, &other.order_by);
+        set_if(&mut self.primary_key, &other.primary_key);
     }
 }
 
@@ -231,6 +259,11 @@ impl TableRulesBuilder {
     }
 
     pub fn add(&mut self, key: &RelName, kind: MatchKind, rule: TableRule) {
+        if let Err(e) = rule.system.validate(&format!("table {key}")) {
+            tracing::warn!(target: "walshadow::config", error = %e, "table entry rejected");
+            self.rejections += 1;
+            return;
+        }
         match RelMatcher::compile(key, kind) {
             Ok(matcher) => self.rules.push((self.layer, matcher, rule)),
             Err(e) => {

@@ -63,8 +63,22 @@
 //!
 //! 9. `pattern_row_scopes_tables_by_glob`
 //!    * Glob rules include matching tables and exclude guarded tables
+//! 10. `opt_in_row_pins_order_by_and_primary_key`
+//!    * `config_table` row opts a table in and names `order_by` /
+//!      `primary_key` in the same row.
+//!    * Expect: the auto-created CH table keys on the operator's columns,
+//!      not the declared PK order, with the index prefix they asked for
+//!      (plans/config.md §Destination shape).
+//!
+//! 10. `pattern_row_shapes_auto_created_tables`
+//!    * `config_table` row with `match = 'glob'` names system columns and
+//!      the sort key for `app.events_*` before those tables exist.
+//!    * Expect: the auto-created CH table carries the renamed LSN column,
+//!      no delete marker, and the operator sort key, while a relation the
+//!      pattern misses keeps the cluster-wide names.
 //!
 //! Source-side `config_*` install runs the real `sql/runtime_config_install.sql`
+
 //! inside the bootstrap schema dump, so the drills double as install-script
 //! coverage (psql `\if` default-schema guard included).
 
@@ -1065,4 +1079,186 @@ async fn pattern_row_scopes_tables_by_glob() {
         others, "0",
         "excluded / unmatched relations must not create"
     );
+}
+
+/// Drill 10: a `config_table` row carries the sort key of the very table its
+/// `replicate = true` creates, so the CREATE cannot fall back to the PK.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opt_in_row_pins_order_by_and_primary_key() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.keyed (id bigint, tenant bigint, body text, \
+             PRIMARY KEY (id, tenant));\n"
+    );
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    // replicate_all off so the opt-in row is what creates the CH table:
+    // auto-create fires on first sight of a relation, before any config row
+    // for it can arrive, and walshadow never rekeys a table CH already holds
+    let mut pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name: "walshadow-config-order-by",
+            ddl: Some(overlay_ddl_args()),
+        },
+        |cfg| cfg.replicate_all = false,
+    )
+    .await;
+
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO walshadow.config_table \
+             (namespace, relname, replicate, order_by, primary_key) \
+             VALUES ('app', 'keyed', true, ARRAY['tenant', 'id'], ARRAY['tenant'])"
+                .into(),
+            "INSERT INTO app.keyed (id, tenant, body) VALUES (1, 7, 'keyed')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    let ddl = ch
+        .query("SHOW CREATE TABLE walshadow_test.keyed")
+        .expect("show create");
+    assert!(ddl.contains("ORDER BY (tenant, id)"), "{ddl}");
+    assert!(ddl.contains("PRIMARY KEY (tenant)"), "{ddl}");
+
+    let n = ch
+        .query("SELECT count() FROM walshadow_test.keyed FINAL WHERE _is_deleted = 0")
+        .expect("ch count");
+    assert_eq!(n, "1", "post-opt-in insert must reach CH");
+}
+
+/// Drill 10: a `match = 'glob'` row shapes tables that do not exist yet.
+/// `replicate_all` creates a relation the first time it is seen, so a literal
+/// `config_table` row can never beat the CREATE — the pattern row, committed
+/// before the source `CREATE TABLE`, is the only way to name the system
+/// columns of an auto-created table (plans/config.md §Destination shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pattern_row_shapes_auto_created_tables() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let schema_sql = format!("{INSTALL_SQL}\nCREATE SCHEMA app;\n");
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port: slot.ch_tcp,
+        mappings: vec![],
+        app_name: "walshadow-config-glob-shape",
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO walshadow.config_table \
+             (namespace, relname, match, lsn, is_deleted, order_by) \
+             VALUES ('app', 'events_*', 'glob', '_peerdb_version', '', \
+                 ARRAY['tenant', 'id'])"
+                .into(),
+            "CREATE TABLE app.events_2026 (id bigint, tenant bigint, body text, \
+                 PRIMARY KEY (id, tenant))"
+                .into(),
+            "CREATE TABLE app.orders (id bigint PRIMARY KEY, body text)".into(),
+            "INSERT INTO app.events_2026 (id, tenant, body) VALUES (1, 7, 'shaped')".into(),
+            "INSERT INTO app.orders (id, body) VALUES (1, 'unshaped')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    let ddl = ch
+        .query("SHOW CREATE TABLE walshadow_test.events_2026")
+        .expect("show create");
+    assert!(ddl.contains("`_peerdb_version` UInt64"), "{ddl}");
+    assert!(!ddl.contains("_is_deleted"), "marker dropped: {ddl}");
+    assert!(ddl.contains("ORDER BY (tenant, id)"), "{ddl}");
+
+    // A relation the pattern misses keeps the cluster-wide names
+    let other = ch
+        .query("SHOW CREATE TABLE walshadow_test.orders")
+        .expect("show create");
+    assert!(other.contains("`_lsn` UInt64"), "{other}");
+    assert!(other.contains("_is_deleted"), "{other}");
+
+    let body = ch
+        .query("SELECT argMax(body, _peerdb_version) FROM walshadow_test.events_2026 WHERE id = 1")
+        .expect("ch body");
+    assert_eq!(body, "shaped", "rows INSERT under the renamed columns");
 }

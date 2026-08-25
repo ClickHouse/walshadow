@@ -591,7 +591,7 @@ mod tests {
                 columns: Vec::new(),
             }),
             Arc::default(),
-            false,
+            Default::default(),
         )
     }
 

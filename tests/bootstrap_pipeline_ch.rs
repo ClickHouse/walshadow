@@ -181,7 +181,7 @@ async fn bootstrap_tail_fans_out_n2() {
             std::env::temp_dir().join("ws-bootstrap-ch-unused.bin"),
             walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
         ),
-        false,
+        Default::default(),
         None,
     ));
     let outcome = drain.await.expect("drain join").expect("drain ok");

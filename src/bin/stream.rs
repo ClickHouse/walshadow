@@ -1568,6 +1568,7 @@ async fn run_session(
             &config_rx.borrow(),
             emitter_cfg.database.clone(),
             emitter_cfg.soft_delete,
+            emitter_cfg.system_columns.clone(),
             emitter_cfg.replicate_all,
             emitter_cfg.runtime_config_schema.clone(),
         );
@@ -2897,6 +2898,14 @@ async fn seed_runtime_config(
                 target_table: row.try_get("target_table").ok().flatten(),
                 replicate: row.try_get("replicate").ok().flatten(),
                 initial_load: row.try_get("initial_load").ok().flatten(),
+                order_by: row.try_get("order_by").ok().flatten(),
+                primary_key: row.try_get("primary_key").ok().flatten(),
+                system: walshadow::mapping::SystemColumnNames {
+                    lsn: row.try_get("lsn").ok().flatten(),
+                    xid: row.try_get("xid").ok().flatten(),
+                    commit_ts: row.try_get("commit_ts").ok().flatten(),
+                    is_deleted: row.try_get("is_deleted").ok().flatten(),
+                },
                 match_kind: row.try_get("match").ok().flatten(),
             },
         );
@@ -3478,6 +3487,9 @@ async fn populate_metrics(
             .unwrap_or(0),
         emitter_unsupported_relations: emitter_stats
             .map(|s| s.unsupported_relations.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        emitter_deletes_discarded: emitter_stats
+            .map(|s| s.deletes_discarded.load(Ordering::Relaxed))
             .unwrap_or(0),
         oracle_resolved_total: oracle_stats
             .map(|s| s.resolved.load(Ordering::Relaxed))
@@ -4262,10 +4274,10 @@ async fn run_bootstrap(
 
     let ch_target = match ch_config {
         Some(emitter_cfg) => {
-            let mapping = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
+            let (mapping, resolved) = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
                 .await
                 .context("bootstrap: build mapping")?;
-            Some((emitter_cfg, mapping))
+            Some((emitter_cfg, mapping, resolved))
         }
         None => None,
     };
@@ -4277,7 +4289,7 @@ async fn run_bootstrap(
     let cfg = BootstrapConfig::new(shadow_data_dir.clone());
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
 
-    let (shipped, outcome) = if let Some((emitter_cfg, mapping)) = ch_target {
+    let (shipped, outcome) = if let Some((emitter_cfg, mapping, resolved)) = ch_target {
         // Route bootstrap rows through the shared insert tail. Bootstrap
         // is the easy case: every row op=Insert at _lsn = start_lsn, no
         // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
@@ -4320,9 +4332,11 @@ async fn run_bootstrap(
                 deferred_path,
                 walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
             ),
-            emitter_cfg.soft_delete,
-            // Static mapping above: no overlay during greenfield bootstrap
-            None,
+            emitter_cfg.row_policy(),
+            // No source-PG overlay during greenfield bootstrap, but the same
+            // snapshot the CREATEs above rendered from: per-relation system
+            // column names have to match what CH now holds
+            Some(resolved),
         ));
         let (drain_res, pump_res) = tokio::join!(drain, pump);
         let drain_outcome = drain_res
@@ -4404,11 +4418,13 @@ async fn run_bootstrap(
 /// Routing map for the bootstrap drain: explicit `[table.*]` seeded up front,
 /// then every seeded relation run through the DDL applicator's `Added` path so
 /// `auto_create` namespaces get their CH table created and mapping registered.
+/// Returns the snapshot those CREATEs rendered from, so the drain freezes
+/// routes against the same per-relation rules.
 async fn bootstrap_build_mapping(
     emitter_cfg: &EmitterConfig,
     catalog: &walshadow::backup_page_walk::CatalogMap,
     args: &Args,
-) -> Result<MappingHandle> {
+) -> Result<(MappingHandle, Arc<walshadow::config::ResolvedConfig>)> {
     let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
     let cli_overrides = CliOverrides {
         drop_table_strategy: args.drop_table_strategy,
@@ -4424,17 +4440,19 @@ async fn bootstrap_build_mapping(
         cli_base(args),
         mapping.clone(),
     );
-    let (ddl_cfg, merged_tables) = {
+    let (ddl_cfg, merged_tables, resolved) = {
         let snap = config_rx.borrow();
         (
             walshadow::ch_ddl::DdlConfig::from_resolved(
                 &snap,
                 emitter_cfg.database.clone(),
                 emitter_cfg.soft_delete,
+                emitter_cfg.system_columns.clone(),
                 emitter_cfg.replicate_all,
                 emitter_cfg.runtime_config_schema.clone(),
             ),
             Arc::new(snap.tables.clone()),
+            snap.clone(),
         )
     };
     // Publish rule-adjusted targets before creating tables
@@ -4449,7 +4467,7 @@ async fn bootstrap_build_mapping(
             .await
             .with_context(|| format!("bootstrap: ensure CH table {}", desc.rel_name))?;
     }
-    Ok(mapping)
+    Ok((mapping, resolved))
 }
 
 /// Mark bootstrap before extraction, clear only after backup and required

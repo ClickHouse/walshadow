@@ -24,6 +24,7 @@ pub const CIDROID: u32 = 650;
 pub const FLOAT4OID: u32 = 700;
 pub const FLOAT8OID: u32 = 701;
 pub const INETOID: u32 = 869;
+pub const TEXTARRAYOID: u32 = 1009;
 pub const BPCHAROID: u32 = 1042;
 pub const VARCHAROID: u32 = 1043;
 pub const DATEOID: u32 = 1082;

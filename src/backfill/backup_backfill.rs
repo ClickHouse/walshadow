@@ -350,7 +350,7 @@ async fn walk_and_ship(
         ctx.stats.clone(),
         resolver.clone(),
         DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX),
-        ctx.emitter.soft_delete,
+        ctx.emitter.row_policy(),
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
     ));
 
@@ -901,7 +901,7 @@ async fn replay_gap(
         mapping: ctx.mapping.snapshot().await,
         stats: ctx.stats.clone(),
         budget: ctx.budget.clone(),
-        soft_delete: ctx.emitter.soft_delete,
+        row_policy: ctx.emitter.row_policy(),
         config: ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         batch_rows: ctx.emitter.drain_batch_rows,
         batch_bytes: ctx.emitter.drain_batch_bytes,
@@ -948,7 +948,7 @@ struct ReplaySink {
     stats: Arc<EmitterStats>,
     budget: Option<crate::budget::MemoryBudget>,
     /// Boot-only delete-retention policy, frozen into route snapshots
-    soft_delete: bool,
+    row_policy: crate::emit::route::RowPolicy,
     /// Config snapshot for route freezes: gap replay re-seeds from current
     /// config, not history (route history has no WAL position)
     config: Option<Arc<ResolvedConfig>>,
@@ -1069,6 +1069,19 @@ impl ReplaySink {
                         self.commits_past_s += 1;
                         continue;
                     }
+                    let policy = self
+                        .row_policy
+                        .for_rel(self.config.as_deref(), &rel.rel_name);
+                    // Append-only destination (no delete marker): see
+                    // `decode_and_route`
+                    if policy.system.is_deleted.is_none()
+                        && matches!(heap.decoded.op, crate::decode::heap_decoder::HeapOp::Delete)
+                    {
+                        self.stats
+                            .deletes_discarded
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
                     let rel = rel.clone();
                     let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
                         .await
@@ -1084,8 +1097,7 @@ impl ReplaySink {
                         .config
                         .as_ref()
                         .map_or_else(Arc::default, |rc| rc.column_rules.clone());
-                    let route =
-                        crate::emit::route::RouteSnapshot::freeze(mapping, rules, self.soft_delete);
+                    let route = crate::emit::route::RouteSnapshot::freeze(mapping, rules, policy);
                     let seq = if let Some((seq, rows)) = &mut self.open {
                         *rows += 1;
                         *seq

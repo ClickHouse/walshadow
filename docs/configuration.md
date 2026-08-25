@@ -61,8 +61,9 @@ including tables created later. `init` writes `[source]`, `[ch]`, and chosen
 Pass file with `--ch-config`. Loader also merges sibling directory formed by
 replacing `.toml` with `.d`, for example `ch-config.d/*.toml`
 
-Unknown keys, invalid values, and incompatible mapping fields fail validation
-instead of falling back silently
+Invalid values and incompatible mapping fields fail validation instead of
+falling back silently. Loader ignores unknown keys, so check spelling here when
+a setting has no effect
 
 ## Precedence
 
@@ -116,6 +117,8 @@ restored
 Apply live:
 
 - table and column rules
+- per-table metadata column names, `order_by`, and `primary_key`, applied when
+  walshadow creates a table, see [Query destination data](destination-tables.md)
 - namespace destinations and drop policy
 - pause state
 - batch sizes, flush timeout, compression, and retry count
@@ -125,6 +128,7 @@ Require restart:
 
 - `replicate_all`
 - runtime-config schema
+- cluster-wide `[system_columns]` names
 - soft-delete and TOAST modes
 - worker-pool sizes and memory limits
 - backup and shadow bootstrap choices
@@ -160,6 +164,10 @@ INSERT INTO walshadow.config_table
 VALUES
     ('public', 'orders', true, 'copy');
 ```
+
+`config_table` also carries destination shape: `order_by` and `primary_key` as
+`text[]`, and `lsn`, `xid`, `commit_ts`, `is_deleted` for metadata column names.
+See [Query destination data](destination-tables.md)
 
 walshadow reads these tables but never writes them. Keep archive credentials
 and bootstrap configuration in TOML, not source-side tables

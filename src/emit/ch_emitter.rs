@@ -3,8 +3,9 @@
 //!
 //! Synthetic columns `_lsn UInt64`, `_xid UInt32`, `_commit_ts
 //! DateTime64(6, 'UTC')`, `_is_deleted Bool` append after every mapped
-//! column. `_is_deleted` (1 on delete) wires `ReplacingMergeTree`'s
-//! deletion arg unless `EmitterConfig::soft_delete` keeps it queryable.
+//! column; [`SystemColumns`] renames them and can drop the delete marker.
+//! `_is_deleted` (1 on delete) wires `ReplacingMergeTree`'s deletion arg
+//! unless `EmitterConfig::soft_delete` keeps it queryable.
 //! PG `TimestampTz` epoch is 2000-01-01; shift to Unix epoch
 //! (`DATETIME64_PG_EPOCH_US`) to match CH `DateTime64(6)`.
 //!
@@ -37,8 +38,8 @@ use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules};
 use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::mapping::{
-    ColumnMapping, DropTableStrategy, NamespaceMapping, TableMapping, TableTarget, ToastConfig,
-    ToastMode,
+    ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
+    TableMapping, TableTarget, ToastConfig, ToastMode,
 };
 use crate::runtime_config::{InitialLoadMode, TableRow};
 use crate::schema::{RelDescriptor, RelName};
@@ -56,7 +57,8 @@ pub(crate) const DATETIME64_PG_EPOCH_US: i64 = walrus::pg::replication::PG_EPOCH
 /// Days between PG `date` epoch (2000-01-01) and the Unix epoch.
 pub(crate) const DATE32_PG_EPOCH_DAYS: i32 = (DATETIME64_PG_EPOCH_US / 1_000_000 / 86_400) as i32;
 
-/// Heap op codes for [`TableEncoder::append_row`]; `OP_DELETE` sets `_is_deleted`
+/// Heap op codes for [`TableEncoder::append_row`]; `OP_DELETE` sets the
+/// delete marker
 pub(crate) const OP_INSERT: i8 = 1;
 pub(crate) const OP_UPDATE: i8 = 2;
 pub(crate) const OP_DELETE: i8 = 3;
@@ -148,10 +150,14 @@ pub struct EmitterConfig {
     /// full `insert_timeout` on a dead socket. Guards the start of a run,
     /// when connections sat idle since the previous one.
     pub idle_reconnect: Duration,
-    /// Keep `_is_deleted` out of `ReplacingMergeTree`'s args so delete
+    /// Keep the delete marker out of `ReplacingMergeTree`'s args so delete
     /// tombstones stay queryable instead of collapsing on FINAL. Column
-    /// always emitted; off by default
+    /// still emitted; off by default
     pub soft_delete: bool,
+    /// `[system_columns]`: cluster-wide names of the columns walshadow appends
+    /// per row, and whether the delete marker exists. Boot-only; per-relation
+    /// renames layer over it via `table_entries` / `config_table`
+    pub system_columns: Arc<SystemColumns>,
     /// Where externally-TOASTed chunks live + miss policy. `[toast]` block;
     /// default disabled (NULL/default-fill unrecoverable values)
     pub toast: ToastConfig,
@@ -322,6 +328,7 @@ impl Default for EmitterConfig {
             insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
             idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
             soft_delete: false,
+            system_columns: Arc::default(),
             toast: ToastConfig::default(),
             decode_chunk_rows: DEFAULT_DECODE_CHUNK_ROWS,
             drain_batch_rows: DEFAULT_DRAIN_BATCH_ROWS,
@@ -527,6 +534,8 @@ struct ConfigDocument {
     #[serde(default)]
     stream: StreamPatch,
     #[serde(default)]
+    system_columns: SystemColumns,
+    #[serde(default)]
     source: crate::config::SourceConn,
     backup: Option<BackupSection>,
     #[serde(default)]
@@ -606,6 +615,14 @@ struct TablePatch {
     target_table: Option<String>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     initial_load: Option<InitialLoadMode>,
+    order_by: Option<Vec<String>>,
+    primary_key: Option<Vec<String>>,
+    /// Same four keys as `[system_columns]`, for this entry's relations alone
+    lsn: Option<String>,
+    xid: Option<String>,
+    commit_ts: Option<String>,
+    #[serde(default, deserialize_with = "crate::mapping::de_marker_override")]
+    is_deleted: Option<String>,
     #[serde(
         rename = "match",
         default,
@@ -632,6 +649,14 @@ struct ColumnPatch {
 }
 
 impl EmitterConfig {
+    /// Boot-only row-shape knobs frozen into every route
+    pub fn row_policy(&self) -> crate::emit::route::RowPolicy {
+        crate::emit::route::RowPolicy {
+            soft_delete: self.soft_delete,
+            system: self.system_columns.clone(),
+        }
+    }
+
     /// Parse a TOML config of the shape:
     ///
     /// ```toml
@@ -643,11 +668,21 @@ impl EmitterConfig {
     /// password = ""
     /// compression = "lz4"   # one of none / lz4 / zstd
     ///
+    /// [system_columns]      # optional: rename what walshadow appends per row
+    /// lsn = "_lsn"
+    /// xid = "_xid"
+    /// commit_ts = "_commit_ts"
+    /// is_deleted = "_is_deleted"   # false drops the marker (and DELETE rows)
+    ///
     /// [table.public.foo]     # [table.<namespace>.<relname>], quote weird names
     /// replicate = true
     /// initial_load = "none"  # one of none / copy / base_backup / object_store
     /// target_database = "default"  # optional: namespace override, else [ch] database
     /// target_table = "foo"         # optional: source relname
+    /// order_by = ["id"]            # optional: CH ORDER BY, else replica identity
+    /// primary_key = ["id"]         # optional: index prefix of order_by
+    /// lsn = "_peerdb_version"      # optional: per-relation system column
+    /// is_deleted = false           # renames, same keys as [system_columns]
     /// columns = [
     ///   { attnum = 1, target = "id",   type = "UInt64" },
     ///   { attnum = 2, target = "name", type = "Nullable(String)" },
@@ -697,6 +732,10 @@ impl EmitterConfig {
             .map_or(out.retry.max_backoff, Duration::from_millis);
         out.drop_table_strategy = ch.drop_table_strategy.unwrap_or(out.drop_table_strategy);
         out.soft_delete = ch.soft_delete.unwrap_or(out.soft_delete);
+        doc.system_columns
+            .validate()
+            .map_err(EmitterError::Config)?;
+        out.system_columns = Arc::new(doc.system_columns);
         out.toast.mode = doc.toast.mode.unwrap_or(out.toast.mode);
         out.resident_payload_max = doc
             .memory
@@ -734,11 +773,21 @@ impl EmitterConfig {
                 let ctx = format!("table.{ns}.{name}");
                 let kind = t.match_kind.unwrap_or(MatchKind::Exact);
                 let replicate = t.replicate;
+                let system = SystemColumnNames {
+                    lsn: t.lsn,
+                    xid: t.xid,
+                    commit_ts: t.commit_ts,
+                    is_deleted: t.is_deleted,
+                };
+                system.validate(&ctx).map_err(EmitterError::Config)?;
                 let rule = TableRule {
+                    system,
                     target_database: t.target_database,
                     target_table: t.target_table,
                     replicate,
                     initial_load: t.initial_load.map(|m| m.as_str().to_string()),
+                    order_by: t.order_by,
+                    primary_key: t.primary_key,
                 };
                 out.table_entries.push((rel.clone(), kind, rule.clone()));
                 let mut pinned = Vec::new();
@@ -863,8 +912,9 @@ pub(crate) struct TablePlan {
     pub(crate) synth_lsn: ColumnPlan,
     pub(crate) synth_xid: ColumnPlan,
     pub(crate) synth_commit_ts: ColumnPlan,
-    /// `_is_deleted Bool` (1 on delete, else 0), always appended last
-    pub(crate) synth_is_deleted: ColumnPlan,
+    /// Delete marker `Bool` (1 on delete, else 0), appended last. `None` when
+    /// `[system_columns] is_deleted = false` drops it
+    pub(crate) synth_is_deleted: Option<ColumnPlan>,
     /// Pre-formatted so on-tuple paths don't reassemble per row
     pub(crate) insert_sql: String,
 }
@@ -916,6 +966,7 @@ impl TablePlan {
         rel: &RelDescriptor,
         mapping: &TableMapping,
         column_rules: &ColumnRules,
+        system: &SystemColumns,
     ) -> Result<Self, EmitterError> {
         let mut columns = Vec::with_capacity(mapping.columns.len());
         let mut col_sql = Vec::with_capacity(mapping.columns.len() + 4);
@@ -983,14 +1034,18 @@ impl TablePlan {
                 decimal: None,
             })
         };
-        let synth_lsn = mk("_lsn", "UInt64")?;
-        let synth_xid = mk("_xid", "UInt32")?;
-        let synth_commit_ts = mk("_commit_ts", "DateTime64(6, 'UTC')")?;
-        let synth_is_deleted = mk("_is_deleted", "Bool")?;
+        let synth_lsn = mk(&system.lsn, "UInt64")?;
+        let synth_xid = mk(&system.xid, "UInt32")?;
+        let synth_commit_ts = mk(&system.commit_ts, "DateTime64(6, 'UTC')")?;
+        let synth_is_deleted = system
+            .is_deleted
+            .as_deref()
+            .map(|name| mk(name, "Bool"))
+            .transpose()?;
         col_sql.push(quote_ident(&synth_lsn.name));
         col_sql.push(quote_ident(&synth_xid.name));
         col_sql.push(quote_ident(&synth_commit_ts.name));
-        col_sql.push(quote_ident(&synth_is_deleted.name));
+        col_sql.extend(synth_is_deleted.iter().map(|c| quote_ident(&c.name)));
         let insert_sql = format!(
             "INSERT INTO {} ({}) FORMAT Native",
             mapping.target.sql(),
@@ -1012,7 +1067,7 @@ pub(crate) struct TableEncoder {
     pub(crate) plan: TablePlan,
     pub(crate) rows: usize,
     pub(crate) approx_bytes: usize,
-    /// Mirrors `plan.columns + 4 synth`
+    /// Mirrors `plan.columns` plus the synthetic columns the plan carries
     pub(crate) buffers: Vec<ColumnBuf>,
 }
 
@@ -1192,7 +1247,7 @@ impl ColumnBuf {
     }
 }
 
-/// Fresh per-column buffers matching `plan` (mapped + four synthetic).
+/// Fresh per-column buffers matching `plan` (mapped + synthetic).
 /// Shared by [`TableEncoder::new`] and [`TableEncoder::take_block`] so
 /// synthetic-column widths live in one place.
 pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterError> {
@@ -1203,19 +1258,21 @@ pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterE
     buffers.push(ColumnBuf::Fixed {
         width: 8,
         bytes: Vec::new(),
-    }); // _lsn UInt64
+    }); // lsn UInt64
     buffers.push(ColumnBuf::Fixed {
         width: 4,
         bytes: Vec::new(),
-    }); // _xid UInt32
+    }); // xid UInt32
     buffers.push(ColumnBuf::Fixed {
         width: 8,
         bytes: Vec::new(),
-    }); // _commit_ts DateTime64(6)
-    buffers.push(ColumnBuf::Fixed {
-        width: 1,
-        bytes: Vec::new(),
-    }); // _is_deleted Bool (1 wire byte, same as UInt8)
+    }); // commit_ts DateTime64(6)
+    if plan.synth_is_deleted.is_some() {
+        buffers.push(ColumnBuf::Fixed {
+            width: 1,
+            bytes: Vec::new(),
+        }); // delete marker Bool (1 wire byte, same as UInt8)
+    }
     Ok(buffers)
 }
 
@@ -1277,14 +1334,16 @@ impl TableEncoder {
                 })?,
             }
         }
-        // Synthetic columns: _lsn, _xid, _commit_ts (unix micros), _is_deleted
+        // Synthetic columns: lsn, xid, commit_ts (unix micros), delete marker
         let off = mapping.columns.len();
         push_fixed(&mut self.buffers[off], &decoded.source_lsn.to_le_bytes())?;
         push_fixed(&mut self.buffers[off + 1], &decoded.xid.to_le_bytes())?;
         let unix_us = committed.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
         push_fixed(&mut self.buffers[off + 2], &unix_us.to_le_bytes())?;
-        let is_deleted: u8 = (op_code == OP_DELETE).into();
-        push_fixed(&mut self.buffers[off + 3], &is_deleted.to_le_bytes())?;
+        if self.plan.synth_is_deleted.is_some() {
+            let is_deleted: u8 = (op_code == OP_DELETE).into();
+            push_fixed(&mut self.buffers[off + 3], &is_deleted.to_le_bytes())?;
+        }
         self.rows += 1;
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
         Ok(())
@@ -1686,6 +1745,9 @@ crate::atomic_stats! {
         pub blocks_sent,
         pub xacts_committed,
         pub unsupported_relations,
+        /// DELETE rows dropped because `[system_columns] is_deleted = false`
+        /// leaves them nowhere to land
+        pub deletes_discarded,
         /// `retries_attempted` counts one per failing operation, not per
         /// attempt (one op needing 3 retries adds 3)
         pub reconnects,
@@ -2301,7 +2363,14 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).expect("plan builds");
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .expect("plan builds");
         assert!(plan.insert_sql.contains("INSERT INTO `default`.`foo`"));
         assert!(plan.insert_sql.contains("`id`"));
         assert!(plan.insert_sql.contains("`name`"));
@@ -2320,7 +2389,7 @@ mod tests {
         // numeric-shaped default: the plan drill `numeric(38,0)` → `Int128`
         m.columns[0].target_type = "Decimal(38, 0)".into();
         let rules = col_rules(&[("id", "Int128")]);
-        let plan = TablePlan::build(alloc, &rel, &m, &rules).unwrap();
+        let plan = TablePlan::build(alloc, &rel, &m, &rules, &SystemColumns::default()).unwrap();
         assert_eq!(plan.columns[0].type_repr, "Int128");
         // scale-0 decimal wire keeps the numeric text→scaled encode path
         assert_eq!(
@@ -2341,7 +2410,7 @@ mod tests {
         // Operator-renamed CH column: override still keys on source attname
         m.columns[1].target_name = "label".into();
         let rules = col_rules(&[("name", "String")]);
-        let plan = TablePlan::build(alloc, &rel, &m, &rules).unwrap();
+        let plan = TablePlan::build(alloc, &rel, &m, &rules, &SystemColumns::default()).unwrap();
         assert_eq!(plan.columns[1].name, "label");
         assert_eq!(plan.columns[1].type_repr, "String");
     }
@@ -2354,7 +2423,7 @@ mod tests {
         // encode_value writes int4 as 4 LE bytes; no textualization exists,
         // so Int32 → String must fall back rather than poison the batcher
         let rules = col_rules(&[("id", "String")]);
-        let plan = TablePlan::build(alloc, &rel, &m, &rules).unwrap();
+        let plan = TablePlan::build(alloc, &rel, &m, &rules, &SystemColumns::default()).unwrap();
         assert_eq!(plan.columns[0].type_repr, "Int32");
     }
 
@@ -2393,7 +2462,14 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).expect("plan builds");
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .expect("plan builds");
         assert!(plan.insert_sql.contains("`_is_deleted`"));
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(1, Some("a")), &m, OP_INSERT)
@@ -2441,7 +2517,14 @@ mod tests {
         let rel = mk_rel();
         let mut m = mk_mapping();
         m.columns[1].target_type = "String".into();
-        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).expect("plan builds");
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .expect("plan builds");
         let mut enc = TableEncoder::new(plan).unwrap();
         // Delete: non-key column absent from the key-only old image
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
@@ -2461,7 +2544,14 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).expect("plan builds");
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .expect("plan builds");
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
         match &enc.buffers[1] {
@@ -2475,7 +2565,14 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).unwrap();
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .unwrap();
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(7, Some("seven")), &m, OP_INSERT)
             .unwrap();
@@ -2765,6 +2862,118 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn config_system_columns_reach_config() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [system_columns]\n\
+             lsn = \"_peerdb_version\"\n\
+             is_deleted = false\n",
+        )
+        .unwrap();
+        assert_eq!(c.system_columns.lsn, "_peerdb_version");
+        assert!(c.system_columns.is_deleted.is_none());
+        assert!(!c.row_policy().soft_delete);
+        // Absent section keeps the defaults
+        let d = EmitterConfig::from_toml_str("[ch]\n").unwrap();
+        assert_eq!(*d.system_columns, SystemColumns::default());
+    }
+
+    #[test]
+    fn table_block_renames_system_columns_for_its_relations() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [system_columns]\n\
+             lsn = \"_v\"\n\
+             [table.public.events]\n\
+             lsn = \"_peerdb_version\"\n\
+             is_deleted = false\n\
+             [table.app.\"events_*\"]\n\
+             match = \"glob\"\n\
+             commit_ts = \"_peerdb_synced_at\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.system_columns.lsn, "_v", "cluster-wide default stands");
+        let entry = |rel: RelName| {
+            c.table_entries
+                .iter()
+                .find(|(r, _, _)| *r == rel)
+                .expect("entry")
+        };
+        let (_, kind, rule) = entry(RelName::new("public", "events"));
+        assert_eq!(*kind, MatchKind::Exact);
+        assert_eq!(rule.system.lsn.as_deref(), Some("_peerdb_version"));
+        assert_eq!(rule.system.is_deleted.as_deref(), Some(""));
+        let (_, kind, rule) = entry(RelName::new("app", "events_*"));
+        assert_eq!(*kind, MatchKind::Glob);
+        assert_eq!(rule.system.commit_ts.as_deref(), Some("_peerdb_synced_at"));
+    }
+
+    #[test]
+    fn table_block_rejects_rename_onto_another_system_column() {
+        assert!(EmitterConfig::from_toml_str("[ch]\n[table.public.t]\nlsn = \"_xid\"\n").is_err());
+        assert!(EmitterConfig::from_toml_str("[ch]\n[table.public.t]\nis_deleted = 7\n").is_err());
+    }
+
+    #[test]
+    fn config_table_key_lists_parse_from_arrays() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.public.events]\n\
+             order_by = [\"tenant\", \"id\"]\n\
+             primary_key = [\"tenant\"]\n",
+        )
+        .unwrap();
+        let rel = RelName::new("public", "events");
+        let (_, _, rule) = &c.table_entries[0];
+        assert_eq!(
+            rule.order_by.as_deref(),
+            Some(["tenant".to_string(), "id".to_string()].as_slice())
+        );
+        assert_eq!(
+            rule.primary_key.as_deref(),
+            Some(["tenant".to_string()].as_slice())
+        );
+        // Key lists also apply to a columns-less opt-in block
+        assert!(!c.tables.contains_key(&rel));
+        // Arrays only: a bare string is a config error, never a split list
+        for bad in [
+            "order_by = 7",
+            "order_by = \"tenant, id\"",
+            "primary_key = \"tenant\"",
+        ] {
+            assert!(
+                EmitterConfig::from_toml_str(&format!("[ch]\n[table.public.t]\n{bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_renames_synthetic_columns_and_can_drop_the_marker() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let m = mk_mapping();
+        let sys = SystemColumns {
+            lsn: "_v".into(),
+            xid: "_x".into(),
+            commit_ts: "_at".into(),
+            is_deleted: None,
+        };
+        let plan =
+            TablePlan::build(alloc, &rel, &m, &ColumnRules::default(), &sys).expect("plan builds");
+        assert!(
+            plan.insert_sql
+                .ends_with("`_v`, `_x`, `_at`) FORMAT Native"),
+            "{}",
+            plan.insert_sql
+        );
+        assert!(plan.synth_is_deleted.is_none());
+        let enc = TableEncoder::new(plan).expect("encoder");
+        // Mapped columns plus three synthetic, no marker buffer
+        assert_eq!(enc.buffers.len(), m.columns.len() + 3);
     }
 
     #[test]

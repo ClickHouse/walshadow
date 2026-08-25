@@ -1133,9 +1133,111 @@ mod tests {
         let s = r.rules.settings(&rel);
         assert_eq!(s.target_database.as_deref(), Some("sql_db"));
         assert_eq!(s.replicate, Some(true), "TOML scope still applies");
-        let ddl =
-            crate::emit::ch_ddl::DdlConfig::from_resolved(&r, "db".into(), false, false, None);
+        let ddl = crate::emit::ch_ddl::DdlConfig::from_resolved(
+            &r,
+            "db".into(),
+            false,
+            Arc::default(),
+            false,
+            None,
+        );
         assert_eq!(ddl.declared_scope(&rel), Some(true));
+    }
+
+    #[test]
+    fn overlay_key_lists_override_toml() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.public.events]\n\
+             order_by = [\"id\"]\n\
+             primary_key = [\"id\"]\n\
+             [table.public.other]\n\
+             order_by = [\"a\"]\n",
+        )
+        .unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.tables.insert(
+            RelName::new("public", "events"),
+            TableRow {
+                order_by: Some(vec!["tenant".into(), "id".into()]),
+                primary_key: Some(vec!["tenant".into()]),
+                ..Default::default()
+            },
+        );
+        let (r, _) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        let events = RelName::new("public", "events");
+        let s = r.rules.settings(&events);
+        assert_eq!(s.order_by.unwrap(), ["tenant", "id"]);
+        assert_eq!(s.primary_key.unwrap(), ["tenant"]);
+        let other = r.rules.settings(&RelName::new("public", "other"));
+        assert_eq!(
+            other.order_by.unwrap(),
+            ["a"],
+            "untouched relation keeps its TOML list"
+        );
+        // A row reaches the DDL applicator through the resolved snapshot
+        let ddl = crate::emit::ch_ddl::DdlConfig::from_resolved(
+            &r,
+            "db".into(),
+            false,
+            Arc::default(),
+            false,
+            None,
+        );
+        let settings = ddl.rules.settings(&events);
+        let shape = ddl.create_shape(&settings);
+        assert_eq!(shape.order_by, ["tenant", "id"]);
+        assert_eq!(shape.primary_key, ["tenant"]);
+    }
+
+    /// A pattern row shapes relations no row can name: under `replicate_all`
+    /// the CREATE fires the first time a table is seen, before a literal row
+    /// for it could arrive
+    #[test]
+    fn overlay_pattern_row_renames_system_columns_of_unknown_relation() {
+        let base = EmitterConfig::from_toml_str("[ch]\n").unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.tables.insert(
+            RelName::new("app", "events_*"),
+            TableRow {
+                match_kind: Some("glob".into()),
+                system: crate::mapping::SystemColumnNames {
+                    lsn: Some("_peerdb_version".into()),
+                    is_deleted: Some(String::new()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (r, rejections) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        assert_eq!(rejections, 0);
+        let policy = crate::emit::route::RowPolicy::default();
+        // No mapping, no descriptor, no CREATE yet: the shape is still known
+        let sys = policy
+            .for_rel(Some(&r), &RelName::new("app", "events_2026"))
+            .system;
+        assert_eq!(sys.lsn, "_peerdb_version");
+        assert!(sys.is_deleted.is_none());
+        assert_eq!(sys.xid, "_xid", "unnamed column inherits");
+        assert_eq!(
+            *policy
+                .for_rel(Some(&r), &RelName::new("app", "orders"))
+                .system,
+            crate::mapping::SystemColumns::default(),
+            "a relation the pattern misses keeps the cluster-wide names"
+        );
     }
 
     fn auto_create_set(base: &EmitterConfig, overlay: &ConfigOverlay) -> ahash::HashSet<String> {
@@ -1147,7 +1249,8 @@ mod tests {
             &OptInState::default(),
             &ColumnRules::default(),
         );
-        DdlConfig::from_resolved(&r, "db".into(), false, false, None).auto_create_namespaces
+        DdlConfig::from_resolved(&r, "db".into(), false, Arc::default(), false, None)
+            .auto_create_namespaces
     }
 
     #[test]
