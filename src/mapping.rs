@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::catalog::type_bridge::{self, ResolvedColumn};
 use crate::column_rules::{ColumnRule, ColumnRules};
 use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
+use crate::table_rules::set_if;
 use ahash::HashMap;
 use tokio::sync::RwLock;
 
@@ -115,6 +116,191 @@ impl std::str::FromStr for ToastMode {
 #[derive(Debug, Clone, Default)]
 pub struct ToastConfig {
     pub mode: ToastMode,
+}
+
+/// Names of the columns walshadow appends to every replicated CH table, and
+/// whether the delete marker exists at all. `[system_columns]` sets the
+/// cluster-wide default; a `[table.*]` block or `config_table` row renames per
+/// relation ([`SystemColumnNames`]). A rename does not ALTER tables already
+/// created, and every INSERT column list rebuilds from these, so an operator
+/// renaming after first sync must ALTER the destination themselves. TOAST
+/// mirror tables are walshadow-internal and keep their own fixed names.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct SystemColumns {
+    pub lsn: String,
+    pub xid: String,
+    pub commit_ts: String,
+    /// `None` leaves the delete marker out of both DDL and INSERT. DELETE rows
+    /// then have nowhere to land, so they are discarded (counted in
+    /// `emitter_deletes_discarded`) — for append-only destinations
+    #[serde(deserialize_with = "de_delete_marker")]
+    pub is_deleted: Option<String>,
+}
+
+impl Default for SystemColumns {
+    fn default() -> Self {
+        Self {
+            lsn: "_lsn".into(),
+            xid: "_xid".into(),
+            commit_ts: "_commit_ts".into(),
+            is_deleted: Some("_is_deleted".into()),
+        }
+    }
+}
+
+/// `is_deleted = false` (or an empty name) drops the delete marker
+fn de_delete_marker<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    use serde::Deserialize;
+    match toml::Value::deserialize(d)? {
+        toml::Value::Boolean(false) => Ok(None),
+        toml::Value::Boolean(true) => Ok(SystemColumns::default().is_deleted),
+        toml::Value::String(name) => Ok((!name.is_empty()).then_some(name)),
+        v => Err(serde::de::Error::custom(format!(
+            "expected a string or false, got {}",
+            v.type_str()
+        ))),
+    }
+}
+
+impl SystemColumns {
+    /// A blank rename or a name colliding with another system column yields a
+    /// CH table walshadow cannot INSERT into, so both are config errors
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, name) in [
+            ("lsn", &self.lsn),
+            ("xid", &self.xid),
+            ("commit_ts", &self.commit_ts),
+        ] {
+            if name.is_empty() {
+                return Err(format!("system_columns.{key}: name must not be empty"));
+            }
+        }
+        let names = self.names();
+        for (i, a) in names.iter().enumerate() {
+            if names[i + 1..].contains(a) {
+                return Err(format!("system_columns: `{a}` named twice"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every system column present, in the order the emitter appends them
+    pub fn names(&self) -> Vec<&str> {
+        let mut v = vec![
+            self.lsn.as_str(),
+            self.xid.as_str(),
+            self.commit_ts.as_str(),
+        ];
+        v.extend(self.is_deleted.as_deref());
+        v
+    }
+
+    /// Apply per-relation renames. Total rather than fallible: a rename onto a
+    /// name another system column holds is skipped, so no merge of layers can
+    /// render a CH table with two identically named columns. Entries are
+    /// name-checked where they are parsed, so a skip here means two layers
+    /// collided
+    pub fn renamed(&self, names: &SystemColumnNames) -> Self {
+        let mut out = self.clone();
+        for (i, over) in [&names.lsn, &names.xid, &names.commit_ts]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(name) = over.as_deref().filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            if out
+                .names()
+                .iter()
+                .enumerate()
+                .any(|(j, n)| j != i && *n == name)
+            {
+                continue;
+            }
+            let field = match i {
+                0 => &mut out.lsn,
+                1 => &mut out.xid,
+                _ => &mut out.commit_ts,
+            };
+            *field = name.into();
+        }
+        match names.is_deleted.as_deref() {
+            Some("") => out.is_deleted = None,
+            Some(name) if !out.names()[..3].contains(&name) => out.is_deleted = Some(name.into()),
+            _ => {}
+        }
+        out
+    }
+}
+
+/// Per-relation renames layered over [`SystemColumns`]. `None` inherits the
+/// cluster-wide name. An empty string inherits too — a blank `text` overlay
+/// column must not blank a column name — except on `is_deleted`, where it drops
+/// the marker (and with it every DELETE row), like `[system_columns]
+/// is_deleted = false`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SystemColumnNames {
+    pub lsn: Option<String>,
+    pub xid: Option<String>,
+    pub commit_ts: Option<String>,
+    pub is_deleted: Option<String>,
+}
+
+impl SystemColumnNames {
+    pub fn is_empty(&self) -> bool {
+        self.lsn.is_none()
+            && self.xid.is_none()
+            && self.commit_ts.is_none()
+            && self.is_deleted.is_none()
+    }
+
+    pub fn overlay(&mut self, other: &Self) {
+        set_if(&mut self.lsn, &other.lsn);
+        set_if(&mut self.xid, &other.xid);
+        set_if(&mut self.commit_ts, &other.commit_ts);
+        set_if(&mut self.is_deleted, &other.is_deleted);
+    }
+
+    /// Reject a set naming one column twice, or renaming onto a name another
+    /// system column holds by default: both yield a CH table walshadow cannot
+    /// INSERT into. `ctx` names the config entry
+    pub fn validate(&self, ctx: &str) -> Result<(), String> {
+        let renamed = SystemColumns::default().renamed(self);
+        let landed = renamed.names();
+        let wanted = [
+            self.lsn.as_deref(),
+            self.xid.as_deref(),
+            self.commit_ts.as_deref(),
+            self.is_deleted.as_deref(),
+        ];
+        for (i, want) in wanted.into_iter().enumerate() {
+            let Some(want) = want.filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            if landed.get(i) != Some(&want) {
+                return Err(format!("{ctx}: `{want}` names two system columns"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-relation delete marker: `false` (or a blank name) drops it for this
+/// relation alone, `true` restores the cluster-wide name
+pub(crate) fn de_marker_override<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    use serde::Deserialize;
+    match toml::Value::deserialize(d)? {
+        toml::Value::Boolean(false) => Ok(Some(String::new())),
+        toml::Value::Boolean(true) => Ok(SystemColumns::default().is_deleted),
+        toml::Value::String(name) => Ok(Some(name)),
+        v => Err(serde::de::Error::custom(format!(
+            "expected a string or false, got {}",
+            v.type_str()
+        ))),
+    }
 }
 
 /// Immutable routing-map version. Planners snapshot one per transaction so a
@@ -242,6 +428,93 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse a `[system_columns]` body the way `ConfigDocument` does
+    fn system_columns(body: &str) -> Result<SystemColumns, String> {
+        let sys: SystemColumns = toml::from_str(body).map_err(crate::toml_de::message)?;
+        sys.validate()?;
+        Ok(sys)
+    }
+
+    #[test]
+    fn system_columns_default_when_section_absent() {
+        let sys = system_columns("").unwrap();
+        assert_eq!(sys, SystemColumns::default());
+        assert_eq!(sys.names(), ["_lsn", "_xid", "_commit_ts", "_is_deleted"]);
+    }
+
+    #[test]
+    fn system_columns_rename_and_disable_marker() {
+        let sys = system_columns("lsn = \"_peerdb_version\"\ncommit_ts = \"_peerdb_synced_at\"\n")
+            .unwrap();
+        assert_eq!(sys.lsn, "_peerdb_version");
+        assert_eq!(sys.commit_ts, "_peerdb_synced_at");
+        assert_eq!(sys.xid, "_xid");
+        assert_eq!(sys.is_deleted.as_deref(), Some("_is_deleted"));
+
+        let off = system_columns("is_deleted = false\n").unwrap();
+        assert!(off.is_deleted.is_none());
+        assert_eq!(off.names(), ["_lsn", "_xid", "_commit_ts"]);
+        let renamed = system_columns("is_deleted = \"gone\"\n").unwrap();
+        assert_eq!(renamed.is_deleted.as_deref(), Some("gone"));
+    }
+
+    #[test]
+    fn system_columns_reject_empty_and_colliding_names() {
+        // Both yield a CH table walshadow cannot INSERT into
+        assert!(system_columns("lsn = \"\"\n").is_err());
+        assert!(system_columns("xid = \"_lsn\"\n").is_err());
+        assert!(system_columns("lsn = 7\n").is_err());
+    }
+
+    #[test]
+    fn per_relation_rename_inherits_unnamed_columns() {
+        let names = SystemColumnNames {
+            lsn: Some("_peerdb_version".into()),
+            is_deleted: Some(String::new()),
+            ..SystemColumnNames::default()
+        };
+        names.validate("table.public.t").unwrap();
+        let sys = SystemColumns::default().renamed(&names);
+        assert_eq!(sys.lsn, "_peerdb_version");
+        assert_eq!(sys.xid, "_xid", "unnamed column inherits");
+        assert!(sys.is_deleted.is_none(), "blank marker drops it");
+    }
+
+    #[test]
+    fn per_relation_blank_name_inherits() {
+        let sys = SystemColumns::default().renamed(&SystemColumnNames {
+            lsn: Some(String::new()),
+            ..SystemColumnNames::default()
+        });
+        assert_eq!(
+            sys.lsn, "_lsn",
+            "a blank overlay column must not blank a name"
+        );
+    }
+
+    #[test]
+    fn per_relation_rename_onto_another_system_column_rejected() {
+        let onto = SystemColumnNames {
+            lsn: Some("_xid".into()),
+            ..SystemColumnNames::default()
+        };
+        assert!(onto.validate("t").is_err());
+        assert!(
+            SystemColumnNames {
+                lsn: Some("_v".into()),
+                xid: Some("_v".into()),
+                ..SystemColumnNames::default()
+            }
+            .validate("t")
+            .is_err()
+        );
+        // Layers can still collide after their own checks pass; the merge
+        // keeps the name it holds rather than rendering two columns as one
+        let sys = SystemColumns::default().renamed(&onto);
+        assert_eq!(sys.names().len(), 4);
+        assert_eq!(sys.lsn, "_lsn");
+    }
 
     fn one_table() -> (RelName, HashMap<RelName, TableMapping>) {
         let rel = RelName::new("public", "t");

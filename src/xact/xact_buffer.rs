@@ -1588,7 +1588,9 @@ impl MergeSource {
 
 enum MergeItem {
     Heap(Box<DescribedHeap>),
-    Event(DrainEntry),
+    /// Boxed: a config row carries every per-relation setting, so the variant
+    /// dwarfs the heap pointer the merge yields per row
+    Event(Box<DrainEntry>),
 }
 
 /// Lazy k-way merge over per-xid sources + event queues, `source_lsn` ASC.
@@ -1698,7 +1700,7 @@ impl MergedDrain {
             match pick {
                 Pick::Event(i) => {
                     let (_lsn, ev) = self.events[i].pop_front().expect("just peeked head");
-                    return Ok(Some(MergeItem::Event(ev)));
+                    return Ok(Some(MergeItem::Event(Box::new(ev))));
                 }
                 Pick::Data(i) => {
                     let entry = self.sources[i]
@@ -2245,7 +2247,7 @@ impl CommittedDrain {
                 Some(MergeItem::Event(event)) => ordered_events.push(OrderedEvent {
                     heap_idx: heaps.len(),
                     row_idx: m.rows.len(),
-                    event,
+                    event: *event,
                 }),
                 Some(MergeItem::Heap(h)) => {
                     if h.decoded.op == HeapOp::Truncate {

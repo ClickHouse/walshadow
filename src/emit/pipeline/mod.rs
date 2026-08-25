@@ -269,7 +269,7 @@ impl PipelineConfig {
             retires,
             resume_floor,
             mapping,
-            emitter.soft_delete,
+            emitter.row_policy(),
         );
 
         Ok((

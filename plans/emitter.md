@@ -386,8 +386,17 @@ CH applies its own zero-init
 ### Synthetic columns
 
 Destination metadata contract lives in
-[`docs/destination-tables.md`](../docs/destination-tables.md). All four values
-remain non-nullable and append after mapped columns in `TableEncoder::new`
+[`docs/destination-tables.md`](../docs/destination-tables.md). Values stay
+non-nullable and append after mapped columns in `TableEncoder::new`. Names come
+from the relation's resolved `SystemColumns`, so every site that renders or
+encodes a metadata column reads them per relation instead of a constant
+
+The delete marker is optional (`is_deleted = false`). Without it a DELETE would
+land as a phantom insert of the old image, so those rows are discarded where the
+placed count is taken (`decode_and_route`, and the object-store gap-replay
+sink), counted in `walshadow_emitter_deletes_discarded_total`. Dropping them
+anywhere later would short the ack collector's per-seq reconcile and pin the
+watermark
 
 `_lsn` is dedup key because emitter ack lags actual CH durability by up
 to one flush window. On restart the manifest floor rewinds to
@@ -449,8 +458,10 @@ table:
 | `Dropped { rel_name }` | gated on the namespace's `DropTableStrategy` (`drop_strategy_for`, else global): `Retain` (default) skips silently, `Warn` skips at WARN, `Drop` runs `DROP TABLE IF EXISTS` |
 
 `render_create_table` builds CREATE off descriptor: attributes through
-`type_bridge::map`, PK columns first in `ORDER BY` (else `_lsn`
-fallback), engine pinned to `ReplacingMergeTree(_lsn)`. Synthetic
+`type_bridge::map`, then the sort key — the operator `order_by`
+([`docs/destination-tables.md`](../docs/destination-tables.md)) when it names
+non-nullable destination columns, else PK columns first (else `_lsn` fallback) —
+engine pinned to `ReplacingMergeTree(_lsn)`. Synthetic
 columns appended after mapped columns, same shape as `TablePlan::build`.
 `render_create_table_from_mapping` builds off the mapping instead (its
 columns are the emitter's INSERT contract), resolving `ORDER BY` key

@@ -47,7 +47,7 @@ use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::decode::DecodeJob;
 use crate::emit::pipeline::plan_spool::{PlanItem, SealedPlan};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
-use crate::emit::route::{RouteSnapshot, RoutedHeap};
+use crate::emit::route::{RouteSnapshot, RoutedHeap, RowPolicy};
 use crate::mapping::{MappingHandle, MappingSnapshot, TableMapping};
 use crate::pos::{Floor, Monotone};
 use crate::runtime_config::{ConfigEvent, TableRow};
@@ -122,8 +122,8 @@ pub struct ReorderSink {
     /// Shared routing map, snapshotted into `route_mapping` at route-state
     /// resets (this coordinator's own event applies are the fenced writers).
     mapping: MappingHandle,
-    /// Boot-only delete-retention policy, frozen into route snapshots.
-    soft_delete: bool,
+    /// Boot-only row-shape policy, frozen into route snapshots.
+    row_policy: RowPolicy,
     /// Byte cap per transaction plan spool file
     plan_disk_max: u64,
     /// Plan spool directory (the xact spill dir), cached at spawn so the
@@ -162,7 +162,7 @@ impl ReorderSink {
         retires: RetireLedger,
         resume_floor: Arc<Monotone<Floor>>,
         mapping: MappingHandle,
-        soft_delete: bool,
+        row_policy: RowPolicy,
     ) -> Self {
         // subscribe() marks the current value seen, so a `ctl reload`
         // racing pipeline spawn would stay invisible to has_changed —
@@ -204,7 +204,7 @@ impl ReorderSink {
             applied_opt_ins: HashSet::new(),
             pending_opt_ins: HashMap::new(),
             mapping,
-            soft_delete,
+            row_policy,
 
             route_mapping: None,
             route_config: None,
@@ -851,7 +851,7 @@ impl ReorderSink {
                 let mut view = ReorderRouteView::new(
                     self.route_mapping.clone(),
                     self.route_config.clone(),
-                    self.soft_delete,
+                    self.row_policy.clone(),
                     self.applicator.as_mut(),
                     self.stats.clone(),
                 );
@@ -978,7 +978,7 @@ pub struct ReorderRouteView<'a> {
     /// Catalog fold above `mapping`; `None` value = locally dropped
     overlay: HashMap<RelName, Option<TableMapping>>,
     memo: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
-    soft_delete: bool,
+    row_policy: RowPolicy,
     applicator: Option<&'a mut DdlApplicator>,
     stats: Arc<EmitterStats>,
 }
@@ -987,7 +987,7 @@ impl<'a> ReorderRouteView<'a> {
     pub fn new(
         mapping: Option<MappingSnapshot>,
         config: Option<Arc<ResolvedConfig>>,
-        soft_delete: bool,
+        row_policy: RowPolicy,
         applicator: Option<&'a mut DdlApplicator>,
         stats: Arc<EmitterStats>,
     ) -> Self {
@@ -996,7 +996,7 @@ impl<'a> ReorderRouteView<'a> {
             config,
             overlay: HashMap::new(),
             memo: HashMap::new(),
-            soft_delete,
+            row_policy,
             applicator,
             stats,
         }
@@ -1018,7 +1018,8 @@ impl PlanRouteView for ReorderRouteView<'_> {
                 .config
                 .as_ref()
                 .map_or_else(Arc::default, |rc| rc.column_rules.clone());
-            RouteSnapshot::freeze(Arc::new(m), rules, self.soft_delete)
+            let policy = self.row_policy.for_rel(self.config.as_deref(), rel_name);
+            RouteSnapshot::freeze(Arc::new(m), rules, policy)
         });
         let result = if route.is_none() {
             self.stats
@@ -1150,8 +1151,13 @@ mod tests {
         )]));
 
         let stats = Arc::new(EmitterStats::default());
-        let mut view =
-            ReorderRouteView::new(Some(handle.snapshot().await), None, false, None, stats);
+        let mut view = ReorderRouteView::new(
+            Some(handle.snapshot().await),
+            None,
+            RowPolicy::default(),
+            None,
+            stats,
+        );
         assert!(view.route_for(&heap_of(&planned)).is_some());
         assert!(view.route_for(&heap_of(&added)).is_none());
 

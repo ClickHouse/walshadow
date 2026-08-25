@@ -506,6 +506,12 @@ impl CopyBackfiller {
         dest.clone()
     }
 
+    /// Live per-relation rules, for destination names the staging promote
+    /// has to match. `None` without a resolver (tests): the boot set stands
+    fn table_rules(&self) -> Option<Arc<crate::table_rules::TableRules>> {
+        self.config_rx.as_ref().map(|rx| rx.borrow().rules.clone())
+    }
+
     fn refresh_gauges(&self, ledger: &Ledger) {
         self.pending
             .store(ledger.pending_count(), Ordering::Relaxed);
@@ -742,7 +748,10 @@ impl CopyBackfiller {
         if plan.rels.is_empty() {
             return;
         }
-        let mut sess = match StagingSession::connect(self.dest_emitter()).await {
+        let mut sess = match StagingSession::connect(self.dest_emitter())
+            .await
+            .map(|s| s.with_rules(self.table_rules()))
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(
@@ -870,7 +879,9 @@ impl CopyBackfiller {
             table: target.table,
             s_lsn: rec.s_lsn.get(),
         };
-        let mut sess = StagingSession::connect(self.dest_emitter()).await?;
+        let mut sess = StagingSession::connect(self.dest_emitter())
+            .await?
+            .with_rules(self.table_rules());
         match sess.table_uuid(&rel.database, &rel.staging_table()).await? {
             None => {
                 self.mark_done_entry(name).await;
@@ -1058,7 +1069,7 @@ impl CopyBackfiller {
                 self.spill_dir.join("copy_deferred.bin"),
                 crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX,
             ),
-            self.emitter.soft_delete,
+            self.emitter.row_policy(),
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         ));
 

@@ -127,6 +127,9 @@ pub struct StagingSession {
     client: BoxedAsyncClient,
     /// Kept whole for reconnect; shared with the pass that opened the session
     conn: Arc<EmitterConfig>,
+    /// Per-relation destination rules, for the promote's `_lsn` predicate when
+    /// a `[table.*]` block or `config_table` row renamed that column
+    rules: Option<Arc<crate::table_rules::TableRules>>,
     retry: RetryConfig,
     timeout: Duration,
 }
@@ -141,7 +144,25 @@ impl StagingSession {
             retry: emitter.retry.clone(),
             timeout: emitter.insert_timeout,
             conn: emitter,
+            rules: None,
         })
+    }
+
+    pub fn with_rules(mut self, rules: Option<Arc<crate::table_rules::TableRules>>) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    /// LSN column of one relation's destination
+    fn lsn_column(&self, rel: &RelName) -> String {
+        match &self.rules {
+            Some(rules) => rules
+                .settings(rel)
+                .system_columns(&self.conn.system_columns)
+                .lsn
+                .clone(),
+            None => self.conn.system_columns.lsn.clone(),
+        }
     }
 
     async fn attempt_write(&mut self, sql: &str) -> Result<(), EmitterError> {
@@ -295,8 +316,9 @@ impl StagingSession {
             );
         }
         let list = cols.join(", ");
+        let lsn = quote_ident(&self.lsn_column(&rel.rel));
         self.exec_retry(&format!(
-            "INSERT INTO {} ({list}) SELECT {list} FROM {} WHERE `_lsn` > {}",
+            "INSERT INTO {} ({list}) SELECT {list} FROM {} WHERE {lsn} > {}",
             rel.real_sql(),
             rel.staging_sql(),
             rel.s_lsn

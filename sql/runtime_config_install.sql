@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_table (
     initial_load    text,            -- one-time backfill mode for pre-opt-in
                                      -- rows: 'none' | 'copy' | 'base_backup'
                                      -- | 'object_store'; NULL means omitted
+    order_by        text[],          -- ClickHouse ORDER BY columns; NULL
+                                     -- inherits, empty array derives
+    primary_key     text[],          -- ClickHouse PRIMARY KEY; must prefix
+                                     -- order_by
+    lsn             text,            -- per-relation names for the columns
+    xid             text,            -- walshadow appends; NULL inherits
+    commit_ts       text,            -- [system_columns]
+    is_deleted      text,            -- '' drops the marker (and DELETE rows)
     PRIMARY KEY (namespace, relname)
 );
 
@@ -72,7 +80,13 @@ ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS replicate 
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS initial_load    text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_database text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_table    text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS order_by        text[];
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS primary_key     text[];
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS match           text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS lsn             text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS xid             text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS commit_ts       text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS is_deleted      text;
 ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS match           text;
 
 -- REPLICA IDENTITY FULL logs the complete old-row image on UPDATE/DELETE, so a

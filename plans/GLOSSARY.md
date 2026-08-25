@@ -561,9 +561,13 @@ diverging `shadow_apply` vs `dispatched` signals shadow lag
 `XLOG_XACT_ASSIGNMENT`; a hint only, authoritative subxact list arrives
 inline on commit/abort record ([xact.md](xact.md))
 
-**synthetic columns** — four trailing columns on every dest table:
-`_lsn` UInt64, `_xid` UInt32, `_commit_ts` DateTime64(6,'UTC'),
-`_is_deleted` Bool ([emitter.md](emitter.md))
+**synthetic columns** — trailing columns on every dest table, default
+names `_lsn` UInt64, `_xid` UInt32, `_commit_ts` DateTime64(6,'UTC'),
+`_is_deleted` Bool. `[system_columns]` renames them cluster-wide and can
+drop the delete marker; a `[table.*]` block or `config_table` row (literal
+or `match` pattern) overrides per relation
+([emitter.md](emitter.md),
+[destination tables guide](../docs/destination-tables.md))
 
 **tail** — reusable batcher + inserter pool + ack collector unit; WAL
 pipeline and bootstrap drain feed the identical tail, `tail.finish`

@@ -83,6 +83,14 @@ pub struct TableRow {
     /// parses at dispatch in [`crate::backfill::opt_in`], validate-late like every
     /// overlay value); absent / `none` streams from opt-in LSN.
     pub initial_load: Option<String>,
+    /// CH `ORDER BY` for this table's `CREATE`. NULL keeps startup TOML value;
+    /// empty array uses replica identity
+    pub order_by: Option<Vec<String>>,
+    /// CH `PRIMARY KEY` sparse-index prefix. Ignored unless prefix of `ORDER BY`
+    pub primary_key: Option<Vec<String>>,
+    /// Per-relation renames of the columns walshadow appends. NULL on a column
+    /// inherits `[system_columns]`; `is_deleted = ''` drops the marker
+    pub system: crate::mapping::SystemColumnNames,
     pub match_kind: Option<String>,
 }
 
@@ -297,6 +305,19 @@ fn field_string(rel: &RelDescriptor, cols: &[Option<ColumnValue>], name: &str) -
     }
 }
 
+fn field_string_array(
+    rel: &RelDescriptor,
+    cols: &[Option<ColumnValue>],
+    name: &str,
+) -> Option<Vec<String>> {
+    match column(rel, cols, name)? {
+        ColumnValue::PgPending { type_oid, raw } if *type_oid == crate::schema::TEXTARRAYOID => {
+            crate::decode::codecs::decode_text_array(raw)
+        }
+        _ => None,
+    }
+}
+
 /// Interpret a config-table heap write into a [`ConfigEvent`]. `rel` must
 /// describe the same relation `decoded` targets. `None` when the write carries
 /// no usable image or the row key is missing.
@@ -356,6 +377,14 @@ pub fn interpret(
                     target_table: field_string(rel, &cols, "target_table"),
                     replicate: field_bool(rel, &cols, "replicate"),
                     initial_load: field_string(rel, &cols, "initial_load"),
+                    order_by: field_string_array(rel, &cols, "order_by"),
+                    primary_key: field_string_array(rel, &cols, "primary_key"),
+                    system: crate::mapping::SystemColumnNames {
+                        lsn: field_string(rel, &cols, "lsn"),
+                        xid: field_string(rel, &cols, "xid"),
+                        commit_ts: field_string(rel, &cols, "commit_ts"),
+                        is_deleted: field_string(rel, &cols, "is_deleted"),
+                    },
                     match_kind: field_string(rel, &cols, "match"),
                 },
             })
@@ -420,6 +449,13 @@ mod tests {
             persistence: 'p',
             replident: ReplIdent::Full { pk_attnums: None },
             attributes: attrs,
+        }
+    }
+
+    fn text_array(values: &[&str]) -> ColumnValue {
+        ColumnValue::PgPending {
+            type_oid: crate::schema::TEXTARRAYOID,
+            raw: crate::decode::codecs::text_array_body(values),
         }
     }
 
@@ -595,6 +631,8 @@ mod tests {
                 attr(4, "target_table", 25),
                 attr(5, "replicate", 16),
                 attr(6, "initial_load", 25),
+                attr(7, "order_by", crate::schema::TEXTARRAYOID),
+                attr(8, "primary_key", crate::schema::TEXTARRAYOID),
             ],
         );
         let new = vec![
@@ -604,6 +642,8 @@ mod tests {
             Some(ColumnValue::Text("events".into())),
             Some(ColumnValue::Bool(true)),
             Some(ColumnValue::Text("copy".into())),
+            Some(text_array(&["tenant", "id"])),
+            Some(text_array(&["tenant"])),
         ];
         match interpret(
             ConfigTableKind::Table,
@@ -618,6 +658,8 @@ mod tests {
                 assert_eq!(row.target_table.as_deref(), Some("events"));
                 assert_eq!(row.replicate, Some(true));
                 assert_eq!(row.initial_load.as_deref(), Some("copy"));
+                assert_eq!(row.order_by.unwrap(), ["tenant", "id"]);
+                assert_eq!(row.primary_key.unwrap(), ["tenant"]);
             }
             other => panic!("expected TableUpserted, got {other:?}"),
         }
@@ -664,6 +706,8 @@ mod tests {
                 attr(2, "relname", 25),
                 attr(3, "match", 25),
                 attr(4, "replicate", 16),
+                attr(5, "lsn", 25),
+                attr(6, "is_deleted", 25),
             ],
         );
         let new = vec![
@@ -671,6 +715,8 @@ mod tests {
             Some(ColumnValue::Text("events_.*".into())),
             Some(ColumnValue::Text("regex".into())),
             Some(ColumnValue::Bool(true)),
+            Some(ColumnValue::Text("_peerdb_version".into())),
+            Some(ColumnValue::Text(String::new())),
         ];
         match interpret(
             ConfigTableKind::Table,
@@ -683,6 +729,9 @@ mod tests {
                 assert_eq!(rel, RelName::new("app", "events_.*"));
                 assert!(row.is_pattern());
                 assert_eq!(row.replicate, Some(true));
+                assert_eq!(row.system.lsn.as_deref(), Some("_peerdb_version"));
+                assert_eq!(row.system.is_deleted.as_deref(), Some(""));
+                assert_eq!(row.system.xid, None, "absent column inherits");
             }
             other => panic!("expected TableUpserted, got {other:?}"),
         }

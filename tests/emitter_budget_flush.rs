@@ -162,7 +162,11 @@ async fn budget_trips_seal_complete_inserts() {
             .expect("spawn tail");
 
     let rel = rel_descriptor();
-    let route = walshadow::emit::route::RouteSnapshot::freeze(mapping(), Arc::default(), false);
+    let route = walshadow::emit::route::RouteSnapshot::freeze(
+        mapping(),
+        Arc::default(),
+        Default::default(),
+    );
     const N: i32 = 5;
     let commit_lsn = 0xC0FFEE;
     ack.register(0, commit_lsn);

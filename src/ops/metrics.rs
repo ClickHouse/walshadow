@@ -126,6 +126,8 @@ pub struct MetricsSnapshot {
     pub emitter_blocks_total: u64,
     pub emitter_xacts_total: u64,
     pub emitter_unsupported_relations: u64,
+    /// DELETE rows dropped for want of a delete-marker column
+    pub emitter_deletes_discarded: u64,
     /// Forward-declared per-table opt-ins (`config_table.replicate=true`)
     /// awaiting their `CREATE TABLE`.
     pub config_pending_decl_rels: u64,
@@ -720,6 +722,12 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "Tuples skipped because the source relation has no mapping in --ch-config.",
             "counter",
             snap.emitter_unsupported_relations,
+        ),
+        (
+            "walshadow_emitter_deletes_discarded_total",
+            "DELETE rows dropped because is_deleted = false leaves no marker column.",
+            "counter",
+            snap.emitter_deletes_discarded,
         ),
         (
             "walshadow_pump_queue_depth",

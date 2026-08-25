@@ -36,11 +36,11 @@ use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping,
-    TableMapping, TableTarget, apply_column_rule, derive_columns_for_mapping,
+    SystemColumns, TableMapping, TableTarget, apply_column_rule, derive_columns_for_mapping,
     fold_diff_into_mapping,
 };
 use crate::schema::{RelDescriptor, RelName, SchemaDiff, SchemaEvent, replident_key_attnums};
-use crate::table_rules::TableRules;
+use crate::table_rules::{TableRule, TableRules};
 use ahash::{HashMap, HashSet, HashSetExt};
 
 /// Knobs that don't ride the INSERT pump. [`DdlApplicator`] rebuilds them
@@ -62,21 +62,27 @@ pub struct DdlConfig {
     /// Per-namespace overrides, fallback to the global fields above when
     /// a namespace has none
     pub namespaces: HashMap<String, NamespaceMapping>,
-    /// Keep `_is_deleted` out of `ReplacingMergeTree`'s args so deletes
+    /// Keep the delete marker out of `ReplacingMergeTree`'s args so deletes
     /// stay queryable; mirrors [`EmitterConfig::soft_delete`]
     pub soft_delete: bool,
+    /// Cluster-wide names of the appended columns, and whether the delete
+    /// marker exists; mirrors [`EmitterConfig::system_columns`]. A per-relation
+    /// rule renames over it
+    pub system: Arc<SystemColumns>,
     pub rules: Arc<TableRules>,
     pub column_rules: Arc<ColumnRules>,
 }
 
 impl DdlConfig {
     /// Build from a resolved snapshot. `target_database`, `soft_delete`,
-    /// `replicate_all` and `runtime_config_schema` are boot-only knobs the
-    /// resolver does not republish, so callers thread them through unchanged.
+    /// `system`, `replicate_all` and `runtime_config_schema` are boot-only
+    /// knobs the resolver does not republish, so callers thread them through
+    /// unchanged.
     pub fn from_resolved(
         resolved: &ResolvedConfig,
         target_database: String,
         soft_delete: bool,
+        system: Arc<SystemColumns>,
         replicate_all: bool,
         runtime_config_schema: Option<String>,
     ) -> Self {
@@ -94,6 +100,7 @@ impl DdlConfig {
             target_database,
             namespaces: resolved.namespaces.clone(),
             soft_delete,
+            system,
             rules: resolved.rules.clone(),
             column_rules: resolved.column_rules.clone(),
         }
@@ -118,15 +125,26 @@ impl DdlConfig {
         self
     }
 
-    fn create_target(&self, rel: &RelName) -> TableTarget {
-        let settings = self.rules.settings(rel);
+    fn create_target(&self, settings: &TableRule, rel: &RelName) -> TableTarget {
         TableTarget {
             database: settings
                 .target_database
+                .clone()
                 .unwrap_or_else(|| self.target_database_for(&rel.namespace).to_owned()),
             table: settings
                 .target_table
+                .clone()
                 .unwrap_or_else(|| rel.name.to_string()),
+        }
+    }
+
+    /// Destination shape for one relation's `CREATE TABLE`
+    pub(crate) fn create_shape<'a>(&'a self, settings: &'a TableRule) -> CreateShape<'a> {
+        CreateShape {
+            system: settings.system_columns(&self.system),
+            soft_delete: self.soft_delete,
+            order_by: settings.order_by.as_deref().unwrap_or_default(),
+            primary_key: settings.primary_key.as_deref().unwrap_or_default(),
         }
     }
 
@@ -150,6 +168,19 @@ impl DdlConfig {
             || (self.replicate_all
                 && !is_system_namespace(&rel.namespace, self.runtime_config_schema.as_deref()))
     }
+}
+
+/// Destination-shape inputs for one `CREATE TABLE`
+pub struct CreateShape<'a> {
+    pub system: Arc<SystemColumns>,
+    /// Keep the delete marker out of `ReplacingMergeTree`'s args
+    pub soft_delete: bool,
+    /// Operator `ORDER BY` (destination column names); empty derives the key
+    /// from replica identity
+    pub order_by: &'a [String],
+    /// Operator `PRIMARY KEY`: the sparse-index prefix CH indexes, not a
+    /// uniqueness constraint. Empty leaves it equal to `ORDER BY`
+    pub primary_key: &'a [String],
 }
 
 pub(crate) fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> bool {
@@ -231,10 +262,11 @@ impl DdlApplicator {
         &self.config
     }
 
-    /// Fold a republished snapshot into `config` (namespaces + drop
-    /// strategy). `target_database` + `soft_delete` are boot-only, so they
-    /// carry over. No-op until the resolver sends a new value; called at
-    /// each apply so DDL runs against the current config.
+    /// Fold a republished snapshot into `config` (namespaces, drop strategy,
+    /// table + column rules). `target_database`, `soft_delete` and the
+    /// system-column names are boot-only, so they carry over. No-op until the
+    /// resolver sends a new value; called at each apply so DDL runs against
+    /// the current config.
     async fn refresh_config(&mut self) -> Result<(), EmitterError> {
         if !self.config_rx.has_changed().unwrap_or(false) {
             return Ok(());
@@ -245,6 +277,7 @@ impl DdlApplicator {
                 &snap,
                 self.config.target_database.clone(),
                 self.config.soft_delete,
+                self.config.system.clone(),
                 self.config.replicate_all,
                 self.config.runtime_config_schema.clone(),
             );
@@ -295,7 +328,9 @@ impl DdlApplicator {
         // no-ops an operator-managed table and re-creates after strategy=drop.
         if let Some(m) = self.mapping_for(&desc.rel_name).await {
             self.ensure_database(&m.target.database).await?;
-            let sql = render_create_table_from_mapping(desc, &m, self.config.soft_delete);
+            let settings = self.config.rules.settings(&desc.rel_name);
+            let sql =
+                render_create_table_from_mapping(desc, &m, &self.config.create_shape(&settings));
             self.execute(&sql).await?;
             self.stats.creates_applied += 1;
             return Ok(());
@@ -312,13 +347,10 @@ impl DdlApplicator {
         }
         // Drives both CREATE TABLE and the row-routing mapping below so
         // rows and DDL land in the same place
-        let target = self.config.create_target(&desc.rel_name);
-        let Some(sql) = render_create_table(
-            desc,
-            &target,
-            self.config.soft_delete,
-            &self.config.column_rules,
-        )?
+        let settings = self.config.rules.settings(&desc.rel_name);
+        let target = self.config.create_target(&settings, &desc.rel_name);
+        let shape = self.config.create_shape(&settings);
+        let Some(sql) = render_create_table(desc, &target, &shape, &self.config.column_rules)?
         else {
             self.stats.skipped += 1;
             return Ok(());
@@ -343,13 +375,10 @@ impl DdlApplicator {
     /// Idempotent: `IF NOT EXISTS` no-ops a re-create.
     pub async fn ensure_ch_table(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
         self.refresh_config().await?;
-        let target = self.config.create_target(&desc.rel_name);
-        let Some(sql) = render_create_table(
-            desc,
-            &target,
-            self.config.soft_delete,
-            &self.config.column_rules,
-        )?
+        let settings = self.config.rules.settings(&desc.rel_name);
+        let target = self.config.create_target(&settings, &desc.rel_name);
+        let shape = self.config.create_shape(&settings);
+        let Some(sql) = render_create_table(desc, &target, &shape, &self.config.column_rules)?
         else {
             tracing::warn!(
                 target: "walshadow::ch_ddl",
@@ -568,6 +597,7 @@ impl DdlApplicator {
                     rc,
                     self.config.target_database.clone(),
                     self.config.soft_delete,
+                    self.config.system.clone(),
                     self.config.replicate_all,
                     self.config.runtime_config_schema.clone(),
                 )
@@ -657,8 +687,10 @@ fn predict_route_effect(
             {
                 return Ok(None);
             }
-            let target = cfg.create_target(&desc.rel_name);
-            if render_create_table(desc, &target, cfg.soft_delete, &cfg.column_rules)?.is_none() {
+            let settings = cfg.rules.settings(&desc.rel_name);
+            let target = cfg.create_target(&settings, &desc.rel_name);
+            let shape = cfg.create_shape(&settings);
+            if render_create_table(desc, &target, &shape, &cfg.column_rules)?.is_none() {
                 return Ok(None);
             }
             let columns = derive_columns_for_mapping(desc, &cfg.column_rules);
@@ -740,32 +772,109 @@ pub fn render_add_column(target: &str, name: &str, resolved: &ResolvedColumn) ->
 }
 
 /// Shared CREATE tail: synthetic columns (mirror `TablePlan::build`),
-/// engine, `ORDER BY` key names (else `_lsn`)
+/// engine, `ORDER BY` key names (else the LSN column)
 fn render_create_sql(
     target: &str,
     mut col_defs: Vec<String>,
     key_names: Vec<String>,
-    soft_delete: bool,
+    shape: &CreateShape<'_>,
 ) -> String {
-    col_defs.push("`_lsn` UInt64".into());
-    col_defs.push("`_xid` UInt32".into());
-    col_defs.push("`_commit_ts` DateTime64(6, 'UTC')".into());
-    col_defs.push("`_is_deleted` Bool".into());
-    // soft_delete keeps `_is_deleted` out of the engine args
-    let engine_args = if soft_delete {
-        "`_lsn`"
-    } else {
-        "`_lsn`, `_is_deleted`"
+    let sys = &shape.system;
+    let lsn = quote_ident(&sys.lsn);
+    col_defs.push(format!("{lsn} UInt64"));
+    col_defs.push(format!("{} UInt32", quote_ident(&sys.xid)));
+    col_defs.push(format!(
+        "{} DateTime64(6, 'UTC')",
+        quote_ident(&sys.commit_ts)
+    ));
+    // soft_delete keeps the delete marker out of the engine args; without the
+    // marker column there is nothing to pass either
+    let engine_args = match &sys.is_deleted {
+        Some(name) => {
+            let marker = quote_ident(name);
+            col_defs.push(format!("{marker} Bool"));
+            if shape.soft_delete {
+                lsn.clone()
+            } else {
+                format!("{lsn}, {marker}")
+            }
+        }
+        None => lsn.clone(),
     };
-    let order_by = if key_names.is_empty() {
-        "(`_lsn`)".to_string()
+    let keys = if key_names.is_empty() {
+        vec![lsn]
     } else {
-        format!("({})", key_names.join(", "))
+        key_names
     };
+    // CH indexes the PRIMARY KEY prefix of the sorting key; a non-prefix is a
+    // CREATE-time error there, so drop it and let the key default to ORDER BY
+    let primary_key = match shape.primary_key {
+        [] => String::new(),
+        pk if pk
+            .iter()
+            .map(|n| quote_ident(n))
+            .eq(keys.iter().take(pk.len()).cloned()) =>
+        {
+            format!("\nPRIMARY KEY ({})", keys[..pk.len()].join(", "))
+        }
+        pk => {
+            tracing::warn!(
+                target: "walshadow::ch_ddl",
+                table = %target,
+                primary_key = ?pk,
+                "primary_key ignored: not a prefix of ORDER BY",
+            );
+            String::new()
+        }
+    };
+    let order_by = keys.join(", ");
     format!(
-        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree({engine_args})\nORDER BY {order_by}",
+        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree({engine_args})\nORDER BY ({order_by}){primary_key}",
         col_defs.join(",\n  ")
     )
+}
+
+/// Operator `ORDER BY` names → quoted key list. `orderable` maps every
+/// destination column name a sort key may use to whether CH would reject it
+/// (`Nullable` sort keys are illegal). An override naming an absent or
+/// nullable column is dropped whole with a WARN, so one bad config row
+/// degrades to the replica-identity key instead of failing every CREATE.
+fn resolve_order_by(
+    target: &str,
+    order_by: &[String],
+    orderable: &HashMap<&str, bool>,
+    derived: Vec<String>,
+) -> Vec<String> {
+    if order_by.is_empty() {
+        return derived;
+    }
+    let mut keys = Vec::with_capacity(order_by.len());
+    for name in order_by {
+        let Some(false) = orderable.get(name.as_str()) else {
+            tracing::warn!(
+                target: "walshadow::ch_ddl",
+                table = %target,
+                column = %name,
+                reason = if orderable.contains_key(name.as_str()) { "nullable" } else { "absent" },
+                "order_by ignored; keying on replica identity",
+            );
+            return derived;
+        };
+        keys.push(quote_ident(name));
+    }
+    keys
+}
+
+/// System columns are always non-nullable, so any of them may sort
+fn orderable_system<'a>(sys: &'a SystemColumns, orderable: &mut HashMap<&'a str, bool>) {
+    for name in sys.names() {
+        orderable.insert(name, false);
+    }
+}
+
+/// ClickHouse rejects Nullable columns in a sorting key
+fn is_nullable(ch_type: &str) -> bool {
+    ch_type.starts_with("Nullable(")
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for an autodiscovered relation. `None`
@@ -773,7 +882,7 @@ fn render_create_sql(
 pub fn render_create_table(
     desc: &RelDescriptor,
     target: &TableTarget,
-    soft_delete: bool,
+    shape: &CreateShape<'_>,
     rules: &ColumnRules,
 ) -> Result<Option<String>, EmitterError> {
     let target = target.sql();
@@ -794,32 +903,34 @@ pub fn render_create_table(
             resolved,
             rules.settings(&desc.rel_name, &att.name),
         );
-        cols.push((att.attnum, quote_ident(&name), resolved));
+        cols.push((att.attnum, name, resolved));
     }
     let col_defs: Vec<String> = cols
         .iter()
         .map(|(_, name, r)| {
+            let name = quote_ident(name);
             r.default_sql.as_ref().map_or_else(
                 || format!("{name} {}", r.ch_type),
                 |d| format!("{name} {} DEFAULT {d}", r.ch_type),
             )
         })
         .collect();
+    let mut orderable: HashMap<&str, bool> = HashMap::default();
+    orderable_system(&shape.system, &mut orderable);
+    for (_, name, r) in &cols {
+        orderable.insert(name, is_nullable(&r.ch_type));
+    }
     // ClickHouse rejects Nullable columns in ORDER BY
-    let key_names: Vec<String> = pk_attnums
+    let derived: Vec<String> = pk_attnums
         .iter()
         .filter_map(|a| {
             cols.iter()
-                .find(|(attnum, _, r)| attnum == a && !r.ch_type.starts_with("Nullable("))
-                .map(|(_, name, _)| name.clone())
+                .find(|(attnum, _, r)| attnum == a && !is_nullable(&r.ch_type))
+                .map(|(_, name, _)| quote_ident(name))
         })
         .collect();
-    Ok(Some(render_create_sql(
-        &target,
-        col_defs,
-        key_names,
-        soft_delete,
-    )))
+    let key_names = resolve_order_by(&target, shape.order_by, &orderable, derived);
+    Ok(Some(render_create_sql(&target, col_defs, key_names, shape)))
 }
 
 /// CH `UNKNOWN_DATABASE`
@@ -860,38 +971,60 @@ pub async fn ensure_boot_database(cfg: &EmitterConfig) -> Result<bool, EmitterEr
 /// `CREATE TABLE IF NOT EXISTS` rendered from an existing mapping — the
 /// re-create path for a mapped dest dropped under strategy=drop. Columns
 /// come from the mapping (the emitter's INSERT contract), not the
-/// descriptor; `ORDER BY` resolves the descriptor's key attnums through
-/// the mapping, skipping Nullable targets (CH rejects nullable sort
-/// keys), else `_lsn`
+/// descriptor; `ORDER BY` takes the operator override when it names
+/// non-nullable destination columns, else resolves the descriptor's key
+/// attnums through the mapping (skipping Nullable targets, which CH rejects
+/// as sort keys), else the LSN column
 pub fn render_create_table_from_mapping(
     desc: &RelDescriptor,
     mapping: &TableMapping,
-    soft_delete: bool,
+    shape: &CreateShape<'_>,
 ) -> String {
     let col_defs: Vec<String> = mapping
         .columns
         .iter()
         .map(|c| format!("{} {}", quote_ident(&c.target_name), c.target_type))
         .collect();
-    let key_names: Vec<String> = replident_key_attnums(desc)
+    let mut orderable: HashMap<&str, bool> = HashMap::default();
+    orderable_system(&shape.system, &mut orderable);
+    for c in &mapping.columns {
+        orderable.insert(&c.target_name, is_nullable(&c.target_type));
+    }
+    let derived: Vec<String> = replident_key_attnums(desc)
         .iter()
         .filter_map(|a| {
             mapping
                 .columns
                 .iter()
-                .find(|c| c.src_attnum == *a && !c.target_type.starts_with("Nullable"))
+                .find(|c| c.src_attnum == *a && !is_nullable(&c.target_type))
                 .map(|c| quote_ident(&c.target_name))
         })
         .collect();
-    render_create_sql(&mapping.target.sql(), col_defs, key_names, soft_delete)
+    let target = mapping.target.sql();
+    let key_names = resolve_order_by(&target, shape.order_by, &orderable, derived);
+    render_create_sql(&target, col_defs, key_names, shape)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mapping::{ColumnMapping, TableMapping};
+    use std::sync::LazyLock;
+
+    static SYS: LazyLock<Arc<SystemColumns>> = LazyLock::new(Arc::default);
+
     fn dest(database: &str, desc: &RelDescriptor) -> TableTarget {
         TableTarget::new(database, &desc.rel_name.name)
+    }
+
+    /// Default system columns, no operator key override
+    fn shape(soft_delete: bool) -> CreateShape<'static> {
+        CreateShape {
+            system: SYS.clone(),
+            soft_delete,
+            order_by: &[],
+            primary_key: &[],
+        }
     }
     use crate::schema::{INT4OID, TEXTOID, TIMESTAMPTZOID};
     use crate::schema::{RelAttr, RelDescriptor, ReplIdent, SchemaDiff};
@@ -938,6 +1071,7 @@ mod tests {
             target_database: "default".into(),
             namespaces,
             soft_delete: false,
+            system: Arc::default(),
             rules: Arc::default(),
             column_rules: Arc::default(),
         };
@@ -963,6 +1097,7 @@ mod tests {
             target_database: "default".into(),
             namespaces: HashMap::new(),
             soft_delete: false,
+            system: Arc::default(),
             rules: Arc::default(),
             column_rules: Arc::default(),
         };
@@ -1021,6 +1156,11 @@ mod tests {
             TableRule {
                 replicate: Some(true),
                 target_database: Some("warehouse".into()),
+                system: crate::mapping::SystemColumnNames {
+                    lsn: Some("_peerdb_version".into()),
+                    is_deleted: Some(String::new()),
+                    ..Default::default()
+                },
                 ..TableRule::default()
             },
         );
@@ -1050,13 +1190,14 @@ mod tests {
             target_database: "default".into(),
             namespaces: ahash::HashMap::default(),
             soft_delete: false,
+            system: Arc::default(),
             rules: Arc::new(rules),
             column_rules: Arc::default(),
         };
         let events = RelName::new("app", "events_1");
         assert!(cfg.auto_creates(&events));
         assert_eq!(
-            cfg.create_target(&events),
+            cfg.create_target(&cfg.rules.settings(&events), &events),
             TableTarget::new("warehouse", "events_1")
         );
         assert_eq!(
@@ -1067,9 +1208,21 @@ mod tests {
         assert!(!cfg.auto_creates(&RelName::new("app", "events_audit")));
         assert_eq!(cfg.declared_scope(&RelName::new("walshadow", "x")), None);
         assert!(!cfg.auto_creates(&RelName::new("pg_catalog", "pg_class")));
+        let settings = cfg.rules.settings(&events);
+        let shape = cfg.create_shape(&settings);
+        assert_eq!(shape.system.lsn, "_peerdb_version");
+        assert!(shape.system.is_deleted.is_none(), "marker dropped");
+        assert_eq!(shape.system.xid, "_xid", "unnamed column inherits");
+        let other = RelName::new("other", "t");
         assert_eq!(
-            cfg.create_target(&RelName::new("other", "t")),
+            cfg.create_target(&cfg.rules.settings(&other), &other),
             TableTarget::new("default", "t")
+        );
+        let settings = cfg.rules.settings(&other);
+        assert_eq!(
+            cfg.create_shape(&settings).system.lsn,
+            "_lsn",
+            "a relation no entry renames keeps the cluster-wide names"
         );
     }
 
@@ -1130,7 +1283,7 @@ mod tests {
                 target_type: None,
             },
         );
-        let sql = render_create_table(&d, &dest("db", &d), false, &b.finish().0)
+        let sql = render_create_table(&d, &dest("db", &d), &shape(false), &b.finish().0)
             .unwrap()
             .expect("renderable");
         assert!(sql.contains("`order_id` Int32"), "{sql}");
@@ -1152,7 +1305,7 @@ mod tests {
                 target_type: Some("Nullable(Int32)".into()),
             },
         );
-        let sql = render_create_table(&d, &dest("db", &d), false, &b.finish().0)
+        let sql = render_create_table(&d, &dest("db", &d), &shape(false), &b.finish().0)
             .unwrap()
             .expect("renderable");
         assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
@@ -1168,9 +1321,14 @@ mod tests {
             ],
             Some(vec![1]),
         );
-        let sql = render_create_table(&d, &dest("default", &d), false, &ColumnRules::default())
-            .unwrap()
-            .unwrap();
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS `default`.`orders`"));
         assert!(sql.contains("`id` Int32"));
         assert!(sql.contains("`body` Nullable(String)"));
@@ -1196,9 +1354,14 @@ mod tests {
         d.replident = ReplIdent::Full {
             pk_attnums: Some(vec![1]),
         };
-        let sql = render_create_table(&d, &dest("default", &d), false, &ColumnRules::default())
-            .unwrap()
-            .unwrap();
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(sql.ends_with("ORDER BY (`id`)"), "{sql}");
         assert!(!sql.contains("ORDER BY _lsn"), "{sql}");
     }
@@ -1215,9 +1378,14 @@ mod tests {
             ],
             Some(vec![2, 1]),
         );
-        let sql = render_create_table(&d, &dest("default", &d), false, &ColumnRules::default())
-            .unwrap()
-            .unwrap();
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(sql.contains("`a` Int32"), "{sql}");
         assert!(sql.contains("`b` Int32"), "{sql}");
         assert!(!sql.contains("`a` Nullable"), "{sql}");
@@ -1236,9 +1404,14 @@ mod tests {
             ],
             Some(vec![1]),
         );
-        let sql = render_create_table(&d, &dest("default", &d), true, &ColumnRules::default())
-            .unwrap()
-            .unwrap();
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(true),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
         // Column always present; soft_delete only drops it from the engine
         assert!(sql.contains("`_is_deleted` Bool"));
         assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`)"));
@@ -1249,9 +1422,14 @@ mod tests {
     #[test]
     fn render_create_table_falls_back_to_lsn_when_no_pk() {
         let d = desc("events", vec![att(1, "body", TEXTOID, false, None)], None);
-        let sql = render_create_table(&d, &dest("default", &d), false, &ColumnRules::default())
-            .unwrap()
-            .unwrap();
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(sql.ends_with("ORDER BY (`_lsn`)"));
     }
 
@@ -1271,9 +1449,14 @@ mod tests {
             index_oid: 16500,
             key_attnums: vec![2, 1],
         };
-        let sql = render_create_table(&d, &dest("default", &d), false, &ColumnRules::default())
-            .unwrap()
-            .unwrap();
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(!sql.contains("`key` Nullable"), "{sql}");
         assert!(!sql.contains("`tenant` Nullable"), "{sql}");
         assert!(sql.contains("`body` Nullable(String)"), "{sql}");
@@ -1288,9 +1471,14 @@ mod tests {
             vec![att(2, "body", TEXTOID, false, None)],
             Some(vec![1]),
         );
-        let sql = render_create_table(&d, &dest("default", &d), false, &ColumnRules::default())
-            .unwrap()
-            .unwrap();
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
     }
 
@@ -1299,7 +1487,7 @@ mod tests {
         let mut a = att(1, "ship_at", TIMESTAMPTZOID, false, None);
         a.typmod = 3;
         let d = desc("t", vec![a], None);
-        let sql = render_create_table(&d, &dest("db", &d), false, &ColumnRules::default())
+        let sql = render_create_table(&d, &dest("db", &d), &shape(false), &ColumnRules::default())
             .unwrap()
             .unwrap();
         assert!(
@@ -1333,7 +1521,7 @@ mod tests {
                 },
             ],
         };
-        let sql = render_create_table_from_mapping(&d, &m, false);
+        let sql = render_create_table_from_mapping(&d, &m, &shape(false));
         assert!(
             sql.contains("CREATE TABLE IF NOT EXISTS `warehouse`.`orders_pinned`"),
             "{sql}"
@@ -1356,8 +1544,196 @@ mod tests {
                 target_type: "Nullable(Int32)".into(),
             }],
         };
-        let sql = render_create_table_from_mapping(&d, &m, false);
+        let sql = render_create_table_from_mapping(&d, &m, &shape(false));
         assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
+    }
+
+    #[test]
+    fn render_create_table_renames_system_columns() {
+        let sys = SystemColumns {
+            lsn: "_peerdb_version".into(),
+            xid: "_xid".into(),
+            commit_ts: "_peerdb_synced_at".into(),
+            is_deleted: Some("_peerdb_is_deleted".into()),
+        };
+        let d = desc("t", vec![att(1, "id", INT4OID, true, None)], Some(vec![1]));
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &CreateShape {
+                system: sys.clone().into(),
+                soft_delete: false,
+                order_by: &[],
+                primary_key: &[],
+            },
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(sql.contains("`_peerdb_version` UInt64"), "{sql}");
+        assert!(
+            sql.contains("`_peerdb_synced_at` DateTime64(6, 'UTC')"),
+            "{sql}"
+        );
+        assert!(sql.contains("`_peerdb_is_deleted` Bool"), "{sql}");
+        assert!(
+            sql.contains("ReplacingMergeTree(`_peerdb_version`, `_peerdb_is_deleted`)"),
+            "{sql}"
+        );
+        assert!(!sql.contains("`_lsn`"), "{sql}");
+    }
+
+    #[test]
+    fn render_create_table_without_delete_marker() {
+        // No marker column, so nothing to hand ReplacingMergeTree as its
+        // deletion arg; keyless tables still sort on the LSN column
+        let sys = SystemColumns {
+            is_deleted: None,
+            ..SystemColumns::default()
+        };
+        let d = desc("t", vec![att(1, "id", INT4OID, true, None)], None);
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &CreateShape {
+                system: sys.clone().into(),
+                soft_delete: false,
+                order_by: &[],
+                primary_key: &[],
+            },
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!sql.contains("_is_deleted"), "{sql}");
+        assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`)"), "{sql}");
+        assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
+    }
+
+    #[test]
+    fn render_create_table_takes_operator_order_by_over_pk() {
+        let d = desc(
+            "t",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "tenant", INT4OID, true, None),
+            ],
+            Some(vec![1]),
+        );
+        let order_by = vec!["tenant".to_string(), "id".to_string()];
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &CreateShape {
+                system: SYS.clone(),
+                soft_delete: false,
+                order_by: &order_by,
+                primary_key: &[],
+            },
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(sql.ends_with("ORDER BY (`tenant`, `id`)"), "{sql}");
+    }
+
+    #[test]
+    fn render_create_table_order_by_ignored_when_column_absent_or_nullable() {
+        let d = desc(
+            "t",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "body", TEXTOID, false, None),
+            ],
+            Some(vec![1]),
+        );
+        for keys in [vec!["nope".to_string()], vec!["body".to_string()]] {
+            let sql = render_create_table(
+                &d,
+                &dest("default", &d),
+                &CreateShape {
+                    system: SYS.clone(),
+                    soft_delete: false,
+                    order_by: &keys,
+                    primary_key: &[],
+                },
+                &ColumnRules::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(sql.ends_with("ORDER BY (`id`)"), "{keys:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn render_create_table_primary_key_prefix_renders_non_prefix_drops() {
+        let d = desc(
+            "t",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "tenant", INT4OID, true, None),
+            ],
+            Some(vec![1]),
+        );
+        let order_by = vec!["tenant".to_string(), "id".to_string()];
+        let mk = |primary_key: &[String]| {
+            render_create_table(
+                &d,
+                &dest("default", &d),
+                &CreateShape {
+                    system: SYS.clone(),
+                    soft_delete: false,
+                    order_by: &order_by,
+                    primary_key,
+                },
+                &ColumnRules::default(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let sql = mk(&["tenant".to_string()]);
+        assert!(
+            sql.ends_with("ORDER BY (`tenant`, `id`)\nPRIMARY KEY (`tenant`)"),
+            "{sql}"
+        );
+        // `id` is not a prefix of (tenant, id): CH would reject the CREATE
+        let sql = mk(&["id".to_string()]);
+        assert!(sql.ends_with("ORDER BY (`tenant`, `id`)"), "{sql}");
+    }
+
+    #[test]
+    fn render_create_table_from_mapping_takes_operator_order_by() {
+        let d = desc("t", vec![att(1, "id", INT4OID, true, None)], Some(vec![1]));
+        let m = TableMapping {
+            target: TableTarget::new("db", "t"),
+            columns: vec![
+                ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "order_id".into(),
+                    target_type: "Int32".into(),
+                },
+                ColumnMapping {
+                    src_attnum: 2,
+                    target_name: "tenant".into(),
+                    target_type: "Int32".into(),
+                },
+            ],
+        };
+        let order_by = vec!["tenant".to_string(), "order_id".to_string()];
+        let sql = render_create_table_from_mapping(
+            &d,
+            &m,
+            &CreateShape {
+                system: SYS.clone(),
+                soft_delete: false,
+                order_by: &order_by,
+                primary_key: &["tenant".to_string()],
+            },
+        );
+        assert!(
+            sql.ends_with("ORDER BY (`tenant`, `order_id`)\nPRIMARY KEY (`tenant`)"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -1382,7 +1758,8 @@ mod tests {
         // type_bridge falls back to String for unknown OIDs today, so
         // this never hits None; revisit if the bridge grows strictness
         let d = desc("t", vec![att(1, "id", 99999, true, None)], None);
-        let sql = render_create_table(&d, &dest("db", &d), false, &ColumnRules::default()).unwrap();
+        let sql = render_create_table(&d, &dest("db", &d), &shape(false), &ColumnRules::default())
+            .unwrap();
         assert!(sql.is_some(), "fallback path keeps the CREATE renderable");
     }
 
@@ -1457,6 +1834,7 @@ mod tests {
             target_database: "default".into(),
             namespaces: ahash::HashMap::default(),
             soft_delete: false,
+            system: Arc::default(),
             rules: Arc::default(),
             column_rules: Arc::default(),
         };

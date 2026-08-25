@@ -74,8 +74,8 @@ pub struct ColMeta {
 pub struct BatchMeta {
     pub table_key: RelName,
     pub insert_sql: String,
-    /// Order matches `InsertBatch::buffers`: mapped columns then the four
-    /// synthetic (`_lsn`, `_xid`, `_commit_ts`, `_is_deleted`).
+    /// Order matches `InsertBatch::buffers`: mapped columns then the
+    /// synthetic ones (lsn, xid, commit_ts, delete marker when configured).
     pub columns: Vec<ColMeta>,
     pub schema_epoch: u64,
 }
@@ -90,11 +90,14 @@ impl BatchMeta {
             });
         }
         for synth in [
-            &plan.synth_lsn,
-            &plan.synth_xid,
-            &plan.synth_commit_ts,
-            &plan.synth_is_deleted,
-        ] {
+            Some(&plan.synth_lsn),
+            Some(&plan.synth_xid),
+            Some(&plan.synth_commit_ts),
+            plan.synth_is_deleted.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             columns.push(ColMeta {
                 name: synth.name.clone(),
                 type_repr: synth.type_repr.clone(),
@@ -309,6 +312,7 @@ async fn handle_row(
                 &row.rel,
                 &row.route.mapping,
                 &row.route.column_rules,
+                row.route.system_columns(),
             )
             .map_err(|e| e.to_string())?;
             let meta = Arc::new(BatchMeta::from_plan(&plan, e.key().clone(), ctx.epoch));
@@ -480,7 +484,7 @@ mod tests {
                 }],
             }),
             Arc::default(),
-            false,
+            Default::default(),
         )
     }
 
@@ -662,7 +666,7 @@ mod tests {
                 }],
             }),
             Arc::new(rules.finish().0),
-            false,
+            Default::default(),
         );
         msg_tx.send(BatcherMsg::Row(r)).await.expect("send row");
         drop(msg_tx);

@@ -16,7 +16,7 @@ use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
-use crate::emit::route::RouteSnapshot;
+use crate::emit::route::{RouteSnapshot, RowPolicy};
 use crate::mapping::{MappingHandle, TableMapping};
 use crate::schema::RelDescriptor;
 use crate::toast::{
@@ -46,7 +46,7 @@ pub async fn drain(
     stats: Arc<EmitterStats>,
     resolver: ToastResolver,
     mut deferred: DeferredSpool,
-    soft_delete: bool,
+    row_policy: RowPolicy,
     config: Option<Arc<ResolvedConfig>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     // Routes frozen once per pass from the caller's config snapshot
@@ -58,9 +58,10 @@ pub async fn drain(
             let rules = config
                 .as_ref()
                 .map_or_else(Arc::default, |rc| rc.column_rules.clone());
+            let policy = row_policy.for_rel(config.as_deref(), name);
             (
                 name.clone(),
-                RouteSnapshot::freeze(Arc::new(mapping.clone()), rules, soft_delete),
+                RouteSnapshot::freeze(Arc::new(mapping.clone()), rules, policy),
             )
         })
         .collect();
@@ -565,7 +566,7 @@ mod tests {
             stats.clone(),
             ToastResolver::disabled(),
             mem_spool(),
-            false,
+            Default::default(),
             None,
         ));
 
@@ -617,7 +618,7 @@ mod tests {
             stats.clone(),
             ToastResolver::disabled(),
             mem_spool(),
-            false,
+            Default::default(),
             None,
         ));
 
@@ -667,7 +668,7 @@ mod tests {
             stats.clone(),
             resolver,
             mem_spool(),
-            false,
+            Default::default(),
             None,
         ));
 
@@ -732,7 +733,7 @@ mod tests {
             ToastResolver::with_store(store, stats.clone()),
             // Threshold 0: deferred referrer rides a real spool file
             DeferredSpool::new(spool_tmp.path().join("bootstrap_deferred.bin"), 0),
-            false,
+            Default::default(),
             None,
         ));
 
@@ -790,7 +791,7 @@ mod tests {
             stats.clone(),
             ToastResolver::with_store(store, stats.clone()),
             mem_spool(),
-            false,
+            Default::default(),
             None,
         ));
         // Wait for the referrer to defer, then unmap before walk EOF

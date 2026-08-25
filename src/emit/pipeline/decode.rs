@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::decode::heap_decoder::CommittedTuple;
+use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
@@ -109,6 +109,12 @@ pub async fn decode_and_route(
         let Some(route) = envelope.route else {
             continue;
         };
+        // No delete-marker column: a DELETE would land as a phantom insert of
+        // the old image, so drop it (append-only destination)
+        if route.drops_deletes() && matches!(envelope.described.decoded.op, HeapOp::Delete) {
+            ctx.stats.deletes_discarded.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let mut heap = envelope.described;
         let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &ctx.resolver)
             .await
@@ -192,4 +198,147 @@ pub fn spawn_pool(
         }));
     }
     handles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap};
+    use crate::emit::route::{RouteSnapshot, RowPolicy};
+    use crate::mapping::{ColumnMapping, SystemColumns, TableMapping, TableTarget};
+    use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
+    use crate::toast::ToastResolver;
+    use walrus::pg::walparser::RelFileNode;
+
+    const RFN: RelFileNode = RelFileNode {
+        spc_node: 1663,
+        db_node: 5,
+        rel_node: 16385,
+    };
+
+    fn rel() -> Arc<RelDescriptor> {
+        Arc::new(RelDescriptor {
+            rfn: RFN,
+            oid: 16385,
+            toast_oid: 0,
+            namespace_oid: 2200,
+            rel_name: RelName::new("public", "t"),
+            kind: 'r',
+            persistence: 'p',
+            replident: ReplIdent::Default { pk_attnums: None },
+            attributes: vec![RelAttr {
+                attnum: 1,
+                name: "id".into(),
+                type_oid: 23,
+                typmod: -1,
+                not_null: true,
+                dropped: false,
+                type_name: "int4".into(),
+                type_byval: true,
+                type_len: 4,
+                type_align: 'i',
+                type_storage: 'p',
+                missing_text: None,
+            }],
+        })
+    }
+
+    fn heap(op: HeapOp, route: Arc<RouteSnapshot>) -> RoutedHeap {
+        let tuple = Some(DecodedTuple {
+            columns: vec![Some(ColumnValue::Int4(1))],
+            partial: false,
+        });
+        let (new, old) = match op {
+            HeapOp::Delete => (None, tuple),
+            _ => (tuple, None),
+        };
+        RoutedHeap {
+            described: DescribedHeap {
+                decoded: DecodedHeap {
+                    rfn: RFN,
+                    xid: 7,
+                    source_lsn: 0x1000,
+                    op,
+                    new,
+                    old,
+                },
+                descriptor: rel(),
+                descriptor_valid_from: 0x40,
+            },
+            route: Some(route),
+        }
+    }
+
+    fn route(system: SystemColumns) -> Arc<RouteSnapshot> {
+        RouteSnapshot::freeze(
+            Arc::new(TableMapping {
+                target: TableTarget::new("default", "t"),
+                columns: vec![ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: "Int32".into(),
+                }],
+            }),
+            Arc::default(),
+            RowPolicy {
+                soft_delete: false,
+                system: Arc::new(system),
+            },
+        )
+    }
+
+    /// Without a delete-marker column a DELETE has nowhere to land: it must
+    /// drop here, before the placed count the ack collector reconciles
+    #[tokio::test]
+    async fn deletes_drop_when_marker_disabled() {
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let stats = Arc::new(EmitterStats::default());
+        let ctx = DecodeCtx {
+            oracle: None,
+            msg_tx,
+            stats: stats.clone(),
+            resolver: ToastResolver::disabled(),
+            chunk_rows: 8,
+        };
+        let no_marker = route(SystemColumns {
+            is_deleted: None,
+            ..SystemColumns::default()
+        });
+        let routed = decode_and_route(
+            &ctx,
+            0,
+            0,
+            0x2000,
+            vec![
+                heap(HeapOp::Insert, no_marker.clone()),
+                heap(HeapOp::Delete, no_marker),
+            ],
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("decode");
+        assert_eq!(routed, 1, "insert routed, delete dropped");
+        assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
+        match msg_rx.recv().await {
+            Some(BatcherMsg::Rows(chunk)) => assert_eq!(chunk.rows.len(), 1),
+            other => panic!("expected one row chunk, got {}", other.is_some()),
+        }
+
+        // Default policy keeps the marker, so the DELETE rides through
+        let marked = route(SystemColumns::default());
+        let routed = decode_and_route(
+            &ctx,
+            1,
+            0,
+            0x3000,
+            vec![heap(HeapOp::Delete, marked)],
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("decode");
+        assert_eq!(routed, 1);
+        assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
+    }
 }

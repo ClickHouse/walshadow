@@ -380,7 +380,11 @@ async fn emitter_tls_round_trip() {
         .send(BatcherMsg::Row(RoutedRow {
             seq: 0,
             rel,
-            route: walshadow::emit::route::RouteSnapshot::freeze(mapping, Arc::default(), false),
+            route: walshadow::emit::route::RouteSnapshot::freeze(
+                mapping,
+                Arc::default(),
+                Default::default(),
+            ),
             committed: tuple,
             value_permit: None,
         }))
