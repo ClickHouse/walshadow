@@ -22,6 +22,7 @@ pub mod backfill;
 pub mod budget;
 pub mod catalog;
 pub mod ch;
+pub mod column_rules;
 pub mod config;
 pub mod decode;
 pub mod emit;
@@ -35,6 +36,7 @@ pub mod record;
 pub mod runtime_config;
 pub mod schema;
 pub mod source;
+pub mod table_rules;
 pub mod toast;
 pub mod xact;
 

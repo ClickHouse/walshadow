@@ -61,6 +61,9 @@
 //!    * Route snapshots attach at planning: a transaction planned before
 //!      the opt-in never re-routes, one planned after routes whole.
 //!
+//! 9. `pattern_row_scopes_tables_by_glob`
+//!    * Glob rules include matching tables and exclude guarded tables
+//!
 //! Source-side `config_*` install runs the real `sql/runtime_config_install.sql`
 //! inside the bootstrap schema dump, so the drills double as install-script
 //! coverage (psql `\if` default-schema guard included).
@@ -945,4 +948,95 @@ async fn pre_opt_in_xact_discards_post_opt_in_routes() {
         )
         .expect("ch v");
     assert_eq!(v, "post-opt-in");
+}
+
+/// Drill 9: glob rules scope tables created later
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pattern_row_scopes_tables_by_glob() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let schema_sql = format!("{INSTALL_SQL}\nCREATE SCHEMA app;\n");
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    let mut pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name: "walshadow-config-glob-scope",
+            ddl: Some(overlay_ddl_args()),
+        },
+        |cfg| cfg.replicate_all = false,
+    )
+    .await;
+
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, match, replicate) \
+             VALUES ('app', 'events_*', 'glob', true), ('app', '*_audit', 'glob', false)"
+                .into(),
+            "CREATE TABLE app.events_2026 (id bigint PRIMARY KEY, body text)".into(),
+            "CREATE TABLE app.events_audit (id bigint PRIMARY KEY, body text)".into(),
+            "CREATE TABLE app.orders (id bigint PRIMARY KEY, body text)".into(),
+            "INSERT INTO app.events_2026 (id, body) VALUES (1, 'in-scope')".into(),
+            "INSERT INTO app.events_audit (id, body) VALUES (1, 'barred')".into(),
+            "INSERT INTO app.orders (id, body) VALUES (1, 'unscoped')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    let body = ch
+        .query(
+            "SELECT argMax(body, _lsn) FROM walshadow_test.events_2026 \
+             WHERE _is_deleted = 0 AND id = 1",
+        )
+        .expect("ch body");
+    assert_eq!(body, "in-scope", "the opt-in pattern creates and routes");
+
+    let others = ch
+        .query(
+            "SELECT count() FROM system.tables WHERE database = 'walshadow_test' \
+             AND name IN ('events_audit', 'orders')",
+        )
+        .expect("ch table existence");
+    assert_eq!(
+        others, "0",
+        "excluded / unmatched relations must not create"
+    );
 }

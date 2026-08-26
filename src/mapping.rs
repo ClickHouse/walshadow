@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-use crate::catalog::type_bridge;
-use crate::schema::{RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
+use crate::catalog::type_bridge::{self, ResolvedColumn};
+use crate::column_rules::{ColumnRule, ColumnRules};
+use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
 use ahash::HashMap;
 use tokio::sync::RwLock;
 
@@ -145,28 +146,63 @@ pub fn mapping_handle(tables: HashMap<RelName, TableMapping>) -> MappingHandle {
     })
 }
 
-pub fn derive_columns_for_mapping(desc: &RelDescriptor) -> Vec<ColumnMapping> {
+/// CH name and type a rule states for an attribute, falling back to the
+/// bridge. A stated type drops the bridge default, which belonged to the
+/// type the rule just replaced
+pub fn apply_column_rule(
+    attname: &str,
+    resolved: ResolvedColumn,
+    rule: ColumnRule,
+) -> (String, ResolvedColumn) {
+    (
+        rule.target_name.unwrap_or_else(|| attname.to_owned()),
+        rule.target_type.map_or(resolved, |ch_type| ResolvedColumn {
+            ch_type,
+            default_sql: None,
+        }),
+    )
+}
+
+pub fn map_column(
+    rel: &RelName,
+    attr: &RelAttr,
+    pk_member: bool,
+    rules: &ColumnRules,
+) -> Option<ColumnMapping> {
+    let resolved = type_bridge::map(attr, pk_member).ok()?;
+    let (target_name, resolved) =
+        apply_column_rule(&attr.name, resolved, rules.settings(rel, &attr.name));
+    Some(ColumnMapping {
+        src_attnum: attr.attnum,
+        target_name,
+        target_type: resolved.ch_type,
+    })
+}
+
+pub fn derive_columns_for_mapping(desc: &RelDescriptor, rules: &ColumnRules) -> Vec<ColumnMapping> {
     let keys = replident_key_attnums(desc);
     desc.attributes
         .iter()
         .filter(|attr| !attr.dropped)
-        .filter_map(|attr| {
-            type_bridge::map(attr, keys.contains(&attr.attnum))
-                .ok()
-                .map(|resolved| ColumnMapping {
-                    src_attnum: attr.attnum,
-                    target_name: attr.name.clone(),
-                    target_type: resolved.ch_type,
-                })
-        })
+        .filter_map(|attr| map_column(&desc.rel_name, attr, keys.contains(&attr.attnum), rules))
         .collect()
 }
 
-pub fn fold_diff_into_mapping(target: &mut TableMapping, new: &RelDescriptor, diff: &SchemaDiff) {
+pub fn fold_diff_into_mapping(
+    target: &mut TableMapping,
+    new: &RelDescriptor,
+    diff: &SchemaDiff,
+    rules: &ColumnRules,
+) {
     for (attnum, old_name, new_name) in &diff.renamed_columns {
+        // Preserve configured target name after source rename
+        let renamed_to = rules
+            .settings(&new.rel_name, new_name)
+            .target_name
+            .unwrap_or_else(|| new_name.clone());
         for column in &mut target.columns {
             if column.src_attnum == *attnum && column.target_name == *old_name {
-                column.target_name.clone_from(new_name);
+                column.target_name.clone_from(&renamed_to);
             }
         }
     }
@@ -178,12 +214,8 @@ pub fn fold_diff_into_mapping(target: &mut TableMapping, new: &RelDescriptor, di
             continue;
         }
         let key = replident_key_attnums(new).contains(&attr.attnum);
-        if let Ok(resolved) = type_bridge::map(attr, key) {
-            target.columns.push(ColumnMapping {
-                src_attnum: attr.attnum,
-                target_name: attr.name.clone(),
-                target_type: resolved.ch_type,
-            });
+        if let Some(column) = map_column(&new.rel_name, attr, key, rules) {
+            target.columns.push(column);
         }
     }
 }
@@ -228,5 +260,133 @@ mod tests {
         handle.publish(Arc::new(map2)).await;
         assert!(!planned.contains_key(&rel2), "snapshot predates the swap");
         assert!(handle.with(|m| m.contains_key(&rel2)).await);
+    }
+
+    fn attr(attnum: i16, name: &str, type_oid: u32) -> crate::schema::RelAttr {
+        crate::schema::RelAttr {
+            attnum,
+            name: name.into(),
+            type_oid,
+            typmod: -1,
+            not_null: true,
+            dropped: false,
+            type_name: String::new(),
+            type_byval: true,
+            type_len: 4,
+            type_align: 'i',
+            type_storage: 'p',
+            missing_text: None,
+        }
+    }
+
+    fn events_desc(attrs: Vec<crate::schema::RelAttr>) -> RelDescriptor {
+        RelDescriptor {
+            rfn: walrus::pg::walparser::RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 16385,
+            },
+            oid: 16385,
+            toast_oid: 0,
+            namespace_oid: 2200,
+            rel_name: RelName::new("app", "events"),
+            kind: 'r',
+            persistence: 'p',
+            replident: crate::schema::ReplIdent::Default { pk_attnums: None },
+            attributes: attrs,
+        }
+    }
+
+    fn amount_rules() -> ColumnRules {
+        let mut b = crate::column_rules::ColumnRulesBuilder::new();
+        b.add(
+            &RelName::new("app", "events"),
+            crate::table_rules::MatchKind::Exact,
+            "legacy_id",
+            crate::table_rules::MatchKind::Exact,
+            crate::column_rules::ColumnRule {
+                target_name: Some("id".into()),
+                target_type: None,
+            },
+        );
+        b.add(
+            &RelName::new("app", "*"),
+            crate::table_rules::MatchKind::Glob,
+            "*_amount",
+            crate::table_rules::MatchKind::Glob,
+            crate::column_rules::ColumnRule {
+                target_name: None,
+                target_type: Some("Decimal(38, 9)".into()),
+            },
+        );
+        b.finish().0
+    }
+
+    #[test]
+    fn derived_columns_take_rule_name_and_type() {
+        let desc = events_desc(vec![
+            attr(1, "legacy_id", crate::schema::INT4OID),
+            attr(2, "net_amount", crate::schema::NUMERICOID),
+            attr(3, "note", crate::schema::TEXTOID),
+        ]);
+        let columns = derive_columns_for_mapping(&desc, &amount_rules());
+        assert_eq!(columns[0].src_attnum, 1);
+        assert_eq!(columns[0].target_name, "id", "rule renames");
+        assert_eq!(columns[1].target_type, "Decimal(38, 9)", "glob retypes");
+        assert_eq!(columns[2].target_name, "note");
+        assert_eq!(columns[2].target_type, "String", "unmatched keeps bridge");
+    }
+
+    #[test]
+    fn folded_column_takes_the_rule_its_name_matches() {
+        let rules = amount_rules();
+        let old = events_desc(vec![attr(1, "legacy_id", crate::schema::INT4OID)]);
+        let mut mapping = TableMapping {
+            target: TableTarget::new("db", "events"),
+            columns: derive_columns_for_mapping(&old, &rules),
+        };
+        let added = attr(2, "gross_amount", crate::schema::NUMERICOID);
+        let new = events_desc(vec![
+            attr(1, "legacy_id", crate::schema::INT4OID),
+            added.clone(),
+        ]);
+        fold_diff_into_mapping(
+            &mut mapping,
+            &new,
+            &SchemaDiff {
+                added_columns: vec![added],
+                dropped_columns: vec![],
+                renamed_columns: vec![],
+                type_changes: vec![],
+            },
+            &rules,
+        );
+        assert_eq!(mapping.columns[1].target_type, "Decimal(38, 9)");
+    }
+
+    #[test]
+    fn rename_lands_on_the_name_the_rule_states() {
+        let rules = amount_rules();
+        let mut mapping = TableMapping {
+            target: TableTarget::new("db", "events"),
+            columns: vec![ColumnMapping {
+                src_attnum: 1,
+                target_name: "id_v1".into(),
+                target_type: "Int32".into(),
+            }],
+        };
+        let new = events_desc(vec![attr(1, "legacy_id", crate::schema::INT4OID)]);
+        fold_diff_into_mapping(
+            &mut mapping,
+            &new,
+            &SchemaDiff {
+                added_columns: vec![],
+                dropped_columns: vec![],
+                renamed_columns: vec![(1, "id_v1".into(), "legacy_id".into())],
+                type_changes: vec![],
+            },
+            &rules,
+        );
+        assert_eq!(mapping.columns[0].target_name, "id");
     }
 }

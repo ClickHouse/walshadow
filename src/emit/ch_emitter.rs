@@ -30,6 +30,7 @@ use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
 #[cfg(test)]
 use crate::ch::is_retryable;
 use crate::ch::{CompressionChoice, ConnectionConfig, EmitterError, quote_ident};
+use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules};
 #[cfg(test)]
 use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
@@ -41,6 +42,7 @@ use crate::schema::{RelDescriptor, RelName};
 use crate::source::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
+use crate::table_rules::{MatchKind, TableRule};
 use ahash::{HashMap, HashMapExt};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
@@ -113,6 +115,10 @@ pub struct EmitterConfig {
     /// Per-table initial-load mode from TOML `[table.*]` blocks. Applies at
     /// boot for pinned mappings; SQL opt-ins carry their own mode.
     pub table_initial_loads: HashMap<RelName, String>,
+    /// Table rules in declaration order
+    pub table_entries: Vec<(RelName, MatchKind, TableRule)>,
+    /// Column rules in declaration order
+    pub column_entries: Vec<ColumnEntry>,
     pub table_opt_ins: HashMap<RelName, TableRow>,
     /// `[stream] paused`: pump idles (stops consuming source WAL) when true.
     /// Live via reload.
@@ -305,6 +311,8 @@ impl Default for EmitterConfig {
             flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
             tables: HashMap::new(),
             table_initial_loads: HashMap::new(),
+            table_entries: Vec::new(),
+            column_entries: Vec::new(),
             table_opt_ins: HashMap::new(),
             paused: false,
             replicate_all: true,
@@ -699,97 +707,178 @@ impl EmitterConfig {
                     })?;
                     let replicate = t.get("replicate").and_then(Value::as_bool);
                     let rel = RelName::new(ns, name);
-                    let Some(cols_v) = t.get("columns").and_then(Value::as_array) else {
+                    let ctx = format!("table.{ns}.{name}");
+                    let kind = match t.get("match") {
+                        None => MatchKind::Exact,
+                        Some(v) => {
+                            let s = v.as_str().ok_or_else(|| {
+                                EmitterError::Config(format!("{ctx}.match: expected a string"))
+                            })?;
+                            MatchKind::parse(s)
+                                .map_err(|e| EmitterError::Config(format!("{ctx}.match: {e}")))?
+                        }
+                    };
+                    let rule = TableRule {
+                        target_database: t
+                            .get("target_database")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        target_table: t
+                            .get("target_table")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        replicate,
+                        initial_load: t
+                            .get("initial_load")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                    };
+                    out.table_entries.push((rel.clone(), kind, rule.clone()));
+                    let cols_v = match t.get("columns") {
+                        None => &[],
+                        Some(v) => v.as_array().map(Vec::as_slice).ok_or_else(|| {
+                            EmitterError::Config(format!("{ctx}.columns: expected an array"))
+                        })?,
+                    };
+                    let mut pinned = Vec::new();
+                    let mut named = Vec::new();
+                    for (i, c) in cols_v.iter().enumerate() {
+                        let ctx = format!("{ctx}.columns[{i}]");
+                        let ct = c.as_table().ok_or_else(|| {
+                            EmitterError::Config(format!("{ctx}: expected a table"))
+                        })?;
+                        let str_field = |key: &str| -> Result<Option<String>, EmitterError> {
+                            match ct.get(key) {
+                                None => Ok(None),
+                                Some(v) => {
+                                    v.as_str().map(|s| Some(s.to_string())).ok_or_else(|| {
+                                        EmitterError::Config(format!(
+                                            "{ctx}.{key}: expected a string"
+                                        ))
+                                    })
+                                }
+                            }
+                        };
+                        let target = str_field("target")?;
+                        let target_type = str_field("type")?;
+                        let att_kind = match str_field("match")? {
+                            None => MatchKind::Exact,
+                            Some(s) => MatchKind::parse(&s)
+                                .map_err(|e| EmitterError::Config(format!("{ctx}.match: {e}")))?,
+                        };
+                        match (ct.get("attnum"), str_field("name")?) {
+                            (Some(_), Some(_)) => {
+                                return Err(EmitterError::Config(format!(
+                                    "{ctx}: attnum and name are alternatives, not both"
+                                )));
+                            }
+                            (None, None) => {
+                                return Err(EmitterError::Config(format!(
+                                    "{ctx}: missing attnum or name"
+                                )));
+                            }
+                            (Some(a), None) => {
+                                if ct.contains_key("match") {
+                                    return Err(EmitterError::Config(format!(
+                                        "{ctx}.match: an attnum entry names one column already"
+                                    )));
+                                }
+                                let src_attnum = a.as_integer().ok_or_else(|| {
+                                    EmitterError::Config(format!(
+                                        "{ctx}.attnum: expected an integer"
+                                    ))
+                                })?;
+                                pinned.push(ColumnMapping {
+                                    src_attnum: i16::try_from(src_attnum).map_err(|_| {
+                                        EmitterError::Config(format!(
+                                            "{ctx}.attnum {src_attnum} out of i16 range"
+                                        ))
+                                    })?,
+                                    target_name: target.ok_or_else(|| {
+                                        EmitterError::Config(format!("{ctx}: missing target"))
+                                    })?,
+                                    target_type: target_type.ok_or_else(|| {
+                                        EmitterError::Config(format!("{ctx}: missing type"))
+                                    })?,
+                                });
+                            }
+                            (None, Some(attname)) => {
+                                if target.is_some() && att_kind != MatchKind::Exact {
+                                    return Err(EmitterError::Config(format!(
+                                        "{ctx}.target: a `match = \"{}\"` entry can name \
+                                         several columns, which cannot share one target",
+                                        att_kind.as_str()
+                                    )));
+                                }
+                                if target.is_none() && target_type.is_none() {
+                                    return Err(EmitterError::Config(format!(
+                                        "{ctx}: sets neither target nor type"
+                                    )));
+                                }
+                                named.push(ColumnEntry {
+                                    rel: rel.clone(),
+                                    rel_kind: kind,
+                                    attname,
+                                    att_kind,
+                                    rule: ColumnRule {
+                                        target_name: target,
+                                        target_type,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    if !pinned.is_empty() && !named.is_empty() {
+                        return Err(EmitterError::Config(format!(
+                            "{ctx}.columns: attnum entries pin the whole projection, so a \
+                             name entry beside them would never apply"
+                        )));
+                    }
+                    out.column_entries.append(&mut named);
+                    if kind != MatchKind::Exact {
+                        if !pinned.is_empty() {
+                            return Err(EmitterError::Config(format!(
+                                "{ctx}.columns: a `match = \"{}\"` entry cannot pin attnums; \
+                                 key the entries on `name` instead",
+                                kind.as_str()
+                            )));
+                        }
+                        continue;
+                    }
+                    if pinned.is_empty() {
                         out.table_opt_ins.insert(
                             rel,
                             TableRow {
-                                target_database: t
-                                    .get("target_database")
-                                    .and_then(Value::as_str)
-                                    .map(String::from),
-                                target_table: t
-                                    .get("target_table")
-                                    .and_then(Value::as_str)
-                                    .map(String::from),
+                                target_database: rule.target_database,
+                                target_table: rule.target_table,
                                 replicate,
-                                initial_load: t
-                                    .get("initial_load")
-                                    .and_then(Value::as_str)
-                                    .map(String::from),
+                                initial_load: rule.initial_load,
+                                ..TableRow::default()
                             },
                         );
                         continue;
-                    };
+                    }
                     if replicate == Some(false) {
                         continue;
                     }
-                    let database = t
-                        .get("target_database")
-                        .and_then(Value::as_str)
+                    let database = rule
+                        .target_database
                         .or_else(|| {
                             out.namespaces
                                 .get(ns.as_str())
-                                .and_then(|n| n.target_database.as_deref())
+                                .and_then(|n| n.target_database.clone())
                         })
-                        .unwrap_or(&out.database)
-                        .to_string();
-                    let table = t
-                        .get("target_table")
-                        .and_then(Value::as_str)
-                        .unwrap_or(name)
-                        .to_string();
-                    let mut columns = Vec::with_capacity(cols_v.len());
-                    for (i, c) in cols_v.iter().enumerate() {
-                        let ct = c.as_table().ok_or_else(|| {
-                            EmitterError::Config(format!(
-                                "table.{ns}.{name}.columns[{i}]: expected a table"
-                            ))
-                        })?;
-                        let src_attnum =
-                            ct.get("attnum")
-                                .and_then(Value::as_integer)
-                                .ok_or_else(|| {
-                                    EmitterError::Config(format!(
-                                        "table.{ns}.{name}.columns[{i}]: missing attnum"
-                                    ))
-                                })?;
-                        let target_name = ct
-                            .get("target")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
-                                EmitterError::Config(format!(
-                                    "table.{ns}.{name}.columns[{i}]: missing target"
-                                ))
-                            })?
-                            .to_string();
-                        let target_type = ct
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
-                                EmitterError::Config(format!(
-                                    "table.{ns}.{name}.columns[{i}]: missing type"
-                                ))
-                            })?
-                            .to_string();
-                        columns.push(ColumnMapping {
-                            src_attnum: i16::try_from(src_attnum).map_err(|_| {
-                                EmitterError::Config(format!(
-                                    "table.{ns}.{name}.columns[{i}].attnum {src_attnum} out of i16 range"
-                                ))
-                            })?,
-                            target_name,
-                            target_type,
-                        });
-                    }
+                        .unwrap_or_else(|| out.database.clone());
+                    let table = rule.target_table.unwrap_or_else(|| name.to_string());
                     out.tables.insert(
                         rel.clone(),
                         TableMapping {
                             target: TableTarget { database, table },
-                            columns,
+                            columns: pinned,
                         },
                     );
-                    if let Some(mode) = t.get("initial_load").and_then(Value::as_str) {
-                        out.table_initial_loads.insert(rel, mode.to_string());
+                    if let Some(mode) = rule.initial_load {
+                        out.table_initial_loads.insert(rel, mode);
                     }
                 }
             }
@@ -851,19 +940,12 @@ pub(crate) struct DecimalWire {
 }
 
 impl TablePlan {
-    /// Synthetic columns always non-nullable (emitter always populates).
-    ///
-    /// `column_overrides` is the `config_column` overlay slice for this rel
-    /// (source attname → CH type). Resolved here because this is where the
-    /// descriptor meets the mapping: attname→attnum comes from `rel`, and an
-    /// inadmissible override (see [`override_wire`]) falls back to the
-    /// mapping's type with a WARN — a config row must degrade, never poison
-    /// the batcher (Regime A).
+    /// Synthetic columns are always non-nullable
     pub(crate) fn build(
         alloc: Allocator,
         rel: &RelDescriptor,
         mapping: &TableMapping,
-        column_overrides: Option<&HashMap<String, String>>,
+        column_rules: &ColumnRules,
     ) -> Result<Self, EmitterError> {
         let mut columns = Vec::with_capacity(mapping.columns.len());
         let mut col_sql = Vec::with_capacity(mapping.columns.len() + 4);
@@ -882,13 +964,13 @@ impl TablePlan {
                 ast,
                 decimal,
             };
-            if let Some(ov) = column_overrides
-                && let Some(ty) = rel
-                    .attributes
-                    .iter()
-                    .find(|a| a.attnum == c.src_attnum && !a.dropped)
-                    .and_then(|a| ov.get(&a.name))
+            if let Some(ty) = rel
+                .attributes
+                .iter()
+                .find(|a| a.attnum == c.src_attnum && !a.dropped)
+                .and_then(|a| column_rules.settings(&rel.rel_name, &a.name).target_type)
             {
+                let ty = &ty;
                 match TypeAst::parse(ty, alloc) {
                     Ok(oast) => {
                         if let Some(decimal) = override_wire(&plan.ast, &oast) {
@@ -1893,6 +1975,23 @@ mod tests {
         }
     }
 
+    fn col_rules(entries: &[(&str, &str)]) -> ColumnRules {
+        let mut b = crate::column_rules::ColumnRulesBuilder::new();
+        for (attname, target_type) in entries {
+            b.add(
+                &RelName::new("public", "foo"),
+                MatchKind::Exact,
+                attname,
+                MatchKind::Exact,
+                ColumnRule {
+                    target_type: Some((*target_type).into()),
+                    ..ColumnRule::default()
+                },
+            );
+        }
+        b.finish().0
+    }
+
     fn mk_rel() -> RelDescriptor {
         use crate::schema::{RelAttr, ReplIdent};
         use walrus::pg::walparser::RelFileNode;
@@ -2228,7 +2327,7 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
+        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).expect("plan builds");
         assert!(plan.insert_sql.contains("INSERT INTO `default`.`foo`"));
         assert!(plan.insert_sql.contains("`id`"));
         assert!(plan.insert_sql.contains("`name`"));
@@ -2246,8 +2345,8 @@ mod tests {
         let mut m = mk_mapping();
         // numeric-shaped default: the plan drill `numeric(38,0)` → `Int128`
         m.columns[0].target_type = "Decimal(38, 0)".into();
-        let overrides = HashMap::from_iter([("id".to_string(), "Int128".to_string())]);
-        let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
+        let rules = col_rules(&[("id", "Int128")]);
+        let plan = TablePlan::build(alloc, &rel, &m, &rules).unwrap();
         assert_eq!(plan.columns[0].type_repr, "Int128");
         // scale-0 decimal wire keeps the numeric text→scaled encode path
         assert_eq!(
@@ -2267,8 +2366,8 @@ mod tests {
         let mut m = mk_mapping();
         // Operator-renamed CH column: override still keys on source attname
         m.columns[1].target_name = "label".into();
-        let overrides = HashMap::from_iter([("name".to_string(), "String".to_string())]);
-        let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
+        let rules = col_rules(&[("name", "String")]);
+        let plan = TablePlan::build(alloc, &rel, &m, &rules).unwrap();
         assert_eq!(plan.columns[1].name, "label");
         assert_eq!(plan.columns[1].type_repr, "String");
     }
@@ -2280,8 +2379,8 @@ mod tests {
         let m = mk_mapping();
         // encode_value writes int4 as 4 LE bytes; no textualization exists,
         // so Int32 → String must fall back rather than poison the batcher
-        let overrides = HashMap::from_iter([("id".to_string(), "String".to_string())]);
-        let plan = TablePlan::build(alloc, &rel, &m, Some(&overrides)).unwrap();
+        let rules = col_rules(&[("id", "String")]);
+        let plan = TablePlan::build(alloc, &rel, &m, &rules).unwrap();
         assert_eq!(plan.columns[0].type_repr, "Int32");
     }
 
@@ -2320,7 +2419,7 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
+        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).expect("plan builds");
         assert!(plan.insert_sql.contains("`_is_deleted`"));
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(1, Some("a")), &m, OP_INSERT)
@@ -2368,7 +2467,7 @@ mod tests {
         let rel = mk_rel();
         let mut m = mk_mapping();
         m.columns[1].target_type = "String".into();
-        let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
+        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).expect("plan builds");
         let mut enc = TableEncoder::new(plan).unwrap();
         // Delete: non-key column absent from the key-only old image
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
@@ -2388,7 +2487,7 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m, None).expect("plan builds");
+        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).expect("plan builds");
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
         match &enc.buffers[1] {
@@ -2402,7 +2501,7 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let m = mk_mapping();
-        let plan = TablePlan::build(alloc, &rel, &m, None).unwrap();
+        let plan = TablePlan::build(alloc, &rel, &m, &ColumnRules::default()).unwrap();
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(7, Some("seven")), &m, OP_INSERT)
             .unwrap();
@@ -2539,6 +2638,119 @@ mod tests {
         let rel = RelName::new("public", "skip");
         assert!(!c.tables.contains_key(&rel));
         assert!(!c.table_initial_loads.contains_key(&rel));
+    }
+
+    #[test]
+    fn config_table_pattern_entry_keys_on_pattern() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.public.\"events_*\"]\n\
+             match = \"glob\"\n\
+             replicate = true\n\
+             initial_load = \"copy\"\n",
+        )
+        .unwrap();
+        let (rel, kind, rule) = &c.table_entries[0];
+        assert_eq!(*rel, RelName::new("public", "events_*"));
+        assert_eq!(*kind, MatchKind::Glob);
+        assert_eq!(rule.replicate, Some(true));
+        assert_eq!(rule.initial_load.as_deref(), Some("copy"));
+        assert!(c.table_opt_ins.is_empty());
+    }
+
+    #[test]
+    fn config_table_literal_entry_lands_in_entries_and_opt_ins() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.public.events]\n\
+             replicate = true\n\
+             target_table = \"ev\"\n",
+        )
+        .unwrap();
+        let rel = RelName::new("public", "events");
+        let (_, kind, rule) = &c.table_entries[0];
+        assert_eq!(*kind, MatchKind::Exact);
+        assert_eq!(rule.target_table.as_deref(), Some("ev"));
+        assert!(c.table_opt_ins.contains_key(&rel));
+    }
+
+    #[test]
+    fn config_table_rejects_bad_match_and_pattern_columns() {
+        assert!(
+            EmitterConfig::from_toml_str("[ch]\n[table.public.t]\nmatch = \"like\"\n").is_err(),
+            "a typo must not read as a literal name"
+        );
+        assert!(
+            EmitterConfig::from_toml_str(
+                "[ch]\n[table.public.\"t.*\"]\nmatch = \"regex\"\n\
+                 columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn config_column_name_entries_state_rules_not_a_projection() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.app.events]\n\
+             replicate = true\n\
+             columns = [\n  \
+               { name = \"legacy_id\", target = \"id\", type = \"UInt64\" },\n  \
+               { name = \"*_at\", match = \"glob\", type = \"DateTime64(6, 'UTC')\" },\n\
+             ]\n",
+        )
+        .unwrap();
+        let rel = RelName::new("app", "events");
+        assert!(!c.tables.contains_key(&rel));
+        assert!(c.table_opt_ins.contains_key(&rel));
+        assert_eq!(c.column_entries.len(), 2);
+        let first = &c.column_entries[0];
+        assert_eq!(first.rel, rel);
+        assert_eq!(first.rel_kind, MatchKind::Exact);
+        assert_eq!(first.attname, "legacy_id");
+        assert_eq!(first.att_kind, MatchKind::Exact);
+        assert_eq!(first.rule.target_name.as_deref(), Some("id"));
+        assert_eq!(first.rule.target_type.as_deref(), Some("UInt64"));
+        let second = &c.column_entries[1];
+        assert_eq!(second.att_kind, MatchKind::Glob);
+        assert!(second.rule.target_name.is_none());
+    }
+
+    #[test]
+    fn config_column_name_entries_ride_a_pattern_block() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.app.\"*\"]\n\
+             match = \"glob\"\n\
+             replicate = true\n\
+             columns = [{ name = \"*_at\", match = \"glob\", type = \"DateTime64(6, 'UTC')\" }]\n",
+        )
+        .unwrap();
+        let e = &c.column_entries[0];
+        assert_eq!(e.rel, RelName::new("app", "*"));
+        assert_eq!(e.rel_kind, MatchKind::Glob);
+        assert!(c.table_opt_ins.is_empty(), "a pattern queues no opt-in");
+    }
+
+    #[test]
+    fn config_column_entry_shapes_are_exclusive() {
+        let bad = [
+            "columns = [{ attnum = 1, name = \"id\", type = \"UInt64\" }]",
+            "columns = [{ target = \"id\", type = \"UInt64\" }]",
+            "columns = [{ attnum = 1, match = \"glob\", target = \"id\", type = \"UInt64\" }]",
+            "columns = [{ name = \"*_at\", match = \"glob\", target = \"ts\" }]",
+            "columns = [{ name = \"id\" }]",
+            "columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }, \
+             { name = \"ts\", type = \"DateTime\" }]",
+        ];
+        for body in bad {
+            assert!(
+                EmitterConfig::from_toml_str(&format!("[ch]\n[table.app.events]\n{body}\n"))
+                    .is_err(),
+                "{body}"
+            );
+        }
     }
 
     #[test]

@@ -55,15 +55,12 @@ pub async fn drain(
         .await
         .iter()
         .map(|(name, mapping)| {
-            let overrides = config
+            let rules = config
                 .as_ref()
-                .and_then(|rc| rc.columns.get(name))
-                .cloned()
-                .map(Arc::new)
-                .unwrap_or_default();
+                .map_or_else(Arc::default, |rc| rc.column_rules.clone());
             (
                 name.clone(),
-                RouteSnapshot::freeze(Arc::new(mapping.clone()), overrides, soft_delete),
+                RouteSnapshot::freeze(Arc::new(mapping.clone()), rules, soft_delete),
             )
         })
         .collect();

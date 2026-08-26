@@ -1,21 +1,11 @@
-//! Route envelopes — frozen routing/encoding state attached to rows.
-//!
-//! [`RouteSnapshot`] freezes the encoder-plan inputs a relation resolved to
-//! over one WAL interval: destination mapping, `config_column` overrides,
-//! encoding policy. Rows carry the snapshot to the batcher so a mapping or
-//! config change never reinterprets rows already routed.
+//! Route snapshots freeze routing and encoding inputs for each WAL interval
 
 use std::sync::Arc;
 
+use crate::column_rules::ColumnRules;
 use crate::decode::heap_decoder::DescribedHeap;
 use crate::mapping::{TableMapping, TableTarget};
-use ahash::HashMap;
 
-/// `config_column` overlay slice for one relation: source attname → CH type
-pub type ColumnOverrides = HashMap<String, String>;
-
-/// Encoder-plan inputs beyond mapping + overrides. Alloc-free (no parsed
-/// type ASTs) so snapshots can serialize and dedup by content
 #[derive(Debug)]
 pub struct RowEncodingSnapshot {
     pub destination: TableTarget,
@@ -28,9 +18,7 @@ pub struct RowEncodingSnapshot {
 #[derive(Debug)]
 pub struct RouteSnapshot {
     pub mapping: Arc<TableMapping>,
-    /// Overlay slice frozen with the route, consumed at batcher plan build.
-    /// Empty when the overlay is off or names no columns for this relation
-    pub column_overrides: Arc<ColumnOverrides>,
+    pub column_rules: Arc<ColumnRules>,
     pub encoding: Arc<RowEncodingSnapshot>,
 }
 
@@ -38,7 +26,7 @@ impl RouteSnapshot {
     /// Freeze encoder-plan inputs; destination derives from mapping target
     pub fn freeze(
         mapping: Arc<TableMapping>,
-        column_overrides: Arc<ColumnOverrides>,
+        column_rules: Arc<ColumnRules>,
         soft_delete: bool,
     ) -> Arc<Self> {
         let encoding = Arc::new(RowEncodingSnapshot {
@@ -47,7 +35,7 @@ impl RouteSnapshot {
         });
         Arc::new(Self {
             mapping,
-            column_overrides,
+            column_rules,
             encoding,
         })
     }

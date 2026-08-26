@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_namespace (
 CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_table (
     namespace       text NOT NULL,
     relname         text NOT NULL,
+    match           text,
     target_database text,            -- ClickHouse database; NULL derives from
                                      -- config_namespace.target_database / TOML
     target_table    text,            -- ClickHouse table; NULL derives from relname
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_column (
     namespace   text NOT NULL,
     relname     text NOT NULL,
     attname     text NOT NULL,
+    match       text,
     target_type text,                -- ClickHouse type expression
     PRIMARY KEY (namespace, relname, attname)
 );
@@ -70,6 +72,8 @@ ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS replicate 
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS initial_load    text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_database text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_table    text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS match           text;
+ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS match           text;
 
 -- REPLICA IDENTITY FULL logs the complete old-row image on UPDATE/DELETE, so a
 -- DELETE always carries the key columns the decoder reads (namespace/relname/

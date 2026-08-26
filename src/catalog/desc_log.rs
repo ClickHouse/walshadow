@@ -684,6 +684,22 @@ impl DescriptorLog {
             .collect()
     }
 
+    /// Names of user relations `Present` at `lsn`, TOAST and system schemas
+    /// dropped — the catalog a name pattern resolves against
+    pub fn user_rel_names_at(&self, lsn: u64, config_schema: Option<&str>) -> Vec<RelName> {
+        self.active_present_at(lsn)
+            .into_iter()
+            .filter(|d| {
+                d.kind != 't'
+                    && !crate::emit::ch_ddl::is_system_namespace(
+                        &d.rel_name.namespace,
+                        config_schema,
+                    )
+            })
+            .map(|d| d.rel_name.clone())
+            .collect()
+    }
+
     /// One-time baseline on an empty log: writes the ckpt (meta +
     /// seed batch) so `covered_through` is durable before any tail append.
     /// Boundaries at or below `covered_through` are baked into the seed —

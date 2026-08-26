@@ -140,27 +140,71 @@ host = "localhost"
 database = "analytics"
 
 # Opt a table out (wins over replicate_all):
-[table."public.audit_log"]
+[table.public.audit_log]
 replicate = false
 
 # Or list explicitly — replicate only what you name:
 [stream]
 replicate_all = false
-[table."public.users"]
+[table.public.users]
 replicate = true
 initial_load = "none"
-target = "users"
+target_table = "users"
 columns = [
     { attnum = 1, target = "id",    type = "UInt64" },
     { attnum = 2, target = "name",  type = "String" },
 ]
 ```
 
+Table blocks take two key levels, `[table.<namespace>.<relname>]`; a name
+carrying a dot or other TOML-special character quotes per key rules, e.g.
+`[table.public."odd.name"]`.
+
 `replicate_all` skips system schemas (`pg_*`, `information_schema`, the
 `[runtime_config]` schema). `attnum` values match `pg_attribute.attnum`
 (1-based) on the source relation; `type` is the CH destination type walshadow
 advertises in the INSERT block. SIGHUP reloads mappings atomically;
 connection params stay boot-only.
+
+Name a set of tables instead of one, with `match`:
+
+```toml
+[table.app."events_*"]              # each name part an anchored pattern
+match = "glob"                      # exact (default) | glob | regex
+replicate = true
+initial_load = "copy"
+
+[table.app."*_audit"]               # a guardrail: excludes even what
+match = "glob"                      # a wider opt-in swept in
+replicate = false
+```
+
+Everything a `config_table` row carries — destination, `replicate`,
+`initial_load` — also takes `match = "glob"` / `"regex"`, which is how you
+scope tables that do not exist yet: under `auto_create` / `replicate_all` a
+relation reaches CH the first time it is seen, before a row naming it could
+arrive. See [plans/config.md](plans/config.md).
+
+Columns take the same treatment. A `columns` entry keys on `attnum` or on
+`name`, never both, and one array holds one kind:
+
+```toml
+[table.app."*"]
+match = "glob"
+replicate = true
+columns = [
+    { name = "*_at", match = "glob", type = "DateTime64(6, 'UTC')" },
+    { name = "legacy_id", target = "id" },   # rename, keep the bridge type
+]
+```
+
+An `attnum` entry pins the projection outright, so it needs `target` + `type`
+and only fits a block naming one relation. A `name` entry states the CH name
+or type of a column the descriptor yields anyway: `target` and `type` are each
+optional, a `match` entry may not set `target` (several columns cannot share
+one CH name), and the whole array pins nothing — scope still comes from
+`replicate` / `auto_create`. `config_column` rows take `match` the same way,
+over the whole `(namespace, relname, attname)` key.
 
 
 ## Building from source

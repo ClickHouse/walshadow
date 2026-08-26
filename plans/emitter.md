@@ -436,6 +436,29 @@ columns = [
 ]
 ```
 
+A `columns` entry uses either `attnum` or `name`. Do not mix both forms in one
+array.
+
+- `attnum` pins a projection. `target` and `type` are required.
+- `name` changes a catalog-derived column. `target` and `type` are optional.
+  Source name and derived type remain when omitted. Set `match` to `glob` or
+  `regex` to cover current and future columns. Pattern entries cannot set
+  `target`, because several columns cannot share one ClickHouse name.
+
+```toml
+[table.app."*"]
+match = "glob"
+replicate = true
+columns = [
+  { name = "*_at", match = "glob", type = "DateTime64(6, 'UTC')" },
+  { name = "legacy_id", target = "id" },
+]
+```
+
+Name entries do not select tables for replication. Use `replicate` or
+`auto_create` for scope. Column rules apply to mappings, `CREATE TABLE`,
+`ADD COLUMN`, and encoder plans.
+
 `MappingHandle = Arc<tokio::sync::RwLock<HashMap<RelName, TableMapping>>>`
 is the live handle the planner's route view resolves from. Handle is
 cloneable; daemon's SIGHUP task swaps whole inner `HashMap`. Routes

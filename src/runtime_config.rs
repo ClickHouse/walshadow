@@ -21,6 +21,7 @@
 
 use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
 use crate::schema::{RelDescriptor, RelName};
+use crate::table_rules::MatchKind;
 use ahash::HashMap;
 
 pub const CONFIG_GLOBAL: &str = "config_global";
@@ -82,6 +83,16 @@ pub struct TableRow {
     /// parses at dispatch in [`crate::backfill::opt_in`], validate-late like every
     /// overlay value); absent / `none` streams from opt-in LSN.
     pub initial_load: Option<String>,
+    pub match_kind: Option<String>,
+}
+
+impl TableRow {
+    pub fn is_pattern(&self) -> bool {
+        !matches!(
+            MatchKind::parse(self.match_kind.as_deref().unwrap_or_default()),
+            Ok(MatchKind::Exact)
+        )
+    }
 }
 
 /// Parsed `config_table.initial_load` mode.
@@ -125,6 +136,7 @@ impl InitialLoadMode {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColumnRow {
     pub target_type: Option<String>,
+    pub match_kind: Option<String>,
 }
 
 /// One applied config change, interpreted from a config-table heap write and
@@ -148,6 +160,7 @@ pub enum ConfigEvent {
     },
     TableRemoved {
         rel: RelName,
+        pattern: bool,
     },
     ColumnUpserted {
         rel: RelName,
@@ -197,7 +210,7 @@ impl ConfigOverlay {
             ConfigEvent::TableUpserted { rel, row } => {
                 self.tables.insert(rel, row);
             }
-            ConfigEvent::TableRemoved { rel } => {
+            ConfigEvent::TableRemoved { rel, .. } => {
                 self.tables.remove(&rel);
             }
             ConfigEvent::ColumnUpserted { rel, attname, row } => {
@@ -322,7 +335,12 @@ pub fn interpret(
                 &field_string(rel, &cols, "relname")?,
             );
             if removed {
-                return Some(ConfigEvent::TableRemoved { rel: key });
+                let pattern = TableRow {
+                    match_kind: field_string(rel, &cols, "match"),
+                    ..TableRow::default()
+                }
+                .is_pattern();
+                return Some(ConfigEvent::TableRemoved { rel: key, pattern });
             }
             Some(ConfigEvent::TableUpserted {
                 rel: key,
@@ -331,6 +349,7 @@ pub fn interpret(
                     target_table: field_string(rel, &cols, "target_table"),
                     replicate: field_bool(rel, &cols, "replicate"),
                     initial_load: field_string(rel, &cols, "initial_load"),
+                    match_kind: field_string(rel, &cols, "match"),
                 },
             })
         }
@@ -348,6 +367,7 @@ pub fn interpret(
                 attname,
                 row: ColumnRow {
                     target_type: field_string(rel, &cols, "target_type"),
+                    match_kind: field_string(rel, &cols, "match"),
                 },
             })
         }
@@ -625,6 +645,88 @@ mod tests {
                 assert_eq!(row.initial_load, None);
             }
             other => panic!("expected TableUpserted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_upsert_reads_match_kind() {
+        let r = rel(
+            CONFIG_TABLE,
+            vec![
+                attr(1, "namespace", 25),
+                attr(2, "relname", 25),
+                attr(3, "match", 25),
+                attr(4, "replicate", 16),
+            ],
+        );
+        let new = vec![
+            Some(ColumnValue::Text("app".into())),
+            Some(ColumnValue::Text("events_.*".into())),
+            Some(ColumnValue::Text("regex".into())),
+            Some(ColumnValue::Bool(true)),
+        ];
+        match interpret(
+            ConfigTableKind::Table,
+            &heap(HeapOp::Insert, Some(new.clone()), None),
+            &r,
+        )
+        .unwrap()
+        {
+            ConfigEvent::TableUpserted { rel, row } => {
+                assert_eq!(rel, RelName::new("app", "events_.*"));
+                assert!(row.is_pattern());
+                assert_eq!(row.replicate, Some(true));
+            }
+            other => panic!("expected TableUpserted, got {other:?}"),
+        }
+        match interpret(
+            ConfigTableKind::Table,
+            &heap(HeapOp::Delete, None, Some(new)),
+            &r,
+        )
+        .unwrap()
+        {
+            ConfigEvent::TableRemoved { rel, pattern } => {
+                assert_eq!(rel, RelName::new("app", "events_.*"));
+                assert!(pattern);
+            }
+            other => panic!("expected TableRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn column_upsert_reads_match_kind() {
+        let r = rel(
+            CONFIG_COLUMN,
+            vec![
+                attr(1, "namespace", 25),
+                attr(2, "relname", 25),
+                attr(3, "attname", 25),
+                attr(4, "match", 25),
+                attr(5, "target_type", 25),
+            ],
+        );
+        let new = vec![
+            Some(ColumnValue::Text("app".into())),
+            Some(ColumnValue::Text("*".into())),
+            Some(ColumnValue::Text("*_amount".into())),
+            Some(ColumnValue::Text("glob".into())),
+            Some(ColumnValue::Text("Decimal(38, 9)".into())),
+        ];
+        match interpret(
+            ConfigTableKind::Column,
+            &heap(HeapOp::Insert, Some(new), None),
+            &r,
+        )
+        .unwrap()
+        {
+            ConfigEvent::ColumnUpserted { rel, attname, row } => {
+                assert_eq!(rel, RelName::new("app", "*"));
+                assert_eq!(attname, "*_amount");
+                assert_eq!(row.match_kind.as_deref(), Some("glob"));
+                assert_eq!(row.target_type.as_deref(), Some("Decimal(38, 9)"));
+            }
+            other => panic!("expected ColumnUpserted, got {other:?}"),
         }
     }
 

@@ -1080,18 +1080,12 @@ impl ReplaySink {
                         continue;
                     };
                     let mapping = Arc::new(mapping.clone());
-                    let overrides = self
+                    let rules = self
                         .config
                         .as_ref()
-                        .and_then(|rc| rc.columns.get(&rel.rel_name))
-                        .cloned()
-                        .map(Arc::new)
-                        .unwrap_or_default();
-                    let route = crate::emit::route::RouteSnapshot::freeze(
-                        mapping,
-                        overrides,
-                        self.soft_delete,
-                    );
+                        .map_or_else(Arc::default, |rc| rc.column_rules.clone());
+                    let route =
+                        crate::emit::route::RouteSnapshot::freeze(mapping, rules, self.soft_delete);
                     let seq = if let Some((seq, rows)) = &mut self.open {
                         *rows += 1;
                         *seq
