@@ -29,12 +29,8 @@ untouched.
 - `tables` — per-relation destination mapping, keyed `"<namespace>.<relname>"`
 - `namespaces` — per-namespace defaults (`auto_create`, `target_database`,
   `drop_table_strategy`)
-- `columns` — per-column CH-type override from the `config_column` overlay,
-  keyed `"<namespace>.<relname>"` → source attname → CH type expression,
-  WAL-tracked. Consumed by `TablePlan::build` (the batcher's plan cache),
-  which resolves attname→attnum against the descriptor at hand and swaps the
-  column's encode type when the override is wire-compatible (see §column
-  overrides below)
+- `column_rules` — per-column CH names and types from TOML and
+  `config_column`, applied when building mappings, DDL, and encoder plans
 - `drop_table_strategy` — global DROP fallback; per-namespace overrides it
 - `row_budget`, `byte_budget`, `flush_timeout` — emitter batch-seal triggers,
   read live by the batcher per seal decision (ticker re-armed on change)
@@ -82,7 +78,8 @@ left as it stands, since its retention is what a rollback to that server
 reads.
 `target_database`, `soft_delete`, `[stream] replicate_all`, and the
 `[runtime_config] schema` name thread into the DDL applicator at construction
-and carry across refreshes unchanged. `replicate_all` (default `true`)
+and carry across refreshes unchanged. Refreshed snapshots provide per-table
+destinations and scope. `replicate_all` (default `true`)
 auto-creates and replicates every user table whose namespace is not a system
 schema (`pg_*`, `information_schema`, the runtime-config schema); an explicit
 `auto_create` namespace or a `replicate = false` opt-out still wins.
@@ -138,6 +135,53 @@ whether the daemon owns a shadow lifecycle at all, which is a
 per-invocation recovery decision like `--start-lsn` and `--ignore-cursor`,
 and CLI-only keeps a stale config file from stomping it.
 
+## Name patterns
+
+Set `match` on a table or column entry to choose how names are read:
+
+- `exact` matches a literal name and is default
+- `glob` supports `*`, `?`, character classes such as `[a-z]`, and choices
+  such as `{one,two}`
+- `regex` supports regular expressions without backreferences
+
+Glob and regex patterns match whole names. For example, `events_*` matches
+`events_2026`, but `events` does not match `my_events`.
+
+```toml
+[table.app."events_*"]
+match = "glob"
+replicate = true
+initial_load = "copy"
+target_database = "warehouse"
+```
+
+```sql
+INSERT INTO walshadow.config_table (namespace, relname, match, replicate)
+VALUES ('app', 'events_*', 'glob', true);
+```
+
+Use glob for common prefix and suffix matches. Use regex when glob cannot
+express a pattern, for example `v[0-9]+_.*`.
+
+Matching patterns apply from least specific to most specific. Longer combined
+namespace and table patterns are more specific. An exact entry applies last.
+Runtime config wins when it repeats a TOML pattern. Any matching pattern with
+`replicate = false` blocks pattern-based opt-ins, but an exact entry can
+override it.
+
+`config_column.match` applies to namespace, table, and column names together.
+Invalid patterns and unknown match modes are rejected and logged. Other rules
+remain active.
+
+Pattern table rules also control scope:
+
+- `replicate = false` prevents automatic creation and removes matching routes
+- `replicate = true` enables automatic creation and requested initial loads
+  for matching tables, including tables created later
+- existing routes keep pinned column mappings
+- patterns never include `pg_*`, `information_schema`, or runtime config
+  schemas
+
 ## `<schema>.config_*` tables
 
 DBA runs [`sql/runtime_config_install.sql`](../sql/runtime_config_install.sql)
@@ -150,12 +194,14 @@ daemon — preserving walshadow's read-only-source posture. Four tables:
   `drop_table_strategy`
 - `config_namespace` — key `namespace`: `target_database`, `auto_create`,
   `drop_table_strategy`
-- `config_table` — key `(namespace, relname)`: `target_database`,
-  `target_table` (each NULL = derived: namespace default / source relname),
-  `replicate`, `initial_load` (`none`, `copy`, `base_backup`, `object_store`).
+- `config_table` — key `(namespace, relname)`: `match` (`exact`, `glob`, or
+  `regex`), `target_database`, `target_table`
+  (each NULL = derived: namespace default / source relname), `replicate`,
+  `initial_load` (`none`, `copy`, `base_backup`, `object_store`).
   Name key, not relfilenode, rfn is unknown at row-insert time for
   forward-declared tables
-- `config_column` — key `(namespace, relname, attname)`: `target_type`
+- `config_column` — key `(namespace, relname, attname)`: `match` (`exact`,
+  `glob`, or `regex`), `target_type`
 
 Every column is nullable and NULL means "daemon default / TOML applies", so the
 schema grows additively: a newer daemon reading an older install still works.
@@ -277,6 +323,16 @@ destination unchanged.
 
 ## Column overrides
 
+Column rules use same precedence as name patterns: least specific patterns
+first, followed by an exact rule. When TOML and `config_column` define same
+rule, `config_column` wins.
+
+- TOML name rules may set ClickHouse column names and types. New tables and
+  columns use these values in mappings and DDL. A custom type removes any
+  generated default. Nullable columns are omitted from `ORDER BY`.
+- `config_column` may change encoder type for an existing column. It cannot
+  rename a ClickHouse column or alter its type.
+
 `config_column.target_type` reaches the emitted projection in two stages,
 because the two failure classes surface at different points:
 
@@ -306,9 +362,8 @@ receiver, so backfilled rows encode under the same overrides as WAL-driven
 rows. The greenfield bootstrap tail stays TOML-only (no resolver exists yet at
 that phase).
 
-The override changes the projection only — CH-side DDL (`CREATE TABLE` /
-`ADD COLUMN`) still renders bridge-derived types; retyping an existing CH
-column stays an operator migration.
+Runtime overrides change encoder projection only. Retyping an existing
+ClickHouse column remains an operator migration.
 
 ## Subscribers
 

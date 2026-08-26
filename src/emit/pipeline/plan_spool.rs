@@ -590,7 +590,7 @@ mod tests {
                 target: TableTarget::new("db", "t"),
                 columns: Vec::new(),
             }),
-            Arc::new(HashMap::new()),
+            Arc::default(),
             false,
         )
     }

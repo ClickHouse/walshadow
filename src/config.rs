@@ -32,6 +32,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
 
 use crate::ch::{CompressionChoice, EmitterError};
+use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::{
     DropTableStrategy, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
@@ -39,7 +40,8 @@ use crate::mapping::{
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
-use ahash::{HashMap, HashMapExt, HashSet};
+use crate::table_rules::{MatchKind, TableRules, TableRulesBuilder};
+use ahash::{HashMap, HashSet};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceConn {
@@ -166,13 +168,8 @@ pub struct ResolvedConfig {
     pub tables: HashMap<RelName, TableMapping>,
     /// Per-namespace defaults keyed on PG schema name
     pub namespaces: HashMap<String, NamespaceMapping>,
-    /// Per-column CH-type override from the `config_column` overlay, keyed
-    /// rel → source attname → CH type expression.
-    /// Type strings are parse-validated at merge (Regime A: malformed
-    /// rejected, prior value kept). Consumed by `TablePlan::build`, which
-    /// resolves attname→attnum against the descriptor at hand and swaps the
-    /// column's encode type when the override is wire-compatible.
-    pub columns: HashMap<RelName, HashMap<String, String>>,
+    pub column_rules: Arc<ColumnRules>,
+    pub rules: Arc<TableRules>,
     /// Global DROP TABLE strategy fallback (`retain` / `drop` / `warn`);
     /// per-namespace `NamespaceMapping::drop_table_strategy` overrides it
     pub drop_table_strategy: String,
@@ -242,7 +239,7 @@ impl Default for ResolvedConfig {
             &ConfigOverlay::default(),
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         )
         .0
     }
@@ -347,7 +344,7 @@ impl ConfigResolver {
     ) -> (Arc<Self>, watch::Receiver<Arc<ResolvedConfig>>) {
         let overlay = ConfigOverlay::default();
         let opt_in = OptInState::default();
-        let (initial, _) = Self::resolve(base, &overlay, &cli, &opt_in, &HashMap::new());
+        let (initial, _) = Self::resolve(base, &overlay, &cli, &opt_in, &ColumnRules::default());
         let (tx, rx) = watch::channel(Arc::new(initial));
         let this = Arc::new(Self {
             toml_path,
@@ -425,11 +422,18 @@ impl ConfigResolver {
     ) {
         let mut inner = self.inner.lock().await;
         let rel = desc.rel_name.clone();
+        // Keep routing target aligned with DDL target
+        let settings = self.tx.borrow().rules.settings(&rel);
         let target = TableTarget {
-            database: db_override.unwrap_or_else(|| Self::target_db_for(&inner, &rel.namespace)),
-            table: table_override.unwrap_or_else(|| rel.name.to_string()),
+            database: db_override
+                .or(settings.target_database)
+                .unwrap_or_else(|| Self::target_db_for(&inner, &rel.namespace)),
+            table: table_override
+                .or(settings.target_table)
+                .unwrap_or_else(|| rel.name.to_string()),
         };
-        let columns = derive_columns_for_mapping(desc);
+        let column_rules = self.tx.borrow().column_rules.clone();
+        let columns = derive_columns_for_mapping(desc, &column_rules);
         inner
             .opt_in
             .mappings
@@ -479,10 +483,11 @@ impl ConfigResolver {
         row
     }
 
-    /// Whether the operator opted this rel out (`replicate=false`). Read by
-    /// `DdlApplicator::apply_added` so an excluded rel skips auto-create.
     pub async fn is_excluded(&self, rel: &RelName) -> bool {
-        self.inner.lock().await.opt_in.excluded.contains(rel)
+        if self.inner.lock().await.opt_in.excluded.contains(rel) {
+            return true;
+        }
+        self.tx.borrow().rules.settings(rel).replicate == Some(false)
     }
 
     /// Record an applicator-derived mapping (`auto_create` CREATE TABLE) so
@@ -528,13 +533,14 @@ impl ConfigResolver {
         if inner.opt_in.excluded.contains(rel) {
             return;
         }
+        let rules = self.tx.borrow().column_rules.clone();
         if let Some(m) = inner.opt_in.mappings.get_mut(rel) {
-            fold_diff_into_mapping(m, new, diff);
+            fold_diff_into_mapping(m, new, diff, &rules);
         } else if let Some(m) = inner.opt_in.derived.get_mut(rel) {
-            fold_diff_into_mapping(m, new, diff);
+            fold_diff_into_mapping(m, new, diff, &rules);
         } else if let Some(base) = inner.base.tables.get(rel) {
             let mut m = base.clone();
-            fold_diff_into_mapping(&mut m, new, diff);
+            fold_diff_into_mapping(&mut m, new, diff, &rules);
             inner.opt_in.derived.insert(rel.clone(), m);
         } else {
             return;
@@ -569,7 +575,7 @@ impl ConfigResolver {
             &inner.overlay,
             &self.cli,
             &inner.opt_in,
-            &prev.columns,
+            &prev.column_rules,
         );
         self.rejections.store(rejections, Ordering::Relaxed);
         self.mapping
@@ -589,21 +595,74 @@ impl ConfigResolver {
     /// overrides on top. Returns the resolved config and the count of overlay
     /// values rejected as malformed (kept at the pre-overlay value, logged at
     /// WARN — Regime A: a bad row never crashes or freezes the pump).
-    /// `prev_columns` is the last published snapshot's column overrides: a
-    /// `target_type` that fails to parse falls back to its entry there, so a
-    /// malformed update can't revert an already-accepted encode type.
     fn resolve(
         base: &EmitterConfig,
         overlay: &ConfigOverlay,
         cli: &CliOverrides,
         opt_in: &OptInState,
-        prev_columns: &HashMap<RelName, HashMap<String, String>>,
+        prev_columns: &ColumnRules,
     ) -> (ResolvedConfig, u64) {
         let mut rejections = 0u64;
+        // Runtime config overrides TOML at equal specificity
+        let mut rules = TableRulesBuilder::new();
+        for (rel, kind, rule) in &base.table_entries {
+            rules.add(rel, *kind, rule.clone());
+        }
+        rules.next_layer();
+        for (rel, row) in &overlay.tables {
+            rules.add_row(rel, row);
+        }
+        let (rules, rule_rejections) = rules.finish();
+        rejections += rule_rejections;
+        let rules = Arc::new(rules);
+
+        let mut column_rules = ColumnRulesBuilder::new();
+        for e in &base.column_entries {
+            column_rules.add(&e.rel, e.rel_kind, &e.attname, e.att_kind, e.rule.clone());
+        }
+        column_rules.next_layer();
+        for ((rel, attname), row) in &overlay.columns {
+            let kind = match MatchKind::parse(row.match_kind.as_deref().unwrap_or_default()) {
+                Ok(k) => k,
+                Err(e) => {
+                    column_rules.bump_rejections();
+                    tracing::warn!(target: "walshadow::config", qname = %rel, attname = %attname, error = %e, "config_column.match rejected");
+                    continue;
+                }
+            };
+            let Some(ty) = &row.target_type else {
+                continue;
+            };
+            // Validate syntax now, validate wire compatibility with descriptor
+            let accepted = if TypeAst::parse(ty, Allocator::stdlib()).is_ok() {
+                Some(ty.as_str())
+            } else {
+                column_rules.bump_rejections();
+                let prior = prev_columns.accepted_type(rel, attname);
+                tracing::warn!(target: "walshadow::config", qname = %rel, attname = %attname, value = %ty, kept_prior = prior.is_some(), "config_column.target_type rejected: unparseable CH type");
+                prior
+            };
+            if let Some(ty) = accepted {
+                column_rules.record_accepted(rel, attname, ty);
+                column_rules.add(
+                    rel,
+                    kind,
+                    attname,
+                    kind,
+                    ColumnRule {
+                        target_type: Some(ty.to_owned()),
+                        ..ColumnRule::default()
+                    },
+                );
+            }
+        }
+        let (column_rules, column_rejections) = column_rules.finish();
+        rejections += column_rejections;
         let mut rc = ResolvedConfig {
             tables: base.tables.clone(),
             namespaces: base.namespaces.clone(),
-            columns: HashMap::new(),
+            column_rules: Arc::new(column_rules),
+            rules: rules.clone(),
             drop_table_strategy: base.drop_table_strategy.clone(),
             row_budget: base.row_budget,
             byte_budget: base.byte_budget,
@@ -710,65 +769,32 @@ impl ConfigResolver {
             }
         }
 
+        for (rel, m) in rc.tables.iter_mut() {
+            let settings = rules.settings(rel);
+            if let Some(db) = settings.target_database {
+                m.target.database = db;
+            }
+            if let Some(t) = settings.target_table {
+                m.target.table = t;
+            }
+        }
         for (rel, row) in &overlay.tables {
-            // `target_database`/`target_table` override the destination of a
-            // table already mapped by TOML or opted in above (both carry the
-            // column projection). A `config_table` row that only sets a target
-            // for an unmapped table can't be routed without a projection —
-            // `replicate=true` is the way to bring such a table into scope.
-            // NULL = that part unchanged.
-            if row.target_database.is_some() || row.target_table.is_some() {
-                match rc.tables.get_mut(rel) {
-                    Some(m) => {
-                        if let Some(db) = &row.target_database {
-                            m.target.database = db.clone();
-                        }
-                        if let Some(t) = &row.target_table {
-                            m.target.table = t.clone();
-                        }
-                    }
-                    None => tracing::warn!(
-                        target: "walshadow::config",
-                        qname = %rel,
-                        "config_table target ignored: no mapping (set replicate=true to opt-in)",
-                    ),
-                }
+            let names_target = row.target_database.is_some() || row.target_table.is_some();
+            if names_target && !row.is_pattern() && !rc.tables.contains_key(rel) {
+                tracing::warn!(
+                    target: "walshadow::config",
+                    qname = %rel,
+                    "config_table target ignored: no mapping (set replicate=true to opt-in)",
+                );
             }
         }
 
-        for ((rel, attname), row) in &overlay.columns {
-            if let Some(ty) = &row.target_type {
-                // Parse-validate here so a malformed type never reaches a
-                // TablePlan build (whose error would poison the batcher).
-                // Wire-shape compatibility needs the descriptor, so that
-                // check (with fallback) runs at plan build instead.
-                if TypeAst::parse(ty, Allocator::stdlib()).is_ok() {
-                    rc.columns
-                        .entry(rel.clone())
-                        .or_default()
-                        .insert(attname.clone(), ty.clone());
-                } else {
-                    rejections += 1;
-                    // Bad update keeps last accepted override (prev snapshot);
-                    // overlay mirrors PG rows so retention can't live there
-                    let prior = prev_columns.get(rel).and_then(|m| m.get(attname));
-                    if let Some(prior) = prior {
-                        rc.columns
-                            .entry(rel.clone())
-                            .or_default()
-                            .insert(attname.clone(), prior.clone());
-                    }
-                    tracing::warn!(target: "walshadow::config", qname = %rel, attname = %attname, value = %ty, kept_prior = prior.is_some(), "config_column.target_type rejected: unparseable CH type");
-                }
-            }
-        }
-
-        // Opt-out (last, so exclusion wins over any TOML/overlay mapping):
-        // a `replicate=false` rel leaves the routing map, so route planning
-        // resolves None and its rows discard mid-stream.
+        // Apply exclusions after mappings
         for rel in &opt_in.excluded {
             rc.tables.remove(rel);
         }
+        rc.tables
+            .retain(|rel, _| rules.settings(rel).replicate != Some(false));
 
         // Layer 1: CLI (top). Survives SIGHUP + stale overlay rows.
         if let Some(v) = &cli.drop_table_strategy {
@@ -805,6 +831,7 @@ impl ConfigResolver {
 mod tests {
     use super::*;
     use crate::runtime_config::{GlobalRow, NamespaceRow, TableRow};
+    use ahash::HashMapExt;
 
     fn base_with(drop_strategy: &str) -> EmitterConfig {
         EmitterConfig::from_toml_str(&format!(
@@ -833,7 +860,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(r.drop_table_strategy, "drop");
         // CLI beats overlay.
@@ -846,7 +873,7 @@ mod tests {
             &overlay,
             &cli,
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(r.drop_table_strategy, "warn");
     }
@@ -859,7 +886,7 @@ mod tests {
             &ConfigOverlay::default(),
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(r.drop_table_strategy, "drop");
     }
@@ -884,7 +911,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(rej, 0);
         assert_eq!(r.row_budget, 1000);
@@ -910,7 +937,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(rej, 3);
         // Prior (TOML/base) values survive each rejection.
@@ -950,7 +977,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         let ns = r.namespaces.get("public").unwrap();
         assert!(ns.auto_create);
@@ -964,6 +991,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pattern_opt_out_drops_a_toml_mapped_relation() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.app.tmp_scratch]\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n",
+        )
+        .unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.tables.insert(
+            RelName::new("app", "tmp_*"),
+            TableRow {
+                match_kind: Some("glob".into()),
+                replicate: Some(false),
+                ..Default::default()
+            },
+        );
+        let (r, _) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        assert!(
+            !r.tables.contains_key(&RelName::new("app", "tmp_scratch")),
+            "an excluding pattern takes the mapping out of the routing map"
+        );
+    }
+
+    #[test]
+    fn overlay_pattern_scope_expands_over_present_relations() {
+        let base = EmitterConfig::from_toml_str("[ch]\n").unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.tables.insert(
+            RelName::new("app", "*_audit"),
+            TableRow {
+                match_kind: Some("glob".into()),
+                replicate: Some(false),
+                ..Default::default()
+            },
+        );
+        overlay.tables.insert(
+            RelName::new("app", "events_*"),
+            TableRow {
+                match_kind: Some("glob".into()),
+                replicate: Some(true),
+                initial_load: Some("copy".into()),
+                ..Default::default()
+            },
+        );
+        let (r, _) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        let present = [
+            RelName::new("app", "events_1"),
+            RelName::new("app", "events_audit"),
+            RelName::new("app", "orders"),
+        ];
+        let scoped = r.rules.pattern_scoped(|| present.to_vec(), |_| false);
+        assert_eq!(scoped.len(), 2, "opt-in and opt-out both dispatch");
+        let opted: Vec<_> = scoped
+            .iter()
+            .filter(|(_, row)| row.replicate == Some(true))
+            .map(|(rel, _)| rel.name.to_string())
+            .collect();
+        assert_eq!(opted, ["events_1"]);
+        assert_eq!(
+            r.rules.settings(&present[1]).replicate,
+            Some(false),
+            "an excluding pattern is a guardrail: it beats a matching opt-in"
+        );
+    }
+
+    #[test]
+    fn overlay_pattern_retargets_a_mapped_relation() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.app.events_1]\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n",
+        )
+        .unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.tables.insert(
+            RelName::new("app", "events_*"),
+            TableRow {
+                match_kind: Some("glob".into()),
+                target_database: Some("warehouse".into()),
+                ..Default::default()
+            },
+        );
+        let (r, _) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        let t = r.tables.get(&RelName::new("app", "events_1")).unwrap();
+        assert_eq!(t.target.database, "warehouse");
+        assert_eq!(t.columns.len(), 1, "TOML projection preserved");
+    }
+
+    #[test]
+    fn overlay_bad_pattern_rejected_and_counted() {
+        let base = EmitterConfig::from_toml_str("[ch]\n").unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.tables.insert(
+            RelName::new("app", "ev(nt"),
+            TableRow {
+                match_kind: Some("regex".into()),
+                replicate: Some(true),
+                ..Default::default()
+            },
+        );
+        overlay.tables.insert(
+            RelName::new("app", "orders"),
+            TableRow {
+                match_kind: Some("like".into()),
+                ..Default::default()
+            },
+        );
+        let (r, rejections) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        assert_eq!(rejections, 2, "unparseable regex + unknown match kind");
+        assert!(!r.rules.has_patterns());
+    }
+
+    #[test]
+    fn overlay_row_overrides_toml_entry() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.app.\"events_*\"]\n\
+             match = \"glob\"\n\
+             replicate = true\n\
+             target_database = \"toml_db\"\n",
+        )
+        .unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.tables.insert(
+            RelName::new("app", "events_*"),
+            TableRow {
+                match_kind: Some("glob".into()),
+                target_database: Some("sql_db".into()),
+                ..Default::default()
+            },
+        );
+        let (r, _) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        let rel = RelName::new("app", "events_2026");
+        let s = r.rules.settings(&rel);
+        assert_eq!(s.target_database.as_deref(), Some("sql_db"));
+        assert_eq!(s.replicate, Some(true), "TOML scope still applies");
+        let ddl =
+            crate::emit::ch_ddl::DdlConfig::from_resolved(&r, "db".into(), false, false, None);
+        assert_eq!(ddl.declared_scope(&rel), Some(true));
+    }
+
     fn auto_create_set(base: &EmitterConfig, overlay: &ConfigOverlay) -> ahash::HashSet<String> {
         use crate::emit::ch_ddl::DdlConfig;
         let (r, _) = ConfigResolver::resolve(
@@ -971,7 +1170,7 @@ mod tests {
             overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         DdlConfig::from_resolved(&r, "db".into(), false, false, None).auto_create_namespaces
     }
@@ -1104,7 +1303,7 @@ mod tests {
             &ConfigOverlay::default(),
             &CliOverrides::default(),
             &opt_in,
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert!(
             r.tables.contains_key(&RelName::new("public", "events")),
@@ -1307,12 +1506,14 @@ mod tests {
             (RelName::new("public", "t"), "amount".into()),
             ColumnRow {
                 target_type: Some("Int128".into()),
+                ..ColumnRow::default()
             },
         );
         overlay.columns.insert(
             (RelName::new("public", "t"), "bad".into()),
             ColumnRow {
                 target_type: Some("NotAType(".into()),
+                ..ColumnRow::default()
             },
         );
         let (r, rej) = ConfigResolver::resolve(
@@ -1320,15 +1521,88 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(rej, 1, "unparseable type rejected");
-        let t = r
-            .columns
-            .get(&RelName::new("public", "t"))
-            .expect("table entry");
-        assert_eq!(t.get("amount").map(String::as_str), Some("Int128"));
-        assert!(!t.contains_key("bad"));
+        let rel = RelName::new("public", "t");
+        assert_eq!(
+            r.column_rules.settings(&rel, "amount").target_type,
+            Some("Int128".into())
+        );
+        assert!(r.column_rules.settings(&rel, "bad").target_type.is_none());
+    }
+
+    #[test]
+    fn column_rules_layer_toml_under_a_pattern_overlay_row() {
+        use crate::runtime_config::ColumnRow;
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.app.events]\n\
+             replicate = true\n\
+             columns = [{ name = \"amount\", target = \"amt\", type = \"Decimal(38, 2)\" }]\n",
+        )
+        .unwrap();
+        let mut overlay = ConfigOverlay::default();
+        overlay.columns.insert(
+            (RelName::new("app", "*"), "amount".into()),
+            ColumnRow {
+                target_type: Some("Int128".into()),
+                match_kind: Some("glob".into()),
+            },
+        );
+        let (r, rej) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        assert_eq!(rej, 0);
+        let s = r
+            .column_rules
+            .settings(&RelName::new("app", "events"), "amount");
+        assert_eq!(
+            s.target_name.as_deref(),
+            Some("amt"),
+            "TOML names the CH column: the overlay row states no name"
+        );
+        assert_eq!(
+            s.target_type.as_deref(),
+            Some("Decimal(38, 2)"),
+            "a literal entry outranks a pattern however late its layer"
+        );
+        assert_eq!(
+            r.column_rules
+                .settings(&RelName::new("app", "orders"), "amount")
+                .target_type
+                .as_deref(),
+            Some("Int128")
+        );
+        assert!(
+            r.column_rules
+                .settings(&RelName::new("other", "events"), "amount")
+                .target_type
+                .is_none()
+        );
+        overlay.columns.insert(
+            (RelName::new("app", "events"), "amount".into()),
+            ColumnRow {
+                target_type: Some("Int128".into()),
+                match_kind: None,
+            },
+        );
+        let (r, _) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        let s = r
+            .column_rules
+            .settings(&RelName::new("app", "events"), "amount");
+        assert_eq!(s.target_type.as_deref(), Some("Int128"));
+        assert_eq!(s.target_name.as_deref(), Some("amt"), "name still TOML's");
     }
 
     #[test]
@@ -1341,6 +1615,7 @@ mod tests {
             key.clone(),
             ColumnRow {
                 target_type: Some("Decimal(38, 2)".into()),
+                ..ColumnRow::default()
             },
         );
         let (first, rej) = ConfigResolver::resolve(
@@ -1348,7 +1623,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(rej, 0);
         // Malformed update replaces the overlay row wholesale; merge keeps
@@ -1357,6 +1632,7 @@ mod tests {
             key,
             ColumnRow {
                 target_type: Some("NotAType(".into()),
+                ..ColumnRow::default()
             },
         );
         let (second, rej) = ConfigResolver::resolve(
@@ -1364,14 +1640,13 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &first.columns,
+            &first.column_rules,
         );
         assert_eq!(rej, 1);
         let amount = |r: &ResolvedConfig| {
-            r.columns
-                .get(&RelName::new("public", "t"))
-                .and_then(|t| t.get("amount"))
-                .cloned()
+            r.column_rules
+                .settings(&RelName::new("public", "t"), "amount")
+                .target_type
         };
         assert_eq!(amount(&second).as_deref(), Some("Decimal(38, 2)"));
         // Retention carries forward while the bad row stays in the overlay
@@ -1380,7 +1655,7 @@ mod tests {
             &overlay,
             &CliOverrides::default(),
             &OptInState::default(),
-            &second.columns,
+            &second.column_rules,
         );
         assert_eq!(rej, 1);
         assert_eq!(amount(&third).as_deref(), Some("Decimal(38, 2)"));
@@ -1403,19 +1678,28 @@ mod tests {
             attname: "amount".into(),
             row: ColumnRow {
                 target_type: Some(ty.into()),
+                ..ColumnRow::default()
             },
         };
         resolver.apply_config_event(upsert("Decimal(38, 2)")).await;
         assert!(rx.changed().await.is_ok());
         assert_eq!(
-            rx.borrow_and_update().columns[&RelName::new("public", "t")]["amount"],
-            "Decimal(38, 2)"
+            rx.borrow_and_update()
+                .column_rules
+                .settings(&RelName::new("public", "t"), "amount")
+                .target_type
+                .as_deref(),
+            Some("Decimal(38, 2)")
         );
         resolver.apply_config_event(upsert("NotAType(")).await;
         assert!(rx.changed().await.is_ok());
         assert_eq!(
-            rx.borrow_and_update().columns[&RelName::new("public", "t")]["amount"],
-            "Decimal(38, 2)",
+            rx.borrow_and_update()
+                .column_rules
+                .settings(&RelName::new("public", "t"), "amount")
+                .target_type
+                .as_deref(),
+            Some("Decimal(38, 2)"),
             "malformed update keeps last accepted override"
         );
         assert_eq!(resolver.rejections(), 1);
@@ -1427,11 +1711,7 @@ mod tests {
             })
             .await;
         assert!(rx.changed().await.is_ok());
-        assert!(
-            !rx.borrow_and_update()
-                .columns
-                .contains_key(&RelName::new("public", "t"))
-        );
+        assert!(rx.borrow_and_update().column_rules.is_empty());
         assert_eq!(resolver.rejections(), 0, "gauge clears with the bad row");
     }
 
@@ -1556,7 +1836,7 @@ mod tests {
             &ConfigOverlay::default(),
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(r.source.host, "pg-b");
         assert_eq!(r.source.port, 5433);
@@ -1576,7 +1856,7 @@ mod tests {
             &ConfigOverlay::default(),
             &CliOverrides::default(),
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(r.source.slot.as_deref(), Some("target_phys"));
 
@@ -1589,7 +1869,7 @@ mod tests {
             &ConfigOverlay::default(),
             &cli,
             &OptInState::default(),
-            &HashMap::new(),
+            &ColumnRules::default(),
         );
         assert_eq!(r.source.slot.as_deref(), Some("pinned"));
     }

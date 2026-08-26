@@ -1526,6 +1526,12 @@ async fn run_session(
                     .values()
                     .filter_map(|r| r.initial_load.as_ref()),
             )
+            .chain(
+                emitter_cfg
+                    .table_entries
+                    .iter()
+                    .filter_map(|(_, _, rule)| rule.initial_load.as_ref()),
+            )
             .any(|mode| InitialLoadMode::parse(mode).is_some_and(|m| m != InitialLoadMode::None));
         // One validated resident-payload pool for the pipeline and every
         // concurrent backup pass
@@ -1558,7 +1564,7 @@ async fn run_session(
         // `initial_load` row: COPY covers commits before it, WAL the rest;
         // the ledger resumes/no-ops rows seen on an earlier boot.
         for (rel, row) in &seeded_table_rows {
-            if row.replicate.is_some() {
+            if row.replicate.is_some() && !row.is_pattern() {
                 walshadow::opt_in::apply_table_opt_in(
                     &resolver,
                     &mut applicator,
@@ -1587,9 +1593,31 @@ async fn run_session(
                 .with_context(|| format!("config opt-in for {rel}"))?;
             }
         }
+        let pattern_scoped: Vec<(RelName, walshadow::runtime_config::TableRow)> = {
+            let snap = config_rx.borrow();
+            let config_schema = emitter_cfg.runtime_config_schema.as_deref();
+            snap.rules.pattern_scoped(
+                || desc_log.user_rel_names_at(raw_start.get(), config_schema),
+                |rel| snap.tables.contains_key(rel),
+            )
+        };
+        for (rel, row) in &pattern_scoped {
+            walshadow::opt_in::apply_table_opt_in(
+                &resolver,
+                &mut applicator,
+                &catalog,
+                backfiller_effects.as_ref(),
+                rel,
+                row,
+                raw_start.get(),
+            )
+            .await
+            .with_context(|| format!("pattern opt-in for {rel}"))?;
+        }
         let sql_scoped_tables: HashSet<RelName> = seeded_table_rows
             .iter()
-            .filter(|(_, row)| row.replicate.is_some())
+            .filter(|(_, row)| row.replicate.is_some() && !row.is_pattern())
+            .chain(pattern_scoped.iter())
             .map(|(rel, _)| rel.clone())
             .collect();
         let active_tables: HashSet<RelName> = config_rx.borrow().tables.keys().cloned().collect();
@@ -2817,13 +2845,16 @@ async fn seed_runtime_config(
                 target_table: row.try_get("target_table").ok().flatten(),
                 replicate: row.try_get("replicate").ok().flatten(),
                 initial_load: row.try_get("initial_load").ok().flatten(),
+                match_kind: row.try_get("match").ok().flatten(),
             },
         );
     }
 
     for row in client
         .query(
-            &format!("SELECT namespace, relname, attname, target_type FROM {s}.config_column"),
+            &format!(
+                "SELECT namespace, relname, attname, match, target_type FROM {s}.config_column"
+            ),
             &[],
         )
         .await
@@ -2835,7 +2866,8 @@ async fn seed_runtime_config(
         overlay.columns.insert(
             (RelName::new(&namespace, &relname), attname),
             ColumnRow {
-                target_type: row.get("target_type"),
+                target_type: row.try_get("target_type").ok().flatten(),
+                match_kind: row.try_get("match").ok().flatten(),
             },
         );
     }
@@ -4327,13 +4359,21 @@ async fn bootstrap_build_mapping(
         cli_source_base(args),
         mapping.clone(),
     );
-    let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_resolved(
-        &config_rx.borrow(),
-        emitter_cfg.database.clone(),
-        emitter_cfg.soft_delete,
-        emitter_cfg.replicate_all,
-        emitter_cfg.runtime_config_schema.clone(),
-    );
+    let (ddl_cfg, merged_tables) = {
+        let snap = config_rx.borrow();
+        (
+            walshadow::ch_ddl::DdlConfig::from_resolved(
+                &snap,
+                emitter_cfg.database.clone(),
+                emitter_cfg.soft_delete,
+                emitter_cfg.replicate_all,
+                emitter_cfg.runtime_config_schema.clone(),
+            ),
+            Arc::new(snap.tables.clone()),
+        )
+    };
+    // Publish rule-adjusted targets before creating tables
+    mapping.publish(merged_tables).await;
     let mut applicator =
         walshadow::ch_ddl::DdlApplicator::new(emitter_cfg, ddl_cfg, mapping.clone(), config_rx)
             .await

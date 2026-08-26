@@ -308,7 +308,7 @@ async fn handle_row(
                 ctx.alloc,
                 &row.rel,
                 &row.route.mapping,
-                Some(&row.route.column_overrides),
+                &row.route.column_rules,
             )
             .map_err(|e| e.to_string())?;
             let meta = Arc::new(BatchMeta::from_plan(&plan, e.key().clone(), ctx.epoch));
@@ -640,7 +640,17 @@ mod tests {
             None,
         );
         // Int32 → UInt32 is wire-compatible (same fixed width), admissible
-        let overrides = HashMap::from_iter([(String::from("id"), String::from("UInt32"))]);
+        let mut rules = crate::column_rules::ColumnRulesBuilder::new();
+        rules.add(
+            &RelName::new("public", "t"),
+            crate::table_rules::MatchKind::Exact,
+            "id",
+            crate::table_rules::MatchKind::Exact,
+            crate::column_rules::ColumnRule {
+                target_type: Some("UInt32".into()),
+                ..Default::default()
+            },
+        );
         let mut r = row(0, 1);
         r.route = RouteSnapshot::freeze(
             Arc::new(TableMapping {
@@ -651,7 +661,7 @@ mod tests {
                     target_type: "Int32".into(),
                 }],
             }),
-            Arc::new(overrides),
+            Arc::new(rules.finish().0),
             false,
         );
         msg_tx.send(BatcherMsg::Row(r)).await.expect("send row");

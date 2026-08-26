@@ -239,9 +239,22 @@ impl ReorderSink {
             let desired: Vec<(RelName, TableRow)> = {
                 let rx = self.reload_rx.as_mut().unwrap();
                 let snap = rx.borrow_and_update();
+                let config_schema = self
+                    .applicator
+                    .as_ref()
+                    .and_then(|a| a.config().runtime_config_schema.clone());
+                // Keep prior pattern opt-ins in desired set
+                let scoped = snap.rules.pattern_scoped(
+                    || {
+                        self.log
+                            .user_rel_names_at(commit_lsn, config_schema.as_deref())
+                    },
+                    |rel| snap.tables.contains_key(rel) && !self.applied_opt_ins.contains(rel),
+                );
                 snap.table_opt_ins
                     .iter()
                     .map(|(rel, row)| (rel.clone(), row.clone()))
+                    .chain(scoped)
                     .collect()
             };
             let desired_in: HashSet<RelName> = desired
@@ -364,7 +377,7 @@ impl ReorderSink {
         // register / drop the descriptor-derived mapping. `commit_lsn` is the
         // backfill boundary `S` for an `initial_load` opt-in.
         match event {
-            ConfigEvent::TableUpserted { rel, row } => {
+            ConfigEvent::TableUpserted { rel, row } if !row.is_pattern() => {
                 if let Some(applicator) = self.applicator.as_mut() {
                     crate::backfill::opt_in::apply_table_opt_in(
                         &resolver,
@@ -379,7 +392,10 @@ impl ReorderSink {
                     .map_err(|e| SinkError::Other(format!("opt-in: {e}")))?;
                 }
             }
-            ConfigEvent::TableRemoved { rel } => {
+            ConfigEvent::TableRemoved {
+                rel,
+                pattern: false,
+            } => {
                 resolver.exclude_table(rel).await;
                 if let Some(b) = &self.backfiller {
                     b.note_opt_out(rel).await;
@@ -998,14 +1014,11 @@ impl PlanRouteView for ReorderRouteView<'_> {
             None => self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned(),
         };
         let route = mapped.map(|m| {
-            let overrides = self
+            let rules = self
                 .config
                 .as_ref()
-                .and_then(|rc| rc.columns.get(rel_name))
-                .cloned()
-                .map(Arc::new)
-                .unwrap_or_default();
-            RouteSnapshot::freeze(Arc::new(m), overrides, self.soft_delete)
+                .map_or_else(Arc::default, |rc| rc.column_rules.clone());
+            RouteSnapshot::freeze(Arc::new(m), rules, self.soft_delete)
         });
         let result = if route.is_none() {
             self.stats
