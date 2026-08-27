@@ -39,7 +39,9 @@ use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::mapping::{ColumnMapping, NamespaceMapping, TableMapping, TableTarget};
+use walshadow::mapping::{
+    ColumnMapping, DropTableStrategy, NamespaceMapping, TableMapping, TableTarget,
+};
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle, TailKind};
@@ -527,7 +529,7 @@ pub struct BuildPipelineArgs<'a> {
 #[derive(Default)]
 pub struct DdlPipelineArgs {
     pub namespaces: ahash::HashMap<String, NamespaceMapping>,
-    pub drop_table_strategy: Option<String>,
+    pub drop_table_strategy: Option<DropTableStrategy>,
     /// Source-PG schema holding the `config_*` runtime-config overlay tables
     /// (TOML `[runtime_config] schema`). `Some` diverts their heap writes into
     /// `ConfigEvent`s (never CH) and enables per-table opt-in dispatch —
@@ -765,8 +767,8 @@ async fn build_pipeline_inner(
     // capture at catalog boundaries.
     if let Some(d) = ddl.as_ref() {
         emitter_cfg.namespaces = d.namespaces.clone();
-        if let Some(s) = &d.drop_table_strategy {
-            emitter_cfg.drop_table_strategy = s.clone();
+        if let Some(s) = d.drop_table_strategy {
+            emitter_cfg.drop_table_strategy = s;
         }
     }
 

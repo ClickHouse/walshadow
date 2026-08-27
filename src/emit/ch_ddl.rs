@@ -86,10 +86,8 @@ impl DdlConfig {
             .filter(|(_, v)| v.auto_create)
             .map(|(k, _)| k.clone())
             .collect();
-        let drop_table_strategy =
-            DropTableStrategy::parse(&resolved.drop_table_strategy).unwrap_or_default();
         Self {
-            drop_table_strategy,
+            drop_table_strategy: resolved.drop_table_strategy,
             auto_create_namespaces,
             replicate_all,
             runtime_config_schema,
@@ -111,8 +109,7 @@ impl DdlConfig {
     fn drop_strategy_for(&self, namespace: &str) -> DropTableStrategy {
         self.namespaces
             .get(namespace)
-            .and_then(|n| n.drop_table_strategy.as_deref())
-            .and_then(|s| DropTableStrategy::parse(s).ok())
+            .and_then(|n| n.drop_table_strategy)
             .unwrap_or(self.drop_table_strategy)
     }
 
@@ -923,7 +920,7 @@ mod tests {
             NamespaceMapping {
                 target_database: Some("warehouse".into()),
                 auto_create: true,
-                drop_table_strategy: Some("drop".into()),
+                drop_table_strategy: Some(DropTableStrategy::Drop),
             },
         );
         namespaces.insert(
@@ -1367,18 +1364,18 @@ mod tests {
     #[test]
     fn drop_table_strategy_parses() {
         assert_eq!(
-            DropTableStrategy::parse("retain").unwrap(),
+            "retain".parse::<DropTableStrategy>().unwrap(),
             DropTableStrategy::Retain
         );
         assert_eq!(
-            DropTableStrategy::parse("Drop").unwrap(),
+            "Drop".parse::<DropTableStrategy>().unwrap(),
             DropTableStrategy::Drop
         );
         assert_eq!(
-            DropTableStrategy::parse("warn").unwrap(),
+            "warn".parse::<DropTableStrategy>().unwrap(),
             DropTableStrategy::Warn
         );
-        assert!(DropTableStrategy::parse("bogus").is_err());
+        assert!("bogus".parse::<DropTableStrategy>().is_err());
     }
 
     #[test]

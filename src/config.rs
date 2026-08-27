@@ -43,14 +43,18 @@ use crate::schema::{RelDescriptor, RelName, SchemaDiff};
 use crate::table_rules::{MatchKind, TableRules, TableRulesBuilder};
 use ahash::{HashMap, HashSet};
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
 pub struct SourceConn {
     pub host: String,
+    #[serde(deserialize_with = "crate::toml_de::de_port")]
     pub port: u16,
     pub user: String,
     pub password: Option<String>,
     pub dbname: String,
+    #[serde(deserialize_with = "de_sslmode")]
     pub sslmode: SslMode,
+    #[serde(deserialize_with = "crate::toml_de::de_nonempty")]
     pub slot: Option<String>,
 }
 
@@ -84,46 +88,26 @@ impl std::fmt::Debug for SourceConn {
     }
 }
 
+fn de_sslmode<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SslMode, D::Error> {
+    use serde::Deserialize;
+    SslMode::parse(&String::deserialize(d)?).map_err(serde::de::Error::custom)
+}
+
+#[derive(serde::Deserialize)]
+struct SourceDocument {
+    #[serde(default)]
+    source: SourceConn,
+}
+
 impl SourceConn {
     /// Parse `[source]` out of a merged config table. Absent section keeps the
     /// defaults; a malformed port or sslmode is an error so `ctl apply`
     /// rejects it before the daemon reloads onto an unreachable endpoint.
     pub fn from_table(root: &toml::Table) -> Result<Self, String> {
-        let mut out = Self::default();
-        let Some(src) = root.get("source").and_then(toml::Value::as_table) else {
-            return Ok(out);
-        };
-        if let Some(v) = src.get("host") {
-            out.host = scalar_string(v).ok_or("source.host: expected a string")?;
-        }
-        if let Some(v) = src.get("port") {
-            out.port = match v {
-                toml::Value::Integer(i) => {
-                    u16::try_from(*i).map_err(|_| format!("source.port: {i} out of range"))?
-                }
-                v => scalar_string(v)
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("source.port: expected a port number")?,
-            };
-        }
-        if let Some(v) = src.get("user") {
-            out.user = scalar_string(v).ok_or("source.user: expected a string")?;
-        }
-        if let Some(v) = src.get("password") {
-            out.password = Some(scalar_string(v).ok_or("source.password: expected a string")?);
-        }
-        if let Some(v) = src.get("dbname") {
-            out.dbname = scalar_string(v).ok_or("source.dbname: expected a string")?;
-        }
-        if let Some(v) = src.get("sslmode") {
-            let s = scalar_string(v).ok_or("source.sslmode: expected a string")?;
-            out.sslmode = SslMode::parse(&s).map_err(|e| format!("source.sslmode: {e}"))?;
-        }
-        if let Some(v) = src.get("slot") {
-            let s = scalar_string(v).ok_or("source.slot: expected a string")?;
-            out.slot = (!s.is_empty()).then_some(s);
-        }
-        Ok(out)
+        let doc: SourceDocument = toml::Value::Table(root.clone())
+            .try_into()
+            .map_err(crate::toml_de::message)?;
+        Ok(doc.source)
     }
 
     /// Connection for the replication socket, its sidecar SQL client, and
@@ -149,16 +133,6 @@ impl SourceConn {
     }
 }
 
-/// TOML scalar as a string. Tables and arrays yield `None`; the CLI `[source]`
-/// base layer writes an integer port, files write either.
-fn scalar_string(v: &toml::Value) -> Option<String> {
-    match v {
-        toml::Value::String(s) => Some(s.clone()),
-        toml::Value::Table(_) | toml::Value::Array(_) => None,
-        v => Some(v.to_string()),
-    }
-}
-
 /// Pre-materialised resolved config, snapshotted by subscribers via
 /// `watch::Receiver<Arc<ResolvedConfig>>`. Rebuilt whole on every reload,
 /// so a snapshot is internally consistent — no per-field tearing.
@@ -170,9 +144,8 @@ pub struct ResolvedConfig {
     pub namespaces: HashMap<String, NamespaceMapping>,
     pub column_rules: Arc<ColumnRules>,
     pub rules: Arc<TableRules>,
-    /// Global DROP TABLE strategy fallback (`retain` / `drop` / `warn`);
-    /// per-namespace `NamespaceMapping::drop_table_strategy` overrides it
-    pub drop_table_strategy: String,
+    /// Global DROP TABLE fallback, overridden per namespace
+    pub drop_table_strategy: DropTableStrategy,
     /// Emitter batch-seal row trigger (live: batcher reads per seal decision)
     pub row_budget: usize,
     /// Emitter batch-seal byte trigger (live)
@@ -252,7 +225,7 @@ impl Default for ResolvedConfig {
 /// CLI flag today live here.
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
-    pub drop_table_strategy: Option<String>,
+    pub drop_table_strategy: Option<DropTableStrategy>,
     pub flush_timeout: Option<Duration>,
     pub source_slot: Option<String>,
 }
@@ -622,7 +595,12 @@ impl ConfigResolver {
         }
         column_rules.next_layer();
         for ((rel, attname), row) in &overlay.columns {
-            let kind = match MatchKind::parse(row.match_kind.as_deref().unwrap_or_default()) {
+            let kind = match row
+                .match_kind
+                .as_deref()
+                .unwrap_or_default()
+                .parse::<MatchKind>()
+            {
                 Ok(k) => k,
                 Err(e) => {
                     column_rules.bump_rejections();
@@ -663,7 +641,7 @@ impl ConfigResolver {
             namespaces: base.namespaces.clone(),
             column_rules: Arc::new(column_rules),
             rules: rules.clone(),
-            drop_table_strategy: base.drop_table_strategy.clone(),
+            drop_table_strategy: base.drop_table_strategy,
             row_budget: base.row_budget,
             byte_budget: base.byte_budget,
             flush_timeout: base.flush_timeout,
@@ -694,8 +672,8 @@ impl ConfigResolver {
         // Layer 2: source-PG overlay.
         if let Some(g) = &overlay.global {
             if let Some(v) = &g.drop_table_strategy {
-                if DropTableStrategy::parse(v).is_ok() {
-                    rc.drop_table_strategy = v.clone();
+                if let Ok(s) = v.parse::<DropTableStrategy>() {
+                    rc.drop_table_strategy = s;
                 } else {
                     rejections += 1;
                     tracing::warn!(target: "walshadow::config", value = %v, "config_global.drop_table_strategy rejected");
@@ -741,9 +719,9 @@ impl ConfigResolver {
                 // Validate via build_codec so an unsupported-at-compile-time
                 // codec (e.g. zstd with the feature off) is rejected here, never
                 // surfaced as a fatal when the inserter reconnects.
-                match CompressionChoice::parse(v).and_then(|c| c.build_codec().map(|_| c)) {
-                    Ok(c) => rc.compression = c,
-                    Err(_) => {
+                match v.parse().map(|c: CompressionChoice| (c, c.build_codec())) {
+                    Ok((c, Ok(_))) => rc.compression = c,
+                    _ => {
                         rejections += 1;
                         tracing::warn!(target: "walshadow::config", value = %v, "config_global.compression rejected");
                     }
@@ -760,8 +738,8 @@ impl ConfigResolver {
                 entry.auto_create = v;
             }
             if let Some(v) = &row.drop_table_strategy {
-                if DropTableStrategy::parse(v).is_ok() {
-                    entry.drop_table_strategy = Some(v.clone());
+                if let Ok(s) = v.parse::<DropTableStrategy>() {
+                    entry.drop_table_strategy = Some(s);
                 } else {
                     rejections += 1;
                     tracing::warn!(target: "walshadow::config", namespace = %ns, value = %v, "config_namespace.drop_table_strategy rejected");
@@ -797,8 +775,8 @@ impl ConfigResolver {
             .retain(|rel, _| rules.settings(rel).replicate != Some(false));
 
         // Layer 1: CLI (top). Survives SIGHUP + stale overlay rows.
-        if let Some(v) = &cli.drop_table_strategy {
-            rc.drop_table_strategy = v.clone();
+        if let Some(v) = cli.drop_table_strategy {
+            rc.drop_table_strategy = v;
         }
         if let Some(d) = cli.flush_timeout {
             rc.flush_timeout = d;
@@ -862,10 +840,10 @@ mod tests {
             &OptInState::default(),
             &ColumnRules::default(),
         );
-        assert_eq!(r.drop_table_strategy, "drop");
+        assert_eq!(r.drop_table_strategy, DropTableStrategy::Drop);
         // CLI beats overlay.
         let cli = CliOverrides {
-            drop_table_strategy: Some("warn".into()),
+            drop_table_strategy: Some(DropTableStrategy::Warn),
             ..Default::default()
         };
         let (r, _) = ConfigResolver::resolve(
@@ -875,7 +853,7 @@ mod tests {
             &OptInState::default(),
             &ColumnRules::default(),
         );
-        assert_eq!(r.drop_table_strategy, "warn");
+        assert_eq!(r.drop_table_strategy, DropTableStrategy::Warn);
     }
 
     #[test]
@@ -888,7 +866,7 @@ mod tests {
             &OptInState::default(),
             &ColumnRules::default(),
         );
-        assert_eq!(r.drop_table_strategy, "drop");
+        assert_eq!(r.drop_table_strategy, DropTableStrategy::Drop);
     }
 
     #[test]
@@ -941,7 +919,7 @@ mod tests {
         );
         assert_eq!(rej, 3);
         // Prior (TOML/base) values survive each rejection.
-        assert_eq!(r.drop_table_strategy, "retain");
+        assert_eq!(r.drop_table_strategy, DropTableStrategy::Retain);
         assert_eq!(r.compression, base.compression);
         assert_eq!(r.row_budget, base.row_budget);
     }
@@ -1747,7 +1725,7 @@ mod tests {
             toml::Table::new(),
             mapping,
         );
-        assert_eq!(rx.borrow().drop_table_strategy, "retain");
+        assert_eq!(rx.borrow().drop_table_strategy, DropTableStrategy::Retain);
 
         let overlay = ConfigOverlay {
             global: Some(GlobalRow {
@@ -1758,13 +1736,19 @@ mod tests {
         };
         resolver.seed_overlay(overlay).await;
         assert!(rx.changed().await.is_ok());
-        assert_eq!(rx.borrow_and_update().drop_table_strategy, "drop");
+        assert_eq!(
+            rx.borrow_and_update().drop_table_strategy,
+            DropTableStrategy::Drop
+        );
 
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;
         assert!(rx.changed().await.is_ok());
-        assert_eq!(rx.borrow_and_update().drop_table_strategy, "retain");
+        assert_eq!(
+            rx.borrow_and_update().drop_table_strategy,
+            DropTableStrategy::Retain
+        );
     }
 
     #[tokio::test]
@@ -1779,7 +1763,7 @@ mod tests {
             mapping,
         );
         resolver.reload().await.unwrap();
-        assert_eq!(rx.borrow().drop_table_strategy, "retain");
+        assert_eq!(rx.borrow().drop_table_strategy, DropTableStrategy::Retain);
     }
 
     #[test]
@@ -1815,12 +1799,24 @@ mod tests {
     /// here is rejected and rolled back instead of reloading the pump onto an
     /// endpoint it cannot dial
     #[test]
-    fn source_conn_rejects_bad_sslmode_and_port() {
-        let bad_ssl: toml::Table = toml::from_str("[source]\nsslmode = \"maybe\"\n").unwrap();
+    fn source_conn_rejects_malformed_values() {
+        let table = |s: &str| toml::from_str::<toml::Table>(s).unwrap();
+        let bad_ssl = table("[source]\nsslmode = \"maybe\"\n");
         assert!(SourceConn::from_table(&bad_ssl).is_err());
         assert!(EmitterConfig::from_table(&bad_ssl).is_err());
-        let bad_port: toml::Table = toml::from_str("[source]\nport = 99999\n").unwrap();
-        assert!(SourceConn::from_table(&bad_port).is_err());
+        for src in [
+            "[source]\nport = 99999\n",
+            "[source]\nport = \"nope\"\n",
+            "[source]\nport = true\n",
+            "[source]\nhost = 3\n",
+            "[source]\nuser = true\n",
+            "[source]\ndbname = 5\n",
+            "source = 3\n",
+        ] {
+            SourceConn::from_table(&table(src)).expect_err(src);
+        }
+        let empty_slot = SourceConn::from_table(&table("[source]\nslot = \"\"\n")).unwrap();
+        assert!(empty_slot.slot.is_none());
     }
 
     /// The pump diffs `ResolvedConfig.source` to decide a feed swap, so the

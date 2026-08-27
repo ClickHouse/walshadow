@@ -29,6 +29,7 @@ compile_error!(
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use ahash::HashSet;
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use std::fs;
 use std::future::Future;
 use std::pin::Pin;
@@ -56,12 +57,12 @@ use walshadow::boundary_hold::{
     BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
 };
 use walshadow::ch_emitter::{
-    DEFAULT_DECODER_POOL, DEFAULT_INSERTER_POOL, EmitterConfig, EmitterStats,
+    BootstrapMode, DEFAULT_DECODER_POOL, DEFAULT_INSERTER_POOL, EmitterConfig, EmitterStats,
 };
 use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig, SourceConn, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::manifest;
-use walshadow::mapping::MappingHandle;
+use walshadow::mapping::{DropTableStrategy, MappingHandle};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
 use walshadow::pg::{quote_ident, socket_conninfo};
 use walshadow::pipeline::{Fatal, PipelineConfig, TailKind, bootstrap, tail};
@@ -91,25 +92,6 @@ use walshadow::transition::{
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
-/// Choose bootstrap source for empty shadow data dir
-/// Initialized data dir resumes regardless of mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
-enum BootstrapMode {
-    /// Never bootstrap. Without `--bootstrap-shadow-data-dir`, manage shadow
-    /// externally. With data dir, manage initialized cluster but reject
-    /// empty dir
-    #[default]
-    Off,
-    /// Source-PG-driven BASE_BACKUP over the replication protocol,
-    /// reuses `--host` / `--port` / `--user`, no extra credentials
-    Direct,
-    /// wal-g-compatible BASE_BACKUP from a `DynStorage` bucket. Storage
-    /// config read from `[backup]` in `--ch-config`;
-    /// `--bootstrap-backup-name` selects the backup (LATEST = newest sentinel)
-    #[value(name = "object_store", alias = "object-store")]
-    ObjectStore,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BootstrapPlan {
     mode: BootstrapMode,
@@ -130,13 +112,6 @@ fn positive_usize(name: &str, cli: Option<usize>, toml: usize) -> usize {
 
 fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<BootstrapPlan> {
     let toml = ch.map(|c| &c.bootstrap);
-    let toml_mode = match toml.and_then(|b| b.mode.as_deref()) {
-        Some("direct") => Some(BootstrapMode::Direct),
-        Some("object_store") => Some(BootstrapMode::ObjectStore),
-        Some("off") => Some(BootstrapMode::Off),
-        None => None,
-        Some(other) => anyhow::bail!("[bootstrap] mode {other:?} unsupported"),
-    };
     // External-shadow (no data dir) can't bootstrap; only default to Direct when
     // a shadow data dir is configured.
     let default_mode = if args.bootstrap_shadow_data_dir.is_some() {
@@ -144,7 +119,8 @@ fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<Bootstra
     } else {
         BootstrapMode::Off
     };
-    let mode = cli_over_toml(args.bootstrap_mode, toml_mode).unwrap_or(default_mode);
+    let mode =
+        cli_over_toml(args.bootstrap_mode, toml.and_then(|b| b.mode)).unwrap_or(default_mode);
     let backup_name = cli_over_toml(
         args.bootstrap_backup_name.clone(),
         toml.and_then(|b| b.backup_name.clone()),
@@ -152,7 +128,8 @@ fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<Bootstra
     let parallelism = cli_over_toml(
         args.bootstrap_object_store_parallelism,
         toml.and_then(|b| b.object_store_parallelism),
-    );
+    )
+    .map(NonZeroUsize::get);
 
     if mode != BootstrapMode::ObjectStore {
         for (knob, set) in [
@@ -494,7 +471,7 @@ struct Args {
     /// survives SIGHUP reload, so an operator can pin the drop policy from
     /// the command line without editing TOML. Absent defers to TOML.
     #[arg(long)]
-    drop_table_strategy: Option<String>,
+    drop_table_strategy: Option<DropTableStrategy>,
     /// HTTP/Prometheus metrics bind address. Disabled when absent.
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
@@ -534,7 +511,7 @@ struct Args {
     /// `--ch-config`. Initialized data dir resumes without bootstrap
     /// regardless of mode. Unset falls through to `[bootstrap] mode` in
     /// `--ch-config`, then to `off`
-    #[arg(long, value_enum)]
+    #[arg(long)]
     bootstrap_mode: Option<BootstrapMode>,
     /// Shadow PG data dir. When set, daemon bootstraps or resumes shadow,
     /// writes config, starts and supervises postmaster, then stops it on
@@ -551,7 +528,7 @@ struct Args {
     /// Unset falls through to `[bootstrap] object_store_parallelism`, then
     /// to `ObjectStoreSource`'s own `min(4, num_cpus)` default.
     #[arg(long)]
-    bootstrap_object_store_parallelism: Option<usize>,
+    bootstrap_object_store_parallelism: Option<NonZeroUsize>,
     /// BASE_BACKUP fast-checkpoint flag for `direct` mode. `true` avoids
     /// waiting for source's checkpoint_timeout; flip off if checkpoint
     /// cost matters more than bootstrap latency.
@@ -1542,7 +1519,7 @@ async fn run_session(
         // the watch substrate; SIGHUP re-reads TOML and republishes. The
         // mapping refresher + DDL applicator subscribe.
         let cli_overrides = CliOverrides {
-            drop_table_strategy: args.drop_table_strategy.clone(),
+            drop_table_strategy: args.drop_table_strategy,
             flush_timeout: args
                 .ch_flush_timeout_ms
                 .map(std::time::Duration::from_millis),
@@ -1715,7 +1692,7 @@ async fn run_session(
             let has_initial_load = emitter_cfg
                 .table_initial_loads
                 .get(rel)
-                .and_then(|mode| InitialLoadMode::parse(mode))
+                .and_then(|mode| mode.parse::<InitialLoadMode>().ok())
                 .is_some_and(|m| m != InitialLoadMode::None);
             if has_initial_load {
                 continue;
@@ -2986,9 +2963,9 @@ async fn apply_toml_initial_loads(
         if !active_tables.contains(rel) || sql_scoped_tables.contains(rel) {
             continue;
         }
-        match InitialLoadMode::parse(mode) {
-            Some(InitialLoadMode::None) => {}
-            Some(parsed) => {
+        match mode.parse() {
+            Ok(InitialLoadMode::None) => {}
+            Ok(parsed) => {
                 let desc = catalog.lock().await.descriptor_by_name(rel).await?;
                 let Some(desc) = desc else {
                     tracing::warn!(
@@ -3008,7 +2985,7 @@ async fn apply_toml_initial_loads(
                     ),
                 }
             }
-            None => tracing::warn!(
+            Err(_) => tracing::warn!(
                 target: "walshadow::config",
                 qname = %rel,
                 mode,
@@ -4424,7 +4401,7 @@ async fn bootstrap_build_mapping(
 ) -> Result<MappingHandle> {
     let mapping = walshadow::mapping::mapping_handle(emitter_cfg.tables.clone());
     let cli_overrides = CliOverrides {
-        drop_table_strategy: args.drop_table_strategy.clone(),
+        drop_table_strategy: args.drop_table_strategy,
         flush_timeout: args
             .ch_flush_timeout_ms
             .map(std::time::Duration::from_millis),

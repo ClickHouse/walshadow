@@ -141,9 +141,9 @@ async fn opt_in_known(
         .materialize_opt_in(desc, row.target_database.clone(), row.target_table.clone())
         .await;
     if let Some(mode) = row.initial_load.as_deref() {
-        match InitialLoadMode::parse(mode) {
-            Some(InitialLoadMode::None) => {}
-            Some(parsed) => match backfiller {
+        match mode.parse() {
+            Ok(InitialLoadMode::None) => {}
+            Ok(parsed) => match backfiller {
                 Some(b) => {
                     b.clone()
                         .note_opt_in(desc.clone(), parsed, opt_in_lsn)
@@ -156,7 +156,7 @@ async fn opt_in_known(
                     "initial_load requested but no backfiller wired; streaming from opt-in LSN only",
                 ),
             },
-            None => tracing::warn!(
+            Err(_) => tracing::warn!(
                 target: "walshadow::config",
                 qname = %desc.rel_name,
                 mode,

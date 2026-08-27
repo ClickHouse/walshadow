@@ -22,6 +22,8 @@
 //! source LSN so `ReplacingMergeTree` dedup keys on the right value;
 //! WAL ordering within a single dest table is preserved
 
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,9 +37,10 @@ use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules};
 use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::mapping::{
-    ColumnMapping, NamespaceMapping, TableMapping, TableTarget, ToastConfig, ToastMode,
+    ColumnMapping, DropTableStrategy, NamespaceMapping, TableMapping, TableTarget, ToastConfig,
+    ToastMode,
 };
-use crate::runtime_config::TableRow;
+use crate::runtime_config::{InitialLoadMode, TableRow};
 use crate::schema::{RelDescriptor, RelName};
 use crate::source::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
@@ -133,7 +136,7 @@ pub struct EmitterConfig {
     pub namespaces: HashMap<String, NamespaceMapping>,
     /// Global `--drop-table-strategy` default; per-namespace override
     /// via `[namespace.<ns>] drop_table_strategy = ...`
-    pub drop_table_strategy: String,
+    pub drop_table_strategy: DropTableStrategy,
     pub retry: RetryConfig,
     /// Wall-clock limit for one INSERT attempt. If connection stalls
     /// mid-INSERT, return retryable [`EmitterError::Timeout`] so inserter
@@ -206,6 +209,39 @@ pub struct EmitterConfig {
     pub bootstrap: BootstrapSettings,
 }
 
+/// Choose bootstrap source for empty shadow data dir
+/// Initialized data dir resumes regardless of mode
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BootstrapMode {
+    /// Never bootstrap. Without `--bootstrap-shadow-data-dir`, manage shadow
+    /// externally. With data dir, manage initialized cluster but reject
+    /// empty dir
+    #[default]
+    Off,
+    /// Source-PG-driven BASE_BACKUP over the replication protocol,
+    /// reuses `--host` / `--port` / `--user`, no extra credentials
+    Direct,
+    /// wal-g-compatible BASE_BACKUP from a `DynStorage` bucket. Storage
+    /// config read from `[backup]` in `--ch-config`;
+    /// `--bootstrap-backup-name` selects the backup (LATEST = newest sentinel)
+    ObjectStore,
+}
+
+impl std::str::FromStr for BootstrapMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "direct" => Ok(Self::Direct),
+            "object_store" | "object-store" => Ok(Self::ObjectStore),
+            other => Err(format!(
+                "unknown bootstrap mode `{other}` (expected off / direct / object_store)"
+            )),
+        }
+    }
+}
+
 /// `[bootstrap]` table. Every field is `Option` so an omitted key falls
 /// through to the CLI flag, then to the built-in default — a set key that
 /// the CLI also passes loses to the CLI.
@@ -213,11 +249,12 @@ pub struct EmitterConfig {
 /// `shadow_data_dir` stays CLI-only: it decides whether the daemon owns a
 /// shadow at all, and pairs with `--start-lsn` / `--ignore-cursor` as a
 /// per-invocation recovery decision.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct BootstrapSettings {
-    /// `mode`: `off` / `direct` / `object_store`. Validated at parse so a
-    /// typo fails at startup rather than silently reading as `off`
-    pub mode: Option<String>,
+    /// `mode`: `off` / `direct` / `object_store`. Validated at parse so a typo
+    /// fails at startup rather than silently reading as `off`
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    pub mode: Option<BootstrapMode>,
     /// `backup_name`: `LATEST` or a literal `base_…` name. The
     /// `base_`-prefix check lives in `bin/stream.rs`, next to the
     /// object-store dispatch that consumes it
@@ -225,45 +262,7 @@ pub struct BootstrapSettings {
     /// `object_store_parallelism`: in-flight data parts. `None` leaves
     /// [`crate::backup_source_object_store::ObjectStoreSource`]'s
     /// `min(4, num_cpus)` clamp in place
-    pub object_store_parallelism: Option<usize>,
-}
-
-/// Accepted `[bootstrap] mode` values; mirrors `bin/stream.rs`'s
-/// `BootstrapMode` clap enum, which cannot live here (no clap in the lib).
-pub const BOOTSTRAP_MODES: [&str; 3] = ["off", "direct", "object_store"];
-
-/// `[bootstrap]` table → [`BootstrapSettings`].
-fn parse_bootstrap(tbl: &toml::value::Table) -> Result<BootstrapSettings, EmitterError> {
-    use toml::Value;
-    let mode = tbl.get("mode").and_then(Value::as_str).map(String::from);
-    if let Some(m) = &mode
-        && !BOOTSTRAP_MODES.contains(&m.as_str())
-    {
-        return Err(EmitterError::Config(format!(
-            "[bootstrap] mode {m:?} must be one of off / direct / object_store"
-        )));
-    }
-    let object_store_parallelism = match tbl.get("object_store_parallelism") {
-        Some(v) => Some(
-            v.as_integer()
-                .and_then(|n| usize::try_from(n).ok())
-                .filter(|n| *n > 0)
-                .ok_or_else(|| {
-                    EmitterError::Config(
-                        "[bootstrap] object_store_parallelism must be a positive integer".into(),
-                    )
-                })?,
-        ),
-        None => None,
-    };
-    Ok(BootstrapSettings {
-        mode,
-        backup_name: tbl
-            .get("backup_name")
-            .and_then(Value::as_str)
-            .map(String::from),
-        object_store_parallelism,
-    })
+    pub object_store_parallelism: Option<NonZeroUsize>,
 }
 
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
@@ -318,7 +317,7 @@ impl Default for EmitterConfig {
             replicate_all: true,
             pending_capture: Default::default(),
             namespaces: HashMap::new(),
-            drop_table_strategy: "retain".into(),
+            drop_table_strategy: DropTableStrategy::default(),
             retry: RetryConfig::default(),
             insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
             idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
@@ -346,10 +345,18 @@ fn backup_err(msg: impl std::fmt::Display) -> EmitterError {
     EmitterError::Config(format!("[backup] {msg}"))
 }
 
-fn backup_str(tbl: &toml::value::Table, key: &str) -> Option<String> {
-    tbl.get(key)
-        .and_then(toml::Value::as_str)
-        .map(str::to_string)
+/// `[backup]` fields shared across storage backends
+#[derive(Debug, serde::Deserialize)]
+struct BackupSection {
+    archive: Option<String>,
+    region: Option<String>,
+    endpoint: Option<String>,
+    #[serde(default)]
+    force_path_style: bool,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    session_token: Option<String>,
+    credentials_path: Option<String>,
 }
 
 fn split_bucket_prefix(rest: &str) -> (String, String) {
@@ -367,7 +374,7 @@ trait BackupBackend {
     fn build(
         &self,
         rest: &str,
-        tbl: &toml::value::Table,
+        bk: &BackupSection,
     ) -> Result<walrus::config::StorageSettings, EmitterError>;
 }
 
@@ -379,15 +386,15 @@ impl BackupBackend for S3Backend {
     fn build(
         &self,
         rest: &str,
-        tbl: &toml::value::Table,
+        bk: &BackupSection,
     ) -> Result<walrus::config::StorageSettings, EmitterError> {
         use walrus::storage::s3::{CredentialSource, Credentials, ImdsProvider, S3Config};
         let (bucket, prefix) = split_bucket_prefix(rest);
-        let creds = match (backup_str(tbl, "access_key"), backup_str(tbl, "secret_key")) {
+        let creds = match (bk.access_key.clone(), bk.secret_key.clone()) {
             (Some(access_key), Some(secret_key)) => CredentialSource::Static(Credentials {
                 access_key,
                 secret_key,
-                session_token: backup_str(tbl, "session_token"),
+                session_token: bk.session_token.clone(),
                 expires_at: None,
             }),
             (None, None) => CredentialSource::Imds(Arc::new(
@@ -402,13 +409,10 @@ impl BackupBackend for S3Backend {
         Ok(walrus::config::StorageSettings::S3(S3Config {
             bucket,
             prefix,
-            region: backup_str(tbl, "region").unwrap_or_else(|| "us-east-1".into()),
+            region: bk.region.clone().unwrap_or_else(|| "us-east-1".into()),
             creds,
-            endpoint: backup_str(tbl, "endpoint"),
-            force_path_style: tbl
-                .get("force_path_style")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false),
+            endpoint: bk.endpoint.clone(),
+            force_path_style: bk.force_path_style,
         }))
     }
 }
@@ -421,15 +425,15 @@ impl BackupBackend for GcsBackend {
     fn build(
         &self,
         rest: &str,
-        tbl: &toml::value::Table,
+        bk: &BackupSection,
     ) -> Result<walrus::config::StorageSettings, EmitterError> {
         let (bucket, prefix) = split_bucket_prefix(rest);
         Ok(walrus::config::StorageSettings::Gcs(
             walrus::storage::gcs::GcsConfig {
                 bucket,
                 prefix,
-                credentials_path: backup_str(tbl, "credentials_path"),
-                endpoint: backup_str(tbl, "endpoint"),
+                credentials_path: bk.credentials_path.clone(),
+                endpoint: bk.endpoint.clone(),
             },
         ))
     }
@@ -443,7 +447,7 @@ impl BackupBackend for FsBackend {
     fn build(
         &self,
         rest: &str,
-        _tbl: &toml::value::Table,
+        _bk: &BackupSection,
     ) -> Result<walrus::config::StorageSettings, EmitterError> {
         Ok(walrus::config::StorageSettings::Fs {
             path: rest.to_string(),
@@ -453,14 +457,16 @@ impl BackupBackend for FsBackend {
 
 /// `[backup]` table → `walrus::config::Settings`. The `archive` URI prefix
 /// dispatches to the matching [`BackupBackend`].
-fn parse_backup(tbl: &toml::value::Table) -> Result<walrus::config::Settings, EmitterError> {
+fn parse_backup(bk: &BackupSection) -> Result<walrus::config::Settings, EmitterError> {
     let backends: [&dyn BackupBackend; 3] = [&S3Backend, &GcsBackend, &FsBackend];
-    let archive = backup_str(tbl, "archive")
+    let archive = bk
+        .archive
+        .clone()
         .ok_or_else(|| backup_err("archive required (s3://, gs://, or file://)"))?;
     for backend in backends {
         if let Some(rest) = archive.strip_prefix(backend.prefix()) {
             return Ok(walrus::config::Settings {
-                storage: backend.build(rest, tbl)?,
+                storage: backend.build(rest, bk)?,
                 ..walrus::config::Settings::default()
             });
         }
@@ -508,6 +514,123 @@ impl ConnectionConfig for EmitterConfig {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ConfigDocument {
+    #[serde(default)]
+    ch: ChPatch,
+    #[serde(default)]
+    toast: ToastPatch,
+    #[serde(default)]
+    memory: MemoryPatch,
+    #[serde(default)]
+    runtime_config: RuntimeConfigPatch,
+    #[serde(default)]
+    stream: StreamPatch,
+    #[serde(default)]
+    source: crate::config::SourceConn,
+    backup: Option<BackupSection>,
+    #[serde(default)]
+    bootstrap: BootstrapSettings,
+    #[serde(default)]
+    namespace: BTreeMap<String, NamespacePatch>,
+    #[serde(default)]
+    table: BTreeMap<String, BTreeMap<String, TablePatch>>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ChPatch {
+    host: Option<String>,
+    port: Option<u16>,
+    database: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+    secure: Option<bool>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    compression: Option<CompressionChoice>,
+    row_budget: Option<usize>,
+    byte_budget: Option<usize>,
+    drain_batch_rows: Option<usize>,
+    drain_batch_bytes: Option<usize>,
+    plan_disk_max: Option<u64>,
+    decoder_pool_size: Option<usize>,
+    inserter_pool_size: Option<usize>,
+    decoder_batch_size: Option<usize>,
+    decoder_queue_capacity: Option<usize>,
+    flush_timeout_ms: Option<u64>,
+    retry_max_attempts: Option<u32>,
+    retry_initial_backoff_ms: Option<u64>,
+    retry_max_backoff_ms: Option<u64>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    drop_table_strategy: Option<DropTableStrategy>,
+    soft_delete: Option<bool>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ToastPatch {
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    mode: Option<ToastMode>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct MemoryPatch {
+    resident_payload_max: Option<usize>,
+    inline_value_max: Option<usize>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct RuntimeConfigPatch {
+    #[serde(default, deserialize_with = "crate::toml_de::de_nonempty")]
+    schema: Option<String>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct StreamPatch {
+    paused: Option<bool>,
+    replicate_all: Option<bool>,
+    pending_max_boundaries_per_xact: Option<u32>,
+    pending_max_hold_ms: Option<u64>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct NamespacePatch {
+    target_database: Option<String>,
+    auto_create: Option<bool>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    drop_table_strategy: Option<DropTableStrategy>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct TablePatch {
+    replicate: Option<bool>,
+    target_database: Option<String>,
+    target_table: Option<String>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    initial_load: Option<InitialLoadMode>,
+    #[serde(
+        rename = "match",
+        default,
+        deserialize_with = "crate::toml_de::de_from_str"
+    )]
+    match_kind: Option<MatchKind>,
+    #[serde(default)]
+    columns: Vec<ColumnPatch>,
+}
+
+#[derive(serde::Deserialize)]
+struct ColumnPatch {
+    attnum: Option<i16>,
+    name: Option<String>,
+    target: Option<String>,
+    #[serde(rename = "type")]
+    target_type: Option<String>,
+    #[serde(
+        rename = "match",
+        default,
+        deserialize_with = "crate::toml_de::de_from_str"
+    )]
+    match_kind: Option<MatchKind>,
+}
+
 impl EmitterConfig {
     /// Parse a TOML config of the shape:
     ///
@@ -538,348 +661,195 @@ impl EmitterConfig {
 
     /// Build from an already-parsed (and possibly conf.d-merged) TOML table.
     pub fn from_table(root: &toml::Table) -> Result<Self, EmitterError> {
-        use toml::Value;
+        let doc: ConfigDocument = toml::Value::Table(root.clone())
+            .try_into()
+            .map_err(crate::toml_de::config_error)?;
         let mut out = Self::default();
-        if let Some(ch) = root.get("ch").and_then(Value::as_table) {
-            if let Some(v) = ch.get("host").and_then(Value::as_str) {
-                out.host = v.into();
-            }
-            if let Some(v) = ch.get("port").and_then(Value::as_integer) {
-                out.port = u16::try_from(v)
-                    .map_err(|_| EmitterError::Config(format!("port {v} out of u16 range")))?;
-            }
-            if let Some(v) = ch.get("database").and_then(Value::as_str) {
-                out.database = v.into();
-            }
-            if let Some(v) = ch.get("user").and_then(Value::as_str) {
-                out.user = v.into();
-            }
-            if let Some(v) = ch.get("password").and_then(Value::as_str) {
-                out.password = v.into();
-            }
-            if let Some(v) = ch.get("secure").and_then(Value::as_bool) {
-                out.secure = v;
-            }
-            if let Some(v) = ch.get("compression").and_then(Value::as_str) {
-                out.compression = CompressionChoice::parse(v)?;
-            }
-            if let Some(v) = ch.get("row_budget").and_then(Value::as_integer) {
-                out.row_budget = usize::try_from(v).unwrap_or(DEFAULT_ROW_BUDGET);
-            }
-            if let Some(v) = ch.get("byte_budget").and_then(Value::as_integer) {
-                out.byte_budget = usize::try_from(v).unwrap_or(DEFAULT_BYTE_BUDGET);
-            }
-            if let Some(v) = ch.get("drain_batch_rows").and_then(Value::as_integer) {
-                out.drain_batch_rows = usize::try_from(v).unwrap_or(DEFAULT_DRAIN_BATCH_ROWS);
-            }
-            if let Some(v) = ch.get("drain_batch_bytes").and_then(Value::as_integer) {
-                out.drain_batch_bytes = usize::try_from(v).unwrap_or(DEFAULT_DRAIN_BATCH_BYTES);
-            }
-            if let Some(v) = ch.get("plan_disk_max").and_then(Value::as_integer) {
-                out.plan_disk_max = u64::try_from(v).unwrap_or(DEFAULT_PLAN_DISK_MAX);
-            }
-            // Negatives land on 0 so both they and a literal 0 reach the
-            // single clamp in bin/stream.rs rather than passing silently.
-            if let Some(v) = ch.get("decoder_pool_size").and_then(Value::as_integer) {
-                out.decoder_pool_size = usize::try_from(v).unwrap_or(0);
-            }
-            if let Some(v) = ch.get("inserter_pool_size").and_then(Value::as_integer) {
-                out.inserter_pool_size = usize::try_from(v).unwrap_or(0);
-            }
-            if let Some(v) = ch.get("decoder_batch_size").and_then(Value::as_integer) {
-                out.decoder_batch_size = usize::try_from(v).unwrap_or(0);
-            }
-            if let Some(v) = ch.get("decoder_queue_capacity").and_then(Value::as_integer) {
-                out.decoder_queue_capacity = usize::try_from(v).unwrap_or(0);
-            }
-            if let Some(v) = ch.get("flush_timeout_ms").and_then(Value::as_integer)
-                && let Ok(ms) = u64::try_from(v)
-            {
-                out.flush_timeout = Duration::from_millis(ms);
-            }
-            if let Some(v) = ch.get("retry_max_attempts").and_then(Value::as_integer) {
-                out.retry.max_attempts = u32::try_from(v).unwrap_or(out.retry.max_attempts);
-            }
-            if let Some(v) = ch
-                .get("retry_initial_backoff_ms")
-                .and_then(Value::as_integer)
-                && let Ok(ms) = u64::try_from(v)
-            {
-                out.retry.initial_backoff = std::time::Duration::from_millis(ms);
-            }
-            if let Some(v) = ch.get("retry_max_backoff_ms").and_then(Value::as_integer)
-                && let Ok(ms) = u64::try_from(v)
-            {
-                out.retry.max_backoff = std::time::Duration::from_millis(ms);
-            }
-            if let Some(v) = ch.get("drop_table_strategy").and_then(Value::as_str) {
-                out.drop_table_strategy = v.into();
-            }
-            if let Some(v) = ch.get("soft_delete").and_then(Value::as_bool) {
-                out.soft_delete = v;
-            }
-        }
-        if let Some(toast) = root.get("toast").and_then(Value::as_table)
-            && let Some(v) = toast.get("mode").and_then(Value::as_str)
-        {
-            out.toast.mode = ToastMode::parse(v).map_err(EmitterError::Config)?;
-        }
-        if let Some(mem) = root.get("memory").and_then(Value::as_table) {
-            if let Some(v) = mem.get("resident_payload_max").and_then(Value::as_integer) {
-                out.resident_payload_max =
-                    usize::try_from(v).unwrap_or(DEFAULT_RESIDENT_PAYLOAD_MAX);
-            }
-            if let Some(v) = mem.get("inline_value_max").and_then(Value::as_integer) {
-                out.inline_value_max = usize::try_from(v).unwrap_or(DEFAULT_INLINE_VALUE_MAX);
-            }
-        }
-        if let Some(rc) = root.get("runtime_config").and_then(Value::as_table)
-            && let Some(schema) = rc.get("schema").and_then(Value::as_str)
-            && !schema.is_empty()
-        {
-            // Empty string == omitted == overlay disabled.
-            out.runtime_config_schema = Some(schema.into());
-        }
-        if let Some(st) = root.get("stream").and_then(Value::as_table) {
-            if let Some(v) = st.get("paused").and_then(Value::as_bool) {
-                out.paused = v;
-            }
-            if let Some(v) = st.get("replicate_all").and_then(Value::as_bool) {
-                out.replicate_all = v;
-            }
-            if let Some(v) = st
-                .get("pending_max_boundaries_per_xact")
-                .and_then(Value::as_integer)
-            {
-                out.pending_capture.max_boundaries_per_xact = u32::try_from(v).unwrap_or(u32::MAX);
-            }
-            if let Some(v) = st.get("pending_max_hold_ms").and_then(Value::as_integer) {
-                out.pending_capture.max_hold_per_xact =
-                    Duration::from_millis(u64::try_from(v).unwrap_or(0));
-            }
-        }
-        out.source = crate::config::SourceConn::from_table(root).map_err(EmitterError::Config)?;
-        if let Some(bk) = root.get("backup").and_then(Value::as_table) {
+        let ch = doc.ch;
+        out.host = ch.host.unwrap_or(out.host);
+        out.port = ch.port.unwrap_or(out.port);
+        out.database = ch.database.unwrap_or(out.database);
+        out.user = ch.user.unwrap_or(out.user);
+        out.password = ch.password.unwrap_or(out.password);
+        out.secure = ch.secure.unwrap_or(out.secure);
+        out.compression = ch.compression.unwrap_or(out.compression);
+        out.row_budget = ch.row_budget.unwrap_or(out.row_budget);
+        out.byte_budget = ch.byte_budget.unwrap_or(out.byte_budget);
+        out.drain_batch_rows = ch.drain_batch_rows.unwrap_or(out.drain_batch_rows);
+        out.drain_batch_bytes = ch.drain_batch_bytes.unwrap_or(out.drain_batch_bytes);
+        out.plan_disk_max = ch.plan_disk_max.unwrap_or(out.plan_disk_max);
+        // Leave zero for bin/stream.rs to clamp
+        out.decoder_pool_size = ch.decoder_pool_size.unwrap_or(out.decoder_pool_size);
+        out.inserter_pool_size = ch.inserter_pool_size.unwrap_or(out.inserter_pool_size);
+        out.decoder_batch_size = ch.decoder_batch_size.unwrap_or(out.decoder_batch_size);
+        out.decoder_queue_capacity = ch
+            .decoder_queue_capacity
+            .unwrap_or(out.decoder_queue_capacity);
+        out.flush_timeout = ch
+            .flush_timeout_ms
+            .map_or(out.flush_timeout, Duration::from_millis);
+        out.retry.max_attempts = ch.retry_max_attempts.unwrap_or(out.retry.max_attempts);
+        out.retry.initial_backoff = ch
+            .retry_initial_backoff_ms
+            .map_or(out.retry.initial_backoff, Duration::from_millis);
+        out.retry.max_backoff = ch
+            .retry_max_backoff_ms
+            .map_or(out.retry.max_backoff, Duration::from_millis);
+        out.drop_table_strategy = ch.drop_table_strategy.unwrap_or(out.drop_table_strategy);
+        out.soft_delete = ch.soft_delete.unwrap_or(out.soft_delete);
+        out.toast.mode = doc.toast.mode.unwrap_or(out.toast.mode);
+        out.resident_payload_max = doc
+            .memory
+            .resident_payload_max
+            .unwrap_or(out.resident_payload_max);
+        out.inline_value_max = doc.memory.inline_value_max.unwrap_or(out.inline_value_max);
+        out.runtime_config_schema = doc.runtime_config.schema;
+        let st = doc.stream;
+        out.paused = st.paused.unwrap_or(out.paused);
+        out.replicate_all = st.replicate_all.unwrap_or(out.replicate_all);
+        out.pending_capture.max_boundaries_per_xact = st
+            .pending_max_boundaries_per_xact
+            .unwrap_or(out.pending_capture.max_boundaries_per_xact);
+        out.pending_capture.max_hold_per_xact = st
+            .pending_max_hold_ms
+            .map_or(out.pending_capture.max_hold_per_xact, Duration::from_millis);
+        out.source = doc.source;
+        if let Some(bk) = &doc.backup {
             out.backup = Some(parse_backup(bk)?);
         }
-        if let Some(bs) = root.get("bootstrap").and_then(Value::as_table) {
-            out.bootstrap = parse_bootstrap(bs)?;
+        out.bootstrap = doc.bootstrap;
+        for (ns, n) in doc.namespace {
+            out.namespaces.insert(
+                ns,
+                NamespaceMapping {
+                    target_database: n.target_database,
+                    auto_create: n.auto_create.unwrap_or(false),
+                    drop_table_strategy: n.drop_table_strategy,
+                },
+            );
         }
-        if let Some(nss) = root.get("namespace").and_then(Value::as_table) {
-            for (k, v) in nss {
-                let t = v.as_table().ok_or_else(|| {
-                    EmitterError::Config(format!("namespace.{k}: expected a table"))
-                })?;
-                let target_database = t
-                    .get("target_database")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                let auto_create = t
-                    .get("auto_create")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let drop_table_strategy = t
-                    .get("drop_table_strategy")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                out.namespaces.insert(
-                    k.clone(),
-                    NamespaceMapping {
-                        target_database,
-                        auto_create,
-                        drop_table_strategy,
-                    },
-                );
-            }
-        }
-        if let Some(tbls) = root.get("table").and_then(Value::as_table) {
-            // Two key levels: [table.<namespace>.<relname>]. Names with
-            // weird characters (dots included) quote per TOML key rules
-            for (ns, rels) in tbls {
-                let rels = rels.as_table().ok_or_else(|| {
-                    EmitterError::Config(format!(
-                        "table.{ns}: expected [table.<namespace>.<relname>] blocks"
-                    ))
-                })?;
-                for (name, v) in rels {
-                    let t = v.as_table().ok_or_else(|| {
-                        EmitterError::Config(format!("table.{ns}.{name}: expected a table"))
-                    })?;
-                    let replicate = t.get("replicate").and_then(Value::as_bool);
-                    let rel = RelName::new(ns, name);
-                    let ctx = format!("table.{ns}.{name}");
-                    let kind = match t.get("match") {
-                        None => MatchKind::Exact,
-                        Some(v) => {
-                            let s = v.as_str().ok_or_else(|| {
-                                EmitterError::Config(format!("{ctx}.match: expected a string"))
-                            })?;
-                            MatchKind::parse(s)
-                                .map_err(|e| EmitterError::Config(format!("{ctx}.match: {e}")))?
-                        }
-                    };
-                    let rule = TableRule {
-                        target_database: t
-                            .get("target_database")
-                            .and_then(Value::as_str)
-                            .map(String::from),
-                        target_table: t
-                            .get("target_table")
-                            .and_then(Value::as_str)
-                            .map(String::from),
-                        replicate,
-                        initial_load: t
-                            .get("initial_load")
-                            .and_then(Value::as_str)
-                            .map(String::from),
-                    };
-                    out.table_entries.push((rel.clone(), kind, rule.clone()));
-                    let cols_v = match t.get("columns") {
-                        None => &[],
-                        Some(v) => v.as_array().map(Vec::as_slice).ok_or_else(|| {
-                            EmitterError::Config(format!("{ctx}.columns: expected an array"))
-                        })?,
-                    };
-                    let mut pinned = Vec::new();
-                    let mut named = Vec::new();
-                    for (i, c) in cols_v.iter().enumerate() {
-                        let ctx = format!("{ctx}.columns[{i}]");
-                        let ct = c.as_table().ok_or_else(|| {
-                            EmitterError::Config(format!("{ctx}: expected a table"))
-                        })?;
-                        let str_field = |key: &str| -> Result<Option<String>, EmitterError> {
-                            match ct.get(key) {
-                                None => Ok(None),
-                                Some(v) => {
-                                    v.as_str().map(|s| Some(s.to_string())).ok_or_else(|| {
-                                        EmitterError::Config(format!(
-                                            "{ctx}.{key}: expected a string"
-                                        ))
-                                    })
-                                }
-                            }
-                        };
-                        let target = str_field("target")?;
-                        let target_type = str_field("type")?;
-                        let att_kind = match str_field("match")? {
-                            None => MatchKind::Exact,
-                            Some(s) => MatchKind::parse(&s)
-                                .map_err(|e| EmitterError::Config(format!("{ctx}.match: {e}")))?,
-                        };
-                        match (ct.get("attnum"), str_field("name")?) {
-                            (Some(_), Some(_)) => {
-                                return Err(EmitterError::Config(format!(
-                                    "{ctx}: attnum and name are alternatives, not both"
-                                )));
-                            }
-                            (None, None) => {
-                                return Err(EmitterError::Config(format!(
-                                    "{ctx}: missing attnum or name"
-                                )));
-                            }
-                            (Some(a), None) => {
-                                if ct.contains_key("match") {
-                                    return Err(EmitterError::Config(format!(
-                                        "{ctx}.match: an attnum entry names one column already"
-                                    )));
-                                }
-                                let src_attnum = a.as_integer().ok_or_else(|| {
-                                    EmitterError::Config(format!(
-                                        "{ctx}.attnum: expected an integer"
-                                    ))
-                                })?;
-                                pinned.push(ColumnMapping {
-                                    src_attnum: i16::try_from(src_attnum).map_err(|_| {
-                                        EmitterError::Config(format!(
-                                            "{ctx}.attnum {src_attnum} out of i16 range"
-                                        ))
-                                    })?,
-                                    target_name: target.ok_or_else(|| {
-                                        EmitterError::Config(format!("{ctx}: missing target"))
-                                    })?,
-                                    target_type: target_type.ok_or_else(|| {
-                                        EmitterError::Config(format!("{ctx}: missing type"))
-                                    })?,
-                                });
-                            }
-                            (None, Some(attname)) => {
-                                if target.is_some() && att_kind != MatchKind::Exact {
-                                    return Err(EmitterError::Config(format!(
-                                        "{ctx}.target: a `match = \"{}\"` entry can name \
-                                         several columns, which cannot share one target",
-                                        att_kind.as_str()
-                                    )));
-                                }
-                                if target.is_none() && target_type.is_none() {
-                                    return Err(EmitterError::Config(format!(
-                                        "{ctx}: sets neither target nor type"
-                                    )));
-                                }
-                                named.push(ColumnEntry {
-                                    rel: rel.clone(),
-                                    rel_kind: kind,
-                                    attname,
-                                    att_kind,
-                                    rule: ColumnRule {
-                                        target_name: target,
-                                        target_type,
-                                    },
-                                });
-                            }
-                        }
-                    }
-                    if !pinned.is_empty() && !named.is_empty() {
-                        return Err(EmitterError::Config(format!(
-                            "{ctx}.columns: attnum entries pin the whole projection, so a \
-                             name entry beside them would never apply"
-                        )));
-                    }
-                    out.column_entries.append(&mut named);
-                    if kind != MatchKind::Exact {
-                        if !pinned.is_empty() {
+        for (ns, rels) in doc.table {
+            for (name, t) in rels {
+                let rel = RelName::new(&ns, &name);
+                let ctx = format!("table.{ns}.{name}");
+                let kind = t.match_kind.unwrap_or(MatchKind::Exact);
+                let replicate = t.replicate;
+                let rule = TableRule {
+                    target_database: t.target_database,
+                    target_table: t.target_table,
+                    replicate,
+                    initial_load: t.initial_load.map(|m| m.as_str().to_string()),
+                };
+                out.table_entries.push((rel.clone(), kind, rule.clone()));
+                let mut pinned = Vec::new();
+                let mut named = Vec::new();
+                for (i, c) in t.columns.into_iter().enumerate() {
+                    let ctx = format!("{ctx}.columns[{i}]");
+                    let att_kind = c.match_kind.unwrap_or(MatchKind::Exact);
+                    match (c.attnum, c.name) {
+                        (Some(_), Some(_)) => {
                             return Err(EmitterError::Config(format!(
-                                "{ctx}.columns: a `match = \"{}\"` entry cannot pin attnums; \
-                                 key the entries on `name` instead",
-                                kind.as_str()
+                                "{ctx}: attnum and name are alternatives, not both"
                             )));
                         }
-                        continue;
+                        (None, None) => {
+                            return Err(EmitterError::Config(format!(
+                                "{ctx}: missing attnum or name"
+                            )));
+                        }
+                        (Some(src_attnum), None) => {
+                            if c.match_kind.is_some() {
+                                return Err(EmitterError::Config(format!(
+                                    "{ctx}.match: an attnum entry names one column already"
+                                )));
+                            }
+                            pinned.push(ColumnMapping {
+                                src_attnum,
+                                target_name: c.target.ok_or_else(|| {
+                                    EmitterError::Config(format!("{ctx}: missing target"))
+                                })?,
+                                target_type: c.target_type.ok_or_else(|| {
+                                    EmitterError::Config(format!("{ctx}: missing type"))
+                                })?,
+                            });
+                        }
+                        (None, Some(attname)) => {
+                            if c.target.is_some() && att_kind != MatchKind::Exact {
+                                return Err(EmitterError::Config(format!(
+                                    "{ctx}.target: a `match = \"{}\"` entry can name \
+                                     several columns, which cannot share one target",
+                                    att_kind.as_str()
+                                )));
+                            }
+                            if c.target.is_none() && c.target_type.is_none() {
+                                return Err(EmitterError::Config(format!(
+                                    "{ctx}: sets neither target nor type"
+                                )));
+                            }
+                            named.push(ColumnEntry {
+                                rel: rel.clone(),
+                                rel_kind: kind,
+                                attname,
+                                att_kind,
+                                rule: ColumnRule {
+                                    target_name: c.target,
+                                    target_type: c.target_type,
+                                },
+                            });
+                        }
                     }
-                    if pinned.is_empty() {
-                        out.table_opt_ins.insert(
-                            rel,
-                            TableRow {
-                                target_database: rule.target_database,
-                                target_table: rule.target_table,
-                                replicate,
-                                initial_load: rule.initial_load,
-                                ..TableRow::default()
-                            },
-                        );
-                        continue;
+                }
+                if !pinned.is_empty() && !named.is_empty() {
+                    return Err(EmitterError::Config(format!(
+                        "{ctx}.columns: attnum entries pin the whole projection, so a \
+                         name entry beside them would never apply"
+                    )));
+                }
+                out.column_entries.append(&mut named);
+                if kind != MatchKind::Exact {
+                    if !pinned.is_empty() {
+                        return Err(EmitterError::Config(format!(
+                            "{ctx}.columns: a `match = \"{}\"` entry cannot pin attnums; \
+                             key the entries on `name` instead",
+                            kind.as_str()
+                        )));
                     }
-                    if replicate == Some(false) {
-                        continue;
-                    }
-                    let database = rule
-                        .target_database
-                        .or_else(|| {
-                            out.namespaces
-                                .get(ns.as_str())
-                                .and_then(|n| n.target_database.clone())
-                        })
-                        .unwrap_or_else(|| out.database.clone());
-                    let table = rule.target_table.unwrap_or_else(|| name.to_string());
-                    out.tables.insert(
-                        rel.clone(),
-                        TableMapping {
-                            target: TableTarget { database, table },
-                            columns: pinned,
+                    continue;
+                }
+                if pinned.is_empty() {
+                    out.table_opt_ins.insert(
+                        rel,
+                        TableRow {
+                            target_database: rule.target_database,
+                            target_table: rule.target_table,
+                            replicate,
+                            initial_load: rule.initial_load,
+                            ..TableRow::default()
                         },
                     );
-                    if let Some(mode) = rule.initial_load {
-                        out.table_initial_loads.insert(rel, mode);
-                    }
+                    continue;
+                }
+                if replicate == Some(false) {
+                    continue;
+                }
+                let database = rule
+                    .target_database
+                    .or_else(|| {
+                        out.namespaces
+                            .get(ns.as_str())
+                            .and_then(|n| n.target_database.clone())
+                    })
+                    .unwrap_or_else(|| out.database.clone());
+                let table = rule.target_table.unwrap_or(name);
+                out.tables.insert(
+                    rel.clone(),
+                    TableMapping {
+                        target: TableTarget { database, table },
+                        columns: pinned,
+                    },
+                );
+                if let Some(mode) = rule.initial_load {
+                    out.table_initial_loads.insert(rel, mode);
                 }
             }
         }
@@ -2072,22 +2042,24 @@ mod tests {
     #[test]
     fn compression_choice_parses_case_insensitively() {
         assert_eq!(
-            CompressionChoice::parse("LZ4").unwrap(),
+            "LZ4".parse::<CompressionChoice>().unwrap(),
             CompressionChoice::Lz4
         );
         assert_eq!(
-            CompressionChoice::parse("Zstd").unwrap(),
+            "Zstd".parse::<CompressionChoice>().unwrap(),
             CompressionChoice::Zstd
         );
         assert_eq!(
-            CompressionChoice::parse("none").unwrap(),
+            "none".parse::<CompressionChoice>().unwrap(),
             CompressionChoice::None
         );
         assert_eq!(
-            CompressionChoice::parse("").unwrap(),
+            "".parse::<CompressionChoice>().unwrap(),
             CompressionChoice::None
         );
-        CompressionChoice::parse("snappy").expect_err("unknown codec");
+        "snappy"
+            .parse::<CompressionChoice>()
+            .expect_err("unknown codec");
     }
 
     #[test]
@@ -2563,9 +2535,29 @@ mod tests {
             compression = "lz4"
             row_budget = 1024
             byte_budget = 4096
+            drain_batch_rows = 9
+            drain_batch_bytes = 10
+            plan_disk_max = 11
+            decoder_pool_size = 12
+            inserter_pool_size = 13
+            decoder_batch_size = 14
+            decoder_queue_capacity = 15
+            flush_timeout_ms = 16
+            retry_max_attempts = 17
+            retry_initial_backoff_ms = 18
+            retry_max_backoff_ms = 19
 
             [toast]
             mode = "clickhouse"
+
+            [runtime_config]
+            schema = "ws"
+
+            [stream]
+            paused = true
+            replicate_all = false
+            pending_max_boundaries_per_xact = 22
+            pending_max_hold_ms = 23
 
             [table.public.foo]
             initial_load = "copy"
@@ -2577,7 +2569,9 @@ mod tests {
         let c = EmitterConfig::from_toml_str(src).expect("parses");
         assert_eq!(c.host, "ch.example.com");
         assert_eq!(c.port, 9000);
+        assert_eq!(c.database, "default");
         assert_eq!(c.user, "ingest");
+        assert_eq!(c.password, "secret");
         assert!(c.secure);
         assert_eq!(c.compression, CompressionChoice::Lz4);
         // Omitting `secure` defaults to plaintext
@@ -2588,6 +2582,22 @@ mod tests {
         );
         assert_eq!(c.row_budget, 1024);
         assert_eq!(c.byte_budget, 4096);
+        assert_eq!((c.drain_batch_rows, c.drain_batch_bytes), (9, 10));
+        assert_eq!(c.plan_disk_max, 11);
+        assert_eq!((c.decoder_pool_size, c.inserter_pool_size), (12, 13));
+        assert_eq!((c.decoder_batch_size, c.decoder_queue_capacity), (14, 15));
+        assert_eq!(c.flush_timeout, Duration::from_millis(16));
+        assert_eq!(c.retry.max_attempts, 17);
+        assert_eq!(c.retry.initial_backoff, Duration::from_millis(18));
+        assert_eq!(c.retry.max_backoff, Duration::from_millis(19));
+        assert_eq!(c.runtime_config_schema.as_deref(), Some("ws"));
+        assert!(c.paused);
+        assert!(!c.replicate_all);
+        assert_eq!(c.pending_capture.max_boundaries_per_xact, 22);
+        assert_eq!(
+            c.pending_capture.max_hold_per_xact,
+            Duration::from_millis(23)
+        );
         let rel = RelName::new("public", "foo");
         let t = c.tables.get(&rel).expect("mapping present");
         // target_database/target_table omitted: [ch] database + source relname
@@ -2607,6 +2617,8 @@ mod tests {
             EmitterConfig::from_toml_str("[ch]\n").unwrap().toast.mode,
             crate::mapping::ToastMode::Disabled
         );
+        let empty = EmitterConfig::from_toml_str("[runtime_config]\nschema = \"\"\n").unwrap();
+        assert!(empty.runtime_config_schema.is_none());
         // Removed disk mode surfaces as a config error, not a silent default
         assert!(EmitterConfig::from_toml_str("[ch]\n[toast]\nmode = \"disk\"\n").is_err());
     }
@@ -2946,6 +2958,69 @@ mod tests {
         assert!(
             EmitterConfig::from_toml_str("[backup]\narchive = \"s3://b\"\naccess_key = \"AK\"\n")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn config_type_error_names_the_path() {
+        let rejects = |src: &str, path: &str| {
+            let msg = EmitterConfig::from_toml_str(src)
+                .expect_err(src)
+                .to_string();
+            assert!(msg.contains(path), "{src:?}: {msg}");
+        };
+        rejects("[ch]\nport = 70000\n", "`ch.port`");
+        rejects("[ch]\nrow_budget = \"4096\"\n", "`ch.row_budget`");
+        rejects("[ch]\nsoft_delete = \"yes\"\n", "`ch.soft_delete`");
+        rejects(
+            "[memory]\ninline_value_max = -1\n",
+            "`memory.inline_value_max`",
+        );
+        rejects("[stream]\nreplicate_all = 0\n", "`stream.replicate_all`");
+        rejects(
+            "[table.public.orders]\nreplicate = \"false\"\n",
+            "`table.public.orders.replicate`",
+        );
+        rejects(
+            "[namespace.sales]\nauto_create = \"true\"\n",
+            "`namespace.sales.auto_create`",
+        );
+        rejects("[table.public.orders]\ntarget_table = 3\n", "target_table");
+        rejects(
+            "[namespace.sales]\ntarget_database = true\n",
+            "target_database",
+        );
+        rejects("source = 3\n", "`source`");
+        rejects("[table]\npublic = 3\n", "`table.public`");
+        rejects("[table.public]\norders = 3\n", "`table.public.orders`");
+        rejects("[table.public.orders]\ncolumns = 3\n", "columns");
+    }
+
+    #[test]
+    fn config_rejects_unknown_semantic_values() {
+        for src in [
+            "[ch]\ncompression = \"snappy\"\n",
+            "[ch]\ndrop_table_strategy = \"dorp\"\n",
+            "[toast]\nmode = \"disk\"\n",
+            "[bootstrap]\nmode = \"objectstore\"\n",
+            "[bootstrap]\nobject_store_parallelism = 0\n",
+            "[source]\nsslmode = \"maybe\"\n",
+            "[namespace.sales]\ndrop_table_strategy = \"dorp\"\n",
+            "[table.public.orders]\ninitial_load = \"cpoy\"\n",
+            "[table.public.orders]\nmatch = \"like\"\n",
+        ] {
+            EmitterConfig::from_toml_str(src).expect_err(src);
+        }
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\ndrop_table_strategy = \"DROP\"\n             [namespace.sales]\ndrop_table_strategy = \"warn\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            (
+                c.drop_table_strategy,
+                c.namespaces["sales"].drop_table_strategy,
+            ),
+            (DropTableStrategy::Drop, Some(DropTableStrategy::Warn))
         );
     }
 }
