@@ -415,7 +415,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
     let tmp = tempfile::tempdir().unwrap();
     // Rows land before the WAL stream ever starts, so COPY is the only path
     // that can carry them to CH. Column mix drives all three wire-decode
-    // paths: int8/text/timestamptz native, numeric via ::text, jsonb cast.
+    // paths: int8/text/timestamptz/bytea native, numeric via ::text, jsonb cast.
     let schema_sql = format!(
         "{INSTALL_SQL}\n\
          CREATE SCHEMA app;\n\
@@ -424,11 +424,18 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
             name text,\
             price numeric(10,2),\
             added_at timestamptz,\
-            meta jsonb);\n\
+            meta jsonb,\
+            weight numeric,\
+            blob bytea,\
+            note text);\n\
          INSERT INTO app.inventory VALUES\
-            (1, 'anvil',  10.00, '2024-01-02 03:04:05+00', '{{\"a\": 1}}'),\
-            (2, 'bolt',   12.50, '2024-01-02 03:04:06+00', '{{\"b\": 2}}'),\
-            (3, 'crate',  99.99, NULL, NULL);\n"
+            (1, 'anvil',  10.00, '2024-01-02 03:04:05+00', '{{\"a\": 1}}',\
+             1.5, NULL, NULL),\
+            (2, 'bolt',   12.50, '2024-01-02 03:04:06+00', '{{\"b\": 2}}',\
+             'NaN', decode(repeat('ab', 30000), 'hex'), repeat('z', 120000)),\
+            (3, 'crate',  99.99, NULL, NULL, 'Infinity', NULL, NULL),\
+            (4, 'quoin',   0.01, '2024-01-02 03:04:07+00', NULL,\
+             '-Infinity', NULL, NULL);\n"
     );
     let (
         fx::BootstrappedClusters {
@@ -486,19 +493,19 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
     pipeline.shutdown().await.expect("pipeline drains clean");
 
     // Backfill runs as a detached task on its own CH tail; poll for
-    // convergence (3 COPY rows + 1 streamed row) rather than racing it.
+    // convergence (4 COPY rows + 1 streamed row) rather than racing it.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut n = String::new();
     while std::time::Instant::now() < deadline {
         n = ch
             .query("SELECT count(DISTINCT id) FROM walshadow_test.inventory FINAL WHERE _is_deleted = 0")
             .unwrap_or_default();
-        if n == "4" {
+        if n == "5" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert_eq!(n, "4", "3 backfilled + 1 streamed row must reach CH");
+    assert_eq!(n, "5", "4 backfilled + 1 streamed row must reach CH");
 
     // Untouched pre-opt-in row: COPY carried every column faithfully.
     let bolt = ch
@@ -509,6 +516,25 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
         )
         .expect("ch backfilled row");
     assert_eq!(bolt, "bolt\t12.5\t2024-01-02 03:04:06.000000\t{\"b\": 2}");
+
+    // TOAST-sized values survive COPY.
+    let big = ch
+        .query(
+            "SELECT length(argMax(blob, _lsn)), length(argMax(note, _lsn)) \
+             FROM walshadow_test.inventory WHERE _is_deleted = 0 AND id = 2",
+        )
+        .expect("ch large values");
+    assert_eq!(big, "30000\t120000");
+
+    // Non-finite numerics survive text decoding.
+    let weights = ch
+        .query(
+            "SELECT argMaxIf(weight, _lsn, id = 2), argMaxIf(weight, _lsn, id = 3), \
+                    argMaxIf(weight, _lsn, id = 4) \
+             FROM walshadow_test.inventory WHERE _is_deleted = 0",
+        )
+        .expect("ch numeric specials");
+    assert_eq!(weights, "NaN\tInfinity\t-Infinity");
 
     // NULLs survive the wire.
     let crate_row = ch

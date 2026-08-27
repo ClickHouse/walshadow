@@ -56,6 +56,8 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio_postgres::binary_copy::BinaryCopyOutStream;
+use tokio_postgres::types::Type;
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::conn::PgConfig;
 
@@ -230,109 +232,6 @@ impl Ledger {
 }
 
 // ---------------------------------------------------------------------------
-// Binary COPY wire parser
-// ---------------------------------------------------------------------------
-
-/// `PGCOPY\n\xff\r\n\0`
-const COPY_SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
-
-/// Incremental parser over `CopyOutStream` chunks (chunk boundaries are
-/// arbitrary relative to rows). Yields one raw-field row at a time; a `-1`
-/// field count is the trailer.
-struct CopyBinaryParser {
-    buf: Vec<u8>,
-    pos: usize,
-    header_parsed: bool,
-    done: bool,
-}
-
-impl CopyBinaryParser {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            pos: 0,
-            header_parsed: false,
-            done: false,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) {
-        if self.pos > 0 {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
-        }
-        self.buf.extend_from_slice(chunk);
-    }
-
-    fn avail(&self) -> &[u8] {
-        &self.buf[self.pos..]
-    }
-
-    /// `Ok(Some(fields))` per complete row; `Ok(None)` when more input is
-    /// needed or the trailer was consumed.
-    fn next_row(&mut self) -> Result<Option<Vec<Option<Vec<u8>>>>, String> {
-        if self.done {
-            return Ok(None);
-        }
-        if !self.header_parsed {
-            let b = self.avail();
-            if b.len() < COPY_SIGNATURE.len() + 8 {
-                return Ok(None);
-            }
-            if &b[..COPY_SIGNATURE.len()] != COPY_SIGNATURE {
-                return Err("bad binary COPY signature".into());
-            }
-            // flags (4) + header extension length (4) + extension bytes
-            let ext_off = COPY_SIGNATURE.len() + 4;
-            let ext_len = u32::from_be_bytes(b[ext_off..ext_off + 4].try_into().unwrap()) as usize;
-            let hdr = ext_off + 4 + ext_len;
-            if b.len() < hdr {
-                return Ok(None);
-            }
-            self.pos += hdr;
-            self.header_parsed = true;
-        }
-
-        // Scan a whole row before consuming, so a row split across chunks
-        // never half-advances.
-        let b = self.avail();
-        if b.len() < 2 {
-            return Ok(None);
-        }
-        let nfields = i16::from_be_bytes(b[..2].try_into().unwrap());
-        if nfields == -1 {
-            self.pos += 2;
-            self.done = true;
-            return Ok(None);
-        }
-        if nfields < 0 {
-            return Err(format!("bad binary COPY field count {nfields}"));
-        }
-        let mut cur = 2usize;
-        let mut fields: Vec<Option<Vec<u8>>> = Vec::with_capacity(nfields as usize);
-        for _ in 0..nfields {
-            if b.len() < cur + 4 {
-                return Ok(None);
-            }
-            let len = i32::from_be_bytes(b[cur..cur + 4].try_into().unwrap());
-            cur += 4;
-            if len == -1 {
-                fields.push(None);
-                continue;
-            }
-            let len = usize::try_from(len).map_err(|_| format!("bad field length {len}"))?;
-            if b.len() < cur + len {
-                return Ok(None);
-            }
-            fields.push(Some(b[cur..cur + len].to_vec()));
-            cur += len;
-        }
-        self.pos += cur;
-        Ok(Some(fields))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Per-column decode plan
 // ---------------------------------------------------------------------------
 
@@ -366,6 +265,12 @@ struct ColPlan {
     kind: WireKind,
 }
 
+struct CopyPlan {
+    select: String,
+    cols: Vec<ColPlan>,
+    natts: usize,
+}
+
 fn wire_kind(type_oid: u32) -> Option<WireKind> {
     Some(match type_oid {
         BOOLOID => WireKind::Bool,
@@ -389,11 +294,9 @@ fn wire_kind(type_oid: u32) -> Option<WireKind> {
     })
 }
 
-/// SELECT list + decode plan + column-slot count (max attnum; dropped attrs
-/// stay `None`, matching the WAL heap decoder's attnum-1 indexing).
-fn column_plan(desc: &RelDescriptor) -> (String, Vec<ColPlan>, usize) {
+fn column_plan(desc: &RelDescriptor) -> CopyPlan {
     let mut select = String::new();
-    let mut plan = Vec::new();
+    let mut cols = Vec::new();
     let mut natts = 0usize;
     for a in &desc.attributes {
         natts = natts.max(a.attnum.max(0) as usize);
@@ -410,12 +313,16 @@ fn column_plan(desc: &RelDescriptor) -> (String, Vec<ColPlan>, usize) {
             select.push_str(", ");
         }
         select.push_str(&expr);
-        plan.push(ColPlan {
+        cols.push(ColPlan {
             attnum: a.attnum,
             kind,
         });
     }
-    (select, plan, natts)
+    CopyPlan {
+        select,
+        cols,
+        natts,
+    }
 }
 
 fn fixed<const N: usize>(raw: &[u8], what: &str) -> Result<[u8; N], String> {
@@ -423,53 +330,41 @@ fn fixed<const N: usize>(raw: &[u8], what: &str) -> Result<[u8; N], String> {
         .map_err(|_| format!("{what}: expected {N} bytes, got {}", raw.len()))
 }
 
-fn utf8(raw: Vec<u8>) -> Result<String, Vec<u8>> {
-    String::from_utf8(raw).map_err(|e| e.into_bytes())
+fn text_or_bytea(raw: &[u8], wrap: fn(String) -> ColumnValue) -> ColumnValue {
+    std::str::from_utf8(raw).map_or_else(|_| ColumnValue::Bytea(raw.to_vec()), |s| wrap(s.into()))
 }
 
 /// Decode one non-NULL wire field into the same [`ColumnValue`] variant the
 /// WAL heap decoder produces for that column.
-fn decode_field(kind: WireKind, raw: Vec<u8>) -> Result<ColumnValue, String> {
+fn decode_field(kind: WireKind, raw: &[u8]) -> Result<ColumnValue, String> {
     Ok(match kind {
-        WireKind::Bool => ColumnValue::Bool(fixed::<1>(&raw, "bool")?[0] != 0),
-        WireKind::Char => ColumnValue::Char(fixed::<1>(&raw, "char")?[0] as i8),
-        WireKind::Int2 => ColumnValue::Int2(i16::from_be_bytes(fixed(&raw, "int2")?)),
-        WireKind::Int4 => ColumnValue::Int4(i32::from_be_bytes(fixed(&raw, "int4")?)),
-        WireKind::Int8 => ColumnValue::Int8(i64::from_be_bytes(fixed(&raw, "int8")?)),
-        WireKind::Oid => ColumnValue::Oid(u32::from_be_bytes(fixed(&raw, "oid")?)),
-        WireKind::Float4 => ColumnValue::Float4(f32::from_be_bytes(fixed(&raw, "float4")?)),
-        WireKind::Float8 => ColumnValue::Float8(f64::from_be_bytes(fixed(&raw, "float8")?)),
-        WireKind::Date => ColumnValue::Date(i32::from_be_bytes(fixed(&raw, "date")?)),
-        WireKind::Time => ColumnValue::Time(i64::from_be_bytes(fixed(&raw, "time")?)),
-        WireKind::Timestamp => {
-            ColumnValue::Timestamp(i64::from_be_bytes(fixed(&raw, "timestamp")?))
-        }
+        WireKind::Bool => ColumnValue::Bool(fixed::<1>(raw, "bool")?[0] != 0),
+        WireKind::Char => ColumnValue::Char(fixed::<1>(raw, "char")?[0] as i8),
+        WireKind::Int2 => ColumnValue::Int2(i16::from_be_bytes(fixed(raw, "int2")?)),
+        WireKind::Int4 => ColumnValue::Int4(i32::from_be_bytes(fixed(raw, "int4")?)),
+        WireKind::Int8 => ColumnValue::Int8(i64::from_be_bytes(fixed(raw, "int8")?)),
+        WireKind::Oid => ColumnValue::Oid(u32::from_be_bytes(fixed(raw, "oid")?)),
+        WireKind::Float4 => ColumnValue::Float4(f32::from_be_bytes(fixed(raw, "float4")?)),
+        WireKind::Float8 => ColumnValue::Float8(f64::from_be_bytes(fixed(raw, "float8")?)),
+        WireKind::Date => ColumnValue::Date(i32::from_be_bytes(fixed(raw, "date")?)),
+        WireKind::Time => ColumnValue::Time(i64::from_be_bytes(fixed(raw, "time")?)),
+        WireKind::Timestamp => ColumnValue::Timestamp(i64::from_be_bytes(fixed(raw, "timestamp")?)),
         WireKind::TimestampTz => {
-            ColumnValue::TimestampTz(i64::from_be_bytes(fixed(&raw, "timestamptz")?))
+            ColumnValue::TimestampTz(i64::from_be_bytes(fixed(raw, "timestamptz")?))
         }
-        WireKind::Uuid => ColumnValue::Uuid(fixed(&raw, "uuid")?),
-        WireKind::Bytea => ColumnValue::Bytea(raw),
-        // Invalid UTF-8 surfaces as Bytea, same as the heap decoder
-        WireKind::Text | WireKind::CastText => match utf8(raw) {
-            Ok(s) => ColumnValue::Text(s),
-            Err(b) => ColumnValue::Bytea(b),
-        },
-        WireKind::Name => match utf8(raw) {
-            Ok(s) => ColumnValue::Name(s),
-            Err(b) => ColumnValue::Bytea(b),
-        },
-        WireKind::Json => match utf8(raw) {
-            Ok(s) => ColumnValue::Json(s),
-            Err(b) => ColumnValue::Bytea(b),
-        },
+        WireKind::Uuid => ColumnValue::Uuid(fixed(raw, "uuid")?),
+        WireKind::Bytea => ColumnValue::Bytea(raw.to_vec()),
+        WireKind::Text | WireKind::CastText => text_or_bytea(raw, ColumnValue::Text),
+        WireKind::Name => text_or_bytea(raw, ColumnValue::Name),
+        WireKind::Json => text_or_bytea(raw, ColumnValue::Json),
         // numeric_out text form; specials carry their flag
         WireKind::NumericText => {
-            let s = utf8(raw).map_err(|_| "numeric::text not utf8".to_string())?;
-            ColumnValue::Numeric(match s.as_str() {
+            let s = std::str::from_utf8(raw).map_err(|_| "numeric::text not utf8".to_string())?;
+            ColumnValue::Numeric(match s {
                 "NaN" => NumericKind::NaN,
                 "Infinity" => NumericKind::PInf,
                 "-Infinity" => NumericKind::NInf,
-                _ => NumericKind::Finite(s),
+                _ => NumericKind::Finite(s.into()),
             })
         }
     })
@@ -1168,31 +1063,27 @@ impl CopyBackfiller {
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         ));
 
-        let (select_list, plan, natts) = column_plan(desc);
-        let sql = format!("COPY (SELECT {select_list} FROM {qtable}) TO STDOUT (FORMAT binary)");
-        let stream = client.copy_out(&sql).await.context("backfill: COPY out")?;
-        futures::pin_mut!(stream);
-
-        let mut parser = CopyBinaryParser::new();
-        let mut rows = 0u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("backfill: COPY stream")?;
-            parser.push(&chunk);
-            while let Some(fields) = parser.next_row().map_err(anyhow::Error::msg)? {
-                if fields.len() != plan.len() {
-                    anyhow::bail!(
-                        "backfill: row has {} fields, plan expects {}",
-                        fields.len(),
-                        plan.len()
-                    );
-                }
-                let mut columns: Vec<Option<ColumnValue>> = vec![None; natts];
-                for (raw, cp) in fields.into_iter().zip(&plan) {
-                    let v = if let Some(raw) = raw {
-                        decode_field(cp.kind, raw).map_err(anyhow::Error::msg)?
-                    } else {
-                        ColumnValue::Null
-                    };
+        let plan = column_plan(desc);
+        let sql = format!(
+            "COPY (SELECT {} FROM {qtable}) TO STDOUT (FORMAT binary)",
+            plan.select
+        );
+        let rows = {
+            let byte_fields = vec![Type::BYTEA; plan.cols.len()];
+            let copy = client.copy_out(&sql).await.context("backfill: COPY out")?;
+            let stream = BinaryCopyOutStream::new(copy, &byte_fields);
+            futures::pin_mut!(stream);
+            let mut rows = 0u64;
+            while let Some(row) = stream.next().await {
+                let row = row.context("backfill: COPY stream")?;
+                let mut columns: Vec<Option<ColumnValue>> = vec![None; plan.natts];
+                for (i, cp) in plan.cols.iter().enumerate() {
+                    let raw: Option<&[u8]> = row.try_get(i).context("backfill: COPY field")?;
+                    let v = raw
+                        .map(|raw| decode_field(cp.kind, raw))
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?
+                        .unwrap_or(ColumnValue::Null);
                     columns[(cp.attnum - 1).max(0) as usize] = Some(v);
                 }
                 tup_tx
@@ -1212,7 +1103,8 @@ impl CopyBackfiller {
                     .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
                 rows += 1;
             }
-        }
+            rows
+        };
         drop(tup_tx);
 
         let outcome = drain
@@ -1295,59 +1187,6 @@ mod tests {
         }
     }
 
-    /// One-row binary COPY payload: header, row of `fields`, trailer.
-    fn copy_payload(rows: &[Vec<Option<&[u8]>>]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(COPY_SIGNATURE);
-        out.extend_from_slice(&0u32.to_be_bytes()); // flags
-        out.extend_from_slice(&0u32.to_be_bytes()); // no header extension
-        for fields in rows {
-            out.extend_from_slice(&(fields.len() as i16).to_be_bytes());
-            for f in fields {
-                match f {
-                    None => out.extend_from_slice(&(-1i32).to_be_bytes()),
-                    Some(b) => {
-                        out.extend_from_slice(&(b.len() as i32).to_be_bytes());
-                        out.extend_from_slice(b);
-                    }
-                }
-            }
-        }
-        out.extend_from_slice(&(-1i16).to_be_bytes());
-        out
-    }
-
-    #[test]
-    fn parser_handles_arbitrary_chunk_splits() {
-        let v42 = 42i64.to_be_bytes();
-        let payload = copy_payload(&[
-            vec![Some(&v42[..]), Some(b"hello"), None],
-            vec![Some(&v42[..]), None, Some(b"x")],
-        ]);
-        // Feed byte-by-byte: worst-case splits everywhere
-        let mut parser = CopyBinaryParser::new();
-        let mut rows = Vec::new();
-        for b in &payload {
-            parser.push(std::slice::from_ref(b));
-            while let Some(row) = parser.next_row().unwrap() {
-                rows.push(row);
-            }
-        }
-        assert!(parser.done, "trailer consumed");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][0].as_deref(), Some(&v42[..]));
-        assert_eq!(rows[0][1].as_deref(), Some(&b"hello"[..]));
-        assert_eq!(rows[0][2], None);
-        assert_eq!(rows[1][2].as_deref(), Some(&b"x"[..]));
-    }
-
-    #[test]
-    fn parser_rejects_bad_signature() {
-        let mut parser = CopyBinaryParser::new();
-        parser.push(b"NOTACOPYSTREAM------");
-        assert!(parser.next_row().is_err());
-    }
-
     #[test]
     fn plan_casts_out_of_matrix_and_skips_dropped() {
         let d = desc(vec![
@@ -1356,50 +1195,67 @@ mod tests {
             attr(3, "price", NUMERICOID, false),
             attr(4, "tags", 1009, false), // text[] — out of matrix
         ]);
-        let (select, plan, natts) = column_plan(&d);
-        assert_eq!(select, "\"id\", \"price\"::text, \"tags\"::text");
-        assert_eq!(natts, 4);
-        assert_eq!(plan.len(), 3, "dropped column not selected");
-        assert_eq!(plan[0].kind, WireKind::Int8);
-        assert_eq!(plan[1].kind, WireKind::NumericText);
-        assert_eq!(plan[2].kind, WireKind::CastText);
+        let plan = column_plan(&d);
+        assert_eq!(plan.select, "\"id\", \"price\"::text, \"tags\"::text");
+        assert_eq!(plan.natts, 4);
+        assert_eq!(plan.cols.len(), 3, "dropped column not selected");
+        assert_eq!(plan.cols[0].kind, WireKind::Int8);
+        assert_eq!(plan.cols[1].kind, WireKind::NumericText);
+        assert_eq!(plan.cols[2].kind, WireKind::CastText);
+        assert_eq!(plan.cols[2].attnum, 4);
     }
 
     #[test]
     fn decode_matches_wal_variants() {
         assert_eq!(
-            decode_field(WireKind::Int8, 7i64.to_be_bytes().to_vec()).unwrap(),
+            decode_field(WireKind::Int8, &7i64.to_be_bytes()).unwrap(),
             ColumnValue::Int8(7),
         );
         assert_eq!(
-            decode_field(WireKind::Bool, vec![1]).unwrap(),
+            decode_field(WireKind::Bool, &[1]).unwrap(),
             ColumnValue::Bool(true),
         );
         assert_eq!(
-            decode_field(WireKind::Date, 8000i32.to_be_bytes().to_vec()).unwrap(),
+            decode_field(WireKind::Date, &8000i32.to_be_bytes()).unwrap(),
             ColumnValue::Date(8000),
         );
         assert_eq!(
-            decode_field(WireKind::Text, b"abc".to_vec()).unwrap(),
+            decode_field(WireKind::Text, b"abc").unwrap(),
             ColumnValue::Text("abc".into()),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, b"12.50".to_vec()).unwrap(),
+            decode_field(WireKind::Name, b"orders").unwrap(),
+            ColumnValue::Name("orders".into()),
+        );
+        assert_eq!(
+            decode_field(WireKind::Json, b"{\"a\": 1}").unwrap(),
+            ColumnValue::Json("{\"a\": 1}".into()),
+        );
+        assert_eq!(
+            decode_field(WireKind::NumericText, b"12.50").unwrap(),
             ColumnValue::Numeric(NumericKind::Finite("12.50".into())),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, b"NaN".to_vec()).unwrap(),
+            decode_field(WireKind::NumericText, b"NaN").unwrap(),
             ColumnValue::Numeric(NumericKind::NaN),
         );
         assert_eq!(
-            decode_field(WireKind::CastText, b"{1,2}".to_vec()).unwrap(),
+            decode_field(WireKind::NumericText, b"Infinity").unwrap(),
+            ColumnValue::Numeric(NumericKind::PInf),
+        );
+        assert_eq!(
+            decode_field(WireKind::NumericText, b"-Infinity").unwrap(),
+            ColumnValue::Numeric(NumericKind::NInf),
+        );
+        assert_eq!(
+            decode_field(WireKind::CastText, b"{1,2}").unwrap(),
             ColumnValue::Text("{1,2}".into()),
         );
         // Wrong width is an error, not a silent misread
-        assert!(decode_field(WireKind::Int4, vec![0, 1]).is_err());
+        assert!(decode_field(WireKind::Int4, &[0, 1]).is_err());
         // Invalid UTF-8 degrades to Bytea like the heap decoder
         assert_eq!(
-            decode_field(WireKind::Text, vec![0xFF, 0xFE]).unwrap(),
+            decode_field(WireKind::Text, &[0xFF, 0xFE]).unwrap(),
             ColumnValue::Bytea(vec![0xFF, 0xFE]),
         );
     }
