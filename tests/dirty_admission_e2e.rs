@@ -17,7 +17,7 @@ use fx::spawn_txn;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use walshadow::mapping::NamespaceMapping;
+use walshadow::mapping::{NamespaceMapping, ToastMode};
 use walshadow::shadow::Shadow;
 
 fn skip_gate() -> bool {
@@ -607,5 +607,121 @@ async fn top_abort_with_ddl_appends_no_metadata_and_emits_no_rows() {
             .sum::<u64>(),
         0,
         "abort discards raw entries without decoding",
+    );
+}
+
+/// Distinct lengths so the mirror assertions name which value they mean.
+const BODY_PRE_SQL: &str = "repeat('pre-existing-generation!', 512)"; // 12288
+const BODY_PRE_LEN: &str = "12288";
+const BODY_DIRTY_SQL: &str = "repeat('written-under-ddl!', 512)"; // 9216
+const BODY_DIRTY_LEN: &str = "9216";
+
+/// `BEGIN; DDL; INSERT <toasted>; COMMIT` against a TOAST heap that already
+/// existed — the everyday migration shape.
+///
+/// The catalog touch defers *every* later record in the tree, so the chunk
+/// records stash even though their filenode resolved fine all along. That
+/// filenode carries no `XLOG_SMGR_CREATE` marker: PG never re-created it,
+/// because `ADD COLUMN` of a nullable column rewrites nothing. Commit-time
+/// resolution must read that as "not a generation" rather than "a generation
+/// I failed to observe" — the heap superseded nothing, so the mirror is owed
+/// no residual `O - B` sweep.
+///
+/// The pre-existing value's survival is the load-bearing assertion: a barrier
+/// queued here would tombstone every mirror TID below its as-of point, which
+/// is silent data loss rather than a stopped stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_then_toasted_insert_keeps_existing_toast_generation() {
+    if skip_gate() {
+        return;
+    }
+    let mut drill = build_drill_with(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA dtd;\n\
+         CREATE TABLE dtd.doc (id bigint PRIMARY KEY, body text);\n\
+         ALTER TABLE dtd.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n",
+        "dtd",
+        "walshadow-dirty-toast",
+        |cfg| cfg.toast.mode = ToastMode::ClickHouse,
+    )
+    .await;
+
+    // Clean transaction: the TOAST heap fills and mirrors with nothing
+    // dirty, so the next transaction meets it as an ordinary, long-lived
+    // generation — exactly the state a table reaches before a migration
+    let driver = spawn_txn(
+        &drill.source,
+        &format!(
+            "INSERT INTO dtd.doc (id, body) VALUES (1, {BODY_PRE_SQL});\n\
+             SELECT pg_switch_wal();\n"
+        ),
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+    fx::wait_query(
+        &drill.ch,
+        "SELECT length(argMax(body, _lsn)) FROM walshadow_test.doc WHERE id = 1",
+        BODY_PRE_LEN,
+        "pre-existing toasted value never landed",
+    )
+    .await;
+
+    let driver = spawn_txn(
+        &drill.source,
+        &format!(
+            "BEGIN;\n\
+             ALTER TABLE dtd.doc ADD COLUMN tag text;\n\
+             INSERT INTO dtd.doc (id, body, tag) VALUES (2, {BODY_DIRTY_SQL}, 'x');\n\
+             COMMIT;\n\
+             SELECT pg_switch_wal();\n"
+        ),
+    );
+    let shipped = fx::pump_segments_res(&mut drill.pipeline, 1, Duration::from_secs(45))
+        .await
+        .expect("toasted write under a catalog touch must not fail closed");
+    let _ = driver.join();
+    assert!(shipped >= 1, "dirty-toast segment never shipped");
+
+    let decoder_stats = drill.pipeline.sinks.decoder.stats_handle();
+    let emitter_stats = drill.pipeline.stats.clone();
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+    let ch = &drill.ch;
+
+    fx::wait_query(
+        ch,
+        "SELECT length(argMax(body, _lsn)) FROM walshadow_test.doc WHERE id = 2",
+        BODY_DIRTY_LEN,
+        "chunks stashed under the dirty tree never rehydrated",
+    )
+    .await;
+    // Barrier-free is the point: the pre-existing generation is still whole
+    fx::wait_query(
+        ch,
+        "SELECT length(argMax(body, _lsn)) FROM walshadow_test.doc WHERE id = 1",
+        BODY_PRE_LEN,
+        "pre-existing toasted value lost after the dirty-tree commit",
+    )
+    .await;
+    assert_eq!(
+        emitter_stats.toast_rewrite_barriers.load(Ordering::Relaxed),
+        0,
+        "no filenode rotated, so the commit owes the mirror no residual sweep",
+    );
+    assert_eq!(
+        emitter_stats.toast_mirror_truncates.load(Ordering::Relaxed),
+        0,
+        "and never a truncate",
+    );
+    // Without this the test could pass vacuously if the defer arm stopped
+    // stashing toast records
+    assert!(
+        decoder_stats.raw_stash_deferred.load(Ordering::Relaxed) >= 1,
+        "records must actually have taken the defer arm",
+    );
+    assert!(
+        emitter_stats.toast_stash_decoded.load(Ordering::Relaxed) >= 1,
+        "and the chunks must decode out of the stash, not be discarded",
     );
 }

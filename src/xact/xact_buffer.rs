@@ -46,7 +46,7 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 use walrus::pg::walparser::{RelFileNode, RmId};
 
-use crate::catalog::desc_log::{Ambiguity, DescriptorLog, LookupResult};
+use crate::catalog::desc_log::{Ambiguity, DescriptorLog, LogEntry, LogValue, LookupResult};
 use crate::catalog::pending::{PendingCatalog, PendingSlot};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats};
 use crate::decode::heap_decoder::{
@@ -632,11 +632,15 @@ pub async fn resolve_stash(
                         through_lsn: a.through_lsn,
                     });
                 }
-                let marker = buffer.lock().await.marker_lsn(rfn);
-                let Some(marker_lsn) = marker else {
+                // Only a rotation leaves a dead generation to sweep, and only
+                // a marker dates the sweep
+                if let Some(marker_lsn) = buffer.lock().await.marker_lsn(rfn) {
+                    barriers.push((rel.oid, marker_lsn));
+                } else if superseded_generation(log, rel.oid, rfn, mark.first_lsn) {
                     return Err(XactBufferError::IncompleteToastGeneration { relid: rel.oid });
-                };
-                barriers.push((rel.oid, marker_lsn));
+                } else {
+                    stats.toast_stash_in_place.fetch_add(1, Ordering::Relaxed);
+                }
                 outcomes.insert(rfn, StashOutcome::Toast(rel));
             }
             Ok((rel, valid_from)) => {
@@ -706,6 +710,15 @@ pub async fn resolve_stash(
         },
     );
     Ok(())
+}
+
+/// Whether `rfn` replaced a different live filenode for `oid`, read before
+/// the xact's first stashed record so this commit cannot answer for itself
+fn superseded_generation(log: &DescriptorLog, oid: u32, rfn: RelFileNode, first_lsn: u64) -> bool {
+    matches!(
+        log.predecessor_before(oid, first_lsn).as_deref(),
+        Some(LogEntry { value: LogValue::Present(prev), .. }) if prev.rfn != rfn
+    )
 }
 
 /// Per-xact + TOAST buffer with spill-to-disk overflow, keyed by `xid`

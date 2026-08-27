@@ -3326,6 +3326,9 @@ async fn populate_metrics(
         toast_stash_discarded_total: emitter_stats
             .map(|s| s.toast_stash_discarded.load(Ordering::Relaxed))
             .unwrap_or(0),
+        toast_stash_in_place_total: emitter_stats
+            .map(|s| s.toast_stash_in_place.load(Ordering::Relaxed))
+            .unwrap_or(0),
         stash_foreign_db_skipped_total: emitter_stats
             .map(|s| s.stash_foreign_db_skipped.load(Ordering::Relaxed))
             .unwrap_or(0),

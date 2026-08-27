@@ -1748,6 +1748,8 @@ crate::atomic_stats! {
         /// Stashed records discarded: filenode unresolvable post-commit
         /// (dropped or rotated away), end-state-neutral by AEL supersession
         pub toast_stash_discarded,
+        /// Stashed toast filenodes that rotated nothing, so queued no barrier
+        pub toast_stash_in_place,
         /// Stashed filenodes resolved to a foreign database at commit,
         /// cluster-level skip counted once per filenode
         pub stash_foreign_db_skipped,

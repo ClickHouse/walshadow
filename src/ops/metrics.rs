@@ -96,6 +96,7 @@ pub struct MetricsSnapshot {
     pub raw_stash_deferred_total: u64,
     pub toast_stash_decoded_total: u64,
     pub toast_stash_discarded_total: u64,
+    pub toast_stash_in_place_total: u64,
     pub stash_foreign_db_skipped_total: u64,
     /// Routed heaps sealed into transaction plans
     pub xact_plan_rows: u64,
@@ -681,6 +682,13 @@ pub fn render(snap: &MetricsSnapshot) -> String {
              (dropped or rotated away).",
             "counter",
             snap.toast_stash_discarded_total,
+        ),
+        (
+            "walshadow_toast_stash_in_place_total",
+            "Stashed toast filenodes that superseded no predecessor, so \
+             queued no residual barrier.",
+            "counter",
+            snap.toast_stash_in_place_total,
         ),
         (
             "walshadow_stash_foreign_db_skipped_total",
