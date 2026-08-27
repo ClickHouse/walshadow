@@ -1,143 +1,158 @@
-# runtime config resolver
+# Runtime configuration
 
-Layered config resolver: merge operator config layers into one
-pre-materialised [`ResolvedConfig`](../src/config.rs) and publish it on a
-`watch` channel subscribers snapshot from. Three layers, highest wins:
-**CLI flag > `<schema>.config_*` PG row > TOML**.
+Config resolver combines TOML, rows from PostgreSQL config tables, and explicit
+CLI flags into one snapshot. Later layers override earlier ones, in this order:
 
-The PG-row layer is the source-PG overlay: config rows a DBA writes via SQL
-into operator-owned tables on source PG, replicated through the WAL stream the
-daemon already decodes, and applied at each row's commit LSN under the same
-barrier fence the catalog applicator uses for DDL. TOML stays authoritative for
-bootstrap (connection params) and is the only surface when the overlay is
-disabled. CLI on top so an operator's recovery flag can't be stomped by a stale
-config row scrolling in via WAL replay.
+1. TOML
+2. Rows from `<schema>.config_*` tables
+3. Explicit CLI flags
+
+A DBA manages PostgreSQL config rows with SQL on source server. Walshadow reads
+these changes from its existing WAL stream and applies each change at its commit
+LSN. Config changes use same ordering barrier as DDL changes.
+
+TOML defines bootstrap settings, including connection parameters. It is also
+the only config source when PostgreSQL config tables are disabled. Explicit CLI
+flags have highest priority so recovery options remain fixed during WAL replay.
 
 ## Opt-in
 
-The overlay is off unless `[runtime_config] schema = "…"` names the source-PG
-schema housing the config tables (typical value `walshadow`). Empty string or
-field omitted: overlay disabled, daemon runs pure TOML+CLI, never queries source
-for overlay rows, never classifies their WAL writes. One switch turns the whole
-subsystem off, so deployments without the schema installed keep working
-untouched.
+PostgreSQL config tables are disabled by default. Set
+`[runtime_config] schema = "…"` to name their schema on source server. A typical
+value is `walshadow`. Omitting this field or setting it to an empty string keeps
+this feature disabled. In that case, daemon uses only TOML and CLI values. It
+does not query config tables or treat changes to them specially. Existing
+deployments therefore do not need these tables.
 
-## What resolves live vs boot-only
+## TOML load
 
-`ResolvedConfig` carries every knob that reloads without a restart:
+Config loading reads base TOML file and its `conf.d` fragments. CLI-derived
+`[source]` values provide defaults beneath file values. Loader rejects wrong
+types, out-of-range numbers, unknown values, and unknown keys. Each error names
+its config path, so a misspelled value cannot silently select a default.
 
-- `tables` — per-relation destination mapping, keyed `"<namespace>.<relname>"`
-- `namespaces` — per-namespace defaults (`auto_create`, `target_database`,
-  `drop_table_strategy`)
-- `column_rules` — per-column CH names and types from TOML and
-  `config_column`, applied when building mappings, DDL, and encoder plans
-- `drop_table_strategy` — global DROP fallback; per-namespace overrides it
-- `row_budget`, `byte_budget`, `flush_timeout` — emitter batch-seal triggers,
-  read live by the batcher per seal decision (ticker re-armed on change)
-- `compression` — per-INSERT wire codec, read live by the inserter, which
-  rebuilds its codec + reconnects on change
-- `retry_max_attempts` — CH client retry budget, read live by the inserter
-- `host` / `port` / `database` / `user` / `password` / `secure` — CH
-  connection; the inserter pool and `DdlApplicator` compare the conn tuple off
-  the watch and reconnect at a batch / apply boundary
-- `source` — whole `[source]` as a `SourceConn`: host/port/user/password/
-  dbname/sslmode plus `slot`, the physical slot the pump streams from
-  (`None` = slotless). TOML+CLI only: the overlay rows travel over the very
-  stream this connection carries, so a source row can't move the source. The
-  pump diffs the value off the watch and swaps its `SourceFeed` between chunks
-  after proving `system_id` and timeline; backfills opened later COPY from the
-  new address ([control.md](control.md) §Source endpoint move). Endpoint and
-  slot are one value because they take one reconnect — a slot binds at
-  `START_REPLICATION` — and a promotion target names its slot its own way.
-  `--slot` pins the name for the process
+Validation also covers `[table.*]` and `[namespace.*]` blocks, `columns` arrays,
+and rules involving multiple fields. Examples include choosing `attnum` or
+`name`, preventing a pinned projection from also being a pattern, and requiring
+a target or type where appropriate. `ctl apply` performs same validation before
+reloading daemon.
 
-The last five emitter knobs live on `ResolvedConfig` rather than boot-only on
-[`EmitterConfig`](../src/ch_emitter.rs) so a `config_global` row can retune
-batching / compression / retry mid-stream. The pipeline spawns from
-`EmitterConfig`, so `bin/stream.rs` reconciles these five back onto the boot
-`EmitterConfig` from the seeded resolved snapshot before spawn — boot state
-matches steady state.
+TOML fields, corresponding CLI flags, and PostgreSQL rows share one set of
+accepted values.
 
-Bootstrap fixed points stay on `EmitterConfig`, boot-only, never republished:
-toast store, `soft_delete`, pending capture cost controls (`[stream]
-pending_max_boundaries_per_xact`, `pending_max_hold_ms`;
-[desc_log.md](desc_log.md) Pending capture), `[memory]
-resident_payload_max` / `inline_value_max` (resident
-budget pool + leaf reserve sized at pipeline spawn — [emitter.md](emitter.md)
-Memory budget; `spill.dir` stays the `--spill-dir` CLI arg), and the backup
-archive (`[backup]` → `EmitterConfig.backup`, see below). These wire into
-pipeline stages at spawn.
+## Live and boot-only settings
 
-Slot *creation* is boot-only even though the name is not: walshadow creates
-the boot-named slot idempotently before pre-flight ([source.md](source.md))
-and creates nothing after. A slot created on a moved endpoint reserves WAL at
-that server's head, which proves nothing about coverage of the resume floor,
-so an absent slot is the operator's to pre-create; the pump refuses the swap
-and keeps streaming from the current feed until it exists. The old slot is
-left as it stands, since its retention is what a rollback to that server
-reads.
-`target_database`, `soft_delete`, `[stream] replicate_all`, and the
-`[runtime_config] schema` name thread into the DDL applicator at construction
-and carry across refreshes unchanged. Refreshed snapshots provide per-table
-destinations and scope. `replicate_all` (default `true`)
-auto-creates and replicates every user table whose namespace is not a system
-schema (`pg_*`, `information_schema`, the runtime-config schema); an explicit
-`auto_create` namespace or a `replicate = false` opt-out still wins.
+These settings can change without restarting daemon:
+
+- per-relation destination mapping, keyed on `(namespace, relname)`
+- per-namespace defaults: `auto_create`, `target_database`,
+  `drop_table_strategy`
+- per-column ClickHouse names and types from TOML and `config_column`, applied when
+  building mappings, DDL, and encoder plans
+- `[ch] drop_table_strategy`, used as global fallback for `DROP TABLE`.
+  Per-namespace settings override it
+- `[ch] row_budget`, `byte_budget`, and `flush_timeout_ms`, which decide when to
+  seal a batch. A new timeout applies to blocks opened after a change. An open
+  block keeps its existing deadline
+- `[ch] compression` and `retry_max_attempts`. Compression changes apply to
+  next batch and require a reconnect. Retry changes apply to next attempt
+- ClickHouse connection fields `[ch] host`, `port`, `database`, `user`,
+  `password`, and `secure`. Connection reopens at a batch or apply boundary
+- all `[source]` connection fields: `host`, `port`, `user`, `password`,
+  `dbname`, `sslmode`, and `slot`. An omitted slot means slotless replication.
+  Only TOML and CLI may change source connection because PostgreSQL config rows
+  arrive through that connection. Pump changes feeds between chunks after
+  verifying `system_id` and timeline. Backfills started after a change copy
+  from new address. See [Source endpoint move](control.md#source-endpoint-move).
+  Endpoint and slot change together because both require a reconnect and slot
+  is selected during `START_REPLICATION`. `--slot` fixes slot name for process
+
+Live batching, compression, and retry settings allow `config_global` changes to
+take effect during streaming. Pipeline starts with config loaded at startup, so
+startup and live resolution use same settings.
+
+Other settings apply only at startup because they determine pipeline structure
+or resource limits. These include toast store, `soft_delete`, pending capture
+cost controls (`[stream] pending_max_boundaries_per_xact` and
+`pending_max_hold_ms`; see [Pending capture](desc_log.md#pending-capture)),
+`[memory] resident_payload_max`, `[memory] inline_value_max` (see
+[Memory budget](emitter.md#memory-budget)), and backup archive (`[backup]`,
+described below). Spill directory is set only with `--spill-dir`.
+
+Slot name may change at runtime, but slot creation happens only at startup.
+Walshadow creates configured startup slot if needed before preflight checks.
+See [source.md](source.md). It does not create slots after startup. A slot
+created during an endpoint change would reserve WAL only from current server
+position and could not prove that required resume LSN is available. Operator
+must create missing slot before changing endpoints, and pump rejects endpoint
+change until slot exists. Walshadow leaves old slot in place so it can retain
+WAL needed for rollback.
+
+`target_database`, `soft_delete`, `[stream] replicate_all`, and
+`[runtime_config] schema` determine DDL applicator scope at startup and do not
+change on reload. Reloaded snapshots still contain per-table destinations.
+`replicate_all` (default `true`) auto-creates and replicates every user table
+outside system schemas (`pg_*`, `information_schema`, and configured runtime
+config schema). An explicit `auto_create` namespace or a
+`replicate = false` opt-out takes precedence.
 
 ## `[backup]` archive
 
-Storage for object-store bootstrap, WAL refill, and object-store backfill,
-parsed into a `walrus::config::Settings` (`parse_backup` reuses walrus's own
-`StorageSettings`/`S3Config`/`GcsConfig`).
+`[backup]` configures storage used for object-store bootstrap, WAL refill, and
+object-store backfill. URI scheme in `archive` selects storage backend. Settings
+for other backends are ignored.
 
 ```toml
 [backup]
-archive = "s3://my-bucket/walshadow"   # s3:// | gs:// | file://  — required; scheme picks the backend
+archive = "s3://my-bucket/walshadow"   # required: s3://, gs://, or file://
 region  = "us-east-1"                  # s3, optional (default us-east-1)
 endpoint = "https://minio.internal"    # s3, optional
 force_path_style = true                # s3, optional
-access_key = "…"                       # s3, optional — both keys → static creds, neither → IMDSv2
+access_key = "…"                       # s3, optional
 secret_key = "…"
 credentials_path = "/gcs-sa.json"      # gcs, optional
 ```
 
-Omitting section leaves `EmitterConfig.backup = None`: object-store
-bootstrap/backfill error out, and source WAL removal stops restart with an
-operator-actionable error. Daemon never substitutes a fresh base backup for
-missing archive coverage. See [bootstrap.md](bootstrap.md) restart contract.
+Set both `access_key` and `secret_key` to use static credentials. Omit both to
+use IMDSv2.
+
+Omitting this section disables archive. Object-store bootstrap and backfill then
+return errors. If source WAL has been removed, restart stops with an error that
+explains required operator action. Daemon does not create a new base backup to
+replace missing archive coverage. See restart contract in
+[bootstrap.md](bootstrap.md).
 
 ## `[bootstrap]` shadow seeding
 
-`[backup]` says where the bucket is; `[bootstrap]` says whether to seed a
-shadow from it. Parsed into `EmitterConfig.bootstrap`, boot-only, and merged
-with the matching `--bootstrap-*` flags under the usual CLI > TOML rule —
-per field, so `--bootstrap-mode direct` alone still reads `backup_name` from
-TOML.
+`[backup]` selects archive location. `[bootstrap]` controls whether startup
+seeds a shadow from that archive. These settings apply only at startup.
+Matching `--bootstrap-*` flags override individual TOML fields. For example,
+`--bootstrap-mode direct` changes mode but still reads `backup_name` from TOML.
 
 ```toml
 [bootstrap]
-mode = "object_store"            # off | direct | object_store
+mode = "object_store"            # off, direct, or object_store
 backup_name = "LATEST"           # LATEST, or a literal base_… name
-object_store_parallelism = 8     # unset keeps min(4, num_cpus)
+object_store_parallelism = 8     # default is min(4, num_cpus)
 ```
 
-Default `mode` is `direct` when `--bootstrap-shadow-data-dir` is set (fresh
-boot does an initial copy, then streams), else `off`: external-shadow runs
-have nothing to seed and `resolve_shadow_start` rejects a non-`off` mode there.
+Default mode is `direct` when `--bootstrap-shadow-data-dir` is set. A fresh
+start then performs an initial copy before streaming. Otherwise, default mode
+is `off`. Runs using an external shadow have nothing to seed and reject any
+other mode.
 
-An unrecognised `mode` and a non-positive `object_store_parallelism` both
-fail at parse, so a typo cannot read as `off` and silently skip bootstrap.
-The last two keys apply only to `object_store`; set under another mode they
-log a warning and are ignored.
+Loader rejects unknown modes and non-positive `object_store_parallelism`.
+`backup_name` and `object_store_parallelism` apply only in `object_store` mode.
+Other modes log a warning and ignore them.
 
-`--bootstrap-shadow-data-dir` has no TOML surface on purpose. It decides
-whether the daemon owns a shadow lifecycle at all, which is a
-per-invocation recovery decision like `--start-lsn` and `--ignore-cursor`,
-and CLI-only keeps a stale config file from stomping it.
+`--bootstrap-shadow-data-dir` is available only as a CLI flag. It determines
+whether daemon manages shadow lifecycle for this run, like `--start-lsn` and
+`--ignore-cursor`. Keeping it out of TOML prevents an old config file from
+changing a recovery decision.
 
 ## Name patterns
 
-Set `match` on a table or column entry to choose how names are read:
+Set `match` on a table or column entry to choose how names are matched:
 
 - `exact` matches a literal name and is default
 - `glob` supports `*`, `?`, character classes such as `[a-z]`, and choices
@@ -163,15 +178,15 @@ VALUES ('app', 'events_*', 'glob', true);
 Use glob for common prefix and suffix matches. Use regex when glob cannot
 express a pattern, for example `v[0-9]+_.*`.
 
-Matching patterns apply from least specific to most specific. Longer combined
-namespace and table patterns are more specific. An exact entry applies last.
-Runtime config wins when it repeats a TOML pattern. Any matching pattern with
-`replicate = false` blocks pattern-based opt-ins, but an exact entry can
-override it.
+Walshadow applies matching patterns from least specific to most specific.
+Longer combined namespace and table patterns are more specific. Exact entries
+apply after patterns. A PostgreSQL config row overrides an identical TOML
+pattern. If any matching pattern sets `replicate = false`, it blocks opt-ins
+from other patterns. An exact entry may override that result.
 
 `config_column.match` applies to namespace, table, and column names together.
-Invalid patterns and unknown match modes are rejected and logged. Other rules
-remain active.
+Walshadow rejects and logs invalid patterns and unknown match modes. Other
+valid rules remain active.
 
 Pattern table rules also control scope:
 
@@ -184,148 +199,121 @@ Pattern table rules also control scope:
 
 ## `<schema>.config_*` tables
 
-DBA runs [`sql/runtime_config_install.sql`](../sql/runtime_config_install.sql)
-(schema name via psql var `walshadow_schema`, default `walshadow`). The daemon
-NEVER writes these tables — single writer is source PG, single reader is the
-daemon — preserving walshadow's read-only-source posture. Four tables:
+Install config tables with
+[`sql/runtime_config_install.sql`](../sql/runtime_config_install.sql). Set psql
+variable `walshadow_schema` to choose schema name; default is `walshadow`.
+Walshadow reads these tables but never writes them, so source access remains
+read-only from daemon. Installation creates four tables:
 
-- `config_global` — singleton (`id smallint PK CHECK (id = 1)`): `row_budget`,
+- `config_global` contains one row, enforced by
+  `id smallint PRIMARY KEY CHECK (id = 1)`. It configures `row_budget`,
   `byte_budget`, `flush_timeout_ms`, `compression`, `retry_max_attempts`,
   `drop_table_strategy`
-- `config_namespace` — key `namespace`: `target_database`, `auto_create`,
-  `drop_table_strategy`
-- `config_table` — key `(namespace, relname)`: `match` (`exact`, `glob`, or
-  `regex`), `target_database`, `target_table`
-  (each NULL = derived: namespace default / source relname), `replicate`,
-  `initial_load` (`none`, `copy`, `base_backup`, `object_store`).
-  Name key, not relfilenode, rfn is unknown at row-insert time for
-  forward-declared tables
-- `config_column` — key `(namespace, relname, attname)`: `match` (`exact`,
-  `glob`, or `regex`), `target_type`
+- `config_namespace` uses `namespace` as its key. It configures
+  `target_database`, `auto_create`, and `drop_table_strategy`
+- `config_table` uses `(namespace, relname)` as its key. It configures `match`
+  (`exact`, `glob`, or `regex`), `target_database`, `target_table`, `replicate`,
+  and `initial_load` (`none`, `copy`, `base_backup`, or `object_store`). A NULL
+  target database uses namespace default. A NULL target table uses source
+  relation name. Key uses relation name instead of relfilenode because a
+  forward-declared table has no relfilenode when config row is inserted
+- `config_column` uses `(namespace, relname, attname)` as its key. It configures
+  `match` (`exact`, `glob`, or `regex`) and `target_type`
 
-Every column is nullable and NULL means "daemon default / TOML applies", so the
-schema grows additively: a newer daemon reading an older install still works.
-TOML `[table.*]` blocks take the same mode strings; omitting the key there
-matches SQL NULL. All four carry `REPLICA IDENTITY FULL`, see decode below.
+Nullable config values use daemon default or TOML value when set to NULL. This
+allows new config fields to be added without breaking a newer daemon against an
+older installation. TOML `[table.*]` blocks accept same mode strings. Omitting a
+TOML key has same effect as SQL NULL. All four tables use
+`REPLICA IDENTITY FULL` for WAL decoding described below.
 
-## Decode + interpret
+## Reading config writes
 
-No `config_decoder` task, no relfilenode filter. Config-table writes ride the
-normal heap-decode path and are intercepted in
-[`BufferingDecoderSink::on_record`](../src/xact_buffer.rs) after decode, before
-routing to CH: a write is a config write when its resolved descriptor has
-`rel_name.namespace == <schema>` and `ConfigTableKind::from_relname(name)` matches
-one of the four tables. Detection by resolved relation name is **rotation-proof
-for free** — TRUNCATE / VACUUM FULL / rewrite rotates the relfilenode but the
-decode path re-resolves every descriptor, so the name still matches, with no
-frozen filter to refetch. Config writes never reach CH (the implicit namespace
-filter that keeps walshadow's own config out of the target).
+Walshadow recognizes a config change by resolved relation name: configured
+schema and one of four table names. It does not rely on relfilenode, so
+`TRUNCATE`, `VACUUM FULL`, and table rewrites require no config refresh. Config
+changes are excluded from ClickHouse replication.
 
-[`runtime_config::interpret`](../src/runtime_config.rs) turns each config tuple
-into a typed `ConfigEvent` (`GlobalUpserted`/`GlobalCleared`,
-`Namespace{Upserted,Removed}`, `Table{Upserted,Removed}`,
-`Column{Upserted,Removed}`). At walshadow's `wal_level=logical` floor PG logs the
-new tuple whole (prefix/suffix compression is off for logically-logged
-relations), so INSERT and UPDATE already carry every column; `interpret`
-reconstructs each from the record alone (INSERT/UPDATE from the new tuple,
-DELETE from the old image for the row key) with no dependency on prior in-daemon
-state and no before-image lookup. `REPLICA IDENTITY FULL` guarantees the DELETE
-old image carries those key columns regardless of the table's primary-key shape,
-at negligible WAL cost (operator-scale writes, tiny rows). Events carry whole
-typed rows; values are validated late, at resolver merge, not here.
+Each WAL record contains enough information to read a complete config row
+without earlier in-memory state or a before-image lookup. With minimum supported
+`wal_level=logical`, PostgreSQL logs complete new tuples for `INSERT` and
+`UPDATE`. `REPLICA IDENTITY FULL` supplies row key for `DELETE`. Extra WAL cost
+is small because config writes are infrequent and rows are small. Resolver
+validates values when it merges config, not while decoding WAL.
 
 ## Apply at commit LSN
 
-```rust
-enum DrainEntry {
-    Catalog(SchemaEvent),
-    Config(ConfigEvent),
-}
-```
+A config row takes effect once at its commit LSN. Walshadow orders it with heap
+rows and catalog events using same LSN barrier used for DDL. Column changes also
+invalidate cached encoder plans.
 
-`DrainEntry::Config` events ride the same `ordered_events` interleave and barrier
-apply as `DrainEntry::Catalog`: interpreted events stamp `(xid, source_lsn)` and
-merge into the heap stream by LSN. One apply site owns the enum: the executor's
-plan replay in [`pipeline/reorder.rs`](../src/emit/pipeline/reorder.rs), each
-control entry fenced and applied at its pinned walk position.
+Routing state is fixed for an entire transaction. See Transaction planner in
+[emitter.md](emitter.md). A config event does not affect transaction currently
+being planned. Transactions planned before config commit use old routing state,
+and transactions planned after it use new state. One transaction never mixes
+routing versions, and a config change does not reroute rows from its own
+transaction.
 
-`ConfigResolver::apply_config_event` mutates the overlay, **writes the live
-`MappingHandle` synchronously under the barrier fence**, bumps
-`invalidation_epoch` for shape-changing (`Column*`) events, then republishes.
-`watch` republish stays the mechanism only for the barrier-free
-contexts (boot seed, SIGHUP) and the DDL applicator's own `DdlConfig` refresh.
+## Initial config load
 
-Granularity is whole-transaction ([emitter.md](emitter.md) Transaction
-planner): each transaction plans entirely under one frozen route state.
-The planner's route view folds in-walk **catalog** entries into its
-local view (an auto-create `Added` routes same-xact trailing rows), but
-**config** entries deliberately do not — a transaction planned before a
-config commit routes wholly under pre-config state, one planned after
-wholly under post; no transaction ever mixes route versions, and a
-config row never retroactively re-routes its own xact's rows. The real
-side effect lands once, at executor replay, under the fence.
+At startup, Walshadow loads PostgreSQL config tables after catalog seed and
+before starting WAL pump. WAL becomes its only source for later changes.
+Initial loads for pinned TOML mappings start after PostgreSQL config is loaded,
+so SQL include and exclude rules take precedence. See [add_table.md](add_table.md)
+for backup-based initial load modes.
 
-## Boot seed
+Initial load also verifies installation. If TOML names a schema that does not
+contain expected config tables, daemon refuses to start. An installed but empty
+schema uses TOML defaults and behaves like a TOML-only deployment.
 
-`bin/stream.rs::seed_runtime_config` runs between catalog seed and pump start,
-when the overlay is enabled: four `SELECT`s through the source sidecar libpq
-connection populate a `ConfigOverlay`, handed to `ConfigResolver::seed_overlay`,
-then the pump starts and WAL becomes the only config source. TOML
-`initial_load` for pinned mappings dispatches after this seed
-([add_table.md](add_table.md) covers the backup-sourced modes), so SQL
-inclusion/exclusion rows win. The `config_global` read doubles as the install
-probe: a missing table errors there, so a schema
-named in TOML but not installed refuses to start rather than silently no-op
-(explicit opt-in). A present-but-empty `config_global` is fine — greenfield
-falls through to TOML defaults, behaviour identical to TOML-only.
+## Merge and reload
 
-## Resolver
+Each merge starts with TOML, applies PostgreSQL config, then applies explicit CLI
+flags. Resolver builds a complete replacement snapshot before publishing it.
+Subscribers therefore see either old snapshot or new snapshot, never a partial
+update. Config apply and concurrent reload are atomic relative to each other.
 
-`ConfigResolver` owns the `watch::Sender` and, behind one lock, the two mutable
-merge inputs (TOML `base`, PG `overlay`) so an apply is atomic against a
-concurrent SIGHUP:
+A reload reads TOML again and merges current PostgreSQL and CLI values.
+Reloading ignores connection parameters from file. Read and parse errors keep
+last valid snapshot active. SIGHUP and control socket command `config reload`
+use same path described in [control.md](control.md). Reload remains available
+for process lifetime, although a missing config-table installation still fails
+startup. In metrics-only mode without `--ch-config`, reload does nothing.
 
-- `new(base, cli, toml_path, mapping, invalidation_epoch)` builds the initial
-  (overlay-empty) snapshot and returns the shared resolver plus a seeded receiver
-- `resolve(base, overlay, cli)` merges one snapshot: TOML base, then the overlay,
-  then explicit CLI on top. Rebuilt whole each time, so a snapshot never tears
-- `seed_overlay(overlay)` replaces the overlay wholesale (boot seed) + republishes
-- `apply_config_event(event)` is the live WAL path above
-- `reload()` (SIGHUP) re-reads TOML, re-merges overlay + CLI, publishes.
-  Connection params in the reloaded file are ignored; read/parse errors leave the
-  last snapshot in effect (no send on failure)
-
-CLI overrides are `Option<T>`: `Some` wins over overlay + TOML and survives
-reload, `None` defers. Two flags: `--drop-table-strategy` and
+Only explicitly supplied CLI flags override other config sources and continue
+to do so after reload. Omitted flags leave selection to PostgreSQL config and
+TOML. This rule currently applies to `--drop-table-strategy` and
 `--ch-flush-timeout-ms`.
 
-## Failure containment (Regime A)
+## Invalid runtime values
 
-WAL pump alive, a config value malformed: the resolver validates at merge and
-rejects the offending value, keeping the pre-overlay value in effect. Never
-crashes, never pauses the pump, never abandons other keys. Per-field:
-`drop_table_strategy` via `DropTableStrategy::parse`; `row_budget`/`byte_budget`
-via `usize` conversion + `> 0`; `flush_timeout_ms`/`retry_max_attempts` via
-unsigned conversion; `compression` via `CompressionChoice::parse` **then
-`build_codec`**, so a codec unsupported at compile time (e.g. zstd with the
-feature off) is rejected at merge, never surfaced as a fatal when the inserter
-reconnects; `config_column.target_type` via `TypeAst::parse` (wire
-compatibility needs the descriptor, so that check falls back at plan build —
-§column overrides). Rejections increment a counter
-(`ConfigResolver::rejections`) and log at WARN. Validation runs at merge, not
-at decode.
+Resolver validates PostgreSQL config values during merge. If a value is
+invalid, it rejects that value and keeps value selected before PostgreSQL layer.
+WAL pump continues, and other valid keys still apply. Each rejection increments
+a counter and writes a `WARN` log entry.
 
-`config_table.target_database` / `target_table` override the destination only
-of a table already mapped by TOML (which carries the column projection); a row
-for an unmapped table would need column auto-derivation, so it is skipped with
-a WARN rather than emitting a column-less INSERT. NULL leaves that part of the
-destination unchanged.
+Validation checks following constraints:
+
+- `drop_table_strategy` must use an accepted value
+- `row_budget` and `byte_budget` must be positive and within supported ranges
+- `flush_timeout_ms` and `retry_max_attempts` must be within supported ranges
+- `compression` must name an accepted codec compiled into current build. For
+  example, a build without zstd support rejects zstd during merge instead of
+  failing when inserter reconnects
+- `config_column.target_type` must parse as a ClickHouse type. Compatibility
+  with source descriptor is checked later when building a plan, as described in
+  [Column overrides](#column-overrides)
+
+`config_table.target_database` and `target_table` may override destination only
+for tables already mapped in TOML, which supplies column projection. A row for
+an unmapped table would require deriving its columns, so Walshadow skips it and
+logs a warning instead of sending an `INSERT` without columns. NULL leaves that
+part of destination unchanged.
 
 ## Column overrides
 
-Column rules use same precedence as name patterns: least specific patterns
-first, followed by an exact rule. When TOML and `config_column` define same
-rule, `config_column` wins.
+Column rules use same precedence as name patterns. Walshadow applies least
+specific patterns first and exact rules last. When TOML and `config_column`
+define same rule, `config_column` takes precedence.
 
 - TOML name rules may set ClickHouse column names and types. New tables and
   columns use these values in mappings and DDL. A custom type removes any
@@ -333,141 +321,62 @@ rule, `config_column` wins.
 - `config_column` may change encoder type for an existing column. It cannot
   rename a ClickHouse column or alter its type.
 
-`config_column.target_type` reaches the emitted projection in two stages,
-because the two failure classes surface at different points:
+Walshadow applies `config_column.target_type` in two stages because syntax and
+source compatibility become known at different times:
 
-- **Merge (resolver):** the type string parses via `TypeAst::parse` or the row
-  is rejected (rejections tick, WARN, prior value kept) — a malformed type must
-  never reach a `TablePlan` build, whose error would poison the batcher. The
-  overlay mirrors the PG row (bad value included), so "prior" here is the last
-  accepted override, carried forward off the previous published snapshot; a
-  boot seed of a bad row has no prior, the column keeps its descriptor-derived
-  type. An explicit row DELETE clears the override — retention covers bad
-  updates only
-- **Plan build (batcher):** `TablePlan::build` is where the descriptor meets
-  the mapping, so attname→attnum resolves exactly there; the override swaps the
-  column's encode type only when wire-compatible. `encode_value` performs no
-  arithmetic conversion, so admissibility (`override_wire`) is: a
-  Decimal-encoded source takes any Decimal, String, or a signed
-  Int32/64/128/256 as a scale-0 decimal (`numeric(38,0)` → `Int128`); a
-  string-shaped source takes string-shaped; a fixed-width source takes a
-  same-width non-Decimal reinterpretation (`Int32` → `UInt32`). Inadmissible
-  (`numeric` → `Float32`, `Int32` → `String`) keeps the default with a WARN
+1. During merge, target type must parse as a ClickHouse type. Resolver rejects
+   a malformed type, increments rejection counter, logs a warning, and keeps
+   last accepted override. Last accepted override may differ from current
+   PostgreSQL row after an invalid update. If initial config load contains an
+   invalid value, no earlier override exists and column keeps type derived from
+   source descriptor. Deleting a config row explicitly clears its override.
+2. During plan construction, source descriptor and target mapping are both
+   available. Walshadow resolves `attname` to `attnum` and uses override only if
+   it is compatible with wire encoding. Encoding does not perform arithmetic
+   conversion. A Decimal source may use any Decimal, String, or signed
+   `Int32`, `Int64`, `Int128`, or `Int256` as a scale-zero decimal. For example,
+   `numeric(38,0)` may use `Int128`. A string-shaped source requires a
+   string-shaped target. A fixed-width source may use a same-width, non-Decimal
+   reinterpretation, such as `Int32` to `UInt32`. Incompatible conversions,
+   such as `numeric` to `Float32` or `Int32` to `String`, keep default type and
+   produce a warning.
 
-Fencing needs no extra machinery: a `Column*` apply runs under the reorder
-barrier whose fence already `FlushAll`ed the batcher, clearing its plan cache,
-so post-apply rows rebuild plans against the republished snapshot. The
-dedicated backfill tails (COPY / backup passes) receive the same watch
-receiver, so backfilled rows encode under the same overrides as WAL-driven
-rows. The greenfield bootstrap tail stays TOML-only (no resolver exists yet at
-that phase).
+Column changes run under reorder barrier. Barrier flushes batcher and clears its
+plan cache before publishing new snapshot, so later rows rebuild plans from new
+config. COPY and backup backfills read same snapshot and use same overrides.
+Initial bootstrap of a new deployment uses only TOML because resolver is not
+yet running.
 
-Runtime overrides change encoder projection only. Retyping an existing
-ClickHouse column remains an operator migration.
-
-## Subscribers
-
-Consumers snapshot the receiver; the overlay feeds only the resolver merge
-point, not the consumer set. Four consumers:
-
-- **Routing map refresher** (`spawn_mapping_refresher`, `bin/stream.rs`) — on
-  each republish full-swaps the live `MappingHandle` the planner's route view
-  resolves from. (The
-  WAL apply path writes this handle directly under the fence; the refresher
-  covers the barrier-free republishes)
-- **DDL applicator** ([`ch_ddl::DdlApplicator`](../src/ch_ddl.rs)) — folds a
-  republished snapshot into its `DdlConfig` (namespaces + drop strategy) via
-  `refresh_config` at the top of each `apply`
-- **Batcher** ([`pipeline/batcher.rs`](../src/pipeline/batcher.rs)) — reads
-  `row_budget`/`byte_budget`/`flush_timeout` off the watch per seal decision; a
-  new `flush_timeout` applies to blocks armed after the change, open blocks keep
-  the deadline they armed; feeds `ResolvedConfig::columns` to each `TablePlan`
-  build (§column overrides)
-- **Inserter** ([`pipeline/inserter.rs`](../src/pipeline/inserter.rs)) — reads
-  `retry_max_attempts` per attempt loop and `compression` at each batch boundary,
-  reconnecting when the codec changes
-
-## SIGHUP
-
-`run` installs the handler at boot; install failure is fatal, so a running
-daemon always has the reload path armed. `spawn_sighup_reload` holds the
-process-lifetime `Reloader` and calls `Reloader::reload()` on each signal —
-the same path as the control socket's `config reload`
-([control.md](control.md)). The `Reloader` carries the running session's
-resolver (`set_resolver`); with none registered (metrics-only run, no
-`--ch-config`) reload is a no-op tap.
+Runtime overrides change only encoder projection. Operator must migrate an
+existing ClickHouse column when its stored type needs to change.
 
 ## Mapping lifecycle
 
-Republish rebuilds the routing map whole from the merge inputs, so every
-runtime mapping mutation must be recorded in a layer republish rebuilds from.
-The resolver owns that state: opt-in mappings (`materialize_opt_in`) and a
-`derived` layer holding `auto_create`-derived mappings
-(`register_derived_mapping`) plus ALTER diff folds (`apply_schema_diff`).
-The `DdlApplicator` routes through these when built `with_resolver`; its
-direct-handle writes remain only for resolver-less contexts (bootstrap drain,
-tests), where nothing republishes.
+Publishing config rebuilds complete routing map from resolver inputs. Resolver
+therefore stores every runtime mapping change. It maintains explicit opt-in
+mappings and a derived layer for mappings created by `auto_create` or updated
+from source `ALTER TABLE` changes.
 
-Layer order at resolve: TOML `base`, then `derived`, then opt-in — so an
-explicit opt-in beats an auto-derivation, and a diff fold on a TOML-owned
-mapping lands copy-on-write in `derived`, shadowing the TOML entry (a SIGHUP
-TOML re-read cannot revert an applied source ALTER; restart re-derives from
-TOML + WAL replay). Source `DROP TABLE` under strategy=Drop forgets the
-derived/opt-in entry (`forget_derived_mapping`) so a future `Added`
-re-derives columns; an overlay `replicate=true` row re-parks as a
-forward-declaration so a source re-create re-materialises the opt-in against
-the fresh descriptor. A TOML-pinned mapping is operator-managed and stays;
-strategy=Drop hands dest lifecycle to source DDL, so `apply_added` re-creates
-the dest from the mapping on a source re-create — create → drop → create
-round-trips without operator CH work.
+Resolution starts with TOML, then applies derived mappings, then explicit
+opt-ins. An explicit opt-in therefore overrides automatic derivation. Changes
+from source `ALTER TABLE` are copied into derived layer and override original
+TOML mapping. A SIGHUP reload cannot undo an applied source change. After a
+restart, Walshadow derives state again from TOML and WAL replay.
 
-## Deferred
+With `drop_table_strategy = "drop"`, source `DROP TABLE` removes derived or
+opt-in mapping so a later `CREATE TABLE` can derive new columns. If a PostgreSQL
+config row still sets `replicate = true`, resolver keeps it as a declaration
+for a table that does not yet exist. Recreating source table then materializes
+mapping from new descriptor. A pinned TOML mapping remains because operator
+manages it. Drop strategy recreates its ClickHouse destination from that
+mapping, so a create, drop, and recreate sequence needs no separate ClickHouse
+change.
 
-Unbuilt signal commands, net-new knobs, degraded mode, and resolver-source
-observability live in
-[future/runtime_config_from_pg.md](future/runtime_config_from_pg.md).
+## Related documentation
 
-## Acceptance drills
-
-- **Disabled by default.** TOML omits `[runtime_config].schema` or sets `""`.
-  Daemon never queries source for overlay rows, never classifies config writes
-- **Greenfield seed.** Schema installed, all config tables empty. Behaviour
-  identical to TOML-only with the same values
-- **Not installed.** `[runtime_config].schema` names a schema that isn't
-  installed. `seed_runtime_config` errors on the `config_global` probe; daemon
-  refuses to start
-- **Namespace flip.** TOML `auto_create = false`; operator inserts
-  `config_namespace ('public', 'default', true)`. Subsequent
-  `CREATE TABLE public.events(...)` materialises on CH
-- **Mapping-add ordering.** `INSERT config_table` commits, then rows into the
-  now-mapped table commit. CH receives the rows under the post-config target;
-  a transaction planned before the opt-in commit instead discards whole
-  (whole-transaction granularity, never a mixed-route xact)
-- **Batch tunables live.** `config_global.row_budget = 1000`,
-  `flush_timeout_ms = 250`; emitter flushes at the smaller trigger. Bump to 100k
-  and observe larger batches — batcher picks up the resolved snapshot mid-pipeline
-- **Precedence.** CLI `--drop-table-strategy=warn` + `config_global` row `drop`
-  + TOML `retain` resolves to `warn`. Drop the CLI flag → `drop`. Truncate the
-  row → `retain`
-- **Validation rejection.** Insert `config_global.compression = 'brotli'` (or a
-  negative budget). Resolver rejects, `rejections` ticks, daemon stays up, other
-  keys unaffected; UPDATE to a valid value and the next apply picks it up
-- **Target-type override.** Source column `numeric(38,0)` default-maps to
-  `Decimal(38, 0)`. Operator sets `config_column.target_type = 'Int128'`; the
-  barrier flush rebuilds the plan, post-config rows encode as scale-0 `Int128`.
-  Setting `'Float32'` instead keeps `Decimal(38, 0)` with a WARN
-  (wire-incompatible); an unparseable string rejects at merge, `rejections`
-  ticks
-- **Auto-create survives republish.** `auto_create` namespace, source runs
-  `CREATE TABLE` + INSERTs (mapping auto-derived), then any config row applies
-  (republish full-swap). Subsequent INSERTs still reach CH — the derived
-  mapping is resolver-owned, not clobbered
-
-## Cross-links
-
-- [emitter.md](emitter.md) — `MappingHandle`, `NamespaceMapping`, `TablePlan`;
-  the `ResolvedConfig` shape
-- [shadow.md](shadow.md) — `ShadowCatalog::subscribe` feeds the DDL applicator
-  that refreshes from the resolver
-- [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) —
-  unbuilt signal commands, knobs, degraded mode, and observability
+- [emitter.md](emitter.md) describes routing maps, namespace defaults, encoder
+  plans, and resolved snapshot
+- [shadow.md](shadow.md) describes catalog updates sent to DDL applicator and
+  config refreshes from resolver
+- [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) describes
+  possible signal commands, config fields, degraded mode, and observability

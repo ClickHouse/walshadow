@@ -89,7 +89,7 @@ pub struct TableRow {
 impl TableRow {
     pub fn is_pattern(&self) -> bool {
         !matches!(
-            MatchKind::parse(self.match_kind.as_deref().unwrap_or_default()),
+            self.match_kind.as_deref().unwrap_or_default().parse(),
             Ok(MatchKind::Exact)
         )
     }
@@ -110,18 +110,25 @@ pub enum InitialLoadMode {
     ObjectStore,
 }
 
-impl InitialLoadMode {
-    pub fn parse(s: &str) -> Option<Self> {
+impl std::str::FromStr for InitialLoadMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
         match s {
-            "none" => Some(Self::None),
-            "copy" => Some(Self::Copy),
-            "base_backup" => Some(Self::BaseBackup),
-            "object_store" => Some(Self::ObjectStore),
-            _ => None,
+            "none" => Ok(Self::None),
+            "copy" => Ok(Self::Copy),
+            "base_backup" => Ok(Self::BaseBackup),
+            "object_store" => Ok(Self::ObjectStore),
+            other => Err(format!(
+                "unknown initial_load mode `{other}` (expected none / copy / \
+                 base_backup / object_store)"
+            )),
         }
     }
+}
 
-    /// Inverse of [`Self::parse`]; ledger serialization + metrics labels.
+impl InitialLoadMode {
+    /// Canonical ledger and metric label
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -732,16 +739,10 @@ mod tests {
 
     #[test]
     fn initial_load_parse_accepts_explicit_none() {
-        assert_eq!(InitialLoadMode::parse("none"), Some(InitialLoadMode::None));
-        assert_eq!(InitialLoadMode::parse("copy"), Some(InitialLoadMode::Copy));
-        assert_eq!(
-            InitialLoadMode::parse("base_backup"),
-            Some(InitialLoadMode::BaseBackup)
-        );
-        assert_eq!(
-            InitialLoadMode::parse("object_store"),
-            Some(InitialLoadMode::ObjectStore)
-        );
-        assert_eq!(InitialLoadMode::parse("null"), None);
+        assert_eq!("none".parse(), Ok(InitialLoadMode::None));
+        assert_eq!("copy".parse(), Ok(InitialLoadMode::Copy));
+        assert_eq!("base_backup".parse(), Ok(InitialLoadMode::BaseBackup));
+        assert_eq!("object_store".parse(), Ok(InitialLoadMode::ObjectStore));
+        assert!("null".parse::<InitialLoadMode>().is_err());
     }
 }

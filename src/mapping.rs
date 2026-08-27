@@ -47,7 +47,7 @@ impl std::fmt::Display for TableTarget {
 pub struct NamespaceMapping {
     pub target_database: Option<String>,
     pub auto_create: bool,
-    pub drop_table_strategy: Option<String>,
+    pub drop_table_strategy: Option<DropTableStrategy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,8 +58,10 @@ pub enum DropTableStrategy {
     Warn,
 }
 
-impl DropTableStrategy {
-    pub fn parse(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for DropTableStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "retain" => Ok(Self::Retain),
             "drop" => Ok(Self::Drop),
@@ -67,6 +69,17 @@ impl DropTableStrategy {
             other => Err(format!(
                 "unknown drop-table-strategy {other:?} (expected retain / drop / warn)"
             )),
+        }
+    }
+}
+
+impl DropTableStrategy {
+    /// Canonical spelling for overlay and CLI values
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retain => "retain",
+            Self::Drop => "drop",
+            Self::Warn => "warn",
         }
     }
 }
@@ -85,8 +98,10 @@ pub enum ToastMode {
     ClickHouse,
 }
 
-impl ToastMode {
-    pub fn parse(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for ToastMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "disabled" | "off" | "none" | "" => Ok(Self::Disabled),
             "clickhouse" | "ch" => Ok(Self::ClickHouse),

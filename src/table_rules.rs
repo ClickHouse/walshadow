@@ -22,8 +22,10 @@ pub enum MatchKind {
     Regex,
 }
 
-impl MatchKind {
-    pub fn parse(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for MatchKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "exact" => Ok(Self::Exact),
             "glob" => Ok(Self::Glob),
@@ -33,7 +35,9 @@ impl MatchKind {
             )),
         }
     }
+}
 
+impl MatchKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Exact => "exact",
@@ -237,7 +241,12 @@ impl TableRulesBuilder {
     }
 
     pub fn add_row(&mut self, key: &RelName, row: &TableRow) {
-        let kind = match MatchKind::parse(row.match_kind.as_deref().unwrap_or_default()) {
+        let kind = match row
+            .match_kind
+            .as_deref()
+            .unwrap_or_default()
+            .parse::<MatchKind>()
+        {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(target: "walshadow::config", qname = %key, error = %e, "config_table.match rejected");
@@ -528,9 +537,9 @@ mod tests {
 
     #[test]
     fn match_kind_parse() {
-        assert_eq!(MatchKind::parse("").unwrap(), MatchKind::Exact);
-        assert_eq!(MatchKind::parse(" Regex ").unwrap(), MatchKind::Regex);
-        assert_eq!(MatchKind::parse("glob").unwrap(), MatchKind::Glob);
-        assert!(MatchKind::parse("like").is_err());
+        assert_eq!("".parse::<MatchKind>().unwrap(), MatchKind::Exact);
+        assert_eq!(" Regex ".parse::<MatchKind>().unwrap(), MatchKind::Regex);
+        assert_eq!("glob".parse::<MatchKind>().unwrap(), MatchKind::Glob);
+        assert!("like".parse::<MatchKind>().is_err());
     }
 }

@@ -160,8 +160,7 @@ impl Ledger {
                         .map(|e| {
                             // Only this daemon writes modes; an unparseable one
                             // degrades to re-COPY like a corrupt ledger would
-                            let mode =
-                                InitialLoadMode::parse(&e.mode).unwrap_or(InitialLoadMode::Copy);
+                            let mode = e.mode.parse().unwrap_or(InitialLoadMode::Copy);
                             (
                                 RelName::new(&e.namespace, &e.relname),
                                 LedgerRec {

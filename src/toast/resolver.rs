@@ -1440,10 +1440,10 @@ mod tests {
 
     #[test]
     fn toast_mode_parse_rejects_disk() {
-        assert!(ToastMode::parse("disk").is_err());
-        assert!(ToastMode::parse("local").is_err());
-        assert_eq!(ToastMode::parse("ch").unwrap(), ToastMode::ClickHouse);
-        assert_eq!(ToastMode::parse("").unwrap(), ToastMode::Disabled);
+        assert!("disk".parse::<ToastMode>().is_err());
+        assert!("local".parse::<ToastMode>().is_err());
+        assert_eq!("ch".parse::<ToastMode>().unwrap(), ToastMode::ClickHouse);
+        assert_eq!("".parse::<ToastMode>().unwrap(), ToastMode::Disabled);
     }
 
     #[tokio::test]

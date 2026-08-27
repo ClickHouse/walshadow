@@ -43,18 +43,22 @@ pub enum CompressionChoice {
     Zstd,
 }
 
-impl CompressionChoice {
-    pub fn parse(value: &str) -> Result<Self, EmitterError> {
-        match value.to_ascii_lowercase().as_str() {
+impl std::str::FromStr for CompressionChoice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
             "none" | "off" | "" => Ok(Self::None),
             "lz4" => Ok(Self::Lz4),
             "zstd" => Ok(Self::Zstd),
-            other => Err(EmitterError::Config(format!(
+            other => Err(format!(
                 "unknown compression `{other}` (expected none / lz4 / zstd)"
-            ))),
+            )),
         }
     }
+}
 
+impl CompressionChoice {
     fn to_wire(self) -> Compression {
         match self {
             Self::None => Compression::None,

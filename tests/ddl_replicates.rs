@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use walshadow::ch_emitter::EmitterConfig;
 use walshadow::mapping::TableTarget;
-use walshadow::mapping::{ColumnMapping, NamespaceMapping};
+use walshadow::mapping::{ColumnMapping, DropTableStrategy, NamespaceMapping};
 use walshadow::schema::RelName;
 
 // Each test shifts these by +0 / +10 / +20. The CH server's
@@ -324,7 +324,7 @@ async fn drop_table_strategy_drop_removes_dest() {
             drop_table_strategy: None,
         },
     );
-    ddl_args.drop_table_strategy = Some("drop".into());
+    ddl_args.drop_table_strategy = Some(DropTableStrategy::Drop);
 
     let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
         tmp: &tmp,
@@ -445,7 +445,7 @@ async fn pinned_mapping_create_drop_create_recreates_dest() {
     }];
 
     let ddl_args = fx::DdlPipelineArgs {
-        drop_table_strategy: Some("drop".into()),
+        drop_table_strategy: Some(DropTableStrategy::Drop),
         ..Default::default()
     };
 

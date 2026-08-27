@@ -39,6 +39,7 @@ pub mod schema;
 pub mod source;
 pub mod table_rules;
 pub mod toast;
+mod toml_de;
 pub mod xact;
 
 #[doc(hidden)]
