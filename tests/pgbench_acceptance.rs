@@ -235,7 +235,7 @@ fn pgbench_init(source: &Shadow, scale: u32) -> Result<()> {
 
 /// Parametrized body: `decoder_pool` / `inserter_pool` are the daemon's
 /// `--decoder-pool-size` / `--inserter-pool-size`. At 2/2 this drives N
-/// concurrent `AsyncClient`s for both bootstrap and WAL under the DDL
+/// concurrent `BoxedAsyncClient`s for both bootstrap and WAL under the DDL
 /// barrier, asserting out-of-order INSERTs across connections stay
 /// `_lsn`-correct (the parity oracle at the end).
 async fn run_ddl_intermix(
@@ -368,7 +368,7 @@ async fn run_ddl_intermix(
             bootstrap_shadow_data_dir.to_str().unwrap(),
             "--bootstrap-shadow-replay-timeout",
             "180",
-            // N>1 here drives concurrent AsyncClients for bootstrap +
+            // N>1 here drives concurrent BoxedAsyncClients for bootstrap +
             // WAL; the end-state parity oracle proves out-of-order
             // INSERTs across connections stay _lsn-correct.
             "--decoder-pool-size",
@@ -622,7 +622,7 @@ async fn pgbench_acceptance_ddl_intermix() {
 }
 
 /// Same drill at decoder/inserter pool 2/2 — the live daemon coverage for
-/// N>1 concurrent `AsyncClient`s under the DDL barrier that the in-process
+/// N>1 concurrent `BoxedAsyncClient`s under the DDL barrier that the in-process
 /// `pipeline_parallel_{e2e,ddl_e2e}` tests can't provide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgbench_acceptance_ddl_intermix_pooled() {

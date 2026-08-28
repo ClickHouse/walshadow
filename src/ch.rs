@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clickhouse_c::{AsyncClient, ClientOpts, Codec, Compression, Event};
+use clickhouse_c::{AsyncClient, BoxedAsyncClient, ClientOpts, Codec, Compression, Event};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -106,7 +106,9 @@ pub trait ConnectionConfig {
     fn idle_reconnect(&self) -> Duration;
 }
 
-pub async fn connect_client(config: &impl ConnectionConfig) -> Result<AsyncClient, EmitterError> {
+pub async fn connect_client(
+    config: &impl ConnectionConfig,
+) -> Result<BoxedAsyncClient, EmitterError> {
     let compression = config.compression();
     let codec = compression.build_codec()?;
     let mut opts = ClientOpts::new()
@@ -119,14 +121,16 @@ pub async fn connect_client(config: &impl ConnectionConfig) -> Result<AsyncClien
         let tls = config
             .tls_config()
             .unwrap_or_else(clickhouse_c::tls::default_config);
-        Ok(AsyncClient::connect_tls(addr, config.host(), opts, codec, tls).await?)
+        let client = AsyncClient::connect_tls(addr, config.host(), opts, codec, tls).await?;
+        Ok(client.boxed())
     } else {
-        Ok(AsyncClient::connect(addr, opts, codec).await?)
+        let client = AsyncClient::connect(addr, opts, codec).await?;
+        Ok(client.boxed())
     }
 }
 
 pub async fn reconnect_if_idle(
-    client: &mut AsyncClient,
+    client: &mut BoxedAsyncClient,
     config: &impl ConnectionConfig,
     last_used: Instant,
 ) -> Result<bool, EmitterError> {
@@ -137,7 +141,7 @@ pub async fn reconnect_if_idle(
     Ok(true)
 }
 
-pub async fn drain_to_end_of_stream(client: &mut AsyncClient) -> Result<(), EmitterError> {
+pub async fn drain_to_end_of_stream(client: &mut BoxedAsyncClient) -> Result<(), EmitterError> {
     loop {
         match client.recv_event().await? {
             Event::EndOfStream => return Ok(()),
@@ -166,7 +170,7 @@ pub async fn with_timeout<T>(
 }
 
 pub async fn exec_drain(
-    client: &mut AsyncClient,
+    client: &mut BoxedAsyncClient,
     sql: &str,
     timeout: Duration,
 ) -> Result<(), EmitterError> {

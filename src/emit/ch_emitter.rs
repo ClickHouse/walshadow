@@ -16,7 +16,7 @@
 //!
 //! ## Cross-table ordering inside an xact
 //!
-//! `AsyncClient` is single-query-at-a-time, so an xact touching T1 and
+//! `BoxedAsyncClient` is single-query-at-a-time, so an xact touching T1 and
 //! T2 lands all T1 rows (one INSERT) then all T2 (next INSERT); WAL
 //! interleaving across tables is not preserved. `_lsn` carries the
 //! source LSN so `ReplacingMergeTree` dedup keys on the right value;

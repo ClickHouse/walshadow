@@ -1,3 +1,0 @@
-[submodule "clickhouse-c-rs/clickhouse-c"]
-	path = clickhouse-c-rs/clickhouse-c
-	url = https://github.com/ClickHouse/clickhouse-c

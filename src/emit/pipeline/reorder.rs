@@ -407,7 +407,7 @@ impl ReorderSink {
     }
 
     // Helpers take `&mut self` so the borrow across awaits is `&mut Self`
-    // (Send): owned `DdlApplicator`/`AsyncClient` is Send but not Sync, so a
+    // (Send): owned `DdlApplicator`/`BoxedAsyncClient` is Send but not Sync, so a
     // shared `&Self` across an await wouldn't be Send.
     async fn dispatch_job(&mut self, job: DecodeJob) -> Result<(), SinkError> {
         self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);

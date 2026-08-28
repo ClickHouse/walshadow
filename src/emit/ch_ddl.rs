@@ -9,7 +9,7 @@
 //! | `Changed.type_changes` | rejected — logged, not applied (open question) |
 //! | `Dropped` | `DROP TABLE IF EXISTS …` gated on [`DropTableStrategy`] |
 //!
-//! Opens its own `AsyncClient` (separate from the INSERT pump) so DDL
+//! Opens its own `BoxedAsyncClient` (separate from the INSERT pump) so DDL
 //! doesn't ride the INSERT backpressure path.
 //!
 //! ## Coordination with the INSERT pump
@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use clickhouse_c::AsyncClient;
+use clickhouse_c::BoxedAsyncClient;
 use tokio::sync::watch;
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
@@ -160,9 +160,9 @@ pub(crate) fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>)
         || runtime_config_schema.is_some_and(|s| !s.is_empty() && s == ns)
 }
 
-/// CH-side DDL writer. Owns one AsyncClient over its own TCP.
+/// CH-side DDL writer. Owns one BoxedAsyncClient over its own TCP.
 pub struct DdlApplicator {
-    client: AsyncClient,
+    client: BoxedAsyncClient,
     config: DdlConfig,
     /// Live config layers. `refresh_config` folds a republished snapshot
     /// into `config` (namespaces + drop strategy) at each apply, so SIGHUP
