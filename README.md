@@ -287,7 +287,6 @@ one machine — do not collide
 ```
 src/                walshadow daemon + library (submodules: emit/ source/ backfill/ decode/ catalog/ …)
 src/bin/            CLI entry points (stream, filter, classify)
-clickhouse-c-rs/    CH-Native client, separate submodule
 pgext/              walshadow decode-bridge PG module (PGXS)
 sql/                runtime-config overlay install SQL
 architecture/       overview + internals diagrams

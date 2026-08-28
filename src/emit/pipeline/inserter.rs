@@ -1,4 +1,4 @@
-//! Inserter pool — N `AsyncClient` connections sending sealed batches.
+//! Inserter pool — N `BoxedAsyncClient` connections sending sealed batches.
 //!
 //! ClickHouse Cloud INSERT cost is mostly RTT + object-store part commit, so
 //! throughput comes from keeping many INSERTs in flight. Each inserter pulls
@@ -12,7 +12,7 @@
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
-use clickhouse_c::{Allocator, AsyncClient, BlockBuilder, TypeAst};
+use clickhouse_c::{Allocator, BlockBuilder, BoxedAsyncClient, TypeAst};
 use tokio::task::JoinHandle;
 
 use crate::ch::{
@@ -31,7 +31,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 
 struct Inserter {
-    client: AsyncClient,
+    client: BoxedAsyncClient,
     last_used: std::time::Instant,
     alloc: Allocator,
     config: EmitterConfig,

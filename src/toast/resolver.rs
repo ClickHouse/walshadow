@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use clickhouse_c::{Allocator, AsyncClient, Block, BlockBuilder, ColumnBuilder, Event, TypeAst};
+use clickhouse_c::{
+    Allocator, Block, BlockBuilder, BoxedAsyncClient, ColumnBuilder, Event, TypeAst,
+};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -498,7 +500,7 @@ const CH_UNKNOWN_TABLE: i32 = 60;
 const CH_UNKNOWN_DATABASE: i32 = 81;
 
 struct ChState {
-    client: Option<AsyncClient>,
+    client: Option<BoxedAsyncClient>,
     created: HashSet<u32>,
 }
 

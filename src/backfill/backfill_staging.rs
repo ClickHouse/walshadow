@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clickhouse_c::{AsyncClient, Block, Event};
+use clickhouse_c::{Block, BoxedAsyncClient, Event};
 
 use crate::backfill::backfill_types::BackupRequest;
 use crate::ch::{
@@ -124,7 +124,7 @@ pub async fn prepare(
 /// One CH control connection for staging DDL + swap statements, with the
 /// inserter pool's bounded per-attempt timeout.
 pub struct StagingSession {
-    client: AsyncClient,
+    client: BoxedAsyncClient,
     /// Kept whole for reconnect; shared with the pass that opened the session
     conn: Arc<EmitterConfig>,
     retry: RetryConfig,

@@ -25,7 +25,6 @@ RUN apk add --no-cache \
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY clickhouse-c-rs ./clickhouse-c-rs
 COPY bench ./bench
 COPY src ./src
 # Cache mounts persist cargo's registry/git and the target dir across builds,

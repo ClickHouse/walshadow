@@ -1,5 +1,5 @@
 [workspace]
-members = ["clickhouse-c-rs", "bench"]
+members = ["bench"]
 
 [package]
 name = "walshadow"
@@ -37,7 +37,7 @@ zstd = ["clickhouse-c-rs/zstd"]
 
 [dependencies]
 wal-rus = "0.3.0"
-clickhouse-c-rs = { path = "clickhouse-c-rs", default-features = false, features = ["tokio", "tls"] }
+clickhouse-c-rs = { version = "0.1.1", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
 ahash = "0.8"
