@@ -1,11 +1,9 @@
 # TOAST support — pg_toast chunks mirrored off the WAL window
 
-Externally-toasted column values are reconstructable in every path, including
-values toasted *before* the replication window. Chunks land in a store of
-record (`ToastResolver` / `ChunkStore`, `src/toast.rs`), selected by
-`[toast] mode`, so reassembly does not depend on a value's chunks coinciding
-with the referring tuple in WAL. In-xact WAL reassembly is the fast path — see
-[xact.md](xact.md).
+User-facing mode selection and large-value behavior live in
+[`docs/destination-tables.md`](../docs/destination-tables.md#large-toasted-values).
+This note covers chunk identity, as-of reconstruction, and replay-safe
+reclamation. In-xact WAL reassembly is fast path, see [xact.md](xact.md)
 
 ![TOAST architecture](../architecture/toast.svg)
 
@@ -19,11 +17,6 @@ structural (a rewritten heap has different TIDs, a reused line pointer
 supersedes its tombstone at a higher version); nothing resolves anything.
 Reclamation is `ReplacingMergeTree` merge behavior, not walshadow logic.
 
-- **Modes.** `disabled` (default; NULL/default-fill on miss, counted
-  `toast_values_filled_default`, never an error) and `clickhouse`
-  (`ClickHouseChunkStore`, one CH table per toast rel). `MemChunkStore` is
-  the in-memory test double whose `fetch` is the literal as-of algorithm the
-  SQL encodes.
 - **Schema.** `pg_toast_<relid>` (`blkno`, `offnum`, `chunk_id`, `chunk_seq`,
   `chunk_data`, `_lsn`, `_is_deleted`), `ReplacingMergeTree(_lsn,
   _is_deleted)` `ORDER BY (blkno, offnum)`, bloom-filter index on `chunk_id`.

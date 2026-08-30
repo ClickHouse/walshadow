@@ -171,7 +171,8 @@ host = "ch-analytics"; port = 9000; database = "an"; ...
 
 Routing *rules* (which relation → which destination) are logical, not
 connection state, so they belong in the runtime-config overlay: extend
-`config_table` / `config_namespace` (schema in [../config.md](../config.md))
+`config_table` / `config_namespace` described in
+[`docs/configuration.md`](../../docs/configuration.md#source-side-runtime-config)
 with a `destinations text[]` column. TOML `[table.…]` / `[namespace.…]` blocks
 gain a `destinations` field (absent → the single default destination, preserving
 the single-destination behavior byte-for-byte). This makes §0 the

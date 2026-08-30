@@ -324,8 +324,8 @@ barrier. Variants (see diagram legend for trigger → DDL mapping):
 `auto_create`, `target_database`, and `drop_table_strategy` (the latter two
 resolved per-namespace in `DdlApplicator`); `type_overrides`,
 `order_by_default`, and `engine_default` are not covered. The
-`watch::Receiver<Arc<ResolvedConfig>>` resolver substrate
-([config.md](config.md)) merges CLI > PG-row > TOML with SIGHUP republish, and
+`watch::Receiver<Arc<ResolvedConfig>>` resolver substrate in
+[`src/config.rs`](../src/config.rs) merges CLI > PG-row > TOML with SIGHUP republish, and
 the DdlApplicator refreshes namespace config from it per apply. The decode pool
 reads `Arc<RwLock<HashMap>>` on the hot path, bridged from the watch snapshot by
 a refresher task. The source-PG-driven work (signal channel, per-table opt-in +

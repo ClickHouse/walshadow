@@ -6,7 +6,7 @@ Within one daemon lifetime the schema-diff baseline (`prev_known`) is
 warm for the whole resolved scope — `ShadowCatalog::seed_baseline` at
 boot for TOML-pinned rels, the per-table opt-in dispatch for
 `config_table` rels (`plans/emitter.md` "Baseline seeding",
-`plans/config.md`). Everything below extends the general invariant —
+`src/config.rs`). Everything below extends the general invariant —
 **an in-process cache must never decide which CH SQL runs** — past one
 lifetime: across restart, to drops during downtime, and to durable
 rename/drop fidelity.

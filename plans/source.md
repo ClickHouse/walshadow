@@ -80,7 +80,7 @@ misaligned push). It proves continuity before it asks for a byte
 ([failover.md](failover.md) §Reconnect): the manifest's `system_id`, then the
 live chain placing the branch being read where walshadow's own chain does and
 still serving `resume_lsn`, then the configured slot. `cfg` is the live
-`[source]` endpoint ([control.md](control.md) §Source endpoint move), so the
+`[source]` endpoint ([configuration](../docs/configuration.md#live-control)), so the
 address reached can differ from the one boot dialed and those proofs are what
 keep a mistyped host, or a sibling of the same cluster, from replaying
 foreign WAL into these artifacts. A newer live timeline is a promotion, and

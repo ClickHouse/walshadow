@@ -1,14 +1,13 @@
 # walshadow
 
-Catalog-replay sidecar that turns a physical-WAL stream from PostgreSQL
-into CDC for ClickHouse. Shadow PG runs as a recovery-mode standby fed
-by walshadow's walsender, exposing source's catalog state for the decoder
-without ever hosting user-heap data
+Replicate PostgreSQL rows into ClickHouse from physical WAL, including initial
+load, continuous changes, schema evolution, restarts, and planned source
+switchover
 
-For design, see [plans/overview.md](plans/overview.md) and component
-docs indexed at [plans/INDEX.md](plans/INDEX.md); for diagrams,
-[architecture/README.md](architecture/README.md); for future work,
-[plans/future/INDEX.md](plans/future/INDEX.md)
+Start with [user documentation](docs/README.md). Engineering rationale lives
+in [plans/](plans/INDEX.md), architecture diagrams in
+[architecture/](architecture/README.md), and open work in
+[plans/future/](plans/future/INDEX.md)
 
 ## Quick start (docker)
 
@@ -29,8 +28,12 @@ docker compose -f docker/docker-compose.yml logs -f walshadow
 ```
 
 Set `PG_MAJOR` to source PostgreSQL major. `init` validates both connections,
-creates destination database, and selects source tables with row keys. Fix any
-reported source requirements, then rerun it
+creates destination database, and queues source tables with row keys for
+initial load. Fix any reported source requirements, then rerun it
+
+Chosen tables set initial load, not scope: written config keeps `[stream]
+replicate_all` at its default `true`, so every user table replicates until you
+turn that off
 
 Wait for `shadow caught up to bootstrap end_lsn`, change a selected source row,
 then query matching ClickHouse table:
@@ -40,8 +43,9 @@ clickhouse-client --host ch.internal --database cdc --query \
     "SELECT * FROM users FINAL ORDER BY id"
 ```
 
-See [docker/QUICKSTART.md](docker/QUICKSTART.md) for table selection and
-teardown. Add browser status with provisioned Prometheus and Grafana:
+See [getting started](docs/getting-started.md) for full walkthrough and
+[table selection](docs/table-selection.md) for scope and initial-load choices.
+Add browser status with provisioned Prometheus and Grafana:
 
 ```
 docker compose -f docker/docker-compose.yml \
@@ -137,8 +141,7 @@ walshadow-stream ctl help
 
 Each verb applies to the running session, which reconfigures in place with
 no restart. Mutations land in `ch-config.d/50-api.toml`, leaving
-operator-owned config untouched. Details in
-[plans/control.md](plans/control.md)
+operator-owned config untouched. See [configuration](docs/configuration.md)
 
 ### CH emitter config
 
@@ -204,7 +207,7 @@ Everything a `config_table` row carries — destination, `replicate`,
 `initial_load` — also takes `match = "glob"` / `"regex"`, which is how you
 scope tables that do not exist yet: under `auto_create` / `replicate_all` a
 relation reaches CH the first time it is seen, before a row naming it could
-arrive. See [plans/config.md](plans/config.md).
+arrive. See [table selection](docs/table-selection.md)
 
 Columns take the same treatment. A `columns` entry keys on `attnum` or on
 `name`, never both, and one array holds one kind:

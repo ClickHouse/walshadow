@@ -45,7 +45,7 @@
 //!      `Decimal(38, 0)`, operator inserts `config_column.target_type`.
 //!    * Expect: post-override rows encode at the override's scale — the
 //!      stored `123.45` (vs a scale-0 `123`) proves the override reached
-//!      the projection (plans/config.md §Column overrides).
+//!      the projection (`docs/configuration.md`).
 //!
 //! 7. `auto_create_namespace_via_config_namespace`
 //!    * Operator inserts `config_namespace (auto_create=true)`, no
@@ -760,7 +760,7 @@ async fn auto_create_namespace_via_config_namespace() {
 }
 
 /// Drill 6: `config_column.target_type` reaches the emitted projection
-/// (plans/config.md §Column overrides). CH dest pre-created with
+/// (`docs/configuration.md`). CH dest pre-created with
 /// `Decimal(38, 2)` while TOML deliberately maps the stale bridge default
 /// `Decimal(38, 0)`; the override row lands via WAL before the DML. The
 /// stored scale is the witness: an applied override encodes `123.45`, a

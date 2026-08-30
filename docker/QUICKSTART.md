@@ -1,5 +1,7 @@
 # Connect existing databases
 
+Canonical user guide: [`docs/getting-started.md`](../docs/getting-started.md)
+
 Requires Docker Compose, PostgreSQL 16 or newer, and ClickHouse. Set
 `PG_MAJOR` to source PostgreSQL major because shadow is its physical clone
 
@@ -17,9 +19,9 @@ docker compose -f docker/docker-compose.yml up -d
 docker compose -f docker/docker-compose.yml logs -f walshadow
 ```
 
-`init` validates both connections, creates destination database, and selects
-source tables with row keys. It reports SQL needed when source does not have
-`wal_level = logical`, replication permission, or usable row keys
+`init` validates both connections, creates destination database, and queues
+source tables with row keys for initial load. It reports SQL needed when source
+does not have `wal_level = logical`, replication permission, or usable row keys
 
 Wait for:
 
@@ -70,6 +72,10 @@ docker compose -f docker/docker-compose.yml run --rm walshadow \
 
 `--initial-load copy` is default. Use `--initial-load none` to stream only
 changes after selection. Config persists in `walshadow-config` volume
+
+Selection sets initial load, not scope. Every user table replicates until
+config carries `[stream] replicate_all = false`, see
+[table selection](../docs/table-selection.md)
 
 ## Teardown
 

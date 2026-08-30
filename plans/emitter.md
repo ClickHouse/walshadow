@@ -105,8 +105,8 @@ config applicator. Route state folds into a `PlanRouteView` resolving
 from frozen versions; in-walk control entries fold into the LOCAL view
 only — global mapping/config/CH changes belong to the executor at
 replay. This is what makes config changes whole-transaction-granular:
-a transaction plans entirely under one route state, never mixes
-versions ([config.md](config.md)). `route_for` returning `None` is the
+a transaction plans entirely under one route state, never mixes versions.
+`route_for` returning `None` is the
 deterministic unmapped discard, counted, planned as `route_id =
 u32::MAX` — it skips detoast and codec work entirely
 
@@ -354,23 +354,9 @@ today is `String`, anything else dies cleanly at `append`
 `type_bridge::map(att, pk_member) -> ResolvedColumn` maps one
 `RelAttr` to CH type expression plus optional `DEFAULT <expr>`.
 `pk_member = true` strips `Nullable(_)` wrap because CH refuses
-`Nullable` in `ORDER BY`. Matrix is hard-coded in `base_type_for`:
-
-| PG | CH |
-|---|---|
-| bool | Bool |
-| "char" / int2/4/8 | Int8/16/32/64 |
-| oid | UInt32 |
-| float4/8 | Float32/64 |
-| numeric(p,s), 1 ≤ p ≤ 76 | Decimal(p,s); else String |
-| text / varchar(n) / bpchar(n) / name / bytea | String |
-| date | Date32 |
-| time | Time64(6) |
-| timetz / interval | String (text form) |
-| timestamp(p) / timestamptz(p) | DateTime64(p, 'UTC'), p ≤ 6 |
-| uuid | UUID |
-| inet / cidr / json / jsonb | String |
-| array / unknown | String fallback |
+`Nullable` in `ORDER BY`. User-visible matrix lives in
+[`docs/destination-tables.md`](../docs/destination-tables.md#default-type-mapping),
+hard-coded by `base_type_for`
 
 `numeric` needs `1 ≤ p ≤ 76` for `Decimal`; `p = 0`, scale outside
 `0 ≤ s ≤ p`, or unconstrained `numeric` (which can carry NaN/±Inf) fall
@@ -399,15 +385,9 @@ CH applies its own zero-init
 
 ### Synthetic columns
 
-Every destination table carries four trailing synthetic columns,
-non-nullable by construction, encoded in `TableEncoder::new`:
-
-| column | type | purpose |
-|---|---|---|
-| `_lsn` | `UInt64` | source commit-record LSN. `ReplacingMergeTree(_lsn)` keys dedup on this so restart-and-replay window collapses re-emitted rows to latest LSN per PK |
-| `_xid` | `UInt32` | source xid. Lets analytic queries group all rows from one xact, recover xact boundary CH lost when emitter serialised across tables |
-| `_commit_ts` | `DateTime64(6, 'UTC')` | xact commit timestamp, shifted from PG's 2000-01-01 epoch to Unix via `DATETIME64_PG_EPOCH_US` |
-| `_is_deleted` | `Bool` | 1 on delete, else 0. `Bool` is `UInt8` underneath (1 wire byte), so it satisfies `ReplacingMergeTree`'s `is_deleted` UInt8 requirement. `ReplacingMergeTree(_lsn, _is_deleted)` second arg collapses deletes on FINAL; `WHERE _is_deleted = 0` is the cheap "live rows" filter. `soft_delete` keeps it out of the engine args to retain tombstones |
+Destination metadata contract lives in
+[`docs/destination-tables.md`](../docs/destination-tables.md). All four values
+remain non-nullable and append after mapped columns in `TableEncoder::new`
 
 `_lsn` is dedup key because emitter ack lags actual CH durability by up
 to one flush window. On restart the manifest floor rewinds to
@@ -417,47 +397,8 @@ without walshadow having to track which rows already landed
 
 ## Mapping config
 
-`EmitterConfig::tables` parses from TOML `[table.<namespace>.<relname>]`
-blocks (two key levels; names with weird characters quote per TOML key
-rules). Destination parts stay separate — `TableTarget { database, table }`
-joins only at SQL construction (`TableTarget::sql`); `target_database`
-defaults to the namespace override else `[ch] database`, `target_table` to
-the source relname:
-
-```toml
-[table.public.foo]
-replicate = true
-initial_load = "none"
-target_database = "default"
-target_table = "foo"
-columns = [
-  { attnum = 1, target = "id",   type = "UInt64" },
-  { attnum = 2, target = "name", type = "Nullable(String)" },
-]
-```
-
-A `columns` entry uses either `attnum` or `name`. Do not mix both forms in one
-array.
-
-- `attnum` pins a projection. `target` and `type` are required.
-- `name` changes a catalog-derived column. `target` and `type` are optional.
-  Source name and derived type remain when omitted. Set `match` to `glob` or
-  `regex` to cover current and future columns. Pattern entries cannot set
-  `target`, because several columns cannot share one ClickHouse name.
-
-```toml
-[table.app."*"]
-match = "glob"
-replicate = true
-columns = [
-  { name = "*_at", match = "glob", type = "DateTime64(6, 'UTC')" },
-  { name = "legacy_id", target = "id" },
-]
-```
-
-Name entries do not select tables for replication. Use `replicate` or
-`auto_create` for scope. Column rules apply to mappings, `CREATE TABLE`,
-`ADD COLUMN`, and encoder plans.
+User mapping syntax and behavior live in
+[`docs/table-selection.md`](../docs/table-selection.md)
 
 `MappingHandle = Arc<tokio::sync::RwLock<HashMap<RelName, TableMapping>>>`
 is the live handle the planner's route view resolves from. Handle is
@@ -469,37 +410,10 @@ effect at the next transaction's plan. The batcher's cached
 `FlushAll` (or restart) rebuilds it — a SIGHUP retarget therefore
 fully applies only at the next DDL/TRUNCATE boundary
 
-### NamespaceMapping (partial)
-
-Per-source-namespace defaults block, `[namespace."public"]`. Three
-fields wired today:
-
-```rust
-pub struct NamespaceMapping {
-    pub target_database: Option<String>,
-    pub auto_create: bool,
-    pub drop_table_strategy: Option<String>,
-}
-```
-
-`auto_create = true` lets `DdlApplicator::apply_added` run
-`CREATE TABLE IF NOT EXISTS` on first sight of a relation in the
-namespace and auto-derive a `TableMapping` via
-`derive_columns_for_mapping`. Per-table TOML still wins when both are
-configured for the same relation
-
-`target_database` and `drop_table_strategy` resolve per-namespace
-through `DdlConfig::{target_database_for, drop_strategy_for}`: the
-applicator carries the namespace map and falls back to the global
-`target_database` / `drop_table_strategy` when a namespace has no
-override. The per-namespace `target_database` drives both the CREATE
-and the derived row-routing mapping, so rows and DDL land in the same
-database
-
 ## Namespace mapping gaps
 
 `auto_create`, `target_database`, and `drop_table_strategy` resolve through
-the resolver substrate ([config.md](config.md)): `ResolvedConfig`
+`ResolvedConfig` in [`src/config.rs`](../src/config.rs)
 (`tables` + `namespaces` + `columns` type-override table) published on a
 `watch::Receiver<Arc<ResolvedConfig>>`, CLI > PG-row > TOML merge, SIGHUP
 republish. The planner's route view reads `Arc<RwLock<HashMap>>` when
@@ -512,8 +426,7 @@ richer namespace surface is not covered:
   `ENGINE = ReplacingMergeTree(_lsn)`; no per-namespace override (e.g.,
   `MergeTree`, `CollapsingMergeTree`)
 
-See [config.md](config.md) for the resolver substrate + overlay and
-[future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) for
+See [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md) for
 the source-PG-driven work (signals, opt-in + backfill, net-new knobs)
 
 ## DdlApplicator
@@ -712,9 +625,6 @@ extended CH outages)
   `DecodedHeap`. Read-time defaults tier-classify here
 - [ops.md](ops.md) — manifest, stall watchdog, SIGHUP mapping
   reload, slot advance on `min(shadow_replay_lsn, emitter_ack_lsn)`
-- [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
-  — `clickhouse-c-rs` unsafe surface (`BlockBuilder` borrows into
-  `ColumnBuf` slabs, `PosixIo` owns fd, `Client` lifetime invariants)
 - [bootstrap.md](bootstrap.md) — shared-tail wiring, `tail.finish`
   handshake
 - [oracle.md](oracle.md) — Tier 3 default resolution via PG-side
@@ -722,8 +632,8 @@ extended CH outages)
 - [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
   — pipeline design record; remaining: pump wire/record split,
   bootstrap decode pool (Option B), hot-table sharding, M/N sizing
-- [config.md](config.md) — resolver substrate: `ResolvedConfig`
-  + `watch::Receiver`, CLI > PG-row > TOML merge, SIGHUP republish
+- [`src/config.rs`](../src/config.rs) — resolver substrate,
+  `ResolvedConfig`, snapshot publication, and precedence
 - [future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
   — pg-driven config overlay building on the resolver substrate
 - [future/ch_bounce_recovery.md](future/ch_bounce_recovery.md) —

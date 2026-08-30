@@ -1,14 +1,15 @@
-# walshadow plan index
+# walshadow engineering index
 
-Component docs for walshadow's current implementation state. Start at
+Engineering rationale and invariants for walshadow. Start at
 [overview.md](overview.md) for system shape, then drop into individual
-components. Future-work proposals live under [future/](future/INDEX.md).
-Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
+components. User workflows and supported behavior live under
+[`docs/`](../docs/README.md). Future-work proposals live under
+[future/](future/INDEX.md). Cross-doc terminology is collected in
+[GLOSSARY.md](GLOSSARY.md)
 
 ## Components
 
-- [overview.md](overview.md) — system shape, supported PG versions,
-  filter contract, ordering invariants, acceptance gates
+- [overview.md](overview.md) — system shape, filter contract, ordering invariants
 - [filter.md](filter.md) — WAL filter, CRC rewrite, catalog tracker,
   dirty tree, rmgr-level keep/drop, NOOP-over-fork rationale
 - [source.md](source.md) — START_REPLICATION PHYSICAL pump,
@@ -26,8 +27,8 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
   reassembly, commit-time stash + raw decode, local-disk spill + body
   spool, `DrainEntry` ordering
 - [TOAST.md](TOAST.md) — TID-keyed `pg_toast_<relid>` CH mirror
-  (`disabled`/`clickhouse`), delete tombstones + RMT-merge reclaim,
-  as-of fetch, superseded-fill miss policy, bootstrap tap +
+  with delete tombstones + RMT-merge reclaim, as-of fetch,
+  superseded-fill miss policy, bootstrap tap +
   defer-resolve; deferred R1 JOIN mode, streaming reassembly
 - [emitter.md](emitter.md) — parallel decode+insert pipeline
   (reorder plan → execute → decode ×M → batcher → inserter ×N → ack
@@ -36,30 +37,24 @@ Cross-doc terminology is collected in [GLOSSARY.md](GLOSSARY.md)
 - [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
   / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
   shared insert tail, restart source fallback contract
-- [ops.md](ops.md) — preflight, metrics, retention, manifest (floor,
-  6 LSNs), standby-status triple, kill-restart drill
-- [failover.md](failover.md) — source timeline crossing: operator
-  switchover protocol, frozen pause frontier, promotion gate, fork proofs,
+- [ops.md](ops.md) — retention, manifest floor, standby-status triple,
+  resume invariants
+- [failover.md](failover.md) — source timeline crossing: frozen pause
+  frontier, promotion gate, fork proofs,
   pipeline barrier at the fork, committed resume position, fork-segment
   prefix verification, shadow handoff order, lineage-aware resume and
   reconnect, slot proofs, parked refusals
-- [control.md](control.md) — in-process control plane: `ctl` unix-socket
-  line protocol, base+`conf.d` config merge (API writes only its
-  `50-api.toml` fragment), live reload (mappings/budgets/CH-conn/table
-  selection/pause) with no restart, config-driven table opt-in, pause as
-  `[stream] paused`, `Reloader` (no session lifecycle)
 - [oracle.md](oracle.md) — PgPending resolver, walshadow PG
   extension
-- [clickhouse-c-rs Safety model](../clickhouse-c-rs/README.md#safety-model)
-  — FFI trust boundary, `Client<'fd>` lifetime shape, `PosixIo`
-  `BorrowedFd` discipline, packet-payload union
 
 ## Future work
 
 [future/INDEX.md](future/INDEX.md) collects design docs for unbuilt work:
 runtime-config signals and net-new knobs, two-phase commit,
 sequence-state replication, cross-table ordering, CH-bounce recovery,
-parked operational polish. Promote built behavior into `plans/`
+parked operational polish. Once built, keep behavior in code and tests, move
+user-facing consequences into `docs/`, and retain only rationale or invariants
+which code cannot express
 
 ## Architecture diagrams
 
