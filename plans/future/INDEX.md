@@ -1,14 +1,16 @@
 # plans/future — index
 
-Planning-only docs for unbuilt work. Drop new proposals here as they
-surface; promote into `plans/` once built
+Planning-only docs for unbuilt work. Drop new proposals here as they surface
+and remove implementation walkthroughs once code and tests carry them. Move
+user-facing behavior into [`docs/`](../../docs/README.md), retain built-design
+rationale under `plans/` only when code cannot express it
 
 * [TABLESPACES.md](TABLESPACES.md) — source-tablespace correctness: bootstrap page-walk + shadow directory materialization; full-rfn physical identity invariant
 * [catalog_capture_completeness.md](catalog_capture_completeness.md) — catalog → descriptor dependency taxonomy: capture-all trigger set, pg_type/typname staleness, rename events, toast-spool retire on rotation
 * [descriptor_timeline.md](descriptor_timeline.md) — per-record layout fidelity inside a dirty xact: hold at `XLOG_XACT_INVALIDATIONS`, shadow-side historic read via pgext, per-command descriptor timeline replacing the commit-time sample
 * [custom_rmgr.md](custom_rmgr.md), redo interpose for command-boundary capture: pre-wire arm, custom rmgr callback, pushed arrival, bounded publication gate, crash-safe fallback
 * [DESTINATIONS.md](DESTINATIONS.md) — N:M ClickHouse destination routing: fan-out/fan-in, per-dest ack accounting, slot-advance tension
-* [runtime_config_from_pg.md](runtime_config_from_pg.md) — source-PG runtime config: signal channel, net-new knobs, degraded-mode fallback, resolver observability (resolver substrate + per-table opt-in + column overrides in [config.md](../config.md))
+* [runtime_config_from_pg.md](runtime_config_from_pg.md) — source-PG runtime config: signal channel, net-new knobs, degraded-mode fallback, resolver observability beyond implemented surface in [`docs/configuration.md`](../../docs/configuration.md)
 * [shadow_schema_export.md](shadow_schema_export.md) — shadow PG as schema-only catalog donor to third-party clusters
 * [shadow_toast.md](shadow_toast.md) — shadow-backed TOAST chunk store with WAL replay and crash-safe reclamation fencing
 * [failover.md](failover.md) — beyond the switchover crossing in [../failover.md](../failover.md): unplanned promotion (transaction-state fence, overwrite contrecord), slotless pause windows, timeline-aware archive and base-backup replay

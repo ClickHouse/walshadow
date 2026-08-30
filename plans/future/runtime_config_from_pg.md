@@ -1,13 +1,14 @@
 # runtime config from source PG
 
-Source-PG-driven config that builds on the resolver substrate
-([../config.md](../config.md)): config rows a DBA writes into `<schema>.config_*`
+Source-PG-driven config that builds on resolver in
+[`src/config.rs`](../../src/config.rs): config rows a DBA writes into `<schema>.config_*`
 on source PG, seeded at boot and applied live at each row's commit LSN, merged
 **CLI > PG-row > TOML**, detected inline by resolved qualified name, interpreted
 into `ConfigEvent`s, applied through `DrainEntry::Config` under the barrier fence.
 
-Implemented baseline lives in [config.md](../config.md) and
-[add_table.md](../add_table.md): boot seed, commit-ordered config rows,
+Implemented baseline lives in code, user surface in
+[`docs/configuration.md`](../../docs/configuration.md), and backup-mode rationale
+in [add_table.md](../add_table.md): boot seed, commit-ordered config rows,
 per-table opt-in, `initial_load`, and column overrides. This document keeps
 only remaining extensions:
 
@@ -28,8 +29,8 @@ Orthogonal to config-row state: imperatives that don't make sense to store as a
 row (`flush_now`, `pause_emitter`, `resume_emitter`, `force_reseed <rfn>`,
 `drop_slot_at_lsn <X>`, debug toggles). The WAL pump already classifies
 `RmId::LogicalMsg = 21` records (see `classify`) but discards the body; this
-parses the body in the same inline decode path the config-table interception
-uses ([../config.md](../config.md)), filters on a configurable prefix (TOML
+parses body in same inline decode path as config-table interception, filters on
+a configurable prefix (TOML
 `[runtime_config] message_prefix`, default `walshadow`), and routes the payload
 to a small command parser. Unknown commands log at WARN and increment
 `walshadow_signal_unknown_total{cmd=…}` — never crash.
@@ -142,14 +143,15 @@ surgical when the xact also carries changes to keep.
 
 Per-table `replicate`, forward declarations, `initial_load` modes, crash-safe
 backfill ledgers, and convergence rules are current behavior. See
-[config.md](../config.md) and [add_table.md](../add_table.md). Extensions below
+[`docs/table-selection.md`](../../docs/table-selection.md) and
+[add_table.md](../add_table.md). Extensions below
 must preserve inclusion-agnostic buffering and `_lsn` convergence guarantees
 documented there
 
 ## Net-new knobs
 
-Knobs with no runtime path — each needs a TOML/overlay field plus the machinery
-behind it, distinct from the knobs the resolver resolves ([../config.md](../config.md)):
+Knobs with no runtime path, each needs a TOML or overlay field plus machinery
+behind it, distinct from knobs resolved by [`src/config.rs`](../../src/config.rs):
 
 | key | table | type | notes |
 |---|---|---|---|

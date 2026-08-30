@@ -205,7 +205,7 @@ pub struct EmitterConfig {
     /// `None` (section omitted) disables refill.
     pub backup: Option<walrus::config::Settings>,
     /// `[bootstrap]`: shadow seeding source + its object-store knobs.
-    /// Boot-only; the CLI flag layers on top (CLI > TOML, per config.md)
+    /// Boot-only, CLI overrides TOML
     pub bootstrap: BootstrapSettings,
 }
 

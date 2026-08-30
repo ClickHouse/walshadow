@@ -221,8 +221,7 @@ impl DdlApplicator {
         })
     }
 
-    /// Route mapping writes through the resolver so they survive its
-    /// republish full-swap (the [config.md] "Known limitation" clobber).
+    /// Route mapping writes through resolver so republished snapshots retain them
     pub fn with_resolver(mut self, resolver: Arc<ConfigResolver>) -> Self {
         self.resolver = Some(resolver);
         self

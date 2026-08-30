@@ -1,25 +1,9 @@
 # backup-sourced per-table initial load
 
-High-fidelity `initial_load` modes for per-table opt-in
-([future/runtime_config_from_pg.md](future/runtime_config_from_pg.md)
-§Per-table opt-in): source pre-opt-in rows from a base backup instead of a
-live `COPY (SELECT …)`. Reuses greenfield bootstrap plumbing
-([bootstrap.md](bootstrap.md)) — `BackupSource` impls, `PageWalkSink`,
-`pipeline::bootstrap::drain` — with a per-rel filter over the tables being
-added. Orchestrated by `src/backup_backfill.rs`; dispatch + coalescing live
-on the backfiller (`src/copy_backfill.rs`); visibility gate in
-`src/visibility.rs`.
-
-`config_table.initial_load` (text) selects the mode; TOML
-`[table.*] initial_load` is the equivalent surface for pinned mappings
-(applies at boot with `S` = the WAL resume LSN):
-
-| value | source | WAL leg |
-|---|---|---|
-| `'none'` \| NULL | none | live stream from `S` |
-| `'copy'` | live `COPY (SELECT …)` at `_lsn = S` (`src/copy_backfill.rs`) | live stream from `S` |
-| `'base_backup'` | fresh `BASE_BACKUP` over a second replication conn (`DirectSource`) | live stream from `S` |
-| `'object_store'` | latest wal-g full backup from bucket (`ObjectStoreSource`) | archive-WAL gap replay `B_redo → S`, then live stream |
+User-facing mode selection and tradeoffs live in
+[`docs/table-selection.md`](../docs/table-selection.md). This note keeps design
+for backup-sourced modes: shared decoder, visibility gate, WAL coverage, and
+atomic staging publication
 
 ## Why beyond COPY
 
@@ -90,9 +74,8 @@ on the backfiller (`src/copy_backfill.rs`); visibility gate in
   on a backfill. Rows route via a per-pass snapshot of the mapping pointed at
   staging tables — the destination is untouched until publish (§Staging
   swap). The pass resolver shares the pipeline's memory budget
-  (`PassContext`, [emitter.md](emitter.md) Memory budget). Regime A
-  ([config.md](config.md) §Failure containment) holds: a failed pass
-  leaves every entry pending in the ledger, never poisons the pump
+  (`PassContext`, [emitter.md](emitter.md) Memory budget). A failed pass leaves
+  every entry pending in the ledger and never poisons the pump
 - **Ledger.** `backfills.toml` entries carry `mode` (absent ⇒ `copy`) and the
   staging-swap phase (`swapped` + staging uuid, §Staging swap); boot re-runs
   the recorded mode at the recorded `S` — or resumes the swap tail — the
@@ -231,19 +214,6 @@ drop); missing ⇒ only the done mark is owed. A failed pass joins its whole
 tail before surfacing, so no detached inserter can final-flush into a staging
 table a retry has already rebuilt.
 
-Caveats: `EXCHANGE TABLES` needs an Atomic/Replicated database engine (the
-modern default); `CREATE TABLE .. AS` clones engine args, so a `Replicated*`
-destination with a hard-coded ZooKeeper path (no `{uuid}` macro) collides;
-materialized views on the destination never fire for backfill rows (staging
-inserts don't trigger them) and fire twice for copy-back rows.
-
-## Observability
-
-- `config_backfills_pending` gauge keeps counting all modes; per-mode
-  labelled series (`mode="copy|base_backup|object_store"`) split it
-- Per-pass INFO summary: rows walked / gated / deferred, multixact emits,
-  gap segments + records replayed, pg_xact segments + patch size, `B_redo`
-
 ## Anti-goals
 
 - **No shadow involvement.** Backup bytes never land in a data dir; the modes
@@ -254,34 +224,3 @@ inserts don't trigger them) and fire twice for copy-back rows.
 - **No server-side filtering.** Do not fork the BASE_BACKUP protocol;
   cluster-sized bandwidth is the documented cost of `'base_backup'`, and
   `'object_store'` is the answer when that cost bites
-
-## Acceptance drills
-
-- **base_backup opt-in.** Non-empty `app.orders`; insert
-  `config_table (replicate=true, initial_load='base_backup')`. Daemon streams
-  WAL from `S`, second replication conn pulls the backup, only `app.orders`
-  filenodes walk, rows land at `_lsn = S`. Mutations committed mid-backup
-  reflect the WAL copy, not the walked copy
-- **Dead tuple stays dead.** Delete a row, opt in via `'base_backup'` before
-  autovacuum prunes. Walked page still carries the tuple; visibility gate
-  drops it; CH never resurrects
-- **object_store opt-in.** wal-g bucket with a full backup + continuous
-  archive. Opt in with `'object_store'`; zero source SQL/replication load
-  beyond the live slot; walked rows at `_lsn = B_redo`, gap replay bridges to
-  `S`, post-`S` inserts stream live. Row mutated in the gap ends at its gap
-  commit LSN value
-- **Catalog skew aborts.** `ALTER TABLE app.orders ADD COLUMN` between backup
-  and opt-in. Pre-scan detects the `pg_attribute` write, backfill aborts with
-  the remedy error, ledger entry stays pending, live stream unaffected
-- **Coalesce.** Two `'base_backup'` opt-ins in one xact → one backup pass,
-  both rels' filenodes walk in it
-- **Unknown mode.** `initial_load='snapshot'` warns
-  (`unknown initial_load mode`), scope change still applies, streaming from
-  `S` only
-- **Failed pass leaves destination untouched.** Kill the source mid-walk;
-  destination carries only live rows, the partial load sits in
-  `<table>__wsstg`, ledger stays pending. Retry rebuilds staging and
-  publishes exactly once
-- **Swap crash recovery.** Crash between `EXCHANGE` and copy-back; boot
-  resumes from `swapped`: uuid mismatch ⇒ exchange already applied, copy-back
-  delivers the live-window rows (`_lsn > S`), staging drops, entry marks done

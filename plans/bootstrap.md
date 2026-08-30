@@ -109,7 +109,8 @@ archive, then source):
    operator action.
 
 Same recovery path (`SourceRecovery::recover`) handles initial attach and
-mid-stream reconnect. Archive is the `[backup]` config in [config.md](config.md).
+mid-stream reconnect. Archive configuration is documented in
+[`docs/configuration.md`](../docs/configuration.md#backup-archive)
 
 ## BackupSource trait
 

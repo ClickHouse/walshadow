@@ -243,8 +243,7 @@ pub fn cli_over_toml<T>(cli: Option<T>, toml: Option<T>) -> Option<T> {
 /// [`ConfigResolver::materialize_opt_in`].
 ///
 /// Opt-in mappings live here, not in `base.tables`, so the `MappingHandle`
-/// full-swap in [`ConfigResolver::republish`] keeps them — fixing, for opt-in
-/// rels, the clobber the base [config.md] "Known limitation" describes.
+/// full-swap in [`ConfigResolver::republish`] keeps them
 #[derive(Debug, Clone, Default)]
 struct OptInState {
     /// Descriptor-derived mappings for tables opted in via `replicate=true`.
@@ -253,9 +252,7 @@ struct OptInState {
     /// Applicator-derived runtime mappings: `auto_create` CREATEs and ALTER
     /// diff folds ([`ConfigResolver::apply_schema_diff`]). Overlaid onto
     /// `resolved.tables` under `mappings`, so opt-in wins. Living here (not
-    /// only in the live handle) is what makes them survive the republish
-    /// full-swap — closing the auto-create half of the [config.md] "Known
-    /// limitation" clobber.
+    /// only in live handle) makes them survive republish full-swap
     derived: HashMap<RelName, TableMapping>,
     /// Tables opted out via `replicate=false` / `TableRemoved`; removed from
     /// `resolved.tables` even when TOML-mapped.
@@ -1369,8 +1366,7 @@ mod tests {
         assert!(rx.changed().await.is_ok());
         assert!(rx.borrow_and_update().tables.contains_key(&rel));
         assert!(mapping.with(|m| m.contains_key(&rel)).await);
-        // An unrelated overlay apply full-swaps the handle; the derived
-        // mapping must survive (the [config.md] "Known limitation" clobber)
+        // Unrelated overlay apply full-swaps handle, derived mapping must survive
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;

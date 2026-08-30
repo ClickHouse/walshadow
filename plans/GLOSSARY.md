@@ -122,22 +122,22 @@ verdict, ambiguous fails closed, tombstoned/uncovered discard counted
 
 **config precedence** — three-layer merge, highest wins:
 CLI > PG row > TOML; snapshot rebuilt whole per republish so it never
-tears ([config.md](config.md))
+tears ([configuration guide](../docs/configuration.md))
 
 **config\_\* tables** — four DBA-written tables on source PG
 (`config_global`, `config_namespace`, `config_table`, `config_column`)
 carrying overlay config; installed by `sql/runtime_config_install.sql`,
 REPLICA IDENTITY FULL, text-keyed so forward declaration works
-([config.md](config.md))
+([configuration guide](../docs/configuration.md))
 
 **ConfigEvent** — typed event interpreted from an intercepted
 config-table write; rides `DrainEntry::Config`, applies at row's commit
-LSN under barrier fence ([config.md](config.md))
+LSN under barrier fence ([src/runtime_config.rs](../src/runtime_config.rs))
 
 **ConfigResolver** — layered resolver merging TOML base, PG overlay, CLI
 into `ResolvedConfig` snapshots on a watch channel; SIGHUP re-reads
 TOML, malformed values reject at merge leaving prior value in effect
-([config.md](config.md))
+([src/config.rs](../src/config.rs))
 
 **contiguous-done watermark** — highest seq with `placed == acked` and
 every predecessor done; its `commit_lsn` is the durable frontier slot
@@ -194,7 +194,7 @@ surfaces ([xact.md](xact.md))
 Heaps merge beside control items; catalog-before-heap tie-break at equal
 `(xid, source_lsn)` makes ALTER land before dependent INSERT encodes,
 `OrderedEvent.row_idx` puts TOAST rows before lifecycle barriers
-([xact.md](xact.md), [config.md](config.md))
+([xact.md](xact.md), [src/runtime_config.rs](../src/runtime_config.rs))
 
 **emitter_ack_lsn** — contiguous-done commit LSN: every xact at/below is
 durable on CH. Advertised as standby `apply_lsn`, bounds source slot
@@ -231,7 +231,7 @@ bumping schema_epoch; barrier and shutdown path
 
 **forward declaration** — `config_table` row whose relation doesn't
 exist yet; parked keyed on `(namespace, relname)`, materialized when matching
-CREATE TABLE arrives ([config.md](config.md))
+CREATE TABLE arrives ([src/backfill/opt_in.rs](../src/backfill/opt_in.rs))
 
 **FPI** — full-page image on a WAL block ref; `restore_block_image`
 rebuilds 8 KiB page per compression method (none/pglz/lz4/zstd). Serves
@@ -267,7 +267,7 @@ Truncate ([decoder.md](decoder.md))
 **initial_load** — per-table pre-opt-in row source: `none`, `copy`
 (live COPY at `_lsn = S`), `base_backup` (fresh BASE_BACKUP),
 `object_store` (wal-g bucket + gap replay)
-([add_table.md](add_table.md), [config.md](config.md))
+([add_table.md](add_table.md), [table selection guide](../docs/table-selection.md))
 
 **InsertBatcher** — single hub task owning one TableEncoder per dest
 table; rows from all decoders merge into one part per flush window,
@@ -281,7 +281,7 @@ resend the still-owned batch and `_lsn` dedup absorbs duplicates
 
 **install probe** — `config_global` read at seed: schema named in TOML
 but not installed refuses boot, keeping overlay opt-in explicit
-([config.md](config.md))
+([src/bin/stream.rs](../src/bin/stream.rs))
 
 **interval lookup** — `descriptor_at(rfn, L)` / `descriptor_by_oid_at`:
 binary search of a key's version chain for the last entry with
@@ -322,7 +322,7 @@ than pg_class heap writes ([filter.md](filter.md),
 **MappingHandle** — live `Arc<RwLock<HashMap<String, TableMapping>>>`
 decode pool consults per row; refresher / SIGHUP swap it whole, cached
 encoders rebuild at next barrier ([emitter.md](emitter.md),
-[config.md](config.md))
+[src/mapping.rs](../src/mapping.rs))
 
 **memory budget / MemoryPermit** — process-wide resident-payload byte
 pool (`[memory]`), admission + leaf compartments; permits attach to
@@ -347,7 +347,7 @@ target format, rebuilt by inserter over batch's owned slabs
 **opt-in** — two related switches: `[runtime_config] schema` enables
 whole overlay subsystem; `config_table.replicate` opts one table into
 replication, triggering backfill per `initial_load`
-([config.md](config.md), [add_table.md](add_table.md))
+([table selection guide](../docs/table-selection.md), [add_table.md](add_table.md))
 
 **oracle** — PgPending resolver: shadow decodes on-disk bytes through
 the bridge worker's `DECODE` op (same `typoutput` PG would call) into text
@@ -361,7 +361,7 @@ barrier segments
 
 **overlay** — PG-row config layer: DBA-written `config_*` rows on source
 PG, replicated through WAL, applied at each row's commit LSN
-([config.md](config.md))
+([src/runtime_config.rs](../src/runtime_config.rs))
 
 **overlay scan** — unrelated to the config overlay: the bridge worker's
 `SCAN` op reading one uncommitted transaction's own catalog rows off
@@ -442,7 +442,7 @@ serves both ([source.md](source.md))
 
 **Regime A (failure containment)** — with WAL pump alive, malformed
 config value rejects at merge and prior value stays; never crashes,
-pauses, or abandons other keys ([config.md](config.md))
+pauses, or abandons other keys ([src/config.rs](../src/config.rs))
 
 **RelDescriptor / RelAttr** — per-relation / per-column catalog product
 from ShadowCatalog; dropped columns retained so decoder can walk null
@@ -487,12 +487,12 @@ commit boundaries) ([bootstrap.md](bootstrap.md))
 **row_budget / byte_budget / flush_timeout** — batch seal triggers
 (defaults 65536 rows / 1 MiB / 100 ms floor); live-reloadable knobs read
 by batcher per seal decision ([emitter.md](emitter.md),
-[config.md](config.md))
+[src/config.rs](../src/config.rs))
 
 **S** — WAL resume LSN for an opt-in: config row's commit LSN live, WAL
 resume LSN on boot re-run. `copy` and `base_backup` rows tag
 `_lsn = S`; "apply everything from S, discard nothing"
-([add_table.md](add_table.md), [config.md](config.md))
+([add_table.md](add_table.md), [table selection guide](../docs/table-selection.md))
 
 **schema_epoch** — counter bumped per FlushAll; table plans and inserter
 type caches key on it so post-DDL rows rebuild against new descriptors

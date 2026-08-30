@@ -9,76 +9,18 @@ no `--ignore-cursor`, no re-read past the ancestor tail, no skipped WAL
 A restart anywhere across a crossing is ordinary, because the crossing
 commits a resume position on the descendant before anything else moves onto
 it: every window either side of that commit resumes on the branch the floor
-names and reaches the same output
-([`tests/control_plane_e2e.rs`](../tests/control_plane_e2e.rs)). Unplanned
-promotion and ancestor-timeline base backups are
-[future/failover.md](future/failover.md)
+names and reaches the same output. Unplanned promotion and ancestor-timeline
+base backups are [future work](future/failover.md)
 
-Scope is operator-driven switchover — writes stop before promotion, so
-every transaction resolves and no torn record survives
-
-## Operator protocol
-
-```text
-old primary   writes ──────────────────► stop
-                    R     C  P
-target        replay ────────────────────► P ── promote ──► F ── TLI 5 ──►
-walshadow     consume ───► pause at C ········ resume ─► drain C→F ─► TLI 5
-
-              R = durable floor, C = frozen consumed frontier,
-              P = frozen received frontier (source head), F = fork
-              R <= C <= P <= F, arranged before promotion, proved after
-```
-
-1. pre-create the physical slot on the promotion target, when slot mode is
-   on. Its name is the target's to choose, since step 4 repoints
-   `[source] slot` along with the address, but it exists before step 4:
-   walshadow creates no slot it was not booted with, and one created at the
-   target's head reserves nothing below it. Physical slots are never
-   synchronized to a standby at any PostgreSQL version; PG 17 slot sync
-   covers logical slots created with `failover = true`
-   (`src/backend/replication/logical/slotsync.c`)
-2. `ctl apply` `[stream] paused = true`, read both frozen pause LSNs back
-   from `ctl status`
-3. stop writes on the old primary (demote, or `pg_ctl stop -m fast`)
-4. repoint `[source]` at the target with `ctl apply` (`slot` too, when the
-   target's slot is named differently), adopted live while paused, *before*
-   promoting it
-5. wait for `ctl status` `promotion_ready = true`, which is target replay
-   at or past `pause_received_lsn`, target receive level with target
-   replay, and the target still in recovery. `promotion_blocked_on` names
-   the first term that fails
-6. promote the target
-7. `ctl apply` `[stream] paused = false`
-
-Steps 2, 4, and 5 carry the obligations; the rest is orchestration
-walshadow does not join. Repoint before the wait, not after: the gate
-reads the target through the connection the repoint moved, so it needs no
-second tool and no second credential. Replay covering the old primary's
-final durable record is the same statement as replay covering
-`pause_received_lsn`, since the frozen head is what the source last
-reported
-
-`C` and `P` answer different questions. `C` is where resume asks the
-promoted target to start. `P` is the source head walshadow last heard
-about, which the target must reach before promotion. Freezing one
-without the other either understates what the target owes or misstates
-the resume position
-
-Repoint before promote because it collapses the two transition shapes into
-one: walshadow holds a connection to the server that gets promoted, so the
-walsender ends the ancestor stream with a next-timeline result rather than
-dropping it, and the promotion gate has somewhere to read from
-
-A stable endpoint (VIP, proxy, DNS) skips step 4 and still crosses, with no
-restart. Every reconnect proves continuity rather than equality
-(§Reconnect), so an address that comes back promoted is a fork to cross,
-not a stranger to refuse
+Scope is operator-driven switchover, writes stop before promotion so every
+transaction resolves and no torn record survives. Operator workflow and status
+fields live in [`docs/failover.md`](../docs/failover.md)
 
 ## What pause freezes
 
-Pause stops consumption, not production. `F` is created in step 6, after
-the freeze, so `received <= F` is arranged rather than hoped for:
+Pause stops consumption, not production. Let `C` be frozen consumed frontier,
+`P` frozen received frontier, and `F` fork created by promotion. Protocol
+arranges `C <= P <= F`:
 
 - `drain <= consumed <= received <= F`, so no ClickHouse row comes from
   WAL the descendant branch never had
@@ -93,21 +35,21 @@ the freeze, so `received <= F` is arranged rather than hoped for:
 Unpaused consumption inverts the first point: a target promoted while
 behind walshadow leaves rows in ClickHouse from a branch that no longer
 exists, with no path to remove them. Pause bounds that exposure to `C`,
-step 5 removes it
+promotion gate removes it
 
 Everything behind the frozen frontier keeps moving — floor,
 `emitter_ack`, descriptor batches, manifest cadence, shadow replay — so
 an aborted promotion resumes on the ancestor with no descendant artifact
 written, not with byte-identical artifacts
 
-A restart inside the pause comes back paused, since the pause is config,
-and re-freezes both numbers rather than restoring them (§Surfaces). Between
-steps 3 and 4 it comes back to an endpoint that is down, so boot waits for
+A restart inside pause comes back paused and re-freezes both numbers rather
+than restoring them. Between old-primary shutdown and target repoint it comes
+back to an endpoint that is down, so boot waits for
 the source instead of exiting: `ctl` and `/metrics` bind before the first
 connection attempt, and the repoint that ends the wait is applied to the
 daemon doing the waiting
 
-Fast shutdown narrows step 5 without being asked: it writes the shutdown
+Fast shutdown narrows promotion gate without being asked: it writes shutdown
 checkpoint, *then* wakes walsenders to drain, and the postmaster waits
 for them to exit (`src/backend/postmaster/postmaster.c`); `WalSndDone`
 exits only once the standby confirmed flush of everything sent
@@ -446,61 +388,6 @@ A clean `pg_ctl stop -m fast` reaches none of them: it rolls live sessions
 back and each xid-assigned transaction writes its abort before the
 shutdown checkpoint, so the ancestor tail between `P` and `F` resolves
 every transaction open at the pause
-
-## Surfaces
-
-`ctl status` carries the whole switchover surface
-([control.md](control.md) §Verbs): the cluster `source_system_id`, which
-orchestration reads back to confirm which one a repoint landed on; the
-branches `source_timeline`,
-`floor_timeline`, `shadow_served_timeline`, `shadow_replay_timeline`; the
-refusals `source_swap_blocked_on`, `crossing_blocked_on`,
-`crossing_detail`; the gate `promotion_ready`, `promotion_blocked_on`,
-`target_in_recovery`, `target_replay_lsn`, `target_receive_lsn`; and the
-LSNs `pause_consumed_lsn`, `pause_received_lsn`, `floor`,
-`source_received`, `drain`, `emitter_ack`, `shadow_replay`
-
-Both `pause_*` freeze when the pump observes the pause and read `0/0`
-otherwise, so a promotion decision compares against a frontier that cannot
-move under it. A restart mid-pause re-freezes them — conservatively, since
-consumed drops back to the floor and received re-derives from the live head
-— which moves numbers a decision was already taken from, so
-`pause_refrozen` says the pair has to be read again
-
-The two shadow branches are what separate a shadow that followed the chain
-from one that merely survived: served is what the walsender advertises,
-replay is the oldest branch an attached client is still reading
-
-`[stream] paused` is the only control input; a dedicated switchover verb
-would add a state machine for what pause plus these checks already do
-
-Metrics: `walshadow_source_info{system_id}` — a label, since a 64-bit
-identifier does not survive a float sample — plus
-`walshadow_source_timeline`, `walshadow_floor_timeline`,
-`walshadow_shadow_served_timeline`, `walshadow_shadow_replay_timeline`,
-`walshadow_timeline_switches_total`,
-`walshadow_timeline_switch_failures_total{reason}`,
-`walshadow_timeline_switch_lsn`,
-`walshadow_timeline_prefix_bytes_verified_total`,
-`walshadow_timeline_transition_seconds_total`,
-`walshadow_crossing_wedged`, `walshadow_pause_consumed_lsn`,
-`walshadow_pause_received_lsn`
-
-`walshadow_timeline_switch_lsn` comes off the chain at boot, so it reports
-the fork a restart resumed across rather than zero
-
-Every transition logs system id, both timelines, switch LSN, resume LSN,
-committed floor, `drain` as the publication ceiling, verified prefix bytes,
-and slot. The proof, each barrier wait with its `waiting_on` label, and the
-commit log separately, so a crossing that pauses says where. Never
-credentials or full connection strings
-
-`ctl status` and `/metrics` keep answering across the barrier, and across a
-parked crossing: the pump holds the fork proof rather than blocking inside
-the crossing, so the loop publishes every tick. The pair it publishes is re-read at publish time
-rather than reused from the top of the iteration, so the crossing's own
-iteration reports the committed floor and branch instead of the values it
-started with
 
 ## Stream end shapes
 
