@@ -352,6 +352,7 @@ async fn walk_and_ship(
         DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX),
         ctx.emitter.row_policy(),
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
+        ctx.oracle.clone(),
     ));
 
     // Success signal before the joins: gate resolves deferred tuples only

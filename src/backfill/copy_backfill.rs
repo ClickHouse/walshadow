@@ -72,6 +72,7 @@ use crate::decode::heap_decoder::ColumnValue;
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::emit::pipeline::{Fatal, bootstrap, tail};
 use crate::mapping::MappingHandle;
+use crate::ops::oracle::Oracle;
 use crate::pg::{current_wal_lsn, quote_ident};
 use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
@@ -412,6 +413,7 @@ pub struct CopyBackfiller {
     /// Pipeline's resident-payload pool: backup passes run concurrently
     /// with live streaming and draw from the same budget
     budget: Option<crate::budget::MemoryBudget>,
+    oracle: Option<Arc<Oracle>>,
     /// Fixed scratch paths require one cluster backup pass at a time
     backup_pass_lock: Mutex<()>,
     inner: Mutex<Inner>,
@@ -434,6 +436,7 @@ impl CopyBackfiller {
         spill_dir: &Path,
         config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
         budget: Option<crate::budget::MemoryBudget>,
+        oracle: Option<Arc<Oracle>>,
     ) -> Self {
         let ledger = Ledger::load(spill_dir).await;
         let emitter = Arc::new(emitter);
@@ -454,6 +457,7 @@ impl CopyBackfiller {
             spill_dir: spill_dir.to_path_buf(),
             config_rx,
             budget,
+            oracle,
             backup_pass_lock: Mutex::new(()),
             inner: Mutex::new(Inner {
                 ledger,
@@ -726,6 +730,7 @@ impl CopyBackfiller {
             scratch_dir: self.spill_dir.join("backup_backfill"),
             config_rx: self.config_rx.clone(),
             budget: self.budget.clone(),
+            oracle: self.oracle.clone(),
         };
         let outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, reqs).await?;
         self.publish_staged(&staging, reqs).await;
@@ -1071,6 +1076,7 @@ impl CopyBackfiller {
             ),
             self.emitter.row_policy(),
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
+            None,
         ));
 
         let plan = column_plan(desc);

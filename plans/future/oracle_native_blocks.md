@@ -66,8 +66,8 @@ column-major batch):
 
 This only changes *where* serialization happens; it still needs a live PG with
 the walshadow module to do the decoding. Greenfield has none until after
-bootstrap — that gap is [greenfield_oracle.md](greenfield_oracle.md), and the
-two are independent.
+bootstrap — that is handled by the bootstrap oracle
+([../bootstrap.md](../bootstrap.md)), independently of this.
 
 ## Alternative considered
 

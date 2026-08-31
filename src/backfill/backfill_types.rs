@@ -10,6 +10,7 @@ use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::mapping::MappingHandle;
+use crate::ops::oracle::Oracle;
 use crate::schema::RelDescriptor;
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,7 @@ pub struct PassContext {
     pub scratch_dir: PathBuf,
     pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
     pub budget: Option<MemoryBudget>,
+    pub oracle: Option<Arc<Oracle>>,
 }
 
 #[derive(Debug, Default, Clone)]

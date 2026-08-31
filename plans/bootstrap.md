@@ -54,10 +54,10 @@ for rendered diagram. Five clusters top→bottom:
    `tail.finish` seals partial batches and waits all seqs durable
    before handoff. Metrics-only runs (no `--ch-config`) instead drain
    through `drain_backfill` into a counting `TupleObserver`.
-   Bridge-routed tier-3 values (jsonb, arrays, hstore, …) can't be
-   resolved here — the shadow/bridge don't exist until after bootstrap —
-   so they currently land empty; in-tree types (geography, vector) are
-   fine. Fix in [future/greenfield_oracle.md](future/greenfield_oracle.md)
+   Bridge-routed tier-3 values (jsonb, arrays, hstore, enums, …) are
+   resolved here by the bootstrap oracle (see below), since the real
+   shadow/bridge don't exist until after bootstrap; in-tree types
+   (geography, vector) render without it.
 4. **Shadow handoff** — `BootstrapOutcome { start, end }` returned;
    daemon writes `standby.signal` and calls `materialize_conf` to
    replace shadow's config files. Config includes walshadow settings,
@@ -74,6 +74,37 @@ for rendered diagram. Five clusters top→bottom:
 
 Phases 1-3 run synchronously inside `run_bootstrap`; phases 4-5 hand off
 to daemon's main loop
+
+## Bootstrap oracle — tier-3 resolution
+
+The page-walk yields raw on-disk Datums, so bridge-routed tier-3 types
+(jsonb, arrays, hstore, citext, enums, ranges, domains) carry the source
+`atttypid` and need a PG to run `typoutput` by OID — but the real shadow
+isn't up until phase 4. `run_bootstrap` therefore stands up a throwaway,
+**OID-exact** side PG (`BootstrapOracle`, `src/backfill/bootstrap_oracle.rs`)
+before the drain and points the bridge/oracle at it, resolving tier-3 inline,
+single-pass, for Direct and ObjectStore alike.
+
+- **OID-exact from schema only.** `initdb` → start `postgres -b` (binary-upgrade
+  mode) → `pg_dump --binary-upgrade --schema-only --no-owner --no-privileges`
+  from source, applied in → stop → restart normal with `shared_preload_libraries
+  = 'walshadow'`. `--binary-upgrade` pins every `pg_type`/`pg_enum` OID (and
+  extension member OIDs) to the source's — the pg_upgrade mechanism. Schema-only,
+  so dataset size is irrelevant. `-b` is needed only to apply the dump; serving
+  runs in normal mode. `Drop` stops it and removes the scratch dir.
+- **Drain wiring.** `bootstrap::drain` takes `oracle: Option<Arc<Oracle>>`; a
+  `resolve_row` helper runs on every route path — `render_ext_columns` (in-tree
+  geography/vector, no PG) then `resolve_pending_tuple` (bridge).
+- **Gated.** Provisioned only when the mapped set has a bridge-routed tier-3
+  column (`needs_bridge`); in-tree-only (vector/geography) or scalar schemas skip
+  it.
+- **Fails hard.** If provisioning fails (e.g. an extension `.so` isn't
+  installable on the host — same requirement the shadow already has), bootstrap
+  errors out rather than loading empty columns; `Unsupported` stays fail-closed.
+- **Opt-in backup-backfill** (`initial_load = base_backup`/`object_store`,
+  `backup_backfill.rs`) has the same raw-Datum shape and reuses the **live**
+  oracle via `PassContext.oracle` — steady state, real shadow already up.
+- Coverage validated by `tests/bootstrap_types_e2e.rs`.
 
 ## Restart contract
 
