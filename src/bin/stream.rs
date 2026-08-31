@@ -4133,8 +4133,10 @@ fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
 /// Run BASE_BACKUP into new shadow data dir and return backup `end_lsn`
 /// Caller starts WAL pump from returned LSN, then starts and supervises
 /// shadow in [`run`]
-/// [`BOOTSTRAP_INCOMPLETE_MARKER`] remains after any failed bootstrap;
-/// automatic rebootstrap is intentionally unsupported
+/// Config, credential, and CH-endpoint failures are resolved before the data
+/// dir is created, so they leave nothing behind. Once extraction starts,
+/// [`BOOTSTRAP_INCOMPLETE_MARKER`] remains after a failure; automatic
+/// rebootstrap is intentionally unsupported
 ///
 /// `ch_config` `Some`: bootstrap rows route through the shared insert tail
 /// (synthetic INSERT `_lsn = start_lsn`, `_commit_ts = 0`, `_is_deleted = 0`).
@@ -4152,9 +4154,6 @@ async fn run_bootstrap(
         .bootstrap_shadow_data_dir
         .clone()
         .context("--bootstrap-shadow-data-dir required when --bootstrap-mode != off")?;
-    prepare_bootstrap_dir(&shadow_data_dir)
-        .await
-        .context("prepare shadow data dir for bootstrap")?;
 
     // Never land a base backup onto a dir that already holds a cluster: a
     // `PG_VERSION` with no completion marker is a crashed bootstrap or a
@@ -4243,7 +4242,6 @@ async fn run_bootstrap(
         BootstrapMode::Off => unreachable!("dispatch happened in run()"),
     };
 
-    let cfg = BootstrapConfig::new(shadow_data_dir.clone());
     // Tail drain gets a second CatalogMap clone for rfn → descriptor
     // lookups; cheap since `Arc<RelDescriptor>` values stay shared.
     let drain_catalog = catalog_map.clone();
@@ -4261,9 +4259,25 @@ async fn run_bootstrap(
         ToastResolver::disabled()
     };
     let store_toast = resolver.stores_chunks();
+
+    let ch_target = match ch_config {
+        Some(emitter_cfg) => {
+            let mapping = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
+                .await
+                .context("bootstrap: build mapping")?;
+            Some((emitter_cfg, mapping))
+        }
+        None => None,
+    };
+
+    prepare_bootstrap_dir(&shadow_data_dir)
+        .await
+        .context("prepare shadow data dir for bootstrap")?;
+
+    let cfg = BootstrapConfig::new(shadow_data_dir.clone());
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
 
-    let (shipped, outcome) = if let Some(emitter_cfg) = ch_config {
+    let (shipped, outcome) = if let Some((emitter_cfg, mapping)) = ch_target {
         // Route bootstrap rows through the shared insert tail. Bootstrap
         // is the easy case: every row op=Insert at _lsn = start_lsn, no
         // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
@@ -4285,10 +4299,6 @@ async fn run_bootstrap(
         )
         .await
         .context("bootstrap: spawn insert tail")?;
-        // [table.*] plus auto_create-namespace tables, created on CH here.
-        let mapping = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
-            .await
-            .context("bootstrap: build mapping")?;
         tracing::info!(
             target: "walshadow::bootstrap",
             addr = %addr,
