@@ -52,9 +52,10 @@ components. User workflows and supported behavior live under
 [future/INDEX.md](future/INDEX.md) collects design docs for unbuilt work:
 runtime-config signals and net-new knobs, two-phase commit,
 sequence-state replication, cross-table ordering, CH-bounce recovery,
-parked operational polish. Once built, keep behavior in code and tests, move
-user-facing consequences into `docs/`, and retain only rationale or invariants
-which code cannot express
+greenfield tier-3 oracle (throwaway bootstrap PG), oracle emitting CH-native
+blocks, parked operational polish. Once built, keep behavior in code and tests,
+move user-facing consequences into `docs/`, and retain only rationale or
+invariants which code cannot express
 
 ## Architecture diagrams
 

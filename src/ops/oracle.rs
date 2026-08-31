@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::decode::heap_decoder::ColumnValue;
 use crate::ops::bridge::{Bridge, DecodedItem};
+use crate::schema::RelAttr;
 
 crate::atomic_stats! {
     pub struct OracleStats {
@@ -117,6 +118,77 @@ pub async fn resolve_pending_tuple(oracle: &Oracle, columns: &mut [Option<Column
     }
 }
 
+/// Render extension types with dynamic OIDs that the bridge can't (or
+/// shouldn't) resolve, from their raw on-disk bytes to text, in place:
+/// - PostGIS `geography`/`geometry` 2-D points → WKT `POINT(x y)` (typoutput
+///   would yield HEXEWKB, and the oracle can't call `ST_AsText`).
+/// - pgvector `vector`/`halfvec` → `[a,b,c]` (decoded in-tree so the shadow
+///   needs no pgvector; the emitter parses this into `Array(Float32)`).
+pub fn render_ext_columns(attrs: &[RelAttr], columns: &mut [Option<ColumnValue>]) {
+    for att in attrs {
+        if att.dropped {
+            continue;
+        }
+        let Ok(idx) = usize::try_from(att.attnum - 1) else {
+            continue;
+        };
+        let Some(cell) = columns.get_mut(idx) else {
+            continue;
+        };
+        let Some(ColumnValue::PgPending { raw, .. }) = cell.as_ref() else {
+            continue;
+        };
+        let rendered = match att.type_name.as_str() {
+            "geography" | "geometry" => gserialized_point_to_wkt(raw),
+            "vector" | "halfvec" => vector_to_text(raw),
+            _ => None,
+        };
+        if let Some(text) = rendered {
+            *cell = Some(ColumnValue::Text(text));
+        }
+    }
+}
+
+/// pgvector on-disk `vector`: `[dim u16-le][unused u16-le][f32-le × dim]` →
+/// `[a,b,c]`. `None` if the body is short of `dim` floats.
+fn vector_to_text(raw: &[u8]) -> Option<String> {
+    if raw.len() < 4 {
+        return None;
+    }
+    let dim = u16::from_le_bytes(raw[0..2].try_into().ok()?) as usize;
+    if raw.len() < 4 + dim * 4 {
+        return None;
+    }
+    let mut out = String::from("[");
+    for i in 0..dim {
+        if i > 0 {
+            out.push(',');
+        }
+        let off = 4 + i * 4;
+        let f = f32::from_le_bytes(raw[off..off + 4].try_into().ok()?);
+        out.push_str(&f.to_string());
+    }
+    out.push(']');
+    Some(out)
+}
+
+/// PostGIS on-disk GSERIALIZED → `POINT(x y)` for 2-D points. Layout:
+/// `[srid(3) + gflags(1)][geomtype u32-le][…]`; POINT has geomtype 1 and its
+/// two `f64`-LE coordinates are the trailing 16 bytes. `None` for non-points.
+fn gserialized_point_to_wkt(raw: &[u8]) -> Option<String> {
+    if raw.len() < 16 {
+        return None;
+    }
+    let geomtype = u32::from_le_bytes(raw[4..8].try_into().ok()?);
+    if geomtype != 1 {
+        return None;
+    }
+    let n = raw.len();
+    let x = f64::from_le_bytes(raw[n - 16..n - 8].try_into().ok()?);
+    let y = f64::from_le_bytes(raw[n - 8..n].try_into().ok()?);
+    Some(format!("POINT({x} {y})"))
+}
+
 impl OracleStats {
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
@@ -138,6 +210,30 @@ impl OracleStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gserialized_2d_point_renders_wkt() {
+        // [srid+gflags:4][geomtype=1:4][X f64le][Y f64le]
+        let mut raw = vec![0u8, 0, 0, 0, 1, 0, 0, 0];
+        raw.extend_from_slice(&30.5_f64.to_le_bytes());
+        raw.extend_from_slice(&81.25_f64.to_le_bytes());
+        assert_eq!(
+            gserialized_point_to_wkt(&raw).as_deref(),
+            Some("POINT(30.5 81.25)")
+        );
+        // non-point geomtype → None
+        raw[4] = 2;
+        assert_eq!(gserialized_point_to_wkt(&raw), None);
+    }
+
+    #[test]
+    fn vector_body_renders_bracket_list() {
+        let mut raw = vec![3u8, 0, 0, 0]; // dim=3, unused=0
+        for f in [1.5f32, 2.0, 3.25] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(vector_to_text(&raw).as_deref(), Some("[1.5,2,3.25]"));
+    }
 
     #[test]
     fn stats_summary_skips_zero_buckets() {

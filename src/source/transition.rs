@@ -298,7 +298,7 @@ impl ForkBarrier {
                 fork_segment,
             });
         }
-        if !self.shadow_apply_lsn.is_some_and(|a| a >= switch_lsn.get()) {
+        if self.shadow_apply_lsn.is_none_or(|a| a < switch_lsn.get()) {
             return Some(ForkWait::ShadowApply {
                 applied: self.shadow_apply_lsn,
                 fork: switch_lsn,
