@@ -233,7 +233,7 @@ produces correct survivor set
 
 ## Spill backend
 
-[`src/spill.rs`](../src/spill.rs). File name
+[`src/xact/spill.rs`](../src/xact/spill.rs). File name
 `xid-{xid:010}-{first_lsn:016X}.bin` mirrors PG's
 `pg_replslot/<slot>/xid-*.snap` shape; without LSN suffix, two streams
 that picked up same xid value after a slot rebuild or post-restart
@@ -281,7 +281,7 @@ always "drained into CH" or "replayable from the floor"
 Sibling file families share the dir and the startup wipe: per-drain
 TOAST body spools (`toastbody-{xid:010}-{commit_lsn:016X}.bin`, raw
 concatenated bodies, no framing — `BodyRef` ranges are process-local)
-and deferred-record spools ([`src/spool.rs`](../src/spool.rs), own
+and deferred-record spools ([`src/backfill/spool.rs`](../src/backfill/spool.rs), own
 "WD" magic + version so a cross-read fails as `SpillError::Format`).
 Disk is unmetered — spilling is the pressure release for the memory
 budget, so it must always succeed; sizing the spill volume is an

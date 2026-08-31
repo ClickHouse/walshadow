@@ -241,14 +241,15 @@ pub enum ColumnValue {
     Interval(crate::decode::codecs::IntervalValue),
     /// `json` Tier 3, varlena text on disk, passed through unchanged.
     Json(String),
-    /// Tier 3 deferred (not numeric/inet/interval/json). Carries raw
-    /// on-disk body; resolved to text post-plan by shadow PG's `typoutput`
-    /// over the bridge socket, best effort: shadow may lag row's catalog
-    /// state. Unresolved (bridge transport failed or `typoutput` raised, counted
-    /// `fallback_raw`): emitter appends raw on-disk bytes.
+    /// Unhandled on-disk Datum body, varlena header stripped
     PgPending {
         type_oid: u32,
         raw: Vec<u8>,
+    },
+    /// Attribute default text requiring `typinput`, not Datum reconstruction
+    PgPendingText {
+        type_oid: u32,
+        text: String,
     },
     /// On-disk TOAST pointer; xact buffer's TOAST reassembly dereferences.
     ExternalToast(ToastPointer),
@@ -288,6 +289,7 @@ impl ColumnValue {
             ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => s.len(),
             ColumnValue::Bytea(b) => b.len(),
             ColumnValue::PgPending { raw, .. } | ColumnValue::Unsupported { raw, .. } => raw.len(),
+            ColumnValue::PgPendingText { text, .. } => text.len(),
             ColumnValue::ExternalToast(_) => 16,
         }
     }
@@ -872,7 +874,7 @@ fn decode_tuple_payload(
 }
 
 /// Resolve `RelAttr::missing_text` (PG `attmissingval[1]::text`) via the
-/// Tier 1/2 matrix; Tier 3 falls to `PgPending` (oracle resolves at emit).
+/// Tier 1/2 matrix; Tier 3 falls to `PgPendingText` (oracle resolves at emit).
 /// `Null` when attribute has no missing default.
 pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
     let Some(text) = att.missing_text.as_deref() else {
@@ -914,11 +916,10 @@ pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
             .unwrap_or(ColumnValue::Null),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID => ColumnValue::Text(text.to_owned()),
         JSONOID => ColumnValue::Json(text.to_owned()),
-        // typoutput text is what typinput expects, so shadow recovers bytea
-        // via text -> oid -> typinput -> typsend
-        _ => ColumnValue::PgPending {
+        // attmissingval text requires typinput
+        _ => ColumnValue::PgPendingText {
             type_oid: att.type_oid,
-            raw: text.as_bytes().to_vec(),
+            text: text.to_owned(),
         },
     }
 }
@@ -1283,6 +1284,35 @@ pub(crate) fn varlena_to_value(type_oid: u32, body: Cow<[u8]>) -> ColumnValue {
             type_oid,
             raw: body.into_owned(),
         },
+    }
+}
+
+/// Match decoder paths producing typed values
+pub(crate) fn local_matrix_covers(type_oid: u32, type_len: i16) -> bool {
+    match type_len {
+        -1 => matches!(
+            type_oid,
+            BYTEAOID | TEXTOID | VARCHAROID | BPCHAROID | NUMERICOID | INETOID | CIDROID | JSONOID
+        ),
+        -2 => true,
+        _ => matches!(
+            type_oid,
+            BOOLOID
+                | CHAROID
+                | INT2OID
+                | INT4OID
+                | INT8OID
+                | FLOAT4OID
+                | FLOAT8OID
+                | OIDOID
+                | DATEOID
+                | TIMEOID
+                | TIMESTAMPOID
+                | TIMESTAMPTZOID
+                | TIMETZOID
+                | UUIDOID
+                | INTERVALOID
+        ),
     }
 }
 
@@ -2009,16 +2039,83 @@ mod tests {
 
         let mut num = rel_attr(1, "n", NUMERICOID, -1, 'i');
         num.missing_text = Some("3.14".into());
-        match missing_value_for(&num) {
-            ColumnValue::PgPending { type_oid, raw } => {
-                assert_eq!(type_oid, NUMERICOID);
-                assert_eq!(raw, b"3.14");
+        assert_eq!(
+            missing_value_for(&num),
+            ColumnValue::PgPendingText {
+                type_oid: NUMERICOID,
+                text: "3.14".into(),
             }
-            other => panic!("expected PgPending for numeric, got {other:?}"),
-        }
+        );
 
         let none = rel_attr(1, "x", INT4OID, 4, 'i');
         assert_eq!(missing_value_for(&none), ColumnValue::Null);
+    }
+
+    #[test]
+    fn local_matrix_agrees_with_decoder() {
+        let fixed: [(u32, i16); 17] = [
+            (BOOLOID, 1),
+            (CHAROID, 1),
+            (INT2OID, 2),
+            (INT4OID, 4),
+            (INT8OID, 8),
+            (FLOAT4OID, 4),
+            (FLOAT8OID, 8),
+            (OIDOID, 4),
+            (DATEOID, 4),
+            (TIMEOID, 8),
+            (TIMESTAMPOID, 8),
+            (TIMESTAMPTZOID, 8),
+            (TIMETZOID, 12),
+            (UUIDOID, 16),
+            (INTERVALOID, 16),
+            (NAMEOID, 64),
+            (2202, 4),
+        ];
+        for (oid, len) in fixed {
+            let att = rel_attr(1, "c", oid, len, 'i');
+            let buf = vec![0u8; len as usize];
+            let (v, _) = decode_one_value(&att, &buf, 0).expect("decodes");
+            let raw = matches!(
+                v,
+                ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. }
+            );
+            assert_eq!(
+                !raw,
+                local_matrix_covers(oid, len),
+                "oid {oid} typlen {len}"
+            );
+        }
+
+        let bodies: [(u32, Vec<u8>); 9] = [
+            (BYTEAOID, vec![1, 2]),
+            (TEXTOID, b"x".to_vec()),
+            (VARCHAROID, b"x".to_vec()),
+            (BPCHAROID, b"x".to_vec()),
+            (NUMERICOID, {
+                let mut n = 0x8000u16.to_le_bytes().to_vec();
+                n.extend_from_slice(&1i16.to_le_bytes());
+                n
+            }),
+            (
+                INETOID,
+                vec![crate::decode::codecs::PGSQL_AF_INET, 32, 1, 2, 3, 4],
+            ),
+            (
+                CIDROID,
+                vec![crate::decode::codecs::PGSQL_AF_INET, 32, 1, 2, 3, 4],
+            ),
+            (JSONOID, b"{}".to_vec()),
+            (3802, vec![0, 0, 0, 0]),
+        ];
+        for (oid, body) in bodies {
+            let v = varlena_to_value(oid, Cow::Owned(body));
+            let raw = matches!(
+                v,
+                ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. }
+            );
+            assert_eq!(!raw, local_matrix_covers(oid, -1), "varlena oid {oid}");
+        }
     }
 
     #[test]

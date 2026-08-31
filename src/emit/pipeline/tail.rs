@@ -100,7 +100,16 @@ pub async fn spawn(
     emitter_ack: Arc<Monotone<EmitterAck>>,
     fatal: Fatal,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
-    spawn_with_config(emitter, inserter_pool_size, stats, emitter_ack, fatal, None).await
+    spawn_with_config(
+        emitter,
+        inserter_pool_size,
+        stats,
+        emitter_ack,
+        fatal,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Metrics-only tail: ack collector + one swallow task, zero CH
@@ -152,6 +161,7 @@ pub async fn spawn_with_config(
     emitter_ack: Arc<Monotone<EmitterAck>>,
     fatal: Fatal,
     config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    oracle: Option<Arc<crate::ops::oracle::Oracle>>,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
     let n = inserter_pool_size.max(1);
 
@@ -169,7 +179,10 @@ pub async fn spawn_with_config(
         ack.clone(),
         stats.clone(),
         fatal.clone(),
-        config_rx.clone(),
+        inserter::PoolOptions {
+            config_rx: config_rx.clone(),
+            oracle,
+        },
     )
     .await?;
 

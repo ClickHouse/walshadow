@@ -22,7 +22,8 @@ Static catalog snapshot would force three concessions:
 Second Postgres beside wal-rus, schema only with WAL-driven catalog, removes all
 three. Source DDL writes catalog heap records, replay keeps shadow `pg_catalog`
 current without operator coordination. Relfilenode rewrites ride same WAL.
-`typsend` and `typoutput` on shadow provide differential oracle over libpq
+Shadow also converts types walshadow has no codec for, through a preloaded
+PG module ([oracle](oracle.md))
 
 Cost is one extra `postgres` process, schema-sized data directory, and CPU for
 catalog-WAL filtering plus CRC rewrite. Catalog WAL is a small fraction of
@@ -90,5 +91,6 @@ walshadow and remains preferred until measurement disproves its cost
 - [transaction buffer](xact.md), commit ordering and spill
 - [emitter](emitter.md), ClickHouse pipeline and DDL barriers
 - [bootstrap](bootstrap.md), initial shadow and row load
+- [oracle](oracle.md), Native conversion on shadow for undecoded types
 - [operations](ops.md), durable floor and retention
 - [source timeline crossing](failover.md), planned branch transition proof

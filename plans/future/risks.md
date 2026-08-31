@@ -20,7 +20,7 @@ sized
 ## Catalog cache invalidation granularity
 
 `ShadowCatalog`'s single generation counter bumps on any `pg_class`
-write — see [`src/shadow_catalog.rs`](../src/shadow_catalog.rs).
+write — see [`src/catalog/shadow_catalog.rs`](../../src/catalog/shadow_catalog.rs).
 Over-invalidates: an unrelated `ALTER TABLE t1 ADD COLUMN` evicts
 `t2`'s cached descriptor. Cache hit-rate hit is real but
 typically benign because catalog writes are rare relative to heap
@@ -52,12 +52,12 @@ at steady state; alarm threshold should match
 
 ## Differential oracle false positives
 
-[`src/oracle.rs`](../src/oracle.rs) compares decoder text against
+[`src/ops/oracle.rs`](../../src/ops/oracle.rs) compares decoder text against
 shadow's `SELECT $1::bytea::<typ>::text`. Sensitive to locale-bound
 output: numeric thousands separator, timestamp formatting, money
 
 Pinned at bootstrap today: shadow `initdb` forces `lc_numeric=C`
-and `lc_time=C`. Documented in [`src/shadow.rs`](../src/shadow.rs)
+and `lc_time=C`. Documented in [`src/catalog/shadow.rs`](../../src/catalog/shadow.rs)
 init path. Closes the locale axis
 
 Remaining risk: timezone DB skew. Shadow's `pg_timezone_names` and

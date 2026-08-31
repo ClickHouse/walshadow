@@ -18,8 +18,8 @@ use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::emit::route::{RouteSnapshot, RowPolicy};
 use crate::mapping::{MappingHandle, TableMapping};
-use crate::ops::oracle::{Oracle, render_ext_columns, resolve_pending_tuple};
-use crate::schema::{RelAttr, RelDescriptor, RelName};
+use crate::ops::oracle::render_ext_columns;
+use crate::schema::{RelDescriptor, RelName};
 use crate::toast::{
     CHUNK_PUT_BATCH, CHUNK_PUT_BYTES, FetchedValue, ToastResolver, ToastRow, check_value_caps,
     detoasted_value, finish_value, pointer_extsize,
@@ -50,7 +50,6 @@ pub async fn drain(
     mut deferred: DeferredSpool,
     row_policy: RowPolicy,
     config: Option<Arc<ResolvedConfig>>,
-    oracle: Option<Arc<Oracle>>,
     skip_initial: HashSet<RelName>,
 ) -> Result<BootstrapDrainOutcome, String> {
     // Routes frozen once per pass from the caller's config snapshot
@@ -136,14 +135,14 @@ pub async fn drain(
             }
             let mut tuple = tuple;
             let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
-            resolve_row(oracle.as_deref(), &rel.attributes, &mut tuple.columns).await;
+            render_ext_columns(&rel.attributes, &mut tuple.columns);
             route_row(&msg_tx, seq, rel, route, tuple, permit).await?;
             bump(&mut open, &mut rows_routed);
             continue;
         }
 
         let mut tuple = tuple;
-        resolve_row(oracle.as_deref(), &rel.attributes, &mut tuple.columns).await;
+        render_ext_columns(&rel.attributes, &mut tuple.columns);
         route_row(&msg_tx, seq, rel, route, tuple, None).await?;
         bump(&mut open, &mut rows_routed);
     }
@@ -185,7 +184,7 @@ pub async fn drain(
                 continue;
             };
             let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
-            resolve_row(oracle.as_deref(), &rel.attributes, &mut tuple.columns).await;
+            render_ext_columns(&rel.attributes, &mut tuple.columns);
             route_row(&msg_tx, seq, rel, route, tuple, permit).await?;
             placed += 1;
             rows_routed += 1;
@@ -212,17 +211,6 @@ fn bump(open: &mut Option<(walrus::pg::walparser::RelFileNode, u64, u64)>, rows_
         slot.2 += 1;
     }
     *rows_routed += 1;
-}
-
-async fn resolve_row(
-    oracle: Option<&Oracle>,
-    attrs: &[RelAttr],
-    columns: &mut [Option<ColumnValue>],
-) {
-    render_ext_columns(attrs, columns);
-    if let Some(o) = oracle {
-        resolve_pending_tuple(o, columns).await;
-    }
 }
 
 async fn route_row(
@@ -590,7 +578,6 @@ mod tests {
             mem_spool(),
             Default::default(),
             None,
-            None,
             std::collections::HashSet::new(),
         ));
 
@@ -644,7 +631,6 @@ mod tests {
             mem_spool(),
             Default::default(),
             None,
-            None,
             std::collections::HashSet::new(),
         ));
 
@@ -694,7 +680,6 @@ mod tests {
             resolver,
             mem_spool(),
             Default::default(),
-            None,
             None,
             std::collections::HashSet::new(),
         ));
@@ -762,7 +747,6 @@ mod tests {
             DeferredSpool::new(spool_tmp.path().join("bootstrap_deferred.bin"), 0),
             Default::default(),
             None,
-            None,
             std::collections::HashSet::new(),
         ));
 
@@ -821,7 +805,6 @@ mod tests {
             ToastResolver::with_store(store, stats.clone()),
             mem_spool(),
             Default::default(),
-            None,
             None,
             std::collections::HashSet::new(),
         ));

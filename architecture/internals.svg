@@ -516,7 +516,7 @@
 <path fill="#5d4628" stroke="#6e6963" d="M731.87,-830.42C731.87,-830.42 526.87,-830.42 526.87,-830.42 520.87,-830.42 514.87,-824.42 514.87,-818.42 514.87,-818.42 514.87,-783.42 514.87,-783.42 514.87,-777.42 520.87,-771.42 526.87,-771.42 526.87,-771.42 731.87,-771.42 731.87,-771.42 737.87,-771.42 743.87,-777.42 743.87,-783.42 743.87,-783.42 743.87,-818.42 743.87,-818.42 743.87,-824.42 737.87,-830.42 731.87,-830.42"/>
 <text xml:space="preserve" text-anchor="middle" x="629.37" y="-816.92" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">decode pool ×M</text>
 <text xml:space="preserve" text-anchor="middle" x="629.37" y="-804.17" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">planned envelopes (descriptor + route ride)</text>
-<text xml:space="preserve" text-anchor="middle" x="629.37" y="-791.42" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">oracle PgPending resolve</text>
+<text xml:space="preserve" text-anchor="middle" x="629.37" y="-791.42" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">oracle columns stay raw</text>
 <text xml:space="preserve" text-anchor="middle" x="629.37" y="-778.67" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">chunk 1024 rows / 4 MiB</text>
 </g>
 <!-- drain&#45;&gt;cdecode -->
@@ -594,22 +594,23 @@
 <!-- chwire -->
 <g id="node24" class="node">
 <title>chwire</title>
-<path fill="#5d4628" stroke="#6e6963" d="M701.12,-377.92C701.12,-377.92 557.62,-377.92 557.62,-377.92 551.62,-377.92 545.62,-371.92 545.62,-365.92 545.62,-365.92 545.62,-330.92 545.62,-330.92 545.62,-324.92 551.62,-318.92 557.62,-318.92 557.62,-318.92 701.12,-318.92 701.12,-318.92 707.12,-318.92 713.12,-324.92 713.12,-330.92 713.12,-330.92 713.12,-365.92 713.12,-365.92 713.12,-371.92 707.12,-377.92 701.12,-377.92"/>
-<text xml:space="preserve" text-anchor="middle" x="629.37" y="-364.42" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">inserter pool ×N</text>
-<text xml:space="preserve" text-anchor="middle" x="629.37" y="-351.67" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">BlockBuilder over sealed batch</text>
-<text xml:space="preserve" text-anchor="middle" x="629.37" y="-338.92" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">one complete INSERT each</text>
-<text xml:space="preserve" text-anchor="middle" x="629.37" y="-326.17" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">send_with_retry + reconnect</text>
+<path fill="#5d4628" stroke="#6e6963" d="M701.12,-384.3C701.12,-384.3 557.62,-384.3 557.62,-384.3 551.62,-384.3 545.62,-378.3 545.62,-372.3 545.62,-372.3 545.62,-324.55 545.62,-324.55 545.62,-318.55 551.62,-312.55 557.62,-312.55 557.62,-312.55 701.12,-312.55 701.12,-312.55 707.12,-312.55 713.12,-318.55 713.12,-324.55 713.12,-324.55 713.12,-372.3 713.12,-372.3 713.12,-378.3 707.12,-384.3 701.12,-384.3"/>
+<text xml:space="preserve" text-anchor="middle" x="629.37" y="-370.8" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">inserter pool ×N</text>
+<text xml:space="preserve" text-anchor="middle" x="629.37" y="-358.05" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">BlockBuilder over sealed batch</text>
+<text xml:space="preserve" text-anchor="middle" x="629.37" y="-345.3" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">oracle Native block spliced in</text>
+<text xml:space="preserve" text-anchor="middle" x="629.37" y="-332.55" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">one complete INSERT each</text>
+<text xml:space="preserve" text-anchor="middle" x="629.37" y="-319.8" font-family="Helvetica,sans-Serif" font-size="10.00" fill="#ece1d7">send_with_retry + reconnect</text>
 </g>
 <!-- tableenc&#45;&gt;chwire -->
 <g id="edge19" class="edge">
 <title>tableenc&#45;&gt;chwire</title>
-<path fill="none" stroke="#c1a78e" d="M629.37,-596.71C629.37,-544.08 629.37,-445.13 629.37,-389.69"/>
-<polygon fill="#c1a78e" stroke="#c1a78e" points="632.87,-389.74 629.37,-379.74 625.87,-389.74 632.87,-389.74"/>
+<path fill="none" stroke="#c1a78e" d="M629.37,-596.71C629.37,-546.04 629.37,-452.44 629.37,-396.06"/>
+<polygon fill="#c1a78e" stroke="#c1a78e" points="632.87,-396.14 629.37,-386.14 625.87,-396.14 632.87,-396.14"/>
 </g>
 <!-- chwire&#45;&gt;ch -->
 <g id="edge46" class="edge">
 <title>chwire&#45;&gt;ch</title>
-<path fill="none" stroke="#bf8c5f" stroke-width="2" d="M655.31,-318.68C692.04,-278.78 762.23,-205.39 829.37,-151.05 867.56,-120.14 914.98,-89.7 947.86,-69.71"/>
+<path fill="none" stroke="#bf8c5f" stroke-width="2" d="M661.15,-312.36C699.15,-271.38 765.63,-202.63 829.37,-151.05 867.56,-120.14 914.98,-89.7 947.86,-69.71"/>
 <polygon fill="#bf8c5f" stroke="#bf8c5f" stroke-width="2" points="949.49,-72.81 956.25,-64.65 945.88,-66.82 949.49,-72.81"/>
 </g>
 <!-- ackcol -->
@@ -625,7 +626,7 @@
 <!-- chwire&#45;&gt;ackcol -->
 <g id="edge20" class="edge">
 <title>chwire&#45;&gt;ackcol</title>
-<path fill="none" stroke="#b380b0" stroke-dasharray="1,5" d="M623.67,-318.61C615.56,-270.53 604.92,-171.86 636.62,-97.3 639.67,-90.12 644.24,-83.4 649.4,-77.33"/>
+<path fill="none" stroke="#b380b0" stroke-dasharray="1,5" d="M622.62,-312.15C614.73,-262.11 606.28,-168.66 636.62,-97.3 639.67,-90.12 644.24,-83.4 649.4,-77.33"/>
 <polygon fill="#b380b0" stroke="#b380b0" points="651.94,-79.74 656.23,-70.06 646.84,-74.95 651.94,-79.74"/>
 <text xml:space="preserve" text-anchor="middle" x="666.99" y="-116.87" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ece1d7">Acked after</text>
 <text xml:space="preserve" text-anchor="middle" x="666.99" y="-105.62" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ece1d7">EndOfStream</text>

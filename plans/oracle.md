@@ -1,72 +1,141 @@
-# oracle — PgPending resolver for Tier 3 types
+# oracle — Native columns for types walshadow does not decode
 
-[`src/oracle.rs`](../src/oracle.rs) plus [`pgext/`](../pgext/)
+[`src/ops/oracle.rs`](../src/ops/oracle.rs) plus [`pgext/`](../pgext/)
 
 ![oracle](../architecture/oracle.svg)
 
 ## Purpose
 
-Tier 3 types are where in-tree decoders diverge from PG on edge cases:
-on-disk varlena layouts shift between PG versions, `typoutput`
-formatting carries locale baggage, custom typmod paths exist walshadow
-doesn't reimplement. Ship known-stable types in-tree, route everything
-else through the shadow-PG bridge calling the same `typoutput` PG itself
-would call
+Some source types are where in-tree decoders diverge from PG on edge cases:
+on-disk varlena layouts shift between PG versions, composite values carry
+quoting and nesting rules, custom typmod paths exist walshadow doesn't
+reimplement. Ship known-stable types in-tree; hand everything else to shadow
+PG, which reconstructs the Datum and converts it straight into a ClickHouse
+Native column
 
-Resolution is best-effort by policy: the oracle resolves post-plan, so
-its answer reflects shadow's catalog state at resolve time, which may
-lag the row's own catalog interval in DDL edge cases — accepted in
-exchange for mostly supporting unknown types. Unresolved `PgPending`
-ships raw on-disk bytes; unresolved `Unsupported` stays the
-fail-closed backstop at encode
+Ownership is the point. PostgreSQL owns Datum interpretation,
+[`pg-clickhouse-c`](https://github.com/ClickHouse/pg-clickhouse-c) owns the
+PG-to-CH conversion, `clickhouse-c` owns the Native format. walshadow never
+interprets array elements, hstore pairs, JSON text, null maps, or nested
+offsets
 
-## In-tree Tier 3
+Resolution runs at sealed-batch granularity, one request per `InsertBatch`,
+after the batcher has fixed row order and before the inserter opens its
+ClickHouse query. It is not best-effort: one Datum the worker cannot convert
+fails the whole batch, because a substituted value is one the destination
+cannot tell from real data
 
-`numeric`, `inet`, `cidr`, `interval`. Decoded by
-[`src/codecs.rs`](../src/codecs.rs); see also [decoder.md](decoder.md)
-for PgPending dispatch around them
+The oracle's answer reflects shadow's catalog at resolve time, which may lag
+the row's own catalog interval in DDL edge cases — accepted in exchange for
+supporting types walshadow has no codec for
+
+## Local matrix
+
+Fixed-width scalars, `bytea`, `text` / `varchar` / `bpchar`, `numeric`,
+`inet`, `cidr`, `interval`, `json`, timestamps, `uuid`. Decoded by
+[`src/decode/codecs.rs`](../src/decode/codecs.rs);
+[`local_matrix_covers`](../src/decode/heap_decoder.rs) is the single predicate the
+emit plan routes on, kept in step with the decoder's own arms by
+`local_matrix_agrees_with_decoder`
 
 Why these:
 
 - stable wire format across PG versions walshadow targets
-- mechanical conversion (no per-row libpq round-trip needed)
-- locale-independent text rendering once `lc_numeric` is pinned
+- mechanical conversion, no per-row round trip needed
+- flat wire shape ClickHouse takes as a fixed or string slab
 
-`numeric` carries NaN / ±Infinity sentinels; `inet` vs `cidr`
-disambiguation lives at type-OID level not body bytes (on-disk vs wire
-confusion surfaced here historically)
+`numeric` carries NaN / ±Infinity sentinels; `inet` vs `cidr` disambiguation
+lives at type-OID level not body bytes (on-disk vs wire confusion surfaced
+here historically)
 
-## In-tree extension types
+## What routes to the oracle
 
-PostGIS `geography`/`geometry` and pgvector `vector`/`halfvec` are rendered
-in-tree from their on-disk bytes by `render_ext_columns` (`src/ops/oracle.rs`),
-matched on `RelAttr.type_name` (dynamic OIDs). geography 2-D points →
-WKT `POINT(x y)` (`gserialized_point_to_wkt`); vector → `[a,b,c]`
-(`vector_to_text`). No bridge round-trip, so these resolve even where the
-shadow worker is unavailable (e.g. greenfield bootstrap).
+[`ColumnEncoding::choose`](../src/emit/ch_emitter.rs) decides once per column, from
+the source attribute and the final target type, and never rediscovers it from
+a row's value:
 
-## Bridge-routed Tier 3
+- the local matrix does not cover the source attribute — `jsonb`, arrays,
+  `hstore`, `tsvector`, ranges, domains, enums, `name`, extension types
+- or the target needs PG-aware composite conversion — `Array`, `Map`, `JSON`,
+  `Object`, under an optional `Nullable`
 
-`jsonb`, arrays, `hstore`, `tsvector`, ranges, domains. Heap decoder emits
-[`ColumnValue::PgPending { type_oid, raw }`](../src/heap_decoder.rs);
-[`resolve_pending_tuple`](../src/oracle.rs) collects every pending column of a
-tuple into one `DECODE` request to shadow's bridge worker, swaps `PgPending`
-for `Text` on each item that rendered
+Everything else stays local. A column that routes locally but arrives holding
+raw on-disk bytes is a plan bug and errors rather than shipping the bytes as a
+String
 
-## Shared resolve step
+PostGIS `geography` / `geometry` route to the oracle like any other extension
+type, but `render_ext_columns` (`src/ops/oracle.rs`) still claims 2-D points
+in-tree first, matched on `RelAttr.type_name` because their OIDs are dynamic.
+A rendered `POINT(x y)` crosses as a literal cell and lands verbatim; anything
+it does not claim crosses as on-disk bytes and gets `typoutput`. `ST_AsText`
+semantics are what the `String` mapping wants, and `typoutput` would give
+HEXEWKB instead
 
-`resolve_decoded_heap(oracle, attrs, decoded)` runs `render_ext_columns` then
-(if an oracle is present) `resolve_pending_tuple` over a heap's new/old tuples.
-Both the live decode pool (`emit/pipeline/decode.rs`) and the object-store /
-COPY backfill paths call it, so backfilled rows resolve identically to
-streamed ones. **Greenfield bootstrap is the exception**: it runs before the
-shadow/bridge exist, so it resolves them against a throwaway OID-exact side PG
-instead of the shadow — see the bootstrap oracle in
-[bootstrap.md](bootstrap.md).
+pgvector `vector` / `halfvec` need no special case: pgvector registers an
+explicit cast to `real[]`, so a `Array(Float32)` target converts through PG's
+own cast machinery
 
-Two alternatives considered (insert + select round-trip;
-`SELECT $1::bytea::<typ>::text`) require reconstructing wire format from
-on-disk format — same codec work the worker elides
+Every producer — the live decode pool, the COPY / object-store backfills, and
+greenfield bootstrap — leaves oracle columns as on-disk bytes and lets the
+inserter convert them, so backfilled rows land identically to streamed ones.
+**Greenfield bootstrap is the exception in one respect**: it runs before the
+shadow exists, so its tail holds a throwaway OID-exact side PG instead — see
+the bootstrap oracle in [bootstrap.md](bootstrap.md)
+
+## Protocol v2
+
+One `ENCODE_NATIVE` request (opcode `0x02`) per sealed batch carrying oracle
+columns. Outer framing is unchanged; see
+[`pgext/walshadow.h`](../pgext/walshadow.h) for the constants both sides share
+
+```text
+request  = be_u32 n_rows | be_u32 n_columns
+           n_columns × ( be_u32 source_type_oid   # 0 only when every cell defaults
+                       | be_i32 source_typmod
+                       | lenstr output_name
+                       | lenstr target_ch_type )  # canonical, from the daemon's TypeAst
+           n_rows × n_columns × cell
+
+cell     = 0x00                                   # Default: SQL NULL or absent field
+         | 0x01 be_u32 len bytes                  # DiskRaw: Datum body, varlena header stripped
+         | 0x02 be_u32 len bytes                  # TextInput: canonical PG text, eg attmissingval
+         | 0x03 be_u32 len bytes                  # Literal: value the daemon already rendered
+
+response = WS_STATUS_OK | one locally framed Native block, to the end of the frame
+```
+
+All metadata precedes all cells so worker builds its `pgch_writer` before
+reading a value. Cells are row-major. Worker checkpoints writer at each row,
+keeps checkpoint storage for next row after every column appends, and rolls
+whole row back when conversion raises. Completed rows remain a valid block
+prefix, so pgext can narrow later handling without reimplementing
+pg-clickhouse-c column trees
+
+The Native block repeats names, types, column count, and row count. That
+repetition is the integrity check: the daemon requires every response column
+to sit at its requested position, under its requested name, with a type string
+byte-identical to the one it asked for. Both sides render canonical type names
+through `clickhouse-c`, so a difference means the two pins disagree
+
+Response bytes are untrusted despite the owner-only socket: a wrong block
+would put mismatched values under the right column name. `Block::validate`
+runs, a second read must reach clean EOF, and no ClickHouse query starts until
+all of that passes
+
+## Splicing
+
+The inserter decodes the response once with `clickhouse-c-rs`, then builds the
+final block over three kinds of column:
+
+- local fixed / string / nullable slabs, through `build_leaf` + `build_root`
+- decoded oracle column trees, through `BlockBuilder::append_column`
+- synthetic `_lsn` / `_xid` / `_commit_ts` / `_is_deleted` slabs
+
+`append_column` borrows the decoded tree, so the writer re-emits the same
+offsets, null maps, and data slabs the worker wrote, under the inserter's own
+expected `TypeAst`. Nothing visits a value. The response block outlives the
+whole `send_with_retry` loop, so a ClickHouse reconnect resends the same
+columns rather than asking the oracle again
 
 ## walshadow PG module
 
@@ -74,25 +143,56 @@ Lives at [`pgext/`](../pgext/), built via PGXS. Not an extension: no control
 file, no SQL script, no `pg_proc` row. Shadow's catalog is a read-only physical
 copy of source's, so `CREATE EXTENSION` can never run there; the module is
 reached only through `shared_preload_libraries`. Module is required on every
-catalog shadow; walshadow writes preload settings into shadows it owns. See
-[`pgext/walshadow.h`](../pgext/walshadow.h) for socket protocol definitions
-
-`ws_decode_datum_text` reconstructs a Datum from on-disk bytes per typlen /
-typbyval, then runs `OidOutputFunctionCall` on the type's `typoutput`. Four
-branches: varlena / cstring / typbyval fixed / fixed by-ref
+catalog shadow; walshadow writes preload settings into shadows it owns
 
 Files:
 
-- [`pgext/decode.c`](../pgext/decode.c) — on-disk Datum → `typoutput` text
+- [`pgext/native.c`](../pgext/native.c) — Datum reconstruction, source
+  adapters, writer, Native response. Also the one translation unit compiling
+  `pg-clickhouse-c` and `clickhouse-c`
 - [`pgext/overlay.c`](../pgext/overlay.c) — `SnapshotAny` catalog projections
 - [`pgext/worker.c`](../pgext/worker.c) — worker registration, socket, framing
+- [`pgext/pg-clickhouse-c`](../pgext/pg-clickhouse-c) — unmodified upstream,
+  pinned as a recursive submodule carrying its own `clickhouse-c`
 - [`pgext/Makefile`](../pgext/Makefile) — PGXS-driven, `MODULE_big` only
+- [`pgext/README.md`](../pgext/README.md) — build and load steps, nothing
+  about behavior
 
-Loaded into **shadow PG**; stays shadow-only.
+Loaded into **shadow PG**; stays shadow-only. The worker opens one Unix socket
+and never links the daemon or reaches ClickHouse
+
+Missing conversion gets narrow source adapter in `native.c` built on PG APIs,
+or the type stays unsupported. One adapter exists:
+
+- **hstore** — a `Map` target has no PG `record[]` cast, so the one
+  `hstore_to_matrix` accepting the source type and owned by the same extension
+  supplies the key/value matrix. Resolving by extension membership keeps a
+  relocated hstore working; an ambiguous match is refused
+
+Cast arity is not walshadow policy: the dependency drives `f(value)`,
+`f(value, typmod)`, and `f(value, typmod, explicit)` cast functions itself
+
+## Datum reconstruction
+
+`ws_reconstruct_datum` rebuilds the Datum from on-disk bytes per typlen /
+typbyval. Four branches: varlena (fresh 4-byte header around the body),
+cstring, typbyval fixed (memcpy into a Datum slot), fixed by-ref (palloc).
+`TextInput` cells go through the type's `typinput` with the requested typmod
+instead
+
+## Atomicity
+
+Writer has request lifetime; pgext owns one reusable checkpoint.
+pg-clickhouse-c records every node buffer length at row boundary; rollback
+restores fixed and string data, nested offsets, tuple children, null maps, and
+low-cardinality slabs without copying retained rows. One `ERROR` still escapes
+to worker's request `PG_TRY`, aborting transaction and resetting response, so
+no partial block reaches daemon. `ErrorContextCallback` names failing request
+column and row index. Raw value is never copied into error
 
 ## Decode environment
 
-`typoutput` is not a pure function of the bytes: `timestamptz` follows
+Conversion is not a pure function of the bytes: `timestamptz` follows
 `TimeZone`, dates `DateStyle`, `interval` `IntervalStyle`, `bytea`
 `bytea_output`, floats `extra_float_digits`. The worker's connection would
 otherwise inherit whatever database and role defaults replicated from source,
@@ -103,8 +203,8 @@ the source session instead would need metadata WAL does not carry
 
 ## Catalog reads
 
-`DECODE` is one of four ops the socket carries; `SCAN` is the other one with a
-daemon consumer. It projects `pg_class`, `pg_attribute`, `pg_index`,
+`ENCODE_NATIVE` is one of four ops the socket carries; `SCAN` is the other one
+with a daemon consumer. It projects `pg_class`, `pg_attribute`, `pg_index`,
 `pg_namespace` and `pg_type` under `SnapshotAny`, filtered to what one
 transaction sees: rows it inserted are present, rows it deleted are not, and
 another transaction's uncommitted rows are not. Values are each type's text
@@ -143,21 +243,56 @@ is no tree to misattribute a writer to
 
 Daemon requires worker at startup. `--bridge-socket` defaults to
 `<shadow-socket-dir>/walshadow-bridge.sock`; failure to connect within shadow
-connect budget aborts startup. A worker whose `typoutput` raises for one item
-bumps `stats.fallback_raw` and leaves that column raw, rest of batch stays
-unaffected. Transport failure bumps `stats.errors` and client redials on next
-request. Stats surface as
-`walshadow_decode_{resolved,fallback_raw,errors}_total`
+connect budget aborts startup
+
+Three failures, none of which can substitute data:
+
+- **cell conversion** — short body, unknown OID, failed cast, a
+  multidimensional array against a one-layer target, invalid JSON. Aborts the
+  request, counts `conversion_errors`, non-retryable. No ClickHouse query
+  begins and no row is acknowledged
+- **request or response semantics** — target type the dependency cannot write,
+  wrong response schema, malformed Native block. Non-retryable, trips the
+  pipeline fatal before the query, leaves the seq unacknowledged so a
+  supervisor restart replays the same batch
+- **transport** — the bridge redials and replays one read-only request; past
+  that the inserter's bounded retry policy applies, and exhaustion trips fatal
+  with the ack floor unchanged
+
+There is no fall back to local composite encoding. Retaining that path would
+make a value depend on worker uptime
+
+Counters: `walshadow_oracle_{blocks,rows,cells}_total`,
+`walshadow_oracle_conversion_errors_total`, `walshadow_oracle_errors_total`.
+Native volume counts once, on the bridge, as
+`walshadow_bridge_native_bytes_total`
+
+## Backpressure
+
+Raw bodies live in the sealed batch rather than in decode-worker values, and
+`TableEncoder::approx_bytes` counts them. The oracle request also rides one
+bridge frame, a ceiling the configurable ClickHouse byte budget knows nothing
+about. `append_row` sizes a row's cells before touching a buffer, so a row the
+pending request cannot hold seals the batch and opens the next one:
+`ORACLE_BATCH_SEAL_BYTES` bounds resident request bytes without bounding a row.
+Only a row whose own request would not frame is refused, and the frame ceiling
+(`WS_MAX_REQUEST_BYTES`, mirrored by the bridge's `MAX_REQUEST_BYTES`) sits well
+above `inline_value_max` so a toast value the pipeline admits always frames
+
+Removing per-row resolution from the decode pool removes every bridge await
+from decode workers: their throughput and ordering no longer depend on bridge
+RTT
 
 ## Pinning shadow locale
 
-`lc_numeric` and `lc_time` pinned at shadow bootstrap. Without this,
-`typoutput` on `numeric` and `interval` would diff against walshadow's
+`lc_numeric` and `lc_time` pinned at shadow bootstrap. Without this, PG's own
+text rendering of `numeric` and `interval` would diff against walshadow's
 locale-independent rendering on deployments running non-`C` locales.
 See [shadow.md](shadow.md) for bootstrap surface
 
 ## Cross-links
 
-- [decoder.md](decoder.md) — `ColumnValue::PgPending` dispatch + Tier 3
-  routing through `heap_decoder`
+- [decoder.md](decoder.md) — `ColumnValue::PgPending` dispatch + routing
+  through `heap_decoder`
+- [emitter.md](emitter.md) — where the sealed-batch resolution stage sits
 - [shadow.md](shadow.md) — where the worker's GUCs get written, lc_* pinning

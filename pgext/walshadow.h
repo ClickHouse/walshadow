@@ -1,14 +1,4 @@
-/*
- * walshadow — shared declarations for the shadow-side module.
- *
- * One entry point: a background worker reached via
- * shared_preload_libraries. Needs no catalog row, which is the whole point —
- * a shadow standby's catalog is a read-only physical copy of source's, so
- * anything requiring a pg_proc row is unreachable there.
- *
- * Wire encoding is network byte order throughout (pqformat's pq_send*),
- * matching PG's own convention rather than the daemon's native LE.
- */
+/* Shared declarations, wire integers use network byte order */
 #ifndef WALSHADOW_H
 #define WALSHADOW_H
 
@@ -18,23 +8,30 @@
 
 /* Bumped when a request or response layout changes, or when an op's reading
  * of an unchanged layout changes */
-#define WS_PROTO_VERSION		1
+#define WS_PROTO_VERSION		2
 /* Bumped when any catalog projection changes shape */
 #define WS_PROJECTION_VERSION	1
 
 /* request opcodes */
-#define WS_OP_HELLO			0x01
-#define WS_OP_DECODE		0x02
-#define WS_OP_SCAN			0x03
-#define WS_OP_REPLAY_LSN	0x04
+#define WS_OP_HELLO				0x01
+#define WS_OP_ENCODE_NATIVE		0x02
+#define WS_OP_SCAN				0x03
+#define WS_OP_REPLAY_LSN		0x04
 
 /* response status byte */
 #define WS_STATUS_OK		0x00
 #define WS_STATUS_ERROR		0x01
 
-/* per-item kind in a DECODE response */
-#define WS_ITEM_TEXT		0x00
-#define WS_ITEM_ERROR		0x01
+/* per-cell tag in an ENCODE_NATIVE request */
+#define WS_CELL_DEFAULT		0x00
+#define WS_CELL_DISK_RAW	0x01
+#define WS_CELL_TEXT		0x02
+#define WS_CELL_LITERAL		0x03
+
+/* Match daemon MAX_REQUEST_BYTES, exceed maximum inline TOAST value */
+#define WS_MAX_REQUEST_BYTES	(256 * 1024 * 1024)
+/* Match daemon MAX_RESPONSE_BYTES */
+#define WS_MAX_RESPONSE_BYTES	(256 * 1024 * 1024)
 
 /*
  * Catalogs the overlay scan covers. Ids are wire values; never renumber.
@@ -48,8 +45,7 @@ typedef enum WsCatalog
 	WS_CAT_TYPE = 5,
 } WsCatalog;
 
-/* decode.c */
-extern char *ws_decode_datum_text(Oid typoid, bytea *raw);
+extern void ws_handle_encode_native(StringInfo req, StringInfo resp);
 
 /* overlay.c */
 typedef struct WsScanStats

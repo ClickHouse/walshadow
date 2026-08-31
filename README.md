@@ -260,7 +260,7 @@ land before the first CREATE. See
 
 ## Building from source
 
-Workspace + two submodules:
+Workspace + submodules:
 
 ```
 git submodule update --init --recursive
@@ -277,7 +277,10 @@ Binaries land under `target/release/`:
 - `walshadow-classify`, record-level classifier for diagnostics
 
 The PG module under `pgext/` is built separately via PGXS. It backs the
-decode oracle and the catalog overlay reads:
+decode oracle and the catalog overlay reads, and compiles
+[`pg-clickhouse-c`](https://github.com/ClickHouse/pg-clickhouse-c) — a
+recursive submodule under `pgext/` — into its own translation unit, so a
+shallow clone builds nothing:
 
 ```
 make -C pgext install

@@ -15,14 +15,14 @@
 //! ```text
 //! [2 bytes "WS" magic] [u16 LE version] then repeating:
 //! [u8 tag] [u32 len LE] [body of `len` bytes]
-//!   tag = 0 → SpillEntry::Heap        (body = u32 dict id + encoded DecodedHeap)
-//!   tag = 1 → SpillEntry::Chunk       (body = encoded ToastChunk)
-//!   tag = 2 → SpillEntry::ToastDelete (body = encoded ToastDelete)
-//!   tag = 3 → SpillEntry::Raw         (body = encoded RawRecord)
-//!   tag = 4 → descriptor dictionary   (body = u64 valid_from + descriptor)
+//!   TAG_HEAP         (body = u32 dict id + encoded DecodedHeap)
+//!   TAG_CHUNK        (body = encoded ToastChunk)
+//!   TAG_TOAST_DELETE (body = encoded ToastDelete)
+//!   TAG_RAW          (body = encoded RawRecord)
+//!   TAG_DESCRIPTOR   (body = u64 valid_from + descriptor)
 //! ```
 //!
-//! Tag 4 never surfaces as an entry: each distinct `(rfn, valid_from)`
+//! `TAG_DESCRIPTOR` never surfaces as an entry: each distinct `(rfn, valid_from)`
 //! descriptor writes once before its first referencing heap, so spilled
 //! [`DescribedHeap`]s rehydrate the exact attached descriptor without a
 //! live log lookup (file stays self-contained; capture landing mid-spill
@@ -279,12 +279,64 @@ pub type Result<T> = std::result::Result<T, SpillError>;
 /// ASCII for `xxd`-friendly debug
 pub const SPILL_MAGIC: [u8; 2] = *b"WS";
 /// v2 added `HeapOp::Truncate` body encoding. v3 added chunk TIDs and
-/// `ToastDelete` entries. v4 added tag-3 `Raw` stashed records. v5 added
-/// tag-4 descriptor dictionary (Heap bodies reference descriptors by dict
+/// `ToastDelete` entries. v4 added `TAG_RAW` stashed records. v5 added
+/// the `TAG_DESCRIPTOR` dictionary (Heap bodies reference descriptors by dict
 /// id). v6 added writer xid to heap + raw bodies. `DrainEntry` events
 /// (Catalog, ToastBarrier, Config/Signal) are drain-time, never spilled,
 /// so they don't touch this format
 pub const SPILL_VERSION: u16 = 6;
+
+/// Wire tags, one block per tag space so encode and decode read off the same
+/// table. Renumbering is a body-encoding change: bump [`SPILL_VERSION`]
+///
+/// Entry frames: [`SpillEntry`] variants plus the descriptor dictionary
+const TAG_HEAP: u8 = 0;
+const TAG_CHUNK: u8 = 1;
+const TAG_TOAST_DELETE: u8 = 2;
+const TAG_RAW: u8 = 3;
+const TAG_DESCRIPTOR: u8 = 4;
+
+/// [`HeapOp`], one byte in every heap body
+const OP_INSERT: u8 = 0;
+const OP_UPDATE: u8 = 1;
+const OP_HOT_UPDATE: u8 = 2;
+const OP_DELETE: u8 = 3;
+const OP_TRUNCATE: u8 = 4;
+
+/// [`ColumnValue`], leading byte of every encoded column. Shared with the
+/// backfill spool, which reuses [`encode_value`] / [`decode_value`]
+const VAL_NULL: u8 = 0;
+const VAL_BOOL: u8 = 1;
+const VAL_CHAR: u8 = 2;
+const VAL_INT2: u8 = 3;
+const VAL_INT4: u8 = 4;
+const VAL_INT8: u8 = 5;
+const VAL_FLOAT4: u8 = 6;
+const VAL_FLOAT8: u8 = 7;
+const VAL_OID: u8 = 8;
+const VAL_DATE: u8 = 9;
+const VAL_TIME: u8 = 10;
+const VAL_TIMESTAMP: u8 = 11;
+const VAL_TIMESTAMPTZ: u8 = 12;
+const VAL_TIMETZ: u8 = 13;
+const VAL_UUID: u8 = 14;
+const VAL_NAME: u8 = 15;
+const VAL_BYTEA: u8 = 16;
+const VAL_TEXT: u8 = 17;
+const VAL_EXTERNAL_TOAST: u8 = 18;
+const VAL_UNSUPPORTED: u8 = 19;
+const VAL_NUMERIC: u8 = 20;
+const VAL_INET: u8 = 21;
+const VAL_INTERVAL: u8 = 22;
+const VAL_JSON: u8 = 23;
+const VAL_PG_PENDING: u8 = 24;
+const VAL_PG_PENDING_TEXT: u8 = 25;
+
+/// [`crate::decode::codecs::NumericKind`], inside a [`VAL_NUMERIC`] body
+const NUM_FINITE: u8 = 0;
+const NUM_NAN: u8 = 1;
+const NUM_PINF: u8 = 2;
+const NUM_NINF: u8 = 3;
 
 pub struct SpillStore {
     dir: PathBuf,
@@ -521,21 +573,23 @@ impl SpillWriter {
                 let next_id = self.dict.len() as u32;
                 let id = *self.dict.entry(key).or_insert(next_id);
                 if id == next_id {
-                    frame_into(&mut body, 4, |out| {
+                    frame_into(&mut body, TAG_DESCRIPTOR, |out| {
                         push_u64(out, h.descriptor_valid_from);
                         encode_descriptor_bytes(out, &h.descriptor);
                     });
                 }
-                frame_into(&mut body, 0, |out| {
+                frame_into(&mut body, TAG_HEAP, |out| {
                     push_u32(out, id);
                     encode_heap_into(out, &h.decoded);
                 });
             }
-            SpillEntry::Chunk(c) => frame_into(&mut body, 1, |out| encode_chunk_into(out, c)),
-            SpillEntry::ToastDelete(d) => {
-                frame_into(&mut body, 2, |out| encode_toast_delete_into(out, d))
+            SpillEntry::Chunk(c) => {
+                frame_into(&mut body, TAG_CHUNK, |out| encode_chunk_into(out, c))
             }
-            SpillEntry::Raw(r) => frame_into(&mut body, 3, |out| encode_raw_into(out, r)),
+            SpillEntry::ToastDelete(d) => frame_into(&mut body, TAG_TOAST_DELETE, |out| {
+                encode_toast_delete_into(out, d)
+            }),
+            SpillEntry::Raw(r) => frame_into(&mut body, TAG_RAW, |out| encode_raw_into(out, r)),
         }
         self.file.write_all(&body).await?;
         self.byte_count += body.len() as u64;
@@ -629,7 +683,7 @@ impl SpillReader {
         Ok(())
     }
 
-    /// One entry per call; `Ok(None)` at clean EOF. Tag-4 dictionary
+    /// One entry per call; `Ok(None)` at clean EOF. `TAG_DESCRIPTOR`
     /// records fold into `dict` and never surface
     pub async fn next(&mut self) -> Result<Option<SpillEntry>> {
         if !self.header_checked {
@@ -649,7 +703,7 @@ impl SpillReader {
             self.file.read_exact(&mut body).await?;
             let mut cur = Cursor::new(&body);
             let entry = match tag_buf[0] {
-                0 => {
+                TAG_HEAP => {
                     let dict_id = cur.u32()? as usize;
                     let h = decode_heap(&mut cur)?;
                     let Some((descriptor, valid_from)) = self.dict.get(dict_id).cloned() else {
@@ -667,10 +721,10 @@ impl SpillReader {
                         descriptor_valid_from: valid_from,
                     }))
                 }
-                1 => SpillEntry::Chunk(decode_chunk(&mut cur)?),
-                2 => SpillEntry::ToastDelete(decode_toast_delete(&mut cur)?),
-                3 => SpillEntry::Raw(Box::new(decode_raw(&mut cur)?)),
-                4 => {
+                TAG_CHUNK => SpillEntry::Chunk(decode_chunk(&mut cur)?),
+                TAG_TOAST_DELETE => SpillEntry::ToastDelete(decode_toast_delete(&mut cur)?),
+                TAG_RAW => SpillEntry::Raw(Box::new(decode_raw(&mut cur)?)),
+                TAG_DESCRIPTOR => {
                     let valid_from = cur.u64()?;
                     let (d, used) =
                         decode_descriptor_bytes(&body[cur.pos..]).map_err(|detail| {
@@ -740,11 +794,11 @@ pub(crate) fn encode_heap_into(out: &mut Vec<u8>, h: &DecodedHeap) {
     push_u32(out, h.xid);
     push_u64(out, h.source_lsn);
     let op_byte: u8 = match h.op {
-        HeapOp::Insert => 0,
-        HeapOp::Update => 1,
-        HeapOp::HotUpdate => 2,
-        HeapOp::Delete => 3,
-        HeapOp::Truncate => 4,
+        HeapOp::Insert => OP_INSERT,
+        HeapOp::Update => OP_UPDATE,
+        HeapOp::HotUpdate => OP_HOT_UPDATE,
+        HeapOp::Delete => OP_DELETE,
+        HeapOp::Truncate => OP_TRUNCATE,
     };
     push_u8(out, op_byte);
     encode_opt_tuple(out, h.new.as_ref());
@@ -773,122 +827,127 @@ fn encode_opt_tuple(out: &mut Vec<u8>, t: Option<&DecodedTuple>) {
 
 pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
     match v {
-        ColumnValue::Null => push_u8(out, 0),
+        ColumnValue::Null => push_u8(out, VAL_NULL),
         ColumnValue::Bool(b) => {
-            push_u8(out, 1);
+            push_u8(out, VAL_BOOL);
             push_u8(out, *b as u8);
         }
         ColumnValue::Char(i) => {
-            push_u8(out, 2);
+            push_u8(out, VAL_CHAR);
             push_u8(out, *i as u8);
         }
         ColumnValue::Int2(i) => {
-            push_u8(out, 3);
+            push_u8(out, VAL_INT2);
             push_u16(out, *i as u16);
         }
         ColumnValue::Int4(i) => {
-            push_u8(out, 4);
+            push_u8(out, VAL_INT4);
             push_i32(out, *i);
         }
         ColumnValue::Int8(i) => {
-            push_u8(out, 5);
+            push_u8(out, VAL_INT8);
             push_i64(out, *i);
         }
         ColumnValue::Float4(f) => {
-            push_u8(out, 6);
+            push_u8(out, VAL_FLOAT4);
             out.extend_from_slice(&f.to_le_bytes());
         }
         ColumnValue::Float8(f) => {
-            push_u8(out, 7);
+            push_u8(out, VAL_FLOAT8);
             out.extend_from_slice(&f.to_le_bytes());
         }
         ColumnValue::Oid(i) => {
-            push_u8(out, 8);
+            push_u8(out, VAL_OID);
             push_u32(out, *i);
         }
         ColumnValue::Date(i) => {
-            push_u8(out, 9);
+            push_u8(out, VAL_DATE);
             push_i32(out, *i);
         }
         ColumnValue::Time(i) => {
-            push_u8(out, 10);
+            push_u8(out, VAL_TIME);
             push_i64(out, *i);
         }
         ColumnValue::Timestamp(i) => {
-            push_u8(out, 11);
+            push_u8(out, VAL_TIMESTAMP);
             push_i64(out, *i);
         }
         ColumnValue::TimestampTz(i) => {
-            push_u8(out, 12);
+            push_u8(out, VAL_TIMESTAMPTZ);
             push_i64(out, *i);
         }
         ColumnValue::TimeTz { micros, tz_seconds } => {
-            push_u8(out, 13);
+            push_u8(out, VAL_TIMETZ);
             push_i64(out, *micros);
             push_i32(out, *tz_seconds);
         }
         ColumnValue::Uuid(b) => {
-            push_u8(out, 14);
+            push_u8(out, VAL_UUID);
             out.extend_from_slice(b);
         }
         ColumnValue::Name(s) => {
-            push_u8(out, 15);
+            push_u8(out, VAL_NAME);
             push_str(out, s);
         }
         ColumnValue::Bytea(b) => {
-            push_u8(out, 16);
+            push_u8(out, VAL_BYTEA);
             push_bytes(out, b);
         }
         ColumnValue::Text(s) => {
-            push_u8(out, 17);
+            push_u8(out, VAL_TEXT);
             push_str(out, s);
         }
         ColumnValue::ExternalToast(p) => {
-            push_u8(out, 18);
+            push_u8(out, VAL_EXTERNAL_TOAST);
             push_i32(out, p.va_rawsize);
             push_u32(out, p.va_extinfo);
             push_u32(out, p.va_valueid);
             push_u32(out, p.va_toastrelid);
         }
         ColumnValue::Unsupported { type_oid, raw } => {
-            push_u8(out, 19);
+            push_u8(out, VAL_UNSUPPORTED);
             push_u32(out, *type_oid);
             push_bytes(out, raw);
         }
         ColumnValue::Numeric(n) => {
             use crate::decode::codecs::NumericKind;
-            push_u8(out, 20);
+            push_u8(out, VAL_NUMERIC);
             match n {
                 NumericKind::Finite(s) => {
-                    push_u8(out, 0);
+                    push_u8(out, NUM_FINITE);
                     push_str(out, s);
                 }
-                NumericKind::NaN => push_u8(out, 1),
-                NumericKind::PInf => push_u8(out, 2),
-                NumericKind::NInf => push_u8(out, 3),
+                NumericKind::NaN => push_u8(out, NUM_NAN),
+                NumericKind::PInf => push_u8(out, NUM_PINF),
+                NumericKind::NInf => push_u8(out, NUM_NINF),
             }
         }
         ColumnValue::Inet(v) => {
-            push_u8(out, 21);
+            push_u8(out, VAL_INET);
             push_u8(out, v.family);
             push_u8(out, v.bits);
             push_u8(out, v.is_cidr as u8);
             push_bytes(out, &v.addr);
         }
         ColumnValue::Interval(v) => {
-            push_u8(out, 22);
+            push_u8(out, VAL_INTERVAL);
             push_i32(out, v.months);
             push_i32(out, v.days);
             push_i64(out, v.micros);
         }
         ColumnValue::Json(s) => {
-            push_u8(out, 23);
+            push_u8(out, VAL_JSON);
             push_str(out, s);
         }
         ColumnValue::PgPending { type_oid, raw } => {
-            push_u8(out, 24);
+            push_u8(out, VAL_PG_PENDING);
             push_u32(out, *type_oid);
             push_bytes(out, raw);
+        }
+        ColumnValue::PgPendingText { type_oid, text } => {
+            push_u8(out, VAL_PG_PENDING_TEXT);
+            push_u32(out, *type_oid);
+            push_str(out, text);
         }
     }
 }
@@ -1009,11 +1068,11 @@ pub(crate) fn decode_heap(c: &mut Cursor) -> Result<DecodedHeap> {
     let xid = c.u32()?;
     let source_lsn = c.u64()?;
     let op = match c.u8()? {
-        0 => HeapOp::Insert,
-        1 => HeapOp::Update,
-        2 => HeapOp::HotUpdate,
-        3 => HeapOp::Delete,
-        4 => HeapOp::Truncate,
+        OP_INSERT => HeapOp::Insert,
+        OP_UPDATE => HeapOp::Update,
+        OP_HOT_UPDATE => HeapOp::HotUpdate,
+        OP_DELETE => HeapOp::Delete,
+        OP_TRUNCATE => HeapOp::Truncate,
         other => {
             return Err(SpillError::Format {
                 offset: c.pos,
@@ -1057,29 +1116,29 @@ fn decode_opt_tuple(c: &mut Cursor) -> Result<Option<DecodedTuple>> {
 pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
     let tag = c.u8()?;
     let v = match tag {
-        0 => ColumnValue::Null,
-        1 => ColumnValue::Bool(c.u8()? != 0),
-        2 => ColumnValue::Char(c.u8()? as i8),
-        3 => ColumnValue::Int2(c.u16()? as i16),
-        4 => ColumnValue::Int4(c.i32()?),
-        5 => ColumnValue::Int8(c.i64()?),
-        6 => ColumnValue::Float4(c.f32()?),
-        7 => ColumnValue::Float8(c.f64()?),
-        8 => ColumnValue::Oid(c.u32()?),
-        9 => ColumnValue::Date(c.i32()?),
-        10 => ColumnValue::Time(c.i64()?),
-        11 => ColumnValue::Timestamp(c.i64()?),
-        12 => ColumnValue::TimestampTz(c.i64()?),
-        13 => {
+        VAL_NULL => ColumnValue::Null,
+        VAL_BOOL => ColumnValue::Bool(c.u8()? != 0),
+        VAL_CHAR => ColumnValue::Char(c.u8()? as i8),
+        VAL_INT2 => ColumnValue::Int2(c.u16()? as i16),
+        VAL_INT4 => ColumnValue::Int4(c.i32()?),
+        VAL_INT8 => ColumnValue::Int8(c.i64()?),
+        VAL_FLOAT4 => ColumnValue::Float4(c.f32()?),
+        VAL_FLOAT8 => ColumnValue::Float8(c.f64()?),
+        VAL_OID => ColumnValue::Oid(c.u32()?),
+        VAL_DATE => ColumnValue::Date(c.i32()?),
+        VAL_TIME => ColumnValue::Time(c.i64()?),
+        VAL_TIMESTAMP => ColumnValue::Timestamp(c.i64()?),
+        VAL_TIMESTAMPTZ => ColumnValue::TimestampTz(c.i64()?),
+        VAL_TIMETZ => {
             let micros = c.i64()?;
             let tz_seconds = c.i32()?;
             ColumnValue::TimeTz { micros, tz_seconds }
         }
-        14 => ColumnValue::Uuid(c.need(16)?.try_into().unwrap()),
-        15 => ColumnValue::Name(c.string()?),
-        16 => ColumnValue::Bytea(c.bytes()?),
-        17 => ColumnValue::Text(c.string()?),
-        18 => {
+        VAL_UUID => ColumnValue::Uuid(c.need(16)?.try_into().unwrap()),
+        VAL_NAME => ColumnValue::Name(c.string()?),
+        VAL_BYTEA => ColumnValue::Bytea(c.bytes()?),
+        VAL_TEXT => ColumnValue::Text(c.string()?),
+        VAL_EXTERNAL_TOAST => {
             let va_rawsize = c.i32()?;
             let va_extinfo = c.u32()?;
             let va_valueid = c.u32()?;
@@ -1091,19 +1150,19 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
                 va_toastrelid,
             })
         }
-        19 => {
+        VAL_UNSUPPORTED => {
             let type_oid = c.u32()?;
             let raw = c.bytes()?;
             ColumnValue::Unsupported { type_oid, raw }
         }
-        20 => {
+        VAL_NUMERIC => {
             use crate::decode::codecs::NumericKind;
             let kind = c.u8()?;
             ColumnValue::Numeric(match kind {
-                0 => NumericKind::Finite(c.string()?),
-                1 => NumericKind::NaN,
-                2 => NumericKind::PInf,
-                3 => NumericKind::NInf,
+                NUM_FINITE => NumericKind::Finite(c.string()?),
+                NUM_NAN => NumericKind::NaN,
+                NUM_PINF => NumericKind::PInf,
+                NUM_NINF => NumericKind::NInf,
                 other => {
                     return Err(SpillError::Format {
                         offset: c.pos,
@@ -1112,7 +1171,7 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
                 }
             })
         }
-        21 => {
+        VAL_INET => {
             let family = c.u8()?;
             let bits = c.u8()?;
             let is_cidr = c.u8()? != 0;
@@ -1124,7 +1183,7 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
                 addr,
             })
         }
-        22 => {
+        VAL_INTERVAL => {
             let months = c.i32()?;
             let days = c.i32()?;
             let micros = c.i64()?;
@@ -1134,11 +1193,16 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
                 micros,
             })
         }
-        23 => ColumnValue::Json(c.string()?),
-        24 => {
+        VAL_JSON => ColumnValue::Json(c.string()?),
+        VAL_PG_PENDING => {
             let type_oid = c.u32()?;
             let raw = c.bytes()?;
             ColumnValue::PgPending { type_oid, raw }
+        }
+        VAL_PG_PENDING_TEXT => {
+            let type_oid = c.u32()?;
+            let text = c.string()?;
+            ColumnValue::PgPendingText { type_oid, text }
         }
         other => {
             return Err(SpillError::Format {
@@ -1649,8 +1713,42 @@ mod tests {
         }
     }
 
+    /// Exhaustive: a new [`ColumnValue`] variant fails to compile here until
+    /// named, and the tag cross-checks `encode_value`'s leading byte
+    fn expected_tag(v: &ColumnValue) -> u8 {
+        match v {
+            ColumnValue::Null => VAL_NULL,
+            ColumnValue::Bool(_) => VAL_BOOL,
+            ColumnValue::Char(_) => VAL_CHAR,
+            ColumnValue::Int2(_) => VAL_INT2,
+            ColumnValue::Int4(_) => VAL_INT4,
+            ColumnValue::Int8(_) => VAL_INT8,
+            ColumnValue::Float4(_) => VAL_FLOAT4,
+            ColumnValue::Float8(_) => VAL_FLOAT8,
+            ColumnValue::Oid(_) => VAL_OID,
+            ColumnValue::Date(_) => VAL_DATE,
+            ColumnValue::Time(_) => VAL_TIME,
+            ColumnValue::Timestamp(_) => VAL_TIMESTAMP,
+            ColumnValue::TimestampTz(_) => VAL_TIMESTAMPTZ,
+            ColumnValue::TimeTz { .. } => VAL_TIMETZ,
+            ColumnValue::Uuid(_) => VAL_UUID,
+            ColumnValue::Name(_) => VAL_NAME,
+            ColumnValue::Bytea(_) => VAL_BYTEA,
+            ColumnValue::Text(_) => VAL_TEXT,
+            ColumnValue::ExternalToast(_) => VAL_EXTERNAL_TOAST,
+            ColumnValue::Unsupported { .. } => VAL_UNSUPPORTED,
+            ColumnValue::Numeric(_) => VAL_NUMERIC,
+            ColumnValue::Inet(_) => VAL_INET,
+            ColumnValue::Interval(_) => VAL_INTERVAL,
+            ColumnValue::Json(_) => VAL_JSON,
+            ColumnValue::PgPending { .. } => VAL_PG_PENDING,
+            ColumnValue::PgPendingText { .. } => VAL_PG_PENDING_TEXT,
+        }
+    }
+
     #[test]
     fn encode_decode_value_round_trip_for_every_variant() {
+        use crate::decode::codecs::{InetValue, IntervalValue, NumericKind, PGSQL_AF_INET6};
         let cases = [
             ColumnValue::Null,
             ColumnValue::Bool(true),
@@ -1684,21 +1782,6 @@ mod tests {
                 type_oid: 1700,
                 raw: vec![0xAB; 32],
             },
-        ];
-        for v in cases {
-            let mut out = Vec::new();
-            encode_value(&mut out, &v);
-            let mut cur = Cursor::new(&out);
-            let decoded = decode_value(&mut cur).unwrap();
-            assert_eq!(decoded, v, "round-trip mismatch for {v:?}");
-            assert_eq!(cur.pos, out.len(), "trailing bytes for {v:?}");
-        }
-    }
-
-    #[test]
-    fn encode_decode_remaining_value_variants_round_trip() {
-        use crate::decode::codecs::{InetValue, IntervalValue, NumericKind, PGSQL_AF_INET6};
-        let cases = [
             ColumnValue::Numeric(NumericKind::Finite("3.14".into())),
             ColumnValue::Numeric(NumericKind::NaN),
             ColumnValue::Numeric(NumericKind::PInf),
@@ -1719,15 +1802,39 @@ mod tests {
                 type_oid: 3802,
                 raw: vec![0xAA, 0xBB, 0xCC],
             },
+            ColumnValue::PgPendingText {
+                type_oid: 1007,
+                text: "{1,2}".into(),
+            },
         ];
+        let mut seen = std::collections::BTreeSet::new();
         for v in cases {
             let mut out = Vec::new();
             encode_value(&mut out, &v);
+            assert_eq!(out[0], expected_tag(&v), "tag mismatch for {v:?}");
+            seen.insert(out[0]);
             let mut cur = Cursor::new(&out);
             let decoded = decode_value(&mut cur).unwrap();
             assert_eq!(decoded, v, "round-trip mismatch for {v:?}");
             assert_eq!(cur.pos, out.len(), "trailing bytes for {v:?}");
         }
+        // Samples span a gapless 0..next, and next decodes as unknown: together
+        // that is the whole tag space, so a variant added without a sample here
+        // trips the probe below
+        let next = seen.len() as u8;
+        assert_eq!(
+            seen,
+            (0..next).collect(),
+            "sampled tags are not gapless from {VAL_NULL}"
+        );
+        let probe = decode_value(&mut Cursor::new(&[next]));
+        let Err(SpillError::Format { detail, .. }) = probe else {
+            panic!("tag {next} decodes, so it needs a round-trip sample here")
+        };
+        assert!(
+            detail.contains("unknown ColumnValue tag"),
+            "tag {next} is live, so it needs a round-trip sample here: {detail}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

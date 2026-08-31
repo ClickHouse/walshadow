@@ -1,10 +1,11 @@
 //! Decode pool — the CPU/IO-parallel stage.
 //!
-//! Each worker pulls a [`DecodeJob`] and per heap detoasts, runs oracle
-//! `PgPending` resolution, and routes under the attached
+//! Each worker pulls a [`DecodeJob`] and per heap detoasts, renders narrow
+//! local extensions, and routes under the attached
 //! [`RouteSnapshot`](crate::emit::route::RouteSnapshot) to the
 //! [`InsertBatcher`](crate::emit::pipeline::batcher). After the xact's last row it
-//! reports `Placed{seq, rows}`.
+//! reports `Placed{seq, rows}`. Oracle resolution happens later, in the
+//! inserter.
 //!
 //! Out-of-order completion across workers is fine: rows carry `source_lsn`
 //! as `_lsn`, so `ReplacingMergeTree(_lsn)` converges per PK
@@ -23,7 +24,6 @@ use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
 use crate::emit::route::RoutedHeap;
-use crate::ops::oracle::{Oracle, resolve_pending_tuple};
 use crate::toast::{ChunkRefMap, ToastResolver};
 use crate::xact::xact_buffer::{ChunkGeneration, detoast_heap};
 
@@ -49,7 +49,6 @@ pub struct DecodeJob {
 /// here resolves catalog or mapping state.
 #[derive(Clone)]
 pub struct DecodeCtx {
-    pub oracle: Option<Arc<Oracle>>,
     /// Shared FIFO `BatcherMsg` channel: a chunk enqueues as one ordered item
     /// so a barrier `FlushAll` can't overtake it.
     pub msg_tx: mpsc::Sender<BatcherMsg>,
@@ -126,22 +125,12 @@ pub async fn decode_and_route(
             commit_ts,
             commit_lsn,
         };
-        // Extension types (PostGIS geography → WKT, pgvector → [..]) rendered
-        // in-tree before the bridge, which can't (or needn't) resolve them.
+        // PostGIS WKT differs from typoutput HEXEWKB
         if let Some(t) = committed.decoded.new.as_mut() {
             crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
         }
         if let Some(t) = committed.decoded.old.as_mut() {
             crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
-        }
-        if let Some(oracle) = &ctx.oracle {
-            // Resolve PgPending via shadow PG extension
-            if let Some(t) = committed.decoded.new.as_mut() {
-                resolve_pending_tuple(oracle, &mut t.columns).await;
-            }
-            if let Some(t) = committed.decoded.old.as_mut() {
-                resolve_pending_tuple(oracle, &mut t.columns).await;
-            }
         }
         buf_bytes += committed.decoded.approx_bytes();
         buf.push(RoutedRow {
@@ -302,7 +291,6 @@ mod tests {
         let (msg_tx, mut msg_rx) = mpsc::channel(8);
         let stats = Arc::new(EmitterStats::default());
         let ctx = DecodeCtx {
-            oracle: None,
             msg_tx,
             stats: stats.clone(),
             resolver: ToastResolver::disabled(),

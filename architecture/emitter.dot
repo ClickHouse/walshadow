@@ -38,7 +38,7 @@ digraph emitter {
     label="decode pool ×M  (emit/pipeline/decode.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    decode [label="decode worker ×M\nplanned envelopes: descriptor + route attached,\nvalues resolved at planning\noracle PgPending resolve\nchunk 1024 rows / 4 MiB", fillcolor="#4D4128"];
+    decode [label="decode worker ×M\nplanned envelopes: descriptor + route attached,\nvalues resolved at planning\noracle columns stay raw for the inserter\nchunk 1024 rows / 4 MiB", fillcolor="#4D4128"];
   }
 
   // ═════ batcher hub ═════
@@ -58,7 +58,7 @@ digraph emitter {
     label="inserter pool ×N  (emit/pipeline/inserter.rs)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
-    ins [label="inserter ×N — any idle takes any batch\nTypeAst cache per (table, epoch)\nBlockBuilder over owned slabs\nsend_query → send_data → EndOfStream\nsend_with_retry: reconnect + backoff,\ninsert_timeout 30 s; exhaustion = Fatal", fillcolor="#5D4628"];
+    ins [label="inserter ×N — any idle takes any batch\nTypeAst cache per (table, epoch)\noracle: one request per sealed batch,\nsplice returned Native columns\nBlockBuilder over owned slabs\nsend_query → send_data → EndOfStream\nsend_with_retry: reconnect + backoff,\ninsert_timeout 30 s; exhaustion = Fatal", fillcolor="#5D4628"];
   }
 
   // ═════ DDL path: barrier + applicator (own CH connection) ═════

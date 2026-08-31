@@ -2,13 +2,13 @@
 
 Pump bytes off source PG, walk pages into records at page cadence,
 dispatch each record through a fan-out sink chain. One ingress site
-([`SourceFeed`](../src/source_feed.rs)), one walker
-([`StreamingWalker`](../src/streaming_walker.rs)), one record-cadence
-dispatch point ([`WalStream::push`](../src/wal_stream.rs)). Filter
+([`SourceFeed`](../src/source/source_feed.rs)), one walker
+([`StreamingWalker`](../src/source/streaming_walker.rs)), one record-cadence
+dispatch point ([`WalStream::push`](../src/source/wal_stream.rs)). Filter
 rewrite into shadow's `pg_wal/`, heap decode into CH Native blocks,
 xact buffering, oracle all hang off
-[`RecordSink`](../src/wal_stream.rs) +
-[`RecordBytesSink`](../src/wal_stream.rs) traits with no second walk
+[`RecordSink`](../src/source/wal_stream.rs) +
+[`RecordBytesSink`](../src/source/wal_stream.rs) traits with no second walk
 of bytes
 
 ![source pipeline](../architecture/source.svg)
@@ -24,30 +24,30 @@ xact buffer consume to build CH Native blocks
 
 Same parse, same walk, same byte ranges. Filter decision (Keep / Drop)
 computed once per record, broadcast to both consumers via
-[`CompositeRecordSink`](../src/wal_stream.rs). Drop path NOOP-rewrites
+[`CompositeRecordSink`](../src/source/wal_stream.rs). Drop path NOOP-rewrites
 bytes in place inside walker buffer so segment-cadence disk output
-([`DirSegmentSink`](../src/wal_stream.rs)) and record-cadence shadow
-wire ([`ShadowStreamSink`](../src/shadow_stream.rs)) ship the same
+([`DirSegmentSink`](../src/source/wal_stream.rs)) and record-cadence shadow
+wire ([`ShadowStreamSink`](../src/source/shadow_stream.rs)) ship the same
 rewrite
 
 ## SourceFeed
 
-[`src/source_feed.rs`](../src/source_feed.rs). Wraps wal-rus's
+[`src/source/source_feed.rs`](../src/source/source_feed.rs). Wraps wal-rus's
 `walrus::pg::replication::conn::ReplicationConn`:
 `IDENTIFY_SYSTEM` → `START_REPLICATION PHYSICAL <slot>? <lsn>
 TIMELINE <tli>` → `next_chunk` loop returning
-[`WalChunk { start_lsn, server_wal_end, data }`](../src/source_feed.rs)
+[`WalChunk { start_lsn, server_wal_end, data }`](../src/source/source_feed.rs)
 per `CopyData('w')` frame. `next_chunk` blocks on one server message;
 WAL data returns to caller, keepalives absorbed transparently,
 `reply_requested` echoes `'r'` status update inline.
-[`StandbyStatus { write_lsn, flush_lsn, apply_lsn }`](../src/source_feed.rs)
+[`StandbyStatus { write_lsn, flush_lsn, apply_lsn }`](../src/source/source_feed.rs)
 passes in per call; `send_status` clamps each field to its own monotonic
 high-water (`StatusFloors` via `clamp_status`) — PG treats flush/apply
 regression as a protocol violation and force-disconnects. Per-field
 floors, not one shared high-water: a leading `write` must not lift
 `flush`/`apply`, which would claim durability the filter and CH emitter
 have not reached and let source recycle un-filtered WAL. Cadence
-[`DEFAULT_STATUS_INTERVAL = 10s`](../src/source_feed.rs); source's
+[`DEFAULT_STATUS_INTERVAL = 10s`](../src/source/source_feed.rs); source's
 `wal_sender_timeout` default 60s gives 6× headroom
 
 `slot: Option<&str>` on `start_physical_replication`: Some = bind
@@ -120,9 +120,9 @@ daemon), but the hook exists
 
 ## WalStream::push
 
-[`src/wal_stream.rs`](../src/wal_stream.rs). Page-cadence record entry
-point. Owns [`StreamingWalker`](../src/streaming_walker.rs), long-lived
-[`Filter`](../src/filter.rs), per-segment manifest accumulator,
+[`src/source/wal_stream.rs`](../src/source/wal_stream.rs). Page-cadence record entry
+point. Owns [`StreamingWalker`](../src/source/streaming_walker.rs), long-lived
+[`Filter`](../src/filter/engine.rs), per-segment manifest accumulator,
 optional `RecordBytesSink` for shadow wire
 
 ```rust
@@ -171,19 +171,19 @@ fresh `WalStream` + fresh upstream connection at durable
 
 ## StreamingWalker
 
-[`src/streaming_walker.rs`](../src/streaming_walker.rs). Stateful page
+[`src/source/streaming_walker.rs`](../src/source/streaming_walker.rs). Stateful page
 walker driven by `WalStream::push` as bytes arrive. Carries page-cursor
 + `Pending` cross-page stitcher + 16 MiB segment-accumulating buffer
 across calls
 
-[`StreamingWalker::buffer() -> &[u8]`](../src/streaming_walker.rs)
+[`StreamingWalker::buffer() -> &[u8]`](../src/source/streaming_walker.rs)
 returns live segment buffer; `WalStream::flush_segment` hands it to
 `SegmentSink::on_segment` without `Vec` allocation, `reset_segment()`
 `buf.clear()`s in place. One 16 MiB allocation across the whole pump,
 not one per segment
 
 `try_next() -> Option<Result<CompletedRecord, _>>` yields next finalised
-record. [`CompletedRecord`](../src/streaming_walker.rs) carries
+record. [`CompletedRecord`](../src/source/streaming_walker.rs) carries
 `byte_ranges`, `start_offset`, `page_magic`, `stitched_bytes:
 Option<Vec<u8>>`: `None` for single-page records (overwhelmingly common,
 caller reads via `completed.logical_bytes(walker.buffer())` borrowing
@@ -198,7 +198,7 @@ sidesteps the NLL trap that bit `CompletedRecord<'a>` borrowing into
 `rewrite_record(byte_ranges, bytes)` scatters post-`noop_replace` bytes
 into walker buffer. Mutates `&mut self.buf`, so parsed record's borrows
 into the same buffer must release first —
-[`WalStream::drain_records`](../src/wal_stream.rs) materialises
+[`WalStream::drain_records`](../src/source/wal_stream.rs) materialises
 `parsed.into_owned()` between filter decide and rewrite
 
 Walker rejects pre-PG-15 magic
@@ -209,9 +209,9 @@ not parser
 
 ## CompositeRecordSink fan-out
 
-[`src/wal_stream.rs`](../src/wal_stream.rs). Single dispatch site in
+[`src/source/wal_stream.rs`](../src/source/wal_stream.rs). Single dispatch site in
 `WalStream::push`, fan-out via
-[`CompositeRecordSink`](../src/wal_stream.rs) — `inner: Vec<Box<dyn
+[`CompositeRecordSink`](../src/source/wal_stream.rs) — `inner: Vec<Box<dyn
 RecordSink + Send>>`, push sees single `&mut dyn RecordSink`
 
 `MetricsRecordSink` runs on pump task — counter bumps only, no await,
@@ -222,11 +222,11 @@ park pump
 Byte path lives separately on `RecordBytesSink::on_wire_chunk`, not on
 `RecordSink`. Filter's NOOP rewrite for dropped records fires inside
 `drain_records` before either sink sees bytes, so both shadow's wire
-and shadow's archive ([`DirSegmentSink`](../src/wal_stream.rs)) ship
+and shadow's archive ([`DirSegmentSink`](../src/source/wal_stream.rs)) ship
 rewritten sequence. See [filter.md](filter.md) for filter rules + NOOP
 rewrite contract
 
-[`BufferingDecoderSink`](../src/xact_buffer.rs) sits as second sink in
+[`BufferingDecoderSink`](../src/xact/xact_buffer.rs) sits as second sink in
 queued chain. Sees every `Decision::Drop` record on `RM_HEAP_ID` /
 `RM_HEAP2_ID` (user-data records filter has already byte-rewritten to
 NOOP for shadow's benefit). Pre-rewrite parse carried on
@@ -235,7 +235,7 @@ NOOP for shadow's benefit). Pre-rewrite parse carried on
 
 ## QueueingRecordSink
 
-[`src/queueing_record_sink.rs`](../src/queueing_record_sink.rs).
+[`src/source/queueing_record_sink.rs`](../src/source/queueing_record_sink.rs).
 Decouples decoder's `ShadowCatalog::wait_for_replay` from pump task
 
 Wire ordering fires `RecordBytesSink::on_wire_chunk` before
@@ -279,12 +279,12 @@ WAL at last COMMIT, kill-restart idle catchup never resolves
 
 ## Catalog-boundary publication hold
 
-[`src/boundary_hold.rs`](../src/boundary_hold.rs). At a
+[`src/source/boundary_hold.rs`](../src/source/boundary_hold.rs). At a
 `catalog_boundary` commit the pump must not publish successor bytes
 until shadow replays through the commit's `next_lsn` — the seam
 descriptor capture samples shadow at ([desc_log.md](desc_log.md))
 
-[`BoundaryHoldSink`](../src/boundary_hold.rs) wraps
+[`BoundaryHoldSink`](../src/source/boundary_hold.rs) wraps
 `QueueingRecordSink` in the daemon's sink chain and blocks inside
 `on_record`: `WalStream` dispatches wire bytes for record N, then
 awaits the record sink before framing N+1, so parking there withholds
@@ -292,7 +292,7 @@ every successor byte from both the shadow wire and the archive segment
 sink (segment flush follows record drain; `restore_command` never
 observes unreleased bytes). At the boundary it first force-flushes the
 pump-side batch so the commit cannot strand in the accumulator, then
-parks in [`CatalogBoundaryGate::hold`](../src/boundary_hold.rs) until
+parks in [`CatalogBoundaryGate::hold`](../src/source/boundary_hold.rs) until
 the aggregate walreceiver apply LSN reaches `next_lsn`. DML-only
 commits never park; hold cost is DDL-rate
 
@@ -336,14 +336,14 @@ info line with held duration at target `walshadow::boundary_hold`
 ## DecoderSink
 
 Per-record decoder dispatch lives in
-[`BufferingDecoderSink`](../src/xact_buffer.rs). `decoder_sink` module
-([`src/decoder_sink.rs`](../src/decoder_sink.rs)) carries shared types:
-[`TupleObserver`](../src/decoder_sink.rs),
-[`DecoderStats`](../src/decoder_sink.rs),
-[`DecoderSinkError`](../src/decoder_sink.rs).
-[`MetricsTupleObserver`](../src/decoder_sink.rs) hosts
-[`DecoderStats`](../src/decoder_sink.rs) counter;
-[`CollectingTupleObserver`](../src/decoder_sink.rs) is test collector.
+[`BufferingDecoderSink`](../src/xact/xact_buffer.rs). `decoder_sink` module
+([`src/decode/decoder_sink.rs`](../src/decode/decoder_sink.rs)) carries shared types:
+[`TupleObserver`](../src/decode/decoder_sink.rs),
+[`DecoderStats`](../src/decode/decoder_sink.rs),
+[`DecoderSinkError`](../src/decode/decoder_sink.rs).
+[`MetricsTupleObserver`](../src/decode/decoder_sink.rs) hosts
+[`DecoderStats`](../src/decode/decoder_sink.rs) counter;
+[`CollectingTupleObserver`](../src/decode/decoder_sink.rs) is test collector.
 `TupleObserver` is the greenfield-bootstrap page-walk drain destination
 (`drain_backfill`); WAL commit drain feeds the pipeline's reorder
 coordinator instead ([emitter.md](emitter.md))
@@ -407,7 +407,7 @@ cross-page record completion via `Pending::materialise(buf)`;
 `walrus::pg::replication::stream` exposes
 `encode_wal_data_frame_into(&mut Vec<u8>, ...)` and
 `encode_keepalive_frame_into(&mut Vec<u8>, ...)`.
-[`ShadowStreamSink`](../src/shadow_stream.rs) writes CopyData envelope
+[`ShadowStreamSink`](../src/source/shadow_stream.rs) writes CopyData envelope
 (`'d'` tag + u32 BE length placeholder + body + back-patch) straight
 into each connection's send queue Vec. One Vec per (record ×
 connection), not three
@@ -433,7 +433,7 @@ Why homemade: naive approach is "shadow `restore_command` from
 walshadow's filtered segment dir". That's archive-only, sits on segment
 cadence — shadow's `pg_last_wal_replay_lsn` advances only when shadow
 finds a new segment file. Catalog gate `wait_for_replay(at_lsn)` inside
-[`BufferingDecoderSink::on_record`](../src/xact_buffer.rs) therefore
+[`BufferingDecoderSink::on_record`](../src/xact/xact_buffer.rs) therefore
 stalls for entire segment (up to 16 MiB / source's write rate, plus
 `archive_timeout`) on every cache miss. Source UPDATE → CH FINAL latency
 bottoms out at segment cadence
@@ -480,9 +480,9 @@ stop publication at a mid-segment commit, so archive-only operation is
 not startable
 
 Sink: `ShadowStreamSink` composes via
-[`WalStream::set_bytes_sink`](../src/wal_stream.rs). Per-connection
+[`WalStream::set_bytes_sink`](../src/source/wal_stream.rs). Per-connection
 `dispatched_lsn` / `flush_lsn` / `apply_lsn` tracked in
-[`ShadowStreamState`](../src/shadow_stream.rs) behind one
+[`ShadowStreamState`](../src/source/shadow_stream.rs) behind one
 `Arc<Mutex>`. Slow-client cutoff drops socket past
 `walsender_slow_threshold` queued bytes; shadow catches up via
 `restore_command` from `out/` plus in-segment `wire_buf` backfill on
@@ -492,7 +492,7 @@ reconnect. See [shadow.md](shadow.md)
 
 [`src/bin/stream.rs`](../src/bin/stream.rs). `walshadow-stream` daemon
 entry point. Boots in order: args + pre-flight validators
-([`preflight.rs`](../src/preflight.rs)); bootstrap empty shadow or resume
+([`preflight.rs`](../src/ops/preflight.rs)); bootstrap empty shadow or resume
 initialized shadow when `--bootstrap-shadow-data-dir` is set; bootstrap
 from direct `BASE_BACKUP` or wal-g-compatible object store backup
 ([shadow.md](shadow.md)); connect `SourceFeed`; run `IDENTIFY_SYSTEM`;

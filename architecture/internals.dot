@@ -72,9 +72,9 @@ digraph internals {
   // ════════ ⑥ emitter pipeline ════════
   subgraph cluster_ch {
     label="⑥ emitter pipeline — shared path for ClickHouse and metrics-only runs"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    cdecode  [label="decode pool ×M\nplanned envelopes (descriptor + route ride)\noracle PgPending resolve\nchunk 1024 rows / 4 MiB", fillcolor="#5D4628"];
+    cdecode  [label="decode pool ×M\nplanned envelopes (descriptor + route ride)\noracle columns stay raw\nchunk 1024 rows / 4 MiB", fillcolor="#5D4628"];
     tableenc [label="InsertBatcher\nTableEncoder per table\nNative columns +\n_lsn / _xid / _commit_ts / _is_deleted\nrow/byte budget + deadline seal", fillcolor="#5D4628"];
-    chwire   [label="inserter pool ×N\nBlockBuilder over sealed batch\none complete INSERT each\nsend_with_retry + reconnect", fillcolor="#5D4628"];
+    chwire   [label="inserter pool ×N\nBlockBuilder over sealed batch\noracle Native block spliced in\none complete INSERT each\nsend_with_retry + reconnect", fillcolor="#5D4628"];
     nulltail [label="metrics-only tail\nno ClickHouse connection\nacknowledge immediately", fillcolor="#4D3A28", shape=note];
     ackcol   [label="ack collector\npublish latest position after\nevery earlier commit completes", fillcolor="#4D3A28", shape=note];
     toastio  [label="ToastResolver / CH mirrors\nput births+tombstones before publish\nfetch pre-window values\ntruncate / retire / rewrite O−B", fillcolor="#5D4628"];

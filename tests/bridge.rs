@@ -1,44 +1,6 @@
-//! pgext bridge worker, end to end over its unix socket.
+//! pgext bridge worker integration tests
 //!
-//! Needs `walshadow.so` built in `pgext/` (`make -C pgext`) against the same
-//! PG major as `initdb` on PATH; fails when it isn't there.
-//!
-//! Drills cover bridge protocol and lifecycle:
-//!
-//! 1. `bridge_hello_and_decode_batch` — version gate, `REPLAY_LSN`, and a
-//!    `DECODE` batch where a truncated body and an unknown type oid return
-//!    item errors without costing their neighbours
-//! 2. `bridge_decode_matches_typoutput` — every `ws_decode_datum_text` branch
-//!    (varlena, cstring, fixed by-value, fixed by-reference) against PG's own
-//!    rendering of the same value
-//! 3. `bridge_scans_uncommitted_ddl` — `SCAN` against an open transaction: one
-//!    `pg_class` row per oid despite the superseded versions on the page, the
-//!    new column with its `attmissingval`, a rolled-back savepoint's column
-//!    absent, a relation created in-transaction visible by oid, a foreign
-//!    in-progress whole-catalog writer failing the scan as inconclusive, the
-//!    committed shape returned after `ROLLBACK`, and every handled error
-//!    leaving the same connection serving. Also the two arguments that turn
-//!    the same scan into a committed read: top xid 0, and no oid list, which
-//!    still projects `attnum >= 1` now that it is legal on every catalog
-//! 4. `bridge_reconnects_after_worker_exit` — worker killed mid-flight, daemon
-//!    redials, no cluster restart; the restarted worker pins its decode output
-//!    GUCs over contrary database defaults
-//! 5. `bridge_drops_bad_frames_per_connection` — oversize and zero-length
-//!    frames close only their own connection
-//! 6. `bridge_error_frames_stay_parseable` — unknown opcode and trailing
-//!    request bytes answer one exactly-consumed error frame, same connection
-//!    serves the next request
-//! 7. `bridge_overlay_descriptors_track_open_ddl` — mirroring statement,
-//!    committed scan and overlay scan agree for an untouched relation, then
-//!    overlay alone tracks an open transaction's added column, new relation,
-//!    schema, and type
-//! 8. `bridge_committed_read_falls_back_when_replay_moves` — a committed read
-//!    whose pin breaks answers off the mirroring statement; the same break
-//!    fails an overlay read
-//!
-//! Clusters here are plain (non-recovery) PG. The overlay predicate keys off
-//! xids, not recovery, so an open transaction exercises the same code a
-//! standby's replaying transaction does.
+//! Require `pgext/walshadow.so` built against `initdb` PG major
 
 #[path = "common/ports.rs"]
 mod ports;
@@ -53,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::{Client, NoTls};
 use walshadow::bridge::{
-    AttributeRow, Bridge, BridgeError, Catalog, ClassRow, DecodedItem, IndexRow, NamespaceRow,
+    AttributeRow, Bridge, BridgeError, Catalog, ClassRow, IndexRow, NamespaceRow,
     PROJECTION_VERSION, PROTO_VERSION,
 };
+use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::pg::socket_conninfo;
 use walshadow::schema::ReplIdent;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
@@ -214,8 +177,54 @@ fn array_int4_1_2_3() -> Vec<u8> {
     out
 }
 
+/// Encode each on-disk Datum body as CH `String`
+async fn bytes_through_oracle(bridge: Arc<Bridge>, items: &[(u32, &[u8])]) -> Vec<Vec<u8>> {
+    let oracle = Oracle::new(bridge);
+    let bufs: Vec<OracleColumnBuf> = items
+        .iter()
+        .map(|(oid, raw)| {
+            let mut b = OracleColumnBuf::new(*oid, -1);
+            b.push(OracleCell::DiskRaw(raw.to_vec()));
+            b
+        })
+        .collect();
+    let names: Vec<String> = (0..items.len()).map(|i| format!("c{i}")).collect();
+    let columns: Vec<OracleRequestColumn<'_>> = bufs
+        .iter()
+        .zip(&names)
+        .enumerate()
+        .map(|(i, (buf, name))| OracleRequestColumn {
+            ordinal: i as u32,
+            name,
+            target_type: "String",
+            buf,
+        })
+        .collect();
+    let block = oracle
+        .encode_batch(&columns, 1, clickhouse_c::Allocator::stdlib())
+        .await
+        .expect("oracle answers");
+    (0..items.len())
+        .map(|i| {
+            let (_, data) = block
+                .column(i as u32)
+                .and_then(|c| c.string())
+                .expect("string column");
+            data.to_vec()
+        })
+        .collect()
+}
+
+async fn strings_through_oracle(bridge: Arc<Bridge>, items: &[(u32, &[u8])]) -> Vec<String> {
+    bytes_through_oracle(bridge, items)
+        .await
+        .into_iter()
+        .map(|b| String::from_utf8(b).expect("utf8"))
+        .collect()
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn bridge_hello_and_decode_batch() {
+async fn bridge_hello_and_encode_native() {
     if !pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
@@ -234,41 +243,60 @@ async fn bridge_hello_and_decode_batch() {
     assert_eq!(bridge.replay_lsn().await.expect("replay_lsn"), 0);
 
     let text = body(b"hi there");
-    let bpchar = body(b"pad ");
     let numeric = numeric_42();
     let array = array_int4_1_2_3();
+    let bridge = Arc::new(bridge);
     let items: [(u32, &[u8]); _] = [
         (23, &[42, 0, 0, 0]), // int4
-        (16, &[1]),           // bool
         (25, &text),          // text
-        (1042, &bpchar),      // bpchar
         (1700, &numeric),     // numeric
         (1007, &array),       // int4[]
-        (23, &[0x00]),        // int4 body shorter than typlen
-        (999_999, &[0x00]),   // no such type
-        (23, &[7, 0, 0, 0]),  // batch keeps going after the errors
     ];
-    let out = bridge.decode(&items).await.expect("decode");
-
-    assert_eq!(out.len(), items.len());
-    let want = ["42", "t", "hi there", "pad ", "42", "{1,2,3}"];
-    for (got, want) in out.iter().zip(want) {
-        assert_eq!(got, &DecodedItem::Text(want.to_string()));
-    }
-    assert!(matches!(out[6], DecodedItem::Error(_)), "{:?}", out[6]);
-    assert!(matches!(out[7], DecodedItem::Error(_)), "{:?}", out[7]);
-    assert_eq!(out[8], DecodedItem::Text("7".to_string()));
+    let out = strings_through_oracle(bridge.clone(), &items).await;
+    assert_eq!(out, ["42", "hi there", "42", "{1,2,3}"]);
 
     use std::sync::atomic::Ordering;
-    assert_eq!(bridge.stats.decode_item_errors.load(Ordering::Relaxed), 2);
+    assert!(bridge.stats.native_bytes.load(Ordering::Relaxed) > 0);
+
+    // Bad body aborts request without closing connection
+    let bad: [(u32, &[u8]); _] = [(23, &[42, 0, 0, 0]), (23, &[0x00])];
+    let oracle = Oracle::new(bridge.clone());
+    let bufs: Vec<OracleColumnBuf> = bad
+        .iter()
+        .map(|(oid, raw)| {
+            let mut b = OracleColumnBuf::new(*oid, -1);
+            b.push(OracleCell::DiskRaw(raw.to_vec()));
+            b
+        })
+        .collect();
+    let names = ["a", "b"];
+    let columns: Vec<OracleRequestColumn<'_>> = bufs
+        .iter()
+        .zip(names)
+        .enumerate()
+        .map(|(i, (buf, name))| OracleRequestColumn {
+            ordinal: i as u32,
+            name,
+            target_type: "String",
+            buf,
+        })
+        .collect();
+    assert!(
+        oracle
+            .encode_batch(&columns, 1, clickhouse_c::Allocator::stdlib())
+            .await
+            .is_err(),
+        "short int4 body fails the request",
+    );
+    assert_eq!(
+        strings_through_oracle(bridge.clone(), &[(23, &[7, 0, 0, 0])]).await,
+        ["7"],
+    );
     assert!(bridge.is_up());
 }
 
-/// Every branch of `ws_decode_datum_text`, differentially against the same
-/// cluster's `typoutput`. Was `pgext`'s pg_regress suite before the SQL
-/// surface went away; the socket is the only entry point now.
 #[tokio::test(flavor = "current_thread")]
-async fn bridge_decode_matches_typoutput() {
+async fn bridge_native_strings_match_typoutput() {
     if !pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
@@ -291,11 +319,6 @@ async fn bridge_decode_matches_typoutput() {
         ),
         ("text", Vec::new(), "''".into()),
         ("varchar", b"abc".to_vec(), "'abc'".into()),
-        (
-            "bytea",
-            vec![0xde, 0xad, 0xbe, 0xef],
-            "'\\xdeadbeef'".into(),
-        ),
         ("json", br#"{"k":1}"#.to_vec(), r#"'{"k":1}'"#.into()),
         // >126 bytes, so PG stores a 4-byte header on disk
         (
@@ -312,8 +335,6 @@ async fn bridge_decode_matches_typoutput() {
             1_234_567_890i64.to_le_bytes().to_vec(),
             "1234567890".into(),
         ),
-        ("bool", vec![1], "true".into()),
-        ("bool", vec![0], "false".into()),
         ("oid", 1234u32.to_le_bytes().to_vec(), "1234".into()),
         ("float4", 1.0f32.to_le_bytes().to_vec(), "1.0".into()),
         ("float8", 1.0f64.to_le_bytes().to_vec(), "1.0".into()),
@@ -335,22 +356,32 @@ async fn bridge_decode_matches_typoutput() {
     for (ty, raw, _) in &cases {
         items.push((oid_of_type(&sql, ty).await, raw.as_slice()));
     }
-    let out = bridge.decode(&items).await.expect("decode");
+    let bridge = Arc::new(bridge);
+    let out = strings_through_oracle(bridge.clone(), &items).await;
     assert_eq!(out.len(), cases.len());
 
     for (got, (ty, _, literal)) in out.iter().zip(&cases) {
-        // `format('%s')` runs the type's output function; `::text` would pick
-        // up a pg_cast entry instead (bool renders "true", boolout gives "t")
         let want = scalar(&sql, &format!("SELECT format('%s', ({literal})::{ty})")).await;
-        assert_eq!(
-            got,
-            &DecodedItem::Text(want.clone()),
-            "{ty} from {literal} — PG renders {want}",
-        );
+        assert_eq!(got, &want, "{ty} from {literal} — PG renders {want}");
     }
 
-    // Fixed-width bodies shorter than typlen, and a type oid with no row,
-    // are per-item errors
+    let cast_shaped: [(&str, Vec<u8>, &[u8]); 4] = [
+        ("bool", vec![1], b"true"),
+        ("bool", vec![0], b"false"),
+        ("bpchar", body(b"pad "), b"pad"),
+        ("bytea", vec![0xde, 0xad], &[0xde, 0xad]),
+    ];
+    let mut items: Vec<(u32, &[u8])> = Vec::with_capacity(cast_shaped.len());
+    for (ty, raw, _) in &cast_shaped {
+        items.push((oid_of_type(&sql, ty).await, raw.as_slice()));
+    }
+    let out = bytes_through_oracle(bridge.clone(), &items).await;
+    for (got, (ty, _, want)) in out.iter().zip(&cast_shaped) {
+        assert_eq!(got.as_slice(), *want, "{ty}");
+    }
+
+    // Invalid fixed widths and unknown OIDs abort whole request
+    let oracle = Oracle::new(bridge.clone());
     let empty: &[u8] = &[];
     let short_uuid: &[u8] = &[0x00, 0x11];
     let bad: [(u32, &[u8]); _] = [
@@ -358,9 +389,22 @@ async fn bridge_decode_matches_typoutput() {
         (oid_of_type(&sql, "uuid").await, short_uuid),
         (2_147_483_647, &[0x00]),
     ];
-    let out = bridge.decode(&bad).await.expect("decode");
-    for (i, item) in out.iter().enumerate() {
-        assert!(matches!(item, DecodedItem::Error(_)), "{i}: {item:?}");
+    for (oid, raw) in bad {
+        let mut b = OracleColumnBuf::new(oid, -1);
+        b.push(OracleCell::DiskRaw(raw.to_vec()));
+        let columns = [OracleRequestColumn {
+            ordinal: 0,
+            name: "c",
+            target_type: "String",
+            buf: &b,
+        }];
+        assert!(
+            oracle
+                .encode_batch(&columns, 1, clickhouse_c::Allocator::stdlib())
+                .await
+                .is_err(),
+            "oid {oid} must fail the request",
+        );
     }
     assert!(bridge.is_up());
 }
@@ -631,16 +675,17 @@ async fn bridge_reconnects_after_worker_exit() {
         (1186, &interval_90s), // interval
         (17, &[0xde, 0xad]),   // bytea
     ];
-    let out = bridge.decode(&items).await.expect("decode");
-    let want = [
-        "2000-01-01 00:00:00+00",
-        "2000-01-01",
-        "00:01:30",
-        r"\xdead",
-    ];
-    for (got, want) in out.iter().zip(want) {
-        assert_eq!(got, &DecodedItem::Text(want.to_string()));
-    }
+    let out = bytes_through_oracle(Arc::new(bridge), &items).await;
+    assert_eq!(
+        out,
+        [
+            b"2000-01-01 00:00:00+00".to_vec(),
+            b"2000-01-01".to_vec(),
+            b"00:01:30".to_vec(),
+            // bytea keeps its bytes rather than byteaout's `\x` escape
+            vec![0xde, 0xad],
+        ]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -654,8 +699,7 @@ async fn bridge_drops_bad_frames_per_connection() {
     let bridge = dial(&guard.sh).await;
     let path = guard.sh.bridge_socket().unwrap().to_path_buf();
 
-    // Over walshadow.max_request_mb, and zero-length: both close the
-    // connection before any payload is read
+    // Invalid frame lengths close connection before payload read
     for header in [u32::MAX, 0] {
         let mut raw = UnixStream::connect(&path).expect("raw connect");
         raw.write_all(&header.to_be_bytes()).expect("write header");

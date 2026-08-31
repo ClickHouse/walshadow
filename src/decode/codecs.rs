@@ -5,8 +5,7 @@
 //! - **Deferred to the shadow bridge worker**: `jsonb`, arrays, `tsvector`,
 //!   every other Tier 3 type. Surfaced as
 //!   [`crate::decode::heap_decoder::ColumnValue::PgPending`] carrying raw on-disk
-//!   bytes; resolved at emit time by shadow PG's own `typoutput`, reached over
-//!   the bridge socket. One source of truth, no codec drift. Runtime config
+//!   bytes; encoded at emit time by shadow PG. Runtime config
 //!   reads its own `text[]` columns locally, decoding before the bridge exists.
 //!
 //! Each decoder takes the varlena *body* (or raw fixed-width bytes for

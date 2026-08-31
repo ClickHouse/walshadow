@@ -74,7 +74,7 @@ digraph decoder {
     tier1 [label="Tier 1 — fixed-width\nbool / char / int2/4/8 / oid\nfloat4/8 / date / time / timestamp[tz]\ntimetz (12) / uuid (16) / name (64)\ninterval (16, via codecs)", fillcolor="#4D4128"];
     tier2 [label="Tier 2 — varlena (typlen = −1)\ndecode_varlena: 1B short / 4B (un)compressed / on-disk TOAST\nbytea / text / bpchar / varchar / json\ninvalid UTF-8 → Bytea fallback", fillcolor="#4D4128"];
     tier3 [label="Tier 3 — in-tree codecs (codecs.rs)\nnumeric (decode_numeric)\ninet / cidr (decode_inet)\ninterval (decode_interval)\njson (passthrough)", fillcolor="#4D4128"];
-    pending [label="PgPending { type_oid, raw }\njsonb / range / arrays /\ntsvector / vendor types →\noracle: walshadow_decode_disk(oid, bytea)", fillcolor="#5D3F40"];
+    pending [label="PgPending { type_oid, raw }\njsonb / range / arrays /\ntsvector / vendor types →\noracle: ENCODE_NATIVE per sealed batch", fillcolor="#5D3F40"];
     toast [label="ExternalToast(ToastPointer)\nvarattrib_1b_e (tag 18)\nva_rawsize / va_extinfo /\nva_valueid / va_toastrelid", fillcolor="#5D3F40", shape=note];
     tier2 -> toast [style=dashed, label="on-disk ptr"];
   }

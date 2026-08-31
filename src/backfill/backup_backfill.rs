@@ -305,6 +305,7 @@ async fn walk_and_ship(
         Arc::new(crate::pos::Monotone::new(0)),
         fatal.clone(),
         ctx.config_rx.clone(),
+        ctx.oracle.clone(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("backup_backfill: spawn insert tail: {e}"))?;
@@ -352,7 +353,6 @@ async fn walk_and_ship(
         DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX),
         ctx.emitter.row_policy(),
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
-        ctx.oracle.clone(),
         std::collections::HashSet::new(),
     ));
 

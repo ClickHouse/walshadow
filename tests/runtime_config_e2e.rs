@@ -87,6 +87,7 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use walshadow::mapping::ColumnMapping;
@@ -458,7 +459,14 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
+    ) = fx::bootstrap_clusters_with_bridge(
+        &tmp,
+        &schema_sql,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
+    )
+    .await;
     let _src_stop = fx::StopOnDrop { sh: &source };
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
@@ -467,18 +475,29 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
-    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
-        tmp: &tmp,
-        source: &source,
-        shadow: &shadow,
-        shadow_filter_dir: &shadow_filter_dir,
-        shadow_stream_state,
-        ch_database: "walshadow_test",
-        ch_tcp_port: slot.ch_tcp,
-        mappings: vec![],
-        app_name: "walshadow-config-backfill",
-        ddl: Some(overlay_ddl_args()),
-    })
+    // `meta jsonb` sits outside the local matrix, so the backfill tail needs
+    // the same oracle the WAL path uses
+    let socket = shadow.bridge_socket().expect("bridge configured");
+    let bridge = walshadow::bridge::connect_with_budget(socket, Duration::from_secs(30))
+        .await
+        .expect("bridge connect");
+    let oracle = Arc::new(walshadow::oracle::Oracle::new(Arc::new(bridge)));
+
+    let mut pipeline = fx::build_pipeline_with_oracle(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name: "walshadow-config-backfill",
+            ddl: Some(overlay_ddl_args()),
+        },
+        oracle,
+    )
     .await;
 
     // Opt-in commits at S; the UPDATE + INSERT commit after S so they ride
