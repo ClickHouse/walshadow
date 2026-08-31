@@ -349,10 +349,10 @@ whole overlay subsystem; `config_table.replicate` opts one table into
 replication, triggering backfill per `initial_load`
 ([table selection guide](../docs/table-selection.md), [add_table.md](add_table.md))
 
-**oracle** — PgPending resolver: shadow decodes on-disk bytes through
-the bridge worker's `DECODE` op (same `typoutput` PG would call) into text
-post-plan; best-effort, unresolved values ship raw bytes
-([oracle.md](oracle.md))
+**oracle** — resolver for types walshadow does not decode: shadow PG
+converts on-disk bytes into a ClickHouse Native column through the bridge
+worker's `ENCODE_NATIVE` op, one request per sealed batch. No fallback, a
+cell it cannot convert fails the batch ([oracle.md](oracle.md))
 
 **ordered_events** — `DrainedBatch` catalog/config/toast-barrier positions
 interleaved with heaps and TOAST-row cursors; pipeline walks them as
@@ -384,14 +384,15 @@ observes `[stream] paused`; a switchover's promotion decision compares the
 target's replay against the frozen received value, and resume asks for the
 frozen consumed one ([failover.md](failover.md))
 
-**PgPending** — ColumnValue fallback `{type_oid, raw}` for types without
-in-tree codec (jsonb, ranges, arrays, tsvector, vendor types); resolved
-at emit via required oracle bridge; per-item `typoutput` errors preserve raw
-bytes ([decoder.md](decoder.md), [oracle.md](oracle.md))
+**PgPending / PgPendingText** — ColumnValue variants for types without
+in-tree codec (jsonb, ranges, arrays, tsvector, vendor types): on-disk
+Datum body, or `attmissingval` text needing `typinput`. Both cross to the
+oracle as cells, neither is ever rendered locally
+([decoder.md](decoder.md), [oracle.md](oracle.md))
 
 **pgext** — walshadow PG module (PGXS, shadow-only), loaded through
 `shared_preload_libraries` rather than `CREATE EXTENSION`; serves catalog
-reads and on-disk decode over a unix socket
+reads and Native conversion over a unix socket
 ([oracle.md](oracle.md), [`pgext/walshadow.h`](../pgext/walshadow.h))
 
 **PgXactAccum / PgXactPatch** — backup-era `pg_xact` accumulated from

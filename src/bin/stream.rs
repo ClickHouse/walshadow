@@ -3493,11 +3493,17 @@ async fn populate_metrics(
         emitter_deletes_discarded: emitter_stats
             .map(|s| s.deletes_discarded.load(Ordering::Relaxed))
             .unwrap_or(0),
-        oracle_resolved_total: oracle_stats
-            .map(|s| s.resolved.load(Ordering::Relaxed))
+        oracle_blocks_total: oracle_stats
+            .map(|s| s.blocks.load(Ordering::Relaxed))
             .unwrap_or(0),
-        oracle_fallback_raw_total: oracle_stats
-            .map(|s| s.fallback_raw.load(Ordering::Relaxed))
+        oracle_rows_total: oracle_stats
+            .map(|s| s.rows.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_cells_total: oracle_stats
+            .map(|s| s.cells.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_conversion_errors_total: oracle_stats
+            .map(|s| s.conversion_errors.load(Ordering::Relaxed))
             .unwrap_or(0),
         oracle_errors_total: oracle_stats
             .map(|s| s.errors.load(Ordering::Relaxed))
@@ -3585,8 +3591,7 @@ async fn populate_metrics(
         bridge_scan_subtrans_mismatch_total: bridge_gauge(bridge_stats, |b| {
             &b.scan_subtrans_mismatch
         }),
-        bridge_decode_items_total: bridge_gauge(bridge_stats, |b| &b.decode_items),
-        bridge_decode_item_errors_total: bridge_gauge(bridge_stats, |b| &b.decode_item_errors),
+        bridge_native_bytes_total: bridge_gauge(bridge_stats, |b| &b.native_bytes),
     };
     registry.set(snap).await;
 }
@@ -4304,21 +4309,6 @@ async fn run_bootstrap(
         let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
         let fatal = Fatal::new();
         let inserter_pool_size = emitter_cfg.inserter_pool_size;
-        let (msg_tx, ack, tail) = tail::spawn(
-            &emitter_cfg,
-            inserter_pool_size,
-            stats.clone(),
-            emitter_ack,
-            fatal.clone(),
-        )
-        .await
-        .context("bootstrap: spawn insert tail")?;
-        tracing::info!(
-            target: "walshadow::bootstrap",
-            addr = %addr,
-            inserters = inserter_pool_size,
-            "bootstrap insert tail started",
-        );
 
         let source_conninfo = format!(
             "host={} port={} user={} dbname={} sslmode={}",
@@ -4332,26 +4322,46 @@ async fn run_bootstrap(
                 "prefer"
             },
         );
-        let bootstrap_oracle =
-            if walshadow::backfill::bootstrap_oracle::needs_bridge(&drain_catalog) {
-                Some(
-                    walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
-                        args.spill_dir.join("bootstrap_oracle"),
-                        source_conninfo,
-                        src_cfg.password.clone(),
-                        args.bridge_lib_dir.clone(),
-                        Duration::from_secs(args.shadow_connect_timeout),
-                    )
-                    .await
-                    .context(
-                        "bootstrap oracle: greenfield needs it to resolve tier-3 types; \
-                     refusing to load empty columns",
-                    )?,
+        let bootstrap_oracle = if walshadow::backfill::bootstrap_oracle::needs_oracle(
+            &drain_catalog,
+            &mapping.snapshot().await,
+            &resolved.column_rules,
+        ) {
+            Some(
+                walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
+                    args.spill_dir.join("bootstrap_oracle"),
+                    source_conninfo,
+                    src_cfg.password.clone(),
+                    args.bridge_lib_dir.clone(),
+                    Duration::from_secs(args.shadow_connect_timeout),
                 )
-            } else {
-                None
-            };
-        let oracle = bootstrap_oracle.as_ref().map(|o| o.oracle());
+                .await
+                .context(
+                    "bootstrap oracle: greenfield needs it to convert oracle columns; \
+                     refusing to load empty columns",
+                )?,
+            )
+        } else {
+            None
+        };
+
+        let (msg_tx, ack, tail) = tail::spawn_with_config(
+            &emitter_cfg,
+            inserter_pool_size,
+            stats.clone(),
+            emitter_ack,
+            fatal.clone(),
+            None,
+            bootstrap_oracle.as_ref().map(|o| o.oracle()),
+        )
+        .await
+        .context("bootstrap: spawn insert tail")?;
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            addr = %addr,
+            inserters = inserter_pool_size,
+            "bootstrap insert tail started",
+        );
 
         // `initial_load = "none"` (table override, else namespace) opts a
         // relation out of the greenfield snapshot: create it + stream CDC, but
@@ -4393,7 +4403,6 @@ async fn run_bootstrap(
             // snapshot the CREATEs above rendered from: per-relation system
             // column names have to match what CH now holds
             Some(resolved),
-            oracle,
             skip_initial,
         ));
         let (drain_res, pump_res) = tokio::join!(drain, pump);

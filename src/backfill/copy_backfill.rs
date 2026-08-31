@@ -31,8 +31,9 @@
 //! byte/text strings decode natively into the same [`ColumnValue`] variants
 //! the WAL path produces; `numeric` selects as `::text` (numeric_out is the
 //! exact `NumericKind::Finite` form); every out-of-matrix type also selects
-//! as `::text` and ships as [`ColumnValue::Text`], mirroring the WAL path's
-//! `PgPending`→oracle→text resolution and the type bridge's `String` mapping.
+//! as `::text` and ships as [`ColumnValue::PgPendingText`], so the oracle
+//! converts it through `typinput` exactly as it does a WAL-path default
+//! (plans/oracle.md).
 //!
 //! ## Resume ledger
 //!
@@ -263,6 +264,7 @@ enum WireKind {
 struct ColPlan {
     attnum: i16,
     kind: WireKind,
+    type_oid: u32,
 }
 
 struct CopyPlan {
@@ -316,6 +318,7 @@ fn column_plan(desc: &RelDescriptor) -> CopyPlan {
         cols.push(ColPlan {
             attnum: a.attnum,
             kind,
+            type_oid: a.type_oid,
         });
     }
     CopyPlan {
@@ -334,9 +337,8 @@ fn text_or_bytea(raw: &[u8], wrap: fn(String) -> ColumnValue) -> ColumnValue {
     std::str::from_utf8(raw).map_or_else(|_| ColumnValue::Bytea(raw.to_vec()), |s| wrap(s.into()))
 }
 
-/// Decode one non-NULL wire field into the same [`ColumnValue`] variant the
-/// WAL heap decoder produces for that column.
-fn decode_field(kind: WireKind, raw: &[u8]) -> Result<ColumnValue, String> {
+/// Decode non-NULL wire field into heap-decoder value shape
+fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<ColumnValue, String> {
     Ok(match kind {
         WireKind::Bool => ColumnValue::Bool(fixed::<1>(raw, "bool")?[0] != 0),
         WireKind::Char => ColumnValue::Char(fixed::<1>(raw, "char")?[0] as i8),
@@ -354,7 +356,15 @@ fn decode_field(kind: WireKind, raw: &[u8]) -> Result<ColumnValue, String> {
         }
         WireKind::Uuid => ColumnValue::Uuid(fixed(raw, "uuid")?),
         WireKind::Bytea => ColumnValue::Bytea(raw.to_vec()),
-        WireKind::Text | WireKind::CastText => text_or_bytea(raw, ColumnValue::Text),
+        WireKind::Text => text_or_bytea(raw, ColumnValue::Text),
+        // Preserve source type for typinput
+        WireKind::CastText => match std::str::from_utf8(raw) {
+            Ok(s) => ColumnValue::PgPendingText {
+                type_oid,
+                text: s.to_owned(),
+            },
+            Err(_) => ColumnValue::Bytea(raw.to_vec()),
+        },
         WireKind::Name => text_or_bytea(raw, ColumnValue::Name),
         WireKind::Json => text_or_bytea(raw, ColumnValue::Json),
         // numeric_out text form; specials carry their flag
@@ -1054,6 +1064,7 @@ impl CopyBackfiller {
             Arc::new(crate::pos::Monotone::new(0)),
             fatal.clone(),
             self.config_rx.clone(),
+            self.oracle.clone(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("backfill: spawn insert tail: {e}"))?;
@@ -1076,7 +1087,6 @@ impl CopyBackfiller {
             ),
             self.emitter.row_policy(),
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
-            None,
             std::collections::HashSet::new(),
         ));
 
@@ -1097,7 +1107,7 @@ impl CopyBackfiller {
                 for (i, cp) in plan.cols.iter().enumerate() {
                     let raw: Option<&[u8]> = row.try_get(i).context("backfill: COPY field")?;
                     let v = raw
-                        .map(|raw| decode_field(cp.kind, raw))
+                        .map(|raw| decode_field(cp.kind, cp.type_oid, raw))
                         .transpose()
                         .map_err(anyhow::Error::msg)?
                         .unwrap_or(ColumnValue::Null);
@@ -1225,54 +1235,57 @@ mod tests {
     #[test]
     fn decode_matches_wal_variants() {
         assert_eq!(
-            decode_field(WireKind::Int8, &7i64.to_be_bytes()).unwrap(),
+            decode_field(WireKind::Int8, 0, &7i64.to_be_bytes()).unwrap(),
             ColumnValue::Int8(7),
         );
         assert_eq!(
-            decode_field(WireKind::Bool, &[1]).unwrap(),
+            decode_field(WireKind::Bool, 0, &[1]).unwrap(),
             ColumnValue::Bool(true),
         );
         assert_eq!(
-            decode_field(WireKind::Date, &8000i32.to_be_bytes()).unwrap(),
+            decode_field(WireKind::Date, 0, &8000i32.to_be_bytes()).unwrap(),
             ColumnValue::Date(8000),
         );
         assert_eq!(
-            decode_field(WireKind::Text, b"abc").unwrap(),
+            decode_field(WireKind::Text, 0, b"abc").unwrap(),
             ColumnValue::Text("abc".into()),
         );
         assert_eq!(
-            decode_field(WireKind::Name, b"orders").unwrap(),
+            decode_field(WireKind::Name, 0, b"orders").unwrap(),
             ColumnValue::Name("orders".into()),
         );
         assert_eq!(
-            decode_field(WireKind::Json, b"{\"a\": 1}").unwrap(),
+            decode_field(WireKind::Json, 0, b"{\"a\": 1}").unwrap(),
             ColumnValue::Json("{\"a\": 1}".into()),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, b"12.50").unwrap(),
+            decode_field(WireKind::NumericText, 0, b"12.50").unwrap(),
             ColumnValue::Numeric(NumericKind::Finite("12.50".into())),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, b"NaN").unwrap(),
+            decode_field(WireKind::NumericText, 0, b"NaN").unwrap(),
             ColumnValue::Numeric(NumericKind::NaN),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, b"Infinity").unwrap(),
+            decode_field(WireKind::NumericText, 0, b"Infinity").unwrap(),
             ColumnValue::Numeric(NumericKind::PInf),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, b"-Infinity").unwrap(),
+            decode_field(WireKind::NumericText, 0, b"-Infinity").unwrap(),
             ColumnValue::Numeric(NumericKind::NInf),
         );
         assert_eq!(
-            decode_field(WireKind::CastText, b"{1,2}").unwrap(),
-            ColumnValue::Text("{1,2}".into()),
+            decode_field(WireKind::CastText, 1007, b"{1,2}").unwrap(),
+            ColumnValue::PgPendingText {
+                type_oid: 1007,
+                text: "{1,2}".into(),
+            },
         );
         // Wrong width is an error, not a silent misread
-        assert!(decode_field(WireKind::Int4, &[0, 1]).is_err());
+        assert!(decode_field(WireKind::Int4, 0, &[0, 1]).is_err());
         // Invalid UTF-8 degrades to Bytea like the heap decoder
         assert_eq!(
-            decode_field(WireKind::Text, &[0xFF, 0xFE]).unwrap(),
+            decode_field(WireKind::Text, 0, &[0xFF, 0xFE]).unwrap(),
             ColumnValue::Bytea(vec![0xFF, 0xFE]),
         );
     }

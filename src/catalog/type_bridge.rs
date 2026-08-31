@@ -29,7 +29,7 @@
 //! | `vector` / `halfvec` | `Array(Float32)` | pgvector, by type name |
 //! | `geography` / `geometry` | `String` | WKT `POINT(x y)`, rendered at decode |
 //! | `<elem>[]` | `Array(Nullable(<elem>))` | 1-D supported elems, else String |
-//! | unknown | `String` | falls through to PgPending bytes |
+//! | unknown | `String` | oracle converts, never raw bytes |
 //!
 //! Nullability: `not_null = false` wraps inner in `Nullable(_)` unless
 //! column is in CH `ORDER BY` (PK columns must stay non-nullable; caller
@@ -257,6 +257,7 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
             // lands as a cast, matching PG `DEFAULT typeinput('…')` semantics
             Some(sql_bytes_literal(raw))
         }
+        ColumnValue::PgPendingText { text, .. } => Some(sql_bytes_literal(text.as_bytes())),
         ColumnValue::ExternalToast(_) | ColumnValue::Unsupported { .. } => None,
     }
 }

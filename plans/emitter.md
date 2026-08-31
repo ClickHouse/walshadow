@@ -138,8 +138,8 @@ into replay verbatim
 Each worker pulls a `DecodeJob` of planned `RoutedHeap` envelopes —
 descriptor and route ride each envelope, nothing here resolves catalog
 or mapping state. Per heap: `detoast_heap` (values already resolved at
-planning, chunks ride empty), oracle `PgPending`
-resolution, then routes `RoutedRow`s to the
+planning, chunks ride empty), `render_ext_columns` for the narrow
+PostGIS point case, then routes `RoutedRow`s to the
 batcher in chunks (`DECODE_CHUNK_ROWS = 1024` / `DECODE_CHUNK_BYTES =
 4 MiB`, amortizing the channel hop). After the xact's last row it
 reports `Placed { seq, rows }`. Decode errors are fatal — a
@@ -198,6 +198,10 @@ owned slabs (`TypeAst` cache keyed on `(table, schema_epoch)`;
 `TypeAst` is `Send` not `Sync`, each inserter parses its own), and
 runs one `send_query` + `send_data` + `send_data_end` +
 drain-to-`EndOfStream`
+
+A batch holding oracle columns resolves them first: one bridge request
+before the query opens, spliced into the same block
+([oracle.md](oracle.md))
 
 Durability invariant: `ack.acked(per_seq)` fires **only after** the
 drain returns. Until then a connection drop replays the still-owned
@@ -553,22 +557,15 @@ Nothing foreign survives to planning or the decode pool
 
 PG's fast-path `ALTER TABLE ADD COLUMN … DEFAULT k` plants
 `attmissingval[1]` instead of rewriting heap. `RelAttr.missing_text`
-carries typoutput text; resolution tiers:
+carries typoutput text. `heap_decoder::missing_value_for(att)` parses it
+at decode time for the types it covers, so the batcher sees a finished
+`ColumnValue`; everything else becomes
+`ColumnValue::PgPendingText { type_oid, text }` and crosses in the batch's
+oracle request as a `TextInput` cell for the type's `typinput`. No fallback:
+a value still holding source bytes on a locally-routed column errors
 
-- Tier 1 (immediate): bool / int / float / numeric / text — decoder
-  resolves at parse time via `heap_decoder::missing_value_for(att)`,
-  batcher sees fully-decoded `ColumnValue`
-- Tier 2 (typmod-aware): timestamp / timestamptz / date — decoder
-  resolves with typmod
-- Tier 3 (oracle): unsupported / array / domain types — decoder emits
-  `ColumnValue::PgPending { raw, type_oid }`. Decode workers run
-  `resolve_pending_tuple` against the shadow-side extension; falls
-  through to raw bytes when oracle absent
-
-`encode_value` handles a surviving `PgPending` by shipping `raw` as
-String — no error, no stat bump, operators handle post-process via
-PG-side tooling. See [decoder.md](decoder.md) for tier classification +
-[oracle.md](oracle.md) for extension protocol
+See [decoder.md](decoder.md) for which types parse in-tree,
+[oracle.md](oracle.md) for the protocol
 
 ## Ack-LSN tracking
 
@@ -641,8 +638,8 @@ extended CH outages)
   reload, slot advance on `min(shadow_replay_lsn, emitter_ack_lsn)`
 - [bootstrap.md](bootstrap.md) — shared-tail wiring, `tail.finish`
   handshake
-- [oracle.md](oracle.md) — Tier 3 default resolution via PG-side
-  extension, `PgPending` routing
+- [oracle.md](oracle.md) — sealed-batch Native conversion in the
+  shadow PG module, and which columns route to it
 - [future/pipeline_backpressure_and_scaling.md](future/pipeline_backpressure_and_scaling.md)
   — pipeline design record; remaining: pump wire/record split,
   bootstrap decode pool (Option B), hot-table sharding, M/N sizing

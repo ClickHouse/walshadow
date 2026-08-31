@@ -230,6 +230,7 @@ impl PipelineConfig {
                     emitter_ack.clone(),
                     fatal.clone(),
                     tail_config_rx,
+                    oracle,
                 )
                 .await?
             }
@@ -240,7 +241,6 @@ impl PipelineConfig {
         let (jobs_tx, jobs_rx) = async_channel::bounded::<decode::DecodeJob>((m * 4).max(8));
 
         let ctx = decode::DecodeCtx {
-            oracle,
             msg_tx: msg_tx.clone(),
             stats: stats.clone(),
             resolver: resolver.clone(),

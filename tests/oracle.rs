@@ -1,21 +1,6 @@
-//! Differential decode oracle.
+//! Sealed-batch Native oracle integration tests
 //!
-//! Four drills, each against a PG started with the bridge worker preloaded
-//! (`dynamic_library_path` points at the `pgext` build tree, so no
-//! `make install` is needed). Skipped silently when `initdb` isn't on PATH;
-//! fails when `pgext` hasn't been built:
-//!
-//! 1. `oracle_resolves_tier3_disk_bytes` — for each of `numeric` / `inet` /
-//!    `interval` / `int4[]`, synthesize on-disk bytes and assert the resolved
-//!    text matches PG's `typoutput`.
-//! 2. `oracle_falls_back_on_undecodable_bytes` — a body `typoutput` rejects
-//!    leaves the column unresolved and counts `fallback_raw`, with the oracle
-//!    still serving afterwards.
-//! 3. `oracle_resolves_pg_pending_to_text` — runs the decode pool's
-//!    `resolve_pending_tuple` over a `PgPending` column, asserts the resolved
-//!    tuple carries a `Text` value matching PG's representation.
-//! 4. `oracle_recovers_after_cluster_restart` — resolution fails while the
-//!    cluster is down (counted `errors`), recovers once it is back.
+//! Use preloaded worker from `pgext` build tree
 
 #[path = "common/ports.rs"]
 mod ports;
@@ -27,15 +12,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use walrus::pg::walparser::RelFileNode;
-use walshadow::codecs;
-use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
-use walshadow::oracle::{Oracle, resolve_pending_tuple};
-use walshadow::schema::{INETOID, INTERVALOID, NUMERICOID};
+use clickhouse_c::{Allocator, ColumnLayout};
+use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
+use walshadow::schema::NUMERICOID;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 
 /// int4 array, ie `INT4ARRAYOID`
 const INT4ARRAYOID: u32 = 1007;
+const JSONBOID: u32 = 3802;
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -99,27 +83,16 @@ async fn oracle_on(sh: &Shadow) -> Oracle {
     Oracle::new(Arc::new(bridge))
 }
 
-/// Build short-form numeric for `42`: header 0x8000 (NUMERIC_SHORT,
-/// dscale=0, weight=0), one digit (42).
-fn numeric_42_bytes() -> Vec<u8> {
-    let mut out = 0x8000u16.to_le_bytes().to_vec();
-    out.extend_from_slice(&42i16.to_le_bytes());
-    out
+fn alloc() -> Allocator {
+    Allocator::stdlib()
 }
 
-/// On-disk inet body for `192.168.0.1` (full /32 mask). PG's wire
-/// format adds `is_cidr` + `nb` after `bits`; the heap format does not.
-fn inet_192_168_0_1_bytes() -> Vec<u8> {
-    vec![codecs::PGSQL_AF_INET, 32, 192, 168, 0, 1]
-}
-
-/// On-disk interval body for `1 month 2 days 3 microseconds`.
-fn interval_1mon_2day_3us_bytes() -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&3i64.to_le_bytes());
-    out.extend_from_slice(&2i32.to_le_bytes());
-    out.extend_from_slice(&1i32.to_le_bytes());
-    out
+fn buf(oid: u32, cells: Vec<OracleCell>) -> OracleColumnBuf {
+    let mut b = OracleColumnBuf::new(oid, -1);
+    for c in cells {
+        b.push(c);
+    }
+    b
 }
 
 /// `[1, 2, 3]` int4 array on-disk body.
@@ -143,117 +116,284 @@ fn array_int4_1_2_3_bytes() -> Vec<u8> {
     out
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn oracle_resolves_tier3_disk_bytes() {
-    let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
-        return;
-    };
-    let oracle = oracle_on(&guard.sh).await;
+/// `{"a": "b"}` as jsonb's on-disk body: an object container header, one
+/// JEntry per key and value (a payload length, since neither carries
+/// `JENTRY_HAS_OFF`), then the payload. Strings need no alignment padding.
+fn jsonb_a_b_bytes() -> Vec<u8> {
+    // JB_FOBJECT | 1 pair
+    let mut out = 0x2000_0001u32.to_le_bytes().to_vec();
+    // JENTRY_ISSTRING (0), length 1, for key "a" and value "b"
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(b"ab");
+    out
+}
 
-    let cases: [(u32, Vec<u8>, &str); 4] = [
-        (NUMERICOID, numeric_42_bytes(), "42"),
-        (INETOID, inet_192_168_0_1_bytes(), "192.168.0.1"),
-        (
-            INTERVALOID,
-            interval_1mon_2day_3us_bytes(),
-            // PG renders as "1 mon 2 days 00:00:00.000003"
-            "1 mon 2 days 00:00:00.000003",
-        ),
-        (INT4ARRAYOID, array_int4_1_2_3_bytes(), "{1,2,3}"),
-    ];
-    for (oid, raw, want) in &cases {
-        let got = oracle.resolve_pending(*oid, raw).await;
-        assert_eq!(got.as_deref(), Some(*want), "oid {oid}");
+/// A 2-D int4 array. PG arrays carry no declared dimensionality, so this is
+/// what a runtime value that outgrows a one-layer `Array(T)` target looks like.
+fn array_int4_2d_bytes() -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in [2i32, 0, 23, 2, 2, 1, 1] {
+        out.extend_from_slice(&v.to_le_bytes());
     }
-
-    assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 4);
-    assert_eq!(oracle.stats.fallback_raw.load(Ordering::Relaxed), 0);
-    assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
+    for v in [1i32, 2, 3, 4] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_falls_back_on_undecodable_bytes() {
+async fn oracle_encodes_tier3_disk_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
         return;
     };
     let oracle = oracle_on(&guard.sh).await;
 
-    // int4 body shorter than typlen: the worker raises per item rather than
-    // failing the request
-    assert!(oracle.resolve_pending(23, b"\x00").await.is_none());
-    // Type oid with no pg_type row
-    assert!(oracle.resolve_pending(2147483647, b"\x00").await.is_none());
-    assert_eq!(oracle.stats.fallback_raw.load(Ordering::Relaxed), 2);
-    assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
-
-    // Item errors are per item, so the oracle still serves
-    assert_eq!(
-        oracle
-            .resolve_pending(NUMERICOID, &numeric_42_bytes())
-            .await
-            .as_deref(),
-        Some("42"),
+    let arr = buf(
+        INT4ARRAYOID,
+        vec![OracleCell::DiskRaw(array_int4_1_2_3_bytes())],
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn oracle_resolves_pg_pending_to_text() {
-    let tmp = tempfile::tempdir().unwrap();
-    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
-        return;
-    };
-    let oracle = oracle_on(&guard.sh).await;
-
-    // Wire two PgPending columns through the decode pool's resolution path;
-    // one request must cover the whole tuple.
-    let mut committed = CommittedTuple {
-        decoded: DecodedHeap {
-            rfn: RelFileNode {
-                spc_node: 1663,
-                db_node: 5,
-                rel_node: 16400,
-            },
-            xid: 1234,
-            source_lsn: 0xDEADBEEF,
-            op: HeapOp::Insert,
-            new: Some(DecodedTuple {
-                columns: vec![
-                    Some(ColumnValue::PgPending {
-                        type_oid: NUMERICOID,
-                        raw: numeric_42_bytes(),
-                    }),
-                    Some(ColumnValue::Int4(7)),
-                    Some(ColumnValue::Unsupported {
-                        type_oid: INT4ARRAYOID,
-                        raw: array_int4_1_2_3_bytes(),
-                    }),
-                ],
-                partial: false,
-            }),
-            old: None,
+    let js = buf(JSONBOID, vec![OracleCell::DiskRaw(jsonb_a_b_bytes())]);
+    // Attribute-default text takes typinput path
+    let num = buf(NUMERICOID, vec![OracleCell::TextInput(b"42.5".to_vec())]);
+    let columns = [
+        OracleRequestColumn {
+            ordinal: 0,
+            name: "tags",
+            target_type: "Array(Int32)",
+            buf: &arr,
         },
-        commit_ts: 0,
-        commit_lsn: 0,
+        OracleRequestColumn {
+            ordinal: 2,
+            name: "doc",
+            target_type: "JSON",
+            buf: &js,
+        },
+        OracleRequestColumn {
+            ordinal: 5,
+            name: "amount",
+            target_type: "String",
+            buf: &num,
+        },
+    ];
+
+    let block = oracle
+        .encode_batch(&columns, 1, alloc())
+        .await
+        .expect("oracle answers");
+
+    let tags = block.column(0).expect("tags");
+    assert_eq!(tags.array_offsets(), Some(&[3u64][..]));
+    let (w, bytes) = tags.array_values().and_then(|c| c.fixed()).expect("int32s");
+    assert_eq!(w, 4);
+    assert_eq!(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+    );
+
+    let doc = block.column(2).expect("doc");
+    let (_, json) = doc.string().expect("json strings");
+    assert_eq!(std::str::from_utf8(json).unwrap(), r#"{"a": "b"}"#);
+
+    let amount = block.column(5).expect("amount");
+    let (_, text) = amount.string().expect("strings");
+    assert_eq!(std::str::from_utf8(text).unwrap(), "42.5");
+
+    assert_eq!(oracle.stats.blocks.load(Ordering::Relaxed), 1);
+    assert_eq!(oracle.stats.cells.load(Ordering::Relaxed), 3);
+    assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oracle_defaults_fill_absent_cells() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
     };
-    if let Some(t) = committed.decoded.new.as_mut() {
-        resolve_pending_tuple(&oracle, &mut t.columns).await;
+    let oracle = oracle_on(&guard.sh).await;
+
+    // Default cells permit source OID zero
+    let nullable = buf(0, vec![OracleCell::Default]);
+    let array = buf(0, vec![OracleCell::Default]);
+    let json = buf(0, vec![OracleCell::Default]);
+    let columns = [
+        OracleRequestColumn {
+            ordinal: 0,
+            name: "n",
+            target_type: "Nullable(String)",
+            buf: &nullable,
+        },
+        OracleRequestColumn {
+            ordinal: 1,
+            name: "a",
+            target_type: "Array(Int32)",
+            buf: &array,
+        },
+        OracleRequestColumn {
+            ordinal: 2,
+            name: "j",
+            target_type: "JSON",
+            buf: &json,
+        },
+    ];
+
+    let block = oracle
+        .encode_batch(&columns, 1, alloc())
+        .await
+        .expect("oracle answers");
+
+    assert_eq!(block.column(0).and_then(|c| c.null_map()), Some(&[1u8][..]));
+    assert_eq!(
+        block.column(1).and_then(|c| c.array_offsets()),
+        Some(&[0u64][..])
+    );
+    let (_, j) = block.column(2).and_then(|c| c.string()).expect("json");
+    assert_eq!(std::str::from_utf8(j).unwrap(), "{}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oracle_fails_whole_request_on_bad_cell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
+    };
+    let oracle = oracle_on(&guard.sh).await;
+
+    // Second row exceeds target array dimensionality
+    let bad = buf(
+        INT4ARRAYOID,
+        vec![
+            OracleCell::DiskRaw(array_int4_1_2_3_bytes()),
+            OracleCell::DiskRaw(array_int4_2d_bytes()),
+        ],
+    );
+    let columns = [OracleRequestColumn {
+        ordinal: 0,
+        name: "tags",
+        target_type: "Array(Int32)",
+        buf: &bad,
+    }];
+    let err = oracle
+        .encode_batch(&columns, 2, alloc())
+        .await
+        .expect_err("bad cell fails the request");
+    assert!(err.to_string().contains("row 1"), "{err}");
+    assert_eq!(oracle.stats.blocks.load(Ordering::Relaxed), 0);
+    assert_eq!(oracle.stats.conversion_errors.load(Ordering::Relaxed), 1);
+
+    // Request failure preserves connection
+    let good = buf(
+        INT4ARRAYOID,
+        vec![OracleCell::DiskRaw(array_int4_1_2_3_bytes())],
+    );
+    let columns = [OracleRequestColumn {
+        ordinal: 0,
+        name: "tags",
+        target_type: "Array(Int32)",
+        buf: &good,
+    }];
+    let block = oracle
+        .encode_batch(&columns, 1, alloc())
+        .await
+        .expect("oracle still serves");
+    assert!(matches!(
+        block.column(0).and_then(|c| c.layout()),
+        Some(ColumnLayout::Array)
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_refuses_malformed_requests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
+    };
+    let socket = guard.sh.bridge_socket().expect("bridge configured");
+    let bridge = walshadow::bridge::connect_with_budget(socket, Duration::from_secs(20))
+        .await
+        .expect("bridge connect");
+
+    let framed = |rows: u32, cols: u32, meta: &[u8], cells: &[u8]| -> Vec<u8> {
+        let mut v = rows.to_be_bytes().to_vec();
+        v.extend_from_slice(&cols.to_be_bytes());
+        v.extend_from_slice(meta);
+        v.extend_from_slice(cells);
+        v
+    };
+    let meta = |oid: u32| -> Vec<u8> {
+        let mut m = oid.to_be_bytes().to_vec();
+        m.extend_from_slice(&(-1i32).to_be_bytes());
+        m.extend_from_slice(&1u32.to_be_bytes());
+        m.push(b'c');
+        m.extend_from_slice(&6u32.to_be_bytes());
+        m.extend_from_slice(b"String");
+        m
+    };
+    let one = meta(23);
+    let cases: [(&str, Vec<u8>); 7] = [
+        ("zero rows", framed(0, 1, &one, &[])),
+        ("zero columns", framed(1, 0, &[], &[])),
+        (
+            "cell grid past the frame",
+            framed(u32::MAX, u32::MAX, &one, &[]),
+        ),
+        ("empty column name", {
+            let mut m = 23u32.to_be_bytes().to_vec();
+            m.extend_from_slice(&(-1i32).to_be_bytes());
+            m.extend_from_slice(&0u32.to_be_bytes());
+            m.extend_from_slice(&6u32.to_be_bytes());
+            m.extend_from_slice(b"String");
+            framed(1, 1, &m, &[0x01, 0, 0, 0, 4, 42, 0, 0, 0])
+        }),
+        ("unknown cell tag", framed(1, 1, &one, &[0x7f])),
+        (
+            "cell length past the frame",
+            framed(1, 1, &one, &[0x01, 0xff, 0xff, 0xff, 0xff]),
+        ),
+        (
+            "value cell with no source type",
+            framed(1, 1, &meta(0), &[0x01, 0, 0, 0, 1, b'x']),
+        ),
+    ];
+    for (what, payload) in cases {
+        let err = bridge
+            .encode_native(&payload)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{what}: worker accepted a malformed request"));
+        assert!(
+            matches!(err, walshadow::bridge::BridgeError::Remote(_)),
+            "{what}: {err}",
+        );
     }
 
-    let new = committed.decoded.new.as_ref().unwrap();
-    assert!(
-        matches!(&new.columns[0], Some(ColumnValue::Text(s)) if s == "42"),
-        "got {:?}",
-        new.columns[0],
+    // Reject bytes beyond declared cells
+    let mut trailing = framed(1, 1, &one, &[0x01, 0, 0, 0, 4, 42, 0, 0, 0]);
+    trailing.push(0);
+    assert!(bridge.encode_native(&trailing).await.is_err());
+
+    // Parser errors preserve connection
+    let oracle = Oracle::new(Arc::new(bridge));
+    let good = buf(
+        INT4ARRAYOID,
+        vec![OracleCell::DiskRaw(array_int4_1_2_3_bytes())],
     );
-    assert!(matches!(&new.columns[1], Some(ColumnValue::Int4(7))));
-    assert!(
-        matches!(&new.columns[2], Some(ColumnValue::Text(s)) if s == "{1,2,3}"),
-        "got {:?}",
-        new.columns[2],
-    );
-    assert_eq!(oracle.stats.resolved.load(Ordering::Relaxed), 2);
+    let columns = [OracleRequestColumn {
+        ordinal: 0,
+        name: "tags",
+        target_type: "Array(Int32)",
+        buf: &good,
+    }];
+    oracle
+        .encode_batch(&columns, 1, alloc())
+        .await
+        .expect("worker still serves");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -263,21 +403,27 @@ async fn oracle_recovers_after_cluster_restart() {
         return;
     };
     let oracle = oracle_on(&guard.sh).await;
-    assert_eq!(
-        oracle
-            .resolve_pending(NUMERICOID, &numeric_42_bytes())
-            .await
-            .as_deref(),
-        Some("42"),
+    let one = buf(
+        INT4ARRAYOID,
+        vec![OracleCell::DiskRaw(array_int4_1_2_3_bytes())],
     );
+    let request = || {
+        [OracleRequestColumn {
+            ordinal: 0,
+            name: "tags",
+            target_type: "Array(Int32)",
+            buf: &one,
+        }]
+    };
+    oracle
+        .encode_batch(&request(), 1, alloc())
+        .await
+        .expect("first request");
 
     guard.sh.stop().expect("stop");
     assert!(
-        oracle
-            .resolve_pending(NUMERICOID, &numeric_42_bytes())
-            .await
-            .is_none(),
-        "no resolution while the cluster is down",
+        oracle.encode_batch(&request(), 1, alloc()).await.is_err(),
+        "no block while the cluster is down",
     );
     assert!(oracle.stats.errors.load(Ordering::Relaxed) >= 1);
 
@@ -285,10 +431,7 @@ async fn oracle_recovers_after_cluster_restart() {
     // Postmaster is up before the worker has re-bound its socket
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let got = oracle
-            .resolve_pending(NUMERICOID, &numeric_42_bytes())
-            .await;
-        if got.as_deref() == Some("42") {
+        if oracle.encode_batch(&request(), 1, alloc()).await.is_ok() {
             break;
         }
         assert!(

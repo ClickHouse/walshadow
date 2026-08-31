@@ -1,21 +1,6 @@
-//! Data-type coverage for greenfield Direct bootstrap → ClickHouse.
+//! Greenfield Direct bootstrap type coverage
 //!
-//! One source row spanning every mapped type — scalars, numeric, uuid,
-//! temporal, json/jsonb, and the extension / oracle-resolved types
-//! (`hstore`, `citext`, enum, arrays, `pgvector`, and `postgis` when
-//! available) — bootstraps via `--bootstrap-mode=direct` into an
-//! auto-created CH table, then every tier-3 column is asserted populated.
-//!
-//! Tier-3 columns land empty unless the bootstrap oracle (an OID-pinned
-//! throwaway PG built from the source schema via `pg_dump --binary-upgrade`)
-//! resolves them during the drain, so this is the end-to-end proof of that
-//! path. `hstore`/`citext`/enum/arrays go through the bridge worker;
-//! `pgvector`/`postgis` render in-tree.
-//!
-//! Skipped when `initdb` / `pg_basebackup` / `clickhouse` or the `hstore` /
-//! `citext` / `vector` extensions are absent (`postgis` columns are added
-//! only when installed). Needs `walshadow.so` on the PG library path
-//! (`make -C pgext install`), same as the other bootstrap-CH drills.
+//! Require installed `walshadow.so`, ClickHouse, and source extensions
 
 #![cfg(target_os = "linux")]
 

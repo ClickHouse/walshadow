@@ -20,10 +20,11 @@ use crate::ch::{
     reconnect_if_idle, with_timeout,
 };
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, build_column};
+use crate::emit::ch_emitter::{ColumnBuf, EmitterConfig, EmitterStats, build_leaf, build_root};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatchMeta, InsertBatch};
+use crate::ops::oracle::{Oracle, OracleBlock, OracleError, OracleRequestColumn};
 use crate::schema::RelName;
 use ahash::{HashMap, HashMapExt};
 use std::sync::Arc;
@@ -45,6 +46,7 @@ struct Inserter {
     /// compression are re-read at each batch boundary (a compression change
     /// reconnects, since the codec is fixed at connect).
     config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    oracle: Option<Arc<Oracle>>,
 }
 
 impl Inserter {
@@ -172,12 +174,37 @@ impl Inserter {
                 .asts
                 .remove(&batch.meta.table_key)
                 .expect("ensure_asts inserted");
-            let arena = bumpalo::Bump::new();
             let result = 'send: {
-                let nodes: Vec<ColumnBuilder<'_>> = match batch
+                // Keep resolved block alive across every INSERT retry
+                let resolved = match resolve_oracle_with_retry(
+                    self.oracle.clone(),
+                    self.alloc,
+                    &batch,
+                    &self.config.retry,
+                    &self.stats,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => break 'send Err(e),
+                };
+                let leaves: Vec<Option<ColumnBuilder<'_>>> = match batch
                     .buffers
                     .iter()
-                    .map(|buf| build_column(buf, batch.n_rows, &arena))
+                    .map(|buf| build_leaf(buf, batch.n_rows))
+                    .collect::<Result<_, _>>()
+                {
+                    Ok(v) => v,
+                    Err(e) => break 'send Err(e),
+                };
+                let roots: Vec<Option<ColumnBuilder<'_>>> = match batch
+                    .buffers
+                    .iter()
+                    .zip(&leaves)
+                    .map(|(buf, leaf)| match buf {
+                        ColumnBuf::Oracle(_) => Ok(None),
+                        _ => build_root(buf, leaf.as_ref(), batch.n_rows).map(Some),
+                    })
                     .collect::<Result<_, _>>()
                 {
                     Ok(v) => v,
@@ -189,9 +216,23 @@ impl Inserter {
                     .columns
                     .iter()
                     .enumerate()
-                    .try_for_each(|(i, col)| {
-                        bb.append(&col.name, asts[i].view(), &nodes[i])
-                            .map_err(Into::into)
+                    .try_for_each(|(i, col)| match &roots[i] {
+                        Some(node) => bb
+                            .append(&col.name, asts[i].view(), node)
+                            .map_err(Into::into),
+                        None => {
+                            let decoded = resolved
+                                .as_ref()
+                                .and_then(|r| r.column(i as u32))
+                                .ok_or_else(|| {
+                                    EmitterError::Type(format!(
+                                        "oracle answered no column for {}",
+                                        col.name
+                                    ))
+                                })?;
+                            bb.append_column(&col.name, asts[i].view(), decoded)
+                                .map_err(Into::into)
+                        }
                     });
                 match appended {
                     Ok(()) => self.send_with_retry(&batch.meta.insert_sql, &bb).await,
@@ -220,8 +261,69 @@ impl Inserter {
     }
 }
 
-/// Connect `n` inserters and spawn their drain loops; a connect failure
-/// aborts pool startup.
+/// Retry transport failures only
+async fn resolve_oracle_with_retry(
+    oracle: Option<Arc<Oracle>>,
+    alloc: Allocator,
+    batch: &InsertBatch,
+    retry: &crate::emit::ch_emitter::RetryConfig,
+    stats: &EmitterStats,
+) -> Result<Option<OracleBlock>, EmitterError> {
+    let mut attempt = 0u32;
+    let mut backoff = retry.initial_backoff;
+    loop {
+        match resolve_oracle(oracle.clone(), alloc, batch).await {
+            Ok(v) => return Ok(v),
+            Err(e) if e.retryable() && attempt < retry.max_attempts => {
+                stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
+                attempt += 1;
+                backoff_step(&mut backoff, retry.max_backoff).await;
+            }
+            Err(e) => return Err(EmitterError::Type(e.to_string())),
+        }
+    }
+}
+
+async fn resolve_oracle(
+    oracle: Option<Arc<Oracle>>,
+    alloc: Allocator,
+    batch: &InsertBatch,
+) -> Result<Option<OracleBlock>, OracleError> {
+    let columns: Vec<OracleRequestColumn<'_>> = batch
+        .buffers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, buf)| match buf {
+            ColumnBuf::Oracle(o) => Some(OracleRequestColumn {
+                ordinal: i as u32,
+                name: &batch.meta.columns[i].name,
+                target_type: &batch.meta.columns[i].type_repr,
+                buf: o,
+            }),
+            _ => None,
+        })
+        .collect();
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let oracle = oracle.ok_or_else(|| {
+        OracleError::Absent(format!(
+            "{} needs the shadow oracle, which this pipeline has none of",
+            batch.meta.table_key
+        ))
+    })?;
+    oracle
+        .encode_batch(&columns, batch.n_rows, alloc)
+        .await
+        .map(Some)
+}
+
+pub(crate) struct PoolOptions {
+    pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    pub oracle: Option<Arc<Oracle>>,
+}
+
+/// Connect `n` inserters and spawn drain loops
 pub(crate) async fn spawn_pool(
     n: usize,
     config: &EmitterConfig,
@@ -229,7 +331,7 @@ pub(crate) async fn spawn_pool(
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     fatal: Fatal,
-    config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    options: PoolOptions,
 ) -> Result<Vec<JoinHandle<()>>, EmitterError> {
     let mut handles = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
@@ -242,7 +344,8 @@ pub(crate) async fn spawn_pool(
             asts: HashMap::new(),
             ack: ack.clone(),
             stats: stats.clone(),
-            config_rx: config_rx.clone(),
+            config_rx: options.config_rx.clone(),
+            oracle: options.oracle.clone(),
         };
         let rx = rx.clone();
         let fatal = fatal.clone();

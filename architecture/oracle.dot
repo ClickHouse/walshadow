@@ -1,108 +1,125 @@
-// walshadow, PgPending decode oracle
-// PgPending resolver path over a unix socket into shadow PG's preloaded
-// worker. Per-item and transport fallback stay visible.
+// walshadow, sealed-batch Native oracle
+// Columns walshadow does not decode cross a unix socket to shadow PG's
+// preloaded worker, which returns one partial ClickHouse Native block per
+// sealed batch. Request atomicity and the splice stay visible.
 //
 // regeneration spec:
-// sources of truth: plans/oracle.md · pgext/ · src/ oracle-path module (grep src/ for oracle|pending)
-// subsumes: plans/oracle.md § resolver flow + worker surface + failure semantics
+// sources of truth: plans/oracle.md · pgext/ · src/ops/oracle.rs · src/emit/pipeline/inserter.rs
+// subsumes: plans/oracle.md § routing + protocol v2 + splicing + failure semantics
 // quality bar:
-//   - required bridge path stays legible
-//   - batched socket round-trip reads as one canonical orange edge
-//   - fallback path visually distinct from main path
+//   - one request per sealed batch reads as one canonical orange edge
+//   - the splice (local slabs + decoded columns into one block) stays legible
+//   - failure paths never reach ClickHouse
 // shared style: palette.md
 digraph oracle {
   rankdir=TB;
   compound=true;
-  graph [fontname="Helvetica", labelloc="t", label="walshadow oracle, PgPending decode bridge", fontsize=14, splines=spline, nodesep=0.35, ranksep=0.9, bgcolor="#272623", fontcolor="#ECE1D7"];
+  graph [fontname="Helvetica", labelloc="t", label="walshadow oracle, sealed-batch Native columns", fontsize=14, splines=spline, nodesep=0.35, ranksep=0.9, bgcolor="#272623", fontcolor="#ECE1D7"];
   node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#6E6963", fontcolor="#ECE1D7"];
   edge  [fontname="Helvetica", fontsize=9, color="#c1a78e", fontcolor="#ECE1D7"];
 
   // ════════ ① decoder hand-off ════════
   subgraph cluster_decoder {
     label="① decoder — ColumnValue (heap_decoder.rs)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    tier12 [label="ColumnValue::Tier 1/2\nfixed-width / varlena\nlocally rendered\n(no raw bytes kept)", fillcolor="#4D4128"];
-    tier3  [label="ColumnValue::Tier 3\nnumeric / inet / cidr /\ninterval (codecs.rs)\nlocal decode only\n(raw bytes discarded)", fillcolor="#4D4128"];
-    pend   [label="ColumnValue::PgPending\n{ type_oid, raw }\njsonb / array / range /\ntsvector / domain / vendor", fillcolor="#5D3F40"];
-    unsup  [label="ColumnValue::Unsupported\n{ type_oid, raw }\nfail-closed backstop\nunless oracle resolves", fillcolor="#5D3F40"];
+    local  [label="local matrix\nfixed-width / bytea / text /\nnumeric / inet / interval / json\nlocal_matrix_covers() == true", fillcolor="#4D4128"];
+    pend   [label="ColumnValue::PgPending\n{ type_oid, raw }\njsonb / array / hstore / range /\ndomain / enum / vendor", fillcolor="#5D3F40"];
+    pendtx [label="ColumnValue::PgPendingText\n{ type_oid, text }\nattmissingval, canonical PG text\nnot a physical body", fillcolor="#5D3F40"];
+    wkt    [label="render_ext_columns\nPostGIS 2-D point -> WKT\nin-tree, matched on type_name\n(typoutput would give HEXEWKB)", fillcolor="#5D3F40"];
   }
 
-  // ════════ ② oracle decode path ════════
-  subgraph cluster_oracle {
-    label="② oracle path, post-plan; metrics-only runs skip it"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    resolve  [label="resolve_pending_tuple\ncollect PgPending | Unsupported\none DECODE batch per tuple\nswap each text answer to Text\nbest effort: shadow may lag\nrow's catalog interval", fillcolor="#5D3F40"];
-    stats    [label="OracleStats\nresolved / fallback_raw / errors\n\nBridgeStats\nup / requests / errors /\nlatency / reconnects / items", fillcolor="#5D3F40", shape=note];
+  // ════════ ② plan + accumulate ════════
+  subgraph cluster_plan {
+    label="② emit plan — decided once per column, never per row"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    choose [label="ColumnEncoding::choose\nOracle when the local matrix\nmisses the source attribute,\nor the target is Array / Map /\nJSON / Object", fillcolor="#4D4128"];
+    slab   [label="local ColumnBuf\nFixed / String /\nNullableFixed / NullableString", fillcolor="#4D4128"];
+    ocol   [label="ColumnBuf::Oracle\none cell per row:\nDefault | DiskRaw |\nTextInput | Literal\nsize-capped below the frame", fillcolor="#5D3F40"];
   }
 
-  // ════════ ③ bridge client ════════
-  client [label="Bridge\ntokio::net::UnixStream\nHELLO version gate\nframed DECODE request\nreconnect + retry on\ntransport failure", fillcolor="#4D4D28"];
+  // ════════ ③ inserter, one request per sealed batch ════════
+  subgraph cluster_inserter {
+    label="③ inserter (pipeline/inserter.rs) — before send_query"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    encode [label="Oracle::encode_batch\nrow-major request:\nall metadata, then all cells\none per InsertBatch", fillcolor="#5D3F40"];
+    verify [label="validate response\none block, clean EOF,\nBlock::validate,\nrows / cols / names /\ncanonical type strings", fillcolor="#5D3F40"];
+    splice [label="BlockBuilder\nappend local roots +\nappend_column decoded roots +\nsynthetic _lsn/_xid/_commit_ts\nblock outlives every retry", fillcolor="#5D4628"];
+    stats  [label="OracleStats\nblocks / rows / cells /\nconversion_errors / errors\n\nBridgeStats\nup / requests / latency /\nreconnects / native_bytes", fillcolor="#5D3F40", shape=note];
+  }
+
+  client [label="Bridge\ntokio::net::UnixStream\nHELLO version gate (proto 2)\nENCODE_NATIVE frame\nredial + one replay on\ntransport failure", fillcolor="#4D4D28"];
 
   // ════════ ④ shadow PG + preloaded worker ════════
   subgraph cluster_shadow {
     label="④ shadow PG"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    worker [label="walshadow background worker\n(pgext/worker.c)\nunix socket, mode 0600\none transaction per request\none subtransaction per item\nerror frame or connection close", fillcolor="#3D4128"];
-    decode [label="ws_decode_datum_text\n(pgext/decode.c)\nSearchSysCache1(TYPEOID)\nDatum reconstruct ×4 branches:\n  typlen=−1 varlena\n  typlen=−2 cstring\n  typbyval fixed (memcpy)\n  fixed by-ref (palloc)\nOidOutputFunctionCall(typoutput)", fillcolor="#3D4128"];
+    worker [label="walshadow background worker\n(pgext/worker.c)\nunix socket, mode 0600\none transaction per request\nno per-cell subtransaction:\nthe request is atomic", fillcolor="#3D4128"];
+    native [label="pgext/native.c\nws_reconstruct_datum ×4 branches:\n  typlen=-1 varlena\n  typlen=-2 cstring\n  typbyval fixed (memcpy)\n  fixed by-ref (palloc)\nsource adapters: hstore matrix,\nmulti-arg casts\npgch_append_datum per cell", fillcolor="#3D4128"];
+    writer [label="pgch_writer -> chc_block_write\nnull maps, array offsets,\nmap tuples, JSON markers\nstraight into the response\nStringInfo, local framing", fillcolor="#3D4128"];
     env    [label="pinned output environment\nTimeZone = UTC\nDateStyle = ISO, MDY\nIntervalStyle = postgres\nextra_float_digits = 1\nbytea_output = hex", fillcolor="#3D4128", shape=note];
   }
 
   // ════════ ⑤ pgext build artifact ════════
   subgraph cluster_pgext {
     label="⑤ pgext/ (PGXS build)"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    artifact [label="walshadow.so\ndecode.o + overlay.o + worker.o\nno control file\nno SQL script\nno pg_proc row", fillcolor="#4D3850", shape=note];
+    artifact [label="walshadow.so\nnative.o + overlay.o + worker.o\nvendor/pg-clickhouse-c (pinned,\nunmodified, with clickhouse-c)\nno control file, no SQL script,\nno pg_proc row", fillcolor="#4D3850", shape=note];
   }
 
-  // ════════ ⑥ emit sinks (downstream branch off oracle) ════════
-  subgraph cluster_emit {
-    label="⑥ downstream — emit-time disposition"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
-    emit_text [label="ColumnValue::Text\n→ CH String\n(encode_value)", fillcolor="#5D4628"];
-    emit_raw  [label="PgPending raw bytes\n→ append_string_bytes(raw)\nbest-effort verbatim body", fillcolor="#5D4628"];
-    emit_fail [label="Unsupported unresolved\n→ EmitterError::\nUnsupportedValue (fatal)", fillcolor="#5D4628", shape=note];
+  // ════════ ⑥ terminal states ════════
+  subgraph cluster_out {
+    label="⑥ outcome"; style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
+    ch     [label="ClickHouse INSERT\nsend_query + send_data +\nsend_data_end, then ack", fillcolor="#5D4628"];
+    fail   [label="batch fails before any query\nconversion / semantic / transport\nseq stays unacknowledged,\nreplayed on restart", fillcolor="#5D4628", shape=note];
   }
 
-  // ─── main flow edges (LR spine, high weight) ───
-  pend    -> resolve  [color="#A1A9CC", penwidth=2, label="required bridge", weight=10];
-  unsup   -> resolve  [color="#A1A9CC", style=dashed, label="required bridge", weight=5];
-  resolve -> client   [color="#CBA85E", penwidth=2, label="one DECODE batch\nper tuple", weight=10];
-  client  -> worker   [color="#CBA85E", penwidth=2, dir=both, arrowtail=open, lhead=cluster_shadow, label="framed unix\nsocket request", weight=10];
+  // ─── main spine ───
+  local   -> choose [color="#A1A9CC", weight=10];
+  pend    -> choose [color="#A1A9CC", penwidth=2, weight=10];
+  pendtx  -> choose [color="#A1A9CC", weight=5];
+  wkt     -> choose [color="#A1A9CC", style=dashed, label="literal cell", weight=5];
+  choose  -> slab   [color="#A1A9CC", label="Local"];
+  choose  -> ocol   [color="#A1A9CC", penwidth=2, label="Oracle"];
+  ocol    -> encode [color="#CBA85E", penwidth=2, label="sealed batch", weight=10];
+  encode  -> client [color="#CBA85E", penwidth=2, label="one request\nper batch", weight=10];
+  client  -> worker [color="#CBA85E", penwidth=2, dir=both, arrowtail=open, lhead=cluster_shadow, label="framed unix\nsocket request", weight=10];
+  encode  -> verify [color="#CBA85E", penwidth=2, label="Native bytes"];
+  verify  -> splice [color="#BF8C5F", penwidth=2, label="decoded column tree,\nborrowed not copied"];
+  slab    -> splice [color="#BF8C5F", label="owned slabs"];
+  splice  -> ch     [color="#BF8C5F", penwidth=2];
 
-  // ─── local tiers never reach the oracle ───
-  tier12 -> emit_text [color="#BF8C5F", style=dotted, constraint=false, label="local render"];
-  tier3  -> emit_text [color="#BF8C5F", style=dotted, constraint=false, label="local render"];
-
-  // ─── shadow internal: worker calls decode under pinned output GUCs ───
-  worker -> decode [color="#6E6963", label="each item"];
-  decode -> env    [style=dashed, color="#6E6963", constraint=false];
+  // ─── shadow internals ───
+  worker -> native [color="#6E6963", label="cell loop, error\ncontext = column + row"];
+  native -> writer [color="#6E6963"];
+  native -> env    [style=dashed, color="#6E6963", constraint=false];
 
   // ─── pgext preload edge ───
   artifact -> worker [style=dashed, color="#6E6963", lhead=cluster_shadow, ltail=cluster_pgext, label="$libdir or build tree\nshared_preload_libraries\n+ walshadow.* GUCs"];
 
-  // ─── stats fan-in (off-axis, constraint=false) ───
-  resolve  -> stats [style=dashed, color="#CBA85E", constraint=false, label="resolved++ /\nfallback_raw++ /\nerrors++"];
-  client   -> stats [style=dashed, color="#CBA85E", constraint=false, label="request /\ntransport counters"];
+  // ─── failure fan-out ───
+  worker -> fail [color="#8F5D5D", style=dashed, constraint=false, label="one bad Datum\naborts the request"];
+  verify -> fail [color="#8F5D5D", style=dashed, constraint=false, label="wrong schema or\nmalformed block"];
+  client -> fail [color="#8F5D5D", style=dotted, constraint=false, label="transport, past\nretry budget"];
 
-  // ─── emit disposition (off-axis fan-out from oracle) ───
-  resolve  -> emit_text [color="#BF8C5F", penwidth=2, constraint=false, label="text item\n→ Text"];
-  resolve  -> emit_raw  [color="#BF8C5F", style=dashed, constraint=false, label="item or transport error\n(PgPending)"];
-  resolve  -> emit_fail [color="#BF8C5F", style=dotted, constraint=false, label="item or transport error\n(Unsupported)"];
+  // ─── stats fan-in ───
+  encode -> stats [style=dashed, color="#CBA85E", constraint=false];
+  client -> stats [style=dashed, color="#CBA85E", constraint=false];
 
   // ─── Legend ───
   legend [shape=plaintext, label=<
     <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>node fill</B></TD></TR>
-      <TR><TD BGCOLOR="#4D4128" WIDTH="20"></TD><TD>decoder ColumnValue</TD></TR>
+      <TR><TD BGCOLOR="#4D4128" WIDTH="20"></TD><TD>local decode + plan</TD></TR>
       <TR><TD BGCOLOR="#5D3F40"></TD><TD>oracle (src/ops/oracle.rs)</TD></TR>
       <TR><TD BGCOLOR="#4D4D28"></TD><TD>bridge client</TD></TR>
       <TR><TD BGCOLOR="#3D4128"></TD><TD>shadow PG worker</TD></TR>
       <TR><TD BGCOLOR="#4D3850"></TD><TD>pgext/ build artifact</TD></TR>
-      <TR><TD BGCOLOR="#5D4628"></TD><TD>emit sink</TD></TR>
+      <TR><TD BGCOLOR="#5D4628"></TD><TD>final block / outcome</TD></TR>
       <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>edge colour</B></TD></TR>
-      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>pending → resolver</TD></TR>
+      <TR><TD><FONT COLOR="#A1A9CC"><B>━━</B></FONT></TD><TD>value → encoding choice</TD></TR>
       <TR><TD><FONT COLOR="#CBA85E"><B>━━</B></FONT></TD><TD>unix socket (MAIN wire)</TD></TR>
-      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>emit-time disposition</TD></TR>
+      <TR><TD><FONT COLOR="#BF8C5F"><B>━━</B></FONT></TD><TD>block assembly</TD></TR>
+      <TR><TD><FONT COLOR="#8F5D5D"><B>┄┄</B></FONT></TD><TD>failure, before any CH query</TD></TR>
       <TR><TD><FONT COLOR="#6E6963"><B>┄┄</B></FONT></TD><TD>pgext preload (filesystem)</TD></TR>
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>policy</B></TD></TR>
-      <TR><TD COLSPAN="2" ALIGN="LEFT">Best effort: resolution runs post-plan;<BR ALIGN="LEFT"/>shadow's catalog may lag the row's<BR ALIGN="LEFT"/>interval in DDL edge cases — accepted<BR ALIGN="LEFT"/>to mostly support unknown types.</TD></TR>
-      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>bridge absence</B></TD></TR>
-      <TR><TD COLSPAN="2" ALIGN="LEFT">Unset socket or boot connect failure<BR ALIGN="LEFT"/>means no Oracle. PgPending reaches<BR ALIGN="LEFT"/>emitter unchanged and writes raw<BR ALIGN="LEFT"/>bytes. Unsupported remains fatal.<BR ALIGN="LEFT"/>Runtime transport failure retries<BR ALIGN="LEFT"/>once, then uses same disposition.</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>ownership</B></TD></TR>
+      <TR><TD COLSPAN="2" ALIGN="LEFT">PostgreSQL owns Datum interpretation,<BR ALIGN="LEFT"/>pg-clickhouse-c owns PG→CH conversion,<BR ALIGN="LEFT"/>clickhouse-c owns Native format.<BR ALIGN="LEFT"/>walshadow never reads an array element,<BR ALIGN="LEFT"/>hstore pair, null map or nested offset.</TD></TR>
+      <TR><TD COLSPAN="2" BGCOLOR="#34302c"><B>atomicity</B></TD></TR>
+      <TR><TD COLSPAN="2" ALIGN="LEFT">The writer has request lifetime and no<BR ALIGN="LEFT"/>per-cell rollback, so one unconvertible<BR ALIGN="LEFT"/>Datum fails the whole batch. No partial<BR ALIGN="LEFT"/>block reaches the daemon, no ClickHouse<BR ALIGN="LEFT"/>query starts, no row is acknowledged.<BR ALIGN="LEFT"/>Nothing falls back to a substituted value.</TD></TR>
     </TABLE>
   >];
   worker -> legend [style=invis];

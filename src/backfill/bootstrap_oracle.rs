@@ -5,14 +5,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use clickhouse_c::Allocator;
+
 use crate::backfill::backup_page_walk::CatalogMap;
 use crate::catalog::shadow::{BridgeConf, Shadow, ShadowConfig};
+use crate::column_rules::ColumnRules;
+use crate::emit::ch_emitter::TablePlan;
+use crate::mapping::{MappingSnapshot, SystemColumns};
 use crate::ops::oracle::Oracle;
-use crate::schema::{
-    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
-    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONOID, NAMEOID, NUMERICOID, OIDOID, RelAttr, TEXTOID,
-    TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID, VARCHAROID,
-};
 
 const ORACLE_PORT: u16 = 55440;
 
@@ -124,48 +124,145 @@ fn run_pg_dump(conninfo: &str, password: Option<&str>) -> Result<String> {
     String::from_utf8(out.stdout).context("pg_dump output not utf8")
 }
 
-pub fn needs_bridge(catalog: &CatalogMap) -> bool {
-    catalog.descriptors().any(|d| {
-        d.attributes
-            .iter()
-            .any(|a| !a.dropped && attr_needs_bridge(a))
+pub fn needs_oracle(
+    catalog: &CatalogMap,
+    tables: &MappingSnapshot,
+    column_rules: &ColumnRules,
+) -> bool {
+    let alloc = Allocator::stdlib();
+    let system = SystemColumns::default();
+    catalog.descriptors().any(|desc| {
+        tables.get(&desc.rel_name).is_some_and(|mapping| {
+            TablePlan::build(alloc, desc, mapping, column_rules, &system)
+                .map_or(true, |plan| plan.needs_oracle())
+        })
     })
 }
 
-fn attr_needs_bridge(a: &RelAttr) -> bool {
-    !is_native_scalar(a.type_oid)
-        && !matches!(
-            a.type_name.as_str(),
-            "geography" | "geometry" | "vector" | "halfvec"
-        )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::column_rules::{ColumnRule, ColumnRulesBuilder};
+    use crate::decode::heap_decoder::local_matrix_covers;
+    use crate::mapping::{TableMapping, TableTarget, derive_columns_for_mapping};
+    use crate::schema::{INT4OID, JSONOID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
+    use crate::table_rules::MatchKind;
+    use ahash::HashMap;
 
-fn is_native_scalar(oid: u32) -> bool {
-    matches!(
-        oid,
-        BOOLOID
-            | BYTEAOID
-            | CHAROID
-            | NAMEOID
-            | INT8OID
-            | INT2OID
-            | INT4OID
-            | TEXTOID
-            | OIDOID
-            | JSONOID
-            | CIDROID
-            | FLOAT4OID
-            | FLOAT8OID
-            | INETOID
-            | BPCHAROID
-            | VARCHAROID
-            | DATEOID
-            | TIMEOID
-            | TIMESTAMPOID
-            | TIMESTAMPTZOID
-            | INTERVALOID
-            | TIMETZOID
-            | NUMERICOID
-            | UUIDOID
-    )
+    fn attr(attnum: i16, name: &str, type_oid: u32, type_name: &str, type_len: i16) -> RelAttr {
+        RelAttr {
+            attnum,
+            name: name.into(),
+            type_oid,
+            typmod: -1,
+            not_null: false,
+            dropped: false,
+            type_name: type_name.into(),
+            type_byval: type_len > 0,
+            type_len,
+            type_align: 'i',
+            type_storage: if type_len < 0 { 'x' } else { 'p' },
+            missing_text: None,
+        }
+    }
+
+    fn rel(attrs: Vec<RelAttr>) -> RelDescriptor {
+        RelDescriptor {
+            rfn: walrus::pg::walparser::RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 16385,
+            },
+            oid: 16385,
+            toast_oid: 0,
+            namespace_oid: 2200,
+            rel_name: RelName::new("public", "foo"),
+            kind: 'r',
+            persistence: 'p',
+            replident: ReplIdent::Default { pk_attnums: None },
+            attributes: attrs,
+        }
+    }
+
+    fn bridged(desc: RelDescriptor, rules: &ColumnRules) -> (CatalogMap, MappingSnapshot) {
+        let mapping = TableMapping {
+            target: TableTarget::new("default", "foo"),
+            columns: derive_columns_for_mapping(&desc, rules),
+        };
+        let mut tables = HashMap::default();
+        tables.insert(desc.rel_name.clone(), mapping);
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(desc));
+        (catalog, Arc::new(tables))
+    }
+
+    fn override_rule(attname: &str, target_type: &str) -> ColumnRules {
+        let mut b = ColumnRulesBuilder::new();
+        b.add(
+            &RelName::new("public", "foo"),
+            MatchKind::Exact,
+            attname,
+            MatchKind::Exact,
+            ColumnRule {
+                target_type: Some(target_type.into()),
+                ..ColumnRule::default()
+            },
+        );
+        b.finish().0
+    }
+
+    #[test]
+    fn json_target_needs_oracle_though_source_decodes_locally() {
+        assert!(
+            local_matrix_covers(JSONOID, -1),
+            "premise: json decodes local"
+        );
+        let rules = ColumnRules::default();
+        let (catalog, tables) = bridged(
+            rel(vec![
+                attr(1, "id", INT4OID, "int4", 4),
+                attr(2, "doc", JSONOID, "json", -1),
+            ]),
+            &rules,
+        );
+        assert_eq!(
+            tables[&RelName::new("public", "foo")].columns[1].target_type,
+            "Nullable(JSON)",
+            "premise: default bridge maps json to a composite CH target",
+        );
+        assert!(needs_oracle(&catalog, &tables, &rules));
+    }
+
+    #[test]
+    fn scalar_targets_need_no_oracle() {
+        let rules = ColumnRules::default();
+        let (catalog, tables) = bridged(
+            rel(vec![
+                attr(1, "id", INT4OID, "int4", 4),
+                attr(2, "name", TEXTOID, "text", -1),
+            ]),
+            &rules,
+        );
+        assert!(!needs_oracle(&catalog, &tables, &rules));
+    }
+
+    #[test]
+    fn composite_override_over_local_source_needs_oracle() {
+        let rules = override_rule("name", "Array(Nullable(String))");
+        let (catalog, tables) = bridged(
+            rel(vec![
+                attr(1, "id", INT4OID, "int4", 4),
+                attr(2, "name", TEXTOID, "text", -1),
+            ]),
+            &rules,
+        );
+        assert!(needs_oracle(&catalog, &tables, &rules));
+    }
+
+    #[test]
+    fn unmapped_relation_needs_no_oracle() {
+        let rules = ColumnRules::default();
+        let (catalog, _) = bridged(rel(vec![attr(1, "doc", JSONOID, "json", -1)]), &rules);
+        assert!(!needs_oracle(&catalog, &Arc::default(), &rules));
+    }
 }

@@ -23,6 +23,20 @@ Review these limits before production use
 - `base_backup` and `object_store` table loads publish with staging-table swap, database must support `EXCHANGE TABLES`
 - backup rows inserted into staging do not fire destination materialized views, live rows copied back after swap can fire twice
 
+## Types shadow PostgreSQL converts
+
+Values outside walshadow's own codec set (`jsonb`, arrays, `hstore`, enums,
+ranges, domains, extension types) are converted by shadow PostgreSQL, one
+request per insert batch
+
+- a value shadow PostgreSQL cannot convert stops the batch and names the
+  column and row, rather than writing a substituted value
+- a multidimensional array does not fit the default one-layer `Array(...)`
+  mapping; map the column to a matching nested `Array(Array(...))` instead
+- greenfield bootstrap runs before the shadow exists, so it starts a throwaway
+  PostgreSQL from the source schema to convert them; that needs `pg_dump` and
+  the source's extensions installable on the daemon host, else bootstrap stops
+
 ## Ordering and consistency
 
 - committed end state converges by source row key and `_lsn`

@@ -649,8 +649,8 @@ pub async fn build_pipeline_with(
     build_pipeline_inner(args, tune, None).await
 }
 
-/// `build_pipeline` with the decode oracle wired in, so `PgPending`/`Unsupported`
-/// columns resolve to text via the shadow's `walshadow` extension.
+/// `build_pipeline` with the oracle wired in, so oracle-routed columns convert
+/// to Native through the shadow's `walshadow` module (plans/oracle.md).
 pub async fn build_pipeline_with_oracle(
     args: BuildPipelineArgs<'_>,
     oracle: Arc<walshadow::oracle::Oracle>,

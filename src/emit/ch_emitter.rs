@@ -28,7 +28,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst, TypeRef};
+use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
 
 #[cfg(test)]
 use crate::ch::is_retryable;
@@ -41,8 +41,12 @@ use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
     TableMapping, TableTarget,
 };
+use crate::ops::bridge::MAX_REQUEST_BYTES;
+use crate::ops::oracle::{
+    ORACLE_BATCH_SEAL_BYTES, OracleCell, OracleColumnBuf, REQUEST_FRAME_BYTES, request_column_bytes,
+};
 use crate::runtime_config::{InitialLoadMode, TableRow};
-use crate::schema::{RelDescriptor, RelName};
+use crate::schema::{RelAttr, RelDescriptor, RelName};
 use crate::source::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
@@ -911,9 +915,69 @@ pub(crate) struct TablePlan {
 
 pub(crate) struct ColumnPlan {
     pub(crate) name: String,
+    /// Canonical CH type shared by oracle request and response
     pub(crate) type_repr: String,
     pub(crate) ast: TypeAst,
     pub(crate) decimal: Option<DecimalWire>,
+    pub(crate) encoding: ColumnEncoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColumnEncoding {
+    Local,
+    Oracle {
+        /// Zero when every cell defaults
+        source_type_oid: u32,
+        source_typmod: i32,
+    },
+}
+
+impl ColumnEncoding {
+    fn choose(att: Option<&RelAttr>, ast: &TypeAst) -> Self {
+        let Some(att) = att else {
+            // Predeclared post-ALTER column has only default cells
+            return if composite_target(ast) {
+                Self::Oracle {
+                    source_type_oid: 0,
+                    source_typmod: -1,
+                }
+            } else {
+                Self::Local
+            };
+        };
+        if composite_target(ast)
+            || !crate::decode::heap_decoder::local_matrix_covers(att.type_oid, att.type_len)
+        {
+            Self::Oracle {
+                source_type_oid: att.type_oid,
+                source_typmod: att.typmod,
+            }
+        } else {
+            Self::Local
+        }
+    }
+}
+
+/// Render type identically on both protocol sides
+fn canonical_type(ast: &TypeAst, configured: &str) -> String {
+    ast.view()
+        .name()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .unwrap_or(configured)
+        .to_owned()
+}
+
+fn composite_target(ast: &TypeAst) -> bool {
+    let view = ast.view();
+    let inner = if view.kind() == Some(Kind::Nullable) {
+        view.child(0)
+    } else {
+        Some(view)
+    };
+    matches!(
+        inner.and_then(|v| v.kind()),
+        Some(Kind::Array | Kind::Map | Kind::Json | Kind::Object)
+    )
 }
 
 /// Physical wire width of a CH `Decimal`: one of four signed-integer
@@ -966,20 +1030,22 @@ impl TablePlan {
         // emits NULL for any missing attnum, so a static-config typo
         // surfaces as an always-NULL column (or CH reject if non-nullable)
         for c in &mapping.columns {
+            let att = rel
+                .attributes
+                .iter()
+                .find(|a| a.attnum == c.src_attnum && !a.dropped);
             let ast = TypeAst::parse(&c.target_type, alloc)
                 .map_err(|e| EmitterError::Type(format!("{}: {e}", c.target_type)))?;
             let decimal = decimal_wire_of(&ast);
             let mut plan = ColumnPlan {
                 name: c.target_name.clone(),
-                type_repr: c.target_type.clone(),
+                type_repr: canonical_type(&ast, &c.target_type),
+                encoding: ColumnEncoding::choose(att, &ast),
                 ast,
                 decimal,
             };
-            if let Some(ty) = rel
-                .attributes
-                .iter()
-                .find(|a| a.attnum == c.src_attnum && !a.dropped)
-                .and_then(|a| column_rules.settings(&rel.rel_name, &a.name).target_type)
+            if let Some(ty) =
+                att.and_then(|a| column_rules.settings(&rel.rel_name, &a.name).target_type)
             {
                 let ty = &ty;
                 match TypeAst::parse(ty, alloc) {
@@ -987,7 +1053,8 @@ impl TablePlan {
                         if let Some(decimal) = override_wire(&plan.ast, &oast) {
                             plan = ColumnPlan {
                                 name: plan.name,
-                                type_repr: ty.clone(),
+                                type_repr: canonical_type(&oast, ty),
+                                encoding: ColumnEncoding::choose(att, &oast),
                                 ast: oast,
                                 decimal,
                             };
@@ -1022,6 +1089,7 @@ impl TablePlan {
                 ast: TypeAst::parse(ty, alloc)
                     .map_err(|e| EmitterError::Type(format!("{ty}: {e}")))?,
                 decimal: None,
+                encoding: ColumnEncoding::Local,
             })
         };
         let synth_lsn = mk(&system.lsn, "UInt64")?;
@@ -1050,6 +1118,19 @@ impl TablePlan {
             insert_sql,
         })
     }
+
+    pub(crate) fn needs_oracle(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|c| matches!(c.encoding, ColumnEncoding::Oracle { .. }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Append {
+    Done,
+    /// Row not appended, seal and retry it
+    Full,
 }
 
 /// Per-table per-xact accumulator, one block buffer per CH column.
@@ -1057,6 +1138,10 @@ pub(crate) struct TableEncoder {
     pub(crate) plan: TablePlan,
     pub(crate) rows: usize,
     pub(crate) approx_bytes: usize,
+    /// Pending oracle frame size
+    pub(crate) oracle_bytes: usize,
+    oracle_overhead: usize,
+    oracle_cells: Vec<OracleCell>,
     /// Mirrors `plan.columns` plus the synthetic columns the plan carries
     pub(crate) buffers: Vec<ColumnBuf>,
 }
@@ -1065,9 +1150,15 @@ pub(crate) struct TableEncoder {
 /// slices at flush time; cleared after `send_data`.
 pub(crate) enum ColumnBuf {
     /// `width` bytes per row, packed little-endian
-    Fixed { width: usize, bytes: Vec<u8> },
+    Fixed {
+        width: usize,
+        bytes: Vec<u8>,
+    },
     /// `offsets[i]` is the cumulative exclusive end of row `i` in `data`
-    String { offsets: Vec<u64>, data: Vec<u8> },
+    String {
+        offsets: Vec<u64>,
+        data: Vec<u8>,
+    },
     /// `null_map[i] = 1` means NULL; zero bytes go into `inner` for null
     /// rows so the slab stays dense
     NullableFixed {
@@ -1080,112 +1171,12 @@ pub(crate) enum ColumnBuf {
         data: Vec<u8>,
         null_map: Vec<u8>,
     },
-    /// `Array(<inner>)`: `offsets[i]` is the cumulative element count through
-    /// row `i`; elements accumulate in `inner`. `elem` drives text→wire for
-    /// each element. Not itself Nullable (CH forbids `Nullable(Array)`): a
-    /// NULL/absent source value lands as an empty array.
-    Array {
-        offsets: Vec<u64>,
-        inner: Box<ColumnBuf>,
-        elem: ChScalar,
-    },
-    /// `Map(String, <vals>)` == `Array(Tuple(keys, vals))`. `offsets[i]` is
-    /// the cumulative entry count through row `i`. Keys are non-nullable
-    /// `String`; a NULL/absent source value lands as an empty map.
-    Map {
-        offsets: Vec<u64>,
-        keys: Box<ColumnBuf>,
-        vals: Box<ColumnBuf>,
-    },
-    /// CH `JSON` (string serialization). `null_map` is `Some` for
-    /// `Nullable(JSON)`. A value that isn't valid JSON text (unresolved jsonb
-    /// on-disk bytes, non-text) can't go in — it becomes NULL (nullable) or
-    /// `{}` (non-nullable), never raw bytes CH would reject.
-    Json {
-        offsets: Vec<u64>,
-        data: Vec<u8>,
-        null_map: Option<Vec<u8>>,
-    },
-}
-
-/// Scalar CH element kind for array elements: drives parsing a PG array text
-/// token into little-endian wire bytes (or a String element).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChScalar {
-    Bool,
-    I8,
-    I16,
-    I32,
-    I64,
-    U32,
-    F32,
-    F64,
-    Uuid,
-    Str,
-}
-
-impl ChScalar {
-    fn from_kind(kind: Option<Kind>) -> Option<Self> {
-        Some(match kind? {
-            Kind::Bool => Self::Bool,
-            Kind::Int8 => Self::I8,
-            Kind::Int16 => Self::I16,
-            Kind::Int32 => Self::I32,
-            Kind::Int64 => Self::I64,
-            Kind::UInt32 => Self::U32,
-            Kind::Float32 => Self::F32,
-            Kind::Float64 => Self::F64,
-            Kind::Uuid => Self::Uuid,
-            Kind::String => Self::Str,
-            _ => return None,
-        })
-    }
+    Oracle(OracleColumnBuf),
 }
 
 impl ColumnBuf {
-    /// Width comes from clickhouse-c `chc_type_elem_size` so
-    /// FixedString(N), DateTime64, Decimal*, Enum resolve without
-    /// walshadow mirroring the type-string surface. `elem_size == 0`
-    /// means varlen on-wire shape; only `String` is handled, other
-    /// varlens fall through to the String arms and die on first `append`.
     fn new_for_ast(ast: &TypeAst) -> Result<Self, EmitterError> {
-        Self::new_for_view(ast.view())
-    }
-
-    fn new_for_view(view: TypeRef<'_>) -> Result<Self, EmitterError> {
-        match view.kind() {
-            Some(Kind::Array) => {
-                let child = view
-                    .child(0)
-                    .ok_or_else(|| EmitterError::Type("Array type with no child".into()))?;
-                let elem_kind = if child.kind() == Some(Kind::Nullable) {
-                    child.child(0).and_then(|c| c.kind())
-                } else {
-                    child.kind()
-                };
-                let elem = ChScalar::from_kind(elem_kind)
-                    .ok_or_else(|| EmitterError::Type("Array element type not encodable".into()))?;
-                return Ok(Self::Array {
-                    offsets: Vec::new(),
-                    inner: Box::new(Self::new_for_view(child)?),
-                    elem,
-                });
-            }
-            Some(Kind::Map) => {
-                let k = view
-                    .child(0)
-                    .ok_or_else(|| EmitterError::Type("Map type with no key".into()))?;
-                let v = view
-                    .child(1)
-                    .ok_or_else(|| EmitterError::Type("Map type with no value".into()))?;
-                return Ok(Self::Map {
-                    offsets: Vec::new(),
-                    keys: Box::new(Self::new_for_view(k)?),
-                    vals: Box::new(Self::new_for_view(v)?),
-                });
-            }
-            _ => {}
-        }
+        let view = ast.view();
         let (nullable, inner) = if view.kind() == Some(Kind::Nullable) {
             (
                 true,
@@ -1195,15 +1186,7 @@ impl ColumnBuf {
         } else {
             (false, view)
         };
-        if inner.kind() == Some(Kind::Json) {
-            return Ok(Self::Json {
-                offsets: Vec::new(),
-                data: Vec::new(),
-                null_map: nullable.then(Vec::new),
-            });
-        }
-        let elem = inner.elem_size();
-        Ok(match (nullable, elem) {
+        Ok(match (nullable, inner.elem_size()) {
             (false, 0) => Self::String {
                 offsets: Vec::new(),
                 data: Vec::new(),
@@ -1237,31 +1220,7 @@ impl ColumnBuf {
                 data,
                 null_map,
             } => offsets.len() * 8 + data.len() + null_map.len(),
-            Self::Array { offsets, inner, .. } => offsets.len() * 8 + inner.approx_size(),
-            Self::Map {
-                offsets,
-                keys,
-                vals,
-            } => offsets.len() * 8 + keys.approx_size() + vals.approx_size(),
-            Self::Json {
-                offsets,
-                data,
-                null_map,
-            } => offsets.len() * 8 + data.len() + null_map.as_ref().map_or(0, Vec::len),
-        }
-    }
-
-    /// Rows appended so far (element count for the inner buffer of an Array/Map).
-    fn rows(&self) -> usize {
-        match self {
-            Self::Fixed { width, bytes } => bytes.len().checked_div(*width).unwrap_or(0),
-            Self::String { offsets, .. } => offsets.len(),
-            Self::NullableFixed { null_map, .. } | Self::NullableString { null_map, .. } => {
-                null_map.len()
-            }
-            Self::Array { offsets, .. }
-            | Self::Map { offsets, .. }
-            | Self::Json { offsets, .. } => offsets.len(),
+            Self::Oracle(o) => o.approx_size(),
         }
     }
 
@@ -1285,26 +1244,8 @@ impl ColumnBuf {
                 offsets.push(data.len() as u64);
                 Ok(())
             }
-            // CH Array/Map can't be Nullable; a NULL source value is an empty
-            // array/map (offset repeats the running element count).
-            Self::Array { offsets, inner, .. } => {
-                offsets.push(inner.rows() as u64);
-                Ok(())
-            }
-            Self::Map { offsets, keys, .. } => {
-                offsets.push(keys.rows() as u64);
-                Ok(())
-            }
-            Self::Json {
-                offsets,
-                data,
-                null_map,
-            } => {
-                if let Some(nm) = null_map {
-                    nm.push(1);
-                }
-                data.extend_from_slice(b"{}");
-                offsets.push(data.len() as u64);
+            Self::Oracle(o) => {
+                o.push(OracleCell::Default);
                 Ok(())
             }
             _ => Err(EmitterError::UnsupportedValue {
@@ -1393,7 +1334,13 @@ impl ColumnBuf {
 pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterError> {
     let mut buffers = Vec::with_capacity(plan.columns.len() + 4);
     for c in &plan.columns {
-        buffers.push(ColumnBuf::new_for_ast(&c.ast)?);
+        buffers.push(match c.encoding {
+            ColumnEncoding::Local => ColumnBuf::new_for_ast(&c.ast)?,
+            ColumnEncoding::Oracle {
+                source_type_oid,
+                source_typmod,
+            } => ColumnBuf::Oracle(OracleColumnBuf::new(source_type_oid, source_typmod)),
+        });
     }
     buffers.push(ColumnBuf::Fixed {
         width: 8,
@@ -1419,10 +1366,20 @@ pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterE
 impl TableEncoder {
     pub(crate) fn new(plan: TablePlan) -> Result<Self, EmitterError> {
         let buffers = fresh_buffers(&plan)?;
+        let oracle_overhead = REQUEST_FRAME_BYTES
+            + plan
+                .columns
+                .iter()
+                .filter(|c| matches!(c.encoding, ColumnEncoding::Oracle { .. }))
+                .map(|c| request_column_bytes(&c.name, &c.type_repr))
+                .sum::<usize>();
         Ok(Self {
             plan,
             rows: 0,
             approx_bytes: 0,
+            oracle_bytes: oracle_overhead,
+            oracle_overhead,
+            oracle_cells: Vec::new(),
             buffers,
         })
     }
@@ -1435,45 +1392,72 @@ impl TableEncoder {
         let rows = self.rows;
         self.rows = 0;
         self.approx_bytes = 0;
+        self.oracle_bytes = self.oracle_overhead;
         Ok((old, rows))
     }
 
-    /// Caller picks the source side (DELETE uses `old`) and the op code.
+    /// Return [`Append::Full`] without mutation when oracle threshold is hit
     pub fn append_row(
         &mut self,
         committed: &CommittedTuple,
         mapping: &TableMapping,
         op_code: i8,
-    ) -> Result<(), EmitterError> {
+    ) -> Result<Append, EmitterError> {
         let decoded = &committed.decoded;
         let side = match decoded.op {
             HeapOp::Delete => decoded.old.as_ref(),
             _ => decoded.new.as_ref(),
         };
+        let value_of = |col: &ColumnMapping| {
+            side.and_then(|t| t.columns.get((col.src_attnum - 1) as usize))
+                .and_then(|opt| opt.as_ref())
+        };
+        // Size oracle cells before mutating column buffers
+        let mut cells = std::mem::take(&mut self.oracle_cells);
+        cells.clear();
+        let mut row_oracle_bytes = 0usize;
+        for (i, col) in mapping.columns.iter().enumerate() {
+            if let ColumnBuf::Oracle(o) = &self.buffers[i] {
+                let cell = oracle_cell(value_of(col), o.source_type_oid)
+                    .map_err(|e| name_column(e, &col.target_name))?;
+                row_oracle_bytes += cell.wire_bytes();
+                cells.push(cell);
+            }
+        }
+        if self.rows > 0 && self.oracle_bytes + row_oracle_bytes > ORACLE_BATCH_SEAL_BYTES {
+            cells.clear();
+            self.oracle_cells = cells;
+            return Ok(Append::Full);
+        }
+        // Enforce hard frame cap even for first row
+        if self.oracle_overhead + row_oracle_bytes > MAX_REQUEST_BYTES {
+            return Err(EmitterError::Type(format!(
+                "row needs {row_oracle_bytes} oracle bytes, one request carries {MAX_REQUEST_BYTES}"
+            )));
+        }
+        let mut cell_iter = cells.iter_mut();
         for (i, col) in mapping.columns.iter().enumerate() {
             let decimal = self.plan.columns[i].decimal;
             let buf = &mut self.buffers[i];
-            let raw_value = side
-                .and_then(|t| t.columns.get((col.src_attnum - 1) as usize))
-                .and_then(|opt| opt.as_ref());
-            match raw_value {
+            if let ColumnBuf::Oracle(o) = buf {
+                let cell = cell_iter.next().expect("one cell per oracle column");
+                o.push(std::mem::replace(cell, OracleCell::Default));
+                continue;
+            }
+            match value_of(col) {
                 // Absent / NULL coerces: Nullable target takes NULL,
                 // non-Nullable the type default. Covers key-only delete
                 // tombstones under non-FULL replica identity and NULL
                 // source values mapped onto non-Nullable columns
                 None | Some(ColumnValue::Null) => buf.append_default(),
-                Some(v) => encode_value(buf, v, decimal).map_err(|mut e| {
-                    if let EmitterError::UnsupportedValue {
-                        ref mut target_column,
-                        ..
-                    } = e
-                    {
-                        *target_column = col.target_name.clone();
-                    }
-                    e
-                })?,
+                Some(v) => {
+                    encode_value(buf, v, decimal).map_err(|e| name_column(e, &col.target_name))?
+                }
             }
         }
+        cells.clear();
+        self.oracle_cells = cells;
+        self.oracle_bytes += row_oracle_bytes;
         // Synthetic columns: lsn, xid, commit_ts (unix micros), delete marker
         let off = mapping.columns.len();
         push_fixed(&mut self.buffers[off], &decoded.source_lsn.to_le_bytes())?;
@@ -1486,69 +1470,58 @@ impl TableEncoder {
         }
         self.rows += 1;
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
-        Ok(())
+        Ok(Append::Done)
     }
 }
 
-/// Build the root `ColumnBuilder` for one column's buffer, recursively for
-/// composite (`Array`/`Map`) shapes. A `ColumnBuilder` node borrows its slabs
-/// and any child nodes and cannot move once aliased, so every intermediate
-/// node is allocated in `bump` (stable address, one shared `'b` lifetime) and
-/// lives until `send_data` returns. `n_rows` is the row count at this level
-/// (element count for a nested inner buffer).
-pub(crate) fn build_column<'b>(
-    buf: &'b ColumnBuf,
+fn name_column(mut e: EmitterError, target: &str) -> EmitterError {
+    if let EmitterError::UnsupportedValue {
+        ref mut target_column,
+        ..
+    } = e
+    {
+        *target_column = target.to_string();
+    }
+    e
+}
+
+/// Build stable leaves before roots borrow them
+pub(crate) fn build_leaf(
+    buf: &ColumnBuf,
     n_rows: usize,
-    bump: &'b bumpalo::Bump,
+) -> Result<Option<ColumnBuilder<'_>>, EmitterError> {
+    Ok(match buf {
+        ColumnBuf::NullableFixed { width, inner, .. } => {
+            Some(ColumnBuilder::fixed(inner, *width, n_rows)?)
+        }
+        ColumnBuf::NullableString { offsets, data, .. } => {
+            Some(ColumnBuilder::string(offsets, data, n_rows)?)
+        }
+        _ => None,
+    })
+}
+
+/// Borrow leaf from storage that outlives returned root
+pub(crate) fn build_root<'b>(
+    buf: &'b ColumnBuf,
+    leaf: Option<&'b ColumnBuilder<'b>>,
+    n_rows: usize,
 ) -> Result<ColumnBuilder<'b>, EmitterError> {
+    let wrap = |null_map: &'b [u8]| -> Result<ColumnBuilder<'b>, EmitterError> {
+        let leaf = leaf.ok_or_else(|| EmitterError::Type("nullable column without leaf".into()))?;
+        Ok(leaf.nullable(null_map)?)
+    };
     Ok(match buf {
         ColumnBuf::Fixed { width, bytes } => ColumnBuilder::fixed(bytes, *width, n_rows)?,
         ColumnBuf::String { offsets, data } => ColumnBuilder::string(offsets, data, n_rows)?,
-        ColumnBuf::NullableFixed {
-            width,
-            null_map,
-            inner,
-        } => {
-            let leaf = bump.alloc(ColumnBuilder::fixed(inner, *width, n_rows)?);
-            leaf.nullable(null_map)?
+        ColumnBuf::NullableFixed { null_map, .. } | ColumnBuf::NullableString { null_map, .. } => {
+            wrap(null_map)?
         }
-        ColumnBuf::NullableString {
-            offsets,
-            data,
-            null_map,
-        } => {
-            let leaf = bump.alloc(ColumnBuilder::string(offsets, data, n_rows)?);
-            leaf.nullable(null_map)?
+        ColumnBuf::Oracle(_) => {
+            return Err(EmitterError::Type(
+                "oracle column has no local wire shape".into(),
+            ));
         }
-        ColumnBuf::Array { offsets, inner, .. } => {
-            let child = bump.alloc(build_column(inner, inner.rows(), bump)?);
-            child.array(offsets, n_rows)?
-        }
-        ColumnBuf::Map {
-            offsets,
-            keys,
-            vals,
-        } => {
-            let entries = keys.rows();
-            let kb = build_column(keys, entries, bump)?;
-            let vb = build_column(vals, entries, bump)?;
-            let children = bump.alloc([kb, vb]);
-            let ptrs: &mut [*mut clickhouse_c::sys::chc_column; 2] =
-                bump.alloc([std::ptr::null_mut(); 2]);
-            let tup = bump.alloc(ColumnBuilder::tuple(&children[..], &mut ptrs[..])?);
-            tup.array(offsets, n_rows)?
-        }
-        ColumnBuf::Json {
-            offsets,
-            data,
-            null_map,
-        } => match null_map {
-            Some(nm) => {
-                let leaf = bump.alloc(ColumnBuilder::string(offsets, data, n_rows)?);
-                leaf.nullable(nm)?
-            }
-            None => ColumnBuilder::string(offsets, data, n_rows)?,
-        },
     })
 }
 
@@ -1819,12 +1792,6 @@ fn encode_value(
     v: &ColumnValue,
     decimal: Option<DecimalWire>,
 ) -> Result<(), EmitterError> {
-    match buf {
-        ColumnBuf::Array { .. } => return encode_array(buf, v),
-        ColumnBuf::Map { .. } => return encode_map(buf, v),
-        ColumnBuf::Json { .. } => return encode_json(buf, v),
-        _ => {}
-    }
     match v {
         ColumnValue::Null => buf.append_null(),
         ColumnValue::Bool(b) => buf.append_fixed_bytes(&[*b as u8]),
@@ -1892,320 +1859,50 @@ fn encode_value(
             target_column: String::new(),
             kind: "unresolved TOAST pointer (xact buffer should have reassembled)",
         }),
-        // PgPending normally resolves to text earlier (decode pool via the
-        // bridge worker). Still set here means resolution failed
-        // through; best effort ships raw on-disk bytes
-        ColumnValue::PgPending { raw, .. } => buf.append_string_bytes(raw),
-        ColumnValue::Unsupported { .. } => Err(EmitterError::UnsupportedValue {
-            target_column: String::new(),
-            kind: "unsupported PG type oid",
-        }),
-    }
-}
-
-/// Post-oracle text of an array/hstore value, or `None` for a NULL/absent
-/// value. Non-text (unresolved bridge) logs and yields `None` (empty).
-fn composite_text(v: &ColumnValue) -> Option<&str> {
-    match v {
-        ColumnValue::Text(s) | ColumnValue::Name(s) | ColumnValue::Json(s) => Some(s.as_str()),
-        ColumnValue::Null => None,
-        _ => {
-            tracing::warn!(
-                target: "walshadow::emitter",
-                "array/map column value not resolved to text; emitting empty",
-            );
-            None
+        ColumnValue::PgPendingText { text, .. } => buf.append_string_bytes(text.as_bytes()),
+        // Never interpret raw Datum bytes as local String data
+        ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. } => {
+            Err(EmitterError::UnsupportedValue {
+                target_column: String::new(),
+                kind: "unresolved source value routed to a local column",
+            })
         }
     }
 }
 
-fn encode_array(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> {
-    let ColumnBuf::Array {
-        offsets,
-        inner,
-        elem,
-    } = buf
-    else {
-        unreachable!("encode_array on non-Array buffer");
-    };
-    let elem = *elem;
-    if let Some(text) = composite_text(v) {
-        // pgvector renders `[1,2,3]`; PG arrays render `{1,2}`.
-        let parsed = if text.trim_start().starts_with('[') && text.trim_end().ends_with(']') {
-            parse_vector_list(text)
+/// Map NULL, absent, and unlogged fields to default cells
+fn oracle_cell(v: Option<&ColumnValue>, source_type_oid: u32) -> Result<OracleCell, EmitterError> {
+    let mismatch = |got: u32| EmitterError::UnsupportedValue {
+        target_column: String::new(),
+        kind: if got == 0 {
+            "decoded value on an oracle column"
         } else {
-            parse_pg_array_1d(text)
-        };
-        match parsed {
-            Ok(elems) => {
-                for e in &elems {
-                    match e {
-                        Some(tok) => append_scalar_text(inner, elem, tok)?,
-                        None => inner.append_null()?,
-                    }
-                }
-            }
-            Err(()) => tracing::warn!(
-                target: "walshadow::emitter",
-                value = %text,
-                "array value not 1-D/parseable; emitting empty array",
-            ),
-        }
-    }
-    offsets.push(inner.rows() as u64);
-    Ok(())
-}
-
-fn encode_map(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> {
-    let ColumnBuf::Map {
-        offsets,
-        keys,
-        vals,
-    } = buf
-    else {
-        unreachable!("encode_map on non-Map buffer");
+            "source type oid differs from the planned one"
+        },
     };
-    if let Some(text) = composite_text(v) {
-        match parse_hstore(text) {
-            Ok(pairs) => {
-                for (k, val) in &pairs {
-                    keys.append_string_bytes(k.as_bytes())?;
-                    match val {
-                        Some(vv) => vals.append_string_bytes(vv.as_bytes())?,
-                        None => vals.append_null()?,
-                    }
-                }
+    Ok(match v {
+        None | Some(ColumnValue::Null) => OracleCell::Default,
+        Some(ColumnValue::PgPending { type_oid, raw })
+        | Some(ColumnValue::Unsupported { type_oid, raw }) => {
+            if *type_oid != source_type_oid {
+                return Err(mismatch(*type_oid));
             }
-            Err(()) => tracing::warn!(
-                target: "walshadow::emitter",
-                value = %text,
-                "hstore value unparseable; emitting empty map",
-            ),
+            OracleCell::DiskRaw(raw.clone())
         }
-    }
-    offsets.push(keys.rows() as u64);
-    Ok(())
-}
-
-fn encode_json(buf: &mut ColumnBuf, v: &ColumnValue) -> Result<(), EmitterError> {
-    let ColumnBuf::Json {
-        offsets,
-        data,
-        null_map,
-    } = buf
-    else {
-        unreachable!("encode_json on non-Json buffer");
-    };
-    if let ColumnValue::Json(s) | ColumnValue::Text(s) | ColumnValue::Name(s) = v
-        && s.trim_start().starts_with('{')
-    {
-        if let Some(nm) = null_map {
-            nm.push(0);
-        }
-        data.extend_from_slice(s.as_bytes());
-    } else {
-        if let Some(nm) = null_map {
-            nm.push(1);
-        }
-        data.extend_from_slice(b"{}");
-    }
-    offsets.push(data.len() as u64);
-    Ok(())
-}
-
-/// Append one array element token (already unquoted) to the element buffer,
-/// parsing it per the CH element kind.
-fn append_scalar_text(buf: &mut ColumnBuf, elem: ChScalar, tok: &str) -> Result<(), EmitterError> {
-    let bad = |k: &'static str| EmitterError::Type(format!("array element {k}: {tok:?}"));
-    match elem {
-        ChScalar::Bool => buf.append_fixed_bytes(&[u8::from(matches!(tok, "t" | "true" | "1"))]),
-        ChScalar::I8 => {
-            buf.append_fixed_bytes(&tok.parse::<i8>().map_err(|_| bad("i8"))?.to_le_bytes())
-        }
-        ChScalar::I16 => {
-            buf.append_fixed_bytes(&tok.parse::<i16>().map_err(|_| bad("i16"))?.to_le_bytes())
-        }
-        ChScalar::I32 => {
-            buf.append_fixed_bytes(&tok.parse::<i32>().map_err(|_| bad("i32"))?.to_le_bytes())
-        }
-        ChScalar::I64 => {
-            buf.append_fixed_bytes(&tok.parse::<i64>().map_err(|_| bad("i64"))?.to_le_bytes())
-        }
-        ChScalar::U32 => {
-            buf.append_fixed_bytes(&tok.parse::<u32>().map_err(|_| bad("u32"))?.to_le_bytes())
-        }
-        ChScalar::F32 => {
-            buf.append_fixed_bytes(&tok.parse::<f32>().map_err(|_| bad("f32"))?.to_le_bytes())
-        }
-        ChScalar::F64 => {
-            buf.append_fixed_bytes(&tok.parse::<f64>().map_err(|_| bad("f64"))?.to_le_bytes())
-        }
-        ChScalar::Uuid => {
-            let raw = parse_uuid_text(tok).ok_or_else(|| bad("uuid"))?;
-            buf.append_fixed_bytes(&crate::decode::codecs::uuid_to_ch_wire(&raw))
-        }
-        ChScalar::Str => buf.append_string_bytes(tok.as_bytes()),
-    }
-}
-
-fn parse_uuid_text(s: &str) -> Option<[u8; 16]> {
-    let hex: Vec<u8> = s.bytes().filter(|c| *c != b'-').collect();
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let h = std::str::from_utf8(&hex[i * 2..i * 2 + 2]).ok()?;
-        *byte = u8::from_str_radix(h, 16).ok()?;
-    }
-    Some(out)
-}
-
-/// A `"..."`-quoted token starting at `start`; returns the unescaped value and
-/// the index just past the closing quote. Only `\\` and `\"` are escapes in
-/// PG array/hstore output; raw multibyte bytes are copied verbatim.
-fn read_quoted(s: &str, start: usize) -> Result<(String, usize), ()> {
-    let b = s.as_bytes();
-    let mut i = start + 1;
-    let mut out: Vec<u8> = Vec::new();
-    while i < b.len() {
-        match b[i] {
-            b'\\' => {
-                i += 1;
-                if i >= b.len() {
-                    return Err(());
-                }
-                out.push(b[i]);
-                i += 1;
+        Some(ColumnValue::PgPendingText { type_oid, text }) => {
+            if *type_oid != source_type_oid {
+                return Err(mismatch(*type_oid));
             }
-            b'"' => return String::from_utf8(out).map(|v| (v, i + 1)).map_err(|_| ()),
-            c => {
-                out.push(c);
-                i += 1;
-            }
+            OracleCell::TextInput(text.as_bytes().to_vec())
         }
-    }
-    Err(())
-}
-
-/// Parse PG's canonical 1-D array output `{a,b,"c,d",NULL}` into elements
-/// (`None` = NULL). `Err` for multi-dimensional input (nested `{}` or a
-/// `[lo:hi]=` dimension prefix), which the caller downgrades to an empty array.
-fn parse_pg_array_1d(s: &str) -> Result<Vec<Option<String>>, ()> {
-    let s = s.trim();
-    if s.starts_with('[') {
-        return Err(());
-    }
-    let inner = s
-        .strip_prefix('{')
-        .and_then(|x| x.strip_suffix('}'))
-        .ok_or(())?;
-    let mut out = Vec::new();
-    if inner.is_empty() {
-        return Ok(out);
-    }
-    let b = inner.as_bytes();
-    let mut i = 0;
-    loop {
-        if b[i] == b'"' {
-            let (val, ni) = read_quoted(inner, i)?;
-            out.push(Some(val));
-            i = ni;
-        } else {
-            let start = i;
-            while i < b.len() && b[i] != b',' {
-                if b[i] == b'{' || b[i] == b'}' {
-                    return Err(());
-                }
-                i += 1;
-            }
-            let tok = &inner[start..i];
-            out.push(if tok == "NULL" {
-                None
-            } else {
-                Some(tok.to_string())
-            });
+        // json varlena body is text
+        Some(ColumnValue::Json(s)) => OracleCell::DiskRaw(s.as_bytes().to_vec()),
+        // PostGIS WKT must bypass HEXEWKB typoutput
+        Some(ColumnValue::Text(s)) | Some(ColumnValue::Name(s)) => {
+            OracleCell::Literal(s.as_bytes().to_vec())
         }
-        if i >= b.len() {
-            break;
-        }
-        if b[i] == b',' {
-            i += 1;
-            continue;
-        }
-        return Err(());
-    }
-    Ok(out)
-}
-
-/// Parse a pgvector literal `[1,2,3]` into element tokens. No NULLs/quotes.
-fn parse_vector_list(s: &str) -> Result<Vec<Option<String>>, ()> {
-    let inner = s
-        .trim()
-        .strip_prefix('[')
-        .and_then(|x| x.strip_suffix(']'))
-        .ok_or(())?;
-    if inner.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(inner
-        .split(',')
-        .map(|t| Some(t.trim().to_string()))
-        .collect())
-}
-
-/// Parse PG's hstore output `"k"=>"v", "k2"=>NULL` into key/value pairs
-/// (`None` = NULL value). Keys are always quoted.
-fn parse_hstore(s: &str) -> Result<Vec<(String, Option<String>)>, ()> {
-    let s = s.trim();
-    let mut out = Vec::new();
-    if s.is_empty() {
-        return Ok(out);
-    }
-    let b = s.as_bytes();
-    let mut i = 0;
-    let skip_ws = |b: &[u8], mut i: usize| {
-        while i < b.len() && b[i] == b' ' {
-            i += 1;
-        }
-        i
-    };
-    loop {
-        i = skip_ws(b, i);
-        if i >= b.len() {
-            break;
-        }
-        if b[i] != b'"' {
-            return Err(());
-        }
-        let (key, ni) = read_quoted(s, i)?;
-        i = skip_ws(b, ni);
-        if i + 1 >= b.len() || b[i] != b'=' || b[i + 1] != b'>' {
-            return Err(());
-        }
-        i = skip_ws(b, i + 2);
-        let val = if i < b.len() && b[i] == b'"' {
-            let (v, ni) = read_quoted(s, i)?;
-            i = ni;
-            Some(v)
-        } else if s[i..].starts_with("NULL") {
-            i += 4;
-            None
-        } else {
-            return Err(());
-        };
-        out.push((key, val));
-        i = skip_ws(b, i);
-        if i >= b.len() {
-            break;
-        }
-        if b[i] == b',' {
-            i += 1;
-            continue;
-        }
-        return Err(());
-    }
-    Ok(out)
+        Some(_) => return Err(mismatch(0)),
+    })
 }
 
 crate::atomic_stats! {
@@ -2297,7 +1994,6 @@ crate::atomic_stats! {
     }
 }
 
-// Manual Debug: deriving would dump the whole slab; report just lengths
 impl std::fmt::Debug for ColumnBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2331,35 +2027,11 @@ impl std::fmt::Debug for ColumnBuf {
                 .field("offsets_len", &offsets.len())
                 .field("data_len", &data.len())
                 .finish(),
-            Self::Array {
-                offsets,
-                inner,
-                elem,
-            } => f
-                .debug_struct("Array")
-                .field("rows", &offsets.len())
-                .field("elem", elem)
-                .field("inner", inner)
-                .finish(),
-            Self::Map {
-                offsets,
-                keys,
-                vals,
-            } => f
-                .debug_struct("Map")
-                .field("rows", &offsets.len())
-                .field("keys", keys)
-                .field("vals", vals)
-                .finish(),
-            Self::Json {
-                offsets,
-                data,
-                null_map,
-            } => f
-                .debug_struct("Json")
-                .field("rows", &offsets.len())
-                .field("data_len", &data.len())
-                .field("nullable", &null_map.is_some())
+            Self::Oracle(o) => f
+                .debug_struct("Oracle")
+                .field("rows", &o.cells().len())
+                .field("source_oid", &o.source_type_oid)
+                .field("wire_bytes", &o.approx_size())
                 .finish(),
         }
     }
@@ -2690,10 +2362,6 @@ mod tests {
             ("Nullable(String)", "NullableString"),
             ("FixedString(7)", "Fixed"),
             ("Nullable(FixedString(7))", "NullableFixed"),
-            ("Array(Nullable(Int32))", "Array"),
-            ("Map(String, Nullable(String))", "Map"),
-            ("JSON", "Json"),
-            ("Nullable(JSON)", "Json"),
         ];
         for (name, tag) in cases {
             let ast = TypeAst::parse(name, alloc).expect("parses");
@@ -2703,149 +2371,10 @@ mod tests {
                 ColumnBuf::String { .. } => "String",
                 ColumnBuf::NullableFixed { .. } => "NullableFixed",
                 ColumnBuf::NullableString { .. } => "NullableString",
-                ColumnBuf::Array { .. } => "Array",
-                ColumnBuf::Map { .. } => "Map",
-                ColumnBuf::Json { .. } => "Json",
+                ColumnBuf::Oracle(_) => "Oracle",
             };
             assert_eq!(actual, tag, "{name}");
         }
-    }
-
-    #[test]
-    fn encode_json_text_null_and_unresolved() {
-        let alloc = Allocator::stdlib();
-        let ast = TypeAst::parse("Nullable(JSON)", alloc).unwrap();
-        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
-        encode_value(&mut buf, &ColumnValue::Json("{\"a\":1}".into()), None).unwrap();
-        encode_value(&mut buf, &ColumnValue::Null, None).unwrap();
-        // unresolved jsonb (raw on-disk bytes) must not reach CH as raw → NULL
-        encode_value(
-            &mut buf,
-            &ColumnValue::PgPending {
-                type_oid: 3802,
-                raw: vec![1, 0, 0, 0],
-            },
-            None,
-        )
-        .unwrap();
-        let ColumnBuf::Json {
-            offsets,
-            data,
-            null_map,
-        } = &buf
-        else {
-            panic!("expected Json buf");
-        };
-        assert_eq!(data, &br#"{"a":1}{}{}"#[..]);
-        assert_eq!(offsets, &[7, 9, 11]);
-        assert_eq!(null_map.as_deref(), Some(&[0u8, 1, 1][..]));
-    }
-
-    #[test]
-    fn parse_array_handles_nulls_quotes_and_rejects_multidim() {
-        assert_eq!(
-            parse_pg_array_1d("{1,2,3}").unwrap(),
-            vec![Some("1".into()), Some("2".into()), Some("3".into())]
-        );
-        assert_eq!(
-            parse_pg_array_1d("{}").unwrap(),
-            Vec::<Option<String>>::new()
-        );
-        assert_eq!(
-            parse_pg_array_1d("{a,NULL,\"b,c\"}").unwrap(),
-            vec![Some("a".into()), None, Some("b,c".into())]
-        );
-        assert_eq!(
-            parse_pg_array_1d("{\"a\\\"b\"}").unwrap(),
-            vec![Some("a\"b".into())]
-        );
-        assert!(parse_pg_array_1d("{{1,2},{3,4}}").is_err());
-        assert!(parse_pg_array_1d("[1:2]={1,2}").is_err());
-    }
-
-    #[test]
-    fn parse_vector_and_encode_into_array_float32() {
-        assert_eq!(
-            parse_vector_list("[1,2,3]").unwrap(),
-            vec![Some("1".into()), Some("2".into()), Some("3".into())]
-        );
-        assert_eq!(
-            parse_vector_list("[]").unwrap(),
-            Vec::<Option<String>>::new()
-        );
-        let alloc = Allocator::stdlib();
-        let ast = TypeAst::parse("Array(Float32)", alloc).unwrap();
-        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
-        encode_value(&mut buf, &ColumnValue::Text("[1.5,2.5]".into()), None).unwrap();
-        let ColumnBuf::Array {
-            offsets,
-            inner,
-            elem,
-        } = &buf
-        else {
-            panic!("expected Array buf");
-        };
-        assert_eq!(*elem, ChScalar::F32);
-        assert_eq!(offsets, &[2]);
-        assert_eq!(inner.rows(), 2);
-    }
-
-    #[test]
-    fn parse_hstore_pairs_and_nulls() {
-        assert_eq!(
-            parse_hstore("\"k\"=>\"v\", \"x\"=>NULL").unwrap(),
-            vec![("k".into(), Some("v".into())), ("x".into(), None)]
-        );
-        assert_eq!(
-            parse_hstore("").unwrap(),
-            Vec::<(String, Option<String>)>::new()
-        );
-        assert_eq!(
-            parse_hstore("\"a=>b\"=>\"c,d\"").unwrap(),
-            vec![("a=>b".into(), Some("c,d".into()))]
-        );
-    }
-
-    #[test]
-    fn encode_array_offsets_track_elements_and_null_is_empty() {
-        let alloc = Allocator::stdlib();
-        let ast = TypeAst::parse("Array(Nullable(Int32))", alloc).unwrap();
-        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
-        encode_value(&mut buf, &ColumnValue::Text("{10,20,30}".into()), None).unwrap();
-        encode_value(&mut buf, &ColumnValue::Null, None).unwrap();
-        encode_value(&mut buf, &ColumnValue::Text("{40}".into()), None).unwrap();
-        let ColumnBuf::Array { offsets, inner, .. } = &buf else {
-            panic!("expected Array buf");
-        };
-        // cumulative element counts: 3, still 3 (empty), 4
-        assert_eq!(offsets, &[3, 3, 4]);
-        assert_eq!(inner.rows(), 4);
-    }
-
-    #[test]
-    fn encode_map_offsets_track_entries() {
-        let alloc = Allocator::stdlib();
-        let ast = TypeAst::parse("Map(String, Nullable(String))", alloc).unwrap();
-        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
-        encode_value(
-            &mut buf,
-            &ColumnValue::Text("\"a\"=>\"1\", \"b\"=>NULL".into()),
-            None,
-        )
-        .unwrap();
-        encode_value(&mut buf, &ColumnValue::Null, None).unwrap();
-        let ColumnBuf::Map {
-            offsets,
-            keys,
-            vals,
-            ..
-        } = &buf
-        else {
-            panic!("expected Map buf");
-        };
-        assert_eq!(offsets, &[2, 2]);
-        assert_eq!(keys.rows(), 2);
-        assert_eq!(vals.rows(), 2);
     }
 
     #[test]
@@ -3134,6 +2663,51 @@ mod tests {
 
     /// Key-only old image, the shape a delete logs under non-FULL
     /// replica identity
+    #[test]
+    fn oracle_row_over_the_seal_threshold_starts_a_new_batch() {
+        let alloc = Allocator::stdlib();
+        let rel = mk_rel();
+        let mut m = mk_mapping();
+        m.columns[1].target_type = "JSON".into();
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.columns[1].encoding,
+            ColumnEncoding::Oracle { .. }
+        ));
+        let mut enc = TableEncoder::new(plan).unwrap();
+        let big = "x".repeat(ORACLE_BATCH_SEAL_BYTES * 3 / 5);
+        assert_eq!(
+            enc.append_row(&committed(1, Some(&big)), &m, OP_INSERT)
+                .unwrap(),
+            Append::Done
+        );
+        let before = enc.oracle_bytes;
+        assert_eq!(
+            enc.append_row(&committed(2, Some(&big)), &m, OP_INSERT)
+                .unwrap(),
+            Append::Full
+        );
+        assert_eq!(
+            (enc.rows, enc.oracle_bytes),
+            (1, before),
+            "row not appended"
+        );
+        assert_eq!(enc.take_block().unwrap().1, 1);
+        assert_eq!(
+            enc.append_row(&committed(2, Some(&big)), &m, OP_INSERT)
+                .unwrap(),
+            Append::Done
+        );
+        assert_eq!(enc.rows, 1);
+    }
+
     fn committed_delete(id: i32) -> CommittedTuple {
         CommittedTuple {
             decoded: DecodedHeap {

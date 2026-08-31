@@ -144,8 +144,8 @@ Common mappings include:
 | `json`, `jsonb` | `JSON` |
 | `hstore` | `Map(String, Nullable(String))` |
 | `vector`, `halfvec` (pgvector) | `Array(Float32)` |
-| `geography`, `geometry` (PostGIS) | `String` (WKT) |
-| `<elem>[]` arrays | `Array(Nullable(<elem>))`; unknown elem → `Array(Nullable(String))` |
+| `geography`, `geometry` (PostGIS) | `String`, WKT for 2-D points, PostgreSQL's own hex form otherwise |
+| `<elem>[]` arrays | `Array(Nullable(<elem>))`; unknown elem → `Array(Nullable(String))`. One layer, so a multidimensional value needs an explicit nested override |
 | `inet`, `cidr`, `interval`, unknown types | `String` |
 
 Nullable source columns become `Nullable(...)` unless used as ClickHouse sort

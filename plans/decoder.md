@@ -2,7 +2,7 @@
 
 Heap-tuple decoder. Walks `RM_HEAP` / `RM_HEAP2` records, projects WAL
 payload bytes through per-relation
-[`RelDescriptor`](../src/shadow_catalog.rs) snapshots, emits one
+[`RelDescriptor`](../src/catalog/shadow_catalog.rs) snapshots, emits one
 `DecodedHeap { rfn, xid, source_lsn, op, new, old }` per logged tuple
 into xact buffer. Tier 1/2 types decode inline against on-disk layout;
 Tier 3 hot types (numeric, inet, interval, json) decode in-tree;
@@ -56,9 +56,9 @@ carries pg_class OIDs rather than a relfilenode
 
 `Truncate` is unique: `xl_heap_truncate` main_data carries pg_class OIDs
 (not relfilenodes) with no block ref, so
-[`BufferingDecoderSink::handle_truncate`](../src/xact_buffer.rs)
+[`BufferingDecoderSink::handle_truncate`](../src/xact/xact_buffer.rs)
 intercepts pre-decode — parses via
-[`main_data::parse_xl_heap_truncate`](../src/main_data.rs),
+[`main_data::parse_xl_heap_truncate`](../src/filter/main_data.rs),
 `wait_for_replay(source_lsn)` so shadow's pg_class fetch sees
 post-truncate filenode, resolves each relid through
 `ShadowCatalog::relation_by_oid`, fans out one `HeapOp::Truncate` per
@@ -141,7 +141,7 @@ coalesces them under one xact bucket
 
 ## `main_data` parsers
 
-[`src/main_data.rs`](../src/main_data.rs) carries parsers for records
+[`src/filter/main_data.rs`](../src/filter/main_data.rs) carries parsers for records
 walshadow needs to read `main_data` for outside `xl_heap_*` shape:
 
 - `parse_xl_heap_truncate(md) -> Option<HeapTruncate>` — extracts
@@ -210,7 +210,7 @@ va_toastrelid })` for TOAST reassembly to dereference
 
 ### Tier 3 — codecs + `PgPending`
 
-In-tree decoders ([`src/codecs.rs`](../src/codecs.rs)):
+In-tree decoders ([`src/decode/codecs.rs`](../src/decode/codecs.rs)):
 
 - `numeric` (1700) — short / long / special header variants, base-10000
   digits, NaN / ±Inf flags; finite values rendered to PG-text form
@@ -222,15 +222,14 @@ In-tree decoders ([`src/codecs.rs`](../src/codecs.rs)):
 Everything else — `jsonb`, range types, arrays (`typcategory='A'`),
 `tsvector`, vendor types — routes through
 `ColumnValue::PgPending { type_oid, raw }` carrying on-disk varlena
-body. Emitter resolves text form at emit time through shadow PG's own
-`typoutput`, reached over required bridge worker socket. Per-item
-`typoutput` errors leave `PgPending` unresolved and preserve on-disk body
-(see [oracle.md](oracle.md) § Failure semantics). One source of truth lives
-on shadow, no per-type codec drift to chase in walshadow itself
+body. Decoder never renders it: the body crosses to shadow PG untouched
+and comes back as a ClickHouse Native column, one request per sealed
+batch ([oracle.md](oracle.md)). One source of truth lives on shadow, no
+per-type codec drift to chase in walshadow itself
 
 ## Replica identity
 
-[`ReplIdent`](../src/shadow_catalog.rs) variants and old-tuple shape,
+[`ReplIdent`](../src/catalog/shadow_catalog.rs) variants and old-tuple shape,
 per PG `ExtractReplicaIdentity`:
 
 | variant | wire | decoder behaviour |
@@ -252,7 +251,7 @@ special-casing each variant
 PG's fast-path `ALTER TABLE ADD COLUMN ... DEFAULT k` stamps
 `pg_attribute.atthasmissing = true` + `attmissingval[1]` (text form via
 `typoutput`) on catalog row. Shadow catalog fetch path
-([`shadow_catalog.rs::fetch_attributes`](../src/shadow_catalog.rs))
+([`catalog/shadow_catalog.rs::fetch_attributes`](../src/catalog/shadow_catalog.rs))
 populates `RelAttr.missing_text: Option<String>`
 
 When WAL writer's `natts` (from `t_infomask2 & HEAP_NATTS_MASK`) is
@@ -267,12 +266,13 @@ Decoder closes gap via `missing_value_for(att)`:
 - `CHAROID`: first byte cast to `i8`
 - `TEXTOID / VARCHAROID / BPCHAROID / NAMEOID / JSONOID`: text
   passthrough
-- Anything else: `PgPending { type_oid, raw: text.as_bytes().to_vec() }`
-  so shadow's `typinput` recovers bytea via oracle path
+- Anything else: `PgPendingText { type_oid, text }`, a distinct variant
+  because the oracle must reach it through `typinput` rather than
+  reconstructing a Datum from on-disk bytes ([oracle.md](oracle.md))
 
 Missing-value path uses `RelAttr.missing_text` (PG-text form) and
-`missing_value_for(att)`, which routes Tier 3 through `PgPending` rather
-than decoding binary array elements in `codecs.rs`
+`missing_value_for(att)`, which routes Tier 3 through `PgPendingText`
+rather than decoding binary array elements in `codecs.rs`
 
 Physical NULL (bitmap bit clear within writer's `natts` window) still
 wins: missing-value substitution only fires for trailing attributes
@@ -280,7 +280,7 @@ the writer did not log
 
 ## FPI handling
 
-[`src/fpi.rs::restore_block_image(block, page_magic) -> [u8; 8192]`](../src/fpi.rs)
+[`src/decode/fpi.rs::restore_block_image(block, page_magic) -> [u8; 8192]`](../src/decode/fpi.rs)
 reconstructs 8 KiB page from `XLogRecordBlock.image`. Dispatches on
 `block.header.image_header.compression_method(page_magic)` returning
 `Option<FpiCompressionMethod>`. Page-magic argument selects between PG
@@ -311,9 +311,9 @@ re-reads, `XLOG_FPI_FOR_HINT` post-checkpoint hot set where no
 
 ## pg_class decoder
 
-[`src/pg_class_decoder.rs::decode_pg_class_tuple(record, block_idx) -> DecodeOutcome`](../src/pg_class_decoder.rs)
+[`src/filter/pg_class_decoder.rs::decode_pg_class_tuple(record, block_idx) -> DecodeOutcome`](../src/filter/pg_class_decoder.rs)
 is a narrow heap-tuple decoder targeting pg_class block data only.
-Feeds [`CatalogTracker`](../src/catalog_tracker.rs) so
+Feeds [`CatalogTracker`](../src/filter/catalog_tracker.rs) so
 user-vs-catalog whitelist tracks `relfilenode` rewrites on non-mapped
 catalogs (`VACUUM FULL pg_depend`, `REINDEX pg_constraint`, `CLUSTER`).
 Mapped catalogs (pg_class, pg_attribute, pg_type, pg_proc, shared
@@ -362,7 +362,7 @@ images keyed on rfn + replica-identity attrs to reconstruct, emitter
 treats `None` as "leave CH column untouched" via per-op write path
 
 `commit_ts` / `commit_lsn` arrive on
-[`CommittedTuple`](../src/heap_decoder.rs) wrapper from xact buffer's
+[`CommittedTuple`](../src/decode/heap_decoder.rs) wrapper from xact buffer's
 commit step, not here. Decoder is unaware of xact state — stamps every
 record eagerly, leaves abort-then-ghost-row reconciliation to buffer
 

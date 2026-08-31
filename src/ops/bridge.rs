@@ -6,10 +6,7 @@
 //! Worker serves a unix socket, so it needs no `pg_proc` row on a shadow
 //! standby whose catalog is a read-only physical copy of source's.
 //!
-//! Wire contract lives in `pgext/walshadow.h`; this is its only client.
-//! [`Oracle`](crate::ops::oracle::Oracle) leaves pending values unresolved on
-//! bridge failure. Catalog callers receive [`BridgeError`] and choose their
-//! own degradation policy.
+//! Wire contract lives in `pgext/walshadow.h`
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,13 +21,12 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 1;
 
-/// Matches the worker's `walshadow.max_request_mb` default. Larger frames are
-/// refused by the worker with a connection close, so refuse locally first
-const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+/// Match `WS_MAX_REQUEST_BYTES`
+pub const MAX_REQUEST_BYTES: usize = 256 * 1024 * 1024;
 /// Whole-catalog `pg_type` text output is the largest response in practice
 const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 /// Matches `WS_MAX_SCAN_OIDS`. A longer list is the caller's to chunk, since
@@ -41,12 +37,12 @@ pub const MAX_SCAN_OIDS: usize = 65536;
 #[repr(u8)]
 pub enum Op {
     Hello = 0x01,
-    Decode = 0x02,
+    EncodeNative = 0x02,
     Scan = 0x03,
     ReplayLsn = 0x04,
 }
 
-pub const OP_LABELS: [&str; 4] = ["hello", "decode", "scan", "replay_lsn"];
+pub const OP_LABELS: [&str; 4] = ["hello", "encode_native", "scan", "replay_lsn"];
 pub const OP_COUNT: usize = OP_LABELS.len();
 
 impl Op {
@@ -120,6 +116,13 @@ pub enum BridgeError {
     ReplayMismatch { expected: u64, start: u64, end: u64 },
 }
 
+impl BridgeError {
+    /// Return whether socket can no longer carry requests
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Protocol(_))
+    }
+}
+
 /// Worker identity, captured by `HELLO` and re-verified on every reconnect
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hello {
@@ -129,12 +132,16 @@ pub struct Hello {
     pub in_recovery: bool,
 }
 
-/// One `DECODE` item. `Error` carries the `typoutput` failure verbatim; the
-/// batch around it still completed
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DecodedItem {
-    Text(String),
-    Error(String),
+/// Own response frame backing borrowed Native block
+#[derive(Clone, Debug)]
+pub struct NativeResponse {
+    frame: Vec<u8>,
+}
+
+impl NativeResponse {
+    pub fn bytes(&self) -> &[u8] {
+        &self.frame[1..]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -162,8 +169,7 @@ crate::atomic_stats! {
         /// Scans that found replay off the position the read pinned. Committed
         /// reads answer these off SQL instead; overlay reads fail
         pub scan_replay_moved,
-        pub decode_items,
-        pub decode_item_errors,
+        pub native_bytes,
         /// Per-op, indexed by [`OP_LABELS`]
         pub requests: [AtomicU64; OP_COUNT],
         pub errors: [AtomicU64; OP_COUNT],
@@ -182,10 +188,9 @@ impl BridgeStats {
                 write!(&mut s, " {label}={n}").unwrap();
             }
         }
-        let pairs: [(&str, u64); 5] = [
+        let pairs: [(&str, u64); 4] = [
             ("err", self.errors.iter().map(ld).sum()),
             ("reconn", ld(&self.reconnects)),
-            ("item_err", ld(&self.decode_item_errors)),
             ("mismatch", ld(&self.scan_subtrans_mismatch)),
             ("replay_moved", ld(&self.scan_replay_moved)),
         ];
@@ -243,50 +248,13 @@ impl Bridge {
         Cursor::at(&body, 1).u64()
     }
 
-    /// Render on-disk bytes through each type's `typoutput`. Item bytes are
-    /// the varlena body with its header stripped, as
-    /// [`ColumnValue::PgPending`](crate::decode::heap_decoder::ColumnValue)
-    /// carries it; the worker wraps a fresh header
-    pub async fn decode(&self, items: &[(u32, &[u8])]) -> Result<Vec<DecodedItem>, BridgeError> {
-        let size: usize = items.iter().map(|(_, raw)| raw.len() + 8).sum();
-        let mut payload = Vec::with_capacity(4 + size);
-        payload.extend_from_slice(&(items.len() as u32).to_be_bytes());
-        for (type_oid, raw) in items {
-            payload.extend_from_slice(&type_oid.to_be_bytes());
-            payload.extend_from_slice(&(raw.len() as u32).to_be_bytes());
-            payload.extend_from_slice(raw);
-        }
-
-        let body = self.call(Op::Decode, &payload).await?;
-        let mut c = Cursor::at(&body, 1);
-        let n = c.u32()? as usize;
-        if n != items.len() {
-            return Err(BridgeError::Protocol(format!(
-                "decode answered {n} items for {} sent",
-                items.len()
-            )));
-        }
-        let mut out = Vec::with_capacity(n);
-        let mut item_errors = 0u64;
-        for _ in 0..n {
-            let kind = c.u8()?;
-            let text = c.lenstr()?;
-            out.push(match kind {
-                0 => DecodedItem::Text(text),
-                1 => {
-                    item_errors += 1;
-                    DecodedItem::Error(text)
-                }
-                k => return Err(BridgeError::Protocol(format!("decode item kind {k}"))),
-            });
-        }
+    /// Return response remainder as one locally framed Native block
+    pub async fn encode_native(&self, payload: &[u8]) -> Result<NativeResponse, BridgeError> {
+        let frame = self.call(Op::EncodeNative, payload).await?;
         self.stats
-            .decode_items
-            .fetch_add(n as u64, Ordering::Relaxed);
-        self.stats
-            .decode_item_errors
-            .fetch_add(item_errors, Ordering::Relaxed);
-        Ok(out)
+            .native_bytes
+            .fetch_add((frame.len() - 1) as u64, Ordering::Relaxed);
+        Ok(NativeResponse { frame })
     }
 
     /// Read `cat` as transaction `top_xid` sees it, or the committed view when
@@ -491,10 +459,8 @@ impl Bridge {
     }
 }
 
-/// Errors that mean the socket is unusable, as opposed to a worker that
-/// answered and said no
 fn is_transport_error(res: &Result<Vec<u8>, BridgeError>) -> bool {
-    matches!(res, Err(BridgeError::Io(_)) | Err(BridgeError::Protocol(_)))
+    matches!(res, Err(e) if e.is_transport())
 }
 
 async fn round_trip(
@@ -972,34 +938,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn decode_round_trip_maps_item_kinds() {
+    async fn encode_native_returns_the_frame_past_the_status() {
+        let native = b"native-block-bytes".to_vec();
         let mut body = vec![0u8];
-        body.extend_from_slice(&2u32.to_be_bytes());
-        body.push(0);
-        body.extend_from_slice(&2u32.to_be_bytes());
-        body.extend_from_slice(b"42");
-        body.push(1);
-        body.extend_from_slice(&4u32.to_be_bytes());
-        body.extend_from_slice(b"boom");
+        body.extend_from_slice(&native);
         let (_tmp, path) = spawn_worker(vec![
             Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
             Some(body),
         ]);
 
         let bridge = Bridge::connect(&path).await.unwrap();
-        let out = bridge
-            .decode(&[(23, &[42, 0, 0, 0]), (114, &[1])])
-            .await
-            .unwrap();
+        let out = bridge.encode_native(&[0u8; 8]).await.unwrap();
+        assert_eq!(out.bytes(), &native[..]);
         assert_eq!(
-            out,
-            vec![
-                DecodedItem::Text("42".to_string()),
-                DecodedItem::Error("boom".to_string()),
-            ]
+            bridge.stats.native_bytes.load(Ordering::Relaxed),
+            native.len() as u64
         );
-        assert_eq!(bridge.stats.decode_items.load(Ordering::Relaxed), 2);
-        assert_eq!(bridge.stats.decode_item_errors.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1089,7 +1043,7 @@ mod tests {
 
         let bridge = Bridge::connect(&path).await.unwrap();
         let huge = vec![0u8; MAX_REQUEST_BYTES];
-        let err = bridge.decode(&[(23, &huge)]).await.unwrap_err();
+        let err = bridge.encode_native(&huge).await.unwrap_err();
         assert!(
             matches!(err, BridgeError::RequestTooLarge { .. }),
             "got {err:?}"

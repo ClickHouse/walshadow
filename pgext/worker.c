@@ -59,7 +59,6 @@ static char *ws_socket_path = NULL;
 static char *ws_database = NULL;
 static int	ws_io_timeout_ms = 30000;
 static int	ws_lock_timeout_ms = 1000;
-static int	ws_max_request_mb = 64;
 
 static MemoryContext ws_request_ctx = NULL;
 static char ws_bound_path[MAXPGPATH];
@@ -157,8 +156,7 @@ ws_listen(const char *path)
 	strlcpy(ws_bound_path, path, sizeof(ws_bound_path));
 	on_proc_exit(ws_unlink_socket, 0);
 
-	/* Decode runs arbitrary typoutput over caller-supplied bytes and the scan
-	 * reads any catalog row, so the socket is owner-only. */
+	/* Protect Datum reconstruction and unrestricted catalog scans */
 	if (chmod(path, S_IRUSR | S_IWUSR) < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -310,70 +308,6 @@ ws_put_lenstr(StringInfo out, const char *s)
 }
 
 static void
-ws_handle_decode(StringInfo req, StringInfo resp)
-{
-	uint32		nitems = pq_getmsgint(req, 4);
-	uint32		i;
-
-	pq_sendbyte(resp, WS_STATUS_OK);
-	pq_sendint32(resp, nitems);
-
-	for (i = 0; i < nitems; i++)
-	{
-		Oid			typoid = (Oid) pq_getmsgint(req, 4);
-		uint32		len = pq_getmsgint(req, 4);
-		const char *bytes = pq_getmsgbytes(req, (int) len);
-		MemoryContext oldctx = CurrentMemoryContext;
-		ResourceOwner oldowner = CurrentResourceOwner;
-		int			mark = resp->len;
-
-		/*
-		 * typoutput on bytes walshadow reconstructed from WAL can raise on
-		 * anything from a short body to a type whose input assumptions the
-		 * decoder got wrong. One bad value must not cost the batch.
-		 */
-		BeginInternalSubTransaction(NULL);
-		MemoryContextSwitchTo(oldctx);
-		PG_TRY();
-		{
-			bytea	   *raw = (bytea *) palloc(VARHDRSZ + len);
-			char	   *txt;
-
-			SET_VARSIZE(raw, VARHDRSZ + len);
-			memcpy(VARDATA(raw), bytes, len);
-
-			/* Decode before writing the marker: a throw mid-item must not
-			 * leave a half-written item behind. */
-			txt = ws_decode_datum_text(typoid, raw);
-			pq_sendbyte(resp, WS_ITEM_TEXT);
-			ws_put_lenstr(resp, txt);
-
-			ReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(oldctx);
-			CurrentResourceOwner = oldowner;
-		}
-		PG_CATCH();
-		{
-			ErrorData  *edata;
-
-			MemoryContextSwitchTo(oldctx);
-			edata = CopyErrorData();
-			FlushErrorState();
-			RollbackAndReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(oldctx);
-			CurrentResourceOwner = oldowner;
-
-			resp->len = mark;
-			resp->data[mark] = '\0';
-			pq_sendbyte(resp, WS_ITEM_ERROR);
-			ws_put_lenstr(resp, edata->message);
-			FreeErrorData(edata);
-		}
-		PG_END_TRY();
-	}
-}
-
-static void
 ws_handle_scan(StringInfo req, StringInfo resp)
 {
 	WsCatalog	cat = (WsCatalog) pq_getmsgbyte(req);
@@ -435,7 +369,7 @@ ws_dispatch(StringInfo req, StringInfo resp)
 	{
 		uint8		op = pq_getmsgbyte(req);
 
-		if (op == WS_OP_DECODE || op == WS_OP_SCAN)
+		if (op == WS_OP_ENCODE_NATIVE || op == WS_OP_SCAN)
 		{
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();
@@ -456,8 +390,8 @@ ws_dispatch(StringInfo req, StringInfo resp)
 				pq_sendbyte(resp, WS_STATUS_OK);
 				pq_sendint64(resp, (uint64) GetXLogReplayRecPtr(NULL));
 				break;
-			case WS_OP_DECODE:
-				ws_handle_decode(req, resp);
+			case WS_OP_ENCODE_NATIVE:
+				ws_handle_encode_native(req, resp);
 				break;
 			case WS_OP_SCAN:
 				ws_handle_scan(req, resp);
@@ -491,7 +425,16 @@ ws_dispatch(StringInfo req, StringInfo resp)
 
 		resetStringInfo(resp);
 		pq_sendbyte(resp, WS_STATUS_ERROR);
-		ws_put_lenstr(resp, edata->message);
+		if (edata->context)
+		{
+			/* Preserve cell coordinates carried by error context */
+			char	   *msg = psprintf("%s (%s)", edata->message, edata->context);
+
+			ws_put_lenstr(resp, msg);
+			pfree(msg);
+		}
+		else
+			ws_put_lenstr(resp, edata->message);
 		FreeErrorData(edata);
 		RESUME_INTERRUPTS();
 	}
@@ -509,9 +452,6 @@ ws_serve_request(pgsocket fd)
 {
 	uint32		hdr;
 	uint32		len;
-	/* enlargeStringInfo ERRORs at MaxAllocSize, and that would happen outside
-	 * the request catch; reject before allocating */
-	Size		max_len = Min((Size) ws_max_request_mb << 20, MaxAllocSize - 1);
 	StringInfoData req;
 	StringInfoData resp;
 	MemoryContext oldctx;
@@ -521,7 +461,11 @@ ws_serve_request(pgsocket fd)
 		return false;
 	len = pg_ntoh32(hdr);
 
-	if (len < 1 || (Size) len > max_len)
+	/* enlargeStringInfo ERRORs at MaxAllocSize, and that would happen outside
+	 * the request catch; reject before allocating */
+	StaticAssertStmt(WS_MAX_REQUEST_BYTES < MaxAllocSize,
+					 "request ceiling must leave StringInfo room");
+	if (len < 1 || (Size) len > (Size) WS_MAX_REQUEST_BYTES)
 	{
 		ereport(LOG,
 				(errmsg("walshadow: rejecting request frame of %u bytes", len)));
@@ -771,13 +715,6 @@ _PG_init(void)
 							&ws_lock_timeout_ms,
 							1000, 0, INT_MAX,
 							PGC_POSTMASTER, GUC_UNIT_MS,
-							NULL, NULL, NULL);
-	DefineCustomIntVariable("walshadow.max_request_mb",
-							"Largest request frame the bridge accepts.",
-							NULL,
-							&ws_max_request_mb,
-							64, 1, 1024,
-							PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("walshadow");

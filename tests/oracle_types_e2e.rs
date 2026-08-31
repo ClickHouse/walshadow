@@ -1,8 +1,6 @@
-//! Oracle-path types (arrays/enums/geometric/pgvector), end-to-end: they decode
-//! to `PgPending`/`Unsupported` and resolve through the bridge worker preloaded
-//! into the shadow standby, so `pgext` must be built (`make -C pgext`);
-//! pgvector also needs `vector` installed on source. Resolved text matches PG
-//! `typoutput`.
+//! Oracle type integration tests
+//!
+//! Require built `pgext` and source extensions used by each test
 
 #![cfg(target_os = "linux")]
 
@@ -58,6 +56,26 @@ async fn run_oracle(
     mappings: Vec<fx::TableMappingSpec>,
     workload: &str,
 ) -> (Shadow, fx::ChServer, tempfile::TempDir) {
+    let (source, ch, tmp, _oracle) = run_oracle_stats(
+        slot,
+        app_name,
+        schema_sql,
+        ch_create_sql,
+        mappings,
+        workload,
+    )
+    .await;
+    (source, ch, tmp)
+}
+
+async fn run_oracle_stats(
+    slot: fx::Ports,
+    app_name: &str,
+    schema_sql: &str,
+    ch_create_sql: &str,
+    mappings: Vec<fx::TableMappingSpec>,
+    workload: &str,
+) -> (Shadow, fx::ChServer, tempfile::TempDir, Arc<Oracle>) {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -90,7 +108,7 @@ async fn run_oracle(
         bridge.info().expect("hello").in_recovery,
         "shadow must serve decode while in recovery",
     );
-    let oracle = Oracle::new(Arc::new(bridge));
+    let oracle = Arc::new(Oracle::new(Arc::new(bridge)));
 
     let mut pipeline = fx::build_pipeline_with_oracle(
         fx::BuildPipelineArgs {
@@ -105,7 +123,7 @@ async fn run_oracle(
             app_name,
             ddl: None,
         },
-        Arc::new(oracle),
+        oracle.clone(),
     )
     .await;
 
@@ -122,7 +140,7 @@ async fn run_oracle(
     pipeline.shutdown().await.expect("pipeline drains clean");
     let _ = shadow.stop();
 
-    (source, ch, tmp)
+    (source, ch, tmp, oracle)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -174,6 +192,199 @@ async fn arrays_resolve_via_oracle() {
         vec!["{1,NULL,3}", "{x,NULL}", "<null>"],
         "NULL elements + SQL NULL array",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_array_targets_carry_elements_and_nulls() {
+    if skip_gate() {
+        return;
+    }
+    let (source, ch, _tmp) = run_oracle(
+        fx::Ports::alloc(),
+        "walshadow-oracle-native-arrays",
+        "CREATE TABLE public.na (\
+            id int PRIMARY KEY, ints int[], texts text[], opt int[], ids uuid[]);\n",
+        "CREATE OR REPLACE TABLE walshadow_test.na (\
+            id Int32, ints Array(Int32), texts Array(String), \
+            opt Array(Nullable(Int32)), ids Array(UUID),\
+            _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "na"),
+            target_table: TableTarget::new("walshadow_test", "na"),
+            columns: vec![
+                col(1, "id", "Int32"),
+                col(2, "ints", "Array(Int32)"),
+                col(3, "texts", "Array(String)"),
+                col(4, "opt", "Array(Nullable(Int32))"),
+                col(5, "ids", "Array(UUID)"),
+            ],
+        }],
+        "INSERT INTO public.na VALUES \
+            (1, '{1,2,3}', '{a,\"b,c\"}', '{1,NULL,3}', \
+                '{00112233-4455-6677-8899-aabbccddeeff}'),\
+            (2, '{}', '{}', '{}', '{}'),\
+            (3, NULL, NULL, NULL, NULL);\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    let row = |id: i32| -> String {
+        ch.query(&format!(
+            "SELECT ints, texts, opt, ids FROM walshadow_test.na FINAL \
+             WHERE id = {id} AND _is_deleted = 0"
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        row(1),
+        "[1,2,3]\t[\'a\',\'b,c\']\t[1,NULL,3]\t[\'00112233-4455-6677-8899-aabbccddeeff\']",
+    );
+    assert_eq!(row(2), "[]\t[]\t[]\t[]", "empty arrays");
+    // CH forbids Nullable(Array), so a SQL NULL array lands empty
+    assert_eq!(row(3), "[]\t[]\t[]\t[]", "NULL array");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hstore_maps_through_the_extension_expander() {
+    if skip_gate() || !extension_available("hstore") {
+        eprintln!("skip: hstore extension not installed");
+        return;
+    }
+    let (source, ch, _tmp) = run_oracle(
+        fx::Ports::alloc(),
+        "walshadow-oracle-hstore",
+        "CREATE EXTENSION hstore;\n\
+         CREATE TABLE public.hs (id int PRIMARY KEY, h hstore);\n",
+        "CREATE OR REPLACE TABLE walshadow_test.hs (\
+            id Int32, h Map(String, Nullable(String)),\
+            _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "hs"),
+            target_table: TableTarget::new("walshadow_test", "hs"),
+            columns: vec![
+                col(1, "id", "Int32"),
+                col(2, "h", "Map(String, Nullable(String))"),
+            ],
+        }],
+        "INSERT INTO public.hs VALUES \
+            (1, '\"a=>b\" => \"c,d\", e => NULL, f => \"\"'),\
+            (2, ''),\
+            (3, NULL);\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    // hstore is unordered, so read keys sorted and values by key
+    let row = |id: i32, expr: &str| -> String {
+        ch.query(&format!(
+            "SELECT {expr} FROM walshadow_test.hs FINAL WHERE id = {id} AND _is_deleted = 0"
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        row(
+            1,
+            "arraySort(mapKeys(h)), h['a=>b'], isNull(h['e']), concat('<', h['f'], '>')"
+        ),
+        "['a=>b','e','f']\tc,d\t1\t<>",
+        "separators, NULL value, and empty value survive",
+    );
+    assert_eq!(row(2, "h"), "{}", "empty hstore");
+    assert_eq!(row(3, "h"), "{}", "SQL NULL hstore");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn json_targets_take_every_json_shape() {
+    if skip_gate() {
+        return;
+    }
+    let (source, ch, _tmp) = run_oracle(
+        fx::Ports::alloc(),
+        "walshadow-oracle-json",
+        "CREATE TABLE public.js (id int PRIMARY KEY, b jsonb, j json);\n",
+        "CREATE OR REPLACE TABLE walshadow_test.js (\
+            id Int32, b JSON, j JSON,\
+            _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "js"),
+            target_table: TableTarget::new("walshadow_test", "js"),
+            columns: vec![
+                col(1, "id", "Int32"),
+                col(2, "b", "JSON"),
+                col(3, "j", "JSON"),
+            ],
+        }],
+        "INSERT INTO public.js VALUES \
+            (1, '{\"a\": 1}', '{\"b\": [1,2]}'),\
+            (2, NULL, NULL);\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        ch.query("SELECT b.a, j.b FROM walshadow_test.js FINAL WHERE id = 1 AND _is_deleted = 0")
+            .unwrap(),
+        "1\t[1,2]",
+        "JSON paths resolve, so the column really is typed JSON",
+    );
+    // Non-nullable JSON cannot hold NULL; an absent value is the empty object
+    assert_eq!(
+        ch.query(
+            "SELECT toString(b) FROM walshadow_test.js FINAL WHERE id = 2 AND _is_deleted = 0"
+        )
+        .unwrap(),
+        "{}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_request_covers_a_whole_sealed_batch() {
+    if skip_gate() {
+        return;
+    }
+    const ROWS: u64 = 200;
+    let (source, ch, _tmp, oracle) = run_oracle_stats(
+        fx::Ports::alloc(),
+        "walshadow-oracle-batching",
+        "CREATE TABLE public.bt (id int PRIMARY KEY, tags int[]);\n",
+        "CREATE OR REPLACE TABLE walshadow_test.bt (\
+            id Int32, tags Array(Int32),\
+            _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "bt"),
+            target_table: TableTarget::new("walshadow_test", "bt"),
+            columns: vec![col(1, "id", "Int32"), col(2, "tags", "Array(Int32)")],
+        }],
+        &format!(
+            "INSERT INTO public.bt SELECT g, ARRAY[g, g + 1] FROM generate_series(1, {ROWS}) g;\n\
+             SELECT pg_switch_wal();\n"
+        ),
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        ch.query("SELECT count(), sum(tags[1]) FROM walshadow_test.bt FINAL WHERE _is_deleted = 0")
+            .unwrap(),
+        format!("{ROWS}\t{}", ROWS * (ROWS + 1) / 2),
+    );
+
+    use std::sync::atomic::Ordering;
+    let blocks = oracle.stats.blocks.load(Ordering::Relaxed);
+    let rows = oracle.stats.rows.load(Ordering::Relaxed);
+    assert_eq!(rows, ROWS, "every row went through the oracle");
+    assert!(
+        blocks < ROWS / 10,
+        "{blocks} requests for {rows} rows reads as per-row, not per-batch",
+    );
+    assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -32,7 +32,7 @@ use tokio::time::Instant;
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
 use crate::emit::ch_emitter::{
-    ColumnBuf, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TablePlan,
+    Append, ColumnBuf, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TablePlan,
 };
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
@@ -327,6 +327,24 @@ async fn handle_row(
             })
         }
     };
+    let op = match row.committed.decoded.op {
+        HeapOp::Insert => OP_INSERT,
+        HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
+        HeapOp::Delete => OP_DELETE,
+        // TRUNCATE is a reorder barrier; must never route here
+        HeapOp::Truncate => return Err("TRUNCATE routed to batcher".into()),
+    };
+    // Seal before appending row that exceeds oracle frame threshold
+    let append = t
+        .enc
+        .append_row(&row.committed, &row.route.mapping, op)
+        .map_err(|e| e.to_string())?;
+    if append == Append::Full {
+        emit_batch(t, ctx.out, ctx.stats).await?;
+        t.enc
+            .append_row(&row.committed, &row.route.mapping, op)
+            .map_err(|e| e.to_string())?;
+    }
     // Every row of a chunk shares one permit, so the tail entry settles it:
     // pushes for this table come only from this table's rows, and a seal
     // clears the list so the next batch takes its own hold
@@ -340,16 +358,6 @@ async fn handle_row(
     if let Some(p) = row.value_permit {
         t.value_permits.push(p);
     }
-    let op = match row.committed.decoded.op {
-        HeapOp::Insert => OP_INSERT,
-        HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
-        HeapOp::Delete => OP_DELETE,
-        // TRUNCATE is a reorder barrier; must never route here
-        HeapOp::Truncate => return Err("TRUNCATE routed to batcher".into()),
-    };
-    t.enc
-        .append_row(&row.committed, &row.route.mapping, op)
-        .map_err(|e| e.to_string())?;
     match t.seq_counts.last_mut() {
         Some((s, c)) if *s == row.seq => *c += 1,
         _ => t.seq_counts.push((row.seq, 1)),

@@ -320,7 +320,7 @@ barrier. Variants (see diagram legend for trigger → DDL mapping):
 
 ## Namespace mapping gaps
 
-`NamespaceMapping` ([src/ch_emitter.rs](../src/ch_emitter.rs)) carries
+`NamespaceMapping` ([src/emit/ch_emitter.rs](../src/emit/ch_emitter.rs)) carries
 `auto_create`, `target_database`, and `drop_table_strategy` (the latter two
 resolved per-namespace in `DdlApplicator`); `type_overrides`,
 `order_by_default`, and `engine_default` are not covered. The
