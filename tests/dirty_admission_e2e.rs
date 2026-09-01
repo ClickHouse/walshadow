@@ -17,7 +17,7 @@ use fx::spawn_txn;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use walshadow::mapping::{NamespaceMapping, ToastMode};
+use walshadow::mapping::NamespaceMapping;
 use walshadow::shadow::Shadow;
 
 fn skip_gate() -> bool {
@@ -643,7 +643,7 @@ async fn ddl_then_toasted_insert_keeps_existing_toast_generation() {
          ALTER TABLE dtd.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n",
         "dtd",
         "walshadow-dirty-toast",
-        |cfg| cfg.toast.mode = ToastMode::ClickHouse,
+        |_cfg| {},
     )
     .await;
 

@@ -42,7 +42,6 @@ mod fx;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use walshadow::mapping::ToastMode;
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
@@ -177,9 +176,7 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
             app_name: "walshadow-toast-tombstone",
             ddl: Some(fx::DdlPipelineArgs::default()),
         },
-        move |cfg| {
-            cfg.toast.mode = ToastMode::ClickHouse;
-        },
+        move |_cfg| {},
     )
     .await;
     let stats = pipeline.stats.clone();

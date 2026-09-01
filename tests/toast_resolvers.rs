@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::mapping::ToastMode;
 use walshadow::spill::ToastDelete;
 use walshadow::toast::{
     ChunkStore, ChunkStoreError, ClickHouseChunkStore, FetchedValue, ToastResolver, ToastRow,
@@ -455,8 +454,7 @@ async fn ch_resolver_put_rows_then_fetch_into() {
     ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
         .expect("create db");
 
-    let mut cfg = config(ch.port);
-    cfg.toast.mode = ToastMode::ClickHouse;
+    let cfg = config(ch.port);
     let stats = Arc::new(EmitterStats::default());
     let resolver = ToastResolver::from_config(&cfg, stats.clone());
     assert!(resolver.stores_chunks());
@@ -465,10 +463,8 @@ async fn ch_resolver_put_rows_then_fetch_into() {
 
 #[tokio::test]
 async fn disabled_resolver_no_store_fills_on_miss() {
-    // ToastMode::Disabled is the config default.
-    let cfg = EmitterConfig::default();
     let stats = Arc::new(EmitterStats::default());
-    let resolver = ToastResolver::from_config(&cfg, stats.clone());
+    let resolver = ToastResolver::disabled().with_stats(stats.clone());
     assert!(!resolver.stores_chunks());
     assert!(resolver.fill_on_miss());
 

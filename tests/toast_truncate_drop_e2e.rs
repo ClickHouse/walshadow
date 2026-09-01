@@ -24,7 +24,6 @@ mod fx;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use walshadow::mapping::ToastMode;
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
@@ -130,9 +129,7 @@ async fn cold_restart_drop_retires_mirror() {
             app_name: "walshadow-toast-cold-restart-1",
             ddl: Some(fx::DdlPipelineArgs::default()),
         },
-        move |cfg| {
-            cfg.toast.mode = ToastMode::ClickHouse;
-        },
+        move |_cfg| {},
     )
     .await;
 
@@ -173,9 +170,7 @@ async fn cold_restart_drop_retires_mirror() {
             app_name: "walshadow-toast-cold-restart-2",
             ddl: Some(fx::DdlPipelineArgs::default()),
         },
-        move |cfg| {
-            cfg.toast.mode = ToastMode::ClickHouse;
-        },
+        move |_cfg| {},
     )
     .await;
 
@@ -298,9 +293,7 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
                 app_name: "walshadow-toast-crash-replay",
                 ddl: Some(fx::DdlPipelineArgs::default()),
             },
-            move |cfg| {
-                cfg.toast.mode = ToastMode::ClickHouse;
-            },
+            move |_cfg| {},
         )
     };
     let mut pipeline = build(shadow_stream_state.clone()).await;
@@ -460,9 +453,7 @@ async fn drop_retire_survives_restart_from_ledger() {
                 app_name,
                 ddl: Some(fx::DdlPipelineArgs::default()),
             },
-            move |cfg| {
-                cfg.toast.mode = ToastMode::ClickHouse;
-            },
+            move |_cfg| {},
         )
     };
 

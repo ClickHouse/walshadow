@@ -23,7 +23,6 @@ use std::time::Duration;
 
 use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
-use walshadow::mapping::ToastMode;
 use walshadow::schema::RelName;
 
 /// 16 bytes * 512 = 8192, comfortably past the ~2KB toast threshold and
@@ -116,7 +115,7 @@ async fn replident_full_unchanged_toast_update() {
             app_name: "walshadow-toast-rif",
             ddl: None,
         },
-        |cfg| cfg.toast.mode = ToastMode::ClickHouse,
+        |_cfg| {},
     )
     .await;
 

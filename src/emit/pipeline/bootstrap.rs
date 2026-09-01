@@ -362,7 +362,6 @@ fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastR
 mod tests {
     use super::*;
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
-    use crate::emit::ch_emitter::EmitterConfig;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
 
     /// Mem-only under the default threshold; path never created
@@ -684,8 +683,7 @@ mod tests {
         drop(tup_tx);
 
         let stats = Arc::new(EmitterStats::default());
-        // from_config (not disabled()) so the resolver shares this stats handle
-        let resolver = ToastResolver::from_config(&EmitterConfig::default(), stats.clone());
+        let resolver = ToastResolver::disabled().with_stats(stats.clone());
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,

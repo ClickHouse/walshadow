@@ -39,7 +39,7 @@ use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
-    TableMapping, TableTarget, ToastConfig, ToastMode,
+    TableMapping, TableTarget,
 };
 use crate::runtime_config::{InitialLoadMode, TableRow};
 use crate::schema::{RelDescriptor, RelName};
@@ -158,9 +158,6 @@ pub struct EmitterConfig {
     /// per row, and whether the delete marker exists. Boot-only; per-relation
     /// renames layer over it via `table_entries` / `config_table`
     pub system_columns: Arc<SystemColumns>,
-    /// Where externally-TOASTed chunks live + miss policy. `[toast]` block;
-    /// default disabled (NULL/default-fill unrecoverable values)
-    pub toast: ToastConfig,
     /// Rows a decode worker coalesces before routing one chunk to the
     /// batcher (`DEFAULT_DECODE_CHUNK_ROWS`). Tunable so
     /// tests can trip the mid-loop flush without a huge xact.
@@ -329,7 +326,6 @@ impl Default for EmitterConfig {
             idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
             soft_delete: false,
             system_columns: Arc::default(),
-            toast: ToastConfig::default(),
             decode_chunk_rows: DEFAULT_DECODE_CHUNK_ROWS,
             drain_batch_rows: DEFAULT_DRAIN_BATCH_ROWS,
             drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
@@ -526,8 +522,6 @@ struct ConfigDocument {
     #[serde(default)]
     ch: ChPatch,
     #[serde(default)]
-    toast: ToastPatch,
-    #[serde(default)]
     memory: MemoryPatch,
     #[serde(default)]
     runtime_config: RuntimeConfigPatch,
@@ -572,12 +566,6 @@ struct ChPatch {
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     drop_table_strategy: Option<DropTableStrategy>,
     soft_delete: Option<bool>,
-}
-
-#[derive(Default, serde::Deserialize)]
-struct ToastPatch {
-    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
-    mode: Option<ToastMode>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -738,7 +726,6 @@ impl EmitterConfig {
             .validate()
             .map_err(EmitterError::Config)?;
         out.system_columns = Arc::new(doc.system_columns);
-        out.toast.mode = doc.toast.mode.unwrap_or(out.toast.mode);
         out.resident_payload_max = doc
             .memory
             .resident_payload_max
@@ -3366,16 +3353,8 @@ mod tests {
         );
         // soft_delete defaults off when the key is absent
         assert!(!c.soft_delete);
-        assert_eq!(c.toast.mode, crate::mapping::ToastMode::ClickHouse);
-        // Toast block omitted => disabled
-        assert_eq!(
-            EmitterConfig::from_toml_str("[ch]\n").unwrap().toast.mode,
-            crate::mapping::ToastMode::Disabled
-        );
         let empty = EmitterConfig::from_toml_str("[runtime_config]\nschema = \"\"\n").unwrap();
         assert!(empty.runtime_config_schema.is_none());
-        // Removed disk mode surfaces as a config error, not a silent default
-        assert!(EmitterConfig::from_toml_str("[ch]\n[toast]\nmode = \"disk\"\n").is_err());
     }
 
     #[test]
@@ -3868,7 +3847,6 @@ mod tests {
         for src in [
             "[ch]\ncompression = \"snappy\"\n",
             "[ch]\ndrop_table_strategy = \"dorp\"\n",
-            "[toast]\nmode = \"disk\"\n",
             "[bootstrap]\nmode = \"objectstore\"\n",
             "[bootstrap]\nobject_store_parallelism = 0\n",
             "[source]\nsslmode = \"maybe\"\n",

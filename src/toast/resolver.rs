@@ -24,9 +24,6 @@ use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
-#[cfg(test)]
-use crate::mapping::ToastConfig;
-use crate::mapping::ToastMode;
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -883,12 +880,8 @@ impl ToastResolver {
     }
 
     pub fn from_config(emitter: &EmitterConfig, stats: Arc<EmitterStats>) -> Self {
-        let store: Option<Arc<dyn ChunkStore>> = match emitter.toast.mode {
-            ToastMode::Disabled => None,
-            ToastMode::ClickHouse => Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
-        };
         Self {
-            store,
+            store: Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
             stats,
             inline_value_max: emitter.inline_value_max,
             budget: None,
@@ -908,6 +901,11 @@ impl ToastResolver {
     /// Leaf-permit pool, attached at pipeline spawn
     pub fn with_budget(mut self, budget: crate::budget::MemoryBudget) -> Self {
         self.budget = Some(budget);
+        self
+    }
+
+    pub fn with_stats(mut self, stats: Arc<EmitterStats>) -> Self {
+        self.stats = stats;
         self
     }
 
@@ -1440,14 +1438,6 @@ mod tests {
         assert_eq!(budget.resident_bytes(), 0, "nothing leaked");
     }
 
-    #[test]
-    fn toast_mode_parse_rejects_disk() {
-        assert!("disk".parse::<ToastMode>().is_err());
-        assert!("local".parse::<ToastMode>().is_err());
-        assert_eq!("ch".parse::<ToastMode>().unwrap(), ToastMode::ClickHouse);
-        assert_eq!("".parse::<ToastMode>().unwrap(), ToastMode::Disabled);
-    }
-
     #[tokio::test]
     async fn resolver_disabled_fills_on_miss_no_store() {
         let r = ToastResolver::disabled();
@@ -1605,12 +1595,7 @@ mod tests {
 
     #[test]
     fn ch_mode_builds_a_store() {
-        let cfg = EmitterConfig {
-            toast: ToastConfig {
-                mode: ToastMode::ClickHouse,
-            },
-            ..Default::default()
-        };
+        let cfg = EmitterConfig::default();
         let r = ToastResolver::from_config(&cfg, Arc::new(EmitterStats::default()));
         assert!(r.stores_chunks());
         assert!(!r.fill_on_miss());
