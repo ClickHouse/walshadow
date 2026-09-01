@@ -19,12 +19,13 @@ use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::emit::route::{RouteSnapshot, RowPolicy};
 use crate::mapping::{MappingHandle, TableMapping};
 use crate::ops::oracle::{Oracle, render_ext_columns, resolve_pending_tuple};
-use crate::schema::{RelAttr, RelDescriptor};
+use crate::schema::{RelAttr, RelDescriptor, RelName};
 use crate::toast::{
     CHUNK_PUT_BATCH, CHUNK_PUT_BYTES, FetchedValue, ToastResolver, ToastRow, check_value_caps,
     detoasted_value, finish_value, pointer_extsize,
 };
 use ahash::HashMap;
+use std::collections::HashSet;
 
 /// Completion frontier for `FlushAll` and resume advance
 #[derive(Debug, Clone, Copy, Default)]
@@ -50,6 +51,7 @@ pub async fn drain(
     row_policy: RowPolicy,
     config: Option<Arc<ResolvedConfig>>,
     oracle: Option<Arc<Oracle>>,
+    skip_initial: HashSet<RelName>,
 ) -> Result<BootstrapDrainOutcome, String> {
     // Routes frozen once per pass from the caller's config snapshot
     let routes: HashMap<_, _> = mapping_handle
@@ -96,6 +98,10 @@ pub async fn drain(
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
+
+        if skip_initial.contains(&rel.rel_name) {
+            continue;
+        }
 
         if catalog.is_toast(rfn.db_node, rfn.rel_node) {
             if let Some(row) = row_from_columns(tuple, rel.oid) {
@@ -586,6 +592,7 @@ mod tests {
             Default::default(),
             None,
             None,
+            std::collections::HashSet::new(),
         ));
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
@@ -639,6 +646,7 @@ mod tests {
             Default::default(),
             None,
             None,
+            std::collections::HashSet::new(),
         ));
 
         let mut seqs: Vec<u64> = Vec::new();
@@ -690,6 +698,7 @@ mod tests {
             Default::default(),
             None,
             None,
+            std::collections::HashSet::new(),
         ));
 
         let mut rows = Vec::new();
@@ -756,6 +765,7 @@ mod tests {
             Default::default(),
             None,
             None,
+            std::collections::HashSet::new(),
         ));
 
         let mut rows = Vec::new();
@@ -815,6 +825,7 @@ mod tests {
             Default::default(),
             None,
             None,
+            std::collections::HashSet::new(),
         ));
         // Wait for the referrer to defer, then unmap before walk EOF
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

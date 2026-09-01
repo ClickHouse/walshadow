@@ -58,6 +58,7 @@ async fn prepared_ddl_drains_at_commit_prepared() {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
             drop_table_strategy: None,
+            initial_load: None,
         },
     );
 

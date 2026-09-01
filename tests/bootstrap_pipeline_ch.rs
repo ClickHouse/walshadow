@@ -184,6 +184,7 @@ async fn bootstrap_tail_fans_out_n2() {
         Default::default(),
         None,
         None,
+        std::collections::HashSet::new(),
     ));
     let outcome = drain.await.expect("drain join").expect("drain ok");
     assert_eq!(outcome.next_seq, 2, "one seq per rfn");

@@ -1053,6 +1053,7 @@ mod tests {
                 target_database: Some("warehouse".into()),
                 auto_create: true,
                 drop_table_strategy: Some(DropTableStrategy::Drop),
+                initial_load: None,
             },
         );
         namespaces.insert(
@@ -1061,6 +1062,7 @@ mod tests {
                 target_database: None,
                 auto_create: true,
                 drop_table_strategy: None,
+                initial_load: None,
             },
         );
         let cfg = DdlConfig {
