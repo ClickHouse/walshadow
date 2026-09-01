@@ -888,6 +888,7 @@ async fn build_pipeline_inner(
                     &spill_dir,
                     Some(config_rx.clone()),
                     None,
+                    oracle.clone(),
                 )
                 .await,
             ))

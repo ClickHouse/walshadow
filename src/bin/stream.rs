@@ -47,6 +47,7 @@ use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
+use walrus::pg::replication::tls::SslMode;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -1604,6 +1605,7 @@ async fn run_session(
                 &args.spill_dir,
                 Some(config_rx.clone()),
                 Some(pipeline_budget.clone()),
+                oracle.clone(),
             )
             .await,
         ));
@@ -4318,6 +4320,39 @@ async fn run_bootstrap(
             "bootstrap insert tail started",
         );
 
+        let source_conninfo = format!(
+            "host={} port={} user={} dbname={} sslmode={}",
+            src_cfg.host,
+            src_cfg.port,
+            src_cfg.user,
+            src_cfg.database,
+            if src_cfg.sslmode == SslMode::Disable {
+                "disable"
+            } else {
+                "prefer"
+            },
+        );
+        let bootstrap_oracle =
+            if walshadow::backfill::bootstrap_oracle::needs_bridge(&drain_catalog) {
+                Some(
+                    walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
+                        args.spill_dir.join("bootstrap_oracle"),
+                        source_conninfo,
+                        src_cfg.password.clone(),
+                        args.bridge_lib_dir.clone(),
+                        Duration::from_secs(args.shadow_connect_timeout),
+                    )
+                    .await
+                    .context(
+                        "bootstrap oracle: greenfield needs it to resolve tier-3 types; \
+                     refusing to load empty columns",
+                    )?,
+                )
+            } else {
+                None
+            };
+        let oracle = bootstrap_oracle.as_ref().map(|o| o.oracle());
+
         let deferred_path = args.spill_dir.join("bootstrap_deferred.bin");
         tokio::fs::remove_file(&deferred_path).await.ok();
         let drain = tokio::spawn(bootstrap::drain(
@@ -4337,6 +4372,7 @@ async fn run_bootstrap(
             // snapshot the CREATEs above rendered from: per-relation system
             // column names have to match what CH now holds
             Some(resolved),
+            oracle,
         ));
         let (drain_res, pump_res) = tokio::join!(drain, pump);
         let drain_outcome = drain_res

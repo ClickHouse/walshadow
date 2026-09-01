@@ -405,34 +405,44 @@ impl Shadow {
     }
 
     pub fn start(&self) -> Result<()> {
+        self.start_with_opts(None)
+    }
+
+    pub fn start_binary_upgrade(&self) -> Result<()> {
+        self.start_with_opts(Some("-b"))
+    }
+
+    fn start_with_opts(&self, pg_opts: Option<&str>) -> Result<()> {
         let log = self.config.data_dir.join("startup.log");
-        let res = self.run(
-            "pg_ctl",
-            [
-                "-D",
-                self.config.data_str(),
-                "-l",
-                log.to_str().expect("non-utf8 log path"),
-                "-w",
-                "-t",
-                "86400",
-                "start",
-            ],
-        );
-        match res {
-            Ok(_) => Ok(()),
-            // pg_ctl only reports "could not start server"
-            // Include log where Postgres reports required GUC value
+        let log_str = log.to_str().expect("non-utf8 log path");
+        let mut args: Vec<&str> = vec![
+            "-D",
+            self.config.data_str(),
+            "-l",
+            log_str,
+            "-w",
+            "-t",
+            "86400",
+        ];
+        if let Some(o) = pg_opts {
+            args.push("-o");
+            args.push(o);
+        }
+        args.push("start");
+        let res = self.run("pg_ctl", args);
+        if let Err(ShadowError::Process {
+            cmd,
+            status,
+            stderr,
+        }) = res
+        {
             Err(ShadowError::Process {
                 cmd,
                 status,
-                stderr,
-            }) => Err(ShadowError::Process {
-                cmd,
-                status,
                 stderr: format!("{stderr}\nstartup.log tail:\n{}", log_tail(&log)),
-            }),
-            Err(e) => Err(e),
+            })
+        } else {
+            res.map(|_| ())
         }
     }
 
@@ -522,12 +532,15 @@ impl Shadow {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        child
-            .stdin
-            .as_mut()
-            .expect("piped")
-            .write_all(sql.as_bytes())?;
+        // Feed stdin from a thread while the parent drains stdout/stderr, or a
+        // dump large/noisy enough to fill psql's output pipe deadlocks the write.
+        let mut stdin = child.stdin.take().expect("piped");
+        let payload = sql.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
         let out = child.wait_with_output()?;
+        let _ = writer.join();
         self.check("psql -f -", out).map(|_| ())
     }
 

@@ -16,7 +16,6 @@ rationale under `plans/` only when code cannot express it
 * [failover.md](failover.md) — beyond the switchover crossing in [../failover.md](../failover.md): unplanned promotion (transaction-state fence, overwrite contrecord), slotless pause windows, timeline-aware archive and base-backup replay
 * [sync_commit_witness.md](sync_commit_witness.md) — walshadow as RPO=0 durability standby
 * [two_phase_commit.md](two_phase_commit.md) — `XLOG_XACT_PREPARE` handling and gxid-keyed buffer
-* [greenfield_oracle.md](greenfield_oracle.md) — resolve bridge-routed tier-3 (jsonb/arrays/hstore) during greenfield bootstrap via a throwaway PG (walshadow module + source extensions) torn down after; OID-matching constraint (restore-from-backup vs resolve-by-name)
 * [oracle_native_blocks.md](oracle_native_blocks.md) — bridge/pgext emits CH-native column bytes instead of `typoutput` text, batching `DECODE` from row-at-a-time to a column-major list of rows (matches CH's columnar block, amortizes the round trip); removes the emitter-side composite re-parse (`ColumnBuf::{Array,Map,Json}`, text parsers, `NodeArena`); does not solve greenfield
 * [ch_bounce_recovery.md](ch_bounce_recovery.md) — deeper re-emit-from-spill on retry-budget exhaustion
 * [pinned_ddl_baseline.md](pinned_ddl_baseline.md) — schema-event outcome must be a function of config + baseline, not cache warmth: CH-existence / persisted-baseline options for cross-restart consistency, drop detection across downtime, opt-in mapping vs republish

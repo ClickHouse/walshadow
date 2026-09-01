@@ -60,9 +60,9 @@ for `Text` on each item that rendered
 Both the live decode pool (`emit/pipeline/decode.rs`) and the object-store /
 COPY backfill paths call it, so backfilled rows resolve identically to
 streamed ones. **Greenfield bootstrap is the exception**: it runs before the
-shadow/bridge exist, so bridge-routed types there resolve to nothing (in-tree
-types still work) — the fix is
-[future/greenfield_oracle.md](future/greenfield_oracle.md).
+shadow/bridge exist, so it resolves them against a throwaway OID-exact side PG
+instead of the shadow — see the bootstrap oracle in
+[bootstrap.md](bootstrap.md).
 
 Two alternatives considered (insert + select round-trip;
 `SELECT $1::bytea::<typ>::text`) require reconstructing wire format from
