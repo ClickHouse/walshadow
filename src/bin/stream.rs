@@ -4353,6 +4353,27 @@ async fn run_bootstrap(
             };
         let oracle = bootstrap_oracle.as_ref().map(|o| o.oracle());
 
+        // `initial_load = "none"` (table override, else namespace) opts a
+        // relation out of the greenfield snapshot: create it + stream CDC, but
+        // don't page-walk its existing rows.
+        let skip_initial: std::collections::HashSet<_> = drain_catalog
+            .descriptors()
+            .filter_map(|d| {
+                let rn = &d.rel_name;
+                let none = match emitter_cfg.table_initial_loads.get(rn) {
+                    Some(s) => s.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
+                    None => {
+                        resolved
+                            .namespaces
+                            .get(rn.namespace.as_ref())
+                            .and_then(|n| n.initial_load)
+                            == Some(InitialLoadMode::None)
+                    }
+                };
+                none.then(|| rn.clone())
+            })
+            .collect();
+
         let deferred_path = args.spill_dir.join("bootstrap_deferred.bin");
         tokio::fs::remove_file(&deferred_path).await.ok();
         let drain = tokio::spawn(bootstrap::drain(
@@ -4373,6 +4394,7 @@ async fn run_bootstrap(
             // column names have to match what CH now holds
             Some(resolved),
             oracle,
+            skip_initial,
         ));
         let (drain_res, pump_res) = tokio::join!(drain, pump);
         let drain_outcome = drain_res

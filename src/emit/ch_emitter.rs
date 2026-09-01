@@ -606,6 +606,8 @@ struct NamespacePatch {
     auto_create: Option<bool>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     drop_table_strategy: Option<DropTableStrategy>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    initial_load: Option<InitialLoadMode>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -764,6 +766,7 @@ impl EmitterConfig {
                     target_database: n.target_database,
                     auto_create: n.auto_create.unwrap_or(false),
                     drop_table_strategy: n.drop_table_strategy,
+                    initial_load: n.initial_load,
                 },
             );
         }

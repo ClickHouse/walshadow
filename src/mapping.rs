@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
 use crate::column_rules::{ColumnRule, ColumnRules};
+use crate::runtime_config::InitialLoadMode;
 use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
 use crate::table_rules::set_if;
 use ahash::HashMap;
@@ -49,6 +50,7 @@ pub struct NamespaceMapping {
     pub target_database: Option<String>,
     pub auto_create: bool,
     pub drop_table_strategy: Option<DropTableStrategy>,
+    pub initial_load: Option<InitialLoadMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

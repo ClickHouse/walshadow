@@ -1077,6 +1077,7 @@ impl CopyBackfiller {
             self.emitter.row_policy(),
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
             None,
+            std::collections::HashSet::new(),
         ));
 
         let plan = column_plan(desc);

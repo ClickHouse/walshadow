@@ -70,6 +70,7 @@ async fn build_drill_with(
             target_database: Some("walshadow_test".into()),
             auto_create: true,
             drop_table_strategy: None,
+            initial_load: None,
         },
     );
 
