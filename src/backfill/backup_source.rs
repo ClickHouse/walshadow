@@ -163,7 +163,7 @@ pub(crate) fn tar_entry_meta<R: AsyncRead + Unpin>(
         return Ok(None);
     }
     let header = entry.header();
-    let size = header.size().unwrap_or(0);
+    let size = entry.effective_size();
     let mode = header.mode().unwrap_or(0o644);
     let etype = header.entry_type();
     let kind = if etype.is_dir() {
