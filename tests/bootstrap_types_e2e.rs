@@ -98,8 +98,7 @@ fn write_autocreate_config(path: &Path, ch_port: u16) -> Result<()> {
          compression = \"lz4\"\n\
          \n\
          [table.\"public\".\"all_types\"]\n\
-         replicate = true\n\
-         initial_load = \"none\"\n"
+         replicate = true\n"
     );
     fs::write(path, body).context("write ch-config")
 }

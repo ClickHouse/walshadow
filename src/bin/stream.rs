@@ -367,8 +367,11 @@ struct Args {
     shadow_port: u16,
     #[arg(long, default_value = "postgres")]
     shadow_user: String,
-    #[arg(long, default_value = "postgres")]
-    shadow_dbname: String,
+    /// Deprecated and ignored: the shadow is a physical clone of the source
+    /// cluster, so its catalog is resolved from the applied `[source] dbname`
+    /// (which is `--dbname` when no config overrides it). Setting it warns.
+    #[arg(long, hide = true)]
+    shadow_dbname: Option<String>,
     /// Wall-clock budget for the initial connect against shadow PG.
     /// Reused by [`with_transient_retry`] so a still-warming shadow
     /// doesn't fail the daemon on first boot.
@@ -776,6 +779,13 @@ fn validate_transport_args(args: &Args) -> Result<()> {
         args.catalog_hold_timeout > 0,
         "--catalog-hold-timeout must be positive",
     );
+    if let Some(db) = &args.shadow_dbname {
+        tracing::warn!(
+            target: "walshadow",
+            shadow_dbname = %db,
+            "--shadow-dbname is deprecated and ignored; the shadow catalog follows the applied [source] dbname",
+        );
+    }
     Ok(())
 }
 
@@ -965,7 +975,7 @@ async fn run_session(
     let shadow_lifecycle: Option<ShadowLifecycle> = match &shadow_start {
         ShadowStart::External => None,
         ShadowStart::Bootstrap(dir) | ShadowStart::Resume(dir) => {
-            let shadow = Arc::new(build_owned_shadow(args, dir.clone()));
+            let shadow = Arc::new(build_owned_shadow(args, &source_conn.dbname, dir.clone()));
             shadow
                 .write_standby_signal()
                 .context("write standby.signal")?;
@@ -1242,7 +1252,9 @@ async fn run_session(
             .context("shadow-socket-dir not UTF-8")?,
         args.shadow_port,
         &args.shadow_user,
-        &args.shadow_dbname,
+        // not args.dbname: [source] dbname merges over the flag, and
+        // set_target_db reads this client's oid
+        &source_conn.dbname,
     );
     let connect_budget = Duration::from_secs(args.shadow_connect_timeout);
     let bridge_path = args.bridge_socket_path();
@@ -1273,7 +1285,7 @@ async fn run_session(
         socket = %args.shadow_socket_dir.display(),
         port = args.shadow_port,
         user = %args.shadow_user,
-        dbname = %args.shadow_dbname,
+        dbname = %source_conn.dbname,
         "shadow connected",
     );
 
@@ -1289,7 +1301,7 @@ async fn run_session(
             &args.shadow_socket_dir,
             args.shadow_port,
             &args.shadow_user,
-            &args.shadow_dbname,
+            &source_conn.dbname,
         )
         .await?;
         let report = walshadow::preflight::run(walshadow::preflight::Inputs {
@@ -4375,7 +4387,12 @@ async fn run_bootstrap(
             .descriptors()
             .filter_map(|d| {
                 let rn = &d.rel_name;
-                let none = match emitter_cfg.table_initial_loads.get(rn) {
+                let table_mode = emitter_cfg
+                    .table_opt_ins
+                    .get(rn)
+                    .and_then(|r| r.initial_load.as_deref())
+                    .or_else(|| emitter_cfg.table_initial_loads.get(rn).map(String::as_str));
+                let none = match table_mode {
                     Some(s) => s.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
                     None => {
                         resolved
@@ -4632,13 +4649,13 @@ async fn prepare_bootstrap_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_owned_shadow(args: &Args, data_dir: PathBuf) -> Shadow {
+fn build_owned_shadow(args: &Args, dbname: &str, data_dir: PathBuf) -> Shadow {
     let mut cfg = ShadowConfig::new(data_dir, args.out_dir.clone());
     cfg.port = args.shadow_port;
     cfg.socket_dir = args.shadow_socket_dir.clone();
     cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
     cfg.user = args.shadow_user.clone();
-    cfg.dbname = args.shadow_dbname.clone();
+    cfg.dbname = dbname.to_string();
     // Only a shadow walshadow started can be given a preload line; External
     // clusters are the operator's to configure
     let mut bridge = walshadow::shadow::BridgeConf::in_dir(&cfg.socket_dir);
