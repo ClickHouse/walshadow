@@ -94,32 +94,6 @@ pub struct ColumnMapping {
     pub target_type: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ToastMode {
-    #[default]
-    Disabled,
-    ClickHouse,
-}
-
-impl std::str::FromStr for ToastMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "disabled" | "off" | "none" | "" => Ok(Self::Disabled),
-            "clickhouse" | "ch" => Ok(Self::ClickHouse),
-            other => Err(format!(
-                "unknown toast mode `{other}` (expected disabled / clickhouse)"
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ToastConfig {
-    pub mode: ToastMode,
-}
-
 /// Names of the columns walshadow appends to every replicated CH table, and
 /// whether the delete marker exists at all. `[system_columns]` sets the
 /// cluster-wide default; a `[table.*]` block or `config_table` row renames per

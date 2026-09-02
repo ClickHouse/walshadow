@@ -207,8 +207,13 @@ impl PipelineConfig {
 
         // One resolver shared by the decode pool (fetch on miss) and the
         // reorder coordinator (put per commit).
-        let resolver = crate::toast::ToastResolver::from_config(&emitter, stats.clone())
-            .with_budget(budget.clone());
+        // Metrics-only (Null tail) has no CH connection, so no chunk store.
+        let resolver = if matches!(tail, TailKind::Null) {
+            crate::toast::ToastResolver::disabled().with_stats(stats.clone())
+        } else {
+            crate::toast::ToastResolver::from_config(&emitter, stats.clone())
+        }
+        .with_budget(budget.clone());
 
         // Live emitter knobs (budgets/flush/compression/retry) reach the batcher
         // + inserter pool via this receiver; `None` keeps them at boot values.

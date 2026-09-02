@@ -35,7 +35,6 @@ mod fx;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use walshadow::mapping::ToastMode;
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
@@ -169,9 +168,7 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
             app_name: "walshadow-toast-rewrite",
             ddl: Some(fx::DdlPipelineArgs::default()),
         },
-        move |cfg| {
-            cfg.toast.mode = ToastMode::ClickHouse;
-        },
+        move |_cfg| {},
     )
     .await;
     let stats = pipeline.stats.clone();
@@ -519,9 +516,7 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
             app_name: "walshadow-toast-alter-rewrite",
             ddl: Some(fx::DdlPipelineArgs::default()),
         },
-        move |cfg| {
-            cfg.toast.mode = ToastMode::ClickHouse;
-        },
+        move |_cfg| {},
     )
     .await;
     let stats = pipeline.stats.clone();
