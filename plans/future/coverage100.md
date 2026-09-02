@@ -13,7 +13,7 @@ on files, functions, branches, and observable behavior
 Use line coverage as target metric. Function coverage helps find untouched
 routines, but hides missed match arms inside already-hit functions
 
-Refreshed 2026-06-26 from CI `line coverage (pg17)` job (run 28219022837).
+Refreshed 2026-06-26 from CI run 28219022837, PG 17 alone.
 
 - **Target:** 89.49% line coverage (17602 / 19670), 2068 missed lines from
   `cargo llvm-cov report --summary-only`. Use this denominator for
@@ -30,7 +30,7 @@ Real work is **2068 missed executable lines**, not the inflated monomorphized
 `FN` count.
 
 Regenerate locally with CI coverage recipe, PG 17 and ClickHouse running, see
-`.github/workflows/ci.yml` `coverage:` job:
+`.github/workflows/ci.yml` `test:` job:
 
 ```sh
 cargo llvm-cov clean --workspace
