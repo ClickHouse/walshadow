@@ -167,11 +167,11 @@ Flush triggers, each sealing one `InsertBatch` (complete INSERT's
 worth of owned column slabs + `per_seq` row counts for the collector +
 the rows' admission/value permits, dropped post-insert-ack):
 
-- `enc.rows >= row_budget` (default 65536)
-- `enc.approx_bytes >= byte_budget` (default 1 MiB)
-- per-table deadline armed on first buffered row (`flush_timeout`;
-  operator `0` is substituted with a 100 ms pipeline default —
-  `DEFAULT_PIPELINE_FLUSH` — else a cold table's rows pin the
+- `enc.rows >= row_budget` (default 4,194,304)
+- `enc.approx_bytes >= byte_budget` (default 256 MiB)
+- per-table deadline armed on first buffered row (`flush_timeout`, default
+  1 s; operator `0` is substituted with 100 ms pipeline fallback,
+  `DEFAULT_PIPELINE_FLUSH`, preventing cold table rows from pinning
   watermark indefinitely). Batcher sleeps to the nearest armed
   deadline, so `flush_timeout` is an upper bound on partial-block
   hold time; a `flush_timeout`-period ticker would put real hold
