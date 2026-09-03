@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_postgres::Client;
 use walrus::pg::walparser::{Oid, RelFileNode};
@@ -38,10 +38,18 @@ use crate::backfill::backup_page_walk::{
 use crate::backfill::backup_sink::{
     CatalogFilenodes, DiskLanderSink, DiskLanderStats, MultiplexSink,
 };
-use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
+use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, PumpStats, StartInfo};
 use crate::decode::decoder_sink::TupleObserver;
 use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
-use ahash::HashSet;
+
+/// Live counter handles, readable while the pump runs. The pump publishes
+/// into these, so a caller ticks `/metrics` off them instead of waiting for
+/// [`BootstrapOutcome`]
+#[derive(Debug, Clone, Default)]
+pub struct BootstrapProgress {
+    pub pump: Arc<PumpStats>,
+    pub page_walk: Arc<PageWalkStats>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
@@ -52,9 +60,10 @@ pub struct BootstrapConfig {
     /// `rel_node < 16384` bootstrap rule misses. Empty in greenfield where
     /// seed runs after bootstrap
     pub catalog_filenodes: CatalogFilenodes,
-    /// Main filenodes whose pages nothing downstream keeps, declined
-    /// before decode. See [`PageWalkSink::with_skip_filenodes`]
-    pub skip_filenodes: HashSet<(Oid, Oid)>,
+    /// Filenodes worth decoding: mapped relations plus their TOAST heaps.
+    /// `None` taps every seeded relation
+    pub tap_filenodes: Option<Arc<ahash::HashSet<(Oid, Oid)>>>,
+    pub progress: BootstrapProgress,
 }
 
 impl BootstrapConfig {
@@ -62,7 +71,8 @@ impl BootstrapConfig {
         Self {
             shadow_data_dir,
             catalog_filenodes: CatalogFilenodes::new(),
-            skip_filenodes: HashSet::default(),
+            tap_filenodes: None,
+            progress: BootstrapProgress::default(),
         }
     }
 
@@ -71,8 +81,10 @@ impl BootstrapConfig {
         self
     }
 
-    pub fn with_skip_filenodes(mut self, skip: HashSet<(Oid, Oid)>) -> Self {
-        self.skip_filenodes = skip;
+    /// Decline every filenode outside `set` at `begin`, so unmapped
+    /// relations drain off the wire without a page decode
+    pub fn with_tap_filenodes(mut self, set: Arc<ahash::HashSet<(Oid, Oid)>>) -> Self {
+        self.tap_filenodes = Some(set);
         self
     }
 }
@@ -81,8 +93,60 @@ impl BootstrapConfig {
 pub struct BootstrapOutcome {
     pub start: StartInfo,
     pub end: EndInfo,
-    pub disk: DiskLanderStats,
-    pub page_walk: PageWalkStats,
+    pub disk: Arc<DiskLanderStats>,
+    pub page_walk: Arc<PageWalkStats>,
+    pub pump: Arc<PumpStats>,
+}
+
+/// Filenodes worth page-walking: main files of relations `walked` accepts,
+/// plus the TOAST heap of every relation `routed` accepts. `begin` declines
+/// everything else, so an unreplicated relation's bytes drain off the wire
+/// without a page decode.
+///
+/// The two predicates differ on initial-load opt-outs: their rows never walk,
+/// but their CDC updates can carry unchanged external pointers, and those
+/// resolve only against a mirror the chunk pages seeded.
+///
+/// `None` disables the filter: a routed relation whose `reltoastrelid` the
+/// seed did not resolve would otherwise have its TOAST heap skipped, and its
+/// referring rows would fail resolution mid-drain. Fail open, walk everything.
+pub fn tap_filenode_set(
+    catalog: &CatalogMap,
+    routed: impl Fn(&RelName) -> bool,
+    walked: impl Fn(&RelName) -> bool,
+) -> Option<ahash::HashSet<(Oid, Oid)>> {
+    use ahash::HashSetExt;
+    let by_oid: ahash::HashMap<Oid, (Oid, Oid)> = catalog
+        .descriptors()
+        .map(|d| (d.oid, (d.rfn.db_node, d.rfn.rel_node)))
+        .collect();
+    let mut set = ahash::HashSet::new();
+    for d in catalog.descriptors() {
+        if !routed(&d.rel_name) {
+            continue;
+        }
+        if walked(&d.rel_name) {
+            set.insert((d.rfn.db_node, d.rfn.rel_node));
+        }
+        if d.toast_oid == 0 {
+            continue;
+        }
+        match by_oid.get(&d.toast_oid) {
+            Some(&key) => {
+                set.insert(key);
+            }
+            None => {
+                tracing::warn!(
+                    target: "walshadow::bootstrap",
+                    relation = %d.rel_name,
+                    toast_oid = d.toast_oid,
+                    "toast heap absent from the catalog seed, walking every relation",
+                );
+                return None;
+            }
+        }
+    }
+    Some(set)
 }
 
 /// Spawn pump on a tokio task, yield `(rx, handle)` so caller drains
@@ -112,12 +176,12 @@ pub fn spawn_greenfield_bootstrap(
     // count + skip (disabled mode, values NULL/default-filled).
     store_toast: bool,
 ) -> (
-    mpsc::Receiver<BackfillTuple>,
+    mpsc::Receiver<Vec<BackfillTuple>>,
     JoinHandle<Result<BootstrapOutcome>>,
 ) {
     // Bounded: PageWalkSink::chunk awaits a free slot, so a slow drain
     // backpressures the source instead of buffering the whole relation
-    let (tx, rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+    let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
     let pump = tokio::spawn(async move {
         tokio::fs::create_dir_all(&cfg.shadow_data_dir)
             .await
@@ -129,47 +193,31 @@ pub fn spawn_greenfield_bootstrap(
             })?;
 
         let lander = DiskLanderSink::new(cfg.catalog_filenodes);
-        let page_walk =
-            PageWalkSink::new(catalog_map, tx, store_toast).with_skip_filenodes(cfg.skip_filenodes);
-        let mux = MultiplexSink::new(lander, page_walk);
-
-        // Keep typed Arc beside erased trait-object Arc to recover stats
-        // after source completes; both point at the same Mutex
-        let typed: Arc<Mutex<MultiplexSink<PageWalkSink>>> = Arc::new(Mutex::new(mux));
-        let erased: Arc<Mutex<dyn BackupSink>> = typed.clone();
+        let disk = lander.stats.clone();
+        let mut page_walk = PageWalkSink::new(catalog_map, tx, store_toast)
+            .with_stats(cfg.progress.page_walk.clone());
+        if let Some(set) = cfg.tap_filenodes.clone() {
+            page_walk = page_walk.with_tap_filenodes(set);
+        }
+        // Counters are atomics on shared handles, so the sink never has to
+        // come back out of the source
+        let sink: Arc<dyn BackupSink> = Arc::new(MultiplexSink::new(lander, page_walk));
 
         let data_dir = cfg.shadow_data_dir.clone();
         let (start, end) = source
-            .run(data_dir, erased)
+            .run(data_dir, sink, cfg.progress.pump.clone())
             .await
             .context("bootstrap: source.run")?;
 
-        // Source dropped its `erased` clone on return, so `try_unwrap`
-        // succeeds unless a clone leaked; else read through the Mutex
-        let outcome = match Arc::try_unwrap(typed) {
-            Ok(mtx) => {
-                let mux = mtx.into_inner();
-                let (lander, page_walk) = mux.into_inner();
-                // Dropping `page_walk` closes the channel sender in `out_tx`,
-                // so a concurrent drain observes channel-close on next recv
-                BootstrapOutcome {
-                    start,
-                    end,
-                    disk: lander.stats,
-                    page_walk: page_walk.stats,
-                }
-            }
-            Err(arc) => {
-                let g = arc.lock().await;
-                BootstrapOutcome {
-                    start,
-                    end,
-                    disk: g.lander_stats().clone(),
-                    page_walk: PageWalkStats::default(),
-                }
-            }
-        };
-        Ok(outcome)
+        // Dropping the last sink Arc closes the channel sender in `out_tx`,
+        // so a concurrent drain observes channel-close on next recv
+        Ok(BootstrapOutcome {
+            start,
+            end,
+            disk,
+            page_walk: cfg.progress.page_walk.clone(),
+            pump: cfg.progress.pump.clone(),
+        })
     });
     (rx, pump)
 }
@@ -187,8 +235,8 @@ pub async fn run_greenfield_bootstrap(
     let (mut rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
     let drain = tokio::spawn(async move {
         let mut out = Vec::new();
-        while let Some(t) = rx.recv().await {
-            out.push(t);
+        while let Some(slab) = rx.recv().await {
+            out.extend(slab);
         }
         out
     });
@@ -213,28 +261,30 @@ pub async fn run_greenfield_bootstrap(
 /// Final `on_xact_end` after channel-close lets the transitional emitter
 /// release CH state before the daemon swaps to the shadow-catalog emitter.
 pub async fn drain_backfill<O: TupleObserver + ?Sized>(
-    mut rx: mpsc::Receiver<BackfillTuple>,
+    mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
     observer: &mut O,
 ) -> Result<u64> {
     let mut shipped: u64 = 0;
     let mut last_rfn: Option<RelFileNode> = None;
     let mut last_lsn: u64 = 0;
-    while let Some(tuple) = rx.recv().await {
-        if let Some(prev) = last_rfn
-            && prev != tuple.rfn
-        {
-            observer.on_xact_end(last_lsn).await.map_err(|e| {
-                anyhow::anyhow!("bootstrap drain: emitter rejected mid-table xact end: {e}")
-            })?;
+    while let Some(slab) = rx.recv().await {
+        for tuple in slab {
+            if let Some(prev) = last_rfn
+                && prev != tuple.rfn
+            {
+                observer.on_xact_end(last_lsn).await.map_err(|e| {
+                    anyhow::anyhow!("bootstrap drain: emitter rejected mid-table xact end: {e}")
+                })?;
+            }
+            last_rfn = Some(tuple.rfn);
+            last_lsn = tuple.source_lsn;
+            let committed = tuple.into_committed_insert();
+            observer
+                .on_tuple(&committed)
+                .await
+                .map_err(|e| anyhow::anyhow!("bootstrap drain: emitter rejected tuple: {e}"))?;
+            shipped += 1;
         }
-        last_rfn = Some(tuple.rfn);
-        last_lsn = tuple.source_lsn;
-        let committed = tuple.into_committed_insert();
-        observer
-            .on_tuple(&committed)
-            .await
-            .map_err(|e| anyhow::anyhow!("bootstrap drain: emitter rejected tuple: {e}"))?;
-        shipped += 1;
     }
     observer
         .on_xact_end(last_lsn)
@@ -249,6 +299,16 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
 /// filenode. Wrap in [`seed_in_snapshot`] when DDL quiescence isn't external.
 /// Filenode 0 (partitioned parents, views) has no heap to page-walk; skipped.
 pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
+    seed_catalog(client, None).await
+}
+
+/// Re-read one relation for descriptor validation. Silent: repair calls it
+/// once per locked batch, not once per pass
+pub(crate) async fn seed_relation_from_source(client: &Client, oid: u32) -> Result<CatalogMap> {
+    seed_catalog(client, Some(oid)).await
+}
+
+async fn seed_catalog(client: &Client, oid: Option<u32>) -> Result<CatalogMap> {
     let db_oid = current_database_oid(client).await?;
     let rows = client
         .query(
@@ -267,8 +327,9 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
                 coalesce(pg_relation_filenode(c.oid), 0)::oid \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.oid >= 16384 AND c.relkind IN ('r', 't', 'm')",
-            &[],
+             WHERE c.oid >= 16384 AND c.relkind IN ('r', 't', 'm') \
+               AND ($1::oid IS NULL OR c.oid = $1)",
+            &[&oid],
         )
         .await
         .context("bootstrap: enumerate user relations on source")?;
@@ -309,11 +370,13 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         };
         map.insert(Arc::new(desc));
     }
-    tracing::info!(
-        target = "walshadow::backfill_bootstrap",
-        relations = map.len(),
-        "catalog seed populated"
-    );
+    if oid.is_none() {
+        tracing::info!(
+            target = "walshadow::backfill_bootstrap",
+            relations = map.len(),
+            "catalog seed populated"
+        );
+    }
     Ok(map)
 }
 
@@ -421,27 +484,17 @@ mod tests {
         async fn run(
             self: Box<Self>,
             data_dir: PathBuf,
-            sink: Arc<Mutex<dyn BackupSink>>,
+            sink: Arc<dyn BackupSink>,
+            stats: Arc<PumpStats>,
         ) -> Result<(StartInfo, EndInfo)> {
-            {
-                let mut g = sink.lock().await;
-                g.start(&self.start).await?;
-            }
-            for (i, (meta, body)) in self.files.iter().enumerate() {
+            sink.start(&self.start).await?;
+            let target =
+                crate::backfill::backup_source::PumpTarget::new(data_dir, sink.clone(), stats);
+            for (meta, body) in self.files.iter() {
                 let mut cur: &[u8] = body;
-                crate::backfill::backup_source::pump_entry(
-                    &mut cur,
-                    meta,
-                    &data_dir,
-                    &sink,
-                    crate::backfill::backup_source::EntryId(i as u64),
-                )
-                .await?;
+                crate::backfill::backup_source::pump_entry(&mut cur, meta, &target).await?;
             }
-            {
-                let mut g = sink.lock().await;
-                g.finish(&self.end).await?;
-            }
+            sink.finish(&self.end).await?;
             Ok((self.start.clone(), self.end.clone()))
         }
     }
@@ -534,14 +587,14 @@ mod tests {
     async fn drain_backfill_synthesises_inserts_into_observer() {
         use crate::decode::decoder_sink::CollectingTupleObserver;
 
-        let (tx, rx) = mpsc::channel::<BackfillTuple>(64);
+        let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
         let rfn = RelFileNode {
             spc_node: 1663,
             db_node: 5,
             rel_node: 16400,
         };
         for v in 0..3 {
-            tx.send(BackfillTuple {
+            tx.send(vec![BackfillTuple {
                 rfn,
                 xid: 100 + v,
                 xmax: 0,
@@ -552,7 +605,7 @@ mod tests {
                 columns: vec![Some(crate::decode::heap_decoder::ColumnValue::Int4(
                     v as i32,
                 ))],
-            })
+            }])
             .await
             .unwrap();
         }
@@ -620,9 +673,9 @@ mod tests {
             db_node: 5,
             rel_node: 16400,
         };
-        let (tx, rx) = mpsc::channel::<BackfillTuple>(64);
+        let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
         for v in 0..4u32 {
-            tx.send(BackfillTuple {
+            tx.send(vec![BackfillTuple {
                 rfn,
                 xid: v,
                 xmax: 0,
@@ -633,7 +686,7 @@ mod tests {
                 columns: vec![Some(crate::decode::heap_decoder::ColumnValue::Int4(
                     v as i32,
                 ))],
-            })
+            }])
             .await
             .unwrap();
         }
@@ -651,7 +704,7 @@ mod tests {
     async fn drain_backfill_calls_on_xact_end_even_on_empty_channel() {
         // Sender dropped without a tuple; `on_xact_end` still fires so the
         // transitional emitter's INSERT cleanup runs unconditionally
-        let (tx, rx) = mpsc::channel::<BackfillTuple>(64);
+        let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
         drop(tx);
         let mut obs = CountingObserver::default();
         let shipped = drain_backfill(rx, &mut obs).await.unwrap();

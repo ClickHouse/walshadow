@@ -53,12 +53,11 @@ use crate::backfill::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink,
 };
 use crate::backfill::backup_sentinel::build_lsn_pair;
-use crate::backfill::backup_source::{BackupSink, BackupSource};
+use crate::backfill::backup_source::{BackupSink, BackupSource, PumpStats};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
-use crate::backfill::visibility_gate::{GateStats, Undecidable, resolve_phase, stream_phase};
-use crate::backfill::visibility_repair::PendingSet;
+use crate::backfill::visibility_gate::{GateOutput, GateStats, resolve_phase, stream_phase};
 use crate::backfill::wal_replay::{
     ReplayStats, ReplayTargets, WalReplayInputs, WalReplaySink, pump_segments_through,
 };
@@ -305,14 +304,15 @@ async fn walk_and_ship(
 
     let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
     let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new()));
-    let (walk_tx, walk_rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-    let (gated_tx, gated_rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+    let (walk_tx, walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+    let (gated_tx, gated_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
 
-    let sink = PageWalkSink::new(filter.clone(), walk_tx, store_toast)
-        .with_pg_xact_accum(pg_xact.clone())
-        .with_pg_multixact_accum(pg_multixact.clone())
-        .with_lsn_overrides(lsn_overrides);
-    let erased: Arc<Mutex<dyn BackupSink>> = Arc::new(Mutex::new(sink));
+    let sink: Arc<dyn BackupSink> = Arc::new(
+        PageWalkSink::new(filter.clone(), walk_tx, store_toast)
+            .with_pg_xact_accum(pg_xact.clone())
+            .with_pg_multixact_accum(pg_multixact.clone())
+            .with_lsn_overrides(lsn_overrides),
+    );
 
     // data_dir is never written: PageWalkSink only Taps/Skips
     let data_dir = ctx.scratch_dir.join("void");
@@ -338,12 +338,12 @@ async fn walk_and_ship(
     let drain = tokio::spawn(bootstrap::drain(
         gated_rx,
         filter,
-        ctx.mapping.clone(),
+        ctx.mapping.snapshot().await,
         tail.msg_tx.clone(),
         tail.ack.clone(),
         ctx.stats.clone(),
         resolver.clone(),
-        DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX),
+        Some(DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX)),
         ctx.emitter.row_policy(),
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         HashSet::new(),
@@ -353,7 +353,7 @@ async fn walk_and_ship(
     // against a complete pg_xact accum; a failed source drops the sender
     // and the gate discards them instead
     let run_res = source
-        .run(data_dir, erased)
+        .run(data_dir, sink, Arc::new(PumpStats::default()))
         .await
         .context("backup_backfill: source.run");
     if run_res.is_ok() {
@@ -434,8 +434,8 @@ async fn walk_and_ship(
 /// Run visibility gate and track `pg_xact` segments
 #[allow(clippy::too_many_arguments)]
 async fn gate_task(
-    mut rx: mpsc::Receiver<BackfillTuple>,
-    tx: mpsc::Sender<BackfillTuple>,
+    mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
+    tx: mpsc::Sender<Vec<BackfillTuple>>,
     filter: CatalogMap,
     pg_xact: Arc<std::sync::Mutex<PgXactAccum>>,
     pg_multixact: Arc<std::sync::Mutex<PgMultiXactAccum>>,
@@ -445,12 +445,10 @@ async fn gate_task(
 ) -> Result<(GateStats, usize), String> {
     let mut stats = GateStats::default();
     // Per-table loads abort on unprovable tuples
-    let mut no_pending = PendingSet::empty();
     stream_phase(
         &mut rx,
-        &tx,
+        &GateOutput::Rows(&tx),
         &filter,
-        &mut no_pending,
         &mut deferred,
         &mut stats,
     )
@@ -465,7 +463,7 @@ async fn gate_task(
     let multi = std::mem::take(&mut *pg_multixact.lock().expect("pg_multixact accum lock"));
     let segments = accum.segment_count();
     let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
-    resolve_phase(deferred, &view, &tx, Undecidable::Abort, &mut stats).await?;
+    resolve_phase(deferred, &view, &GateOutput::Rows(&tx), &mut stats).await?;
     Ok((stats, segments))
 }
 
@@ -1230,30 +1228,30 @@ mod tests {
 
         // Hinted-committed: passes through immediately
         walk_tx
-            .send(tuple(
+            .send(vec![tuple(
                 16400,
                 100,
                 0,
                 HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID,
-            ))
+            )])
             .await
             .unwrap();
         // Hinted-aborted: gated
         walk_tx
-            .send(tuple(16400, 101, 0, HEAP_XMIN_INVALID))
+            .send(vec![tuple(16400, 101, 0, HEAP_XMIN_INVALID)])
             .await
             .unwrap();
         // Unhinted, gap-committed writer: deferred, then emitted via patch
-        walk_tx.send(tuple(16400, 500, 0, 0)).await.unwrap();
+        walk_tx.send(vec![tuple(16400, 500, 0, 0)]).await.unwrap();
         // Unhinted, gap-aborted writer: deferred, then gated via patch
-        walk_tx.send(tuple(16400, 600, 0, 0)).await.unwrap();
+        walk_tx.send(vec![tuple(16400, 600, 0, 0)]).await.unwrap();
         drop(walk_tx);
         walk_ok_tx.send(()).unwrap();
 
         let (stats, _segments) = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
         while let Some(t) = gated_rx.recv().await {
-            got.push(t.xid);
+            got.extend(t.iter().map(|x| x.xid));
         }
         assert_eq!(got, [100, 500]);
         assert_eq!(stats.emitted, 2);
@@ -1294,23 +1292,23 @@ mod tests {
 
         // Hinted-committed: routed before the failure, stays flushed
         walk_tx
-            .send(tuple(
+            .send(vec![tuple(
                 16400,
                 100,
                 0,
                 HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID,
-            ))
+            )])
             .await
             .unwrap();
         // Unhinted: deferred, must be discarded
-        walk_tx.send(tuple(16400, 500, 0, 0)).await.unwrap();
+        walk_tx.send(vec![tuple(16400, 500, 0, 0)]).await.unwrap();
         drop(walk_tx);
         drop(walk_ok_tx);
 
         let (stats, _segments) = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
         while let Some(t) = gated_rx.recv().await {
-            got.push(t.xid);
+            got.extend(t.iter().map(|x| x.xid));
         }
         assert_eq!(got, [100], "deferred tuple not emitted");
         assert_eq!(stats.emitted, 1);
@@ -1359,12 +1357,12 @@ mod tests {
         ));
 
         walk_tx
-            .send(tuple(
+            .send(vec![tuple(
                 16400,
                 100,
                 10,
                 HEAP_XMIN_COMMITTED | HEAP_XMAX_IS_MULTI,
-            ))
+            )])
             .await
             .unwrap();
         drop(walk_tx);
@@ -1399,12 +1397,12 @@ mod tests {
         ));
 
         walk_tx
-            .send(tuple(
+            .send(vec![tuple(
                 16400,
                 100,
                 10,
                 HEAP_XMIN_COMMITTED | HEAP_XMAX_IS_MULTI,
-            ))
+            )])
             .await
             .unwrap();
         drop(walk_tx);

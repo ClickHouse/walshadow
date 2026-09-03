@@ -57,7 +57,12 @@ async fn crossing_transaction(with_slot: bool) {
     .expect("write ch-config");
 
     let daemon = fx::DaemonRun::prepare(tmp.path(), slot.metrics).expect("daemon layout");
-    let mut args = vec!["--bootstrap-max-rate-kib", MAX_RATE_KIB];
+    let mut args = vec![
+        "--bootstrap-max-rate-kib",
+        MAX_RATE_KIB,
+        "--bootstrap-wind-down-secs",
+        "0",
+    ];
     if with_slot {
         args.extend(["--slot", "walshadow_crossing"]);
     }

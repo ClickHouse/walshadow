@@ -1,201 +1,175 @@
-//! Replace relations whose backup-page visibility cannot be proven
+//! Repair external values and unresolved visibility through source CTID reads
 //!
-//! Read each pending relation through PostgreSQL `COPY`, emit visible,
-//! detoasted rows at page-walk coverage LSN. Keep chunk pages in mirror for
-//! later WAL rows carrying old external pointers
+//! Preserve chunk mirrors for WAL rows carrying old external pointers
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::walparser::{Oid, RelFileNode};
+use walrus::pg::walparser::Oid;
 
-use crate::backfill::backfill_bootstrap::seed_in_snapshot;
+use crate::backfill::backfill_bootstrap::seed_relation_from_source;
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
-use crate::backfill::copy_backfill::copy_rows_into;
-use crate::decode::heap_decoder::ColumnValue;
-use crate::mapping::MappingSnapshot;
-use crate::pg::current_wal_lsn;
+use crate::backfill::copy_backfill::{CopyRate, copy_selected_rows_into};
+use crate::mapping::{MappingSnapshot, TableMapping};
+use crate::pg::{current_wal_lsn, quote_ident};
 use crate::schema::{RelDescriptor, RelName};
 use crate::source::source_feed::open_sql_client;
-use ahash::{HashMap, HashSet};
+use ahash::HashMap;
 
-/// Reason for authoritative relation read
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingReason {
-    /// `xmax` multixact outside backup coverage
-    UnresolvedMultiXact,
-    /// Mapped external value may reference ambiguous chunk generations
-    ExternalToast,
+/// CTIDs per `COPY`, bounding the `ctid = ANY (ARRAY[...])` literal
+const CTID_BATCH: usize = 256;
+
+#[derive(Debug, Default, Clone)]
+pub struct RepairScope {
+    mapped: HashMap<(Oid, Oid), TableMapping>,
 }
 
-/// Relations handed from page walk to repair
-#[derive(Debug, Default)]
-pub struct PendingSet {
-    rels: HashMap<(Oid, Oid), PendingReason>,
-    /// Filenodes repair may read, `None` unrestricted. Greenfield scopes to
-    /// the mapping snapshot: the drain routes by mapping, so reading an
-    /// unmapped relation ships rows it drops
-    scope: Option<HashSet<(Oid, Oid)>>,
-    external: HashMap<(Oid, Oid), Vec<usize>>,
-}
-
-impl PendingSet {
-    /// Empty set for per-table loads without repair
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    pub fn mapped(catalog: &CatalogMap, mapping: &MappingSnapshot) -> Self {
-        let mut set = Self::empty();
-        let mut scope = HashSet::default();
-        for desc in catalog.descriptors() {
-            let Some(mapped) = mapping.get(&desc.rel_name) else {
-                continue;
-            };
-            let key = (desc.rfn.db_node, desc.rfn.rel_node);
-            scope.insert(key);
-            if desc.toast_oid == 0 {
-                continue;
-            }
-            let columns: Vec<_> = mapped
-                .columns
-                .iter()
-                .filter_map(|c| {
-                    let attr = desc.attributes.iter().find(|a| a.attnum == c.src_attnum)?;
-                    (attr.type_len == -1 && !attr.dropped)
-                        .then(|| usize::try_from(i32::from(attr.attnum) - 1).ok())
-                        .flatten()
+impl RepairScope {
+    /// Repair reads follow the drain's routes: `walked` narrows them to the
+    /// relations the page walk ships, so a read never lands rows the drain drops
+    pub fn mapped(
+        catalog: &CatalogMap,
+        mapping: &MappingSnapshot,
+        walked: impl Fn(&RelName) -> bool,
+    ) -> Self {
+        Self {
+            mapped: catalog
+                .descriptors()
+                .filter(|d| walked(&d.rel_name))
+                .filter_map(|d| {
+                    mapping
+                        .get(&d.rel_name)
+                        .map(|m| ((d.rfn.db_node, d.rfn.rel_node), m.clone()))
                 })
-                .collect();
-            if !columns.is_empty() {
-                set.external.insert(key, columns);
-            }
+                .collect(),
         }
-        set.scope = Some(scope);
-        set
     }
 
-    pub fn observe_external(&mut self, tuple: &BackfillTuple) -> bool {
-        let key = (tuple.rfn.db_node, tuple.rfn.rel_node);
-        let external = self.external.get(&key).is_some_and(|columns| {
-            columns.iter().any(|&i| {
-                matches!(
-                    tuple.columns.get(i),
-                    Some(Some(ColumnValue::ExternalToast(_)))
-                )
-            })
-        });
-        if external {
-            self.mark(tuple.rfn, PendingReason::ExternalToast);
-        }
-        external
+    fn get(&self, tuple: &BackfillTuple) -> Option<&TableMapping> {
+        self.mapped.get(&(tuple.rfn.db_node, tuple.rfn.rel_node))
     }
 
-    /// Pre-mark relations owning TOAST storage
-    pub fn toast_capable(catalog: &CatalogMap) -> Self {
-        let mut set = Self::default();
-        for desc in catalog.descriptors().filter(|d| d.toast_oid != 0) {
-            set.rels.insert(
-                (desc.rfn.db_node, desc.rfn.rel_node),
-                PendingReason::ExternalToast,
-            );
-        }
-        set
+    pub fn has_external(&self, tuple: &BackfillTuple) -> bool {
+        self.get(tuple)
+            .is_some_and(|m| tuple.has_mapped_external(m))
     }
+}
 
-    /// Restrict repair to `mapped` filenodes, dropping pre-marks outside it
-    pub fn scoped_to(mut self, mapped: HashSet<(Oid, Oid)>) -> Self {
-        self.rels.retain(|k, _| mapped.contains(k));
-        self.external.retain(|k, _| mapped.contains(k));
-        self.scope = Some(mapped);
-        self
-    }
-
-    /// Hand a relation over mid-walk. First reason wins. Out of scope is
-    /// dropped: the tuple was headed for the drain's discard either way
-    pub fn mark(&mut self, rfn: RelFileNode, reason: PendingReason) {
-        let key = (rfn.db_node, rfn.rel_node);
-        if self.scope.as_ref().is_some_and(|s| !s.contains(&key)) {
-            return;
-        }
-        self.rels.entry(key).or_insert(reason);
-    }
-
-    /// Check whether repair replaces relation main pages
-    pub fn holds(&self, db_node: Oid, rel_node: Oid) -> bool {
-        self.rels.contains_key(&(db_node, rel_node))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rels.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.rels.len()
-    }
-
-    pub fn count_for(&self, reason: PendingReason) -> u64 {
-        self.rels.values().filter(|r| **r == reason).count() as u64
-    }
+pub struct RepairBatch {
+    pub rows: Vec<BackfillTuple>,
+    /// Backup SLRUs left visibility undecidable, so a source read replaces
+    /// every in-scope row rather than only the externally toasted ones
+    pub unresolved: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RepairStats {
-    pub relations: u64,
     pub rows: u64,
-    /// Relations `initial_load = "none"` opted out of
-    pub skipped: u64,
-    /// Source write head after final read
     pub p_hi: u64,
 }
 
-/// Read pending relations through PostgreSQL at `coverage_lsn`
-///
-/// Reject descriptors changed since page walk
-pub async fn repair(
-    pending: &PendingSet,
-    catalog: &CatalogMap,
-    skip_initial: &HashSet<RelName>,
-    source: &PgConfig,
-    coverage_lsn: u64,
-    tx: &mpsc::Sender<BackfillTuple>,
-) -> Result<RepairStats> {
-    let mut stats = RepairStats::default();
-    if pending.is_empty() {
-        return Ok(stats);
-    }
-    let client = open_sql_client(source)
-        .await
-        .context("visibility repair: source sql connect")?;
-    client
-        .batch_execute("SET row_security = off")
-        .await
-        .context("visibility repair: reject row security filtering")?;
-    // Re-read the same seed the walk's catalog came from, so an unchanged
-    // relation compares equal field for field
-    let fresh = seed_in_snapshot(&client)
-        .await
-        .context("visibility repair: re-seed source catalog")?;
+pub struct RowRepair {
+    pub source: PgConfig,
+    pub catalog: CatalogMap,
+    pub scope: RepairScope,
+    pub rate: CopyRate,
+}
 
-    for &(db_node, rel_node) in pending.rels.keys() {
-        let desc = catalog.get(db_node, rel_node).with_context(|| {
-            format!("visibility repair: filenode {db_node}/{rel_node} left the catalog map")
-        })?;
-        if skip_initial.contains(&desc.rel_name) {
-            stats.skipped += 1;
-            continue;
+impl RowRepair {
+    pub async fn run(
+        self,
+        mut rx: mpsc::Receiver<RepairBatch>,
+        tx: mpsc::Sender<Vec<BackfillTuple>>,
+    ) -> Result<RepairStats> {
+        let mut stats = RepairStats::default();
+        let mut connection = None;
+        while let Some(RepairBatch { rows, unresolved }) = rx.recv().await {
+            let mut pass = Vec::new();
+            let mut reads: HashMap<_, Vec<_>> = HashMap::default();
+            // Unresolved rows out of scope get no read and have no route, so
+            // they reach neither branch
+            for t in rows {
+                if self
+                    .scope
+                    .get(&t)
+                    .is_some_and(|m| unresolved || t.has_mapped_external(m))
+                {
+                    reads
+                        .entry((t.rfn.db_node, t.rfn.rel_node, t.source_lsn))
+                        .or_default()
+                        .push((t.blkno, t.offnum));
+                } else if !unresolved {
+                    pass.push(t);
+                }
+            }
+            if !pass.is_empty() {
+                tx.send(pass)
+                    .await
+                    .context("row repair: drain closed early")?;
+            }
+            if reads.is_empty() {
+                continue;
+            }
+            if connection.is_none() {
+                let client = open_sql_client(&self.source)
+                    .await
+                    .context("row repair: source sql connect")?;
+                client.batch_execute("SET row_security = off").await?;
+                connection = Some(client);
+            }
+            let client = connection.as_ref().unwrap();
+            for ((db, rel, lsn), tids) in reads {
+                let desc = self
+                    .catalog
+                    .get(db, rel)
+                    .with_context(|| format!("row repair: unknown filenode {db}/{rel}"))?;
+                stats.rows += copy_locked(client, &desc, lsn, &tx, &tids, &self.rate).await?;
+            }
         }
-        assert_unchanged(&fresh, &desc)?;
-        stats.relations += 1;
-        stats.rows += copy_rows_into(&client, &desc, coverage_lsn, tx)
-            .await
-            .with_context(|| format!("visibility repair: COPY {}", desc.rel_name))?;
+        if let Some(client) = connection {
+            stats.p_hi = current_wal_lsn(&client).await?;
+        }
+        Ok(stats)
     }
-    // Sample after reads to bound every snapshot
-    stats.p_hi = current_wal_lsn(&client)
-        .await
-        .context("visibility repair: source write head")?;
-    Ok(stats)
+}
+
+/// Hold `ACCESS SHARE` across descriptor validation and every `COPY`, so no
+/// rewrite slips between the shape check and the reads it authorises
+async fn copy_locked(
+    client: &tokio_postgres::Client,
+    desc: &RelDescriptor,
+    lsn: u64,
+    tx: &mpsc::Sender<Vec<BackfillTuple>>,
+    tids: &[(u32, u16)],
+    rate: &CopyRate,
+) -> Result<u64> {
+    client.batch_execute("BEGIN").await?;
+    let result: Result<u64> = async {
+        client
+            .batch_execute(&format!(
+                "LOCK TABLE ONLY {}.{} IN ACCESS SHARE MODE",
+                quote_ident(&desc.rel_name.namespace),
+                quote_ident(&desc.rel_name.name),
+            ))
+            .await
+            .with_context(|| format!("row repair: lock {}", desc.rel_name))?;
+        let fresh = seed_relation_from_source(client, desc.oid).await?;
+        assert_unchanged(&fresh, desc)?;
+        let mut rows = 0;
+        // PostgreSQL CTIDs identify physical versions, WAL covers moved or deleted rows
+        for batch in tids.chunks(CTID_BATCH) {
+            rows += copy_selected_rows_into(client, desc, lsn, tx, Some(batch), rate)
+                .await
+                .with_context(|| format!("row repair: COPY {}", desc.rel_name))?;
+        }
+        Ok(rows)
+    }
+    .await;
+    // Release relation lock on both success and failure
+    let released = client.batch_execute("ROLLBACK").await;
+    let rows = result?;
+    released?;
+    Ok(rows)
 }
 
 /// Verify COPY target still matches walked descriptor
@@ -252,90 +226,52 @@ fn shape(d: &RelDescriptor) -> String {
 mod tests {
     use super::*;
     use crate::backfill::backup_page_walk::make_rel_named;
-    use ahash::HashSetExt;
-    use std::sync::Arc;
+    use crate::mapping::TableTarget;
 
-    fn desc(
-        oid: Oid,
-        rel_node: Oid,
-        toast_oid: Oid,
-        namespace: &str,
-        name: &str,
-    ) -> Arc<RelDescriptor> {
-        make_rel_named(oid, rel_node, toast_oid, RelName::new(namespace, name))
-    }
-
-    /// A relation with a toast relation is pending before the walk. Its
-    /// chunk store is not: the mirror is a cache the walk keeps filling
-    #[test]
-    fn toast_capable_scope_takes_the_parent_but_not_its_chunks() {
-        let mut catalog = CatalogMap::new();
-        catalog.insert(desc(16400, 16400, 16402, "public", "with_text"));
-        catalog.insert(desc(16402, 16403, 0, "pg_toast", "pg_toast_16400"));
-        catalog.insert(desc(16500, 16500, 0, "public", "fixed_width"));
-
-        let set = PendingSet::toast_capable(&catalog);
-
-        assert_eq!(set.len(), 1);
-        assert!(set.holds(5, 16400), "parent is pending");
-        assert!(!set.holds(5, 16403), "its chunk filenode still walks");
-        assert!(!set.holds(5, 16500), "a fixed-width relation still walks");
-        assert_eq!(set.count_for(PendingReason::ExternalToast), 1);
-    }
-
-    /// Repair reads the source, so scope follows the drain's routes: an
-    /// unmapped relation's rows would be dropped on arrival
-    #[test]
-    fn scope_drops_unmapped_relations_and_their_later_marks() {
-        let mut catalog = CatalogMap::new();
-        catalog.insert(desc(16400, 16400, 16402, "public", "mapped"));
-        catalog.insert(desc(16500, 16500, 16502, "public", "unmapped"));
-
-        let mut set =
-            PendingSet::toast_capable(&catalog).scoped_to([(5, 16400)].into_iter().collect());
-
-        assert_eq!(set.len(), 1);
-        assert!(set.holds(5, 16400));
-        assert!(!set.holds(5, 16500), "pre-mark outside the mapping drops");
-
-        let unmapped = catalog.get(5, 16500).unwrap();
-        set.mark(unmapped.rfn, PendingReason::UnresolvedMultiXact);
-        assert!(!set.holds(5, 16500), "so does a walk-time mark");
-    }
-
-    /// Marking mid-walk keeps the first reason
-    #[test]
-    fn walk_time_mark_keeps_the_first_reason() {
-        let mut catalog = CatalogMap::new();
-        catalog.insert(desc(16400, 16400, 16402, "public", "t"));
-        let mut set = PendingSet::empty();
-        assert!(!set.holds(5, 16400));
-
-        let parent = catalog.get(5, 16400).unwrap();
-        set.mark(parent.rfn, PendingReason::UnresolvedMultiXact);
-        set.mark(parent.rfn, PendingReason::ExternalToast);
-
-        assert_eq!(set.len(), 1);
-        assert!(set.holds(5, 16400));
-        assert_eq!(set.count_for(PendingReason::UnresolvedMultiXact), 1);
-        assert_eq!(set.count_for(PendingReason::ExternalToast), 0);
-    }
-
-    /// Nothing pending means no source connection at all
     #[tokio::test]
-    async fn repair_without_pending_relations_touches_nothing() {
-        let (tx, _rx) = mpsc::channel(1);
-        let source = crate::config::SourceConn::default().to_pg_config();
-        let stats = repair(
-            &PendingSet::empty(),
-            &CatalogMap::new(),
-            &HashSet::new(),
-            &source,
-            0x1000,
-            &tx,
-        )
+    async fn out_of_scope_rows_never_connect() {
+        let mut catalog = CatalogMap::new();
+        let d = make_rel_named(16400, 16400, 0, RelName::new("public", "t"));
+        catalog.insert(d.clone());
+        let mapping = [(
+            d.rel_name.clone(),
+            TableMapping {
+                target: TableTarget::new("default", "t"),
+                columns: Vec::new(),
+            },
+        )]
+        .into_iter()
+        .collect::<HashMap<_, _>>()
+        .into();
+        let scope = RepairScope::mapped(&catalog, &mapping, |_| false);
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(RepairBatch {
+            rows: vec![BackfillTuple {
+                rfn: d.rfn,
+                xid: 0,
+                xmax: 0,
+                infomask: 0,
+                source_lsn: 0x1000,
+                blkno: 0,
+                offnum: 1,
+                columns: Vec::new(),
+            }],
+            unresolved: true,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let stats = RowRepair {
+            source: crate::config::SourceConn::default().to_pg_config(),
+            catalog,
+            scope,
+            rate: CopyRate::new(None),
+        }
+        .run(rx, out_tx)
         .await
         .unwrap();
         assert_eq!(stats, RepairStats::default());
+        assert!(out_rx.recv().await.is_none());
     }
 }

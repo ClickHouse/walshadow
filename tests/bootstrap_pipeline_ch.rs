@@ -142,7 +142,7 @@ async fn bootstrap_tail_fans_out_n2() {
     let mut catalog = CatalogMap::new();
     catalog.insert(rel(16400, "foo"));
     catalog.insert(rel(16401, "baz"));
-    let mapping = walshadow::mapping::mapping_handle(cfg.tables.clone());
+    let mapping = std::sync::Arc::new(cfg.tables.clone());
 
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
@@ -160,12 +160,12 @@ async fn bootstrap_tail_fans_out_n2() {
     // Feed all foo rows then all baz rows — contiguous per rfn, as
     // PageWalkSink emits. Two seqs, each spanning ~8 budget-sized batches.
     // cap > 2*ROWS_PER_TABLE so the pre-send fits before the drain spawns
-    let (tup_tx, tup_rx) = tokio::sync::mpsc::channel::<BackfillTuple>(128);
+    let (tup_tx, tup_rx) = tokio::sync::mpsc::channel::<Vec<BackfillTuple>>(128);
     for id in 0..ROWS_PER_TABLE {
-        tup_tx.send(tuple(16400, id)).await.unwrap();
+        tup_tx.send(vec![tuple(16400, id)]).await.unwrap();
     }
     for id in 0..ROWS_PER_TABLE {
-        tup_tx.send(tuple(16401, id)).await.unwrap();
+        tup_tx.send(vec![tuple(16401, id)]).await.unwrap();
     }
     drop(tup_tx);
 
@@ -177,10 +177,7 @@ async fn bootstrap_tail_fans_out_n2() {
         ack.clone(),
         stats.clone(),
         ToastResolver::disabled(),
-        walshadow::spool::DeferredSpool::new(
-            std::env::temp_dir().join("ws-bootstrap-ch-unused.bin"),
-            walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
-        ),
+        None,
         Default::default(),
         None,
         ahash::HashSet::default(),

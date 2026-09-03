@@ -177,7 +177,7 @@ async fn window_writes_reach_ch() {
             .find(|l| l.contains("bootstrap visibility gate settled"))
             .context("no gate summary")?;
         anyhow::ensure!(
-            gate.contains("pending_relations=0"),
+            gate.contains("unresolved=0"),
             "unexpected source repair: {gate}"
         );
         Ok(())

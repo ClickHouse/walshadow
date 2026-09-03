@@ -263,6 +263,8 @@ impl DaemonRun {
                 &ports::PG_SHADOW_PORT.to_string(),
                 "--shadow-user",
                 "postgres",
+                "--bridge-lib-dir",
+                pgext_dir().to_str().unwrap(),
                 "--shadow-dbname",
                 "postgres",
                 "--spill-dir",

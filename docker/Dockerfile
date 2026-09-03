@@ -26,6 +26,7 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY bench ./bench
+COPY benches ./benches
 COPY src ./src
 # Cache mounts persist cargo's registry/git and the target dir across builds,
 # so a source change recompiles only the changed crates, not all deps. The

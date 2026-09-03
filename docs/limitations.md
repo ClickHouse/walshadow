@@ -55,11 +55,25 @@ request per insert batch
   record, using source or archived WAL; missing history stops replication
   instead of skipping it. Earlier records can still leave missing inserts or
   stale deletes
-- mapped external TOAST values or unresolved multixacts trigger whole-relation
-  `COPY` repair; inline values and unmapped external columns stay on page walk
+- mapped external TOAST values trigger streaming `COPY` reads of at most 256
+  physical row locations (CTIDs) per query, alongside backup page walk; inline
+  values and unmapped external columns stay on page walk. Tables with external
+  values in every row still require reading every such row from source
+- unresolved multixacts trigger CTID `COPY` repair after backup and window
+  replay; repair reads remain serial
+- repair output streams through bounded channels into configured inserter pool;
+  user table data never lands in shadow catalog. Unknown visibility can still
+  spill to bootstrap scratch files until transaction logs arrive
+- `--bootstrap-max-rate-kib` caps direct backup transfer and COPY repair output
+  separately, each at configured rate; concurrent rates can add together.
+  COPY cap counts binary field bytes, not source disk reads; WAL stays unthrottled
+- `--bootstrap-wind-down-secs` controls live window wait for transactions open
+  across handoff (default 5, zero skips waiting). Timeout resumes pump below
+  `end_lsn` at oldest buffered record; increasing wait reduces these rewinds
 - repair reads each physical relation with `ONLY` and rejects row-security
   filtering; source account must be able to read every row of repaired relations
-- dropping or rewriting a relation before repair fails bootstrap
+- repair locks each relation through descriptor validation and every COPY of
+  that batch, rejecting dropped, rewritten, or reshaped relations between batches
 - DDL during greenfield bootstrap is unsupported; affected relations may be
   skipped or fail repair
 - `copy` scans selected table through PostgreSQL SQL path
@@ -75,8 +89,10 @@ externally before replication window. Enable ClickHouse TOAST storage before
 initial load when complete large-value history matters
 
 Reused TOAST value IDs can leave ambiguous generations in backup chunk mirrors
-when hint bits do not prove older chunks dead. COPY repair fixes baseline rows,
-but later unchanged-pointer updates still depend on those mirrors
+when hint bits do not prove older chunks dead. CTID repair fixes baseline rows,
+but later unchanged-pointer updates still depend on those mirrors. Chunk lookup
+orders by `(ver, blkno, offnum)` for determinism, not generation correctness:
+a newer generation at a lower TID can lose when versions tie
 
 ## Not an HA system
 

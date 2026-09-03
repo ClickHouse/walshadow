@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, SliceIo};
 
 use crate::decode::heap_decoder::ColumnValue;
-use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES};
+use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
 use crate::schema::RelAttr;
 
 /// Cell tags, matching `WS_CELL_*` in `pgext/walshadow.h`
@@ -71,21 +71,61 @@ pub struct OracleColumnBuf {
     pub source_typmod: i32,
     cells: Vec<OracleCell>,
     wire_bytes: usize,
+    /// PostgreSQL hands a String target its literal back unchanged, so such
+    /// a column resolves in the daemon while every cell is one
+    string_target: bool,
+    /// Cells no local conversion covers. One is enough to send the whole
+    /// column, literals included
+    remote_cells: usize,
+    /// Wire cost of the literals held so far, owed to the request estimate
+    /// the moment a cell strands them
+    literal_bytes: usize,
 }
 
 impl OracleColumnBuf {
-    pub fn new(source_type_oid: u32, source_typmod: i32) -> Self {
+    pub fn new(source_type_oid: u32, source_typmod: i32, target_type: &str) -> Self {
         Self {
             source_type_oid,
             source_typmod,
             cells: Vec::new(),
             wire_bytes: 0,
+            string_target: matches!(target_type, "String" | "Nullable(String)"),
+            remote_cells: 0,
+            literal_bytes: 0,
         }
     }
 
     pub fn push(&mut self, cell: OracleCell) {
-        self.wire_bytes += cell.wire_bytes();
+        let bytes = cell.wire_bytes();
+        self.wire_bytes += bytes;
+        if self.resolves_locally(&cell) {
+            self.literal_bytes += bytes;
+        } else {
+            self.remote_cells += 1;
+        }
         self.cells.push(cell);
+    }
+
+    /// Whether appending `cell` keeps the column off the request
+    pub fn resolves_locally(&self, cell: &OracleCell) -> bool {
+        self.string_target
+            && self.remote_cells == 0
+            && matches!(cell, OracleCell::Literal(_) | OracleCell::Default)
+    }
+
+    /// Literal bytes a remote cell would drag onto the request, since the
+    /// column then travels whole
+    pub fn stranded_bytes(&self) -> usize {
+        if self.remote_cells == 0 {
+            self.literal_bytes
+        } else {
+            0
+        }
+    }
+
+    /// Column carries `n_rows` cells the daemon can render itself
+    pub fn resolves_batch_locally(&self, n_rows: usize) -> bool {
+        self.string_target && self.remote_cells == 0 && self.cells.len() == n_rows
     }
 
     pub fn cells(&self) -> &[OracleCell] {
@@ -141,6 +181,18 @@ impl Oracle {
         }
     }
 
+    /// Requests the shadow answers at once, ie the bridge's pool width. One
+    /// worker serves one request per loop iteration
+    pub fn concurrency(&self) -> usize {
+        self.bridge.pool_size()
+    }
+
+    /// Round-trip cost of resolution: the request bytes and worker service
+    /// time behind [`OracleStats`]
+    pub fn bridge_stats(&self) -> Arc<crate::ops::bridge::BridgeStats> {
+        self.bridge.stats.clone()
+    }
+
     pub async fn encode_batch(
         &self,
         columns: &[OracleRequestColumn<'_>],
@@ -158,8 +210,11 @@ impl Oracle {
                 )));
             }
         }
-        let payload = encode_request(columns, n_rows);
-        let response = match self.bridge.encode_native(&payload).await {
+        let response = match self
+            .bridge
+            .encode_native(encode_request(columns, n_rows))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 if matches!(e, BridgeError::Remote(_)) {
@@ -201,13 +256,16 @@ pub const ORACLE_BATCH_SEAL_BYTES: usize = 32 << 20;
 
 const _: () = assert!(ORACLE_BATCH_SEAL_BYTES <= MAX_REQUEST_BYTES);
 
-/// Encode all column metadata before row-major cells
+/// Encode all column metadata before row-major cells, past the bridge's
+/// unwritten frame prefix. Seal bytes reach 32 MiB, so building into the
+/// frame rather than into a payload the bridge then copies saves one
+/// allocation and one memcpy of the whole request
 fn encode_request(columns: &[OracleRequestColumn<'_>], n_rows: usize) -> Vec<u8> {
     let size: usize = columns
         .iter()
         .map(|c| request_column_bytes(c.name, c.target_type) + c.buf.approx_size())
         .sum();
-    let mut out = Vec::with_capacity(8 + size);
+    let mut out = request_frame(8 + size);
     out.extend_from_slice(&(n_rows as u32).to_be_bytes());
     out.extend_from_slice(&(columns.len() as u32).to_be_bytes());
     for c in columns {
@@ -364,6 +422,7 @@ impl OracleStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::bridge::FRAME_PREFIX_BYTES;
 
     fn col<'a>(
         ordinal: u32,
@@ -381,16 +440,16 @@ mod tests {
 
     #[test]
     fn request_frames_metadata_then_row_major_cells() {
-        let mut a = OracleColumnBuf::new(1007, -1);
+        let mut a = OracleColumnBuf::new(1007, -1, "Array(Int32)");
         a.push(OracleCell::DiskRaw(vec![9, 9]));
         a.push(OracleCell::Default);
-        let mut b = OracleColumnBuf::new(3802, -1);
+        let mut b = OracleColumnBuf::new(3802, -1, "JSON");
         b.push(OracleCell::Literal(b"x".to_vec()));
         b.push(OracleCell::TextInput(b"{}".to_vec()));
         let cols = [col(0, "t", "Array(Int32)", &a), col(3, "j", "JSON", &b)];
 
         let out = encode_request(&cols, 2);
-        let mut c = 0;
+        let mut c = FRAME_PREFIX_BYTES;
         let u32_at = |c: &mut usize| {
             let v = u32::from_be_bytes(out[*c..*c + 4].try_into().unwrap());
             *c += 4;
@@ -434,12 +493,12 @@ mod tests {
 
     #[test]
     fn request_column_bytes_matches_framed_size() {
-        let mut buf = OracleColumnBuf::new(114, -1);
+        let mut buf = OracleColumnBuf::new(114, -1, "Nullable(JSON)");
         buf.push(OracleCell::Default);
         buf.push(OracleCell::DiskRaw(vec![1, 2, 3]));
         let cols = [col(7, "payload", "Nullable(JSON)", &buf)];
         assert_eq!(
-            encode_request(&cols, 2).len() + 1, // opcode the bridge prepends
+            encode_request(&cols, 2).len() + 1 - FRAME_PREFIX_BYTES,
             REQUEST_FRAME_BYTES
                 + request_column_bytes("payload", "Nullable(JSON)")
                 + buf.approx_size()

@@ -348,9 +348,29 @@ impl Drop for ChServer {
 // ---------------------------------------------------------------------------
 
 pub struct BootstrappedClusters {
-    pub source: Shadow,
-    pub shadow: Shadow,
+    pub source: ClusterGuard,
+    pub shadow: ClusterGuard,
     pub shadow_filter_dir: PathBuf,
+}
+
+/// A started cluster, stopped when the test lets go of it. Nothing else asks
+/// the postmaster to exit, so without this the tempdir is unlinked under a
+/// live one, and the bridge worker's gcov profile, written only at a clean
+/// backend exit, is lost with it
+pub struct ClusterGuard(Shadow);
+
+impl std::ops::Deref for ClusterGuard {
+    type Target = Shadow;
+
+    fn deref(&self) -> &Shadow {
+        &self.0
+    }
+}
+
+impl Drop for ClusterGuard {
+    fn drop(&mut self) {
+        let _ = self.0.stop();
+    }
 }
 
 /// Build tree holding `walshadow.so`, fed to shadow as `dynamic_library_path`.
@@ -495,8 +515,8 @@ async fn bootstrap_clusters_inner(
 
     (
         BootstrappedClusters {
-            source,
-            shadow,
+            source: ClusterGuard(source),
+            shadow: ClusterGuard(shadow),
             shadow_filter_dir,
         },
         shadow_stream_state,
@@ -727,7 +747,7 @@ async fn build_pipeline_inner(
     };
     let bridge_path = shadow.bridge_socket().expect("bridge configured");
     let bridge = Arc::new(
-        walshadow::bridge::connect_with_budget(bridge_path, Duration::from_secs(60))
+        walshadow::bridge::connect_with_budget(bridge_path, 1, Duration::from_secs(60))
             .await
             .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", bridge_path.display())),
     );

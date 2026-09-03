@@ -178,6 +178,10 @@ fn listener_probe_failures_preserve_the_path() {
     // Stale socket, so there is a file whose survival is observable
     drop(UnixListener::bind(&path).expect("stale listener"));
     let stale_inode = fs::metadata(&path).unwrap().ino();
+    // A second link keeps that inode allocated once the path is reclaimed.
+    // Without it the rebind can be handed the number back, as ext4 does, and
+    // the reclaim reads as a survival
+    fs::hard_link(&path, tmp.path().join("stale.pinned")).expect("pin stale inode");
 
     faults.arm(&[
         Rule::fail(Op::Socket, 1, libc::EMFILE), // attempt 1: no probe possible

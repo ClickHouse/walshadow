@@ -10,7 +10,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -27,11 +27,17 @@ pub const PROJECTION_VERSION: u32 = 1;
 
 /// Match `WS_MAX_REQUEST_BYTES`
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024 * 1024;
+/// `len: u32be` then `op: u8`. Request builders reserve this much leading
+/// room so the bridge patches the prefix in place and one `write_all` ships
+/// the frame, rather than reallocating and copying the whole payload
+pub const FRAME_PREFIX_BYTES: usize = 5;
 /// Whole-catalog `pg_type` text output is the largest response in practice
 const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 /// Matches `WS_MAX_SCAN_OIDS`. A longer list is the caller's to chunk, since
 /// only the caller knows whether the chunks share a replay position
 pub const MAX_SCAN_OIDS: usize = 65536;
+/// Matches `WS_MAX_WORKERS`, the ceiling on `walshadow.bridge_workers`
+pub const MAX_BRIDGE_WORKERS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -49,6 +55,13 @@ impl Op {
     /// Index into the per-op stat arrays, parallel to [`OP_LABELS`]
     fn slot(self) -> usize {
         self as usize - 1
+    }
+
+    /// Catalog reads pin to worker 0. `SCAN` answers off a replay position
+    /// it reports back, and `HELLO` establishes the identity every other
+    /// worker is then checked against, so neither may drift between sockets
+    fn pinned(self) -> bool {
+        matches!(self, Op::Hello | Op::Scan)
     }
 }
 
@@ -132,13 +145,74 @@ pub struct Hello {
     pub in_recovery: bool,
 }
 
-/// Own response frame backing borrowed Native block
-#[derive(Clone, Debug)]
-pub struct NativeResponse {
-    frame: Vec<u8>,
+/// Response body a worker answered with, on loan from the bridge's pool.
+/// Parsers borrow it, then it goes back on drop
+#[derive(Debug)]
+pub struct Response<'a> {
+    body: Vec<u8>,
+    len: usize,
+    pool: &'a BufPool,
 }
 
-impl NativeResponse {
+impl std::ops::Deref for Response<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.body[..self.len]
+    }
+}
+
+impl Drop for Response<'_> {
+    fn drop(&mut self) {
+        self.pool.give(std::mem::take(&mut self.body));
+    }
+}
+
+/// Response bodies return here instead of to the allocator. A 32 MiB
+/// `ENCODE_NATIVE` answer otherwise costs a fresh mapping plus a full zeroing
+/// pass per batch, and the daemon asks for one such answer per sealed block.
+/// A pooled body keeps its length, so only the bytes a longer answer adds
+/// ever get zeroed
+#[derive(Debug)]
+struct BufPool {
+    free: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// One body per worker in flight, so a deeper free list only holds
+    /// peak-sized allocations nothing is going to claim
+    cap: usize,
+}
+
+impl BufPool {
+    fn new(cap: usize) -> Self {
+        Self {
+            free: std::sync::Mutex::new(Vec::new()),
+            cap,
+        }
+    }
+
+    fn take(&self) -> Vec<u8> {
+        self.lock().pop().unwrap_or_default()
+    }
+
+    fn give(&self, buf: Vec<u8>) {
+        let mut free = self.lock();
+        if free.len() < self.cap {
+            free.push(buf);
+        }
+    }
+
+    /// Held across `pop`/`push` only, so a panicking caller cannot poison it
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Vec<u8>>> {
+        self.free.lock().expect("bridge response pool")
+    }
+}
+
+/// Native block, borrowed out of the response body it arrived in
+#[derive(Debug)]
+pub struct NativeResponse<'a> {
+    frame: Response<'a>,
+}
+
+impl NativeResponse<'_> {
     pub fn bytes(&self) -> &[u8] {
         &self.frame[1..]
     }
@@ -170,10 +244,20 @@ crate::atomic_stats! {
         /// reads answer these off SQL instead; overlay reads fail
         pub scan_replay_moved,
         pub native_bytes,
+        /// Bridge sockets the pool holds, one per shadow-side worker
+        pub pool_size,
         /// Per-op, indexed by [`OP_LABELS`]
         pub requests: [AtomicU64; OP_COUNT],
         pub errors: [AtomicU64; OP_COUNT],
         pub request_nanos: [AtomicU64; OP_COUNT],
+        /// Queued behind another caller's request on the one socket. Against
+        /// `service_nanos` this is what says whether the worker is the
+        /// limiter or the funnel in front of it is
+        pub lock_wait_nanos: [AtomicU64; OP_COUNT],
+        /// Wire time with the socket held: worker conversion plus transfer
+        pub service_nanos: [AtomicU64; OP_COUNT],
+        pub request_bytes: [AtomicU64; OP_COUNT],
+        pub response_bytes: [AtomicU64; OP_COUNT],
     }
 }
 
@@ -203,12 +287,25 @@ impl BridgeStats {
     }
 }
 
+/// One shadow-side worker's socket. A worker serves one request at a time,
+/// so the mutex is the worker, not an artefact of sharing
 #[derive(Debug)]
-pub struct Bridge {
+struct Slot {
     path: PathBuf,
     conn: Mutex<Option<UnixStream>>,
-    /// Set by the first successful `HELLO`; later dials must match it
+}
+
+#[derive(Debug)]
+pub struct Bridge {
+    /// Slot 0 is `walshadow.socket_path`, slot `i` is `socket_path.i`.
+    /// Stateless ops round-robin; [`Op::pinned`] ops stay on slot 0
+    slots: Vec<Slot>,
+    next: AtomicUsize,
+    /// Set by the first successful `HELLO`; later dials, on any slot, must
+    /// match it. A worker that came back a different build means a mixed
+    /// install and must fail closed
     info: OnceLock<Hello>,
+    bufs: BufPool,
     pub stats: Arc<BridgeStats>,
 }
 
@@ -217,19 +314,55 @@ impl Bridge {
     /// mismatch is refused rather than negotiated: the daemon would misparse
     /// the projections
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, BridgeError> {
+        Self::connect_pooled(path, 1).await
+    }
+
+    /// One socket per shadow-side worker, matching
+    /// `walshadow.bridge_workers`. Every slot must answer: a pool short of
+    /// the configured width is a half-started shadow, and silently running
+    /// narrower would hide it
+    pub async fn connect_pooled(
+        path: impl AsRef<Path>,
+        workers: usize,
+    ) -> Result<Self, BridgeError> {
+        let base = path.as_ref();
+        let slots: Vec<Slot> = (0..workers.clamp(1, MAX_BRIDGE_WORKERS))
+            .map(|i| Slot {
+                path: if i == 0 {
+                    base.to_owned()
+                } else {
+                    PathBuf::from(format!("{}.{i}", base.display()))
+                },
+                conn: Mutex::new(None),
+            })
+            .collect();
         let bridge = Self {
-            path: path.as_ref().to_owned(),
-            conn: Mutex::new(None),
+            bufs: BufPool::new(slots.len()),
+            slots,
+            next: AtomicUsize::new(0),
             info: OnceLock::new(),
             stats: Arc::new(BridgeStats::default()),
         };
-        let stream = bridge.dial().await?;
-        *bridge.conn.lock().await = Some(stream);
+        // Slot 0 first, so its HELLO is the identity the rest are checked
+        // against rather than whichever worker happened to answer first
+        for slot in &bridge.slots {
+            let stream = bridge.dial(slot).await?;
+            *slot.conn.lock().await = Some(stream);
+        }
+        bridge
+            .stats
+            .pool_size
+            .store(bridge.slots.len() as u64, Ordering::Relaxed);
         Ok(bridge)
     }
 
+    /// `walshadow.socket_path`, ie slot 0
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.slots[0].path
+    }
+
+    pub fn pool_size(&self) -> usize {
+        self.slots.len()
     }
 
     /// `None` before the first successful `HELLO`, which [`connect`](Self::connect)
@@ -244,13 +377,14 @@ impl Bridge {
 
     /// `pg_last_wal_replay_lsn` by shared-memory read, one round trip
     pub async fn replay_lsn(&self) -> Result<u64, BridgeError> {
-        let body = self.call(Op::ReplayLsn, &[]).await?;
+        let body = self.call(Op::ReplayLsn, request_frame(0)).await?;
         Cursor::at(&body, 1).u64()
     }
 
-    /// Return response remainder as one locally framed Native block
-    pub async fn encode_native(&self, payload: &[u8]) -> Result<NativeResponse, BridgeError> {
-        let frame = self.call(Op::EncodeNative, payload).await?;
+    /// Return response remainder as one locally framed Native block.
+    /// `frame` carries [`FRAME_PREFIX_BYTES`] of unwritten leading room
+    pub async fn encode_native(&self, frame: Vec<u8>) -> Result<NativeResponse<'_>, BridgeError> {
+        let frame = self.call(Op::EncodeNative, frame).await?;
         self.stats
             .native_bytes
             .fetch_add((frame.len() - 1) as u64, Ordering::Relaxed);
@@ -288,16 +422,16 @@ impl Bridge {
         oids: &[u32],
         boundary: u64,
     ) -> Result<ScanResult, BridgeError> {
-        let mut payload = Vec::with_capacity(17 + oids.len() * 4);
-        payload.push(cat as u8);
-        payload.extend_from_slice(&top_xid.to_be_bytes());
-        payload.extend_from_slice(&boundary.to_be_bytes());
-        payload.extend_from_slice(&(oids.len() as u32).to_be_bytes());
+        let mut frame = request_frame(17 + oids.len() * 4);
+        frame.push(cat as u8);
+        frame.extend_from_slice(&top_xid.to_be_bytes());
+        frame.extend_from_slice(&boundary.to_be_bytes());
+        frame.extend_from_slice(&(oids.len() as u32).to_be_bytes());
         for oid in oids {
-            payload.extend_from_slice(&oid.to_be_bytes());
+            frame.extend_from_slice(&oid.to_be_bytes());
         }
 
-        let body = self.call(Op::Scan, &payload).await?;
+        let body = self.call(Op::Scan, frame).await?;
         let mut c = Cursor::at(&body, 1);
         let replay_lsn_start = c.u64()?;
         let replay_lsn_end = c.u64()?;
@@ -387,14 +521,18 @@ impl Bridge {
 
     /// Fresh socket plus `HELLO`. Takes no connection lock, so
     /// [`call`](Self::call) may hold one across it
-    async fn dial(&self) -> Result<UnixStream, BridgeError> {
-        let mut stream = UnixStream::connect(&self.path).await?;
+    async fn dial(&self, slot: &Slot) -> Result<UnixStream, BridgeError> {
+        let mut stream = UnixStream::connect(&slot.path).await?;
+        widen_sockbufs(&stream);
         let started = Instant::now();
-        let res = round_trip(&mut stream, Op::Hello, &[]).await;
+        let mut hello = request_frame(0);
+        patch_frame(&mut hello, Op::Hello);
+        let mut body = Vec::new();
+        let res = round_trip(&mut stream, &hello, &mut body).await;
         self.record(Op::Hello, started, &res);
-        let body = res?;
+        let len = res?;
 
-        let mut c = Cursor::at(&body, 1);
+        let mut c = Cursor::at(&body[..len], 1);
         let info = Hello {
             proto: c.u32()?,
             projection: c.u32()?,
@@ -420,11 +558,13 @@ impl Bridge {
         Ok(stream)
     }
 
-    async fn call(&self, op: Op, payload: &[u8]) -> Result<Vec<u8>, BridgeError> {
+    /// `frame` carries [`FRAME_PREFIX_BYTES`] of unwritten leading room,
+    /// patched here rather than copied into a second buffer
+    async fn call(&self, op: Op, mut frame: Vec<u8>) -> Result<Response<'_>, BridgeError> {
         let started = Instant::now();
         // Refuse before the socket sees it: the worker answers a frame this
         // size by closing, and a healthy connection must not pay for that
-        let len = payload.len() + 1;
+        let len = frame.len() - FRAME_PREFIX_BYTES + 1;
         if len > MAX_REQUEST_BYTES {
             let res = Err(BridgeError::RequestTooLarge {
                 len,
@@ -433,9 +573,19 @@ impl Bridge {
             self.record(op, started, &res);
             return res;
         }
-        let mut guard = self.conn.lock().await;
+        patch_frame(&mut frame, op);
+        let stat = op.slot();
+        self.stats.request_bytes[stat].fetch_add(frame.len() as u64, Ordering::Relaxed);
+        let slot = self.pick(op);
+        let mut body = self.bufs.take();
+        let mut guard = slot.conn.lock().await;
+        let held = Instant::now();
+        self.stats.lock_wait_nanos[stat].fetch_add(
+            held.duration_since(started).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         let mut res = match guard.as_mut() {
-            Some(stream) => round_trip(stream, op, payload).await,
+            Some(stream) => round_trip(stream, &frame, &mut body).await,
             None => Err(BridgeError::Io(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "bridge disconnected",
@@ -446,9 +596,9 @@ impl Bridge {
         if is_transport_error(&res) {
             *guard = None;
             self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
-            match self.dial().await {
+            match self.dial(slot).await {
                 Ok(mut stream) => {
-                    res = round_trip(&mut stream, op, payload).await;
+                    res = round_trip(&mut stream, &frame, &mut body).await;
                     if !is_transport_error(&res) {
                         *guard = Some(stream);
                     }
@@ -457,11 +607,37 @@ impl Bridge {
             }
         }
         drop(guard);
+        self.stats.service_nanos[stat]
+            .fetch_add(held.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Ok(len) = &res {
+            self.stats.response_bytes[stat].fetch_add(*len as u64, Ordering::Relaxed);
+        }
         self.record(op, started, &res);
-        res
+        match res {
+            Ok(len) => Ok(Response {
+                body,
+                len,
+                pool: &self.bufs,
+            }),
+            Err(e) => {
+                self.bufs.give(body);
+                Err(e)
+            }
+        }
     }
 
-    fn record(&self, op: Op, started: Instant, res: &Result<Vec<u8>, BridgeError>) {
+    /// Round-robin over the pool, except for ops pinned to worker 0.
+    /// `ENCODE_NATIVE` is stateless and read-only, so any worker answers any
+    /// request
+    fn pick(&self, op: Op) -> &Slot {
+        if op.pinned() || self.slots.len() == 1 {
+            return &self.slots[0];
+        }
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        &self.slots[i]
+    }
+
+    fn record<T>(&self, op: Op, started: Instant, res: &Result<T, BridgeError>) {
         let slot = op.slot();
         self.stats.requests[slot].fetch_add(1, Ordering::Relaxed);
         self.stats.request_nanos[slot]
@@ -479,23 +655,60 @@ impl Bridge {
     }
 }
 
-fn is_transport_error(res: &Result<Vec<u8>, BridgeError>) -> bool {
+fn is_transport_error<T>(res: &Result<T, BridgeError>) -> bool {
     matches!(res, Err(e) if e.is_transport())
 }
 
+/// Matches `WS_SOCKBUF_BYTES` in `pgext/worker.c`. A multi-megabyte frame
+/// against default socket buffers costs hundreds of `EAGAIN` round trips
+/// on each side, so both ends ask for a wide window
+const SOCKBUF_BYTES: libc::c_int = 4 * 1024 * 1024;
+
+/// Advisory: a kernel that refuses leaves the default, which only costs
+/// more wakeups. The worker widens its own end on accept
+fn widen_sockbufs(stream: &UnixStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let want = SOCKBUF_BYTES;
+    for opt in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        // SAFETY: `fd` is owned by `stream` and outlives the call; `want` is
+        // a live `c_int` of the length passed
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (&raw const want).cast(),
+                std::mem::size_of_val(&want) as libc::socklen_t,
+            );
+        }
+    }
+}
+
+/// Leading room for the length + opcode prefix, unwritten until the bridge
+/// knows both
+pub fn request_frame(payload_capacity: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(FRAME_PREFIX_BYTES + payload_capacity);
+    v.resize(FRAME_PREFIX_BYTES, 0);
+    v
+}
+
+fn patch_frame(frame: &mut [u8], op: Op) {
+    let len = (frame.len() - FRAME_PREFIX_BYTES + 1) as u32;
+    frame[..4].copy_from_slice(&len.to_be_bytes());
+    frame[4] = op as u8;
+}
+
+/// One write: a peer that dribbles a partial frame is what the worker's
+/// io_timeout_ms exists to bound, and the daemon must not be that peer
+/// Answer lands in `body`, whose length is the high-water mark of every
+/// answer that buffer has carried; the returned count is this one's
 async fn round_trip(
     stream: &mut UnixStream,
-    op: Op,
-    payload: &[u8],
-) -> Result<Vec<u8>, BridgeError> {
-    let len = payload.len() + 1;
-    // One write: a peer that dribbles a partial frame is what the worker's
-    // io_timeout_ms exists to bound, and the daemon must not be that peer
-    let mut frame = Vec::with_capacity(4 + len);
-    frame.extend_from_slice(&(len as u32).to_be_bytes());
-    frame.push(op as u8);
-    frame.extend_from_slice(payload);
-    stream.write_all(&frame).await?;
+    frame: &[u8],
+    body: &mut Vec<u8>,
+) -> Result<usize, BridgeError> {
+    stream.write_all(frame).await?;
     stream.flush().await?;
 
     let mut hdr = [0u8; 4];
@@ -506,12 +719,15 @@ async fn round_trip(
             "response frame of {len} bytes"
         )));
     }
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).await?;
+    if body.len() < len {
+        body.resize(len, 0);
+    }
+    let body = &mut body[..len];
+    stream.read_exact(body).await?;
 
     match body[0] {
-        0 => Ok(body),
-        1 => Err(BridgeError::Remote(Cursor::at(&body, 1).lenstr()?)),
+        0 => Ok(len),
+        1 => Err(BridgeError::Remote(Cursor::at(body, 1).lenstr()?)),
         s => Err(BridgeError::Protocol(format!("response status {s}"))),
     }
 }
@@ -519,9 +735,13 @@ async fn round_trip(
 /// Connect with a wall-clock budget while shadow reaches consistency.
 /// Matches catalog's
 /// [`with_transient_retry`](crate::catalog::shadow_catalog::with_transient_retry) shape
-pub async fn connect_with_budget(path: &Path, budget: Duration) -> Result<Bridge, BridgeError> {
+pub async fn connect_with_budget(
+    path: &Path,
+    workers: usize,
+    budget: Duration,
+) -> Result<Bridge, BridgeError> {
     let deadline = tokio::time::Instant::now() + budget;
-    (|| Bridge::connect(path))
+    (|| Bridge::connect_pooled(path, workers))
         .retry(
             ExponentialBuilder::default()
                 .with_min_delay(Duration::from_millis(100))
@@ -968,12 +1188,36 @@ mod tests {
         ]);
 
         let bridge = Bridge::connect(&path).await.unwrap();
-        let out = bridge.encode_native(&[0u8; 8]).await.unwrap();
+        let mut req = request_frame(8);
+        req.extend_from_slice(&[0u8; 8]);
+        let out = bridge.encode_native(req).await.unwrap();
         assert_eq!(out.bytes(), &native[..]);
         assert_eq!(
             bridge.stats.native_bytes.load(Ordering::Relaxed),
             native.len() as u64
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pooled_body_carries_a_shorter_answer_after_a_longer_one() {
+        let long = vec![b'L'; 4096];
+        let short = vec![b'S'; 7];
+        let framed = |payload: &[u8]| {
+            let mut b = vec![0u8];
+            b.extend_from_slice(payload);
+            b
+        };
+        let (_tmp, path) = spawn_worker(vec![
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(framed(&long)),
+            Some(framed(&short)),
+        ]);
+
+        let bridge = Bridge::connect(&path).await.unwrap();
+        for want in [&long, &short] {
+            let out = bridge.encode_native(request_frame(0)).await.unwrap();
+            assert_eq!(out.bytes(), &want[..], "answer of {} bytes", want.len());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1062,8 +1306,9 @@ mod tests {
         let (_tmp, path) = spawn_worker(vec![Some(hello_body(PROTO_VERSION, PROJECTION_VERSION))]);
 
         let bridge = Bridge::connect(&path).await.unwrap();
-        let huge = vec![0u8; MAX_REQUEST_BYTES];
-        let err = bridge.encode_native(&huge).await.unwrap_err();
+        let mut huge = request_frame(MAX_REQUEST_BYTES);
+        huge.resize(FRAME_PREFIX_BYTES + MAX_REQUEST_BYTES, 0);
+        let err = bridge.encode_native(huge).await.unwrap_err();
         assert!(
             matches!(err, BridgeError::RequestTooLarge { .. }),
             "got {err:?}"

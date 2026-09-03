@@ -28,6 +28,7 @@ impl BootstrapOracle {
         source_conninfo: String,
         source_password: Option<String>,
         bridge_lib_dir: Option<PathBuf>,
+        workers: usize,
         connect_budget: Duration,
     ) -> Result<Self> {
         let data_dir = base_dir.join("pg");
@@ -73,6 +74,7 @@ impl BootstrapOracle {
             let mut bridge = BridgeConf::in_dir(&b_sock);
             bridge.socket_path = b_bridge;
             bridge.library_dir = bridge_lib_dir;
+            bridge.workers = workers;
             let cfg_b = oracle_cfg(&b_data, &b_base, &b_sock, Some(bridge));
             let b = Shadow::new(cfg_b);
             b.write_base_conf().context("serve conf")?;
@@ -83,9 +85,10 @@ impl BootstrapOracle {
         .context("bootstrap oracle provision task")?
         .context("bootstrap oracle provision")?;
 
-        let bridge = crate::ops::bridge::connect_with_budget(&bridge_socket, connect_budget)
-            .await
-            .context("bootstrap oracle bridge connect")?;
+        let bridge =
+            crate::ops::bridge::connect_with_budget(&bridge_socket, workers, connect_budget)
+                .await
+                .context("bootstrap oracle bridge connect")?;
         Ok(Self {
             shadow,
             oracle: Arc::new(Oracle::new(Arc::new(bridge))),
@@ -95,6 +98,12 @@ impl BootstrapOracle {
 
     pub fn oracle(&self) -> Arc<Oracle> {
         self.oracle.clone()
+    }
+
+    /// Outlives the throwaway PG, so bootstrap's oracle cost keeps rendering
+    /// after handoff
+    pub fn bridge_stats(&self) -> Arc<crate::ops::bridge::BridgeStats> {
+        self.oracle.bridge_stats()
     }
 }
 
@@ -260,6 +269,7 @@ fn should_drop_entry(seg: &[&str], excluded: &std::collections::HashSet<&str>) -
     })
 }
 
+/// Include every mapped relation, window WAL also emits snapshot opt-outs
 pub fn needs_oracle(
     catalog: &CatalogMap,
     tables: &MappingSnapshot,

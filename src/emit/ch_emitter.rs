@@ -1349,7 +1349,11 @@ pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterE
             ColumnEncoding::Oracle {
                 source_type_oid,
                 source_typmod,
-            } => ColumnBuf::Oracle(OracleColumnBuf::new(source_type_oid, source_typmod)),
+            } => ColumnBuf::Oracle(OracleColumnBuf::new(
+                source_type_oid,
+                source_typmod,
+                &c.type_repr,
+            )),
         });
     }
     buffers.push(ColumnBuf::Fixed {
@@ -1426,15 +1430,23 @@ impl TableEncoder {
         let mut cells = std::mem::take(&mut self.oracle_cells);
         cells.clear();
         let mut row_oracle_bytes = 0usize;
+        // Literals bound for a String target never reach the request, so they
+        // owe it nothing until a cell needing conversion strands them
+        let mut stranded_bytes = 0usize;
         for (i, col) in mapping.columns.iter().enumerate() {
             if let ColumnBuf::Oracle(o) = &self.buffers[i] {
                 let cell = oracle_cell(value_of(col), o.source_type_oid)
                     .map_err(|e| name_column(e, &col.target_name))?;
-                row_oracle_bytes += cell.wire_bytes();
+                if !o.resolves_locally(&cell) {
+                    row_oracle_bytes += cell.wire_bytes();
+                    stranded_bytes += o.stranded_bytes();
+                }
                 cells.push(cell);
             }
         }
-        if self.rows > 0 && self.oracle_bytes + row_oracle_bytes > ORACLE_BATCH_SEAL_BYTES {
+        if self.rows > 0
+            && self.oracle_bytes + row_oracle_bytes + stranded_bytes > ORACLE_BATCH_SEAL_BYTES
+        {
             cells.clear();
             self.oracle_cells = cells;
             return Ok(Append::Full);
@@ -1467,7 +1479,7 @@ impl TableEncoder {
         }
         cells.clear();
         self.oracle_cells = cells;
-        self.oracle_bytes += row_oracle_bytes;
+        self.oracle_bytes += row_oracle_bytes + stranded_bytes;
         // Synthetic columns: lsn, xid, commit_ts (unix micros), delete marker
         let off = mapping.columns.len();
         push_fixed(&mut self.buffers[off], &decoded.source_lsn.to_le_bytes())?;
@@ -1495,7 +1507,36 @@ fn name_column(mut e: EmitterError, target: &str) -> EmitterError {
     e
 }
 
-/// Build stable leaves before roots borrow them
+/// PostgreSQL returns literal String cells unchanged
+pub(crate) fn literal_column(
+    buf: &OracleColumnBuf,
+    target_type: &str,
+    n_rows: usize,
+) -> Option<ColumnBuf> {
+    if !buf.resolves_batch_locally(n_rows) {
+        return None;
+    }
+    let offsets = Vec::with_capacity(n_rows);
+    let data = Vec::new();
+    let mut local = if target_type == "Nullable(String)" {
+        ColumnBuf::NullableString {
+            offsets,
+            data,
+            null_map: Vec::with_capacity(n_rows),
+        }
+    } else {
+        ColumnBuf::String { offsets, data }
+    };
+    for cell in buf.cells() {
+        if let OracleCell::Literal(bytes) = cell {
+            local.append_string_bytes(bytes).ok()?;
+        } else {
+            local.append_default();
+        }
+    }
+    Some(local)
+}
+
 pub(crate) fn build_leaf(
     buf: &ColumnBuf,
     n_rows: usize,
@@ -2001,6 +2042,19 @@ crate::atomic_stats! {
         pub insertbatch_rows_in,
         pub insertbatch_batches_out,
         pub inserter_batches_in,
+        /// Inserter time inside the INSERT round trip (`send_query` through
+        /// `EndOfStream`), retries included. Against `inserter_pool_size ×
+        /// elapsed` this is CH-side utilization
+        pub inserter_ch_nanos,
+        /// Inserter time rebuilding the Native block over the batch's slabs
+        pub inserter_encode_nanos,
+        /// Resolver time inside the oracle round trip, retries included.
+        /// Overlaps the inserters' ClickHouse time, so against
+        /// `inserter_ch_nanos` it says which stage is the limiter
+        pub oracle_resolve_nanos,
+        /// Oracle-routed columns the daemon built itself: rendered cells
+        /// against a `String` target, which PG would hand straight back
+        pub oracle_local_columns,
     }
 }
 
@@ -2381,6 +2435,94 @@ mod tests {
             let ast = TypeAst::parse(name, alloc).expect("parses");
             assert_eq!(ast.view().elem_size(), 0, "{name}");
         }
+    }
+
+    #[test]
+    fn literal_column_requires_string_target_and_rendered_cells() {
+        let mut buf = OracleColumnBuf::new(0, -1, "String");
+        buf.push(OracleCell::Literal(b"a".to_vec()));
+        buf.push(OracleCell::Default);
+        match literal_column(&buf, "String", 2) {
+            Some(ColumnBuf::String { offsets, data }) => {
+                assert_eq!(data, b"a");
+                assert_eq!(offsets, [1, 1]);
+            }
+            other => panic!("got {other:?}"),
+        }
+        for reject in ["Array(String)", "LowCardinality(String)", "JSON", "Int32"] {
+            let mut buf = OracleColumnBuf::new(0, -1, reject);
+            buf.push(OracleCell::Literal(b"a".to_vec()));
+            buf.push(OracleCell::Default);
+            assert!(
+                literal_column(&buf, reject, 2).is_none(),
+                "{reject} needs the worker",
+            );
+        }
+        // Cell count must match the batch, else offsets would not
+        assert!(literal_column(&buf, "String", 3).is_none());
+        for cell in [
+            OracleCell::DiskRaw(b"a".to_vec()),
+            OracleCell::TextInput(b"a".to_vec()),
+        ] {
+            let mut buf = OracleColumnBuf::new(0, -1, "String");
+            buf.push(OracleCell::Literal(b"a".to_vec()));
+            buf.push(cell);
+            for target in ["String", "Nullable(String)"] {
+                assert!(literal_column(&buf, target, 2).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn literal_string_cells_stay_off_the_oracle_batch_estimate() {
+        let alloc = Allocator::stdlib();
+        let mut rel = mk_rel();
+        // Source type the local matrix misses, so `name` plans as an oracle
+        // column while its String target still renders literals in-daemon
+        rel.attributes[1].type_oid = 17_000;
+        let m = mk_mapping();
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.columns[1].encoding,
+            ColumnEncoding::Oracle { .. }
+        ));
+        let mut enc = TableEncoder::new(plan).unwrap();
+        let overhead = enc.oracle_bytes;
+        let big = "x".repeat(ORACLE_BATCH_SEAL_BYTES * 3 / 5);
+        for id in 1..=2 {
+            assert_eq!(
+                enc.append_row(&committed(id, Some(&big)), &m, OP_INSERT)
+                    .unwrap(),
+                Append::Done,
+                "literal rows do not seal",
+            );
+        }
+        assert_eq!(
+            enc.oracle_bytes, overhead,
+            "literals owe the request nothing"
+        );
+        // A cell needing conversion sends the column whole, so the literals
+        // it strands seal the batch rather than overrun the frame cap
+        let mut json_row = committed(3, None);
+        json_row.decoded.new.as_mut().expect("insert tuple").columns[1] =
+            Some(ColumnValue::Json("{}".into()));
+        assert_eq!(
+            enc.append_row(&json_row, &m, OP_INSERT).unwrap(),
+            Append::Full
+        );
+        let (buffers, rows) = enc.take_block().unwrap();
+        assert_eq!(rows, 2);
+        let ColumnBuf::Oracle(o) = &buffers[1] else {
+            panic!("oracle column")
+        };
+        assert!(literal_column(o, "Nullable(String)", rows).is_some());
     }
 
     #[test]

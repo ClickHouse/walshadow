@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use clickhouse_c::Allocator;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::ch::EmitterError;
 use crate::config::ResolvedConfig;
@@ -23,15 +23,17 @@ use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::emit::pipeline::inserter;
+use crate::emit::pipeline::resolver::{self, ResolvedBatch};
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::pos::{EmitterAck, Monotone};
 use ahash::{HashMap, HashMapExt};
 
 /// Spawned tail stages; holding this keeps the tasks owned by the caller.
 pub struct TailParts {
-    collector: JoinHandle<()>,
-    batcher: JoinHandle<()>,
-    inserters: Vec<JoinHandle<()>>,
+    collector: AbortOnDropHandle<()>,
+    batcher: AbortOnDropHandle<()>,
+    resolvers: Vec<AbortOnDropHandle<()>>,
+    inserters: Vec<AbortOnDropHandle<()>>,
 }
 
 impl TailParts {
@@ -40,6 +42,9 @@ impl TailParts {
     /// channel close and this hangs.
     pub async fn join(self) {
         let _ = self.batcher.await;
+        for h in self.resolvers {
+            let _ = h.await;
+        }
         for h in self.inserters {
             let _ = h.await;
         }
@@ -102,8 +107,6 @@ pub struct OwnedTail {
 }
 
 impl OwnedTail {
-    /// Bounded legs pass `inserter_pool_size = 1`: they replay serially, and
-    /// the batcher's queue already overlaps insert with decode
     pub async fn spawn(
         emitter: &EmitterConfig,
         inserter_pool_size: usize,
@@ -185,6 +188,7 @@ pub fn spawn_null(
     emitter_ack: Arc<Monotone<EmitterAck>>,
 ) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
     let (ack, collector) = ack::spawn(emitter_ack);
+    let collector = AbortOnDropHandle::new(collector);
     let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let swallow_ack = ack.clone();
     let batcher = tokio::spawn(async move {
@@ -209,7 +213,8 @@ pub fn spawn_null(
         ack,
         TailParts {
             collector,
-            batcher,
+            batcher: AbortOnDropHandle::new(batcher),
+            resolvers: Vec::new(),
             inserters: Vec::new(),
         },
     )
@@ -230,25 +235,42 @@ pub async fn spawn_with_config(
     let n = inserter_pool_size.max(1);
 
     let (ack, collector) = ack::spawn(emitter_ack);
+    let collector = AbortOnDropHandle::new(collector);
 
     // Rows and FlushAll share one FIFO channel so a flush can't overtake rows
     // enqueued before it
     let (msg_tx, msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let (batches_tx, batches_rx) = async_channel::bounded::<InsertBatch>((n * 2).max(4));
+    // One resolved batch per inserter is what keeps every one of them fed
+    let (resolved_tx, resolved_rx) = async_channel::bounded::<ResolvedBatch>(n);
 
     let inserters = inserter::spawn_pool(
         n,
         emitter,
-        batches_rx,
+        resolved_rx,
         ack.clone(),
         stats.clone(),
         fatal.clone(),
         inserter::PoolOptions {
             config_rx: config_rx.clone(),
-            oracle,
         },
     )
     .await?;
+
+    // As wide as the bridge: a narrower pool leaves shadow workers idle, a
+    // wider one only queues on their sockets
+    let resolvers = resolver::spawn_pool(
+        oracle.as_ref().map_or(1, |o| o.concurrency()),
+        batches_rx,
+        resolved_tx,
+        resolver::ResolverOptions {
+            oracle,
+            retry: emitter.retry.clone(),
+            stats: stats.clone(),
+            fatal: fatal.clone(),
+            config_rx: config_rx.clone(),
+        },
+    );
 
     // Boot fallback for the batcher; the live path re-reads from `config_rx`.
     let flush_timeout = if emitter.flush_timeout.is_zero() {
@@ -275,8 +297,24 @@ pub async fn spawn_with_config(
         ack,
         TailParts {
             collector,
-            batcher,
-            inserters,
+            batcher: AbortOnDropHandle::new(batcher),
+            resolvers: resolvers.into_iter().map(AbortOnDropHandle::new).collect(),
+            inserters: inserters.into_iter().map(AbortOnDropHandle::new).collect(),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropped_tail_closes_workers_with_live_producers() {
+        let (tx, ack, parts) = spawn_null(Arc::new(Monotone::new(0)));
+        drop(parts);
+        tokio::time::timeout(std::time::Duration::from_secs(1), tx.closed())
+            .await
+            .unwrap();
+        drop(ack);
+    }
 }

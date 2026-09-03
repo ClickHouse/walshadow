@@ -51,7 +51,7 @@ pub fn pgext_dir() -> PathBuf {
 
 const MAGIC: u32 = 0x5753_4831; // "WSH1"
 const MAX_RULES: usize = 16;
-const N_OPS: usize = 10;
+const N_OPS: usize = 11;
 /// magic, generation, rules_parsed, reserved
 const HEADER_WORDS: usize = 4;
 
@@ -68,6 +68,7 @@ pub enum Op {
     Chmod,
     Fcntl,
     Close,
+    Setsockopt,
 }
 
 impl Op {
@@ -83,6 +84,7 @@ impl Op {
             Self::Chmod => "chmod",
             Self::Fcntl => "fcntl",
             Self::Close => "close",
+            Self::Setsockopt => "setsockopt",
         }
     }
 
@@ -98,6 +100,7 @@ impl Op {
             Self::Chmod => 7,
             Self::Fcntl => 8,
             Self::Close => 9,
+            Self::Setsockopt => 10,
         }
     }
 }

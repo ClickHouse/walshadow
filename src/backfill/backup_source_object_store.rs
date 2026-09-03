@@ -28,9 +28,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-
-use tokio::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -45,7 +42,7 @@ use crate::backfill::backup_sentinel::build_lsn_pair;
 #[cfg(test)]
 use crate::backfill::backup_sentinel::{parse_timeline_from_name, tablespaces_from_spec};
 use crate::backfill::backup_source::{
-    BackupSink, BackupSource, EndInfo, StartInfo, pump_tar_to_sink,
+    BackupSink, BackupSource, EndInfo, PumpStats, PumpTarget, StartInfo, pump_tar_to_sink,
 };
 
 /// `parallelism` bounds in-flight data parts; `pg_control` always runs
@@ -90,7 +87,8 @@ impl BackupSource for ObjectStoreSource {
     async fn run(
         self: Box<Self>,
         data_dir: PathBuf,
-        sink: Arc<Mutex<dyn BackupSink>>,
+        sink: Arc<dyn BackupSink>,
+        stats: Arc<PumpStats>,
     ) -> Result<(StartInfo, EndInfo)> {
         let ObjectStoreSource {
             settings,
@@ -124,10 +122,7 @@ impl BackupSource for ObjectStoreSource {
         }
 
         let (start, end) = build_lsn_pair(&resolved, &sentinel)?;
-        {
-            let mut g = sink.lock().await;
-            g.start(&start).await?;
-        }
+        sink.start(&start).await?;
 
         let parts = list_tar_parts(&storage, &resolved).await?;
         if parts.is_empty() {
@@ -149,10 +144,7 @@ impl BackupSource for ObjectStoreSource {
             "draining tar partitions"
         );
 
-        // Shared counter across concurrent parts; unique EntryId per
-        // entry keeps interleaved begin/chunk on the shared sink mutex
-        // from clobbering each other's page-walk slot.
-        let next_entry = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(PumpTarget::new(data_dir, sink.clone(), stats));
 
         // Phase A: bounded fan-out of data parts via buffer_unordered
         // try_collect short-circuits on the first part error. A plain
@@ -161,16 +153,9 @@ impl BackupSource for ObjectStoreSource {
             .map(|key| {
                 let storage = storage.clone();
                 let settings = settings.clone();
-                let data_dir = data_dir.clone();
-                let sink = sink.clone();
-                let next_entry = next_entry.clone();
                 let spool = part_spool_dir.clone();
-                async move {
-                    unpack_one_part(
-                        &settings, &storage, &key, &data_dir, &spool, sink, next_entry,
-                    )
-                    .await
-                }
+                let target = target.clone();
+                async move { unpack_one_part(&settings, &storage, &key, &spool, &target).await }
             })
             .buffer_unordered(parallelism)
             .try_collect::<Vec<_>>()
@@ -179,22 +164,10 @@ impl BackupSource for ObjectStoreSource {
         // Phase B: pg_control barrier, single-task. wal-g emits one
         // control part; walk in sorted order if ever more
         for key in &control_parts {
-            unpack_one_part(
-                &settings,
-                &storage,
-                key,
-                &data_dir,
-                &part_spool_dir,
-                sink.clone(),
-                next_entry.clone(),
-            )
-            .await?;
+            unpack_one_part(&settings, &storage, key, &part_spool_dir, &target).await?;
         }
 
-        {
-            let mut g = sink.lock().await;
-            g.finish(&end).await?;
-        }
+        sink.finish(&end).await?;
         Ok((start, end))
     }
 }
@@ -206,10 +179,8 @@ async fn unpack_one_part(
     settings: &Settings,
     storage: &DynStorage,
     key: &str,
-    data_dir: &std::path::Path,
     part_spool_dir: &std::path::Path,
-    sink: Arc<Mutex<dyn BackupSink>>,
-    next_entry: Arc<AtomicU64>,
+    target: &PumpTarget,
 ) -> Result<()> {
     let method = method_from_key(key);
     let body = storage
@@ -222,7 +193,7 @@ async fn unpack_one_part(
     let decoded = compression::decode(method, Box::pin(spooled));
 
     let mut archive = tokio_tar::Archive::new(decoded);
-    pump_tar_to_sink(&mut archive, data_dir, &sink, &next_entry)
+    pump_tar_to_sink(&mut archive, target)
         .await
         .with_context(|| format!("ObjectStoreSource: tar unpack {key}"))?;
     tracing::info!(
@@ -242,6 +213,13 @@ async fn unpack_one_part(
 /// so no error or panic path can leak it. Same trick as
 /// [`crate::spill::BodySpoolFile`]. Bytes are still compressed here, so
 /// scratch tracks object size rather than the unpacked tar.
+///
+/// Per-entry tap sinks removed the shared-lock stall this was also
+/// covering, and the page walk outruns any realistic GET, but the spool
+/// stays: the pipeline it feeds backpressures
+/// on ClickHouse by design, so a live body would be held for however long
+/// CH is the limiter, which the 60s cap does not allow. Decode speed was
+/// never the binding term.
 async fn spool_backup_part(
     dir: &std::path::Path,
     key: &str,

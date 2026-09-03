@@ -81,7 +81,7 @@ async fn open_catalog(shadow: &Shadow, replay_timeout: Duration) -> ShadowCatalo
 async fn open_bridge(shadow: &Shadow) -> Arc<Bridge> {
     let path = shadow.bridge_socket().expect("bridge configured");
     Arc::new(
-        walshadow::bridge::connect_with_budget(path, Duration::from_secs(20))
+        walshadow::bridge::connect_with_budget(path, 1, Duration::from_secs(20))
             .await
             .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", path.display())),
     )

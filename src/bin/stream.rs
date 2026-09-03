@@ -49,11 +49,12 @@ use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
 use walshadow::backfill::visibility_gate::{
-    GateStats, PendingGate, resolve_greenfield, stream_phase,
+    GateOutput, GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
 };
-use walshadow::backfill::visibility_repair::PendingSet;
+use walshadow::backfill::visibility_repair::RepairScope;
 use walshadow::backfill_bootstrap::{
-    BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
+    BootstrapConfig, BootstrapOutcome, BootstrapProgress, drain_backfill, seed_in_snapshot,
+    spawn_greenfield_bootstrap,
 };
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
@@ -71,7 +72,7 @@ use walshadow::mapping::{DropTableStrategy, MappingHandle};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
 use walshadow::pg::{quote_ident, socket_conninfo};
 use walshadow::pipeline::tail::OwnedTail;
-use walshadow::pipeline::{Fatal, PipelineConfig, TailKind, bootstrap};
+use walshadow::pipeline::{Fatal, PipelineConfig, TailKind};
 use walshadow::pos::{
     Drain, EmitterAck, FilterDispatched, FilterDurable, Floor, Gate, Monotone, Pos, ShadowFlush,
     ShadowReplay, SourceReceived,
@@ -553,11 +554,14 @@ struct Args {
     /// cost matters more than bootstrap latency.
     #[arg(long, default_value_t = true)]
     bootstrap_fast_checkpoint: bool,
-    /// BASE_BACKUP `MAX_RATE` in kB/s for `direct` mode (PG accepts
-    /// 32..1048576). Caps the backup's read bandwidth on the source; the
-    /// window WAL leg keeps the destination converging while it streams
+    /// Cap direct BASE_BACKUP and bootstrap COPY repair separately in KiB/s
+    /// PostgreSQL accepts 32..1048576; window WAL remains unthrottled
     #[arg(long, value_parser = clap::value_parser!(i32).range(32..=1_048_576))]
     bootstrap_max_rate_kib: Option<i32>,
+    /// Wait this many seconds for transactions crossing live bootstrap handoff
+    /// Zero resumes immediately from oldest buffered record
+    #[arg(long, default_value_t = 5)]
+    bootstrap_wind_down_secs: u64,
     /// Fetch the bootstrap WAL window from the `[backup]` bucket instead of
     /// inside `base.tar` (`direct` mode only). Source then needn't retain or
     /// re-ship `[start_lsn, end_lsn]`, which is what fills its disk at high
@@ -964,6 +968,10 @@ async fn run_session(
     );
     let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref())?;
     let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
+    let bridge_workers = match shadow_start {
+        ShadowStart::External => 1,
+        _ => bridge_pool_size(ch_config.as_ref()),
+    };
     // Slot before bootstrap
     if let Some(slot) = source_conn.slot.as_deref() {
         feed.ensure_physical_slot(slot)
@@ -971,6 +979,15 @@ async fn run_session(
             .with_context(|| format!("ensure physical replication slot {slot}"))?;
         tracing::info!(target: "walshadow", slot, "physical replication slot ready");
     }
+    // Uptime anchors here, ahead of bootstrap: an initial load is part of the
+    // session, and a `t0` that only starts at the status loop reads as a
+    // counter reset to a scraper watching through it
+    let start_instant = Instant::now();
+    // One emitter-counter handle for both phases. Bootstrap's insert tail and
+    // the streaming pipeline write the same series, so sharing it is what
+    // keeps inserter and TOAST totals from resetting at handoff
+    let emitter_stats = Arc::new(EmitterStats::default());
+    let mut bootstrap_metrics: Option<BootstrapMetrics> = None;
     let bootstrap_handoff: Option<BootstrapHandoff> =
         if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
             if !args.skip_preflight {
@@ -988,11 +1005,22 @@ async fn run_session(
                 .into_result()
                 .context("pre-flight rejected bootstrap")?;
             }
-            Some(
-                run_bootstrap(&cfg, &mut feed, args, &bootstrap_plan, ch_config.clone())
-                    .await
-                    .context("bootstrap")?,
+            let (handoff, stage) = run_bootstrap(
+                &cfg,
+                &mut feed,
+                args,
+                &bootstrap_plan,
+                ch_config.clone(),
+                BootstrapObservers {
+                    metrics: &metrics,
+                    emitter_stats: emitter_stats.clone(),
+                    uptime_from: start_instant,
+                },
             )
+            .await
+            .context("bootstrap")?;
+            bootstrap_metrics = Some(stage);
+            Some(handoff)
         } else {
             None
         };
@@ -1004,7 +1032,12 @@ async fn run_session(
     let shadow_lifecycle: Option<ShadowLifecycle> = match &shadow_start {
         ShadowStart::External => None,
         ShadowStart::Bootstrap(dir) | ShadowStart::Resume(dir) => {
-            let shadow = Arc::new(build_owned_shadow(args, &source_conn.dbname, dir.clone()));
+            let shadow = Arc::new(build_owned_shadow(
+                args,
+                &source_conn.dbname,
+                dir.clone(),
+                bridge_workers,
+            ));
             shadow
                 .write_standby_signal()
                 .context("write standby.signal")?;
@@ -1286,7 +1319,7 @@ async fn run_session(
     let connect_budget = Duration::from_secs(args.shadow_connect_timeout);
     let bridge_path = args.bridge_socket_path();
     let bridge = Arc::new(
-        walshadow::bridge::connect_with_budget(&bridge_path, connect_budget)
+        walshadow::bridge::connect_with_budget(&bridge_path, bridge_workers, connect_budget)
             .await
             .with_context(|| format!("connect bridge at {}", bridge_path.display()))?,
     );
@@ -1294,6 +1327,7 @@ async fn run_session(
     tracing::info!(
         target: "walshadow::bridge",
         socket = %bridge_path.display(),
+        workers = bridge.pool_size(),
         pg_version = info.map(|i| i.pg_version_num).unwrap_or(0),
         in_recovery = info.map(|i| i.in_recovery).unwrap_or(false),
         "bridge connected",
@@ -1623,7 +1657,7 @@ async fn run_session(
         .await
         .context("init DDL applicator")?
         .with_resolver(resolver.clone());
-        let stats = Arc::new(EmitterStats::default());
+        let stats = emitter_stats.clone();
         emitter_stats_handle = Some(stats.clone());
         // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
         // own source session + CH tail per backfill or pass, spill-dir
@@ -1765,6 +1799,7 @@ async fn run_session(
             addr = %addr,
             decoders,
             inserters,
+            resolvers = bridge.pool_size(),
             "parallel decode+insert pipeline starting",
         );
         PipelineConfig {
@@ -2000,7 +2035,6 @@ async fn run_session(
             .context("resume WAL source")?;
     }
 
-    let start_instant = Instant::now();
     let mut segments_shipped = 0u64;
     let mut prev_dispatched = stream.dispatched_lsn();
     let mut rate_estimator = RateEstimator::default();
@@ -2674,10 +2708,6 @@ async fn run_session(
             drain_resident,
             Some(&pipeline_handle.budget),
             decoder_stats,
-            emitter_stats,
-            oracle_stats,
-            bridge_stats,
-            start_instant.elapsed().as_secs(),
             SourceSwapView {
                 swaps: source_swaps_total,
                 failures: source_swap_failures_total,
@@ -2708,6 +2738,13 @@ async fn run_session(
             &desc_log,
             metrics_resolver.as_deref(),
             metrics_backfiller.as_deref(),
+            StageCounters {
+                emitter: emitter_stats,
+                oracle: [oracle_stats, bootstrap_metrics.as_ref().map(|b| &*b.oracle)],
+                bridge: [bridge_stats, bootstrap_metrics.as_ref().map(|b| &*b.bridge)],
+                bootstrap: bootstrap_metrics.as_ref().map(|b| &b.progress),
+                uptime_secs: start_instant.elapsed().as_secs(),
+            },
         )
         .await;
         if advanced {
@@ -3342,10 +3379,6 @@ async fn populate_metrics(
     drain_resident: DrainResident,
     budget: Option<&walshadow::budget::MemoryBudget>,
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
-    emitter_stats: Option<&walshadow::ch_emitter::EmitterStats>,
-    oracle_stats: Option<&walshadow::oracle::OracleStats>,
-    bridge_stats: Option<&walshadow::bridge::BridgeStats>,
-    uptime_secs: u64,
     source_swap: SourceSwapView,
     timeline_view: TimelineView,
     shadow_view: ShadowMetricsView,
@@ -3354,10 +3387,10 @@ async fn populate_metrics(
     desc_log: &walshadow::desc_log::DescriptorLog,
     config_resolver: Option<&ConfigResolver>,
     backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
+    counters: StageCounters<'_>,
 ) {
     use std::collections::BTreeMap;
     use walshadow::record::rmgr_label;
-    let (proc_cpu, proc_rss) = read_process_stats();
     let desc_log_gauges = desc_log.gauges();
     let log_stats = desc_log.stats_handle();
     let mut by_rm = BTreeMap::new();
@@ -3390,12 +3423,6 @@ async fn populate_metrics(
         resident_payload_peak_bytes: budget.map(|b| b.peak_bytes()).unwrap_or(0),
         memory_budget_waits_total: budget.map(|b| b.waits_total()).unwrap_or(0),
         memory_budget_overshoots_total: budget.map(|b| b.overshoots_total()).unwrap_or(0),
-        bootstrap_deferred_bytes: emitter_stats
-            .map(|s| s.bootstrap_deferred_bytes.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        bootstrap_deferred_spool_bytes: emitter_stats
-            .map(|s| s.bootstrap_deferred_spool_bytes.load(Ordering::Relaxed))
-            .unwrap_or(0),
         spill_evictions_total: xact_stats.spill_evictions_total,
         xacts_committed_total: xact_stats.committed_xacts_total,
         xacts_aborted_total: xact_stats.aborted_xacts_total,
@@ -3404,78 +3431,8 @@ async fn populate_metrics(
         decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
         decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
         decoder_toast_deletes_total: decoder_stats.toast_chunk_deletes.load(Ordering::Relaxed),
-        toast_tombstones_stored_total: emitter_stats
-            .map(|s| s.toast_tombstones_stored.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_values_filled_superseded_total: emitter_stats
-            .map(|s| s.toast_values_filled_superseded.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_values_filled_mismatch_total: emitter_stats
-            .map(|s| s.toast_values_filled_mismatch.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_mirror_truncates_total: emitter_stats
-            .map(|s| s.toast_mirror_truncates.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_mirror_retires_total: emitter_stats
-            .map(|s| s.toast_mirror_retires.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_rewrite_barriers_total: emitter_stats
-            .map(|s| s.toast_rewrite_barriers.load(Ordering::Relaxed))
-            .unwrap_or(0),
         toast_stash_buffered_total: decoder_stats.toast_stash_buffered.load(Ordering::Relaxed),
         raw_stash_deferred_total: decoder_stats.raw_stash_deferred.load(Ordering::Relaxed),
-        toast_stash_decoded_total: emitter_stats
-            .map(|s| s.toast_stash_decoded.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_stash_discarded_total: emitter_stats
-            .map(|s| s.toast_stash_discarded.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_stash_in_place_total: emitter_stats
-            .map(|s| s.toast_stash_in_place.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        stash_foreign_db_skipped_total: emitter_stats
-            .map(|s| s.stash_foreign_db_skipped.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        xact_plan_rows: emitter_stats
-            .map(|s| s.plan_rows.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        xact_plan_bytes_by_storage: emitter_stats
-            .map(|s| {
-                [
-                    s.plan_bytes_mem.load(Ordering::Relaxed),
-                    s.plan_bytes_file.load(Ordering::Relaxed),
-                ]
-            })
-            .unwrap_or_default(),
-        xact_plan_failures_by_reason: emitter_stats
-            .map(|s| {
-                [
-                    s.plan_failures_spool.load(Ordering::Relaxed),
-                    s.plan_failures_fail_closed_image_only
-                        .load(Ordering::Relaxed),
-                    s.plan_failures_fail_closed_malformed
-                        .load(Ordering::Relaxed),
-                    s.plan_failures_fail_closed_unsupported_op
-                        .load(Ordering::Relaxed),
-                    s.plan_failures_stash_ambiguous.load(Ordering::Relaxed),
-                    s.plan_failures_incomplete_toast.load(Ordering::Relaxed),
-                    s.plan_failures_missing_stash_resolution
-                        .load(Ordering::Relaxed),
-                    s.plan_failures_detoast.load(Ordering::Relaxed),
-                    s.plan_failures_partial_update.load(Ordering::Relaxed),
-                    s.plan_failures_view.load(Ordering::Relaxed),
-                    s.plan_failures_drain.load(Ordering::Relaxed),
-                ]
-            })
-            .unwrap_or_default(),
-        route_snapshots_by_result: emitter_stats
-            .map(|s| {
-                [
-                    s.route_snapshots_mapped.load(Ordering::Relaxed),
-                    s.route_snapshots_unmapped.load(Ordering::Relaxed),
-                ]
-            })
-            .unwrap_or_default(),
         raw_stash_records_by_kind_op: [
             decoder_stats.raw_stash_dirty_ops.load(),
             decoder_stats.raw_stash_marker_ops.load(),
@@ -3484,72 +3441,10 @@ async fn populate_metrics(
             xact_stats.raw_stash_bytes_mem,
             xact_stats.raw_stash_bytes_spill,
         ],
-        raw_decode_records_by_kind_op: emitter_stats
-            .map(|s| {
-                [
-                    s.raw_decode_toast_ops.load(),
-                    s.raw_decode_ordinary_ops.load(),
-                ]
-            })
-            .unwrap_or_default(),
-        raw_decode_rows_by_op: emitter_stats
-            .map(|s| s.raw_decode_rows_ops.load())
-            .unwrap_or_default(),
         raw_pending_rows: drain_resident.raw_pending_rows,
         raw_pending_bytes: drain_resident.raw_pending_bytes,
-        emitter_rows_total: emitter_stats
-            .map(|s| s.rows_emitted.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        emitter_blocks_total: emitter_stats
-            .map(|s| s.blocks_sent.load(Ordering::Relaxed))
-            .unwrap_or(0),
         pump_queue_depth,
         queue_records_out_total,
-        queue_jobs_out_total: emitter_stats
-            .map(|s| s.queue_jobs_out.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        decode_jobs_in_total: emitter_stats
-            .map(|s| s.decode_jobs_in.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        decode_rows_out_total: emitter_stats
-            .map(|s| s.decode_rows_out.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        insertbatch_rows_in_total: emitter_stats
-            .map(|s| s.insertbatch_rows_in.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        insertbatch_batches_out_total: emitter_stats
-            .map(|s| s.insertbatch_batches_out.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        inserter_batches_in_total: emitter_stats
-            .map(|s| s.inserter_batches_in.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        process_cpu_seconds_total: proc_cpu,
-        process_resident_memory_bytes: proc_rss,
-        emitter_xacts_total: emitter_stats
-            .map(|s| s.xacts_committed.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        emitter_unsupported_relations: emitter_stats
-            .map(|s| s.unsupported_relations.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        emitter_deletes_discarded: emitter_stats
-            .map(|s| s.deletes_discarded.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        oracle_blocks_total: oracle_stats
-            .map(|s| s.blocks.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        oracle_rows_total: oracle_stats
-            .map(|s| s.rows.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        oracle_cells_total: oracle_stats
-            .map(|s| s.cells.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        oracle_conversion_errors_total: oracle_stats
-            .map(|s| s.conversion_errors.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        oracle_errors_total: oracle_stats
-            .map(|s| s.errors.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        uptime_secs,
         source_endpoint_swaps_total: source_swap.swaps,
         source_endpoint_swap_failures_total: source_swap.failures,
         source_endpoint_swap_pending: u64::from(source_swap.pending),
@@ -3622,35 +3517,239 @@ async fn populate_metrics(
         config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),
         config_backfills_pending: backfiller.map(|b| b.pending_count()).unwrap_or(0),
         config_backfills_pending_by_mode: backfiller.map(|b| b.pending_by_mode()).unwrap_or([0; 3]),
-        bridge_up: bridge_gauge(bridge_stats, |b| &b.up),
-        bridge_requests_by_op: bridge_ops(bridge_stats.map(|b| &b.requests)),
-        bridge_errors_by_op: bridge_ops(bridge_stats.map(|b| &b.errors)),
-        bridge_request_nanos_by_op: bridge_ops(bridge_stats.map(|b| &b.request_nanos)),
-        bridge_reconnects_total: bridge_gauge(bridge_stats, |b| &b.reconnects),
-        bridge_scan_rows_total: bridge_gauge(bridge_stats, |b| &b.scan_rows),
-        bridge_scan_replay_moved_total: bridge_gauge(bridge_stats, |b| &b.scan_replay_moved),
-        bridge_scan_subtrans_mismatch_total: bridge_gauge(bridge_stats, |b| {
-            &b.scan_subtrans_mismatch
-        }),
-        bridge_native_bytes_total: bridge_gauge(bridge_stats, |b| &b.native_bytes),
+        ..stage_gauges(&counters)
     };
     registry.set(snap).await;
 }
 
-/// Zero when bridge stats are unavailable, so series stays present
-fn bridge_gauge(
-    stats: Option<&walshadow::bridge::BridgeStats>,
-    pick: fn(&walshadow::bridge::BridgeStats) -> &AtomicU64,
-) -> u64 {
-    stats.map(|b| pick(b).load(Ordering::Relaxed)).unwrap_or(0)
+/// Counters both phases write. Bootstrap runs its own insert tail and oracle
+/// PG before a status loop exists, so its ticker publishes this group beside
+/// pump progress and the series carry across handoff rather than reading as a
+/// reset: the emitter handle is shared, and the two oracle bridges' cumulative
+/// counters sum into one series
+struct StageCounters<'a> {
+    emitter: Option<&'a walshadow::ch_emitter::EmitterStats>,
+    /// Live first, bootstrap's second. Only one of the pair is ever serving
+    oracle: [Option<&'a walshadow::oracle::OracleStats>; 2],
+    bridge: [Option<&'a walshadow::bridge::BridgeStats>; 2],
+    bootstrap: Option<&'a BootstrapProgress>,
+    uptime_secs: u64,
 }
 
-fn bridge_ops(
-    counters: Option<&[AtomicU64; walshadow::bridge::OP_COUNT]>,
-) -> [u64; walshadow::bridge::OP_COUNT] {
-    counters
-        .map(|a| std::array::from_fn(|i| a[i].load(Ordering::Relaxed)))
-        .unwrap_or_default()
+fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
+    let (proc_cpu, proc_rss) = read_process_stats();
+    let emitter_stats = v.emitter;
+    let uptime_secs = v.uptime_secs;
+    let oracle = |pick: fn(&walshadow::oracle::OracleStats) -> &AtomicU64| -> u64 {
+        v.oracle
+            .iter()
+            .flatten()
+            .map(|s| pick(s).load(Ordering::Relaxed))
+            .sum()
+    };
+    let bridge = |pick: fn(&walshadow::bridge::BridgeStats) -> &AtomicU64| -> u64 {
+        v.bridge
+            .iter()
+            .flatten()
+            .map(|s| pick(s).load(Ordering::Relaxed))
+            .sum()
+    };
+    let bridge_ops = |pick: fn(
+        &walshadow::bridge::BridgeStats,
+    ) -> &[AtomicU64; walshadow::bridge::OP_COUNT]|
+     -> [u64; walshadow::bridge::OP_COUNT] {
+        std::array::from_fn(|i| {
+            v.bridge
+                .iter()
+                .flatten()
+                .map(|s| pick(s)[i].load(Ordering::Relaxed))
+                .sum()
+        })
+    };
+    MetricsSnapshot {
+        bootstrap_deferred_bytes: emitter_stats
+            .map(|s| s.bootstrap_deferred_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        bootstrap_deferred_spool_bytes: emitter_stats
+            .map(|s| s.bootstrap_deferred_spool_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_tombstones_stored_total: emitter_stats
+            .map(|s| s.toast_tombstones_stored.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_values_filled_superseded_total: emitter_stats
+            .map(|s| s.toast_values_filled_superseded.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_values_filled_mismatch_total: emitter_stats
+            .map(|s| s.toast_values_filled_mismatch.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_mirror_truncates_total: emitter_stats
+            .map(|s| s.toast_mirror_truncates.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_mirror_retires_total: emitter_stats
+            .map(|s| s.toast_mirror_retires.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_rewrite_barriers_total: emitter_stats
+            .map(|s| s.toast_rewrite_barriers.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_stash_decoded_total: emitter_stats
+            .map(|s| s.toast_stash_decoded.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_stash_discarded_total: emitter_stats
+            .map(|s| s.toast_stash_discarded.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_stash_in_place_total: emitter_stats
+            .map(|s| s.toast_stash_in_place.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        stash_foreign_db_skipped_total: emitter_stats
+            .map(|s| s.stash_foreign_db_skipped.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        xact_plan_rows: emitter_stats
+            .map(|s| s.plan_rows.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        xact_plan_bytes_by_storage: emitter_stats
+            .map(|s| {
+                [
+                    s.plan_bytes_mem.load(Ordering::Relaxed),
+                    s.plan_bytes_file.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        xact_plan_failures_by_reason: emitter_stats
+            .map(|s| {
+                [
+                    s.plan_failures_spool.load(Ordering::Relaxed),
+                    s.plan_failures_fail_closed_image_only
+                        .load(Ordering::Relaxed),
+                    s.plan_failures_fail_closed_malformed
+                        .load(Ordering::Relaxed),
+                    s.plan_failures_fail_closed_unsupported_op
+                        .load(Ordering::Relaxed),
+                    s.plan_failures_stash_ambiguous.load(Ordering::Relaxed),
+                    s.plan_failures_incomplete_toast.load(Ordering::Relaxed),
+                    s.plan_failures_missing_stash_resolution
+                        .load(Ordering::Relaxed),
+                    s.plan_failures_detoast.load(Ordering::Relaxed),
+                    s.plan_failures_partial_update.load(Ordering::Relaxed),
+                    s.plan_failures_view.load(Ordering::Relaxed),
+                    s.plan_failures_drain.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        route_snapshots_by_result: emitter_stats
+            .map(|s| {
+                [
+                    s.route_snapshots_mapped.load(Ordering::Relaxed),
+                    s.route_snapshots_unmapped.load(Ordering::Relaxed),
+                ]
+            })
+            .unwrap_or_default(),
+        raw_decode_records_by_kind_op: emitter_stats
+            .map(|s| {
+                [
+                    s.raw_decode_toast_ops.load(),
+                    s.raw_decode_ordinary_ops.load(),
+                ]
+            })
+            .unwrap_or_default(),
+        raw_decode_rows_by_op: emitter_stats
+            .map(|s| s.raw_decode_rows_ops.load())
+            .unwrap_or_default(),
+        emitter_rows_total: emitter_stats
+            .map(|s| s.rows_emitted.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        emitter_blocks_total: emitter_stats
+            .map(|s| s.blocks_sent.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        queue_jobs_out_total: emitter_stats
+            .map(|s| s.queue_jobs_out.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        decode_jobs_in_total: emitter_stats
+            .map(|s| s.decode_jobs_in.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        decode_rows_out_total: emitter_stats
+            .map(|s| s.decode_rows_out.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        insertbatch_rows_in_total: emitter_stats
+            .map(|s| s.insertbatch_rows_in.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        insertbatch_batches_out_total: emitter_stats
+            .map(|s| s.insertbatch_batches_out.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        inserter_batches_in_total: emitter_stats
+            .map(|s| s.inserter_batches_in.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        inserter_ch_seconds_total: emitter_stats
+            .map(|s| s.inserter_ch_nanos.load(Ordering::Relaxed) as f64 / 1e9)
+            .unwrap_or(0.0),
+        inserter_encode_seconds_total: emitter_stats
+            .map(|s| s.inserter_encode_nanos.load(Ordering::Relaxed) as f64 / 1e9)
+            .unwrap_or(0.0),
+        oracle_resolve_seconds_total: emitter_stats
+            .map(|s| s.oracle_resolve_nanos.load(Ordering::Relaxed) as f64 / 1e9)
+            .unwrap_or(0.0),
+        process_cpu_seconds_total: proc_cpu,
+        process_resident_memory_bytes: proc_rss,
+        emitter_xacts_total: emitter_stats
+            .map(|s| s.xacts_committed.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        emitter_unsupported_relations: emitter_stats
+            .map(|s| s.unsupported_relations.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        emitter_deletes_discarded: emitter_stats
+            .map(|s| s.deletes_discarded.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_local_columns_total: emitter_stats
+            .map(|s| s.oracle_local_columns.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_blocks_total: oracle(|s| &s.blocks),
+        oracle_rows_total: oracle(|s| &s.rows),
+        oracle_cells_total: oracle(|s| &s.cells),
+        oracle_conversion_errors_total: oracle(|s| &s.conversion_errors),
+        oracle_errors_total: oracle(|s| &s.errors),
+        uptime_secs,
+        // Gauge, so it answers off whichever bridge is serving: bootstrap's
+        // oracle socket is gone by the time the live bridge dials
+        bridge_up: v
+            .bridge
+            .iter()
+            .flatten()
+            .next()
+            .map_or(0, |b| b.up.load(Ordering::Relaxed)),
+        bridge_requests_by_op: bridge_ops(|b| &b.requests),
+        bridge_errors_by_op: bridge_ops(|b| &b.errors),
+        bridge_request_nanos_by_op: bridge_ops(|b| &b.request_nanos),
+        bridge_lock_wait_nanos_by_op: bridge_ops(|b| &b.lock_wait_nanos),
+        bridge_service_nanos_by_op: bridge_ops(|b| &b.service_nanos),
+        bridge_request_bytes_by_op: bridge_ops(|b| &b.request_bytes),
+        bridge_response_bytes_by_op: bridge_ops(|b| &b.response_bytes),
+        bridge_reconnects_total: bridge(|b| &b.reconnects),
+        bridge_scan_rows_total: bridge(|b| &b.scan_rows),
+        bridge_scan_replay_moved_total: bridge(|b| &b.scan_replay_moved),
+        bridge_scan_subtrans_mismatch_total: bridge(|b| &b.scan_subtrans_mismatch),
+        bridge_native_bytes_total: bridge(|b| &b.native_bytes),
+        ..bootstrap_gauges(v.bootstrap)
+    }
+}
+
+/// Bootstrap stage attribution, frozen at its final values once the pump
+/// returns. Rendered for the whole session so a slow initial load stays
+/// attributable after the fact
+fn bootstrap_gauges(progress: Option<&BootstrapProgress>) -> MetricsSnapshot {
+    let Some(p) = progress else {
+        return MetricsSnapshot::default();
+    };
+    let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    MetricsSnapshot {
+        bootstrap_bytes_tapped: ld(&p.pump.bytes_tapped),
+        bootstrap_pages_walked: ld(&p.page_walk.pages_walked),
+        bootstrap_tuples_emitted: ld(&p.page_walk.tuples_emitted),
+        bootstrap_files_walked: ld(&p.page_walk.files_walked),
+        bootstrap_files_skipped_unmapped: ld(&p.page_walk.files_skipped_unmapped),
+        bootstrap_decode_seconds: ld(&p.page_walk.decode_nanos) as f64 / 1e9,
+        bootstrap_tap_seconds: ld(&p.pump.sink_chunk_nanos) as f64 / 1e9,
+        bootstrap_channel_block_seconds: ld(&p.page_walk.channel_block_nanos) as f64 / 1e9,
+        ..MetricsSnapshot::default()
+    }
 }
 
 /// Retry transient source failures, stop when source reports missing WAL.
@@ -4209,8 +4308,15 @@ async fn run_bootstrap(
     args: &Args,
     plan: &BootstrapPlan,
     ch_config: Option<EmitterConfig>,
-) -> Result<BootstrapHandoff> {
+    observers: BootstrapObservers<'_>,
+) -> Result<(BootstrapHandoff, BootstrapMetrics)> {
+    let BootstrapObservers {
+        metrics,
+        emitter_stats,
+        uptime_from,
+    } = observers;
     let timing = walshadow::ops::stages::BOOTSTRAP.start();
+    let bridge_workers = bridge_pool_size(ch_config.as_ref());
     let shadow_data_dir = args
         .bootstrap_shadow_data_dir
         .clone()
@@ -4319,7 +4425,9 @@ async fn run_bootstrap(
     // Build the toast resolver up front, sharing its counters with the
     // bootstrap tail. The store-toast flag tells the page walk whether to
     // decode pg_toast_* pages.
-    let bootstrap_stats = Arc::new(EmitterStats::default());
+    // Counters are the daemon's, not this phase's: the streaming pipeline
+    // keeps adding to them, so a load's insert cost survives handoff
+    let bootstrap_stats = emitter_stats;
     // Leaf-only pool for the bootstrap tail: caps each value (V3) and
     // bounds decoded rows in flight to insert ack; no admission stage
     let resolver = if let Some(cfg) = &ch_config {
@@ -4331,12 +4439,14 @@ async fn run_bootstrap(
     };
     let store_toast = resolver.stores_chunks();
 
-    let (ch_target, walk_skip) = match ch_config {
+    let ch_target = match ch_config {
         Some(emitter_cfg) => {
             let (mapping, resolved) = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
                 .await
                 .context("bootstrap: build mapping")?;
-            let routed = mapping.snapshot().await;
+            // `initial_load = "none"` (table override, else namespace) opts a
+            // relation out of the greenfield snapshot: create it + stream CDC,
+            // but don't page-walk its existing rows.
             let skip_initial: HashSet<_> = drain_catalog
                 .descriptors()
                 .filter_map(|d| {
@@ -4359,67 +4469,39 @@ async fn run_bootstrap(
                     none.then(|| rn.clone())
                 })
                 .collect();
-            let mapped: HashSet<_> = drain_catalog
-                .descriptors()
-                .filter(|d| routed.contains_key(&d.rel_name) && !skip_initial.contains(&d.rel_name))
-                .map(|d| (d.rfn.db_node, d.rfn.rel_node))
-                .collect();
-            let pending = PendingSet::mapped(&drain_catalog, &routed).scoped_to(mapped.clone());
-            let skip = drain_catalog
-                .descriptors()
-                .map(|d| (d.rfn.db_node, d.rfn.rel_node))
-                .filter(|&(db, rel)| {
-                    !drain_catalog.is_toast(db, rel) && !mapped.contains(&(db, rel))
-                })
-                .collect();
-            (
-                Some((emitter_cfg, mapping, resolved, pending, skip_initial)),
-                skip,
-            )
+            Some((emitter_cfg, mapping, resolved, skip_initial))
         }
-        None => (None, HashSet::default()),
+        None => None,
     };
 
-    prepare_bootstrap_dir(&shadow_data_dir)
-        .await
-        .context("prepare shadow data dir for bootstrap")?;
+    // Decline unmapped relations at `begin` so their pages never decode.
+    // Metrics-only (no CH) has no mapping to filter against, so it walks all
+    let (tap_filenodes, needs_oracle, repair_scope, routes) = match &ch_target {
+        Some((_, mapping, resolved, skip_initial)) => {
+            let routed = mapping.snapshot().await;
+            let is_routed = |rn: &RelName| routed.contains_key(rn);
+            let walked = |rn: &RelName| is_routed(rn) && !skip_initial.contains(rn);
+            let scope = RepairScope::mapped(&drain_catalog, &routed, walked);
+            (
+                walshadow::backfill_bootstrap::tap_filenode_set(&drain_catalog, is_routed, walked)
+                    .map(Arc::new),
+                walshadow::backfill::bootstrap_oracle::needs_oracle(
+                    &drain_catalog,
+                    &routed,
+                    &resolved.column_rules,
+                ),
+                scope,
+                routed,
+            )
+        }
+        None => (None, false, RepairScope::default(), Default::default()),
+    };
 
-    // Sample window floor before BASE_BACKUP
-    let source_ident = feed
-        .identify_system()
-        .await
-        .context("bootstrap: sample source write head for the window leg")?;
-    let source_major = (feed.server_version_num() / 10000) as u32;
-
-    let cfg = BootstrapConfig::new(shadow_data_dir.clone())
-        .with_skip_filenodes(walk_skip)
-        .with_catalog_filenodes(catalog_filenodes);
-    let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
-
-    // Keep oracle alive through live or file window replay
-    let mut bootstrap_oracle: Option<walshadow::backfill::bootstrap_oracle::BootstrapOracle> = None;
-    let mut window_cfg: Option<walshadow::backfill::bootstrap_window::WindowLegConfig> = None;
-    // Overlay window transaction outcomes on backup pg_xact
-    let window_patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
-    // Metrics-only mode has no pending gate
-    let mut pending_gate: Option<PendingGate> = None;
-    // Preserve live failure if file fallback also fails
-    let mut window_leg_error: Option<anyhow::Error> = None;
-    let window_scratch = args.spill_dir.join("bootstrap_window");
-    tokio::fs::remove_dir_all(&window_scratch).await.ok();
-
-    let (shipped, outcome, mut window) = if let Some(target) = ch_target {
-        let (emitter_cfg, mapping, resolved, mut pending, skip_initial) = target;
-        // Route bootstrap rows through the shared insert tail. Bootstrap
-        // is the easy case: every row op=Insert at _lsn = start_lsn, no
-        // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
-        // defaults 0 to its own partial-flush deadline.
-        let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
-        let stats = bootstrap_stats.clone();
-        // Window leg shares the tail's fatal, so a CH outage stops both
-        let fatal = Fatal::new();
-        let inserter_pool_size = emitter_cfg.inserter_pool_size;
-
+    // Off the backup window: provisioning is an initdb + pg_dump + apply +
+    // restart, and doing it after `BASE_BACKUP` opens parks a live backup
+    // through all of it — in object-store mode against walrus's 60 s request
+    // cap
+    let bootstrap_oracle = if needs_oracle {
         let source_conninfo = format!(
             "host={} port={} user={} dbname={} sslmode={}",
             src_cfg.host,
@@ -4432,26 +4514,99 @@ async fn run_bootstrap(
                 "prefer"
             },
         );
-        if walshadow::backfill::bootstrap_oracle::needs_oracle(
-            &drain_catalog,
-            &mapping.snapshot().await,
-            &resolved.column_rules,
-        ) {
-            bootstrap_oracle = Some(
-                walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
-                    args.spill_dir.join("bootstrap_oracle"),
-                    source_conninfo,
-                    src_cfg.password.clone(),
-                    args.bridge_lib_dir.clone(),
-                    Duration::from_secs(args.shadow_connect_timeout),
-                )
-                .await
-                .context(
-                    "bootstrap oracle: greenfield needs it to convert oracle columns; \
-                     refusing to load empty columns",
-                )?,
-            );
+        Some(
+            walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
+                args.spill_dir.join("bootstrap_oracle"),
+                source_conninfo,
+                src_cfg.password.clone(),
+                args.bridge_lib_dir.clone(),
+                bridge_workers,
+                Duration::from_secs(args.shadow_connect_timeout),
+            )
+            .await
+            .context(
+                "bootstrap oracle: greenfield needs it to resolve tier-3 types; \
+                 refusing to load empty columns",
+            )?,
+        )
+    } else {
+        None
+    };
+    let oracle = bootstrap_oracle.as_ref().map(|o| o.oracle());
+
+    prepare_bootstrap_dir(&shadow_data_dir)
+        .await
+        .context("prepare shadow data dir for bootstrap")?;
+
+    // Sample window floor before BASE_BACKUP
+    let source_ident = feed
+        .identify_system()
+        .await
+        .context("bootstrap: sample source write head for the window leg")?;
+    let source_major = (feed.server_version_num() / 10000) as u32;
+
+    let mut cfg =
+        BootstrapConfig::new(shadow_data_dir.clone()).with_catalog_filenodes(catalog_filenodes);
+    if let Some(set) = tap_filenodes {
+        cfg = cfg.with_tap_filenodes(set);
+    }
+    let progress = cfg.progress.clone();
+    // Only writer of the registry until the status loop starts. Publishing the
+    // whole stage group is what makes oracle-versus-ClickHouse attribution
+    // answerable during an initial load, rather than page decode alone
+    let oracle_stats = oracle.as_ref().map(|o| o.stats.clone()).unwrap_or_default();
+    let bridge_stats = bootstrap_oracle
+        .as_ref()
+        .map(|o| o.bridge_stats())
+        .unwrap_or_default();
+    let ticker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
+        let metrics = metrics.clone();
+        let progress = progress.clone();
+        let stats = bootstrap_stats.clone();
+        let oracle_stats = oracle_stats.clone();
+        let bridge_stats = bridge_stats.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                metrics
+                    .set(stage_gauges(&StageCounters {
+                        emitter: Some(&stats),
+                        oracle: [None, Some(&oracle_stats)],
+                        bridge: [None, Some(&bridge_stats)],
+                        bootstrap: Some(&progress),
+                        uptime_secs: uptime_from.elapsed().as_secs(),
+                    }))
+                    .await;
+            }
         }
+    }));
+    let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
+    let pump = tokio_util::task::AbortOnDropHandle::new(pump);
+
+    let mut window_cfg: Option<walshadow::backfill::bootstrap_window::WindowLegConfig> = None;
+    // Overlay window transaction outcomes on backup pg_xact
+    let window_patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
+    // Metrics-only mode has no pending gate
+    let mut pending_gate: Option<PendingGate> = None;
+    let copy_rate =
+        walshadow::copy_backfill::CopyRate::new(args.bootstrap_max_rate_kib.map(|n| n as u32));
+    // Preserve live failure if file fallback also fails
+    let mut window_leg_error: Option<anyhow::Error> = None;
+    let window_scratch = args.spill_dir.join("bootstrap_window");
+    tokio::fs::remove_dir_all(&window_scratch).await.ok();
+
+    let (shipped, outcome, mut window) = if let Some(target) = ch_target {
+        let (emitter_cfg, mapping, resolved, skip_initial) = target;
+        // Route bootstrap rows through the shared insert tail. Bootstrap
+        // is the easy case: every row op=Insert at _lsn = start_lsn, no
+        // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
+        // defaults 0 to its own partial-flush deadline.
+        let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+        let stats = bootstrap_stats.clone();
+        // Window leg shares the tail's fatal, so a CH outage stops both
+        let fatal = Fatal::new();
+        let inserter_pool_size = emitter_cfg.inserter_pool_size;
 
         // Throwaway watermark: durability proof is `wait_through(K)`, resume
         // LSN is carried via the WAL pipeline's emitter_ack seed (see `run`),
@@ -4462,7 +4617,7 @@ async fn run_bootstrap(
             stats.clone(),
             fatal.clone(),
             None,
-            bootstrap_oracle.as_ref().map(|o| o.oracle()),
+            oracle.clone(),
             "bootstrap",
         )
         .await
@@ -4482,7 +4637,7 @@ async fn run_bootstrap(
                 config: resolved.clone(),
                 stats: stats.clone(),
                 resolver: resolver.clone(),
-                oracle: bootstrap_oracle.as_ref().map(|o| o.oracle()),
+                oracle: oracle.clone(),
                 fatal: fatal.clone(),
                 scratch_dir: window_scratch.clone(),
                 patch: window_patch.clone(),
@@ -4490,18 +4645,32 @@ async fn run_bootstrap(
                 pg_major: source_major,
                 system_id: source_ident.sysid.clone(),
                 timeline: source_ident.timeline,
+                wind_down: Duration::from_secs(args.bootstrap_wind_down_secs),
             }
         });
         let live_cfg = window_cfg.clone().filter(|_| plan.live_window_leg(args));
 
+        // No source-PG overlay during greenfield bootstrap, and the same
+        // mapping snapshot the CREATEs above rendered from: per-relation
+        // system column names have to match what CH now holds
+        let sink = GreenfieldSink {
+            source: src_cfg.clone(),
+            catalog: drain_catalog.clone(),
+            mapping: routes,
+            repair_scope,
+            copy_rate,
+            config: resolved.clone(),
+            emitter: emitter_cfg.clone(),
+            stats: stats.clone(),
+            resolver: resolver.clone(),
+            skip_initial,
+        };
+
         // Gate page tuples, defer unknowns until transaction logs land
         let gate_spool_path = args.spill_dir.join("bootstrap_gate_deferred.bin");
         tokio::fs::remove_file(&gate_spool_path).await.ok();
-        let (gated_tx, gated_rx) =
-            tokio::sync::mpsc::channel::<walshadow::backup_page_walk::BackfillTuple>(
-                walshadow::backup_page_walk::BOOTSTRAP_TUPLE_CHANNEL_CAP,
-            );
-        let gate = tokio::spawn({
+        let (gated_tx, stages) = sink.spawn(tail.msg_tx.clone(), tail.ack.clone());
+        let gate = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
             let catalog = drain_catalog.clone();
             let mut rx = rx;
             let mut spool = walshadow::spool::DeferredSpool::new(
@@ -4512,38 +4681,16 @@ async fn run_bootstrap(
                 let mut gate_stats = GateStats::default();
                 stream_phase(
                     &mut rx,
-                    &gated_tx,
+                    &GateOutput::Repair(&gated_tx),
                     &catalog,
-                    &mut pending,
                     &mut spool,
                     &mut gate_stats,
                 )
                 .await
-                .map(|()| (gate_stats, spool, pending))
+                .map(|()| (gate_stats, spool))
             }
-        });
+        }));
 
-        let deferred_path = args.spill_dir.join("bootstrap_deferred.bin");
-        tokio::fs::remove_file(&deferred_path).await.ok();
-        let drain = tokio::spawn(bootstrap::drain(
-            gated_rx,
-            drain_catalog.clone(),
-            mapping.clone(),
-            tail.msg_tx.clone(),
-            tail.ack.clone(),
-            stats.clone(),
-            resolver.clone(),
-            walshadow::spool::DeferredSpool::new(
-                deferred_path,
-                walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
-            ),
-            emitter_cfg.row_policy(),
-            // No source-PG overlay during greenfield bootstrap, but the same
-            // snapshot the CREATEs above rendered from: per-relation system
-            // column names have to match what CH now holds
-            Some(resolved.clone()),
-            skip_initial.clone(),
-        ));
         // Borrow feed until stop watch publishes end_lsn or zero
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
         // Keep sender alive while leg winds down
@@ -4570,34 +4717,44 @@ async fn run_bootstrap(
                 None => Ok(None),
             }
         };
-        let (gate_res, drain_res, pump_res, leg_res) =
-            tokio::join!(gate, drain, pump_then_stop, leg_fut);
-        let (gate_stats, gate_spool, pending) = gate_res
-            .context("bootstrap gate join")?
-            .map_err(|e| anyhow::anyhow!("bootstrap gate: {e}"))?;
-        let drain_outcome = drain_res
-            .context("bootstrap drain join")?
-            .map_err(|e| anyhow::anyhow!("bootstrap drain: {e}"))?;
-        let outcome: BootstrapOutcome = pump_res
-            .context("bootstrap pump join")?
-            .context("bootstrap pump")?;
-        // Retry failed live read from landed WAL
-        let window = match leg_res {
-            Ok(w) => {
-                if w.is_some() {
-                    window_cfg = None;
+        let (gate_res, stage_res, pump_res, leg_res) =
+            tokio::join!(gate, stages.join(), pump_then_stop, leg_fut);
+        let prepared = (|| -> Result<_> {
+            let (repair_stats, drain_outcome) = stage_res.map_err(|e| anyhow::anyhow!(e))?;
+            let (mut gate_stats, gate_spool) = gate_res
+                .context("bootstrap gate join")?
+                .map_err(|e| anyhow::anyhow!("bootstrap gate: {e}"))?;
+            gate_stats.repaired_rows += repair_stats.rows;
+            gate_stats.p_hi = gate_stats.p_hi.max(repair_stats.p_hi);
+            let outcome: BootstrapOutcome = pump_res
+                .context("bootstrap pump join")?
+                .context("bootstrap pump")?;
+            // Retry failed live read from landed WAL
+            let window = match leg_res {
+                Ok(w) => {
+                    if w.is_some() {
+                        window_cfg = None;
+                    }
+                    w
                 }
-                w
-            }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "walshadow::bootstrap",
+                        error = %format!("{e:#}"),
+                        "live backup-window leg failed; replaying the window from the \
+                         WAL the backup landed",
+                    );
+                    window_leg_error = Some(e);
+                    None
+                }
+            };
+            Ok((gate_stats, gate_spool, drain_outcome, outcome, window))
+        })();
+        let (gate_stats, gate_spool, drain_outcome, outcome, window) = match prepared {
+            Ok(prepared) => prepared,
             Err(e) => {
-                tracing::warn!(
-                    target: "walshadow::bootstrap",
-                    error = %format!("{e:#}"),
-                    "live backup-window leg failed; replaying the window from the \
-                     WAL the backup landed",
-                );
-                window_leg_error = Some(e);
-                None
+                tail.quiesce().await;
+                return Err(e);
             }
         };
         let k = drain_outcome.next_seq;
@@ -4613,18 +4770,8 @@ async fn run_bootstrap(
         );
         pending_gate = Some(PendingGate {
             deferred: gate_spool,
-            pending,
-            catalog: drain_catalog,
-            mapping,
-            config: resolved,
-            emitter: emitter_cfg,
-            stats,
-            resolver: resolver.clone(),
-            oracle: bootstrap_oracle.as_ref().map(|o| o.oracle()),
-            skip_initial,
-            source: src_cfg.clone(),
-            start_lsn: outcome.start.start_lsn,
-            spill_dir: args.spill_dir.clone(),
+            sink,
+            oracle: oracle.clone(),
             stream_stats: gate_stats,
         });
         (drain_outcome.rows_routed, outcome, window)
@@ -4670,14 +4817,27 @@ async fn run_bootstrap(
         start_lsn = format_pg_lsn(outcome.start.start_lsn).to_string(),
         end_lsn = format_pg_lsn(outcome.end.end_lsn).to_string(),
         timeline = outcome.start.timeline,
-        kept_files = outcome.disk.kept_files,
-        skipped_denylist = outcome.disk.skipped_denylist,
-        files_walked = outcome.page_walk.files_walked,
-        files_skipped_by_caller = outcome.page_walk.files_skipped_by_caller,
-        tuples_emitted = outcome.page_walk.tuples_emitted,
+        kept_files = outcome.disk.kept_files.load(Ordering::Relaxed),
+        skipped_denylist = outcome.disk.skipped_denylist.load(Ordering::Relaxed),
+        files_walked = outcome.page_walk.files_walked.load(Ordering::Relaxed),
+        tuples_emitted = outcome.page_walk.tuples_emitted.load(Ordering::Relaxed),
         drained = shipped,
         "bootstrap landed",
     );
+    // Stage attribution: which of tap, decode or emitter drain owned the
+    // wall clock. Sum exceeds elapsed under source parallelism
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        elapsed_secs = timing.elapsed().as_secs_f64(),
+        bytes_tapped = outcome.pump.bytes_tapped.load(Ordering::Relaxed),
+        pages_walked = outcome.page_walk.pages_walked.load(Ordering::Relaxed),
+        tap_secs = outcome.pump.sink_chunk_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+        decode_secs = outcome.page_walk.decode_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+        channel_block_secs = outcome.page_walk.channel_block_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+        files_skipped_unmapped = outcome.page_walk.files_skipped_unmapped.load(Ordering::Relaxed),
+        "bootstrap stage timings",
+    );
+    ticker.abort();
 
     if let Some((settings, storage)) = wal_hydrate {
         fetch_wal_into_pg_wal(
@@ -4766,9 +4926,7 @@ async fn run_bootstrap(
             deferred = gate.deferred,
             multixact_emitted = gate.multixact_emitted,
             chunks_gated = gate.chunks_gated,
-            pending_relations = gate.pending_relations,
-            pending_multixact = gate.pending_multixact,
-            pending_discarded = gate.pending_discarded,
+            unresolved = gate.unresolved,
             repaired_rows = gate.repaired_rows,
             p_hi = gate.p_hi,
             patch_xacts = patch.len(),
@@ -4793,10 +4951,35 @@ async fn run_bootstrap(
         .context("clear completed bootstrap marker")?;
 
     timing.finish();
-    Ok(BootstrapHandoff {
-        end_lsn: outcome.end.end_lsn,
-        open_floor,
-    })
+    Ok((
+        BootstrapHandoff {
+            end_lsn: outcome.end.end_lsn,
+            open_floor,
+        },
+        BootstrapMetrics {
+            progress,
+            oracle: oracle_stats,
+            bridge: bridge_stats,
+        },
+    ))
+}
+
+/// Registry the bootstrap ticker writes, and the handles it publishes there.
+/// Both outlive bootstrap: the daemon's `t0` and the emitter counters the
+/// streaming pipeline goes on adding to
+struct BootstrapObservers<'a> {
+    metrics: &'a MetricsRegistry,
+    emitter_stats: Arc<EmitterStats>,
+    uptime_from: Instant,
+}
+
+/// What bootstrap leaves behind for the status loop to keep publishing. The
+/// oracle handles outlive their throwaway PG, so its request cost stays on
+/// the same series the live bridge then adds to
+struct BootstrapMetrics {
+    progress: BootstrapProgress,
+    oracle: Arc<walshadow::oracle::OracleStats>,
+    bridge: Arc<walshadow::bridge::BridgeStats>,
 }
 
 /// Bootstrap-to-pump handoff
@@ -4959,7 +5142,16 @@ async fn prepare_bootstrap_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_owned_shadow(args: &Args, dbname: &str, data_dir: PathBuf) -> Shadow {
+/// Inserter count is the demand on the oracle: one bridge worker and one
+/// resolver per inserter is what keeps a batch resolving while the others
+/// insert
+fn bridge_pool_size(ch_config: Option<&EmitterConfig>) -> usize {
+    ch_config
+        .map_or(1, |cfg| cfg.inserter_pool_size)
+        .clamp(1, walshadow::bridge::MAX_BRIDGE_WORKERS)
+}
+
+fn build_owned_shadow(args: &Args, dbname: &str, data_dir: PathBuf, workers: usize) -> Shadow {
     let mut cfg = ShadowConfig::new(data_dir, args.out_dir.clone());
     cfg.port = args.shadow_port;
     cfg.socket_dir = args.shadow_socket_dir.clone();
@@ -4971,6 +5163,7 @@ fn build_owned_shadow(args: &Args, dbname: &str, data_dir: PathBuf) -> Shadow {
     let mut bridge = walshadow::shadow::BridgeConf::in_dir(&cfg.socket_dir);
     bridge.socket_path = args.bridge_socket_path();
     bridge.library_dir = args.bridge_lib_dir.clone();
+    bridge.workers = workers;
     cfg.bridge = Some(bridge);
     Shadow::new(cfg)
 }
@@ -5287,6 +5480,68 @@ mod tests {
         Args::parse_from(base.iter().copied().chain(argv.iter().copied()))
     }
 
+    #[test]
+    fn stage_gauges_folds_bootstrap_oracle_into_the_live_series() {
+        use walshadow::bridge::{BridgeStats, OP_LABELS};
+        use walshadow::oracle::OracleStats;
+        let encode = OP_LABELS
+            .iter()
+            .position(|l| *l == "encode_native")
+            .expect("op label");
+        let bump = |s: &BridgeStats, n: u64| {
+            s.up.store(1, Ordering::Relaxed);
+            s.requests[encode].fetch_add(n, Ordering::Relaxed);
+            s.native_bytes.fetch_add(n, Ordering::Relaxed);
+        };
+        let (live_bridge, boot_bridge) = (BridgeStats::default(), BridgeStats::default());
+        bump(&live_bridge, 2);
+        bump(&boot_bridge, 5);
+        live_bridge.up.store(0, Ordering::Relaxed);
+        let (live_oracle, boot_oracle) = (OracleStats::default(), OracleStats::default());
+        live_oracle.rows.fetch_add(3, Ordering::Relaxed);
+        boot_oracle.rows.fetch_add(7, Ordering::Relaxed);
+
+        let snap = stage_gauges(&StageCounters {
+            emitter: None,
+            oracle: [Some(&live_oracle), Some(&boot_oracle)],
+            bridge: [Some(&live_bridge), Some(&boot_bridge)],
+            bootstrap: None,
+            uptime_secs: 11,
+        });
+        assert_eq!(snap.oracle_rows_total, 10);
+        assert_eq!(snap.bridge_native_bytes_total, 7);
+        assert_eq!(
+            snap.bridge_requests_by_op[encode], 7,
+            "both bridges' requests land on one series"
+        );
+        // Live bridge owns the gauge once it exists, whatever bootstrap left
+        assert_eq!(snap.bridge_up, 0);
+        assert_eq!(snap.uptime_secs, 11);
+
+        let boot_only = stage_gauges(&StageCounters {
+            emitter: None,
+            oracle: [None, Some(&boot_oracle)],
+            bridge: [None, Some(&boot_bridge)],
+            bootstrap: None,
+            uptime_secs: 11,
+        });
+        assert_eq!(boot_only.oracle_rows_total, 7);
+        assert_eq!(boot_only.bridge_up, 1, "bootstrap's bridge answers alone");
+    }
+
+    #[test]
+    fn bootstrap_wind_down_accepts_override_and_zero() {
+        assert_eq!(args_from(&[]).bootstrap_wind_down_secs, 5);
+        assert_eq!(
+            args_from(&["--bootstrap-wind-down-secs", "60"]).bootstrap_wind_down_secs,
+            60
+        );
+        assert_eq!(
+            args_from(&["--bootstrap-wind-down-secs", "0"]).bootstrap_wind_down_secs,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn archive_fetch_reads_exact_segment() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5417,6 +5672,34 @@ mod tests {
             args_from(&["--bridge-socket", "/tmp/custom.sock"]).bridge_socket_path(),
             PathBuf::from("/tmp/custom.sock")
         );
+    }
+
+    #[test]
+    fn owned_shadow_sizes_bridge_from_inserter_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = args_from(&[]);
+        for (toml, workers, slots) in [
+            (None, 1, 2),
+            (Some("[ch]"), 3, 4),
+            (Some("[ch]\ninserter_pool_size = 5"), 5, 6),
+            (Some("[ch]\ninserter_pool_size = 16"), 8, 9),
+        ] {
+            let config = toml.map(|t| EmitterConfig::from_toml_str(t).unwrap());
+            let shadow = build_owned_shadow(
+                &args,
+                "postgres",
+                tmp.path().to_path_buf(),
+                bridge_pool_size(config.as_ref()),
+            );
+            let floor = walshadow::shadow::SourceGucFloor {
+                max_worker_processes: 1,
+                ..Default::default()
+            };
+            shadow.materialize_conf(&floor, None).unwrap();
+            let conf = std::fs::read_to_string(tmp.path().join("postgresql.conf")).unwrap();
+            assert!(conf.contains(&format!("walshadow.bridge_workers = {workers}\n")));
+            assert!(conf.contains(&format!("max_worker_processes = {slots}\n")));
+        }
     }
 
     #[test]

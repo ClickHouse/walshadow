@@ -95,6 +95,7 @@ async fn open_catalog(shadow: &Shadow) -> ShadowCatalog {
     let bridge = Arc::new(
         walshadow::bridge::connect_with_budget(
             shadow.bridge_socket().expect("bridge configured"),
+            1,
             Duration::from_secs(20),
         )
         .await

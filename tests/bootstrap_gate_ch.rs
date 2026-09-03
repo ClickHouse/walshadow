@@ -147,7 +147,7 @@ async fn dead_and_aborted_tuples_stay_out_of_ch() {
         ensure!(!line.contains("deferred=0"), "nothing deferred: {line}");
         // Fixed-width relation bypasses repair
         ensure!(
-            line.contains("pending_relations=0"),
+            line.contains("unresolved=0"),
             "relation left the walk: {line}"
         );
         Ok(())
