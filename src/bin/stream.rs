@@ -960,25 +960,25 @@ async fn run_session(
     } else {
         None
     };
-    // Regenerate config because walsender address and port may change
-    // Read minimum GUC values from shadow pg_control
+    // Regenerate config because shadow's port, socket, and GUC floor may change
     // Keep shadow alive until pipeline teardown finishes
     let shadow_lifecycle: Option<ShadowLifecycle> = match &shadow_start {
         ShadowStart::External => None,
         ShadowStart::Bootstrap(dir) | ShadowStart::Resume(dir) => {
             let shadow = Arc::new(build_owned_shadow(args, dir.clone()));
-            let conninfo = walsender_primary_conninfo(args.walsender_bind);
             shadow
                 .write_standby_signal()
                 .context("write standby.signal")?;
             start_owned_shadow(
                 &shadow,
-                conninfo.clone(),
                 bootstrap_end_lsn,
                 Duration::from_secs(args.bootstrap_shadow_replay_timeout),
             )
             .await?;
-            Some(ShadowLifecycle::spawn(shadow, conninfo))
+            Some(ShadowLifecycle::spawn(
+                shadow,
+                walsender_primary_conninfo(args.walsender_bind),
+            ))
         }
     };
     let backup_settings = ch_config.as_ref().and_then(|c| c.backup.clone());
@@ -1151,10 +1151,7 @@ async fn run_session(
         .collect();
 
     let mut stream = WalStream::new(start_timeline, WAL_SEG_SIZE, aligned)?;
-    // Bind walsender listener BEFORE shadow's walreceiver can connect.
-    // Without an active sink, the catalog gate inside `BufferingDecoderSink`
-    // deadlocks: shadow's replay LSN never advances since segment-sink fires
-    // after per-record dispatch in the current ordering.
+    // Shadow must attach to this listener before catalog replay can advance
     let mut shadow_boot = walshadow::shadow_stream::ShadowStreamState::new(
         history.shadow_boot_branch(stored_timeline, aligned.get(), start_timeline),
         ident.sysid.clone(),
@@ -1197,6 +1194,14 @@ async fn run_session(
     stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
         shadow_state.clone(),
     )));
+    // Set address after bind so first connection succeeds
+    // Supervisor restarts a shadow that is down, with the address in its conf
+    if let (Some(lifecycle), Some(conninfo)) = (
+        &shadow_lifecycle,
+        walsender_primary_conninfo(args.walsender_bind),
+    ) {
+        probe_blocking(&lifecycle.shadow, move |s| s.point_at_walsender(&conninfo)).await;
+    }
 
     // Seed catalog tracker from source's current pg_class before
     // START_REPLICATION. Closes the "source rotated a mapped catalog above
@@ -4655,15 +4660,13 @@ fn walsender_primary_conninfo(bind: SocketAddr) -> Option<String> {
     })
 }
 
-/// Start daemon-owned shadow with current walsender address and minimum
-/// GUC values from its `pg_control`
+/// Start daemon-owned shadow using archived WAL
 /// After fresh bootstrap, wait for backup `end_lsn`; direct mode includes
 /// required WAL in `base.tar`
 /// Restart a postmaster left alive by an unclean prior exit so it binds
-/// this daemon's port, socket, and walsender address
+/// this daemon's port and socket
 async fn start_owned_shadow(
     shadow: &Arc<Shadow>,
-    conninfo: Option<String>,
     replay_target: Option<u64>,
     replay_timeout: Duration,
 ) -> Result<()> {
@@ -4681,8 +4684,7 @@ async fn start_owned_shadow(
             s.stop().context("stop stale shadow before restart")?;
         }
         s.clear_stale_pid().context("clear stale postmaster.pid")?;
-        s.start_with_floor_retry(conninfo.as_deref())
-            .context("shadow start")?;
+        s.start_with_floor_retry(None).context("shadow start")?;
         if let Some(target) = replay_target {
             let lsn = s
                 .wait_for_replay(target, replay_timeout)

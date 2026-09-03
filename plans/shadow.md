@@ -38,9 +38,9 @@ otherwise compose at daemon level
    dir. Never turn standby recovery failure into automatic rebootstrap
 2. Run `write_standby_signal`. Standby signal keeps shadow in recovery
    while it receives continuous WAL stream
-3. Run `control_guc_floor` and
-   `materialize_conf(floor, primary_conninfo)`. They read five minimum
-   GUC values from shadow's `pg_control` with `pg_controldata`.
+3. Run `control_guc_floor` and `materialize_conf(floor, None)`. They
+   read five minimum GUC values from shadow's `pg_control` with
+   `pg_controldata`.
    `LC_ALL=C` keeps output labels stable. PostgreSQL
    checks these values against `pg_control`, so reading them locally
    matches WAL being replayed and avoids querying source. Current
@@ -51,8 +51,9 @@ otherwise compose at daemon level
    `autovacuum = off`, `fsync = on`, `hot_standby = on`,
    `wal_level = replica`, `listen_addresses = ''`),
    `restore_command = 'cp <filter_dir>/%f %p'`,
-   `recovery_target_timeline = 'latest'`, and `primary_conninfo =
-   '<walsender>'`. Empty `postgresql.auto.conf` to remove source
+   and `recovery_target_timeline = 'latest'`. Omit `primary_conninfo`
+   so shadow reads only archived WAL until step 5
+   Empty `postgresql.auto.conf` to remove source
    `ALTER SYSTEM` settings included by BASE_BACKUP. Write
    socket-only `pg_hba.conf` using trust authentication and empty
    `pg_ident.conf`. Do not use config files from backup because Debian
@@ -67,7 +68,10 @@ otherwise compose at daemon level
    `pg_ctl` only reports "could not start server" while log includes
    required value. After a fresh bootstrap, run
    `wait_for_replay(end_lsn, timeout)` against WAL included in backup
-5. Call `is_running` every 2 s. If postmaster stops, restart it with
+5. Once walsender listens, run `point_at_walsender(conninfo)` to append
+   `primary_conninfo` and reload PostgreSQL. This avoids waiting for
+   `wal_retrieve_retry_interval` after a failed connection
+6. Call `is_running` every 2 s. If postmaster stops, restart it with
    backoff and read minimum GUC values again. Hot standby can pause
    replay when WAL requires higher value. Detect a pause with
    `pg_get_wal_replay_pause_state()`, then confirm the cause: a floor
@@ -78,7 +82,7 @@ otherwise compose at daemon level
    running settings (operator `pg_wal_replay_pause`, recovery target)
    holds untouched. On daemon exit, run `pg_ctl stop -m fast` so data
    dir is ready for next startup
-6. Run `health` to check recovery state, replay LSN, `pg_class` count,
+7. Run `health` to check recovery state, replay LSN, `pg_class` count,
    and `pg_proc` lookup in one corruption probe
 
 After bootstrap marker clears, every later start is standby recovery.
