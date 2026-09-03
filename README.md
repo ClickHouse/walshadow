@@ -80,9 +80,9 @@ or
 ## Running standalone
 
 The easiest path: point the daemon at source PG + an empty data dir and let
-it bootstrap its own shadow. First install the PG module so the shadow can
-preload it (`make -C pgext install`; see [Building](#building-from-source)),
-create the target CH database (walshadow makes tables, not databases), then:
+it bootstrap its own shadow. Walshadow creates configured CH database when
+missing. First install PG module so shadow can preload it
+(`make -C pgext install`; see [Building](#building-from-source)), then:
 
 ```
 walshadow-stream \
