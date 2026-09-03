@@ -58,9 +58,11 @@ fn cell_overlong(out: &mut Vec<u8>, tag: u8, len: u32) {
     out.extend_from_slice(&len.to_be_bytes());
 }
 
+/// Catalog, top xid, parked replay boundary, then the oid list and its count
 fn scan(cat: u8, top: u32, oids: &[u32]) -> Vec<u8> {
     let mut out = vec![OP_SCAN, cat];
     out.extend_from_slice(&top.to_be_bytes());
+    out.extend_from_slice(&0u64.to_be_bytes());
     out.extend_from_slice(&(oids.len() as u32).to_be_bytes());
     for oid in oids {
         out.extend_from_slice(&oid.to_be_bytes());
@@ -92,13 +94,14 @@ fn scan_rejects_arguments_it_cannot_serve() {
     // Oid list ceiling, checked before anything is allocated for it
     let mut over = vec![OP_SCAN, CAT_CLASS];
     over.extend_from_slice(&0u32.to_be_bytes());
+    over.extend_from_slice(&0u64.to_be_bytes());
     over.extend_from_slice(&65537u32.to_be_bytes());
     let msg = error_of(&mut sock, &over);
     assert!(msg.contains("65537 exceeds 65536"), "{msg}");
 
     // Oid list shorter than its own count
     let mut truncated = scan(CAT_CLASS, 0, &[1259]);
-    truncated[6..10].copy_from_slice(&2u32.to_be_bytes());
+    truncated[14..18].copy_from_slice(&2u32.to_be_bytes());
     let msg = error_of(&mut sock, &truncated);
     assert!(msg.contains("insufficient data"), "{msg}");
 

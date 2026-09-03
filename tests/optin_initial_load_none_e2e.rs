@@ -1,9 +1,8 @@
 //! Greenfield Direct bootstrap must honour `initial_load = "none"` on a
 //! `replicate = true` opt-in table (a `[table.*]` section with no explicit
 //! `columns`, which lands in `table_opt_ins` rather than `table_initial_loads`).
-//! The table's pre-existing rows must NOT be page-walked, but the table is still
-//! created and post-boot CDC still streams. Reproduces a deployment where 10000
-//! rows synced despite `initial_load = "none"`.
+//! Preserve snapshot opt-out while converting array writes during bootstrap
+//! window replay and subsequent CDC
 
 #![cfg(target_os = "linux")]
 
@@ -60,8 +59,8 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
     let _src_stop = fx::StopOnDrop { sh: &source };
     source
         .apply_schema_dump(
-            "CREATE TABLE public.t(id int PRIMARY KEY, name text);\n\
-             INSERT INTO public.t SELECT g, 'pre-'||g FROM generate_series(1, 500) g;\n\
+            "CREATE TABLE public.t(id int PRIMARY KEY, name int[]);\n\
+             INSERT INTO public.t SELECT g, ARRAY[g] FROM generate_series(1, 500) g;\n\
              CHECKPOINT;\nSELECT pg_switch_wal();\n",
         )
         .expect("load pre-boot rows");
@@ -121,6 +120,8 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
             ch_config_path.to_str().unwrap(),
             "--bootstrap-mode",
             "direct",
+            "--bootstrap-max-rate-kib",
+            "32768",
             "--bootstrap-shadow-data-dir",
             bootstrap_shadow_data_dir.to_str().unwrap(),
             "--bootstrap-shadow-replay-timeout",
@@ -150,20 +151,32 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        // Give any (erroneous) snapshot rows time to arrive before asserting 0.
-        std::thread::sleep(Duration::from_secs(3));
-        let boot_n = ch
-            .query("SELECT count() FROM default.t")
-            .unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while source.psql_one("SELECT count(*) FROM pg_stat_progress_basebackup")? == "0" {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "bootstrap never opened BASE_BACKUP"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        source.apply_schema_dump(
+            "INSERT INTO public.t VALUES (100000, ARRAY[1,2]); SELECT pg_switch_wal()",
+        )?;
+        fx::wait_for_ch_value(
+            &ch,
+            "SELECT name FROM default.t FINAL WHERE id = 100000",
+            "[1,2]",
+            Duration::from_secs(60),
+        )?;
         anyhow::ensure!(
-            boot_n == "0",
-            "initial_load=none ignored: {boot_n} snapshot rows landed"
+            ch.query("SELECT count() FROM default.t FINAL WHERE id <= 500")? == "0",
+            "initial_load=none loaded snapshot rows"
         );
 
         // CDC still streams: a post-boot insert must appear.
         source
             .apply_schema_dump(
-                "INSERT INTO public.t VALUES (100001, 'cdc');\nSELECT pg_switch_wal();\n",
+                "INSERT INTO public.t VALUES (100001, ARRAY[3,4]);\nSELECT pg_switch_wal();\n",
             )
             .context("post-boot insert")?;
         let deadline = Instant::now() + Duration::from_secs(60);

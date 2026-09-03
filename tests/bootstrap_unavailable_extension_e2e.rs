@@ -193,14 +193,8 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
     write_autocreate_config(&ch_config, slot.ch_tcp).expect("write ch-config");
 
     let daemon = fx::DaemonRun::prepare(tmp.path(), slot.metrics).expect("prepare daemon");
-    let pgext = fx::pgext_dir();
     let child = daemon
-        .spawn(
-            &source,
-            &ch_config,
-            slot.walsender,
-            &["--bridge-lib-dir", pgext.to_str().unwrap()],
-        )
+        .spawn(&source, &ch_config, slot.walsender, &[])
         .expect("spawn walshadow-stream");
     let guard = fx::ChildGuard::new(child);
 

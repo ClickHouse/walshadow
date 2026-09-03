@@ -31,7 +31,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use walshadow::mapping::NamespaceMapping;
-use walshadow::shadow::Shadow;
 
 fn skip_gate() -> bool {
     if !fx::requirements_available() {
@@ -41,8 +40,8 @@ fn skip_gate() -> bool {
 }
 
 struct Drill {
-    source: Shadow,
-    shadow: Shadow,
+    source: fx::ClusterGuard,
+    shadow: fx::ClusterGuard,
     ch: fx::ChServer,
     pipeline: fx::Pipeline,
     _tmp: tempfile::TempDir,

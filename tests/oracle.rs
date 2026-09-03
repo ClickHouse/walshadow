@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use clickhouse_c::Allocator;
 use walshadow::backfill::bootstrap_oracle::BootstrapOracle;
-use walshadow::bridge::{Bridge, BridgeError};
+use walshadow::bridge::{Bridge, BridgeError, FRAME_PREFIX_BYTES, request_frame};
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::schema::NUMERICOID;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
@@ -79,7 +79,7 @@ fn start_pg(tmp: &tempfile::TempDir, port: u16) -> Option<StopOnDrop> {
 
 async fn bridge_on(sh: &Shadow) -> Bridge {
     let path = sh.bridge_socket().expect("bridge configured");
-    walshadow::bridge::connect_with_budget(path, Duration::from_secs(20))
+    walshadow::bridge::connect_with_budget(path, 1, Duration::from_secs(20))
         .await
         .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", path.display()))
 }
@@ -93,7 +93,9 @@ fn alloc() -> Allocator {
 }
 
 fn buf(oid: u32, cells: Vec<OracleCell>) -> OracleColumnBuf {
-    let mut b = OracleColumnBuf::new(oid, -1);
+    // Every request here names its own target; the buffer's copy only steers
+    // local rendering, which these cases ask the worker for regardless
+    let mut b = OracleColumnBuf::new(oid, -1, "String");
     for c in cells {
         b.push(c);
     }
@@ -163,6 +165,7 @@ async fn bootstrap_oracle_preserves_types_and_removes_cluster() {
             conninfo,
             password,
             Some(pgext_dir()),
+            1,
             Duration::from_secs(20),
         )
         .await
@@ -271,6 +274,7 @@ async fn bootstrap_oracle_reports_source_errors() {
             conninfo,
             None,
             Some(pgext_dir()),
+            1,
             Duration::from_secs(20),
         )
         .await
@@ -591,8 +595,16 @@ async fn oracle_fails_whole_request_on_bad_cell() {
     assert_eq!(bridge.stats.reconnects.load(Ordering::Relaxed), 0);
 }
 
+/// Raw payload past the frame prefix, for shapes `native_request` cannot build
+fn framed(payload: &[u8]) -> Vec<u8> {
+    let mut out = request_frame(payload.len());
+    out.extend_from_slice(payload);
+    out
+}
+
 fn native_request(oid: u32, name: &str, ty: &str, cells: &[u8], rows: u32) -> Vec<u8> {
-    let mut out = rows.to_be_bytes().to_vec();
+    let mut out = request_frame(16 + name.len() + ty.len() + cells.len());
+    out.extend_from_slice(&rows.to_be_bytes());
     out.extend_from_slice(&1u32.to_be_bytes());
     out.extend_from_slice(&oid.to_be_bytes());
     out.extend_from_slice(&(-1i32).to_be_bytes());
@@ -624,8 +636,8 @@ async fn worker_refuses_malformed_requests() {
             native_request(23, "c", "Int32", &[0], 0),
             "0 rows and 1 columns",
         ),
-        (vec![0, 0, 0, 1, 0, 0, 0, 0], "1 rows and 0 columns"),
-        (vec![255; 8], "bytes remain"),
+        (framed(&[0, 0, 0, 1, 0, 0, 0, 0]), "1 rows and 0 columns"),
+        (framed(&[255; 8]), "bytes remain"),
         (
             native_request(23, "", "Int32", &[0], 1),
             "empty name or type",
@@ -657,17 +669,19 @@ async fn worker_refuses_malformed_requests() {
             "no default value for ClickHouse type",
         ),
     ];
+    let name_len = FRAME_PREFIX_BYTES + 16;
     let mut bad_name = native_request(23, "c", "Int32", &[0], 1);
-    bad_name[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+    bad_name[name_len..name_len + 4].copy_from_slice(&u32::MAX.to_be_bytes());
     cases.push((bad_name, "string length 4294967295 past end of request"));
+    let type_len = name_len + 5;
     let mut bad_type = native_request(23, "c", "Int32", &[0], 1);
-    bad_type[21..25].copy_from_slice(&u32::MAX.to_be_bytes());
+    bad_type[type_len..type_len + 4].copy_from_slice(&u32::MAX.to_be_bytes());
     cases.push((bad_type, "string length 4294967295 past end of request"));
     let mut trailing = native_request(23, "c", "String", &[1, 0, 0, 0, 4, 42, 0, 0, 0], 1);
     trailing.push(0);
     cases.push((trailing, "invalid message format"));
     for (payload, expected) in cases {
-        let err = bridge.encode_native(&payload).await.unwrap_err();
+        let err = bridge.encode_native(payload).await.unwrap_err();
         assert!(
             matches!(err, BridgeError::Remote(ref msg) if msg.contains(expected)),
             "{expected}: {err}"

@@ -572,7 +572,7 @@ impl ClickHouseChunkStore {
         )
     }
 
-    /// Prune candidates, then break reused-generation ties by TID
+    /// Break equal-version ties deterministically; TID order cannot identify newer generations
     fn fetch_sql(&self, toast_relid: u32, value_id: u32, max_lsn: u64) -> String {
         let table = self.toast_table(toast_relid);
         format!(

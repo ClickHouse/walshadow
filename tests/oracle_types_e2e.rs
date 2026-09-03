@@ -17,7 +17,6 @@ use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::oracle::Oracle;
 use walshadow::schema::RelName;
-use walshadow::shadow::Shadow;
 
 fn skip_gate() -> bool {
     if !fx::requirements_available() {
@@ -54,7 +53,7 @@ async fn run_oracle(
     ch_create_sql: &str,
     mappings: Vec<fx::TableMappingSpec>,
     workload: &str,
-) -> (Shadow, fx::ChServer, tempfile::TempDir) {
+) -> (fx::ClusterGuard, fx::ChServer, tempfile::TempDir) {
     let (source, ch, tmp, _oracle) = run_oracle_stats(
         slot,
         app_name,
@@ -74,7 +73,12 @@ async fn run_oracle_stats(
     ch_create_sql: &str,
     mappings: Vec<fx::TableMappingSpec>,
     workload: &str,
-) -> (Shadow, fx::ChServer, tempfile::TempDir, Arc<Oracle>) {
+) -> (
+    fx::ClusterGuard,
+    fx::ChServer,
+    tempfile::TempDir,
+    Arc<Oracle>,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -100,7 +104,7 @@ async fn run_oracle_stats(
 
     // Worker binds only once recovery reaches consistency, so budget the dial
     let socket = shadow.bridge_socket().expect("bridge configured");
-    let bridge = walshadow::bridge::connect_with_budget(socket, Duration::from_secs(30))
+    let bridge = walshadow::bridge::connect_with_budget(socket, 1, Duration::from_secs(30))
         .await
         .expect("bridge connect");
     assert!(

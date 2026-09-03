@@ -102,16 +102,24 @@ async fn pump_to_lsn(
     Ok(())
 }
 
-/// Drive one catalog boundary through capture. `hold_lock` decides whether a
-/// transaction leaves a recovery-held AEL on `pg_type` straddling it.
-/// Returns how far capture got, or `Err` once the budget expires.
-async fn run_boundary(hold_lock: bool) -> Result<(), String> {
-    run_boundary_ddl(hold_lock, "ALTER TABLE demo ADD COLUMN w int").await
+/// Catalog transaction V leaves a recovery-held AEL on. `None` straddles the
+/// boundary with no lock at all
+type Held<'a> = Option<&'a str>;
+
+/// Read whole, so the scan carries no oid list
+const PG_TYPE: &str = "pg_catalog.pg_type";
+/// Read against the relation oids the boundary names, so the scan is scoped
+const PG_ATTRIBUTE: &str = "pg_catalog.pg_attribute";
+
+/// Drive one catalog boundary through capture. Returns how far capture got,
+/// or `Err` once the budget expires
+async fn run_boundary(held: Held<'_>) -> Result<(), String> {
+    run_boundary_ddl(held, "ALTER TABLE demo ADD COLUMN w int").await
 }
 
 /// `d_ddl`: transaction D's catalog mutation, whose boundary lands between V's
 /// lock and V's commit.
-async fn run_boundary_ddl(hold_lock: bool, d_ddl: &str) -> Result<(), String> {
+async fn run_boundary_ddl(held: Held<'_>, d_ddl: &str) -> Result<(), String> {
     let so = wstest_module();
     let ports = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
@@ -119,6 +127,11 @@ async fn run_boundary_ddl(hold_lock: bool, d_ddl: &str) -> Result<(), String> {
     let schema = format!(
         "CREATE TABLE demo (id int primary key, v text);\n\
          INSERT INTO demo VALUES (1, 'a');\n\
+         -- An aborted inserter's pg_attribute row for demo, which a scan\n\
+         -- reading under SnapshotAny has to reject on its own\n\
+         BEGIN;\n\
+         ALTER TABLE demo ADD COLUMN rolled_back int;\n\
+         ROLLBACK;\n\
          CREATE FUNCTION ws_test_lock_unlock_relation(oid) RETURNS void \
          AS '{}', 'ws_test_lock_unlock_relation' LANGUAGE c;\n",
         so.display(),
@@ -164,14 +177,14 @@ async fn run_boundary_ddl(hold_lock: bool, d_ddl: &str) -> Result<(), String> {
     })
     .await;
 
-    // Transaction V: take AEL on pg_type, release it source-side, stay open.
-    // The shadow keeps the replayed lock until V commits.
-    let v = hold_lock.then(|| {
+    // Transaction V: take AEL on the catalog, release it source-side, stay
+    // open. The shadow keeps the replayed lock until V commits.
+    let v = held.map(|catalog| {
         fx::spawn_txn(
             &source,
             &format!(
                 "BEGIN;\n\
-                 SELECT ws_test_lock_unlock_relation('pg_catalog.pg_type'::regclass);\n\
+                 SELECT ws_test_lock_unlock_relation('{catalog}'::regclass);\n\
                  SELECT pg_sleep({HOLD_SECS});\n\
                  COMMIT;\n"
             ),
@@ -180,7 +193,7 @@ async fn run_boundary_ddl(hold_lock: bool, d_ddl: &str) -> Result<(), String> {
 
     // V parks in pg_sleep, so its lock record is written and its commit is
     // not. The source-side lock is already gone, which is what lets D run.
-    if hold_lock {
+    if held.is_some() {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let parked = source
@@ -247,7 +260,7 @@ async fn boundary_capture_completes_without_held_catalog_lock() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
         return;
     }
-    run_boundary(false).await.expect("control boundary");
+    run_boundary(None).await.expect("control boundary");
 }
 
 /// Regression: capture must not wait on a lock whose release is in the WAL
@@ -258,7 +271,7 @@ async fn boundary_capture_survives_recovery_held_catalog_lock() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
         return;
     }
-    if let Err(e) = run_boundary(true).await {
+    if let Err(e) = run_boundary(Some(PG_TYPE)).await {
         panic!(
             "boundary capture wedged behind a recovery-held AccessExclusiveLock \
              on pg_type: {e}"
@@ -275,10 +288,30 @@ async fn boundary_capture_survives_recovery_held_lock_with_fast_default() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
         return;
     }
-    if let Err(e) = run_boundary_ddl(true, "ALTER TABLE demo ADD COLUMN w int DEFAULT 7").await {
+    if let Err(e) =
+        run_boundary_ddl(Some(PG_TYPE), "ALTER TABLE demo ADD COLUMN w int DEFAULT 7").await
+    {
         panic!(
             "fast-default capture wedged behind a recovery-held AccessExclusiveLock \
              on pg_type (attmissingval formatting must stay lock-free): {e}"
+        );
+    }
+}
+
+/// Scoped sub-case: `pg_class` pins the position first and is not the catalog
+/// under lock, so the `pg_attribute` scan behind it arrives with both an oid
+/// list and a lock it cannot take, the one read that filters rows itself
+/// instead of letting an index do it
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_capture_survives_recovery_held_lock_on_scoped_catalog() {
+    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
+        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+        return;
+    }
+    if let Err(e) = run_boundary(Some(PG_ATTRIBUTE)).await {
+        panic!(
+            "boundary capture wedged behind a recovery-held AccessExclusiveLock \
+             on pg_attribute: {e}"
         );
     }
 }

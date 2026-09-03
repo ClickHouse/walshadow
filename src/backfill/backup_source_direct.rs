@@ -10,18 +10,17 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use walrus::pg::replication::base_backup::{
     BackupEvent, BaseBackupOpts, ChannelReader, run_base_backup,
 };
 use walrus::pg::replication::conn::{PgConfig, ReplicationConn};
 
 use crate::backfill::backup_source::{
-    BackupSink, BackupSource, EndInfo, StartInfo, pump_tar_to_sink,
+    BackupSink, BackupSource, EndInfo, PumpStats, PumpTarget, StartInfo, pump_tar_to_sink,
 };
 
 /// Replication-protocol BASE_BACKUP issuer
@@ -41,7 +40,8 @@ impl BackupSource for DirectSource {
     async fn run(
         self: Box<Self>,
         data_dir: PathBuf,
-        sink: Arc<Mutex<dyn BackupSink>>,
+        sink: Arc<dyn BackupSink>,
+        stats: Arc<PumpStats>,
     ) -> Result<(StartInfo, EndInfo)> {
         let DirectSource { source, opts } = *self;
 
@@ -58,9 +58,7 @@ impl BackupSource for DirectSource {
 
         let mut start: Option<StartInfo> = None;
         let mut end: Option<EndInfo> = None;
-        // Archives drain sequentially here; shared counter kept for
-        // symmetry with object_store's concurrent parts
-        let next_entry = AtomicU64::new(0);
+        let target = PumpTarget::new(data_dir, sink.clone(), stats);
 
         while let Some(ev) = rx.recv().await {
             let ev = ev.context("DirectSource: BASE_BACKUP event channel")?;
@@ -71,10 +69,7 @@ impl BackupSource for DirectSource {
                         timeline: s.timeline,
                         tablespaces: s.tablespaces,
                     };
-                    {
-                        let mut g = sink.lock().await;
-                        g.start(&s).await?;
-                    }
+                    sink.start(&s).await?;
                     start = Some(s);
                 }
                 BackupEvent::Archive { meta, body } => {
@@ -84,17 +79,14 @@ impl BackupSource for DirectSource {
                         oid = meta.oid,
                         "archive open",
                     );
-                    drive_archive(body, &data_dir, sink.clone(), &next_entry).await?;
+                    drive_archive(body, &target).await?;
                 }
                 BackupEvent::Finish(e) => {
                     let e = EndInfo {
                         end_lsn: e.end_lsn,
                         timeline: e.timeline,
                     };
-                    {
-                        let mut g = sink.lock().await;
-                        g.finish(&e).await?;
-                    }
+                    sink.finish(&e).await?;
                     end = Some(e);
                 }
             }
@@ -115,13 +107,11 @@ impl BackupSource for DirectSource {
 /// SyncIoBridge / spawn_blocking.
 async fn drive_archive(
     body: mpsc::Receiver<std::io::Result<bytes::Bytes>>,
-    data_dir: &std::path::Path,
-    sink: Arc<Mutex<dyn BackupSink>>,
-    next_entry: &AtomicU64,
+    target: &PumpTarget,
 ) -> Result<()> {
     let reader = ChannelReader::new(body);
     let mut archive = tokio_tar::Archive::new(reader);
-    pump_tar_to_sink(&mut archive, data_dir, &sink, next_entry)
+    pump_tar_to_sink(&mut archive, target)
         .await
         .context("DirectSource: tar unpack")?;
     Ok(())

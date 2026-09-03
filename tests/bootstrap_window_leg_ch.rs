@@ -107,6 +107,7 @@ async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
     let stats = Arc::new(EmitterStats::default());
     let emitter = emitter(ports.ch_tcp);
     let cfg = WindowLegConfig {
+        wind_down: Duration::from_secs(5),
         mapping: walshadow::mapping::mapping_handle(emitter.tables.clone()),
         emitter,
         config: Arc::new(ResolvedConfig::default()),
@@ -233,6 +234,7 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(Some(end_lsn));
         let patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
         let cfg = WindowLegConfig {
+            wind_down: Duration::from_secs(5),
             emitter: emitter(slot.ch_tcp),
             mapping: walshadow::mapping::mapping_handle(emitter(slot.ch_tcp).tables),
             config: Arc::new(ResolvedConfig::default()),
@@ -284,4 +286,195 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
     if let Err(e) = result {
         panic!("{e:#}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctid_repair_converges_with_updates_deletes_reuse_and_crossing_transaction() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let ports = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let source = fx::make_pg(&tmp, "source", ports.source);
+    source.initdb().unwrap();
+    source.write_base_conf().unwrap();
+    fx::append_source_conf(&source);
+    source.start().unwrap();
+    let _stop = fx::StopOnDrop { sh: &source };
+    source.apply_schema_dump(&format!(
+        "CREATE SCHEMA {SCHEMA};
+         CREATE TABLE {SCHEMA}.t (id int PRIMARY KEY, name text) WITH (autovacuum_enabled=false);
+         INSERT INTO {SCHEMA}.t VALUES (1,'keep'), (2,'old'), (3,'delete'), (4,'reuse'), (5,'before');
+         SELECT pg_switch_wal();"
+    )).unwrap();
+    let ch =
+        fx::ChServer::spawn(tempfile::tempdir().unwrap(), ports.ch_tcp, ports.ch_http).unwrap();
+    ch.query("CREATE DATABASE walshadow_test").unwrap();
+    ch.query(
+        "CREATE TABLE walshadow_test.t (id Int32, name String, _lsn UInt64, _xid UInt32,
+        _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool)
+        ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+    )
+    .unwrap();
+    let pg = fx::pg_cfg(&source, "repair-convergence-test");
+    let sql = open_sql_client(&pg).await.unwrap();
+    let catalog = seed_catalog_from_source(&sql).await.unwrap();
+    let desc = catalog
+        .descriptors()
+        .find(|d| d.rel_name == RelName::new(SCHEMA, "t"))
+        .unwrap();
+    let mut feed = SourceFeed::connect(&pg).await.unwrap();
+    let ident = feed.identify_system().await.unwrap();
+    let tids: Vec<String> = sql
+        .query(
+            &format!("SELECT ctid::text FROM {SCHEMA}.t ORDER BY id"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let tuples = tids
+        .iter()
+        .map(|tid| {
+            let (blk, off) = tid.trim_matches(['(', ')']).split_once(',').unwrap();
+            walshadow::backup_page_walk::BackfillTuple {
+                rfn: desc.rfn,
+                xid: 100,
+                xmax: 10,
+                infomask: walshadow::visibility::HEAP_XMIN_COMMITTED
+                    | walshadow::visibility::HEAP_XMAX_IS_MULTI,
+                source_lsn: ident.xlogpos,
+                blkno: blk.parse().unwrap(),
+                offnum: off.parse().unwrap(),
+                columns: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    sql.batch_execute(&format!(
+        "UPDATE {SCHEMA}.t SET name='new' WHERE id=2;
+         DELETE FROM {SCHEMA}.t WHERE id IN (3,4)"
+    ))
+    .await
+    .unwrap();
+    sql.batch_execute(&format!("VACUUM {SCHEMA}.t"))
+        .await
+        .unwrap();
+    sql.batch_execute(&format!("INSERT INTO {SCHEMA}.t VALUES (6,'reused')"))
+        .await
+        .unwrap();
+    let reused: String = sql
+        .query_one(
+            &format!("SELECT ctid::text FROM {SCHEMA}.t WHERE id=6"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        tids.contains(&reused),
+        "test requires CTID reuse: {reused}, {tids:?}"
+    );
+    let crossing = open_sql_client(&pg).await.unwrap();
+    crossing
+        .batch_execute(&format!(
+            "BEGIN; UPDATE {SCHEMA}.t SET name='cross' WHERE id=5"
+        ))
+        .await
+        .unwrap();
+
+    let emitter = emitter(ports.ch_tcp);
+    let mapping = walshadow::mapping::mapping_handle(emitter.tables.clone());
+    let routes = mapping.snapshot().await;
+    let stats = Arc::new(EmitterStats::default());
+    let tail = walshadow::pipeline::tail::OwnedTail::spawn(
+        &emitter,
+        1,
+        stats.clone(),
+        Fatal::new(),
+        None,
+        None,
+        "repair convergence",
+    )
+    .await
+    .unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel(1);
+    let repair = tokio::spawn(
+        walshadow::visibility_repair::RowRepair {
+            source: pg,
+            catalog: catalog.clone(),
+            scope: walshadow::visibility_repair::RepairScope::mapped(&catalog, &routes, |_| true),
+            rate: walshadow::copy_backfill::CopyRate::new(None),
+        }
+        .run(rx, out_tx),
+    );
+    let drain = tokio::spawn(walshadow::pipeline::bootstrap::drain(
+        out_rx,
+        catalog.clone(),
+        routes,
+        tail.msg_tx.clone(),
+        tail.ack.clone(),
+        stats.clone(),
+        ToastResolver::disabled(),
+        None,
+        Default::default(),
+        None,
+        Default::default(),
+    ));
+    let mut spool = walshadow::spool::DeferredSpool::new(tmp.path().join("gate"), 0);
+    for t in tuples {
+        spool.push(t).await.unwrap();
+    }
+    let accum = walshadow::visibility::PgXactAccum::new();
+    let patch = PgXactPatch::new();
+    let multi = walshadow::visibility::PgMultiXactAccum::new();
+    let view = walshadow::visibility::PgXactView::new(&accum, &patch).with_multixact(&multi);
+    let mut gate_stats = walshadow::visibility_gate::GateStats::default();
+    walshadow::visibility_gate::resolve_phase(
+        spool,
+        &view,
+        &walshadow::visibility_gate::GateOutput::Repair(&tx),
+        &mut gate_stats,
+    )
+    .await
+    .unwrap();
+    drop(tx);
+    repair.await.unwrap().unwrap();
+    let drained = drain.await.unwrap().unwrap();
+    tail.finish(drained.next_seq).await.unwrap();
+    assert_eq!(gate_stats.unresolved, 5);
+    crossing.batch_execute("COMMIT").await.unwrap();
+    let end = walshadow::pg::current_wal_lsn(&sql).await.unwrap();
+    sql.batch_execute("SELECT pg_switch_wal()").await.unwrap();
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(Some(end));
+    let cfg = WindowLegConfig {
+        emitter,
+        mapping,
+        config: Arc::new(ResolvedConfig::default()),
+        stats,
+        resolver: ToastResolver::disabled(),
+        oracle: None,
+        fatal: Fatal::new(),
+        scratch_dir: tmp.path().join("leg"),
+        patch: Arc::new(std::sync::Mutex::new(PgXactPatch::new())),
+        catalog,
+        pg_major: (feed.server_version_num() / 10000) as u32,
+        system_id: ident.sysid,
+        timeline: ident.timeline,
+        wind_down: Duration::ZERO,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stream_window(cfg, &mut feed, ident.xlogpos, stop_rx),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        ch.query("SELECT id, name FROM walshadow_test.t FINAL WHERE NOT _is_deleted ORDER BY id")
+            .unwrap(),
+        "1\tkeep\n2\tnew\n5\tcross\n6\treused"
+    );
 }

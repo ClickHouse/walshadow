@@ -57,6 +57,7 @@ impl Fixture {
         let bridge = Arc::new(
             walshadow::bridge::connect_with_budget(
                 &source.config().socket_dir.join("walshadow-bridge.sock"),
+                1,
                 Duration::from_secs(20),
             )
             .await

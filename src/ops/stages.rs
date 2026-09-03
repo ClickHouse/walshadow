@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::future::Future;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Stage {
     name: &'static str,
@@ -51,6 +51,10 @@ pub struct Timer<'a> {
 }
 
 impl Timer<'_> {
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
     pub fn finish(mut self) {
         self.completed = true;
     }

@@ -73,7 +73,12 @@ async fn run_drill<F: FnOnce(&Shadow) -> std::thread::JoinHandle<()>>(
     slot: fx::Ports,
     app_name: &str,
     spawn_driver: F,
-) -> (Shadow, fx::ChServer, tempfile::TempDir, tempfile::TempDir) {
+) -> (
+    fx::ClusterGuard,
+    fx::ChServer,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {

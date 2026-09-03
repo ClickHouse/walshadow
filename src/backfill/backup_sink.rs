@@ -11,15 +11,17 @@
 //! `CatalogTracker::seed_from_source`.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
 use crate::backfill::backup_source::{
-    BackupSink, EndInfo, EntryId, FileAction, FileKind, FileMeta, StartInfo,
+    BackupSink, EndInfo, FileAction, FileKind, FileMeta, StartInfo,
 };
 use crate::backfill::pg_path::{is_system_dir, parse_base_path};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
-use ahash::{HashSet, HashSetExt};
+use ahash::HashSet;
 
 /// `relfilenode < 16384` is always bootstrap catalog. Rotated-catalog
 /// filenodes (`VACUUM FULL` / `REINDEX` on a catalog) land in `whitelist`.
@@ -71,23 +73,24 @@ impl FromIterator<(u32, u32)> for CatalogFilenodes {
 /// (PG recovery refuses to start without them).
 pub struct DiskLanderSink {
     pub catalog_filenodes: CatalogFilenodes,
-    pub stats: DiskLanderStats,
+    pub stats: Arc<DiskLanderStats>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct DiskLanderStats {
-    pub kept_files: u64,
-    pub kept_dirs: u64,
-    pub kept_symlinks: u64,
-    pub skipped_denylist: u64,
-    pub skipped_user_heap: u64,
+crate::atomic_stats! {
+    pub struct DiskLanderStats {
+        pub kept_files,
+        pub kept_dirs,
+        pub kept_symlinks,
+        pub skipped_denylist,
+        pub skipped_user_heap,
+    }
 }
 
 impl DiskLanderSink {
     pub fn new(catalog_filenodes: CatalogFilenodes) -> Self {
         Self {
             catalog_filenodes,
-            stats: DiskLanderStats::default(),
+            stats: Arc::new(DiskLanderStats::default()),
         }
     }
 
@@ -117,7 +120,7 @@ impl DiskLanderSink {
 }
 
 /// Distinguishes skip-denylist from skip-user-heap so MultiplexSink can
-/// flip the latter to `Tap` when a page-walk sink is composed in.
+/// flip the latter to a tap when a page-walk sink is composed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskAction {
     Keep,
@@ -125,64 +128,56 @@ pub enum DiskAction {
     SkipUserHeap,
 }
 
-#[async_trait]
-impl BackupSink for DiskLanderSink {
-    async fn begin(&mut self, _entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
-        let action = match self.classify(meta) {
-            DiskAction::Keep => FileAction::Keep,
-            DiskAction::SkipDenylist | DiskAction::SkipUserHeap => FileAction::Skip,
+impl DiskLanderSink {
+    /// Count one routing decision. Split out so `MultiplexSink` records the
+    /// lander's view of an entry it hands to the tap instead
+    fn record(&self, action: DiskAction, meta: &FileMeta) {
+        let bump = |c: &AtomicU64| {
+            c.fetch_add(1, Ordering::Relaxed);
         };
-        if action == FileAction::Keep {
-            match meta.kind {
-                FileKind::File => self.stats.kept_files += 1,
-                FileKind::Dir => self.stats.kept_dirs += 1,
-                FileKind::Symlink { .. } => self.stats.kept_symlinks += 1,
-            }
-        } else {
-            match self.classify(meta) {
-                DiskAction::SkipDenylist => self.stats.skipped_denylist += 1,
-                DiskAction::SkipUserHeap => self.stats.skipped_user_heap += 1,
-                DiskAction::Keep => unreachable!(),
-            }
+        match action {
+            DiskAction::Keep => match meta.kind {
+                FileKind::File => bump(&self.stats.kept_files),
+                FileKind::Dir => bump(&self.stats.kept_dirs),
+                FileKind::Symlink { .. } => bump(&self.stats.kept_symlinks),
+            },
+            DiskAction::SkipDenylist => bump(&self.stats.skipped_denylist),
+            DiskAction::SkipUserHeap => bump(&self.stats.skipped_user_heap),
         }
-        Ok(action)
-    }
-    async fn chunk(&mut self, _entry: EntryId, _bytes: &[u8]) -> io::Result<()> {
-        // Never returns Tap, so chunk() should never fire
-        Err(io::Error::other(
-            "DiskLanderSink::chunk called — sink only ever Keeps or Skips",
-        ))
-    }
-    async fn end(&mut self, _entry: EntryId) -> io::Result<()> {
-        Ok(())
     }
 }
 
-/// Multiplexes a DiskLanderSink (Keep / Skip) and a Tap-target sink
-/// (typically PageWalkSink) over one source pass; begin() picks the
-/// route, chunk/end follow it.
+#[async_trait]
+impl BackupSink for DiskLanderSink {
+    async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction> {
+        let action = self.classify(meta);
+        self.record(action, meta);
+        Ok(match action {
+            DiskAction::Keep => FileAction::Keep,
+            DiskAction::SkipDenylist | DiskAction::SkipUserHeap => FileAction::Skip,
+        })
+    }
+}
+
+/// Routes a DiskLanderSink (Keep / Skip) and a tap-target sink
+/// (typically PageWalkSink) over one source pass. Pure router: the tap's
+/// own `EntrySink` carries the body, so nothing here is on the hot path.
 pub struct MultiplexSink<T> {
     lander: DiskLanderSink,
     tap: T,
-    /// Entries routed to the tap. A set, not a flag, so concurrent
-    /// entries (object_store fan-out) dispatch to the right inner sink
-    /// instead of racing one shared bool.
-    tap_entries: HashSet<EntryId>,
 }
 
 impl<T: BackupSink> MultiplexSink<T> {
     pub fn new(lander: DiskLanderSink, tap: T) -> Self {
-        Self {
-            lander,
-            tap,
-            tap_entries: HashSet::new(),
-        }
+        Self { lander, tap }
     }
 
-    pub fn lander_stats(&self) -> &DiskLanderStats {
+    #[cfg(test)]
+    pub fn lander_stats(&self) -> &Arc<DiskLanderStats> {
         &self.lander.stats
     }
 
+    #[cfg(test)]
     pub fn into_inner(self) -> (DiskLanderSink, T) {
         (self.lander, self.tap)
     }
@@ -190,49 +185,25 @@ impl<T: BackupSink> MultiplexSink<T> {
 
 #[async_trait]
 impl<T: BackupSink> BackupSink for MultiplexSink<T> {
-    async fn start(&mut self, info: &StartInfo) -> io::Result<()> {
+    async fn start(&self, info: &StartInfo) -> io::Result<()> {
         self.lander.start(info).await?;
         self.tap.start(info).await?;
         Ok(())
     }
-    async fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
-        let action = match self.lander.classify(meta) {
-            DiskAction::Keep => {
-                self.lander.begin(entry, meta).await?;
-                FileAction::Keep
-            }
-            DiskAction::SkipDenylist => {
-                self.lander.begin(entry, meta).await?;
-                FileAction::Skip
-            }
-            DiskAction::SkipUserHeap => {
-                // Flip to Tap if the inner sink accepts; honour its
-                // decline (Skip / Keep) otherwise
-                let inner_action = self.tap.begin(entry, meta).await?;
-                if inner_action == FileAction::Tap {
-                    self.tap_entries.insert(entry);
-                }
-                inner_action
-            }
-        };
-        Ok(action)
-    }
-    async fn chunk(&mut self, entry: EntryId, bytes: &[u8]) -> io::Result<()> {
-        if self.tap_entries.contains(&entry) {
-            self.tap.chunk(entry, bytes).await
-        } else {
-            Err(io::Error::other("MultiplexSink: chunk without active tap"))
+    async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction> {
+        let disk = self.lander.classify(meta);
+        if disk != DiskAction::SkipUserHeap {
+            return self.lander.begin(meta).await;
         }
-    }
-    async fn end(&mut self, entry: EntryId) -> io::Result<()> {
-        if self.tap_entries.remove(&entry) {
-            self.tap.end(entry).await?;
-        } else {
-            self.lander.end(entry).await?;
+        // Hand it to the tap; honour its decline (Skip / Keep) otherwise,
+        // counting the lander's own verdict only when it keeps the entry
+        let inner = self.tap.begin(meta).await?;
+        if !inner.is_tap() {
+            self.lander.record(disk, meta);
         }
-        Ok(())
+        Ok(inner)
     }
-    async fn finish(&mut self, info: &EndInfo) -> io::Result<()> {
+    async fn finish(&self, info: &EndInfo) -> io::Result<()> {
         self.lander.finish(info).await?;
         self.tap.finish(info).await?;
         Ok(())
@@ -414,28 +385,43 @@ mod tests {
         }
     }
 
-    /// Counts begin / chunk / end, always returns Tap. Exercises
-    /// MultiplexSink without the full page walker.
-    #[derive(Debug, Default)]
-    struct CountingTap {
-        begins: u64,
-        chunks: u64,
-        ends: u64,
-        bytes: u64,
+    fn ld(a: &AtomicU64) -> u64 {
+        a.load(Ordering::Relaxed)
     }
+
+    /// Counts begin / chunk / end, always taps. Exercises MultiplexSink
+    /// without the full page walker.
+    #[derive(Debug, Default)]
+    struct TapCounts {
+        begins: AtomicU64,
+        chunks: AtomicU64,
+        ends: AtomicU64,
+        bytes: AtomicU64,
+    }
+
+    struct CountingTap(Arc<TapCounts>);
+
     #[async_trait]
     impl BackupSink for CountingTap {
-        async fn begin(&mut self, _entry: EntryId, _meta: &FileMeta) -> io::Result<FileAction> {
-            self.begins += 1;
-            Ok(FileAction::Tap)
+        async fn begin(&self, _meta: &FileMeta) -> io::Result<FileAction> {
+            self.0.begins.fetch_add(1, Ordering::Relaxed);
+            Ok(FileAction::Tap(Box::new(CountingEntry(self.0.clone()))))
         }
-        async fn chunk(&mut self, _entry: EntryId, bytes: &[u8]) -> io::Result<()> {
-            self.chunks += 1;
-            self.bytes += bytes.len() as u64;
+    }
+
+    struct CountingEntry(Arc<TapCounts>);
+
+    #[async_trait]
+    impl crate::backfill::backup_source::EntrySink for CountingEntry {
+        async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.0.chunks.fetch_add(1, Ordering::Relaxed);
+            self.0
+                .bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             Ok(())
         }
-        async fn end(&mut self, _entry: EntryId) -> io::Result<()> {
-            self.ends += 1;
+        async fn end(self: Box<Self>) -> io::Result<()> {
+            self.0.ends.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -443,49 +429,43 @@ mod tests {
     #[tokio::test]
     async fn multiplex_sink_routes_user_heap_to_tap() {
         let lander = DiskLanderSink::new(CatalogFilenodes::new());
-        let tap = CountingTap::default();
-        let mut mux = MultiplexSink::new(lander, tap);
+        let counts = Arc::new(TapCounts::default());
+        let mux = MultiplexSink::new(lander, CountingTap(counts.clone()));
 
-        let m = FileMeta {
-            path: PathBuf::from("base/5/1259"),
+        let file = |p: &str| FileMeta {
+            path: PathBuf::from(p),
             size: 0,
             mode: 0,
             kind: FileKind::File,
         };
-        assert_eq!(mux.begin(EntryId(0), &m).await.unwrap(), FileAction::Keep);
-        mux.end(EntryId(0)).await.unwrap();
+        assert!(matches!(
+            mux.begin(&file("base/5/1259")).await.unwrap(),
+            FileAction::Keep
+        ));
 
-        let m = FileMeta {
-            path: PathBuf::from("base/5/16400"),
-            size: 0,
-            mode: 0,
-            kind: FileKind::File,
+        let FileAction::Tap(mut entry) = mux.begin(&file("base/5/16400")).await.unwrap() else {
+            panic!("user heap must tap");
         };
-        assert_eq!(mux.begin(EntryId(1), &m).await.unwrap(), FileAction::Tap);
-        mux.chunk(EntryId(1), &[0u8; 1024]).await.unwrap();
-        mux.chunk(EntryId(1), &[1u8; 512]).await.unwrap();
-        mux.end(EntryId(1)).await.unwrap();
+        entry.chunk(&[0u8; 1024]).await.unwrap();
+        entry.chunk(&[1u8; 512]).await.unwrap();
+        entry.end().await.unwrap();
 
-        let m = FileMeta {
-            path: PathBuf::from("pg_replslot/0/state"),
-            size: 0,
-            mode: 0,
-            kind: FileKind::File,
-        };
-        assert_eq!(mux.begin(EntryId(2), &m).await.unwrap(), FileAction::Skip);
-        mux.end(EntryId(2)).await.unwrap();
+        assert!(matches!(
+            mux.begin(&file("pg_replslot/0/state")).await.unwrap(),
+            FileAction::Skip
+        ));
 
-        let (lander, tap) = mux.into_inner();
-        assert_eq!(tap.begins, 1);
-        assert_eq!(tap.chunks, 2);
-        assert_eq!(tap.ends, 1);
-        assert_eq!(tap.bytes, 1536);
-        assert_eq!(lander.stats.kept_files, 1);
-        // User heap delegated to tap; lander never begin'd it so
-        // skipped_user_heap stays 0. tap.begins == 1 is the
-        // operator-visible "routed away from disk" signal.
-        assert_eq!(lander.stats.skipped_user_heap, 0);
-        assert_eq!(lander.stats.skipped_denylist, 1);
+        let (lander, _) = mux.into_inner();
+        assert_eq!(ld(&counts.begins), 1);
+        assert_eq!(ld(&counts.chunks), 2);
+        assert_eq!(ld(&counts.ends), 1);
+        assert_eq!(ld(&counts.bytes), 1536);
+        assert_eq!(ld(&lander.stats.kept_files), 1);
+        // User heap delegated to tap, so the lander's own skip counter
+        // stays 0. `counts.begins == 1` is the operator-visible
+        // "routed away from disk" signal.
+        assert_eq!(ld(&lander.stats.skipped_user_heap), 0);
+        assert_eq!(ld(&lander.stats.skipped_denylist), 1);
     }
 
     #[test]
@@ -505,26 +485,18 @@ mod tests {
     #[tokio::test]
     async fn multiplex_lander_stats_exposes_disk_counters() {
         let lander = DiskLanderSink::new(CatalogFilenodes::new());
-        let mut mux = MultiplexSink::new(lander, CountingTap::default());
-        let m = FileMeta {
-            path: PathBuf::from("base/5/1259"),
+        let mux = MultiplexSink::new(lander, CountingTap(Arc::default()));
+        let file = |p: &str| FileMeta {
+            path: PathBuf::from(p),
             size: 0,
             mode: 0,
             kind: FileKind::File,
         };
-        assert_eq!(mux.begin(EntryId(0), &m).await.unwrap(), FileAction::Keep);
-        mux.end(EntryId(0)).await.unwrap();
-        let m = FileMeta {
-            path: PathBuf::from("pg_replslot/0/state"),
-            size: 0,
-            mode: 0,
-            kind: FileKind::File,
-        };
-        assert_eq!(mux.begin(EntryId(1), &m).await.unwrap(), FileAction::Skip);
-        mux.end(EntryId(1)).await.unwrap();
+        mux.begin(&file("base/5/1259")).await.unwrap();
+        mux.begin(&file("pg_replslot/0/state")).await.unwrap();
 
         let stats = mux.lander_stats();
-        assert_eq!(stats.kept_files, 1);
-        assert_eq!(stats.skipped_denylist, 1);
+        assert_eq!(ld(&stats.kept_files), 1);
+        assert_eq!(ld(&stats.skipped_denylist), 1);
     }
 }

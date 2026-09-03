@@ -6,7 +6,6 @@
 #[path = "common/ports.rs"]
 mod fx;
 
-use ahash::{HashSet, HashSetExt};
 use std::fs;
 use std::io::Write as _;
 use std::process::Command;
@@ -15,9 +14,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use walshadow::backfill_bootstrap::seed_catalog_from_source;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
+use walshadow::copy_backfill::CopyRate;
+use walshadow::heap_decoder::ColumnValue;
+use walshadow::mapping::{TableMapping, TableTarget};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::open_sql_client;
-use walshadow::visibility_repair::{PendingReason, PendingSet, repair};
+use walshadow::visibility_repair::{RepairBatch, RepairScope, RowRepair};
 
 /// Coverage boundary every baseline row carries
 const S: u64 = 0x0100_0000;
@@ -70,55 +72,109 @@ async fn seed(sh: &Shadow) -> CatalogMap {
     seed_catalog_from_source(&client).await.expect("seed")
 }
 
-async fn drain(mut rx: mpsc::Receiver<BackfillTuple>) -> Vec<BackfillTuple> {
+fn scope(catalog: &CatalogMap, name: &str) -> RepairScope {
+    let d = catalog
+        .descriptors()
+        .find(|d| &*d.rel_name.name == name)
+        .unwrap();
+    let mapping = [(
+        d.rel_name.clone(),
+        TableMapping {
+            target: TableTarget::new("default", name),
+            columns: Vec::new(),
+        },
+    )]
+    .into_iter()
+    .collect::<ahash::HashMap<_, _>>()
+    .into();
+    RepairScope::mapped(catalog, &mapping, |_| true)
+}
+
+async fn requests(sh: &Shadow, catalog: &CatalogMap, name: &str) -> Vec<BackfillTuple> {
+    let d = catalog
+        .descriptors()
+        .find(|d| &*d.rel_name.name == name)
+        .unwrap();
+    let client = open_sql_client(&fx::pg_cfg(sh, APP)).await.unwrap();
+    client
+        .query(
+            &format!(
+                "SELECT ctid::text FROM ONLY {}.{} ORDER BY ctid",
+                walshadow::pg::quote_ident(&d.rel_name.namespace),
+                walshadow::pg::quote_ident(name)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let tid: String = r.get(0);
+            let (blk, off) = tid.trim_matches(['(', ')']).split_once(',').unwrap();
+            BackfillTuple {
+                rfn: d.rfn,
+                xid: 0,
+                xmax: 0,
+                infomask: 0,
+                source_lsn: S,
+                blkno: blk.parse().unwrap(),
+                offnum: off.parse().unwrap(),
+                columns: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+async fn drain(mut rx: mpsc::Receiver<Vec<BackfillTuple>>) -> Vec<BackfillTuple> {
     let mut out = Vec::new();
-    while let Some(t) = rx.recv().await {
-        out.push(t);
+    while let Some(slab) = rx.recv().await {
+        out.extend(slab);
     }
     out
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inherited_rows_keep_their_physical_relation() {
+async fn unresolved_rows_keep_their_physical_relation() {
     if !pg_available() {
         return;
     }
     let src = start_source(
         "CREATE TABLE parent (id int PRIMARY KEY, body text);
          CREATE TABLE child () INHERITS (parent);
-         INSERT INTO parent VALUES (1, 'parent');
-         INSERT INTO child VALUES (2, 'child');",
+         INSERT INTO parent VALUES (1, 'parent'), (2, 'deleted'), (3, 'unrequested');
+         INSERT INTO child VALUES (4, 'child');",
     );
     let catalog = seed(&src.sh).await;
-    let parent = catalog
-        .descriptors()
-        .find(|d| &*d.rel_name.name == "parent")
+    let rows = requests(&src.sh, &catalog, "parent").await;
+    src.sh
+        .apply_schema_dump("DELETE FROM ONLY parent WHERE id = 2")
         .unwrap();
-    let pending = PendingSet::toast_capable(&catalog).scoped_to(
-        [(parent.rfn.db_node, parent.rfn.rel_node)]
-            .into_iter()
-            .collect(),
-    );
-    let (tx, rx) = mpsc::channel(4);
-    let collect = tokio::spawn(drain(rx));
-    let stats = repair(
-        &pending,
-        &catalog,
-        &HashSet::new(),
-        &fx::pg_cfg(&src.sh, APP),
-        S,
-        &tx,
-    )
+    let scope = scope(&catalog, "parent");
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(RepairBatch {
+        rows: rows[..2].to_vec(),
+        unresolved: true,
+    })
     .await
     .unwrap();
     drop(tx);
+    let (out_tx, out_rx) = mpsc::channel(1);
+    let collect = tokio::spawn(drain(out_rx));
+    let stats = RowRepair {
+        source: fx::pg_cfg(&src.sh, APP),
+        catalog,
+        scope,
+        rate: CopyRate::new(None),
+    }
+    .run(rx, out_tx)
+    .await
+    .unwrap();
     let rows = collect.await.unwrap();
     assert_eq!(stats.rows, 1);
-    assert_eq!(rows[0].rfn, parent.rfn);
-    assert!(matches!(
-        rows[0].columns[0],
-        Some(walshadow::heap_decoder::ColumnValue::Int4(1))
-    ));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source_lsn, S);
+    assert!(matches!(rows[0].columns[0], Some(ColumnValue::Int4(1))));
+    assert!(stats.p_hi > S);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -135,167 +191,267 @@ async fn row_security_cannot_silently_filter_repair() {
          CREATE POLICY visible ON t FOR SELECT TO repl USING (id=1);",
     );
     let catalog = seed(&src.sh).await;
-    let pending = PendingSet::toast_capable(&catalog);
-    let mut pg = fx::pg_cfg(&src.sh, APP);
-    pg.user = "repl".into();
-    let (tx, mut rx) = mpsc::channel(4);
-    let err = repair(&pending, &catalog, &HashSet::new(), &pg, S, &tx)
+    let rows = requests(&src.sh, &catalog, "t").await;
+    let scope = scope(&catalog, "t");
+    let mut source = fx::pg_cfg(&src.sh, APP);
+    source.user = "repl".into();
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(RepairBatch {
+        rows,
+        unresolved: true,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let (out_tx, mut out_rx) = mpsc::channel(1);
+    let err = RowRepair {
+        source,
+        catalog,
+        scope,
+        rate: CopyRate::new(None),
+    }
+    .run(rx, out_tx)
+    .await
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("row-level security"), "{err:#}");
+    assert!(out_rx.recv().await.is_none());
+}
+
+async fn assert_repair_rejects_after_read(change: &str, expected: &str) {
+    let src = start_source(
+        "CREATE TABLE t (id int PRIMARY KEY, body text); INSERT INTO t VALUES (1, 'a')",
+    );
+    let catalog = seed(&src.sh).await;
+    let rows = requests(&src.sh, &catalog, "t").await;
+    let scope = scope(&catalog, "t");
+    let (tx, rx) = mpsc::channel(1);
+    let (out_tx, mut out_rx) = mpsc::channel(1);
+    let worker = tokio::spawn(
+        RowRepair {
+            source: fx::pg_cfg(&src.sh, APP),
+            catalog,
+            scope,
+            rate: CopyRate::new(None),
+        }
+        .run(rx, out_tx),
+    );
+    tx.send(RepairBatch {
+        rows: rows.clone(),
+        unresolved: true,
+    })
+    .await
+    .unwrap();
+    assert_eq!(out_rx.recv().await.unwrap().len(), 1);
+    src.sh.apply_schema_dump(change).unwrap();
+    tx.send(RepairBatch {
+        rows,
+        unresolved: true,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let err = worker.await.unwrap().unwrap_err();
+    assert!(format!("{err:#}").contains(expected), "{err:#}");
+    assert!(out_rx.recv().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewritten_relation_after_first_read_fails() {
+    if !pg_available() {
+        return;
+    }
+    assert_repair_rejects_after_read("VACUUM FULL t", "rewritten inside the backup window").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replaced_relation_after_first_read_fails() {
+    if !pg_available() {
+        return;
+    }
+    assert_repair_rejects_after_read("DROP TABLE t; CREATE TABLE t (id int PRIMARY KEY, body text); INSERT INTO t VALUES (99, 'replacement')", "gone from the source").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn added_column_after_first_read_fails() {
+    if !pg_available() {
+        return;
+    }
+    assert_repair_rejects_after_read(
+        "ALTER TABLE t ADD COLUMN extra int",
+        "changed inside the backup window",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repair_holds_relation_lock_through_copy() {
+    if !pg_available() {
+        return;
+    }
+    let src = start_source(
+        "CREATE TABLE t (id int PRIMARY KEY, body text); INSERT INTO t SELECT g, repeat('x', 700000) FROM generate_series(1, 6) g",
+    );
+    let catalog = seed(&src.sh).await;
+    let rows = requests(&src.sh, &catalog, "t").await;
+    let scope = scope(&catalog, "t");
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(RepairBatch {
+        rows,
+        unresolved: true,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let (out_tx, out_rx) = mpsc::channel(1);
+    let worker = tokio::spawn(
+        RowRepair {
+            source: fx::pg_cfg(&src.sh, APP),
+            catalog,
+            scope,
+            rate: CopyRate::new(None),
+        }
+        .run(rx, out_tx),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while out_rx.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let client = open_sql_client(&fx::pg_cfg(&src.sh, "repair-ddl-test"))
+        .await
+        .unwrap();
+    client
+        .batch_execute("SET lock_timeout = '100ms'")
+        .await
+        .unwrap();
+    let err = client
+        .batch_execute("ALTER TABLE t ADD COLUMN extra int")
         .await
         .unwrap_err();
-    assert!(format!("{err:#}").contains("row-level security"), "{err:#}");
-    drop(tx);
-    assert!(rx.recv().await.is_none());
-}
-
-/// Read TOAST-owning relation whole through PostgreSQL
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn toast_capable_relation_is_read_whole_at_the_coverage_lsn() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    let src = start_source(
-        "CREATE TABLE public.t (id int4 PRIMARY KEY, body text NOT NULL) \
-           WITH (autovacuum_enabled = false);\n\
-         ALTER TABLE public.t ALTER COLUMN body SET STORAGE EXTERNAL;\n\
-         INSERT INTO public.t SELECT g, repeat('body-'||g::text||'---', 700) \
-           FROM generate_series(1, 6) g;\n\
-         DELETE FROM public.t WHERE id > 4;\n\
-         CREATE TABLE public.fixed (id int4 PRIMARY KEY, n int8 NOT NULL);\n\
-         INSERT INTO public.fixed SELECT g, g FROM generate_series(1, 3) g;\n",
-    );
-    let catalog = seed(&src.sh).await;
-    let pending = PendingSet::toast_capable(&catalog);
-    // `fixed` has no varlena column, so PostgreSQL gave it no toast relation
     assert_eq!(
-        pending.len(),
-        1,
-        "only the text-bearing relation is pending"
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
     );
-    assert_eq!(pending.count_for(PendingReason::ExternalToast), 1);
-
-    let (tx, rx) = mpsc::channel(64);
-    let collect = tokio::spawn(drain(rx));
-    let stats = repair(
-        &pending,
-        &catalog,
-        &HashSet::new(),
-        &fx::pg_cfg(&src.sh, APP),
-        S,
-        &tx,
-    )
-    .await
-    .expect("repair");
-    drop(tx);
-    let rows = collect.await.unwrap();
-
-    assert_eq!(stats.relations, 1);
-    assert_eq!(stats.rows, 4, "the deleted versions are not visible");
-    assert_eq!(rows.len(), 4);
-    // Baseline uses coverage LSN
-    assert!(rows.iter().all(|r| r.source_lsn == S));
-    assert!(
-        stats.p_hi > S,
-        "p_hi is a frontier, sampled after the reads"
-    );
-    // Bodies came back detoasted, so nothing here consulted a chunk mirror
-    let body = rows[0].columns[1].as_ref().expect("body column");
-    assert!(
-        format!("{body:?}").contains("body-"),
-        "external value arrived inline: {body:?}"
-    );
-}
-
-/// Skip relations excluded from initial load
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn opted_out_relation_is_skipped_not_scanned() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    let src = start_source(
-        "CREATE TABLE public.t (id int4 PRIMARY KEY, body text NOT NULL);\n\
-         INSERT INTO public.t VALUES (1, 'one');\n",
-    );
-    let catalog = seed(&src.sh).await;
-    let pending = PendingSet::toast_capable(&catalog);
-    let skip: HashSet<_> = catalog.descriptors().map(|d| d.rel_name.clone()).collect();
-
-    let (tx, rx) = mpsc::channel(4);
-    let collect = tokio::spawn(drain(rx));
-    let stats = repair(&pending, &catalog, &skip, &fx::pg_cfg(&src.sh, APP), S, &tx)
+    let rows = drain(out_rx).await;
+    assert_eq!(worker.await.unwrap().unwrap().rows, 6);
+    assert_eq!(rows.len(), 6);
+    client
+        .batch_execute("ALTER TABLE t ADD COLUMN extra int")
         .await
-        .expect("repair");
-    drop(tx);
-
-    assert_eq!(stats.skipped, 1);
-    assert_eq!(stats.relations, 0);
-    assert_eq!(stats.rows, 0);
-    assert!(collect.await.unwrap().is_empty());
+        .unwrap();
 }
 
-/// Seed the catalog off a baseline relation, mutate the source, then require
-/// repair to reject the drift naming every needle in `expected`
-async fn assert_repair_rejects(change: &str, expected: &[&str]) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_repair_streams_selected_versions_before_input_closes() {
+    if !pg_available() {
+        return;
+    }
+    use walshadow::heap_decoder::{ColumnValue, ToastPointer};
+    use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+
     let src = start_source(
-        "CREATE TABLE public.t (id int4 PRIMARY KEY, body text NOT NULL);\n\
-         INSERT INTO public.t SELECT g, 'row-'||g::text FROM generate_series(1, 4) g;\n",
+        "CREATE TABLE t (id int PRIMARY KEY, body text) WITH (autovacuum_enabled = false);
+         ALTER TABLE t ALTER COLUMN body SET STORAGE EXTERNAL;
+         INSERT INTO t SELECT g, repeat('body-' || g::text, 2000) FROM generate_series(1, 5) g;
+         CREATE TABLE child () INHERITS (t);
+         INSERT INTO child SELECT g, 'child' FROM generate_series(1, 5) g;",
     );
     let catalog = seed(&src.sh).await;
-    let pending = PendingSet::toast_capable(&catalog);
-    src.sh.apply_schema_dump(change).expect("source change");
-
-    let (tx, _rx) = mpsc::channel(4);
-    let err = repair(
-        &pending,
-        &catalog,
-        &HashSet::new(),
-        &fx::pg_cfg(&src.sh, APP),
-        S,
-        &tx,
-    )
+    let desc = catalog
+        .descriptors()
+        .find(|d| &*d.rel_name.name == "t")
+        .unwrap()
+        .clone();
+    let pg = fx::pg_cfg(&src.sh, APP);
+    let client = open_sql_client(&pg).await.unwrap();
+    let tids = client
+        .query(
+            "SELECT ctid::text FROM ONLY t WHERE id BETWEEN 2 AND 4 ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    let tuples = tids
+        .iter()
+        .map(|row| {
+            let tid: String = row.get(0);
+            let (blk, off) = tid.trim_matches(['(', ')']).split_once(',').unwrap();
+            BackfillTuple {
+                rfn: desc.rfn,
+                xid: 0,
+                xmax: 0,
+                infomask: 0,
+                source_lsn: S,
+                blkno: blk.parse().unwrap(),
+                offnum: off.parse().unwrap(),
+                columns: vec![
+                    Some(ColumnValue::Int4(0)),
+                    Some(ColumnValue::ExternalToast(ToastPointer {
+                        va_rawsize: 12004,
+                        va_extinfo: 12000,
+                        va_valueid: 1,
+                        va_toastrelid: desc.toast_oid,
+                    })),
+                ],
+            }
+        })
+        .collect();
+    client
+        .batch_execute("UPDATE ONLY t SET id = 30 WHERE id = 3; DELETE FROM ONLY t WHERE id = 4;")
+        .await
+        .unwrap();
+    let mapping = [(
+        desc.rel_name.clone(),
+        TableMapping {
+            target: TableTarget::new("default", "t"),
+            columns: vec![ColumnMapping {
+                src_attnum: 2,
+                target_name: "body".into(),
+                target_type: "String".into(),
+            }],
+        },
+    )]
+    .into_iter()
+    .collect::<ahash::HashMap<_, _>>()
+    .into();
+    let scope = RepairScope::mapped(&catalog, &mapping, |_| true);
+    let (tx, rx) = mpsc::channel(1);
+    let (out_tx, mut out_rx) = mpsc::channel(1);
+    let worker = tokio::spawn(
+        RowRepair {
+            source: pg,
+            catalog,
+            scope,
+            rate: CopyRate::new(None),
+        }
+        .run(rx, out_tx),
+    );
+    tx.send(RepairBatch {
+        rows: tuples,
+        unresolved: false,
+    })
     .await
-    .expect_err("drifted relation is not repairable");
-    let msg = format!("{err:#}");
-    for needle in expected {
-        assert!(msg.contains(needle), "want {needle:?} in {msg}");
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rewritten_relation_fails_the_pass() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    // Rewrite rotates filenode
-    assert_repair_rejects(
-        "VACUUM FULL public.t;\n",
-        &["rewritten inside the backup window"],
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dropped_relation_fails_the_pass() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    assert_repair_rejects("DROP TABLE public.t;\n", &["gone from the source"]).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn added_column_fails_the_pass() {
-    if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    // No rewrite, so the filenode still matches; the shape does not. The
-    // report names the new column
-    assert_repair_rejects(
-        "ALTER TABLE public.t ADD COLUMN extra int4;\n",
-        &["changed inside the backup window", "extra"],
-    )
-    .await;
+    .unwrap();
+    let rows = tokio::time::timeout(Duration::from_secs(10), out_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exclude moved, deleted, inherited and unrequested rows"
+    );
+    assert!(matches!(rows[0].columns[0], Some(ColumnValue::Int4(2))));
+    assert!(
+        matches!(&rows[0].columns[1], Some(ColumnValue::Text(body)) if body == &"body-2".repeat(2000))
+    );
+    assert_eq!(rows[0].source_lsn, S);
+    assert!(!worker.is_finished(), "emit before backup EOF");
+    drop(tx);
+    assert!(out_rx.recv().await.is_none());
+    let stats = worker.await.unwrap().unwrap();
+    assert_eq!(stats.rows, 1);
+    assert!(stats.p_hi > S);
 }

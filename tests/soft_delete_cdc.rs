@@ -11,7 +11,6 @@ use std::time::Duration;
 use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
-use walshadow::shadow::Shadow;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
 
@@ -57,7 +56,7 @@ async fn run_drill(
     slot: fx::Ports,
     app_name: &str,
     workload: &str,
-) -> (Shadow, fx::ChServer, tempfile::TempDir) {
+) -> (fx::ClusterGuard, fx::ChServer, tempfile::TempDir) {
     run_drill_with(slot, app_name, workload, |_| {}).await
 }
 
@@ -66,7 +65,7 @@ async fn run_drill_with(
     app_name: &str,
     workload: &str,
     tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
-) -> (Shadow, fx::ChServer, tempfile::TempDir) {
+) -> (fx::ClusterGuard, fx::ChServer, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {

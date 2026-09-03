@@ -12,7 +12,7 @@ mod ports;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use pgext::{hello, hello_on, wait_until};
+use pgext::{Faults, Op, Rule, hello, hello_on, wait_until};
 
 /// Header of a one byte request frame, first byte only: enough to make the
 /// connection readable, not enough to finish the frame
@@ -236,7 +236,7 @@ fn empty_socket_path_defines_gucs_without_a_worker() {
 
     assert_eq!(
         pg.sql("SELECT count(*)::text FROM pg_settings WHERE name LIKE 'walshadow.%'"),
-        "4"
+        "5"
     );
     assert_eq!(
         pg.sql(
@@ -245,4 +245,29 @@ fn empty_socket_path_defines_gucs_without_a_worker() {
         "0"
     );
     assert!(!pg.bridge_path().exists());
+}
+
+/// Widening an accepted connection's socket buffers is advisory: a kernel that
+/// refuses leaves the defaults, which only costs more waits. The refusal is a
+/// DEBUG1 line and nothing the client can see
+#[test]
+fn worker_serves_a_connection_whose_buffers_cannot_widen() {
+    if !pgext::pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut pg = pgext::stage(tmp.path(), ports::PG_SHADOW_PORT, Duration::from_secs(30));
+    let faults = Faults::new(tmp.path());
+    // The two directions are set under one `||`, so failing the first covers
+    // the pair
+    faults.arm(&[Rule::fail(Op::Setsockopt, 1, libc::ENOBUFS)]);
+    pg.start(&faults.env());
+    pg.wait_log(0, "walshadow bridge listening");
+
+    let mut conn = hello_on(&pg.bridge_path());
+    faults.wait_consumed();
+    // Both the handshake and the request behind it crossed the connection
+    // whose buffers stayed at the default
+    hello(&mut conn);
 }

@@ -148,12 +148,7 @@ async fn backup_window_wal_never_materialises_the_shadow() {
             &source,
             &ch_config_path,
             slot.walsender,
-            &[
-                "--bootstrap-max-rate-kib",
-                MAX_RATE_KIB,
-                "--bridge-lib-dir",
-                fx::pgext_dir().to_str().unwrap(),
-            ],
+            &["--bootstrap-max-rate-kib", MAX_RATE_KIB],
         )
         .expect("spawn walshadow-stream");
     let guard = fx::ChildGuard::new(child);

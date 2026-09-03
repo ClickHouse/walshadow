@@ -2,27 +2,32 @@
 //!
 //! [`stream_phase`] resolves hint bits and spools unknowns. [`resolve_phase`]
 //! uses complete backup transaction logs plus WAL commit overlay. Greenfield
-//! repairs relations whose tuples remain undecidable
+//! repairs tuples whose visibility remains undecidable
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::sync::mpsc;
+use tokio_util::task::AbortOnDropHandle;
 use walrus::pg::replication::conn::PgConfig;
 
 use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
-use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
-use crate::backfill::visibility_repair::{PendingReason, PendingSet, RepairStats, repair};
+use crate::backfill::copy_backfill::CopyRate;
+use crate::backfill::spool::DeferredSpool;
+use crate::backfill::visibility_repair::{RepairBatch, RepairScope, RepairStats, RowRepair};
 use crate::config::ResolvedConfig;
 use crate::decode::visibility::{
-    HEAP_XMAX_IS_MULTI, PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView, Visibility,
-    read_pg_multixact, read_pg_xact, tuple_visibility,
+    HEAP_XMAX_IS_MULTI, PgXactPatch, PgXactView, Visibility, read_pg_multixact, read_pg_xact,
+    tuple_visibility,
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::pipeline::ack::AckHandle;
+use crate::emit::pipeline::batcher::BatcherMsg;
+use crate::emit::pipeline::bootstrap::BootstrapDrainOutcome;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
-use crate::mapping::MappingHandle;
+use crate::mapping::MappingSnapshot;
 use crate::schema::RelName;
 use crate::toast::ToastResolver;
 use ahash::HashSet;
@@ -35,69 +40,69 @@ pub struct GateStats {
     pub multixact_emitted: u64,
     /// Chunk tuples the hint bits proved dead, dropped before the store
     pub chunks_gated: u64,
-    /// Walked tuples replaced by relation repair
-    pub pending_discarded: u64,
-    /// Relations handed to visibility repair
-    pub pending_relations: u64,
-    /// Relations pending for undecidable multixacts
-    pub pending_multixact: u64,
+    /// Tuples handed to source visibility repair
+    pub unresolved: u64,
     /// Rows emitted by visibility repair
     pub repaired_rows: u64,
     /// Source write head after final repair read
     pub p_hi: u64,
 }
 
-/// Policy for tuples remaining undecidable
-#[derive(Debug)]
-pub enum Undecidable<'a> {
-    /// Abort per-table loads
-    Abort,
-    /// Hand greenfield relation to repair
-    Pending(&'a mut PendingSet),
+pub enum GateOutput<'a> {
+    Rows(&'a mpsc::Sender<Vec<BackfillTuple>>),
+    Repair(&'a mpsc::Sender<RepairBatch>),
+}
+
+impl GateOutput<'_> {
+    async fn send(&self, rows: Vec<BackfillTuple>, unresolved: bool) -> bool {
+        match self {
+            Self::Rows(tx) => tx.send(rows).await.is_ok(),
+            Self::Repair(tx) => tx.send(RepairBatch { rows, unresolved }).await.is_ok(),
+        }
+    }
 }
 
 /// Resolve hint bits, spool unknown main tuples, pass chunks unless proven dead
+///
+/// Slab in, slab out: the walk's batching survives the gate, which only drops
+/// what the verdict removes
 pub async fn stream_phase(
-    rx: &mut mpsc::Receiver<BackfillTuple>,
-    tx: &mpsc::Sender<BackfillTuple>,
+    rx: &mut mpsc::Receiver<Vec<BackfillTuple>>,
+    tx: &GateOutput<'_>,
     catalog: &CatalogMap,
-    pending: &mut PendingSet,
     deferred: &mut DeferredSpool,
     stats: &mut GateStats,
 ) -> Result<(), String> {
-    while let Some(t) = rx.recv().await {
-        if catalog.is_toast(t.rfn.db_node, t.rfn.rel_node) {
-            if tuple_visibility(t.xid, t.xmax, t.infomask, None) == Visibility::Skip {
-                stats.chunks_gated += 1;
+    while let Some(slab) = rx.recv().await {
+        let mut pass = Vec::with_capacity(slab.len());
+        for t in slab {
+            if catalog.is_toast(t.rfn.db_node, t.rfn.rel_node) {
+                if tuple_visibility(t.xid, t.xmax, t.infomask, None) == Visibility::Skip {
+                    stats.chunks_gated += 1;
+                    continue;
+                }
+                pass.push(t);
                 continue;
             }
-            if tx.send(t).await.is_err() {
-                break;
-            }
-            continue;
-        }
-        // Repair replaces main-page tuples
-        if pending.holds(t.rfn.db_node, t.rfn.rel_node) {
-            stats.pending_discarded += 1;
-            continue;
-        }
-        let visibility = tuple_visibility(t.xid, t.xmax, t.infomask, None);
-        if visibility != Visibility::Skip && pending.observe_external(&t) {
-            stats.pending_discarded += 1;
-            continue;
-        }
-        match visibility {
-            Visibility::Emit => {
-                if !emit(t, tx, stats).await {
-                    break;
+            let visibility = tuple_visibility(t.xid, t.xmax, t.infomask, None);
+            match visibility {
+                Visibility::Emit => {
+                    if t.infomask & HEAP_XMAX_IS_MULTI != 0 {
+                        stats.multixact_emitted += 1;
+                    }
+                    stats.emitted += 1;
+                    pass.push(t);
                 }
+                Visibility::Skip => stats.gated += 1,
+                // Multixact verdict requires complete view
+                Visibility::Defer | Visibility::Unresolvable => deferred
+                    .push(t)
+                    .await
+                    .map_err(|e| format!("visibility gate: deferred spool: {e}"))?,
             }
-            Visibility::Skip => stats.gated += 1,
-            // Multixact verdict requires complete view
-            Visibility::Defer | Visibility::Unresolvable => deferred
-                .push(t)
-                .await
-                .map_err(|e| format!("visibility gate: deferred spool: {e}"))?,
+        }
+        if !pass.is_empty() && !tx.send(pass, false).await {
+            break;
         }
     }
     stats.deferred = deferred.records();
@@ -108,10 +113,11 @@ pub async fn stream_phase(
 pub async fn resolve_phase(
     deferred: DeferredSpool,
     view: &PgXactView<'_>,
-    tx: &mpsc::Sender<BackfillTuple>,
-    mut undecidable: Undecidable<'_>,
+    tx: &GateOutput<'_>,
     stats: &mut GateStats,
 ) -> Result<(), String> {
+    let mut out = SlabTx::new(tx, false);
+    let mut repair = SlabTx::new(tx, true);
     let mut replay = deferred
         .into_reader()
         .await
@@ -122,31 +128,33 @@ pub async fn resolve_phase(
         .await
         .map_err(|e| format!("visibility gate: deferred spool replay: {e}"))?
     {
-        if let Undecidable::Pending(set) = &undecidable
-            && set.holds(t.rfn.db_node, t.rfn.rel_node)
-        {
-            stats.pending_discarded += 1;
-            continue;
-        }
         match tuple_visibility(t.xid, t.xmax, t.infomask, Some(view)) {
             Visibility::Emit => {
-                if !emit(t, tx, stats).await {
+                if t.infomask & HEAP_XMAX_IS_MULTI != 0 {
+                    stats.multixact_emitted += 1;
+                }
+                stats.emitted += 1;
+                if !out.push(t).await {
                     break;
                 }
             }
             Visibility::Skip | Visibility::Defer => stats.gated += 1,
-            Visibility::Unresolvable => match &mut undecidable {
-                Undecidable::Abort => {
+            Visibility::Unresolvable => match tx {
+                GateOutput::Rows(_) => {
                     fail = Some(undecidable_multixact(&t));
                     break;
                 }
-                Undecidable::Pending(set) => {
-                    set.mark(t.rfn, PendingReason::UnresolvedMultiXact);
-                    stats.pending_discarded += 1;
+                GateOutput::Repair(_) => {
+                    stats.unresolved += 1;
+                    if !repair.push(t).await {
+                        break;
+                    }
                 }
             },
         }
     }
+    out.flush().await;
+    repair.flush().await;
     replay
         .finish()
         .await
@@ -157,13 +165,47 @@ pub async fn resolve_phase(
     }
 }
 
-async fn emit(t: BackfillTuple, tx: &mpsc::Sender<BackfillTuple>, stats: &mut GateStats) -> bool {
-    if t.infomask & HEAP_XMAX_IS_MULTI != 0 {
-        stats.multixact_emitted += 1;
-    }
-    stats.emitted += 1;
-    tx.send(t).await.is_ok()
+/// Regroup a per-tuple source into walk-sized slabs, so the spool replay and
+/// repair reads cost the drain one channel hop per batch, not per row
+struct SlabTx<'a> {
+    tx: &'a GateOutput<'a>,
+    unresolved: bool,
+    buf: Vec<BackfillTuple>,
+    closed: bool,
 }
+
+impl<'a> SlabTx<'a> {
+    fn new(tx: &'a GateOutput<'a>, unresolved: bool) -> Self {
+        Self {
+            tx,
+            unresolved,
+            buf: Vec::with_capacity(GATE_SLAB_ROWS),
+            closed: false,
+        }
+    }
+
+    /// `false` once the drain hangs up
+    async fn push(&mut self, t: BackfillTuple) -> bool {
+        self.buf.push(t);
+        if self.buf.len() < GATE_SLAB_ROWS {
+            return !self.closed;
+        }
+        self.flush().await
+    }
+
+    async fn flush(&mut self) -> bool {
+        if self.closed || self.buf.is_empty() {
+            return !self.closed;
+        }
+        let slab = std::mem::replace(&mut self.buf, Vec::with_capacity(GATE_SLAB_ROWS));
+        self.closed = !self.tx.send(slab, self.unresolved).await;
+        !self.closed
+    }
+}
+
+/// Rows per slab out of the spool replay and repair reads. Row width is
+/// unbounded here, so the drain's own budget is the resident ceiling
+const GATE_SLAB_ROWS: usize = 256;
 
 fn undecidable_multixact(t: &BackfillTuple) -> String {
     format!(
@@ -173,31 +215,98 @@ fn undecidable_multixact(t: &BackfillTuple) -> String {
     )
 }
 
-/// Greenfield resolution inputs
-pub struct PendingGate {
-    pub deferred: DeferredSpool,
+/// Destination both greenfield legs write: page walk, then deferred
+/// resolution. One frozen mapping serves the repair scope and the drain's
+/// routes, so a route can never want a value the repair never read
+pub struct GreenfieldSink {
+    /// Source endpoint for repair reads
+    pub source: PgConfig,
     pub catalog: CatalogMap,
-    pub mapping: MappingHandle,
+    pub mapping: MappingSnapshot,
+    pub repair_scope: RepairScope,
+    pub copy_rate: CopyRate,
     pub config: Arc<ResolvedConfig>,
     pub emitter: EmitterConfig,
     pub stats: Arc<EmitterStats>,
     pub resolver: ToastResolver,
-    pub oracle: Option<Arc<crate::ops::oracle::Oracle>>,
     /// Relations excluded from initial load
     pub skip_initial: HashSet<RelName>,
-    /// Source endpoint for repair reads
-    pub source: PgConfig,
-    /// Relations handed to repair
-    pub pending: PendingSet,
-    /// Coverage tag for walked and repaired rows
-    pub start_lsn: u64,
-    /// Repair spill root
-    pub spill_dir: PathBuf,
+}
+
+/// Spawned repair and drain stages of one leg
+pub struct RepairDrain {
+    repair: AbortOnDropHandle<Result<RepairStats>>,
+    drain: AbortOnDropHandle<Result<BootstrapDrainOutcome, String>>,
+}
+
+impl GreenfieldSink {
+    /// Spawn source repair feeding the bootstrap drain. Gate stage owns the
+    /// returned sender; dropping it winds both stages down
+    pub fn spawn(
+        &self,
+        msg_tx: mpsc::Sender<BatcherMsg>,
+        ack: AckHandle,
+    ) -> (mpsc::Sender<RepairBatch>, RepairDrain) {
+        let (tx, rx) = mpsc::channel(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+        let (repaired_tx, repaired_rx) = mpsc::channel(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+        let repair = AbortOnDropHandle::new(tokio::spawn(
+            RowRepair {
+                source: self.source.clone(),
+                catalog: self.catalog.clone(),
+                scope: self.repair_scope.clone(),
+                rate: self.copy_rate.clone(),
+            }
+            .run(rx, repaired_tx),
+        ));
+        let drain = AbortOnDropHandle::new(tokio::spawn(bootstrap::drain(
+            repaired_rx,
+            self.catalog.clone(),
+            self.mapping.clone(),
+            msg_tx,
+            ack,
+            self.stats.clone(),
+            self.resolver.clone(),
+            // Repair strips mapped external pointers, so nothing defers
+            None,
+            self.emitter.row_policy(),
+            Some(self.config.clone()),
+            self.skip_initial.clone(),
+        )));
+        (tx, RepairDrain { repair, drain })
+    }
+}
+
+impl RepairDrain {
+    /// Join both stages before surfacing either error, so a failed repair
+    /// still lets the drain finish what it holds
+    pub async fn join(self) -> Result<(RepairStats, BootstrapDrainOutcome), String> {
+        let repaired = join_stage(self.repair, "row repair").await;
+        let drained = join_stage(self.drain, "drain").await;
+        Ok((repaired?, drained?))
+    }
+}
+
+async fn join_stage<T, E: std::fmt::Display>(
+    handle: AbortOnDropHandle<Result<T, E>>,
+    stage: &str,
+) -> Result<T, String> {
+    match handle.await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("bootstrap {stage}: {e:#}")),
+        Err(e) => Err(format!("bootstrap {stage} join: {e}")),
+    }
+}
+
+/// Greenfield resolution inputs
+pub struct PendingGate {
+    pub deferred: DeferredSpool,
+    pub sink: GreenfieldSink,
+    pub oracle: Option<Arc<crate::ops::oracle::Oracle>>,
     /// Streaming-phase counters
     pub stream_stats: GateStats,
 }
 
-/// Resolve deferred tuples and repair pending relations
+/// Resolve deferred tuples and repair unresolved visibility
 pub async fn resolve_greenfield(
     gate: PendingGate,
     data_dir: &Path,
@@ -205,42 +314,21 @@ pub async fn resolve_greenfield(
 ) -> Result<GateStats> {
     let PendingGate {
         deferred,
-        catalog,
-        mapping,
-        config,
-        emitter,
-        stats,
-        resolver,
+        sink,
         oracle,
-        skip_initial,
-        source,
-        mut pending,
-        start_lsn,
-        spill_dir,
         stream_stats: mut gate_stats,
     } = gate;
-    if deferred.records() == 0 && pending.is_empty() {
+    if deferred.records() == 0 {
         return Ok(gate_stats);
     }
-    // Repair rides the same drain, so it needs its own view of what the
-    // drain takes ownership of
-    let repair_catalog = catalog.clone();
-    let repair_skip = skip_initial.clone();
-    // SLRUs only answer the spool; a pending-only pass reads none of them
-    let (accum, multi) = if deferred.records() == 0 {
-        (PgXactAccum::new(), PgMultiXactAccum::new())
-    } else {
-        (
-            read_pg_xact(data_dir).await?,
-            read_pg_multixact(data_dir).await?,
-        )
-    };
+    let accum = read_pg_xact(data_dir).await?;
+    let multi = read_pg_multixact(data_dir).await?;
     let view = PgXactView::new(&accum, patch).with_multixact(&multi);
 
     let tail = OwnedTail::spawn(
-        &emitter,
-        1,
-        stats.clone(),
+        &sink.emitter,
+        sink.emitter.inserter_pool_size,
+        sink.stats.clone(),
         Fatal::new(),
         None,
         oracle,
@@ -249,57 +337,16 @@ pub async fn resolve_greenfield(
     .await
     .map_err(anyhow::Error::msg)?;
 
-    let toast_spool = spill_dir.join("bootstrap_gate_toast.bin");
-    tokio::fs::remove_file(&toast_spool).await.ok();
-    let (tx, rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-    let drain = tokio::spawn(bootstrap::drain(
-        rx,
-        catalog,
-        mapping,
-        tail.msg_tx.clone(),
-        tail.ack.clone(),
-        stats,
-        resolver,
-        DeferredSpool::new(toast_spool, DEFERRED_SPOOL_MEM_MAX),
-        emitter.row_policy(),
-        Some(config),
-        skip_initial,
-    ));
-
-    let mut resolved = resolve_phase(
-        deferred,
-        &view,
-        &tx,
-        Undecidable::Pending(&mut pending),
-        &mut gate_stats,
-    )
-    .await;
-    gate_stats.pending_relations = pending.len() as u64;
-    gate_stats.pending_multixact = pending.count_for(PendingReason::UnresolvedMultiXact);
-    if resolved.is_ok() {
-        match repair(
-            &pending,
-            &repair_catalog,
-            &repair_skip,
-            &source,
-            start_lsn,
-            &tx,
-        )
-        .await
-        {
-            Ok(r) => {
-                gate_stats.repaired_rows = r.rows;
-                gate_stats.p_hi = r.p_hi;
-                log_repair(&r, gate_stats.pending_multixact);
-            }
-            Err(e) => resolved = Err(format!("{e:#}")),
-        }
-    }
+    let (tx, stages) = sink.spawn(tail.msg_tx.clone(), tail.ack.clone());
+    let resolved = resolve_phase(deferred, &view, &GateOutput::Repair(&tx), &mut gate_stats).await;
     drop(tx);
-    let drained = drain.await.context("visibility gate: drain join")?;
     // Drain tail before surfacing errors
-    let next_seq = match (resolved, drained) {
-        (Ok(()), Ok(o)) => o.next_seq,
+    let next_seq = match (resolved, stages.join().await) {
+        (Ok(()), Ok((repaired, drained))) => {
+            gate_stats.repaired_rows += repaired.rows;
+            gate_stats.p_hi = gate_stats.p_hi.max(repaired.p_hi);
+            drained.next_seq
+        }
         (Err(e), _) | (_, Err(e)) => {
             tail.quiesce().await;
             anyhow::bail!(e);
@@ -309,30 +356,16 @@ pub async fn resolve_greenfield(
     Ok(gate_stats)
 }
 
-/// Log repair convergence frontier
-fn log_repair(r: &RepairStats, multixact_relations: u64) {
-    if r.relations == 0 && r.skipped == 0 {
-        return;
-    }
-    tracing::info!(
-        target: "walshadow::bootstrap",
-        relations = r.relations,
-        rows = r.rows,
-        skipped = r.skipped,
-        multixact_relations,
-        p_hi = r.p_hi,
-        "visibility repair read pending relations through PostgreSQL",
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backfill::backup_page_walk::make_rel_named;
+    use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::decode::visibility::{
         HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED,
         HEAP_XMIN_INVALID,
     };
+    use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum};
     use ahash::HashSetExt;
     use walrus::pg::walparser::RelFileNode;
 
@@ -383,32 +416,38 @@ mod tests {
     /// let through
     async fn run_stream_phase(
         catalog: &CatalogMap,
-        pending: &mut PendingSet,
         tuples: Vec<BackfillTuple>,
     ) -> (GateStats, Vec<BackfillTuple>) {
         let (tx, mut rx) = mpsc::channel(8);
         let (walk_tx, mut walk_rx) = mpsc::channel(8);
+        // One tuple per slab: exercises the per-tuple verdicts, not batching
         for t in tuples {
-            walk_tx.send(t).await.unwrap();
+            walk_tx.send(vec![t]).await.unwrap();
         }
         drop(walk_tx);
 
         let mut stats = GateStats::default();
         let mut spool = spool_of(Vec::new()).await;
-        stream_phase(&mut walk_rx, &tx, catalog, pending, &mut spool, &mut stats)
-            .await
-            .unwrap();
+        stream_phase(
+            &mut walk_rx,
+            &GateOutput::Rows(&tx),
+            catalog,
+            &mut spool,
+            &mut stats,
+        )
+        .await
+        .unwrap();
         drop(tx);
 
         let mut passed = Vec::new();
-        while let Some(t) = rx.recv().await {
-            passed.push(t);
+        while let Some(slab) = rx.recv().await {
+            passed.extend(slab);
         }
         (stats, passed)
     }
 
     #[tokio::test]
-    async fn repair_requires_a_mapped_external_value() {
+    async fn mapped_external_values_stream_without_marking_relations() {
         use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
         use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
         use crate::schema::RelName;
@@ -454,15 +493,13 @@ mod tests {
             .into_iter()
             .collect::<ahash::HashMap<_, _>>()
             .into();
-            let mut pending = PendingSet::mapped(&catalog, &mapping);
-            assert!(pending.is_empty());
+            let scope = RepairScope::mapped(&catalog, &mapping, |_| true);
             let row = |value, infomask| BackfillTuple {
                 columns: vec![Some(ColumnValue::Int4(1)), Some(value)],
                 ..tuple(100, 0, infomask)
             };
             let (stats, passed) = run_stream_phase(
                 &catalog,
-                &mut pending,
                 vec![
                     row(ColumnValue::Text("inline".into()), HEAP_XMIN_COMMITTED),
                     row(external.clone(), HEAP_XMIN_INVALID),
@@ -471,8 +508,9 @@ mod tests {
             )
             .await;
             assert_eq!(stats.gated, 1);
-            assert_eq!(pending.holds(5, 16400), body_mapped);
-            assert_eq!(passed.len(), if body_mapped { 1 } else { 2 });
+            assert_eq!(passed.len(), 2);
+            assert!(!scope.has_external(&passed[0]));
+            assert_eq!(scope.has_external(&passed[1]), body_mapped);
         }
     }
 
@@ -488,7 +526,6 @@ mod tests {
         // Deleted value, aborted insert, then one that is still live
         let (stats, passed) = run_stream_phase(
             &toast_catalog(16401),
-            &mut PendingSet::empty(),
             vec![
                 chunk(200, HEAP_XMIN_COMMITTED | HEAP_XMAX_COMMITTED),
                 chunk(0, HEAP_XMIN_INVALID),
@@ -504,53 +541,11 @@ mod tests {
         assert_eq!(stats.deferred, 0);
     }
 
-    /// Repair replaces main rows but preserves chunk cache
-    #[tokio::test]
-    async fn pending_relation_drops_its_pages_and_keeps_its_chunks() {
-        let mut catalog = CatalogMap::new();
-        catalog.insert(make_rel_named(
-            16400,
-            16400,
-            16402,
-            RelName::new("public", "t"),
-        ));
-        catalog.insert(make_rel_named(
-            16402,
-            16403,
-            0,
-            RelName::new("pg_toast", "pg_toast_16400"),
-        ));
-        let mut pending = PendingSet::toast_capable(&catalog);
-
-        let live = HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID;
-        let (stats, passed) = run_stream_phase(
-            &catalog,
-            &mut pending,
-            vec![
-                tuple(100, 0, live),
-                BackfillTuple {
-                    rfn: rfn(16403),
-                    ..tuple(100, 0, live)
-                },
-            ],
-        )
-        .await;
-
-        assert_eq!(stats.pending_discarded, 1, "its main page is dropped");
-        assert_eq!(stats.emitted, 0);
-        assert_eq!(
-            passed.iter().map(|t| t.rfn.rel_node).collect::<Vec<_>>(),
-            [16403],
-            "only its chunk reaches the store",
-        );
-    }
-
     /// Preserve chunks without decisive hint bits
     #[tokio::test]
     async fn undecidable_chunks_still_pass_through() {
         let (stats, passed) = run_stream_phase(
             &toast_catalog(16401),
-            &mut PendingSet::empty(),
             vec![BackfillTuple {
                 rfn: rfn(16401),
                 ..tuple(100, 0, 0)
@@ -564,41 +559,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn greenfield_hands_undecidable_multixact_relation_over() {
+    async fn greenfield_repairs_only_undecidable_tuples() {
         let accum = PgXactAccum::new();
         let patch = PgXactPatch::new();
-        // No collected offsets segment: the mxid is below any known range
         let multi = PgMultiXactAccum::new();
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, mut rx) = mpsc::channel(4);
         let mut stats = GateStats::default();
         let spool = spool_of(vec![
+            tuple(100, 0, HEAP_XMIN_COMMITTED),
             tuple(100, 10, HEAP_XMIN_COMMITTED | HEAP_XMAX_IS_MULTI),
             tuple(100, 0, HEAP_XMIN_COMMITTED),
         ])
         .await;
-
-        let mut pending = PendingSet::empty();
-        resolve_phase(
-            spool,
-            &view,
-            &tx,
-            Undecidable::Pending(&mut pending),
-            &mut stats,
-        )
-        .await
-        .unwrap();
+        resolve_phase(spool, &view, &GateOutput::Repair(&tx), &mut stats)
+            .await
+            .unwrap();
         drop(tx);
-
-        assert!(
-            rx.recv().await.is_none(),
-            "an undecidable tuple is never guessed"
-        );
-        assert_eq!(stats.emitted, 0);
-        assert_eq!(stats.pending_discarded, 2);
-        assert_eq!(pending.len(), 1, "its relation goes to the repair path");
-        assert_eq!(pending.count_for(PendingReason::UnresolvedMultiXact), 1);
-        assert!(pending.holds(5, 16400));
+        let visible = rx.recv().await.expect("visible rows");
+        assert!(!visible.unresolved);
+        assert_eq!(visible.rows.len(), 2);
+        let unresolved = rx.recv().await.expect("unresolved row");
+        assert!(unresolved.unresolved);
+        assert_eq!(unresolved.rows.len(), 1);
+        assert_eq!(unresolved.rows[0].xmax, 10);
+        assert!(rx.recv().await.is_none());
+        assert_eq!(stats.emitted, 2);
+        assert_eq!(stats.unresolved, 1);
     }
 
     #[tokio::test]
@@ -616,7 +603,7 @@ mod tests {
         )])
         .await;
 
-        let err = resolve_phase(spool, &view, &tx, Undecidable::Abort, &mut stats)
+        let err = resolve_phase(spool, &view, &GateOutput::Rows(&tx), &mut stats)
             .await
             .unwrap_err();
         assert!(err.contains("pg_multixact"), "{err}");
@@ -628,18 +615,19 @@ mod tests {
     async fn resolve_greenfield_is_a_noop_without_deferrals() {
         let pending = PendingGate {
             deferred: spool_of(Vec::new()).await,
-            catalog: CatalogMap::new(),
-            mapping: crate::mapping::mapping_handle(Default::default()),
-            config: Arc::new(ResolvedConfig::default()),
-            emitter: EmitterConfig::default(),
-            stats: Arc::new(EmitterStats::default()),
-            resolver: ToastResolver::disabled(),
+            sink: GreenfieldSink {
+                source: crate::config::SourceConn::default().to_pg_config(),
+                catalog: CatalogMap::new(),
+                mapping: Default::default(),
+                repair_scope: RepairScope::default(),
+                copy_rate: CopyRate::new(None),
+                config: Arc::new(ResolvedConfig::default()),
+                emitter: EmitterConfig::default(),
+                stats: Arc::new(EmitterStats::default()),
+                resolver: ToastResolver::disabled(),
+                skip_initial: HashSet::new(),
+            },
             oracle: None,
-            skip_initial: HashSet::new(),
-            source: crate::config::SourceConn::default().to_pg_config(),
-            pending: PendingSet::empty(),
-            start_lsn: 0x1000,
-            spill_dir: std::env::temp_dir(),
             stream_stats: GateStats {
                 emitted: 7,
                 ..Default::default()

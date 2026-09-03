@@ -35,9 +35,6 @@ use ahash::HashSet;
 /// Wind-down poll while source sends no WAL
 const STOP_POLL: Duration = Duration::from_millis(100);
 
-/// Maximum wait for transactions open below handoff
-const WIND_DOWN_MAX: Duration = Duration::from_secs(5);
-
 /// Inputs shared with concurrent bootstrap drain
 #[derive(Clone)]
 pub struct WindowLegConfig {
@@ -60,6 +57,7 @@ pub struct WindowLegConfig {
     pub pg_major: u32,
     pub system_id: String,
     pub timeline: u32,
+    pub wind_down: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,7 +83,7 @@ pub async fn stream_window(
     let leg = Leg::open(&cfg, from_lsn)
         .await
         .context("bootstrap window leg: open")?;
-    run_live(leg, cfg.timeline, feed, from_lsn, stop).await
+    run_live(leg, cfg.timeline, feed, from_lsn, stop, cfg.wind_down).await
 }
 
 /// Replay window WAL already on disk
@@ -194,7 +192,7 @@ impl Leg {
         let (filter_rfns, targets) = replay_scope(&cfg.catalog);
         let tail = OwnedTail::spawn(
             &cfg.emitter,
-            1,
+            cfg.emitter.inserter_pool_size,
             cfg.stats.clone(),
             cfg.fatal.clone(),
             None,
@@ -312,6 +310,7 @@ async fn run_live(
     feed: &mut SourceFeed,
     from_lsn: u64,
     mut stop: watch::Receiver<Option<u64>>,
+    wind_down_max: Duration,
 ) -> Result<WindowLegStats> {
     let begin = read_start(from_lsn);
     feed.start_physical_replication(None, begin, timeline)
@@ -333,7 +332,7 @@ async fn run_live(
                 break Ok(());
             }
             let since = *wind_down.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() >= WIND_DOWN_MAX {
+            if since.elapsed() >= wind_down_max {
                 // Pump resumes from open_floor to rebuild these transactions
                 tracing::warn!(
                     target: "walshadow::bootstrap",

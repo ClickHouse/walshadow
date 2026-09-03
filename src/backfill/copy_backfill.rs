@@ -85,6 +85,13 @@ use crate::schema::{
 };
 use crate::source::source_feed::open_sql_client;
 use crate::toast::ToastResolver;
+
+/// Rows per COPY-backfill channel hop. Byte trigger below bounds the wide-row
+/// case, so this only caps the narrow-row hop rate
+const COPY_SLAB_ROWS: usize = 1024;
+/// Decoded value bytes per hop. With
+/// [`BOOTSTRAP_TUPLE_CHANNEL_CAP`] this is the resident payload ceiling
+const COPY_SLAB_BYTES: usize = 1 << 20;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
@@ -330,15 +337,67 @@ fn column_plan(desc: &RelDescriptor) -> CopyPlan {
 }
 
 /// Copy visible, detoasted rows from `desc` into `tx`, tagged `lsn`
+///
+/// Slabs the channel: one hop per [`COPY_SLAB_BYTES`] of decoded values, not
+/// one per row. Byte-triggered so wide rows keep the resident bound whatever
+/// the row count
 pub(crate) async fn copy_rows_into(
     client: &tokio_postgres::Client,
     desc: &RelDescriptor,
     lsn: u64,
-    tx: &mpsc::Sender<BackfillTuple>,
+    tx: &mpsc::Sender<Vec<BackfillTuple>>,
+) -> anyhow::Result<u64> {
+    copy_selected_rows_into(client, desc, lsn, tx, None, &CopyRate::new(None)).await
+}
+
+#[derive(Clone)]
+pub struct CopyRate {
+    bytes_per_sec: Option<u64>,
+    next: Arc<Mutex<tokio::time::Instant>>,
+}
+
+impl CopyRate {
+    pub fn new(kib: Option<u32>) -> Self {
+        Self {
+            bytes_per_sec: kib.filter(|n| *n != 0).map(|n| u64::from(n) * 1024),
+            next: Arc::new(Mutex::new(tokio::time::Instant::now())),
+        }
+    }
+
+    async fn consume(&self, bytes: usize) {
+        if let Some(rate) = self.bytes_per_sec {
+            let mut next = self.next.lock().await;
+            *next = (*next).max(tokio::time::Instant::now())
+                + Duration::from_secs_f64(bytes as f64 / rate as f64);
+            tokio::time::sleep_until(*next).await;
+        }
+    }
+}
+
+pub(crate) async fn copy_selected_rows_into(
+    client: &tokio_postgres::Client,
+    desc: &RelDescriptor,
+    lsn: u64,
+    tx: &mpsc::Sender<Vec<BackfillTuple>>,
+    tids: Option<&[(u32, u16)]>,
+    rate: &CopyRate,
 ) -> anyhow::Result<u64> {
     let plan = column_plan(desc);
+    let predicate = if let Some(tids) = tids {
+        if tids.is_empty() {
+            return Ok(0);
+        }
+        let tids = tids
+            .iter()
+            .map(|(blk, off)| format!("'({blk},{off})'::tid"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(" WHERE ctid = ANY (ARRAY[{tids}])")
+    } else {
+        String::new()
+    };
     let sql = format!(
-        "COPY (SELECT {} FROM ONLY {}.{}) TO STDOUT (FORMAT binary)",
+        "COPY (SELECT {} FROM ONLY {}.{}{predicate}) TO STDOUT (FORMAT binary)",
         plan.select,
         quote_ident(&desc.rel_name.namespace),
         quote_ident(&desc.rel_name.name),
@@ -348,11 +407,16 @@ pub(crate) async fn copy_rows_into(
     let stream = BinaryCopyOutStream::new(copy, &byte_fields);
     futures::pin_mut!(stream);
     let mut rows = 0u64;
+    let mut slab: Vec<BackfillTuple> = Vec::new();
+    let mut slab_bytes = 0usize;
+    let mut wire_bytes = 0;
     while let Some(row) = stream.next().await {
         let row = row.context("backfill: COPY stream")?;
         let mut columns: Vec<Option<ColumnValue>> = vec![None; plan.natts];
+        wire_bytes += 2 + 4 * plan.cols.len();
         for (i, cp) in plan.cols.iter().enumerate() {
             let raw: Option<&[u8]> = row.try_get(i).context("backfill: COPY field")?;
+            wire_bytes += raw.map_or(0, <[u8]>::len);
             let v = raw
                 .map(|raw| decode_field(cp.kind, cp.type_oid, raw))
                 .transpose()
@@ -360,7 +424,12 @@ pub(crate) async fn copy_rows_into(
                 .unwrap_or(ColumnValue::Null);
             columns[(cp.attnum - 1).max(0) as usize] = Some(v);
         }
-        tx.send(BackfillTuple {
+        slab_bytes += columns
+            .iter()
+            .flatten()
+            .map(ColumnValue::approx_bytes)
+            .sum::<usize>();
+        slab.push(BackfillTuple {
             rfn: desc.rfn,
             xid: 0,
             xmax: 0,
@@ -370,10 +439,21 @@ pub(crate) async fn copy_rows_into(
             blkno: 0,
             offnum: 0,
             columns,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
+        });
         rows += 1;
+        if slab.len() >= COPY_SLAB_ROWS || slab_bytes >= COPY_SLAB_BYTES {
+            slab_bytes = 0;
+            rate.consume(std::mem::take(&mut wire_bytes)).await;
+            tx.send(std::mem::take(&mut slab))
+                .await
+                .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
+        }
+    }
+    if !slab.is_empty() {
+        rate.consume(wire_bytes).await;
+        tx.send(slab)
+            .await
+            .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
     }
     Ok(rows)
 }
@@ -1128,20 +1208,16 @@ impl CopyBackfiller {
 
         let mut catalog = CatalogMap::new();
         catalog.insert(desc.clone());
-        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
         let drain = tokio::spawn(bootstrap::drain(
             tup_rx,
             catalog,
-            self.mapping.clone(),
+            self.mapping.snapshot().await,
             tail.msg_tx.clone(),
             tail.ack.clone(),
             self.stats.clone(),
-            // Disabled resolver never defers; spool stays empty
             ToastResolver::disabled(),
-            crate::backfill::spool::DeferredSpool::new(
-                self.spill_dir.join("copy_deferred.bin"),
-                crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX,
-            ),
+            None,
             self.emitter.row_policy(),
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
             HashSet::new(),
@@ -1195,6 +1271,27 @@ struct CopyOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn copy_rate_charges_each_batch_without_banking_idle_time() {
+        let rate = CopyRate::new(Some(32));
+        let start = tokio::time::Instant::now();
+        rate.consume(32 * 1024).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        let sibling = rate.clone();
+        let next = tokio::time::Instant::now();
+        tokio::join!(rate.consume(16 * 1024), sibling.consume(16 * 1024));
+        assert_eq!(next.elapsed(), Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let next = tokio::time::Instant::now();
+        rate.consume(16 * 1024).await;
+        assert_eq!(next.elapsed(), Duration::from_millis(500));
+        let unlimited = CopyRate::new(None);
+        let start = tokio::time::Instant::now();
+        unlimited.consume(1024 * 1024).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
     use crate::schema::{RelAttr, RelName, ReplIdent};
     use walrus::pg::walparser::RelFileNode;
 

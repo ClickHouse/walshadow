@@ -53,12 +53,13 @@ enum ws_op
 	WS_OP_CHMOD,
 	WS_OP_FCNTL,
 	WS_OP_CLOSE,
+	WS_OP_SETSOCKOPT,
 	WS_N_OPS
 };
 
 static const char *const ws_op_names[WS_N_OPS] = {
 	"socket", "bind", "listen", "connect", "accept",
-	"recv", "send", "chmod", "fcntl", "close"
+	"recv", "send", "chmod", "fcntl", "close", "setsockopt"
 };
 
 enum ws_action
@@ -110,6 +111,7 @@ static ssize_t (*ws_real_send) (int, const void *, size_t, int);
 static int	(*ws_real_chmod) (const char *, mode_t);
 static int	(*ws_real_fcntl) (int, int, ...);
 static int	(*ws_real_close) (int);
+static int	(*ws_real_setsockopt) (int, int, int, const void *, socklen_t);
 
 static void
 ws_die(const char *what)
@@ -148,6 +150,7 @@ ws_init(void)
 	ws_real_chmod = ws_next("chmod");
 	ws_real_fcntl = ws_next("fcntl");
 	ws_real_close = ws_next("close");
+	ws_real_setsockopt = ws_next("setsockopt");
 
 	path = getenv("WS_FAULT_STATE");
 	if (path == NULL)
@@ -445,6 +448,21 @@ chmod(const char *path, mode_t mode)
 		return -1;
 	}
 	return ws_real_chmod(path, mode);
+}
+
+int
+setsockopt(int fd, int level, int name, const void *val, socklen_t len)
+{
+	const struct ws_rule *rule;
+
+	if (!ws_hook(__builtin_return_address(0), WS_OP_SETSOCKOPT, &rule))
+		return ws_real_setsockopt(fd, level, name, val, len);
+	if (rule != NULL && rule->action == WS_ACT_FAIL)
+	{
+		errno = rule->arg;
+		return -1;
+	}
+	return ws_real_setsockopt(fd, level, name, val, len);
 }
 
 int

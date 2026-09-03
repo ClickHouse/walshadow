@@ -9,7 +9,6 @@ mod fx;
 use std::time::Duration;
 
 use walshadow::mapping::NamespaceMapping;
-use walshadow::shadow::Shadow;
 
 fn skip_gate() -> bool {
     if !fx::requirements_available() {
@@ -25,7 +24,12 @@ async fn run(
     schema_sql: &str,
     stmts: Vec<String>,
     segments: u64,
-) -> (Shadow, Shadow, fx::ChServer, tempfile::TempDir) {
+) -> (
+    fx::ClusterGuard,
+    fx::ClusterGuard,
+    fx::ChServer,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {

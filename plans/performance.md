@@ -29,7 +29,7 @@ Check process uptime and cumulative series remain valid across phase changes
 
 | Measured limit | Candidate |
 |---|---|
-| Bootstrap page decode cannot feed inserters | Move page decode out of shared sink into bounded workers |
+| Bootstrap page decode cannot feed inserters | Add decode workers behind the per-entry page walk |
 | ClickHouse round trips leave workers idle | Tune inserter count and batch size within memory and part-count budgets |
 | One hot table saturates batcher | Shard by stable row key, measure extra part cost |
 | Catalog-boundary holds dominate | Evaluate [replay callback](custom_rmgr.md) |
@@ -52,11 +52,12 @@ cost before changing framing or allocation
 
 ## Bootstrap worker shape
 
-Move expensive tuple decode out of `PageWalkSink::chunk` only after profiling
-shared-sink serialization. Keep page framing and slot walk in producer; submit
-owned tuple bytes, full physical locator, load boundary, and completion identity
-to bounded workers. Reuse decode/resolve/route logic where job semantics match
-WAL jobs already containing decoded heaps need not share bootstrap wire shape
+Each tap entry decodes its own segment, so add decode workers only after
+profiling shows per-entry decode rather than source concurrency as the limit
+Keep page framing and slot walk in producer; submit owned tuple bytes, full
+physical locator, load boundary, and completion identity to bounded workers
+Reuse decode/resolve/route logic where job semantics match. WAL jobs already
+containing decoded heaps need not share bootstrap wire shape
 
 Assign sequence and expected completion counts before worker reordering. Current
 [bootstrap drain](../src/emit/pipeline/bootstrap.rs) infers sequence boundaries

@@ -1,4 +1,4 @@
-//! Verify greenfield repairs TOAST-owning relations and seeds chunk mirror
+//! Verify greenfield repairs external rows and seeds chunk mirror
 //! for later unchanged external pointers
 
 #![cfg(target_os = "linux")]
@@ -150,11 +150,14 @@ async fn dead_and_aborted_external_values_stay_out_of_ch() {
         let stderr = daemon.stderr();
         let line = stderr
             .lines()
-            .find(|l| l.contains("visibility repair read pending relations"))
+            .find(|l| l.contains("bootstrap visibility gate settled"))
             .context("repair never logged its read")?;
-        ensure!(line.contains("relations=1"), "repair read nothing: {line}");
         ensure!(
-            line.contains(&format!("rows={N_LIVE}")),
+            line.contains("unresolved=0"),
+            "unexpected unresolved visibility: {line}"
+        );
+        ensure!(
+            line.contains(&format!("repaired_rows={N_LIVE}")),
             "repair row count off: {line}"
         );
 
