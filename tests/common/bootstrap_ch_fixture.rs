@@ -271,16 +271,13 @@ pub fn create_ch_dest_table(ch: &ChServer, database: &str, table: &str) -> Resul
     Ok(())
 }
 
-/// Append `wal_level=logical` + `max_wal_senders` to the source PG's
-/// postgresql.conf so the daemon's preflight (which insists on
-/// `logical`) clears and BASE_BACKUP can attach. Mirrors the
-/// `append_source_conf` helpers in the bootstrap drill tests.
+/// Configure bootstrap source with spare sender slots for switchover
 pub fn append_source_conf(sh: &Shadow) -> Result<()> {
     let path = sh.config().data_dir.join("postgresql.conf");
     let mut f = fs::OpenOptions::new().append(true).open(&path)?;
     writeln!(f, "\n# walshadow bootstrap-CH source overrides")?;
     writeln!(f, "wal_level = logical")?;
-    writeln!(f, "max_wal_senders = 4")?;
+    writeln!(f, "max_wal_senders = 8")?;
     Ok(())
 }
 

@@ -5,6 +5,7 @@
 //! Daemon path: [`control_guc_floor`](Shadow::control_guc_floor),
 //! [`materialize_conf`](Shadow::materialize_conf),
 //! [`write_standby_signal`](Shadow::write_standby_signal),
+//! [`point_at_walsender`](Shadow::point_at_walsender),
 //! [`clear_stale_pid`](Shadow::clear_stale_pid),
 //! [`start_with_floor_retry`](Shadow::start_with_floor_retry),
 //! [`wait_for_replay`](Shadow::wait_for_replay),
@@ -360,9 +361,7 @@ impl Shadow {
             max_locks_per_transaction = floor.max_locks_per_transaction,
         );
         if let Some(conninfo) = primary_conninfo {
-            // Escape single quotes in PostgreSQL config string
-            let escaped = conninfo.replace('\'', "''");
-            conf.push_str(&format!("primary_conninfo = '{escaped}'\n"));
+            conf.push_str(&primary_conninfo_line(conninfo));
         }
         conf.push_str(&self.config.bridge_conf());
         let d = &self.config.data_dir;
@@ -378,6 +377,15 @@ impl Shadow {
              local replication all trust\n",
         )?;
         fs::write(d.join("pg_ident.conf"), "# walshadow: unused\n")?;
+        Ok(())
+    }
+
+    /// Set `primary_conninfo` and reload running shadow
+    pub fn point_at_walsender(&self, conninfo: &str) -> Result<()> {
+        let conf_path = self.config.data_dir.join("postgresql.conf");
+        let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
+        f.write_all(primary_conninfo_line(conninfo).as_bytes())?;
+        self.run("pg_ctl", ["-D", self.config.data_str(), "reload"])?;
         Ok(())
     }
 
@@ -709,6 +717,10 @@ impl Shadow {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+}
+
+fn primary_conninfo_line(conninfo: &str) -> String {
+    format!("primary_conninfo = '{}'\n", conninfo.replace('\'', "''"))
 }
 
 /// Parse required GUC values from `pg_controldata`

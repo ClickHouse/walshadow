@@ -61,8 +61,9 @@ for rendered diagram. Five clusters top→bottom:
 4. **Shadow handoff** — `BootstrapOutcome { start, end }` returned;
    daemon writes `standby.signal` and calls `materialize_conf` to
    replace shadow's config files. Config includes walshadow settings,
-   minimum GUC values from `pg_control`, `restore_command`, and
-   `primary_conninfo`. Daemon empties `postgresql.auto.conf`, starts
+   minimum GUC values from `pg_control`, and `restore_command`, but not
+   `primary_conninfo`, which daemon adds after walsender starts
+   (see [shadow.md](shadow.md)). Daemon empties `postgresql.auto.conf`, starts
    shadow with `start_with_floor_retry`, waits for `end_lsn` with
    `wait_for_replay`, then supervises it (see [shadow.md](shadow.md))
 5. **Manifest + WAL pump start** — the ack atomic seeds at `end_lsn`
