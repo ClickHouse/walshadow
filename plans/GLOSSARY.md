@@ -208,9 +208,10 @@ so does the whole segment holding it, since a fork copies the ancestor
 prefix into a descendant-named file ([failover.md](failover.md))
 
 **FileAction (Keep / Skip / Tap)** — per-backup-file sink decision: land
-body under data dir, drain unread, or stream body through `chunk()`
-with nothing landing (page walk, pg_xact accumulation)
-([bootstrap.md](bootstrap.md))
+body under data dir, drain unread, or stream body into an owned
+`EntrySink` with nothing landing (page walk, pg_xact accumulation).
+Owned rather than a shared-state lookup so concurrent tar parts share no
+lock on the body path ([bootstrap.md](bootstrap.md))
 
 **filter** — per-record keep/drop engine on WalStream: kept records pass
 (catalog-only blocks retained, CRC32C recomputed), drops NOOP-rewrite in
@@ -349,8 +350,8 @@ whole overlay subsystem; `config_table.replicate` opts one table into
 replication, triggering backfill per `initial_load`
 ([table selection guide](../docs/table-selection.md), [add_table.md](add_table.md))
 
-**oracle** — resolver for types walshadow does not decode: shadow PG
-converts on-disk bytes into a ClickHouse Native column through the bridge
+**oracle** — converter for types walshadow does not decode: shadow PG
+turns on-disk bytes into a ClickHouse Native column through the bridge
 worker's `ENCODE_NATIVE` op, one request per sealed batch. No fallback, a
 cell it cannot convert fails the batch ([oracle.md](oracle.md))
 
@@ -400,8 +401,8 @@ backup files, patched with commit/abort records harvested from gap-WAL
 pre-scan; backs the visibility gate ([add_table.md](add_table.md))
 
 **pipeline** — parallel decode+insert tail: reorder → decode ×M →
-batcher → inserter ×N → ack watermark, in `src/pipeline/`; stands up
-only with `--ch-config` ([emitter.md](emitter.md))
+batcher → resolve ×W → inserter ×N → ack watermark, in `src/pipeline/`;
+stands up only with `--ch-config` ([emitter.md](emitter.md))
 
 **placed** — decoder's per-seq report that all a xact's rows are routed
 to batcher; seq is done at `placed == acked`
@@ -460,6 +461,12 @@ keyless `Default` ([shadow.md](shadow.md))
 **reorder coordinator** — single-threaded commit-order boundary matching
 `RM_XACT_ID` records; assigns seqs, dispatches decode jobs, owns
 barriers ([emitter.md](emitter.md))
+
+**resolver pool** — ×W tasks between batcher and inserters answering
+sealed batches' oracle columns, W = the bridge's pool width; overlaps a
+bridge round trip with other inserters' queries, and builds columns of
+already-rendered cells locally instead of shipping them
+([emitter.md](emitter.md), [oracle.md](oracle.md))
 
 **restore_command fallback** — shadow's archive channel
 (`cp <out_dir>/%f %p`) at segment cadence when walsender wire drops or a
@@ -570,9 +577,9 @@ or `match` pattern) overrides per relation
 ([emitter.md](emitter.md),
 [destination tables guide](../docs/destination-tables.md))
 
-**tail** — reusable batcher + inserter pool + ack collector unit; WAL
-pipeline and bootstrap drain feed the identical tail, `tail.finish`
-seals partials and waits all seqs durable
+**tail** — reusable batcher + resolver pool + inserter pool + ack
+collector unit; WAL pipeline and bootstrap drain feed the identical tail,
+`tail.finish` seals partials and waits all seqs durable
 ([emitter.md](emitter.md), [bootstrap.md](bootstrap.md))
 
 **Tier 1 / 2 / 3** — decoder type matrix: fixed-width (`type_len > 0`)

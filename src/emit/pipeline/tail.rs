@@ -23,6 +23,7 @@ use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::emit::pipeline::inserter;
+use crate::emit::pipeline::resolver::{self, ResolvedBatch};
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::pos::{EmitterAck, Monotone};
 use ahash::{HashMap, HashMapExt};
@@ -31,6 +32,7 @@ use ahash::{HashMap, HashMapExt};
 pub struct TailParts {
     collector: JoinHandle<()>,
     batcher: JoinHandle<()>,
+    resolvers: Vec<JoinHandle<()>>,
     inserters: Vec<JoinHandle<()>>,
 }
 
@@ -40,6 +42,9 @@ impl TailParts {
     /// channel close and this hangs.
     pub async fn join(self) {
         let _ = self.batcher.await;
+        for h in self.resolvers {
+            let _ = h.await;
+        }
         for h in self.inserters {
             let _ = h.await;
         }
@@ -146,6 +151,7 @@ pub fn spawn_null(
         TailParts {
             collector,
             batcher,
+            resolvers: Vec::new(),
             inserters: Vec::new(),
         },
     )
@@ -171,20 +177,36 @@ pub async fn spawn_with_config(
     // enqueued before it
     let (msg_tx, msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let (batches_tx, batches_rx) = async_channel::bounded::<InsertBatch>((n * 2).max(4));
+    // One resolved batch per inserter is what keeps every one of them fed
+    let (resolved_tx, resolved_rx) = async_channel::bounded::<ResolvedBatch>(n);
 
     let inserters = inserter::spawn_pool(
         n,
         emitter,
-        batches_rx,
+        resolved_rx,
         ack.clone(),
         stats.clone(),
         fatal.clone(),
         inserter::PoolOptions {
             config_rx: config_rx.clone(),
-            oracle,
         },
     )
     .await?;
+
+    // As wide as the bridge: a narrower pool leaves shadow workers idle, a
+    // wider one only queues on their sockets
+    let resolvers = resolver::spawn_pool(
+        oracle.as_ref().map_or(1, |o| o.concurrency()),
+        batches_rx,
+        resolved_tx,
+        resolver::ResolverOptions {
+            oracle,
+            retry: emitter.retry.clone(),
+            stats: stats.clone(),
+            fatal: fatal.clone(),
+            config_rx: config_rx.clone(),
+        },
+    );
 
     // Boot fallback for the batcher; the live path re-reads from `config_rx`.
     let flush_timeout = if emitter.flush_timeout.is_zero() {
@@ -212,6 +234,7 @@ pub async fn spawn_with_config(
         TailParts {
             collector,
             batcher,
+            resolvers,
             inserters,
         },
     ))

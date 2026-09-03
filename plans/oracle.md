@@ -20,8 +20,9 @@ interprets array elements, hstore pairs, JSON text, null maps, or nested
 offsets
 
 Resolution runs at sealed-batch granularity, one request per `InsertBatch`,
-after the batcher has fixed row order and before the inserter opens its
-ClickHouse query. It is not best-effort: one Datum the worker cannot convert
+in the resolver stage between batcher and inserter pool
+([emitter.md](emitter.md)) so a round trip overlaps other inserters' queries
+rather than idling their connections. It is not best-effort: one Datum the worker cannot convert
 fails the whole batch, because a substituted value is one the destination
 cannot tell from real data
 
@@ -66,8 +67,8 @@ String
 PostGIS `geography` / `geometry` route to the oracle like any other extension
 type, but `render_ext_columns` (`src/ops/oracle.rs`) still claims 2-D points
 in-tree first, matched on `RelAttr.type_name` because their OIDs are dynamic.
-A rendered `POINT(x y)` crosses as a literal cell and lands verbatim; anything
-it does not claim crosses as on-disk bytes and gets `typoutput`. `ST_AsText`
+A rendered `POINT(x y)` lands verbatim; anything it does not claim crosses as
+on-disk bytes and gets `typoutput`. `ST_AsText`
 semantics are what the `String` mapping wants, and `typoutput` would give
 HEXEWKB instead
 
@@ -124,8 +125,8 @@ all of that passes
 
 ## Splicing
 
-The inserter decodes the response once with `clickhouse-c-rs`, then builds the
-final block over three kinds of column:
+The resolver decodes the response once with `clickhouse-c-rs`, then the
+inserter builds the final block over three kinds of column:
 
 - local fixed / string / nullable slabs, through `build_leaf` + `build_root`
 - decoded oracle column trees, through `BlockBuilder::append_column`
@@ -136,6 +137,20 @@ offsets, null maps, and data slabs the worker wrote, under the inserter's own
 expected `TypeAst`. Nothing visits a value. The response block outlives the
 whole `send_with_retry` loop, so a ClickHouse reconnect resends the same
 columns rather than asking the oracle again
+
+## Columns the request leaves out
+
+A column whose every cell is `Literal` or `Default`, against a `String` or
+`Nullable(String)` target, is bytes the daemon rendered and ClickHouse wants
+unchanged: the worker would wrap each in a `text` and pgch would cast it
+straight back. `literal_column` builds those in the resolver, matching
+`ws_append_default` on defaults — NULL under `Nullable`, empty string
+otherwise. Anything wrapping a String (`Array`, `LowCardinality`) is PG's to
+parse, and one un-rendered cell keeps its whole column in the request
+
+Live case is a PostGIS 2-D point column with a `String` target, which is
+often a table's only oracle column — then the batch makes no request at all.
+`walshadow_oracle_local_columns_total` counts columns taken this way
 
 ## walshadow PG module
 
@@ -239,6 +254,26 @@ bound to the requested transaction. Losing the oid list loses the lock argument
 with it, which is why an empty list is only safe on the committed read — there
 is no tree to misattribute a writer to
 
+## Worker pool
+
+Each worker serves one request per loop iteration, so one worker means
+oracle throughput is one PG backend's conversion rate however wide the
+daemon's inserter pool is. `walshadow.bridge_workers` (default 1, ceiling
+`WS_MAX_WORKERS`) registers copies: worker 0 keeps the bare
+`walshadow.socket_path`, worker `i` listens on `socket_path.i`. On a
+daemon-owned shadow `--bridge-workers` writes that GUC, sizes the daemon's
+socket pool to match, and with it the resolver pool
+
+`ENCODE_NATIVE` and `REPLAY_LSN` are stateless and read-only, so the pool
+round-robins them. `HELLO` and `SCAN` pin to worker 0: a scan answers off
+a replay position it reports back, and the first `HELLO` establishes the
+identity every other worker is then checked against, so a build mismatch
+across the pool fails closed at connect rather than mid-read
+
+`Bridge::connect_pooled` requires every configured slot to answer. A pool
+short of its configured width is a half-started shadow, and running
+narrower would hide it
+
 ## Failure semantics
 
 Daemon requires worker at startup. `--bridge-socket` defaults to
@@ -265,7 +300,13 @@ make a value depend on worker uptime
 Counters: `walshadow_oracle_{blocks,rows,cells}_total`,
 `walshadow_oracle_conversion_errors_total`, `walshadow_oracle_errors_total`.
 Native volume counts once, on the bridge, as
-`walshadow_bridge_native_bytes_total`
+`walshadow_bridge_native_bytes_total`.
+`walshadow_bridge_lock_wait_seconds_total{op}` against
+`walshadow_bridge_service_seconds_total{op}` is what says whether the
+worker or the socket in front of it is the limiter, and
+`walshadow_oracle_resolve_seconds_total` against
+`walshadow_inserter_ch_seconds_total` which of the two overlapped stages
+is
 
 ## Backpressure
 
@@ -281,7 +322,8 @@ above `inline_value_max` so a toast value the pipeline admits always frames
 
 Removing per-row resolution from the decode pool removes every bridge await
 from decode workers: their throughput and ordering no longer depend on bridge
-RTT
+RTT. The resolver stage holds one extra batch per inserter beyond that, which
+is what a queue deep enough to keep every inserter fed costs
 
 ## Pinning shadow locale
 

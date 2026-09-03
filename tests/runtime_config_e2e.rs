@@ -478,7 +478,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
     // `meta jsonb` sits outside the local matrix, so the backfill tail needs
     // the same oracle the WAL path uses
     let socket = shadow.bridge_socket().expect("bridge configured");
-    let bridge = walshadow::bridge::connect_with_budget(socket, Duration::from_secs(30))
+    let bridge = walshadow::bridge::connect_with_budget(socket, 1, Duration::from_secs(30))
         .await
         .expect("bridge connect");
     let oracle = Arc::new(walshadow::oracle::Oracle::new(Arc::new(bridge)));

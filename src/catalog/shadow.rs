@@ -69,6 +69,10 @@ pub struct BridgeConf {
     /// Bounds a catalog lock the worker cannot get, which would otherwise hang
     /// against recovery
     pub lock_timeout: Duration,
+    /// `walshadow.bridge_workers`. Each worker serves one request at a time,
+    /// so this is how many oracle round trips can be in flight. Worker 0
+    /// keeps `socket_path`; worker `i` listens on `socket_path.i`
+    pub workers: usize,
 }
 
 impl BridgeConf {
@@ -79,6 +83,7 @@ impl BridgeConf {
             library_dir: None,
             io_timeout: Duration::from_secs(30),
             lock_timeout: Duration::from_secs(1),
+            workers: 1,
         }
     }
 
@@ -99,11 +104,14 @@ impl BridgeConf {
             "walshadow.socket_path = '{}'\n\
              walshadow.database = '{}'\n\
              walshadow.io_timeout_ms = {}\n\
-             walshadow.lock_timeout_ms = {}\n",
+             walshadow.lock_timeout_ms = {}\n\
+             walshadow.bridge_workers = {}\n",
             quote_path(&self.socket_path),
             quote(dbname),
             self.io_timeout.as_millis(),
             self.lock_timeout.as_millis(),
+            self.workers
+                .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS),
         ));
         out
     }

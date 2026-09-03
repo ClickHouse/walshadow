@@ -4,12 +4,12 @@ CH-side ingest is a parallel decode+insert pipeline (`src/pipeline/`):
 
 ```text
 pump -> QueueingRecordSink -> reorder (plan -> execute) -> [decode x M]
-           -> InsertBatcher -> [inserter x N] -> ClickHouse
-                             \-> ack collector -> emitter_ack_lsn
+           -> InsertBatcher -> [resolve x W] -> [inserter x N] -> ClickHouse
+                                              \-> ack collector -> emitter_ack_lsn
 ```
 
 Pipeline stages live in `src/pipeline/{reorder,planner,plan_spool,
-decode,batcher,inserter,ack,tail,mod}.rs`; encoding primitives
+decode,batcher,resolver,inserter,ack,tail,mod}.rs`; encoding primitives
 (`EmitterConfig`, `TableEncoder`,
 `TablePlan`, `ColumnBuf`, value encode, `EmitterStats`) in
 `src/ch_emitter.rs`; DDL in `src/ch_ddl.rs`; PG → CH type mapping in
@@ -187,6 +187,21 @@ the rows' admission/value permits, dropped post-insert-ack):
 4-table xacts coalesce into one MergeTree part per window instead of
 one per xact
 
+### Resolver pool — `pipeline/resolver.rs`, ×W
+
+W = the bridge's pool width, since that is how many requests the shadow
+answers at once. Pops sealed `InsertBatch`es, answers their oracle
+columns, and pushes `(batch, local, block)` onto a queue one deep per
+inserter. Overlaps `T_oracle` with `T_ch` — sequential stages cost
+`T_oracle + T_ch / N`, these cost `max(T_oracle / W, T_ch / N)`. Costs
+one extra resident batch per inserter
+
+A batch with no oracle column crosses without touching the bridge, and
+so does one whose oracle columns the daemon can answer itself: cells
+already rendered locally (PostGIS WKT via `render_ext_columns`) against
+a `String` target are the bytes ClickHouse wants, and PG would hand them
+straight back. `oracle_local_columns` counts those
+
 ### Inserter pool — `pipeline/inserter.rs`, ×N
 
 N `AsyncClient` connections. CH Cloud INSERT cost is mostly RTT +
@@ -199,9 +214,9 @@ owned slabs (`TypeAst` cache keyed on `(table, schema_epoch)`;
 runs one `send_query` + `send_data` + `send_data_end` +
 drain-to-`EndOfStream`
 
-A batch holding oracle columns resolves them first: one bridge request
-before the query opens, spliced into the same block
-([oracle.md](oracle.md))
+Oracle columns arrive already answered: the resolver stage hands over a
+block to splice ([oracle.md](oracle.md)), so an inserter's ClickHouse
+connection is never idle for a bridge round trip
 
 Durability invariant: `ack.acked(per_seq)` fires **only after** the
 drain returns. Until then a connection drop replays the still-owned

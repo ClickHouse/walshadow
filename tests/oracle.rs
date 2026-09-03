@@ -77,7 +77,7 @@ fn start_pg(tmp: &tempfile::TempDir, port: u16) -> Option<StopOnDrop> {
 
 async fn oracle_on(sh: &Shadow) -> Oracle {
     let path = sh.bridge_socket().expect("bridge configured");
-    let bridge = walshadow::bridge::connect_with_budget(path, Duration::from_secs(20))
+    let bridge = walshadow::bridge::connect_with_budget(path, 1, Duration::from_secs(20))
         .await
         .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", path.display()));
     Oracle::new(Arc::new(bridge))
@@ -315,12 +315,14 @@ async fn worker_refuses_malformed_requests() {
         return;
     };
     let socket = guard.sh.bridge_socket().expect("bridge configured");
-    let bridge = walshadow::bridge::connect_with_budget(socket, Duration::from_secs(20))
+    let bridge = walshadow::bridge::connect_with_budget(socket, 1, Duration::from_secs(20))
         .await
         .expect("bridge connect");
 
+    // Past the bridge's frame prefix, as `encode_request` builds it
     let framed = |rows: u32, cols: u32, meta: &[u8], cells: &[u8]| -> Vec<u8> {
-        let mut v = rows.to_be_bytes().to_vec();
+        let mut v = walshadow::bridge::request_frame(0);
+        v.extend_from_slice(&rows.to_be_bytes());
         v.extend_from_slice(&cols.to_be_bytes());
         v.extend_from_slice(meta);
         v.extend_from_slice(cells);
@@ -363,7 +365,7 @@ async fn worker_refuses_malformed_requests() {
     ];
     for (what, payload) in cases {
         let err = bridge
-            .encode_native(&payload)
+            .encode_native(payload)
             .await
             .err()
             .unwrap_or_else(|| panic!("{what}: worker accepted a malformed request"));
@@ -376,7 +378,7 @@ async fn worker_refuses_malformed_requests() {
     // Reject bytes beyond declared cells
     let mut trailing = framed(1, 1, &one, &[0x01, 0, 0, 0, 4, 42, 0, 0, 0]);
     trailing.push(0);
-    assert!(bridge.encode_native(&trailing).await.is_err());
+    assert!(bridge.encode_native(trailing).await.is_err());
 
     // Parser errors preserve connection
     let oracle = Oracle::new(Arc::new(bridge));

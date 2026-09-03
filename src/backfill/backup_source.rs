@@ -25,13 +25,26 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::Mutex;
 
 use walrus::pg::replication::base_backup::Tablespace;
+
+crate::atomic_stats! {
+    /// Bootstrap pump stage attribution, shared from the orchestrator down
+    /// through the source. Measures what the pump hands over, not what a
+    /// sink made of it: entry counts live on the sinks' own stats
+    pub struct PumpStats {
+        /// Body bytes handed to a `Tap` entry
+        pub bytes_tapped,
+        /// Inside `EntrySink::chunk`: page framing, decode, channel send.
+        /// Against `page_walk.decode_nanos` this is the tap's overhead
+        pub sink_chunk_nanos,
+    }
+}
 
 /// Filesystem-object kind. Tar-driven sources translate tar entry types
 /// here; the trait does not expose tar.
@@ -63,24 +76,48 @@ pub struct FileMeta {
 }
 
 /// Sink routing decision per file at `begin()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileAction {
     /// Source writes body / materializes dir or symlink under
-    /// `data_dir`; no `chunk()`
+    /// `data_dir`; no body callbacks
     Keep,
-    /// Source drains body unread; no land, no `chunk()`
+    /// Source drains body unread; no land, no body callbacks
     Skip,
-    /// Source streams body through `chunk()`, no land. Dir / Symlink
-    /// fire `chunk()` zero times
-    Tap,
+    /// Source streams the body into this owned sink, then drops it.
+    /// Owned rather than a shared-state decision so concurrent entries
+    /// need no lock on the body path. Dir / Symlink chunk zero times
+    Tap(Box<dyn EntrySink>),
 }
 
-/// Per-file token threaded through `begin`/`chunk`/`end`. Sinks key
-/// per-entry state on it so concurrent entries (object_store fan-out
-/// under `buffer_unordered`, sink mutex released across body reads)
-/// keep independent state. Monotonic per source run, globally unique.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EntryId(pub u64);
+impl FileAction {
+    pub fn is_tap(&self) -> bool {
+        matches!(self, FileAction::Tap(_))
+    }
+}
+
+impl std::fmt::Debug for FileAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FileAction::Keep => "Keep",
+            FileAction::Skip => "Skip",
+            FileAction::Tap(_) => "Tap",
+        })
+    }
+}
+
+/// One `Tap` entry's body consumer. Owned by the source task driving that
+/// entry, so nothing here contends with another entry: whatever state a
+/// page walk or SLRU accumulator needs lives in the impl, and shared
+/// state it does touch (catalog map, counters, channel sender) is
+/// already `Sync`.
+#[async_trait]
+pub trait EntrySink: Send {
+    /// Body bytes in file order, arbitrary chunk sizes. Awaiting here
+    /// backpressures the source
+    async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Fires once, after the last `chunk`
+    async fn end(self: Box<Self>) -> io::Result<()>;
+}
 
 /// Mirrors wal-rus `pg::replication::base_backup::StartInfo` so callers
 /// wired to wal-rus types don't translate.
@@ -98,44 +135,54 @@ pub struct EndInfo {
     pub timeline: u32,
 }
 
-/// Per-file consumer, driven by [`BackupSource::run`]: `start` once,
-/// then per file `begin` / (if `Tap`) zero-or-more `chunk` / `end`,
-/// then `finish` once.
+/// Per-file router, driven by [`BackupSource::run`]: `start` once, then
+/// `begin` per file, then `finish` once. A `Tap` decision hands back its
+/// own [`EntrySink`], so the body path never re-enters here.
 ///
-/// `Send` because parallel source impls drive the sink from worker
-/// tasks. All methods async so a sink can backpressure its driver
-/// directly: `chunk` awaiting a full downstream channel parks the body
-/// read, which parks the source fetch. No intermediate buffer.
+/// `&self` throughout: routing reads immutable state and bumps atomics, so
+/// parallel source impls share one `Arc` with no lock. A source that holds
+/// a lock across a body read serializes every other entry behind it,
+/// which is what the owned entry sink exists to avoid.
 #[async_trait]
-pub trait BackupSink: Send {
-    async fn start(&mut self, _info: &StartInfo) -> io::Result<()> {
+pub trait BackupSink: Send + Sync {
+    async fn start(&self, _info: &StartInfo) -> io::Result<()> {
         Ok(())
     }
 
     /// Must be cheap; per-file dispatch is the hot path
-    async fn begin(&mut self, entry: EntryId, meta: &FileMeta) -> io::Result<FileAction>;
+    async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction>;
 
-    /// Body bytes for a `Tap` entry, in file order per entry, arbitrary
-    /// chunk sizes. Calls for distinct entries may interleave. Awaiting
-    /// here backpressures the source.
-    async fn chunk(&mut self, entry: EntryId, bytes: &[u8]) -> io::Result<()>;
-
-    /// Fires once per `begin()`, regardless of action returned
-    async fn end(&mut self, entry: EntryId) -> io::Result<()>;
-
-    async fn finish(&mut self, _info: &EndInfo) -> io::Result<()> {
+    async fn finish(&self, _info: &EndInfo) -> io::Result<()> {
         Ok(())
     }
 }
 
-/// `data_dir` receives `Keep`d bodies. Sink behind `Arc<Mutex<_>>` so
-/// parallel source impls share it without per-worker copies.
+/// Everything a tar-part driver needs behind one `Arc`, so a parallel
+/// source hands its workers a clone instead of four arguments. `data_dir`
+/// receives `Keep`d bodies.
+pub struct PumpTarget {
+    pub data_dir: PathBuf,
+    pub sink: Arc<dyn BackupSink>,
+    pub stats: Arc<PumpStats>,
+}
+
+impl PumpTarget {
+    pub fn new(data_dir: PathBuf, sink: Arc<dyn BackupSink>, stats: Arc<PumpStats>) -> Self {
+        Self {
+            data_dir,
+            sink,
+            stats,
+        }
+    }
+}
+
 #[async_trait]
 pub trait BackupSource: Send {
     async fn run(
         self: Box<Self>,
         data_dir: PathBuf,
-        sink: Arc<Mutex<dyn BackupSink>>,
+        sink: Arc<dyn BackupSink>,
+        stats: Arc<PumpStats>,
     ) -> anyhow::Result<(StartInfo, EndInfo)>;
 }
 
@@ -190,11 +237,9 @@ pub(crate) fn tar_entry_meta<R: AsyncRead + Unpin>(
 /// Drain one tokio_tar archive against a sink, emitting per-entry
 /// callbacks. Called by `DirectSource` (per `BackupEvent::Archive.body`)
 /// and `ObjectStoreSource` (per fetched tar part).
-pub(crate) async fn pump_tar_to_sink<R>(
+pub async fn pump_tar_to_sink<R>(
     archive: &mut tokio_tar::Archive<R>,
-    data_dir: &Path,
-    sink: &Arc<Mutex<dyn BackupSink>>,
-    next_entry: &AtomicU64,
+    target: &PumpTarget,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + Send,
@@ -207,35 +252,22 @@ where
         let Some(meta) = tar_entry_meta(&entry)? else {
             continue;
         };
-        let id = EntryId(next_entry.fetch_add(1, Ordering::Relaxed));
-        pump_entry(&mut entry, &meta, data_dir, sink, id).await?;
+        pump_entry(&mut entry, &meta, target).await?;
     }
     Ok(())
 }
 
 /// One tar entry through the sink. Factored so callers can drive
 /// non-tar-shaped FileMeta sequences (e.g. inline symlink emission).
-pub(crate) async fn pump_entry<R>(
-    body: &mut R,
-    meta: &FileMeta,
-    data_dir: &Path,
-    sink: &Arc<Mutex<dyn BackupSink>>,
-    entry: EntryId,
-) -> io::Result<()>
+pub async fn pump_entry<R>(body: &mut R, meta: &FileMeta, target: &PumpTarget) -> io::Result<()>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
-    let action = {
-        let mut s = sink.lock().await;
-        s.begin(entry, meta).await?
-    };
-    match action {
-        FileAction::Keep => write_kept(body, meta, data_dir).await?,
-        FileAction::Skip => drain_to_void(body).await?,
-        FileAction::Tap => stream_to_sink(body, meta, sink, entry).await?,
+    match target.sink.begin(meta).await? {
+        FileAction::Keep => write_kept(body, meta, &target.data_dir).await,
+        FileAction::Skip => drain_to_void(body).await,
+        FileAction::Tap(entry) => stream_to_entry(body, meta, entry, &target.stats).await,
     }
-    let mut s = sink.lock().await;
-    s.end(entry).await
 }
 
 async fn drain_to_void<R>(body: &mut R) -> io::Result<()>
@@ -252,18 +284,18 @@ where
     Ok(())
 }
 
-async fn stream_to_sink<R>(
+async fn stream_to_entry<R>(
     body: &mut R,
     meta: &FileMeta,
-    sink: &Arc<Mutex<dyn BackupSink>>,
-    entry: EntryId,
+    mut entry: Box<dyn EntrySink>,
+    stats: &PumpStats,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
     if !matches!(meta.kind, FileKind::File) {
         drain_to_void(body).await?;
-        return Ok(());
+        return entry.end().await;
     }
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -271,13 +303,16 @@ where
         if n == 0 {
             break;
         }
-        // Guard held across the chunk await: a full downstream channel
-        // parks this read (and any concurrent part contending the lock),
-        // propagating backpressure to the source fetch
-        let mut s = sink.lock().await;
-        s.chunk(entry, &buf[..n]).await?;
+        stats.bytes_tapped.fetch_add(n as u64, Ordering::Relaxed);
+        // Awaiting here parks only this entry's read, and through it this
+        // part's fetch. Other parts keep draining
+        let entered = Instant::now();
+        entry.chunk(&buf[..n]).await?;
+        stats
+            .sink_chunk_nanos
+            .fetch_add(entered.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
-    Ok(())
+    entry.end().await
 }
 
 async fn write_kept<R>(body: &mut R, meta: &FileMeta, data_dir: &Path) -> io::Result<()>
@@ -339,9 +374,7 @@ where
 #[allow(dead_code)]
 pub(crate) async fn emit_tablespace_symlink(
     tablespace: &Tablespace,
-    data_dir: &Path,
-    sink: &Arc<Mutex<dyn BackupSink>>,
-    entry: EntryId,
+    target: &PumpTarget,
 ) -> io::Result<()> {
     if tablespace.is_default() {
         return Ok(());
@@ -355,7 +388,7 @@ pub(crate) async fn emit_tablespace_symlink(
         },
     };
     let mut body = tokio::io::empty();
-    pump_entry(&mut body, &meta, data_dir, sink, entry).await
+    pump_entry(&mut body, &meta, target).await
 }
 
 #[cfg(test)]
@@ -417,34 +450,59 @@ mod tests {
     use super::*;
 
     /// Collects every callback into `events` so tests assert on the
-    /// exact sequence; `tapped` holds captured Tap chunks per file.
+    /// exact sequence; `tapped` holds captured Tap bodies per file.
     #[derive(Debug, Default)]
     pub(crate) struct RecordingSink {
-        pub events: Vec<Event>,
-        pub tapped: Vec<(PathBuf, Vec<u8>)>,
-        cur_path: Option<PathBuf>,
-        cur_tap: Option<Vec<u8>>,
+        pub events: std::sync::Mutex<Vec<Event>>,
+        pub tapped: std::sync::Mutex<Vec<(PathBuf, Vec<u8>)>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum Event {
         Start { start_lsn: u64, timeline: u32 },
-        Begin { path: PathBuf, action: FileAction },
+        Begin { path: PathBuf, action: &'static str },
         Chunk { len: usize },
         End { path: PathBuf },
         Finish { end_lsn: u64 },
     }
 
+    /// Owned per-entry recorder, so the sink itself stays lock-free on the
+    /// body path exactly as production sinks do
+    struct RecordingEntry {
+        sink: Arc<RecordingSink>,
+        path: PathBuf,
+        body: Vec<u8>,
+    }
+
     #[async_trait]
-    impl BackupSink for RecordingSink {
-        async fn start(&mut self, info: &StartInfo) -> io::Result<()> {
-            self.events.push(Event::Start {
+    impl EntrySink for RecordingEntry {
+        async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.sink
+                .events
+                .lock()
+                .unwrap()
+                .push(Event::Chunk { len: bytes.len() });
+            self.body.extend_from_slice(bytes);
+            Ok(())
+        }
+        async fn end(self: Box<Self>) -> io::Result<()> {
+            let RecordingEntry { sink, path, body } = *self;
+            sink.tapped.lock().unwrap().push((path.clone(), body));
+            sink.events.lock().unwrap().push(Event::End { path });
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl BackupSink for Arc<RecordingSink> {
+        async fn start(&self, info: &StartInfo) -> io::Result<()> {
+            self.events.lock().unwrap().push(Event::Start {
                 start_lsn: info.start_lsn,
                 timeline: info.timeline,
             });
             Ok(())
         }
-        async fn begin(&mut self, _entry: EntryId, meta: &FileMeta) -> io::Result<FileAction> {
+        async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction> {
             let s = meta.path.to_string_lossy();
             let action = if s.starts_with("pg_replslot/") {
                 if matches!(meta.kind, FileKind::Dir) {
@@ -453,35 +511,31 @@ mod tests {
                     FileAction::Skip
                 }
             } else if s == "base/5/16400" {
-                FileAction::Tap
+                FileAction::Tap(Box::new(RecordingEntry {
+                    sink: self.clone(),
+                    path: meta.path.clone(),
+                    body: Vec::new(),
+                }))
             } else {
                 FileAction::Keep
             };
-            self.events.push(Event::Begin {
+            self.events.lock().unwrap().push(Event::Begin {
                 path: meta.path.clone(),
-                action,
+                action: match action {
+                    FileAction::Keep => "Keep",
+                    FileAction::Skip => "Skip",
+                    FileAction::Tap(_) => "Tap",
+                },
             });
-            self.cur_path = Some(meta.path.clone());
-            self.cur_tap = (action == FileAction::Tap).then(Vec::new);
+            if !action.is_tap() {
+                self.events.lock().unwrap().push(Event::End {
+                    path: meta.path.clone(),
+                });
+            }
             Ok(action)
         }
-        async fn chunk(&mut self, _entry: EntryId, bytes: &[u8]) -> io::Result<()> {
-            self.events.push(Event::Chunk { len: bytes.len() });
-            if let Some(buf) = self.cur_tap.as_mut() {
-                buf.extend_from_slice(bytes);
-            }
-            Ok(())
-        }
-        async fn end(&mut self, _entry: EntryId) -> io::Result<()> {
-            let path = self.cur_path.take().unwrap_or_default();
-            if let Some(buf) = self.cur_tap.take() {
-                self.tapped.push((path.clone(), buf));
-            }
-            self.events.push(Event::End { path });
-            Ok(())
-        }
-        async fn finish(&mut self, info: &EndInfo) -> io::Result<()> {
-            self.events.push(Event::Finish {
+        async fn finish(&self, info: &EndInfo) -> io::Result<()> {
+            self.events.lock().unwrap().push(Event::Finish {
                 end_lsn: info.end_lsn,
             });
             Ok(())
@@ -573,13 +627,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let tar_bytes = testing::build_synthetic_tar().await;
-        let recording = Arc::new(Mutex::new(RecordingSink::default()));
-        let sink: Arc<Mutex<dyn BackupSink>> = recording.clone();
+        let recording = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn BackupSink> = Arc::new(recording.clone());
         let mut archive = tokio_tar::Archive::new(std::io::Cursor::new(tar_bytes));
-        let next_entry = AtomicU64::new(0);
-        pump_tar_to_sink(&mut archive, data_dir, &sink, &next_entry)
-            .await
-            .unwrap();
+        let target = PumpTarget::new(data_dir.to_path_buf(), sink, Arc::new(PumpStats::default()));
+        pump_tar_to_sink(&mut archive, &target).await.unwrap();
 
         assert!(data_dir.join("base/5/1259").exists(), "catalog must land");
         assert!(data_dir.join("global/1213").exists(), "global must land");
@@ -590,10 +642,9 @@ mod tests {
         // User heap tapped, not landed
         assert!(!data_dir.join("base/5/16400").exists());
 
-        let r = recording.lock().await;
+        let events = recording.events.lock().unwrap();
         // Last file event must be pg_control end (contract 3)
-        let last_end = r
-            .events
+        let last_end = events
             .iter()
             .rev()
             .find_map(|e| match e {
@@ -603,8 +654,7 @@ mod tests {
             .unwrap();
         assert_eq!(last_end, PathBuf::from("pg_control"));
         // Tapped chunks sum to the file body length
-        let tapped_bytes: usize = r
-            .events
+        let tapped_bytes: usize = events
             .iter()
             .filter_map(|e| match e {
                 Event::Chunk { len } => Some(*len),

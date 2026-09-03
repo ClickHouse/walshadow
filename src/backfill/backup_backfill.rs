@@ -55,7 +55,7 @@ use crate::backfill::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink,
 };
 use crate::backfill::backup_sentinel::build_lsn_pair;
-use crate::backfill::backup_source::{BackupSink, BackupSource};
+use crate::backfill::backup_source::{BackupSink, BackupSource, PumpStats};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
@@ -312,14 +312,15 @@ async fn walk_and_ship(
 
     let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
     let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new()));
-    let (walk_tx, walk_rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-    let (gated_tx, gated_rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+    let (walk_tx, walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+    let (gated_tx, gated_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
 
-    let sink = PageWalkSink::new(filter.clone(), walk_tx, store_toast)
-        .with_pg_xact_accum(pg_xact.clone())
-        .with_pg_multixact_accum(pg_multixact.clone())
-        .with_lsn_overrides(lsn_overrides);
-    let erased: Arc<Mutex<dyn BackupSink>> = Arc::new(Mutex::new(sink));
+    let sink: Arc<dyn BackupSink> = Arc::new(
+        PageWalkSink::new(filter.clone(), walk_tx, store_toast)
+            .with_pg_xact_accum(pg_xact.clone())
+            .with_pg_multixact_accum(pg_multixact.clone())
+            .with_lsn_overrides(lsn_overrides),
+    );
 
     // data_dir is never written: PageWalkSink only Taps/Skips
     let data_dir = ctx.scratch_dir.join("void");
@@ -360,7 +361,7 @@ async fn walk_and_ship(
     // against a complete pg_xact accum; a failed source drops the sender
     // and the gate discards them instead
     let run_res = source
-        .run(data_dir, erased)
+        .run(data_dir, sink, Arc::new(PumpStats::default()))
         .await
         .context("backup_backfill: source.run");
     if run_res.is_ok() {
@@ -469,8 +470,8 @@ struct GateStats {
 /// predates WAL coverage, skipping risks dropping a live row.
 #[allow(clippy::too_many_arguments)]
 async fn gate_task(
-    mut rx: mpsc::Receiver<BackfillTuple>,
-    tx: mpsc::Sender<BackfillTuple>,
+    mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
+    tx: mpsc::Sender<Vec<BackfillTuple>>,
     filter: CatalogMap,
     pg_xact: Arc<std::sync::Mutex<PgXactAccum>>,
     pg_multixact: Arc<std::sync::Mutex<PgMultiXactAccum>>,
@@ -479,29 +480,33 @@ async fn gate_task(
     mut deferred: DeferredSpool,
 ) -> Result<GateStats, String> {
     let mut stats = GateStats::default();
-    while let Some(t) = rx.recv().await {
-        if filter.is_toast(t.rfn.db_node, t.rfn.rel_node) {
-            if tx.send(t).await.is_err() {
-                return Ok(stats);
+    // Slab in, slab out: the gate never breaks a walk slab into per-tuple
+    // channel hops, it only drops what the visibility verdict removes
+    while let Some(slab) = rx.recv().await {
+        let mut pass = Vec::with_capacity(slab.len());
+        for t in slab {
+            if filter.is_toast(t.rfn.db_node, t.rfn.rel_node) {
+                pass.push(t);
+                continue;
             }
-            continue;
+            match tuple_visibility(t.xid, t.xmax, t.infomask, None) {
+                Visibility::Emit => {
+                    if t.infomask & crate::decode::visibility::HEAP_XMAX_IS_MULTI != 0 {
+                        stats.multixact_emitted += 1;
+                    }
+                    stats.emitted += 1;
+                    pass.push(t);
+                }
+                Visibility::Skip => stats.gated += 1,
+                Visibility::Defer => deferred
+                    .push(t)
+                    .await
+                    .map_err(|e| format!("backup_backfill: deferred spool: {e}"))?,
+                Visibility::Unresolvable => return Err(unresolvable_multixact(&t)),
+            }
         }
-        match tuple_visibility(t.xid, t.xmax, t.infomask, None) {
-            Visibility::Emit => {
-                if t.infomask & crate::decode::visibility::HEAP_XMAX_IS_MULTI != 0 {
-                    stats.multixact_emitted += 1;
-                }
-                stats.emitted += 1;
-                if tx.send(t).await.is_err() {
-                    return Ok(stats);
-                }
-            }
-            Visibility::Skip => stats.gated += 1,
-            Visibility::Defer => deferred
-                .push(t)
-                .await
-                .map_err(|e| format!("backup_backfill: deferred spool: {e}"))?,
-            Visibility::Unresolvable => return Err(unresolvable_multixact(&t)),
+        if !pass.is_empty() && tx.send(pass).await.is_err() {
+            return Ok(stats);
         }
     }
     // Walk EOF: sink dropped. Deferred tuples sit in the spool past its
@@ -535,7 +540,7 @@ async fn gate_task(
                     stats.multixact_emitted += 1;
                 }
                 stats.emitted += 1;
-                if tx.send(t).await.is_err() {
+                if tx.send(vec![t]).await.is_err() {
                     return Ok(stats);
                 }
             }
@@ -1603,30 +1608,30 @@ mod tests {
 
         // Hinted-committed: passes through immediately
         walk_tx
-            .send(tuple(
+            .send(vec![tuple(
                 16400,
                 100,
                 0,
                 HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID,
-            ))
+            )])
             .await
             .unwrap();
         // Hinted-aborted: gated
         walk_tx
-            .send(tuple(16400, 101, 0, HEAP_XMIN_INVALID))
+            .send(vec![tuple(16400, 101, 0, HEAP_XMIN_INVALID)])
             .await
             .unwrap();
         // Unhinted, gap-committed writer: deferred, then emitted via patch
-        walk_tx.send(tuple(16400, 500, 0, 0)).await.unwrap();
+        walk_tx.send(vec![tuple(16400, 500, 0, 0)]).await.unwrap();
         // Unhinted, gap-aborted writer: deferred, then gated via patch
-        walk_tx.send(tuple(16400, 600, 0, 0)).await.unwrap();
+        walk_tx.send(vec![tuple(16400, 600, 0, 0)]).await.unwrap();
         drop(walk_tx);
         walk_ok_tx.send(()).unwrap();
 
         let stats = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
         while let Some(t) = gated_rx.recv().await {
-            got.push(t.xid);
+            got.extend(t.iter().map(|x| x.xid));
         }
         assert_eq!(got, [100, 500]);
         assert_eq!(stats.emitted, 2);
@@ -1667,23 +1672,23 @@ mod tests {
 
         // Hinted-committed: routed before the failure, stays flushed
         walk_tx
-            .send(tuple(
+            .send(vec![tuple(
                 16400,
                 100,
                 0,
                 HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID,
-            ))
+            )])
             .await
             .unwrap();
         // Unhinted: deferred, must be discarded
-        walk_tx.send(tuple(16400, 500, 0, 0)).await.unwrap();
+        walk_tx.send(vec![tuple(16400, 500, 0, 0)]).await.unwrap();
         drop(walk_tx);
         drop(walk_ok_tx);
 
         let stats = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
         while let Some(t) = gated_rx.recv().await {
-            got.push(t.xid);
+            got.extend(t.iter().map(|x| x.xid));
         }
         assert_eq!(got, [100], "deferred tuple not emitted");
         assert_eq!(stats.emitted, 1);
@@ -1732,12 +1737,12 @@ mod tests {
         ));
 
         walk_tx
-            .send(tuple(
+            .send(vec![tuple(
                 16400,
                 100,
                 10,
                 HEAP_XMIN_COMMITTED | HEAP_XMAX_IS_MULTI,
-            ))
+            )])
             .await
             .unwrap();
         drop(walk_tx);
@@ -1772,12 +1777,12 @@ mod tests {
         ));
 
         walk_tx
-            .send(tuple(
+            .send(vec![tuple(
                 16400,
                 100,
                 10,
                 HEAP_XMIN_COMMITTED | HEAP_XMAX_IS_MULTI,
-            ))
+            )])
             .await
             .unwrap();
         drop(walk_tx);

@@ -23,8 +23,8 @@ use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::{ColumnBuf, EmitterConfig, EmitterStats, build_leaf, build_root};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
-use crate::emit::pipeline::batcher::{BatchMeta, InsertBatch};
-use crate::ops::oracle::{Oracle, OracleBlock, OracleError, OracleRequestColumn};
+use crate::emit::pipeline::batcher::BatchMeta;
+use crate::emit::pipeline::resolver::ResolvedBatch;
 use crate::schema::RelName;
 use ahash::{HashMap, HashMapExt};
 use std::sync::Arc;
@@ -46,7 +46,6 @@ struct Inserter {
     /// compression are re-read at each batch boundary (a compression change
     /// reconnects, since the codec is fixed at connect).
     config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
-    oracle: Option<Arc<Oracle>>,
 }
 
 impl Inserter {
@@ -84,6 +83,7 @@ impl Inserter {
         let retry = self.config.retry.clone();
         let mut attempt = 0u32;
         let mut backoff = retry.initial_backoff;
+        let started = std::time::Instant::now();
         reconnect_if_idle(&mut self.client, &self.config, self.last_used).await?;
         loop {
             let attempt_result = with_timeout(self.config.insert_timeout, async {
@@ -97,6 +97,9 @@ impl Inserter {
             match attempt_result {
                 Ok(()) => {
                     self.last_used = std::time::Instant::now();
+                    self.stats
+                        .inserter_ch_nanos
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     return Ok(());
                 }
                 Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
@@ -110,8 +113,13 @@ impl Inserter {
         }
     }
 
-    async fn run(mut self, rx: async_channel::Receiver<InsertBatch>, fatal: Fatal) {
-        while let Ok(batch) = rx.recv().await {
+    async fn run(mut self, rx: async_channel::Receiver<ResolvedBatch>, fatal: Fatal) {
+        while let Ok(ResolvedBatch {
+            batch,
+            local,
+            resolved,
+        }) = rx.recv().await
+        {
             // Live emitter knobs (overlay active): pick up the retry budget and
             // compression. A compression change needs a fresh client — the codec
             // is fixed at connect — reconnected here at a batch boundary, never
@@ -174,22 +182,17 @@ impl Inserter {
                 .asts
                 .remove(&batch.meta.table_key)
                 .expect("ensure_asts inserted");
+            // Columns the resolver built locally stand in for their oracle
+            // buffers; the rest still splice out of the answered block
+            let bufs: Vec<&ColumnBuf> = batch
+                .buffers
+                .iter()
+                .enumerate()
+                .map(|(i, buf)| local.get(i).and_then(Option::as_ref).unwrap_or(buf))
+                .collect();
             let result = 'send: {
-                // Keep resolved block alive across every INSERT retry
-                let resolved = match resolve_oracle_with_retry(
-                    self.oracle.clone(),
-                    self.alloc,
-                    &batch,
-                    &self.config.retry,
-                    &self.stats,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => break 'send Err(e),
-                };
-                let leaves: Vec<Option<ColumnBuilder<'_>>> = match batch
-                    .buffers
+                let encode_started = std::time::Instant::now();
+                let leaves: Vec<Option<ColumnBuilder<'_>>> = match bufs
                     .iter()
                     .map(|buf| build_leaf(buf, batch.n_rows))
                     .collect::<Result<_, _>>()
@@ -197,8 +200,7 @@ impl Inserter {
                     Ok(v) => v,
                     Err(e) => break 'send Err(e),
                 };
-                let roots: Vec<Option<ColumnBuilder<'_>>> = match batch
-                    .buffers
+                let roots: Vec<Option<ColumnBuilder<'_>>> = match bufs
                     .iter()
                     .zip(&leaves)
                     .map(|(buf, leaf)| match buf {
@@ -234,6 +236,10 @@ impl Inserter {
                                 .map_err(Into::into)
                         }
                     });
+                self.stats.inserter_encode_nanos.fetch_add(
+                    encode_started.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
                 match appended {
                     Ok(()) => self.send_with_retry(&batch.meta.insert_sql, &bb).await,
                     Err(e) => Err(e),
@@ -261,73 +267,15 @@ impl Inserter {
     }
 }
 
-/// Retry transport failures only
-async fn resolve_oracle_with_retry(
-    oracle: Option<Arc<Oracle>>,
-    alloc: Allocator,
-    batch: &InsertBatch,
-    retry: &crate::emit::ch_emitter::RetryConfig,
-    stats: &EmitterStats,
-) -> Result<Option<OracleBlock>, EmitterError> {
-    let mut attempt = 0u32;
-    let mut backoff = retry.initial_backoff;
-    loop {
-        match resolve_oracle(oracle.clone(), alloc, batch).await {
-            Ok(v) => return Ok(v),
-            Err(e) if e.retryable() && attempt < retry.max_attempts => {
-                stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
-                attempt += 1;
-                backoff_step(&mut backoff, retry.max_backoff).await;
-            }
-            Err(e) => return Err(EmitterError::Type(e.to_string())),
-        }
-    }
-}
-
-async fn resolve_oracle(
-    oracle: Option<Arc<Oracle>>,
-    alloc: Allocator,
-    batch: &InsertBatch,
-) -> Result<Option<OracleBlock>, OracleError> {
-    let columns: Vec<OracleRequestColumn<'_>> = batch
-        .buffers
-        .iter()
-        .enumerate()
-        .filter_map(|(i, buf)| match buf {
-            ColumnBuf::Oracle(o) => Some(OracleRequestColumn {
-                ordinal: i as u32,
-                name: &batch.meta.columns[i].name,
-                target_type: &batch.meta.columns[i].type_repr,
-                buf: o,
-            }),
-            _ => None,
-        })
-        .collect();
-    if columns.is_empty() {
-        return Ok(None);
-    }
-    let oracle = oracle.ok_or_else(|| {
-        OracleError::Absent(format!(
-            "{} needs the shadow oracle, which this pipeline has none of",
-            batch.meta.table_key
-        ))
-    })?;
-    oracle
-        .encode_batch(&columns, batch.n_rows, alloc)
-        .await
-        .map(Some)
-}
-
 pub(crate) struct PoolOptions {
     pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
-    pub oracle: Option<Arc<Oracle>>,
 }
 
 /// Connect `n` inserters and spawn drain loops
 pub(crate) async fn spawn_pool(
     n: usize,
     config: &EmitterConfig,
-    rx: async_channel::Receiver<InsertBatch>,
+    rx: async_channel::Receiver<ResolvedBatch>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     fatal: Fatal,
@@ -345,7 +293,6 @@ pub(crate) async fn spawn_pool(
             ack: ack.clone(),
             stats: stats.clone(),
             config_rx: options.config_rx.clone(),
-            oracle: options.oracle.clone(),
         };
         let rx = rx.clone();
         let fatal = fatal.clone();

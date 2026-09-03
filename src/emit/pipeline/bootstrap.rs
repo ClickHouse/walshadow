@@ -15,7 +15,8 @@ use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::AckHandle;
-use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
+use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
+use crate::emit::pipeline::decode::DECODE_CHUNK_BYTES;
 use crate::emit::route::{RouteSnapshot, RowPolicy};
 use crate::mapping::{MappingHandle, TableMapping};
 use crate::ops::oracle::render_ext_columns;
@@ -26,6 +27,11 @@ use crate::toast::{
 };
 use ahash::HashMap;
 use std::collections::HashSet;
+
+/// Rows per `BatcherMsg::Rows` from the bootstrap drain. Fixed rather than
+/// config-driven: bootstrap rows are uniform inserts, and the byte trigger
+/// covers the fat-row case
+const DRAIN_CHUNK_ROWS: usize = 1024;
 
 /// Completion frontier for `FlushAll` and resume advance
 #[derive(Debug, Clone, Copy, Default)]
@@ -40,7 +46,7 @@ pub struct BootstrapDrainOutcome {
 /// descriptor and mapping re-resolve from frozen per-pass snapshots
 #[allow(clippy::too_many_arguments)]
 pub async fn drain(
-    mut rx: mpsc::Receiver<BackfillTuple>,
+    mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
     catalog: CatalogMap,
     mapping_handle: MappingHandle,
     msg_tx: mpsc::Sender<BatcherMsg>,
@@ -74,79 +80,84 @@ pub async fn drain(
     let mut chunk_batch: Vec<ToastRow> = Vec::new();
     let mut chunk_batch_bytes = 0usize;
     let mut start_lsn = 0u64;
-    while let Some(tuple) = rx.recv().await {
-        let rfn = tuple.rfn;
-        let source_lsn = tuple.source_lsn;
-        start_lsn = source_lsn;
+    // Rows coalesce into `BatcherMsg::Rows` on the same dual trigger the
+    // decode pool uses, so a walk slab costs one channel hop, not one per row
+    let mut out = RowBuf::default();
+    while let Some(slab) = rx.recv().await {
+        for tuple in slab {
+            let rfn = tuple.rfn;
+            let source_lsn = tuple.source_lsn;
+            start_lsn = source_lsn;
 
-        let same = matches!(&open, Some((r, _, _)) if *r == rfn);
-        let seq = if same {
-            open.as_ref().expect("same implies open").1
-        } else {
-            if let Some((_, prev_seq, prev_rows)) = open.take() {
-                ack.placed(prev_seq, prev_rows);
-            }
-            let s = next_seq;
-            next_seq += 1;
-            ack.register(s, source_lsn);
-            open = Some((rfn, s, 0));
-            s
-        };
-
-        let Some(rel) = catalog.get(rfn.db_node, rfn.rel_node) else {
-            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-
-        if skip_initial.contains(&rel.rel_name) {
-            continue;
-        }
-
-        if catalog.is_toast(rfn.db_node, rfn.rel_node) {
-            if let Some(row) = row_from_columns(tuple, rel.oid) {
-                chunk_batch_bytes += row.chunk_data.len();
-                chunk_batch.push(row);
-                if chunk_batch.len() >= CHUNK_PUT_BATCH || chunk_batch_bytes >= CHUNK_PUT_BYTES {
-                    flush_chunks(&resolver, &mut chunk_batch).await?;
-                    chunk_batch_bytes = 0;
+            let same = matches!(&open, Some((r, _, _)) if *r == rfn);
+            let seq = if same {
+                open.as_ref().expect("same implies open").1
+            } else {
+                if let Some((_, prev_seq, prev_rows)) = open.take() {
+                    // Every row of the closing seq on the channel before its
+                    // expected count is published
+                    out.flush(&msg_tx).await?;
+                    ack.placed(prev_seq, prev_rows);
                 }
-            }
-            continue;
-        }
+                let s = next_seq;
+                next_seq += 1;
+                ack.register(s, source_lsn);
+                open = Some((rfn, s, 0));
+                s
+            };
 
-        let Some(route) = routes.get(&rel.rel_name).cloned() else {
-            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
+            let Some(rel) = catalog.get(rfn.db_node, rfn.rel_node) else {
+                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
 
-        if has_mapped_external_toast(&tuple, &route.mapping) {
-            if resolver.stores_chunks() {
-                deferred
-                    .push(tuple)
-                    .await
-                    .map_err(|e| format!("bootstrap: deferred spool: {e}"))?;
-                stats
-                    .bootstrap_deferred_bytes
-                    .store(deferred.resident_bytes() as u64, Ordering::Relaxed);
-                stats
-                    .bootstrap_deferred_spool_bytes
-                    .store(deferred.spooled_bytes(), Ordering::Relaxed);
+            if skip_initial.contains(&rel.rel_name) {
                 continue;
             }
-            let mut tuple = tuple;
-            let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
-            render_ext_columns(&rel.attributes, &mut tuple.columns);
-            route_row(&msg_tx, seq, rel, route, tuple, permit).await?;
-            bump(&mut open, &mut rows_routed);
-            continue;
-        }
 
-        let mut tuple = tuple;
-        render_ext_columns(&rel.attributes, &mut tuple.columns);
-        route_row(&msg_tx, seq, rel, route, tuple, None).await?;
-        bump(&mut open, &mut rows_routed);
+            if catalog.is_toast(rfn.db_node, rfn.rel_node) {
+                if let Some(row) = row_from_columns(tuple, rel.oid) {
+                    chunk_batch_bytes += row.chunk_data.len();
+                    chunk_batch.push(row);
+                    if chunk_batch.len() >= CHUNK_PUT_BATCH || chunk_batch_bytes >= CHUNK_PUT_BYTES
+                    {
+                        flush_chunks(&resolver, &mut chunk_batch).await?;
+                        chunk_batch_bytes = 0;
+                    }
+                }
+                continue;
+            }
+
+            let Some(route) = routes.get(&rel.rel_name).cloned() else {
+                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+
+            let mut tuple = tuple;
+            let mut permit = None;
+            if has_mapped_external_toast(&tuple, &route.mapping) {
+                if resolver.stores_chunks() {
+                    deferred
+                        .push(tuple)
+                        .await
+                        .map_err(|e| format!("bootstrap: deferred spool: {e}"))?;
+                    stats
+                        .bootstrap_deferred_bytes
+                        .store(deferred.resident_bytes() as u64, Ordering::Relaxed);
+                    stats
+                        .bootstrap_deferred_spool_bytes
+                        .store(deferred.spooled_bytes(), Ordering::Relaxed);
+                    continue;
+                }
+                permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
+            }
+            render_ext_columns(&rel.attributes, &mut tuple.columns);
+            out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
+            bump(&mut open, &mut rows_routed);
+        }
     }
 
+    out.flush(&msg_tx).await?;
     if let Some((_, seq, rows)) = open.take() {
         ack.placed(seq, rows);
     }
@@ -185,10 +196,11 @@ pub async fn drain(
             };
             let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
             render_ext_columns(&rel.attributes, &mut tuple.columns);
-            route_row(&msg_tx, seq, rel, route, tuple, permit).await?;
+            out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
             placed += 1;
             rows_routed += 1;
         }
+        out.flush(&msg_tx).await?;
         replay
             .finish()
             .await
@@ -213,25 +225,54 @@ fn bump(open: &mut Option<(walrus::pg::walparser::RelFileNode, u64, u64)>, rows_
     *rows_routed += 1;
 }
 
-async fn route_row(
-    msg_tx: &mpsc::Sender<BatcherMsg>,
-    seq: u64,
-    rel: Arc<RelDescriptor>,
-    route: Arc<RouteSnapshot>,
-    tuple: BackfillTuple,
-    value_permit: Option<crate::budget::MemoryPermit>,
-) -> Result<(), String> {
-    let committed = tuple.into_committed_insert();
-    msg_tx
-        .send(BatcherMsg::Row(RoutedRow {
+/// Coalesces routed rows into one `BatcherMsg::Rows` per
+/// [`DECODE_CHUNK_BYTES`]-shaped trigger, the same amortization the streaming
+/// decode pool gets. Rows of different seqs may share a chunk; the batcher
+/// routes each independently
+#[derive(Default)]
+struct RowBuf {
+    rows: Vec<RoutedRow>,
+    bytes: usize,
+}
+
+impl RowBuf {
+    async fn push(
+        &mut self,
+        msg_tx: &mpsc::Sender<BatcherMsg>,
+        seq: u64,
+        rel: Arc<RelDescriptor>,
+        route: Arc<RouteSnapshot>,
+        tuple: BackfillTuple,
+        value_permit: Option<crate::budget::MemoryPermit>,
+    ) -> Result<(), String> {
+        let committed = tuple.into_committed_insert();
+        self.bytes += committed.decoded.approx_bytes();
+        self.rows.push(RoutedRow {
             seq,
             rel,
             route,
             committed,
             value_permit: value_permit.map(Arc::new),
-        }))
-        .await
-        .map_err(|_| "bootstrap: batcher channel closed".to_string())
+        });
+        if self.rows.len() >= DRAIN_CHUNK_ROWS || self.bytes >= DECODE_CHUNK_BYTES {
+            self.flush(msg_tx).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self, msg_tx: &mpsc::Sender<BatcherMsg>) -> Result<(), String> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        self.bytes = 0;
+        msg_tx
+            .send(BatcherMsg::Rows(RowChunk {
+                rows: std::mem::take(&mut self.rows),
+                permit: None,
+            }))
+            .await
+            .map_err(|_| "bootstrap: batcher channel closed".to_string())
+    }
 }
 
 /// Check only columns routed to ClickHouse
@@ -348,6 +389,21 @@ fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastR
 
 #[cfg(test)]
 mod tests {
+    /// Flatten the drain's coalesced `Rows` chunks back to a row list
+    async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<RoutedRow> {
+        let mut rows = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                BatcherMsg::Rows(chunk) => rows.extend(chunk.rows),
+                BatcherMsg::Row(r) => rows.push(r),
+                BatcherMsg::FlushAll(reply) => {
+                    let _ = reply.send(());
+                }
+            }
+        }
+        rows
+    }
+
     use super::*;
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
@@ -556,13 +612,13 @@ mod tests {
         let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
         for id in 0..3 {
-            tup_tx.send(tuple(16400, id)).await.unwrap();
+            tup_tx.send(vec![tuple(16400, id)]).await.unwrap();
         }
         for id in 0..2 {
-            tup_tx.send(tuple(16401, id)).await.unwrap();
+            tup_tx.send(vec![tuple(16401, id)]).await.unwrap();
         }
         drop(tup_tx);
 
@@ -582,7 +638,7 @@ mod tests {
         ));
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
-        while let Some(BatcherMsg::Row(r)) = msg_rx.recv().await {
+        for r in collect_rows(&mut msg_rx).await {
             *by_seq.entry(r.seq).or_default() += 1;
         }
         let outcome = drain_task.await.unwrap().unwrap();
@@ -611,12 +667,12 @@ mod tests {
         let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
         // 16400, 16401(unmapped), 16400 → seqs 0,1,2; only 0 and 2 route
-        tup_tx.send(tuple(16400, 1)).await.unwrap();
-        tup_tx.send(tuple(16401, 9)).await.unwrap();
-        tup_tx.send(tuple(16400, 2)).await.unwrap();
+        tup_tx.send(vec![tuple(16400, 1)]).await.unwrap();
+        tup_tx.send(vec![tuple(16401, 9)]).await.unwrap();
+        tup_tx.send(vec![tuple(16400, 2)]).await.unwrap();
         drop(tup_tx);
 
         let stats = Arc::new(EmitterStats::default());
@@ -634,10 +690,11 @@ mod tests {
             std::collections::HashSet::new(),
         ));
 
-        let mut seqs: Vec<u64> = Vec::new();
-        while let Some(BatcherMsg::Row(r)) = msg_rx.recv().await {
-            seqs.push(r.seq);
-        }
+        let seqs: Vec<u64> = collect_rows(&mut msg_rx)
+            .await
+            .iter()
+            .map(|r| r.seq)
+            .collect();
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.next_seq, 3, "three distinct rfn runs");
         assert_eq!(outcome.rows_routed, 2, "unmapped rel routed nothing");
@@ -660,10 +717,10 @@ mod tests {
         let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
         tup_tx
-            .send(bytea_toast_tuple(16400, 16500, 1))
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
             .await
             .unwrap();
         drop(tup_tx);
@@ -684,10 +741,7 @@ mod tests {
             std::collections::HashSet::new(),
         ));
 
-        let mut rows = Vec::new();
-        while let Some(BatcherMsg::Row(r)) = msg_rx.recv().await {
-            rows.push(r);
-        }
+        let rows = collect_rows(&mut msg_rx).await;
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.next_seq, 1);
         assert_eq!(outcome.rows_routed, 1);
@@ -719,16 +773,16 @@ mod tests {
         let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
         let spool_tmp = tempfile::tempdir().unwrap();
 
         // toast chunk first (its own zero-row seq), then the referring main row
         tup_tx
-            .send(toast_chunk_tuple(16500, 1, 0, b"hello"))
+            .send(vec![toast_chunk_tuple(16500, 1, 0, b"hello")])
             .await
             .unwrap();
         tup_tx
-            .send(bytea_toast_tuple(16400, 16500, 1))
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
             .await
             .unwrap();
         drop(tup_tx);
@@ -750,10 +804,7 @@ mod tests {
             std::collections::HashSet::new(),
         ));
 
-        let mut rows = Vec::new();
-        while let Some(BatcherMsg::Row(r)) = msg_rx.recv().await {
-            rows.push(r);
-        }
+        let rows = collect_rows(&mut msg_rx).await;
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.next_seq, 3, "toast seq, main seq, deferred seq");
         assert_eq!(outcome.rows_routed, 1);
@@ -782,14 +833,14 @@ mod tests {
         let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
         let (ack, collector) = ack::spawn(emitter_ack);
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
         tup_tx
-            .send(toast_chunk_tuple(16500, 1, 0, b"hello"))
+            .send(vec![toast_chunk_tuple(16500, 1, 0, b"hello")])
             .await
             .unwrap();
         tup_tx
-            .send(bytea_toast_tuple(16400, 16500, 1))
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
             .await
             .unwrap();
 
@@ -817,10 +868,7 @@ mod tests {
         mapping.mutate(|m| Arc::make_mut(m).clear()).await;
         drop(tup_tx);
 
-        let mut rows = Vec::new();
-        while let Some(BatcherMsg::Row(r)) = msg_rx.recv().await {
-            rows.push(r);
-        }
+        let rows = collect_rows(&mut msg_rx).await;
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.rows_routed, 1, "unmapping must not drop the row");
         assert_eq!(rows.len(), 1);

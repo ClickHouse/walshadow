@@ -101,7 +101,7 @@ async fn run_oracle_stats(
 
     // Worker binds only once recovery reaches consistency, so budget the dial
     let socket = shadow.bridge_socket().expect("bridge configured");
-    let bridge = walshadow::bridge::connect_with_budget(socket, Duration::from_secs(30))
+    let bridge = walshadow::bridge::connect_with_budget(socket, 1, Duration::from_secs(30))
         .await
         .expect("bridge connect");
     assert!(

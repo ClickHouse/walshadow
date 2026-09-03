@@ -1486,6 +1486,51 @@ fn name_column(mut e: EmitterError, target: &str) -> EmitterError {
 }
 
 /// Build stable leaves before roots borrow them
+/// Answer an oracle-routed column locally when the request would be a
+/// no-op: every cell is bytes the daemon rendered, and the worker's `String`
+/// path wraps each in a `text` that pgch casts straight back. Defaults take
+/// the shape `ws_append_default` gives them — NULL under `Nullable`, empty
+/// string otherwise. `None` leaves the column in the request
+pub(crate) fn literal_column(
+    buf: &OracleColumnBuf,
+    target_type: &str,
+    n_rows: usize,
+) -> Option<ColumnBuf> {
+    if !buf.literal_only() || buf.cells().len() != n_rows {
+        return None;
+    }
+    // `canonical_type` renders these two exactly; anything wrapping a String
+    // (`LowCardinality`, `Array`) is PG's to build
+    let nullable = target_type == "Nullable(String)";
+    if !nullable && target_type != "String" {
+        return None;
+    }
+    let mut offsets = Vec::with_capacity(n_rows);
+    let mut data = Vec::new();
+    let mut null_map = vec![0u8; if nullable { n_rows } else { 0 }];
+    for (i, cell) in buf.cells().iter().enumerate() {
+        match cell {
+            OracleCell::Literal(b) => data.extend_from_slice(b),
+            // `literal_only` admits nothing else
+            _ => {
+                if nullable {
+                    null_map[i] = 1;
+                }
+            }
+        }
+        offsets.push(data.len() as u64);
+    }
+    Some(if nullable {
+        ColumnBuf::NullableString {
+            offsets,
+            data,
+            null_map,
+        }
+    } else {
+        ColumnBuf::String { offsets, data }
+    })
+}
+
 pub(crate) fn build_leaf(
     buf: &ColumnBuf,
     n_rows: usize,
@@ -1991,6 +2036,19 @@ crate::atomic_stats! {
         pub insertbatch_rows_in,
         pub insertbatch_batches_out,
         pub inserter_batches_in,
+        /// Inserter time inside the INSERT round trip (`send_query` through
+        /// `EndOfStream`), retries included. Against `inserter_pool_size ×
+        /// elapsed` this is CH-side utilization
+        pub inserter_ch_nanos,
+        /// Inserter time rebuilding the Native block over the batch's slabs
+        pub inserter_encode_nanos,
+        /// Resolver time inside the oracle round trip, retries included.
+        /// Overlaps the inserters' ClickHouse time, so against
+        /// `inserter_ch_nanos` it says which stage is the limiter
+        pub oracle_resolve_nanos,
+        /// Oracle-routed columns the daemon built itself: rendered cells
+        /// against a `String` target, which PG would hand straight back
+        pub oracle_local_columns,
     }
 }
 
@@ -2350,6 +2408,30 @@ mod tests {
             let ast = TypeAst::parse(name, alloc).expect("parses");
             assert_eq!(ast.view().elem_size(), 0, "{name}");
         }
+    }
+
+    /// A default under a bare `String` is the empty string, matching
+    /// `ws_append_default`; a target that wraps String is PG's to build
+    #[test]
+    fn literal_column_takes_only_a_bare_string_target() {
+        let mut buf = OracleColumnBuf::new(0, -1);
+        buf.push(OracleCell::Literal(b"a".to_vec()));
+        buf.push(OracleCell::Default);
+        match literal_column(&buf, "String", 2) {
+            Some(ColumnBuf::String { offsets, data }) => {
+                assert_eq!(data, b"a");
+                assert_eq!(offsets, [1, 1]);
+            }
+            other => panic!("got {other:?}"),
+        }
+        for reject in ["Array(String)", "LowCardinality(String)", "JSON", "Int32"] {
+            assert!(
+                literal_column(&buf, reject, 2).is_none(),
+                "{reject} needs the worker",
+            );
+        }
+        // Cell count must match the batch, else offsets would not
+        assert!(literal_column(&buf, "String", 3).is_none());
     }
 
     #[test]

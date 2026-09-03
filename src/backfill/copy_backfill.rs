@@ -84,6 +84,13 @@ use crate::schema::{
 };
 use crate::source::source_feed::open_sql_client;
 use crate::toast::ToastResolver;
+
+/// Rows per COPY-backfill channel hop. Byte trigger below bounds the wide-row
+/// case, so this only caps the narrow-row hop rate
+const COPY_SLAB_ROWS: usize = 1024;
+/// Decoded value bytes per hop. With
+/// [`BOOTSTRAP_TUPLE_CHANNEL_CAP`] this is the resident payload ceiling
+const COPY_SLAB_BYTES: usize = 1 << 20;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
@@ -1071,7 +1078,7 @@ impl CopyBackfiller {
 
         let mut catalog = CatalogMap::new();
         catalog.insert(desc.clone());
-        let (tup_tx, tup_rx) = mpsc::channel::<BackfillTuple>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
         let drain = tokio::spawn(bootstrap::drain(
             tup_rx,
             catalog,
@@ -1101,6 +1108,11 @@ impl CopyBackfiller {
             let stream = BinaryCopyOutStream::new(copy, &byte_fields);
             futures::pin_mut!(stream);
             let mut rows = 0u64;
+            // Slab the channel: one hop per `COPY_SLAB_BYTES` of decoded
+            // values, not one per row. Byte-triggered so wide rows keep the
+            // resident bound whatever the row count
+            let mut slab: Vec<BackfillTuple> = Vec::new();
+            let mut slab_bytes = 0usize;
             while let Some(row) = stream.next().await {
                 let row = row.context("backfill: COPY stream")?;
                 let mut columns: Vec<Option<ColumnValue>> = vec![None; plan.natts];
@@ -1113,22 +1125,37 @@ impl CopyBackfiller {
                         .unwrap_or(ColumnValue::Null);
                     columns[(cp.attnum - 1).max(0) as usize] = Some(v);
                 }
+                slab_bytes += columns
+                    .iter()
+                    .flatten()
+                    .map(ColumnValue::approx_bytes)
+                    .sum::<usize>();
+                slab.push(BackfillTuple {
+                    rfn: desc.rfn,
+                    xid: 0,
+                    xmax: 0,
+                    infomask: 0,
+                    source_lsn: s_lsn.get(),
+                    // COPY text rows have no on-page TID (values arrive
+                    // detoasted, no chunks flow here)
+                    blkno: 0,
+                    offnum: 0,
+                    columns,
+                });
+                rows += 1;
+                if slab.len() >= COPY_SLAB_ROWS || slab_bytes >= COPY_SLAB_BYTES {
+                    slab_bytes = 0;
+                    tup_tx
+                        .send(std::mem::take(&mut slab))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
+                }
+            }
+            if !slab.is_empty() {
                 tup_tx
-                    .send(BackfillTuple {
-                        rfn: desc.rfn,
-                        xid: 0,
-                        xmax: 0,
-                        infomask: 0,
-                        source_lsn: s_lsn.get(),
-                        // COPY text rows have no on-page TID (values arrive
-                        // detoasted, no chunks flow here)
-                        blkno: 0,
-                        offnum: 0,
-                        columns,
-                    })
+                    .send(slab)
                     .await
                     .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
-                rows += 1;
             }
             rows
         };
