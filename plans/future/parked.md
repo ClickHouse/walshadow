@@ -1,7 +1,12 @@
 # parked — small operational debt and follow-up polish
 
-Operational debt collected from retros plus follow-ups from the
-allocation-audit pass. One-line per item
+Operational debt collected from retros, one line per item. Items that fit
+a subject doc live there instead: perf and profiling work in
+[perf_regression.md](perf_regression.md), coverage and skip-gate hazards in
+[coverage100.md](coverage100.md), decoder-fidelity risks in
+[risks.md](risks.md), config knobs in
+[runtime_config_from_pg.md](runtime_config_from_pg.md), DDL transition
+corpus in [ddl_fuzz.md](ddl_fuzz.md)
 
 ## v1.0 operational polish
 
@@ -12,49 +17,6 @@ allocation-audit pass. One-line per item
 * **OnceCell shared CH-server fixture.** Five acceptance tests each
   spawn own CH (~5 s × N startup). Total CI cost ~25 s of unique
   boot time. Flag if test count doubles
-
-## Cross-major fixture pinning
-
-* **MULTI_INSERT + xl_xact_commit fixtures against PG 16/17/18 via
-  `tests/classify_fixture.rs`.** Cross-major drift in tail-walk
-  semantics would surface as silent decoder mismatch under one
-  specific major. cross-major snapshot fixtures called for snapshot
-  fixtures across majors
-
-## Drive currently-skipped tests
-
-Acceptance tests ship with runtime skip-gates checking for `initdb` /
-`pg_basebackup` / `clickhouse` on `PATH`; *not* `#[ignore]`. Each
-needs source PG + CH + (usually) basebackup-cloned shadow. Drive in
-CI when those binaries reliably present:
-
-* `kill_restart`
-* `pgbench_acceptance`
-* `bootstrap_direct_ch`
-* `bootstrap_object_store_ch`
-* `truncate`
-* `subxact`
-* `copy_into`
-* `add_column_default`
-
-Each is a one-line un-skip + observation of which fixture path
-needs a kick. Acceptance items §1 (pgbench), §5 (kill-restart)
-remain unverified against live topology until driven
-
-## Zero-copy follow-ups
-
-* **Criterion benchmark.** Allocation-count + RSS measurement
-  post-hoc; land `benches/` crate when measurement contested.
-  Targets predicted RSS drop (≈200 MB → ≈0 for 100k-record
-  heap-INSERT segment) + 1.5-3× decode throughput from dropped
-  allocator pressure
-* **`XLogRecord.blocks` smallvec.** Records average 0-2 blocks;
-  `SmallVec<[_; 2]>` keeps common case stack-resident. Allocation
-  polish below byte-traffic wins from Cow
-* **Header-walk single-pass merge.** `record.blocks` walk runs
-  twice (once for IDs, once for payloads) in wal-rus parser. Merge
-  into single pass since IDs arrive in order. Leftover from wal-g
-  port
 
 ## Walsender hardening
 
@@ -68,17 +30,3 @@ remain unverified against live topology until driven
 * **Walsender keepalive-timeout unit test.** Indirectly covered by
   libpq + PG-walreceiver round-trips in `walsender_pg18_walreceiver`;
   explicit unit test is polish
-
-## Decoder follow-ups
-
-* **Subxact `XACT_XINFO_HAS_INVALS` ordering verification fixture.**
-  Capture commit record from PG with all `xinfo` bits set; prove
-  walk doesn't drift under out-of-the-way ordering on some major.
-  Subxact retro flagged this
-* **TRUNCATE strategy knob.** v1 emits single `TRUNCATE TABLE <dest>`
-  per relation. Per-table `truncate_strategy = "passthrough" |
-  "ignore"` knob once downstream consumer asks. Defer-until-asked
-* **DROP TABLE propagation polish.** Basic path runs via
-  `SchemaEvent` + `DrainEntry::Catalog` channel. Corner cases
-  (CASCADE, RESTRICT, dependent objects) need pinning against
-  fixture matrix
