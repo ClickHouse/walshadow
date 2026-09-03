@@ -20,7 +20,7 @@ use walshadow::bridge::{
 };
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::pg::socket_conninfo;
-use walshadow::schema::ReplIdent;
+use walshadow::schema::{NUMERICOID, ReplIdent};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{CatalogError, ShadowCatalog, ShadowCatalogConfig};
 
@@ -56,6 +56,10 @@ impl Drop for StopOnDrop {
 }
 
 fn start_pg(tmp: &tempfile::TempDir, port: u16) -> StopOnDrop {
+    start_pg_with_workers(tmp, port, 1)
+}
+
+fn start_pg_with_workers(tmp: &tempfile::TempDir, port: u16, workers: usize) -> StopOnDrop {
     let lib_dir = pgext_dir();
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
     cfg.port = port;
@@ -63,6 +67,7 @@ fn start_pg(tmp: &tempfile::TempDir, port: u16) -> StopOnDrop {
     cfg.ctl_timeout = Duration::from_secs(60);
     let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
     bridge.library_dir = Some(lib_dir);
+    bridge.workers = workers;
     cfg.bridge = Some(bridge);
     fs::create_dir_all(&cfg.filter_out_dir).unwrap();
     fs::create_dir_all(&cfg.socket_dir).unwrap();
@@ -76,7 +81,7 @@ fn start_pg(tmp: &tempfile::TempDir, port: u16) -> StopOnDrop {
 
 async fn dial(sh: &Shadow) -> Bridge {
     let path = sh.bridge_socket().expect("bridge configured");
-    walshadow::bridge::connect_with_budget(path, Duration::from_secs(20))
+    walshadow::bridge::connect_with_budget(path, 1, Duration::from_secs(20))
         .await
         .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", path.display()))
 }
@@ -115,7 +120,7 @@ async fn open_catalog(sh: &Shadow, bridge: Arc<Bridge>) -> ShadowCatalog {
 async fn open_mirror_catalog(sh: &Shadow, sock: &Path) -> (Arc<Bridge>, ShadowCatalog) {
     spawn_moving_worker(tokio::net::UnixListener::bind(sock).expect("bind stand-in"));
     let bridge = Arc::new(
-        walshadow::bridge::connect_with_budget(sock, Duration::from_secs(5))
+        walshadow::bridge::connect_with_budget(sock, 1, Duration::from_secs(5))
             .await
             .expect("stand-in bridge"),
     );
@@ -1026,4 +1031,103 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
         ),
         "{err:?}"
     );
+}
+
+/// `walshadow.bridge_workers = 4` registers four workers on
+/// `socket_path`, `socket_path.1`, `.2`, `.3`. Pooling them is what stops
+/// oracle throughput being one backend's conversion rate.
+///
+/// Asserts routing, not rate: four in-flight `ENCODE_NATIVE`s over four
+/// sockets each get their own answer back. The pooled-vs-single throughput
+/// ratio is hardware-bound (cores cap it) so it is measured by the perf
+/// workload, never asserted here, see
+/// [`plans/future/perf_regression.md`](../plans/future/perf_regression.md)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn bridge_worker_pool_serves_concurrent_requests() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    const WORKERS: usize = 4;
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = start_pg_with_workers(&tmp, ports::PG_SHADOW_PORT, WORKERS);
+    let path = guard.sh.bridge_socket().expect("bridge configured");
+
+    let pooled = Arc::new(
+        walshadow::bridge::connect_with_budget(path, WORKERS, Duration::from_secs(30))
+            .await
+            .expect("pooled bridge connect"),
+    );
+    // Same shadow, one socket: a budget below the worker count is honoured
+    let single = Arc::new(
+        walshadow::bridge::connect_with_budget(path, 1, Duration::from_secs(30))
+            .await
+            .expect("single bridge connect"),
+    );
+    assert_eq!(pooled.pool_size(), WORKERS, "one socket per worker");
+    assert_eq!(single.pool_size(), 1);
+    // Every slot dialled its own HELLO; a mismatch would have failed connect
+    assert!(pooled.info().is_some());
+
+    // Wide enough that requests are still overlapping when the last one is
+    // dispatched, which is the state a shared slot would have to serialize
+    const ROWS: usize = 10_000;
+    let cells = Arc::new({
+        let mut b = OracleColumnBuf::new(NUMERICOID, -1);
+        for _ in 0..ROWS {
+            b.push(OracleCell::DiskRaw(numeric_42()));
+        }
+        b
+    });
+
+    /// One `ENCODE_NATIVE` per task, all in flight at once
+    async fn race(bridge: &Arc<Bridge>, cells: &Arc<OracleColumnBuf>, tasks: usize) {
+        let mut set = Vec::new();
+        for _ in 0..tasks {
+            let bridge = bridge.clone();
+            let cells = cells.clone();
+            set.push(tokio::spawn(async move {
+                let columns = [OracleRequestColumn {
+                    ordinal: 0,
+                    name: "c0",
+                    target_type: "String",
+                    buf: &cells,
+                }];
+                Oracle::new(bridge)
+                    .encode_batch(
+                        &columns,
+                        cells.cells().len(),
+                        clickhouse_c::Allocator::stdlib(),
+                    )
+                    .await
+                    .expect("oracle answers")
+                    .column(0)
+                    .and_then(|c| c.string())
+                    .expect("string column")
+                    .0
+                    .len()
+            }));
+        }
+        for h in set {
+            assert_eq!(h.await.unwrap(), ROWS, "one offset per row");
+        }
+    }
+
+    race(&pooled, &cells, WORKERS).await;
+    // One socket carrying the same concurrency answers every caller too
+    race(&single, &cells, WORKERS).await;
+
+    // Pool width is operator-visible
+    assert_eq!(
+        pooled
+            .stats
+            .pool_size
+            .load(std::sync::atomic::Ordering::Relaxed),
+        WORKERS as u64,
+    );
+    // Catalog reads stayed on worker 0 whatever the pool width
+    pooled
+        .scan(Catalog::Namespace, 0, &[])
+        .await
+        .expect("scan pinned to slot 0 still answers");
 }

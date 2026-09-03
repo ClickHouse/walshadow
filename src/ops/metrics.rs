@@ -78,6 +78,16 @@ pub struct MetricsSnapshot {
     pub bootstrap_deferred_bytes: u64,
     /// Encoded bytes in the bootstrap TOAST-deferred spool file
     pub bootstrap_deferred_spool_bytes: u64,
+    /// Bootstrap pump stage attribution. Live while a greenfield bootstrap
+    /// runs, then frozen at its final values for the rest of the session
+    pub bootstrap_bytes_tapped: u64,
+    pub bootstrap_pages_walked: u64,
+    pub bootstrap_tuples_emitted: u64,
+    pub bootstrap_files_walked: u64,
+    pub bootstrap_files_skipped_unmapped: u64,
+    pub bootstrap_decode_seconds: f64,
+    pub bootstrap_tap_seconds: f64,
+    pub bootstrap_channel_block_seconds: f64,
     pub spill_evictions_total: u64,
     pub xacts_committed_total: u64,
     pub xacts_aborted_total: u64,
@@ -150,8 +160,12 @@ pub struct MetricsSnapshot {
     pub insertbatch_rows_in_total: u64,
     pub insertbatch_batches_out_total: u64,
     pub inserter_batches_in_total: u64,
+    pub inserter_ch_seconds_total: f64,
+    pub inserter_encode_seconds_total: f64,
+    pub oracle_resolve_seconds_total: f64,
     pub process_cpu_seconds_total: f64,
     pub process_resident_memory_bytes: u64,
+    pub oracle_local_columns_total: u64,
     pub oracle_blocks_total: u64,
     pub oracle_rows_total: u64,
     pub oracle_cells_total: u64,
@@ -165,6 +179,12 @@ pub struct MetricsSnapshot {
     pub bridge_requests_by_op: [u64; 4],
     pub bridge_errors_by_op: [u64; 4],
     pub bridge_request_nanos_by_op: [u64; 4],
+    /// Queued behind another caller on the single bridge socket
+    pub bridge_lock_wait_nanos_by_op: [u64; 4],
+    /// Wire time with the socket held
+    pub bridge_service_nanos_by_op: [u64; 4],
+    pub bridge_request_bytes_by_op: [u64; 4],
+    pub bridge_response_bytes_by_op: [u64; 4],
     pub bridge_reconnects_total: u64,
     pub bridge_scan_rows_total: u64,
     pub bridge_scan_subtrans_mismatch_total: u64,
@@ -574,6 +594,36 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             snap.bootstrap_deferred_spool_bytes,
         ),
         (
+            "walshadow_bootstrap_bytes_tapped_total",
+            "Backup body bytes the bootstrap pump handed to the page-walk sink.",
+            "counter",
+            snap.bootstrap_bytes_tapped,
+        ),
+        (
+            "walshadow_bootstrap_pages_walked_total",
+            "8 KiB heap pages the bootstrap walk framed.",
+            "counter",
+            snap.bootstrap_pages_walked,
+        ),
+        (
+            "walshadow_bootstrap_tuples_emitted_total",
+            "Live tuples the bootstrap walk decoded off backup pages.",
+            "counter",
+            snap.bootstrap_tuples_emitted,
+        ),
+        (
+            "walshadow_bootstrap_files_walked_total",
+            "User-heap segments the bootstrap walk decoded.",
+            "counter",
+            snap.bootstrap_files_walked,
+        ),
+        (
+            "walshadow_bootstrap_files_skipped_unmapped_total",
+            "User-heap segments declined at begin because no mapped relation owns them; their bytes drain unread.",
+            "counter",
+            snap.bootstrap_files_skipped_unmapped,
+        ),
+        (
             "walshadow_spill_evictions_total",
             "Total evictions in→spill since daemon start.",
             "counter",
@@ -783,6 +833,12 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "Resident set size of the walshadow process (VmRSS).",
             "gauge",
             snap.process_resident_memory_bytes,
+        ),
+        (
+            "walshadow_oracle_local_columns_total",
+            "Oracle-routed columns the daemon built itself: already-rendered cells against a String target, which PG would hand straight back.",
+            "counter",
+            snap.oracle_local_columns_total,
         ),
         (
             "walshadow_oracle_blocks_total",
@@ -1278,12 +1334,47 @@ pub fn render(snap: &MetricsSnapshot) -> String {
         for (op, v) in OP_LABELS.iter().zip(snap.bridge_errors_by_op) {
             writeln!(s, "{name}{{op=\"{op}\"}} {v}").unwrap();
         }
-        let name = "walshadow_bridge_request_seconds_total";
-        writeln!(s, "# HELP {name} Wall time spent in bridge round trips.").unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (op, v) in OP_LABELS.iter().zip(snap.bridge_request_nanos_by_op) {
-            let secs = v as f64 / 1e9;
-            writeln!(s, "{name}{{op=\"{op}\"}} {secs}").unwrap();
+        for (name, help, nanos) in [
+            (
+                "walshadow_bridge_request_seconds_total",
+                "Wall time spent in bridge round trips.",
+                snap.bridge_request_nanos_by_op,
+            ),
+            (
+                "walshadow_bridge_lock_wait_seconds_total",
+                "Wall time bridge callers spent queued for the socket. Against bridge_service_seconds this says whether the worker or the funnel in front of it is the limiter.",
+                snap.bridge_lock_wait_nanos_by_op,
+            ),
+            (
+                "walshadow_bridge_service_seconds_total",
+                "Wall time on the wire with the bridge socket held: worker conversion plus transfer.",
+                snap.bridge_service_nanos_by_op,
+            ),
+        ] {
+            writeln!(s, "# HELP {name} {help}").unwrap();
+            writeln!(s, "# TYPE {name} counter").unwrap();
+            for (op, v) in OP_LABELS.iter().zip(nanos) {
+                let secs = v as f64 / 1e9;
+                writeln!(s, "{name}{{op=\"{op}\"}} {secs}").unwrap();
+            }
+        }
+        for (name, help, bytes) in [
+            (
+                "walshadow_bridge_request_bytes_total",
+                "Request frame bytes written to the bridge socket.",
+                snap.bridge_request_bytes_by_op,
+            ),
+            (
+                "walshadow_bridge_response_bytes_total",
+                "Response frame bytes read back off the bridge socket.",
+                snap.bridge_response_bytes_by_op,
+            ),
+        ] {
+            writeln!(s, "# HELP {name} {help}").unwrap();
+            writeln!(s, "# TYPE {name} counter").unwrap();
+            for (op, v) in OP_LABELS.iter().zip(bytes) {
+                writeln!(s, "{name}{{op=\"{op}\"}} {v}").unwrap();
+            }
         }
     }
 
@@ -1338,6 +1429,43 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     .unwrap();
     writeln!(s, "# TYPE {name} counter").unwrap();
     writeln!(s, "{name} {:.3}", snap.desc_capture_seconds_total).unwrap();
+
+    for (name, help, secs) in [
+        (
+            "walshadow_bootstrap_decode_seconds_total",
+            "Cumulative CPU inside the bootstrap page walk, tuple decode included.",
+            snap.bootstrap_decode_seconds,
+        ),
+        (
+            "walshadow_bootstrap_tap_seconds_total",
+            "Cumulative time bootstrap tap readers spent inside the sink: page framing, decode, channel send. Against bootstrap_decode_seconds this is the tap's own overhead.",
+            snap.bootstrap_tap_seconds,
+        ),
+        (
+            "walshadow_bootstrap_channel_block_seconds_total",
+            "Cumulative time the bootstrap walk spent waiting for a free tuple-channel slot, i.e. emitter drain time seen by the walk.",
+            snap.bootstrap_channel_block_seconds,
+        ),
+        (
+            "walshadow_inserter_ch_seconds_total",
+            "Cumulative inserter time inside the ClickHouse INSERT round trip. Against inserter_pool_size x uptime this is CH-side utilization.",
+            snap.inserter_ch_seconds_total,
+        ),
+        (
+            "walshadow_inserter_encode_seconds_total",
+            "Cumulative inserter time rebuilding the Native block over a batch's owned slabs.",
+            snap.inserter_encode_seconds_total,
+        ),
+        (
+            "walshadow_oracle_resolve_seconds_total",
+            "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
+            snap.oracle_resolve_seconds_total,
+        ),
+    ] {
+        writeln!(s, "# HELP {name} {help}").unwrap();
+        writeln!(s, "# TYPE {name} counter").unwrap();
+        writeln!(s, "{name} {secs:.3}").unwrap();
+    }
 
     // Process CPU as a float counter (seconds); rate() ≈ cores in use.
     let name = "walshadow_process_cpu_seconds_total";
@@ -1469,6 +1597,37 @@ mod tests {
         }
         assert!(body.contains("walshadow_route_snapshots_total{result=\"mapped\"} 7"));
         assert!(body.contains("walshadow_route_snapshots_total{result=\"unmapped\"} 8"));
+    }
+
+    /// Bootstrap stage attribution reaches `/metrics`. `BootstrapOutcome`
+    /// counters used to stop at a log line, which is what made a slow
+    /// initial load unattributable
+    #[test]
+    fn render_exposes_bootstrap_stage_attribution() {
+        let snap = MetricsSnapshot {
+            bootstrap_bytes_tapped: 1 << 30,
+            bootstrap_pages_walked: 131_072,
+            bootstrap_files_skipped_unmapped: 297,
+            bootstrap_decode_seconds: 12.5,
+            bootstrap_channel_block_seconds: 3.25,
+            bootstrap_tap_seconds: 0.0,
+            inserter_ch_seconds_total: 41.5,
+            oracle_resolve_seconds_total: 8.25,
+            ..MetricsSnapshot::default()
+        };
+        let body = render(&snap);
+        for want in [
+            "walshadow_bootstrap_bytes_tapped_total 1073741824",
+            "walshadow_bootstrap_pages_walked_total 131072",
+            "walshadow_bootstrap_files_skipped_unmapped_total 297",
+            "walshadow_bootstrap_decode_seconds_total 12.500",
+            "walshadow_bootstrap_channel_block_seconds_total 3.250",
+            "walshadow_bootstrap_tap_seconds_total 0.000",
+            "walshadow_inserter_ch_seconds_total 41.500",
+            "walshadow_oracle_resolve_seconds_total 8.250",
+        ] {
+            assert!(body.contains(want), "missing {want}");
+        }
     }
 
     /// Prometheus rejects a family declared twice; `descriptor_ambiguous_total`

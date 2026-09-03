@@ -20,7 +20,8 @@ rationale under `plans/` only when code cannot express it
 * [pinned_ddl_baseline.md](pinned_ddl_baseline.md) — schema-event outcome must be a function of config + baseline, not cache warmth: CH-existence / persisted-baseline options for cross-restart consistency, drop detection across downtime, opt-in mapping vs republish
 * [coverage100.md](coverage100.md) — drive `cargo llvm-cov` line coverage toward 100%: tiered work list (pure units → fixtures → live e2e → hard tail)
 * [FUZZ.md](FUZZ.md) — continuous coverage-guided fuzzing (cargo-fuzz/libFuzzer) across wal-rus + walshadow + clickhouse-c-rs: tiered targets, round-trip/differential oracles, C-boundary ASan, unattended-VM supervisor
+* [perf_regression.md](perf_regression.md) — performance measurement off CI machines: no wall-clock assertions in the suite, own workflow on dedicated hardware, `bench/` initial-load shape, disposable `benches/` microbenches, regression bands
 * [pipeline_backpressure_and_scaling.md](pipeline_backpressure_and_scaling.md) — parallel decode+insert pipeline: WAL-pump backpressure via wire/record split, decode/insert scaling (bootstrap Option B, hot-table sharding, N/M sizing); pipeline substrate in [emitter.md](../emitter.md)
 * [dependencies.md](dependencies.md) — crates.io replacement candidates for generic object storage, MPMC, retry, throttling, and metrics code
 * [risks.md](risks.md) — measurement-deferred risks and open questions
-* [parked.md](parked.md) — small operational polish + cross-major fixtures + skipped-test drive
+* [parked.md](parked.md) — small operational polish + walsender hardening (TLS/SCRAM, `hot_standby_feedback`)

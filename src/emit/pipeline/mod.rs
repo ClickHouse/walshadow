@@ -18,6 +18,7 @@ pub mod inserter;
 pub mod plan_spool;
 pub mod planner;
 pub mod reorder;
+pub mod resolver;
 pub mod tail;
 
 use std::sync::Arc;

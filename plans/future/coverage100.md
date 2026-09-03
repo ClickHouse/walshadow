@@ -97,6 +97,12 @@ Use existing in-proc and fixture paths. Extend
 Extend existing `WALSHADOW_USE_LOCAL` e2e tests. Keep live-state cases in
 existing harnesses rather than adding binaries
 
+Skip gates here are runtime, not `#[ignore]`: a suite checks for `initdb` /
+`pg_basebackup` / `clickhouse` on PATH and returns early when absent, so a
+job missing one reports the suite as passing while its lines stay uncovered
+for no visible reason. Read durations, a live suite that "passes" in ~0 s
+did not run
+
 - `shadow_catalog.rs::seed_from_source` and dependent closures: drive via
   `tests/catalog_seed.rs` / `tests/shadow_catalog.rs`
 - `ch_emitter.rs::reconnect`: explicit CH drop mid-stream

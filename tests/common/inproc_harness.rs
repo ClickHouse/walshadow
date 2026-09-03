@@ -725,7 +725,7 @@ async fn build_pipeline_inner(
     };
     let bridge_path = shadow.bridge_socket().expect("bridge configured");
     let bridge = Arc::new(
-        walshadow::bridge::connect_with_budget(bridge_path, Duration::from_secs(60))
+        walshadow::bridge::connect_with_budget(bridge_path, 1, Duration::from_secs(60))
             .await
             .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", bridge_path.display())),
     );

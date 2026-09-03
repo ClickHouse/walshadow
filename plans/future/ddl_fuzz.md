@@ -55,6 +55,8 @@ limits from new interactions and gives shrinker stable endpoints
 | drop PK constraint, drop its column | CH still uses column in `ORDER BY`; CH DROP COLUMN fails after any earlier xact effects | preflight whole plan against target key |
 | add PK to table created keyless | CH retains `ORDER BY (_lsn)`; updates do not collapse by new PK | rebuild key or keep case unsupported |
 | `DROP TABLE; CREATE TABLE` with same name under each drop strategy | `retain` / `warn` preserve old rows and `CREATE IF NOT EXISTS` no-ops; `drop` should round-trip | encode policy-specific lifecycle oracle |
+| `DROP TABLE s.t CASCADE` with a dependent view, FK child or partition child | basic path emits the drop via `SchemaEvent` + `DrainEntry::Catalog`; dependent relations get no event of their own | decide whether cascaded relations follow the drop strategy or are left to drift |
+| `DROP TABLE s.t RESTRICT` refused by source, then DML on `s.t` | source rejects, so no WAL and no event; mapping must stay intact | assert a refused DDL leaves no destination effect |
 | `CREATE UNLOGGED TABLE; INSERT ...` | catalog may create CH table; user DML has no durable WAL | reject mapping or mark no-row policy explicitly |
 | `ALTER TABLE ... SET UNLOGGED`, mutate, `SET LOGGED` | unlogged interval disappears; stale CH rows can survive conversion | reject persistence transition |
 | attach populated partition, then write through parent | heap WAL names leaf; pinned parent target receives no fan-in and attach emits no row backfill | define partition routing/backfill semantics |

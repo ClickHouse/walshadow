@@ -49,7 +49,8 @@ use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
 use walshadow::backfill_bootstrap::{
-    BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
+    BootstrapConfig, BootstrapOutcome, BootstrapProgress, drain_backfill, seed_in_snapshot,
+    spawn_greenfield_bootstrap,
 };
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
@@ -385,6 +386,12 @@ struct Args {
     /// `dynamic_library_path`.
     #[arg(long)]
     bridge_lib_dir: Option<PathBuf>,
+    /// Bridge workers to run on a daemon-owned shadow, and sockets to pool
+    /// against. Each worker serves one request at a time, so a value below
+    /// the decode pool's width caps oracle throughput at that many
+    /// concurrent round trips whatever the daemon does.
+    #[arg(long, default_value_t = 1)]
+    bridge_workers: usize,
     /// Walsender bind address. `127.0.0.1:0` lets the kernel pick a free
     /// port, valid only for externally managed shadow (no
     /// `--bootstrap-shadow-data-dir`): operator reads
@@ -937,6 +944,7 @@ async fn run_session(
             .with_context(|| format!("ensure physical replication slot {slot}"))?;
         tracing::info!(target: "walshadow", slot, "physical replication slot ready");
     }
+    let mut bootstrap_progress: Option<BootstrapProgress> = None;
     let bootstrap_end_lsn: Option<u64> = if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
         if !args.skip_preflight {
             let source_sql = feed
@@ -952,11 +960,18 @@ async fn run_session(
             .into_result()
             .context("pre-flight rejected bootstrap")?;
         }
-        Some(
-            run_bootstrap(&cfg, &mut feed, args, &bootstrap_plan, ch_config.clone())
-                .await
-                .context("bootstrap")?,
+        let (end_lsn, progress) = run_bootstrap(
+            &cfg,
+            &mut feed,
+            args,
+            &bootstrap_plan,
+            ch_config.clone(),
+            &metrics,
         )
+        .await
+        .context("bootstrap")?;
+        bootstrap_progress = Some(progress);
+        Some(end_lsn)
     } else {
         None
     };
@@ -1247,7 +1262,7 @@ async fn run_session(
     let connect_budget = Duration::from_secs(args.shadow_connect_timeout);
     let bridge_path = args.bridge_socket_path();
     let bridge = Arc::new(
-        walshadow::bridge::connect_with_budget(&bridge_path, connect_budget)
+        walshadow::bridge::connect_with_budget(&bridge_path, args.bridge_workers, connect_budget)
             .await
             .with_context(|| format!("connect bridge at {}", bridge_path.display()))?,
     );
@@ -1255,6 +1270,7 @@ async fn run_session(
     tracing::info!(
         target: "walshadow::bridge",
         socket = %bridge_path.display(),
+        workers = bridge.pool_size(),
         pg_version = info.map(|i| i.pg_version_num).unwrap_or(0),
         in_recovery = info.map(|i| i.in_recovery).unwrap_or(false),
         "bridge connected",
@@ -1729,6 +1745,7 @@ async fn run_session(
             addr = %addr,
             decoders,
             inserters,
+            resolvers = bridge.pool_size(),
             "parallel decode+insert pipeline starting",
         );
         PipelineConfig {
@@ -2672,6 +2689,7 @@ async fn run_session(
             &desc_log,
             metrics_resolver.as_deref(),
             metrics_backfiller.as_deref(),
+            bootstrap_progress.as_ref(),
         )
         .await;
         if advanced {
@@ -3318,6 +3336,7 @@ async fn populate_metrics(
     desc_log: &walshadow::desc_log::DescriptorLog,
     config_resolver: Option<&ConfigResolver>,
     backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
+    bootstrap: Option<&BootstrapProgress>,
 ) {
     use std::collections::BTreeMap;
     use walshadow::record::rmgr_label;
@@ -3487,6 +3506,15 @@ async fn populate_metrics(
         inserter_batches_in_total: emitter_stats
             .map(|s| s.inserter_batches_in.load(Ordering::Relaxed))
             .unwrap_or(0),
+        inserter_ch_seconds_total: emitter_stats
+            .map(|s| s.inserter_ch_nanos.load(Ordering::Relaxed) as f64 / 1e9)
+            .unwrap_or(0.0),
+        inserter_encode_seconds_total: emitter_stats
+            .map(|s| s.inserter_encode_nanos.load(Ordering::Relaxed) as f64 / 1e9)
+            .unwrap_or(0.0),
+        oracle_resolve_seconds_total: emitter_stats
+            .map(|s| s.oracle_resolve_nanos.load(Ordering::Relaxed) as f64 / 1e9)
+            .unwrap_or(0.0),
         process_cpu_seconds_total: proc_cpu,
         process_resident_memory_bytes: proc_rss,
         emitter_xacts_total: emitter_stats
@@ -3497,6 +3525,9 @@ async fn populate_metrics(
             .unwrap_or(0),
         emitter_deletes_discarded: emitter_stats
             .map(|s| s.deletes_discarded.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        oracle_local_columns_total: emitter_stats
+            .map(|s| s.oracle_local_columns.load(Ordering::Relaxed))
             .unwrap_or(0),
         oracle_blocks_total: oracle_stats
             .map(|s| s.blocks.load(Ordering::Relaxed))
@@ -3590,6 +3621,10 @@ async fn populate_metrics(
         bridge_requests_by_op: bridge_ops(bridge_stats.map(|b| &b.requests)),
         bridge_errors_by_op: bridge_ops(bridge_stats.map(|b| &b.errors)),
         bridge_request_nanos_by_op: bridge_ops(bridge_stats.map(|b| &b.request_nanos)),
+        bridge_lock_wait_nanos_by_op: bridge_ops(bridge_stats.map(|b| &b.lock_wait_nanos)),
+        bridge_service_nanos_by_op: bridge_ops(bridge_stats.map(|b| &b.service_nanos)),
+        bridge_request_bytes_by_op: bridge_ops(bridge_stats.map(|b| &b.request_bytes)),
+        bridge_response_bytes_by_op: bridge_ops(bridge_stats.map(|b| &b.response_bytes)),
         bridge_reconnects_total: bridge_gauge(bridge_stats, |b| &b.reconnects),
         bridge_scan_rows_total: bridge_gauge(bridge_stats, |b| &b.scan_rows),
         bridge_scan_replay_moved_total: bridge_gauge(bridge_stats, |b| &b.scan_replay_moved),
@@ -3597,8 +3632,30 @@ async fn populate_metrics(
             &b.scan_subtrans_mismatch
         }),
         bridge_native_bytes_total: bridge_gauge(bridge_stats, |b| &b.native_bytes),
+        ..bootstrap_gauges(bootstrap)
     };
     registry.set(snap).await;
+}
+
+/// Bootstrap stage attribution, frozen at its final values once the pump
+/// returns. Rendered for the whole session so a slow initial load stays
+/// attributable after the fact
+fn bootstrap_gauges(progress: Option<&BootstrapProgress>) -> MetricsSnapshot {
+    let Some(p) = progress else {
+        return MetricsSnapshot::default();
+    };
+    let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    MetricsSnapshot {
+        bootstrap_bytes_tapped: ld(&p.pump.bytes_tapped),
+        bootstrap_pages_walked: ld(&p.page_walk.pages_walked),
+        bootstrap_tuples_emitted: ld(&p.page_walk.tuples_emitted),
+        bootstrap_files_walked: ld(&p.page_walk.files_walked),
+        bootstrap_files_skipped_unmapped: ld(&p.page_walk.files_skipped_unmapped),
+        bootstrap_decode_seconds: ld(&p.page_walk.decode_nanos) as f64 / 1e9,
+        bootstrap_tap_seconds: ld(&p.pump.sink_chunk_nanos) as f64 / 1e9,
+        bootstrap_channel_block_seconds: ld(&p.page_walk.channel_block_nanos) as f64 / 1e9,
+        ..MetricsSnapshot::default()
+    }
 }
 
 /// Zero when bridge stats are unavailable, so series stays present
@@ -4173,7 +4230,9 @@ async fn run_bootstrap(
     args: &Args,
     plan: &BootstrapPlan,
     ch_config: Option<EmitterConfig>,
-) -> Result<u64> {
+    metrics: &MetricsRegistry,
+) -> Result<(u64, BootstrapProgress)> {
+    let bootstrap_started = Instant::now();
     let shadow_data_dir = args
         .bootstrap_shadow_data_dir
         .clone()
@@ -4289,19 +4348,114 @@ async fn run_bootstrap(
             let (mapping, resolved) = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
                 .await
                 .context("bootstrap: build mapping")?;
-            Some((emitter_cfg, mapping, resolved))
+            // `initial_load = "none"` (table override, else namespace) opts a
+            // relation out of the greenfield snapshot: create it + stream CDC,
+            // but don't page-walk its existing rows.
+            let skip_initial: std::collections::HashSet<_> = drain_catalog
+                .descriptors()
+                .filter_map(|d| {
+                    let rn = &d.rel_name;
+                    let none = match emitter_cfg.table_initial_loads.get(rn) {
+                        Some(s) => s.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
+                        None => {
+                            resolved
+                                .namespaces
+                                .get(rn.namespace.as_ref())
+                                .and_then(|n| n.initial_load)
+                                == Some(InitialLoadMode::None)
+                        }
+                    };
+                    none.then(|| rn.clone())
+                })
+                .collect();
+            Some((emitter_cfg, mapping, resolved, skip_initial))
         }
         None => None,
     };
+
+    // Decline unmapped relations at `begin` so their pages never decode.
+    // Metrics-only (no CH) has no mapping to filter against, so it walks all
+    let (tap_filenodes, needs_oracle) = match &ch_target {
+        Some((_, mapping, resolved, skip_initial)) => {
+            let mapped = mapping.snapshot().await;
+            let walked = |rn: &RelName| mapped.contains_key(rn) && !skip_initial.contains(rn);
+            (
+                walshadow::backfill_bootstrap::tap_filenode_set(&drain_catalog, walked)
+                    .map(Arc::new),
+                walshadow::backfill::bootstrap_oracle::needs_oracle(
+                    &drain_catalog,
+                    &mapped,
+                    &resolved.column_rules,
+                    walked,
+                ),
+            )
+        }
+        None => (None, false),
+    };
+
+    // Off the backup window: provisioning is an initdb + pg_dump + apply +
+    // restart, and doing it after `BASE_BACKUP` opens parks a live backup
+    // through all of it — in object-store mode against walrus's 60 s request
+    // cap
+    let bootstrap_oracle = if needs_oracle {
+        let source_conninfo = format!(
+            "host={} port={} user={} dbname={} sslmode={}",
+            src_cfg.host,
+            src_cfg.port,
+            src_cfg.user,
+            src_cfg.database,
+            if src_cfg.sslmode == SslMode::Disable {
+                "disable"
+            } else {
+                "prefer"
+            },
+        );
+        Some(
+            walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
+                args.spill_dir.join("bootstrap_oracle"),
+                source_conninfo,
+                src_cfg.password.clone(),
+                args.bridge_lib_dir.clone(),
+                args.bridge_workers,
+                Duration::from_secs(args.shadow_connect_timeout),
+            )
+            .await
+            .context(
+                "bootstrap oracle: greenfield needs it to resolve tier-3 types; \
+                 refusing to load empty columns",
+            )?,
+        )
+    } else {
+        None
+    };
+    let oracle = bootstrap_oracle.as_ref().map(|o| o.oracle());
 
     prepare_bootstrap_dir(&shadow_data_dir)
         .await
         .context("prepare shadow data dir for bootstrap")?;
 
-    let cfg = BootstrapConfig::new(shadow_data_dir.clone());
+    let mut cfg = BootstrapConfig::new(shadow_data_dir.clone());
+    if let Some(set) = tap_filenodes {
+        cfg = cfg.with_tap_filenodes(set);
+    }
+    let progress = cfg.progress.clone();
+    // Only writer of the registry until the status loop starts, so a plain
+    // gauge-only snapshot is the whole surface here
+    let ticker = tokio::spawn({
+        let metrics = metrics.clone();
+        let progress = progress.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                metrics.set(bootstrap_gauges(Some(&progress))).await;
+            }
+        }
+    });
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
 
-    let (shipped, outcome) = if let Some((emitter_cfg, mapping, resolved)) = ch_target {
+    let (shipped, outcome) = if let Some((emitter_cfg, mapping, resolved, skip_initial)) = ch_target
+    {
         // Route bootstrap rows through the shared insert tail. Bootstrap
         // is the easy case: every row op=Insert at _lsn = start_lsn, no
         // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
@@ -4315,41 +4469,6 @@ async fn run_bootstrap(
         let fatal = Fatal::new();
         let inserter_pool_size = emitter_cfg.inserter_pool_size;
 
-        let source_conninfo = format!(
-            "host={} port={} user={} dbname={} sslmode={}",
-            src_cfg.host,
-            src_cfg.port,
-            src_cfg.user,
-            src_cfg.database,
-            if src_cfg.sslmode == SslMode::Disable {
-                "disable"
-            } else {
-                "prefer"
-            },
-        );
-        let bootstrap_oracle = if walshadow::backfill::bootstrap_oracle::needs_oracle(
-            &drain_catalog,
-            &mapping.snapshot().await,
-            &resolved.column_rules,
-        ) {
-            Some(
-                walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
-                    args.spill_dir.join("bootstrap_oracle"),
-                    source_conninfo,
-                    src_cfg.password.clone(),
-                    args.bridge_lib_dir.clone(),
-                    Duration::from_secs(args.shadow_connect_timeout),
-                )
-                .await
-                .context(
-                    "bootstrap oracle: greenfield needs it to convert oracle columns; \
-                     refusing to load empty columns",
-                )?,
-            )
-        } else {
-            None
-        };
-
         let (msg_tx, ack, tail) = tail::spawn_with_config(
             &emitter_cfg,
             inserter_pool_size,
@@ -4357,7 +4476,7 @@ async fn run_bootstrap(
             emitter_ack,
             fatal.clone(),
             None,
-            bootstrap_oracle.as_ref().map(|o| o.oracle()),
+            oracle,
         )
         .await
         .context("bootstrap: spawn insert tail")?;
@@ -4367,27 +4486,6 @@ async fn run_bootstrap(
             inserters = inserter_pool_size,
             "bootstrap insert tail started",
         );
-
-        // `initial_load = "none"` (table override, else namespace) opts a
-        // relation out of the greenfield snapshot: create it + stream CDC, but
-        // don't page-walk its existing rows.
-        let skip_initial: std::collections::HashSet<_> = drain_catalog
-            .descriptors()
-            .filter_map(|d| {
-                let rn = &d.rel_name;
-                let none = match emitter_cfg.table_initial_loads.get(rn) {
-                    Some(s) => s.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
-                    None => {
-                        resolved
-                            .namespaces
-                            .get(rn.namespace.as_ref())
-                            .and_then(|n| n.initial_load)
-                            == Some(InitialLoadMode::None)
-                    }
-                };
-                none.then(|| rn.clone())
-            })
-            .collect();
 
         let deferred_path = args.spill_dir.join("bootstrap_deferred.bin");
         tokio::fs::remove_file(&deferred_path).await.ok();
@@ -4442,18 +4540,33 @@ async fn run_bootstrap(
         (shipped, outcome)
     };
 
+    let ld = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
     tracing::info!(
         target: "walshadow::bootstrap",
         start_lsn = format_pg_lsn(outcome.start.start_lsn).to_string(),
         end_lsn = format_pg_lsn(outcome.end.end_lsn).to_string(),
         timeline = outcome.start.timeline,
-        kept_files = outcome.disk.kept_files,
-        skipped_denylist = outcome.disk.skipped_denylist,
-        files_walked = outcome.page_walk.files_walked,
-        tuples_emitted = outcome.page_walk.tuples_emitted,
+        kept_files = ld(&outcome.disk.kept_files),
+        skipped_denylist = ld(&outcome.disk.skipped_denylist),
+        files_walked = ld(&outcome.page_walk.files_walked),
+        tuples_emitted = ld(&outcome.page_walk.tuples_emitted),
         drained = shipped,
         "bootstrap landed",
     );
+    // Stage attribution: which of tap, decode or emitter drain owned the
+    // wall clock. Sum exceeds elapsed under source parallelism
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        elapsed_secs = bootstrap_started.elapsed().as_secs_f64(),
+        bytes_tapped = ld(&outcome.pump.bytes_tapped),
+        pages_walked = ld(&outcome.page_walk.pages_walked),
+        tap_secs = ld(&outcome.pump.sink_chunk_nanos) as f64 / 1e9,
+        decode_secs = ld(&outcome.page_walk.decode_nanos) as f64 / 1e9,
+        channel_block_secs = ld(&outcome.page_walk.channel_block_nanos) as f64 / 1e9,
+        files_skipped_unmapped = ld(&outcome.page_walk.files_skipped_unmapped),
+        "bootstrap stage timings",
+    );
+    ticker.abort();
 
     if let Some((settings, storage)) = wal_hydrate {
         fetch_wal_into_pg_wal(
@@ -4484,7 +4597,7 @@ async fn run_bootstrap(
         .await
         .context("clear completed bootstrap marker")?;
 
-    Ok(outcome.end.end_lsn)
+    Ok((outcome.end.end_lsn, progress))
 }
 
 /// Routing map for the bootstrap drain: explicit `[table.*]` seeded up front,
@@ -4644,6 +4757,7 @@ fn build_owned_shadow(args: &Args, data_dir: PathBuf) -> Shadow {
     let mut bridge = walshadow::shadow::BridgeConf::in_dir(&cfg.socket_dir);
     bridge.socket_path = args.bridge_socket_path();
     bridge.library_dir = args.bridge_lib_dir.clone();
+    bridge.workers = args.bridge_workers;
     cfg.bridge = Some(bridge);
     Shadow::new(cfg)
 }

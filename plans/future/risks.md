@@ -66,6 +66,32 @@ not from source. Source on tzdata 2023d, shadow's host on tzdata
 2024a, divergence on rare-but-real timestamp tzname output.
 Mitigation: pin tzdata version at deploy time. Not enforced
 
+## Cross-major commit-record tail walk
+
+A commit record's tail is variable-shape: `xl_xact_commit` appends
+subxact array, dropped-stats items, relfilelocators, invalidation
+messages, twophase gid and origin, each behind its `xl_xact_xinfo` bit.
+Reaching a later field means skipping every earlier one at the right
+width, so a wrong width reads a valid-looking record wrong and CRC
+catches nothing: the bytes are intact, the interpretation is not
+
+The shape does move. `xl_xact_stats_item` went 12 → 16 bytes in PG 18
+(PostgreSQL commit `b14e9ce7d55`, `PgStat_HashKey.objid` widened to 8
+bytes carried as two `uint32`), and the `SysCacheIdentifier` values the
+invalidation walk matches on shifted 35/36 → 37/38 in the same major.
+[`src/decode/wal_xact.rs`](../../src/decode/wal_xact.rs) branches on
+`page_magic` for both. `MULTI_INSERT` carries the same class of exposure,
+its per-tuple walk reads header flags rather than a fixed stride
+
+Risk is a per-major branch that no test pins, so the next widening or id
+shift is silent on exactly one major. Mitigation is fixture pinning
+through [`tests/classify_fixture.rs`](../../tests/classify_fixture.rs):
+capture a commit record with every `xinfo` bit set (subxacts, dropped
+stats, relfilelocators, `XACT_XINFO_HAS_INVALS`, origin) plus a
+`MULTI_INSERT` batch, on 16 / 17 / 18, and assert each major's walk lands
+on the same fields. Capture is already scripted per major; the snapshots
+are what is missing
+
 ## Path A CRC at >1 GB/s WAL
 
 Filter rewrites every kept record's CRC32C; today single-threaded.
@@ -77,8 +103,8 @@ classification). Defer thread pool until measurement demands.
 overview.md pitfall #8 flagged this
 
 Zero-copy framing already cut allocator pressure off the hot path;
-CRC is the next bottleneck if `criterion` benchmarks land and
-surface it. Bench is itself deferred, see [parked.md](parked.md)
+CRC is the next bottleneck once a bench surfaces it, see
+[perf_regression.md](perf_regression.md)
 
 ## PG fork temptation
 

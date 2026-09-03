@@ -77,6 +77,17 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 tracing-opentelemetry = { version = "0.33", default-features = false }
 mimalloc = "0.1.52"
 
+# `harness = false` throughout: these take shape flags rather than libtest
+# filters. Bootstrap pump + drain needs no PG and no CH; oracle batch needs
+# a shadow PG for its roundtrip stage only
+[[bench]]
+name = "bootstrap_pump"
+harness = false
+
+[[bench]]
+name = "oracle_batch"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"
 # Enable paused time for batch deadline tests

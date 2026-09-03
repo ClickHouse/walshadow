@@ -43,9 +43,10 @@ for rendered diagram. Five clusters top→bottom:
    - user heap → `PageWalkSink` (Tap) → decoded 8 KiB at a time
    - denylist contents → Skip; denylist dir entries themselves → Keep
      as empty dirs
-3. **Drain → CH** (concurrent with step 2) — `PageWalkSink` ships
-   `BackfillTuple`s through bounded mpsc (`BOOTSTRAP_TUPLE_CHANNEL_CAP
-   = 256`, backpressures the tar pump) to
+3. **Drain → CH** (concurrent with step 2) — each `PageWalkEntry` ships
+   slabs of `BackfillTuple`s through a bounded mpsc
+   (`BOOTSTRAP_TUPLE_CHANNEL_CAP` slabs of `SLAB_BYTES`, backpressures
+   the tar pump) to
    `pipeline::bootstrap::drain`, which synthesizes rows
    `{ op=Insert, commit_lsn=start_lsn }` against the snapshot
    `CatalogMap` and routes into the shared insert tail (batcher +
@@ -161,10 +162,15 @@ pub trait BackupSource: Send {
     async fn run(
         self: Box<Self>,
         data_dir: PathBuf,
-        sink: Arc<Mutex<dyn BackupSink>>,
+        sink: Arc<dyn BackupSink>,
+        stats: Arc<PumpStats>,
     ) -> Result<(StartInfo, EndInfo)>;
 }
 ```
+
+`stats` is the pump's stage attribution (`bytes_tapped`,
+`sink_chunk_nanos`), shared with the orchestrator so `/metrics` reads it
+while the pump runs.
 
 Public types:
 
@@ -180,9 +186,13 @@ Public types:
 - `FileMeta { path, size, mode, kind }` — `path` cluster-relative,
   sanitized against `..` / absolute-root at source-impl boundary
   (`tar_entry_meta` returns `Ok(None)` on parent-dir traversal)
-- `FileAction::{Keep, Skip, Tap}` — sink decision per `begin()`. Keep:
-  source writes body under `data_dir`; Skip: drain body unread; Tap:
-  stream body bytes through `chunk()` callbacks, nothing lands
+- `FileAction::{Keep, Skip, Tap(Box<dyn EntrySink>)}` — sink decision per
+  `begin()`. Keep: source writes body under `data_dir`; Skip: drain body
+  unread; Tap: source streams body bytes into the returned owned entry
+  sink, nothing lands
+- `EntrySink` — one tap entry's body consumer, `chunk` then `end`. Owned
+  by the source task driving that entry, so concurrent entries share no
+  lock on the body path
 
 Per-source guarantees in `src/backup_source.rs` module docs:
 
@@ -195,14 +205,20 @@ Per-source guarantees in `src/backup_source.rs` module docs:
 4. `finish()` fires after the last `end()`, carries `end_lsn`
 5. Paths are cluster-relative & traversal-safe
 
-Sink trait surface (`BackupSink`): `#[async_trait]` `start` / `begin`
-/ `chunk` / `end` / `finish`, `Send` so ObjectStore worker pool can
-share `Arc<Mutex<dyn BackupSink>>`. Async surface is load-bearing:
-`chunk` fires inside tokio runtime context source drives, and
-PageWalkSink's bounded `mpsc::Sender::send(...).await` there is what
-backpressures the tar pump against drain throughput (async surface +
-bounded channel exist precisely to get this bound; a sync trait +
-unbounded channel would not)
+Sink trait surface (`BackupSink`): `#[async_trait]` `start` / `begin` /
+`finish`, all `&self`, `Send + Sync` so the ObjectStore worker pool
+shares one `Arc<dyn BackupSink>` with no lock. Routing reads immutable
+state and bumps atomics; the body path lives on the per-entry
+`EntrySink` the `Tap` decision hands back. A sink that instead held a
+shared lock across a body read would serialize every other entry behind
+it, which is why the decision is owned rather than a lookup.
+
+Async surface is load-bearing: `EntrySink::chunk` fires inside the tokio
+runtime context the source drives, and `PageWalkEntry`'s bounded
+`mpsc::Sender::send(...).await` there is what backpressures the tar pump
+against drain throughput (async surface + bounded channel exist
+precisely to get this bound; a sync trait + unbounded channel would
+not)
 
 ## Two source impls
 
@@ -246,10 +262,19 @@ primitives against `DynStorage` bucket (wal-g-compatible layout):
   (default `min(4, num_cpus)`, overridden by
   `--bootstrap-object-store-parallelism` / `[bootstrap]
   object_store_parallelism` when either is set) via `buffer_unordered`,
-  sharing `Arc<Mutex<dyn BackupSink>>`
+  sharing one `Arc<dyn BackupSink>`. Parallelism reaches the page walk
+  because each part's tap entries own their own walk state
+  (`benches/bootstrap_pump.rs` measures it)
 - `pg_control` parts run as hard barrier after every data part drains
   — `for key in &control_parts` single-task loop. Multiple control
   parts is unusual (wal-g emits exactly one) but loop handles it
+
+Part bodies spool to scratch before decode (`spool_backup_part`) so the GET
+completes at network speed. Per-entry tap sinks removed the shared-lock
+stall the spool was also covering, but it stays: the pipeline downstream
+backpressures on ClickHouse by design, and a live body held for however
+long CH is the limiter exceeds walrus's 60 s request cap. Costs
+`parallelism × part_size` of scratch, compressed
 
 V1 constraint: delta chains error out. Incremented files need
 disk-resident base to overlay onto via wal-rus's
@@ -329,18 +354,37 @@ in which case body drops unread — `PageWalkSink::begin` does this for
 `pg_control` etc that arrive at user-heap-looking paths or for files
 whose path does not parse as `base/<db>/<filenode>`
 
-Stats recovery: orchestrator holds two `Arc` clones to same
-`Mutex<MultiplexSink<PageWalkSink>>` — one typed for stats teardown &
-one erased (`Arc<Mutex<dyn BackupSink>>`) for source call. `Mutex<dyn
-?Sized>::into_inner` does not exist (unsized inner); `Arc::try_unwrap`
-on typed clone after source returns recovers both inner sinks for
-stats reporting
+Stats are atomics on `Arc` handles the orchestrator keeps beside the
+sink (`BootstrapProgress { pump, page_walk }`, `DiskLanderStats`), so the
+sink never has to come back out of the source and `/metrics` reads the
+counters while the pump runs. Dropping the last sink `Arc` closes the
+tuple-channel sender, which is how a concurrent drain sees EOF
 
 ## PageWalkSink
 
-`src/backup_page_walk.rs`. 2A initial-load: Tap user-heap file bodies,
-accumulate 8 KiB at a time, walk each full page's `ItemIdData` slots,
-decode live tuples through same heap decoder WAL hot path uses
+`src/backup_page_walk.rs`. 2A initial-load: `PageWalkSink::begin`
+resolves the segment's descriptor and hands back a `PageWalkEntry` that
+owns the walk. The entry accumulates body bytes into a `SLAB_BYTES`
+slab, walks every complete page in place out of it, carries only a
+sub-page remainder into the next slab, and decodes live tuples through
+the same heap decoder the WAL hot path uses.
+
+Two slabs ping-pong per entry: the walk runs on `spawn_blocking` (pure
+CPU over a byte slice, no async in it) with at most one in flight, so
+the tar reader refills one slab while the other decodes and the async
+runtime keeps its workers for the drain stage. Walking in place is what
+removes the per-page 8 KiB allocation plus buffer memmove a
+`drain(..PAGE_BYTES)` per page costs.
+
+Per-page counters accumulate in a plain `PageWalkTally` and publish into
+the atomic `PageWalkStats` once per slab: a `fetch_add` per tuple, on a
+line the reader task also touches, costs more than the decode it counts.
+
+`begin` also applies the mapped-filenode filter when the orchestrator
+passes one (`tap_filenodes`): a relation no mapping routes returns
+`Skip`, so its bytes drain off the wire and its pages never decode.
+`skip_initial` in the drain stays the authority; the set is a superset
+filter, not a second source of truth
 
 `heap_decoder::decode_block_data` is exposed as `pub(crate)` for this
 consumer. On-disk tuple shape carries full `HeapTupleHeaderData` (23
@@ -362,10 +406,12 @@ decoder, exercised from two callers
   failures bump `tuples_skipped_truncated` so a single torn page does
   not abort whole bootstrap
 
-`BackfillTuple { rfn, xid, source_lsn, columns }` ships over bounded
-mpsc (`BOOTSTRAP_TUPLE_CHANNEL_CAP`) to orchestrator's drain task.
-`source_lsn` is `StartInfo::start_lsn` for every emitted row — every
-backfill row tags identically
+`BackfillTuple { rfn, xid, source_lsn, columns }` ships in slabs over a
+bounded mpsc (`BOOTSTRAP_TUPLE_CHANNEL_CAP` slabs) to the
+orchestrator's drain task. One channel hop per walk slab, not per
+tuple; `SLAB_BYTES × CAP` bounds the heap payload in flight per
+concurrent segment. `source_lsn` is `StartInfo::start_lsn` for every
+emitted row — every backfill row tags identically
 
 V1 limits:
 
@@ -391,6 +437,12 @@ V1 limits:
   [TOAST.md](TOAST.md)
 - **No 2C CH-side COPY load.** PageWalkSink (2A) is the sole
   initial-load path; see [Why not 2C](#why-not-2c-ch-side-copy-load) below
+
+`pipeline::bootstrap::drain` coalesces routed rows into
+`BatcherMsg::Rows` on the same row/byte dual trigger the streaming
+decode pool uses, so a walk slab costs one batcher hop rather than one
+per row. The open seq's buffer flushes at an rfn flip before
+`placed(prev_seq, rows)` publishes its expected count.
 
 Rfn contiguity buys seq economy, not correctness: `PageWalkSink`
 emits all rows for one rfn contiguously before moving on, so
@@ -440,7 +492,7 @@ is the only shape with bounded memory at scale
 - `seed_in_snapshot(client) -> CatalogMap` — REPEATABLE READ wrapper
   around `seed_catalog_from_source`. Always COMMITs (read-only xact;
   commit-vs-rollback is purely about releasing snapshot)
-- `spawn_greenfield_bootstrap(cfg, source, catalog_map) -> (mpsc::Receiver<BackfillTuple>, JoinHandle<Result<BootstrapOutcome>>)` —
+- `spawn_greenfield_bootstrap(cfg, source, catalog_map) -> (mpsc::Receiver<Vec<BackfillTuple>>, JoinHandle<Result<BootstrapOutcome>>)` —
   streaming primitive. Caller drains concurrently with source pump;
   bounded channel backpressures pump against drain rate, so memory is
   bounded by `BOOTSTRAP_TUPLE_CHANNEL_CAP`, not source tuple count.
@@ -561,6 +613,27 @@ Synchronous `pg_ctl` and `psql` commands run inside
 `--bootstrap-shadow-replay-timeout` (default 300 s) limits post-bootstrap
 wait. `--shadow-socket-dir` and `--shadow-port` configure shadow
 listener used later by `ShadowCatalog`
+
+## Stage attribution
+
+`BootstrapProgress` carries the pump's and walk's atomic counters; a ticker
+publishes them into `/metrics` while the pump runs and the status loop keeps
+rendering their final values afterwards, so a slow initial load stays
+attributable after the fact. One `bootstrap stage timings` log line at the
+end carries the same numbers:
+
+- `walshadow_bootstrap_bytes_tapped_total`,
+  `walshadow_bootstrap_pages_walked_total`,
+  `walshadow_bootstrap_tuples_emitted_total`,
+  `walshadow_bootstrap_files_walked_total` — what moved
+- `walshadow_bootstrap_files_skipped_unmapped_total` — segments declined at
+  `begin` because no mapping routes them
+- `walshadow_bootstrap_decode_seconds_total` — CPU in the page walk
+- `walshadow_bootstrap_channel_block_seconds_total` — the walk waiting on a
+  free tuple-channel slot, ie emitter drain time seen by the walk
+- `walshadow_bootstrap_tap_seconds_total` — time inside the tap entry:
+  page framing, decode, channel send. Against `decode_seconds` this is
+  the tap's own overhead
 
 ## Cross-links
 

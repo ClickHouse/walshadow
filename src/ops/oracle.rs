@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, SliceIo};
 
 use crate::decode::heap_decoder::ColumnValue;
-use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES};
+use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
 use crate::schema::RelAttr;
 
 /// Cell tags, matching `WS_CELL_*` in `pgext/walshadow.h`
@@ -71,6 +71,7 @@ pub struct OracleColumnBuf {
     pub source_typmod: i32,
     cells: Vec<OracleCell>,
     wire_bytes: usize,
+    literal_only: bool,
 }
 
 impl OracleColumnBuf {
@@ -80,12 +81,21 @@ impl OracleColumnBuf {
             source_typmod,
             cells: Vec::new(),
             wire_bytes: 0,
+            literal_only: true,
         }
     }
 
     pub fn push(&mut self, cell: OracleCell) {
+        self.literal_only &= matches!(cell, OracleCell::Literal(_) | OracleCell::Default);
         self.wire_bytes += cell.wire_bytes();
         self.cells.push(cell);
+    }
+
+    /// No cell needs a source type: each is either bytes the daemon already
+    /// rendered or a default. Against a `String` target such a column would
+    /// cross to PG only to be handed straight back
+    pub fn literal_only(&self) -> bool {
+        self.literal_only
     }
 
     pub fn cells(&self) -> &[OracleCell] {
@@ -141,6 +151,12 @@ impl Oracle {
         }
     }
 
+    /// Requests the shadow answers at once, ie the bridge's pool width. One
+    /// worker serves one request per loop iteration
+    pub fn concurrency(&self) -> usize {
+        self.bridge.pool_size()
+    }
+
     pub async fn encode_batch(
         &self,
         columns: &[OracleRequestColumn<'_>],
@@ -158,8 +174,11 @@ impl Oracle {
                 )));
             }
         }
-        let payload = encode_request(columns, n_rows);
-        let response = match self.bridge.encode_native(&payload).await {
+        let response = match self
+            .bridge
+            .encode_native(encode_request(columns, n_rows))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 if matches!(e, BridgeError::Remote(_)) {
@@ -201,13 +220,16 @@ pub const ORACLE_BATCH_SEAL_BYTES: usize = 32 << 20;
 
 const _: () = assert!(ORACLE_BATCH_SEAL_BYTES <= MAX_REQUEST_BYTES);
 
-/// Encode all column metadata before row-major cells
+/// Encode all column metadata before row-major cells, past the bridge's
+/// unwritten frame prefix. Seal bytes reach 32 MiB, so building into the
+/// frame rather than into a payload the bridge then copies saves one
+/// allocation and one memcpy of the whole request
 fn encode_request(columns: &[OracleRequestColumn<'_>], n_rows: usize) -> Vec<u8> {
     let size: usize = columns
         .iter()
         .map(|c| request_column_bytes(c.name, c.target_type) + c.buf.approx_size())
         .sum();
-    let mut out = Vec::with_capacity(8 + size);
+    let mut out = request_frame(8 + size);
     out.extend_from_slice(&(n_rows as u32).to_be_bytes());
     out.extend_from_slice(&(columns.len() as u32).to_be_bytes());
     for c in columns {
@@ -364,6 +386,7 @@ impl OracleStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::bridge::FRAME_PREFIX_BYTES;
 
     fn col<'a>(
         ordinal: u32,
@@ -390,7 +413,7 @@ mod tests {
         let cols = [col(0, "t", "Array(Int32)", &a), col(3, "j", "JSON", &b)];
 
         let out = encode_request(&cols, 2);
-        let mut c = 0;
+        let mut c = FRAME_PREFIX_BYTES;
         let u32_at = |c: &mut usize| {
             let v = u32::from_be_bytes(out[*c..*c + 4].try_into().unwrap());
             *c += 4;
@@ -439,7 +462,7 @@ mod tests {
         buf.push(OracleCell::DiskRaw(vec![1, 2, 3]));
         let cols = [col(7, "payload", "Nullable(JSON)", &buf)];
         assert_eq!(
-            encode_request(&cols, 2).len() + 1, // opcode the bridge prepends
+            encode_request(&cols, 2).len() + 1 - FRAME_PREFIX_BYTES,
             REQUEST_FRAME_BYTES
                 + request_column_bytes("payload", "Nullable(JSON)")
                 + buf.approx_size()

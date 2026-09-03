@@ -284,14 +284,25 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
     // base/<dbid>/ + global/. Use a generous lower bound rather than
     // a tight count: PG version drift changes the exact number.
     assert!(
-        outcome.disk.kept_files > 100,
+        outcome
+            .disk
+            .kept_files
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 100,
         "expected >100 catalog files landed, got {}; \
          tuned for PG initdb expectations — bump or investigate \
          a regression",
-        outcome.disk.kept_files,
+        outcome
+            .disk
+            .kept_files
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
     assert!(
-        outcome.disk.skipped_denylist > 0,
+        outcome
+            .disk
+            .skipped_denylist
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
         "no denylist files skipped — expected at least one under pg_replslot/ or pg_stat_tmp/",
     );
 
@@ -325,23 +336,49 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
 
     // --- PageWalkSink stats ---
     assert!(
-        outcome.page_walk.files_seen > 0,
+        outcome
+            .page_walk
+            .files_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
         "no user-heap files observed by the tap",
     );
     assert!(
-        outcome.page_walk.files_walked > 0,
+        outcome
+            .page_walk
+            .files_walked
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
         "no user-heap files walked (filenode mismatch with CatalogMap?)",
     );
-    assert!(outcome.page_walk.pages_walked > 0, "no heap pages walked",);
     assert!(
-        outcome.page_walk.tuples_emitted >= N_ROWS as u64,
+        outcome
+            .page_walk
+            .pages_walked
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "no heap pages walked",
+    );
+    assert!(
+        outcome
+            .page_walk
+            .tuples_emitted
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= N_ROWS as u64,
         "expected >= {N_ROWS} tuples emitted from page walk, got {}",
-        outcome.page_walk.tuples_emitted,
+        outcome
+            .page_walk
+            .tuples_emitted
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
 
     // --- Drain delivered every tuple ---
     assert_eq!(
-        shipped, outcome.page_walk.tuples_emitted,
+        shipped,
+        outcome
+            .page_walk
+            .tuples_emitted
+            .load(std::sync::atomic::Ordering::Relaxed),
         "drain count != page walk emit count — channel dropped tuples"
     );
 

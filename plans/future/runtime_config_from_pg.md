@@ -157,6 +157,7 @@ behind it, distinct from knobs resolved by [`src/config.rs`](../../src/config.rs
 |---|---|---|---|
 | `engine` / `order_by` | table, namespace | text | fixed in `ch_ddl` (engine hardcoded `ReplacingMergeTree`, order_by derived from PK/replica-identity index); shape change, needs rfn drain + `TablePlan` rebuild |
 | `exclude` | column | bool | `ColumnMapping` has no such field; drops a column from projection + future DDL; shape change |
+| `truncate_strategy` | table, namespace | text | `passthrough` (today's single `TRUNCATE TABLE <dest>` per relation) or `ignore`; non-shape key, defer until a downstream consumer asks |
 | `ch_settings` | global, namespace, table | jsonb | applied to INSERT/CREATE TABLE, merged narrow-wins |
 | `sample_rate` | (TOML only) | float | emitter row-drop sampling for debug, distinct from the `--validate` oracle sampler in `src/oracle.rs` |
 | `signal_prefix` | (TOML only) | text | which `pg_logical_emit_message` prefix to scan |

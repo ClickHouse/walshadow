@@ -181,12 +181,23 @@ async fn direct_source_self_hosted_via_replication_protocol() {
 
     // DiskLanderSink coverage
     assert!(
-        outcome.disk.kept_files > 100,
+        outcome
+            .disk
+            .kept_files
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 100,
         "expected >100 catalog files landed, got {}",
-        outcome.disk.kept_files,
+        outcome
+            .disk
+            .kept_files
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
     assert!(
-        outcome.disk.skipped_denylist > 0,
+        outcome
+            .disk
+            .skipped_denylist
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
         "no denylist files skipped — expected at least one under pg_replslot/ or pg_stat_tmp/",
     );
 
@@ -214,15 +225,46 @@ async fn direct_source_self_hosted_via_replication_protocol() {
     );
 
     // PageWalkSink stats
-    assert!(outcome.page_walk.files_seen > 0);
-    assert!(outcome.page_walk.files_walked > 0);
-    assert!(outcome.page_walk.pages_walked > 0);
     assert!(
-        outcome.page_walk.tuples_emitted >= N_ROWS as u64,
-        "expected >= {N_ROWS} tuples emitted from page walk, got {}",
-        outcome.page_walk.tuples_emitted,
+        outcome
+            .page_walk
+            .files_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
     );
-    assert_eq!(shipped, outcome.page_walk.tuples_emitted);
+    assert!(
+        outcome
+            .page_walk
+            .files_walked
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    );
+    assert!(
+        outcome
+            .page_walk
+            .pages_walked
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    );
+    assert!(
+        outcome
+            .page_walk
+            .tuples_emitted
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= N_ROWS as u64,
+        "expected >= {N_ROWS} tuples emitted from page walk, got {}",
+        outcome
+            .page_walk
+            .tuples_emitted
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    assert_eq!(
+        shipped,
+        outcome
+            .page_walk
+            .tuples_emitted
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // CommittedTuple shape
     let mut int_ids: HashSet<i32> = HashSet::new();

@@ -13,6 +13,7 @@ use crate::column_rules::ColumnRules;
 use crate::emit::ch_emitter::TablePlan;
 use crate::mapping::{MappingSnapshot, SystemColumns};
 use crate::ops::oracle::Oracle;
+use crate::schema::RelName;
 
 const ORACLE_PORT: u16 = 55440;
 
@@ -28,6 +29,7 @@ impl BootstrapOracle {
         source_conninfo: String,
         source_password: Option<String>,
         bridge_lib_dir: Option<PathBuf>,
+        workers: usize,
         connect_budget: Duration,
     ) -> Result<Self> {
         let data_dir = base_dir.join("pg");
@@ -57,6 +59,7 @@ impl BootstrapOracle {
             let mut bridge = BridgeConf::in_dir(&b_sock);
             bridge.socket_path = b_bridge;
             bridge.library_dir = bridge_lib_dir;
+            bridge.workers = workers;
             let cfg_b = oracle_cfg(&b_data, &b_base, &b_sock, Some(bridge));
             let b = Shadow::new(cfg_b);
             b.write_base_conf().context("serve conf")?;
@@ -67,9 +70,10 @@ impl BootstrapOracle {
         .context("bootstrap oracle provision task")?
         .context("bootstrap oracle provision")?;
 
-        let bridge = crate::ops::bridge::connect_with_budget(&bridge_socket, connect_budget)
-            .await
-            .context("bootstrap oracle bridge connect")?;
+        let bridge =
+            crate::ops::bridge::connect_with_budget(&bridge_socket, workers, connect_budget)
+                .await
+                .context("bootstrap oracle bridge connect")?;
         Ok(Self {
             shadow,
             oracle: Arc::new(Oracle::new(Arc::new(bridge))),
@@ -124,19 +128,28 @@ fn run_pg_dump(conninfo: &str, password: Option<&str>) -> Result<String> {
     String::from_utf8(out.stdout).context("pg_dump output not utf8")
 }
 
+/// Provisioning costs an `initdb` + `pg_dump` + apply + restart, so gate it
+/// on the relations that actually reach ClickHouse. `walked` narrows the
+/// mapped set further to what the greenfield snapshot page-walks: an
+/// `initial_load = "none"` relation ships no bootstrap row, so its oracle
+/// columns are not a reason to stand up a side Postgres
 pub fn needs_oracle(
     catalog: &CatalogMap,
     tables: &MappingSnapshot,
     column_rules: &ColumnRules,
+    walked: impl Fn(&RelName) -> bool,
 ) -> bool {
     let alloc = Allocator::stdlib();
     let system = SystemColumns::default();
-    catalog.descriptors().any(|desc| {
-        tables.get(&desc.rel_name).is_some_and(|mapping| {
-            TablePlan::build(alloc, desc, mapping, column_rules, &system)
-                .map_or(true, |plan| plan.needs_oracle())
+    catalog
+        .descriptors()
+        .filter(|d| walked(&d.rel_name))
+        .any(|desc| {
+            tables.get(&desc.rel_name).is_some_and(|mapping| {
+                TablePlan::build(alloc, desc, mapping, column_rules, &system)
+                    .map_or(true, |plan| plan.needs_oracle())
+            })
         })
-    })
 }
 
 #[cfg(test)]
@@ -230,7 +243,7 @@ mod tests {
             "Nullable(JSON)",
             "premise: default bridge maps json to a composite CH target",
         );
-        assert!(needs_oracle(&catalog, &tables, &rules));
+        assert!(needs_oracle(&catalog, &tables, &rules, |_| true));
     }
 
     #[test]
@@ -243,7 +256,7 @@ mod tests {
             ]),
             &rules,
         );
-        assert!(!needs_oracle(&catalog, &tables, &rules));
+        assert!(!needs_oracle(&catalog, &tables, &rules, |_| true));
     }
 
     #[test]
@@ -256,13 +269,27 @@ mod tests {
             ]),
             &rules,
         );
-        assert!(needs_oracle(&catalog, &tables, &rules));
+        assert!(needs_oracle(&catalog, &tables, &rules, |_| true));
     }
 
     #[test]
     fn unmapped_relation_needs_no_oracle() {
         let rules = ColumnRules::default();
         let (catalog, _) = bridged(rel(vec![attr(1, "doc", JSONOID, "json", -1)]), &rules);
-        assert!(!needs_oracle(&catalog, &Arc::default(), &rules));
+        assert!(!needs_oracle(&catalog, &Arc::default(), &rules, |_| true));
+    }
+
+    #[test]
+    fn relation_out_of_the_snapshot_needs_no_oracle() {
+        let rules = ColumnRules::default();
+        let (catalog, tables) = bridged(
+            rel(vec![
+                attr(1, "id", INT4OID, "int4", 4),
+                attr(2, "doc", JSONOID, "json", -1),
+            ]),
+            &rules,
+        );
+        assert!(needs_oracle(&catalog, &tables, &rules, |_| true));
+        assert!(!needs_oracle(&catalog, &tables, &rules, |_| false));
     }
 }

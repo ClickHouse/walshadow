@@ -373,7 +373,7 @@ captured fixtures across PG 16/17/18. `tests/classify_fixture.rs` infra
 snapshots MULTI_INSERT fixtures; the same fixture gap covers
 `XACT_XINFO_HAS_SUBXACTS` layout. Drift in either record's per-major
 shape would surface as silent decode mismatch on exactly one major.
-Tracked in [future/parked.md](future/parked.md). Structural cousins —
+Tracked in [future/risks.md](future/risks.md). Structural cousins —
 `xl_heap_*` headers, `xl_heap_multi_insert` field order,
 `attmissingval` encoding — are stable per WAL alignment memory note +
 direct catalog cross-check against PG 16/17/18 source, absent

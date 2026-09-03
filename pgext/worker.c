@@ -43,9 +43,22 @@
 PG_MODULE_MAGIC;
 
 #define WS_MAX_CONNS		8
+/*
+ * Each worker serves one request at a time, so oracle throughput is one
+ * backend's conversion rate. `walshadow.bridge_workers` registers copies;
+ * worker 0 keeps the bare `socket_path` so a single-worker deployment and
+ * every catalog read are untouched, worker i listens on `socket_path.i`.
+ */
+#define WS_MAX_WORKERS		8
 #define WS_LISTEN_BACKLOG	16
 #define WS_IDLE_POLL_MS		1000
 #define WS_MAX_SCAN_OIDS	65536
+/*
+ * A 32 MiB request against default socket buffers costs hundreds of
+ * EAGAIN round trips; ask for a wide window and accept whatever the
+ * kernel grants (it halves the request and clamps to wmem_max).
+ */
+#define WS_SOCKBUF_BYTES	(4 * 1024 * 1024)
 
 /* wait-set positions, in the order ws_build_wait_set adds them */
 #define WS_POS_LATCH		0
@@ -53,10 +66,27 @@ PG_MODULE_MAGIC;
 #define WS_POS_LISTEN		2
 #define WS_POS_CONN0		3
 
+/* ... and in the per-connection io set */
+#define WS_IO_POS_LATCH		0
+#define WS_IO_POS_PM_DEATH	1
+#define WS_IO_POS_SOCKET	2
+
+/*
+ * One accepted connection. `io` is created once and its socket event mask
+ * flipped between readable and writeable, because building a fresh epoll
+ * set per EAGAIN is what a large transfer would otherwise pay for.
+ */
+typedef struct WsConn
+{
+	pgsocket	fd;
+	WaitEventSet *io;
+}			WsConn;
+
 PGDLLEXPORT void ws_worker_main(Datum main_arg);
 
 static char *ws_socket_path = NULL;
 static char *ws_database = NULL;
+static int	ws_bridge_workers = 1;
 static int	ws_io_timeout_ms = 30000;
 static int	ws_lock_timeout_ms = 1000;
 
@@ -175,20 +205,34 @@ ws_listen(const char *path)
 	return fd;
 }
 
+static WaitEventSet *
+ws_create_wait_set(int nevents)
+{
+#if PG_VERSION_NUM >= 170000
+	return CreateWaitEventSet(NULL, nevents);
+#else
+	return CreateWaitEventSet(TopMemoryContext, nevents);
+#endif
+}
+
 /*
- * Wait for `event` on one socket. `false` means the caller should abandon the
- * connection: shutdown was requested.
+ * Wait for `event` on one connection, reusing its own wait set. `false`
+ * means the caller should abandon the connection: shutdown was requested.
  */
 static bool
-ws_wait_socket(pgsocket fd, int event, long timeout_ms)
+ws_wait_conn(WsConn *conn, int event, long timeout_ms)
 {
-	int			rc;
+	WaitEvent	events[3];
+	int			nready;
+	int			i;
 
-	rc = WaitLatchOrSocket(MyLatch,
-						   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT | event,
-						   fd, timeout_ms, PG_WAIT_EXTENSION);
-	if (rc & WL_LATCH_SET)
+	ModifyWaitEvent(conn->io, WS_IO_POS_SOCKET, event, NULL);
+	nready = WaitEventSetWait(conn->io, timeout_ms, events,
+							  lengthof(events), PG_WAIT_EXTENSION);
+	for (i = 0; i < nready; i++)
 	{
+		if (events[i].pos != WS_IO_POS_LATCH)
+			continue;
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 		if (ConfigReloadPending)
@@ -203,10 +247,11 @@ ws_wait_socket(pgsocket fd, int event, long timeout_ms)
 }
 
 static bool
-ws_read_exact(pgsocket fd, char *buf, size_t len)
+ws_read_exact(WsConn *conn, char *buf, size_t len)
 {
 	size_t		got = 0;
 	TimestampTz deadline;
+	pgsocket	fd = conn->fd;
 
 	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
 										   ws_io_timeout_ms);
@@ -242,17 +287,18 @@ ws_read_exact(pgsocket fd, char *buf, size_t len)
 							ws_io_timeout_ms)));
 			return false;
 		}
-		if (!ws_wait_socket(fd, WL_SOCKET_READABLE, wait_ms))
+		if (!ws_wait_conn(conn, WL_SOCKET_READABLE, wait_ms))
 			return false;
 	}
 	return true;
 }
 
 static bool
-ws_write_all(pgsocket fd, const char *buf, size_t len)
+ws_write_all(WsConn *conn, const char *buf, size_t len)
 {
 	size_t		sent = 0;
 	TimestampTz deadline;
+	pgsocket	fd = conn->fd;
 
 	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
 										   ws_io_timeout_ms);
@@ -288,7 +334,7 @@ ws_write_all(pgsocket fd, const char *buf, size_t len)
 							ws_io_timeout_ms)));
 			return false;
 		}
-		if (!ws_wait_socket(fd, WL_SOCKET_WRITEABLE, wait_ms))
+		if (!ws_wait_conn(conn, WL_SOCKET_WRITEABLE, wait_ms))
 			return false;
 	}
 	return true;
@@ -448,7 +494,7 @@ ws_dispatch(StringInfo req, StringInfo resp)
  * `false` closes the connection.
  */
 static bool
-ws_serve_request(pgsocket fd)
+ws_serve_request(WsConn *conn)
 {
 	uint32		hdr;
 	uint32		len;
@@ -457,7 +503,7 @@ ws_serve_request(pgsocket fd)
 	MemoryContext oldctx;
 	bool		ok = false;
 
-	if (!ws_read_exact(fd, (char *) &hdr, sizeof(hdr)))
+	if (!ws_read_exact(conn, (char *) &hdr, sizeof(hdr)))
 		return false;
 	len = pg_ntoh32(hdr);
 
@@ -476,7 +522,7 @@ ws_serve_request(pgsocket fd)
 
 	initStringInfo(&req);
 	enlargeStringInfo(&req, (int) len);
-	if (ws_read_exact(fd, req.data, len))
+	if (ws_read_exact(conn, req.data, len))
 	{
 		req.len = (int) len;
 		req.data[len] = '\0';
@@ -487,8 +533,8 @@ ws_serve_request(pgsocket fd)
 		ws_dispatch(&req, &resp);
 
 		hdr = pg_hton32((uint32) resp.len);
-		ok = ws_write_all(fd, (char *) &hdr, sizeof(hdr)) &&
-			ws_write_all(fd, resp.data, (size_t) resp.len);
+		ok = ws_write_all(conn, (char *) &hdr, sizeof(hdr)) &&
+			ws_write_all(conn, resp.data, (size_t) resp.len);
 	}
 
 	MemoryContextSwitchTo(oldctx);
@@ -501,32 +547,54 @@ ws_serve_request(pgsocket fd)
  * ------------------------------------------------------------------------- */
 
 /*
- * Rebuilt per iteration: the wait-set API has no portable event removal, and
- * this loop is idle-dominated.
+ * The wait-set API has no portable event removal, so the set is rebuilt on
+ * a membership change and reused across every iteration in between. Under
+ * load that is one epoll set per connect/disconnect rather than per request.
  */
 static WaitEventSet *
-ws_build_wait_set(pgsocket listen_fd, const pgsocket *conns, int nconns)
+ws_build_wait_set(pgsocket listen_fd, const WsConn *conns, int nconns)
 {
-	WaitEventSet *set;
+	WaitEventSet *set = ws_create_wait_set(nconns + WS_POS_CONN0);
 	int			i;
 
-#if PG_VERSION_NUM >= 170000
-	set = CreateWaitEventSet(NULL, nconns + WS_POS_CONN0);
-#else
-	set = CreateWaitEventSet(CurrentMemoryContext, nconns + WS_POS_CONN0);
-#endif
 	AddWaitEventToSet(set, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 	AddWaitEventToSet(set, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
 	AddWaitEventToSet(set, WL_SOCKET_READABLE, listen_fd, NULL, NULL);
 	for (i = 0; i < nconns; i++)
-		AddWaitEventToSet(set, WL_SOCKET_READABLE, conns[i], NULL, NULL);
+		AddWaitEventToSet(set, WL_SOCKET_READABLE, conns[i].fd, NULL, NULL);
 	return set;
 }
 
+/*
+ * Widen the socket buffers so a multi-megabyte frame crosses in a handful
+ * of syscalls. Advisory: a kernel that refuses leaves the default, which
+ * only costs more EAGAIN waits.
+ */
 static void
-ws_accept(pgsocket listen_fd, pgsocket *conns, int *nconns)
+ws_widen_sockbufs(pgsocket fd)
+{
+	int			want = WS_SOCKBUF_BYTES;
+
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (char *) &want, sizeof(want)) < 0 ||
+		setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (char *) &want, sizeof(want)) < 0)
+		ereport(DEBUG1,
+				(errcode_for_socket_access(),
+				 errmsg("walshadow: could not widen socket buffers: %m")));
+}
+
+/*
+ * Membership generation, bumped on every accept and drop. The serve loop
+ * keys its cached wait set off this, not off nconns: an accept and a drop
+ * in the same iteration leave nconns unchanged over a different fd set,
+ * and a stale set would then poll a closed fd and miss the new one.
+ */
+static uint64 ws_conn_gen = 0;
+
+static bool
+ws_accept(pgsocket listen_fd, WsConn *conns, int *nconns)
 {
 	pgsocket	fd;
+	WsConn	   *conn;
 
 	fd = accept(listen_fd, NULL, NULL);
 	if (fd == PGINVALID_SOCKET)
@@ -535,7 +603,7 @@ ws_accept(pgsocket listen_fd, pgsocket *conns, int *nconns)
 			ereport(LOG,
 					(errcode_for_socket_access(),
 					 errmsg("walshadow: accept failed: %m")));
-		return;
+		return false;
 	}
 	if (*nconns >= WS_MAX_CONNS)
 	{
@@ -543,7 +611,7 @@ ws_accept(pgsocket listen_fd, pgsocket *conns, int *nconns)
 				(errmsg("walshadow: refusing connection, %d already open",
 						WS_MAX_CONNS)));
 		closesocket(fd);
-		return;
+		return false;
 	}
 	if (!pg_set_noblock(fd))
 	{
@@ -551,27 +619,39 @@ ws_accept(pgsocket listen_fd, pgsocket *conns, int *nconns)
 				(errcode_for_socket_access(),
 				 errmsg("walshadow: could not set client socket non-blocking: %m")));
 		closesocket(fd);
-		return;
+		return false;
 	}
-	conns[(*nconns)++] = fd;
+	ws_widen_sockbufs(fd);
+
+	conn = &conns[(*nconns)++];
+	ws_conn_gen++;
+	conn->fd = fd;
+	conn->io = ws_create_wait_set(3);
+	AddWaitEventToSet(conn->io, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+	AddWaitEventToSet(conn->io, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
+	AddWaitEventToSet(conn->io, WL_SOCKET_READABLE, fd, NULL, NULL);
+	return true;
 }
 
 static void
-ws_drop_conn(pgsocket *conns, int *nconns, int idx)
+ws_drop_conn(WsConn *conns, int *nconns, int idx)
 {
-	closesocket(conns[idx]);
+	FreeWaitEventSet(conns[idx].io);
+	closesocket(conns[idx].fd);
 	conns[idx] = conns[--*nconns];
+	ws_conn_gen++;
 }
 
 static void
 ws_serve_loop(pgsocket listen_fd)
 {
-	pgsocket	conns[WS_MAX_CONNS];
+	WsConn		conns[WS_MAX_CONNS];
 	int			nconns = 0;
+	WaitEventSet *set = NULL;
+	uint64		set_gen = 0;
 
 	for (;;)
 	{
-		WaitEventSet *set;
 		WaitEvent	events[WS_MAX_CONNS + WS_POS_CONN0];
 		int			nready;
 		int			i;
@@ -586,10 +666,15 @@ ws_serve_loop(pgsocket listen_fd)
 		if (ShutdownRequestPending)
 			break;
 
-		set = ws_build_wait_set(listen_fd, conns, nconns);
+		if (set == NULL || set_gen != ws_conn_gen)
+		{
+			if (set != NULL)
+				FreeWaitEventSet(set);
+			set = ws_build_wait_set(listen_fd, conns, nconns);
+			set_gen = ws_conn_gen;
+		}
 		nready = WaitEventSetWait(set, WS_IDLE_POLL_MS, events,
 								  lengthof(events), PG_WAIT_EXTENSION);
-		FreeWaitEventSet(set);
 
 		for (i = 0; i < nready; i++)
 		{
@@ -611,12 +696,14 @@ ws_serve_loop(pgsocket listen_fd)
 		if (serve >= 0 && serve < nconns)
 		{
 			pgstat_report_activity(STATE_RUNNING, "walshadow request");
-			if (!ws_serve_request(conns[serve]))
+			if (!ws_serve_request(&conns[serve]))
 				ws_drop_conn(conns, &nconns, serve);
 			pgstat_report_activity(STATE_IDLE, NULL);
 		}
 	}
 
+	if (set != NULL)
+		FreeWaitEventSet(set);
 	while (nconns > 0)
 		ws_drop_conn(conns, &nconns, 0);
 	closesocket(listen_fd);
@@ -625,8 +712,10 @@ ws_serve_loop(pgsocket listen_fd)
 void
 ws_worker_main(Datum main_arg)
 {
+	int			idx = DatumGetInt32(main_arg);
 	pgsocket	listen_fd;
 	char		buf[32];
+	char		path[MAXPGPATH];
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -659,10 +748,14 @@ ws_worker_main(Datum main_arg)
 										   "walshadow request",
 										   ALLOCSET_DEFAULT_SIZES);
 
-	listen_fd = ws_listen(ws_socket_path);
+	if (idx == 0)
+		strlcpy(path, ws_socket_path, sizeof(path));
+	else
+		snprintf(path, sizeof(path), "%s.%d", ws_socket_path, idx);
+	listen_fd = ws_listen(path);
 	ereport(LOG,
 			(errmsg("walshadow bridge listening on \"%s\" (proto %d)",
-					ws_socket_path, WS_PROTO_VERSION)));
+					path, WS_PROTO_VERSION)));
 
 	ws_serve_loop(listen_fd);
 
@@ -680,6 +773,7 @@ void
 _PG_init(void)
 {
 	BackgroundWorker worker;
+	int			i;
 
 	/*
 	 * Worker registration and its postmaster-scoped GUCs are only legal
@@ -716,20 +810,33 @@ _PG_init(void)
 							1000, 0, INT_MAX,
 							PGC_POSTMASTER, GUC_UNIT_MS,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("walshadow.bridge_workers",
+							"Bridge workers to register.",
+							"Worker 0 listens on socket_path, worker i on "
+							"socket_path.i. Each serves one request at a "
+							"time, so this bounds concurrent decode.",
+							&ws_bridge_workers,
+							1, 1, WS_MAX_WORKERS,
+							PGC_POSTMASTER, 0,
+							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("walshadow");
 
 	if (ws_socket_path == NULL || ws_socket_path[0] == '\0')
 		return;
 
-	memset(&worker, 0, sizeof(worker));
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	/* Catalog reads need a database connection, so not before consistency */
-	worker.bgw_start_time = BgWorkerStart_ConsistentState;
-	worker.bgw_restart_time = 5;
-	strlcpy(worker.bgw_library_name, "walshadow", BGW_MAXLEN);
-	strlcpy(worker.bgw_function_name, "ws_worker_main", BGW_MAXLEN);
-	strlcpy(worker.bgw_name, "walshadow bridge", BGW_MAXLEN);
-	strlcpy(worker.bgw_type, "walshadow bridge", BGW_MAXLEN);
-	RegisterBackgroundWorker(&worker);
+	for (i = 0; i < ws_bridge_workers; i++)
+	{
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+		/* Catalog reads need a database connection, so not before consistency */
+		worker.bgw_start_time = BgWorkerStart_ConsistentState;
+		worker.bgw_restart_time = 5;
+		worker.bgw_main_arg = Int32GetDatum(i);
+		strlcpy(worker.bgw_library_name, "walshadow", BGW_MAXLEN);
+		strlcpy(worker.bgw_function_name, "ws_worker_main", BGW_MAXLEN);
+		snprintf(worker.bgw_name, BGW_MAXLEN, "walshadow bridge %d", i);
+		strlcpy(worker.bgw_type, "walshadow bridge", BGW_MAXLEN);
+		RegisterBackgroundWorker(&worker);
+	}
 }
