@@ -812,9 +812,8 @@ fn descriptor_from_rows(
             class.relnamespace, class.oid
         ))
     })?;
-    let replident = replident_from_parts(
+    let replident = ReplIdent::from_parts(
         class.relreplident,
-        class.oid,
         indexes
             .iter()
             .find(|i| i.indisprimary)
@@ -823,7 +822,8 @@ fn descriptor_from_rows(
             .iter()
             .find(|i| i.indisreplident)
             .map(|i| (i.indexrelid, i.indkey.clone())),
-    )?;
+    )
+    .map_err(|e| CatalogError::Parse(format!("{e} for relation {}", class.oid)))?;
 
     let mut ordered: Vec<&AttributeRow> = attrs.iter().collect();
     ordered.sort_unstable_by_key(|a| a.attnum);
@@ -876,33 +876,6 @@ fn descriptor_from_rows(
         replident,
         attributes,
     })
-}
-
-fn replident_from_parts(
-    c: char,
-    rel_oid: Oid,
-    pk_attnums: Option<Vec<i16>>,
-    using_index: Option<(Oid, Vec<i16>)>,
-) -> Result<ReplIdent> {
-    match c {
-        'd' => Ok(ReplIdent::Default { pk_attnums }),
-        'n' => Ok(ReplIdent::Nothing),
-        'f' => Ok(ReplIdent::Full { pk_attnums }),
-        'i' => {
-            let (index_oid, key_attnums) = using_index.ok_or_else(|| {
-                CatalogError::Parse(format!(
-                    "relreplident='i' but no pg_index row with indisreplident=true for relation {rel_oid}",
-                ))
-            })?;
-            Ok(ReplIdent::UsingIndex {
-                index_oid,
-                key_attnums,
-            })
-        }
-        other => Err(CatalogError::Parse(format!(
-            "unknown relreplident {other:?} (expected one of d/n/f/i)",
-        ))),
-    }
 }
 
 #[cfg(test)]

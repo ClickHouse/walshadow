@@ -33,10 +33,7 @@
 mod fx;
 
 use std::fs;
-use std::net::SocketAddr;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +48,7 @@ use walrus::storage::DynStorage;
 use walrus::storage::fs::FsStorage;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
-use walshadow::shadow::{Shadow, ShadowConfig};
+use walshadow::shadow::Shadow;
 
 const N_ROWS: i32 = 64;
 
@@ -83,19 +80,6 @@ async fn push_completed_wal_segments(
     Ok(())
 }
 
-fn make_source(tmp: &tempfile::TempDir) -> Shadow {
-    let mut cfg = ShadowConfig::new(
-        tmp.path().join("source-data"),
-        tmp.path().join("source-filtered"),
-    );
-    cfg.port = fx::PG_SOURCE_PORT;
-    cfg.socket_dir = tmp.path().join("source-sock");
-    cfg.ctl_timeout = Duration::from_secs(60);
-    fs::create_dir_all(&cfg.filter_out_dir).unwrap();
-    fs::create_dir_all(&cfg.socket_dir).unwrap();
-    Shadow::new(cfg)
-}
-
 /// Minimal Settings for an uncompressed `FsStorage` root — matches
 /// `bootstrap_object_store_e2e.rs::test_settings`.
 fn test_settings(storage_root: PathBuf) -> Settings {
@@ -111,12 +95,7 @@ fn test_settings(storage_root: PathBuf) -> Settings {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn object_store_bootstrap_ch_end_to_end() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -124,11 +103,7 @@ async fn object_store_bootstrap_ch_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
 
     // 1. Source PG.
-    let source = make_source(&tmp);
-    source.initdb().expect("initdb source");
-    source.write_base_conf().expect("source base conf");
-    fx::append_source_conf(&source).expect("append source conf");
-    source.start().expect("start source");
+    let source = fx::start_source(&tmp);
     let _src_stop = fx::StopOnDrop { sh: &source };
 
     // 2. Schema + workload.
@@ -205,132 +180,51 @@ async fn object_store_bootstrap_ch_end_to_end() {
     ch_config_body.push_str(&format!("\n[backup]\narchive = \"{archive_uri}\"\n"));
     fs::write(&ch_config_path, ch_config_body).expect("append [backup] to ch-config");
 
-    // 6. Shadow layout. Daemon writes port and socket config, so test
-    //    does not add source settings before bootstrap
-    let bootstrap_shadow_data_dir = tmp.path().join("shadow-data");
-    let shadow_sock = tmp.path().join("shadow-sock");
-    fs::create_dir_all(&shadow_sock).unwrap();
-    let shadow_filter_dir = tmp.path().join("filtered");
-    fs::create_dir_all(&shadow_filter_dir).unwrap();
-    let spill_dir = tmp.path().join("spill");
-    fs::create_dir_all(&spill_dir).unwrap();
-
-    // 7. Spawn walshadow-stream. The daemon reads the archive from the
+    // 6. Spawn walshadow-stream. The daemon reads the archive from the
     //    `[backup]` section of `--ch-config` (built into a
     //    `walrus::config::Settings`), not `WALG_*` env.
-    let bin = env!("CARGO_BIN_EXE_walshadow-stream");
-    let stderr_path = tmp.path().join("daemon.stderr.log");
-    let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{}", slot.metrics).parse().unwrap();
-    let child = Command::new(bin)
-        .args([
-            "--host",
-            source.config().socket_dir.to_str().unwrap(),
-            "--port",
-            &fx::PG_SOURCE_PORT.to_string(),
-            "--user",
-            "postgres",
-            "--dbname",
-            "postgres",
-            "--sslmode",
-            "disable",
-            "--out-dir",
-            shadow_filter_dir.to_str().unwrap(),
-            "--shadow-socket-dir",
-            shadow_sock.to_str().unwrap(),
-            "--shadow-port",
-            &fx::PG_SHADOW_PORT.to_string(),
-            "--shadow-user",
-            "postgres",
-            "--shadow-dbname",
-            "postgres",
-            "--spill-dir",
-            spill_dir.to_str().unwrap(),
-            "--status-interval",
-            "1",
-            "--metrics-bind",
-            &metrics_addr.to_string(),
-            "--walsender-bind",
-            &format!("127.0.0.1:{}", slot.walsender),
-            "--retention-bytes",
-            "0",
-            "--ch-config",
-            ch_config_path.to_str().unwrap(),
-            "--bootstrap-mode",
+    let daemon = fx::DaemonRun::prepare(tmp.path(), slot.metrics).expect("daemon layout");
+    let child = daemon
+        .spawn_mode(
+            &source,
+            &ch_config_path,
+            slot.walsender,
             "object-store",
-            "--bootstrap-shadow-data-dir",
-            bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-backup-name",
-            &backup_name,
-            "--bootstrap-shadow-replay-timeout",
-            "120",
-        ])
-        .env("PGHOST", source.config().socket_dir.to_str().unwrap())
-        .env("PGPORT", fx::PG_SOURCE_PORT.to_string())
-        .env("PGUSER", "postgres")
-        .env("PGDATABASE", "postgres")
-        .env("RUST_LOG", "warn,walshadow=info")
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .process_group(0)
-        .spawn()
+            &["--bootstrap-backup-name", &backup_name],
+            &[
+                ("PGHOST", socket_host.clone()),
+                ("PGPORT", source.config().port.to_string()),
+                ("PGUSER", "postgres".into()),
+                ("PGDATABASE", "postgres".into()),
+            ],
+        )
         .expect("spawn walshadow-stream");
     let guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
-        // 8. Wait for the daemon's metrics endpoint (liveness). The daemon
+        // 7. Wait for the daemon's metrics endpoint (liveness). The daemon
         //    binds it before the bootstrap tail drains to CH, so it is not
         //    a bootstrap-complete signal on its own.
-        fx::wait_for_listen(metrics_addr, Duration::from_secs(30))
+        fx::wait_for_listen(daemon.metrics_addr, Duration::from_secs(30))
             .context("daemon metrics endpoint never came up")?;
 
-        // 9. Poll until the bootstrap rows are durable on CH — the tail
-        //    drains asynchronously, so racing it with an immediate assert
-        //    flakes on slow CI.
         let src_count = source
             .psql_one("SELECT count(*) FROM s14.t")
             .context("source count")?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            let n = ch
-                .query("SELECT count() FROM default.t FINAL WHERE _is_deleted = 0")
-                .unwrap_or_default();
-            if n == src_count {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!("bootstrap rows never reached CH: source={src_count}, ch={n}");
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        fx::wait_for_ch_value(
+            &ch,
+            "SELECT count() FROM default.t FINAL WHERE _is_deleted = 0",
+            &src_count,
+            Duration::from_secs(60),
+        )?;
 
-        // 10. Oracle. ChildGuard's Drop SIGKILLs the daemon at end of scope;
-        //     no `pg_switch_wal` + drain cycle since the surface is bootstrap
-        //     correctness, not streaming.
+        // 8. Oracle. No `pg_switch_wal` + drain cycle since the surface is
+        //    bootstrap correctness, not streaming.
         fx::assert_ch_matches_source(&ch, &source, "s14.t", "default.t")
             .context("source vs CH parity")?;
 
         Ok(())
     })();
 
-    // 12. Kill daemon before shadow so supervisor cannot restart it
-    //     Stop any remaining postmaster
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
-    if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
-        let mut shadow_cfg =
-            ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());
-        shadow_cfg.port = fx::PG_SHADOW_PORT;
-        shadow_cfg.socket_dir = shadow_sock.clone();
-        shadow_cfg.ctl_timeout = Duration::from_secs(60);
-        let shadow = Shadow::new(shadow_cfg);
-        let _ = shadow.stop();
-    }
-
-    if let Err(e) = result {
-        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
-    }
+    fx::finish_daemon(guard, &daemon, result);
 }

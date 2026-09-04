@@ -17,26 +17,11 @@
 mod fx;
 
 use std::fs;
-use std::time::Duration;
 
 use walshadow::ch_emitter::EmitterConfig;
 use walshadow::config::SourceConn;
 use walshadow::init::{InitOpts, run};
 use walshadow::schema::RelName;
-use walshadow::shadow::{Shadow, ShadowConfig};
-
-fn make_source(tmp: &tempfile::TempDir) -> Shadow {
-    let mut cfg = ShadowConfig::new(
-        tmp.path().join("source-data"),
-        tmp.path().join("source-filtered"),
-    );
-    cfg.port = fx::PG_SOURCE_PORT;
-    cfg.socket_dir = tmp.path().join("source-sock");
-    cfg.ctl_timeout = Duration::from_secs(60);
-    fs::create_dir_all(&cfg.filter_out_dir).unwrap();
-    fs::create_dir_all(&cfg.socket_dir).unwrap();
-    Shadow::new(cfg)
-}
 
 /// Percent-encode a socket dir into the libpq URL spelling
 fn socket_url(socket_dir: &std::path::Path, dbname: &str) -> String {
@@ -61,7 +46,7 @@ async fn init_probes_both_ends_and_writes_a_bootable_config() {
     let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
 
-    let source = make_source(&tmp);
+    let source = fx::make_source(&tmp);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
     fx::append_source_conf(&source).expect("append source conf");

@@ -754,7 +754,7 @@ fn log_tail(path: &Path) -> String {
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let _ = f.seek(SeekFrom::Start(len.saturating_sub(TAIL)));
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(len.min(TAIL) as usize);
     let _ = f.read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
 }

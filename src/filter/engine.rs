@@ -441,7 +441,7 @@ impl Filter {
         // db 0 = shared relation; user rels there are impossible, kept for
         // symmetry with is_target_or_shared
         let mut capture_all = false;
-        let mut inval_oids: Vec<u32> = Vec::new();
+        let mut inval_oids: Vec<u32> = Vec::with_capacity(payload.invals.relcache.len());
         for inval in &payload.invals.relcache {
             if !self.is_target_or_shared(inval.db_id) {
                 continue;
@@ -526,7 +526,7 @@ impl Filter {
         let invals = parse_xact_invalidations(&record.main_data, page_magic)?;
         let namespace_hit = invals.namespace.hits(|db| self.is_target_or_shared(db));
         let mut flush = false;
-        let mut oids: Vec<u32> = Vec::new();
+        let mut oids: Vec<u32> = Vec::with_capacity(invals.relcache.len());
         for inval in &invals.relcache {
             if !self.is_target_or_shared(inval.db_id) {
                 continue;

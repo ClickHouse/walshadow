@@ -106,13 +106,13 @@ Reclamation is `ReplacingMergeTree` merge behavior, not walshadow logic.
   (`src/pipeline/bootstrap.rs`), unmapped rels drop at `lookup_mapping`
   (counted `unsupported_relations`), and with nothing mapped nothing defers,
   so the deferred hard-error path cannot fire. Bootstrap consults the static
-  `[table.*]` map only, never `[namespace.*]`. Filtering is at the drain, not
-  the walk: catalog seeding is unconditional, main heap pages still decode
-  and drop; only `pg_toast_*` decode is config-gated (`store_toast`). Seeds
-  every toast rel in the catalog — no per-table filter. A re-seed of a live
-  deployment runs as a one-off against a scratch
-  `--bootstrap-shadow-data-dir` and separate `--out-dir` so the live
-  manifest stays untouched.
+  `[table.*]` map only, never `[namespace.*]`. Catalog seeding is
+  unconditional and every toast rel seeds its mirror — no per-table filter;
+  only `pg_toast_*` decode is config-gated (`store_toast`). Main files
+  outside the mapping snapshot are declined at the walk, so a mirror-only
+  seed decodes chunk pages alone. A re-seed of a live deployment runs as a
+  one-off against a scratch `--bootstrap-shadow-data-dir` and separate
+  `--out-dir` so the live manifest stays untouched.
 - **Decode shape (R2).** Value reassembled before the main-table INSERT,
   stored inline `Bytea`/`Text`; `encode_value` (`src/ch_emitter.rs`) needs no
   toast-specific handling. Tier 3 detoast routing: `detoasted_value` runs

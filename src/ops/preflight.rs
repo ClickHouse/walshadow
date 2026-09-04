@@ -17,6 +17,7 @@
 //! - `--bootstrap-wal-from-archive` is set but source doesn't archive WAL:
 //!   the bootstrap skips the inline WAL window and reads it from the
 //!   `[backup]` bucket, so an unarchived source leaves nothing to fetch.
+//! - source `max_wal_senders` cannot seat Direct backup and window stream
 
 use std::fmt;
 
@@ -28,6 +29,9 @@ use crate::schema::RelName;
 
 /// Catalog accessors assume PG-16 column layouts; PG <16 unsupported.
 pub const MIN_SERVER_VERSION_NUM: i32 = 160_000;
+
+/// Concurrent direct-backup replication connections
+const DIRECT_BOOTSTRAP_SENDERS: i32 = 2;
 
 #[derive(Debug, Error)]
 pub enum PreflightError {
@@ -80,6 +84,13 @@ pub enum PreflightError {
          operator contract"
     )]
     ArchiveTargetEmpty,
+    #[error(
+        "source max_wal_senders={got} < {need}: a direct bootstrap holds {need} \
+         replication connections at once — BASE_BACKUP, and the daemon's own, \
+         which streams the backup window to the destination while the backup \
+         runs. Raise max_wal_senders on the source"
+    )]
+    WalSendersTooLow { got: i32, need: i32 },
     #[error("pg query: {0}")]
     Pg(#[from] tokio_postgres::Error),
     #[error("shadow_version_num could not be parsed: {0:?}")]
@@ -142,6 +153,8 @@ pub struct ShadowInputs<'a> {
 /// Checks that gate `BASE_BACKUP`, run before `run_bootstrap`.
 pub struct BootstrapInputs<'a> {
     pub source_sql: &'a Client,
+    /// Stream window live instead of replaying hydrated segments
+    pub window_leg: bool,
     /// Bootstrap will set `wal: false` and hydrate shadow's `pg_wal/` from
     /// the `[backup]` bucket instead of from `base.tar`.
     pub wal_from_archive: bool,
@@ -267,6 +280,19 @@ pub async fn shadow(input: ShadowInputs<'_>) -> Result<PreflightReport, Prefligh
 /// hydrate.
 pub async fn bootstrap(input: BootstrapInputs<'_>) -> Result<PreflightReport, PreflightError> {
     let mut report = PreflightReport { errors: Vec::new() };
+    if input.window_leg {
+        let got: i32 = input
+            .source_sql
+            .query_one("SELECT current_setting('max_wal_senders')::int", &[])
+            .await?
+            .get(0);
+        if got < DIRECT_BOOTSTRAP_SENDERS {
+            report.errors.push(PreflightError::WalSendersTooLow {
+                got,
+                need: DIRECT_BOOTSTRAP_SENDERS,
+            });
+        }
+    }
     if !input.wal_from_archive {
         return Ok(report);
     }

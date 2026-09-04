@@ -56,9 +56,12 @@ once through `MultiplexSink`, catalog files land on shadow data dir
 while user-heap pages Tap through page walk into shared insert tail;
 handoff to WAL pump at `end_lsn` ([bootstrap.md](bootstrap.md))
 
+**backup window** — `[start_lsn, end_lsn]`, span covered by base-backup WAL
+replay ([bootstrap.md](bootstrap.md))
+
 **BufferingDecoderSink** — decoder-side record sink: gates on catalog
 replay, decodes heap records into XactBuffer, intercepts TRUNCATE and
-config writes. Shared by hot path and gap replay
+config writes. Shared by hot path and WAL replay legs
 ([source.md](source.md), [decoder.md](decoder.md))
 
 **catalog gate** — see wait_for_replay
@@ -240,7 +243,7 @@ page walk and TOAST re-read, never the tuple-bytes path
 
 **gap replay** — `object_store` step fetching archive WAL
 `B_redo → S` into scratch, replaying committed rows at real commit LSNs
-through shared decode path ([add_table.md](add_table.md))
+through `WalReplaySink` ([add_table.md](add_table.md))
 
 **generation counter** — ShadowCatalog cache invalidation: single u64
 bumped on any pg_class write. Coarse-fires by design, over-invalidates
@@ -395,9 +398,9 @@ oracle as cells, neither is ever rendered locally
 reads and Native conversion over a unix socket
 ([oracle.md](oracle.md), [`pgext/walshadow.h`](../pgext/walshadow.h))
 
-**PgXactAccum / PgXactPatch** — backup-era `pg_xact` accumulated from
-backup files, patched with commit/abort records harvested from gap-WAL
-pre-scan; backs the visibility gate ([add_table.md](add_table.md))
+**PgXactAccum / PgXactPatch** — backup `pg_xact` state plus commit/abort
+records harvested from gap or window WAL; backs visibility gate
+([add_table.md](add_table.md), [bootstrap.md](bootstrap.md))
 
 **pipeline** — parallel decode+insert tail: reorder → decode ×M →
 batcher → inserter ×N → ack watermark, in `src/pipeline/`; stands up
@@ -619,16 +622,24 @@ buffer state is process-local and spill clears on boot
 `numeric(p,s)` maps `Decimal(p,s)` else String
 ([emitter.md](emitter.md))
 
-**visibility gate** — backup-page tuple filter (`src/visibility.rs`):
-emit only when backup-era pg_xact says xmin committed and xmax
-absent/aborted, infomask hint bits short-circuit; what makes backup
-modes higher-fidelity than greenfield's raw walk
-([add_table.md](add_table.md))
+**visibility gate** — backup-page tuple filter: emit when `xmin` committed and
+`xmax` is absent or aborted; use hint bits before transaction logs. Greenfield
+resolves deferred tuples after window replay. Drop TOAST chunks only when
+proven dead
+([add_table.md](add_table.md), [bootstrap.md](bootstrap.md))
+
+**visibility repair** — read a relation through PostgreSQL `COPY` when backup
+state cannot prove tuple visibility. Applies up front to TOAST-owning
+relations; tags rows at `S` ([bootstrap.md](bootstrap.md))
 
 **wait_for_replay / catalog gate** — ShadowCatalog gate blocking until
 `pg_last_wal_replay_lsn() >= commit_lsn`; enforces ordering invariant
 shadow replay LSN ≥ decoder read LSN so decoder reads post-DDL catalog
 ([shadow.md](shadow.md), [overview.md](overview.md))
+
+**WalReplaySink** — bounded WAL-range decoder used by greenfield window replay
+and `object_store` gap replay ([bootstrap.md](bootstrap.md),
+[add_table.md](add_table.md))
 
 **wal-rus** — WAL parsing / replication crate walshadow builds on:
 replication client and server halves, record parser, BASE_BACKUP and
@@ -644,6 +655,9 @@ threshold, shadow catches up via restore_command
 **WalStream** — page-cadence ingest: `push(lsn, bytes)` drives stateful
 walker (cross-page stitching, 16 MiB segment buffer), fires per-record
 dispatch through sink fan-out ([source.md](source.md))
+
+**window leg** — greenfield WAL path covering backup window from live stream
+or hydrated segments ([bootstrap.md](bootstrap.md))
 
 **XactBuffer** — per-xid hold-and-flush of decoded heaps + TOAST chunks
 until commit/abort, spilling past budget; PG `ReorderBuffer` analogue

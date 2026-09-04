@@ -47,6 +47,13 @@ request per insert batch
 
 ## Initial loads
 
+- transactions open past greenfield handoff need a replication slot to retain
+  in-window records; earlier records can still leave missing inserts or stale
+  deletes
+- relations requiring multixact or TOAST visibility repair are read whole
+  through `COPY`; dropping or rewriting them before repair fails bootstrap
+- DDL during greenfield bootstrap is unsupported; affected relations may be
+  skipped or fail repair
 - `copy` scans selected table through PostgreSQL SQL path
 - `base_backup` transfers cluster-sized backup even for one table
 - `object_store` requires full wal-g backup and continuous archived WAL to selection point

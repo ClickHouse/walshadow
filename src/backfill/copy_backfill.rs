@@ -71,7 +71,8 @@ use crate::config::ResolvedConfig;
 use crate::decode::codecs::NumericKind;
 use crate::decode::heap_decoder::ColumnValue;
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
-use crate::emit::pipeline::{Fatal, bootstrap, tail};
+use crate::emit::pipeline::tail::OwnedTail;
+use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::mapping::MappingHandle;
 use crate::ops::oracle::Oracle;
 use crate::pg::{current_wal_lsn, quote_ident};
@@ -298,7 +299,7 @@ fn wire_kind(type_oid: u32) -> Option<WireKind> {
 
 fn column_plan(desc: &RelDescriptor) -> CopyPlan {
     let mut select = String::new();
-    let mut cols = Vec::new();
+    let mut cols = Vec::with_capacity(desc.attributes.len());
     let mut natts = 0usize;
     for a in &desc.attributes {
         natts = natts.max(a.attnum.max(0) as usize);
@@ -326,6 +327,55 @@ fn column_plan(desc: &RelDescriptor) -> CopyPlan {
         cols,
         natts,
     }
+}
+
+/// Copy visible, detoasted rows from `desc` into `tx`, tagged `lsn`
+pub(crate) async fn copy_rows_into(
+    client: &tokio_postgres::Client,
+    desc: &RelDescriptor,
+    lsn: u64,
+    tx: &mpsc::Sender<BackfillTuple>,
+) -> anyhow::Result<u64> {
+    let plan = column_plan(desc);
+    let sql = format!(
+        "COPY (SELECT {} FROM {}.{}) TO STDOUT (FORMAT binary)",
+        plan.select,
+        quote_ident(&desc.rel_name.namespace),
+        quote_ident(&desc.rel_name.name),
+    );
+    let byte_fields = vec![Type::BYTEA; plan.cols.len()];
+    let copy = client.copy_out(&sql).await.context("backfill: COPY out")?;
+    let stream = BinaryCopyOutStream::new(copy, &byte_fields);
+    futures::pin_mut!(stream);
+    let mut rows = 0u64;
+    while let Some(row) = stream.next().await {
+        let row = row.context("backfill: COPY stream")?;
+        let mut columns: Vec<Option<ColumnValue>> = vec![None; plan.natts];
+        for (i, cp) in plan.cols.iter().enumerate() {
+            let raw: Option<&[u8]> = row.try_get(i).context("backfill: COPY field")?;
+            let v = raw
+                .map(|raw| decode_field(cp.kind, cp.type_oid, raw))
+                .transpose()
+                .map_err(anyhow::Error::msg)?
+                .unwrap_or(ColumnValue::Null);
+            columns[(cp.attnum - 1).max(0) as usize] = Some(v);
+        }
+        tx.send(BackfillTuple {
+            rfn: desc.rfn,
+            xid: 0,
+            xmax: 0,
+            infomask: 0,
+            source_lsn: lsn,
+            // COPY rows have no on-page TID
+            blkno: 0,
+            offnum: 0,
+            columns,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
+        rows += 1;
+    }
+    Ok(rows)
 }
 
 fn fixed<const N: usize>(raw: &[u8], what: &str) -> Result<[u8; N], String> {
@@ -777,7 +827,7 @@ impl CopyBackfiller {
                 return;
             }
         };
-        let mut swapped: Vec<&StagingRel> = Vec::new();
+        let mut swapped: Vec<&StagingRel> = Vec::with_capacity(plan.rels.len());
         for rel in &plan.rels {
             match self.swap_rel(&mut sess, rel).await {
                 Ok(true) => swapped.push(rel),
@@ -1056,18 +1106,17 @@ impl CopyBackfiller {
         }
 
         // Dedicated tail: own CH connection, own seq space, own fatal.
-        let fatal = Fatal::new();
-        let (msg_tx, ack, tail) = tail::spawn_with_config(
+        let tail = OwnedTail::spawn(
             &self.dest_emitter(),
             1,
             self.stats.clone(),
-            Arc::new(crate::pos::Monotone::new(0)),
-            fatal.clone(),
+            Fatal::new(),
             self.config_rx.clone(),
             self.oracle.clone(),
+            "backfill",
         )
         .await
-        .map_err(|e| anyhow::anyhow!("backfill: spawn insert tail: {e}"))?;
+        .map_err(anyhow::Error::msg)?;
 
         let mut catalog = CatalogMap::new();
         catalog.insert(desc.clone());
@@ -1076,8 +1125,8 @@ impl CopyBackfiller {
             tup_rx,
             catalog,
             self.mapping.clone(),
-            msg_tx.clone(),
-            ack.clone(),
+            tail.msg_tx.clone(),
+            tail.ack.clone(),
             self.stats.clone(),
             // Disabled resolver never defers; spool stays empty
             ToastResolver::disabled(),
@@ -1087,51 +1136,10 @@ impl CopyBackfiller {
             ),
             self.emitter.row_policy(),
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
-            std::collections::HashSet::new(),
+            HashSet::new(),
         ));
 
-        let plan = column_plan(desc);
-        let sql = format!(
-            "COPY (SELECT {} FROM {qtable}) TO STDOUT (FORMAT binary)",
-            plan.select
-        );
-        let rows = {
-            let byte_fields = vec![Type::BYTEA; plan.cols.len()];
-            let copy = client.copy_out(&sql).await.context("backfill: COPY out")?;
-            let stream = BinaryCopyOutStream::new(copy, &byte_fields);
-            futures::pin_mut!(stream);
-            let mut rows = 0u64;
-            while let Some(row) = stream.next().await {
-                let row = row.context("backfill: COPY stream")?;
-                let mut columns: Vec<Option<ColumnValue>> = vec![None; plan.natts];
-                for (i, cp) in plan.cols.iter().enumerate() {
-                    let raw: Option<&[u8]> = row.try_get(i).context("backfill: COPY field")?;
-                    let v = raw
-                        .map(|raw| decode_field(cp.kind, cp.type_oid, raw))
-                        .transpose()
-                        .map_err(anyhow::Error::msg)?
-                        .unwrap_or(ColumnValue::Null);
-                    columns[(cp.attnum - 1).max(0) as usize] = Some(v);
-                }
-                tup_tx
-                    .send(BackfillTuple {
-                        rfn: desc.rfn,
-                        xid: 0,
-                        xmax: 0,
-                        infomask: 0,
-                        source_lsn: s_lsn.get(),
-                        // COPY text rows have no on-page TID (values arrive
-                        // detoasted, no chunks flow here)
-                        blkno: 0,
-                        offnum: 0,
-                        columns,
-                    })
-                    .await
-                    .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
-                rows += 1;
-            }
-            rows
-        };
+        let rows = copy_rows_into(&client, desc, s_lsn.get(), &tup_tx).await?;
         drop(tup_tx);
 
         let outcome = drain
@@ -1140,7 +1148,7 @@ impl CopyBackfiller {
             .map_err(anyhow::Error::msg)?;
         // Upper bound on the COPY snapshot; WAL apply past it = converged
         let p_hi = current_wal_lsn(&client).await?;
-        tail.finish(msg_tx, ack, outcome.next_seq, &fatal)
+        tail.finish(outcome.next_seq)
             .await
             .map_err(anyhow::Error::msg)?;
         Ok(CopyOutcome {

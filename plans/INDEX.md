@@ -36,7 +36,7 @@ components. User workflows and supported behavior live under
   `type_bridge`, synthetic columns, `DdlApplicator`, barrier fence
 - [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
   / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
-  shared insert tail, restart source fallback contract
+  shared insert tail, window WAL replay, restart fallback
 - [ops.md](ops.md) — retention, manifest floor, standby-status triple,
   resume invariants
 - [failover.md](failover.md) — source timeline crossing: frozen pause

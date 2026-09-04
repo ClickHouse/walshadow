@@ -105,8 +105,7 @@ fn overlay_ddl_args() -> fx::DdlPipelineArgs {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_via_config_table_replicates_new_table() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -193,8 +192,7 @@ async fn opt_in_via_config_table_replicates_new_table() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_out_mid_stream_drains_and_halts() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -318,8 +316,7 @@ async fn opt_out_mid_stream_drains_and_halts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forward_decl_materializes_on_create_table() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -421,8 +418,7 @@ async fn forward_decl_materializes_on_create_table() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -604,8 +600,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_then_alter_add_column_reaches_ch() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -710,8 +705,7 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
 /// drives auto-create, not just the per-table `replicate=true` opt-in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_create_namespace_via_config_namespace() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -801,8 +795,7 @@ async fn auto_create_namespace_via_config_namespace() {
 /// dropped one encodes scale-0 `123`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn column_target_type_override_reaches_projection() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -915,8 +908,7 @@ async fn column_target_type_override_reaches_projection() {
 /// heap rows in WAL routes those rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pre_opt_in_xact_discards_post_opt_in_routes() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -1013,8 +1005,7 @@ async fn pre_opt_in_xact_discards_post_opt_in_routes() {
 /// Drill 9: glob rules scope tables created later
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pattern_row_scopes_tables_by_glob() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -1105,8 +1096,7 @@ async fn pattern_row_scopes_tables_by_glob() {
 /// `replicate = true` creates, so the CREATE cannot fall back to the PK.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_row_pins_order_by_and_primary_key() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -1196,8 +1186,7 @@ async fn opt_in_row_pins_order_by_and_primary_key() {
 /// columns of an auto-created table (plans/config.md §Destination shape).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pattern_row_shapes_auto_created_tables() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 

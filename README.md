@@ -62,6 +62,8 @@ when any of these fails:
 
 - `server_version_num >= 160_000`, shadow major equals source major
 - `wal_level = logical`
+- `max_wal_senders >= 2` for direct bootstrap: `BASE_BACKUP` and window WAL
+  streaming run concurrently
 - every mapped relation has a row key for deletes: a PRIMARY KEY
   (`REPLICA IDENTITY DEFAULT`), `USING INDEX`, or `FULL`. `NOTHING` and
   keyless `DEFAULT` are rejected. `FULL` is accepted, not required

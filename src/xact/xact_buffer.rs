@@ -36,7 +36,7 @@
 //! Spill-to-ClickHouse (Option B) is deferred; v1 is local-disk-only.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, VecDeque, hash_map::Entry};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -613,8 +613,8 @@ pub async fn resolve_stash(
     if rfns.is_empty() {
         return Ok(());
     }
-    let mut outcomes: HashMap<RelFileNode, StashOutcome> = HashMap::new();
-    let mut barriers: Vec<(u32, u64)> = Vec::new();
+    let mut outcomes: HashMap<RelFileNode, StashOutcome> = HashMap::with_capacity(rfns.len());
+    let mut barriers: Vec<(u32, u64)> = Vec::with_capacity(rfns.len());
     for (rfn, mark) in &rfns {
         let (rfn, mark) = (*rfn, *mark);
         match log.descriptor_at_spanned(rfn, next_lsn) {
@@ -870,8 +870,7 @@ impl XactBuffer {
             .iter()
             .map(|(xid, st)| {
                 let mut last_lsn = st.first_lsn.get();
-                let mut rels: std::collections::BTreeSet<(u32, u32)> =
-                    std::collections::BTreeSet::new();
+                let mut rels: BTreeSet<(u32, u32)> = BTreeSet::new();
                 let mut heap_count = 0u64;
                 let mut chunk_count = 0u64;
                 for e in &st.in_mem {
@@ -1785,10 +1784,10 @@ impl MergedDrain {
         self.chunk_bytes += mem_len + CHUNK_REF_META;
         self.chunk_gauge.add(mem_len + CHUNK_REF_META);
         match self.chunks.entry((c.toast_relid, c.value_id)) {
-            std::collections::hash_map::Entry::Occupied(mut o) => {
+            Entry::Occupied(mut o) => {
                 o.get_mut().push(c.chunk_seq, body);
             }
-            std::collections::hash_map::Entry::Vacant(v) => {
+            Entry::Vacant(v) => {
                 v.insert(ValueRef::new(c.chunk_seq, body));
             }
         }
@@ -2324,7 +2323,7 @@ pub async fn detoast_heap(
     // Attached at decode: same descriptor interpretation from decode to
     // detoast regardless of captures landing in between
     let rel = heap.descriptor.clone();
-    let mut uses: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut uses: HashMap<(u32, u32), u32> = HashMap::with_capacity(pointers.len());
     for p in &pointers {
         *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
     }
@@ -3832,10 +3831,10 @@ mod tests {
         for &(seq, body) in chunks {
             let body = Body::Mem(bytes::Bytes::from_static(body));
             match map.entry(key) {
-                std::collections::hash_map::Entry::Occupied(mut o) => {
+                Entry::Occupied(mut o) => {
                     o.get_mut().push(seq, body);
                 }
-                std::collections::hash_map::Entry::Vacant(v) => {
+                Entry::Vacant(v) => {
                     v.insert(ValueRef::new(seq, body));
                 }
             }
@@ -3888,10 +3887,10 @@ mod tests {
         for &(seq, body) in chunks {
             let r = Body::File(w.append(body).unwrap());
             match map.entry(key) {
-                std::collections::hash_map::Entry::Occupied(mut o) => {
+                Entry::Occupied(mut o) => {
                     o.get_mut().push(seq, r);
                 }
-                std::collections::hash_map::Entry::Vacant(v) => {
+                Entry::Vacant(v) => {
                     v.insert(ValueRef::new(seq, r));
                 }
             }
