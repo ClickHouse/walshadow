@@ -8,7 +8,7 @@
 
 /* Bumped when a request or response layout changes, or when an op's reading
  * of an unchanged layout changes */
-#define WS_PROTO_VERSION		2
+#define WS_PROTO_VERSION		3
 /* Bumped when any catalog projection changes shape */
 #define WS_PROJECTION_VERSION	1
 
@@ -62,11 +62,33 @@ typedef struct WsScanStats
 extern int	ws_overlay_ncols(WsCatalog cat);
 
 /*
+ * How a scan may treat the target catalog's lock.
+ *
+ * A caller that named a replay position has withheld every successor byte to
+ * park the shadow there, so a lock this scan waits for can have its release
+ * sitting in that withheld WAL — waiting deadlocks the daemon against its own
+ * shadow. Such callers therefore never wait. Reading *without* the lock needs
+ * more than that: the position the caller named must be where replay actually
+ * is, which is what makes the pages stable.
+ */
+typedef enum WsScanLock
+{
+	/* No position named. Ordinary locking, and it may wait */
+	WS_SCAN_LOCK_WAIT = 0,
+	/* Position named but replay is elsewhere, so the caller's guarantee does
+	 * not hold: take the lock if free, error rather than wait or read past it */
+	WS_SCAN_LOCK_NOWAIT = 1,
+	/* Position named and verified: take the lock if free, read without it
+	 * otherwise */
+	WS_SCAN_LOCK_PINNED = 2,
+} WsScanLock;
+
+/*
  * `top` invalid reads the committed view; an empty `oids` reads the whole
  * catalog, which is the only mode pg_namespace and pg_type have.
  */
 extern void ws_overlay_scan(WsCatalog cat, TransactionId top,
-							const Oid *oids, int noids,
+							const Oid *oids, int noids, WsScanLock lock,
 							StringInfo out, WsScanStats *stats);
 
 #endif							/* WALSHADOW_H */

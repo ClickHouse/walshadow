@@ -297,7 +297,7 @@ mod tests {
                 type_len: if type_oid == INT4OID { 4 } else { -1 },
                 type_align: 'i',
                 type_storage: if type_oid == INT4OID { 'p' } else { 'x' },
-                missing_text: None,
+                missing_default: None,
             }],
         })
     }

@@ -539,7 +539,7 @@ mod tests {
             type_len: 4,
             type_align: 'i',
             type_storage: 'p',
-            missing_text: None,
+            missing_default: None,
         }
     }
 

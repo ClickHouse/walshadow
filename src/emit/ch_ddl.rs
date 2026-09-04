@@ -1126,7 +1126,7 @@ mod tests {
             type_len: 4,
             type_align: 'i',
             type_storage: 'p',
-            missing_text: missing.map(String::from),
+            missing_default: missing.map(|s| crate::schema::MissingDefault::Text(s.into())),
         }
     }
 

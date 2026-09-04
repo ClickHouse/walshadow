@@ -10,17 +10,25 @@
  *
  * Never opens the target relation. The replaying transaction holds
  * AccessExclusiveLock on it and standby lock replay is driven by the startup
- * process, so relation_open would block against recovery. Catalogs only, and
- * standby lock replay records AccessExclusiveLocks alone, so AccessShareLock
- * on a catalog never conflicts with the DDL in flight.
+ * process, so relation_open would block against recovery. Catalogs only.
+ *
+ * AccessShareLock on a catalog does not conflict with the DDL in flight, but
+ * that is not the only lock replay can be holding: any unrelated source
+ * transaction that took AccessExclusiveLock on the catalog itself — VACUUM
+ * truncating a bloated pg_type is the one seen in practice — leaves the
+ * startup process holding it until that transaction's commit record is
+ * replayed, and the caller is withholding exactly that record. A pinned scan
+ * therefore takes the lock only if it is free, and reads without it otherwise;
+ * see `ws_overlay_scan`.
  *
  * An invalid top xid asks the same scan for the committed view, which is what
  * the daemon captures at a catalog commit. Same projections, same assembly on
  * the other side, so committed and uncommitted descriptors cannot drift apart.
  *
  * Values are emitted in each type's text output form, one projection per
- * catalog. Projections mirror daemon descriptor inputs and Rust ScanRow
- * parsers. Bump WS_PROJECTION_VERSION on any change.
+ * catalog — except pg_attribute.attmissingval, shipped as raw hex bytes (the
+ * daemon decodes it). Projections mirror daemon descriptor inputs and Rust
+ * ScanRow parsers. Bump WS_PROJECTION_VERSION on any change.
  */
 #include "postgres.h"
 
@@ -36,6 +44,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "libpq/pqformat.h"
+#include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
@@ -99,6 +108,25 @@ static void
 ws_put_name(StringInfo out, const NameData *n)
 {
 	ws_put_str(out, NameStr(*n));
+}
+
+/* Raw bytes as lowercase hex, so the string-typed wire can carry binary. */
+static void
+ws_put_bytes_hex(StringInfo out, const unsigned char *bytes, int len)
+{
+	static const char hexdig[] = "0123456789abcdef";
+	int			i;
+
+	pq_sendint32(out, (uint32) len * 2);
+	for (i = 0; i < len; i++)
+	{
+		char		pair[2] = {
+			hexdig[(bytes[i] >> 4) & 0x0F],
+			hexdig[bytes[i] & 0x0F],
+		};
+
+		pq_sendbytes(out, pair, 2);
+	}
 }
 
 /* -------------------------------------------------------------------------
@@ -250,17 +278,13 @@ ws_emit_attribute(StringInfo out, HeapTuple tup, TupleDesc desc)
 			ws_put_null(out);
 		else
 		{
-			Oid			outfunc;
-			bool		varlena;
-
 			/*
-			 * Stored as anyarray; anyarray_out reads the element type from
-			 * the array header. A default whose element type was created by
-			 * this same uncommitted transaction is invisible to that lookup
-			 * and errors the request, degrading the capture.
+			 * Ship raw bytes; the daemon decodes the element. anyarray_out here
+			 * would take a pg_type lock the recovery replay may hold exclusive.
 			 */
-			getTypeOutputInfo(ANYARRAYOID, &outfunc, &varlena);
-			ws_put_str(out, OidOutputFunctionCall(outfunc, d));
+			struct varlena *arr = pg_detoast_datum((struct varlena *) DatumGetPointer(d));
+
+			ws_put_bytes_hex(out, (const unsigned char *) arr, (int) VARSIZE(arr));
 		}
 	}
 }
@@ -412,12 +436,74 @@ ws_scan_emit(Relation rel, const WsCatalogPlan *plan, Oid key,
 	systable_endscan(scan);
 }
 
+/* qsort/bsearch comparator over Oid */
+static int
+ws_oid_cmp(const void *a, const void *b)
+{
+	Oid			x = *(const Oid *) a;
+	Oid			y = *(const Oid *) b;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * One heap pass, emitting rows whose key attribute is in `sorted` (or every
+ * row when `nsorted` is 0). Used only when the catalog's lock was unavailable:
+ * `systable_beginscan` with an index would `index_open` it under
+ * AccessShareLock, which is the wait this path exists to avoid, so the index
+ * is skipped and the oid list is applied to the heap tuple instead.
+ *
+ * `scanned` counts rows that passed the oid filter, so it stays comparable to
+ * the indexed path.
+ */
+static void
+ws_scan_emit_lockfree(Relation rel, const WsCatalogPlan *plan,
+					  const Oid *sorted, int nsorted, TransactionId top,
+					  StringInfo out, WsScanStats *stats)
+{
+	SysScanDesc scan;
+	ScanKeyData skey[1];
+	int			nkeys = 0;
+	HeapTuple	tup;
+	TupleDesc	desc = RelationGetDescr(rel);
+	bool		scoped = nsorted > 0;
+
+	if (plan->min_attnum != 0)
+		ScanKeyInit(&skey[nkeys++], Anum_pg_attribute_attnum,
+					BTGreaterEqualStrategyNumber, F_INT2GE,
+					Int16GetDatum(plan->min_attnum));
+
+	scan = systable_beginscan(rel, InvalidOid, false, SnapshotAny, nkeys, skey);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		if (scoped)
+		{
+			bool		isnull;
+			Datum		key = heap_getattr(tup, plan->keyattno, desc, &isnull);
+			Oid			keyoid = DatumGetObjectId(key);
+
+			if (isnull)
+				continue;
+			if (bsearch(&keyoid, sorted, (size_t) nsorted, sizeof(Oid),
+						ws_oid_cmp) == NULL)
+				continue;
+		}
+		stats->scanned++;
+		if (!ws_tuple_visible(tup->t_data, top, scoped, stats))
+			continue;
+		stats->emitted++;
+		plan->emit(out, tup, desc);
+	}
+	systable_endscan(scan);
+}
+
 void
 ws_overlay_scan(WsCatalog cat, TransactionId top, const Oid *oids, int noids,
-				StringInfo out, WsScanStats *stats)
+				WsScanLock lock, StringInfo out, WsScanStats *stats)
 {
 	WsCatalogPlan plan;
 	bool		rel_scoped;
+	bool		locked;
 	Relation	rel;
 
 	if (!ws_catalog_plan(cat, &plan))
@@ -429,9 +515,50 @@ ws_overlay_scan(WsCatalog cat, TransactionId top, const Oid *oids, int noids,
 	 * pg_namespace and pg_type have. The lock argument comes with the list, so
 	 * losing the list loses the argument too */
 	rel_scoped = AttributeNumberIsValid(plan.keyattno) && noids > 0;
-	rel = table_open(plan.relid, AccessShareLock);
 
-	if (rel_scoped)
+	/*
+	 * See WsScanLock. A caller that named a replay position never waits here:
+	 * the release for a lock replay is holding can be in the WAL that caller
+	 * is withholding, so waiting deadlocks the daemon against its own shadow.
+	 * Reading without the lock is licensed only once that position is known to
+	 * be where replay is, which is what holds these pages still — together
+	 * with the shadow being read-only, so no local backend can write either.
+	 */
+	if (lock == WS_SCAN_LOCK_WAIT)
+	{
+		LockRelationOid(plan.relid, AccessShareLock);
+		locked = true;
+	}
+	else
+	{
+		locked = ConditionalLockRelationOid(plan.relid, AccessShareLock);
+		if (!locked && lock == WS_SCAN_LOCK_NOWAIT)
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("walshadow: %u is locked and replay is not at the position the scan named",
+							plan.relid),
+					 errdetail("Reading without the lock needs that position to hold; waiting for it can deadlock against withheld WAL.")));
+		if (!locked)
+			elog(DEBUG1,
+				 "walshadow: pinned scan of %u read without AccessShareLock",
+				 plan.relid);
+	}
+	rel = table_open(plan.relid, NoLock);
+
+	if (!locked)
+	{
+		Oid		   *sorted = NULL;
+
+		if (rel_scoped)
+		{
+			sorted = palloc_array(Oid, noids);
+			memcpy(sorted, oids, sizeof(Oid) * (size_t) noids);
+			qsort(sorted, (size_t) noids, sizeof(Oid), ws_oid_cmp);
+		}
+		ws_scan_emit_lockfree(rel, &plan, sorted, rel_scoped ? noids : 0,
+							  top, out, stats);
+	}
+	else if (rel_scoped)
 	{
 		int			i;
 
@@ -441,5 +568,7 @@ ws_overlay_scan(WsCatalog cat, TransactionId top, const Oid *oids, int noids,
 	else
 		ws_scan_emit(rel, &plan, InvalidOid, top, false, out, stats);
 
-	table_close(rel, AccessShareLock);
+	table_close(rel, NoLock);
+	if (locked)
+		UnlockRelationOid(plan.relid, AccessShareLock);
 }

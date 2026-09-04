@@ -83,7 +83,7 @@ use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::pos::{Floor, Pos};
-use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
+use crate::schema::{MissingDefault, RelAttr, RelDescriptor, RelName, ReplIdent};
 use ahash::{HashMap, HashSet, HashSetExt};
 
 pub const CKPT_FILE: &str = "desc_log.ckpt";
@@ -978,16 +978,20 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
     push_u32(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
 }
-fn push_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
-    match s {
+fn push_opt_missing(out: &mut Vec<u8>, m: Option<&MissingDefault>) {
+    match m {
         None => push_u8(out, 0),
-        Some(s) => {
+        Some(MissingDefault::Text(s)) => {
             push_u8(out, 1);
             push_str(out, s);
         }
+        Some(MissingDefault::Raw(b)) => {
+            push_u8(out, 2);
+            push_u32(out, b.len() as u32);
+            out.extend_from_slice(b);
+        }
     }
 }
-
 fn encode_header(id: &DescLogIdentity) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -1123,7 +1127,7 @@ fn encode_descriptor(out: &mut Vec<u8>, d: &RelDescriptor) {
         push_i16(out, a.type_len);
         push_u8(out, a.type_align as u8);
         push_u8(out, a.type_storage as u8);
-        push_opt_str(out, a.missing_text.as_deref());
+        push_opt_missing(out, a.missing_default.as_ref());
     }
 }
 
@@ -1226,10 +1230,16 @@ impl<'a> Cur<'a> {
         let bs = self.need(n)?;
         String::from_utf8(bs.to_vec()).map_err(|e| self.corrupt(format!("utf8: {e}")))
     }
-    fn opt_string(&mut self) -> Result<Option<String>> {
+    fn opt_missing(&mut self) -> Result<Option<MissingDefault>> {
         Ok(match self.u8()? {
             0 => None,
-            _ => Some(self.string()?),
+            1 => Some(MissingDefault::Text(self.string()?)),
+            2 => {
+                let n = self.u32()? as usize;
+                let bs = self.need(n)?;
+                Some(MissingDefault::Raw(bs.to_vec()))
+            }
+            t => return Err(self.corrupt(format!("missing_default tag {t}"))),
         })
     }
     fn charlike(&mut self) -> Result<char> {
@@ -1538,7 +1548,7 @@ fn decode_descriptor(cur: &mut Cur<'_>) -> Result<RelDescriptor> {
             type_len: cur.i16()?,
             type_align: cur.charlike()?,
             type_storage: cur.charlike()?,
-            missing_text: cur.opt_string()?,
+            missing_default: cur.opt_missing()?,
         });
     }
     Ok(RelDescriptor {
@@ -1606,7 +1616,7 @@ mod tests {
                 type_len: 8,
                 type_align: 'd',
                 type_storage: 'p',
-                missing_text: None,
+                missing_default: None,
             },
             // Dropped slot: physical layout retained, type link severed
             RelAttr {
@@ -1621,7 +1631,7 @@ mod tests {
                 type_len: -1,
                 type_align: 'i',
                 type_storage: 'x',
-                missing_text: None,
+                missing_default: None,
             },
         ];
         if extra_col {
@@ -1637,7 +1647,7 @@ mod tests {
                 type_len: 4,
                 type_align: 'i',
                 type_storage: 'p',
-                missing_text: Some("42".into()),
+                missing_default: Some("42".into()),
             });
         }
         Arc::new(RelDescriptor {

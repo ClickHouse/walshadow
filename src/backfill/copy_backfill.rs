@@ -1192,7 +1192,7 @@ mod tests {
             type_len: 8,
             type_align: 'd',
             type_storage: 'p',
-            missing_text: None,
+            missing_default: None,
         }
     }
 
