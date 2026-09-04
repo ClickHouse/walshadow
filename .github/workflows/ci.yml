@@ -152,6 +152,12 @@ jobs:
           make PG_CONFIG=$PG_CONFIG
           sudo make PG_CONFIG=$PG_CONFIG install
 
+      # Separate module, never installed: catalog_ael_boundary loads it into
+      # the *source* cluster to reproduce VACUUM's lock lifetime deterministically
+      - name: Build walshadow test-only PG module
+        working-directory: walshadow/pgext/test
+        run: make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg-major }}/bin/pg_config
+
       # Each e2e test stages a source + shadow PG cluster on disk; the
       # runner's root fs is small, so point TMPDIR at the larger /mnt volume.
       - name: Set TMPDIR to /mnt

@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 1;
 
@@ -264,15 +264,34 @@ impl Bridge {
     /// have. Losing the oid list loses the lock argument with it, so an
     /// uncommitted whole-catalog read fails rather than guess at a writer whose
     /// parentage standby `pg_subtrans` cannot resolve
+    ///
+    /// Unpinned: the worker locks the catalog the ordinary way. Callers holding
+    /// replay still use [`scan_at`](Self::scan_at)
     pub async fn scan(
         &self,
         cat: Catalog,
         top_xid: u32,
         oids: &[u32],
     ) -> Result<ScanResult, BridgeError> {
-        let mut payload = Vec::with_capacity(9 + oids.len() * 4);
+        self.scan_inner(cat, top_xid, oids, 0).await
+    }
+
+    /// `boundary` is the replay position the caller has parked the shadow at,
+    /// or `0` when it has not parked one. Naming it licenses the worker to read
+    /// a catalog whose lock replay is holding — necessary because that lock's
+    /// release can be in the WAL the caller is withholding — so the worker
+    /// re-checks the position before doing so.
+    async fn scan_inner(
+        &self,
+        cat: Catalog,
+        top_xid: u32,
+        oids: &[u32],
+        boundary: u64,
+    ) -> Result<ScanResult, BridgeError> {
+        let mut payload = Vec::with_capacity(17 + oids.len() * 4);
         payload.push(cat as u8);
         payload.extend_from_slice(&top_xid.to_be_bytes());
+        payload.extend_from_slice(&boundary.to_be_bytes());
         payload.extend_from_slice(&(oids.len() as u32).to_be_bytes());
         for oid in oids {
             payload.extend_from_slice(&oid.to_be_bytes());
@@ -335,20 +354,21 @@ impl Bridge {
         oids: &[u32],
         boundary: u64,
     ) -> Result<ScanResult, BridgeError> {
-        let res = self.scan(cat, top_xid, oids).await?;
+        let res = self.scan_inner(cat, top_xid, oids, boundary).await?;
         self.pinned(res, boundary)
     }
 
     /// First scan of a read with no boundary of its own: whatever position it
     /// reports becomes the pin for the rest, so only a move inside this one
-    /// scan fails here
+    /// scan fails here. Sent unpinned — the caller has nothing to assert yet,
+    /// so the worker keeps normal locking for it
     pub async fn scan_pinning(
         &self,
         cat: Catalog,
         top_xid: u32,
         oids: &[u32],
     ) -> Result<ScanResult, BridgeError> {
-        let res = self.scan(cat, top_xid, oids).await?;
+        let res = self.scan_inner(cat, top_xid, oids, 0).await?;
         let boundary = res.replay_lsn_start;
         self.pinned(res, boundary)
     }

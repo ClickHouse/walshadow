@@ -312,6 +312,8 @@ ws_handle_scan(StringInfo req, StringInfo resp)
 {
 	WsCatalog	cat = (WsCatalog) pq_getmsgbyte(req);
 	TransactionId top = (TransactionId) pq_getmsgint(req, 4);
+	/* Replay position the caller parked at, 0 when it has not parked one */
+	uint64		boundary = pq_getmsgint64(req);
 	uint32		noids = pq_getmsgint(req, 4);
 	int			ncols = ws_overlay_ncols(cat);
 	Oid		   *oids = NULL;
@@ -319,6 +321,7 @@ ws_handle_scan(StringInfo req, StringInfo resp)
 	WsScanStats stats = {0, 0, 0};
 	uint64		lsn_start;
 	uint64		lsn_end;
+	WsScanLock	lock;
 	uint32		i;
 
 	if (ncols < 0)
@@ -340,12 +343,22 @@ ws_handle_scan(StringInfo req, StringInfo resp)
 
 	initStringInfo(&rows);
 	/*
-	 * Caller asserts both LSNs equal the boundary it parked replay at. Equal
-	 * but wrong is impossible: replay cannot rewind, and the daemon holds the
-	 * successor bytes.
+	 * Both LSNs go back for the caller to check against the boundary it parked
+	 * replay at. Equal but wrong is impossible: replay cannot rewind, and the
+	 * daemon holds the successor bytes.
+	 *
+	 * The pre-scan sample also decides how the scan may treat the catalog's
+	 * lock: reading without it needs replay to actually be where the caller
+	 * says, and that cannot be judged from the response.
 	 */
 	lsn_start = (uint64) GetXLogReplayRecPtr(NULL);
-	ws_overlay_scan(cat, top, oids, (int) noids, &rows, &stats);
+	if (boundary == 0)
+		lock = WS_SCAN_LOCK_WAIT;
+	else if (lsn_start == boundary)
+		lock = WS_SCAN_LOCK_PINNED;
+	else
+		lock = WS_SCAN_LOCK_NOWAIT;
+	ws_overlay_scan(cat, top, oids, (int) noids, lock, &rows, &stats);
 	lsn_end = (uint64) GetXLogReplayRecPtr(NULL);
 
 	pq_sendbyte(resp, WS_STATUS_OK);

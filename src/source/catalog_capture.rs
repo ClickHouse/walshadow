@@ -432,10 +432,10 @@ impl CatalogCapture {
             let mut cat = self.catalog.lock().await;
             if info.capture_all {
                 self.stats.capture_all_runs.fetch_add(1, Relaxed);
-                cat.fetch_all_descriptors().await
+                cat.fetch_all_descriptors_at(next_lsn).await
             } else {
                 let oids: Vec<Oid> = info.oids.iter().map(|a| a.oid).collect();
-                cat.fetch_descriptors_batch(&oids).await
+                cat.fetch_descriptors_batch_at(&oids, next_lsn).await
             }
         }
         .map_err(|e| SinkError::Other(format!("descriptor capture at {commit_lsn:#X}: {e}")))?;
