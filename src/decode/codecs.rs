@@ -59,7 +59,7 @@ pub fn decode_text_array(body: &[u8]) -> Option<Vec<String>> {
     let nitems = usize::try_from(word(12)?).ok()?;
     // ARR_DATA_PTR: MAXALIGN(sizeof(ArrayType) + 2 * 4 * ndim) less stripped header
     let mut cursor = 20usize;
-    let mut values = Vec::new();
+    let mut values = Vec::with_capacity(nitems);
     for _ in 0..nitems {
         cursor = cursor.next_multiple_of(4);
         // Elements keep their own varlena header, nominal-aligned (`array_out`)
@@ -189,7 +189,7 @@ pub fn decode_numeric(body: &[u8]) -> Result<NumericKind, CodecError> {
         (sign, weight, dscale, 4usize)
     };
 
-    let mut digits = Vec::new();
+    let mut digits = Vec::with_capacity((body.len() - digits_off) / 2);
     let mut cur = digits_off;
     while cur + 2 <= body.len() {
         digits.push(i16::from_le_bytes([body[cur], body[cur + 1]]));

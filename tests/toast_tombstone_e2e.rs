@@ -77,8 +77,7 @@ fn live_values_sql(chunk_table: &str, max_lsn: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 

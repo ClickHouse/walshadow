@@ -79,8 +79,7 @@ fn doc_mappings() -> Vec<fx::TableMappingSpec> {
 /// fires and the mirror leaks indefinitely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_restart_drop_retires_mirror() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -239,8 +238,7 @@ async fn cold_restart_drop_retires_mirror() {
 /// as the durable original, equal-version rows dedup can't arbitrate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_crash_replay_keeps_referrer_bytes() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -404,8 +402,7 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
 /// WAL pumped at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_retire_survives_restart_from_ledger() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 

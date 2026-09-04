@@ -26,16 +26,7 @@ use walshadow::schema::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_replicates_dml() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    if !fx::pg_basebackup_available() {
-        eprintln!("skip: no pg_basebackup on PATH");
-        return;
-    }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::requirements_available() {
         return;
     }
 
@@ -266,16 +257,7 @@ const META2_SQL: &str = "repeat('v2-update-', 60)";
 /// the max-`_lsn` row, not NULL-skipping argMax) catches it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_slices_multi_batch_commit() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    if !fx::pg_basebackup_available() {
-        eprintln!("skip: no pg_basebackup on PATH");
-        return;
-    }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::requirements_available() {
         return;
     }
 

@@ -37,16 +37,18 @@ for rendered diagram. Five clusters top→bottom:
    snapshot via `seed_in_snapshot` so concurrent DDL during seed read
    does not tear
 2. **BASE_BACKUP pump** — `BackupSource` (Direct or ObjectStore) opens
-   backup; `MultiplexSink` dispatches each `FileMeta`:
+   backup; the backup-window WAL leg (below) starts alongside it;
+   `MultiplexSink` dispatches each `FileMeta`:
    - catalog filenodes & system files → `DiskLanderSink` (Keep) →
      written to shadow `data_dir`
-   - user heap → `PageWalkSink` (Tap) → decoded 8 KiB at a time
+   - user heap → `PageWalkSink` (Tap) → decoded 8 KiB at a time, less
+     the main files the caller declined (unmapped, repair-pending)
    - denylist contents → Skip; denylist dir entries themselves → Keep
      as empty dirs
 3. **Drain → CH** (concurrent with step 2) — `PageWalkSink` ships
    `BackfillTuple`s through bounded mpsc (`BOOTSTRAP_TUPLE_CHANNEL_CAP
-   = 256`, backpressures the tar pump) to
-   `pipeline::bootstrap::drain`, which synthesizes rows
+   = 256`, backpressures the tar pump) through the visibility gate
+   (below) to `pipeline::bootstrap::drain`, which synthesizes rows
    `{ op=Insert, commit_lsn=start_lsn }` against the snapshot
    `CatalogMap` and routes into the shared insert tail (batcher +
    inserter pool + ack collector, same unit as streaming — see
@@ -66,7 +68,9 @@ for rendered diagram. Five clusters top→bottom:
    (see [shadow.md](shadow.md)). Daemon empties `postgresql.auto.conf`, starts
    shadow with `start_with_floor_retry`, waits for `end_lsn` with
    `wait_for_replay`, then supervises it (see [shadow.md](shadow.md))
-5. **Manifest + WAL pump start** — the ack atomic seeds at `end_lsn`
+5. **Manifest + WAL pump start** — the window leg has sealed its tail by
+   here, so the range below `end_lsn` is durable on CH before the pump
+   takes over. The ack atomic seeds at `end_lsn`
    (first status tick persists it to `manifest.toml`), `SourceFeed`
    opens `START_REPLICATION PHYSICAL <slot> <end_lsn>`, steady-state
    emitter (now backed by live `ShadowCatalog`) takes over.
@@ -75,6 +79,95 @@ for rendered diagram. Five clusters top→bottom:
 
 Phases 1-3 run synchronously inside `run_bootstrap`; phases 4-5 hand off
 to daemon's main loop
+
+## Backup-window WAL leg
+
+`BASE_BACKUP` produces a mix of page states across `[start_lsn, end_lsn]`.
+Shadow recovery settles that mix with WAL. Window leg does same for
+ClickHouse, emitting commits at real LSNs above walked rows tagged at
+`start_lsn`.
+
+WAL comes from one of two places:
+
+- **Direct:** stream from source position sampled before `BASE_BACKUP`, using
+  daemon's replication connection without claiming its slot
+- **Archive or object store:** replay WAL hydrated into shadow `pg_wal/`
+
+Direct mode falls back to landed WAL when live streaming fails. Bootstrap
+fails if both paths fail.
+
+Read starts at segment boundary below sampled position. Commits through
+sampled position are ignored because walked pages cover them.
+
+Leg reads through `end_lsn`, updates `PgXactPatch`, then waits within a bound
+for transactions opened below handoff. Pump overlap is deduplicated by commit
+LSN.
+
+If transactions remain open, `open_floor` reports their earliest buffered
+record and pump resumes there when a pre-created slot retains it. Initial
+manifest persists this lower position. Without a slot, pump resumes at
+`end_lsn`, see V1 limits.
+
+Window decoding uses pre-backup descriptors. Unknown filenodes increment
+`unknown_rfns`; DDL during bootstrap remains unsupported.
+
+Live leg leaves its connection in `COPY`; replacement connection must match
+sampled system ID and timeline.
+
+Direct mode needs two WAL senders for base backup and window leg. Metrics-only
+mode skips leg.
+
+## Visibility gate
+
+Page walk sees dead, aborted, and in-flight versions. Visibility gate uses
+hint bits and backup transaction logs to select live tuples.
+
+Gate sits between page walk and drain (`visibility_gate::stream_phase`,
+shared with backup-sourced per-table loads). Emit when `xmin` committed and
+`xmax` is absent or aborted.
+
+Unsettled tuples enter `DeferredSpool` and resolve after backup lands. Reading
+partial `pg_xact` earlier could classify a committed deleter as in flight.
+
+Resolution runs after the backup-window leg, not at walk end
+(`visibility_gate::resolve_greenfield`):
+
+- read landed `pg_xact` and `pg_multixact`
+- overlay window commits from `PgXactPatch`
+- ship survivors on a new tail at `_lsn = start_lsn`
+
+Window leg re-emits tuples committed inside window. Transactions open past
+handoff remain limited, see V1 limits.
+
+TOAST chunks use a one-sided gate: drop only when hint bits prove them dead.
+Chunk TID breaks same-LSN ties between reused value IDs.
+
+## Visibility repair
+
+When backup `pg_multixact` cannot decide visibility, gate marks whole relation
+pending. `visibility_repair::repair` replaces walked tuples with visible,
+detoasted rows from PostgreSQL `COPY`.
+
+Relations owning a TOAST relation are pending before the first page is read.
+A `(value_id, chunk_seq)` mirror cannot distinguish reused generations.
+
+Pending covers the mapping snapshot only. The drain routes by mapping, so a
+`COPY` of an unmapped relation ships rows it drops.
+
+The walk declines main files of pending and unmapped relations; their bodies
+drain unread. Any relation holding an unbounded varlena column owns TOAST
+storage (PG `heapam_relation_needs_toast_table`), so page decode serves
+fixed-width relations and repair carries the rest.
+
+Chunk pages still seed mirror for later WAL rows carrying unchanged external
+pointers. Missing mirror data remains fatal.
+
+Repaired rows use `start_lsn`, ensuring covered WAL outranks baseline rows.
+
+Dropped, rewritten, or reshaped relations fail repair under DDL-quiesce
+contract.
+
+Per-table loads stop instead of repairing. Metrics-only runs skip gate.
 
 ## Bootstrap oracle — tier-3 resolution
 
@@ -326,8 +419,9 @@ forks route identically
 matrix in diagram above. Lander never asks for `chunk()` (only Keeps
 or Skips). Tap sink can decline a user-heap entry by returning `Skip`,
 in which case body drops unread — `PageWalkSink::begin` does this for
-`pg_control` etc that arrive at user-heap-looking paths or for files
-whose path does not parse as `base/<db>/<filenode>`
+`pg_control` etc that arrive at user-heap-looking paths, for files
+whose path does not parse as `base/<db>/<filenode>`, and for main files
+the caller declined up front (`with_skip_filenodes`)
 
 Stats recovery: orchestrator holds two `Arc` clones to same
 `Mutex<MultiplexSink<PageWalkSink>>` — one typed for stats teardown &
@@ -370,9 +464,15 @@ backfill row tags identically
 V1 limits:
 
 - **No FPI replay on backup pages.** Pages with `pd_lsn < start_lsn`
-  captured mid-write walk as they land in the backup. WAL in
-  `[start_lsn, end_lsn]` updating same tuples re-emits at higher `_lsn` &
-  `ReplacingMergeTree(_lsn)` collapses duplicate
+  walk as they land in the backup; the window leg re-emits every tuple WAL
+  touched in `[start_lsn, end_lsn]` at its real commit LSN, and
+  `ReplacingMergeTree(_lsn)` keeps that over the walked copy
+- **Writers open past the handoff.** A transaction still open when the
+  window leg stops can leave missing inserts or stale deletes. A pre-created
+  slot lets pump rebuild in-window records from `open_floor`; records before
+  window remain uncovered.
+  [future/bootstrap_open_xact_carry.md](future/bootstrap_open_xact_carry.md)
+  keeps those tuples until the transaction settles
 - **TOAST-spilled columns resolve when a chunk store is configured.**
   Inline varlena decodes through the heap decoder; external pointers
   surface as `ColumnValue::ExternalToast`. With `[toast] mode != disabled`

@@ -48,6 +48,10 @@ use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
+use walshadow::backfill::visibility_gate::{
+    GateStats, PendingGate, resolve_greenfield, stream_phase,
+};
+use walshadow::backfill::visibility_repair::PendingSet;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, BootstrapOutcome, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
 };
@@ -66,7 +70,8 @@ use walshadow::manifest;
 use walshadow::mapping::{DropTableStrategy, MappingHandle};
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, RateEstimator};
 use walshadow::pg::{quote_ident, socket_conninfo};
-use walshadow::pipeline::{Fatal, PipelineConfig, TailKind, bootstrap, tail};
+use walshadow::pipeline::tail::OwnedTail;
+use walshadow::pipeline::{Fatal, PipelineConfig, TailKind, bootstrap};
 use walshadow::pos::{
     Drain, EmitterAck, FilterDispatched, FilterDurable, Floor, Gate, Monotone, Pos, ShadowFlush,
     ShadowReplay, SourceReceived,
@@ -74,7 +79,9 @@ use walshadow::pos::{
 use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
-use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE};
+use walshadow::record::{
+    MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE, segments_covering,
+};
 use walshadow::retention::{
     DEFAULT_RETENTION_BYTES, DEFAULT_TRIM_INTERVAL, max_segment_end, trim_below_lsn,
 };
@@ -90,6 +97,7 @@ use walshadow::transition::{
     CrossingState, CrossingWedge, ForkGuards, Switchover, TimelineStats, TransitionError,
     load_boot_history, seed_shadow_branches,
 };
+use walshadow::visibility::PgXactPatch;
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
@@ -98,6 +106,13 @@ struct BootstrapPlan {
     mode: BootstrapMode,
     backup_name: String,
     parallelism: Option<usize>,
+}
+
+impl BootstrapPlan {
+    /// Stream window live for Direct mode, replay hydrated WAL otherwise
+    fn live_window_leg(&self, args: &Args) -> bool {
+        self.mode == BootstrapMode::Direct && !args.bootstrap_wal_from_archive
+    }
 }
 
 /// `cli_over_toml` plus a ≥1 clamp for pool/batch sizes.
@@ -535,6 +550,11 @@ struct Args {
     /// cost matters more than bootstrap latency.
     #[arg(long, default_value_t = true)]
     bootstrap_fast_checkpoint: bool,
+    /// BASE_BACKUP `MAX_RATE` in kB/s for `direct` mode (PG accepts
+    /// 32..1048576). Caps the backup's read bandwidth on the source; the
+    /// window WAL leg keeps the destination converging while it streams
+    #[arg(long, value_parser = clap::value_parser!(i32).range(32..=1_048_576))]
+    bootstrap_max_rate_kib: Option<i32>,
     /// Fetch the bootstrap WAL window from the `[backup]` bucket instead of
     /// inside `base.tar` (`direct` mode only). Source then needn't retain or
     /// re-ship `[start_lsn, end_lsn]`, which is what fills its disk at high
@@ -654,12 +674,16 @@ fn build_otlp_provider(
 fn init_tracing(
     otlp_endpoint: Option<&str>,
 ) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use std::io::IsTerminal;
+
     use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
+        // Redirected stderr is read by tests and log collectors, not a pager
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr);
 
     // Best-effort: a bad endpoint logs and degrades to no-traces rather
@@ -937,29 +961,35 @@ async fn run_session(
             .with_context(|| format!("ensure physical replication slot {slot}"))?;
         tracing::info!(target: "walshadow", slot, "physical replication slot ready");
     }
-    let bootstrap_end_lsn: Option<u64> = if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
-        if !args.skip_preflight {
-            let source_sql = feed
-                .sql_client()
+    let bootstrap_handoff: Option<BootstrapHandoff> =
+        if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
+            if !args.skip_preflight {
+                let source_sql = feed
+                    .sql_client()
+                    .await
+                    .context("source sidecar sql for bootstrap pre-flight")?;
+                walshadow::preflight::bootstrap(walshadow::preflight::BootstrapInputs {
+                    source_sql,
+                    wal_from_archive: args.bootstrap_wal_from_archive,
+                    window_leg: bootstrap_plan.live_window_leg(args),
+                })
                 .await
-                .context("source sidecar sql for bootstrap pre-flight")?;
-            walshadow::preflight::bootstrap(walshadow::preflight::BootstrapInputs {
-                source_sql,
-                wal_from_archive: args.bootstrap_wal_from_archive,
-            })
-            .await
-            .context("bootstrap pre-flight probe")?
-            .into_result()
-            .context("pre-flight rejected bootstrap")?;
-        }
-        Some(
-            run_bootstrap(&cfg, &mut feed, args, &bootstrap_plan, ch_config.clone())
-                .await
-                .context("bootstrap")?,
-        )
-    } else {
-        None
-    };
+                .context("bootstrap pre-flight probe")?
+                .into_result()
+                .context("pre-flight rejected bootstrap")?;
+            }
+            Some(
+                run_bootstrap(&cfg, &mut feed, args, &bootstrap_plan, ch_config.clone())
+                    .await
+                    .context("bootstrap")?,
+            )
+        } else {
+            None
+        };
+    let bootstrap_end_lsn: Option<u64> = bootstrap_handoff.as_ref().map(|h| h.end_lsn);
+    let bootstrap_resume_lsn: Option<u64> = bootstrap_handoff
+        .as_ref()
+        .map(|h| h.resume_lsn(source_conn.slot.is_some()));
     // Regenerate config because shadow's port, socket, and GUC floor may change
     // Keep shadow alive until pipeline teardown finishes
     let shadow_lifecycle: Option<ShadowLifecycle> = match &shadow_start {
@@ -1021,10 +1051,7 @@ async fn run_session(
                 );
             }
         };
-    // Resume precedence: `--start-lsn` > bootstrap end > manifest emitter-ack
-    // > greenfield (source write head). `--ignore-cursor` forces greenfield
-    // (recovery drills). Bootstrap `end_lsn` outranks the manifest: shadow
-    // catalog state is at `end_lsn`, so consuming WAL before it double-counts.
+    // Precedence: explicit > bootstrap > manifest > greenfield head
     let manifest_at_boot = if args.ignore_cursor {
         None
     } else {
@@ -1032,7 +1059,7 @@ async fn run_session(
     };
     let raw_start = manifest::resolve_resume_lsn(
         start_lsn_override,
-        bootstrap_end_lsn.map(Pos::new),
+        bootstrap_resume_lsn.map(Pos::new),
         manifest_at_boot.as_ref().map(|m| m.lsn.emitter_ack),
         ident.xlogpos,
     );
@@ -1330,14 +1357,11 @@ async fn run_session(
         "spill dir ready",
     );
 
-    // Persist the bootstrap end LSN as the initial resume manifest so a restart
-    // in the window before the first manifest write resumes from `end_lsn` (like
-    // a standby reading its backup's redo point) instead of falling to greenfield
-    // head and skipping `(end_lsn, head]`. Only after a fresh bootstrap.
-    if let Some(end_lsn) = bootstrap_end_lsn {
+    // Persist handoff before streaming can advance manifest
+    if let (Some(end_lsn), Some(resume)) = (bootstrap_end_lsn, bootstrap_resume_lsn) {
         let initial = manifest::Manifest {
             version: manifest::MANIFEST_VERSION,
-            floor: manifest::resolved_floor(end_lsn, end_lsn),
+            floor: manifest::resolved_floor(resume, end_lsn),
             source: live_identity.clone(),
             wal: manifest::WalBranch {
                 stream_timeline: start_timeline,
@@ -1346,8 +1370,8 @@ async fn run_session(
                 source_received: end_lsn.into(),
                 filter_durable: end_lsn.into(),
                 shadow_replay: end_lsn.into(),
-                drain: end_lsn.into(),
-                emitter_ack: end_lsn.into(),
+                drain: resume.into(),
+                emitter_ack: resume.into(),
                 shadow_flush: end_lsn.into(),
             },
         };
@@ -4173,7 +4197,7 @@ async fn run_bootstrap(
     args: &Args,
     plan: &BootstrapPlan,
     ch_config: Option<EmitterConfig>,
-) -> Result<u64> {
+) -> Result<BootstrapHandoff> {
     let shadow_data_dir = args
         .bootstrap_shadow_data_dir
         .clone()
@@ -4232,7 +4256,7 @@ async fn run_bootstrap(
                 ),
                 fast_checkpoint: args.bootstrap_fast_checkpoint,
                 no_verify_checksums: false,
-                max_rate_kib: None,
+                max_rate_kib: args.bootstrap_max_rate_kib,
                 wal: hydrate.is_none(),
             };
             (Box::new(DirectSource::new(src_cfg.clone(), opts)), hydrate)
@@ -4284,34 +4308,71 @@ async fn run_bootstrap(
     };
     let store_toast = resolver.stores_chunks();
 
-    let ch_target = match ch_config {
+    let (ch_target, walk_skip) = match ch_config {
         Some(emitter_cfg) => {
             let (mapping, resolved) = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
                 .await
                 .context("bootstrap: build mapping")?;
-            Some((emitter_cfg, mapping, resolved))
+            // Repair TOAST-owning relations instead of trusting chunk
+            // generations, scoped to what the drain routes
+            let routed = mapping.snapshot().await;
+            let mapped: HashSet<_> = drain_catalog
+                .descriptors()
+                .filter(|d| routed.contains_key(&d.rel_name))
+                .map(|d| (d.rfn.db_node, d.rfn.rel_node))
+                .collect();
+            let pending = PendingSet::toast_capable(&drain_catalog).scoped_to(mapped.clone());
+            // Main pages nothing keeps: unmapped rows drop at the drain's
+            // route lookup, pending rows are replaced by repair. Chunk files
+            // still walk, the mirror seeds from every one of them
+            let skip = drain_catalog
+                .descriptors()
+                .map(|d| (d.rfn.db_node, d.rfn.rel_node))
+                .filter(|&(db, rel)| {
+                    !drain_catalog.is_toast(db, rel)
+                        && (!mapped.contains(&(db, rel)) || pending.holds(db, rel))
+                })
+                .collect();
+            (Some((emitter_cfg, mapping, resolved, pending)), skip)
         }
-        None => None,
+        None => (None, HashSet::default()),
     };
 
     prepare_bootstrap_dir(&shadow_data_dir)
         .await
         .context("prepare shadow data dir for bootstrap")?;
 
-    let cfg = BootstrapConfig::new(shadow_data_dir.clone());
+    // Sample window floor before BASE_BACKUP
+    let source_ident = feed
+        .identify_system()
+        .await
+        .context("bootstrap: sample source write head for the window leg")?;
+    let source_major = (feed.server_version_num() / 10000) as u32;
+
+    let cfg = BootstrapConfig::new(shadow_data_dir.clone()).with_skip_filenodes(walk_skip);
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
 
-    let (shipped, outcome) = if let Some((emitter_cfg, mapping, resolved)) = ch_target {
+    // Keep oracle alive through live or file window replay
+    let mut bootstrap_oracle: Option<walshadow::backfill::bootstrap_oracle::BootstrapOracle> = None;
+    let mut window_cfg: Option<walshadow::backfill::bootstrap_window::WindowLegConfig> = None;
+    // Overlay window transaction outcomes on backup pg_xact
+    let window_patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
+    // Metrics-only mode has no pending gate
+    let mut pending_gate: Option<PendingGate> = None;
+    // Preserve live failure if file fallback also fails
+    let mut window_leg_error: Option<anyhow::Error> = None;
+    let window_scratch = args.spill_dir.join("bootstrap_window");
+    tokio::fs::remove_dir_all(&window_scratch).await.ok();
+
+    let (shipped, outcome, mut window) = if let Some(target) = ch_target {
+        let (emitter_cfg, mapping, resolved, pending) = target;
         // Route bootstrap rows through the shared insert tail. Bootstrap
         // is the easy case: every row op=Insert at _lsn = start_lsn, no
         // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
         // defaults 0 to its own partial-flush deadline.
         let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
         let stats = bootstrap_stats.clone();
-        // Throwaway watermark: durability proof is `wait_through(K)`,
-        // resume LSN is carried via the WAL pipeline's emitter_ack seed
-        // (see `run`), so uniform `commit_lsn = start_lsn` here is fine.
-        let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
+        // Window leg shares the tail's fatal, so a CH outage stops both
         let fatal = Fatal::new();
         let inserter_pool_size = emitter_cfg.inserter_pool_size;
 
@@ -4327,12 +4388,12 @@ async fn run_bootstrap(
                 "prefer"
             },
         );
-        let bootstrap_oracle = if walshadow::backfill::bootstrap_oracle::needs_oracle(
+        if walshadow::backfill::bootstrap_oracle::needs_oracle(
             &drain_catalog,
             &mapping.snapshot().await,
             &resolved.column_rules,
         ) {
-            Some(
+            bootstrap_oracle = Some(
                 walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
                     args.spill_dir.join("bootstrap_oracle"),
                     source_conninfo,
@@ -4345,22 +4406,23 @@ async fn run_bootstrap(
                     "bootstrap oracle: greenfield needs it to convert oracle columns; \
                      refusing to load empty columns",
                 )?,
-            )
-        } else {
-            None
-        };
+            );
+        }
 
-        let (msg_tx, ack, tail) = tail::spawn_with_config(
+        // Throwaway watermark: durability proof is `wait_through(K)`, resume
+        // LSN is carried via the WAL pipeline's emitter_ack seed (see `run`),
+        // so uniform `commit_lsn = start_lsn` here is fine.
+        let tail = OwnedTail::spawn(
             &emitter_cfg,
             inserter_pool_size,
             stats.clone(),
-            emitter_ack,
             fatal.clone(),
             None,
             bootstrap_oracle.as_ref().map(|o| o.oracle()),
+            "bootstrap",
         )
         .await
-        .context("bootstrap: spawn insert tail")?;
+        .map_err(anyhow::Error::msg)?;
         tracing::info!(
             target: "walshadow::bootstrap",
             addr = %addr,
@@ -4371,7 +4433,7 @@ async fn run_bootstrap(
         // `initial_load = "none"` (table override, else namespace) opts a
         // relation out of the greenfield snapshot: create it + stream CDC, but
         // don't page-walk its existing rows.
-        let skip_initial: std::collections::HashSet<_> = drain_catalog
+        let skip_initial: HashSet<_> = drain_catalog
             .descriptors()
             .filter_map(|d| {
                 let rn = &d.rel_name;
@@ -4389,14 +4451,63 @@ async fn run_bootstrap(
             })
             .collect();
 
+        // Run WAL window beside page walk when user relations exist
+        window_cfg = (!drain_catalog.is_empty()).then(|| {
+            walshadow::backfill::bootstrap_window::WindowLegConfig {
+                emitter: emitter_cfg.clone(),
+                mapping: mapping.clone(),
+                config: resolved.clone(),
+                stats: stats.clone(),
+                resolver: resolver.clone(),
+                oracle: bootstrap_oracle.as_ref().map(|o| o.oracle()),
+                fatal: fatal.clone(),
+                scratch_dir: window_scratch.clone(),
+                patch: window_patch.clone(),
+                catalog: drain_catalog.clone(),
+                pg_major: source_major,
+                system_id: source_ident.sysid.clone(),
+                timeline: source_ident.timeline,
+            }
+        });
+        let live_cfg = window_cfg.clone().filter(|_| plan.live_window_leg(args));
+
+        // Gate page tuples, defer unknowns until transaction logs land
+        let gate_spool_path = args.spill_dir.join("bootstrap_gate_deferred.bin");
+        tokio::fs::remove_file(&gate_spool_path).await.ok();
+        let (gated_tx, gated_rx) =
+            tokio::sync::mpsc::channel::<walshadow::backup_page_walk::BackfillTuple>(
+                walshadow::backup_page_walk::BOOTSTRAP_TUPLE_CHANNEL_CAP,
+            );
+        let gate = tokio::spawn({
+            let catalog = drain_catalog.clone();
+            let mut rx = rx;
+            let mut spool = walshadow::spool::DeferredSpool::new(
+                gate_spool_path,
+                walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
+            );
+            async move {
+                let mut gate_stats = GateStats::default();
+                stream_phase(
+                    &mut rx,
+                    &gated_tx,
+                    &catalog,
+                    &pending,
+                    &mut spool,
+                    &mut gate_stats,
+                )
+                .await
+                .map(|()| (gate_stats, spool, pending))
+            }
+        });
+
         let deferred_path = args.spill_dir.join("bootstrap_deferred.bin");
         tokio::fs::remove_file(&deferred_path).await.ok();
         let drain = tokio::spawn(bootstrap::drain(
-            rx,
-            drain_catalog,
-            mapping,
-            msg_tx.clone(),
-            ack.clone(),
+            gated_rx,
+            drain_catalog.clone(),
+            mapping.clone(),
+            tail.msg_tx.clone(),
+            tail.ack.clone(),
             stats.clone(),
             resolver.clone(),
             walshadow::spool::DeferredSpool::new(
@@ -4407,21 +4518,68 @@ async fn run_bootstrap(
             // No source-PG overlay during greenfield bootstrap, but the same
             // snapshot the CREATEs above rendered from: per-relation system
             // column names have to match what CH now holds
-            Some(resolved),
-            skip_initial,
+            Some(resolved.clone()),
+            skip_initial.clone(),
         ));
-        let (drain_res, pump_res) = tokio::join!(drain, pump);
+        // Borrow feed until stop watch publishes end_lsn or zero
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
+        // Keep sender alive while leg winds down
+        let stop_tx = &stop_tx;
+        let pump_then_stop = async move {
+            let res = pump.await;
+            let end = match &res {
+                Ok(Ok(o)) => o.end.end_lsn,
+                _ => 0,
+            };
+            let _ = stop_tx.send(Some(end));
+            res
+        };
+        let leg_fut = async {
+            match live_cfg {
+                Some(cfg) => walshadow::backfill::bootstrap_window::stream_window(
+                    cfg,
+                    feed,
+                    source_ident.xlogpos,
+                    stop_rx,
+                )
+                .await
+                .map(Some),
+                None => Ok(None),
+            }
+        };
+        let (gate_res, drain_res, pump_res, leg_res) =
+            tokio::join!(gate, drain, pump_then_stop, leg_fut);
+        let (gate_stats, gate_spool, pending) = gate_res
+            .context("bootstrap gate join")?
+            .map_err(|e| anyhow::anyhow!("bootstrap gate: {e}"))?;
         let drain_outcome = drain_res
             .context("bootstrap drain join")?
             .map_err(|e| anyhow::anyhow!("bootstrap drain: {e}"))?;
         let outcome: BootstrapOutcome = pump_res
             .context("bootstrap pump join")?
             .context("bootstrap pump")?;
+        // Retry failed live read from landed WAL
+        let window = match leg_res {
+            Ok(w) => {
+                if w.is_some() {
+                    window_cfg = None;
+                }
+                w
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "walshadow::bootstrap",
+                    error = %format!("{e:#}"),
+                    "live backup-window leg failed; replaying the window from the \
+                     WAL the backup landed",
+                );
+                window_leg_error = Some(e);
+                None
+            }
+        };
         let k = drain_outcome.next_seq;
 
-        tail.finish(msg_tx, ack, k, &fatal)
-            .await
-            .map_err(|m| anyhow::anyhow!("bootstrap: {m}"))?;
+        tail.finish(k).await.map_err(anyhow::Error::msg)?;
         tracing::info!(
             target: "walshadow::bootstrap",
             rows_routed = drain_outcome.rows_routed,
@@ -4430,17 +4588,59 @@ async fn run_bootstrap(
             seqs = k,
             "bootstrap insert tail drained",
         );
-        (drain_outcome.rows_routed, outcome)
+        pending_gate = Some(PendingGate {
+            deferred: gate_spool,
+            pending,
+            catalog: drain_catalog,
+            mapping,
+            config: resolved,
+            emitter: emitter_cfg,
+            stats,
+            resolver: resolver.clone(),
+            oracle: bootstrap_oracle.as_ref().map(|o| o.oracle()),
+            skip_initial,
+            source: src_cfg.clone(),
+            start_lsn: outcome.start.start_lsn,
+            spill_dir: args.spill_dir.clone(),
+            stream_stats: gate_stats,
+        });
+        (drain_outcome.rows_routed, outcome, window)
     } else {
-        // Metrics-only: bootstrap rows counted, not shipped.
+        // Metrics-only skips destination convergence
         let mut observer = MetricsTupleObserver::default();
         let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
         let shipped = drain_res.context("bootstrap drain")?;
         let outcome: BootstrapOutcome = pump_res
             .context("bootstrap pump join")?
             .context("bootstrap pump")?;
-        (shipped, outcome)
+        (shipped, outcome, None)
     };
+
+    // Replace live-leg COPY connection and recheck source identity
+    if window.is_some() || window_leg_error.is_some() {
+        *feed = SourceFeed::connect(src_cfg)
+            .await
+            .with_context(|| {
+                format!(
+                    "bootstrap: reconnect source {}:{} after the window leg",
+                    src_cfg.host, src_cfg.port
+                )
+            })?
+            .with_status_interval(Duration::from_secs(args.status_interval));
+        let now = feed
+            .identify_system()
+            .await
+            .context("bootstrap: IDENTIFY_SYSTEM after the window leg")?;
+        anyhow::ensure!(
+            now.sysid == source_ident.sysid && now.timeline == source_ident.timeline,
+            "source identity moved during bootstrap: system {} timeline {} when the backup \
+             opened, system {} timeline {} now",
+            source_ident.sysid,
+            source_ident.timeline,
+            now.sysid,
+            now.timeline,
+        );
+    }
 
     tracing::info!(
         target: "walshadow::bootstrap",
@@ -4450,6 +4650,7 @@ async fn run_bootstrap(
         kept_files = outcome.disk.kept_files,
         skipped_denylist = outcome.disk.skipped_denylist,
         files_walked = outcome.page_walk.files_walked,
+        files_skipped_by_caller = outcome.page_walk.files_skipped_by_caller,
         tuples_emitted = outcome.page_walk.tuples_emitted,
         drained = shipped,
         "bootstrap landed",
@@ -4468,6 +4669,70 @@ async fn run_bootstrap(
         .context("bootstrap: hydrate shadow pg_wal from object store")?;
     }
 
+    // Replay hydrated or fallback window from shadow pg_wal
+    if let Some(mut cfg) = window_cfg {
+        cfg.timeline = outcome.start.timeline;
+        let pg_wal = shadow_data_dir.join("pg_wal");
+        let replayed = async {
+            let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
+                &pg_wal,
+                outcome.start.timeline,
+                outcome.start.start_lsn,
+                outcome.end.end_lsn,
+            )
+            .await?;
+            walshadow::backfill::bootstrap_window::replay_segments(
+                cfg,
+                &segments,
+                outcome.start.start_lsn,
+                outcome.end.end_lsn,
+            )
+            .await
+        }
+        .await;
+        window = Some(replayed.map_err(|e| match window_leg_error {
+            Some(live) => e.context(format!("after the live window leg failed: {live:#}")),
+            None => e.context("bootstrap: backup-window WAL leg"),
+        })?);
+    }
+    let open_floor = window.and_then(|w| w.open_floor);
+    if let Some(w) = window {
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            from_lsn = format_pg_lsn(w.from_lsn).to_string(),
+            through_lsn = format_pg_lsn(w.through_lsn).to_string(),
+            rows = w.replay.rows_replayed,
+            commits_below_from = w.replay.commits_below_from,
+            unknown_rfns = w.replay.unknown_rfns,
+            open_floor = w.open_floor.map(|l| format_pg_lsn(l).to_string()),
+            "backup window shipped",
+        );
+    }
+    tokio::fs::remove_dir_all(&window_scratch).await.ok();
+
+    // Resolve deferred tuples after window transaction overlay is complete
+    if let Some(pending) = pending_gate {
+        let patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock"));
+        let gate = resolve_greenfield(pending, &shadow_data_dir, &patch)
+            .await
+            .context("bootstrap: visibility gate")?;
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            emitted = gate.emitted,
+            gated = gate.gated,
+            deferred = gate.deferred,
+            multixact_emitted = gate.multixact_emitted,
+            chunks_gated = gate.chunks_gated,
+            pending_relations = gate.pending_relations,
+            pending_multixact = gate.pending_multixact,
+            pending_discarded = gate.pending_discarded,
+            repaired_rows = gate.repaired_rows,
+            p_hi = gate.p_hi,
+            patch_xacts = patch.len(),
+            "bootstrap visibility gate settled",
+        );
+    }
+
     // PG refuses to start on a data dir whose mode isn't 0700 or 0750.
     // BASE_BACKUP tar carries no entry for the root, so extraction leaves
     // it at the process umask (typically 0755); reassert 0700 before pg_ctl.
@@ -4484,7 +4749,39 @@ async fn run_bootstrap(
         .await
         .context("clear completed bootstrap marker")?;
 
-    Ok(outcome.end.end_lsn)
+    Ok(BootstrapHandoff {
+        end_lsn: outcome.end.end_lsn,
+        open_floor,
+    })
+}
+
+/// Bootstrap-to-pump handoff
+struct BootstrapHandoff {
+    /// Backup end and shadow state boundary
+    end_lsn: u64,
+    /// Earliest record among transactions open at window seal
+    open_floor: Option<u64>,
+}
+
+impl BootstrapHandoff {
+    /// Resume at open transaction floor when slot retains it
+    fn resume_lsn(&self, has_slot: bool) -> u64 {
+        match self.open_floor {
+            Some(floor) if has_slot => floor.min(self.end_lsn),
+            Some(floor) => {
+                tracing::warn!(
+                    target: "walshadow::bootstrap",
+                    open_floor = %format_pg_lsn(floor),
+                    end_lsn = %format_pg_lsn(self.end_lsn),
+                    "xacts open across the bootstrap handoff: without a replication slot \
+                     the pump resumes at end_lsn, and rows they wrote below it reach the \
+                     destination only through a later change",
+                );
+                self.end_lsn
+            }
+            None => self.end_lsn,
+        }
+    }
 }
 
 /// Routing map for the bootstrap drain: explicit `[table.*]` seeded up front,
@@ -4912,25 +5209,16 @@ async fn fetch_wal_into_pg_wal(
     end_lsn: u64,
     timeline: u32,
 ) -> Result<()> {
-    use walrus::pg::wal::segment::SegmentName;
-
-    let seg_size = WAL_SEG_SIZE;
     let pg_wal_dir = shadow_data_dir.join("pg_wal");
     tokio::fs::create_dir_all(&pg_wal_dir)
         .await
         .with_context(|| format!("create {}", pg_wal_dir.display()))?;
-    let mut cur = SegmentName {
-        timeline,
-        log_id: (start_lsn >> 32) as u32,
-        seg_no: ((start_lsn & 0xFFFF_FFFF) / seg_size) as u32,
-    };
-    let mut fetched: u32 = 0;
-    loop {
-        let name = cur.format();
+    let segments = segments_covering(timeline, start_lsn..end_lsn.saturating_add(1));
+    for seg in &segments {
+        let name = seg.format();
         let dst = pg_wal_dir.join(&name);
-        // Off: loop enumerates every segment in [start,end] explicitly, so
-        // read-ahead would only duplicate the next iteration's fetch & risk
-        // downloading past end_lsn
+        // Off: the range is enumerated explicitly, so read-ahead would only
+        // duplicate the next fetch & risk downloading past end_lsn
         walrus::pg::wal::fetch::handle(
             settings,
             storage.clone(),
@@ -4940,16 +5228,10 @@ async fn fetch_wal_into_pg_wal(
         )
         .await
         .with_context(|| format!("fetch WAL {name} -> {}", dst.display()))?;
-        fetched += 1;
-        let seg_end = cur.start_lsn(seg_size).saturating_add(seg_size);
-        if end_lsn < seg_end {
-            break;
-        }
-        cur = cur.next(seg_size);
     }
     tracing::info!(
         target: "walshadow::bootstrap",
-        fetched,
+        fetched = segments.len(),
         start_lsn = format_pg_lsn(start_lsn).to_string(),
         end_lsn = format_pg_lsn(end_lsn).to_string(),
         timeline,
@@ -5283,5 +5565,23 @@ mod tests {
         let ci = walsender_primary_conninfo("127.0.0.1:5441".parse().unwrap()).unwrap();
         assert!(ci.contains("host=127.0.0.1"), "{ci}");
         assert!(ci.contains("port=5441"), "{ci}");
+    }
+
+    #[test]
+    fn bootstrap_handoff_resumes_at_open_floor_only_with_a_slot() {
+        let crossing = BootstrapHandoff {
+            end_lsn: 0x3000,
+            open_floor: Some(0x1000),
+        };
+        assert_eq!(crossing.resume_lsn(true), 0x1000);
+        // No slot: nothing retains WAL below end_lsn, so resume there
+        assert_eq!(crossing.resume_lsn(false), 0x3000);
+
+        let clean = BootstrapHandoff {
+            end_lsn: 0x3000,
+            open_floor: None,
+        };
+        assert_eq!(clean.resume_lsn(true), 0x3000);
+        assert_eq!(clean.resume_lsn(false), 0x3000);
     }
 }

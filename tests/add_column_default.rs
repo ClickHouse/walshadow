@@ -30,16 +30,7 @@ use walshadow::schema::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_column_default_replicates_pre_alter_default() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    if !fx::pg_basebackup_available() {
-        eprintln!("skip: no pg_basebackup on PATH");
-        return;
-    }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::requirements_available() {
         return;
     }
 

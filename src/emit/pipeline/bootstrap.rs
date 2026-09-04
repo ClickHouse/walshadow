@@ -16,7 +16,7 @@ use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
-use crate::emit::route::{RouteSnapshot, RowPolicy};
+use crate::emit::route::{RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingHandle, TableMapping};
 use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
@@ -24,8 +24,7 @@ use crate::toast::{
     CHUNK_PUT_BATCH, CHUNK_PUT_BYTES, FetchedValue, ToastResolver, ToastRow, check_value_caps,
     detoasted_value, finish_value, pointer_extsize,
 };
-use ahash::HashMap;
-use std::collections::HashSet;
+use ahash::HashSet;
 
 /// Completion frontier for `FlushAll` and resume advance
 #[derive(Debug, Clone, Copy, Default)]
@@ -53,21 +52,11 @@ pub async fn drain(
     skip_initial: HashSet<RelName>,
 ) -> Result<BootstrapDrainOutcome, String> {
     // Routes frozen once per pass from the caller's config snapshot
-    let routes: HashMap<_, _> = mapping_handle
-        .snapshot()
-        .await
-        .iter()
-        .map(|(name, mapping)| {
-            let rules = config
-                .as_ref()
-                .map_or_else(Arc::default, |rc| rc.column_rules.clone());
-            let policy = row_policy.for_rel(config.as_deref(), name);
-            (
-                name.clone(),
-                RouteSnapshot::freeze(Arc::new(mapping.clone()), rules, policy),
-            )
-        })
-        .collect();
+    let routes = freeze_routes(
+        &mapping_handle.snapshot().await,
+        config.as_deref(),
+        &row_policy,
+    );
     let mut next_seq = 0u64;
     let mut rows_routed = 0u64;
     let mut open: Option<(walrus::pg::walparser::RelFileNode, u64, u64)> = None;
@@ -364,7 +353,7 @@ mod tests {
     use crate::emit::pipeline::batcher::BatcherMsg;
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use crate::toast::MemChunkStore;
-    use ahash::{HashMap, HashMapExt};
+    use ahash::{HashMap, HashMapExt, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
     fn rel(rel_node: u32) -> Arc<RelDescriptor> {
@@ -578,7 +567,7 @@ mod tests {
             mem_spool(),
             Default::default(),
             None,
-            std::collections::HashSet::new(),
+            HashSet::new(),
         ));
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
@@ -631,7 +620,7 @@ mod tests {
             mem_spool(),
             Default::default(),
             None,
-            std::collections::HashSet::new(),
+            HashSet::new(),
         ));
 
         let mut seqs: Vec<u64> = Vec::new();
@@ -681,7 +670,7 @@ mod tests {
             mem_spool(),
             Default::default(),
             None,
-            std::collections::HashSet::new(),
+            HashSet::new(),
         ));
 
         let mut rows = Vec::new();
@@ -747,7 +736,7 @@ mod tests {
             DeferredSpool::new(spool_tmp.path().join("bootstrap_deferred.bin"), 0),
             Default::default(),
             None,
-            std::collections::HashSet::new(),
+            HashSet::new(),
         ));
 
         let mut rows = Vec::new();
@@ -806,7 +795,7 @@ mod tests {
             mem_spool(),
             Default::default(),
             None,
-            std::collections::HashSet::new(),
+            HashSet::new(),
         ));
         // Wait for the referrer to defer, then unmap before walk EOF
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

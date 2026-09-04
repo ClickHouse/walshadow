@@ -575,13 +575,14 @@ impl ClickHouseChunkStore {
         )
     }
 
-    /// Bloom-prune candidate TIDs, then aggregate full history before filtering
+    /// Prune candidates, then break reused-generation ties by TID
     fn fetch_sql(&self, toast_relid: u32, value_id: u32, max_lsn: u64) -> String {
         let table = self.toast_table(toast_relid);
         format!(
-            "SELECT `chunk_seq`, argMax(`chunk_data`, `ver`) AS `chunk_data`\n\
+            "SELECT `chunk_seq`, argMax(`chunk_data`, (`ver`, `blkno`, `offnum`)) AS `chunk_data`\n\
              FROM (\n  \
-             SELECT argMax(`chunk_id`, `_lsn`) AS `chunk_id`,\n         \
+             SELECT `blkno`, `offnum`,\n         \
+             argMax(`chunk_id`, `_lsn`) AS `chunk_id`,\n         \
              argMax(`chunk_seq`, `_lsn`) AS `chunk_seq`,\n         \
              argMax(`chunk_data`, `_lsn`) AS `chunk_data`,\n         \
              max(`_lsn`) AS `ver`,\n         \
@@ -655,7 +656,8 @@ impl ClickHouseChunkStore {
             let mut lsn = Vec::with_capacity(n * 8);
             let mut is_deleted = Vec::with_capacity(n);
             let mut offsets = Vec::with_capacity(n);
-            let mut data = Vec::new();
+            let data_len = group.iter().map(|r| r.chunk_data.len()).sum();
+            let mut data = Vec::with_capacity(data_len);
             for r in &group {
                 blkno.extend_from_slice(&r.blkno.to_le_bytes());
                 offnum.extend_from_slice(&r.offnum.to_le_bytes());
@@ -1572,9 +1574,10 @@ mod tests {
 
         assert_eq!(
             store.fetch_sql(16500, 7, 0x2000),
-            "SELECT `chunk_seq`, argMax(`chunk_data`, `ver`) AS `chunk_data`\n\
+            "SELECT `chunk_seq`, argMax(`chunk_data`, (`ver`, `blkno`, `offnum`)) AS `chunk_data`\n\
              FROM (\n  \
-             SELECT argMax(`chunk_id`, `_lsn`) AS `chunk_id`,\n         \
+             SELECT `blkno`, `offnum`,\n         \
+             argMax(`chunk_id`, `_lsn`) AS `chunk_id`,\n         \
              argMax(`chunk_seq`, `_lsn`) AS `chunk_seq`,\n         \
              argMax(`chunk_data`, `_lsn`) AS `chunk_data`,\n         \
              max(`_lsn`) AS `ver`,\n         \

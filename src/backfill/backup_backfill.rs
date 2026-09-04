@@ -27,10 +27,8 @@
 //! sentinel → fetch gap segments → records-only pre-scan (catalog-skew
 //! abort + [`PgXactPatch`] harvest) → filtered walk (gate resolves deferred
 //! tuples against backup pg_xact + patch at successful walk EOF) → gap replay
-//! through the shared decode path ([`BufferingDecoderSink`] +
-//! [`XactBuffer::drain_committed`]) with
-//! rows emitted at real commit LSNs, commits past a rel's `S` dropped (the
-//! live stream owns them; dedup absorbs overlap regardless).
+//! through [`WalReplaySink`], shared with greenfield window replay. Rows use
+//! commit LSNs and stop at each relation's coverage bound.
 //!
 //! The pre-scan aborts on gap writes that would invalidate the walk: a
 //! pg_class / pg_attribute new-tuple write whose row oid is (or cannot be
@@ -59,34 +57,30 @@ use crate::backfill::backup_source::{BackupSink, BackupSource};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
-use crate::config::ResolvedConfig;
-use crate::decode::heap_decoder::{CommittedTuple, XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
-use crate::decode::visibility::{
-    PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView, Visibility, tuple_visibility,
+use crate::backfill::visibility_gate::{GateStats, Undecidable, resolve_phase, stream_phase};
+use crate::backfill::visibility_repair::PendingSet;
+use crate::backfill::wal_replay::{
+    ReplayStats, ReplayTargets, WalReplayInputs, WalReplaySink, pump_segments_through,
 };
+use crate::decode::heap_decoder::{XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
+use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView};
 use crate::decode::wal_xact::{
-    XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
-    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
+    XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
+    XLOG_XACT_OPMASK, parse_xact_payload,
 };
-use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
-use crate::emit::pipeline::{Fatal, ack::AckHandle, bootstrap, tail};
+use crate::emit::pipeline::batcher::BatcherMsg;
+use crate::emit::pipeline::tail::OwnedTail;
+use crate::emit::pipeline::{Fatal, ack::AckHandle, bootstrap};
 use crate::filter::main_data::{parse_xl_heap_truncate, parse_xl_relmap_update};
-use crate::filter::manifest::Manifest;
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap,
 };
-use crate::mapping::MappingSnapshot;
-use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
+use crate::record::{Record, RecordSink, SinkError, segments_covering};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
-use crate::source::wal_stream::WalStream;
-use crate::toast::{ChunkRefMap, ToastResolver};
-use crate::xact::xact_buffer::{
-    BufferingDecoderSink, DrainEntry, DrainedBatch, SubxactTracker, WalkStep, XactBuffer,
-    XactBufferConfig, detoast_heap, resolve_stash,
-};
-use ahash::{HashMap, HashSet};
+use crate::toast::ToastResolver;
+use crate::xact::xact_buffer::{XactBuffer, XactBufferConfig};
+use ahash::{HashMap, HashSet, HashSetExt};
 
 /// Run one coalesced backup pass for `reqs` (all sharing `mode`).
 pub async fn run_pass(
@@ -297,18 +291,17 @@ async fn walk_and_ship(
 
     // Dedicated tail: own CH connection, own seq space, own fatal — the
     // live pipeline never blocks on a backfill (Regime A)
-    let fatal = Fatal::new();
-    let (msg_tx, ack, tail) = tail::spawn_with_config(
+    let tail = OwnedTail::spawn(
         &ctx.emitter,
         1,
         ctx.stats.clone(),
-        Arc::new(crate::pos::Monotone::new(0)),
-        fatal.clone(),
+        Fatal::new(),
         ctx.config_rx.clone(),
         ctx.oracle.clone(),
+        "backup_backfill",
     )
     .await
-    .map_err(|e| anyhow::anyhow!("backup_backfill: spawn insert tail: {e}"))?;
+    .map_err(anyhow::Error::msg)?;
 
     let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
     let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new()));
@@ -346,14 +339,14 @@ async fn walk_and_ship(
         gated_rx,
         filter,
         ctx.mapping.clone(),
-        msg_tx.clone(),
-        ack.clone(),
+        tail.msg_tx.clone(),
+        tail.ack.clone(),
         ctx.stats.clone(),
         resolver.clone(),
         DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX),
         ctx.emitter.row_policy(),
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
-        std::collections::HashSet::new(),
+        HashSet::new(),
     ));
 
     // Success signal before the joins: gate resolves deferred tuples only
@@ -377,13 +370,14 @@ async fn walk_and_ship(
     let drain_join = drain.await.context("backup_backfill: drain join");
 
     if let Err(e) = run_res {
-        quiesce_tail(msg_tx, ack, tail).await;
+        tail.quiesce().await;
         return Err(e);
     }
-    let gate_stats = match gate_join.and_then(|r| r.map_err(anyhow::Error::msg)) {
+    let (gate_stats, pg_xact_segments) = match gate_join.and_then(|r| r.map_err(anyhow::Error::msg))
+    {
         Ok(s) => s,
         Err(e) => {
-            quiesce_tail(msg_tx, ack, tail).await;
+            tail.quiesce().await;
             return Err(e);
         }
     };
@@ -393,18 +387,18 @@ async fn walk_and_ship(
     outcome.rows_gated += gate_stats.gated;
     outcome.rows_deferred += gate_stats.deferred;
     outcome.multixact_emitted += gate_stats.multixact_emitted;
-    outcome.pg_xact_segments = gate_stats.pg_xact_segments;
+    outcome.pg_xact_segments = pg_xact_segments;
     let drain_outcome = match drain_join.and_then(|r| r.map_err(anyhow::Error::msg)) {
         Ok(o) => o,
         Err(e) => {
-            quiesce_tail(msg_tx, ack, tail).await;
+            tail.quiesce().await;
             return Err(e);
         }
     };
 
     let mut next_seq = drain_outcome.next_seq;
     if let Some((segments, timeline, b_redo)) = replay {
-        let s_by_rfn: HashMap<(Oid, Oid), (Arc<RelDescriptor>, u64)> = reqs
+        let s_by_rfn: ReplayTargets = reqs
             .iter()
             .map(|r| (rfn_key(&r.desc), (r.desc.clone(), r.s_lsn)))
             .collect();
@@ -415,8 +409,8 @@ async fn walk_and_ship(
             b_redo,
             s_by_rfn,
             resolver.clone(),
-            msg_tx.clone(),
-            ack.clone(),
+            tail.msg_tx.clone(),
+            tail.ack.clone(),
             next_seq,
         )
         .await
@@ -424,49 +418,20 @@ async fn walk_and_ship(
         let replay_stats = match replay_res {
             Ok(s) => s,
             Err(e) => {
-                quiesce_tail(msg_tx, ack, tail).await;
+                tail.quiesce().await;
                 return Err(e);
             }
         };
         next_seq = replay_stats.next_seq;
         outcome.rows_replayed = replay_stats.rows_replayed;
-        outcome.replay_commits_past_s = replay_stats.commits_past_s;
+        outcome.replay_commits_past_s = replay_stats.commits_past_through;
     }
 
-    tail.finish(msg_tx, ack, next_seq, &fatal)
-        .await
-        .map_err(anyhow::Error::msg)?;
+    tail.finish(next_seq).await.map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
-/// Failed-pass teardown: with gate + drain already joined, dropping the
-/// last producer handles closes the batcher, which final-flushes and
-/// cascades the inserters + collector down. Bounded by the inserters'
-/// retry policy (a CH outage trips their fatal, not a hang).
-async fn quiesce_tail(msg_tx: mpsc::Sender<BatcherMsg>, ack: AckHandle, tail: tail::TailParts) {
-    drop(msg_tx);
-    drop(ack);
-    tail.join().await;
-}
-
-#[derive(Debug, Default)]
-struct GateStats {
-    emitted: u64,
-    gated: u64,
-    deferred: u64,
-    multixact_emitted: u64,
-    pg_xact_segments: usize,
-}
-
-/// Visibility gate between the page walk and the drain. Hint-decidable
-/// tuples route immediately; undecidable ones (including every non-lock-only
-/// multixact xmax) defer until walk EOF, when collected pg_xact +
-/// pg_multixact (+ gap patch) are complete. Toast-chunk tuples bypass the
-/// gate: the store is keyed and only referenced values get pulled.
-/// Deferred resolution requires `walk_ok`: channel close alone also happens
-/// when a failed source drops the sink mid-walk. An unresolvable multixact
-/// errors the pass: emitting risks resurrecting a dead version whose delete
-/// predates WAL coverage, skipping risks dropping a live row.
+/// Run visibility gate and track `pg_xact` segments
 #[allow(clippy::too_many_arguments)]
 async fn gate_task(
     mut rx: mpsc::Receiver<BackfillTuple>,
@@ -477,85 +442,31 @@ async fn gate_task(
     patch: PgXactPatch,
     walk_ok: oneshot::Receiver<()>,
     mut deferred: DeferredSpool,
-) -> Result<GateStats, String> {
+) -> Result<(GateStats, usize), String> {
     let mut stats = GateStats::default();
-    while let Some(t) = rx.recv().await {
-        if filter.is_toast(t.rfn.db_node, t.rfn.rel_node) {
-            if tx.send(t).await.is_err() {
-                return Ok(stats);
-            }
-            continue;
-        }
-        match tuple_visibility(t.xid, t.xmax, t.infomask, None) {
-            Visibility::Emit => {
-                if t.infomask & crate::decode::visibility::HEAP_XMAX_IS_MULTI != 0 {
-                    stats.multixact_emitted += 1;
-                }
-                stats.emitted += 1;
-                if tx.send(t).await.is_err() {
-                    return Ok(stats);
-                }
-            }
-            Visibility::Skip => stats.gated += 1,
-            Visibility::Defer => deferred
-                .push(t)
-                .await
-                .map_err(|e| format!("backup_backfill: deferred spool: {e}"))?,
-            Visibility::Unresolvable => return Err(unresolvable_multixact(&t)),
-        }
-    }
-    // Walk EOF: sink dropped. Deferred tuples sit in the spool past its
-    // in-memory prefix, resident bytes bounded regardless of unhinted count.
-    stats.deferred = deferred.records();
-    // pg_xact is complete only if the walk finished; a partial accum reads
-    // committed deleters as in-progress and recent aborts as ancient-committed,
-    // emitting dead tuples a rerun can't remove
+    // Per-table loads abort on unprovable tuples
+    let no_pending = PendingSet::empty();
+    stream_phase(
+        &mut rx,
+        &tx,
+        &filter,
+        &no_pending,
+        &mut deferred,
+        &mut stats,
+    )
+    .await?;
     if walk_ok.await.is_err() {
         stats.gated += stats.deferred;
         deferred.discard().await;
-        return Ok(stats);
+        return Ok((stats, 0));
     }
     // Take the accums out so no std guard is held across the sends below
     let accum = std::mem::take(&mut *pg_xact.lock().expect("pg_xact accum lock"));
     let multi = std::mem::take(&mut *pg_multixact.lock().expect("pg_multixact accum lock"));
-    stats.pg_xact_segments = accum.segment_count();
+    let segments = accum.segment_count();
     let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
-    let mut replay = deferred
-        .into_reader()
-        .await
-        .map_err(|e| format!("backup_backfill: deferred spool seal: {e}"))?;
-    while let Some(t) = replay
-        .next()
-        .await
-        .map_err(|e| format!("backup_backfill: deferred spool replay: {e}"))?
-    {
-        match tuple_visibility(t.xid, t.xmax, t.infomask, Some(&view)) {
-            Visibility::Emit => {
-                if t.infomask & crate::decode::visibility::HEAP_XMAX_IS_MULTI != 0 {
-                    stats.multixact_emitted += 1;
-                }
-                stats.emitted += 1;
-                if tx.send(t).await.is_err() {
-                    return Ok(stats);
-                }
-            }
-            Visibility::Skip | Visibility::Defer => stats.gated += 1,
-            Visibility::Unresolvable => return Err(unresolvable_multixact(&t)),
-        }
-    }
-    replay
-        .finish()
-        .await
-        .map_err(|e| format!("backup_backfill: deferred spool cleanup: {e}"))?;
-    Ok(stats)
-}
-
-fn unresolvable_multixact(t: &BackfillTuple) -> String {
-    format!(
-        "backup_backfill: multixact xmax {} (rfn {}/{}) unresolvable from the backup's \
-         pg_multixact snapshot; remedy: fresher backup, or initial_load='copy'",
-        t.xmax, t.rfn.db_node, t.rfn.rel_node
-    )
+    resolve_phase(deferred, &view, &tx, Undecidable::Abort, &mut stats).await?;
+    Ok((stats, segments))
 }
 
 // ---------------------------------------------------------------------------
@@ -577,15 +488,10 @@ pub async fn fetch_gap_segments(
     tokio::fs::create_dir_all(seg_dir)
         .await
         .with_context(|| format!("create {}", seg_dir.display()))?;
-    let seg_size = WAL_SEG_SIZE;
-    let mut cur = SegmentName {
-        timeline,
-        log_id: (from >> 32) as u32,
-        seg_no: ((from & 0xFFFF_FFFF) / seg_size) as u32,
-    };
-    let mut out = Vec::new();
-    loop {
-        let name = cur.format();
+    let segments = segments_covering(timeline, from..to.saturating_add(1));
+    let mut out = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let name = seg.format();
         let dst = seg_dir.join(&name);
         if !dst.exists() {
             walrus::pg::wal::fetch::handle(
@@ -598,70 +504,75 @@ pub async fn fetch_gap_segments(
             .await
             .with_context(|| format!("fetch WAL {name}"))?;
         }
-        out.push((cur, dst));
-        let seg_end = cur.start_lsn(seg_size).saturating_add(seg_size);
-        if to < seg_end {
-            break;
-        }
-        cur = cur.next(seg_size);
+        out.push((seg, dst));
     }
     Ok(out)
 }
 
-/// Segment output of the replay/pre-scan streams is discarded; only the
-/// record dispatch matters.
-struct DropSegments;
+// ---------------------------------------------------------------------------
+// Gap replay
+// ---------------------------------------------------------------------------
 
-impl SegmentSink for DropSegments {
-    fn on_segment<'a>(
-        &'a mut self,
-        _seg: SegmentName,
-        _bytes: &'a [u8],
-        _manifest: &'a Manifest,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(std::future::ready(Ok(())))
-    }
-
-    fn on_partial_segment<'a>(
-        &'a mut self,
-        _seg: SegmentName,
-        _bytes: &'a [u8],
-        _manifest: &'a Manifest,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(std::future::ready(Ok(())))
-    }
-}
-
-/// Drive fetched segments through a `RecordSink` in LSN order. Scoped to
-/// the pass's database like the live stream, so replayed records defer
-/// decode against the same catalog-dirty trees the hot path would build
-async fn pump_segments_through(
+/// Replay fetched gap segments between walk and live-stream coverage
+#[allow(clippy::too_many_arguments)]
+async fn replay_gap(
+    ctx: &PassContext,
     segments: &[(SegmentName, PathBuf)],
     timeline: u32,
-    target_db_oid: Oid,
-    sink: &mut (dyn RecordSink + Send),
-) -> Result<()> {
-    let Some((first, _)) = segments.first() else {
-        return Ok(());
-    };
-    let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
-        .map_err(|e| anyhow::anyhow!("backup_backfill: WalStream: {e}"))?;
-    stream.filter_mut().set_target_db(target_db_oid);
-    let mut seg_sink = DropSegments;
-    for (seg, path) in segments {
-        let bytes = tokio::fs::read(path)
+    b_redo: u64,
+    targets: ReplayTargets,
+    resolver: ToastResolver,
+    msg_tx: mpsc::Sender<BatcherMsg>,
+    ack: AckHandle,
+    next_seq: u64,
+) -> Result<ReplayStats> {
+    let spill = ctx.scratch_dir.join("replay_spill");
+    tokio::fs::create_dir_all(&spill).await.ok();
+    let buffer = Arc::new(Mutex::new(
+        XactBuffer::new(XactBufferConfig::new(spill))
+            .map_err(|e| anyhow::anyhow!("backup_backfill: replay xact buffer: {e}"))?,
+    ));
+    buffer.lock().await.clear_spill_dir().await.ok();
+
+    // Include opted-in main and TOAST filenodes
+    let mut filter_rfns: HashSet<(Oid, Oid)> = targets.keys().copied().collect();
+    for (desc, _) in targets.values() {
+        if let Some(td) = ctx
+            .catalog
+            .lock()
             .await
-            .with_context(|| format!("read {}", path.display()))?;
-        stream
-            .push(seg.start_lsn(WAL_SEG_SIZE), &bytes, sink, &mut seg_sink)
+            .toast_descriptor_for(desc.oid)
             .await
-            .map_err(|e| anyhow::anyhow!("backup_backfill: replay {}: {e}", seg.format()))?;
+            .map_err(|e| anyhow::anyhow!("backup_backfill: toast descriptor: {e}"))?
+        {
+            filter_rfns.insert(rfn_key(&td));
+        }
     }
-    stream
-        .close(None, sink)
-        .await
-        .map_err(|e| anyhow::anyhow!("backup_backfill: replay close: {e}"))?;
-    Ok(())
+
+    let mut sink = WalReplaySink::new(WalReplayInputs {
+        log: ctx.log.clone(),
+        buffer,
+        resolver,
+        filter_rfns,
+        targets,
+        from_lsn: b_redo,
+        // Filter is the opted-in set, so unfiltered rels are deliberate
+        whole_db_filter: false,
+        mapping: ctx.mapping.snapshot().await,
+        stats: ctx.stats.clone(),
+        budget: ctx.budget.clone(),
+        row_policy: ctx.emitter.row_policy(),
+        config: ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
+        batch_rows: ctx.emitter.drain_batch_rows,
+        batch_bytes: ctx.emitter.drain_batch_bytes,
+        msg_tx,
+        ack,
+        next_seq,
+        // Pre-scan already harvested transaction patch
+        patch: None,
+    });
+    pump_segments_through(segments, timeline, ctx.log.db_oid(), &mut sink).await?;
+    Ok(sink.stats())
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +633,11 @@ struct PrescanSink {
 }
 
 impl PrescanSink {
+    /// Keep the first reason: later records observe a patch already known bad
+    fn fail_closed(&mut self, reason: String) {
+        self.skew.get_or_insert(reason);
+    }
+
     fn observe(&mut self, record: &Record<'_>) {
         let rm = record.parsed.header.resource_manager_id;
         if rm == RmId::Xact as u8 {
@@ -729,16 +645,20 @@ impl PrescanSink {
             let xid = record.parsed.header.xact_id;
             match info & XLOG_XACT_OPMASK {
                 XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
-                    let payload =
-                        parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
-                            .unwrap_or_default();
-                    self.patch.commit(xid, &payload.subxacts);
+                    match parse_xact_payload(info, &record.parsed.main_data, record.page_magic) {
+                        // COMMIT PREPARED: header xid is the finishing
+                        // backend's, the verdict belongs to the prepared xid
+                        Ok(p) => self
+                            .patch
+                            .commit(p.twophase_xid.unwrap_or(xid), &p.subxacts),
+                        Err(e) => self.fail_closed(format!("malformed commit payload: {e}")),
+                    }
                 }
                 XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
-                    let payload =
-                        parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
-                            .unwrap_or_default();
-                    self.patch.abort(xid, &payload.subxacts);
+                    match parse_xact_payload(info, &record.parsed.main_data, record.page_magic) {
+                        Ok(p) => self.patch.abort(p.twophase_xid.unwrap_or(xid), &p.subxacts),
+                        Err(e) => self.fail_closed(format!("malformed abort payload: {e}")),
+                    }
                 }
                 _ => {}
             }
@@ -838,361 +758,13 @@ impl RecordSink for PrescanSink {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Gap replay
-// ---------------------------------------------------------------------------
-
-struct ReplayStats {
-    next_seq: u64,
-    rows_replayed: u64,
-    commits_past_s: u64,
-}
-
-/// Replay the gap through the shared decode path: heap records whose rfn is
-/// in the filter set feed the same [`BufferingDecoderSink`] the hot path
-/// uses (subxacts, TOAST reassembly, update/delete decode for free); commit
-/// records drain through [`XactBuffer::drain_committed`] +
-/// [`DrainedBatch::into_walk`] — the same apply plan the reorder barrier
-/// runs — shipping rows at their real commit LSNs on the pass's tail.
-#[allow(clippy::too_many_arguments)]
-async fn replay_gap(
-    ctx: &PassContext,
-    segments: &[(SegmentName, PathBuf)],
-    timeline: u32,
-    b_redo: u64,
-    targets: HashMap<(Oid, Oid), (Arc<RelDescriptor>, u64)>,
-    resolver: ToastResolver,
-    msg_tx: mpsc::Sender<BatcherMsg>,
-    ack: AckHandle,
-    next_seq: u64,
-) -> Result<ReplayStats> {
-    let spill = ctx.scratch_dir.join("replay_spill");
-    tokio::fs::create_dir_all(&spill).await.ok();
-    let buffer = Arc::new(Mutex::new(
-        XactBuffer::new(XactBufferConfig::new(spill))
-            .map_err(|e| anyhow::anyhow!("backup_backfill: replay xact buffer: {e}"))?,
-    ));
-    buffer.lock().await.clear_spill_dir().await.ok();
-
-    // Filter rfns: opted-in mains + their toast rels (chunks reassemble
-    // inside the buffered xact)
-    let mut filter_rfns: HashSet<(Oid, Oid)> = targets.keys().copied().collect();
-    for (desc, _) in targets.values() {
-        if let Some(td) = ctx
-            .catalog
-            .lock()
-            .await
-            .toast_descriptor_for(desc.oid)
-            .await
-            .map_err(|e| anyhow::anyhow!("backup_backfill: toast descriptor: {e}"))?
-        {
-            filter_rfns.insert(rfn_key(&td));
-        }
-    }
-
-    let mut sink = ReplaySink {
-        decoder: BufferingDecoderSink::new(ctx.log.clone(), buffer.clone()),
-        buffer,
-        log: ctx.log.clone(),
-        pending: Default::default(),
-        subxact_tracker: SubxactTracker::new(),
-        resolver,
-        filter_rfns,
-        targets,
-        b_redo,
-        mapping: ctx.mapping.snapshot().await,
-        stats: ctx.stats.clone(),
-        budget: ctx.budget.clone(),
-        row_policy: ctx.emitter.row_policy(),
-        config: ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
-        batch_rows: ctx.emitter.drain_batch_rows,
-        batch_bytes: ctx.emitter.drain_batch_bytes,
-        msg_tx,
-        ack,
-        next_seq,
-        open: None,
-        rows_replayed: 0,
-        commits_past_s: 0,
-    };
-    pump_segments_through(segments, timeline, ctx.log.db_oid(), &mut sink).await?;
-
-    Ok(ReplayStats {
-        next_seq: sink.next_seq,
-        rows_replayed: sink.rows_replayed,
-        commits_past_s: sink.commits_past_s,
-    })
-}
-
-/// Serial gap drain over pre-filtered records; mirrors the daemon's
-/// `DecoderXactPair` without the queueing worker. Rows gate per rel: one
-/// seq per commit that routed at least one row, real `commit_lsn`, commits
-/// at or under `b_redo` live in the walked backup pages, commits past the
-/// rel's `S` belong to the live stream (dedup absorbs overlap regardless).
-/// Catalog/config drain entries are ignored — the live stream owns DDL and
-/// the prescan aborts on filtered-rel catalog skew below `S`.
-struct ReplaySink {
-    decoder: BufferingDecoderSink,
-    buffer: Arc<Mutex<XactBuffer>>,
-    log: Arc<crate::catalog::desc_log::DescriptorLog>,
-    /// Always empty: gap replay reads committed history, where no
-    /// transaction is in flight to have speculative catalog state
-    pending: crate::catalog::pending::PendingCatalog,
-    subxact_tracker: SubxactTracker,
-    resolver: ToastResolver,
-    filter_rfns: HashSet<(Oid, Oid)>,
-    targets: HashMap<(Oid, Oid), (Arc<RelDescriptor>, u64)>,
-    b_redo: u64,
-    /// Mapping version frozen at replay start: gap replay re-seeds route
-    /// state from current config, and no config event applies mid-replay
-    /// (catalog/config drain entries are ignored here), so one snapshot
-    /// covers the whole replay
-    mapping: MappingSnapshot,
-    stats: Arc<EmitterStats>,
-    budget: Option<crate::budget::MemoryBudget>,
-    /// Boot-only delete-retention policy, frozen into route snapshots
-    row_policy: crate::emit::route::RowPolicy,
-    /// Config snapshot for route freezes: gap replay re-seeds from current
-    /// config, not history (route history has no WAL position)
-    config: Option<Arc<ResolvedConfig>>,
-    /// Drain-slice budget, same knobs as the pipeline reorder
-    batch_rows: usize,
-    batch_bytes: usize,
-    msg_tx: mpsc::Sender<BatcherMsg>,
-    ack: AckHandle,
-    next_seq: u64,
-    /// Current commit's `(seq, rows routed)`; registered lazily on its
-    /// first routed row so row-less commits consume no seq
-    open: Option<(u64, u64)>,
-    rows_replayed: u64,
-    commits_past_s: u64,
-}
-
-impl ReplaySink {
-    async fn on_commit(
-        &mut self,
-        xid: u32,
-        info: u8,
-        record: &Record<'_>,
-    ) -> std::result::Result<(), SinkError> {
-        let payload = parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
-            .unwrap_or_default();
-        // Deferred resolution for filenodes invisible at record time;
-        // installs decode verdicts + `O - B` barriers ahead of the drain
-        resolve_stash(
-            &self.buffer,
-            &self.log,
-            &self.pending,
-            xid,
-            &payload.subxacts,
-            record.next_lsn,
-            self.resolver.stats_handle(),
-        )
-        .await
-        .map_err(SinkError::from)?;
-        let mut drain = self
-            .buffer
-            .lock()
-            .await
-            .drain_committed(
-                xid,
-                payload.xact_time,
-                record.source_lsn,
-                &payload.subxacts,
-                self.resolver.stores_chunks(),
-            )
-            .await
-            .map_err(SinkError::from)?;
-        while let Some(batch) = drain
-            .next_batch(self.batch_rows, self.batch_bytes, self.budget.as_ref())
-            .await
-            .map_err(SinkError::from)?
-        {
-            self.apply_batch(batch, drain.commit_ts, drain.commit_lsn)
-                .await?;
-        }
-        drain.finish().await.map_err(SinkError::from)?;
-        if let Some((seq, rows)) = self.open.take() {
-            self.ack.placed(seq, rows);
-        }
-        self.subxact_tracker.forget_tree(xid);
-        Ok(())
-    }
-
-    async fn apply_batch(
-        &mut self,
-        batch: DrainedBatch,
-        commit_ts: i64,
-        commit_lsn: u64,
-    ) -> std::result::Result<(), SinkError> {
-        let walk = batch.into_walk();
-        let ref_maps: Vec<&ChunkRefMap> = walk.chunks.iter().map(|g| g.map()).collect();
-        // One spool per xact; generations sealed before spooling carry None
-        let spool = walk.chunks.iter().find_map(|g| g.spool());
-        let mut rows_cursor = 0usize;
-        for step in walk.steps {
-            match step {
-                WalkStep::Rows { upto } => {
-                    if upto > rows_cursor {
-                        self.resolver
-                            .put_row_refs(walk.new_rows.spool(), &walk.new_rows[rows_cursor..upto])
-                            .await
-                            .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
-                        rows_cursor = upto;
-                    }
-                }
-                // Live stream owns DDL/config apply
-                WalkStep::Event(DrainEntry::Catalog(_))
-                | WalkStep::Event(DrainEntry::Config(_)) => {}
-                WalkStep::Event(DrainEntry::ToastBarrier {
-                    toast_relid,
-                    marker_lsn,
-                }) => {
-                    self.resolver
-                        .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
-                        .await
-                        .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
-                }
-                WalkStep::Truncate(_) => {
-                    // xl_heap_truncate carries no block ref, never passes the
-                    // rfn filter
-                    debug_assert!(false, "TRUNCATE heap in gap replay");
-                }
-                WalkStep::Heap(mut heap) => {
-                    let rfn = heap.decoded.rfn;
-                    let Some((rel, s_cap)) = self.targets.get(&(rfn.db_node, rfn.rel_node)) else {
-                        continue;
-                    };
-                    if commit_lsn <= self.b_redo {
-                        // Backup pages already reflect this commit; the walked
-                        // copy (tagged min(B_redo, S)) carries it
-                        continue;
-                    }
-                    if commit_lsn > *s_cap {
-                        self.commits_past_s += 1;
-                        continue;
-                    }
-                    let policy = self
-                        .row_policy
-                        .for_rel(self.config.as_deref(), &rel.rel_name);
-                    // Append-only destination (no delete marker): see
-                    // `decode_and_route`
-                    if policy.system.is_deleted.is_none()
-                        && matches!(heap.decoded.op, crate::decode::heap_decoder::HeapOp::Delete)
-                    {
-                        self.stats
-                            .deletes_discarded
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    let rel = rel.clone();
-                    let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
-                        .await
-                        .map_err(SinkError::from)?;
-                    let Some(mapping) = self.mapping.get(&rel.rel_name) else {
-                        self.stats
-                            .unsupported_relations
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    };
-                    let mapping = Arc::new(mapping.clone());
-                    let rules = self
-                        .config
-                        .as_ref()
-                        .map_or_else(Arc::default, |rc| rc.column_rules.clone());
-                    let route = crate::emit::route::RouteSnapshot::freeze(mapping, rules, policy);
-                    let seq = if let Some((seq, rows)) = &mut self.open {
-                        *rows += 1;
-                        *seq
-                    } else {
-                        let seq = self.next_seq;
-                        self.next_seq += 1;
-                        self.ack.register(seq, commit_lsn);
-                        self.open = Some((seq, 1));
-                        seq
-                    };
-                    self.msg_tx
-                        .send(BatcherMsg::Row(RoutedRow {
-                            seq,
-                            rel,
-                            route,
-                            committed: CommittedTuple {
-                                decoded: heap.decoded,
-                                commit_ts,
-                                commit_lsn,
-                            },
-                            value_permit: value_permit.map(Arc::new),
-                        }))
-                        .await
-                        .map_err(|_| {
-                            SinkError::Other("backup_backfill: replay tail closed".into())
-                        })?;
-                    self.rows_replayed += 1;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl RecordSink for ReplaySink {
-    fn on_record<'a>(
-        &'a mut self,
-        record: &'a Record<'a>,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            let rm = record.parsed.header.resource_manager_id;
-            if rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 {
-                let in_filter = record.parsed.blocks.first().is_some_and(|b| {
-                    let rel = b.header.location.rel;
-                    self.filter_rfns.contains(&(rel.db_node, rel.rel_node))
-                });
-                if in_filter {
-                    self.decoder.on_record(record).await?;
-                }
-            } else if rm == RmId::Xact as u8 {
-                let info = record.parsed.header.info;
-                let xid = record.parsed.header.xact_id;
-                match info & XLOG_XACT_OPMASK {
-                    XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
-                        self.on_commit(xid, info, record).await?;
-                    }
-                    XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
-                        let payload =
-                            parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
-                                .unwrap_or_default();
-                        self.buffer
-                            .lock()
-                            .await
-                            .abort(xid, record.source_lsn, &payload.subxacts)
-                            .await
-                            .map_err(SinkError::from)?;
-                        self.subxact_tracker.forget_tree(xid);
-                    }
-                    XLOG_XACT_ASSIGNMENT => {
-                        // Hint for eviction policy; correctness rides on the
-                        // commit / abort record's authoritative subxact list
-                        if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data)
-                        {
-                            self.subxact_tracker.assign(xtop, &subs);
-                        }
-                    }
-                    _ => {
-                        // PREPARE / INVALIDATIONS unhandled; xact stays
-                        // buffered until COMMIT_PREPARED
-                    }
-                }
-            }
-            Ok(())
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::decode::visibility::{
         HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
     };
+    use crate::decode::wal_xact::{XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO};
     use crate::record::Route;
     use walrus::pg::walparser::{
         BlockLocation, RelFileNode, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
@@ -1327,6 +899,61 @@ mod tests {
             view.xid_status(701),
             crate::decode::visibility::XidStatus::Aborted
         );
+    }
+
+    /// `xl_xact_twophase` payload: xact_time, xinfo, then the prepared xid
+    fn two_phase_main_data(prepared: u32) -> Vec<u8> {
+        let mut md: Vec<u8> = 7i64.to_le_bytes().to_vec();
+        md.extend_from_slice(&XACT_XINFO_HAS_TWOPHASE.to_le_bytes());
+        md.extend_from_slice(&prepared.to_le_bytes());
+        md
+    }
+
+    /// Patch prepared xid rather than finishing backend xid
+    #[test]
+    fn prescan_keys_two_phase_verdicts_to_the_prepared_xid() {
+        let mut s = prescan(16400, 16400);
+        s.observe(&record(
+            RmId::Xact,
+            XLOG_XACT_COMMIT_PREPARED | XLOG_XACT_HAS_INFO,
+            777,
+            two_phase_main_data(800),
+            None,
+        ));
+        s.observe(&record(
+            RmId::Xact,
+            XLOG_XACT_ABORT_PREPARED | XLOG_XACT_HAS_INFO,
+            778,
+            two_phase_main_data(801),
+            None,
+        ));
+        assert!(s.skew.is_none());
+        let accum = PgXactAccum::new();
+        let view = PgXactView::new(&accum, &s.patch);
+        assert_eq!(
+            view.xid_status(800),
+            crate::decode::visibility::XidStatus::Committed
+        );
+        assert_eq!(
+            view.xid_status(801),
+            crate::decode::visibility::XidStatus::Aborted
+        );
+        assert_eq!(s.patch.len(), 2, "finishing backend's xid stays unpatched");
+    }
+
+    /// Reject truncated subxact payload
+    #[test]
+    fn prescan_fails_closed_on_malformed_xact_payload() {
+        let mut s = prescan(16400, 16400);
+        s.observe(&record(
+            RmId::Xact,
+            XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO,
+            700,
+            vec![0u8; 10],
+            None,
+        ));
+        assert!(s.skew.is_some(), "malformed commit payload fails closed");
+        assert!(s.patch.is_empty());
     }
 
     #[test]
@@ -1623,7 +1250,7 @@ mod tests {
         drop(walk_tx);
         walk_ok_tx.send(()).unwrap();
 
-        let stats = gate.await.unwrap().unwrap();
+        let (stats, _segments) = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
         while let Some(t) = gated_rx.recv().await {
             got.push(t.xid);
@@ -1680,7 +1307,7 @@ mod tests {
         drop(walk_tx);
         drop(walk_ok_tx);
 
-        let stats = gate.await.unwrap().unwrap();
+        let (stats, _segments) = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
         while let Some(t) = gated_rx.recv().await {
             got.push(t.xid);
@@ -1743,7 +1370,7 @@ mod tests {
         drop(walk_tx);
         walk_ok_tx.send(()).unwrap();
 
-        let stats = gate.await.unwrap().unwrap();
+        let (stats, _segments) = gate.await.unwrap().unwrap();
         assert!(gated_rx.recv().await.is_none(), "dead tuple must not emit");
         assert_eq!(stats.deferred, 1, "multixact defers to EOF");
         assert_eq!(stats.gated, 1);

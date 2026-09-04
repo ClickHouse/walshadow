@@ -41,6 +41,7 @@ use crate::backfill::backup_sink::{
 use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::decode::decoder_sink::TupleObserver;
 use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
+use ahash::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
@@ -51,6 +52,9 @@ pub struct BootstrapConfig {
     /// `rel_node < 16384` bootstrap rule misses. Empty in greenfield where
     /// seed runs after bootstrap
     pub catalog_filenodes: CatalogFilenodes,
+    /// Main filenodes whose pages nothing downstream keeps, declined
+    /// before decode. See [`PageWalkSink::with_skip_filenodes`]
+    pub skip_filenodes: HashSet<(Oid, Oid)>,
 }
 
 impl BootstrapConfig {
@@ -58,11 +62,17 @@ impl BootstrapConfig {
         Self {
             shadow_data_dir,
             catalog_filenodes: CatalogFilenodes::new(),
+            skip_filenodes: HashSet::default(),
         }
     }
 
     pub fn with_catalog_filenodes(mut self, c: CatalogFilenodes) -> Self {
         self.catalog_filenodes = c;
+        self
+    }
+
+    pub fn with_skip_filenodes(mut self, skip: HashSet<(Oid, Oid)>) -> Self {
+        self.skip_filenodes = skip;
         self
     }
 }
@@ -119,7 +129,8 @@ pub fn spawn_greenfield_bootstrap(
             })?;
 
         let lander = DiskLanderSink::new(cfg.catalog_filenodes);
-        let page_walk = PageWalkSink::new(catalog_map, tx, store_toast);
+        let page_walk =
+            PageWalkSink::new(catalog_map, tx, store_toast).with_skip_filenodes(cfg.skip_filenodes);
         let mux = MultiplexSink::new(lander, page_walk);
 
         // Keep typed Arc beside erased trait-object Arc to recover stats
@@ -321,47 +332,33 @@ pub async fn seed_in_snapshot(client: &Client) -> Result<CatalogMap> {
 }
 
 async fn fetch_replident(client: &Client, c: char, rel_oid: Oid) -> Result<ReplIdent> {
-    match c {
-        'd' => {
-            let row = client
-                .query_opt(
-                    "SELECT indkey::int2[] FROM pg_index \
-                     WHERE indrelid = $1 AND indisprimary = true LIMIT 1",
-                    &[&rel_oid],
-                )
-                .await?;
-            let pk_attnums = row.map(|r| r.get::<_, Vec<i16>>(0));
-            Ok(ReplIdent::Default { pk_attnums })
-        }
-        'n' => Ok(ReplIdent::Nothing),
-        'f' => {
-            // Capture the PK even under FULL so the CH ORDER BY uses it, not `_lsn`.
-            let row = client
-                .query_opt(
-                    "SELECT indkey::int2[] FROM pg_index \
-                     WHERE indrelid = $1 AND indisprimary = true LIMIT 1",
-                    &[&rel_oid],
-                )
-                .await?;
-            let pk_attnums = row.map(|r| r.get::<_, Vec<i16>>(0));
-            Ok(ReplIdent::Full { pk_attnums })
-        }
-        'i' => {
-            let row = client
-                .query_one(
-                    "SELECT indexrelid::oid, indkey::int2[] FROM pg_index \
-                     WHERE indrelid = $1 AND indisreplident = true LIMIT 1",
-                    &[&rel_oid],
-                )
-                .await
-                .context("bootstrap: replident='i' missing pg_index row")?;
-            Ok(ReplIdent::UsingIndex {
-                index_oid: row.get(0),
-                key_attnums: row.get(1),
-            })
-        }
-        other => anyhow::bail!("bootstrap: unknown relreplident {other:?}"),
-    }
+    // Capture the PK even under FULL so the CH ORDER BY uses it, not `_lsn`
+    let pk_attnums = if c == 'd' || c == 'f' {
+        client
+            .query_opt(
+                "SELECT indkey::int2[] FROM pg_index \
+                 WHERE indrelid = $1 AND indisprimary = true LIMIT 1",
+                &[&rel_oid],
+            )
+            .await?
+            .map(|r| r.get::<_, Vec<i16>>(0))
+    } else {
+        None
+    };
+    let using_index = if c == 'i' {
+        client
+            .query_opt(
+                "SELECT indexrelid::oid, indkey::int2[] FROM pg_index \
+                 WHERE indrelid = $1 AND indisreplident = true LIMIT 1",
+                &[&rel_oid],
+            )
+            .await?
+            .map(|r| (r.get(0), r.get(1)))
+    } else {
+        None
+    };
+    ReplIdent::from_parts(c, pk_attnums, using_index)
+        .map_err(|e| anyhow::anyhow!("bootstrap: {e} for relation {rel_oid}"))
 }
 
 async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>> {
