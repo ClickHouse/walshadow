@@ -12,6 +12,10 @@
 //!   sibling test probing that port meanwhile would find it free. Lock files
 //!   sit under `TMPDIR`, so concurrent test processes must share one.
 //!
+//! Also hands out the socket [`PgConfig`] a test dials a fixture cluster on,
+//! the other half of naming one: `application_name` says which drill holds a
+//! connection when `pg_stat_activity` is read.
+//!
 //! Postgres clusters here are socket-only (`listen_addresses = ''`) and PG keys
 //! its SysV segment off the data dir inode (PG `src/backend/port/sysv_shmem.c`),
 //! so a cluster's `port` only names a socket file inside a per-test temp dir.
@@ -25,6 +29,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use ahash::{HashSet, HashSetExt};
+use walrus::pg::replication::conn::PgConfig;
+use walrus::pg::replication::tls::{SslMode, TlsParams};
+use walshadow::shadow::Shadow;
 
 /// Socket-only cluster ports. Distinct per role so a test that puts source and
 /// shadow in one socket dir still gets distinct socket files.
@@ -129,5 +136,19 @@ impl Ports {
             metrics: reserve_port(),
             walsender: reserve_port(),
         }
+    }
+}
+
+/// Socket connection parameters for a fixture cluster
+pub fn pg_cfg(sh: &Shadow, application_name: &str) -> PgConfig {
+    PgConfig {
+        host: sh.config().socket_dir.to_str().unwrap().to_string(),
+        port: sh.config().port,
+        user: "postgres".into(),
+        password: None,
+        database: "postgres".into(),
+        application_name: application_name.into(),
+        sslmode: SslMode::Disable,
+        tls: TlsParams::default(),
     }
 }

@@ -30,11 +30,13 @@ digraph timeline_bootstrap {
     lan2  [label="DiskLanderSink\ncatalog → shadow data dir\nuser-heap filenode Skip", fillcolor="#4D3A28"];
     walk2 [label="PageWalkSink\ndecode 8 KiB heap pages\nmain + pg_toast tuples with TID\n→ BackfillTuple (mpsc)", fillcolor="#4D3A28"];
     dsk2  [label="shadow data dir\ncatalog files landed", fillcolor="#4D3850", shape=note];
+    leg2  [label="window WAL leg\ndaemon feed, sampled pre-backup\ndecode → insert tail", fillcolor="#4D3A28"];
 
     bs2 -> src2 [label="replication protocol", color="#A1A9CC", dir=both, arrowtail=open];
     bs2 -> lan2  [label="MultiplexSink"];
     bs2 -> walk2 [label="MultiplexSink"];
     lan2 -> dsk2 [label="land file"];
+    src2 -> leg2 [label="window WAL, live", color="#A1A9CC", dir=both, arrowtail=open];
   }
   map1 -> bs2 [label="open BASE_BACKUP", lhead=cluster_p2, color="#A1A9CC"];
 
@@ -43,12 +45,15 @@ digraph timeline_bootstrap {
     label="③ drain → ClickHouse  (concurrent with ②)";
     style="rounded,filled"; color="#4c4641"; fillcolor="#34302c"; fontcolor="#ECE1D7";
 
+    gate3  [label="visibility gate\nhint bits → inline\nunknown → spool\nresolve from pg_xact + patch", fillcolor="#4D3A28"];
     drain3 [label="pipeline::bootstrap::drain\nToastRows → mirror batch\nExternalToast → deferred\nflush chunks, fetch + resolve\nmap main rows; one seq per rfn flip", fillcolor="#4D3A28"];
     ch3    [label="ClickHouse\nTOAST mirrors: put before deferred fetch\nmain tables: shared insert tail\nbatcher + inserter ×N + ack collector\ntail.finish → all seqs durable", fillcolor="#4D4128"];
 
+    gate3 -> drain3 [label="tuples that were live\nat backup time"];
     drain3 -> ch3 [label="BatcherMsg::Row", color="#BF8C5F"];
   }
-  walk2 -> drain3 [label="BackfillTuple\n(bounded mpsc 256,\nbackpressures pump)", lhead=cluster_p3];
+  walk2 -> gate3 [label="BackfillTuple\n(bounded mpsc 256,\nbackpressures pump)", lhead=cluster_p3];
+  leg2 -> ch3 [label="window commits at real _lsn\noutrank walked rows", color="#BF8C5F", lhead=cluster_p3];
 
   // ═════ ④ shadow handoff ═════
   subgraph cluster_p4 {

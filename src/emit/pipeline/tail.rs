@@ -88,6 +88,70 @@ impl TailParts {
     }
 }
 
+/// Tail plus the producer handles a single bootstrap leg holds
+///
+/// The leg owns its seq space, so the durable watermark is throwaway:
+/// completion is `wait_through(next_seq)`, not a resume position
+pub struct OwnedTail {
+    pub msg_tx: mpsc::Sender<BatcherMsg>,
+    pub ack: AckHandle,
+    parts: TailParts,
+    fatal: Fatal,
+    /// Prefix for the errors this leg reports
+    context: &'static str,
+}
+
+impl OwnedTail {
+    /// Bounded legs pass `inserter_pool_size = 1`: they replay serially, and
+    /// the batcher's queue already overlaps insert with decode
+    pub async fn spawn(
+        emitter: &EmitterConfig,
+        inserter_pool_size: usize,
+        stats: Arc<EmitterStats>,
+        fatal: Fatal,
+        config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+        oracle: Option<Arc<crate::ops::oracle::Oracle>>,
+        context: &'static str,
+    ) -> Result<Self, String> {
+        let (msg_tx, ack, parts) = spawn_with_config(
+            emitter,
+            inserter_pool_size,
+            stats,
+            Arc::new(Monotone::<EmitterAck>::new(0)),
+            fatal.clone(),
+            config_rx,
+            oracle,
+        )
+        .await
+        .map_err(|e| format!("{context}: spawn insert tail: {e}"))?;
+        Ok(Self {
+            msg_tx,
+            ack,
+            parts,
+            fatal,
+            context,
+        })
+    }
+
+    /// Seal batches and prove every seq below `through` durable
+    pub async fn finish(self, through: u64) -> Result<(), String> {
+        self.parts
+            .finish(self.msg_tx, self.ack, through, &self.fatal)
+            .await
+            .map_err(|m| format!("{}: {m}", self.context))
+    }
+
+    /// Failed-leg teardown: dropping the last producer handles closes the
+    /// batcher, which final-flushes and cascades the inserters + collector
+    /// down. Bounded by the inserters' retry policy (a CH outage trips their
+    /// fatal, not a hang)
+    pub async fn quiesce(self) {
+        drop(self.msg_tx);
+        drop(self.ack);
+        self.parts.join().await;
+    }
+}
+
 /// Stand up the tail: ack collector, inserter pool (`n` connections),
 /// batcher. Returns the `BatcherMsg` sender + [`AckHandle`] (clone into
 /// producers) and join handles. Fails only if an inserter connection can't

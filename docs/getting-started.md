@@ -13,8 +13,9 @@ Prepare:
 - PostgreSQL account with `REPLICATION` and read access to selected tables
 - Matching PostgreSQL major for walshadow image
 
-Source must use `wal_level = logical` and at least one WAL sender. Each selected
-table needs a usable row key
+Source must use `wal_level = logical` and at least two WAL senders for
+concurrent streaming and base backup. Each selected table needs a usable row
+key
 
 ```sql
 ALTER SYSTEM SET wal_level = logical;

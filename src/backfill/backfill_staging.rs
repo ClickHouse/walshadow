@@ -85,8 +85,8 @@ pub async fn prepare(
     let mut sess = StagingSession::connect(emitter).await?;
     // Freeze routing for entire staging plan
     let live_map = live.snapshot().await;
-    let mut staged: HashMap<RelName, TableMapping> = HashMap::new();
-    let mut rels = Vec::new();
+    let mut staged: HashMap<RelName, TableMapping> = HashMap::with_capacity(reqs.len());
+    let mut rels = Vec::with_capacity(reqs.len());
     for r in reqs {
         let name = &r.desc.rel_name;
         let Some(m) = live_map.get(name) else {

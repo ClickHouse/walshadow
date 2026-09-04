@@ -35,8 +35,7 @@ const META2_SQL: &str = "repeat('v2-update-', 60)";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replident_full_unchanged_toast_update() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 

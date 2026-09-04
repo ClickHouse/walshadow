@@ -77,6 +77,26 @@ impl RouteSnapshot {
     }
 }
 
+/// One frozen route per mapped relation, so a bounded pass never re-reads
+/// config or re-clones column rules per row
+pub fn freeze_routes(
+    mapping: &crate::mapping::MappingSnapshot,
+    config: Option<&crate::config::ResolvedConfig>,
+    row_policy: &RowPolicy,
+) -> ahash::HashMap<RelName, Arc<RouteSnapshot>> {
+    let rules = config.map_or_else(Arc::default, |rc| rc.column_rules.clone());
+    mapping
+        .iter()
+        .map(|(name, m)| {
+            let policy = row_policy.for_rel(config, name);
+            (
+                name.clone(),
+                RouteSnapshot::freeze(Arc::new(m.clone()), rules.clone(), policy),
+            )
+        })
+        .collect()
+}
+
 /// Described heap plus its resolved route. `route = None` means the relation
 /// is deterministically unmapped at that interval — a normal counted discard,
 /// distinct from a missing descriptor

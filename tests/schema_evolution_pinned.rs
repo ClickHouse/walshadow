@@ -35,8 +35,7 @@ use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
 fn skip_if_missing() -> bool {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return true;
     }
     false

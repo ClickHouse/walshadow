@@ -126,8 +126,7 @@ fn mappings_for(namespace: &str, table: &str) -> Vec<fx::TableMappingSpec> {
 /// records unseen — and must classify the commit from its inval set alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rename_commit_after_restart_reroutes() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
+    if !fx::requirements_available() {
         return;
     }
     let slot = fx::Ports::alloc();
@@ -224,8 +223,7 @@ async fn rename_commit_after_restart_reroutes() {
 /// xact's inval set; namespace catcache invals must force capture-all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prepared_rename_commit_after_restart_reroutes() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse on PATH");
+    if !fx::requirements_available() {
         return;
     }
     let slot = fx::Ports::alloc();

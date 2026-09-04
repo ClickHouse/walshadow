@@ -47,6 +47,17 @@ request per insert batch
 
 ## Initial loads
 
+- transactions open past greenfield handoff resume from their first buffered
+  record, using source or archived WAL; missing history stops replication
+  instead of skipping it. Earlier records can still leave missing inserts or
+  stale deletes
+- mapped external TOAST values or unresolved multixacts trigger whole-relation
+  `COPY` repair; inline values and unmapped external columns stay on page walk
+- repair reads each physical relation with `ONLY` and rejects row-security
+  filtering; source account must be able to read every row of repaired relations
+- dropping or rewriting a relation before repair fails bootstrap
+- DDL during greenfield bootstrap is unsupported; affected relations may be
+  skipped or fail repair
 - `copy` scans selected table through PostgreSQL SQL path
 - `base_backup` transfers cluster-sized backup even for one table
 - `object_store` requires full wal-g backup and continuous archived WAL to selection point
@@ -58,6 +69,10 @@ request per insert batch
 Default `[toast] mode = "disabled"` cannot always reconstruct values stored
 externally before replication window. Enable ClickHouse TOAST storage before
 initial load when complete large-value history matters
+
+Reused TOAST value IDs can leave ambiguous generations in backup chunk mirrors
+when hint bits do not prove older chunks dead. COPY repair fixes baseline rows,
+but later unchanged-pointer updates still depend on those mirrors
 
 ## Not an HA system
 

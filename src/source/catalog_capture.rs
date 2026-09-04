@@ -305,13 +305,13 @@ impl CatalogCapture {
     /// shape after them, so the oid's last non-`Retired` entry is the shape
     /// CH is told about.
     fn replay_events(&self, batch: &BatchRecord) -> Vec<PendingEvent> {
-        let mut last_for_oid: HashMap<Oid, usize> = HashMap::new();
+        let mut last_for_oid: HashMap<Oid, usize> = HashMap::with_capacity(batch.entries.len());
         for (at, entry) in batch.entries.iter().enumerate() {
             if !matches!(entry.value, LogValue::Retired) {
                 last_for_oid.insert(entry.oid, at);
             }
         }
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(last_for_oid.len());
         for (at, entry) in batch.entries.iter().enumerate() {
             if last_for_oid.get(&entry.oid) != Some(&at) {
                 continue;

@@ -139,7 +139,7 @@ impl DirtyTree {
                 .map(|(x, _)| *x),
         );
         let mut merged: Option<DirtyState> = None;
-        let mut drained: Vec<u32> = Vec::new();
+        let mut drained: Vec<u32> = Vec::with_capacity(members.len());
         for x in members {
             if drained.contains(&x) {
                 continue;

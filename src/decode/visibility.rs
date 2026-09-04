@@ -29,7 +29,10 @@
 //! risks resurrecting a pre-coverage dead version, skipping risks dropping
 //! a live row, so the pass aborts.
 
+use std::path::{Path, PathBuf};
+
 use ahash::{HashMap, HashSet};
+use anyhow::{Context, Result};
 
 // t_infomask bits, PG src/include/access/htup_details.h
 pub const HEAP_XMAX_KEYSHR_LOCK: u16 = 0x0010;
@@ -448,7 +451,7 @@ pub fn tuple_visibility(
 }
 
 /// Parse a `pg_xact/<hex>` cluster-relative path into its segment number.
-pub fn pg_xact_segno_from_path(path: &std::path::Path) -> Option<u32> {
+pub fn pg_xact_segno_from_path(path: &Path) -> Option<u32> {
     let mut comps = path.components();
     let dir = comps.next()?;
     if dir.as_os_str() != "pg_xact" {
@@ -468,7 +471,7 @@ pub enum MultiXactSegment {
 }
 
 /// Parse a `pg_multixact/{offsets,members}/<hex>` cluster-relative path.
-pub fn pg_multixact_segno_from_path(path: &std::path::Path) -> Option<MultiXactSegment> {
+pub fn pg_multixact_segno_from_path(path: &Path) -> Option<MultiXactSegment> {
     let mut comps = path.components();
     if comps.next()?.as_os_str() != "pg_multixact" {
         return None;
@@ -486,10 +489,68 @@ pub fn pg_multixact_segno_from_path(path: &std::path::Path) -> Option<MultiXactS
     }
 }
 
+/// Read landed `pg_xact` segments off a cluster data dir
+pub async fn read_pg_xact(data_dir: &Path) -> Result<PgXactAccum> {
+    let mut accum = PgXactAccum::new();
+    for (rel, bytes) in read_slru_dir(data_dir, Path::new("pg_xact")).await? {
+        if let Some(segno) = pg_xact_segno_from_path(&rel) {
+            accum.insert_segment(segno, bytes);
+        }
+    }
+    Ok(accum)
+}
+
+/// Read landed `pg_multixact` offsets and members segments
+pub async fn read_pg_multixact(data_dir: &Path) -> Result<PgMultiXactAccum> {
+    let mut accum = PgMultiXactAccum::new();
+    for sub in ["offsets", "members"] {
+        let dir = Path::new("pg_multixact").join(sub);
+        for (rel, bytes) in read_slru_dir(data_dir, &dir).await? {
+            match pg_multixact_segno_from_path(&rel) {
+                Some(MultiXactSegment::Offsets(s)) => accum.insert_offsets_segment(s, bytes),
+                Some(MultiXactSegment::Members(s)) => accum.insert_members_segment(s, bytes),
+                None => {}
+            }
+        }
+    }
+    Ok(accum)
+}
+
+/// Read files under a cluster-relative SLRU directory, keyed by that path.
+/// A directory the cluster never made reads as empty
+async fn read_slru_dir(data_dir: &Path, rel_dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let dir = data_dir.join(rel_dir);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("slru: read {}", dir.display())),
+    };
+    let mut out = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("slru: scan {}", dir.display()))?
+    {
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .await
+            .with_context(|| format!("slru: stat {}", path.display()))?
+            .is_file()
+        {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("slru: read {}", path.display()))?;
+        out.push((rel_dir.join(entry.file_name()), bytes));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn accum_with(segno: u32, statuses: &[(u32, u8)]) -> PgXactAccum {
         let mut bytes = vec![0u8; 8192];
@@ -793,5 +854,41 @@ mod tests {
             pg_xact_segno_from_path(Path::new("pg_xact/nested/0000")),
             None
         );
+    }
+
+    /// pg_xact segment bytes with `xid` marked committed
+    fn pg_xact_segment(xid: u32) -> Vec<u8> {
+        let mut bytes = vec![0u8; 8192];
+        bytes[(xid / 4) as usize] |= 0x01 << ((xid % 4) * 2);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn slru_reads_come_off_the_landed_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        tokio::fs::create_dir_all(dir.join("pg_xact"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("pg_xact").join("0000"), pg_xact_segment(700))
+            .await
+            .unwrap();
+        // Segment 1 proves the hex filename is the segment number, not an index
+        tokio::fs::write(dir.join("pg_xact").join("0001"), pg_xact_segment(3))
+            .await
+            .unwrap();
+
+        let accum = read_pg_xact(dir).await.unwrap();
+        // No pg_multixact/ at all: a cluster that never made one
+        let multi = read_pg_multixact(dir).await.unwrap();
+        let patch = PgXactPatch::new();
+        let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
+
+        assert_eq!(view.xid_status(700), XidStatus::Committed);
+        assert_eq!(
+            view.xid_status(PG_XACT_XIDS_PER_SEGMENT + 3),
+            XidStatus::Committed,
+        );
+        assert_eq!(view.xid_status(701), XidStatus::InProgress);
     }
 }

@@ -20,8 +20,7 @@ use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
 fn skip_gate() -> bool {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return true;
     }
     false

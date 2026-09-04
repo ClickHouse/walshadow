@@ -20,7 +20,7 @@
 #[path = "ports.rs"]
 mod ports;
 #[allow(unused_imports)]
-pub use ports::{PG_SHADOW_PORT, PG_SOURCE_PORT, Ports, reserve_port, reserve_span};
+pub use ports::{PG_SHADOW_PORT, PG_SOURCE_PORT, Ports, pg_cfg, reserve_port, reserve_span};
 
 use std::fs;
 use std::io::Write as _;
@@ -33,8 +33,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
-use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::{SslMode, TlsParams};
 
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
@@ -87,6 +85,20 @@ pub fn clickhouse_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+pub fn requirements_available() -> bool {
+    for (tool, found) in [
+        ("initdb", pg_available()),
+        ("pg_basebackup", pg_basebackup_available()),
+        ("clickhouse", clickhouse_available()),
+    ] {
+        if !found {
+            eprintln!("skip: no {tool} on PATH");
+            return false;
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -675,17 +687,7 @@ async fn build_pipeline_inner(
         app_name,
         ddl,
     } = args;
-    let scfg = source.config();
-    let pgcfg = PgConfig {
-        host: scfg.socket_dir.to_string_lossy().into_owned(),
-        port: scfg.port,
-        user: "postgres".into(),
-        password: None,
-        database: "postgres".into(),
-        application_name: app_name.into(),
-        sslmode: SslMode::Disable,
-        tls: TlsParams::default(),
-    };
+    let pgcfg = pg_cfg(source, app_name);
     let mut feed = SourceFeed::connect(&pgcfg)
         .await
         .expect("source feed connect")

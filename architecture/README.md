@@ -34,8 +34,9 @@ derives off channel ① (cache miss → diff → `SchemaEvent` →
 ### 4. Bootstrap timeline — greenfield in five phases
 
 Catalog seed → BASE_BACKUP pump → drain to CH → shadow handoff → WAL
-streaming. Bootstrap waits for CH writes, then uses backup end as new
-restart point. First status update saves it in `manifest.toml`.
+streaming. A concurrent WAL leg ships backup-window commits at their real
+`_lsn`, above walked rows. Bootstrap waits for CH writes, then uses backup end
+as restart point. First status update saves it in `manifest.toml`.
 
 ![bootstrap timeline](timeline_bootstrap.svg)
 

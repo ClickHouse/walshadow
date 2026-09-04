@@ -28,7 +28,7 @@ use crate::decode::heap_decoder::{
     ColumnValue, CommittedTuple, DecodeError, DecodedHeap, DecodedTuple, HeapOp, decode_block_data,
 };
 use crate::schema::RelDescriptor;
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSet};
 
 /// Heap page size, PG compile-time, identical to wal-rus `BLOCK_SIZE`
 pub const PAGE_BYTES: usize = 8192;
@@ -162,6 +162,9 @@ pub struct PageWalkStats {
     pub files_walked: u64,
     /// Filenode absent from catalog map, typically a race against the seed
     pub files_skipped_unknown_filenode: u64,
+    /// Main files the caller declined up front: relations whose rows the
+    /// drain or visibility repair would replace
+    pub files_skipped_by_caller: u64,
     pub toast_files_observed: u64,
     pub pages_walked: u64,
     pub slots_seen: u64,
@@ -357,6 +360,9 @@ pub struct PageWalkSink {
     /// backfills tag each rel with its own boundary; greenfield leaves
     /// this empty). Keyed `(db_node, rel_node)`.
     lsn_overrides: HashMap<(Oid, Oid), u64>,
+    /// Main filenodes to decline at `begin`, keyed `(db_node, rel_node)`.
+    /// Their bodies drain unread instead of paying page decode
+    skip: HashSet<(Oid, Oid)>,
     pub stats: PageWalkStats,
     /// Bounded ([`BOOTSTRAP_TUPLE_CHANNEL_CAP`]): `chunk` is async, so a
     /// full channel awaits in `ship_tuple`, parking the source body read
@@ -411,6 +417,7 @@ impl PageWalkSink {
             catalog,
             source_lsn: 0,
             lsn_overrides: HashMap::new(),
+            skip: HashSet::default(),
             stats: PageWalkStats::default(),
             out_tx: Some(out_tx),
             captured: Vec::new(),
@@ -445,6 +452,15 @@ impl PageWalkSink {
         self
     }
 
+    /// Decline listed main filenodes before decode. Caller policy: rows a
+    /// mapping snapshot never routes, or a relation visibility repair reads
+    /// whole. `pg_toast_*` filenodes are never declined, the mirror seeds
+    /// from every one of them
+    pub fn with_skip_filenodes(mut self, skip: HashSet<(Oid, Oid)>) -> Self {
+        self.skip = skip;
+        self
+    }
+
     /// Test-mode: emitted tuples land in `captured` instead of the mpsc
     #[cfg(test)]
     pub fn new_capturing(catalog: CatalogMap) -> Self {
@@ -452,6 +468,7 @@ impl PageWalkSink {
             catalog,
             source_lsn: 0,
             lsn_overrides: HashMap::new(),
+            skip: HashSet::default(),
             stats: PageWalkStats::default(),
             out_tx: None,
             captured: Vec::new(),
@@ -594,6 +611,10 @@ impl BackupSink for PageWalkSink {
         self.stats.files_seen += 1;
         let desc = self.catalog.get(f.db, f.filenode);
         let is_toast = self.catalog.is_toast(f.db, f.filenode);
+        if !is_toast && self.skip.contains(&(f.db, f.filenode)) {
+            self.stats.files_skipped_by_caller += 1;
+            return Ok(FileAction::Skip);
+        }
         if is_toast {
             self.stats.toast_files_observed += 1;
         } else if desc.is_some() {
@@ -707,6 +728,28 @@ pub(crate) fn make_rel() -> RelDescriptor {
             missing_text: None,
         }],
     }
+}
+
+/// [`make_rel`] retargeted onto another relation. Kind follows the
+/// namespace, the way PostgreSQL names chunk relations
+#[cfg(test)]
+pub(crate) fn make_rel_named(
+    oid: Oid,
+    rel_node: Oid,
+    toast_oid: Oid,
+    name: crate::schema::RelName,
+) -> std::sync::Arc<RelDescriptor> {
+    let mut desc = make_rel();
+    desc.rfn.rel_node = rel_node;
+    desc.oid = oid;
+    desc.toast_oid = toast_oid;
+    desc.kind = if &*name.namespace == PG_TOAST_NS {
+        't'
+    } else {
+        'r'
+    };
+    desc.rel_name = name;
+    std::sync::Arc::new(desc)
 }
 
 /// Test fixture: synthesise an 8 KiB heap page with one int4 tuple in
@@ -969,6 +1012,48 @@ mod tests {
             );
         }
         assert_eq!(sink.stats.files_seen, 0);
+    }
+
+    /// Caller-declined main files drain unread: the drain drops unmapped
+    /// rows and repair replaces pending ones. Chunk files still walk, the
+    /// mirror seeds from every toast rel
+    #[tokio::test]
+    async fn pagewalk_sink_declines_caller_skipped_main_files() {
+        use crate::schema::RelName;
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        let mut toast = make_rel();
+        toast.rfn.rel_node = 16401;
+        toast.oid = 16401;
+        toast.rel_name = RelName::new("pg_toast", "pg_toast_16400");
+        catalog.insert(Arc::new(toast));
+        let mut sink = PageWalkSink::new_capturing_with_toast(catalog)
+            .with_skip_filenodes([(5, 16400), (5, 16401)].into_iter().collect());
+        sink.start(&StartInfo {
+            start_lsn: 0x1000,
+            timeline: 1,
+            tablespaces: Vec::new(),
+        })
+        .await
+        .unwrap();
+        for (i, (path, want)) in [
+            ("base/5/16400", FileAction::Skip),
+            ("base/5/16401", FileAction::Tap),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let meta = FileMeta {
+                path: PathBuf::from(path),
+                size: PAGE_BYTES as u64,
+                mode: 0o600,
+                kind: FileKind::File,
+            };
+            assert_eq!(sink.begin(EntryId(i as u64), &meta).await.unwrap(), *want);
+        }
+        assert_eq!(sink.stats.files_skipped_by_caller, 1);
+        assert_eq!(sink.stats.files_walked, 0);
+        assert_eq!(sink.stats.toast_files_observed, 1);
     }
 
     #[tokio::test]

@@ -28,16 +28,7 @@ const N_ROWS: u32 = 500;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn copy_into_multi_insert_replicates() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return;
-    }
-    if !fx::pg_basebackup_available() {
-        eprintln!("skip: no pg_basebackup on PATH");
-        return;
-    }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::requirements_available() {
         return;
     }
 

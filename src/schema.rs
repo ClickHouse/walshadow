@@ -87,6 +87,44 @@ pub enum ReplIdent {
     },
 }
 
+impl ReplIdent {
+    /// `pg_class.relreplident`
+    pub fn to_char(&self) -> char {
+        match self {
+            ReplIdent::Default { .. } => 'd',
+            ReplIdent::Nothing => 'n',
+            ReplIdent::Full { .. } => 'f',
+            ReplIdent::UsingIndex { .. } => 'i',
+        }
+    }
+
+    /// Build from `pg_class.relreplident` plus the `pg_index` rows it names:
+    /// the primary key for `d`/`f`, the replica-identity index for `i`
+    pub fn from_parts(
+        c: char,
+        pk_attnums: Option<Vec<i16>>,
+        using_index: Option<(Oid, Vec<i16>)>,
+    ) -> Result<Self, String> {
+        match c {
+            'd' => Ok(ReplIdent::Default { pk_attnums }),
+            'n' => Ok(ReplIdent::Nothing),
+            'f' => Ok(ReplIdent::Full { pk_attnums }),
+            'i' => {
+                let (index_oid, key_attnums) = using_index.ok_or_else(|| {
+                    "relreplident='i' but no pg_index row with indisreplident=true".to_owned()
+                })?;
+                Ok(ReplIdent::UsingIndex {
+                    index_oid,
+                    key_attnums,
+                })
+            }
+            other => Err(format!(
+                "unknown relreplident {other:?} (expected one of d/n/f/i)"
+            )),
+        }
+    }
+}
+
 /// Resolve stored primary/index keys, including primary key metadata under `Full`
 pub fn replident_key_attnums(desc: &RelDescriptor) -> &[i16] {
     match &desc.replident {
