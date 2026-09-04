@@ -130,6 +130,15 @@ macro_rules! query_with_reconnect {
     }};
 }
 
+/// Replay position a name lookup is pinned to, plus whether the caller pinned
+/// it (withholding successor WAL) or this read merely observed it. Only the
+/// former may skip SQL.
+#[derive(Clone, Copy)]
+struct NamePin {
+    lsn: u64,
+    by_caller: bool,
+}
+
 impl ShadowCatalog {
     /// Connect over a libpq key=value conninfo. One-shot; wrap in
     /// [`with_transient_retry`] for retry-on-PG-coming-up. `conninfo` is stashed
@@ -261,7 +270,14 @@ impl ShadowCatalog {
     }
 
     /// Wait until shadow's replay LSN ≥ `target`, returning the deciding poll's
-    /// LSN. `target = 0` returns on the first non-NULL LSN.
+    /// LSN. `target = 0` returns on the first non-zero LSN.
+    ///
+    /// Polls the bridge worker, not SQL. `SELECT pg_last_wal_replay_lsn()`
+    /// needs no lock of its own but its *parse* opens `pg_type`, so it blocks
+    /// whenever replay is holding an AccessExclusiveLock on a catalog — and the
+    /// release for such a lock can be in WAL this very wait is what unblocks.
+    /// The worker reads the position out of shared memory instead, and it is
+    /// long-lived, so it parses nothing here.
     pub async fn wait_for_replay(&mut self, target: u64) -> Result<u64> {
         if let Some(seen) = self.last_replay_lsn
             && seen >= target
@@ -271,11 +287,13 @@ impl ShadowCatalog {
         }
         self.stats.replay_waits += 1;
         let start = Instant::now();
+        let bridge = self.bridge.clone();
         loop {
-            let row = self
-                .query_one_retry("SELECT pg_last_wal_replay_lsn()", &[])
-                .await?;
-            let lsn = row.get::<_, Option<PgLsn>>(0).map(u64::from);
+            // Worker reports 0 off a standby, same as the SQL function's NULL
+            let lsn = match bridge.replay_lsn().await? {
+                0 => None,
+                lsn => Some(lsn),
+            };
             if let Some(lsn) = lsn {
                 self.last_replay_lsn = Some(self.last_replay_lsn.map_or(lsn, |old| old.max(lsn)));
                 if lsn >= target {
@@ -301,18 +319,47 @@ impl ShadowCatalog {
         &mut self,
         oids: &[Oid],
     ) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_committed(Scope::Oids(oids)).await
+        self.fetch_committed(Scope::Oids(oids), None).await
     }
 
     /// Every eligible user relation: capture-all + descriptor-log boot seed.
     pub async fn fetch_all_descriptors(&mut self) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_committed(Scope::Eligible).await
+        self.fetch_committed(Scope::Eligible, None).await
+    }
+
+    /// [`fetch_descriptors_batch`](Self::fetch_descriptors_batch) for a caller
+    /// that has parked replay at `boundary` and withheld every successor byte.
+    ///
+    /// Saying so is what keeps the read out of the deadlock: the worker checks
+    /// the position on both sides and may then read a catalog whose lock replay
+    /// is holding, and no step falls back to ordinary SQL, whose parse would
+    /// queue behind that same lock.
+    pub async fn fetch_descriptors_batch_at(
+        &mut self,
+        oids: &[Oid],
+        boundary: u64,
+    ) -> Result<(u64, Vec<RelDescriptor>)> {
+        self.fetch_committed(Scope::Oids(oids), Some(boundary))
+            .await
+    }
+
+    /// [`fetch_all_descriptors`](Self::fetch_all_descriptors), pinned as in
+    /// [`fetch_descriptors_batch_at`](Self::fetch_descriptors_batch_at).
+    pub async fn fetch_all_descriptors_at(
+        &mut self,
+        boundary: u64,
+    ) -> Result<(u64, Vec<RelDescriptor>)> {
+        self.fetch_committed(Scope::Eligible, Some(boundary)).await
     }
 
     /// Committed catalog at one replay position.
-    async fn fetch_committed(&mut self, scope: Scope<'_>) -> Result<(u64, Vec<RelDescriptor>)> {
+    async fn fetch_committed(
+        &mut self,
+        scope: Scope<'_>,
+        boundary: Option<u64>,
+    ) -> Result<(u64, Vec<RelDescriptor>)> {
         self.stats.fetches += 1;
-        let rows = self.committed_rows(scope).await?;
+        let rows = self.committed_rows(scope, boundary).await?;
         let replay_lsn = rows.replay_lsn;
         let db_node = self.current_db_oid().await?;
         let default_tablespace = self.default_tablespace_oid().await?;
@@ -324,9 +371,20 @@ impl ShadowCatalog {
     /// hold; away from one it moves between requests, so no sequence of scans
     /// answers for a single position and the statement's one snapshot always
     /// does.
-    async fn committed_rows(&mut self, scope: Scope<'_>) -> Result<DescriptorRows> {
+    async fn committed_rows(
+        &mut self,
+        scope: Scope<'_>,
+        boundary: Option<u64>,
+    ) -> Result<DescriptorRows> {
         let bridge = self.bridge.clone();
-        match self.scan_rows(&bridge, scope, 0, None).await {
+        let res = self.scan_rows(&bridge, scope, 0, boundary).await;
+        // A pinned read has no SQL fallback: the mirroring statement's parse
+        // opens pg_type, so it would queue behind exactly the recovery-held
+        // lock the pinned path exists to read past. Surface the error instead
+        if boundary.is_some() {
+            return res;
+        }
+        match res {
             Err(e) if worker_cannot_answer(&e) => self.mirror_rows(scope).await,
             other => other,
         }
@@ -417,7 +475,10 @@ impl ShadowCatalog {
                 &class.iter().map(|c| c.relnamespace).collect(),
                 |r: NamespaceRow| (r.oid, r.nspname),
                 top_xid,
-                pinned,
+                NamePin {
+                    lsn: pinned,
+                    by_caller: boundary.is_some(),
+                },
             )
             .await?;
         // DROP COLUMN zeroes atttypid, and no pg_type row for it is what leaves
@@ -434,7 +495,10 @@ impl ShadowCatalog {
                     .collect(),
                 |r: TypeRow| (r.oid, r.typname),
                 top_xid,
-                pinned,
+                NamePin {
+                    lsn: pinned,
+                    by_caller: boundary.is_some(),
+                },
             )
             .await?;
 
@@ -459,14 +523,20 @@ impl ShadowCatalog {
         DescriptorRows::from_mirror(&rows)
     }
 
-    /// Oid → name for one whole-catalog projection, committed read first and
-    /// the overlay only for what it missed.
+    /// Oid → name for one whole-catalog projection.
     ///
-    /// The overlay scan behind it has no oid list and so no lock argument, and
-    /// refuses to answer while any foreign writer is mid-DDL. Running it only
-    /// for what the committed read lacks keeps that exposure to names the
-    /// requesting transaction created itself; a committed read never gets
-    /// there at all.
+    /// A pinned read (`caller_pinned`) goes to the worker and stops there.
+    /// The SQL it would otherwise try first resolves names out of `pg_type` and
+    /// `pg_namespace`, and its parse takes AccessShareLock on `pg_type` — the
+    /// lock replay can be holding on behalf of a transaction whose commit is in
+    /// the WAL the caller is withholding. That query is the one that hung the
+    /// daemon against its own shadow.
+    ///
+    /// Unpinned reads keep the committed-read-first order: the overlay scan
+    /// behind them has no oid list and so no lock argument, and refuses to
+    /// answer while any foreign writer is mid-DDL, so running it only for what
+    /// the committed read lacks keeps that exposure to names the requesting
+    /// transaction created itself.
     async fn resolve_names<R: ScanRow>(
         &mut self,
         bridge: &Bridge,
@@ -474,18 +544,21 @@ impl ShadowCatalog {
         wanted: &BTreeSet<Oid>,
         name_of: fn(R) -> (Oid, String),
         top_xid: u32,
-        boundary: u64,
+        pin: NamePin,
     ) -> Result<HashMap<Oid, String>> {
         if wanted.is_empty() {
             return Ok(HashMap::new());
         }
-        let list: Vec<Oid> = wanted.iter().copied().collect();
-        let rows = self.query_retry(sql, &[&list]).await?;
-        let mut names: HashMap<Oid, String> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-        if names.len() == wanted.len() {
-            return Ok(names);
+        let mut names: HashMap<Oid, String> = HashMap::new();
+        if !pin.by_caller {
+            let list: Vec<Oid> = wanted.iter().copied().collect();
+            let rows = self.query_retry(sql, &[&list]).await?;
+            names.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
+            if names.len() == wanted.len() {
+                return Ok(names);
+            }
         }
-        let scan = bridge.scan_at(R::CATALOG, top_xid, &[], boundary).await?;
+        let scan = bridge.scan_at(R::CATALOG, top_xid, &[], pin.lsn).await?;
         for row in scan.parse::<R>()? {
             let (oid, name) = name_of(row);
             if wanted.contains(&oid) {
