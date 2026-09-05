@@ -49,7 +49,7 @@ done
 # last occurrence), so `--network public` or another dir still works.
 echo "installing walshadow-ec2-bench wrapper…"
 "${SSH[@]}" "cat | sudo tee /usr/local/bin/walshadow-ec2-bench >/dev/null && sudo chmod +x /usr/local/bin/walshadow-ec2-bench" <<WRAP
-#!/usr/bin/env bash
+#!/bin/sh
 exec sudo docker run --rm --network host -v /opt/bench:/opt/bench $REMOTE_IMAGE \\
   --state-dir /opt/bench/ec2 --results-dir /opt/bench/results "\$@"
 WRAP

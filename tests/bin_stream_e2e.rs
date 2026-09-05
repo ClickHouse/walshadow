@@ -597,7 +597,7 @@ fn spawn_writer(socket_dir: &Path) -> Result<Child> {
         socket_dir.display(),
         ports::PG_SOURCE_PORT,
     );
-    Command::new("bash")
+    Command::new("sh")
         .arg("-c")
         .arg(script)
         .process_group(0)
