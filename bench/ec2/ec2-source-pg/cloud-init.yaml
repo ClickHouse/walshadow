@@ -6,8 +6,8 @@ write_files:
   - path: /opt/walshadow/init/source/00-hba.sh
     permissions: '0755'
     content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
+      #!/bin/sh
+      set -eu
       echo "host replication all all trust" >> "$PGDATA/pg_hba.conf"
   - path: /opt/walshadow/init/source/01-schema.sql
     permissions: '0644'
@@ -26,8 +26,8 @@ write_files:
   - path: /opt/walshadow/init/source/02-pgbench.sh
     permissions: '0755'
     content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
+      #!/bin/sh
+      set -eu
       [ -n "${WALSHADOW_DEMO_PGBENCH:-}" ] || exit 0
       SCALE="${PGBENCH_SCALE:-1}"
       pgbench -i -s "$SCALE" -q -U "$POSTGRES_USER" -d "$POSTGRES_DB"

@@ -259,9 +259,9 @@ halting on the first.
   Per target, `-max_total_time=3600`, loop:
 
 ```sh
-#!/usr/bin/env bash
+#!/bin/sh
 # fuzz/run-forever.sh — round-robin every target, persist shared corpus
-set -euo pipefail
+set -eu
 targets=$(cargo +nightly fuzz list)
 while true; do
   for t in $targets; do

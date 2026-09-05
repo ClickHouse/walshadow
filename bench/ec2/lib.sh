@@ -5,7 +5,12 @@
 # lib.sh; helpers run from the node dir.
 
 # Echo KEY=value's value from a state.env-style file. $1=path, $2=key.
-read_state_var() { grep -E "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2-; }
+read_state_var() {
+  awk -v prefix="$2=" '
+    index($0, prefix) == 1 { value = substr($0, length(prefix) + 1) }
+    END { print value }
+  ' "$1" 2>/dev/null || true
+}
 
 # Echo a sibling node's IP, failing when terraform has not written it yet.
 # $1=node dir, $2=state.env key.

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # walshadow container entrypoint. Creates state directories, then execs the
 # daemon against the configured source and ClickHouse.
 #
@@ -10,7 +10,7 @@
 # init` and `docker compose exec walshadow walshadow-stream ctl status` both
 # work without the daemon's flags.
 
-set -euo pipefail
+set -eu
 
 case "${1:-}" in
     init | ctl)
@@ -36,7 +36,6 @@ mkdir -p "${CH_CONFIG%.toml}.d"
 # Discrete source flags for callers predating WALSHADOW_PG_URL
 # (bench/ec2/ec2-walshadow/deploy.sh). Skipped once a URL is set, which the
 # daemon reads for itself.
-SOURCE_ARGS=()
 if [ -z "${WALSHADOW_PG_URL:-}" ]; then
     if [ -z "${WALSHADOW_SOURCE_HOST:-}" ] && [ ! -f "$CH_CONFIG" ]; then
         echo "walshadow: no source configured. Set WALSHADOW_PG_URL," >&2
@@ -44,40 +43,29 @@ if [ -z "${WALSHADOW_PG_URL:-}" ]; then
         echo "  config at $CH_CONFIG (write one with \`init\`)." >&2
         exit 64
     fi
-    if [ -n "${WALSHADOW_SOURCE_HOST:-}" ]; then
-        SOURCE_ARGS+=(
-            --host "$WALSHADOW_SOURCE_HOST"
-            --port "${WALSHADOW_SOURCE_PORT:-5432}"
-            --user "${WALSHADOW_SOURCE_USER:-postgres}"
-            --dbname "${WALSHADOW_SOURCE_DB:-postgres}"
-            --sslmode "${WALSHADOW_SOURCE_SSLMODE:-disable}"
-        )
-    fi
 fi
 
 # Pool sizes fall through to the binary's compiled defaults unless overridden
 # via env. clap rejects a flag passed twice, so only inject when the caller
 # (e.g. EC2 deploy.sh via "$@") didn't already pass it.
-POOL_ARGS=()
-if [ -n "${WALSHADOW_DECODER_POOL:-}" ]; then
-    case " $* " in
-        *" --decoder-pool-size "*) ;;
-        *) POOL_ARGS+=(--decoder-pool-size "$WALSHADOW_DECODER_POOL") ;;
-    esac
-fi
+case " $* " in
+    *" --xact-buffer-max "*) ;;
+    *) set -- --xact-buffer-max "${WALSHADOW_XACT_BUFFER_MAX:-1073741824}" "$@" ;;
+esac
 if [ -n "${WALSHADOW_INSERTER_POOL:-}" ]; then
     case " $* " in
         *" --inserter-pool-size "*) ;;
-        *) POOL_ARGS+=(--inserter-pool-size "$WALSHADOW_INSERTER_POOL") ;;
+        *) set -- --inserter-pool-size "$WALSHADOW_INSERTER_POOL" "$@" ;;
     esac
 fi
-case " $* " in
-    *" --xact-buffer-max "*) ;;
-    *) POOL_ARGS+=(--xact-buffer-max "${WALSHADOW_XACT_BUFFER_MAX:-1073741824}") ;;
-esac
+if [ -n "${WALSHADOW_DECODER_POOL:-}" ]; then
+    case " $* " in
+        *" --decoder-pool-size "*) ;;
+        *) set -- --decoder-pool-size "$WALSHADOW_DECODER_POOL" "$@" ;;
+    esac
+fi
 
-exec walshadow-stream \
-    "${SOURCE_ARGS[@]}" \
+set -- \
     --out-dir "$OUT_DIR" \
     --spill-dir "$SPILL_DIR" \
     --shadow-socket-dir "$SOCKET_DIR" \
@@ -91,5 +79,16 @@ exec walshadow-stream \
     --metrics-bind 0.0.0.0:9484 \
     --control-socket "${WALSHADOW_CONTROL_SOCKET:-/var/run/walshadow/control.sock}" \
     --status-interval "${WALSHADOW_STATUS_INTERVAL:-5}" \
-    "${POOL_ARGS[@]}" \
     "$@"
+
+if [ -z "${WALSHADOW_PG_URL:-}" ] && [ -n "${WALSHADOW_SOURCE_HOST:-}" ]; then
+    set -- \
+        --host "$WALSHADOW_SOURCE_HOST" \
+        --port "${WALSHADOW_SOURCE_PORT:-5432}" \
+        --user "${WALSHADOW_SOURCE_USER:-postgres}" \
+        --dbname "${WALSHADOW_SOURCE_DB:-postgres}" \
+        --sslmode "${WALSHADOW_SOURCE_SSLMODE:-disable}" \
+        "$@"
+fi
+
+exec walshadow-stream "$@"

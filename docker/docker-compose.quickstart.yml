@@ -4,7 +4,7 @@ name: walshadow-quickstart
 
 services:
   postgres:
-    image: postgres:18-bookworm
+    image: postgres:18-alpine
     environment:
       POSTGRES_PASSWORD: postgres
     command:
@@ -26,7 +26,7 @@ services:
       retries: 30
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.3
+    image: clickhouse/clickhouse-server:26.3-alpine
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
     volumes:
@@ -36,7 +36,7 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
       interval: 2s
       timeout: 3s
       retries: 30

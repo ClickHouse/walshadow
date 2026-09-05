@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Capture a WAL segment for the classifier fixture.
 #
 # Default image: postgres:16. walshadow operationally supports PG 16+
@@ -10,7 +10,7 @@
 # WALSHADOW_USE_LOCAL=1 to bypass docker; local `postgres` must be 15+.
 #
 # Output: segments/000000010000000000000001.gz
-set -euo pipefail
+set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"
 out="$here/segments"
@@ -19,12 +19,12 @@ mkdir -p "$out"
 work="$(mktemp -d)"
 PG_IMAGE="${WALSHADOW_PG_IMAGE:-postgres:16}"
 CID=""
-trap '[[ -n "$CID" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+trap '[ -z "$CID" ] || docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$work"' 0
 
-if [[ "${WALSHADOW_USE_LOCAL:-0}" == "1" ]]; then
+if [ "${WALSHADOW_USE_LOCAL:-0}" = "1" ]; then
     echo "WALSHADOW_USE_LOCAL=1: using local postgres" >&2
-    local_major=$(postgres -V | awk '{print $3}' | cut -d. -f1)
-    if [[ -z "$local_major" || "$local_major" -lt 15 ]]; then
+    local_major=$(postgres -V | awk '{split($3, version, "."); print version[1]}')
+    if [ -z "$local_major" ] || [ "$local_major" -lt 15 ]; then
         echo "local postgres major '$local_major' < 15; walshadow rejects PG ≤ 14 captures" >&2
         exit 1
     fi
@@ -64,11 +64,13 @@ else
         -c autovacuum=off \
         -c shared_buffers=32MB)
     # Wait for readiness.
-    for _ in $(seq 1 60); do
+    attempts=0
+    while [ "$attempts" -lt 60 ]; do
         if docker exec "$CID" pg_isready -U postgres -d postgres >/dev/null 2>&1; then
             break
         fi
         sleep 0.5
+        attempts=$((attempts + 1))
     done
     docker cp "$here/workload.sql" "$CID:/tmp/workload.sql"
     docker exec -u postgres "$CID" psql -d postgres -v ON_ERROR_STOP=1 -f /tmp/workload.sql >/dev/null
@@ -81,7 +83,7 @@ else
     seg="$work/segment"
 fi
 
-[[ -f "$seg" ]] || { echo "no segment at $seg" >&2; exit 1; }
+[ -f "$seg" ] || { echo "no segment at $seg" >&2; exit 1; }
 
 # Truncate trailing zero 8 KiB pages: find first run of >=2 zero pages
 # from EOF and snip there. Keeps a few zero pages of padding so the
