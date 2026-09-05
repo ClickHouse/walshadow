@@ -21,7 +21,7 @@ clickhouses://user:password@host:9440/database
 Environment variables keep credentials out of command history:
 
 ```bash
-export WALSHADOW_SOURCE_URL='postgres://replicator:secret@source/app?sslmode=require'
+export WALSHADOW_PG_URL='postgres://replicator:secret@source/app?sslmode=require'
 export WALSHADOW_CH_URL='clickhouses://default:secret@clickhouse.example/cdc'
 ```
 
@@ -144,7 +144,7 @@ at same commit boundary as source data
 Install tables, choosing schema if needed:
 
 ```bash
-psql "$WALSHADOW_SOURCE_URL" \
+psql "$WALSHADOW_PG_URL" \
     -v walshadow_schema=walshadow \
     -f sql/runtime_config_install.sql
 ```
