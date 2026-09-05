@@ -258,7 +258,7 @@ struct InitArgs {
         default_value = "/etc/walshadow/ch-config.toml"
     )]
     config: PathBuf,
-    #[arg(long, env = walshadow::init::SOURCE_URL_ENV)]
+    #[arg(long, env = walshadow::init::PG_URL_ENV)]
     source_url: Option<String>,
     #[arg(long, env = walshadow::init::CH_URL_ENV)]
     ch_url: Option<String>,
@@ -310,7 +310,7 @@ struct Args {
     /// `postgres://user:password@host:5432/dbname?sslmode=require`. Wins
     /// over the discrete `--host` / `--port` / … flags, loses to
     /// `[source]` in `--ch-config`, same as they do
-    #[arg(long, env = walshadow::init::SOURCE_URL_ENV)]
+    #[arg(long, env = walshadow::init::PG_URL_ENV)]
     source_url: Option<String>,
     /// Destination as one URL, eg
     /// `clickhouse://user:password@host:9000/database`. Supplies `[ch]`

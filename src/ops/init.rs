@@ -23,7 +23,7 @@ use crate::preflight::{self, MIN_SERVER_VERSION_NUM, PreflightError, SourceInput
 use crate::schema::RelName;
 use crate::source_feed::open_sql_client;
 
-pub const SOURCE_URL_ENV: &str = "WALSHADOW_SOURCE_URL";
+pub const PG_URL_ENV: &str = "WALSHADOW_PG_URL";
 pub const CH_URL_ENV: &str = "WALSHADOW_CH_URL";
 
 pub struct InitOpts {
@@ -53,7 +53,7 @@ pub async fn run(opts: InitOpts) -> Result<()> {
     }
     let source_url = resolve_url(
         opts.source_url.clone(),
-        SOURCE_URL_ENV,
+        PG_URL_ENV,
         "Source Postgres URL",
         "postgres://user:password@host:5432/dbname",
     )?;

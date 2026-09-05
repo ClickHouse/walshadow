@@ -1,8 +1,8 @@
-# walshadow quickstart — replicate your own Postgres into your own
+# walshadow deployment — replicate your own Postgres into your own
 # ClickHouse. One service: the daemon, plus the shadow PG it owns inside the
-# container. Walkthrough in docker/QUICKSTART.md
+# container. Walkthrough in docs/getting-started.md
 #
-#   export WALSHADOW_SOURCE_URL=postgres://user:password@host:5432/dbname
+#   export WALSHADOW_PG_URL=postgres://user:password@host:5432/dbname
 #   export WALSHADOW_CH_URL=clickhouse://user:password@host:9000/database
 #   docker compose -f docker/docker-compose.yml run --rm walshadow init
 #   docker compose -f docker/docker-compose.yml up --build -d
@@ -27,7 +27,7 @@ services:
     environment:
       - RUST_LOG=${RUST_LOG:-warn,walshadow=info}
       # Bare names pass the shell's value through, so an unset URL stays unset
-      - WALSHADOW_SOURCE_URL
+      - WALSHADOW_PG_URL
       - WALSHADOW_CH_URL
     ports:
       - "${WALSHADOW_METRICS_PORT:-9484}:9484"

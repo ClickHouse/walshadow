@@ -2,7 +2,7 @@
 # walshadow container entrypoint. Creates state directories, then execs the
 # daemon against the configured source and ClickHouse.
 #
-# Connection settings come from WALSHADOW_SOURCE_URL / WALSHADOW_CH_URL (the
+# Connection settings come from WALSHADOW_PG_URL / WALSHADOW_CH_URL (the
 # daemon reads both from the environment), from a config mounted at
 # WALSHADOW_CH_CONFIG, or from the discrete WALSHADOW_SOURCE_* variables.
 #
@@ -33,13 +33,13 @@ mkdir -p "$OUT_DIR" "$SPILL_DIR" "$SOCKET_DIR"
 CH_CONFIG="${WALSHADOW_CH_CONFIG:-/etc/walshadow/ch-config.toml}"
 mkdir -p "${CH_CONFIG%.toml}.d"
 
-# Discrete source flags for callers predating WALSHADOW_SOURCE_URL
+# Discrete source flags for callers predating WALSHADOW_PG_URL
 # (bench/ec2/ec2-walshadow/deploy.sh). Skipped once a URL is set, which the
 # daemon reads for itself.
 SOURCE_ARGS=()
-if [ -z "${WALSHADOW_SOURCE_URL:-}" ]; then
+if [ -z "${WALSHADOW_PG_URL:-}" ]; then
     if [ -z "${WALSHADOW_SOURCE_HOST:-}" ] && [ ! -f "$CH_CONFIG" ]; then
-        echo "walshadow: no source configured. Set WALSHADOW_SOURCE_URL," >&2
+        echo "walshadow: no source configured. Set WALSHADOW_PG_URL," >&2
         echo "  eg postgres://user:password@host:5432/dbname, or mount a" >&2
         echo "  config at $CH_CONFIG (write one with \`init\`)." >&2
         exit 64

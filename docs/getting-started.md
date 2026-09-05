@@ -28,15 +28,20 @@ ALTER TABLE public.events REPLICA IDENTITY FULL;
 
 Restart PostgreSQL after changing `wal_level` or `max_wal_senders`
 
-## 1. Set connection URLs
+## 1. Clone and set connection URLs
 
 Clone repository with submodules, then export source major and both endpoints
 
 ```bash
-git submodule update --init --recursive
+# Clone walshadow and required submodules
+git clone --recurse-submodules https://github.com/ClickHouse/walshadow.git
+cd walshadow
 
+# Match image to source PostgreSQL major
 export PG_MAJOR=17
-export WALSHADOW_SOURCE_URL='postgres://replicator:secret@db.internal:5432/app?sslmode=require'
+
+# Configure existing PostgreSQL and ClickHouse endpoints
+export WALSHADOW_PG_URL='postgres://replicator:secret@db.internal:5432/app?sslmode=require'
 export WALSHADOW_CH_URL='clickhouse://default:secret@ch.internal:9000/cdc'
 ```
 
