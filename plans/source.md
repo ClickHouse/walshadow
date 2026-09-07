@@ -11,7 +11,7 @@ xact buffering, oracle all hang off
 [`RecordBytesSink`](../src/source/wal_stream.rs) traits with no second walk
 of bytes
 
-![source pipeline](../architecture/source.svg)
+![source pipeline](../architecture/overview.svg)
 
 ## Purpose
 

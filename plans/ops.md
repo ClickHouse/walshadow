@@ -36,7 +36,7 @@ publishes persisted floor to pruners, then sends standby-status triple to
 source. Publishing only after durable write makes every GC cut no newer than
 restart position
 
-![ops](../architecture/ops.svg)
+![ops](../architecture/recovery.svg)
 
 ## Standby-status triple
 

@@ -22,7 +22,7 @@ COLUMN ... DEFAULT k` fast-path missing values reconstructed inline;
 truly absent bytes flow as `None` columns with `partial = true` for
 xact buffer to backfill from previous image
 
-![decoder](../architecture/decoder.svg)
+![decoder](../architecture/overview.svg)
 
 ## Entry point
 

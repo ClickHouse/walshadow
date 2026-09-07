@@ -5,7 +5,7 @@ User-facing mode selection and large-value behavior live in
 This note covers chunk identity, as-of reconstruction, and replay-safe
 reclamation. In-xact WAL reassembly is fast path, see [xact.md](xact.md)
 
-![TOAST architecture](../architecture/toast.svg)
+![TOAST architecture](../architecture/values.svg)
 
 ## Store — TID-keyed mirror
 

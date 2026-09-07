@@ -38,7 +38,7 @@ commit-record LSN known durable on CH
 
 ## Stage walk
 
-![emitter](../architecture/emitter.svg)
+![emitter](../architecture/workers.svg)
 
 ### Reorder coordinator — `pipeline/reorder.rs`
 

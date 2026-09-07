@@ -27,8 +27,8 @@ violates catalog-only constraint at [overview.md](overview.md)
 
 ## Five-phase greenfield timeline
 
-See [architecture/timeline_bootstrap.svg](../architecture/timeline_bootstrap.svg)
-for rendered diagram. Five clusters top→bottom:
+See [bootstrap data paths](../architecture/bootstrap.svg)
+for data paths and handoff. Bootstrap proceeds through five phases:
 
 1. **Catalog seed** — `walshadow-stream --bootstrap-mode=direct` opens
    libpq side channel to source PG, runs `seed_catalog_from_source`

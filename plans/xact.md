@@ -26,7 +26,7 @@ Descriptor access is a wait-free interval lookup against the durable
 log ([desc_log.md](desc_log.md)); heaps with `ColumnValue::ExternalToast`
 resolve their owner descriptor at drain the same way
 
-![xact](../architecture/xact.svg)
+![xact](../architecture/workers.svg)
 
 ## Buffer shape
 
