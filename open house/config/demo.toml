@@ -1,0 +1,61 @@
+profile = "stage"
+
+[detector]
+baseline_trades_min = 30
+recent_trades_min   = 10
+buy_multiple_min    = 8.0
+imbalance_min       = 0.8
+cooldown_ms         = 10000
+
+# A batch-and-load pipeline does not deliver on a metronome, so the simulated
+# delay wanders inside this band instead of sitting on one number.
+[delay]
+simulated_min_ms = 5000
+simulated_max_ms = 7000
+
+[collector]
+interval_ms      = 100
+query_timeout_ms = 2000
+
+[probe]
+workers          = 4
+interval_ms      = 100
+poll_interval_ms = 20
+timeout_ms       = 10000
+window_secs      = 30
+
+# walshadow's destination carries _lsn/_xid/_commit_ts/_is_deleted and is a
+# ReplacingMergeTree, so reads need FINAL and the delete filter.
+[destination]
+final          = true
+deleted_filter = true
+table          = "market_trades"
+# probes ride the real table, outside the traded market range
+probe_market_id = 100
+
+[shock]
+max_duration_ms     = 60000
+price_path_to       = 68
+# after the burst ends the price eases back to where the market was before it,
+# so a burst is a transient spike and the market is reusable
+recovery_secs       = 30
+
+[snapshot]
+push_interval_ms = 150
+chart_points     = 900
+tape_rows        = 12
+history_runs     = 4
+
+[profiles.stage]
+rate                = 10000
+rows_per_commit     = 1
+connections         = 96
+active_markets      = 1000
+burst_multiplier    = 24
+
+[profiles.local]
+rate                = 400
+rows_per_commit     = 1
+connections         = 8
+active_markets      = 40
+burst_multiplier    = 24

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Market Pulse — OpenHouse NYC</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="stage">
+
+  <header>
+    <div class="brand">MARKET&nbsp;PULSE <em>/ activity radar</em></div>
+    <div class="masthead-right">
+      <div class="tags">
+        <span class="tag">SIMULATED MARKET DATA</span>
+      </div>
+      <span class="venue">OPENHOUSE NYC</span>
+      <div class="conn" id="conn"><span class="dot"></span><span id="conn-text">CONNECTING</span></div>
+    </div>
+  </header>
+
+  <div class="market">
+    <div>
+      <h1 id="market-name">—</h1>
+      <div class="sub" id="market-sub">SOURCE MARKET ACTIVITY · COMMITTED POSTGRESQL TRADES</div>
+    </div>
+    <div class="price num"><span id="price">—</span><span>¢</span></div>
+  </div>
+
+  <div class="chart-wrap">
+    <canvas id="chart"></canvas>
+    <div class="chart-legend">
+      <span><span class="swatch" style="background:#ffffff"></span>Price (source)</span>
+      <span><span class="swatch" style="background:#199e70"></span><b>Live alert</b></span>
+      <span><span class="swatch" style="background:#c98500"></span><b>Delayed alert</b></span>
+      <span><span class="swatch" style="background:#4a4a46"></span>Burst window</span>
+    </div>
+  </div>
+
+  <div class="cards">
+    <div class="card live" id="card-live">
+      <div class="card-head">
+        <span class="card-title">WITH WALSHADOW</span>
+      </div>
+      <div class="verdict waiting" id="live-verdict">No unusual buying</div>
+      <div class="gauge">
+        <div class="gauge-head">
+          <span class="gauge-k">BUY PRESSURE NOW</span>
+          <span class="gauge-v num" id="live-now">—</span>
+        </div>
+        <div class="gauge-bar"><i id="live-fill"></i><b class="gauge-tick"></b></div>
+      </div>
+      <div class="alertline" id="live-alert">No alert yet</div>
+    </div>
+
+    <div class="card delayed" id="card-delayed">
+      <div class="card-head">
+        <span class="card-title">LOGICAL REPLICATION SETUP (SIMULATED)</span>
+      </div>
+      <div class="verdict waiting" id="delayed-verdict">No unusual buying</div>
+      <div class="gauge">
+        <div class="gauge-head">
+          <span class="gauge-k">BUY PRESSURE NOW</span>
+          <span class="gauge-v num" id="delayed-now">—</span>
+        </div>
+        <div class="gauge-bar"><i id="delayed-fill"></i><b class="gauge-tick"></b></div>
+      </div>
+      <div class="alertline" id="delayed-alert">No alert yet</div>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="k">COMMITTED TRADES / S</div>
+      <div class="v num" id="stat-tps">—</div>
+      <div class="w" id="stat-tps-w">measured source commits</div>
+    </div>
+    <div class="stat">
+      <div class="k">REPLICATION p95</div>
+      <div class="v num" id="stat-p95">—</div>
+      <div class="w" id="stat-p95-w">—</div>
+    </div>
+    <div class="stat">
+      <div class="k">LIVE ALERT TIME</div>
+      <div class="v num" id="stat-alert">—</div>
+      <div class="w">from first burst commit · measured in cloud</div>
+    </div>
+  </div>
+
+  <footer>
+    <div class="tape" id="tape"></div>
+    <div style="display:flex;gap:1.4rem;align-items:center">
+      <div class="history" id="history"></div>
+      <div class="countdown" id="countdown">NEXT BURST <b>—</b></div>
+    </div>
+  </footer>
+</div>
+
+<div id="drawer">
+  <h2>EVIDENCE — OFFSTAGE</h2>
+  <table id="ev-metrics"></table>
+  <h2>THE SAME FIVE TRADES, BOTH SIDES</h2>
+  <div class="ev-cols">
+    <div><h3>POSTGRES — source of truth</h3><table id="ev-pg"></table></div>
+    <div><h3>CLICKHOUSE — after replication</h3><table id="ev-ch"></table></div>
+  </div>
+  <h2>FRAME PAIRING — most recent 12 <em>completed</em> pairs</h2>
+  <table id="ev-frames"></table>
+  <h2>COLLECTOR SQL</h2>
+  <pre id="ev-sql">—</pre>
+</div>
+<div class="hint">D = details · F = fullscreen</div>
+
+<script src="app.js"></script>
+</body>
+</html>

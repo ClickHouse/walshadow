@@ -1,0 +1,31 @@
+[workspace]
+
+[package]
+name = "market-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+parking_lot = "0.12"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
+tokio-postgres-rustls = "0.13"
+tokio-rustls = { version = "0.26", features = ["ring"] }
+webpki-roots = "1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.9"
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3

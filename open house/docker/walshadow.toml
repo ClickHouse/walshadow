@@ -1,0 +1,28 @@
+[source]
+host = "postgres"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "postgres"
+sslmode = "disable"
+# A permanent physical slot. Without one the source recycles WAL segments the
+# daemon has not consumed yet, and at high commit rates it will: the stream
+# then dies with "requested WAL segment has already been removed" and cannot
+# recover without an archive. The slot turns that data loss into backpressure.
+slot = "walshadow_openhouse"
+
+[ch]
+host = "clickhouse"
+port = 9000
+database = "openhouse"
+user = "default"
+password = ""
+flush_timeout_ms = 50
+
+# The demo's feature query filters a 31-second event_ts window across ~1000
+# markets. Left to the source row key the destination would sort on id and that
+# window would scan history, so the shape is pinned here — it only applies at
+# CREATE TABLE time, and walshadow never rekeys a table ClickHouse already has.
+[table.public.market_trades]
+order_by = ["event_ts", "market_id", "id"]
+primary_key = ["event_ts"]

@@ -1,0 +1,15 @@
+#cloud-config
+package_update: true
+packages:
+  - build-essential
+  - pkg-config
+  - postgresql-client
+  - tmux
+  - jq
+  - python3
+  - curl
+runcmd:
+  - [ bash, -lc, "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable" ]
+  - [ bash, -lc, "install -d -o ubuntu -g ubuntu /opt/openhouse /opt/openhouse/results" ]
+  - [ bash, -lc, "echo 'source $HOME/.cargo/env' >> /home/ubuntu/.bashrc" ]
+  - [ bash, -lc, "touch /var/lib/cloud/openhouse-ready" ]
