@@ -192,6 +192,16 @@ ObjectStore alike.
   extension member OIDs) to the source's — the pg_upgrade mechanism. Schema-only,
   so dataset size is irrelevant. `-b` is needed only to apply the dump; serving
   runs in normal mode. `Drop` stops it and removes the scratch dir.
+- **Unavailable extensions dropped, not fatal.** `--binary-upgrade` recreates
+  every source extension's members inline, including C functions that load
+  `$libdir/<ext>`; a source extension with no control file on the oracle host
+  (eg `pg_clickhouse`, irrelevant to type conversion) would abort the whole
+  apply. So the extensions installed on source but missing from the oracle's
+  `pg_available_extensions` are excluded from the dump — via
+  `--exclude-extension` on pg_dump 17+, or by stripping their entries from the
+  dump text on 16 (`filter_out_extensions`). A dropped extension whose type a
+  mapped table actually uses still fails at that table's `CREATE`, so it stays
+  fail-closed for anything the oracle genuinely needs.
 - **Tail wiring.** `tail::spawn_with_config` takes the oracle, so backfilled
   rows convert per sealed batch exactly as streamed ones do
   ([oracle.md](oracle.md)); the drain itself only runs `render_ext_columns`
@@ -200,9 +210,10 @@ ObjectStore alike.
   `needs_oracle`, which counts the target too — a locally decoded source
   against a `JSON` / `Array` / `Map` target still needs PG. Scalar-only
   schemas skip it.
-- **Fails hard.** If provisioning fails (e.g. an extension `.so` isn't
-  installable on the host — same requirement the shadow already has), bootstrap
-  errors out rather than loading empty columns; `Unsupported` stays fail-closed.
+- **Fails hard.** If provisioning otherwise fails (eg an extension a mapped
+  table's type needs isn't installable on the host — same requirement the
+  shadow already has), bootstrap errors out rather than loading empty columns;
+  `Unsupported` stays fail-closed.
 - **Opt-in backup-backfill** (`initial_load = base_backup`/`object_store`,
   `backup_backfill.rs`) has the same raw-Datum shape and reuses the **live**
   oracle via `PassContext.oracle` — steady state, real shadow already up.

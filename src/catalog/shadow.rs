@@ -576,6 +576,20 @@ impl Shadow {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
+    /// Extension names with a control file in this install
+    /// (`pg_available_extensions`) — ie the ones `CREATE EXTENSION` and the
+    /// binary-upgrade dump can actually build here.
+    pub fn available_extensions(&self) -> Result<std::collections::HashSet<String>> {
+        let raw = self
+            .psql_one("SELECT coalesce(string_agg(name, ','), '') FROM pg_available_extensions")?;
+        Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect())
+    }
+
     pub fn is_in_recovery(&self) -> Result<bool> {
         match self.psql_one("SELECT pg_is_in_recovery()")?.as_str() {
             "t" => Ok(true),
