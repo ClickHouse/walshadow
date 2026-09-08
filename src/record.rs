@@ -13,6 +13,30 @@ use crate::filter::manifest::Manifest;
 
 pub const WAL_SEG_SIZE: u64 = walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
+/// Complete segments covering half-open `range` on `timeline`. A boundary
+/// `range.end` needs no further segment; inclusive callers pass
+/// `end.saturating_add(1)`
+pub fn segments_covering(timeline: u32, range: std::ops::Range<u64>) -> Vec<SegmentName> {
+    let mut cur = SegmentName {
+        timeline,
+        log_id: (range.start >> 32) as u32,
+        seg_no: ((range.start & 0xFFFF_FFFF) / WAL_SEG_SIZE) as u32,
+    };
+    let segment_count = range
+        .end
+        .saturating_sub(cur.start_lsn(WAL_SEG_SIZE))
+        .div_ceil(WAL_SEG_SIZE)
+        .max(1);
+    let mut out = Vec::with_capacity(segment_count as usize);
+    loop {
+        out.push(cur);
+        if range.end <= cur.start_lsn(WAL_SEG_SIZE).saturating_add(WAL_SEG_SIZE) {
+            break out;
+        }
+        cur = cur.next(WAL_SEG_SIZE);
+    }
+}
+
 /// Numeric id fallback for unknown rmgrs
 pub fn rmgr_label(rm: u8) -> String {
     let named = match rm {

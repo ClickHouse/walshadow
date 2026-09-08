@@ -26,6 +26,7 @@ PostgreSQL major version
 ## Documentation
 
 - [Documentation index](docs/README.md)
+- [Architecture](architecture/README.md)
 - [Configuration](docs/configuration.md)
 - [Table selection](docs/table-selection.md)
 - [Destination tables](docs/destination-tables.md)

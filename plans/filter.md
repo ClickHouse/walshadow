@@ -9,7 +9,7 @@ with CRC32C recomputed. Output re-parses through wal-rus `WalParser`;
 `filtered_lsn == source_lsn` per byte offset, no LSN translation
 downstream. Manifest sidecar indexes byte positions, not LSN pairs
 
-![filter](../architecture/filter.svg)
+![filter](../architecture/overview.svg)
 
 ## Classifier
 

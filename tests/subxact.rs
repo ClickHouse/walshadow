@@ -503,17 +503,5 @@ async fn many_subxacts_emit_assignment_record() {
 }
 
 fn skip_gate() -> bool {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return true;
-    }
-    if !fx::pg_basebackup_available() {
-        eprintln!("skip: no pg_basebackup on PATH");
-        return true;
-    }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
-        return true;
-    }
-    false
+    !fx::requirements_available()
 }

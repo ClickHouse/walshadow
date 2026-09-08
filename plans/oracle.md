@@ -2,7 +2,7 @@
 
 [`src/ops/oracle.rs`](../src/ops/oracle.rs) plus [`pgext/`](../pgext/)
 
-![oracle](../architecture/oracle.svg)
+![oracle](../architecture/values.svg)
 
 ## Purpose
 

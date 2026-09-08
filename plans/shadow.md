@@ -102,7 +102,7 @@ duplicate connection state for no measurable win
 
 ## Three channels to shadow
 
-See [architecture/shadow_communication.dot](../architecture/shadow_communication.dot)
+See [shadow communication](../architecture/overview.svg)
 for rendered diagram:
 
 1. **libpq catalog queries** — `ShadowCatalog`'s tokio-postgres client.
@@ -144,7 +144,7 @@ pub async fn fetch_overlay_descriptors(&mut self,
     -> Result<Vec<RelDescriptor>>;          // uncommitted DDL, see below
 ```
 
-![shadow](../architecture/shadow.svg)
+![shadow](../architecture/catalog.svg)
 
 No cache, no invalidation, no event channel: descriptor history lives
 in the durable log ([desc_log.md](desc_log.md)); capture calls these

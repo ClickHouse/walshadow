@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="1024" viewBox="0 0 1120 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Catalog capture and DDL ordering</title>
+  <desc id="desc">At a catalog boundary the pump holds later publication, allows shadow replay through that boundary, scans pinned descriptors, persists history and attaches schema events before forwarding the commit. ReorderSink waits for decode placement, flushes batches, waits for durable inserts, then applies DDL or TRUNCATE on its separate ClickHouse connection.</desc>
+  <defs>
+    <marker id="data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#A3A9CE" stroke-width="1.5"/></marker>
+    <marker id="control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#E49B5D" stroke-width="1.5"/></marker>
+    <marker id="catalog" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#85B695" stroke-width="1.5"/></marker>
+  </defs>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; font-size: 18px; fill: #ECE1D7; }
+    .name { font-family: monospace; font-size: 19px; font-weight: 600; }
+    .group { font-size: 19px; font-weight: 700; }
+    .label { font-size: 17px; fill: #C1A78E; }
+  </style>
+  <rect width="1120" height="1024" fill="#292522"/>
+  <text x="96" y="35" class="group" text-anchor="middle">Capture (log miss)</text>
+  <text x="96" y="63" class="label" text-anchor="middle">BoundaryHoldSink</text>
+  <path d="M 96 80 V 518" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <text x="392" y="35" class="group" text-anchor="middle">Shadow PG</text>
+  <text x="392" y="63" class="label" text-anchor="middle">replay + worker</text>
+  <path d="M 392 80 V 518" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <text x="688" y="35" class="group" text-anchor="middle">Local state</text>
+  <text x="688" y="63" class="label" text-anchor="middle">DescriptorLog / XactBuffer</text>
+  <path d="M 688 80 V 518" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <text x="984" y="35" class="group" text-anchor="middle">Row pipeline</text>
+  <text x="984" y="63" class="label" text-anchor="middle">QueueingRecordSink</text>
+  <path d="M 984 80 V 518" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <rect x="86" y="128" width="20" height="308" fill="#233524" stroke="#85B695" stroke-width="1.3"/>
+  <path d="M 96 112 H 392" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
+  <text x="244.0" y="100" class="label" text-anchor="middle">Publish through boundary L</text>
+  <path d="M 392 176 H 96" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)"/>
+  <text x="244.0" y="164" class="label" text-anchor="middle">Replay reaches L</text>
+  <path d="M 96 248 H 392" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)"/>
+  <text x="244.0" y="236" class="label" text-anchor="middle">SCAN at pinned L</text>
+  <path d="M 392 312 H 96" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)"/>
+  <text x="244.0" y="300" class="label" text-anchor="middle">RelDescriptor batch</text>
+  <path d="M 96 384 H 688" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)"/>
+  <text x="392.0" y="372" class="label" text-anchor="middle">Persist descriptors; attach SchemaEvent(xid)</text>
+  <path d="M 96 472 H 984" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
+  <text x="540.0" y="460" class="label" text-anchor="middle">Forward commit record; release later WAL</text>
+  <text x="112" y="422" class="label">Hold later WAL publication</text>
+  <path d="M 32 548 H 1088" fill="none" stroke="#867462" stroke-width="1.5"/>
+  <text x="32" y="582" class="group">DDL / TRUNCATE barrier in ReorderSink</text>
+  <text x="96" y="625" class="group" text-anchor="middle">ReorderSink</text>
+  <path d="M 96 648 V 1000" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <text x="552" y="625" class="group" text-anchor="middle">Decode / batcher / ack</text>
+  <path d="M 552 648 V 1000" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <text x="984" y="625" class="group" text-anchor="middle">ClickHouse</text>
+  <path d="M 984 648 V 1000" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <path d="M 96 686 H 552" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <text x="324.0" y="674" class="label" text-anchor="middle">Wait until earlier seqs are Placed</text>
+  <path d="M 96 754 H 552" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <text x="324.0" y="742" class="label" text-anchor="middle">FlushAll, seal earlier rows</text>
+  <path d="M 552 822 H 96" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <text x="324.0" y="810" class="label" text-anchor="middle">Wait until earlier INSERTs are Acked</text>
+  <path d="M 96 902 H 984" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <text x="540.0" y="890" class="label" text-anchor="middle">DdlApplicator: CREATE / ALTER / DROP / TRUNCATE</text>
+  <path d="M 984 970 H 96" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <text x="540.0" y="958" class="label" text-anchor="middle">DDL completes; resume later data</text>
+</svg>

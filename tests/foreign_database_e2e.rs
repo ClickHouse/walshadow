@@ -16,8 +16,7 @@ use walshadow::mapping::NamespaceMapping;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreign_database_ddl_and_dml_never_reach_the_followed_output() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::requirements_available() {
         return;
     }
 

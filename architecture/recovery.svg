@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="940" viewBox="0 0 1120 940" role="img" aria-labelledby="title desc">
+  <title id="title">Restart floor, persistence and cleanup</title>
+  <desc id="desc">Status loop combines unfinished transaction positions, completed ClickHouse work and fsynced filtered WAL to compute a conservative aligned restart floor. It persists manifest.toml before publishing that floor to descriptor garbage collection, TOAST retirements and source feedback. Restart validates source identity and obtains WAL from source or configured archive.</desc>
+  <defs>
+    <marker id="data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#A3A9CE" stroke-width="1.5"/></marker>
+    <marker id="control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#E49B5D" stroke-width="1.5"/></marker>
+    <marker id="catalog" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#85B695" stroke-width="1.5"/></marker>
+  </defs>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; font-size: 18px; fill: #ECE1D7; }
+    .name { font-family: monospace; font-size: 19px; font-weight: 600; }
+    .group { font-size: 19px; font-weight: 700; }
+    .label { font-size: 17px; fill: #C1A78E; }
+  </style>
+  <rect width="1120" height="940" fill="#292522"/>
+  <rect x="48" y="40" width="272" height="106" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="64" y="69" class="name">XactBuffer</text>
+  <text x="64" y="93" class="">Oldest unfinished transaction</text>
+  <text x="64" y="117" class="">Pending commit / spill state</text>
+  <rect x="424" y="40" width="272" height="106" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="440" y="69" class="name">AckCollector</text>
+  <text x="440" y="93" class="">Contiguous durable work</text>
+  <text x="440" y="117" class="">emitter_ack_lsn</text>
+  <rect x="800" y="40" width="272" height="106" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="816" y="69" class="name">Segment fsync task</text>
+  <text x="816" y="93" class="">Durable filtered WAL</text>
+  <text x="816" y="117" class="">durable_lsn</text>
+  <path d="M 184 208 H 936" fill="none" stroke="#E49B5D" stroke-width="1.5"/>
+  <path d="M 184 146 V 208" fill="none" stroke="#E49B5D" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <path d="M 560 146 V 208" fill="none" stroke="#E49B5D" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <path d="M 936 146 V 208" fill="none" stroke="#E49B5D" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <path d="M 560 208 V 264" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <rect x="344" y="264" width="432" height="112" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="360" y="293" class="name">Status loop / resolved_floor</text>
+  <text x="360" y="317" class="">Protect unfinished transactions</text>
+  <text x="360" y="341" class="">Align down, clamp to durable filtered WAL</text>
+  <path d="M 560 376 V 432" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <path d="M 344 444 C 344 428 776 428 776 444 V 508 C 776 524 344 524 344 508 Z M 344 444 C 344 460 776 460 776 444" fill="#422741" stroke="#CF9BC2" stroke-width="1.3"/>
+  <text x="360" y="472" class="name">manifest.toml</text>
+  <text x="360" y="498" class="">Source identity, timeline, saved restart floor</text>
+  <rect x="48" y="432" width="224" height="192" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="64" y="461" class="name">Restart</text>
+  <text x="64" y="485" class="">Validate source identity</text>
+  <text x="64" y="509" class="">Read saved floor</text>
+  <text x="64" y="533" class="">Source → archive</text>
+  <text x="64" y="557" class="">→ source fallback</text>
+  <text x="64" y="581" class="">Replay unfinished work</text>
+  <path d="M 344 482 H 272" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <path d="M 560 520 V 608" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <text x="576" y="566" class="label">persist before publish</text>
+  <rect x="344" y="608" width="432" height="80" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="360" y="637" class="name">Publish saved floor</text>
+  <text x="360" y="661" class="">resume_floor / GC watch / source feedback</text>
+  <path d="M 184 736 H 936" fill="none" stroke="#E49B5D" stroke-width="1.5"/>
+  <path d="M 560 688 V 736" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <path d="M 184 736 V 784" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <path d="M 560 736 V 784" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <path d="M 936 736 V 784" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
+  <rect x="48" y="784" width="272" height="112" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="64" y="813" class="name">DescriptorLog GC</text>
+  <text x="64" y="837" class="">Discard obsolete history</text>
+  <text x="64" y="861" class="">below saved replay floor</text>
+  <rect x="424" y="784" width="272" height="112" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="440" y="813" class="name">TOAST retirements</text>
+  <text x="440" y="837" class="">toast_retires.toml ledger</text>
+  <text x="440" y="861" class="">Retire after saved floor</text>
+  <rect x="800" y="784" width="272" height="112" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="816" y="813" class="name">Source slot feedback</text>
+  <text x="816" y="837" class="">write / flush / apply</text>
+  <text x="816" y="861" class="">Also cap by shadow progress</text>
+</svg>

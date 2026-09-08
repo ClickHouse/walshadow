@@ -1,13 +1,12 @@
-//! Shared scaffolding for the bootstrap → CH end-to-end
-//! drills (`bootstrap_direct_ch.rs`,
-//! `bootstrap_object_store_ch.rs`).
+//! Shared scaffolding for the `bootstrap_*_ch.rs` end-to-end drills.
 //!
 //! Owns: the `ChServer` subprocess wrapper (lifted from
-//! `pipeline_e2e.rs` so the pipeline DDL drill, both bootstrap drills,
+//! `pipeline_e2e.rs` so the pipeline DDL drill, the bootstrap drills,
 //! and the kill-restart drill share one driver), TOML CH-config
 //! rendering for the table mapping the daemon consumes via
-//! `--ch-config`, and the `assert_ch_matches_source` count/sum/md5
-//! oracle the two drills share.
+//! `--ch-config`, the `assert_ch_matches_source` count/sum/md5 oracle,
+//! and the source / `DaemonRun` / teardown scaffolding each drill
+//! repeats verbatim.
 //!
 //! Included from the test files via `#[path = "common/..."]` rather
 //! than wired through `tests/common/mod.rs` because Cargo would
@@ -18,7 +17,7 @@
 #[path = "ports.rs"]
 mod ports;
 #[allow(unused_imports)]
-pub use ports::{PG_SHADOW_PORT, PG_SOURCE_PORT, Ports, reserve_port, reserve_span};
+pub use ports::{PG_SHADOW_PORT, PG_SOURCE_PORT, Ports, pg_cfg, reserve_port, reserve_span};
 
 use std::fs;
 use std::io::Write;
@@ -31,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
-use walshadow::shadow::{BridgeConf, Shadow};
+use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 
 /// ClickHouse server subprocess wrapper shared by the pipeline DDL
 /// drill, both bootstrap-to-CH drills, and the
@@ -153,6 +152,178 @@ impl Drop for ChServer {
     }
 }
 
+/// Source cluster under `tmp`, socket-only on the source port.
+pub fn make_source(tmp: &tempfile::TempDir) -> Shadow {
+    let mut cfg = ShadowConfig::new(
+        tmp.path().join("source-data"),
+        tmp.path().join("source-filtered"),
+    );
+    cfg.port = ports::PG_SOURCE_PORT;
+    cfg.socket_dir = tmp.path().join("source-sock");
+    cfg.ctl_timeout = Duration::from_secs(60);
+    fs::create_dir_all(&cfg.filter_out_dir).unwrap();
+    fs::create_dir_all(&cfg.socket_dir).unwrap();
+    Shadow::new(cfg)
+}
+
+/// Whether PostgreSQL reports a base backup in flight.
+pub fn backup_in_progress(source: &Shadow) -> bool {
+    let n = source
+        .psql_one("SELECT count(*) FROM pg_stat_progress_basebackup")
+        .unwrap_or_default();
+    n.trim() != "0" && !n.trim().is_empty()
+}
+
+/// Wait until the daemon's `BASE_BACKUP` shows up on the source, the cue
+/// for a drill to write inside the backup window.
+pub fn wait_for_backup_streaming(source: &Shadow, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !backup_in_progress(source) {
+        if Instant::now() >= deadline {
+            bail!("BASE_BACKUP never showed up in pg_stat_progress_basebackup");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// Daemon-side layout of one bootstrap-to-CH drill: the dirs the flags
+/// name, plus where the daemon's stderr lands.
+pub struct DaemonRun {
+    pub shadow_data_dir: PathBuf,
+    pub shadow_sock: PathBuf,
+    pub filter_dir: PathBuf,
+    pub spill_dir: PathBuf,
+    pub stderr_path: PathBuf,
+    pub metrics_addr: std::net::SocketAddr,
+}
+
+impl DaemonRun {
+    /// Create every dir the daemon expects to exist. The shadow data dir
+    /// stays absent: bootstrap refuses to land on a populated one.
+    pub fn prepare(tmp: &Path, metrics_port: u16) -> Result<Self> {
+        let run = Self {
+            shadow_data_dir: tmp.join("shadow-data"),
+            shadow_sock: tmp.join("shadow-sock"),
+            filter_dir: tmp.join("filtered"),
+            spill_dir: tmp.join("spill"),
+            stderr_path: tmp.join("daemon.stderr.log"),
+            metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,
+        };
+        for d in [&run.shadow_sock, &run.filter_dir, &run.spill_dir] {
+            fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
+        }
+        Ok(run)
+    }
+
+    /// Spawn `walshadow-stream` in `--bootstrap-mode direct` against
+    /// `source`, appending `extra` flags.
+    pub fn spawn(
+        &self,
+        source: &Shadow,
+        ch_config: &Path,
+        walsender_port: u16,
+        extra: &[&str],
+    ) -> Result<Child> {
+        self.spawn_mode(source, ch_config, walsender_port, "direct", extra, &[])
+    }
+
+    /// [`Self::spawn`] in another bootstrap mode, with the command
+    /// environment that mode reads (object store resolves libpq vars). Its
+    /// own process group, so a shadow it spawned dies with the kill in
+    /// `ChildGuard`.
+    pub fn spawn_mode(
+        &self,
+        source: &Shadow,
+        ch_config: &Path,
+        walsender_port: u16,
+        mode: &str,
+        extra: &[&str],
+        env: &[(&str, String)],
+    ) -> Result<Child> {
+        let stderr = fs::File::create(&self.stderr_path)
+            .with_context(|| format!("create {}", self.stderr_path.display()))?;
+        Command::new(env!("CARGO_BIN_EXE_walshadow-stream"))
+            .args([
+                "--host",
+                source.config().socket_dir.to_str().unwrap(),
+                "--port",
+                &source.config().port.to_string(),
+                "--user",
+                "postgres",
+                "--dbname",
+                "postgres",
+                "--sslmode",
+                "disable",
+                "--out-dir",
+                self.filter_dir.to_str().unwrap(),
+                "--shadow-socket-dir",
+                self.shadow_sock.to_str().unwrap(),
+                "--shadow-port",
+                &ports::PG_SHADOW_PORT.to_string(),
+                "--shadow-user",
+                "postgres",
+                "--shadow-dbname",
+                "postgres",
+                "--spill-dir",
+                self.spill_dir.to_str().unwrap(),
+                "--status-interval",
+                "1",
+                "--metrics-bind",
+                &self.metrics_addr.to_string(),
+                "--walsender-bind",
+                &format!("127.0.0.1:{walsender_port}"),
+                "--retention-bytes",
+                "0",
+                "--ch-config",
+                ch_config.to_str().unwrap(),
+                "--bootstrap-mode",
+                mode,
+                "--bootstrap-shadow-data-dir",
+                self.shadow_data_dir.to_str().unwrap(),
+                "--bootstrap-shadow-replay-timeout",
+                "120",
+            ])
+            .args(extra)
+            .envs(env.iter().map(|(k, v)| (*k, v)))
+            .env("RUST_LOG", "warn,walshadow=info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .process_group(0)
+            .spawn()
+            .context("spawn walshadow-stream")
+    }
+
+    /// Everything the daemon has logged so far.
+    pub fn stderr(&self) -> String {
+        fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+
+    /// Wait for a needle to appear in the daemon's log.
+    pub fn wait_for_log(&self, needle: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        while !self.stderr().contains(needle) {
+            if Instant::now() >= deadline {
+                bail!("daemon never logged {needle:?}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    }
+
+    /// Stop a shadow the daemon left running after its own exit.
+    pub fn stop_shadow(&self) {
+        if !self.shadow_data_dir.join("postmaster.pid").exists() {
+            return;
+        }
+        let mut cfg = ShadowConfig::new(self.shadow_data_dir.clone(), self.filter_dir.clone());
+        cfg.port = ports::PG_SHADOW_PORT;
+        cfg.socket_dir = self.shadow_sock.clone();
+        cfg.ctl_timeout = Duration::from_secs(60);
+        let _ = Shadow::new(cfg).stop();
+    }
+}
+
 /// Skip-gate probe — same shape as `pipeline_e2e.rs::clickhouse_available`.
 pub fn clickhouse_available() -> bool {
     Command::new("clickhouse")
@@ -182,6 +353,62 @@ pub fn pg_basebackup_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Skip gate every daemon bootstrap drill shares. Names the missing tool.
+pub fn requirements_available() -> bool {
+    for (tool, found) in [
+        ("initdb", pg_available()),
+        ("pg_basebackup", pg_basebackup_available()),
+        ("clickhouse", clickhouse_available()),
+    ] {
+        if !found {
+            eprintln!("skip: no {tool} on PATH");
+            return false;
+        }
+    }
+    true
+}
+
+/// Source cluster under `tmp`, initialised with the bootstrap overrides and
+/// running. Caller keeps it alive and wraps it in [`StopOnDrop`].
+pub fn start_source(tmp: &tempfile::TempDir) -> Shadow {
+    let source = make_source(tmp);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("source base conf");
+    append_source_conf(&source).expect("append source conf");
+    source.start().expect("start source");
+    source
+}
+
+/// Poll `sql` on CH until it answers `want`. The tail drains asynchronously,
+/// so racing it with an immediate assert flakes on slow CI.
+pub fn wait_for_ch_value(ch: &ChServer, sql: &str, want: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let got = ch.query(sql).unwrap_or_default();
+        if got == want {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("CH never answered {want:?} to `{sql}`, last {got:?}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Kill the daemon before the shadow, so its supervisor cannot restart the
+/// postmaster, then stop whatever SIGKILL left behind and report `result`
+/// with the daemon's log attached.
+pub fn finish_daemon(guard: ChildGuard, daemon: &DaemonRun, result: Result<()>) {
+    if let Some(mut child) = guard.into_inner() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    daemon.stop_shadow();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{}", daemon.stderr());
+    }
 }
 
 /// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`.

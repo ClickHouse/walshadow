@@ -36,7 +36,7 @@ components. User workflows and supported behavior live under
   `type_bridge`, synthetic columns, `DdlApplicator`, barrier fence
 - [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
   / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
-  shared insert tail, restart source fallback contract
+  shared insert tail, window WAL replay, restart fallback
 - [ops.md](ops.md) — retention, manifest floor, standby-status triple,
   resume invariants
 - [failover.md](failover.md) — source timeline crossing: frozen pause
@@ -58,16 +58,13 @@ invariants which code cannot express
 
 ## Architecture diagrams
 
-Live under [architecture/](../architecture/README.md). System-level
-SVGs cover overview, internals, shadow communication, bootstrap
-timeline, streaming timeline, restart timelines. Component SVGs cover
-filter, source, shadow, decoder, xact, TOAST, emitter, bootstrap, ops,
-and oracle. Updated on architecturally load-bearing changes
+[architecture](../architecture/README.md) owns diagrams shared by these plans:
+[streaming topology](../architecture/overview.svg),
+[worker pools](../architecture/workers.svg),
+[catalog capture and DDL](../architecture/catalog.svg),
+[TOAST and type conversion](../architecture/values.svg),
+[bootstrap](../architecture/bootstrap.svg), and
+[restart and cleanup](../architecture/recovery.svg)
 
-## Regenerating diagrams
-
-Each `architecture/<comp>.dot` carries its own regeneration spec as a
-header comment (sources of truth, subsumed plan section, quality bar);
-shared style invariants live in [`architecture/palette.md`](../architecture/palette.md).
-Workflow in [`architecture/README.md`](../architecture/README.md#regenerating-a-diagram).
-Use when regenerating a component diagram after material code change
+Update those SVG sources when component connections change; embed them here
+instead of maintaining separate diagrams

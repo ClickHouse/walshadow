@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use walrus::pg::backup::parse_pg_lsn;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 
@@ -53,19 +52,6 @@ fn append_conf(sh: &Shadow, extra: &[&str]) {
     writeln!(f, "max_wal_senders = 4").unwrap();
     for line in extra {
         writeln!(f, "{line}").unwrap();
-    }
-}
-
-fn pg_cfg(sh: &Shadow) -> PgConfig {
-    PgConfig {
-        host: sh.config().socket_dir.to_str().unwrap().to_string(),
-        port: sh.config().port,
-        user: "postgres".into(),
-        password: None,
-        database: "postgres".into(),
-        application_name: "source-reconnect-test".into(),
-        sslmode: SslMode::Disable,
-        tls: TlsParams::default(),
     }
 }
 
@@ -120,7 +106,7 @@ async fn reconnect_resumes_after_walsender_terminated() {
     source.start().unwrap();
     let _stop = StopOnDrop(&source);
 
-    let cfg = pg_cfg(&source);
+    let cfg = ports::pg_cfg(&source, "source-reconnect-test");
     let mut feed = SourceFeed::connect(&cfg).await.unwrap();
     let ident = feed.identify_system().await.unwrap();
     feed.start_physical_replication(None, ident.xlogpos, ident.timeline)
@@ -178,7 +164,7 @@ async fn recycled_segment_surfaces_58p01() {
     source.start().unwrap();
     let _stop = StopOnDrop(&source);
 
-    let cfg = pg_cfg(&source);
+    let cfg = ports::pg_cfg(&source, "source-reconnect-test");
     let mut feed = SourceFeed::connect(&cfg).await.unwrap();
     let ident = feed.identify_system().await.unwrap();
     let old_lsn = ident.xlogpos;
@@ -239,7 +225,7 @@ async fn slot_prevents_segment_recycle() {
     source.start().unwrap();
     let _stop = StopOnDrop(&source);
 
-    let cfg = pg_cfg(&source);
+    let cfg = ports::pg_cfg(&source, "source-reconnect-test");
     let slot = "walshadow_recycle_test";
     let mut feed = SourceFeed::connect(&cfg).await.unwrap();
     let ident = feed.identify_system().await.unwrap();

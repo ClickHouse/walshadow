@@ -635,19 +635,7 @@ fn spawn_daemon(bin: &str, args: &[String], stderr_path: &Path) -> Result<Child>
 }
 
 fn gated() -> bool {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
-        return false;
-    }
-    if !fx::pg_basebackup_available() {
-        eprintln!("skip: no pg_basebackup on PATH");
-        return false;
-    }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
-        return false;
-    }
-    true
+    fx::requirements_available()
 }
 
 const USER_EMAIL: &str =

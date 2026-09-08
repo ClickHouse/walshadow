@@ -101,9 +101,10 @@ pub async fn decode_and_route(
     // One spool per xact; generations sealed before spooling carry None
     let spool = chunks.iter().find_map(|g| g.spool());
     let mut routed = 0u64;
-    let mut buf: Vec<RoutedRow> = Vec::new();
+    let mut heaps = heaps.into_iter();
+    let mut buf: Vec<RoutedRow> = Vec::with_capacity(ctx.chunk_rows.min(heaps.len()));
     let mut buf_bytes = 0usize;
-    for envelope in heaps {
+    while let Some(envelope) = heaps.next() {
         // Discard precedes detoast: unrouted values never hit the resolver
         let Some(route) = envelope.route else {
             continue;
@@ -143,6 +144,7 @@ pub async fn decode_and_route(
         routed += 1;
         if buf.len() >= ctx.chunk_rows || buf_bytes >= DECODE_CHUNK_BYTES {
             route_chunk(&ctx.msg_tx, std::mem::take(&mut buf), permit.clone()).await?;
+            buf.reserve(ctx.chunk_rows.min(heaps.len()));
             buf_bytes = 0;
         }
     }
