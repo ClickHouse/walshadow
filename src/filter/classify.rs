@@ -48,12 +48,22 @@ pub fn rmgr_is_special(rm: u8) -> bool {
     )
 }
 
+/// `XLOG_FPI_FOR_HINT` / `XLOG_FPI` info bytes (PG `access/xlog_internal.h`)
+pub const XLOG_FPI_FOR_HINT: u8 = 0xA0;
+pub const XLOG_FPI: u8 = 0xB0;
+
+/// Xlog-rmgr record carrying a page image rather than recovery plumbing.
+pub fn is_page_image(record: &XLogRecord) -> bool {
+    record.header.resource_manager_id == RmId::Xlog as u8
+        && matches!(record.header.info & 0xF0, XLOG_FPI | XLOG_FPI_FOR_HINT)
+}
+
 pub fn is_catalog_relnode(rel_node: u32) -> bool {
     rel_node != 0 && rel_node < FIRST_NORMAL_OBJECT_ID
 }
 
 pub fn classify(record: &XLogRecord) -> Class {
-    if rmgr_is_special(record.header.resource_manager_id) {
+    if rmgr_is_special(record.header.resource_manager_id) && !is_page_image(record) {
         return Class::Special;
     }
     if record.blocks.is_empty() {
@@ -207,6 +217,42 @@ mod tests {
     fn xlog_record_classifies_special_even_with_blocks() {
         let r = record_with(RmId::Xlog, &[16500]);
         assert_eq!(classify(&r), Class::Special);
+    }
+
+    fn fpi_record(info: u8, rel_nodes: &[u32]) -> XLogRecord<'_> {
+        let mut r = record_with(RmId::Xlog, rel_nodes);
+        r.header.info = info;
+        r
+    }
+
+    #[test]
+    fn fpi_for_hint_on_user_relation_is_dropped() {
+        let r = fpi_record(XLOG_FPI_FOR_HINT, &[16500]);
+        assert!(is_page_image(&r));
+        assert_eq!(classify(&r), Class::User);
+    }
+
+    #[test]
+    fn fpi_on_user_relation_is_dropped() {
+        assert_eq!(classify(&fpi_record(XLOG_FPI, &[16500])), Class::User);
+    }
+
+    #[test]
+    fn fpi_on_catalog_relation_still_replays() {
+        assert_eq!(classify(&fpi_record(XLOG_FPI, &[1259])), Class::Catalog);
+        assert_eq!(
+            classify(&fpi_record(XLOG_FPI_FOR_HINT, &[1259])),
+            Class::Catalog
+        );
+    }
+
+    #[test]
+    fn non_image_xlog_records_stay_special() {
+        for info in [0x00, 0x10, 0x40, 0x60, 0x90] {
+            let r = fpi_record(info, &[16500]);
+            assert!(!is_page_image(&r), "info {info:#04x}");
+            assert_eq!(classify(&r), Class::Special, "info {info:#04x}");
+        }
     }
 
     #[test]
