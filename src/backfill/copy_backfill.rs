@@ -899,7 +899,9 @@ impl CopyBackfiller {
         if !self.mark_swapped(&rel.rel, &uuid).await {
             anyhow::bail!("ledger persist failed; exchange withheld");
         }
-        sess.exchange(rel).await?;
+        crate::ops::stages::PUBLISH
+            .measure(sess.exchange(rel))
+            .await?;
         Ok(true)
     }
 
@@ -908,9 +910,11 @@ impl CopyBackfiller {
         sess: &mut StagingSession,
         rel: &StagingRel,
     ) -> anyhow::Result<()> {
+        let timing = crate::ops::stages::SETTLE.start();
         sess.copy_back(rel).await?;
         sess.drop_staging(rel).await?;
         self.mark_done_entry(&rel.rel).await;
+        timing.finish();
         Ok(())
     }
 
@@ -1143,7 +1147,9 @@ impl CopyBackfiller {
             HashSet::new(),
         ));
 
-        let rows = copy_rows_into(&client, desc, s_lsn.get(), &tup_tx).await?;
+        let rows = crate::ops::stages::COPY
+            .measure(copy_rows_into(&client, desc, s_lsn.get(), &tup_tx))
+            .await?;
         drop(tup_tx);
 
         let outcome = drain
@@ -1152,7 +1158,8 @@ impl CopyBackfiller {
             .map_err(anyhow::Error::msg)?;
         // Upper bound on the COPY snapshot; WAL apply past it = converged
         let p_hi = current_wal_lsn(&client).await?;
-        tail.finish(outcome.next_seq)
+        crate::ops::stages::INSERT_FLUSH
+            .measure(tail.finish(outcome.next_seq))
             .await
             .map_err(anyhow::Error::msg)?;
         Ok(CopyOutcome {

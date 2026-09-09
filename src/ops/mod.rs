@@ -7,4 +7,5 @@ pub mod metrics;
 pub mod oracle;
 pub mod preflight;
 pub mod retention;
+pub mod stages;
 pub mod trace;

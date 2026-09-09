@@ -1403,7 +1403,8 @@ async fn handle_client(
     let n = socket.read(&mut buf).await?;
     let _ = n;
     let snap = registry.snapshot().await;
-    let body = render(&snap);
+    let mut body = render(&snap);
+    crate::ops::stages::render(&mut body);
     let resp = format!(
         "HTTP/1.0 200 OK\r\n\
          Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\

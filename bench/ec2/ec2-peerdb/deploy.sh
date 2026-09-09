@@ -13,14 +13,13 @@
 # PeerDB stages ClickHouse CDC through the MinIO bundled in its compose file.
 set -euo pipefail
 cd "$(dirname "$0")"
-source ./state.env   # PUBLIC_IP, PEM, ...
+# shellcheck source-path=SCRIPTDIR
 source ../lib.sh
+node_init
 
-node_ssh_setup
-
-SRC_PRIV="${SOURCE_PRIVATE_IP:-$(require_state_ip ec2-source-pg SOURCE_PRIVATE_IP)}"
-CH_PRIV="${CH_PRIVATE_IP:-$(require_state_ip ec2-clickhouse PRIVATE_IP)}"
-echo "source PG: $SRC_PRIV:5432   clickhouse: $CH_PRIV:9000"
+SRC_PRIV="$(node_ip "${SOURCE_PRIVATE_IP:-}" ec2-source-pg SOURCE_PRIVATE_IP)"
+CH_PRIV="$(node_ip "${CH_PRIVATE_IP:-}" ec2-clickhouse PRIVATE_IP)"
+log "source PG: $SRC_PRIV:5432   clickhouse: $CH_PRIV:9000"
 
 # cloud-init installs Docker and clones PeerDB
 wait_cloud_init
@@ -32,10 +31,13 @@ wait_cloud_init
 # to http://host.docker.internal:9001 — only reachable from THIS box. Our
 # ClickHouse runs on a separate host, so rewrite it to this box's private IP
 # (MinIO is published on :9001; terraform opens 9001 to the VPC). Idempotent.
-echo "pointing PeerDB S3 staging endpoint at http://$PRIVATE_IP:9001 (for the external ClickHouse)…"
-"${SSH[@]}" "sudo sed -i -E 's|(PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ENDPOINT_URL_S3:[[:space:]]*).*|\\1http://$PRIVATE_IP:9001|' /opt/peerdb/docker-compose.yml"
+log "pointing PeerDB S3 staging endpoint at http://$PRIVATE_IP:9001 (for the external ClickHouse)"
+remote_sh "$PRIVATE_IP" <<'EOS'
+sudo sed -i -E "s|(PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ENDPOINT_URL_S3:[[:space:]]*).*|\1http://$1:9001|" \
+  /opt/peerdb/docker-compose.yml
+EOS
 
-echo "bringing up the PeerDB stack (docker compose up -d; first run pulls several GB)…"
+log "bringing up the PeerDB stack (docker compose up -d; first run pulls several GB)"
 "${SSH[@]}" 'cd /opt/peerdb && sudo docker compose up -d 2>&1 | tail -8'
 
 # psql helper: a throwaway client container on the host network talks to the
@@ -43,14 +45,14 @@ echo "bringing up the PeerDB stack (docker compose up -d; first run pulls severa
 PSQL='sudo docker run --rm -i --network host postgres:17-alpine psql "host=127.0.0.1 port=9900 user=peerdb password=peerdb dbname=peerdb sslmode=disable"'
 
 retry_remote 40 10 "the PeerDB SQL server on :9900" "$PSQL -tAc 'select 1' | grep -q 1"
-echo "peerdb-server up"
+log "peerdb-server up"
 
 # The PeerDB quickstart runs one-shot inits that race their dependencies on a
 # fresh/slow boot and can silently fail: (a) MinIO bucket creation — without it
 # CREATE PEER fails S3 validation (NoSuchBucket); (b) Temporal search-attribute
 # registration — without MirrorName, CREATE MIRROR can't start its workflow.
 # Re-assert both, idempotently, before configuring anything.
-echo "ensuring MinIO staging bucket 'peerdbbucket' exists…"
+log "ensuring MinIO staging bucket 'peerdbbucket' exists"
 "${SSH[@]}" "cd /opt/peerdb && sudo docker compose exec -T minio sh -c 'mc alias set m http://localhost:9000 _peerdb_minioadmin _peerdb_minioadmin >/dev/null 2>&1; mc mb -p m/peerdbbucket' 2>&1 | tail -1" || true
 retry_remote 6 10 "Temporal search attribute 'MirrorName'" \
   "cd /opt/peerdb && sudo docker compose exec -T temporal-admin-tools temporal operator search-attribute create --namespace default --name MirrorName --type Keyword --address temporal:7233" || true
@@ -60,7 +62,7 @@ if [ "${CONFIGURE_MIRROR:-1}" = "1" ]; then
   # config changes — CREATE MIRROR errors if the mirror already exists, so
   # without this a re-deploy silently keeps the old config. DROP MIRROR also
   # removes the source slot + publication. Non-fatal (no-op on first run).
-  echo "dropping existing mirror (if any) so re-deploy re-applies config…"
+  log "dropping existing mirror (if any) so re-deploy re-applies config"
   "${SSH[@]}" "$PSQL -c 'DROP MIRROR IF EXISTS demo_users;'" 2>&1 | tail -1 || true
 
   # PeerDB OWNS its destination table — the normalized table carries _peerdb_*
@@ -69,10 +71,10 @@ if [ "${CONFIGURE_MIRROR:-1}" = "1" ]; then
   # the VPC) so PeerDB recreates it with the right schema. The mapping below
   # also targets the table `users` in the peer's `demo` database — NOT the
   # literal name `demo.users`, which would create a dotted-name table.
-  echo "dropping any pre-existing demo.users on ClickHouse so PeerDB owns it…"
+  log "dropping any pre-existing demo.users on ClickHouse so PeerDB owns it"
   "${SSH[@]}" "curl -s 'http://$CH_PRIV:8123/' --data-binary 'DROP TABLE IF EXISTS demo.users' && echo '  dropped'"
 
-  echo "creating peers + mirror (non-fatal; see NOTE)…"
+  log "creating peers + mirror (non-fatal; see NOTE)"
   "${SSH[@]}" "$PSQL" <<SQL || echo "  ⚠ peer/mirror DDL returned non-zero — adjust for your PeerDB version or use the UI"
 -- Source Postgres peer (demo source; trust auth accepts any password).
 CREATE PEER source_pg FROM POSTGRES WITH (
