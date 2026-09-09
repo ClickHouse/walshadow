@@ -36,7 +36,8 @@ case "$NODE" in
     DIR=ec2-peerdb LABEL=flowworker
     PERF_FLAGS='-g'
     PIDS_CMD='cd /opt/peerdb && sudo docker compose ps -q | xargs -r -I{} sudo docker inspect -f "{{.State.Pid}}" {}'
-    # flow-worker is the CDC engine
+    # flow-worker is the CDC engine; $() runs on the node
+    # shellcheck disable=SC2016
     TARGET_CMD='cd /opt/peerdb && sudo docker inspect -f "{{.State.Pid}}" "$(sudo docker compose ps -q flow-worker)"'
     ;;
   pg-standby)
@@ -57,18 +58,15 @@ case "$NODE" in
     ;;
 esac
 
+# shellcheck source-path=SCRIPTDIR
+source ./lib.sh
 cd "$DIR"
-source ./state.env   # PUBLIC_IP, PEM
-source ../lib.sh
-node_ssh_setup
+node_init
 
-echo "starting on-CPU profile of $NODE on $PUBLIC_IP for ${DUR}s (background)…"
-"${SSH[@]}" "DUR=$(printf %q "$DUR") LABEL=$(printf %q "$LABEL") \
-  PERF_FLAGS=$(printf %q "$PERF_FLAGS") \
-  PIDS_CMD=$(printf %q "$PIDS_CMD") PIDS_ALT=$(printf %q "$PIDS_ALT") \
-  TARGET_CMD=$(printf %q "$TARGET_CMD") TARGET_ALT=$(printf %q "$TARGET_ALT") \
-  bash -s" <<'PROF'
+log "starting on-CPU profile of $NODE on $PUBLIC_IP for ${DUR}s (background)"
+remote_sh "$DUR" "$LABEL" "$PERF_FLAGS" "$PIDS_CMD" "$PIDS_ALT" "$TARGET_CMD" "$TARGET_ALT" <<'PROF'
 set -e
+DUR="$1" LABEL="$2" PERF_FLAGS="$3" PIDS_CMD="$4" PIDS_ALT="$5" TARGET_CMD="$6" TARGET_ALT="$7"
 TS="$(date +%Y%m%d-%H%M%S)"
 OUT=/opt/profile
 sudo install -d -o ubuntu "$OUT"
@@ -90,16 +88,30 @@ TARGET="$(first_pids "$TARGET_CMD" "$TARGET_ALT")"
 TARGET="${TARGET%%,*}"
 echo "$LABEL pids (perf): $PIDS    eBPF target: ${TARGET:-none}"
 
+# The capture runs from a file, so the two samplers stay plain shell instead of
+# a nested quoted string.
+cat >/tmp/oncpu-capture.sh <<'CAP'
+OUT="$1" TS="$2" LABEL="$3" DUR="$4" PERF_FLAGS="$5" TARGET="$6" PIDS="$7"
+if [ -n "$TARGET" ]; then
+  profile-bpfcc -F 99 -f -p "$TARGET" "$DUR" >"$OUT/oncpu-$LABEL-$TS.folded" 2>"$OUT/oncpu-$TS.log" &
+fi
+# Re-filter to live pids: perf -p aborts the record if any one has exited.
+LIVE=""
+for x in $(echo "$PIDS" | tr ',' ' '); do
+  [ -d "/proc/$x" ] && LIVE="$LIVE,$x"
+done
+LIVE="${LIVE#,}"
+# PERF_FLAGS is a flag list, so it must word-split
+# shellcheck disable=SC2086
+perf record -F 99 $PERF_FLAGS -p "$LIVE" -o "$OUT/perf-$TS.data" -- sleep "$DUR" 2>>"$OUT/perf-$TS.log" \
+  || echo 'perf record failed (see log)' >>"$OUT/perf-$TS.log"
+wait
+chown -R ubuntu "$OUT"
+CAP
+
 # Detach so the capture survives this SSH session; hand the output back to ubuntu.
-sudo nohup bash -c "
-  { [ -n '$TARGET' ] && profile-bpfcc -F 99 -f -p '$TARGET' $DUR > $OUT/oncpu-$LABEL-$TS.folded 2>$OUT/oncpu-$TS.log ; } &
-  # Re-filter to live pids: perf -p aborts the record if any one has exited.
-  LIVE=\"\"; for x in \$(echo '$PIDS' | tr ',' ' '); do [ -d /proc/\$x ] && LIVE=\"\$LIVE,\$x\"; done; LIVE=\${LIVE#,}
-  perf record -F 99 $PERF_FLAGS -p \"\$LIVE\" -o $OUT/perf-$TS.data -- sleep $DUR 2>>$OUT/perf-$TS.log \
-    || echo 'perf record failed (see log)' >>$OUT/perf-$TS.log
-  wait
-  chown -R ubuntu $OUT
-" >/dev/null 2>&1 &
+sudo nohup bash /tmp/oncpu-capture.sh \
+  "$OUT" "$TS" "$LABEL" "$DUR" "$PERF_FLAGS" "$TARGET" "$PIDS" </dev/null >/dev/null 2>&1 &
 echo "capturing ${DUR}s → $OUT/perf-$TS.data + oncpu-$LABEL-$TS.folded (background)"
 PROF
 echo "started — now kick off the benchmark. ../stack.sh down copies the profiles back."

@@ -30,7 +30,20 @@
 #   ./stack.sh status           list running project instances
 set -euo pipefail
 cd "$(dirname "$0")"
-source ./aws-env.sh
+LOG_TAG=stack
+# shellcheck source-path=SCRIPTDIR
+source ./lib.sh
+case "${1:-} ${2:-}" in
+  "bench plot" | "bench fetch") ;;
+  "bench run" | "bench initial-load" | "bench bootstrap")
+    # shellcheck source-path=SCRIPTDIR
+    if [ "${BENCH_REUSE_STACK:-0}" != 1 ]; then source ./aws-env.sh; fi
+    ;;
+  *)
+    # shellcheck source-path=SCRIPTDIR
+    source ./aws-env.sh
+    ;;
+esac
 
 TF_DIR=terraform
 TFVARS="$TF_DIR/setup.auto.tfvars"
@@ -75,7 +88,7 @@ pre_down() {
   local dir
   dir="$(streamer_dir "$(tfvar streamer none)")"
   if [ -n "$dir" ] && [ -f "$dir/state.env" ]; then
-    ( cd "$dir" && source ./state.env && source ../lib.sh && copy_remote_profiles )
+    with_node "$dir" copy_remote_profiles
     if [ -x "$dir/pre_down.sh" ]; then ( cd "$dir" && ./pre_down.sh ); fi
   fi
 }
@@ -86,7 +99,7 @@ up() {
   [ -n "$dir" ] || { echo "unknown setup '$setup' (known: $KNOWN_SETUPS)" >&2; exit 1; }
   if [ "$(tfvar streamer none)" != "$setup" ]; then pre_down; fi
   [ "$setup" = pg ] && ch=false
-  echo "▲ bringing up '$setup' (streamer: $dir)"
+  log "bringing up '$setup' (streamer: $dir)"
   apply_setup "$setup" "$ch" true
   # Base source-PG post-boot setup (runtime-config overlay + replicate-all seed);
   # idempotent, runs before the streamer's deploy so the daemon seeds from it.
@@ -121,8 +134,13 @@ bench() {
     down)
       apply_setup "$(tfvar streamer none)" "$(tfvar clickhouse true)" false
       ;;
-    run)   bench_run "$@" ;;
+    run)   bench_run suite "$@" ;;
+    initial-load) bench_run initial-load "$@" ;;
+    bootstrap) bench_run bootstrap "$@" ;;
     fetch) bench_fetch "${1:-}" ;;
+    plot)
+      cargo run --release --manifest-path ../Cargo.toml --bin walshadow-bench-plot -- "$@"
+      ;;
     *) usage; exit 1 ;;
   esac
 }
@@ -131,28 +149,62 @@ bench() {
 # walshadow-ec2-bench's own --results-dir default.
 results_root() { echo "$(cd .. && pwd)/results"; }
 
+# Drive one bench invocation on the runner (called through with_node, so SSH is
+# already pointed at it), landing provenance beside the results the bench wrote.
+# $1 = local results dir, $2 = run name, rest = the bench argv.
+run_suite() {
+  local out="$1" name="$2"
+  shift 2
+  log "suite '$name' on the runner ($PUBLIC_IP), against the VPC-internal endpoints"
+  "${SCP[@]}" "$out/provenance.txt" "ubuntu@$PUBLIC_IP:/opt/bench/$name-provenance.txt"
+  remote_sh "$name" "$@" <<'EOS'
+name="$1"
+shift
+"$@" </dev/null
+rc=$?
+cp "/opt/bench/$name-provenance.txt" "/opt/bench/results/$name/provenance.txt"
+exit $rc
+EOS
+}
+
 # Run the standard suite on the in-VPC runner, then copy the results back.
 # $1 = run name, rest are extra walshadow-ec2-bench flags (--run-secs, --dest, …).
 bench_run() {
-  local name="${1:-}" rc=0
+  local shape="$1" name="${2:-}" rc=0 out
+  local -a remote_argv
+  shift
   shift || true
   [ -n "$name" ] || { echo "usage: ./stack.sh bench run <name> [bench flags]" >&2; exit 1; }
+  [[ "$name" =~ ^[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$ ]] || { echo "invalid run name" >&2; exit 1; }
   [ -e "$(results_root)/$name" ] && { echo "$(results_root)/$name exists — choose another name" >&2; exit 1; }
   [ "$(tfvar streamer none)" != none ] || { echo "no streamer up — ./stack.sh up <setup> first" >&2; exit 1; }
 
-  apply_setup "$(tfvar streamer none)" "$(tfvar clickhouse true)" true
-  ( cd ec2-bench && ./deploy.sh )
+  if [ "${BENCH_REUSE_STACK:-0}" != 1 ]; then
+    apply_setup "$(tfvar streamer none)" "$(tfvar clickhouse true)" true
+    ( cd ec2-bench && ./deploy.sh )
+  fi
+  out="$(results_root)/$name"
+  mkdir -p "$out"
+  write_provenance "$name" "$out" || return
+  if [ "$shape" = suite ]; then
+    remote_argv=(walshadow-ec2-bench --suite "$name" "$@")
+  else
+    remote_argv=(walshadow-ec2-bench --run-name "$name" --bench "$shape" "$@")
+  fi
 
   # The suite tees each shape into its own file on the box as it goes, so a
   # dropped SSH session loses the tail, not the results already written; `bench
   # fetch <name>` collects whatever landed.
-  (
-    cd ec2-bench && source ./state.env && source ../lib.sh && node_ssh_setup
-    echo "▶ suite '$name' on the runner ($PUBLIC_IP), against the VPC-internal endpoints"
-    "${SSH[@]}" "walshadow-ec2-bench --suite '$name' $*"
-  ) || rc=$?
+  with_node ec2-bench run_suite "$out" "$name" "${remote_argv[@]}" || rc=$?
   bench_fetch "$name" || true
   [ "$rc" -eq 0 ] || { echo "suite failed (exit $rc)" >&2; exit "$rc"; }
+}
+
+# Pull one run's results off the runner (called through with_node).
+# $1 = run name, $2 = local parent dir.
+fetch_results() {
+  "${SCP[@]}" -r "ubuntu@$PUBLIC_IP:/opt/bench/results/$1" "$2/" \
+    || { echo "nothing to copy for '$1'" >&2; return 1; }
 }
 
 # Copy /opt/bench/results/<name> off the runner into bench/results/<name>, with
@@ -161,14 +213,29 @@ bench_fetch() {
   local name="${1:-}" out
   [ -n "$name" ] || { echo "usage: ./stack.sh bench fetch <name>" >&2; exit 1; }
   out="$(results_root)/$name"
-  (
-    cd ec2-bench && source ./state.env && source ../lib.sh && node_ssh_setup
-    mkdir -p "$(dirname "$out")"
-    "${SCP[@]}" -r "ubuntu@$PUBLIC_IP:/opt/bench/results/$name" "$(dirname "$out")/" \
-      || { echo "nothing to copy for '$name'" >&2; exit 1; }
-  )
-  write_provenance "$name" "$out"
+  mkdir -p "$(dirname "$out")"
+  with_node ec2-bench fetch_results "$name" "$(dirname "$out")"
+  if [ ! -f "$out/provenance.txt" ]; then
+    echo "warning: run has no start-time provenance" >&2
+  fi
   echo "✅ results → $out"
+}
+
+# Provenance lines gathered on a node (both called through with_node).
+driver_provenance() {
+  remote_sh <<'EOS'
+printf 'driver_image: '
+cat /opt/bench/driver-image.txt
+EOS
+}
+
+streamer_provenance() {
+  remote_sh <<'EOS'
+sudo docker inspect walshadow --format 'daemon_image: {{.Image}}'
+sudo docker inspect walshadow --format 'daemon_revision: {{index .Config.Labels "org.opencontainers.image.revision"}}'
+sudo docker exec walshadow postgres -V
+sudo sha256sum /opt/walshadow/ch-config.toml
+EOS
 }
 
 # What a reader needs to compare this run against another: which setup, on what
@@ -177,22 +244,36 @@ write_provenance() {
   local name="$1" out="$2" root head
   root="$(cd ../.. && pwd)"
   if head="$(git -C "$root" rev-parse --short HEAD 2>/dev/null)"; then
-    git -C "$root" diff --quiet 2>/dev/null || head="$head-dirty"
+    git -C "$root" diff --quiet HEAD 2>/dev/null || head="$head-dirty"
   else
     head=unknown
   fi
   {
     echo "run:           $name"
-    echo "fetched:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "started:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "setup:         $(tfvar streamer none)"
     echo "instance_type: $(tf output -raw instance_type 2>/dev/null || echo unknown)"
     echo "az:            $(tf output -raw az 2>/dev/null || echo unknown)"
     echo "driver:        in-VPC bench runner (ec2-bench)"
     echo "repo:          $head"
+    with_node ec2-bench driver_provenance
+    if [ "$(tfvar streamer none)" = walshadow ]; then
+      with_node ec2-walshadow streamer_provenance
+    fi
   } > "$out/provenance.txt"
+  if [ -n "${BENCH_EXPECTED_REVISION:-}" ]; then
+    local actual
+    actual="$(awk '/^daemon_revision:/ {print $2}' "$out/provenance.txt")"
+    if [ "$actual" != "$BENCH_EXPECTED_REVISION" ]; then
+      echo "daemon revision mismatch: expected $BENCH_EXPECTED_REVISION, got $actual" >&2
+      return 1
+    fi
+  fi
 }
 
 status() {
+  # backticks in --query are JMESPath literals, not shell
+  # shellcheck disable=SC2016
   aws ec2 describe-instances \
     --filters "Name=tag:Name,Values=walshadow-*" \
               "Name=instance-state-name,Values=pending,running,stopping,stopped" \

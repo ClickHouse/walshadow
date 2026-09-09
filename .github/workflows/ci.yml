@@ -309,6 +309,10 @@ jobs:
           path: walshadow
           submodules: recursive
 
+      - name: shellcheck
+        working-directory: walshadow
+        run: git ls-files '*.sh' | xargs shellcheck -x
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

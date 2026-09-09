@@ -15,11 +15,17 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY bench ./bench
-RUN cargo build --release -p walshadow-bench --bin walshadow-ec2-bench
+COPY bench/Cargo.toml ./bench/Cargo.toml
+COPY bench/src ./bench/src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=walshadow-bench-target,target=/src/target \
+    --mount=type=bind,source=.,target=/context \
+    if [ -d /context/benches ]; then cp -r /context/benches ./benches; fi \
+    && cargo build --release -p walshadow-bench --bin walshadow-ec2-bench \
+    && cp /src/target/release/walshadow-ec2-bench /usr/local/bin/walshadow-ec2-bench
 
-FROM alpine:3.21 AS runtime
+FROM alpine:3.24 AS runtime
 # libgcc for the (dynamically-linked musl) Rust binary; no codec libs needed.
-RUN apk add --no-cache libgcc
-COPY --from=builder /src/target/release/walshadow-ec2-bench /usr/local/bin/walshadow-ec2-bench
+RUN apk add --no-cache libgcc openssh-client
+COPY --from=builder /usr/local/bin/walshadow-ec2-bench /usr/local/bin/walshadow-ec2-bench
 ENTRYPOINT ["walshadow-ec2-bench"]

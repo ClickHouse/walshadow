@@ -20,6 +20,8 @@
 //! [`run`] is the high-level entry point; the binaries are thin CLIs that build
 //! a [`PgConfig`] + [`DestSpec`] + params and call [`dispatch`].
 
+pub mod initial_load;
+pub mod plot;
 pub mod suite;
 
 use std::sync::Arc;
@@ -42,6 +44,8 @@ pub enum Bench {
     SingleRow,
     Sustained,
     Interleaved,
+    InitialLoad,
+    Bootstrap,
 }
 
 /// Which kind of destination the bench polls for visibility.
@@ -158,6 +162,9 @@ pub trait Destination: Send + Sync {
 /// stack, state.env lookup for the EC2 deployment).
 #[derive(Args, Debug)]
 pub struct CommonArgs {
+    #[command(flatten)]
+    pub initial_load: initial_load::InitialLoadArgs,
+
     /// Which benchmark to run. Required unless the binary offers a whole-suite
     /// mode (see `ec2_bench`'s `--suite`).
     #[arg(long, value_enum)]
@@ -273,6 +280,20 @@ pub async fn dispatch(c: &CommonArgs, pg_host: String, dest_host: String) -> Res
         password: c.pg_password.clone(),
         table: c.table.clone(),
     };
+    if matches!(which, Bench::InitialLoad | Bench::Bootstrap) {
+        if c.dest != DestKind::Clickhouse {
+            bail!("initial-load requires walshadow runtime config and ClickHouse");
+        }
+        return initial_load::run(
+            &pg_cfg,
+            dest_host,
+            c.ch_http_port,
+            c.count_interval_ms,
+            which == Bench::Bootstrap,
+            &c.initial_load,
+        )
+        .await;
+    }
     let dest_spec = match c.dest {
         DestKind::Clickhouse => DestSpec::Clickhouse(ChConfig {
             host: dest_host,
@@ -329,6 +350,9 @@ pub async fn run(
     sustained: &SustainedParams,
     interleaved: &InterleavedParams,
 ) -> Result<()> {
+    if matches!(which, Bench::InitialLoad | Bench::Bootstrap) {
+        bail!("use dispatch for initial-load");
+    }
     let pg = Arc::new(
         PgClient::connect(pg_cfg)
             .await
@@ -357,6 +381,7 @@ pub async fn run(
         Bench::SingleRow => single.poll_interval_ms,
         Bench::Sustained => sustained.poll_interval_ms,
         Bench::Interleaved => interleaved.poll_interval_ms,
+        Bench::InitialLoad | Bench::Bootstrap => unreachable!(),
     };
     pg.truncate().await.context("clear source table")?;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -382,6 +407,7 @@ pub async fn run(
         Bench::SingleRow => run_single_row(&pg, dest.as_ref(), single).await?,
         Bench::Sustained => run_sustained(pg_cfg, pg.clone(), dest.clone(), sustained).await?,
         Bench::Interleaved => run_interleaved(pg_cfg, dest.clone(), interleaved).await?,
+        Bench::InitialLoad | Bench::Bootstrap => unreachable!(),
     }
     Ok(())
 }
@@ -428,6 +454,13 @@ pub async fn run_single_row(
         }
     }
 
+    println!(
+        "BENCH_JSON {}",
+        serde_json::json!({
+            "bench": "single-row", "latency_ms": samples_ms, "timeouts": timeouts,
+            "complete": timeouts == 0,
+        })
+    );
     Summary::from(&mut samples_ms).print("commit→visible latency (ms)");
     if timeouts > 0 {
         println!("  timeouts: {timeouts}");
@@ -647,6 +680,15 @@ pub async fn run_sustained(
     let insert_secs = insert_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     let achieved_rate = rows_inserted as f64 / insert_secs;
     let tput = Throughput::from_curve(&curve, expected, insert_secs, achieved_rate);
+    println!(
+        "BENCH_JSON {}",
+        serde_json::json!({
+            "bench": "sustained", "curve": curve, "expected_rows": expected,
+            "latency_ms": samples_ms, "timeouts": timeouts, "count_errors": count_errors,
+            "elapsed_secs": tput.all_visible_at, "complete": tput.all_visible_at.is_some(),
+            "source_rows_per_sec": achieved_rate, "insert_secs": insert_secs,
+        })
+    );
     let Throughput {
         dest_rows,
         all_visible_at,
@@ -837,6 +879,13 @@ pub async fn run_interleaved(
     println!();
     println!("  committed transactions: {xacts}");
     println!("  rows total:             {total_rows}");
+    println!(
+        "BENCH_JSON {}",
+        serde_json::json!({
+            "bench": "interleaved", "latency_ms": samples_ms, "timeouts": timeouts,
+            "expected_rows": total_rows, "complete": timeouts == 0,
+        })
+    );
     Summary::from(&mut samples_ms).print("commit→all-visible latency (ms)");
     if timeouts > 0 {
         println!("  timeouts: {timeouts}");
@@ -1078,14 +1127,22 @@ impl ChHttp {
     /// very long sustained-overload drains raise `poll_interval_ms` so polling
     /// doesn't churn through sockets.
     pub async fn query(&self, sql: &str) -> Result<String> {
+        self.request("POST", "/", sql).await
+    }
+
+    pub async fn get(&self, path: &str) -> Result<String> {
+        self.request("GET", path, "").await
+    }
+
+    async fn request(&self, method: &str, path: &str, body: &str) -> Result<String> {
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
             .await
             .with_context(|| format!("connect ClickHouse {}:{}", self.host, self.port))?;
         let req = format!(
-            "POST / HTTP/1.0\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "{method} {path} HTTP/1.0\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             self.host,
-            sql.len(),
-            sql
+            body.len(),
+            body
         );
         stream.write_all(req.as_bytes()).await?;
         let mut buf = Vec::new();

@@ -1008,12 +1008,13 @@ async fn run_session(
             shadow
                 .write_standby_signal()
                 .context("write standby.signal")?;
-            start_owned_shadow(
-                &shadow,
-                bootstrap_end_lsn,
-                Duration::from_secs(args.bootstrap_shadow_replay_timeout),
-            )
-            .await?;
+            walshadow::ops::stages::SHADOW_REPLAY
+                .measure(start_owned_shadow(
+                    &shadow,
+                    bootstrap_end_lsn,
+                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+                ))
+                .await?;
             Some(ShadowLifecycle::spawn(
                 shadow,
                 walsender_primary_conninfo(args.walsender_bind),
@@ -4209,6 +4210,7 @@ async fn run_bootstrap(
     plan: &BootstrapPlan,
     ch_config: Option<EmitterConfig>,
 ) -> Result<BootstrapHandoff> {
+    let timing = walshadow::ops::stages::BOOTSTRAP.start();
     let shadow_data_dir = args
         .bootstrap_shadow_data_dir
         .clone()
@@ -4758,6 +4760,7 @@ async fn run_bootstrap(
         .await
         .context("clear completed bootstrap marker")?;
 
+    timing.finish();
     Ok(BootstrapHandoff {
         end_lsn: outcome.end.end_lsn,
         open_floor,

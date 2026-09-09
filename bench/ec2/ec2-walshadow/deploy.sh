@@ -24,10 +24,12 @@
 # 100 ms default (lowest latency, most parts), not per-commit emits.
 set -euo pipefail
 cd "$(dirname "$0")"
-source ./state.env   # PUBLIC_IP, PEM, ...
+# shellcheck source-path=SCRIPTDIR
 source ../lib.sh
+node_init
 
 IMAGE="${IMAGE:-walshadow:local}"
+DATA_VOLUME="${DATA_VOLUME:-walshadow-data}"
 FLUSH_TIMEOUT_MS="${FLUSH_TIMEOUT_MS:-1000}"
 # Source-PG schema housing the config_* overlay tables (ec2-source-pg/deploy.sh
 # installs + seeds them). Empty string disables the overlay (TOML-only scope).
@@ -42,26 +44,17 @@ JAEGER_MAX_TRACES="${JAEGER_MAX_TRACES:-50000}"
 JAEGER_MEMORY="${JAEGER_MEMORY:-1g}"
 TRACE_SAMPLE_RATIO="${TRACE_SAMPLE_RATIO:-0.01}"
 XACT_BUFFER_MAX="${XACT_BUFFER_MAX:-1073741824}"
-node_ssh_setup
 
-SRC_PRIV="${SOURCE_PRIVATE_IP:-$(require_state_ip ec2-source-pg SOURCE_PRIVATE_IP)}"
+SRC_PRIV="$(node_ip "${SOURCE_PRIVATE_IP:-}" ec2-source-pg SOURCE_PRIVATE_IP)"
 # CH host: explicit CH_HOST (e.g. Cloud endpoint) wins, else legacy
 # CH_PRIVATE_IP, else the in-VPC ec2-clickhouse node.
-CH_HOST="${CH_HOST:-${CH_PRIVATE_IP:-$(require_state_ip ec2-clickhouse PRIVATE_IP)}}"
-echo "source PG: $SRC_PRIV:5432   clickhouse: $CH_HOST:$CH_PORT (secure=$CH_SECURE, db=$CH_DATABASE)"
+CH_HOST="$(node_ip "${CH_HOST:-${CH_PRIVATE_IP:-}}" ec2-clickhouse PRIVATE_IP)"
+log "source PG: $SRC_PRIV:5432   clickhouse: $CH_HOST:$CH_PORT (secure=$CH_SECURE, db=$CH_DATABASE)"
 
 wait_cloud_init
 
-# Ship the image unless it's already present on the host (use FORCE=1 to resend).
-REMOTE_IMAGE="$(remote_image_tag "$IMAGE")"
-if [ "${FORCE:-0}" != "1" ] && [ -n "$REMOTE_IMAGE" ]; then
-  echo "image $REMOTE_IMAGE already on host (FORCE=1 to resend)"
-else
-  echo "shipping $IMAGE (docker save | ssh | docker load)..."
-  docker save "$IMAGE" | gzip | "${SSH[@]}" 'gunzip | sudo docker load'
-  REMOTE_IMAGE="$(remote_image_tag "$IMAGE")"
-  [ -n "$REMOTE_IMAGE" ] || { echo "$IMAGE missing on host after load" >&2; exit 1; }
-fi
+# Keep an image already on the host unless FORCE=1 asks for a resend.
+REMOTE_IMAGE="$(ship_image "$IMAGE" "${FORCE:-0}")"
 
 # Backup data requires matching PostgreSQL major versions
 IMG_MAJOR="$("${SSH[@]}" "sudo docker run --rm --entrypoint postgres $REMOTE_IMAGE -V" | grep -oE '[0-9]+' | head -1)"
@@ -81,7 +74,7 @@ fi
 # Table scope is overlay-driven (walshadow.config_* on the source, seeded by
 # ec2-source-pg/deploy.sh) — no hardcoded [table.*] blocks, so the daemon
 # replicates whatever the overlay opts in.
-echo "writing ch-config.toml (ch host=$CH_HOST:$CH_PORT secure=$CH_SECURE, flush_timeout_ms=$FLUSH_TIMEOUT_MS, runtime_config_schema='$RUNTIME_CONFIG_SCHEMA') and starting container..."
+log "writing ch-config.toml (ch host=$CH_HOST:$CH_PORT secure=$CH_SECURE, flush_timeout_ms=$FLUSH_TIMEOUT_MS, runtime_config_schema='$RUNTIME_CONFIG_SCHEMA') and starting container"
 "${SSH[@]}" "sudo install -d /opt/walshadow && sudo tee /opt/walshadow/ch-config.toml >/dev/null" <<EOF
 [ch]
 host = "$CH_HOST"
@@ -99,27 +92,35 @@ EOF
 
 # Memory-bound Jaeger (in-memory storage capped at JAEGER_MAX_TRACES, RAM at
 # JAEGER_MEMORY) on walshadow-net so the daemon ships spans to it by name.
-"${SSH[@]}" "sudo docker network inspect walshadow-net >/dev/null 2>&1 || sudo docker network create walshadow-net"
-"${SSH[@]}" "sudo docker rm -f jaeger >/dev/null 2>&1 || true; sudo docker run -d --name jaeger --restart unless-stopped \
+remote_sh "$JAEGER_IMAGE" "$JAEGER_MEMORY" "$JAEGER_MAX_TRACES" <<'EOS'
+image="$1" memory="$2" max_traces="$3"
+sudo docker network inspect walshadow-net >/dev/null 2>&1 || sudo docker network create walshadow-net
+sudo docker rm -f jaeger >/dev/null 2>&1 || true
+sudo docker run -d --name jaeger --restart unless-stopped \
   --network walshadow-net \
-  --memory '$JAEGER_MEMORY' \
+  --memory "$memory" \
   -e COLLECTOR_OTLP_ENABLED=true \
   -e SPAN_STORAGE_TYPE=memory \
-  -e MEMORY_MAX_TRACES='$JAEGER_MAX_TRACES' \
+  -e MEMORY_MAX_TRACES="$max_traces" \
   -p 16686:16686 -p 4317:4317 \
-  $JAEGER_IMAGE >/dev/null && echo 'jaeger started'"
+  "$image" >/dev/null && echo 'jaeger started'
+EOS
 
-"${SSH[@]}" "sudo docker rm -f walshadow >/dev/null 2>&1 || true; sudo docker run -d --name walshadow --restart unless-stopped \
+remote_sh "$REMOTE_IMAGE" "$SRC_PRIV" "$XACT_BUFFER_MAX" "$DATA_VOLUME" "$TRACE_SAMPLE_RATIO" <<'EOS'
+image="$1" src_host="$2" xact_buffer_max="$3" data_volume="$4" trace_sample_ratio="$5"
+sudo docker rm -f walshadow >/dev/null 2>&1 || true
+sudo docker run -d --name walshadow --restart unless-stopped \
   --network walshadow-net \
   -e RUST_LOG='warn,walshadow=info' \
-  -e WALSHADOW_SOURCE_HOST='$SRC_PRIV' \
+  -e WALSHADOW_SOURCE_HOST="$src_host" \
   -e WALSHADOW_SOURCE_PORT=5432 \
-  -e WALSHADOW_XACT_BUFFER_MAX='$XACT_BUFFER_MAX' \
+  -e WALSHADOW_XACT_BUFFER_MAX="$xact_buffer_max" \
   -e OTEL_EXPORTER_OTLP_ENDPOINT='http://jaeger:4317' \
   -v /opt/walshadow/ch-config.toml:/etc/walshadow/ch-config.toml:ro \
-  -v walshadow-data:/var/lib/walshadow \
+  -v "$data_volume":/var/lib/walshadow \
   -p 9484:9484 \
-  $REMOTE_IMAGE --trace-sample-ratio '$TRACE_SAMPLE_RATIO' >/dev/null && echo started"
+  "$image" --trace-sample-ratio "$trace_sample_ratio" >/dev/null && echo started
+EOS
 
 # Grafana + Prometheus: only uploaded/recreated when FORCE_METRICS=1.
 if [ "${FORCE_METRICS:-0}" = "1" ]; then
@@ -131,23 +132,30 @@ if [ "${FORCE_METRICS:-0}" = "1" ]; then
 
   tar -C "$(repo_root)/docker" -czf - grafana prometheus \
     | "${SSH[@]}" "sudo install -d /opt/walshadow/obs && sudo tar -C /opt/walshadow/obs -xzf -"
-  # compose hostname 'clickhouse' -> private IP
-  "${SSH[@]}" "sudo grep -rl clickhouse /opt/walshadow/obs 2>/dev/null | sudo xargs -r sed -i 's/clickhouse:/$CH_HOST:/g; s#//clickhouse#//$CH_HOST#g'"
 
-  "${SSH[@]}" "sudo docker rm -f prometheus >/dev/null 2>&1 || true; sudo docker run -d --name prometheus --restart unless-stopped \
-    --network walshadow-net \
-    -v /opt/walshadow/obs/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
-    -p 9090:9090 \
-    $PROM_IMAGE >/dev/null && echo 'prometheus started'"
+  remote_sh "$CH_HOST" "$PROM_IMAGE" "$GRAFANA_IMAGE" <<'EOS'
+ch_host="$1" prom_image="$2" grafana_image="$3"
+# compose hostname 'clickhouse' -> private IP
+sudo grep -rl clickhouse /opt/walshadow/obs 2>/dev/null \
+  | sudo xargs -r sed -i "s/clickhouse:/$ch_host:/g; s#//clickhouse#//$ch_host#g"
 
-  "${SSH[@]}" "sudo docker rm -f grafana >/dev/null 2>&1 || true; sudo docker run -d --name grafana --restart unless-stopped \
-    --network walshadow-net \
-    -e GF_AUTH_ANONYMOUS_ENABLED=true -e GF_AUTH_ANONYMOUS_ORG_ROLE=Admin \
-    -e GF_INSTALL_PLUGINS=grafana-clickhouse-datasource \
-    -v /opt/walshadow/obs/grafana/provisioning:/etc/grafana/provisioning:ro \
-    -v /opt/walshadow/obs/grafana/dashboards:/var/lib/grafana/dashboards:ro \
-    -p 3000:3000 \
-    $GRAFANA_IMAGE >/dev/null && echo 'grafana started'"
+sudo docker rm -f prometheus >/dev/null 2>&1 || true
+sudo docker run -d --name prometheus --restart unless-stopped \
+  --network walshadow-net \
+  -v /opt/walshadow/obs/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+  -p 9090:9090 \
+  "$prom_image" >/dev/null && echo 'prometheus started'
+
+sudo docker rm -f grafana >/dev/null 2>&1 || true
+sudo docker run -d --name grafana --restart unless-stopped \
+  --network walshadow-net \
+  -e GF_AUTH_ANONYMOUS_ENABLED=true -e GF_AUTH_ANONYMOUS_ORG_ROLE=Admin \
+  -e GF_INSTALL_PLUGINS=grafana-clickhouse-datasource \
+  -v /opt/walshadow/obs/grafana/provisioning:/etc/grafana/provisioning:ro \
+  -v /opt/walshadow/obs/grafana/dashboards:/var/lib/grafana/dashboards:ro \
+  -p 3000:3000 \
+  "$grafana_image" >/dev/null && echo 'grafana started'
+EOS
 fi
 
 echo

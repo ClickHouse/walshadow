@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, ValueEnum};
 
-use walshadow_bench::{CommonArgs, DestKind};
+use walshadow_bench::{Bench, CommonArgs, DestKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Network {
@@ -62,6 +62,10 @@ struct Args {
     /// instead of the single `--bench`. Refuses an existing folder.
     #[arg(long, value_name = "NAME")]
     suite: Option<String>,
+
+    /// Capture one --bench run into a fresh results folder
+    #[arg(long, conflicts_with = "suite")]
+    run_name: Option<String>,
 
     /// Where `--suite` writes its run folders.
     #[arg(long, default_value = "bench/results")]
@@ -123,7 +127,7 @@ fn resolve_host(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     args.validate()?;
     let src_state = args.state_dir.join("ec2-source-pg/state.env");
     // source-pg records its private IP under SOURCE_PRIVATE_IP.
@@ -155,6 +159,31 @@ async fn main() -> Result<()> {
             bail!("failed: {}", failed.join(", "));
         }
         return Ok(());
+    }
+    if let Some(name) = &args.run_name {
+        let mut child = Vec::new();
+        let mut argv = std::env::args().skip(1);
+        while let Some(arg) = argv.next() {
+            if arg == "--run-name" {
+                argv.next();
+            } else if !arg.starts_with("--run-name=") {
+                child.push(arg);
+            }
+        }
+        return walshadow_bench::suite::run_one(name, &args.results_dir, &child);
+    }
+    if matches!(
+        args.common.bench,
+        Some(Bench::InitialLoad | Bench::Bootstrap)
+    ) && args.common.initial_load.metrics_url.is_none()
+    {
+        let host = resolve_host(
+            None,
+            &args.state_dir.join("ec2-walshadow/state.env"),
+            args.network,
+            "PRIVATE_IP",
+        )?;
+        args.common.initial_load.metrics_url = Some(format!("http://{host}:9484/metrics"));
     }
     walshadow_bench::dispatch(&args.common, pg_host, dest_host).await
 }

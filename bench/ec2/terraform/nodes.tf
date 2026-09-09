@@ -34,7 +34,7 @@ locals {
       sg_desc = "walshadow daemon: SSH + metrics + grafana/prometheus/jaeger from my IP"
       ingress = [
         { port = 22, scopes = ["my"] },
-        { port = 9484, scopes = ["my"] },
+        { port = 9484, scopes = ["my", "vpc"] },
         { port = 3000, scopes = ["my"] },
         { port = 9090, scopes = ["my"] },
         { port = 16686, scopes = ["my"] },

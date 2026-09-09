@@ -86,8 +86,32 @@ pub fn run(
         }
     }
 
+    if let Err(error) = crate::plot::generate(std::slice::from_ref(&out), &[], &out.join("graphs"))
+    {
+        eprintln!("graphs unavailable: {error:#}");
+    }
     println!("\nall done → {}", out.display());
     Ok(failed)
+}
+
+pub fn run_one(name: &str, results_dir: &Path, args: &[String]) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        || matches!(name, "." | "..")
+    {
+        bail!("run name must contain letters, digits, dots, underscores or hyphens");
+    }
+    fs::create_dir_all(results_dir)?;
+    let out = results_dir.join(name);
+    fs::create_dir(&out).with_context(|| format!("create {}", out.display()))?;
+    let result = run_shape(&std::env::current_exe()?, &out.join("bench.txt"), args, &[]);
+    if let Err(error) = crate::plot::generate(std::slice::from_ref(&out), &[], &out.join("graphs"))
+    {
+        eprintln!("graphs unavailable: {error:#}");
+    }
+    result
 }
 
 /// Run one shape as a child process, teeing its merged output to `file`.
