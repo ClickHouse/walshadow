@@ -49,8 +49,24 @@ impl BootstrapOracle {
             a.initdb().context("initdb")?;
             a.write_base_conf().context("base conf")?;
             a.start_binary_upgrade().context("start -b")?;
-            let dump = run_pg_dump(&source_conninfo, source_password.as_deref())
-                .context("pg_dump --binary-upgrade")?;
+
+            let available = a.available_extensions().context("oracle extensions")?;
+            let installed = source_extensions(&source_conninfo, source_password.as_deref())
+                .context("source extensions")?;
+            let unavailable: Vec<String> = installed
+                .into_iter()
+                .filter(|e| !available.contains(e))
+                .collect();
+
+            let major = pg_dump_major().context("pg_dump version")?;
+            let dump = if major >= 17 {
+                run_pg_dump(&source_conninfo, source_password.as_deref(), &unavailable)
+                    .context("pg_dump --binary-upgrade")?
+            } else {
+                let raw = run_pg_dump(&source_conninfo, source_password.as_deref(), &[])
+                    .context("pg_dump --binary-upgrade")?;
+                filter_out_extensions(&raw, &unavailable)
+            };
             a.apply_schema_dump(&dump).context("apply schema")?;
             a.stop().context("stop -b")?;
 
@@ -104,16 +120,18 @@ fn oracle_cfg(
     cfg
 }
 
-fn run_pg_dump(conninfo: &str, password: Option<&str>) -> Result<String> {
+fn run_pg_dump(conninfo: &str, password: Option<&str>, exclude: &[String]) -> Result<String> {
     let mut cmd = Command::new("pg_dump");
     cmd.args([
         "--binary-upgrade",
         "--schema-only",
         "--no-owner",
         "--no-privileges",
-        "-d",
-        conninfo,
     ]);
+    for ext in exclude {
+        cmd.arg(format!("--exclude-extension={ext}"));
+    }
+    cmd.args(["-d", conninfo]);
     if let Some(pw) = password {
         cmd.env("PGPASSWORD", pw);
     }
@@ -122,6 +140,124 @@ fn run_pg_dump(conninfo: &str, password: Option<&str>) -> Result<String> {
         anyhow::bail!("pg_dump failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     String::from_utf8(out.stdout).context("pg_dump output not utf8")
+}
+
+/// Extensions installed on the source. The binary-upgrade dump recreates each
+/// one's member objects inline, including C functions that load `$libdir/<ext>`.
+fn source_extensions(conninfo: &str, password: Option<&str>) -> Result<Vec<String>> {
+    let mut cmd = Command::new("psql");
+    cmd.args([
+        "-tAXq",
+        "-d",
+        conninfo,
+        "-c",
+        "SELECT extname FROM pg_catalog.pg_extension",
+    ]);
+    if let Some(pw) = password {
+        cmd.env("PGPASSWORD", pw);
+    }
+    let out = cmd.output().context("spawn psql")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "source extensions query failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8(out.stdout)
+        .context("psql output not utf8")?
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Major version of the `pg_dump` on `PATH`. `--exclude-extension` is 17+.
+fn pg_dump_major() -> Result<u32> {
+    let out = Command::new("pg_dump")
+        .arg("--version")
+        .output()
+        .context("spawn pg_dump --version")?;
+    if !out.status.success() {
+        anyhow::bail!("pg_dump --version failed");
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find_map(|tok| {
+            let digits: String = tok.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u32>().ok()
+        })
+        .with_context(|| format!("parse pg_dump version from {text:?}"))
+}
+
+/// Drop, from a `--binary-upgrade` dump, every entry belonging to an
+/// `excluded` extension: the extension itself, its `COMMENT`, and each member
+/// object (matched by its in-block `ALTER EXTENSION <ext> ADD`). Used on PG16,
+/// whose `pg_dump` has no `--exclude-extension`. Top-level `SET` directives are
+/// preserved even inside a dropped entry, since they configure the session, not
+/// the extension. An entry runs from its `-- Name: …; Type: …` header comment
+/// to the next such header.
+fn filter_out_extensions(dump: &str, excluded: &[String]) -> String {
+    if excluded.is_empty() {
+        return dump.to_string();
+    }
+    let excluded: std::collections::HashSet<&str> = excluded.iter().map(String::as_str).collect();
+    let lines: Vec<&str> = dump.lines().collect();
+    let n = lines.len();
+    let is_header = |i: usize| {
+        i + 2 < n
+            && lines[i] == "--"
+            && lines[i + 1].starts_with("-- Name: ")
+            && lines[i + 2] == "--"
+    };
+
+    let mut starts = vec![0usize];
+    starts.extend((0..n).filter(|&i| is_header(i)));
+    starts.dedup();
+
+    let mut out: Vec<&str> = Vec::with_capacity(n);
+    for (k, &start) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(n);
+        let seg = &lines[start..end];
+        if is_header(start) && should_drop_entry(seg, &excluded) {
+            out.extend(
+                seg.iter()
+                    .copied()
+                    .filter(|l| l.trim_start().starts_with("SET ")),
+            );
+        } else {
+            out.extend_from_slice(seg);
+        }
+    }
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    joined
+}
+
+fn should_drop_entry(seg: &[&str], excluded: &std::collections::HashSet<&str>) -> bool {
+    let meta = seg
+        .get(1)
+        .and_then(|h| h.strip_prefix("-- Name: "))
+        .unwrap_or("");
+    if let Some((name, rest)) = meta.split_once("; Type: ") {
+        let typ = rest.split(';').next().unwrap_or("").trim();
+        if typ == "EXTENSION" && excluded.contains(name) {
+            return true;
+        }
+        if typ == "COMMENT"
+            && name
+                .strip_prefix("EXTENSION ")
+                .is_some_and(|e| excluded.contains(e.trim()))
+        {
+            return true;
+        }
+    }
+    seg.iter().any(|l| {
+        l.trim_start()
+            .strip_prefix("ALTER EXTENSION ")
+            .and_then(|r| r.split_whitespace().next())
+            .is_some_and(|ext| excluded.contains(ext.trim_matches('"')))
+    })
 }
 
 pub fn needs_oracle(
@@ -264,5 +400,84 @@ mod tests {
         let rules = ColumnRules::default();
         let (catalog, _) = bridged(rel(vec![attr(1, "doc", JSONOID, "json", -1)]), &rules);
         assert!(!needs_oracle(&catalog, &Arc::default(), &rules));
+    }
+
+    const DUMP: &str = "\
+--
+-- PostgreSQL database dump
+--
+
+SET statement_timeout = 0;
+
+--
+-- Name: pg_clickhouse; Type: EXTENSION; Schema: -; Owner: -
+--
+
+DROP EXTENSION IF EXISTS pg_clickhouse;
+SELECT pg_catalog.binary_upgrade_create_empty_extension('pg_clickhouse', 'public', true, '1.0', NULL, NULL, ARRAY[]::pg_catalog.text[]);
+
+
+--
+-- Name: EXTENSION pg_clickhouse; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pg_clickhouse IS 'stub clickhouse extension';
+
+
+--
+-- Name: pg_clickhouse_noop(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pg_clickhouse_noop() RETURNS integer
+    LANGUAGE c
+    AS '$libdir/pg_clickhouse', 'pg_clickhouse_noop';
+
+-- For binary upgrade, handle extension membership the hard way
+ALTER EXTENSION pg_clickhouse ADD FUNCTION public.pg_clickhouse_noop();
+
+
+SET default_table_access_method = heap;
+
+--
+-- Name: app; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app (
+    id integer NOT NULL,
+    name text
+);
+";
+
+    #[test]
+    fn filter_drops_only_the_excluded_extension() {
+        let out = filter_out_extensions(DUMP, &["pg_clickhouse".to_string()]);
+        assert!(
+            !out.contains("pg_clickhouse"),
+            "all pg_clickhouse refs gone"
+        );
+        assert!(
+            !out.contains("$libdir"),
+            "no missing-library CREATE FUNCTION"
+        );
+        assert!(out.contains("CREATE TABLE public.app"), "mapped table kept");
+        assert!(
+            out.contains("SET default_table_access_method = heap;"),
+            "top-level SET in a dropped entry is preserved"
+        );
+        assert!(out.contains("SET statement_timeout = 0;"), "preamble kept");
+    }
+
+    #[test]
+    fn filter_is_identity_when_nothing_excluded() {
+        assert_eq!(filter_out_extensions(DUMP, &[]), DUMP.to_string());
+    }
+
+    #[test]
+    fn filter_keeps_extensions_not_in_the_excluded_set() {
+        let out = filter_out_extensions(DUMP, &["some_other_ext".to_string()]);
+        assert!(
+            out.contains("pg_clickhouse"),
+            "unrelated exclusion is a no-op"
+        );
     }
 }
