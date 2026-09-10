@@ -66,8 +66,8 @@ impl BootstrapConfig {
         }
     }
 
-    pub fn with_catalog_filenodes(mut self, c: CatalogFilenodes) -> Self {
-        self.catalog_filenodes = c;
+    pub fn with_catalog_filenodes(mut self, c: impl IntoIterator<Item = (Oid, Oid)>) -> Self {
+        self.catalog_filenodes = c.into_iter().collect();
         self
     }
 
@@ -404,7 +404,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = BootstrapConfig::new(tmp.path().to_path_buf());
         assert!(cfg.catalog_filenodes.is_empty());
-        let cfg = cfg.with_catalog_filenodes(CatalogFilenodes::from_iter([(5, 50000), (0, 99999)]));
+        let cfg = cfg.with_catalog_filenodes([(5, 50000), (0, 99999)]);
         assert_eq!(cfg.catalog_filenodes.len(), 2);
         assert!(cfg.catalog_filenodes.is_catalog(5, 50000));
     }

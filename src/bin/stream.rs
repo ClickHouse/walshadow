@@ -4239,9 +4239,19 @@ async fn run_bootstrap(
     let catalog_map = seed_in_snapshot(sql_client)
         .await
         .context("bootstrap: seed_in_snapshot")?;
+    // One seed, two consumers that must agree: the landing decides which
+    // relation files reach the shadow, `filter_landed_wal` decides which
+    // records may redo onto them. Disagreement re-creates a skipped file.
+    let mut landing_tracker = walshadow::catalog_tracker::CatalogTracker::new();
+    landing_tracker
+        .seed_from_source(sql_client)
+        .await
+        .context("bootstrap: seed catalog filenodes")?;
+    let catalog_filenodes: Vec<_> = landing_tracker.nodes().collect();
     tracing::info!(
         target: "walshadow::bootstrap",
         relations = catalog_map.len(),
+        catalog_filenodes = catalog_filenodes.len(),
         mode = ?plan.mode,
         shadow_data_dir = %shadow_data_dir.display(),
         "catalog map seeded",
@@ -4381,7 +4391,9 @@ async fn run_bootstrap(
         .context("bootstrap: sample source write head for the window leg")?;
     let source_major = (feed.server_version_num() / 10000) as u32;
 
-    let cfg = BootstrapConfig::new(shadow_data_dir.clone()).with_skip_filenodes(walk_skip);
+    let cfg = BootstrapConfig::new(shadow_data_dir.clone())
+        .with_skip_filenodes(walk_skip)
+        .with_catalog_filenodes(catalog_filenodes);
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
 
     // Keep oracle alive through live or file window replay
@@ -4720,6 +4732,26 @@ async fn run_bootstrap(
         );
     }
     tokio::fs::remove_dir_all(&window_scratch).await.ok();
+
+    // The backup's WAL landed raw. Everything that needed the raw bytes has
+    // read them by now; rewrite before the shadow's recovery gets a look.
+    let landed = walshadow::backfill::wal_landing::filter_landed_wal(
+        &shadow_data_dir.join("pg_wal"),
+        outcome.start.timeline,
+        outcome.end.end_lsn,
+        landing_tracker,
+    )
+    .await
+    .context("bootstrap: filter landed WAL")?;
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        segments = landed.segments,
+        segments_blanked = landed.segments_blanked,
+        kept = landed.kept,
+        dropped = landed.dropped,
+        dropped_bytes = landed.dropped_bytes,
+        "landed WAL filtered",
+    );
 
     // Resolve deferred tuples after window transaction overlay is complete
     if let Some(pending) = pending_gate {
