@@ -1,6 +1,6 @@
 //! Page-walk Tap sink. Decodes user-heap tar entries through the same
 //! heap decoder the WAL hot path uses (`decode_block_data`).
-//! See [plans/bootstrap.md](../plans/bootstrap.md).
+//! See [architecture/bootstrap.md](../../architecture/bootstrap.md).
 //!
 //! ## V1 limits
 //!
@@ -8,7 +8,7 @@
 //!   captured mid-write get walked as-shipped. WAL records in
 //!   `[start_lsn, end_lsn]` re-emit at higher `_lsn` and
 //!   `ReplacingMergeTree(_lsn)` collapses the duplicate. Accepted
-//!   brief-duplicate window, see [plans/bootstrap.md](../plans/bootstrap.md).
+//!   brief-duplicate window, see [architecture/bootstrap.md](../../architecture/bootstrap.md).
 //! - With chunk storage enabled, walk `pg_toast_<relid>` pages and let
 //!   bootstrap drain resolve deferred referrers
 
@@ -378,7 +378,7 @@ pub struct PageWalkSink {
     /// Decode TOAST pages only when configured store consumes them
     store_toast: bool,
     /// `pg_xact/` segments Tap into here for backfill visibility gate
-    /// (plans/add_table.md); `None` (greenfield) keeps Skip.
+    /// (architecture/bootstrap.md); `None` (greenfield) keeps Skip.
     pg_xact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgXactAccum>>>,
     /// `pg_multixact/{offsets,members}` segments, for multixact xmax
     /// resolution in the same gate

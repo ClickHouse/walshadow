@@ -15,7 +15,7 @@
 //! [`crate::backfill::copy_backfill::CopyBackfiller`]: `'copy'` issues a snapshot-free
 //! COPY of pre-opt-in rows at `_lsn = S` (the opt-in LSN); `'base_backup'` /
 //! `'object_store'` coalesce into a backup-sourced page-walk pass
-//! ([`crate::backfill::backup_backfill`], plans/add_table.md). All
+//! ([`crate::backfill::backup_backfill`], architecture/bootstrap.md). All
 //! converge with the WAL stream via `ReplacingMergeTree(_lsn)` dedup, and the
 //! backfiller's ledger dedups restarts. `None` (backfiller not wired) streams
 //! from the opt-in LSN only; so do unknown mode strings (validate-late, never

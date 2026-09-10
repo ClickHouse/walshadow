@@ -1,5 +1,5 @@
-//! Runtime-config overlay e2e drills (plans/future/runtime_config_from_pg.md
-//! §Acceptance drills): operator writes to source-PG `walshadow.config_table`
+//! Runtime-config overlay e2e drills (docs/configuration.md):
+//! operator writes to source-PG `walshadow.config_table`
 //! drive per-table scope live off the WAL stream.
 //!
 //! 1. `opt_in_via_config_table_replicates_new_table`
@@ -33,12 +33,8 @@
 //! 5. `opt_in_then_alter_add_column_reaches_ch`
 //!    * `app.gadgets` opted in via `config_table`, then source runs
 //!      `ALTER TABLE ... ADD COLUMN`.
-//!    * Expect: the ALTER diffs against the baseline the opt-in dispatch
-//!      recorded at the config row's commit LSN → `Changed` → CH
-//!      `ADD COLUMN`, and a trailing INSERT carries the new column. A cold
-//!      baseline would instead surface `Added`, which `apply_added` skips
-//!      for mapped rels — CH would stay a column behind
-//!      (plans/future/pinned_ddl_baseline.md).
+//!    * Expect: ALTER diffs against durable source descriptor history,
+//!      adds destination column, and trailing INSERT carries its value
 //!
 //! 6. `column_target_type_override_reaches_projection`
 //!    * CH dest pre-created `Decimal(38, 2)`, TOML maps the stale
@@ -68,7 +64,7 @@
 //!      `primary_key` in the same row.
 //!    * Expect: the auto-created CH table keys on the operator's columns,
 //!      not the declared PK order, with the index prefix they asked for
-//!      (plans/config.md §Destination shape).
+//!      (docs/destination-tables.md).
 //!
 //! 10. `pattern_row_shapes_auto_created_tables`
 //!    * `config_table` row with `match = 'glob'` names system columns and
@@ -1183,7 +1179,7 @@ async fn opt_in_row_pins_order_by_and_primary_key() {
 /// `replicate_all` creates a relation the first time it is seen, so a literal
 /// `config_table` row can never beat the CREATE — the pattern row, committed
 /// before the source `CREATE TABLE`, is the only way to name the system
-/// columns of an auto-created table (plans/config.md §Destination shape).
+/// columns of an auto-created table (docs/destination-tables.md).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pattern_row_shapes_auto_created_tables() {
     if !fx::requirements_available() {

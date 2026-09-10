@@ -325,7 +325,7 @@ impl CatalogTracker {
     /// capture-all constantly and leave the enumerated path dead. The cost
     /// is a stale `RelAttr.type_name` after `ALTER TYPE … RENAME`, which no
     /// decode path reads — accepted, with remediation options in
-    /// `plans/future/catalog_capture_completeness.md`
+    /// `plans/catalog.md`
     pub fn is_capture_all_catalog(&self, db: u32, rel: u32) -> bool {
         match self.pg_namespace_filenode.get(&db) {
             Some(&fnum) => fnum == rel,

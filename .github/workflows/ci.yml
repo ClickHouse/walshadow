@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    # walshadow operationally supports PG 16+ (see PLAN.md "Supported
-    # PostgreSQL versions"). Matrix pins the on-PATH PG binaries to one
+    # Supported versions live in docs/limitations.md
+    # Matrix pins the on-PATH PG binaries to one
     # specific major; tests + fixture-capture scripts pick up whichever
     # `initdb` / `pg_ctl` / `postgres` lands first.
     # Merge coverage because PostgreSQL versions take different code paths.

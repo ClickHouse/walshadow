@@ -1,5 +1,5 @@
-//! TOAST mirror retirement across pipeline restarts (`plans/TOAST.md`
-//! phase 2): owner DROP paths that need a rebuilt pipeline.
+//! TOAST mirror retirement across pipeline restarts (`architecture/values.md`):
+//! owner DROP paths that need a rebuilt pipeline
 //!
 //! * cold-restart DROP — a rebuilt pipeline (empty `prev_known`, no chunk
 //!   decode) still retires the mirror off the `seed_baseline`-warmed

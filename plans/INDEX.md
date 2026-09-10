@@ -1,70 +1,47 @@
-# walshadow engineering index
+# Planned work
 
-Engineering rationale and invariants for walshadow. Start at
-[overview.md](overview.md) for system shape, then drop into individual
-components. User workflows and supported behavior live under
-[`docs/`](../docs/README.md). Future-work proposals live under
-[future/](future/INDEX.md). Cross-doc terminology is collected in
-[GLOSSARY.md](GLOSSARY.md)
+Keep only unfinished work here. Describe problem, next step, constraints, and
+evidence needed to finish. Check code and tests before treating an old proposal
+as a missing feature
 
-## Components
+Current behavior belongs in [docs](../docs/README.md). System design belongs in
+[architecture](../architecture/README.md). Existing function signatures, wire
+layouts, implementation walkthroughs, and exhaustive metric lists belong in source. Keep
+proposed interfaces, persistence ordering, alternatives, and acceptance matrices
+here when other workstreams need them before implementation exists
 
-- [overview.md](overview.md) — system shape, filter contract, ordering invariants
-- [filter.md](filter.md) — WAL filter, CRC rewrite, catalog tracker,
-  dirty tree, rmgr-level keep/drop, NOOP-over-fork rationale
-- [source.md](source.md) — START_REPLICATION PHYSICAL pump,
-  `WalStream`, `StreamingWalker`, fan-out sinks, `QueueingRecordSink`,
-  `DecoderSink`, walshadow walsender server
-- [shadow.md](shadow.md) — shadow PG lifecycle, `ShadowCatalog` async
-  libpq client, `RelDescriptor`, reconnect resilience
-- [desc_log.md](desc_log.md) — durable descriptor log: boundary
-  capture, interval lookups, ambiguity intervals, replay-from-log,
-  seed + coverage horizon, GC against the resolved floor
-- [decoder.md](decoder.md) — heap-tuple decoder, Tier 1/2 codec
-  matrix, FPI decompression, `main_data` parsers, `pg_class_decoder`,
-  read-time defaults
-- [xact.md](xact.md) — `XactBuffer`, `SubxactTracker`, TOAST
-  reassembly, commit-time stash + raw decode, local-disk spill + body
-  spool, `DrainEntry` ordering
-- [TOAST.md](TOAST.md) — TID-keyed `pg_toast_<relid>` CH mirror
-  with delete tombstones + RMT-merge reclaim, as-of fetch,
-  superseded-fill miss policy, bootstrap tap +
-  defer-resolve; deferred R1 JOIN mode, streaming reassembly
-- [emitter.md](emitter.md) — parallel decode+insert pipeline
-  (reorder plan → execute → decode ×M → batcher → inserter ×N → ack
-  watermark), transaction planner + plan spool, memory budget,
-  `type_bridge`, synthetic columns, `DdlApplicator`, barrier fence
-- [bootstrap.md](bootstrap.md) — greenfield BASE_BACKUP, `BackupSource`
-  / `BackupSink` traits, `MultiplexSink`, `PageWalkSink` 2A decoder,
-  shared insert tail, window WAL replay, restart fallback
-- [ops.md](ops.md) — retention, manifest floor, standby-status triple,
-  resume invariants
-- [failover.md](failover.md) — source timeline crossing: frozen pause
-  frontier, promotion gate, fork proofs,
-  pipeline barrier at the fork, committed resume position, fork-segment
-  prefix verification, shadow handoff order, lineage-aware resume and
-  reconnect, slot proofs, parked refusals
-- [oracle.md](oracle.md) — PgPending resolver, walshadow PG
-  extension
+Read [shared implementation constraints](coordination.md) before changing WAL
+publication, durable progress, physical identity, or pipeline concurrency
 
-## Future work
+## Production readiness
 
-[future/INDEX.md](future/INDEX.md) collects design docs for unbuilt work:
-runtime-config signals and net-new knobs, two-phase commit,
-sequence-state replication, cross-table ordering, CH-bounce recovery,
-parked operational polish. Once built, keep behavior in code and tests,
-move user-facing consequences into `docs/`, and retain only rationale or
-invariants which code cannot express
+Start with small guards against silent divergence and tests of restart behavior
+Resolve bootstrap visibility before relying on backup loads under concurrent
+writes. A documented limitation does not imply code rejects it
 
-## Architecture diagrams
+| Plan | Next step |
+|---|---|
+| [Schema changes](schema.md) | Reject unsupported transitions before destination effects |
+| [Tablespaces](tablespaces.md) | Reject unsafe layouts before bootstrap, then add complete support |
+| [Catalog completeness](catalog.md) | Stop when a surviving relation has lost buffered payload |
+| [Bootstrap visibility](bootstrap.md) | Preserve tuples whose transaction outcome is still unknown |
+| [Verification](verification.md) | Enforce CI prerequisites and prove outage, restart, and WAL-version behavior |
+| [100% line coverage](coverage100.md) | Close fixture, live-system, CLI, and fault-path gaps, then enforce 100% |
 
-[architecture](../architecture/README.md) owns diagrams shared by these plans:
-[streaming topology](../architecture/overview.svg),
-[worker pools](../architecture/workers.svg),
-[catalog capture and DDL](../architecture/catalog.svg),
-[TOAST and type conversion](../architecture/values.svg),
-[bootstrap](../architecture/bootstrap.svg), and
-[restart and cleanup](../architecture/recovery.svg)
+## Further work
 
-Update those SVG sources when component connections change; embed them here
-instead of maintaining separate diagrams
+| Plan | Reason to take it up |
+|---|---|
+| [Fuzzing](fuzzing.md) | Find parser and schema-transition interactions beyond fixed regressions |
+| [Performance](performance.md) | Locate bottlenecks before changing concurrency or allocation |
+| [Runtime configuration](runtime_config.md) | Add source-side commands and explain effective settings |
+| [Failover](failover.md) | Continue after unplanned promotion or across archived timeline changes |
+| [Shadow TOAST storage](shadow_toast.md) | Evaluate PostgreSQL-backed large-value reads with safe reclamation |
+| [Replay callback](custom_rmgr.md) | Reduce measured command-boundary capture stalls |
+| [Dependencies](dependencies.md) | Replace generic protocol code when an adapter preserves behavior |
+| [Optional capabilities](extensions.md) | Meet a concrete routing, export, vector, or durability requirement |
+
+Remove completed proposals instead of keeping a second implementation reference
+Keep unresolved acceptance tests even when their proposed implementation has
+been replaced by another design. Treat sketches as proposals, verify source
+before choosing names or replacing existing mechanisms

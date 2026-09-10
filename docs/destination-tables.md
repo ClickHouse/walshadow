@@ -169,3 +169,13 @@ mode = "clickhouse"
 Default `disabled` mode fills unrecoverable values with null or column default
 and reports counters. Enable `clickhouse` before initial load for workloads with
 large text, JSON, arrays, or bytea values
+
+Missing required mirror tables stop replication. Do not delete active mirrors
+to reduce disk use. Relation-drop cleanup can leave empty mirror tables until
+operator cleanup; retain them while any restart can still reread older referring
+rows. Treat manual mirror cleanup as a recovery-state decision
+
+Inline reconstruction still materializes each value. Values exceeding configured
+limit fail instead of allocating without bound. See command help for TOAST
+memory limits and [current limits](limitations.md#large-values) for generation
+ambiguity during backup

@@ -1,5 +1,5 @@
 //! Staging-table coherence for backup-sourced initial loads
-//! (plans/add_table.md §Staging swap).
+//! (architecture/bootstrap.md).
 //!
 //! A pass's rows land in `<table>__wsstg`, never the destination; success
 //! publishes atomically via `EXCHANGE TABLES` then copies the live-window

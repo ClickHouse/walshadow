@@ -4,15 +4,19 @@ Review these limits before production use
 
 ## PostgreSQL
 
-- PostgreSQL 16 or newer only
+- PostgreSQL 16, 17, and 18, daemon rejects unaudited majors
 - shadow PostgreSQL major must match source major
 - one source database per walshadow process
 - `wal_level = logical` required
 - every replicated table needs usable replica identity
-- prepared transactions are not supported, `PREPARE TRANSACTION` changes can be lost
+- prepared transactions are not supported for production use; commit and abort
+  records are handled, but full restart and bootstrap cases still need validation
 - sequence state is not replicated, values already stored in table rows still replicate
 - non-default tablespaces are unsafe for bootstrap and managed-shadow lifecycle
 - unplanned primary promotion is not supported
+
+Unsupported behavior is not uniformly rejected at startup. Review source schema
+and workload limits before attaching
 
 ## ClickHouse
 

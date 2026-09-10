@@ -662,7 +662,7 @@ pub async fn build_pipeline_with(
 }
 
 /// `build_pipeline` with the oracle wired in, so oracle-routed columns convert
-/// to Native through the shadow's `walshadow` module (plans/oracle.md).
+/// to Native through the shadow's `walshadow` module (architecture/values.md).
 pub async fn build_pipeline_with_oracle(
     args: BuildPipelineArgs<'_>,
     oracle: Arc<walshadow::oracle::Oracle>,

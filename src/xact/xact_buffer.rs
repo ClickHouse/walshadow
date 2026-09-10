@@ -647,7 +647,7 @@ pub async fn resolve_stash(
                 if mark.payload_free {
                     // Markerless records were tracked without payload before
                     // the filenode resolved decodable; documented residual,
-                    // `plans/future/catalog_capture_completeness.md`
+                    // `plans/catalog.md`
                     tracing::warn!(
                         target: "walshadow::xact_buffer",
                         relid = rel.oid,

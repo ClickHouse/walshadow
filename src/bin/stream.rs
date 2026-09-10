@@ -462,8 +462,8 @@ struct Args {
     /// throughput lever. Only with `--ch-config`.
     #[arg(long)]
     inserter_pool_size: Option<usize>,
-    /// Xact / TOAST buffer spill dir. Wiped every startup per the
-    /// crash-recovery contract in [plans/xact.md](../../plans/xact.md).
+    /// Xact / TOAST spill and durable recovery state directory
+    /// Startup removes transient transaction spill only
     #[arg(long)]
     spill_dir: PathBuf,
     /// In-memory xact buffer budget in bytes. Default matches PG's
@@ -1103,7 +1103,7 @@ async fn run_session(
     // Branch selection is per segment, through the source's history: a floor
     // stored on an ancestor is served by that ancestor, whatever the live head
     // reports, and a floor at a fork segment's start is served by the descendant
-    // whose file holds the ancestor prefix (plans/failover.md §Lineage).
+    // whose file holds the ancestor prefix (architecture/recovery.md).
     let stored_timeline = manifest_at_boot
         .as_ref()
         .map(|m| m.source.timeline)
@@ -1135,7 +1135,7 @@ async fn run_session(
     // Same number, different branch: the chain places a sibling exactly where it
     // places a descendant, and only the switchpoint separates them. A stored
     // begin is the chain a previous run proved, carried forward
-    // (plans/failover.md §Lineage)
+    // (architecture/recovery.md)
     let stored_begin = manifest_at_boot
         .as_ref()
         .map(|m| m.source.timeline_begin.get())
@@ -2150,7 +2150,7 @@ async fn run_session(
                 // already hold. Both re-freeze conservatively — consumed drops
                 // back to the floor, received re-derives from the live head —
                 // but a promotion decision has to be taken from the pair on
-                // offer now (plans/failover.md §What pause freezes)
+                // offer now (architecture/recovery.md)
                 pause_refrozen = !ever_unpaused;
                 let (consumed, head) = pause_frontier.expect("just frozen");
                 tracing::info!(
@@ -2171,7 +2171,7 @@ async fn run_session(
         // Step 5 of the protocol, answered off the connection step 4's repoint
         // already moved onto the target: replay, receive, and recovery state
         // beside the frozen frontier they have to reach
-        // (plans/failover.md §Operator protocol)
+        // (architecture/recovery.md)
         if !paused {
             promotion = PromotionGate::blocked("not_paused");
             promotion_polled_at = None;
@@ -3262,7 +3262,7 @@ struct SourceSwapView {
 }
 
 /// Branch selection plus the frozen pause frontier — everything a switchover
-/// decision reads (plans/failover.md §Surfaces).
+/// decision reads (architecture/recovery.md).
 struct TimelineView {
     source_system_id: u64,
     /// Branch the pump is reading
@@ -3696,7 +3696,7 @@ fn stream_branch(history: &TimelineHistory, system_id: u64, stream: &WalStream) 
 
 /// Step 5's gate: what the promotion target owes before it may be promoted,
 /// answered off the source connection walshadow already holds rather than a
-/// second `psql` (plans/failover.md §Operator protocol).
+/// second `psql` (architecture/recovery.md).
 #[derive(Debug, Clone, Copy, Default)]
 struct PromotionGate {
     ready: bool,
@@ -3787,7 +3787,7 @@ const BARRIER_LOG_INTERVAL: Duration = Duration::from_secs(2);
 /// descendant. Sound only behind the barrier, which proved nothing below the
 /// fork is still in flight — the floor's contract is that a restart from it
 /// loses nothing, not that the natural terms have caught up to it
-/// (plans/failover.md §Crossing order).
+/// (architecture/recovery.md).
 ///
 /// Publishes to the pruners only after the persist, the same order the status
 /// loop uses: a cut must never sit above what a crash-now restart replays from.
@@ -3835,7 +3835,7 @@ async fn commit_fork_resume(
 ///
 /// Exiting instead would crash-loop the window a switchover opens between
 /// stopping writes on the old primary and repointing at the target
-/// (plans/failover.md §Operator protocol): every restart there dials a server
+/// (architecture/recovery.md): every restart there dials a server
 /// that is down. `ctl` and `/metrics` are bound before this, so the repoint
 /// that ends the wait can be applied to the daemon doing the waiting.
 async fn connect_source_waiting(
@@ -3903,7 +3903,7 @@ struct SourceBranch {
     /// number is not unique across branches — two standbys of one primary,
     /// promoted independently, are both timeline 2 under one system identifier
     /// — so number equality alone accepts a sibling
-    /// (plans/failover.md §Lineage). `0` above timeline 1 means unrecorded.
+    /// (architecture/recovery.md). `0` above timeline 1 means unrecorded.
     begin: u64,
 }
 

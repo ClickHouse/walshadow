@@ -1,5 +1,5 @@
 //! Backup-era tuple visibility gate for backup-sourced initial loads
-//! (plans/add_table.md §Visibility gate).
+//! (architecture/bootstrap.md).
 //!
 //! A page walk sees raw pages: dead-but-unvacuumed tuples, aborted inserts,
 //! in-flight writers. Emit a tuple only when backup-era `pg_xact` says `xmin`

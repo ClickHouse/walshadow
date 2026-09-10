@@ -1,8 +1,9 @@
 # pgext — walshadow PG module
 
-Loadable module for shadow PG, built by PGXS. Behavior, wire protocol, and
-failure semantics live in [`plans/oracle.md`](../plans/oracle.md); this file
-covers building and loading it
+Loadable module for shadow PG, built by PGXS. Read
+[value architecture](../architecture/values.md) for role in replication and
+[worker.c](worker.c) for protocol and failure handling. This guide covers
+building and loading it
 
 ## Build
 

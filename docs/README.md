@@ -17,3 +17,7 @@ Use remaining guides as needed:
 - [Operations](operations.md), monitoring, restarts, and WAL retention
 - [Planned source switchover](failover.md), controlled PostgreSQL primary moves
 - [Current limitations](limitations.md), unsupported behavior and safeguards
+- [Development](development.md), builds, integration prerequisites, fixtures, and coverage
+
+Read [architecture](../architecture/README.md) for system design and
+[plans](../plans/INDEX.md) for unfinished work

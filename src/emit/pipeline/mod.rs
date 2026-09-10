@@ -6,7 +6,7 @@
 //!                              \-> ack collector -> emitter_ack_lsn
 //! ```
 //!
-//! See `plans/future/pipeline_backpressure_and_scaling.md`. Pool sizes M/N come from
+//! See `architecture/README.md`. Pool sizes M/N come from
 //! the CLI; size-1 is the degenerate serial case. The [`ack`] watermark is
 //! contiguous-done so source slot recycling never outruns CH durability.
 

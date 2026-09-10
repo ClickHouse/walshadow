@@ -3,7 +3,7 @@
 //! - source `server_version_num` < 160_000.
 //! - shadow/source major mismatch: a same-physical-WAL standby can't span
 //!   majors, PG's catalog layout changes across them.
-//! - source `wal_level` not `logical` ([PLAN.md §4]; physical-only WAL
+//! - source `wal_level` not `logical` (physical-only WAL
 //!   omits the old-tuple bytes UPDATE/DELETE need).
 //! - a mapped relation has no usable row key: `REPLICA IDENTITY NOTHING`,
 //!   or `DEFAULT` on a table without a primary key. DELETE logs the key

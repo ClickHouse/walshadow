@@ -18,7 +18,7 @@
 //! what earns that — with nothing in flight below `F`, the resume floor moves to
 //! the fork segment's start on the descendant, which PostgreSQL serves out of
 //! its own verbatim copy of the ancestor prefix
-//! (plans/failover.md §Crossing order).
+//! (architecture/recovery.md).
 //!
 //! Advertising after the commit is load-bearing in both directions. Earlier and
 //! the shadow is told about a fork whose floor still names the ancestor; later
@@ -27,7 +27,7 @@
 //! Scope is operator-driven switchover: writes stop, every transaction
 //! resolves, and no torn record survives, so the fence and the
 //! overwrite-contrecord path are typed refusals rather than working paths
-//! (plans/future/failover.md).
+//! (plans/failover.md).
 
 use std::io;
 use std::path::Path;
@@ -234,7 +234,7 @@ pub enum ForkWait {
     /// Segments below the fork are not fsynced, so the fork segment's start is
     /// not yet a durable position. A clean end seals them on its own; an
     /// unclean one needs the truncation from
-    /// plans/future/failover.md §Unplanned promotion first.
+    /// plans/failover.md first.
     ArchiveSeal {
         durable: Pos<FilterDurable>,
         fork_segment: Pos<Floor>,
@@ -443,7 +443,7 @@ impl Switchover<'_> {
         // independently, are both timeline 2 under one system identifier. Only
         // where the branch begins separates them, and walshadow already proved
         // that against the chain it came in on
-        // (plans/failover.md §Lineage)
+        // (architecture/recovery.md)
         let live_begin = live_history
             .begin_of(finished_tli)
             .ok_or_else(not_descendant)?;
@@ -589,7 +589,7 @@ impl Switchover<'_> {
         // The promotion target's slot has to already reach the position about to
         // be committed. `START_REPLICATION` would answer for the request alone,
         // leaving a slot that pins nothing below it to be found at the next
-        // restart (plans/failover.md §Slot)
+        // restart (architecture/recovery.md)
         if let Some(name) = slot {
             let restart_lsn = feed
                 .prove_physical_slot(name, Pos::new(seg_start), Pos::new(seg_start))

@@ -111,10 +111,10 @@ pub enum InitialLoadMode {
     /// Snapshot-free COPY at `_lsn = S` ([`crate::backfill::copy_backfill`]).
     Copy,
     /// Fresh `BASE_BACKUP` page-walk filtered to the opted-in rels
-    /// (plans/add_table.md).
+    /// (architecture/bootstrap.md).
     BaseBackup,
     /// Object-store base backup + archive-WAL gap replay, filtered
-    /// (plans/add_table.md).
+    /// (architecture/bootstrap.md).
     ObjectStore,
 }
 

@@ -67,7 +67,7 @@
   <path d="M 472 608 V 704" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <rect x="48" y="872" width="1024" height="80" fill="#292522" stroke="#867462" stroke-width="1.3"/>
   <text x="64" y="901" class="name">Bootstrap handoff</text>
-  <text x="64" y="925" class="">Finish page + window INSERTs; shadow reaches backup end; start WAL pipeline at end_lsn</text>
+  <text x="64" y="925" class="">Finish page + window INSERTs; catch shadow up; resume from oldest required WAL</text>
   <path d="M 168 792 V 872" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
   <path d="M 472 792 V 872" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
   <path d="M 888 608 V 872" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>

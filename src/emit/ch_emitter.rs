@@ -191,7 +191,7 @@ pub struct EmitterConfig {
     pub inline_value_max: usize,
     /// `[ch] decoder_pool_size`: decode workers (M). `> 1` relaxes
     /// per-table WAL order, leaning on `_lsn` ReplacingMergeTree dedup
-    /// ([emitter.md](../../plans/emitter.md)). `--decoder-pool-size`
+    /// ([emitter.md](../../architecture/README.md)). `--decoder-pool-size`
     /// overrides. Boot-only, the pool is sized at pipeline spawn
     pub decoder_pool_size: usize,
     /// `[ch] inserter_pool_size`: concurrent CH INSERT connections (N).
