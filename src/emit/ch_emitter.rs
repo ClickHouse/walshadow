@@ -286,9 +286,19 @@ pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
 /// with exponential backoff capped at `max_backoff`.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
+    /// Retry budget after initial call, including failed reconnects
     pub max_attempts: u32,
     pub initial_backoff: std::time::Duration,
     pub max_backoff: std::time::Duration,
+}
+
+impl RetryConfig {
+    pub(crate) fn backoff(&self) -> backon::ExponentialBuilder {
+        backon::ExponentialBuilder::default()
+            .with_min_delay(self.initial_backoff)
+            .with_max_delay(self.max_backoff)
+            .with_max_times(self.max_attempts as usize)
+    }
 }
 
 impl Default for RetryConfig {
@@ -2106,7 +2116,28 @@ pub async fn load_effective(
 mod tests {
     use super::*;
     use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple};
+    use backon::BackoffBuilder;
     use walrus::pg::walparser::RelFileNode;
+
+    #[test]
+    fn retry_backoff_preserves_delay_policy() {
+        for (initial, cap, expected) in [
+            (1, 3, [1, 2, 3, 3]),
+            (4, 3, [4, 3, 3, 3]),
+            (1, 0, [1, 0, 0, 0]),
+            (0, 3, [0, 0, 0, 0]),
+        ] {
+            let retry = RetryConfig {
+                max_attempts: 4,
+                initial_backoff: Duration::from_secs(initial),
+                max_backoff: Duration::from_secs(cap),
+            };
+            assert_eq!(
+                retry.backoff().build().collect::<Vec<_>>(),
+                expected.map(Duration::from_secs)
+            );
+        }
+    }
 
     #[test]
     fn defaults_match_high_throughput_profile() {

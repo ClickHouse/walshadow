@@ -20,12 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clickhouse_c::{Block, BoxedAsyncClient, Event};
+use clickhouse_c::{Block, Event};
 
 use crate::backfill::backfill_types::BackupRequest;
-use crate::ch::{
-    EmitterError, backoff_step, connect_client, exec_drain, is_retryable, quote_ident, with_timeout,
-};
+use crate::ch::{ChConn, EmitterError, exec_drain, quote_ident, with_timeout};
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
 use crate::mapping::{MappingHandle, TableMapping, TableTarget};
 use crate::schema::RelName;
@@ -124,7 +122,7 @@ pub async fn prepare(
 /// One CH control connection for staging DDL + swap statements, with the
 /// inserter pool's bounded per-attempt timeout.
 pub struct StagingSession {
-    client: BoxedAsyncClient,
+    client: ChConn,
     /// Kept whole for reconnect; shared with the pass that opened the session
     conn: Arc<EmitterConfig>,
     /// Per-relation destination rules, for the promote's `_lsn` predicate when
@@ -136,7 +134,7 @@ pub struct StagingSession {
 
 impl StagingSession {
     pub async fn connect(emitter: Arc<EmitterConfig>) -> Result<Self> {
-        let client = connect_client(&*emitter)
+        let client = ChConn::connect(&*emitter)
             .await
             .map_err(|e| anyhow::anyhow!("backfill_staging: connect: {e}"))?;
         Ok(Self {
@@ -166,32 +164,33 @@ impl StagingSession {
     }
 
     async fn attempt_write(&mut self, sql: &str) -> Result<(), EmitterError> {
-        exec_drain(&mut self.client, sql, self.timeout).await
+        let timeout = self.timeout;
+        let client = self.client.ready(&*self.conn).await?;
+        exec_drain(client, sql, timeout).await
     }
 
     /// Statement safe to re-apply (DROP/CREATE IF NOT EXISTS, dedup-absorbed
     /// INSERT..SELECT): reconnect + resend on retryable failure.
     async fn exec_retry(&mut self, sql: &str) -> Result<()> {
-        let mut attempt = 0u32;
-        let mut backoff = self.retry.initial_backoff;
-        loop {
-            match self.attempt_write(sql).await {
-                Ok(()) => return Ok(()),
-                Err(e) if is_retryable(&e) && attempt < self.retry.max_attempts => {
+        let timeout = self.timeout;
+        self.client
+            .retry(
+                &*self.conn,
+                self.retry.backoff(),
+                |mut client| async move {
+                    let result = exec_drain(&mut client, sql, timeout).await;
+                    (client, result)
+                },
+                |e, attempt| {
                     tracing::warn!(
                         target: "walshadow::backfill_staging",
                         error = %e, attempt, sql,
                         "statement failed; reconnecting + retrying",
                     );
-                    attempt += 1;
-                    backoff_step(&mut backoff, self.retry.max_backoff).await;
-                    self.client = connect_client(&*self.conn)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("backfill_staging: reconnect: {e}"))?;
-                }
-                Err(e) => return Err(anyhow::anyhow!("backfill_staging: {sql}: {e}")),
-            }
-        }
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }
 
     /// Single attempt, no resend: an ambiguous timeout may have applied
@@ -204,11 +203,17 @@ impl StagingSession {
 
     /// Single-column String SELECT, one attempt under the timeout.
     async fn query_strings(&mut self, sql: &str) -> Result<Vec<String>> {
-        with_timeout(self.timeout, async {
-            self.client.send_query(sql, None).await?;
+        let timeout = self.timeout;
+        let client = self
+            .client
+            .ready(&*self.conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))?;
+        with_timeout(timeout, async {
+            client.send_query(sql, None).await?;
             let mut out = Vec::new();
             loop {
-                match self.client.recv_event().await? {
+                match client.recv_event().await? {
                     Event::Data(block) => read_string_column(&block, &mut out)?,
                     Event::EndOfStream => break,
                     Event::Exception(exc) => {
@@ -365,6 +370,28 @@ fn sql_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn staging_retry_includes_failed_reconnect() {
+        let sql = "DROP TABLE IF EXISTS staging";
+        for retries in 0..=2 {
+            let (config, server) =
+                crate::ch::test_support::retry_server(retries, sql, false, false).await;
+            let mut session = StagingSession::connect(Arc::new(config)).await.unwrap();
+            assert_eq!(session.exec_retry(sql).await.is_ok(), retries == 2);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_ambiguity_does_not_retry() {
+        let sql = "EXCHANGE TABLES staging AND live";
+        let (config, server) = crate::ch::test_support::retry_server(2, sql, false, false).await;
+        let mut session = StagingSession::connect(Arc::new(config)).await.unwrap();
+        assert!(session.exec_once(sql).await.is_err());
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 
     #[test]
     fn staging_rel_renders_sql_names() {
