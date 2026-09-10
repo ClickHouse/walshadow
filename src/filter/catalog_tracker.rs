@@ -180,6 +180,12 @@ impl CatalogTracker {
         self.nodes.insert((db_node, rel_node));
     }
 
+    /// Known catalog `(db_node, rel_node)` pairs, for consumers that classify
+    /// off the same seed without carrying the tracker
+    pub fn nodes(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.nodes.iter().copied()
+    }
+
     /// `rel < FIRST_NORMAL_OBJECT_ID` is the bootstrap rule; relmap
     /// updates add post-rewrite filenumbers. `db_node == 0` (shared:
     /// pg_database, pg_authid, …) consulted for any db.
