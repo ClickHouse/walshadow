@@ -36,11 +36,16 @@ WALSHADOW_USE_LOCAL=1 fixtures/wal/vacuum_full_pg_depend/capture.sh
 Run instrumented suite and generate reports from same execution:
 
 ```bash
+make -C pgext coverage-build
 cargo llvm-cov clean --workspace
 cargo llvm-cov nextest --workspace --all-targets --locked --no-report --no-fail-fast
 cargo llvm-cov report --summary-only
 cargo llvm-cov report --lcov --output-path /tmp/walshadow-lcov.info
+make -C pgext coverage-html
 ```
+
+Install GCC, matching `gcov`, and `gcovr` for
+[PG module coverage](../pgext/README.md#coverage) of `pgext/*.c` and `pgext/*.h`
 
 CI merges coverage across PostgreSQL 16, 17, and 18. Use fresh line-coverage
 reports to locate missing behavior; exported function counts can include generic
